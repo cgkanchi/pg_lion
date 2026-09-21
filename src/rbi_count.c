@@ -84,8 +84,18 @@ PG_FUNCTION_INFO_V1(roaring_index_count);
 PG_FUNCTION_INFO_V1(roaring_index_count2);
 PG_FUNCTION_INFO_V1(roaring_index_count_stats);
 
-/* Initial and maximum growth step of the recheck TID array. */
+/* First size of the recheck TID array, and the step it grows past its budget. */
 #define RBI_RECHECK_INIT_TIDS	256
+#define RBI_RECHECK_GROW_TIDS	1024
+
+/*
+ * Floor and ceiling of the recheck batch budget (in TIDs).  The floor keeps a
+ * tiny work_mem from turning the batched block recheck back into one block
+ * visit per TID; the ceiling is an allocation bound, not a policy: a batch
+ * must stay well inside what repalloc() will hand out.
+ */
+#define RBI_RECHECK_MIN_BATCH	4096
+#define RBI_RECHECK_MAX_BATCH	((int) (MaxAllocSize / sizeof(ItemPointerData) / 2))
 
 /*
  * A posting set is worth materializing (DESIGN.md section 9 and the comment
@@ -115,7 +125,9 @@ typedef struct RBICountCtx
 	ItemPointerData *tids;
 	int			ntids;
 	int			maxtids;
+	int			batchmax;		/* flush the list once it holds this many */
 	bool		tids_sorted;	/* they came out in order (they always do) */
+	int64		recheck_count;	/* rows counted by the batches flushed so far */
 } RBICountCtx;
 
 /*
@@ -194,6 +206,7 @@ typedef struct RBISetCursor
 } RBISetCursor;
 
 static void rbi_cursor_next(RBISetCursor *cur);
+static void rbi_recheck_flush(RBICountCtx *cx);
 
 
 /* ---------------------------------------------------------------------
@@ -201,19 +214,19 @@ static void rbi_cursor_next(RBISetCursor *cur);
  * --------------------------------------------------------------------- */
 
 /*
- * Oid of the "roaring" access method.  Cached; relation-level caches already
- * invalidate on DDL, and an access method cannot be dropped and recreated
- * with a different Oid while any of its indexes exist.
+ * Oid of the "roaring" access method.
+ *
+ * NOT cached in a static: the extension can be dropped and recreated inside
+ * one backend (DROP EXTENSION ... CASCADE takes the indexes with it, so no
+ * index survives to pin the old Oid), and the new pg_am row legitimately gets
+ * a different Oid.  A process-local cache would then reject every index as
+ * "not a roaring index".  get_am_oid() is a GetSysCacheOid1(AMNAME) lookup,
+ * which the syscache invalidates correctly and answers from memory.
  */
 Oid
 rbi_get_am_oid(void)
 {
-	static Oid	cached = InvalidOid;
-
-	if (!OidIsValid(cached))
-		cached = get_am_oid("roaring", false);
-
-	return cached;
+	return get_am_oid("roaring", false);
 }
 
 /*
@@ -1536,13 +1549,78 @@ typedef struct RBIRecheckCollector
 	const bool *needrecheck;	/* RBI_BLOCKS_PER_CONTAINER entries */
 } RBIRecheckCollector;
 
+/*
+ * How many TIDs one recheck batch may hold (DESIGN.md §9).
+ *
+ * The list used to grow by doubling until the whole merge was over: 20
+ * million candidates - which a hot standby produces for any 20-million-row
+ * posting set, because it never trusts the visibility map - meant a 192 MiB
+ * array, and past 134 million candidates an allocation request larger than
+ * palloc will serve.  work_mem is the executor's own answer to "how much may
+ * one node keep", so it is the budget here too.
+ */
+static int
+rbi_recheck_budget(void)
+{
+	int64		budget = ((int64) work_mem * INT64CONST(1024)) /
+		(int64) sizeof(ItemPointerData);
+
+	if (budget < RBI_RECHECK_MIN_BATCH)
+		budget = RBI_RECHECK_MIN_BATCH;
+	if (budget > RBI_RECHECK_MAX_BATCH)
+		budget = RBI_RECHECK_MAX_BATCH;
+	return (int) budget;
+}
+
 static void
 rbi_recheck_add(RBICountCtx *cx, uint64 code)
 {
+	ItemPointerData tid;
+
+	rbi_code_to_tid(code, &tid);
+
+	/*
+	 * Bounded batches.  When the list is full, recheck what it holds right
+	 * now, add the visible rows to the running total and start over - rather
+	 * than keeping every candidate TID until the merge ends.
+	 *
+	 * Why flushing here, in the middle of the merge and with the source pages
+	 * still pinned, is safe (this is the §9 interlock, so it has to be
+	 * argued): the ordering rule is that the VISIBILITY MAP question about a
+	 * container's heap blocks must be asked before the pin on the page that
+	 * container came from is released, and nothing here touches that - the VM
+	 * checks for this container have already happened (they are what put
+	 * these TIDs on the list) and the pins are still held.  Rechecking a TID
+	 * in the heap under our snapshot needs no index pin at all:
+	 *
+	 *	- if VACUUM has removed that TID from the index and from the heap page
+	 *	  meanwhile, the tuple was dead to every snapshot including ours, so
+	 *	  not counting it is right - and table_fetch_tid()/
+	 *	  heap_hot_search_buffer() find nothing there;
+	 *	- if the line pointer has since been reused by a brand-new tuple, that
+	 *	  tuple's xmin is later than our snapshot, so it is invisible to it
+	 *	  and is not counted either.
+	 *
+	 * The only cost of an early flush is that a heap block whose TIDs
+	 * straddle two batches is pinned twice, so the flush waits for a block
+	 * boundary; that also keeps blocks_rechecked exact.
+	 */
+	if (cx->ntids >= cx->batchmax &&
+		(!cx->tids_sorted ||
+		 ItemPointerGetBlockNumber(&cx->tids[cx->ntids - 1]) !=
+		 ItemPointerGetBlockNumber(&tid)))
+		rbi_recheck_flush(cx);
+
 	if (cx->ntids >= cx->maxtids)
 	{
-		int			newmax = (cx->maxtids == 0) ?
-			RBI_RECHECK_INIT_TIDS : cx->maxtids * 2;
+		int			newmax;
+
+		if (cx->maxtids == 0)
+			newmax = Min(RBI_RECHECK_INIT_TIDS, cx->batchmax);
+		else if (cx->maxtids < cx->batchmax)
+			newmax = Min(cx->maxtids * 2, cx->batchmax);
+		else
+			newmax = cx->maxtids + RBI_RECHECK_GROW_TIDS;	/* a long block */
 
 		if (cx->tids == NULL)
 			cx->tids = (ItemPointerData *)
@@ -1553,7 +1631,7 @@ rbi_recheck_add(RBICountCtx *cx, uint64 code)
 		cx->maxtids = newmax;
 	}
 
-	rbi_code_to_tid(code, &cx->tids[cx->ntids]);
+	cx->tids[cx->ntids] = tid;
 
 	/*
 	 * The list is built in ckey order, and inside a container in ascending lo
@@ -1854,6 +1932,22 @@ rbi_recheck_heap(RBICountCtx *cx)
 	return visible;
 }
 
+/*
+ * Recheck the batch accumulated so far and empty the list.  Called from
+ * rbi_recheck_add() whenever the budget is reached (the safety argument is
+ * there) and once more when the merge is over.
+ */
+static void
+rbi_recheck_flush(RBICountCtx *cx)
+{
+	if (cx->ntids == 0)
+		return;
+
+	cx->recheck_count += rbi_recheck_heap(cx);
+	cx->ntids = 0;
+	cx->tids_sorted = true;
+}
+
 
 /* ---------------------------------------------------------------------
  * The merge
@@ -1992,6 +2086,7 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.in_recovery = RecoveryInProgress();
 	cx.tids_sorted = true;
+	cx.batchmax = rbi_recheck_budget();
 
 	cursors = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * nsources);
 	work[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
@@ -2109,11 +2204,12 @@ merge_done:
 
 	/*
 	 * Everything that could be answered from the visibility map has been;
-	 * what is left needs the heap and the snapshot.  No index page is pinned
-	 * any more, which is fine: the decisions that needed a pin were all made
-	 * above.
+	 * what is left of the last batch needs the heap and the snapshot.  No
+	 * index page is pinned any more, which is fine: the decisions that needed
+	 * a pin were all made above.
 	 */
-	result = cx.count + rbi_recheck_heap(&cx);
+	rbi_recheck_flush(&cx);
+	result = cx.count + cx.recheck_count;
 
 	if (BufferIsValid(cx.vmbuf))
 		ReleaseBuffer(cx.vmbuf);
@@ -2370,7 +2466,8 @@ typedef struct RBICountCall
 } RBICountCall;
 
 static void
-rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, RBICountCall *call)
+rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
+				   RBICountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	int			i;
@@ -2476,6 +2573,26 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, RBICountCall *call)
 				 errmsg("cannot count through index \"%s\" because row-level security is enabled on table \"%s\"",
 						RelationGetRelationName(call->index[0]),
 						RelationGetRelationName(call->heap))));
+
+	/*
+	 * Snapshot eligibility.  The planner decides this for a query that
+	 * mentions the table; a direct SQL count was handed an index nobody
+	 * vetted, so it asks the same question itself - once the snapshot is
+	 * known, which is why this is the last thing rbi_count_sql() does before
+	 * the lookup.  An index that indcheckxmin makes unusable does not contain
+	 * the HOT-chain versions an old snapshot still sees, and rechecking
+	 * cannot invent a TID that is not in the posting set (DESIGN.md §9).
+	 */
+	for (i = 0; i < nkeys; i++)
+	{
+		const char *why;
+
+		if (!rbi_index_usable(call->index[i], snapshot, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot count through index \"%s\" because %s",
+							RelationGetRelationName(call->index[i]), why)));
+	}
 }
 
 static void
@@ -2500,11 +2617,11 @@ rbi_count_sql(FunctionCallInfo fcinfo, int nkeys, RBICountStats *stats)
 	int64		result;
 	int			i;
 
-	rbi_count_sql_open(fcinfo, nkeys, &call);
-
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
 		elog(ERROR, "roaring index count requires an active snapshot");
+
+	rbi_count_sql_open(fcinfo, nkeys, snapshot, &call);
 
 	/*
 	 * index_beginscan() takes a relation-level predicate lock on an index

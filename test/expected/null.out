@@ -453,9 +453,9 @@ SELECT entries, null_tids FROM roaring_index_stats('rbi_null_k');
 (1 row)
 
 SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-    rbi_nullcmp     
---------------------
- index scan, 1 rows
+     rbi_nullcmp     
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL');
@@ -517,9 +517,9 @@ SELECT roaring_index_verify('rbi_null_k', true);
 (1 row)
 
 SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-    rbi_nullcmp     
---------------------
- index scan, 1 rows
+     rbi_nullcmp     
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL AND d = 1');

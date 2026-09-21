@@ -127,10 +127,12 @@ opfamily, looked up once per relation and cached in `rd_amcache`) with the index
 INLINE entries hold their containers in the entry tuple while the payload is ≤ `inline_limit`
 bytes (reloption, default 4096 = RBI_MAX_INLINE_LIMIT). When an insert would exceed that, the entry
 *spills*: allocate a container page, move the containers there, set head = tail = that page, flags =
-CHAIN (keeping RBI_ENTRY_NULLKEY), and shrink the entry tuple. Entries never convert back from CHAIN
-to INLINE. The default is the maximum on purpose: a CHAIN posting set owns whole container pages, so
-a key whose set is a few hundred bytes costs a whole page once it spills (§13 measured a 20000-key
-index at 164 MB with a 1024-byte limit against 35 MB with 4096).
+CHAIN (keeping every RBI_ENTRY_RESERVED bit: a key-less entry that loses its flag becomes an
+ordinary entry with a zero-length key that no reader looks for, so the next row of its kind starts a
+second one - the 2026-09-20 review reproduced exactly that), and shrink the entry tuple. Entries
+never convert back from CHAIN to INLINE. The default is the maximum on purpose: a CHAIN posting set
+owns whole container pages, so a key whose set is a few hundred bytes costs a whole page once it
+spills (§13 measured a 20000-key index at 164 MB with a 1024-byte limit against 35 MB with 4096).
 
 Container pages (per key, CHAIN entries): items are RBIContainer structs, ascending ckey within a
 page; all ckeys on page P are smaller than all ckeys on P.rightlink. `minckey`/`maxckey` in the
@@ -302,7 +304,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- ERRORs on any structural inconsistency: page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container, ntids/ncontainers sums; with heapallindexed, scans the heap with a
-        -- fresh snapshot and checks that every visible tuple's TID is present under its key.
+        -- fresh snapshot and checks that every visible tuple's TID is present under its key -
+        -- refusing (rbi_index_usable(), §9) when this transaction's snapshot may not use the index.
     (phase 2) roaring_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
@@ -387,18 +390,43 @@ Algorithm `rbi_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *ke
    ckey order), and for each TID call `table_index_fetch_tuple(fetch, &tid, snap, slot, &call_again,
    &all_dead)` in a loop over call_again (HOT chains); count each visible tuple found. Use
    `table_index_fetch_begin/end`. Tuples for which the fetch finds nothing are not counted.
-5. Return the count. Memory: recheck list in a per-call context; cap nothing (a worst case of 5% dirty
-   pages on 10M rows is 500k TIDs = 3 MB).
+   (In PostgreSQL 20devel that API is gone and `table_fetch_tid()` replaces it; the heap AM is served
+   by one `heap_hot_search_buffer()` loop per heap BLOCK instead, under one share lock.)
+5. Return the count. Memory: the recheck list lives in a per-call context and is BOUNDED - it holds
+   at most `work_mem` worth of TIDs (floor: a few thousand). When it fills up, the batch it holds is
+   rechecked right there, its visible rows are added to the running total and the list starts over;
+   the flush waits for a heap-block boundary, so no block is pinned twice and `blocks_rechecked`
+   stays exact. Without a bound, 20M candidates - which a standby produces for any 20M-row posting
+   set, since it never trusts the VM - meant a 192 MiB array, and 134M candidates an impossible
+   allocation.
+   Flushing mid-merge does not weaken the interlock above: the ordering rule is that the VM question
+   about a container's blocks is asked before the pin on the page that container came from is
+   released, and a flush asks no VM question - those are what put the TIDs on the list. Rechecking a
+   TID needs no index pin at all: if VACUUM removed that TID meanwhile, the tuple was dead to every
+   snapshot including ours (nothing to count, and nothing is found); if the line pointer was reused,
+   the new tuple's xmin is later than our snapshot and is invisible to it.
 
 SQL surface for tests: `roaring_index_count(idx regclass, key anyelement) RETURNS bigint` and
 `roaring_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
 Both verify the key type matches the index's opcintype, open the heap via IndexGetRelation with
 AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
+Nobody vetted the index they were handed, so they also make the decision the planner makes in
+get_relation_info() before looking anything up: `rbi_index_usable(index, snapshot, &why)` (rbi.h,
+implemented in rbi_pages.c, shared with roaring_index_verify's heapallindexed pass) requires
+indisvalid and indisready and applies the indcheckxmin rule against TransactionXmin exactly as
+plancat.c does; an unusable index is an ERROR naming the reason, never a count. This is not an
+optimisation: an index built from a broken HOT chain holds only the latest version of that chain, so
+an older snapshot's row is not in the posting set and no amount of heap rechecking can put it back
+(the 2026-09-20 review reproduced `count(*) WHERE k = 1` = 1 against `roaring_index_count()` = 0;
+test/isolation/count_checkxmin.spec is that case).
 Isolation tests must cover: concurrent uncommitted insert (not counted), committed insert (counted
 in a new snapshot, not in an old REPEATABLE READ one), delete + VACUUM racing with the count (a
 cursor or `pg_sleep`-free spec using isolationtester steps: s1 opens a REPEATABLE READ transaction
 and counts once, s2 deletes rows and commits, s3 runs VACUUM, s1 counts again and must still see the
-old value; then in READ COMMITTED s1 must see the new value).
+old value; then in READ COMMITTED s1 must see the new value), and an index the caller's snapshot may
+not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the build set
+indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
+that is missing the row it still sees).
 
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`rbi_customscan.c`)
 
@@ -427,19 +455,75 @@ Planner integration
   - GROUP BY is empty, or exactly one plain Var of the rel with a roaring index. The grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.
+  - **The driving index's equality is the grouping equality** (2026-09-20 review, finding 3). An
+    index's entries are the classes of
+    strategy 1 of ITS opfamily on its own key type, and an operator class is free to define a
+    coarser equality than the type's (a text opclass over `lower()` is a valid opclass, and the
+    2026-09-20 review built one: 50k `'A'` and 50k `'a'` came out as one group of 100k). So the
+    equality operator the planner chose for the grouping column - `SortGroupClause.eqop`, which is
+    the type's own - must be exactly the operator
+    `get_opfamily_member(idx->opfamily[0], opcintype, opcintype, 1)` returns, compared by Oid;
+    cross-type equality does not arise for a group column. Matching collation is NOT enough. The
+    check is per relation, so every partition's own index is checked (§16), and it covers the
+    `count(col)` cases of §14 that read the group column's entries, since those are only reached
+    through a grouping index. A sum-over-all driver (§14) is exempt: the entries of one index are
+    disjoint and cover every row however they partition it, so their total does not depend on the
+    equality. Without GROUP BY nothing else does either - counting a class needs no assumption
+    about how the class was formed, only that the clause's operator is the index's strategy 1.
   - The planner's grouped_rel target contains only the GROUP BY column(s) and the aggregate(s).
+- **Value-producing pushdown has a stricter contract than counting** (2026-09-20 review, finding 4).
+  A posting set stores ONE representative key per equality class, chosen when the entry was created,
+  and nothing keeps a visible row with that exact representation in it: indexing citext
+  `'SecretOldSpelling'`, deleting it, inserting 10,000 `'secretoldspelling'` and vacuuming leaves an
+  entry whose key is a spelling the table no longer contains. So a pushdown that PRODUCES a value -
+  the GROUP BY column in the output target, or a column a `=` clause pins whose value the target
+  list prints from the entry's stored key - is only built when equality on that index implies an
+  identical binary representation. Both halves are checked, per relation, in `rbi_collect_targets()`:
+  - the index's own equality (strategy 1 for (opcintype, opcintype)) IS the type's equality, i.e.
+    the equality of the type's default btree opclass. Otherwise "same entry" is weaker than "equal"
+    and the question below is not even the right one;
+  - and that equality is representation-preserving, decided exactly as btree deduplication decides
+    it in `_bt_allequalimage()`: the type's default btree opfamily (`lookup_type_cache` with
+    `TYPECACHE_BTREE_OPFAMILY`), its `BTEQUALIMAGE_PROC` (support function 4) for (type, type),
+    called under the INDEX's collation - which is how `btequalimage`/`btvarstrequalimage` decide
+    determinism. A missing support function or a false answer (citext, numeric `1.0`/`1.00`,
+    nondeterministic collations) means no.
+
+  A count-only pushdown - no group column in the output and no pinned column echoed - is unaffected:
+  every member of the class is counted whatever it is spelled like. `IS NULL` is exempt as well:
+  NULL has one representation. Regression coverage is in `test/sql/citext.sql` (the review's
+  representative case) and `test/sql/pushdown.sql` (numeric, and a text GROUP BY that still pushes
+  down).
 - Add a CustomPath with `flags = 0` (no parallel, no backward, no mark/restore), `pathtarget =
   grouped_rel->reltarget`, rows = estimated groups (from estimate_num_groups, or 1 without GROUP BY),
   startup/total cost = (index pages for the involved keys, estimated as the index size × selectivity,
-  clamped ≥ 1) × random_page_cost + containers × cpu_operator_cost + expected recheck TIDs (assume
-  the fraction of heap pages not all-visible from `pg_class.relallvisible/relpages`) × cpu_tuple_cost
-  + random_page_cost per recheck page. This is deliberately optimistic but proportional; document it.
+  clamped ≥ 1) × random_page_cost + containers × cpu_operator_cost + expected recheck TIDs (the
+  fraction of heap pages not all-visible from `pg_class.relallvisible/relpages`, times the rows the
+  clauses select) × cpu_tuple_cost + random_page_cost per recheck PAGE, where the pages are bounded
+  by the pages the visibility map cannot vouch for:
+  - without GROUP BY, `Min(recheck_tids, heap_pages × dirtyfrac)`. A single count walks the merged
+    result in TID order and visits each such block at most once, and charging random reads across
+    the whole heap instead priced the node out of the case it exists for: on a freshly vacuumed
+    1M-row table (4480 pages, 4425 all-visible) the model asked 18054 against a bitmap aggregate's
+    16247, for a count that rechecked zero TIDs and ran in 0.24 ms (2026-09-20 review, finding 5);
+  - with GROUP BY, `Min(numgroups × heap_pages × dirtyfrac, recheck_tids)`: each group's merge
+    returns to a dirty block separately, which is what keeps a thousand groups of one TID per block
+    on a heap that is not all-visible losing to the sequential scan that does the same work once.
+
+  This is deliberately optimistic but proportional; document it. `test/sql/pushdown.sql` pins both
+  ends: a 200k-row table vacuumed and then slightly extended (relallvisible just under relpages)
+  must choose the node for a single count and for a small GROUP BY with nothing disabled, and the
+  1000-group never-vacuumed table must still lose to the sequential scan.
 - PlanCustomPath produces a CustomScan with `scan.scanrelid = 0` (upper-level node),
   `custom_scan_tlist` = the output columns (group key Var(s) with their original varno/varattno, and
   the aggregate as a Const-shaped placeholder replaced at execution), and `custom_private` holding:
   the heap relid, the list of (index oid, attnum, const datum serialized via a Const node) for WHERE,
   the group-by (index oid, attnum) or none, and the aggregate kinds. Use `build_path_tlist`-style
   handling with INDEX_VAR references in the plan's targetlist as pg_strom/TimescaleDB do.
+  `custom_private` is a POSITIONAL list (the `RBI_PRIV_*` indexes), so its first member is a shape
+  marker - an IntList of `RBI_PRIV_MAGIC` and the number of members - which BeginCustomScan checks
+  before reading any offset and ERRORs on. Planner/executor drift, or a plan built by a differently
+  shaped build of the library, is then a message and not a misread Oid.
 
 Executor
 - BeginCustomScan: open heap with NoLock (the executor already locked every RTE); index_open each
@@ -666,7 +750,9 @@ RBI_ENTRY_NULLKEY, keylen 0, hash 0, living in bucket 0 and matched by the flag 
 Everything that searches a bucket for a key skips it (rbi_find_entry_ext), and everything that reads
 a stored key asks first; `rbi_find_null_entry()` is the only way to it. Once located it is an
 ordinary entry: it spills to a chain, is filtered by VACUUM and is counted exactly like any other,
-and the spill keeps the flag.
+and the spill keeps the flag - every path that rewrites an entry's flags (insert spill, VACUUM spill,
+rbi_entry_rebuild, build) preserves all of RBI_ENTRY_RESERVED, and verify() reports a key-less entry
+without one as corruption (keylen 0 is not a legal key length).
 
 Build: the tuplesort's key column may be NULL (hash 0 for NULLs; both passes group by the isnull
 flag first, then by key). Insert: NULL → the null entry (created on first use). Scan:
@@ -746,6 +832,13 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
   operator and an opfamily member and hash function for the compared type, all checked per
   partition because nothing stops two partitions from using different opclasses. A foreign table,
   or a leaf without one of the indexes, bails out.
+- The two §10 rules about what an index's entries MEAN are checked per partition for the same
+  reason: the driving index's strategy-1 operator must be the grouping equality
+  (`SortGroupClause.eqop`), and an index whose stored key will be printed - the group key in the
+  output, or a column a `=` clause pins - must have the type's own equality and a
+  representation-preserving one (`BTEQUALIMAGE_PROC` under that index's collation). One partition
+  with a coarser or a differently spelled opclass declines the whole query; there is no per-
+  partition fallback, because the node produces one result set.
 - No live partitions (everything pruned) adds no path at all: the planner's own dummy-rel handling
   gives the right answer.
 - One CustomPath on the parent's grouped rel. custom_private gains two members: RBI_PRIV_PARTS, a
@@ -757,9 +850,28 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
 - Cost: `rbi_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
   allvisfrac and rows and its own indexes; the path's cost is the sum over the leaves. numgroups
   comes from `estimate_num_groups` on the PARENT (a partition may hold rows of every group), and is
-  used unchanged for each of them.
+  used unchanged for each of them. A partitioned GROUP BY adds the merge itself:
+  `numgroups × hashentrysize × cpu_operator_cost`, all of it startup cost, because the node emits
+  nothing until the last partition has been counted.
 - A partitioned GROUP BY needs a hashable grouping column (`SortGroupClause.hashable`), because the
   partitions' groups are merged in a hash table; one table needs no merge and does not care.
+- **The merge has a memory budget, enforced at plan time** (2026-09-20 review, finding 6). The
+  TupleHashTable below holds every distinct group of every partition until the last one has been
+  counted, and it has no spill path: unlike HashAggregate it cannot fall back to batches on disk.
+  So the planner estimates it as
+  `hashentrysize = MAXALIGN(get_attavgwidth(), or the type's average width when there are no stats)
+  + 64` bytes per group - the key, the minimal tuple's header, the hash table's per-entry
+  bookkeeping and the int64 count - and declines the pushdown when
+  `numgroups × hashentrysize` exceeds `get_hash_memory_limit()`, which is the same
+  `work_mem × hash_mem_multiplier` budget HashAggregate respects. The ordinary Agg, which can
+  spill, then gets the query. Neither a count (no groups to merge) nor a single table (no merge)
+  is subject to it; `test/sql/partition.sql` shows all three with the other plan types disabled,
+  so that only the budget can decide. This bounds the merge, not the per-relation count: the TID
+  recheck list of §9 is a separate structure with its own bound. It is also a PLAN-time bound and
+  therefore only as good as `estimate_num_groups`: a bad underestimate still builds a table larger
+  than the budget at run time, which is the same exposure HashAggregate has before it decides to
+  spill. An executor-side cap would need the node to be able to finish differently (spill the
+  merge, or restart as a plain Agg) and is not v1.
 - Partitionwise aggregation is left alone: the existing `patype != PARTITIONWISE_AGGREGATE_NONE`
   bail-out means that with `enable_partitionwise_aggregate = on` a partitioned table gets the
   planner's own per-partition Aggs and not this node.
@@ -788,7 +900,9 @@ Executor
   (`RBIClauseState.storedkey`, copied into a small context of its own) the first time a relation's
   entry has it, because the posting set is gone by the time the row comes out. With partitions that
   is the first partition that holds the key; any other partition's key compares equal to it by the
-  index's own equality.
+  index's own equality - and, since the planner only builds a value-producing node when every
+  partition's index has the type's own representation-preserving equality (§10), "compares equal"
+  there means "is the same bytes".
 - ReScan throws all of it away - entry scan, posting sets, the open partition, the merged hash table
   and the remembered keys - and starts again.
 - EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Roaring Indexes` line keeps
@@ -806,6 +920,10 @@ set is fixed at plan time), Params in the WHERE clauses (§10, not partition-spe
 execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation as above. Planning
 costs one `index_open` per clause per partition (`rbi_index_bucket_pages` reads the meta page), and
 EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
+Also not supported, and refused rather than attempted: a grouping whose merged hash table would
+not fit in `get_hash_memory_limit()` (above), a partition whose opclass groups rows differently
+from the query, and a value-producing grouping over a type whose equality does not preserve the
+representation (§10).
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
@@ -897,6 +1015,8 @@ array, a tsvector with no lexemes - which are under no key at all and which an A
 (`tags @> '{}'`) still has to find.  A NULL column value goes to the NULL entry as before; the two
 are mutually exclusive and verify() says so.  `rbi_find_entry_ext()` skips both, and
 `rbi_find_reserved_entry()` (with `rbi_find_null_entry()` as a wrapper) is the only way to either.
+Like the NULL entry it keeps its flag through a spill, whether the spill happens on insert or inside
+VACUUM (§4, §14); test/sql/array.sql and test/sql/tsvector.sql take both transitions.
 
 The meta page version is NOT bumped.  A version 2 index built with a scalar opclass has no empty
 entry and needs none - only a multi-key opclass ever writes one, and those did not exist before this
@@ -919,8 +1039,11 @@ so no snapshot that can see the row can run before the last of them is written.
 Extraction (`rbi_extract_value()`, rbi_multikey.c) drops NULL keys and duplicates.  A row whose array
 holds a NULL element is indexed under its other elements; nothing ever looks for a NULL key, because
 a query with one falls back to a rechecking scan.  Duplicates must go, or `rbi_container_add()` would
-report "already indexed" and leave `ntids` wrong.  The dedupe is quadratic in the keys of ONE row
-(an equality call each), which needs no ordering operator the key type may not have.
+report "already indexed" and leave `ntids` wrong.  The dedupe hashes every key once and sorts the
+keys BY THEIR HASH, so the only candidates for equality are adjacent and each key is compared (with
+the equality proc, the only ordering-free tool the opclass promises) against the distinct keys of its
+own hash run - one of them, except on a hash collision.  A row with n keys therefore costs n hashes,
+one sort and about n equality calls; the keys come out in hash order, which nothing depends on.
 
 `ntids` therefore counts (key, row) pairs, and so does `IndexBuildResult.index_tuples`.  A row with
 no keys contributes one pair, in the EMPTY entry.  **VACUUM is unchanged**: its callback is per TID

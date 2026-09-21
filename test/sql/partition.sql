@@ -321,6 +321,47 @@ RESET enable_bitmapscan;
 RESET enable_indexscan;
 DROP TABLE rbi_parte;
 
+-- ---- the cross-partition group table has a budget -------------------------
+/*
+ * A partitioned GROUP BY holds every group of every partition in a
+ * TupleHashTable until the last partition has been counted (DESIGN.md section
+ * 16), and that table cannot spill.  The planner therefore declines when the
+ * estimated table does not fit in the budget HashAggregate itself respects,
+ * work_mem * hash_mem_multiplier, and lets the ordinary Agg - which can spill
+ * - have the query (the 2026-09-20 review, finding 6).
+ *
+ * Every other plan is disabled around the two plans below, so the only thing
+ * that can decide between them is the budget.
+ */
+CREATE TABLE rbi_pbig (g int NOT NULL, k int NOT NULL) PARTITION BY RANGE (k);
+CREATE TABLE rbi_pbig1 PARTITION OF rbi_pbig FOR VALUES FROM (0) TO (5);
+CREATE TABLE rbi_pbig2 PARTITION OF rbi_pbig FOR VALUES FROM (5) TO (10);
+INSERT INTO rbi_pbig SELECT i % 5000, i % 10 FROM generate_series(1, 50000) i;
+CREATE INDEX rbi_pbig_g ON rbi_pbig USING roaring (g);
+CREATE INDEX rbi_pbig_k ON rbi_pbig USING roaring (k);
+VACUUM ANALYZE rbi_pbig;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET work_mem = '64kB';			-- 5000 groups of (key + 64 bytes) do not fit
+SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
+SET work_mem = '4MB';			-- and now they do
+SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
+SELECT rbi_pp('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
+/*
+ * A count has no groups to merge, and a single table does not merge at all,
+ * so neither is subject to the budget.
+ */
+SET work_mem = '64kB';
+SELECT rbi_pplan('SELECT count(*) FROM rbi_pbig WHERE g = 7');
+SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pbig1 GROUP BY g');
+RESET work_mem;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT count(*) FROM (SELECT g, count(*) FROM rbi_pbig GROUP BY g) s;
+DROP TABLE rbi_pbig;
+
 -- ---- a partition without a usable roaring index ---------------------------
 CREATE TABLE rbi_pnx (id int NOT NULL, a int NOT NULL, k int NOT NULL)
 	PARTITION BY RANGE (k);

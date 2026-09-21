@@ -231,6 +231,43 @@ SELECT rbi_ccmp('rbi_cnt_c5000', 'rbi_cnt', 'c5000', '1234');
 COMMIT;
 
 /*
+ * Bounded recheck batches (2026-09-20 review, finding 6).
+ *
+ * The candidate TIDs of blocks that are not all-visible used to be kept until
+ * the whole merge was over: 20 million of them - which a hot standby produces
+ * for any 20-million-row posting set, because it never trusts the visibility
+ * map - meant a 192 MiB array.  The list is now flushed whenever it reaches a
+ * budget taken from work_mem, at a block boundary so that no heap block is
+ * visited twice.  With the minimum work_mem the budget is about 10900 TIDs,
+ * so the counts below take several batches each, and every answer and every
+ * statistic must be exactly what one single batch produces.
+ */
+DELETE FROM rbi_cnt WHERE i % 37 = 0;	-- every heap page is dirty again
+CREATE TEMP TABLE rbi_wm (q text, budget text, cnt bigint, blocks_skipped bigint,
+						  tids_rechecked bigint, blocks_rechecked bigint);
+SET work_mem = '64kB';
+INSERT INTO rbi_wm SELECT 'b3f', 'min', *
+  FROM roaring_index_count_stats('rbi_cnt_b3', false);
+INSERT INTO rbi_wm SELECT 'c10', 'min', *
+  FROM roaring_index_count_stats('rbi_cnt_c10', 0);
+SELECT rbi_ccmp('rbi_cnt_b3', 'rbi_cnt', 'b3', 'false');
+SELECT rbi_ccmp('rbi_cnt_c5000', 'rbi_cnt', 'c5000', '1234');
+SELECT rbi_ccmp2('rbi_cnt_c10', '3', 'rbi_cnt_m7', '2', 'rbi_cnt', 'c10', 'm7');
+RESET work_mem;
+INSERT INTO rbi_wm SELECT 'b3f', 'big', *
+  FROM roaring_index_count_stats('rbi_cnt_b3', false);
+INSERT INTO rbi_wm SELECT 'c10', 'big', *
+  FROM roaring_index_count_stats('rbi_cnt_c10', 0);
+-- one answer per query, whatever the budget was
+SELECT q, count(DISTINCT (cnt, blocks_skipped, tids_rechecked, blocks_rechecked))
+			AS answers
+  FROM rbi_wm GROUP BY q ORDER BY q;
+SELECT cnt = (SELECT count(*) FROM rbi_cnt WHERE NOT b3) AS count_ok,
+	   tids_rechecked > 40000 AS enough_tids_for_several_batches
+  FROM rbi_wm WHERE q = 'b3f' AND budget = 'min';
+DROP TABLE rbi_wm;
+
+/*
  * The batched heap recheck.
  *
  * Blocks that are not all-visible are visited one BLOCK at a time: the buffer
@@ -380,6 +417,32 @@ SELECT roaring_index_count('rbi_cnt', 0);
 CREATE TABLE rbi_cnt_other (k int4);
 CREATE INDEX rbi_cnt_other_k ON rbi_cnt_other USING roaring (k);
 SELECT roaring_index_count('rbi_cnt_c10', 0, 'rbi_cnt_other_k', 0);
+/*
+ * Indexes that exist but that this transaction may not use (2026-09-20
+ * review, finding 2).  A direct SQL count was handed an index nobody vetted,
+ * so it makes the checks get_relation_info() makes for a query; the
+ * cross-session indcheckxmin case, which is the one that produced a wrong
+ * answer, is in test/isolation/count_checkxmin.spec.
+ */
+CREATE TABLE rbi_cnt_elig (k int4);
+INSERT INTO rbi_cnt_elig SELECT i % 3 FROM generate_series(1, 300) i;
+CREATE INDEX rbi_cnt_elig_k ON rbi_cnt_elig USING roaring (k);
+SELECT roaring_index_count('rbi_cnt_elig_k', 1);
+UPDATE pg_index SET indisvalid = false
+ WHERE indexrelid = 'rbi_cnt_elig_k'::regclass;
+SELECT roaring_index_count('rbi_cnt_elig_k', 1);
+SELECT roaring_index_count('rbi_cnt_elig_k', 1, 'rbi_cnt_elig_k', 1);
+-- the verifier shares the check
+SELECT roaring_index_verify('rbi_cnt_elig_k', true);
+UPDATE pg_index SET indisvalid = true, indisready = false
+ WHERE indexrelid = 'rbi_cnt_elig_k'::regclass;
+SELECT roaring_index_count('rbi_cnt_elig_k', 1);
+UPDATE pg_index SET indisready = true
+ WHERE indexrelid = 'rbi_cnt_elig_k'::regclass;
+SELECT roaring_index_count('rbi_cnt_elig_k', 1);
+SELECT roaring_index_verify('rbi_cnt_elig_k', true);
+DROP TABLE rbi_cnt_elig;
+
 -- NULL arguments: STRICT
 SELECT roaring_index_count('rbi_cnt_c10', NULL::int4) IS NULL AS null_key;
 SELECT roaring_index_count(NULL, 0) IS NULL AS null_index;
@@ -388,5 +451,28 @@ DROP TABLE rbi_cnt_other;
 DROP TABLE rbi_cnt_hot;
 DROP TABLE rbi_cnt_tiny;
 DROP TABLE rbi_cnt;
+/*
+ * DROP EXTENSION + CREATE EXTENSION in one backend (2026-09-20 review,
+ * finding 7).  CASCADE takes every roaring index with it, so recreating the
+ * extension legitimately gives the access method a NEW pg_am Oid.  The count
+ * functions used to cache the old one in a process-local static and then
+ * reject every index with "is not a roaring index"; the Oid now comes from
+ * the AMNAME syscache, which is invalidated properly.  (This is the last
+ * thing this file does: the CASCADE drops the indexes of every roaring index
+ * in the database.)
+ */
+CREATE TABLE rbi_cnt_re (k int4);
+INSERT INTO rbi_cnt_re SELECT i % 10 FROM generate_series(1, 1000) i;
+CREATE INDEX rbi_cnt_re_k ON rbi_cnt_re USING roaring (k);
+SELECT roaring_index_count('rbi_cnt_re_k', 3);
+DROP EXTENSION roaring_index CASCADE;
+CREATE EXTENSION roaring_index;
+SELECT to_regclass('rbi_cnt_re_k') IS NULL AS index_dropped_by_cascade;
+CREATE INDEX rbi_cnt_re_k ON rbi_cnt_re USING roaring (k);
+SELECT roaring_index_count('rbi_cnt_re_k', 3);
+SELECT roaring_index_verify('rbi_cnt_re_k', true);
+SELECT count(*) FROM rbi_cnt_re WHERE k = 3;
+DROP TABLE rbi_cnt_re;
+
 DROP FUNCTION rbi_ccmp(text, text, text, text);
 DROP FUNCTION rbi_ccmp2(text, text, text, text, text, text, text);

@@ -1,7 +1,8 @@
 #!/bin/bash
 S=${SCRATCH:?set SCRATCH to the directory holding pginst/ and q/}
 B=$S/pginst/bin; Q=$S/q; LOG=$S/bench_plans.log; RES=$S/bench_results.txt
-export PGHOST=/tmp/claude-1000/pgsk PGPORT=54329 PGUSER=postgres PGDATABASE=postgres
+# the launcher (bench/lib.sh) sets the endpoint; these defaults only apply when bench.sh is run by hand
+export PGHOST=${PGHOST:-/tmp/claude-1000/pgsk} PGPORT=${PGPORT:-54329} PGUSER=${PGUSER:-postgres} PGDATABASE=${PGDATABASE:-postgres}
 T=${T:-5}
 # ONLY="1 2b 2c" runs a subset of phases; default all
 only() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }

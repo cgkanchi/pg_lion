@@ -396,6 +396,13 @@ SELECT rbi_pd('SELECT b, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY b');
  pushed down, 1 rows
 (1 row)
 
+-- a by-reference group key whose type prints what it stores
+SELECT rbi_pd('SELECT c, count(*) FROM rbi_pdt GROUP BY c');
+       rbi_pd        
+---------------------
+ pushed down, 4 rows
+(1 row)
+
 -- count(col) where col cannot be NULL
 SELECT rbi_pd('SELECT count(a) FROM rbi_pdt WHERE a = 3');
        rbi_pd        
@@ -830,6 +837,265 @@ SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdd GROUP BY g');
  pushed down, 1000 rows
 (1 row)
 
+-- ---- a nearly all-visible heap is what the pushdown is for --------------
+/*
+ * The other side of the same model: 200k rows vacuumed, then a few thousand
+ * more inserted, so that relallvisible is just short of relpages - the
+ * ordinary state of a large table that is mostly read.  The rechecks can only
+ * touch the pages the visibility map cannot vouch for, and the estimate has
+ * to say so; charging random reads across the whole heap made the node lose
+ * to plans doing far more work (the 2026-09-20 review, finding 5).  Nothing
+ * is disabled here: which plan the cost model picks IS the test.
+ */
+CREATE TABLE rbi_pdw (id int NOT NULL, k int NOT NULL);
+INSERT INTO rbi_pdw SELECT i, i % 10 FROM generate_series(1, 200000) i;
+CREATE INDEX rbi_pdw_k ON rbi_pdw USING roaring (k);
+VACUUM ANALYZE rbi_pdw;
+INSERT INTO rbi_pdw SELECT 200000 + i, i % 10 FROM generate_series(1, 4000) i;
+ANALYZE rbi_pdw;
+SELECT relallvisible > 0 AND relallvisible < relpages AS nearly_all_visible
+  FROM pg_class WHERE relname = 'rbi_pdw';
+ nearly_all_visible 
+--------------------
+ t
+(1 row)
+
+SELECT rbi_pd('SELECT count(*) FROM rbi_pdw WHERE k = 3');
+       rbi_pd        
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT rbi_plans('SELECT count(*) FROM rbi_pdw WHERE k = 3');
+                 rbi_plans                  
+--------------------------------------------
+ -- on:
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_pdw_k (k = 3)
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on rbi_pdw
+         Recheck Cond: (k = 3)
+         ->  Bitmap Index Scan on rbi_pdw_k
+               Index Cond: (k = 3)
+(9 rows)
+
+SELECT rbi_pd('SELECT k, count(*) FROM rbi_pdw GROUP BY k');
+        rbi_pd        
+----------------------
+ pushed down, 10 rows
+(1 row)
+
+SELECT rbi_plans('SELECT k, count(*) FROM rbi_pdw GROUP BY k');
+            rbi_plans             
+----------------------------------
+ -- on:
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_pdw_k (k)
+   Group Key: k
+ -- off:
+ HashAggregate
+   Group Key: k
+   ->  Seq Scan on rbi_pdw
+(8 rows)
+
+-- ---- an opclass whose equality is not the grouping equality -------------
+/*
+ * An operator class may define a coarser equality than the type's own, and
+ * this one does: it calls two strings equal when they differ only in case.
+ * It is a valid roaring opclass - its hash agrees with its equality - but its
+ * entries are already-merged groups, and no GROUP BY may be answered from
+ * them, not even a count-only one whose key never reaches the output: the
+ * counts themselves would belong to the wrong groups (the 2026-09-20 review,
+ * finding 3).
+ */
+CREATE FUNCTION rbi_lower_eq(text, text) RETURNS boolean
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT lower($1) = lower($2) $$;
+CREATE OPERATOR === (LEFTARG = text, RIGHTARG = text, FUNCTION = rbi_lower_eq,
+					 COMMUTATOR = ===);
+CREATE FUNCTION rbi_lower_hash(text) RETURNS integer
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT hashtext(lower($1)) $$;
+CREATE OPERATOR CLASS rbi_lower_ops FOR TYPE text USING roaring AS
+	OPERATOR 1 === (text, text),
+	FUNCTION 1 rbi_lower_hash(text);
+CREATE TABLE rbi_pdc (v text NOT NULL);
+INSERT INTO rbi_pdc SELECT 'A' FROM generate_series(1, 50000);
+INSERT INTO rbi_pdc SELECT 'a' FROM generate_series(1, 50000);
+CREATE INDEX rbi_pdc_v ON rbi_pdc USING roaring (v rbi_lower_ops);
+VACUUM ANALYZE rbi_pdc;
+-- one entry for the two spellings, which is what the opclass says
+SELECT entries FROM roaring_index_stats('rbi_pdc_v');
+ entries 
+---------
+       1
+(1 row)
+
+SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdc GROUP BY v');
+         rbi_pd          
+-------------------------
+ not pushed down, 2 rows
+(1 row)
+
+SELECT rbi_plans('SELECT v, count(*) FROM rbi_pdc GROUP BY v');
+         rbi_plans         
+---------------------------
+ -- on:
+ HashAggregate
+   Group Key: v
+   ->  Seq Scan on rbi_pdc
+ -- off:
+ HashAggregate
+   Group Key: v
+   ->  Seq Scan on rbi_pdc
+(8 rows)
+
+SELECT rbi_pd('SELECT count(*) FROM rbi_pdc GROUP BY v');
+         rbi_pd          
+-------------------------
+ not pushed down, 2 rows
+(1 row)
+
+SELECT v, count(*) FROM rbi_pdc GROUP BY v ORDER BY v;
+ v | count 
+---+-------
+ A | 50000
+ a | 50000
+(2 rows)
+
+/*
+ * The very same data under the default text opclass does drive the node, so
+ * what the queries above turned down is the opclass and not the table or the
+ * cost model.
+ */
+CREATE TABLE rbi_pdv (v text NOT NULL);
+INSERT INTO rbi_pdv SELECT 'A' FROM generate_series(1, 50000);
+INSERT INTO rbi_pdv SELECT 'a' FROM generate_series(1, 50000);
+CREATE INDEX rbi_pdv_v ON rbi_pdv USING roaring (v);
+VACUUM ANALYZE rbi_pdv;
+SELECT entries FROM roaring_index_stats('rbi_pdv_v');
+ entries 
+---------
+       2
+(1 row)
+
+SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdv GROUP BY v');
+       rbi_pd        
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT rbi_plans('SELECT v, count(*) FROM rbi_pdv GROUP BY v');
+            rbi_plans             
+----------------------------------
+ -- on:
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_pdv_v (v)
+   Group Key: v
+ -- off:
+ HashAggregate
+   Group Key: v
+   ->  Seq Scan on rbi_pdv
+(8 rows)
+
+SELECT v, count(*) FROM rbi_pdv GROUP BY v ORDER BY v;
+ v | count 
+---+-------
+ A | 50000
+ a | 50000
+(2 rows)
+
+-- ---- a type whose equality does not preserve the representation ---------
+/*
+ * numeric 1.0 and 1.00 are equal and share one posting-set entry, but they
+ * are different strings, and the entry keeps whichever of them was indexed
+ * first.  Printing that key could produce a value no visible row holds, so
+ * every value-producing shape steps aside; counting the class is exact
+ * either way and is still pushed down (the 2026-09-20 review, finding 4).
+ */
+CREATE TABLE rbi_pdn (v numeric NOT NULL);
+INSERT INTO rbi_pdn SELECT 1.0 FROM generate_series(1, 20000);
+INSERT INTO rbi_pdn SELECT 1.00 FROM generate_series(1, 20000);
+INSERT INTO rbi_pdn SELECT 2.5 FROM generate_series(1, 20000);
+CREATE INDEX rbi_pdn_v ON rbi_pdn USING roaring (v);
+VACUUM ANALYZE rbi_pdn;
+SELECT entries FROM roaring_index_stats('rbi_pdn_v');
+ entries 
+---------
+       2
+(1 row)
+
+SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdn GROUP BY v');
+         rbi_pd          
+-------------------------
+ not pushed down, 2 rows
+(1 row)
+
+SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdn WHERE v = 1.000 GROUP BY v');
+         rbi_pd          
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+/*
+ * With every other plan disabled the node would be chosen if the planner had
+ * built it at all, which makes the two answers here the plan-time rule and
+ * not the cost model: no node for the grouping, and the count as before.
+ */
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT rbi_plans('SELECT v, count(*) FROM rbi_pdn GROUP BY v');
+         rbi_plans         
+---------------------------
+ -- on:
+ HashAggregate
+   Group Key: v
+   ->  Seq Scan on rbi_pdn
+         Disabled: true
+ -- off:
+ HashAggregate
+   Group Key: v
+   ->  Seq Scan on rbi_pdn
+         Disabled: true
+(10 rows)
+
+SELECT rbi_plans('SELECT count(*) FROM rbi_pdn WHERE v = 1.000');
+                rbi_plans                 
+------------------------------------------
+ -- on:
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_pdn_v (v = 1.000)
+ -- off:
+ Aggregate
+   ->  Seq Scan on rbi_pdn
+         Disabled: true
+         Filter: (v = 1.000)
+(8 rows)
+
+SELECT rbi_pd('SELECT count(*) FROM rbi_pdn WHERE v = 1.000');
+       rbi_pd        
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT v, count(*) FROM rbi_pdn GROUP BY v ORDER BY v;
+  v  | count 
+-----+-------
+ 1.0 | 40000
+ 2.5 | 20000
+(2 rows)
+
+DROP TABLE rbi_pdn;
+DROP TABLE rbi_pdv;
+DROP TABLE rbi_pdc;
+DROP OPERATOR CLASS rbi_lower_ops USING roaring;
+DROP OPERATOR === (text, text);
+DROP FUNCTION rbi_lower_eq(text, text);
+DROP FUNCTION rbi_lower_hash(text);
+DROP TABLE rbi_pdw;
 DROP TABLE rbi_pdd;
 DROP TABLE rbi_pde;
 DROP TABLE rbi_pdt;

@@ -1059,18 +1059,22 @@ rbi_verify_heapallindexed(RBIVerifyState *vs)
 
 	/*
 	 * A new snapshot is guaranteed to have every entry the index needs, but
-	 * at higher isolation levels an old transaction snapshot may predate the
-	 * index's indcheckxmin horizon, in which case it is not safe to use.
+	 * an old transaction snapshot may predate the index's indcheckxmin
+	 * horizon, in which case it is not safe to use.  That test - and the
+	 * validity/readiness tests next to it - are the planner's, shared with
+	 * the SQL count functions in rbi_index_usable().
 	 */
-	if (IsolationUsesXactSnapshot() && vs->index->rd_index->indcheckxmin &&
-		!TransactionIdPrecedes(HeapTupleHeaderGetXmin(vs->index->rd_indextuple->t_data),
-							   snapshot->xmin))
 	{
-		UnregisterSnapshot(snapshot);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("index \"%s\" cannot be verified using transaction snapshot",
-						RelationGetRelationName(vs->index))));
+		const char *why;
+
+		if (!rbi_index_usable(vs->index, snapshot, &why))
+		{
+			UnregisterSnapshot(snapshot);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot verify index \"%s\" against the heap because %s",
+							RelationGetRelationName(vs->index), why)));
+		}
 	}
 
 	/*

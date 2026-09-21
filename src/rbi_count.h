@@ -235,7 +235,11 @@ extern void rbi_entry_scan_end(RBIEntryScan *es);
  * Shared helpers
  * --------------------------------------------------------------------- */
 
-/* Oid of the "roaring" access method, cached for the life of the backend. */
+/*
+ * Oid of the "roaring" access method, from the AMNAME syscache (never a
+ * process-local static: DROP EXTENSION + CREATE EXTENSION in one backend
+ * gives the access method a new Oid).
+ */
 extern Oid	rbi_get_am_oid(void);
 
 /* ---------------------------------------------------------------------

@@ -149,6 +149,31 @@ rbi_keynode_flat(RBIKeyNodeKind kind, int nkeys)
  * --------------------------------------------------------------------- */
 
 /*
+ * One extracted key's hash and its position in the extraction function's
+ * array, sorted by hash so that equal keys become adjacent.  The position is
+ * the tie-break, so the order is deterministic whatever qsort does with equal
+ * elements.
+ */
+typedef struct RBIHashPos
+{
+	uint32		hash;
+	int32		pos;
+} RBIHashPos;
+
+static int
+rbi_hashpos_cmp(const void *a, const void *b)
+{
+	const RBIHashPos *x = (const RBIHashPos *) a;
+	const RBIHashPos *y = (const RBIHashPos *) b;
+
+	if (x->hash < y->hash)
+		return -1;
+	if (x->hash > y->hash)
+		return 1;
+	return (x->pos < y->pos) ? -1 : ((x->pos > y->pos) ? 1 : 0);
+}
+
+/*
  * Extract the keys of one indexed value.
  *
  * NULL keys are dropped: a row whose array holds a NULL element is indexed
@@ -158,13 +183,19 @@ rbi_keynode_flat(RBIKeyNodeKind kind, int nkeys)
  * because a posting set is a set and adding the same TID twice would make
  * rbi_container_add() report "already indexed" and leave ntids wrong.
  *
- * The dedupe is quadratic in the number of keys of ONE row.  Sorting would
- * need an ordering operator the key type is not required to have (the opclass
- * only promises a hash and an equality), so instead every key is hashed once
- * and the inner loop compares hashes: an equality call only happens for a
- * pair that really might be equal.  A tsvector of three hundred lexemes
- * therefore costs 300 hashes and 45000 integer comparisons rather than 45000
- * function calls.
+ * Deduplication needs no ordering operator the key type may not have (the
+ * opclass only promises a hash and an equality): every key is hashed once and
+ * the keys are sorted BY THEIR HASH, which puts the only candidates for
+ * equality - the keys with the same hash - next to each other.  Each key is
+ * then compared with the equality proc against the distinct keys of its own
+ * hash run only, which is one key in every case but a hash collision.  So a
+ * tsvector of n lexemes costs n hashes, one sort and about n equality calls,
+ * rather than the n^2/2 hash comparisons the first implementation of this
+ * function did (a three-hundred-lexeme document: 45000 of them).
+ *
+ * The keys come out in hash order rather than in the order the extraction
+ * function returned them.  Nothing depends on the order: each key is inserted
+ * into its own bucket, and the build sorts by (hash, code) anyway.
  *
  * Returns the number of distinct non-NULL keys and puts them in *keys, which
  * is palloc'd in the current context (NULL when there are none).  Zero means
@@ -177,8 +208,10 @@ rbi_extract_value(RBIState *state, Datum value, Datum **keys)
 	int32		nraw = 0;
 	bool	   *nulls = NULL;
 	Datum	   *out;
-	uint32	   *hashes;
+	RBIHashPos *ord;
+	int			nlive = 0;
 	int			nout = 0;
+	int			runstart = 0;	/* where this hash's distinct keys start */
 	int			i;
 	int			j;
 
@@ -194,48 +227,55 @@ rbi_extract_value(RBIState *state, Datum value, Datum **keys)
 	if (nraw <= 0 || raw == NULL)
 		return 0;
 
-	out = (Datum *) palloc(sizeof(Datum) * nraw);
-	hashes = (uint32 *) palloc(sizeof(uint32) * nraw);
-
+	/* Hash every non-NULL key once, then sort those hashes. */
+	ord = (RBIHashPos *) palloc(sizeof(RBIHashPos) * nraw);
 	for (i = 0; i < nraw; i++)
 	{
-		uint32		hash;
-		bool		dup = false;
-
 		if (nulls != NULL && nulls[i])
 			continue;
+		ord[nlive].hash = rbi_hash_key(state, raw[i]);
+		ord[nlive].pos = i;
+		nlive++;
+	}
 
-		hash = rbi_hash_key(state, raw[i]);
+	if (nlive == 0)
+	{
+		pfree(ord);
+		return 0;
+	}
+	if (nlive > 1)
+		qsort(ord, (size_t) nlive, sizeof(RBIHashPos), rbi_hashpos_cmp);
 
-		for (j = 0; j < nout; j++)
+	out = (Datum *) palloc(sizeof(Datum) * nlive);
+
+	for (i = 0; i < nlive; i++)
+	{
+		Datum		key = raw[ord[i].pos];
+		bool		dup = false;
+
+		/* A new hash value starts a new run of possible equals. */
+		if (i > 0 && ord[i].hash != ord[i - 1].hash)
+			runstart = nout;
+
+		for (j = runstart; j < nout; j++)
 		{
-			if (hashes[j] != hash)
-				continue;
 			if (DatumGetBool(FunctionCall2Coll(&state->eqproc,
 											   state->collation,
-											   out[j], raw[i])))
+											   out[j], key)))
 			{
 				dup = true;
 				break;
 			}
 		}
 		if (!dup)
-		{
-			hashes[nout] = hash;
-			out[nout++] = raw[i];
-		}
+			out[nout++] = key;
 
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	pfree(hashes);
+	pfree(ord);
 
-	if (nout == 0)
-	{
-		pfree(out);
-		return 0;
-	}
-
+	Assert(nout > 0);
 	*keys = out;
 	return nout;
 }

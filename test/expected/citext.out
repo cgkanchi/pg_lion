@@ -85,5 +85,96 @@ SELECT count(*) FROM rbi_ci WHERE name = 'ALICE';
 (1 row)
 
 DROP TABLE rbi_ci;
+-- ---- the stored key is one representative of an equality class ----------
+/*
+ * An entry keeps the spelling it was created with, for the whole class.  Once
+ * every row of that spelling is gone the stored key is a value no visible row
+ * holds, so a pushdown that would PRINT it - the GROUP BY column, or a column
+ * a WHERE clause pins - has to step aside and let the ordinary aggregate read
+ * the value off a live row (the 2026-09-20 review, finding 4).  Counting the
+ * class is exact whatever it is spelled like, and is still pushed down.
+ */
+RESET enable_seqscan;
+CREATE TABLE rbi_cirep (name citext NOT NULL);
+INSERT INTO rbi_cirep VALUES ('SecretOldSpelling');
+CREATE INDEX rbi_cirep_name ON rbi_cirep USING roaring (name);
+DELETE FROM rbi_cirep;
+INSERT INTO rbi_cirep SELECT 'secretoldspelling' FROM generate_series(1, 10000);
+VACUUM ANALYZE rbi_cirep;
+-- one entry, and the key in it is the spelling that was deleted
+SELECT entries FROM roaring_index_stats('rbi_cirep_name');
+ entries 
+---------
+       1
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT name, count(*) FROM rbi_cirep GROUP BY name;
+         QUERY PLAN          
+-----------------------------
+ HashAggregate
+   Group Key: name
+   ->  Seq Scan on rbi_cirep
+(3 rows)
+
+SELECT name, count(*) FROM rbi_cirep GROUP BY name;
+       name        | count 
+-------------------+-------
+ secretoldspelling | 10000
+(1 row)
+
+SELECT left(name::text, 1) AS first_letter, count(*) FROM rbi_cirep GROUP BY name;
+ first_letter | count 
+--------------+-------
+ s            | 10000
+(1 row)
+
+-- a column a clause pins is printed from the same key, and steps aside too
+EXPLAIN (COSTS OFF)
+SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+                      QUERY PLAN                      
+------------------------------------------------------
+ GroupAggregate
+   ->  Seq Scan on rbi_cirep
+         Filter: (name = 'SECRETOLDSPELLING'::citext)
+(3 rows)
+
+SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+       name        | count 
+-------------------+-------
+ secretoldspelling | 10000
+(1 row)
+
+-- counting needs no representative: still the custom node
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING';
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_cirep_name (name = SECRETOLDSPELLING)
+(2 rows)
+
+SELECT count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING';
+ count 
+-------
+ 10000
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_cirep GROUP BY name;
+         QUERY PLAN          
+-----------------------------
+ HashAggregate
+   Group Key: name
+   ->  Seq Scan on rbi_cirep
+         Disabled: true
+(4 rows)
+
+SELECT count(*) FROM rbi_cirep GROUP BY name;
+ count 
+-------
+ 10000
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE rbi_cirep;
 DROP EXTENSION roaring_index_citext;
 DROP EXTENSION citext;

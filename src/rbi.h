@@ -471,6 +471,16 @@ extern bool rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf,
 /* Clamp a requested bucket count into [1, RBI_MAX_BUCKETS]; no rounding. */
 extern uint32 rbi_clamp_buckets(int64 nbuckets);
 
+/*
+ * May this transaction use index for a query under snapshot?  Requires
+ * indisvalid and indisready, and honours indcheckxmin exactly as the planner
+ * does in get_relation_info().  Callers that open an index by name (the SQL
+ * count functions, the verifier) must ask, because nothing else checked for
+ * them; *why receives the reason when the answer is false.
+ */
+extern bool rbi_index_usable(Relation index, Snapshot snapshot,
+							 const char **why);
+
 
 /* ---------- additive helpers (wave 2, insert/vacuum/verify) ---------- */
 

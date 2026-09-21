@@ -250,6 +250,37 @@ SELECT rbi_tscmp($$SELECT grp, count(*) FROM rbi_ts
 				  WHERE tsv @@ to_tsquery('english', 'w1 & w2') GROUP BY grp$$);
 SELECT roaring_index_verify('rbi_ts_tsv', true);
 
+-- ---- the EMPTY entry spilling (2026-09-20 review, finding 1) ----------
+/*
+ * A tsvector with no lexemes belongs to the reserved EMPTY entry, which must
+ * stay the EMPTY entry when its posting set moves onto container pages - the
+ * array case is argued in array.sql; here the rows are empty documents.
+ */
+CREATE TABLE rbi_ts_empty (id int NOT NULL, tsv tsvector);
+CREATE INDEX rbi_ts_empty_tsv ON rbi_ts_empty USING roaring (tsv)
+	WITH (inline_limit = 64);
+INSERT INTO rbi_ts_empty
+SELECT i, CASE WHEN i % 2 = 0 THEN to_tsvector('simple', '')
+			   ELSE to_tsvector('simple', 'onlyword') END
+  FROM generate_series(1, 6000) i;
+-- one EMPTY entry with 3000 rows and one lexeme entry, both spilled
+SELECT entries, inline_entries, null_tids, empty_tids,
+	   container_pages > 0 AS spilled
+  FROM roaring_index_stats('rbi_ts_empty_tsv');
+SELECT roaring_index_verify('rbi_ts_empty_tsv', true);
+-- these rows must join the EMPTY entry, not start a second one
+INSERT INTO rbi_ts_empty VALUES (10001, to_tsvector('simple', '')), (10002, NULL);
+SELECT entries, null_tids, empty_tids
+  FROM roaring_index_stats('rbi_ts_empty_tsv');
+SELECT roaring_index_verify('rbi_ts_empty_tsv', true);
+-- and once more after a VACUUM has rewritten the entries
+DELETE FROM rbi_ts_empty WHERE id % 4 = 0;
+VACUUM rbi_ts_empty;
+SELECT entries, null_tids, empty_tids
+  FROM roaring_index_stats('rbi_ts_empty_tsv');
+SELECT roaring_index_verify('rbi_ts_empty_tsv', true);
+DROP TABLE rbi_ts_empty;
+
 -- ---- max_entries on a lexeme index -------------------------------------
 CREATE TABLE rbi_ts_many (tsv tsvector);
 INSERT INTO rbi_ts_many

@@ -540,9 +540,9 @@ SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{upd,t5}'$$);
 (1 row)
 
 SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{t5}'$$);
-     rbi_arrcmp     
---------------------
- index scan, 1 rows
+     rbi_arrcmp      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 VACUUM rbi_arr;
@@ -585,6 +585,152 @@ SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr
  pushed down, 8 rows
 (1 row)
 
+-- ---- reserved entries that spill (2026-09-20 review, finding 1) --------
+/*
+ * Both key-less entries - the EMPTY entry of §17 and the NULL entry of §14 -
+ * must keep their identity when their posting set outgrows the entry tuple
+ * and moves onto container pages.  rbi_entry_spill() used to preserve only
+ * the NULL flag, so a spilled EMPTY entry came back as an ordinary entry with
+ * a zero-length key: the next empty array could not find it and started a
+ * second one, roaring_index_stats() stopped counting those rows in
+ * empty_tids, and roaring_index_verify() reported a key of length 0.
+ *
+ * inline_limit = 64 makes a posting set spill after a handful of TIDs, and
+ * alternating rows keep the containers from being cheap runs, so the INSERT
+ * path performs the transition for both kinds.
+ */
+CREATE TABLE rbi_arr_res (id int NOT NULL, a int[]);
+CREATE INDEX rbi_arr_res_a ON rbi_arr_res USING roaring (a)
+	WITH (inline_limit = 64);
+INSERT INTO rbi_arr_res
+SELECT i, CASE WHEN i % 2 = 0 THEN '{}'::int[] ELSE '{1}'::int[] END
+  FROM generate_series(1, 10000) i;
+-- exactly two entries: the EMPTY one with 5000 rows, and key 1
+SELECT entries, inline_entries, null_tids, empty_tids,
+	   container_pages > 0 AS spilled
+  FROM roaring_index_stats('rbi_arr_res_a');
+ entries | inline_entries | null_tids | empty_tids | spilled 
+---------+----------------+-----------+------------+---------
+       2 |              0 |         0 |       5000 | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_arr_res_a', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+-- the same for the NULL entry, in the same index
+INSERT INTO rbi_arr_res
+SELECT i, CASE WHEN i % 2 = 0 THEN NULL ELSE '{2}'::int[] END
+  FROM generate_series(10001, 14000) i;
+-- four entries, all of them chains now: EMPTY, NULL, key 1, key 2
+SELECT entries, inline_entries, null_tids, empty_tids
+  FROM roaring_index_stats('rbi_arr_res_a');
+ entries | inline_entries | null_tids | empty_tids 
+---------+----------------+-----------+------------
+       4 |              0 |      2000 |       5000
+(1 row)
+
+SELECT roaring_index_verify('rbi_arr_res_a', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+-- The proof that the spilled entries are still the reserved ones: these two
+-- rows must JOIN them instead of creating a third and fourth key-less entry.
+INSERT INTO rbi_arr_res VALUES (20001, '{}'), (20002, NULL);
+SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_res_a');
+ entries | null_tids | empty_tids 
+---------+-----------+------------
+       4 |      2001 |       5001
+(1 row)
+
+SELECT roaring_index_verify('rbi_arr_res_a', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_res WHERE a @> '{}'$$);
+     rbi_arrcmp     
+--------------------
+ index scan, 1 rows
+(1 row)
+
+SELECT rbi_arrcmp($$SELECT id FROM rbi_arr_res WHERE a IS NULL AND id > 13990$$);
+     rbi_arrcmp     
+--------------------
+ index scan, 6 rows
+(1 row)
+
+/*
+ * VACUUM performs the same transition: each key here is clustered, so the
+ * build gives it a couple of run containers that fit in the entry tuple;
+ * deleting every other row turns each of them into a bitset, and the entry no
+ * longer fits inline, so ambulkdelete spills it while rewriting it
+ * (test/sql/vacuum.sql does the same thing to ordinary keys).
+ */
+CREATE TABLE rbi_arr_res2 (id int NOT NULL, a int[]);
+INSERT INTO rbi_arr_res2
+SELECT i, CASE WHEN i <= 10000 THEN '{}'::int[]
+			   WHEN i <= 20000 THEN NULL
+			   ELSE '{7}'::int[] END
+  FROM generate_series(1, 30000) i;
+CREATE INDEX rbi_arr_res2_a ON rbi_arr_res2 USING roaring (a);
+-- three INLINE entries: EMPTY, NULL and key 7, runs of clustered TIDs
+SELECT entries, inline_entries, run_containers, null_tids, empty_tids,
+	   container_pages > 0 AS spilled
+  FROM roaring_index_stats('rbi_arr_res2_a');
+ entries | inline_entries | run_containers | null_tids | empty_tids | spilled 
+---------+----------------+----------------+-----------+------------+---------
+       3 |              3 |              5 |     10000 |      10000 | f
+(1 row)
+
+DELETE FROM rbi_arr_res2 WHERE id % 2 = 0;
+VACUUM rbi_arr_res2;
+-- every entry has spilled during the VACUUM, reserved ones included
+SELECT entries, inline_entries, bitset_containers, null_tids, empty_tids,
+	   container_pages > 0 AS spilled
+  FROM roaring_index_stats('rbi_arr_res2_a');
+ entries | inline_entries | bitset_containers | null_tids | empty_tids | spilled 
+---------+----------------+-------------------+-----------+------------+---------
+       3 |              0 |                 3 |      5000 |       5000 | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_arr_res2_a', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+INSERT INTO rbi_arr_res2 VALUES (20001, '{}'), (20002, NULL);
+SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_res2_a');
+ entries | null_tids | empty_tids 
+---------+-----------+------------
+       3 |      5001 |       5001
+(1 row)
+
+SELECT roaring_index_verify('rbi_arr_res2_a', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_res2 WHERE a @> '{}'$$);
+     rbi_arrcmp     
+--------------------
+ index scan, 1 rows
+(1 row)
+
+SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_res2 WHERE a IS NULL$$);
+     rbi_arrcmp     
+--------------------
+ index scan, 1 rows
+(1 row)
+
+DROP TABLE rbi_arr_res, rbi_arr_res2;
 -- ---- a partitioned table (DESIGN.md §16 meets §17) ---------------------
 CREATE TABLE rbi_arr_part (id int, grp int, tags text[]) PARTITION BY RANGE (id);
 CREATE TABLE rbi_arr_p1 PARTITION OF rbi_arr_part FOR VALUES FROM (0) TO (2000);

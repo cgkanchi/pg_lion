@@ -35,6 +35,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/nbtree.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
@@ -68,6 +69,7 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 #include "storage/predicate.h"
 
@@ -126,39 +128,52 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 /*
  * What the planner decided, in a form the executor can be handed through
  * custom_private.  Everything in there has to be a copyable/serialisable
- * node, so it is six plain lists plus one filled in at plan time:
+ * node, so it is seven plain lists plus one filled in at plan time, behind a
+ * shape marker:
  *
- *	0	OidList: heap Oid, group index Oid (InvalidOid if none), then one
+ *	0	IntList: RBI_PRIV_MAGIC and RBI_PRIV_NMEMBERS.  The list is
+ *		positional, so the executor checks this before reading anything else:
+ *		a plan made by a differently shaped build of this library (a cached
+ *		plan across an upgrade, a hand-built node) is then an error and not a
+ *		list silently read at the wrong offsets.  Bump RBI_PRIV_MAGIC whenever
+ *		the meaning of a member changes without its position doing so.
+ *	1	OidList: heap Oid, group index Oid (InvalidOid if none), then one
  *		Oid per WHERE clause, in the same order as the other lists.  For a
  *		partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
  *		column names against it) and every index Oid is InvalidOid: the real
  *		ones are per partition, in RBI_PRIV_PARTS.
- *	1	IntList: base RT index, group attnum (0 if none), the RBI_FLAG_* bits,
+ *	2	IntList: base RT index, group attnum (0 if none), the RBI_FLAG_* bits,
  *		then one attnum per WHERE clause.  Attnums are the PARENT's
  *		throughout; each partition's own numbering lives in its index Oids.
- *	2	List of Const: one per WHERE clause - the compared value, the array of
+ *	3	List of Const: one per WHERE clause - the compared value, the array of
  *		an IN list, or a NULL placeholder for a null test
- *	3	IntList: RBI_CLAUSE_* for each WHERE clause
- *	4	List of OidList, one per live leaf partition and empty for a plain
+ *	4	IntList: RBI_CLAUSE_* for each WHERE clause
+ *	5	List of OidList, one per live leaf partition and empty for a plain
  *		table (DESIGN.md §16): heap Oid, group index Oid (InvalidOid if
  *		none), then one index Oid per WHERE clause
- *	5	The group column, when there is one: a two-element list holding the
+ *	6	The group column, when there is one: a two-element list holding the
  *		group Var (for its type, typmod and collation) and a one-element
  *		OidList holding the equality operator the planner chose for it.  That
- *		operator is what the cross-partition TupleHashTable groups by.
- *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
+ *		operator is what the cross-partition TupleHashTable groups by, and it
+ *		is the equality every driving index had to agree with at plan time.
+ *	7	OidList: the operator of each WHERE clause (InvalidOid for a null
  *		test), which is what EXPLAIN prints a multi-key clause with
- *	7	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
+ *	8	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
-#define RBI_PRIV_OIDS		0
-#define RBI_PRIV_INTS		1
-#define RBI_PRIV_CONSTS		2
-#define RBI_PRIV_CLAUSEKINDS 3
-#define RBI_PRIV_PARTS		4
-#define RBI_PRIV_GROUPKEY	5
-#define RBI_PRIV_CLAUSEOPS	6
-#define RBI_PRIV_TLKINDS	7
+#define RBI_PRIV_VERSION	0
+#define RBI_PRIV_OIDS		1
+#define RBI_PRIV_INTS		2
+#define RBI_PRIV_CONSTS		3
+#define RBI_PRIV_CLAUSEKINDS 4
+#define RBI_PRIV_PARTS		5
+#define RBI_PRIV_GROUPKEY	6
+#define RBI_PRIV_CLAUSEOPS	7
+#define RBI_PRIV_TLKINDS	8
+
+/* Shape of the list above: "RBI" and a shape version, and its length. */
+#define RBI_PRIV_MAGIC		0x52424901
+#define RBI_PRIV_NMEMBERS	9
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -372,6 +387,112 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
 	}
 
 	return NULL;
+}
+
+/*
+ * The equality operator an index's opclass defines on its own key type: the
+ * relation whose classes its entries are.  A scalar roaring opclass always
+ * has it (the AM requires strategy 1), but an opfamily that only declares
+ * cross-type members for (opcintype, opcintype) would not, and then nothing
+ * below can be proved about the index.
+ */
+static Oid
+rbi_index_equality_op(IndexOptInfo *idx)
+{
+	return get_opfamily_member(idx->opfamily[0], idx->opcintype[0],
+							   idx->opcintype[0], RBI_STRAT_EQUAL);
+}
+
+/*
+ * Does equality on this type imply that equal values have the same binary
+ * representation?
+ *
+ * This is the question btree deduplication asks before it may replace one
+ * tuple with another that compares equal (_bt_allequalimage() in
+ * src/backend/access/nbtree/nbtutils.c), and it is exactly the question the
+ * count pushdown has to ask before it prints a key an index stored instead of
+ * a value a visible row holds: a posting set keeps ONE representative per
+ * equality class, and if the type allows two equal values to look different
+ * (citext 'Bob'/'BOB', numeric 1.0/1.00, a nondeterministic collation) that
+ * representative may be a spelling no visible row contains (the 2026-09-20
+ * review, finding 4).
+ *
+ * The test is the type's DEFAULT btree opclass (lookup_type_cache with
+ * TYPECACHE_BTREE_OPFAMILY, the same family SortGroupClause.eqop comes from),
+ * its BTEQUALIMAGE_PROC support function, called under the collation the
+ * index compared its keys with - which is how btequalimage/btvarstrequalimage
+ * decide determinism.  No support function means no (that is btree's rule as
+ * well).
+ */
+static bool
+rbi_type_equalimage(Oid typid, Oid collation)
+{
+	TypeCacheEntry *typentry;
+	Oid			proc;
+
+	typentry = lookup_type_cache(typid, TYPECACHE_BTREE_OPFAMILY);
+	if (!OidIsValid(typentry->btree_opf) || !OidIsValid(typentry->btree_opintype))
+		return false;
+
+	proc = get_opfamily_proc(typentry->btree_opf, typentry->btree_opintype,
+							 typentry->btree_opintype, BTEQUALIMAGE_PROC);
+	if (!OidIsValid(proc))
+		return false;
+
+	/*
+	 * A collatable type's support function insists on being told a collation
+	 * (check_collation_set() in btvarstrequalimage()), so a key type that has
+	 * one but an index that does not is simply refused here.
+	 */
+	if (OidIsValid(get_typcollation(typentry->btree_opintype)) &&
+		!OidIsValid(collation))
+		return false;
+
+	return DatumGetBool(OidFunctionCall1Coll(proc, collation,
+											 ObjectIdGetDatum(typentry->btree_opintype)));
+}
+
+/*
+ * May the node print a value taken from this index's stored keys?
+ *
+ * Two things have to hold, and both are properties of the index rather than
+ * of the query, so they are checked once per relation (per partition: nothing
+ * stops two partitions from using different opclasses):
+ *
+ *	- the index's own equality has to BE the type's equality, so that "in the
+ *	  same entry" implies "equal" in the sense the next test is about.  The
+ *	  index groups rows by strategy 1 of its opfamily, which is free to be a
+ *	  coarser relation than the type's default equality (the review's
+ *	  lower()-based text opclass is a valid opclass and a coarser one);
+ *	- and equality has to imply an identical representation, or the stored
+ *	  representative may be a spelling no visible row has.
+ *
+ * When either fails the query may still be pushed down as a COUNT: counting
+ * an equality class needs no representative.  Only value-producing pushdowns
+ * - the GROUP BY column in the output, or a column a WHERE clause pins whose
+ * value the target list prints - come through here.
+ */
+static bool
+rbi_index_can_emit_value(IndexOptInfo *idx)
+{
+	Oid			typid = idx->opcintype[0];
+	Oid			idxeq = rbi_index_equality_op(idx);
+	TypeCacheEntry *typentry;
+	Oid			typeeq;
+
+	if (!OidIsValid(idxeq))
+		return false;
+
+	typentry = lookup_type_cache(typid, TYPECACHE_BTREE_OPFAMILY);
+	if (!OidIsValid(typentry->btree_opf) || !OidIsValid(typentry->btree_opintype))
+		return false;
+	typeeq = get_opfamily_member(typentry->btree_opf, typentry->btree_opintype,
+								 typentry->btree_opintype,
+								 BTEqualStrategyNumber);
+	if (!OidIsValid(typeeq) || typeeq != idxeq)
+		return false;
+
+	return rbi_type_equalimage(typid, idx->indexcollations[0]);
 }
 
 /*
@@ -614,12 +735,31 @@ typedef struct RBIClauseInfo
 	StrategyNumber strategy;	/* multi-key clauses only */
 	Oid			extractquery;	/* multi-key clauses only */
 	Oid			collation;		/* clause input collation; InvalidOid if the operator ignores it */
+	bool		valueout;		/* the target list prints this column's value,
+								 * so the index has to be able to produce it
+								 * (rbi_index_can_emit_value()) */
 } RBIClauseInfo;
 
+/*
+ * Everything the driving index of one relation has to satisfy, gathered once
+ * by rbi_try_count_path() and applied to every partition's own index.
+ */
+typedef struct RBIDriveInfo
+{
+	AttrNumber	attno;			/* in the PARENT's numbering, 0 for none */
+	Oid			collation;		/* the grouping column's collation, or none */
+	Oid			eqop;			/* GROUP BY: the equality the index must have
+								 * as strategy 1 of its opfamily; InvalidOid
+								 * when nothing groups (the sum-over-all of
+								 * DESIGN.md §14 does not care how the entries
+								 * partition the rows) */
+	bool		valueout;		/* the group key appears in the output */
+} RBIDriveInfo;
+
 static bool
-rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
-					Oid drivecoll, List *whereattnos, List *clauseinfos,
-					List **targets)
+rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
+					const RBIDriveInfo *drive, List *whereattnos,
+					List *clauseinfos, List **targets)
 {
 	RangeTblEntry *rte;
 	RBICountTarget *t;
@@ -651,18 +791,19 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 		for (i = 0; i < rel->nparts; i++)
 		{
 			RelOptInfo *child = rel->part_rels[i];
+			RBIDriveInfo cdrive = *drive;
 			List	   *cattnos = NIL;
-			AttrNumber	cdrive = 0;
 
 			if (child == NULL || !bms_is_member(i, rel->live_parts))
 				continue;		/* pruned at plan time */
 			if (IS_DUMMY_REL(child))
 				continue;		/* provably empty: it counts nothing */
 
-			if (driveattno != 0)
+			if (drive->attno != 0)
 			{
-				cdrive = rbi_child_attno(root, child->relid, driveattno);
-				if (cdrive == 0)
+				cdrive.attno = rbi_child_attno(root, child->relid,
+											   drive->attno);
+				if (cdrive.attno == 0)
 					return false;
 			}
 			foreach(l1, whereattnos)
@@ -675,7 +816,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 				cattnos = lappend_int(cattnos, (int) ca);
 			}
 
-			if (!rbi_collect_targets(root, child, cdrive, drivecoll, cattnos,
+			if (!rbi_collect_targets(root, child, &cdrive, cattnos,
 									 clauseinfos, targets))
 				return false;
 		}
@@ -702,14 +843,39 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 	 * over - must be a scalar one: its entries have to be the column's
 	 * values, one per row.
 	 */
-	if (driveattno != 0)
+	if (drive->attno != 0)
 	{
-		t->driveidx = rbi_find_roaring_index(rel, driveattno, false);
+		t->driveidx = rbi_find_roaring_index(rel, drive->attno, false);
 		if (t->driveidx == NULL)
 			return false;
 		/* Grouping under one collation, index built under another: no. */
-		if (OidIsValid(drivecoll) &&
-			t->driveidx->indexcollations[0] != drivecoll)
+		if (OidIsValid(drive->collation) &&
+			t->driveidx->indexcollations[0] != drive->collation)
+			return false;
+
+		/*
+		 * Grouping asks for the groups of ONE equality relation, and the
+		 * index's entries are the classes of its own opclass equality.  A
+		 * matching collation does not make those the same relation: an
+		 * opclass may define a coarser equality on the same type (a text
+		 * opclass over lower(), say), and then its entries are already
+		 * merged groups that no amount of cross-partition merging can take
+		 * apart.  So strategy 1 of this index's opfamily, on its own key
+		 * type, has to be the very operator the planner chose for the
+		 * grouping column (the 2026-09-20 review, finding 3).  This also
+		 * covers the count(col) cases of DESIGN.md §14 that read the group
+		 * column's entries (a real group is count(*), the NULL group is 0),
+		 * because they are only reached through a grouping index.
+		 */
+		if (OidIsValid(drive->eqop) &&
+			rbi_index_equality_op(t->driveidx) != drive->eqop)
+			return false;
+
+		/*
+		 * Printing the group key means printing a key this index stored, so
+		 * it has to be a representation the rows really have (finding 4).
+		 */
+		if (drive->valueout && !rbi_index_can_emit_value(t->driveidx))
 			return false;
 	}
 
@@ -723,6 +889,11 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 
 		if (idx == NULL)
 			return false;
+
+		/* Same rule for a pinned column whose value the output prints. */
+		if (ci->valueout && !rbi_index_can_emit_value(idx))
+			return false;
+
 		t->whereidx = lappend(t->whereidx, idx);
 	}
 
@@ -838,6 +1009,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		dirty_pages;
 	double		matching = Max(rel->rows, 1.0);
 	double		containers_per_key;
 	double		random_pages = 0;	/* bucket page lookups */
@@ -884,13 +1056,31 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * to say so: every TID whose heap block the visibility map cannot vouch
 	 * for is fetched from the heap.  Charge cpu_tuple_cost for each of them
 	 * and one random page fetch per distinct block they are expected to
-	 * touch.  Assuming a distinct block per rechecked TID (capped by the size
-	 * of the heap) is pessimistic on purpose: a thousand groups of one TID
-	 * per block on a heap that is not all-visible has to lose to a sequential
-	 * scan, because that is exactly what it would do.
+	 * touch.
+	 *
+	 * The blocks that can be touched are only the ones the visibility map
+	 * cannot vouch for - heap_pages * dirtyfrac, from the same
+	 * relallvisible/relpages the TID estimate comes from - and a single count
+	 * visits each of them at most once, because it walks the merged result in
+	 * TID order.  Charging random reads across the WHOLE heap instead made
+	 * the model refuse the pushdown on freshly vacuumed tables, where it is
+	 * at its best (the 2026-09-20 review, finding 5).
+	 *
+	 * A GROUP BY is the case that really does return to a block repeatedly:
+	 * every group whose rows include a tuple on a dirty block pins it again,
+	 * so the visits are numgroups per dirty block, bounded by the number of
+	 * rechecked TIDs (a block cannot be visited more often than it has
+	 * candidate TIDs on it).  That keeps the case the model exists for - a
+	 * thousand groups of one TID per block on a heap the visibility map
+	 * cannot vouch for - losing to the sequential scan that would do the
+	 * same work once.
 	 */
+	dirty_pages = Min(heap_pages * dirtyfrac, heap_pages);
 	recheck_tids = matching * dirtyfrac;
-	recheck_pages = Min(recheck_tids, heap_pages);
+	if (groupidx != NULL)
+		recheck_pages = Min(numgroups * dirty_pages, recheck_tids);
+	else
+		recheck_pages = Min(recheck_tids, dirty_pages);
 
 	run = random_pages * random_page_cost;
 	run += seq_pages * seq_page_cost;
@@ -911,7 +1101,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 static void
 rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, double numgroups,
-					double outrows)
+					double outrows, double hashentrysize)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -942,8 +1132,27 @@ rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 
 	cpath->path.rows = outrows;
 	cpath->path.disabled_nodes = 0;
-	/* Without GROUP BY the single output row needs the whole scan first. */
-	cpath->path.startup_cost = (outrows <= 1.0) ? run : 0.0;
+
+	if (hashentrysize > 0.0)
+	{
+		/*
+		 * A partitioned GROUP BY merges the partitions' groups in a hash
+		 * table (DESIGN.md §16) and emits nothing until the last partition
+		 * has been counted: the whole scan is startup work, and the merge
+		 * itself is one materialized entry of hashentrysize bytes per group.
+		 * Charging that makes a plan whose only cost was per-group memory
+		 * comparable with the Agg it replaces (the 2026-09-20 review,
+		 * finding 5); the hard budget is at plan time, in
+		 * rbi_try_count_path().
+		 */
+		run += numgroups * hashentrysize * cpu_operator_cost;
+		cpath->path.startup_cost = run;
+	}
+	else
+	{
+		/* Without GROUP BY the single output row needs the whole scan first. */
+		cpath->path.startup_cost = (outrows <= 1.0) ? run : 0.0;
+	}
 	cpath->path.total_cost = run;
 }
 
@@ -994,6 +1203,10 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		singlegroup = false;
 	bool		sumall = false;
 	bool		partitioned = false;
+	bool		groupvalueout = false;	/* the output prints the group key */
+	List	   *valueattnos = NIL;	/* pinned columns the output prints */
+	RBIDriveInfo drive;
+	double		hashentrysize = 0.0;
 	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
 	List	   *clauseinfos = NIL;	/* RBIClauseInfo, one per clause */
 	List	   *whereclauses = NIL; /* the clause, for selectivity */
@@ -1117,13 +1330,23 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		groupattno = groupvar->varattno;
 
 		/*
-		 * The groups of all the partitions are merged in a TupleHashTable
-		 * (DESIGN.md §16) built from the equality operator the planner chose
-		 * for this grouping column, so that column has to be hashable.  One
-		 * table needs no merging and does not care.
+		 * The equality the planner chose for this column is what the index
+		 * that drives the scan has to implement, whether there is one
+		 * relation or many (rbi_collect_targets(), finding 3 of the
+		 * 2026-09-20 review), so a grouping clause without one is of no use
+		 * here.
 		 */
 		groupeqop = sgc->eqop;
-		if (partitioned && (!sgc->hashable || !OidIsValid(groupeqop)))
+		if (!OidIsValid(groupeqop))
+			return;
+
+		/*
+		 * The groups of all the partitions are merged in a TupleHashTable
+		 * (DESIGN.md §16) built from that operator, so with more than one
+		 * relation the column also has to be hashable.  One table needs no
+		 * merging and does not care.
+		 */
+		if (partitioned && !sgc->hashable)
 			return;
 	}
 
@@ -1427,10 +1650,20 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			 * equal must not change what the query prints.  A column pinned
 			 * to NULL by `IS NULL` prints NULL, which the stored key of the
 			 * reserved entry says as well.
+			 *
+			 * Either way the value comes out of an index entry, so the index
+			 * has to be one whose entries can produce it - which is decided
+			 * per relation, once the indexes are known.  `IS NULL` is exempt:
+			 * NULL has one representation.
 			 */
-			if (!(groupvar != NULL && v->varattno == groupvar->varattno) &&
-				!list_member_int(eqattnos, (int) v->varattno) &&
-				!list_member_int(nullattnos, (int) v->varattno))
+			if (groupvar != NULL && v->varattno == groupvar->varattno)
+				groupvalueout = true;
+			else if (list_member_int(eqattnos, (int) v->varattno))
+			{
+				if (!list_member_int(valueattnos, (int) v->varattno))
+					valueattnos = lappend_int(valueattnos, (int) v->varattno);
+			}
+			else if (!list_member_int(nullattnos, (int) v->varattno))
 				return;
 		}
 		else if (IsA(node, Aggref))
@@ -1447,6 +1680,20 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 
 	/*
+	 * Which clauses have to produce a value, rather than just select rows: a
+	 * value-producing pushdown needs an index whose stored keys are a
+	 * representation the rows themselves have (finding 4 of the 2026-09-20
+	 * review), and that is checked per relation below.
+	 */
+	foreach(lc, clauseinfos)
+	{
+		RBIClauseInfo *ci = (RBIClauseInfo *) lfirst(lc);
+
+		ci->valueout = (ci->kind == RBI_CLAUSE_EQ &&
+						list_member_int(valueattnos, (int) ci->attno));
+	}
+
+	/*
 	 * ---- the relations to count, and the indexes on each of them ----
 	 *
 	 * One table, or one live leaf partition at a time (DESIGN.md §16).  The
@@ -1454,9 +1701,12 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * onto each partition through its AppendRelInfo before looking an index
 	 * up, because partitions may number their columns differently.
 	 */
-	if (!rbi_collect_targets(root, input_rel, driveattno,
-							 (groupvar != NULL) ? groupvar->varcollid : InvalidOid,
-							 whereattnos,
+	drive.attno = driveattno;
+	drive.collation = (groupvar != NULL) ? groupvar->varcollid : InvalidOid;
+	drive.eqop = (groupvar != NULL) ? groupeqop : InvalidOid;
+	drive.valueout = groupvalueout;
+
+	if (!rbi_collect_targets(root, input_rel, &drive, whereattnos,
 							 clauseinfos, &targets))
 		return;
 	if (targets == NIL)
@@ -1478,6 +1728,33 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		numgroups = 1.0;
 
 	outrows = (groupvar != NULL) ? numgroups : 1.0;
+
+	/*
+	 * A partitioned GROUP BY keeps every group of every partition in a
+	 * TupleHashTable until the last partition has been counted (DESIGN.md
+	 * §16), and that table has no spill path: the node cannot fall back to a
+	 * sorted merge the way HashAggregate falls back to disk.  So decline at
+	 * plan time when the estimated table does not fit in the budget
+	 * HashAggregate itself respects - work_mem * hash_mem_multiplier, via
+	 * get_hash_memory_limit() - and let the ordinary Agg, which can spill,
+	 * have the query (the 2026-09-20 review, finding 6).
+	 *
+	 * The estimate is one entry per group: the key (its average width, or its
+	 * length when it is fixed) plus the minimal tuple's header, the hash
+	 * table's own per-entry bookkeeping and the int64 count, for which 64
+	 * bytes is the round number.
+	 */
+	if (partitioned && groupvar != NULL)
+	{
+		int32		width = get_attavgwidth(rte->relid, groupattno);
+
+		if (width <= 0)
+			width = get_typavgwidth(groupvar->vartype, groupvar->vartypmod);
+
+		hashentrysize = (double) (MAXALIGN(width) + 64);
+		if (numgroups * hashentrysize > (double) get_hash_memory_limit())
+			return;
+	}
 
 	/*
 	 * A plain table's own Oids go in RBI_PRIV_OIDS, which is where the
@@ -1552,13 +1829,23 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	cpath->custom_restrictinfo = NIL;
-	cpath->custom_private = list_make5(oids, ints, consts, ckinds, parts);
+	/*
+	 * The shape marker comes first, so that rbi_begin_custom_scan() can
+	 * refuse a list it does not recognise instead of reading it positionally.
+	 */
+	cpath->custom_private = list_make1(list_make2_int(RBI_PRIV_MAGIC,
+													  RBI_PRIV_NMEMBERS));
+	cpath->custom_private = lappend(cpath->custom_private, oids);
+	cpath->custom_private = lappend(cpath->custom_private, ints);
+	cpath->custom_private = lappend(cpath->custom_private, consts);
+	cpath->custom_private = lappend(cpath->custom_private, ckinds);
+	cpath->custom_private = lappend(cpath->custom_private, parts);
 	cpath->custom_private = lappend(cpath->custom_private, groupkey);
 	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
 	cpath->methods = &rbi_count_path_methods;
 
 	rbi_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
-						numgroups, outrows);
+						numgroups, outrows, hashentrysize);
 
 	add_path(output_rel, &cpath->path);
 }
@@ -1890,16 +2177,41 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
 	RBICountScanState *st = (RBICountScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	List	   *oids = (List *) list_nth(cscan->custom_private, RBI_PRIV_OIDS);
-	List	   *ints = (List *) list_nth(cscan->custom_private, RBI_PRIV_INTS);
-	List	   *consts = (List *) list_nth(cscan->custom_private, RBI_PRIV_CONSTS);
-	List	   *ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
-	List	   *partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
-	List	   *groupkey = (List *) list_nth(cscan->custom_private, RBI_PRIV_GROUPKEY);
-	List	   *clauseops = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEOPS);
-	List	   *kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
+	List	   *shape;
+	List	   *oids;
+	List	   *ints;
+	List	   *consts;
+	List	   *ckinds;
+	List	   *partlist;
+	List	   *groupkey;
+	List	   *clauseops;
+	List	   *kinds;
 	int			flags;
 	int			i;
+
+	/*
+	 * custom_private is read positionally, so check that it is the list this
+	 * build writes before reading a single offset of it.  A mismatch means
+	 * the planner half and the executor half of this file have drifted apart
+	 * (or a plan from another build has been handed to us); saying so is far
+	 * better than decoding Oids out of the wrong member.
+	 */
+	shape = (list_length(cscan->custom_private) == RBI_PRIV_NMEMBERS) ?
+		(List *) list_nth(cscan->custom_private, RBI_PRIV_VERSION) : NIL;
+	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
+		linitial_int(shape) != RBI_PRIV_MAGIC ||
+		lsecond_int(shape) != RBI_PRIV_NMEMBERS)
+		elog(ERROR, "RoaringCount: unrecognized custom_private shape (%d members)",
+			 list_length(cscan->custom_private));
+
+	oids = (List *) list_nth(cscan->custom_private, RBI_PRIV_OIDS);
+	ints = (List *) list_nth(cscan->custom_private, RBI_PRIV_INTS);
+	consts = (List *) list_nth(cscan->custom_private, RBI_PRIV_CONSTS);
+	ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
+	partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
+	groupkey = (List *) list_nth(cscan->custom_private, RBI_PRIV_GROUPKEY);
+	clauseops = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEOPS);
+	kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
 
 	st->heapoid = linitial_oid(oids);
 	st->groupidxoid = lsecond_oid(oids);

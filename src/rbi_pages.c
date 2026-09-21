@@ -26,6 +26,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/typcache.h"
 #include "varatt.h"
 
@@ -35,6 +36,78 @@ static void rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off,
 								bool replace, Buffer entrybuf,
 								OffsetNumber entryoff, RBIEntryTuple *entry,
 								RBIContainer **items, int nitems);
+
+/*
+ * May this transaction answer a query from this index at all?
+ *
+ * Every caller that opens a roaring index by name - the SQL count functions,
+ * the verifier - has to make the decision the planner makes for a query that
+ * mentions the table, because the index it was handed was not approved by
+ * anyone.  There are three ways an index can exist and still be unusable:
+ *
+ *	- indisvalid is false: the index is not complete (a failed CREATE INDEX
+ *	  CONCURRENTLY, a failed REINDEX CONCURRENTLY, or an index still being
+ *	  built).  get_relation_info() ignores such an index entirely.
+ *	- indisready is false: it is not even receiving inserts yet, so it is
+ *	  missing rows by construction.
+ *	- indcheckxmin is true and the index tuple's xmin is not yet old enough:
+ *	  the index build found a broken HOT chain and indexed only the LATEST
+ *	  version of it, so a snapshot that can still see an older version of
+ *	  that row cannot use the index (src/backend/access/heap/README.HOT).
+ *	  This is the case that produces a WRONG ANSWER rather than a missing
+ *	  optimisation: the row is not in the posting set the count selects, and
+ *	  no amount of heap rechecking puts back a TID that is not there.
+ *
+ * The indcheckxmin test is the one get_relation_info() applies
+ * (src/backend/optimizer/util/plancat.c): compare against TransactionXmin,
+ * the xmin of the OLDEST snapshot this transaction has taken, which is the
+ * conservative bound for every snapshot it can still use.  A snapshot handed
+ * in explicitly is honoured too when it is somehow older than that.
+ *
+ * Returns true when the index may be used.  Otherwise *why (which may not be
+ * NULL) is set to a short phrase that reads after "because".
+ */
+bool
+rbi_index_usable(Relation index, Snapshot snapshot, const char **why)
+{
+	Form_pg_index idx = index->rd_index;
+	TransactionId limit = TransactionXmin;
+
+	Assert(why != NULL);
+	*why = NULL;
+
+	if (!idx->indisvalid)
+	{
+		*why = "the index is not valid";
+		return false;
+	}
+	if (!idx->indisready)
+	{
+		*why = "the index is not ready for queries";
+		return false;
+	}
+
+	if (!idx->indcheckxmin)
+		return true;
+
+	/*
+	 * TransactionXmin is set from the transaction's first snapshot and never
+	 * moves, so it already covers the caller's snapshot; be conservative
+	 * anyway if the caller brought an older one.
+	 */
+	if (snapshot != NULL && TransactionIdIsValid(snapshot->xmin) &&
+		TransactionIdPrecedes(snapshot->xmin, limit))
+		limit = snapshot->xmin;
+
+	if (!TransactionIdPrecedes(HeapTupleHeaderGetXmin(index->rd_indextuple->t_data),
+							   limit))
+	{
+		*why = "it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot";
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * Clamp a requested bucket count into [1, RBI_MAX_BUCKETS].
@@ -1293,9 +1366,15 @@ rbi_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 	rbi_page_update_minmax(curpage);
 
-	/* Only the INLINE/CHAIN half of the flags changes: the reserved NULL-key
-	 * entry stays the NULL-key entry once its payload moves to a chain. */
-	entry->flags = (entry->flags & RBI_ENTRY_NULLKEY) | RBI_ENTRY_CHAIN;
+	/*
+	 * Only the INLINE/CHAIN half of the flags changes: a reserved entry
+	 * (NULL-key, §14, or empty-key, §17) stays the reserved entry it was once
+	 * its payload moves to a chain.  Losing a reserved bit here would leave a
+	 * key-less entry that rbi_find_reserved_entry() no longer finds and that
+	 * every other reader takes for an ordinary entry with a zero-length key,
+	 * so the next row of that kind would start a second entry.
+	 */
+	entry->flags = (entry->flags & RBI_ENTRY_RESERVED) | RBI_ENTRY_CHAIN;
 	entry->head = head;
 	entry->tail = BufferGetBlockNumber(curbuf);
 	rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
