@@ -1,0 +1,63 @@
+== phase 1: btree only ==
+p_c2_btree_ios                    583.723 ms
+p_c200_btree_ios                    5.672 ms
+p_c20k_btree_ios                    0.181 ms
+p_c1m_btree_ios                     0.123 ms
+p_c200_btree_bitmap                75.303 ms
+and3_btree                         82.203 ms
+grp_c200_btree_ios               1567.854 ms
+grp_c2_btree_ios                 1502.274 ms
+range_c20k_btree_ios                5.876 ms
+fetch_c200_btree                   88.582 ms
+== phase 2: gin only ==
+p_c2_gin_bitmap                  1720.168 ms
+p_c200_gin_bitmap                  88.544 ms
+p_c20k_gin_bitmap                   0.884 ms
+p_c1m_gin_bitmap                    0.139 ms
+and3_gin                          185.536 ms
+range_c20k_gin_bitmap             773.765 ms
+fetch_c200_gin                     89.005 ms
+== phase 2b: roaring AM only ==
+p_c2_roaring_bitmap              1130.341 ms
+p_c200_roaring_bitmap              82.471 ms
+p_c200_clustered_roaring_bitmap        7.053 ms
+p_c20k_roaring_bitmap               0.850 ms
+p_c1m_roaring_bitmap                0.132 ms
+and3_roaring                       65.661 ms
+range_c20k_roaring_bitmap         961.490 ms
+fetch_c200_roaring                 80.513 ms
+== phase 2c: roaring count pushdown (CustomScan) ==
+p_c2_pushdown                       2.507 ms
+p_c200_pushdown                     0.352 ms
+p_c200_clustered_pushdown           0.113 ms
+p_c20k_pushdown                     0.147 ms
+p_c1m_pushdown                      0.115 ms
+and3_pushdown                       4.851 ms
+grp_c200_pushdown                  50.507 ms
+grp_c2_pushdown                     5.172 ms
+== phase 3: seqscan + roaring simulation ==
+grp_c200_seqscan                 2587.499 ms
+grp_c2_seqscan                   2159.614 ms
+p_c2_rb_naive                       2.353 ms
+p_c2_rb_vmall                       3.248 ms
+p_c2_rb_vm95                      195.889 ms
+p_c200_rb_naive                     0.160 ms
+p_c200_rb_vmall                     0.608 ms
+p_c200_rb_vm95                      5.332 ms
+p_c20k_rb_naive                     0.130 ms
+p_c20k_rb_vmall                     0.216 ms
+p_c20k_rb_vm95                      0.431 ms
+p_c1m_rb_naive                      0.123 ms
+p_c1m_rb_vmall                      0.150 ms
+p_c1m_rb_vm95                       0.202 ms
+and3_rb_naive                       6.269 ms
+and3_rb_vm95                        7.378 ms
+grp_c200_rb_naive                   8.362 ms
+grp_c200_rb_vmall                  98.531 ms
+grp_c200_rb_vm95                  933.700 ms
+grp_c2_rb_naive                     5.022 ms
+grp_c2_rb_vmall                     7.020 ms
+grp_c2_rb_vm95                    360.163 ms
+range_c20k_rb_naive                11.708 ms
+fetch_c200_rb_tidscan              59.611 ms
+BENCH_DONE

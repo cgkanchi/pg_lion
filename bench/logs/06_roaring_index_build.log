@@ -1,0 +1,48 @@
+Time: 19.952 ms
+Time: 1.130 ms
+Time: 11076.429 ms (00:11.076)
+Time: 20125.221 ms (00:20.125)
+Time: 18117.174 ms (00:18.117)
+Time: 17361.983 ms (00:17.362)
+Time: 16488.306 ms (00:16.488)
+Time: 9052.286 ms (00:09.052)
+Time: 11703.347 ms (00:11.703)
+Time: 2.939 ms
+           relname           |  size   
+-----------------------------+---------
+ fact_c10_btree              | 132 MB
+ fact_c10_gin                | 23 MB
+ fact_c10_roaring            | 41 MB
+ fact_c1m_btree              | 152 MB
+ fact_c1m_gin                | 199 MB
+ fact_c1m_roaring            | 337 MB
+ fact_c2_btree               | 132 MB
+ fact_c2_gin                 | 21 MB
+ fact_c2_roaring             | 56 MB
+ fact_c200_btree             | 132 MB
+ fact_c200_gin               | 39 MB
+ fact_c200_roaring           | 51 MB
+ fact_c200_clustered_btree   | 132 MB
+ fact_c200_clustered_gin     | 23 MB
+ fact_c200_clustered_roaring | 2120 kB
+ fact_c20k_btree             | 138 MB
+ fact_c20k_gin               | 157 MB
+ fact_c20k_roaring           | 475 MB
+ fact_c_skew_btree           | 133 MB
+ fact_c_skew_gin             | 26 MB
+ fact_c_skew_roaring         | 41 MB
+(21 rows)
+
+Time: 19.010 ms
+       c        | nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers |  ntids   | container_bytes | free_bytes 
+----------------+----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+----------+-----------------+------------
+ c2             |       64 |           64 |       2 |              0 |            7102 |       7104 |                1 |              7102 |              1 | 20000000 |        29148138 |   29211920
+ c10            |       64 |           64 |      10 |              0 |            5143 |      35520 |            35520 |                 0 |              0 | 20000000 |        40284160 |    1893132
+ c200           |       64 |           64 |     200 |              0 |            6399 |     710399 |           710399 |                 0 |              0 | 20000000 |        45683192 |    1997568
+ c20k           |     1024 |         1024 |   20000 |              0 |           59776 |   17429911 |         17429911 |                 0 |              0 | 20000000 |       179439288 |  145913396
+ c1m            |    32768 |        43115 | 1000000 |        1000000 |               0 |   19943621 |         19943621 |                 0 |              0 | 20000000 |       199548968 |  104757032
+ c200_clustered |       64 |           64 |     201 |              1 |             200 |       3752 |                2 |                 0 |           3750 | 20000000 |          947404 |    1158104
+ c_skew         |       64 |           64 |    1000 |              0 |            5180 |    1533383 |          1529831 |                 0 |           3552 | 20000000 |        24223034 |    4071612
+(7 rows)
+
+Time: 378.400 ms

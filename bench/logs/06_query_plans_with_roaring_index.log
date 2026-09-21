@@ -1,0 +1,1290 @@
+### p_c2_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off]
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=8660 read=7
+   I/O Timings: shared read=0.477
+   ->  Index Only Scan using fact_c2_btree on fact (actual rows=10002270.00 loops=1)
+         Index Cond: (c2 = 1)
+         Heap Fetches: 10402
+         Index Searches: 1
+         Buffers: shared hit=8660 read=7
+         I/O Timings: shared read=0.477
+ Planning:
+   Buffers: shared hit=323 read=3
+   I/O Timings: shared read=0.464
+ Planning Time: 2.676 ms
+ Execution Time: 632.553 ms
+(14 rows)
+
+### p_c200_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off]
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=165
+   ->  Index Only Scan using fact_c200_btree on fact (actual rows=100382.00 loops=1)
+         Index Cond: (c200 = 17)
+         Heap Fetches: 86
+         Index Searches: 1
+         Buffers: shared hit=165
+ Planning:
+   Buffers: shared hit=319
+ Planning Time: 2.053 ms
+ Execution Time: 7.422 ms
+(11 rows)
+
+### p_c20k_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off]
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=14
+   ->  Index Only Scan using fact_c20k_btree on fact (actual rows=1025.00 loops=1)
+         Index Cond: (c20k = 123)
+         Heap Fetches: 3
+         Index Searches: 1
+         Buffers: shared hit=14
+ Planning:
+   Buffers: shared hit=319
+ Planning Time: 1.435 ms
+ Execution Time: 0.208 ms
+(11 rows)
+
+### p_c1m_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off]
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=10
+   ->  Index Only Scan using fact_c1m_btree on fact (actual rows=20.00 loops=1)
+         Index Cond: (c1m = 12345)
+         Heap Fetches: 0
+         Index Searches: 1
+         Buffers: shared hit=10
+ Planning:
+   Buffers: shared hit=316
+ Planning Time: 1.723 ms
+ Execution Time: 0.222 ms
+(11 rows)
+
+### p_c200_btree_bitmap  [-c enable_seqscan=off -c enable_indexonlyscan=off -c enable_indexscan=off]
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=81485
+   ->  Bitmap Heap Scan on fact (actual rows=100382.00 loops=1)
+         Recheck Cond: (c200 = 17)
+         Heap Blocks: exact=81398
+         Buffers: shared hit=81485
+         ->  Bitmap Index Scan on fact_c200_btree (actual rows=100382.00 loops=1)
+               Index Cond: (c200 = 17)
+               Index Searches: 1
+               Buffers: shared hit=87
+ Planning:
+   Buffers: shared hit=319
+ Planning Time: 1.052 ms
+ Execution Time: 237.730 ms
+(14 rows)
+
+### and3_btree  [-c enable_seqscan=off]
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=11677
+   ->  Bitmap Heap Scan on fact (actual rows=5044.00 loops=1)
+         Recheck Cond: ((c200 = 17) AND (c10 = 3))
+         Filter: (c2 = 1)
+         Rows Removed by Filter: 5059
+         Heap Blocks: exact=9903
+         Buffers: shared hit=11677
+         ->  BitmapAnd (actual rows=0.00 loops=1)
+               Buffers: shared hit=1774
+               ->  Bitmap Index Scan on fact_c200_btree (actual rows=100382.00 loops=1)
+                     Index Cond: (c200 = 17)
+                     Index Searches: 1
+                     Buffers: shared hit=87
+               ->  Bitmap Index Scan on fact_c10_btree (actual rows=1999592.00 loops=1)
+                     Index Cond: (c10 = 3)
+                     Index Searches: 1
+                     Buffers: shared hit=1687
+ Planning:
+   Buffers: shared hit=325
+ Planning Time: 1.169 ms
+ Execution Time: 133.868 ms
+(22 rows)
+
+### grp_c200_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off -c enable_hashagg=off]
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ GroupAggregate (actual rows=200.00 loops=1)
+   Group Key: c200
+   Buffers: shared hit=35200
+   ->  Index Only Scan using fact_c200_btree on fact (actual rows=20000000.00 loops=1)
+         Heap Fetches: 20944
+         Index Searches: 1
+         Buffers: shared hit=35200
+ Planning:
+   Buffers: shared hit=323
+ Planning Time: 1.417 ms
+ Execution Time: 1665.001 ms
+(11 rows)
+
+### grp_c2_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off -c enable_hashagg=off]
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ GroupAggregate (actual rows=2.00 loops=1)
+   Group Key: c2
+   Buffers: shared hit=17327
+   ->  Index Only Scan using fact_c2_btree on fact (actual rows=20000000.00 loops=1)
+         Heap Fetches: 20944
+         Index Searches: 1
+         Buffers: shared hit=17327
+ Planning:
+   Buffers: shared hit=323
+ Planning Time: 1.047 ms
+ Execution Time: 1692.394 ms
+(11 rows)
+
+### range_c20k_btree_ios  [-c enable_seqscan=off -c enable_bitmapscan=off]
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=897
+   ->  Index Only Scan using fact_c20k_btree on fact (actual rows=99676.00 loops=1)
+         Index Cond: ((c20k >= 100) AND (c20k <= 199))
+         Heap Fetches: 106
+         Index Searches: 1
+         Buffers: shared hit=897
+ Planning:
+   Buffers: shared hit=323
+ Planning Time: 1.081 ms
+ Execution Time: 6.763 ms
+(11 rows)
+
+### fetch_c200_btree  [-c enable_seqscan=off]
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=81485
+   ->  Bitmap Heap Scan on fact (actual rows=100382.00 loops=1)
+         Recheck Cond: (c200 = 17)
+         Heap Blocks: exact=81398
+         Buffers: shared hit=81485
+         ->  Bitmap Index Scan on fact_c200_btree (actual rows=100382.00 loops=1)
+               Index Cond: (c200 = 17)
+               Index Searches: 1
+               Buffers: shared hit=87
+ Planning:
+   Buffers: shared hit=318 read=1
+   I/O Timings: shared read=0.230
+ Planning Time: 1.349 ms
+ Execution Time: 220.412 ms
+(15 rows)
+
+### p_c2_gin_bitmap  [-c enable_seqscan=off]
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=228603
+   ->  Bitmap Heap Scan on fact (actual rows=10002270.00 loops=1)
+         Recheck Cond: (c2 = 1)
+         Heap Blocks: exact=227273
+         Buffers: shared hit=228603
+         ->  Bitmap Index Scan on fact_c2_gin (actual rows=10002270.00 loops=1)
+               Index Cond: (c2 = 1)
+               Index Searches: 1
+               Buffers: shared hit=1330
+ Planning:
+   Buffers: shared hit=318
+ Planning Time: 1.857 ms
+ Execution Time: 1859.423 ms
+(14 rows)
+
+### p_c200_gin_bitmap  [-c enable_seqscan=off]
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=81425
+   ->  Bitmap Heap Scan on fact (actual rows=100382.00 loops=1)
+         Recheck Cond: (c200 = 17)
+         Heap Blocks: exact=81398
+         Buffers: shared hit=81425
+         ->  Bitmap Index Scan on fact_c200_gin (actual rows=100382.00 loops=1)
+               Index Cond: (c200 = 17)
+               Index Searches: 1
+               Buffers: shared hit=27
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 1.066 ms
+ Execution Time: 166.349 ms
+(14 rows)
+
+### p_c20k_gin_bitmap  [-c enable_seqscan=off]
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=1028
+   ->  Bitmap Heap Scan on fact (actual rows=1025.00 loops=1)
+         Recheck Cond: (c20k = 123)
+         Heap Blocks: exact=1024
+         Buffers: shared hit=1028
+         ->  Bitmap Index Scan on fact_c20k_gin (actual rows=1025.00 loops=1)
+               Index Cond: (c20k = 123)
+               Index Searches: 1
+               Buffers: shared hit=4
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 1.112 ms
+ Execution Time: 6.648 ms
+(14 rows)
+
+### p_c1m_gin_bitmap  [-c enable_seqscan=off]
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=24
+   ->  Bitmap Heap Scan on fact (actual rows=20.00 loops=1)
+         Recheck Cond: (c1m = 12345)
+         Heap Blocks: exact=20
+         Buffers: shared hit=24
+         ->  Bitmap Index Scan on fact_c1m_gin (actual rows=20.00 loops=1)
+               Index Cond: (c1m = 12345)
+               Index Searches: 1
+               Buffers: shared hit=4
+ Planning:
+   Buffers: shared hit=314
+ Planning Time: 1.050 ms
+ Execution Time: 0.336 ms
+(14 rows)
+
+### and3_gin  [-c enable_seqscan=off]
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=10222
+   ->  Bitmap Heap Scan on fact (actual rows=5044.00 loops=1)
+         Recheck Cond: ((c200 = 17) AND (c10 = 3))
+         Filter: (c2 = 1)
+         Rows Removed by Filter: 5059
+         Heap Blocks: exact=9903
+         Buffers: shared hit=10222
+         ->  BitmapAnd (actual rows=0.00 loops=1)
+               Buffers: shared hit=319
+               ->  Bitmap Index Scan on fact_c200_gin (actual rows=100382.00 loops=1)
+                     Index Cond: (c200 = 17)
+                     Index Searches: 1
+                     Buffers: shared hit=27
+               ->  Bitmap Index Scan on fact_c10_gin (actual rows=1999592.00 loops=1)
+                     Index Cond: (c10 = 3)
+                     Index Searches: 1
+                     Buffers: shared hit=292
+ Planning:
+   Buffers: shared hit=325
+ Planning Time: 1.164 ms
+ Execution Time: 227.476 ms
+(22 rows)
+
+### range_c20k_gin_bitmap  [-c enable_seqscan=off]
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=101096
+   ->  Bitmap Heap Scan on fact (actual rows=99676.00 loops=1)
+         Recheck Cond: ((c20k >= 100) AND (c20k <= 199))
+         Heap Blocks: exact=80903
+         Buffers: shared hit=101096
+         ->  Bitmap Index Scan on fact_c20k_gin (actual rows=99676.00 loops=1)
+               Index Cond: ((c20k >= 100) AND (c20k <= 199))
+               Index Searches: 1
+               Buffers: shared hit=20193
+ Planning:
+   Buffers: shared hit=322
+ Planning Time: 0.972 ms
+ Execution Time: 959.227 ms
+(14 rows)
+
+### fetch_c200_gin  [-c enable_seqscan=off]
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=81425
+   ->  Bitmap Heap Scan on fact (actual rows=100382.00 loops=1)
+         Recheck Cond: (c200 = 17)
+         Heap Blocks: exact=81398
+         Buffers: shared hit=81425
+         ->  Bitmap Index Scan on fact_c200_gin (actual rows=100382.00 loops=1)
+               Index Cond: (c200 = 17)
+               Index Searches: 1
+               Buffers: shared hit=27
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 1.110 ms
+ Execution Time: 179.728 ms
+(14 rows)
+
+### p_c2_roaring_bitmap  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=230825
+   ->  Bitmap Heap Scan on fact (actual rows=10002270.00 loops=1)
+         Recheck Cond: (c2 = 1)
+         Heap Blocks: exact=227273
+         Buffers: shared hit=230825
+         ->  Bitmap Index Scan on fact_c2_roaring (actual rows=10002270.00 loops=1)
+               Index Cond: (c2 = 1)
+               Index Searches: 1
+               Buffers: shared hit=3552
+ Planning:
+   Buffers: shared hit=309
+ Planning Time: 0.932 ms
+ Execution Time: 1356.513 ms
+(14 rows)
+
+### p_c200_roaring_bitmap  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=81431
+   ->  Bitmap Heap Scan on fact (actual rows=100382.00 loops=1)
+         Recheck Cond: (c200 = 17)
+         Heap Blocks: exact=81398
+         Buffers: shared hit=81431
+         ->  Bitmap Index Scan on fact_c200_roaring (actual rows=100382.00 loops=1)
+               Index Cond: (c200 = 17)
+               Index Searches: 1
+               Buffers: shared hit=33
+ Planning:
+   Buffers: shared hit=309
+ Planning Time: 0.957 ms
+ Execution Time: 167.933 ms
+(14 rows)
+
+### p_c200_clustered_roaring_bitmap  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=1139
+   ->  Bitmap Heap Scan on fact (actual rows=100000.00 loops=1)
+         Recheck Cond: (c200_clustered = 17)
+         Heap Blocks: exact=1137
+         Buffers: shared hit=1139
+         ->  Bitmap Index Scan on fact_c200_clustered_roaring (actual rows=100000.00 loops=1)
+               Index Cond: (c200_clustered = 17)
+               Index Searches: 1
+               Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=309
+ Planning Time: 0.909 ms
+ Execution Time: 9.108 ms
+(14 rows)
+
+### p_c20k_roaring_bitmap  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=1028
+   ->  Bitmap Heap Scan on fact (actual rows=1025.00 loops=1)
+         Recheck Cond: (c20k = 123)
+         Heap Blocks: exact=1024
+         Buffers: shared hit=1028
+         ->  Bitmap Index Scan on fact_c20k_roaring (actual rows=1025.00 loops=1)
+               Index Cond: (c20k = 123)
+               Index Searches: 1
+               Buffers: shared hit=4
+ Planning:
+   Buffers: shared hit=309
+ Planning Time: 1.071 ms
+ Execution Time: 8.338 ms
+(14 rows)
+
+### p_c1m_roaring_bitmap  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=21
+   ->  Bitmap Heap Scan on fact (actual rows=20.00 loops=1)
+         Recheck Cond: (c1m = 12345)
+         Heap Blocks: exact=20
+         Buffers: shared hit=21
+         ->  Bitmap Index Scan on fact_c1m_roaring (actual rows=20.00 loops=1)
+               Index Cond: (c1m = 12345)
+               Index Searches: 1
+               Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=306
+ Planning Time: 0.926 ms
+ Execution Time: 0.315 ms
+(14 rows)
+
+### and3_roaring  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=10451
+   ->  Bitmap Heap Scan on fact (actual rows=5044.00 loops=1)
+         Recheck Cond: ((c200 = 17) AND (c10 = 3))
+         Filter: (c2 = 1)
+         Rows Removed by Filter: 5059
+         Heap Blocks: exact=9903
+         Buffers: shared hit=10451
+         ->  BitmapAnd (actual rows=0.00 loops=1)
+               Buffers: shared hit=548
+               ->  Bitmap Index Scan on fact_c200_roaring (actual rows=100382.00 loops=1)
+                     Index Cond: (c200 = 17)
+                     Index Searches: 1
+                     Buffers: shared hit=33
+               ->  Bitmap Index Scan on fact_c10_roaring (actual rows=1999592.00 loops=1)
+                     Index Cond: (c10 = 3)
+                     Index Searches: 1
+                     Buffers: shared hit=515
+ Planning:
+   Buffers: shared hit=315
+ Planning Time: 1.005 ms
+ Execution Time: 118.210 ms
+(22 rows)
+
+### range_c20k_roaring_bitmap  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=227328
+   ->  Seq Scan on fact (actual rows=99676.00 loops=1)
+         Disabled: true
+         Filter: ((c20k >= 100) AND (c20k <= 199))
+         Rows Removed by Filter: 19900324
+         Buffers: shared hit=227328
+ Planning:
+   Buffers: shared hit=312
+ Planning Time: 0.856 ms
+ Execution Time: 1009.134 ms
+(11 rows)
+
+### fetch_c200_roaring  [-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off]
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=81431
+   ->  Bitmap Heap Scan on fact (actual rows=100382.00 loops=1)
+         Recheck Cond: (c200 = 17)
+         Heap Blocks: exact=81398
+         Buffers: shared hit=81431
+         ->  Bitmap Index Scan on fact_c200_roaring (actual rows=100382.00 loops=1)
+               Index Cond: (c200 = 17)
+               Index Searches: 1
+               Buffers: shared hit=33
+ Planning:
+   Buffers: shared hit=309
+ Planning Time: 0.940 ms
+ Execution Time: 163.032 ms
+(14 rows)
+
+### p_c2_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=1.00 loops=1)
+   Roaring Indexes: fact_c2_roaring (c2 = 1)
+   Heap Blocks Skipped via VM: 227035
+   Heap TIDs Rechecked: 10402
+   Heap Blocks Rechecked: 238
+   Containers Visited: 3552
+   Buffers: shared hit=3798
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 0.987 ms
+ Execution Time: 6.104 ms
+(11 rows)
+
+### p_c200_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=1.00 loops=1)
+   Roaring Indexes: fact_c200_roaring (c200 = 17)
+   Heap Blocks Skipped via VM: 81327
+   Heap TIDs Rechecked: 86
+   Heap Blocks Rechecked: 71
+   Containers Visited: 3552
+   Buffers: shared hit=112
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 1.306 ms
+ Execution Time: 0.810 ms
+(11 rows)
+
+### p_c200_clustered_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=1.00 loops=1)
+   Roaring Indexes: fact_c200_clustered_roaring (c200_clustered = 17)
+   Heap Blocks Skipped via VM: 1137
+   Heap TIDs Rechecked: 0
+   Heap Blocks Rechecked: 0
+   Containers Visited: 19
+   Buffers: shared hit=4
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 0.965 ms
+ Execution Time: 0.089 ms
+(11 rows)
+
+### p_c20k_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=1.00 loops=1)
+   Roaring Indexes: fact_c20k_roaring (c20k = 123)
+   Heap Blocks Skipped via VM: 1021
+   Heap TIDs Rechecked: 3
+   Heap Blocks Rechecked: 3
+   Containers Visited: 891
+   Buffers: shared hit=15
+ Planning:
+   Buffers: shared hit=317
+ Planning Time: 0.972 ms
+ Execution Time: 0.196 ms
+(11 rows)
+
+### p_c1m_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=1.00 loops=1)
+   Roaring Indexes: fact_c1m_roaring (c1m = 12345)
+   Heap Blocks Skipped via VM: 20
+   Heap TIDs Rechecked: 0
+   Heap Blocks Rechecked: 0
+   Containers Visited: 20
+   Buffers: shared hit=12
+ Planning:
+   Buffers: shared hit=314
+ Planning Time: 0.927 ms
+ Execution Time: 0.115 ms
+(11 rows)
+
+### and3_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=1.00 loops=1)
+   Roaring Indexes: fact_c10_roaring (c10 = 3), fact_c200_roaring (c200 = 17), fact_c2_roaring (c2 = 1)
+   Heap Blocks Skipped via VM: 4985
+   Heap TIDs Rechecked: 5
+   Heap Blocks Rechecked: 5
+   Containers Visited: 10656
+   Buffers: shared hit=4115
+ Planning:
+   Buffers: shared hit=323
+ Planning Time: 1.104 ms
+ Execution Time: 8.668 ms
+(11 rows)
+
+### grp_c200_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=200.00 loops=1)
+   Roaring Indexes: fact_c200_roaring (c200)
+   Group Key: c200
+   Heap Blocks Skipped via VM: 16193256
+   Heap TIDs Rechecked: 20944
+   Heap Blocks Rechecked: 16951
+   Containers Visited: 710399
+   Buffers: shared hit=25022
+ Planning:
+   Buffers: shared hit=316
+ Planning Time: 1.059 ms
+ Execution Time: 60.686 ms
+(12 rows)
+
+### grp_c2_pushdown  [-c roaring_index.enable_count_pushdown=on]
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (RoaringCount) (actual rows=2.00 loops=1)
+   Roaring Indexes: fact_c2_roaring (c2)
+   Group Key: c2
+   Heap Blocks Skipped via VM: 454070
+   Heap TIDs Rechecked: 20944
+   Heap Blocks Rechecked: 476
+   Containers Visited: 7104
+   Buffers: shared hit=7666
+ Planning:
+   Buffers: shared hit=316
+ Planning Time: 0.952 ms
+ Execution Time: 11.540 ms
+(12 rows)
+
+### grp_c200_seqscan  [-c enable_indexonlyscan=off -c enable_indexscan=off -c enable_bitmapscan=off -c roaring_index.enable_count_pushdown=off]
+                        QUERY PLAN                        
+----------------------------------------------------------
+ HashAggregate (actual rows=200.00 loops=1)
+   Group Key: c200
+   Batches: 1  Memory Usage: 32kB
+   Buffers: shared hit=227328
+   ->  Seq Scan on fact (actual rows=20000000.00 loops=1)
+         Buffers: shared hit=227328
+ Planning:
+   Buffers: shared hit=322
+ Planning Time: 1.084 ms
+ Execution Time: 2732.828 ms
+(10 rows)
+
+### grp_c2_seqscan  [-c enable_indexonlyscan=off -c enable_indexscan=off -c enable_bitmapscan=off -c roaring_index.enable_count_pushdown=off]
+                        QUERY PLAN                        
+----------------------------------------------------------
+ HashAggregate (actual rows=2.00 loops=1)
+   Group Key: c2
+   Batches: 1  Memory Usage: 32kB
+   Buffers: shared hit=227328
+   ->  Seq Scan on fact (actual rows=20000000.00 loops=1)
+         Buffers: shared hit=227328
+ Planning:
+   Buffers: shared hit=322
+ Planning Time: 1.115 ms
+ Execution Time: 2389.815 ms
+(10 rows)
+
+### p_c2_rb_naive  []
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Bitmap Heap Scan on rb_c2 (actual rows=1.00 loops=1)
+   Recheck Cond: (key = 1)
+   Heap Blocks: exact=1
+   Buffers: shared hit=24 read=2544
+   I/O Timings: shared read=59.970
+   ->  Bitmap Index Scan on rb_c2_key_idx (actual rows=1.00 loops=1)
+         Index Cond: (key = 1)
+         Index Searches: 1
+         Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=80 read=1
+   I/O Timings: shared read=0.209
+ Planning Time: 0.940 ms
+ Execution Time: 80.837 ms
+(14 rows)
+
+### p_c2_rb_vmall  []
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Nested Loop (actual rows=1.00 loops=1)
+   Buffers: shared hit=2591 read=16
+   I/O Timings: shared read=1.039
+   ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=2
+         ->  Bitmap Heap Scan on rb_c2 r (actual rows=1.00 loops=1)
+               Recheck Cond: (key = 1)
+               Heap Blocks: exact=1
+               Buffers: shared hit=2
+               ->  Bitmap Index Scan on rb_c2_key_idx (actual rows=1.00 loops=1)
+                     Index Cond: (key = 1)
+                     Index Searches: 1
+                     Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=117
+ Planning Time: 0.674 ms
+ Execution Time: 9.594 ms
+(20 rows)
+
+### p_c2_rb_vm95  []
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Buffers: shared hit=507775 read=17
+   I/O Timings: shared read=0.700
+   InitPlan expr_1
+     ->  Nested Loop (actual rows=1.00 loops=1)
+           Buffers: shared hit=2594 read=17
+           I/O Timings: shared read=0.700
+           ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+                 Buffers: shared hit=1
+           ->  Materialize (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=2
+                 ->  Bitmap Heap Scan on rb_c2 r (actual rows=1.00 loops=1)
+                       Recheck Cond: (key = 1)
+                       Heap Blocks: exact=1
+                       Buffers: shared hit=2
+                       ->  Bitmap Index Scan on rb_c2_key_idx (actual rows=1.00 loops=1)
+                             Index Cond: (key = 1)
+                             Index Searches: 1
+                             Buffers: shared hit=1
+   InitPlan expr_2
+     ->  Aggregate (actual rows=1.00 loops=1)
+           Buffers: shared hit=505181
+           InitPlan array_1
+             ->  Nested Loop (actual rows=502616.00 loops=1)
+                   Buffers: shared hit=2565
+                   ->  Bitmap Heap Scan on rb_c2 r_1 (actual rows=1.00 loops=1)
+                         Recheck Cond: (key = 1)
+                         Heap Blocks: exact=1
+                         Buffers: shared hit=2
+                         ->  Bitmap Index Scan on rb_c2_key_idx (actual rows=1.00 loops=1)
+                               Index Cond: (key = 1)
+                               Index Searches: 1
+                               Buffers: shared hit=1
+                   ->  Nested Loop (actual rows=502616.00 loops=1)
+                         Buffers: shared hit=2563
+                         ->  Seq Scan on vm_mask m_1 (actual rows=1.00 loops=1)
+                               Buffers: shared hit=1
+                         ->  Function Scan on rb_iterate x (actual rows=502616.00 loops=1)
+                               Buffers: shared hit=2562
+           ->  Tid Scan on fact (actual rows=502616.00 loops=1)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=505181
+ Planning:
+   Buffers: shared hit=485 read=1
+   I/O Timings: shared read=0.071
+ Planning Time: 1.694 ms
+ Execution Time: 281.377 ms
+(48 rows)
+
+### p_c200_rb_naive  []
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Bitmap Heap Scan on rb_c200 (actual rows=1.00 loops=1)
+   Recheck Cond: (key = 17)
+   Heap Blocks: exact=1
+   Buffers: shared hit=24 read=37
+   I/O Timings: shared read=2.152
+   ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+         Index Cond: (key = 17)
+         Index Searches: 1
+         Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=81
+ Planning Time: 0.743 ms
+ Execution Time: 2.913 ms
+(13 rows)
+
+### p_c200_rb_vmall  []
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Nested Loop (actual rows=1.00 loops=1)
+   Buffers: shared hit=100
+   ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=2
+         ->  Bitmap Heap Scan on rb_c200 r (actual rows=1.00 loops=1)
+               Recheck Cond: (key = 17)
+               Heap Blocks: exact=1
+               Buffers: shared hit=2
+               ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+                     Index Cond: (key = 17)
+                     Index Searches: 1
+                     Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=117
+ Planning Time: 0.858 ms
+ Execution Time: 1.225 ms
+(19 rows)
+
+### p_c200_rb_vm95  []
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Buffers: shared hit=5300
+   InitPlan expr_1
+     ->  Nested Loop (actual rows=1.00 loops=1)
+           Buffers: shared hit=104
+           ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+                 Buffers: shared hit=1
+           ->  Materialize (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=2
+                 ->  Bitmap Heap Scan on rb_c200 r (actual rows=1.00 loops=1)
+                       Recheck Cond: (key = 17)
+                       Heap Blocks: exact=1
+                       Buffers: shared hit=2
+                       ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+                             Index Cond: (key = 17)
+                             Index Searches: 1
+                             Buffers: shared hit=1
+   InitPlan expr_2
+     ->  Aggregate (actual rows=1.00 loops=1)
+           Buffers: shared hit=5196
+           InitPlan array_1
+             ->  Nested Loop (actual rows=5138.00 loops=1)
+                   Buffers: shared hit=58
+                   ->  Bitmap Heap Scan on rb_c200 r_1 (actual rows=1.00 loops=1)
+                         Recheck Cond: (key = 17)
+                         Heap Blocks: exact=1
+                         Buffers: shared hit=2
+                         ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+                               Index Cond: (key = 17)
+                               Index Searches: 1
+                               Buffers: shared hit=1
+                   ->  Nested Loop (actual rows=5138.00 loops=1)
+                         Buffers: shared hit=56
+                         ->  Seq Scan on vm_mask m_1 (actual rows=1.00 loops=1)
+                               Buffers: shared hit=1
+                         ->  Function Scan on rb_iterate x (actual rows=5138.00 loops=1)
+                               Buffers: shared hit=55
+           ->  Tid Scan on fact (actual rows=5138.00 loops=1)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=5196
+ Planning:
+   Buffers: shared hit=486
+ Planning Time: 1.498 ms
+ Execution Time: 20.253 ms
+(45 rows)
+
+### p_c20k_rb_naive  []
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Bitmap Heap Scan on rb_c20k (actual rows=1.00 loops=1)
+   Recheck Cond: (key = 123)
+   Heap Blocks: exact=1
+   Buffers: shared hit=26 read=6
+   I/O Timings: shared read=1.611
+   ->  Bitmap Index Scan on rb_c20k_key_idx (actual rows=1.00 loops=1)
+         Index Cond: (key = 123)
+         Index Searches: 1
+         Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=81
+ Planning Time: 0.759 ms
+ Execution Time: 1.961 ms
+(13 rows)
+
+### p_c20k_rb_vmall  []
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Nested Loop (actual rows=1.00 loops=1)
+   Buffers: shared hit=71
+   ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=3
+         ->  Bitmap Heap Scan on rb_c20k r (actual rows=1.00 loops=1)
+               Recheck Cond: (key = 123)
+               Heap Blocks: exact=1
+               Buffers: shared hit=3
+               ->  Bitmap Index Scan on rb_c20k_key_idx (actual rows=1.00 loops=1)
+                     Index Cond: (key = 123)
+                     Index Searches: 1
+                     Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=117
+ Planning Time: 0.760 ms
+ Execution Time: 0.509 ms
+(19 rows)
+
+### p_c20k_rb_vm95  []
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Buffers: shared hit=166
+   InitPlan expr_1
+     ->  Nested Loop (actual rows=1.00 loops=1)
+           Buffers: shared hit=75
+           ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+                 Buffers: shared hit=1
+           ->  Materialize (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=3
+                 ->  Bitmap Heap Scan on rb_c20k r (actual rows=1.00 loops=1)
+                       Recheck Cond: (key = 123)
+                       Heap Blocks: exact=1
+                       Buffers: shared hit=3
+                       ->  Bitmap Index Scan on rb_c20k_key_idx (actual rows=1.00 loops=1)
+                             Index Cond: (key = 123)
+                             Index Searches: 1
+                             Buffers: shared hit=2
+   InitPlan expr_2
+     ->  Aggregate (actual rows=1.00 loops=1)
+           Buffers: shared hit=91
+           InitPlan array_1
+             ->  Nested Loop (actual rows=63.00 loops=1)
+                   Buffers: shared hit=28
+                   ->  Bitmap Heap Scan on rb_c20k r_1 (actual rows=1.00 loops=1)
+                         Recheck Cond: (key = 123)
+                         Heap Blocks: exact=1
+                         Buffers: shared hit=3
+                         ->  Bitmap Index Scan on rb_c20k_key_idx (actual rows=1.00 loops=1)
+                               Index Cond: (key = 123)
+                               Index Searches: 1
+                               Buffers: shared hit=2
+                   ->  Nested Loop (actual rows=63.00 loops=1)
+                         Buffers: shared hit=25
+                         ->  Seq Scan on vm_mask m_1 (actual rows=1.00 loops=1)
+                               Buffers: shared hit=1
+                         ->  Function Scan on rb_iterate x (actual rows=63.00 loops=1)
+                               Buffers: shared hit=24
+           ->  Tid Scan on fact (actual rows=63.00 loops=1)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=91
+ Planning:
+   Buffers: shared hit=486
+ Planning Time: 1.539 ms
+ Execution Time: 1.664 ms
+(45 rows)
+
+### p_c1m_rb_naive  []
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Bitmap Heap Scan on rb_c1m (actual rows=1.00 loops=1)
+   Recheck Cond: (key = 12345)
+   Heap Blocks: exact=1
+   Buffers: shared hit=4
+   ->  Bitmap Index Scan on rb_c1m_key_idx (actual rows=1.00 loops=1)
+         Index Cond: (key = 12345)
+         Index Searches: 1
+         Buffers: shared hit=3
+ Planning:
+   Buffers: shared hit=81
+ Planning Time: 0.729 ms
+ Execution Time: 0.202 ms
+(12 rows)
+
+### p_c1m_rb_vmall  []
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Nested Loop (actual rows=1.00 loops=1)
+   Buffers: shared hit=43
+   ->  Bitmap Heap Scan on rb_c1m r (actual rows=1.00 loops=1)
+         Recheck Cond: (key = 12345)
+         Heap Blocks: exact=1
+         Buffers: shared hit=4
+         ->  Bitmap Index Scan on rb_c1m_key_idx (actual rows=1.00 loops=1)
+               Index Cond: (key = 12345)
+               Index Searches: 1
+               Buffers: shared hit=3
+   ->  Materialize (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=1
+         ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+               Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=117
+ Planning Time: 0.770 ms
+ Execution Time: 0.428 ms
+(19 rows)
+
+### p_c1m_rb_vm95  []
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Buffers: shared hit=71
+   InitPlan expr_1
+     ->  Nested Loop (actual rows=1.00 loops=1)
+           Buffers: shared hit=47
+           ->  Bitmap Heap Scan on rb_c1m r (actual rows=1.00 loops=1)
+                 Recheck Cond: (key = 12345)
+                 Heap Blocks: exact=1
+                 Buffers: shared hit=4
+                 ->  Bitmap Index Scan on rb_c1m_key_idx (actual rows=1.00 loops=1)
+                       Index Cond: (key = 12345)
+                       Index Searches: 1
+                       Buffers: shared hit=3
+           ->  Materialize (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=1
+                 ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+                       Buffers: shared hit=1
+   InitPlan expr_2
+     ->  Aggregate (actual rows=1.00 loops=1)
+           Buffers: shared hit=24
+           InitPlan array_1
+             ->  Nested Loop (actual rows=0.00 loops=1)
+                   Buffers: shared hit=24
+                   ->  Bitmap Heap Scan on rb_c1m r_1 (actual rows=1.00 loops=1)
+                         Recheck Cond: (key = 12345)
+                         Heap Blocks: exact=1
+                         Buffers: shared hit=4
+                         ->  Bitmap Index Scan on rb_c1m_key_idx (actual rows=1.00 loops=1)
+                               Index Cond: (key = 12345)
+                               Index Searches: 1
+                               Buffers: shared hit=3
+                   ->  Nested Loop (actual rows=0.00 loops=1)
+                         Buffers: shared hit=20
+                         ->  Seq Scan on vm_mask m_1 (actual rows=1.00 loops=1)
+                               Buffers: shared hit=1
+                         ->  Function Scan on rb_iterate x (actual rows=0.00 loops=1)
+                               Buffers: shared hit=19
+           ->  Tid Scan on fact (actual rows=0.00 loops=1)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=24
+ Planning:
+   Buffers: shared hit=486
+ Planning Time: 1.576 ms
+ Execution Time: 0.686 ms
+(45 rows)
+
+### and3_rb_naive  []
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Nested Loop (actual rows=1.00 loops=1)
+   Buffers: shared hit=2653 read=517
+   I/O Timings: shared read=9.262
+   ->  Nested Loop (actual rows=1.00 loops=1)
+         Buffers: shared hit=4
+         ->  Bitmap Heap Scan on rb_c10 a (actual rows=1.00 loops=1)
+               Recheck Cond: (key = 3)
+               Heap Blocks: exact=1
+               Buffers: shared hit=2
+               ->  Bitmap Index Scan on rb_c10_key_idx (actual rows=1.00 loops=1)
+                     Index Cond: (key = 3)
+                     Index Searches: 1
+                     Buffers: shared hit=1
+         ->  Materialize (actual rows=1.00 loops=1)
+               Storage: Memory  Maximum Storage: 17kB
+               Buffers: shared hit=2
+               ->  Bitmap Heap Scan on rb_c200 b (actual rows=1.00 loops=1)
+                     Recheck Cond: (key = 17)
+                     Heap Blocks: exact=1
+                     Buffers: shared hit=2
+                     ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+                           Index Cond: (key = 17)
+                           Index Searches: 1
+                           Buffers: shared hit=1
+   ->  Materialize (actual rows=1.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=2
+         ->  Bitmap Heap Scan on rb_c2 c (actual rows=1.00 loops=1)
+               Recheck Cond: (key = 1)
+               Heap Blocks: exact=1
+               Buffers: shared hit=2
+               ->  Bitmap Index Scan on rb_c2_key_idx (actual rows=1.00 loops=1)
+                     Index Cond: (key = 1)
+                     Index Searches: 1
+                     Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=162
+ Planning Time: 0.864 ms
+ Execution Time: 35.277 ms
+(39 rows)
+
+### and3_rb_vm95  []
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Buffers: shared hit=3488
+   CTE r
+     ->  Nested Loop (actual rows=1.00 loops=1)
+           Buffers: shared hit=3170
+           ->  Nested Loop (actual rows=1.00 loops=1)
+                 Buffers: shared hit=4
+                 ->  Bitmap Heap Scan on rb_c10 a (actual rows=1.00 loops=1)
+                       Recheck Cond: (key = 3)
+                       Heap Blocks: exact=1
+                       Buffers: shared hit=2
+                       ->  Bitmap Index Scan on rb_c10_key_idx (actual rows=1.00 loops=1)
+                             Index Cond: (key = 3)
+                             Index Searches: 1
+                             Buffers: shared hit=1
+                 ->  Materialize (actual rows=1.00 loops=1)
+                       Storage: Memory  Maximum Storage: 17kB
+                       Buffers: shared hit=2
+                       ->  Bitmap Heap Scan on rb_c200 b (actual rows=1.00 loops=1)
+                             Recheck Cond: (key = 17)
+                             Heap Blocks: exact=1
+                             Buffers: shared hit=2
+                             ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+                                   Index Cond: (key = 17)
+                                   Index Searches: 1
+                                   Buffers: shared hit=1
+           ->  Materialize (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=2
+                 ->  Bitmap Heap Scan on rb_c2 c (actual rows=1.00 loops=1)
+                       Recheck Cond: (key = 1)
+                       Heap Blocks: exact=1
+                       Buffers: shared hit=2
+                       ->  Bitmap Index Scan on rb_c2_key_idx (actual rows=1.00 loops=1)
+                             Index Cond: (key = 1)
+                             Index Searches: 1
+                             Buffers: shared hit=1
+   InitPlan expr_1
+     ->  Nested Loop (actual rows=1.00 loops=1)
+           Buffers: shared hit=3213
+           ->  CTE Scan on r (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 55kB
+                 Buffers: shared hit=3170
+           ->  Materialize (actual rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=1
+                 ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+                       Buffers: shared hit=1
+   InitPlan expr_2
+     ->  Aggregate (actual rows=1.00 loops=1)
+           Buffers: shared hit=275
+           InitPlan array_1
+             ->  Nested Loop (actual rows=255.00 loops=1)
+                   Buffers: shared hit=20
+                   ->  Seq Scan on vm_mask m_1 (actual rows=1.00 loops=1)
+                         Buffers: shared hit=1
+                   ->  Nested Loop (actual rows=255.00 loops=1)
+                         Buffers: shared hit=19
+                         ->  CTE Scan on r r_1 (actual rows=1.00 loops=1)
+                               Storage: Memory  Maximum Storage: 55kB
+                         ->  Function Scan on rb_iterate x (actual rows=255.00 loops=1)
+                               Buffers: shared hit=19
+           ->  Tid Scan on fact (actual rows=255.00 loops=1)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=275
+ Planning:
+   Buffers: shared hit=542
+ Planning Time: 1.607 ms
+ Execution Time: 17.268 ms
+(69 rows)
+
+### grp_c200_rb_naive  []
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on rb_c200 (actual rows=200.00 loops=1)
+   Buffers: shared hit=460 read=6804
+   I/O Timings: shared read=290.140
+ Planning:
+   Buffers: shared hit=64
+ Planning Time: 0.255 ms
+ Execution Time: 313.252 ms
+(7 rows)
+
+### grp_c200_rb_vmall  []
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Nested Loop (actual rows=200.00 loops=1)
+   Buffers: shared hit=10288
+   ->  Seq Scan on vm_mask (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=200.00 loops=1)
+         Storage: Memory  Maximum Storage: 26kB
+         Buffers: shared hit=4
+         ->  Seq Scan on rb_c200 (actual rows=200.00 loops=1)
+               Buffers: shared hit=4
+ Planning:
+   Buffers: shared hit=100
+ Planning Time: 0.347 ms
+ Execution Time: 102.221 ms
+(13 rows)
+
+### grp_c200_rb_vm95  []
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Nested Loop (actual rows=200.00 loops=1)
+   Buffers: shared hit=1026909
+   ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=200.00 loops=1)
+         Storage: Memory  Maximum Storage: 26kB
+         Buffers: shared hit=4
+         ->  Seq Scan on rb_c200 r (actual rows=200.00 loops=1)
+               Buffers: shared hit=4
+   SubPlan expr_1
+     ->  Aggregate (actual rows=1.00 loops=200)
+           Buffers: shared hit=1015821
+           InitPlan array_1
+             ->  Function Scan on rb_iterate x (actual rows=5023.92 loops=200)
+                   Buffers: shared hit=11037
+           ->  Tid Scan on fact f (actual rows=5023.92 loops=200)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=1015821
+ Planning:
+   Buffers: shared hit=391
+ Planning Time: 1.237 ms
+ Execution Time: 1014.824 ms
+(22 rows)
+
+### grp_c2_rb_naive  []
+                  QUERY PLAN                  
+----------------------------------------------
+ Seq Scan on rb_c2 (actual rows=2.00 loops=1)
+   Buffers: shared hit=2568 read=2540
+   I/O Timings: shared read=44.801
+ Planning:
+   Buffers: shared hit=64
+ Planning Time: 0.259 ms
+ Execution Time: 73.375 ms
+(7 rows)
+
+### grp_c2_rb_vmall  []
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Nested Loop (actual rows=2.00 loops=1)
+   Buffers: shared hit=5162
+   ->  Seq Scan on vm_mask (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=2.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=1
+         ->  Seq Scan on rb_c2 (actual rows=2.00 loops=1)
+               Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=100
+ Planning Time: 0.318 ms
+ Execution Time: 15.184 ms
+(13 rows)
+
+### grp_c2_rb_vm95  []
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Nested Loop (actual rows=2.00 loops=1)
+   Buffers: shared hit=1015076
+   ->  Seq Scan on vm_mask m (actual rows=1.00 loops=1)
+         Buffers: shared hit=1
+   ->  Materialize (actual rows=2.00 loops=1)
+         Storage: Memory  Maximum Storage: 17kB
+         Buffers: shared hit=1
+         ->  Seq Scan on rb_c2 r (actual rows=2.00 loops=1)
+               Buffers: shared hit=1
+   SubPlan expr_1
+     ->  Aggregate (actual rows=1.00 loops=2)
+           Buffers: shared hit=1009906
+           InitPlan array_1
+             ->  Function Scan on rb_iterate x (actual rows=502392.00 loops=2)
+                   Buffers: shared hit=5122
+           ->  Tid Scan on fact f (actual rows=502392.00 loops=2)
+                 TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+                 Buffers: shared hit=1009906
+ Planning:
+   Buffers: shared hit=391
+ Planning Time: 1.197 ms
+ Execution Time: 465.813 ms
+(22 rows)
+
+### range_c20k_rb_naive  []
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=325 read=205
+   I/O Timings: shared read=42.628
+   ->  Bitmap Heap Scan on rb_c20k (actual rows=100.00 loops=1)
+         Recheck Cond: ((key >= 100) AND (key <= 199))
+         Heap Blocks: exact=2
+         Buffers: shared hit=4
+         ->  Bitmap Index Scan on rb_c20k_key_idx (actual rows=100.00 loops=1)
+               Index Cond: ((key >= 100) AND (key <= 199))
+               Index Searches: 1
+               Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=80
+ Planning Time: 0.368 ms
+ Execution Time: 57.617 ms
+(15 rows)
+
+### fetch_c200_rb_tidscan  []
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=100443
+   InitPlan array_1
+     ->  Nested Loop (actual rows=100382.00 loops=1)
+           Buffers: shared hit=61
+           ->  Bitmap Heap Scan on rb_c200 (actual rows=1.00 loops=1)
+                 Recheck Cond: (key = 17)
+                 Heap Blocks: exact=1
+                 Buffers: shared hit=2
+                 ->  Bitmap Index Scan on rb_c200_key_idx (actual rows=1.00 loops=1)
+                       Index Cond: (key = 17)
+                       Index Searches: 1
+                       Buffers: shared hit=1
+           ->  Function Scan on rb_iterate x (actual rows=100382.00 loops=1)
+                 Buffers: shared hit=59
+   ->  Tid Scan on fact (actual rows=100382.00 loops=1)
+         TID Cond: (ctid = ANY ((InitPlan array_1).col1))
+         Buffers: shared hit=100443
+ Planning:
+   Buffers: shared hit=481
+ Planning Time: 1.508 ms
+ Execution Time: 149.956 ms
+(22 rows)
+
