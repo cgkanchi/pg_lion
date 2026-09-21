@@ -1,3 +1,5 @@
+> Note: this document predates the rename to **pg_lion** (2026-09-21). Names map as: extension `roaring_index` -> `pg_lion`, access method `roaring` -> `lion`, functions `roaring_index_*` -> `lion_index_*`, GUC `roaring_index.*` -> `pg_lion.*`, C prefix `rbi_`/`RBI` -> `lion_`/`LION`/`Lion`, files `src/rbi_*.c` -> `src/lion_*.c`.
+
 # Follow-up code, architecture, and performance review — 2026-09-21
 
 Reviewed commit: `7db8f11` (`Fix the eight findings of the 2026-09-20 codebase review`). The extension fixes are substantially effective, and the expanded regression suite passes. **Four P2 findings remain: two reliability gaps and two measured planner-performance issues.** The review did not reproduce a remaining P1 in the previously affected paths; passing these checks does not establish correctness under every SQL, recovery, or concurrency scenario.

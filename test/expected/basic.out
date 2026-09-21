@@ -1,11 +1,11 @@
--- Basic functional test for the roaring index access method.
+-- Basic functional test for the lion index access method.
 \set VERBOSITY terse
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 -- This file exercises the access method's bitmap-scan path; the count pushdown
 -- (tested in pushdown.sql) would otherwise take over the count(*) demonstrations.
-SET roaring_index.enable_count_pushdown = off;
--- Deterministic data set with a mix of cardinalities.  Only rbi_r10 depends
+SET pg_lion.enable_count_pushdown = off;
+-- Deterministic data set with a mix of cardinalities.  Only lion_r10 depends
 -- on the seeded PRNG; every other column is a pure function of i.
 SELECT setseed(0.42);
  setseed 
@@ -13,7 +13,7 @@ SELECT setseed(0.42);
  
 (1 row)
 
-CREATE TABLE rbi_basic AS
+CREATE TABLE lion_basic AS
 SELECT i,
        (i % 2) = 0                                  AS b2,
        (i % 10)::int4                               AS c10,
@@ -26,24 +26,24 @@ SELECT i,
        (random() * 9)::int4                         AS r10,
        CASE WHEN i % 1000 = 0 THEN NULL ELSE (i % 5)::int4 END AS cnull
   FROM generate_series(1, 200000) i;
-CREATE INDEX rbi_b2 ON rbi_basic USING roaring (b2);
-CREATE INDEX rbi_c10 ON rbi_basic USING roaring (c10);
-CREATE INDEX rbi_c1000 ON rbi_basic USING roaring (c1000);
-CREATE INDEX rbi_c50k ON rbi_basic USING roaring (c50k);
-CREATE INDEX rbi_t1000 ON rbi_basic USING roaring (t1000);
-CREATE INDEX rbi_d10 ON rbi_basic USING roaring (d10);
-CREATE INDEX rbi_n1000 ON rbi_basic USING roaring (n1000);
-CREATE INDEX rbi_u1000 ON rbi_basic USING roaring (u1000);
-CREATE INDEX rbi_r10 ON rbi_basic USING roaring (r10);
-CREATE INDEX rbi_cnull ON rbi_basic USING roaring (cnull);
-ANALYZE rbi_basic;
+CREATE INDEX lion_b2 ON lion_basic USING lion (b2);
+CREATE INDEX lion_c10 ON lion_basic USING lion (c10);
+CREATE INDEX lion_c1000 ON lion_basic USING lion (c1000);
+CREATE INDEX lion_c50k ON lion_basic USING lion (c50k);
+CREATE INDEX lion_t1000 ON lion_basic USING lion (t1000);
+CREATE INDEX lion_d10 ON lion_basic USING lion (d10);
+CREATE INDEX lion_n1000 ON lion_basic USING lion (n1000);
+CREATE INDEX lion_u1000 ON lion_basic USING lion (u1000);
+CREATE INDEX lion_r10 ON lion_basic USING lion (r10);
+CREATE INDEX lion_cnull ON lion_basic USING lion (cnull);
+ANALYZE lion_basic;
 /*
- * rbi_cmp() runs the same predicate twice: once with only bitmap scans
- * enabled (and verifies from the plan that the roaring index really was
+ * lion_cmp() runs the same predicate twice: once with only bitmap scans
+ * enabled (and verifies from the plan that the lion index really was
  * used) and once with a plain sequential scan.  It reports the row count so
  * that a wrong-but-consistent answer would still show up in the diff.
  */
-CREATE OR REPLACE FUNCTION rbi_cmp(tbl text, pred text) RETURNS text
+CREATE OR REPLACE FUNCTION lion_cmp(tbl text, pred text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	q text := format('SELECT count(*) AS c, coalesce(sum(i), 0) AS s FROM %s WHERE %s', tbl, pred);
@@ -74,307 +74,307 @@ BEGIN
 	END IF;
 	RETURN format('ok %s rows', a.c);
 END $$;
--- The plan really is a bitmap index scan on the roaring index.
+-- The plan really is a bitmap index scan on the lion index.
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE c1000 = 42;
-                 QUERY PLAN                 
---------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c1000 = 42;
+                 QUERY PLAN                  
+---------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: (c1000 = 42)
-         ->  Bitmap Index Scan on rbi_c1000
+         ->  Bitmap Index Scan on lion_c1000
                Index Cond: (c1000 = 42)
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE t1000 = 'key 7';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE t1000 = 'key 7';
                     QUERY PLAN                     
 ---------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: (t1000 = 'key 7'::text)
-         ->  Bitmap Index Scan on rbi_t1000
+         ->  Bitmap Index Scan on lion_t1000
                Index Cond: (t1000 = 'key 7'::text)
 (5 rows)
 
 RESET enable_seqscan;
 -- 2 distinct values: one bitset container per 64 heap blocks.
-SELECT rbi_cmp('rbi_basic', 'b2');
-    rbi_cmp     
+SELECT lion_cmp('lion_basic', 'b2');
+    lion_cmp    
 ----------------
  ok 100000 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'NOT b2');
-    rbi_cmp     
+SELECT lion_cmp('lion_basic', 'NOT b2');
+    lion_cmp    
 ----------------
  ok 100000 rows
 (1 row)
 
 -- 10 distinct values
-SELECT rbi_cmp('rbi_basic', 'c10 = 0');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'c10 = 0');
+   lion_cmp    
 ---------------
  ok 20000 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c10 = 9');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'c10 = 9');
+   lion_cmp    
 ---------------
  ok 20000 rows
 (1 row)
 
 -- 1000 distinct values
-SELECT rbi_cmp('rbi_basic', 'c1000 = 0');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'c1000 = 0');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c1000 = 42');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'c1000 = 42');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c1000 = 999');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'c1000 = 999');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
 -- 50000 distinct values (int8)
-SELECT rbi_cmp('rbi_basic', 'c50k = 29');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c50k = 29');
+ lion_cmp  
 -----------
  ok 4 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c50k = 49729');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c50k = 49729');
+ lion_cmp  
 -----------
  ok 4 rows
 (1 row)
 
 -- text, date, numeric, uuid
-SELECT rbi_cmp('rbi_basic', 't1000 = ''key 0''');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 't1000 = ''key 0''');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 't1000 = ''key 777''');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 't1000 = ''key 777''');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'd10 = DATE ''2020-01-05''');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'd10 = DATE ''2020-01-05''');
+   lion_cmp    
 ---------------
  ok 20000 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'n1000 = 124.875');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'n1000 = 124.875');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'u1000 = md5(''500'')::uuid');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'u1000 = md5(''500'')::uuid');
+  lion_cmp   
 -------------
  ok 200 rows
 (1 row)
 
 -- seeded-random column
-SELECT rbi_cmp('rbi_basic', 'r10 = 4');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'r10 = 4');
+   lion_cmp    
 ---------------
  ok 22232 rows
 (1 row)
 
 -- keys that match no row at all
-SELECT rbi_cmp('rbi_basic', 'c1000 = -1');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c1000 = -1');
+ lion_cmp  
 -----------
  ok 0 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c50k = 1000000');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c50k = 1000000');
+ lion_cmp  
 -----------
  ok 0 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 't1000 = ''no such key''');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 't1000 = ''no such key''');
+ lion_cmp  
 -----------
  ok 0 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'd10 = DATE ''1999-01-01''');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'd10 = DATE ''1999-01-01''');
+ lion_cmp  
 -----------
  ok 0 rows
 (1 row)
 
 -- NULL keys are not indexed: the scan must return nothing and not fail.
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE cnull = (SELECT NULL::int4);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE cnull = (SELECT NULL::int4);
                          QUERY PLAN                         
 ------------------------------------------------------------
  Aggregate
    InitPlan expr_1
      ->  Result
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: (cnull = (InitPlan expr_1).col1)
-         ->  Bitmap Index Scan on rbi_cnull
+         ->  Bitmap Index Scan on lion_cnull
                Index Cond: (cnull = (InitPlan expr_1).col1)
 (7 rows)
 
-SELECT count(*) FROM rbi_basic WHERE cnull = (SELECT NULL::int4);
+SELECT count(*) FROM lion_basic WHERE cnull = (SELECT NULL::int4);
  count 
 -------
      0
 (1 row)
 
 RESET enable_seqscan;
-SELECT rbi_cmp('rbi_basic', 'cnull = 3');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'cnull = 3');
+   lion_cmp    
 ---------------
  ok 40000 rows
 (1 row)
 
 -- IS NULL cannot use the index but must still be right
-SELECT count(*) FROM rbi_basic WHERE cnull IS NULL;
+SELECT count(*) FROM lion_basic WHERE cnull IS NULL;
  count 
 -------
    200
 (1 row)
 
--- BitmapAnd over two roaring indexes
+-- BitmapAnd over two lion indexes
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE c10 = 3 AND c1000 = 419;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c10 = 3 AND c1000 = 419;
                      QUERY PLAN                      
 -----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: ((c1000 = 419) AND (c10 = 3))
          ->  BitmapAnd
-               ->  Bitmap Index Scan on rbi_c1000
+               ->  Bitmap Index Scan on lion_c1000
                      Index Cond: (c1000 = 419)
-               ->  Bitmap Index Scan on rbi_c10
+               ->  Bitmap Index Scan on lion_c10
                      Index Cond: (c10 = 3)
 (8 rows)
 
 RESET enable_seqscan;
-SELECT rbi_cmp('rbi_basic', 'c10 = 3 AND c1000 = 419');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c10 = 3 AND c1000 = 419');
+ lion_cmp  
 -----------
  ok 0 rows
 (1 row)
 
 -- BitmapOr: the planner uses one index scan per array element
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE c1000 IN (11, 22, 33);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c1000 IN (11, 22, 33);
                             QUERY PLAN                             
 -------------------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: (c1000 = ANY ('{11,22,33}'::integer[]))
-         ->  Bitmap Index Scan on rbi_c1000
+         ->  Bitmap Index Scan on lion_c1000
                Index Cond: (c1000 = ANY ('{11,22,33}'::integer[]))
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE c1000 = 11 OR t1000 = 'key 500';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c1000 = 11 OR t1000 = 'key 500';
                             QUERY PLAN                             
 -------------------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: ((c1000 = 11) OR (t1000 = 'key 500'::text))
          ->  BitmapOr
-               ->  Bitmap Index Scan on rbi_c1000
+               ->  Bitmap Index Scan on lion_c1000
                      Index Cond: (c1000 = 11)
-               ->  Bitmap Index Scan on rbi_t1000
+               ->  Bitmap Index Scan on lion_t1000
                      Index Cond: (t1000 = 'key 500'::text)
 (8 rows)
 
 RESET enable_seqscan;
-SELECT rbi_cmp('rbi_basic', 'c1000 IN (11, 22, 33)');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'c1000 IN (11, 22, 33)');
+  lion_cmp   
 -------------
  ok 600 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c1000 = 11 OR t1000 = ''key 500''');
-   rbi_cmp   
+SELECT lion_cmp('lion_basic', 'c1000 = 11 OR t1000 = ''key 500''');
+  lion_cmp   
 -------------
  ok 400 rows
 (1 row)
 
 -- Cross-type equality inside the shared integer operator family
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE c50k = 29::int4;
-                QUERY PLAN                 
--------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c50k = 29::int4;
+                 QUERY PLAN                 
+--------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: (c50k = 29)
-         ->  Bitmap Index Scan on rbi_c50k
+         ->  Bitmap Index Scan on lion_c50k
                Index Cond: (c50k = 29)
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_basic WHERE c10 = 3::int8;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c10 = 3::int8;
                   QUERY PLAN                   
 -----------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_basic
+   ->  Bitmap Heap Scan on lion_basic
          Recheck Cond: (c10 = '3'::bigint)
-         ->  Bitmap Index Scan on rbi_c10
+         ->  Bitmap Index Scan on lion_c10
                Index Cond: (c10 = '3'::bigint)
 (5 rows)
 
 RESET enable_seqscan;
-SELECT rbi_cmp('rbi_basic', 'c50k = 29::int4');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c50k = 29::int4');
+ lion_cmp  
 -----------
  ok 4 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c50k = 29::int2');
-  rbi_cmp  
+SELECT lion_cmp('lion_basic', 'c50k = 29::int2');
+ lion_cmp  
 -----------
  ok 4 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c10 = 3::int8');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'c10 = 3::int8');
+   lion_cmp    
 ---------------
  ok 20000 rows
 (1 row)
 
-SELECT rbi_cmp('rbi_basic', 'c10 = 3::int2');
-    rbi_cmp    
+SELECT lion_cmp('lion_basic', 'c10 = 3::int2');
+   lion_cmp    
 ---------------
  ok 20000 rows
 (1 row)
 
 -- varchar reaches the text opclass by binary coercion
-CREATE TABLE rbi_varchar (v varchar(32));
-INSERT INTO rbi_varchar SELECT 'v' || (i % 100) FROM generate_series(1, 10000) i;
-CREATE INDEX rbi_varchar_idx ON rbi_varchar USING roaring (v);
+CREATE TABLE lion_varchar (v varchar(32));
+INSERT INTO lion_varchar SELECT 'v' || (i % 100) FROM generate_series(1, 10000) i;
+CREATE INDEX lion_varchar_idx ON lion_varchar USING lion (v);
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_varchar WHERE v = 'v42';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_varchar WHERE v = 'v42';
                      QUERY PLAN                      
 -----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_varchar
+   ->  Bitmap Heap Scan on lion_varchar
          Recheck Cond: ((v)::text = 'v42'::text)
-         ->  Bitmap Index Scan on rbi_varchar_idx
+         ->  Bitmap Index Scan on lion_varchar_idx
                Index Cond: ((v)::text = 'v42'::text)
 (5 rows)
 
-SELECT count(*) FROM rbi_varchar WHERE v = 'v42';
+SELECT count(*) FROM lion_varchar WHERE v = 'v42';
  count 
 -------
    100
@@ -382,23 +382,23 @@ SELECT count(*) FROM rbi_varchar WHERE v = 'v42';
 
 RESET enable_seqscan;
 -- An enum column uses the anyenum opclass
-CREATE TYPE rbi_color AS ENUM ('red', 'green', 'blue');
-CREATE TABLE rbi_enum AS
-SELECT (ARRAY['red', 'green', 'blue']::rbi_color[])[1 + (i % 3)] AS c
+CREATE TYPE lion_color AS ENUM ('red', 'green', 'blue');
+CREATE TABLE lion_enum AS
+SELECT (ARRAY['red', 'green', 'blue']::lion_color[])[1 + (i % 3)] AS c
   FROM generate_series(1, 5000) i;
-CREATE INDEX rbi_enum_idx ON rbi_enum USING roaring (c);
+CREATE INDEX lion_enum_idx ON lion_enum USING lion (c);
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_enum WHERE c = 'green';
-                     QUERY PLAN                     
-----------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_enum WHERE c = 'green';
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_enum
-         Recheck Cond: (c = 'green'::rbi_color)
-         ->  Bitmap Index Scan on rbi_enum_idx
-               Index Cond: (c = 'green'::rbi_color)
+   ->  Bitmap Heap Scan on lion_enum
+         Recheck Cond: (c = 'green'::lion_color)
+         ->  Bitmap Index Scan on lion_enum_idx
+               Index Cond: (c = 'green'::lion_color)
 (5 rows)
 
-SELECT count(*) FROM rbi_enum WHERE c = 'green';
+SELECT count(*) FROM lion_enum WHERE c = 'green';
  count 
 -------
   1667
@@ -406,10 +406,10 @@ SELECT count(*) FROM rbi_enum WHERE c = 'green';
 
 RESET enable_seqscan;
 -- An empty table builds a valid (tiny) index
-CREATE TABLE rbi_empty (k int4);
-CREATE INDEX rbi_empty_idx ON rbi_empty USING roaring (k);
+CREATE TABLE lion_empty (k int4);
+CREATE INDEX lion_empty_idx ON lion_empty USING lion (k);
 SET enable_seqscan = off;
-SELECT count(*) FROM rbi_empty WHERE k = 1;
+SELECT count(*) FROM lion_empty WHERE k = 1;
  count 
 -------
      0
@@ -417,37 +417,37 @@ SELECT count(*) FROM rbi_empty WHERE k = 1;
 
 RESET enable_seqscan;
 -- An insert into an index built on an empty table creates the first entry
-INSERT INTO rbi_empty VALUES (1);
+INSERT INTO lion_empty VALUES (1);
 /*
  * VACUUM removes the deleted TIDs from the index; the answers must stay
  * correct both before and after it runs.
  */
-CREATE TABLE rbi_vac AS
+CREATE TABLE lion_vac AS
 SELECT i, (i % 50)::int4 AS k FROM generate_series(1, 20000) i;
-CREATE INDEX rbi_vac_idx ON rbi_vac USING roaring (k);
-VACUUM rbi_vac;
+CREATE INDEX lion_vac_idx ON lion_vac USING lion (k);
+VACUUM lion_vac;
 SET enable_seqscan = off;
-SELECT count(*), sum(i) FROM rbi_vac WHERE k = 7;
+SELECT count(*), sum(i) FROM lion_vac WHERE k = 7;
  count |   sum   
 -------+---------
    400 | 3992800
 (1 row)
 
-DELETE FROM rbi_vac WHERE i <= 10000;
-VACUUM rbi_vac;
-SELECT count(*), sum(i) FROM rbi_vac WHERE k = 7;
+DELETE FROM lion_vac WHERE i <= 10000;
+VACUUM lion_vac;
+SELECT count(*), sum(i) FROM lion_vac WHERE k = 7;
  count |   sum   
 -------+---------
    200 | 2996400
 (1 row)
 
 RESET enable_seqscan;
-SELECT count(*), sum(i) FROM rbi_vac WHERE k + 0 = 7;
+SELECT count(*), sum(i) FROM lion_vac WHERE k + 0 = 7;
  count |   sum   
 -------+---------
    200 | 2996400
 (1 row)
 
-DROP TABLE rbi_vac;
-DROP TABLE rbi_varchar, rbi_enum, rbi_empty;
-DROP TYPE rbi_color;
+DROP TABLE lion_vac;
+DROP TABLE lion_varchar, lion_enum, lion_empty;
+DROP TYPE lion_color;

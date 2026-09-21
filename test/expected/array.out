@@ -8,18 +8,18 @@
 -- and not just the pushdown's.
 \set VERBOSITY terse
 SET client_min_messages = warning;
-LOAD 'roaring_index';
+LOAD 'pg_lion';
 /* VACUUM can only set all-visible for commits that reached disk (citext.sql). */
 SET synchronous_commit = on;
 SET default_statistics_target = 1000;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE DOMAIN tarr AS text[];
 /*
  * Run one query through the index (count pushdown enabled, seqscan off) and
  * through a plain sequential scan, prove the two results are equal as
  * multisets, and report which node answered the first one.
  */
-CREATE FUNCTION rbi_arrcmp(q text) RETURNS text
+CREATE FUNCTION lion_arrcmp(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -27,30 +27,30 @@ DECLARE
 	nrows bigint;
 	ndiff bigint;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushed down';
 		ELSIF ln LIKE '%Bitmap Index Scan%' THEN
 			node := 'index scan';
 		END IF;
 	END LOOP;
-	EXECUTE format('CREATE TEMP TABLE rbi_a_idx AS %s', q);
+	EXECUTE format('CREATE TEMP TABLE lion_a_idx AS %s', q);
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
-	EXECUTE format('CREATE TEMP TABLE rbi_a_seq AS %s', q);
+	EXECUTE format('CREATE TEMP TABLE lion_a_seq AS %s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 
-	EXECUTE 'SELECT count(*) FROM rbi_a_idx' INTO nrows;
-	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM rbi_a_idx EXCEPT ALL SELECT * FROM rbi_a_seq) a)'
-			' + (SELECT count(*) FROM (SELECT * FROM rbi_a_seq EXCEPT ALL SELECT * FROM rbi_a_idx) b)'
+	EXECUTE 'SELECT count(*) FROM lion_a_idx' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_a_idx EXCEPT ALL SELECT * FROM lion_a_seq) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_a_seq EXCEPT ALL SELECT * FROM lion_a_idx) b)'
 		INTO ndiff;
-	EXECUTE 'DROP TABLE rbi_a_idx, rbi_a_seq';
+	EXECUTE 'DROP TABLE lion_a_idx, lion_a_seq';
 
 	IF ndiff <> 0 THEN
 		RETURN format('MISMATCH: %s rows differ', ndiff);
@@ -58,7 +58,7 @@ BEGIN
 	RETURN format('%s, %s rows', node, nrows);
 END $$;
 /* The plan of one query with the index preferred. */
-CREATE FUNCTION rbi_arrplan(q text) RETURNS SETOF text
+CREATE FUNCTION lion_arrplan(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -74,13 +74,13 @@ END $$;
 -- tags: 1 to 3 of 40 text tags, with duplicates on purpose (row i holds
 -- t(i%40) twice whenever i%7 = 0) and a NULL element every 53rd row.
 -- nums: two int elements.  Row 0 has empty arrays, row -1 NULL ones.
-CREATE TABLE rbi_arr (
+CREATE TABLE lion_arr (
 	id		int			NOT NULL,
-	grp		int			NOT NULL,	-- 8 groups, scalar roaring index
+	grp		int			NOT NULL,	-- 8 groups, scalar lion index
 	tags	text[],
 	nums	int[]
 );
-INSERT INTO rbi_arr
+INSERT INTO lion_arr
 SELECT i, i % 8,
 	   CASE WHEN i % 53 = 0
 			THEN ARRAY['t' || (i % 40), NULL, 't' || (i % 13)]
@@ -90,15 +90,15 @@ SELECT i, i % 8,
 	   END,
 	   ARRAY[i % 11, i % 5]
   FROM generate_series(1, 20000) i;
-INSERT INTO rbi_arr VALUES (0, 0, '{}', '{}');
-INSERT INTO rbi_arr VALUES (-1, 1, NULL, NULL);
-CREATE INDEX rbi_arr_tags ON rbi_arr USING roaring (tags);
-CREATE INDEX rbi_arr_nums ON rbi_arr USING roaring (nums);
-CREATE INDEX rbi_arr_grp ON rbi_arr USING roaring (grp);
-VACUUM ANALYZE rbi_arr;
+INSERT INTO lion_arr VALUES (0, 0, '{}', '{}');
+INSERT INTO lion_arr VALUES (-1, 1, NULL, NULL);
+CREATE INDEX lion_arr_tags ON lion_arr USING lion (tags);
+CREATE INDEX lion_arr_nums ON lion_arr USING lion (nums);
+CREATE INDEX lion_arr_grp ON lion_arr USING lion (grp);
+VACUUM ANALYZE lion_arr;
 -- The opclasses validate.
 SELECT amvalidate(oid) FROM pg_opclass
- WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'roaring')
+ WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
    AND opcname IN ('array_ops', 'tsvector_ops')
  ORDER BY opcname;
  amvalidate 
@@ -110,163 +110,163 @@ SELECT amvalidate(oid) FROM pg_opclass
 -- The index stores ELEMENTS, so its key column is the element type.
 SELECT a.attname, a.atttypid::regtype
   FROM pg_attribute a
- WHERE a.attrelid = 'rbi_arr_tags'::regclass AND a.attnum > 0;
+ WHERE a.attrelid = 'lion_arr_tags'::regclass AND a.attnum > 0;
  attname | atttypid 
 ---------+----------
  tags    | text
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_tags', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_tags', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_nums', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_nums', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 -- 40 tag entries + 13 + 3 overlap; the NULL array is one entry, the empty
 -- array another.  empty_tids counts the rows no key was extracted from.
-SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_tags');
+SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_tags');
  entries | null_tids | empty_tids 
 ---------+-----------+------------
       42 |         1 |          1
 (1 row)
 
-SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_nums');
+SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_nums');
  entries | null_tids | empty_tids 
 ---------+-----------+------------
       13 |         1 |          1
 (1 row)
 
--- roaring_index_count() is a single-key function: a multi-key index has no
+-- lion_index_count() is a single-key function: a multi-key index has no
 -- equality strategy to look a value up with, and says so.
-SELECT roaring_index_count('rbi_arr_tags', '{t5}'::text[]);
-ERROR:  type text[] cannot be compared with index "rbi_arr_tags"
+SELECT lion_index_count('lion_arr_tags', '{t5}'::text[]);
+ERROR:  type text[] cannot be compared with index "lion_arr_tags"
 -- ---- plans -------------------------------------------------------------
-SELECT rbi_arrplan($$SELECT id FROM rbi_arr WHERE tags @> '{t5}'$$);
-                 rbi_arrplan                  
+SELECT lion_arrplan($$SELECT id FROM lion_arr WHERE tags @> '{t5}'$$);
+                 lion_arrplan                 
 ----------------------------------------------
- Bitmap Heap Scan on rbi_arr
+ Bitmap Heap Scan on lion_arr
    Recheck Cond: (tags @> '{t5}'::text[])
-   ->  Bitmap Index Scan on rbi_arr_tags
+   ->  Bitmap Index Scan on lion_arr_tags
          Index Cond: (tags @> '{t5}'::text[])
 (4 rows)
 
-SELECT rbi_arrplan($$SELECT count(*) FROM rbi_arr WHERE tags @> '{t5,t7}'$$);
-                    rbi_arrplan                    
----------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_arr_tags (tags @> {t5,t7})
+SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5,t7}'$$);
+                  lion_arrplan                   
+-------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_arr_tags (tags @> {t5,t7})
 (2 rows)
 
-SELECT rbi_arrplan($$SELECT count(*) FROM rbi_arr WHERE tags && '{t5,t7}'$$);
-                    rbi_arrplan                    
----------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_arr_tags (tags && {t5,t7})
+SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags && '{t5,t7}'$$);
+                  lion_arrplan                   
+-------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_arr_tags (tags && {t5,t7})
 (2 rows)
 
 -- `<@` needs every row rechecked, so it is never pushed down
-SELECT rbi_arrplan($$SELECT count(*) FROM rbi_arr WHERE tags <@ '{t5,t7}'$$);
-                      rbi_arrplan                      
+SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags <@ '{t5,t7}'$$);
+                     lion_arrplan                      
 -------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_arr
+   ->  Bitmap Heap Scan on lion_arr
          Recheck Cond: (tags <@ '{t5,t7}'::text[])
-         ->  Bitmap Index Scan on rbi_arr_tags
+         ->  Bitmap Index Scan on lion_arr_tags
                Index Cond: (tags <@ '{t5,t7}'::text[])
 (5 rows)
 
 -- `@> '{}'` is every non-NULL row: an ALL-mode scan, also not pushed down
-SELECT rbi_arrplan($$SELECT count(*) FROM rbi_arr WHERE tags @> '{}'$$);
-                   rbi_arrplan                    
+SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags @> '{}'$$);
+                   lion_arrplan                   
 --------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_arr
+   ->  Bitmap Heap Scan on lion_arr
          Recheck Cond: (tags @> '{}'::text[])
-         ->  Bitmap Index Scan on rbi_arr_tags
+         ->  Bitmap Index Scan on lion_arr_tags
                Index Cond: (tags @> '{}'::text[])
 (5 rows)
 
-SELECT rbi_arrplan($$SELECT grp, count(*) FROM rbi_arr
+SELECT lion_arrplan($$SELECT grp, count(*) FROM lion_arr
 					 WHERE tags @> '{t5}' GROUP BY grp$$);
-                            rbi_arrplan                            
--------------------------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_arr_grp (grp), rbi_arr_tags (tags @> {t5})
+                           lion_arrplan                           
+------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_arr_grp (grp), lion_arr_tags (tags @> {t5})
    Group Key: grp
 (3 rows)
 
-SELECT rbi_arrplan($$SELECT count(*) FROM rbi_arr
+SELECT lion_arrplan($$SELECT count(*) FROM lion_arr
 					 WHERE tags @> '{t5}' AND nums && '{3}'$$);
-                                rbi_arrplan                                 
-----------------------------------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_arr_tags (tags @> {t5}), rbi_arr_nums (nums && {3})
+                               lion_arrplan                                
+---------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_arr_tags (tags @> {t5}), lion_arr_nums (nums && {3})
 (2 rows)
 
 -- ---- @> with one, two and three elements -------------------------------
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t5}'$$);
-      rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t5}'$$);
+      lion_arrcmp      
 -----------------------
  index scan, 2000 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t5,t5}'$$);
-      rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t5,t5}'$$);
+      lion_arrcmp      
 -----------------------
  index scan, 2000 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t5,t2}'$$);
-      rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t5,t2}'$$);
+     lion_arrcmp      
 ----------------------
  index scan, 620 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t5,t2,t0}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t5,t2,t0}'$$);
+     lion_arrcmp     
 ---------------------
  index scan, 45 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t5,nosuchtag}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t5,nosuchtag}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 0 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE nums @> '{3,4}'$$);
-      rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE nums @> '{3,4}'$$);
+     lion_arrcmp      
 ----------------------
  index scan, 727 rows
 (1 row)
 
 -- ---- && ----------------------------------------------------------------
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && '{t5}'$$);
-      rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{t5}'$$);
+      lion_arrcmp      
 -----------------------
  index scan, 2000 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && '{t5,t2}'$$);
-      rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{t5,t2}'$$);
+      lion_arrcmp      
 -----------------------
  index scan, 8424 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && '{nosuchtag,t39}'$$);
-      rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{nosuchtag,t39}'$$);
+     lion_arrcmp      
 ----------------------
  index scan, 500 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && '{nosuchtag}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{nosuchtag}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 0 rows
 (1 row)
@@ -274,196 +274,196 @@ SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && '{nosuchtag}'$$);
 -- ---- two index quals on one column --------------------------------------
 -- The access method answers ONE qual per scan and marks every TID for
 -- recheck, so the bitmap heap scan applies the rest (DESIGN.md §5).
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr
+SELECT lion_arrcmp($$SELECT id FROM lion_arr
 				   WHERE tags @> '{t5}' AND tags && '{t2,t7}'$$);
-      rbi_arrcmp      
+     lion_arrcmp      
 ----------------------
  index scan, 676 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr
+SELECT lion_arrcmp($$SELECT id FROM lion_arr
 				   WHERE tags @> '{t5}' AND tags @> '{t2}'$$);
-      rbi_arrcmp      
+     lion_arrcmp      
 ----------------------
  index scan, 620 rows
 (1 row)
 
 -- ---- <@ (recheck) ------------------------------------------------------
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags <@ '{t5,t2,t0}'$$);
-      rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags <@ '{t5,t2,t0}'$$);
+     lion_arrcmp      
 ----------------------
  index scan, 245 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE nums <@ '{0,1,2,3,4}'$$);
-      rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE nums <@ '{0,1,2,3,4}'$$);
+      lion_arrcmp      
 -----------------------
  index scan, 9093 rows
 (1 row)
 
 -- ---- empty query arrays ------------------------------------------------
 -- `@> '{}'` is true of every non-NULL array, empty ones included.
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{}'$$);
-       rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{}'$$);
+      lion_arrcmp       
 ------------------------
  index scan, 20001 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
 -- `&& '{}'` is true of nothing.
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && '{}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 0 rows
 (1 row)
 
 -- ---- NULLs on both sides -----------------------------------------------
 -- A NULL element in the QUERY: `@>` is then false everywhere, `&&` ignores it.
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> ARRAY['t5', NULL]$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> ARRAY['t5', NULL]$$);
+    lion_arrcmp     
 --------------------
  index scan, 0 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags && ARRAY['t5', NULL]$$);
-      rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && ARRAY['t5', NULL]$$);
+      lion_arrcmp      
 -----------------------
  index scan, 2000 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> ARRAY[NULL]::text[]$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> ARRAY[NULL]::text[]$$);
+    lion_arrcmp     
 --------------------
  index scan, 0 rows
 (1 row)
 
 -- A NULL element in the indexed VALUE: the row is indexed under its others.
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t1}' AND id % 53 = 0$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t1}' AND id % 53 = 0$$);
+     lion_arrcmp     
 ---------------------
  index scan, 37 rows
 (1 row)
 
 -- A NULL array value itself.
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags IS NULL$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags IS NULL$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags IS NOT NULL$$);
-       rbi_arrcmp       
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags IS NOT NULL$$);
+      lion_arrcmp       
 ------------------------
  index scan, 20001 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags IS NULL$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags IS NULL$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
 -- ---- the count pushdown ------------------------------------------------
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{t5,t2}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5,t2}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags && '{t5,t2}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags && '{t5,t2}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr
 				   WHERE tags @> '{t5}' AND tags && '{t2,t7}'$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr
 				   WHERE tags @> '{t5}' AND nums @> '{3}'$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr
 				   WHERE tags @> '{t5}' AND grp = 3$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- a key that does not exist: no rows, and no merge to run
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{t5,nosuchtag}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5,nosuchtag}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
--- the counts themselves (rbi_arrcmp only proves the two plans agree)
-SELECT count(*) FROM rbi_arr WHERE tags @> '{t5,t2}';
+-- the counts themselves (lion_arrcmp only proves the two plans agree)
+SELECT count(*) FROM lion_arr WHERE tags @> '{t5,t2}';
  count 
 -------
    620
 (1 row)
 
-SELECT count(*) FROM rbi_arr WHERE tags && '{t5,t2}';
+SELECT count(*) FROM lion_arr WHERE tags && '{t5,t2}';
  count 
 -------
   8424
 (1 row)
 
-SELECT count(*) FROM rbi_arr WHERE tags @> '{t5}' AND tags && '{t2,t7}';
+SELECT count(*) FROM lion_arr WHERE tags @> '{t5}' AND tags && '{t2,t7}';
  count 
 -------
    676
 (1 row)
 
-SELECT count(*) FROM rbi_arr WHERE tags @> '{t5,nosuchtag}';
+SELECT count(*) FROM lion_arr WHERE tags @> '{t5,nosuchtag}';
  count 
 -------
      0
 (1 row)
 
-SELECT count(*) FROM rbi_arr WHERE tags @> '{}';
+SELECT count(*) FROM lion_arr WHERE tags @> '{}';
  count 
 -------
  20001
 (1 row)
 
 -- ---- GROUP BY a scalar column with a multi-key WHERE clause ------------
-SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT grp, count(*) FROM lion_arr
 				   WHERE tags @> '{t5}' GROUP BY grp$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 8 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT grp, count(*) FROM lion_arr
 				   WHERE tags && '{t5,t2}' GROUP BY grp$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 8 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT grp, count(*) FROM lion_arr
 				   WHERE tags @> '{t5}' AND nums @> '{3}' GROUP BY grp$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 8 rows
 (1 row)
 
 -- the real answer, for comparison
-SELECT grp, count(*) FROM rbi_arr WHERE tags @> '{t5}' GROUP BY grp ORDER BY grp;
+SELECT grp, count(*) FROM lion_arr WHERE tags @> '{t5}' GROUP BY grp ORDER BY grp;
  grp | count 
 -----+-------
    0 |   192
@@ -477,110 +477,110 @@ SELECT grp, count(*) FROM rbi_arr WHERE tags @> '{t5}' GROUP BY grp ORDER BY grp
 (8 rows)
 
 -- ---- writes ------------------------------------------------------------
-INSERT INTO rbi_arr
+INSERT INTO lion_arr
 SELECT i, i % 8, ARRAY['t' || (i % 40), 'new' || (i % 3)], ARRAY[i % 11, 99]
   FROM generate_series(20001, 21000) i;
-INSERT INTO rbi_arr VALUES (30000, 2, '{}', NULL);
-INSERT INTO rbi_arr VALUES (30001, 2, ARRAY[NULL]::text[], '{7}');
-SELECT roaring_index_verify('rbi_arr_tags', true);
- roaring_index_verify 
-----------------------
+INSERT INTO lion_arr VALUES (30000, 2, '{}', NULL);
+INSERT INTO lion_arr VALUES (30001, 2, ARRAY[NULL]::text[], '{7}');
+SELECT lion_index_verify('lion_arr_tags', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_nums', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_nums', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_tags');
+SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_tags');
  entries | null_tids | empty_tids 
 ---------+-----------+------------
       45 |         1 |          3
 (1 row)
 
 -- a dirty heap: the count has to visit it
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{new1}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{new1}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{t5,new1}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{t5,new1}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 9 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{}' AND id > 29999$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{}' AND id > 29999$$);
+    lion_arrcmp     
 --------------------
  index scan, 2 rows
 (1 row)
 
-UPDATE rbi_arr SET tags = ARRAY['upd', 't5'] WHERE id BETWEEN 100 AND 200;
-DELETE FROM rbi_arr WHERE id BETWEEN 300 AND 400;
-SELECT roaring_index_verify('rbi_arr_tags', true);
- roaring_index_verify 
-----------------------
+UPDATE lion_arr SET tags = ARRAY['upd', 't5'] WHERE id BETWEEN 100 AND 200;
+DELETE FROM lion_arr WHERE id BETWEEN 300 AND 400;
+SELECT lion_index_verify('lion_arr_tags', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr WHERE tags @> '{upd}'$$);
-      rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags @> '{upd}'$$);
+     lion_arrcmp      
 ----------------------
  index scan, 101 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{upd,t5}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{upd,t5}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{t5}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-VACUUM rbi_arr;
-SELECT roaring_index_verify('rbi_arr_tags', true);
- roaring_index_verify 
-----------------------
+VACUUM lion_arr;
+SELECT lion_index_verify('lion_arr_tags', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_nums', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_nums', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 -- an all-visible heap: the count comes out of the visibility map
-VACUUM ANALYZE rbi_arr;
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{upd,t5}'$$);
-     rbi_arrcmp      
+VACUUM ANALYZE lion_arr;
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{upd,t5}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags @> '{t5}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr WHERE tags && '{upd,new1}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags && '{upd,new1}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr
+SELECT lion_arrcmp($$SELECT grp, count(*) FROM lion_arr
 				   WHERE tags @> '{t5}' GROUP BY grp$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 8 rows
 (1 row)
@@ -589,78 +589,78 @@ SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr
 /*
  * Both key-less entries - the EMPTY entry of §17 and the NULL entry of §14 -
  * must keep their identity when their posting set outgrows the entry tuple
- * and moves onto container pages.  rbi_entry_spill() used to preserve only
+ * and moves onto container pages.  lion_entry_spill() used to preserve only
  * the NULL flag, so a spilled EMPTY entry came back as an ordinary entry with
  * a zero-length key: the next empty array could not find it and started a
- * second one, roaring_index_stats() stopped counting those rows in
- * empty_tids, and roaring_index_verify() reported a key of length 0.
+ * second one, lion_index_stats() stopped counting those rows in
+ * empty_tids, and lion_index_verify() reported a key of length 0.
  *
  * inline_limit = 64 makes a posting set spill after a handful of TIDs, and
  * alternating rows keep the containers from being cheap runs, so the INSERT
  * path performs the transition for both kinds.
  */
-CREATE TABLE rbi_arr_res (id int NOT NULL, a int[]);
-CREATE INDEX rbi_arr_res_a ON rbi_arr_res USING roaring (a)
+CREATE TABLE lion_arr_res (id int NOT NULL, a int[]);
+CREATE INDEX lion_arr_res_a ON lion_arr_res USING lion (a)
 	WITH (inline_limit = 64);
-INSERT INTO rbi_arr_res
+INSERT INTO lion_arr_res
 SELECT i, CASE WHEN i % 2 = 0 THEN '{}'::int[] ELSE '{1}'::int[] END
   FROM generate_series(1, 10000) i;
 -- exactly two entries: the EMPTY one with 5000 rows, and key 1
 SELECT entries, inline_entries, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
-  FROM roaring_index_stats('rbi_arr_res_a');
+  FROM lion_index_stats('lion_arr_res_a');
  entries | inline_entries | null_tids | empty_tids | spilled 
 ---------+----------------+-----------+------------+---------
        2 |              0 |         0 |       5000 | t
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_res_a', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_res_a', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 -- the same for the NULL entry, in the same index
-INSERT INTO rbi_arr_res
+INSERT INTO lion_arr_res
 SELECT i, CASE WHEN i % 2 = 0 THEN NULL ELSE '{2}'::int[] END
   FROM generate_series(10001, 14000) i;
 -- four entries, all of them chains now: EMPTY, NULL, key 1, key 2
 SELECT entries, inline_entries, null_tids, empty_tids
-  FROM roaring_index_stats('rbi_arr_res_a');
+  FROM lion_index_stats('lion_arr_res_a');
  entries | inline_entries | null_tids | empty_tids 
 ---------+----------------+-----------+------------
        4 |              0 |      2000 |       5000
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_res_a', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_res_a', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 -- The proof that the spilled entries are still the reserved ones: these two
 -- rows must JOIN them instead of creating a third and fourth key-less entry.
-INSERT INTO rbi_arr_res VALUES (20001, '{}'), (20002, NULL);
-SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_res_a');
+INSERT INTO lion_arr_res VALUES (20001, '{}'), (20002, NULL);
+SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_res_a');
  entries | null_tids | empty_tids 
 ---------+-----------+------------
        4 |      2001 |       5001
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_res_a', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_res_a', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_res WHERE a @> '{}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res WHERE a @> '{}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT id FROM rbi_arr_res WHERE a IS NULL AND id > 13990$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_res WHERE a IS NULL AND id > 13990$$);
+    lion_arrcmp     
 --------------------
  index scan, 6 rows
 (1 row)
@@ -672,150 +672,150 @@ SELECT rbi_arrcmp($$SELECT id FROM rbi_arr_res WHERE a IS NULL AND id > 13990$$)
  * longer fits inline, so ambulkdelete spills it while rewriting it
  * (test/sql/vacuum.sql does the same thing to ordinary keys).
  */
-CREATE TABLE rbi_arr_res2 (id int NOT NULL, a int[]);
-INSERT INTO rbi_arr_res2
+CREATE TABLE lion_arr_res2 (id int NOT NULL, a int[]);
+INSERT INTO lion_arr_res2
 SELECT i, CASE WHEN i <= 10000 THEN '{}'::int[]
 			   WHEN i <= 20000 THEN NULL
 			   ELSE '{7}'::int[] END
   FROM generate_series(1, 30000) i;
-CREATE INDEX rbi_arr_res2_a ON rbi_arr_res2 USING roaring (a);
+CREATE INDEX lion_arr_res2_a ON lion_arr_res2 USING lion (a);
 -- three INLINE entries: EMPTY, NULL and key 7, runs of clustered TIDs
 SELECT entries, inline_entries, run_containers, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
-  FROM roaring_index_stats('rbi_arr_res2_a');
+  FROM lion_index_stats('lion_arr_res2_a');
  entries | inline_entries | run_containers | null_tids | empty_tids | spilled 
 ---------+----------------+----------------+-----------+------------+---------
        3 |              3 |              5 |     10000 |      10000 | f
 (1 row)
 
-DELETE FROM rbi_arr_res2 WHERE id % 2 = 0;
-VACUUM rbi_arr_res2;
+DELETE FROM lion_arr_res2 WHERE id % 2 = 0;
+VACUUM lion_arr_res2;
 -- every entry has spilled during the VACUUM, reserved ones included
 SELECT entries, inline_entries, bitset_containers, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
-  FROM roaring_index_stats('rbi_arr_res2_a');
+  FROM lion_index_stats('lion_arr_res2_a');
  entries | inline_entries | bitset_containers | null_tids | empty_tids | spilled 
 ---------+----------------+-------------------+-----------+------------+---------
        3 |              0 |                 3 |      5000 |       5000 | t
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_res2_a', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_res2_a', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-INSERT INTO rbi_arr_res2 VALUES (20001, '{}'), (20002, NULL);
-SELECT entries, null_tids, empty_tids FROM roaring_index_stats('rbi_arr_res2_a');
+INSERT INTO lion_arr_res2 VALUES (20001, '{}'), (20002, NULL);
+SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_res2_a');
  entries | null_tids | empty_tids 
 ---------+-----------+------------
        3 |      5001 |       5001
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_res2_a', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_res2_a', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_res2 WHERE a @> '{}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a @> '{}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_res2 WHERE a IS NULL$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a IS NULL$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
-DROP TABLE rbi_arr_res, rbi_arr_res2;
+DROP TABLE lion_arr_res, lion_arr_res2;
 -- ---- a partitioned table (DESIGN.md §16 meets §17) ---------------------
-CREATE TABLE rbi_arr_part (id int, grp int, tags text[]) PARTITION BY RANGE (id);
-CREATE TABLE rbi_arr_p1 PARTITION OF rbi_arr_part FOR VALUES FROM (0) TO (2000);
-CREATE TABLE rbi_arr_p2 PARTITION OF rbi_arr_part FOR VALUES FROM (2000) TO (4000);
-INSERT INTO rbi_arr_part
+CREATE TABLE lion_arr_part (id int, grp int, tags text[]) PARTITION BY RANGE (id);
+CREATE TABLE lion_arr_p1 PARTITION OF lion_arr_part FOR VALUES FROM (0) TO (2000);
+CREATE TABLE lion_arr_p2 PARTITION OF lion_arr_part FOR VALUES FROM (2000) TO (4000);
+INSERT INTO lion_arr_part
 SELECT i, i % 8, ARRAY['t' || (i % 40), 't' || (i % 13)]
   FROM generate_series(0, 3999) i;
-CREATE INDEX ON rbi_arr_p1 USING roaring (tags);
-CREATE INDEX ON rbi_arr_p2 USING roaring (tags);
-CREATE INDEX ON rbi_arr_p1 USING roaring (grp);
-CREATE INDEX ON rbi_arr_p2 USING roaring (grp);
-VACUUM ANALYZE rbi_arr_part;
-SELECT rbi_arrplan($$SELECT count(*) FROM rbi_arr_part WHERE tags @> '{t5,t2}'$$);
-             rbi_arrplan              
---------------------------------------
- Custom Scan (RoaringCount)
-   Partitions: rbi_arr_p1, rbi_arr_p2
-   Roaring Indexes: (tags @> {t5,t2})
+CREATE INDEX ON lion_arr_p1 USING lion (tags);
+CREATE INDEX ON lion_arr_p2 USING lion (tags);
+CREATE INDEX ON lion_arr_p1 USING lion (grp);
+CREATE INDEX ON lion_arr_p2 USING lion (grp);
+VACUUM ANALYZE lion_arr_part;
+SELECT lion_arrplan($$SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}'$$);
+              lion_arrplan              
+----------------------------------------
+ Custom Scan (LionCount)
+   Partitions: lion_arr_p1, lion_arr_p2
+   Lion Indexes: (tags @> {t5,t2})
 (3 rows)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arr_part WHERE tags @> '{t5,t2}'$$);
-     rbi_arrcmp      
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}'$$);
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT grp, count(*) FROM rbi_arr_part
+SELECT lion_arrcmp($$SELECT grp, count(*) FROM lion_arr_part
 				   WHERE tags && '{t5,t2}' GROUP BY grp$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 8 rows
 (1 row)
 
-SELECT count(*) FROM rbi_arr_part WHERE tags @> '{t5,t2}';
+SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}';
  count 
 -------
     15
 (1 row)
 
-DROP TABLE rbi_arr_part;
+DROP TABLE lion_arr_part;
 -- ---- element types the keys cannot be made from ------------------------
 -- The element type needs a hash opclass, and says so when it has none.
-CREATE TABLE rbi_arr_odd (p point[], m int[][], d tarr);
-CREATE INDEX ON rbi_arr_odd USING roaring (p);
+CREATE TABLE lion_arr_odd (p point[], m int[][], d tarr);
+CREATE INDEX ON lion_arr_odd USING lion (p);
 ERROR:  could not identify a hash function for type point
 -- A multi-dimensional array is just its elements, and a domain its base type.
-CREATE INDEX rbi_arr_odd_m ON rbi_arr_odd USING roaring (m);
-CREATE INDEX rbi_arr_odd_d ON rbi_arr_odd USING roaring (d);
-INSERT INTO rbi_arr_odd (m, d)
+CREATE INDEX lion_arr_odd_m ON lion_arr_odd USING lion (m);
+CREATE INDEX lion_arr_odd_d ON lion_arr_odd USING lion (d);
+INSERT INTO lion_arr_odd (m, d)
 	VALUES ('{{1,2},{3,4}}', '{a,b}'), ('{{5,6},{1,9}}', '{b,c}');
-SELECT roaring_index_verify('rbi_arr_odd_m', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_odd_m', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_arr_odd_d', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_arr_odd_d', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT m FROM rbi_arr_odd WHERE m @> '{1}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT m FROM lion_arr_odd WHERE m @> '{1}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 2 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT m FROM rbi_arr_odd WHERE m @> '{{1,2}}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT m FROM lion_arr_odd WHERE m @> '{{1,2}}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT d FROM rbi_arr_odd WHERE d @> '{b}'$$);
-     rbi_arrcmp     
+SELECT lion_arrcmp($$SELECT d FROM lion_arr_odd WHERE d @> '{b}'$$);
+    lion_arrcmp     
 --------------------
  index scan, 2 rows
 (1 row)
 
-DROP TABLE rbi_arr_odd;
+DROP TABLE lion_arr_odd;
 -- ---- costing the ALL-mode fallback (2026-09-21 follow-up review) -------
 /*
  * `<@`, `@> '{}'` and any query with a NULL element cannot be answered from
- * the stored element memberships: the extractor falls back to RBI_QMODE_ALL,
+ * the stored element memberships: the extractor falls back to LION_QMODE_ALL,
  * the scan emits the union of every entry, and every candidate row is
  * fetched and rechecked in the heap (DESIGN.md §17).  The generic index
  * estimate used to price that with the PREDICATE's selectivity, which made a
@@ -829,85 +829,85 @@ DROP TABLE rbi_arr_odd;
  * the expensive shape too, because the query's SHAPE is what decides its
  * mode.
  */
-CREATE TABLE rbi_arrc (id int NOT NULL, tags text[] NOT NULL);
-INSERT INTO rbi_arrc
+CREATE TABLE lion_arrc (id int NOT NULL, tags text[] NOT NULL);
+INSERT INTO lion_arrc
 SELECT i, ARRAY['t' || (i % 20), 't' || (i % 400), 'u' || i]
   FROM generate_series(1, 20000) i;
-CREATE INDEX rbi_arrc_tags ON rbi_arrc USING roaring (tags);
-VACUUM ANALYZE rbi_arrc;
+CREATE INDEX lion_arrc_tags ON lion_arrc USING lion (tags);
+VACUUM ANALYZE lion_arrc;
 -- exact: containment and overlap over real elements
-EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc WHERE tags @> ARRAY['u500'];
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc WHERE tags @> ARRAY['u500'];
                       QUERY PLAN                      
 ------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_arrc
+   ->  Bitmap Heap Scan on lion_arrc
          Recheck Cond: (tags @> '{u500}'::text[])
-         ->  Bitmap Index Scan on rbi_arrc_tags
+         ->  Bitmap Index Scan on lion_arrc_tags
                Index Cond: (tags @> '{u500}'::text[])
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags @> ARRAY['u500', 't0'];
                        QUERY PLAN                        
 ---------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_arrc
+   ->  Bitmap Heap Scan on lion_arrc
          Recheck Cond: (tags @> '{u500,t0}'::text[])
-         ->  Bitmap Index Scan on rbi_arrc_tags
+         ->  Bitmap Index Scan on lion_arrc_tags
                Index Cond: (tags @> '{u500,t0}'::text[])
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags && ARRAY['u500', 'u501'];
                         QUERY PLAN                         
 -----------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_arrc
+   ->  Bitmap Heap Scan on lion_arrc
          Recheck Cond: (tags && '{u500,u501}'::text[])
-         ->  Bitmap Index Scan on rbi_arrc_tags
+         ->  Bitmap Index Scan on lion_arrc_tags
                Index Cond: (tags && '{u500,u501}'::text[])
 (5 rows)
 
 -- ALL mode: `<@`, the empty array, a NULL element
-EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags <@ ARRAY['u500', 't0', 't1'];
                     QUERY PLAN                    
 --------------------------------------------------
  Aggregate
-   ->  Seq Scan on rbi_arrc
+   ->  Seq Scan on lion_arrc
          Filter: (tags <@ '{u500,t0,t1}'::text[])
 (3 rows)
 
-EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc WHERE tags @> ARRAY[]::text[];
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc WHERE tags @> ARRAY[]::text[];
                QUERY PLAN               
 ----------------------------------------
  Aggregate
-   ->  Seq Scan on rbi_arrc
+   ->  Seq Scan on lion_arrc
          Filter: (tags @> '{}'::text[])
 (3 rows)
 
-EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags @> ARRAY['u500', NULL];
                    QUERY PLAN                    
 -------------------------------------------------
  Aggregate
-   ->  Seq Scan on rbi_arrc
+   ->  Seq Scan on lion_arrc
          Filter: (tags @> '{u500,NULL}'::text[])
 (3 rows)
 
 -- an unknown value has to be priced as the expensive shape as well
-PREPARE rbi_arrc_p(text[]) AS SELECT sum(id) FROM rbi_arrc WHERE tags @> $1;
+PREPARE lion_arrc_p(text[]) AS SELECT sum(id) FROM lion_arrc WHERE tags @> $1;
 SET plan_cache_mode = force_generic_plan;
-EXPLAIN (COSTS OFF) EXECUTE rbi_arrc_p(ARRAY['u500']);
+EXPLAIN (COSTS OFF) EXECUTE lion_arrc_p(ARRAY['u500']);
           QUERY PLAN          
 ------------------------------
  Aggregate
-   ->  Seq Scan on rbi_arrc
+   ->  Seq Scan on lion_arrc
          Filter: (tags @> $1)
 (3 rows)
 
 RESET plan_cache_mode;
-DEALLOCATE rbi_arrc_p;
+DEALLOCATE lion_arrc_p;
 /*
  * ... and the count pushdown refuses a multi-key clause it cannot see the
  * query of, for the same reason: `tags @> $1` with `$1 = '{}'` extracts to
@@ -915,95 +915,95 @@ DEALLOCATE rbi_arrc_p;
  * there would be no plan left to fall back to (DESIGN.md §17).  A CUSTOM
  * plan folds the parameter to a literal and is pushed down as usual.
  */
-PREPARE rbi_arrc_c(text[]) AS SELECT count(*) FROM rbi_arrc WHERE tags @> $1;
+PREPARE lion_arrc_c(text[]) AS SELECT count(*) FROM lion_arrc WHERE tags @> $1;
 SET plan_cache_mode = force_generic_plan;
-EXPLAIN (COSTS OFF) EXECUTE rbi_arrc_c(ARRAY['u500']);
+EXPLAIN (COSTS OFF) EXECUTE lion_arrc_c(ARRAY['u500']);
           QUERY PLAN          
 ------------------------------
  Aggregate
-   ->  Seq Scan on rbi_arrc
+   ->  Seq Scan on lion_arrc
          Filter: (tags @> $1)
 (3 rows)
 
-EXECUTE rbi_arrc_c(ARRAY['u500']);
+EXECUTE lion_arrc_c(ARRAY['u500']);
  count 
 -------
      1
 (1 row)
 
-EXECUTE rbi_arrc_c(ARRAY[]::text[]);
+EXECUTE lion_arrc_c(ARRAY[]::text[]);
  count 
 -------
  20000
 (1 row)
 
 SET plan_cache_mode = force_custom_plan;
-EXPLAIN (COSTS OFF) EXECUTE rbi_arrc_c(ARRAY['u500']);
-                    QUERY PLAN                     
----------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_arrc_tags (tags @> {u500})
+EXPLAIN (COSTS OFF) EXECUTE lion_arrc_c(ARRAY['u500']);
+                   QUERY PLAN                    
+-------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_arrc_tags (tags @> {u500})
 (2 rows)
 
-EXECUTE rbi_arrc_c(ARRAY['u500']);
+EXECUTE lion_arrc_c(ARRAY['u500']);
  count 
 -------
      1
 (1 row)
 
 RESET plan_cache_mode;
-DEALLOCATE rbi_arrc_c;
+DEALLOCATE lion_arrc_c;
 -- and the answers are the same whichever plan runs
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arrc
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arrc
 				    WHERE tags <@ ARRAY['u500', 't0', 't1']$$);
-     rbi_arrcmp     
+    lion_arrcmp     
 --------------------
  index scan, 1 rows
 (1 row)
 
-SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arrc
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arrc
 				    WHERE tags @> ARRAY['u500', 't0']$$);
-     rbi_arrcmp      
+     lion_arrcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-DROP TABLE rbi_arrc;
+DROP TABLE lion_arrc;
 -- ---- max_entries, the cardinality guard --------------------------------
-CREATE TABLE rbi_arr_many (a text[]);
-INSERT INTO rbi_arr_many
+CREATE TABLE lion_arr_many (a text[]);
+INSERT INTO lion_arr_many
 SELECT ARRAY['k' || i, 'k' || (i + 1)] FROM generate_series(1, 2000) i;
 -- the build counts the distinct keys exactly, so the warning is exact
 SET client_min_messages = warning;
-CREATE INDEX rbi_arr_many_a ON rbi_arr_many USING roaring (a)
+CREATE INDEX lion_arr_many_a ON lion_arr_many USING lion (a)
 	WITH (max_entries = 100);
-WARNING:  roaring index "rbi_arr_many_a" has more than 100 distinct keys
+WARNING:  lion index "lion_arr_many_a" has more than 100 distinct keys
 -- once per backend per index: the insert below stays quiet
-INSERT INTO rbi_arr_many VALUES (ARRAY['brand', 'new']);
-SELECT entries > 100 FROM roaring_index_stats('rbi_arr_many_a');
+INSERT INTO lion_arr_many VALUES (ARRAY['brand', 'new']);
+SELECT entries > 100 FROM lion_index_stats('lion_arr_many_a');
  ?column? 
 ----------
  t
 (1 row)
 
 -- a fresh index in a fresh backend warns again, this time from an insert
-DROP INDEX rbi_arr_many_a;
+DROP INDEX lion_arr_many_a;
 \connect -
 SET client_min_messages = warning;
 SET synchronous_commit = on;
-CREATE INDEX rbi_arr_many_b ON rbi_arr_many USING roaring (a)
+CREATE INDEX lion_arr_many_b ON lion_arr_many USING lion (a)
 	WITH (max_entries = 1000000);
-ALTER INDEX rbi_arr_many_b SET (max_entries = 50);
-INSERT INTO rbi_arr_many SELECT ARRAY['z' || i] FROM generate_series(1, 200) i;
-WARNING:  roaring index "rbi_arr_many_b" has more than 50 distinct keys
-SELECT roaring_index_verify('rbi_arr_many_b', true);
- roaring_index_verify 
-----------------------
+ALTER INDEX lion_arr_many_b SET (max_entries = 50);
+INSERT INTO lion_arr_many SELECT ARRAY['z' || i] FROM generate_series(1, 200) i;
+WARNING:  lion index "lion_arr_many_b" has more than 50 distinct keys
+SELECT lion_index_verify('lion_arr_many_b', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-DROP TABLE rbi_arr_many;
-DROP TABLE rbi_arr;
-DROP FUNCTION rbi_arrcmp(text);
-DROP FUNCTION rbi_arrplan(text);
+DROP TABLE lion_arr_many;
+DROP TABLE lion_arr;
+DROP FUNCTION lion_arrcmp(text);
+DROP FUNCTION lion_arrplan(text);
 DROP DOMAIN tarr;

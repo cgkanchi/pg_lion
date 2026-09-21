@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_scan.c
- *		Bitmap scan support for the roaring index (DESIGN.md section 5, SCAN).
+ * lion_scan.c
+ *		Bitmap scan support for the lion index (DESIGN.md section 5, SCAN).
  *
- * A roaring index answers one qual on its single key column: an equality to a
+ * A lion index answers one qual on its single key column: an equality to a
  * value, `= ANY (array)` (DESIGN.md §15, amsearcharray), `IS NULL` or
  * `IS NOT NULL` (DESIGN.md §14, amsearchnulls).  The scan finds the entries
  * the qual selects and emits their posting sets into the caller's TIDBitmap.
@@ -12,7 +12,7 @@
  * instead.  The query is handed to the opclass's extractQuery function, which
  * yields keys and a mode; an exact mode gives a boolean tree over those keys,
  * whose posting sets are combined by the very evaluator the count pushdown
- * uses (rbi_sets_iterate(), DESIGN.md §9 cursors), and anything else falls
+ * uses (lion_sets_iterate(), DESIGN.md §9 cursors), and anything else falls
  * back to emitting every indexed row with recheck set.
  *
  * Only one page lock is held at a time, and never across the TIDBitmap calls:
@@ -35,22 +35,22 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
-#include "rbi.h"
-#include "rbi_count.h"
+#include "lion.h"
+#include "lion_count.h"
 
-typedef struct RBIScanOpaqueData
+typedef struct LionScanOpaqueData
 {
-	RBIState   *state;			/* cached relation state */
+	LionState   *state;			/* cached relation state */
 	Oid			subtype;		/* type of the scan key argument */
 	FmgrInfo	subhashproc;	/* hash function for that type */
 	bool		subhashvalid;
 	bool		recheck;		/* the emitted TIDs are a superset */
-} RBIScanOpaqueData;
+} LionScanOpaqueData;
 
-typedef RBIScanOpaqueData *RBIScanOpaque;
+typedef LionScanOpaqueData *LionScanOpaque;
 
-/* State threaded through rbi_container_iterate() by rbi_container_to_tbm() */
-typedef struct RBITbmState
+/* State threaded through lion_container_iterate() by lion_container_to_tbm() */
+typedef struct LionTbmState
 {
 	TIDBitmap  *tbm;
 	BlockNumber firstblk;		/* first heap block of the container */
@@ -58,18 +58,18 @@ typedef struct RBITbmState
 	int			ntids;
 	int64		total;
 	bool		recheck;		/* passed on to tbm_add_tuples() */
-	ItemPointerData tids[RBI_MAX_OFFSET + 1];
-} RBITbmState;
+	ItemPointerData tids[LION_MAX_OFFSET + 1];
+} LionTbmState;
 
 static bool
-rbi_tbm_callback(uint16 lo, void *arg)
+lion_tbm_callback(uint16 lo, void *arg)
 {
-	RBITbmState *st = (RBITbmState *) arg;
+	LionTbmState *st = (LionTbmState *) arg;
 	uint16		blkinc;
 	OffsetNumber off;
 	BlockNumber blk;
 
-	rbi_lo_split(lo, &blkinc, &off);
+	lion_lo_split(lo, &blkinc, &off);
 	blk = st->firstblk + (BlockNumber) blkinc;
 
 	/*
@@ -78,14 +78,14 @@ rbi_tbm_callback(uint16 lo, void *arg)
 	 * belt and braces: a corrupt container must not overrun tids[].
 	 */
 	if (st->ntids > 0 &&
-		(blk != st->curblk || st->ntids > RBI_MAX_OFFSET))
+		(blk != st->curblk || st->ntids > LION_MAX_OFFSET))
 	{
 		tbm_add_tuples(st->tbm, st->tids, st->ntids, st->recheck);
 		st->ntids = 0;
 	}
 	st->curblk = blk;
 
-	Assert(st->ntids <= RBI_MAX_OFFSET);
+	Assert(st->ntids <= LION_MAX_OFFSET);
 	ItemPointerSet(&st->tids[st->ntids], blk, off);
 	st->ntids++;
 	st->total++;
@@ -99,12 +99,12 @@ rbi_tbm_callback(uint16 lo, void *arg)
  * own container key has to be recomputed as the ckey changes.
  */
 static bool
-rbi_tbm_pair_callback(uint32 ckey, uint16 lo, void *arg)
+lion_tbm_pair_callback(uint32 ckey, uint16 lo, void *arg)
 {
-	RBITbmState *st = (RBITbmState *) arg;
+	LionTbmState *st = (LionTbmState *) arg;
 
-	st->firstblk = rbi_ckey_first_block(ckey);
-	return rbi_tbm_callback(lo, arg);
+	st->firstblk = lion_ckey_first_block(ckey);
+	return lion_tbm_callback(lo, arg);
 }
 
 /*
@@ -112,21 +112,21 @@ rbi_tbm_pair_callback(uint32 ckey, uint16 lo, void *arg)
  * tbm_add_tuples() call per heap block.  Returns the number of TIDs emitted.
  */
 int64
-rbi_container_to_tbm(const RBIContainer *c, TIDBitmap *tbm, bool recheck)
+lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck)
 {
-	RBITbmState st;
+	LionTbmState st;
 
 	st.tbm = tbm;
-	st.firstblk = rbi_ckey_first_block(c->ckey);
+	st.firstblk = lion_ckey_first_block(c->ckey);
 	st.curblk = InvalidBlockNumber;
 	st.ntids = 0;
 	st.total = 0;
 	st.recheck = recheck;
 
-	if (c->type == RBI_CT_SPARSE)
-		rbi_sparse_iterate(c, rbi_tbm_pair_callback, &st);
+	if (c->type == LION_CT_SPARSE)
+		lion_sparse_iterate(c, lion_tbm_pair_callback, &st);
 	else
-		rbi_container_iterate(c, rbi_tbm_callback, &st);
+		lion_container_iterate(c, lion_tbm_callback, &st);
 
 	if (st.ntids > 0)
 		tbm_add_tuples(tbm, st.tids, st.ntids, st.recheck);
@@ -139,29 +139,29 @@ rbi_container_to_tbm(const RBIContainer *c, TIDBitmap *tbm, bool recheck)
  * without padding, so each one is copied into an aligned buffer first.
  */
 static int64
-rbi_emit_inline(const char *payload, Size paylen, TIDBitmap *tbm, bool recheck)
+lion_emit_inline(const char *payload, Size paylen, TIDBitmap *tbm, bool recheck)
 {
 	int64		ntids = 0;
 	Size		off = 0;
-	RBIContainer *cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	LionContainer *cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-	while (rbi_inline_fetch(payload, paylen, &off, cbuf) > 0)
-		ntids += rbi_container_to_tbm(cbuf, tbm, recheck);
+	while (lion_inline_fetch(payload, paylen, &off, cbuf) > 0)
+		ntids += lion_container_to_tbm(cbuf, tbm, recheck);
 
 	pfree(cbuf);
 	return ntids;
 }
 
 IndexScanDesc
-rbibeginscan(Relation r, int nkeys, int norderbys)
+lionbeginscan(Relation r, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
-	RBIScanOpaque so;
+	LionScanOpaque so;
 
 	scan = RelationGetIndexScan(r, nkeys, norderbys);
 
-	so = (RBIScanOpaque) palloc0(sizeof(RBIScanOpaqueData));
-	so->state = rbi_get_state(r);
+	so = (LionScanOpaque) palloc0(sizeof(LionScanOpaqueData));
+	so->state = lion_get_state(r);
 	so->subtype = InvalidOid;
 	so->subhashvalid = false;
 
@@ -171,7 +171,7 @@ rbibeginscan(Relation r, int nkeys, int norderbys)
 }
 
 void
-rbirescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+lionrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		  ScanKey orderbys, int norderbys)
 {
 	if (scankey && scan->numberOfKeys > 0)
@@ -180,9 +180,9 @@ rbirescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 }
 
 void
-rbiendscan(IndexScanDesc scan)
+lionendscan(IndexScanDesc scan)
 {
-	RBIScanOpaque so = (RBIScanOpaque) scan->opaque;
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
 
 	if (so != NULL)
 	{
@@ -201,7 +201,7 @@ rbiendscan(IndexScanDesc scan)
  * while a container page is pinned, and this function pins them.
  */
 static int64
-rbi_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
+lion_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
 {
 	PGAlignedBlock *copy;
 	int64		ntids = 0;
@@ -222,16 +222,16 @@ rbi_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
 		buf = ReadBuffer(index, blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (!RBIPageIsContainer(page))
+		if (!LionPageIsContainer(page))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "roaring index: block %u is not a container page",
+			elog(ERROR, "lion index: block %u is not a container page",
 				 blkno);
 		}
 		memcpy(cpage, page, BLCKSZ);
 		UnlockReleaseBuffer(buf);
 
-		blkno = RBIPageGetOpaque(cpage)->rightlink;
+		blkno = LionPageGetOpaque(cpage)->rightlink;
 
 		maxoff = PageGetMaxOffsetNumber(cpage);
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
@@ -240,7 +240,7 @@ rbi_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			ntids += rbi_container_to_tbm((RBIContainer *) PageGetItem(cpage, iid),
+			ntids += lion_container_to_tbm((LionContainer *) PageGetItem(cpage, iid),
 										  tbm, recheck);
 		}
 
@@ -258,29 +258,29 @@ rbi_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
  * touched.
  */
 static int64
-rbi_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
+lion_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
 			   OffsetNumber entryoff, TIDBitmap *tbm, bool recheck)
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
-	RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 	char	   *payload = NULL;
 	Size		paylen = 0;
 	BlockNumber blkno = InvalidBlockNumber;
 	int64		ntids;
 
-	if (entry->flags & RBI_ENTRY_INLINE)
+	if (entry->flags & LION_ENTRY_INLINE)
 	{
-		paylen = RBI_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+		paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
 		if (paylen > 0)
 		{
 			payload = (char *) palloc(paylen);
-			memcpy(payload, RBIEntryGetPayload(entry), paylen);
+			memcpy(payload, LionEntryGetPayload(entry), paylen);
 		}
 	}
 	else
 	{
-		Assert(entry->flags & RBI_ENTRY_CHAIN);
+		Assert(entry->flags & LION_ENTRY_CHAIN);
 		blkno = entry->head;
 	}
 
@@ -290,12 +290,12 @@ rbi_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
 
 	if (payload != NULL)
 	{
-		ntids = rbi_emit_inline(payload, paylen, tbm, recheck);
+		ntids = lion_emit_inline(payload, paylen, tbm, recheck);
 		pfree(payload);
 		return ntids;
 	}
 
-	return rbi_emit_chain(index, blkno, tbm, recheck);
+	return lion_emit_chain(index, blkno, tbm, recheck);
 }
 
 /*
@@ -305,13 +305,13 @@ rbi_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
  * which for an array key is the type of its elements.
  */
 static uint32
-rbi_scankey_hash(IndexScanDesc scan, RBIScanOpaque so, Oid subtype,
+lion_scankey_hash(IndexScanDesc scan, LionScanOpaque so, Oid subtype,
 				 Oid collation, Datum value)
 {
 	Relation	index = scan->indexRelation;
 
 	if (!OidIsValid(subtype) || subtype == index->rd_opcintype[0])
-		return rbi_hash_key(so->state, value);
+		return lion_hash_key(so->state, value);
 
 	if (!so->subhashvalid || so->subtype != subtype)
 	{
@@ -338,25 +338,25 @@ rbi_scankey_hash(IndexScanDesc scan, RBIScanOpaque so, Oid subtype,
  * Emit the posting set of one search value.
  */
 static int64
-rbi_emit_value(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey, Datum value,
+lion_emit_value(IndexScanDesc scan, LionScanOpaque so, ScanKey skey, Datum value,
 			   TIDBitmap *tbm)
 {
 	Relation	index = scan->indexRelation;
-	RBIState   *state = so->state;
+	LionState   *state = so->state;
 	uint32		hash;
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 
-	hash = rbi_scankey_hash(scan, so, skey->sk_subtype, skey->sk_collation,
+	hash = lion_scankey_hash(scan, so, skey->sk_subtype, skey->sk_collation,
 							value);
 
 	headbuf = ReadBuffer(index,
-						 RBI_BUCKET_BLKNO(rbi_bucket_of(hash,
+						 LION_BUCKET_BLKNO(lion_bucket_of(hash,
 														state->meta.nbuckets)));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
-	if (!rbi_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
+	if (!lion_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
 							value, hash, &skey->sk_func, skey->sk_collation,
 							&entrybuf, &entryoff))
 	{
@@ -364,7 +364,7 @@ rbi_emit_value(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey, Datum value,
 		return 0;
 	}
 
-	return rbi_emit_entry(index, headbuf, entrybuf, entryoff, tbm, so->recheck);
+	return lion_emit_entry(index, headbuf, entrybuf, entryoff, tbm, so->recheck);
 }
 
 /*
@@ -373,7 +373,7 @@ rbi_emit_value(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey, Datum value,
  * nothing, and repeated elements are harmless because a TIDBitmap is a set.
  */
 static int64
-rbi_emit_array(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
+lion_emit_array(IndexScanDesc scan, LionScanOpaque so, ScanKey skey,
 			   TIDBitmap *tbm)
 {
 	ArrayType  *arr = DatumGetArrayTypeP(skey->sk_argument);
@@ -395,7 +395,7 @@ rbi_emit_array(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
 	{
 		if (nulls[i])
 			continue;			/* `x = NULL` is never true */
-		ntids += rbi_emit_value(scan, so, skey, elems[i], tbm);
+		ntids += lion_emit_value(scan, so, skey, elems[i], tbm);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -411,23 +411,23 @@ rbi_emit_array(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
  * `col IS NULL` (DESIGN.md §14): the reserved NULL entry of bucket 0.
  */
 static int64
-rbi_emit_null(Relation index, RBIState *state, TIDBitmap *tbm, bool recheck)
+lion_emit_null(Relation index, LionState *state, TIDBitmap *tbm, bool recheck)
 {
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 
-	headbuf = ReadBuffer(index, RBI_BUCKET_BLKNO(RBI_NULLKEY_BUCKET));
+	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(LION_NULLKEY_BUCKET));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
-	if (!rbi_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
+	if (!lion_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
 							 &entrybuf, &entryoff))
 	{
 		UnlockReleaseBuffer(headbuf);
 		return 0;
 	}
 
-	return rbi_emit_entry(index, headbuf, entrybuf, entryoff, tbm, recheck);
+	return lion_emit_entry(index, headbuf, entrybuf, entryoff, tbm, recheck);
 }
 
 /*
@@ -458,7 +458,7 @@ rbi_emit_null(Relation index, RBIState *state, TIDBitmap *tbm, bool recheck)
  * this scan can see.
  */
 static int64
-rbi_emit_all_keys(Relation index, RBIState *state, TIDBitmap *tbm,
+lion_emit_all_keys(Relation index, LionState *state, TIDBitmap *tbm,
 				  bool recheck)
 {
 	PGAlignedBlock *copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
@@ -468,7 +468,7 @@ rbi_emit_all_keys(Relation index, RBIState *state, TIDBitmap *tbm,
 
 	for (b = 0; b < state->meta.nbuckets; b++)
 	{
-		BlockNumber blkno = RBI_BUCKET_BLKNO(b);
+		BlockNumber blkno = LION_BUCKET_BLKNO(b);
 
 		while (BlockNumberIsValid(blkno))
 		{
@@ -480,36 +480,36 @@ rbi_emit_all_keys(Relation index, RBIState *state, TIDBitmap *tbm,
 			buf = ReadBuffer(index, blkno);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
-			if (!RBIPageIsBucket(page))
+			if (!LionPageIsBucket(page))
 			{
 				UnlockReleaseBuffer(buf);
-				elog(ERROR, "roaring index: block %u is not a bucket page",
+				elog(ERROR, "lion index: block %u is not a bucket page",
 					 blkno);
 			}
 			memcpy(cpage, page, BLCKSZ);
 			UnlockReleaseBuffer(buf);
 
-			blkno = RBIPageGetOpaque(cpage)->rightlink;
+			blkno = LionPageGetOpaque(cpage)->rightlink;
 			maxoff = PageGetMaxOffsetNumber(cpage);
 
 			for (off = FirstOffsetNumber; off <= maxoff; off++)
 			{
 				ItemId		iid = PageGetItemId(cpage, off);
-				RBIEntryTuple *entry;
+				LionEntryTuple *entry;
 
 				if (!ItemIdIsUsed(iid))
 					continue;
-				entry = (RBIEntryTuple *) PageGetItem(cpage, iid);
-				if (RBIEntryIsNullKey(entry))
+				entry = (LionEntryTuple *) PageGetItem(cpage, iid);
+				if (LionEntryIsNullKey(entry))
 					continue;
 
-				if ((entry->flags & RBI_ENTRY_INLINE) != 0)
-					ntids += rbi_emit_inline(RBIEntryGetPayload(entry),
-											 RBI_ENTRY_PAYLOAD_LEN(entry,
+				if ((entry->flags & LION_ENTRY_INLINE) != 0)
+					ntids += lion_emit_inline(LionEntryGetPayload(entry),
+											 LION_ENTRY_PAYLOAD_LEN(entry,
 																   ItemIdGetLength(iid)),
 											 tbm, recheck);
 				else
-					ntids += rbi_emit_chain(index, entry->head, tbm, recheck);
+					ntids += lion_emit_chain(index, entry->head, tbm, recheck);
 
 				CHECK_FOR_INTERRUPTS();
 			}
@@ -524,20 +524,20 @@ rbi_emit_all_keys(Relation index, RBIState *state, TIDBitmap *tbm,
  * Multi-key opclasses (DESIGN.md §17)
  * --------------------------------------------------------------------- */
 
-/* State threaded through rbi_sets_iterate() by rbi_emit_query(). */
-typedef struct RBIQueryEmitState
+/* State threaded through lion_sets_iterate() by lion_emit_query(). */
+typedef struct LionQueryEmitState
 {
 	TIDBitmap  *tbm;
 	bool		recheck;
 	int64		ntids;
-} RBIQueryEmitState;
+} LionQueryEmitState;
 
 static bool
-rbi_query_emit_cb(const RBIContainer *c, void *arg)
+lion_query_emit_cb(const LionContainer *c, void *arg)
 {
-	RBIQueryEmitState *es = (RBIQueryEmitState *) arg;
+	LionQueryEmitState *es = (LionQueryEmitState *) arg;
 
-	es->ntids += rbi_container_to_tbm(c, es->tbm, es->recheck);
+	es->ntids += lion_container_to_tbm(c, es->tbm, es->recheck);
 	return true;
 }
 
@@ -545,7 +545,7 @@ rbi_query_emit_cb(const RBIContainer *c, void *arg)
  * Answer one multi-key query (`tags @> '{a,b}'`, `tsv @@ 'a & b'`, ...).
  *
  * The opclass's extractQuery function says which keys the query needs and how
- * exactly they answer it; rbi_extract_query() turns that into one of three
+ * exactly they answer it; lion_extract_query() turns that into one of three
  * shapes (DESIGN.md §17):
  *
  *	NONE	nothing can match - `tags && '{}'`, an empty tsquery;
@@ -560,12 +560,12 @@ rbi_query_emit_cb(const RBIContainer *c, void *arg)
  * this function takes is taken before the first container page is pinned.
  */
 static int64
-rbi_emit_query(Relation index, RBIState *state, StrategyNumber strategy,
+lion_emit_query(Relation index, LionState *state, StrategyNumber strategy,
 			   Datum query, TIDBitmap *tbm, bool recheck)
 {
-	RBIQuery	q;
-	RBIPostingSet *sets;
-	RBIQueryEmitState es;
+	LionQuery	q;
+	LionPostingSet *sets;
+	LionQueryEmitState es;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	int			i;
@@ -577,29 +577,29 @@ rbi_emit_query(Relation index, RBIState *state, StrategyNumber strategy,
 	 * context of their own rather than the executor's.
 	 */
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
-								"roaring index multikey scan",
+								"lion index multikey scan",
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
-	rbi_extract_query(state, query, strategy, &q);
+	lion_extract_query(state, query, strategy, &q);
 
-	if (q.mode != RBI_QMODE_KEYS)
+	if (q.mode != LION_QMODE_KEYS)
 	{
 		int64		ntids = 0;
 
 		MemoryContextSwitchTo(oldcxt);
-		if (q.mode == RBI_QMODE_ALL)
-			ntids = rbi_emit_all_keys(index, state, tbm, true);
+		if (q.mode == LION_QMODE_ALL)
+			ntids = lion_emit_all_keys(index, state, tbm, true);
 		MemoryContextDelete(cxt);
 		return ntids;
 	}
 
 	Assert(q.nkeys > 0 && q.tree != NULL);
 
-	sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * q.nkeys);
+	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * q.nkeys);
 	for (i = 0; i < q.nkeys; i++)
 	{
-		(void) rbi_posting_set_lookup(index, q.keys[i], InvalidOid, &sets[i]);
+		(void) lion_posting_set_lookup(index, q.keys[i], InvalidOid, &sets[i]);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -607,11 +607,11 @@ rbi_emit_query(Relation index, RBIState *state, StrategyNumber strategy,
 	es.recheck = recheck;
 	es.ntids = 0;
 
-	(void) rbi_sets_iterate(q.nkeys, sets, q.tree, rbi_query_emit_cb, &es);
+	(void) lion_sets_iterate(q.nkeys, sets, q.tree, lion_query_emit_cb, &es);
 
 	/* Every pin goes before the memory the sets live in does. */
 	for (i = 0; i < q.nkeys; i++)
-		rbi_posting_set_release(&sets[i]);
+		lion_posting_set_release(&sets[i]);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
@@ -630,17 +630,17 @@ rbi_emit_query(Relation index, RBIState *state, StrategyNumber strategy,
  * cost nothing but the second lookup.
  */
 static int64
-rbi_emit_multikey(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
+lion_emit_multikey(IndexScanDesc scan, LionScanOpaque so, ScanKey skey,
 				  TIDBitmap *tbm)
 {
 	Relation	index = scan->indexRelation;
-	RBIState   *state = so->state;
+	LionState   *state = so->state;
 
 	/*
 	 * A strategy this file does not know is an ERROR and not an empty result:
 	 * the opclass would be claiming an operator the scan cannot answer, and
 	 * answering "no rows" would be a wrong answer rather than a missing
-	 * optimisation.  rbi_gin_strategy() raises it.
+	 * optimisation.  lion_gin_strategy() raises it.
 	 */
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
 	{
@@ -663,7 +663,7 @@ rbi_emit_multikey(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
 		{
 			if (nulls[i])
 				continue;		/* a strict operator with a NULL is not true */
-			ntids += rbi_emit_query(index, state, skey->sk_strategy,
+			ntids += lion_emit_query(index, state, skey->sk_strategy,
 									elems[i], tbm, so->recheck);
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -676,23 +676,23 @@ rbi_emit_multikey(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
 		return ntids;
 	}
 
-	return rbi_emit_query(index, state, skey->sk_strategy, skey->sk_argument,
+	return lion_emit_query(index, state, skey->sk_strategy, skey->sk_argument,
 						  tbm, so->recheck);
 }
 
 int64
-rbigetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	Relation	index = scan->indexRelation;
-	RBIScanOpaque so = (RBIScanOpaque) scan->opaque;
-	RBIState   *state;
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+	LionState   *state;
 	ScanKey		skey;
 
 	/*
 	 * Re-fetch the cached state: a relcache invalidation since ambeginscan
 	 * would have thrown the copy in rd_amcache away.
 	 */
-	state = so->state = rbi_get_state(index);
+	state = so->state = lion_get_state(index);
 
 	pgstat_count_index_scan(index);
 	if (scan->instrument)
@@ -747,9 +747,9 @@ rbigetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	/* The null tests carry no strategy number and must be tested first. */
 	if ((skey->sk_flags & SK_SEARCHNULL) != 0)
-		return rbi_emit_null(index, state, tbm, so->recheck);
+		return lion_emit_null(index, state, tbm, so->recheck);
 	if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
-		return rbi_emit_all_keys(index, state, tbm, so->recheck);
+		return lion_emit_all_keys(index, state, tbm, so->recheck);
 
 	/* `col = NULL` (or a NULL array) is never true. */
 	if ((skey->sk_flags & SK_ISNULL) != 0)
@@ -757,13 +757,13 @@ rbigetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	/* A multi-key opclass answers the strategies of DESIGN.md §17. */
 	if (state->multikey)
-		return rbi_emit_multikey(scan, so, skey, tbm);
+		return lion_emit_multikey(scan, so, skey, tbm);
 
-	if (skey->sk_strategy != RBI_STRAT_EQUAL)
+	if (skey->sk_strategy != LION_STRAT_EQUAL)
 		return 0;
 
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
-		return rbi_emit_array(scan, so, skey, tbm);
+		return lion_emit_array(scan, so, skey, tbm);
 
-	return rbi_emit_value(scan, so, skey, skey->sk_argument, tbm);
+	return lion_emit_value(scan, so, skey, skey->sk_argument, tbm);
 }

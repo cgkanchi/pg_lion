@@ -1,4 +1,8 @@
 """Deterministic datasets and explicit SQL/operator coverage."""
+
+def am_name(family):
+    """Access method name for a benchmark family label (the roaring family's AM is 'lion')."""
+    return 'lion' if family == 'roaring' else family
 from dataclasses import dataclass, asdict
 
 SCALAR_COLUMNS = ['c2', 'c20', 'c200', 'c20k', 'c1m', 'clustered', 'skew', 'nullable']
@@ -112,7 +116,7 @@ def index_specs(suite, family):
     if suite=='scalar':
         method='btree' if family=='btree_tuned' else family
         suffix=' WITH (fastupdate=on)' if family=='gin' else ' WITH (pages_per_range=32)' if family=='brin' else ''
-        specs=[(f'ix_{c}',f'CREATE INDEX ix_{c} ON fact USING {method} ({c}){suffix}') for c in SCALAR_COLUMNS]
+        specs=[(f'ix_{c}',f'CREATE INDEX ix_{c} ON fact USING {am_name(method)} ({c}){suffix}') for c in SCALAR_COLUMNS]
         if family=='btree_tuned':
             specs += [('ix_composite','CREATE INDEX ix_composite ON fact (c200,c20,c2)'),
                       ('ix_covering','CREATE INDEX ix_covering ON fact (c200) INCLUDE (id,payload)')]
@@ -121,5 +125,5 @@ def index_specs(suite, family):
         if family=='gist':
             return [('ix_tsv','CREATE INDEX ix_tsv ON docs USING gist (tsv)'),
                     ('ix_grp','CREATE INDEX ix_grp ON docs USING gist (grp)')]
-        return [(f'ix_{c}',f'CREATE INDEX ix_{c} ON docs USING {family} ({c})') for c in ['tags','tsv','grp']]
+        return [(f'ix_{c}',f'CREATE INDEX ix_{c} ON docs USING {am_name(family)} ({c})') for c in ['tags','tsv','grp']]
     raise ValueError(suite)

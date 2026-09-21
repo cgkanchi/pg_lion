@@ -1,10 +1,13 @@
-# roaring_index — a roaring-bitmap inverted index AM for PostgreSQL (prototype)
+# pg_lion — a roaring-bitmap inverted index AM for PostgreSQL (prototype)
 
-`CREATE INDEX ... USING roaring (col)` builds one posting set of roaring-style containers
+Formerly `roaring_index`; renamed to pg_lion on 2026-09-21 (a roaring bitmap index, hence the lion). The on-disk
+format is unchanged: the meta-page magic still spells `RBI1`, so indexes built before the rename remain readable.
+
+`CREATE INDEX ... USING lion (col)` builds one posting set of roaring-style containers
 (array / bitset / run, ≤ 4104 bytes each, one per 64 heap pages) or sparse (container key, offset)
 segments per distinct key, plus one reserved entry for the rows whose key is NULL. The index serves
 Bitmap Index Scans through `amgetbitmap` for `col = v`, `col = ANY (list)`, `col IS NULL` and
-`col IS NOT NULL`, and a CustomScan (`RoaringCount`) answers
+`col IS NOT NULL`, and a CustomScan (`LionCount`) answers
 `SELECT count(*) [, k] FROM t WHERE k1 = c1 [AND ...] [GROUP BY k]` from the containers plus the
 visibility map, visiting the heap only for pages that are not all-visible. `DESIGN.md` is the spec:
 on-disk format, locking protocol, the VACUUM/visibility-map interlock argument (§9, §11), and the
@@ -27,28 +30,28 @@ generic-WAL records, and concurrent insert/delete/vacuum/read stress runs. Nothi
 `--enable-injection-points` and the `injection_points` test module installed, and
 `pg_isolation_regress` installed from `src/test/isolation`.
 
-    CREATE EXTENSION roaring_index;
-    CREATE INDEX ON fact USING roaring (country) WITH (buckets = 256, inline_limit = 4096);
-    SELECT * FROM roaring_index_stats('fact_country_idx');
-    SELECT roaring_index_verify('fact_country_idx', heapallindexed => true);
-    SELECT roaring_index_count('fact_country_idx', 'Japan');          -- VM-interlocked count
-    SET roaring_index.enable_count_pushdown = on;                       -- default on
-    EXPLAIN (ANALYZE) SELECT country, count(*) FROM fact GROUP BY country;   -- Custom Scan (RoaringCount)
+    CREATE EXTENSION pg_lion;
+    CREATE INDEX ON fact USING lion (country) WITH (buckets = 256, inline_limit = 4096);
+    SELECT * FROM lion_index_stats('fact_country_idx');
+    SELECT lion_index_verify('fact_country_idx', heapallindexed => true);
+    SELECT lion_index_count('fact_country_idx', 'Japan');          -- VM-interlocked count
+    SET pg_lion.enable_count_pushdown = on;                       -- default on
+    EXPLAIN (ANALYZE) SELECT country, count(*) FROM fact GROUP BY country;   -- Custom Scan (LionCount)
 
 ## Source layout
 
-    src/rbi_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
-    src/rbi_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
-    src/rbi.h, rbi_pages.c on-disk structs; meta/bucket/entry/chain primitives, page splits, generic WAL
-    src/rbi_am.c           handler, reloptions, amvalidate, cost estimate, buildempty, _PG_init hook/GUC
-    src/rbi_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key page chains
-    src/rbi_scan.c         amgetbitmap
-    src/rbi_insert.c       aminsert (bucket-serialised; bitset in-place fast path)
-    src/rbi_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
-    src/rbi_funcs.c        roaring_index_stats(), roaring_index_verify()
-    src/rbi_count.[ch]     rbi_count_keys(): VM-interlocked counting, per-block batched heap recheck
-    src/rbi_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "RoaringCount"
-    src/rbi_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
+    src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
+    src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
+    src/lion.h, lion_pages.c on-disk structs; meta/bucket/entry/chain primitives, page splits, generic WAL
+    src/lion_am.c           handler, reloptions, amvalidate, cost estimate, buildempty, _PG_init hook/GUC
+    src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key page chains
+    src/lion_scan.c         amgetbitmap
+    src/lion_insert.c       aminsert (bucket-serialised; bitset in-place fast path)
+    src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
+    src/lion_funcs.c        lion_index_stats(), lion_index_verify()
+    src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
+    src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
+    src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit
 
 ## Key types
@@ -57,7 +60,7 @@ One default operator class per type, reusing the hash access method's hash funct
 (`int2/int4/int8`, one family with cross-type equality), `float4/float8`, `numeric`, `bool`, `"char"`,
 `name`, `text` (and `varchar` through it), `char(n)`, `bytea`, `uuid`, `date`, `time`, `timetz`,
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `jsonb`, `pg_lsn`, `xid`, `cid`, `tid`,
-`oid`, and any enum. Case-insensitive text: `CREATE EXTENSION roaring_index_citext` (requires
+`oid`, and any enum. Case-insensitive text: `CREATE EXTENSION pg_lion_citext` (requires
 `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2000 bytes are rejected.
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
@@ -65,8 +68,8 @@ One default operator class per type, reusing the hash access method's hash funct
 `array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
 extraction functions, and answer
 
-    CREATE INDEX ON doc USING roaring (tags);       -- text[], int[], ...
-    CREATE INDEX ON doc USING roaring (tsv);        -- tsvector
+    CREATE INDEX ON doc USING lion (tags);       -- text[], int[], ...
+    CREATE INDEX ON doc USING lion (tsv);        -- tsvector
 
     tags @> '{a,b}'    the intersection of the elements' posting sets, exact
     tags && '{a,b}'    their union, exact
@@ -89,7 +92,7 @@ moves out of its entry tuple onto container pages of its own. The build chooses 
 from the BYTES its entries need, at three quarters of a page per bucket - not from the number of
 distinct keys - because every bucket owns a head page whether it needs one or not. Bucket counts
 are no longer rounded to a power of two; a hash is mapped to its bucket with a modulo.
-`roaring_index_stats()` reports the bucket count, the pages and entries, the containers by kind,
+`lion_index_stats()` reports the bucket count, the pages and entries, the containers by kind,
 the sparse segments, `null_tids`, the number of rows whose key is NULL, and `empty_tids`, the number
 of rows a multi-key opclass extracted no key from.
 
@@ -160,7 +163,7 @@ are 10x smaller than GIN and 60x smaller than btree.
 | c200_clustered | 132 MB | 23 MB | 2.1 MB | 2.7 MB |
 | c_skew | 133 MB | 26 MB | 41 MB | 30 MB |
 
-Build time per roaring index: 11-19 s (btree 4-10 s, GIN 4-21 s). A 14-bit container experiment
+Build time per lion index: 11-19 s (btree 4-10 s, GIN 4-21 s). A 14-bit container experiment
 helped only the 2-valued column (56 to 38 MB) and hurt mid-cardinality keys by 18%, so 15 bits stays.
 What remains of the gap on c20k is that each key's 6 KB posting set exceeds the inline limit and owns
 a whole container page (20,000 pages, 95 MB of them empty); sharing container pages between keys is
@@ -183,10 +186,10 @@ The roaring bitmap-index-scan node itself is fast (500k TIDs in 4 ms) but every 
 through Bitmap Heap Scan is heap-bound, exactly as the feasibility study predicted (the 10M-row
 count varied between 1.06 and 1.44 s across runs).
 
-Count pushdown (`Custom Scan (RoaringCount)`: containers + visibility map, heap visited only for
+Count pushdown (`Custom Scan (LionCount)`: containers + visibility map, heap visited only for
 the ~120 pages of this table that are not all-visible), pgbench average ms, same 20M-row table:
 
-| query | seqscan / hashagg | btree index-only | RoaringCount | speedup vs btree |
+| query | seqscan / hashagg | btree index-only | LionCount | speedup vs btree |
 |---|---|---|---|---|
 | count(*) where c2 = 1 (10M rows) | ~2000 | 604 | **2.6** | 230x |
 | count(*) where c200 = 17 (100k) | | 5.7 | **0.38** | 15x |
@@ -216,7 +219,7 @@ introduced the per-container visibility-map read); earlier runs survive only as 
 # Feasibility benchmark (pre-implementation)
 
 Reproducible material behind the 2026-09-20 assessment of the idea posted to pgsql-hackers in June 2022
-("An inverted index using roaring bitmaps"). Everything here ran against PostgreSQL master
+("An inverted index using lion bitmaps"). Everything here ran against PostgreSQL master
 (20devel, commit 9e17d25e, built from source with `-O2`) and pg_roaringbitmap 1.3 (CRoaring 4.3.11),
 on WSL2, 16 cores, 23 GB RAM, private cluster with `fsync=off`, `jit=off`, no parallel query,
 `work_mem=256MB`, `autovacuum=off`.

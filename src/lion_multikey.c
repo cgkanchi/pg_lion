@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_multikey.c
- *		Multi-key opclasses for the roaring index: arrays and tsvector
+ * lion_multikey.c
+ *		Multi-key opclasses for the lion index: arrays and tsvector
  *		(DESIGN.md §17).
  *
  * A multi-key opclass indexes one column value under many keys.  Rather than
@@ -17,12 +17,12 @@
  * this file does NOT reuse is GIN's consistent function: a roaring scan does
  * not test one row at a time against a bitmap of "which keys matched", it
  * combines whole posting sets.  So the query side turns the extracted keys
- * into a boolean TREE (RBIKeyNode) that the set algebra in rbi_count.c can
+ * into a boolean TREE (LionKeyNode) that the set algebra in lion_count.c can
  * evaluate, and falls back to "scan everything and recheck" for any query
  * shape that a plain AND/OR of key sets cannot express.
  *
- * The three answers a query can produce are RBI_QMODE_NONE (no rows),
- * RBI_QMODE_KEYS (exactly the rows the tree selects) and RBI_QMODE_ALL (every
+ * The three answers a query can produce are LION_QMODE_NONE (no rows),
+ * LION_QMODE_KEYS (exactly the rows the tree selects) and LION_QMODE_ALL (every
  * indexed row, with the operator re-applied by the caller).
  *
  *-------------------------------------------------------------------------
@@ -36,7 +36,7 @@
 #include "utils/datum.h"
 #include "utils/rel.h"
 
-#include "rbi.h"
+#include "lion.h"
 
 /*
  * Extracting more keys than this from one query is refused rather than
@@ -45,9 +45,9 @@
  * count pushdown rests on, and the same pin budget applies to a bitmap scan
  * that walks several chains at once).  A query with a thousand lexemes is
  * also exactly the case where a sequential scan does well.  Such a query
- * falls back to RBI_QMODE_ALL, which is correct, not an error.
+ * falls back to LION_QMODE_ALL, which is correct, not an error.
  */
-#define RBI_MAX_QUERY_KEYS		1000
+#define LION_MAX_QUERY_KEYS		1000
 
 /*
  * GIN's own strategy numbers for the operators our multi-key classes borrow
@@ -67,27 +67,27 @@
  * wrong operator and hand back INCLUDE_EMPTY, which only costs a rechecking
  * full scan - so the mapping lives in one place and is asserted to be total.
  */
-#define RBI_GIN_OVERLAP		1
-#define RBI_GIN_CONTAINS	2
-#define RBI_GIN_CONTAINED	3
-#define RBI_GIN_TSMATCH		1	/* tsvector_ops: @@ is GIN strategy 1 */
+#define LION_GIN_OVERLAP		1
+#define LION_GIN_CONTAINS	2
+#define LION_GIN_CONTAINED	3
+#define LION_GIN_TSMATCH		1	/* tsvector_ops: @@ is GIN strategy 1 */
 
 static StrategyNumber
-rbi_gin_strategy(StrategyNumber strategy)
+lion_gin_strategy(StrategyNumber strategy)
 {
 	switch (strategy)
 	{
-		case RBI_STRAT_CONTAINS:
-			return RBI_GIN_CONTAINS;
-		case RBI_STRAT_OVERLAP:
-			return RBI_GIN_OVERLAP;
-		case RBI_STRAT_CONTAINED:
-			return RBI_GIN_CONTAINED;
-		case RBI_STRAT_MATCH:
-			return RBI_GIN_TSMATCH;
+		case LION_STRAT_CONTAINS:
+			return LION_GIN_CONTAINS;
+		case LION_STRAT_OVERLAP:
+			return LION_GIN_OVERLAP;
+		case LION_STRAT_CONTAINED:
+			return LION_GIN_CONTAINED;
+		case LION_STRAT_MATCH:
+			return LION_GIN_TSMATCH;
 	}
 
-	elog(ERROR, "roaring index: strategy %d is not a multi-key strategy",
+	elog(ERROR, "lion index: strategy %d is not a multi-key strategy",
 		 strategy);
 	return 0;					/* keep the compiler quiet */
 }
@@ -96,12 +96,12 @@ rbi_gin_strategy(StrategyNumber strategy)
  * Key trees
  * --------------------------------------------------------------------- */
 
-static RBIKeyNode *
-rbi_keynode_leaf(int keyno)
+static LionKeyNode *
+lion_keynode_leaf(int keyno)
 {
-	RBIKeyNode *n = (RBIKeyNode *) palloc0(sizeof(RBIKeyNode));
+	LionKeyNode *n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
 
-	n->kind = RBI_KN_KEY;
+	n->kind = LION_KN_KEY;
 	n->keyno = keyno;
 	return n;
 }
@@ -111,18 +111,18 @@ rbi_keynode_leaf(int keyno)
  * one-child operator is folded away: the evaluator would handle it, but the
  * tree is easier to read in a debugger without it.
  */
-static RBIKeyNode *
-rbi_keynode_op(RBIKeyNodeKind kind, RBIKeyNode **args, int nargs)
+static LionKeyNode *
+lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args, int nargs)
 {
-	RBIKeyNode *n;
+	LionKeyNode *n;
 
-	Assert(kind == RBI_KN_AND || kind == RBI_KN_OR);
+	Assert(kind == LION_KN_AND || kind == LION_KN_OR);
 	Assert(nargs >= 1);
 
 	if (nargs == 1)
 		return args[0];
 
-	n = (RBIKeyNode *) palloc0(sizeof(RBIKeyNode));
+	n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
 	n->kind = kind;
 	n->nargs = nargs;
 	n->args = args;
@@ -130,18 +130,18 @@ rbi_keynode_op(RBIKeyNodeKind kind, RBIKeyNode **args, int nargs)
 }
 
 /* A flat AND (or OR) over keys 0 .. nkeys-1. */
-static RBIKeyNode *
-rbi_keynode_flat(RBIKeyNodeKind kind, int nkeys)
+static LionKeyNode *
+lion_keynode_flat(LionKeyNodeKind kind, int nkeys)
 {
-	RBIKeyNode **args;
+	LionKeyNode **args;
 	int			i;
 
 	Assert(nkeys >= 1);
-	args = (RBIKeyNode **) palloc(sizeof(RBIKeyNode *) * nkeys);
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nkeys);
 	for (i = 0; i < nkeys; i++)
-		args[i] = rbi_keynode_leaf(i);
+		args[i] = lion_keynode_leaf(i);
 
-	return rbi_keynode_op(kind, args, nkeys);
+	return lion_keynode_op(kind, args, nkeys);
 }
 
 /* ---------------------------------------------------------------------
@@ -154,17 +154,17 @@ rbi_keynode_flat(RBIKeyNodeKind kind, int nkeys)
  * the tie-break, so the order is deterministic whatever qsort does with equal
  * elements.
  */
-typedef struct RBIHashPos
+typedef struct LionHashPos
 {
 	uint32		hash;
 	int32		pos;
-} RBIHashPos;
+} LionHashPos;
 
 static int
-rbi_hashpos_cmp(const void *a, const void *b)
+lion_hashpos_cmp(const void *a, const void *b)
 {
-	const RBIHashPos *x = (const RBIHashPos *) a;
-	const RBIHashPos *y = (const RBIHashPos *) b;
+	const LionHashPos *x = (const LionHashPos *) a;
+	const LionHashPos *y = (const LionHashPos *) b;
 
 	if (x->hash < y->hash)
 		return -1;
@@ -178,10 +178,10 @@ rbi_hashpos_cmp(const void *a, const void *b)
  *
  * NULL keys are dropped: a row whose array holds a NULL element is indexed
  * under its other elements, and `@>`/`&&` with a NULL on either side is
- * answered by a rechecking scan (see rbi_extract_query()), never from the
+ * answered by a rechecking scan (see lion_extract_query()), never from the
  * posting sets, so nothing looks for a NULL key.  Duplicates are dropped too,
  * because a posting set is a set and adding the same TID twice would make
- * rbi_container_add() report "already indexed" and leave ntids wrong.
+ * lion_container_add() report "already indexed" and leave ntids wrong.
  *
  * Deduplication needs no ordering operator the key type may not have (the
  * opclass only promises a hash and an equality): every key is hashed once and
@@ -202,13 +202,13 @@ rbi_hashpos_cmp(const void *a, const void *b)
  * the row belongs in the reserved EMPTY entry (DESIGN.md §17).
  */
 int
-rbi_extract_value(RBIState *state, Datum value, Datum **keys)
+lion_extract_value(LionState *state, Datum value, Datum **keys)
 {
 	Datum	   *raw;
 	int32		nraw = 0;
 	bool	   *nulls = NULL;
 	Datum	   *out;
-	RBIHashPos *ord;
+	LionHashPos *ord;
 	int			nlive = 0;
 	int			nout = 0;
 	int			runstart = 0;	/* where this hash's distinct keys start */
@@ -228,12 +228,12 @@ rbi_extract_value(RBIState *state, Datum value, Datum **keys)
 		return 0;
 
 	/* Hash every non-NULL key once, then sort those hashes. */
-	ord = (RBIHashPos *) palloc(sizeof(RBIHashPos) * nraw);
+	ord = (LionHashPos *) palloc(sizeof(LionHashPos) * nraw);
 	for (i = 0; i < nraw; i++)
 	{
 		if (nulls != NULL && nulls[i])
 			continue;
-		ord[nlive].hash = rbi_hash_key(state, raw[i]);
+		ord[nlive].hash = lion_hash_key(state, raw[i]);
 		ord[nlive].pos = i;
 		nlive++;
 	}
@@ -244,7 +244,7 @@ rbi_extract_value(RBIState *state, Datum value, Datum **keys)
 		return 0;
 	}
 	if (nlive > 1)
-		qsort(ord, (size_t) nlive, sizeof(RBIHashPos), rbi_hashpos_cmp);
+		qsort(ord, (size_t) nlive, sizeof(LionHashPos), lion_hashpos_cmp);
 
 	out = (Datum *) palloc(sizeof(Datum) * nlive);
 
@@ -312,8 +312,8 @@ rbi_extract_value(RBIState *state, Datum value, Datum **keys)
  * alone is enough to decide, and so that a future opclass whose extractQuery
  * does not set pmatch cannot produce a wrong tree.
  */
-static RBIKeyNode *
-rbi_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
+static LionKeyNode *
+lion_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 				 bool *ok)
 {
 	QueryItem  *item;
@@ -337,7 +337,7 @@ rbi_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 			*ok = false;
 			return NULL;
 		}
-		return rbi_keynode_leaf(map[i]);
+		return lion_keynode_leaf(map[i]);
 	}
 
 	if (item->type != QI_OPR)
@@ -352,7 +352,7 @@ rbi_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 		case OP_OR:
 			{
 				uint32		left = item->qoperator.left;
-				RBIKeyNode **args;
+				LionKeyNode **args;
 
 				/*
 				 * The left operand is at item + left, and the right subtree
@@ -367,16 +367,16 @@ rbi_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 					return NULL;
 				}
 
-				args = (RBIKeyNode **) palloc(sizeof(RBIKeyNode *) * 2);
+				args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
 
 				/* Right operand first, exactly as ts_type.h lays them out. */
-				args[1] = rbi_tsquery_tree(items, size, i + 1, map, ok);
-				args[0] = rbi_tsquery_tree(items, size, i + (int32) left,
+				args[1] = lion_tsquery_tree(items, size, i + 1, map, ok);
+				args[0] = lion_tsquery_tree(items, size, i + (int32) left,
 										   map, ok);
 				if (!*ok)
 					return NULL;
-				return rbi_keynode_op(item->qoperator.oper == OP_AND ?
-									  RBI_KN_AND : RBI_KN_OR, args, 2);
+				return lion_keynode_op(item->qoperator.oper == OP_AND ?
+									  LION_KN_AND : LION_KN_OR, args, 2);
 			}
 
 		default:
@@ -387,11 +387,11 @@ rbi_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 }
 
 /*
- * The tsquery half of rbi_extract_query(): turn the query into a tree over
+ * The tsquery half of lion_extract_query(): turn the query into a tree over
  * the keys extractQuery returned, or give up.
  */
-static RBIKeyNode *
-rbi_tsquery_plan(Datum query, int nkeys)
+static LionKeyNode *
+lion_tsquery_plan(Datum query, int nkeys)
 {
 	TSQuery		tsq = DatumGetTSQuery(query);
 	QueryItem  *items;
@@ -399,7 +399,7 @@ rbi_tsquery_plan(Datum query, int nkeys)
 	int32		i;
 	int32		j = 0;
 	bool		ok = true;
-	RBIKeyNode *tree;
+	LionKeyNode *tree;
 
 	if (tsq->size <= 0)
 		return NULL;
@@ -425,7 +425,7 @@ rbi_tsquery_plan(Datum query, int nkeys)
 		return NULL;
 	}
 
-	tree = rbi_tsquery_tree(items, tsq->size, 0, map, &ok);
+	tree = lion_tsquery_tree(items, tsq->size, 0, map, &ok);
 	pfree(map);
 
 	return ok ? tree : NULL;
@@ -440,14 +440,14 @@ rbi_tsquery_plan(Datum query, int nkeys)
  * are only read when extractQuery set them.
  *
  * Anything that is not "the rows are exactly the ones an AND/OR of whole key
- * sets selects" becomes RBI_QMODE_ALL: a partial (prefix) match, because the
+ * sets selects" becomes LION_QMODE_ALL: a partial (prefix) match, because the
  * keys are hashed and a range of them cannot be walked; a NULL key, because
  * no row is indexed under one; INCLUDE_EMPTY and ALL, because the rows a
  * multi-key opclass extracted nothing from are not under any key.
  */
 void
-rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
-				  RBIQuery *q)
+lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
+				  LionQuery *q)
 {
 	int32		nkeys = 0;
 	bool	   *pmatch = NULL;
@@ -459,13 +459,13 @@ rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
 
 	Assert(state->multikey);
 
-	memset(q, 0, sizeof(RBIQuery));
+	memset(q, 0, sizeof(LionQuery));
 
 	keys = (Datum *) DatumGetPointer(FunctionCall7Coll(&state->extractquery,
 													   state->collation,
 													   query,
 													   PointerGetDatum(&nkeys),
-													   UInt16GetDatum(rbi_gin_strategy(strategy)),
+													   UInt16GetDatum(lion_gin_strategy(strategy)),
 													   PointerGetDatum(&pmatch),
 													   PointerGetDatum(&extra_data),
 													   PointerGetDatum(&nulls),
@@ -478,7 +478,7 @@ rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
 	if (searchMode != GIN_SEARCH_MODE_DEFAULT)
 	{
 		/* INCLUDE_EMPTY and ALL both mean "every indexed row, then recheck". */
-		q->mode = RBI_QMODE_ALL;
+		q->mode = LION_QMODE_ALL;
 		return;
 	}
 
@@ -488,13 +488,13 @@ rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
 		 * DEFAULT mode with no keys: nothing can match.  `tags && '{}'` and
 		 * an empty tsquery both land here.
 		 */
-		q->mode = RBI_QMODE_NONE;
+		q->mode = LION_QMODE_NONE;
 		return;
 	}
 
-	if (nkeys > RBI_MAX_QUERY_KEYS)
+	if (nkeys > LION_MAX_QUERY_KEYS)
 	{
-		q->mode = RBI_QMODE_ALL;
+		q->mode = LION_QMODE_ALL;
 		return;
 	}
 
@@ -502,7 +502,7 @@ rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
 	{
 		if ((pmatch != NULL && pmatch[i]) || (nulls != NULL && nulls[i]))
 		{
-			q->mode = RBI_QMODE_ALL;
+			q->mode = LION_QMODE_ALL;
 			return;
 		}
 	}
@@ -512,21 +512,21 @@ rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
 
 	switch (strategy)
 	{
-		case RBI_STRAT_CONTAINS:
+		case LION_STRAT_CONTAINS:
 			/* every element of the query array must be present */
-			q->tree = rbi_keynode_flat(RBI_KN_AND, nkeys);
+			q->tree = lion_keynode_flat(LION_KN_AND, nkeys);
 			break;
 
-		case RBI_STRAT_OVERLAP:
+		case LION_STRAT_OVERLAP:
 			/* at least one of them */
-			q->tree = rbi_keynode_flat(RBI_KN_OR, nkeys);
+			q->tree = lion_keynode_flat(LION_KN_OR, nkeys);
 			break;
 
-		case RBI_STRAT_MATCH:
-			q->tree = rbi_tsquery_plan(query, nkeys);
+		case LION_STRAT_MATCH:
+			q->tree = lion_tsquery_plan(query, nkeys);
 			break;
 
-		case RBI_STRAT_CONTAINED:
+		case LION_STRAT_CONTAINED:
 
 			/*
 			 * `<@` cannot be answered from the keys at all - a row matches
@@ -544,11 +544,11 @@ rbi_extract_query(RBIState *state, Datum query, StrategyNumber strategy,
 
 	if (q->tree == NULL)
 	{
-		q->mode = RBI_QMODE_ALL;
+		q->mode = LION_QMODE_ALL;
 		q->nkeys = 0;
 		q->keys = NULL;
 		return;
 	}
 
-	q->mode = RBI_QMODE_KEYS;
+	q->mode = LION_QMODE_KEYS;
 }

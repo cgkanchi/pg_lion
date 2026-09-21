@@ -1,12 +1,12 @@
 -- NULL keys (DESIGN.md section 14).
 --
--- A roaring index keeps the rows whose key is NULL in one reserved entry of
+-- A lion index keeps the rows whose key is NULL in one reserved entry of
 -- bucket 0.  Everything below checks the same thing twice: that the index
 -- path (bitmap scan, or the count pushdown) agrees with a plain sequential
--- scan, and that roaring_index_verify() is happy after every phase.
+-- scan, and that lion_index_verify() is happy after every phase.
 \set VERBOSITY terse
 SET client_min_messages = warning;
-LOAD 'roaring_index';
+LOAD 'pg_lion';
 /*
  * The count pushdown only skips the heap for pages the visibility map
  * vouches for, and VACUUM can only set that bit once the inserting
@@ -16,14 +16,14 @@ LOAD 'roaring_index';
  */
 SET synchronous_commit = on;
 SET default_statistics_target = 1000;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 /*
- * rbi_nullcmp() runs one query two ways - through the index (with the count
+ * lion_nullcmp() runs one query two ways - through the index (with the count
  * pushdown enabled) and through a plain sequential scan - and reports whether
  * the custom node was used and how many rows came out, after proving the two
  * result sets are equal as multisets.
  */
-CREATE FUNCTION rbi_nullcmp(q text) RETURNS text
+CREATE FUNCTION lion_nullcmp(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -31,29 +31,29 @@ DECLARE
 	nrows bigint;
 	ndiff bigint;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			pushed := true;
 		END IF;
 	END LOOP;
-	EXECUTE format('CREATE TEMP TABLE rbi_n_idx AS %s', q);
+	EXECUTE format('CREATE TEMP TABLE lion_n_idx AS %s', q);
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
-	EXECUTE format('CREATE TEMP TABLE rbi_n_seq AS %s', q);
+	EXECUTE format('CREATE TEMP TABLE lion_n_seq AS %s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
-	EXECUTE 'SELECT count(*) FROM rbi_n_idx' INTO nrows;
-	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM rbi_n_idx EXCEPT ALL SELECT * FROM rbi_n_seq) a)'
-			' + (SELECT count(*) FROM (SELECT * FROM rbi_n_seq EXCEPT ALL SELECT * FROM rbi_n_idx) b)'
+	EXECUTE 'SELECT count(*) FROM lion_n_idx' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_n_idx EXCEPT ALL SELECT * FROM lion_n_seq) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_n_seq EXCEPT ALL SELECT * FROM lion_n_idx) b)'
 		INTO ndiff;
-	EXECUTE 'DROP TABLE rbi_n_idx, rbi_n_seq';
+	EXECUTE 'DROP TABLE lion_n_idx, lion_n_seq';
 
 	IF ndiff <> 0 THEN
 		RETURN format('MISMATCH: %s rows differ', ndiff);
@@ -63,7 +63,7 @@ BEGIN
 				  nrows);
 END $$;
 /* The plan of one query, with the pushdown on. */
-CREATE FUNCTION rbi_nullplan(q text) RETURNS SETOF text
+CREATE FUNCTION lion_nullplan(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -74,50 +74,50 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 END $$;
-CREATE TABLE rbi_null (
+CREATE TABLE lion_null (
 	id	int	NOT NULL,
 	k	int,			-- one row in seven is NULL
 	t	text,			-- one row in eleven is NULL
 	d	int				-- never NULL, for the intersections
 );
-INSERT INTO rbi_null
+INSERT INTO lion_null
 SELECT i,
 	   CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 END,
 	   CASE WHEN i % 11 = 0 THEN NULL ELSE 'v' || (i % 3) END,
 	   i % 4
   FROM generate_series(1, 50000) i;
-CREATE INDEX rbi_null_k ON rbi_null USING roaring (k);
-CREATE INDEX rbi_null_t ON rbi_null USING roaring (t);
-CREATE INDEX rbi_null_d ON rbi_null USING roaring (d);
-VACUUM ANALYZE rbi_null;
+CREATE INDEX lion_null_k ON lion_null USING lion (k);
+CREATE INDEX lion_null_t ON lion_null USING lion (t);
+CREATE INDEX lion_null_d ON lion_null USING lion (d);
+VACUUM ANALYZE lion_null;
 -- ---- what the index holds ----------------------------------------------
-SELECT roaring_index_verify('rbi_null_k', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_null_t', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_t', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 -- one entry per key plus the reserved NULL entry
-SELECT entries, ntids, null_tids FROM roaring_index_stats('rbi_null_k');
+SELECT entries, ntids, null_tids FROM lion_index_stats('lion_null_k');
  entries | ntids | null_tids 
 ---------+-------+-----------
        6 | 50000 |      7142
 (1 row)
 
-SELECT entries, ntids, null_tids FROM roaring_index_stats('rbi_null_t');
+SELECT entries, ntids, null_tids FROM lion_index_stats('lion_null_t');
  entries | ntids | null_tids 
 ---------+-------+-----------
        4 | 50000 |      4545
 (1 row)
 
 -- a column without NULLs has no null entry at all
-SELECT entries, ntids, null_tids FROM roaring_index_stats('rbi_null_d');
+SELECT entries, ntids, null_tids FROM lion_index_stats('lion_null_d');
  entries | ntids | null_tids 
 ---------+-------+-----------
        4 | 50000 |         0
@@ -128,223 +128,223 @@ SELECT count(*) AS total,
 	   count(k) AS k_not_null,
 	   count(*) - count(k) AS k_null,
 	   count(t) AS t_not_null
-  FROM rbi_null;
+  FROM lion_null;
  total | k_not_null | k_null | t_not_null 
 -------+------------+--------+------------
  50000 |      42858 |   7142 |      45455
 (1 row)
 
 -- ---- bitmap scans (amsearchnulls) --------------------------------------
-SELECT rbi_nullplan('SELECT id FROM rbi_null WHERE k IS NULL');
-             rbi_nullplan              
----------------------------------------
- Bitmap Heap Scan on rbi_null
+SELECT lion_nullplan('SELECT id FROM lion_null WHERE k IS NULL');
+             lion_nullplan              
+----------------------------------------
+ Bitmap Heap Scan on lion_null
    Recheck Cond: (k IS NULL)
-   ->  Bitmap Index Scan on rbi_null_k
+   ->  Bitmap Index Scan on lion_null_k
          Index Cond: (k IS NULL)
 (4 rows)
 
-SELECT rbi_nullplan('SELECT id FROM rbi_null WHERE k IS NOT NULL');
-             rbi_nullplan              
----------------------------------------
- Bitmap Heap Scan on rbi_null
+SELECT lion_nullplan('SELECT id FROM lion_null WHERE k IS NOT NULL');
+             lion_nullplan              
+----------------------------------------
+ Bitmap Heap Scan on lion_null
    Recheck Cond: (k IS NOT NULL)
-   ->  Bitmap Index Scan on rbi_null_k
+   ->  Bitmap Index Scan on lion_null_k
          Index Cond: (k IS NOT NULL)
 (4 rows)
 
-SELECT rbi_nullplan($$SELECT id FROM rbi_null WHERE t IS NULL$$);
-             rbi_nullplan              
----------------------------------------
- Bitmap Heap Scan on rbi_null
+SELECT lion_nullplan($$SELECT id FROM lion_null WHERE t IS NULL$$);
+             lion_nullplan              
+----------------------------------------
+ Bitmap Heap Scan on lion_null
    Recheck Cond: (t IS NULL)
-   ->  Bitmap Index Scan on rbi_null_t
+   ->  Bitmap Index Scan on lion_null_t
          Index Cond: (t IS NULL)
 (4 rows)
 
-SET roaring_index.enable_count_pushdown = off;
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL');
-      rbi_nullcmp      
+SET pg_lion.enable_count_pushdown = off;
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL');
+     lion_nullcmp      
 -----------------------
  index scan, 7142 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NOT NULL');
-      rbi_nullcmp       
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NOT NULL');
+      lion_nullcmp      
 ------------------------
  index scan, 42858 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE t IS NULL');
-      rbi_nullcmp      
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE t IS NULL');
+     lion_nullcmp      
 -----------------------
  index scan, 4545 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE t IS NOT NULL');
-      rbi_nullcmp       
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE t IS NOT NULL');
+      lion_nullcmp      
 ------------------------
  index scan, 45455 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL AND t IS NULL');
-     rbi_nullcmp      
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL AND t IS NULL');
+     lion_nullcmp     
 ----------------------
  index scan, 649 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL AND t = ''v1''');
-      rbi_nullcmp      
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL AND t = ''v1''');
+     lion_nullcmp      
 -----------------------
  index scan, 2165 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k = 3 AND t IS NULL');
-     rbi_nullcmp      
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k = 3 AND t IS NULL');
+     lion_nullcmp     
 ----------------------
  index scan, 779 rows
 (1 row)
 
 -- a NULL comparison value is not a null test and matches nothing
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k = NULL');
-    rbi_nullcmp     
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k = NULL');
+    lion_nullcmp    
 --------------------
  index scan, 0 rows
 (1 row)
 
-SET roaring_index.enable_count_pushdown = on;
+SET pg_lion.enable_count_pushdown = on;
 -- ---- the count pushdown ------------------------------------------------
-SELECT rbi_nullplan('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-               rbi_nullplan                
--------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_null_k (k IS NULL)
+SELECT lion_nullplan('SELECT count(*) FROM lion_null WHERE k IS NULL');
+              lion_nullplan              
+-----------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_null_k (k IS NULL)
 (2 rows)
 
-SELECT rbi_nullplan('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL');
-                             rbi_nullplan                             
-----------------------------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_null_k (all keys), rbi_null_k (k IS NOT NULL)
+SELECT lion_nullplan('SELECT count(*) FROM lion_null WHERE k IS NOT NULL');
+                            lion_nullplan                            
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_null_k (all keys), lion_null_k (k IS NOT NULL)
 (2 rows)
 
-SELECT rbi_nullplan('SELECT k, count(*) FROM rbi_null GROUP BY k');
-           rbi_nullplan            
------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_null_k (k)
+SELECT lion_nullplan('SELECT k, count(*) FROM lion_null GROUP BY k');
+          lion_nullplan          
+---------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_null_k (k)
    Group Key: k
 (3 rows)
 
-SELECT rbi_nullplan('SELECT k, count(k) FROM rbi_null GROUP BY k');
-           rbi_nullplan            
------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_null_k (k)
+SELECT lion_nullplan('SELECT k, count(k) FROM lion_null GROUP BY k');
+          lion_nullplan          
+---------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_null_k (k)
    Group Key: k
 (3 rows)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE t IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE t IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE t IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE t IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL AND t IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL AND t IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL AND t IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NOT NULL AND t IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL AND d = 2');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL AND d = 2');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL AND d = 2');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NOT NULL AND d = 2');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k = 3 AND t IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k = 3 AND t IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- a contradiction still has to come out as zero
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL AND k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL AND k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- ... and a redundant null test must not change anything
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k = 3 AND k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k = 3 AND k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- GROUP BY a nullable column: the NULL group comes from the null entry
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 6 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT t, count(*) FROM rbi_null GROUP BY t');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT t, count(*) FROM lion_null GROUP BY t');
+    lion_nullcmp     
 ---------------------
  pushed down, 4 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE d = 1 GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null WHERE d = 1 GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 6 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE t IS NULL GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null WHERE t IS NULL GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 6 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE k IS NOT NULL GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null WHERE k IS NOT NULL GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 5 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE k IS NULL GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null WHERE k IS NULL GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
@@ -354,64 +354,64 @@ SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE k IS NULL GROUP BY k'
  * prints for that column must come from the equality's entry, not from the
  * null entry that happens to be listed first.
  */
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE k IS NOT NULL AND k = 3 GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null WHERE k IS NOT NULL AND k = 3 GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null WHERE k = 3 AND k IS NOT NULL GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null WHERE k = 3 AND k IS NOT NULL GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(k) FROM rbi_null WHERE k IS NULL GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(k) FROM lion_null WHERE k IS NULL GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- count(col) of the group column: count(*) for real groups, 0 for the NULL one
-SELECT rbi_nullcmp('SELECT k, count(k) FROM rbi_null GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(k) FROM lion_null GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 6 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) AS n_all, count(k) AS n_k FROM rbi_null GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) AS n_all, count(k) AS n_k FROM lion_null GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 6 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(k) FROM rbi_null WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(k) FROM lion_null WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(k) FROM rbi_null WHERE k = 3');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(k) FROM lion_null WHERE k = 3');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(k) FROM rbi_null WHERE k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(k) FROM lion_null WHERE k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- count() of a column nothing constrains is still not pushed down
-SELECT rbi_nullcmp('SELECT count(t) FROM rbi_null WHERE k = 3');
-    rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(t) FROM lion_null WHERE k = 3');
+    lion_nullcmp    
 --------------------
  index scan, 1 rows
 (1 row)
 
 -- the results themselves
-SELECT k, count(*), count(k) FROM rbi_null GROUP BY k ORDER BY k NULLS LAST;
+SELECT k, count(*), count(k) FROM lion_null GROUP BY k ORDER BY k NULLS LAST;
  k | count | count 
 ---+-------+-------
  0 |  8572 |  8572
@@ -422,7 +422,7 @@ SELECT k, count(*), count(k) FROM rbi_null GROUP BY k ORDER BY k NULLS LAST;
    |  7142 |     0
 (6 rows)
 
-SELECT t, count(*) FROM rbi_null WHERE k IS NULL GROUP BY t ORDER BY t NULLS LAST;
+SELECT t, count(*) FROM lion_null WHERE k IS NULL GROUP BY t ORDER BY t NULLS LAST;
  t  | count 
 ----+-------
  v0 |  2164
@@ -432,221 +432,221 @@ SELECT t, count(*) FROM rbi_null WHERE k IS NULL GROUP BY t ORDER BY t NULLS LAS
 (4 rows)
 
 -- ---- inserts of NULL keys (aminsert) -----------------------------------
-INSERT INTO rbi_null
+INSERT INTO lion_null
 SELECT i, NULL, NULL, i % 4 FROM generate_series(50001, 60000) i;
-SELECT roaring_index_verify('rbi_null_k', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_null_t', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_t', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT entries, null_tids FROM roaring_index_stats('rbi_null_k');
+SELECT entries, null_tids FROM lion_index_stats('lion_null_k');
  entries | null_tids 
 ---------+-----------
        6 |     17142
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL AND d = 3');
-      rbi_nullcmp      
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL AND d = 3');
+     lion_nullcmp      
 -----------------------
  index scan, 4286 rows
 (1 row)
 
 -- a NULL key inserted into an index that had none
-CREATE TABLE rbi_null_late (id int NOT NULL, k int NOT NULL);
-INSERT INTO rbi_null_late SELECT i, i % 9 FROM generate_series(1, 5000) i;
-CREATE INDEX rbi_null_late_k ON rbi_null_late USING roaring (k);
-SELECT null_tids FROM roaring_index_stats('rbi_null_late_k');
+CREATE TABLE lion_null_late (id int NOT NULL, k int NOT NULL);
+INSERT INTO lion_null_late SELECT i, i % 9 FROM generate_series(1, 5000) i;
+CREATE INDEX lion_null_late_k ON lion_null_late USING lion (k);
+SELECT null_tids FROM lion_index_stats('lion_null_late_k');
  null_tids 
 -----------
          0
 (1 row)
 
-ALTER TABLE rbi_null_late ALTER COLUMN k DROP NOT NULL;
-INSERT INTO rbi_null_late VALUES (5001, NULL), (5002, NULL);
-SELECT roaring_index_verify('rbi_null_late_k', true);
- roaring_index_verify 
-----------------------
+ALTER TABLE lion_null_late ALTER COLUMN k DROP NOT NULL;
+INSERT INTO lion_null_late VALUES (5001, NULL), (5002, NULL);
+SELECT lion_index_verify('lion_null_late_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT entries, ntids, null_tids FROM roaring_index_stats('rbi_null_late_k');
+SELECT entries, ntids, null_tids FROM lion_index_stats('lion_null_late_k');
  entries | ntids | null_tids 
 ---------+-------+-----------
       10 |  5002 |         2
 (1 row)
 
-VACUUM ANALYZE rbi_null_late;
-SELECT rbi_nullcmp('SELECT id FROM rbi_null_late WHERE k IS NULL');
-    rbi_nullcmp     
+VACUUM ANALYZE lion_null_late;
+SELECT lion_nullcmp('SELECT id FROM lion_null_late WHERE k IS NULL');
+    lion_nullcmp    
 --------------------
  index scan, 2 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_late WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_late WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- ---- deletes and VACUUM ------------------------------------------------
 -- before VACUUM the TIDs are still in the index and the heap recheck decides
-DELETE FROM rbi_null WHERE k IS NULL AND id % 2 = 0;
-SELECT roaring_index_verify('rbi_null_k', true);
- roaring_index_verify 
-----------------------
+DELETE FROM lion_null WHERE k IS NULL AND id % 2 = 0;
+SELECT lion_index_verify('lion_null_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL AND d = 1');
-      rbi_nullcmp      
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL AND d = 1');
+     lion_nullcmp      
 -----------------------
  index scan, 4285 rows
 (1 row)
 
-VACUUM rbi_null;
-SELECT roaring_index_verify('rbi_null_k', true);
- roaring_index_verify 
-----------------------
+VACUUM lion_null;
+SELECT lion_index_verify('lion_null_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_null_t', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_t', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT null_tids = (SELECT count(*) FROM rbi_null WHERE k IS NULL) AS null_tids_match
-  FROM roaring_index_stats('rbi_null_k');
+SELECT null_tids = (SELECT count(*) FROM lion_null WHERE k IS NULL) AS null_tids_match
+  FROM lion_index_stats('lion_null_k');
  null_tids_match 
 -----------------
  t
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 6 rows
 (1 row)
 
 -- every NULL row gone: the entry stays, empty, and produces no group
-DELETE FROM rbi_null WHERE k IS NULL;
-VACUUM rbi_null;
-SELECT roaring_index_verify('rbi_null_k', true);
- roaring_index_verify 
-----------------------
+DELETE FROM lion_null WHERE k IS NULL;
+VACUUM lion_null;
+SELECT lion_index_verify('lion_null_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT entries, null_tids FROM roaring_index_stats('rbi_null_k');
+SELECT entries, null_tids FROM lion_index_stats('lion_null_k');
  entries | null_tids 
 ---------+-----------
        6 |         0
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 5 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null WHERE k IS NULL');
-    rbi_nullcmp     
+SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL');
+    lion_nullcmp    
 --------------------
  index scan, 0 rows
 (1 row)
 
 -- ---- a table that is nothing but NULLs ---------------------------------
-CREATE TABLE rbi_null_all (id int NOT NULL, k int);
-INSERT INTO rbi_null_all SELECT i, NULL FROM generate_series(1, 20000) i;
-CREATE INDEX rbi_null_all_k ON rbi_null_all USING roaring (k);
-VACUUM ANALYZE rbi_null_all;
-SELECT roaring_index_verify('rbi_null_all_k', true);
- roaring_index_verify 
-----------------------
+CREATE TABLE lion_null_all (id int NOT NULL, k int);
+INSERT INTO lion_null_all SELECT i, NULL FROM generate_series(1, 20000) i;
+CREATE INDEX lion_null_all_k ON lion_null_all USING lion (k);
+VACUUM ANALYZE lion_null_all;
+SELECT lion_index_verify('lion_null_all_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 SELECT entries, ntids, null_tids, container_pages > 0 AS null_entry_spilled
-  FROM roaring_index_stats('rbi_null_all_k');
+  FROM lion_index_stats('lion_null_all_k');
  entries | ntids | null_tids | null_entry_spilled 
 ---------+-------+-----------+--------------------
        1 | 20000 |     20000 | f
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NOT NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NOT NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null_all GROUP BY k');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null_all GROUP BY k');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k = 1');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k = 1');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- and the same index after half of it is deleted and vacuumed
-DELETE FROM rbi_null_all WHERE id % 2 = 0;
-VACUUM rbi_null_all;
-SELECT roaring_index_verify('rbi_null_all_k', true);
- roaring_index_verify 
-----------------------
+DELETE FROM lion_null_all WHERE id % 2 = 0;
+VACUUM lion_null_all;
+SELECT lion_index_verify('lion_null_all_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
@@ -656,137 +656,137 @@ SELECT roaring_index_verify('rbi_null_all_k', true);
  * pages - it has to stay the NULL entry while it does.
  */
 SELECT null_tids, container_pages > 0 AS null_entry_spilled
-  FROM roaring_index_stats('rbi_null_all_k');
+  FROM lion_index_stats('lion_null_all_k');
  null_tids | null_entry_spilled 
 -----------+--------------------
      10000 | t
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null_all WHERE k IS NULL');
-      rbi_nullcmp       
+SELECT lion_nullcmp('SELECT id FROM lion_null_all WHERE k IS NULL');
+      lion_nullcmp      
 ------------------------
  index scan, 10000 rows
 (1 row)
 
 /* The same thing built as a chain from the start, and then inserted into. */
-CREATE INDEX rbi_null_all_k2 ON rbi_null_all USING roaring (k)
+CREATE INDEX lion_null_all_k2 ON lion_null_all USING lion (k)
 	WITH (inline_limit = 64);
-SELECT roaring_index_verify('rbi_null_all_k2', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_all_k2', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
 SELECT entries, null_tids, container_pages > 0 AS null_entry_spilled
-  FROM roaring_index_stats('rbi_null_all_k2');
+  FROM lion_index_stats('lion_null_all_k2');
  entries | null_tids | null_entry_spilled 
 ---------+-----------+--------------------
        1 |     10000 | t
 (1 row)
 
-INSERT INTO rbi_null_all SELECT i, NULL FROM generate_series(20001, 20500) i;
-SELECT roaring_index_verify('rbi_null_all_k2', true);
- roaring_index_verify 
-----------------------
+INSERT INTO lion_null_all SELECT i, NULL FROM generate_series(20001, 20500) i;
+SELECT lion_index_verify('lion_null_all_k2', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT null_tids FROM roaring_index_stats('rbi_null_all_k2');
+SELECT null_tids FROM lion_index_stats('lion_null_all_k2');
  null_tids 
 -----------
      10500
 (1 row)
 
-VACUUM ANALYZE rbi_null_all;
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NULL');
-     rbi_nullcmp     
+VACUUM ANALYZE lion_null_all;
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
 -- VACUUM filtering a NULL entry that is a chain of container pages
-DELETE FROM rbi_null_all WHERE id % 3 = 0;
-VACUUM rbi_null_all;
-SELECT roaring_index_verify('rbi_null_all_k', true);
- roaring_index_verify 
-----------------------
+DELETE FROM lion_null_all WHERE id % 3 = 0;
+VACUUM lion_null_all;
+SELECT lion_index_verify('lion_null_all_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT roaring_index_verify('rbi_null_all_k2', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_null_all_k2', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT null_tids = (SELECT count(*) FROM rbi_null_all) AS null_tids_match
-  FROM roaring_index_stats('rbi_null_all_k2');
+SELECT null_tids = (SELECT count(*) FROM lion_null_all) AS null_tids_match
+  FROM lion_index_stats('lion_null_all_k2');
  null_tids_match 
 -----------------
  t
 (1 row)
 
-SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NULL');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NULL');
+    lion_nullcmp     
 ---------------------
  pushed down, 1 rows
 (1 row)
 
-SELECT rbi_nullcmp('SELECT id FROM rbi_null_all WHERE k IS NULL AND id < 100');
-     rbi_nullcmp     
+SELECT lion_nullcmp('SELECT id FROM lion_null_all WHERE k IS NULL AND id < 100');
+    lion_nullcmp     
 ---------------------
  index scan, 33 rows
 (1 row)
 
 -- ---- an empty index and an index built on NULL-only data ---------------
-CREATE TABLE rbi_null_empty (id int NOT NULL, k int);
-CREATE INDEX rbi_null_empty_k ON rbi_null_empty USING roaring (k);
-SELECT roaring_index_verify('rbi_null_empty_k', true);
- roaring_index_verify 
-----------------------
+CREATE TABLE lion_null_empty (id int NOT NULL, k int);
+CREATE INDEX lion_null_empty_k ON lion_null_empty USING lion (k);
+SELECT lion_index_verify('lion_null_empty_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT entries, null_tids FROM roaring_index_stats('rbi_null_empty_k');
+SELECT entries, null_tids FROM lion_index_stats('lion_null_empty_k');
  entries | null_tids 
 ---------+-----------
        0 |         0
 (1 row)
 
-INSERT INTO rbi_null_empty VALUES (1, NULL), (2, 7), (3, NULL);
-SELECT roaring_index_verify('rbi_null_empty_k', true);
- roaring_index_verify 
-----------------------
+INSERT INTO lion_null_empty VALUES (1, NULL), (2, 7), (3, NULL);
+SELECT lion_index_verify('lion_null_empty_k', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-SELECT entries, ntids, null_tids FROM roaring_index_stats('rbi_null_empty_k');
+SELECT entries, ntids, null_tids FROM lion_index_stats('lion_null_empty_k');
  entries | ntids | null_tids 
 ---------+-------+-----------
        2 |     3 |         2
 (1 row)
 
 SET enable_seqscan = off;
-SELECT id FROM rbi_null_empty WHERE k IS NULL ORDER BY id;
+SELECT id FROM lion_null_empty WHERE k IS NULL ORDER BY id;
  id 
 ----
   1
   3
 (2 rows)
 
-SELECT id FROM rbi_null_empty WHERE k IS NOT NULL ORDER BY id;
+SELECT id FROM lion_null_empty WHERE k IS NOT NULL ORDER BY id;
  id 
 ----
   2
 (1 row)
 
 RESET enable_seqscan;
-DROP TABLE rbi_null, rbi_null_late, rbi_null_all, rbi_null_empty;
-DROP FUNCTION rbi_nullcmp(text);
-DROP FUNCTION rbi_nullplan(text);
+DROP TABLE lion_null, lion_null_late, lion_null_all, lion_null_empty;
+DROP FUNCTION lion_nullcmp(text);
+DROP FUNCTION lion_nullplan(text);

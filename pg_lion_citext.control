@@ -1,0 +1,4 @@
+comment = 'lion index operator class for citext (case-insensitive equality)'
+default_version = '0.1'
+relocatable = true
+requires = 'pg_lion, citext'

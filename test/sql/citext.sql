@@ -1,32 +1,32 @@
--- case-insensitive keys through the roaring_index_citext extension
+-- case-insensitive keys through the pg_lion_citext extension
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 RESET client_min_messages;
 CREATE EXTENSION citext;
-CREATE EXTENSION roaring_index_citext;
+CREATE EXTENSION pg_lion_citext;
 -- async commits leave pages non-all-visible for VACUUM; the cost model then prefers the seqscan
 SET synchronous_commit = on;
-CREATE TABLE rbi_ci (id int, name citext NOT NULL);
-INSERT INTO rbi_ci SELECT g, (ARRAY['Alice','BOB','carol','Alice ','bob'])[1 + g % 5] FROM generate_series(1, 5000) g;
-CREATE INDEX rbi_ci_name ON rbi_ci USING roaring (name);
-VACUUM ANALYZE rbi_ci;
+CREATE TABLE lion_ci (id int, name citext NOT NULL);
+INSERT INTO lion_ci SELECT g, (ARRAY['Alice','BOB','carol','Alice ','bob'])[1 + g % 5] FROM generate_series(1, 5000) g;
+CREATE INDEX lion_ci_name ON lion_ci USING lion (name);
+VACUUM ANALYZE lion_ci;
 SET enable_seqscan = off;
 -- 'alice' matches 'Alice' (case-insensitive) but not 'Alice ' (trailing space)
-SELECT count(*) FROM rbi_ci WHERE name = 'alice';
-SELECT count(*) FROM rbi_ci WHERE name = 'BoB';
-SELECT count(*) FROM rbi_ci WHERE name = 'nobody';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
-SET roaring_index.enable_count_pushdown = off;
-SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
-RESET roaring_index.enable_count_pushdown;
+SELECT count(*) FROM lion_ci WHERE name = 'alice';
+SELECT count(*) FROM lion_ci WHERE name = 'BoB';
+SELECT count(*) FROM lion_ci WHERE name = 'nobody';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
+RESET pg_lion.enable_count_pushdown;
 -- distinct keys: 'Alice' and 'Alice ' are different, 'BOB'/'bob' are one key
-SELECT name, count(*) FROM rbi_ci GROUP BY name ORDER BY name;
-SELECT entries FROM roaring_index_stats('rbi_ci_name');
-SELECT roaring_index_verify('rbi_ci_name', true);
-INSERT INTO rbi_ci VALUES (0, 'aLiCe');
-SELECT count(*) FROM rbi_ci WHERE name = 'ALICE';
-DROP TABLE rbi_ci;
+SELECT name, count(*) FROM lion_ci GROUP BY name ORDER BY name;
+SELECT entries FROM lion_index_stats('lion_ci_name');
+SELECT lion_index_verify('lion_ci_name', true);
+INSERT INTO lion_ci VALUES (0, 'aLiCe');
+SELECT count(*) FROM lion_ci WHERE name = 'ALICE';
+DROP TABLE lion_ci;
 
 -- ---- the stored key is one representative of an equality class ----------
 /*
@@ -38,28 +38,28 @@ DROP TABLE rbi_ci;
  * class is exact whatever it is spelled like, and is still pushed down.
  */
 RESET enable_seqscan;
-CREATE TABLE rbi_cirep (name citext NOT NULL);
-INSERT INTO rbi_cirep VALUES ('SecretOldSpelling');
-CREATE INDEX rbi_cirep_name ON rbi_cirep USING roaring (name);
-DELETE FROM rbi_cirep;
-INSERT INTO rbi_cirep SELECT 'secretoldspelling' FROM generate_series(1, 10000);
-VACUUM ANALYZE rbi_cirep;
+CREATE TABLE lion_cirep (name citext NOT NULL);
+INSERT INTO lion_cirep VALUES ('SecretOldSpelling');
+CREATE INDEX lion_cirep_name ON lion_cirep USING lion (name);
+DELETE FROM lion_cirep;
+INSERT INTO lion_cirep SELECT 'secretoldspelling' FROM generate_series(1, 10000);
+VACUUM ANALYZE lion_cirep;
 -- one entry, and the key in it is the spelling that was deleted
-SELECT entries FROM roaring_index_stats('rbi_cirep_name');
-EXPLAIN (COSTS OFF) SELECT name, count(*) FROM rbi_cirep GROUP BY name;
-SELECT name, count(*) FROM rbi_cirep GROUP BY name;
-SELECT left(name::text, 1) AS first_letter, count(*) FROM rbi_cirep GROUP BY name;
+SELECT entries FROM lion_index_stats('lion_cirep_name');
+EXPLAIN (COSTS OFF) SELECT name, count(*) FROM lion_cirep GROUP BY name;
+SELECT name, count(*) FROM lion_cirep GROUP BY name;
+SELECT left(name::text, 1) AS first_letter, count(*) FROM lion_cirep GROUP BY name;
 -- a column a clause pins is printed from the same key, and steps aside too
 EXPLAIN (COSTS OFF)
-SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
-SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+SELECT name, count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+SELECT name, count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
 -- counting needs no representative: still the custom node
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING';
-SELECT count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_cirep GROUP BY name;
-SELECT count(*) FROM rbi_cirep GROUP BY name;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
+SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep GROUP BY name;
+SELECT count(*) FROM lion_cirep GROUP BY name;
 RESET enable_seqscan;
-DROP TABLE rbi_cirep;
-DROP EXTENSION roaring_index_citext;
+DROP TABLE lion_cirep;
+DROP EXTENSION pg_lion_citext;
 DROP EXTENSION citext;

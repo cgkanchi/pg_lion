@@ -1,4 +1,4 @@
 comment = 'roaring bitmap inverted index access method'
 default_version = '0.1'
-module_pathname = '$libdir/roaring_index'
+module_pathname = '$libdir/pg_lion'
 relocatable = true

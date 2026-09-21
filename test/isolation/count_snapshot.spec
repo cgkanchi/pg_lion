@@ -1,4 +1,4 @@
-# Snapshot semantics of roaring_index_count() (DESIGN.md section 9).
+# Snapshot semantics of lion_index_count() (DESIGN.md section 9).
 #
 # The count must always be exactly count(*) of the equivalent SELECT under
 # the caller's snapshot, whatever other sessions are doing.  Every step here
@@ -13,10 +13,10 @@
 setup
 {
 	SET synchronous_commit = on;
-	CREATE EXTENSION IF NOT EXISTS roaring_index;
+	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE TABLE cnt_snap (id int, k int NOT NULL);
 	INSERT INTO cnt_snap SELECT i, i % 4 FROM generate_series(1, 4000) i;
-	CREATE INDEX cnt_snap_k ON cnt_snap USING roaring (k)
+	CREATE INDEX cnt_snap_k ON cnt_snap USING lion (k)
 		WITH (inline_limit = 64);
 }
 
@@ -27,15 +27,15 @@ teardown
 
 # The long-lived REPEATABLE READ reader.
 session s1
-setup			{ SET roaring_index.enable_count_pushdown = off; }
+setup			{ SET pg_lion.enable_count_pushdown = off; }
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
-step s1_count	{ SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count	{ SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain; }
 step s1_commit	{ COMMIT; }
 
 # The writer.
 session s2
-setup			{ SET roaring_index.enable_count_pushdown = off; }
+setup			{ SET pg_lion.enable_count_pushdown = off; }
 step s2_begin	{ BEGIN; }
 step s2_insert	{ INSERT INTO cnt_snap SELECT 10000 + i, 1
 					FROM generate_series(1, 100) i; }
@@ -44,8 +44,8 @@ step s2_commit	{ COMMIT; }
 
 # A reader that takes a fresh snapshot for every statement.
 session s3
-setup			{ SET roaring_index.enable_count_pushdown = off; }
-step s3_count	{ SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+setup			{ SET pg_lion.enable_count_pushdown = off; }
+step s3_count	{ SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain; }
 step s3_vacuum	{ VACUUM cnt_snap; }
 

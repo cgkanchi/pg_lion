@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_am.c
+ * lion_am.c
  *		Access method handler, reloptions, opclass validation, cost estimate
- *		and ambuildempty for the roaring index.  See DESIGN.md section 6.
+ *		and ambuildempty for the lion index.  See DESIGN.md section 6.
  *
  *-------------------------------------------------------------------------
  */
@@ -33,88 +33,88 @@
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
-#include "rbi.h"
-#include "rbi_count.h"
+#include "lion.h"
+#include "lion_count.h"
 
 PG_MODULE_MAGIC_EXT(
-					.name = "roaring_index",
+					.name = "pg_lion",
 					.version = PG_VERSION
 );
 
-PG_FUNCTION_INFO_V1(roaring_handler);
+PG_FUNCTION_INFO_V1(lion_handler);
 
 /*
- * Strategies and support procedure numbers live in rbi.h, because build,
+ * Strategies and support procedure numbers live in lion.h, because build,
  * insert, scan and count all need them.  The multi-key strategies of
  * DESIGN.md §17 are 2 .. 5; a scalar opclass has only strategy 1.
  */
-#define RBI_MULTI_STRATEGY_MASK \
-	((1 << RBI_STRAT_CONTAINS) | (1 << RBI_STRAT_OVERLAP) | \
-	 (1 << RBI_STRAT_CONTAINED) | (1 << RBI_STRAT_MATCH))
+#define LION_MULTI_STRATEGY_MASK \
+	((1 << LION_STRAT_CONTAINS) | (1 << LION_STRAT_OVERLAP) | \
+	 (1 << LION_STRAT_CONTAINED) | (1 << LION_STRAT_MATCH))
 
-/* Kind of relation options for roaring indexes */
-static relopt_kind rbi_relopt_kind;
+/* Kind of relation options for lion indexes */
+static relopt_kind lion_relopt_kind;
 
-static const relopt_parse_elt rbi_relopt_tab[] = {
-	{"buckets", RELOPT_TYPE_INT, offsetof(RBIOptions, buckets)},
-	{"inline_limit", RELOPT_TYPE_INT, offsetof(RBIOptions, inline_limit)},
-	{"max_entries", RELOPT_TYPE_INT, offsetof(RBIOptions, max_entries)}
+static const relopt_parse_elt lion_relopt_tab[] = {
+	{"buckets", RELOPT_TYPE_INT, offsetof(LionOptions, buckets)},
+	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
+	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)}
 };
 
 /*
  * Module initialisation: register the reloptions of the roaring AM, the
- * count-pushdown GUC and the planner hook that plants the RoaringCount
- * CustomScan (DESIGN.md section 10, implemented in rbi_customscan.c).
+ * count-pushdown GUC and the planner hook that plants the LionCount
+ * CustomScan (DESIGN.md section 10, implemented in lion_customscan.c).
  *
  * This runs the first time the library is loaded into a backend, which for
- * any query over a roaring index happens in get_relation_info() when the
+ * any query over a lion index happens in get_relation_info() when the
  * planner opens the index and fetches its handler - well before
  * create_upper_paths_hook is consulted for that same query.
  */
 void
 _PG_init(void)
 {
-	rbi_relopt_kind = add_reloption_kind();
+	lion_relopt_kind = add_reloption_kind();
 
-	add_int_reloption(rbi_relopt_kind, "buckets",
+	add_int_reloption(lion_relopt_kind, "buckets",
 					  "Number of hash buckets (0 selects it from the data)",
-					  0, 0, RBI_MAX_BUCKETS,
+					  0, 0, LION_MAX_BUCKETS,
 					  AccessExclusiveLock);
-	add_int_reloption(rbi_relopt_kind, "inline_limit",
+	add_int_reloption(lion_relopt_kind, "inline_limit",
 					  "Maximum size in bytes of a posting set kept inside its entry tuple",
-					  RBI_DEFAULT_INLINE_LIMIT, RBI_MIN_INLINE_LIMIT,
-					  RBI_MAX_INLINE_LIMIT,
+					  LION_DEFAULT_INLINE_LIMIT, LION_MIN_INLINE_LIMIT,
+					  LION_MAX_INLINE_LIMIT,
 					  AccessExclusiveLock);
-	add_int_reloption(rbi_relopt_kind, "max_entries",
+	add_int_reloption(lion_relopt_kind, "max_entries",
 					  "Distinct keys above which the index warns once per backend (0 disables)",
-					  RBI_DEFAULT_MAX_ENTRIES, 0, INT_MAX,
+					  LION_DEFAULT_MAX_ENTRIES, 0, INT_MAX,
 					  ShareUpdateExclusiveLock);
 
-	DefineCustomBoolVariable("roaring_index.enable_count_pushdown",
-							 "Answer count(*) over roaring indexes from the index and the visibility map.",
+	DefineCustomBoolVariable("pg_lion.enable_count_pushdown",
+							 "Answer count(*) over lion indexes from the index and the visibility map.",
 							 NULL,
-							 &rbi_enable_count_pushdown,
+							 &lion_enable_count_pushdown,
 							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("roaring_index");
+	MarkGUCPrefixReserved("pg_lion");
 
-	rbi_prev_create_upper_paths_hook = create_upper_paths_hook;
-	create_upper_paths_hook = rbi_create_upper_paths;
+	lion_prev_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = lion_create_upper_paths;
 }
 
 /*
  * Handler function: return the IndexAmRoutine of the roaring AM.
  */
 Datum
-roaring_handler(PG_FUNCTION_ARGS)
+lion_handler(PG_FUNCTION_ARGS)
 {
 	static const IndexAmRoutine amroutine = {
 		.type = T_IndexAmRoutine,
-		.amstrategies = RBI_NSTRATEGIES,
-		.amsupport = RBI_NPROC,
+		.amstrategies = LION_NSTRATEGIES,
+		.amsupport = LION_NPROC,
 		.amoptsprocnum = 0,
 		.amcanorder = false,
 		.amcanorderbyop = false,
@@ -147,25 +147,25 @@ roaring_handler(PG_FUNCTION_ARGS)
 		.amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL,
 		.amkeytype = InvalidOid,
 
-		.ambuild = rbibuild,
-		.ambuildempty = rbibuildempty,
-		.aminsert = rbiinsert,
+		.ambuild = lionbuild,
+		.ambuildempty = lionbuildempty,
+		.aminsert = lioninsert,
 		.aminsertcleanup = NULL,
-		.ambulkdelete = rbibulkdelete,
-		.amvacuumcleanup = rbivacuumcleanup,
+		.ambulkdelete = lionbulkdelete,
+		.amvacuumcleanup = lionvacuumcleanup,
 		.amcanreturn = NULL,
-		.amcostestimate = rbicostestimate,
+		.amcostestimate = lioncostestimate,
 		.amgettreeheight = NULL,
-		.amoptions = rbioptions,
+		.amoptions = lionoptions,
 		.amproperty = NULL,
 		.ambuildphasename = NULL,
-		.amvalidate = rbivalidate,
+		.amvalidate = lionvalidate,
 		.amadjustmembers = NULL,
-		.ambeginscan = rbibeginscan,
-		.amrescan = rbirescan,
+		.ambeginscan = lionbeginscan,
+		.amrescan = lionrescan,
 		.amgettuple = NULL,
-		.amgetbitmap = rbigetbitmap,
-		.amendscan = rbiendscan,
+		.amgetbitmap = liongetbitmap,
+		.amendscan = lionendscan,
 		.ammarkpos = NULL,
 		.amrestrpos = NULL,
 		.amestimateparallelscan = NULL,
@@ -182,13 +182,13 @@ roaring_handler(PG_FUNCTION_ARGS)
  * Parse reloptions.
  */
 bytea *
-rbioptions(Datum reloptions, bool validate)
+lionoptions(Datum reloptions, bool validate)
 {
 	return (bytea *) build_reloptions(reloptions, validate,
-									  rbi_relopt_kind,
-									  sizeof(RBIOptions),
-									  rbi_relopt_tab,
-									  lengthof(rbi_relopt_tab));
+									  lion_relopt_kind,
+									  sizeof(LionOptions),
+									  lion_relopt_tab,
+									  lengthof(lion_relopt_tab));
 }
 
 /*
@@ -196,7 +196,7 @@ rbioptions(Datum reloptions, bool validate)
  * compared with a text constant presents the constant the opclass will see.
  */
 static Node *
-rbi_cost_strip(Node *node)
+lion_cost_strip(Node *node)
 {
 	while (node != NULL && IsA(node, RelabelType))
 		node = (Node *) ((RelabelType *) node)->arg;
@@ -205,40 +205,40 @@ rbi_cost_strip(Node *node)
 
 /*
  * Does this index's opclass extract many keys from one value (DESIGN.md §17)?
- * The presence of support function 2 is the same test rbi_fill_state() makes.
+ * The presence of support function 2 is the same test lion_fill_state() makes.
  */
 static bool
-rbi_index_is_multikey(IndexOptInfo *index)
+lion_index_is_multikey(IndexOptInfo *index)
 {
 	return OidIsValid(get_opfamily_proc(index->opfamily[0],
 										index->opcintype[0],
 										index->opcintype[0],
-										RBI_EXTRACTVALUE_PROC));
+										LION_EXTRACTVALUE_PROC));
 }
 
 /*
  * Extract one multi-key query at plan time and say whether answering it means
- * emitting every posting of every entry (DESIGN.md §17's RBI_QMODE_ALL).
+ * emitting every posting of every entry (DESIGN.md §17's LION_QMODE_ALL).
  *
- * rbi_extract_query() wants an RBIState, but only for the extractQuery
+ * lion_extract_query() wants an LionState, but only for the extractQuery
  * FmgrInfo and the collation; nothing here touches an index.  A missing
  * extraction function means the question cannot be answered, which is costed
  * as the expensive answer.
  */
 static bool
-rbi_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
+lion_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 					   Datum query)
 {
 	Oid			proc;
 	FmgrInfo	flinfo;
-	RBIState	state;
-	RBIQuery	q;
+	LionState	state;
+	LionQuery	q;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	bool		full;
 
 	proc = get_opfamily_proc(index->opfamily[0], index->opcintype[0],
-							 index->opcintype[0], RBI_EXTRACTQUERY_PROC);
+							 index->opcintype[0], LION_EXTRACTQUERY_PROC);
 	if (!OidIsValid(proc))
 		return true;
 
@@ -253,8 +253,8 @@ rbi_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
 
-	rbi_extract_query(&state, query, strategy, &q);
-	full = (q.mode == RBI_QMODE_ALL);
+	lion_extract_query(&state, query, strategy, &q);
+	full = (q.mode == LION_QMODE_ALL);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
@@ -269,7 +269,7 @@ rbi_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
  * assumed to contain such an element.
  */
 static bool
-rbi_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
+lion_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 							 Node *arraynode)
 {
 	Const	   *con = (Const *) arraynode;
@@ -299,7 +299,7 @@ rbi_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 	{
 		if (nulls[i])
 			continue;			/* never true, nothing is scanned for it */
-		full = rbi_query_is_full_scan(index, strategy, elems[i]);
+		full = lion_query_is_full_scan(index, strategy, elems[i]);
 	}
 
 	pfree(elems);
@@ -311,10 +311,10 @@ rbi_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 }
 
 /*
- * Will rbigetbitmap() have to walk the WHOLE index for this path - read every
+ * Will liongetbitmap() have to walk the WHOLE index for this path - read every
  * bucket, every entry and every posting of every entry?
  *
- * rbigetbitmap() answers ONE qual per scan and marks the rest for recheck,
+ * liongetbitmap() answers ONE qual per scan and marks the rest for recheck,
  * choosing the most selective-looking one: a plain operator first, then a
  * ScalarArrayOp, then a null test.  The cost of the scan is the cost of the
  * qual it answers, so the choice is mirrored here.
@@ -323,9 +323,9 @@ rbi_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
  *
  *	- `col IS NOT NULL`, which is every entry but the reserved NULL one
  *	  (DESIGN.md §14);
- *	- a multi-key query the extractor answers with RBI_QMODE_ALL: a phrase, a
+ *	- a multi-key query the extractor answers with LION_QMODE_ALL: a phrase, a
  *	  prefix, a NOT, a weight mask, `<@`, `@> '{}'`, a NULL element, or more
- *	  than RBI_MAX_QUERY_KEYS keys (DESIGN.md §17).  Correctness is preserved
+ *	  than LION_MAX_QUERY_KEYS keys (DESIGN.md §17).  Correctness is preserved
  *	  by the recheck, but the scan reads the whole index and hands the heap
  *	  every indexed row;
  *	- and a multi-key query whose value is not a plan-time Const (a Param):
@@ -346,7 +346,7 @@ rbi_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
  * 2026-09-21 follow-up review).
  */
 static bool
-rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
+lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 {
 	IndexOptInfo *index = path->indexinfo;
 	Node	   *chosen = NULL;
@@ -396,7 +396,7 @@ rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 		return ((NullTest *) chosen)->nulltesttype == IS_NOT_NULL;
 
 	/* A scalar opclass looks ONE key up, whatever the operator's operand. */
-	if (!rbi_index_is_multikey(index))
+	if (!lion_index_is_multikey(index))
 		return false;
 
 	if (IsA(chosen, OpExpr))
@@ -412,7 +412,7 @@ rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 															index->opfamily[0]);
 		if (strategy == 0)
 			return true;
-		arg = rbi_cost_strip((Node *) lsecond(op->args));
+		arg = lion_cost_strip((Node *) lsecond(op->args));
 		if (arg == NULL || !IsA(arg, Const))
 			return true;
 		if (((Const *) arg)->constisnull)
@@ -421,7 +421,7 @@ rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 			*emits_all_rows = false;
 			return false;
 		}
-		if (rbi_query_is_full_scan(index, strategy,
+		if (lion_query_is_full_scan(index, strategy,
 								   ((Const *) arg)->constvalue))
 			return true;
 		*emits_all_rows = false;
@@ -439,9 +439,9 @@ rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 															index->opfamily[0]);
 		if (strategy == 0)
 			return true;
-		if (strategy != RBI_STRAT_EQUAL &&
-			rbi_array_query_is_full_scan(index, strategy,
-										 rbi_cost_strip((Node *) lsecond(saop->args))))
+		if (strategy != LION_STRAT_EQUAL &&
+			lion_array_query_is_full_scan(index, strategy,
+										 lion_cost_strip((Node *) lsecond(saop->args))))
 			return true;
 
 		/* a union of single-key lookups, or of exact multi-key queries */
@@ -451,24 +451,24 @@ rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 }
 
 /*
- * Cost estimate: the generic estimate, with two corrections.  A roaring index
+ * Cost estimate: the generic estimate, with two corrections.  A lion index
  * has no correlation with the heap order (contrib/bloom does the same), and a
  * scan that has to walk the whole index is priced as one rather than as the
  * selective lookup its predicate's output selectivity suggests.
  */
 void
-rbicostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				Cost *indexStartupCost, Cost *indexTotalCost,
 				Selectivity *indexSelectivity, double *indexCorrelation,
 				double *indexPages)
 {
 	GenericCosts costs = {0};
 	bool		emits_all_rows;
-	bool		fullscan = rbi_scan_walks_whole_index(path, &emits_all_rows);
+	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
 
 	/*
 	 * A full walk visits every index tuple - every (key, row) posting, which
-	 * is what pg_class.reltuples of a roaring index counts - and
+	 * is what pg_class.reltuples of a lion index counts - and
 	 * genericcostestimate() then prorates that into every index page.
 	 */
 	if (fullscan)
@@ -532,7 +532,7 @@ rbicostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
  *				type's default hash opclass is used instead.
  */
 bool
-rbivalidate(Oid opclassoid)
+lionvalidate(Oid opclassoid)
 {
 	bool		result = true;
 	HeapTuple	classtup;
@@ -572,14 +572,14 @@ rbivalidate(Oid opclassoid)
 	/*
 	 * Which shape is this?  An extractValue procedure for the opclass's own
 	 * type is what makes an opclass multi-key, and it is the same test
-	 * rbi_fill_state() makes at run time (through index_getprocid()).
+	 * lion_fill_state() makes at run time (through index_getprocid()).
 	 */
 	for (i = 0; i < proclist->n_members; i++)
 	{
 		Form_pg_amproc procform =
 			(Form_pg_amproc) GETSTRUCT(&proclist->members[i]->tuple);
 
-		if (procform->amprocnum == RBI_EXTRACTVALUE_PROC &&
+		if (procform->amprocnum == LION_EXTRACTVALUE_PROC &&
 			procform->amproclefttype == opcintype &&
 			procform->amprocrighttype == opcintype)
 			multikey = true;
@@ -597,14 +597,14 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s contains support function %s with different left and right input types",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_procedure(procform->amproc))));
 			result = false;
 		}
 
 		switch (procform->amprocnum)
 		{
-			case RBI_HASH_PROC:
+			case LION_HASH_PROC:
 				if (multikey)
 					ok = check_amproc_signature(procform->amproc, INT4OID,
 												false, 1, 1, opckeytype);
@@ -613,14 +613,14 @@ rbivalidate(Oid opclassoid)
 												false, 1, 1,
 												procform->amproclefttype);
 				break;
-			case RBI_EXTRACTVALUE_PROC:
+			case LION_EXTRACTVALUE_PROC:
 				/* GIN's extractValue; some opclasses omit nullFlags */
 				ok = check_amproc_signature(procform->amproc, INTERNALOID,
 											false, 2, 3,
 											procform->amproclefttype,
 											INTERNALOID, INTERNALOID);
 				break;
-			case RBI_EXTRACTQUERY_PROC:
+			case LION_EXTRACTQUERY_PROC:
 				/* GIN's extractQuery; some omit nullFlags and searchMode */
 				ok = check_amproc_signature(procform->amproc, INTERNALOID,
 											false, 5, 7,
@@ -633,7 +633,7 @@ rbivalidate(Oid opclassoid)
 				ereport(INFO,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("operator family \"%s\" of access method %s contains function %s with invalid support number %d",
-								opfamilyname, "roaring",
+								opfamilyname, "lion",
 								format_procedure(procform->amproc),
 								procform->amprocnum)));
 				result = false;
@@ -646,15 +646,15 @@ rbivalidate(Oid opclassoid)
 		 * never stored.  Only the opclass's own type pair can be judged here,
 		 * for the same reason ginvalidate() gives.
 		 */
-		if (procform->amprocnum != RBI_HASH_PROC && !multikey &&
+		if (procform->amprocnum != LION_HASH_PROC && !multikey &&
 			procform->amproclefttype == opcintype)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator class \"%s\" of access method %s has support function %s but no support function %d",
-							opclassname, "roaring",
+							opclassname, "lion",
 							format_procedure(procform->amproc),
-							RBI_EXTRACTVALUE_PROC)));
+							LION_EXTRACTVALUE_PROC)));
 			result = false;
 		}
 
@@ -663,12 +663,12 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s contains function %s with wrong signature for support number %d",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_procedure(procform->amproc),
 							procform->amprocnum)));
 			result = false;
 		}
-		else if (procform->amprocnum == RBI_HASH_PROC && !multikey)
+		else if (procform->amprocnum == LION_HASH_PROC && !multikey)
 			hashabletypes = list_append_unique_oid(hashabletypes,
 												   procform->amproclefttype);
 	}
@@ -690,16 +690,16 @@ rbivalidate(Oid opclassoid)
 		 */
 		stratok = multikey ?
 			(oprform->amopstrategy >= 1 &&
-			 oprform->amopstrategy <= RBI_NSTRATEGIES &&
-			 (RBI_MULTI_STRATEGY_MASK & (1 << oprform->amopstrategy)) != 0) :
-			(oprform->amopstrategy == RBI_STRAT_EQUAL);
+			 oprform->amopstrategy <= LION_NSTRATEGIES &&
+			 (LION_MULTI_STRATEGY_MASK & (1 << oprform->amopstrategy)) != 0) :
+			(oprform->amopstrategy == LION_STRAT_EQUAL);
 
 		if (!stratok)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s contains operator %s with invalid strategy number %d",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_operator(oprform->amopopr),
 							oprform->amopstrategy)));
 			result = false;
@@ -711,7 +711,7 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s contains invalid ORDER BY specification for operator %s",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_operator(oprform->amopopr))));
 			result = false;
 		}
@@ -723,7 +723,7 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s contains operator %s with wrong signature",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_operator(oprform->amopopr))));
 			result = false;
 		}
@@ -742,7 +742,7 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s lacks support function for operator %s",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_operator(oprform->amopopr))));
 			result = false;
 		}
@@ -767,12 +767,12 @@ rbivalidate(Oid opclassoid)
 		 * (tsvector,tsvector)), so the per-operator and per-class checks
 		 * above and below are all there is.
 		 */
-		if (!multikey && thisgroup->operatorset != (1 << RBI_STRAT_EQUAL))
+		if (!multikey && thisgroup->operatorset != (1 << LION_STRAT_EQUAL))
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s is missing operator(s) for types %s and %s",
-							opfamilyname, "roaring",
+							opfamilyname, "lion",
 							format_type_be(thisgroup->lefttype),
 							format_type_be(thisgroup->righttype))));
 			result = false;
@@ -782,24 +782,24 @@ rbivalidate(Oid opclassoid)
 	/* The opclass itself must be complete */
 	if (multikey)
 	{
-		uint64		want = (((uint64) 1) << RBI_EXTRACTVALUE_PROC) |
-			(((uint64) 1) << RBI_EXTRACTQUERY_PROC);
+		uint64		want = (((uint64) 1) << LION_EXTRACTVALUE_PROC) |
+			(((uint64) 1) << LION_EXTRACTQUERY_PROC);
 
 		/*
 		 * A hash function for the key type is required unless the key type is
 		 * polymorphic, in which case there is no single function to name and
 		 * the key type's default hash opclass answers instead
-		 * (rbi_fill_state()).
+		 * (lion_fill_state()).
 		 */
 		if (!IsPolymorphicType(opckeytype))
-			want |= ((uint64) 1) << RBI_HASH_PROC;
+			want |= ((uint64) 1) << LION_HASH_PROC;
 
 		if (!opclassgroup || (opclassgroup->functionset & want) != want)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator class \"%s\" of access method %s is missing support function(s)",
-							opclassname, "roaring")));
+							opclassname, "lion")));
 			result = false;
 		}
 
@@ -808,19 +808,19 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator class \"%s\" of access method %s is missing operator(s)",
-							opclassname, "roaring")));
+							opclassname, "lion")));
 			result = false;
 		}
 	}
 	else
 	{
 		if (!opclassgroup ||
-			(opclassgroup->functionset & (((uint64) 1) << RBI_HASH_PROC)) == 0)
+			(opclassgroup->functionset & (((uint64) 1) << LION_HASH_PROC)) == 0)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator class \"%s\" of access method %s is missing support function %d",
-							opclassname, "roaring", RBI_HASH_PROC)));
+							opclassname, "lion", LION_HASH_PROC)));
 			result = false;
 		}
 		if (!opclassgroup)
@@ -828,7 +828,7 @@ rbivalidate(Oid opclassoid)
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator class \"%s\" of access method %s is missing operator(s)",
-							opclassname, "roaring")));
+							opclassname, "lion")));
 			result = false;
 		}
 	}
@@ -844,24 +844,24 @@ rbivalidate(Oid opclassoid)
  * Build an empty index in the init fork (used for unlogged relations).
  */
 void
-rbibuildempty(Relation index)
+lionbuildempty(Relation index)
 {
-	RBIOptions *opts = (RBIOptions *) index->rd_options;
+	LionOptions *opts = (LionOptions *) index->rd_options;
 	uint32		nbuckets;
 	uint32		inline_limit;
 	uint32		b;
 	Buffer		buf;
 
-	nbuckets = rbi_clamp_buckets((opts && opts->buckets > 0) ?
-								 opts->buckets : RBI_DEFAULT_BUCKETS);
-	inline_limit = opts ? (uint32) opts->inline_limit : RBI_DEFAULT_INLINE_LIMIT;
+	nbuckets = lion_clamp_buckets((opts && opts->buckets > 0) ?
+								 opts->buckets : LION_DEFAULT_BUCKETS);
+	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
 
 	/* Meta page */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
-	Assert(BufferGetBlockNumber(buf) == RBI_METAPAGE_BLKNO);
+	Assert(BufferGetBlockNumber(buf) == LION_METAPAGE_BLKNO);
 	START_CRIT_SECTION();
-	rbi_init_metapage(BufferGetPage(buf), nbuckets, inline_limit);
+	lion_init_metapage(BufferGetPage(buf), nbuckets, inline_limit);
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();
@@ -872,9 +872,9 @@ rbibuildempty(Relation index)
 	{
 		buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 								EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
-		Assert(BufferGetBlockNumber(buf) == RBI_BUCKET_BLKNO(b));
+		Assert(BufferGetBlockNumber(buf) == LION_BUCKET_BLKNO(b));
 		START_CRIT_SECTION();
-		rbi_init_page(BufferGetPage(buf), RBI_PAGE_BUCKET);
+		lion_init_page(BufferGetPage(buf), LION_PAGE_BUCKET);
 		MarkBufferDirty(buf);
 		log_newpage_buffer(buf, true);
 		END_CRIT_SECTION();

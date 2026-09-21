@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_pages.c
- *		Storage primitives for the roaring index access method: meta page,
+ * lion_pages.c
+ *		Storage primitives for the lion index access method: meta page,
  *		bucket pages and entry tuples, container chains and their splits,
  *		page allocation.  See DESIGN.md sections 4 and 5.
  *
@@ -30,17 +30,17 @@
 #include "utils/typcache.h"
 #include "varatt.h"
 
-#include "rbi.h"
+#include "lion.h"
 
-static void rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off,
+static void lion_split_and_place(Relation index, Buffer buf, OffsetNumber off,
 								bool replace, Buffer entrybuf,
-								OffsetNumber entryoff, RBIEntryTuple *entry,
-								RBIContainer **items, int nitems);
+								OffsetNumber entryoff, LionEntryTuple *entry,
+								LionContainer **items, int nitems);
 
 /*
  * May this transaction answer a query from this index at all?
  *
- * Every caller that opens a roaring index by name - the SQL count functions,
+ * Every caller that opens a lion index by name - the SQL count functions,
  * the verifier - has to make the decision the planner makes for a query that
  * mentions the table, because the index it was handed was not approved by
  * anyone.  There are three ways an index can exist and still be unusable:
@@ -68,7 +68,7 @@ static void rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off,
  * NULL) is set to a short phrase that reads after "because".
  */
 bool
-rbi_index_usable(Relation index, Snapshot snapshot, const char **why)
+lion_index_usable(Relation index, Snapshot snapshot, const char **why)
 {
 	Form_pg_index idx = index->rd_index;
 	TransactionId limit = TransactionXmin;
@@ -110,62 +110,62 @@ rbi_index_usable(Relation index, Snapshot snapshot, const char **why)
 }
 
 /*
- * Clamp a requested bucket count into [1, RBI_MAX_BUCKETS].
+ * Clamp a requested bucket count into [1, LION_MAX_BUCKETS].
  *
  * Bucket counts are not rounded to a power of two: a hash is mapped to its
- * bucket with a modulo (rbi_bucket_of()), so any count works, and ambuild
+ * bucket with a modulo (lion_bucket_of()), so any count works, and ambuild
  * picks one from the bytes the entries need rather than from a key count
  * (DESIGN.md §5).  The `buckets` reloption therefore means exactly what it
  * says.
  */
 uint32
-rbi_clamp_buckets(int64 nbuckets)
+lion_clamp_buckets(int64 nbuckets)
 {
 	if (nbuckets <= 1)
 		return 1;
-	if (nbuckets >= RBI_MAX_BUCKETS)
-		return RBI_MAX_BUCKETS;
+	if (nbuckets >= LION_MAX_BUCKETS)
+		return LION_MAX_BUCKETS;
 	return (uint32) nbuckets;
 }
 
 /*
- * Initialise a page of the roaring index.  Sets up the special area.
+ * Initialise a page of the lion index.  Sets up the special area.
  */
 void
-rbi_init_page(Page page, uint16 flags)
+lion_init_page(Page page, uint16 flags)
 {
-	RBIPageOpaque opaque;
+	LionPageOpaque opaque;
 
-	PageInit(page, BLCKSZ, RBI_SPECIAL_SIZE);
+	PageInit(page, BLCKSZ, LION_SPECIAL_SIZE);
 
-	opaque = RBIPageGetOpaque(page);
+	opaque = LionPageGetOpaque(page);
 	opaque->rightlink = InvalidBlockNumber;
 	opaque->minckey = 0;
 	opaque->maxckey = 0;
 	opaque->flags = flags;
-	opaque->page_id = RBI_PAGE_ID;
+	opaque->page_id = LION_PAGE_ID;
 }
 
 /*
  * Fill in a meta page image.
  */
 void
-rbi_init_metapage(Page page, uint32 nbuckets, uint32 inline_limit)
+lion_init_metapage(Page page, uint32 nbuckets, uint32 inline_limit)
 {
-	RBIMetaPageData *meta;
+	LionMetaPageData *meta;
 
-	rbi_init_page(page, RBI_PAGE_META);
+	lion_init_page(page, LION_PAGE_META);
 
-	meta = RBIPageGetMeta(page);
-	memset(meta, 0, sizeof(RBIMetaPageData));
-	meta->magic = RBI_MAGIC;
-	meta->version = RBI_VERSION;
-	meta->offset_bits = RBI_OFFSET_BITS;
-	meta->container_bits = RBI_CONTAINER_BITS;
+	meta = LionPageGetMeta(page);
+	memset(meta, 0, sizeof(LionMetaPageData));
+	meta->magic = LION_MAGIC;
+	meta->version = LION_VERSION;
+	meta->offset_bits = LION_OFFSET_BITS;
+	meta->container_bits = LION_CONTAINER_BITS;
 	meta->nbuckets = nbuckets;
 	meta->inline_limit = inline_limit;
 
-	((PageHeader) page)->pd_lower += sizeof(RBIMetaPageData);
+	((PageHeader) page)->pd_lower += sizeof(LionMetaPageData);
 	Assert(((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper);
 }
 
@@ -179,7 +179,7 @@ rbi_init_metapage(Page page, uint32 nbuckets, uint32 inline_limit)
  * keeps a crash from leaving an initialised page that nothing points at.
  */
 Buffer
-rbi_new_buffer_xl(Relation index, GenericXLogState *xstate, uint16 flags,
+lion_new_buffer_xl(Relation index, GenericXLogState *xstate, uint16 flags,
 				  Page *pagep)
 {
 	Buffer		buffer;
@@ -189,7 +189,7 @@ rbi_new_buffer_xl(Relation index, GenericXLogState *xstate, uint16 flags,
 							   EB_LOCK_FIRST);
 
 	page = GenericXLogRegisterBuffer(xstate, buffer, GENERIC_XLOG_FULL_IMAGE);
-	rbi_init_page(page, flags);
+	lion_init_page(page, flags);
 
 	if (pagep != NULL)
 		*pagep = page;
@@ -204,13 +204,13 @@ rbi_new_buffer_xl(Relation index, GenericXLogState *xstate, uint16 flags,
  * page replays correctly.
  */
 Buffer
-rbi_new_buffer(Relation index, uint16 flags)
+lion_new_buffer(Relation index, uint16 flags)
 {
 	Buffer		buffer;
 	GenericXLogState *xstate;
 
 	xstate = GenericXLogStart(index);
-	buffer = rbi_new_buffer_xl(index, xstate, flags, NULL);
+	buffer = lion_new_buffer_xl(index, xstate, flags, NULL);
 	GenericXLogFinish(xstate);
 
 	return buffer;
@@ -220,49 +220,49 @@ rbi_new_buffer(Relation index, uint16 flags)
  * Read and validate the meta page.
  */
 void
-rbi_read_meta(Relation index, RBIMetaPageData *meta)
+lion_read_meta(Relation index, LionMetaPageData *meta)
 {
 	Buffer		buf;
 	Page		page;
-	RBIMetaPageData *ondisk;
+	LionMetaPageData *ondisk;
 
-	buf = ReadBuffer(index, RBI_METAPAGE_BLKNO);
+	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	if (PageIsNew(page) || !RBIPageIsMeta(page) ||
-		RBIPageGetOpaque(page)->page_id != RBI_PAGE_ID)
+	if (PageIsNew(page) || !LionPageIsMeta(page) ||
+		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
 	{
 		UnlockReleaseBuffer(buf);
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" is not a valid roaring index",
+				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index))));
 	}
 
-	ondisk = RBIPageGetMeta(page);
+	ondisk = LionPageGetMeta(page);
 	*meta = *ondisk;
 	UnlockReleaseBuffer(buf);
 
-	if (meta->magic != RBI_MAGIC || meta->version != RBI_VERSION)
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" is not a valid roaring index",
+				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
-						   meta->magic, meta->version, RBI_MAGIC, RBI_VERSION)));
+						   meta->magic, meta->version, LION_MAGIC, LION_VERSION)));
 
-	if (meta->offset_bits != RBI_OFFSET_BITS ||
-		meta->container_bits != RBI_CONTAINER_BITS)
+	if (meta->offset_bits != LION_OFFSET_BITS ||
+		meta->container_bits != LION_CONTAINER_BITS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" was built for a different block size",
 						RelationGetRelationName(index)),
 				 errdetail("Index has offset_bits %u, container_bits %u; this build uses %d and %d.",
 						   meta->offset_bits, meta->container_bits,
-						   RBI_OFFSET_BITS, RBI_CONTAINER_BITS)));
+						   LION_OFFSET_BITS, LION_CONTAINER_BITS)));
 
-	if (meta->nbuckets == 0 || meta->nbuckets > RBI_MAX_BUCKETS)
+	if (meta->nbuckets == 0 || meta->nbuckets > LION_MAX_BUCKETS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" has an invalid bucket count %u",
@@ -274,23 +274,23 @@ rbi_read_meta(Relation index, RBIMetaPageData *meta)
  * because ambuild needs a state before the meta page exists.
  */
 void
-rbi_fill_state(Relation index, RBIState *state, const RBIMetaPageData *meta,
+lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 			   MemoryContext cxt)
 {
 	Form_pg_attribute att;
 	Oid			eqopr;
 	Oid			eqfunc;
 
-	memset(state, 0, sizeof(RBIState));
+	memset(state, 0, sizeof(LionState));
 	state->meta = *meta;
 
 	if (IndexRelationGetNumberOfKeyAttributes(index) != 1)
-		elog(ERROR, "roaring index \"%s\" must have exactly one key column",
+		elog(ERROR, "lion index \"%s\" must have exactly one key column",
 			 RelationGetRelationName(index));
 
 	/*
 	 * The index's own tuple descriptor already carries the KEY type, opclass
-	 * STORAGE and polymorphism resolved (see the comment on RBIState.typid),
+	 * STORAGE and polymorphism resolved (see the comment on LionState.typid),
 	 * so a multi-key class needs no extra type lookup here.
 	 */
 	att = TupleDescAttr(RelationGetDescr(index), 0);
@@ -313,21 +313,21 @@ rbi_fill_state(Relation index, RBIState *state, const RBIMetaPageData *meta,
 
 	/* Multi-key opclass?  Support proc 2 is what says so (DESIGN.md §17). */
 	state->multikey =
-		OidIsValid(index_getprocid(index, 1, RBI_EXTRACTVALUE_PROC));
+		OidIsValid(index_getprocid(index, 1, LION_EXTRACTVALUE_PROC));
 
 	if (state->multikey)
 	{
-		if (!OidIsValid(index_getprocid(index, 1, RBI_EXTRACTQUERY_PROC)))
+		if (!OidIsValid(index_getprocid(index, 1, LION_EXTRACTQUERY_PROC)))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("operator class of index \"%s\" has support function %d but not %d",
 							RelationGetRelationName(index),
-							RBI_EXTRACTVALUE_PROC, RBI_EXTRACTQUERY_PROC)));
+							LION_EXTRACTVALUE_PROC, LION_EXTRACTQUERY_PROC)));
 
 		fmgr_info_copy(&state->extractvalue,
-					   index_getprocinfo(index, 1, RBI_EXTRACTVALUE_PROC), cxt);
+					   index_getprocinfo(index, 1, LION_EXTRACTVALUE_PROC), cxt);
 		fmgr_info_copy(&state->extractquery,
-					   index_getprocinfo(index, 1, RBI_EXTRACTQUERY_PROC), cxt);
+					   index_getprocinfo(index, 1, LION_EXTRACTQUERY_PROC), cxt);
 	}
 
 	/*
@@ -337,9 +337,9 @@ rbi_fill_state(Relation index, RBIState *state, const RBIMetaPageData *meta,
 	 * type's default hash opclass, the way GIN resolves its comparison
 	 * function in initGinState().
 	 */
-	if (OidIsValid(index_getprocid(index, 1, RBI_HASH_PROC)))
+	if (OidIsValid(index_getprocid(index, 1, LION_HASH_PROC)))
 		fmgr_info_copy(&state->hashproc,
-					   index_getprocinfo(index, 1, RBI_HASH_PROC), cxt);
+					   index_getprocinfo(index, 1, LION_HASH_PROC), cxt);
 	else
 	{
 		TypeCacheEntry *typentry;
@@ -366,7 +366,7 @@ rbi_fill_state(Relation index, RBIState *state, const RBIMetaPageData *meta,
 		get_opfamily_member(index->rd_opfamily[0],
 							index->rd_opcintype[0],
 							index->rd_opcintype[0],
-							RBI_STRAT_EQUAL);
+							LION_STRAT_EQUAL);
 	if (OidIsValid(eqopr))
 	{
 		eqfunc = get_opcode(eqopr);
@@ -399,38 +399,38 @@ rbi_fill_state(Relation index, RBIState *state, const RBIMetaPageData *meta,
 /*
  * Get the cached per-relation state, building it on first use.
  */
-RBIState *
-rbi_get_state(Relation index)
+LionState *
+lion_get_state(Relation index)
 {
-	RBIState   *state;
-	RBIMetaPageData meta;
+	LionState   *state;
+	LionMetaPageData meta;
 
 	if (index->rd_amcache != NULL)
-		return (RBIState *) index->rd_amcache;
+		return (LionState *) index->rd_amcache;
 
-	rbi_read_meta(index, &meta);
+	lion_read_meta(index, &meta);
 
-	state = (RBIState *) MemoryContextAlloc(index->rd_indexcxt,
-											sizeof(RBIState));
-	rbi_fill_state(index, state, &meta, index->rd_indexcxt);
+	state = (LionState *) MemoryContextAlloc(index->rd_indexcxt,
+											sizeof(LionState));
+	lion_fill_state(index, state, &meta, index->rd_indexcxt);
 
 	index->rd_amcache = (void *) state;
 	return state;
 }
 
 /*
- * Heap TIDs whose offset does not fit in RBI_OFFSET_BITS cannot be encoded.
+ * Heap TIDs whose offset does not fit in LION_OFFSET_BITS cannot be encoded.
  */
 void
-rbi_check_key_offset(ItemPointer tid)
+lion_check_key_offset(ItemPointer tid)
 {
-	if (ItemPointerGetOffsetNumber(tid) > RBI_MAX_OFFSET)
+	if (ItemPointerGetOffsetNumber(tid) > LION_MAX_OFFSET)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("roaring index: table access method is not supported"),
+				 errmsg("lion index: table access method is not supported"),
 				 errdetail("Item pointer offset %u exceeds the maximum of %u supported by this index.",
 						   ItemPointerGetOffsetNumber(tid),
-						   (unsigned) RBI_MAX_OFFSET)));
+						   (unsigned) LION_MAX_OFFSET)));
 }
 
 /* ---------------------------------------------------------------------
@@ -438,7 +438,7 @@ rbi_check_key_offset(ItemPointer tid)
  * --------------------------------------------------------------------- */
 
 uint32
-rbi_hash_key(RBIState *state, Datum key)
+lion_hash_key(LionState *state, Datum key)
 {
 	return DatumGetUInt32(FunctionCall1Coll(&state->hashproc,
 											state->collation, key));
@@ -449,7 +449,7 @@ rbi_hash_key(RBIState *state, Datum key)
  * (DESIGN.md section 4).
  */
 Size
-rbi_key_datum_size(RBIState *state, Datum key)
+lion_key_datum_size(LionState *state, Datum key)
 {
 	Size		size;
 
@@ -471,20 +471,20 @@ rbi_key_datum_size(RBIState *state, Datum key)
 		size = strlen(DatumGetCString(key)) + 1;
 	}
 
-	if (size > RBI_MAX_KEY_SIZE)
+	if (size > LION_MAX_KEY_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("roaring index key size %zu exceeds maximum %d",
-						size, RBI_MAX_KEY_SIZE)));
+				 errmsg("lion index key size %zu exceeds maximum %d",
+						size, LION_MAX_KEY_SIZE)));
 
 	return size;
 }
 
 /*
- * Store key at dest, which must have rbi_key_datum_size() bytes.
+ * Store key at dest, which must have lion_key_datum_size() bytes.
  */
 void
-rbi_store_key(RBIState *state, Datum key, char *dest)
+lion_store_key(LionState *state, Datum key, char *dest)
 {
 	if (state->typbyval)
 		memcpy(dest, &key, sizeof(Datum));
@@ -512,7 +512,7 @@ rbi_store_key(RBIState *state, Datum key, char *dest)
  * page pinned.
  */
 Datum
-rbi_fetch_key(RBIState *state, const char *src)
+lion_fetch_key(LionState *state, const char *src)
 {
 	if (state->typbyval)
 	{
@@ -526,7 +526,7 @@ rbi_fetch_key(RBIState *state, const char *src)
 }
 
 bool
-rbi_keys_equal(RBIState *state, Datum a, Datum b)
+lion_keys_equal(LionState *state, Datum a, Datum b)
 {
 	return DatumGetBool(FunctionCall2Coll(&state->eqproc, state->collation,
 										  a, b));
@@ -542,7 +542,7 @@ rbi_keys_equal(RBIState *state, Datum a, Datum b)
  * size, or 0 when the payload has been consumed.
  */
 Size
-rbi_inline_fetch(const char *payload, Size paylen, Size *off, RBIContainer *buf)
+lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *buf)
 {
 	Size		avail;
 	Size		peek;
@@ -550,30 +550,30 @@ rbi_inline_fetch(const char *payload, Size paylen, Size *off, RBIContainer *buf)
 
 	Assert(*off <= paylen);
 	avail = paylen - *off;
-	if (avail < RBI_CONTAINER_HDRSZ)
+	if (avail < LION_CONTAINER_HDRSZ)
 	{
 		if (avail != 0)
-			elog(ERROR, "roaring index: malformed inline posting set");
+			elog(ERROR, "lion index: malformed inline posting set");
 		return 0;
 	}
 
 	/*
 	 * The item may be unaligned, so everything is read through the caller's
-	 * buffer.  rbi_container_size() of a RUN container needs the nruns field,
+	 * buffer.  lion_container_size() of a RUN container needs the nruns field,
 	 * which is the first uint16 of the payload, so peek that far before asking
 	 * for the size.  Every other item kind, sparse segments included, is sized
 	 * from the header alone.
 	 */
-	peek = Min(avail, RBI_CONTAINER_HDRSZ + sizeof(uint16));
+	peek = Min(avail, LION_CONTAINER_HDRSZ + sizeof(uint16));
 	memcpy(buf, payload + *off, peek);
-	if (buf->type != RBI_CT_ARRAY && buf->type != RBI_CT_BITSET &&
-		buf->type != RBI_CT_RUN && buf->type != RBI_CT_SPARSE)
-		elog(ERROR, "roaring index: malformed inline item of type %u",
+	if (buf->type != LION_CT_ARRAY && buf->type != LION_CT_BITSET &&
+		buf->type != LION_CT_RUN && buf->type != LION_CT_SPARSE)
+		elog(ERROR, "lion index: malformed inline item of type %u",
 			 buf->type);
-	csize = rbi_item_size(buf);
-	if (csize < RBI_CONTAINER_HDRSZ || csize > RBI_CONTAINER_MAX_SIZE ||
+	csize = lion_item_size(buf);
+	if (csize < LION_CONTAINER_HDRSZ || csize > LION_CONTAINER_MAX_SIZE ||
 		csize > avail)
-		elog(ERROR, "roaring index: malformed inline item");
+		elog(ERROR, "lion index: malformed inline item");
 
 	memcpy(buf, payload + *off, csize);
 	*off += csize;
@@ -587,25 +587,25 @@ rbi_inline_fetch(const char *payload, Size paylen, Size *off, RBIContainer *buf)
  * The layout is: header, key bytes, MAXALIGN padding, payload.  For INLINE
  * entries the payload is a sequence of containers in ascending ckey order,
  * packed back to back with no padding, so a container inside it is generally
- * unaligned; read them with rbi_inline_fetch().  head/tail/ncontainers/ntids
+ * unaligned; read them with lion_inline_fetch().  head/tail/ncontainers/ntids
  * are left at their empty values; the caller fills them in.
  */
-RBIEntryTuple *
-rbi_make_entry(RBIState *state, Datum key, uint32 hash, uint16 flags,
+LionEntryTuple *
+lion_make_entry(LionState *state, Datum key, uint32 hash, uint16 flags,
 			   const char *payload, Size payloadlen, Size *size)
 {
-	RBIEntryTuple *entry;
-	Size		keylen = rbi_key_datum_size(state, key);
-	Size		payoff = MAXALIGN((RBI_ENTRY_HDRSZ) + keylen);
+	LionEntryTuple *entry;
+	Size		keylen = lion_key_datum_size(state, key);
+	Size		payoff = MAXALIGN((LION_ENTRY_HDRSZ) + keylen);
 	Size		total = payoff + payloadlen;
 
-	if (total > RBI_MAX_ITEM_SIZE)
+	if (total > LION_MAX_ITEM_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("roaring index entry of %zu bytes is too large for a page",
+				 errmsg("lion index entry of %zu bytes is too large for a page",
 						total)));
 
-	entry = (RBIEntryTuple *) palloc0(total);
+	entry = (LionEntryTuple *) palloc0(total);
 	entry->hash = hash;
 	entry->flags = flags;
 	entry->keylen = (uint16) keylen;
@@ -614,7 +614,7 @@ rbi_make_entry(RBIState *state, Datum key, uint32 hash, uint16 flags,
 	entry->ncontainers = 0;
 	entry->ntids = 0;
 
-	rbi_store_key(state, key, RBIEntryGetKey(entry));
+	lion_store_key(state, key, LionEntryGetKey(entry));
 
 	if (payloadlen > 0)
 	{
@@ -636,25 +636,25 @@ rbi_make_entry(RBIState *state, Datum key, uint32 hash, uint16 flags,
  * payload, so once such an entry exists the insert, VACUUM and count paths
  * treat it exactly like any other.
  */
-RBIEntryTuple *
-rbi_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
+LionEntryTuple *
+lion_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
 						Size payloadlen, Size *size)
 {
-	RBIEntryTuple *entry;
-	Size		payoff = MAXALIGN(RBI_ENTRY_HDRSZ);
+	LionEntryTuple *entry;
+	Size		payoff = MAXALIGN(LION_ENTRY_HDRSZ);
 	Size		total = payoff + payloadlen;
 
-	Assert(reservedflag == RBI_ENTRY_NULLKEY ||
-		   reservedflag == RBI_ENTRY_EMPTYKEY);
+	Assert(reservedflag == LION_ENTRY_NULLKEY ||
+		   reservedflag == LION_ENTRY_EMPTYKEY);
 
-	if (total > RBI_MAX_ITEM_SIZE)
+	if (total > LION_MAX_ITEM_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("roaring index entry of %zu bytes is too large for a page",
+				 errmsg("lion index entry of %zu bytes is too large for a page",
 						total)));
 
-	entry = (RBIEntryTuple *) palloc0(total);
-	entry->hash = RBI_NULLKEY_HASH;
+	entry = (LionEntryTuple *) palloc0(total);
+	entry->hash = LION_NULLKEY_HASH;
 	entry->flags = flags | reservedflag;
 	entry->keylen = 0;
 	entry->head = InvalidBlockNumber;
@@ -681,21 +681,21 @@ rbi_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
  * The caller owns the result and fills in flags, head, tail, ncontainers and
  * ntids as needed.
  */
-RBIEntryTuple *
-rbi_entry_rebuild(const RBIEntryTuple *entry, const char *payload,
+LionEntryTuple *
+lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 				  Size payloadlen, Size *size)
 {
-	Size		payoff = RBIEntryPayloadOffset(entry);
+	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		total = payoff + payloadlen;
-	RBIEntryTuple *copy;
+	LionEntryTuple *copy;
 
-	if (total > RBI_MAX_ITEM_SIZE)
+	if (total > LION_MAX_ITEM_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("roaring index entry of %zu bytes is too large for a page",
+				 errmsg("lion index entry of %zu bytes is too large for a page",
 						total)));
 
-	copy = (RBIEntryTuple *) palloc(total);
+	copy = (LionEntryTuple *) palloc(total);
 	memcpy(copy, entry, payoff);
 	if (payloadlen > 0)
 	{
@@ -716,7 +716,7 @@ rbi_entry_rebuild(const RBIEntryTuple *entry, const char *payload,
  * entry lives on the bucket head page, and an extra pinned buffer otherwise.
  */
 bool
-rbi_find_entry_counted(Relation index, RBIState *state, Buffer headbuf,
+lion_find_entry_counted(Relation index, LionState *state, Buffer headbuf,
 					   int lockmode, Datum key, uint32 hash, FmgrInfo *eqproc,
 					   Oid collation, Buffer *buf, OffsetNumber *offnum,
 					   int *npages)
@@ -738,7 +738,7 @@ rbi_find_entry_counted(Relation index, RBIState *state, Buffer headbuf,
 		OffsetNumber off;
 		BlockNumber next;
 
-		Assert(RBIPageIsBucket(page));
+		Assert(LionPageIsBucket(page));
 
 		if (npages != NULL)
 			(*npages)++;
@@ -746,24 +746,24 @@ rbi_find_entry_counted(Relation index, RBIState *state, Buffer headbuf,
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
-			RBIEntryTuple *entry;
+			LionEntryTuple *entry;
 			Datum		stored;
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (RBIEntryTuple *) PageGetItem(page, iid);
+			entry = (LionEntryTuple *) PageGetItem(page, iid);
 			if (entry->hash != hash)
 				continue;
 
 			/*
 			 * A reserved entry has no key to compare and hashes to 0, which a
 			 * real key may hash to as well: they are only ever found through
-			 * rbi_find_reserved_entry() (DESIGN.md §14 and §17).
+			 * lion_find_reserved_entry() (DESIGN.md §14 and §17).
 			 */
-			if (RBIEntryIsReserved(entry))
+			if (LionEntryIsReserved(entry))
 				continue;
 
-			stored = rbi_fetch_key(state, RBIEntryGetKey(entry));
+			stored = lion_fetch_key(state, LionEntryGetKey(entry));
 			if (DatumGetBool(FunctionCall2Coll(eqproc, collation, stored, key)))
 			{
 				*buf = cur;
@@ -772,7 +772,7 @@ rbi_find_entry_counted(Relation index, RBIState *state, Buffer headbuf,
 			}
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(next))
 			break;
 
@@ -796,19 +796,19 @@ rbi_find_entry_counted(Relation index, RBIState *state, Buffer headbuf,
 }
 
 bool
-rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode,
+lion_find_entry_ext(Relation index, LionState *state, Buffer headbuf, int lockmode,
 				   Datum key, uint32 hash, FmgrInfo *eqproc, Oid collation,
 				   Buffer *buf, OffsetNumber *offnum)
 {
-	return rbi_find_entry_counted(index, state, headbuf, lockmode, key, hash,
+	return lion_find_entry_counted(index, state, headbuf, lockmode, key, hash,
 								  eqproc, collation, buf, offnum, NULL);
 }
 
 bool
-rbi_find_entry(Relation index, RBIState *state, Buffer headbuf, int lockmode,
+lion_find_entry(Relation index, LionState *state, Buffer headbuf, int lockmode,
 			   Datum key, uint32 hash, Buffer *buf, OffsetNumber *offnum)
 {
-	return rbi_find_entry_ext(index, state, headbuf, lockmode, key, hash,
+	return lion_find_entry_ext(index, state, headbuf, lockmode, key, hash,
 							  NULL, InvalidOid, buf, offnum);
 }
 
@@ -818,14 +818,14 @@ rbi_find_entry(Relation index, RBIState *state, Buffer headbuf, int lockmode,
  * held in lockmode by the caller, and is left locked.
  */
 bool
-rbi_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
+lion_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
 								uint16 reservedflag, Buffer *buf,
 								OffsetNumber *offnum, int *npages)
 {
 	Buffer		cur = headbuf;
 
-	Assert(reservedflag == RBI_ENTRY_NULLKEY ||
-		   reservedflag == RBI_ENTRY_EMPTYKEY);
+	Assert(reservedflag == LION_ENTRY_NULLKEY ||
+		   reservedflag == LION_ENTRY_EMPTYKEY);
 
 	if (npages != NULL)
 		*npages = 0;
@@ -837,7 +837,7 @@ rbi_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
 		OffsetNumber off;
 		BlockNumber next;
 
-		Assert(RBIPageIsBucket(page));
+		Assert(LionPageIsBucket(page));
 
 		if (npages != NULL)
 			(*npages)++;
@@ -845,11 +845,11 @@ rbi_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
-			RBIEntryTuple *entry;
+			LionEntryTuple *entry;
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (RBIEntryTuple *) PageGetItem(page, iid);
+			entry = (LionEntryTuple *) PageGetItem(page, iid);
 			if ((entry->flags & reservedflag) == 0)
 				continue;
 
@@ -858,7 +858,7 @@ rbi_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
 			return true;
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(next))
 			break;
 
@@ -882,10 +882,10 @@ rbi_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
 }
 
 bool
-rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
+lion_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
 						uint16 reservedflag, Buffer *buf, OffsetNumber *offnum)
 {
-	return rbi_find_reserved_entry_counted(index, headbuf, lockmode,
+	return lion_find_reserved_entry_counted(index, headbuf, lockmode,
 										   reservedflag, buf, offnum, NULL);
 }
 
@@ -894,7 +894,7 @@ rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
  * the head locked, which serialises this against every writer of the bucket.
  */
 int
-rbi_bucket_npages(Relation index, Buffer headbuf)
+lion_bucket_npages(Relation index, Buffer headbuf)
 {
 	Buffer		cur = headbuf;
 	int			n = 0;
@@ -904,10 +904,10 @@ rbi_bucket_npages(Relation index, Buffer headbuf)
 		Page		page = BufferGetPage(cur);
 		BlockNumber next;
 
-		Assert(RBIPageIsBucket(page));
+		Assert(LionPageIsBucket(page));
 		n++;
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(next))
 			break;
 
@@ -933,7 +933,7 @@ rbi_bucket_npages(Relation index, Buffer headbuf)
  * EXCLUSIVE by the caller).  Adds a bucket page if no existing page has room.
  */
 void
-rbi_add_entry(Relation index, Buffer headbuf, RBIEntryTuple *entry, Size size)
+lion_add_entry(Relation index, Buffer headbuf, LionEntryTuple *entry, Size size)
 {
 	Buffer		cur = headbuf;
 	Size		need = MAXALIGN(size);
@@ -946,7 +946,7 @@ rbi_add_entry(Relation index, Buffer headbuf, RBIEntryTuple *entry, Size size)
 		Page		page = BufferGetPage(cur);
 		BlockNumber next;
 
-		Assert(RBIPageIsBucket(page));
+		Assert(LionPageIsBucket(page));
 
 		if (PageGetFreeSpace(page) >= need)
 		{
@@ -954,14 +954,14 @@ rbi_add_entry(Relation index, Buffer headbuf, RBIEntryTuple *entry, Size size)
 			p = GenericXLogRegisterBuffer(xstate, cur, 0);
 			if (PageAddItemExtended(p, entry, size,
 									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-				elog(ERROR, "roaring index: failed to add entry to bucket page");
+				elog(ERROR, "lion index: failed to add entry to bucket page");
 			GenericXLogFinish(xstate);
 			if (cur != headbuf)
 				UnlockReleaseBuffer(cur);
 			return;
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(next))
 			break;
 
@@ -986,12 +986,12 @@ rbi_add_entry(Relation index, Buffer headbuf, RBIEntryTuple *entry, Size size)
 	{
 		Page		np;
 
-		nbuf = rbi_new_buffer_xl(index, xstate, RBI_PAGE_BUCKET, &np);
+		nbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_BUCKET, &np);
 
 		if (PageAddItemExtended(np, entry, size,
 								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-			elog(ERROR, "roaring index: failed to add entry to new bucket page");
-		RBIPageGetOpaque(p)->rightlink = BufferGetBlockNumber(nbuf);
+			elog(ERROR, "lion index: failed to add entry to new bucket page");
+		LionPageGetOpaque(p)->rightlink = BufferGetBlockNumber(nbuf);
 	}
 	GenericXLogFinish(xstate);
 
@@ -1005,8 +1005,8 @@ rbi_add_entry(Relation index, Buffer headbuf, RBIEntryTuple *entry, Size size)
  * the new version does not fit.
  */
 bool
-rbi_replace_entry(Relation index, GenericXLogState *state, Buffer buf,
-				  OffsetNumber offnum, RBIEntryTuple *entry, Size size)
+lion_replace_entry(Relation index, GenericXLogState *state, Buffer buf,
+				  OffsetNumber offnum, LionEntryTuple *entry, Size size)
 {
 	GenericXLogState *xstate = state;
 	Page		page;
@@ -1041,9 +1041,9 @@ rbi_replace_entry(Relation index, GenericXLogState *state, Buffer buf,
  * minckey/maxckey is to say which ckeys this page owns (DESIGN.md §13).
  */
 void
-rbi_page_update_minmax(Page page)
+lion_page_update_minmax(Page page)
 {
-	RBIPageOpaque opaque = RBIPageGetOpaque(page);
+	LionPageOpaque opaque = LionPageGetOpaque(page);
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 
 	if (maxoff < FirstOffsetNumber)
@@ -1053,10 +1053,10 @@ rbi_page_update_minmax(Page page)
 		return;
 	}
 
-	opaque->minckey = rbi_item_first_ckey((RBIContainer *)
+	opaque->minckey = lion_item_first_ckey((LionContainer *)
 										  PageGetItem(page,
 													  PageGetItemId(page, FirstOffsetNumber)));
-	opaque->maxckey = rbi_item_last_ckey((RBIContainer *)
+	opaque->maxckey = lion_item_last_ckey((LionContainer *)
 										 PageGetItem(page,
 													 PageGetItemId(page, maxoff)));
 }
@@ -1067,7 +1067,7 @@ rbi_page_update_minmax(Page page)
  * chain cannot change under it.
  */
 BlockNumber
-rbi_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 ckey)
+lion_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 ckey)
 {
 	BlockNumber blk;
 	Buffer		buf;
@@ -1086,8 +1086,8 @@ rbi_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 c
 	buf = ReadBuffer(index, tail);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	Assert(RBIPageIsContainer(page));
-	minckey = RBIPageGetOpaque(page)->minckey;
+	Assert(LionPageIsContainer(page));
+	minckey = LionPageGetOpaque(page)->minckey;
 	tailitems = PageGetMaxOffsetNumber(page);
 	UnlockReleaseBuffer(buf);
 
@@ -1110,9 +1110,9 @@ rbi_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 c
 		buf = ReadBuffer(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		Assert(RBIPageIsContainer(page));
-		maxckey = RBIPageGetOpaque(page)->maxckey;
-		next = RBIPageGetOpaque(page)->rightlink;
+		Assert(LionPageIsContainer(page));
+		maxckey = LionPageGetOpaque(page)->maxckey;
+		next = LionPageGetOpaque(page)->rightlink;
 		nitems = PageGetMaxOffsetNumber(page);
 		UnlockReleaseBuffer(buf);
 
@@ -1136,7 +1136,7 @@ rbi_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 c
  * item that can possibly cover it.
  */
 OffsetNumber
-rbi_page_find_item(Page page, uint32 ckey, bool *found)
+lion_page_find_item(Page page, uint32 ckey, bool *found)
 {
 	OffsetNumber low = FirstOffsetNumber;
 	OffsetNumber high = PageGetMaxOffsetNumber(page);
@@ -1147,9 +1147,9 @@ rbi_page_find_item(Page page, uint32 ckey, bool *found)
 	while (low <= high)
 	{
 		OffsetNumber mid = low + (high - low) / 2;
-		RBIContainer *c = (RBIContainer *) PageGetItem(page, PageGetItemId(page, mid));
+		LionContainer *c = (LionContainer *) PageGetItem(page, PageGetItemId(page, mid));
 
-		if (rbi_item_first_ckey(c) <= ckey)
+		if (lion_item_first_ckey(c) <= ckey)
 		{
 			cand = mid;
 			low = mid + 1;
@@ -1166,9 +1166,9 @@ rbi_page_find_item(Page page, uint32 ckey, bool *found)
 		return FirstOffsetNumber;	/* ckey belongs before every item */
 
 	{
-		RBIContainer *c = (RBIContainer *) PageGetItem(page, PageGetItemId(page, cand));
+		LionContainer *c = (LionContainer *) PageGetItem(page, PageGetItemId(page, cand));
 
-		if (rbi_item_last_ckey(c) >= ckey)
+		if (lion_item_last_ckey(c) >= ckey)
 		{
 			*found = true;
 			return cand;
@@ -1183,7 +1183,7 @@ rbi_page_find_item(Page page, uint32 ckey, bool *found)
  * offset is the position the container should be inserted at.
  */
 OffsetNumber
-rbi_page_find_container(Page page, uint32 ckey, bool *found)
+lion_page_find_container(Page page, uint32 ckey, bool *found)
 {
 	OffsetNumber low = FirstOffsetNumber;
 	OffsetNumber high = PageGetMaxOffsetNumber(page);
@@ -1194,7 +1194,7 @@ rbi_page_find_container(Page page, uint32 ckey, bool *found)
 	while (low <= high)
 	{
 		OffsetNumber mid = low + (high - low) / 2;
-		RBIContainer *c = (RBIContainer *) PageGetItem(page, PageGetItemId(page, mid));
+		LionContainer *c = (LionContainer *) PageGetItem(page, PageGetItemId(page, mid));
 
 		if (c->ckey == ckey)
 		{
@@ -1220,12 +1220,12 @@ rbi_page_find_container(Page page, uint32 ckey, bool *found)
  * once it is a CHAIN entry, so this cannot fail.
  */
 static void
-rbi_put_entry(Relation index, GenericXLogState *xstate, Buffer entrybuf,
-			  OffsetNumber entryoff, RBIEntryTuple *entry)
+lion_put_entry(Relation index, GenericXLogState *xstate, Buffer entrybuf,
+			  OffsetNumber entryoff, LionEntryTuple *entry)
 {
-	if (!rbi_replace_entry(index, xstate, entrybuf, entryoff, entry,
-						   RBIEntryPayloadOffset(entry)))
-		elog(ERROR, "roaring index: could not update entry tuple at %u/%u",
+	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry,
+						   LionEntryPayloadOffset(entry)))
+		elog(ERROR, "lion index: could not update entry tuple at %u/%u",
 			 BufferGetBlockNumber(entrybuf), entryoff);
 }
 
@@ -1242,26 +1242,26 @@ rbi_put_entry(Relation index, GenericXLogState *xstate, Buffer entrybuf,
  * free.
  */
 Size
-rbi_item_alloc_size(const RBIContainer *item, Size size)
+lion_item_alloc_size(const LionContainer *item, Size size)
 {
 	Size		extra;
 	Size		alloc;
 
-	Assert(size == rbi_item_size(item));
+	Assert(size == lion_item_size(item));
 
 	/* A bitset is already the largest an item can be. */
-	if (item->type == RBI_CT_BITSET)
+	if (item->type == LION_CT_BITSET)
 		return size;
 
-	extra = size / RBI_ITEM_SLACK_FRACTION;
-	extra = Max(extra, (Size) RBI_ITEM_SLACK_MIN);
-	extra = Min(extra, (Size) RBI_ITEM_SLACK_MAX);
+	extra = size / LION_ITEM_SLACK_FRACTION;
+	extra = Max(extra, (Size) LION_ITEM_SLACK_MIN);
+	extra = Min(extra, (Size) LION_ITEM_SLACK_MAX);
 
 	alloc = MAXALIGN(size) + MAXALIGN(extra);
-	if (alloc > (Size) RBI_CONTAINER_MAX_SIZE)
-		alloc = Min(MAXALIGN(size), (Size) RBI_CONTAINER_MAX_SIZE);
+	if (alloc > (Size) LION_CONTAINER_MAX_SIZE)
+		alloc = Min(MAXALIGN(size), (Size) LION_CONTAINER_MAX_SIZE);
 
-	Assert(alloc >= size && alloc - size <= RBI_ITEM_SLACK_LIMIT);
+	Assert(alloc >= size && alloc - size <= LION_ITEM_SLACK_LIMIT);
 	return alloc;
 }
 
@@ -1272,7 +1272,7 @@ rbi_item_alloc_size(const RBIContainer *item, Size size)
  * slack would put the whole item in every record.
  */
 static void
-rbi_item_zero_slack(RBIContainer *item, Size size, Size alloc)
+lion_item_zero_slack(LionContainer *item, Size size, Size alloc)
 {
 	Assert(alloc >= size);
 	if (alloc > size)
@@ -1291,31 +1291,31 @@ rbi_item_zero_slack(RBIContainer *item, Size size, Size alloc)
  * the counters from the containers.
  */
 void
-rbi_chain_put_container_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
-								   OffsetNumber entryoff, RBIEntryTuple *entry,
-								   RBIContainer *c, int *ncontainers_delta,
+lion_chain_put_container_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
+								   OffsetNumber entryoff, LionEntryTuple *entry,
+								   LionContainer *c, int *ncontainers_delta,
 								   bool slack)
 {
 	Page		page = BufferGetPage(buf);
 	OffsetNumber off;
 	bool		found;
 
-	Assert(c->type != RBI_CT_SPARSE);
-	Assert(RBIPageIsContainer(page));
+	Assert(c->type != LION_CT_SPARSE);
+	Assert(LionPageIsContainer(page));
 
-	off = rbi_page_find_container(page, c->ckey, &found);
+	off = lion_page_find_container(page, c->ckey, &found);
 	*ncontainers_delta = found ? 0 : 1;
 
-	rbi_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
+	lion_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
 								   found, &c, 1, slack);
 }
 
 void
-rbi_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
-							   OffsetNumber entryoff, RBIEntryTuple *entry,
-							   RBIContainer *c, int *ncontainers_delta)
+lion_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
+							   OffsetNumber entryoff, LionEntryTuple *entry,
+							   LionContainer *c, int *ncontainers_delta)
 {
-	rbi_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, entry, c,
+	lion_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, entry, c,
 									   ncontainers_delta, false);
 }
 
@@ -1330,35 +1330,35 @@ rbi_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
  * container from being visible as two items holding the same ckey.
  */
 void
-rbi_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
-							   OffsetNumber entryoff, RBIEntryTuple *entry,
+lion_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
+							   OffsetNumber entryoff, LionEntryTuple *entry,
 							   OffsetNumber off, bool replace,
-							   RBIContainer **items, int nitems, bool slack)
+							   LionContainer **items, int nitems, bool slack)
 {
 	Page		page = BufferGetPage(buf);
-	Size		sizes[RBI_MAX_PUT_ITEMS];
-	Size		allocs[RBI_MAX_PUT_ITEMS];
+	Size		sizes[LION_MAX_PUT_ITEMS];
+	Size		allocs[LION_MAX_PUT_ITEMS];
 	Size		need = 0;
 	Size		want = 0;
 	Size		have;
 	int			i;
 
-	Assert((entry->flags & RBI_ENTRY_CHAIN) != 0);
+	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
 	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
-	Assert(RBIPageIsContainer(page));
-	Assert(nitems >= 1 && nitems <= RBI_MAX_PUT_ITEMS);
+	Assert(LionPageIsContainer(page));
+	Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
 
 	for (i = 0; i < nitems; i++)
 	{
-		sizes[i] = rbi_item_size(items[i]);
-		Assert(sizes[i] <= RBI_CONTAINER_MAX_SIZE);
+		sizes[i] = lion_item_size(items[i]);
+		Assert(sizes[i] <= LION_CONTAINER_MAX_SIZE);
 		Assert(i == 0 ||
-			   rbi_item_first_ckey(items[i]) > rbi_item_last_ckey(items[i - 1]));
-		allocs[i] = slack ? rbi_item_alloc_size(items[i], sizes[i]) : sizes[i];
+			   lion_item_first_ckey(items[i]) > lion_item_last_ckey(items[i - 1]));
+		allocs[i] = slack ? lion_item_alloc_size(items[i], sizes[i]) : sizes[i];
 		need += MAXALIGN(sizes[i]) + sizeof(ItemIdData);
 		want += MAXALIGN(allocs[i]) + sizeof(ItemIdData);
 	}
-	Assert(need <= RBI_MAX_ITEM_SIZE + sizeof(ItemIdData));
+	Assert(need <= LION_MAX_ITEM_SIZE + sizeof(ItemIdData));
 
 	/* One item taking another one's place: overwrite it where it is. */
 	if (replace && nitems == 1)
@@ -1377,16 +1377,16 @@ rbi_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 		{
 			/*
 			 * cur comes off the page, and the item is copied out of a work
-			 * buffer of RBI_CONTAINER_MAX_SIZE bytes, so a page that claims
+			 * buffer of LION_CONTAINER_MAX_SIZE bytes, so a page that claims
 			 * more than that (only a corrupt one can) gets the exact size.
 			 */
-			if (cur >= sizes[0] && cur <= (Size) RBI_CONTAINER_MAX_SIZE &&
-				cur - sizes[0] <= RBI_ITEM_SLACK_LIMIT)
+			if (cur >= sizes[0] && cur <= (Size) LION_CONTAINER_MAX_SIZE &&
+				cur - sizes[0] <= LION_ITEM_SLACK_LIMIT)
 				writesz = cur;
 			else if (MAXALIGN(allocs[0]) <=
 					 MAXALIGN(cur) + PageGetExactFreeSpace(page))
 				writesz = allocs[0];
-			rbi_item_zero_slack(items[0], sizes[0], writesz);
+			lion_item_zero_slack(items[0], sizes[0], writesz);
 		}
 
 		{
@@ -1395,8 +1395,8 @@ rbi_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 
 			if (PageIndexTupleOverwrite(p, off, items[0], writesz))
 			{
-				rbi_page_update_minmax(p);
-				rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
+				lion_page_update_minmax(p);
+				lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 				GenericXLogFinish(xstate);
 				return;
 			}
@@ -1431,16 +1431,16 @@ rbi_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 
 		for (i = 0; i < nitems; i++)
 		{
-			rbi_item_zero_slack(items[i], sizes[i], allocs[i]);
+			lion_item_zero_slack(items[i], sizes[i], allocs[i]);
 			if (PageAddItemExtended(p, items[i], allocs[i],
 									off + (OffsetNumber) i,
 									0) == InvalidOffsetNumber)
-				elog(ERROR, "roaring index: failed to add item to page %u",
+				elog(ERROR, "lion index: failed to add item to page %u",
 					 BufferGetBlockNumber(buf));
 		}
 
-		rbi_page_update_minmax(p);
-		rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
+		lion_page_update_minmax(p);
+		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 		GenericXLogFinish(xstate);
 		return;
 	}
@@ -1450,42 +1450,42 @@ rbi_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 	 * them at their exact size - a page that has just been split has room to
 	 * spare, and the items get their slack back the next time they grow.
 	 */
-	rbi_split_and_place(index, buf, off, replace, entrybuf, entryoff, entry,
+	lion_split_and_place(index, buf, off, replace, entrybuf, entryoff, entry,
 						items, nitems);
 }
 
 void
-rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
-						   OffsetNumber entryoff, RBIEntryTuple *entry,
+lion_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
+						   OffsetNumber entryoff, LionEntryTuple *entry,
 						   OffsetNumber off, bool replace,
-						   RBIContainer **items, int nitems)
+						   LionContainer **items, int nitems)
 {
-	rbi_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
+	lion_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
 								   replace, items, nitems, false);
 }
 
 /*
  * Insert or replace a container in the chain of entry, splitting pages when
  * necessary.  Finds and locks the owning container page itself; see
- * rbi_chain_put_container_locked() for the contract on entry.
+ * lion_chain_put_container_locked() for the contract on entry.
  */
 void
-rbi_chain_put_container(Relation index, Buffer entrybuf, OffsetNumber entryoff,
-						RBIEntryTuple *entry, RBIContainer *c,
+lion_chain_put_container(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+						LionEntryTuple *entry, LionContainer *c,
 						int *ncontainers_delta)
 {
 	BlockNumber blk;
 	Buffer		buf;
 
-	Assert((entry->flags & RBI_ENTRY_CHAIN) != 0);
+	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
 	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
 
-	blk = rbi_chain_find_page(index, entry->head, entry->tail, c->ckey);
+	blk = lion_chain_find_page(index, entry->head, entry->tail, c->ckey);
 
 	buf = ReadBuffer(index, blk);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	rbi_chain_put_container_locked(index, buf, entrybuf, entryoff, entry, c,
+	lion_chain_put_container_locked(index, buf, entrybuf, entryoff, entry, c,
 								   ncontainers_delta);
 
 	UnlockReleaseBuffer(buf);
@@ -1502,24 +1502,24 @@ rbi_chain_put_container(Relation index, Buffer entrybuf, OffsetNumber entryoff,
  * as the last container page.
  */
 void
-rbi_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
-				RBIEntryTuple *entry, const char *payload, Size paylen)
+lion_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+				LionEntryTuple *entry, const char *payload, Size paylen)
 {
 	GenericXLogState *xstate;
 	Buffer		curbuf;
 	Page		curpage;
-	RBIContainer *cbuf;
+	LionContainer *cbuf;
 	BlockNumber head;
 	Size		off = 0;
 	Size		csize;
 
-	cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
 	xstate = GenericXLogStart(index);
-	curbuf = rbi_new_buffer_xl(index, xstate, RBI_PAGE_CONTAINER, &curpage);
+	curbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER, &curpage);
 	head = BufferGetBlockNumber(curbuf);
 
-	while ((csize = rbi_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
 	{
 		if (PageGetFreeSpace(curpage) < MAXALIGN(csize))
 		{
@@ -1530,10 +1530,10 @@ rbi_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 			 * Link the next page in from the current one inside the same
 			 * record, then continue the walk in a new record.
 			 */
-			nextbuf = rbi_new_buffer_xl(index, xstate, RBI_PAGE_CONTAINER,
+			nextbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER,
 										&nextpage);
-			rbi_page_update_minmax(curpage);
-			RBIPageGetOpaque(curpage)->rightlink = BufferGetBlockNumber(nextbuf);
+			lion_page_update_minmax(curpage);
+			LionPageGetOpaque(curpage)->rightlink = BufferGetBlockNumber(nextbuf);
 			GenericXLogFinish(xstate);
 			UnlockReleaseBuffer(curbuf);
 
@@ -1544,24 +1544,24 @@ rbi_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 		if (PageAddItemExtended(curpage, cbuf, csize,
 								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-			elog(ERROR, "roaring index: failed to spill container to page %u",
+			elog(ERROR, "lion index: failed to spill container to page %u",
 				 BufferGetBlockNumber(curbuf));
 	}
 
-	rbi_page_update_minmax(curpage);
+	lion_page_update_minmax(curpage);
 
 	/*
 	 * Only the INLINE/CHAIN half of the flags changes: a reserved entry
 	 * (NULL-key, §14, or empty-key, §17) stays the reserved entry it was once
 	 * its payload moves to a chain.  Losing a reserved bit here would leave a
-	 * key-less entry that rbi_find_reserved_entry() no longer finds and that
+	 * key-less entry that lion_find_reserved_entry() no longer finds and that
 	 * every other reader takes for an ordinary entry with a zero-length key,
 	 * so the next row of that kind would start a second entry.
 	 */
-	entry->flags = (entry->flags & RBI_ENTRY_RESERVED) | RBI_ENTRY_CHAIN;
+	entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
 	entry->head = head;
 	entry->tail = BufferGetBlockNumber(curbuf);
-	rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
+	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 
 	GenericXLogFinish(xstate);
 	UnlockReleaseBuffer(curbuf);
@@ -1577,14 +1577,14 @@ rbi_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
  * after P.  If the new items still do not fit on P, a second new page M
  * holding them is linked between P and N.  This always makes progress because
  * the caller's items together fit on an empty page (they are at most
- * RBI_MAX_PUT_ITEMS items of at most RBI_CONTAINER_MAX_SIZE bytes, and a
+ * LION_MAX_PUT_ITEMS items of at most LION_CONTAINER_MAX_SIZE bytes, and a
  * segment split only ever adds a few bytes to what was one item).  Items
  * never move left and never move to an existing page.
  */
 static void
-rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
+lion_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 					Buffer entrybuf, OffsetNumber entryoff,
-					RBIEntryTuple *entry, RBIContainer **items, int nitems)
+					LionEntryTuple *entry, LionContainer **items, int nitems)
 {
 	Page		page = BufferGetPage(buf);
 	BlockNumber blk = BufferGetBlockNumber(buf);
@@ -1593,7 +1593,7 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	OffsetNumber delfirst = off;
 	int			ndel = (int) (maxoff + 1 - delfirst);
 	int			nmove = (int) (maxoff + 1 - firstright);
-	Size		sizes[RBI_MAX_PUT_ITEMS];
+	Size		sizes[LION_MAX_PUT_ITEMS];
 	Size		need = 0;
 	char	   *movebuf = NULL;
 	Size	   *movelen = NULL;
@@ -1605,17 +1605,17 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	Page		pM = NULL;
 	Buffer		nbuf = InvalidBuffer;
 	Buffer		mbuf = InvalidBuffer;
-	BlockNumber oldright = RBIPageGetOpaque(page)->rightlink;
+	BlockNumber oldright = LionPageGetOpaque(page)->rightlink;
 	BlockNumber nblk = InvalidBlockNumber;
 	BlockNumber mblk = InvalidBlockNumber;
 	int			i;
 
 	Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
-	Assert(nitems >= 1 && nitems <= RBI_MAX_PUT_ITEMS);
+	Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
 
 	for (i = 0; i < nitems; i++)
 	{
-		sizes[i] = rbi_item_size(items[i]);
+		sizes[i] = lion_item_size(items[i]);
 		need += MAXALIGN(sizes[i]) + sizeof(ItemIdData);
 	}
 
@@ -1657,13 +1657,13 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	 */
 	if (nmove > 0)
 	{
-		nbuf = rbi_new_buffer_xl(index, xstate, RBI_PAGE_CONTAINER, &pN);
+		nbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER, &pN);
 		nblk = BufferGetBlockNumber(nbuf);
 	}
 
 	if (ndel > 0)
 		PageIndexMultiDelete(pP, delofs, ndel);
-	rbi_page_update_minmax(pP);
+	lion_page_update_minmax(pP);
 
 	if (PageGetExactFreeSpace(pP) >= need)
 	{
@@ -1671,22 +1671,22 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 		{
 			if (PageAddItemExtended(pP, items[i], sizes[i],
 									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-				elog(ERROR, "roaring index: failed to place item after split");
+				elog(ERROR, "lion index: failed to place item after split");
 		}
-		rbi_page_update_minmax(pP);
+		lion_page_update_minmax(pP);
 	}
 	else
 	{
 		/* The items get a page of their own, linked immediately after P. */
-		mbuf = rbi_new_buffer_xl(index, xstate, RBI_PAGE_CONTAINER, &pM);
+		mbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER, &pM);
 		mblk = BufferGetBlockNumber(mbuf);
 		for (i = 0; i < nitems; i++)
 		{
 			if (PageAddItemExtended(pM, items[i], sizes[i],
 									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-				elog(ERROR, "roaring index: failed to place item on new page");
+				elog(ERROR, "lion index: failed to place item on new page");
 		}
-		rbi_page_update_minmax(pM);
+		lion_page_update_minmax(pM);
 	}
 
 	if (nmove > 0)
@@ -1695,9 +1695,9 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 		{
 			if (PageAddItemExtended(pN, moveptr[i], movelen[i],
 									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-				elog(ERROR, "roaring index: failed to move container during split");
+				elog(ERROR, "lion index: failed to move container during split");
 		}
-		rbi_page_update_minmax(pN);
+		lion_page_update_minmax(pN);
 	}
 
 	/* Relink: P -> [M] -> [N] -> oldright */
@@ -1706,14 +1706,14 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 
 		if (BlockNumberIsValid(mblk))
 		{
-			RBIPageGetOpaque(pM)->rightlink = after_m;
-			RBIPageGetOpaque(pP)->rightlink = mblk;
+			LionPageGetOpaque(pM)->rightlink = after_m;
+			LionPageGetOpaque(pP)->rightlink = mblk;
 		}
 		else
-			RBIPageGetOpaque(pP)->rightlink = after_m;
+			LionPageGetOpaque(pP)->rightlink = after_m;
 
 		if (BlockNumberIsValid(nblk))
-			RBIPageGetOpaque(pN)->rightlink = oldright;
+			LionPageGetOpaque(pN)->rightlink = oldright;
 	}
 
 	/* If P was the tail, the chain has a new last page. */
@@ -1727,7 +1727,7 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	}
 
 	/* The entry always travels with the container change. */
-	rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
+	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 
 	GenericXLogFinish(xstate);
 
@@ -1758,18 +1758,18 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
  * --------------------------------------------------------------------- */
 
 /* Indexes this backend has already complained about, keyed by relation Oid. */
-static HTAB *rbi_warned_indexes = NULL;
+static HTAB *lion_warned_indexes = NULL;
 
 int
-rbi_max_entries(Relation index)
+lion_max_entries(Relation index)
 {
-	RBIOptions *opts = (RBIOptions *) index->rd_options;
+	LionOptions *opts = (LionOptions *) index->rd_options;
 
-	return opts ? opts->max_entries : RBI_DEFAULT_MAX_ENTRIES;
+	return opts ? opts->max_entries : LION_DEFAULT_MAX_ENTRIES;
 }
 
 int64
-rbi_bucket_nentries(Relation index, Buffer headbuf)
+lion_bucket_nentries(Relation index, Buffer headbuf)
 {
 	Buffer		cur = headbuf;
 	int64		n = 0;
@@ -1781,7 +1781,7 @@ rbi_bucket_nentries(Relation index, Buffer headbuf)
 		OffsetNumber off;
 		BlockNumber next;
 
-		Assert(RBIPageIsBucket(page));
+		Assert(LionPageIsBucket(page));
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
@@ -1789,7 +1789,7 @@ rbi_bucket_nentries(Relation index, Buffer headbuf)
 				n++;
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(next))
 			break;
 
@@ -1816,32 +1816,32 @@ rbi_bucket_nentries(Relation index, Buffer headbuf)
 }
 
 void
-rbi_warn_max_entries(Relation index, int64 nentries)
+lion_warn_max_entries(Relation index, int64 nentries)
 {
 	Oid			relid = RelationGetRelid(index);
 	bool		found;
 
-	if (rbi_warned_indexes == NULL)
+	if (lion_warned_indexes == NULL)
 	{
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(Oid);
 		ctl.hcxt = TopMemoryContext;
-		rbi_warned_indexes = hash_create("roaring index max_entries warnings",
+		lion_warned_indexes = hash_create("lion index max_entries warnings",
 										 16, &ctl,
 										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 
-	(void) hash_search(rbi_warned_indexes, &relid, HASH_ENTER, &found);
+	(void) hash_search(lion_warned_indexes, &relid, HASH_ENTER, &found);
 	if (found)
 		return;					/* this backend has said it once already */
 
 	ereport(WARNING,
-			(errmsg("roaring index \"%s\" has more than %d distinct keys",
-					RelationGetRelationName(index), rbi_max_entries(index)),
+			(errmsg("lion index \"%s\" has more than %d distinct keys",
+					RelationGetRelationName(index), lion_max_entries(index)),
 			 errdetail("The index holds about " INT64_FORMAT " entries; its max_entries option is %d.",
-					   nentries, rbi_max_entries(index)),
+					   nentries, lion_max_entries(index)),
 			 errhint("Raise max_entries, or index a column with fewer distinct keys.")));
 }
 
@@ -1849,19 +1849,19 @@ rbi_warn_max_entries(Relation index, int64 nentries)
  * Bucket directory guard (DESIGN.md §5)
  *
  * ambuild sizes the bucket directory once and nothing ever resizes it, so an
- * index created on an empty table keeps RBI_DEFAULT_BUCKETS buckets for good
+ * index created on an empty table keeps LION_DEFAULT_BUCKETS buckets for good
  * and answers every lookup by walking a long chain of bucket pages.  The
  * remedy is a REINDEX, which sizes the directory from the data that is
  * actually there - so the index says once per backend that it wants one.
  * --------------------------------------------------------------------- */
 
 /* Indexes this backend has already complained about, keyed by relation Oid. */
-static HTAB *rbi_warned_buckets = NULL;
+static HTAB *lion_warned_buckets = NULL;
 
 void
-rbi_warn_bucket_chain(Relation index, int npages)
+lion_warn_bucket_chain(Relation index, int npages)
 {
-	RBIOptions *opts = (RBIOptions *) index->rd_options;
+	LionOptions *opts = (LionOptions *) index->rd_options;
 	Oid			relid = RelationGetRelid(index);
 	bool		found;
 
@@ -1869,26 +1869,26 @@ rbi_warn_bucket_chain(Relation index, int npages)
 	if (opts != NULL && opts->buckets > 0)
 		return;
 
-	if (rbi_warned_buckets == NULL)
+	if (lion_warned_buckets == NULL)
 	{
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(Oid);
 		ctl.hcxt = TopMemoryContext;
-		rbi_warned_buckets = hash_create("roaring index bucket chain warnings",
+		lion_warned_buckets = hash_create("lion index bucket chain warnings",
 										 16, &ctl,
 										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 
-	(void) hash_search(rbi_warned_buckets, &relid, HASH_ENTER, &found);
+	(void) hash_search(lion_warned_buckets, &relid, HASH_ENTER, &found);
 	if (found)
 		return;					/* this backend has said it once already */
 
 	ereport(WARNING,
-			(errmsg("roaring index \"%s\" has outgrown its bucket directory",
+			(errmsg("lion index \"%s\" has outgrown its bucket directory",
 					RelationGetRelationName(index)),
 			 errdetail("One bucket chain is %d pages long; the index was built with %u buckets, which is what a lookup of a key has to walk.",
-					   npages, rbi_get_state(index)->meta.nbuckets),
+					   npages, lion_get_state(index)->meta.nbuckets),
 			 errhint("REINDEX the index: the bucket count is chosen at build time from the entries that exist then, and this index was built smaller (often on an empty table).")));
 }

@@ -1,3 +1,5 @@
+> Note: this document predates the rename to **pg_lion** (2026-09-21). Names map as: extension `roaring_index` -> `pg_lion`, access method `roaring` -> `lion`, functions `roaring_index_*` -> `lion_index_*`, GUC `roaring_index.*` -> `pg_lion.*`, C prefix `rbi_`/`RBI` -> `lion_`/`LION`/`Lion`, files `src/rbi_*.c` -> `src/lion_*.c`.
+
 # Roaring versus PostgreSQL index types: measured comparison
 
 Roaring's strongest result is counting and grouping a vacuumed, read-heavy table without visiting the heap. It is a specialized addition to a PostgreSQL indexing strategy. Composite and covering B-tree indexes win several selective intersections and heap-fetch workloads here, while B-tree also supplies range and ordered access that roaring does not implement. Writes, visibility-map changes, prepared-plan selection, and how the index was built materially change the comparison.

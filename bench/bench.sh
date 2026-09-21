@@ -38,7 +38,7 @@ run "fetch_c200_gin" "-c enable_seqscan=off" fetch_c200_idx.sql
 fi
 if only 2b; then
 echo "== phase 2b: roaring AM only =="; invalid btree; invalid gin; valid roaring
-NB="-c enable_seqscan=off -c roaring_index.enable_count_pushdown=off"
+NB="-c enable_seqscan=off -c pg_lion.enable_count_pushdown=off"
 for c in c2 c200 c200_clustered c20k c1m; do run "p_${c}_roaring_bitmap" "$NB" p_${c}_idx.sql; done
 run "and3_roaring" "$NB" and3_idx.sql
 run "range_c20k_roaring_bitmap" "$NB" range_c20k_idx.sql
@@ -46,15 +46,15 @@ run "fetch_c200_roaring" "$NB" fetch_c200_idx.sql
 fi
 if only 2c; then
 echo "== phase 2c: roaring count pushdown (CustomScan) =="; valid roaring
-PD="-c roaring_index.enable_count_pushdown=on"
+PD="-c pg_lion.enable_count_pushdown=on"
 for c in c2 c200 c200_clustered c20k c1m; do run "p_${c}_pushdown" "$PD" p_${c}_idx.sql; done
 run "and3_pushdown" "$PD" and3_idx.sql
 for c in c200 c2; do run "grp_${c}_pushdown" "$PD" grp_${c}_idx.sql; done
 fi
 if only 3; then
 echo "== phase 3: seqscan + roaring simulation =="; valid btree; valid gin; invalid roaring
-run "grp_c200_seqscan" "-c enable_indexonlyscan=off -c enable_indexscan=off -c enable_bitmapscan=off -c roaring_index.enable_count_pushdown=off" grp_c200_idx.sql
-run "grp_c2_seqscan" "-c enable_indexonlyscan=off -c enable_indexscan=off -c enable_bitmapscan=off -c roaring_index.enable_count_pushdown=off" grp_c2_idx.sql
+run "grp_c200_seqscan" "-c enable_indexonlyscan=off -c enable_indexscan=off -c enable_bitmapscan=off -c pg_lion.enable_count_pushdown=off" grp_c200_idx.sql
+run "grp_c2_seqscan" "-c enable_indexonlyscan=off -c enable_indexscan=off -c enable_bitmapscan=off -c pg_lion.enable_count_pushdown=off" grp_c2_idx.sql
 for c in c2 c200 c20k c1m; do for v in naive vmall vm95; do run "p_${c}_rb_$v" "" p_${c}_rb_$v.sql; done; done
 run "and3_rb_naive" "" and3_rb_naive.sql
 run "and3_rb_vm95" "" and3_rb_vm95.sql

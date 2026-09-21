@@ -4,11 +4,11 @@ Use [quick.py](quick.py) after building and installing the current extension. Th
 
 The earlier [500k/50k baseline](results/quick/2026-09-21-baseline/REPORT.md) remains a historical `quick-v1` run. The larger profile requires a new baseline; the runner rejects comparisons between these profiles.
 
-Only **B-tree, GIN, roaring, and roaring_bitmap** are timed. Sequential execution remains an untimed correctness reference. `roaring_bitmap` reuses the roaring indexes with count pushdown disabled. Document queries compare GIN and roaring because B-tree has no matching array/full-text index in this workload.
+Only **B-tree, GIN, roaring, and roaring_bitmap** are timed. Sequential execution remains an untimed correctness reference. `roaring_bitmap` reuses the lion indexes with count pushdown disabled. Document queries compare GIN and roaring because B-tree has no matching array/full-text index in this workload.
 
 ## Run after each change
 
-Requirements: Python 3.9+ on Linux, a PostgreSQL installation containing `libpq`, and installed `roaring_index`, `btree_gin`, and `pg_visibility`. No Python packages or charting dependencies are required. The runner creates a private temporary cluster and stops/removes it afterward. It never connects to an existing database.
+Requirements: Python 3.9+ on Linux, a PostgreSQL installation containing `libpq`, and installed `pg_lion`, `btree_gin`, and `pg_visibility`. No Python packages or charting dependencies are required. The runner creates a private temporary cluster and stops/removes it afterward. It never connects to an existing database.
 
 For the repository's local PostgreSQL installation:
 

@@ -27,7 +27,7 @@ def command(args, **kwargs):
 class Cluster:
     def __init__(self, prefix, output):
         self.prefix, self.output = Path(prefix).resolve(), output
-        self.root = Path(tempfile.mkdtemp(prefix='rbi-comparison-', dir='/tmp'))
+        self.root = Path(tempfile.mkdtemp(prefix='lion-comparison-', dir='/tmp'))
         self.data, self.socket = self.root/'data', self.root/'socket'
         self.socket.mkdir(mode=0o700)
         self.started = False
@@ -54,7 +54,7 @@ class Cluster:
         if actual != self.data.resolve():
             self.db.close()
             raise RuntimeError(f'Unexpected cluster {actual}; refusing SQL')
-        self.db.query("LOAD 'roaring_index'; SET statement_timeout='60s'")
+        self.db.query("LOAD 'pg_lion'; SET statement_timeout='60s'")
 
     def stop(self):
         if self.db:
@@ -148,11 +148,11 @@ class Suite:
     def settings(self, variant, mode='default', memory='64MB'):
         push = 'on' if variant == 'roaring' else 'off'
         seq = 'off' if mode == 'prefer_index' else 'on'
-        self.db.query(f"SET roaring_index.enable_count_pushdown={push}; SET enable_seqscan={seq}; "
+        self.db.query(f"SET pg_lion.enable_count_pushdown={push}; SET enable_seqscan={seq}; "
                       f"SET work_mem='{memory}'; SET max_parallel_workers_per_gather=0")
 
     def reference(self, cases):
-        self.db.query("SET roaring_index.enable_count_pushdown=off; SET enable_seqscan=on; "
+        self.db.query("SET pg_lion.enable_count_pushdown=off; SET enable_seqscan=on; "
                       "SET enable_indexscan=off; SET enable_indexonlyscan=off; SET enable_bitmapscan=off")
         try:
             return {c.id: digest(self.db.query(c.sql)) for c in cases}
@@ -235,7 +235,7 @@ class Suite:
             plan = self.db.explain(case.sql)
             tree = list(nodes(plan['Plan']))
             used = sorted({x['Index Name'] for x in tree if 'Index Name' in x})
-            custom = any(x.get('Custom Plan Provider') == 'RoaringCount' for x in tree)
+            custom = any(x.get('Custom Plan Provider') == 'LionCount' for x in tree)
             scans = sorted({x['Node Type'] for x in tree if 'Scan' in x['Node Type']})
             # Custom scan embeds its own index access; EXPLAIN need not emit Index Name.
             fallback = context['variant'] != 'seq' and not used and not custom
@@ -274,8 +274,8 @@ class Suite:
             def client(worker):
                 db = DB(self.cluster.libpq, self.cluster.conninfo)
                 try:
-                    db.query("LOAD 'roaring_index'; SET statement_timeout='60s'; "
-                             f"SET roaring_index.enable_count_pushdown={'on' if variant=='roaring' else 'off'}")
+                    db.query("LOAD 'pg_lion'; SET statement_timeout='60s'; "
+                             f"SET pg_lion.enable_count_pushdown={'on' if variant=='roaring' else 'off'}")
                     db.query(case.sql)
                     barrier.wait()
                     start = time.perf_counter()
@@ -392,7 +392,7 @@ class Suite:
                 note='Fresh owned cluster; retained completed portfolios; shuffled rounds restart from the configured seed')]
         try:
             self.cluster.start(initialize=True)
-            for ext in ['roaring_index','btree_gin','btree_gist','pg_visibility']:
+            for ext in ['pg_lion','btree_gin','btree_gist','pg_visibility']:
                 self.db.query(f'CREATE EXTENSION {ext}')
             metadata['server_version'] = self.db.scalar('SELECT version()')
             metadata['settings'] = self.db.query('SELECT name,setting,unit,source FROM pg_settings ORDER BY name',dictionaries=True)
@@ -423,7 +423,7 @@ class Suite:
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--prefix',required=True,help='Installed PostgreSQL with roaring_index, btree_gin, btree_gist, pg_visibility')
+    p.add_argument('--prefix',required=True,help='Installed PostgreSQL with pg_lion, btree_gin, btree_gist, pg_visibility')
     p.add_argument('--output',required=True,help='New output directory (refuses overwrite)')
     p.add_argument('--rows',type=int,nargs='+',default=[1000000,5000000])
     p.add_argument('--documents',type=int,default=200000)

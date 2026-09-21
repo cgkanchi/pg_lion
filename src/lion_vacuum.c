@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_vacuum.c
- *		ambulkdelete / amvacuumcleanup for the roaring index
+ * lion_vacuum.c
+ *		ambulkdelete / amvacuumcleanup for the lion index
  *		(DESIGN.md sections 5 and 11).
  *
  * Three rules shape everything in this file.
@@ -24,7 +24,7 @@
  *	  sufficient: pages are never recycled, so a new page is always right of
  *	  its split origin and is visited after it, and the set of dead TIDs is
  *	  fixed before index cleanup starts.  The same reason is why the
- *	  re-placement of a container that grew (rbi_vacuum_regrow) walks right
+ *	  re-placement of a container that grew (lion_vacuum_regrow) walks right
  *	  from the page the container was filtered on, cleanup-locking each page
  *	  on the way, instead of jumping straight to the page that owns its ckey.
  *
@@ -81,7 +81,7 @@
  *	  absolute values computed in an earlier window.
  *	- A container that grew out of its slot has to be re-placed through the
  *	  chain machinery, which may split its page.  That happens in a window of
- *	  its own (rbi_vacuum_regrow), which finds the page the container is on by
+ *	  its own (lion_vacuum_regrow), which finds the page the container is on by
  *	  walking right under cleanup locks (rule 1) -- a concurrent insert, or the
  *	  re-placement of an earlier container, may have split the page and moved
  *	  this container right -- and re-reads and re-filters the container it
@@ -113,99 +113,99 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
-#include "rbi.h"
+#include "lion.h"
 
-typedef struct RBIVacState
+typedef struct LionVacState
 {
 	Relation	index;
-	RBIState   *state;
+	LionState   *state;
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
 	IndexBulkDeleteResult *stats;
 	double		numtids;		/* sum of ntids over every entry */
-	RBIContainer *cbuf;			/* aligned container work buffer */
+	LionContainer *cbuf;			/* aligned container work buffer */
 	MemoryContext pagecxt;		/* reset per container page and per entry */
-} RBIVacState;
+} LionVacState;
 
-/* Argument of the rbi_container_remove_if() predicate. */
-typedef struct RBIVacPred
+/* Argument of the lion_container_remove_if() predicate. */
+typedef struct LionVacPred
 {
 	uint32		ckey;
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
-} RBIVacPred;
+} LionVacPred;
 
 /* One item (container or sparse segment) to be written back to its page. */
-typedef struct RBIVacItem
+typedef struct LionVacItem
 {
 	OffsetNumber off;			/* where it sits on the page */
 	Size		size;			/* size of the filtered item */
 	uint32		removed;		/* TIDs it lost */
-	RBIContainer *c;			/* the filtered item */
-} RBIVacItem;
+	LionContainer *c;			/* the filtered item */
+} LionVacItem;
 
 /* What one filtering pass over a container page found. */
-typedef struct RBIVacWork
+typedef struct LionVacWork
 {
-	RBIVacItem *work;			/* containers to write back */
+	LionVacItem *work;			/* containers to write back */
 	OffsetNumber *delofs;		/* containers that lost every member */
 	int			nwork;
 	int			ndel;
 	uint64		delremoved;		/* TIDs the deleted containers held */
-} RBIVacWork;
+} LionVacWork;
 
 /* A CHAIN entry seen by pass 1, to be walked by pass 2. */
-typedef struct RBIVacChain
+typedef struct LionVacChain
 {
 	OffsetNumber off;			/* offset of the entry on its bucket page */
 	BlockNumber head;			/* first page of its container chain */
-} RBIVacChain;
+} LionVacChain;
 
-static void rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket);
-static void rbi_vacuum_inline(RBIVacState *vs, Buffer buf, OffsetNumber off);
-static void rbi_vacuum_chain(RBIVacState *vs, Buffer entrybuf,
+static void lion_vacuum_bucket(LionVacState *vs, uint32 bucket);
+static void lion_vacuum_inline(LionVacState *vs, Buffer buf, OffsetNumber off);
+static void lion_vacuum_chain(LionVacState *vs, Buffer entrybuf,
 							 OffsetNumber entryoff, BlockNumber head);
-static BlockNumber rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
+static BlockNumber lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
 											 OffsetNumber entryoff,
 											 BlockNumber blk);
-static BlockNumber rbi_vacuum_filter_page(RBIVacState *vs, Buffer buf,
-										  RBIVacWork *w);
-static void rbi_vacuum_apply_page(RBIVacState *vs, Buffer entrybuf,
+static BlockNumber lion_vacuum_filter_page(LionVacState *vs, Buffer buf,
+										  LionVacWork *w);
+static void lion_vacuum_apply_page(LionVacState *vs, Buffer entrybuf,
 								  OffsetNumber entryoff, Buffer buf,
-								  RBIVacWork *w, uint32 **grownp,
+								  LionVacWork *w, uint32 **grownp,
 								  int *ngrownp);
-static void rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf,
+static void lion_vacuum_regrow(LionVacState *vs, Buffer entrybuf,
 							  OffsetNumber entryoff, BlockNumber startblk,
 							  uint32 ckey);
-static RBIEntryTuple *rbi_vacuum_entry_copy(Buffer entrybuf,
+static LionEntryTuple *lion_vacuum_entry_copy(Buffer entrybuf,
 											OffsetNumber entryoff, Size *size);
 
 /*
- * The predicate handed to rbi_container_remove_if(): map the container
+ * The predicate handed to lion_container_remove_if(): map the container
  * coordinates back to a heap TID and ask the caller of ambulkdelete.
  */
 static bool
-rbi_vac_is_dead(uint16 lo, void *arg)
+lion_vac_is_dead(uint16 lo, void *arg)
 {
-	RBIVacPred *pred = (RBIVacPred *) arg;
+	LionVacPred *pred = (LionVacPred *) arg;
 	ItemPointerData tid;
 
-	rbi_code_to_tid(rbi_make_code(pred->ckey, lo), &tid);
+	lion_code_to_tid(lion_make_code(pred->ckey, lo), &tid);
 
 	return pred->callback(&tid, pred->callback_state);
 }
 
 /*
- * The same predicate for rbi_sparse_remove_if(), whose pairs carry their own
+ * The same predicate for lion_sparse_remove_if(), whose pairs carry their own
  * container key (DESIGN.md §13).
  */
 static bool
-rbi_vac_is_dead_pair(uint32 ckey, uint16 lo, void *arg)
+lion_vac_is_dead_pair(uint32 ckey, uint16 lo, void *arg)
 {
-	RBIVacPred *pred = (RBIVacPred *) arg;
+	LionVacPred *pred = (LionVacPred *) arg;
 	ItemPointerData tid;
 
-	rbi_code_to_tid(rbi_make_code(ckey, lo), &tid);
+	lion_code_to_tid(lion_make_code(ckey, lo), &tid);
 
 	return pred->callback(&tid, pred->callback_state);
 }
@@ -218,32 +218,32 @@ rbi_vac_is_dead_pair(uint32 ckey, uint16 lo, void *arg)
  * sparse segment is a plain sorted list and can only shrink.
  */
 static uint32
-rbi_vac_filter_item(RBIContainer *item, RBIVacPred *pred)
+lion_vac_filter_item(LionContainer *item, LionVacPred *pred)
 {
-	if (item->type == RBI_CT_SPARSE)
-		return rbi_sparse_remove_if(item, rbi_vac_is_dead_pair, pred);
+	if (item->type == LION_CT_SPARSE)
+		return lion_sparse_remove_if(item, lion_vac_is_dead_pair, pred);
 
 	pred->ckey = item->ckey;
-	return rbi_container_remove_if(item, rbi_vac_is_dead, pred);
+	return lion_container_remove_if(item, lion_vac_is_dead, pred);
 }
 
 /* Pick the smallest representation of a filtered item. */
 static void
-rbi_vac_optimize_item(RBIContainer *item)
+lion_vac_optimize_item(LionContainer *item)
 {
-	if (item->type != RBI_CT_SPARSE)
-		rbi_container_optimize(item);
+	if (item->type != LION_CT_SPARSE)
+		lion_container_optimize(item);
 }
 
 /*
  * ambulkdelete
  */
 IndexBulkDeleteResult *
-rbibulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			  IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	index = info->index;
-	RBIVacState vs;
+	LionVacState vs;
 	MemoryContext vaccxt;
 	MemoryContext oldcxt;
 	uint32		b;
@@ -253,12 +253,12 @@ rbibulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	memset(&vs, 0, sizeof(vs));
 	vs.index = index;
-	vs.state = rbi_get_state(index);
+	vs.state = lion_get_state(index);
 	vs.callback = callback;
 	vs.callback_state = callback_state;
 	vs.stats = stats;
 	vs.numtids = 0;
-	vs.cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
 	/*
 	 * VACUUM does not run in a short-lived context, so all per-bucket work
@@ -266,16 +266,16 @@ rbibulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * long) walk of a container chain into one that is reset per page.
 	 */
 	vaccxt = AllocSetContextCreate(CurrentMemoryContext,
-								   "roaring index vacuum",
+								   "lion index vacuum",
 								   ALLOCSET_DEFAULT_SIZES);
 	vs.pagecxt = AllocSetContextCreate(CurrentMemoryContext,
-									   "roaring index vacuum page",
+									   "lion index vacuum page",
 									   ALLOCSET_DEFAULT_SIZES);
 
 	for (b = 0; b < vs.state->meta.nbuckets; b++)
 	{
 		oldcxt = MemoryContextSwitchTo(vaccxt);
-		rbi_vacuum_bucket(&vs, b);
+		lion_vacuum_bucket(&vs, b);
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextReset(vaccxt);
 
@@ -300,7 +300,7 @@ rbibulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
  * amvacuumcleanup
  */
 IndexBulkDeleteResult *
-rbivacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
 	if (info->analyze_only)
 		return stats;
@@ -327,9 +327,9 @@ rbivacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * container chains of the CHAIN entries pass 1 found (see the file header).
  */
 static void
-rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket)
+lion_vacuum_bucket(LionVacState *vs, uint32 bucket)
 {
-	BlockNumber blk = RBI_BUCKET_BLKNO(bucket);
+	BlockNumber blk = LION_BUCKET_BLKNO(bucket);
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -338,7 +338,7 @@ rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket)
 		BlockNumber next;
 		OffsetNumber maxoff;
 		OffsetNumber off;
-		RBIVacChain *chains;
+		LionVacChain *chains;
 		int			nchains = 0;
 		int			i;
 
@@ -352,35 +352,35 @@ rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket)
 		LockBufferForCleanup(buf);
 		page = BufferGetPage(buf);
 
-		if (!RBIPageIsBucket(page))
+		if (!LionPageIsBucket(page))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "roaring index: block %u is not a bucket page", blk);
+			elog(ERROR, "lion index: block %u is not a bucket page", blk);
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		maxoff = PageGetMaxOffsetNumber(page);
-		chains = (RBIVacChain *) palloc(sizeof(RBIVacChain) * (maxoff + 1));
+		chains = (LionVacChain *) palloc(sizeof(LionVacChain) * (maxoff + 1));
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
-			RBIEntryTuple *entry;
+			LionEntryTuple *entry;
 
 			if (!ItemIdIsUsed(iid))
 				continue;
 
-			entry = (RBIEntryTuple *) PageGetItem(page, iid);
+			entry = (LionEntryTuple *) PageGetItem(page, iid);
 
-			if ((entry->flags & RBI_ENTRY_INLINE) != 0)
-				rbi_vacuum_inline(vs, buf, off);
-			else if ((entry->flags & RBI_ENTRY_CHAIN) != 0)
+			if ((entry->flags & LION_ENTRY_INLINE) != 0)
+				lion_vacuum_inline(vs, buf, off);
+			else if ((entry->flags & LION_ENTRY_CHAIN) != 0)
 			{
 				if (!BlockNumberIsValid(entry->head) ||
 					!BlockNumberIsValid(entry->tail))
 				{
 					UnlockReleaseBuffer(buf);
-					elog(ERROR, "roaring index: chain entry %u on block %u has no container pages",
+					elog(ERROR, "lion index: chain entry %u on block %u has no container pages",
 						 off, blk);
 				}
 				chains[nchains].off = off;
@@ -392,7 +392,7 @@ rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket)
 				uint16		flags = entry->flags;
 
 				UnlockReleaseBuffer(buf);
-				elog(ERROR, "roaring index: entry %u on block %u has invalid flags %u",
+				elog(ERROR, "lion index: entry %u on block %u has invalid flags %u",
 					 off, blk, flags);
 			}
 
@@ -406,7 +406,7 @@ rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket)
 
 		/* Pass 2, holding no page lock between its steps. */
 		for (i = 0; i < nchains; i++)
-			rbi_vacuum_chain(vs, buf, chains[i].off, chains[i].head);
+			lion_vacuum_chain(vs, buf, chains[i].off, chains[i].head);
 
 		ReleaseBuffer(buf);
 		pfree(chains);
@@ -425,15 +425,15 @@ rbi_vacuum_bucket(RBIVacState *vs, uint32 bucket)
  * pages, exactly as an insert would.
  */
 static void
-rbi_vacuum_inline(RBIVacState *vs, Buffer buf, OffsetNumber off)
+lion_vacuum_inline(LionVacState *vs, Buffer buf, OffsetNumber off)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
-	RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
-	Size		paylen = RBI_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
 	MemoryContext oldcxt;
 	StringInfoData newpay;
-	RBIVacPred	pred;
+	LionVacPred	pred;
 	char	   *oldpay;
 	Size		cur = 0;
 	Size		csize;
@@ -445,22 +445,22 @@ rbi_vacuum_inline(RBIVacState *vs, Buffer buf, OffsetNumber off)
 
 	/* The payload is copied out: a spill rewrites the entry under our feet. */
 	oldpay = (char *) palloc(paylen);
-	memcpy(oldpay, RBIEntryGetPayload(entry), paylen);
+	memcpy(oldpay, LionEntryGetPayload(entry), paylen);
 
 	pred.callback = vs->callback;
 	pred.callback_state = vs->callback_state;
 
 	initStringInfo(&newpay);
-	while ((csize = rbi_inline_fetch(oldpay, paylen, &cur, vs->cbuf)) > 0)
+	while ((csize = lion_inline_fetch(oldpay, paylen, &cur, vs->cbuf)) > 0)
 	{
-		removed += rbi_vac_filter_item(vs->cbuf, &pred);
+		removed += lion_vac_filter_item(vs->cbuf, &pred);
 
 		if (vs->cbuf->cardinality == 0)
 			continue;			/* drop empty containers and segments */
 
-		rbi_vac_optimize_item(vs->cbuf);
+		lion_vac_optimize_item(vs->cbuf);
 		appendBinaryStringInfo(&newpay, (char *) vs->cbuf,
-							   rbi_item_size(vs->cbuf));
+							   lion_item_size(vs->cbuf));
 		ncontainers++;
 		ntids += vs->cbuf->cardinality;
 	}
@@ -479,16 +479,16 @@ rbi_vacuum_inline(RBIVacState *vs, Buffer buf, OffsetNumber off)
 
 	if ((Size) newpay.len <= (Size) vs->state->meta.inline_limit)
 	{
-		RBIEntryTuple *newentry;
+		LionEntryTuple *newentry;
 		Size		newsize;
 		bool		ok;
 
-		newentry = rbi_entry_rebuild(entry, newpay.data, (Size) newpay.len,
+		newentry = lion_entry_rebuild(entry, newpay.data, (Size) newpay.len,
 									 &newsize);
 		newentry->ncontainers = ncontainers;
 		newentry->ntids = ntids;
 
-		ok = rbi_replace_entry(vs->index, NULL, buf, off, newentry, newsize);
+		ok = lion_replace_entry(vs->index, NULL, buf, off, newentry, newsize);
 		if (ok)
 		{
 			MemoryContextSwitchTo(oldcxt);
@@ -499,14 +499,14 @@ rbi_vacuum_inline(RBIVacState *vs, Buffer buf, OffsetNumber off)
 
 	/* It no longer fits inline: move the posting set onto container pages. */
 	{
-		RBIEntryTuple *chain;
+		LionEntryTuple *chain;
 		Size		chainsize;
 
-		chain = rbi_entry_rebuild(entry, NULL, 0, &chainsize);
+		chain = lion_entry_rebuild(entry, NULL, 0, &chainsize);
 		chain->ncontainers = ncontainers;
 		chain->ntids = ntids;
 
-		rbi_entry_spill(vs->index, buf, off, chain, newpay.data,
+		lion_entry_spill(vs->index, buf, off, chain, newpay.data,
 						(Size) newpay.len);
 	}
 
@@ -521,22 +521,22 @@ rbi_vacuum_inline(RBIVacState *vs, Buffer buf, OffsetNumber off)
  * are never deleted or moved.
  */
 static void
-rbi_vacuum_chain(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
+lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 				 BlockNumber head)
 {
 	BlockNumber blk = head;
-	RBIEntryTuple *entry;
+	LionEntryTuple *entry;
 
 	while (BlockNumberIsValid(blk))
 	{
-		blk = rbi_vacuum_container_page(vs, entrybuf, entryoff, blk);
+		blk = lion_vacuum_container_page(vs, entrybuf, entryoff, blk);
 
 		vacuum_delay_point(false);
 	}
 
 	/* Report what the entry holds now that every page has been visited. */
 	LockBuffer(entrybuf, BUFFER_LOCK_SHARE);
-	entry = (RBIEntryTuple *) PageGetItem(BufferGetPage(entrybuf),
+	entry = (LionEntryTuple *) PageGetItem(BufferGetPage(entrybuf),
 										  PageGetItemId(BufferGetPage(entrybuf),
 														entryoff));
 	vs->numtids += (double) entry->ntids;
@@ -549,23 +549,23 @@ rbi_vacuum_chain(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
  * the page inside every window and its counters are only ever updated with
  * deltas.
  */
-static RBIEntryTuple *
-rbi_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
+static LionEntryTuple *
+lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
-	RBIEntryTuple *entry;
+	LionEntryTuple *entry;
 
 	if (!ItemIdIsUsed(iid))
-		elog(ERROR, "roaring index: entry %u on block %u is gone",
+		elog(ERROR, "lion index: entry %u on block %u is gone",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	entry = (RBIEntryTuple *) PageGetItem(page, iid);
-	if ((entry->flags & RBI_ENTRY_CHAIN) == 0)
-		elog(ERROR, "roaring index: entry %u on block %u is no longer a chain entry",
+	entry = (LionEntryTuple *) PageGetItem(page, iid);
+	if ((entry->flags & LION_ENTRY_CHAIN) == 0)
+		elog(ERROR, "lion index: entry %u on block %u is no longer a chain entry",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	return rbi_entry_rebuild(entry, NULL, 0, size);
+	return lion_entry_rebuild(entry, NULL, 0, size);
 }
 
 /*
@@ -574,12 +574,12 @@ rbi_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
  * protocol this implements.
  */
 static BlockNumber
-rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
+lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
 						  OffsetNumber entryoff, BlockNumber blk)
 {
 	Buffer		buf;
 	BlockNumber next;
-	RBIVacWork	w;
+	LionVacWork	w;
 	uint32	   *grown = NULL;
 	int			ngrown = 0;
 	int			i;
@@ -598,7 +598,7 @@ rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
 		 */
 		LockBufferForCleanup(buf);
 
-		next = rbi_vacuum_filter_page(vs, buf, &w);
+		next = lion_vacuum_filter_page(vs, buf, &w);
 
 		if (w.nwork == 0 && w.ndel == 0)
 		{
@@ -609,7 +609,7 @@ rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
 
 		if (ConditionalLockBuffer(entrybuf))
 		{
-			rbi_vacuum_apply_page(vs, entrybuf, entryoff, buf, &w,
+			lion_vacuum_apply_page(vs, entrybuf, entryoff, buf, &w,
 								  &grown, &ngrown);
 			LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -627,9 +627,9 @@ rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
 		if (ConditionalLockBufferForCleanup(buf))
 		{
 			/* The page was unlocked in between, so filter it again. */
-			next = rbi_vacuum_filter_page(vs, buf, &w);
+			next = lion_vacuum_filter_page(vs, buf, &w);
 			if (w.nwork > 0 || w.ndel > 0)
-				rbi_vacuum_apply_page(vs, entrybuf, entryoff, buf, &w,
+				lion_vacuum_apply_page(vs, entrybuf, entryoff, buf, &w,
 									  &grown, &ngrown);
 			LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -648,7 +648,7 @@ rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
 	 * move the others to the right.
 	 */
 	for (i = 0; i < ngrown; i++)
-		rbi_vacuum_regrow(vs, entrybuf, entryoff, blk, grown[i]);
+		lion_vacuum_regrow(vs, entrybuf, entryoff, blk, grown[i]);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(vs->pagecxt);
@@ -663,28 +663,28 @@ rbi_vacuum_container_page(RBIVacState *vs, Buffer entrybuf,
  * The rightlink is read here, before anything on this page can move: a split
  * only ever inserts brand new pages between this one and the old right
  * sibling, and everything that moves onto them has already been filtered
- * (except the containers that grew, which rbi_vacuum_regrow() follows), so
+ * (except the containers that grew, which lion_vacuum_regrow() follows), so
  * continuing at the old rightlink visits every container that still needs
  * work.
  */
 static BlockNumber
-rbi_vacuum_filter_page(RBIVacState *vs, Buffer buf, RBIVacWork *w)
+lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w)
 {
 	Page		page = BufferGetPage(buf);
 	BlockNumber blk = BufferGetBlockNumber(buf);
 	OffsetNumber maxoff;
 	OffsetNumber off;
-	RBIVacPred	pred;
+	LionVacPred	pred;
 
-	if (!RBIPageIsContainer(page))
-		elog(ERROR, "roaring index: block %u is not a container page", blk);
+	if (!LionPageIsContainer(page))
+		elog(ERROR, "lion index: block %u is not a container page", blk);
 
 	maxoff = PageGetMaxOffsetNumber(page);
 
 	w->nwork = 0;
 	w->ndel = 0;
 	w->delremoved = 0;
-	w->work = (RBIVacItem *) palloc(sizeof(RBIVacItem) * (maxoff + 1));
+	w->work = (LionVacItem *) palloc(sizeof(LionVacItem) * (maxoff + 1));
 	w->delofs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * (maxoff + 1));
 
 	pred.callback = vs->callback;
@@ -693,7 +693,7 @@ rbi_vacuum_filter_page(RBIVacState *vs, Buffer buf, RBIVacWork *w)
 	for (off = FirstOffsetNumber; off <= maxoff; off++)
 	{
 		ItemId		iid = PageGetItemId(page, off);
-		RBIVacItem *item;
+		LionVacItem *item;
 		Size		isize;
 		uint32		nremoved;
 
@@ -701,12 +701,12 @@ rbi_vacuum_filter_page(RBIVacState *vs, Buffer buf, RBIVacWork *w)
 			continue;
 
 		isize = ItemIdGetLength(iid);
-		if (isize > RBI_CONTAINER_MAX_SIZE)
-			elog(ERROR, "roaring index: item of %zu bytes at %u/%u",
+		if (isize > LION_CONTAINER_MAX_SIZE)
+			elog(ERROR, "lion index: item of %zu bytes at %u/%u",
 				 isize, blk, off);
 		memcpy(vs->cbuf, PageGetItem(page, iid), isize);
 
-		nremoved = rbi_vac_filter_item(vs->cbuf, &pred);
+		nremoved = lion_vac_filter_item(vs->cbuf, &pred);
 		if (nremoved == 0)
 			continue;
 
@@ -718,33 +718,33 @@ rbi_vacuum_filter_page(RBIVacState *vs, Buffer buf, RBIVacWork *w)
 			continue;
 		}
 
-		rbi_vac_optimize_item(vs->cbuf);
+		lion_vac_optimize_item(vs->cbuf);
 		item = &w->work[w->nwork++];
 		item->off = off;
-		item->size = rbi_item_size(vs->cbuf);
+		item->size = lion_item_size(vs->cbuf);
 		item->removed = nremoved;
-		item->c = (RBIContainer *) palloc(item->size);
+		item->c = (LionContainer *) palloc(item->size);
 		memcpy(item->c, vs->cbuf, item->size);
 	}
 
-	return RBIPageGetOpaque(page)->rightlink;
+	return LionPageGetOpaque(page)->rightlink;
 }
 
 /*
- * Apply the result of rbi_vacuum_filter_page() to the page: everything that
+ * Apply the result of lion_vacuum_filter_page() to the page: everything that
  * fits in place goes into one WAL record that also carries the entry tuple
  * with its new counters.  The caller holds a cleanup lock on buf and the
  * entry page EXCLUSIVE, and has not released either since the filtering.
  *
  * *grownp receives the ckeys of the containers that no longer fit their slot;
- * they are dealt with by rbi_vacuum_regrow() once both locks are gone.
+ * they are dealt with by lion_vacuum_regrow() once both locks are gone.
  */
 static void
-rbi_vacuum_apply_page(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
-					  Buffer buf, RBIVacWork *w, uint32 **grownp, int *ngrownp)
+lion_vacuum_apply_page(LionVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
+					  Buffer buf, LionVacWork *w, uint32 **grownp, int *ngrownp)
 {
 	Relation	index = vs->index;
-	RBIEntryTuple *ecopy;
+	LionEntryTuple *ecopy;
 	Size		esize;
 	GenericXLogState *xstate;
 	Page		p;
@@ -756,7 +756,7 @@ rbi_vacuum_apply_page(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 	Assert(w->nwork > 0 || w->ndel > 0);
 
 	/* The entry may have been changed by inserts since the last window. */
-	ecopy = rbi_vacuum_entry_copy(entrybuf, entryoff, &esize);
+	ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
 	grown = (uint32 *) palloc(sizeof(uint32) * (w->nwork + 1));
 
 	xstate = GenericXLogStart(index);
@@ -792,26 +792,26 @@ rbi_vacuum_apply_page(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 		if (PageIndexTupleOverwrite(p, w->work[i].off, w->work[i].c,
 									w->work[i].size))
 			removed += w->work[i].removed;
-		else if (w->work[i].c->type == RBI_CT_SPARSE)
+		else if (w->work[i].c->type == LION_CT_SPARSE)
 		{
 			/* A segment only ever shrinks, so its slot always holds it. */
 			GenericXLogAbort(xstate);
-			elog(ERROR, "roaring index: filtered sparse segment %u on block %u no longer fits",
+			elog(ERROR, "lion index: filtered sparse segment %u on block %u no longer fits",
 				 w->work[i].c->ckey, BufferGetBlockNumber(buf));
 		}
 		else
 			grown[ngrown++] = w->work[i].c->ckey;
 	}
 
-	rbi_page_update_minmax(p);
+	lion_page_update_minmax(p);
 
 	Assert(ecopy->ntids >= removed);
 	ecopy->ntids -= removed;
 	Assert(ecopy->ncontainers >= (uint32) w->ndel);
 	ecopy->ncontainers -= (uint32) w->ndel;
 
-	if (!rbi_replace_entry(index, xstate, entrybuf, entryoff, ecopy, esize))
-		elog(ERROR, "roaring index: could not update entry %u on block %u",
+	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, ecopy, esize))
+		elog(ERROR, "lion index: could not update entry %u on block %u",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
 	GenericXLogFinish(xstate);
@@ -838,7 +838,7 @@ rbi_vacuum_apply_page(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
  * may have added a TID to it since it was last read.
  */
 static void
-rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
+lion_vacuum_regrow(LionVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 				  BlockNumber startblk, uint32 ckey)
 {
 	Relation	index = vs->index;
@@ -846,7 +846,7 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 
 	for (;;)
 	{
-		RBIEntryTuple *ecopy;
+		LionEntryTuple *ecopy;
 		Size		esize;
 		Buffer		buf;
 		Page		page;
@@ -855,21 +855,21 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 		BlockNumber next;
 		bool		found;
 		uint32		nremoved;
-		RBIVacPred	pred;
+		LionVacPred	pred;
 
 		buf = ReadBuffer(index, blk);
 
 		/* Rule 1: a cleanup lock on every page on the way, in chain order. */
 		LockBufferForCleanup(buf);
 		page = BufferGetPage(buf);
-		if (!RBIPageIsContainer(page))
+		if (!LionPageIsContainer(page))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "roaring index: block %u is not a container page", blk);
+			elog(ERROR, "lion index: block %u is not a container page", blk);
 		}
 
-		off = rbi_page_find_container(page, ckey, &found);
-		next = RBIPageGetOpaque(page)->rightlink;
+		off = lion_page_find_container(page, ckey, &found);
+		next = LionPageGetOpaque(page)->rightlink;
 
 		if (!found)
 		{
@@ -879,7 +879,7 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 			 */
 			UnlockReleaseBuffer(buf);
 			if (!BlockNumberIsValid(next))
-				elog(ERROR, "roaring index: container %u of entry %u on block %u vanished from its chain",
+				elog(ERROR, "lion index: container %u of entry %u on block %u vanished from its chain",
 					 ckey, entryoff, BufferGetBlockNumber(entrybuf));
 			blk = next;
 			CHECK_FOR_INTERRUPTS();
@@ -901,14 +901,14 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 			}
 
 			/* The page was unlocked in between: locate the container again. */
-			off = rbi_page_find_container(page, ckey, &found);
+			off = lion_page_find_container(page, ckey, &found);
 			if (!found)
 			{
-				next = RBIPageGetOpaque(page)->rightlink;
+				next = LionPageGetOpaque(page)->rightlink;
 				LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
 				UnlockReleaseBuffer(buf);
 				if (!BlockNumberIsValid(next))
-					elog(ERROR, "roaring index: container %u of entry %u on block %u vanished from its chain",
+					elog(ERROR, "lion index: container %u of entry %u on block %u vanished from its chain",
 						 ckey, entryoff, BufferGetBlockNumber(entrybuf));
 				blk = next;
 				CHECK_FOR_INTERRUPTS();
@@ -917,11 +917,11 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 		}
 
 		/* Everything read from here on is used inside this window only. */
-		ecopy = rbi_vacuum_entry_copy(entrybuf, entryoff, &esize);
+		ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
 
 		iid = PageGetItemId(page, off);
-		if (ItemIdGetLength(iid) > RBI_CONTAINER_MAX_SIZE)
-			elog(ERROR, "roaring index: container of %zu bytes at %u/%u",
+		if (ItemIdGetLength(iid) > LION_CONTAINER_MAX_SIZE)
+			elog(ERROR, "lion index: container of %zu bytes at %u/%u",
 				 (Size) ItemIdGetLength(iid), blk, off);
 		memcpy(vs->cbuf, PageGetItem(page, iid), ItemIdGetLength(iid));
 
@@ -930,18 +930,18 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 		 * ckey is never the first ckey of a segment (one ckey lives in one
 		 * item), so the item found here must be the container itself.
 		 */
-		if (vs->cbuf->type == RBI_CT_SPARSE)
+		if (vs->cbuf->type == LION_CT_SPARSE)
 		{
 			LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "roaring index: container key %u of entry %u is now a sparse segment",
+			elog(ERROR, "lion index: container key %u of entry %u is now a sparse segment",
 				 ckey, entryoff);
 		}
 
 		pred.ckey = ckey;
 		pred.callback = vs->callback;
 		pred.callback_state = vs->callback_state;
-		nremoved = rbi_container_remove_if(vs->cbuf, rbi_vac_is_dead, &pred);
+		nremoved = lion_container_remove_if(vs->cbuf, lion_vac_is_dead, &pred);
 
 		if (nremoved > 0)
 		{
@@ -955,14 +955,14 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 				OffsetNumber delof = off;
 
 				PageIndexMultiDelete(p, &delof, 1);
-				rbi_page_update_minmax(p);
+				lion_page_update_minmax(p);
 
 				Assert(ecopy->ncontainers >= 1);
 				ecopy->ncontainers -= 1;
 
-				if (!rbi_replace_entry(index, xstate, entrybuf, entryoff,
+				if (!lion_replace_entry(index, xstate, entrybuf, entryoff,
 									   ecopy, esize))
-					elog(ERROR, "roaring index: could not update entry %u on block %u",
+					elog(ERROR, "lion index: could not update entry %u on block %u",
 						 entryoff, BufferGetBlockNumber(entrybuf));
 
 				GenericXLogFinish(xstate);
@@ -971,16 +971,16 @@ rbi_vacuum_regrow(RBIVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 			{
 				int			delta;
 
-				rbi_container_optimize(vs->cbuf);
+				lion_container_optimize(vs->cbuf);
 
 				/*
 				 * This writes the container and the entry in one record, and
 				 * splits the page if the container still does not fit.
 				 */
-				rbi_chain_put_container_locked(index, buf, entrybuf, entryoff,
+				lion_chain_put_container_locked(index, buf, entrybuf, entryoff,
 											   ecopy, vs->cbuf, &delta);
 				if (delta != 0)
-					elog(ERROR, "roaring index: container %u of entry %u on block %u vanished from its chain",
+					elog(ERROR, "lion index: container %u of entry %u on block %u vanished from its chain",
 						 ckey, entryoff, BufferGetBlockNumber(entrybuf));
 			}
 

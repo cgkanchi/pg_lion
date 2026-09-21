@@ -1,9 +1,9 @@
 # The visibility-map interlock of DESIGN.md section 9, and the cancellability
 # of the wait it imposes on VACUUM (DESIGN.md section 11), shown to be real.
 #
-# rbi_count.c copies containers out of an index page, keeps the PIN on that
+# lion_count.c copies containers out of an index page, keeps the PIN on that
 # page, and only then asks the visibility map about the heap blocks those
-# containers cover.  The injection point "roaring-count-containers-pinned"
+# containers cover.  The injection point "lion-count-containers-pinned"
 # fires exactly in that window.  ambulkdelete takes LockBufferForCleanup() on
 # the index pages it rewrites (DESIGN.md section 11), and a cleanup lock waits
 # for every pin to go away, so a VACUUM that runs while a counting backend is
@@ -59,11 +59,11 @@
 setup
 {
 	SET synchronous_commit = on;
-	CREATE EXTENSION IF NOT EXISTS roaring_index;
+	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	CREATE TABLE cnt_race (id int, k int NOT NULL);
 	INSERT INTO cnt_race SELECT i, i % 4 FROM generate_series(1, 4000) i;
-	CREATE INDEX cnt_race_k ON cnt_race USING roaring (k);
+	CREATE INDEX cnt_race_k ON cnt_race USING lion (k);
 
 	CREATE FUNCTION cnt_race_wait_for_vacuum() RETURNS boolean
 	LANGUAGE plpgsql AS $fn$
@@ -98,22 +98,22 @@ teardown
 }
 
 # The counting session.  The pushdown is off so that its plain count(*) does
-# not run into the injection point; only roaring_index_count() does.
+# not run into the injection point; only lion_index_count() does.
 session s1
 setup
 {
-	SET roaring_index.enable_count_pushdown = off;
+	SET pg_lion.enable_count_pushdown = off;
 	SELECT injection_points_set_local();
-	SELECT injection_points_attach('roaring-count-containers-pinned', 'wait');
+	SELECT injection_points_attach('lion-count-containers-pinned', 'wait');
 }
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step s1_plain	{ SELECT count(*) FROM cnt_race WHERE k = 1; }
-step s1_count	{ SELECT roaring_index_count('cnt_race_k', 1); }
+step s1_count	{ SELECT lion_index_count('cnt_race_k', 1); }
 step s1_commit	{ COMMIT; }
 
 # The writer, which also releases s1 from the injection point.
 session s2
-setup			{ SET roaring_index.enable_count_pushdown = off; }
+setup			{ SET pg_lion.enable_count_pushdown = off; }
 # Rows that are dead to everybody, so the VACUUM below really has index
 # entries to remove and really has to take cleanup locks.
 step s2_predel	{ DELETE FROM cnt_race WHERE id > 3800; }
@@ -121,23 +121,23 @@ step s2_delete	{ DELETE FROM cnt_race WHERE k = 1 AND id <= 2000; }
 # Assert the wait, then release s1.
 step s2_wakeup	{
 	SELECT cnt_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
-	SELECT injection_points_wakeup('roaring-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
 }
 # The same assertion on its own, for the run where the VACUUM is cancelled
 # before anything releases s1.
 step s2_watch	{ SELECT cnt_race_wait_for_vacuum() AS vacuum_waited_for_the_pin; }
-step s2_release	{ SELECT injection_points_wakeup('roaring-count-containers-pinned'); }
-step s2_detach	{ SELECT injection_points_detach('roaring-count-containers-pinned'); }
+step s2_release	{ SELECT injection_points_wakeup('lion-count-containers-pinned'); }
+step s2_detach	{ SELECT injection_points_detach('lion-count-containers-pinned'); }
 
 # The vacuuming session.
 session s3
-setup			{ SET roaring_index.enable_count_pushdown = off; }
+setup			{ SET pg_lion.enable_count_pushdown = off; }
 step s3_prep	{ VACUUM cnt_race; }
 step s3_limit	{ SET statement_timeout = '1s'; }
 step s3_vacuum	{ VACUUM cnt_race; }
 step s3_reset	{ RESET statement_timeout; }
 step s3_count	{ SELECT count(*) FROM cnt_race WHERE k = 1; }
-step s3_verify	{ SELECT roaring_index_verify('cnt_race_k', true); }
+step s3_verify	{ SELECT lion_index_verify('cnt_race_k', true); }
 
 # VACUUM waits for the pin and finishes once the reader has let go of it.
 permutation

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_insert.c
- *		aminsert for the roaring index (DESIGN.md section 5, INSERT).
+ * lion_insert.c
+ *		aminsert for the lion index (DESIGN.md section 5, INSERT).
  *
  * One TID is added to the posting set of one key.  The bucket head page is
  * held EXCLUSIVE for the whole operation, so all writers of a key (inserts
@@ -24,7 +24,7 @@
  * inserts into one key cheap: when the item on the page can take the member
  * without changing the number of bytes the page has allotted it, the member
  * is added directly in the GenericXLog page image
- * (rbi_insert_container_inplace(), rbi_insert_segment_inplace()) under the
+ * (lion_insert_container_inplace(), lion_insert_segment_inplace()) under the
  * same locks and in the same single record as the entry tuple.  Nothing else
  * on the page moves, so the WAL delta is a few bytes.  A BITSET container
  * always qualifies (4104 bytes whatever its cardinality); an ARRAY or RUN
@@ -37,9 +37,9 @@
  *
  *	- a container with that ckey: as before.
  *	- a sparse segment whose range covers the ckey: the pair goes in, and if
- *	  that brings the ckey to RBI_SPARSE_THRESHOLD members it is promoted to
+ *	  that brings the ckey to LION_SPARSE_THRESHOLD members it is promoted to
  *	  a container of its own and the segment is split around it.  A segment
- *	  that is already at RBI_SPARSE_MAX_PAIRS splits in half first.
+ *	  that is already at LION_SPARSE_MAX_PAIRS splits in half first.
  *	- nothing owns the ckey: the pair joins the segment immediately before it
  *	  (preferred, because a segment grows to the right cheaply), else the one
  *	  immediately after it, else it becomes a new one-pair segment.  Nothing
@@ -48,14 +48,14 @@
  *
  * A NULL key is no different once its entry has been located: it lives in the
  * reserved NULL entry of bucket 0, which has no key bytes and is recognised
- * by RBI_ENTRY_NULLKEY (DESIGN.md §14), and its payload is an ordinary
+ * by LION_ENTRY_NULLKEY (DESIGN.md §14), and its payload is an ordinary
  * INLINE payload that spills to a chain like any other.  So is the reserved
  * EMPTY entry a multi-key opclass uses for rows it extracts no key from
  * (DESIGN.md §17); a row with several keys is simply several of these
  * inserts, one per key.
  *
  * Splitting a segment produces up to three items where there was one, and
- * they are placed in a single WAL record (rbi_chain_put_items_locked): a
+ * they are placed in a single WAL record (lion_chain_put_items_locked): a
  * crash must never leave the same ckey in two items.
  *
  * Every page modification goes through GenericXLog, and the entry tuple is
@@ -73,26 +73,26 @@
 #include "utils/rel.h"
 #include "varatt.h"
 
-#include "rbi.h"
+#include "lion.h"
 
-static void rbi_insert_new_entry(Relation index, RBIState *state, Buffer headbuf,
+static void lion_insert_new_entry(Relation index, LionState *state, Buffer headbuf,
 								 Datum key, uint16 reservedflag, uint32 hash,
 								 uint32 ckey, uint16 lo);
-static void rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
+static void lion_insert_inline(Relation index, LionState *state, Buffer entrybuf,
 							  OffsetNumber entryoff, uint32 ckey, uint16 lo);
-static void rbi_insert_chain(Relation index, Buffer entrybuf,
+static void lion_insert_chain(Relation index, Buffer entrybuf,
 							 OffsetNumber entryoff, uint32 ckey, uint16 lo);
-static bool rbi_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
+static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 										 Buffer entrybuf, OffsetNumber entryoff,
-										 RBIEntryTuple *entry, Size entrysize,
+										 LionEntryTuple *entry, Size entrysize,
 										 uint16 lo, bool *done);
-static bool rbi_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
+static bool lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 									   Buffer entrybuf, OffsetNumber entryoff,
-									   RBIEntryTuple *entry, Size entrysize,
+									   LionEntryTuple *entry, Size entrysize,
 									   uint32 ckey, uint16 lo, bool *done);
-static void rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off,
+static void lion_insert_segment(Relation index, Buffer buf, OffsetNumber off,
 							   bool replace, Buffer entrybuf,
-							   OffsetNumber entryoff, RBIEntryTuple *entry,
+							   OffsetNumber entryoff, LionEntryTuple *entry,
 							   uint32 ckey, uint16 lo);
 
 /*
@@ -102,15 +102,15 @@ static void rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off,
  * that replace it are built.  items[] points into these buffers and is what
  * goes on the page, in ascending ckey order.
  */
-typedef struct RBISegWork
+typedef struct LionSegWork
 {
-	RBIContainer *seg;			/* the segment, mutated in place */
-	RBIContainer *cont;			/* container promoted out of it */
-	RBIContainer *left;
-	RBIContainer *right;
-	RBIContainer *items[RBI_MAX_PUT_ITEMS];
+	LionContainer *seg;			/* the segment, mutated in place */
+	LionContainer *cont;			/* container promoted out of it */
+	LionContainer *left;
+	LionContainer *right;
+	LionContainer *items[LION_MAX_PUT_ITEMS];
 	int			nitems;
-} RBISegWork;
+} LionSegWork;
 
 /*
  * The buffers are allocated on demand: most inserts never touch a segment at
@@ -118,7 +118,7 @@ typedef struct RBISegWork
  * per insert would be four separate allocations on the hot path for nothing.
  */
 static void
-rbi_segwork_init(RBISegWork *w)
+lion_segwork_init(LionSegWork *w)
 {
 	w->seg = NULL;
 	w->cont = NULL;
@@ -127,20 +127,20 @@ rbi_segwork_init(RBISegWork *w)
 	w->nitems = 0;
 }
 
-static RBIContainer *
-rbi_segwork_buf(RBIContainer **p)
+static LionContainer *
+lion_segwork_buf(LionContainer **p)
 {
 	if (*p == NULL)
-		*p = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+		*p = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	return *p;
 }
 
 /* Does this item accept one more pair? */
 static bool
-rbi_segment_has_room(const RBIContainer *item)
+lion_segment_has_room(const LionContainer *item)
 {
-	return item->type == RBI_CT_SPARSE &&
-		item->cardinality < RBI_SPARSE_MAX_PAIRS;
+	return item->type == LION_CT_SPARSE &&
+		item->cardinality < LION_SPARSE_MAX_PAIRS;
 }
 
 /*
@@ -151,37 +151,37 @@ rbi_segment_has_room(const RBIContainer *item)
  * The threshold test comes first, on purpose: promoting the ckey to a
  * container *shrinks* the segment, so a segment that is at its maximum needs
  * splitting only when the pair really stays in it, and one insert can never
- * need more than RBI_MAX_PUT_ITEMS items.
+ * need more than LION_MAX_PUT_ITEMS items.
  */
 static bool
-rbi_segment_add(RBISegWork *w, uint32 ckey, uint16 lo)
+lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 {
 	uint32		cnt;
 
-	Assert(w->seg->type == RBI_CT_SPARSE);
+	Assert(w->seg->type == LION_CT_SPARSE);
 	w->nitems = 0;
 
-	if (rbi_sparse_contains(w->seg, ckey, lo))
+	if (lion_sparse_contains(w->seg, ckey, lo))
 		return false;			/* already indexed */
 
-	cnt = rbi_sparse_count(w->seg, ckey);
+	cnt = lion_sparse_count(w->seg, ckey);
 
-	if (cnt + 1 >= RBI_SPARSE_THRESHOLD)
+	if (cnt + 1 >= LION_SPARSE_THRESHOLD)
 	{
 		/* Dense enough: the ckey becomes a container of its own. */
-		(void) rbi_segwork_buf(&w->cont);
-		(void) rbi_segwork_buf(&w->left);
-		(void) rbi_segwork_buf(&w->right);
+		(void) lion_segwork_buf(&w->cont);
+		(void) lion_segwork_buf(&w->left);
+		(void) lion_segwork_buf(&w->right);
 
-		if (rbi_sparse_extract(w->seg, ckey, w->cont) != cnt)
-			elog(ERROR, "roaring index: sparse segment lost container key %u",
+		if (lion_sparse_extract(w->seg, ckey, w->cont) != cnt)
+			elog(ERROR, "lion index: sparse segment lost container key %u",
 				 ckey);
-		if (!rbi_container_add(w->cont, lo))
-			elog(ERROR, "roaring index: duplicate member in sparse segment for container key %u",
+		if (!lion_container_add(w->cont, lo))
+			elog(ERROR, "lion index: duplicate member in sparse segment for container key %u",
 				 ckey);
-		rbi_container_optimize(w->cont);
+		lion_container_optimize(w->cont);
 
-		rbi_sparse_split_at(w->seg, ckey, w->left, w->right);
+		lion_sparse_split_at(w->seg, ckey, w->left, w->right);
 
 		if (w->left->cardinality > 0)
 			w->items[w->nitems++] = w->left;
@@ -189,19 +189,19 @@ rbi_segment_add(RBISegWork *w, uint32 ckey, uint16 lo)
 		if (w->right->cardinality > 0)
 			w->items[w->nitems++] = w->right;
 	}
-	else if (rbi_sparse_insert(w->seg, ckey, lo, NULL))
+	else if (lion_sparse_insert(w->seg, ckey, lo, NULL))
 	{
 		w->items[w->nitems++] = w->seg;
 	}
-	else if (rbi_sparse_split_half(w->seg, rbi_segwork_buf(&w->left),
-								   rbi_segwork_buf(&w->right)))
+	else if (lion_sparse_split_half(w->seg, lion_segwork_buf(&w->left),
+								   lion_segwork_buf(&w->right)))
 	{
 		/* Full: split at a container key boundary, then insert in one half. */
-		RBIContainer *half = (ckey <= rbi_item_last_ckey(w->left)) ?
+		LionContainer *half = (ckey <= lion_item_last_ckey(w->left)) ?
 			w->left : w->right;
 
-		if (!rbi_sparse_insert(half, ckey, lo, NULL))
-			elog(ERROR, "roaring index: half of a split sparse segment is full");
+		if (!lion_sparse_insert(half, ckey, lo, NULL))
+			elog(ERROR, "lion index: half of a split sparse segment is full");
 
 		w->items[w->nitems++] = w->left;
 		w->items[w->nitems++] = w->right;
@@ -216,14 +216,14 @@ rbi_segment_add(RBISegWork *w, uint32 ckey, uint16 lo)
 		 */
 		uint32		only = w->seg->ckey;
 
-		(void) rbi_segwork_buf(&w->cont);
-		(void) rbi_sparse_extract(w->seg, only, w->cont);
-		rbi_container_optimize(w->cont);
+		(void) lion_segwork_buf(&w->cont);
+		(void) lion_sparse_extract(w->seg, only, w->cont);
+		lion_container_optimize(w->cont);
 		Assert(w->seg->cardinality == 0);
 
-		rbi_sparse_init(w->left, ckey);
-		if (!rbi_sparse_insert(w->left, ckey, lo, NULL))
-			elog(ERROR, "roaring index: empty sparse segment rejected a pair");
+		lion_sparse_init(w->left, ckey);
+		if (!lion_sparse_insert(w->left, ckey, lo, NULL))
+			elog(ERROR, "lion index: empty sparse segment rejected a pair");
 
 		if (ckey < only)
 		{
@@ -237,7 +237,7 @@ rbi_segment_add(RBISegWork *w, uint32 ckey, uint16 lo)
 		}
 	}
 
-	Assert(w->nitems >= 1 && w->nitems <= RBI_MAX_PUT_ITEMS);
+	Assert(w->nitems >= 1 && w->nitems <= LION_MAX_PUT_ITEMS);
 	return true;
 }
 
@@ -251,37 +251,37 @@ rbi_segment_add(RBISegWork *w, uint32 ckey, uint16 lo)
  * written in the same WAL record as the items.
  */
 static void
-rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
+lion_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
 				   Buffer entrybuf, OffsetNumber entryoff,
-				   RBIEntryTuple *entry, uint32 ckey, uint16 lo)
+				   LionEntryTuple *entry, uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(buf);
-	RBISegWork	w;
+	LionSegWork	w;
 
-	rbi_segwork_init(&w);
+	lion_segwork_init(&w);
 
 	if (replace)
 	{
 		ItemId		iid = PageGetItemId(page, off);
 		Size		isize = ItemIdGetLength(iid);
 
-		if (isize > RBI_CONTAINER_MAX_SIZE)
-			elog(ERROR, "roaring index: item of %zu bytes at %u/%u", isize,
+		if (isize > LION_CONTAINER_MAX_SIZE)
+			elog(ERROR, "lion index: item of %zu bytes at %u/%u", isize,
 				 BufferGetBlockNumber(buf), off);
-		memcpy(rbi_segwork_buf(&w.seg), PageGetItem(page, iid), isize);
+		memcpy(lion_segwork_buf(&w.seg), PageGetItem(page, iid), isize);
 
-		if (w.seg->type != RBI_CT_SPARSE)
-			elog(ERROR, "roaring index: item %u on block %u is not a sparse segment",
+		if (w.seg->type != LION_CT_SPARSE)
+			elog(ERROR, "lion index: item %u on block %u is not a sparse segment",
 				 off, BufferGetBlockNumber(buf));
 
-		if (!rbi_segment_add(&w, ckey, lo))
+		if (!lion_segment_add(&w, ckey, lo))
 			return;				/* already indexed: nothing changes */
 	}
 	else
 	{
-		rbi_sparse_init(rbi_segwork_buf(&w.seg), ckey);
-		if (!rbi_sparse_insert(w.seg, ckey, lo, NULL))
-			elog(ERROR, "roaring index: empty sparse segment rejected a pair");
+		lion_sparse_init(lion_segwork_buf(&w.seg), ckey);
+		if (!lion_sparse_insert(w.seg, ckey, lo, NULL))
+			elog(ERROR, "lion index: empty sparse segment rejected a pair");
 		w.items[0] = w.seg;
 		w.nitems = 1;
 	}
@@ -289,7 +289,7 @@ rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	entry->ntids += 1;
 	entry->ncontainers += (uint32) (w.nitems - (replace ? 1 : 0));
 
-	rbi_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
+	lion_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
 								   replace, w.items, w.nitems, true);
 }
 
@@ -298,20 +298,20 @@ rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
  * aligned.  Returns the number of bytes written.
  */
 static Size
-rbi_put_singleton(char *dst, uint32 ckey, uint16 lo)
+lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
 {
 	union
 	{
-		RBIContainer c;
+		LionContainer c;
 		uint64		force_align;
-		char		data[RBI_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
+		char		data[LION_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
 	}			buf;
 	Size		csize;
 
-	rbi_sparse_init(&buf.c, ckey);
-	if (!rbi_sparse_insert(&buf.c, ckey, lo, NULL))
-		elog(ERROR, "roaring index: empty sparse segment rejected a pair");
-	csize = rbi_sparse_size(&buf.c);
+	lion_sparse_init(&buf.c, ckey);
+	if (!lion_sparse_insert(&buf.c, ckey, lo, NULL))
+		elog(ERROR, "lion index: empty sparse segment rejected a pair");
+	csize = lion_sparse_size(&buf.c);
 
 	Assert(csize <= sizeof(buf.data));
 	memcpy(dst, &buf.c, csize);
@@ -321,7 +321,7 @@ rbi_put_singleton(char *dst, uint32 ckey, uint16 lo)
 
 /*
  * Rebuild an INLINE payload with (ckey, lo) added, writing it to out, which
- * must have room for paylen + RBI_CONTAINER_MAX_SIZE bytes (a container grows
+ * must have room for paylen + LION_CONTAINER_MAX_SIZE bytes (a container grows
  * by at most that much; splitting a segment into three items grows the
  * payload by at most 26 bytes, and a new segment adds 14).
  *
@@ -330,11 +330,11 @@ rbi_put_singleton(char *dst, uint32 ckey, uint16 lo)
  * number of items, which is -0 .. +2.
  */
 static Size
-rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
+lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 			   char *out, int *ndelta)
 {
-	RBIContainer *cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
-	RBISegWork	w;
+	LionContainer *cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	LionSegWork	w;
 	Size		off;
 	Size		used = 0;
 	Size		csize;
@@ -345,7 +345,7 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	bool		prev_ok = false;
 
 	*ndelta = 0;
-	rbi_segwork_init(&w);
+	lion_segwork_init(&w);
 
 	/*
 	 * Pass 1: decide which item takes the pair.  The items are ordered by
@@ -353,25 +353,25 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	 * the item that covers the ckey or on the first item beyond it.
 	 */
 	off = 0;
-	while (rbi_inline_fetch(payload, paylen, &off, cbuf) > 0)
+	while (lion_inline_fetch(payload, paylen, &off, cbuf) > 0)
 	{
-		if (rbi_item_covers(cbuf, ckey))
+		if (lion_item_covers(cbuf, ckey))
 		{
 			target = n;
 			break;
 		}
-		if (rbi_item_first_ckey(cbuf) > ckey)
+		if (lion_item_first_ckey(cbuf) > ckey)
 		{
 			/* In the gap: the segment before it, else the one after it. */
 			if (prev_ok)
 				target = previdx;
-			else if (rbi_segment_has_room(cbuf))
+			else if (lion_segment_has_room(cbuf))
 				target = n;
 			else
 				insertpos = n;
 			break;
 		}
-		prev_ok = rbi_segment_has_room(cbuf);
+		prev_ok = lion_segment_has_room(cbuf);
 		previdx = n;
 		n++;
 	}
@@ -388,23 +388,23 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	/* Pass 2: copy the payload, replacing or inserting where pass 1 said. */
 	off = 0;
 	n = 0;
-	while ((csize = rbi_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
 	{
 		if (n == insertpos)
 		{
-			used += rbi_put_singleton(out + used, ckey, lo);
+			used += lion_put_singleton(out + used, ckey, lo);
 			*ndelta = 1;
 			insertpos = -1;
 		}
 
 		if (n == target)
 		{
-			if (cbuf->type == RBI_CT_SPARSE)
+			if (cbuf->type == LION_CT_SPARSE)
 			{
 				int			i;
 
-				memcpy(rbi_segwork_buf(&w.seg), cbuf, csize);
-				if (!rbi_segment_add(&w, ckey, lo))
+				memcpy(lion_segwork_buf(&w.seg), cbuf, csize);
+				if (!lion_segment_add(&w, ckey, lo))
 				{
 					pfree(cbuf);
 					return 0;	/* already indexed */
@@ -412,7 +412,7 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 
 				for (i = 0; i < w.nitems; i++)
 				{
-					Size		isz = rbi_item_size(w.items[i]);
+					Size		isz = lion_item_size(w.items[i]);
 
 					memcpy(out + used, w.items[i], isz);
 					used += isz;
@@ -424,12 +424,12 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 
 			/* A container with this very ckey. */
 			Assert(cbuf->ckey == ckey);
-			if (!rbi_container_add(cbuf, lo))
+			if (!lion_container_add(cbuf, lo))
 			{
 				pfree(cbuf);
 				return 0;		/* already indexed */
 			}
-			csize = rbi_container_size(cbuf);
+			csize = lion_container_size(cbuf);
 		}
 
 		memcpy(out + used, cbuf, csize);
@@ -440,7 +440,7 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	if (insertpos >= 0)
 	{
 		/* The payload was empty, or the new segment goes at the end. */
-		used += rbi_put_singleton(out + used, ckey, lo);
+		used += lion_put_singleton(out + used, ckey, lo);
 		*ndelta = 1;
 	}
 
@@ -454,22 +454,22 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
  * is the reserved NULL-key entry of bucket 0 (DESIGN.md §14).
  */
 static void
-rbi_insert_new_entry(Relation index, RBIState *state, Buffer headbuf,
+lion_insert_new_entry(Relation index, LionState *state, Buffer headbuf,
 					 Datum key, uint16 reservedflag, uint32 hash, uint32 ckey,
 					 uint16 lo)
 {
-	char		payload[RBI_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
-	RBIEntryTuple *entry;
+	char		payload[LION_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
+	LionEntryTuple *entry;
 	Size		paylen;
 	Size		size;
-	int			max_entries = rbi_max_entries(index);
+	int			max_entries = lion_max_entries(index);
 
-	paylen = rbi_put_singleton(payload, ckey, lo);
+	paylen = lion_put_singleton(payload, ckey, lo);
 
 	entry = (reservedflag != 0) ?
-		rbi_make_reserved_entry(reservedflag, RBI_ENTRY_INLINE, payload,
+		lion_make_reserved_entry(reservedflag, LION_ENTRY_INLINE, payload,
 								paylen, &size) :
-		rbi_make_entry(state, key, hash, RBI_ENTRY_INLINE,
+		lion_make_entry(state, key, hash, LION_ENTRY_INLINE,
 					   payload, paylen, &size);
 	entry->ncontainers = 1;
 	entry->ntids = 1;
@@ -488,14 +488,14 @@ rbi_insert_new_entry(Relation index, RBIState *state, Buffer headbuf,
 	 */
 	if (max_entries > 0)
 	{
-		int64		nbucket = rbi_bucket_nentries(index, headbuf) + 1;
+		int64		nbucket = lion_bucket_nentries(index, headbuf) + 1;
 		int64		estimate = nbucket * (int64) state->meta.nbuckets;
 
 		if (estimate > (int64) max_entries)
-			rbi_warn_max_entries(index, estimate);
+			lion_warn_max_entries(index, estimate);
 	}
 
-	rbi_add_entry(index, headbuf, entry, size);
+	lion_add_entry(index, headbuf, entry, size);
 
 	pfree(entry);
 }
@@ -506,13 +506,13 @@ rbi_insert_new_entry(Relation index, RBIState *state, Buffer headbuf,
  * EXCLUSIVE.
  */
 static void
-rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
+lion_insert_inline(Relation index, LionState *state, Buffer entrybuf,
 				  OffsetNumber entryoff, uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
-	RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
-	Size		paylen = RBI_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
 	uint32		ncontainers = entry->ncontainers;
 	uint64		ntids = entry->ntids;
 	char	   *oldpay;
@@ -525,10 +525,10 @@ rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
 	 * the old items are still being read.
 	 */
 	oldpay = (char *) palloc(paylen);
-	memcpy(oldpay, RBIEntryGetPayload(entry), paylen);
+	memcpy(oldpay, LionEntryGetPayload(entry), paylen);
 
-	newpay = (char *) palloc(paylen + RBI_CONTAINER_MAX_SIZE);
-	newlen = rbi_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
+	newpay = (char *) palloc(paylen + LION_CONTAINER_MAX_SIZE);
+	newlen = lion_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
 
 	if (newlen == 0)
 	{
@@ -540,15 +540,15 @@ rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
 
 	if (newlen <= (Size) state->meta.inline_limit)
 	{
-		RBIEntryTuple *newentry;
+		LionEntryTuple *newentry;
 		Size		newsize;
 		bool		ok;
 
-		newentry = rbi_entry_rebuild(entry, newpay, newlen, &newsize);
+		newentry = lion_entry_rebuild(entry, newpay, newlen, &newsize);
 		newentry->ncontainers = (uint32) ((int) ncontainers + ndelta);
 		newentry->ntids = ntids + 1;
 
-		ok = rbi_replace_entry(index, NULL, entrybuf, entryoff, newentry,
+		ok = lion_replace_entry(index, NULL, entrybuf, entryoff, newentry,
 							   newsize);
 		pfree(newentry);
 
@@ -566,21 +566,21 @@ rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
 	 * through the chain path.
 	 */
 	{
-		RBIEntryTuple *chain;
+		LionEntryTuple *chain;
 		Size		chainsize;
 
-		chain = rbi_entry_rebuild(entry, NULL, 0, &chainsize);
+		chain = lion_entry_rebuild(entry, NULL, 0, &chainsize);
 		chain->ncontainers = ncontainers;
 		chain->ntids = ntids;
 
-		rbi_entry_spill(index, entrybuf, entryoff, chain, oldpay, paylen);
+		lion_entry_spill(index, entrybuf, entryoff, chain, oldpay, paylen);
 		pfree(chain);
 	}
 
 	pfree(newpay);
 	pfree(oldpay);
 
-	rbi_insert_chain(index, entrybuf, entryoff, ckey, lo);
+	lion_insert_chain(index, entrybuf, entryoff, ckey, lo);
 }
 
 /*
@@ -595,13 +595,13 @@ rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
  *
  * Which containers qualify:
  *
- *	BITSET	always: it is RBI_CONTAINER_MAX_SIZE bytes whatever its
+ *	BITSET	always: it is LION_CONTAINER_MAX_SIZE bytes whatever its
  *			cardinality, so adding a member cannot change its size.
  *	ARRAY	when the item has two spare bytes inside it (DESIGN.md §4,
- *			growth slack) and the array is not at RBI_ARRAY_MAX_CARD, where
- *			rbi_container_add() would turn it into a bitset.
+ *			growth slack) and the array is not at LION_ARRAY_MAX_CARD, where
+ *			lion_container_add() would turn it into a bitset.
  *	RUN		when the item has room for one more run and the run count is
- *			below RBI_RUN_MAX_NRUNS, for the same reason.
+ *			below LION_RUN_MAX_NRUNS, for the same reason.
  *
  * Returns false when the container cannot take the member without changing
  * its size on the page; then nothing has been done and the caller takes the
@@ -612,36 +612,36 @@ rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
  * tuple, which is written in the same WAL record as the container.
  */
 static bool
-rbi_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
+lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 							 Buffer entrybuf, OffsetNumber entryoff,
-							 RBIEntryTuple *entry, Size entrysize, uint16 lo,
+							 LionEntryTuple *entry, Size entrysize, uint16 lo,
 							 bool *done)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
-	RBIContainer *onpage = (RBIContainer *) PageGetItem(page, iid);
+	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
 	Size		alloc = ItemIdGetLength(iid);
 	Size		need;
 	GenericXLogState *xstate;
 	Page		p;
-	RBIContainer *c;
+	LionContainer *c;
 
 	switch (onpage->type)
 	{
-		case RBI_CT_BITSET:
-			need = RBI_CONTAINER_MAX_SIZE;
+		case LION_CT_BITSET:
+			need = LION_CONTAINER_MAX_SIZE;
 			break;
 
-		case RBI_CT_ARRAY:
-			if (onpage->cardinality >= RBI_ARRAY_MAX_CARD)
+		case LION_CT_ARRAY:
+			if (onpage->cardinality >= LION_ARRAY_MAX_CARD)
 				return false;	/* would become a bitset */
-			need = rbi_container_size(onpage) + sizeof(uint16);
+			need = lion_container_size(onpage) + sizeof(uint16);
 			break;
 
-		case RBI_CT_RUN:
-			if (RBI_RUN_NRUNS(onpage) >= RBI_RUN_MAX_NRUNS)
+		case LION_CT_RUN:
+			if (LION_RUN_NRUNS(onpage) >= LION_RUN_MAX_NRUNS)
 				return false;	/* would become a bitset */
-			need = rbi_container_size(onpage) + sizeof(RBIRun);
+			need = lion_container_size(onpage) + sizeof(LionRun);
 			break;
 
 		default:
@@ -654,25 +654,25 @@ rbi_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	*done = true;
 
 	/* Already indexed: do not start a record at all. */
-	if (rbi_container_contains(onpage, lo))
+	if (lion_container_contains(onpage, lo))
 		return true;
 
 	xstate = GenericXLogStart(index);
 	p = GenericXLogRegisterBuffer(xstate, buf, 0);
-	c = (RBIContainer *) PageGetItem(p, PageGetItemId(p, off));
+	c = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
 
-	if (!rbi_container_add(c, lo))
-		elog(ERROR, "roaring index: container %u on block %u changed under an exclusive lock",
+	if (!lion_container_add(c, lo))
+		elog(ERROR, "lion index: container %u on block %u changed under an exclusive lock",
 			 c->ckey, BufferGetBlockNumber(buf));
 
 	/* The whole point: the item still ends where it ended. */
-	Assert(rbi_container_size(c) <= alloc);
+	Assert(lion_container_size(c) <= alloc);
 
 	entry->ntids += 1;
 
 	/* The entry always travels with the container change. */
-	if (!rbi_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
-		elog(ERROR, "roaring index: could not update entry %u on block %u",
+	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
+		elog(ERROR, "lion index: could not update entry %u on block %u",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
 	GenericXLogFinish(xstate);
@@ -687,58 +687,58 @@ rbi_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
  * offset untouched.
  *
  * Only for a pair that really stays in the segment: a container key that
- * reaches RBI_SPARSE_THRESHOLD members has to be promoted to a container of
+ * reaches LION_SPARSE_THRESHOLD members has to be promoted to a container of
  * its own, which turns one item into up to three and belongs to
- * rbi_insert_segment().  Unlike a container, a segment covers a RANGE of
+ * lion_insert_segment().  Unlike a container, a segment covers a RANGE of
  * container keys, and the pair may extend it, so the page bounds are
  * recomputed.
  */
 static bool
-rbi_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
+lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 						   Buffer entrybuf, OffsetNumber entryoff,
-						   RBIEntryTuple *entry, Size entrysize,
+						   LionEntryTuple *entry, Size entrysize,
 						   uint32 ckey, uint16 lo, bool *done)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
-	RBIContainer *onpage = (RBIContainer *) PageGetItem(page, iid);
+	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
 	Size		alloc = ItemIdGetLength(iid);
 	GenericXLogState *xstate;
 	Page		p;
-	RBIContainer *s;
+	LionContainer *s;
 	bool		dup = false;
 
-	Assert(onpage->type == RBI_CT_SPARSE);
+	Assert(onpage->type == LION_CT_SPARSE);
 
-	if (onpage->cardinality >= RBI_SPARSE_MAX_PAIRS)
+	if (onpage->cardinality >= LION_SPARSE_MAX_PAIRS)
 		return false;			/* would have to split */
-	if (rbi_sparse_count(onpage, ckey) + 1 >= RBI_SPARSE_THRESHOLD)
+	if (lion_sparse_count(onpage, ckey) + 1 >= LION_SPARSE_THRESHOLD)
 		return false;			/* would have to promote the container key */
-	if (alloc < rbi_sparse_size(onpage) + RBI_SPARSE_PAIR_SIZE)
+	if (alloc < lion_sparse_size(onpage) + LION_SPARSE_PAIR_SIZE)
 		return false;			/* no slack inside the item */
 
 	*done = true;
 
-	if (rbi_sparse_contains(onpage, ckey, lo))
+	if (lion_sparse_contains(onpage, ckey, lo))
 		return true;
 
 	xstate = GenericXLogStart(index);
 	p = GenericXLogRegisterBuffer(xstate, buf, 0);
-	s = (RBIContainer *) PageGetItem(p, PageGetItemId(p, off));
+	s = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
 
-	if (!rbi_sparse_insert(s, ckey, lo, &dup) || dup)
-		elog(ERROR, "roaring index: sparse segment %u on block %u changed under an exclusive lock",
+	if (!lion_sparse_insert(s, ckey, lo, &dup) || dup)
+		elog(ERROR, "lion index: sparse segment %u on block %u changed under an exclusive lock",
 			 off, BufferGetBlockNumber(buf));
 
-	Assert(rbi_sparse_size(s) <= alloc);
+	Assert(lion_sparse_size(s) <= alloc);
 
 	/* A segment's range can grow in either direction. */
-	rbi_page_update_minmax(p);
+	lion_page_update_minmax(p);
 
 	entry->ntids += 1;
 
-	if (!rbi_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
-		elog(ERROR, "roaring index: could not update entry %u on block %u",
+	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
+		elog(ERROR, "lion index: could not update entry %u on block %u",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
 	GenericXLogFinish(xstate);
@@ -751,7 +751,7 @@ rbi_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
  *
  * The append case - the ckey belongs on the chain's tail page, which is where
  * every insert into a growing posting set lands - is decided with the
- * exclusive lock the insert needs anyway.  rbi_chain_find_page() would take a
+ * exclusive lock the insert needs anyway.  lion_chain_find_page() would take a
  * SHARE lock on that very page first, only to read its minckey and drop it
  * again, and on a hot key that is one more handoff of the page's lock between
  * the waiters for nothing: the measured ceiling of concurrent inserts into
@@ -760,11 +760,11 @@ rbi_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
  *
  * An empty tail page owns nothing (its minckey is 0, which would swallow
  * every ckey), so it falls through to the walk, exactly as in
- * rbi_chain_find_page().  Nothing is held while walking: the tail lock is
+ * lion_chain_find_page().  Nothing is held while walking: the tail lock is
  * dropped first, so no page is ever locked before a page to its left.
  */
 static Buffer
-rbi_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
+lion_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
 						   uint32 ckey)
 {
 	Buffer		buf;
@@ -777,26 +777,26 @@ rbi_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
 
-	if (!RBIPageIsContainer(page))
+	if (!LionPageIsContainer(page))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "roaring index: block %u is not a container page", tail);
+		elog(ERROR, "lion index: block %u is not a container page", tail);
 	}
 
 	if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber &&
-		ckey >= RBIPageGetOpaque(page)->minckey)
+		ckey >= LionPageGetOpaque(page)->minckey)
 		return buf;
 
 	UnlockReleaseBuffer(buf);
 
-	blk = rbi_chain_find_page(index, head, tail, ckey);
+	blk = lion_chain_find_page(index, head, tail, ckey);
 	buf = ReadBuffer(index, blk);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	if (!RBIPageIsContainer(BufferGetPage(buf)))
+	if (!LionPageIsContainer(BufferGetPage(buf)))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "roaring index: block %u is not a container page", blk);
+		elog(ERROR, "lion index: block %u is not a container page", blk);
 	}
 
 	return buf;
@@ -807,14 +807,14 @@ rbi_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
  * EXCLUSIVE.
  */
 static void
-rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 				 uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
-	RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
-	RBIEntryTuple *ecopy;
-	RBIContainer *cbuf;
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *ecopy;
+	LionContainer *cbuf;
 	Size		esize;
 	BlockNumber blk;
 	Buffer		buf;
@@ -823,28 +823,28 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 	bool		found;
 	int			delta;
 
-	ecopy = rbi_entry_rebuild(entry, NULL, 0, &esize);
+	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
 	Assert(esize == ItemIdGetLength(iid));
-	Assert((ecopy->flags & RBI_ENTRY_CHAIN) != 0);
+	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
 
-	cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-	buf = rbi_insert_lock_chain_page(index, ecopy->head, ecopy->tail, ckey);
+	buf = lion_insert_lock_chain_page(index, ecopy->head, ecopy->tail, ckey);
 	blk = BufferGetBlockNumber(buf);
 	cpage = BufferGetPage(buf);
 
 	/* Which item owns this ckey: a container, a segment, or nothing yet? */
-	off = rbi_page_find_item(cpage, ckey, &found);
+	off = lion_page_find_item(cpage, ckey, &found);
 
 	if (found &&
-		((RBIContainer *) PageGetItem(cpage, PageGetItemId(cpage, off)))->type
-		== RBI_CT_SPARSE)
+		((LionContainer *) PageGetItem(cpage, PageGetItemId(cpage, off)))->type
+		== LION_CT_SPARSE)
 	{
 		bool		done = false;
 
-		if (!rbi_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
+		if (!lion_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
 										ecopy, esize, ckey, lo, &done))
-			rbi_insert_segment(index, buf, off, true, entrybuf, entryoff,
+			lion_insert_segment(index, buf, off, true, entrybuf, entryoff,
 							   ecopy, ckey, lo);
 		UnlockReleaseBuffer(buf);
 		pfree(cbuf);
@@ -863,12 +863,12 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		OffsetNumber target = InvalidOffsetNumber;
 
 		if (off > FirstOffsetNumber &&
-			rbi_segment_has_room((RBIContainer *)
+			lion_segment_has_room((LionContainer *)
 								 PageGetItem(cpage,
 											 PageGetItemId(cpage, OffsetNumberPrev(off)))))
 			target = OffsetNumberPrev(off);
 		else if (off <= maxoff &&
-				 rbi_segment_has_room((RBIContainer *)
+				 lion_segment_has_room((LionContainer *)
 									  PageGetItem(cpage, PageGetItemId(cpage, off))))
 			target = off;
 
@@ -876,10 +876,10 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		{
 			bool		done = false;
 
-			if (!rbi_insert_segment_inplace(index, buf, target, entrybuf,
+			if (!lion_insert_segment_inplace(index, buf, target, entrybuf,
 											entryoff, ecopy, esize, ckey, lo,
 											&done))
-				rbi_insert_segment(index, buf, target, true, entrybuf,
+				lion_insert_segment(index, buf, target, true, entrybuf,
 								   entryoff, ecopy, ckey, lo);
 			UnlockReleaseBuffer(buf);
 			pfree(cbuf);
@@ -888,7 +888,7 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		}
 
 		/* No segment to join: the pair becomes a new one-pair segment. */
-		rbi_insert_segment(index, buf, off, false, entrybuf, entryoff, ecopy,
+		lion_insert_segment(index, buf, off, false, entrybuf, entryoff, ecopy,
 						   ckey, lo);
 		UnlockReleaseBuffer(buf);
 		pfree(cbuf);
@@ -901,9 +901,9 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		ItemId		ciid = PageGetItemId(cpage, off);
 		bool		done = false;
 
-		Assert(((RBIContainer *) PageGetItem(cpage, ciid))->ckey == ckey);
+		Assert(((LionContainer *) PageGetItem(cpage, ciid))->ckey == ckey);
 
-		if (rbi_insert_container_inplace(index, buf, off, entrybuf, entryoff,
+		if (lion_insert_container_inplace(index, buf, off, entrybuf, entryoff,
 										 ecopy, esize, lo, &done))
 		{
 			Assert(done);
@@ -918,11 +918,11 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		 * DESIGN.md §4); copying the slack along is harmless, and the
 		 * allocated length can never exceed a work buffer.
 		 */
-		if (ItemIdGetLength(ciid) > RBI_CONTAINER_MAX_SIZE)
-			elog(ERROR, "roaring index: container of %zu bytes at %u/%u",
+		if (ItemIdGetLength(ciid) > LION_CONTAINER_MAX_SIZE)
+			elog(ERROR, "lion index: container of %zu bytes at %u/%u",
 				 (Size) ItemIdGetLength(ciid), blk, off);
 		memcpy(cbuf, PageGetItem(cpage, ciid), ItemIdGetLength(ciid));
-		if (!rbi_container_add(cbuf, lo))
+		if (!lion_container_add(cbuf, lo))
 		{
 			/* already indexed */
 			UnlockReleaseBuffer(buf);
@@ -934,7 +934,7 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 	ecopy->ntids += 1;
 
-	rbi_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, ecopy,
+	lion_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, ecopy,
 									   cbuf, &delta, true);
 	UnlockReleaseBuffer(buf);
 
@@ -952,7 +952,7 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
  * key is meaningless and the bucket is 0.
  */
 static void
-rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
+lion_insert_one(Relation index, LionState *state, Datum key, uint16 reservedflag,
 			   uint32 ckey, uint16 lo)
 {
 	uint32		hash;
@@ -962,40 +962,40 @@ rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
 	bool		found;
 	int			npages = 0;
 
-	hash = (reservedflag != 0) ? RBI_NULLKEY_HASH : rbi_hash_key(state, key);
+	hash = (reservedflag != 0) ? LION_NULLKEY_HASH : lion_hash_key(state, key);
 
 	headbuf = ReadBuffer(index,
-						 RBI_BUCKET_BLKNO(rbi_bucket_of(hash,
+						 LION_BUCKET_BLKNO(lion_bucket_of(hash,
 														state->meta.nbuckets)));
 	LockBuffer(headbuf, BUFFER_LOCK_EXCLUSIVE);
 
 	found = (reservedflag != 0) ?
-		rbi_find_reserved_entry_counted(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
+		lion_find_reserved_entry_counted(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
 										reservedflag, &entrybuf, &entryoff,
 										&npages) :
-		rbi_find_entry_counted(index, state, headbuf, BUFFER_LOCK_EXCLUSIVE,
+		lion_find_entry_counted(index, state, headbuf, BUFFER_LOCK_EXCLUSIVE,
 							   key, hash, NULL, InvalidOid, &entrybuf,
 							   &entryoff, &npages);
 
 	if (!found)
 	{
-		rbi_insert_new_entry(index, state, headbuf, key, reservedflag, hash,
+		lion_insert_new_entry(index, state, headbuf, key, reservedflag, hash,
 							 ckey, lo);
 	}
 	else
 	{
-		RBIEntryTuple *entry;
+		LionEntryTuple *entry;
 
-		entry = (RBIEntryTuple *) PageGetItem(BufferGetPage(entrybuf),
+		entry = (LionEntryTuple *) PageGetItem(BufferGetPage(entrybuf),
 											  PageGetItemId(BufferGetPage(entrybuf),
 															entryoff));
 
-		if ((entry->flags & RBI_ENTRY_INLINE) != 0)
-			rbi_insert_inline(index, state, entrybuf, entryoff, ckey, lo);
+		if ((entry->flags & LION_ENTRY_INLINE) != 0)
+			lion_insert_inline(index, state, entrybuf, entryoff, ckey, lo);
 		else
-			rbi_insert_chain(index, entrybuf, entryoff, ckey, lo);
+			lion_insert_chain(index, entrybuf, entryoff, ckey, lo);
 
-		/* rbi_find_entry() does not pin the head page twice. */
+		/* lion_find_entry() does not pin the head page twice. */
 		if (entrybuf != headbuf)
 			UnlockReleaseBuffer(entrybuf);
 	}
@@ -1008,15 +1008,15 @@ rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
 	 * several times the entry bytes its bucket count was chosen for.  Said
 	 * after the locks are gone, because ereport() can be interrupted.
 	 */
-	if (npages > RBI_BUCKET_PAGES_WARN)
-		rbi_warn_bucket_chain(index, npages);
+	if (npages > LION_BUCKET_PAGES_WARN)
+		lion_warn_bucket_chain(index, npages);
 }
 
 /*
  * aminsert
  *
  * checkUnique is irrelevant (amcanunique is false) and indexUnchanged is
- * ignored: a roaring index has no way of knowing whether it has seen this
+ * ignored: a lion index has no way of knowing whether it has seen this
  * TID before without looking, and the lookup is the bulk of the work anyway.
  *
  * A multi-key opclass (DESIGN.md §17) turns one row into several independent
@@ -1028,11 +1028,11 @@ rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
  * them has been written.
  */
 bool
-rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
+lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		  Relation heapRel, IndexUniqueCheck checkUnique, bool indexUnchanged,
 		  IndexInfo *indexInfo)
 {
-	RBIState   *state;
+	LionState   *state;
 	MemoryContext insertcxt;
 	MemoryContext oldcxt;
 	Datum		key;
@@ -1040,18 +1040,18 @@ rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	uint32		ckey;
 	uint16		lo;
 
-	rbi_check_key_offset(ht_ctid);
+	lion_check_key_offset(ht_ctid);
 
-	state = rbi_get_state(index);
+	state = lion_get_state(index);
 
 	insertcxt = AllocSetContextCreate(CurrentMemoryContext,
-									  "roaring index insert",
+									  "lion index insert",
 									  ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(insertcxt);
 
-	code = rbi_tid_to_code(ht_ctid);
-	ckey = rbi_code_ckey(code);
-	lo = rbi_code_lo(code);
+	code = lion_tid_to_code(ht_ctid);
+	ckey = lion_code_ckey(code);
+	lo = lion_code_lo(code);
 
 	/*
 	 * A NULL value belongs to the reserved NULL entry, which lives in bucket 0
@@ -1060,19 +1060,19 @@ rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	 * puts the row in the reserved EMPTY entry the same way (DESIGN.md §17).
 	 */
 	if (isnull[0])
-		rbi_insert_one(index, state, (Datum) 0, RBI_ENTRY_NULLKEY, ckey, lo);
+		lion_insert_one(index, state, (Datum) 0, LION_ENTRY_NULLKEY, ckey, lo);
 	else if (state->multikey)
 	{
 		Datum	   *keys;
-		int			nkeys = rbi_extract_value(state, values[0], &keys);
+		int			nkeys = lion_extract_value(state, values[0], &keys);
 		int			i;
 
 		if (nkeys == 0)
-			rbi_insert_one(index, state, (Datum) 0, RBI_ENTRY_EMPTYKEY,
+			lion_insert_one(index, state, (Datum) 0, LION_ENTRY_EMPTYKEY,
 						   ckey, lo);
 		for (i = 0; i < nkeys; i++)
 		{
-			rbi_insert_one(index, state, keys[i], 0, ckey, lo);
+			lion_insert_one(index, state, keys[i], 0, ckey, lo);
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
@@ -1082,7 +1082,7 @@ rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		if (!state->typbyval && state->typlen == -1)
 			key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-		rbi_insert_one(index, state, key, 0, ckey, lo);
+		lion_insert_one(index, state, key, 0, ckey, lo);
 	}
 
 	MemoryContextSwitchTo(oldcxt);

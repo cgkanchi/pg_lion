@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+def am_name(family):
+    """Access method name for a benchmark family label (the roaring family's AM is 'lion')."""
+    return 'lion' if family == 'roaring' else family
 """Supplement: incremental growth, changing-key churn, dirty counts, hot-key writers."""
 import argparse
 import concurrent.futures
@@ -45,10 +49,10 @@ class Stress:
         if method!='seq':
             for c in columns:
                 suffix=' WITH (pages_per_range=32)' if method=='brin' else ''
-                self.db.query(f'CREATE INDEX ON {table} USING {method} ({c}){suffix}')
+                self.db.query(f'CREATE INDEX ON {table} USING {am_name(method)} ({c}){suffix}')
 
     def reference(self,sql):
-        self.db.query('SET roaring_index.enable_count_pushdown=off; SET enable_indexscan=off; '
+        self.db.query('SET pg_lion.enable_count_pushdown=off; SET enable_indexscan=off; '
                       'SET enable_indexonlyscan=off; SET enable_bitmapscan=off; SET enable_seqscan=on')
         try:
             return digest(self.db.query(sql))
@@ -61,14 +65,14 @@ class Stress:
             variants.append('roaring_sql')
         expected={name:self.reference(sql) for name,sql in queries}
         for variant in variants:
-            self.db.query(f"SET roaring_index.enable_count_pushdown={'on' if variant=='roaring' else 'off'}; "
+            self.db.query(f"SET pg_lion.enable_count_pushdown={'on' if variant=='roaring' else 'off'}; "
                           f"SET enable_seqscan={'off' if profile=='dirty_memory' else 'on'}")
             actual_queries=queries
             if variant=='roaring_sql':
-                actual_queries=[('dense',"SELECT roaring_index_count('fact_h_idx',0::int)"),
-                                ('group',"SELECT 0,roaring_index_count('fact_h_idx',0::int) UNION ALL SELECT 1,roaring_index_count('fact_h_idx',1::int)")]
+                actual_queries=[('dense',"SELECT lion_index_count('fact_h_idx',0::int)"),
+                                ('group',"SELECT 0,lion_index_count('fact_h_idx',0::int) UNION ALL SELECT 1,lion_index_count('fact_h_idx',1::int)")]
                 self.record(kind='recheck_stats',profile=profile,variant=variant,**context,
-                            **self.db.query("SELECT * FROM roaring_index_count_stats('fact_h_idx',0::int)",dictionaries=True)[0])
+                            **self.db.query("SELECT * FROM lion_index_count_stats('fact_h_idx',0::int)",dictionaries=True)[0])
             for name,sql in actual_queries:
                 actual=digest(self.db.query(sql))
                 if actual!=expected[name]:
@@ -89,7 +93,7 @@ class Stress:
                     heap_bytes=int(self.db.scalar("SELECT pg_table_size('fact')")),**context)
         if method=='roaring':
             for column in ['k','h']:
-                stats=self.db.query(f"SELECT * FROM roaring_index_stats('fact_{column}_idx')",dictionaries=True)[0]
+                stats=self.db.query(f"SELECT * FROM lion_index_stats('fact_{column}_idx')",dictionaries=True)[0]
                 self.record(kind='roaring_stats',profile=profile,method=method,index=f'fact_{column}_idx',**context,**stats)
 
     def growth(self,method):
@@ -132,7 +136,7 @@ class Stress:
                  ('point',f'EXECUTE bench_point({point})',f'SELECT count(*) FROM fact WHERE k={point}::bigint')]
         expected={name:self.reference(sql) for name,_,sql in queries}
         for mode in ['force_custom_plan','force_generic_plan']:
-            self.db.query(f"SET roaring_index.enable_count_pushdown={'on' if method=='roaring' else 'off'}; "
+            self.db.query(f"SET pg_lion.enable_count_pushdown={'on' if method=='roaring' else 'off'}; "
                           f"SET enable_seqscan=on; SET plan_cache_mode={mode}; "
                           'PREPARE bench_dense(int) AS SELECT count(*) FROM fact WHERE h=$1; '
                           'PREPARE bench_point(bigint) AS SELECT count(*) FROM fact WHERE k=$1')
@@ -182,7 +186,7 @@ class Stress:
             def writer(worker):
                 db=DB(self.cluster.libpq,self.cluster.conninfo)
                 try:
-                    db.query("LOAD 'roaring_index'; SET statement_timeout='60s'")
+                    db.query("LOAD 'pg_lion'; SET statement_timeout='60s'")
                     barrier.wait()
                     start=time.perf_counter()
                     batch=0
@@ -209,7 +213,7 @@ class Stress:
                         median_ms=statistics.median(latency),p95_ms=latency[min(len(latency)-1,int(len(latency)*.95))],
                         wal_bytes=wal,index_bytes=int(self.db.scalar("SELECT pg_indexes_size('writes')")),
                         correctness='row_count_pass')
-            self.db.query('SET enable_seqscan=off; SET roaring_index.enable_count_pushdown=off')
+            self.db.query('SET enable_seqscan=off; SET pg_lion.enable_count_pushdown=off')
             for key in [0,1]:
                 sql=f'SELECT count(*) FROM writes WHERE h={key}'
                 indexed=int(self.db.scalar(sql))
@@ -225,7 +229,7 @@ class Stress:
     def run(self):
         try:
             self.cluster.start(initialize=True)
-            for ext in ['roaring_index','btree_gin','btree_gist','pg_visibility']:
+            for ext in ['pg_lion','btree_gin','btree_gist','pg_visibility']:
                 self.db.query(f'CREATE EXTENSION {ext}')
             self.metadata['server_version']=self.db.scalar('SELECT version()')
             self.metadata['settings']=self.db.query('SELECT name,setting,unit FROM pg_settings ORDER BY name',dictionaries=True)

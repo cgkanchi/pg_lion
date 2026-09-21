@@ -1,15 +1,15 @@
 #!/bin/bash
 #
-# write_micro.sh - repeatable write-path measurements for the roaring index.
+# write_micro.sh - repeatable write-path measurements for the lion index.
 #
 # The numbers this produces are the ones the write wave is judged by:
 #
 #   build8      time and WAL of building the eight-index scalar portfolio
 #               (the same eight columns bench/comprehensive uses) on 1M rows
 #   ins10k      time and WAL of inserting 10,000 rows into that 1M-row table,
-#               with one roaring index and with eight, and per single index
+#               with one lion index and with eight, and per single index
 #   burst       an 8-client pgbench insert burst (100 rows per transaction)
-#               on a table with one roaring index on a two-valued key
+#               on a table with one lion index on a two-valued key
 #   waits       wait-event sampling of the same burst (who is blocking whom)
 #
 # Everything runs on a PRIVATE cluster (not the dev cluster on 54329), so that
@@ -28,7 +28,7 @@
 #                                          # not move at all, so compare that)
 #   bench/write_micro.sh burst LABEL       # the 8-client bursts only
 #   bench/write_micro.sh burstscale LABEL  # tps by clients x key count; env
-#                                          # RBI_WM_SCALE_KEYS, _SCALE_CLIENTS,
+#                                          # LION_WM_SCALE_KEYS, _SCALE_CLIENTS,
 #                                          # _BURST_UNLOGGED=1 pick the cells
 #   bench/write_micro.sh waits LABEL       # wait-event breakdown of the burst
 #   bench/write_micro.sh wal LABEL [COLS]  # WAL composition per record type
@@ -41,22 +41,22 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PGBIN=$ROOT/.local/pg/bin
-DATA=${RBI_WM_DATA:-$ROOT/.local/data-wm}
-SOCK=${RBI_WM_SOCK:-/tmp/claude-1000/pgsk-wm}
-PORT=${RBI_WM_PORT:-54330}
+DATA=${LION_WM_DATA:-$ROOT/.local/data-wm}
+SOCK=${LION_WM_SOCK:-/tmp/claude-1000/pgsk-wm}
+PORT=${LION_WM_PORT:-54330}
 OUT=$ROOT/bench/results/write-micro
 export PATH=$PGBIN:$PATH
 export PGHOST=$SOCK PGPORT=$PORT PGUSER=postgres PGDATABASE=postgres
 
-ROWS=${RBI_WM_ROWS:-1000000}
-NINS=${RBI_WM_NINS:-10000}
-BURST_SECONDS=${RBI_WM_BURST_SECONDS:-5}
-BURST_CLIENTS=${RBI_WM_BURST_CLIENTS:-8}
+ROWS=${LION_WM_ROWS:-1000000}
+NINS=${LION_WM_NINS:-10000}
+BURST_SECONDS=${LION_WM_BURST_SECONDS:-5}
+BURST_CLIENTS=${LION_WM_BURST_CLIENTS:-8}
 # burstscale knobs: key counts, client counts, and whether the table (and so
 # its index) is unlogged, which is how much of the critical section is WAL.
-SCALE_KEYS=${RBI_WM_SCALE_KEYS:-"2 1000"}
-SCALE_CLIENTS=${RBI_WM_SCALE_CLIENTS:-"1 4 8"}
-BURST_UNLOGGED=${RBI_WM_BURST_UNLOGGED:-0}
+SCALE_KEYS=${LION_WM_SCALE_KEYS:-"2 1000"}
+SCALE_CLIENTS=${LION_WM_SCALE_CLIENTS:-"1 4 8"}
+BURST_UNLOGGED=${LION_WM_BURST_UNLOGGED:-0}
 COLUMNS="c2 c20 c200 c20k c1m clustered skew nullable"
 
 q() { psql -X -q -v ON_ERROR_STOP=1 "$@"; }
@@ -106,7 +106,7 @@ wm_load_template() {
 	psql -X -q -c "DROP DATABASE IF EXISTS wm_tpl" >/dev/null
 	psql -X -q -c "CREATE DATABASE wm_tpl" >/dev/null
 	q -d wm_tpl <<SQL
-CREATE EXTENSION roaring_index;
+CREATE EXTENSION pg_lion;
 CREATE TABLE fact AS $(scalar_data "$ROWS" 1);
 CREATE TABLE ins$NINS AS $(scalar_data "$NINS" $((ROWS + 1)));
 VACUUM (ANALYZE) fact;
@@ -230,7 +230,7 @@ measure_inserts() {
 	emit "ins${NINS}_noindex_steady" "$3" "$4" "second batch"
 }
 
-# WAL composition of a 10,000-row insert with one roaring index: which
+# WAL composition of a 10,000-row insert with one lion index: which
 # resource manager, how much of it full-page images, how much per record.
 # Needs pg_walinspect, which is in contrib.
 measure_wal_breakdown() {
@@ -263,7 +263,7 @@ burst_setup() {
 	psql -X -q -c "CREATE DATABASE wm_burst" >/dev/null
 	psql -X -q -c "ALTER DATABASE wm_burst SET synchronous_commit = $sync" >/dev/null
 	q -d wm_burst <<SQL
-CREATE EXTENSION roaring_index;
+CREATE EXTENSION pg_lion;
 CREATE $([ "$BURST_UNLOGGED" = 1 ] && echo UNLOGGED) TABLE writes (k bigint, h int);
 $([ "$am" = none ] || echo "CREATE INDEX ix_h ON writes USING $am (h);")
 CHECKPOINT;

@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_count.c
+ * lion_count.c
  *		Heap-skipping count(*) over roaring posting sets, interlocked with
  *		the visibility map.  DESIGN.md section 9 is the specification and
  *		the safety argument; this file is deliberately shaped so that the
@@ -39,7 +39,7 @@
  * VACUUM sets a heap page all-visible only after ambulkdelete() has finished
  * on EVERY index of the table, so one pin that blocks one index's
  * ambulkdelete blocks the all-visible bit for all of them.  That is what lets
- * rbi_posting_set_materialize() serve the WHERE sets of a GROUP BY from
+ * lion_posting_set_materialize() serve the WHERE sets of a GROUP BY from
  * pinless private copies while the group's own set is read the pinned way;
  * see the comment on that function.
  *
@@ -78,18 +78,18 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
-#include "rbi.h"
-#include "rbi_count.h"
+#include "lion.h"
+#include "lion_count.h"
 
-PG_FUNCTION_INFO_V1(roaring_index_count);
-PG_FUNCTION_INFO_V1(roaring_index_count2);
-PG_FUNCTION_INFO_V1(roaring_index_count_stats);
-PG_FUNCTION_INFO_V1(roaring_index_count_group_stats);
-PG_FUNCTION_INFO_V1(roaring_index_count_any);
+PG_FUNCTION_INFO_V1(lion_index_count);
+PG_FUNCTION_INFO_V1(lion_index_count2);
+PG_FUNCTION_INFO_V1(lion_index_count_stats);
+PG_FUNCTION_INFO_V1(lion_index_count_group_stats);
+PG_FUNCTION_INFO_V1(lion_index_count_any);
 
 /* First size of the recheck TID array, and the step it grows past its budget. */
-#define RBI_RECHECK_INIT_TIDS	256
-#define RBI_RECHECK_GROW_TIDS	1024
+#define LION_RECHECK_INIT_TIDS	256
+#define LION_RECHECK_GROW_TIDS	1024
 
 /*
  * Floor and ceiling of the recheck batch budget (in TIDs).  The floor keeps a
@@ -97,45 +97,45 @@ PG_FUNCTION_INFO_V1(roaring_index_count_any);
  * visit per TID; the ceiling is an allocation bound, not a policy: a batch
  * must stay well inside what repalloc() will hand out.
  */
-#define RBI_RECHECK_MIN_BATCH	4096
-#define RBI_RECHECK_MAX_BATCH	((int) (MaxAllocSize / sizeof(ItemPointerData) / 2))
+#define LION_RECHECK_MIN_BATCH	4096
+#define LION_RECHECK_MAX_BATCH	((int) (MaxAllocSize / sizeof(ItemPointerData) / 2))
 
 /*
  * Above this many containers at one container key, an OR node stops folding
  * them pairwise and accumulates them in a bitset image instead (see
- * rbi_ecursor_build()).  Pairwise is cheaper while the containers are few and
+ * lion_ecursor_build()).  Pairwise is cheaper while the containers are few and
  * small, because it touches only their members; the image costs a fixed pass
  * over the whole container key's range however few members arrive.  Measured
  * on 1M rows with IN lists of 3, 10, 100 and 1000 values.
  */
-#ifndef RBI_OR_BITSET_MIN
-#define RBI_OR_BITSET_MIN	32
+#ifndef LION_OR_BITSET_MIN
+#define LION_OR_BITSET_MIN	32
 #endif
 
 /*
  * A posting set is worth materializing (DESIGN.md section 9 and the comment
- * on rbi_posting_set_materialize()) when it is this small.  Either bound is
+ * on lion_posting_set_materialize()) when it is this small.  Either bound is
  * enough: 64 containers cover 4096 heap blocks however fat they are, and a
  * set of many thin containers is cheap to keep as long as it stays under the
  * byte budget.  A set that fails both bounds keeps being walked page by page.
  */
-#define RBI_MATERIALIZE_MAX_CONTAINERS	64
-#define RBI_MATERIALIZE_MAX_BYTES		(256 * 1024)
+#define LION_MATERIALIZE_MAX_CONTAINERS	64
+#define LION_MATERIALIZE_MAX_BYTES		(256 * 1024)
 
 /*
  * Per-call state of one count.  The visibility map buffer is kept for the
  * whole call (one VM page covers ~32k heap blocks) and released at the end.
  */
-typedef struct RBICountCtx
+typedef struct LionCountCtx
 {
 	Relation	heap;
 	Snapshot	snapshot;
 	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
 	bool		serializable;	/* IsolationIsSerializable() at start: take page predicate locks */
 	bool		in_recovery;	/* hot standby: the pin interlock does not hold, recheck everything */
-	RBIVisCache *cache;			/* per-query visibility cache, or NULL */
+	LionVisCache *cache;			/* per-query visibility cache, or NULL */
 	int64		count;			/* members counted straight from the VM */
-	RBICountStats stats;
+	LionCountStats stats;
 
 	/* TIDs on heap blocks that were not all-visible, in ascending order */
 	ItemPointerData *tids;
@@ -144,28 +144,28 @@ typedef struct RBICountCtx
 	int			batchmax;		/* flush the list once it holds this many */
 	bool		tids_sorted;	/* they came out in order (they always do) */
 	int64		recheck_count;	/* rows counted by the batches flushed so far */
-} RBICountCtx;
+} LionCountCtx;
 
 /*
  * A posting set's containers copied out of the index, private to the backend
  * and holding no pin.  Containers are MAXALIGNed inside buf so that a BITSET
  * payload keeps its uint64 alignment, and are in ascending ckey order, which
- * is what the merge in rbi_count_posting_sets() requires.
+ * is what the merge in lion_count_posting_sets() requires.
  */
-typedef struct RBIMatSet
+typedef struct LionMatSet
 {
 	int			ncontainers;
 	Size		bytes;
 	char	   *buf;
-	RBIContainer **containers;
-} RBIMatSet;
+	LionContainer **containers;
+} LionMatSet;
 
 /*
  * A cursor over the containers of one posting set, in ascending ckey order.
  *
  * Invariant (DESIGN.md section 9): whenever cur is valid, pinbuf is a pin on
  * the page cur was copied out of.  The pin is dropped only by
- * rbi_cursor_next() / rbi_cursor_close(), never anywhere else, so every place
+ * lion_cursor_next() / lion_cursor_close(), never anywhere else, so every place
  * that lets go of a source page is visible in this file as a call to one of
  * those two functions.
  *
@@ -173,9 +173,9 @@ typedef struct RBIMatSet
  * merge, the AND and the visibility-map mask below need not know they exist:
  * a segment is expanded one container key at a time into segbuf, each time
  * as a temporary ARRAY container holding that key's (at most
- * RBI_SPARSE_THRESHOLD - 1) members.  The keys come out in ascending order,
+ * LION_SPARSE_THRESHOLD - 1) members.  The keys come out in ascending order,
  * exactly like real containers, so the merge still sees one ascending run of
- * container keys per set, and rbi_count_container() still does one
+ * container keys per set, and lion_count_container() still does one
  * visibility-map read per container key.
  *
  * The pin discipline is unchanged by that, and this is the reason it works:
@@ -183,17 +183,17 @@ typedef struct RBIMatSet
  * INLINE payload copy), and the source page pin is only dropped when the
  * cursor moves past the LAST item of that page -- which cannot happen while
  * a segment of it still has container keys left, because only
- * rbi_cursor_next_item() advances the page and it is not called until then.
+ * lion_cursor_next_item() advances the page and it is not called until then.
  */
-typedef struct RBISetCursor
+typedef struct LionSetCursor
 {
-	const RBIPostingSet *set;
+	const LionPostingSet *set;
 	bool		valid;			/* cur points at a container */
-	const RBIContainer *cur;
+	const LionContainer *cur;
 
 	/* INLINE sets: offset into the payload copy */
 	Size		payoff;
-	RBIContainer *cbuf;			/* aligned staging buffer (payloads are packed) */
+	LionContainer *cbuf;			/* aligned staging buffer (payloads are packed) */
 
 	/* materialized sets: index into set->mat->containers */
 	int			matidx;
@@ -206,23 +206,23 @@ typedef struct RBISetCursor
 	Page		img;
 
 	/* the sparse segment being expanded, and how far into its pairs */
-	const RBIContainer *seg;
+	const LionContainer *seg;
 	uint32		segpos;
-	RBIContainer *segbuf;		/* one container key's members, built here */
+	LionContainer *segbuf;		/* one container key's members, built here */
 
 	/*
 	 * Pin on the source page of the current container.  For an INLINE set
-	 * this is the RBIPostingSet's own bucket-page pin, which the cursor
+	 * this is the LionPostingSet's own bucket-page pin, which the cursor
 	 * borrows and must not release (ownpin is false).
 	 */
 	Buffer		pinbuf;
 	bool		ownpin;
 
-	RBICountCtx *cx;			/* for statistics */
-} RBISetCursor;
+	LionCountCtx *cx;			/* for statistics */
+} LionSetCursor;
 
-static void rbi_cursor_next(RBISetCursor *cur);
-static void rbi_recheck_flush(RBICountCtx *cx);
+static void lion_cursor_next(LionSetCursor *cur);
+static void lion_recheck_flush(LionCountCtx *cx);
 
 
 /* ---------------------------------------------------------------------
@@ -230,51 +230,51 @@ static void rbi_recheck_flush(RBICountCtx *cx);
  * --------------------------------------------------------------------- */
 
 /*
- * Oid of the "roaring" access method.
+ * Oid of the "lion" access method.
  *
  * NOT cached in a static: the extension can be dropped and recreated inside
  * one backend (DROP EXTENSION ... CASCADE takes the indexes with it, so no
  * index survives to pin the old Oid), and the new pg_am row legitimately gets
  * a different Oid.  A process-local cache would then reject every index as
- * "not a roaring index".  get_am_oid() is a GetSysCacheOid1(AMNAME) lookup,
+ * "not a lion index".  get_am_oid() is a GetSysCacheOid1(AMNAME) lookup,
  * which the syscache invalidates correctly and answers from memory.
  */
 Oid
-rbi_get_am_oid(void)
+lion_get_am_oid(void)
 {
-	return get_am_oid("roaring", false);
+	return get_am_oid("lion", false);
 }
 
 /*
  * Everything needed to probe an index with keys of one search type: the hash
  * function to use, and, when the type is not the index's own, the cross-type
  * equality function to compare stored keys against it.  This is the same
- * dance rbi_scan.c does for scan keys: the hash must come from the argument
+ * dance lion_scan.c does for scan keys: the hash must come from the argument
  * type's own support function, the comparison from the opfamily's strategy-1
  * operator with the stored type on the left.
  *
  * It is a struct rather than a call per key because an IN list probes one
- * index with up to RBI_MAX_ARRAY_ELEMS keys of the same type (DESIGN.md §15),
+ * index with up to LION_MAX_ARRAY_ELEMS keys of the same type (DESIGN.md §15),
  * and the catalogue lookups behind it are the same every time.
  */
-typedef struct RBIProbe
+typedef struct LionProbe
 {
 	bool		crosstype;		/* the keys are not the index's own type */
 	FmgrInfo	eqproc;			/* crosstype: stored = search comparison */
 	FmgrInfo	hashinfo;		/* crosstype: the search type's own hash */
 	int16		typlen;			/* the search type, for datumIsEqual() */
 	bool		typbyval;
-} RBIProbe;
+} LionProbe;
 
 static void
-rbi_probe_init(Relation index, RBIState *state, Oid keytype, RBIProbe *probe)
+lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 {
 	Oid			opfamily = index->rd_opfamily[0];
 	Oid			opcintype = index->rd_opcintype[0];
 	Oid			eqopr;
 	Oid			hashproc;
 
-	memset(probe, 0, sizeof(RBIProbe));
+	memset(probe, 0, sizeof(LionProbe));
 
 	if (!OidIsValid(keytype) || keytype == opcintype)
 	{
@@ -308,10 +308,10 @@ rbi_probe_init(Relation index, RBIState *state, Oid keytype, RBIProbe *probe)
 }
 
 static inline uint32
-rbi_probe_hash(RBIState *state, RBIProbe *probe, Datum key)
+lion_probe_hash(LionState *state, LionProbe *probe, Datum key)
 {
 	if (!probe->crosstype)
-		return rbi_hash_key(state, key);
+		return lion_hash_key(state, key);
 	return DatumGetUInt32(FunctionCall1Coll(&probe->hashinfo, state->collation,
 											key));
 }
@@ -329,14 +329,14 @@ rbi_probe_hash(RBIState *state, RBIProbe *probe, Datum key)
  * ps->pinbuf (DESIGN.md section 9).
  */
 static void
-rbi_fill_posting_set(Relation index, RBIState *state, Buffer buf,
-					 OffsetNumber offnum, RBIPostingSet *ps, bool *keeppin)
+lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
+					 OffsetNumber offnum, LionPostingSet *ps, bool *keeppin)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, offnum);
-	RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 
-	memset(ps, 0, sizeof(RBIPostingSet));
+	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
 	ps->pinbuf = InvalidBuffer;
 	ps->found = true;
@@ -347,11 +347,11 @@ rbi_fill_posting_set(Relation index, RBIState *state, Buffer buf,
 	ps->mat = NULL;
 
 	/*
-	 * rbi_fetch_key() points into the page for by-reference types, so copy
+	 * lion_fetch_key() points into the page for by-reference types, so copy
 	 * the key out while the buffer is still locked.  The reserved NULL entry
 	 * (DESIGN.md §14) has no key bytes to copy.
 	 */
-	ps->keyisnull = RBIEntryIsNullKey(entry);
+	ps->keyisnull = LionEntryIsNullKey(entry);
 	if (ps->keyisnull)
 	{
 		ps->storedkey = (Datum) 0;
@@ -359,26 +359,26 @@ rbi_fill_posting_set(Relation index, RBIState *state, Buffer buf,
 	}
 	else
 	{
-		ps->storedkey = datumCopy(rbi_fetch_key(state, RBIEntryGetKey(entry)),
+		ps->storedkey = datumCopy(lion_fetch_key(state, LionEntryGetKey(entry)),
 								  state->typbyval, state->typlen);
 		ps->hasstoredkey = true;
 	}
 
-	if ((entry->flags & RBI_ENTRY_INLINE) != 0)
+	if ((entry->flags & LION_ENTRY_INLINE) != 0)
 	{
 		ps->is_inline = true;
 		ps->head = InvalidBlockNumber;
-		ps->paylen = RBI_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+		ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
 		if (ps->paylen > 0)
 		{
 			ps->payload = (char *) palloc(ps->paylen);
-			memcpy(ps->payload, RBIEntryGetPayload(entry), ps->paylen);
+			memcpy(ps->payload, LionEntryGetPayload(entry), ps->paylen);
 		}
 		*keeppin = true;
 	}
 	else
 	{
-		Assert((entry->flags & RBI_ENTRY_CHAIN) != 0);
+		Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
 		ps->is_inline = false;
 		ps->head = entry->head;
 		*keeppin = false;
@@ -391,18 +391,18 @@ rbi_fill_posting_set(Relation index, RBIState *state, Buffer buf,
  * then hash, so equal values (which hash equally) end up adjacent and the
  * duplicate check is a look at the neighbours.
  */
-typedef struct RBIProbeKey
+typedef struct LionProbeKey
 {
 	uint32		bucket;
 	uint32		hash;
 	int32		idx;			/* position in the caller's value array */
-} RBIProbeKey;
+} LionProbeKey;
 
 static int
-rbi_probe_key_cmp(const void *a, const void *b)
+lion_probe_key_cmp(const void *a, const void *b)
 {
-	const RBIProbeKey *x = (const RBIProbeKey *) a;
-	const RBIProbeKey *y = (const RBIProbeKey *) b;
+	const LionProbeKey *x = (const LionProbeKey *) a;
+	const LionProbeKey *y = (const LionProbeKey *) b;
 
 	if (x->bucket != y->bucket)
 		return x->bucket < y->bucket ? -1 : 1;
@@ -413,29 +413,29 @@ rbi_probe_key_cmp(const void *a, const void *b)
 
 /*
  * Locate the entry of one key whose hash has already been computed.  This is
- * rbi_posting_set_lookup() from the bucket read onwards, split out so that a
+ * lion_posting_set_lookup() from the bucket read onwards, split out so that a
  * whole IN list can have its hashes taken - and its bucket pages visited in
- * order - before any page is read (rbi_posting_set_lookup_many()).
+ * order - before any page is read (lion_posting_set_lookup_many()).
  */
 static bool
-rbi_posting_set_locate(Relation index, RBIState *state, RBIProbe *probe,
+lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 					   Datum key, uint32 hash, uint32 bucket,
-					   RBIPostingSet *ps)
+					   LionPostingSet *ps)
 {
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	bool		keeppin;
 
-	memset(ps, 0, sizeof(RBIPostingSet));
+	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
 
-	headbuf = ReadBuffer(index, RBI_BUCKET_BLKNO(bucket));
+	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(bucket));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
-	if (!rbi_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
+	if (!lion_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
 							key, hash,
 							probe->crosstype ? &probe->eqproc : NULL,
 							state->collation,
@@ -445,14 +445,14 @@ rbi_posting_set_locate(Relation index, RBIState *state, RBIProbe *probe,
 		return false;
 	}
 
-	rbi_fill_posting_set(index, state, entrybuf, entryoff, ps, &keeppin);
+	lion_fill_posting_set(index, state, entrybuf, entryoff, ps, &keeppin);
 
 	if (keeppin)
 	{
 		/*
 		 * DESIGN.md section 9: an INLINE payload's interlock is a pin on the
 		 * bucket page it lives on, so drop the content lock but hold on to
-		 * the pin until rbi_posting_set_release().
+		 * the pin until lion_posting_set_release().
 		 */
 		LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
 		ps->pinbuf = entrybuf;
@@ -470,18 +470,18 @@ rbi_posting_set_locate(Relation index, RBIState *state, RBIProbe *probe,
 }
 
 bool
-rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
-					   RBIPostingSet *ps)
+lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
+					   LionPostingSet *ps)
 {
-	RBIState   *state = rbi_get_state(index);
-	RBIProbe	probe;
+	LionState   *state = lion_get_state(index);
+	LionProbe	probe;
 	uint32		hash;
 
-	rbi_probe_init(index, state, keytype, &probe);
-	hash = rbi_probe_hash(state, &probe, key);
+	lion_probe_init(index, state, keytype, &probe);
+	hash = lion_probe_hash(state, &probe, key);
 
-	return rbi_posting_set_locate(index, state, &probe, key, hash,
-								  rbi_bucket_of(hash, state->meta.nbuckets),
+	return lion_posting_set_locate(index, state, &probe, key, hash,
+								  lion_bucket_of(hash, state->meta.nbuckets),
 								  ps);
 }
 
@@ -489,7 +489,7 @@ rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * Locate the posting sets of many keys of one index at once: the IN list of
  * DESIGN.md §15, whose union the merge in this file then evaluates.
  *
- * Two things are done here that a loop over rbi_posting_set_lookup() cannot:
+ * Two things are done here that a loop over lion_posting_set_lookup() cannot:
  *
  *	- the keys are hashed first and the entries are then located in (bucket,
  *	  hash) order, so the bucket pages are read in ascending block order and
@@ -505,17 +505,17 @@ rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * *sets must have room for nvalues sets; the located ones come out packed at
  * the front, in bucket order, and the return value is how many there are.
  * Every one of them - found or not - must be handed to
- * rbi_posting_set_release().  *nfound, if given, is how many of them have an
+ * lion_posting_set_release().  *nfound, if given, is how many of them have an
  * entry in the index at all: nfound == 0 means the union selects nothing.
  */
 int
-rbi_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
+lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 							const Datum *values, const bool *isnull,
-							RBIPostingSet *sets, int *nfound)
+							LionPostingSet *sets, int *nfound)
 {
-	RBIState   *state = rbi_get_state(index);
-	RBIProbe	probe;
-	RBIProbeKey *probes;
+	LionState   *state = lion_get_state(index);
+	LionProbe	probe;
+	LionProbeKey *probes;
 	int			nprobe = 0;
 	int			nsets = 0;
 	int			found = 0;
@@ -527,22 +527,22 @@ rbi_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 	if (nvalues == 0)
 		return 0;
 
-	rbi_probe_init(index, state, keytype, &probe);
+	lion_probe_init(index, state, keytype, &probe);
 
-	probes = (RBIProbeKey *) palloc(sizeof(RBIProbeKey) * nvalues);
+	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * nvalues);
 	for (i = 0; i < nvalues; i++)
 	{
 		if (isnull != NULL && isnull[i])
 			continue;			/* `col = NULL` is never true */
-		probes[nprobe].hash = rbi_probe_hash(state, &probe, values[i]);
-		probes[nprobe].bucket = rbi_bucket_of(probes[nprobe].hash,
+		probes[nprobe].hash = lion_probe_hash(state, &probe, values[i]);
+		probes[nprobe].bucket = lion_bucket_of(probes[nprobe].hash,
 											  state->meta.nbuckets);
 		probes[nprobe].idx = i;
 		nprobe++;
 	}
 
 	if (nprobe > 1)
-		qsort(probes, nprobe, sizeof(RBIProbeKey), rbi_probe_key_cmp);
+		qsort(probes, nprobe, sizeof(LionProbeKey), lion_probe_key_cmp);
 
 	for (i = 0; i < nprobe; i++)
 	{
@@ -566,7 +566,7 @@ rbi_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 		if (dup)
 			continue;
 
-		if (rbi_posting_set_locate(index, state, &probe,
+		if (lion_posting_set_locate(index, state, &probe,
 								   values[probes[i].idx], probes[i].hash,
 								   probes[i].bucket, &sets[nsets]))
 			found++;
@@ -588,30 +588,30 @@ rbi_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
  * of DESIGN.md §9 included - is identical to a real key's.
  */
 bool
-rbi_posting_set_lookup_null(Relation index, RBIPostingSet *ps)
+lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
 {
-	RBIState   *state = rbi_get_state(index);
+	LionState   *state = lion_get_state(index);
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	bool		keeppin;
 
-	memset(ps, 0, sizeof(RBIPostingSet));
+	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
 
-	headbuf = ReadBuffer(index, RBI_BUCKET_BLKNO(RBI_NULLKEY_BUCKET));
+	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(LION_NULLKEY_BUCKET));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
-	if (!rbi_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
+	if (!lion_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
 							 &entrybuf, &entryoff))
 	{
 		UnlockReleaseBuffer(headbuf);
 		return false;
 	}
 
-	rbi_fill_posting_set(index, state, entrybuf, entryoff, ps, &keeppin);
+	lion_fill_posting_set(index, state, entrybuf, entryoff, ps, &keeppin);
 
 	if (keeppin)
 	{
@@ -631,7 +631,7 @@ rbi_posting_set_lookup_null(Relation index, RBIPostingSet *ps)
 }
 
 void
-rbi_posting_set_release(RBIPostingSet *ps)
+lion_posting_set_release(LionPostingSet *ps)
 {
 	if (BufferIsValid(ps->pinbuf))
 		ReleaseBuffer(ps->pinbuf);
@@ -666,7 +666,7 @@ rbi_posting_set_release(RBIPostingSet *ps)
  * That does not make a wrong count possible, because the number this file
  * produces is the count of the INTERSECTION, and the intersection is only
  * ever counted from the visibility map while at least one participating set
- * is being read the pinned way - rbi_count_posting_sets() enforces that.
+ * is being read the pinned way - lion_count_posting_sets() enforces that.
  * Take a TID t that the stale copy still contains and that is really dead:
  *
  *	- either t is no longer in the pinned set's container, and it is not in
@@ -684,13 +684,13 @@ rbi_posting_set_release(RBIPostingSet *ps)
  * entry is written before the inserting transaction commits, so every row
  * visible to our snapshot was already in the index when we took the copy.
  *
- * The copy is walked exactly the way rbi_cursor_next() walks a chain - items
+ * The copy is walked exactly the way lion_cursor_next() walks a chain - items
  * and rightlink read together under one SHARE lock - so a concurrent page
  * split (which only ever moves items to a new page to the right) cannot make
  * us miss or duplicate a container.
  */
 static bool
-rbi_posting_set_materialize(RBIPostingSet *ps)
+lion_posting_set_materialize(LionPostingSet *ps)
 {
 	MemoryContext oldcxt;
 	PGAlignedBlock *imgbuf;
@@ -710,7 +710,7 @@ rbi_posting_set_materialize(RBIPostingSet *ps)
 
 	oldcxt = MemoryContextSwitchTo(ps->cxt != NULL ? ps->cxt : CurrentMemoryContext);
 
-	offcap = Min(RBI_MATERIALIZE_MAX_CONTAINERS * 2, 256);
+	offcap = Min(LION_MATERIALIZE_MAX_CONTAINERS * 2, 256);
 	offs = (Size *) palloc(sizeof(Size) * offcap);
 	cap = 8192;
 	buf = (char *) palloc(cap);
@@ -727,29 +727,29 @@ rbi_posting_set_materialize(RBIPostingSet *ps)
 		pagebuf = ReadBuffer(ps->index, blkno);
 		LockBuffer(pagebuf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(pagebuf);
-		if (!RBIPageIsContainer(page))
+		if (!LionPageIsContainer(page))
 		{
 			UnlockReleaseBuffer(pagebuf);
-			elog(ERROR, "roaring index: block %u is not a container page",
+			elog(ERROR, "lion index: block %u is not a container page",
 				 blkno);
 		}
 		memcpy(img, page, BLCKSZ);
 		UnlockReleaseBuffer(pagebuf);
 
-		blkno = RBIPageGetOpaque(img)->rightlink;
+		blkno = LionPageGetOpaque(img)->rightlink;
 		maxoff = PageGetMaxOffsetNumber(img);
 
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
 			ItemId		iid = PageGetItemId(img, off);
-			const RBIContainer *c;
+			const LionContainer *c;
 			Size		sz;
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			c = (const RBIContainer *) PageGetItem(img, iid);
-			sz = rbi_item_size(c);
-			Assert(sz <= RBI_CONTAINER_MAX_SIZE);
+			c = (const LionContainer *) PageGetItem(img, iid);
+			sz = lion_item_size(c);
+			Assert(sz <= LION_CONTAINER_MAX_SIZE);
 
 			/*
 			 * Give up as soon as the set fails BOTH budgets: a wide set is
@@ -757,8 +757,8 @@ rbi_posting_set_materialize(RBIPostingSet *ps)
 			 * counts as the one item it is, which is also how the entry
 			 * counts it in ncontainers.
 			 */
-			if (noffs >= RBI_MATERIALIZE_MAX_CONTAINERS &&
-				used + sz > RBI_MATERIALIZE_MAX_BYTES)
+			if (noffs >= LION_MATERIALIZE_MAX_CONTAINERS &&
+				used + sz > LION_MATERIALIZE_MAX_BYTES)
 			{
 				ok = false;
 				break;
@@ -790,19 +790,19 @@ rbi_posting_set_materialize(RBIPostingSet *ps)
 
 	if (ok)
 	{
-		RBIMatSet  *mat = (RBIMatSet *) palloc(sizeof(RBIMatSet));
+		LionMatSet  *mat = (LionMatSet *) palloc(sizeof(LionMatSet));
 
 		mat->ncontainers = noffs;
 		mat->bytes = used;
 		mat->buf = buf;
-		mat->containers = (RBIContainer **)
-			palloc(sizeof(RBIContainer *) * Max(noffs, 1));
+		mat->containers = (LionContainer **)
+			palloc(sizeof(LionContainer *) * Max(noffs, 1));
 		for (i = 0; i < noffs; i++)
 		{
-			mat->containers[i] = (RBIContainer *) (buf + offs[i]);
+			mat->containers[i] = (LionContainer *) (buf + offs[i]);
 			if (i > 0 &&
-				rbi_item_first_ckey(mat->containers[i]) <=
-				rbi_item_last_ckey(mat->containers[i - 1]))
+				lion_item_first_ckey(mat->containers[i]) <=
+				lion_item_last_ckey(mat->containers[i - 1]))
 				sorted = false;
 		}
 
@@ -813,7 +813,7 @@ rbi_posting_set_materialize(RBIPostingSet *ps)
 		 * comparison per item to rule out.
 		 */
 		if (!sorted)
-			elog(ERROR, "roaring index: containers of \"%s\" are out of order",
+			elog(ERROR, "lion index: containers of \"%s\" are out of order",
 				 RelationGetRelationName(ps->index));
 
 		ps->mat = mat;
@@ -836,10 +836,10 @@ rbi_posting_set_materialize(RBIPostingSet *ps)
 
 /*
  * Release the pin the cursor owns, if any.  The only two callers are
- * rbi_cursor_next() (page exhausted) and rbi_cursor_close().
+ * lion_cursor_next() (page exhausted) and lion_cursor_close().
  */
 static void
-rbi_cursor_unpin(RBISetCursor *cur)
+lion_cursor_unpin(LionSetCursor *cur)
 {
 	if (cur->ownpin && BufferIsValid(cur->pinbuf))
 		ReleaseBuffer(cur->pinbuf);
@@ -848,9 +848,9 @@ rbi_cursor_unpin(RBISetCursor *cur)
 }
 
 static void
-rbi_cursor_init(RBISetCursor *cur, const RBIPostingSet *set, RBICountCtx *cx)
+lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx)
 {
-	memset(cur, 0, sizeof(RBISetCursor));
+	memset(cur, 0, sizeof(LionSetCursor));
 	cur->set = set;
 	cur->cx = cx;
 	cur->pinbuf = InvalidBuffer;
@@ -866,9 +866,9 @@ rbi_cursor_init(RBISetCursor *cur, const RBIPostingSet *set, RBICountCtx *cx)
 	}
 	else if (set->is_inline)
 	{
-		cur->cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+		cur->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		cur->payoff = 0;
-		/* borrowed, not owned: the RBIPostingSet releases it */
+		/* borrowed, not owned: the LionPostingSet releases it */
 		cur->pinbuf = set->pinbuf;
 		cur->ownpin = false;
 	}
@@ -879,7 +879,7 @@ rbi_cursor_init(RBISetCursor *cur, const RBIPostingSet *set, RBICountCtx *cx)
 		cur->nextblk = set->head;
 	}
 
-	rbi_cursor_next(cur);
+	lion_cursor_next(cur);
 }
 
 /*
@@ -888,16 +888,16 @@ rbi_cursor_init(RBISetCursor *cur, const RBIPostingSet *set, RBICountCtx *cx)
  *
  * DESIGN.md section 9: for a CHAIN set this is the one place a source page
  * pin is dropped, and it happens only once the caller has finished with every
- * item of that page - see rbi_count_container(), which calls
- * rbi_cursor_next() immediately after the visibility-map checks and nowhere
+ * item of that page - see lion_count_container(), which calls
+ * lion_cursor_next() immediately after the visibility-map checks and nowhere
  * else.
  */
-static const RBIContainer *
-rbi_cursor_next_item(RBISetCursor *cur)
+static const LionContainer *
+lion_cursor_next_item(LionSetCursor *cur)
 {
 	if (cur->set->mat != NULL)
 	{
-		const RBIMatSet *mat = cur->set->mat;
+		const LionMatSet *mat = cur->set->mat;
 
 		if (cur->matidx >= mat->ncontainers)
 			return NULL;
@@ -906,7 +906,7 @@ rbi_cursor_next_item(RBISetCursor *cur)
 
 	if (cur->set->is_inline)
 	{
-		if (rbi_inline_fetch(cur->set->payload, cur->set->paylen,
+		if (lion_inline_fetch(cur->set->payload, cur->set->paylen,
 							 &cur->payoff, cur->cbuf) == 0)
 			return NULL;		/* payload exhausted; the set keeps its pin */
 		return cur->cbuf;
@@ -925,11 +925,11 @@ rbi_cursor_next_item(RBISetCursor *cur)
 			cur->off = OffsetNumberNext(cur->off);
 			if (!ItemIdIsUsed(iid))
 				continue;
-			return (const RBIContainer *) PageGetItem(cur->img, iid);
+			return (const LionContainer *) PageGetItem(cur->img, iid);
 		}
 
 		/* Its items have all been consumed: the pin may go. */
-		rbi_cursor_unpin(cur);
+		lion_cursor_unpin(cur);
 
 		if (!BlockNumberIsValid(cur->nextblk))
 			return NULL;
@@ -937,15 +937,15 @@ rbi_cursor_next_item(RBISetCursor *cur)
 		buf = ReadBuffer(cur->set->index, cur->nextblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (!RBIPageIsContainer(page))
+		if (!LionPageIsContainer(page))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "roaring index: block %u is not a container page",
+			elog(ERROR, "lion index: block %u is not a container page",
 				 cur->nextblk);
 		}
 
 		/*
-		 * Copy the page - items and rightlink together, as rbi_scan.c does -
+		 * Copy the page - items and rightlink together, as lion_scan.c does -
 		 * then drop the content lock but keep the pin (DESIGN.md section 9).
 		 */
 		memcpy(cur->img, page, BLCKSZ);
@@ -953,7 +953,7 @@ rbi_cursor_next_item(RBISetCursor *cur)
 		cur->pinbuf = buf;
 		cur->ownpin = true;
 
-		cur->nextblk = RBIPageGetOpaque(cur->img)->rightlink;
+		cur->nextblk = LionPageGetOpaque(cur->img)->rightlink;
 		cur->off = FirstOffsetNumber;
 		cur->maxoff = PageGetMaxOffsetNumber(cur->img);
 
@@ -971,11 +971,11 @@ rbi_cursor_next_item(RBISetCursor *cur)
  * is the pin on the page it came from.
  */
 static bool
-rbi_cursor_emit_segment(RBISetCursor *cur)
+lion_cursor_emit_segment(LionSetCursor *cur)
 {
-	const RBIContainer *seg = cur->seg;
-	const uint32 *ckeys = RBI_SPARSE_CKEYS_CONST(seg);
-	const uint16 *los = RBI_SPARSE_LOS_CONST(seg);
+	const LionContainer *seg = cur->seg;
+	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(seg);
+	const uint16 *los = LION_SPARSE_LOS_CONST(seg);
 	uint32		n = seg->cardinality;
 	uint32		ckey;
 
@@ -988,13 +988,13 @@ rbi_cursor_emit_segment(RBISetCursor *cur)
 	 * sparse segment at all.
 	 */
 	if (cur->segbuf == NULL)
-		cur->segbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+		cur->segbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
 	ckey = ckeys[cur->segpos];
-	rbi_container_init(cur->segbuf, ckey);
+	lion_container_init(cur->segbuf, ckey);
 	do
 	{
-		rbi_container_append_sorted(cur->segbuf, los[cur->segpos]);
+		lion_container_append_sorted(cur->segbuf, los[cur->segpos]);
 		cur->segpos++;
 	} while (cur->segpos < n && ckeys[cur->segpos] == ckey);
 
@@ -1006,10 +1006,10 @@ rbi_cursor_emit_segment(RBISetCursor *cur)
 
 /*
  * Advance to the next container of the set, expanding sparse segments one
- * container key at a time (see the comment on RBISetCursor).
+ * container key at a time (see the comment on LionSetCursor).
  */
 static void
-rbi_cursor_next(RBISetCursor *cur)
+lion_cursor_next(LionSetCursor *cur)
 {
 	cur->valid = false;
 	cur->cur = NULL;
@@ -1020,19 +1020,19 @@ rbi_cursor_next(RBISetCursor *cur)
 	/* Still inside a segment?  Its next container key is the next container. */
 	if (cur->seg != NULL)
 	{
-		if (rbi_cursor_emit_segment(cur))
+		if (lion_cursor_emit_segment(cur))
 			return;
 		cur->seg = NULL;
 	}
 
 	for (;;)
 	{
-		const RBIContainer *item = rbi_cursor_next_item(cur);
+		const LionContainer *item = lion_cursor_next_item(cur);
 
 		if (item == NULL)
 			return;
 
-		if (item->type != RBI_CT_SPARSE)
+		if (item->type != LION_CT_SPARSE)
 		{
 			cur->cur = item;
 			cur->valid = true;
@@ -1042,16 +1042,16 @@ rbi_cursor_next(RBISetCursor *cur)
 
 		cur->seg = item;
 		cur->segpos = 0;
-		if (rbi_cursor_emit_segment(cur))
+		if (lion_cursor_emit_segment(cur))
 			return;
 		cur->seg = NULL;		/* an empty segment: nothing to present */
 	}
 }
 
 static void
-rbi_cursor_close(RBISetCursor *cur)
+lion_cursor_close(LionSetCursor *cur)
 {
-	rbi_cursor_unpin(cur);
+	lion_cursor_unpin(cur);
 	cur->seg = NULL;
 	cur->valid = false;
 	cur->cur = NULL;
@@ -1067,9 +1067,9 @@ rbi_cursor_close(RBISetCursor *cur)
  * ascending run of container keys just as a single set does, so that the
  * merge below need not know what is behind a source.
  *
- * Three node kinds, which are exactly the three RBIKeyNode kinds:
+ * Three node kinds, which are exactly the three LionKeyNode kinds:
  *
- *	LEAF	one posting set, walked by an RBISetCursor.
+ *	LEAF	one posting set, walked by an LionSetCursor.
  *	OR		the union (DESIGN.md §15's IN lists, and `tags && '{a,b}'`): the
  *			cursor stands at the SMALLEST container key any child has left,
  *			and its container is the OR of the containers of every child
@@ -1091,8 +1091,8 @@ rbi_cursor_close(RBISetCursor *cur)
  * THE PIN RULE (DESIGN.md §9) IS UNCHANGED BY EITHER OPERATOR.  Every leaf
  * that contributed a container to the result still pins the page that
  * container was copied from, because a leaf is only advanced by
- * rbi_ecursor_next(), and the merge only calls that from
- * rbi_count_container(), after the visibility map has been consulted for the
+ * lion_ecursor_next(), and the merge only calls that from
+ * lion_count_container(), after the visibility map has been consulted for the
  * merged container.  Leaves that are ahead of the current key hold their own
  * pins as well, which is harmless: a pin too many never makes a count wrong,
  * it only makes VACUUM wait.
@@ -1103,27 +1103,27 @@ rbi_cursor_close(RBISetCursor *cur)
  * own `!alleq` branch is safe: nothing of that container key reaches the
  * visibility map, so no answer rests on it.
  */
-typedef struct RBIOrHeapEnt
+typedef struct LionOrHeapEnt
 {
 	uint32		ckey;			/* sub[child].ckey when it was pushed */
 	int32		child;
-} RBIOrHeapEnt;
+} LionOrHeapEnt;
 
-typedef struct RBIExprCursor
+typedef struct LionExprCursor
 {
-	const RBIKeyNode *node;		/* NULL: an empty source, never valid */
-	RBIKeyNodeKind kind;
+	const LionKeyNode *node;		/* NULL: an empty source, never valid */
+	LionKeyNodeKind kind;
 
-	/* RBI_KN_KEY */
-	RBISetCursor leaf;
+	/* LION_KN_KEY */
+	LionSetCursor leaf;
 
-	/* RBI_KN_AND / RBI_KN_OR */
+	/* LION_KN_AND / LION_KN_OR */
 	int			nsub;
-	struct RBIExprCursor *sub;
-	RBIContainer *acc[2];		/* AND/OR accumulators, only when nsub > 1 */
+	struct LionExprCursor *sub;
+	LionContainer *acc[2];		/* AND/OR accumulators, only when nsub > 1 */
 
 	/*
-	 * RBI_KN_OR, the k-way merge.  heap[0 .. nheap-1] is a min-heap of every
+	 * LION_KN_OR, the k-way merge.  heap[0 .. nheap-1] is a min-heap of every
 	 * child that still has a container and is not standing at the current
 	 * key; hot[0 .. nhot-1] are the children that are, the ones whose
 	 * containers the current result was built from and whose pins therefore
@@ -1132,13 +1132,13 @@ typedef struct RBIExprCursor
 	 *
 	 * The heap carries each child's container key INSIDE the entry rather
 	 * than reading sub[i].ckey while it sifts: a thousand-element IN list is
-	 * a thousand RBIExprCursors, a third of a megabyte, and chasing them
+	 * a thousand LionExprCursors, a third of a megabyte, and chasing them
 	 * through the heap's random access pattern cost more than the linear scan
 	 * over all children that the heap replaced (measured: +4 ms on a
 	 * 1000-value list at 1M rows).  A child's key only changes when the child
 	 * is advanced, which is also when it is pushed back on.
 	 */
-	struct RBIOrHeapEnt *heap;
+	struct LionOrHeapEnt *heap;
 	int			nheap;
 	int		   *hot;
 	int			nhot;
@@ -1147,20 +1147,20 @@ typedef struct RBIExprCursor
 	/* the container the cursor currently stands on */
 	bool		valid;
 	uint32		ckey;
-	const RBIContainer *cur;
+	const LionContainer *cur;
 
 	bool		advance;		/* top level only: took part in this key */
-} RBIExprCursor;
+} LionExprCursor;
 
-static void rbi_ecursor_build(RBIExprCursor *c);
-static void rbi_ecursor_next(RBIExprCursor *c);
+static void lion_ecursor_build(LionExprCursor *c);
+static void lion_ecursor_next(LionExprCursor *c);
 
 /* ---- the OR node's min-heap of children, keyed by container key ---- */
 
 static inline void
-rbi_or_heap_push(RBIExprCursor *c, int child)
+lion_or_heap_push(LionExprCursor *c, int child)
 {
-	RBIOrHeapEnt ent;
+	LionOrHeapEnt ent;
 	int			i = c->nheap++;
 
 	Assert(c->sub[child].valid);
@@ -1180,10 +1180,10 @@ rbi_or_heap_push(RBIExprCursor *c, int child)
 }
 
 static inline int
-rbi_or_heap_pop(RBIExprCursor *c)
+lion_or_heap_pop(LionExprCursor *c)
 {
 	int			top = c->heap[0].child;
-	RBIOrHeapEnt last;
+	LionOrHeapEnt last;
 	int			i = 0;
 
 	Assert(c->nheap > 0);
@@ -1218,20 +1218,20 @@ rbi_or_heap_pop(RBIExprCursor *c)
 
 /*
  * OR one container into a bitset image of a whole container key's range.
- * This is rbi_container.c's own container_or_bitset(), which is private to
+ * This is lion_container.c's own container_or_bitset(), which is private to
  * that module; it is repeated here rather than exported because the union of
  * k containers is this file's problem (DESIGN.md §15) and the shape of a
- * container payload is rbi_container.h's published interface.
+ * container payload is lion_container.h's published interface.
  */
 static void
-rbi_bits_or_container(uint64 *w, const RBIContainer *c)
+lion_bits_or_container(uint64 *w, const LionContainer *c)
 {
-	const char *payload = (const char *) c + RBI_CONTAINER_HDRSZ;
+	const char *payload = (const char *) c + LION_CONTAINER_HDRSZ;
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = (const uint16 *) payload;
 
@@ -1239,19 +1239,19 @@ rbi_bits_or_container(uint64 *w, const RBIContainer *c)
 					w[arr[i] >> 6] |= UINT64CONST(1) << (arr[i] & 63);
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				const uint64 *src = (const uint64 *) payload;
 				int			k;
 
-				for (k = 0; k < RBI_BITSET_WORDS; k++)
+				for (k = 0; k < LION_BITSET_WORDS; k++)
 					w[k] |= src[k];
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
 				uint32		nruns = *(const uint16 *) payload;
-				const RBIRun *runs = (const RBIRun *) (payload + sizeof(uint16));
+				const LionRun *runs = (const LionRun *) (payload + sizeof(uint16));
 
 				for (i = 0; i < nruns; i++)
 				{
@@ -1262,7 +1262,7 @@ rbi_bits_or_container(uint64 *w, const RBIContainer *c)
 					uint64		fmask = PG_UINT64_MAX << (first & 63);
 					uint64		lmask = PG_UINT64_MAX >> (63 - (last & 63));
 
-					Assert(last < RBI_CONTAINER_RANGE);
+					Assert(last < LION_CONTAINER_RANGE);
 					if (fw == lw)
 						w[fw] |= fmask & lmask;
 					else
@@ -1285,85 +1285,85 @@ rbi_bits_or_container(uint64 *w, const RBIContainer *c)
 
 /*
  * Turn the accumulated image into a container in dest (capacity
- * RBI_CONTAINER_MAX_SIZE), in the smallest representation, exactly as
- * rbi_container_or() would have left it.
+ * LION_CONTAINER_MAX_SIZE), in the smallest representation, exactly as
+ * lion_container_or() would have left it.
  */
 static void
-rbi_bits_to_container(const uint64 *w, uint32 ckey, RBIContainer *dest)
+lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
 {
 	uint64		card = 0;
 	int			k;
 
-	for (k = 0; k < RBI_BITSET_WORDS; k++)
+	for (k = 0; k < LION_BITSET_WORDS; k++)
 		card += pg_popcount64(w[k]);
 
-	rbi_container_init(dest, ckey);
+	lion_container_init(dest, ckey);
 	if (card == 0)
 		return;					/* an empty ARRAY; the caller drops it */
 
 	/*
 	 * Written straight into the payload rather than through
-	 * rbi_container_append_sorted() once per member: the image IS a BITSET
+	 * lion_container_append_sorted() once per member: the image IS a BITSET
 	 * payload, so the whole container key costs one memcpy whatever its
-	 * cardinality.  rbi_container_optimize() then picks the representation,
-	 * and in assert builds rbi_container_check() confirms that what was built
+	 * cardinality.  lion_container_optimize() then picks the representation,
+	 * and in assert builds lion_container_check() confirms that what was built
 	 * by hand is a container the rest of the code may be handed.
 	 */
-	Assert(card <= RBI_CONTAINER_RANGE);
-	rbi_container_to_bitset(dest);
-	memcpy(RBI_BITSET_DATA(dest), w, RBI_BITSET_BYTES);
+	Assert(card <= LION_CONTAINER_RANGE);
+	lion_container_to_bitset(dest);
+	memcpy(LION_BITSET_DATA(dest), w, LION_BITSET_BYTES);
 	dest->cardinality = (uint16) card;
-	rbi_container_optimize(dest);
+	lion_container_optimize(dest);
 
 #ifdef USE_ASSERT_CHECKING
 	{
 		const char *why = NULL;
 
-		Assert(rbi_container_check(dest, RBI_CONTAINER_MAX_SIZE, &why));
+		Assert(lion_container_check(dest, LION_CONTAINER_MAX_SIZE, &why));
 	}
 #endif
 }
 
 static void
-rbi_ecursor_init(RBIExprCursor *c, const RBIKeyNode *node,
-				 RBIPostingSet *sets, int nsets, RBICountCtx *cx)
+lion_ecursor_init(LionExprCursor *c, const LionKeyNode *node,
+				 LionPostingSet *sets, int nsets, LionCountCtx *cx)
 {
 	int			i;
 
 	check_stack_depth();
 
-	memset(c, 0, sizeof(RBIExprCursor));
+	memset(c, 0, sizeof(LionExprCursor));
 	c->node = node;
 	if (node == NULL)
 		return;					/* a source with no sets at all */
 
 	c->kind = node->kind;
 
-	if (node->kind == RBI_KN_KEY)
+	if (node->kind == LION_KN_KEY)
 	{
 		Assert(node->keyno >= 0 && node->keyno < nsets);
-		rbi_cursor_init(&c->leaf, &sets[node->keyno], cx);
+		lion_cursor_init(&c->leaf, &sets[node->keyno], cx);
 	}
 	else
 	{
 		Assert(node->nargs >= 1);
 		c->nsub = node->nargs;
-		c->sub = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * c->nsub);
+		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * c->nsub);
 		for (i = 0; i < c->nsub; i++)
-			rbi_ecursor_init(&c->sub[i], node->args[i], sets, nsets, cx);
+			lion_ecursor_init(&c->sub[i], node->args[i], sets, nsets, cx);
 
 		if (c->nsub > 1)
 		{
-			c->acc[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
-			c->acc[1] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+			c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		}
 
-		if (node->kind == RBI_KN_OR)
+		if (node->kind == LION_KN_OR)
 		{
-			c->heap = (RBIOrHeapEnt *) palloc(sizeof(RBIOrHeapEnt) * c->nsub);
+			c->heap = (LionOrHeapEnt *) palloc(sizeof(LionOrHeapEnt) * c->nsub);
 			c->hot = (int *) palloc(sizeof(int) * c->nsub);
 			if (c->nsub > 2)
-				c->bits = (uint64 *) palloc(RBI_BITSET_BYTES);
+				c->bits = (uint64 *) palloc(LION_BITSET_BYTES);
 
 			/*
 			 * Every child that has a container goes on the heap; build()
@@ -1372,21 +1372,21 @@ rbi_ecursor_init(RBIExprCursor *c, const RBIKeyNode *node,
 			for (i = 0; i < c->nsub; i++)
 			{
 				if (c->sub[i].valid)
-					rbi_or_heap_push(c, i);
+					lion_or_heap_push(c, i);
 			}
 		}
 	}
 
-	rbi_ecursor_build(c);
+	lion_ecursor_build(c);
 }
 
 /*
  * Recompute the cursor's current container from its children.
  */
 static void
-rbi_ecursor_build(RBIExprCursor *c)
+lion_ecursor_build(LionExprCursor *c)
 {
-	const RBIContainer *acc;
+	const LionContainer *acc;
 	int			w = 0;
 	int			i;
 
@@ -1396,7 +1396,7 @@ rbi_ecursor_build(RBIExprCursor *c)
 	if (c->node == NULL)
 		return;
 
-	if (c->kind == RBI_KN_KEY)
+	if (c->kind == LION_KN_KEY)
 	{
 		if (!c->leaf.valid)
 			return;
@@ -1406,7 +1406,7 @@ rbi_ecursor_build(RBIExprCursor *c)
 		return;
 	}
 
-	if (c->kind == RBI_KN_OR)
+	if (c->kind == LION_KN_OR)
 	{
 		uint32		minckey;
 
@@ -1414,7 +1414,7 @@ rbi_ecursor_build(RBIExprCursor *c)
 		 * The k-way merge.  Everything that still has a container is on the
 		 * heap, so its root IS the smallest container key any child has left;
 		 * the children standing at it come off the heap into hot[] and stay
-		 * there until rbi_ecursor_next() moves past the key, which is what
+		 * there until lion_ecursor_next() moves past the key, which is what
 		 * keeps their pins - and with them the §9 interlock - in place for as
 		 * long as the result is being counted.
 		 */
@@ -1425,18 +1425,18 @@ rbi_ecursor_build(RBIExprCursor *c)
 		minckey = c->heap[0].ckey;
 		do
 		{
-			c->hot[c->nhot++] = rbi_or_heap_pop(c);
+			c->hot[c->nhot++] = lion_or_heap_pop(c);
 		} while (c->nheap > 0 && c->heap[0].ckey == minckey);
 
 		if (c->nhot == 1)
 			c->cur = c->sub[c->hot[0]].cur;
-		else if (c->nhot < RBI_OR_BITSET_MIN)
+		else if (c->nhot < LION_OR_BITSET_MIN)
 		{
-			const RBIContainer *a = c->sub[c->hot[0]].cur;
+			const LionContainer *a = c->sub[c->hot[0]].cur;
 
 			for (i = 1; i < c->nhot; i++)
 			{
-				rbi_container_or(a, c->sub[c->hot[i]].cur, c->acc[w]);
+				lion_container_or(a, c->sub[c->hot[i]].cur, c->acc[w]);
 				a = c->acc[w];
 				w ^= 1;
 			}
@@ -1445,10 +1445,10 @@ rbi_ecursor_build(RBIExprCursor *c)
 		else
 		{
 			/* One pass over the containers, one container built at the end. */
-			memset(c->bits, 0, RBI_BITSET_BYTES);
+			memset(c->bits, 0, LION_BITSET_BYTES);
 			for (i = 0; i < c->nhot; i++)
-				rbi_bits_or_container(c->bits, c->sub[c->hot[i]].cur);
-			rbi_bits_to_container(c->bits, minckey, c->acc[0]);
+				lion_bits_or_container(c->bits, c->sub[c->hot[i]].cur);
+			lion_bits_to_container(c->bits, minckey, c->acc[0]);
 			c->cur = c->acc[0];
 		}
 
@@ -1457,7 +1457,7 @@ rbi_ecursor_build(RBIExprCursor *c)
 		return;
 	}
 
-	Assert(c->kind == RBI_KN_AND);
+	Assert(c->kind == LION_KN_AND);
 
 	for (;;)
 	{
@@ -1483,7 +1483,7 @@ rbi_ecursor_build(RBIExprCursor *c)
 			if (c->sub[i].ckey != maxckey)
 			{
 				alleq = false;
-				rbi_ecursor_next(&c->sub[i]);
+				lion_ecursor_next(&c->sub[i]);
 			}
 		}
 		if (!alleq)
@@ -1496,12 +1496,12 @@ rbi_ecursor_build(RBIExprCursor *c)
 		w = 0;
 		for (i = 1; i < c->nsub; i++)
 		{
-			rbi_container_and(acc, c->sub[i].cur, c->acc[w]);
+			lion_container_and(acc, c->sub[i].cur, c->acc[w]);
 			acc = c->acc[w];
 			w ^= 1;
 		}
 
-		if (rbi_container_cardinality(acc) > 0)
+		if (lion_container_cardinality(acc) > 0)
 		{
 			c->ckey = maxckey;
 			c->cur = acc;
@@ -1514,7 +1514,7 @@ rbi_ecursor_build(RBIExprCursor *c)
 		 * will ask the visibility map about it and every child may move on.
 		 */
 		for (i = 0; i < c->nsub; i++)
-			rbi_ecursor_next(&c->sub[i]);
+			lion_ecursor_next(&c->sub[i]);
 
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1526,7 +1526,7 @@ rbi_ecursor_build(RBIExprCursor *c)
  * only place a source lets go of a page pin that carried an answer.
  */
 static void
-rbi_ecursor_next(RBIExprCursor *c)
+lion_ecursor_next(LionExprCursor *c)
 {
 	int			i;
 
@@ -1535,11 +1535,11 @@ rbi_ecursor_next(RBIExprCursor *c)
 
 	switch (c->kind)
 	{
-		case RBI_KN_KEY:
-			rbi_cursor_next(&c->leaf);
+		case LION_KN_KEY:
+			lion_cursor_next(&c->leaf);
 			break;
 
-		case RBI_KN_OR:
+		case LION_KN_OR:
 
 			/*
 			 * Only the children that stood at this key move; the ones still
@@ -1551,37 +1551,37 @@ rbi_ecursor_next(RBIExprCursor *c)
 			{
 				int			child = c->hot[i];
 
-				rbi_ecursor_next(&c->sub[child]);
+				lion_ecursor_next(&c->sub[child]);
 				if (c->sub[child].valid)
-					rbi_or_heap_push(c, child);
+					lion_or_heap_push(c, child);
 			}
 			c->nhot = 0;
 			break;
 
-		case RBI_KN_AND:
+		case LION_KN_AND:
 			/* every child stands at c->ckey and contributed to the result */
 			for (i = 0; i < c->nsub; i++)
-				rbi_ecursor_next(&c->sub[i]);
+				lion_ecursor_next(&c->sub[i]);
 			break;
 	}
 
-	rbi_ecursor_build(c);
+	lion_ecursor_build(c);
 }
 
 static void
-rbi_ecursor_close(RBIExprCursor *c)
+lion_ecursor_close(LionExprCursor *c)
 {
 	int			i;
 
 	if (c->node == NULL)
 		return;
 
-	if (c->kind == RBI_KN_KEY)
-		rbi_cursor_close(&c->leaf);
+	if (c->kind == LION_KN_KEY)
+		lion_cursor_close(&c->leaf);
 	else
 	{
 		for (i = 0; i < c->nsub; i++)
-			rbi_ecursor_close(&c->sub[i]);
+			lion_ecursor_close(&c->sub[i]);
 	}
 
 	c->nheap = 0;
@@ -1599,11 +1599,11 @@ rbi_ecursor_close(RBIExprCursor *c)
  * all of them.  NULL when the source has no sets at all, which only a negated
  * source can have (a `col IS NOT NULL` on a column with no NULLs).
  */
-static RBIKeyNode *
-rbi_source_tree(const RBICountSource *src)
+static LionKeyNode *
+lion_source_tree(const LionCountSource *src)
 {
-	RBIKeyNode *node;
-	RBIKeyNode **args;
+	LionKeyNode *node;
+	LionKeyNode **args;
 	int			i;
 
 	if (src->tree != NULL)
@@ -1611,18 +1611,18 @@ rbi_source_tree(const RBICountSource *src)
 	if (src->nsets == 0)
 		return NULL;
 
-	args = (RBIKeyNode **) palloc(sizeof(RBIKeyNode *) * src->nsets);
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * src->nsets);
 	for (i = 0; i < src->nsets; i++)
 	{
-		args[i] = (RBIKeyNode *) palloc0(sizeof(RBIKeyNode));
-		args[i]->kind = RBI_KN_KEY;
+		args[i] = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+		args[i]->kind = LION_KN_KEY;
 		args[i]->keyno = i;
 	}
 	if (src->nsets == 1)
 		return args[0];
 
-	node = (RBIKeyNode *) palloc0(sizeof(RBIKeyNode));
-	node->kind = RBI_KN_OR;
+	node = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+	node->kind = LION_KN_OR;
 	node->nargs = src->nsets;
 	node->args = args;
 	return node;
@@ -1635,7 +1635,7 @@ rbi_source_tree(const RBICountSource *src)
  * an impossible clause cost one bucket lookup per key and no merge.
  */
 static bool
-rbi_source_satisfiable(const RBIKeyNode *node, const RBIPostingSet *sets)
+lion_source_satisfiable(const LionKeyNode *node, const LionPostingSet *sets)
 {
 	int			i;
 
@@ -1644,21 +1644,21 @@ rbi_source_satisfiable(const RBIKeyNode *node, const RBIPostingSet *sets)
 
 	switch (node->kind)
 	{
-		case RBI_KN_KEY:
+		case LION_KN_KEY:
 			return sets[node->keyno].found;
 
-		case RBI_KN_AND:
+		case LION_KN_AND:
 			for (i = 0; i < node->nargs; i++)
 			{
-				if (!rbi_source_satisfiable(node->args[i], sets))
+				if (!lion_source_satisfiable(node->args[i], sets))
 					return false;
 			}
 			return true;
 
-		case RBI_KN_OR:
+		case LION_KN_OR:
 			for (i = 0; i < node->nargs; i++)
 			{
-				if (rbi_source_satisfiable(node->args[i], sets))
+				if (lion_source_satisfiable(node->args[i], sets))
 					return true;
 			}
 			return false;
@@ -1670,8 +1670,8 @@ rbi_source_satisfiable(const RBIKeyNode *node, const RBIPostingSet *sets)
 /*
  * Does every container this expression can yield come with a live buffer pin
  * on the page it was read from?  That is the DESIGN.md §9 interlock, and
- * rbi_count_sources() has to keep at least one positive source that has it
- * (see the comment on rbi_posting_set_materialize()).
+ * lion_count_sources() has to keep at least one positive source that has it
+ * (see the comment on lion_posting_set_materialize()).
  *
  *	- a leaf has it unless its set has been materialized; a leaf whose key has
  *	  no entry yields nothing, so it has it vacuously;
@@ -1682,7 +1682,7 @@ rbi_source_satisfiable(const RBIKeyNode *node, const RBIPostingSet *sets)
  *	  contributed to a given container key is not known in advance.
  */
 static bool
-rbi_source_pinned(const RBIKeyNode *node, const RBIPostingSet *sets)
+lion_source_pinned(const LionKeyNode *node, const LionPostingSet *sets)
 {
 	int			i;
 
@@ -1691,21 +1691,21 @@ rbi_source_pinned(const RBIKeyNode *node, const RBIPostingSet *sets)
 
 	switch (node->kind)
 	{
-		case RBI_KN_KEY:
+		case LION_KN_KEY:
 			return !sets[node->keyno].found || sets[node->keyno].mat == NULL;
 
-		case RBI_KN_AND:
+		case LION_KN_AND:
 			for (i = 0; i < node->nargs; i++)
 			{
-				if (rbi_source_pinned(node->args[i], sets))
+				if (lion_source_pinned(node->args[i], sets))
 					return true;
 			}
 			return false;
 
-		case RBI_KN_OR:
+		case LION_KN_OR:
 			for (i = 0; i < node->nargs; i++)
 			{
-				if (!rbi_source_pinned(node->args[i], sets))
+				if (!lion_source_pinned(node->args[i], sets))
 					return false;
 			}
 			return true;
@@ -1725,36 +1725,36 @@ rbi_source_pinned(const RBIKeyNode *node, const RBIPostingSet *sets)
  * place the format is written down; nothing outside that file exports them.
  * Keep them in step with it.  The static assertions below pin down the parts
  * of the format that visibilitymapdefs.h does export, which is what the bit
- * twiddling in rbi_vm_allvisible_mask() actually depends on.
+ * twiddling in lion_vm_allvisible_mask() actually depends on.
  */
-#define RBI_VM_MAPSIZE				(BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
-#define RBI_VM_HEAPBLOCKS_PER_BYTE	(BITS_PER_BYTE / BITS_PER_HEAPBLOCK)
-#define RBI_VM_HEAPBLOCKS_PER_PAGE	(RBI_VM_MAPSIZE * RBI_VM_HEAPBLOCKS_PER_BYTE)
-#define RBI_VM_HEAPBLK_TO_MAPBYTE(x) \
-	(((x) % RBI_VM_HEAPBLOCKS_PER_PAGE) / RBI_VM_HEAPBLOCKS_PER_BYTE)
+#define LION_VM_MAPSIZE				(BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
+#define LION_VM_HEAPBLOCKS_PER_BYTE	(BITS_PER_BYTE / BITS_PER_HEAPBLOCK)
+#define LION_VM_HEAPBLOCKS_PER_PAGE	(LION_VM_MAPSIZE * LION_VM_HEAPBLOCKS_PER_BYTE)
+#define LION_VM_HEAPBLK_TO_MAPBYTE(x) \
+	(((x) % LION_VM_HEAPBLOCKS_PER_PAGE) / LION_VM_HEAPBLOCKS_PER_BYTE)
 
 StaticAssertDecl(BITS_PER_HEAPBLOCK == 2,
-				 "roaring_index: the visibility map is no longer two bits per heap block");
+				 "pg_lion: the visibility map is no longer two bits per heap block");
 StaticAssertDecl(VISIBILITYMAP_VALID_BITS == 0x03,
-				 "roaring_index: unexpected visibility map bit assignment");
+				 "pg_lion: unexpected visibility map bit assignment");
 StaticAssertDecl(VISIBILITYMAP_ALL_VISIBLE == 0x01,
-				 "roaring_index: all-visible is no longer the low bit of each pair");
+				 "pg_lion: all-visible is no longer the low bit of each pair");
 /* the masks below are uint64s, one bit per heap block a container covers */
-StaticAssertDecl(RBI_BLOCKS_PER_CONTAINER <= 64,
-				 "roaring_index: a container covers more heap blocks than a mask holds");
+StaticAssertDecl(LION_BLOCKS_PER_CONTAINER <= 64,
+				 "pg_lion: a container covers more heap blocks than a mask holds");
 /*
- * A container's heap blocks start at a multiple of RBI_BLOCKS_PER_CONTAINER,
+ * A container's heap blocks start at a multiple of LION_BLOCKS_PER_CONTAINER,
  * and both that and the number of blocks per map page are multiples of the
- * number of blocks per map byte, so every run of blocks rbi_vm_allvisible_mask()
+ * number of blocks per map byte, so every run of blocks lion_vm_allvisible_mask()
  * reads begins and ends on a byte boundary of the map.
  */
-StaticAssertDecl(RBI_BLOCKS_PER_CONTAINER % RBI_VM_HEAPBLOCKS_PER_BYTE == 0,
-				 "roaring_index: container block range is not map-byte aligned");
-StaticAssertDecl(RBI_VM_HEAPBLOCKS_PER_PAGE % RBI_VM_HEAPBLOCKS_PER_BYTE == 0,
-				 "roaring_index: map page does not hold a whole number of map bytes");
+StaticAssertDecl(LION_BLOCKS_PER_CONTAINER % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
+				 "pg_lion: container block range is not map-byte aligned");
+StaticAssertDecl(LION_VM_HEAPBLOCKS_PER_PAGE % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
+				 "pg_lion: map page does not hold a whole number of map bytes");
 
 /*
- * The all-visible bits of the RBI_BLOCKS_PER_CONTAINER consecutive heap blocks
+ * The all-visible bits of the LION_BLOCKS_PER_CONTAINER consecutive heap blocks
  * a container covers, as one mask: bit i is set iff heap block firstblk + i is
  * marked all-visible.  *vmbuf is the caller's visibility map pin; it is moved
  * to whatever map page is needed and left pinned for the next call, exactly as
@@ -1792,29 +1792,29 @@ StaticAssertDecl(RBI_VM_HEAPBLOCKS_PER_PAGE % RBI_VM_HEAPBLOCKS_PER_BYTE == 0,
  * mask says about them is ever read.
  */
 static uint64
-rbi_vm_allvisible_mask(Relation heap, BlockNumber firstblk, Buffer *vmbuf)
+lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, Buffer *vmbuf)
 {
 	uint64		mask = 0;
 	int			b = 0;
 
-	Assert(firstblk % RBI_BLOCKS_PER_CONTAINER == 0);
+	Assert(firstblk % LION_BLOCKS_PER_CONTAINER == 0);
 
 	/*
-	 * Usually one pass.  RBI_VM_HEAPBLOCKS_PER_PAGE (32672 at 8K) is NOT a
-	 * multiple of RBI_BLOCKS_PER_CONTAINER, so roughly one container in five
+	 * Usually one pass.  LION_VM_HEAPBLOCKS_PER_PAGE (32672 at 8K) is NOT a
+	 * multiple of LION_BLOCKS_PER_CONTAINER, so roughly one container in five
 	 * hundred straddles two map pages and needs two - which is why this is a
 	 * loop and not sixteen bytes read in one go.
 	 */
-	while (b < RBI_BLOCKS_PER_CONTAINER)
+	while (b < LION_BLOCKS_PER_CONTAINER)
 	{
 		BlockNumber blk = firstblk + (BlockNumber) b;
 		int			n;
 
 		/* how many of the blocks still wanted live on blk's map page */
-		n = (int) (RBI_VM_HEAPBLOCKS_PER_PAGE -
-				   (blk % RBI_VM_HEAPBLOCKS_PER_PAGE));
-		n = Min(n, RBI_BLOCKS_PER_CONTAINER - b);
-		Assert(n > 0 && n % RBI_VM_HEAPBLOCKS_PER_BYTE == 0);
+		n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
+				   (blk % LION_VM_HEAPBLOCKS_PER_PAGE));
+		n = Min(n, LION_BLOCKS_PER_CONTAINER - b);
+		Assert(n > 0 && n % LION_VM_HEAPBLOCKS_PER_BYTE == 0);
 
 		/*
 		 * Take the pin the way visibilitymap_get_status() does: same buffer
@@ -1827,8 +1827,8 @@ rbi_vm_allvisible_mask(Relation heap, BlockNumber firstblk, Buffer *vmbuf)
 		if (BufferIsValid(*vmbuf))
 		{
 			const char *map = (const char *) PageGetContents(BufferGetPage(*vmbuf));
-			uint32		mapbyte = RBI_VM_HEAPBLK_TO_MAPBYTE(blk);
-			int			nbytes = n / RBI_VM_HEAPBLOCKS_PER_BYTE;
+			uint32		mapbyte = LION_VM_HEAPBLK_TO_MAPBYTE(blk);
+			int			nbytes = n / LION_VM_HEAPBLOCKS_PER_BYTE;
 			int			j;
 
 			for (j = 0; j < nbytes; j++)
@@ -1841,7 +1841,7 @@ rbi_vm_allvisible_mask(Relation heap, BlockNumber firstblk, Buffer *vmbuf)
 
 				v = (uint8) ((v | (v >> 1)) & 0x33);
 				v = (uint8) ((v | (v >> 2)) & 0x0f);
-				mask |= ((uint64) v) << (b + j * RBI_VM_HEAPBLOCKS_PER_BYTE);
+				mask |= ((uint64) v) << (b + j * LION_VM_HEAPBLOCKS_PER_BYTE);
 			}
 		}
 		/* else the fork stops short of these blocks: none of them is all-visible */
@@ -1857,63 +1857,63 @@ rbi_vm_allvisible_mask(Relation heap, BlockNumber firstblk, Buffer *vmbuf)
  * at least one member, in the same bit numbering.
  *
  * One pass over the container, whatever its representation.  The obvious
- * alternative - rbi_container_range_cardinality() once per block range - is
- * RBI_BLOCKS_PER_CONTAINER binary searches whether the container holds three
+ * alternative - lion_container_range_cardinality() once per block range - is
+ * LION_BLOCKS_PER_CONTAINER binary searches whether the container holds three
  * members or thirty-two thousand, and that cost is paid even when the answer
  * is going to be "all of it is all-visible, count the cardinality".
  */
-#define RBI_BITSET_WORDS_PER_BLOCK	(RBI_BITSET_WORDS / RBI_BLOCKS_PER_CONTAINER)
+#define LION_BITSET_WORDS_PER_BLOCK	(LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER)
 
-StaticAssertDecl(RBI_BITSET_WORDS_PER_BLOCK * RBI_BLOCKS_PER_CONTAINER ==
-				 RBI_BITSET_WORDS,
-				 "roaring_index: bitset words do not divide evenly among heap blocks");
+StaticAssertDecl(LION_BITSET_WORDS_PER_BLOCK * LION_BLOCKS_PER_CONTAINER ==
+				 LION_BITSET_WORDS,
+				 "pg_lion: bitset words do not divide evenly among heap blocks");
 
 static uint64
-rbi_container_block_mask(const RBIContainer *c)
+lion_container_block_mask(const LionContainer *c)
 {
-	const char *payload = (const char *) c + RBI_CONTAINER_HDRSZ;
+	const char *payload = (const char *) c + LION_CONTAINER_HDRSZ;
 	uint64		mask = 0;
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = (const uint16 *) payload;
 
 				for (i = 0; i < c->cardinality; i++)
-					mask |= UINT64CONST(1) << (arr[i] >> RBI_OFFSET_BITS);
+					mask |= UINT64CONST(1) << (arr[i] >> LION_OFFSET_BITS);
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				const uint64 *w = (const uint64 *) payload;
 				int			b;
 
-				for (b = 0; b < RBI_BLOCKS_PER_CONTAINER; b++)
+				for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
 				{
 					uint64		any = 0;
 					int			k;
 
-					for (k = 0; k < RBI_BITSET_WORDS_PER_BLOCK; k++)
-						any |= w[b * RBI_BITSET_WORDS_PER_BLOCK + k];
+					for (k = 0; k < LION_BITSET_WORDS_PER_BLOCK; k++)
+						any |= w[b * LION_BITSET_WORDS_PER_BLOCK + k];
 					if (any != 0)
 						mask |= UINT64CONST(1) << b;
 				}
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
 				uint32		nruns = *(const uint16 *) payload;
-				const RBIRun *runs = (const RBIRun *) (payload + sizeof(uint16));
+				const LionRun *runs = (const LionRun *) (payload + sizeof(uint16));
 
 				for (i = 0; i < nruns; i++)
 				{
-					uint32		first = runs[i].start >> RBI_OFFSET_BITS;
+					uint32		first = runs[i].start >> LION_OFFSET_BITS;
 					uint32		last = (((uint32) runs[i].start +
-										 runs[i].len_minus_1) >> RBI_OFFSET_BITS);
+										 runs[i].len_minus_1) >> LION_OFFSET_BITS);
 
-					Assert(last < RBI_BLOCKS_PER_CONTAINER);
+					Assert(last < LION_BLOCKS_PER_CONTAINER);
 					mask |= (PG_UINT64_MAX >> (63 - last)) &
 						(PG_UINT64_MAX << first);
 				}
@@ -1932,11 +1932,11 @@ rbi_container_block_mask(const RBIContainer *c)
  * reinstates exactly the per-block cost the mask exists to avoid, so timings
  * taken on a cassert cluster want -DRBI_NO_VM_MASK_CHECK.
  */
-#if defined(USE_ASSERT_CHECKING) && !defined(RBI_NO_VM_MASK_CHECK)
-#define RBI_VM_MASK_CHECK 1
+#if defined(USE_ASSERT_CHECKING) && !defined(LION_NO_VM_MASK_CHECK)
+#define LION_VM_MASK_CHECK 1
 #endif
 
-#ifdef RBI_VM_MASK_CHECK
+#ifdef LION_VM_MASK_CHECK
 /*
  * visibilitymap_get_status() for every block that has members - the only bits
  * of the mask the count looks at - must agree with the mask.
@@ -1947,7 +1947,7 @@ rbi_container_block_mask(const RBIContainer *c)
  * keeps this assertion from being a race.
  */
 static void
-rbi_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
+lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 				  uint64 allvis, Buffer *vmbuf)
 {
 	uint64		expect = 0;
@@ -1963,7 +1963,7 @@ rbi_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 			expect |= UINT64CONST(1) << b;
 	}
 
-	if (rbi_vm_allvisible_mask(heap, firstblk, vmbuf) == allvis)
+	if (lion_vm_allvisible_mask(heap, firstblk, vmbuf) == allvis)
 		Assert((allvis & members) == expect);
 }
 #endif
@@ -1976,22 +1976,22 @@ rbi_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
  * One heap page's answer: which of its root line pointers hold a tuple
  * visible to the snapshot the cache was filled under.  Bit (off - 1) stands
  * for offset number off; offsets above MaxHeapTuplesPerPage cannot exist on a
- * heap page and are never asked about (rbi_vis_entry_visible() says no).
+ * heap page and are never asked about (lion_vis_entry_visible() says no).
  *
  * 291 bits at the default page size, so 40 bytes of bitmap and 48 of entry.
  */
-#define RBI_VIS_WORDS	(((MaxHeapTuplesPerPage - 1) / 64) + 1)
+#define LION_VIS_WORDS	(((MaxHeapTuplesPerPage - 1) / 64) + 1)
 
-typedef struct RBIVisEntry
+typedef struct LionVisEntry
 {
 	BlockNumber blkno;			/* hash key: the heap block */
 	bool		filled;			/* false: only the visit was recorded */
 	char		status;			/* simplehash's own field */
-	uint64		vis[RBI_VIS_WORDS];
-} RBIVisEntry;
+	uint64		vis[LION_VIS_WORDS];
+} LionVisEntry;
 
-#define SH_PREFIX		rbi_visht
-#define SH_ELEMENT_TYPE RBIVisEntry
+#define SH_PREFIX		lion_visht
+#define SH_ELEMENT_TYPE LionVisEntry
 #define SH_KEY_TYPE		BlockNumber
 #define SH_KEY			blkno
 #define SH_HASH_KEY(tb, key)	murmurhash32(key)
@@ -2008,10 +2008,10 @@ typedef struct RBIVisEntry
  * something else (DESIGN.md §16 walks the partitions of one count one at a
  * time, which is exactly that case).
  */
-struct RBIVisCache
+struct LionVisCache
 {
 	MemoryContext cxt;			/* holds ht and nothing else */
-	rbi_visht_hash *ht;
+	lion_visht_hash *ht;
 	Oid			relid;			/* relation the entries belong to */
 	Snapshot	snapshot;		/* snapshot they were resolved under ... */
 	TransactionId xmin;			/* ... and enough of its identity to notice */
@@ -2032,10 +2032,10 @@ struct RBIVisCache
  * below work_mem, which is the promise the GUC makes.
  */
 static int
-rbi_vis_cache_budget(void)
+lion_vis_cache_budget(void)
 {
 	int64		budget = ((int64) work_mem * INT64CONST(1024)) /
-		((int64) sizeof(RBIVisEntry) * 3);
+		((int64) sizeof(LionVisEntry) * 3);
 
 	if (budget < 64)
 		budget = 64;			/* a tiny work_mem still caches something */
@@ -2044,20 +2044,20 @@ rbi_vis_cache_budget(void)
 	return (int) budget;
 }
 
-RBIVisCache *
-rbi_vis_cache_create(MemoryContext parent)
+LionVisCache *
+lion_vis_cache_create(MemoryContext parent)
 {
-	RBIVisCache *cache;
+	LionVisCache *cache;
 
-	cache = (RBIVisCache *) MemoryContextAllocZero(parent, sizeof(RBIVisCache));
+	cache = (LionVisCache *) MemoryContextAllocZero(parent, sizeof(LionVisCache));
 	cache->cxt = AllocSetContextCreate(parent,
-									   "RoaringCount visibility cache",
+									   "LionCount visibility cache",
 									   ALLOCSET_SMALL_SIZES);
 	return cache;
 }
 
 void
-rbi_vis_cache_reset(RBIVisCache *cache)
+lion_vis_cache_reset(LionVisCache *cache)
 {
 	if (cache == NULL)
 		return;
@@ -2070,7 +2070,7 @@ rbi_vis_cache_reset(RBIVisCache *cache)
 }
 
 void
-rbi_vis_cache_destroy(RBIVisCache *cache)
+lion_vis_cache_destroy(LionVisCache *cache)
 {
 	if (cache == NULL)
 		return;
@@ -2091,10 +2091,10 @@ rbi_vis_cache_destroy(RBIVisCache *cache)
  * for the whole node execution, so the object it hands us cannot be freed and
  * replaced underneath it; two distinct snapshots with the same pointer, xmin,
  * xmax and curcid could still differ in their in-progress list.  A caller
- * that wants a different snapshot must call rbi_vis_cache_reset().
+ * that wants a different snapshot must call lion_vis_cache_reset().
  */
 static void
-rbi_vis_cache_begin(RBIVisCache *cache, Relation heap, Snapshot snapshot)
+lion_vis_cache_begin(LionVisCache *cache, Relation heap, Snapshot snapshot)
 {
 	if (cache == NULL || snapshot == NULL)
 		return;
@@ -2105,7 +2105,7 @@ rbi_vis_cache_begin(RBIVisCache *cache, Relation heap, Snapshot snapshot)
 		cache->xmax != snapshot->xmax ||
 		cache->curcid != snapshot->curcid)
 	{
-		rbi_vis_cache_reset(cache);
+		lion_vis_cache_reset(cache);
 		cache->relid = RelationGetRelid(heap);
 		cache->snapshot = snapshot;
 		cache->xmin = snapshot->xmin;
@@ -2113,13 +2113,13 @@ rbi_vis_cache_begin(RBIVisCache *cache, Relation heap, Snapshot snapshot)
 		cache->curcid = snapshot->curcid;
 	}
 
-	cache->maxentries = rbi_vis_cache_budget();
+	cache->maxentries = lion_vis_cache_budget();
 	if (cache->ncounts < INT_MAX)
 		cache->ncounts++;
 }
 
 static inline bool
-rbi_vis_entry_visible(const RBIVisEntry *e, OffsetNumber off)
+lion_vis_entry_visible(const LionVisEntry *e, OffsetNumber off)
 {
 	int			bit = (int) off - 1;
 
@@ -2134,10 +2134,10 @@ rbi_vis_entry_visible(const RBIVisEntry *e, OffsetNumber off)
  * WHY A CACHED ANSWER IS STILL THE RIGHT ANSWER (this is the whole point of
  * the cache, so it is argued here rather than in DESIGN.md alone)
  * ---------------------------------------------------------------------------
- * The cache is consulted in exactly one place, rbi_recheck_heap_heap(), which
+ * The cache is consulted in exactly one place, lion_recheck_heap_heap(), which
  * is where a TID that the visibility map could not answer for is resolved
  * against the snapshot.  The §9 pin rule is untouched: the visibility-map
- * question is still asked in rbi_count_container() while the index page is
+ * question is still asked in lion_count_container() while the index page is
  * pinned, and only the TIDs it could not answer reach this code.  What is
  * claimed here is narrower: that
  *
@@ -2174,7 +2174,7 @@ rbi_vis_entry_visible(const RBIVisEntry *e, OffsetNumber off)
  *
  * Serializable isolation needs one addition, because a cache hit calls
  * neither HeapCheckForSerializableConflictOut() nor PredicateLockTID():
- * rbi_vis_fill_page() takes PredicateLockPage() for the block it resolves.
+ * lion_vis_fill_page() takes PredicateLockPage() for the block it resolves.
  * That covers every later hit, and the two directions of rw-conflict
  * detection are then both closed: a write that happened BEFORE we resolved
  * the page is caught by the conflict-out check inside the sweep (which walks
@@ -2182,12 +2182,12 @@ rbi_vis_entry_visible(const RBIVisEntry *e, OffsetNumber off)
  * recheck would have), and a write AFTER it is caught by the writer's own
  * CheckForSerializableConflictIn() against that page lock.
  */
-static RBIVisEntry *
-rbi_vis_cache_lookup(RBICountCtx *cx, BlockNumber blkno)
+static LionVisEntry *
+lion_vis_cache_lookup(LionCountCtx *cx, BlockNumber blkno)
 {
 	if (cx->cache == NULL || cx->cache->ht == NULL)
 		return NULL;
-	return rbi_visht_lookup(cx->cache->ht, blkno);
+	return lion_visht_lookup(cx->cache->ht, blkno);
 }
 
 /*
@@ -2208,10 +2208,10 @@ rbi_vis_cache_lookup(RBICountCtx *cx, BlockNumber blkno)
  * Called BEFORE the page is read, so that the hash table's allocations never
  * happen under a buffer content lock.
  */
-static RBIVisEntry *
-rbi_vis_cache_prepare(RBICountCtx *cx, BlockNumber blkno, RBIVisEntry *e)
+static LionVisEntry *
+lion_vis_cache_prepare(LionCountCtx *cx, BlockNumber blkno, LionVisEntry *e)
 {
-	RBIVisCache *cache = cx->cache;
+	LionVisCache *cache = cx->cache;
 	bool		found;
 
 	if (cache == NULL || cache->ncounts < 2)
@@ -2221,7 +2221,7 @@ rbi_vis_cache_prepare(RBICountCtx *cx, BlockNumber blkno, RBIVisEntry *e)
 		return e;				/* second visit: resolve the whole page */
 
 	if (cache->ht == NULL)
-		cache->ht = rbi_visht_create(cache->cxt, 256, NULL);
+		cache->ht = lion_visht_create(cache->cxt, 256, NULL);
 	else if (cache->full ||
 			 cache->ht->members >= (uint64) cache->maxentries)
 	{
@@ -2232,7 +2232,7 @@ rbi_vis_cache_prepare(RBICountCtx *cx, BlockNumber blkno, RBIVisEntry *e)
 	}
 
 	/* First visit: remember only that it happened. */
-	e = rbi_visht_insert(cache->ht, blkno, &found);
+	e = lion_visht_insert(cache->ht, blkno, &found);
 	Assert(!found);
 	e->filled = false;
 	return NULL;
@@ -2243,8 +2243,8 @@ rbi_vis_cache_prepare(RBICountCtx *cx, BlockNumber blkno, RBIVisEntry *e)
  * share locked, into *e.
  */
 static void
-rbi_vis_fill_page(RBICountCtx *cx, Buffer buf, BlockNumber blkno,
-				  RBIVisEntry *e)
+lion_vis_fill_page(LionCountCtx *cx, Buffer buf, BlockNumber blkno,
+				  LionVisEntry *e)
 {
 	Page		page = BufferGetPage(buf);
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
@@ -2278,7 +2278,7 @@ rbi_vis_fill_page(RBICountCtx *cx, Buffer buf, BlockNumber blkno,
 	/*
 	 * Later hits on this block do no per-tuple predicate locking, so lock the
 	 * page once now, the way an index-only scan does for a block it skips
-	 * (see the argument on rbi_vis_cache_lookup()).
+	 * (see the argument on lion_vis_cache_lookup()).
 	 */
 	if (cx->serializable)
 		PredicateLockPage(cx->heap, blkno, cx->snapshot);
@@ -2289,12 +2289,12 @@ rbi_vis_fill_page(RBICountCtx *cx, Buffer buf, BlockNumber blkno,
  * Counting one container
  * --------------------------------------------------------------------- */
 
-typedef struct RBIRecheckCollector
+typedef struct LionRecheckCollector
 {
-	RBICountCtx *cx;
+	LionCountCtx *cx;
 	uint32		ckey;
-	const bool *needrecheck;	/* RBI_BLOCKS_PER_CONTAINER entries */
-} RBIRecheckCollector;
+	const bool *needrecheck;	/* LION_BLOCKS_PER_CONTAINER entries */
+} LionRecheckCollector;
 
 /*
  * How many TIDs one recheck batch may hold (DESIGN.md §9).
@@ -2307,24 +2307,24 @@ typedef struct RBIRecheckCollector
  * one node keep", so it is the budget here too.
  */
 static int
-rbi_recheck_budget(void)
+lion_recheck_budget(void)
 {
 	int64		budget = ((int64) work_mem * INT64CONST(1024)) /
 		(int64) sizeof(ItemPointerData);
 
-	if (budget < RBI_RECHECK_MIN_BATCH)
-		budget = RBI_RECHECK_MIN_BATCH;
-	if (budget > RBI_RECHECK_MAX_BATCH)
-		budget = RBI_RECHECK_MAX_BATCH;
+	if (budget < LION_RECHECK_MIN_BATCH)
+		budget = LION_RECHECK_MIN_BATCH;
+	if (budget > LION_RECHECK_MAX_BATCH)
+		budget = LION_RECHECK_MAX_BATCH;
 	return (int) budget;
 }
 
 static void
-rbi_recheck_add(RBICountCtx *cx, uint64 code)
+lion_recheck_add(LionCountCtx *cx, uint64 code)
 {
 	ItemPointerData tid;
 
-	rbi_code_to_tid(code, &tid);
+	lion_code_to_tid(code, &tid);
 
 	/*
 	 * Bounded batches.  When the list is full, recheck what it holds right
@@ -2356,18 +2356,18 @@ rbi_recheck_add(RBICountCtx *cx, uint64 code)
 		(!cx->tids_sorted ||
 		 ItemPointerGetBlockNumber(&cx->tids[cx->ntids - 1]) !=
 		 ItemPointerGetBlockNumber(&tid)))
-		rbi_recheck_flush(cx);
+		lion_recheck_flush(cx);
 
 	if (cx->ntids >= cx->maxtids)
 	{
 		int			newmax;
 
 		if (cx->maxtids == 0)
-			newmax = Min(RBI_RECHECK_INIT_TIDS, cx->batchmax);
+			newmax = Min(LION_RECHECK_INIT_TIDS, cx->batchmax);
 		else if (cx->maxtids < cx->batchmax)
 			newmax = Min(cx->maxtids * 2, cx->batchmax);
 		else
-			newmax = cx->maxtids + RBI_RECHECK_GROW_TIDS;	/* a long block */
+			newmax = cx->maxtids + LION_RECHECK_GROW_TIDS;	/* a long block */
 
 		if (cx->tids == NULL)
 			cx->tids = (ItemPointerData *)
@@ -2383,7 +2383,7 @@ rbi_recheck_add(RBICountCtx *cx, uint64 code)
 	/*
 	 * The list is built in ckey order, and inside a container in ascending lo
 	 * order, so it comes out sorted by (block, offset) - which is what lets
-	 * rbi_recheck_heap() process it one heap block at a time.  Verify rather
+	 * lion_recheck_heap() process it one heap block at a time.  Verify rather
 	 * than assume: one comparison per TID buys the right to skip the sort.
 	 */
 	if (cx->ntids > 0 &&
@@ -2394,16 +2394,16 @@ rbi_recheck_add(RBICountCtx *cx, uint64 code)
 }
 
 static bool
-rbi_recheck_cb(uint16 lo, void *arg)
+lion_recheck_cb(uint16 lo, void *arg)
 {
-	RBIRecheckCollector *rc = (RBIRecheckCollector *) arg;
+	LionRecheckCollector *rc = (LionRecheckCollector *) arg;
 	uint16		blkinc;
 	OffsetNumber off;
 
-	rbi_lo_split(lo, &blkinc, &off);
-	Assert(blkinc < RBI_BLOCKS_PER_CONTAINER);
+	lion_lo_split(lo, &blkinc, &off);
+	Assert(blkinc < LION_BLOCKS_PER_CONTAINER);
 	if (rc->needrecheck[blkinc])
-		rbi_recheck_add(rc->cx, rbi_make_code(rc->ckey, lo));
+		lion_recheck_add(rc->cx, lion_make_code(rc->ckey, lo));
 
 	return true;
 }
@@ -2427,10 +2427,10 @@ rbi_recheck_cb(uint16 lo, void *arg)
  * step (1) would count dead tuples.
  */
 static void
-rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
-					RBIExprCursor *cursors, int nsources)
+lion_count_container(LionCountCtx *cx, const LionContainer *c,
+					LionExprCursor *cursors, int nsources)
 {
-	BlockNumber firstblk = rbi_ckey_first_block(c->ckey);
+	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
 	uint64		members;		/* blocks of this container that have members */
 	uint64		allvis;			/* blocks marked all-visible in the VM */
 	uint64		dirty;			/* blocks with members that need a heap recheck */
@@ -2443,7 +2443,7 @@ rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
 	 * on the cleanup lock; test/isolation/count_vacuum_race.spec proves it.
 	 * Compiles to nothing without --enable-injection-points.
 	 */
-	INJECTION_POINT("roaring-count-containers-pinned", NULL);
+	INJECTION_POINT("lion-count-containers-pinned", NULL);
 
 	/*
 	 * One pass over the container and one read of the visibility map for all
@@ -2452,16 +2452,16 @@ rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
 	 * tuple being visible to *this* snapshot.  The map read is unlocked and
 	 * may be slightly stale in the "bit was just cleared" direction, which is
 	 * harmless for the same reason it is harmless for index-only scans (see
-	 * visibilitymap_get_status and rbi_vm_allvisible_mask).
+	 * visibilitymap_get_status and lion_vm_allvisible_mask).
 	 */
-	members = rbi_container_block_mask(c);
+	members = lion_container_block_mask(c);
 	if (cx->in_recovery)
-		allvis = 0;				/* see rbi_count_sources(): no interlock on a standby */
+		allvis = 0;				/* see lion_count_sources(): no interlock on a standby */
 	else
 	{
-		allvis = rbi_vm_allvisible_mask(cx->heap, firstblk, &cx->vmbuf);
-#ifdef RBI_VM_MASK_CHECK
-		rbi_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
+		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, &cx->vmbuf);
+#ifdef LION_VM_MASK_CHECK
+		lion_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
 #endif
 	}
 	dirty = members & ~allvis;
@@ -2469,37 +2469,37 @@ rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
 	if (dirty == 0)
 	{
 		/* The common case on a vacuumed table: O(1) per container. */
-		cx->count += rbi_container_cardinality(c);
+		cx->count += lion_container_cardinality(c);
 		cx->stats.blocks_skipped_via_vm += pg_popcount64(members);
 	}
 	else
 	{
-		bool		needrecheck[RBI_BLOCKS_PER_CONTAINER];
+		bool		needrecheck[LION_BLOCKS_PER_CONTAINER];
 		uint32		dirty_members = 0;
 		uint64		m = dirty;
-		RBIRecheckCollector rc;
+		LionRecheckCollector rc;
 
 		memset(needrecheck, 0, sizeof(needrecheck));
 		while (m != 0)
 		{
 			int			b = pg_rightmost_one_pos64(m);
-			uint16		lo_start = (uint16) (b << RBI_OFFSET_BITS);
-			uint16		lo_end = (uint16) (lo_start + RBI_MAX_OFFSET);
+			uint16		lo_start = (uint16) (b << LION_OFFSET_BITS);
+			uint16		lo_end = (uint16) (lo_start + LION_MAX_OFFSET);
 
 			m &= m - 1;
 			needrecheck[b] = true;
-			dirty_members += rbi_container_range_cardinality(c, lo_start, lo_end);
+			dirty_members += lion_container_range_cardinality(c, lo_start, lo_end);
 		}
-		Assert(dirty_members <= rbi_container_cardinality(c));
+		Assert(dirty_members <= lion_container_cardinality(c));
 
-		cx->count += rbi_container_cardinality(c) - dirty_members;
+		cx->count += lion_container_cardinality(c) - dirty_members;
 		cx->stats.blocks_skipped_via_vm += pg_popcount64(members & allvis);
 
 		/* Queue the members of the non-all-visible blocks for a heap recheck. */
 		rc.cx = cx;
 		rc.ckey = c->ckey;
 		rc.needrecheck = needrecheck;
-		rbi_container_iterate(c, rbi_recheck_cb, &rc);
+		lion_container_iterate(c, lion_recheck_cb, &rc);
 	}
 
 	/*
@@ -2523,19 +2523,19 @@ rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
 	/*
 	 * DESIGN.md section 9: every heap block of *c has now been checked
 	 * against the visibility map, so - and only now - the pins on the pages
-	 * the source containers came from may be released.  rbi_ecursor_next() is
+	 * the source containers came from may be released.  lion_ecursor_next() is
 	 * what releases them, and only the sources that contributed to *c (the
 	 * ones the merge flagged) move on.
 	 */
 	for (i = 0; i < nsources; i++)
 	{
 		if (cursors[i].advance)
-			rbi_ecursor_next(&cursors[i]);
+			lion_ecursor_next(&cursors[i]);
 	}
 }
 
 static int
-rbi_tid_cmp(const void *a, const void *b)
+lion_tid_cmp(const void *a, const void *b)
 {
 	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
 }
@@ -2543,7 +2543,7 @@ rbi_tid_cmp(const void *a, const void *b)
 /*
  * Recheck through the table AM, one TID at a time.  This is the portable
  * path; table_fetch_tid() pins, share-locks and unpins the block for every
- * TID, which is what rbi_recheck_heap_heap() avoids for the heap AM.
+ * TID, which is what lion_recheck_heap_heap() avoids for the heap AM.
  *
  * The TIDs come from an index, so each one is the root of a HOT chain, which
  * is exactly what table_fetch_tid() expects: it walks the chain and reports
@@ -2556,7 +2556,7 @@ rbi_tid_cmp(const void *a, const void *b)
  * table_fetch_tid() is its direct replacement for TID-at-a-time lookups.)
  */
 static int64
-rbi_recheck_heap_am(RBICountCtx *cx)
+lion_recheck_heap_am(LionCountCtx *cx)
 {
 	int64		visible = 0;
 	BlockNumber lastblk = InvalidBlockNumber;
@@ -2608,7 +2608,7 @@ rbi_recheck_heap_am(RBICountCtx *cx)
  *	  tests and PredicateLockTID() on the one it returns, so a SERIALIZABLE
  *	  transaction takes exactly the tuple-level predicate locks it would have
  *	  taken through the table AM.  (The all-visible blocks we never look at
- *	  are predicate-locked page-wise in rbi_count_container(), as an
+ *	  are predicate-locked page-wise in lion_count_container(), as an
  *	  index-only scan does.)
  *
  * all_dead is passed as NULL, as the table_fetch_tid() call it replaces did:
@@ -2618,11 +2618,11 @@ rbi_recheck_heap_am(RBICountCtx *cx)
  * The per-query visibility cache sits here and nowhere else: a block whose
  * answer is already known is served from the bitmap with no buffer access at
  * all, and the blocks that are left are fetched once each, as they always
- * were.  rbi_vis_cache_lookup() carries the argument for why a remembered
+ * were.  lion_vis_cache_lookup() carries the argument for why a remembered
  * answer is still the right one.
  */
 static int64
-rbi_recheck_heap_heap(RBICountCtx *cx)
+lion_recheck_heap_heap(LionCountCtx *cx)
 {
 	int64		visible = 0;
 	int			i = 0;
@@ -2630,7 +2630,7 @@ rbi_recheck_heap_heap(RBICountCtx *cx)
 	while (i < cx->ntids)
 	{
 		BlockNumber blk = ItemPointerGetBlockNumber(&cx->tids[i]);
-		RBIVisEntry *e = rbi_vis_cache_lookup(cx, blk);
+		LionVisEntry *e = lion_vis_cache_lookup(cx, blk);
 		Buffer		buf;
 
 		/* Already resolved: no ReadBuffer, no content lock, no heap at all. */
@@ -2639,7 +2639,7 @@ rbi_recheck_heap_heap(RBICountCtx *cx)
 			cx->stats.cache_hits++;
 			do
 			{
-				if (rbi_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
+				if (lion_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
 					visible++;
 				i++;
 			} while (i < cx->ntids &&
@@ -2650,7 +2650,7 @@ rbi_recheck_heap_heap(RBICountCtx *cx)
 		}
 
 		/* Decide (and allocate) before the page is locked. */
-		e = rbi_vis_cache_prepare(cx, blk, e);
+		e = lion_vis_cache_prepare(cx, blk, e);
 
 		buf = ReadBuffer(cx->heap, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2659,10 +2659,10 @@ rbi_recheck_heap_heap(RBICountCtx *cx)
 		if (e != NULL)
 		{
 			/* Resolve the whole page once, then read this count's TIDs off. */
-			rbi_vis_fill_page(cx, buf, blk, e);
+			lion_vis_fill_page(cx, buf, blk, e);
 			do
 			{
-				if (rbi_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
+				if (lion_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
 					visible++;
 				i++;
 			} while (i < cx->ntids &&
@@ -2697,7 +2697,7 @@ rbi_recheck_heap_heap(RBICountCtx *cx)
  * Visit the heap for the TIDs of blocks that were not all-visible.
  */
 static int64
-rbi_recheck_heap(RBICountCtx *cx)
+lion_recheck_heap(LionCountCtx *cx)
 {
 	int64		visible;
 
@@ -2706,15 +2706,15 @@ rbi_recheck_heap(RBICountCtx *cx)
 
 	/*
 	 * Both paths below want the list in (block, offset) order; it is produced
-	 * that way, and rbi_recheck_add() checks that it was.
+	 * that way, and lion_recheck_add() checks that it was.
 	 */
 	if (!cx->tids_sorted)
-		qsort(cx->tids, cx->ntids, sizeof(ItemPointerData), rbi_tid_cmp);
+		qsort(cx->tids, cx->ntids, sizeof(ItemPointerData), lion_tid_cmp);
 
 	if (cx->heap->rd_tableam == GetHeapamTableAmRoutine())
-		visible = rbi_recheck_heap_heap(cx);
+		visible = lion_recheck_heap_heap(cx);
 	else
-		visible = rbi_recheck_heap_am(cx);
+		visible = lion_recheck_heap_am(cx);
 
 	cx->stats.tids_rechecked += cx->ntids;
 	return visible;
@@ -2722,16 +2722,16 @@ rbi_recheck_heap(RBICountCtx *cx)
 
 /*
  * Recheck the batch accumulated so far and empty the list.  Called from
- * rbi_recheck_add() whenever the budget is reached (the safety argument is
+ * lion_recheck_add() whenever the budget is reached (the safety argument is
  * there) and once more when the merge is over.
  */
 static void
-rbi_recheck_flush(RBICountCtx *cx)
+lion_recheck_flush(LionCountCtx *cx)
 {
 	if (cx->ntids == 0)
 		return;
 
-	cx->recheck_count += rbi_recheck_heap(cx);
+	cx->recheck_count += lion_recheck_heap(cx);
 	cx->ntids = 0;
 	cx->tids_sorted = true;
 }
@@ -2742,24 +2742,24 @@ rbi_recheck_flush(RBICountCtx *cx)
  * --------------------------------------------------------------------- */
 
 int64
-rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
-				  RBICountSource *sources, RBICountStats *stats)
+lion_count_sources(Relation heap, Snapshot snapshot, int nsources,
+				  LionCountSource *sources, LionCountStats *stats)
 {
-	return rbi_count_sources_cached(heap, snapshot, nsources, sources, stats,
+	return lion_count_sources_cached(heap, snapshot, nsources, sources, stats,
 									NULL);
 }
 
 int64
-rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
-						 RBICountSource *sources, RBICountStats *stats,
-						 RBIVisCache *cache)
+lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
+						 LionCountSource *sources, LionCountStats *stats,
+						 LionVisCache *cache)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;
-	RBICountCtx cx;
-	RBIExprCursor *cursors;
-	RBIKeyNode **trees;
-	RBIContainer *work[2];
+	LionCountCtx cx;
+	LionExprCursor *cursors;
+	LionKeyNode **trees;
+	LionContainer *work[2];
 	int64		result;
 	int			ncarry;
 	bool	   *carry;
@@ -2774,28 +2774,28 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 * positive source that cannot makes the whole intersection empty, and a
 	 * negated one that cannot simply subtracts nothing.
 	 */
-	trees = (RBIKeyNode **) palloc0(sizeof(RBIKeyNode *) * nsources);
+	trees = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * nsources);
 	for (i = 0; i < nsources; i++)
 	{
-		trees[i] = rbi_source_tree(&sources[i]);
+		trees[i] = lion_source_tree(&sources[i]);
 
 		if (sources[i].negated)
 			continue;
 		npositive++;
-		if (!rbi_source_satisfiable(trees[i], sources[i].sets))
+		if (!lion_source_satisfiable(trees[i], sources[i].sets))
 			return 0;
 	}
 	if (npositive == 0)
-		elog(ERROR, "roaring index count needs at least one positive source");
+		elog(ERROR, "lion index count needs at least one positive source");
 
 	/*
 	 * Decide which sets to serve from a private copy this time (DESIGN.md
-	 * section 9; the argument is on rbi_posting_set_materialize()).
+	 * section 9; the argument is on lion_posting_set_materialize()).
 	 *
 	 * Two rules, and the safety of the whole thing rests on the second:
 	 *
 	 *	1. only a set that has been counted before, which in practice means
-	 *	   the WHERE sets of the GROUP BY path in rbi_customscan.c, where the
+	 *	   the WHERE sets of the GROUP BY path in lion_customscan.c, where the
 	 *	   same sets are intersected with every group in turn and walking
 	 *	   their chains again per group is the dominant cost.  A one-shot
 	 *	   count never pays for a copy it would use once.
@@ -2807,7 +2807,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 *	   on this index, and therefore from having set all-visible on any
 	 *	   heap page at all.  One source is enough, but there must be one, and
 	 *	   it has to be a positive one that holds a pin at EVERY container key
-	 *	   it yields, which is what rbi_source_pinned() decides.
+	 *	   it yields, which is what lion_source_pinned() decides.
 	 *
 	 * A negated set may always be copied: a stale copy can only hold TIDs
 	 * whose rows are dead (a live row's key cannot change without the row
@@ -2826,7 +2826,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 
 		if (sources[i].negated)
 			continue;
-		carry[i] = rbi_source_pinned(trees[i], sources[i].sets);
+		carry[i] = lion_source_pinned(trees[i], sources[i].sets);
 		if (carry[i])
 			ncarry++;
 	}
@@ -2836,7 +2836,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	{
 		for (j = 0; j < sources[i].nsets; j++)
 		{
-			RBIPostingSet *ps = &sources[i].sets[j];
+			LionPostingSet *ps = &sources[i].sets[j];
 
 			if (!ps->found)
 				continue;
@@ -2846,12 +2846,12 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 				continue;		/* rule 1 */
 			if (!sources[i].negated && carry[i] && ncarry <= 1)
 				continue;		/* rule 2: this is the last interlock */
-			if (ps->ncontainers > RBI_MATERIALIZE_MAX_CONTAINERS &&
-				ps->ntids > RBI_MATERIALIZE_MAX_BYTES / sizeof(uint16))
+			if (ps->ncontainers > LION_MATERIALIZE_MAX_CONTAINERS &&
+				ps->ntids > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16))
 				continue;		/* hopeless even as an ARRAY of members */
 
-			if (rbi_posting_set_materialize(ps) && !sources[i].negated &&
-				carry[i] && !rbi_source_pinned(trees[i], sources[i].sets))
+			if (lion_posting_set_materialize(ps) && !sources[i].negated &&
+				carry[i] && !lion_source_pinned(trees[i], sources[i].sets))
 			{
 				carry[i] = false;
 				ncarry--;
@@ -2861,7 +2861,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	Assert(ncarry > 0);
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
-								"roaring index count",
+								"lion index count",
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
@@ -2883,7 +2883,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.in_recovery = RecoveryInProgress();
 	cx.tids_sorted = true;
-	cx.batchmax = rbi_recheck_budget();
+	cx.batchmax = lion_recheck_budget();
 
 	/*
 	 * The visibility cache, if the caller keeps one for this node execution.
@@ -2891,15 +2891,15 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 * snapshot, so a partitioned count may hand the same handle to every
 	 * partition (DESIGN.md §9 and §16).
 	 */
-	rbi_vis_cache_begin(cache, heap, snapshot);
+	lion_vis_cache_begin(cache, heap, snapshot);
 	cx.cache = cache;
 
-	cursors = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * nsources);
-	work[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
-	work[1] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	cursors = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * nsources);
+	work[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	work[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
 	for (i = 0; i < nsources; i++)
-		rbi_ecursor_init(&cursors[i], trees[i], sources[i].sets,
+		lion_ecursor_init(&cursors[i], trees[i], sources[i].sets,
 						 sources[i].nsets, &cx);
 
 	/*
@@ -2912,7 +2912,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 		uint32		maxckey = 0;
 		bool		havemax = false;
 		bool		alleq = true;
-		const RBIContainer *acc = NULL;
+		const LionContainer *acc = NULL;
 		int			w = 0;
 
 		/* The positive sources drive the merge; all must still have data. */
@@ -2946,7 +2946,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 			for (i = 0; i < nsources; i++)
 			{
 				if (!sources[i].negated && cursors[i].ckey < maxckey)
-					rbi_ecursor_next(&cursors[i]);
+					lion_ecursor_next(&cursors[i]);
 			}
 			CHECK_FOR_INTERRUPTS();
 			continue;
@@ -2962,7 +2962,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 				acc = cursors[i].cur;
 			else
 			{
-				rbi_container_and(acc, cursors[i].cur, work[w]);
+				lion_container_and(acc, cursors[i].cur, work[w]);
 				acc = work[w];
 				w ^= 1;
 			}
@@ -2974,21 +2974,21 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 			if (!sources[i].negated)
 				continue;
 			while (cursors[i].valid && cursors[i].ckey < maxckey)
-				rbi_ecursor_next(&cursors[i]);	/* nothing to subtract there */
+				lion_ecursor_next(&cursors[i]);	/* nothing to subtract there */
 			if (!cursors[i].valid || cursors[i].ckey != maxckey)
 				continue;
 
 			cursors[i].advance = true;
-			if (rbi_container_cardinality(acc) > 0)
+			if (lion_container_cardinality(acc) > 0)
 			{
-				rbi_container_andnot(acc, cursors[i].cur, work[w]);
+				lion_container_andnot(acc, cursors[i].cur, work[w]);
 				acc = work[w];
 				w ^= 1;
 			}
 		}
 
-		if (rbi_container_cardinality(acc) > 0)
-			rbi_count_container(&cx, acc, cursors, nsources);
+		if (lion_container_cardinality(acc) > 0)
+			lion_count_container(&cx, acc, cursors, nsources);
 		else
 		{
 			/*
@@ -2998,7 +2998,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 			for (i = 0; i < nsources; i++)
 			{
 				if (cursors[i].advance)
-					rbi_ecursor_next(&cursors[i]);
+					lion_ecursor_next(&cursors[i]);
 			}
 		}
 		CHECK_FOR_INTERRUPTS();
@@ -3006,7 +3006,7 @@ rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 
 merge_done:
 	for (i = 0; i < nsources; i++)
-		rbi_ecursor_close(&cursors[i]);
+		lion_ecursor_close(&cursors[i]);
 
 	/*
 	 * Everything that could be answered from the visibility map has been;
@@ -3014,7 +3014,7 @@ merge_done:
 	 * index page is pinned any more, which is fine: the decisions that needed
 	 * a pin were all made above.
 	 */
-	rbi_recheck_flush(&cx);
+	lion_recheck_flush(&cx);
 	result = cx.count + cx.recheck_count;
 
 	if (BufferIsValid(cx.vmbuf))
@@ -3037,16 +3037,16 @@ merge_done:
 }
 
 bool
-rbi_sets_satisfiable(int nsets, RBIPostingSet *sets, RBIKeyNode *tree)
+lion_sets_satisfiable(int nsets, LionPostingSet *sets, LionKeyNode *tree)
 {
-	RBICountSource src;
+	LionCountSource src;
 
 	memset(&src, 0, sizeof(src));
 	src.nsets = nsets;
 	src.sets = sets;
 	src.tree = tree;
 
-	return rbi_source_satisfiable(rbi_source_tree(&src), sets);
+	return lion_source_satisfiable(lion_source_tree(&src), sets);
 }
 
 /*
@@ -3058,13 +3058,13 @@ rbi_sets_satisfiable(int nsets, RBIPostingSet *sets, RBIKeyNode *tree)
  * why the very same evaluator serves both.
  */
 int64
-rbi_sets_iterate(int nsets, RBIPostingSet *sets, RBIKeyNode *tree,
-				 rbi_container_callback cb, void *arg)
+lion_sets_iterate(int nsets, LionPostingSet *sets, LionKeyNode *tree,
+				 lion_container_callback cb, void *arg)
 {
-	RBICountSource src;
-	RBIExprCursor cursor;
-	RBICountCtx cx;
-	RBIKeyNode *node;
+	LionCountSource src;
+	LionExprCursor cursor;
+	LionCountCtx cx;
+	LionKeyNode *node;
 	int64		total = 0;
 
 	memset(&src, 0, sizeof(src));
@@ -3072,25 +3072,25 @@ rbi_sets_iterate(int nsets, RBIPostingSet *sets, RBIKeyNode *tree,
 	src.sets = sets;
 	src.tree = tree;
 
-	node = rbi_source_tree(&src);
+	node = lion_source_tree(&src);
 	if (node == NULL)
 		return 0;
 
 	memset(&cx, 0, sizeof(cx));
 	cx.vmbuf = InvalidBuffer;
 
-	rbi_ecursor_init(&cursor, node, sets, nsets, &cx);
+	lion_ecursor_init(&cursor, node, sets, nsets, &cx);
 
 	while (cursor.valid)
 	{
-		total += (int64) rbi_container_cardinality(cursor.cur);
+		total += (int64) lion_container_cardinality(cursor.cur);
 		if (!cb(cursor.cur, arg))
 			break;
-		rbi_ecursor_next(&cursor);
+		lion_ecursor_next(&cursor);
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	rbi_ecursor_close(&cursor);
+	lion_ecursor_close(&cursor);
 
 	return total;
 }
@@ -3099,16 +3099,16 @@ rbi_sets_iterate(int nsets, RBIPostingSet *sets, RBIKeyNode *tree,
  * The plain form: count the intersection of nsets posting sets.
  */
 int64
-rbi_count_posting_sets(Relation heap, Snapshot snapshot, int nsets,
-					   RBIPostingSet *sets, RBICountStats *stats)
+lion_count_posting_sets(Relation heap, Snapshot snapshot, int nsets,
+					   LionPostingSet *sets, LionCountStats *stats)
 {
-	RBICountSource *sources;
+	LionCountSource *sources;
 	int64		result;
 	int			i;
 
 	Assert(nsets >= 1);
 
-	sources = (RBICountSource *) palloc0(sizeof(RBICountSource) * nsets);
+	sources = (LionCountSource *) palloc0(sizeof(LionCountSource) * nsets);
 	for (i = 0; i < nsets; i++)
 	{
 		sources[i].nsets = 1;
@@ -3116,33 +3116,33 @@ rbi_count_posting_sets(Relation heap, Snapshot snapshot, int nsets,
 		sources[i].negated = false;
 	}
 
-	result = rbi_count_sources(heap, snapshot, nsets, sources, stats);
+	result = lion_count_sources(heap, snapshot, nsets, sources, stats);
 
 	pfree(sources);
 	return result;
 }
 
 int64
-rbi_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
-			   Datum *keys, Oid *keytypes, RBICountStats *stats)
+lion_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
+			   Datum *keys, Oid *keytypes, LionCountStats *stats)
 {
-	RBIPostingSet *sets;
+	LionPostingSet *sets;
 	int64		result;
 	int			i;
 
 	Assert(nkeys >= 1);
 
-	sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * nkeys);
+	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * nkeys);
 
 	for (i = 0; i < nkeys; i++)
-		rbi_posting_set_lookup(indexes[i], keys[i],
+		lion_posting_set_lookup(indexes[i], keys[i],
 							   keytypes ? keytypes[i] : InvalidOid,
 							   &sets[i]);
 
-	result = rbi_count_posting_sets(heap, snapshot, nkeys, sets, stats);
+	result = lion_count_posting_sets(heap, snapshot, nkeys, sets, stats);
 
 	for (i = 0; i < nkeys; i++)
-		rbi_posting_set_release(&sets[i]);
+		lion_posting_set_release(&sets[i]);
 
 	pfree(sets);
 	return result;
@@ -3154,20 +3154,20 @@ rbi_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
  * --------------------------------------------------------------------- */
 
 void
-rbi_entry_scan_begin(RBIEntryScan *es, Relation index)
+lion_entry_scan_begin(LionEntryScan *es, Relation index)
 {
 	es->index = index;
-	es->state = rbi_get_state(index);
+	es->state = lion_get_state(index);
 	es->bucket = 0;
-	es->blkno = RBI_BUCKET_BLKNO(0);
+	es->blkno = LION_BUCKET_BLKNO(0);
 	es->off = FirstOffsetNumber;
 	es->done = false;
 }
 
 bool
-rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
+lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 {
-	RBIState   *state = es->state;
+	LionState   *state = es->state;
 
 	while (!es->done)
 	{
@@ -3180,10 +3180,10 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 		buf = ReadBuffer(es->index, es->blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (!RBIPageIsBucket(page))
+		if (!LionPageIsBucket(page))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "roaring index: block %u is not a bucket page",
+			elog(ERROR, "lion index: block %u is not a bucket page",
 				 es->blkno);
 		}
 		maxoff = PageGetMaxOffsetNumber(page);
@@ -3191,7 +3191,7 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 		while (es->off <= maxoff)
 		{
 			ItemId		iid = PageGetItemId(page, es->off);
-			RBIEntryTuple *entry;
+			LionEntryTuple *entry;
 			OffsetNumber thisoff = es->off;
 			bool		keeppin;
 
@@ -3199,7 +3199,7 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (RBIEntryTuple *) PageGetItem(page, iid);
+			entry = (LionEntryTuple *) PageGetItem(page, iid);
 
 			/*
 			 * VACUUM keeps entries whose posting set has become empty
@@ -3208,7 +3208,7 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 			if (entry->ntids == 0)
 				continue;
 
-			rbi_fill_posting_set(es->index, state, buf, thisoff, ps, &keeppin);
+			lion_fill_posting_set(es->index, state, buf, thisoff, ps, &keeppin);
 			*key = ps->storedkey;
 			if (keeppin)
 			{
@@ -3225,7 +3225,7 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 			break;
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
 
 		if (got)
@@ -3235,7 +3235,7 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 		if (BlockNumberIsValid(next))
 			es->blkno = next;
 		else if (++es->bucket < state->meta.nbuckets)
-			es->blkno = RBI_BUCKET_BLKNO(es->bucket);
+			es->blkno = LION_BUCKET_BLKNO(es->bucket);
 		else
 		{
 			es->done = true;
@@ -3250,7 +3250,7 @@ rbi_entry_scan_next(RBIEntryScan *es, Datum *key, RBIPostingSet *ps)
 }
 
 void
-rbi_entry_scan_end(RBIEntryScan *es)
+lion_entry_scan_end(LionEntryScan *es)
 {
 	es->done = true;
 }
@@ -3261,17 +3261,17 @@ rbi_entry_scan_end(RBIEntryScan *es)
  * --------------------------------------------------------------------- */
 
 /*
- * Common argument validation for the roaring_index_count* functions.
- * Everything is opened here and closed by rbi_count_sql_close().
+ * Common argument validation for the lion_index_count* functions.
+ * Everything is opened here and closed by lion_count_sql_close().
  */
-typedef struct RBICountCall
+typedef struct LionCountCall
 {
 	int			nkeys;
 	Relation	heap;
 	Relation	index[2];
 	Datum		key[2];
 	Oid			keytype[2];
-} RBICountCall;
+} LionCountCall;
 
 /*
  * Open and vet the indexes of one SQL count: relkind, access method, key
@@ -3280,8 +3280,8 @@ typedef struct RBICountCall
  * below, which walks every entry instead of looking one up).
  */
 static void
-rbi_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
-					   const Oid *keytype, RBICountCall *call)
+lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
+					   const Oid *keytype, LionCountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	int			i;
@@ -3325,21 +3325,21 @@ rbi_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 
 		call->index[i] = index;
 
-		if (index->rd_rel->relam != rbi_get_am_oid())
+		if (index->rd_rel->relam != lion_get_am_oid())
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("index \"%s\" is not a roaring index",
+					 errmsg("index \"%s\" is not a lion index",
 							RelationGetRelationName(index))));
 		if (IndexRelationGetNumberOfKeyAttributes(index) != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("roaring index \"%s\" must have exactly one key column",
+					 errmsg("lion index \"%s\" must have exactly one key column",
 							RelationGetRelationName(index))));
 
 		/*
 		 * The key must be the index's own type, or a type the opfamily can
 		 * compare it with (integer cross-type equality, for instance).
-		 * rbi_probe_init() would raise the same errors later; raising them
+		 * lion_probe_init() would raise the same errors later; raising them
 		 * here keeps them out of the middle of the count.
 		 */
 		if (OidIsValid(call->keytype[i]) &&
@@ -3393,7 +3393,7 @@ rbi_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	 * Snapshot eligibility.  The planner decides this for a query that
 	 * mentions the table; a direct SQL count was handed an index nobody
 	 * vetted, so it asks the same question itself - once the snapshot is
-	 * known, which is why this is the last thing rbi_count_sql() does before
+	 * known, which is why this is the last thing lion_count_sql() does before
 	 * the lookup.  An index that indcheckxmin makes unusable does not contain
 	 * the HOT-chain versions an old snapshot still sees, and rechecking
 	 * cannot invent a TID that is not in the posting set (DESIGN.md §9).
@@ -3402,7 +3402,7 @@ rbi_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	{
 		const char *why;
 
-		if (!rbi_index_usable(call->index[i], snapshot, &why))
+		if (!lion_index_usable(call->index[i], snapshot, &why))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("cannot count through index \"%s\" because %s",
@@ -3411,12 +3411,12 @@ rbi_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 }
 
 /*
- * The same for the roaring_index_count(idx, key [, idx2, key2]) functions,
+ * The same for the lion_index_count(idx, key [, idx2, key2]) functions,
  * whose arguments alternate index and key.
  */
 static void
-rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
-				   RBICountCall *call)
+lion_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
+				   LionCountCall *call)
 {
 	Oid			idxoid[2];
 	Oid			keytype[2];
@@ -3434,14 +3434,14 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 			elog(ERROR, "could not determine the type of the search key");
 	}
 
-	rbi_count_open_indexes(snapshot, nkeys, idxoid, keytype, call);
+	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, call);
 
 	for (i = 0; i < nkeys; i++)
 		call->key[i] = key[i];
 }
 
 static void
-rbi_count_sql_close(RBICountCall *call)
+lion_count_sql_close(LionCountCall *call)
 {
 	int			i;
 
@@ -3455,18 +3455,18 @@ rbi_count_sql_close(RBICountCall *call)
 }
 
 static int64
-rbi_count_sql(FunctionCallInfo fcinfo, int nkeys, RBICountStats *stats)
+lion_count_sql(FunctionCallInfo fcinfo, int nkeys, LionCountStats *stats)
 {
-	RBICountCall call;
+	LionCountCall call;
 	Snapshot	snapshot;
 	int64		result;
 	int			i;
 
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
-		elog(ERROR, "roaring index count requires an active snapshot");
+		elog(ERROR, "lion index count requires an active snapshot");
 
-	rbi_count_sql_open(fcinfo, nkeys, snapshot, &call);
+	lion_count_sql_open(fcinfo, nkeys, snapshot, &call);
 
 	/*
 	 * index_beginscan() takes a relation-level predicate lock on an index
@@ -3478,29 +3478,29 @@ rbi_count_sql(FunctionCallInfo fcinfo, int nkeys, RBICountStats *stats)
 	for (i = 0; i < nkeys; i++)
 		PredicateLockRelation(call.index[i], snapshot);
 
-	result = rbi_count_keys(call.heap, snapshot, nkeys, call.index,
+	result = lion_count_keys(call.heap, snapshot, nkeys, call.index,
 							call.key, call.keytype, stats);
 
-	rbi_count_sql_close(&call);
+	lion_count_sql_close(&call);
 	return result;
 }
 
 Datum
-roaring_index_count(PG_FUNCTION_ARGS)
+lion_index_count(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(rbi_count_sql(fcinfo, 1, NULL));
+	PG_RETURN_INT64(lion_count_sql(fcinfo, 1, NULL));
 }
 
 Datum
-roaring_index_count2(PG_FUNCTION_ARGS)
+lion_index_count2(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(rbi_count_sql(fcinfo, 2, NULL));
+	PG_RETURN_INT64(lion_count_sql(fcinfo, 2, NULL));
 }
 
 Datum
-roaring_index_count_stats(PG_FUNCTION_ARGS)
+lion_index_count_stats(PG_FUNCTION_ARGS)
 {
-	RBICountStats stats;
+	LionCountStats stats;
 	TupleDesc	tupdesc;
 	Datum		values[5];
 	bool		nulls[5] = {false, false, false, false, false};
@@ -3511,7 +3511,7 @@ roaring_index_count_stats(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 
 	memset(&stats, 0, sizeof(stats));
-	count = rbi_count_sql(fcinfo, 1, &stats);
+	count = lion_count_sql(fcinfo, 1, &stats);
 
 	values[0] = Int64GetDatum(count);
 	values[1] = Int64GetDatum(stats.blocks_skipped_via_vm);
@@ -3524,26 +3524,26 @@ roaring_index_count_stats(PG_FUNCTION_ARGS)
 }
 
 /*
- * roaring_index_count_any(idx, keys) - count(*) WHERE col = ANY (keys), the
+ * lion_index_count_any(idx, keys) - count(*) WHERE col = ANY (keys), the
  * SQL form of the IN list of DESIGN.md §15: the union of the listed values'
  * posting sets, counted against the visibility map like any other count.
  *
- * The values are located with rbi_posting_set_lookup_many(), so the bucket
+ * The values are located with lion_posting_set_lookup_many(), so the bucket
  * pages are read in order and duplicates cost nothing, and the union is the
- * k-way merge of rbi_ecursor_build().  Unlike the pushdown, this has no limit
+ * k-way merge of lion_ecursor_build().  Unlike the pushdown, this has no limit
  * on the number of values other than the pins it holds - one bucket page per
  * INLINE entry - so a caller that hands it a very long list should expect to
  * hold that many buffer pins for the duration.
  */
 Datum
-roaring_index_count_any(PG_FUNCTION_ARGS)
+lion_index_count_any(PG_FUNCTION_ARGS)
 {
 	Oid			idxoid = PG_GETARG_OID(0);
 	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(1);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
-	RBICountCall call;
-	RBICountSource src;
-	RBIPostingSet *sets;
+	LionCountCall call;
+	LionCountSource src;
+	LionPostingSet *sets;
 	Snapshot	snapshot;
 	Datum	   *elems;
 	bool	   *nulls;
@@ -3558,17 +3558,17 @@ roaring_index_count_any(PG_FUNCTION_ARGS)
 
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
-		elog(ERROR, "roaring index count requires an active snapshot");
+		elog(ERROR, "lion index count requires an active snapshot");
 
-	rbi_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &call);
+	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &call);
 	PredicateLockRelation(call.index[0], snapshot);
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
-	sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * Max(nelems, 1));
-	nsets = rbi_posting_set_lookup_many(call.index[0], elemtype, nelems,
+	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
+	nsets = lion_posting_set_lookup_many(call.index[0], elemtype, nelems,
 										elems, nulls, sets, &nfound);
 
 	/* An empty array, an all-NULL one, or no listed value with an entry. */
@@ -3577,41 +3577,41 @@ roaring_index_count_any(PG_FUNCTION_ARGS)
 		memset(&src, 0, sizeof(src));
 		src.nsets = nsets;
 		src.sets = sets;
-		count = rbi_count_sources(call.heap, snapshot, 1, &src, NULL);
+		count = lion_count_sources(call.heap, snapshot, 1, &src, NULL);
 	}
 
 	for (i = 0; i < nsets; i++)
-		rbi_posting_set_release(&sets[i]);
+		lion_posting_set_release(&sets[i]);
 
-	rbi_count_sql_close(&call);
+	lion_count_sql_close(&call);
 
 	PG_RETURN_INT64(count);
 }
 
 /*
- * roaring_index_count_group_stats(idx) - count every key of one index under
+ * lion_index_count_group_stats(idx) - count every key of one index under
  * one snapshot, the way the GROUP BY path of DESIGN.md §10 does, sharing one
  * visibility cache across the groups.
  *
- * This is the SQL image of rbi_next_group() in rbi_customscan.c: same entry
- * scan, same one rbi_count_sources_cached() call per group, same single cache
+ * This is the SQL image of lion_next_group() in lion_customscan.c: same entry
+ * scan, same one lion_count_sources_cached() call per group, same single cache
  * for the whole run.  It exists because the cache can only pay off across
- * counts, so nothing a single roaring_index_count() does can exercise it -
+ * counts, so nothing a single lion_index_count() does can exercise it -
  * and a regression test should not have to go through the planner to prove
  * that the dirty pages of a grouped count are visited once instead of once
  * per group.  use_cache = false runs the very same loop with no cache at all,
  * which is what every caller did before the cache existed.
  */
 Datum
-roaring_index_count_group_stats(PG_FUNCTION_ARGS)
+lion_index_count_group_stats(PG_FUNCTION_ARGS)
 {
 	Oid			idxoid = PG_GETARG_OID(0);
 	bool		usecache = PG_GETARG_BOOL(1);
-	RBICountCall call;
+	LionCountCall call;
 	Snapshot	snapshot;
-	RBICountStats stats;
-	RBIVisCache *cache;
-	RBIEntryScan es;
+	LionCountStats stats;
+	LionVisCache *cache;
+	LionEntryScan es;
 	MemoryContext percxt;
 	MemoryContext oldcxt;
 	TupleDesc	tupdesc;
@@ -3626,21 +3626,21 @@ roaring_index_count_group_stats(PG_FUNCTION_ARGS)
 
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
-		elog(ERROR, "roaring index count requires an active snapshot");
+		elog(ERROR, "lion index count requires an active snapshot");
 
-	rbi_count_open_indexes(snapshot, 1, &idxoid, NULL, &call);
+	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, &call);
 
 	/*
 	 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted key,
 	 * so its entries are not column values and a row appears under several of
 	 * them: the sum over the entries is not a row count and neither is any
-	 * single entry a group.  rbi_customscan.c refuses to drive a GROUP BY
+	 * single entry a group.  lion_customscan.c refuses to drive a GROUP BY
 	 * from such an index for the same reason.
 	 */
 	if (OidIsValid(get_opfamily_proc(call.index[0]->rd_opfamily[0],
 									 call.index[0]->rd_opcintype[0],
 									 call.index[0]->rd_opcintype[0],
-									 RBI_EXTRACTVALUE_PROC)))
+									 LION_EXTRACTVALUE_PROC)))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("index \"%s\" has a multi-key operator class, whose entries are not column values",
@@ -3650,17 +3650,17 @@ roaring_index_count_group_stats(PG_FUNCTION_ARGS)
 
 	memset(&stats, 0, sizeof(stats));
 	/* use_cache = false is the pre-cache behaviour, for an A/B in one query */
-	cache = usecache ? rbi_vis_cache_create(CurrentMemoryContext) : NULL;
+	cache = usecache ? lion_vis_cache_create(CurrentMemoryContext) : NULL;
 	percxt = AllocSetContextCreate(CurrentMemoryContext,
-								   "roaring index group count",
+								   "lion index group count",
 								   ALLOCSET_SMALL_SIZES);
 
-	rbi_entry_scan_begin(&es, call.index[0]);
+	lion_entry_scan_begin(&es, call.index[0]);
 
 	for (;;)
 	{
-		RBICountSource src;
-		RBIPostingSet ps;
+		LionCountSource src;
+		LionPostingSet ps;
 		Datum		key;
 		int64		n;
 
@@ -3669,7 +3669,7 @@ roaring_index_count_group_stats(PG_FUNCTION_ARGS)
 		MemoryContextReset(percxt);
 		oldcxt = MemoryContextSwitchTo(percxt);
 
-		if (!rbi_entry_scan_next(&es, &key, &ps))
+		if (!lion_entry_scan_next(&es, &key, &ps))
 		{
 			MemoryContextSwitchTo(oldcxt);
 			break;
@@ -3679,9 +3679,9 @@ roaring_index_count_group_stats(PG_FUNCTION_ARGS)
 		src.nsets = 1;
 		src.sets = &ps;
 
-		n = rbi_count_sources_cached(call.heap, snapshot, 1, &src, &stats,
+		n = lion_count_sources_cached(call.heap, snapshot, 1, &src, &stats,
 									 cache);
-		rbi_posting_set_release(&ps);
+		lion_posting_set_release(&ps);
 		MemoryContextSwitchTo(oldcxt);
 
 		/* A group exists only if one of its rows is visible (§10). */
@@ -3692,10 +3692,10 @@ roaring_index_count_group_stats(PG_FUNCTION_ARGS)
 		}
 	}
 
-	rbi_entry_scan_end(&es);
-	rbi_vis_cache_destroy(cache);
+	lion_entry_scan_end(&es);
+	lion_vis_cache_destroy(cache);
 	MemoryContextDelete(percxt);
-	rbi_count_sql_close(&call);
+	lion_count_sql_close(&call);
 
 	values[0] = Int64GetDatum(groups);
 	values[1] = Int64GetDatum(total);

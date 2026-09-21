@@ -1,4 +1,4 @@
--- The RoaringCount CustomScan (DESIGN.md section 10).
+-- The LionCount CustomScan (DESIGN.md section 10).
 --
 -- Two things are checked for every query: that the plan is (or deliberately
 -- is not) the custom node, and that the rows it produces are exactly the rows
@@ -7,7 +7,7 @@
 -- to be stable.
 \set VERBOSITY terse
 SET client_min_messages = warning;
-LOAD 'roaring_index';
+LOAD 'pg_lion';
 
 /*
  * The visibility map is what makes this feature worth having, and a heap page
@@ -25,14 +25,14 @@ SET synchronous_commit = on;
  */
 SET default_statistics_target = 1000;
 
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 
 /*
- * rbi_pd() runs one query twice, once with the pushdown enabled and once
+ * lion_pd() runs one query twice, once with the pushdown enabled and once
  * without, and reports whether the custom node was used and how many rows
  * came out - after proving the two result sets are equal as multisets.
  */
-CREATE OR REPLACE FUNCTION rbi_pd(q text) RETURNS text
+CREATE OR REPLACE FUNCTION lion_pd(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -40,23 +40,23 @@ DECLARE
 	nrows bigint;
 	ndiff bigint;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			pushed := true;
 		END IF;
 	END LOOP;
-	EXECUTE format('CREATE TEMP TABLE rbi_pd_on AS %s', q);
+	EXECUTE format('CREATE TEMP TABLE lion_pd_on AS %s', q);
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
-	EXECUTE format('CREATE TEMP TABLE rbi_pd_off AS %s', q);
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_pd_off AS %s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
-	EXECUTE 'SELECT count(*) FROM rbi_pd_on' INTO nrows;
-	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM rbi_pd_on EXCEPT ALL SELECT * FROM rbi_pd_off) a)'
-			' + (SELECT count(*) FROM (SELECT * FROM rbi_pd_off EXCEPT ALL SELECT * FROM rbi_pd_on) b)'
+	EXECUTE 'SELECT count(*) FROM lion_pd_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_pd_on EXCEPT ALL SELECT * FROM lion_pd_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_pd_off EXCEPT ALL SELECT * FROM lion_pd_on) b)'
 		INTO ndiff;
-	EXECUTE 'DROP TABLE rbi_pd_on, rbi_pd_off';
+	EXECUTE 'DROP TABLE lion_pd_on, lion_pd_off';
 
 	IF ndiff <> 0 THEN
 		RETURN format('MISMATCH: %s rows differ', ndiff);
@@ -67,22 +67,22 @@ BEGIN
 END $$;
 
 /* Show both plans for one query. */
-CREATE OR REPLACE FUNCTION rbi_plans(q text) RETURNS SETOF text
+CREATE OR REPLACE FUNCTION lion_plans(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	RETURN NEXT '-- on:';
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	RETURN NEXT '-- off:';
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 END $$;
 
 /*
@@ -90,7 +90,7 @@ END $$;
  * zero / non-zero: the exact counts depend on how the rows fall on heap
  * pages, but whether the heap had to be visited at all does not.
  */
-CREATE OR REPLACE FUNCTION rbi_pd_counters(q text) RETURNS SETOF text
+CREATE OR REPLACE FUNCTION lion_pd_counters(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -99,7 +99,7 @@ DECLARE
 	pushed boolean := false;
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
-		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			pushed := true;
 		END IF;
 		nm := btrim(split_part(ln, ':', 1));
@@ -117,14 +117,14 @@ BEGIN
 	END IF;
 END $$;
 
-CREATE TABLE rbi_pdt (
+CREATE TABLE lion_pdt (
 	id	int		NOT NULL,
 	a	int		NOT NULL,
 	b	int		NOT NULL,
 	c	text	NOT NULL,
 	n	int
 );
-INSERT INTO rbi_pdt
+INSERT INTO lion_pdt
 SELECT i,
 	   i % 10,
 	   i % 7,
@@ -132,158 +132,158 @@ SELECT i,
 	   CASE WHEN i % 101 = 0 THEN NULL ELSE i % 5 END
   FROM generate_series(1, 100000) i;
 
-CREATE INDEX rbi_pdt_a ON rbi_pdt USING roaring (a);
-CREATE INDEX rbi_pdt_b ON rbi_pdt USING roaring (b);
-CREATE INDEX rbi_pdt_c ON rbi_pdt USING roaring (c);
-CREATE INDEX rbi_pdt_n ON rbi_pdt USING roaring (n);
+CREATE INDEX lion_pdt_a ON lion_pdt USING lion (a);
+CREATE INDEX lion_pdt_b ON lion_pdt USING lion (b);
+CREATE INDEX lion_pdt_c ON lion_pdt USING lion (c);
+CREATE INDEX lion_pdt_n ON lion_pdt USING lion (n);
 -- The pushdown only wins when most of the heap is all-visible, which is the
 -- case it exists for; VACUUM makes that true and deterministic here.
-VACUUM ANALYZE rbi_pdt;
+VACUUM ANALYZE lion_pdt;
 
 -- ---- plans -------------------------------------------------------------
-SELECT rbi_plans('SELECT count(*) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_plans('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2');
-SELECT rbi_plans($$SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2 AND c = 'c1'$$);
-SELECT rbi_plans('SELECT a, count(*) FROM rbi_pdt GROUP BY a');
-SELECT rbi_plans('SELECT a, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY a');
-SELECT rbi_plans('SELECT count(*) FROM rbi_pdt GROUP BY a');
-SELECT rbi_plans('SELECT count(a) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_plans('SELECT a, count(*) FROM rbi_pdt WHERE a = 3 GROUP BY a');
-SELECT rbi_plans('SELECT n, count(*) FROM rbi_pdt GROUP BY n');
-SELECT rbi_plans('SELECT count(*) FROM rbi_pdt WHERE n IS NULL');
+SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE a = 3');
+SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
+SELECT lion_plans($$SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2 AND c = 'c1'$$);
+SELECT lion_plans('SELECT a, count(*) FROM lion_pdt GROUP BY a');
+SELECT lion_plans('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a');
+SELECT lion_plans('SELECT count(*) FROM lion_pdt GROUP BY a');
+SELECT lion_plans('SELECT count(a) FROM lion_pdt WHERE a = 3');
+SELECT lion_plans('SELECT a, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a');
+SELECT lion_plans('SELECT n, count(*) FROM lion_pdt GROUP BY n');
+SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE n IS NULL');
 
 -- ---- shapes that must push down ----------------------------------------
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2');
-SELECT rbi_pd($$SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2 AND c = 'c1'$$);
-SELECT rbi_pd($$SELECT count(*) FROM rbi_pdt WHERE c = 'c2'$$);
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
+SELECT lion_pd($$SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2 AND c = 'c1'$$);
+SELECT lion_pd($$SELECT count(*) FROM lion_pdt WHERE c = 'c2'$$);
 -- the constant on the left, and a cross-type constant
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE 3 = a');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3::int8');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE 3 = a');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3::int8');
 -- a constant that matches no key at all
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 999');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 999');
 -- the same column constrained twice with the same constant
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND a = 3');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND a = 3');
 -- GROUP BY, with and without a WHERE clause
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY a');
-SELECT rbi_pd($$SELECT a, count(*) FROM rbi_pdt WHERE b = 2 AND c = 'c1' GROUP BY a$$);
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt GROUP BY a');
-SELECT rbi_pd('SELECT b, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY b');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a');
+SELECT lion_pd($$SELECT a, count(*) FROM lion_pdt WHERE b = 2 AND c = 'c1' GROUP BY a$$);
+SELECT lion_pd('SELECT count(*) FROM lion_pdt GROUP BY a');
+SELECT lion_pd('SELECT b, count(*) FROM lion_pdt WHERE b = 2 GROUP BY b');
 /*
  * GROUP BY a column the WHERE clause pins to a single value.  The planner
  * folds such a column out of the group clause, so the node emits at most one
  * row and reports the key the index stored for it - which is what makes a
  * cross-type constant safe here.
  */
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt WHERE a = 3 GROUP BY a');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt WHERE a = 3::int8 GROUP BY a');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt WHERE a = 999 GROUP BY a');
-SELECT rbi_pd('SELECT a, b, count(*) FROM rbi_pdt WHERE a = 3 GROUP BY a, b');
-SELECT rbi_pd($$SELECT c, count(*) FROM rbi_pdt WHERE c = 'c2' GROUP BY c$$);
-SELECT rbi_pd('SELECT b, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY b');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE a = 3::int8 GROUP BY a');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE a = 999 GROUP BY a');
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a, b');
+SELECT lion_pd($$SELECT c, count(*) FROM lion_pdt WHERE c = 'c2' GROUP BY c$$);
+SELECT lion_pd('SELECT b, count(*) FROM lion_pdt WHERE b = 2 GROUP BY b');
 -- a by-reference group key whose type prints what it stores
-SELECT rbi_pd('SELECT c, count(*) FROM rbi_pdt GROUP BY c');
+SELECT lion_pd('SELECT c, count(*) FROM lion_pdt GROUP BY c');
 -- count(col) where col cannot be NULL
-SELECT rbi_pd('SELECT count(a) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_pd('SELECT a, count(a) FROM rbi_pdt GROUP BY a');
-SELECT rbi_pd('SELECT count(*) AS c1, count(a) AS c2, count(*) AS c3 FROM rbi_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(a) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT a, count(a) FROM lion_pdt GROUP BY a');
+SELECT lion_pd('SELECT count(*) AS c1, count(a) AS c2, count(*) AS c3 FROM lion_pdt WHERE a = 3');
 
 /*
  * A nullable group column is fine: the NULL keys have an entry of their own,
  * so the NULL group is produced like any other (DESIGN.md section 14, and
  * test/sql/null.sql for the whole story).
  */
-SELECT rbi_pd('SELECT n, count(*) FROM rbi_pdt GROUP BY n');
+SELECT lion_pd('SELECT n, count(*) FROM lion_pdt GROUP BY n');
 
 -- ---- shapes that must NOT push down ------------------------------------
 -- count() of a column that neither the GROUP BY nor a WHERE clause constrains
-SELECT rbi_pd('SELECT count(n) FROM rbi_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(n) FROM lion_pdt WHERE a = 3');
 -- HAVING
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a HAVING count(*) > 9000');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > 9000');
 -- an aggregate we cannot answer
-SELECT rbi_pd('SELECT sum(id) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_pd('SELECT count(DISTINCT b) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_pd('SELECT count(*) FILTER (WHERE b = 2) FROM rbi_pdt WHERE a = 3');
+SELECT lion_pd('SELECT sum(id) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3');
 -- a qual that is not an indexed equality to a constant
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND id < 500');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a > 3');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND id = 5');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
 -- two different constants on one column
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND a = 4');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND a = 4');
 -- no equality key and no GROUP BY at all
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt');
 -- GROUP BY an unindexed column, and by more than one column
-SELECT rbi_pd('SELECT id, count(*) FROM rbi_pdt WHERE a = 3 GROUP BY id');
-SELECT rbi_pd('SELECT a, b, count(*) FROM rbi_pdt GROUP BY a, b');
+SELECT lion_pd('SELECT id, count(*) FROM lion_pdt WHERE a = 3 GROUP BY id');
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 -- GROUP BY an expression
-SELECT rbi_pd('SELECT a + 1, count(*) FROM rbi_pdt GROUP BY a + 1');
+SELECT lion_pd('SELECT a + 1, count(*) FROM lion_pdt GROUP BY a + 1');
 -- a join
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt x, rbi_pdt y WHERE x.a = 3 AND y.b = 2');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt x, lion_pdt y WHERE x.a = 3 AND y.b = 2');
 
 /*
  * Applicable, but the cost model prefers the ordinary plan: a key the
  * statistics say matches nothing makes the bitmap plan look almost free.
  */
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 999');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 999');
 -- ORDER BY is fine, but the node produces no ordering of its own
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a');
-SELECT rbi_plans('SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
+SELECT lion_plans('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
 
 -- ---- the results themselves --------------------------------------------
-SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a;
-SELECT a, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY a ORDER BY a;
-SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2;
-SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2 AND c = 'c1';
-SELECT count(*) FROM rbi_pdt WHERE a = 999;
-SELECT a, count(*) FROM rbi_pdt WHERE a = 3 GROUP BY a;
-SELECT a, b, count(*) FROM rbi_pdt WHERE a = 3 GROUP BY a, b ORDER BY b;
+SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
+SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a ORDER BY a;
+SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2;
+SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2 AND c = 'c1';
+SELECT count(*) FROM lion_pdt WHERE a = 999;
+SELECT a, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a;
+SELECT a, b, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a, b ORDER BY b;
 
 -- ---- after a DELETE, before VACUUM (the heap recheck path) -------------
-DELETE FROM rbi_pdt WHERE id % 3 = 0;
+DELETE FROM lion_pdt WHERE id % 3 = 0;
 
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY a');
-SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a;
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a');
+SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
 
 -- ---- and after VACUUM (the visibility-map path) ------------------------
-VACUUM rbi_pdt;
+VACUUM lion_pdt;
 
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdt WHERE a = 3 AND b = 2');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a');
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt WHERE b = 2 GROUP BY a');
-SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a;
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a');
+SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
 
 -- ---- a group whose rows have all been deleted disappears ---------------
-DELETE FROM rbi_pdt WHERE a = 5;
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a');
-SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a;
-VACUUM rbi_pdt;
-SELECT rbi_pd('SELECT a, count(*) FROM rbi_pdt GROUP BY a');
-SELECT a, count(*) FROM rbi_pdt GROUP BY a ORDER BY a;
+DELETE FROM lion_pdt WHERE a = 5;
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
+SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
+VACUUM lion_pdt;
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
+SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
 
 -- ---- an empty table ----------------------------------------------------
-CREATE TABLE rbi_pde (k int NOT NULL);
-CREATE INDEX rbi_pde_k ON rbi_pde USING roaring (k);
-VACUUM ANALYZE rbi_pde;
-SELECT rbi_pd('SELECT count(*) FROM rbi_pde WHERE k = 1');
-SELECT rbi_pd('SELECT k, count(*) FROM rbi_pde GROUP BY k');
-SELECT count(*) FROM rbi_pde WHERE k = 1;
+CREATE TABLE lion_pde (k int NOT NULL);
+CREATE INDEX lion_pde_k ON lion_pde USING lion (k);
+VACUUM ANALYZE lion_pde;
+SELECT lion_pd('SELECT count(*) FROM lion_pde WHERE k = 1');
+SELECT lion_pd('SELECT k, count(*) FROM lion_pde GROUP BY k');
+SELECT count(*) FROM lion_pde WHERE k = 1;
 
 -- ---- the node inside a larger plan --------------------------------------
-SELECT rbi_pd('SELECT x, c FROM (VALUES (1), (2)) v(x), LATERAL (SELECT count(*) c FROM rbi_pdt WHERE a = 3) s');
-SELECT rbi_pd('SELECT * FROM (SELECT a, count(*) AS c FROM rbi_pdt GROUP BY a) s WHERE c > 0');
+SELECT lion_pd('SELECT x, c FROM (VALUES (1), (2)) v(x), LATERAL (SELECT count(*) c FROM lion_pdt WHERE a = 3) s');
+SELECT lion_pd('SELECT * FROM (SELECT a, count(*) AS c FROM lion_pdt GROUP BY a) s WHERE c > 0');
 
 -- ---- what EXPLAIN ANALYZE reports ---------------------------------------
-VACUUM rbi_pdt;
-SELECT rbi_pd_counters('SELECT count(*) FROM rbi_pdt WHERE a = 3');
+VACUUM lion_pdt;
+SELECT lion_pd_counters('SELECT count(*) FROM lion_pdt WHERE a = 3');
 -- the pages a DELETE dirties are no longer all-visible, so their TIDs are
 -- fetched from the heap and counted as rechecked blocks
-DELETE FROM rbi_pdt WHERE id % 500 = 0;
-SELECT rbi_pd_counters('SELECT count(*) FROM rbi_pdt WHERE a = 3');
+DELETE FROM lion_pdt WHERE id % 500 = 0;
+SELECT lion_pd_counters('SELECT count(*) FROM lion_pdt WHERE a = 3');
 
 -- ---- a grouping over a heap that is not all-visible ---------------------
 /*
@@ -299,15 +299,15 @@ SELECT rbi_pd_counters('SELECT count(*) FROM rbi_pdt WHERE a = 3');
  * the estimate stopped charging numgroups random reads per dirty page, this
  * was the case that had to lose.
  */
-CREATE TABLE rbi_pdd (g int NOT NULL, pad text NOT NULL);
-INSERT INTO rbi_pdd
+CREATE TABLE lion_pdd (g int NOT NULL, pad text NOT NULL);
+INSERT INTO lion_pdd
 SELECT i % 1000, repeat('x', 200) FROM generate_series(1, 100000) i;
-CREATE INDEX rbi_pdd_g ON rbi_pdd USING roaring (g);
-ANALYZE rbi_pdd;			-- no VACUUM: relallvisible stays 0
-SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdd GROUP BY g');
+CREATE INDEX lion_pdd_g ON lion_pdd USING lion (g);
+ANALYZE lion_pdd;			-- no VACUUM: relallvisible stays 0
+SELECT lion_pd('SELECT g, count(*) FROM lion_pdd GROUP BY g');
 -- and once it is all-visible there is nothing left to recheck at all
-VACUUM ANALYZE rbi_pdd;
-SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdd GROUP BY g');
+VACUUM ANALYZE lion_pdd;
+SELECT lion_pd('SELECT g, count(*) FROM lion_pdd GROUP BY g');
 
 -- ---- the cost model still refuses a grouping it cannot win -------------
 /*
@@ -320,13 +320,13 @@ SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdd GROUP BY g');
  * (2026-09-21).  Nothing is disabled here; which plan the cost model picks IS
  * the test.
  */
-CREATE TABLE rbi_pdh (g int NOT NULL, pad text NOT NULL);
-INSERT INTO rbi_pdh
+CREATE TABLE lion_pdh (g int NOT NULL, pad text NOT NULL);
+INSERT INTO lion_pdh
 SELECT i % 20000, repeat('x', 200) FROM generate_series(1, 100000) i;
-CREATE INDEX rbi_pdh_g ON rbi_pdh USING roaring (g);
-ANALYZE rbi_pdh;
-SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdh GROUP BY g');
-SELECT rbi_plans('SELECT g, count(*) FROM rbi_pdh GROUP BY g');
+CREATE INDEX lion_pdh_g ON lion_pdh USING lion (g);
+ANALYZE lion_pdh;
+SELECT lion_pd('SELECT g, count(*) FROM lion_pdh GROUP BY g');
+SELECT lion_plans('SELECT g, count(*) FROM lion_pdh GROUP BY g');
 
 -- ---- a grouping over a heap a few per cent of which is dirty -----------
 /*
@@ -342,17 +342,17 @@ SELECT rbi_plans('SELECT g, count(*) FROM rbi_pdh GROUP BY g');
  * runs in 2.0 ms against 15.8 ms (2026-09-21).  Nothing is disabled: which
  * plan the cost model picks IS the test.
  */
-CREATE TABLE rbi_pdg (id int NOT NULL, k int NOT NULL, pad text NOT NULL);
-INSERT INTO rbi_pdg
+CREATE TABLE lion_pdg (id int NOT NULL, k int NOT NULL, pad text NOT NULL);
+INSERT INTO lion_pdg
 SELECT i, i % 20, repeat('x', 200) FROM generate_series(1, 100000) i;
-CREATE INDEX rbi_pdg_k ON rbi_pdg USING roaring (k);
-VACUUM ANALYZE rbi_pdg;
-UPDATE rbi_pdg SET pad = pad || 'y' WHERE id <= 5000;
-ANALYZE rbi_pdg;			-- no VACUUM: the updated pages stay dirty
+CREATE INDEX lion_pdg_k ON lion_pdg USING lion (k);
+VACUUM ANALYZE lion_pdg;
+UPDATE lion_pdg SET pad = pad || 'y' WHERE id <= 5000;
+ANALYZE lion_pdg;			-- no VACUUM: the updated pages stay dirty
 SELECT relallvisible > 0 AND relallvisible < relpages AS mostly_all_visible
-  FROM pg_class WHERE relname = 'rbi_pdg';
-SELECT rbi_pd('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
-SELECT rbi_plans('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
+  FROM pg_class WHERE relname = 'lion_pdg';
+SELECT lion_pd('SELECT k, count(*) FROM lion_pdg GROUP BY k');
+SELECT lion_plans('SELECT k, count(*) FROM lion_pdg GROUP BY k');
 /*
  * ... and this is the cache the estimate is allowed to assume: every group
  * comes back to the same dirty pages, and every visit after the first is
@@ -360,7 +360,7 @@ SELECT rbi_plans('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
  * walks the result in TID order and never returns to a block, so it has no
  * cache hits at all (the calls further up).
  */
-SELECT rbi_pd_counters('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
+SELECT lion_pd_counters('SELECT k, count(*) FROM lion_pdg GROUP BY k');
 
 -- ---- an IN list long enough to belong to a B-tree ----------------------
 /*
@@ -375,24 +375,24 @@ SELECT rbi_pd_counters('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
  * down anyway, because each element was priced as a single bucket page (the
  * 2026-09-21 follow-up review).
  */
-CREATE TABLE rbi_pdi (id int NOT NULL, k int NOT NULL);
-INSERT INTO rbi_pdi SELECT i, i % 1000 FROM generate_series(1, 200000) i;
-CREATE INDEX rbi_pdi_r ON rbi_pdi USING roaring (k);
-CREATE INDEX rbi_pdi_b ON rbi_pdi (k);
-VACUUM ANALYZE rbi_pdi;
+CREATE TABLE lion_pdi (id int NOT NULL, k int NOT NULL);
+INSERT INTO lion_pdi SELECT i, i % 1000 FROM generate_series(1, 200000) i;
+CREATE INDEX lion_pdi_r ON lion_pdi USING lion (k);
+CREATE INDEX lion_pdi_b ON lion_pdi (k);
+VACUUM ANALYZE lion_pdi;
 /* The list is generated rather than written out, so that the plan text this
- * reports stays short; rbi_pd() prints the choice and the row count only. */
-CREATE OR REPLACE FUNCTION rbi_pd_in(n int) RETURNS text
+ * reports stays short; lion_pd() prints the choice and the row count only. */
+CREATE OR REPLACE FUNCTION lion_pd_in(n int) RETURNS text
 LANGUAGE plpgsql AS $$
 BEGIN
-	RETURN rbi_pd(format('SELECT count(*) FROM rbi_pdi WHERE k IN (%s)',
+	RETURN lion_pd(format('SELECT count(*) FROM lion_pdi WHERE k IN (%s)',
 						 (SELECT string_agg(g::text, ',')
 							FROM generate_series(0, n - 1) g)));
 END $$;
-SELECT rbi_pd_in(3);
-SELECT rbi_pd_in(10);
-SELECT rbi_pd_in(1000);
-DROP FUNCTION rbi_pd_in(int);
+SELECT lion_pd_in(3);
+SELECT lion_pd_in(10);
+SELECT lion_pd_in(1000);
+DROP FUNCTION lion_pd_in(int);
 
 
 -- ---- a nearly all-visible heap is what the pushdown is for --------------
@@ -405,18 +405,18 @@ DROP FUNCTION rbi_pd_in(int);
  * to plans doing far more work (the 2026-09-20 review, finding 5).  Nothing
  * is disabled here: which plan the cost model picks IS the test.
  */
-CREATE TABLE rbi_pdw (id int NOT NULL, k int NOT NULL);
-INSERT INTO rbi_pdw SELECT i, i % 10 FROM generate_series(1, 200000) i;
-CREATE INDEX rbi_pdw_k ON rbi_pdw USING roaring (k);
-VACUUM ANALYZE rbi_pdw;
-INSERT INTO rbi_pdw SELECT 200000 + i, i % 10 FROM generate_series(1, 4000) i;
-ANALYZE rbi_pdw;
+CREATE TABLE lion_pdw (id int NOT NULL, k int NOT NULL);
+INSERT INTO lion_pdw SELECT i, i % 10 FROM generate_series(1, 200000) i;
+CREATE INDEX lion_pdw_k ON lion_pdw USING lion (k);
+VACUUM ANALYZE lion_pdw;
+INSERT INTO lion_pdw SELECT 200000 + i, i % 10 FROM generate_series(1, 4000) i;
+ANALYZE lion_pdw;
 SELECT relallvisible > 0 AND relallvisible < relpages AS nearly_all_visible
-  FROM pg_class WHERE relname = 'rbi_pdw';
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdw WHERE k = 3');
-SELECT rbi_plans('SELECT count(*) FROM rbi_pdw WHERE k = 3');
-SELECT rbi_pd('SELECT k, count(*) FROM rbi_pdw GROUP BY k');
-SELECT rbi_plans('SELECT k, count(*) FROM rbi_pdw GROUP BY k');
+  FROM pg_class WHERE relname = 'lion_pdw';
+SELECT lion_pd('SELECT count(*) FROM lion_pdw WHERE k = 3');
+SELECT lion_plans('SELECT count(*) FROM lion_pdw WHERE k = 3');
+SELECT lion_pd('SELECT k, count(*) FROM lion_pdw GROUP BY k');
+SELECT lion_plans('SELECT k, count(*) FROM lion_pdw GROUP BY k');
 
 -- ---- an opclass whose equality is not the grouping equality -------------
 /*
@@ -428,43 +428,43 @@ SELECT rbi_plans('SELECT k, count(*) FROM rbi_pdw GROUP BY k');
  * counts themselves would belong to the wrong groups (the 2026-09-20 review,
  * finding 3).
  */
-CREATE FUNCTION rbi_lower_eq(text, text) RETURNS boolean
+CREATE FUNCTION lion_lower_eq(text, text) RETURNS boolean
 	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
 	AS $$ SELECT lower($1) = lower($2) $$;
-CREATE OPERATOR === (LEFTARG = text, RIGHTARG = text, FUNCTION = rbi_lower_eq,
+CREATE OPERATOR === (LEFTARG = text, RIGHTARG = text, FUNCTION = lion_lower_eq,
 					 COMMUTATOR = ===);
-CREATE FUNCTION rbi_lower_hash(text) RETURNS integer
+CREATE FUNCTION lion_lower_hash(text) RETURNS integer
 	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
 	AS $$ SELECT hashtext(lower($1)) $$;
-CREATE OPERATOR CLASS rbi_lower_ops FOR TYPE text USING roaring AS
+CREATE OPERATOR CLASS lion_lower_ops FOR TYPE text USING lion AS
 	OPERATOR 1 === (text, text),
-	FUNCTION 1 rbi_lower_hash(text);
+	FUNCTION 1 lion_lower_hash(text);
 
-CREATE TABLE rbi_pdc (v text NOT NULL);
-INSERT INTO rbi_pdc SELECT 'A' FROM generate_series(1, 50000);
-INSERT INTO rbi_pdc SELECT 'a' FROM generate_series(1, 50000);
-CREATE INDEX rbi_pdc_v ON rbi_pdc USING roaring (v rbi_lower_ops);
-VACUUM ANALYZE rbi_pdc;
+CREATE TABLE lion_pdc (v text NOT NULL);
+INSERT INTO lion_pdc SELECT 'A' FROM generate_series(1, 50000);
+INSERT INTO lion_pdc SELECT 'a' FROM generate_series(1, 50000);
+CREATE INDEX lion_pdc_v ON lion_pdc USING lion (v lion_lower_ops);
+VACUUM ANALYZE lion_pdc;
 -- one entry for the two spellings, which is what the opclass says
-SELECT entries FROM roaring_index_stats('rbi_pdc_v');
-SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdc GROUP BY v');
-SELECT rbi_plans('SELECT v, count(*) FROM rbi_pdc GROUP BY v');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdc GROUP BY v');
-SELECT v, count(*) FROM rbi_pdc GROUP BY v ORDER BY v;
+SELECT entries FROM lion_index_stats('lion_pdc_v');
+SELECT lion_pd('SELECT v, count(*) FROM lion_pdc GROUP BY v');
+SELECT lion_plans('SELECT v, count(*) FROM lion_pdc GROUP BY v');
+SELECT lion_pd('SELECT count(*) FROM lion_pdc GROUP BY v');
+SELECT v, count(*) FROM lion_pdc GROUP BY v ORDER BY v;
 /*
  * The very same data under the default text opclass does drive the node, so
  * what the queries above turned down is the opclass and not the table or the
  * cost model.
  */
-CREATE TABLE rbi_pdv (v text NOT NULL);
-INSERT INTO rbi_pdv SELECT 'A' FROM generate_series(1, 50000);
-INSERT INTO rbi_pdv SELECT 'a' FROM generate_series(1, 50000);
-CREATE INDEX rbi_pdv_v ON rbi_pdv USING roaring (v);
-VACUUM ANALYZE rbi_pdv;
-SELECT entries FROM roaring_index_stats('rbi_pdv_v');
-SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdv GROUP BY v');
-SELECT rbi_plans('SELECT v, count(*) FROM rbi_pdv GROUP BY v');
-SELECT v, count(*) FROM rbi_pdv GROUP BY v ORDER BY v;
+CREATE TABLE lion_pdv (v text NOT NULL);
+INSERT INTO lion_pdv SELECT 'A' FROM generate_series(1, 50000);
+INSERT INTO lion_pdv SELECT 'a' FROM generate_series(1, 50000);
+CREATE INDEX lion_pdv_v ON lion_pdv USING lion (v);
+VACUUM ANALYZE lion_pdv;
+SELECT entries FROM lion_index_stats('lion_pdv_v');
+SELECT lion_pd('SELECT v, count(*) FROM lion_pdv GROUP BY v');
+SELECT lion_plans('SELECT v, count(*) FROM lion_pdv GROUP BY v');
+SELECT v, count(*) FROM lion_pdv GROUP BY v ORDER BY v;
 
 -- ---- a type whose equality does not preserve the representation ---------
 /*
@@ -474,15 +474,15 @@ SELECT v, count(*) FROM rbi_pdv GROUP BY v ORDER BY v;
  * every value-producing shape steps aside; counting the class is exact
  * either way and is still pushed down (the 2026-09-20 review, finding 4).
  */
-CREATE TABLE rbi_pdn (v numeric NOT NULL);
-INSERT INTO rbi_pdn SELECT 1.0 FROM generate_series(1, 20000);
-INSERT INTO rbi_pdn SELECT 1.00 FROM generate_series(1, 20000);
-INSERT INTO rbi_pdn SELECT 2.5 FROM generate_series(1, 20000);
-CREATE INDEX rbi_pdn_v ON rbi_pdn USING roaring (v);
-VACUUM ANALYZE rbi_pdn;
-SELECT entries FROM roaring_index_stats('rbi_pdn_v');
-SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdn GROUP BY v');
-SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdn WHERE v = 1.000 GROUP BY v');
+CREATE TABLE lion_pdn (v numeric NOT NULL);
+INSERT INTO lion_pdn SELECT 1.0 FROM generate_series(1, 20000);
+INSERT INTO lion_pdn SELECT 1.00 FROM generate_series(1, 20000);
+INSERT INTO lion_pdn SELECT 2.5 FROM generate_series(1, 20000);
+CREATE INDEX lion_pdn_v ON lion_pdn USING lion (v);
+VACUUM ANALYZE lion_pdn;
+SELECT entries FROM lion_index_stats('lion_pdn_v');
+SELECT lion_pd('SELECT v, count(*) FROM lion_pdn GROUP BY v');
+SELECT lion_pd('SELECT v, count(*) FROM lion_pdn WHERE v = 1.000 GROUP BY v');
 /*
  * With every other plan disabled the node would be chosen if the planner had
  * built it at all, which makes the two answers here the plan-time rule and
@@ -490,12 +490,12 @@ SELECT rbi_pd('SELECT v, count(*) FROM rbi_pdn WHERE v = 1.000 GROUP BY v');
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SELECT rbi_plans('SELECT v, count(*) FROM rbi_pdn GROUP BY v');
-SELECT rbi_plans('SELECT count(*) FROM rbi_pdn WHERE v = 1.000');
-SELECT rbi_pd('SELECT count(*) FROM rbi_pdn WHERE v = 1.000');
+SELECT lion_plans('SELECT v, count(*) FROM lion_pdn GROUP BY v');
+SELECT lion_plans('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
+SELECT lion_pd('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-SELECT v, count(*) FROM rbi_pdn GROUP BY v ORDER BY v;
+SELECT v, count(*) FROM lion_pdn GROUP BY v ORDER BY v;
 
 -- ---- prepared statements: a parameter where a literal may stand -------
 /*
@@ -508,12 +508,12 @@ SELECT v, count(*) FROM rbi_pdn GROUP BY v ORDER BY v;
  * node evaluates it through its own ExprContext at the start of every scan
  * (DESIGN.md §10).  EXPLAIN prints it as `$1`.
  *
- * rbi_pd_prep() prepares one query, forces a generic plan so that every
+ * lion_pd_prep() prepares one query, forces a generic plan so that every
  * parameter really stays a Param, and proves the answer is the one the same
  * query gives with the pushdown switched off - as a multiset, both ways
  * round.
  */
-CREATE OR REPLACE FUNCTION rbi_pd_prep(q text, args text) RETURNS text
+CREATE OR REPLACE FUNCTION lion_pd_prep(q text, args text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -525,26 +525,26 @@ DECLARE
 BEGIN
 	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
-	EXECUTE 'PREPARE rbi_pp_on AS ' || q;
-	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE rbi_pp_on(' || args || ')' LOOP
-		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_pp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_pp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			pushed := true;
 		END IF;
 	END LOOP;
-	FOR rec IN EXECUTE 'EXECUTE rbi_pp_on(' || args || ')' LOOP
+	FOR rec IN EXECUTE 'EXECUTE lion_pp_on(' || args || ')' LOOP
 		onrows := onrows || rec::text;
 	END LOOP;
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
-	EXECUTE 'PREPARE rbi_pp_off AS ' || q;
-	FOR rec IN EXECUTE 'EXECUTE rbi_pp_off(' || args || ')' LOOP
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE lion_pp_off AS ' || q;
+	FOR rec IN EXECUTE 'EXECUTE lion_pp_off(' || args || ')' LOOP
 		offrows := offrows || rec::text;
 	END LOOP;
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
-	EXECUTE 'DEALLOCATE rbi_pp_on';
-	EXECUTE 'DEALLOCATE rbi_pp_off';
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_pp_on';
+	EXECUTE 'DEALLOCATE lion_pp_off';
 
 	SELECT (SELECT count(*) FROM (SELECT unnest(onrows)
 								  EXCEPT ALL SELECT unnest(offrows)) a)
@@ -560,30 +560,30 @@ BEGIN
 				  coalesce(array_length(onrows, 1), 0));
 END $$;
 
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1', '3');
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1', '-1');
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a = $1', '3');
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a = $1', '-1');
 -- a NULL parameter means zero rows, which is not the same as one group of 0
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1', 'NULL::int');
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = ANY ($1)',
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a = $1', 'NULL::int');
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a = ANY ($1)',
 				   'ARRAY[1,3]');
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = ANY ($1)',
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a = ANY ($1)',
 				   'NULL::int[]');
 -- `a IN ($1, $2)` keeps an ARRAY[] of Params in a generic plan
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a IN ($1, $2)', '1, 3');
-SELECT rbi_pd_prep('SELECT b, count(*) FROM rbi_pdt WHERE a = $1'
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a IN ($1, $2)', '1, 3');
+SELECT lion_pd_prep('SELECT b, count(*) FROM lion_pdt WHERE a = $1'
 				   ' GROUP BY b ORDER BY b', '3');
 -- the pinned column is printed from the entry's stored key, parameter or not
-SELECT rbi_pd_prep('SELECT a, count(*) FROM rbi_pdt WHERE a = $1 GROUP BY a',
+SELECT lion_pd_prep('SELECT a, count(*) FROM lion_pdt WHERE a = $1 GROUP BY a',
 				   '3');
-SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1 AND n IS NULL',
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdt WHERE a = $1 AND n IS NULL',
 				   '3');
 
 SET plan_cache_mode = force_generic_plan;
-PREPARE rbi_pp(int) AS SELECT count(*) FROM rbi_pdt WHERE a = $1;
-EXPLAIN (COSTS OFF) EXECUTE rbi_pp(3);
-EXECUTE rbi_pp(3);
-EXECUTE rbi_pp(4);
-DEALLOCATE rbi_pp;
+PREPARE lion_pp(int) AS SELECT count(*) FROM lion_pdt WHERE a = $1;
+EXPLAIN (COSTS OFF) EXECUTE lion_pp(3);
+EXECUTE lion_pp(3);
+EXECUTE lion_pp(4);
+DEALLOCATE lion_pp;
 RESET plan_cache_mode;
 
 /*
@@ -593,40 +593,40 @@ RESET plan_cache_mode;
  */
 EXPLAIN (COSTS OFF)
 SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
-	 LATERAL (SELECT count(*) AS c FROM rbi_pdt WHERE a = v.k) s;
+	 LATERAL (SELECT count(*) AS c FROM lion_pdt WHERE a = v.k) s;
 SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
-	 LATERAL (SELECT count(*) AS c FROM rbi_pdt WHERE a = v.k) s ORDER BY v.k;
-SET roaring_index.enable_count_pushdown = off;
+	 LATERAL (SELECT count(*) AS c FROM lion_pdt WHERE a = v.k) s ORDER BY v.k;
+SET pg_lion.enable_count_pushdown = off;
 SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
-	 LATERAL (SELECT count(*) AS c FROM rbi_pdt WHERE a = v.k) s ORDER BY v.k;
-RESET roaring_index.enable_count_pushdown;
-DROP FUNCTION rbi_pd_prep(text, text);
+	 LATERAL (SELECT count(*) AS c FROM lion_pdt WHERE a = v.k) s ORDER BY v.k;
+RESET pg_lion.enable_count_pushdown;
+DROP FUNCTION lion_pd_prep(text, text);
 
-DROP TABLE rbi_pdn;
-DROP TABLE rbi_pdv;
-DROP TABLE rbi_pdc;
-DROP OPERATOR CLASS rbi_lower_ops USING roaring;
+DROP TABLE lion_pdn;
+DROP TABLE lion_pdv;
+DROP TABLE lion_pdc;
+DROP OPERATOR CLASS lion_lower_ops USING lion;
 DROP OPERATOR === (text, text);
-DROP FUNCTION rbi_lower_eq(text, text);
-DROP FUNCTION rbi_lower_hash(text);
-DROP TABLE rbi_pdw;
-DROP TABLE rbi_pdd;
-DROP TABLE rbi_pdh;
-DROP TABLE rbi_pdg;
-DROP TABLE rbi_pdi;
-DROP TABLE rbi_pde;
-DROP TABLE rbi_pdt;
-DROP FUNCTION rbi_pd(text);
-DROP FUNCTION rbi_pd_counters(text);
-DROP FUNCTION rbi_plans(text);
+DROP FUNCTION lion_lower_eq(text, text);
+DROP FUNCTION lion_lower_hash(text);
+DROP TABLE lion_pdw;
+DROP TABLE lion_pdd;
+DROP TABLE lion_pdh;
+DROP TABLE lion_pdg;
+DROP TABLE lion_pdi;
+DROP TABLE lion_pde;
+DROP TABLE lion_pdt;
+DROP FUNCTION lion_pd(text);
+DROP FUNCTION lion_pd_counters(text);
+DROP FUNCTION lion_plans(text);
 -- enable_partitionwise_aggregate must not switch the pushdown off for a plain table
-CREATE TABLE rbi_pwa (k int NOT NULL);
-INSERT INTO rbi_pwa SELECT g % 10 FROM generate_series(1, 20000) g;
-CREATE INDEX rbi_pwa_k ON rbi_pwa USING roaring (k);
+CREATE TABLE lion_pwa (k int NOT NULL);
+INSERT INTO lion_pwa SELECT g % 10 FROM generate_series(1, 20000) g;
+CREATE INDEX lion_pwa_k ON lion_pwa USING lion (k);
 SET synchronous_commit = on;
-VACUUM ANALYZE rbi_pwa;
+VACUUM ANALYZE lion_pwa;
 SET enable_partitionwise_aggregate = on;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_pwa WHERE k = 3;
-EXPLAIN (COSTS OFF) SELECT k, count(*) FROM rbi_pwa GROUP BY k;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pwa WHERE k = 3;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_pwa GROUP BY k;
 RESET enable_partitionwise_aggregate;
-DROP TABLE rbi_pwa;
+DROP TABLE lion_pwa;

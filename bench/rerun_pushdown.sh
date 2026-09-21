@@ -8,7 +8,7 @@ P=$(cd "$(dirname "$0")/.." && pwd)
 bench_build_extension "$PREFIX" "$P"
 bench_start_cluster "$PREFIX" "$DATA"
 mkdir -p "$P/bench/logs"
-bench_psql -tA -c "select count(*) || ' roaring indexes' from pg_class where relname like 'fact_%_roaring'"
+bench_psql -tA -c "select count(*) || ' lion indexes' from pg_class where relname like 'fact_%_roaring'"
 SCRATCH=$(dirname "$PREFIX") T=$T ONLY="2b 2c" "$P/bench/bench.sh" > "$P/bench/logs/${TAG}_bench_stdout.txt" 2>&1
 cp "$(dirname "$PREFIX")/bench_results.txt" "$P/bench/logs/${TAG}_queries.txt"
 cp "$(dirname "$PREFIX")/bench_plans.log" "$P/bench/logs/${TAG}_query_plans.log"

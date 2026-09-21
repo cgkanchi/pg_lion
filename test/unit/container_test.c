@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * container_test.c
- *	  Standalone unit tests for src/rbi_container.c.
+ *	  Standalone unit tests for src/lion_container.c.
  *
  *	  Built by "make unit PG_CONFIG=..." with -DFRONTEND, so this program
  *	  links against nothing but libc and the container library itself.
@@ -9,7 +9,7 @@
  *	  plain bool[32768].  After each phase (and periodically inside the
  *	  randomized phases) the container is compared against the reference for
  *	  all 32768 possible members, for cardinality, for to_array() and for
- *	  iterate() order, and rbi_container_check() must accept it.
+ *	  iterate() order, and lion_container_check() must accept it.
  *
  *	  Exit status is 0 only if every check passed.
  *-------------------------------------------------------------------------
@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rbi_container.h"
+#include "lion_container.h"
 
 #define TEST_CKEY	0x0BADF00D
 
@@ -94,9 +94,9 @@ rng_below(uint32 n)
 
 typedef union CBuf
 {
-	RBIContainer c;
+	LionContainer c;
 	uint64		force_align;
-	char		data[RBI_CONTAINER_MAX_SIZE];
+	char		data[LION_CONTAINER_MAX_SIZE];
 } CBuf;
 
 /* ----------------------------------------------------------------
@@ -106,7 +106,7 @@ typedef union CBuf
 
 typedef struct Ref
 {
-	bool		m[RBI_CONTAINER_RANGE];
+	bool		m[LION_CONTAINER_RANGE];
 	uint32		card;
 } Ref;
 
@@ -175,7 +175,7 @@ ref_nruns(const Ref *r)
 	uint32		i;
 	uint32		n = 0;
 
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 		if (r->m[i] && (i == 0 || !r->m[i - 1]))
 			n++;
 	return n;
@@ -186,8 +186,8 @@ ref_nruns(const Ref *r)
  * ----------------------------------------------------------------
  */
 
-static uint16 scratch_array[RBI_CONTAINER_RANGE];
-static uint16 scratch_iter[RBI_CONTAINER_RANGE];
+static uint16 scratch_array[LION_CONTAINER_RANGE];
+static uint16 scratch_iter[LION_CONTAINER_RANGE];
 
 typedef struct IterState
 {
@@ -201,7 +201,7 @@ iter_cb(uint16 lo, void *arg)
 {
 	IterState  *st = (IterState *) arg;
 
-	if (st->n < RBI_CONTAINER_RANGE)
+	if (st->n < LION_CONTAINER_RANGE)
 		st->out[st->n] = lo;
 	st->n++;
 	return st->n < st->limit;
@@ -209,23 +209,23 @@ iter_cb(uint16 lo, void *arg)
 
 /* Cheap per-operation checks. */
 static void
-verify_light(const RBIContainer *c, const Ref *r)
+verify_light(const LionContainer *c, const Ref *r)
 {
 	const char *msg = "?";
 
-	CHECK(rbi_container_size(c) <= RBI_CONTAINER_MAX_SIZE, "size invariant");
-	if (!rbi_container_check(c, RBI_CONTAINER_MAX_SIZE, &msg))
+	CHECK(lion_container_size(c) <= LION_CONTAINER_MAX_SIZE, "size invariant");
+	if (!lion_container_check(c, LION_CONTAINER_MAX_SIZE, &msg))
 		CHECK(false, msg);
 	else
 		CHECK(true, "check");
-	CHECK(rbi_container_cardinality(c) == r->card, "cardinality vs reference");
+	CHECK(lion_container_cardinality(c) == r->card, "cardinality vs reference");
 	CHECK(c->ckey == TEST_CKEY, "ckey preserved");
 	CHECK(c->flags == 0, "flags zero");
 }
 
 /* Full comparison against the reference. */
 static void
-verify_full(const RBIContainer *c, const Ref *r)
+verify_full(const LionContainer *c, const Ref *r)
 {
 	uint32		i;
 	uint32		n;
@@ -238,20 +238,20 @@ verify_full(const RBIContainer *c, const Ref *r)
 
 	/* contains() for every possible member */
 	bad = 0;
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
 		nmember_cmps++;
-		if (rbi_container_contains(c, (uint16) i) != r->m[i])
+		if (lion_container_contains(c, (uint16) i) != r->m[i])
 			bad++;
 	}
 	CHECK(bad == 0, "contains() disagrees with the reference");
 
 	/* to_array() */
-	n = rbi_container_to_array(c, scratch_array);
+	n = lion_container_to_array(c, scratch_array);
 	CHECK(n == r->card, "to_array() count");
 	k = 0;
 	bad = 0;
-	for (i = 0; i < RBI_CONTAINER_RANGE && k < n; i++)
+	for (i = 0; i < LION_CONTAINER_RANGE && k < n; i++)
 		if (r->m[i])
 		{
 			if (scratch_array[k] != (uint16) i)
@@ -266,9 +266,9 @@ verify_full(const RBIContainer *c, const Ref *r)
 
 	/* iterate() must produce exactly the same sequence */
 	st.n = 0;
-	st.limit = RBI_CONTAINER_RANGE + 1;
+	st.limit = LION_CONTAINER_RANGE + 1;
 	st.out = scratch_iter;
-	rbi_container_iterate(c, iter_cb, &st);
+	lion_container_iterate(c, iter_cb, &st);
 	CHECK(st.n == r->card, "iterate() visited the wrong number of members");
 	bad = 0;
 	for (i = 0; i < n && i < st.n; i++)
@@ -279,20 +279,20 @@ verify_full(const RBIContainer *c, const Ref *r)
 	/* the size must be exactly what the representation implies */
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
-			expected = RBI_CONTAINER_HDRSZ + (Size) r->card * sizeof(uint16);
-			CHECK(r->card <= RBI_ARRAY_MAX_CARD, "array over RBI_ARRAY_MAX_CARD");
+		case LION_CT_ARRAY:
+			expected = LION_CONTAINER_HDRSZ + (Size) r->card * sizeof(uint16);
+			CHECK(r->card <= LION_ARRAY_MAX_CARD, "array over LION_ARRAY_MAX_CARD");
 			break;
-		case RBI_CT_BITSET:
-			expected = RBI_CONTAINER_HDRSZ + RBI_BITSET_BYTES;
+		case LION_CT_BITSET:
+			expected = LION_CONTAINER_HDRSZ + LION_BITSET_BYTES;
 			break;
 		default:
-			expected = RBI_CONTAINER_HDRSZ + sizeof(uint16) +
-				(Size) RBI_RUN_NRUNS(c) * sizeof(RBIRun);
-			CHECK(RBI_RUN_NRUNS(c) == ref_nruns(r), "run count vs reference");
+			expected = LION_CONTAINER_HDRSZ + sizeof(uint16) +
+				(Size) LION_RUN_NRUNS(c) * sizeof(LionRun);
+			CHECK(LION_RUN_NRUNS(c) == ref_nruns(r), "run count vs reference");
 			break;
 	}
-	CHECK(rbi_container_size(c) == expected, "rbi_container_size()");
+	CHECK(lion_container_size(c) == expected, "lion_container_size()");
 }
 
 /* Build a container from a reference with repeated add(). */
@@ -301,10 +301,10 @@ build_by_add(CBuf *b, const Ref *r)
 {
 	uint32		i;
 
-	rbi_container_init(&b->c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&b->c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 		if (r->m[i])
-			(void) rbi_container_add(&b->c, (uint16) i);
+			(void) lion_container_add(&b->c, (uint16) i);
 }
 
 /* Build a container from a reference with the bulk builder. */
@@ -313,10 +313,10 @@ build_by_append(CBuf *b, const Ref *r)
 {
 	uint32		i;
 
-	rbi_container_init(&b->c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&b->c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 		if (r->m[i])
-			rbi_container_append_sorted(&b->c, (uint16) i);
+			lion_container_append_sorted(&b->c, (uint16) i);
 }
 
 /* Shared work objects (a Ref is 32KB, so keep them out of the stack). */
@@ -338,35 +338,35 @@ test_empty(void)
 {
 	phase("empty container");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "init() produces an ARRAY");
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "init() produces an ARRAY");
 	CHECK(buf_a.c.cardinality == 0, "init() cardinality is 0");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_HDRSZ,
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_HDRSZ,
 		  "empty container is 8 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(!rbi_container_remove(&buf_a.c, 0), "remove() from empty is false");
-	CHECK(!rbi_container_remove(&buf_a.c, 32767), "remove() from empty is false");
-	CHECK(!rbi_container_contains(&buf_a.c, 12345), "contains() on empty");
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 32767) == 0,
+	CHECK(!lion_container_remove(&buf_a.c, 0), "remove() from empty is false");
+	CHECK(!lion_container_remove(&buf_a.c, 32767), "remove() from empty is false");
+	CHECK(!lion_container_contains(&buf_a.c, 12345), "contains() on empty");
+	CHECK(lion_container_range_cardinality(&buf_a.c, 0, 32767) == 0,
 		  "range_cardinality() on empty");
-	CHECK(rbi_container_remove_range(&buf_a.c, 0, 32767) == 0,
+	CHECK(lion_container_remove_range(&buf_a.c, 0, 32767) == 0,
 		  "remove_range() on empty");
 
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "optimize() of empty picks ARRAY");
-	CHECK(rbi_container_size(&buf_a.c) == 8, "optimized empty is 8 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "optimize() of empty picks ARRAY");
+	CHECK(lion_container_size(&buf_a.c) == 8, "optimized empty is 8 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	rbi_container_to_bitset(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "to_bitset() forces BITSET");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_MAX_SIZE,
+	lion_container_to_bitset(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "to_bitset() forces BITSET");
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_MAX_SIZE,
 		  "BITSET is always 4104 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "optimize() returns an empty BITSET to ARRAY");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "optimize() returns an empty BITSET to ARRAY");
 	verify_full(&buf_a.c, &ref_a);
 }
 
@@ -375,60 +375,60 @@ test_boundaries(void)
 {
 	phase("lo boundaries 0 and 32767");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 
-	CHECK(rbi_container_add(&buf_a.c, 0), "add(0)");
+	CHECK(lion_container_add(&buf_a.c, 0), "add(0)");
 	(void) ref_add(&ref_a, 0);
-	CHECK(rbi_container_size(&buf_a.c) == 10, "one-member ARRAY is 10 bytes");
+	CHECK(lion_container_size(&buf_a.c) == 10, "one-member ARRAY is 10 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(!rbi_container_add(&buf_a.c, 0), "add(0) again is false");
-	CHECK(rbi_container_add(&buf_a.c, 32767), "add(32767)");
+	CHECK(!lion_container_add(&buf_a.c, 0), "add(0) again is false");
+	CHECK(lion_container_add(&buf_a.c, 32767), "add(32767)");
 	(void) ref_add(&ref_a, 32767);
-	CHECK(rbi_container_size(&buf_a.c) == 12, "two-member ARRAY is 12 bytes");
+	CHECK(lion_container_size(&buf_a.c) == 12, "two-member ARRAY is 12 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 0) == 1, "range [0,0]");
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 32767, 32767) == 1,
+	CHECK(lion_container_range_cardinality(&buf_a.c, 0, 0) == 1, "range [0,0]");
+	CHECK(lion_container_range_cardinality(&buf_a.c, 32767, 32767) == 1,
 		  "range [32767,32767]");
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 1, 32766) == 0,
+	CHECK(lion_container_range_cardinality(&buf_a.c, 1, 32766) == 0,
 		  "range [1,32766]");
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 32767) == 2,
+	CHECK(lion_container_range_cardinality(&buf_a.c, 0, 32767) == 2,
 		  "range [0,32767]");
 
 	/* the same two boundary members as a BITSET and as a RUN */
-	rbi_container_to_bitset(&buf_a.c);
+	lion_container_to_bitset(&buf_a.c);
 	verify_full(&buf_a.c, &ref_a);
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 32767) == 2,
+	CHECK(lion_container_range_cardinality(&buf_a.c, 0, 32767) == 2,
 		  "BITSET range [0,32767]");
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "2 scattered members optimize to ARRAY");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "2 scattered members optimize to ARRAY");
 
 	/* a RUN touching both ends */
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	(void) rbi_container_add(&buf_a.c, 0);
-	(void) rbi_container_add(&buf_a.c, 1);
-	(void) rbi_container_add(&buf_a.c, 2);
-	(void) rbi_container_add(&buf_a.c, 32765);
-	(void) rbi_container_add(&buf_a.c, 32766);
-	(void) rbi_container_add(&buf_a.c, 32767);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	(void) lion_container_add(&buf_a.c, 0);
+	(void) lion_container_add(&buf_a.c, 1);
+	(void) lion_container_add(&buf_a.c, 2);
+	(void) lion_container_add(&buf_a.c, 32765);
+	(void) lion_container_add(&buf_a.c, 32766);
+	(void) lion_container_add(&buf_a.c, 32767);
 	(void) ref_add(&ref_a, 0);
 	(void) ref_add(&ref_a, 1);
 	(void) ref_add(&ref_a, 2);
 	(void) ref_add(&ref_a, 32765);
 	(void) ref_add(&ref_a, 32766);
 	(void) ref_add(&ref_a, 32767);
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "two 3-member runs optimize to RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "two runs");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 8, "2-run container is 18 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "two 3-member runs optimize to RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "two runs");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 8, "2-run container is 18 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(rbi_container_remove(&buf_a.c, 32767), "remove(32767) from a RUN");
+	CHECK(lion_container_remove(&buf_a.c, 32767), "remove(32767) from a RUN");
 	(void) ref_remove(&ref_a, 32767);
 	verify_full(&buf_a.c, &ref_a);
-	CHECK(rbi_container_add(&buf_a.c, 32767), "add(32767) back");
+	CHECK(lion_container_add(&buf_a.c, 32767), "add(32767) back");
 	(void) ref_add(&ref_a, 32767);
 	verify_full(&buf_a.c, &ref_a);
 }
@@ -440,58 +440,58 @@ test_array_bitset_transition(void)
 
 	phase("ARRAY <-> BITSET at 2048/2049");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 
 	/* 2048 scattered members: the largest legal ARRAY */
-	for (i = 0; i < RBI_ARRAY_MAX_CARD; i++)
+	for (i = 0; i < LION_ARRAY_MAX_CARD; i++)
 	{
-		CHECK(rbi_container_add(&buf_a.c, (uint16) (i * 3)), "add");
+		CHECK(lion_container_add(&buf_a.c, (uint16) (i * 3)), "add");
 		(void) ref_add(&ref_a, i * 3);
 	}
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "2048 members still fit in an ARRAY");
-	CHECK(buf_a.c.cardinality == RBI_ARRAY_MAX_CARD, "cardinality 2048");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_MAX_SIZE,
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "2048 members still fit in an ARRAY");
+	CHECK(buf_a.c.cardinality == LION_ARRAY_MAX_CARD, "cardinality 2048");
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_MAX_SIZE,
 		  "2048-member ARRAY is 4104 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* a duplicate must not trigger the conversion */
-	CHECK(!rbi_container_add(&buf_a.c, 0), "duplicate add on a full ARRAY");
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "duplicate add leaves the ARRAY alone");
+	CHECK(!lion_container_add(&buf_a.c, 0), "duplicate add on a full ARRAY");
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "duplicate add leaves the ARRAY alone");
 
 	/* member 2049 forces BITSET */
-	CHECK(rbi_container_add(&buf_a.c, (uint16) (RBI_ARRAY_MAX_CARD * 3)), "add 2049th");
-	(void) ref_add(&ref_a, RBI_ARRAY_MAX_CARD * 3);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "2049 members force BITSET");
-	CHECK(buf_a.c.cardinality == RBI_ARRAY_MAX_CARD + 1, "cardinality 2049");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_MAX_SIZE, "BITSET is 4104");
+	CHECK(lion_container_add(&buf_a.c, (uint16) (LION_ARRAY_MAX_CARD * 3)), "add 2049th");
+	(void) ref_add(&ref_a, LION_ARRAY_MAX_CARD * 3);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "2049 members force BITSET");
+	CHECK(buf_a.c.cardinality == LION_ARRAY_MAX_CARD + 1, "cardinality 2049");
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_MAX_SIZE, "BITSET is 4104");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* removing back down to 2048 returns to ARRAY */
-	CHECK(rbi_container_remove(&buf_a.c, (uint16) (RBI_ARRAY_MAX_CARD * 3)), "remove 2049th");
-	(void) ref_remove(&ref_a, RBI_ARRAY_MAX_CARD * 3);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "2048 members return to ARRAY");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_MAX_SIZE, "still 4104 bytes");
+	CHECK(lion_container_remove(&buf_a.c, (uint16) (LION_ARRAY_MAX_CARD * 3)), "remove 2049th");
+	(void) ref_remove(&ref_a, LION_ARRAY_MAX_CARD * 3);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "2048 members return to ARRAY");
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_MAX_SIZE, "still 4104 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* one more removal stays in ARRAY and shrinks */
-	CHECK(rbi_container_remove(&buf_a.c, 0), "remove(0)");
+	CHECK(lion_container_remove(&buf_a.c, 0), "remove(0)");
 	(void) ref_remove(&ref_a, 0);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "still ARRAY");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_MAX_SIZE - 2, "4102 bytes");
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "still ARRAY");
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_MAX_SIZE - 2, "4102 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* the same transition through append_sorted */
 	phase("append_sorted ARRAY -> BITSET");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i <= RBI_ARRAY_MAX_CARD; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i <= LION_ARRAY_MAX_CARD; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 3));
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 3));
 		(void) ref_add(&ref_a, i * 3);
-		if (i < RBI_ARRAY_MAX_CARD)
-			CHECK(buf_a.c.type == RBI_CT_ARRAY, "append_sorted keeps ARRAY <= 2048");
+		if (i < LION_ARRAY_MAX_CARD)
+			CHECK(buf_a.c.type == LION_CT_ARRAY, "append_sorted keeps ARRAY <= 2048");
 		else
-			CHECK(buf_a.c.type == RBI_CT_BITSET, "append_sorted switches at 2049");
+			CHECK(buf_a.c.type == LION_CT_BITSET, "append_sorted switches at 2049");
 	}
 	verify_full(&buf_a.c, &ref_a);
 }
@@ -503,50 +503,50 @@ test_run_merge_and_split(void)
 
 	phase("RUN merge on add, split on remove");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 
 	/* [0..2] [4..6] [8..10] */
 	for (i = 0; i <= 10; i++)
 		if (i % 4 != 3)
 		{
-			(void) rbi_container_add(&buf_a.c, (uint16) i);
+			(void) lion_container_add(&buf_a.c, (uint16) i);
 			(void) ref_add(&ref_a, i);
 		}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "three 3-member runs optimize to RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 3, "3 runs");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 12, "3-run container is 22 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "three 3-member runs optimize to RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 3, "3 runs");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 12, "3-run container is 22 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* adding 3 merges runs 0 and 1 */
-	CHECK(rbi_container_add(&buf_a.c, 3), "add(3) into the gap");
+	CHECK(lion_container_add(&buf_a.c, 3), "add(3) into the gap");
 	(void) ref_add(&ref_a, 3);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "add merged two runs");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "add merged two runs");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* adding 7 merges the rest into one run */
-	CHECK(rbi_container_add(&buf_a.c, 7), "add(7) into the gap");
+	CHECK(lion_container_add(&buf_a.c, 7), "add(7) into the gap");
 	(void) ref_add(&ref_a, 7);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "add merged into a single run");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 4, "1-run container is 14 bytes");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "add merged into a single run");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 4, "1-run container is 14 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* removing from the middle splits */
-	CHECK(rbi_container_remove(&buf_a.c, 5), "remove(5) splits the run");
+	CHECK(lion_container_remove(&buf_a.c, 5), "remove(5) splits the run");
 	(void) ref_remove(&ref_a, 5);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "remove split one run into two");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "remove split one run into two");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* removing the first member of the first run */
-	CHECK(rbi_container_remove(&buf_a.c, 0), "remove(0), run start");
+	CHECK(lion_container_remove(&buf_a.c, 0), "remove(0), run start");
 	(void) ref_remove(&ref_a, 0);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "run start removal keeps the run count");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "run start removal keeps the run count");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* removing the last member of the last run */
-	CHECK(rbi_container_remove(&buf_a.c, 10), "remove(10), run end");
+	CHECK(lion_container_remove(&buf_a.c, 10), "remove(10), run end");
 	(void) ref_remove(&ref_a, 10);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "run end removal keeps the run count");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "run end removal keeps the run count");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* shrink the second run to one member and then delete it */
@@ -554,21 +554,21 @@ test_run_merge_and_split(void)
 	{
 		if (!ref_remove(&ref_a, i))
 			continue;
-		CHECK(rbi_container_remove(&buf_a.c, (uint16) i), "remove from the second run");
+		CHECK(lion_container_remove(&buf_a.c, (uint16) i), "remove from the second run");
 		verify_full(&buf_a.c, &ref_a);
 	}
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "second run disappeared");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "second run disappeared");
 
 	/* drain the first run completely, reaching cardinality 0 */
 	for (i = 1; i <= 4; i++)
 		if (ref_remove(&ref_a, i))
 		{
-			CHECK(rbi_container_remove(&buf_a.c, (uint16) i), "drain the run");
+			CHECK(lion_container_remove(&buf_a.c, (uint16) i), "drain the run");
 			verify_full(&buf_a.c, &ref_a);
 		}
 	CHECK(buf_a.c.cardinality == 0, "cardinality reached 0");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 0, "no runs left");
-	CHECK(rbi_container_size(&buf_a.c) == 10, "empty RUN container is 10 bytes");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 0, "no runs left");
+	CHECK(lion_container_size(&buf_a.c) == 10, "empty RUN container is 10 bytes");
 }
 
 static void
@@ -580,62 +580,62 @@ test_run_overflow(void)
 	/* --- add that would need a 1024th run --- */
 	phase("RUN add overflow -> BITSET");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_RUN_MAX_NRUNS; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
 		for (j = 0; j < 3; j++)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) (6 * i + j));
+			lion_container_append_sorted(&buf_a.c, (uint16) (6 * i + j));
 			(void) ref_add(&ref_a, 6 * i + j);
 		}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "1023 runs optimize to RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == RBI_RUN_MAX_NRUNS, "1023 runs");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 4 * RBI_RUN_MAX_NRUNS,
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "1023 runs optimize to RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == LION_RUN_MAX_NRUNS, "1023 runs");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 4 * LION_RUN_MAX_NRUNS,
 		  "1023-run container is 4102 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* 4 has no neighbour, so it needs a new (1024th) run */
-	CHECK(rbi_container_add(&buf_a.c, 4), "add an isolated value to a full RUN");
+	CHECK(lion_container_add(&buf_a.c, 4), "add an isolated value to a full RUN");
 	(void) ref_add(&ref_a, 4);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "run overflow converts to BITSET");
+	CHECK(buf_a.c.type == LION_CT_BITSET, "run overflow converts to BITSET");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* --- remove that would split into a 1024th run --- */
 	phase("RUN split overflow -> BITSET");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_RUN_MAX_NRUNS; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
 		for (j = 0; j < 3; j++)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) (4 * i + j));
+			lion_container_append_sorted(&buf_a.c, (uint16) (4 * i + j));
 			(void) ref_add(&ref_a, 4 * i + j);
 		}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "1023 runs optimize to RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == RBI_RUN_MAX_NRUNS, "1023 runs");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "1023 runs optimize to RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == LION_RUN_MAX_NRUNS, "1023 runs");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(rbi_container_remove(&buf_a.c, 1), "remove the middle of a run");
+	CHECK(lion_container_remove(&buf_a.c, 1), "remove the middle of a run");
 	(void) ref_remove(&ref_a, 1);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "split overflow converts to BITSET");
+	CHECK(buf_a.c.type == LION_CT_BITSET, "split overflow converts to BITSET");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* --- remove_range that would split into a 1024th run --- */
 	phase("RUN remove_range overflow -> BITSET");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_RUN_MAX_NRUNS; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
 		for (j = 0; j < 5; j++)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) (7 * i + j));
+			lion_container_append_sorted(&buf_a.c, (uint16) (7 * i + j));
 			(void) ref_add(&ref_a, 7 * i + j);
 		}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "1023 5-member runs optimize to RUN");
-	CHECK(rbi_container_remove_range(&buf_a.c, 2, 2) == 1,
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "1023 5-member runs optimize to RUN");
+	CHECK(lion_container_remove_range(&buf_a.c, 2, 2) == 1,
 		  "remove_range() of one interior value");
 	(void) ref_remove_range(&ref_a, 2, 2);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "remove_range split overflow -> BITSET");
+	CHECK(buf_a.c.type == LION_CT_BITSET, "remove_range split overflow -> BITSET");
 	verify_full(&buf_a.c, &ref_a);
 }
 
@@ -646,53 +646,53 @@ test_full_container(void)
 
 	phase("full container (32768 members)");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) i);
+		lion_container_append_sorted(&buf_a.c, (uint16) i);
 		(void) ref_add(&ref_a, i);
 	}
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "append_sorted ends in a BITSET");
-	CHECK(buf_a.c.cardinality == RBI_CONTAINER_RANGE, "cardinality 32768");
+	CHECK(buf_a.c.type == LION_CT_BITSET, "append_sorted ends in a BITSET");
+	CHECK(buf_a.c.cardinality == LION_CONTAINER_RANGE, "cardinality 32768");
 	verify_full(&buf_a.c, &ref_a);
 
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "a full container optimizes to RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "a full container is one run");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 4,
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "a full container optimizes to RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "a full container is one run");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 4,
 		  "a full container is 14 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* punch a hole and fill it again */
-	CHECK(rbi_container_remove(&buf_a.c, 16000), "remove(16000)");
+	CHECK(lion_container_remove(&buf_a.c, 16000), "remove(16000)");
 	(void) ref_remove(&ref_a, 16000);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "the hole split the run");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 8, "18 bytes");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "the hole split the run");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 8, "18 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(rbi_container_add(&buf_a.c, 16000), "add(16000) back");
+	CHECK(lion_container_add(&buf_a.c, 16000), "add(16000) back");
 	(void) ref_add(&ref_a, 16000);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "the runs merged again");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "the runs merged again");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* both ends */
-	CHECK(rbi_container_remove(&buf_a.c, 0), "remove(0)");
+	CHECK(lion_container_remove(&buf_a.c, 0), "remove(0)");
 	(void) ref_remove(&ref_a, 0);
-	CHECK(rbi_container_remove(&buf_a.c, 32767), "remove(32767)");
+	CHECK(lion_container_remove(&buf_a.c, 32767), "remove(32767)");
 	(void) ref_remove(&ref_a, 32767);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "still one run");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "still one run");
 	verify_full(&buf_a.c, &ref_a);
 
-	CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 32767) == ref_a.card,
+	CHECK(lion_container_range_cardinality(&buf_a.c, 0, 32767) == ref_a.card,
 		  "range_cardinality() over everything");
-	CHECK(rbi_container_remove_range(&buf_a.c, 100, 200) == 101,
+	CHECK(lion_container_remove_range(&buf_a.c, 100, 200) == 101,
 		  "remove_range() of 101 members");
 	(void) ref_remove_range(&ref_a, 100, 200);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "remove_range() split the run");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "remove_range() split the run");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* and empty it completely */
-	CHECK(rbi_container_remove_range(&buf_a.c, 0, 32767) == ref_a.card,
+	CHECK(lion_container_remove_range(&buf_a.c, 0, 32767) == ref_a.card,
 		  "remove_range() of everything");
 	(void) ref_remove_range(&ref_a, 0, 32767);
 	CHECK(buf_a.c.cardinality == 0, "container is empty");
@@ -707,64 +707,64 @@ test_optimize_choices(void)
 	/* sparse: ARRAY is smallest */
 	phase("optimize picks ARRAY for sparse data");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 1000; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 7));
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 7));
 		(void) ref_add(&ref_a, i * 7);
 	}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "1000 isolated members -> ARRAY");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2000, "2008 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "1000 isolated members -> ARRAY");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2000, "2008 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* clustered: RUN is smallest */
 	phase("optimize picks RUN for clustered data");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 1000; i++)
 	{
 		uint32		lo = (i / 10) * 100 + (i % 10);
 
-		rbi_container_append_sorted(&buf_a.c, (uint16) lo);
+		lion_container_append_sorted(&buf_a.c, (uint16) lo);
 		(void) ref_add(&ref_a, lo);
 	}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "100 runs of 10 -> RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 100, "100 runs");
-	CHECK(rbi_container_size(&buf_a.c) == 8 + 2 + 400, "410 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "100 runs of 10 -> RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 100, "100 runs");
+	CHECK(lion_container_size(&buf_a.c) == 8 + 2 + 400, "410 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* scattered and too big for either ARRAY or RUN: BITSET */
 	phase("optimize picks BITSET for scattered dense data");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 3000; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 5));
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 5));
 		(void) ref_add(&ref_a, i * 5);
 	}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "3000 isolated members -> BITSET");
-	CHECK(rbi_container_size(&buf_a.c) == RBI_CONTAINER_MAX_SIZE, "4104 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "3000 isolated members -> BITSET");
+	CHECK(lion_container_size(&buf_a.c) == LION_CONTAINER_MAX_SIZE, "4104 bytes");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* exact tie between ARRAY (8+2c) and RUN (10+4r): prefer ARRAY */
 	phase("optimize tie-break prefers ARRAY over RUN");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	{
 		static const uint16 tie[] = {0, 1, 2, 10, 11};
 
 		for (i = 0; i < lengthof(tie); i++)
 		{
-			rbi_container_append_sorted(&buf_a.c, tie[i]);
+			lion_container_append_sorted(&buf_a.c, tie[i]);
 			(void) ref_add(&ref_a, tie[i]);
 		}
 	}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "5 members in 2 runs tie at 18 bytes -> ARRAY");
-	CHECK(rbi_container_size(&buf_a.c) == 18, "18 bytes");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "5 members in 2 runs tie at 18 bytes -> ARRAY");
+	CHECK(lion_container_size(&buf_a.c) == 18, "18 bytes");
 	verify_full(&buf_a.c, &ref_a);
 }
 
@@ -780,13 +780,13 @@ gen_sparse(Ref *r, uint32 n)
 	ref_init(r);
 	while (r->card < n)
 	{
-		uint32		lo = rng_below(RBI_CONTAINER_RANGE);
+		uint32		lo = rng_below(LION_CONTAINER_RANGE);
 
 		if (r->m[lo])
 			continue;
 		if (lo > 0 && r->m[lo - 1])
 			continue;
-		if (lo < RBI_CONTAINER_RANGE - 1 && r->m[lo + 1])
+		if (lo < LION_CONTAINER_RANGE - 1 && r->m[lo + 1])
 			continue;
 		(void) ref_add(r, lo);
 	}
@@ -803,7 +803,7 @@ gen_runs(Ref *r, uint32 nruns, uint32 minlen, uint32 maxlen)
 	for (i = 0; i < nruns; i++)
 	{
 		uint32		len = minlen + rng_below(maxlen - minlen + 1);
-		uint32		start = rng_below(RBI_CONTAINER_RANGE - len);
+		uint32		start = rng_below(LION_CONTAINER_RANGE - len);
 
 		for (j = 0; j < len; j++)
 			(void) ref_add(r, start + j);
@@ -815,40 +815,40 @@ static void
 gen_random(Ref *r, uint32 n)
 {
 	ref_init(r);
-	if (n >= RBI_CONTAINER_RANGE)
+	if (n >= LION_CONTAINER_RANGE)
 	{
 		uint32		i;
 
-		for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+		for (i = 0; i < LION_CONTAINER_RANGE; i++)
 			(void) ref_add(r, i);
 		return;
 	}
 	while (r->card < n)
-		(void) ref_add(r, rng_below(RBI_CONTAINER_RANGE));
+		(void) ref_add(r, rng_below(LION_CONTAINER_RANGE));
 }
 
 /* Build a container of exactly the requested representation. */
 static void
-gen_typed(Ref *r, CBuf *b, RBIContainerType t)
+gen_typed(Ref *r, CBuf *b, LionContainerType t)
 {
 	switch (t)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			gen_sparse(r, 300 + rng_below(300));
 			build_by_append(b, r);
-			rbi_container_optimize(&b->c);
+			lion_container_optimize(&b->c);
 			break;
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			gen_runs(r, 8 + rng_below(12), 150, 600);
 			build_by_append(b, r);
-			rbi_container_optimize(&b->c);
+			lion_container_optimize(&b->c);
 			break;
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			gen_random(r, 3000 + rng_below(6000));
 			build_by_append(b, r);
-			rbi_container_to_bitset(&b->c);
+			lion_container_to_bitset(&b->c);
 			break;
-		case RBI_CT_SPARSE:
+		case LION_CT_SPARSE:
 			/* not a container: see test/unit/sparse_test.c */
 			CHECK(false, "gen_typed() asked for a sparse segment");
 			break;
@@ -856,7 +856,7 @@ gen_typed(Ref *r, CBuf *b, RBIContainerType t)
 	CHECK(b->c.type == t, "generator produced the requested representation");
 }
 
-/* Pick a random existing member, or RBI_CONTAINER_RANGE if there is none. */
+/* Pick a random existing member, or LION_CONTAINER_RANGE if there is none. */
 static uint32
 ref_pick_member(const Ref *r)
 {
@@ -864,18 +864,18 @@ ref_pick_member(const Ref *r)
 	uint32		i;
 
 	if (r->card == 0)
-		return RBI_CONTAINER_RANGE;
-	start = rng_below(RBI_CONTAINER_RANGE);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+		return LION_CONTAINER_RANGE;
+	start = rng_below(LION_CONTAINER_RANGE);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
 		uint32		lo = start + i;
 
-		if (lo >= RBI_CONTAINER_RANGE)
-			lo -= RBI_CONTAINER_RANGE;
+		if (lo >= LION_CONTAINER_RANGE)
+			lo -= LION_CONTAINER_RANGE;
 		if (r->m[lo])
 			return lo;
 	}
-	return RBI_CONTAINER_RANGE;
+	return LION_CONTAINER_RANGE;
 }
 
 /* ----------------------------------------------------------------
@@ -895,15 +895,15 @@ test_append_matches_add(void)
 		gen_random(&ref_a, sizes[k]);
 
 		build_by_add(&buf_a, &ref_a);
-		rbi_container_optimize(&buf_a.c);
+		lion_container_optimize(&buf_a.c);
 		build_by_append(&buf_b, &ref_a);
-		rbi_container_optimize(&buf_b.c);
+		lion_container_optimize(&buf_b.c);
 
-		CHECK(rbi_container_size(&buf_a.c) == rbi_container_size(&buf_b.c),
+		CHECK(lion_container_size(&buf_a.c) == lion_container_size(&buf_b.c),
 			  "append_sorted and add produce the same size");
 		CHECK(buf_a.c.type == buf_b.c.type,
 			  "append_sorted and add produce the same type");
-		CHECK(memcmp(&buf_a.c, &buf_b.c, rbi_container_size(&buf_a.c)) == 0,
+		CHECK(memcmp(&buf_a.c, &buf_b.c, lion_container_size(&buf_a.c)) == 0,
 			  "append_sorted and add produce identical bytes");
 		verify_full(&buf_b.c, &ref_a);
 	}
@@ -914,11 +914,11 @@ test_append_matches_add(void)
 		gen_runs(&ref_a, 5 + k * 40, 3, 40);
 
 		build_by_add(&buf_a, &ref_a);
-		rbi_container_optimize(&buf_a.c);
+		lion_container_optimize(&buf_a.c);
 		build_by_append(&buf_b, &ref_a);
-		rbi_container_optimize(&buf_b.c);
+		lion_container_optimize(&buf_b.c);
 
-		CHECK(memcmp(&buf_a.c, &buf_b.c, rbi_container_size(&buf_a.c)) == 0,
+		CHECK(memcmp(&buf_a.c, &buf_b.c, lion_container_size(&buf_a.c)) == 0,
 			  "clustered: append_sorted and add produce identical bytes");
 		verify_full(&buf_b.c, &ref_a);
 	}
@@ -959,7 +959,7 @@ ref_remove_if(Ref *r, bool (*pred) (uint16, void *))
 	uint32		i;
 	uint32		n = 0;
 
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 		if (r->m[i] && pred((uint16) i, NULL))
 		{
 			r->m[i] = false;
@@ -972,7 +972,7 @@ ref_remove_if(Ref *r, bool (*pred) (uint16, void *))
 static void
 test_remove_if(void)
 {
-	static const RBIContainerType types[] = {RBI_CT_ARRAY, RBI_CT_BITSET, RBI_CT_RUN};
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN};
 	uint32		t;
 	uint32		removed;
 	uint32		expected;
@@ -985,56 +985,56 @@ test_remove_if(void)
 		verify_full(&buf_a.c, &ref_a);
 
 		expected = ref_remove_if(&ref_a, pred_mod3);
-		removed = rbi_container_remove_if(&buf_a.c, pred_mod3, NULL);
+		removed = lion_container_remove_if(&buf_a.c, pred_mod3, NULL);
 		CHECK(removed == expected, "remove_if() removal count");
 		verify_full(&buf_a.c, &ref_a);
 
 		/* a second pass must remove nothing */
-		removed = rbi_container_remove_if(&buf_a.c, pred_mod3, NULL);
+		removed = lion_container_remove_if(&buf_a.c, pred_mod3, NULL);
 		CHECK(removed == 0, "remove_if() is idempotent");
 		verify_full(&buf_a.c, &ref_a);
 
 		/* a predicate that keeps everything */
-		removed = rbi_container_remove_if(&buf_a.c, pred_none, NULL);
+		removed = lion_container_remove_if(&buf_a.c, pred_none, NULL);
 		CHECK(removed == 0, "remove_if(false) removes nothing");
 		verify_full(&buf_a.c, &ref_a);
 
-		rbi_container_optimize(&buf_a.c);
+		lion_container_optimize(&buf_a.c);
 		verify_full(&buf_a.c, &ref_a);
 
 		/* and one that removes everything */
 		expected = ref_a.card;
-		removed = rbi_container_remove_if(&buf_a.c, pred_all, NULL);
+		removed = lion_container_remove_if(&buf_a.c, pred_all, NULL);
 		CHECK(removed == expected, "remove_if(true) empties the container");
 		(void) ref_remove_if(&ref_a, pred_all);
 		CHECK(buf_a.c.cardinality == 0, "cardinality 0 after remove_if(true)");
 		verify_full(&buf_a.c, &ref_a);
-		rbi_container_optimize(&buf_a.c);
+		lion_container_optimize(&buf_a.c);
 		verify_full(&buf_a.c, &ref_a);
 	}
 
 	/* a RUN shredded into more than 1023 runs must leave RUN behind */
-	phase("remove_if shreds a RUN past RBI_RUN_MAX_NRUNS");
+	phase("remove_if shreds a RUN past LION_RUN_MAX_NRUNS");
 	{
 		uint32		i;
 		uint32		j;
 
 		ref_init(&ref_a);
-		rbi_container_init(&buf_a.c, TEST_CKEY);
-		for (i = 0; i < RBI_RUN_MAX_NRUNS; i++)
+		lion_container_init(&buf_a.c, TEST_CKEY);
+		for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
 			for (j = 0; j < 5; j++)
 			{
-				rbi_container_append_sorted(&buf_a.c, (uint16) (7 * i + j));
+				lion_container_append_sorted(&buf_a.c, (uint16) (7 * i + j));
 				(void) ref_add(&ref_a, 7 * i + j);
 			}
-		rbi_container_optimize(&buf_a.c);
-		CHECK(buf_a.c.type == RBI_CT_RUN, "starts as a RUN");
+		lion_container_optimize(&buf_a.c);
+		CHECK(buf_a.c.type == LION_CT_RUN, "starts as a RUN");
 
 		expected = ref_remove_if(&ref_a, pred_even);
-		removed = rbi_container_remove_if(&buf_a.c, pred_even, NULL);
+		removed = lion_container_remove_if(&buf_a.c, pred_even, NULL);
 		CHECK(removed == expected, "remove_if() removal count");
-		CHECK(buf_a.c.type != RBI_CT_RUN, "a shredded RUN leaves the RUN encoding");
-		CHECK(rbi_container_size(&buf_a.c) <= RBI_CONTAINER_MAX_SIZE, "size invariant");
+		CHECK(buf_a.c.type != LION_CT_RUN, "a shredded RUN leaves the RUN encoding");
+		CHECK(lion_container_size(&buf_a.c) <= LION_CONTAINER_MAX_SIZE, "size invariant");
 		verify_full(&buf_a.c, &ref_a);
 	}
 }
@@ -1047,7 +1047,7 @@ test_remove_if(void)
 static void
 test_ranges(void)
 {
-	static const RBIContainerType types[] = {RBI_CT_ARRAY, RBI_CT_BITSET, RBI_CT_RUN};
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN};
 	uint32		t;
 	uint32		i;
 
@@ -1061,8 +1061,8 @@ test_ranges(void)
 		/* read-only range queries */
 		for (i = 0; i < 200; i++)
 		{
-			uint32		s = rng_below(RBI_CONTAINER_RANGE);
-			uint32		e = rng_below(RBI_CONTAINER_RANGE);
+			uint32		s = rng_below(LION_CONTAINER_RANGE);
+			uint32		e = rng_below(LION_CONTAINER_RANGE);
 
 			if (s > e)
 			{
@@ -1071,20 +1071,20 @@ test_ranges(void)
 				s = e;
 				e = tmp;
 			}
-			CHECK(rbi_container_range_cardinality(&buf_a.c, (uint16) s, (uint16) e) ==
+			CHECK(lion_container_range_cardinality(&buf_a.c, (uint16) s, (uint16) e) ==
 				  ref_range_card(&ref_a, s, e), "range_cardinality()");
 		}
-		CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 32767) == ref_a.card,
+		CHECK(lion_container_range_cardinality(&buf_a.c, 0, 32767) == ref_a.card,
 			  "range_cardinality() over the whole range");
-		CHECK(rbi_container_range_cardinality(&buf_a.c, 5, 4) == 0,
+		CHECK(lion_container_range_cardinality(&buf_a.c, 5, 4) == 0,
 			  "range_cardinality() of an empty range");
-		CHECK(rbi_container_remove_range(&buf_a.c, 5, 4) == 0,
+		CHECK(lion_container_remove_range(&buf_a.c, 5, 4) == 0,
 			  "remove_range() of an empty range");
 
 		/* destructive ranges, with a full verify after each */
 		for (i = 0; i < 25 && ref_a.card > 0; i++)
 		{
-			uint32		s = rng_below(RBI_CONTAINER_RANGE);
+			uint32		s = rng_below(LION_CONTAINER_RANGE);
 			uint32		width = rng_below(2000);
 			uint32		e = s + width;
 			uint32		expected;
@@ -1093,7 +1093,7 @@ test_ranges(void)
 			if (e > 32767)
 				e = 32767;
 			expected = ref_range_card(&ref_a, s, e);
-			removed = rbi_container_remove_range(&buf_a.c, (uint16) s, (uint16) e);
+			removed = lion_container_remove_range(&buf_a.c, (uint16) s, (uint16) e);
 			CHECK(removed == expected, "remove_range() removal count");
 			(void) ref_remove_range(&ref_a, s, e);
 			verify_full(&buf_a.c, &ref_a);
@@ -1105,19 +1105,19 @@ test_ranges(void)
 	for (t = 0; t < lengthof(types); t++)
 	{
 		gen_typed(&ref_a, &buf_a, types[t]);
-		(void) rbi_container_add(&buf_a.c, 0);
+		(void) lion_container_add(&buf_a.c, 0);
 		(void) ref_add(&ref_a, 0);
-		(void) rbi_container_add(&buf_a.c, 32767);
+		(void) lion_container_add(&buf_a.c, 32767);
 		(void) ref_add(&ref_a, 32767);
 		verify_full(&buf_a.c, &ref_a);
 
-		CHECK(rbi_container_range_cardinality(&buf_a.c, 0, 0) == 1, "range [0,0]");
-		CHECK(rbi_container_range_cardinality(&buf_a.c, 32767, 32767) == 1,
+		CHECK(lion_container_range_cardinality(&buf_a.c, 0, 0) == 1, "range [0,0]");
+		CHECK(lion_container_range_cardinality(&buf_a.c, 32767, 32767) == 1,
 			  "range [32767,32767]");
-		CHECK(rbi_container_remove_range(&buf_a.c, 0, 0) == 1, "remove_range [0,0]");
+		CHECK(lion_container_remove_range(&buf_a.c, 0, 0) == 1, "remove_range [0,0]");
 		(void) ref_remove_range(&ref_a, 0, 0);
 		verify_full(&buf_a.c, &ref_a);
-		CHECK(rbi_container_remove_range(&buf_a.c, 32767, 32767) == 1,
+		CHECK(lion_container_remove_range(&buf_a.c, 32767, 32767) == 1,
 			  "remove_range [32767,32767]");
 		(void) ref_remove_range(&ref_a, 32767, 32767);
 		verify_full(&buf_a.c, &ref_a);
@@ -1139,7 +1139,7 @@ ref_binop(const Ref *a, const Ref *b, Ref *out, int op)
 	uint32		i;
 
 	ref_init(out);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
 		bool		v;
 
@@ -1164,50 +1164,50 @@ ref_binop(const Ref *a, const Ref *b, Ref *out, int op)
 static void
 run_binops(void)
 {
-	Size		asz = rbi_container_size(&buf_a.c);
+	Size		asz = lion_container_size(&buf_a.c);
 	uint32		card;
 
 	memcpy(&buf_e, &buf_a, asz);
 
 	/* AND */
 	ref_binop(&ref_a, &ref_b, &ref_r, OP_AND);
-	card = rbi_container_and(&buf_a.c, &buf_b.c, &buf_d.c);
+	card = lion_container_and(&buf_a.c, &buf_b.c, &buf_d.c);
 	CHECK(card == ref_r.card, "and() returned the wrong cardinality");
 	CHECK(buf_d.c.ckey == buf_a.c.ckey, "and() dest ckey");
 	verify_full(&buf_d.c, &ref_r);
-	CHECK(rbi_container_and_cardinality(&buf_a.c, &buf_b.c) == ref_r.card,
+	CHECK(lion_container_and_cardinality(&buf_a.c, &buf_b.c) == ref_r.card,
 		  "and_cardinality() disagrees with and()");
-	CHECK(rbi_container_and_cardinality(&buf_b.c, &buf_a.c) == ref_r.card,
+	CHECK(lion_container_and_cardinality(&buf_b.c, &buf_a.c) == ref_r.card,
 		  "and_cardinality() is not symmetric");
 
 	/* OR */
 	ref_binop(&ref_a, &ref_b, &ref_r, OP_OR);
-	card = rbi_container_or(&buf_a.c, &buf_b.c, &buf_d.c);
+	card = lion_container_or(&buf_a.c, &buf_b.c, &buf_d.c);
 	CHECK(card == ref_r.card, "or() returned the wrong cardinality");
 	CHECK(buf_d.c.ckey == buf_a.c.ckey, "or() dest ckey");
 	verify_full(&buf_d.c, &ref_r);
 
 	/* ANDNOT both ways round */
 	ref_binop(&ref_a, &ref_b, &ref_r, OP_ANDNOT);
-	card = rbi_container_andnot(&buf_a.c, &buf_b.c, &buf_d.c);
+	card = lion_container_andnot(&buf_a.c, &buf_b.c, &buf_d.c);
 	CHECK(card == ref_r.card, "andnot() returned the wrong cardinality");
 	CHECK(buf_d.c.ckey == buf_a.c.ckey, "andnot() dest ckey");
 	verify_full(&buf_d.c, &ref_r);
 
 	ref_binop(&ref_b, &ref_a, &ref_r, OP_ANDNOT);
-	card = rbi_container_andnot(&buf_b.c, &buf_a.c, &buf_d.c);
+	card = lion_container_andnot(&buf_b.c, &buf_a.c, &buf_d.c);
 	CHECK(card == ref_r.card, "reverse andnot() cardinality");
 	verify_full(&buf_d.c, &ref_r);
 
 	/* the operands must not have been touched */
-	CHECK(rbi_container_size(&buf_a.c) == asz && memcmp(&buf_e, &buf_a, asz) == 0,
+	CHECK(lion_container_size(&buf_a.c) == asz && memcmp(&buf_e, &buf_a, asz) == 0,
 		  "a set operation modified its left operand");
 }
 
 static void
 test_setops(void)
 {
-	static const RBIContainerType types[] = {RBI_CT_ARRAY, RBI_CT_BITSET, RBI_CT_RUN};
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN};
 	uint32		ta;
 	uint32		tb;
 	uint32		trial;
@@ -1227,7 +1227,7 @@ test_setops(void)
 static void
 test_setops_special(void)
 {
-	static const RBIContainerType types[] = {RBI_CT_ARRAY, RBI_CT_BITSET, RBI_CT_RUN};
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN};
 	uint32		t;
 	uint32		i;
 
@@ -1239,11 +1239,11 @@ test_setops_special(void)
 	{
 		gen_typed(&ref_a, &buf_a, types[t]);
 		ref_init(&ref_b);
-		rbi_container_init(&buf_b.c, TEST_CKEY);
+		lion_container_init(&buf_b.c, TEST_CKEY);
 		run_binops();
 
 		ref_init(&ref_a);
-		rbi_container_init(&buf_a.c, TEST_CKEY);
+		lion_container_init(&buf_a.c, TEST_CKEY);
 		gen_typed(&ref_b, &buf_b, types[t]);
 		run_binops();
 	}
@@ -1251,8 +1251,8 @@ test_setops_special(void)
 	/* both empty */
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
 	run_binops();
 
 	/* identical operands, in every representation */
@@ -1260,51 +1260,51 @@ test_setops_special(void)
 	{
 		gen_typed(&ref_a, &buf_a, types[t]);
 		memcpy(&ref_b, &ref_a, sizeof(Ref));
-		memcpy(&buf_b, &buf_a, rbi_container_size(&buf_a.c));
+		memcpy(&buf_b, &buf_a, lion_container_size(&buf_a.c));
 		run_binops();
 	}
 
 	/* disjoint halves */
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
-		if (i < RBI_CONTAINER_RANGE / 2)
+		if (i < LION_CONTAINER_RANGE / 2)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) i);
+			lion_container_append_sorted(&buf_a.c, (uint16) i);
 			(void) ref_add(&ref_a, i);
 		}
 		else
 		{
-			rbi_container_append_sorted(&buf_b.c, (uint16) i);
+			lion_container_append_sorted(&buf_b.c, (uint16) i);
 			(void) ref_add(&ref_b, i);
 		}
 	}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN && buf_b.c.type == RBI_CT_RUN,
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_RUN && buf_b.c.type == LION_CT_RUN,
 		  "half-full containers optimize to RUN");
 	run_binops();
 
 	/* two full containers */
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) i);
+		lion_container_append_sorted(&buf_a.c, (uint16) i);
 		(void) ref_add(&ref_a, i);
 	}
-	rbi_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_a.c);
 	memcpy(&ref_b, &ref_a, sizeof(Ref));
-	memcpy(&buf_b, &buf_a, rbi_container_size(&buf_a.c));
+	memcpy(&buf_b, &buf_a, lion_container_size(&buf_a.c));
 	run_binops();
 
 	/* full against a single member, so AND leaves exactly one */
 	ref_init(&ref_b);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	(void) rbi_container_add(&buf_b.c, 4242);
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	(void) lion_container_add(&buf_b.c, 4242);
 	(void) ref_add(&ref_b, 4242);
 	run_binops();
 
@@ -1312,78 +1312,78 @@ test_setops_special(void)
 	phase("set algebra: BITSET against a RUN touching lo=0 and lo=32767");
 	gen_random(&ref_a, 9000);
 	build_by_append(&buf_a, &ref_a);
-	rbi_container_to_bitset(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "a is a BITSET");
+	lion_container_to_bitset(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "a is a BITSET");
 	ref_init(&ref_b);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
-		rbi_container_append_sorted(&buf_b.c, (uint16) i);
+		lion_container_append_sorted(&buf_b.c, (uint16) i);
 		(void) ref_add(&ref_b, i);
 	}
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_b.c.type == RBI_CT_RUN && RBI_RUN_NRUNS(&buf_b.c) == 1,
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_b.c.type == LION_CT_RUN && LION_RUN_NRUNS(&buf_b.c) == 1,
 		  "b is the full container as one run");
 	run_binops();
 
 	/* the same, but with the run stopping just short of each boundary */
 	ref_init(&ref_b);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	for (i = 1; i < RBI_CONTAINER_RANGE - 1; i++)
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	for (i = 1; i < LION_CONTAINER_RANGE - 1; i++)
 	{
-		rbi_container_append_sorted(&buf_b.c, (uint16) i);
+		lion_container_append_sorted(&buf_b.c, (uint16) i);
 		(void) ref_add(&ref_b, i);
 	}
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_b.c.type == RBI_CT_RUN, "b is one run inside the boundaries");
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_b.c.type == LION_CT_RUN, "b is one run inside the boundaries");
 	run_binops();
 
 	/* RUN x RUN whose intersection needs more than 1023 runs */
-	phase("RUN x RUN intersection overflowing RBI_RUN_MAX_NRUNS");
+	phase("RUN x RUN intersection overflowing LION_RUN_MAX_NRUNS");
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
 	{
 		/* a: [0..32767] minus every 8th value; b: [0..32767] minus every 8th+4 */
 		if ((i % 8) != 0)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) i);
+			lion_container_append_sorted(&buf_a.c, (uint16) i);
 			(void) ref_add(&ref_a, i);
 		}
 		if ((i % 8) != 4)
 		{
-			rbi_container_append_sorted(&buf_b.c, (uint16) i);
+			lion_container_append_sorted(&buf_b.c, (uint16) i);
 			(void) ref_add(&ref_b, i);
 		}
 	}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_BITSET, "4096 runs cannot be a RUN container");
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "4096 runs cannot be a RUN container");
 	run_binops();
 
 	/* the same shape, but few enough runs to stay RUN encoded */
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
 	for (i = 0; i < 500 * 8; i++)
 	{
 		if ((i % 8) != 0)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) i);
+			lion_container_append_sorted(&buf_a.c, (uint16) i);
 			(void) ref_add(&ref_a, i);
 		}
 		if ((i % 8) != 4)
 		{
-			rbi_container_append_sorted(&buf_b.c, (uint16) i);
+			lion_container_append_sorted(&buf_b.c, (uint16) i);
 			(void) ref_add(&ref_b, i);
 		}
 	}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN && buf_b.c.type == RBI_CT_RUN,
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_RUN && buf_b.c.type == LION_CT_RUN,
 		  "500 runs stay RUN encoded");
 	run_binops();
 }
@@ -1402,7 +1402,7 @@ test_random_ops(uint32 target, const char *label, uint32 nops, uint64 seed)
 	rng_seed(seed);
 	gen_random(&ref_a, target);
 	build_by_add(&buf_a, &ref_a);
-	rbi_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_a.c);
 	verify_full(&buf_a.c, &ref_a);
 
 	for (i = 0; i < nops; i++)
@@ -1411,59 +1411,59 @@ test_random_ops(uint32 target, const char *label, uint32 nops, uint64 seed)
 
 		if (op < 30)
 		{
-			uint32		lo = rng_below(RBI_CONTAINER_RANGE);
+			uint32		lo = rng_below(LION_CONTAINER_RANGE);
 			bool		expected = ref_add(&ref_a, lo);
-			bool		got = rbi_container_add(&buf_a.c, (uint16) lo);
+			bool		got = lion_container_add(&buf_a.c, (uint16) lo);
 
 			CHECK(expected == got, "add() return value");
-			CHECK(rbi_container_contains(&buf_a.c, (uint16) lo),
+			CHECK(lion_container_contains(&buf_a.c, (uint16) lo),
 				  "the member is present after add()");
 		}
 		else if (op < 52)
 		{
-			uint32		lo = rng_below(RBI_CONTAINER_RANGE);
+			uint32		lo = rng_below(LION_CONTAINER_RANGE);
 			bool		expected = ref_remove(&ref_a, lo);
-			bool		got = rbi_container_remove(&buf_a.c, (uint16) lo);
+			bool		got = lion_container_remove(&buf_a.c, (uint16) lo);
 
 			CHECK(expected == got, "remove() return value");
-			CHECK(!rbi_container_contains(&buf_a.c, (uint16) lo),
+			CHECK(!lion_container_contains(&buf_a.c, (uint16) lo),
 				  "the member is gone after remove()");
 		}
 		else if (op < 70)
 		{
 			uint32		lo = ref_pick_member(&ref_a);
 
-			if (lo < RBI_CONTAINER_RANGE)
+			if (lo < LION_CONTAINER_RANGE)
 			{
-				CHECK(rbi_container_remove(&buf_a.c, (uint16) lo),
+				CHECK(lion_container_remove(&buf_a.c, (uint16) lo),
 					  "remove() of a known member returns true");
 				(void) ref_remove(&ref_a, lo);
 			}
 		}
 		else if (op < 80)
-			rbi_container_optimize(&buf_a.c);
+			lion_container_optimize(&buf_a.c);
 		else if (op < 85)
-			rbi_container_to_bitset(&buf_a.c);
+			lion_container_to_bitset(&buf_a.c);
 		else if (op < 93)
 		{
-			uint32		s = rng_below(RBI_CONTAINER_RANGE);
+			uint32		s = rng_below(LION_CONTAINER_RANGE);
 			uint32		e = s + rng_below(4096);
 
 			if (e > 32767)
 				e = 32767;
-			CHECK(rbi_container_range_cardinality(&buf_a.c, (uint16) s, (uint16) e) ==
+			CHECK(lion_container_range_cardinality(&buf_a.c, (uint16) s, (uint16) e) ==
 				  ref_range_card(&ref_a, s, e), "range_cardinality()");
 		}
 		else
 		{
-			uint32		s = rng_below(RBI_CONTAINER_RANGE);
+			uint32		s = rng_below(LION_CONTAINER_RANGE);
 			uint32		e = s + rng_below(1024);
 			uint32		expected;
 
 			if (e > 32767)
 				e = 32767;
 			expected = ref_range_card(&ref_a, s, e);
-			CHECK(rbi_container_remove_range(&buf_a.c, (uint16) s, (uint16) e) == expected,
+			CHECK(lion_container_remove_range(&buf_a.c, (uint16) s, (uint16) e) == expected,
 				  "remove_range() removal count");
 			(void) ref_remove_range(&ref_a, s, e);
 		}
@@ -1486,7 +1486,7 @@ test_or_array_boundary(void)
 	uint32		i;
 
 	/*
-	 * rbi_container_or() may only use its ARRAY fast path while the two
+	 * lion_container_or() may only use its ARRAY fast path while the two
 	 * cardinalities together still fit in an ARRAY payload; exercise both
 	 * sides of that boundary and well past it.
 	 */
@@ -1495,51 +1495,51 @@ test_or_array_boundary(void)
 	/* exactly 1024 + 1024: the fast path fills the payload to the brim */
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	for (i = 0; i < RBI_ARRAY_MAX_CARD / 2; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	for (i = 0; i < LION_ARRAY_MAX_CARD / 2; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (4 * i));
+		lion_container_append_sorted(&buf_a.c, (uint16) (4 * i));
 		(void) ref_add(&ref_a, 4 * i);
-		rbi_container_append_sorted(&buf_b.c, (uint16) (4 * i + 2));
+		lion_container_append_sorted(&buf_b.c, (uint16) (4 * i + 2));
 		(void) ref_add(&ref_b, 4 * i + 2);
 	}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY && buf_b.c.type == RBI_CT_ARRAY,
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY && buf_b.c.type == LION_CT_ARRAY,
 		  "both operands are ARRAY containers");
-	CHECK((uint32) buf_a.c.cardinality + buf_b.c.cardinality == RBI_ARRAY_MAX_CARD,
+	CHECK((uint32) buf_a.c.cardinality + buf_b.c.cardinality == LION_ARRAY_MAX_CARD,
 		  "the cardinalities add up to exactly 2048");
 	run_binops();
 
 	/* one member more: the union no longer fits in an ARRAY payload */
-	rbi_container_append_sorted(&buf_b.c, (uint16) (4 * RBI_ARRAY_MAX_CARD));
-	(void) ref_add(&ref_b, 4 * RBI_ARRAY_MAX_CARD);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_b.c.type == RBI_CT_ARRAY, "b is still an ARRAY");
+	lion_container_append_sorted(&buf_b.c, (uint16) (4 * LION_ARRAY_MAX_CARD));
+	(void) ref_add(&ref_b, 4 * LION_ARRAY_MAX_CARD);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_b.c.type == LION_CT_ARRAY, "b is still an ARRAY");
 	run_binops();
 
 	/* and far past it: 1500 + 1500 interleaved members */
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
 	for (i = 0; i < 1500; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (2 * i));
+		lion_container_append_sorted(&buf_a.c, (uint16) (2 * i));
 		(void) ref_add(&ref_a, 2 * i);
-		rbi_container_append_sorted(&buf_b.c, (uint16) (2 * i + 1));
+		lion_container_append_sorted(&buf_b.c, (uint16) (2 * i + 1));
 		(void) ref_add(&ref_b, 2 * i + 1);
 	}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY && buf_b.c.type == RBI_CT_ARRAY,
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY && buf_b.c.type == LION_CT_ARRAY,
 		  "both operands are ARRAY containers");
 	run_binops();
 
 	/* the union of those two is [0..2999], a single run */
-	(void) rbi_container_or(&buf_a.c, &buf_b.c, &buf_d.c);
-	CHECK(buf_d.c.type == RBI_CT_RUN && RBI_RUN_NRUNS(&buf_d.c) == 1,
+	(void) lion_container_or(&buf_a.c, &buf_b.c, &buf_d.c);
+	CHECK(buf_d.c.type == LION_CT_RUN && LION_RUN_NRUNS(&buf_d.c) == 1,
 		  "the interleaved union optimizes to a single run");
 	CHECK(buf_d.c.cardinality == 3000, "3000 members");
 }
@@ -1553,76 +1553,76 @@ test_run_edge_cases(void)
 
 	/* [0..2] and [10..12] */
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 13; i++)
 		if (i <= 2 || i >= 10)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) i);
+			lion_container_append_sorted(&buf_a.c, (uint16) i);
 			(void) ref_add(&ref_a, i);
 		}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "two runs optimize to RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "2 runs");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "two runs optimize to RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "2 runs");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* 9 is adjacent to the left edge of the second run only */
-	CHECK(rbi_container_add(&buf_a.c, 9), "add(9) extends a run to the left");
+	CHECK(lion_container_add(&buf_a.c, 9), "add(9) extends a run to the left");
 	(void) ref_add(&ref_a, 9);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "extend-left keeps the run count");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "extend-left keeps the run count");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* removals that hit nothing */
-	CHECK(!rbi_container_remove(&buf_a.c, 5), "remove() inside a gap is false");
-	CHECK(!rbi_container_remove(&buf_a.c, 20), "remove() past the last run is false");
-	CHECK(!rbi_container_remove(&buf_a.c, 32767), "remove() at the top is false");
+	CHECK(!lion_container_remove(&buf_a.c, 5), "remove() inside a gap is false");
+	CHECK(!lion_container_remove(&buf_a.c, 20), "remove() past the last run is false");
+	CHECK(!lion_container_remove(&buf_a.c, 32767), "remove() at the top is false");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* a single run, then inserts below it */
 	phase("RUN insert below every run");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 10; i <= 20; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) i);
+		lion_container_append_sorted(&buf_a.c, (uint16) i);
 		(void) ref_add(&ref_a, i);
 	}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "[10..20] is a RUN");
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "1 run");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "[10..20] is a RUN");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "1 run");
 
-	CHECK(!rbi_container_remove(&buf_a.c, 0), "remove() below every run is false");
-	CHECK(!rbi_container_contains(&buf_a.c, 0), "contains(0) below every run");
+	CHECK(!lion_container_remove(&buf_a.c, 0), "remove() below every run is false");
+	CHECK(!lion_container_contains(&buf_a.c, 0), "contains(0) below every run");
 
-	CHECK(rbi_container_add(&buf_a.c, 5), "add(5) below every run");
+	CHECK(lion_container_add(&buf_a.c, 5), "add(5) below every run");
 	(void) ref_add(&ref_a, 5);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "a new run was inserted first");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "a new run was inserted first");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* walk the gap shut from the right, then from the left */
 	for (i = 9; i >= 7; i--)
 	{
-		CHECK(rbi_container_add(&buf_a.c, (uint16) i), "close the gap from the right");
+		CHECK(lion_container_add(&buf_a.c, (uint16) i), "close the gap from the right");
 		(void) ref_add(&ref_a, i);
 		verify_full(&buf_a.c, &ref_a);
 	}
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 2, "still two runs");
-	CHECK(rbi_container_add(&buf_a.c, 6), "add(6) merges the two runs");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 2, "still two runs");
+	CHECK(lion_container_add(&buf_a.c, 6), "add(6) merges the two runs");
 	(void) ref_add(&ref_a, 6);
-	CHECK(RBI_RUN_NRUNS(&buf_a.c) == 1, "the runs merged");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == 1, "the runs merged");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* append_sorted onto a RUN container (the defensive fallback) */
 	phase("append_sorted onto a RUN container");
-	rbi_container_append_sorted(&buf_a.c, 100);
+	lion_container_append_sorted(&buf_a.c, 100);
 	(void) ref_add(&ref_a, 100);
-	CHECK(rbi_container_contains(&buf_a.c, 100), "append_sorted onto a RUN works");
+	CHECK(lion_container_contains(&buf_a.c, 100), "append_sorted onto a RUN works");
 	verify_full(&buf_a.c, &ref_a);
 }
 
 static void
 test_iterate_early_stop(void)
 {
-	static const RBIContainerType types[] = {RBI_CT_ARRAY, RBI_CT_BITSET, RBI_CT_RUN};
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN};
 	uint32		t;
 	uint32		k;
 
@@ -1633,7 +1633,7 @@ test_iterate_early_stop(void)
 		IterState	st;
 
 		gen_typed(&ref_a, &buf_a, types[t]);
-		(void) rbi_container_to_array(&buf_a.c, scratch_array);
+		(void) lion_container_to_array(&buf_a.c, scratch_array);
 		for (k = 1; k <= 5; k++)
 		{
 			uint32		x;
@@ -1642,7 +1642,7 @@ test_iterate_early_stop(void)
 			st.limit = k;
 			st.out = scratch_iter;
 			memset(scratch_iter, 0xFF, k * sizeof(uint16));
-			rbi_container_iterate(&buf_a.c, iter_cb, &st);
+			lion_container_iterate(&buf_a.c, iter_cb, &st);
 			CHECK(st.n == k, "iterate() stopped where the callback asked");
 			for (x = 0; x < k; x++)
 				CHECK(scratch_iter[x] == scratch_array[x],
@@ -1651,7 +1651,7 @@ test_iterate_early_stop(void)
 		st.n = 0;
 		st.limit = ref_a.card + 100;
 		st.out = scratch_iter;
-		rbi_container_iterate(&buf_a.c, iter_cb, &st);
+		lion_container_iterate(&buf_a.c, iter_cb, &st);
 		CHECK(st.n == ref_a.card, "iterate() without an early stop sees everything");
 	}
 }
@@ -1670,10 +1670,10 @@ test_gallop_intersection(void)
 		gen_sparse((i & 1) ? &ref_b : &ref_a, 25 + rng_below(20));
 		gen_sparse((i & 1) ? &ref_a : &ref_b, 1800 + rng_below(200));
 		build_by_append(&buf_a, &ref_a);
-		rbi_container_optimize(&buf_a.c);
+		lion_container_optimize(&buf_a.c);
 		build_by_append(&buf_b, &ref_b);
-		rbi_container_optimize(&buf_b.c);
-		CHECK(buf_a.c.type == RBI_CT_ARRAY && buf_b.c.type == RBI_CT_ARRAY,
+		lion_container_optimize(&buf_b.c);
+		CHECK(buf_a.c.type == LION_CT_ARRAY && buf_b.c.type == LION_CT_ARRAY,
 			  "both operands are ARRAY containers");
 		run_binops();
 	}
@@ -1681,33 +1681,33 @@ test_gallop_intersection(void)
 	/* a small array entirely above a large one: the gallop runs off the end */
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
 	for (i = 0; i < 40; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (30000 + i * 3));
+		lion_container_append_sorted(&buf_a.c, (uint16) (30000 + i * 3));
 		(void) ref_add(&ref_a, 30000 + i * 3);
 	}
 	for (i = 0; i < 2000; i++)
 	{
-		rbi_container_append_sorted(&buf_b.c, (uint16) (i * 2));
+		lion_container_append_sorted(&buf_b.c, (uint16) (i * 2));
 		(void) ref_add(&ref_b, i * 2);
 	}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY && buf_b.c.type == RBI_CT_ARRAY,
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY && buf_b.c.type == LION_CT_ARRAY,
 		  "both operands are ARRAY containers");
 	run_binops();
 
 	/* and entirely below it */
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 40; i++)
 	{
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 3));
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 3));
 		(void) ref_add(&ref_a, i * 3);
 	}
-	rbi_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_a.c);
 	run_binops();
 }
 
@@ -1719,30 +1719,30 @@ test_run_intersection_overflow(void)
 
 	/*
 	 * Two RUN containers whose intersection needs about 2 * 600 runs, so
-	 * rbi_container_and() has to abandon the run-wise path.
+	 * lion_container_and() has to abandon the run-wise path.
 	 */
 	phase("RUN x RUN intersection needing more than 1023 runs");
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
 	for (i = 0; i < 600; i++)
 		for (j = 0; j < 15; j++)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) (20 * i + j));
+			lion_container_append_sorted(&buf_a.c, (uint16) (20 * i + j));
 			(void) ref_add(&ref_a, 20 * i + j);
 		}
 	for (i = 0; i < 600; i++)
 		for (j = 0; j < 15; j++)
 		{
-			rbi_container_append_sorted(&buf_b.c, (uint16) (20 * i + 10 + j));
+			lion_container_append_sorted(&buf_b.c, (uint16) (20 * i + 10 + j));
 			(void) ref_add(&ref_b, 20 * i + 10 + j);
 		}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN && RBI_RUN_NRUNS(&buf_a.c) == 600,
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
+	CHECK(buf_a.c.type == LION_CT_RUN && LION_RUN_NRUNS(&buf_a.c) == 600,
 		  "a is a 600-run container");
-	CHECK(buf_b.c.type == RBI_CT_RUN && RBI_RUN_NRUNS(&buf_b.c) == 600,
+	CHECK(buf_b.c.type == LION_CT_RUN && LION_RUN_NRUNS(&buf_b.c) == 600,
 		  "b is a 600-run container");
 	run_binops();
 
@@ -1750,22 +1750,22 @@ test_run_intersection_overflow(void)
 	phase("RUN x RUN intersection fitting in 1023 runs");
 	ref_init(&ref_a);
 	ref_init(&ref_b);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	rbi_container_init(&buf_b.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_b.c, TEST_CKEY);
 	for (i = 0; i < 200; i++)
 		for (j = 0; j < 15; j++)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) (20 * i + j));
+			lion_container_append_sorted(&buf_a.c, (uint16) (20 * i + j));
 			(void) ref_add(&ref_a, 20 * i + j);
 		}
 	for (i = 0; i < 200; i++)
 		for (j = 0; j < 15; j++)
 		{
-			rbi_container_append_sorted(&buf_b.c, (uint16) (20 * i + 10 + j));
+			lion_container_append_sorted(&buf_b.c, (uint16) (20 * i + 10 + j));
 			(void) ref_add(&ref_b, 20 * i + 10 + j);
 		}
-	rbi_container_optimize(&buf_a.c);
-	rbi_container_optimize(&buf_b.c);
+	lion_container_optimize(&buf_a.c);
+	lion_container_optimize(&buf_b.c);
 	run_binops();
 }
 
@@ -1794,12 +1794,12 @@ test_remove_if_rebuild(void)
 	rng_seed(UINT64CONST(0x5EED0007));
 	gen_runs(&ref_a, 20, 200, 600);
 	build_by_append(&buf_a, &ref_a);
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "starts as a RUN");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "starts as a RUN");
 	expected = ref_remove_if(&ref_a, pred_below_5000);
-	removed = rbi_container_remove_if(&buf_a.c, pred_below_5000, NULL);
+	removed = lion_container_remove_if(&buf_a.c, pred_below_5000, NULL);
 	CHECK(removed == expected, "remove_if() removal count");
-	CHECK(buf_a.c.type == RBI_CT_RUN, "a RUN that still fits stays a RUN");
+	CHECK(buf_a.c.type == LION_CT_RUN, "a RUN that still fits stays a RUN");
 	verify_full(&buf_a.c, &ref_a);
 
 	/*
@@ -1808,49 +1808,49 @@ test_remove_if_rebuild(void)
 	 */
 	phase("remove_if turns a shredded RUN into an ARRAY");
 	ref_init(&ref_a);
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_RUN_MAX_NRUNS; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
 		for (j = 0; j < 3; j++)
 		{
-			rbi_container_append_sorted(&buf_a.c, (uint16) (4 * i + j));
+			lion_container_append_sorted(&buf_a.c, (uint16) (4 * i + j));
 			(void) ref_add(&ref_a, 4 * i + j);
 		}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "starts as a RUN of 1023 runs");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "starts as a RUN of 1023 runs");
 	expected = ref_remove_if(&ref_a, pred_mod4_is_1);
-	removed = rbi_container_remove_if(&buf_a.c, pred_mod4_is_1, NULL);
+	removed = lion_container_remove_if(&buf_a.c, pred_mod4_is_1, NULL);
 	CHECK(removed == expected, "remove_if() removal count");
 	CHECK(ref_a.card == 2046, "2046 members are left");
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "2046 members in 2046 runs become an ARRAY");
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "2046 members in 2046 runs become an ARRAY");
 	verify_full(&buf_a.c, &ref_a);
 
 	/* remove_if() emptying a RUN container outright */
 	phase("remove_if empties a RUN container");
 	gen_runs(&ref_a, 12, 100, 400);
 	build_by_append(&buf_a, &ref_a);
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "starts as a RUN");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "starts as a RUN");
 	expected = ref_a.card;
-	removed = rbi_container_remove_if(&buf_a.c, pred_all, NULL);
+	removed = lion_container_remove_if(&buf_a.c, pred_all, NULL);
 	CHECK(removed == expected, "remove_if(true) removed everything");
 	(void) ref_remove_if(&ref_a, pred_all);
 	CHECK(buf_a.c.cardinality == 0, "the container is empty");
 	verify_full(&buf_a.c, &ref_a);
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_ARRAY, "the emptied container optimizes to ARRAY");
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "the emptied container optimizes to ARRAY");
 	verify_full(&buf_a.c, &ref_a);
 }
 
 /* ----------------------------------------------------------------
- *					rbi_container_check() negatives
+ *					lion_container_check() negatives
  * ----------------------------------------------------------------
  */
 
 static void
-expect_bad(RBIContainer *c, Size avail, const char *what)
+expect_bad(LionContainer *c, Size avail, const char *what)
 {
 	const char *msg = NULL;
-	bool		ok = rbi_container_check(c, avail, &msg);
+	bool		ok = lion_container_check(c, avail, &msg);
 
 	CHECK(!ok, what);
 	CHECK(!ok && msg != NULL, "check() must set *errmsg when it fails");
@@ -1862,122 +1862,122 @@ test_check_rejects(void)
 	const char *msg = NULL;
 	uint32		i;
 
-	phase("rbi_container_check() accepts and rejects");
+	phase("lion_container_check() accepts and rejects");
 
 	/* ---- a valid ARRAY ---- */
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 100; i++)
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 5));
-	CHECK(rbi_container_check(&buf_a.c, RBI_CONTAINER_MAX_SIZE, &msg),
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 5));
+	CHECK(lion_container_check(&buf_a.c, LION_CONTAINER_MAX_SIZE, &msg),
 		  "a valid ARRAY passes");
 	CHECK(msg == NULL, "check() clears *errmsg on success");
-	CHECK(rbi_container_check(&buf_a.c, rbi_container_size(&buf_a.c), &msg),
+	CHECK(lion_container_check(&buf_a.c, lion_container_size(&buf_a.c), &msg),
 		  "an exactly-sized ARRAY passes");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
 	expect_bad(&buf_b.c, 4, "header does not fit in avail_bytes");
-	expect_bad(&buf_b.c, rbi_container_size(&buf_a.c) - 1,
+	expect_bad(&buf_b.c, lion_container_size(&buf_a.c) - 1,
 			   "array does not fit in avail_bytes");
 
 	buf_b.c.type = 0;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "container type 0");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "container type 0");
 	buf_b.c.type = 4;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "container type 4");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "container type 4");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
 	buf_b.c.flags = 1;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "nonzero flags");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "nonzero flags");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	buf_b.c.type = RBI_CT_BITSET;
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	buf_b.c.type = LION_CT_BITSET;
 	buf_b.c.cardinality = 40000;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "cardinality above 32768");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "cardinality above 32768");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	buf_b.c.cardinality = RBI_ARRAY_MAX_CARD + 1;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "array cardinality above 2048");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	buf_b.c.cardinality = LION_ARRAY_MAX_CARD + 1;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "array cardinality above 2048");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_ARRAY_DATA(&buf_b.c)[50] = 40000;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "array member above 32767");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_ARRAY_DATA(&buf_b.c)[50] = 40000;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "array member above 32767");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_ARRAY_DATA(&buf_b.c)[11] = RBI_ARRAY_DATA(&buf_b.c)[10];
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "array members not ascending");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_ARRAY_DATA(&buf_b.c)[11] = LION_ARRAY_DATA(&buf_b.c)[10];
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "array members not ascending");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_ARRAY_DATA(&buf_b.c)[11] = 1;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "array members out of order");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_ARRAY_DATA(&buf_b.c)[11] = 1;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "array members out of order");
 
 	/* ---- a valid BITSET ---- */
-	rbi_container_to_bitset(&buf_a.c);
-	CHECK(rbi_container_check(&buf_a.c, RBI_CONTAINER_MAX_SIZE, &msg),
+	lion_container_to_bitset(&buf_a.c);
+	CHECK(lion_container_check(&buf_a.c, LION_CONTAINER_MAX_SIZE, &msg),
 		  "a valid BITSET passes");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE - 1,
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE - 1,
 			   "bitset does not fit in avail_bytes");
 	buf_b.c.cardinality++;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "bitset cardinality too high");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "bitset cardinality too high");
 	buf_b.c.cardinality -= 2;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "bitset cardinality too low");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "bitset cardinality too low");
 
 	/* ---- a valid RUN ---- */
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 40; i++)
 	{
 		uint32		k;
 
 		for (k = 0; k < 6; k++)
-			rbi_container_append_sorted(&buf_a.c, (uint16) (i * 20 + k));
+			lion_container_append_sorted(&buf_a.c, (uint16) (i * 20 + k));
 	}
-	rbi_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == RBI_CT_RUN, "40 runs of 6 optimize to RUN");
-	CHECK(rbi_container_check(&buf_a.c, RBI_CONTAINER_MAX_SIZE, &msg),
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "40 runs of 6 optimize to RUN");
+	CHECK(lion_container_check(&buf_a.c, LION_CONTAINER_MAX_SIZE, &msg),
 		  "a valid RUN passes");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
 	expect_bad(&buf_b.c, 9, "run header does not fit in avail_bytes");
-	expect_bad(&buf_b.c, rbi_container_size(&buf_a.c) - 1,
+	expect_bad(&buf_b.c, lion_container_size(&buf_a.c) - 1,
 			   "run payload does not fit in avail_bytes");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_RUN_NRUNS(&buf_b.c) = RBI_RUN_MAX_NRUNS + 1;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "more than 1023 runs");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_RUN_NRUNS(&buf_b.c) = LION_RUN_MAX_NRUNS + 1;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "more than 1023 runs");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_RUN_NRUNS(&buf_b.c) = 0;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "no runs but nonzero cardinality");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_RUN_NRUNS(&buf_b.c) = 0;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "no runs but nonzero cardinality");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_RUN_DATA(&buf_b.c)[39].start = 32760;
-	RBI_RUN_DATA(&buf_b.c)[39].len_minus_1 = 100;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "run extends past 32767");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_RUN_DATA(&buf_b.c)[39].start = 32760;
+	LION_RUN_DATA(&buf_b.c)[39].len_minus_1 = 100;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "run extends past 32767");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_RUN_DATA(&buf_b.c)[1].start = (uint16)
-		(RBI_RUN_DATA(&buf_b.c)[0].start + RBI_RUN_DATA(&buf_b.c)[0].len_minus_1 + 1);
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "adjacent runs are not merged");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_RUN_DATA(&buf_b.c)[1].start = (uint16)
+		(LION_RUN_DATA(&buf_b.c)[0].start + LION_RUN_DATA(&buf_b.c)[0].len_minus_1 + 1);
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "adjacent runs are not merged");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
-	RBI_RUN_DATA(&buf_b.c)[1].start = RBI_RUN_DATA(&buf_b.c)[0].start;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "runs are not ascending");
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
+	LION_RUN_DATA(&buf_b.c)[1].start = LION_RUN_DATA(&buf_b.c)[0].start;
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "runs are not ascending");
 
-	memcpy(&buf_b, &buf_a, RBI_CONTAINER_MAX_SIZE);
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
 	buf_b.c.cardinality++;
-	expect_bad(&buf_b.c, RBI_CONTAINER_MAX_SIZE, "run cardinality does not match");
+	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "run cardinality does not match");
 
 	/* an empty ARRAY is valid in exactly 8 bytes */
-	rbi_container_init(&buf_b.c, TEST_CKEY);
-	CHECK(rbi_container_check(&buf_b.c, RBI_CONTAINER_HDRSZ, &msg),
+	lion_container_init(&buf_b.c, TEST_CKEY);
+	CHECK(lion_container_check(&buf_b.c, LION_CONTAINER_HDRSZ, &msg),
 		  "an empty container fits in 8 bytes");
 
-	/* rbi_container_size_for() agrees with rbi_container_size() */
-	CHECK(rbi_container_size_for(RBI_CT_ARRAY, 100, 0) == 8 + 200,
+	/* lion_container_size_for() agrees with lion_container_size() */
+	CHECK(lion_container_size_for(LION_CT_ARRAY, 100, 0) == 8 + 200,
 		  "size_for(ARRAY, 100)");
-	CHECK(rbi_container_size_for(RBI_CT_BITSET, 9999, 0) == RBI_CONTAINER_MAX_SIZE,
+	CHECK(lion_container_size_for(LION_CT_BITSET, 9999, 0) == LION_CONTAINER_MAX_SIZE,
 		  "size_for(BITSET)");
-	CHECK(rbi_container_size_for(RBI_CT_RUN, 9999, 7) == 8 + 2 + 28,
+	CHECK(lion_container_size_for(LION_CT_RUN, 9999, 7) == 8 + 2 + 28,
 		  "size_for(RUN, 7 runs)");
 }
 
@@ -1987,32 +1987,32 @@ test_check_rejects(void)
  */
 
 static const char *
-type_name(const RBIContainer *c)
+type_name(const LionContainer *c)
 {
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			return "ARRAY";
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			return "BITSET";
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			return "RUN";
 	}
 	return "?";
 }
 
 static void
-show_size(const char *what, const RBIContainer *c)
+show_size(const char *what, const LionContainer *c)
 {
-	if (c->type == RBI_CT_RUN)
+	if (c->type == LION_CT_RUN)
 		printf("  %-34s %5u members  %-6s %4u runs  %5zu bytes\n",
 			   what, (unsigned) c->cardinality, type_name(c),
-			   (unsigned) RBI_RUN_NRUNS((RBIContainer *) c),
-			   (size_t) rbi_container_size(c));
+			   (unsigned) LION_RUN_NRUNS((LionContainer *) c),
+			   (size_t) lion_container_size(c));
 	else
 		printf("  %-34s %5u members  %-6s %9s  %5zu bytes\n",
 			   what, (unsigned) c->cardinality, type_name(c), "",
-			   (size_t) rbi_container_size(c));
+			   (size_t) lion_container_size(c));
 }
 
 static void
@@ -2023,43 +2023,43 @@ report_sizes(void)
 
 	printf("\nrepresentative container sizes (after optimize):\n");
 
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	show_size("empty", &buf_a.c);
 
-	(void) rbi_container_add(&buf_a.c, 123);
-	rbi_container_optimize(&buf_a.c);
+	(void) lion_container_add(&buf_a.c, 123);
+	lion_container_optimize(&buf_a.c);
 	show_size("1 member", &buf_a.c);
 
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 2048; i++)
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 3));
-	rbi_container_optimize(&buf_a.c);
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 3));
+	lion_container_optimize(&buf_a.c);
 	show_size("2048 scattered members", &buf_a.c);
 
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 2049; i++)
-		rbi_container_append_sorted(&buf_a.c, (uint16) (i * 3));
-	rbi_container_optimize(&buf_a.c);
+		lion_container_append_sorted(&buf_a.c, (uint16) (i * 3));
+	lion_container_optimize(&buf_a.c);
 	show_size("2049 scattered members", &buf_a.c);
 
-	rbi_container_init(&buf_a.c, TEST_CKEY);
+	lion_container_init(&buf_a.c, TEST_CKEY);
 	for (i = 0; i < 100; i++)
 		for (j = 0; j < 10; j++)
-			rbi_container_append_sorted(&buf_a.c, (uint16) (i * 100 + j));
-	rbi_container_optimize(&buf_a.c);
+			lion_container_append_sorted(&buf_a.c, (uint16) (i * 100 + j));
+	lion_container_optimize(&buf_a.c);
 	show_size("100 runs of 10", &buf_a.c);
 
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_RUN_MAX_NRUNS; i++)
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
 		for (j = 0; j < 3; j++)
-			rbi_container_append_sorted(&buf_a.c, (uint16) (i * 6 + j));
-	rbi_container_optimize(&buf_a.c);
+			lion_container_append_sorted(&buf_a.c, (uint16) (i * 6 + j));
+	lion_container_optimize(&buf_a.c);
 	show_size("1023 runs of 3 (largest RUN)", &buf_a.c);
 
-	rbi_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < RBI_CONTAINER_RANGE; i++)
-		rbi_container_append_sorted(&buf_a.c, (uint16) i);
-	rbi_container_optimize(&buf_a.c);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		lion_container_append_sorted(&buf_a.c, (uint16) i);
+	lion_container_optimize(&buf_a.c);
 	show_size("32768 members (full)", &buf_a.c);
 }
 
@@ -2071,15 +2071,15 @@ report_sizes(void)
 int
 main(void)
 {
-	printf("roaring_index container unit tests\n");
-	printf("  RBI_CONTAINER_HDRSZ=%zu RBI_ARRAY_MAX_CARD=%zu "
-		   "RBI_RUN_MAX_NRUNS=%zu RBI_CONTAINER_MAX_SIZE=%zu\n",
-		   (size_t) RBI_CONTAINER_HDRSZ, (size_t) RBI_ARRAY_MAX_CARD,
-		   (size_t) RBI_RUN_MAX_NRUNS, (size_t) RBI_CONTAINER_MAX_SIZE);
+	printf("pg_lion container unit tests\n");
+	printf("  LION_CONTAINER_HDRSZ=%zu LION_ARRAY_MAX_CARD=%zu "
+		   "LION_RUN_MAX_NRUNS=%zu LION_CONTAINER_MAX_SIZE=%zu\n",
+		   (size_t) LION_CONTAINER_HDRSZ, (size_t) LION_ARRAY_MAX_CARD,
+		   (size_t) LION_RUN_MAX_NRUNS, (size_t) LION_CONTAINER_MAX_SIZE);
 
-	CHECK(sizeof(RBIContainer) == 8, "RBIContainer header is 8 bytes");
-	CHECK(sizeof(RBIRun) == 4, "RBIRun is 4 bytes");
-	CHECK(RBI_CONTAINER_MAX_SIZE == 4104, "RBI_CONTAINER_MAX_SIZE is 4104");
+	CHECK(sizeof(LionContainer) == 8, "LionContainer header is 8 bytes");
+	CHECK(sizeof(LionRun) == 4, "LionRun is 4 bytes");
+	CHECK(LION_CONTAINER_MAX_SIZE == 4104, "LION_CONTAINER_MAX_SIZE is 4104");
 
 	test_empty();
 	test_boundaries();

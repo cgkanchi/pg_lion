@@ -2,7 +2,7 @@ Parsed test spec with 3 sessions
 
 starting permutation: s1_begin s1_count s2_begin s2_insert s1_count s3_count s2_commit s1_count s3_count s1_commit s1_count
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -12,14 +12,14 @@ roaring|plain
 step s2_begin: BEGIN;
 step s2_insert: INSERT INTO cnt_snap SELECT 10000 + i, 1
 					FROM generate_series(1, 100) i;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
    1000| 1000
 (1 row)
 
-step s3_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s3_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -27,14 +27,14 @@ roaring|plain
 (1 row)
 
 step s2_commit: COMMIT;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
    1000| 1000
 (1 row)
 
-step s3_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s3_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -42,7 +42,7 @@ roaring|plain
 (1 row)
 
 step s1_commit: COMMIT;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -52,7 +52,7 @@ roaring|plain
 
 starting permutation: s1_begin s1_count s2_begin s2_delete s1_count s3_count s2_commit s1_count s3_count s1_commit s1_count
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -61,14 +61,14 @@ roaring|plain
 
 step s2_begin: BEGIN;
 step s2_delete: DELETE FROM cnt_snap WHERE k = 1 AND id <= 400;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
    1000| 1000
 (1 row)
 
-step s3_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s3_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -76,14 +76,14 @@ roaring|plain
 (1 row)
 
 step s2_commit: COMMIT;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
    1000| 1000
 (1 row)
 
-step s3_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s3_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -91,7 +91,7 @@ roaring|plain
 (1 row)
 
 step s1_commit: COMMIT;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -101,7 +101,7 @@ roaring|plain
 
 starting permutation: s1_begin s1_count s2_begin s2_delete s2_commit s1_count s3_vacuum s1_count s3_count s1_commit s1_count s3_count
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -111,7 +111,7 @@ roaring|plain
 step s2_begin: BEGIN;
 step s2_delete: DELETE FROM cnt_snap WHERE k = 1 AND id <= 400;
 step s2_commit: COMMIT;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -119,14 +119,14 @@ roaring|plain
 (1 row)
 
 step s3_vacuum: VACUUM cnt_snap;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
    1000| 1000
 (1 row)
 
-step s3_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s3_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
@@ -134,14 +134,14 @@ roaring|plain
 (1 row)
 
 step s1_commit: COMMIT;
-step s1_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s1_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----
     900|  900
 (1 row)
 
-step s3_count: SELECT roaring_index_count('cnt_snap_k', 1) AS roaring,
+step s3_count: SELECT lion_index_count('cnt_snap_k', 1) AS roaring,
 						 (SELECT count(*) FROM cnt_snap WHERE k = 1) AS plain;
 roaring|plain
 -------+-----

@@ -10,15 +10,15 @@
 -- still with EXCEPT ALL in both directions.
 --
 -- The library is in session_preload_libraries (see run.sh), so
--- roaring_index.enable_count_pushdown exists in every session, including the
+-- pg_lion.enable_count_pushdown exists in every session, including the
 -- ones the helpers below run in.
 
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 
 CREATE EXTENSION IF NOT EXISTS citext;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
-CREATE EXTENSION IF NOT EXISTS roaring_index_citext;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
 
 /*
  * One column per operator class kind that has to survive a crash: int4, text,
@@ -26,7 +26,7 @@ CREATE EXTENSION IF NOT EXISTS roaring_index_citext;
  * rows, so both reserved entries of section 14 / section 17 are populated)
  * and tsvector (with NULL and empty rows, likewise).
  */
-CREATE TABLE rbi_rec (
+CREATE TABLE lion_rec (
 	id   bigint PRIMARY KEY,
 	k4   int4   NOT NULL,
 	t    text   NOT NULL,
@@ -44,10 +44,10 @@ CREATE TABLE rbi_rec (
  * t has 3000 distinct values over ~800 heap pages, i.e. about one member per
  * container key: that is what puts sparse segments (section 13) in the index
  * and what makes inserts promote a ckey out of a segment into a real
- * container once it reaches RBI_SPARSE_THRESHOLD members.  k4/ct/nn/b are
+ * container once it reaches LION_SPARSE_THRESHOLD members.  k4/ct/nn/b are
  * dense enough for array, run and bitset containers.
  */
-CREATE FUNCTION rbi_rec_gen(i bigint) RETURNS rbi_rec
+CREATE FUNCTION lion_rec_gen(i bigint) RETURNS lion_rec
 LANGUAGE sql IMMUTABLE AS $$
 	SELECT i,
 		   (i % 200)::int4,
@@ -78,17 +78,17 @@ $$;
  * is what makes the split and spill records of section 4 frequent; buckets = 8
  * forces bucket-page chains.
  */
-CREATE INDEX rbi_rec_ct  ON rbi_rec USING roaring (ct)  WITH (buckets = 8);
-CREATE INDEX rbi_rec_b   ON rbi_rec USING roaring (b)   WITH (inline_limit = 64);
-CREATE INDEX rbi_rec_arr ON rbi_rec USING roaring (arr) WITH (inline_limit = 64, buckets = 16);
+CREATE INDEX lion_rec_ct  ON lion_rec USING lion (ct)  WITH (buckets = 8);
+CREATE INDEX lion_rec_b   ON lion_rec USING lion (b)   WITH (inline_limit = 64);
+CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64, buckets = 16);
 
-INSERT INTO rbi_rec
-SELECT g.* FROM generate_series(1, 40000) i, rbi_rec_gen(i) g;
+INSERT INTO lion_rec
+SELECT g.* FROM generate_series(1, 40000) i, lion_rec_gen(i) g;
 
-CREATE INDEX rbi_rec_k4  ON rbi_rec USING roaring (k4) WITH (inline_limit = 64);
-CREATE INDEX rbi_rec_t   ON rbi_rec USING roaring (t);
-CREATE INDEX rbi_rec_nn  ON rbi_rec USING roaring (nn) WITH (buckets = 8);
-CREATE INDEX rbi_rec_tsv ON rbi_rec USING roaring (tsv);
+CREATE INDEX lion_rec_k4  ON lion_rec USING lion (k4) WITH (inline_limit = 64);
+CREATE INDEX lion_rec_t   ON lion_rec USING lion (t);
+CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn) WITH (buckets = 8);
+CREATE INDEX lion_rec_tsv ON lion_rec USING lion (tsv);
 
 /*
  * The writer's id stream.  Each pgbench client c only ever touches rows with
@@ -104,7 +104,7 @@ CREATE INDEX rbi_rec_tsv ON rbi_rec USING roaring (tsv);
  * committed INSERT has flushed that record, so after recovery the sequence
  * resumes at or above the last id used and the primary key cannot collide.
  */
-CREATE SEQUENCE rbi_rec_ins START 5001;
+CREATE SEQUENCE lion_rec_ins START 5001;
 
 /* ------------------------------------------------------------------ */
 -- What the checks probe.  One definition, used by the crash checks, by the
@@ -114,31 +114,31 @@ CREATE SEQUENCE rbi_rec_ins START 5001;
 /*
  * Single-key probes.  `val` is a SQL expression so cross-type and citext
  * cases can be written out in full; `direct` says whether
- * roaring_index_count() accepts the key (it insists the key type match the
+ * lion_index_count() accepts the key (it insists the key type match the
  * index's opcintype, which a multi-key opclass has no scalar version of).
  */
-CREATE FUNCTION rbi_rec_keys()
+CREATE FUNCTION lion_rec_keys()
 RETURNS TABLE (idx text, col text, val text, direct boolean)
 LANGUAGE sql IMMUTABLE AS $$
-	VALUES ('rbi_rec_k4'::text, 'k4'::text, '0::int4'::text, true),
-		   ('rbi_rec_k4', 'k4', '1::int4', true),
-		   ('rbi_rec_k4', 'k4', '7::int4', true),
-		   ('rbi_rec_k4', 'k4', '199::int4', true),
-		   ('rbi_rec_k4', 'k4', '12345::int4', true),		-- absent key
-		   ('rbi_rec_t', 't', '''v0''::text', true),
-		   ('rbi_rec_t', 't', '''v13''::text', true),
-		   ('rbi_rec_t', 't', '''v2999''::text', true),
-		   ('rbi_rec_t', 't', '''nosuchvalue''::text', true),
-		   ('rbi_rec_ct', 'ct', '''mix0''::citext', true),	-- lower case on purpose
-		   ('rbi_rec_ct', 'ct', '''Mix7''::citext', true),
-		   ('rbi_rec_ct', 'ct', '''MIX39''::citext', true),
-		   ('rbi_rec_ct', 'ct', '''nosuchvalue''::citext', true),
-		   ('rbi_rec_b', 'b', 'true', true),
-		   ('rbi_rec_b', 'b', 'false', true),
-		   ('rbi_rec_nn', 'nn', '0::int4', true),
-		   ('rbi_rec_nn', 'nn', '5::int4', true),
-		   ('rbi_rec_nn', 'nn', '29::int4', true),
-		   ('rbi_rec_nn', 'nn', '-1::int4', true)			-- absent key
+	VALUES ('lion_rec_k4'::text, 'k4'::text, '0::int4'::text, true),
+		   ('lion_rec_k4', 'k4', '1::int4', true),
+		   ('lion_rec_k4', 'k4', '7::int4', true),
+		   ('lion_rec_k4', 'k4', '199::int4', true),
+		   ('lion_rec_k4', 'k4', '12345::int4', true),		-- absent key
+		   ('lion_rec_t', 't', '''v0''::text', true),
+		   ('lion_rec_t', 't', '''v13''::text', true),
+		   ('lion_rec_t', 't', '''v2999''::text', true),
+		   ('lion_rec_t', 't', '''nosuchvalue''::text', true),
+		   ('lion_rec_ct', 'ct', '''mix0''::citext', true),	-- lower case on purpose
+		   ('lion_rec_ct', 'ct', '''Mix7''::citext', true),
+		   ('lion_rec_ct', 'ct', '''MIX39''::citext', true),
+		   ('lion_rec_ct', 'ct', '''nosuchvalue''::citext', true),
+		   ('lion_rec_b', 'b', 'true', true),
+		   ('lion_rec_b', 'b', 'false', true),
+		   ('lion_rec_nn', 'nn', '0::int4', true),
+		   ('lion_rec_nn', 'nn', '5::int4', true),
+		   ('lion_rec_nn', 'nn', '29::int4', true),
+		   ('lion_rec_nn', 'nn', '-1::int4', true)			-- absent key
 $$;
 
 /*
@@ -146,50 +146,50 @@ $$;
  * group), the IS NULL / IS NOT NULL drivers of section 14, and the
  * multi-key operators of section 17.
  */
-CREATE FUNCTION rbi_rec_queries() RETURNS TABLE (q text)
+CREATE FUNCTION lion_rec_queries() RETURNS TABLE (q text)
 LANGUAGE sql IMMUTABLE AS $$
-	VALUES ('select k4, count(*) from rbi_rec group by k4'::text),
-		   ('select t, count(*) from rbi_rec group by t'),
-		   ('select ct, count(*) from rbi_rec group by ct'),
-		   ('select ct, count(*) from rbi_rec where k4 = 5 group by ct'),
-		   ('select b, count(*) from rbi_rec group by b'),
-		   ('select nn, count(*) from rbi_rec group by nn'),
-		   ('select k4, count(*) from rbi_rec where b group by k4'),
-		   ('select nn, count(*) from rbi_rec where k4 = 7 group by nn'),
-		   ('select b, count(*) from rbi_rec where nn is null group by b'),
-		   ('select count(*) from rbi_rec where nn is not null'),
-		   ('select count(*) from rbi_rec where nn is null'),
-		   ('select count(*) from rbi_rec where k4 = 3 and b'),
-		   ('select count(*) from rbi_rec where t = ''v13'' and not b'),
-		   ('select count(*) from rbi_rec where ct = ''mix3''::citext'),
-		   ('select count(*) from rbi_rec where arr @> array[3]'),
-		   ('select count(*) from rbi_rec where arr && array[1,2]'),
-		   ('select count(*) from rbi_rec where arr @> ''{}''::int4[]'),
-		   ('select count(*) from rbi_rec where tsv @@ ''w1''::tsquery'),
-		   ('select count(*) from rbi_rec where tsv @@ ''w2 & w3''::tsquery'),
-		   ('select count(*) from rbi_rec where tsv @@ ''w5 | w7''::tsquery')
+	VALUES ('select k4, count(*) from lion_rec group by k4'::text),
+		   ('select t, count(*) from lion_rec group by t'),
+		   ('select ct, count(*) from lion_rec group by ct'),
+		   ('select ct, count(*) from lion_rec where k4 = 5 group by ct'),
+		   ('select b, count(*) from lion_rec group by b'),
+		   ('select nn, count(*) from lion_rec group by nn'),
+		   ('select k4, count(*) from lion_rec where b group by k4'),
+		   ('select nn, count(*) from lion_rec where k4 = 7 group by nn'),
+		   ('select b, count(*) from lion_rec where nn is null group by b'),
+		   ('select count(*) from lion_rec where nn is not null'),
+		   ('select count(*) from lion_rec where nn is null'),
+		   ('select count(*) from lion_rec where k4 = 3 and b'),
+		   ('select count(*) from lion_rec where t = ''v13'' and not b'),
+		   ('select count(*) from lion_rec where ct = ''mix3''::citext'),
+		   ('select count(*) from lion_rec where arr @> array[3]'),
+		   ('select count(*) from lion_rec where arr && array[1,2]'),
+		   ('select count(*) from lion_rec where arr @> ''{}''::int4[]'),
+		   ('select count(*) from lion_rec where tsv @@ ''w1''::tsquery'),
+		   ('select count(*) from lion_rec where tsv @@ ''w2 & w3''::tsquery'),
+		   ('select count(*) from lion_rec where tsv @@ ''w5 | w7''::tsquery')
 $$;
 
-/* Every roaring index on the table, with what its ntids must add up to. */
-CREATE FUNCTION rbi_rec_indexes() RETURNS TABLE (idx text, ntids_q text)
+/* Every lion index on the table, with what its ntids must add up to. */
+CREATE FUNCTION lion_rec_indexes() RETURNS TABLE (idx text, ntids_q text)
 LANGUAGE sql IMMUTABLE AS $$
 	VALUES
 	  /* A scalar opclass stores exactly one TID per row (a NULL key goes to
 	   * the reserved NULL entry, which ntids counts like any other). */
-	  ('rbi_rec_k4'::text, 'select count(*) from rbi_rec'::text),
-	  ('rbi_rec_t',  'select count(*) from rbi_rec'),
-	  ('rbi_rec_ct', 'select count(*) from rbi_rec'),
-	  ('rbi_rec_b',  'select count(*) from rbi_rec'),
-	  ('rbi_rec_nn', 'select count(*) from rbi_rec'),
+	  ('lion_rec_k4'::text, 'select count(*) from lion_rec'::text),
+	  ('lion_rec_t',  'select count(*) from lion_rec'),
+	  ('lion_rec_ct', 'select count(*) from lion_rec'),
+	  ('lion_rec_b',  'select count(*) from lion_rec'),
+	  ('lion_rec_nn', 'select count(*) from lion_rec'),
 	  /* A multi-key opclass stores one TID per (key, row) pair, and one in
 	   * the reserved EMPTY entry for a row it extracted no key from. */
-	  ('rbi_rec_arr',
+	  ('lion_rec_arr',
 	   'select coalesce(sum(greatest(1, cardinality(u))), 0) from '
 	   '(select array(select distinct e from unnest(arr) x(e) where e is not null) u '
-	   'from rbi_rec) s'),
-	  ('rbi_rec_tsv',
+	   'from lion_rec) s'),
+	  ('lion_rec_tsv',
 	   'select coalesce(sum(greatest(1, coalesce(array_length(tsvector_to_array(tsv), 1), 0))), 0) '
-	   'from rbi_rec')
+	   'from lion_rec')
 $$;
 
 /* ------------------------------------------------------------------ */
@@ -203,18 +203,18 @@ $$;
  * and the multiset comparisons would then be checking a sequential scan
  * against itself.
  */
-CREATE FUNCTION rbi_rec_node(q text) RETURNS text
+CREATE FUNCTION lion_rec_node(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	node text := 'other';
 	ln text;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushdown';
 		ELSIF node <> 'pushdown' AND ln LIKE '%Bitmap Index Scan%' THEN
 			node := 'bitmap';
@@ -229,7 +229,7 @@ END $$;
  * and prove the two results are equal as multisets, with EXCEPT ALL in both
  * directions.  Returns 'ok ...' or a string starting with MISMATCH.
  */
-CREATE FUNCTION rbi_rec_qcmp(q text) RETURNS text
+CREATE FUNCTION lion_rec_qcmp(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	a text[];
@@ -237,15 +237,15 @@ DECLARE
 	ndiff bigint;
 	node text;
 BEGIN
-	node := rbi_rec_node(q);
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	node := lion_rec_node(q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	EXECUTE format('SELECT array_agg(r::text ORDER BY r::text) FROM (%s) r', q)
 		INTO a;
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
@@ -268,10 +268,10 @@ END $$;
 
 /*
  * One single-key probe, four ways: forced index path, forced sequential scan,
- * roaring_index_count() (which reads nothing but the index and the visibility
+ * lion_index_count() (which reads nothing but the index and the visibility
  * map) and the count pushdown.  All four must agree.
  */
-CREATE FUNCTION rbi_rec_kcmp(idx text, col text, val text, direct boolean)
+CREATE FUNCTION lion_rec_kcmp(idx text, col text, val text, direct boolean)
 RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -280,28 +280,28 @@ DECLARE
 	viafun bigint;
 	viapd bigint;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
-	EXECUTE format('SELECT count(*) FROM rbi_rec WHERE %I = %s', col, val)
+	EXECUTE format('SELECT count(*) FROM lion_rec WHERE %I = %s', col, val)
 		INTO viaidx;
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
-	EXECUTE format('SELECT count(*) FROM rbi_rec WHERE %I = %s', col, val)
+	EXECUTE format('SELECT count(*) FROM lion_rec WHERE %I = %s', col, val)
 		INTO viaseq;
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	EXECUTE format('SELECT count(*) FROM rbi_rec WHERE %I = %s', col, val)
+	EXECUTE format('SELECT count(*) FROM lion_rec WHERE %I = %s', col, val)
 		INTO viapd;
 
 	IF direct THEN
-		EXECUTE format('SELECT roaring_index_count(%L::regclass, %s)', idx, val)
+		EXECUTE format('SELECT lion_index_count(%L::regclass, %s)', idx, val)
 			INTO viafun;
 	ELSE
 		viafun := viaseq;
@@ -318,15 +318,15 @@ END $$;
  * The whole check battery.  Returns one row per check; run.sh fails the run on
  * any row with ok = false.
  *
- *   heapallindexed  pass true to roaring_index_verify (the expensive pass that
+ *   heapallindexed  pass true to lion_index_verify (the expensive pass that
  *                   also proves every heap tuple is indexed under every key it
  *                   extracts to).
- *   exact_ntids     require roaring_index_stats().ntids to equal the heap
+ *   exact_ntids     require lion_index_stats().ntids to equal the heap
  *                   exactly, which only holds when the table has just been
  *                   vacuumed with nothing else running; otherwise ntids may
  *                   still hold TIDs of dead tuples and only >= is required.
  */
-CREATE FUNCTION rbi_rec_check(heapallindexed boolean DEFAULT true,
+CREATE FUNCTION lion_rec_check(heapallindexed boolean DEFAULT true,
 							  exact_ntids boolean DEFAULT false)
 RETURNS TABLE (ok boolean, detail text)
 LANGUAGE plpgsql AS $$
@@ -337,13 +337,13 @@ DECLARE
 	want bigint;
 	nrows bigint;
 BEGIN
-	EXECUTE 'SELECT count(*) FROM rbi_rec' INTO nrows;
+	EXECUTE 'SELECT count(*) FROM lion_rec' INTO nrows;
 	ok := true; detail := format('heap has %s rows', nrows); RETURN NEXT;
 
 	/* 1. structural verification, and every heap tuple indexed. */
-	FOR r IN SELECT * FROM rbi_rec_indexes() LOOP
+	FOR r IN SELECT * FROM lion_rec_indexes() LOOP
 		BEGIN
-			EXECUTE format('SELECT roaring_index_verify(%L::regclass, %L)',
+			EXECUTE format('SELECT lion_index_verify(%L::regclass, %L)',
 						   r.idx, heapallindexed);
 			ok := true;
 			detail := format('verify(%s, %s): ok', r.idx, heapallindexed);
@@ -356,8 +356,8 @@ BEGIN
 	END LOOP;
 
 	/* 2. ntids against the heap. */
-	FOR r IN SELECT * FROM rbi_rec_indexes() LOOP
-		EXECUTE format('SELECT ntids FROM roaring_index_stats(%L::regclass)', r.idx)
+	FOR r IN SELECT * FROM lion_rec_indexes() LOOP
+		EXECUTE format('SELECT ntids FROM lion_index_stats(%L::regclass)', r.idx)
 			INTO got;
 		EXECUTE r.ntids_q INTO want;
 		IF exact_ntids THEN
@@ -379,22 +379,22 @@ BEGIN
 	 */
 	FOR r IN
 		SELECT * FROM (VALUES
-			('rbi_rec_nn null_tids'::text,
-			 'select null_tids from roaring_index_stats(''rbi_rec_nn'')'::text,
-			 'select count(*) from rbi_rec where nn is null'::text),
-			('rbi_rec_arr null_tids',
-			 'select null_tids from roaring_index_stats(''rbi_rec_arr'')',
-			 'select count(*) from rbi_rec where arr is null'),
-			('rbi_rec_arr empty_tids',
-			 'select empty_tids from roaring_index_stats(''rbi_rec_arr'')',
-			 'select count(*) from rbi_rec where arr is not null and not exists '
+			('lion_rec_nn null_tids'::text,
+			 'select null_tids from lion_index_stats(''lion_rec_nn'')'::text,
+			 'select count(*) from lion_rec where nn is null'::text),
+			('lion_rec_arr null_tids',
+			 'select null_tids from lion_index_stats(''lion_rec_arr'')',
+			 'select count(*) from lion_rec where arr is null'),
+			('lion_rec_arr empty_tids',
+			 'select empty_tids from lion_index_stats(''lion_rec_arr'')',
+			 'select count(*) from lion_rec where arr is not null and not exists '
 			 '(select 1 from unnest(arr) e where e is not null)'),
-			('rbi_rec_tsv null_tids',
-			 'select null_tids from roaring_index_stats(''rbi_rec_tsv'')',
-			 'select count(*) from rbi_rec where tsv is null'),
-			('rbi_rec_tsv empty_tids',
-			 'select empty_tids from roaring_index_stats(''rbi_rec_tsv'')',
-			 'select count(*) from rbi_rec where tsv is not null and tsv = ''''::tsvector')
+			('lion_rec_tsv null_tids',
+			 'select null_tids from lion_index_stats(''lion_rec_tsv'')',
+			 'select count(*) from lion_rec where tsv is null'),
+			('lion_rec_tsv empty_tids',
+			 'select empty_tids from lion_index_stats(''lion_rec_tsv'')',
+			 'select count(*) from lion_rec where tsv is not null and tsv = ''''::tsvector')
 		) v(what, gotq, wantq)
 	LOOP
 		EXECUTE r.gotq INTO got;
@@ -406,16 +406,16 @@ BEGIN
 	END LOOP;
 
 	/* 4. single-key counts: index vs seqscan vs count() vs pushdown. */
-	FOR r IN SELECT * FROM rbi_rec_keys() LOOP
-		res := rbi_rec_kcmp(r.idx, r.col, r.val, r.direct);
+	FOR r IN SELECT * FROM lion_rec_keys() LOOP
+		res := lion_rec_kcmp(r.idx, r.col, r.val, r.direct);
 		ok := res NOT LIKE 'MISMATCH%';
 		detail := res;
 		RETURN NEXT;
 	END LOOP;
 
 	/* 5. GROUP BY and the multi-key operators, EXCEPT ALL both ways. */
-	FOR r IN SELECT * FROM rbi_rec_queries() LOOP
-		res := rbi_rec_qcmp(r.q);
+	FOR r IN SELECT * FROM lion_rec_queries() LOOP
+		res := lion_rec_qcmp(r.q);
 		ok := res NOT LIKE 'MISMATCH%';
 		detail := res;
 		RETURN NEXT;
@@ -425,9 +425,9 @@ END $$;
 /*
  * A canonical, line-per-probe picture of what the index answers, for
  * comparing a standby against its primary.  Everything goes through the index:
- * roaring_index_count() for the single keys, the count pushdown for the rest.
+ * lion_index_count() for the single keys, the count pushdown for the rest.
  */
-CREATE FUNCTION rbi_rec_probe() RETURNS SETOF text
+CREATE FUNCTION lion_rec_probe() RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	r record;
@@ -436,18 +436,18 @@ DECLARE
 	node text;
 	n bigint;
 BEGIN
-	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 
-	FOR r IN SELECT * FROM rbi_rec_keys() WHERE direct ORDER BY idx, val LOOP
-		EXECUTE format('SELECT roaring_index_count(%L::regclass, %s)', r.idx, r.val)
+	FOR r IN SELECT * FROM lion_rec_keys() WHERE direct ORDER BY idx, val LOOP
+		EXECUTE format('SELECT lion_index_count(%L::regclass, %s)', r.idx, r.val)
 			INTO v;
 		RETURN NEXT format('count %s %s = %s', r.idx, r.val, v);
 	END LOOP;
 
-	FOR r IN SELECT * FROM rbi_rec_queries() ORDER BY q LOOP
-		node := rbi_rec_node(r.q);
-		PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	FOR r IN SELECT * FROM lion_rec_queries() ORDER BY q LOOP
+		node := lion_rec_node(r.q);
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 		PERFORM set_config('enable_seqscan', 'off', true);
 		EXECUTE format('SELECT count(*), coalesce(string_agg(s, E''\n'' ORDER BY s), '''') '
 					   'FROM (SELECT x::text AS s FROM (%s) x) y', r.q)
@@ -467,7 +467,7 @@ END $$;
  * show the opposite - at least one block skipped via the map - or the standby
  * assertion would be vacuously true.
  */
-CREATE FUNCTION rbi_rec_check_count_stats(recovery boolean)
+CREATE FUNCTION lion_rec_check_count_stats(recovery boolean)
 RETURNS TABLE (ok boolean, detail text)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -483,8 +483,8 @@ BEGIN
 		RETURN;
 	END IF;
 
-	FOR r IN SELECT * FROM rbi_rec_keys() WHERE direct ORDER BY idx, val LOOP
-		EXECUTE format('SELECT * FROM roaring_index_count_stats(%L::regclass, %s)',
+	FOR r IN SELECT * FROM lion_rec_keys() WHERE direct ORDER BY idx, val LOOP
+		EXECUTE format('SELECT * FROM lion_index_count_stats(%L::regclass, %s)',
 					   r.idx, r.val)
 			INTO st;
 		anyskipped := anyskipped + st.blocks_skipped;

@@ -1,13 +1,13 @@
-# roaring_index: a roaring-bitmap inverted index AM for PostgreSQL — design v0
+# pg_lion: a roaring-bitmap inverted index AM for PostgreSQL — design v0
 
 Status: prototype targeting PostgreSQL master (20devel). Built and tested against the assert-enabled
 install in `.local/pg` (`.local/pg/bin/pg_config`). This document is the single source of truth for
 on-disk format, locking protocol, and module boundaries. Change it before changing the code.
 
-Extension name: `roaring_index`. Access method name: `roaring`. C symbol prefix: `rbi_` / `RBI`.
+Extension name: `pg_lion`. Access method name: `roaring`. C symbol prefix: `lion_` / `RBI`.
 
-    CREATE EXTENSION roaring_index;
-    CREATE INDEX ON fact USING roaring (country);
+    CREATE EXTENSION pg_lion;
+    CREATE INDEX ON fact USING lion (country);
 
 ## 1. Goals and non-goals for v0
 
@@ -16,8 +16,8 @@ Goals
 - Bitmap scans (`amgetbitmap`) so the planner can use it in Bitmap Index Scan / BitmapAnd / BitmapOr.
 - Correct under concurrent INSERT and VACUUM. Crash-safe via generic WAL.
 - Bulk build via tuplesort. Inserts, VACUUM (ambulkdelete) that removes TIDs and shrinks containers.
-- SQL-callable `roaring_index_stats()` and `roaring_index_verify()` for tests and debugging.
-- Layered so that phase 2 can add: a visibility-map-interlocked `roaring_index_count()` and a
+- SQL-callable `lion_index_stats()` and `lion_index_verify()` for tests and debugging.
+- Layered so that phase 2 can add: a visibility-map-interlocked `lion_index_count()` and a
   CustomScan that answers `count(*) ... GROUP BY key` from containers without visiting the heap.
 
 Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, §14 and §15)
@@ -29,15 +29,15 @@ Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, 
 
 Every heap TID is mapped to a 64-bit code and split into a container key and a 15-bit low part.
 
-    RBI_OFFSET_BITS      = 9 at BLCKSZ 8192 (MaxHeapTuplesPerPage = 291 < 512)
-                           10 at 16K (585), 11 at 32K (1169)   -- computed at compile time, see rbi_tid.h
-    code(tid)            = ((uint64) block << RBI_OFFSET_BITS) | offset        -- 41 bits at 8K
-    RBI_CONTAINER_BITS   = 15
+    LION_OFFSET_BITS      = 9 at BLCKSZ 8192 (MaxHeapTuplesPerPage = 291 < 512)
+                           10 at 16K (585), 11 at 32K (1169)   -- computed at compile time, see lion_tid.h
+    code(tid)            = ((uint64) block << LION_OFFSET_BITS) | offset        -- 41 bits at 8K
+    LION_CONTAINER_BITS   = 15
     ckey(code)           = code >> 15                                          -- uint32, block >> 6 at 8K
     lo(code)             = code & 0x7FFF                                       -- 0 .. 32767
-    blocks per container = 1 << (15 - RBI_OFFSET_BITS) = 64 at 8K
+    blocks per container = 1 << (15 - LION_OFFSET_BITS) = 64 at 8K
 
-Offsets ≥ (1 << RBI_OFFSET_BITS) are an ERROR at insert/build time ("table AM not supported").
+Offsets ≥ (1 << LION_OFFSET_BITS) are an ERROR at insert/build time ("table AM not supported").
 The meta page records offset_bits and container_bits; opening an index with a mismatch is an ERROR.
 
 Why not GIN's 11 offset bits: bitset containers would be 86% empty. Why 15 container bits and not 16:
@@ -45,70 +45,70 @@ a 16-bit bitset is 8192 bytes and cannot be a page item; 15 bits gives a 4096-by
 container fits on any page, and VACUUM can always fall back to a bitset when a run split would
 otherwise grow a container past its slot.
 
-## 3. Containers (module `rbi_container.[ch]`, no backend dependencies beyond `c.h` + pg_bitutils)
+## 3. Containers (module `lion_container.[ch]`, no backend dependencies beyond `c.h` + pg_bitutils)
 
-    typedef struct RBIContainer
+    typedef struct LionContainer
     {
         uint32  ckey;          /* container key (code >> 15) */
         uint16  cardinality;   /* number of members, 0..32768 */
-        uint8   type;          /* RBI_CT_ARRAY=1, RBI_CT_BITSET=2, RBI_CT_RUN=3 */
+        uint8   type;          /* LION_CT_ARRAY=1, LION_CT_BITSET=2, LION_CT_RUN=3 */
         uint8   flags;         /* reserved, 0 */
         /* payload follows immediately (no padding; header is 8 bytes) */
-    } RBIContainer;
+    } LionContainer;
 
 Payloads (all little values are host-endian uint16/uint64, like every other PG on-disk structure):
-- ARRAY:  `uint16 lo[cardinality]`, strictly ascending. Max cardinality RBI_ARRAY_MAX_CARD = 2048.
+- ARRAY:  `uint16 lo[cardinality]`, strictly ascending. Max cardinality LION_ARRAY_MAX_CARD = 2048.
 - BITSET: `uint64 words[512]` (4096 bytes, fixed), bit i set ⇔ lo i is a member.
 - RUN:    `uint16 nruns; struct { uint16 start; uint16 len_minus_1; } runs[nruns]`, runs ascending and
-          non-adjacent (merged). Max RBI_RUN_MAX_NRUNS = 1023 (payload ≤ 4094 bytes).
-- RBI_CONTAINER_MAX_SIZE = 8 + 4096 = 4104 bytes. Invariant: every container ≤ this size.
+          non-adjacent (merged). Max LION_RUN_MAX_NRUNS = 1023 (payload ≤ 4094 bytes).
+- LION_CONTAINER_MAX_SIZE = 8 + 4096 = 4104 bytes. Invariant: every container ≤ this size.
 
 Representation policy
 - Insert into ARRAY beyond 2048 members ⇒ convert to BITSET. Insert into RUN that would exceed
   1023 runs ⇒ convert to BITSET.
 - Remove from BITSET leaving ≤ 2048 members ⇒ convert to ARRAY. Remove from RUN that would exceed
   1023 runs (split) ⇒ convert to BITSET. Cardinality may reach 0; the caller deletes empty containers.
-- `rbi_container_optimize()` picks the smallest of the three representations. It is called at bulk
+- `lion_container_optimize()` picks the smallest of the three representations. It is called at bulk
   build time for every container and by VACUUM after modifying a container. It is *not* called on
   every insert (inserts only enforce the size invariant), matching CRoaring's runOptimize semantics.
-- Mutators operate on a caller-supplied buffer of RBI_CONTAINER_MAX_SIZE bytes. Page code copies a
+- Mutators operate on a caller-supplied buffer of LION_CONTAINER_MAX_SIZE bytes. Page code copies a
   container out of the page into such a buffer, mutates, and writes it back (in place when it fits).
 
-Full API: `src/rbi_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
+Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
 run merging/splitting, and set algebra against a brute-force 32768-bit reference.
 
-## 4. Page layout (module `rbi.h`, implemented in `rbi_pages.c`)
+## 4. Page layout (module `lion.h`, implemented in `lion_pages.c`)
 
 All pages are standard PG pages (PageInit) with a special area:
 
-    typedef struct RBIPageOpaqueData
+    typedef struct LionPageOpaqueData
     {
         BlockNumber rightlink;     /* next page in this chain, or InvalidBlockNumber */
         uint32      minckey;       /* container pages: smallest ckey on page (0 if empty) */
         uint32      maxckey;       /* container pages: largest ckey on page (0 if empty) */
-        uint16      flags;         /* RBI_PAGE_META | RBI_PAGE_BUCKET | RBI_PAGE_CONTAINER */
-        uint16      page_id;       /* RBI_PAGE_ID = 0xFF87, for identification by inspection tools */
-    } RBIPageOpaqueData;
+        uint16      flags;         /* LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER */
+        uint16      page_id;       /* LION_PAGE_ID = 0xFF87, for identification by inspection tools */
+    } LionPageOpaqueData;
 
-Block 0: meta page. Payload struct `RBIMetaPageData` { magic 0x52424931, version 2, offset_bits,
+Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 2, offset_bits,
 container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. Version 2 is the first that
 indexes NULL keys (§14); a version 1 index is structurally valid but has no NULL entry, so opening
 one is an ERROR that asks for a REINDEX rather than a wrong answer to `IS NULL`.
 
 Blocks 1 .. nbuckets: bucket head pages. Bucket b for a key with 32-bit hash h is `h % nbuckets`
-(`rbi_bucket_of()` in rbi.h, the single place that mapping lives); its head page is block `1 + b`.
+(`lion_bucket_of()` in lion.h, the single place that mapping lives); its head page is block `1 + b`.
 A bucket is a rightlink chain of bucket pages holding entry tuples. nbuckets is NOT a power of two:
 ambuild sizes it from the bytes the entries need (§5), and the `buckets` reloption means an exact
 count.
 
 Entry tuple (an item on a bucket page):
 
-    typedef struct RBIEntryTuple
+    typedef struct LionEntryTuple
     {
         uint32      hash;
-        uint16      flags;          /* RBI_ENTRY_INLINE or RBI_ENTRY_CHAIN, plus
-                                     * RBI_ENTRY_NULLKEY for the NULL entry (§14) */
+        uint16      flags;          /* LION_ENTRY_INLINE or LION_ENTRY_CHAIN, plus
+                                     * LION_ENTRY_NULLKEY for the NULL entry (§14) */
         uint16      keylen;         /* bytes of key data stored (0 for the NULL entry) */
         BlockNumber head;           /* CHAIN: first container page; INLINE: InvalidBlockNumber */
         BlockNumber tail;           /* CHAIN: last container page (append hint) */
@@ -116,42 +116,42 @@ Entry tuple (an item on a bucket page):
         uint64      ntids;          /* members in this key's posting set */
         /* key data: keylen bytes, then MAXALIGN padding */
         /* INLINE only: containers back to back, ascending ckey, total bytes = item size - offset */
-    } RBIEntryTuple;                /* header is 32 bytes (RBI_ENTRY_HDRSZ; ntids forces padding) */
+    } LionEntryTuple;                /* header is 32 bytes (LION_ENTRY_HDRSZ; ntids forces padding) */
 
 Key data is stored with datumCopy semantics: by-value types as a full `Datum` (8 bytes);
 fixed-length by-reference types as typlen bytes; varlena as a detoasted, 4-byte-header varlena;
-cstring as strlen+1 bytes. Keys larger than RBI_MAX_KEY_SIZE = 2000 bytes are an ERROR.
+cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2000 bytes are an ERROR.
 Entry lookup compares `hash`, then calls the opclass equality operator's function (strategy 1 of the
 opfamily, looked up once per relation and cached in `rd_amcache`) with the index collation.
 
 INLINE entries hold their containers in the entry tuple while the payload is ≤ `inline_limit`
-bytes (reloption, default 4096 = RBI_MAX_INLINE_LIMIT). When an insert would exceed that, the entry
+bytes (reloption, default 4096 = LION_MAX_INLINE_LIMIT). When an insert would exceed that, the entry
 *spills*: allocate a container page, move the containers there, set head = tail = that page, flags =
-CHAIN (keeping every RBI_ENTRY_RESERVED bit: a key-less entry that loses its flag becomes an
+CHAIN (keeping every LION_ENTRY_RESERVED bit: a key-less entry that loses its flag becomes an
 ordinary entry with a zero-length key that no reader looks for, so the next row of its kind starts a
 second one - the 2026-09-20 review reproduced exactly that), and shrink the entry tuple. Entries
 never convert back from CHAIN to INLINE. The default is the maximum on purpose: a CHAIN posting set
 owns whole container pages, so a key whose set is a few hundred bytes costs a whole page once it
 spills (§13 measured a 20000-key index at 164 MB with a 1024-byte limit against 35 MB with 4096).
 
-Container pages (per key, CHAIN entries): items are RBIContainer structs, ascending ckey within a
+Container pages (per key, CHAIN entries): items are LionContainer structs, ascending ckey within a
 page; all ckeys on page P are smaller than all ckeys on P.rightlink. `minckey`/`maxckey` in the
 special area are maintained on every change. Page P owns free space like any heap/index page; use
 PageAddItemExtended (with explicit offset to keep order), PageIndexTupleOverwrite (handles size
 change), PageIndexTupleDeleteNoCompact/PageIndexMultiDelete + PageRepairFragmentation as needed.
 
-Locating the page for a ckey (`rbi_chain_find_page`): if the tail is non-empty and ckey ≥ tail.minckey
+Locating the page for a ckey (`lion_chain_find_page`): if the tail is non-empty and ckey ≥ tail.minckey
 use tail (the append case; an empty tail has minckey 0 and must not be trusted); otherwise walk from
 head and stop at the first non-empty page with maxckey ≥ ckey, or the last page.
 
-Growth (`rbi_chain_put_container`): overwrite in place if the page has room; otherwise *split* page P:
+Growth (`lion_chain_put_container`): overwrite in place if the page has room; otherwise *split* page P:
 move the items at/after the insert position to a freshly allocated page N linked after P; if the
 container still does not fit on P, place it alone on a second new page M linked between P and N
 (P → M → N → old right). This guarantees progress in one WAL record (P, N, M, entry page = 4 buffers,
 the GenericXLog maximum). Items only ever move right and only to brand-new pages. Pages are never
-freed or unlinked in v0. `rbi_chain_find_page` skips empty pages (VACUUM may leave them mid-chain).
+freed or unlinked in v0. `lion_chain_find_page` skips empty pages (VACUUM may leave them mid-chain).
 INLINE payloads are packed without padding, so containers inside them are unaligned: read them with
-`rbi_inline_fetch()` into an aligned buffer; never cast into the payload. Containers stored as page
+`lion_inline_fetch()` into an aligned buffer; never cast into the payload. Containers stored as page
 items are MAXALIGNed and may be used in place.
 
 Free space accounting: a container page is "full" for a given container when
@@ -160,11 +160,11 @@ container ≤ 4104 bytes and a fresh page holds at least one.
 
 **Growth slack inside an item** (v1 write wave). An item on a container page may be allotted MORE
 bytes than its header needs, so that the next few members can be added inside it. An item therefore
-has two sizes, and both are needed: `rbi_item_size()` is its LOGICAL size, derived from the header,
+has two sizes, and both are needed: `lion_item_size()` is its LOGICAL size, derived from the header,
 and is what every reader uses to find where it ends; `ItemIdGetLength()` is its ALLOCATED length,
-which is what it may grow to in place. `rbi_item_alloc_size()` chooses the second whenever an
-insert writes an item: MAXALIGN(size) plus size/8 clamped into [`RBI_ITEM_SLACK_MIN` = 8,
-`RBI_ITEM_SLACK_MAX` = 64] bytes, capped at RBI_CONTAINER_MAX_SIZE, dropped entirely when the page
+which is what it may grow to in place. `lion_item_alloc_size()` chooses the second whenever an
+insert writes an item: MAXALIGN(size) plus size/8 clamped into [`LION_ITEM_SLACK_MIN` = 8,
+`LION_ITEM_SLACK_MAX` = 64] bytes, capped at LION_CONTAINER_MAX_SIZE, dropped entirely when the page
 has no room for it, and never for a BITSET (4104 bytes is already the maximum an item can be). The
 slack is a fraction of the item rather than a fixed 64 bytes on purpose: a key whose TIDs are
 spread thinly owns dozens of ~50-byte items per page, and 64 bytes of slack each would nearly halve
@@ -177,29 +177,29 @@ the exception is an item that has far more room than it can use - a segment repl
 container one of its container keys was promoted to - which gives the excess back.
 
 An insert whose item has room inside it adds the member there and nowhere else
-(`rbi_insert_container_inplace()`, `rbi_insert_segment_inplace()` in rbi_insert.c): the item keeps
+(`lion_insert_container_inplace()`, `lion_insert_segment_inplace()` in lion_insert.c): the item keeps
 its offset and its allotted length, no other item on the page moves, minckey/maxckey change only
 when a segment's range really grew, and the WAL delta is the handful of bytes that changed. A
-BITSET always qualifies, an ARRAY needs 2 spare bytes and a cardinality below RBI_ARRAY_MAX_CARD, a
-RUN needs 4 and a run count below RBI_RUN_MAX_NRUNS (both would otherwise turn into a bitset), and
-a sparse segment needs 6 and a container key that stays below RBI_SPARSE_THRESHOLD members (else
+BITSET always qualifies, an ARRAY needs 2 spare bytes and a cardinality below LION_ARRAY_MAX_CARD, a
+RUN needs 4 and a run count below LION_RUN_MAX_NRUNS (both would otherwise turn into a bitset), and
+a sparse segment needs 6 and a container key that stays below LION_SPARSE_THRESHOLD members (else
 the key is promoted, which is not an in-place change). Otherwise the general path runs - copy out,
 mutate, write back, split if needed - and leaves fresh slack behind, which is where the slack of a
 growing key comes from in the first place. **Only inserts add slack**: ambuild writes items at
 their exact size, because a bulk-built index is read-mostly and the space would be pure loss, and
-so does VACUUM (`rbi_chain_put_items_locked()` is the no-slack form of
-`rbi_chain_put_items_locked_ext()`).
+so does VACUUM (`lion_chain_put_items_locked()` is the no-slack form of
+`lion_chain_put_items_locked_ext()`).
 
-Slack is bounded by `RBI_ITEM_SLACK_LIMIT` so that it can never be mistaken for corruption:
+Slack is bounded by `LION_ITEM_SLACK_LIMIT` so that it can never be mistaken for corruption:
 verify() accepts an item whose allocated length is up to that much above its logical size, and
-rejects anything else (including any item above RBI_CONTAINER_MAX_SIZE, which is what lets every
-reader copy an item out by ItemIdGetLength() into a fixed work buffer). roaring_index_stats()
+rejects anything else (including any item above LION_CONTAINER_MAX_SIZE, which is what lets every
+reader copy an item out by ItemIdGetLength() into a fixed work buffer). lion_index_stats()
 reports the total as `slack_bytes`; `container_bytes` counts logical bytes only, and `free_bytes`
 comes from PageGetFreeSpace(), which does not see intra-item slack at all.
 
-Page allocation: `rbi_new_buffer()` extends the relation (ExtendBufferedRel), initialises the page
-and logs it in its own GenericXLog record; `rbi_new_buffer_xl()` registers the new page in the
-caller's record instead, and is what rbi_add_entry and the split path use, so a crash cannot leave an
+Page allocation: `lion_new_buffer()` extends the relation (ExtendBufferedRel), initialises the page
+and logs it in its own GenericXLog record; `lion_new_buffer_xl()` registers the new page in the
+caller's record instead, and is what lion_add_entry and the split path use, so a crash cannot leave an
 initialised page that nothing links to. No FSM use in v0; verify() reports unreferenced
 never-initialised or empty pages as WARNINGs (harmless, never reused) and anything else as an ERROR.
 
@@ -208,14 +208,14 @@ never-initialised or empty pages as WARNINGs (harmless, never reused) and anythi
 Lock ordering: bucket head page → other bucket pages → container pages (left to right) → new page.
 Never lock a page to the left of one you hold. The meta page is read once at relation open and cached.
 
-INSERT (`rbi_insert.c`)
+INSERT (`lion_insert.c`)
 1. Hash the key; lock the bucket head page EXCLUSIVE and hold it until the insert is complete.
 2. Walk the bucket chain (lock each further bucket page EXCLUSIVE while inspecting/modifying it;
    pages other than the head may be released when done) to find the entry. If absent, add an INLINE
    entry with one 1-member array container (splitting the bucket chain by appending a new bucket page
    if no bucket page has room).
    **Bucket directory guard** (v1 write wave): the walk counts the pages it visits, and a chain
-   longer than `RBI_BUCKET_PAGES_WARN` = 4 pages means the bucket holds about six times the entry
+   longer than `LION_BUCKET_PAGES_WARN` = 4 pages means the bucket holds about six times the entry
    bytes ambuild sizes a bucket for (three quarters of a page), i.e. the index has outgrown the
    directory it was built with. The threshold is not the "two pages per bucket on average" this
    policy is stated as, because what an insert can observe cheaply is one bucket's chain - a
@@ -224,15 +224,15 @@ INSERT (`rbi_insert.c`)
    20000-key column of bench/write_micro.sh's portfolio, which warned at a threshold of 2 right
    after a clean build. An index that has really outgrown its directory is far past four pages:
    100k keys in an index created empty give 64 buckets of twelve pages each.
-   The backend then says so once per index (`rbi_warn_bucket_chain()`), suggesting a REINDEX. It is
+   The backend then says so once per index (`lion_warn_bucket_chain()`), suggesting a REINDEX. It is
    advisory in exactly the way the §17 cardinality guard is - the index keeps working and keeps
    taking rows - and the estimate is one bucket's chain rather than an average over the directory,
    because hashes spread entries evenly enough and walking the whole directory on every insert would
    cost more than the warning is worth. An index whose `buckets` reloption was set explicitly is
-   never warned about: that count is what its owner asked for. roaring_index_stats() reports the
+   never warned about: that count is what its owner asked for. lion_index_stats() reports the
    same quantity exactly, as `max_bucket_pages` (the longest chain in the index).
    This is a warning and not online growth on purpose. Growing the directory in place would mean
-   splitting buckets (a new bucket count changes `rbi_bucket_of()` for every key, so either the
+   splitting buckets (a new bucket count changes `lion_bucket_of()` for every key, so either the
    whole directory is rehashed under a lock that stops every reader, or the index keeps a split
    point and two hash functions, as dynamic hashing does - and then every reader, the count
    pushdown and VACUUM have to consult it, and a crash in the middle has to leave the two halves
@@ -254,9 +254,9 @@ INSERT (`rbi_insert.c`)
    and an ARRAY, a RUN or a segment qualifies when the item has growth slack (§4), which the general
    path leaves behind whenever an insert writes an item.
    The page is located with the exclusive lock the insert needs anyway: the tail page is tried
-   first (`rbi_insert_lock_chain_page()`), because that is where every insert into a growing posting
-   set lands, and only a ckey the tail does not own falls back to `rbi_chain_find_page()`, which
-   walks from the head. That saves the SHARE acquisition rbi_chain_find_page() would take on the
+   first (`lion_insert_lock_chain_page()`), because that is where every insert into a growing posting
+   set lands, and only a ckey the tail does not own falls back to `lion_chain_find_page()`, which
+   walks from the head. That saves the SHARE acquisition lion_chain_find_page() would take on the
    very same tail page just to read its minckey: two lock acquisitions per appending insert instead
    of three, all of them inside the bucket-lock window. It did NOT move the concurrent-insert
    ceiling of step 6 (643 tps either way, measured by swapping the two builds in one session), which
@@ -291,13 +291,13 @@ INSERT (`rbi_insert.c`)
    the top on failure, as ambulkdelete does in §11) was therefore NOT implemented: it does not
    remove the record write from the window where both pages are held, and it adds an acquisition
    and a retry path. It is worth doing for the case it really helps - an insert whose ckey is in
-   the MIDDLE of a long chain, where `rbi_chain_find_page()` walks many pages under the bucket
+   the MIDDLE of a long chain, where `lion_chain_find_page()` walks many pages under the bucket
    lock - and that is the shape to revisit it in. The structural fix for hot-key inserts is a
    custom WAL resource manager (RegisterCustomRmgr, PG 15+) with physical records ("set member m of
    the item at offset o", "add n to the entry's ntids") instead of GenericXLog's page diffs, which
    would cut the critical section by an order of magnitude.
 
-SCAN (`rbi_scan.c`, amgetbitmap)
+SCAN (`lion_scan.c`, amgetbitmap)
 1. Lock bucket head SHARED, walk the bucket chain (lock coupling not required for bucket pages:
    hold one page at a time; entries are only ever appended to bucket pages or overwritten in place).
 2. On finding the entry: INLINE → copy the payload out, release, emit. CHAIN → copy head, release the
@@ -317,7 +317,7 @@ SCAN (`rbi_scan.c`, amgetbitmap)
    true to tbm_add_tuples() for every TID, so the bitmap heap scan re-applies the original quals.
    Emitting a superset with recheck set is correct; silently dropping the other quals would not be.
 
-VACUUM (`rbi_vacuum.c`, ambulkdelete)
+VACUUM (`lion_vacuum.c`, ambulkdelete)
 1. For each bucket: two passes as described in §11 (the head is cleanup-locked only while its own
    INLINE entries are modified; chain pages are processed without holding the head across waits).
 2. For each entry: INLINE → filter the payload through the callback and repack. Note that removal can
@@ -325,8 +325,8 @@ VACUUM (`rbi_vacuum.c`, ambulkdelete)
    INLINE payload may exceed inline_limit or the page: then the entry spills to a chain during VACUUM.
    CHAIN → walk the chain; each container page is locked with LockBufferForCleanup (this is the
    interlock that phase 2 relies on: a heap-skipping reader keeps the page pinned while it consults
-   the visibility map). Filter every container with rbi_container_remove_if, run
-   rbi_container_optimize, write back in place or, if it grew and no longer fits, re-place it through
+   the visibility map). Filter every container with lion_container_remove_if, run
+   lion_container_optimize, write back in place or, if it grew and no longer fits, re-place it through
    the chain machinery (which may split the page); delete empty containers with one
    PageIndexMultiDelete per page (it compacts; no PageRepairFragmentation needed); update min/max.
    Empty pages stay in the chain. Every page record also carries the updated entry (ncontainers/ntids),
@@ -336,20 +336,20 @@ VACUUM (`rbi_vacuum.c`, ambulkdelete)
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
    counting pages; otherwise pass it through.
 
-BUILD (`rbi_build.c`)
+BUILD (`lion_build.c`)
 1. table_index_build_scan callback pushes (hash int4, key datum, code int8) into a tuplesort created
    with tuplesort_begin_heap over a 3-attribute TupleDesc, sort keys (hash ASC via int4 btree,
    code ASC via int8 btree), TUPLESORT_RANDOMACCESS, maintenance_work_mem. A NULL key goes in with
    hash 0 and the key column NULL (§14); the two passes below group by the isnull flag first.
 2. Pass 1 over the sorted data counts distinct keys (equal hash ⇒ compare with the equality proc,
    remembering the small set of distinct keys seen for the current hash value) and adds up the BYTES
-   their entry tuples will need: for each key, MAXALIGN(MAXALIGN(RBI_ENTRY_HDRSZ + keylen) +
+   their entry tuples will need: for each key, MAXALIGN(MAXALIGN(LION_ENTRY_HDRSZ + keylen) +
    min(payload, inline_limit)) + sizeof(ItemIdData), where the payload of a key with n members is
-   estimated as 6n bytes below RBI_SPARSE_THRESHOLD members (one sparse pair each, §13) and
-   RBI_CONTAINER_HDRSZ + 2n from there on (an ARRAY container). Both halves are rough - pass 1 does
+   estimated as 6n bytes below LION_SPARSE_THRESHOLD members (one sparse pair each, §13) and
+   LION_CONTAINER_HDRSZ + 2n from there on (an ARRAY container). Both halves are rough - pass 1 does
    not group the codes by container key - but they have the right order of magnitude at both
    extremes. nbuckets = reloption if set, else ceil(total bytes / (BLCKSZ * 3/4)), clamped to
-   [RBI_DEFAULT_BUCKETS = 64, 65536]. Bytes rather than key counts, because every bucket owns a head
+   [LION_DEFAULT_BUCKETS = 64, 65536]. Bytes rather than key counts, because every bucket owns a head
    page whether it needs one or not: sizing by distinct keys spent 32768 pages (256 MB) on a
    1M-key index whose entries were 84 MB. The floor matters because indexes are usually built on
    empty tables and filled later.
@@ -363,8 +363,8 @@ BUILD (`rbi_build.c`)
    exact count (§4).
 3. tuplesort_rescan; pass 2 groups by key. Because codes are sorted within a hash, and keys sharing a
    hash are rare, keep one open builder per distinct key of the current hash (a builder = ordered
-   list of containers under construction; use rbi_container_append_sorted with a per-key "last ckey"
-   and finish each container with rbi_container_optimize when the ckey changes). When the hash
+   list of containers under construction; use lion_container_append_sorted with a per-key "last ckey"
+   and finish each container with lion_container_optimize when the ckey changes). When the hash
    changes, flush all builders: small payload → INLINE entry; else allocate container pages and fill
    them sequentially (fill each page until the next container does not fit; set rightlink,
    min/max), then add the CHAIN entry.
@@ -386,7 +386,7 @@ BUILD (`rbi_build.c`)
    memory - one 8 KB image per bucket page that holds entries, allocated lazily - until pass 2 is
    over, and are written afterwards: head pages in bucket order, then the overflow pages in block
    order. That is the cost of this route: the directory is sized at three quarters of a page per
-   bucket, so the images come to ~1.3× the bytes the entries need, bounded by RBI_MAX_BUCKETS pages
+   bucket, so the images come to ~1.3× the bytes the entries need, bounded by LION_MAX_BUCKETS pages
    (512 MB) and by nothing else. Container pages are final as soon as the next container does not
    fit, so only one per open key exists at a time.
    Block numbers come from a counter rather than from extending the relation, in the same order the
@@ -399,7 +399,7 @@ BUILD (`rbi_build.c`)
 5. ambuildempty: init meta + bucket pages (nbuckets = reloption or 64) in INIT_FORKNUM with
    log_newpage, as contrib/bloom does.
 
-## 6. Handler settings (`rbi_am.c`)
+## 6. Handler settings (`lion_am.c`)
 
     amstrategies = 5 (1 equality, 2 @>, 3 &&, 4 <@, 5 @@ -- see §17)
     amsupport = 3 (1 = hash function, same as hash AM; 2 and 3 = GIN's extraction procs, §17)
@@ -410,7 +410,7 @@ BUILD (`rbi_build.c`)
     amstorage = true (§17)           amclusterable = false     ampredlocks = false
     amcanparallel = false            amcanbuildparallel = false    amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
-    amgettuple = NULL                amgetbitmap = rbigetbitmap    amcanreturn = NULL
+    amgettuple = NULL                amgetbitmap = liongetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
     amoptions: reloptions `buckets` (int, 0 = auto, max 65536; any value, not rounded to a power of
@@ -421,16 +421,16 @@ BUILD (`rbi_build.c`)
     Handler follows contrib/bloom in master: `static const IndexAmRoutine amroutine = {...}` returned
     with PG_RETURN_POINTER.
 
-Operator classes (in `roaring_index--0.1.sql`): one DEFAULT opclass per type, reusing the hash AM's
+Operator classes (in `pg_lion--0.1.sql`): one DEFAULT opclass per type, reusing the hash AM's
 support-1 functions, plus the two multi-key classes of §17. Generate the list from the dev cluster with
 `SELECT ... FROM pg_amproc JOIN pg_opclass ... WHERE amname='hash' AND amprocnum=1` for at least:
 int2, int4, int8, oid, bool, "char", text, varchar (via text), bpchar, bytea, uuid, date, time,
 timestamp, timestamptz, interval, numeric, float4, float8, macaddr, inet, name, jsonb, enum types
 via anyenum (hashenum). Strategy 1 operator = the type's `=`.
 
-## 7. SQL functions (`rbi_funcs.c`)
+## 7. SQL functions (`lion_funcs.c`)
 
-    roaring_index_stats(regclass, OUT nbuckets int, OUT bucket_pages bigint, OUT entries bigint,
+    lion_index_stats(regclass, OUT nbuckets int, OUT bucket_pages bigint, OUT entries bigint,
         OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint,
         OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint,
         OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint,
@@ -439,34 +439,34 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- container counts include INLINE containers; free_bytes sums bucket and container pages;
         -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
         -- the reserved no-key entry (§17)
-    roaring_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
+    lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container, ntids/ncontainers sums; with heapallindexed, scans the heap with a
         -- fresh snapshot and checks that every visible tuple's TID is present under its key -
-        -- refusing (rbi_index_usable(), §9) when this transaction's snapshot may not use the index.
-    (phase 2) roaring_index_count(regclass, key anyelement) RETURNS bigint
+        -- refusing (lion_index_usable(), §9) when this transaction's snapshot may not use the index.
+    (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
 
-    src/rbi_tid.h            TID ↔ code helpers                          (fixed; written by the architect)
-    src/rbi_container.h/.c   container library + test/unit/container_test.c   (agent "container")
-    src/rbi.h                on-disk structs, RBIState, prototypes of rbi_pages.c (skeleton by architect)
-    src/rbi_pages.c          meta/bucket/entry/chain primitives, splits, page alloc   (agent "am-core")
-    src/rbi_am.c             handler, options, validate, costestimate, buildempty     (agent "am-core")
-    src/rbi_build.c          ambuild                                                   (agent "am-core")
-    src/rbi_scan.c           ambeginscan/rescan/endscan/getbitmap                      (agent "am-core")
-    src/rbi_insert.c         aminsert                                                  (wave 2)
-    src/rbi_vacuum.c         ambulkdelete/amvacuumcleanup                              (wave 2)
-    src/rbi_funcs.c          stats/verify (+ count in phase 2)                         (wave 2)
-    src/rbi_multikey.c       GIN-style extraction and query trees (§17)                (wave 3)
-    roaring_index.control, roaring_index--0.1.sql, Makefile, test/                    (am-core, then wave 2)
+    src/lion_tid.h            TID ↔ code helpers                          (fixed; written by the architect)
+    src/lion_container.h/.c   container library + test/unit/container_test.c   (agent "container")
+    src/lion.h                on-disk structs, LionState, prototypes of lion_pages.c (skeleton by architect)
+    src/lion_pages.c          meta/bucket/entry/chain primitives, splits, page alloc   (agent "am-core")
+    src/lion_am.c             handler, options, validate, costestimate, buildempty     (agent "am-core")
+    src/lion_build.c          ambuild                                                   (agent "am-core")
+    src/lion_scan.c           ambeginscan/rescan/endscan/getbitmap                      (agent "am-core")
+    src/lion_insert.c         aminsert                                                  (wave 2)
+    src/lion_vacuum.c         ambulkdelete/amvacuumcleanup                              (wave 2)
+    src/lion_funcs.c          stats/verify (+ count in phase 2)                         (wave 2)
+    src/lion_multikey.c       GIN-style extraction and query trees (§17)                (wave 3)
+    pg_lion.control, pg_lion--0.1.sql, Makefile, test/                    (am-core, then wave 2)
 
 Coding conventions: PostgreSQL C style (tabs, K&R braces on their own line for functions, /* */
 comments, `elog(ERROR, ...)` for internal errors, `ereport` with errcode for user-facing errors),
 compile clean with `-Wall -Wextra -Wno-unused-parameter` and cassert enabled. No CRoaring dependency.
 
-## 9. Phase 2a: heap-skipping count with a visibility-map interlock (`rbi_count.c`)
+## 9. Phase 2a: heap-skipping count with a visibility-map interlock (`lion_count.c`)
 
 Goal: `count(*) WHERE k1 = v1 [AND k2 = v2 ...]` computed from containers, visiting the heap only for
 pages that are not all-visible, with exactly the MVCC semantics of the equivalent SELECT under the
@@ -511,20 +511,20 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   correct, no longer O(1) per container). Lifting this needs a custom resource manager whose redo
   takes cleanup locks on container and bucket pages, the way btree_xlog_vacuum does.
 
-Algorithm `rbi_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
+Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
    entries copy the payload while holding the pin; for CHAIN entries note head).
 2. Merge-iterate the k posting sets by ckey (they are sorted). For the AND of k containers with the
-   same ckey use rbi_container_and into a work buffer (k-1 times). Containers whose ckey is missing
+   same ckey use lion_container_and into a work buffer (k-1 times). Containers whose ckey is missing
    from any set contribute nothing.
    Pin discipline: at any time hold at most one pinned page per index (the page whose containers you
    are currently consuming). Advance a set's cursor page only after its containers have been fully
    consumed, and consume means: for the resulting AND container, do the VM checks (step 3) before any
    source page pin is released.
-3. For the result container: for each of the ≤ RBI_BLOCKS_PER_CONTAINER heap blocks with members
-   (compute member counts per block via rbi_container_range_cardinality over the block's lo range;
+3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members
+   (compute member counts per block via lion_container_range_cardinality over the block's lo range;
    skip blocks with 0), `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: count +=
-   members, PredicateLockPage; else: append the block's TIDs (rbi_code_to_tid) to a recheck list.
+   members, PredicateLockPage; else: append the block's TIDs (lion_code_to_tid) to a recheck list.
 4. After the merge completes, recheck: sort the TID list (it is already in TID order if produced in
    ckey order), and for each TID call `table_index_fetch_tuple(fetch, &tid, snap, slot, &call_again,
    &all_dead)` in a loop over call_again (HOT chains); count each visible tuple found. Use
@@ -544,7 +544,7 @@ Algorithm `rbi_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *ke
    TID needs no index pin at all: if VACUUM removed that TID meanwhile, the tuple was dead to every
    snapshot including ours (nothing to count, and nothing is found); if the line pointer was reused,
    the new tuple's xmin is later than our snapshot and is invisible to it.
-6. Per-query visibility cache (`RBIVisCache`, rbi_count.h). A grouped count asks the recheck about
+6. Per-query visibility cache (`LionVisCache`, lion_count.h). A grouped count asks the recheck about
    the same dirty heap pages once per group: at 5M rows with 200 groups and 5% of the rows updated,
    9,062 dirty pages cost 415,884 heap block visits (§12's grouped-count finding). The answer cannot
    change between those visits, so it is resolved once per (page, snapshot) and reused. The cache
@@ -575,24 +575,24 @@ Algorithm `rbi_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *ke
      records the blocks it visits, and a block is resolved on its second visit. A one-shot count
      therefore behaves exactly as it did before the cache existed, down to the last buffer visit.
    - Lifetime: one handle per count node execution, created by the caller
-     (`rbi_vis_cache_create`/`_destroy`) and passed to `rbi_count_sources_cached()`; NULL means no
+     (`lion_vis_cache_create`/`_destroy`) and passed to `lion_count_sources_cached()`; NULL means no
      cache. The handle empties itself when it is handed a different relation or a different
      snapshot, so the partitioned counts of §16 may share one handle and get one cache per
-     partition. `roaring_index_count_group_stats(idx, use_cache)` is the SQL image of that driver,
+     partition. `lion_index_count_group_stats(idx, use_cache)` is the SQL image of that driver,
      for tests: same entry scan, one count per group, one cache.
 
-SQL surface for tests: `roaring_index_count(idx regclass, key anyelement) RETURNS bigint` and
-`roaring_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
+SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
+`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
 Both verify the key type matches the index's opcintype, open the heap via IndexGetRelation with
 AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
 Nobody vetted the index they were handed, so they also make the decision the planner makes in
-get_relation_info() before looking anything up: `rbi_index_usable(index, snapshot, &why)` (rbi.h,
-implemented in rbi_pages.c, shared with roaring_index_verify's heapallindexed pass) requires
+get_relation_info() before looking anything up: `lion_index_usable(index, snapshot, &why)` (lion.h,
+implemented in lion_pages.c, shared with lion_index_verify's heapallindexed pass) requires
 indisvalid and indisready and applies the indcheckxmin rule against TransactionXmin exactly as
 plancat.c does; an unusable index is an ERROR naming the reason, never a count. This is not an
 optimisation: an index built from a broken HOT chain holds only the latest version of that chain, so
 an older snapshot's row is not in the posting set and no amount of heap rechecking can put it back
-(the 2026-09-20 review reproduced `count(*) WHERE k = 1` = 1 against `roaring_index_count()` = 0;
+(the 2026-09-20 review reproduced `count(*) WHERE k = 1` = 1 against `lion_index_count()` = 0;
 test/isolation/count_checkxmin.spec is that case).
 Isolation tests must cover: concurrent uncommitted insert (not counted), committed insert (counted
 in a new snapshot, not in an old REPEATABLE READ one), delete + VACUUM racing with the count (a
@@ -603,11 +603,11 @@ not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the
 indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
 that is missing the row it still sees).
 
-## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`rbi_customscan.c`)
+## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_customscan.c`)
 
 Planner integration
 - Install `create_upper_paths_hook` (chaining to any previous hook) at `_PG_init`; act only for
-  stage UPPERREL_GROUP_AGG. GUC `roaring_index.enable_count_pushdown` (bool, default on).
+  stage UPPERREL_GROUP_AGG. GUC `pg_lion.enable_count_pushdown` (bool, default on).
 - Applicability, all required (bail out silently otherwise):
   - input_rel is a single base relation (RELOPT_BASEREL, RTE_RELATION, relkind ordinary table or
     materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
@@ -616,7 +616,7 @@ Planner integration
   - The query has no HAVING, DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
   - Every baserestrictinfo clause is `Var opeq Const` or `Const opeq Var` where Var is a plain column
-    of the rel with a *valid* roaring index whose opfamily contains that operator as strategy 1 (use
+    of the rel with a *valid* lion index whose opfamily contains that operator as strategy 1 (use
     the index's opfamily and the operator OID; cross-type integer equality is fine because the
     integer opfamily contains it), the compared value is not a literal NULL, and there is at most
     one clause per column (two different values on one column ⇒ bail; the same value twice ⇒
@@ -641,7 +641,7 @@ Planner integration
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
     indexcollations[0] equals that collation, because the index hashed and compared keys under its
     own collation and the count never rechecks the predicate. Checked per partition.
-  - GROUP BY is empty, or exactly one plain Var of the rel with a roaring index. The grouped column
+  - GROUP BY is empty, or exactly one plain Var of the rel with a lion index. The grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.
   - **The driving index's equality is the grouping equality** (2026-09-20 review, finding 3). An
@@ -667,7 +667,7 @@ Planner integration
   entry whose key is a spelling the table no longer contains. So a pushdown that PRODUCES a value -
   the GROUP BY column in the output target, or a column a `=` clause pins whose value the target
   list prints from the entry's stored key - is only built when equality on that index implies an
-  identical binary representation. Both halves are checked, per relation, in `rbi_collect_targets()`:
+  identical binary representation. Both halves are checked, per relation, in `lion_collect_targets()`:
   - the index's own equality (strategy 1 for (opcintype, opcintype)) IS the type's equality, i.e.
     the equality of the type's default btree opclass. Otherwise "same entry" is weaker than "equal"
     and the question below is not even the right one;
@@ -687,7 +687,7 @@ Planner integration
   grouped_rel->reltarget` (a partitioned GROUP BY uses a partially-grouped target instead and is
   wrapped in a Finalize Agg: §16), rows = estimated groups (from estimate_num_groups, or 1 without
   GROUP BY),
-  and a cost (`rbi_cost_count_rel()`, per relation, summed over the leaves of §16) that is the sum
+  and a cost (`lion_cost_count_rel()`, per relation, summed over the leaves of §16) that is the sum
   of what the node really reads:
   - **one bucket page per looked-up key** at random_page_cost, and that key's own container chain -
     written sequentially, so its share of the index's container pages, at least one page - at
@@ -696,7 +696,7 @@ Planner integration
   - **every page of the group index** for a GROUP BY, at seq_page_cost: its entries are all walked;
   - **one O(1) step per container per participating source**, twice cpu_operator_cost (a block mask
     and a visibility-map mask), where a source's containers are `Min(heap_pages /
-    RBI_BLOCKS_PER_CONTAINER, its members)`, so a GROUP BY pays numgroups of them;
+    LION_BLOCKS_PER_CONTAINER, its members)`, so a GROUP BY pays numgroups of them;
   - **the union of an IN list**, cpu_operator_cost × members × log2(nelems): a merge of k sets costs
     that per member however it is organised (§15 builds the k-way one), and a single-key clause with
     k = 1 pays nothing for a merge it does not make;
@@ -715,7 +715,7 @@ Planner integration
   1,174 ms**, with 418,819 buffer hits and zero physical reads over a 71 MiB working set. The same
   shape reproduced here: **15,661 against 155,840**, and 141 ms against 850 ms.
 
-  The page cost respects caching for the same reason (`rbi_heap_page_cost()`): it interpolates
+  The page cost respects caching for the same reason (`lion_heap_page_cost()`): it interpolates
   between seq_page_cost and random_page_cost on whichever of two ratios argues more strongly for
   sequential access - the working set's share of this relation's prorated `effective_cache_size`, as
   `index_pages_fetched()` prorates it, and the fraction of the relation the set covers, as
@@ -753,8 +753,8 @@ Planner integration
   invisible to both, and a parameterised inner side would then count the first outer row's key
   again. Use `build_path_tlist`-style
   handling with INDEX_VAR references in the plan's targetlist as pg_strom/TimescaleDB do.
-  `custom_private` is a POSITIONAL list (the `RBI_PRIV_*` indexes), so its first member is a shape
-  marker - an IntList of `RBI_PRIV_MAGIC` and the number of members - which BeginCustomScan checks
+  `custom_private` is a POSITIONAL list (the `LION_PRIV_*` indexes), so its first member is a shape
+  marker - an IntList of `LION_PRIV_MAGIC` and the number of members - which BeginCustomScan checks
   before reading any offset and ERRORs on. Planner/executor drift, or a plan built by a differently
   shaped build of the library, is then a message and not a misread Oid.
 
@@ -770,14 +770,14 @@ Executor
   (`ExecEvalExprSwitchContext()` through the node's own ExprContext, then `datumCopy()` into a
   context of the node's that lives exactly as long as the scan - the per-tuple memory the evaluation
   leaves its result in belongs to nobody here). ReScan throws them away with everything else.
-- ExecCustomScan without GROUP BY: on the first call compute rbi_count_keys for the WHERE keys and
+- ExecCustomScan without GROUP BY: on the first call compute lion_count_keys for the WHERE keys and
   return one tuple (count); subsequent calls return NULL.
 - ExecCustomScan with GROUP BY: iterate all entries of the group-by index in bucket order (walk
   bucket pages; copy each entry's key and head/inline payload while pinned as in §9). For each
   entry, count the AND of its posting set with the WHERE posting sets (§9). Emit (key, count) only
   when count > 0 (a group exists only if at least one row is visible). Output order is arbitrary;
   the planner must not assume sortedness (pathkeys = NIL). This is one function,
-  `rbi_next_group()`, and it is the whole of the GROUP BY executor: a partitioned scan runs it once
+  `lion_next_group()`, and it is the whole of the GROUP BY executor: a partitioned scan runs it once
   per partition (§16).
 - ReScanCustomScan: reset iteration state. EndCustomScan: close indexes, free.
 - ExplainCustomScan: print "Indexes: idx1 (col = const), ..." and "Group Key: col" and, with ANALYZE,
@@ -791,7 +791,7 @@ Executor
 Tests (pg_regress): the pushdown produces identical results to the plain plan for: no rows; all rows;
 WHERE constants that match no key; cross-type constants; GROUP BY with and without WHERE; after
 DELETE without VACUUM (recheck path) and after VACUUM (VM path); EXPLAIN shows the custom node when
-`roaring_index.enable_count_pushdown = on` and the normal plan when off.  Parameters get the same
+`pg_lion.enable_count_pushdown = on` and the normal plan when off.  Parameters get the same
 treatment under `plan_cache_mode = force_generic_plan`, which is what keeps a `$n` a Param: a
 count, a count that matches nothing, a NULL parameter, `= ANY ($1)`, `IN ($1, $2)`, a GROUP BY with
 a parameterised WHERE clause, a parameterised clause whose column the target list prints, and a
@@ -801,7 +801,7 @@ compared against the same query with the pushdown switched off, as a multiset bo
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too.
 
-## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `rbi_vacuum.c`)
+## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
 ambulkdelete acquires a cleanup lock (an exclusive content lock that also waits for all other pins
 to drop) on **every page it visits** — every bucket page and every container page of every chain,
@@ -856,7 +856,7 @@ Deadlock rule for readers: never acquire a bucket-page lock while holding a pin 
 VACUUM holds the bucket head and then waits for cleanup locks on that bucket's container pages; a
 reader holding a container pin and then asking for the bucket head closes the cycle, and buffer
 LWLocks have no deadlock detection. Finish with the bucket page (copy the entry out, drop its lock)
-before pinning container pages, and never go back. `rbi_chain_find_page()` takes SHARE locks
+before pinning container pages, and never go back. `lion_chain_find_page()` takes SHARE locks
 internally, so do not call it while holding a lock on any page of that chain.
 
 ## 12. Measured on 20M rows (2026-09-20) and v1 priorities
@@ -883,7 +883,7 @@ v1 priorities, in order of measured impact:
    entry ordering, and a strategy number outside the 1..5 §17 now uses) are not.
 6. Page recycling and entry deletion (v0 never frees pages or entries).
 7. Params in the count pushdown; multi-column GROUP BY. Partitions are DONE (§16).
-The per-container visibility-map read (rbi_vm_allvisible_mask) is already in: it turned the GROUP BY
+The per-container visibility-map read (lion_vm_allvisible_mask) is already in: it turned the GROUP BY
 from O(heap blocks × keys) (1034 ms) into O(containers) (50 ms).
 
 ## 13. Sparse segments (v1 format addition)
@@ -893,24 +893,24 @@ fewer than ~4 members per 64-page window (high-cardinality columns, tsvector lex
 cost 24 bytes per row where GIN costs 3.
 
 Item kind. Container pages and INLINE payloads may now hold a fourth item type, the **sparse
-segment**, sharing the 8-byte RBIContainer header:
+segment**, sharing the 8-byte LionContainer header:
 
-    type        = RBI_CT_SPARSE (4)
+    type        = LION_CT_SPARSE (4)
     ckey        = first container key covered by the segment
-    cardinality = number of members n (1 .. RBI_SPARSE_MAX_PAIRS = 682)
+    cardinality = number of members n (1 .. LION_SPARSE_MAX_PAIRS = 682)
     payload     = uint32 ckeys[n], then uint16 los[n]      -- both sorted by (ckey, lo); 6n bytes
     total size  = 8 + 6n  <= 4104 (same bound as every other item)
 
 A segment covers the ckey range [ckey, ckeys[n-1]]. Invariants: every ckey of a posting set appears
 in at most one item (a regular container or inside one segment); items on a page are ordered by first
 ckey and their ranges do not overlap or interleave; page minckey/maxckey and chain ordering use each
-item's first and last ckey; `rbi_item_size()` dispatches on type for containers and segments.
+item's first and last ckey; `lion_item_size()` dispatches on type for containers and segments.
 The entry tuple's `ncontainers` counts ITEMS, containers and segments alike (it is the number the
 chain machinery maintains and verify() checks against the items it finds); the `containers`,
-`array_containers`, `bitset_containers` and `run_containers` columns of roaring_index_stats() count
+`array_containers`, `bitset_containers` and `run_containers` columns of lion_index_stats() count
 only real containers, and `container_bytes` is the bytes of every item, segments included.
 
-Policy. RBI_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular container (array cost
+Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular container (array cost
 12 + 2n beats 6n from n = 4); with ≤ 3 members its pairs live in a segment.
 - Build: per key, group sorted codes by ckey; dense ckeys emit containers, sparse ckeys append to the
   open segment; a container closes the open segment (ranges must not interleave); a segment also
@@ -921,7 +921,7 @@ Policy. RBI_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contain
   segment). Insert the pair in sorted position. If the ckey's members within the segment reach the
   threshold, extract them into a new regular container item and split the segment around it
   (left part, container, right part; empty parts vanish). If a segment overflows 682, split it in
-  half. All through rbi_chain_put_container-style placement so page splits work unchanged.
+  half. All through lion_chain_put_container-style placement so page splits work unchanged.
   Order matters: the threshold test comes FIRST, because promoting a ckey shrinks the segment, so a
   full segment only has to split in half when the pair really stays in it and one insert can never
   produce more than three items. The half-split therefore only happens for a pair that lands inside
@@ -931,12 +931,12 @@ Policy. RBI_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contain
   policy, and the insert promotes the ckey to a container instead of failing.
   A key's first TID is a one-pair segment (14 bytes), not a one-member ARRAY container (10): one
   more byte per singleton key, six instead of ten for every ckey after it.
-  A container built by promoting a ckey out of a segment gets one `rbi_container_optimize()` call,
+  A container built by promoting a ckey out of a segment gets one `lion_container_optimize()` call,
   exactly as the build path does when it closes a container — that is what makes 200 consecutive
   inserts of one key a 14-byte single-run container instead of a 408-byte array.
-- Placement: `rbi_chain_put_items_locked()` replaces the item at an offset (or inserts at it) with
+- Placement: `lion_chain_put_items_locked()` replaces the item at an offset (or inserts at it) with
   1..3 items in ONE GenericXLog record, splitting the page exactly as before when they do not fit;
-  `rbi_chain_put_container_locked()` is a one-item wrapper over it. Atomicity matters here: a crash
+  `lion_chain_put_container_locked()` is a one-item wrapper over it. Atomicity matters here: a crash
   between writing a promoted container and the remains of its segment would leave a ckey in two
   items, which every reader would then see twice.
 - VACUUM: filter pairs; delete empty segments; a regular container that falls below the threshold
@@ -949,8 +949,8 @@ Policy. RBI_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contain
   until extraction). stats: add sparse_segments and sparse_members columns. "Sizes in range" means
   the item's allocated length is at least what its header needs and at most that plus one slack
   allowance (§4): a segment an insert wrote has room for a few more pairs inside it.
-- Container library: `rbi_container_check()` rejects type 4 ("item is a sparse segment, not a
-  container"); segment helpers live in `src/rbi_sparse.[ch]` with their own standalone unit test
+- Container library: `lion_container_check()` rejects type 4 ("item is a sparse segment, not a
+  container"); segment helpers live in `src/lion_sparse.[ch]` with their own standalone unit test
   (test/unit/sparse_test.c, `make unit`). Segments never grow while being filtered, so VACUUM's
   regrow path stays container-only.
 
@@ -1001,12 +1001,12 @@ way, and the posting-set bytes are exactly the ones §13 measured.
 ## 14. NULL keys (v1, implemented)
 
 One reserved entry per index holds the posting set of rows whose key is NULL: flag
-RBI_ENTRY_NULLKEY, keylen 0, hash 0, living in bucket 0 and matched by the flag rather than by key.
-Everything that searches a bucket for a key skips it (rbi_find_entry_ext), and everything that reads
-a stored key asks first; `rbi_find_null_entry()` is the only way to it. Once located it is an
+LION_ENTRY_NULLKEY, keylen 0, hash 0, living in bucket 0 and matched by the flag rather than by key.
+Everything that searches a bucket for a key skips it (lion_find_entry_ext), and everything that reads
+a stored key asks first; `lion_find_null_entry()` is the only way to it. Once located it is an
 ordinary entry: it spills to a chain, is filtered by VACUUM and is counted exactly like any other,
 and the spill keeps the flag - every path that rewrites an entry's flags (insert spill, VACUUM spill,
-rbi_entry_rebuild, build) preserves all of RBI_ENTRY_RESERVED, and verify() reports a key-less entry
+lion_entry_rebuild, build) preserves all of LION_ENTRY_RESERVED, and verify() reports a key-less entry
 without one as corruption (keylen 0 is not a legal key length).
 
 Build: the tuplesort's key column may be NULL (hash 0 for NULLs; both passes group by the isnull
@@ -1022,7 +1022,7 @@ as, both to keep the buffer-pin budget of §9 bounded:
 - `col IS NULL` is a positive source: the null entry's posting set, intersected with the rest.
 - `col IS NOT NULL` is a NEGATED source, not a union of every other entry. The rows whose key is
   NULL are exactly the members of the null entry, so the answer is the intersection of the other
-  clauses MINUS that set, which the merge computes per container key with rbi_container_andnot().
+  clauses MINUS that set, which the merge computes per container key with lion_container_andnot().
   A union of every entry would need one cursor - and up to one buffer pin - per distinct key.
   Any number of `IS NOT NULL` clauses cost one extra cursor each, and no inclusion-exclusion.
 - `col IS NOT NULL` with no other clause and no GROUP BY has nothing to drive the merge, so the
@@ -1037,12 +1037,12 @@ as, both to keep the buffer-pin budget of §9 bounded:
 
 ## 15. IN lists and ScalarArrayOp (v1, implemented)
 
-AM: `amsearcharray = true`. rbigetbitmap receives an SK_SEARCHARRAY key whose argument is an array
+AM: `amsearcharray = true`. liongetbitmap receives an SK_SEARCHARRAY key whose argument is an array
 datum: deconstruct it, skip NULL elements, look up each value and emit its set. Duplicates are not
 filtered there - set semantics make them harmless, they only cost a second lookup.
 
 Count pushdown: accept `ScalarArrayOpExpr` with useOr = true whose operator is strategy 1 of the
-index opfamily and whose array is a non-NULL Const of at most RBI_MAX_ARRAY_ELEMS = 1000 elements;
+index opfamily and whose array is a non-NULL Const of at most LION_MAX_ARRAY_ELEMS = 1000 elements;
 the clause's posting set is the UNION of the elements' sets. Values are deduped (bytewise, which is
 allowed to miss equal-but-not-identical values: a union does not double-count, so a missed duplicate
 only costs work). An empty array, an all-NULL one, or a list none of whose values has an entry means
@@ -1059,7 +1059,7 @@ pages instead, since every element's entry lives on one of those.
 The merge's sources are therefore unions: k sub-cursors merged by container key, yielding the union
 of the containers that share the smallest key any of them still has. The §9 pin rule is per
 sub-cursor and unchanged - a sub-cursor that contributed to the merged container still pins the page
-that container came from, because only the merge advances it, from rbi_count_container(), after the
+that container came from, because only the merge advances it, from lion_count_container(), after the
 visibility-map checks.
 
 Neither half of that may be done by walking all k sub-cursors, because k is up to 1000:
@@ -1071,15 +1071,15 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   random access pattern, which measured *slower* than the linear scan it replaced (+4 ms on a
   1000-value list at 1M rows).
 - **The union itself**: folding m containers pairwise builds and re-optimizes m-1 intermediate
-  containers, which is quadratic in the members. Above `RBI_OR_BITSET_MIN` (32, measured) of them at
+  containers, which is quadratic in the members. Above `LION_OR_BITSET_MIN` (32, measured) of them at
   one container key, they are ORed into one bitset image of the key's range instead and the result
   container is built from it once. Below that the pairwise fold is cheaper, because the image costs
   a fixed pass over the whole 32768-value range however few members arrive.
-- **Locating the entries**: `rbi_posting_set_lookup_many()` hashes every value first and then looks
+- **Locating the entries**: `lion_posting_set_lookup_many()` hashes every value first and then looks
   the entries up in (bucket, hash) order, so the bucket pages are read in ascending block order and
   duplicates - which hash equally and are therefore adjacent in that order - are dropped in one pass
   instead of by comparing every value with every earlier one (half a million `datumIsEqual()` calls
-  at 1000 values). `roaring_index_count_any(idx, keys)` is the SQL form of the whole path.
+  at 1000 values). `lion_index_count_any(idx, keys)` is the SQL form of the whole path.
 
 Measured at 1M rows, all-visible heap, assert build: `count(*) WHERE c20k IN (...)` through this
 path against the same query on a btree (20000 distinct values, 50 rows each) - 3 values 0.13 vs
@@ -1087,7 +1087,7 @@ path against the same query on a btree (20000 distinct values, 50 rows each) - 3
 1000-value case was 24.7 ms with the pairwise fold and the linear scan over all sub-cursors; the
 shorter lists are unchanged, which is the point of the two thresholds.
 
-**Cost.** A list is priced per element and not per clause (§10's `rbi_cost_count_rel()`): one bucket
+**Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one bucket
 page each at random_page_cost, shared once the list is longer than the index has buckets
 (`Min(nelems, nbuckets)`); one chain page each at seq_page_cost, or the clause's share of the
 container pages if that is larger; one container step per element per container key; and
@@ -1116,12 +1116,12 @@ At UPPERREL_GROUP_AGG the input rel may be a partitioned parent: `rte->inh`, rel
 RELOPT_BASEREL. The parent has no storage and, because `get_relation_info()` skips indexes for an
 inheritance parent, no `indexlist` either, so everything is resolved per leaf.
 
-Planning (`rbi_try_count_path`, `rbi_collect_targets`)
+Planning (`lion_try_count_path`, `lion_collect_targets`)
 - The query-level, GROUP BY, WHERE-clause and target-list checks of §10/§14/§15 are unchanged and
   are made against the PARENT: the Vars, attnums and constants the node carries are the parent's.
   Clause analysis no longer looks an index up as it goes; it records (attnum, operator, compared
   type) and the indexes are matched afterwards, once per relation.
-- `rbi_collect_targets()` then walks the partition tree and produces one target - heap Oid, the
+- `lion_collect_targets()` then walks the partition tree and produces one target - heap Oid, the
   index whose entries drive the scan (GROUP BY or the sum-over-all of §14), one index per WHERE
   clause, and the leaf's RelOptInfo for costing - per live leaf partition. It recurses through
   sub-partitioned children, using the planner's already-pruned set (`part_rels[i]` non-NULL and
@@ -1131,8 +1131,8 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
   translated_vars`, since partitions may number their columns differently or have dropped ones. A
   column missing in some partition is a bail-out.
 - Every leaf must be a plain table (relkind `r`; a materialized view is accepted by the same code
-  path but cannot be a partition) with a usable roaring index - the rules of
-  `rbi_find_roaring_index` plus, per clause, strategy 1 of THAT index's opfamily for the clause's
+  path but cannot be a partition) with a usable lion index - the rules of
+  `lion_find_roaring_index` plus, per clause, strategy 1 of THAT index's opfamily for the clause's
   operator and an opfamily member and hash function for the compared type, all checked per
   partition because nothing stops two partitions from using different opclasses. A foreign table,
   or a leaf without one of the indexes, bails out.
@@ -1146,12 +1146,12 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
 - No live partitions (everything pruned) adds no path at all: the planner's own dummy-rel handling
   gives the right answer.
 - One CustomPath per query - added to the grouped rel directly, or, for a GROUP BY, as the subpath
-  of the Finalize Agg that is added instead (below). custom_private gains one member: RBI_PRIV_PARTS, a
+  of the Finalize Agg that is added instead (below). custom_private gains one member: LION_PRIV_PARTS, a
   list of one OidList per partition (heap Oid, driving index Oid or InvalidOid, then one index Oid
   per WHERE clause in clause order), empty for a plain table. A partitioned plan leaves the index
-  Oids in RBI_PRIV_OIDS invalid - there is no single index - and keeps the parent's heap Oid there,
+  Oids in LION_PRIV_OIDS invalid - there is no single index - and keeps the parent's heap Oid there,
   which is what EXPLAIN resolves column names against.
-- Cost: `rbi_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
+- Cost: `lion_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
   allvisfrac and rows and its own indexes; the path's cost is the sum over the leaves. numgroups
   comes from `estimate_num_groups` on the PARENT (a partition may hold rows of every group), and is
   used unchanged for each of them. Each partition's dirty working set is therefore charged once, for
@@ -1179,7 +1179,7 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
 
   Instead the pushdown builds the plan shape core builds for a partial aggregation:
 
-  - the path's target is a partially-grouped PathTarget made by `rbi_make_partial_target()`, which
+  - the path's target is a partially-grouped PathTarget made by `lion_make_partial_target()`, which
     is `make_partial_grouping_target()` (src/backend/optimizer/plan/planner.c) applied to the
     grouped rel's own target: the grouping column carried through with its sortgroupref, every
     other column (one a WHERE clause pins, say) carried through as a plain column, and each Aggref
@@ -1195,7 +1195,7 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
     `create_agg_path(root, output_rel, &cpath->path, output_rel->reltarget, AGG_HASHED,
     AGGSPLIT_FINAL_DESERIAL, root->processed_groupClause, NIL, &agg_final_costs, numgroups)`, with
     `agg_final_costs` from `get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, ...)`. EXPLAIN
-    therefore reads `Finalize HashAggregate -> Custom Scan (RoaringCount)`.
+    therefore reads `Finalize HashAggregate -> Custom Scan (LionCount)`.
 
   The Finalize node combines the partial counts with `int8pl` and spills to disk under
   `work_mem × hash_mem_multiplier` like any HashAggregate, so a grouping that does not fit is
@@ -1226,20 +1226,20 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
     therefore a costing decision, not a correctness one, and wants its own calibration and tests.
 
 Executor
-- `rbi_open_relation()` / `rbi_close_relation()` open and close ONE relation: a plain table once for
+- `lion_open_relation()` / `lion_close_relation()` open and close ONE relation: a plain table once for
   the life of the node, a partition for the length of its own turn. The heap is opened with NoLock -
   the executor holds a lock on every range table entry of the plan, partitions included (the planner
   locked them when it expanded the parent, and `AcquireExecutorLocks()` relocks the whole flat range
   table for a cached plan), and cassert builds check it with `CheckRelationLockedByMe` - and the
   indexes, which are not range table entries, with AccessShareLock.
-- Per relation the node then runs one of `rbi_count_relation()` (the intersection of the WHERE
-  clauses), `rbi_sumall_relation()` (§14's sum over every entry) or `rbi_next_group()` (§10's
+- Per relation the node then runs one of `lion_count_relation()` (the intersection of the WHERE
+  clauses), `lion_sumall_relation()` (§14's sum over every entry) or `lion_next_group()` (§10's
   streaming group loop); all three are the single-table code, unchanged.
 - Without GROUP BY the partition counts are summed and one row is emitted, as §10 says: nothing
   comes out until the last partition has been counted, because the one row is the total.
-- With GROUP BY the node streams. `rbi_next_partial_group()` keeps two pieces of state, which
+- With GROUP BY the node streams. `lion_next_partial_group()` keeps two pieces of state, which
   partition is open (`curpart`) and whether it is open (`partopen`), and on each call: open the
-  partition if it is not open and locate its WHERE clauses; ask `rbi_next_group()` for the next
+  partition if it is not open and locate its WHERE clauses; ask `lion_next_group()` for the next
   group of it and return that row; and when its entry scan runs out, release its posting sets,
   close it, and move to the next one. Each group is emitted as a partial aggregate the moment it
   is counted, so a group with rows in three partitions comes out three times and the Finalize Agg
@@ -1251,7 +1251,7 @@ Executor
   of each partition. There is no cross-partition state: no hash table, no per-node group memory
   beyond one partition's iteration state.
 - The key a target list prints for a column a clause pins to one value is remembered on the clause
-  (`RBIClauseState.storedkey`, copied into a small context of its own) the first time a relation's
+  (`LionClauseState.storedkey`, copied into a small context of its own) the first time a relation's
   entry has it, because the posting set is gone by the time the row comes out. With partitions that
   is the first partition that holds the key; any other partition's key compares equal to it by the
   index's own equality - and, since the planner only builds a value-producing node when every
@@ -1261,7 +1261,7 @@ Executor
   keys - and starts again from the first partition. A Finalize HashAggregate that has not spilled
   re-reads its own table instead of rescanning the node (`ExecReScanAgg()`), so the case that
   really exercises this is a nested loop over a spilling one, which `test/sql/partition.sql` has.
-- EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Roaring Indexes` line keeps
+- EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Lion Indexes` line keeps
   its per-clause text but drops the index name for a partitioned scan (`(a), (b = 2)` rather than
   `idx_a (a), idx_b (b = 2)`), because there is one index per partition and no single name to give.
   `Group Key` and the ANALYZE counters are unchanged and are summed over the partitions.
@@ -1274,7 +1274,7 @@ one heap and its indexes, and each partition is its own.
 Not supported: run-time pruning (the node has no Append and no PartitionPruneInfo, so the partition
 set is fixed at plan time), parallel
 execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation as above. Planning
-costs one `index_open` per clause per partition (`rbi_index_bucket_pages` reads the meta page), and
+costs one `index_open` per clause per partition (`lion_index_bucket_pages` reads the meta page), and
 EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
 Also not supported, and refused rather than attempted: a partition whose opclass groups rows
 differently from the query, and a value-producing grouping over a type whose equality does not
@@ -1299,9 +1299,9 @@ segments, VACUUM, the visibility-map interlock - is unchanged.
 
     strategies   1 =      2 @>      3 &&      4 <@      5 @@
 
-The extraction functions are GIN's, named directly in `roaring_index--0.1.sql`:
+The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
 
-    CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING roaring AS
+    CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
         OPERATOR 2 @> (anyarray, anyarray),
         OPERATOR 3 && (anyarray, anyarray),
         OPERATOR 4 <@ (anyarray, anyarray),
@@ -1309,7 +1309,7 @@ The extraction functions are GIN's, named directly in `roaring_index--0.1.sql`:
         FUNCTION 3 ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
         STORAGE  anyelement;
 
-    CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING roaring AS
+    CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
         OPERATOR 5 @@ (tsvector, tsquery),
         FUNCTION 1 hashtext(text),
         FUNCTION 2 gin_extract_tsvector(tsvector, internal, internal),
@@ -1326,12 +1326,12 @@ Two consequences of borrowing GIN's functions, both binding on any future multi-
   first argument is really a tsquery; that is how GIN declares it (amproclefttype = opcintype), and
   the opclass above copies it verbatim.
 - **the strategy number handed to proc 3 is GIN's, not ours.**  GIN numbers the array operators
-  1 &&, 2 @>, 3 <@, 4 =, and tsvector's @@ is its strategy 1.  `rbi_gin_strategy()` in
-  rbi_multikey.c is the single place that translation lives.  Getting it wrong is silent - the
+  1 &&, 2 @>, 3 <@, 4 =, and tsvector's @@ is its strategy 1.  `lion_gin_strategy()` in
+  lion_multikey.c is the single place that translation lives.  Getting it wrong is silent - the
   extraction answers for the wrong operator and returns INCLUDE_EMPTY, which only costs a rechecking
   full scan - so it is one function with one switch.
 
-`rbivalidate` has two shapes.  A scalar opclass is checked exactly as before (proc 1 with signature
+`lionvalidate` has two shapes.  A scalar opclass is checked exactly as before (proc 1 with signature
 (T) -> int4, strategy 1 only, every operator's types hashable by the family).  An opclass is
 multi-key iff the family has proc 2 for (opcintype, opcintype); then procs 2 and 3 must have GIN's
 signatures, every operator's strategy must be in {2,3,4,5}, and proc 1 is required unless
@@ -1341,11 +1341,11 @@ keys.  `amconsistentequality` stays true: a scalar roaring family holds nothing 
 operators and a multi-key one holds no equality operator at all, so `equality_ops_are_compatible()`
 is never asked about two members of the same roaring family that disagree.
 
-### Key type resolution (`rbi_fill_state`, rbi_pages.c)
+### Key type resolution (`lion_fill_state`, lion_pages.c)
 
 The index's own tuple descriptor already carries the resolved key type: `ConstructTupleDescriptor()`
 substitutes `opckeytype` for the column type and replaces ANYELEMENT under an ANYARRAY opcintype with
-`get_base_element_type()` of the column.  So `RBIState.typid` is still `TupleDescAttr(...)->atttypid`
+`get_base_element_type()` of the column.  So `LionState.typid` is still `TupleDescAttr(...)->atttypid`
 and a roaring array_ops index on `text[]` has a `text` key column.  (Deviation from the sketch this
 section started as, which said "opckeytype when set, else opcintype": taking it from the tuple
 descriptor is the same answer for every class, needs no polymorphism handling of its own, and keeps
@@ -1365,12 +1365,12 @@ descriptor is the same answer for every class, needs no polymorphism handling of
 
 ### The reserved EMPTY entry
 
-A second key-less entry joins the NULL entry of §14: flag `RBI_ENTRY_EMPTYKEY`, hash 0, keylen 0,
+A second key-less entry joins the NULL entry of §14: flag `LION_ENTRY_EMPTYKEY`, hash 0, keylen 0,
 bucket 0, one per index.  It holds the rows a multi-key opclass extracted NO key from - an empty
 array, a tsvector with no lexemes - which are under no key at all and which an ALL-mode scan
 (`tags @> '{}'`) still has to find.  A NULL column value goes to the NULL entry as before; the two
-are mutually exclusive and verify() says so.  `rbi_find_entry_ext()` skips both, and
-`rbi_find_reserved_entry()` (with `rbi_find_null_entry()` as a wrapper) is the only way to either.
+are mutually exclusive and verify() says so.  `lion_find_entry_ext()` skips both, and
+`lion_find_reserved_entry()` (with `lion_find_null_entry()` as a wrapper) is the only way to either.
 Like the NULL entry it keeps its flag through a spill, whether the spill happens on insert or inside
 VACUUM (§4, §14); test/sql/array.sql and test/sql/tsvector.sql take both transitions.
 
@@ -1378,23 +1378,23 @@ The meta page version is NOT bumped.  A version 2 index built with a scalar opcl
 entry and needs none - only a multi-key opclass ever writes one, and those did not exist before this
 wave - so no existing index answers anything wrongly, which is the test §14 set for a version bump.
 
-`roaring_index_stats()` gains `empty_tids`, the member count of that entry, next to `null_tids`.
+`lion_index_stats()` gains `empty_tids`, the member count of that entry, next to `null_tids`.
 
 ### Build and insert
 
-Build (`rbi_build.c`): the tuplesort tuple grows a fourth column, `kind int2`
+Build (`lion_build.c`): the tuplesort tuple grows a fourth column, `kind int2`
 (REAL / NULL / EMPTY), still sorted by (hash, code).  A multi-key row is pushed once per distinct
 extracted key, all with the same code; both passes group by (kind, key) instead of (isnull, key).
 Nothing else changes, because the codes of each key still arrive ascending.
 
-Insert (`rbi_insert.c`): `rbiinsert()` extracts and then performs one ordinary single-key insert per
+Insert (`lion_insert.c`): `lioninsert()` extracts and then performs one ordinary single-key insert per
 key, each taking and releasing its own bucket lock.  They are not atomic with respect to a reader,
 which is exactly the visibility the heap already gives: the inserting transaction has not committed,
 so no snapshot that can see the row can run before the last of them is written.
 
-Extraction (`rbi_extract_value()`, rbi_multikey.c) drops NULL keys and duplicates.  A row whose array
+Extraction (`lion_extract_value()`, lion_multikey.c) drops NULL keys and duplicates.  A row whose array
 holds a NULL element is indexed under its other elements; nothing ever looks for a NULL key, because
-a query with one falls back to a rechecking scan.  Duplicates must go, or `rbi_container_add()` would
+a query with one falls back to a rechecking scan.  Duplicates must go, or `lion_container_add()` would
 report "already indexed" and leave `ntids` wrong.  The dedupe hashes every key once and sorts the
 keys BY THEIR HASH, so the only candidates for equality are adjacent and each key is compared (with
 the equality proc, the only ordering-free tool the opclass promises) against the distinct keys of its
@@ -1408,7 +1408,7 @@ and a TID is removed from every entry that holds it.
 verify(heapallindexed) extracts each heap row's keys with the same function the build uses and checks
 that the TID is present under every one of them, or in the EMPTY entry when there are none.
 
-### Queries (`rbi_extract_query()`, rbi_multikey.c)
+### Queries (`lion_extract_query()`, lion_multikey.c)
 
 `searchMode` starts at GIN_SEARCH_MODE_DEFAULT and an out-of-range answer is treated as
 GIN_SEARCH_MODE_ALL, as `ginNewScanKey()` does.  The result is one of three modes:
@@ -1420,7 +1420,7 @@ GIN_SEARCH_MODE_ALL, as `ginNewScanKey()` does.  The result is one of three mode
 ALL is the answer for: any searchMode but DEFAULT (INCLUDE_EMPTY and ALL, which is what
 `ginqueryarrayextract` returns for `@> '{}'` and for `<@`); any partial-match key (a prefix lexeme -
 the keys are hashed, so a range of them cannot be walked); any NULL key; more than
-RBI_MAX_QUERY_KEYS = 1000 keys; and a tsquery shape the tree builder rejects.
+LION_MAX_QUERY_KEYS = 1000 keys; and a tsquery shape the tree builder rejects.
 
 KEYS trees:
 
@@ -1436,16 +1436,16 @@ KEYS trees:
   and a weight needs weights, neither of which the index stores.)
 - `<@` is unreachable (extractQuery says INCLUDE_EMPTY first) and would be ALL.
 
-### Bitmap scans (`rbi_scan.c`)
+### Bitmap scans (`lion_scan.c`)
 
-`rbigetbitmap` dispatches on `RBIState.multikey`.  NONE emits nothing; ALL emits the union of every
-entry but the NULL one - the EMPTY entry included - with recheck = true (`rbi_emit_all_keys()`, which
+`liongetbitmap` dispatches on `LionState.multikey`.  NONE emits nothing; ALL emits the union of every
+entry but the NULL one - the EMPTY entry included - with recheck = true (`lion_emit_all_keys()`, which
 is the function `IS NOT NULL` already used); KEYS locates one posting set per key and hands the tree
 to the shared evaluator, emitting the result containers with recheck = false.
 
-**The scan reuses the count cursors.**  `rbi_sets_iterate()` (rbi_count.c) walks
+**The scan reuses the count cursors.**  `lion_sets_iterate()` (lion_count.c) walks
 (tree over located posting sets) in ascending container-key order and calls back per container; the
-scan's callback is `rbi_container_to_tbm()`.  The alternative - one TIDBitmap per key combined with
+scan's callback is `lion_container_to_tbm()`.  The alternative - one TIDBitmap per key combined with
 tbm_intersect/tbm_union - was not needed: the cursors already present a set as one ascending run of
 containers, the AND and OR nodes are twenty lines each, and using the same evaluator for the scan and
 the count means the two cannot drift apart.
@@ -1455,24 +1455,24 @@ takes is taken before the first container page is pinned: the reader side of the
 `col op ANY (const array)` reaches a multi-key index too (amsearcharray is on for §15's sake); each
 element is a query of its own and the answers go into the same bitmap, which is their union.
 
-**Costing the ALL fallback** (`rbicostestimate`, rbi_am.c; the 2026-09-21 follow-up review). An
+**Costing the ALL fallback** (`lioncostestimate`, lion_am.c; the 2026-09-21 follow-up review). An
 ALL-mode scan reads the WHOLE index and hands the heap every indexed row, and the generic estimate
 priced it with the PREDICATE's output selectivity instead - it was handed an empty `GenericCosts` and
 told nothing. A prefix query on 200,000 documents was estimated at **192.15** cost units against the
 sequential scan's 9,156.14, for a plan that emitted **1,176,746 posting TIDs** and rechecked 198,020
 rows across 6,628 heap blocks, and it was chosen by default: **62.3 ms against 23.8 ms**, and the
-phrase form **68.6 against 31.8**. So `rbicostestimate` now asks, before calling
+phrase form **68.6 against 31.8**. So `lioncostestimate` now asks, before calling
 `genericcostestimate()`, whether the scan will walk the whole index:
-- it picks the qual `rbigetbitmap()` would actually answer, by the same ranking that function uses
+- it picks the qual `liongetbitmap()` would actually answer, by the same ranking that function uses
   (a plain operator first, then a ScalarArrayOp, then a null test), because the cost of the scan is
   the cost of that one qual and the rest are only rechecked;
 - `col IS NOT NULL` walks every entry (§14), and so does a multi-key query the extraction above
-  answers with RBI_QMODE_ALL - which it is asked at plan time, with the clause's own strategy, the
+  answers with LION_QMODE_ALL - which it is asked at plan time, with the clause's own strategy, the
   same way the count pushdown asks;
 - a multi-key query whose value is not a plan-time Const is costed as ALL, because the MODE follows
   the query's shape and an unknown shape has to be assumed to be the expensive one;
 - then `numIndexTuples` is the index's whole `reltuples` - its (key, row) postings, which is what
-  `rbibuild` reports and `rbivacuumcleanup` keeps, though an ANALYZE since will have overwritten it
+  `lionbuild` reports and `lionvacuumcleanup` keeps, though an ANALYZE since will have overwritten it
   with the heap's row count and made this a lower bound - which prorates into every index page, and
   any page the proration still leaves out is added at random_page_cost;
 - and for the multi-key fallback ONLY, `indexSelectivity` becomes 1.0, so the bitmap heap scan above
@@ -1486,46 +1486,46 @@ weight / `<@` against the bitmap plan's 101.3/98.0/88.7/89.1), and to GIN when a
 (18.8/7.1/27.3 ms), while exact `@>`, `&&` and AND/OR tsqueries keep the count pushdown and the
 bitmap plan unchanged. `test/sql/tsvector.sql` and `test/sql/array.sql` pin the plan shapes.
 
-### The expression evaluator (`rbi_count.c`)
+### The expression evaluator (`lion_count.c`)
 
-§15's union cursor is generalised into `RBIExprCursor`, a cursor over an `RBIKeyNode` tree whose
-leaves are located posting sets.  `RBICountSource` gains a `tree` member; NULL still means "the union
+§15's union cursor is generalised into `LionExprCursor`, a cursor over an `LionKeyNode` tree whose
+leaves are located posting sets.  `LionCountSource` gains a `tree` member; NULL still means "the union
 of all the sets", which is what every pre-§17 caller gets.
 
-    LEAF   one RBISetCursor, as before
+    LEAF   one LionSetCursor, as before
     OR     stands at the smallest container key any child has left; the container is the OR of the
            children standing there (this is exactly §15's union cursor)
     AND    winds the children forward until they all stand at one container key; the container is
            the AND of theirs, and a container key whose intersection comes out empty is skipped
            here rather than handed up
 
-The §9 pin rule survives both operators: a leaf is only advanced by `rbi_ecursor_next()`, and the
-merge only calls that from `rbi_count_container()`, after the visibility map has been consulted - so
+The §9 pin rule survives both operators: a leaf is only advanced by `lion_ecursor_next()`, and the
+merge only calls that from `lion_count_container()`, after the visibility map has been consulted - so
 every leaf that contributed to a counted container still pins the page that container came from.
 The two places an AND lets a pin go without anything having been counted (winding a laggard forward,
 dropping an empty intersection) are safe for the same reason the merge's own `!alleq` branch is:
 nothing of that container key reaches the visibility map.
 
 Materialization (§9) needed a sharper rule, because with a tree "at least one participating set is
-read the pinned way" is no longer implied by counting pinned sets.  `rbi_source_pinned()` decides,
+read the pinned way" is no longer implied by counting pinned sets.  `lion_source_pinned()` decides,
 per source, whether EVERY container it can yield comes with a live pin: a leaf has it unless its set
 is materialized, an AND has it if ANY child has it (all children stand at the key), an OR only if
 EVERY child has it (which children contributed is not known in advance).  A positive source's set is
 only materialized while some positive source still has it.
 
-### Count pushdown (`rbi_customscan.c`)
+### Count pushdown (`lion_customscan.c`)
 
-A new clause kind, `RBI_CLAUSE_MULTI`: an OpExpr whose operator is strategy 2, 3 or 5 of some roaring
+A new clause kind, `LION_CLAUSE_MULTI`: an OpExpr whose operator is strategy 2, 3 or 5 of some roaring
 opfamily, with the column on the LEFT (these operators do not commute: `'{a}' @> tags` is strategy 4)
 and a non-NULL Const on the right.  Strategy 4 and everything that is not a roaring operator bail.
 
-- The strategy is read from the OPERATOR (`rbi_op_roaring_strategy()`, a pg_amop lookup restricted to
+- The strategy is read from the OPERATOR (`lion_op_roaring_strategy()`, a pg_amop lookup restricted to
   the roaring AM), not from an index, because the parent of a partitioned table has no index list
-  (§16) and the clause kind has to be known before any index is matched.  `rbi_match_index()` then
+  (§16) and the clause kind has to be known before any index is matched.  `lion_match_index()` then
   re-checks the strategy against the index that will really answer the clause, per partition.
 - The query is extracted AT PLAN TIME and the clause is only pushed down when the mode is KEYS.  An
   ALL-mode query would have every row rechecked in the heap, which is what the ordinary bitmap plan
-  already does, better.  `rbi_match_index()` additionally insists that each relation's index carries
+  already does, better.  `lion_match_index()` additionally insists that each relation's index carries
   the very extractQuery function the plan-time extraction used, so the run-time extraction cannot
   come out differently.
 - **A multi-key clause therefore requires a Const**, even though §10 accepts a Param for equality
@@ -1545,10 +1545,10 @@ and a non-NULL Const on the right.  Strategy 4 and everything that is not a roar
 - **A multi-key index can never DRIVE a count.**  Its entries are keys, not column values, so
   neither §10's GROUP BY (the groups would be lexemes) nor §14's sum-over-all (a row appears under
   each of its keys, so the sum of the entries is not the number of rows) is correct.
-  `rbi_find_roaring_index()` takes a `multikey` flag and the driving lookup passes false, which makes
+  `lion_find_roaring_index()` takes a `multikey` flag and the driving lookup passes false, which makes
   `count(*) WHERE tags IS NOT NULL` fall back to the ordinary plan.  GROUP BY on a scalar roaring
   column next to a multi-key WHERE clause is the supported and tested combination.
-- EXPLAIN prints the clause with its operator: `Roaring Indexes: idx (tags @> {t5,t7})`,
+- EXPLAIN prints the clause with its operator: `Lion Indexes: idx (tags @> {t5,t7})`,
   `idx (tsv @@ 'w1' & 'w2')`.
 
 ### Cardinality guard
@@ -1569,7 +1569,7 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 cannot tell); prefix, phrase and weighted tsqueries from the posting sets; `col op ANY (...)` in the
 count pushdown (only in the bitmap scan); a Param as a multi-key query in the count pushdown (above);
 a multi-key index as the GROUP BY or sum-over-all driver;
-`roaring_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
+`lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
 
 ### Measured (2026-09-20, 1M rows, 521 MB heap, all-visible, warm cache)
 

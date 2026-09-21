@@ -16,11 +16,11 @@ count
 (1 row)
 
 step s2_delete: DELETE FROM cnt_race WHERE k = 1 AND id <= 2000;
-step s1_count: SELECT roaring_index_count('cnt_race_k', 1); <waiting ...>
+step s1_count: SELECT lion_index_count('cnt_race_k', 1); <waiting ...>
 step s3_vacuum: VACUUM cnt_race; <waiting ...>
 step s2_wakeup: 
 	SELECT cnt_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
-	SELECT injection_points_wakeup('roaring-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
 
 vacuum_waited_for_the_pin
 -------------------------
@@ -33,9 +33,9 @@ injection_points_wakeup
 (1 row)
 
 step s1_count: <... completed>
-roaring_index_count
--------------------
-                950
+lion_index_count
+----------------
+             950
 (1 row)
 
 step s3_vacuum: <... completed>
@@ -46,13 +46,13 @@ count
   450
 (1 row)
 
-step s3_verify: SELECT roaring_index_verify('cnt_race_k', true);
-roaring_index_verify
---------------------
-                    
+step s3_verify: SELECT lion_index_verify('cnt_race_k', true);
+lion_index_verify
+-----------------
+                 
 (1 row)
 
-step s2_detach: SELECT injection_points_detach('roaring-count-containers-pinned');
+step s2_detach: SELECT injection_points_detach('lion-count-containers-pinned');
 injection_points_detach
 -----------------------
                        
@@ -75,7 +75,7 @@ count
 (1 row)
 
 step s2_delete: DELETE FROM cnt_race WHERE k = 1 AND id <= 2000;
-step s1_count: SELECT roaring_index_count('cnt_race_k', 1); <waiting ...>
+step s1_count: SELECT lion_index_count('cnt_race_k', 1); <waiting ...>
 step s3_limit: SET statement_timeout = '1s';
 step s3_vacuum: VACUUM cnt_race; <waiting ...>
 step s2_watch: SELECT cnt_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
@@ -87,16 +87,16 @@ t
 step s3_vacuum: <... completed>
 ERROR:  canceling statement due to statement timeout
 step s3_reset: RESET statement_timeout;
-step s2_release: SELECT injection_points_wakeup('roaring-count-containers-pinned');
+step s2_release: SELECT injection_points_wakeup('lion-count-containers-pinned');
 injection_points_wakeup
 -----------------------
                        
 (1 row)
 
 step s1_count: <... completed>
-roaring_index_count
--------------------
-                950
+lion_index_count
+----------------
+             950
 (1 row)
 
 step s1_commit: COMMIT;
@@ -107,13 +107,13 @@ count
   450
 (1 row)
 
-step s3_verify: SELECT roaring_index_verify('cnt_race_k', true);
-roaring_index_verify
---------------------
-                    
+step s3_verify: SELECT lion_index_verify('cnt_race_k', true);
+lion_index_verify
+-----------------
+                 
 (1 row)
 
-step s2_detach: SELECT injection_points_detach('roaring-count-containers-pinned');
+step s2_detach: SELECT injection_points_detach('lion-count-containers-pinned');
 injection_points_detach
 -----------------------
                        

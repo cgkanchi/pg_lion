@@ -1,4 +1,4 @@
-# Concurrent inserts into one hash bucket of a roaring index.
+# Concurrent inserts into one hash bucket of a lion index.
 #
 # The counting queries carry a second aggregate on purpose: it keeps the
 # plans bitmap heap scans, which is what this spec is about.
@@ -10,43 +10,43 @@
 
 setup
 {
-	CREATE EXTENSION IF NOT EXISTS roaring_index;
-	CREATE TABLE rbi_conc (i int4, k int4);
-	INSERT INTO rbi_conc SELECT i, i % 4 FROM generate_series(1, 20000) i;
-	CREATE INDEX rbi_conc_k ON rbi_conc USING roaring (k)
+	CREATE EXTENSION IF NOT EXISTS pg_lion;
+	CREATE TABLE lion_conc (i int4, k int4);
+	INSERT INTO lion_conc SELECT i, i % 4 FROM generate_series(1, 20000) i;
+	CREATE INDEX lion_conc_k ON lion_conc USING lion (k)
 		WITH (buckets = 1, inline_limit = 64);
-	ANALYZE rbi_conc;
+	ANALYZE lion_conc;
 }
 
 teardown
 {
-	DROP TABLE rbi_conc;
+	DROP TABLE lion_conc;
 }
 
 session s1
 setup		{ BEGIN; }
-step s1_ins	{ INSERT INTO rbi_conc SELECT i, 1 FROM generate_series(20001, 20500) i; }
-step s1_ins2	{ INSERT INTO rbi_conc SELECT i, 5 FROM generate_series(21001, 21100) i; }
+step s1_ins	{ INSERT INTO lion_conc SELECT i, 1 FROM generate_series(20001, 20500) i; }
+step s1_ins2	{ INSERT INTO lion_conc SELECT i, 5 FROM generate_series(21001, 21100) i; }
 step s1_commit	{ COMMIT; }
 step s1_rollback { ROLLBACK; }
 
 session s2
 setup		{ BEGIN; }
-step s2_ins	{ INSERT INTO rbi_conc SELECT i, 1 FROM generate_series(30001, 30500) i; }
-step s2_ins2	{ INSERT INTO rbi_conc SELECT i, 5 FROM generate_series(31001, 31100) i; }
+step s2_ins	{ INSERT INTO lion_conc SELECT i, 1 FROM generate_series(30001, 30500) i; }
+step s2_ins2	{ INSERT INTO lion_conc SELECT i, 5 FROM generate_series(31001, 31100) i; }
 step s2_commit	{ COMMIT; }
 
 session s3
 setup		{ SET enable_seqscan = off; }
-step s3_count	{ SELECT count(*), max(i) FROM rbi_conc WHERE k = 1; }
-step s3_check	{ SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 1) =
-					 (SELECT count(*) FROM rbi_conc WHERE k + 0 = 1) AS k1_matches_seqscan,
-					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 5) =
-					 (SELECT count(*) FROM rbi_conc WHERE k + 0 = 5) AS k5_matches_seqscan,
-					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 1) AS k1,
-					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 5) AS k5; }
-step s3_verify	{ SELECT roaring_index_verify('rbi_conc_k', true); }
-step s3_stats	{ SELECT entries, ntids FROM roaring_index_stats('rbi_conc_k'); }
+step s3_count	{ SELECT count(*), max(i) FROM lion_conc WHERE k = 1; }
+step s3_check	{ SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM lion_conc WHERE k = 1) =
+					 (SELECT count(*) FROM lion_conc WHERE k + 0 = 1) AS k1_matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM lion_conc WHERE k = 5) =
+					 (SELECT count(*) FROM lion_conc WHERE k + 0 = 5) AS k5_matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM lion_conc WHERE k = 1) AS k1,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM lion_conc WHERE k = 5) AS k5; }
+step s3_verify	{ SELECT lion_index_verify('lion_conc_k', true); }
+step s3_stats	{ SELECT entries, ntids FROM lion_index_stats('lion_conc_k'); }
 
 # Both sessions insert into the same key, then into a key that does not exist
 # yet (so both try to create the same entry), with a scan in between.

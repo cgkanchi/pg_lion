@@ -159,7 +159,7 @@ class QuickSuite(Suite):
                                    if x.startswith('model name')),
                     pg_config=command([prefix/'bin/pg_config', '--configure']).strip(),
                     postgres_sha256=sha(prefix/'bin/postgres'),
-                    extension_sha256=sha(Path(command([prefix/'bin/pg_config', '--pkglibdir']).strip())/'roaring_index.so'),
+                    extension_sha256=sha(Path(command([prefix/'bin/pg_config', '--pkglibdir']).strip())/'pg_lion.so'),
                     workload_sha256=hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest())
         (self.output/'queries.json').write_text(json.dumps(spec, indent=2) + '\n')
         def deadline(signum, frame):
@@ -169,7 +169,7 @@ class QuickSuite(Suite):
         try:
             self.cluster.start(initialize=True)
             self.db.query("SET statement_timeout='60s'")
-            for extension in ['roaring_index', 'btree_gin', 'pg_visibility']:
+            for extension in ['pg_lion', 'btree_gin', 'pg_visibility']:
                 self.db.query(f'CREATE EXTENSION {extension}')
             meta['server_version'] = self.db.scalar('SELECT version()')
             meta['settings'] = {name: self.db.scalar('SHOW ' + name) for name in SETTINGS}
@@ -249,7 +249,7 @@ def summarize(directory, write_audit=True):
         if len(values) != meta['arguments']['repeats'] or {r['repeat'] for r in values} != set(range(meta['arguments']['repeats'])):
             raise ValueError('Missing or duplicated timing rounds')
         times = [r['execution_ms'] for r in values]
-        route = ' / '.join(sorted({'RoaringCount' if r['custom_count'] else ', '.join(r['scans']) for r in values}))
+        route = ' / '.join(sorted({'LionCount' if r['custom_count'] else ', '.join(r['scans']) for r in values}))
         result[k] = dict(zip(KEY, k), n=len(times), median_ms=statistics.median(times),
                          min_ms=min(times), max_ms=max(times),
                          planning_median_ms=statistics.median(r['planning_ms'] for r in values), plan=route)
@@ -327,7 +327,7 @@ def report(directory, baseline=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--prefix', help='Installed PostgreSQL with current roaring_index, btree_gin, pg_visibility')
+    parser.add_argument('--prefix', help='Installed PostgreSQL with current pg_lion, btree_gin, pg_visibility')
     parser.add_argument('--output', help='New directory; defaults to bench/results/quick/<UTC timestamp>-<commit>')
     parser.add_argument('--baseline', help='Completed quick run with matching workload/environment')
     parser.add_argument('--report-only', metavar='DIRECTORY', help='Audit/regenerate saved results or compare them without starting PostgreSQL')

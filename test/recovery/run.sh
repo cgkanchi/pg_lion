@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# roaring_index: automated crash-recovery and hot-standby tests.
+# pg_lion: automated crash-recovery and hot-standby tests.
 #
 # USAGE
 #
@@ -26,15 +26,15 @@
 #            per operator class kind, kill the server without a chance to
 #            flush (pg_ctl -m immediate and kill -9, alternating; twice while a
 #            VACUUM is in flight), restart, and check that the indexes came
-#            back intact: roaring_index_verify(idx, true) for each, single-key
-#            counts through the index / a forced seqscan / roaring_index_count()
+#            back intact: lion_index_verify(idx, true) for each, single-key
+#            counts through the index / a forced seqscan / lion_index_count()
 #            / the count pushdown all equal, GROUP BY results equal as
-#            multisets (EXCEPT ALL both ways), and roaring_index_stats().ntids
+#            multisets (EXCEPT ALL both ways), and lion_index_stats().ntids
 #            consistent with the heap - exactly, after a VACUUM.  Each round
 #            also proves the restart really replayed generic WAL.
 #
 #   Phase 2  pg_basebackup -R a hot standby, and check that it answers exactly
-#            what the primary answers, that roaring_index_count_stats() shows
+#            what the primary answers, that lion_index_count_stats() shows
 #            it trusting the visibility map for nothing (DESIGN.md section 9,
 #            "Hot standby"), and that a REPEATABLE READ standby snapshot whose
 #            rows the primary deletes and vacuums is either preserved or
@@ -61,7 +61,7 @@ fi
 ITERS=8
 KEEP=0
 
-BASE=/tmp/claude-1000/rbi_recovery
+BASE=/tmp/claude-1000/lion_recovery
 SOCKDIR=/tmp/claude-1000/pgsk_rec
 PRIMARY_PORT=54340
 STANDBY_PORT=54341
@@ -122,8 +122,8 @@ for d in $FORBIDDEN_SOCKDIRS; do
 	[ "$SOCKDIR" = "$d" ] && die "socket directory $d belongs to another cluster"
 done
 case $BASE in
-	/tmp/claude-1000/rbi_recovery) ;;
-	*) die "refusing to manage data directories outside /tmp/claude-1000/rbi_recovery" ;;
+	/tmp/claude-1000/lion_recovery) ;;
+	*) die "refusing to manage data directories outside /tmp/claude-1000/lion_recovery" ;;
 esac
 if [ -S "$SOCKDIR/.s.PGSQL.$PRIMARY_PORT" ] || [ -S "$SOCKDIR/.s.PGSQL.$STANDBY_PORT" ]; then
 	die "something already listens on $SOCKDIR:$PRIMARY_PORT/$STANDBY_PORT; refusing to share the endpoint"
@@ -201,9 +201,9 @@ wait_true() {
 
 build_extension() {
 	log "-- building the extension into $PREFIX"
-	BUILDDIR=$(mktemp -d /tmp/claude-1000/rbi_rec_build.XXXXXX)
-	cp -r "$PROJECT/src" "$PROJECT/Makefile" "$PROJECT"/roaring_index*.control \
-		"$PROJECT"/roaring_index*--*.sql "$BUILDDIR/"
+	BUILDDIR=$(mktemp -d /tmp/claude-1000/lion_rec_build.XXXXXX)
+	cp -r "$PROJECT/src" "$PROJECT/Makefile" "$PROJECT"/pg_lion*.control \
+		"$PROJECT"/pg_lion*--*.sql "$BUILDDIR/"
 	# Never reuse objects built against another server.
 	rm -f "$BUILDDIR"/src/*.o "$BUILDDIR"/src/*.bc "$BUILDDIR"/*.so
 	mkdir -p "$BUILDDIR/test/sql" "$BUILDDIR/test/isolation"
@@ -238,9 +238,9 @@ write_primary_conf() {
 		# test are the ones this script chose.
 		autovacuum = off
 		max_connections = 30
-		# So roaring_index.enable_count_pushdown exists in every session,
+		# So pg_lion.enable_count_pushdown exists in every session,
 		# including the ones the read-only helpers run in on a standby.
-		session_preload_libraries = 'roaring_index'
+		session_preload_libraries = 'pg_lion'
 		log_line_prefix = '%m [%p] '
 		log_checkpoints = on
 	EOF
@@ -373,7 +373,7 @@ start_vacuum_loop() {
 	(
 		while :; do
 			"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres \
-				-d "$DBNAME" -c "VACUUM (INDEX_CLEANUP ON) rbi_rec" >/dev/null 2>&1 || true
+				-d "$DBNAME" -c "VACUUM (INDEX_CLEANUP ON) lion_rec" >/dev/null 2>&1 || true
 			command sleep 0.6
 		done
 	) &
@@ -405,7 +405,7 @@ phase1() {
 		off=$(stat -c %s "$PRIMARY_LOG")
 		if [ "$vacuum_crash" = 1 ]; then
 			"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres \
-				-d "$DBNAME" -c "VACUUM (INDEX_CLEANUP ON, VERBOSE) rbi_rec" \
+				-d "$DBNAME" -c "VACUUM (INDEX_CLEANUP ON, VERBOSE) lion_rec" \
 				>>"$RUNLOG" 2>&1 &
 			VACPID=$!
 			nap 0.35
@@ -427,12 +427,12 @@ phase1() {
 
 		# Before VACUUM the index may still hold TIDs of dead tuples, so ntids
 		# is only required to be >= what the heap needs; after it, equal.
-		run_check "iter $it post-recovery" psql_p "select * from rbi_rec_check(true, false)"
+		run_check "iter $it post-recovery" psql_p "select * from lion_rec_check(true, false)"
 		ck=$NCHECKS
-		psql_p -c "VACUUM (INDEX_CLEANUP ON) rbi_rec" >>"$RUNLOG" 2>&1
-		run_check "iter $it post-vacuum" psql_p "select * from rbi_rec_check(false, true)"
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
+		run_check "iter $it post-vacuum" psql_p "select * from lion_rec_check(false, true)"
 
-		nrows=$(psql_p -tAc "select count(*) from rbi_rec")
+		nrows=$(psql_p -tAc "select count(*) from lion_rec")
 		t1=$(now_ms)
 		log "iter $it: crash=$style vacuum_in_flight=$vacuum_crash redo_from=${ev% *} generic_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS)) $(( (t1 - t0) / 1000 ))s"
 		SUMMARY+=("phase1 iter $it  crash=$style vacuum_in_flight=$vacuum_crash generic_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS))")
@@ -487,7 +487,7 @@ rr_variant() {
 	restart_standby
 	wait_catchup
 
-	before=$(psql_p -tAc "select count(*) from rbi_rec where k4 = $key")
+	before=$(psql_p -tAc "select count(*) from lion_rec where k4 = $key")
 	[ "$before" -gt 0 ] || die "k4 = $key has no rows on the primary; pick another key"
 
 	out=$BASE/rr_$feedback.out
@@ -512,8 +512,8 @@ rr_variant() {
 			30 "the primary to forget the standby's xmin (hot_standby_feedback = off)"
 	fi
 
-	psql_p -c "DELETE FROM rbi_rec WHERE k4 = $key" >>"$RUNLOG" 2>&1
-	psql_p -c "VACUUM (INDEX_CLEANUP ON) rbi_rec" >>"$RUNLOG" 2>&1
+	psql_p -c "DELETE FROM lion_rec WHERE k4 = $key" >>"$RUNLOG" 2>&1
+	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
 
 	# Neither outcome below means anything unless the primary's VACUUM did
 	# what this variant is about: with feedback on the standby's xmin must
@@ -521,8 +521,8 @@ rr_variant() {
 	# gone - that removal is what the recovery conflict exists to protect the
 	# standby's snapshot from.
 	local ntids live
-	ntids=$(psql_p -tAc "select ntids from roaring_index_stats('rbi_rec_k4')")
-	live=$(psql_p -tAc "select count(*) from rbi_rec")
+	ntids=$(psql_p -tAc "select ntids from lion_index_stats('lion_rec_k4')")
+	live=$(psql_p -tAc "select count(*) from lion_rec")
 	if [ "$feedback" = on ]; then
 		[ "$ntids" -gt "$live" ] ||
 			die "hot_standby_feedback = on did not hold the primary's horizon back: the index has $ntids TIDs for $live live rows, so VACUUM removed the deleted ones and the test below proves nothing"
@@ -561,9 +561,9 @@ rr_variant() {
 
 	# A fresh standby session, once caught up, must see the new count.
 	wait_catchup
-	after=$(psql_p -tAc "select count(*) from rbi_rec where k4 = $key")
-	fresh=$(psql_s -tAc "select roaring_index_count('rbi_rec_k4'::regclass, $key::int4)")
-	seqcnt=$(psql_s -tAc "set enable_seqscan = on; set enable_bitmapscan = off; set enable_indexscan = off; set roaring_index.enable_count_pushdown = off; select count(*) from rbi_rec where k4 = $key")
+	after=$(psql_p -tAc "select count(*) from lion_rec where k4 = $key")
+	fresh=$(psql_s -tAc "select lion_index_count('lion_rec_k4'::regclass, $key::int4)")
+	seqcnt=$(psql_s -tAc "set enable_seqscan = on; set enable_bitmapscan = off; set enable_indexscan = off; set pg_lion.enable_count_pushdown = off; select count(*) from lion_rec where k4 = $key")
 	[ "$fresh" = "$after" ] ||
 		die "BUG: after catching up, a fresh standby session counts k4 = $key as $fresh; the primary says $after"
 	[ "$seqcnt" = "$after" ] ||
@@ -577,30 +577,30 @@ phase2() {
 	log ""
 	log "=== phase 2: hot standby ==="
 
-	psql_p -c "VACUUM (ANALYZE, INDEX_CLEANUP ON) rbi_rec" >>"$RUNLOG" 2>&1
+	psql_p -c "VACUUM (ANALYZE, INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
 	psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
-	run_check "primary pre-basebackup" psql_p "select * from rbi_rec_check(true, true)"
+	run_check "primary pre-basebackup" psql_p "select * from lion_rec_check(true, true)"
 	ck=$NCHECKS
-	run_check "primary count_stats" psql_p "select * from rbi_rec_check_count_stats(false)"
+	run_check "primary count_stats" psql_p "select * from lion_rec_check_count_stats(false)"
 	log "primary: $ck checks ok, and it does skip heap blocks via the visibility map"
 
 	probe_p=$BASE/probe_primary.txt
 	probe_s=$BASE/probe_standby.txt
-	psql_p -tAc "select * from rbi_rec_probe()" >"$probe_p"
+	psql_p -tAc "select * from lion_rec_probe()" >"$probe_p"
 	[ -s "$probe_p" ] || die "the primary probe produced nothing"
 
 	basebackup_standby
 	wait_catchup
 
-	run_check "standby" psql_s "select * from rbi_rec_check(true, false)"
+	run_check "standby" psql_s "select * from lion_rec_check(true, false)"
 	log "standby: $NCHECKS checks ok (verify, counts, GROUP BY, ntids)"
 	SUMMARY+=("phase2 standby      $NCHECKS checks ok in recovery")
 
-	run_check "standby count_stats" psql_s "select * from rbi_rec_check_count_stats(true)"
+	run_check "standby count_stats" psql_s "select * from lion_rec_check_count_stats(true)"
 	log "standby: all $NCHECKS counts skipped 0 heap blocks and rechecked every TID"
 	SUMMARY+=("phase2 standby      $NCHECKS counts skipped 0 blocks, rechecked every TID")
 
-	psql_s -tAc "select * from rbi_rec_probe()" >"$probe_s"
+	psql_s -tAc "select * from lion_rec_probe()" >"$probe_s"
 	if ! diff -u "$probe_p" "$probe_s" >/dev/null 2>&1; then
 		diff -u "$probe_p" "$probe_s" | tee -a "$RUNLOG" | head -40 >&2
 		die "BUG: the standby does not answer what the primary answers (see $RUNLOG)"
@@ -616,11 +616,11 @@ phase2() {
 	"$PGBIN/pg_ctl" -D "$STANDBY_DATA" promote -w -t 120 >>"$RUNLOG" 2>&1 ||
 		die "pg_ctl promote failed"
 	wait_true psql_s "select not pg_is_in_recovery()" 120 "the standby to finish promotion"
-	run_check "promoted standby" psql_s "select * from rbi_rec_check(true, false)"
+	run_check "promoted standby" psql_s "select * from lion_rec_check(true, false)"
 	ck=$NCHECKS
-	psql_s -c "VACUUM (INDEX_CLEANUP ON) rbi_rec" >>"$RUNLOG" 2>&1
-	run_check "promoted standby post-vacuum" psql_s "select * from rbi_rec_check(false, true)"
-	run_check "promoted standby count_stats" psql_s "select * from rbi_rec_check_count_stats(false)"
+	psql_s -c "VACUUM (INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
+	run_check "promoted standby post-vacuum" psql_s "select * from lion_rec_check(false, true)"
+	run_check "promoted standby count_stats" psql_s "select * from lion_rec_check_count_stats(false)"
 	log "promoted standby: $ck checks ok, and it trusts the visibility map again"
 	SUMMARY+=("phase2 promoted     $ck checks ok after promotion, VM path back in use")
 }
@@ -635,7 +635,7 @@ mkdir -p "$BASE"
 trap cleanup EXIT
 
 START=$(now_ms)
-log "roaring_index recovery tests"
+log "pg_lion recovery tests"
 log "prefix     $PREFIX"
 log "server     $("$PGBIN/pg_config" --version)"
 log "clusters   $PRIMARY_DATA (port $PRIMARY_PORT), $STANDBY_DATA (port $STANDBY_PORT)"
@@ -647,15 +647,15 @@ init_primary
 
 log "-- loading the fixture (test/recovery/schema.sql)"
 psql_p -f "$HERE/schema.sql" >>"$RUNLOG" 2>&1 || die "schema.sql failed (see $RUNLOG)"
-psql_p -c "VACUUM (ANALYZE, INDEX_CLEANUP ON) rbi_rec" >>"$RUNLOG" 2>&1
+psql_p -c "VACUUM (ANALYZE, INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
 # Without this the first crash replays everything since initdb, and the
 # end-of-recovery checkpoint recycles the older half of that range before
 # recovery_evidence() can read it.
 psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
 log "-- index shapes after the load and before any crash"
-psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, sparse_segments, container_pages, bucket_pages, null_tids, empty_tids from rbi_rec_indexes(), roaring_index_stats(idx::regclass)" |
+psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, sparse_segments, container_pages, bucket_pages, null_tids, empty_tids from lion_rec_indexes(), lion_index_stats(idx::regclass)" |
 	tee -a "$RUNLOG"
-run_check "baseline" psql_p "select * from rbi_rec_check(true, true)"
+run_check "baseline" psql_p "select * from lion_rec_check(true, true)"
 log "-- baseline: $NCHECKS checks ok"
 
 phase1

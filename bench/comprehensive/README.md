@@ -13,7 +13,7 @@ The [growth/churn/write supplement](../results/2026-09-21-stress/REPORT.md) addi
 
 ## Run
 
-Requirements: Linux, Python 3.9+, PostgreSQL binaries and `libpq.so` under one installation prefix, and installed `roaring_index`, `btree_gin`, `btree_gist`, and `pg_visibility` extensions. Use a release PostgreSQL build for representative performance. The exact server version, configure flags, machine information, settings, seed, SQL, and source commit are saved with each run. Build/install the extension against that prefix first using the repository's normal PGXS workflow. PostgreSQL requires an unprivileged OS user.
+Requirements: Linux, Python 3.9+, PostgreSQL binaries and `libpq.so` under one installation prefix, and installed `pg_lion`, `btree_gin`, `btree_gist`, and `pg_visibility` extensions. Use a release PostgreSQL build for representative performance. The exact server version, configure flags, machine information, settings, seed, SQL, and source commit are saved with each run. Build/install the extension against that prefix first using the repository's normal PGXS workflow. PostgreSQL requires an unprivileged OS user.
 
 ```sh
 python3 bench/comprehensive/run.py \
@@ -32,14 +32,14 @@ For a full-path smoke test:
 ```sh
 python3 bench/comprehensive/run.py \
   --prefix /path/to/postgresql \
-  --output /tmp/rbi-comparison-smoke \
+  --output /tmp/lion-comparison-smoke \
   --rows 10000 --documents 2000 \
   --repeats 1 --warmups 0 --build-repeats 1 \
   --cold-repeats 1 --duration 0.2 --clients 1 2
-python3 bench/comprehensive/report.py /tmp/rbi-comparison-smoke
+python3 bench/comprehensive/report.py /tmp/lion-comparison-smoke
 ```
 
-Use `--help` for subsets. `--duration 0` disables concurrency, `--cold-repeats 0` disables restarts, and `--no-maintenance` skips mutations after the read matrix. Output directories must be new unless `--resume` is explicitly supplied. A normal completion or Python exception stops the owned cluster and removes its temporary data; `--keep-cluster` retains stopped data for inspection. A hard process kill or host crash can leave an orphan under `/tmp/rbi-comparison-*`; inspect its `postmaster.pid` and use the matching installation's `pg_ctl -D ... stop` before removing it. The directory is private and TCP listening is disabled.
+Use `--help` for subsets. `--duration 0` disables concurrency, `--cold-repeats 0` disables restarts, and `--no-maintenance` skips mutations after the read matrix. Output directories must be new unless `--resume` is explicitly supplied. A normal completion or Python exception stops the owned cluster and removes its temporary data; `--keep-cluster` retains stopped data for inspection. A hard process kill or host crash can leave an orphan under `/tmp/lion-comparison-*`; inspect its `postmaster.pid` and use the matching installation's `pg_ctl -D ... stop` before removing it. The directory is private and TCP listening is disabled.
 
 To resume at a completed portfolio boundary, rerun the same command with `--resume`. The source commit and measurement arguments must match. Completed portfolios are retained, and a fresh private cluster handles the rest; resume history is saved. A partially measured portfolio requires a separate run/output directory rather than silently mixing repeated samples. Build statements have the same 60-second statement limit as queries. A failed index is recorded, omitted, and not retried in later build rounds. Its portfolio is labeled **partial** in reports, and query plans show whether surviving indexes or a fallback answered each case. A partial portfolio has no claimed complete build time, and its maintenance/storage costs should not be compared as if it offered all eight indexes.
 

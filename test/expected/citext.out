@@ -1,62 +1,62 @@
--- case-insensitive keys through the roaring_index_citext extension
+-- case-insensitive keys through the pg_lion_citext extension
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 RESET client_min_messages;
 CREATE EXTENSION citext;
-CREATE EXTENSION roaring_index_citext;
+CREATE EXTENSION pg_lion_citext;
 -- async commits leave pages non-all-visible for VACUUM; the cost model then prefers the seqscan
 SET synchronous_commit = on;
-CREATE TABLE rbi_ci (id int, name citext NOT NULL);
-INSERT INTO rbi_ci SELECT g, (ARRAY['Alice','BOB','carol','Alice ','bob'])[1 + g % 5] FROM generate_series(1, 5000) g;
-CREATE INDEX rbi_ci_name ON rbi_ci USING roaring (name);
-VACUUM ANALYZE rbi_ci;
+CREATE TABLE lion_ci (id int, name citext NOT NULL);
+INSERT INTO lion_ci SELECT g, (ARRAY['Alice','BOB','carol','Alice ','bob'])[1 + g % 5] FROM generate_series(1, 5000) g;
+CREATE INDEX lion_ci_name ON lion_ci USING lion (name);
+VACUUM ANALYZE lion_ci;
 SET enable_seqscan = off;
 -- 'alice' matches 'Alice' (case-insensitive) but not 'Alice ' (trailing space)
-SELECT count(*) FROM rbi_ci WHERE name = 'alice';
+SELECT count(*) FROM lion_ci WHERE name = 'alice';
  count 
 -------
   1000
 (1 row)
 
-SELECT count(*) FROM rbi_ci WHERE name = 'BoB';
+SELECT count(*) FROM lion_ci WHERE name = 'BoB';
  count 
 -------
   2000
 (1 row)
 
-SELECT count(*) FROM rbi_ci WHERE name = 'nobody';
+SELECT count(*) FROM lion_ci WHERE name = 'nobody';
  count 
 -------
      0
 (1 row)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
-                  QUERY PLAN                   
------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_ci_name (name = CAROL)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
+                 QUERY PLAN                  
+---------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ci_name (name = CAROL)
 (2 rows)
 
-SET roaring_index.enable_count_pushdown = off;
-SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
  count 
 -------
   1000
 (1 row)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
                      QUERY PLAN                     
 ----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on rbi_ci
+   ->  Bitmap Heap Scan on lion_ci
          Recheck Cond: (name = 'CAROL'::citext)
-         ->  Bitmap Index Scan on rbi_ci_name
+         ->  Bitmap Index Scan on lion_ci_name
                Index Cond: (name = 'CAROL'::citext)
 (5 rows)
 
-RESET roaring_index.enable_count_pushdown;
+RESET pg_lion.enable_count_pushdown;
 -- distinct keys: 'Alice' and 'Alice ' are different, 'BOB'/'bob' are one key
-SELECT name, count(*) FROM rbi_ci GROUP BY name ORDER BY name;
+SELECT name, count(*) FROM lion_ci GROUP BY name ORDER BY name;
   name  | count 
 --------+-------
  Alice  |  1000
@@ -65,26 +65,26 @@ SELECT name, count(*) FROM rbi_ci GROUP BY name ORDER BY name;
  carol  |  1000
 (4 rows)
 
-SELECT entries FROM roaring_index_stats('rbi_ci_name');
+SELECT entries FROM lion_index_stats('lion_ci_name');
  entries 
 ---------
        4
 (1 row)
 
-SELECT roaring_index_verify('rbi_ci_name', true);
- roaring_index_verify 
-----------------------
+SELECT lion_index_verify('lion_ci_name', true);
+ lion_index_verify 
+-------------------
  
 (1 row)
 
-INSERT INTO rbi_ci VALUES (0, 'aLiCe');
-SELECT count(*) FROM rbi_ci WHERE name = 'ALICE';
+INSERT INTO lion_ci VALUES (0, 'aLiCe');
+SELECT count(*) FROM lion_ci WHERE name = 'ALICE';
  count 
 -------
   1001
 (1 row)
 
-DROP TABLE rbi_ci;
+DROP TABLE lion_ci;
 -- ---- the stored key is one representative of an equality class ----------
 /*
  * An entry keeps the spelling it was created with, for the whole class.  Once
@@ -95,34 +95,34 @@ DROP TABLE rbi_ci;
  * class is exact whatever it is spelled like, and is still pushed down.
  */
 RESET enable_seqscan;
-CREATE TABLE rbi_cirep (name citext NOT NULL);
-INSERT INTO rbi_cirep VALUES ('SecretOldSpelling');
-CREATE INDEX rbi_cirep_name ON rbi_cirep USING roaring (name);
-DELETE FROM rbi_cirep;
-INSERT INTO rbi_cirep SELECT 'secretoldspelling' FROM generate_series(1, 10000);
-VACUUM ANALYZE rbi_cirep;
+CREATE TABLE lion_cirep (name citext NOT NULL);
+INSERT INTO lion_cirep VALUES ('SecretOldSpelling');
+CREATE INDEX lion_cirep_name ON lion_cirep USING lion (name);
+DELETE FROM lion_cirep;
+INSERT INTO lion_cirep SELECT 'secretoldspelling' FROM generate_series(1, 10000);
+VACUUM ANALYZE lion_cirep;
 -- one entry, and the key in it is the spelling that was deleted
-SELECT entries FROM roaring_index_stats('rbi_cirep_name');
+SELECT entries FROM lion_index_stats('lion_cirep_name');
  entries 
 ---------
        1
 (1 row)
 
-EXPLAIN (COSTS OFF) SELECT name, count(*) FROM rbi_cirep GROUP BY name;
-         QUERY PLAN          
------------------------------
+EXPLAIN (COSTS OFF) SELECT name, count(*) FROM lion_cirep GROUP BY name;
+          QUERY PLAN          
+------------------------------
  HashAggregate
    Group Key: name
-   ->  Seq Scan on rbi_cirep
+   ->  Seq Scan on lion_cirep
 (3 rows)
 
-SELECT name, count(*) FROM rbi_cirep GROUP BY name;
+SELECT name, count(*) FROM lion_cirep GROUP BY name;
        name        | count 
 -------------------+-------
  secretoldspelling | 10000
 (1 row)
 
-SELECT left(name::text, 1) AS first_letter, count(*) FROM rbi_cirep GROUP BY name;
+SELECT left(name::text, 1) AS first_letter, count(*) FROM lion_cirep GROUP BY name;
  first_letter | count 
 --------------+-------
  s            | 10000
@@ -130,15 +130,15 @@ SELECT left(name::text, 1) AS first_letter, count(*) FROM rbi_cirep GROUP BY nam
 
 -- a column a clause pins is printed from the same key, and steps aside too
 EXPLAIN (COSTS OFF)
-SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+SELECT name, count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
                       QUERY PLAN                      
 ------------------------------------------------------
  GroupAggregate
-   ->  Seq Scan on rbi_cirep
+   ->  Seq Scan on lion_cirep
          Filter: (name = 'SECRETOLDSPELLING'::citext)
 (3 rows)
 
-SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+SELECT name, count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
        name        | count 
 -------------------+-------
  secretoldspelling | 10000
@@ -146,35 +146,35 @@ SELECT name, count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY n
 
 -- counting needs no representative: still the custom node
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING';
-                          QUERY PLAN                          
---------------------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_cirep_name (name = SECRETOLDSPELLING)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cirep_name (name = SECRETOLDSPELLING)
 (2 rows)
 
-SELECT count(*) FROM rbi_cirep WHERE name = 'SECRETOLDSPELLING';
+SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
  count 
 -------
  10000
 (1 row)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_cirep GROUP BY name;
-         QUERY PLAN          
------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep GROUP BY name;
+          QUERY PLAN          
+------------------------------
  HashAggregate
    Group Key: name
-   ->  Seq Scan on rbi_cirep
+   ->  Seq Scan on lion_cirep
          Disabled: true
 (4 rows)
 
-SELECT count(*) FROM rbi_cirep GROUP BY name;
+SELECT count(*) FROM lion_cirep GROUP BY name;
  count 
 -------
  10000
 (1 row)
 
 RESET enable_seqscan;
-DROP TABLE rbi_cirep;
-DROP EXTENSION roaring_index_citext;
+DROP TABLE lion_cirep;
+DROP EXTENSION pg_lion_citext;
 DROP EXTENSION citext;

@@ -38,7 +38,7 @@ def table(headers, rows):
 
 
 def svg_bars(title, values, unit):
-    os.environ.setdefault('MPLCONFIGDIR','/tmp/rbi-benchmark-matplotlib')
+    os.environ.setdefault('MPLCONFIGDIR','/tmp/lion-benchmark-matplotlib')
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -83,7 +83,7 @@ def generate(directory):
         base=stats.get(key[:-1]+('seq',))
         ratio=base['median']/st['median'] if base and st['median'] else None
         if any(s['custom_count'] for s in ss):
-            access='RoaringCount'
+            access='LionCount'
         else:
             access=', '.join(sorted({v for s in ss for v in s['scans']})) or 'no scan'
         if any(s['fallback'] for s in ss):

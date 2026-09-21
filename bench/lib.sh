@@ -73,8 +73,8 @@ bench_start_cluster() {
 # bench_build_extension <prefix> <project dir>  -> builds a clean copy against <prefix>
 bench_build_extension() {
 	local prefix=$1 p=$2 b
-	b=$(mktemp -d /tmp/claude-1000/rbi_bench_build.XXXX)
-	cp -r "$p/src" "$p/Makefile" "$p"/roaring_index*.control "$p"/roaring_index*--*.sql "$b/"
+	b=$(mktemp -d /tmp/claude-1000/lion_bench_build.XXXX)
+	cp -r "$p/src" "$p/Makefile" "$p"/pg_lion*.control "$p"/pg_lion*--*.sql "$b/"
 	rm -f "$b"/src/*.o "$b"/src/*.bc "$b"/*.so   # never reuse objects built against another server
 	mkdir -p "$b/test/sql" "$b/test/isolation"
 	( cd "$b" && make -s PG_CONFIG="$prefix/bin/pg_config" && make -s PG_CONFIG="$prefix/bin/pg_config" install ) \

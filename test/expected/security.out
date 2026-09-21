@@ -1,42 +1,42 @@
 -- Access control, row-level security and collation rules of the count paths
 -- (findings of the 2026-09-20 adversarial review).
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS roaring_index;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
 RESET client_min_messages;
 SET synchronous_commit = on;
-CREATE ROLE rbi_sec_reader;
-CREATE ROLE rbi_sec_other;
-CREATE TABLE rbi_sec (id int, tenant text NOT NULL, secret text NOT NULL, k int NOT NULL);
-INSERT INTO rbi_sec SELECT g, 't' || (g % 3), 's' || (g % 7), g % 5 FROM generate_series(1, 3000) g;
-CREATE INDEX rbi_sec_secret ON rbi_sec USING roaring (secret);
-CREATE INDEX rbi_sec_k ON rbi_sec USING roaring (k);
-CREATE INDEX rbi_sec_tenant ON rbi_sec USING roaring (tenant);
-VACUUM ANALYZE rbi_sec;
+CREATE ROLE lion_sec_reader;
+CREATE ROLE lion_sec_other;
+CREATE TABLE lion_sec (id int, tenant text NOT NULL, secret text NOT NULL, k int NOT NULL);
+INSERT INTO lion_sec SELECT g, 't' || (g % 3), 's' || (g % 7), g % 5 FROM generate_series(1, 3000) g;
+CREATE INDEX lion_sec_secret ON lion_sec USING lion (secret);
+CREATE INDEX lion_sec_k ON lion_sec USING lion (k);
+CREATE INDEX lion_sec_tenant ON lion_sec USING lion (tenant);
+VACUUM ANALYZE lion_sec;
 -- ---------- privileges: the SQL count functions need SELECT like the query would ----------
-SET ROLE rbi_sec_reader;
-SELECT roaring_index_count('rbi_sec_secret', 's1'::text);           -- no privilege at all
-ERROR:  permission denied for table rbi_sec
-SELECT roaring_index_count('rbi_sec_tenant', 't1'::text, 'rbi_sec_secret', 's1'::text);
-ERROR:  permission denied for table rbi_sec
-SELECT * FROM roaring_index_count_stats('rbi_sec_secret', 's1'::text);
-ERROR:  permission denied for table rbi_sec
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_secret', 's1'::text);           -- no privilege at all
+ERROR:  permission denied for table lion_sec
+SELECT lion_index_count('lion_sec_tenant', 't1'::text, 'lion_sec_secret', 's1'::text);
+ERROR:  permission denied for table lion_sec
+SELECT * FROM lion_index_count_stats('lion_sec_secret', 's1'::text);
+ERROR:  permission denied for table lion_sec
 RESET ROLE;
-GRANT SELECT (k) ON rbi_sec TO rbi_sec_reader;              -- column privilege on k only
-SET ROLE rbi_sec_reader;
-SELECT roaring_index_count('rbi_sec_k', 1);                    -- allowed: only k is referenced
- roaring_index_count 
----------------------
-                 600
+GRANT SELECT (k) ON lion_sec TO lion_sec_reader;              -- column privilege on k only
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_k', 1);                    -- allowed: only k is referenced
+ lion_index_count 
+------------------
+              600
 (1 row)
 
-SELECT roaring_index_count('rbi_sec_secret', 's1'::text);           -- still denied: secret is not granted
-ERROR:  permission denied for table rbi_sec
-SELECT roaring_index_count('rbi_sec_tenant', 't1'::text, 'rbi_sec_secret', 's1'::text);   -- denied: tenant and secret are not granted
-ERROR:  permission denied for table rbi_sec
+SELECT lion_index_count('lion_sec_secret', 's1'::text);           -- still denied: secret is not granted
+ERROR:  permission denied for table lion_sec
+SELECT lion_index_count('lion_sec_tenant', 't1'::text, 'lion_sec_secret', 's1'::text);   -- denied: tenant and secret are not granted
+ERROR:  permission denied for table lion_sec
 RESET ROLE;
-GRANT SELECT ON rbi_sec TO rbi_sec_reader;
-SET ROLE rbi_sec_reader;
-SELECT roaring_index_count('rbi_sec_secret', 's1'::text) = (SELECT count(*) FROM rbi_sec WHERE secret = 's1') AS ok;
+GRANT SELECT ON lion_sec TO lion_sec_reader;
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_secret', 's1'::text) = (SELECT count(*) FROM lion_sec WHERE secret = 's1') AS ok;
  ok 
 ----
  t
@@ -44,98 +44,98 @@ SELECT roaring_index_count('rbi_sec_secret', 's1'::text) = (SELECT count(*) FROM
 
 RESET ROLE;
 -- ---------- row-level security: the functions refuse, the planner path stays correct ----------
-GRANT SELECT ON rbi_sec TO rbi_sec_other;
-ALTER TABLE rbi_sec ENABLE ROW LEVEL SECURITY;
-CREATE POLICY rbi_sec_t1 ON rbi_sec FOR SELECT TO rbi_sec_other USING (tenant = 't1');
-SET ROLE rbi_sec_other;
-SELECT roaring_index_count('rbi_sec_k', 1);                    -- refused: RLS applies to this role
-ERROR:  cannot count through index "rbi_sec_k" because row-level security is enabled on table "rbi_sec"
-SELECT count(*) FROM rbi_sec WHERE k = 1;                      -- policy-filtered answer
+GRANT SELECT ON lion_sec TO lion_sec_other;
+ALTER TABLE lion_sec ENABLE ROW LEVEL SECURITY;
+CREATE POLICY lion_sec_t1 ON lion_sec FOR SELECT TO lion_sec_other USING (tenant = 't1');
+SET ROLE lion_sec_other;
+SELECT lion_index_count('lion_sec_k', 1);                    -- refused: RLS applies to this role
+ERROR:  cannot count through index "lion_sec_k" because row-level security is enabled on table "lion_sec"
+SELECT count(*) FROM lion_sec WHERE k = 1;                      -- policy-filtered answer
  count 
 -------
    200
 (1 row)
 
-SELECT count(*) = (SELECT count(*) FROM rbi_sec WHERE k = 1 AND tenant = 't1') AS policy_applied
-  FROM rbi_sec WHERE k = 1;
+SELECT count(*) = (SELECT count(*) FROM lion_sec WHERE k = 1 AND tenant = 't1') AS policy_applied
+  FROM lion_sec WHERE k = 1;
  policy_applied 
 ----------------
  t
 (1 row)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_sec WHERE k = 1;  -- no RoaringCount under security quals
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sec WHERE k = 1;  -- no LionCount under security quals
                      QUERY PLAN                      
 -----------------------------------------------------
  Aggregate
-   ->  Seq Scan on rbi_sec
+   ->  Seq Scan on lion_sec
          Filter: ((tenant = 't1'::text) AND (k = 1))
 (3 rows)
 
 RESET ROLE;
-SELECT roaring_index_count('rbi_sec_k', 1) = (SELECT count(*) FROM rbi_sec WHERE k = 1) AS owner_bypasses_rls;
+SELECT lion_index_count('lion_sec_k', 1) = (SELECT count(*) FROM lion_sec WHERE k = 1) AS owner_bypasses_rls;
  owner_bypasses_rls 
 --------------------
  t
 (1 row)
 
-ALTER TABLE rbi_sec DISABLE ROW LEVEL SECURITY;
+ALTER TABLE lion_sec DISABLE ROW LEVEL SECURITY;
 -- ---------- collation: an index built under another collation is not used by the pushdown ----------
-CREATE TABLE rbi_coll (id int, name text NOT NULL, k int NOT NULL);
-INSERT INTO rbi_coll SELECT g, (ARRAY['a','B','c'])[1 + g % 3], g % 4 FROM generate_series(1, 3000) g;
-CREATE INDEX rbi_coll_name_c ON rbi_coll USING roaring (name COLLATE "C");
-CREATE INDEX rbi_coll_k ON rbi_coll USING roaring (k);
-VACUUM ANALYZE rbi_coll;
+CREATE TABLE lion_coll (id int, name text NOT NULL, k int NOT NULL);
+INSERT INTO lion_coll SELECT g, (ARRAY['a','B','c'])[1 + g % 3], g % 4 FROM generate_series(1, 3000) g;
+CREATE INDEX lion_coll_name_c ON lion_coll USING lion (name COLLATE "C");
+CREATE INDEX lion_coll_k ON lion_coll USING lion (k);
+VACUUM ANALYZE lion_coll;
 SET enable_seqscan = off;
 -- clause collation (default) differs from the index collation ("C"): no pushdown, no index use
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_coll WHERE name = 'B';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE name = 'B';
              QUERY PLAN             
 ------------------------------------
  Aggregate
-   ->  Seq Scan on rbi_coll
+   ->  Seq Scan on lion_coll
          Disabled: true
          Filter: (name = 'B'::text)
 (4 rows)
 
-SELECT count(*) FROM rbi_coll WHERE name = 'B';
+SELECT count(*) FROM lion_coll WHERE name = 'B';
  count 
 -------
   1000
 (1 row)
 
 -- matching collation: pushed down
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_coll WHERE name = 'B' COLLATE "C";
-                  QUERY PLAN                   
------------------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_coll_name_c (name = B)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE name = 'B' COLLATE "C";
+                 QUERY PLAN                  
+---------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_coll_name_c (name = B)
 (2 rows)
 
-SELECT count(*) FROM rbi_coll WHERE name = 'B' COLLATE "C";
+SELECT count(*) FROM lion_coll WHERE name = 'B' COLLATE "C";
  count 
 -------
   1000
 (1 row)
 
 -- GROUP BY under the column's collation cannot drive from the "C" index
-EXPLAIN (COSTS OFF) SELECT name, count(*) FROM rbi_coll GROUP BY name;
-         QUERY PLAN         
-----------------------------
+EXPLAIN (COSTS OFF) SELECT name, count(*) FROM lion_coll GROUP BY name;
+         QUERY PLAN          
+-----------------------------
  HashAggregate
    Group Key: name
-   ->  Seq Scan on rbi_coll
+   ->  Seq Scan on lion_coll
          Disabled: true
 (4 rows)
 
 -- a collation-insensitive column is unaffected
-EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_coll WHERE k = 2;
-              QUERY PLAN               
----------------------------------------
- Custom Scan (RoaringCount)
-   Roaring Indexes: rbi_coll_k (k = 2)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE k = 2;
+             QUERY PLAN              
+-------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_coll_k (k = 2)
 (2 rows)
 
 RESET enable_seqscan;
-DROP TABLE rbi_coll;
-DROP TABLE rbi_sec;
-DROP ROLE rbi_sec_reader;
-DROP ROLE rbi_sec_other;
+DROP TABLE lion_coll;
+DROP TABLE lion_sec;
+DROP ROLE lion_sec_reader;
+DROP ROLE lion_sec_other;

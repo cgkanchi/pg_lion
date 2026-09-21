@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_customscan.c
+ * lion_customscan.c
  *		A CustomScan that answers
  *
  *			SELECT count(*) [, k] FROM t WHERE <clause> [AND <clause> ...]
@@ -8,11 +8,11 @@
  *
  *		out of roaring posting sets, visiting the heap only for pages the
  *		visibility map does not vouch for.  DESIGN.md section 10 is the
- *		specification; the counting itself lives in rbi_count.c and follows
+ *		specification; the counting itself lives in lion_count.c and follows
  *		the pin/visibility-map rule of DESIGN.md section 9.
  *
  * A clause is `k = const` (§10), `k = ANY (const array)` (§15), `k IS NULL`
- * or `k IS NOT NULL` (§14), each on a column with a usable roaring index.
+ * or `k IS NOT NULL` (§14), each on a column with a usable lion index.
  * The first three select rows and are intersected; `IS NOT NULL` subtracts
  * the index's NULL entry from the result, and when it is the only clause the
  * node sums the counts of every entry of that index instead.
@@ -84,21 +84,21 @@
 
 #include "storage/predicate.h"
 
-#include "rbi.h"
-#include "rbi_count.h"
+#include "lion.h"
+#include "lion_count.h"
 
 /* GUC and the previous hook, both owned here and installed by _PG_init. */
-bool		rbi_enable_count_pushdown = true;
-create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
+bool		lion_enable_count_pushdown = true;
+create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 
 /* Kinds of column in custom_scan_tlist. */
-#define RBI_TL_GROUPKEY		0
-#define RBI_TL_COUNT		1
-#define RBI_TL_COUNT_GROUPCOL	2	/* count(group column): 0 for the NULL
+#define LION_TL_GROUPKEY		0
+#define LION_TL_COUNT		1
+#define LION_TL_COUNT_GROUPCOL	2	/* count(group column): 0 for the NULL
 									 * group, the count otherwise (§14) */
-#define RBI_TL_COUNT_ZERO	3	/* count(col) where a clause pins col to NULL */
-/* RBI_TL_WHEREKEY + i: the key stored in the i'th clause's entry */
-#define RBI_TL_WHEREKEY		4
+#define LION_TL_COUNT_ZERO	3	/* count(col) where a clause pins col to NULL */
+/* LION_TL_WHEREKEY + i: the key stored in the i'th clause's entry */
+#define LION_TL_WHEREKEY		4
 
 /*
  * Kinds of WHERE clause the pushdown understands.  EQ, ARRAY and NULL select
@@ -106,13 +106,13 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  * (DESIGN.md §14: the NULL rows are exactly the members of the index's
  * reserved NULL entry, so `IS NOT NULL` is their complement).
  */
-#define RBI_CLAUSE_EQ		0	/* col = const */
-#define RBI_CLAUSE_ARRAY	1	/* col = ANY (const array), DESIGN.md §15 */
-#define RBI_CLAUSE_NULL		2	/* col IS NULL */
-#define RBI_CLAUSE_NOTNULL	3	/* col IS NOT NULL */
-#define RBI_CLAUSE_MULTI	4	/* col @> / && / @@ const, DESIGN.md §17 */
+#define LION_CLAUSE_EQ		0	/* col = const */
+#define LION_CLAUSE_ARRAY	1	/* col = ANY (const array), DESIGN.md §15 */
+#define LION_CLAUSE_NULL		2	/* col IS NULL */
+#define LION_CLAUSE_NOTNULL	3	/* col IS NOT NULL */
+#define LION_CLAUSE_MULTI	4	/* col @> / && / @@ const, DESIGN.md §17 */
 
-#define RBI_CLAUSE_IS_POSITIVE(k)	((k) != RBI_CLAUSE_NOTNULL)
+#define LION_CLAUSE_IS_POSITIVE(k)	((k) != LION_CLAUSE_NOTNULL)
 
 /*
  * Which clause kinds pin their column to ONE value, so that a target list
@@ -120,8 +120,8 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  * multi-key clause pins nothing: `tags @> '{a}'` says what the array
  * contains, not what it is.
  */
-#define RBI_CLAUSE_PINS_VALUE(k) \
-	((k) == RBI_CLAUSE_EQ || (k) == RBI_CLAUSE_NULL)
+#define LION_CLAUSE_PINS_VALUE(k) \
+	((k) == LION_CLAUSE_EQ || (k) == LION_CLAUSE_NULL)
 
 /*
  * An `IN` list longer than this is not pushed down: every listed value needs
@@ -129,12 +129,12 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  * the node runs (DESIGN.md §9).  A long list is also exactly the case where
  * the ordinary bitmap plan does well.
  */
-#define RBI_MAX_ARRAY_ELEMS		1000
+#define LION_MAX_ARRAY_ELEMS		1000
 
-/* Flag bits of the third integer of RBI_PRIV_INTS. */
-#define RBI_FLAG_SINGLEGROUP	0x01
-#define RBI_FLAG_SUMALL			0x02
-#define RBI_FLAG_GROUPIDX		0x04	/* an index drives the entry scan */
+/* Flag bits of the third integer of LION_PRIV_INTS. */
+#define LION_FLAG_SINGLEGROUP	0x01
+#define LION_FLAG_SUMALL			0x02
+#define LION_FLAG_GROUPIDX		0x04	/* an index drives the entry scan */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -142,45 +142,45 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  * node, so it is six plain lists plus one filled in at plan time, behind a
  * shape marker:
  *
- *	0	IntList: RBI_PRIV_MAGIC and RBI_PRIV_NMEMBERS.  The list is
+ *	0	IntList: LION_PRIV_MAGIC and LION_PRIV_NMEMBERS.  The list is
  *		positional, so the executor checks this before reading anything else:
  *		a plan made by a differently shaped build of this library (a cached
  *		plan across an upgrade, a hand-built node) is then an error and not a
- *		list silently read at the wrong offsets.  Bump RBI_PRIV_MAGIC whenever
+ *		list silently read at the wrong offsets.  Bump LION_PRIV_MAGIC whenever
  *		the meaning of a member changes without its position doing so.
  *	1	OidList: heap Oid, group index Oid (InvalidOid if none), then one
  *		Oid per WHERE clause, in the same order as the other lists.  For a
  *		partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
  *		column names against it) and every index Oid is InvalidOid: the real
- *		ones are per partition, in RBI_PRIV_PARTS.
- *	2	IntList: base RT index, group attnum (0 if none), the RBI_FLAG_* bits,
+ *		ones are per partition, in LION_PRIV_PARTS.
+ *	2	IntList: base RT index, group attnum (0 if none), the LION_FLAG_* bits,
  *		then one attnum per WHERE clause.  Attnums are the PARENT's
  *		throughout; each partition's own numbering lives in its index Oids.
  *	3	List of Expr, one per WHERE clause: the compared value, the array of
  *		an IN list, or a NULL Const placeholder for a null test.  It is a
  *		Const for a literal query and a Param - or an ArrayExpr over Consts
  *		and Params - for a prepared one (DESIGN.md §10).  The PATH carries
- *		them here; rbi_plan_custom_path() moves them into the CustomScan's
+ *		them here; lion_plan_custom_path() moves them into the CustomScan's
  *		custom_exprs and leaves this member empty, because that is the field
  *		setrefs.c fixes up and SS_finalize_plan() collects Param ids from -
  *		without which a changed exec Param would not rescan the node
- *	4	IntList: RBI_CLAUSE_* for each WHERE clause
+ *	4	IntList: LION_CLAUSE_* for each WHERE clause
  *	5	List of OidList, one per live leaf partition and empty for a plain
  *		table (DESIGN.md §16): heap Oid, group index Oid (InvalidOid if
  *		none), then one index Oid per WHERE clause
  *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
  *		test), which is what EXPLAIN prints a multi-key clause with
- *	7	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
+ *	7	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
-#define RBI_PRIV_VERSION	0
-#define RBI_PRIV_OIDS		1
-#define RBI_PRIV_INTS		2
-#define RBI_PRIV_CONSTS		3
-#define RBI_PRIV_CLAUSEKINDS 4
-#define RBI_PRIV_PARTS		5
-#define RBI_PRIV_CLAUSEOPS	6
-#define RBI_PRIV_TLKINDS	7
+#define LION_PRIV_VERSION	0
+#define LION_PRIV_OIDS		1
+#define LION_PRIV_INTS		2
+#define LION_PRIV_CONSTS		3
+#define LION_PRIV_CLAUSEKINDS 4
+#define LION_PRIV_PARTS		5
+#define LION_PRIV_CLAUSEOPS	6
+#define LION_PRIV_TLKINDS	7
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -189,22 +189,22 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  * 3 moved the clause values out of member 3 and into custom_exprs, so that a
  * Param among them reaches setrefs.c and SS_finalize_plan() (DESIGN.md §10).
  */
-#define RBI_PRIV_MAGIC		0x52424903
-#define RBI_PRIV_NMEMBERS	8
+#define LION_PRIV_MAGIC		0x52424903
+#define LION_PRIV_NMEMBERS	8
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
  *
  * storedkey is the key the clause's entry holds, which is what a target list
- * that prints the pinned column has to report (see rbi_emit_tuple()).  It is
+ * that prints the pinned column has to report (see lion_emit_tuple()).  It is
  * remembered here rather than read out of the posting set, because with
  * partitions the set is released before the row is emitted; the first
  * partition that has the key wins, and any other partition's key compares
  * equal to it by the opclass equality.
  */
-typedef struct RBIClauseState
+typedef struct LionClauseState
 {
-	int			kind;			/* RBI_CLAUSE_* */
+	int			kind;			/* LION_CLAUSE_* */
 	Oid			idxoid;
 	Oid			opno;			/* the clause's operator (0 for a null test) */
 	AttrNumber	attno;
@@ -225,25 +225,25 @@ typedef struct RBIClauseState
 	Datum		val;
 	bool		valisnull;
 
-	StrategyNumber strategy;	/* RBI_CLAUSE_MULTI: 2, 3 or 5 */
+	StrategyNumber strategy;	/* LION_CLAUSE_MULTI: 2, 3 or 5 */
 	Relation	idx;
 	Datum		storedkey;
 	bool		hasstoredkey;
 	bool		keyisnull;
-} RBIClauseState;
+} LionClauseState;
 
 /*
  * One relation the executor counts: a plain table, or one live leaf
  * partition (DESIGN.md §16).  The index Oids are that relation's own.
  */
-typedef struct RBIPartState
+typedef struct LionPartState
 {
 	Oid			heapoid;
 	Oid			groupidxoid;	/* InvalidOid when no index drives the scan */
 	Oid		   *clauseidxoid;	/* one per WHERE clause */
-} RBIPartState;
+} LionPartState;
 
-typedef struct RBICountScanState
+typedef struct LionCountScanState
 {
 	CustomScanState css;
 
@@ -258,19 +258,19 @@ typedef struct RBICountScanState
 								 * `col IS NOT NULL` with nothing else) */
 	bool		hasgroupidx;	/* an index's entries drive the count */
 	int			nclause;
-	RBIClauseState *clause;
+	LionClauseState *clause;
 	int			ntlist;
 	int		   *tlkind;
 
 	/*
 	 * The relations to count.  npart is 0 for a plain table, whose heap and
 	 * indexes are opened once for the life of the node; a partitioned one
-	 * (DESIGN.md §16) has one RBIPartState per live leaf partition and opens
+	 * (DESIGN.md §16) has one LionPartState per live leaf partition and opens
 	 * them one partition at a time, so that no partition's buffer pin ever
 	 * outlives that partition's processing.
 	 */
 	int			npart;
-	RBIPartState *part;
+	LionPartState *part;
 
 	/* runtime: the relation currently being counted */
 	Relation	heap;
@@ -283,14 +283,14 @@ typedef struct RBICountScanState
 	 * section 9) until the node is reset or closed; the group's set is
 	 * located, counted and released one group at a time.
 	 */
-	RBICountSource *sources;
-	RBIPostingSet groupset;
+	LionCountSource *sources;
+	LionPostingSet groupset;
 	bool		located;
 	bool		valsdone;		/* the clause values have been evaluated */
 	bool		wheremissing;	/* a positive clause selects nothing at all */
 	bool		scanning;
 	bool		done;
-	RBIEntryScan escan;
+	LionEntryScan escan;
 
 	/*
 	 * GROUP BY over a partitioned table (DESIGN.md §16): the partitions are
@@ -314,42 +314,42 @@ typedef struct RBICountScanState
 	 * visibility map cannot vouch for is fetched once per query however many
 	 * groups come back to it - which is what the cost model above is allowed
 	 * to assume.  It is emptied on ReScan and whenever the relation or the
-	 * snapshot changes under it (rbi_count_sources_cached() does the latter).
+	 * snapshot changes under it (lion_count_sources_cached() does the latter).
 	 */
-	RBIVisCache *viscache;
-	RBICountStats stats;
-} RBICountScanState;
+	LionVisCache *viscache;
+	LionCountStats stats;
+} LionCountScanState;
 
-static Plan *rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
+static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								  CustomPath *best_path, List *tlist,
 								  List *clauses, List *custom_plans);
-static Node *rbi_create_custom_scan_state(CustomScan *cscan);
-static void rbi_begin_custom_scan(CustomScanState *node, EState *estate,
+static Node *lion_create_custom_scan_state(CustomScan *cscan);
+static void lion_begin_custom_scan(CustomScanState *node, EState *estate,
 								  int eflags);
-static TupleTableSlot *rbi_exec_custom_scan(CustomScanState *node);
-static void rbi_end_custom_scan(CustomScanState *node);
-static void rbi_rescan_custom_scan(CustomScanState *node);
-static void rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
+static TupleTableSlot *lion_exec_custom_scan(CustomScanState *node);
+static void lion_end_custom_scan(CustomScanState *node);
+static void lion_rescan_custom_scan(CustomScanState *node);
+static void lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 									ExplainState *es);
 
-static const CustomPathMethods rbi_count_path_methods = {
-	.CustomName = "RoaringCount",
-	.PlanCustomPath = rbi_plan_custom_path,
+static const CustomPathMethods lion_count_path_methods = {
+	.CustomName = "LionCount",
+	.PlanCustomPath = lion_plan_custom_path,
 	.ReparameterizeCustomPathByChild = NULL,
 };
 
-static const CustomScanMethods rbi_count_scan_methods = {
-	.CustomName = "RoaringCount",
-	.CreateCustomScanState = rbi_create_custom_scan_state,
+static const CustomScanMethods lion_count_scan_methods = {
+	.CustomName = "LionCount",
+	.CreateCustomScanState = lion_create_custom_scan_state,
 };
 
-static const CustomExecMethods rbi_count_exec_methods = {
-	.CustomName = "RoaringCount",
-	.BeginCustomScan = rbi_begin_custom_scan,
-	.ExecCustomScan = rbi_exec_custom_scan,
-	.EndCustomScan = rbi_end_custom_scan,
-	.ReScanCustomScan = rbi_rescan_custom_scan,
-	.ExplainCustomScan = rbi_explain_custom_scan,
+static const CustomExecMethods lion_count_exec_methods = {
+	.CustomName = "LionCount",
+	.BeginCustomScan = lion_begin_custom_scan,
+	.ExecCustomScan = lion_exec_custom_scan,
+	.EndCustomScan = lion_end_custom_scan,
+	.ReScanCustomScan = lion_rescan_custom_scan,
+	.ExplainCustomScan = lion_explain_custom_scan,
 };
 
 
@@ -360,11 +360,11 @@ static const CustomExecMethods rbi_count_exec_methods = {
 /*
  * Peel binary-coercion relabels off an expression.  A varchar column
  * compared with a text constant arrives as RelabelType(Var) = Const, and the
- * roaring index on that column is a text_ops index, so the relabelled form is
+ * lion index on that column is a text_ops index, so the relabelled form is
  * exactly what we want to match.
  */
 static Node *
-rbi_strip(Node *node)
+lion_strip(Node *node)
 {
 	while (node != NULL && IsA(node, RelabelType))
 		node = (Node *) ((RelabelType *) node)->arg;
@@ -373,17 +373,17 @@ rbi_strip(Node *node)
 
 /*
  * Does this opfamily extract many keys from one value (DESIGN.md §17)?  The
- * presence of support function 2 is the same test rbi_fill_state() makes.
+ * presence of support function 2 is the same test lion_fill_state() makes.
  */
 static bool
-rbi_opfamily_is_multikey(Oid opfamily, Oid opcintype)
+lion_opfamily_is_multikey(Oid opfamily, Oid opcintype)
 {
 	return OidIsValid(get_opfamily_proc(opfamily, opcintype, opcintype,
-										RBI_EXTRACTVALUE_PROC));
+										LION_EXTRACTVALUE_PROC));
 }
 
 /*
- * A usable roaring index on one plain column of rel, or NULL.  Only indexes
+ * A usable lion index on one plain column of rel, or NULL.  Only indexes
  * the planner put in rel->indexlist are considered, which already excludes
  * invalid ones (get_relation_info() skips !indisvalid).
  *
@@ -395,9 +395,9 @@ rbi_opfamily_is_multikey(Oid opfamily, Oid opcintype)
  * the number of rows - which is what DESIGN.md §14's sum-over-all rests on).
  */
 static IndexOptInfo *
-rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
+lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
 {
-	Oid			amoid = rbi_get_am_oid();
+	Oid			amoid = lion_get_am_oid();
 	ListCell   *lc;
 
 	foreach(lc, rel->indexlist)
@@ -414,7 +414,7 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
 			continue;
 		if (idx->indexkeys[0] != attno)
 			continue;
-		if (rbi_opfamily_is_multikey(idx->opfamily[0],
+		if (lion_opfamily_is_multikey(idx->opfamily[0],
 									 idx->opcintype[0]) != multikey)
 			continue;
 
@@ -432,10 +432,10 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
  * below can be proved about the index.
  */
 static Oid
-rbi_index_equality_op(IndexOptInfo *idx)
+lion_index_equality_op(IndexOptInfo *idx)
 {
 	return get_opfamily_member(idx->opfamily[0], idx->opcintype[0],
-							   idx->opcintype[0], RBI_STRAT_EQUAL);
+							   idx->opcintype[0], LION_STRAT_EQUAL);
 }
 
 /*
@@ -460,7 +460,7 @@ rbi_index_equality_op(IndexOptInfo *idx)
  * well).
  */
 static bool
-rbi_type_equalimage(Oid typid, Oid collation)
+lion_type_equalimage(Oid typid, Oid collation)
 {
 	TypeCacheEntry *typentry;
 	Oid			proc;
@@ -508,10 +508,10 @@ rbi_type_equalimage(Oid typid, Oid collation)
  * value the target list prints - come through here.
  */
 static bool
-rbi_index_can_emit_value(IndexOptInfo *idx)
+lion_index_can_emit_value(IndexOptInfo *idx)
 {
 	Oid			typid = idx->opcintype[0];
-	Oid			idxeq = rbi_index_equality_op(idx);
+	Oid			idxeq = lion_index_equality_op(idx);
 	TypeCacheEntry *typentry;
 	Oid			typeeq;
 
@@ -527,7 +527,7 @@ rbi_index_can_emit_value(IndexOptInfo *idx)
 	if (!OidIsValid(typeeq) || typeeq != idxeq)
 		return false;
 
-	return rbi_type_equalimage(typid, idx->indexcollations[0]);
+	return lion_type_equalimage(typid, idx->indexcollations[0]);
 }
 
 /*
@@ -537,7 +537,7 @@ rbi_index_can_emit_value(IndexOptInfo *idx)
  * of the index's opfamily (the index's opfamily and the operator Oid, so
  * cross-type integer equality is fine), and cmptype - the type the column is
  * compared with, InvalidOid for a null test - has to be one the opfamily can
- * compare with the indexed type and can hash, or the lookup in rbi_count.c
+ * compare with the indexed type and can hash, or the lookup in lion_count.c
  * would fail at run time.
  *
  * For a multi-key clause (DESIGN.md §17) the index must be a multi-key one
@@ -547,15 +547,15 @@ rbi_index_can_emit_value(IndexOptInfo *idx)
  * different function might not.
  *
  * Every partition is checked separately, because nothing stops one of them
- * from carrying a roaring index built with a different opclass.
+ * from carrying a lion index built with a different opclass.
  */
 static IndexOptInfo *
-rbi_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
+lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
 				Oid exprcoll)
 {
-	bool		multikey = (kind == RBI_CLAUSE_MULTI);
-	IndexOptInfo *idx = rbi_find_roaring_index(rel, attno, multikey);
+	bool		multikey = (kind == LION_CLAUSE_MULTI);
+	IndexOptInfo *idx = lion_find_roaring_index(rel, attno, multikey);
 
 	if (idx == NULL)
 		return NULL;
@@ -577,23 +577,23 @@ rbi_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 			return NULL;
 		if (get_opfamily_proc(idx->opfamily[0], idx->opcintype[0],
 							  idx->opcintype[0],
-							  RBI_EXTRACTQUERY_PROC) != extractquery)
+							  LION_EXTRACTQUERY_PROC) != extractquery)
 			return NULL;
 		return idx;
 	}
 
 	if (OidIsValid(opno) &&
-		get_op_opfamily_strategy(opno, idx->opfamily[0]) != RBI_STRAT_EQUAL)
+		get_op_opfamily_strategy(opno, idx->opfamily[0]) != LION_STRAT_EQUAL)
 		return NULL;
 
 	if (OidIsValid(cmptype))
 	{
 		if (!OidIsValid(get_opfamily_member(idx->opfamily[0],
 											idx->opcintype[0], cmptype,
-											RBI_STRAT_EQUAL)))
+											LION_STRAT_EQUAL)))
 			return NULL;
 		if (!OidIsValid(get_opfamily_proc(idx->opfamily[0], cmptype, cmptype,
-										  RBI_HASH_PROC)))
+										  LION_HASH_PROC)))
 			return NULL;
 	}
 
@@ -609,13 +609,13 @@ rbi_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
  * BEFORE any index has been matched, because the parent of a partitioned
  * table has no index list of its own (DESIGN.md §16) and the answer decides
  * what the clause even means.  Taking it from the operator rather than from
- * an index is safe because rbi_match_index() checks the strategy again
+ * an index is safe because lion_match_index() checks the strategy again
  * against the index that will really answer the clause, per partition.
  */
 static StrategyNumber
-rbi_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
+lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 {
-	Oid			amoid = rbi_get_am_oid();
+	Oid			amoid = lion_get_am_oid();
 	CatCList   *catlist;
 	StrategyNumber result = 0;
 	int			i;
@@ -648,29 +648,29 @@ rbi_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
  * an ALL-mode query would need every row rechecked against the heap, which is
  * what the ordinary bitmap plan already does and does better.
  *
- * *extractquery receives the support function used, which rbi_match_index()
+ * *extractquery receives the support function used, which lion_match_index()
  * then insists on finding on every index that will answer the clause, so that
  * the run-time extraction cannot come out differently from this one.
  */
 static bool
-rbi_multikey_query_is_exact(Oid opfamily, Oid lefttype,
+lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
 							StrategyNumber strategy, Const *con,
 							Oid *extractquery)
 {
 	FmgrInfo	flinfo;
-	RBIQuery	q;
-	RBIState	state;
+	LionQuery	q;
+	LionState	state;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	bool		exact;
 
 	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
-									  RBI_EXTRACTQUERY_PROC);
+									  LION_EXTRACTQUERY_PROC);
 	if (!OidIsValid(*extractquery))
 		return false;
 
 	/*
-	 * rbi_extract_query() wants an RBIState, but only for the extractQuery
+	 * lion_extract_query() wants an LionState, but only for the extractQuery
 	 * FmgrInfo and the collation; nothing here touches an index.  The
 	 * collation of a query is the clause's own, which for the collatable key
 	 * types the multi-key classes use (text lexemes, text array elements) is
@@ -688,8 +688,8 @@ rbi_multikey_query_is_exact(Oid opfamily, Oid lefttype,
 	fmgr_info(*extractquery, &flinfo);
 	state.extractquery = flinfo;
 
-	rbi_extract_query(&state, con->constvalue, strategy, &q);
-	exact = (q.mode == RBI_QMODE_KEYS);
+	lion_extract_query(&state, con->constvalue, strategy, &q);
+	exact = (q.mode == LION_QMODE_KEYS);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
@@ -701,7 +701,7 @@ rbi_multikey_query_is_exact(Oid opfamily, Oid lefttype,
  * One relation the executor will count, with the indexes it will use: a
  * plain table, or one live leaf partition (DESIGN.md §16).
  */
-typedef struct RBICountTarget
+typedef struct LionCountTarget
 {
 	RelOptInfo *rel;			/* for the per-relation cost */
 	Oid			heapoid;
@@ -711,7 +711,7 @@ typedef struct RBICountTarget
 								 * numbering, which is what a per-relation
 								 * estimate_num_groups() needs; NULL when
 								 * nothing drives the scan */
-} RBICountTarget;
+} LionCountTarget;
 
 /*
  * The Var a parent column becomes in one child, or NULL when the child does
@@ -722,7 +722,7 @@ typedef struct RBICountTarget
  * statistics live on the child.
  */
 static Var *
-rbi_child_var(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
+lion_child_var(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
 {
 	AppendRelInfo *appinfo;
 	Var		   *cvar;
@@ -750,15 +750,15 @@ rbi_child_var(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
  * The same, reduced to the attribute number; 0 when the child lacks it.
  */
 static AttrNumber
-rbi_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
+lion_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
 {
-	Var		   *cvar = rbi_child_var(root, childrelid, parentattno);
+	Var		   *cvar = lion_child_var(root, childrelid, parentattno);
 
 	return (cvar != NULL) ? cvar->varattno : 0;
 }
 
 /*
- * Collect one RBICountTarget per relation the node will count: just rel when
+ * Collect one LionCountTarget per relation the node will count: just rel when
  * it is an ordinary table, or one per live leaf partition when it is a
  * partitioned parent, recursing through sub-partitioned children
  * (DESIGN.md §16).
@@ -770,18 +770,18 @@ rbi_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
  *
  * Returns false when the pushdown is impossible - a child that is not a plain
  * table (a foreign table, say), a column dropped in some partition, or a leaf
- * without a usable roaring index on one of the columns.  An empty *targets
+ * without a usable lion index on one of the columns.  An empty *targets
  * means everything was pruned away; the caller leaves that to the planner's
  * own dummy-rel handling.
  */
 /*
- * Everything rbi_match_index() needs about one clause, gathered once by the
+ * Everything lion_match_index() needs about one clause, gathered once by the
  * clause analysis and reused for every relation.
  */
-typedef struct RBIClauseInfo
+typedef struct LionClauseInfo
 {
 	AttrNumber	attno;			/* in the PARENT's numbering */
-	int			kind;			/* RBI_CLAUSE_* */
+	int			kind;			/* LION_CLAUSE_* */
 	Oid			opno;			/* 0 for a null test */
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
@@ -789,14 +789,14 @@ typedef struct RBIClauseInfo
 	Oid			collation;		/* clause input collation; InvalidOid if the operator ignores it */
 	bool		valueout;		/* the target list prints this column's value,
 								 * so the index has to be able to produce it
-								 * (rbi_index_can_emit_value()) */
-} RBIClauseInfo;
+								 * (lion_index_can_emit_value()) */
+} LionClauseInfo;
 
 /*
  * Everything the driving index of one relation has to satisfy, gathered once
- * by rbi_try_count_path() and applied to every partition's own index.
+ * by lion_try_count_path() and applied to every partition's own index.
  */
-typedef struct RBIDriveInfo
+typedef struct LionDriveInfo
 {
 	AttrNumber	attno;			/* in the PARENT's numbering, 0 for none */
 	Var		   *var;			/* the column as THIS relation numbers it, for
@@ -809,15 +809,15 @@ typedef struct RBIDriveInfo
 								 * DESIGN.md §14 does not care how the entries
 								 * partition the rows) */
 	bool		valueout;		/* the group key appears in the output */
-} RBIDriveInfo;
+} LionDriveInfo;
 
 static bool
-rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
-					const RBIDriveInfo *drive, List *whereattnos,
+lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
+					const LionDriveInfo *drive, List *whereattnos,
 					List *clauseinfos, List **targets)
 {
 	RangeTblEntry *rte;
-	RBICountTarget *t;
+	LionCountTarget *t;
 	ListCell   *l1;
 	ListCell   *l2;
 
@@ -846,7 +846,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		for (i = 0; i < rel->nparts; i++)
 		{
 			RelOptInfo *child = rel->part_rels[i];
-			RBIDriveInfo cdrive = *drive;
+			LionDriveInfo cdrive = *drive;
 			List	   *cattnos = NIL;
 
 			if (child == NULL || !bms_is_member(i, rel->live_parts))
@@ -856,14 +856,14 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 
 			if (drive->attno != 0)
 			{
-				cdrive.var = rbi_child_var(root, child->relid, drive->attno);
+				cdrive.var = lion_child_var(root, child->relid, drive->attno);
 				if (cdrive.var == NULL)
 					return false;
 				cdrive.attno = cdrive.var->varattno;
 			}
 			foreach(l1, whereattnos)
 			{
-				AttrNumber	ca = rbi_child_attno(root, child->relid,
+				AttrNumber	ca = lion_child_attno(root, child->relid,
 												 (AttrNumber) lfirst_int(l1));
 
 				if (ca == 0)
@@ -871,7 +871,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 				cattnos = lappend_int(cattnos, (int) ca);
 			}
 
-			if (!rbi_collect_targets(root, child, &cdrive, cattnos,
+			if (!lion_collect_targets(root, child, &cdrive, cattnos,
 									 clauseinfos, targets))
 				return false;
 		}
@@ -889,7 +889,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	if (rel->indexlist == NIL)
 		return false;
 
-	t = (RBICountTarget *) palloc0(sizeof(RBICountTarget));
+	t = (LionCountTarget *) palloc0(sizeof(LionCountTarget));
 	t->rel = rel;
 	t->heapoid = rte->relid;
 	t->drivevar = drive->var;
@@ -901,7 +901,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (drive->attno != 0)
 	{
-		t->driveidx = rbi_find_roaring_index(rel, drive->attno, false);
+		t->driveidx = lion_find_roaring_index(rel, drive->attno, false);
 		if (t->driveidx == NULL)
 			return false;
 		/* Grouping under one collation, index built under another: no. */
@@ -924,21 +924,21 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		 * because they are only reached through a grouping index.
 		 */
 		if (OidIsValid(drive->eqop) &&
-			rbi_index_equality_op(t->driveidx) != drive->eqop)
+			lion_index_equality_op(t->driveidx) != drive->eqop)
 			return false;
 
 		/*
 		 * Printing the group key means printing a key this index stored, so
 		 * it has to be a representation the rows really have (finding 4).
 		 */
-		if (drive->valueout && !rbi_index_can_emit_value(t->driveidx))
+		if (drive->valueout && !lion_index_can_emit_value(t->driveidx))
 			return false;
 	}
 
 	forboth(l1, whereattnos, l2, clauseinfos)
 	{
-		RBIClauseInfo *ci = (RBIClauseInfo *) lfirst(l2);
-		IndexOptInfo *idx = rbi_match_index(rel, (AttrNumber) lfirst_int(l1),
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l2);
+		IndexOptInfo *idx = lion_match_index(rel, (AttrNumber) lfirst_int(l1),
 											ci->kind, ci->opno, ci->cmptype,
 											ci->strategy, ci->extractquery,
 											ci->collation);
@@ -947,7 +947,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 			return false;
 
 		/* Same rule for a pinned column whose value the output prints. */
-		if (ci->valueout && !rbi_index_can_emit_value(idx))
+		if (ci->valueout && !lion_index_can_emit_value(idx))
 			return false;
 
 		t->whereidx = lappend(t->whereidx, idx);
@@ -973,7 +973,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
  *	- a clause says `col IS NULL`: then it is 0 for every group.
  */
 static bool
-rbi_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
+lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
 				 AttrNumber groupattno, const List *nonnullattnos,
 				 const List *nullattnos)
 {
@@ -1000,7 +1000,7 @@ rbi_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
 	tle = (TargetEntry *) linitial(agg->args);
 	if (!IsA(tle, TargetEntry))
 		return false;
-	arg = rbi_strip((Node *) tle->expr);
+	arg = lion_strip((Node *) tle->expr);
 	if (arg == NULL || !IsA(arg, Var))
 		return false;
 	var = (Var *) arg;
@@ -1036,7 +1036,7 @@ rbi_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  *	  can be - each of them fetched once per query.
  *
  * The bucket pages are NOT charged wholesale: an index carries at least
- * RBI_DEFAULT_BUCKETS of them, which would price a single-key count on a
+ * LION_DEFAULT_BUCKETS of them, which would price a single-key count on a
  * small table above a sequential scan of the whole table.  The bucket count
  * comes from the index's meta page (cached in rd_amcache), as
  * btcostestimate reads the tree height from the metapage.
@@ -1051,10 +1051,10 @@ rbi_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  * every group.
  */
 static double
-rbi_index_bucket_pages(IndexOptInfo *idx)
+lion_index_bucket_pages(IndexOptInfo *idx)
 {
 	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
-	RBIState   *state = rbi_get_state(indexrel);
+	LionState   *state = lion_get_state(indexrel);
 	double		nbuckets = (double) state->meta.nbuckets;
 
 	index_close(indexrel, AccessShareLock);
@@ -1063,12 +1063,12 @@ rbi_index_bucket_pages(IndexOptInfo *idx)
 
 /*
  * How many containers a posting set of `members` members can span: one per
- * RBI_BLOCKS_PER_CONTAINER heap pages, and never more than one per member.
+ * LION_BLOCKS_PER_CONTAINER heap pages, and never more than one per member.
  */
 static double
-rbi_containers_for(double heap_pages, double members)
+lion_containers_for(double heap_pages, double members)
 {
-	return Max(1.0, Min(heap_pages / RBI_BLOCKS_PER_CONTAINER, members));
+	return Max(1.0, Min(heap_pages / LION_BLOCKS_PER_CONTAINER, members));
 }
 
 /*
@@ -1095,7 +1095,7 @@ rbi_containers_for(double heap_pages, double members)
  * I/O, which is the case a blanket preference for this node would get wrong.
  */
 static Cost
-rbi_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
+lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 				   double heap_pages)
 {
 	double		spc_random_page_cost;
@@ -1127,7 +1127,7 @@ rbi_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 }
 
 static Cost
-rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
+lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx,
 				   List *whereidx, List *whereclauses, double numgroups)
 {
@@ -1151,7 +1151,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
 		Selectivity sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
-		double		nbuckets = Max(rbi_index_bucket_pages(idx), 1.0);
+		double		nbuckets = Max(lion_index_bucket_pages(idx), 1.0);
 		double		container_pages;
 		double		nkeys = 1.0;
 
@@ -1184,7 +1184,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		random_pages += Min(nkeys, nbuckets);
 		seq_pages += Max(nkeys, container_pages * sel);
-		ncontainers += nkeys * rbi_containers_for(heap_pages,
+		ncontainers += nkeys * lion_containers_for(heap_pages,
 												  tuples * sel / nkeys);
 		if (nkeys > 1.0)
 			merge_ops += tuples * sel * log2(nkeys);
@@ -1194,7 +1194,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	{
 		seq_pages += Max(1.0, (double) groupidx->pages);
 		ncontainers += numgroups *
-			rbi_containers_for(heap_pages, matching / Max(numgroups, 1.0));
+			lion_containers_for(heap_pages, matching / Max(numgroups, 1.0));
 	}
 	ncontainers = Max(ncontainers, 1.0);
 
@@ -1232,7 +1232,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += seq_pages * seq_page_cost;
 	run += ncontainers * cpu_operator_cost * 2.0;	/* block mask + VM mask */
 	run += merge_ops * cpu_operator_cost;
-	run += recheck_pages * rbi_heap_page_cost(root, rel, recheck_pages,
+	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											  heap_pages);
 	run += recheck_tids * cpu_tuple_cost;
 	run += numgroups * cpu_tuple_cost;
@@ -1247,7 +1247,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
  * as they were before partitions existed.
  */
 static void
-rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, double numgroups,
 					double outrows)
 {
@@ -1256,7 +1256,7 @@ rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 
 	foreach(lc, targets)
 	{
-		RBICountTarget *t = (RBICountTarget *) lfirst(lc);
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
 		List	   *costidx = NIL;
 		List	   *costclauses = NIL;
 		ListCell   *l1;
@@ -1265,13 +1265,13 @@ rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 
 		forthree(l1, t->whereidx, l2, whereclauses, l3, wherekinds)
 		{
-			if (!RBI_CLAUSE_IS_POSITIVE(lfirst_int(l3)))
+			if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(l3)))
 				continue;
 			costidx = lappend(costidx, lfirst(l1));
 			costclauses = lappend(costclauses, lfirst(l2));
 		}
 
-		run += rbi_cost_count_rel(root, t->rel, t->driveidx, costidx,
+		run += lion_cost_count_rel(root, t->rel, t->driveidx, costidx,
 								  costclauses, numgroups);
 
 		list_free(costidx);
@@ -1311,7 +1311,7 @@ rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
  * evaluated per row.
  */
 static bool
-rbi_is_value_expr(Node *node, bool allow_array_expr)
+lion_is_value_expr(Node *node, bool allow_array_expr)
 {
 	if (node == NULL)
 		return false;
@@ -1332,7 +1332,7 @@ rbi_is_value_expr(Node *node, bool allow_array_expr)
 			return false;
 		foreach(lc, a->elements)
 		{
-			if (!rbi_is_value_expr(rbi_strip((Node *) lfirst(lc)), false))
+			if (!lion_is_value_expr(lion_strip((Node *) lfirst(lc)), false))
 				return false;
 		}
 		return true;
@@ -1344,7 +1344,7 @@ rbi_is_value_expr(Node *node, bool allow_array_expr)
  * Number of elements of a Const array, or -1 when it is not a plain array.
  */
 static int
-rbi_array_const_nelems(Const *con)
+lion_array_const_nelems(Const *con)
 {
 	ArrayType  *arr;
 	int			nelems;
@@ -1387,7 +1387,7 @@ rbi_array_const_nelems(Const *con)
  * needs no SRF or window handling here.
  */
 static PathTarget *
-rbi_make_partial_target(PlannerInfo *root, PathTarget *grouping_target)
+lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target)
 {
 	PathTarget *partial_target = create_empty_pathtarget();
 	List	   *non_group_cols = NIL;
@@ -1450,7 +1450,7 @@ rbi_make_partial_target(PlannerInfo *root, PathTarget *grouping_target)
  * check simply returns: the normal plan is always available.
  */
 static void
-rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
+lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   RelOptInfo *output_rel, GroupPathExtraData *extra)
 {
 	Query	   *parse = root->parse;
@@ -1465,21 +1465,21 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		partitioned = false;
 	bool		groupvalueout = false;	/* the output prints the group key */
 	List	   *valueattnos = NIL;	/* pinned columns the output prints */
-	RBIDriveInfo drive;
+	LionDriveInfo drive;
 	PathTarget *partialtarget = NULL;	/* set for a partitioned GROUP BY */
 	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
-	List	   *clauseinfos = NIL;	/* RBIClauseInfo, one per clause */
+	List	   *clauseinfos = NIL;	/* LionClauseInfo, one per clause */
 	List	   *whereclauses = NIL; /* the clause, for selectivity */
 	List	   *whereconsts = NIL;	/* its value expression - a Const, a Param,
 									 * or a NULL placeholder for a null test */
-	List	   *wherekinds = NIL;	/* RBI_CLAUSE_* */
+	List	   *wherekinds = NIL;	/* LION_CLAUSE_* */
 	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
 	List	   *posattnos = NIL;	/* columns with a positive clause */
 	List	   *eqattnos = NIL;		/* columns pinned to one value */
 	List	   *nonnullattnos = NIL;	/* columns a clause proves non-null */
 	List	   *nullattnos = NIL;	/* columns a clause pins to NULL */
-	List	   *targets = NIL;		/* RBICountTarget, one per counted relation */
-	RBICountTarget *first;
+	List	   *targets = NIL;		/* LionCountTarget, one per counted relation */
+	LionCountTarget *first;
 	Var		   *notnullvar = NULL;	/* the first `IS NOT NULL` column */
 	List	   *oids;
 	List	   *ints;
@@ -1583,7 +1583,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
 		if (tle == NULL)
 			return;
-		expr = rbi_strip((Node *) tle->expr);
+		expr = lion_strip((Node *) tle->expr);
 		if (expr == NULL || !IsA(expr, Var))
 			return;
 		groupvar = (Var *) expr;
@@ -1601,7 +1601,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		/*
 		 * The equality the planner chose for this column is what the index
 		 * that drives the scan has to implement, whether there is one
-		 * relation or many (rbi_collect_targets(), finding 3 of the
+		 * relation or many (lion_collect_targets(), finding 3 of the
 		 * 2026-09-20 review), so a grouping clause without one is of no use
 		 * here.
 		 */
@@ -1634,7 +1634,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		Oid			cmptype = InvalidOid;	/* type the index is compared with */
 		StrategyNumber strategy = 0;	/* multi-key clauses only */
 		Oid			extractquery = InvalidOid;
-		RBIClauseInfo *ci;
+		LionClauseInfo *ci;
 		int			kind;
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
@@ -1655,22 +1655,22 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			if (!op_strict(op->opno))
 				return;
 
-			left = rbi_strip((Node *) linitial(op->args));
-			right = rbi_strip((Node *) lsecond(op->args));
+			left = lion_strip((Node *) linitial(op->args));
+			right = lion_strip((Node *) lsecond(op->args));
 			if (left == NULL || right == NULL)
 				return;
 
-			strategy = rbi_op_roaring_strategy(op->opno, &opfamily, &lefttype);
+			strategy = lion_op_roaring_strategy(op->opno, &opfamily, &lefttype);
 
-			if (strategy == RBI_STRAT_EQUAL)
+			if (strategy == LION_STRAT_EQUAL)
 			{
 				/* Equality commutes, so either side may hold the column. */
-				if (IsA(left, Var) && rbi_is_value_expr(right, false))
+				if (IsA(left, Var) && lion_is_value_expr(right, false))
 				{
 					var = (Var *) left;
 					val = right;
 				}
-				else if (rbi_is_value_expr(left, false) && IsA(right, Var))
+				else if (lion_is_value_expr(left, false) && IsA(right, Var))
 				{
 					var = (Var *) right;
 					val = left;
@@ -1688,11 +1688,11 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 				opno = op->opno;
 				cmptype = exprType(val);
-				kind = RBI_CLAUSE_EQ;
+				kind = LION_CLAUSE_EQ;
 			}
-			else if (strategy == RBI_STRAT_CONTAINS ||
-					 strategy == RBI_STRAT_OVERLAP ||
-					 strategy == RBI_STRAT_MATCH)
+			else if (strategy == LION_STRAT_CONTAINS ||
+					 strategy == LION_STRAT_OVERLAP ||
+					 strategy == LION_STRAT_MATCH)
 			{
 				/*
 				 * A multi-key operator (DESIGN.md §17).  Unlike equality it
@@ -1723,13 +1723,13 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				 * a NULL element all want every row rechecked in the heap,
 				 * which is what the ordinary plan does anyway.
 				 */
-				if (!rbi_multikey_query_is_exact(opfamily, lefttype, strategy,
+				if (!lion_multikey_query_is_exact(opfamily, lefttype, strategy,
 												 (Const *) val, &extractquery))
 					return;
 
 				opno = op->opno;
 				cmptype = InvalidOid;	/* the query is not a key */
-				kind = RBI_CLAUSE_MULTI;
+				kind = LION_CLAUSE_MULTI;
 			}
 			else
 				return;			/* strategy 4 (`<@`), or not ours at all */
@@ -1749,11 +1749,11 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			if (!op_strict(saop->opno))
 				return;
 
-			left = rbi_strip((Node *) linitial(saop->args));
-			right = rbi_strip((Node *) lsecond(saop->args));
+			left = lion_strip((Node *) linitial(saop->args));
+			right = lion_strip((Node *) lsecond(saop->args));
 			if (left == NULL || right == NULL)
 				return;
-			if (!IsA(left, Var) || !rbi_is_value_expr(right, true))
+			if (!IsA(left, Var) || !lion_is_value_expr(right, true))
 				return;
 			var = (Var *) left;
 			val = right;
@@ -1770,14 +1770,14 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			{
 				if (((Const *) val)->constisnull)
 					return;
-				nelems = rbi_array_const_nelems((Const *) val);
-				if (nelems < 0 || nelems > RBI_MAX_ARRAY_ELEMS)
+				nelems = lion_array_const_nelems((Const *) val);
+				if (nelems < 0 || nelems > LION_MAX_ARRAY_ELEMS)
 					return;
 			}
 			else if (IsA(val, ArrayExpr))
 			{
 				nelems = list_length(((ArrayExpr *) val)->elements);
-				if (nelems > RBI_MAX_ARRAY_ELEMS)
+				if (nelems > LION_MAX_ARRAY_ELEMS)
 					return;
 			}
 
@@ -1790,8 +1790,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				Oid			opfamily;
 				Oid			lefttype;
 
-				if (rbi_op_roaring_strategy(saop->opno, &opfamily,
-											&lefttype) != RBI_STRAT_EQUAL)
+				if (lion_op_roaring_strategy(saop->opno, &opfamily,
+											&lefttype) != LION_STRAT_EQUAL)
 					return;
 			}
 
@@ -1799,7 +1799,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			cmptype = get_element_type(exprType(val));
 			if (!OidIsValid(cmptype))
 				return;
-			kind = RBI_CLAUSE_ARRAY;
+			kind = LION_CLAUSE_ARRAY;
 		}
 		else if (IsA(clause, NullTest))
 		{
@@ -1808,13 +1808,13 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 			if (nt->argisrow)
 				return;
-			arg = rbi_strip((Node *) nt->arg);
+			arg = lion_strip((Node *) nt->arg);
 			if (arg == NULL || !IsA(arg, Var))
 				return;
 			var = (Var *) arg;
 
 			kind = (nt->nulltesttype == IS_NULL) ?
-				RBI_CLAUSE_NULL : RBI_CLAUSE_NOTNULL;
+				LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
 			/* The executor needs no value; keep the lists in step. */
 			val = (Node *) makeNullConst(var->vartype, var->vartypmod,
 										 var->varcollid);
@@ -1829,15 +1829,15 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		/*
 		 * Which index answers the clause, whether its opfamily has the
 		 * operator as strategy 1, and whether it can hash and compare the
-		 * constant's type is settled per relation, in rbi_match_index():
+		 * constant's type is settled per relation, in lion_match_index():
 		 * with partitions there is one index per partition and they need not
 		 * share an opclass (DESIGN.md §16).
 		 */
 
-		if (RBI_CLAUSE_IS_POSITIVE(kind))
+		if (LION_CLAUSE_IS_POSITIVE(kind))
 			havepositive = true;
 
-		if (RBI_CLAUSE_IS_POSITIVE(kind) && kind != RBI_CLAUSE_MULTI)
+		if (LION_CLAUSE_IS_POSITIVE(kind) && kind != LION_CLAUSE_MULTI)
 		{
 			/*
 			 * At most one positive clause per column: the same clause twice
@@ -1859,7 +1859,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
 				{
 					if (lfirst_int(l1) != (int) var->varattno ||
-						lfirst_int(l3) == RBI_CLAUSE_NOTNULL)
+						lfirst_int(l3) == LION_CLAUSE_NOTNULL)
 						continue;
 					same = (lfirst_int(l3) == kind &&
 							equal(lfirst(l2), val));
@@ -1874,26 +1874,26 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 		switch (kind)
 		{
-			case RBI_CLAUSE_EQ:
+			case LION_CLAUSE_EQ:
 				eqattnos = lappend_int(eqattnos, (int) var->varattno);
 				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
 				break;
-			case RBI_CLAUSE_NOTNULL:
+			case LION_CLAUSE_NOTNULL:
 				if (notnullvar == NULL)
 					notnullvar = var;
 				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
 				break;
-			case RBI_CLAUSE_ARRAY:
-			case RBI_CLAUSE_MULTI:
+			case LION_CLAUSE_ARRAY:
+			case LION_CLAUSE_MULTI:
 				/* a strict operator with a non-NULL constant */
 				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
 				break;
-			case RBI_CLAUSE_NULL:
+			case LION_CLAUSE_NULL:
 				nullattnos = lappend_int(nullattnos, (int) var->varattno);
 				break;
 		}
 
-		ci = (RBIClauseInfo *) palloc0(sizeof(RBIClauseInfo));
+		ci = (LionClauseInfo *) palloc0(sizeof(LionClauseInfo));
 		ci->attno = var->varattno;
 		ci->kind = kind;
 		ci->opno = opno;
@@ -1974,7 +1974,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 		else if (IsA(node, Aggref))
 		{
-			if (!rbi_agg_is_count((Aggref *) node, rti, input_rel,
+			if (!lion_agg_is_count((Aggref *) node, rti, input_rel,
 								  groupattno, nonnullattnos, nullattnos))
 				return;
 			haveagg = true;
@@ -1993,9 +1993,9 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	foreach(lc, clauseinfos)
 	{
-		RBIClauseInfo *ci = (RBIClauseInfo *) lfirst(lc);
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
 
-		ci->valueout = (ci->kind == RBI_CLAUSE_EQ &&
+		ci->valueout = (ci->kind == LION_CLAUSE_EQ &&
 						list_member_int(valueattnos, (int) ci->attno));
 	}
 
@@ -2003,7 +2003,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * ---- the relations to count, and the indexes on each of them ----
 	 *
 	 * One table, or one live leaf partition at a time (DESIGN.md §16).  The
-	 * column numbers above are the parent's; rbi_collect_targets() maps them
+	 * column numbers above are the parent's; lion_collect_targets() maps them
 	 * onto each partition through its AppendRelInfo before looking an index
 	 * up, because partitions may number their columns differently.
 	 */
@@ -2014,12 +2014,12 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	drive.eqop = (groupvar != NULL) ? groupeqop : InvalidOid;
 	drive.valueout = groupvalueout;
 
-	if (!rbi_collect_targets(root, input_rel, &drive, whereattnos,
+	if (!lion_collect_targets(root, input_rel, &drive, whereattnos,
 							 clauseinfos, &targets))
 		return;
 	if (targets == NIL)
 		return;					/* everything was pruned: leave it to the planner */
-	first = (RBICountTarget *) linitial(targets);
+	first = (LionCountTarget *) linitial(targets);
 
 	/* ---- build the path ---- */
 	if (groupvar != NULL)
@@ -2051,7 +2051,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		outrows = 0.0;
 		foreach(lc, targets)
 		{
-			RBICountTarget *t = (RBICountTarget *) lfirst(lc);
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
 			double		relrows = Max(t->rel->rows, 1.0);
 			double		relgroups;
 
@@ -2070,22 +2070,22 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * the partially-grouped one and the grouped rel gets a Finalize Agg
 		 * over it further down.
 		 */
-		partialtarget = rbi_make_partial_target(root, output_rel->reltarget);
+		partialtarget = lion_make_partial_target(root, output_rel->reltarget);
 	}
 
 	/*
-	 * A plain table's own Oids go in RBI_PRIV_OIDS, which is where the
+	 * A plain table's own Oids go in LION_PRIV_OIDS, which is where the
 	 * executor and EXPLAIN have always read them.  A partitioned one leaves
-	 * them invalid - there is no single index - and fills RBI_PRIV_PARTS
+	 * them invalid - there is no single index - and fills LION_PRIV_PARTS
 	 * instead, one OidList per partition in the same clause order.
 	 */
 	oids = list_make2_oid(rte->relid,
 						  (!partitioned && first->driveidx != NULL) ?
 						  first->driveidx->indexoid : InvalidOid);
 	ints = list_make3_int((int) rti, (int) groupattno,
-						  (singlegroup ? RBI_FLAG_SINGLEGROUP : 0) |
-						  (sumall ? RBI_FLAG_SUMALL : 0) |
-						  (driveattno != 0 ? RBI_FLAG_GROUPIDX : 0));
+						  (singlegroup ? LION_FLAG_SINGLEGROUP : 0) |
+						  (sumall ? LION_FLAG_SUMALL : 0) |
+						  (driveattno != 0 ? LION_FLAG_GROUPIDX : 0));
 	{
 		ListCell   *l1;
 		ListCell   *l2;
@@ -2108,7 +2108,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	{
 		foreach(lc, targets)
 		{
-			RBICountTarget *t = (RBICountTarget *) lfirst(lc);
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
 			List	   *one;
 			ListCell   *l1;
 
@@ -2140,20 +2140,20 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->custom_paths = NIL;
 	cpath->custom_restrictinfo = NIL;
 	/*
-	 * The shape marker comes first, so that rbi_begin_custom_scan() can
+	 * The shape marker comes first, so that lion_begin_custom_scan() can
 	 * refuse a list it does not recognise instead of reading it positionally.
 	 */
-	cpath->custom_private = list_make1(list_make2_int(RBI_PRIV_MAGIC,
-													  RBI_PRIV_NMEMBERS));
+	cpath->custom_private = list_make1(list_make2_int(LION_PRIV_MAGIC,
+													  LION_PRIV_NMEMBERS));
 	cpath->custom_private = lappend(cpath->custom_private, oids);
 	cpath->custom_private = lappend(cpath->custom_private, ints);
 	cpath->custom_private = lappend(cpath->custom_private, consts);
 	cpath->custom_private = lappend(cpath->custom_private, ckinds);
 	cpath->custom_private = lappend(cpath->custom_private, parts);
 	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
-	cpath->methods = &rbi_count_path_methods;
+	cpath->methods = &lion_count_path_methods;
 
-	rbi_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
+	lion_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
 						numgroups, outrows);
 
 	/*
@@ -2185,20 +2185,20 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 }
 
 void
-rbi_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					   RelOptInfo *input_rel, RelOptInfo *output_rel,
 					   void *extra)
 {
-	if (rbi_prev_create_upper_paths_hook != NULL)
-		rbi_prev_create_upper_paths_hook(root, stage, input_rel, output_rel,
+	if (lion_prev_create_upper_paths_hook != NULL)
+		lion_prev_create_upper_paths_hook(root, stage, input_rel, output_rel,
 										 extra);
 
 	if (stage != UPPERREL_GROUP_AGG)
 		return;
-	if (!rbi_enable_count_pushdown)
+	if (!lion_enable_count_pushdown)
 		return;
 
-	rbi_try_count_path(root, input_rel, output_rel,
+	lion_try_count_path(root, input_rel, output_rel,
 					   (GroupPathExtraData *) extra);
 }
 
@@ -2210,7 +2210,7 @@ rbi_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
  * targetlist into INDEX_VAR references against it (set_customscan_references).
  */
 static Plan *
-rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					 List *tlist, List *clauses, List *custom_plans)
 {
 	CustomScan *cscan = makeNode(CustomScan);
@@ -2227,11 +2227,11 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * written out or read back; plan time is the first moment that can
 	 * happen, and registering twice is harmless.
 	 */
-	if (GetCustomScanMethods("RoaringCount", true) == NULL)
-		RegisterCustomScanMethods(&rbi_count_scan_methods);
+	if (GetCustomScanMethods("LionCount", true) == NULL)
+		RegisterCustomScanMethods(&lion_count_scan_methods);
 
-	ints = (List *) list_nth(best_path->custom_private, RBI_PRIV_INTS);
-	ckinds = (List *) list_nth(best_path->custom_private, RBI_PRIV_CLAUSEKINDS);
+	ints = (List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
+	ckinds = (List *) list_nth(best_path->custom_private, LION_PRIV_CLAUSEKINDS);
 	groupattno = (AttrNumber) lsecond_int(ints);
 
 	foreach(lc, tlist)
@@ -2252,10 +2252,10 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 * count of the group column is 0 in the NULL group, and count of
 			 * a column a clause pins to NULL is always 0.
 			 */
-			kind = RBI_TL_COUNT;
+			kind = LION_TL_COUNT;
 			if (agg->args != NIL)
 			{
-				Node	   *arg = rbi_strip((Node *)
+				Node	   *arg = lion_strip((Node *)
 											((TargetEntry *) linitial(agg->args))->expr);
 				AttrNumber	attno;
 				int			i;
@@ -2264,15 +2264,15 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				attno = ((Var *) arg)->varattno;
 
 				if (groupattno != 0 && attno == groupattno)
-					kind = RBI_TL_COUNT_GROUPCOL;
+					kind = LION_TL_COUNT_GROUPCOL;
 				else
 				{
 					for (i = 0; i < list_length(ckinds); i++)
 					{
-						if (list_nth_int(ckinds, i) == RBI_CLAUSE_NULL &&
+						if (list_nth_int(ckinds, i) == LION_CLAUSE_NULL &&
 							list_nth_int(ints, 3 + i) == (int) attno)
 						{
-							kind = RBI_TL_COUNT_ZERO;
+							kind = LION_TL_COUNT_ZERO;
 							break;
 						}
 					}
@@ -2285,7 +2285,7 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			int			i;
 
 			if (groupattno != 0 && attno == groupattno)
-				kind = RBI_TL_GROUPKEY;
+				kind = LION_TL_GROUPKEY;
 			else
 			{
 				/*
@@ -2301,21 +2301,21 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				{
 					int			ckind = list_nth_int(ckinds, i - 3);
 
-					if (ckind != RBI_CLAUSE_EQ && ckind != RBI_CLAUSE_NULL)
+					if (ckind != LION_CLAUSE_EQ && ckind != LION_CLAUSE_NULL)
 						continue;
 					if (list_nth_int(ints, i) == (int) attno)
 					{
-						kind = RBI_TL_WHEREKEY + (i - 3);
+						kind = LION_TL_WHEREKEY + (i - 3);
 						break;
 					}
 				}
 				if (kind < 0)
-					elog(ERROR, "RoaringCount: column %d is neither grouped nor constrained",
+					elog(ERROR, "LionCount: column %d is neither grouped nor constrained",
 						 attno);
 			}
 		}
 		else
-			elog(ERROR, "unexpected expression in RoaringCount target list");
+			elog(ERROR, "unexpected expression in LionCount target list");
 
 		foreach(l2, ctlist)
 		{
@@ -2352,14 +2352,14 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * custom_private would be invisible to both.
 	 */
 	cscan->custom_exprs = (List *) list_nth(best_path->custom_private,
-											RBI_PRIV_CONSTS);
+											LION_PRIV_CONSTS);
 	priv = list_copy(best_path->custom_private);
-	lfirst(list_nth_cell(priv, RBI_PRIV_CONSTS)) = NIL;
+	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
 	cscan->custom_private = lappend(priv, kinds);
-	cscan->methods = &rbi_count_scan_methods;
+	cscan->methods = &lion_count_scan_methods;
 
 	return &cscan->scan.plan;
 }
@@ -2370,12 +2370,12 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
  * ===================================================================== */
 
 static Node *
-rbi_create_custom_scan_state(CustomScan *cscan)
+lion_create_custom_scan_state(CustomScan *cscan)
 {
-	RBICountScanState *st = (RBICountScanState *)
-		newNode(sizeof(RBICountScanState), T_CustomScanState);
+	LionCountScanState *st = (LionCountScanState *)
+		newNode(sizeof(LionCountScanState), T_CustomScanState);
 
-	st->css.methods = &rbi_count_exec_methods;
+	st->css.methods = &lion_count_exec_methods;
 	return (Node *) st;
 }
 
@@ -2390,7 +2390,7 @@ rbi_create_custom_scan_state(CustomScan *cscan)
  * indexes are not range table entries and get their own AccessShareLock.
  */
 static void
-rbi_open_relation(RBICountScanState *st, Oid heapoid, Oid groupidxoid,
+lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 				  const Oid *clauseidxoid)
 {
 	int			i;
@@ -2431,7 +2431,7 @@ rbi_open_relation(RBICountScanState *st, Oid heapoid, Oid groupidxoid,
  * and a partition's pins must not outlive that partition's turn.
  */
 static void
-rbi_close_relation(RBICountScanState *st)
+lion_close_relation(LionCountScanState *st)
 {
 	int			i;
 
@@ -2456,9 +2456,9 @@ rbi_close_relation(RBICountScanState *st)
 }
 
 static void
-rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
+lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
-	RBICountScanState *st = (RBICountScanState *) node;
+	LionCountScanState *st = (LionCountScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	List	   *shape;
 	List	   *oids;
@@ -2478,30 +2478,30 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * (or a plan from another build has been handed to us); saying so is far
 	 * better than decoding Oids out of the wrong member.
 	 */
-	shape = (list_length(cscan->custom_private) == RBI_PRIV_NMEMBERS) ?
-		(List *) list_nth(cscan->custom_private, RBI_PRIV_VERSION) : NIL;
+	shape = (list_length(cscan->custom_private) == LION_PRIV_NMEMBERS) ?
+		(List *) list_nth(cscan->custom_private, LION_PRIV_VERSION) : NIL;
 	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
-		linitial_int(shape) != RBI_PRIV_MAGIC ||
-		lsecond_int(shape) != RBI_PRIV_NMEMBERS)
-		elog(ERROR, "RoaringCount: unrecognized custom_private shape (%d members)",
+		linitial_int(shape) != LION_PRIV_MAGIC ||
+		lsecond_int(shape) != LION_PRIV_NMEMBERS)
+		elog(ERROR, "LionCount: unrecognized custom_private shape (%d members)",
 			 list_length(cscan->custom_private));
 
-	oids = (List *) list_nth(cscan->custom_private, RBI_PRIV_OIDS);
-	ints = (List *) list_nth(cscan->custom_private, RBI_PRIV_INTS);
-	ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
+	oids = (List *) list_nth(cscan->custom_private, LION_PRIV_OIDS);
+	ints = (List *) list_nth(cscan->custom_private, LION_PRIV_INTS);
+	ckinds = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEKINDS);
 	exprs = cscan->custom_exprs;
-	partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
-	clauseops = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEOPS);
-	kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
+	partlist = (List *) list_nth(cscan->custom_private, LION_PRIV_PARTS);
+	clauseops = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEOPS);
+	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
 
 	st->heapoid = linitial_oid(oids);
 	st->groupidxoid = lsecond_oid(oids);
 	st->scanrelid = (Index) linitial_int(ints);
 	st->groupattno = (AttrNumber) lsecond_int(ints);
 	flags = lthird_int(ints);
-	st->singlegroup = (flags & RBI_FLAG_SINGLEGROUP) != 0;
-	st->sumall = (flags & RBI_FLAG_SUMALL) != 0;
-	st->hasgroupidx = (flags & RBI_FLAG_GROUPIDX) != 0;
+	st->singlegroup = (flags & LION_FLAG_SINGLEGROUP) != 0;
+	st->sumall = (flags & LION_FLAG_SUMALL) != 0;
+	st->hasgroupidx = (flags & LION_FLAG_GROUPIDX) != 0;
 	st->nclause = list_length(ckinds);
 
 	/*
@@ -2510,7 +2510,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * shape marker, and is said rather than decoded.
 	 */
 	if (list_length(exprs) != st->nclause)
-		elog(ERROR, "RoaringCount: %d clauses but %d value expressions",
+		elog(ERROR, "LionCount: %d clauses but %d value expressions",
 			 st->nclause, list_length(exprs));
 
 	st->ntlist = list_length(kinds);
@@ -2518,11 +2518,11 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	for (i = 0; i < st->ntlist; i++)
 		st->tlkind[i] = list_nth_int(kinds, i);
 
-	st->clause = (RBIClauseState *)
-		palloc0(sizeof(RBIClauseState) * Max(st->nclause, 1));
+	st->clause = (LionClauseState *)
+		palloc0(sizeof(LionClauseState) * Max(st->nclause, 1));
 	for (i = 0; i < st->nclause; i++)
 	{
-		RBIClauseState *cl = &st->clause[i];
+		LionClauseState *cl = &st->clause[i];
 
 		cl->kind = list_nth_int(ckinds, i);
 		cl->idxoid = list_nth_oid(oids, 2 + i);
@@ -2534,7 +2534,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		 * A literal's value is ready now and never changes, so it is taken
 		 * straight from the Const; anything else - a Param, or the ARRAY[]
 		 * of a generic IN list - gets an ExprState and is evaluated at the
-		 * start of each scan (rbi_eval_clause_values()).
+		 * start of each scan (lion_eval_clause_values()).
 		 */
 		cl->valexpr = (Expr *) list_nth(exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
@@ -2555,7 +2555,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->npart = list_length(partlist);
 	if (st->npart > 0)
 	{
-		st->part = (RBIPartState *) palloc0(sizeof(RBIPartState) * st->npart);
+		st->part = (LionPartState *) palloc0(sizeof(LionPartState) * st->npart);
 		for (i = 0; i < st->npart; i++)
 		{
 			List	   *one = (List *) list_nth(partlist, i);
@@ -2580,18 +2580,18 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	memset(&st->stats, 0, sizeof(st->stats));
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
-										 "RoaringCount per-group",
+										 "LionCount per-group",
 										 ALLOCSET_SMALL_SIZES);
 	st->wherecxt = AllocSetContextCreate(estate->es_query_cxt,
-										 "RoaringCount where keys",
+										 "LionCount where keys",
 										 ALLOCSET_SMALL_SIZES);
 	st->keycxt = AllocSetContextCreate(estate->es_query_cxt,
-									   "RoaringCount clause keys",
+									   "LionCount clause keys",
 									   ALLOCSET_SMALL_SIZES);
 	st->valcxt = AllocSetContextCreate(estate->es_query_cxt,
-									   "RoaringCount clause values",
+									   "LionCount clause values",
 									   ALLOCSET_SMALL_SIZES);
-	st->viscache = rbi_vis_cache_create(estate->es_query_cxt);
+	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
@@ -2602,15 +2602,15 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * taking another one.  The indexes are not range table entries, so they
 	 * get their own AccessShareLock.
 	 *
-	 * A partitioned one opens nothing here: rbi_open_relation() opens one
+	 * A partitioned one opens nothing here: lion_open_relation() opens one
 	 * partition at a time (DESIGN.md §16).
 	 */
 	if (st->npart == 0)
-		rbi_open_relation(st, st->heapoid, st->groupidxoid, NULL);
+		lion_open_relation(st, st->heapoid, st->groupidxoid, NULL);
 
 	/* slot 0 is the group's posting set, 1..nclause the WHERE clauses */
-	st->sources = (RBICountSource *)
-		palloc0(sizeof(RBICountSource) * (st->nclause + 1));
+	st->sources = (LionCountSource *)
+		palloc0(sizeof(LionCountSource) * (st->nclause + 1));
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	st->sources[0].negated = false;
@@ -2630,7 +2630,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
  * into a context of the node's own that lives exactly as long as the scan.
  */
 static void
-rbi_eval_clause_values(RBICountScanState *st)
+lion_eval_clause_values(LionCountScanState *st)
 {
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	MemoryContext oldcxt;
@@ -2643,7 +2643,7 @@ rbi_eval_clause_values(RBICountScanState *st)
 
 	for (i = 0; i < st->nclause; i++)
 	{
-		RBIClauseState *cl = &st->clause[i];
+		LionClauseState *cl = &st->clause[i];
 		int16		typlen;
 		bool		typbyval;
 		Datum		val;
@@ -2672,8 +2672,8 @@ rbi_eval_clause_values(RBICountScanState *st)
  * one set per distinct non-NULL element, which the count then unions.
  */
 static void
-rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
-				 RBICountSource *src)
+lion_locate_array(LionCountScanState *st, LionClauseState *cl,
+				 LionCountSource *src)
 {
 	ArrayType  *arr = DatumGetArrayTypeP(cl->val);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
@@ -2690,20 +2690,20 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
-	src->sets = (RBIPostingSet *)
-		palloc0(sizeof(RBIPostingSet) * Max(nelems, 1));
+	src->sets = (LionPostingSet *)
+		palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
 
 	/*
 	 * One call rather than a lookup per element: the values are hashed first
 	 * and their entries located in (bucket, hash) order, so the bucket pages
 	 * are read in block order and duplicates are dropped in one pass over
 	 * that order instead of by comparing every value with every earlier one -
-	 * which at RBI_MAX_ARRAY_ELEMS values is half a million datumIsEqual()
+	 * which at LION_MAX_ARRAY_ELEMS values is half a million datumIsEqual()
 	 * calls (DESIGN.md §15).  Looking a value up twice could not change the
 	 * answer either way, because a union of a set with itself is that set; it
 	 * would only cost the merge another sub-cursor.
 	 */
-	nsets = rbi_posting_set_lookup_many(cl->idx, elemtype, nelems,
+	nsets = lion_posting_set_lookup_many(cl->idx, elemtype, nelems,
 										elems, nulls, src->sets, &nfound);
 	src->nsets = nsets;
 
@@ -2721,48 +2721,48 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
  * Locate the posting sets of one multi-key clause (DESIGN.md §17).
  *
  * The query is extracted again here, with the index's OWN extractQuery
- * function - which rbi_match_index() has already insisted is the one the
+ * function - which lion_match_index() has already insisted is the one the
  * planner used - so the keys and the boolean tree are the same the plan was
  * costed with.  The tree becomes the source's combining expression; the
- * merge in rbi_count.c evaluates it over the sets with the same cursors it
+ * merge in lion_count.c evaluates it over the sets with the same cursors it
  * uses for an IN list, so the DESIGN.md §9 pin discipline is unchanged.
  */
 static void
-rbi_locate_multikey(RBICountScanState *st, RBIClauseState *cl,
-					RBICountSource *src)
+lion_locate_multikey(LionCountScanState *st, LionClauseState *cl,
+					LionCountSource *src)
 {
-	RBIState   *istate = rbi_get_state(cl->idx);
-	RBIQuery	q;
+	LionState   *istate = lion_get_state(cl->idx);
+	LionQuery	q;
 	int			i;
 
-	rbi_extract_query(istate, cl->val,
+	lion_extract_query(istate, cl->val,
 					  (StrategyNumber) get_op_opfamily_strategy(cl->opno,
 																cl->idx->rd_opfamily[0]),
 					  &q);
 
 	/*
 	 * The plan was only made because this extraction came out exact
-	 * (rbi_multikey_query_is_exact()), against this very function and this
+	 * (lion_multikey_query_is_exact()), against this very function and this
 	 * very constant.  A different answer now would mean the count could
 	 * silently miss rows, so say so instead.
 	 */
-	if (q.mode != RBI_QMODE_KEYS)
+	if (q.mode != LION_QMODE_KEYS)
 		elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
 			 RelationGetRelationName(cl->idx));
 
-	src->sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * q.nkeys);
+	src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * q.nkeys);
 	src->nsets = q.nkeys;
 	src->tree = q.tree;
 
 	for (i = 0; i < q.nkeys; i++)
 	{
-		(void) rbi_posting_set_lookup(cl->idx, q.keys[i], InvalidOid,
+		(void) lion_posting_set_lookup(cl->idx, q.keys[i], InvalidOid,
 									  &src->sets[i]);
 		CHECK_FOR_INTERRUPTS();
 	}
 
 	/* An AND over a key with no entry at all selects nothing anywhere. */
-	if (!rbi_sets_satisfiable(src->nsets, src->sets, src->tree))
+	if (!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
 		st->wheremissing = true;
 }
 
@@ -2774,11 +2774,11 @@ rbi_locate_multikey(RBICountScanState *st, RBIClauseState *cl,
  * guarantee the printed value rests on in the single-table case as well.
  */
 static void
-rbi_save_clause_key(RBICountScanState *st, RBIClauseState *cl,
-					const RBIPostingSet *ps)
+lion_save_clause_key(LionCountScanState *st, LionClauseState *cl,
+					const LionPostingSet *ps)
 {
 	MemoryContext oldcxt;
-	RBIState   *istate;
+	LionState   *istate;
 
 	if (cl->hasstoredkey || !ps->found || !ps->hasstoredkey)
 		return;
@@ -2791,7 +2791,7 @@ rbi_save_clause_key(RBICountScanState *st, RBIClauseState *cl,
 		return;
 	}
 
-	istate = rbi_get_state(cl->idx);
+	istate = lion_get_state(cl->idx);
 	oldcxt = MemoryContextSwitchTo(st->keycxt);
 	cl->storedkey = datumCopy(ps->storedkey, istate->typbyval, istate->typlen);
 	MemoryContextSwitchTo(oldcxt);
@@ -2802,13 +2802,13 @@ rbi_save_clause_key(RBICountScanState *st, RBIClauseState *cl,
 /*
  * Locate the posting sets of every WHERE clause of the relation the node is
  * counting.  They keep their pins (for INLINE entries) until
- * rbi_release_where(), which is exactly the DESIGN.md section 9 discipline
+ * lion_release_where(), which is exactly the DESIGN.md section 9 discipline
  * applied for the length of that relation's processing rather than for one
  * container.  With partitions that is one partition's turn; with a plain
  * table it is the whole node execution.
  */
 static void
-rbi_locate_where(RBICountScanState *st)
+lion_locate_where(LionCountScanState *st)
 {
 	MemoryContext oldcxt;
 	int			i;
@@ -2817,10 +2817,10 @@ rbi_locate_where(RBICountScanState *st)
 
 	for (i = 0; i < st->nclause; i++)
 	{
-		RBIClauseState *cl = &st->clause[i];
-		RBICountSource *src = &st->sources[i + 1];
+		LionClauseState *cl = &st->clause[i];
+		LionCountSource *src = &st->sources[i + 1];
 
-		src->negated = (cl->kind == RBI_CLAUSE_NOTNULL);
+		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
 		src->nsets = 0;
 		src->sets = NULL;
 
@@ -2830,8 +2830,8 @@ rbi_locate_where(RBICountScanState *st)
 		 * all never true (every one of those operators is strict).  The
 		 * clause is then not looked up.
 		 */
-		if (cl->valisnull && RBI_CLAUSE_IS_POSITIVE(cl->kind) &&
-			cl->kind != RBI_CLAUSE_NULL)
+		if (cl->valisnull && LION_CLAUSE_IS_POSITIVE(cl->kind) &&
+			cl->kind != LION_CLAUSE_NULL)
 		{
 			st->wheremissing = true;
 			continue;
@@ -2839,33 +2839,33 @@ rbi_locate_where(RBICountScanState *st)
 
 		switch (cl->kind)
 		{
-			case RBI_CLAUSE_EQ:
-				src->sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet));
+			case LION_CLAUSE_EQ:
+				src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
 				src->nsets = 1;
-				if (!rbi_posting_set_lookup(cl->idx, cl->val, cl->valtype,
+				if (!lion_posting_set_lookup(cl->idx, cl->val, cl->valtype,
 											&src->sets[0]))
 					st->wheremissing = true;
 				break;
 
-			case RBI_CLAUSE_ARRAY:
-				rbi_locate_array(st, cl, src);
+			case LION_CLAUSE_ARRAY:
+				lion_locate_array(st, cl, src);
 				break;
 
-			case RBI_CLAUSE_MULTI:
-				rbi_locate_multikey(st, cl, src);
+			case LION_CLAUSE_MULTI:
+				lion_locate_multikey(st, cl, src);
 				break;
 
-			case RBI_CLAUSE_NULL:
-			case RBI_CLAUSE_NOTNULL:
-				src->sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet));
+			case LION_CLAUSE_NULL:
+			case LION_CLAUSE_NOTNULL:
+				src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
 				src->nsets = 1;
-				if (!rbi_posting_set_lookup_null(cl->idx, &src->sets[0]))
+				if (!lion_posting_set_lookup_null(cl->idx, &src->sets[0]))
 				{
 					/*
 					 * No NULL entry at all: `IS NULL` selects nothing, and
 					 * `IS NOT NULL` has nothing to subtract.
 					 */
-					if (cl->kind == RBI_CLAUSE_NULL)
+					if (cl->kind == LION_CLAUSE_NULL)
 						st->wheremissing = true;
 					else
 						src->nsets = 0;
@@ -2873,15 +2873,15 @@ rbi_locate_where(RBICountScanState *st)
 				break;
 
 			default:
-				elog(ERROR, "RoaringCount: unknown clause kind %d", cl->kind);
+				elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
 		}
 
 		/*
 		 * Only a clause that pins the column to ONE value can have its key
 		 * printed, and those are the ones with a single set.
 		 */
-		if (RBI_CLAUSE_PINS_VALUE(cl->kind) && src->nsets == 1)
-			rbi_save_clause_key(st, cl, &src->sets[0]);
+		if (LION_CLAUSE_PINS_VALUE(cl->kind) && src->nsets == 1)
+			lion_save_clause_key(st, cl, &src->sets[0]);
 	}
 
 	MemoryContextSwitchTo(oldcxt);
@@ -2889,7 +2889,7 @@ rbi_locate_where(RBICountScanState *st)
 }
 
 static void
-rbi_release_where(RBICountScanState *st)
+lion_release_where(LionCountScanState *st)
 {
 	int			i;
 	int			j;
@@ -2899,10 +2899,10 @@ rbi_release_where(RBICountScanState *st)
 
 	for (i = 0; i < st->nclause; i++)
 	{
-		RBICountSource *src = &st->sources[i + 1];
+		LionCountSource *src = &st->sources[i + 1];
 
 		for (j = 0; j < src->nsets; j++)
-			rbi_posting_set_release(&src->sets[j]);
+			lion_posting_set_release(&src->sets[j]);
 		src->nsets = 0;
 		src->sets = NULL;
 		src->tree = NULL;		/* it lived in wherecxt, reset below */
@@ -2914,7 +2914,7 @@ rbi_release_where(RBICountScanState *st)
 }
 
 static TupleTableSlot *
-rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
+lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull, int64 count)
 {
 	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
@@ -2928,21 +2928,21 @@ rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
 		slot->tts_isnull[i] = false;
 		switch (kind)
 		{
-			case RBI_TL_GROUPKEY:
+			case LION_TL_GROUPKEY:
 				slot->tts_values[i] = key;
 				slot->tts_isnull[i] = keyisnull;
 				break;
 
-			case RBI_TL_COUNT:
+			case LION_TL_COUNT:
 				slot->tts_values[i] = Int64GetDatum(count);
 				break;
 
-			case RBI_TL_COUNT_GROUPCOL:
+			case LION_TL_COUNT_GROUPCOL:
 				/* count(group column): 0 in the NULL group (DESIGN.md §14) */
 				slot->tts_values[i] = Int64GetDatum(keyisnull ? 0 : count);
 				break;
 
-			case RBI_TL_COUNT_ZERO:
+			case LION_TL_COUNT_ZERO:
 				/* count(col) where a clause pins col to NULL */
 				slot->tts_values[i] = Int64GetDatum(0);
 				break;
@@ -2954,7 +2954,7 @@ rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
 					 * index stored for it, which is the value the heap holds
 					 * (or NULL, for an `IS NULL` clause).
 					 */
-					RBIClauseState *cl = &st->clause[kind - RBI_TL_WHEREKEY];
+					LionClauseState *cl = &st->clause[kind - LION_TL_WHEREKEY];
 
 					/*
 					 * A clause with no entry anywhere counts zero rows, and a
@@ -2989,7 +2989,7 @@ rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
  *
  * These three are what a plain table and one partition of a partitioned one
  * have in common (DESIGN.md §16): the caller has opened the relation with
- * rbi_open_relation() and located its WHERE clauses, and every posting set
+ * lion_open_relation() and located its WHERE clauses, and every posting set
  * they take is released before they return, so no pin of this relation
  * outlives its turn.
  * --------------------------------------------------------------------- */
@@ -2998,7 +2998,7 @@ rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
  * The intersection of the WHERE clauses, with no index driving the count.
  */
 static int64
-rbi_count_relation(RBICountScanState *st)
+lion_count_relation(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
@@ -3010,7 +3010,7 @@ rbi_count_relation(RBICountScanState *st)
 
 	MemoryContextReset(st->pergroup);
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
-	count = rbi_count_sources_cached(st->heap, estate->es_snapshot,
+	count = lion_count_sources_cached(st->heap, estate->es_snapshot,
 									 st->nclause, &st->sources[1],
 									 &st->stats, st->viscache);
 	MemoryContextSwitchTo(oldcxt);
@@ -3023,7 +3023,7 @@ rbi_count_relation(RBICountScanState *st)
  * `col IS NOT NULL` with nothing else to drive the merge).
  */
 static int64
-rbi_sumall_relation(RBICountScanState *st)
+lion_sumall_relation(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
@@ -3033,7 +3033,7 @@ rbi_sumall_relation(RBICountScanState *st)
 	if (st->wheremissing)
 		return 0;
 
-	rbi_entry_scan_begin(&st->escan, st->groupidx);
+	lion_entry_scan_begin(&st->escan, st->groupidx);
 	st->scanning = true;
 
 	for (;;)
@@ -3043,20 +3043,20 @@ rbi_sumall_relation(RBICountScanState *st)
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
-		if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
+		if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
 		{
 			MemoryContextSwitchTo(oldcxt);
 			break;
 		}
 
-		total += rbi_count_sources_cached(st->heap, estate->es_snapshot,
+		total += lion_count_sources_cached(st->heap, estate->es_snapshot,
 										  st->nclause + 1, st->sources,
 										  &st->stats, st->viscache);
-		rbi_posting_set_release(&st->groupset);
+		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 	}
 
-	rbi_entry_scan_end(&st->escan);
+	lion_entry_scan_end(&st->escan);
 	st->scanning = false;
 	return total;
 }
@@ -3071,7 +3071,7 @@ rbi_sumall_relation(RBICountScanState *st)
  * the caller has opened one relation and located its WHERE clauses.
  */
 static TupleTableSlot *
-rbi_next_group(RBICountScanState *st, bool *exhausted)
+lion_next_group(LionCountScanState *st, bool *exhausted)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
@@ -3095,25 +3095,25 @@ rbi_next_group(RBICountScanState *st, bool *exhausted)
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
-		if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
+		if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
 		{
 			MemoryContextSwitchTo(oldcxt);
 			*exhausted = true;
 			return NULL;
 		}
 
-		count = rbi_count_sources_cached(st->heap, estate->es_snapshot,
+		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
 										 st->nclause + 1, st->sources,
 										 &st->stats, st->viscache);
 		keyisnull = st->groupset.keyisnull;
-		rbi_posting_set_release(&st->groupset);
+		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
 		/* A group exists only if at least one of its rows is visible. */
 		if (count == 0)
 			continue;
 
-		return rbi_emit_tuple(st, key, keyisnull, count);
+		return lion_emit_tuple(st, key, keyisnull, count);
 	}
 }
 
@@ -3122,25 +3122,25 @@ rbi_next_group(RBICountScanState *st, bool *exhausted)
  * it, then let go of everything it owns (DESIGN.md §16).
  */
 static int64
-rbi_run_partition(RBICountScanState *st, int p)
+lion_run_partition(LionCountScanState *st, int p)
 {
 	int64		count;
 
-	rbi_open_relation(st, st->part[p].heapoid, st->part[p].groupidxoid,
+	lion_open_relation(st, st->part[p].heapoid, st->part[p].groupidxoid,
 					  st->part[p].clauseidxoid);
-	rbi_locate_where(st);
+	lion_locate_where(st);
 
 	if (st->hasgroupidx)
 	{
 		/* No group key of its own: the only driver left is a sum-over-all. */
 		Assert(st->sumall);
-		count = rbi_sumall_relation(st);
+		count = lion_sumall_relation(st);
 	}
 	else
-		count = rbi_count_relation(st);
+		count = lion_count_relation(st);
 
-	rbi_release_where(st);
-	rbi_close_relation(st);
+	lion_release_where(st);
+	lion_close_relation(st);
 
 	return count;
 }
@@ -3160,7 +3160,7 @@ rbi_run_partition(RBICountScanState *st, int p)
  * before its indexes are closed.
  */
 static TupleTableSlot *
-rbi_next_partial_group(RBICountScanState *st)
+lion_next_partial_group(LionCountScanState *st)
 {
 	for (;;)
 	{
@@ -3172,10 +3172,10 @@ rbi_next_partial_group(RBICountScanState *st)
 				return NULL;
 			}
 
-			rbi_open_relation(st, st->part[st->curpart].heapoid,
+			lion_open_relation(st, st->part[st->curpart].heapoid,
 							  st->part[st->curpart].groupidxoid,
 							  st->part[st->curpart].clauseidxoid);
-			rbi_locate_where(st);
+			lion_locate_where(st);
 			st->partopen = true;
 
 			/*
@@ -3185,7 +3185,7 @@ rbi_next_partial_group(RBICountScanState *st)
 			 */
 			if (!st->wheremissing)
 			{
-				rbi_entry_scan_begin(&st->escan, st->groupidx);
+				lion_entry_scan_begin(&st->escan, st->groupidx);
 				st->scanning = true;
 			}
 		}
@@ -3193,18 +3193,18 @@ rbi_next_partial_group(RBICountScanState *st)
 		if (st->scanning)
 		{
 			bool		exhausted;
-			TupleTableSlot *slot = rbi_next_group(st, &exhausted);
+			TupleTableSlot *slot = lion_next_group(st, &exhausted);
 
 			if (!exhausted)
 				return slot;
 
-			rbi_entry_scan_end(&st->escan);
+			lion_entry_scan_end(&st->escan);
 			st->scanning = false;
 		}
 
 		/* This partition is done: release its sets, then close it. */
-		rbi_release_where(st);
-		rbi_close_relation(st);
+		lion_release_where(st);
+		lion_close_relation(st);
 		st->partopen = false;
 		st->curpart++;
 	}
@@ -3216,16 +3216,16 @@ rbi_next_partial_group(RBICountScanState *st)
  * last of them has been counted.
  */
 static TupleTableSlot *
-rbi_exec_partitioned(RBICountScanState *st)
+lion_exec_partitioned(LionCountScanState *st)
 {
 	int64		total = 0;
 	int			p;
 
 	if (st->hasgroupidx && st->groupattno != 0)
-		return rbi_next_partial_group(st);
+		return lion_next_partial_group(st);
 
 	for (p = 0; p < st->npart; p++)
-		total += rbi_run_partition(st, p);
+		total += lion_run_partition(st, p);
 
 	st->done = true;
 
@@ -3236,13 +3236,13 @@ rbi_exec_partitioned(RBICountScanState *st)
 	if (total == 0 && st->singlegroup)
 		return NULL;
 
-	return rbi_emit_tuple(st, (Datum) 0, true, total);
+	return lion_emit_tuple(st, (Datum) 0, true, total);
 }
 
 static TupleTableSlot *
-rbi_exec_custom_scan(CustomScanState *node)
+lion_exec_custom_scan(CustomScanState *node)
 {
-	RBICountScanState *st = (RBICountScanState *) node;
+	LionCountScanState *st = (LionCountScanState *) node;
 	EState	   *estate = node->ss.ps.state;
 	MemoryContext oldcxt;
 	int64		count;
@@ -3256,21 +3256,21 @@ rbi_exec_custom_scan(CustomScanState *node)
 	 * previous ones away (DESIGN.md §10).
 	 */
 	if (!st->valsdone)
-		rbi_eval_clause_values(st);
+		lion_eval_clause_values(st);
 
 	/* A partitioned table counts one partition at a time. */
 	if (st->npart > 0)
-		return rbi_exec_partitioned(st);
+		return lion_exec_partitioned(st);
 
 	if (!st->located)
-		rbi_locate_where(st);
+		lion_locate_where(st);
 
 	/* ---- no index to iterate: exactly one row ---- */
 	if (!st->hasgroupidx)
 	{
 		/* Without a group index a clause has to drive the count. */
 		st->done = true;
-		count = rbi_count_relation(st);
+		count = lion_count_relation(st);
 
 		/*
 		 * A plain aggregate always produces its one row; a GROUP BY whose
@@ -3280,7 +3280,7 @@ rbi_exec_custom_scan(CustomScanState *node)
 		if (count == 0 && st->singlegroup)
 			return NULL;
 
-		return rbi_emit_tuple(st, (Datum) 0, true, count);
+		return lion_emit_tuple(st, (Datum) 0, true, count);
 	}
 
 	/* ---- the group index drives the count ---- */
@@ -3289,13 +3289,13 @@ rbi_exec_custom_scan(CustomScanState *node)
 		st->done = true;
 		/* A sum over all entries still has to report its one row. */
 		if (st->sumall)
-			return rbi_emit_tuple(st, (Datum) 0, true, 0);
+			return lion_emit_tuple(st, (Datum) 0, true, 0);
 		return NULL;
 	}
 
 	if (!st->scanning)
 	{
-		rbi_entry_scan_begin(&st->escan, st->groupidx);
+		lion_entry_scan_begin(&st->escan, st->groupidx);
 		st->scanning = true;
 	}
 
@@ -3312,27 +3312,27 @@ rbi_exec_custom_scan(CustomScanState *node)
 			MemoryContextReset(st->pergroup);
 			oldcxt = MemoryContextSwitchTo(st->pergroup);
 
-			if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
+			if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
 			{
 				MemoryContextSwitchTo(oldcxt);
 				break;
 			}
 
-			total += rbi_count_sources_cached(st->heap, estate->es_snapshot,
+			total += lion_count_sources_cached(st->heap, estate->es_snapshot,
 											  st->nclause + 1, st->sources,
 											  &st->stats, st->viscache);
-			rbi_posting_set_release(&st->groupset);
+			lion_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
 		}
 
 		st->done = true;
-		return rbi_emit_tuple(st, (Datum) 0, true, total);
+		return lion_emit_tuple(st, (Datum) 0, true, total);
 	}
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
 	{
 		bool		exhausted;
-		TupleTableSlot *slot = rbi_next_group(st, &exhausted);
+		TupleTableSlot *slot = lion_next_group(st, &exhausted);
 
 		if (exhausted)
 			st->done = true;
@@ -3347,20 +3347,20 @@ rbi_exec_custom_scan(CustomScanState *node)
  * has been released before any of them, which is what DESIGN.md §9 requires.
  */
 static void
-rbi_reset_run(RBICountScanState *st)
+lion_reset_run(LionCountScanState *st)
 {
 	int			i;
 
 	if (st->scanning)
 	{
-		rbi_entry_scan_end(&st->escan);
+		lion_entry_scan_end(&st->escan);
 		st->scanning = false;
 	}
-	rbi_posting_set_release(&st->groupset);
-	rbi_release_where(st);
+	lion_posting_set_release(&st->groupset);
+	lion_release_where(st);
 
 	if (st->npart > 0)
-		rbi_close_relation(st);
+		lion_close_relation(st);
 
 	if (st->pergroup != NULL)
 		MemoryContextReset(st->pergroup);
@@ -3375,7 +3375,7 @@ rbi_reset_run(RBICountScanState *st)
 		MemoryContextReset(st->keycxt);
 
 	if (st->viscache != NULL)
-		rbi_vis_cache_reset(st->viscache);
+		lion_vis_cache_reset(st->viscache);
 
 	/*
 	 * The clause values go too: a rescan of a parameterised inner side has to
@@ -3385,7 +3385,7 @@ rbi_reset_run(RBICountScanState *st)
 	st->valsdone = false;
 	for (i = 0; i < st->nclause; i++)
 	{
-		RBIClauseState *cl = &st->clause[i];
+		LionClauseState *cl = &st->clause[i];
 
 		if (cl->valstate != NULL)
 		{
@@ -3401,24 +3401,24 @@ rbi_reset_run(RBICountScanState *st)
 }
 
 static void
-rbi_rescan_custom_scan(CustomScanState *node)
+lion_rescan_custom_scan(CustomScanState *node)
 {
-	RBICountScanState *st = (RBICountScanState *) node;
+	LionCountScanState *st = (LionCountScanState *) node;
 
-	rbi_reset_run(st);
+	lion_reset_run(st);
 	st->done = false;
 }
 
 static void
-rbi_end_custom_scan(CustomScanState *node)
+lion_end_custom_scan(CustomScanState *node)
 {
-	RBICountScanState *st = (RBICountScanState *) node;
+	LionCountScanState *st = (LionCountScanState *) node;
 
-	rbi_reset_run(st);
+	lion_reset_run(st);
 
 	/* A plain table's relations were opened once and are closed once. */
 	if (st->npart == 0)
-		rbi_close_relation(st);
+		lion_close_relation(st);
 
 	if (st->pergroup != NULL)
 	{
@@ -3442,7 +3442,7 @@ rbi_end_custom_scan(CustomScanState *node)
 	}
 	if (st->viscache != NULL)
 	{
-		rbi_vis_cache_destroy(st->viscache);
+		lion_vis_cache_destroy(st->viscache);
 		st->viscache = NULL;
 	}
 }
@@ -3456,17 +3456,17 @@ rbi_end_custom_scan(CustomScanState *node)
  * core's EXPLAIN gives a qual on one (DESIGN.md §10).
  */
 static void
-rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, List *ancestors,
+lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors,
 				   ExplainState *es, StringInfo buf)
 {
 	const char *attname = get_attname(st->heapoid, cl->attno, false);
 
 	switch (cl->kind)
 	{
-		case RBI_CLAUSE_NULL:
+		case LION_CLAUSE_NULL:
 			appendStringInfo(buf, "%s IS NULL", attname);
 			break;
-		case RBI_CLAUSE_NOTNULL:
+		case LION_CLAUSE_NOTNULL:
 			appendStringInfo(buf, "%s IS NOT NULL", attname);
 			break;
 		default:
@@ -3490,9 +3490,9 @@ rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, List *ancestors,
 					getTypeOutputInfo(cl->con->consttype, &outfunc, &isvarlena);
 					val = OidOutputFunctionCall(outfunc, cl->con->constvalue);
 				}
-				if (cl->kind == RBI_CLAUSE_ARRAY)
+				if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s = ANY (%s)", attname, val);
-				else if (cl->kind == RBI_CLAUSE_MULTI)
+				else if (cl->kind == LION_CLAUSE_MULTI)
 				{
 					char	   *opname = get_opname(cl->opno);
 
@@ -3508,10 +3508,10 @@ rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, List *ancestors,
 }
 
 static void
-rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
+lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 						ExplainState *es)
 {
-	RBICountScanState *st = (RBICountScanState *) node;
+	LionCountScanState *st = (LionCountScanState *) node;
 	StringInfoData buf;
 	int			i;
 
@@ -3553,11 +3553,11 @@ rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->npart == 0)
 			appendStringInfo(&buf, "%s ", get_rel_name(st->clause[i].idxoid));
 		appendStringInfoChar(&buf, '(');
-		rbi_explain_clause(st, &st->clause[i], ancestors, es, &buf);
+		lion_explain_clause(st, &st->clause[i], ancestors, es, &buf);
 		appendStringInfoChar(&buf, ')');
 	}
 
-	ExplainPropertyText("Roaring Indexes", buf.data, es);
+	ExplainPropertyText("Lion Indexes", buf.data, es);
 	pfree(buf.data);
 
 	if (st->hasgroupidx && st->groupattno != 0)

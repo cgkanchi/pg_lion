@@ -1,11 +1,11 @@
 /*-------------------------------------------------------------------------
  *
- * rbi_funcs.c
- *		SQL-callable helpers for the roaring index (DESIGN.md section 7):
- *		roaring_index_stats() and roaring_index_verify().
+ * lion_funcs.c
+ *		SQL-callable helpers for the lion index (DESIGN.md section 7):
+ *		lion_index_stats() and lion_index_verify().
  *
  * Both open the index with AccessShareLock and read one page at a time under
- * a SHARE lock, so they run concurrently with inserts; roaring_index_verify()
+ * a SHARE lock, so they run concurrently with inserts; lion_index_verify()
  * additionally holds the SHARE lock of a bucket head page for as long as it
  * is checking that bucket, which pins down the whole bucket (every reader and
  * writer of a key enters through its bucket head) and gives it a stable view.
@@ -32,55 +32,55 @@
 #include "utils/snapmgr.h"
 #include "varatt.h"
 
-#include "rbi.h"
+#include "lion.h"
 
-PG_FUNCTION_INFO_V1(roaring_index_stats);
-PG_FUNCTION_INFO_V1(roaring_index_verify);
+PG_FUNCTION_INFO_V1(lion_index_stats);
+PG_FUNCTION_INFO_V1(lion_index_verify);
 
-#define RBI_STATS_NCOLS		18
+#define LION_STATS_NCOLS		18
 
-typedef struct RBIVerifyState
+typedef struct LionVerifyState
 {
 	Relation	index;
 	Relation	heap;
-	RBIState   *state;
+	LionState   *state;
 	BlockNumber nblocks;
 	uint8	   *refs;			/* how often each block is referenced */
-	RBIContainer *cbuf;			/* aligned container work buffer */
+	LionContainer *cbuf;			/* aligned container work buffer */
 	int64		nnullentries;	/* reserved NULL-key entries seen (at most 1) */
 	int64		nemptyentries;	/* reserved no-key entries seen (at most 1) */
 	Oid			keyoutfunc;		/* output function of the indexed type */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
 	int64		nheaptuples;
-} RBIVerifyState;
+} LionVerifyState;
 
 /*
  * Report structural damage.  Every message names the block (and item) the
  * problem was found in, as the caller has no other way of locating it.
  */
-#define rbi_corrupt(...) \
+#define lion_corrupt(...) \
 	ereport(ERROR, \
 			(errcode(ERRCODE_INDEX_CORRUPTED), \
 			 errmsg(__VA_ARGS__)))
 
 /*
- * Open relid as a roaring index.
+ * Open relid as a lion index.
  */
 static Relation
-rbi_open_index(Oid relid, LOCKMODE lockmode)
+lion_open_index(Oid relid, LOCKMODE lockmode)
 {
 	Relation	index = index_open(relid, lockmode);
 
 	if (index->rd_rel->relkind != RELKIND_INDEX ||
 		index->rd_indam == NULL ||
-		index->rd_indam->ambuild != rbibuild)
+		index->rd_indam->ambuild != lionbuild)
 	{
 		char	   *name = pstrdup(RelationGetRelationName(index));
 
 		index_close(index, lockmode);
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a roaring index", name)));
+				 errmsg("\"%s\" is not a lion index", name)));
 	}
 
 	if (RELATION_IS_OTHER_TEMP(index))
@@ -98,18 +98,18 @@ rbi_open_index(Oid relid, LOCKMODE lockmode)
 }
 
 /* ---------------------------------------------------------------------
- * roaring_index_stats()
+ * lion_index_stats()
  * --------------------------------------------------------------------- */
 
-typedef struct RBIStats
+typedef struct LionStats
 {
 	int64		bucket_pages;
 	int64		entries;
 	int64		inline_entries;
 	int64		container_pages;
 	int64		containers;
-	int64		by_type[4];		/* indexed by RBIContainerType */
-	int64		sparse_segments;	/* items of type RBI_CT_SPARSE */
+	int64		by_type[4];		/* indexed by LionContainerType */
+	int64		sparse_segments;	/* items of type LION_CT_SPARSE */
 	int64		sparse_members;	/* (ckey, lo) pairs inside them */
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
@@ -118,7 +118,7 @@ typedef struct RBIStats
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
 	int64		free_bytes;
-} RBIStats;
+} LionStats;
 
 /*
  * Account for one item of a posting set.  The container counters count real
@@ -127,11 +127,11 @@ typedef struct RBIStats
  * every item, whatever its kind.
  */
 static void
-rbi_stats_item(RBIStats *st, const RBIContainer *c, Size itemlen)
+lion_stats_item(LionStats *st, const LionContainer *c, Size itemlen)
 {
-	Size		size = rbi_item_size(c);
+	Size		size = lion_item_size(c);
 
-	if (c->type == RBI_CT_SPARSE)
+	if (c->type == LION_CT_SPARSE)
 	{
 		st->sparse_segments++;
 		st->sparse_members += (int64) c->cardinality;
@@ -139,7 +139,7 @@ rbi_stats_item(RBIStats *st, const RBIContainer *c, Size itemlen)
 	else
 	{
 		st->containers++;
-		if (c->type >= RBI_CT_ARRAY && c->type <= RBI_CT_RUN)
+		if (c->type >= LION_CT_ARRAY && c->type <= LION_CT_RUN)
 			st->by_type[c->type]++;
 	}
 
@@ -156,29 +156,29 @@ rbi_stats_item(RBIStats *st, const RBIContainer *c, Size itemlen)
 }
 
 Datum
-roaring_index_stats(PG_FUNCTION_ARGS)
+lion_index_stats(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	Relation	index;
-	RBIState   *state;
-	RBIStats	st;
-	RBIContainer *cbuf;
+	LionState   *state;
+	LionStats	st;
+	LionContainer *cbuf;
 	BlockNumber nblocks;
 	BlockNumber blk;
 	TupleDesc	tupdesc;
-	Datum		values[RBI_STATS_NCOLS];
-	bool		nulls[RBI_STATS_NCOLS];
+	Datum		values[LION_STATS_NCOLS];
+	bool		nulls[LION_STATS_NCOLS];
 	HeapTuple	tuple;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	index = rbi_open_index(relid, AccessShareLock);
-	state = rbi_get_state(index);
+	index = lion_open_index(relid, AccessShareLock);
+	state = lion_get_state(index);
 
 	memset(&st, 0, sizeof(st));
-	cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
 	nblocks = RelationGetNumberOfBlocks(index);
 	for (blk = 1; blk < nblocks; blk++)
@@ -192,7 +192,7 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 
-		if (PageIsNew(page) || PageGetSpecialSize(page) != RBI_SPECIAL_SIZE)
+		if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
 		{
 			UnlockReleaseBuffer(buf);
 			continue;
@@ -200,7 +200,7 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 
 		maxoff = PageGetMaxOffsetNumber(page);
 
-		if (RBIPageIsBucket(page))
+		if (LionPageIsBucket(page))
 		{
 			st.bucket_pages++;
 			st.free_bytes += (int64) PageGetFreeSpace(page);
@@ -208,34 +208,34 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 			for (off = FirstOffsetNumber; off <= maxoff; off++)
 			{
 				ItemId		iid = PageGetItemId(page, off);
-				RBIEntryTuple *entry;
+				LionEntryTuple *entry;
 
 				if (!ItemIdIsUsed(iid))
 					continue;
 
-				entry = (RBIEntryTuple *) PageGetItem(page, iid);
+				entry = (LionEntryTuple *) PageGetItem(page, iid);
 				st.entries++;
 				st.ntids += (int64) entry->ntids;
-				if (RBIEntryIsNullKey(entry))
+				if (LionEntryIsNullKey(entry))
 					st.null_tids += (int64) entry->ntids;
-				if (RBIEntryIsEmptyKey(entry))
+				if (LionEntryIsEmptyKey(entry))
 					st.empty_tids += (int64) entry->ntids;
 
-				if ((entry->flags & RBI_ENTRY_INLINE) != 0)
+				if ((entry->flags & LION_ENTRY_INLINE) != 0)
 				{
-					Size		paylen = RBI_ENTRY_PAYLOAD_LEN(entry,
+					Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry,
 															   ItemIdGetLength(iid));
 					Size		cur = 0;
 					Size		csize;
 
 					st.inline_entries++;
-					while ((csize = rbi_inline_fetch(RBIEntryGetPayload(entry),
+					while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
 													 paylen, &cur, cbuf)) > 0)
-						rbi_stats_item(&st, cbuf, csize);
+						lion_stats_item(&st, cbuf, csize);
 				}
 			}
 		}
-		else if (RBIPageIsContainer(page))
+		else if (LionPageIsContainer(page))
 		{
 			st.container_pages++;
 			st.free_bytes += (int64) PageGetFreeSpace(page);
@@ -247,8 +247,8 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 				if (!ItemIdIsUsed(iid))
 					continue;
 
-				rbi_stats_item(&st,
-							   (RBIContainer *) PageGetItem(page, iid),
+				lion_stats_item(&st,
+							   (LionContainer *) PageGetItem(page, iid),
 							   ItemIdGetLength(iid));
 			}
 		}
@@ -272,11 +272,11 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 
 		for (b = 0; b < state->meta.nbuckets; b++)
 		{
-			Buffer		headbuf = ReadBuffer(index, RBI_BUCKET_BLKNO(b));
+			Buffer		headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(b));
 			int			n;
 
 			LockBuffer(headbuf, BUFFER_LOCK_SHARE);
-			n = rbi_bucket_npages(index, headbuf);
+			n = lion_bucket_npages(index, headbuf);
 			UnlockReleaseBuffer(headbuf);
 
 			st.max_bucket_pages = Max(st.max_bucket_pages, (int64) n);
@@ -291,9 +291,9 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 	values[3] = Int64GetDatum(st.inline_entries);
 	values[4] = Int64GetDatum(st.container_pages);
 	values[5] = Int64GetDatum(st.containers);
-	values[6] = Int64GetDatum(st.by_type[RBI_CT_ARRAY]);
-	values[7] = Int64GetDatum(st.by_type[RBI_CT_BITSET]);
-	values[8] = Int64GetDatum(st.by_type[RBI_CT_RUN]);
+	values[6] = Int64GetDatum(st.by_type[LION_CT_ARRAY]);
+	values[7] = Int64GetDatum(st.by_type[LION_CT_BITSET]);
+	values[8] = Int64GetDatum(st.by_type[LION_CT_RUN]);
 	values[9] = Int64GetDatum(st.ntids);
 	values[10] = Int64GetDatum(st.container_bytes);
 	values[11] = Int64GetDatum(st.free_bytes);
@@ -312,7 +312,7 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 }
 
 /* ---------------------------------------------------------------------
- * roaring_index_verify()
+ * lion_index_verify()
  * --------------------------------------------------------------------- */
 
 /*
@@ -320,14 +320,14 @@ roaring_index_stats(PG_FUNCTION_ARGS)
  * (which also stops a corrupt rightlink cycle from looping forever).
  */
 static void
-rbi_verify_visit(RBIVerifyState *vs, BlockNumber blk, const char *what)
+lion_verify_visit(LionVerifyState *vs, BlockNumber blk, const char *what)
 {
 	if (blk >= vs->nblocks)
-		rbi_corrupt("roaring index \"%s\": %s points at block %u, but the index has only %u blocks",
+		lion_corrupt("lion index \"%s\": %s points at block %u, but the index has only %u blocks",
 					RelationGetRelationName(vs->index), what, blk, vs->nblocks);
 
 	if (vs->refs[blk] != 0)
-		rbi_corrupt("roaring index \"%s\": block %u is referenced more than once (reached again as %s)",
+		lion_corrupt("lion index \"%s\": block %u is referenced more than once (reached again as %s)",
 					RelationGetRelationName(vs->index), blk, what);
 
 	vs->refs[blk]++;
@@ -337,12 +337,12 @@ rbi_verify_visit(RBIVerifyState *vs, BlockNumber blk, const char *what)
  * Read blk with a SHARE lock and check its page header and kind.
  */
 static Page
-rbi_verify_read_page(RBIVerifyState *vs, BlockNumber blk, uint16 kind,
+lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 					 Buffer *bufp)
 {
 	Buffer		buf;
 	Page		page;
-	RBIPageOpaque opaque;
+	LionPageOpaque opaque;
 	uint16		flags;
 
 	buf = ReadBuffer(vs->index, blk);
@@ -351,35 +351,35 @@ rbi_verify_read_page(RBIVerifyState *vs, BlockNumber blk, uint16 kind,
 	*bufp = buf;
 
 	if (PageIsNew(page))
-		rbi_corrupt("roaring index \"%s\": block %u has never been initialised",
+		lion_corrupt("lion index \"%s\": block %u has never been initialised",
 					RelationGetRelationName(vs->index), blk);
 
-	if (PageGetSpecialSize(page) != RBI_SPECIAL_SIZE)
-		rbi_corrupt("roaring index \"%s\": block %u has a special area of %u bytes, expected %zu",
+	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		lion_corrupt("lion index \"%s\": block %u has a special area of %u bytes, expected %zu",
 					RelationGetRelationName(vs->index), blk,
 					(unsigned) PageGetSpecialSize(page),
-					(Size) RBI_SPECIAL_SIZE);
+					(Size) LION_SPECIAL_SIZE);
 
-	opaque = RBIPageGetOpaque(page);
+	opaque = LionPageGetOpaque(page);
 
-	if (opaque->page_id != RBI_PAGE_ID)
-		rbi_corrupt("roaring index \"%s\": block %u has page id 0x%04X, expected 0x%04X",
+	if (opaque->page_id != LION_PAGE_ID)
+		lion_corrupt("lion index \"%s\": block %u has page id 0x%04X, expected 0x%04X",
 					RelationGetRelationName(vs->index), blk,
-					opaque->page_id, RBI_PAGE_ID);
+					opaque->page_id, LION_PAGE_ID);
 
-	flags = opaque->flags & (RBI_PAGE_META | RBI_PAGE_BUCKET | RBI_PAGE_CONTAINER);
-	if (flags != RBI_PAGE_META && flags != RBI_PAGE_BUCKET &&
-		flags != RBI_PAGE_CONTAINER)
-		rbi_corrupt("roaring index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
+	flags = opaque->flags & (LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER);
+	if (flags != LION_PAGE_META && flags != LION_PAGE_BUCKET &&
+		flags != LION_PAGE_CONTAINER)
+		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
 					RelationGetRelationName(vs->index), blk, opaque->flags);
 
 	if (flags != kind)
-		rbi_corrupt("roaring index \"%s\": block %u is a %s page, expected a %s page",
+		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
 					RelationGetRelationName(vs->index), blk,
-					flags == RBI_PAGE_META ? "meta" :
-					flags == RBI_PAGE_BUCKET ? "bucket" : "container",
-					kind == RBI_PAGE_META ? "meta" :
-					kind == RBI_PAGE_BUCKET ? "bucket" : "container");
+					flags == LION_PAGE_META ? "meta" :
+					flags == LION_PAGE_BUCKET ? "bucket" : "container",
+					kind == LION_PAGE_META ? "meta" :
+					kind == LION_PAGE_BUCKET ? "bucket" : "container");
 
 	return page;
 }
@@ -389,29 +389,29 @@ rbi_verify_read_page(RBIVerifyState *vs, BlockNumber blk, uint16 kind,
  * so that hashing it cannot run off the end of the item.
  */
 static void
-rbi_verify_keylen(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
-				  const RBIEntryTuple *entry)
+lion_verify_keylen(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
+				  const LionEntryTuple *entry)
 {
-	RBIState   *state = vs->state;
+	LionState   *state = vs->state;
 	Size		keylen = entry->keylen;
-	const char *key = RBIEntryGetKey(entry);
+	const char *key = LionEntryGetKey(entry);
 
-	if (keylen == 0 || keylen > RBI_MAX_KEY_SIZE)
-		rbi_corrupt("roaring index \"%s\": entry %u on block %u has key length %zu, expected 1 .. %d",
+	if (keylen == 0 || keylen > LION_MAX_KEY_SIZE)
+		lion_corrupt("lion index \"%s\": entry %u on block %u has key length %zu, expected 1 .. %d",
 					RelationGetRelationName(vs->index), off, blk, keylen,
-					RBI_MAX_KEY_SIZE);
+					LION_MAX_KEY_SIZE);
 
 	if (state->typbyval)
 	{
 		if (keylen != sizeof(Datum))
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u has key length %zu, expected %zu for a by-value type",
+			lion_corrupt("lion index \"%s\": entry %u on block %u has key length %zu, expected %zu for a by-value type",
 						RelationGetRelationName(vs->index), off, blk, keylen,
 						sizeof(Datum));
 	}
 	else if (state->typlen > 0)
 	{
 		if (keylen != (Size) state->typlen)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u has key length %zu, expected %d",
+			lion_corrupt("lion index \"%s\": entry %u on block %u has key length %zu, expected %d",
 						RelationGetRelationName(vs->index), off, blk, keylen,
 						state->typlen);
 	}
@@ -419,13 +419,13 @@ rbi_verify_keylen(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	{
 		if (VARATT_IS_EXTERNAL(key) || VARATT_IS_COMPRESSED(key) ||
 			VARSIZE_ANY(key) != keylen)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u has a malformed varlena key of %zu bytes",
+			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed varlena key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
 	else
 	{
 		if (strnlen(key, keylen) != keylen - 1)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u has a malformed cstring key of %zu bytes",
+			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed cstring key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
 }
@@ -439,24 +439,24 @@ rbi_verify_keylen(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
  * size of an item inside an INLINE payload, which never has slack).
  */
 static void
-rbi_verify_item_slack(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
-					  const RBIContainer *item, Size avail, const char *what)
+lion_verify_item_slack(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
+					  const LionContainer *item, Size avail, const char *what)
 {
-	Size		size = rbi_item_size(item);
+	Size		size = lion_item_size(item);
 
 	if (avail < size)
-		rbi_corrupt("roaring index \"%s\": %s %u on block %u occupies %zu bytes but needs %zu",
+		lion_corrupt("lion index \"%s\": %s %u on block %u occupies %zu bytes but needs %zu",
 					RelationGetRelationName(vs->index), what, off, blk, avail,
 					size);
 
-	if (avail > (Size) RBI_CONTAINER_MAX_SIZE)
-		rbi_corrupt("roaring index \"%s\": %s %u on block %u occupies %zu bytes, more than an item may ever take",
+	if (avail > (Size) LION_CONTAINER_MAX_SIZE)
+		lion_corrupt("lion index \"%s\": %s %u on block %u occupies %zu bytes, more than an item may ever take",
 					RelationGetRelationName(vs->index), what, off, blk, avail);
 
-	if (avail - size > RBI_ITEM_SLACK_LIMIT)
-		rbi_corrupt("roaring index \"%s\": %s %u on block %u occupies %zu bytes, %zu more than its %zu bytes need (at most %d bytes of slack)",
+	if (avail - size > LION_ITEM_SLACK_LIMIT)
+		lion_corrupt("lion index \"%s\": %s %u on block %u occupies %zu bytes, %zu more than its %zu bytes need (at most %d bytes of slack)",
 					RelationGetRelationName(vs->index), what, off, blk, avail,
-					avail - size, size, RBI_ITEM_SLACK_LIMIT);
+					avail - size, size, LION_ITEM_SLACK_LIMIT);
 }
 
 /*
@@ -467,12 +467,12 @@ rbi_verify_item_slack(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
  * everything before it (the caller keeps the last ckey of the previous item
  * in *prevckey, so this also proves the ranges do not overlap or interleave,
  * within a page and across a chain), and no container key inside it may have
- * reached RBI_SPARSE_THRESHOLD members, because such a key belongs in a
+ * reached LION_SPARSE_THRESHOLD members, because such a key belongs in a
  * container of its own.
  */
 static void
-rbi_verify_segment(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
-				   const RBIContainer *c, Size avail, bool *haveprev,
+lion_verify_segment(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
+				   const LionContainer *c, Size avail, bool *haveprev,
 				   uint32 *prevckey)
 {
 	const char *detail = NULL;
@@ -481,22 +481,22 @@ rbi_verify_segment(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	uint32		run = 1;
 	uint32		i;
 
-	if (!rbi_sparse_check(c, avail, &detail))
-		rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u is corrupt: %s",
+	if (!lion_sparse_check(c, avail, &detail))
+		lion_corrupt("lion index \"%s\": sparse segment %u on block %u is corrupt: %s",
 					RelationGetRelationName(vs->index), off, blk, detail);
 
-	rbi_verify_item_slack(vs, blk, off, c, avail, "sparse segment");
+	lion_verify_item_slack(vs, blk, off, c, avail, "sparse segment");
 
 	if (n == 0)
-		rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u is empty",
+		lion_corrupt("lion index \"%s\": sparse segment %u on block %u is empty",
 					RelationGetRelationName(vs->index), off, blk);
 
 	if (*haveprev && c->ckey <= *prevckey)
-		rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u starts at container key %u, not above the previous key %u",
+		lion_corrupt("lion index \"%s\": sparse segment %u on block %u starts at container key %u, not above the previous key %u",
 					RelationGetRelationName(vs->index), off, blk, c->ckey,
 					*prevckey);
 
-	ckeys = RBI_SPARSE_CKEYS_CONST(c);
+	ckeys = LION_SPARSE_CKEYS_CONST(c);
 	for (i = 1; i <= n; i++)
 	{
 		if (i < n && ckeys[i] == ckeys[i - 1])
@@ -504,14 +504,14 @@ rbi_verify_segment(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
 			run++;
 			continue;
 		}
-		if (run >= RBI_SPARSE_THRESHOLD)
-			rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u holds %u members of container key %u, which needs a container of its own",
+		if (run >= LION_SPARSE_THRESHOLD)
+			lion_corrupt("lion index \"%s\": sparse segment %u on block %u holds %u members of container key %u, which needs a container of its own",
 						RelationGetRelationName(vs->index), off, blk, run,
 						ckeys[i - 1]);
 		run = 1;
 	}
 
-	*prevckey = rbi_item_last_ckey(c);
+	*prevckey = lion_item_last_ckey(c);
 	*haveprev = true;
 }
 
@@ -520,30 +520,30 @@ rbi_verify_segment(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
  * a container, or a sparse segment.
  */
 static void
-rbi_verify_container(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
-					 const RBIContainer *c, Size avail, bool *haveprev,
+lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
+					 const LionContainer *c, Size avail, bool *haveprev,
 					 uint32 *prevckey)
 {
 	const char *detail = NULL;
 
-	if (c->type == RBI_CT_SPARSE)
+	if (c->type == LION_CT_SPARSE)
 	{
-		rbi_verify_segment(vs, blk, off, c, avail, haveprev, prevckey);
+		lion_verify_segment(vs, blk, off, c, avail, haveprev, prevckey);
 		return;
 	}
 
-	if (!rbi_container_check(c, avail, &detail))
-		rbi_corrupt("roaring index \"%s\": container %u on block %u is corrupt: %s",
+	if (!lion_container_check(c, avail, &detail))
+		lion_corrupt("lion index \"%s\": container %u on block %u is corrupt: %s",
 					RelationGetRelationName(vs->index), off, blk, detail);
 
-	rbi_verify_item_slack(vs, blk, off, c, avail, "container");
+	lion_verify_item_slack(vs, blk, off, c, avail, "container");
 
 	if (c->cardinality == 0)
-		rbi_corrupt("roaring index \"%s\": container %u on block %u is empty",
+		lion_corrupt("lion index \"%s\": container %u on block %u is empty",
 					RelationGetRelationName(vs->index), off, blk);
 
 	if (*haveprev && c->ckey <= *prevckey)
-		rbi_corrupt("roaring index \"%s\": container %u on block %u has container key %u, not above the previous key %u",
+		lion_corrupt("lion index \"%s\": container %u on block %u has container key %u, not above the previous key %u",
 					RelationGetRelationName(vs->index), off, blk, c->ckey,
 					*prevckey);
 
@@ -555,8 +555,8 @@ rbi_verify_container(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
  * Walk and check the container chain of a CHAIN entry.
  */
 static void
-rbi_verify_chain(RBIVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
-				 const RBIEntryTuple *entry)
+lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
+				 const LionEntryTuple *entry)
 {
 	BlockNumber blk = entry->head;
 	BlockNumber last = InvalidBlockNumber;
@@ -566,7 +566,7 @@ rbi_verify_chain(RBIVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	uint32		ncontainers = 0;
 
 	if (!BlockNumberIsValid(entry->head) || !BlockNumberIsValid(entry->tail))
-		rbi_corrupt("roaring index \"%s\": chain entry %u on block %u has head %u and tail %u",
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
 					entry->head, entry->tail);
 
@@ -574,27 +574,27 @@ rbi_verify_chain(RBIVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	{
 		Buffer		buf;
 		Page		page;
-		RBIPageOpaque opaque;
+		LionPageOpaque opaque;
 		OffsetNumber maxoff;
 		OffsetNumber off;
 		OffsetNumber firstused = InvalidOffsetNumber;
 		OffsetNumber lastused = InvalidOffsetNumber;
 
-		rbi_verify_visit(vs, blk, "a container chain");
-		page = rbi_verify_read_page(vs, blk, RBI_PAGE_CONTAINER, &buf);
-		opaque = RBIPageGetOpaque(page);
+		lion_verify_visit(vs, blk, "a container chain");
+		page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
+		opaque = LionPageGetOpaque(page);
 		maxoff = PageGetMaxOffsetNumber(page);
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
-			RBIContainer *c;
+			LionContainer *c;
 
 			if (!ItemIdIsUsed(iid))
 				continue;
 
-			c = (RBIContainer *) PageGetItem(page, iid);
-			rbi_verify_container(vs, blk, off, c, ItemIdGetLength(iid),
+			c = (LionContainer *) PageGetItem(page, iid);
+			lion_verify_container(vs, blk, off, c, ItemIdGetLength(iid),
 								 &haveprev, &prevckey);
 
 			card += c->cardinality;
@@ -609,21 +609,21 @@ rbi_verify_chain(RBIVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		if (firstused == InvalidOffsetNumber)
 		{
 			if (opaque->minckey != 0 || opaque->maxckey != 0)
-				rbi_corrupt("roaring index \"%s\": empty container page %u has minckey %u and maxckey %u, expected 0 and 0",
+				lion_corrupt("lion index \"%s\": empty container page %u has minckey %u and maxckey %u, expected 0 and 0",
 							RelationGetRelationName(vs->index), blk,
 							opaque->minckey, opaque->maxckey);
 		}
 		else
 		{
 			uint32		minckey =
-				rbi_item_first_ckey((RBIContainer *)
+				lion_item_first_ckey((LionContainer *)
 									PageGetItem(page, PageGetItemId(page, firstused)));
 			uint32		maxckey =
-				rbi_item_last_ckey((RBIContainer *)
+				lion_item_last_ckey((LionContainer *)
 								   PageGetItem(page, PageGetItemId(page, lastused)));
 
 			if (opaque->minckey != minckey || opaque->maxckey != maxckey)
-				rbi_corrupt("roaring index \"%s\": container page %u has minckey %u and maxckey %u, but holds %u .. %u",
+				lion_corrupt("lion index \"%s\": container page %u has minckey %u and maxckey %u, but holds %u .. %u",
 							RelationGetRelationName(vs->index), blk,
 							opaque->minckey, opaque->maxckey, minckey, maxckey);
 		}
@@ -636,17 +636,17 @@ rbi_verify_chain(RBIVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	}
 
 	if (last != entry->tail)
-		rbi_corrupt("roaring index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, last,
 					entry->tail);
 
 	if (card != entry->ntids)
-		rbi_corrupt("roaring index \"%s\": chain entry %u on block %u claims " UINT64_FORMAT " TIDs, but its containers hold " UINT64_FORMAT,
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims " UINT64_FORMAT " TIDs, but its containers hold " UINT64_FORMAT,
 					RelationGetRelationName(vs->index), eoff, eblk,
 					entry->ntids, card);
 
 	if (ncontainers != entry->ncontainers)
-		rbi_corrupt("roaring index \"%s\": chain entry %u on block %u claims %u containers, but its chain holds %u",
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims %u containers, but its chain holds %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
 					entry->ncontainers, ncontainers);
 }
@@ -655,55 +655,55 @@ rbi_verify_chain(RBIVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  * Check one entry tuple.
  */
 static void
-rbi_verify_entry(RBIVerifyState *vs, uint32 bucket, BlockNumber blk,
+lion_verify_entry(LionVerifyState *vs, uint32 bucket, BlockNumber blk,
 				 OffsetNumber off, ItemId iid, Page page)
 {
-	RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 	Size		itemsz = ItemIdGetLength(iid);
-	uint16		kind = entry->flags & (RBI_ENTRY_INLINE | RBI_ENTRY_CHAIN);
+	uint16		kind = entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN);
 	uint32		nbuckets = vs->state->meta.nbuckets;
 
-	if (itemsz < RBI_ENTRY_HDRSZ)
-		rbi_corrupt("roaring index \"%s\": entry %u on block %u is only %zu bytes",
+	if (itemsz < LION_ENTRY_HDRSZ)
+		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
 					RelationGetRelationName(vs->index), off, blk, itemsz);
 
-	if (kind != RBI_ENTRY_INLINE && kind != RBI_ENTRY_CHAIN)
-		rbi_corrupt("roaring index \"%s\": entry %u on block %u has flags 0x%04X, expected exactly one of INLINE and CHAIN",
+	if (kind != LION_ENTRY_INLINE && kind != LION_ENTRY_CHAIN)
+		lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, expected exactly one of INLINE and CHAIN",
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
 
-	if ((entry->flags & ~(uint16) (RBI_ENTRY_INLINE | RBI_ENTRY_CHAIN |
-								   RBI_ENTRY_RESERVED)) != 0)
-		rbi_corrupt("roaring index \"%s\": entry %u on block %u has unknown flag bits in 0x%04X",
+	if ((entry->flags & ~(uint16) (LION_ENTRY_INLINE | LION_ENTRY_CHAIN |
+								   LION_ENTRY_RESERVED)) != 0)
+		lion_corrupt("lion index \"%s\": entry %u on block %u has unknown flag bits in 0x%04X",
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
 
-	if ((entry->flags & RBI_ENTRY_RESERVED) == RBI_ENTRY_RESERVED)
-		rbi_corrupt("roaring index \"%s\": entry %u on block %u is both the null and the empty entry",
+	if ((entry->flags & LION_ENTRY_RESERVED) == LION_ENTRY_RESERVED)
+		lion_corrupt("lion index \"%s\": entry %u on block %u is both the null and the empty entry",
 					RelationGetRelationName(vs->index), off, blk);
 
-	if (RBIEntryIsReserved(entry))
+	if (LionEntryIsReserved(entry))
 	{
 		/*
 		 * A reserved entry (DESIGN.md §14 and §17): no key bytes, hash 0,
 		 * bucket 0, and one of each per index at most - a second one would
 		 * split its rows between two entries that no reader looks for twice.
 		 */
-		const char *what = RBIEntryIsNullKey(entry) ? "null" : "empty";
+		const char *what = LionEntryIsNullKey(entry) ? "null" : "empty";
 
 		if (entry->keylen != 0)
-			rbi_corrupt("roaring index \"%s\": %s entry %u on block %u has a key of %u bytes",
+			lion_corrupt("lion index \"%s\": %s entry %u on block %u has a key of %u bytes",
 						RelationGetRelationName(vs->index), what, off, blk,
 						entry->keylen);
-		if (entry->hash != RBI_NULLKEY_HASH)
-			rbi_corrupt("roaring index \"%s\": %s entry %u on block %u stores hash %u, expected %d",
+		if (entry->hash != LION_NULLKEY_HASH)
+			lion_corrupt("lion index \"%s\": %s entry %u on block %u stores hash %u, expected %d",
 						RelationGetRelationName(vs->index), what, off, blk,
-						entry->hash, RBI_NULLKEY_HASH);
-		if (bucket != RBI_NULLKEY_BUCKET)
-			rbi_corrupt("roaring index \"%s\": %s entry %u on block %u is in bucket %u, expected bucket %d",
+						entry->hash, LION_NULLKEY_HASH);
+		if (bucket != LION_NULLKEY_BUCKET)
+			lion_corrupt("lion index \"%s\": %s entry %u on block %u is in bucket %u, expected bucket %d",
 						RelationGetRelationName(vs->index), what, off, blk,
-						bucket, RBI_NULLKEY_BUCKET);
-		if (RBIEntryIsNullKey(entry) ? (++vs->nnullentries > 1) :
+						bucket, LION_NULLKEY_BUCKET);
+		if (LionEntryIsNullKey(entry) ? (++vs->nnullentries > 1) :
 			(++vs->nemptyentries > 1))
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u is a second %s entry",
+			lion_corrupt("lion index \"%s\": entry %u on block %u is a second %s entry",
 						RelationGetRelationName(vs->index), off, blk, what);
 
 		/*
@@ -711,37 +711,37 @@ rbi_verify_entry(RBIVerifyState *vs, uint32 bucket, BlockNumber blk,
 		 * a scalar index means the two flag bits have been confused
 		 * somewhere.
 		 */
-		if (RBIEntryIsEmptyKey(entry) && !vs->state->multikey)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u is an empty-key entry, but the operator class extracts no keys",
+		if (LionEntryIsEmptyKey(entry) && !vs->state->multikey)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is an empty-key entry, but the operator class extracts no keys",
 						RelationGetRelationName(vs->index), off, blk);
 	}
 	else
 	{
 		uint32		hash;
 
-		rbi_verify_keylen(vs, blk, off, entry);
+		lion_verify_keylen(vs, blk, off, entry);
 
-		hash = rbi_hash_key(vs->state,
-							rbi_fetch_key(vs->state, RBIEntryGetKey(entry)));
+		hash = lion_hash_key(vs->state,
+							lion_fetch_key(vs->state, LionEntryGetKey(entry)));
 		if (hash != entry->hash)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
+			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
 						RelationGetRelationName(vs->index), off, blk,
 						entry->hash, hash);
 
-		if (rbi_bucket_of(hash, nbuckets) != bucket)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u belongs to bucket %u, but was found in bucket %u",
+		if (lion_bucket_of(hash, nbuckets) != bucket)
+			lion_corrupt("lion index \"%s\": entry %u on block %u belongs to bucket %u, but was found in bucket %u",
 						RelationGetRelationName(vs->index), off, blk,
-						rbi_bucket_of(hash, nbuckets), bucket);
+						lion_bucket_of(hash, nbuckets), bucket);
 	}
 
-	if (itemsz < RBIEntryPayloadOffset(entry))
-		rbi_corrupt("roaring index \"%s\": entry %u on block %u is %zu bytes, too small for its %u byte key",
+	if (itemsz < LionEntryPayloadOffset(entry))
+		lion_corrupt("lion index \"%s\": entry %u on block %u is %zu bytes, too small for its %u byte key",
 					RelationGetRelationName(vs->index), off, blk, itemsz,
 					entry->keylen);
 
-	if (kind == RBI_ENTRY_INLINE)
+	if (kind == LION_ENTRY_INLINE)
 	{
-		Size		paylen = RBI_ENTRY_PAYLOAD_LEN(entry, itemsz);
+		Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
 		Size		cur = 0;
 		Size		csize;
 		bool		haveprev = false;
@@ -750,37 +750,37 @@ rbi_verify_entry(RBIVerifyState *vs, uint32 bucket, BlockNumber blk,
 		uint32		ncontainers = 0;
 
 		if (BlockNumberIsValid(entry->head) || BlockNumberIsValid(entry->tail))
-			rbi_corrupt("roaring index \"%s\": inline entry %u on block %u has head %u and tail %u, expected none",
+			lion_corrupt("lion index \"%s\": inline entry %u on block %u has head %u and tail %u, expected none",
 						RelationGetRelationName(vs->index), off, blk,
 						entry->head, entry->tail);
 
-		while ((csize = rbi_inline_fetch(RBIEntryGetPayload(entry), paylen,
+		while ((csize = lion_inline_fetch(LionEntryGetPayload(entry), paylen,
 										 &cur, vs->cbuf)) > 0)
 		{
-			rbi_verify_container(vs, blk, off, vs->cbuf, csize,
+			lion_verify_container(vs, blk, off, vs->cbuf, csize,
 								 &haveprev, &prevckey);
 			card += vs->cbuf->cardinality;
 			ncontainers++;
 		}
 
 		if (card != entry->ntids)
-			rbi_corrupt("roaring index \"%s\": inline entry %u on block %u claims " UINT64_FORMAT " TIDs, but its payload holds " UINT64_FORMAT,
+			lion_corrupt("lion index \"%s\": inline entry %u on block %u claims " UINT64_FORMAT " TIDs, but its payload holds " UINT64_FORMAT,
 						RelationGetRelationName(vs->index), off, blk,
 						entry->ntids, card);
 
 		if (ncontainers != entry->ncontainers)
-			rbi_corrupt("roaring index \"%s\": inline entry %u on block %u claims %u containers, but its payload holds %u",
+			lion_corrupt("lion index \"%s\": inline entry %u on block %u claims %u containers, but its payload holds %u",
 						RelationGetRelationName(vs->index), off, blk,
 						entry->ncontainers, ncontainers);
 	}
 	else
 	{
-		if (itemsz != RBIEntryPayloadOffset(entry))
-			rbi_corrupt("roaring index \"%s\": chain entry %u on block %u is %zu bytes, expected %zu",
+		if (itemsz != LionEntryPayloadOffset(entry))
+			lion_corrupt("lion index \"%s\": chain entry %u on block %u is %zu bytes, expected %zu",
 						RelationGetRelationName(vs->index), off, blk, itemsz,
-						RBIEntryPayloadOffset(entry));
+						LionEntryPayloadOffset(entry));
 
-		rbi_verify_chain(vs, blk, off, entry);
+		lion_verify_chain(vs, blk, off, entry);
 	}
 }
 
@@ -788,16 +788,16 @@ rbi_verify_entry(RBIVerifyState *vs, uint32 bucket, BlockNumber blk,
  * Check one bucket: its chain of bucket pages and every entry on them.
  */
 static void
-rbi_verify_bucket(RBIVerifyState *vs, uint32 bucket)
+lion_verify_bucket(LionVerifyState *vs, uint32 bucket)
 {
-	BlockNumber headblk = RBI_BUCKET_BLKNO(bucket);
+	BlockNumber headblk = LION_BUCKET_BLKNO(bucket);
 	Buffer		headbuf;
 	Buffer		curbuf;
 	Page		page;
 	BlockNumber blk = headblk;
 
-	rbi_verify_visit(vs, headblk, "a bucket head");
-	page = rbi_verify_read_page(vs, headblk, RBI_PAGE_BUCKET, &headbuf);
+	lion_verify_visit(vs, headblk, "a bucket head");
+	page = lion_verify_read_page(vs, headblk, LION_PAGE_BUCKET, &headbuf);
 	curbuf = headbuf;
 
 	for (;;)
@@ -813,19 +813,19 @@ rbi_verify_bucket(RBIVerifyState *vs, uint32 bucket)
 			if (!ItemIdIsUsed(iid))
 				continue;
 
-			rbi_verify_entry(vs, bucket, blk, off, iid, page);
+			lion_verify_entry(vs, bucket, blk, off, iid, page);
 			CHECK_FOR_INTERRUPTS();
 		}
 
-		next = RBIPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(next))
 			break;
 
-		rbi_verify_visit(vs, next, "a bucket chain");
+		lion_verify_visit(vs, next, "a bucket chain");
 		{
 			Buffer		nextbuf;
 
-			page = rbi_verify_read_page(vs, next, RBI_PAGE_BUCKET, &nextbuf);
+			page = lion_verify_read_page(vs, next, LION_PAGE_BUCKET, &nextbuf);
 			if (curbuf != headbuf)
 				UnlockReleaseBuffer(curbuf);
 			curbuf = nextbuf;
@@ -842,52 +842,52 @@ rbi_verify_bucket(RBIVerifyState *vs, uint32 bucket)
  * Check the meta page.
  */
 static void
-rbi_verify_meta(RBIVerifyState *vs)
+lion_verify_meta(LionVerifyState *vs)
 {
 	Buffer		buf;
 	Page		page;
-	RBIMetaPageData *meta;
+	LionMetaPageData *meta;
 
-	rbi_verify_visit(vs, RBI_METAPAGE_BLKNO, "the meta page");
-	page = rbi_verify_read_page(vs, RBI_METAPAGE_BLKNO, RBI_PAGE_META, &buf);
-	meta = RBIPageGetMeta(page);
+	lion_verify_visit(vs, LION_METAPAGE_BLKNO, "the meta page");
+	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
+	meta = LionPageGetMeta(page);
 
-	if (meta->magic != RBI_MAGIC || meta->version != RBI_VERSION)
-		rbi_corrupt("roaring index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION)
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, RBI_MAGIC, RBI_VERSION);
+					meta->version, LION_MAGIC, LION_VERSION);
 
-	if (meta->offset_bits != RBI_OFFSET_BITS ||
-		meta->container_bits != RBI_CONTAINER_BITS)
-		rbi_corrupt("roaring index \"%s\": meta page has offset_bits %u and container_bits %u, expected %d and %d",
+	if (meta->offset_bits != LION_OFFSET_BITS ||
+		meta->container_bits != LION_CONTAINER_BITS)
+		lion_corrupt("lion index \"%s\": meta page has offset_bits %u and container_bits %u, expected %d and %d",
 					RelationGetRelationName(vs->index), meta->offset_bits,
-					meta->container_bits, RBI_OFFSET_BITS, RBI_CONTAINER_BITS);
+					meta->container_bits, LION_OFFSET_BITS, LION_CONTAINER_BITS);
 
-	if (meta->nbuckets == 0 || meta->nbuckets > RBI_MAX_BUCKETS)
-		rbi_corrupt("roaring index \"%s\": meta page has %u buckets, expected 1 .. %d",
+	if (meta->nbuckets == 0 || meta->nbuckets > LION_MAX_BUCKETS)
+		lion_corrupt("lion index \"%s\": meta page has %u buckets, expected 1 .. %d",
 					RelationGetRelationName(vs->index), meta->nbuckets,
-					RBI_MAX_BUCKETS);
+					LION_MAX_BUCKETS);
 
-	if (meta->inline_limit < RBI_MIN_INLINE_LIMIT ||
-		meta->inline_limit > RBI_MAX_INLINE_LIMIT)
-		rbi_corrupt("roaring index \"%s\": meta page has inline_limit %u, expected %d .. %d",
+	if (meta->inline_limit < LION_MIN_INLINE_LIMIT ||
+		meta->inline_limit > LION_MAX_INLINE_LIMIT)
+		lion_corrupt("lion index \"%s\": meta page has inline_limit %u, expected %d .. %d",
 					RelationGetRelationName(vs->index), meta->inline_limit,
-					RBI_MIN_INLINE_LIMIT, RBI_MAX_INLINE_LIMIT);
+					LION_MIN_INLINE_LIMIT, LION_MAX_INLINE_LIMIT);
 
 	if (meta->nbuckets != vs->state->meta.nbuckets)
-		rbi_corrupt("roaring index \"%s\": meta page has %u buckets, but the cached state has %u",
+		lion_corrupt("lion index \"%s\": meta page has %u buckets, but the cached state has %u",
 					RelationGetRelationName(vs->index), meta->nbuckets,
 					vs->state->meta.nbuckets);
 
 	if (vs->nblocks < 1 + meta->nbuckets)
-		rbi_corrupt("roaring index \"%s\": %u blocks are too few for a meta page and %u buckets",
+		lion_corrupt("lion index \"%s\": %u blocks are too few for a meta page and %u buckets",
 					RelationGetRelationName(vs->index), vs->nblocks,
 					meta->nbuckets);
 
-	if (RBIPageGetOpaque(page)->rightlink != InvalidBlockNumber)
-		rbi_corrupt("roaring index \"%s\": the meta page has a right link to block %u",
+	if (LionPageGetOpaque(page)->rightlink != InvalidBlockNumber)
+		lion_corrupt("lion index \"%s\": the meta page has a right link to block %u",
 					RelationGetRelationName(vs->index),
-					RBIPageGetOpaque(page)->rightlink);
+					LionPageGetOpaque(page)->rightlink);
 
 	UnlockReleaseBuffer(buf);
 }
@@ -903,7 +903,7 @@ rbi_verify_meta(RBIVerifyState *vs)
  * container page (a multi-page spill that did not reach its entry update).
  */
 static void
-rbi_verify_reachable(RBIVerifyState *vs)
+lion_verify_reachable(LionVerifyState *vs)
 {
 	BlockNumber blk;
 
@@ -921,19 +921,19 @@ rbi_verify_reachable(RBIVerifyState *vs)
 		page = BufferGetPage(buf);
 
 		leaked = PageIsNew(page) ||
-			(PageGetSpecialSize(page) == RBI_SPECIAL_SIZE &&
-			 RBIPageGetOpaque(page)->page_id == RBI_PAGE_ID &&
-			 RBIPageIsContainer(page) &&
+			(PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+			 LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
+			 LionPageIsContainer(page) &&
 			 PageGetMaxOffsetNumber(page) == 0);
 
 		UnlockReleaseBuffer(buf);
 
 		if (!leaked)
-			rbi_corrupt("roaring index \"%s\": block %u is not reachable from the meta page",
+			lion_corrupt("lion index \"%s\": block %u is not reachable from the meta page",
 						RelationGetRelationName(vs->index), blk);
 
 		ereport(WARNING,
-				(errmsg("roaring index \"%s\": block %u is unused and unreachable",
+				(errmsg("lion index \"%s\": block %u is unused and unreachable",
 						RelationGetRelationName(vs->index), blk),
 				 errdetail("An interrupted page allocation leaks blocks; they are never reused in this version.")));
 	}
@@ -948,51 +948,51 @@ rbi_verify_reachable(RBIVerifyState *vs)
  * named by reservedflag when there is one (DESIGN.md §14 and §17)?
  */
 static bool
-rbi_verify_tid_present(RBIVerifyState *vs, Datum key, uint16 reservedflag,
+lion_verify_tid_present(LionVerifyState *vs, Datum key, uint16 reservedflag,
 					   uint32 hash, uint32 ckey, uint16 lo)
 {
 	Relation	index = vs->index;
-	RBIState   *state = vs->state;
+	LionState   *state = vs->state;
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	bool		present = false;
 
 	headbuf = ReadBuffer(index,
-						 RBI_BUCKET_BLKNO(rbi_bucket_of(hash,
+						 LION_BUCKET_BLKNO(lion_bucket_of(hash,
 														state->meta.nbuckets)));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
 	if ((reservedflag != 0) ?
-		rbi_find_reserved_entry(index, headbuf, BUFFER_LOCK_SHARE,
+		lion_find_reserved_entry(index, headbuf, BUFFER_LOCK_SHARE,
 								reservedflag, &entrybuf, &entryoff) :
-		rbi_find_entry(index, state, headbuf, BUFFER_LOCK_SHARE, key, hash,
+		lion_find_entry(index, state, headbuf, BUFFER_LOCK_SHARE, key, hash,
 					   &entrybuf, &entryoff))
 	{
 		Page		page = BufferGetPage(entrybuf);
 		ItemId		iid = PageGetItemId(page, entryoff);
-		RBIEntryTuple *entry = (RBIEntryTuple *) PageGetItem(page, iid);
+		LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 
-		if ((entry->flags & RBI_ENTRY_INLINE) != 0)
+		if ((entry->flags & LION_ENTRY_INLINE) != 0)
 		{
-			Size		paylen = RBI_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+			Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
 			Size		cur = 0;
 
-			while (rbi_inline_fetch(RBIEntryGetPayload(entry), paylen, &cur,
+			while (lion_inline_fetch(LionEntryGetPayload(entry), paylen, &cur,
 									vs->cbuf) > 0)
 			{
-				if (rbi_item_covers(vs->cbuf, ckey))
+				if (lion_item_covers(vs->cbuf, ckey))
 				{
-					present = rbi_item_contains(vs->cbuf, ckey, lo);
+					present = lion_item_contains(vs->cbuf, ckey, lo);
 					break;
 				}
-				if (rbi_item_first_ckey(vs->cbuf) > ckey)
+				if (lion_item_first_ckey(vs->cbuf) > ckey)
 					break;
 			}
 		}
 		else
 		{
-			BlockNumber blk = rbi_chain_find_page(index, entry->head,
+			BlockNumber blk = lion_chain_find_page(index, entry->head,
 												  entry->tail, ckey);
 			Buffer		cbuf;
 			Page		cpage;
@@ -1002,9 +1002,9 @@ rbi_verify_tid_present(RBIVerifyState *vs, Datum key, uint16 reservedflag,
 			cbuf = ReadBuffer(index, blk);
 			LockBuffer(cbuf, BUFFER_LOCK_SHARE);
 			cpage = BufferGetPage(cbuf);
-			off = rbi_page_find_item(cpage, ckey, &found);
+			off = lion_page_find_item(cpage, ckey, &found);
 			if (found)
-				present = rbi_item_contains((RBIContainer *)
+				present = lion_item_contains((LionContainer *)
 											PageGetItem(cpage,
 														PageGetItemId(cpage, off)),
 											ckey, lo);
@@ -1025,14 +1025,14 @@ rbi_verify_tid_present(RBIVerifyState *vs, Datum key, uint16 reservedflag,
  * has to be indexed under its key.
  */
 static void
-rbi_verify_one_key(RBIVerifyState *vs, ItemPointer tid, Datum key,
+lion_verify_one_key(LionVerifyState *vs, ItemPointer tid, Datum key,
 				   uint16 reservedflag, uint64 code)
 {
-	uint32		hash = (reservedflag != 0) ? RBI_NULLKEY_HASH :
-		rbi_hash_key(vs->state, key);
+	uint32		hash = (reservedflag != 0) ? LION_NULLKEY_HASH :
+		lion_hash_key(vs->state, key);
 
-	if (rbi_verify_tid_present(vs, key, reservedflag, hash,
-							   rbi_code_ckey(code), rbi_code_lo(code)))
+	if (lion_verify_tid_present(vs, key, reservedflag, hash,
+							   lion_code_ckey(code), lion_code_lo(code)))
 		return;
 
 	ereport(ERROR,
@@ -1043,30 +1043,30 @@ rbi_verify_one_key(RBIVerifyState *vs, ItemPointer tid, Datum key,
 					RelationGetRelationName(vs->heap),
 					RelationGetRelationName(vs->index)),
 			 errdetail("The tuple's key is %s.",
-					   (reservedflag == RBI_ENTRY_NULLKEY) ? "NULL" :
-					   (reservedflag == RBI_ENTRY_EMPTYKEY) ? "absent" :
+					   (reservedflag == LION_ENTRY_NULLKEY) ? "NULL" :
+					   (reservedflag == LION_ENTRY_EMPTYKEY) ? "absent" :
 					   OidOutputFunctionCall(vs->keyoutfunc, key))));
 }
 
 static void
-rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
+lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 						 bool *isnull, bool tupleIsAlive, void *arg)
 {
-	RBIVerifyState *vs = (RBIVerifyState *) arg;
-	RBIState   *state = vs->state;
+	LionVerifyState *vs = (LionVerifyState *) arg;
+	LionState   *state = vs->state;
 	MemoryContext oldcxt;
 	Datum		key;
 	uint64		code;
 
 	oldcxt = MemoryContextSwitchTo(vs->heapcxt);
 
-	rbi_check_key_offset(tid);
-	code = rbi_tid_to_code(tid);
+	lion_check_key_offset(tid);
+	code = lion_tid_to_code(tid);
 
 	if (isnull[0])
 	{
 		/* NULL values live in the reserved entry of bucket 0 (DESIGN.md §14). */
-		rbi_verify_one_key(vs, tid, (Datum) 0, RBI_ENTRY_NULLKEY, code);
+		lion_verify_one_key(vs, tid, (Datum) 0, LION_ENTRY_NULLKEY, code);
 	}
 	else if (state->multikey)
 	{
@@ -1078,13 +1078,13 @@ rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 		 * make, so a row that is missing under one of several keys is found.
 		 */
 		Datum	   *keys;
-		int			nkeys = rbi_extract_value(state, values[0], &keys);
+		int			nkeys = lion_extract_value(state, values[0], &keys);
 		int			i;
 
 		if (nkeys == 0)
-			rbi_verify_one_key(vs, tid, (Datum) 0, RBI_ENTRY_EMPTYKEY, code);
+			lion_verify_one_key(vs, tid, (Datum) 0, LION_ENTRY_EMPTYKEY, code);
 		for (i = 0; i < nkeys; i++)
-			rbi_verify_one_key(vs, tid, keys[i], 0, code);
+			lion_verify_one_key(vs, tid, keys[i], 0, code);
 	}
 	else
 	{
@@ -1092,7 +1092,7 @@ rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 		if (!state->typbyval && state->typlen == -1)
 			key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-		rbi_verify_one_key(vs, tid, key, 0, code);
+		lion_verify_one_key(vs, tid, key, 0, code);
 	}
 
 	vs->nheaptuples++;
@@ -1106,7 +1106,7 @@ rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
  * is in the index, the way contrib/amcheck does for its heapallindexed check.
  */
 static void
-rbi_verify_heapallindexed(RBIVerifyState *vs)
+lion_verify_heapallindexed(LionVerifyState *vs)
 {
 	IndexInfo  *indexinfo = BuildIndexInfo(vs->index);
 	TableScanDesc scan;
@@ -1116,7 +1116,7 @@ rbi_verify_heapallindexed(RBIVerifyState *vs)
 	getTypeOutputInfo(vs->state->typid, &vs->keyoutfunc, &typisvarlena);
 
 	vs->heapcxt = AllocSetContextCreate(CurrentMemoryContext,
-										"roaring index verify heap tuple",
+										"lion index verify heap tuple",
 										ALLOCSET_DEFAULT_SIZES);
 
 	snapshot = RegisterSnapshot(GetTransactionSnapshot());
@@ -1126,12 +1126,12 @@ rbi_verify_heapallindexed(RBIVerifyState *vs)
 	 * an old transaction snapshot may predate the index's indcheckxmin
 	 * horizon, in which case it is not safe to use.  That test - and the
 	 * validity/readiness tests next to it - are the planner's, shared with
-	 * the SQL count functions in rbi_index_usable().
+	 * the SQL count functions in lion_index_usable().
 	 */
 	{
 		const char *why;
 
-		if (!rbi_index_usable(vs->index, snapshot, &why))
+		if (!lion_index_usable(vs->index, snapshot, &why))
 		{
 			UnregisterSnapshot(snapshot);
 			ereport(ERROR,
@@ -1157,7 +1157,7 @@ rbi_verify_heapallindexed(RBIVerifyState *vs)
 	scan = table_beginscan_strat(vs->heap, snapshot, 0, NULL, true, true);
 
 	table_index_build_scan(vs->heap, vs->index, indexinfo, true, false,
-						   rbi_verify_heap_callback, (void *) vs, scan);
+						   lion_verify_heap_callback, (void *) vs, scan);
 
 	UnregisterSnapshot(snapshot);
 	MemoryContextDelete(vs->heapcxt);
@@ -1165,37 +1165,37 @@ rbi_verify_heapallindexed(RBIVerifyState *vs)
 }
 
 Datum
-roaring_index_verify(PG_FUNCTION_ARGS)
+lion_index_verify(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	bool		heapallindexed = PG_GETARG_BOOL(1);
-	RBIVerifyState vs;
+	LionVerifyState vs;
 	Oid			heapoid;
 	uint32		b;
 
 	memset(&vs, 0, sizeof(vs));
 
-	vs.index = rbi_open_index(relid, AccessShareLock);
+	vs.index = lion_open_index(relid, AccessShareLock);
 	heapoid = IndexGetRelation(relid, false);
 	vs.heap = table_open(heapoid, AccessShareLock);
 
-	vs.state = rbi_get_state(vs.index);
+	vs.state = lion_get_state(vs.index);
 	vs.nblocks = RelationGetNumberOfBlocks(vs.index);
-	vs.cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.refs = (uint8 *) palloc0(sizeof(uint8) * Max(vs.nblocks, 1));
 
-	rbi_verify_meta(&vs);
+	lion_verify_meta(&vs);
 
 	for (b = 0; b < vs.state->meta.nbuckets; b++)
 	{
-		rbi_verify_bucket(&vs, b);
+		lion_verify_bucket(&vs, b);
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	rbi_verify_reachable(&vs);
+	lion_verify_reachable(&vs);
 
 	if (heapallindexed)
-		rbi_verify_heapallindexed(&vs);
+		lion_verify_heapallindexed(&vs);
 
 	pfree(vs.refs);
 	pfree(vs.cbuf);

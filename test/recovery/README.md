@@ -1,6 +1,6 @@
 # Crash-recovery and hot-standby tests
 
-`roaring_index` writes generic WAL (`GenericXLogStart`/`GenericXLogFinish`,
+`pg_lion` writes generic WAL (`GenericXLogStart`/`GenericXLogFinish`,
 DESIGN.md §4–§5), and the count path treats a standby specially: in recovery
 the pin interlock of §9 does not hold, so the count trusts the visibility map
 for nothing and rechecks every candidate TID. Neither of those had an
@@ -29,7 +29,7 @@ with `src/*.o` removed — and installed into that prefix, exactly as
 the source tree.
 
 The run creates two clusters of its own under
-`/tmp/claude-1000/rbi_recovery`, on the private socket directory
+`/tmp/claude-1000/lion_recovery`, on the private socket directory
 `/tmp/claude-1000/pgsk_rec` and ports 54340 (primary) and 54341 (standby),
 with `listen_addresses = ''`. It refuses to start if anything already listens
 there, checks `SHOW data_directory` against the directory it asked for before
@@ -38,9 +38,9 @@ trusting a connection, and removes both clusters through an exit trap
 the benchmark clusters.
 
 One caveat about that prefix: it is shared. The run installs
-`roaring_index.so` into it and then starts a cluster that loads it, so another
+`pg_lion.so` into it and then starts a cluster that loads it, so another
 process running `make install` against the same prefix in that window will
-have its build tested instead of yours. That shows up as `roaring_index_verify`
+have its build tested instead of yours. That shows up as `lion_index_verify`
 failing in the *baseline* check, before any crash has happened — a failure
 there is a reason to check who else is installing into the prefix, not a
 recovery bug. Every failure after the baseline is about recovery.
@@ -71,7 +71,7 @@ directions.
 The fixture is a table with one column per operator class kind — `int4`,
 `text`, `citext`, `bool`, a nullable `int4`, `int4[]` (with `NULL`, `'{}'` and
 all-`NULL`-element rows) and `tsvector` (with `NULL` and empty rows) — so both
-reserved key-less entries are populated. Three of the seven roaring indexes
+reserved key-less entries are populated. Three of the seven lion indexes
 are created on the empty table and filled by `aminsert`, so their entries go
 through INLINE→CHAIN spills, sparse-segment promotions and container-page
 splits under WAL; four are built by `ambuild` after the load.
@@ -106,10 +106,10 @@ finish a half-applied two-pass bulkdelete. After every restart:
   shut down and must print `redo starts at`, and `pg_waldump -r Generic` over
   the replayed range must have found generic records. A round that replayed
   nothing fails the run instead of passing silently.
-* `roaring_index_verify(idx, true)` on all seven indexes — structure plus
+* `lion_index_verify(idx, true)` on all seven indexes — structure plus
   every heap tuple present under every key it extracts to.
 * every single-key probe counted four ways — forced index path, forced
-  sequential scan with no index path at all, `roaring_index_count()`, and the
+  sequential scan with no index path at all, `lion_index_count()`, and the
   count pushdown — must give the same number. 19 probes, including absent
   keys, a lower-case `citext` key against mixed-case data, and both `bool`
   values.
@@ -117,7 +117,7 @@ finish a half-applied two-pass bulkdelete. After every restart:
   group, the `IS NULL` and `IS NOT NULL` pushdown drivers, `@>`, `&&` and `@@`
   — compared between the index path and a forced sequential scan as multisets,
   `EXCEPT ALL` in both directions.
-* `roaring_index_stats().ntids` against the heap: `>=` immediately after
+* `lion_index_stats().ntids` against the heap: `>=` immediately after
   recovery (the index may still hold TIDs of dead tuples), and exactly equal
   after a `VACUUM`. For the two multi-key indexes the expected total is the
   number of (key, row) pairs, with one pair for a row that extracted no keys.
@@ -127,13 +127,13 @@ finish a half-applied two-pass bulkdelete. After every restart:
 **Phase 2, hot standby.** `pg_basebackup -R -X stream` into a standby, then:
 
 * the full phase-1 check battery again, in recovery.
-* `roaring_index_count_stats()` for every single-key probe must show
+* `lion_index_count_stats()` for every single-key probe must show
   `blocks_skipped = 0` and `tids_rechecked = count` — §9's rule that a standby
   never trusts the visibility map. On the primary the same probes must show
   the opposite (blocks skipped via the map), or the standby assertion would be
   vacuously true.
 * a line-per-probe picture of everything the index answers — each key count
-  through `roaring_index_count()`, each multi-row query through the pushdown,
+  through `lion_index_count()`, each multi-row query through the pushdown,
   with the plan node that answered it — must be byte-identical between primary
   and standby. Comparing the node too means a standby that quietly stopped
   using the pushdown is a failure rather than a silently weaker test.
@@ -148,11 +148,11 @@ finish a half-applied two-pass bulkdelete. After every restart:
   reachable: the only legal outcomes are the same number again or a cancelled
   session with `conflict with recovery` on stderr. A *different* number fails
   the run. Afterwards, once the standby has caught up, a fresh session must
-  see the new count, through `roaring_index_count()` and through a sequential
+  see the new count, through `lion_index_count()` and through a sequential
   scan.
-* `pg_ctl promote`, then `roaring_index_verify(idx, true)` and the whole
+* `pg_ctl promote`, then `lion_index_verify(idx, true)` and the whole
   battery again on the promoted node, exact `ntids` after a `VACUUM`, and
-  `roaring_index_count_stats()` showing it trusting the visibility map again.
+  `lion_index_count_stats()` showing it trusting the visibility map again.
 
 ## What is not covered
 
@@ -176,7 +176,7 @@ finish a half-applied two-pass bulkdelete. After every restart:
   tests a cascading standby, a restart from an archive, `pg_rewind`, or a
   timeline switch other than the one `pg_ctl promote` makes.
 * **No unlogged or temporary indexes.** `test/sql/unlogged.sql` covers what an
-  unlogged roaring index does; recovery truncates it, so there is nothing to
+  unlogged lion index does; recovery truncates it, so there is nothing to
   check here.
 * **No concurrent readers during the crash.** The writers are killed; nobody
   is mid-scan. The interlock between readers and VACUUM is what

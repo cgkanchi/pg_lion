@@ -28,15 +28,15 @@
 
 BEGIN;
 
-SELECT nextval('rbi_rec_ins') AS i1,
-	   nextval('rbi_rec_ins') AS i2,
-	   nextval('rbi_rec_ins') AS i3 \gset
+SELECT nextval('lion_rec_ins') AS i1,
+	   nextval('lion_rec_ins') AS i2,
+	   nextval('lion_rec_ins') AS i3 \gset
 
-INSERT INTO rbi_rec SELECT g.* FROM rbi_rec_gen(:client_id + 8 * :i1) g;
+INSERT INTO lion_rec SELECT g.* FROM lion_rec_gen(:client_id + 8 * :i1) g;
 
 -- Every indexed column of the new row changes, including the array and the
 -- tsvector, so the multi-key entries and both reserved entries move too.
-UPDATE rbi_rec
+UPDATE lion_rec
    SET k4  = (k4 + 7) % 200,
 	   t   = 'v' || ((k4 * 7 + 11) % 3000),
 	   ct  = ('Mix' || ((k4 + 3) % 40))::citext,
@@ -50,14 +50,14 @@ UPDATE rbi_rec
 				  ELSE tsv || to_tsvector('simple', 'w' || (k4 % 41)) END
  WHERE id = :client_id + 8 * :i1;
 
-INSERT INTO rbi_rec SELECT g.* FROM rbi_rec_gen(:client_id + 8 * :i2) g;
-INSERT INTO rbi_rec SELECT g.* FROM rbi_rec_gen(:client_id + 8 * :i3) g;
+INSERT INTO lion_rec SELECT g.* FROM lion_rec_gen(:client_id + 8 * :i2) g;
+INSERT INTO lion_rec SELECT g.* FROM lion_rec_gen(:client_id + 8 * :i3) g;
 
 -- A short primary-key range, so the cost is bounded even when the range is
 -- full of index entries for rows that have already been deleted.  Roughly half
 -- the windows are empty; the update above is the one that churns every index
 -- on every transaction.
-UPDATE rbi_rec
+UPDATE lion_rec
    SET b = NOT b,
 	   t = 'v' || ((k4 * 13 + 5) % 3000),
 	   nn = CASE WHEN nn IS NULL THEN 0 ELSE (nn + 1) % 30 END
@@ -66,8 +66,8 @@ UPDATE rbi_rec
 -- Exactly three rows, and always rows that exist: an ordered primary-key scan
 -- from the low end, which needs no bookkeeping that a crash could desynchronise
 -- from the table.
-DELETE FROM rbi_rec
- WHERE id IN (SELECT id FROM rbi_rec
+DELETE FROM lion_rec
+ WHERE id IN (SELECT id FROM lion_rec
 			   WHERE id % 8 = :client_id ORDER BY id LIMIT 3);
 
 END;

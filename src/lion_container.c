@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
- * rbi_container.c
- *	  Roaring-style containers for roaring_index.  See DESIGN.md §3.
+ * lion_container.c
+ *	  Roaring-style containers for pg_lion.  See DESIGN.md §3.
  *
  *	  Three representations of a set of 15-bit "lo" values:
  *
@@ -16,19 +16,19 @@
  *														=> BITSET
  *		- removing from a BITSET leaving <= 2048 members	=> ARRAY
  *
- *	  rbi_container_optimize() is the only function that searches for the
+ *	  lion_container_optimize() is the only function that searches for the
  *	  globally smallest representation.
  *
  *	  This file depends only on c.h, port/pg_bitutils.h and the project
  *	  headers, so that it also builds standalone with -DFRONTEND for
  *	  test/unit/container_test.c.  No palloc, no elog: invariants are
- *	  Assert()ed and structural damage is reported by rbi_container_check().
+ *	  Assert()ed and structural damage is reported by lion_container_check().
  *-------------------------------------------------------------------------
  */
 /*
- * rbi_container.h pulls in rbi_tid.h, which needs the server's ItemPointer
+ * lion_container.h pulls in lion_tid.h, which needs the server's ItemPointer
  * declarations in a backend build; in a -DFRONTEND build (the unit tests)
- * rbi_tid.h reduces itself to the code/ckey/lo arithmetic and c.h is enough.
+ * lion_tid.h reduces itself to the code/ckey/lo arithmetic and c.h is enough.
  */
 #ifndef FRONTEND
 #include "postgres.h"
@@ -40,25 +40,25 @@
 
 #include "port/pg_bitutils.h"
 
-#include "rbi_container.h"
+#include "lion_container.h"
 
 /* All-ones 64-bit word. */
-#define RBI_ALL_ONES		UINT64CONST(0xFFFFFFFFFFFFFFFF)
+#define LION_ALL_ONES		UINT64CONST(0xFFFFFFFFFFFFFFFF)
 /* Largest legal lo value. */
-#define RBI_LO_MAX			((uint32) (RBI_CONTAINER_RANGE - 1))
+#define LION_LO_MAX			((uint32) (LION_CONTAINER_RANGE - 1))
 /* A size that always loses the "smallest representation" comparison. */
-#define RBI_SIZE_INFEASIBLE	((Size) (RBI_CONTAINER_MAX_SIZE + 1))
+#define LION_SIZE_INFEASIBLE	((Size) (LION_CONTAINER_MAX_SIZE + 1))
 
 /*
  * A work buffer large enough for any container.  The union forces 8-byte
  * alignment so that the bitset payload (offset 8) is aligned as well.
  */
-typedef union RBIContainerBuf
+typedef union LionContainerBuf
 {
-	RBIContainer hdr;
+	LionContainer hdr;
 	uint64		force_align;
-	char		data[RBI_CONTAINER_MAX_SIZE];
-} RBIContainerBuf;
+	char		data[LION_CONTAINER_MAX_SIZE];
+} LionContainerBuf;
 
 
 /* ----------------------------------------------------------------
@@ -67,57 +67,57 @@ typedef union RBIContainerBuf
  */
 
 static inline uint16 *
-array_mdata(RBIContainer *c)
+array_mdata(LionContainer *c)
 {
-	return (uint16 *) ((char *) c + RBI_CONTAINER_HDRSZ);
+	return (uint16 *) ((char *) c + LION_CONTAINER_HDRSZ);
 }
 
 static inline const uint16 *
-array_cdata(const RBIContainer *c)
+array_cdata(const LionContainer *c)
 {
-	return (const uint16 *) ((const char *) c + RBI_CONTAINER_HDRSZ);
+	return (const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
 }
 
 static inline uint64 *
-bitset_mdata(RBIContainer *c)
+bitset_mdata(LionContainer *c)
 {
-	return (uint64 *) ((char *) c + RBI_CONTAINER_HDRSZ);
+	return (uint64 *) ((char *) c + LION_CONTAINER_HDRSZ);
 }
 
 static inline const uint64 *
-bitset_cdata(const RBIContainer *c)
+bitset_cdata(const LionContainer *c)
 {
-	return (const uint64 *) ((const char *) c + RBI_CONTAINER_HDRSZ);
+	return (const uint64 *) ((const char *) c + LION_CONTAINER_HDRSZ);
 }
 
 static inline uint32
-run_nruns(const RBIContainer *c)
+run_nruns(const LionContainer *c)
 {
-	return (uint32) *(const uint16 *) ((const char *) c + RBI_CONTAINER_HDRSZ);
+	return (uint32) *(const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
 }
 
 static inline void
-run_set_nruns(RBIContainer *c, uint32 nruns)
+run_set_nruns(LionContainer *c, uint32 nruns)
 {
-	Assert(nruns <= RBI_RUN_MAX_NRUNS);
-	*(uint16 *) ((char *) c + RBI_CONTAINER_HDRSZ) = (uint16) nruns;
+	Assert(nruns <= LION_RUN_MAX_NRUNS);
+	*(uint16 *) ((char *) c + LION_CONTAINER_HDRSZ) = (uint16) nruns;
 }
 
-static inline RBIRun *
-run_mdata(RBIContainer *c)
+static inline LionRun *
+run_mdata(LionContainer *c)
 {
-	return (RBIRun *) ((char *) c + RBI_CONTAINER_HDRSZ + sizeof(uint16));
+	return (LionRun *) ((char *) c + LION_CONTAINER_HDRSZ + sizeof(uint16));
 }
 
-static inline const RBIRun *
-run_cdata(const RBIContainer *c)
+static inline const LionRun *
+run_cdata(const LionContainer *c)
 {
-	return (const RBIRun *) ((const char *) c + RBI_CONTAINER_HDRSZ + sizeof(uint16));
+	return (const LionRun *) ((const char *) c + LION_CONTAINER_HDRSZ + sizeof(uint16));
 }
 
 /* Last lo value covered by a run. */
 static inline int32
-run_last(const RBIRun *r)
+run_last(const LionRun *r)
 {
 	return (int32) r->start + (int32) r->len_minus_1;
 }
@@ -126,7 +126,7 @@ run_last(const RBIRun *r)
 /* ----------------------------------------------------------------
  *						bitset primitives
  *
- * These all operate on a bare array of RBI_BITSET_WORDS uint64s.
+ * These all operate on a bare array of LION_BITSET_WORDS uint64s.
  * ----------------------------------------------------------------
  */
 
@@ -135,27 +135,27 @@ static inline uint64
 word_mask(uint32 lo, uint32 hi)
 {
 	Assert(lo <= hi && hi < 64);
-	return (RBI_ALL_ONES >> (63 - (hi - lo))) << lo;
+	return (LION_ALL_ONES >> (63 - (hi - lo))) << lo;
 }
 
 static inline bool
 bits_test(const uint64 *w, uint32 lo)
 {
-	Assert(lo <= RBI_LO_MAX);
+	Assert(lo <= LION_LO_MAX);
 	return (w[lo >> 6] & (UINT64CONST(1) << (lo & 63))) != 0;
 }
 
 static inline void
 bits_set(uint64 *w, uint32 lo)
 {
-	Assert(lo <= RBI_LO_MAX);
+	Assert(lo <= LION_LO_MAX);
 	w[lo >> 6] |= UINT64CONST(1) << (lo & 63);
 }
 
 static inline void
 bits_clear(uint64 *w, uint32 lo)
 {
-	Assert(lo <= RBI_LO_MAX);
+	Assert(lo <= LION_LO_MAX);
 	w[lo >> 6] &= ~(UINT64CONST(1) << (lo & 63));
 }
 
@@ -165,7 +165,7 @@ bits_set_range(uint64 *w, uint32 lo, uint32 hi)
 	uint32		wlo = lo >> 6;
 	uint32		whi = hi >> 6;
 
-	Assert(lo <= hi && hi <= RBI_LO_MAX);
+	Assert(lo <= hi && hi <= LION_LO_MAX);
 	if (wlo == whi)
 	{
 		w[wlo] |= word_mask(lo & 63, hi & 63);
@@ -183,7 +183,7 @@ bits_clear_range(uint64 *w, uint32 lo, uint32 hi)
 	uint32		wlo = lo >> 6;
 	uint32		whi = hi >> 6;
 
-	Assert(lo <= hi && hi <= RBI_LO_MAX);
+	Assert(lo <= hi && hi <= LION_LO_MAX);
 	if (wlo == whi)
 	{
 		w[wlo] &= ~word_mask(lo & 63, hi & 63);
@@ -201,7 +201,7 @@ bits_cardinality(const uint64 *w)
 	uint32		n = 0;
 	uint32		i;
 
-	for (i = 0; i < RBI_BITSET_WORDS; i++)
+	for (i = 0; i < LION_BITSET_WORDS; i++)
 		n += (uint32) pg_popcount64(w[i]);
 	return n;
 }
@@ -214,7 +214,7 @@ bits_range_cardinality(const uint64 *w, uint32 lo, uint32 hi)
 	uint32		n;
 	uint32		i;
 
-	Assert(lo <= hi && hi <= RBI_LO_MAX);
+	Assert(lo <= hi && hi <= LION_LO_MAX);
 	if (wlo == whi)
 		return (uint32) pg_popcount64(w[wlo] & word_mask(lo & 63, hi & 63));
 
@@ -236,7 +236,7 @@ bits_count_runs(const uint64 *w)
 	uint64		prev = 0;
 	uint32		i;
 
-	for (i = 0; i < RBI_BITSET_WORDS; i++)
+	for (i = 0; i < LION_BITSET_WORDS; i++)
 	{
 		uint64		cur = w[i];
 
@@ -253,7 +253,7 @@ bits_extract_array(const uint64 *w, uint16 *out)
 	uint32		n = 0;
 	uint32		i;
 
-	for (i = 0; i < RBI_BITSET_WORDS; i++)
+	for (i = 0; i < LION_BITSET_WORDS; i++)
 	{
 		uint64		cur = w[i];
 		uint32		base = i << 6;
@@ -273,14 +273,14 @@ bits_extract_array(const uint64 *w, uint16 *out)
  * the buffer was too small.
  */
 static uint32
-bits_extract_runs(const uint64 *w, RBIRun *out, uint32 maxruns)
+bits_extract_runs(const uint64 *w, LionRun *out, uint32 maxruns)
 {
 	uint32		n = 0;
 	int32		rstart = -1;
 	int32		rprev = -2;
 	uint32		i;
 
-	for (i = 0; i < RBI_BITSET_WORDS; i++)
+	for (i = 0; i < LION_BITSET_WORDS; i++)
 	{
 		uint64		cur = w[i];
 		int32		base = (int32) (i << 6);
@@ -398,7 +398,7 @@ array_gallop(const uint16 *arr, uint32 n, uint32 from, uint32 key)
 
 /* Index of the rightmost run whose start is <= lo, or -1. */
 static int32
-run_locate(const RBIRun *runs, uint32 nruns, uint32 lo)
+run_locate(const LionRun *runs, uint32 nruns, uint32 lo)
 {
 	int32		lo_i = 0;
 	int32		hi_i = (int32) nruns - 1;
@@ -423,20 +423,20 @@ run_locate(const RBIRun *runs, uint32 nruns, uint32 lo)
 /* ----------------------------------------------------------------
  *				container -> bitset image helpers
  *
- * "w" is always a caller-supplied array of RBI_BITSET_WORDS uint64s that does
+ * "w" is always a caller-supplied array of LION_BITSET_WORDS uint64s that does
  * not overlap the container's own payload.
  * ----------------------------------------------------------------
  */
 
 /* w |= c */
 static void
-container_or_bitset(const RBIContainer *c, uint64 *w)
+container_or_bitset(const LionContainer *c, uint64 *w)
 {
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
 
@@ -444,17 +444,17 @@ container_or_bitset(const RBIContainer *c, uint64 *w)
 					bits_set(w, arr[i]);
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				const uint64 *src = bitset_cdata(c);
 
-				for (i = 0; i < RBI_BITSET_WORDS; i++)
+				for (i = 0; i < LION_BITSET_WORDS; i++)
 					w[i] |= src[i];
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
 
 				for (i = 0; i < nruns; i++)
@@ -469,13 +469,13 @@ container_or_bitset(const RBIContainer *c, uint64 *w)
 
 /* w &= ~c */
 static void
-container_andnot_bitset(const RBIContainer *c, uint64 *w)
+container_andnot_bitset(const LionContainer *c, uint64 *w)
 {
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
 
@@ -483,17 +483,17 @@ container_andnot_bitset(const RBIContainer *c, uint64 *w)
 					bits_clear(w, arr[i]);
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				const uint64 *src = bitset_cdata(c);
 
-				for (i = 0; i < RBI_BITSET_WORDS; i++)
+				for (i = 0; i < LION_BITSET_WORDS; i++)
 					w[i] &= ~src[i];
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
 
 				for (i = 0; i < nruns; i++)
@@ -511,23 +511,23 @@ container_andnot_bitset(const RBIContainer *c, uint64 *w)
  * intersect ARRAY operands by probing, without materialising a bitset.
  */
 static void
-container_and_bitset(const RBIContainer *c, uint64 *w)
+container_and_bitset(const LionContainer *c, uint64 *w)
 {
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				const uint64 *src = bitset_cdata(c);
 
-				for (i = 0; i < RBI_BITSET_WORDS; i++)
+				for (i = 0; i < LION_BITSET_WORDS; i++)
 					w[i] &= src[i];
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
 				uint32		prev = 0;
 
@@ -538,8 +538,8 @@ container_and_bitset(const RBIContainer *c, uint64 *w)
 						bits_clear_range(w, prev, (uint32) runs[i].start - 1);
 					prev = (uint32) run_last(&runs[i]) + 1;
 				}
-				if (prev <= RBI_LO_MAX)
-					bits_clear_range(w, prev, RBI_LO_MAX);
+				if (prev <= LION_LO_MAX)
+					bits_clear_range(w, prev, LION_LO_MAX);
 				break;
 			}
 		default:
@@ -550,24 +550,24 @@ container_and_bitset(const RBIContainer *c, uint64 *w)
 
 /* w = c */
 static void
-container_fill_bitset(const RBIContainer *c, uint64 *w)
+container_fill_bitset(const LionContainer *c, uint64 *w)
 {
-	if (c->type == RBI_CT_BITSET)
-		memcpy(w, bitset_cdata(c), RBI_BITSET_BYTES);
+	if (c->type == LION_CT_BITSET)
+		memcpy(w, bitset_cdata(c), LION_BITSET_BYTES);
 	else
 	{
-		memset(w, 0, RBI_BITSET_BYTES);
+		memset(w, 0, LION_BITSET_BYTES);
 		container_or_bitset(c, w);
 	}
 }
 
 /* Number of maximal runs of consecutive members, whatever the type. */
 static uint32
-container_count_runs(const RBIContainer *c)
+container_count_runs(const LionContainer *c)
 {
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
 				uint32		n = c->cardinality;
@@ -579,9 +579,9 @@ container_count_runs(const RBIContainer *c)
 						nruns++;
 				return nruns;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			return bits_count_runs(bitset_cdata(c));
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			return run_nruns(c);
 		default:
 			Assert(false);
@@ -596,42 +596,42 @@ container_count_runs(const RBIContainer *c)
  */
 
 static void
-container_make_bitset(RBIContainer *c)
+container_make_bitset(LionContainer *c)
 {
-	uint64		w[RBI_BITSET_WORDS];
+	uint64		w[LION_BITSET_WORDS];
 
-	if (c->type == RBI_CT_BITSET)
+	if (c->type == LION_CT_BITSET)
 		return;
 	container_fill_bitset(c, w);
-	c->type = RBI_CT_BITSET;
-	memcpy(bitset_mdata(c), w, RBI_BITSET_BYTES);
+	c->type = LION_CT_BITSET;
+	memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
 }
 
 static void
-container_make_array(RBIContainer *c)
+container_make_array(LionContainer *c)
 {
-	uint16		tmp[RBI_ARRAY_MAX_CARD];
+	uint16		tmp[LION_ARRAY_MAX_CARD];
 	uint32		n;
 
-	if (c->type == RBI_CT_ARRAY)
+	if (c->type == LION_CT_ARRAY)
 		return;
-	Assert(c->cardinality <= RBI_ARRAY_MAX_CARD);
-	n = rbi_container_to_array(c, tmp);
+	Assert(c->cardinality <= LION_ARRAY_MAX_CARD);
+	n = lion_container_to_array(c, tmp);
 	Assert(n == c->cardinality);
-	c->type = RBI_CT_ARRAY;
+	c->type = LION_CT_ARRAY;
 	memcpy(array_mdata(c), tmp, (size_t) n * sizeof(uint16));
 }
 
 static void
-container_make_run(RBIContainer *c)
+container_make_run(LionContainer *c)
 {
-	RBIRun		tmp[RBI_RUN_MAX_NRUNS];
+	LionRun		tmp[LION_RUN_MAX_NRUNS];
 	uint32		n;
 
-	if (c->type == RBI_CT_RUN)
+	if (c->type == LION_CT_RUN)
 		return;
-	if (c->type == RBI_CT_BITSET)
-		n = bits_extract_runs(bitset_cdata(c), tmp, RBI_RUN_MAX_NRUNS);
+	if (c->type == LION_CT_BITSET)
+		n = bits_extract_runs(bitset_cdata(c), tmp, LION_RUN_MAX_NRUNS);
 	else
 	{
 		const uint16 *arr = array_cdata(c);
@@ -643,11 +643,11 @@ container_make_run(RBIContainer *c)
 		{
 			if (i > 0 && (uint32) arr[i] == (uint32) arr[i - 1] + 1)
 			{
-				if (n <= RBI_RUN_MAX_NRUNS)
+				if (n <= LION_RUN_MAX_NRUNS)
 					tmp[n - 1].len_minus_1++;
 				continue;
 			}
-			if (n < RBI_RUN_MAX_NRUNS)
+			if (n < LION_RUN_MAX_NRUNS)
 			{
 				tmp[n].start = arr[i];
 				tmp[n].len_minus_1 = 0;
@@ -655,10 +655,10 @@ container_make_run(RBIContainer *c)
 			n++;
 		}
 	}
-	Assert(n <= RBI_RUN_MAX_NRUNS);
-	c->type = RBI_CT_RUN;
+	Assert(n <= LION_RUN_MAX_NRUNS);
+	c->type = LION_CT_RUN;
 	run_set_nruns(c, n);
-	memcpy(run_mdata(c), tmp, (size_t) n * sizeof(RBIRun));
+	memcpy(run_mdata(c), tmp, (size_t) n * sizeof(LionRun));
 }
 
 /*
@@ -666,47 +666,47 @@ container_make_run(RBIContainer *c)
  * members; "w" must not overlap c.  The RUN encoding is kept when the runs
  * still fit, otherwise the smaller of ARRAY (when it is legal) and BITSET is
  * used.  This is the tail of the RUN removal paths, which per DESIGN.md §3
- * must never leave a BITSET holding <= RBI_ARRAY_MAX_CARD members.
+ * must never leave a BITSET holding <= LION_ARRAY_MAX_CARD members.
  */
 static void
-container_rebuild(RBIContainer *c, const uint64 *w, uint32 card)
+container_rebuild(LionContainer *c, const uint64 *w, uint32 card)
 {
 	uint32		nruns;
 
-	Assert(card <= RBI_CONTAINER_RANGE);
+	Assert(card <= LION_CONTAINER_RANGE);
 	c->cardinality = (uint16) card;
 
 	nruns = bits_count_runs(w);
-	if (nruns <= RBI_RUN_MAX_NRUNS)
+	if (nruns <= LION_RUN_MAX_NRUNS)
 	{
-		RBIRun		runs[RBI_RUN_MAX_NRUNS];
-		uint32		n = bits_extract_runs(w, runs, RBI_RUN_MAX_NRUNS);
+		LionRun		runs[LION_RUN_MAX_NRUNS];
+		uint32		n = bits_extract_runs(w, runs, LION_RUN_MAX_NRUNS);
 
 		Assert(n == nruns);
-		c->type = RBI_CT_RUN;
+		c->type = LION_CT_RUN;
 		run_set_nruns(c, n);
-		memcpy(run_mdata(c), runs, (size_t) n * sizeof(RBIRun));
+		memcpy(run_mdata(c), runs, (size_t) n * sizeof(LionRun));
 		return;
 	}
-	if (card <= RBI_ARRAY_MAX_CARD)
+	if (card <= LION_ARRAY_MAX_CARD)
 	{
-		uint16		vals[RBI_ARRAY_MAX_CARD];
+		uint16		vals[LION_ARRAY_MAX_CARD];
 		uint32		n = bits_extract_array(w, vals);
 
 		Assert(n == card);
-		c->type = RBI_CT_ARRAY;
+		c->type = LION_CT_ARRAY;
 		memcpy(array_mdata(c), vals, (size_t) n * sizeof(uint16));
 		return;
 	}
-	c->type = RBI_CT_BITSET;
-	memcpy(bitset_mdata(c), w, RBI_BITSET_BYTES);
+	c->type = LION_CT_BITSET;
+	memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
 }
 
 /* DESIGN.md §3: a BITSET that has shrunk to <= 2048 members becomes an ARRAY. */
 static inline void
-container_shrink_bitset(RBIContainer *c)
+container_shrink_bitset(LionContainer *c)
 {
-	if (c->type == RBI_CT_BITSET && c->cardinality <= RBI_ARRAY_MAX_CARD)
+	if (c->type == LION_CT_BITSET && c->cardinality <= LION_ARRAY_MAX_CARD)
 		container_make_array(c);
 }
 
@@ -717,56 +717,56 @@ container_shrink_bitset(RBIContainer *c)
  */
 
 Size
-rbi_container_size_for(RBIContainerType type, uint32 cardinality, uint32 nruns)
+lion_container_size_for(LionContainerType type, uint32 cardinality, uint32 nruns)
 {
 	switch (type)
 	{
-		case RBI_CT_ARRAY:
-			return RBI_CONTAINER_HDRSZ + (Size) cardinality * sizeof(uint16);
-		case RBI_CT_BITSET:
-			return RBI_CONTAINER_HDRSZ + RBI_BITSET_BYTES;
-		case RBI_CT_RUN:
-			return RBI_CONTAINER_HDRSZ + sizeof(uint16) +
-				(Size) nruns * sizeof(RBIRun);
-		case RBI_CT_SPARSE:
-			/* a segment is not a container: rbi_sparse_size() sizes those */
+		case LION_CT_ARRAY:
+			return LION_CONTAINER_HDRSZ + (Size) cardinality * sizeof(uint16);
+		case LION_CT_BITSET:
+			return LION_CONTAINER_HDRSZ + LION_BITSET_BYTES;
+		case LION_CT_RUN:
+			return LION_CONTAINER_HDRSZ + sizeof(uint16) +
+				(Size) nruns * sizeof(LionRun);
+		case LION_CT_SPARSE:
+			/* a segment is not a container: lion_sparse_size() sizes those */
 			break;
 	}
 	Assert(false);
-	return RBI_CONTAINER_HDRSZ;
+	return LION_CONTAINER_HDRSZ;
 }
 
 Size
-rbi_container_size(const RBIContainer *c)
+lion_container_size(const LionContainer *c)
 {
-	if (c->type == RBI_CT_RUN)
-		return rbi_container_size_for(RBI_CT_RUN, c->cardinality, run_nruns(c));
-	return rbi_container_size_for((RBIContainerType) c->type, c->cardinality, 0);
+	if (c->type == LION_CT_RUN)
+		return lion_container_size_for(LION_CT_RUN, c->cardinality, run_nruns(c));
+	return lion_container_size_for((LionContainerType) c->type, c->cardinality, 0);
 }
 
 void
-rbi_container_init(RBIContainer *c, uint32 ckey)
+lion_container_init(LionContainer *c, uint32 ckey)
 {
 	c->ckey = ckey;
 	c->cardinality = 0;
-	c->type = RBI_CT_ARRAY;
+	c->type = LION_CT_ARRAY;
 	c->flags = 0;
 }
 
 uint32
-rbi_container_cardinality(const RBIContainer *c)
+lion_container_cardinality(const LionContainer *c)
 {
 	return c->cardinality;
 }
 
 bool
-rbi_container_contains(const RBIContainer *c, uint16 lo)
+lion_container_contains(const LionContainer *c, uint16 lo)
 {
-	Assert((uint32) lo <= RBI_LO_MAX);
+	Assert((uint32) lo <= LION_LO_MAX);
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
 				uint32		n = c->cardinality;
@@ -774,11 +774,11 @@ rbi_container_contains(const RBIContainer *c, uint16 lo)
 
 				return pos < n && arr[pos] == lo;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			return bits_test(bitset_cdata(c), lo);
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				int32		idx = run_locate(runs, run_nruns(c), lo);
 
 				return idx >= 0 && (int32) lo <= run_last(&runs[idx]);
@@ -790,26 +790,26 @@ rbi_container_contains(const RBIContainer *c, uint16 lo)
 }
 
 void
-rbi_container_to_bitset(RBIContainer *c)
+lion_container_to_bitset(LionContainer *c)
 {
 	container_make_bitset(c);
 }
 
 void
-rbi_container_optimize(RBIContainer *c)
+lion_container_optimize(LionContainer *c)
 {
 	uint32		card = c->cardinality;
 	uint32		nruns = container_count_runs(c);
 	Size		asz;
 	Size		rsz;
-	Size		bsz = rbi_container_size_for(RBI_CT_BITSET, card, 0);
+	Size		bsz = lion_container_size_for(LION_CT_BITSET, card, 0);
 
-	asz = (card <= RBI_ARRAY_MAX_CARD)
-		? rbi_container_size_for(RBI_CT_ARRAY, card, 0)
-		: RBI_SIZE_INFEASIBLE;
-	rsz = (nruns <= RBI_RUN_MAX_NRUNS)
-		? rbi_container_size_for(RBI_CT_RUN, card, nruns)
-		: RBI_SIZE_INFEASIBLE;
+	asz = (card <= LION_ARRAY_MAX_CARD)
+		? lion_container_size_for(LION_CT_ARRAY, card, 0)
+		: LION_SIZE_INFEASIBLE;
+	rsz = (nruns <= LION_RUN_MAX_NRUNS)
+		? lion_container_size_for(LION_CT_RUN, card, nruns)
+		: LION_SIZE_INFEASIBLE;
 
 	/* ties prefer ARRAY, then RUN, then BITSET */
 	if (asz <= rsz && asz <= bsz)
@@ -819,7 +819,7 @@ rbi_container_optimize(RBIContainer *c)
 	else
 		container_make_bitset(c);
 
-	Assert(rbi_container_size(c) <= RBI_CONTAINER_MAX_SIZE);
+	Assert(lion_container_size(c) <= LION_CONTAINER_MAX_SIZE);
 }
 
 
@@ -829,9 +829,9 @@ rbi_container_optimize(RBIContainer *c)
  */
 
 static bool
-run_add(RBIContainer *c, uint32 lo)
+run_add(LionContainer *c, uint32 lo)
 {
-	RBIRun	   *runs = run_mdata(c);
+	LionRun	   *runs = run_mdata(c);
 	int32		nruns = (int32) run_nruns(c);
 	int32		idx = run_locate(runs, (uint32) nruns, lo);
 	int32		v = (int32) lo;
@@ -852,7 +852,7 @@ run_add(RBIContainer *c, uint32 lo)
 				runs[idx].len_minus_1 = (uint16)
 					(run_last(&runs[idx + 1]) - (int32) runs[idx].start);
 				memmove(&runs[idx + 1], &runs[idx + 2],
-						(size_t) (nruns - idx - 2) * sizeof(RBIRun));
+						(size_t) (nruns - idx - 2) * sizeof(LionRun));
 				run_set_nruns(c, (uint32) (nruns - 1));
 			}
 			c->cardinality++;
@@ -870,7 +870,7 @@ run_add(RBIContainer *c, uint32 lo)
 	}
 
 	/* a brand new one-element run is needed */
-	if (nruns >= (int32) RBI_RUN_MAX_NRUNS)
+	if (nruns >= (int32) LION_RUN_MAX_NRUNS)
 	{
 		container_make_bitset(c);
 		bits_set(bitset_mdata(c), lo);
@@ -878,7 +878,7 @@ run_add(RBIContainer *c, uint32 lo)
 		return true;
 	}
 	memmove(&runs[idx + 2], &runs[idx + 1],
-			(size_t) (nruns - idx - 1) * sizeof(RBIRun));
+			(size_t) (nruns - idx - 1) * sizeof(LionRun));
 	runs[idx + 1].start = (uint16) v;
 	runs[idx + 1].len_minus_1 = 0;
 	run_set_nruns(c, (uint32) (nruns + 1));
@@ -887,9 +887,9 @@ run_add(RBIContainer *c, uint32 lo)
 }
 
 static bool
-run_remove(RBIContainer *c, uint32 lo)
+run_remove(LionContainer *c, uint32 lo)
 {
-	RBIRun	   *runs = run_mdata(c);
+	LionRun	   *runs = run_mdata(c);
 	int32		nruns = (int32) run_nruns(c);
 	int32		idx = run_locate(runs, (uint32) nruns, lo);
 	int32		v = (int32) lo;
@@ -907,7 +907,7 @@ run_remove(RBIContainer *c, uint32 lo)
 	{
 		/* the whole run disappears */
 		memmove(&runs[idx], &runs[idx + 1],
-				(size_t) (nruns - idx - 1) * sizeof(RBIRun));
+				(size_t) (nruns - idx - 1) * sizeof(LionRun));
 		run_set_nruns(c, (uint32) (nruns - 1));
 	}
 	else if (v == start)
@@ -922,7 +922,7 @@ run_remove(RBIContainer *c, uint32 lo)
 	else
 	{
 		/* the run splits in two */
-		if (nruns >= (int32) RBI_RUN_MAX_NRUNS)
+		if (nruns >= (int32) LION_RUN_MAX_NRUNS)
 		{
 			container_make_bitset(c);
 			bits_clear(bitset_mdata(c), lo);
@@ -931,7 +931,7 @@ run_remove(RBIContainer *c, uint32 lo)
 			return true;
 		}
 		memmove(&runs[idx + 2], &runs[idx + 1],
-				(size_t) (nruns - idx - 1) * sizeof(RBIRun));
+				(size_t) (nruns - idx - 1) * sizeof(LionRun));
 		runs[idx].len_minus_1 = (uint16) (v - 1 - start);
 		runs[idx + 1].start = (uint16) (v + 1);
 		runs[idx + 1].len_minus_1 = (uint16) (last - v - 1);
@@ -942,13 +942,13 @@ run_remove(RBIContainer *c, uint32 lo)
 }
 
 bool
-rbi_container_add(RBIContainer *c, uint16 lo)
+lion_container_add(LionContainer *c, uint16 lo)
 {
-	Assert((uint32) lo <= RBI_LO_MAX);
+	Assert((uint32) lo <= LION_LO_MAX);
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				uint16	   *arr = array_mdata(c);
 				uint32		n = c->cardinality;
@@ -956,7 +956,7 @@ rbi_container_add(RBIContainer *c, uint16 lo)
 
 				if (pos < n && arr[pos] == lo)
 					return false;
-				if (n >= RBI_ARRAY_MAX_CARD)
+				if (n >= LION_ARRAY_MAX_CARD)
 				{
 					container_make_bitset(c);
 					bits_set(bitset_mdata(c), lo);
@@ -969,7 +969,7 @@ rbi_container_add(RBIContainer *c, uint16 lo)
 				c->cardinality++;
 				return true;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				uint64	   *w = bitset_mdata(c);
 
@@ -979,7 +979,7 @@ rbi_container_add(RBIContainer *c, uint16 lo)
 				c->cardinality++;
 				return true;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			return run_add(c, lo);
 		default:
 			Assert(false);
@@ -988,13 +988,13 @@ rbi_container_add(RBIContainer *c, uint16 lo)
 }
 
 bool
-rbi_container_remove(RBIContainer *c, uint16 lo)
+lion_container_remove(LionContainer *c, uint16 lo)
 {
-	Assert((uint32) lo <= RBI_LO_MAX);
+	Assert((uint32) lo <= LION_LO_MAX);
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				uint16	   *arr = array_mdata(c);
 				uint32		n = c->cardinality;
@@ -1007,7 +1007,7 @@ rbi_container_remove(RBIContainer *c, uint16 lo)
 				c->cardinality--;
 				return true;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				uint64	   *w = bitset_mdata(c);
 
@@ -1018,7 +1018,7 @@ rbi_container_remove(RBIContainer *c, uint16 lo)
 				container_shrink_bitset(c);
 				return true;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			return run_remove(c, lo);
 		default:
 			Assert(false);
@@ -1027,17 +1027,17 @@ rbi_container_remove(RBIContainer *c, uint16 lo)
 }
 
 void
-rbi_container_append_sorted(RBIContainer *c, uint16 lo)
+lion_container_append_sorted(LionContainer *c, uint16 lo)
 {
-	Assert((uint32) lo <= RBI_LO_MAX);
+	Assert((uint32) lo <= LION_LO_MAX);
 
-	if (c->type == RBI_CT_ARRAY)
+	if (c->type == LION_CT_ARRAY)
 	{
 		uint16	   *arr = array_mdata(c);
 		uint32		n = c->cardinality;
 
 		Assert(n == 0 || arr[n - 1] < lo);
-		if (n < RBI_ARRAY_MAX_CARD)
+		if (n < LION_ARRAY_MAX_CARD)
 		{
 			arr[n] = lo;
 			c->cardinality = (uint16) (n + 1);
@@ -1046,7 +1046,7 @@ rbi_container_append_sorted(RBIContainer *c, uint16 lo)
 		container_make_bitset(c);
 	}
 
-	if (c->type == RBI_CT_BITSET)
+	if (c->type == LION_CT_BITSET)
 	{
 		uint64	   *w = bitset_mdata(c);
 
@@ -1057,8 +1057,8 @@ rbi_container_append_sorted(RBIContainer *c, uint16 lo)
 	}
 
 	/* A builder never produces a RUN, but stay total if one shows up. */
-	Assert(c->type == RBI_CT_RUN);
-	(void) rbi_container_add(c, lo);
+	Assert(c->type == LION_CT_RUN);
+	(void) lion_container_add(c, lo);
 }
 
 
@@ -1068,13 +1068,13 @@ rbi_container_append_sorted(RBIContainer *c, uint16 lo)
  */
 
 void
-rbi_container_iterate(const RBIContainer *c, rbi_lo_callback cb, void *arg)
+lion_container_iterate(const LionContainer *c, lion_lo_callback cb, void *arg)
 {
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
 				uint32		n = c->cardinality;
@@ -1084,11 +1084,11 @@ rbi_container_iterate(const RBIContainer *c, rbi_lo_callback cb, void *arg)
 						return;
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				const uint64 *w = bitset_cdata(c);
 
-				for (i = 0; i < RBI_BITSET_WORDS; i++)
+				for (i = 0; i < LION_BITSET_WORDS; i++)
 				{
 					uint64		cur = w[i];
 					uint32		base = i << 6;
@@ -1104,9 +1104,9 @@ rbi_container_iterate(const RBIContainer *c, rbi_lo_callback cb, void *arg)
 				}
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
 
 				for (i = 0; i < nruns; i++)
@@ -1127,23 +1127,23 @@ rbi_container_iterate(const RBIContainer *c, rbi_lo_callback cb, void *arg)
 }
 
 uint32
-rbi_container_to_array(const RBIContainer *c, uint16 *out)
+lion_container_to_array(const LionContainer *c, uint16 *out)
 {
 	uint32		n = 0;
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			n = c->cardinality;
 			memcpy(out, array_cdata(c), (size_t) n * sizeof(uint16));
 			break;
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			n = bits_extract_array(bitset_cdata(c), out);
 			break;
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
 
 				for (i = 0; i < nruns; i++)
@@ -1171,14 +1171,14 @@ rbi_container_to_array(const RBIContainer *c, uint16 *out)
  */
 
 uint32
-rbi_container_remove_if(RBIContainer *c, rbi_lo_predicate pred, void *arg)
+lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 {
 	uint32		removed = 0;
 	uint32		i;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				uint16	   *arr = array_mdata(c);
 				uint32		n = c->cardinality;
@@ -1194,11 +1194,11 @@ rbi_container_remove_if(RBIContainer *c, rbi_lo_predicate pred, void *arg)
 				c->cardinality = (uint16) keep;
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				uint64	   *w = bitset_mdata(c);
 
-				for (i = 0; i < RBI_BITSET_WORDS; i++)
+				for (i = 0; i < LION_BITSET_WORDS; i++)
 				{
 					uint64		cur = w[i];
 					uint64		keep = cur;
@@ -1222,14 +1222,14 @@ rbi_container_remove_if(RBIContainer *c, rbi_lo_predicate pred, void *arg)
 				container_shrink_bitset(c);
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				uint64		w[RBI_BITSET_WORDS];
-				const RBIRun *runs = run_cdata(c);
+				uint64		w[LION_BITSET_WORDS];
+				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
 				uint32		card = c->cardinality;
 
-				memset(w, 0, RBI_BITSET_BYTES);
+				memset(w, 0, LION_BITSET_BYTES);
 				for (i = 0; i < nruns; i++)
 				{
 					int32		v = (int32) runs[i].start;
@@ -1251,20 +1251,20 @@ rbi_container_remove_if(RBIContainer *c, rbi_lo_predicate pred, void *arg)
 			Assert(false);
 			break;
 	}
-	Assert(rbi_container_size(c) <= RBI_CONTAINER_MAX_SIZE);
+	Assert(lion_container_size(c) <= LION_CONTAINER_MAX_SIZE);
 	return removed;
 }
 
 uint32
-rbi_container_range_cardinality(const RBIContainer *c, uint16 lo_start, uint16 lo_end)
+lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16 lo_end)
 {
-	Assert((uint32) lo_start <= RBI_LO_MAX && (uint32) lo_end <= RBI_LO_MAX);
+	Assert((uint32) lo_start <= LION_LO_MAX && (uint32) lo_end <= LION_LO_MAX);
 	if (lo_start > lo_end || c->cardinality == 0)
 		return 0;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
 				uint32		n = c->cardinality;
@@ -1272,11 +1272,11 @@ rbi_container_range_cardinality(const RBIContainer *c, uint16 lo_start, uint16 l
 				return array_upper_bound(arr, n, lo_end) -
 					array_lower_bound(arr, n, lo_start);
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			return bits_range_cardinality(bitset_cdata(c), lo_start, lo_end);
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs = run_cdata(c);
+				const LionRun *runs = run_cdata(c);
 				int32		nruns = (int32) run_nruns(c);
 				int32		i = run_locate(runs, (uint32) nruns, lo_start);
 				uint32		n = 0;
@@ -1300,17 +1300,17 @@ rbi_container_range_cardinality(const RBIContainer *c, uint16 lo_start, uint16 l
 }
 
 uint32
-rbi_container_remove_range(RBIContainer *c, uint16 lo_start, uint16 lo_end)
+lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 {
 	uint32		removed;
 
-	Assert((uint32) lo_start <= RBI_LO_MAX && (uint32) lo_end <= RBI_LO_MAX);
+	Assert((uint32) lo_start <= LION_LO_MAX && (uint32) lo_end <= LION_LO_MAX);
 	if (lo_start > lo_end || c->cardinality == 0)
 		return 0;
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				uint16	   *arr = array_mdata(c);
 				uint32		n = c->cardinality;
@@ -1326,7 +1326,7 @@ rbi_container_remove_range(RBIContainer *c, uint16 lo_start, uint16 lo_end)
 				}
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
 				uint64	   *w = bitset_mdata(c);
 
@@ -1339,13 +1339,13 @@ rbi_container_remove_range(RBIContainer *c, uint16 lo_start, uint16 lo_end)
 				}
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				RBIRun	   *runs = run_mdata(c);
+				LionRun	   *runs = run_mdata(c);
 				int32		nruns = (int32) run_nruns(c);
 				int32		s = (int32) lo_start;
 				int32		e = (int32) lo_end;
-				RBIRun		repl[2];
+				LionRun		repl[2];
 				int32		nrepl = 0;
 				int32		newn;
 				int32		i;
@@ -1386,7 +1386,7 @@ rbi_container_remove_range(RBIContainer *c, uint16 lo_start, uint16 lo_end)
 				}
 
 				newn = nruns - (j - i + 1) + nrepl;
-				if (newn > (int32) RBI_RUN_MAX_NRUNS)
+				if (newn > (int32) LION_RUN_MAX_NRUNS)
 				{
 					container_make_bitset(c);
 					bits_clear_range(bitset_mdata(c), lo_start, lo_end);
@@ -1395,7 +1395,7 @@ rbi_container_remove_range(RBIContainer *c, uint16 lo_start, uint16 lo_end)
 					break;
 				}
 				memmove(&runs[i + nrepl], &runs[j + 1],
-						(size_t) (nruns - j - 1) * sizeof(RBIRun));
+						(size_t) (nruns - j - 1) * sizeof(LionRun));
 				for (k = 0; k < nrepl; k++)
 					runs[i + k] = repl[k];
 				run_set_nruns(c, (uint32) newn);
@@ -1407,7 +1407,7 @@ rbi_container_remove_range(RBIContainer *c, uint16 lo_start, uint16 lo_end)
 			removed = 0;
 			break;
 	}
-	Assert(rbi_container_size(c) <= RBI_CONTAINER_MAX_SIZE);
+	Assert(lion_container_size(c) <= LION_CONTAINER_MAX_SIZE);
 	return removed;
 }
 
@@ -1517,9 +1517,9 @@ array_difference(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 
 /* Members of arr that are (not) in the run container rc. */
 static uint32
-array_and_run(const uint16 *arr, uint32 na, const RBIContainer *rc, uint16 *out)
+array_and_run(const uint16 *arr, uint32 na, const LionContainer *rc, uint16 *out)
 {
-	const RBIRun *runs = run_cdata(rc);
+	const LionRun *runs = run_cdata(rc);
 	uint32		nruns = run_nruns(rc);
 	uint32		i = 0;
 	uint32		j = 0;
@@ -1538,10 +1538,10 @@ array_and_run(const uint16 *arr, uint32 na, const RBIContainer *rc, uint16 *out)
 }
 
 static uint32
-array_andnot_run(const uint16 *arr, uint32 na, const RBIContainer *rc,
+array_andnot_run(const uint16 *arr, uint32 na, const LionContainer *rc,
 				 uint16 *out)
 {
-	const RBIRun *runs = run_cdata(rc);
+	const LionRun *runs = run_cdata(rc);
 	uint32		nruns = run_nruns(rc);
 	uint32		i = 0;
 	uint32		j = 0;
@@ -1588,16 +1588,16 @@ array_andnot_bitset(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
 /*
  * Intersect two RUN containers straight into o's run payload.  Returns false
  * (leaving o's payload undefined) if the result needs more than
- * RBI_RUN_MAX_NRUNS runs; the caller then falls back to the bitset path.
+ * LION_RUN_MAX_NRUNS runs; the caller then falls back to the bitset path.
  */
 static bool
-run_and_run(const RBIContainer *a, const RBIContainer *b, RBIContainer *o)
+run_and_run(const LionContainer *a, const LionContainer *b, LionContainer *o)
 {
-	const RBIRun *ra = run_cdata(a);
-	const RBIRun *rb = run_cdata(b);
+	const LionRun *ra = run_cdata(a);
+	const LionRun *rb = run_cdata(b);
 	uint32		na = run_nruns(a);
 	uint32		nb = run_nruns(b);
-	RBIRun	   *out = run_mdata(o);
+	LionRun	   *out = run_mdata(o);
 	uint32		i = 0;
 	uint32		j = 0;
 	uint32		n = 0;
@@ -1612,7 +1612,7 @@ run_and_run(const RBIContainer *a, const RBIContainer *b, RBIContainer *o)
 
 		if (s <= e)
 		{
-			if (n >= RBI_RUN_MAX_NRUNS)
+			if (n >= LION_RUN_MAX_NRUNS)
 				return false;
 			out[n].start = (uint16) s;
 			out[n].len_minus_1 = (uint16) (e - s);
@@ -1624,7 +1624,7 @@ run_and_run(const RBIContainer *a, const RBIContainer *b, RBIContainer *o)
 		else
 			j++;
 	}
-	o->type = RBI_CT_RUN;
+	o->type = LION_CT_RUN;
 	run_set_nruns(o, n);
 	o->cardinality = (uint16) card;
 	return true;
@@ -1632,10 +1632,10 @@ run_and_run(const RBIContainer *a, const RBIContainer *b, RBIContainer *o)
 
 /* Number of members two RUN containers have in common. */
 static uint32
-run_and_run_cardinality(const RBIContainer *a, const RBIContainer *b)
+run_and_run_cardinality(const LionContainer *a, const LionContainer *b)
 {
-	const RBIRun *ra = run_cdata(a);
-	const RBIRun *rb = run_cdata(b);
+	const LionRun *ra = run_cdata(a);
+	const LionRun *rb = run_cdata(b);
 	uint32		na = run_nruns(a);
 	uint32		nb = run_nruns(b);
 	uint32		i = 0;
@@ -1661,46 +1661,46 @@ run_and_run_cardinality(const RBIContainer *a, const RBIContainer *b)
 
 /* Finish a freshly computed result: optimize and copy into dest. */
 static uint32
-container_emit_result(RBIContainer *o, RBIContainer *dest)
+container_emit_result(LionContainer *o, LionContainer *dest)
 {
-	rbi_container_optimize(o);
-	Assert(rbi_container_size(o) <= RBI_CONTAINER_MAX_SIZE);
-	memcpy(dest, o, rbi_container_size(o));
+	lion_container_optimize(o);
+	Assert(lion_container_size(o) <= LION_CONTAINER_MAX_SIZE);
+	memcpy(dest, o, lion_container_size(o));
 	return o->cardinality;
 }
 
 uint32
-rbi_container_and(const RBIContainer *a, const RBIContainer *b,
-				  RBIContainer *dest)
+lion_container_and(const LionContainer *a, const LionContainer *b,
+				  LionContainer *dest)
 {
-	RBIContainerBuf buf;
-	RBIContainer *o = &buf.hdr;
+	LionContainerBuf buf;
+	LionContainer *o = &buf.hdr;
 
 	Assert(a->ckey == b->ckey);
-	rbi_container_init(o, a->ckey);
+	lion_container_init(o, a->ckey);
 
 	if (a->cardinality == 0 || b->cardinality == 0)
 	{
 		/* empty result */
 	}
-	else if (a->type == RBI_CT_ARRAY || b->type == RBI_CT_ARRAY)
+	else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
 	{
-		const RBIContainer *arr = (a->type == RBI_CT_ARRAY) ? a : b;
-		const RBIContainer *oth = (a->type == RBI_CT_ARRAY) ? b : a;
+		const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+		const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
 		uint16	   *out = array_mdata(o);
 		uint32		n;
 
-		if (oth->type == RBI_CT_ARRAY)
+		if (oth->type == LION_CT_ARRAY)
 			n = array_intersect(array_cdata(a), a->cardinality,
 								array_cdata(b), b->cardinality, out);
-		else if (oth->type == RBI_CT_BITSET)
+		else if (oth->type == LION_CT_BITSET)
 			n = array_and_bitset(array_cdata(arr), arr->cardinality,
 								 bitset_cdata(oth), out);
 		else
 			n = array_and_run(array_cdata(arr), arr->cardinality, oth, out);
 		o->cardinality = (uint16) n;
 	}
-	else if (a->type == RBI_CT_RUN && b->type == RBI_CT_RUN &&
+	else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
 			 run_and_run(a, b, o))
 	{
 		/* done: o already holds the intersected runs */
@@ -1711,24 +1711,24 @@ rbi_container_and(const RBIContainer *a, const RBIContainer *b,
 
 		container_fill_bitset(a, w);
 		container_and_bitset(b, w);
-		o->type = RBI_CT_BITSET;
+		o->type = LION_CT_BITSET;
 		o->cardinality = (uint16) bits_cardinality(w);
 	}
 	return container_emit_result(o, dest);
 }
 
 uint32
-rbi_container_or(const RBIContainer *a, const RBIContainer *b,
-				 RBIContainer *dest)
+lion_container_or(const LionContainer *a, const LionContainer *b,
+				 LionContainer *dest)
 {
-	RBIContainerBuf buf;
-	RBIContainer *o = &buf.hdr;
+	LionContainerBuf buf;
+	LionContainer *o = &buf.hdr;
 
 	Assert(a->ckey == b->ckey);
-	rbi_container_init(o, a->ckey);
+	lion_container_init(o, a->ckey);
 
-	if (a->type == RBI_CT_ARRAY && b->type == RBI_CT_ARRAY &&
-		(uint32) a->cardinality + (uint32) b->cardinality <= RBI_ARRAY_MAX_CARD)
+	if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+		(uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
 	{
 		uint32		n = array_union(array_cdata(a), a->cardinality,
 									array_cdata(b), b->cardinality,
@@ -1738,9 +1738,9 @@ rbi_container_or(const RBIContainer *a, const RBIContainer *b,
 	}
 	else if (a->cardinality == 0 || b->cardinality == 0)
 	{
-		const RBIContainer *src = (a->cardinality == 0) ? b : a;
+		const LionContainer *src = (a->cardinality == 0) ? b : a;
 
-		memcpy(o, src, rbi_container_size(src));
+		memcpy(o, src, lion_container_size(src));
 		o->ckey = a->ckey;
 		o->flags = 0;
 	}
@@ -1750,21 +1750,21 @@ rbi_container_or(const RBIContainer *a, const RBIContainer *b,
 
 		container_fill_bitset(a, w);
 		container_or_bitset(b, w);
-		o->type = RBI_CT_BITSET;
+		o->type = LION_CT_BITSET;
 		o->cardinality = (uint16) bits_cardinality(w);
 	}
 	return container_emit_result(o, dest);
 }
 
 uint32
-rbi_container_andnot(const RBIContainer *a, const RBIContainer *b,
-					 RBIContainer *dest)
+lion_container_andnot(const LionContainer *a, const LionContainer *b,
+					 LionContainer *dest)
 {
-	RBIContainerBuf buf;
-	RBIContainer *o = &buf.hdr;
+	LionContainerBuf buf;
+	LionContainer *o = &buf.hdr;
 
 	Assert(a->ckey == b->ckey);
-	rbi_container_init(o, a->ckey);
+	lion_container_init(o, a->ckey);
 
 	if (a->cardinality == 0)
 	{
@@ -1772,18 +1772,18 @@ rbi_container_andnot(const RBIContainer *a, const RBIContainer *b,
 	}
 	else if (b->cardinality == 0)
 	{
-		memcpy(o, a, rbi_container_size(a));
+		memcpy(o, a, lion_container_size(a));
 		o->flags = 0;
 	}
-	else if (a->type == RBI_CT_ARRAY)
+	else if (a->type == LION_CT_ARRAY)
 	{
 		uint16	   *out = array_mdata(o);
 		uint32		n;
 
-		if (b->type == RBI_CT_ARRAY)
+		if (b->type == LION_CT_ARRAY)
 			n = array_difference(array_cdata(a), a->cardinality,
 								 array_cdata(b), b->cardinality, out);
-		else if (b->type == RBI_CT_BITSET)
+		else if (b->type == LION_CT_BITSET)
 			n = array_andnot_bitset(array_cdata(a), a->cardinality,
 									bitset_cdata(b), out);
 		else
@@ -1796,14 +1796,14 @@ rbi_container_andnot(const RBIContainer *a, const RBIContainer *b,
 
 		container_fill_bitset(a, w);
 		container_andnot_bitset(b, w);
-		o->type = RBI_CT_BITSET;
+		o->type = LION_CT_BITSET;
 		o->cardinality = (uint16) bits_cardinality(w);
 	}
 	return container_emit_result(o, dest);
 }
 
 uint32
-rbi_container_and_cardinality(const RBIContainer *a, const RBIContainer *b)
+lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 {
 	Assert(a->ckey == b->ckey);
 
@@ -1811,28 +1811,28 @@ rbi_container_and_cardinality(const RBIContainer *a, const RBIContainer *b)
 		return 0;
 
 	/* BITSET x BITSET: popcount of the ANDed words, nothing materialised */
-	if (a->type == RBI_CT_BITSET && b->type == RBI_CT_BITSET)
+	if (a->type == LION_CT_BITSET && b->type == LION_CT_BITSET)
 	{
 		const uint64 *wa = bitset_cdata(a);
 		const uint64 *wb = bitset_cdata(b);
 		uint32		card = 0;
 		uint32		i;
 
-		for (i = 0; i < RBI_BITSET_WORDS; i++)
+		for (i = 0; i < LION_BITSET_WORDS; i++)
 			card += (uint32) pg_popcount64(wa[i] & wb[i]);
 		return card;
 	}
 
-	if (a->type == RBI_CT_ARRAY || b->type == RBI_CT_ARRAY)
+	if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
 	{
-		const RBIContainer *arr = (a->type == RBI_CT_ARRAY) ? a : b;
-		const RBIContainer *oth = (a->type == RBI_CT_ARRAY) ? b : a;
+		const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+		const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
 		const uint16 *data = array_cdata(arr);
 		uint32		n = arr->cardinality;
 		uint32		card = 0;
 		uint32		i;
 
-		if (oth->type == RBI_CT_ARRAY)
+		if (oth->type == LION_CT_ARRAY)
 		{
 			const uint16 *ba = array_cdata(a);
 			const uint16 *bb = array_cdata(b);
@@ -1856,7 +1856,7 @@ rbi_container_and_cardinality(const RBIContainer *a, const RBIContainer *b)
 			}
 			return card;
 		}
-		if (oth->type == RBI_CT_BITSET)
+		if (oth->type == LION_CT_BITSET)
 		{
 			const uint64 *w = bitset_cdata(oth);
 
@@ -1867,7 +1867,7 @@ rbi_container_and_cardinality(const RBIContainer *a, const RBIContainer *b)
 		}
 		/* ARRAY x RUN */
 		{
-			const RBIRun *runs = run_cdata(oth);
+			const LionRun *runs = run_cdata(oth);
 			uint32		nruns = run_nruns(oth);
 			uint32		j = 0;
 
@@ -1888,15 +1888,15 @@ rbi_container_and_cardinality(const RBIContainer *a, const RBIContainer *b)
 		}
 	}
 
-	if (a->type == RBI_CT_RUN && b->type == RBI_CT_RUN)
+	if (a->type == LION_CT_RUN && b->type == LION_CT_RUN)
 		return run_and_run_cardinality(a, b);
 
 	/* BITSET x RUN */
 	{
-		const RBIContainer *bs = (a->type == RBI_CT_BITSET) ? a : b;
-		const RBIContainer *rc = (a->type == RBI_CT_BITSET) ? b : a;
+		const LionContainer *bs = (a->type == LION_CT_BITSET) ? a : b;
+		const LionContainer *rc = (a->type == LION_CT_BITSET) ? b : a;
 		const uint64 *w = bitset_cdata(bs);
-		const RBIRun *runs = run_cdata(rc);
+		const LionRun *runs = run_cdata(rc);
 		uint32		nruns = run_nruns(rc);
 		uint32		card = 0;
 		uint32		i;
@@ -1914,103 +1914,103 @@ rbi_container_and_cardinality(const RBIContainer *a, const RBIContainer *b)
  * ----------------------------------------------------------------
  */
 
-#define RBI_CHECK_FAIL(msg) \
+#define LION_CHECK_FAIL(msg) \
 	do { *errmsg = (msg); return false; } while (0)
 
 bool
-rbi_container_check(const RBIContainer *c, Size avail_bytes, const char **errmsg)
+lion_container_check(const LionContainer *c, Size avail_bytes, const char **errmsg)
 {
 	uint32		card;
 
 	*errmsg = NULL;
 
-	if (avail_bytes < RBI_CONTAINER_HDRSZ)
-		RBI_CHECK_FAIL("container header does not fit in the available space");
+	if (avail_bytes < LION_CONTAINER_HDRSZ)
+		LION_CHECK_FAIL("container header does not fit in the available space");
 
 	/*
 	 * A sparse segment (DESIGN.md §13) shares this header but is not a
-	 * container: it is checked by rbi_sparse_check(), and reaching this
+	 * container: it is checked by lion_sparse_check(), and reaching this
 	 * function with one means the caller failed to dispatch on the type.
 	 */
-	if (c->type == RBI_CT_SPARSE)
-		RBI_CHECK_FAIL("item is a sparse segment, not a container");
+	if (c->type == LION_CT_SPARSE)
+		LION_CHECK_FAIL("item is a sparse segment, not a container");
 
-	if (c->type != RBI_CT_ARRAY && c->type != RBI_CT_BITSET &&
-		c->type != RBI_CT_RUN)
-		RBI_CHECK_FAIL("invalid container type");
+	if (c->type != LION_CT_ARRAY && c->type != LION_CT_BITSET &&
+		c->type != LION_CT_RUN)
+		LION_CHECK_FAIL("invalid container type");
 
 	if (c->flags != 0)
-		RBI_CHECK_FAIL("container flags are not zero");
+		LION_CHECK_FAIL("container flags are not zero");
 
 	card = c->cardinality;
-	if (card > RBI_CONTAINER_RANGE)
-		RBI_CHECK_FAIL("container cardinality is out of range");
+	if (card > LION_CONTAINER_RANGE)
+		LION_CHECK_FAIL("container cardinality is out of range");
 
 	switch (c->type)
 	{
-		case RBI_CT_ARRAY:
+		case LION_CT_ARRAY:
 			{
 				const uint16 *arr;
 				uint32		i;
 
-				if (card > RBI_ARRAY_MAX_CARD)
-					RBI_CHECK_FAIL("array container has more than RBI_ARRAY_MAX_CARD members");
-				if (rbi_container_size_for(RBI_CT_ARRAY, card, 0) > avail_bytes)
-					RBI_CHECK_FAIL("array container does not fit in the available space");
+				if (card > LION_ARRAY_MAX_CARD)
+					LION_CHECK_FAIL("array container has more than LION_ARRAY_MAX_CARD members");
+				if (lion_container_size_for(LION_CT_ARRAY, card, 0) > avail_bytes)
+					LION_CHECK_FAIL("array container does not fit in the available space");
 				arr = array_cdata(c);
 				for (i = 0; i < card; i++)
 				{
-					if ((uint32) arr[i] > RBI_LO_MAX)
-						RBI_CHECK_FAIL("array container member is out of range");
+					if ((uint32) arr[i] > LION_LO_MAX)
+						LION_CHECK_FAIL("array container member is out of range");
 					if (i > 0 && arr[i] <= arr[i - 1])
-						RBI_CHECK_FAIL("array container members are not strictly ascending");
+						LION_CHECK_FAIL("array container members are not strictly ascending");
 				}
 				break;
 			}
-		case RBI_CT_BITSET:
+		case LION_CT_BITSET:
 			{
-				if (rbi_container_size_for(RBI_CT_BITSET, card, 0) > avail_bytes)
-					RBI_CHECK_FAIL("bitset container does not fit in the available space");
+				if (lion_container_size_for(LION_CT_BITSET, card, 0) > avail_bytes)
+					LION_CHECK_FAIL("bitset container does not fit in the available space");
 				if (bits_cardinality(bitset_cdata(c)) != card)
-					RBI_CHECK_FAIL("bitset container cardinality does not match its payload");
+					LION_CHECK_FAIL("bitset container cardinality does not match its payload");
 				break;
 			}
-		case RBI_CT_RUN:
+		case LION_CT_RUN:
 			{
-				const RBIRun *runs;
+				const LionRun *runs;
 				uint32		nruns;
 				uint32		total = 0;
 				int32		prev_last = -2;
 				uint32		i;
 
-				if (avail_bytes < RBI_CONTAINER_HDRSZ + sizeof(uint16))
-					RBI_CHECK_FAIL("run container header does not fit in the available space");
+				if (avail_bytes < LION_CONTAINER_HDRSZ + sizeof(uint16))
+					LION_CHECK_FAIL("run container header does not fit in the available space");
 				nruns = run_nruns(c);
-				if (nruns > RBI_RUN_MAX_NRUNS)
-					RBI_CHECK_FAIL("run container has more than RBI_RUN_MAX_NRUNS runs");
-				if (rbi_container_size_for(RBI_CT_RUN, card, nruns) > avail_bytes)
-					RBI_CHECK_FAIL("run container does not fit in the available space");
+				if (nruns > LION_RUN_MAX_NRUNS)
+					LION_CHECK_FAIL("run container has more than LION_RUN_MAX_NRUNS runs");
+				if (lion_container_size_for(LION_CT_RUN, card, nruns) > avail_bytes)
+					LION_CHECK_FAIL("run container does not fit in the available space");
 				if (nruns == 0 && card != 0)
-					RBI_CHECK_FAIL("run container cardinality does not match its runs");
+					LION_CHECK_FAIL("run container cardinality does not match its runs");
 				runs = run_cdata(c);
 				for (i = 0; i < nruns; i++)
 				{
 					int32		start = (int32) runs[i].start;
 					int32		last = run_last(&runs[i]);
 
-					if (last > (int32) RBI_LO_MAX)
-						RBI_CHECK_FAIL("run container run extends past the container range");
+					if (last > (int32) LION_LO_MAX)
+						LION_CHECK_FAIL("run container run extends past the container range");
 					if (start <= prev_last + 1)
-						RBI_CHECK_FAIL("run container runs are not ascending, disjoint and merged");
+						LION_CHECK_FAIL("run container runs are not ascending, disjoint and merged");
 					prev_last = last;
 					total += (uint32) (last - start + 1);
 				}
 				if (total != card)
-					RBI_CHECK_FAIL("run container cardinality does not match its runs");
+					LION_CHECK_FAIL("run container cardinality does not match its runs");
 				break;
 			}
 	}
 
-	Assert(rbi_container_size(c) <= avail_bytes);
+	Assert(lion_container_size(c) <= avail_bytes);
 	return true;
 }

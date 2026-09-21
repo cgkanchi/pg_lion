@@ -17,12 +17,12 @@
 
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 
-SELECT 'n1 ' || roaring_index_count('rbi_rec_k4'::regclass, :key ::int4);
+SELECT 'n1 ' || lion_index_count('lion_rec_k4'::regclass, :key ::int4);
 
 -- Long enough for the primary's DELETE + VACUUM to be generated and replayed,
 -- and for max_standby_streaming_delay to expire if replay is blocked on us.
 SELECT pg_sleep(:hold);
 
-SELECT 'n2 ' || roaring_index_count('rbi_rec_k4'::regclass, :key ::int4);
+SELECT 'n2 ' || lion_index_count('lion_rec_k4'::regclass, :key ::int4);
 
 COMMIT;
