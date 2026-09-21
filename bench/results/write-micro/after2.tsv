@@ -1,0 +1,48 @@
+# 2026-09-21T16:11:44Z after2 0e21a97
+# metric	ms	wal_bytes	notes
+build8_roaring	11261.535	59538280	8 indexes
+build8_btree	5506.423	62121888	8 indexes
+build1_roaring_c2	1107.189	2146328	
+build1_roaring_c20	1561.466	2225376	
+build1_roaring_c200	1482.094	2976288	
+build1_roaring_c20k	1300.276	7298496	
+build1_roaring_c1m	1862.277	41290376	
+build1_roaring_clustered	613.354	210256	
+build1_roaring_skew	1302.141	1203976	
+build1_roaring_nullable	1719.177	2981048	
+ins10000_roaring_8idx_sc_off	1203.434	89777168	after checkpoint
+ins10000_roaring_8idx_sc_off_steady	1141.104	53176680	second batch, no checkpoint
+ins10000_roaring_1idx_sc_off	112.555	3700992	after checkpoint
+ins10000_roaring_1idx_sc_off_steady	111.818	2411880	second batch, no checkpoint
+ins10000_btree_8idx_sc_off	272.055	34922832	after checkpoint
+ins10000_btree_8idx_sc_off_steady	214.615	7082760	second batch, no checkpoint
+ins10000_roaring_8idx_sc_on	1249.411	89777176	after checkpoint
+ins10000_roaring_8idx_sc_on_steady	1134.481	53176680	second batch, no checkpoint
+ins10000_roaring_1idx_sc_on	109.506	3700992	after checkpoint
+ins10000_roaring_1idx_sc_on_steady	113.609	2411880	second batch, no checkpoint
+ins10000_btree_8idx_sc_on	287.290	34922832	after checkpoint
+ins10000_btree_8idx_sc_on_steady	215.006	7082760	second batch, no checkpoint
+ins10000_roaring_only_c2	102.421	3005160	after checkpoint
+ins10000_roaring_only_c2_steady	82.856	2877464	second batch
+ins10000_roaring_only_c20	72.917	2598808	after checkpoint
+ins10000_roaring_only_c20_steady	74.338	2466456	second batch
+ins10000_roaring_only_c200	145.306	3700992	after checkpoint
+ins10000_roaring_only_c200_steady	137.944	2411904	second batch
+ins10000_roaring_only_c20k	167.898	34793856	after checkpoint
+ins10000_roaring_only_c20k_steady	312.498	29740072	second batch
+ins10000_roaring_only_c1m	222.465	45907608	after checkpoint
+ins10000_roaring_only_c1m_steady	295.214	16849480	second batch
+ins10000_roaring_only_clustered	64.743	2400656	after checkpoint
+ins10000_roaring_only_clustered_steady	64.883	2392264	second batch
+ins10000_roaring_only_skew	138.096	5622624	after checkpoint
+ins10000_roaring_only_skew_steady	159.969	5307864	second batch
+ins10000_roaring_only_nullable	112.600	3514376	after checkpoint
+ins10000_roaring_only_nullable_steady	129.116	2421392	second batch
+ins10000_noindex	13.312	1665120	after checkpoint
+ins10000_noindex_steady	13.769	1612888	second batch
+burst8_roaring_sc_on	17.736	46747008	tps=360.462478 p95_ms=26.256 rows=180500
+burst8_btree_sc_on	8.341	60413832	tps=841.004092 p95_ms=13.809 rows=421100
+burst8_none_sc_on	9.683	27537544	tps=757.638791 p95_ms=17.289 rows=378800
+burst8_roaring_sc_off	14.297	69661464	tps=552.585856 p95_ms=19.633 rows=276600
+burst8_btree_sc_off	4.786	121673744	tps=1691.214390 p95_ms=7.554 rows=845100
+burst8_none_sc_off	0.404	530012720	tps=14609.933962 p95_ms=1.213 rows=7297700

@@ -281,6 +281,59 @@ SELECT entries, null_tids, empty_tids
 SELECT roaring_index_verify('rbi_ts_empty_tsv', true);
 DROP TABLE rbi_ts_empty;
 
+-- ---- costing the ALL-mode fallback (2026-09-21 follow-up review) -------
+/*
+ * A phrase, a prefix, a weight mask and a NOT cannot be answered from the
+ * stored lexeme memberships, so the extractor falls back to RBI_QMODE_ALL:
+ * the scan emits the union of every entry and every candidate row is fetched
+ * and rechecked in the heap (DESIGN.md §17).  That is correct but it is a
+ * whole-index traversal plus a whole-table recheck, and the generic index
+ * estimate used to price it with the PREDICATE's selectivity instead - a
+ * prefix query estimated at 192 cost units against the sequential scan's
+ * 9156, for a plan that emitted 1.18M posting TIDs and ran 2.6x slower than
+ * that sequential scan (68.6/62.3 ms against 31.8/23.8 ms on 200k
+ * documents).
+ *
+ * The queries here aggregate sum(id) rather than count(*) so that the count
+ * pushdown is out of the picture and the comparison is between the bitmap
+ * plan and the sequential scan, which is where the misestimate lived.  An
+ * exact query must keep the bitmap scan; an ALL-mode one must lose it.
+ */
+CREATE TABLE rbi_tsc (id int NOT NULL, tsv tsvector NOT NULL);
+INSERT INTO rbi_tsc
+SELECT i, to_tsvector('simple',
+					  'common w' || (i % 20) || ' w' || (i % 400) ||
+					  ' rare' || i || ' endword')
+  FROM generate_series(1, 20000) i;
+CREATE INDEX rbi_tsc_tsv ON rbi_tsc USING roaring (tsv);
+VACUUM ANALYZE rbi_tsc;
+-- exact: one lexeme, an AND and an OR over lexemes
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc WHERE tsv @@ 'rare500'::tsquery;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc
+	WHERE tsv @@ 'rare500 & endword'::tsquery;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc
+	WHERE tsv @@ 'rare500 | rare501'::tsquery;
+-- ALL mode: a phrase, a prefix, a weight mask, a NOT
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc
+	WHERE tsv @@ 'common <-> w1'::tsquery;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc WHERE tsv @@ 'rare50:*'::tsquery;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc WHERE tsv @@ 'rare500:A'::tsquery;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_tsc
+	WHERE tsv @@ 'rare500 & !endword'::tsquery;
+-- an unknown value has to be priced as the expensive shape as well
+PREPARE rbi_tsc_p(tsquery) AS SELECT sum(id) FROM rbi_tsc WHERE tsv @@ $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE rbi_tsc_p('rare500');
+RESET plan_cache_mode;
+DEALLOCATE rbi_tsc_p;
+-- and the answers are the same whichever plan runs
+SELECT rbi_tscmp($$SELECT count(*) FROM rbi_tsc WHERE tsv @@ 'rare50:*'::tsquery$$);
+SELECT rbi_tscmp($$SELECT count(*) FROM rbi_tsc
+				   WHERE tsv @@ 'common <-> w1'::tsquery$$);
+SELECT rbi_tscmp($$SELECT count(*) FROM rbi_tsc
+				   WHERE tsv @@ 'rare500 & endword'::tsquery$$);
+DROP TABLE rbi_tsc;
+
 -- ---- max_entries on a lexeme index -------------------------------------
 CREATE TABLE rbi_ts_many (tsv tsvector);
 INSERT INTO rbi_ts_many

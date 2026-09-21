@@ -716,9 +716,10 @@ rbi_entry_rebuild(const RBIEntryTuple *entry, const char *payload,
  * entry lives on the bucket head page, and an extra pinned buffer otherwise.
  */
 bool
-rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode,
-				   Datum key, uint32 hash, FmgrInfo *eqproc, Oid collation,
-				   Buffer *buf, OffsetNumber *offnum)
+rbi_find_entry_counted(Relation index, RBIState *state, Buffer headbuf,
+					   int lockmode, Datum key, uint32 hash, FmgrInfo *eqproc,
+					   Oid collation, Buffer *buf, OffsetNumber *offnum,
+					   int *npages)
 {
 	Buffer		cur = headbuf;
 
@@ -727,6 +728,8 @@ rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode
 		eqproc = &state->eqproc;
 		collation = state->collation;
 	}
+	if (npages != NULL)
+		*npages = 0;
 
 	for (;;)
 	{
@@ -736,6 +739,9 @@ rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode
 		BlockNumber next;
 
 		Assert(RBIPageIsBucket(page));
+
+		if (npages != NULL)
+			(*npages)++;
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
@@ -790,6 +796,15 @@ rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode
 }
 
 bool
+rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode,
+				   Datum key, uint32 hash, FmgrInfo *eqproc, Oid collation,
+				   Buffer *buf, OffsetNumber *offnum)
+{
+	return rbi_find_entry_counted(index, state, headbuf, lockmode, key, hash,
+								  eqproc, collation, buf, offnum, NULL);
+}
+
+bool
 rbi_find_entry(Relation index, RBIState *state, Buffer headbuf, int lockmode,
 			   Datum key, uint32 hash, Buffer *buf, OffsetNumber *offnum)
 {
@@ -803,13 +818,17 @@ rbi_find_entry(Relation index, RBIState *state, Buffer headbuf, int lockmode,
  * held in lockmode by the caller, and is left locked.
  */
 bool
-rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
-						uint16 reservedflag, Buffer *buf, OffsetNumber *offnum)
+rbi_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
+								uint16 reservedflag, Buffer *buf,
+								OffsetNumber *offnum, int *npages)
 {
 	Buffer		cur = headbuf;
 
 	Assert(reservedflag == RBI_ENTRY_NULLKEY ||
 		   reservedflag == RBI_ENTRY_EMPTYKEY);
+
+	if (npages != NULL)
+		*npages = 0;
 
 	for (;;)
 	{
@@ -819,6 +838,9 @@ rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
 		BlockNumber next;
 
 		Assert(RBIPageIsBucket(page));
+
+		if (npages != NULL)
+			(*npages)++;
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
@@ -857,6 +879,53 @@ rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
 	*buf = InvalidBuffer;
 	*offnum = InvalidOffsetNumber;
 	return false;
+}
+
+bool
+rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
+						uint16 reservedflag, Buffer *buf, OffsetNumber *offnum)
+{
+	return rbi_find_reserved_entry_counted(index, headbuf, lockmode,
+										   reservedflag, buf, offnum, NULL);
+}
+
+/*
+ * How many pages the bucket chain starting at headbuf has.  The caller holds
+ * the head locked, which serialises this against every writer of the bucket.
+ */
+int
+rbi_bucket_npages(Relation index, Buffer headbuf)
+{
+	Buffer		cur = headbuf;
+	int			n = 0;
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next;
+
+		Assert(RBIPageIsBucket(page));
+		n++;
+
+		next = RBIPageGetOpaque(page)->rightlink;
+		if (!BlockNumberIsValid(next))
+			break;
+
+		{
+			Buffer		nbuf = ReadBuffer(index, next);
+
+			LockBuffer(nbuf, BUFFER_LOCK_SHARE);
+			if (cur != headbuf)
+				UnlockReleaseBuffer(cur);
+			cur = nbuf;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (cur != headbuf)
+		UnlockReleaseBuffer(cur);
+
+	return n;
 }
 
 /*
@@ -1161,6 +1230,56 @@ rbi_put_entry(Relation index, GenericXLogState *xstate, Buffer entrybuf,
 }
 
 /*
+ * Allocated length for an item that is about to be written to a container
+ * page, with room to grow in place (DESIGN.md §4, "growth slack").
+ *
+ * The slack is a fraction of the item rather than a fixed number of bytes,
+ * because both extremes of item size are common: a key with many container
+ * keys owns dozens of ~50-byte items per page, where 64 bytes of slack each
+ * would nearly halve the page's capacity, while a key with one big ARRAY per
+ * container key wants as much room as it can get.  MAXALIGN padding, which
+ * the page spends on the item either way, is part of the slack and therefore
+ * free.
+ */
+Size
+rbi_item_alloc_size(const RBIContainer *item, Size size)
+{
+	Size		extra;
+	Size		alloc;
+
+	Assert(size == rbi_item_size(item));
+
+	/* A bitset is already the largest an item can be. */
+	if (item->type == RBI_CT_BITSET)
+		return size;
+
+	extra = size / RBI_ITEM_SLACK_FRACTION;
+	extra = Max(extra, (Size) RBI_ITEM_SLACK_MIN);
+	extra = Min(extra, (Size) RBI_ITEM_SLACK_MAX);
+
+	alloc = MAXALIGN(size) + MAXALIGN(extra);
+	if (alloc > (Size) RBI_CONTAINER_MAX_SIZE)
+		alloc = Min(MAXALIGN(size), (Size) RBI_CONTAINER_MAX_SIZE);
+
+	Assert(alloc >= size && alloc - size <= RBI_ITEM_SLACK_LIMIT);
+	return alloc;
+}
+
+/*
+ * Zero the slack of an item in the caller's work buffer, so that the bytes
+ * that land on the page are the same every time the item is written: a
+ * GenericXLog delta is a byte-wise diff of the page image, and garbage in the
+ * slack would put the whole item in every record.
+ */
+static void
+rbi_item_zero_slack(RBIContainer *item, Size size, Size alloc)
+{
+	Assert(alloc >= size);
+	if (alloc > size)
+		memset((char *) item + size, 0, alloc - size);
+}
+
+/*
  * Insert or replace a container on the container page buf, which the caller
  * holds EXCLUSIVE (or with a cleanup lock) and which owns c->ckey, splitting
  * the page when the container does not fit.  The buffer stays locked.
@@ -1172,9 +1291,10 @@ rbi_put_entry(Relation index, GenericXLogState *xstate, Buffer entrybuf,
  * the counters from the containers.
  */
 void
-rbi_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
-							   OffsetNumber entryoff, RBIEntryTuple *entry,
-							   RBIContainer *c, int *ncontainers_delta)
+rbi_chain_put_container_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
+								   OffsetNumber entryoff, RBIEntryTuple *entry,
+								   RBIContainer *c, int *ncontainers_delta,
+								   bool slack)
 {
 	Page		page = BufferGetPage(buf);
 	OffsetNumber off;
@@ -1186,8 +1306,17 @@ rbi_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
 	off = rbi_page_find_container(page, c->ckey, &found);
 	*ncontainers_delta = found ? 0 : 1;
 
-	rbi_chain_put_items_locked(index, buf, entrybuf, entryoff, entry, off,
-							   found, &c, 1);
+	rbi_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
+								   found, &c, 1, slack);
+}
+
+void
+rbi_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
+							   OffsetNumber entryoff, RBIEntryTuple *entry,
+							   RBIContainer *c, int *ncontainers_delta)
+{
+	rbi_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, entry, c,
+									   ncontainers_delta, false);
 }
 
 /*
@@ -1201,14 +1330,16 @@ rbi_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
  * container from being visible as two items holding the same ckey.
  */
 void
-rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
-						   OffsetNumber entryoff, RBIEntryTuple *entry,
-						   OffsetNumber off, bool replace,
-						   RBIContainer **items, int nitems)
+rbi_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
+							   OffsetNumber entryoff, RBIEntryTuple *entry,
+							   OffsetNumber off, bool replace,
+							   RBIContainer **items, int nitems, bool slack)
 {
 	Page		page = BufferGetPage(buf);
 	Size		sizes[RBI_MAX_PUT_ITEMS];
+	Size		allocs[RBI_MAX_PUT_ITEMS];
 	Size		need = 0;
+	Size		want = 0;
 	Size		have;
 	int			i;
 
@@ -1223,24 +1354,54 @@ rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
 		Assert(sizes[i] <= RBI_CONTAINER_MAX_SIZE);
 		Assert(i == 0 ||
 			   rbi_item_first_ckey(items[i]) > rbi_item_last_ckey(items[i - 1]));
+		allocs[i] = slack ? rbi_item_alloc_size(items[i], sizes[i]) : sizes[i];
 		need += MAXALIGN(sizes[i]) + sizeof(ItemIdData);
+		want += MAXALIGN(allocs[i]) + sizeof(ItemIdData);
 	}
 	Assert(need <= RBI_MAX_ITEM_SIZE + sizeof(ItemIdData));
 
 	/* One item taking another one's place: overwrite it where it is. */
 	if (replace && nitems == 1)
 	{
-		GenericXLogState *xstate = GenericXLogStart(index);
-		Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+		Size		cur = ItemIdGetLength(PageGetItemId(page, off));
+		Size		writesz = sizes[0];
 
-		if (PageIndexTupleOverwrite(p, off, items[0], sizes[0]))
+		/*
+		 * With slack, prefer to leave the item's allocated length exactly as
+		 * it is: then PageIndexTupleOverwrite() moves no other item on the
+		 * page and the WAL delta covers the item alone.  An item that has far
+		 * more room than it can use - a segment replaced by the container one
+		 * of its container keys was promoted to - gives the excess back.
+		 */
+		if (slack)
 		{
-			rbi_page_update_minmax(p);
-			rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
-			GenericXLogFinish(xstate);
-			return;
+			/*
+			 * cur comes off the page, and the item is copied out of a work
+			 * buffer of RBI_CONTAINER_MAX_SIZE bytes, so a page that claims
+			 * more than that (only a corrupt one can) gets the exact size.
+			 */
+			if (cur >= sizes[0] && cur <= (Size) RBI_CONTAINER_MAX_SIZE &&
+				cur - sizes[0] <= RBI_ITEM_SLACK_LIMIT)
+				writesz = cur;
+			else if (MAXALIGN(allocs[0]) <=
+					 MAXALIGN(cur) + PageGetExactFreeSpace(page))
+				writesz = allocs[0];
+			rbi_item_zero_slack(items[0], sizes[0], writesz);
 		}
-		GenericXLogAbort(xstate);
+
+		{
+			GenericXLogState *xstate = GenericXLogStart(index);
+			Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+
+			if (PageIndexTupleOverwrite(p, off, items[0], writesz))
+			{
+				rbi_page_update_minmax(p);
+				rbi_put_entry(index, xstate, entrybuf, entryoff, entry);
+				GenericXLogFinish(xstate);
+				return;
+			}
+			GenericXLogAbort(xstate);
+		}
 	}
 
 	/*
@@ -1252,7 +1413,15 @@ rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
 		have += MAXALIGN(ItemIdGetLength(PageGetItemId(page, off))) +
 			sizeof(ItemIdData);
 
-	if (have >= need)
+	/* Slack is a luxury: drop all of it rather than split the page for it. */
+	if (want > have)
+	{
+		for (i = 0; i < nitems; i++)
+			allocs[i] = sizes[i];
+		want = need;
+	}
+
+	if (have >= want)
 	{
 		GenericXLogState *xstate = GenericXLogStart(index);
 		Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
@@ -1262,7 +1431,8 @@ rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
 
 		for (i = 0; i < nitems; i++)
 		{
-			if (PageAddItemExtended(p, items[i], sizes[i],
+			rbi_item_zero_slack(items[i], sizes[i], allocs[i]);
+			if (PageAddItemExtended(p, items[i], allocs[i],
 									off + (OffsetNumber) i,
 									0) == InvalidOffsetNumber)
 				elog(ERROR, "roaring index: failed to add item to page %u",
@@ -1275,9 +1445,23 @@ rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
 		return;
 	}
 
-	/* Not enough room: split the page and place the items. */
+	/*
+	 * Not enough room: split the page and place the items.  The split places
+	 * them at their exact size - a page that has just been split has room to
+	 * spare, and the items get their slack back the next time they grow.
+	 */
 	rbi_split_and_place(index, buf, off, replace, entrybuf, entryoff, entry,
 						items, nitems);
+}
+
+void
+rbi_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
+						   OffsetNumber entryoff, RBIEntryTuple *entry,
+						   OffsetNumber off, bool replace,
+						   RBIContainer **items, int nitems)
+{
+	rbi_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
+								   replace, items, nitems, false);
 }
 
 /*
@@ -1659,4 +1843,52 @@ rbi_warn_max_entries(Relation index, int64 nentries)
 			 errdetail("The index holds about " INT64_FORMAT " entries; its max_entries option is %d.",
 					   nentries, rbi_max_entries(index)),
 			 errhint("Raise max_entries, or index a column with fewer distinct keys.")));
+}
+
+/* ---------------------------------------------------------------------
+ * Bucket directory guard (DESIGN.md §5)
+ *
+ * ambuild sizes the bucket directory once and nothing ever resizes it, so an
+ * index created on an empty table keeps RBI_DEFAULT_BUCKETS buckets for good
+ * and answers every lookup by walking a long chain of bucket pages.  The
+ * remedy is a REINDEX, which sizes the directory from the data that is
+ * actually there - so the index says once per backend that it wants one.
+ * --------------------------------------------------------------------- */
+
+/* Indexes this backend has already complained about, keyed by relation Oid. */
+static HTAB *rbi_warned_buckets = NULL;
+
+void
+rbi_warn_bucket_chain(Relation index, int npages)
+{
+	RBIOptions *opts = (RBIOptions *) index->rd_options;
+	Oid			relid = RelationGetRelid(index);
+	bool		found;
+
+	/* An explicit bucket count is what its owner asked for; leave it alone. */
+	if (opts != NULL && opts->buckets > 0)
+		return;
+
+	if (rbi_warned_buckets == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(Oid);
+		ctl.hcxt = TopMemoryContext;
+		rbi_warned_buckets = hash_create("roaring index bucket chain warnings",
+										 16, &ctl,
+										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	(void) hash_search(rbi_warned_buckets, &relid, HASH_ENTER, &found);
+	if (found)
+		return;					/* this backend has said it once already */
+
+	ereport(WARNING,
+			(errmsg("roaring index \"%s\" has outgrown its bucket directory",
+					RelationGetRelationName(index)),
+			 errdetail("One bucket chain is %d pages long; the index was built with %u buckets, which is what a lookup of a key has to walk.",
+					   npages, rbi_get_state(index)->meta.nbuckets),
+			 errhint("REINDEX the index: the bucket count is chosen at build time from the entries that exist then, and this index was built smaller (often on an empty table).")));
 }

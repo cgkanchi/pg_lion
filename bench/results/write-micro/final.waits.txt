@@ -1,0 +1,30 @@
+--- wait events, roaring, 8 clients, synchronous_commit=on
+ wait_event_type |   wait_event    | samples | pct  
+-----------------+-----------------+---------+------
+ Buffer          | BufferExclusive |    3269 | 57.1
+ CPU (running)   | -               |    1330 | 23.2
+ IO              | WalSync         |     551 |  9.6
+ LWLock          | WALWrite        |     526 |  9.2
+ Client          | ClientRead      |      31 |  0.5
+ IO              | WalWrite        |      12 |  0.2
+ IO              | DataFileExtend  |       5 |  0.1
+ Timeout         | SpinDelay       |       3 |  0.1
+ LWLock          | LockManager     |       1 |  0.0
+(9 rows)
+
+tps = 657.454576
+--- wait events, btree, 8 clients, synchronous_commit=on
+ wait_event_type |   wait_event    | samples | pct  
+-----------------+-----------------+---------+------
+ LWLock          | WALWrite        |    1996 | 34.8
+ Buffer          | BufferExclusive |    1924 | 33.6
+ CPU (running)   | -               |    1143 | 20.0
+ IO              | WalSync         |     591 | 10.3
+ Client          | ClientRead      |      54 |  0.9
+ IO              | DataFileExtend  |       9 |  0.2
+ IO              | WalWrite        |       8 |  0.1
+ Buffer          | BufferShared    |       2 |  0.0
+ Timeout         | SpinDelay       |       1 |  0.0
+(9 rows)
+
+tps = 1467.801713

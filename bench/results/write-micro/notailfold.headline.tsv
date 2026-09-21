@@ -1,0 +1,25 @@
+rep1_build8_roaring	9699.955	59538296	
+rep1_build8_btree	4217.624	62121872	
+rep1_ins_roaring_8idx	1168.236	89777152	after checkpoint
+rep1_ins_roaring_8idx_steady	1058.142	53176680	second batch
+rep1_ins_btree_8idx	274.339	34922832	after checkpoint
+rep1_ins_btree_8idx_steady	202.316	7082760	second batch
+rep2_build8_roaring	9656.028	59538296	
+rep2_build8_btree	4232.424	62121784	
+rep2_ins_roaring_8idx	1155.000	89777224	after checkpoint
+rep2_ins_roaring_8idx_steady	1077.589	53176680	second batch
+rep2_ins_btree_8idx	255.578	34922832	after checkpoint
+rep2_ins_btree_8idx_steady	206.741	7082784	second batch
+rep3_build8_roaring	9648.962	59538384	
+rep3_build8_btree	4311.213	62121784	
+rep3_ins_roaring_8idx	1202.122	89777168	after checkpoint
+rep3_ins_roaring_8idx_steady	1090.420	53176680	second batch
+rep3_ins_btree_8idx	255.205	34922832	after checkpoint
+rep3_ins_btree_8idx_steady	196.286	7082800	second batch
+--- medians over 3 repeats
+build8_btree                     median     4232.4 ms       59.24 MiB
+build8_roaring                   median     9656.0 ms       56.78 MiB
+ins_btree_8idx                   median      255.6 ms       33.31 MiB
+ins_btree_8idx_steady            median      202.3 ms        6.75 MiB
+ins_roaring_8idx                 median     1168.2 ms       85.62 MiB
+ins_roaring_8idx_steady          median     1077.6 ms       50.71 MiB

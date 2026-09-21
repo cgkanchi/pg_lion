@@ -18,10 +18,19 @@
  *	  to the CHAIN case;
  *	- the key has a CHAIN entry: find the container page that owns the ckey,
  *	  copy the item out, add the member and write it back, splitting the
- *	  page if it no longer fits.  A BITSET container is the common case for a
- *	  low-cardinality key and never changes size, so it takes a fast path that
- *	  sets the bit in the page image instead of copying 4104 bytes out and
- *	  back (rbi_insert_bitset_inplace()).
+ *	  page if it no longer fits.
+ *
+ * The last case has an in-place fast path, which is what makes repeated
+ * inserts into one key cheap: when the item on the page can take the member
+ * without changing the number of bytes the page has allotted it, the member
+ * is added directly in the GenericXLog page image
+ * (rbi_insert_container_inplace(), rbi_insert_segment_inplace()) under the
+ * same locks and in the same single record as the entry tuple.  Nothing else
+ * on the page moves, so the WAL delta is a few bytes.  A BITSET container
+ * always qualifies (4104 bytes whatever its cardinality); an ARRAY or RUN
+ * container and a sparse segment qualify when the item has growth slack
+ * inside it (DESIGN.md §4), which the general path leaves behind whenever it
+ * writes an item on behalf of an insert.
  *
  * An item is a container or a sparse segment (DESIGN.md §13), and which one
  * owns a ckey decides what the insert does:
@@ -73,10 +82,14 @@ static void rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
 							  OffsetNumber entryoff, uint32 ckey, uint16 lo);
 static void rbi_insert_chain(Relation index, Buffer entrybuf,
 							 OffsetNumber entryoff, uint32 ckey, uint16 lo);
-static bool rbi_insert_bitset_inplace(Relation index, Buffer buf, OffsetNumber off,
-									  Buffer entrybuf, OffsetNumber entryoff,
-									  RBIEntryTuple *entry, Size entrysize,
-									  uint16 lo, bool *done);
+static bool rbi_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
+										 Buffer entrybuf, OffsetNumber entryoff,
+										 RBIEntryTuple *entry, Size entrysize,
+										 uint16 lo, bool *done);
+static bool rbi_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
+									   Buffer entrybuf, OffsetNumber entryoff,
+									   RBIEntryTuple *entry, Size entrysize,
+									   uint32 ckey, uint16 lo, bool *done);
 static void rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off,
 							   bool replace, Buffer entrybuf,
 							   OffsetNumber entryoff, RBIEntryTuple *entry,
@@ -276,8 +289,8 @@ rbi_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	entry->ntids += 1;
 	entry->ncontainers += (uint32) (w.nitems - (replace ? 1 : 0));
 
-	rbi_chain_put_items_locked(index, buf, entrybuf, entryoff, entry, off,
-							   replace, w.items, w.nitems);
+	rbi_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
+								   replace, w.items, w.nitems, true);
 }
 
 /*
@@ -571,38 +584,73 @@ rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
 }
 
 /*
- * Fast path for adding a member to a BITSET container that is already on a
- * page.  A bitset is always RBI_CONTAINER_MAX_SIZE bytes whatever its
- * cardinality, so the bit can be set directly in the page image instead of
- * copying 4104 bytes into a work buffer and the same 4104 bytes back through
- * PageIndexTupleOverwrite.  Nothing else about the page changes: the item
- * keeps its size and its offset, and minckey/maxckey keep their values
- * because the container keeps its ckey.
+ * Fast path for adding a member to a container that is already on a page:
+ * mutate the container in the page image instead of copying it into a work
+ * buffer, adding the member there and copying the whole thing back through
+ * PageIndexTupleOverwrite.  Nothing else about the page changes - the item
+ * keeps its ALLOCATED length (ItemIdGetLength) and its offset, so no other
+ * item moves - and minckey/maxckey keep their values because the container
+ * keeps its ckey.  The GenericXLog delta is then the handful of bytes the
+ * member really changed.
  *
- * Returns false if the container at (buf, off) is not a bitset; then nothing
- * has been done and the caller takes the general path.  Returns true with
- * *done set when the change (or the discovery that the TID was already
- * indexed) is complete.  buf and entrybuf are held EXCLUSIVE throughout and
- * stay locked; entry is the caller's private copy of the entry tuple, which
- * is written in the same WAL record as the container.
+ * Which containers qualify:
+ *
+ *	BITSET	always: it is RBI_CONTAINER_MAX_SIZE bytes whatever its
+ *			cardinality, so adding a member cannot change its size.
+ *	ARRAY	when the item has two spare bytes inside it (DESIGN.md §4,
+ *			growth slack) and the array is not at RBI_ARRAY_MAX_CARD, where
+ *			rbi_container_add() would turn it into a bitset.
+ *	RUN		when the item has room for one more run and the run count is
+ *			below RBI_RUN_MAX_NRUNS, for the same reason.
+ *
+ * Returns false when the container cannot take the member without changing
+ * its size on the page; then nothing has been done and the caller takes the
+ * general path (which is also what gives the item its slack for next time).
+ * Returns true with *done set when the change - or the discovery that the TID
+ * was already indexed - is complete.  buf and entrybuf are held EXCLUSIVE
+ * throughout and stay locked; entry is the caller's private copy of the entry
+ * tuple, which is written in the same WAL record as the container.
  */
 static bool
-rbi_insert_bitset_inplace(Relation index, Buffer buf, OffsetNumber off,
-						  Buffer entrybuf, OffsetNumber entryoff,
-						  RBIEntryTuple *entry, Size entrysize, uint16 lo,
-						  bool *done)
+rbi_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
+							 Buffer entrybuf, OffsetNumber entryoff,
+							 RBIEntryTuple *entry, Size entrysize, uint16 lo,
+							 bool *done)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
 	RBIContainer *onpage = (RBIContainer *) PageGetItem(page, iid);
+	Size		alloc = ItemIdGetLength(iid);
+	Size		need;
 	GenericXLogState *xstate;
 	Page		p;
 	RBIContainer *c;
 
-	if (onpage->type != RBI_CT_BITSET)
+	switch (onpage->type)
+	{
+		case RBI_CT_BITSET:
+			need = RBI_CONTAINER_MAX_SIZE;
+			break;
+
+		case RBI_CT_ARRAY:
+			if (onpage->cardinality >= RBI_ARRAY_MAX_CARD)
+				return false;	/* would become a bitset */
+			need = rbi_container_size(onpage) + sizeof(uint16);
+			break;
+
+		case RBI_CT_RUN:
+			if (RBI_RUN_NRUNS(onpage) >= RBI_RUN_MAX_NRUNS)
+				return false;	/* would become a bitset */
+			need = rbi_container_size(onpage) + sizeof(RBIRun);
+			break;
+
+		default:
+			return false;
+	}
+
+	if (alloc < need)
 		return false;
 
-	Assert(ItemIdGetLength(iid) == RBI_CONTAINER_MAX_SIZE);
 	*done = true;
 
 	/* Already indexed: do not start a record at all. */
@@ -614,8 +662,11 @@ rbi_insert_bitset_inplace(Relation index, Buffer buf, OffsetNumber off,
 	c = (RBIContainer *) PageGetItem(p, PageGetItemId(p, off));
 
 	if (!rbi_container_add(c, lo))
-		elog(ERROR, "roaring index: bitset container %u on block %u changed under an exclusive lock",
+		elog(ERROR, "roaring index: container %u on block %u changed under an exclusive lock",
 			 c->ckey, BufferGetBlockNumber(buf));
+
+	/* The whole point: the item still ends where it ended. */
+	Assert(rbi_container_size(c) <= alloc);
 
 	entry->ntids += 1;
 
@@ -627,6 +678,128 @@ rbi_insert_bitset_inplace(Relation index, Buffer buf, OffsetNumber off,
 	GenericXLogFinish(xstate);
 
 	return true;
+}
+
+/*
+ * The same for a sparse segment that is already on a page: insert the pair in
+ * its sorted place inside the item, which is one memmove of at most 4 KB
+ * (ckeys[] and los[] both shift) and leaves the item's allocated length and
+ * offset untouched.
+ *
+ * Only for a pair that really stays in the segment: a container key that
+ * reaches RBI_SPARSE_THRESHOLD members has to be promoted to a container of
+ * its own, which turns one item into up to three and belongs to
+ * rbi_insert_segment().  Unlike a container, a segment covers a RANGE of
+ * container keys, and the pair may extend it, so the page bounds are
+ * recomputed.
+ */
+static bool
+rbi_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
+						   Buffer entrybuf, OffsetNumber entryoff,
+						   RBIEntryTuple *entry, Size entrysize,
+						   uint32 ckey, uint16 lo, bool *done)
+{
+	Page		page = BufferGetPage(buf);
+	ItemId		iid = PageGetItemId(page, off);
+	RBIContainer *onpage = (RBIContainer *) PageGetItem(page, iid);
+	Size		alloc = ItemIdGetLength(iid);
+	GenericXLogState *xstate;
+	Page		p;
+	RBIContainer *s;
+	bool		dup = false;
+
+	Assert(onpage->type == RBI_CT_SPARSE);
+
+	if (onpage->cardinality >= RBI_SPARSE_MAX_PAIRS)
+		return false;			/* would have to split */
+	if (rbi_sparse_count(onpage, ckey) + 1 >= RBI_SPARSE_THRESHOLD)
+		return false;			/* would have to promote the container key */
+	if (alloc < rbi_sparse_size(onpage) + RBI_SPARSE_PAIR_SIZE)
+		return false;			/* no slack inside the item */
+
+	*done = true;
+
+	if (rbi_sparse_contains(onpage, ckey, lo))
+		return true;
+
+	xstate = GenericXLogStart(index);
+	p = GenericXLogRegisterBuffer(xstate, buf, 0);
+	s = (RBIContainer *) PageGetItem(p, PageGetItemId(p, off));
+
+	if (!rbi_sparse_insert(s, ckey, lo, &dup) || dup)
+		elog(ERROR, "roaring index: sparse segment %u on block %u changed under an exclusive lock",
+			 off, BufferGetBlockNumber(buf));
+
+	Assert(rbi_sparse_size(s) <= alloc);
+
+	/* A segment's range can grow in either direction. */
+	rbi_page_update_minmax(p);
+
+	entry->ntids += 1;
+
+	if (!rbi_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
+		elog(ERROR, "roaring index: could not update entry %u on block %u",
+			 entryoff, BufferGetBlockNumber(entrybuf));
+
+	GenericXLogFinish(xstate);
+
+	return true;
+}
+
+/*
+ * Lock the container page that owns ckey EXCLUSIVE, for the CHAIN insert path.
+ *
+ * The append case - the ckey belongs on the chain's tail page, which is where
+ * every insert into a growing posting set lands - is decided with the
+ * exclusive lock the insert needs anyway.  rbi_chain_find_page() would take a
+ * SHARE lock on that very page first, only to read its minckey and drop it
+ * again, and on a hot key that is one more handoff of the page's lock between
+ * the waiters for nothing: the measured ceiling of concurrent inserts into
+ * one key is set by how often the page lock changes hands, not by how long
+ * any one holder keeps it (DESIGN.md §5).
+ *
+ * An empty tail page owns nothing (its minckey is 0, which would swallow
+ * every ckey), so it falls through to the walk, exactly as in
+ * rbi_chain_find_page().  Nothing is held while walking: the tail lock is
+ * dropped first, so no page is ever locked before a page to its left.
+ */
+static Buffer
+rbi_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
+						   uint32 ckey)
+{
+	Buffer		buf;
+	Page		page;
+	BlockNumber blk;
+
+	Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
+
+	buf = ReadBuffer(index, tail);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+
+	if (!RBIPageIsContainer(page))
+	{
+		UnlockReleaseBuffer(buf);
+		elog(ERROR, "roaring index: block %u is not a container page", tail);
+	}
+
+	if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber &&
+		ckey >= RBIPageGetOpaque(page)->minckey)
+		return buf;
+
+	UnlockReleaseBuffer(buf);
+
+	blk = rbi_chain_find_page(index, head, tail, ckey);
+	buf = ReadBuffer(index, blk);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+	if (!RBIPageIsContainer(BufferGetPage(buf)))
+	{
+		UnlockReleaseBuffer(buf);
+		elog(ERROR, "roaring index: block %u is not a container page", blk);
+	}
+
+	return buf;
 }
 
 /*
@@ -656,16 +829,9 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 	cbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
 
-	blk = rbi_chain_find_page(index, ecopy->head, ecopy->tail, ckey);
-	buf = ReadBuffer(index, blk);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	buf = rbi_insert_lock_chain_page(index, ecopy->head, ecopy->tail, ckey);
+	blk = BufferGetBlockNumber(buf);
 	cpage = BufferGetPage(buf);
-
-	if (!RBIPageIsContainer(cpage))
-	{
-		UnlockReleaseBuffer(buf);
-		elog(ERROR, "roaring index: block %u is not a container page", blk);
-	}
 
 	/* Which item owns this ckey: a container, a segment, or nothing yet? */
 	off = rbi_page_find_item(cpage, ckey, &found);
@@ -674,8 +840,12 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		((RBIContainer *) PageGetItem(cpage, PageGetItemId(cpage, off)))->type
 		== RBI_CT_SPARSE)
 	{
-		rbi_insert_segment(index, buf, off, true, entrybuf, entryoff, ecopy,
-						   ckey, lo);
+		bool		done = false;
+
+		if (!rbi_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
+										ecopy, esize, ckey, lo, &done))
+			rbi_insert_segment(index, buf, off, true, entrybuf, entryoff,
+							   ecopy, ckey, lo);
 		UnlockReleaseBuffer(buf);
 		pfree(cbuf);
 		pfree(ecopy);
@@ -704,8 +874,13 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 		if (target != InvalidOffsetNumber)
 		{
-			rbi_insert_segment(index, buf, target, true, entrybuf, entryoff,
-							   ecopy, ckey, lo);
+			bool		done = false;
+
+			if (!rbi_insert_segment_inplace(index, buf, target, entrybuf,
+											entryoff, ecopy, esize, ckey, lo,
+											&done))
+				rbi_insert_segment(index, buf, target, true, entrybuf,
+								   entryoff, ecopy, ckey, lo);
 			UnlockReleaseBuffer(buf);
 			pfree(cbuf);
 			pfree(ecopy);
@@ -728,8 +903,8 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 		Assert(((RBIContainer *) PageGetItem(cpage, ciid))->ckey == ckey);
 
-		if (rbi_insert_bitset_inplace(index, buf, off, entrybuf, entryoff,
-									  ecopy, esize, lo, &done))
+		if (rbi_insert_container_inplace(index, buf, off, entrybuf, entryoff,
+										 ecopy, esize, lo, &done))
 		{
 			Assert(done);
 			UnlockReleaseBuffer(buf);
@@ -738,6 +913,14 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 			return;
 		}
 
+		/*
+		 * The item may be longer than the container needs (growth slack,
+		 * DESIGN.md §4); copying the slack along is harmless, and the
+		 * allocated length can never exceed a work buffer.
+		 */
+		if (ItemIdGetLength(ciid) > RBI_CONTAINER_MAX_SIZE)
+			elog(ERROR, "roaring index: container of %zu bytes at %u/%u",
+				 (Size) ItemIdGetLength(ciid), blk, off);
 		memcpy(cbuf, PageGetItem(cpage, ciid), ItemIdGetLength(ciid));
 		if (!rbi_container_add(cbuf, lo))
 		{
@@ -751,8 +934,8 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 	ecopy->ntids += 1;
 
-	rbi_chain_put_container_locked(index, buf, entrybuf, entryoff, ecopy, cbuf,
-								   &delta);
+	rbi_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, ecopy,
+									   cbuf, &delta, true);
 	UnlockReleaseBuffer(buf);
 
 	Assert(delta == 0);
@@ -777,6 +960,7 @@ rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	bool		found;
+	int			npages = 0;
 
 	hash = (reservedflag != 0) ? RBI_NULLKEY_HASH : rbi_hash_key(state, key);
 
@@ -786,10 +970,12 @@ rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
 	LockBuffer(headbuf, BUFFER_LOCK_EXCLUSIVE);
 
 	found = (reservedflag != 0) ?
-		rbi_find_reserved_entry(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
-								reservedflag, &entrybuf, &entryoff) :
-		rbi_find_entry(index, state, headbuf, BUFFER_LOCK_EXCLUSIVE,
-					   key, hash, &entrybuf, &entryoff);
+		rbi_find_reserved_entry_counted(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
+										reservedflag, &entrybuf, &entryoff,
+										&npages) :
+		rbi_find_entry_counted(index, state, headbuf, BUFFER_LOCK_EXCLUSIVE,
+							   key, hash, NULL, InvalidOid, &entrybuf,
+							   &entryoff, &npages);
 
 	if (!found)
 	{
@@ -815,6 +1001,15 @@ rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
 	}
 
 	UnlockReleaseBuffer(headbuf);
+
+	/*
+	 * The bucket directory guard (DESIGN.md §5): this insert has just walked
+	 * the chain of one bucket, and a chain that long means the index holds
+	 * several times the entry bytes its bucket count was chosen for.  Said
+	 * after the locks are gone, because ereport() can be interrupted.
+	 */
+	if (npages > RBI_BUCKET_PAGES_WARN)
+		rbi_warn_bucket_chain(index, npages);
 }
 
 /*

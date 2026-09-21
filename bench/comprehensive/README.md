@@ -1,5 +1,10 @@
 # Reproducible PostgreSQL index comparison
 
+For routine development, use the [quick progress benchmark](../QUICK.md). It keeps B-tree,
+GIN, roaring, and roaring_bitmap at 1M and 5M rows, uses two timing rounds and a reduced
+query/index matrix, and generates baseline query deltas automatically.
+The revised default finished in 4 minutes 28 seconds on the benchmark host.
+
 This suite measures the current extension against sequential scans, B-tree, a tuned B-tree portfolio, hash, GIN, GiST, and BRIN. Roaring is measured both with count pushdown and through the ordinary bitmap path. It creates its own temporary database cluster; it never changes `pg_index.indisvalid` or connects to a user-supplied database endpoint.
 
 Start with the [results and interpretation](../COMPARISON.md). The full measured report is [searchable HTML](../results/2026-09-20-comparison/index.html) or [complete Markdown](../results/2026-09-20-comparison/REPORT.md). The [follow-up review](../../FOLLOWUP_REVIEW.md) tracks the remaining code findings. Historical measurements in the root README use different datasets/builds and should not be merged into this run.

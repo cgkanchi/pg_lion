@@ -363,6 +363,71 @@ SELECT rbi_arrcmp($$SELECT m FROM rbi_arr_odd WHERE m @> '{{1,2}}'$$);
 SELECT rbi_arrcmp($$SELECT d FROM rbi_arr_odd WHERE d @> '{b}'$$);
 DROP TABLE rbi_arr_odd;
 
+-- ---- costing the ALL-mode fallback (2026-09-21 follow-up review) -------
+/*
+ * `<@`, `@> '{}'` and any query with a NULL element cannot be answered from
+ * the stored element memberships: the extractor falls back to RBI_QMODE_ALL,
+ * the scan emits the union of every entry, and every candidate row is
+ * fetched and rechecked in the heap (DESIGN.md §17).  The generic index
+ * estimate used to price that with the PREDICATE's selectivity, which made a
+ * whole-index traversal plus a whole-table recheck look like a selective
+ * lookup.
+ *
+ * sum(id) keeps the count pushdown out of the comparison, so what is being
+ * chosen between is the bitmap plan and the sequential scan.  An exact `@>`
+ * or `&&` must keep the bitmap scan; an ALL-mode query must lose it.  A
+ * multi-key clause whose value is not a plan-time Const has to be priced as
+ * the expensive shape too, because the query's SHAPE is what decides its
+ * mode.
+ */
+CREATE TABLE rbi_arrc (id int NOT NULL, tags text[] NOT NULL);
+INSERT INTO rbi_arrc
+SELECT i, ARRAY['t' || (i % 20), 't' || (i % 400), 'u' || i]
+  FROM generate_series(1, 20000) i;
+CREATE INDEX rbi_arrc_tags ON rbi_arrc USING roaring (tags);
+VACUUM ANALYZE rbi_arrc;
+-- exact: containment and overlap over real elements
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc WHERE tags @> ARRAY['u500'];
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+	WHERE tags @> ARRAY['u500', 't0'];
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+	WHERE tags && ARRAY['u500', 'u501'];
+-- ALL mode: `<@`, the empty array, a NULL element
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+	WHERE tags <@ ARRAY['u500', 't0', 't1'];
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc WHERE tags @> ARRAY[]::text[];
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM rbi_arrc
+	WHERE tags @> ARRAY['u500', NULL];
+-- an unknown value has to be priced as the expensive shape as well
+PREPARE rbi_arrc_p(text[]) AS SELECT sum(id) FROM rbi_arrc WHERE tags @> $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE rbi_arrc_p(ARRAY['u500']);
+RESET plan_cache_mode;
+DEALLOCATE rbi_arrc_p;
+/*
+ * ... and the count pushdown refuses a multi-key clause it cannot see the
+ * query of, for the same reason: `tags @> $1` with `$1 = '{}'` extracts to
+ * ALL mode, which this node cannot answer at all, and at execution time
+ * there would be no plan left to fall back to (DESIGN.md §17).  A CUSTOM
+ * plan folds the parameter to a literal and is pushed down as usual.
+ */
+PREPARE rbi_arrc_c(text[]) AS SELECT count(*) FROM rbi_arrc WHERE tags @> $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE rbi_arrc_c(ARRAY['u500']);
+EXECUTE rbi_arrc_c(ARRAY['u500']);
+EXECUTE rbi_arrc_c(ARRAY[]::text[]);
+SET plan_cache_mode = force_custom_plan;
+EXPLAIN (COSTS OFF) EXECUTE rbi_arrc_c(ARRAY['u500']);
+EXECUTE rbi_arrc_c(ARRAY['u500']);
+RESET plan_cache_mode;
+DEALLOCATE rbi_arrc_c;
+-- and the answers are the same whichever plan runs
+SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arrc
+				    WHERE tags <@ ARRAY['u500', 't0', 't1']$$);
+SELECT rbi_arrcmp($$SELECT count(*) FROM rbi_arrc
+				    WHERE tags @> ARRAY['u500', 't0']$$);
+DROP TABLE rbi_arrc;
+
 -- ---- max_entries, the cardinality guard --------------------------------
 CREATE TABLE rbi_arr_many (a text[]);
 INSERT INTO rbi_arr_many

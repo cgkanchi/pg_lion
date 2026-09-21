@@ -31,10 +31,45 @@
 typedef struct RBICountStats
 {
 	int64		blocks_skipped_via_vm;	/* heap blocks counted from the VM */
-	int64		tids_rechecked; /* TIDs actually fetched from the heap */
-	int64		blocks_rechecked;	/* heap blocks pinned for those fetches */
+	int64		tids_rechecked; /* TIDs resolved by a heap recheck, cache hits
+								 * included */
+	int64		blocks_rechecked;	/* heap blocks pinned for those rechecks */
 	int64		containers_visited; /* containers read from the indexes */
+
+	/*
+	 * The per-query visibility cache (RBIVisCache below).  cache_hits counts
+	 * the heap block visits it answered without touching the buffer manager,
+	 * so cache_hits + blocks_rechecked is the number of block visits the
+	 * recheck asked for.  cache_full counts the block visits that had to be
+	 * fetched because the cache had reached its work_mem budget.
+	 */
+	int64		cache_hits;
+	int64		cache_full;
 } RBICountStats;
+
+/*
+ * A per-query cache of heap visibility answers for blocks that are not
+ * all-visible (DESIGN.md §9).
+ *
+ * A TID's visibility under one MVCC snapshot cannot change while that
+ * snapshot is held, so the answer for every root line pointer of a heap page
+ * may be resolved once and reused by every later recheck of that page - which
+ * is what turns the GROUP BY path's one-recheck-per-group-per-dirty-page into
+ * one pass over the dirty pages.  The safety argument is in rbi_count.c above
+ * rbi_vis_cache_lookup().
+ *
+ * The handle is opaque and is created once per count node execution, in a
+ * context the caller owns; rbi_count_sources_cached() empties it by itself if
+ * it is ever handed a different relation or a different snapshot, so one
+ * handle can serve every group of every partition of a partitioned count.
+ * Passing NULL means "no cache": every recheck then fetches its own blocks,
+ * exactly as before this cache existed.
+ */
+typedef struct RBIVisCache RBIVisCache;
+
+extern RBIVisCache *rbi_vis_cache_create(MemoryContext parent);
+extern void rbi_vis_cache_reset(RBIVisCache *cache);
+extern void rbi_vis_cache_destroy(RBIVisCache *cache);
 
 /*
  * A located posting set: everything the counting code needs in order to
@@ -144,6 +179,24 @@ extern bool rbi_posting_set_lookup_null(Relation index, RBIPostingSet *ps);
 extern bool rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
 								   RBIPostingSet *ps);
 
+/*
+ * Locate the posting sets of nvalues keys of one index at once: the IN list
+ * of DESIGN.md §15.  isnull may be NULL (no value is NULL), and NULL values
+ * are skipped, as `col = NULL` is never true.  The keys are hashed first and
+ * their entries located in (bucket, hash) order, so the bucket pages are read
+ * in ascending block order, and duplicates are dropped in one pass over that
+ * order rather than by comparing every value with every earlier one.
+ *
+ * sets must have room for nvalues; the located sets come out packed at the
+ * front and the return value is how many there are - every one of which the
+ * caller must release.  *nfound (optional) is how many have an entry at all,
+ * so *nfound == 0 means the union selects no rows.
+ */
+extern int rbi_posting_set_lookup_many(Relation index, Oid keytype,
+									   int nvalues, const Datum *values,
+									   const bool *isnull,
+									   RBIPostingSet *sets, int *nfound);
+
 /* Drop whatever pin/memory the posting set holds.  Idempotent. */
 extern void rbi_posting_set_release(RBIPostingSet *ps);
 
@@ -167,6 +220,17 @@ extern int64 rbi_count_posting_sets(Relation heap, Snapshot snapshot,
 extern int64 rbi_count_sources(Relation heap, Snapshot snapshot,
 							   int nsources, RBICountSource *sources,
 							   RBICountStats *stats);
+
+/*
+ * The same, sharing one visibility cache across calls (DESIGN.md §9).  This
+ * is what a driver that counts the same relation many times under one
+ * snapshot - the GROUP BY path of §10, one call per group - should use; cache
+ * may be NULL, and then this is exactly rbi_count_sources().
+ */
+extern int64 rbi_count_sources_cached(Relation heap, Snapshot snapshot,
+									  int nsources, RBICountSource *sources,
+									  RBICountStats *stats,
+									  RBIVisCache *cache);
 
 /*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and

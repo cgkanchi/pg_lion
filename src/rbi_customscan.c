@@ -40,6 +40,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/genam.h"
 #include "access/nbtree.h"
 #include "access/relation.h"
@@ -74,7 +76,9 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/selfuncs.h"
+#include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -152,8 +156,14 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  *	2	IntList: base RT index, group attnum (0 if none), the RBI_FLAG_* bits,
  *		then one attnum per WHERE clause.  Attnums are the PARENT's
  *		throughout; each partition's own numbering lives in its index Oids.
- *	3	List of Const: one per WHERE clause - the compared value, the array of
- *		an IN list, or a NULL placeholder for a null test
+ *	3	List of Expr, one per WHERE clause: the compared value, the array of
+ *		an IN list, or a NULL Const placeholder for a null test.  It is a
+ *		Const for a literal query and a Param - or an ArrayExpr over Consts
+ *		and Params - for a prepared one (DESIGN.md §10).  The PATH carries
+ *		them here; rbi_plan_custom_path() moves them into the CustomScan's
+ *		custom_exprs and leaves this member empty, because that is the field
+ *		setrefs.c fixes up and SS_finalize_plan() collects Param ids from -
+ *		without which a changed exec Param would not rescan the node
  *	4	IntList: RBI_CLAUSE_* for each WHERE clause
  *	5	List of OidList, one per live leaf partition and empty for a plain
  *		table (DESIGN.md §16): heap Oid, group index Oid (InvalidOid if
@@ -175,9 +185,11 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
  * 2 dropped the group column member, which only the cross-partition hash
- * merge needed (DESIGN.md §16: the node emits partial aggregates now).
+ * merge needed (DESIGN.md §16: the node emits partial aggregates now).  Shape
+ * 3 moved the clause values out of member 3 and into custom_exprs, so that a
+ * Param among them reaches setrefs.c and SS_finalize_plan() (DESIGN.md §10).
  */
-#define RBI_PRIV_MAGIC		0x52424902
+#define RBI_PRIV_MAGIC		0x52424903
 #define RBI_PRIV_NMEMBERS	8
 
 /*
@@ -196,7 +208,23 @@ typedef struct RBIClauseState
 	Oid			idxoid;
 	Oid			opno;			/* the clause's operator (0 for a null test) */
 	AttrNumber	attno;
-	Const	   *con;			/* value, array, query, or a NULL placeholder */
+
+	/*
+	 * The compared value: its expression (from custom_exprs), the expression
+	 * itself when it is a plain Const, an initialised ExprState when it is
+	 * not, and the value once it has been evaluated.  A literal query has its
+	 * value ready at plan time; a prepared one evaluates its Param through
+	 * the node's ExprContext at the start of every scan and after every
+	 * ReScan, because a nested loop changes an exec Param between them
+	 * (DESIGN.md §10).
+	 */
+	Expr	   *valexpr;
+	Const	   *con;			/* valexpr, when it is a Const; else NULL */
+	ExprState  *valstate;		/* set up when valexpr is not a Const */
+	Oid			valtype;		/* type valexpr produces */
+	Datum		val;
+	bool		valisnull;
+
 	StrategyNumber strategy;	/* RBI_CLAUSE_MULTI: 2, 3 or 5 */
 	Relation	idx;
 	Datum		storedkey;
@@ -258,6 +286,7 @@ typedef struct RBICountScanState
 	RBICountSource *sources;
 	RBIPostingSet groupset;
 	bool		located;
+	bool		valsdone;		/* the clause values have been evaluated */
 	bool		wheremissing;	/* a positive clause selects nothing at all */
 	bool		scanning;
 	bool		done;
@@ -277,6 +306,17 @@ typedef struct RBICountScanState
 	MemoryContext pergroup;		/* reset before each group is counted */
 	MemoryContext wherecxt;		/* the located WHERE payload copies */
 	MemoryContext keycxt;		/* the clause keys a target list may print */
+	MemoryContext valcxt;		/* the evaluated Param values */
+
+	/*
+	 * One visibility cache for the whole node execution (DESIGN.md §9).
+	 * Every group of every partition counts through it, so a heap block the
+	 * visibility map cannot vouch for is fetched once per query however many
+	 * groups come back to it - which is what the cost model above is allowed
+	 * to assume.  It is emptied on ReScan and whenever the relation or the
+	 * snapshot changes under it (rbi_count_sources_cached() does the latter).
+	 */
+	RBIVisCache *viscache;
 	RBICountStats stats;
 } RBICountScanState;
 
@@ -985,12 +1025,15 @@ rbi_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  *
  *	- for each WHERE key: ONE bucket page (a hash lookup), then that key's own
  *	  container chain, which was written sequentially and is a fraction of the
- *	  index's container pages proportional to the clause selectivity;
+ *	  index's container pages proportional to the clause selectivity.  An IN
+ *	  list is one such lookup per element (DESIGN.md §15);
  *	- for a GROUP BY: every page of the group index;
- *	- one O(1) step per container (the visibility map is read per container);
+ *	- one O(1) step per container per participating source (the visibility map
+ *	  is read per container);
  *	- the heap the visibility map cannot vouch for: the TIDs on blocks that
  *	  are not all-visible (pg_class.relallvisible via RelOptInfo.allvisfrac),
- *	  each rechecked in the heap, on as many distinct blocks as there can be.
+ *	  each resolved against the snapshot, on as many distinct blocks as there
+ *	  can be - each of them fetched once per query.
  *
  * The bucket pages are NOT charged wholesale: an index carries at least
  * RBI_DEFAULT_BUCKETS of them, which would price a single-key count on a
@@ -1018,6 +1061,71 @@ rbi_index_bucket_pages(IndexOptInfo *idx)
 	return nbuckets;
 }
 
+/*
+ * How many containers a posting set of `members` members can span: one per
+ * RBI_BLOCKS_PER_CONTAINER heap pages, and never more than one per member.
+ */
+static double
+rbi_containers_for(double heap_pages, double members)
+{
+	return Max(1.0, Min(heap_pages / RBI_BLOCKS_PER_CONTAINER, members));
+}
+
+/*
+ * The cost of ONE fetch of each of `pages` distinct heap pages of a relation
+ * that has `heap_pages` pages altogether, per page.
+ *
+ * A recheck pass is not a sequence of random disk reads when the pages it
+ * touches are in memory, and two things say that they are:
+ *
+ *	- the working set's share of the cache.  effective_cache_size is what the
+ *	  planner is told about the memory available for caching, and
+ *	  index_pages_fetched() already prorates it over the pages of the query's
+ *	  relations; a dirty working set that fits in this relation's share of it
+ *	  is read from memory rather than from the device, which is what makes a
+ *	  count that visits each dirty page at most once per query (DESIGN.md §9)
+ *	  cheap even when it returns to those pages for every group;
+ *	- and the set's density.  A set that covers most of the relation is read
+ *	  in physical order whatever the cache holds, which is the interpolation
+ *	  cost_bitmap_heap_scan() makes between the two page costs.
+ *
+ * Whichever of the two argues for sequential access more strongly decides,
+ * and the answer moves between seq_page_cost and random_page_cost - so a
+ * dirty working set far larger than the cache is still charged as random
+ * I/O, which is the case a blanket preference for this node would get wrong.
+ */
+static Cost
+rbi_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
+				   double heap_pages)
+{
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+	double		total_pages;
+	double		cache_pages;
+	double		resident;
+	double		density;
+	double		seqness;
+
+	if (pages <= 0.0)
+		return 0.0;
+
+	get_tablespace_page_costs(rel->reltablespace,
+							  &spc_random_page_cost,
+							  &spc_seq_page_cost);
+
+	/* This relation's prorated share of the cache, as index_pages_fetched(). */
+	total_pages = Max(root->total_table_pages, heap_pages);
+	cache_pages = Max((double) effective_cache_size * heap_pages / total_pages,
+					  1.0);
+
+	resident = Min(cache_pages / pages, 1.0);
+	density = sqrt(Min(pages / heap_pages, 1.0));
+	seqness = Max(resident, density);
+
+	return spc_random_page_cost -
+		(spc_random_page_cost - spc_seq_page_cost) * seqness;
+}
+
 static Cost
 rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx,
@@ -1027,81 +1135,105 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		dirty_pages;
 	double		matching = Max(rel->rows, 1.0);
-	double		containers_per_key;
+	double		tuples = Max(rel->tuples, 1.0);
 	double		random_pages = 0;	/* bucket page lookups */
 	double		seq_pages = 0;	/* container chains, read in order */
-	double		ncontainers;
+	double		ncontainers = 0;
+	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
 	double		recheck_pages;
 	Cost		run;
 	ListCell   *lc1;
 	ListCell   *lc2;
 
-	/*
-	 * A key's posting set has at most one container per
-	 * RBI_BLOCKS_PER_CONTAINER heap pages and at most one per matching row.
-	 */
-	containers_per_key = Min(heap_pages / RBI_BLOCKS_PER_CONTAINER, matching);
-	containers_per_key = Max(containers_per_key, 1.0);
-
 	forboth(lc1, whereidx, lc2, whereclauses)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
-		Selectivity sel = clause_selectivity(root, (Node *) lfirst(lc2),
-											 0, JOIN_INNER, NULL);
+		Node	   *clause = (Node *) lfirst(lc2);
+		Selectivity sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		double		nbuckets = Max(rbi_index_bucket_pages(idx), 1.0);
 		double		container_pages;
+		double		nkeys = 1.0;
 
-		container_pages = (double) idx->pages - 1.0 - rbi_index_bucket_pages(idx);
+		container_pages = (double) idx->pages - 1.0 - nbuckets;
 		container_pages = Max(container_pages, 0.0);
 
-		random_pages += 1.0;
-		seq_pages += Max(1.0, container_pages * sel);
+		/*
+		 * An IN list costs one lookup per element (DESIGN.md §15).  Each of
+		 * them hashes to a bucket page of its own - at most one per bucket,
+		 * so a list longer than the index has buckets shares them - walks a
+		 * chain of its own, whose pages are its share of the container pages
+		 * but never fewer than one, and contributes a sub-cursor of its own
+		 * to the union the merge evaluates.  A union of k sets merges the
+		 * members of all of them, which costs log2(k) comparisons per member
+		 * however the merge is organised, and that is the term that makes a
+		 * long list lose: at one million rows a thousand-element list took
+		 * 15 ms against the B-tree index-only scan's 3.1 ms and was chosen
+		 * anyway, because every element was priced as one bucket page (the
+		 * 2026-09-21 follow-up review).  A single-key clause has k = 1 and
+		 * pays nothing for a merge it does not make.
+		 */
+		if (IsA(clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+			nkeys = Max(estimate_array_length(root,
+											  (Node *) lsecond(saop->args)),
+						1.0);
+		}
+
+		random_pages += Min(nkeys, nbuckets);
+		seq_pages += Max(nkeys, container_pages * sel);
+		ncontainers += nkeys * rbi_containers_for(heap_pages,
+												  tuples * sel / nkeys);
+		if (nkeys > 1.0)
+			merge_ops += tuples * sel * log2(nkeys);
 	}
-	if (groupidx != NULL)
-		seq_pages += Max(1.0, (double) groupidx->pages);
 
 	if (groupidx != NULL)
-		ncontainers = numgroups * Max(1.0, Min(heap_pages / RBI_BLOCKS_PER_CONTAINER,
-											   matching / Max(numgroups, 1.0)));
-	else
-		ncontainers = containers_per_key;
-	ncontainers *= Max(1, list_length(whereidx) + (groupidx != NULL ? 1 : 0));
+	{
+		seq_pages += Max(1.0, (double) groupidx->pages);
+		ncontainers += numgroups *
+			rbi_containers_for(heap_pages, matching / Max(numgroups, 1.0));
+	}
+	ncontainers = Max(ncontainers, 1.0);
 
 	/*
 	 * Rechecking is what makes the pushdown expensive, and the estimate has
 	 * to say so: every TID whose heap block the visibility map cannot vouch
-	 * for is fetched from the heap.  Charge cpu_tuple_cost for each of them
-	 * and one random page fetch per distinct block they are expected to
-	 * touch.
+	 * for is resolved against the snapshot.
 	 *
 	 * The blocks that can be touched are only the ones the visibility map
 	 * cannot vouch for - heap_pages * dirtyfrac, from the same
-	 * relallvisible/relpages the TID estimate comes from - and a single count
-	 * visits each of them at most once, because it walks the merged result in
-	 * TID order.  Charging random reads across the WHOLE heap instead made
-	 * the model refuse the pushdown on freshly vacuumed tables, where it is
-	 * at its best (the 2026-09-20 review, finding 5).
+	 * relallvisible/relpages the TID estimate comes from - and each of them
+	 * is FETCHED AT MOST ONCE per query, whatever brings the count back to
+	 * it: the per-query visibility cache resolves every root line pointer of
+	 * a dirty page on its first visit and answers every later visit out of
+	 * memory (DESIGN.md §9).  Charging random reads across the whole heap
+	 * instead made the model refuse the pushdown on freshly vacuumed tables,
+	 * where it is at its best (the 2026-09-20 review, finding 5).
 	 *
-	 * A GROUP BY is the case that really does return to a block repeatedly:
-	 * every group whose rows include a tuple on a dirty block pins it again,
-	 * so the visits are numgroups per dirty block, bounded by the number of
-	 * rechecked TIDs (a block cannot be visited more often than it has
-	 * candidate TIDs on it).  That keeps the case the model exists for - a
-	 * thousand groups of one TID per block on a heap the visibility map
-	 * cannot vouch for - losing to the sequential scan that would do the
-	 * same work once.
+	 * A GROUP BY therefore pays for the same working set as a single count,
+	 * once, and what it repeats per group is CPU: one visibility-bit lookup
+	 * per candidate TID - and the candidates of all the groups together are
+	 * the same matching * dirtyfrac - plus the per-group container
+	 * bookkeeping already in ncontainers above.  Charging
+	 * numgroups * dirty_pages RANDOM reads instead asked 1.8M cost units for
+	 * a 200-group count of five million rows with 9% of the heap pages
+	 * dirty, against the sequential aggregate's 175k, for a node that ran in
+	 * 148 ms against 1174 ms over a resident 71 MiB working set with zero
+	 * physical reads (the 2026-09-21 follow-up review).
 	 */
 	dirty_pages = Min(heap_pages * dirtyfrac, heap_pages);
 	recheck_tids = matching * dirtyfrac;
-	if (groupidx != NULL)
-		recheck_pages = Min(numgroups * dirty_pages, recheck_tids);
-	else
-		recheck_pages = Min(recheck_tids, dirty_pages);
+	recheck_pages = Min(recheck_tids, dirty_pages);
 
 	run = random_pages * random_page_cost;
 	run += seq_pages * seq_page_cost;
 	run += ncontainers * cpu_operator_cost * 2.0;	/* block mask + VM mask */
-	run += recheck_pages * random_page_cost;
+	run += merge_ops * cpu_operator_cost;
+	run += recheck_pages * rbi_heap_page_cost(root, rel, recheck_pages,
+											  heap_pages);
 	run += recheck_tids * cpu_tuple_cost;
 	run += numgroups * cpu_tuple_cost;
 
@@ -1158,6 +1290,54 @@ rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	 */
 	cpath->path.startup_cost = (outrows <= 1.0) ? run : 0.0;
 	cpath->path.total_cost = run;
+}
+
+/*
+ * Is this expression a value the node can compare a column with - a literal,
+ * or a parameter it evaluates at the start of the scan (DESIGN.md §10)?
+ *
+ * A Param is accepted wherever a Const is, which is what lets a prepared
+ * statement's GENERIC plan reach the pushdown: the planner leaves `k = $1` as
+ * a Param, the cost model uses its default selectivity, and the executor
+ * evaluates it through the node's own ExprContext.  Both parameter kinds
+ * qualify: PARAM_EXTERN for a prepared statement's own parameters and
+ * PARAM_EXEC for the ones a nested loop or a LATERAL reference supplies,
+ * which change between rescans.
+ *
+ * An ArrayExpr is accepted for the array of an IN list, because that is the
+ * shape `k IN ($1, $2)` keeps in a generic plan, but only over literals and
+ * parameters: the node evaluates the array ONCE per scan, and an element that
+ * could be volatile does not mean the same thing evaluated once as it does
+ * evaluated per row.
+ */
+static bool
+rbi_is_value_expr(Node *node, bool allow_array_expr)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Const))
+		return true;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		return (p->paramkind == PARAM_EXTERN || p->paramkind == PARAM_EXEC);
+	}
+	if (allow_array_expr && IsA(node, ArrayExpr))
+	{
+		ArrayExpr  *a = (ArrayExpr *) node;
+		ListCell   *lc;
+
+		if (a->multidims || a->elements == NIL)
+			return false;
+		foreach(lc, a->elements)
+		{
+			if (!rbi_is_value_expr(rbi_strip((Node *) lfirst(lc)), false))
+				return false;
+		}
+		return true;
+	}
+	return false;
 }
 
 /*
@@ -1290,7 +1470,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
 	List	   *clauseinfos = NIL;	/* RBIClauseInfo, one per clause */
 	List	   *whereclauses = NIL; /* the clause, for selectivity */
-	List	   *whereconsts = NIL;	/* its Const (a placeholder for a null test) */
+	List	   *whereconsts = NIL;	/* its value expression - a Const, a Param,
+									 * or a NULL placeholder for a null test */
 	List	   *wherekinds = NIL;	/* RBI_CLAUSE_* */
 	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
 	List	   *posattnos = NIL;	/* columns with a positive clause */
@@ -1386,8 +1567,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	{
 		/*
 		 * Every GROUP BY column was proved constant by the planner (it does
-		 * that for a column with an equality qual against a Const), so the
-		 * query has exactly one group - but, unlike a plain aggregate, it
+		 * that for a column with an equality qual against anything that is
+		 * not a Var - a literal or a parameter), so the query has one group - but, unlike a plain aggregate, it
 		 * must produce no row at all when nothing matches.
 		 */
 		singlegroup = (parse->groupClause != NIL);
@@ -1448,7 +1629,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 		Node	   *clause;
 		Var		   *var = NULL;
-		Const	   *con = NULL;
+		Node	   *val = NULL;	/* the value expression, or a placeholder */
 		Oid			opno = InvalidOid;	/* operator the index must know */
 		Oid			cmptype = InvalidOid;	/* type the index is compared with */
 		StrategyNumber strategy = 0;	/* multi-key clauses only */
@@ -1484,24 +1665,29 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			if (strategy == RBI_STRAT_EQUAL)
 			{
 				/* Equality commutes, so either side may hold the column. */
-				if (IsA(left, Var) && IsA(right, Const))
+				if (IsA(left, Var) && rbi_is_value_expr(right, false))
 				{
 					var = (Var *) left;
-					con = (Const *) right;
+					val = right;
 				}
-				else if (IsA(left, Const) && IsA(right, Var))
+				else if (rbi_is_value_expr(left, false) && IsA(right, Var))
 				{
 					var = (Var *) right;
-					con = (Const *) left;
+					val = left;
 				}
 				else
 					return;
 
-				if (con->constisnull)
+				/*
+				 * A literal NULL equals nothing.  A parameter that turns out
+				 * to be NULL is the same answer, but only the executor can
+				 * see it, so it selects no rows there instead.
+				 */
+				if (IsA(val, Const) && ((Const *) val)->constisnull)
 					return;
 
 				opno = op->opno;
-				cmptype = con->consttype;
+				cmptype = exprType(val);
 				kind = RBI_CLAUSE_EQ;
 			}
 			else if (strategy == RBI_STRAT_CONTAINS ||
@@ -1514,11 +1700,21 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				 * other way round, which is strategy 4 and not pushed down -
 				 * so the column has to be the left operand.
 				 */
+				/*
+				 * The QUERY, not just its value, decides whether the posting
+				 * sets can answer this clause at all, so it has to be
+				 * available now: a Param is refused here even though one is
+				 * accepted for equality (DESIGN.md §17).  `tags @> $1` with
+				 * `$1 = '{}'` extracts to ALL mode, which this node cannot
+				 * answer - it has no way to recheck the operator against the
+				 * heap - and by then there would be no plan left to fall back
+				 * to.
+				 */
 				if (!IsA(left, Var) || !IsA(right, Const))
 					return;
 				var = (Var *) left;
-				con = (Const *) right;
-				if (con->constisnull)
+				val = right;
+				if (((Const *) val)->constisnull)
 					return;
 
 				/*
@@ -1528,7 +1724,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				 * which is what the ordinary plan does anyway.
 				 */
 				if (!rbi_multikey_query_is_exact(opfamily, lefttype, strategy,
-												 con, &extractquery))
+												 (Const *) val, &extractquery))
 					return;
 
 				opno = op->opno;
@@ -1557,16 +1753,33 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			right = rbi_strip((Node *) lsecond(saop->args));
 			if (left == NULL || right == NULL)
 				return;
-			if (!IsA(left, Var) || !IsA(right, Const))
+			if (!IsA(left, Var) || !rbi_is_value_expr(right, true))
 				return;
 			var = (Var *) left;
-			con = (Const *) right;
-			if (con->constisnull)
-				return;
+			val = right;
 
-			nelems = rbi_array_const_nelems(con);
-			if (nelems < 0 || nelems > RBI_MAX_ARRAY_ELEMS)
-				return;
+			/*
+			 * The length cap of DESIGN.md §15 applies to the lists whose
+			 * length is known now: a literal array and the ARRAY[...] a
+			 * generic plan keeps for `k IN ($1, $2)`.  A parameter that IS an
+			 * array has no length until the executor has it, and by then
+			 * there is no plan to decline in favour of, so it is answered
+			 * whatever its length.
+			 */
+			if (IsA(val, Const))
+			{
+				if (((Const *) val)->constisnull)
+					return;
+				nelems = rbi_array_const_nelems((Const *) val);
+				if (nelems < 0 || nelems > RBI_MAX_ARRAY_ELEMS)
+					return;
+			}
+			else if (IsA(val, ArrayExpr))
+			{
+				nelems = list_length(((ArrayExpr *) val)->elements);
+				if (nelems > RBI_MAX_ARRAY_ELEMS)
+					return;
+			}
 
 			/*
 			 * `col op ANY (array)` is a union of single-key lookups, so the
@@ -1583,7 +1796,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			}
 
 			opno = saop->opno;
-			cmptype = get_element_type(con->consttype);
+			cmptype = get_element_type(exprType(val));
 			if (!OidIsValid(cmptype))
 				return;
 			kind = RBI_CLAUSE_ARRAY;
@@ -1603,7 +1816,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			kind = (nt->nulltesttype == IS_NULL) ?
 				RBI_CLAUSE_NULL : RBI_CLAUSE_NOTNULL;
 			/* The executor needs no value; keep the lists in step. */
-			con = makeNullConst(var->vartype, var->vartypmod, var->varcollid);
+			val = (Node *) makeNullConst(var->vartype, var->vartypmod,
+										 var->varcollid);
 		}
 		else
 			return;
@@ -1648,7 +1862,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						lfirst_int(l3) == RBI_CLAUSE_NOTNULL)
 						continue;
 					same = (lfirst_int(l3) == kind &&
-							equal((Const *) lfirst(l2), con));
+							equal(lfirst(l2), val));
 					break;
 				}
 				if (!same)
@@ -1696,7 +1910,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		whereattnos = lappend_int(whereattnos, (int) var->varattno);
 		clauseinfos = lappend(clauseinfos, ci);
 		whereclauses = lappend(whereclauses, clause);
-		whereconsts = lappend(whereconsts, con);
+		whereconsts = lappend(whereconsts, val);
 		wherekinds = lappend_int(wherekinds, kind);
 		whereopnos = lappend_oid(whereopnos, opno);
 	}
@@ -1884,7 +2098,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 							   ((IndexOptInfo *) list_nth(first->whereidx,
 														  i))->indexoid);
 			ints = lappend_int(ints, lfirst_int(l1));
-			consts = lappend(consts, copyObject((Const *) lfirst(l2)));
+			consts = lappend(consts, copyObject((Node *) lfirst(l2)));
 			ckinds = lappend_int(ckinds, lfirst_int(l3));
 			i++;
 		}
@@ -2002,6 +2216,7 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	CustomScan *cscan = makeNode(CustomScan);
 	List	   *ctlist = NIL;
 	List	   *kinds = NIL;
+	List	   *priv;
 	List	   *ints;
 	List	   *ckinds;
 	AttrNumber	groupattno;
@@ -2126,11 +2341,24 @@ rbi_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->scan.scanrelid = 0;
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = NIL;
-	cscan->custom_exprs = NIL;
+
+	/*
+	 * The clause values move from custom_private into custom_exprs, which is
+	 * the only field of a CustomScan the planner's later passes look inside:
+	 * set_customscan_references() fixes its expressions up and
+	 * SS_finalize_plan() collects the Param ids it finds there into the
+	 * plan's extParam/allParam, which is what makes the executor rescan this
+	 * node when an exec Param changes (DESIGN.md §10).  A value left only in
+	 * custom_private would be invisible to both.
+	 */
+	cscan->custom_exprs = (List *) list_nth(best_path->custom_private,
+											RBI_PRIV_CONSTS);
+	priv = list_copy(best_path->custom_private);
+	lfirst(list_nth_cell(priv, RBI_PRIV_CONSTS)) = NIL;
+
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
-	cscan->custom_private = lappend(list_copy(best_path->custom_private),
-									kinds);
+	cscan->custom_private = lappend(priv, kinds);
 	cscan->methods = &rbi_count_scan_methods;
 
 	return &cscan->scan.plan;
@@ -2235,7 +2463,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *shape;
 	List	   *oids;
 	List	   *ints;
-	List	   *consts;
+	List	   *exprs;
 	List	   *ckinds;
 	List	   *partlist;
 	List	   *clauseops;
@@ -2260,8 +2488,8 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 	oids = (List *) list_nth(cscan->custom_private, RBI_PRIV_OIDS);
 	ints = (List *) list_nth(cscan->custom_private, RBI_PRIV_INTS);
-	consts = (List *) list_nth(cscan->custom_private, RBI_PRIV_CONSTS);
 	ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
+	exprs = cscan->custom_exprs;
 	partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
 	clauseops = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEOPS);
 	kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
@@ -2274,7 +2502,16 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->singlegroup = (flags & RBI_FLAG_SINGLEGROUP) != 0;
 	st->sumall = (flags & RBI_FLAG_SUMALL) != 0;
 	st->hasgroupidx = (flags & RBI_FLAG_GROUPIDX) != 0;
-	st->nclause = list_length(consts);
+	st->nclause = list_length(ckinds);
+
+	/*
+	 * One value expression per clause, in custom_exprs (see the shape marker
+	 * above).  A mismatch is planner/executor drift, exactly like a wrong
+	 * shape marker, and is said rather than decoded.
+	 */
+	if (list_length(exprs) != st->nclause)
+		elog(ERROR, "RoaringCount: %d clauses but %d value expressions",
+			 st->nclause, list_length(exprs));
 
 	st->ntlist = list_length(kinds);
 	st->tlkind = (int *) palloc(sizeof(int) * Max(st->ntlist, 1));
@@ -2285,12 +2522,33 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		palloc0(sizeof(RBIClauseState) * Max(st->nclause, 1));
 	for (i = 0; i < st->nclause; i++)
 	{
-		st->clause[i].kind = list_nth_int(ckinds, i);
-		st->clause[i].idxoid = list_nth_oid(oids, 2 + i);
-		st->clause[i].attno = (AttrNumber) list_nth_int(ints, 3 + i);
-		st->clause[i].con = (Const *) list_nth(consts, i);
-		st->clause[i].opno = list_nth_oid(clauseops, i);
-		st->clause[i].strategy = 0;
+		RBIClauseState *cl = &st->clause[i];
+
+		cl->kind = list_nth_int(ckinds, i);
+		cl->idxoid = list_nth_oid(oids, 2 + i);
+		cl->attno = (AttrNumber) list_nth_int(ints, 3 + i);
+		cl->opno = list_nth_oid(clauseops, i);
+		cl->strategy = 0;
+
+		/*
+		 * A literal's value is ready now and never changes, so it is taken
+		 * straight from the Const; anything else - a Param, or the ARRAY[]
+		 * of a generic IN list - gets an ExprState and is evaluated at the
+		 * start of each scan (rbi_eval_clause_values()).
+		 */
+		cl->valexpr = (Expr *) list_nth(exprs, i);
+		cl->valtype = exprType((Node *) cl->valexpr);
+		if (IsA(cl->valexpr, Const))
+		{
+			cl->con = (Const *) cl->valexpr;
+			cl->val = cl->con->constvalue;
+			cl->valisnull = cl->con->constisnull;
+		}
+		else
+		{
+			cl->con = NULL;
+			cl->valstate = ExecInitExpr(cl->valexpr, &node->ss.ps);
+		}
 	}
 
 	/* One target per live leaf partition, in the planner's order. */
@@ -2313,6 +2571,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	}
 
 	st->located = false;
+	st->valsdone = false;
 	st->wheremissing = false;
 	st->scanning = false;
 	st->done = false;
@@ -2329,6 +2588,10 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->keycxt = AllocSetContextCreate(estate->es_query_cxt,
 									   "RoaringCount clause keys",
 									   ALLOCSET_SMALL_SIZES);
+	st->valcxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "RoaringCount clause values",
+									   ALLOCSET_SMALL_SIZES);
+	st->viscache = rbi_vis_cache_create(estate->es_query_cxt);
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
@@ -2354,6 +2617,57 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 }
 
 /*
+ * Evaluate the clause values that are not literals (DESIGN.md §10).
+ *
+ * Called once per scan, before anything is looked up, and again after every
+ * ReScan: a nested loop or a LATERAL reference sets a new exec Param between
+ * the two, and the node has to see the new value.  A generic prepared plan's
+ * PARAM_EXTERN is constant for the statement but is still only available
+ * here.
+ *
+ * ExecEvalExprSwitchContext() leaves its result in the per-tuple memory of
+ * the node's ExprContext, which nothing here owns, so the value is copied
+ * into a context of the node's own that lives exactly as long as the scan.
+ */
+static void
+rbi_eval_clause_values(RBICountScanState *st)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	MemoryContext oldcxt;
+	int			i;
+
+	st->valsdone = true;
+
+	MemoryContextReset(st->valcxt);
+	oldcxt = MemoryContextSwitchTo(st->valcxt);
+
+	for (i = 0; i < st->nclause; i++)
+	{
+		RBIClauseState *cl = &st->clause[i];
+		int16		typlen;
+		bool		typbyval;
+		Datum		val;
+		bool		isnull;
+
+		if (cl->valstate == NULL)
+			continue;			/* a literal: cl->val is already right */
+
+		val = ExecEvalExprSwitchContext(cl->valstate, econtext, &isnull);
+		cl->valisnull = isnull;
+		if (isnull)
+		{
+			cl->val = (Datum) 0;
+			continue;
+		}
+
+		get_typlenbyval(cl->valtype, &typlen, &typbyval);
+		cl->val = datumCopy(val, typbyval, typlen);
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * Locate the posting sets of one `col = ANY (array)` clause (DESIGN.md §15):
  * one set per distinct non-NULL element, which the count then unions.
  */
@@ -2361,7 +2675,7 @@ static void
 rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 				 RBICountSource *src)
 {
-	ArrayType  *arr = DatumGetArrayTypeP(cl->con->constvalue);
+	ArrayType  *arr = DatumGetArrayTypeP(cl->val);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
 	int16		elmlen;
 	bool		elmbyval;
@@ -2369,9 +2683,8 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 	Datum	   *elems;
 	bool	   *nulls;
 	int			nelems;
-	int			nsets = 0;
-	int			nfound = 0;
-	int			i;
+	int			nsets;
+	int			nfound;
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
@@ -2380,40 +2693,18 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 	src->sets = (RBIPostingSet *)
 		palloc0(sizeof(RBIPostingSet) * Max(nelems, 1));
 
-	for (i = 0; i < nelems; i++)
-	{
-		bool		dup = false;
-		int			j;
-
-		if (nulls[i])
-			continue;			/* `col = NULL` is never true */
-
-		/*
-		 * Looking a value up twice would only make the union do the same work
-		 * again; it could not change the answer, because a union of a set
-		 * with itself is that set.  The test is the bytewise one, so two
-		 * values that compare equal without being identical still get a set
-		 * each, which is equally harmless.  The planner caps the list at
-		 * RBI_MAX_ARRAY_ELEMS, which bounds this loop.
-		 */
-		for (j = 0; j < i; j++)
-		{
-			if (!nulls[j] &&
-				datumIsEqual(elems[i], elems[j], elmbyval, elmlen))
-			{
-				dup = true;
-				break;
-			}
-		}
-		if (dup)
-			continue;
-
-		if (rbi_posting_set_lookup(cl->idx, elems[i], elemtype,
-								   &src->sets[nsets]))
-			nfound++;
-		nsets++;
-	}
-
+	/*
+	 * One call rather than a lookup per element: the values are hashed first
+	 * and their entries located in (bucket, hash) order, so the bucket pages
+	 * are read in block order and duplicates are dropped in one pass over
+	 * that order instead of by comparing every value with every earlier one -
+	 * which at RBI_MAX_ARRAY_ELEMS values is half a million datumIsEqual()
+	 * calls (DESIGN.md §15).  Looking a value up twice could not change the
+	 * answer either way, because a union of a set with itself is that set; it
+	 * would only cost the merge another sub-cursor.
+	 */
+	nsets = rbi_posting_set_lookup_many(cl->idx, elemtype, nelems,
+										elems, nulls, src->sets, &nfound);
 	src->nsets = nsets;
 
 	/* An empty array, an all-NULL one, or no matching key: no rows at all. */
@@ -2422,7 +2713,7 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 
 	pfree(elems);
 	pfree(nulls);
-	if ((Pointer) arr != DatumGetPointer(cl->con->constvalue))
+	if ((Pointer) arr != DatumGetPointer(cl->val))
 		pfree(arr);
 }
 
@@ -2444,7 +2735,7 @@ rbi_locate_multikey(RBICountScanState *st, RBIClauseState *cl,
 	RBIQuery	q;
 	int			i;
 
-	rbi_extract_query(istate, cl->con->constvalue,
+	rbi_extract_query(istate, cl->val,
 					  (StrategyNumber) get_op_opfamily_strategy(cl->opno,
 																cl->idx->rd_opfamily[0]),
 					  &q);
@@ -2533,13 +2824,26 @@ rbi_locate_where(RBICountScanState *st)
 		src->nsets = 0;
 		src->sets = NULL;
 
+		/*
+		 * A parameter that came out NULL selects no rows at all, whatever the
+		 * clause: `k = NULL`, `k = ANY (NULL)` and a NULL multi-key query are
+		 * all never true (every one of those operators is strict).  The
+		 * clause is then not looked up.
+		 */
+		if (cl->valisnull && RBI_CLAUSE_IS_POSITIVE(cl->kind) &&
+			cl->kind != RBI_CLAUSE_NULL)
+		{
+			st->wheremissing = true;
+			continue;
+		}
+
 		switch (cl->kind)
 		{
 			case RBI_CLAUSE_EQ:
 				src->sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet));
 				src->nsets = 1;
-				if (!rbi_posting_set_lookup(cl->idx, cl->con->constvalue,
-											cl->con->consttype, &src->sets[0]))
+				if (!rbi_posting_set_lookup(cl->idx, cl->val, cl->valtype,
+											&src->sets[0]))
 					st->wheremissing = true;
 				break;
 
@@ -2706,8 +3010,9 @@ rbi_count_relation(RBICountScanState *st)
 
 	MemoryContextReset(st->pergroup);
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
-	count = rbi_count_sources(st->heap, estate->es_snapshot,
-							  st->nclause, &st->sources[1], &st->stats);
+	count = rbi_count_sources_cached(st->heap, estate->es_snapshot,
+									 st->nclause, &st->sources[1],
+									 &st->stats, st->viscache);
 	MemoryContextSwitchTo(oldcxt);
 
 	return count;
@@ -2744,8 +3049,9 @@ rbi_sumall_relation(RBICountScanState *st)
 			break;
 		}
 
-		total += rbi_count_sources(st->heap, estate->es_snapshot,
-								   st->nclause + 1, st->sources, &st->stats);
+		total += rbi_count_sources_cached(st->heap, estate->es_snapshot,
+										  st->nclause + 1, st->sources,
+										  &st->stats, st->viscache);
 		rbi_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -2796,8 +3102,9 @@ rbi_next_group(RBICountScanState *st, bool *exhausted)
 			return NULL;
 		}
 
-		count = rbi_count_sources(st->heap, estate->es_snapshot,
-								  st->nclause + 1, st->sources, &st->stats);
+		count = rbi_count_sources_cached(st->heap, estate->es_snapshot,
+										 st->nclause + 1, st->sources,
+										 &st->stats, st->viscache);
 		keyisnull = st->groupset.keyisnull;
 		rbi_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
@@ -2943,6 +3250,14 @@ rbi_exec_custom_scan(CustomScanState *node)
 	if (st->done)
 		return NULL;
 
+	/*
+	 * The parameters first: a generic prepared plan's `k = $1` and a nested
+	 * loop's exec Param are only values here, and ReScan has thrown the
+	 * previous ones away (DESIGN.md §10).
+	 */
+	if (!st->valsdone)
+		rbi_eval_clause_values(st);
+
 	/* A partitioned table counts one partition at a time. */
 	if (st->npart > 0)
 		return rbi_exec_partitioned(st);
@@ -3003,9 +3318,9 @@ rbi_exec_custom_scan(CustomScanState *node)
 				break;
 			}
 
-			total += rbi_count_sources(st->heap, estate->es_snapshot,
-									   st->nclause + 1, st->sources,
-									   &st->stats);
+			total += rbi_count_sources_cached(st->heap, estate->es_snapshot,
+											  st->nclause + 1, st->sources,
+											  &st->stats, st->viscache);
 			rbi_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
 		}
@@ -3059,6 +3374,28 @@ rbi_reset_run(RBICountScanState *st)
 	if (st->keycxt != NULL)
 		MemoryContextReset(st->keycxt);
 
+	if (st->viscache != NULL)
+		rbi_vis_cache_reset(st->viscache);
+
+	/*
+	 * The clause values go too: a rescan of a parameterised inner side has to
+	 * read the new exec Param rather than the value the last scan copied
+	 * (DESIGN.md §10).  A literal's value lives in the Const and stays.
+	 */
+	st->valsdone = false;
+	for (i = 0; i < st->nclause; i++)
+	{
+		RBIClauseState *cl = &st->clause[i];
+
+		if (cl->valstate != NULL)
+		{
+			cl->val = (Datum) 0;
+			cl->valisnull = false;
+		}
+	}
+	if (st->valcxt != NULL)
+		MemoryContextReset(st->valcxt);
+
 	st->curpart = 0;
 	st->partopen = false;
 }
@@ -3098,14 +3435,29 @@ rbi_end_custom_scan(CustomScanState *node)
 		MemoryContextDelete(st->keycxt);
 		st->keycxt = NULL;
 	}
+	if (st->valcxt != NULL)
+	{
+		MemoryContextDelete(st->valcxt);
+		st->valcxt = NULL;
+	}
+	if (st->viscache != NULL)
+	{
+		rbi_vis_cache_destroy(st->viscache);
+		st->viscache = NULL;
+	}
 }
 
 /*
  * "col = 3", "col = ANY ('{1,2,3}')", "col IS NULL", "col IS NOT NULL",
  * "tags @> {a,b}", "tsv @@ 'a' & 'b'".
+ *
+ * A clause whose value is not a literal is printed as the expression the plan
+ * carries, which for a prepared statement's parameter is `$1` - the same text
+ * core's EXPLAIN gives a qual on one (DESIGN.md §10).
  */
 static void
-rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, StringInfo buf)
+rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, List *ancestors,
+				   ExplainState *es, StringInfo buf)
 {
 	const char *attname = get_attname(st->heapoid, cl->attno, false);
 
@@ -3123,8 +3475,21 @@ rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, StringInfo buf)
 				bool		isvarlena;
 				char	   *val;
 
-				getTypeOutputInfo(cl->con->consttype, &outfunc, &isvarlena);
-				val = OidOutputFunctionCall(outfunc, cl->con->constvalue);
+				if (cl->con == NULL)
+				{
+					List	   *context =
+						set_deparse_context_plan(es->deparse_cxt,
+												 st->css.ss.ps.plan,
+												 ancestors);
+
+					val = deparse_expression((Node *) cl->valexpr, context,
+											 false, false);
+				}
+				else
+				{
+					getTypeOutputInfo(cl->con->consttype, &outfunc, &isvarlena);
+					val = OidOutputFunctionCall(outfunc, cl->con->constvalue);
+				}
 				if (cl->kind == RBI_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s = ANY (%s)", attname, val);
 				else if (cl->kind == RBI_CLAUSE_MULTI)
@@ -3188,7 +3553,7 @@ rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->npart == 0)
 			appendStringInfo(&buf, "%s ", get_rel_name(st->clause[i].idxoid));
 		appendStringInfoChar(&buf, '(');
-		rbi_explain_clause(st, &st->clause[i], &buf);
+		rbi_explain_clause(st, &st->clause[i], ancestors, es, &buf);
 		appendStringInfoChar(&buf, ')');
 	}
 
@@ -3210,5 +3575,9 @@ rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
 							   st->stats.blocks_rechecked, es);
 		ExplainPropertyInteger("Containers Visited", NULL,
 							   st->stats.containers_visited, es);
+		ExplainPropertyInteger("Heap Blocks From Cache", NULL,
+							   st->stats.cache_hits, es);
+		ExplainPropertyInteger("Heap Blocks Past Cache Budget", NULL,
+							   st->stats.cache_full, es);
 	}
 }

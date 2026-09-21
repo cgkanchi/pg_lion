@@ -624,9 +624,9 @@ SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NULL');
 (1 row)
 
 SELECT rbi_nullcmp('SELECT count(*) FROM rbi_null_all WHERE k IS NOT NULL');
-    rbi_nullcmp     
---------------------
- index scan, 1 rows
+     rbi_nullcmp     
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT rbi_nullcmp('SELECT k, count(*) FROM rbi_null_all GROUP BY k');

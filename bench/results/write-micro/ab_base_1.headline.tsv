@@ -1,0 +1,13 @@
+rep1_build8_roaring	13308.332	99219280	
+rep1_build8_btree	4522.343	62121888	
+rep1_ins_roaring_8idx	1147.990	95361416	after checkpoint
+rep1_ins_roaring_8idx_steady	1124.633	59060600	second batch
+rep1_ins_btree_8idx	253.317	34922832	after checkpoint
+rep1_ins_btree_8idx_steady	205.912	7082800	second batch
+--- medians over 1 repeats
+build8_btree                     median     4522.3 ms       59.24 MiB
+build8_roaring                   median    13308.3 ms       94.62 MiB
+ins_btree_8idx                   median      253.3 ms       33.31 MiB
+ins_btree_8idx_steady            median      205.9 ms        6.75 MiB
+ins_roaring_8idx                 median     1148.0 ms       90.94 MiB
+ins_roaring_8idx_steady          median     1124.6 ms       56.32 MiB

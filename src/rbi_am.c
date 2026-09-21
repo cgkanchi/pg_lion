@@ -20,8 +20,10 @@
 #include "catalog/pg_type.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "nodes/pathnodes.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -190,8 +192,269 @@ rbioptions(Datum reloptions, bool validate)
 }
 
 /*
- * Cost estimate: exactly the generic estimate, but a roaring index has no
- * correlation with the heap order (contrib/bloom does the same).
+ * Peel binary-coercion relabels off an expression, so that a varchar column
+ * compared with a text constant presents the constant the opclass will see.
+ */
+static Node *
+rbi_cost_strip(Node *node)
+{
+	while (node != NULL && IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+	return node;
+}
+
+/*
+ * Does this index's opclass extract many keys from one value (DESIGN.md §17)?
+ * The presence of support function 2 is the same test rbi_fill_state() makes.
+ */
+static bool
+rbi_index_is_multikey(IndexOptInfo *index)
+{
+	return OidIsValid(get_opfamily_proc(index->opfamily[0],
+										index->opcintype[0],
+										index->opcintype[0],
+										RBI_EXTRACTVALUE_PROC));
+}
+
+/*
+ * Extract one multi-key query at plan time and say whether answering it means
+ * emitting every posting of every entry (DESIGN.md §17's RBI_QMODE_ALL).
+ *
+ * rbi_extract_query() wants an RBIState, but only for the extractQuery
+ * FmgrInfo and the collation; nothing here touches an index.  A missing
+ * extraction function means the question cannot be answered, which is costed
+ * as the expensive answer.
+ */
+static bool
+rbi_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
+					   Datum query)
+{
+	Oid			proc;
+	FmgrInfo	flinfo;
+	RBIState	state;
+	RBIQuery	q;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	bool		full;
+
+	proc = get_opfamily_proc(index->opfamily[0], index->opcintype[0],
+							 index->opcintype[0], RBI_EXTRACTQUERY_PROC);
+	if (!OidIsValid(proc))
+		return true;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"roaring cost query extract",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	memset(&state, 0, sizeof(state));
+	state.multikey = true;
+	state.collation = index->indexcollations[0];
+	fmgr_info(proc, &flinfo);
+	state.extractquery = flinfo;
+
+	rbi_extract_query(&state, query, strategy, &q);
+	full = (q.mode == RBI_QMODE_ALL);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	return full;
+}
+
+/*
+ * `col op ANY (array)`: each element is a query of its own and their answers
+ * go into the same bitmap, so one element that needs the whole index makes
+ * the scan a full one.  An array that is not available at plan time has to be
+ * assumed to contain such an element.
+ */
+static bool
+rbi_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
+							 Node *arraynode)
+{
+	Const	   *con = (Const *) arraynode;
+	ArrayType  *arr;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int			i;
+	bool		full = false;
+
+	if (arraynode == NULL || !IsA(arraynode, Const))
+		return true;
+	if (con->constisnull)
+		return false;			/* `col op ANY (NULL)` is never true */
+
+	arr = DatumGetArrayTypeP(con->constvalue);
+	elemtype = ARR_ELEMTYPE(arr);
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	for (i = 0; i < nelems && !full; i++)
+	{
+		if (nulls[i])
+			continue;			/* never true, nothing is scanned for it */
+		full = rbi_query_is_full_scan(index, strategy, elems[i]);
+	}
+
+	pfree(elems);
+	pfree(nulls);
+	if ((Pointer) arr != DatumGetPointer(con->constvalue))
+		pfree(arr);
+
+	return full;
+}
+
+/*
+ * Will rbigetbitmap() have to walk the WHOLE index for this path - read every
+ * bucket, every entry and every posting of every entry?
+ *
+ * rbigetbitmap() answers ONE qual per scan and marks the rest for recheck,
+ * choosing the most selective-looking one: a plain operator first, then a
+ * ScalarArrayOp, then a null test.  The cost of the scan is the cost of the
+ * qual it answers, so the choice is mirrored here.
+ *
+ * A full walk is what the AM does for:
+ *
+ *	- `col IS NOT NULL`, which is every entry but the reserved NULL one
+ *	  (DESIGN.md §14);
+ *	- a multi-key query the extractor answers with RBI_QMODE_ALL: a phrase, a
+ *	  prefix, a NOT, a weight mask, `<@`, `@> '{}'`, a NULL element, or more
+ *	  than RBI_MAX_QUERY_KEYS keys (DESIGN.md §17).  Correctness is preserved
+ *	  by the recheck, but the scan reads the whole index and hands the heap
+ *	  every indexed row;
+ *	- and a multi-key query whose value is not a plan-time Const (a Param):
+ *	  the MODE follows the query's shape, not just its value, so an unknown
+ *	  value has to be priced as the expensive shape.
+ *
+ * *emits_all_rows additionally says whether the CANDIDATES the walk produces
+ * are every indexed row, which is what makes the heap side a full recheck
+ * rather than a selective fetch.  The multi-key fallback asks for a superset
+ * and the operator is re-applied to every row; `IS NOT NULL` does not - the
+ * rows it emits are exactly the rows it selects, so its heap side is still
+ * the clause's own selectivity.
+ *
+ * Handing genericcostestimate() an empty GenericCosts instead priced these
+ * as selective lookups - a prefix query estimated at 192 cost units against
+ * the sequential scan's 9156, for a scan that emitted 1.18M posting TIDs and
+ * rechecked 198k rows and ran 2.6x slower than that sequential scan (the
+ * 2026-09-21 follow-up review).
+ */
+static bool
+rbi_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
+{
+	IndexOptInfo *index = path->indexinfo;
+	Node	   *chosen = NULL;
+	int			bestrank = 3;
+	ListCell   *lc;
+
+	*emits_all_rows = false;
+
+	if (index->nkeycolumns != 1)
+		return false;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (iclause->indexcol != 0)
+			continue;
+
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Node	   *clause = (Node *) rinfo->clause;
+			int			rank;
+
+			if (IsA(clause, NullTest))
+				rank = 2;
+			else if (IsA(clause, ScalarArrayOpExpr))
+				rank = 1;
+			else if (IsA(clause, OpExpr))
+				rank = 0;
+			else
+				continue;
+
+			if (rank < bestrank)
+			{
+				bestrank = rank;
+				chosen = clause;
+			}
+		}
+	}
+
+	if (chosen == NULL)
+		return false;
+
+	if (IsA(chosen, NullTest))
+		return ((NullTest *) chosen)->nulltesttype == IS_NOT_NULL;
+
+	/* A scalar opclass looks ONE key up, whatever the operator's operand. */
+	if (!rbi_index_is_multikey(index))
+		return false;
+
+	if (IsA(chosen, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) chosen;
+		StrategyNumber strategy;
+		Node	   *arg;
+
+		*emits_all_rows = true;
+		if (list_length(op->args) != 2)
+			return true;
+		strategy = (StrategyNumber) get_op_opfamily_strategy(op->opno,
+															index->opfamily[0]);
+		if (strategy == 0)
+			return true;
+		arg = rbi_cost_strip((Node *) lsecond(op->args));
+		if (arg == NULL || !IsA(arg, Const))
+			return true;
+		if (((Const *) arg)->constisnull)
+		{
+			/* a strict operator: never true, so nothing is scanned */
+			*emits_all_rows = false;
+			return false;
+		}
+		if (rbi_query_is_full_scan(index, strategy,
+								   ((Const *) arg)->constvalue))
+			return true;
+		*emits_all_rows = false;
+		return false;
+	}
+
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) chosen;
+		StrategyNumber strategy;
+
+		*emits_all_rows = true;
+		if (list_length(saop->args) != 2)
+			return true;
+		strategy = (StrategyNumber) get_op_opfamily_strategy(saop->opno,
+															index->opfamily[0]);
+		if (strategy == 0)
+			return true;
+		if (strategy != RBI_STRAT_EQUAL &&
+			rbi_array_query_is_full_scan(index, strategy,
+										 rbi_cost_strip((Node *) lsecond(saop->args))))
+			return true;
+
+		/* a union of single-key lookups, or of exact multi-key queries */
+		*emits_all_rows = false;
+		return false;
+	}
+}
+
+/*
+ * Cost estimate: the generic estimate, with two corrections.  A roaring index
+ * has no correlation with the heap order (contrib/bloom does the same), and a
+ * scan that has to walk the whole index is priced as one rather than as the
+ * selective lookup its predicate's output selectivity suggests.
  */
 void
 rbicostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -200,8 +463,45 @@ rbicostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				double *indexPages)
 {
 	GenericCosts costs = {0};
+	bool		emits_all_rows;
+	bool		fullscan = rbi_scan_walks_whole_index(path, &emits_all_rows);
+
+	/*
+	 * A full walk visits every index tuple - every (key, row) posting, which
+	 * is what pg_class.reltuples of a roaring index counts - and
+	 * genericcostestimate() then prorates that into every index page.
+	 */
+	if (fullscan)
+		costs.numIndexTuples = Max(path->indexinfo->tuples, 1.0);
 
 	genericcostestimate(root, path, loop_count, &costs);
+
+	if (fullscan)
+	{
+		double		allpages = Max((double) path->indexinfo->pages, 1.0);
+
+		/*
+		 * reltuples of an index is whatever the last ANALYZE or VACUUM left
+		 * there, and ANALYZE writes the HEAP's row count onto every index of
+		 * a table, so the prorated page count can come out short of the
+		 * index the scan really reads.  Charge the rest of it.
+		 */
+		if (costs.numIndexPages < allpages)
+		{
+			costs.indexTotalCost += (allpages - costs.numIndexPages) *
+				costs.spc_random_page_cost;
+			costs.numIndexPages = allpages;
+		}
+
+		/*
+		 * And, for the multi-key fallback, nothing is filtered out before the
+		 * heap either: every indexed row is emitted as a candidate, fetched
+		 * and rechecked there, so the heap side is the cost of a full recheck
+		 * and not of the predicate's own selectivity.
+		 */
+		if (emits_all_rows)
+			costs.indexSelectivity = 1.0;
+	}
 
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;

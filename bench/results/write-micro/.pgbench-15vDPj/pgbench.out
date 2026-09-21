@@ -1,0 +1,18 @@
+pgbench (20devel)
+pgbench: error: client 0 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+pgbench: error: client 3 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+pgbench: error: client 7 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+pgbench: error: client 4 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+pgbench:pgbench: error: client 2 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+ pgbench: pgbench: error: client 1 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+error: client 6 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+error: client 5 script 0 aborted in command 1 query 0: ERROR:  integer out of range
+transaction type: /home/cgkanchi/code/pg_roaring_index/bench/results/write-micro/.burst.sql
+scaling factor: 1
+query mode: prepared
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 5 s
+number of transactions actually processed: 0
+pgbench: error: Run was aborted; the above results are incomplete.

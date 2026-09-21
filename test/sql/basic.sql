@@ -3,6 +3,9 @@
 SET client_min_messages = warning;
 
 CREATE EXTENSION IF NOT EXISTS roaring_index;
+-- This file exercises the access method's bitmap-scan path; the count pushdown
+-- (tested in pushdown.sql) would otherwise take over the count(*) demonstrations.
+SET roaring_index.enable_count_pushdown = off;
 
 -- Deterministic data set with a mix of cardinalities.  Only rbi_r10 depends
 -- on the seeded PRNG; every other column is a pure function of i.

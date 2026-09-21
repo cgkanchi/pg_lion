@@ -544,4 +544,140 @@ extern void rbi_chain_put_items_locked(Relation index, Buffer buf,
 extern void rbi_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 							RBIEntryTuple *entry, const char *payload, Size paylen);
 
+
+/* ---------- additive helpers (wave 3, write path) ---------- */
+
+/*
+ * GROWTH SLACK INSIDE AN ITEM (DESIGN.md §4).
+ *
+ * An item on a container page may be allocated LARGER than the bytes its
+ * header says it needs.  The spare bytes at its end are slack that the insert
+ * path grows into: adding a member to an ARRAY or RUN container, or a pair to
+ * a sparse segment, then happens by memmove INSIDE the item - under the same
+ * lock, in the same WAL record as the entry tuple, without changing the
+ * item's offset or its ItemIdGetLength() - so no other item on the page
+ * moves and the GenericXLog delta is a handful of bytes instead of a page.
+ *
+ * The two sizes of an item are therefore different things, and both are
+ * needed:
+ *
+ *	 rbi_item_size(item)		its LOGICAL size, derived from the header;
+ *								what every reader uses, and what the item
+ *								would be written back as.
+ *	 ItemIdGetLength(iid)		its ALLOCATED length on the page, which is
+ *								what the item may grow to in place.
+ *
+ * Readers never look at the allocated length (they walk items by their
+ * headers), so slack is invisible to them; code that copies an item out of a
+ * page by ItemIdGetLength() - VACUUM does - still works because the allocated
+ * length is capped at RBI_CONTAINER_MAX_SIZE, the size of every item work
+ * buffer.  Slack bytes are always zeroed when an item is written, so that
+ * the page image stays deterministic and the WAL delta stays small.
+ *
+ * A bulk-built index gets no slack at all: it is read-mostly, and the space
+ * would be pure loss.  Slack appears when an insert first grows an item.
+ */
+#define RBI_ITEM_SLACK_MIN		8	/* smallest slack worth having */
+#define RBI_ITEM_SLACK_MAX		64	/* and the most, per item */
+#define RBI_ITEM_SLACK_FRACTION 8	/* size/8, clamped into the above */
+
+/* The most bytes of slack an item may hold (alignment padding included). */
+#define RBI_ITEM_SLACK_LIMIT	(RBI_ITEM_SLACK_MAX + MAXIMUM_ALIGNOF - 1)
+
+/*
+ * Allocated length to write an item of logical size `size` with, so that it
+ * has room to grow in place.  Always >= size, always MAXALIGNed and never
+ * above RBI_CONTAINER_MAX_SIZE; a BITSET container, which is already the
+ * largest an item can be, gets its exact size.  The caller checks that the
+ * result fits on the page and falls back to `size` if it does not.
+ */
+extern Size rbi_item_alloc_size(const RBIContainer *item, Size size);
+
+/* Free bytes inside an item of allocated length itemlen. */
+static inline Size
+rbi_item_slack(const RBIContainer *item, Size itemlen)
+{
+	Size		size = rbi_item_size(item);
+
+	return (itemlen > size) ? itemlen - size : 0;
+}
+
+/*
+ * rbi_chain_put_items_locked() and rbi_chain_put_container_locked() with
+ * control over slack: with slack = true the items are written with room to
+ * grow (and the items[] buffers must have RBI_CONTAINER_MAX_SIZE bytes of
+ * capacity, because their slack is zeroed in place before the copy).  The
+ * two original functions are these with slack = false, which is what VACUUM
+ * and the build want: they write items at their exact size.
+ */
+extern void rbi_chain_put_items_locked_ext(Relation index, Buffer buf,
+										   Buffer entrybuf, OffsetNumber entryoff,
+										   RBIEntryTuple *entry,
+										   OffsetNumber off, bool replace,
+										   RBIContainer **items, int nitems,
+										   bool slack);
+
+extern void rbi_chain_put_container_locked_ext(Relation index, Buffer buf,
+											   Buffer entrybuf, OffsetNumber entryoff,
+											   RBIEntryTuple *entry, RBIContainer *c,
+											   int *ncontainers_delta, bool slack);
+
+/*
+ * THE BUCKET DIRECTORY GUARD (DESIGN.md §5).
+ *
+ * The number of buckets is chosen once, by ambuild, and never changes: there
+ * is no online directory growth in v1.  An index created on an empty table
+ * and filled afterwards therefore keeps RBI_DEFAULT_BUCKETS buckets however
+ * large it grows, and absorbs everything in bucket page chains - which every
+ * lookup of a key has to walk.
+ *
+ * Inserts watch for that: when the chain of the bucket an insert walks is
+ * longer than RBI_BUCKET_PAGES_WARN pages, that bucket holds several times
+ * the entry bytes ambuild sizes a bucket for (three quarters of a page), and
+ * the backend says so once per index.  Like the cardinality guard of §17 this
+ * is advisory - the index keeps working and keeps taking rows - and like it,
+ * the estimate is one bucket's chain rather than the average over all
+ * buckets, because hashes spread entries evenly enough and counting the whole
+ * directory on every insert would cost more than it is worth.  An index whose
+ * `buckets` reloption was set explicitly is never warned about: that count is
+ * what its owner asked for.
+ *
+ * The threshold is four pages and not the two that "twice what ambuild aims
+ * at" would suggest, because a MAXIMUM is being compared against an average:
+ * hash skew and ambuild's own byte estimate (which is about 30% low for keys
+ * whose TIDs spread thinly over container keys, DESIGN.md §13) leave a
+ * freshly built, correctly sized index with three-page buckets - measured on
+ * the 20000-key column of the bench/write_micro.sh portfolio.  An index that
+ * really has outgrown its directory is far past this: 100k keys in an index
+ * created empty give 64 buckets of twelve pages each.
+ *
+ * roaring_index_stats() reports the same thing exactly, as max_bucket_pages.
+ */
+#define RBI_BUCKET_PAGES_WARN	4
+
+extern void rbi_warn_bucket_chain(Relation index, int npages);
+
+/*
+ * Like rbi_find_entry_ext(), but also counts the bucket pages the walk
+ * visited (npages may be NULL).  A walk that finds its entry stops there, so
+ * the count is a lower bound on the length of the chain - which is what the
+ * bucket directory guard wants: it never warns about a chain it has not
+ * actually walked.
+ */
+extern bool rbi_find_entry_counted(Relation index, RBIState *state,
+								   Buffer headbuf, int lockmode, Datum key,
+								   uint32 hash, FmgrInfo *eqproc, Oid collation,
+								   Buffer *buf, OffsetNumber *offnum,
+								   int *npages);
+
+/* The same for the reserved NULL/EMPTY entries (DESIGN.md §14, §17). */
+extern bool rbi_find_reserved_entry_counted(Relation index, Buffer headbuf,
+											int lockmode, uint16 reservedflag,
+											Buffer *buf, OffsetNumber *offnum,
+											int *npages);
+
+/* Length of the bucket chain starting at headbuf, which the caller holds
+ * locked; used by roaring_index_stats(). */
+extern int rbi_bucket_npages(Relation index, Buffer headbuf);
+
 #endif							/* RBI_H */

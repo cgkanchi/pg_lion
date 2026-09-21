@@ -14,6 +14,28 @@
  * the build changes, because the sort orders the codes of each key
  * ascending either way.
  *
+ * Every page is written through the bulk-write API (storage/bulk_write.h),
+ * which is what nbtree and GiST builds use: pages are prepared in
+ * backend-local memory, written straight to the file without going through
+ * shared buffers, WAL-logged in batches of up to 32 as full-page images (or
+ * not at all, for an unlogged relation or wal_level = minimal, in which case
+ * the relation is registered for the next sync instead), and each page is
+ * written exactly ONCE.  That last property is what makes it fast: the old
+ * route through the buffer manager logged a GenericXLog record per entry
+ * tuple, so a million-key index paid a million page diffs and a million WAL
+ * records to fill 15,000 pages.
+ *
+ * Writing each page once means every page has to be final before it is
+ * written, and a bucket page is only final when the last entry that hashes to
+ * it has been added.  Bucket pages therefore live in memory - one 8 KB image
+ * per bucket page that actually holds entries - until pass 2 is over
+ * (rbi_build_flush_buckets()).  That is the one cost of this route: the
+ * bucket directory is sized at about three quarters of a page per bucket, so
+ * the images are roughly 1.3 times the bytes the entry tuples need, bounded
+ * by RBI_MAX_BUCKETS pages (512 MB) in the worst case and by nothing else.
+ * Container pages are final as soon as the next container does not fit, so
+ * only one of those exists per open key at a time.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -28,6 +50,7 @@
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
+#include "storage/bulk_write.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -98,13 +121,26 @@ typedef struct RBIBuilder
 
 	bool		spilled;		/* posting set lives on container pages */
 	BlockNumber head;
-	BlockNumber curblk;			/* block reserved for pageimg */
-	PGAlignedBlock *pageimg;	/* container page under construction */
+	BlockNumber curblk;			/* block pagebuf will be written to */
+	BulkWriteBuffer pagebuf;	/* container page under construction */
 	bool		haspage;
 
 	uint32		nitems;			/* containers and segments (entry.ncontainers) */
 	uint64		ntids;
 } RBIBuilder;
+
+/*
+ * One bucket page under construction.  The image is a bulk-write buffer, so
+ * that writing it out at the end of the build hands the very same memory to
+ * the bulk writer instead of copying it.
+ */
+typedef struct RBIBuildPage
+{
+	struct RBIBuildPage *next;	/* next page of this bucket's chain */
+	struct RBIBuildPage *next2; /* next overflow page in block order */
+	BlockNumber blkno;
+	BulkWriteBuffer buf;		/* the image, NULL once it has been written */
+} RBIBuildPage;
 
 typedef struct RBIBuildState
 {
@@ -124,6 +160,18 @@ typedef struct RBIBuildState
 	MemoryContext buildctx;		/* lives for the whole build */
 	MemoryContext tmpctx;		/* reset per heap tuple / per key group */
 
+	/*
+	 * Page writing (see the file header): one bulk writer for the whole
+	 * build, blocks handed out by a counter instead of by extending the
+	 * relation, and the bucket pages kept in memory until pass 2 is over.
+	 */
+	BulkWriteState *bulk;
+	BlockNumber nblocks;		/* blocks handed out so far */
+	struct RBIBuildPage **bucketpages;	/* head page of each bucket, or NULL */
+	struct RBIBuildPage *overflow;		/* bucket pages beyond the heads, in */
+	struct RBIBuildPage *overflowlast;	/* block order */
+	int64		nbucketpages;
+
 	RBIBuilder **builders;		/* open builders of the current hash */
 	int			nbuilders;
 	int			maxbuilders;
@@ -137,70 +185,163 @@ static void rbi_builder_flush(RBIBuildState *bs, RBIBuilder *b);
 static void rbi_builder_close_segment(RBIBuildState *bs, RBIBuilder *b);
 
 /* ---------------------------------------------------------------------
- * Raw page helpers
+ * Page writing
  *
  * During a build nobody else can see the index, so pages are prepared in
- * backend-local memory and written out in one full-page WAL record.  A block
- * is reserved (the relation is extended) before its contents are final so
- * that the previous page of a chain can store the right rightlink.
+ * backend-local memory and handed to the bulk writer, which writes each of
+ * them exactly once and WAL-logs them in batches.  Block numbers come from a
+ * counter: the meta page is block 0, the bucket directory takes blocks
+ * 1 .. nbuckets, and container pages and further bucket pages are handed the
+ * next free block as they are needed - the same order the buffer-manager
+ * route extended the relation in, so an index built by either route has the
+ * same page at the same block.
  * --------------------------------------------------------------------- */
 
 static BlockNumber
-rbi_build_reserve_page(Relation index)
+rbi_build_alloc_block(RBIBuildState *bs)
 {
-	Buffer		buf;
-	BlockNumber blk;
-
-	buf = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
-							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
-	blk = BufferGetBlockNumber(buf);
-	UnlockReleaseBuffer(buf);
-
-	return blk;
+	return bs->nblocks++;
 }
 
-static void
-rbi_build_write_page(Relation index, BlockNumber blk, const char *image)
+static BulkWriteBuffer
+rbi_build_get_page(RBIBuildState *bs, uint16 flags)
 {
-	Buffer		buf;
-	GenericXLogState *xstate;
-	Page		page;
+	BulkWriteBuffer buf = smgr_bulk_get_buf(bs->bulk);
 
-	buf = ReadBuffer(index, blk);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	rbi_init_page((Page) buf->data, flags);
 
-	xstate = GenericXLogStart(index);
-	page = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
-	memcpy(page, image, BLCKSZ);
-	GenericXLogFinish(xstate);
-
-	UnlockReleaseBuffer(buf);
+	return buf;
 }
 
 /*
- * Create the meta page and all bucket head pages.
+ * Write the meta page and reserve the bucket directory.  The head pages
+ * themselves are written by rbi_build_flush_buckets() once their entries are
+ * all in; until then the directory is a hole in the file that the bulk writer
+ * fills with zeroes if a container page is written past it, and overwrites
+ * with the real pages afterwards.
  */
 static void
-rbi_build_init_pages(Relation index, uint32 nbuckets, uint32 inline_limit)
+rbi_build_init_pages(RBIBuildState *bs)
 {
-	PGAlignedBlock img;
+	BulkWriteBuffer meta = smgr_bulk_get_buf(bs->bulk);
 	BlockNumber blk;
+
+	rbi_init_metapage((Page) meta->data, bs->nbuckets, bs->inline_limit);
+	blk = rbi_build_alloc_block(bs);
+	Assert(blk == RBI_METAPAGE_BLKNO);
+	smgr_bulk_write(bs->bulk, blk, meta, true);
+
+	bs->bucketpages = (RBIBuildPage **)
+		MemoryContextAllocZero(bs->buildctx,
+							   sizeof(RBIBuildPage *) * bs->nbuckets);
+	bs->nblocks = RBI_BUCKET_BLKNO(bs->nbuckets);
+}
+
+/*
+ * A new page for a bucket's chain.  prev is the page it is linked after, or
+ * NULL for the bucket's head page, which owns a block of the directory.
+ */
+static RBIBuildPage *
+rbi_build_new_bucket_page(RBIBuildState *bs, uint32 bucket, RBIBuildPage *prev)
+{
+	RBIBuildPage *bp = (RBIBuildPage *)
+		MemoryContextAllocZero(bs->buildctx, sizeof(RBIBuildPage));
+
+	bp->buf = rbi_build_get_page(bs, RBI_PAGE_BUCKET);
+	bs->nbucketpages++;
+
+	if (prev == NULL)
+	{
+		bp->blkno = RBI_BUCKET_BLKNO(bucket);
+		bs->bucketpages[bucket] = bp;
+	}
+	else
+	{
+		bp->blkno = rbi_build_alloc_block(bs);
+		RBIPageGetOpaque((Page) prev->buf->data)->rightlink = bp->blkno;
+		prev->next = bp;
+
+		/* Overflow pages are written in the order they were allocated. */
+		if (bs->overflowlast == NULL)
+			bs->overflow = bp;
+		else
+			bs->overflowlast->next2 = bp;
+		bs->overflowlast = bp;
+	}
+
+	return bp;
+}
+
+/*
+ * Add one entry tuple to its bucket, appending a bucket page when no page of
+ * the chain has room.  This is rbi_add_entry() (rbi_pages.c) without the
+ * locking and the WAL record: same walk, same PageAddItemExtended(), so the
+ * pages come out byte for byte the same.
+ */
+static void
+rbi_build_add_entry(RBIBuildState *bs, uint32 bucket, RBIEntryTuple *entry,
+					Size size)
+{
+	Size		need = MAXALIGN(size);
+	RBIBuildPage *bp = bs->bucketpages[bucket];
+
+	if (bp == NULL)
+		bp = rbi_build_new_bucket_page(bs, bucket, NULL);
+
+	for (;;)
+	{
+		Page		page = (Page) bp->buf->data;
+
+		Assert(RBIPageIsBucket(page));
+
+		if (PageGetFreeSpace(page) >= need)
+		{
+			if (PageAddItemExtended(page, entry, size, InvalidOffsetNumber,
+									0) == InvalidOffsetNumber)
+				elog(ERROR, "roaring index: failed to add entry to bucket page");
+			return;
+		}
+
+		if (bp->next == NULL)
+			(void) rbi_build_new_bucket_page(bs, bucket, bp);
+		bp = bp->next;
+
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Write every bucket page: the head pages in bucket order first (an empty
+ * bucket still owns its head page), then the overflow pages in block order.
+ */
+static void
+rbi_build_flush_buckets(RBIBuildState *bs)
+{
+	RBIBuildPage *bp;
 	uint32		b;
 
-	rbi_init_metapage((Page) img.data, nbuckets, inline_limit);
-	blk = rbi_build_reserve_page(index);
-	if (blk != RBI_METAPAGE_BLKNO)
-		elog(ERROR, "roaring index: meta page landed on block %u", blk);
-	rbi_build_write_page(index, blk, img.data);
-
-	rbi_init_page((Page) img.data, RBI_PAGE_BUCKET);
-	for (b = 0; b < nbuckets; b++)
+	for (b = 0; b < bs->nbuckets; b++)
 	{
-		blk = rbi_build_reserve_page(index);
-		if (blk != RBI_BUCKET_BLKNO(b))
-			elog(ERROR, "roaring index: bucket page %u landed on block %u", b, blk);
-		rbi_build_write_page(index, blk, img.data);
+		bp = bs->bucketpages[b];
 
+		if (bp == NULL)
+			smgr_bulk_write(bs->bulk, RBI_BUCKET_BLKNO(b),
+							rbi_build_get_page(bs, RBI_PAGE_BUCKET), true);
+		else
+		{
+			Assert(bp->blkno == RBI_BUCKET_BLKNO(b));
+			smgr_bulk_write(bs->bulk, bp->blkno, bp->buf, true);
+			bp->buf = NULL;
+		}
+
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	for (bp = bs->overflow; bp != NULL; bp = bp->next2)
+	{
+		Assert(bp->buf != NULL);
+		smgr_bulk_write(bs->bulk, bp->blkno, bp->buf, true);
+		bp->buf = NULL;
 		CHECK_FOR_INTERRUPTS();
 	}
 }
@@ -230,7 +371,7 @@ rbi_builder_create(RBIBuildState *bs, Datum key, int keykind, uint32 hash)
 	b->head = InvalidBlockNumber;
 	b->curblk = InvalidBlockNumber;
 	b->haspage = false;
-	b->pageimg = NULL;
+	b->pagebuf = NULL;
 
 	if (bs->nbuilders >= bs->maxbuilders)
 	{
@@ -257,25 +398,26 @@ rbi_builder_spill(RBIBuildState *bs, RBIBuilder *b, RBIContainer *c)
 
 	if (!b->haspage)
 	{
-		b->pageimg = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
-		b->curblk = rbi_build_reserve_page(bs->index);
+		b->pagebuf = rbi_build_get_page(bs, RBI_PAGE_CONTAINER);
+		b->curblk = rbi_build_alloc_block(bs);
 		b->head = b->curblk;
-		rbi_init_page((Page) b->pageimg->data, RBI_PAGE_CONTAINER);
 		b->haspage = true;
 	}
 
-	img = (Page) b->pageimg->data;
+	img = (Page) b->pagebuf->data;
 
 	if (PageGetFreeSpace(img) < MAXALIGN(csize))
 	{
-		BlockNumber next = rbi_build_reserve_page(bs->index);
+		BlockNumber next = rbi_build_alloc_block(bs);
 
 		rbi_page_update_minmax(img);
 		RBIPageGetOpaque(img)->rightlink = next;
-		rbi_build_write_page(bs->index, b->curblk, b->pageimg->data);
+		/* the page is final: hand the image itself to the bulk writer */
+		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
 
 		b->curblk = next;
-		rbi_init_page(img, RBI_PAGE_CONTAINER);
+		b->pagebuf = rbi_build_get_page(bs, RBI_PAGE_CONTAINER);
+		img = (Page) b->pagebuf->data;
 	}
 
 	if (PageAddItemExtended(img, c, csize, InvalidOffsetNumber, 0) ==
@@ -417,19 +559,20 @@ rbi_builder_flush(RBIBuildState *bs, RBIBuilder *b)
 {
 	RBIEntryTuple *entry;
 	Size		size;
-	Buffer		headbuf;
 
 	rbi_builder_finish_group(bs, b);
 	rbi_builder_close_segment(bs, b);
 
 	if (b->spilled)
 	{
-		Page		img = (Page) b->pageimg->data;
+		Page		img = (Page) b->pagebuf->data;
 
 		Assert(b->haspage);
 		rbi_page_update_minmax(img);
 		RBIPageGetOpaque(img)->rightlink = InvalidBlockNumber;
-		rbi_build_write_page(bs->index, b->curblk, b->pageimg->data);
+		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+		b->pagebuf = NULL;
+		b->haspage = false;
 
 		entry = (b->keykind != RBI_KEY_REAL) ?
 			rbi_make_reserved_entry(rbi_reserved_flag(b->keykind),
@@ -452,11 +595,7 @@ rbi_builder_flush(RBIBuildState *bs, RBIBuilder *b)
 	entry->ncontainers = b->nitems;
 	entry->ntids = b->ntids;
 
-	headbuf = ReadBuffer(bs->index,
-						 RBI_BUCKET_BLKNO(rbi_bucket_of(b->hash, bs->nbuckets)));
-	LockBuffer(headbuf, BUFFER_LOCK_EXCLUSIVE);
-	rbi_add_entry(bs->index, headbuf, entry, size);
-	UnlockReleaseBuffer(headbuf);
+	rbi_build_add_entry(bs, rbi_bucket_of(b->hash, bs->nbuckets), entry, size);
 
 	pfree(entry);
 }
@@ -873,8 +1012,31 @@ rbibuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		 * afterwards, and a single bucket would make every later insert scan
 		 * the whole entry list.
 		 */
-		int64		want = (int64) ((entrybytes + RBI_BUCKET_FILL_BYTES - 1) /
-									RBI_BUCKET_FILL_BYTES);
+		double		bytes = (double) entrybytes;
+		int64		want;
+
+		/*
+		 * The heap may already be known to hold more rows than this build put
+		 * in the index, and the directory is sized once and never resized
+		 * (DESIGN.md §5), so scale the estimate up by what pg_class.reltuples
+		 * says.  Only ever up, and only for an index over the whole table: a
+		 * partial index holds the rows its predicate selects, and sizing that
+		 * for the whole heap would spend pages on buckets that stay empty.
+		 * reltuples is -1 when nothing has analysed the heap yet, and an index
+		 * built on an empty table therefore still gets the floor above - which
+		 * is exactly the case the `buckets` reloption is for.
+		 */
+		if (bs.indtuples > 0 && indexInfo->ii_Predicate == NIL &&
+			heap->rd_rel->reltuples > bs.indtuples)
+		{
+			bytes *= (double) heap->rd_rel->reltuples / bs.indtuples;
+			elog(DEBUG1, "roaring index \"%s\": heap has %.0f rows against %.0f indexed; sizing for %.0f entry bytes",
+				 RelationGetRelationName(index), (double) heap->rd_rel->reltuples,
+				 bs.indtuples, bytes);
+		}
+
+		want = (int64) ((bytes + RBI_BUCKET_FILL_BYTES - 1) /
+						RBI_BUCKET_FILL_BYTES);
 
 		bs.nbuckets = rbi_clamp_buckets(Max(want, (int64) RBI_DEFAULT_BUCKETS));
 	}
@@ -891,9 +1053,29 @@ rbibuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (bs.max_entries > 0 && ndistinct > (int64) bs.max_entries)
 		rbi_warn_max_entries(index, ndistinct);
 
-	rbi_build_init_pages(index, bs.nbuckets, bs.inline_limit);
+	/*
+	 * Everything below writes pages, and all of it goes through one bulk
+	 * writer: nothing may touch these blocks through the buffer manager until
+	 * smgr_bulk_finish() has written and (if needed) synced them.
+	 */
+	{
+		/*
+		 * The bulk writer allocates its page buffers in the context that is
+		 * current when it starts, and frees them as it writes them; keep them
+		 * in the build context, which outlives smgr_bulk_finish().
+		 */
+		MemoryContext oldctx = MemoryContextSwitchTo(bs.buildctx);
 
+		bs.bulk = smgr_bulk_start_rel(index, MAIN_FORKNUM);
+		MemoryContextSwitchTo(oldctx);
+	}
+	rbi_build_init_pages(&bs);
 	rbi_build_write_entries(&bs);
+	rbi_build_flush_buckets(&bs);
+	smgr_bulk_finish(bs.bulk);
+
+	elog(DEBUG1, "roaring index \"%s\": %u blocks, " INT64_FORMAT " bucket pages",
+		 RelationGetRelationName(index), bs.nblocks, bs.nbucketpages);
 
 	tuplesort_end(bs.sortstate);
 	ExecDropSingleTupleTableSlot(bs.inslot);

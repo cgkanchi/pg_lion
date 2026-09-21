@@ -562,7 +562,9 @@ BEGIN
 		IF nm IN ('Partitions', 'Roaring Indexes', 'Group Key') THEN
 			RETURN NEXT btrim(ln);
 		ELSIF nm IN ('Heap Blocks Skipped via VM', 'Heap TIDs Rechecked',
-					 'Heap Blocks Rechecked', 'Containers Visited') THEN
+					 'Heap Blocks Rechecked', 'Containers Visited',
+					 'Heap Blocks From Cache',
+					 'Heap Blocks Past Cache Budget') THEN
 			val := btrim(split_part(ln, ':', 2))::bigint;
 			RETURN NEXT format('%s %s', nm,
 							   CASE WHEN val = 0 THEN '= 0' ELSE '> 0' END);
@@ -579,6 +581,13 @@ SELECT rbi_pp_counters('SELECT a, count(*) FROM rbi_part GROUP BY a');
 -- the pages a DELETE dirties are no longer all-visible
 DELETE FROM rbi_part WHERE id % 700 = 0;
 SELECT rbi_pp_counters('SELECT count(*) FROM rbi_part WHERE a = 3');
+/*
+ * One visibility cache serves every group of every partition (DESIGN.md §9),
+ * so a grouping over a heap the visibility map cannot vouch for comes back to
+ * its dirty pages without pinning them again; a single count never returns to
+ * a block at all and has no cache hits.
+ */
+SELECT rbi_pp_counters('SELECT a, count(*) FROM rbi_part GROUP BY a');
 
 -- ---- the indexes are still sound -------------------------------------------
 VACUUM rbi_part;

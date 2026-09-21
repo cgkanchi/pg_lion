@@ -12,3 +12,5 @@ test/unit/sparse_test
 __pycache__/
 *.pyc
 .deps/
+# Frequent automatically named measurements stay local; named baselines can be committed.
+bench/results/quick/*T*Z-*/

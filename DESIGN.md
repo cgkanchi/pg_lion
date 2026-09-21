@@ -158,6 +158,45 @@ Free space accounting: a container page is "full" for a given container when
 PageGetFreeSpace(page) < MAXALIGN(size) + sizeof(ItemIdData). Splits guarantee progress because every
 container ≤ 4104 bytes and a fresh page holds at least one.
 
+**Growth slack inside an item** (v1 write wave). An item on a container page may be allotted MORE
+bytes than its header needs, so that the next few members can be added inside it. An item therefore
+has two sizes, and both are needed: `rbi_item_size()` is its LOGICAL size, derived from the header,
+and is what every reader uses to find where it ends; `ItemIdGetLength()` is its ALLOCATED length,
+which is what it may grow to in place. `rbi_item_alloc_size()` chooses the second whenever an
+insert writes an item: MAXALIGN(size) plus size/8 clamped into [`RBI_ITEM_SLACK_MIN` = 8,
+`RBI_ITEM_SLACK_MAX` = 64] bytes, capped at RBI_CONTAINER_MAX_SIZE, dropped entirely when the page
+has no room for it, and never for a BITSET (4104 bytes is already the maximum an item can be). The
+slack is a fraction of the item rather than a fixed 64 bytes on purpose: a key whose TIDs are
+spread thinly owns dozens of ~50-byte items per page, and 64 bytes of slack each would nearly halve
+what a page holds; MAXALIGN padding, which the page spends either way, is part of the slack and
+therefore free. Slack bytes are zeroed when the item is written, so that the page image is
+deterministic and a GenericXLog delta of a later change stays small. An item that is written back
+over itself keeps the allocated length it already has whenever that is still enough (and not
+wastefully more), because then PageIndexTupleOverwrite() moves no other item on the page at all;
+the exception is an item that has far more room than it can use - a segment replaced by the
+container one of its container keys was promoted to - which gives the excess back.
+
+An insert whose item has room inside it adds the member there and nowhere else
+(`rbi_insert_container_inplace()`, `rbi_insert_segment_inplace()` in rbi_insert.c): the item keeps
+its offset and its allotted length, no other item on the page moves, minckey/maxckey change only
+when a segment's range really grew, and the WAL delta is the handful of bytes that changed. A
+BITSET always qualifies, an ARRAY needs 2 spare bytes and a cardinality below RBI_ARRAY_MAX_CARD, a
+RUN needs 4 and a run count below RBI_RUN_MAX_NRUNS (both would otherwise turn into a bitset), and
+a sparse segment needs 6 and a container key that stays below RBI_SPARSE_THRESHOLD members (else
+the key is promoted, which is not an in-place change). Otherwise the general path runs - copy out,
+mutate, write back, split if needed - and leaves fresh slack behind, which is where the slack of a
+growing key comes from in the first place. **Only inserts add slack**: ambuild writes items at
+their exact size, because a bulk-built index is read-mostly and the space would be pure loss, and
+so does VACUUM (`rbi_chain_put_items_locked()` is the no-slack form of
+`rbi_chain_put_items_locked_ext()`).
+
+Slack is bounded by `RBI_ITEM_SLACK_LIMIT` so that it can never be mistaken for corruption:
+verify() accepts an item whose allocated length is up to that much above its logical size, and
+rejects anything else (including any item above RBI_CONTAINER_MAX_SIZE, which is what lets every
+reader copy an item out by ItemIdGetLength() into a fixed work buffer). roaring_index_stats()
+reports the total as `slack_bytes`; `container_bytes` counts logical bytes only, and `free_bytes`
+comes from PageGetFreeSpace(), which does not see intra-item slack at all.
+
 Page allocation: `rbi_new_buffer()` extends the relation (ExtendBufferedRel), initialises the page
 and logs it in its own GenericXLog record; `rbi_new_buffer_xl()` registers the new page in the
 caller's record instead, and is what rbi_add_entry and the split path use, so a crash cannot leave an
@@ -175,20 +214,88 @@ INSERT (`rbi_insert.c`)
    pages other than the head may be released when done) to find the entry. If absent, add an INLINE
    entry with one 1-member array container (splitting the bucket chain by appending a new bucket page
    if no bucket page has room).
+   **Bucket directory guard** (v1 write wave): the walk counts the pages it visits, and a chain
+   longer than `RBI_BUCKET_PAGES_WARN` = 4 pages means the bucket holds about six times the entry
+   bytes ambuild sizes a bucket for (three quarters of a page), i.e. the index has outgrown the
+   directory it was built with. The threshold is not the "two pages per bucket on average" this
+   policy is stated as, because what an insert can observe cheaply is one bucket's chain - a
+   maximum, not an average - and hash skew plus ambuild's byte estimate (~30% low for keys whose
+   TIDs spread thinly, §13) leave a correctly sized index with three-page buckets; measured on the
+   20000-key column of bench/write_micro.sh's portfolio, which warned at a threshold of 2 right
+   after a clean build. An index that has really outgrown its directory is far past four pages:
+   100k keys in an index created empty give 64 buckets of twelve pages each.
+   The backend then says so once per index (`rbi_warn_bucket_chain()`), suggesting a REINDEX. It is
+   advisory in exactly the way the §17 cardinality guard is - the index keeps working and keeps
+   taking rows - and the estimate is one bucket's chain rather than an average over the directory,
+   because hashes spread entries evenly enough and walking the whole directory on every insert would
+   cost more than the warning is worth. An index whose `buckets` reloption was set explicitly is
+   never warned about: that count is what its owner asked for. roaring_index_stats() reports the
+   same quantity exactly, as `max_bucket_pages` (the longest chain in the index).
+   This is a warning and not online growth on purpose. Growing the directory in place would mean
+   splitting buckets (a new bucket count changes `rbi_bucket_of()` for every key, so either the
+   whole directory is rehashed under a lock that stops every reader, or the index keeps a split
+   point and two hash functions, as dynamic hashing does - and then every reader, the count
+   pushdown and VACUUM have to consult it, and a crash in the middle has to leave the two halves
+   consistent). Measured: 100k keys inserted into an index created empty keep 64 buckets and 773
+   bucket pages, and the 100-key IN median goes from 0.104 ms (bulk-built, 847 buckets) to 0.321 ms
+   (bench/results/2026-09-21-stress). A REINDEX costs one build and puts it back; online growth is
+   out of scope for v1.
 3. INLINE: rebuild the inline payload in a work buffer with the member added; if ≤ inline_limit and it
    fits on the bucket page (after PageRepairFragmentation if needed), overwrite the entry tuple;
    else spill to a chain (allocate one page, add all containers) and fall through to CHAIN.
 4. CHAIN: find the page for ckey; lock it EXCLUSIVE; copy container out, add member (or create a new
    1-member container), write back / split as in §4; update entry (ncontainers, ntids, tail).
-   Fast path: a BITSET container has the same size (4104 bytes) whatever its cardinality, so when the
-   container already on the page is a bitset the member is set directly in the GenericXLog page image
-   (same locks, same single record carrying the entry tuple) instead of being copied out, mutated and
-   written back with PageIndexTupleOverwrite. Nothing else on the page changes: same item size, same
-   offset, same ckey, so min/max stay put.
+   Fast path: when the item already on the page can take the member without changing the number of
+   bytes the page has allotted it, the member is added directly in the GenericXLog page image
+   (same locks, same single record carrying the entry tuple) instead of being copied out, mutated
+   and written back with PageIndexTupleOverwrite. Nothing else on the page changes: same allotted
+   length, same offset, same ckey, so min/max stay put (a sparse segment may extend its range, and
+   then only min/max move). A BITSET always qualifies - it is 4104 bytes whatever its cardinality -
+   and an ARRAY, a RUN or a segment qualifies when the item has growth slack (§4), which the general
+   path leaves behind whenever an insert writes an item.
+   The page is located with the exclusive lock the insert needs anyway: the tail page is tried
+   first (`rbi_insert_lock_chain_page()`), because that is where every insert into a growing posting
+   set lands, and only a ckey the tail does not own falls back to `rbi_chain_find_page()`, which
+   walks from the head. That saves the SHARE acquisition rbi_chain_find_page() would take on the
+   very same tail page just to read its minckey: two lock acquisitions per appending insert instead
+   of three, all of them inside the bucket-lock window. It did NOT move the concurrent-insert
+   ceiling of step 6 (643 tps either way, measured by swapping the two builds in one session), which
+   is what step 6 explains; it is kept because it strictly removes work from inside that window, and
+   an insert whose ckey is not on the tail pays the same number of acquisitions as before (an
+   exclusive lock on the tail where it used to be a shared one).
 5. All page modifications go through GenericXLog: one GenericXLogStart per atomic step, registering
    at most 4 buffers (a split touches P, N, possibly M, and the bucket page).
 6. Release everything. Inserts to different buckets do not block each other; inserts to the same
-   bucket serialize. Documented and accepted for v0.
+   bucket serialize. Documented and accepted for v0, and measured for v1 (bench/write_micro.sh,
+   8 clients × 100 rows per transaction, fsync on, synchronous_commit on, 1 index):
+
+       transactions/s, 100 rows each      1 client   4 clients   8 clients
+       roaring, 2 key values                 387        629         643
+       roaring, 1000 key values              371       1078        1890
+       btree, 2 key values                   460       1128        1466
+       no index, 2 key values                511       1170        2296
+
+   With a thousand key values the index side all but disappears (5.1× scaling, 82% of the no-index
+   ceiling); with two it flatlines at 1.7×. The wait-event profile of the two-value case is 57%
+   `Buffer/BufferExclusive` against btree's 31%, so the buffer content locks of the two keys' pages
+   are indeed where the time goes - but shortening the hold is NOT what would fix it, and the
+   numbers say why. A single-client roaring insert costs ~7.7 µs of which the serialized part is the
+   GenericXLog record: registering a buffer copies the whole 8 KB page, GenericXLogFinish() diffs
+   it against the copy and applies the image, so a record covering the container page and the
+   bucket page moves ~48 KB of memory per single-TID insert, all of it inside both locks because
+   §5 requires the entry's counters to travel with the container change. Repeating the burst on an
+   UNLOGGED table - no delta, no XLogInsert - lifts it only from 643 to 868 tps (btree 1466 → 2150,
+   no index 2296 → 19538), so the cost is the page-sized copying rather than the logging.
+   The protocol that would shorten the bucket hold (release the bucket page, walk and lock the
+   chain page, then ConditionalLockBuffer() the bucket page and re-read the entry, retrying from
+   the top on failure, as ambulkdelete does in §11) was therefore NOT implemented: it does not
+   remove the record write from the window where both pages are held, and it adds an acquisition
+   and a retry path. It is worth doing for the case it really helps - an insert whose ckey is in
+   the MIDDLE of a long chain, where `rbi_chain_find_page()` walks many pages under the bucket
+   lock - and that is the shape to revisit it in. The structural fix for hot-key inserts is a
+   custom WAL resource manager (RegisterCustomRmgr, PG 15+) with physical records ("set member m of
+   the item at offset o", "add n to the entry's ntids") instead of GenericXLog's page diffs, which
+   would cut the critical section by an order of magnitude.
 
 SCAN (`rbi_scan.c`, amgetbitmap)
 1. Lock bucket head SHARED, walk the bucket chain (lock coupling not required for bucket pages:
@@ -246,6 +353,14 @@ BUILD (`rbi_build.c`)
    page whether it needs one or not: sizing by distinct keys spent 32768 pages (256 MB) on a
    1M-key index whose entries were 84 MB. The floor matters because indexes are usually built on
    empty tables and filled later.
+   The byte total is scaled up by `pg_class.reltuples / indexed rows` when the heap is known to hold
+   more rows than this build put in the index, because the directory is sized once and nothing ever
+   resizes it (INSERT step 2 warns when it has been outgrown). Only ever up, and only for an index
+   over the whole table: a partial index holds the rows its predicate selects, and sizing that for
+   the whole heap would spend pages on buckets that stay empty. reltuples is -1 until something
+   analyses the heap, so an index built on an EMPTY table still gets the floor - for that case the
+   only way to say how large the index is going to be is the `buckets` reloption, which means an
+   exact count (§4).
 3. tuplesort_rescan; pass 2 groups by key. Because codes are sorted within a hash, and keys sharing a
    hash are rare, keep one open builder per distinct key of the current hash (a builder = ordered
    list of containers under construction; use rbi_container_append_sorted with a per-key "last ckey"
@@ -253,10 +368,34 @@ BUILD (`rbi_build.c`)
    changes, flush all builders: small payload → INLINE entry; else allocate container pages and fill
    them sequentially (fill each page until the next container does not fit; set rightlink,
    min/max), then add the CHAIN entry.
-4. Pages are written through the buffer manager; each new page goes through GenericXLog (register,
-   fill, finish), or, if !RelationNeedsWAL, without WAL. Meta and bucket pages are created first;
-   entry tuples are added to bucket pages under EXCLUSIVE locks like inserts (no concurrency exists
-   during build, but the code path is shared).
+4. Pages are written through the bulk-write API (storage/bulk_write.h), which is what the nbtree
+   and GiST builds use: `smgr_bulk_start_rel()` once for MAIN_FORKNUM, `smgr_bulk_get_buf()` for
+   each page image, `smgr_bulk_write()` when that page is final, `smgr_bulk_finish()` at the end.
+   Pages go straight to the file without passing through shared buffers, are WAL-logged in batches
+   of up to 32 as full-page images (or not logged at all for an unlogged relation or under
+   wal_level = minimal, in which case the relation is registered for the next sync), and each page
+   is written EXACTLY ONCE. Nothing may touch these blocks through the buffer manager until
+   smgr_bulk_finish() has returned.
+   Writing each page once is the point: the old route through the buffer manager logged one
+   GenericXLog record per entry tuple, so a build of 632k keys paid 632k page diffs and 632k WAL
+   records to fill 15k pages (measured, 1M rows, one column: 4.7 s and 76 MiB of WAL against 1.9 s
+   and 39 MiB now; the eight-index portfolio of bench/COMPARISON.md went 13.0 s / 95 MiB to
+   11.3 s / 57 MiB, which is below btree's 59 MiB).
+   It also means a page has to be FINAL before it is written, and a bucket page is only final when
+   the last entry that hashes to it has been added. Bucket pages therefore live in backend-local
+   memory - one 8 KB image per bucket page that holds entries, allocated lazily - until pass 2 is
+   over, and are written afterwards: head pages in bucket order, then the overflow pages in block
+   order. That is the cost of this route: the directory is sized at three quarters of a page per
+   bucket, so the images come to ~1.3× the bytes the entries need, bounded by RBI_MAX_BUCKETS pages
+   (512 MB) and by nothing else. Container pages are final as soon as the next container does not
+   fit, so only one per open key exists at a time.
+   Block numbers come from a counter rather than from extending the relation, in the same order the
+   buffer-manager route extended it (meta = 0, bucket directory = 1 .. nbuckets, then container
+   pages and further bucket pages on demand), so an index built by either route has the same page at
+   the same block - which is what keeps every regression output identical. The directory is a hole
+   in the file while pass 2 runs; the bulk writer fills a hole with zero pages when a later block is
+   written past it, and the real pages overwrite them afterwards, which costs one extra 8 KB
+   buffered write per bucket page and no WAL.
 5. ambuildempty: init meta + bucket pages (nbuckets = reloption or 64) in INIT_FORKNUM with
    log_newpage, as contrib/bloom does.
 
@@ -405,6 +544,42 @@ Algorithm `rbi_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *ke
    TID needs no index pin at all: if VACUUM removed that TID meanwhile, the tuple was dead to every
    snapshot including ours (nothing to count, and nothing is found); if the line pointer was reused,
    the new tuple's xmin is later than our snapshot and is invisible to it.
+6. Per-query visibility cache (`RBIVisCache`, rbi_count.h). A grouped count asks the recheck about
+   the same dirty heap pages once per group: at 5M rows with 200 groups and 5% of the rows updated,
+   9,062 dirty pages cost 415,884 heap block visits (§12's grouped-count finding). The answer cannot
+   change between those visits, so it is resolved once per (page, snapshot) and reused. The cache
+   maps a heap block to a bitmap of MaxHeapTuplesPerPage bits - which of its ROOT line pointers hold
+   a tuple visible to this snapshot - in a hash table in a per-node memory context, bounded by
+   `work_mem` in entries; when the budget is reached nothing more is inserted and the blocks that
+   did not get in are fetched per batch exactly as before (`cache_full` counts those visits).
+   - Where: in the flush only, i.e. after the VM check, exactly where rechecks happen today. The
+     pin rule of the argument above is untouched; the cache changes nothing about *which* TIDs are
+     rechecked, only whether the page has to be read for them.
+   - Why an answer keeps: `heap_hot_search_buffer(root TID, snapshot)` is a function of the snapshot.
+     A tuple visible to us is not dead to all, so nothing may remove it; HOT pruning may rewrite the
+     chain, but it only drops versions dead to *every* snapshot and leaves the survivors reachable
+     from the root in order, so the version found from a given root does not change (the same
+     guarantee a bitmap heap scan relies on between building its TID list and visiting the heap);
+     a "not visible" answer cannot become visible, because every tuple written after we looked
+     belongs to a transaction that is in progress at our snapshot, or began after it, or is ours
+     with a command id at or above the snapshot's curcid; and line pointer numbers never move.
+   - Serializable isolation: a cache hit calls neither HeapCheckForSerializableConflictOut() nor
+     PredicateLockTID(), so filling an entry takes `PredicateLockPage(heap, blk, snapshot)` once.
+     Both directions of rw-conflict detection are then closed: a write that happened BEFORE the page
+     was resolved is caught by the conflict-out check inside the sweep (which walks every chain on
+     the page, a superset of what any one recheck tests), and a write after it by the writer's own
+     CheckForSerializableConflictIn() against that page lock. Page locks may be coarsened to a
+     relation lock by SSI, which is conservative.
+   - When it fills: the sweep costs one visibility test per line pointer instead of one per wanted
+     TID, so it is only done once reuse is evident - the first count records nothing, the second
+     records the blocks it visits, and a block is resolved on its second visit. A one-shot count
+     therefore behaves exactly as it did before the cache existed, down to the last buffer visit.
+   - Lifetime: one handle per count node execution, created by the caller
+     (`rbi_vis_cache_create`/`_destroy`) and passed to `rbi_count_sources_cached()`; NULL means no
+     cache. The handle empties itself when it is handed a different relation or a different
+     snapshot, so the partitioned counts of §16 may share one handle and get one cache per
+     partition. `roaring_index_count_group_stats(idx, use_cache)` is the SQL image of that driver,
+     for tests: same entry scan, one count per group, one cache.
 
 SQL surface for tests: `roaring_index_count(idx regclass, key anyelement) RETURNS bigint` and
 `roaring_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
@@ -443,11 +618,25 @@ Planner integration
   - Every baserestrictinfo clause is `Var opeq Const` or `Const opeq Var` where Var is a plain column
     of the rel with a *valid* roaring index whose opfamily contains that operator as strategy 1 (use
     the index's opfamily and the operator OID; cross-type integer equality is fine because the
-    integer opfamily contains it), the Const is not NULL, and there is at most one clause per column
-    (two different constants on one column ⇒ bail; the same constant twice ⇒ dedupe). Parameters
-    (Param nodes) may be supported later; v0 = Const only. §15 adds `Var = ANY (Const array)` and
-    §14 the two null tests to the shapes accepted here; an `IS NOT NULL` clause is exempt from the
-    one-clause-per-column rule, because it constrains no value.
+    integer opfamily contains it), the compared value is not a literal NULL, and there is at most
+    one clause per column (two different values on one column ⇒ bail; the same value twice ⇒
+    dedupe, by `equal()`, so two different Params on one column bail). §15 adds
+    `Var = ANY (array)` and §14 the two null tests to the shapes accepted here; an `IS NOT NULL`
+    clause is exempt from the one-clause-per-column rule, because it constrains no value.
+  - **A Param stands wherever a Const may** (2026-09-21 follow-up review). A prepared statement's
+    GENERIC plan keeps `k = $1` as a Param - that is what a generic plan IS - and accepting only
+    literals meant the node was never used by one: a dense count fell back to the ordinary plan and
+    measured **5.6 ms against 0.025 ms** on 100k rows, and 207 ms against 3.1 ms on five million.
+    Both parameter kinds are accepted, PARAM_EXTERN for a statement's own parameters and PARAM_EXEC
+    for the ones a nested loop or a LATERAL reference supplies, for equality and for the array of an
+    IN list; `k IN ($1, $2)` keeps an `ArrayExpr` over them in a generic plan, and that is accepted
+    too, as long as its elements are themselves literals or parameters (the node evaluates the array
+    ONCE per scan, and an element that could be volatile does not mean the same thing evaluated once
+    as it does evaluated per row). A multi-key clause (§17) still requires a Const, because there
+    the query's SHAPE and not just its value decides whether the posting sets can answer it at all.
+    At plan time the value is unknown, so `clause_selectivity()` gives the estimate it gives any
+    non-Const comparison; at run time a NULL value selects no rows, which every operator involved
+    agrees with by being strict.
   - Collations follow the planner's IndexCollMatchesExprColl() rule: a collation-sensitive clause
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
     indexcollations[0] equals that collation, because the index hashed and compared keys under its
@@ -498,19 +687,40 @@ Planner integration
   grouped_rel->reltarget` (a partitioned GROUP BY uses a partially-grouped target instead and is
   wrapped in a Finalize Agg: §16), rows = estimated groups (from estimate_num_groups, or 1 without
   GROUP BY),
-  startup/total cost = (index pages for the involved keys, estimated as the index size × selectivity,
-  clamped ≥ 1) × random_page_cost + containers × cpu_operator_cost + expected recheck TIDs (the
-  fraction of heap pages not all-visible from `pg_class.relallvisible/relpages`, times the rows the
-  clauses select) × cpu_tuple_cost + random_page_cost per recheck PAGE, where the pages are bounded
-  by the pages the visibility map cannot vouch for:
-  - without GROUP BY, `Min(recheck_tids, heap_pages × dirtyfrac)`. A single count walks the merged
-    result in TID order and visits each such block at most once, and charging random reads across
-    the whole heap instead priced the node out of the case it exists for: on a freshly vacuumed
-    1M-row table (4480 pages, 4425 all-visible) the model asked 18054 against a bitmap aggregate's
-    16247, for a count that rechecked zero TIDs and ran in 0.24 ms (2026-09-20 review, finding 5);
-  - with GROUP BY, `Min(numgroups × heap_pages × dirtyfrac, recheck_tids)`: each group's merge
-    returns to a dirty block separately, which is what keeps a thousand groups of one TID per block
-    on a heap that is not all-visible losing to the sequential scan that does the same work once.
+  and a cost (`rbi_cost_count_rel()`, per relation, summed over the leaves of §16) that is the sum
+  of what the node really reads:
+  - **one bucket page per looked-up key** at random_page_cost, and that key's own container chain -
+    written sequentially, so its share of the index's container pages, at least one page - at
+    seq_page_cost. An IN list is one such lookup per element (§15) and the bucket pages are shared
+    once the list is longer than the index has buckets, so the pages are `Min(nelems, nbuckets)`;
+  - **every page of the group index** for a GROUP BY, at seq_page_cost: its entries are all walked;
+  - **one O(1) step per container per participating source**, twice cpu_operator_cost (a block mask
+    and a visibility-map mask), where a source's containers are `Min(heap_pages /
+    RBI_BLOCKS_PER_CONTAINER, its members)`, so a GROUP BY pays numgroups of them;
+  - **the union of an IN list**, cpu_operator_cost × members × log2(nelems): a merge of k sets costs
+    that per member however it is organised (§15 builds the k-way one), and a single-key clause with
+    k = 1 pays nothing for a merge it does not make;
+  - **the heap the visibility map cannot vouch for**: `recheck_tids = rows × dirtyfrac` from
+    `pg_class.relallvisible/relpages`, one cpu_tuple_cost each - that is a visibility-bit lookup in
+    the per-query cache of §9 - on `Min(recheck_tids, heap_pages × dirtyfrac)` DISTINCT pages,
+    fetched ONCE per query whatever brings the count back to them.
+
+  That last bound is the whole of the 2026-09-21 follow-up review's grouped-count finding. The node
+  used to be charged `Min(numgroups × heap_pages × dirtyfrac, recheck_tids)` page visits at
+  random_page_cost, on the grounds that each group's merge returns to a dirty block separately. It
+  does, but §9's visibility cache resolves a dirty page once per snapshot and answers every later
+  group out of memory, so those are repeated CPU and not repeated I/O. At 5M rows, 200 groups and 5%
+  of the rows updated (91,345 of 100,407 pages all-visible) the old model asked **1,815,739** cost
+  units against the sequential aggregate's 175,511 - for a node that ran in **148 ms against
+  1,174 ms**, with 418,819 buffer hits and zero physical reads over a 71 MiB working set. The same
+  shape reproduced here: **15,661 against 155,840**, and 141 ms against 850 ms.
+
+  The page cost respects caching for the same reason (`rbi_heap_page_cost()`): it interpolates
+  between seq_page_cost and random_page_cost on whichever of two ratios argues more strongly for
+  sequential access - the working set's share of this relation's prorated `effective_cache_size`, as
+  `index_pages_fetched()` prorates it, and the fraction of the relation the set covers, as
+  `cost_bitmap_heap_scan()` interpolates it. A dirty working set much larger than the cache is still
+  charged as random I/O, which is the failure a blanket preference for this node would hide.
 
   The node streams: every row is emitted as it is counted, so the startup cost is 0 except for the
   forms that produce a single row (a plain count, or a GROUP BY the planner folded to one group),
@@ -518,15 +728,30 @@ Planner integration
   beyond one group's iteration state, and nothing above the node is priced here - a partitioned
   GROUP BY puts core's Finalize Agg on top and core costs that (§16).
 
-  This is deliberately optimistic but proportional; document it. `test/sql/pushdown.sql` pins both
-  ends: a 200k-row table vacuumed and then slightly extended (relallvisible just under relpages)
-  must choose the node for a single count and for a small GROUP BY with nothing disabled, and the
-  1000-group never-vacuumed table must still lose to the sequential scan.
+  This is deliberately optimistic but proportional; document it. `test/sql/pushdown.sql` pins every
+  end of it with nothing disabled, so that which plan the cost model picks IS the test:
+  - a 200k-row table vacuumed and then slightly extended (relallvisible just under relpages) must
+    choose the node for a single count and for a small GROUP BY;
+  - a 100k-row table vacuumed and then 5% of its rows updated - about a tenth of its pages dirty -
+    must choose it for a 20-group GROUP BY (2.0 ms against 15.8 ms);
+  - a 1000-group never-vacuumed table must choose it as well, which is the answer that CHANGED with
+    the visibility cache: one pass over the dirty pages plus 100,000 bit lookups is 17.9 ms against
+    the sequential aggregate's 26.8 ms;
+  - and a 20000-group never-vacuumed table must still lose to it, because there the per-group work
+    and not the recheck is what costs: 40.8 ms against 28.0 ms. Higher-cardinality groupings lose by
+    more (at 5M rows, GROUP BY over 20000 keys is 1,541 ms against 1,114 ms and over a million keys
+    4,654 ms against 2,047 ms), and the model refuses all of them.
 - PlanCustomPath produces a CustomScan with `scan.scanrelid = 0` (upper-level node),
   `custom_scan_tlist` = the output columns (group key Var(s) with their original varno/varattno, and
   the aggregate as a Const-shaped placeholder replaced at execution), and `custom_private` holding:
-  the heap relid, the list of (index oid, attnum, const datum serialized via a Const node) for WHERE,
-  the group-by (index oid, attnum) or none, and the aggregate kinds. Use `build_path_tlist`-style
+  the heap relid, the list of (index oid, attnum) for WHERE, the group-by (index oid, attnum) or
+  none, and the aggregate kinds.  The clause VALUES travel in `custom_exprs` rather than in
+  `custom_private`, because that is the only field of a CustomScan the planner's later passes look
+  inside: `set_customscan_references()` fixes its expressions up and `SS_finalize_plan()` collects
+  the Param ids it finds there into the plan's extParam/allParam, which is what makes the executor
+  rescan this node when an exec Param changes.  A value left only in `custom_private` would be
+  invisible to both, and a parameterised inner side would then count the first outer row's key
+  again. Use `build_path_tlist`-style
   handling with INDEX_VAR references in the plan's targetlist as pg_strom/TimescaleDB do.
   `custom_private` is a POSITIONAL list (the `RBI_PRIV_*` indexes), so its first member is a shape
   marker - an IntList of `RBI_PRIV_MAGIC` and the number of members - which BeginCustomScan checks
@@ -536,7 +761,15 @@ Planner integration
 Executor
 - BeginCustomScan: open heap with NoLock (the executor already locked every RTE); index_open each
   index with AccessShareLock; register the executor snapshot (estate->es_snapshot); allocate work
-  buffers and a per-group memory context.
+  buffers, a per-group memory context and one visibility cache for the whole execution (§9); and
+  take each clause's value from `custom_exprs` - a Const's is read straight out of it, anything else
+  gets an `ExecInitExpr()` ExprState.
+- The parameters are evaluated at the START of each scan, not in BeginCustomScan: an exec Param is
+  set by the nested loop after the node has been initialised and again before every rescan, so the
+  values are computed on the first ExecCustomScan call after each ReScan
+  (`ExecEvalExprSwitchContext()` through the node's own ExprContext, then `datumCopy()` into a
+  context of the node's that lives exactly as long as the scan - the per-tuple memory the evaluation
+  leaves its result in belongs to nobody here). ReScan throws them away with everything else.
 - ExecCustomScan without GROUP BY: on the first call compute rbi_count_keys for the WHERE keys and
   return one tuple (count); subsequent calls return NULL.
 - ExecCustomScan with GROUP BY: iterate all entries of the group-by index in bucket order (walk
@@ -548,12 +781,22 @@ Executor
   per partition (§16).
 - ReScanCustomScan: reset iteration state. EndCustomScan: close indexes, free.
 - ExplainCustomScan: print "Indexes: idx1 (col = const), ..." and "Group Key: col" and, with ANALYZE,
-  the number of TIDs rechecked in the heap and heap blocks skipped via the visibility map.
+  the number of TIDs rechecked in the heap, the heap blocks skipped via the visibility map, the
+  containers visited, and the block visits the visibility cache answered or had to let past its
+  budget ("Heap Blocks From Cache" / "Heap Blocks Past Cache Budget", §9). A clause whose value is
+  not a literal is printed as the expression the plan carries, which for a prepared statement's
+  parameter is `$1` - the text core's EXPLAIN gives a qual on one - via `deparse_expression()`
+  against the plan's own deparse context.
 
 Tests (pg_regress): the pushdown produces identical results to the plain plan for: no rows; all rows;
 WHERE constants that match no key; cross-type constants; GROUP BY with and without WHERE; after
 DELETE without VACUUM (recheck path) and after VACUUM (VM path); EXPLAIN shows the custom node when
-`roaring_index.enable_count_pushdown = on` and the normal plan when off. `test/sql/null.sql` and
+`roaring_index.enable_count_pushdown = on` and the normal plan when off.  Parameters get the same
+treatment under `plan_cache_mode = force_generic_plan`, which is what keeps a `$n` a Param: a
+count, a count that matches nothing, a NULL parameter, `= ANY ($1)`, `IN ($1, $2)`, a GROUP BY with
+a parameterised WHERE clause, a parameterised clause whose column the target list prints, and a
+LATERAL nested loop whose inner side is rescanned with a new exec Param for every outer row - each
+compared against the same query with the pushdown switched off, as a multiset both ways round. `test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too.
@@ -703,7 +946,9 @@ Policy. RBI_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contain
   on the fly (≤ 3 members), so the merge/AND/VM-mask code is unchanged; one VM mask read per ckey.
 - verify: segments sorted, non-overlapping with neighbours, sizes in range, cardinality == n, each
   ckey inside a segment has < threshold members (after build; inserts may transiently violate only
-  until extraction). stats: add sparse_segments and sparse_members columns.
+  until extraction). stats: add sparse_segments and sparse_members columns. "Sizes in range" means
+  the item's allocated length is at least what its header needs and at most that plus one slack
+  allowance (§4): a segment an insert wrote has room for a few more pairs inside it.
 - Container library: `rbi_container_check()` rejects type 4 ("item is a sparse segment, not a
   container"); segment helpers live in `src/rbi_sparse.[ch]` with their own standalone unit test
   (test/unit/sparse_test.c, `make unit`). Segments never grow while being filtered, so VACUUM's
@@ -804,11 +1049,60 @@ only costs work). An empty array, an all-NULL one, or a list none of whose value
 zero rows. Longer lists are left to the ordinary plan, because every listed value needs a posting
 set of its own and each may hold a buffer pin for as long as the node runs.
 
-The merge's sources are therefore unions: k sub-cursors merged by container key, yielding
-rbi_container_or() of the containers that share the smallest key any of them still has. The §9 pin
-rule is per sub-cursor and unchanged - a sub-cursor that contributed to the merged container still
-pins the page that container came from, because only rbi_ucursor_next() advances it and the merge
-only calls that from rbi_count_container(), after the visibility-map checks.
+The array may also be a Param, or an `ArrayExpr` over literals and Params, which is what `k IN
+($1, $2)` and `k = ANY ($1)` keep in a generic plan (§10). The length cap then applies only when the
+length is known at plan time - a literal array's and an ArrayExpr's. A Param that IS an array has no
+length until the executor has it, and by then there is no plan left to decline in favour of, so it
+is answered whatever its length; the pin budget the cap protects is bounded by the index's bucket
+pages instead, since every element's entry lives on one of those.
+
+The merge's sources are therefore unions: k sub-cursors merged by container key, yielding the union
+of the containers that share the smallest key any of them still has. The §9 pin rule is per
+sub-cursor and unchanged - a sub-cursor that contributed to the merged container still pins the page
+that container came from, because only the merge advances it, from rbi_count_container(), after the
+visibility-map checks.
+
+Neither half of that may be done by walking all k sub-cursors, because k is up to 1000:
+- **Which sub-cursors are at the smallest key**: a binary MIN-HEAP of the sub-cursors, keyed by
+  their current container key. The ones standing at the root's key come off the heap into a "hot"
+  list and go back on as they are advanced, so the per-container-key cost is proportional to the
+  sub-cursors that take part rather than to k. The heap entry carries a COPY of the child's
+  container key: reading it out of the child while sifting chases a thousand ~300-byte cursors in a
+  random access pattern, which measured *slower* than the linear scan it replaced (+4 ms on a
+  1000-value list at 1M rows).
+- **The union itself**: folding m containers pairwise builds and re-optimizes m-1 intermediate
+  containers, which is quadratic in the members. Above `RBI_OR_BITSET_MIN` (32, measured) of them at
+  one container key, they are ORed into one bitset image of the key's range instead and the result
+  container is built from it once. Below that the pairwise fold is cheaper, because the image costs
+  a fixed pass over the whole 32768-value range however few members arrive.
+- **Locating the entries**: `rbi_posting_set_lookup_many()` hashes every value first and then looks
+  the entries up in (bucket, hash) order, so the bucket pages are read in ascending block order and
+  duplicates - which hash equally and are therefore adjacent in that order - are dropped in one pass
+  instead of by comparing every value with every earlier one (half a million `datumIsEqual()` calls
+  at 1000 values). `roaring_index_count_any(idx, keys)` is the SQL form of the whole path.
+
+Measured at 1M rows, all-visible heap, assert build: `count(*) WHERE c20k IN (...)` through this
+path against the same query on a btree (20000 distinct values, 50 rows each) - 3 values 0.13 vs
+0.08 ms, 10 values 0.26 vs 0.11 ms, 100 values 1.80 vs 0.51 ms, 1000 values 14.7 vs 4.4 ms. The
+1000-value case was 24.7 ms with the pairwise fold and the linear scan over all sub-cursors; the
+shorter lists are unchanged, which is the point of the two thresholds.
+
+**Cost.** A list is priced per element and not per clause (§10's `rbi_cost_count_rel()`): one bucket
+page each at random_page_cost, shared once the list is longer than the index has buckets
+(`Min(nelems, nbuckets)`); one chain page each at seq_page_cost, or the clause's share of the
+container pages if that is larger; one container step per element per container key; and
+`members × log2(nelems)` at cpu_operator_cost for the k-way merge above. Charging a list as a single
+bucket page made a thousand-element list look four times cheaper than it is and the planner chose it
+anyway: at 1M rows 15.4 ms against the B-tree index-only scan's 3.1 ms, and at 5M rows 67 against 16
+(the 2026-09-21 follow-up review). With the per-element model, and after the k-way merge above, the
+crossover falls where the measurements do for a list over MANY distinct keys - 5M rows, `c20k`, one
+prepared statement per length: 3 values 0.098 ms against the B-tree's 0.066, 10 values 0.49 against
+0.18, 100 values 3.18 against 1.77 (refused), 1000 values 32.3 against 17.4 (refused) - and it keeps
+the node for a list over FEW distinct keys, where it wins by a lot and the B-tree has to read an
+index tuple per row: `c200` with 3 values 1.58 ms against 5.47, 10 values 6.8 against 17.1, 100
+values 20.8 against 173.9, and `c2 IN (0, 1)` 14.4 ms against 364.9. The two shortest high-
+cardinality lists are the model's remaining mispredictions, by 0.03 and 0.31 ms; `test/sql/
+pushdown.sql` pins the choice at 3, 10 and 1000 values on a table of its own.
 
 A GROUP BY over the same column restricts the groups to the listed values (the group's set is
 intersected with the union, and a group outside the list counts 0 and is not emitted).
@@ -860,7 +1154,12 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
 - Cost: `rbi_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
   allvisfrac and rows and its own indexes; the path's cost is the sum over the leaves. numgroups
   comes from `estimate_num_groups` on the PARENT (a partition may hold rows of every group), and is
-  used unchanged for each of them. Nothing is added for a merge, because there is none, and the
+  used unchanged for each of them. Each partition's dirty working set is therefore charged once, for
+  the same reason a single table's is (§10): one visibility cache serves the whole node execution
+  and empties itself as the partition under it changes, so a partition's dirty pages are fetched
+  once per query however many of its groups come back to them (§9). A partition's own
+  `effective_cache_size` share is prorated from its own page count, so a partitioned table is not
+  quietly treated as one huge relation. Nothing is added for a merge, because there is none, and the
   Finalize Agg on top is costed by core's own `create_agg_path()`/`cost_agg()` - including its
   spill. The node's `rows` is what it really emits: for a partitioned GROUP BY the SUM over the
   partitions of that partition's own `estimate_num_groups` (made against the child Var, so against
@@ -973,7 +1272,7 @@ VACUUM of one partition cannot affect the count of another: the interlock argume
 one heap and its indexes, and each partition is its own.
 
 Not supported: run-time pruning (the node has no Append and no PartitionPruneInfo, so the partition
-set is fixed at plan time), Params in the WHERE clauses (§10, not partition-specific), parallel
+set is fixed at plan time), parallel
 execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation as above. Planning
 costs one `index_open` per clause per partition (`rbi_index_bucket_pages` reads the meta page), and
 EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
@@ -1156,6 +1455,37 @@ takes is taken before the first container page is pinned: the reader side of the
 `col op ANY (const array)` reaches a multi-key index too (amsearcharray is on for §15's sake); each
 element is a query of its own and the answers go into the same bitmap, which is their union.
 
+**Costing the ALL fallback** (`rbicostestimate`, rbi_am.c; the 2026-09-21 follow-up review). An
+ALL-mode scan reads the WHOLE index and hands the heap every indexed row, and the generic estimate
+priced it with the PREDICATE's output selectivity instead - it was handed an empty `GenericCosts` and
+told nothing. A prefix query on 200,000 documents was estimated at **192.15** cost units against the
+sequential scan's 9,156.14, for a plan that emitted **1,176,746 posting TIDs** and rechecked 198,020
+rows across 6,628 heap blocks, and it was chosen by default: **62.3 ms against 23.8 ms**, and the
+phrase form **68.6 against 31.8**. So `rbicostestimate` now asks, before calling
+`genericcostestimate()`, whether the scan will walk the whole index:
+- it picks the qual `rbigetbitmap()` would actually answer, by the same ranking that function uses
+  (a plain operator first, then a ScalarArrayOp, then a null test), because the cost of the scan is
+  the cost of that one qual and the rest are only rechecked;
+- `col IS NOT NULL` walks every entry (§14), and so does a multi-key query the extraction above
+  answers with RBI_QMODE_ALL - which it is asked at plan time, with the clause's own strategy, the
+  same way the count pushdown asks;
+- a multi-key query whose value is not a plan-time Const is costed as ALL, because the MODE follows
+  the query's shape and an unknown shape has to be assumed to be the expensive one;
+- then `numIndexTuples` is the index's whole `reltuples` - its (key, row) postings, which is what
+  `rbibuild` reports and `rbivacuumcleanup` keeps, though an ANALYZE since will have overwritten it
+  with the heap's row count and made this a lower bound - which prorates into every index page, and
+  any page the proration still leaves out is added at random_page_cost;
+- and for the multi-key fallback ONLY, `indexSelectivity` becomes 1.0, so the bitmap heap scan above
+  is costed as a recheck of the whole table. `IS NOT NULL` keeps the clause's own selectivity: the
+  rows it emits are exactly the rows it selects, so its heap side is not a full recheck even though
+  its index side is a full walk.
+
+Phrase, prefix, weighted and NOT tsqueries, `<@`, `@> '{}'` and a query with a NULL element then lose
+the bitmap plan to the sequential scan (measured **61.5/51.9/45.5/65.8 ms** for phrase / prefix /
+weight / `<@` against the bitmap plan's 101.3/98.0/88.7/89.1), and to GIN when a GIN index is present
+(18.8/7.1/27.3 ms), while exact `@>`, `&&` and AND/OR tsqueries keep the count pushdown and the
+bitmap plan unchanged. `test/sql/tsvector.sql` and `test/sql/array.sql` pin the plan shapes.
+
 ### The expression evaluator (`rbi_count.c`)
 
 §15's union cursor is generalised into `RBIExprCursor`, a cursor over an `RBIKeyNode` tree whose
@@ -1198,6 +1528,14 @@ and a non-NULL Const on the right.  Strategy 4 and everything that is not a roar
   already does, better.  `rbi_match_index()` additionally insists that each relation's index carries
   the very extractQuery function the plan-time extraction used, so the run-time extraction cannot
   come out differently.
+- **A multi-key clause therefore requires a Const**, even though §10 accepts a Param for equality
+  and for an IN list.  What decides whether this node can answer the clause at all is the query's
+  SHAPE - `tags @> $1` with `$1 = '{}'` extracts to ALL mode, as does a phrase or a prefix tsquery -
+  and a Param has no shape until the executor has it, at which point the plan is fixed and there is
+  nothing to fall back to: the node cannot recheck the operator against the heap, so it would have
+  to error on a query it was handed legitimately.  A generic plan over `tags @> $1` therefore uses
+  the ordinary plan (costed as ALL, above); a custom plan folds the parameter to a literal and is
+  pushed down as usual.  `test/sql/array.sql` pins both.
 - At run time the clause's source is the tree over its keys' posting sets, ANDed with the other
   clauses by the merge, exactly like an IN list's union.  Several multi-key clauses on ONE column are
   allowed (the one-positive-clause-per-column rule of §10 is for clauses that pin a value;
@@ -1229,7 +1567,8 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 
 `<@` from the posting sets (a row matches when it has no key OUTSIDE the query array, which the index
 cannot tell); prefix, phrase and weighted tsqueries from the posting sets; `col op ANY (...)` in the
-count pushdown (only in the bitmap scan); a multi-key index as the GROUP BY or sum-over-all driver;
+count pushdown (only in the bitmap scan); a Param as a multi-key query in the count pushdown (above);
+a multi-key index as the GROUP BY or sum-over-all driver;
 `roaring_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
 
 ### Measured (2026-09-20, 1M rows, 521 MB heap, all-visible, warm cache)

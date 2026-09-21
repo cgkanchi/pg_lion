@@ -61,6 +61,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "common/hashfn.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
@@ -83,6 +84,8 @@
 PG_FUNCTION_INFO_V1(roaring_index_count);
 PG_FUNCTION_INFO_V1(roaring_index_count2);
 PG_FUNCTION_INFO_V1(roaring_index_count_stats);
+PG_FUNCTION_INFO_V1(roaring_index_count_group_stats);
+PG_FUNCTION_INFO_V1(roaring_index_count_any);
 
 /* First size of the recheck TID array, and the step it grows past its budget. */
 #define RBI_RECHECK_INIT_TIDS	256
@@ -96,6 +99,18 @@ PG_FUNCTION_INFO_V1(roaring_index_count_stats);
  */
 #define RBI_RECHECK_MIN_BATCH	4096
 #define RBI_RECHECK_MAX_BATCH	((int) (MaxAllocSize / sizeof(ItemPointerData) / 2))
+
+/*
+ * Above this many containers at one container key, an OR node stops folding
+ * them pairwise and accumulates them in a bitset image instead (see
+ * rbi_ecursor_build()).  Pairwise is cheaper while the containers are few and
+ * small, because it touches only their members; the image costs a fixed pass
+ * over the whole container key's range however few members arrive.  Measured
+ * on 1M rows with IN lists of 3, 10, 100 and 1000 values.
+ */
+#ifndef RBI_OR_BITSET_MIN
+#define RBI_OR_BITSET_MIN	32
+#endif
 
 /*
  * A posting set is worth materializing (DESIGN.md section 9 and the comment
@@ -118,6 +133,7 @@ typedef struct RBICountCtx
 	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
 	bool		serializable;	/* IsolationIsSerializable() at start: take page predicate locks */
 	bool		in_recovery;	/* hot standby: the pin interlock does not hold, recheck everything */
+	RBIVisCache *cache;			/* per-query visibility cache, or NULL */
 	int64		count;			/* members counted straight from the VM */
 	RBICountStats stats;
 
@@ -230,26 +246,42 @@ rbi_get_am_oid(void)
 }
 
 /*
- * Hash a search key and, when it is not of the index's own type, work out the
- * cross-type equality function to compare stored keys against it.  This is
- * the same dance rbi_scan.c does for scan keys: the hash must come from the
- * argument type's own support function, the comparison from the opfamily's
- * strategy-1 operator with the stored type on the left.
+ * Everything needed to probe an index with keys of one search type: the hash
+ * function to use, and, when the type is not the index's own, the cross-type
+ * equality function to compare stored keys against it.  This is the same
+ * dance rbi_scan.c does for scan keys: the hash must come from the argument
+ * type's own support function, the comparison from the opfamily's strategy-1
+ * operator with the stored type on the left.
+ *
+ * It is a struct rather than a call per key because an IN list probes one
+ * index with up to RBI_MAX_ARRAY_ELEMS keys of the same type (DESIGN.md §15),
+ * and the catalogue lookups behind it are the same every time.
  */
-static uint32
-rbi_probe_prepare(Relation index, RBIState *state, Datum key, Oid keytype,
-				  FmgrInfo *eqproc, bool *crosstype)
+typedef struct RBIProbe
+{
+	bool		crosstype;		/* the keys are not the index's own type */
+	FmgrInfo	eqproc;			/* crosstype: stored = search comparison */
+	FmgrInfo	hashinfo;		/* crosstype: the search type's own hash */
+	int16		typlen;			/* the search type, for datumIsEqual() */
+	bool		typbyval;
+} RBIProbe;
+
+static void
+rbi_probe_init(Relation index, RBIState *state, Oid keytype, RBIProbe *probe)
 {
 	Oid			opfamily = index->rd_opfamily[0];
 	Oid			opcintype = index->rd_opcintype[0];
 	Oid			eqopr;
 	Oid			hashproc;
-	FmgrInfo	hashinfo;
 
-	*crosstype = false;
+	memset(probe, 0, sizeof(RBIProbe));
 
 	if (!OidIsValid(keytype) || keytype == opcintype)
-		return rbi_hash_key(state, key);
+	{
+		probe->typlen = state->typlen;
+		probe->typbyval = state->typbyval;
+		return;
+	}
 
 	eqopr = get_opfamily_member(opfamily, opcintype, keytype, 1);
 	if (!OidIsValid(eqopr))
@@ -269,11 +301,19 @@ rbi_probe_prepare(Relation index, RBIState *state, Datum key, Oid keytype,
 						format_type_be(keytype),
 						get_opfamily_name(opfamily, false))));
 
-	fmgr_info(get_opcode(eqopr), eqproc);
-	*crosstype = true;
+	fmgr_info(get_opcode(eqopr), &probe->eqproc);
+	fmgr_info(hashproc, &probe->hashinfo);
+	probe->crosstype = true;
+	get_typlenbyval(keytype, &probe->typlen, &probe->typbyval);
+}
 
-	fmgr_info(hashproc, &hashinfo);
-	return DatumGetUInt32(FunctionCall1Coll(&hashinfo, state->collation, key));
+static inline uint32
+rbi_probe_hash(RBIState *state, RBIProbe *probe, Datum key)
+{
+	if (!probe->crosstype)
+		return rbi_hash_key(state, key);
+	return DatumGetUInt32(FunctionCall1Coll(&probe->hashinfo, state->collation,
+											key));
 }
 
 
@@ -345,15 +385,43 @@ rbi_fill_posting_set(Relation index, RBIState *state, Buffer buf,
 	}
 }
 
-bool
-rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
+/*
+ * One key of an IN list, in the order its entry should be looked up in:
+ * bucket first, so the bucket pages are visited in ascending block order,
+ * then hash, so equal values (which hash equally) end up adjacent and the
+ * duplicate check is a look at the neighbours.
+ */
+typedef struct RBIProbeKey
+{
+	uint32		bucket;
+	uint32		hash;
+	int32		idx;			/* position in the caller's value array */
+} RBIProbeKey;
+
+static int
+rbi_probe_key_cmp(const void *a, const void *b)
+{
+	const RBIProbeKey *x = (const RBIProbeKey *) a;
+	const RBIProbeKey *y = (const RBIProbeKey *) b;
+
+	if (x->bucket != y->bucket)
+		return x->bucket < y->bucket ? -1 : 1;
+	if (x->hash != y->hash)
+		return x->hash < y->hash ? -1 : 1;
+	return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
+}
+
+/*
+ * Locate the entry of one key whose hash has already been computed.  This is
+ * rbi_posting_set_lookup() from the bucket read onwards, split out so that a
+ * whole IN list can have its hashes taken - and its bucket pages visited in
+ * order - before any page is read (rbi_posting_set_lookup_many()).
+ */
+static bool
+rbi_posting_set_locate(Relation index, RBIState *state, RBIProbe *probe,
+					   Datum key, uint32 hash, uint32 bucket,
 					   RBIPostingSet *ps)
 {
-	RBIState   *state = rbi_get_state(index);
-	FmgrInfo	eqproc;
-	bool		crosstype;
-	uint32		hash;
-	uint32		bucket;
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
@@ -364,15 +432,13 @@ rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
 
-	hash = rbi_probe_prepare(index, state, key, keytype, &eqproc, &crosstype);
-	bucket = rbi_bucket_of(hash, state->meta.nbuckets);
-
 	headbuf = ReadBuffer(index, RBI_BUCKET_BLKNO(bucket));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
 	if (!rbi_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
 							key, hash,
-							crosstype ? &eqproc : NULL, state->collation,
+							probe->crosstype ? &probe->eqproc : NULL,
+							state->collation,
 							&entrybuf, &entryoff))
 	{
 		UnlockReleaseBuffer(headbuf);
@@ -401,6 +467,119 @@ rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
 	}
 
 	return true;
+}
+
+bool
+rbi_posting_set_lookup(Relation index, Datum key, Oid keytype,
+					   RBIPostingSet *ps)
+{
+	RBIState   *state = rbi_get_state(index);
+	RBIProbe	probe;
+	uint32		hash;
+
+	rbi_probe_init(index, state, keytype, &probe);
+	hash = rbi_probe_hash(state, &probe, key);
+
+	return rbi_posting_set_locate(index, state, &probe, key, hash,
+								  rbi_bucket_of(hash, state->meta.nbuckets),
+								  ps);
+}
+
+/*
+ * Locate the posting sets of many keys of one index at once: the IN list of
+ * DESIGN.md §15, whose union the merge in this file then evaluates.
+ *
+ * Two things are done here that a loop over rbi_posting_set_lookup() cannot:
+ *
+ *	- the keys are hashed first and the entries are then located in (bucket,
+ *	  hash) order, so the bucket pages are read in ascending block order and
+ *	  each one that several keys land in is read once while it is hot, instead
+ *	  of in whatever order the array happened to list its values;
+ *	- duplicates are dropped in one pass over that order instead of by
+ *	  comparing every value with every earlier one, which at the 1000 values
+ *	  the planner allows is half a million datumIsEqual() calls.  Equal values
+ *	  hash equally, so they are adjacent in this order; the comparison is the
+ *	  bytewise one, so two values that compare equal without being identical
+ *	  still get a set each, which is harmless (a union does not double-count).
+ *
+ * *sets must have room for nvalues sets; the located ones come out packed at
+ * the front, in bucket order, and the return value is how many there are.
+ * Every one of them - found or not - must be handed to
+ * rbi_posting_set_release().  *nfound, if given, is how many of them have an
+ * entry in the index at all: nfound == 0 means the union selects nothing.
+ */
+int
+rbi_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
+							const Datum *values, const bool *isnull,
+							RBIPostingSet *sets, int *nfound)
+{
+	RBIState   *state = rbi_get_state(index);
+	RBIProbe	probe;
+	RBIProbeKey *probes;
+	int			nprobe = 0;
+	int			nsets = 0;
+	int			found = 0;
+	int			i;
+
+	Assert(nvalues >= 0);
+	if (nfound != NULL)
+		*nfound = 0;
+	if (nvalues == 0)
+		return 0;
+
+	rbi_probe_init(index, state, keytype, &probe);
+
+	probes = (RBIProbeKey *) palloc(sizeof(RBIProbeKey) * nvalues);
+	for (i = 0; i < nvalues; i++)
+	{
+		if (isnull != NULL && isnull[i])
+			continue;			/* `col = NULL` is never true */
+		probes[nprobe].hash = rbi_probe_hash(state, &probe, values[i]);
+		probes[nprobe].bucket = rbi_bucket_of(probes[nprobe].hash,
+											  state->meta.nbuckets);
+		probes[nprobe].idx = i;
+		nprobe++;
+	}
+
+	if (nprobe > 1)
+		qsort(probes, nprobe, sizeof(RBIProbeKey), rbi_probe_key_cmp);
+
+	for (i = 0; i < nprobe; i++)
+	{
+		bool		dup = false;
+		int			j;
+
+		/*
+		 * A duplicate can only be among the entries with this very hash, and
+		 * the sort has put those together; a run of them is as long as the
+		 * number of values that collide, which is one in practice.
+		 */
+		for (j = i - 1; j >= 0 && probes[j].hash == probes[i].hash; j--)
+		{
+			if (datumIsEqual(values[probes[i].idx], values[probes[j].idx],
+							 probe.typbyval, probe.typlen))
+			{
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+
+		if (rbi_posting_set_locate(index, state, &probe,
+								   values[probes[i].idx], probes[i].hash,
+								   probes[i].bucket, &sets[nsets]))
+			found++;
+		nsets++;
+
+		if ((i & 0x3f) == 0)
+			CHECK_FOR_INTERRUPTS();
+	}
+
+	pfree(probes);
+	if (nfound != NULL)
+		*nfound = found;
+	return nsets;
 }
 
 /*
@@ -680,8 +859,6 @@ rbi_cursor_init(RBISetCursor *cur, const RBIPostingSet *set, RBICountCtx *cx)
 	if (!set->found)
 		return;
 
-	cur->segbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
-
 	if (set->mat != NULL)
 	{
 		/* a private copy: nothing to pin, nothing to walk */
@@ -805,6 +982,14 @@ rbi_cursor_emit_segment(RBISetCursor *cur)
 	if (cur->segpos >= n)
 		return false;
 
+	/*
+	 * Allocated on first use, not per cursor: an IN list of a thousand values
+	 * (DESIGN.md §15) is a thousand cursors, and most posting sets hold no
+	 * sparse segment at all.
+	 */
+	if (cur->segbuf == NULL)
+		cur->segbuf = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+
 	ckey = ckeys[cur->segpos];
 	rbi_container_init(cur->segbuf, ckey);
 	do
@@ -888,7 +1073,15 @@ rbi_cursor_close(RBISetCursor *cur)
  *	OR		the union (DESIGN.md §15's IN lists, and `tags && '{a,b}'`): the
  *			cursor stands at the SMALLEST container key any child has left,
  *			and its container is the OR of the containers of every child
- *			standing at that key.
+ *			standing at that key.  With a thousand children - which §15's
+ *			longest IN list has - neither of those may be done by walking all
+ *			of them: the smallest key comes off a binary MIN-HEAP of the
+ *			children, keyed by their current container key, and the union of
+ *			the children that stand at it is accumulated in one pass through
+ *			a bitset image instead of k-1 pairwise unions that each build and
+ *			re-optimize an intermediate container.  Both costs are then
+ *			proportional to the containers that actually take part rather
+ *			than to the length of the list.
  *	AND		the intersection (`tags @> '{a,b}'`, and the AND nodes of a
  *			tsquery, DESIGN.md §17): the children are wound forward until
  *			they all stand at one container key, and the container is the AND
@@ -910,6 +1103,12 @@ rbi_cursor_close(RBISetCursor *cur)
  * own `!alleq` branch is safe: nothing of that container key reaches the
  * visibility map, so no answer rests on it.
  */
+typedef struct RBIOrHeapEnt
+{
+	uint32		ckey;			/* sub[child].ckey when it was pushed */
+	int32		child;
+} RBIOrHeapEnt;
+
 typedef struct RBIExprCursor
 {
 	const RBIKeyNode *node;		/* NULL: an empty source, never valid */
@@ -923,6 +1122,28 @@ typedef struct RBIExprCursor
 	struct RBIExprCursor *sub;
 	RBIContainer *acc[2];		/* AND/OR accumulators, only when nsub > 1 */
 
+	/*
+	 * RBI_KN_OR, the k-way merge.  heap[0 .. nheap-1] is a min-heap of every
+	 * child that still has a container and is not standing at the current
+	 * key; hot[0 .. nhot-1] are the children that are, the ones whose
+	 * containers the current result was built from and whose pins therefore
+	 * carry the §9 interlock.  bits is the accumulator for a union of many of
+	 * them.
+	 *
+	 * The heap carries each child's container key INSIDE the entry rather
+	 * than reading sub[i].ckey while it sifts: a thousand-element IN list is
+	 * a thousand RBIExprCursors, a third of a megabyte, and chasing them
+	 * through the heap's random access pattern cost more than the linear scan
+	 * over all children that the heap replaced (measured: +4 ms on a
+	 * 1000-value list at 1M rows).  A child's key only changes when the child
+	 * is advanced, which is also when it is pushed back on.
+	 */
+	struct RBIOrHeapEnt *heap;
+	int			nheap;
+	int		   *hot;
+	int			nhot;
+	uint64	   *bits;
+
 	/* the container the cursor currently stands on */
 	bool		valid;
 	uint32		ckey;
@@ -933,6 +1154,175 @@ typedef struct RBIExprCursor
 
 static void rbi_ecursor_build(RBIExprCursor *c);
 static void rbi_ecursor_next(RBIExprCursor *c);
+
+/* ---- the OR node's min-heap of children, keyed by container key ---- */
+
+static inline void
+rbi_or_heap_push(RBIExprCursor *c, int child)
+{
+	RBIOrHeapEnt ent;
+	int			i = c->nheap++;
+
+	Assert(c->sub[child].valid);
+	ent.ckey = c->sub[child].ckey;
+	ent.child = child;
+
+	while (i > 0)
+	{
+		int			parent = (i - 1) / 2;
+
+		if (c->heap[parent].ckey <= ent.ckey)
+			break;
+		c->heap[i] = c->heap[parent];
+		i = parent;
+	}
+	c->heap[i] = ent;
+}
+
+static inline int
+rbi_or_heap_pop(RBIExprCursor *c)
+{
+	int			top = c->heap[0].child;
+	RBIOrHeapEnt last;
+	int			i = 0;
+
+	Assert(c->nheap > 0);
+	if (--c->nheap == 0)
+		return top;
+
+	last = c->heap[c->nheap];
+	for (;;)
+	{
+		int			l = 2 * i + 1;
+		int			r = l + 1;
+		int			small = i;
+		uint32		smallkey = last.ckey;
+
+		if (l < c->nheap && c->heap[l].ckey < smallkey)
+		{
+			small = l;
+			smallkey = c->heap[l].ckey;
+		}
+		if (r < c->nheap && c->heap[r].ckey < smallkey)
+			small = r;
+		if (small == i)
+			break;
+		c->heap[i] = c->heap[small];
+		i = small;
+	}
+	c->heap[i] = last;
+	return top;
+}
+
+/* ---- the union of more than two containers, in one pass ---- */
+
+/*
+ * OR one container into a bitset image of a whole container key's range.
+ * This is rbi_container.c's own container_or_bitset(), which is private to
+ * that module; it is repeated here rather than exported because the union of
+ * k containers is this file's problem (DESIGN.md §15) and the shape of a
+ * container payload is rbi_container.h's published interface.
+ */
+static void
+rbi_bits_or_container(uint64 *w, const RBIContainer *c)
+{
+	const char *payload = (const char *) c + RBI_CONTAINER_HDRSZ;
+	uint32		i;
+
+	switch (c->type)
+	{
+		case RBI_CT_ARRAY:
+			{
+				const uint16 *arr = (const uint16 *) payload;
+
+				for (i = 0; i < c->cardinality; i++)
+					w[arr[i] >> 6] |= UINT64CONST(1) << (arr[i] & 63);
+				break;
+			}
+		case RBI_CT_BITSET:
+			{
+				const uint64 *src = (const uint64 *) payload;
+				int			k;
+
+				for (k = 0; k < RBI_BITSET_WORDS; k++)
+					w[k] |= src[k];
+				break;
+			}
+		case RBI_CT_RUN:
+			{
+				uint32		nruns = *(const uint16 *) payload;
+				const RBIRun *runs = (const RBIRun *) (payload + sizeof(uint16));
+
+				for (i = 0; i < nruns; i++)
+				{
+					uint32		first = runs[i].start;
+					uint32		last = first + runs[i].len_minus_1;
+					uint32		fw = first >> 6;
+					uint32		lw = last >> 6;
+					uint64		fmask = PG_UINT64_MAX << (first & 63);
+					uint64		lmask = PG_UINT64_MAX >> (63 - (last & 63));
+
+					Assert(last < RBI_CONTAINER_RANGE);
+					if (fw == lw)
+						w[fw] |= fmask & lmask;
+					else
+					{
+						uint32		j;
+
+						w[fw] |= fmask;
+						for (j = fw + 1; j < lw; j++)
+							w[j] = PG_UINT64_MAX;
+						w[lw] |= lmask;
+					}
+				}
+				break;
+			}
+		default:
+			Assert(false);		/* a sparse segment is never a container */
+			break;
+	}
+}
+
+/*
+ * Turn the accumulated image into a container in dest (capacity
+ * RBI_CONTAINER_MAX_SIZE), in the smallest representation, exactly as
+ * rbi_container_or() would have left it.
+ */
+static void
+rbi_bits_to_container(const uint64 *w, uint32 ckey, RBIContainer *dest)
+{
+	uint64		card = 0;
+	int			k;
+
+	for (k = 0; k < RBI_BITSET_WORDS; k++)
+		card += pg_popcount64(w[k]);
+
+	rbi_container_init(dest, ckey);
+	if (card == 0)
+		return;					/* an empty ARRAY; the caller drops it */
+
+	/*
+	 * Written straight into the payload rather than through
+	 * rbi_container_append_sorted() once per member: the image IS a BITSET
+	 * payload, so the whole container key costs one memcpy whatever its
+	 * cardinality.  rbi_container_optimize() then picks the representation,
+	 * and in assert builds rbi_container_check() confirms that what was built
+	 * by hand is a container the rest of the code may be handed.
+	 */
+	Assert(card <= RBI_CONTAINER_RANGE);
+	rbi_container_to_bitset(dest);
+	memcpy(RBI_BITSET_DATA(dest), w, RBI_BITSET_BYTES);
+	dest->cardinality = (uint16) card;
+	rbi_container_optimize(dest);
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		const char *why = NULL;
+
+		Assert(rbi_container_check(dest, RBI_CONTAINER_MAX_SIZE, &why));
+	}
+#endif
+}
 
 static void
 rbi_ecursor_init(RBIExprCursor *c, const RBIKeyNode *node,
@@ -967,6 +1357,24 @@ rbi_ecursor_init(RBIExprCursor *c, const RBIKeyNode *node,
 			c->acc[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
 			c->acc[1] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
 		}
+
+		if (node->kind == RBI_KN_OR)
+		{
+			c->heap = (RBIOrHeapEnt *) palloc(sizeof(RBIOrHeapEnt) * c->nsub);
+			c->hot = (int *) palloc(sizeof(int) * c->nsub);
+			if (c->nsub > 2)
+				c->bits = (uint64 *) palloc(RBI_BITSET_BYTES);
+
+			/*
+			 * Every child that has a container goes on the heap; build()
+			 * takes the ones standing at the smallest key back off it.
+			 */
+			for (i = 0; i < c->nsub; i++)
+			{
+				if (c->sub[i].valid)
+					rbi_or_heap_push(c, i);
+			}
+		}
 	}
 
 	rbi_ecursor_build(c);
@@ -1000,42 +1408,51 @@ rbi_ecursor_build(RBIExprCursor *c)
 
 	if (c->kind == RBI_KN_OR)
 	{
-		uint32		minckey = 0;
-		bool		havemin = false;
+		uint32		minckey;
 
-		for (i = 0; i < c->nsub; i++)
-		{
-			if (!c->sub[i].valid)
-				continue;
-			if (!havemin || c->sub[i].ckey < minckey)
-			{
-				minckey = c->sub[i].ckey;
-				havemin = true;
-			}
-		}
-
-		if (!havemin)
+		/*
+		 * The k-way merge.  Everything that still has a container is on the
+		 * heap, so its root IS the smallest container key any child has left;
+		 * the children standing at it come off the heap into hot[] and stay
+		 * there until rbi_ecursor_next() moves past the key, which is what
+		 * keeps their pins - and with them the §9 interlock - in place for as
+		 * long as the result is being counted.
+		 */
+		Assert(c->nhot == 0);
+		if (c->nheap == 0)
 			return;				/* every child is exhausted */
 
-		acc = NULL;
-		for (i = 0; i < c->nsub; i++)
+		minckey = c->heap[0].ckey;
+		do
 		{
-			if (!c->sub[i].valid || c->sub[i].ckey != minckey)
-				continue;
+			c->hot[c->nhot++] = rbi_or_heap_pop(c);
+		} while (c->nheap > 0 && c->heap[0].ckey == minckey);
 
-			if (acc == NULL)
-				acc = c->sub[i].cur;
-			else
+		if (c->nhot == 1)
+			c->cur = c->sub[c->hot[0]].cur;
+		else if (c->nhot < RBI_OR_BITSET_MIN)
+		{
+			const RBIContainer *a = c->sub[c->hot[0]].cur;
+
+			for (i = 1; i < c->nhot; i++)
 			{
-				/* Same container key on both sides, so this is a plain OR. */
-				rbi_container_or(acc, c->sub[i].cur, c->acc[w]);
-				acc = c->acc[w];
+				rbi_container_or(a, c->sub[c->hot[i]].cur, c->acc[w]);
+				a = c->acc[w];
 				w ^= 1;
 			}
+			c->cur = a;
+		}
+		else
+		{
+			/* One pass over the containers, one container built at the end. */
+			memset(c->bits, 0, RBI_BITSET_BYTES);
+			for (i = 0; i < c->nhot; i++)
+				rbi_bits_or_container(c->bits, c->sub[c->hot[i]].cur);
+			rbi_bits_to_container(c->bits, minckey, c->acc[0]);
+			c->cur = c->acc[0];
 		}
 
 		c->ckey = minckey;
-		c->cur = acc;
 		c->valid = true;
 		return;
 	}
@@ -1123,11 +1540,22 @@ rbi_ecursor_next(RBIExprCursor *c)
 			break;
 
 		case RBI_KN_OR:
-			for (i = 0; i < c->nsub; i++)
+
+			/*
+			 * Only the children that stood at this key move; the ones still
+			 * on the heap are ahead of it and stay where they are.  A child
+			 * that has a container again goes back on the heap, which is the
+			 * one place an OR lets go of a page that carried an answer.
+			 */
+			for (i = 0; i < c->nhot; i++)
 			{
-				if (c->sub[i].valid && c->sub[i].ckey == c->ckey)
-					rbi_ecursor_next(&c->sub[i]);
+				int			child = c->hot[i];
+
+				rbi_ecursor_next(&c->sub[child]);
+				if (c->sub[child].valid)
+					rbi_or_heap_push(c, child);
 			}
+			c->nhot = 0;
 			break;
 
 		case RBI_KN_AND:
@@ -1156,6 +1584,8 @@ rbi_ecursor_close(RBIExprCursor *c)
 			rbi_ecursor_close(&c->sub[i]);
 	}
 
+	c->nheap = 0;
+	c->nhot = 0;
 	c->valid = false;
 	c->cur = NULL;
 }
@@ -1539,6 +1969,323 @@ rbi_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 #endif
 
 /* ---------------------------------------------------------------------
+ * The per-query visibility cache
+ * --------------------------------------------------------------------- */
+
+/*
+ * One heap page's answer: which of its root line pointers hold a tuple
+ * visible to the snapshot the cache was filled under.  Bit (off - 1) stands
+ * for offset number off; offsets above MaxHeapTuplesPerPage cannot exist on a
+ * heap page and are never asked about (rbi_vis_entry_visible() says no).
+ *
+ * 291 bits at the default page size, so 40 bytes of bitmap and 48 of entry.
+ */
+#define RBI_VIS_WORDS	(((MaxHeapTuplesPerPage - 1) / 64) + 1)
+
+typedef struct RBIVisEntry
+{
+	BlockNumber blkno;			/* hash key: the heap block */
+	bool		filled;			/* false: only the visit was recorded */
+	char		status;			/* simplehash's own field */
+	uint64		vis[RBI_VIS_WORDS];
+} RBIVisEntry;
+
+#define SH_PREFIX		rbi_visht
+#define SH_ELEMENT_TYPE RBIVisEntry
+#define SH_KEY_TYPE		BlockNumber
+#define SH_KEY			blkno
+#define SH_HASH_KEY(tb, key)	murmurhash32(key)
+#define SH_EQUAL(tb, a, b)		((a) == (b))
+#define SH_SCOPE		static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+/*
+ * The cache itself.  relid and the snapshot fields are not a lookup key but a
+ * guard: a handle that is handed a different relation or a different snapshot
+ * empties itself rather than answering from entries that were resolved under
+ * something else (DESIGN.md §16 walks the partitions of one count one at a
+ * time, which is exactly that case).
+ */
+struct RBIVisCache
+{
+	MemoryContext cxt;			/* holds ht and nothing else */
+	rbi_visht_hash *ht;
+	Oid			relid;			/* relation the entries belong to */
+	Snapshot	snapshot;		/* snapshot they were resolved under ... */
+	TransactionId xmin;			/* ... and enough of its identity to notice */
+	TransactionId xmax;			/* that it has been replaced */
+	CommandId	curcid;
+	int			ncounts;		/* counts served since the last reset */
+	int			maxentries;		/* work_mem budget, in entries */
+	bool		full;			/* budget reached: stop inserting */
+};
+
+/*
+ * How many entries work_mem allows.
+ *
+ * An open-addressing table keeps more slots than members (simplehash grows at
+ * a fill factor of 0.9) and allocates the bigger array before freeing the
+ * smaller one while it grows, so the nominal entry budget is a third of what
+ * work_mem would buy outright; that keeps the real high-water mark at or
+ * below work_mem, which is the promise the GUC makes.
+ */
+static int
+rbi_vis_cache_budget(void)
+{
+	int64		budget = ((int64) work_mem * INT64CONST(1024)) /
+		((int64) sizeof(RBIVisEntry) * 3);
+
+	if (budget < 64)
+		budget = 64;			/* a tiny work_mem still caches something */
+	if (budget > INT_MAX / 2)
+		budget = INT_MAX / 2;
+	return (int) budget;
+}
+
+RBIVisCache *
+rbi_vis_cache_create(MemoryContext parent)
+{
+	RBIVisCache *cache;
+
+	cache = (RBIVisCache *) MemoryContextAllocZero(parent, sizeof(RBIVisCache));
+	cache->cxt = AllocSetContextCreate(parent,
+									   "RoaringCount visibility cache",
+									   ALLOCSET_SMALL_SIZES);
+	return cache;
+}
+
+void
+rbi_vis_cache_reset(RBIVisCache *cache)
+{
+	if (cache == NULL)
+		return;
+	cache->ht = NULL;
+	MemoryContextReset(cache->cxt);
+	cache->relid = InvalidOid;
+	cache->snapshot = NULL;
+	cache->ncounts = 0;
+	cache->full = false;
+}
+
+void
+rbi_vis_cache_destroy(RBIVisCache *cache)
+{
+	if (cache == NULL)
+		return;
+	cache->ht = NULL;
+	if (cache->cxt != NULL)
+		MemoryContextDelete(cache->cxt);
+	cache->cxt = NULL;
+}
+
+/*
+ * Attach the cache to one count: empty it if it was filled for another
+ * relation or under another snapshot, and note that another count has begun.
+ *
+ * The relation is the check that matters in practice - §16 walks the
+ * partitions of one count one at a time, and block numbers mean different
+ * things in each - and it is exact.  The snapshot check is a guard rather
+ * than a proof: what makes reuse safe is that the driver holds one snapshot
+ * for the whole node execution, so the object it hands us cannot be freed and
+ * replaced underneath it; two distinct snapshots with the same pointer, xmin,
+ * xmax and curcid could still differ in their in-progress list.  A caller
+ * that wants a different snapshot must call rbi_vis_cache_reset().
+ */
+static void
+rbi_vis_cache_begin(RBIVisCache *cache, Relation heap, Snapshot snapshot)
+{
+	if (cache == NULL || snapshot == NULL)
+		return;
+
+	if (cache->relid != RelationGetRelid(heap) ||
+		cache->snapshot != snapshot ||
+		cache->xmin != snapshot->xmin ||
+		cache->xmax != snapshot->xmax ||
+		cache->curcid != snapshot->curcid)
+	{
+		rbi_vis_cache_reset(cache);
+		cache->relid = RelationGetRelid(heap);
+		cache->snapshot = snapshot;
+		cache->xmin = snapshot->xmin;
+		cache->xmax = snapshot->xmax;
+		cache->curcid = snapshot->curcid;
+	}
+
+	cache->maxentries = rbi_vis_cache_budget();
+	if (cache->ncounts < INT_MAX)
+		cache->ncounts++;
+}
+
+static inline bool
+rbi_vis_entry_visible(const RBIVisEntry *e, OffsetNumber off)
+{
+	int			bit = (int) off - 1;
+
+	if (off < FirstOffsetNumber || bit >= MaxHeapTuplesPerPage)
+		return false;			/* no heap page can hold that line pointer */
+	return (e->vis[bit / 64] & (UINT64CONST(1) << (bit % 64))) != 0;
+}
+
+/*
+ * The cached answer for a heap block, or NULL when there is none.
+ *
+ * WHY A CACHED ANSWER IS STILL THE RIGHT ANSWER (this is the whole point of
+ * the cache, so it is argued here rather than in DESIGN.md alone)
+ * ---------------------------------------------------------------------------
+ * The cache is consulted in exactly one place, rbi_recheck_heap_heap(), which
+ * is where a TID that the visibility map could not answer for is resolved
+ * against the snapshot.  The §9 pin rule is untouched: the visibility-map
+ * question is still asked in rbi_count_container() while the index page is
+ * pinned, and only the TIDs it could not answer reach this code.  What is
+ * claimed here is narrower: that
+ *
+ *		heap_hot_search_buffer(root TID, snapshot)
+ *
+ * is a function of the snapshot alone, so it may be evaluated once per (page,
+ * snapshot) and reused for the rest of the query.  Four things could break
+ * that, and none of them can happen:
+ *
+ *	1. The tuple we found could be removed.  It is visible to our snapshot,
+ *	   which is registered, so it is not dead to all: neither HOT pruning nor
+ *	   VACUUM may remove it or its root line pointer.
+ *	2. HOT pruning could rewrite the chain under us.  It may: it can turn the
+ *	   root line pointer into a redirect and drop intermediate versions.  But
+ *	   it only removes versions that are dead to ALL snapshots - therefore
+ *	   invisible to ours - and it keeps every surviving version reachable from
+ *	   the root in chain order, which is precisely what
+ *	   heap_hot_search_buffer() walks.  The version it finds from a given root
+ *	   is unchanged.  (This is the same guarantee a bitmap heap scan relies on
+ *	   between building its TID list and visiting the heap.)
+ *	3. An answer of "not visible" could become "visible".  That needs a tuple
+ *	   whose xmin our snapshot accepts to appear at that offset.  Every tuple
+ *	   written after we looked belongs to a transaction that is either still
+ *	   in progress at our snapshot, or began after it, or is our own with a
+ *	   command id at or above the snapshot's curcid - invisible in all three
+ *	   cases.  Line pointer numbers never move (page compaction moves tuple
+ *	   data, not line pointers), so an existing visible tuple cannot arrive at
+ *	   a different offset either.
+ *	4. An answer of "visible" could become "not visible".  A delete by a
+ *	   concurrent transaction leaves the tuple visible to our snapshot whether
+ *	   it commits or not, and a delete by our own transaction is stamped with
+ *	   a command id at or above curcid, which HeapTupleSatisfiesMVCC also
+ *	   reports as still visible.
+ *
+ * Serializable isolation needs one addition, because a cache hit calls
+ * neither HeapCheckForSerializableConflictOut() nor PredicateLockTID():
+ * rbi_vis_fill_page() takes PredicateLockPage() for the block it resolves.
+ * That covers every later hit, and the two directions of rw-conflict
+ * detection are then both closed: a write that happened BEFORE we resolved
+ * the page is caught by the conflict-out check inside the sweep (which walks
+ * every chain on the page, so it tests a superset of the tuples any single
+ * recheck would have), and a write AFTER it is caught by the writer's own
+ * CheckForSerializableConflictIn() against that page lock.
+ */
+static RBIVisEntry *
+rbi_vis_cache_lookup(RBICountCtx *cx, BlockNumber blkno)
+{
+	if (cx->cache == NULL || cx->cache->ht == NULL)
+		return NULL;
+	return rbi_visht_lookup(cx->cache->ht, blkno);
+}
+
+/*
+ * The entry whose bitmap the caller should resolve for blkno, or NULL when
+ * there is nothing to resolve: no cache, a single count with nothing to
+ * reuse, the block's first visit (which is only recorded), or a cache that
+ * has spent its budget.
+ *
+ * The sweep costs one visibility test per line pointer of the page instead of
+ * one per TID this count wants, so it is only worth doing once reuse is
+ * evident: the first count records nothing, the second records the blocks it
+ * visits, and a block is resolved on its second visit.  A one-shot count -
+ * one call, every heap block visited once - therefore does exactly what it
+ * did before the cache existed, down to the last buffer visit.  This mirrors
+ * the `nuses >= 2` rule that decides when a posting set is worth
+ * materializing.
+ *
+ * Called BEFORE the page is read, so that the hash table's allocations never
+ * happen under a buffer content lock.
+ */
+static RBIVisEntry *
+rbi_vis_cache_prepare(RBICountCtx *cx, BlockNumber blkno, RBIVisEntry *e)
+{
+	RBIVisCache *cache = cx->cache;
+	bool		found;
+
+	if (cache == NULL || cache->ncounts < 2)
+		return NULL;
+
+	if (e != NULL)
+		return e;				/* second visit: resolve the whole page */
+
+	if (cache->ht == NULL)
+		cache->ht = rbi_visht_create(cache->cxt, 256, NULL);
+	else if (cache->full ||
+			 cache->ht->members >= (uint64) cache->maxentries)
+	{
+		/* The budget is spent: this block keeps being fetched per batch. */
+		cache->full = true;
+		cx->stats.cache_full++;
+		return NULL;
+	}
+
+	/* First visit: remember only that it happened. */
+	e = rbi_visht_insert(cache->ht, blkno, &found);
+	Assert(!found);
+	e->filled = false;
+	return NULL;
+}
+
+/*
+ * Resolve every root line pointer of the page in buf, which the caller holds
+ * share locked, into *e.
+ */
+static void
+rbi_vis_fill_page(RBICountCtx *cx, Buffer buf, BlockNumber blkno,
+				  RBIVisEntry *e)
+{
+	Page		page = BufferGetPage(buf);
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber off;
+
+	Assert(!e->filled);
+	if (maxoff > (OffsetNumber) MaxHeapTuplesPerPage)
+		maxoff = (OffsetNumber) MaxHeapTuplesPerPage;	/* cannot happen */
+
+	memset(e->vis, 0, sizeof(e->vis));
+	for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+	{
+		ItemPointerData tid;
+		HeapTupleData heapTuple;
+
+		ItemPointerSet(&tid, blkno, off);
+
+		/*
+		 * The same call the per-TID recheck makes, for every line pointer
+		 * instead of the ones this count happens to want.  An offset that is
+		 * not the root of a chain (an unused or dead line pointer, or a
+		 * heap-only tuple) yields false, which is exactly what a recheck of
+		 * that TID would have returned - and no index TID points at one.
+		 */
+		if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
+								   &heapTuple, NULL, true))
+			e->vis[(off - 1) / 64] |= UINT64CONST(1) << ((off - 1) % 64);
+	}
+	e->filled = true;
+
+	/*
+	 * Later hits on this block do no per-tuple predicate locking, so lock the
+	 * page once now, the way an index-only scan does for a block it skips
+	 * (see the argument on rbi_vis_cache_lookup()).
+	 */
+	if (cx->serializable)
+		PredicateLockPage(cx->heap, blkno, cx->snapshot);
+}
+
+
+/* ---------------------------------------------------------------------
  * Counting one container
  * --------------------------------------------------------------------- */
 
@@ -1867,6 +2614,12 @@ rbi_recheck_heap_am(RBICountCtx *cx)
  * all_dead is passed as NULL, as the table_fetch_tid() call it replaces did:
  * we have no index tuple to mark killed, and asking for it would cost a
  * GlobalVisTest per invisible chain for nothing.
+ *
+ * The per-query visibility cache sits here and nowhere else: a block whose
+ * answer is already known is served from the bitmap with no buffer access at
+ * all, and the blocks that are left are fetched once each, as they always
+ * were.  rbi_vis_cache_lookup() carries the argument for why a remembered
+ * answer is still the right one.
  */
 static int64
 rbi_recheck_heap_heap(RBICountCtx *cx)
@@ -1877,26 +2630,61 @@ rbi_recheck_heap_heap(RBICountCtx *cx)
 	while (i < cx->ntids)
 	{
 		BlockNumber blk = ItemPointerGetBlockNumber(&cx->tids[i]);
+		RBIVisEntry *e = rbi_vis_cache_lookup(cx, blk);
 		Buffer		buf;
+
+		/* Already resolved: no ReadBuffer, no content lock, no heap at all. */
+		if (e != NULL && e->filled)
+		{
+			cx->stats.cache_hits++;
+			do
+			{
+				if (rbi_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
+					visible++;
+				i++;
+			} while (i < cx->ntids &&
+					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		/* Decide (and allocate) before the page is locked. */
+		e = rbi_vis_cache_prepare(cx, blk, e);
 
 		buf = ReadBuffer(cx->heap, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		cx->stats.blocks_rechecked++;
 
-		do
+		if (e != NULL)
 		{
-			ItemPointerData tid = cx->tids[i];	/* callee updates it */
-			HeapTupleData heapTuple;
+			/* Resolve the whole page once, then read this count's TIDs off. */
+			rbi_vis_fill_page(cx, buf, blk, e);
+			do
+			{
+				if (rbi_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
+					visible++;
+				i++;
+			} while (i < cx->ntids &&
+					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+		}
+		else
+		{
+			do
+			{
+				ItemPointerData tid = cx->tids[i];	/* callee updates it */
+				HeapTupleData heapTuple;
 
-			if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
-									   &heapTuple, NULL, true))
-				visible++;
-			i++;
-		} while (i < cx->ntids &&
-				 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+				if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
+										   &heapTuple, NULL, true))
+					visible++;
+				i++;
+			} while (i < cx->ntids &&
+					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+		}
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		ReleaseBuffer(buf);
-		cx->stats.blocks_rechecked++;
 
 		/* Only now: an interrupt cannot be serviced under a buffer lock. */
 		CHECK_FOR_INTERRUPTS();
@@ -1956,6 +2744,15 @@ rbi_recheck_flush(RBICountCtx *cx)
 int64
 rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 				  RBICountSource *sources, RBICountStats *stats)
+{
+	return rbi_count_sources_cached(heap, snapshot, nsources, sources, stats,
+									NULL);
+}
+
+int64
+rbi_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
+						 RBICountSource *sources, RBICountStats *stats,
+						 RBIVisCache *cache)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;
@@ -2087,6 +2884,15 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	cx.in_recovery = RecoveryInProgress();
 	cx.tids_sorted = true;
 	cx.batchmax = rbi_recheck_budget();
+
+	/*
+	 * The visibility cache, if the caller keeps one for this node execution.
+	 * It is emptied here if it holds answers for another relation or another
+	 * snapshot, so a partitioned count may hand the same handle to every
+	 * partition (DESIGN.md §9 and §16).
+	 */
+	rbi_vis_cache_begin(cache, heap, snapshot);
+	cx.cache = cache;
 
 	cursors = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * nsources);
 	work[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
@@ -2223,6 +3029,8 @@ merge_done:
 		stats->tids_rechecked += cx.stats.tids_rechecked;
 		stats->blocks_rechecked += cx.stats.blocks_rechecked;
 		stats->containers_visited += cx.stats.containers_visited;
+		stats->cache_hits += cx.stats.cache_hits;
+		stats->cache_full += cx.stats.cache_full;
 	}
 
 	return result;
@@ -2465,49 +3273,55 @@ typedef struct RBICountCall
 	Oid			keytype[2];
 } RBICountCall;
 
+/*
+ * Open and vet the indexes of one SQL count: relkind, access method, key
+ * type, privileges, row-level security and snapshot eligibility.  keytype may
+ * be NULL, which means the caller has no search key at all (the grouped form
+ * below, which walks every entry instead of looking one up).
+ */
 static void
-rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
-				   RBICountCall *call)
+rbi_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
+					   const Oid *keytype, RBICountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	int			i;
 
-	call->nkeys = nkeys;
+	call->nkeys = nidx;
 	call->heap = NULL;
 	for (i = 0; i < 2; i++)
-		call->index[i] = NULL;
-
-	for (i = 0; i < nkeys; i++)
 	{
-		Oid			idxoid = PG_GETARG_OID(2 * i);
+		call->index[i] = NULL;
+		call->keytype[i] = InvalidOid;
+	}
+
+	for (i = 0; i < nidx; i++)
+	{
 		Oid			hoid;
 
-		call->key[i] = PG_GETARG_DATUM(2 * i + 1);
-		call->keytype[i] = get_fn_expr_argtype(fcinfo->flinfo, 2 * i + 1);
-		if (!OidIsValid(call->keytype[i]))
-			elog(ERROR, "could not determine the type of the search key");
+		if (keytype != NULL)
+			call->keytype[i] = keytype[i];
 
-		if (get_rel_relkind(idxoid) != RELKIND_INDEX)
+		if (get_rel_relkind(idxoid[i]) != RELKIND_INDEX)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("\"%s\" is not an index", get_rel_name(idxoid))));
+					 errmsg("\"%s\" is not an index", get_rel_name(idxoid[i]))));
 
-		hoid = IndexGetRelation(idxoid, false);
+		hoid = IndexGetRelation(idxoid[i], false);
 		if (i == 0)
 			heapoid = hoid;
 		else if (hoid != heapoid)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("indexes \"%s\" and \"%s\" are not on the same table",
-							get_rel_name(PG_GETARG_OID(0)),
-							get_rel_name(idxoid))));
+							get_rel_name(idxoid[0]),
+							get_rel_name(idxoid[i]))));
 	}
 
 	call->heap = table_open(heapoid, AccessShareLock);
 
-	for (i = 0; i < nkeys; i++)
+	for (i = 0; i < nidx; i++)
 	{
-		Relation	index = index_open(PG_GETARG_OID(2 * i), AccessShareLock);
+		Relation	index = index_open(idxoid[i], AccessShareLock);
 
 		call->index[i] = index;
 
@@ -2525,10 +3339,11 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 		/*
 		 * The key must be the index's own type, or a type the opfamily can
 		 * compare it with (integer cross-type equality, for instance).
-		 * rbi_probe_prepare() would raise the same errors later; raising them
+		 * rbi_probe_init() would raise the same errors later; raising them
 		 * here keeps them out of the middle of the count.
 		 */
-		if (call->keytype[i] != index->rd_opcintype[0] &&
+		if (OidIsValid(call->keytype[i]) &&
+			call->keytype[i] != index->rd_opcintype[0] &&
 			!OidIsValid(get_opfamily_member(index->rd_opfamily[0],
 											index->rd_opcintype[0],
 											call->keytype[i], 1)))
@@ -2549,7 +3364,7 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 	 */
 	if (pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
 	{
-		for (i = 0; i < nkeys; i++)
+		for (i = 0; i < nidx; i++)
 		{
 			AttrNumber	attnum = call->index[i]->rd_index->indkey.values[0];
 
@@ -2583,7 +3398,7 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 	 * the HOT-chain versions an old snapshot still sees, and rechecking
 	 * cannot invent a TID that is not in the posting set (DESIGN.md §9).
 	 */
-	for (i = 0; i < nkeys; i++)
+	for (i = 0; i < nidx; i++)
 	{
 		const char *why;
 
@@ -2593,6 +3408,36 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 					 errmsg("cannot count through index \"%s\" because %s",
 							RelationGetRelationName(call->index[i]), why)));
 	}
+}
+
+/*
+ * The same for the roaring_index_count(idx, key [, idx2, key2]) functions,
+ * whose arguments alternate index and key.
+ */
+static void
+rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
+				   RBICountCall *call)
+{
+	Oid			idxoid[2];
+	Oid			keytype[2];
+	Datum		key[2];
+	int			i;
+
+	Assert(nkeys >= 1 && nkeys <= 2);
+
+	for (i = 0; i < nkeys; i++)
+	{
+		idxoid[i] = PG_GETARG_OID(2 * i);
+		key[i] = PG_GETARG_DATUM(2 * i + 1);
+		keytype[i] = get_fn_expr_argtype(fcinfo->flinfo, 2 * i + 1);
+		if (!OidIsValid(keytype[i]))
+			elog(ERROR, "could not determine the type of the search key");
+	}
+
+	rbi_count_open_indexes(snapshot, nkeys, idxoid, keytype, call);
+
+	for (i = 0; i < nkeys; i++)
+		call->key[i] = key[i];
 }
 
 static void
@@ -2657,8 +3502,8 @@ roaring_index_count_stats(PG_FUNCTION_ARGS)
 {
 	RBICountStats stats;
 	TupleDesc	tupdesc;
-	Datum		values[4];
-	bool		nulls[4] = {false, false, false, false};
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
 	int64		count;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -2672,6 +3517,193 @@ roaring_index_count_stats(PG_FUNCTION_ARGS)
 	values[1] = Int64GetDatum(stats.blocks_skipped_via_vm);
 	values[2] = Int64GetDatum(stats.tids_rechecked);
 	values[3] = Int64GetDatum(stats.blocks_rechecked);
+	/* one count never revisits a heap block, so this is always 0 here */
+	values[4] = Int64GetDatum(stats.cache_hits);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * roaring_index_count_any(idx, keys) - count(*) WHERE col = ANY (keys), the
+ * SQL form of the IN list of DESIGN.md §15: the union of the listed values'
+ * posting sets, counted against the visibility map like any other count.
+ *
+ * The values are located with rbi_posting_set_lookup_many(), so the bucket
+ * pages are read in order and duplicates cost nothing, and the union is the
+ * k-way merge of rbi_ecursor_build().  Unlike the pushdown, this has no limit
+ * on the number of values other than the pins it holds - one bucket page per
+ * INLINE entry - so a caller that hands it a very long list should expect to
+ * hold that many buffer pins for the duration.
+ */
+Datum
+roaring_index_count_any(PG_FUNCTION_ARGS)
+{
+	Oid			idxoid = PG_GETARG_OID(0);
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(1);
+	Oid			elemtype = ARR_ELEMTYPE(arr);
+	RBICountCall call;
+	RBICountSource src;
+	RBIPostingSet *sets;
+	Snapshot	snapshot;
+	Datum	   *elems;
+	bool	   *nulls;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	int			nelems;
+	int			nsets;
+	int			nfound;
+	int64		count = 0;
+	int			i;
+
+	snapshot = GetActiveSnapshot();
+	if (snapshot == NULL)
+		elog(ERROR, "roaring index count requires an active snapshot");
+
+	rbi_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &call);
+	PredicateLockRelation(call.index[0], snapshot);
+
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * Max(nelems, 1));
+	nsets = rbi_posting_set_lookup_many(call.index[0], elemtype, nelems,
+										elems, nulls, sets, &nfound);
+
+	/* An empty array, an all-NULL one, or no listed value with an entry. */
+	if (nfound > 0)
+	{
+		memset(&src, 0, sizeof(src));
+		src.nsets = nsets;
+		src.sets = sets;
+		count = rbi_count_sources(call.heap, snapshot, 1, &src, NULL);
+	}
+
+	for (i = 0; i < nsets; i++)
+		rbi_posting_set_release(&sets[i]);
+
+	rbi_count_sql_close(&call);
+
+	PG_RETURN_INT64(count);
+}
+
+/*
+ * roaring_index_count_group_stats(idx) - count every key of one index under
+ * one snapshot, the way the GROUP BY path of DESIGN.md §10 does, sharing one
+ * visibility cache across the groups.
+ *
+ * This is the SQL image of rbi_next_group() in rbi_customscan.c: same entry
+ * scan, same one rbi_count_sources_cached() call per group, same single cache
+ * for the whole run.  It exists because the cache can only pay off across
+ * counts, so nothing a single roaring_index_count() does can exercise it -
+ * and a regression test should not have to go through the planner to prove
+ * that the dirty pages of a grouped count are visited once instead of once
+ * per group.  use_cache = false runs the very same loop with no cache at all,
+ * which is what every caller did before the cache existed.
+ */
+Datum
+roaring_index_count_group_stats(PG_FUNCTION_ARGS)
+{
+	Oid			idxoid = PG_GETARG_OID(0);
+	bool		usecache = PG_GETARG_BOOL(1);
+	RBICountCall call;
+	Snapshot	snapshot;
+	RBICountStats stats;
+	RBIVisCache *cache;
+	RBIEntryScan es;
+	MemoryContext percxt;
+	MemoryContext oldcxt;
+	TupleDesc	tupdesc;
+	Datum		values[7];
+	bool		nulls[7] = {false, false, false, false, false, false, false};
+	int64		groups = 0;
+	int64		total = 0;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	snapshot = GetActiveSnapshot();
+	if (snapshot == NULL)
+		elog(ERROR, "roaring index count requires an active snapshot");
+
+	rbi_count_open_indexes(snapshot, 1, &idxoid, NULL, &call);
+
+	/*
+	 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted key,
+	 * so its entries are not column values and a row appears under several of
+	 * them: the sum over the entries is not a row count and neither is any
+	 * single entry a group.  rbi_customscan.c refuses to drive a GROUP BY
+	 * from such an index for the same reason.
+	 */
+	if (OidIsValid(get_opfamily_proc(call.index[0]->rd_opfamily[0],
+									 call.index[0]->rd_opcintype[0],
+									 call.index[0]->rd_opcintype[0],
+									 RBI_EXTRACTVALUE_PROC)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("index \"%s\" has a multi-key operator class, whose entries are not column values",
+						RelationGetRelationName(call.index[0]))));
+
+	PredicateLockRelation(call.index[0], snapshot);
+
+	memset(&stats, 0, sizeof(stats));
+	/* use_cache = false is the pre-cache behaviour, for an A/B in one query */
+	cache = usecache ? rbi_vis_cache_create(CurrentMemoryContext) : NULL;
+	percxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "roaring index group count",
+								   ALLOCSET_SMALL_SIZES);
+
+	rbi_entry_scan_begin(&es, call.index[0]);
+
+	for (;;)
+	{
+		RBICountSource src;
+		RBIPostingSet ps;
+		Datum		key;
+		int64		n;
+
+		CHECK_FOR_INTERRUPTS();
+
+		MemoryContextReset(percxt);
+		oldcxt = MemoryContextSwitchTo(percxt);
+
+		if (!rbi_entry_scan_next(&es, &key, &ps))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			break;
+		}
+
+		memset(&src, 0, sizeof(src));
+		src.nsets = 1;
+		src.sets = &ps;
+
+		n = rbi_count_sources_cached(call.heap, snapshot, 1, &src, &stats,
+									 cache);
+		rbi_posting_set_release(&ps);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* A group exists only if one of its rows is visible (§10). */
+		if (n > 0)
+		{
+			groups++;
+			total += n;
+		}
+	}
+
+	rbi_entry_scan_end(&es);
+	rbi_vis_cache_destroy(cache);
+	MemoryContextDelete(percxt);
+	rbi_count_sql_close(&call);
+
+	values[0] = Int64GetDatum(groups);
+	values[1] = Int64GetDatum(total);
+	values[2] = Int64GetDatum(stats.blocks_skipped_via_vm);
+	values[3] = Int64GetDatum(stats.tids_rechecked);
+	values[4] = Int64GetDatum(stats.blocks_rechecked);
+	values[5] = Int64GetDatum(stats.cache_hits);
+	values[6] = Int64GetDatum(stats.cache_full);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

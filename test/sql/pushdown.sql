@@ -104,7 +104,9 @@ BEGIN
 		END IF;
 		nm := btrim(split_part(ln, ':', 1));
 		IF nm IN ('Heap Blocks Skipped via VM', 'Heap TIDs Rechecked',
-				  'Heap Blocks Rechecked', 'Containers Visited') THEN
+				  'Heap Blocks Rechecked', 'Containers Visited',
+				  'Heap Blocks From Cache',
+				  'Heap Blocks Past Cache Budget') THEN
 			val := btrim(split_part(ln, ':', 2))::bigint;
 			RETURN NEXT format('%s %s', nm,
 							   CASE WHEN val = 0 THEN '= 0' ELSE '> 0' END);
@@ -283,12 +285,19 @@ SELECT rbi_pd_counters('SELECT count(*) FROM rbi_pdt WHERE a = 3');
 DELETE FROM rbi_pdt WHERE id % 500 = 0;
 SELECT rbi_pd_counters('SELECT count(*) FROM rbi_pdt WHERE a = 3');
 
--- ---- the cost model refuses a heap that is not all-visible --------------
+-- ---- a grouping over a heap that is not all-visible ---------------------
 /*
  * A thousand groups whose rows are spread over every heap page, on a heap the
- * visibility map cannot vouch for: every TID would have to be fetched from
- * the heap, which is more work than the sequential scan does, so the planner
- * must not choose the pushdown.
+ * visibility map cannot vouch for.  Every TID has to be resolved against the
+ * snapshot - but each dirty BLOCK is fetched only once per query, because the
+ * per-query visibility cache answers every later group from memory
+ * (DESIGN.md §9), so the node makes one pass over the heap and not one per
+ * group.  It is therefore pushed down here, and measurably should be: on a
+ * 100k-row table in this state the node ran in 17.9 ms against the
+ * sequential aggregate's 26.8 ms, and once the pages had become all-visible
+ * again 8.0 ms against 18.4 ms (2026-09-21).  Before the cache, and before
+ * the estimate stopped charging numgroups random reads per dirty page, this
+ * was the case that had to lose.
  */
 CREATE TABLE rbi_pdd (g int NOT NULL, pad text NOT NULL);
 INSERT INTO rbi_pdd
@@ -296,9 +305,95 @@ SELECT i % 1000, repeat('x', 200) FROM generate_series(1, 100000) i;
 CREATE INDEX rbi_pdd_g ON rbi_pdd USING roaring (g);
 ANALYZE rbi_pdd;			-- no VACUUM: relallvisible stays 0
 SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdd GROUP BY g');
--- once it is all-visible the same query is worth pushing down
+-- and once it is all-visible there is nothing left to recheck at all
 VACUUM ANALYZE rbi_pdd;
 SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdd GROUP BY g');
+
+-- ---- the cost model still refuses a grouping it cannot win -------------
+/*
+ * The other end of the same model.  Twenty thousand groups of five rows over
+ * a hundred thousand rows: the recheck is not what costs here, the per-group
+ * work is - one entry lookup and one container per group - and it is more
+ * than the sequential scan plus a HashAggregate does.  The planner must
+ * refuse, and measurably should: 28.0 ms for the sequential aggregate
+ * against 40.8 ms for the node when sequential scans are discouraged
+ * (2026-09-21).  Nothing is disabled here; which plan the cost model picks IS
+ * the test.
+ */
+CREATE TABLE rbi_pdh (g int NOT NULL, pad text NOT NULL);
+INSERT INTO rbi_pdh
+SELECT i % 20000, repeat('x', 200) FROM generate_series(1, 100000) i;
+CREATE INDEX rbi_pdh_g ON rbi_pdh USING roaring (g);
+ANALYZE rbi_pdh;
+SELECT rbi_pd('SELECT g, count(*) FROM rbi_pdh GROUP BY g');
+SELECT rbi_plans('SELECT g, count(*) FROM rbi_pdh GROUP BY g');
+
+-- ---- a grouping over a heap a few per cent of which is dirty -----------
+/*
+ * The case the 2026-09-21 follow-up review measured: a vacuumed table, then
+ * five per cent of its rows updated, which leaves about a tenth of its heap
+ * pages unable to be vouched for - the ordinary state of a large table that
+ * is mostly read and occasionally written.  A GROUP BY returns to those
+ * pages for every group, but the per-query visibility cache fetches each of
+ * them once (DESIGN.md §9), so the estimate must charge one pass over the
+ * dirty working set and not numgroups random reads per page.  Charging the
+ * latter asked 1.8M cost units against the sequential aggregate's 175k on
+ * five million rows and lost a query the node wins by 7.9x; here the node
+ * runs in 2.0 ms against 15.8 ms (2026-09-21).  Nothing is disabled: which
+ * plan the cost model picks IS the test.
+ */
+CREATE TABLE rbi_pdg (id int NOT NULL, k int NOT NULL, pad text NOT NULL);
+INSERT INTO rbi_pdg
+SELECT i, i % 20, repeat('x', 200) FROM generate_series(1, 100000) i;
+CREATE INDEX rbi_pdg_k ON rbi_pdg USING roaring (k);
+VACUUM ANALYZE rbi_pdg;
+UPDATE rbi_pdg SET pad = pad || 'y' WHERE id <= 5000;
+ANALYZE rbi_pdg;			-- no VACUUM: the updated pages stay dirty
+SELECT relallvisible > 0 AND relallvisible < relpages AS mostly_all_visible
+  FROM pg_class WHERE relname = 'rbi_pdg';
+SELECT rbi_pd('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
+SELECT rbi_plans('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
+/*
+ * ... and this is the cache the estimate is allowed to assume: every group
+ * comes back to the same dirty pages, and every visit after the first is
+ * answered out of memory instead of pinning the page again.  A single count
+ * walks the result in TID order and never returns to a block, so it has no
+ * cache hits at all (the calls further up).
+ */
+SELECT rbi_pd_counters('SELECT k, count(*) FROM rbi_pdg GROUP BY k');
+
+-- ---- an IN list long enough to belong to a B-tree ----------------------
+/*
+ * Every element of an IN list is a bucket lookup, a container chain of its
+ * own and one more sub-cursor in the union the merge evaluates, and the
+ * estimate has to say so: a B-tree descends once per element and then reads
+ * its leaves in order, which is less work per element by a factor that grows
+ * with the list.  Measured on this table, three values take 0.021 ms through
+ * the node against the B-tree index-only scan's 0.063 ms, and a thousand
+ * values 14.1 ms against 13.9 ms - and at one million rows of the benchmark's
+ * wider table a thousand values took 15.4 ms against 3.1 ms and were pushed
+ * down anyway, because each element was priced as a single bucket page (the
+ * 2026-09-21 follow-up review).
+ */
+CREATE TABLE rbi_pdi (id int NOT NULL, k int NOT NULL);
+INSERT INTO rbi_pdi SELECT i, i % 1000 FROM generate_series(1, 200000) i;
+CREATE INDEX rbi_pdi_r ON rbi_pdi USING roaring (k);
+CREATE INDEX rbi_pdi_b ON rbi_pdi (k);
+VACUUM ANALYZE rbi_pdi;
+/* The list is generated rather than written out, so that the plan text this
+ * reports stays short; rbi_pd() prints the choice and the row count only. */
+CREATE OR REPLACE FUNCTION rbi_pd_in(n int) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	RETURN rbi_pd(format('SELECT count(*) FROM rbi_pdi WHERE k IN (%s)',
+						 (SELECT string_agg(g::text, ',')
+							FROM generate_series(0, n - 1) g)));
+END $$;
+SELECT rbi_pd_in(3);
+SELECT rbi_pd_in(10);
+SELECT rbi_pd_in(1000);
+DROP FUNCTION rbi_pd_in(int);
+
 
 -- ---- a nearly all-visible heap is what the pushdown is for --------------
 /*
@@ -402,6 +497,111 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 SELECT v, count(*) FROM rbi_pdn GROUP BY v ORDER BY v;
 
+-- ---- prepared statements: a parameter where a literal may stand -------
+/*
+ * A GENERIC plan keeps `a = $1` as a Param, and the pushdown used to accept
+ * nothing but a literal: the count of a dense key then fell back to the
+ * ordinary plan and lost the whole point of the node (a measured 5.6 ms
+ * sequential scan against 0.025 ms, and 207 ms against 3.1 ms on five
+ * million rows - the 2026-09-21 follow-up review).  A Param is now accepted
+ * wherever a Const is, for equality and for the array of an IN list, and the
+ * node evaluates it through its own ExprContext at the start of every scan
+ * (DESIGN.md §10).  EXPLAIN prints it as `$1`.
+ *
+ * rbi_pd_prep() prepares one query, forces a generic plan so that every
+ * parameter really stays a Param, and proves the answer is the one the same
+ * query gives with the pushdown switched off - as a multiset, both ways
+ * round.
+ */
+CREATE OR REPLACE FUNCTION rbi_pd_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	rec record;
+	pushed boolean := false;
+	onrows text[] := '{}';
+	offrows text[] := '{}';
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+
+	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE rbi_pp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE rbi_pp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	FOR rec IN EXECUTE 'EXECUTE rbi_pp_on(' || args || ')' LOOP
+		onrows := onrows || rec::text;
+	END LOOP;
+
+	PERFORM set_config('roaring_index.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE rbi_pp_off AS ' || q;
+	FOR rec IN EXECUTE 'EXECUTE rbi_pp_off(' || args || ')' LOOP
+		offrows := offrows || rec::text;
+	END LOOP;
+
+	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE rbi_pp_on';
+	EXECUTE 'DEALLOCATE rbi_pp_off';
+
+	SELECT (SELECT count(*) FROM (SELECT unnest(onrows)
+								  EXCEPT ALL SELECT unnest(offrows)) a)
+		 + (SELECT count(*) FROM (SELECT unnest(offrows)
+								  EXCEPT ALL SELECT unnest(onrows)) b)
+	  INTO ndiff;
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  coalesce(array_length(onrows, 1), 0));
+END $$;
+
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1', '3');
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1', '-1');
+-- a NULL parameter means zero rows, which is not the same as one group of 0
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1', 'NULL::int');
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = ANY ($1)',
+				   'ARRAY[1,3]');
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = ANY ($1)',
+				   'NULL::int[]');
+-- `a IN ($1, $2)` keeps an ARRAY[] of Params in a generic plan
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a IN ($1, $2)', '1, 3');
+SELECT rbi_pd_prep('SELECT b, count(*) FROM rbi_pdt WHERE a = $1'
+				   ' GROUP BY b ORDER BY b', '3');
+-- the pinned column is printed from the entry's stored key, parameter or not
+SELECT rbi_pd_prep('SELECT a, count(*) FROM rbi_pdt WHERE a = $1 GROUP BY a',
+				   '3');
+SELECT rbi_pd_prep('SELECT count(*) FROM rbi_pdt WHERE a = $1 AND n IS NULL',
+				   '3');
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE rbi_pp(int) AS SELECT count(*) FROM rbi_pdt WHERE a = $1;
+EXPLAIN (COSTS OFF) EXECUTE rbi_pp(3);
+EXECUTE rbi_pp(3);
+EXECUTE rbi_pp(4);
+DEALLOCATE rbi_pp;
+RESET plan_cache_mode;
+
+/*
+ * An exec Param, which a nested loop changes between rescans: the node has to
+ * re-evaluate it every time rather than count the first outer row's key
+ * again.
+ */
+EXPLAIN (COSTS OFF)
+SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
+	 LATERAL (SELECT count(*) AS c FROM rbi_pdt WHERE a = v.k) s;
+SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
+	 LATERAL (SELECT count(*) AS c FROM rbi_pdt WHERE a = v.k) s ORDER BY v.k;
+SET roaring_index.enable_count_pushdown = off;
+SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
+	 LATERAL (SELECT count(*) AS c FROM rbi_pdt WHERE a = v.k) s ORDER BY v.k;
+RESET roaring_index.enable_count_pushdown;
+DROP FUNCTION rbi_pd_prep(text, text);
+
 DROP TABLE rbi_pdn;
 DROP TABLE rbi_pdv;
 DROP TABLE rbi_pdc;
@@ -411,6 +611,9 @@ DROP FUNCTION rbi_lower_eq(text, text);
 DROP FUNCTION rbi_lower_hash(text);
 DROP TABLE rbi_pdw;
 DROP TABLE rbi_pdd;
+DROP TABLE rbi_pdh;
+DROP TABLE rbi_pdg;
+DROP TABLE rbi_pdi;
 DROP TABLE rbi_pde;
 DROP TABLE rbi_pdt;
 DROP FUNCTION rbi_pd(text);

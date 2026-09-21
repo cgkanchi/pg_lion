@@ -112,6 +112,11 @@ caller; the pushdown only uses an index whose collation matches the clause or gr
 
 ## Reproducible comparison and latest review
 
+For frequent progress checks, use the [quick benchmark](bench/QUICK.md): B-tree, GIN,
+roaring, and roaring_bitmap, two timing rounds, and saved-baseline comparisons.
+It retains both 1M and 5M scalar rows plus 200k documents, using a reduced query/index matrix.
+The revised default finished in 4 minutes 28 seconds on the benchmark host.
+
 The [comprehensive benchmark](bench/comprehensive/README.md) compares B-tree, hash, GIN, GiST,
 BRIN, sequential scans, and roaring with count pushdown enabled/disabled. It includes exact-result
 checks, recorded query plans, build/maintenance/WAL costs, visibility and memory stress, and concurrent

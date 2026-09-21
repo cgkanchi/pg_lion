@@ -81,9 +81,9 @@ SELECT rbi_ins_check('single rows');
 (1 row)
 
 SELECT * FROM roaring_index_stats('rbi_ins_k');
- nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids 
-----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------
-       64 |           64 |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |     521224 |               4 |              5 |         0 |          0
+ nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | max_bucket_pages 
+----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+------------------
+       64 |           64 |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |     521224 |               4 |              5 |         0 |          0 |           0 |                1
 (1 row)
 
 -- Phase 2: multi-row VALUES.
@@ -446,5 +446,215 @@ SELECT rbi_cmp('rbi_dense', 'k = 2');
  ok 0 rows
 (1 row)
 
-DROP TABLE rbi_ins, rbi_spill, rbi_dense, rbi_mid, rbi_inlmid;
+/*
+ * GROWTH SLACK (DESIGN.md section 4).  An item an insert writes on a
+ * container page is allotted a few bytes more than it needs, and the next
+ * members go into that slack in place, without moving anything else on the
+ * page.  20 keys over 20000 rows put about 700 members in each container key
+ * of each key: too many to stay a sparse segment, too few for a bitset, and
+ * not consecutive, so every container is an ARRAY that grows two bytes at a
+ * time.  inline_limit = 64 keeps the posting sets off the bucket pages, where
+ * items have no slack.
+ */
+CREATE TABLE rbi_slack (i int4, k int4);
+CREATE INDEX rbi_slack_k ON rbi_slack USING roaring (k) WITH (inline_limit = 64);
+INSERT INTO rbi_slack SELECT i, i % 20 FROM generate_series(1, 20000) i;
+SELECT array_containers > 0 AS has_arrays, slack_bytes > 0 AS has_slack,
+	   slack_bytes <= 72 * (containers + sparse_segments) AS slack_within_bound
+  FROM roaring_index_stats('rbi_slack_k');
+ has_arrays | has_slack | slack_within_bound 
+------------+-----------+--------------------
+ t          | t         | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_slack_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_slack', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 1000 rows
+(1 row)
+
+-- More inserts into the same container keys: they go into the slack, and the
+-- posting sets stay exactly as correct.
+CREATE TEMP TABLE rbi_slack_before AS
+	SELECT container_bytes, container_pages FROM roaring_index_stats('rbi_slack_k');
+INSERT INTO rbi_slack SELECT i, i % 20 FROM generate_series(20001, 22000) i;
+SELECT ntids, slack_bytes > 0 AS has_slack,
+	   slack_bytes <= 72 * (containers + sparse_segments) AS slack_within_bound
+  FROM roaring_index_stats('rbi_slack_k');
+ ntids | has_slack | slack_within_bound 
+-------+-----------+--------------------
+ 22000 | t         | t
+(1 row)
+
+SELECT (SELECT container_bytes FROM roaring_index_stats('rbi_slack_k')) >
+	   (SELECT container_bytes FROM rbi_slack_before) AS items_grew;
+ items_grew 
+------------
+ t
+(1 row)
+
+SELECT roaring_index_verify('rbi_slack_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_slack', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 1100 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_slack', 'k = 0');
+   rbi_cmp    
+--------------
+ ok 1100 rows
+(1 row)
+
+-- A bulk build writes items at their exact size: a bulk-built index of the
+-- very same rows has no slack at all.
+CREATE INDEX rbi_slack_b ON rbi_slack USING roaring (k) WITH (inline_limit = 64);
+SELECT array_containers > 0 AS has_arrays, slack_bytes AS bulk_slack_bytes
+  FROM roaring_index_stats('rbi_slack_b');
+ has_arrays | bulk_slack_bytes 
+------------+------------------
+ t          |                0
+(1 row)
+
+SELECT roaring_index_verify('rbi_slack_b', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+/*
+ * An index created empty and grown keeps the bucket count it was built with
+ * (DESIGN.md section 5): 80000 distinct keys in 64 buckets make bucket chains
+ * of several pages, which is what every lookup of a key has to walk.  The
+ * insert path says so once per backend per index, and REINDEX sizes the
+ * directory from the data that is there now.
+ */
+CREATE TABLE rbi_grow (i int4, k int4);
+CREATE INDEX rbi_grow_k ON rbi_grow USING roaring (k);
+SELECT nbuckets, max_bucket_pages FROM roaring_index_stats('rbi_grow_k');
+ nbuckets | max_bucket_pages 
+----------+------------------
+       64 |                1
+(1 row)
+
+INSERT INTO rbi_grow SELECT i, i FROM generate_series(1, 80000) i;
+WARNING:  roaring index "rbi_grow_k" has outgrown its bucket directory
+SELECT nbuckets, max_bucket_pages > 4 AS outgrown
+  FROM roaring_index_stats('rbi_grow_k');
+ nbuckets | outgrown 
+----------+----------
+       64 | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_grow_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_grow', 'k = 12345');
+  rbi_cmp  
+-----------
+ ok 1 rows
+(1 row)
+
+CREATE TEMP TABLE rbi_grow_before AS
+	SELECT nbuckets, max_bucket_pages FROM roaring_index_stats('rbi_grow_k');
+REINDEX INDEX rbi_grow_k;
+SELECT (SELECT nbuckets FROM roaring_index_stats('rbi_grow_k')) >
+	   (SELECT nbuckets FROM rbi_grow_before) AS directory_grew,
+	   (SELECT max_bucket_pages FROM roaring_index_stats('rbi_grow_k')) <
+	   (SELECT max_bucket_pages FROM rbi_grow_before) AS chains_shortened;
+ directory_grew | chains_shortened 
+----------------+------------------
+ t              | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_grow_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_grow', 'k = 12345');
+  rbi_cmp  
+-----------
+ ok 1 rows
+(1 row)
+
+-- An explicit bucket count is never warned about: it is what its owner asked
+-- for (rbi_spill_k above has buckets = 1 and 97 keys and says nothing).
+CREATE INDEX rbi_grow_x ON rbi_grow USING roaring (k) WITH (buckets = 4);
+INSERT INTO rbi_grow VALUES (80001, 80001);
+SELECT nbuckets, max_bucket_pages > 4 AS outgrown
+  FROM roaring_index_stats('rbi_grow_x');
+ nbuckets | outgrown 
+----------+----------
+        4 | t
+(1 row)
+
+DROP INDEX rbi_grow_x;
+/*
+ * ambuild sizes the directory for the heap it is told about: when
+ * pg_class.reltuples says the table holds more rows than the build put in the
+ * index, the estimate is scaled up by that ratio (DESIGN.md section 5), and a
+ * partial index is sized for the rows its predicate selects instead.
+ */
+CREATE TABLE rbi_relt (i int4, k int4);
+INSERT INTO rbi_relt SELECT i, i FROM generate_series(1, 40000) i;
+ANALYZE rbi_relt;
+DELETE FROM rbi_relt WHERE i > 4000;
+CREATE INDEX rbi_relt_k ON rbi_relt USING roaring (k);
+CREATE INDEX rbi_relt_p ON rbi_relt USING roaring (k) WHERE i <= 2000;
+SELECT (SELECT nbuckets FROM roaring_index_stats('rbi_relt_k')) >
+	   (SELECT nbuckets FROM roaring_index_stats('rbi_relt_p'))
+	   AS whole_table_sized_larger;
+ whole_table_sized_larger 
+--------------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE rbi_relt_before AS
+	SELECT nbuckets FROM roaring_index_stats('rbi_relt_k');
+-- once the statistics tell the truth, the same data wants a smaller directory
+VACUUM (ANALYZE) rbi_relt;
+REINDEX INDEX rbi_relt_k;
+SELECT (SELECT nbuckets FROM roaring_index_stats('rbi_relt_k')) <
+	   (SELECT nbuckets FROM rbi_relt_before) AS directory_shrank;
+ directory_shrank 
+------------------
+ t
+(1 row)
+
+SELECT roaring_index_verify('rbi_relt_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_relt_p', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_relt', 'k = 1234');
+  rbi_cmp  
+-----------
+ ok 1 rows
+(1 row)
+
+DROP TABLE rbi_ins, rbi_spill, rbi_dense, rbi_mid, rbi_inlmid, rbi_slack,
+		   rbi_grow, rbi_relt;
 DROP FUNCTION rbi_ins_check(text);

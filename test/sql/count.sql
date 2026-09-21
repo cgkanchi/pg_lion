@@ -154,12 +154,22 @@ SELECT rbi_ccmp('rbi_cnt_tiny_k', 'rbi_cnt_tiny', 'k', '1');
 SELECT rbi_ccmp('rbi_cnt_tiny_k', 'rbi_cnt_tiny', 'k', '2');
 
 /*
- * The visibility map interlock.  Nothing is all-visible before the first
- * VACUUM, so every TID has to be rechecked in the heap; afterwards the whole
- * posting set is answered from the map.
+ * The visibility map interlock.  How much of a freshly loaded heap is
+ * all-visible before the first VACUUM is NOT deterministic: on-access pruning
+ * (heap_page_prune_opt(), which sets visibility map bits as well as pruning)
+ * runs during every sequential scan, so it depends on what has read the table
+ * and on the oldest snapshot in the cluster while it did -- running this file
+ * on its own and running it after another test file give different answers.
+ * What must hold either way is that the count is right and that the two
+ * numbers agree with each other: a posting set with no dead TIDs in it has
+ * every member either on a block the map answered or in the recheck list, so
+ * "nothing was skipped" and "everything was rechecked" are the same
+ * statement.  The states where the numbers themselves are pinned down are
+ * asserted below, after VACUUM and after the DELETE.
  */
-SELECT count = 20000 AS count_ok, blocks_skipped = 0 AS nothing_skipped,
-       tids_rechecked = 20000 AS all_rechecked
+SELECT count = 20000 AS count_ok,
+       tids_rechecked <= 20000 AS no_tid_rechecked_twice,
+       (blocks_skipped = 0) = (tids_rechecked = 20000) AS map_and_recheck_agree
   FROM roaring_index_count_stats('rbi_cnt_c10', 0);
 
 VACUUM rbi_cnt;
@@ -244,7 +254,8 @@ COMMIT;
  */
 DELETE FROM rbi_cnt WHERE i % 37 = 0;	-- every heap page is dirty again
 CREATE TEMP TABLE rbi_wm (q text, budget text, cnt bigint, blocks_skipped bigint,
-						  tids_rechecked bigint, blocks_rechecked bigint);
+						  tids_rechecked bigint, blocks_rechecked bigint,
+						  cache_hits bigint);
 SET work_mem = '64kB';
 INSERT INTO rbi_wm SELECT 'b3f', 'min', *
   FROM roaring_index_count_stats('rbi_cnt_b3', false);
@@ -265,6 +276,9 @@ SELECT q, count(DISTINCT (cnt, blocks_skipped, tids_rechecked, blocks_rechecked)
 SELECT cnt = (SELECT count(*) FROM rbi_cnt WHERE NOT b3) AS count_ok,
 	   tids_rechecked > 40000 AS enough_tids_for_several_batches
   FROM rbi_wm WHERE q = 'b3f' AND budget = 'min';
+-- a single count visits every heap block once, so it never has a cache hit
+SELECT count(*) FILTER (WHERE cache_hits <> 0) AS single_counts_with_cache_hits
+  FROM rbi_wm;
 DROP TABLE rbi_wm;
 
 /*
@@ -403,6 +417,129 @@ SELECT (SELECT count(*) FROM (SELECT * FROM rbi_grp_on3 EXCEPT ALL SELECT * FROM
 
 DROP TABLE rbi_grp_on, rbi_grp_on2, rbi_grp_on3,
 		   rbi_grp_off, rbi_grp_off2, rbi_grp_off3;
+
+/*
+ * The per-query visibility cache (DESIGN.md section 9).
+ *
+ * A grouped count rechecks the dirty heap blocks of every group separately,
+ * so 200 groups used to fetch the same dirty pages 200 times.  A TID's
+ * visibility under one MVCC snapshot cannot change while that snapshot is
+ * held, so the answer for every root line pointer of a page is resolved once
+ * and reused: the block visits of the later groups become bitmap lookups with
+ * no buffer access at all.
+ *
+ * roaring_index_count_group_stats(idx, use_cache) is the SQL image of the
+ * GROUP BY driver -- the same entry scan, one count per group, one cache for
+ * the whole run -- so both halves of the A/B fit in one query.  What must
+ * hold:
+ *
+ *	- the answer does not depend on the cache, and is the answer of the
+ *	  equivalent GROUP BY;
+ *	- the number of block visits does not depend on the cache either; what
+ *	  changes is how many of them are fetches (blocks_rechecked) and how many
+ *	  are cache hits;
+ *	- the fetches collapse to about two per dirty page (the first visit only
+ *	  records the block, the second resolves it), whatever the group count.
+ */
+CREATE TEMP TABLE rbi_vc (idx text, mode text, groups bigint, cnt bigint,
+						  blocks_skipped bigint, tids_rechecked bigint,
+						  blocks_rechecked bigint, cache_hits bigint,
+						  cache_full bigint);
+INSERT INTO rbi_vc
+SELECT 'hot_g', 'nocache', * FROM roaring_index_count_group_stats('rbi_cnt_hot_g', false);
+INSERT INTO rbi_vc
+SELECT 'hot_g', 'cached', * FROM roaring_index_count_group_stats('rbi_cnt_hot_g', true);
+INSERT INTO rbi_vc
+SELECT 'hot_k', 'nocache', * FROM roaring_index_count_group_stats('rbi_cnt_hot_k', false);
+INSERT INTO rbi_vc
+SELECT 'hot_k', 'cached', * FROM roaring_index_count_group_stats('rbi_cnt_hot_k', true);
+
+-- one answer per index, whether or not the cache was used ...
+SELECT idx, count(DISTINCT (groups, cnt, blocks_skipped, tids_rechecked)) AS answers,
+	   count(DISTINCT blocks_rechecked + cache_hits) AS block_visits
+  FROM rbi_vc GROUP BY idx ORDER BY idx;
+-- ... and it is the answer of the equivalent GROUP BY
+SELECT idx,
+	   cnt = (SELECT count(*) FROM rbi_cnt_hot) AS rows_ok,
+	   groups = CASE idx
+					WHEN 'hot_g' THEN (SELECT count(*) FROM
+									   (SELECT g FROM rbi_cnt_hot GROUP BY g) x)
+					WHEN 'hot_k' THEN (SELECT count(*) FROM
+									   (SELECT k FROM rbi_cnt_hot GROUP BY k) x)
+				END AS groups_ok
+  FROM rbi_vc WHERE mode = 'cached' ORDER BY idx;
+/*
+ * The cache is used and it replaces fetches with hits.  How big the win is
+ * depends on how many groups there are to share the answer: hot_g has 37
+ * groups and hot_k has 5, and the cached run fetches each dirty page about
+ * twice either way, so the ratio is the group count minus a constant.
+ */
+SELECT idx,
+	   c.cache_hits > 0 AS cache_used,
+	   c.cache_full = 0 AS budget_was_enough,
+	   n.cache_hits = 0 AS nocache_has_no_hits,
+	   n.blocks_rechecked > c.blocks_rechecked AS fewer_fetches,
+	   n.blocks_rechecked > 5 * c.blocks_rechecked AS many_fewer_fetches
+  FROM (SELECT * FROM rbi_vc WHERE mode = 'cached') c
+	   JOIN (SELECT * FROM rbi_vc WHERE mode = 'nocache') n USING (idx)
+ ORDER BY idx;
+DELETE FROM rbi_vc;
+
+/*
+ * Serializable isolation.  A cache hit calls neither
+ * HeapCheckForSerializableConflictOut() nor PredicateLockTID(), so the page
+ * whose answer was resolved is predicate-locked once, the way an index-only
+ * scan locks a page it skips.  The result must be the same and the locks must
+ * be there (SSI may coarsen page locks into a relation lock, which is why
+ * only their presence is asserted).
+ */
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+INSERT INTO rbi_vc
+SELECT 'hot_g', 'serializable', * FROM roaring_index_count_group_stats('rbi_cnt_hot_g', true);
+SELECT cnt = (SELECT count(*) FROM rbi_cnt_hot) AS rows_ok,
+	   cache_hits > 0 AS cache_used
+  FROM rbi_vc WHERE mode = 'serializable';
+SELECT count(*) > 0 AS took_predicate_locks
+  FROM pg_locks
+ WHERE mode = 'SIReadLock'
+   AND relation = 'rbi_cnt_hot'::regclass;
+COMMIT;
+
+/*
+ * A cache that fills up.  The budget is work_mem (in entries), and when it is
+ * reached nothing more is inserted: the blocks that did not get in are
+ * fetched per batch, exactly as they were before the cache existed, and
+ * cache_full counts those visits.  rbi_cnt is 200k rows over ~1600 heap
+ * pages, every one of them dirtied by the DELETE above, which is well past
+ * what 64kB of entries holds.
+ */
+SET work_mem = '64kB';
+INSERT INTO rbi_vc
+SELECT 'c10', 'full', * FROM roaring_index_count_group_stats('rbi_cnt_c10', true);
+RESET work_mem;
+INSERT INTO rbi_vc
+SELECT 'c10', 'cached', * FROM roaring_index_count_group_stats('rbi_cnt_c10', true);
+SELECT count(DISTINCT (groups, cnt, blocks_skipped, tids_rechecked)) AS answers,
+	   count(DISTINCT blocks_rechecked + cache_hits) AS block_visits
+  FROM rbi_vc WHERE idx = 'c10';
+SELECT cnt = (SELECT count(*) FROM rbi_cnt) AS rows_ok,
+	   groups = 10 AS groups_ok
+  FROM rbi_vc WHERE idx = 'c10' AND mode = 'full';
+SELECT (SELECT cache_full FROM rbi_vc WHERE idx='c10' AND mode='full') > 0
+			AS ran_out_of_budget,
+	   (SELECT cache_full FROM rbi_vc WHERE idx='c10' AND mode='cached') = 0
+			AS budget_was_enough,
+	   (SELECT cache_hits FROM rbi_vc WHERE idx='c10' AND mode='full') > 0
+			AS still_cached_something,
+	   (SELECT blocks_rechecked FROM rbi_vc WHERE idx='c10' AND mode='full') >
+	   (SELECT blocks_rechecked FROM rbi_vc WHERE idx='c10' AND mode='cached')
+			AS a_small_cache_fetches_more;
+DROP TABLE rbi_vc;
+
+-- the cache is on by default, and the function is STRICT like the others
+SELECT count = (SELECT count(*) FROM rbi_cnt) AS rows_ok, cache_hits > 0 AS cache_used
+  FROM roaring_index_count_group_stats('rbi_cnt_c10');
+SELECT roaring_index_count_group_stats(NULL) IS NULL AS null_index;
 
 /* Error cases. */
 -- wrong key type

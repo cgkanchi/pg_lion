@@ -217,6 +217,66 @@ SELECT rbi_incmp($$SELECT count(*) FROM rbi_in WHERE b IN (1, 2) AND c IN ('c1',
 SELECT rbi_incmp(format('SELECT count(*) FROM rbi_in WHERE a = ANY (''%s''::int[])', rbi_inlist(0, 1200, 100000)));
 SELECT count(*) FROM rbi_in WHERE a < 1201;
 
+/*
+ * The union itself: roaring_index_count_any() (DESIGN.md section 15).
+ *
+ * The pushdown's IN list and this function share the whole evaluation - the
+ * values are located by rbi_posting_set_lookup_many(), which hashes them all
+ * and then visits the bucket pages in (bucket, hash) order, and the union is
+ * the k-way merge over the leaf cursors, ORed through a bitset image once
+ * more than a handful of them stand at one container key.  Going through SQL
+ * reaches the shapes the pushdown declines: a list longer than
+ * RBI_MAX_ARRAY_ELEMS, and lists whose duplicates and NULLs are not constant
+ * folded away.
+ */
+CREATE FUNCTION rbi_anycmp(idx text, tbl text, col text, arr text)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	a bigint;
+	b bigint;
+BEGIN
+	EXECUTE format('SELECT roaring_index_count_any(%L::regclass, %s)', idx, arr)
+		INTO a;
+	EXECUTE format('SELECT count(*) FROM %s WHERE %I = ANY (%s)', tbl, col, arr)
+		INTO b;
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH roaring=%s select=%s', a, b);
+	END IF;
+	RETURN format('ok %s', a);
+END $$;
+
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{7}''::int[]');
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{7,8,9}''::int[]');
+-- duplicates: a union of a set with itself is that set
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{7,7,7,8,8,9}''::int[]');
+-- NULLs are not = ANY(...), and an all-NULL or empty list selects nothing
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{7,NULL,8}''::int[]');
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{NULL,NULL}''::int[]');
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{}''::int[]');
+-- values with no entry at all, alone and mixed in
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{900,901}''::int[]');
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a', '''{7,900,8,901}''::int[]');
+-- every key of the index, which is every row: the union is the whole table
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a',
+				  format('%L::int[]', rbi_inlist(0, 499, 500)));
+-- ... and the same list with every value repeated four times, plus absent ones
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a',
+				  format('%L::int[]', rbi_inlist(0, 2499, 625)));
+-- a 3000-value list: longer than the pushdown accepts, and exact here
+SELECT rbi_anycmp('rbi_in_a', 'rbi_in', 'a',
+				  format('%L::int[]', rbi_inlist(0, 2999, 100000)));
+-- by-reference keys, a two-value list, and cross-type element types
+SELECT rbi_anycmp('rbi_in_c', 'rbi_in', 'c', '''{c1,c3}''::text[]');
+SELECT rbi_anycmp('rbi_in_b', 'rbi_in', 'b', '''{1,2}''::int8[]');
+SELECT rbi_anycmp('rbi_in_b', 'rbi_in', 'b', '''{1,2}''::int2[]');
+-- a nullable column: the reserved NULL entry is not a listed value
+SELECT rbi_anycmp('rbi_in_n', 'rbi_in', 'n', '''{1,2}''::int[]');
+SELECT rbi_anycmp('rbi_in_n', 'rbi_in', 'n', '''{1,2,3,4,5,6}''::int[]');
+-- the same errors the single-key count raises
+SELECT roaring_index_count_any('rbi_in_a', '{1}'::text[]);
+SELECT roaring_index_count_any('rbi_in', '{1}'::int[]);
+SELECT roaring_index_count_any('rbi_in_a', NULL::int[]) IS NULL AS null_array;
+
 -- ---- an empty table ----------------------------------------------------
 CREATE TABLE rbi_in_empty (k int NOT NULL);
 CREATE INDEX rbi_in_empty_k ON rbi_in_empty USING roaring (k);
@@ -226,5 +286,6 @@ SELECT rbi_incmp('SELECT k, count(*) FROM rbi_in_empty WHERE k IN (1, 2) GROUP B
 
 DROP TABLE rbi_in, rbi_in_empty;
 DROP FUNCTION rbi_incmp(text);
+DROP FUNCTION rbi_anycmp(text, text, text, text);
 DROP FUNCTION rbi_inlist(int, int, int);
 DROP FUNCTION rbi_inplan(text);

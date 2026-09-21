@@ -1,0 +1,49 @@
+{
+  "profile": "quick-v1",
+  "arguments": {
+    "prefix": "/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/pginst",
+    "output": "bench/results/quick/2026-09-21-baseline",
+    "baseline": null,
+    "rows": [
+      500000
+    ],
+    "documents": 50000,
+    "repeats": 3,
+    "warmups": 1,
+    "seed": 20260921,
+    "max_seconds": 180,
+    "resume": false,
+    "keep_cluster": false,
+    "build_repeats": 1
+  },
+  "status": "complete",
+  "started_utc": "2026-09-21T15:43:35Z",
+  "commit": "0e21a9754f4a63f1c0dd257d938a4d46d49a4990",
+  "source_diff": "",
+  "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpu_count": 16,
+  "cpu_model": "AMD Ryzen 7 5700X3D 8-Core Processor",
+  "pg_config": "'--prefix=/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/pginst' '--without-icu' '--without-zlib' '--without-readline' 'CFLAGS=-O2'",
+  "postgres_sha256": "96a7e5f96c821bc93f4b366f28268c5a58d2a18ba6891284375aeceb17118345",
+  "extension_sha256": "f2c4f21b9dbbfb0f79defa059e966b7063378ab14aef936301ebe63abddfdfe4",
+  "workload_sha256": "bb546a43cf73cdad8d7210b61be759a74106585c9532ee8c550fb78da2223332",
+  "server_version": "PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "settings": {
+    "shared_buffers": "512MB",
+    "work_mem": "64MB",
+    "maintenance_work_mem": "512MB",
+    "max_parallel_workers_per_gather": "0",
+    "max_parallel_maintenance_workers": "2",
+    "jit": "off",
+    "fsync": "on",
+    "synchronous_commit": "on",
+    "full_page_writes": "on",
+    "autovacuum": "off",
+    "random_page_cost": "4",
+    "seq_page_cost": "1",
+    "effective_cache_size": "4GB",
+    "hash_mem_multiplier": "2"
+  },
+  "elapsed_seconds": 28.7854156930116,
+  "errors": 0
+}

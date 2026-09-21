@@ -12,14 +12,11 @@ CREATE INDEX rbi_unlogged_t ON rbi_unlogged USING roaring (t)
 ANALYZE rbi_unlogged;
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_unlogged WHERE k = 42;
-                   QUERY PLAN                    
--------------------------------------------------
- Aggregate
-   ->  Bitmap Heap Scan on rbi_unlogged
-         Recheck Cond: (k = 42)
-         ->  Bitmap Index Scan on rbi_unlogged_k
-               Index Cond: (k = 42)
-(5 rows)
+                 QUERY PLAN                 
+--------------------------------------------
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_unlogged_k (k = 42)
+(2 rows)
 
 SELECT count(*), sum(i) FROM rbi_unlogged WHERE k = 42;
  count |   sum   

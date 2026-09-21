@@ -1,0 +1,57 @@
+--- WAL breakdown, roaring on c2, second 10k-row batch (no checkpoint)
+    record_type     | count | record_mib | fpi_mib | bytes_per_record 
+--------------------+-------+------------+---------+------------------
+ Heap/INSERT        |  9827 |       1.50 |    0.00 |            160.4
+ Generic/Generic    | 10000 |       1.16 |    0.00 |            122.0
+ Heap/INSERT+INIT   |   173 |       0.03 |    0.00 |            160.4
+ Transaction/COMMIT |     1 |       0.00 |    0.00 |             34.0
+(4 rows)
+
+--- WAL breakdown, roaring on c20, second 10k-row batch (no checkpoint)
+    record_type     | count | record_mib | fpi_mib | bytes_per_record 
+--------------------+-------+------------+---------+------------------
+ Heap/INSERT        |  9827 |       1.50 |    0.00 |            160.4
+ Generic/Generic    | 10000 |       0.77 |    0.00 |             80.9
+ Heap/INSERT+INIT   |   173 |       0.03 |    0.00 |            160.4
+ Transaction/COMMIT |     1 |       0.00 |    0.00 |             34.0
+(4 rows)
+
+--- WAL breakdown, roaring on c200, second 10k-row batch (no checkpoint)
+    record_type     | count | record_mib | fpi_mib | bytes_per_record 
+--------------------+-------+------------+---------+------------------
+ Heap/INSERT        |  9827 |       1.50 |    0.00 |            160.4
+ Generic/Generic    | 10000 |       0.72 |    0.00 |             75.6
+ Heap/INSERT+INIT   |   173 |       0.03 |    0.00 |            160.4
+ Transaction/COMMIT |     1 |       0.00 |    0.00 |             34.0
+(4 rows)
+
+--- WAL breakdown, roaring on c20k, second 10k-row batch (no checkpoint)
+    record_type     | count | record_mib | fpi_mib | bytes_per_record 
+--------------------+-------+------------+---------+------------------
+ Generic/Generic    | 10125 |      26.66 |    0.04 |           2766.0
+ Heap/INSERT        |  9827 |       1.50 |    0.00 |            160.4
+ Heap/INSERT+INIT   |   173 |       0.03 |    0.00 |            160.4
+ Transaction/COMMIT |     1 |       0.00 |    0.00 |             34.0
+(4 rows)
+
+--- WAL breakdown, roaring on c1m, second 10k-row batch (no checkpoint)
+    record_type     | count | record_mib | fpi_mib | bytes_per_record 
+--------------------+-------+------------+---------+------------------
+ Generic/Generic    | 10065 |      14.44 |    0.00 |           1505.3
+ Heap/INSERT        |  9827 |       1.50 |    0.00 |            160.4
+ Heap/INSERT+INIT   |   173 |       0.03 |    0.00 |            160.4
+ Transaction/COMMIT |     1 |       0.00 |    0.00 |             34.0
+(4 rows)
+
+--- WAL breakdown, btree on c200, second 10k-row batch (no checkpoint)
+    record_type     | count | record_mib | fpi_mib | bytes_per_record 
+--------------------+-------+------------+---------+------------------
+ Heap/INSERT        |  9827 |       1.50 |    0.00 |            160.4
+ Btree/INSERT_LEAF  |  9986 |       0.61 |    0.00 |             64.0
+ Btree/SPLIT_R      |    14 |       0.01 |    0.10 |           7770.7
+ Heap/INSERT+INIT   |   173 |       0.03 |    0.00 |            160.4
+ Btree/DEDUP        |   268 |       0.01 |    0.00 |             53.4
+ Btree/INSERT_UPPER |    14 |       0.00 |    0.01 |            563.0
+ Transaction/COMMIT |     1 |       0.00 |    0.00 |             34.0
+(7 rows)
+

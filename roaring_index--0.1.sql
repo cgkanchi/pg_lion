@@ -227,17 +227,53 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 COMMENT ON FUNCTION roaring_index_count(regclass, anyelement, regclass, anyelement) IS
 	'count rows matching both keys from two roaring indexes on the same table';
 
+/*
+ * count(*) WHERE col = ANY (keys): the union of the listed values' posting
+ * sets (DESIGN.md section 15), located in bucket order and merged k-way.
+ */
+CREATE FUNCTION roaring_index_count_any(idx regclass, keys anyarray)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'roaring_index_count_any'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION roaring_index_count_any(regclass, anyarray) IS
+	'count rows whose key is in the array, skipping all-visible heap pages';
+
 CREATE FUNCTION roaring_index_count_stats(idx regclass, key anyelement,
 										  OUT count bigint,
 										  OUT blocks_skipped bigint,
 										  OUT tids_rechecked bigint,
-										  OUT blocks_rechecked bigint)
+										  OUT blocks_rechecked bigint,
+										  OUT cache_hits bigint)
 RETURNS record
 AS 'MODULE_PATHNAME', 'roaring_index_count_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 
 COMMENT ON FUNCTION roaring_index_count_stats(regclass, anyelement) IS
 	'roaring_index_count() plus how much of the heap it had to visit';
+
+/*
+ * Count every key of one index under one snapshot, sharing one per-query
+ * visibility cache across the groups, exactly as the GROUP BY pushdown does
+ * (DESIGN.md section 9).  cache_hits is the number of heap block visits the
+ * cache answered without touching the buffer manager; cache_full counts the
+ * visits that had to be fetched because the cache had used up work_mem.
+ */
+CREATE FUNCTION roaring_index_count_group_stats(idx regclass,
+												use_cache boolean DEFAULT true,
+												OUT groups bigint,
+												OUT count bigint,
+												OUT blocks_skipped bigint,
+												OUT tids_rechecked bigint,
+												OUT blocks_rechecked bigint,
+												OUT cache_hits bigint,
+												OUT cache_full bigint)
+RETURNS record
+AS 'MODULE_PATHNAME', 'roaring_index_count_group_stats'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION roaring_index_count_group_stats(regclass, boolean) IS
+	'count every key of a roaring index, as the GROUP BY pushdown does, and report the heap visits';
 
 /* ------------------------------------------------------------------ */
 -- stats/verify functions (rbi_funcs.c)
@@ -259,7 +295,9 @@ CREATE FUNCTION roaring_index_stats(idx regclass,
 									OUT sparse_segments int8,
 									OUT sparse_members int8,
 									OUT null_tids int8,
-									OUT empty_tids int8)
+									OUT empty_tids int8,
+									OUT slack_bytes int8,
+									OUT max_bucket_pages int8)
 RETURNS record
 AS 'MODULE_PATHNAME', 'roaring_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;

@@ -37,7 +37,7 @@
 PG_FUNCTION_INFO_V1(roaring_index_stats);
 PG_FUNCTION_INFO_V1(roaring_index_verify);
 
-#define RBI_STATS_NCOLS		16
+#define RBI_STATS_NCOLS		18
 
 typedef struct RBIVerifyState
 {
@@ -114,7 +114,9 @@ typedef struct RBIStats
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
 	int64		empty_tids;		/* members of the reserved EMPTY entry (§17) */
-	int64		container_bytes;
+	int64		max_bucket_pages;	/* longest bucket chain (DESIGN.md §5) */
+	int64		container_bytes;	/* logical bytes of every item */
+	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
 	int64		free_bytes;
 } RBIStats;
 
@@ -125,8 +127,10 @@ typedef struct RBIStats
  * every item, whatever its kind.
  */
 static void
-rbi_stats_item(RBIStats *st, const RBIContainer *c, Size csize)
+rbi_stats_item(RBIStats *st, const RBIContainer *c, Size itemlen)
 {
+	Size		size = rbi_item_size(c);
+
 	if (c->type == RBI_CT_SPARSE)
 	{
 		st->sparse_segments++;
@@ -138,7 +142,17 @@ rbi_stats_item(RBIStats *st, const RBIContainer *c, Size csize)
 		if (c->type >= RBI_CT_ARRAY && c->type <= RBI_CT_RUN)
 			st->by_type[c->type]++;
 	}
-	st->container_bytes += (int64) csize;
+
+	/*
+	 * container_bytes counts what the items really hold; an item on a
+	 * container page may have been allotted more than that, and those spare
+	 * bytes - growth slack an insert can add a member into without moving
+	 * anything else (DESIGN.md §4) - are reported separately.  An item inside
+	 * an INLINE payload never has any.
+	 */
+	st->container_bytes += (int64) size;
+	if (itemlen > size)
+		st->slack_bytes += (int64) (itemlen - size);
 }
 
 Datum
@@ -245,6 +259,31 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 
 	pfree(cbuf);
 
+	/*
+	 * The longest bucket chain, which is what a lookup of a key in the worst
+	 * bucket has to walk.  ambuild aims at one page per bucket, so a number
+	 * well above 1 means the index has outgrown the directory it was built
+	 * with and wants a REINDEX (DESIGN.md §5); inserts warn about the same
+	 * thing.  It needs a walk of its own: the page loop above visits blocks in
+	 * block order and cannot tell which bucket an overflow page belongs to.
+	 */
+	{
+		uint32		b;
+
+		for (b = 0; b < state->meta.nbuckets; b++)
+		{
+			Buffer		headbuf = ReadBuffer(index, RBI_BUCKET_BLKNO(b));
+			int			n;
+
+			LockBuffer(headbuf, BUFFER_LOCK_SHARE);
+			n = rbi_bucket_npages(index, headbuf);
+			UnlockReleaseBuffer(headbuf);
+
+			st.max_bucket_pages = Max(st.max_bucket_pages, (int64) n);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+
 	memset(nulls, 0, sizeof(nulls));
 	values[0] = Int32GetDatum((int32) state->meta.nbuckets);
 	values[1] = Int64GetDatum(st.bucket_pages);
@@ -262,6 +301,8 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 	values[13] = Int64GetDatum(st.sparse_members);
 	values[14] = Int64GetDatum(st.null_tids);
 	values[15] = Int64GetDatum(st.empty_tids);
+	values[16] = Int64GetDatum(st.slack_bytes);
+	values[17] = Int64GetDatum(st.max_bucket_pages);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -390,6 +431,35 @@ rbi_verify_keylen(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
 }
 
 /*
+ * An item may be allotted MORE bytes on a container page than its header
+ * needs: growth slack the insert path adds a member into without moving
+ * anything else on the page (DESIGN.md §4).  So the rule is not "the item
+ * fills its space exactly" any more, but "it fills it to within one slack
+ * allowance": avail is the allocated length (ItemIdGetLength, or the exact
+ * size of an item inside an INLINE payload, which never has slack).
+ */
+static void
+rbi_verify_item_slack(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
+					  const RBIContainer *item, Size avail, const char *what)
+{
+	Size		size = rbi_item_size(item);
+
+	if (avail < size)
+		rbi_corrupt("roaring index \"%s\": %s %u on block %u occupies %zu bytes but needs %zu",
+					RelationGetRelationName(vs->index), what, off, blk, avail,
+					size);
+
+	if (avail > (Size) RBI_CONTAINER_MAX_SIZE)
+		rbi_corrupt("roaring index \"%s\": %s %u on block %u occupies %zu bytes, more than an item may ever take",
+					RelationGetRelationName(vs->index), what, off, blk, avail);
+
+	if (avail - size > RBI_ITEM_SLACK_LIMIT)
+		rbi_corrupt("roaring index \"%s\": %s %u on block %u occupies %zu bytes, %zu more than its %zu bytes need (at most %d bytes of slack)",
+					RelationGetRelationName(vs->index), what, off, blk, avail,
+					avail - size, size, RBI_ITEM_SLACK_LIMIT);
+}
+
+/*
  * Check one sparse segment (DESIGN.md §13).
  *
  * Besides its own structure, a segment has to respect the two rules that
@@ -415,10 +485,7 @@ rbi_verify_segment(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
 		rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u is corrupt: %s",
 					RelationGetRelationName(vs->index), off, blk, detail);
 
-	if (rbi_sparse_size(c) != avail)
-		rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u occupies %zu bytes but needs %zu",
-					RelationGetRelationName(vs->index), off, blk, avail,
-					rbi_sparse_size(c));
+	rbi_verify_item_slack(vs, blk, off, c, avail, "sparse segment");
 
 	if (n == 0)
 		rbi_corrupt("roaring index \"%s\": sparse segment %u on block %u is empty",
@@ -469,10 +536,7 @@ rbi_verify_container(RBIVerifyState *vs, BlockNumber blk, OffsetNumber off,
 		rbi_corrupt("roaring index \"%s\": container %u on block %u is corrupt: %s",
 					RelationGetRelationName(vs->index), off, blk, detail);
 
-	if (rbi_container_size(c) != avail)
-		rbi_corrupt("roaring index \"%s\": container %u on block %u occupies %zu bytes but needs %zu",
-					RelationGetRelationName(vs->index), off, blk, avail,
-					rbi_container_size(c));
+	rbi_verify_item_slack(vs, blk, off, c, avail, "container");
 
 	if (c->cardinality == 0)
 		rbi_corrupt("roaring index \"%s\": container %u on block %u is empty",

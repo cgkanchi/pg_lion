@@ -1,0 +1,1655 @@
+{
+  "configurations": [
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "btree",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "gin",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 1000000,
+      "variant": "roaring_bitmap",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "btree",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "gin",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c20k_123"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "in_c20k_100"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and3"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "is_null"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "fetch_medium"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "range_random"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c2_0"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "and2"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "dirty_scattered",
+      "mode": "prefer_index",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "eq_c200_17"
+    },
+    {
+      "suite": "scalar",
+      "rows": 5000000,
+      "variant": "roaring_bitmap",
+      "phase": "after_maintenance",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "group_c200"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_common"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_and"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_or"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_common"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_and"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_phrase"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_prefix"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "gin",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_fetch"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_common"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_and"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_or"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_common"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_and"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_phrase"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_prefix"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_fetch"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_common"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_and"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "array_or"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_common"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_and"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_phrase"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_prefix"
+    },
+    {
+      "suite": "documents",
+      "rows": 200000,
+      "variant": "roaring_bitmap",
+      "phase": "clean",
+      "mode": "default",
+      "memory": "64MB",
+      "case": "ts_fetch"
+    }
+  ],
+  "scalar": [
+    {
+      "id": "eq_c2_0",
+      "category": "equality",
+      "sql": "SELECT count(*) FROM fact WHERE c2=0",
+      "stress": true
+    },
+    {
+      "id": "eq_c200_17",
+      "category": "equality",
+      "sql": "SELECT count(*) FROM fact WHERE c200=17",
+      "stress": true
+    },
+    {
+      "id": "eq_c20k_123",
+      "category": "equality",
+      "sql": "SELECT count(*) FROM fact WHERE c20k=123",
+      "stress": true
+    },
+    {
+      "id": "in_c20k_100",
+      "category": "in_list",
+      "sql": "SELECT count(*) FROM fact WHERE c20k IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99)",
+      "stress": false
+    },
+    {
+      "id": "and2",
+      "category": "intersection",
+      "sql": "SELECT count(*) FROM fact WHERE c200=17 AND c2=1",
+      "stress": true
+    },
+    {
+      "id": "and3",
+      "category": "intersection",
+      "sql": "SELECT count(*) FROM fact WHERE c200=17 AND c20=3 AND c2=1",
+      "stress": true
+    },
+    {
+      "id": "is_null",
+      "category": "null",
+      "sql": "SELECT count(*) FROM fact WHERE nullable IS NULL",
+      "stress": true
+    },
+    {
+      "id": "fetch_medium",
+      "category": "heap_fetch",
+      "sql": "SELECT sum(id),sum(length(payload)) FROM fact WHERE c200=17",
+      "stress": true
+    },
+    {
+      "id": "range_random",
+      "category": "range",
+      "sql": "SELECT count(*) FROM fact WHERE c20k BETWEEN 100 AND 199",
+      "stress": true
+    },
+    {
+      "id": "group_c200",
+      "category": "grouping",
+      "sql": "SELECT c200,count(*) FROM fact GROUP BY c200",
+      "stress": true
+    }
+  ],
+  "documents": [
+    {
+      "id": "array_common",
+      "category": "array_contains",
+      "sql": "SELECT count(*) FROM docs WHERE tags @> ARRAY['t1']",
+      "stress": false
+    },
+    {
+      "id": "array_and",
+      "category": "array_contains",
+      "sql": "SELECT count(*) FROM docs WHERE tags @> ARRAY['t1','t17']",
+      "stress": false
+    },
+    {
+      "id": "array_or",
+      "category": "array_overlap",
+      "sql": "SELECT count(*) FROM docs WHERE tags && ARRAY['t1','t17','t123']",
+      "stress": false
+    },
+    {
+      "id": "ts_common",
+      "category": "text_search",
+      "sql": "SELECT count(*) FROM docs WHERE tsv @@ 'common'::tsquery",
+      "stress": false
+    },
+    {
+      "id": "ts_and",
+      "category": "text_search",
+      "sql": "SELECT count(*) FROM docs WHERE tsv @@ 'w1 & w17'::tsquery",
+      "stress": false
+    },
+    {
+      "id": "ts_phrase",
+      "category": "text_fallback",
+      "sql": "SELECT count(*) FROM docs WHERE tsv @@ 'common <-> w1'::tsquery",
+      "stress": false
+    },
+    {
+      "id": "ts_prefix",
+      "category": "text_fallback",
+      "sql": "SELECT count(*) FROM docs WHERE tsv @@ 'rare12:*'::tsquery",
+      "stress": false
+    },
+    {
+      "id": "ts_fetch",
+      "category": "heap_fetch",
+      "sql": "SELECT sum(id),sum(length(payload)) FROM docs WHERE tsv @@ 'w1'::tsquery",
+      "stress": false
+    }
+  ],
+  "data_sql": {
+    "scalar": {
+      "1000000": "SELECT i::bigint AS id,\n        ((hashint8extended(i::bigint,11) & 9223372036854775807)%2)::int AS c2, ((hashint8extended(i::bigint,22) & 9223372036854775807)%20)::int AS c20,\n        ((hashint8extended(i::bigint,33) & 9223372036854775807)%200)::int AS c200, ((hashint8extended(i::bigint,44) & 9223372036854775807)%20000)::int AS c20k,\n        ((hashint8extended(i::bigint,55) & 9223372036854775807)%1000000)::int AS c1m,\n        LEAST(199, ((i-1)*200/1000000))::int AS clustered,\n        CASE WHEN (hashint8extended(i::bigint,66) & 9223372036854775807)%10<9 THEN 0 ELSE 1+((hashint8extended(i::bigint,77) & 9223372036854775807)%999)::int END AS skew,\n        CASE WHEN (hashint8extended(i::bigint,88) & 9223372036854775807)%10=0 THEN NULL ELSE ((hashint8extended(i::bigint,99) & 9223372036854775807)%200)::int END AS nullable,\n        repeat(md5(i::text),2) AS payload\n        FROM generate_series(1::bigint,1000000::bigint) i",
+      "5000000": "SELECT i::bigint AS id,\n        ((hashint8extended(i::bigint,11) & 9223372036854775807)%2)::int AS c2, ((hashint8extended(i::bigint,22) & 9223372036854775807)%20)::int AS c20,\n        ((hashint8extended(i::bigint,33) & 9223372036854775807)%200)::int AS c200, ((hashint8extended(i::bigint,44) & 9223372036854775807)%20000)::int AS c20k,\n        ((hashint8extended(i::bigint,55) & 9223372036854775807)%1000000)::int AS c1m,\n        LEAST(199, ((i-1)*200/5000000))::int AS clustered,\n        CASE WHEN (hashint8extended(i::bigint,66) & 9223372036854775807)%10<9 THEN 0 ELSE 1+((hashint8extended(i::bigint,77) & 9223372036854775807)%999)::int END AS skew,\n        CASE WHEN (hashint8extended(i::bigint,88) & 9223372036854775807)%10=0 THEN NULL ELSE ((hashint8extended(i::bigint,99) & 9223372036854775807)%200)::int END AS nullable,\n        repeat(md5(i::text),2) AS payload\n        FROM generate_series(1::bigint,5000000::bigint) i"
+    },
+    "documents": "SELECT i::bigint AS id, ((hashint8extended(i::bigint,13) & 9223372036854775807)%20)::int AS grp,\n        CASE WHEN i%101=0 THEN NULL WHEN i%97=0 THEN ARRAY[]::text[]\n             ELSE ARRAY['t'||((hashint8extended(i::bigint,14) & 9223372036854775807)%20),'t'||((hashint8extended(i::bigint,15) & 9223372036854775807)%200),'t'||((hashint8extended(i::bigint,16) & 9223372036854775807)%2000)] END AS tags,\n        CASE WHEN i%101=0 THEN NULL ELSE to_tsvector('simple',\n             CASE WHEN i%97=0 THEN '' ELSE\n             'common w'||((hashint8extended(i::bigint,14) & 9223372036854775807)%20)||' w'||((hashint8extended(i::bigint,15) & 9223372036854775807)%200)||' w'||((hashint8extended(i::bigint,16) & 9223372036854775807)%2000)||\n             ' rare'||((hashint8extended(i::bigint,17) & 9223372036854775807)%10000)||' endword' END) END AS tsv,\n        repeat(md5(i::text),2) AS payload\n        FROM generate_series(1::bigint,200000::bigint) i"
+  },
+  "indexes": {
+    "scalar": {
+      "btree": [
+        [
+          "ix_c2",
+          "CREATE INDEX ix_c2 ON fact USING btree (c2)"
+        ],
+        [
+          "ix_c20",
+          "CREATE INDEX ix_c20 ON fact USING btree (c20)"
+        ],
+        [
+          "ix_c200",
+          "CREATE INDEX ix_c200 ON fact USING btree (c200)"
+        ],
+        [
+          "ix_c20k",
+          "CREATE INDEX ix_c20k ON fact USING btree (c20k)"
+        ],
+        [
+          "ix_nullable",
+          "CREATE INDEX ix_nullable ON fact USING btree (nullable)"
+        ]
+      ],
+      "gin": [
+        [
+          "ix_c2",
+          "CREATE INDEX ix_c2 ON fact USING gin (c2) WITH (fastupdate=on)"
+        ],
+        [
+          "ix_c20",
+          "CREATE INDEX ix_c20 ON fact USING gin (c20) WITH (fastupdate=on)"
+        ],
+        [
+          "ix_c200",
+          "CREATE INDEX ix_c200 ON fact USING gin (c200) WITH (fastupdate=on)"
+        ],
+        [
+          "ix_c20k",
+          "CREATE INDEX ix_c20k ON fact USING gin (c20k) WITH (fastupdate=on)"
+        ],
+        [
+          "ix_nullable",
+          "CREATE INDEX ix_nullable ON fact USING gin (nullable) WITH (fastupdate=on)"
+        ]
+      ],
+      "roaring": [
+        [
+          "ix_c2",
+          "CREATE INDEX ix_c2 ON fact USING roaring (c2)"
+        ],
+        [
+          "ix_c20",
+          "CREATE INDEX ix_c20 ON fact USING roaring (c20)"
+        ],
+        [
+          "ix_c200",
+          "CREATE INDEX ix_c200 ON fact USING roaring (c200)"
+        ],
+        [
+          "ix_c20k",
+          "CREATE INDEX ix_c20k ON fact USING roaring (c20k)"
+        ],
+        [
+          "ix_nullable",
+          "CREATE INDEX ix_nullable ON fact USING roaring (nullable)"
+        ]
+      ]
+    },
+    "documents": {
+      "gin": [
+        [
+          "ix_tags",
+          "CREATE INDEX ix_tags ON docs USING gin (tags)"
+        ],
+        [
+          "ix_tsv",
+          "CREATE INDEX ix_tsv ON docs USING gin (tsv)"
+        ]
+      ],
+      "roaring": [
+        [
+          "ix_tags",
+          "CREATE INDEX ix_tags ON docs USING roaring (tags)"
+        ],
+        [
+          "ix_tsv",
+          "CREATE INDEX ix_tsv ON docs USING roaring (tsv)"
+        ]
+      ]
+    }
+  }
+}
