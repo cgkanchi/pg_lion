@@ -11,3 +11,4 @@ log/
 test/unit/sparse_test
 __pycache__/
 *.pyc
+.deps/

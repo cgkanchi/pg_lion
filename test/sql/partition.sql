@@ -1,12 +1,16 @@
 -- The count pushdown over partitioned tables (DESIGN.md section 16).
 --
--- The node counts one live leaf partition at a time and adds the results up,
--- so what has to be checked is that it finds the right partitions (the
--- planner's pruned set, recursively through sub-partitioning), the right
--- index in each of them (attnums differ when a partition has a dropped
--- column), and that the rows it produces are exactly the rows the ordinary
--- plan produces.  The last check is done with EXCEPT ALL in both directions,
--- so a wrong answer fails even if it happens to be stable.
+-- The node counts one live leaf partition at a time.  Without GROUP BY it
+-- adds the results up and emits one row; with GROUP BY it emits one PARTIAL
+-- aggregate per group per partition, streamed as each partition is counted,
+-- and core's Finalize HashAggregate above it combines them.  So what has to
+-- be checked is that it finds the right partitions (the planner's pruned set,
+-- recursively through sub-partitioning), the right index in each of them
+-- (attnums differ when a partition has a dropped column), that the plan is
+-- that two-node shape, and that the rows the whole thing produces are exactly
+-- the rows the ordinary plan produces.  The last check is done with EXCEPT
+-- ALL in both directions, so a wrong answer fails even if it happens to be
+-- stable.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'roaring_index';
@@ -71,6 +75,44 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
+END $$;
+
+/*
+ * What the top node of one executed plan is, and whether its hash table had
+ * to spill.  A partitioned GROUP BY is pushed down as PARTIAL aggregates with
+ * core's Finalize HashAggregate on top (DESIGN.md section 16), and the point
+ * of that shape is that the finalize step spills to disk when the groups do
+ * not fit in hash_mem.  The batch and byte counts themselves depend on the
+ * machine, so this reads them out of EXPLAIN (FORMAT JSON) and prints only
+ * the predicates.
+ */
+CREATE FUNCTION rbi_pspill(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	pl json;
+	top json;
+	child json;
+	batches bigint;
+	disk bigint;
+BEGIN
+	PERFORM set_config('roaring_index.enable_count_pushdown', 'on', true);
+	EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF,'
+			' BUFFERS OFF, FORMAT JSON) ' || q INTO pl;
+	top := pl -> 0 -> 'Plan';
+	child := top -> 'Plans' -> 0;
+	batches := coalesce((top ->> 'HashAgg Batches')::bigint, 0);
+	disk := coalesce((top ->> 'Disk Usage')::bigint, 0);
+
+	RETURN NEXT format('top: %s %s %s',
+					   coalesce(top ->> 'Partial Mode', '?'),
+					   coalesce(top ->> 'Strategy', '?'),
+					   top ->> 'Node Type');
+	RETURN NEXT format('child: %s',
+					   coalesce(child ->> 'Custom Plan Provider',
+								child ->> 'Node Type', 'none'));
+	RETURN NEXT format('rows: %s', top ->> 'Actual Rows');
+	RETURN NEXT format('batches > 1: %s', batches > 1);
+	RETURN NEXT format('disk usage > 0: %s', disk > 0);
 END $$;
 
 -- ---- the table ----------------------------------------------------------
@@ -165,6 +207,22 @@ SELECT rbi_pplan('SELECT a, count(*) FROM rbi_part GROUP BY a');
 SELECT rbi_pplan('SELECT a, count(*) FROM rbi_part WHERE b = 2 GROUP BY a');
 SELECT rbi_pplan('SELECT count(*) FROM rbi_part WHERE n IS NULL');
 SELECT rbi_pplan('SELECT count(*) FROM rbi_part WHERE a IN (1, 4, 7)');
+SELECT rbi_pplan('SELECT n, count(*) AS c1, count(n) AS c2 FROM rbi_part GROUP BY n');
+SELECT rbi_pplan('SELECT a, b, count(*) FROM rbi_part WHERE b = 2 GROUP BY a, b');
+
+/*
+ * What the node itself produces for a partitioned GROUP BY: the group key and
+ * a PARTIAL count per aggregate (DESIGN.md section 16).  This is the shape
+ * setrefs.c matched the Finalize Agg's own references against, so EXPLAIN
+ * VERBOSE printing it is the check that the two halves agree.  The third plan
+ * also carries a column the WHERE clause pins (b), which the partial target
+ * has to pass through untouched.
+ */
+EXPLAIN (VERBOSE, COSTS OFF) SELECT a, count(*) FROM rbi_part GROUP BY a;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT n, count(*) AS c1, count(n) AS c2 FROM rbi_part GROUP BY n;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT a, b, count(*) FROM rbi_part WHERE b = 2 GROUP BY a, b;
 
 -- ---- the shapes that must push down --------------------------------------
 SELECT rbi_pp('SELECT count(*) FROM rbi_part WHERE a = 3');
@@ -321,17 +379,18 @@ RESET enable_bitmapscan;
 RESET enable_indexscan;
 DROP TABLE rbi_parte;
 
--- ---- the cross-partition group table has a budget -------------------------
+-- ---- partial aggregates, finalized (and spilled) by core -------------------
 /*
- * A partitioned GROUP BY holds every group of every partition in a
- * TupleHashTable until the last partition has been counted (DESIGN.md section
- * 16), and that table cannot spill.  The planner therefore declines when the
- * estimated table does not fit in the budget HashAggregate itself respects,
- * work_mem * hash_mem_multiplier, and lets the ordinary Agg - which can spill
- * - have the query (the 2026-09-20 review, finding 6).
+ * A partitioned GROUP BY does not merge the partitions' groups in the node
+ * any more: it emits one PARTIAL aggregate per group per partition and core's
+ * Finalize HashAggregate combines them (DESIGN.md section 16).  That is what
+ * bounds the memory - the node keeps nothing between rows, and the finalize
+ * step batches to disk under hash_mem exactly like any other HashAggregate -
+ * so a grouping far too large for work_mem is no longer refused.
  *
- * Every other plan is disabled around the two plans below, so the only thing
- * that can decide between them is the budget.
+ * Every other plan is disabled around the plans below, so that the pushdown
+ * is what runs; the numbers themselves are reduced to predicates, because
+ * how many batches a spill needs is not a property of this extension.
  */
 CREATE TABLE rbi_pbig (g int NOT NULL, k int NOT NULL) PARTITION BY RANGE (k);
 CREATE TABLE rbi_pbig1 PARTITION OF rbi_pbig FOR VALUES FROM (0) TO (5);
@@ -343,24 +402,81 @@ VACUUM ANALYZE rbi_pbig;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
-SET work_mem = '64kB';			-- 5000 groups of (key + 64 bytes) do not fit
+SET hash_mem_multiplier = 1.0;
+SET work_mem = '64kB';			-- 5000 groups do not fit: the finalize spills
 SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
-SET work_mem = '4MB';			-- and now they do
+SELECT rbi_pspill('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
+SELECT rbi_pp('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
+SET work_mem = '4MB';			-- and now they fit, so it does not
 SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
+SELECT rbi_pspill('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
 SELECT rbi_pp('SELECT g, count(*) FROM rbi_pbig GROUP BY g');
 /*
- * A count has no groups to merge, and a single table does not merge at all,
- * so neither is subject to the budget.
+ * A count has no groups at all, and a single table streams its own groups -
+ * neither has ever had anything above it.
  */
 SET work_mem = '64kB';
 SELECT rbi_pplan('SELECT count(*) FROM rbi_pbig WHERE g = 7');
 SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pbig1 GROUP BY g');
+/*
+ * A Finalize HashAggregate that has spilled rescans its input instead of
+ * re-reading its own table (ExecReScanAgg), so a nested loop over a spilling
+ * one is what makes the node abandon a half-scanned partition and start the
+ * whole partition list again (ReScanCustomScan).
+ */
+SET enable_material = off;
+SELECT rbi_pplan('SELECT v.x, count(*) AS groups, sum(s.c) AS rows'
+				 ' FROM (VALUES (1), (2)) v(x)'
+				 ' LEFT JOIN LATERAL (SELECT g, count(*) c FROM rbi_pbig'
+				 ' GROUP BY g) s ON s.g >= v.x GROUP BY v.x');
+SELECT v.x, count(*) AS groups, sum(s.c) AS rows
+  FROM (VALUES (1), (2)) v(x)
+  LEFT JOIN LATERAL (SELECT g, count(*) c FROM rbi_pbig GROUP BY g) s
+	ON s.g >= v.x
+ GROUP BY v.x ORDER BY 1;
+RESET enable_material;
 RESET work_mem;
+RESET hash_mem_multiplier;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 SELECT count(*) FROM (SELECT g, count(*) FROM rbi_pbig GROUP BY g) s;
 DROP TABLE rbi_pbig;
+
+-- ---- stale statistics bound nothing any more -------------------------------
+/*
+ * The budget this section used to enforce was a PLAN-time one, and therefore
+ * only as good as estimate_num_groups(): a partitioned parent is never
+ * auto-analyzed, so ten estimated groups against twenty thousand actual ones
+ * let the executor build a hash table with no bound at all (the 2026-09-21
+ * follow-up review).  With the merge gone the estimate bounds nothing that
+ * matters: the query is pushed down, every group is counted exactly, and the
+ * Finalize HashAggregate spills.
+ */
+CREATE TABLE rbi_pstale (g int NOT NULL, k int NOT NULL) PARTITION BY RANGE (k);
+CREATE TABLE rbi_pstale1 PARTITION OF rbi_pstale FOR VALUES FROM (0) TO (5);
+CREATE TABLE rbi_pstale2 PARTITION OF rbi_pstale FOR VALUES FROM (5) TO (10);
+INSERT INTO rbi_pstale SELECT i % 10, i % 10 FROM generate_series(1, 10000) i;
+CREATE INDEX rbi_pstale_g ON rbi_pstale USING roaring (g);
+VACUUM ANALYZE rbi_pstale;
+-- what the planner knows about the grouping column: ten groups
+SELECT n_distinct FROM pg_stats
+ WHERE tablename = 'rbi_pstale' AND attname = 'g' AND inherited;
+-- twenty thousand brand-new keys, vacuumed (all-visible) but NOT analyzed
+INSERT INTO rbi_pstale SELECT 1000 + i, i % 10 FROM generate_series(1, 20000) i;
+VACUUM rbi_pstale;
+SELECT n_distinct FROM pg_stats
+ WHERE tablename = 'rbi_pstale' AND attname = 'g' AND inherited;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1.0;
+SELECT rbi_pplan('SELECT g, count(*) FROM rbi_pstale GROUP BY g');
+SELECT rbi_pspill('SELECT g, count(*) FROM rbi_pstale GROUP BY g');
+SELECT rbi_pp('SELECT g, count(*) FROM rbi_pstale GROUP BY g');
+SELECT count(*) AS groups, sum(c) AS rows
+  FROM (SELECT g, count(*) c FROM rbi_pstale GROUP BY g) s;
+RESET work_mem;
+RESET hash_mem_multiplier;
+DROP TABLE rbi_pstale;
 
 -- ---- a partition without a usable roaring index ---------------------------
 CREATE TABLE rbi_pnx (id int NOT NULL, a int NOT NULL, k int NOT NULL)
@@ -395,8 +511,10 @@ DROP TABLE rbi_pnx;
 
 -- ---- the node inside a larger plan ----------------------------------------
 /*
- * A nested loop rescans the node once per outer row, which is the one path
- * that has to throw the merged group table away and rebuild it.
+ * A nested loop rescans its inner side once per outer row.  With a group key
+ * the node now sits under a Finalize HashAggregate, which reuses its own
+ * table rather than re-reading the node unless it spilled (that case is in
+ * the spill section above); a plain count is rescanned directly.
  */
 SET enable_material = off;
 SET enable_seqscan = off;
@@ -434,6 +552,12 @@ BEGIN
 		IF ln LIKE '%Custom Scan (RoaringCount)%' THEN
 			pushed := true;
 		END IF;
+		/*
+		 * A partitioned GROUP BY has a Finalize HashAggregate above the node
+		 * (DESIGN.md section 16), whose own Group Key line is not what this
+		 * function is about: start at the node itself.
+		 */
+		CONTINUE WHEN NOT pushed;
 		nm := btrim(split_part(ln, ':', 1));
 		IF nm IN ('Partitions', 'Roaring Indexes', 'Group Key') THEN
 			RETURN NEXT btrim(ln);
@@ -466,3 +590,4 @@ DROP TABLE rbi_part;
 DROP FUNCTION rbi_pp(text);
 DROP FUNCTION rbi_pp_counters(text);
 DROP FUNCTION rbi_pplan(text);
+DROP FUNCTION rbi_pspill(text);

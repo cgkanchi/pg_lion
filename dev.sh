@@ -1,7 +1,8 @@
 #!/bin/bash
 # Dev cluster helpers.  Usage: ./dev.sh {start|stop|restart|psql [args]|reset|env}
 P=$(cd "$(dirname "$0")" && pwd)
-export PGHOST=/tmp/claude-1000/pgsk PGPORT=54329 PGUSER=postgres PGDATABASE=postgres
+# RBI_SOCK / RBI_PORT let a worktree run its own cluster next to the main one
+export PGHOST=${RBI_SOCK:-/tmp/claude-1000/pgsk} PGPORT=${RBI_PORT:-54329} PGUSER=postgres PGDATABASE=postgres
 export PATH=$P/.local/pg/bin:$PATH
 D=$P/.local/data
 case "$1" in

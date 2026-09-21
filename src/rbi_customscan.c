@@ -26,9 +26,15 @@
  * The relation may also be a PARTITIONED table (DESIGN.md §16).  Then the
  * node counts one live leaf partition at a time - each with its own heap and
  * its own indexes, found through the planner's already-pruned part_rels and
- * with the column numbers translated per partition - and adds the results up.
- * Everything below that says "the relation" therefore means "the relation the
- * node is currently counting": one table, or one partition of many.
+ * with the column numbers translated per partition.  Without GROUP BY the
+ * partition counts are added up into the one row.  With GROUP BY the node
+ * emits PARTIAL aggregates instead - one (group key, int8 partial count) per
+ * group per partition, streamed as each partition is counted - and the
+ * planner puts core's Finalize HashAggregate on top to combine them, which
+ * is what lets a grouping larger than hash_mem spill to disk instead of
+ * being refused.  Everything below that says "the relation" therefore means
+ * "the relation the node is currently counting": one table, or one partition
+ * of many.
  *
  *-------------------------------------------------------------------------
  */
@@ -57,6 +63,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
+#include "optimizer/prep.h"
 #include "optimizer/tlist.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
@@ -128,7 +135,7 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 /*
  * What the planner decided, in a form the executor can be handed through
  * custom_private.  Everything in there has to be a copyable/serialisable
- * node, so it is seven plain lists plus one filled in at plan time, behind a
+ * node, so it is six plain lists plus one filled in at plan time, behind a
  * shape marker:
  *
  *	0	IntList: RBI_PRIV_MAGIC and RBI_PRIV_NMEMBERS.  The list is
@@ -151,14 +158,9 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  *	5	List of OidList, one per live leaf partition and empty for a plain
  *		table (DESIGN.md §16): heap Oid, group index Oid (InvalidOid if
  *		none), then one index Oid per WHERE clause
- *	6	The group column, when there is one: a two-element list holding the
- *		group Var (for its type, typmod and collation) and a one-element
- *		OidList holding the equality operator the planner chose for it.  That
- *		operator is what the cross-partition TupleHashTable groups by, and it
- *		is the equality every driving index had to agree with at plan time.
- *	7	OidList: the operator of each WHERE clause (InvalidOid for a null
+ *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
  *		test), which is what EXPLAIN prints a multi-key clause with
- *	8	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
+ *	7	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define RBI_PRIV_VERSION	0
@@ -167,13 +169,16 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 #define RBI_PRIV_CONSTS		3
 #define RBI_PRIV_CLAUSEKINDS 4
 #define RBI_PRIV_PARTS		5
-#define RBI_PRIV_GROUPKEY	6
-#define RBI_PRIV_CLAUSEOPS	7
-#define RBI_PRIV_TLKINDS	8
+#define RBI_PRIV_CLAUSEOPS	6
+#define RBI_PRIV_TLKINDS	7
 
-/* Shape of the list above: "RBI" and a shape version, and its length. */
-#define RBI_PRIV_MAGIC		0x52424901
-#define RBI_PRIV_NMEMBERS	9
+/*
+ * Shape of the list above: "RBI" and a shape version, and its length.  Shape
+ * 2 dropped the group column member, which only the cross-partition hash
+ * merge needed (DESIGN.md §16: the node emits partial aggregates now).
+ */
+#define RBI_PRIV_MAGIC		0x52424902
+#define RBI_PRIV_NMEMBERS	8
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -259,25 +264,15 @@ typedef struct RBICountScanState
 	RBIEntryScan escan;
 
 	/*
-	 * GROUP BY over a partitioned table: the groups of the partitions are
-	 * merged here, by the equality and hash operators of the grouping column
-	 * (DESIGN.md §16).  Every partition is counted before the first row comes
-	 * out, because a group may have rows in any of them.  Each entry's
-	 * "additional" bytes hold the int64 running count.
+	 * GROUP BY over a partitioned table (DESIGN.md §16): the partitions are
+	 * walked one at a time and each one's groups are emitted as PARTIAL
+	 * aggregates as they are counted, so the node's only state between rows
+	 * is which partition is open and how far its entry scan has got.  curpart
+	 * is the partition being scanned and partopen says whether it is open;
+	 * core's Finalize HashAggregate above combines the partial counts.
 	 */
-	Oid			grouptype;
-	int32		grouptypmod;
-	Oid			groupcollid;
-	Oid			groupeqop;
-	TupleHashTable hashtab;
-	TupleTableSlot *hashslot;	/* virtual, for probing */
-	TupleTableSlot *hashoutslot;	/* minimal, for reading entries back */
-	TupleDesc	hashdesc;
-	MemoryContext hashmetacxt;
-	MemoryContext hashtuplescxt;
-	MemoryContext hashtempcxt;
-	bool		hashfilled;
-	TupleHashIterator hashiter;
+	int			curpart;
+	bool		partopen;
 
 	MemoryContext pergroup;		/* reset before each group is counted */
 	MemoryContext wherecxt;		/* the located WHERE payload copies */
@@ -672,37 +667,54 @@ typedef struct RBICountTarget
 	Oid			heapoid;
 	IndexOptInfo *driveidx;		/* the index whose entries are scanned, or NULL */
 	List	   *whereidx;		/* IndexOptInfo *, one per WHERE clause */
+	Var		   *drivevar;		/* the driving column in THIS relation's own
+								 * numbering, which is what a per-relation
+								 * estimate_num_groups() needs; NULL when
+								 * nothing drives the scan */
 } RBICountTarget;
 
 /*
- * The attribute number a parent column has in one child, or 0 when the child
- * does not have it (a column dropped in that partition).  Partitions may
- * number their columns differently, so every attnum the pushdown carries
- * across a partition boundary goes through here (DESIGN.md §16).
+ * The Var a parent column becomes in one child, or NULL when the child does
+ * not have it (a column dropped in that partition).  Partitions may number
+ * their columns differently, so every attnum the pushdown carries across a
+ * partition boundary goes through here (DESIGN.md §16); the Var itself is
+ * what a per-partition group estimate has to be made against, because the
+ * statistics live on the child.
  */
-static AttrNumber
-rbi_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
+static Var *
+rbi_child_var(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
 {
 	AppendRelInfo *appinfo;
 	Var		   *cvar;
 
 	if (parentattno <= 0)
-		return 0;
+		return NULL;
 	if (childrelid == 0 || childrelid >= (Index) root->simple_rel_array_size)
-		return 0;
+		return NULL;
 	if (root->append_rel_array == NULL)
-		return 0;
+		return NULL;
 	appinfo = root->append_rel_array[childrelid];
 	if (appinfo == NULL)
-		return 0;
+		return NULL;
 	if ((int) parentattno > list_length(appinfo->translated_vars))
-		return 0;
+		return NULL;
 
 	cvar = (Var *) list_nth(appinfo->translated_vars, parentattno - 1);
 	if (cvar == NULL || !IsA(cvar, Var) || cvar->varattno <= 0)
-		return 0;
+		return NULL;
 
-	return cvar->varattno;
+	return cvar;
+}
+
+/*
+ * The same, reduced to the attribute number; 0 when the child lacks it.
+ */
+static AttrNumber
+rbi_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
+{
+	Var		   *cvar = rbi_child_var(root, childrelid, parentattno);
+
+	return (cvar != NULL) ? cvar->varattno : 0;
 }
 
 /*
@@ -747,6 +759,9 @@ typedef struct RBIClauseInfo
 typedef struct RBIDriveInfo
 {
 	AttrNumber	attno;			/* in the PARENT's numbering, 0 for none */
+	Var		   *var;			/* the column as THIS relation numbers it, for
+								 * a per-relation group estimate; NULL for
+								 * none */
 	Oid			collation;		/* the grouping column's collation, or none */
 	Oid			eqop;			/* GROUP BY: the equality the index must have
 								 * as strategy 1 of its opfamily; InvalidOid
@@ -801,10 +816,10 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 
 			if (drive->attno != 0)
 			{
-				cdrive.attno = rbi_child_attno(root, child->relid,
-											   drive->attno);
-				if (cdrive.attno == 0)
+				cdrive.var = rbi_child_var(root, child->relid, drive->attno);
+				if (cdrive.var == NULL)
 					return false;
+				cdrive.attno = cdrive.var->varattno;
 			}
 			foreach(l1, whereattnos)
 			{
@@ -837,6 +852,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	t = (RBICountTarget *) palloc0(sizeof(RBICountTarget));
 	t->rel = rel;
 	t->heapoid = rte->relid;
+	t->drivevar = drive->var;
 
 	/*
 	 * The driving index - a GROUP BY column's, or the one DESIGN.md §14 sums
@@ -859,7 +875,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		 * matching collation does not make those the same relation: an
 		 * opclass may define a coarser equality on the same type (a text
 		 * opclass over lower(), say), and then its entries are already
-		 * merged groups that no amount of cross-partition merging can take
+		 * merged groups that no aggregation above the node can take
 		 * apart.  So strategy 1 of this index's opfamily, on its own key
 		 * type, has to be the very operator the planner chose for the
 		 * grouping column (the 2026-09-20 review, finding 3).  This also
@@ -1101,7 +1117,7 @@ rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 static void
 rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, double numgroups,
-					double outrows, double hashentrysize)
+					double outrows)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -1133,26 +1149,14 @@ rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	cpath->path.rows = outrows;
 	cpath->path.disabled_nodes = 0;
 
-	if (hashentrysize > 0.0)
-	{
-		/*
-		 * A partitioned GROUP BY merges the partitions' groups in a hash
-		 * table (DESIGN.md §16) and emits nothing until the last partition
-		 * has been counted: the whole scan is startup work, and the merge
-		 * itself is one materialized entry of hashentrysize bytes per group.
-		 * Charging that makes a plan whose only cost was per-group memory
-		 * comparable with the Agg it replaces (the 2026-09-20 review,
-		 * finding 5); the hard budget is at plan time, in
-		 * rbi_try_count_path().
-		 */
-		run += numgroups * hashentrysize * cpu_operator_cost;
-		cpath->path.startup_cost = run;
-	}
-	else
-	{
-		/* Without GROUP BY the single output row needs the whole scan first. */
-		cpath->path.startup_cost = (outrows <= 1.0) ? run : 0.0;
-	}
+	/*
+	 * Every form of the node streams its rows as it counts them - one per
+	 * group, and with partitions one per group per partition (DESIGN.md §16:
+	 * the partials go to a Finalize Agg above, which is costed by core) - so
+	 * only the single-row forms have to do the whole scan before the first
+	 * row comes out.
+	 */
+	cpath->path.startup_cost = (outrows <= 1.0) ? run : 0.0;
 	cpath->path.total_cost = run;
 }
 
@@ -1185,6 +1189,82 @@ rbi_array_const_nelems(Const *con)
 }
 
 /*
+ * The partially-grouped PathTarget a partitioned GROUP BY node produces
+ * (DESIGN.md §16): the grouping column(s) unchanged, plus every aggregate
+ * marked as the INITIAL phase of a split aggregate.  For count(*) and
+ * count(col) the transition type is int8 and there is nothing to serialize,
+ * so a partial row is just (group key, int8 partial count).
+ *
+ * This is make_partial_grouping_target() (src/backend/optimizer/plan/
+ * planner.c) applied to our own grouped target, and it has to stay that:
+ * setrefs.c re-derives the partial Aggrefs from the Finalize Agg's own ones
+ * (convert_combining_aggrefs()) and matches them against the subplan's target
+ * list with equal(), so an Aggref that differs in any field - the aggsplit
+ * above all - would not be found.
+ *
+ * Our target only ever holds plain Vars and count Aggrefs at the top level
+ * (the checks above refuse everything else), which is why pull_var_clause()
+ * needs no SRF or window handling here.
+ */
+static PathTarget *
+rbi_make_partial_target(PlannerInfo *root, PathTarget *grouping_target)
+{
+	PathTarget *partial_target = create_empty_pathtarget();
+	List	   *non_group_cols = NIL;
+	List	   *non_group_exprs;
+	int			i = 0;
+	ListCell   *lc;
+
+	foreach(lc, grouping_target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(grouping_target, i);
+
+		if (sgref && root->processed_groupClause &&
+			get_sortgroupref_clause_noerr(sgref,
+										  root->processed_groupClause) != NULL)
+		{
+			/*
+			 * A grouping column, carried through as it is - sortgroupref and
+			 * all, because that is how the Finalize Agg finds it again
+			 * (set_upper_references() matches group items by sortgroupref
+			 * first, and make_agg() numbers its grouping columns that way).
+			 */
+			add_column_to_pathtarget(partial_target, expr, sgref);
+		}
+		else
+			non_group_cols = lappend(non_group_cols, expr);
+		i++;
+	}
+
+	non_group_exprs = pull_var_clause((Node *) non_group_cols,
+									  PVC_INCLUDE_AGGREGATES |
+									  PVC_RECURSE_WINDOWFUNCS |
+									  PVC_INCLUDE_PLACEHOLDERS);
+	add_new_columns_to_pathtarget(partial_target, non_group_exprs);
+
+	foreach(lc, partial_target->exprs)
+	{
+		Aggref	   *aggref = (Aggref *) lfirst(lc);
+
+		if (IsA(aggref, Aggref))
+		{
+			Aggref	   *newaggref = makeNode(Aggref);
+
+			/* Flat-copy, as core does, so no other tree is damaged. */
+			memcpy(newaggref, aggref, sizeof(Aggref));
+			mark_partial_aggref(newaggref, AGGSPLIT_INITIAL_SERIAL);
+			lfirst(lc) = newaggref;
+		}
+	}
+
+	list_free(non_group_exprs);
+	list_free(non_group_cols);
+
+	return set_pathtarget_cost_width(root, partial_target);
+}
+
+/*
  * Decide whether count(*) over input_rel can be answered from roaring
  * posting sets and, if so, add a CustomPath to output_rel.  Every failed
  * check simply returns: the normal plan is always available.
@@ -1206,7 +1286,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		groupvalueout = false;	/* the output prints the group key */
 	List	   *valueattnos = NIL;	/* pinned columns the output prints */
 	RBIDriveInfo drive;
-	double		hashentrysize = 0.0;
+	PathTarget *partialtarget = NULL;	/* set for a partitioned GROUP BY */
 	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
 	List	   *clauseinfos = NIL;	/* RBIClauseInfo, one per clause */
 	List	   *whereclauses = NIL; /* the clause, for selectivity */
@@ -1225,7 +1305,6 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	List	   *consts = NIL;
 	List	   *ckinds = NIL;
 	List	   *parts = NIL;
-	List	   *groupkey = NIL;
 	CustomPath *cpath;
 	double		numgroups;
 	double		outrows;
@@ -1245,8 +1324,6 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		parse->hasDistinctOn || parse->distinctClause != NIL)
 		return;
 	if (parse->rowMarks != NIL || root->rowMarks != NIL)
-		return;
-	if (extra != NULL && extra->patype != PARTITIONWISE_AGGREGATE_NONE)
 		return;
 	if (extra != NULL && extra->havingQual != NULL)
 		return;
@@ -1279,6 +1356,17 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (rte->relkind != RELKIND_PARTITIONED_TABLE)
 			return;
 		if (input_rel->part_scheme == NULL || !IS_PARTITIONED_REL(input_rel))
+			return;
+
+		/*
+		 * With partitionwise aggregation the planner builds its own per-child
+		 * grouping paths; ours would only compete on cost, and the interaction
+		 * is untested, so stay out of the way.  This applies to partitioned
+		 * parents only: grouping_planner() sets patype whenever the GUC is on,
+		 * before it knows whether the input is partitioned at all, so testing
+		 * it earlier would switch the pushdown off for plain tables too.
+		 */
+		if (extra != NULL && extra->patype != PARTITIONWISE_AGGREGATE_NONE)
 			return;
 		partitioned = true;
 	}
@@ -1341,12 +1429,16 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			return;
 
 		/*
-		 * The groups of all the partitions are merged in a TupleHashTable
-		 * (DESIGN.md §16) built from that operator, so with more than one
-		 * relation the column also has to be hashable.  One table needs no
-		 * merging and does not care.
+		 * A partitioned GROUP BY emits one PARTIAL aggregate per group per
+		 * partition and lets core's Finalize HashAggregate combine them
+		 * (DESIGN.md §16), so the column has to be hashable and the planner
+		 * has to consider the aggregates splittable at all.  count(*) and
+		 * count(col) always are, but the answer is the planner's to give.
+		 * One table needs neither: it streams its finished groups.
 		 */
-		if (partitioned && !sgc->hashable)
+		if (partitioned &&
+			(!sgc->hashable || extra == NULL ||
+			 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0))
 			return;
 	}
 
@@ -1702,6 +1794,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * up, because partitions may number their columns differently.
 	 */
 	drive.attno = driveattno;
+	drive.var = (driveattno != 0) ?
+		((groupvar != NULL) ? groupvar : notnullvar) : NULL;
 	drive.collation = (groupvar != NULL) ? groupvar->varcollid : InvalidOid;
 	drive.eqop = (groupvar != NULL) ? groupeqop : InvalidOid;
 	drive.valueout = groupvalueout;
@@ -1727,33 +1821,42 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	else
 		numgroups = 1.0;
 
-	outrows = (groupvar != NULL) ? numgroups : 1.0;
-
 	/*
-	 * A partitioned GROUP BY keeps every group of every partition in a
-	 * TupleHashTable until the last partition has been counted (DESIGN.md
-	 * §16), and that table has no spill path: the node cannot fall back to a
-	 * sorted merge the way HashAggregate falls back to disk.  So decline at
-	 * plan time when the estimated table does not fit in the budget
-	 * HashAggregate itself respects - work_mem * hash_mem_multiplier, via
-	 * get_hash_memory_limit() - and let the ordinary Agg, which can spill,
-	 * have the query (the 2026-09-20 review, finding 6).
-	 *
-	 * The estimate is one entry per group: the key (its average width, or its
-	 * length when it is fixed) plus the minimal tuple's header, the hash
-	 * table's own per-entry bookkeeping and the int64 count, for which 64
-	 * bytes is the round number.
+	 * How many rows the node itself produces.  One per group, except for a
+	 * partitioned GROUP BY, which emits one PARTIAL row per group per
+	 * partition and lets the Finalize Agg above combine them (DESIGN.md §16):
+	 * that is the sum of the partitions' own group estimates, each made
+	 * against the partition's statistics and capped by its row count.
 	 */
-	if (partitioned && groupvar != NULL)
+	if (groupvar == NULL)
+		outrows = 1.0;
+	else if (!partitioned)
+		outrows = numgroups;
+	else
 	{
-		int32		width = get_attavgwidth(rte->relid, groupattno);
+		outrows = 0.0;
+		foreach(lc, targets)
+		{
+			RBICountTarget *t = (RBICountTarget *) lfirst(lc);
+			double		relrows = Max(t->rel->rows, 1.0);
+			double		relgroups;
 
-		if (width <= 0)
-			width = get_typavgwidth(groupvar->vartype, groupvar->vartypmod);
+			if (t->drivevar != NULL)
+				relgroups = estimate_num_groups(root,
+												list_make1(t->drivevar),
+												relrows, NULL, NULL);
+			else
+				relgroups = numgroups;
+			outrows += Min(relgroups, relrows);
+		}
+		outrows = Max(outrows, 1.0);
 
-		hashentrysize = (double) (MAXALIGN(width) + 64);
-		if (numgroups * hashentrysize > (double) get_hash_memory_limit())
-			return;
+		/*
+		 * ... and those rows are partial aggregates, so the node's target is
+		 * the partially-grouped one and the grouped rel gets a Finalize Agg
+		 * over it further down.
+		 */
+		partialtarget = rbi_make_partial_target(root, output_rel->reltarget);
 	}
 
 	/*
@@ -1804,14 +1907,6 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 
 	/*
-	 * The group column's type, typmod and collation (from the Var) and the
-	 * equality operator the planner chose for it: what the cross-partition
-	 * TupleHashTable of DESIGN.md §16 is built from.
-	 */
-	if (groupvar != NULL)
-		groupkey = list_make2(copyObject(groupvar), list_make1_oid(groupeqop));
-
-	/*
 	 * The strategy of a multi-key clause travels with its operator: the
 	 * executor re-extracts the query and EXPLAIN prints the operator's name,
 	 * and both need the Oid.
@@ -1820,7 +1915,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = output_rel;
-	cpath->path.pathtarget = output_rel->reltarget;
+	cpath->path.pathtarget = partialtarget ? partialtarget :
+		output_rel->reltarget;
 	cpath->path.param_info = NULL;
 	cpath->path.parallel_aware = false;
 	cpath->path.parallel_safe = false;
@@ -1840,12 +1936,36 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->custom_private = lappend(cpath->custom_private, consts);
 	cpath->custom_private = lappend(cpath->custom_private, ckinds);
 	cpath->custom_private = lappend(cpath->custom_private, parts);
-	cpath->custom_private = lappend(cpath->custom_private, groupkey);
 	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
 	cpath->methods = &rbi_count_path_methods;
 
 	rbi_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
-						numgroups, outrows, hashentrysize);
+						numgroups, outrows);
+
+	/*
+	 * A partitioned GROUP BY produces partial aggregates, so what goes into
+	 * the grouped rel is core's Finalize HashAggregate over the node - which
+	 * combines the per-partition counts and, unlike anything this node could
+	 * hold, spills to disk when the groups do not fit in hash_mem
+	 * (DESIGN.md §16).  Everything else is already the finished answer.
+	 */
+	if (partialtarget != NULL)
+	{
+		AggClauseCosts agg_final_costs;
+
+		MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
+		get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
+
+		add_path(output_rel, (Path *)
+				 create_agg_path(root, output_rel, &cpath->path,
+								 output_rel->reltarget,
+								 AGG_HASHED, AGGSPLIT_FINAL_DESERIAL,
+								 root->processed_groupClause,
+								 NIL,	/* HAVING was refused above */
+								 &agg_final_costs,
+								 numgroups));
+		return;
+	}
 
 	add_path(output_rel, &cpath->path);
 }
@@ -2107,71 +2227,6 @@ rbi_close_relation(RBICountScanState *st)
 	}
 }
 
-/*
- * Build the TupleHashTable that merges the groups of the partitions
- * (DESIGN.md §16).  One column - the grouping column - hashed and compared
- * with the operators the planner chose for the GROUP BY clause, so that a
- * NULL group merges like any other and a type whose equality is not bytewise
- * (citext, say) groups the way the query says it should.
- */
-static void
-rbi_build_group_hash(RBICountScanState *st)
-{
-	EState	   *estate = st->css.ss.ps.state;
-	Oid		   *eqfuncoids;
-	FmgrInfo   *hashfunctions;
-	AttrNumber *keycol;
-	Oid		   *collations;
-	double		nelements;
-
-	Assert(OidIsValid(st->grouptype) && OidIsValid(st->groupeqop));
-
-	st->hashdesc = CreateTemplateTupleDesc(1);
-	TupleDescInitEntry(st->hashdesc, (AttrNumber) 1, "groupkey",
-					   st->grouptype, st->grouptypmod, 0);
-	TupleDescInitEntryCollation(st->hashdesc, (AttrNumber) 1, st->groupcollid);
-	TupleDescFinalize(st->hashdesc);
-
-	st->hashslot = MakeSingleTupleTableSlot(st->hashdesc, &TTSOpsVirtual);
-	st->hashoutslot = MakeSingleTupleTableSlot(st->hashdesc, &TTSOpsMinimalTuple);
-
-	st->hashmetacxt = AllocSetContextCreate(estate->es_query_cxt,
-											"RoaringCount group hash meta",
-											ALLOCSET_SMALL_SIZES);
-	st->hashtuplescxt = AllocSetContextCreate(estate->es_query_cxt,
-											  "RoaringCount group hash tuples",
-											  ALLOCSET_DEFAULT_SIZES);
-	st->hashtempcxt = AllocSetContextCreate(estate->es_query_cxt,
-											"RoaringCount group hash temp",
-											ALLOCSET_SMALL_SIZES);
-
-	execTuplesHashPrepare(1, &st->groupeqop, &eqfuncoids, &hashfunctions);
-
-	keycol = (AttrNumber *) palloc(sizeof(AttrNumber));
-	keycol[0] = 1;
-	collations = (Oid *) palloc(sizeof(Oid));
-	collations[0] = st->groupcollid;
-
-	nelements = st->css.ss.ps.plan->plan_rows;
-	if (!(nelements >= 16.0))
-		nelements = 16.0;
-
-	st->hashtab = BuildTupleHashTable(&st->css.ss.ps,
-									  st->hashdesc,
-									  &TTSOpsVirtual,
-									  1,
-									  keycol,
-									  eqfuncoids,
-									  hashfunctions,
-									  collations,
-									  nelements,
-									  sizeof(int64),
-									  st->hashmetacxt,
-									  st->hashtuplescxt,
-									  st->hashtempcxt,
-									  false);
-}
-
 static void
 rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -2183,7 +2238,6 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *consts;
 	List	   *ckinds;
 	List	   *partlist;
-	List	   *groupkey;
 	List	   *clauseops;
 	List	   *kinds;
 	int			flags;
@@ -2209,7 +2263,6 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	consts = (List *) list_nth(cscan->custom_private, RBI_PRIV_CONSTS);
 	ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
 	partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
-	groupkey = (List *) list_nth(cscan->custom_private, RBI_PRIV_GROUPKEY);
 	clauseops = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEOPS);
 	kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
 
@@ -2259,21 +2312,12 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		}
 	}
 
-	if (groupkey != NIL)
-	{
-		Var		   *gv = (Var *) linitial(groupkey);
-
-		st->grouptype = gv->vartype;
-		st->grouptypmod = gv->vartypmod;
-		st->groupcollid = gv->varcollid;
-		st->groupeqop = linitial_oid((List *) lsecond(groupkey));
-	}
-
 	st->located = false;
 	st->wheremissing = false;
 	st->scanning = false;
 	st->done = false;
-	st->hashfilled = false;
+	st->curpart = 0;
+	st->partopen = false;
 	memset(&st->stats, 0, sizeof(st->stats));
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
@@ -2307,10 +2351,6 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	st->sources[0].negated = false;
-
-	/* The cross-partition group merge (DESIGN.md §16). */
-	if (st->npart > 0 && st->hasgroupidx && st->groupattno != 0)
-		rbi_build_group_hash(st);
 }
 
 /*
@@ -2716,51 +2756,21 @@ rbi_sumall_relation(RBICountScanState *st)
 }
 
 /*
- * Add one group's count to the cross-partition hash table.
+ * The next group of the relation the node has open, as one row.
+ *
+ * Returns NULL and sets *exhausted once the relation's entry scan has run
+ * out; every other return is a row.  This is the streaming group loop of
+ * DESIGN.md §10, shared by the single-table path and by each partition of a
+ * partitioned one (§16), which is why nothing here knows about partitions:
+ * the caller has opened one relation and located its WHERE clauses.
  */
-static void
-rbi_hash_add_group(RBICountScanState *st, Datum key, bool keyisnull,
-				   int64 count)
-{
-	TupleHashEntry entry;
-	bool		isnew;
-	int64	   *slotcount;
-
-	ExecClearTuple(st->hashslot);
-	st->hashslot->tts_values[0] = key;
-	st->hashslot->tts_isnull[0] = keyisnull;
-	ExecStoreVirtualTuple(st->hashslot);
-
-	entry = LookupTupleHashEntry(st->hashtab, st->hashslot, &isnew, NULL);
-	slotcount = (int64 *) TupleHashEntryGetAdditional(st->hashtab, entry);
-	if (isnew)
-		*slotcount = count;
-	else
-		*slotcount += count;
-
-	/*
-	 * The entry (and the copy of the key inside it) lives in the table's own
-	 * context; everything the hash and equality functions allocated is in the
-	 * temp one and can go.
-	 */
-	ExecClearTuple(st->hashslot);
-	MemoryContextReset(st->hashtempcxt);
-}
-
-/*
- * Count every group of one relation into the hash table.
- */
-static void
-rbi_group_relation_into_hash(RBICountScanState *st)
+static TupleTableSlot *
+rbi_next_group(RBICountScanState *st, bool *exhausted)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
 
-	if (st->wheremissing)
-		return;
-
-	rbi_entry_scan_begin(&st->escan, st->groupidx);
-	st->scanning = true;
+	*exhausted = false;
 
 	for (;;)
 	{
@@ -2770,13 +2780,20 @@ rbi_group_relation_into_hash(RBICountScanState *st)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * The key of the group we returned last time lives in pergroup, and
+		 * the caller is done with it by now: a scan node's tuple is only
+		 * guaranteed until its next call.
+		 */
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
 		if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
 		{
 			MemoryContextSwitchTo(oldcxt);
-			break;
+			*exhausted = true;
+			return NULL;
 		}
 
 		count = rbi_count_sources(st->heap, estate->es_snapshot,
@@ -2789,30 +2806,24 @@ rbi_group_relation_into_hash(RBICountScanState *st)
 		if (count == 0)
 			continue;
 
-		/* The key still lives in pergroup; the hash table takes a copy. */
-		rbi_hash_add_group(st, key, keyisnull, count);
+		return rbi_emit_tuple(st, key, keyisnull, count);
 	}
-
-	rbi_entry_scan_end(&st->escan);
-	st->scanning = false;
 }
 
 /*
- * Walk one partition: open it, locate its clauses, hand it to one of the
- * three above, then let go of everything it owns (DESIGN.md §16).
+ * Walk one partition without a group key: open it, locate its clauses, count
+ * it, then let go of everything it owns (DESIGN.md §16).
  */
 static int64
-rbi_run_partition(RBICountScanState *st, int p, bool intohash)
+rbi_run_partition(RBICountScanState *st, int p)
 {
-	int64		count = 0;
+	int64		count;
 
 	rbi_open_relation(st, st->part[p].heapoid, st->part[p].groupidxoid,
 					  st->part[p].clauseidxoid);
 	rbi_locate_where(st);
 
-	if (intohash)
-		rbi_group_relation_into_hash(st);
-	else if (st->hasgroupidx)
+	if (st->hasgroupidx)
 	{
 		/* No group key of its own: the only driver left is a sum-over-all. */
 		Assert(st->sumall);
@@ -2828,44 +2839,74 @@ rbi_run_partition(RBICountScanState *st, int p, bool intohash)
 }
 
 /*
- * Return the next merged group, or NULL when the table has been drained.
+ * GROUP BY over a partitioned table: one PARTIAL aggregate per group per
+ * partition (DESIGN.md §16).
+ *
+ * The partitions are walked in the planner's order and each one is opened,
+ * iterated and closed in turn, its groups emitted as they are counted.  The
+ * node therefore holds no cross-partition state at all - no hash table, no
+ * per-node group memory beyond one partition's iteration state - and the
+ * Finalize HashAggregate core puts above it combines the partial counts,
+ * spilling to disk under hash_mem like any HashAggregate.  A group with rows
+ * in several partitions is emitted once per partition, and the §9 pin
+ * discipline is unchanged: a partition's posting sets are all released
+ * before its indexes are closed.
  */
 static TupleTableSlot *
-rbi_next_hash_group(RBICountScanState *st)
+rbi_next_partial_group(RBICountScanState *st)
 {
-	TupleHashEntry entry;
-
-	while ((entry = ScanTupleHashTable(st->hashtab, &st->hashiter)) != NULL)
+	for (;;)
 	{
-		int64	   *count = (int64 *) TupleHashEntryGetAdditional(st->hashtab,
-																 entry);
-		Datum		key;
-		bool		isnull;
+		if (!st->partopen)
+		{
+			if (st->curpart >= st->npart)
+			{
+				st->done = true;
+				return NULL;
+			}
 
-		if (*count <= 0)
-			continue;			/* only positive counts are ever inserted */
+			rbi_open_relation(st, st->part[st->curpart].heapoid,
+							  st->part[st->curpart].groupidxoid,
+							  st->part[st->curpart].clauseidxoid);
+			rbi_locate_where(st);
+			st->partopen = true;
 
-		/*
-		 * The minimal tuple belongs to the hash table's context, so the key
-		 * stays valid for as long as the node does.
-		 */
-		ExecClearTuple(st->hashoutslot);
-		ExecStoreMinimalTuple(TupleHashEntryGetTuple(entry), st->hashoutslot,
-							  false);
-		key = slot_getattr(st->hashoutslot, 1, &isnull);
+			/*
+			 * A positive clause with no entry in THIS partition selects
+			 * nothing here, whatever the others hold, so its entry scan is
+			 * skipped and no group of it is emitted.
+			 */
+			if (!st->wheremissing)
+			{
+				rbi_entry_scan_begin(&st->escan, st->groupidx);
+				st->scanning = true;
+			}
+		}
 
-		return rbi_emit_tuple(st, key, isnull, *count);
+		if (st->scanning)
+		{
+			bool		exhausted;
+			TupleTableSlot *slot = rbi_next_group(st, &exhausted);
+
+			if (!exhausted)
+				return slot;
+
+			rbi_entry_scan_end(&st->escan);
+			st->scanning = false;
+		}
+
+		/* This partition is done: release its sets, then close it. */
+		rbi_release_where(st);
+		rbi_close_relation(st);
+		st->partopen = false;
+		st->curpart++;
 	}
-
-	st->done = true;
-	return NULL;
 }
 
 /*
- * The partitioned form of the node (DESIGN.md §16).  Nothing comes out until
- * every partition has been counted: without GROUP BY because the one row is
- * the sum over all of them, with GROUP BY because a group may have rows in
- * any partition.
+ * The partitioned form of the node without a group key (DESIGN.md §16): the
+ * one row is the sum over every partition, so nothing comes out until the
+ * last of them has been counted.
  */
 static TupleTableSlot *
 rbi_exec_partitioned(RBICountScanState *st)
@@ -2874,19 +2915,10 @@ rbi_exec_partitioned(RBICountScanState *st)
 	int			p;
 
 	if (st->hasgroupidx && st->groupattno != 0)
-	{
-		if (!st->hashfilled)
-		{
-			for (p = 0; p < st->npart; p++)
-				(void) rbi_run_partition(st, p, true);
-			st->hashfilled = true;
-			InitTupleHashIterator(st->hashtab, &st->hashiter);
-		}
-		return rbi_next_hash_group(st);
-	}
+		return rbi_next_partial_group(st);
 
 	for (p = 0; p < st->npart; p++)
-		total += rbi_run_partition(st, p, false);
+		total += rbi_run_partition(st, p);
 
 	st->done = true;
 
@@ -2983,42 +3015,13 @@ rbi_exec_custom_scan(CustomScanState *node)
 	}
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
-	for (;;)
 	{
-		Datum		key;
+		bool		exhausted;
+		TupleTableSlot *slot = rbi_next_group(st, &exhausted);
 
-		CHECK_FOR_INTERRUPTS();
-
-		/*
-		 * The key of the group we returned last time lives in pergroup, and
-		 * the caller is done with it by now: a scan node's tuple is only
-		 * guaranteed until its next call.
-		 */
-		ExecClearTuple(node->ss.ss_ScanTupleSlot);
-		MemoryContextReset(st->pergroup);
-		oldcxt = MemoryContextSwitchTo(st->pergroup);
-
-		if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
-		{
-			MemoryContextSwitchTo(oldcxt);
+		if (exhausted)
 			st->done = true;
-			return NULL;
-		}
-
-		count = rbi_count_sources(st->heap, estate->es_snapshot,
-								  st->nclause + 1, st->sources, &st->stats);
-		{
-			bool		keyisnull = st->groupset.keyisnull;
-
-			rbi_posting_set_release(&st->groupset);
-			MemoryContextSwitchTo(oldcxt);
-
-			/* A group exists only if at least one of its rows is visible. */
-			if (count == 0)
-				continue;
-
-			return rbi_emit_tuple(st, key, keyisnull, count);
-		}
+		return slot;
 	}
 }
 
@@ -3056,15 +3059,8 @@ rbi_reset_run(RBICountScanState *st)
 	if (st->keycxt != NULL)
 		MemoryContextReset(st->keycxt);
 
-	if (st->hashtab != NULL)
-		ResetTupleHashTable(st->hashtab);
-	if (st->hashtempcxt != NULL)
-		MemoryContextReset(st->hashtempcxt);
-	if (st->hashslot != NULL)
-		ExecClearTuple(st->hashslot);
-	if (st->hashoutslot != NULL)
-		ExecClearTuple(st->hashoutslot);
-	st->hashfilled = false;
+	st->curpart = 0;
+	st->partopen = false;
 }
 
 static void
@@ -3087,18 +3083,6 @@ rbi_end_custom_scan(CustomScanState *node)
 	if (st->npart == 0)
 		rbi_close_relation(st);
 
-	if (st->hashslot != NULL)
-	{
-		ExecDropSingleTupleTableSlot(st->hashslot);
-		st->hashslot = NULL;
-	}
-	if (st->hashoutslot != NULL)
-	{
-		ExecDropSingleTupleTableSlot(st->hashoutslot);
-		st->hashoutslot = NULL;
-	}
-	st->hashtab = NULL;
-
 	if (st->pergroup != NULL)
 	{
 		MemoryContextDelete(st->pergroup);
@@ -3113,21 +3097,6 @@ rbi_end_custom_scan(CustomScanState *node)
 	{
 		MemoryContextDelete(st->keycxt);
 		st->keycxt = NULL;
-	}
-	if (st->hashmetacxt != NULL)
-	{
-		MemoryContextDelete(st->hashmetacxt);
-		st->hashmetacxt = NULL;
-	}
-	if (st->hashtuplescxt != NULL)
-	{
-		MemoryContextDelete(st->hashtuplescxt);
-		st->hashtuplescxt = NULL;
-	}
-	if (st->hashtempcxt != NULL)
-	{
-		MemoryContextDelete(st->hashtempcxt);
-		st->hashtempcxt = NULL;
 	}
 }
 

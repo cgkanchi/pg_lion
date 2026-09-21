@@ -416,3 +416,14 @@ DROP TABLE rbi_pdt;
 DROP FUNCTION rbi_pd(text);
 DROP FUNCTION rbi_pd_counters(text);
 DROP FUNCTION rbi_plans(text);
+-- enable_partitionwise_aggregate must not switch the pushdown off for a plain table
+CREATE TABLE rbi_pwa (k int NOT NULL);
+INSERT INTO rbi_pwa SELECT g % 10 FROM generate_series(1, 20000) g;
+CREATE INDEX rbi_pwa_k ON rbi_pwa USING roaring (k);
+SET synchronous_commit = on;
+VACUUM ANALYZE rbi_pwa;
+SET enable_partitionwise_aggregate = on;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_pwa WHERE k = 3;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM rbi_pwa GROUP BY k;
+RESET enable_partitionwise_aggregate;
+DROP TABLE rbi_pwa;
