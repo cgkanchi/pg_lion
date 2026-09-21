@@ -55,7 +55,9 @@
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/index.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -64,12 +66,14 @@
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -103,6 +107,7 @@ typedef struct RBICountCtx
 	Snapshot	snapshot;
 	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
 	bool		serializable;	/* IsolationIsSerializable() at start: take page predicate locks */
+	bool		in_recovery;	/* hot standby: the pin interlock does not hold, recheck everything */
 	int64		count;			/* members counted straight from the VM */
 	RBICountStats stats;
 
@@ -1625,10 +1630,15 @@ rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
 	 * visibilitymap_get_status and rbi_vm_allvisible_mask).
 	 */
 	members = rbi_container_block_mask(c);
-	allvis = rbi_vm_allvisible_mask(cx->heap, firstblk, &cx->vmbuf);
+	if (cx->in_recovery)
+		allvis = 0;				/* see rbi_count_sources(): no interlock on a standby */
+	else
+	{
+		allvis = rbi_vm_allvisible_mask(cx->heap, firstblk, &cx->vmbuf);
 #ifdef RBI_VM_MASK_CHECK
-	rbi_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
+		rbi_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
 #endif
+	}
 	dirty = members & ~allvis;
 
 	if (dirty == 0)
@@ -1971,6 +1981,16 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	/* SerializationNeededForRead() begins with exactly this test; hoisting it
 	 * lets non-serializable counts skip the per-block PredicateLockPage loop. */
 	cx.serializable = IsolationIsSerializable();
+	/*
+	 * On a hot standby the §9 interlock does not exist: WAL replay of our
+	 * generic records takes ordinary exclusive locks, not cleanup locks, so a
+	 * reader's pin does not stop ambulkdelete's records from being replayed,
+	 * and the heap records that follow can set all-visible while this backend
+	 * still holds a copy of the old containers.  Until the AM has its own
+	 * resource manager whose redo takes cleanup locks, a standby rechecks
+	 * every candidate TID in the heap and never trusts the visibility map.
+	 */
+	cx.in_recovery = RecoveryInProgress();
 	cx.tids_sorted = true;
 
 	cursors = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * nsources);
@@ -2423,6 +2443,39 @@ rbi_count_sql_open(FunctionCallInfo fcinfo, int nkeys, RBICountCall *call)
 					 errdetail("The index is on type %s.",
 							   format_type_be(index->rd_opcintype[0]))));
 	}
+
+	/*
+	 * Privileges: exactly what the equivalent query needs.  SELECT count(*)
+	 * FROM t WHERE col = key references only col, so SELECT on the table or
+	 * on every indexed column is required; with less than that the count
+	 * would let a caller probe values it is not allowed to read.
+	 */
+	if (pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+	{
+		for (i = 0; i < nkeys; i++)
+		{
+			AttrNumber	attnum = call->index[i]->rd_index->indkey.values[0];
+
+			if (pg_attribute_aclcheck(heapoid, attnum, GetUserId(),
+									  ACL_SELECT) != ACLCHECK_OK)
+				aclcheck_error(ACLCHECK_NO_PRIV,
+							   get_relkind_objtype(call->heap->rd_rel->relkind),
+							   RelationGetRelationName(call->heap));
+		}
+	}
+
+	/*
+	 * Row-level security: the policies would have to be evaluated per row,
+	 * and the whole point of this count is not to look at rows.  Refuse.
+	 * The same query through the planner still works: the pushdown declines
+	 * relations with security quals and the ordinary plan applies them.
+	 */
+	if (check_enable_rls(heapoid, InvalidOid, false) == RLS_ENABLED)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot count through index \"%s\" because row-level security is enabled on table \"%s\"",
+						RelationGetRelationName(call->index[0]),
+						RelationGetRelationName(call->heap))));
 }
 
 static void
@@ -2445,12 +2498,23 @@ rbi_count_sql(FunctionCallInfo fcinfo, int nkeys, RBICountStats *stats)
 	RBICountCall call;
 	Snapshot	snapshot;
 	int64		result;
+	int			i;
 
 	rbi_count_sql_open(fcinfo, nkeys, &call);
 
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
 		elog(ERROR, "roaring index count requires an active snapshot");
+
+	/*
+	 * index_beginscan() takes a relation-level predicate lock on an index
+	 * whose AM has no ampredlocks (indexam.c).  We read the index without a
+	 * scan, so take the same lock ourselves - before looking, so that an
+	 * absent key is covered too: otherwise two SERIALIZABLE transactions could
+	 * each count an absent key, insert it, and both commit.
+	 */
+	for (i = 0; i < nkeys; i++)
+		PredicateLockRelation(call.index[i], snapshot);
 
 	result = rbi_count_keys(call.heap, snapshot, nkeys, call.index,
 							call.key, call.keytype, stats);

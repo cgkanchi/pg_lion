@@ -69,6 +69,8 @@
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
+#include "storage/predicate.h"
+
 #include "rbi.h"
 #include "rbi_count.h"
 
@@ -393,12 +395,24 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
  */
 static IndexOptInfo *
 rbi_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
-				Oid cmptype, StrategyNumber strategy, Oid extractquery)
+				Oid cmptype, StrategyNumber strategy, Oid extractquery,
+				Oid exprcoll)
 {
 	bool		multikey = (kind == RBI_CLAUSE_MULTI);
 	IndexOptInfo *idx = rbi_find_roaring_index(rel, attno, multikey);
 
 	if (idx == NULL)
+		return NULL;
+
+	/*
+	 * The planner's own rule, IndexCollMatchesExprColl(): a collation-
+	 * sensitive clause may only use an index built under that collation.
+	 * The index hashed and compared its keys with its own collation and the
+	 * count never rechecks the predicate, so a mismatch (say a case-
+	 * insensitive index under a case-sensitive query) would count rows the
+	 * query does not select.
+	 */
+	if (OidIsValid(exprcoll) && idx->indexcollations[0] != exprcoll)
 		return NULL;
 
 	if (multikey)
@@ -599,11 +613,12 @@ typedef struct RBIClauseInfo
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
 	Oid			extractquery;	/* multi-key clauses only */
+	Oid			collation;		/* clause input collation; InvalidOid if the operator ignores it */
 } RBIClauseInfo;
 
 static bool
 rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
-					List *whereattnos, List *clauseinfos,
+					Oid drivecoll, List *whereattnos, List *clauseinfos,
 					List **targets)
 {
 	RangeTblEntry *rte;
@@ -660,7 +675,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 				cattnos = lappend_int(cattnos, (int) ca);
 			}
 
-			if (!rbi_collect_targets(root, child, cdrive, cattnos,
+			if (!rbi_collect_targets(root, child, cdrive, drivecoll, cattnos,
 									 clauseinfos, targets))
 				return false;
 		}
@@ -692,6 +707,10 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 		t->driveidx = rbi_find_roaring_index(rel, driveattno, false);
 		if (t->driveidx == NULL)
 			return false;
+		/* Grouping under one collation, index built under another: no. */
+		if (OidIsValid(drivecoll) &&
+			t->driveidx->indexcollations[0] != drivecoll)
+			return false;
 	}
 
 	forboth(l1, whereattnos, l2, clauseinfos)
@@ -699,7 +718,8 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 		RBIClauseInfo *ci = (RBIClauseInfo *) lfirst(l2);
 		IndexOptInfo *idx = rbi_match_index(rel, (AttrNumber) lfirst_int(l1),
 											ci->kind, ci->opno, ci->cmptype,
-											ci->strategy, ci->extractquery);
+											ci->strategy, ci->extractquery,
+											ci->collation);
 
 		if (idx == NULL)
 			return false;
@@ -1351,6 +1371,12 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		ci->cmptype = cmptype;
 		ci->strategy = strategy;
 		ci->extractquery = extractquery;
+		if (IsA(clause, OpExpr))
+			ci->collation = ((OpExpr *) clause)->inputcollid;
+		else if (IsA(clause, ScalarArrayOpExpr))
+			ci->collation = ((ScalarArrayOpExpr *) clause)->inputcollid;
+		else
+			ci->collation = InvalidOid;
 
 		whereattnos = lappend_int(whereattnos, (int) var->varattno);
 		clauseinfos = lappend(clauseinfos, ci);
@@ -1428,7 +1454,9 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * onto each partition through its AppendRelInfo before looking an index
 	 * up, because partitions may number their columns differently.
 	 */
-	if (!rbi_collect_targets(root, input_rel, driveattno, whereattnos,
+	if (!rbi_collect_targets(root, input_rel, driveattno,
+							 (groupvar != NULL) ? groupvar->varcollid : InvalidOid,
+							 whereattnos,
 							 clauseinfos, &targets))
 		return;
 	if (targets == NIL)
@@ -1744,6 +1772,22 @@ rbi_open_relation(RBICountScanState *st, Oid heapoid, Oid groupidxoid,
 
 	if (OidIsValid(groupidxoid))
 		st->groupidx = index_open(groupidxoid, AccessShareLock);
+
+	/*
+	 * index_beginscan() would take a relation-level predicate lock on each of
+	 * these (the AM has no ampredlocks); we read them without a scan, so take
+	 * it here, before any lookup, so that absent keys are covered as well.
+	 * Without it two SERIALIZABLE transactions could each count an absent
+	 * key, insert it, and both commit.
+	 */
+	{
+		Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
+
+		for (i = 0; i < st->nclause; i++)
+			PredicateLockRelation(st->clause[i].idx, snapshot);
+		if (st->groupidx != NULL)
+			PredicateLockRelation(st->groupidx, snapshot);
+	}
 }
 
 /*

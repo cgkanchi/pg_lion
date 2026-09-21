@@ -104,6 +104,11 @@ values are left to the ordinary plan, a multi-key index can never drive a `GROUP
 sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
 stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
 with an error and have to be rebuilt with REINDEX.
+On a hot standby the count paths recheck every candidate TID in the heap instead of trusting the
+visibility map (generic WAL replay does not take the cleanup locks the pin interlock relies on), so
+they stay correct there but are no longer O(1) per container. The SQL count functions require SELECT
+on the table or on the indexed columns and refuse tables where row-level security applies to the
+caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
 
 ## Index size after the v1 build policy (5M rows, 2026-09-20)
 

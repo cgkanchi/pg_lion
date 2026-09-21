@@ -350,6 +350,25 @@ Why this is safe (the argument reviewers will check — keep the code shaped lik
 - Serializable isolation: call `PredicateLockPage(heap, blk, snapshot)` for every heap block counted
   from the VM without a heap visit, exactly as heapam_indexscan.c does for index-only scans.
 
+Four rules added after the 2026-09-20 adversarial review (all implemented and regression-tested in
+test/sql/security.sql and test/isolation/count_serializable.spec):
+- **Privileges.** The SQL count functions require what the equivalent query requires: SELECT on the
+  table, or SELECT on every indexed column they touch; otherwise `permission denied`. The CustomScan
+  path is covered by the executor's own ExecCheckPermissions on the range table.
+- **Row-level security.** The SQL functions refuse a table on which RLS applies to the caller
+  (policies would have to be evaluated per row); the CustomScan declines relations with security
+  quals, so the ordinary plan applies the policies.
+- **SERIALIZABLE.** index_beginscan() takes a relation-level predicate lock on any index whose AM
+  has no ampredlocks; the count reads indexes without a scan, so it takes PredicateLockRelation on
+  every index it opens, before any lookup, so that absent keys are covered. Without it two
+  serializable transactions could each count an absent key, insert it, and both commit.
+- **Hot standby.** The pin interlock relies on ambulkdelete taking cleanup locks; WAL replay of
+  generic records takes only exclusive locks, so on a standby a reader's pin does not stop replay
+  from removing TIDs and the following heap records from setting all-visible. In recovery the count
+  therefore treats every heap block as not all-visible and rechecks every candidate TID (still
+  correct, no longer O(1) per container). Lifting this needs a custom resource manager whose redo
+  takes cleanup locks on container and bucket pages, the way btree_xlog_vacuum does.
+
 Algorithm `rbi_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
    entries copy the payload while holding the pin; for CHAIN entries note head).
@@ -401,6 +420,10 @@ Planner integration
     (Param nodes) may be supported later; v0 = Const only. §15 adds `Var = ANY (Const array)` and
     §14 the two null tests to the shapes accepted here; an `IS NOT NULL` clause is exempt from the
     one-clause-per-column rule, because it constrains no value.
+  - Collations follow the planner's IndexCollMatchesExprColl() rule: a collation-sensitive clause
+    (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
+    indexcollations[0] equals that collation, because the index hashed and compared keys under its
+    own collation and the count never rechecks the predicate. Checked per partition.
   - GROUP BY is empty, or exactly one plain Var of the rel with a roaring index. The grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.

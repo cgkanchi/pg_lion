@@ -1,0 +1,50 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_func s2_func s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_func: SELECT roaring_index_count('ser_k', 99);
+roaring_index_count
+-------------------
+                  0
+(1 row)
+
+step s2_func: SELECT roaring_index_count('ser_k', 99);
+roaring_index_count
+-------------------
+                  0
+(1 row)
+
+step s1_insert: INSERT INTO ser VALUES (99);
+step s2_insert: INSERT INTO ser VALUES (99);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_plan s1_push s2_push s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT count(*) FROM ser WHERE k = 99;
+QUERY PLAN                       
+---------------------------------
+Custom Scan (RoaringCount)       
+  Roaring Indexes: ser_k (k = 99)
+(2 rows)
+
+step s1_push: SELECT count(*) FROM ser WHERE k = 99;
+count
+-----
+    0
+(1 row)
+
+step s2_push: SELECT count(*) FROM ser WHERE k = 99;
+count
+-----
+    0
+(1 row)
+
+step s1_insert: INSERT INTO ser VALUES (99);
+step s2_insert: INSERT INTO ser VALUES (99);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
