@@ -126,19 +126,21 @@ bitset per page leaves half of each page empty, so dense random keys cost more t
 high-cardinality keys cost 2-3x GIN because every member becomes its own container. Clustered keys
 are 10x smaller than GIN and 60x smaller than btree.
 
-| column | btree | GIN | roaring, 15-bit containers | roaring, 14-bit (experiment) |
+| column | btree | GIN | roaring, first format | roaring, current format (sparse segments, inline 4096, byte-sized buckets) |
 |---|---|---|---|---|
-| c2 | 132 MB | 21 MB | 56 MB | 38 MB |
+| c2 | 132 MB | 21 MB | 56 MB | 56 MB |
 | c10 | 132 MB | 23 MB | 41 MB | 41 MB |
-| c200 | 132 MB | 39 MB | 51 MB | 60 MB |
-| c20k | 138 MB | 157 MB | 475 MB | 477 MB |
-| c1m | 152 MB | 199 MB | 337 MB (all INLINE entries) | 337 MB |
-| c200_clustered | 132 MB | 23 MB | 2.1 MB | 2.1 MB |
-| c_skew | 133 MB | 26 MB | 41 MB | 48 MB |
+| c200 | 132 MB | 39 MB | 51 MB | 51 MB |
+| c20k | 138 MB | 157 MB | 475 MB | 209 MB |
+| c1m | 152 MB | 199 MB | 337 MB | 240 MB |
+| c200_clustered | 132 MB | 23 MB | 2.1 MB | 2.7 MB |
+| c_skew | 133 MB | 26 MB | 41 MB | 30 MB |
 
-Build time per roaring index: 16-17 s (btree 4-10 s, GIN 4-21 s). The 14-bit variant helps only the
-2-valued column and hurts mid-cardinality keys, so 15 bits stays; the real fixes are better bitset page
-packing and a sparse posting representation for keys with few members per container.
+Build time per roaring index: 11-19 s (btree 4-10 s, GIN 4-21 s). A 14-bit container experiment
+helped only the 2-valued column (56 to 38 MB) and hurt mid-cardinality keys by 18%, so 15 bits stays.
+What remains of the gap on c20k is that each key's 6 KB posting set exceeds the inline limit and owns
+a whole container page (20,000 pages, 95 MB of them empty); sharing container pages between keys is
+the next size item.
 
 Bitmap-scan path (amgetbitmap, count pushdown disabled), pgbench average ms:
 
@@ -162,14 +164,14 @@ the ~120 pages of this table that are not all-visible), pgbench average ms, same
 
 | query | seqscan / hashagg | btree index-only | RoaringCount | speedup vs btree |
 |---|---|---|---|---|
-| count(*) where c2 = 1 (10M rows) | ~2000 | 539 | **2.6** | 200x |
-| count(*) where c200 = 17 (100k) | | 5.4 | **0.35** | 15x |
+| count(*) where c2 = 1 (10M rows) | ~2000 | 604 | **2.6** | 230x |
+| count(*) where c200 = 17 (100k) | | 5.7 | **0.38** | 15x |
 | count(*) where c200_clustered = 17 | | 5.2 | **0.11** | 45x |
 | count(*) where c20k = 123 (1k) | | 0.17 | 0.15 | 1x |
 | count(*) where c1m = 12345 (20) | | 0.12 | 0.12 | 1x |
-| count(*) where c10 = 3 and c200 = 17 and c2 = 1 | | 84 (BitmapAnd) | **4.9** | 17x |
-| c200, count(*) group by c200 | 2354 | 1337 | **50** | 27x (47x vs seqscan) |
-| c2, count(*) group by c2 | 1989 | 1347 | **5.3** | 250x |
+| count(*) where c10 = 3 and c200 = 17 and c2 = 1 | | 85 (BitmapAnd) | **4.9** | 17x |
+| c200, count(*) group by c200 | 2473 | 1409 | **56** | 25x (44x vs seqscan) |
+| c2, count(*) group by c2 | 2038 | 1407 | **5.6** | 250x |
 
 These are the numbers the 2022 demo hinted at, now produced by a transactionally correct index: the
 count honours the caller's snapshot, rechecks TIDs on non-all-visible pages in the heap, and holds
@@ -182,8 +184,8 @@ keys (parity with btree, 2-3x the space of GIN), range predicates (unsupported),
 few pages are all-visible (the recheck path is 1.8x faster than a seqscan at best and the cost model
 falls back to the seqscan when `relallvisible` says so).
 
-Raw logs: `results/06b_bits15_*` (bitmap phases, 15-bit), `results/07_bits14_*` (14-bit experiment),
-`results/08_vmmask_*` (final run with the per-container visibility-map read).
+Raw logs: `bench/logs/09_final_*` (this run, current format), `bench/logs/08_vmmask_*` (the run that
+introduced the per-container visibility-map read); earlier runs survive only as tables here.
 
 ---
 

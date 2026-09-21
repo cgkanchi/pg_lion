@@ -501,10 +501,11 @@ internally, so do not call it while holding a lock on any page of that chain.
 
 ## 12. Measured on 20M rows (2026-09-20) and v1 priorities
 
-Measured (optimized build, see README): count pushdown 2.6 ms for a 10M-row key, 50 ms for a 200-group
-GROUP BY, 4.9 ms for a 3-index AND; bitmap-scan paths heap-bound at parity with btree/GIN; index build
-16-17 s per column; inserts ~4x btree cost. Sizes: clustered keys 10x smaller than GIN, dense random
-keys 1.3-2.7x GIN, sparse high-cardinality keys 2-3x GIN.
+Measured (optimized build, see README; final run with sparse segments, inline_limit 4096 and byte-sized
+buckets): count pushdown 2.6 ms for a 10M-row key, 56 ms for a 200-group GROUP BY, 4.9 ms for a 3-index
+AND; bitmap-scan paths heap-bound at parity with btree/GIN; index build 11-19 s per column; inserts ~4x
+btree cost. Sizes on 20M rows: clustered keys 9x smaller than GIN, dense random keys 1.3-2.7x GIN,
+sparse high-cardinality keys 1.2-1.3x GIN (c20k 209 MB vs 157, c1m 240 MB vs 199).
 
 v1 priorities, in order of measured impact:
 1. DONE (§13): sparse posting representation for keys with few members per container.
