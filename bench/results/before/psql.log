@@ -1,0 +1,12 @@
+NOTICE:  extension "pg_lion" already exists, skipping
+NOTICE:  extension "pg_walinspect" already exists, skipping
+NOTICE:  table "fact" does not exist, skipping
+NOTICE:  table "fact" does not exist, skipping
+NOTICE:  table "fact" does not exist, skipping
+WARNING:  lion index "fact_k_idx" has outgrown its bucket directory
+DETAIL:  One bucket chain is 5 pages long; the index was built with 847 buckets, which is what a lookup of a key has to walk.
+HINT:  REINDEX the index: the bucket count is chosen at build time from the entries that exist then, and this index was built smaller (often on an empty table).
+WARNING:  lion index "fact_k_idx" has outgrown its bucket directory
+DETAIL:  One bucket chain is 5 pages long; the index was built with 847 buckets, which is what a lookup of a key has to walk.
+HINT:  REINDEX the index: the bucket count is chosen at build time from the entries that exist then, and this index was built smaller (often on an empty table).
+NOTICE:  table "fact" does not exist, skipping

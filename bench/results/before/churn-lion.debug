@@ -1,0 +1,10 @@
+DEBUG:  lion vacuum "fact_k_idx": total 1229.6 ms (cleanup-lock wait 0.3, filter 0.0, apply 0.0, inline 1220.7); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_h_idx": total 3.9 ms (cleanup-lock wait 0.0, filter 3.7, apply 0.1, inline 0.0); pages 34 visited / 18 changed, 18 records, items 2 rewritten / 16 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_k_idx": total 1252.1 ms (cleanup-lock wait 0.3, filter 0.0, apply 0.0, inline 1239.4); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_h_idx": total 2.9 ms (cleanup-lock wait 0.0, filter 2.7, apply 0.1, inline 0.0); pages 50 visited / 18 changed, 18 records, items 4 rewritten / 14 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_k_idx": total 1184.6 ms (cleanup-lock wait 0.4, filter 0.0, apply 0.0, inline 1168.5); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_h_idx": total 3.9 ms (cleanup-lock wait 0.0, filter 3.6, apply 0.1, inline 0.0); pages 64 visited / 20 changed, 20 records, items 4 rewritten / 16 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_k_idx": total 1110.7 ms (cleanup-lock wait 0.4, filter 0.0, apply 0.0, inline 1092.1); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_h_idx": total 2.9 ms (cleanup-lock wait 0.0, filter 2.6, apply 0.1, inline 0.0); pages 80 visited / 18 changed, 18 records, items 4 rewritten / 14 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_k_idx": total 1335.3 ms (cleanup-lock wait 0.5, filter 0.0, apply 0.0, inline 1312.1); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "fact_h_idx": total 4.1 ms (cleanup-lock wait 0.0, filter 3.9, apply 0.1, inline 0.0); pages 94 visited / 20 changed, 20 records, items 4 rewritten / 16 deleted, 0 regrown

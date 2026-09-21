@@ -297,7 +297,8 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT null_tids int8,
 									OUT empty_tids int8,
 									OUT slack_bytes int8,
-									OUT max_bucket_pages int8)
+									OUT max_bucket_pages int8,
+									OUT deleted_pages int8)
 RETURNS record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;

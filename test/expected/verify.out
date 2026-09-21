@@ -10,10 +10,10 @@ SELECT setseed(0.42);
 
 -- What the functions look like.
 \df lion_index_stats
-                                                                                                                                                                                                                                                            List of functions
- Schema |       Name       | Result data type |                                                                                                                                                                                                                                Argument data types                                                                                                                                                                                                                                | Type 
---------+------------------+------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------
- public | lion_index_stats | record           | idx regclass, OUT nbuckets integer, OUT bucket_pages bigint, OUT entries bigint, OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint, OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint, OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint, OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint, OUT empty_tids bigint, OUT slack_bytes bigint, OUT max_bucket_pages bigint | func
+                                                                                                                                                                                                                                                                         List of functions
+ Schema |       Name       | Result data type |                                                                                                                                                                                                                                             Argument data types                                                                                                                                                                                                                                             | Type 
+--------+------------------+------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------
+ public | lion_index_stats | record           | idx regclass, OUT nbuckets integer, OUT bucket_pages bigint, OUT entries bigint, OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint, OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint, OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint, OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint, OUT empty_tids bigint, OUT slack_bytes bigint, OUT max_bucket_pages bigint, OUT deleted_pages bigint | func
 (1 row)
 
 \df lion_index_verify
@@ -32,9 +32,9 @@ CREATE TABLE lion_vfy_empty (k int4);
 CREATE INDEX lion_vfy_empty_k ON lion_vfy_empty USING lion (k)
 	WITH (buckets = 4);
 SELECT * FROM lion_index_stats('lion_vfy_empty_k');
- nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | max_bucket_pages 
-----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+------------------
-        4 |            4 |       0 |              0 |               0 |          0 |                0 |                 0 |              0 |     0 |               0 |      32592 |               0 |              0 |         0 |          0 |           0 |                1
+ nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | max_bucket_pages | deleted_pages 
+----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+------------------+---------------
+        4 |            4 |       0 |              0 |               0 |          0 |                0 |                 0 |              0 |     0 |               0 |      32560 |               0 |              0 |         0 |          0 |           0 |                1 |             0
 (1 row)
 
 SELECT lion_index_verify('lion_vfy_empty_k');
@@ -264,7 +264,7 @@ SELECT lion_index_verify('lion_vfy_u', true);
 SELECT entries, ntids FROM lion_index_stats('lion_vfy_k');
  entries | ntids  
 ---------+--------
-     998 | 120000
+     997 | 120000
 (1 row)
 
 /*

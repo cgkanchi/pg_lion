@@ -26,6 +26,7 @@
 
 #include "access/relscan.h"
 #include "executor/instrument_node.h"
+#include "utils/injection_point.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -201,9 +202,11 @@ lionendscan(IndexScanDesc scan)
  * while a container page is pinned, and this function pins them.
  */
 static int64
-lion_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
+lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
+			   bool recheck)
 {
 	PGAlignedBlock *copy;
+	BlockNumber blkno = head;
 	int64		ntids = 0;
 
 	if (!BlockNumberIsValid(blkno))
@@ -218,18 +221,24 @@ lion_emit_chain(Relation index, BlockNumber blkno, TIDBitmap *tbm, bool recheck)
 		Page		cpage = (Page) copy->data;
 		OffsetNumber maxoff;
 		OffsetNumber off;
+		bool		owned;
 
 		buf = ReadBuffer(index, blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (!LionPageIsContainer(page))
-		{
-			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index: block %u is not a container page",
-				 blkno);
-		}
-		memcpy(cpage, page, BLCKSZ);
+		owned = lion_page_owns_entry(page, hash, head);
+		if (owned)
+			memcpy(cpage, page, BLCKSZ);
 		UnlockReleaseBuffer(buf);
+
+		/*
+		 * DESIGN.md §18: a page that no longer claims this chain means the
+		 * chain was freed after the entry was copied out, which can only
+		 * happen once its posting set held nothing visible to anyone.  The
+		 * scan stops there; outside verify() this is never an error.
+		 */
+		if (!owned)
+			break;
 
 		blkno = LionPageGetOpaque(cpage)->rightlink;
 
@@ -267,6 +276,7 @@ lion_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
 	char	   *payload = NULL;
 	Size		paylen = 0;
 	BlockNumber blkno = InvalidBlockNumber;
+	uint32		hash = entry->hash;
 	int64		ntids;
 
 	if (entry->flags & LION_ENTRY_INLINE)
@@ -295,7 +305,19 @@ lion_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
 		return ntids;
 	}
 
-	return lion_emit_chain(index, blkno, tbm, recheck);
+	/*
+	 * Test hook: the entry has been copied and its bucket page released, so
+	 * all this scan holds of the posting set is a head block - no pin, no
+	 * lock, nothing that stops a VACUUM from deleting the entry and freeing
+	 * the chain, or an insert from taking those pages back.  What keeps the
+	 * walk below correct is the owner check in each page's special area
+	 * (DESIGN.md §18); test/isolation/vacuum_chain_reuse.spec parks a reader
+	 * here and does exactly that to it.  Compiles to nothing without
+	 * --enable-injection-points.
+	 */
+	INJECTION_POINT("lion-scan-chain-entered", NULL);
+
+	return lion_emit_chain(index, hash, blkno, tbm, recheck);
 }
 
 /*
@@ -509,7 +531,8 @@ lion_emit_all_keys(Relation index, LionState *state, TIDBitmap *tbm,
 																   ItemIdGetLength(iid)),
 											 tbm, recheck);
 				else
-					ntids += lion_emit_chain(index, entry->head, tbm, recheck);
+					ntids += lion_emit_chain(index, entry->hash, entry->head,
+											tbm, recheck);
 
 				CHECK_FOR_INTERRUPTS();
 			}

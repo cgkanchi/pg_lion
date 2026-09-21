@@ -75,10 +75,15 @@ SELECT (SELECT ntids FROM lion_index_stats('lion_vac_k')) =
 	   (SELECT reltuples::int8 FROM pg_class WHERE relname = 'lion_vac_k')
 	   AS reltuples_matches_ntids;
 
--- Whole keys: the entries stay (the key remains known) but hold no TIDs.
+-- Whole keys: the entries whose posting sets are now empty are DELETED
+-- (DESIGN.md §18), so the index forgets those keys entirely.
+CREATE TEMP TABLE lion_vac_keys AS
+	SELECT entries FROM lion_index_stats('lion_vac_k');
 DELETE FROM lion_vac WHERE k IN (3, 4);
 VACUUM lion_vac;
 SELECT entries, ntids FROM lion_index_stats('lion_vac_k');
+SELECT (SELECT entries FROM lion_vac_keys) -
+	   (SELECT entries FROM lion_index_stats('lion_vac_k')) AS entries_deleted;
 SELECT lion_index_verify('lion_vac_k', true);
 SELECT lion_cmp('lion_vac', 'k = 3');
 SELECT lion_cmp('lion_vac', 'k = 5');
@@ -218,7 +223,7 @@ SELECT (SELECT sparse_segments FROM lion_index_stats('lion_vacsp_k')) <
 	   (SELECT sparse_members FROM lion_vacsp_before) AS fewer_members;
 SELECT sparse_members = ntids AS still_all_pairs,
 	   ntids = (SELECT count(*) FROM lion_vacsp) AS ntids_matches_heap,
-	   entries AS entries_are_kept
+	   entries AS entries_left
   FROM lion_index_stats('lion_vacsp_k');
 /*
  * d keeps its containers even where they are now down to a handful of
@@ -234,7 +239,8 @@ SELECT lion_cmp('lion_vacsp', 'k = 7919');	-- the row of i = 1, deleted
 SELECT lion_cmp('lion_vacsp', 'd = 8');		-- d = 8 is i % 40 = 8, i. e. i % 4 = 0
 SELECT lion_cmp('lion_vacsp', 'd = 7');		-- d = 7 needs an odd i: all gone
 
--- Delete the rest: every segment goes away, the entries stay.
+-- Delete the rest: every segment goes away and so does every entry
+-- (DESIGN.md §18); an index that indexes nothing holds no entries at all.
 DELETE FROM lion_vacsp;
 VACUUM lion_vacsp;
 SELECT entries > 0 AS entries_are_kept, containers, sparse_segments,
@@ -254,4 +260,130 @@ SELECT lion_index_verify('lion_vacsp_k', true);
 SELECT lion_index_verify('lion_vacsp_d', true);
 SELECT lion_cmp('lion_vacsp', 'd = 7');
 
-DROP TABLE lion_vac, lion_vacrun, lion_vacsp;
+/* ---------------------------------------------------------------------
+ * DESIGN.md §18: entry deletion, whole-chain free and page reuse.
+ * --------------------------------------------------------------------- */
+
+/*
+ * A key whose rows all go away loses its entry, and the container pages its
+ * chain owned become DELETED pages in the free space map.  A later spill
+ * takes them back, so the relation does not grow.
+ */
+CREATE TABLE lion_free (i int4, k int4);
+CREATE INDEX lion_free_k ON lion_free USING lion (k) WITH (inline_limit = 64);
+INSERT INTO lion_free SELECT i, i % 4 FROM generate_series(1, 200000) i;
+VACUUM lion_free;
+CREATE TEMP TABLE lion_free_before AS
+	SELECT entries, container_pages, deleted_pages,
+		   (SELECT relpages FROM pg_class WHERE relname = 'lion_free_k') AS relpages
+	  FROM lion_index_stats('lion_free_k');
+SELECT entries, container_pages > 0 AS has_chains, deleted_pages
+  FROM lion_index_stats('lion_free_k');
+
+-- Two of the four keys vanish entirely.
+DELETE FROM lion_free WHERE k IN (0, 1);
+VACUUM lion_free;
+SELECT entries,
+	   deleted_pages > 0 AS pages_were_freed,
+	   container_pages < (SELECT container_pages FROM lion_free_before)
+		   AS fewer_live_container_pages
+  FROM lion_index_stats('lion_free_k');
+SELECT lion_index_verify('lion_free_k', true);
+SELECT lion_cmp('lion_free', 'k = 0');
+SELECT lion_cmp('lion_free', 'k = 2');
+
+/*
+ * The freed pages come back: two new keys with as many rows as the freed ones
+ * had spill into them, so the free space map hands out what it holds and the
+ * relation grows by less than the pages it gave back (it cannot be exactly
+ * zero: a chain's HEAD page is the one page that is never recycled, so that
+ * owner_head stays a chain identity a reader can trust).
+ */
+CREATE TEMP TABLE lion_free_size AS
+	SELECT pg_relation_size('lion_free_k') AS bytes,
+		   (SELECT deleted_pages FROM lion_index_stats('lion_free_k')) AS freed;
+INSERT INTO lion_free SELECT i, 4 + (i % 2) FROM generate_series(200001, 300000) i;
+SELECT entries,
+	   (SELECT deleted_pages FROM lion_index_stats('lion_free_k')) <
+	   (SELECT freed FROM lion_free_size) AS freed_pages_were_reused,
+	   pg_relation_size('lion_free_k') - (SELECT bytes FROM lion_free_size) <
+	   (SELECT freed FROM lion_free_size) * current_setting('block_size')::bigint
+		   AS grew_less_than_it_freed
+  FROM lion_index_stats('lion_free_k');
+SELECT lion_index_verify('lion_free_k', true);
+SELECT lion_cmp('lion_free', 'k = 4');
+SELECT lion_cmp('lion_free', 'k = 2');
+
+-- A REINDEX of the same data holds the same keys and the same TIDs, and has
+-- no freed pages at all.
+CREATE TEMP TABLE lion_free_reix AS
+	SELECT entries, ntids FROM lion_index_stats('lion_free_k');
+REINDEX INDEX lion_free_k;
+SELECT (SELECT entries FROM lion_index_stats('lion_free_k')) =
+	   (SELECT entries FROM lion_free_reix) AS same_entries,
+	   (SELECT ntids FROM lion_index_stats('lion_free_k')) =
+	   (SELECT ntids FROM lion_free_reix) AS same_ntids,
+	   (SELECT deleted_pages FROM lion_index_stats('lion_free_k')) AS deleted_after_reindex;
+SELECT lion_index_verify('lion_free_k', true);
+
+/*
+ * The reserved NULL and EMPTY entries (DESIGN.md §14, §17) are deleted like
+ * any other and recreated on demand.
+ */
+CREATE TABLE lion_vnull (i int4, k int4, a text[]);
+CREATE INDEX lion_vnull_k ON lion_vnull USING lion (k);
+CREATE INDEX lion_vnull_a ON lion_vnull USING lion (a);
+INSERT INTO lion_vnull
+SELECT i, CASE WHEN i % 3 = 0 THEN NULL ELSE i % 5 END,
+		  CASE WHEN i % 7 = 0 THEN ARRAY[]::text[] ELSE ARRAY['t' || (i % 11)] END
+  FROM generate_series(1, 5000) i;
+SELECT null_tids > 0 AS has_null_entry FROM lion_index_stats('lion_vnull_k');
+SELECT empty_tids > 0 AS has_empty_entry FROM lion_index_stats('lion_vnull_a');
+
+DELETE FROM lion_vnull WHERE k IS NULL;
+DELETE FROM lion_vnull WHERE a = ARRAY[]::text[];
+VACUUM lion_vnull;
+SELECT null_tids, (SELECT count(*) FROM lion_vnull WHERE k IS NULL) AS heap_nulls
+  FROM lion_index_stats('lion_vnull_k');
+SELECT empty_tids FROM lion_index_stats('lion_vnull_a');
+SELECT lion_index_verify('lion_vnull_k', true);
+SELECT lion_index_verify('lion_vnull_a', true);
+SELECT lion_cmp('lion_vnull', 'k IS NULL');
+
+-- ... and the next row of each kind recreates them.
+INSERT INTO lion_vnull VALUES (90001, NULL, ARRAY[]::text[]);
+SELECT null_tids FROM lion_index_stats('lion_vnull_k');
+SELECT empty_tids FROM lion_index_stats('lion_vnull_a');
+SELECT lion_index_verify('lion_vnull_k', true);
+SELECT lion_index_verify('lion_vnull_a', true);
+SELECT lion_cmp('lion_vnull', 'k IS NULL');
+
+/*
+ * Slack bounds (DESIGN.md §4 and §18).  A filtered item keeps the bytes the
+ * page allotted it, so the index reports slack after a VACUUM that removed a
+ * few members from every container - and verify() accepts exactly as much as
+ * the bound allows, so a passing verify() IS the assertion that it is
+ * bounded.
+ */
+CREATE TABLE lion_slackv (i int4, k int4);
+CREATE INDEX lion_slackv_k ON lion_slackv USING lion (k);
+INSERT INTO lion_slackv SELECT i, i % 8 FROM generate_series(1, 200000) i;
+VACUUM lion_slackv;
+SELECT slack_bytes AS slack_after_build FROM lion_index_stats('lion_slackv_k');
+DELETE FROM lion_slackv WHERE i % 50 = 0;
+VACUUM lion_slackv;
+SELECT slack_bytes > 0 AS vacuum_left_slack,
+	   slack_bytes < container_bytes AS slack_is_a_minority
+  FROM lion_index_stats('lion_slackv_k');
+SELECT lion_index_verify('lion_slackv_k', true);
+SELECT lion_cmp('lion_slackv', 'k = 3');
+
+-- The slack is reusable: new rows go into it without the index growing.
+CREATE TEMP TABLE lion_slackv_size AS
+	SELECT pg_relation_size('lion_slackv_k') AS bytes;
+INSERT INTO lion_slackv SELECT i, i % 8 FROM generate_series(200001, 202000) i;
+SELECT pg_relation_size('lion_slackv_k') <= (SELECT bytes FROM lion_slackv_size)
+	   AS grew_into_the_slack;
+SELECT lion_index_verify('lion_slackv_k', true);
+
+DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv;

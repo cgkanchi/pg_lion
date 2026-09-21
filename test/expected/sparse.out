@@ -516,7 +516,7 @@ SELECT sparse_members = ntids AS still_all_sparse,
   FROM lion_index_stats('sp_hi_k');
  still_all_sparse | ntids_matches_heap | entries_are_kept 
 ------------------+--------------------+------------------
- t                | t                  |           120000
+ t                | t                  |            40000
 (1 row)
 
 SELECT lion_index_verify('sp_hi_k', true);
@@ -585,7 +585,7 @@ SELECT entries, containers, sparse_segments, ntids
   FROM lion_index_stats('sp_thr_k');
  entries | containers | sparse_segments | ntids 
 ---------+------------+-----------------+-------
-       1 |          0 |               0 |     0
+       0 |          0 |               0 |     0
 (1 row)
 
 SELECT lion_index_verify('sp_thr_k', true);

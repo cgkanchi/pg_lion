@@ -1,0 +1,1 @@
+../vacuum_entry_delete.spec

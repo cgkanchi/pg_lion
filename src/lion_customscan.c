@@ -17,6 +17,14 @@
  * the index's NULL entry from the result, and when it is the only clause the
  * node sums the counts of every entry of that index instead.
  *
+ * A top-level `OR` of such clauses (DESIGN.md §19) is one source as well: its
+ * arms are positive clauses, or ANDs of them, on columns of the same relation
+ * with usable indexes of their own, and the source is the UNION of the arms.
+ * Its leaves are ordinary members of the clause array - so that an index is
+ * matched for each of them per partition, a Param among them reaches
+ * custom_exprs, and the cost model prices every lookup - and the OR structure
+ * over them travels separately, in LION_PRIV_ORS.
+ *
  * The node is planted at UPPERREL_GROUP_AGG by create_upper_paths_hook, so
  * it replaces the whole Agg-over-scan subtree rather than part of it.  Its
  * scan.scanrelid is 0 (it is an upper node with no scan relation of its own)
@@ -93,12 +101,21 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 
 /* Kinds of column in custom_scan_tlist. */
 #define LION_TL_GROUPKEY		0
-#define LION_TL_COUNT		1
-#define LION_TL_COUNT_GROUPCOL	2	/* count(group column): 0 for the NULL
+#define LION_TL_GROUPKEY2	1	/* the second GROUP BY column (DESIGN.md §20) */
+#define LION_TL_COUNT		2
+#define LION_TL_COUNT_GROUPCOL	3	/* count(group column): 0 for the NULL
 									 * group, the count otherwise (§14) */
-#define LION_TL_COUNT_ZERO	3	/* count(col) where a clause pins col to NULL */
+#define LION_TL_COUNT_GROUPCOL2	4	/* the same for the second group column */
+#define LION_TL_COUNT_ZERO	5	/* count(col) where a clause pins col to NULL */
 /* LION_TL_WHEREKEY + i: the key stored in the i'th clause's entry */
-#define LION_TL_WHEREKEY		4
+#define LION_TL_WHEREKEY		6
+
+/*
+ * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
+ * driven by that index's entry scan; two are the nested loop of
+ * lion_next_group2(), whose cost is the product of the two entry counts.
+ */
+#define LION_MAX_GROUPCOLS	2
 
 /*
  * Kinds of WHERE clause the pushdown understands.  EQ, ARRAY and NULL select
@@ -148,14 +165,16 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		plan across an upgrade, a hand-built node) is then an error and not a
  *		list silently read at the wrong offsets.  Bump LION_PRIV_MAGIC whenever
  *		the meaning of a member changes without its position doing so.
- *	1	OidList: heap Oid, group index Oid (InvalidOid if none), then one
- *		Oid per WHERE clause, in the same order as the other lists.  For a
- *		partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
+ *	1	OidList: heap Oid, the outer and inner group index Oids (InvalidOid if
+ *		none; the inner one only for a two-column GROUP BY, DESIGN.md §20),
+ *		then one Oid per WHERE clause, in the same order as the other lists.
+ *		For a partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
  *		column names against it) and every index Oid is InvalidOid: the real
  *		ones are per partition, in LION_PRIV_PARTS.
- *	2	IntList: base RT index, group attnum (0 if none), the LION_FLAG_* bits,
- *		then one attnum per WHERE clause.  Attnums are the PARENT's
- *		throughout; each partition's own numbering lives in its index Oids.
+ *	2	IntList: base RT index, the outer and inner group attnums (0 if none),
+ *		the LION_FLAG_* bits, then one attnum per WHERE clause.  Attnums are
+ *		the PARENT's throughout; each partition's own numbering lives in its
+ *		index Oids.
  *	3	List of Expr, one per WHERE clause: the compared value, the array of
  *		an IN list, or a NULL Const placeholder for a null test.  It is a
  *		Const for a literal query and a Param - or an ArrayExpr over Consts
@@ -166,11 +185,16 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		without which a changed exec Param would not rescan the node
  *	4	IntList: LION_CLAUSE_* for each WHERE clause
  *	5	List of OidList, one per live leaf partition and empty for a plain
- *		table (DESIGN.md §16): heap Oid, group index Oid (InvalidOid if
- *		none), then one index Oid per WHERE clause
+ *		table (DESIGN.md §16): heap Oid, the outer and inner group index Oids
+ *		(InvalidOid if none), then one index Oid per WHERE clause
  *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
  *		test), which is what EXPLAIN prints a multi-key clause with
- *	7	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	7	List of IntList, one per OR restriction (DESIGN.md §19):
+ *		{first clause index, number of arms, then the number of leaves in
+ *		each arm}.  Its leaves are the clauses [first, first + sum) of the
+ *		lists above, contiguous and in arm order; they are not sources of
+ *		their own and pin no value the target list may print
+ *	8	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -180,7 +204,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_CLAUSEKINDS 4
 #define LION_PRIV_PARTS		5
 #define LION_PRIV_CLAUSEOPS	6
-#define LION_PRIV_TLKINDS	7
+#define LION_PRIV_ORS		7
+#define LION_PRIV_TLKINDS	8
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -188,9 +213,11 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * merge needed (DESIGN.md §16: the node emits partial aggregates now).  Shape
  * 3 moved the clause values out of member 3 and into custom_exprs, so that a
  * Param among them reaches setrefs.c and SS_finalize_plan() (DESIGN.md §10).
+ * Shape 4 added the OR structure of DESIGN.md §19, and shape 5 the second
+ * GROUP BY column of DESIGN.md §20.
  */
-#define LION_PRIV_MAGIC		0x52424903
-#define LION_PRIV_NMEMBERS	8
+#define LION_PRIV_MAGIC		0x52424905
+#define LION_PRIV_NMEMBERS	9
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -233,6 +260,30 @@ typedef struct LionClauseState
 } LionClauseState;
 
 /*
+ * One OR restriction (DESIGN.md §19), as a structure over the flattened
+ * clause array: clauses [first, first + nleaves) are its leaves, grouped into
+ * narms arms of armlen[] leaves each, in arm order.  An arm of more than one
+ * leaf is their AND; the source is the OR of the arms.
+ */
+typedef struct LionOrState
+{
+	int			first;
+	int			nleaves;
+	int			narms;
+	int		   *armlen;
+} LionOrState;
+
+/*
+ * One input of the merge, after slot 0 (the group).  A plain clause is one
+ * item; an OR restriction is one item over several clauses (DESIGN.md §19).
+ */
+typedef struct LionSourceItem
+{
+	int			clauseno;		/* the clause, or the OR's first leaf */
+	int			orno;			/* -1, or the OR this item stands for */
+} LionSourceItem;
+
+/*
  * One relation the executor counts: a plain table, or one live leaf
  * partition (DESIGN.md §16).  The index Oids are that relation's own.
  */
@@ -240,6 +291,7 @@ typedef struct LionPartState
 {
 	Oid			heapoid;
 	Oid			groupidxoid;	/* InvalidOid when no index drives the scan */
+	Oid			groupidxoid2;	/* the inner one of a two-column GROUP BY */
 	Oid		   *clauseidxoid;	/* one per WHERE clause */
 } LionPartState;
 
@@ -251,7 +303,9 @@ typedef struct LionCountScanState
 	Oid			heapoid;
 	Index		scanrelid;
 	Oid			groupidxoid;
+	Oid			groupidxoid2;	/* the inner index of a two-column GROUP BY */
 	AttrNumber	groupattno;
+	AttrNumber	groupattno2;
 	bool		singlegroup;	/* GROUP BY over constant columns only */
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
@@ -261,6 +315,17 @@ typedef struct LionCountScanState
 	LionClauseState *clause;
 	int			ntlist;
 	int		   *tlkind;
+
+	/*
+	 * The OR restrictions (DESIGN.md §19) and the sources they and the plain
+	 * clauses make up.  item[k] describes source slot k + 1; a clause that is
+	 * an OR leaf has no source of its own, which is what inor[] says.
+	 */
+	int			nor;
+	LionOrState *ors;
+	bool	   *inor;			/* one per clause */
+	int			nitem;
+	LionSourceItem *item;
 
 	/*
 	 * The relations to count.  npart is 0 for a plain table, whose heap and
@@ -275,22 +340,47 @@ typedef struct LionCountScanState
 	/* runtime: the relation currently being counted */
 	Relation	heap;
 	Relation	groupidx;
+	Relation	groupidx2;
 
 	/*
 	 * The inputs of the count: slot 0 is the group (or the driving index of
-	 * a sumall), slots 1 .. nclause the WHERE clauses.  The clause sources
+	 * a sumall), slots 1 .. nitem the WHERE items - one per plain clause and
+	 * one per OR restriction (DESIGN.md §19) - and, for a two-column GROUP BY
+	 * (DESIGN.md §20), slot nitem + 1 is the inner group.  The clause sources
 	 * are located once per node execution and keep their pins (DESIGN.md
-	 * section 9) until the node is reset or closed; the group's set is
-	 * located, counted and released one group at a time.
+	 * section 9) until the node is reset or closed; the groups' sets are
+	 * located, counted and released one group (one pair) at a time.
 	 */
 	LionCountSource *sources;
+	int			nsource;		/* nitem + 1, or nitem + 2 with two group cols */
 	LionPostingSet groupset;
+	LionPostingSet groupset2;
 	bool		located;
 	bool		valsdone;		/* the clause values have been evaluated */
 	bool		wheremissing;	/* a positive clause selects nothing at all */
 	bool		scanning;
 	bool		done;
 	LionEntryScan escan;
+
+	/*
+	 * The nested loop of a two-column GROUP BY (DESIGN.md §20).  The outer
+	 * index's entries drive the scan exactly as a single group column's do;
+	 * the inner index's KEYS are read once per relation into innercxt and
+	 * each pair's inner posting set is located afresh, because a located set
+	 * holds a buffer pin and there must be no pin per distinct inner value
+	 * (DESIGN.md §9).  When the keys do not fit the work_mem budget innerkey
+	 * is NULL and the inner index's entry scan is walked once per outer group
+	 * instead, which needs no memory at all.
+	 */
+	Datum	   *innerkey;
+	bool	   *innerisnull;
+	int			ninnerkey;
+	int			inneridx;		/* next inner key of the current outer group */
+	bool		outeropen;		/* groupset holds the current outer group */
+	Datum		outerkey;
+	bool		outerisnull;
+	LionEntryScan escan2;		/* the innerkey == NULL fallback */
+	bool		scanning2;
 
 	/*
 	 * GROUP BY over a partitioned table (DESIGN.md §16): the partitions are
@@ -304,6 +394,8 @@ typedef struct LionCountScanState
 	bool		partopen;
 
 	MemoryContext pergroup;		/* reset before each group is counted */
+	MemoryContext outercxt;		/* §20: the outer group's set and key */
+	MemoryContext innercxt;		/* §20: the inner index's cached keys */
 	MemoryContext wherecxt;		/* the located WHERE payload copies */
 	MemoryContext keycxt;		/* the clause keys a target list may print */
 	MemoryContext valcxt;		/* the evaluated Param values */
@@ -705,12 +797,18 @@ typedef struct LionCountTarget
 {
 	RelOptInfo *rel;			/* for the per-relation cost */
 	Oid			heapoid;
-	IndexOptInfo *driveidx;		/* the index whose entries are scanned, or NULL */
+	IndexOptInfo *driveidx[LION_MAX_GROUPCOLS];	/* the indexes whose entries
+												 * are scanned; [0] is the
+												 * outer one, [1] the inner
+												 * one of a two-column GROUP
+												 * BY (DESIGN.md §20) */
 	List	   *whereidx;		/* IndexOptInfo *, one per WHERE clause */
-	Var		   *drivevar;		/* the driving column in THIS relation's own
-								 * numbering, which is what a per-relation
-								 * estimate_num_groups() needs; NULL when
-								 * nothing drives the scan */
+	Var		   *drivevar[LION_MAX_GROUPCOLS];	/* the driving columns in THIS
+												 * relation's own numbering,
+												 * which is what a per-relation
+												 * estimate_num_groups() needs;
+												 * NULL when nothing drives the
+												 * scan */
 } LionCountTarget;
 
 /*
@@ -813,13 +911,14 @@ typedef struct LionDriveInfo
 
 static bool
 lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
-					const LionDriveInfo *drive, List *whereattnos,
+					const LionDriveInfo *drive, int ndrive, List *whereattnos,
 					List *clauseinfos, List **targets)
 {
 	RangeTblEntry *rte;
 	LionCountTarget *t;
 	ListCell   *l1;
 	ListCell   *l2;
+	int			d;
 
 	/* Sub-partitioning nests, exactly as expand_partitioned_rtentry() does. */
 	check_stack_depth();
@@ -846,7 +945,7 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		for (i = 0; i < rel->nparts; i++)
 		{
 			RelOptInfo *child = rel->part_rels[i];
-			LionDriveInfo cdrive = *drive;
+			LionDriveInfo cdrive[LION_MAX_GROUPCOLS];
 			List	   *cattnos = NIL;
 
 			if (child == NULL || !bms_is_member(i, rel->live_parts))
@@ -854,12 +953,16 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 			if (IS_DUMMY_REL(child))
 				continue;		/* provably empty: it counts nothing */
 
-			if (drive->attno != 0)
+			for (d = 0; d < ndrive; d++)
 			{
-				cdrive.var = lion_child_var(root, child->relid, drive->attno);
-				if (cdrive.var == NULL)
+				cdrive[d] = drive[d];
+				if (drive[d].attno == 0)
+					continue;
+				cdrive[d].var = lion_child_var(root, child->relid,
+											  drive[d].attno);
+				if (cdrive[d].var == NULL)
 					return false;
-				cdrive.attno = cdrive.var->varattno;
+				cdrive[d].attno = cdrive[d].var->varattno;
 			}
 			foreach(l1, whereattnos)
 			{
@@ -871,7 +974,7 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 				cattnos = lappend_int(cattnos, (int) ca);
 			}
 
-			if (!lion_collect_targets(root, child, &cdrive, cattnos,
+			if (!lion_collect_targets(root, child, cdrive, ndrive, cattnos,
 									 clauseinfos, targets))
 				return false;
 		}
@@ -892,21 +995,24 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	t = (LionCountTarget *) palloc0(sizeof(LionCountTarget));
 	t->rel = rel;
 	t->heapoid = rte->relid;
-	t->drivevar = drive->var;
 
 	/*
-	 * The driving index - a GROUP BY column's, or the one DESIGN.md §14 sums
-	 * over - must be a scalar one: its entries have to be the column's
-	 * values, one per row.
+	 * The driving indexes - a GROUP BY column's (two of them for the nested
+	 * loop of DESIGN.md §20), or the one DESIGN.md §14 sums over - must be
+	 * scalar ones: their entries have to be the column's values, one per row.
 	 */
-	if (drive->attno != 0)
+	for (d = 0; d < ndrive; d++)
 	{
-		t->driveidx = lion_find_roaring_index(rel, drive->attno, false);
-		if (t->driveidx == NULL)
+		t->drivevar[d] = drive[d].var;
+		if (drive[d].attno == 0)
+			continue;
+
+		t->driveidx[d] = lion_find_roaring_index(rel, drive[d].attno, false);
+		if (t->driveidx[d] == NULL)
 			return false;
 		/* Grouping under one collation, index built under another: no. */
-		if (OidIsValid(drive->collation) &&
-			t->driveidx->indexcollations[0] != drive->collation)
+		if (OidIsValid(drive[d].collation) &&
+			t->driveidx[d]->indexcollations[0] != drive[d].collation)
 			return false;
 
 		/*
@@ -923,15 +1029,15 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		 * column's entries (a real group is count(*), the NULL group is 0),
 		 * because they are only reached through a grouping index.
 		 */
-		if (OidIsValid(drive->eqop) &&
-			lion_index_equality_op(t->driveidx) != drive->eqop)
+		if (OidIsValid(drive[d].eqop) &&
+			lion_index_equality_op(t->driveidx[d]) != drive[d].eqop)
 			return false;
 
 		/*
 		 * Printing the group key means printing a key this index stored, so
 		 * it has to be a representation the rows really have (finding 4).
 		 */
-		if (drive->valueout && !lion_index_can_emit_value(t->driveidx))
+		if (drive[d].valueout && !lion_index_can_emit_value(t->driveidx[d]))
 			return false;
 	}
 
@@ -974,12 +1080,13 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
  */
 static bool
 lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
-				 AttrNumber groupattno, const List *nonnullattnos,
-				 const List *nullattnos)
+				 const AttrNumber *groupattno, int ngroup,
+				 const List *nonnullattnos, const List *nullattnos)
 {
 	TargetEntry *tle;
 	Node	   *arg;
 	Var		   *var;
+	int			i;
 
 	if (agg->aggfnoid != F_COUNT_ && agg->aggfnoid != F_COUNT_ANY)
 		return false;
@@ -1008,8 +1115,11 @@ lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
 			var->varlevelsup != 0)
 		return false;
 
-	if (groupattno == var->varattno)
-		return true;
+	for (i = 0; i < ngroup; i++)
+	{
+		if (groupattno[i] == var->varattno)
+			return true;
+	}
 	if (list_member_int((List *) nullattnos, (int) var->varattno))
 		return true;
 	if (list_member_int((List *) nonnullattnos, (int) var->varattno))
@@ -1128,8 +1238,10 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
-				   IndexOptInfo *groupidx,
-				   List *whereidx, List *whereclauses, double numgroups)
+				   IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
+				   List *whereidx, List *whereclauses, List *wherekinds,
+				   List *ors, double numgroups,
+				   double outer_entries, double inner_entries)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -1142,18 +1254,39 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
 	double		recheck_pages;
+	double	   *clausesel;		/* each clause's own selectivity, for §19 */
+	int			nclause = list_length(whereclauses);
+	int			ci = 0;
+	Cost		pair_cost = 0;	/* §20: the (outer, inner) group pairs */
 	Cost		run;
 	ListCell   *lc1;
 	ListCell   *lc2;
+	ListCell   *lc3;
 
-	forboth(lc1, whereidx, lc2, whereclauses)
+	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+
+	forthree(lc1, whereidx, lc2, whereclauses, lc3, wherekinds)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
-		Selectivity sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
-		double		nbuckets = Max(lion_index_bucket_pages(idx), 1.0);
+		Selectivity sel;
+		double		nbuckets;
 		double		container_pages;
 		double		nkeys = 1.0;
+
+		if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
+		{
+			/*
+			 * `IS NOT NULL` selects no rows of its own; it has been left out
+			 * of this estimate since before partitions existed.
+			 */
+			ci++;
+			continue;
+		}
+
+		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		clausesel[ci++] = sel;
+		nbuckets = Max(lion_index_bucket_pages(idx), 1.0);
 
 		container_pages = (double) idx->pages - 1.0 - nbuckets;
 		container_pages = Max(container_pages, 0.0);
@@ -1190,11 +1323,80 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			merge_ops += tuples * sel * log2(nkeys);
 	}
 
+	/*
+	 * An OR across columns (DESIGN.md §19) is the union of its arms, and a
+	 * union of k sub-cursors costs what §15's IN list does: log2(k)
+	 * comparisons per member, over the members of all of them together.  The
+	 * lookups and the chains of its leaves have already been charged above,
+	 * one per leaf, exactly as if they had been separate clauses; the term
+	 * here is the merge they take part in and nothing else.
+	 */
+	foreach(lc1, ors)
+	{
+		List	   *one = (List *) lfirst(lc1);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		double		members = 0;
+		int			nleaves = 0;
+		int			i;
+
+		for (i = 0; i < narms; i++)
+			nleaves += list_nth_int(one, 2 + i);
+		for (i = first; i < first + nleaves && i < nclause; i++)
+			members += tuples * clausesel[i];
+
+		if (nleaves > 1)
+			merge_ops += members * log2((double) nleaves);
+	}
+	pfree(clausesel);
+
 	if (groupidx != NULL)
 	{
 		seq_pages += Max(1.0, (double) groupidx->pages);
 		ncontainers += numgroups *
 			lion_containers_for(heap_pages, matching / Max(numgroups, 1.0));
+	}
+
+	/*
+	 * A second GROUP BY column (DESIGN.md §20) is a nested loop over the two
+	 * indexes' entries: the outer index's entries drive the scan and the
+	 * inner index is read ONCE - its keys are kept in memory - but every
+	 * (outer, inner) PAIR costs a lookup of the inner posting set and an
+	 * attempt at the intersection, whether or not that comes out empty.
+	 * Three terms, and the second is the one that decides:
+	 *
+	 *	- one cpu_tuple_cost per pair, for the lookup and the per-pair
+	 *	  bookkeeping;
+	 *	- the INTERSECTION itself.  ANDing two containers costs about the
+	 *	  members of the smaller of them, so one pair costs about
+	 *	  Min(rows/outer_entries, rows/inner_entries) member steps, and summed
+	 *	  over all outer_entries x inner_entries pairs that is exactly
+	 *	  `Min(outer_entries, inner_entries) x rows` - independent of which of
+	 *	  the two drives the scan, which is why the choice of outer is about
+	 *	  the entry scans and the memory and not about this;
+	 *	- and the container bookkeeping of both sides at every pair, which is
+	 *	  what makes a pair of WIDELY SPREAD groups expensive even when their
+	 *	  intersection is empty: two groups whose rows are scattered over the
+	 *	  whole heap have a container at nearly every container key, so the
+	 *	  merge steps through all of them.
+	 *
+	 * Measured on 200k rows of a 100-byte-wide table, uncorrelated columns
+	 * (2026-09-21, assert build): 20 x 2 groups is 5.6 ms against the
+	 * sequential aggregate's 37.3 ms and is chosen; 200 x 20 is 60.7 ms
+	 * against 36.8 ms and must NOT be, which the member term above is what
+	 * says; 20000 x 200 is four million pairs and is refused by a wide
+	 * margin.
+	 */
+	if (groupidx2 != NULL)
+	{
+		double		oe = Max(outer_entries, 1.0);
+		double		ie = Max(inner_entries, 1.0);
+
+		seq_pages += Max(1.0, (double) groupidx2->pages);
+		pair_cost = Max(oe * ie, numgroups) * cpu_tuple_cost;
+		merge_ops += Min(oe, ie) * tuples;
+		ncontainers += oe * ie * (lion_containers_for(heap_pages, tuples / oe) +
+								  lion_containers_for(heap_pages, tuples / ie));
 	}
 	ncontainers = Max(ncontainers, 1.0);
 
@@ -1236,6 +1438,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 											  heap_pages);
 	run += recheck_tids * cpu_tuple_cost;
 	run += numgroups * cpu_tuple_cost;
+	run += pair_cost;
 
 	return run;
 }
@@ -1244,12 +1447,15 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
  * Sum the per-relation costs over every relation the node will count and put
  * the result on the path.  The WHERE clauses that do not select rows
  * (`IS NOT NULL`, DESIGN.md §14) are left out of the per-relation estimate,
- * as they were before partitions existed.
+ * as they were before partitions existed - by lion_cost_count_rel() itself
+ * rather than by filtering the lists here, because the OR structure of
+ * DESIGN.md §19 names its leaves by their position in them.
  */
 static void
 lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
-					List *whereclauses, List *wherekinds, double numgroups,
-					double outrows)
+					List *whereclauses, List *wherekinds, List *ors,
+					double numgroups, double outer_entries,
+					double inner_entries, double outrows)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -1257,25 +1463,11 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	foreach(lc, targets)
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
-		List	   *costidx = NIL;
-		List	   *costclauses = NIL;
-		ListCell   *l1;
-		ListCell   *l2;
-		ListCell   *l3;
 
-		forthree(l1, t->whereidx, l2, whereclauses, l3, wherekinds)
-		{
-			if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(l3)))
-				continue;
-			costidx = lappend(costidx, lfirst(l1));
-			costclauses = lappend(costclauses, lfirst(l2));
-		}
-
-		run += lion_cost_count_rel(root, t->rel, t->driveidx, costidx,
-								  costclauses, numgroups);
-
-		list_free(costidx);
-		list_free(costclauses);
+		run += lion_cost_count_rel(root, t->rel, t->driveidx[0],
+								  t->driveidx[1], t->whereidx,
+								  whereclauses, wherekinds, ors, numgroups,
+								  outer_entries, inner_entries);
 	}
 
 	cpath->path.rows = outrows;
@@ -1369,6 +1561,294 @@ lion_array_const_nelems(Const *con)
 }
 
 /*
+ * One WHERE clause as the analysis below understands it: which column it
+ * constrains, with what, and everything lion_match_index() will need in order
+ * to find an index for it on each relation.
+ */
+typedef struct LionLeafInfo
+{
+	Var		   *var;
+	Node	   *val;			/* the value expression, or a NULL placeholder */
+	Oid			opno;			/* 0 for a null test */
+	Oid			cmptype;		/* the type the column is compared with */
+	StrategyNumber strategy;	/* multi-key clauses only */
+	Oid			extractquery;	/* multi-key clauses only */
+	Oid			collation;		/* clause input collation, or none */
+	int			kind;			/* LION_CLAUSE_* */
+} LionLeafInfo;
+
+/*
+ * Is this clause one the posting sets can answer, and on a plain column of
+ * rti?  Fills *out and returns true, or returns false and leaves the caller
+ * to decline the whole query.
+ *
+ * allow_negated says whether `col IS NOT NULL` - the one clause kind that
+ * subtracts rather than selects (DESIGN.md §14) - is acceptable here.  Under
+ * an OR it is not: the union of the arms would have to be the union of one
+ * arm's complement with the others', and the complement of a posting set is
+ * not a posting set (DESIGN.md §19).
+ */
+static bool
+lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
+				 LionLeafInfo *out)
+{
+	memset(out, 0, sizeof(LionLeafInfo));
+	out->opno = InvalidOid;
+	out->cmptype = InvalidOid;
+	out->extractquery = InvalidOid;
+	out->collation = InvalidOid;
+
+	if (clause == NULL)
+		return false;
+
+	if (IsA(clause, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) clause;
+		Node	   *left;
+		Node	   *right;
+		Oid			opfamily;
+		Oid			lefttype;
+
+		if (list_length(op->args) != 2)
+			return false;
+		if (!op_strict(op->opno))
+			return false;
+
+		left = lion_strip((Node *) linitial(op->args));
+		right = lion_strip((Node *) lsecond(op->args));
+		if (left == NULL || right == NULL)
+			return false;
+
+		out->strategy = lion_op_roaring_strategy(op->opno, &opfamily, &lefttype);
+
+		if (out->strategy == LION_STRAT_EQUAL)
+		{
+			/* Equality commutes, so either side may hold the column. */
+			if (IsA(left, Var) && lion_is_value_expr(right, false))
+			{
+				out->var = (Var *) left;
+				out->val = right;
+			}
+			else if (lion_is_value_expr(left, false) && IsA(right, Var))
+			{
+				out->var = (Var *) right;
+				out->val = left;
+			}
+			else
+				return false;
+
+			/*
+			 * A literal NULL equals nothing.  A parameter that turns out to be
+			 * NULL is the same answer, but only the executor can see it, so it
+			 * selects no rows there instead.
+			 */
+			if (IsA(out->val, Const) && ((Const *) out->val)->constisnull)
+				return false;
+
+			out->opno = op->opno;
+			out->cmptype = exprType(out->val);
+			out->kind = LION_CLAUSE_EQ;
+		}
+		else if (out->strategy == LION_STRAT_CONTAINS ||
+				 out->strategy == LION_STRAT_OVERLAP ||
+				 out->strategy == LION_STRAT_MATCH)
+		{
+			/*
+			 * A multi-key operator (DESIGN.md §17).  Unlike equality it does
+			 * not commute - `'{a}' @> tags` is a containment the other way
+			 * round, which is strategy 4 and not pushed down - so the column
+			 * has to be the left operand.
+			 *
+			 * The QUERY, not just its value, decides whether the posting sets
+			 * can answer this clause at all, so it has to be available now: a
+			 * Param is refused here even though one is accepted for equality
+			 * (DESIGN.md §17).  `tags @> $1` with `$1 = '{}'` extracts to ALL
+			 * mode, which this node cannot answer - it has no way to recheck
+			 * the operator against the heap - and by then there would be no
+			 * plan left to fall back to.
+			 */
+			if (!IsA(left, Var) || !IsA(right, Const))
+				return false;
+			out->var = (Var *) left;
+			out->val = right;
+			if (((Const *) out->val)->constisnull)
+				return false;
+
+			/*
+			 * Only an EXACT query is pushed down.  `tags @> '{}'`, `<@`, a
+			 * tsquery with NOT/phrase/prefix/weights and anything with a NULL
+			 * element all want every row rechecked in the heap, which is what
+			 * the ordinary plan does anyway.
+			 */
+			if (!lion_multikey_query_is_exact(opfamily, lefttype, out->strategy,
+											 (Const *) out->val,
+											 &out->extractquery))
+				return false;
+
+			out->opno = op->opno;
+			out->cmptype = InvalidOid;	/* the query is not a key */
+			out->kind = LION_CLAUSE_MULTI;
+		}
+		else
+			return false;		/* strategy 4 (`<@`), or not ours at all */
+
+		out->collation = op->inputcollid;
+	}
+	else if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+		Node	   *left;
+		Node	   *right;
+		Oid			opfamily;
+		Oid			lefttype;
+		int			nelems;
+
+		/* `= ALL (...)` is not a union of keys (DESIGN.md §15). */
+		if (!saop->useOr)
+			return false;
+		if (list_length(saop->args) != 2)
+			return false;
+		if (!op_strict(saop->opno))
+			return false;
+
+		left = lion_strip((Node *) linitial(saop->args));
+		right = lion_strip((Node *) lsecond(saop->args));
+		if (left == NULL || right == NULL)
+			return false;
+		if (!IsA(left, Var) || !lion_is_value_expr(right, true))
+			return false;
+		out->var = (Var *) left;
+		out->val = right;
+
+		/*
+		 * The length cap of DESIGN.md §15 applies to the lists whose length is
+		 * known now: a literal array and the ARRAY[...] a generic plan keeps
+		 * for `k IN ($1, $2)`.  A parameter that IS an array has no length
+		 * until the executor has it, and by then there is no plan to decline
+		 * in favour of, so it is answered whatever its length.
+		 */
+		if (IsA(out->val, Const))
+		{
+			if (((Const *) out->val)->constisnull)
+				return false;
+			nelems = lion_array_const_nelems((Const *) out->val);
+			if (nelems < 0 || nelems > LION_MAX_ARRAY_ELEMS)
+				return false;
+		}
+		else if (IsA(out->val, ArrayExpr))
+		{
+			nelems = list_length(((ArrayExpr *) out->val)->elements);
+			if (nelems > LION_MAX_ARRAY_ELEMS)
+				return false;
+		}
+
+		/*
+		 * `col op ANY (array)` is a union of single-key lookups, so the
+		 * operator has to be equality; `tags @> ANY (...)` would be a union of
+		 * multi-key queries, which nothing here builds.
+		 */
+		if (lion_op_roaring_strategy(saop->opno, &opfamily,
+									&lefttype) != LION_STRAT_EQUAL)
+			return false;
+
+		out->opno = saop->opno;
+		out->cmptype = get_element_type(exprType(out->val));
+		if (!OidIsValid(out->cmptype))
+			return false;
+		out->kind = LION_CLAUSE_ARRAY;
+		out->collation = saop->inputcollid;
+	}
+	else if (IsA(clause, NullTest))
+	{
+		NullTest   *nt = (NullTest *) clause;
+		Node	   *arg;
+
+		if (nt->argisrow)
+			return false;
+		if (nt->nulltesttype != IS_NULL && !allow_negated)
+			return false;
+		arg = lion_strip((Node *) nt->arg);
+		if (arg == NULL || !IsA(arg, Var))
+			return false;
+		out->var = (Var *) arg;
+
+		out->kind = (nt->nulltesttype == IS_NULL) ?
+			LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
+		/* The executor needs no value; keep the lists in step. */
+		out->val = (Node *) makeNullConst(out->var->vartype,
+										  out->var->vartypmod,
+										  out->var->varcollid);
+	}
+	else
+		return false;
+
+	if (out->var->varno != (int) rti || out->var->varattno <= 0 ||
+		out->var->varlevelsup != 0)
+		return false;
+
+	return true;
+}
+
+/*
+ * Append one analysed clause to the parallel lists the planner carries.  The
+ * flattened clause array holds the leaves of an OR restriction alongside the
+ * plain clauses (DESIGN.md §19), so everything that follows - matching an
+ * index per relation, pricing the lookup, moving a Param into custom_exprs -
+ * treats them alike; inor says which are which.
+ */
+static void
+lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
+				  List **whereattnos, List **clauseinfos, List **whereclauses,
+				  List **whereconsts, List **wherekinds, List **whereopnos,
+				  List **whereinor)
+{
+	LionClauseInfo *ci = (LionClauseInfo *) palloc0(sizeof(LionClauseInfo));
+
+	ci->attno = leaf->var->varattno;
+	ci->kind = leaf->kind;
+	ci->opno = leaf->opno;
+	ci->cmptype = leaf->cmptype;
+	ci->strategy = leaf->strategy;
+	ci->extractquery = leaf->extractquery;
+	ci->collation = leaf->collation;
+
+	*whereattnos = lappend_int(*whereattnos, (int) leaf->var->varattno);
+	*clauseinfos = lappend(*clauseinfos, ci);
+	*whereclauses = lappend(*whereclauses, clause);
+	*whereconsts = lappend(*whereconsts, leaf->val);
+	*wherekinds = lappend_int(*wherekinds, leaf->kind);
+	*whereopnos = lappend_oid(*whereopnos, leaf->opno);
+	*whereinor = lappend_int(*whereinor, inor ? 1 : 0);
+}
+
+/*
+ * Which clauses are leaves of an OR restriction (DESIGN.md §19)?  Decoded
+ * from LION_PRIV_ORS, whose lists name a contiguous run of clauses each.
+ */
+static bool *
+lion_or_leaf_map(List *ors, int nclause)
+{
+	bool	   *map = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	ListCell   *lc;
+
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			nleaves = 0;
+		int			i;
+
+		for (i = 0; i < narms; i++)
+			nleaves += list_nth_int(one, 2 + i);
+		for (i = first; i < first + nleaves && i < nclause; i++)
+			map[i] = true;
+	}
+
+	return map;
+}
+
+/*
  * The partially-grouped PathTarget a partitioned GROUP BY node produces
  * (DESIGN.md §16): the grouping column(s) unchanged, plus every aggregate
  * marked as the INITIAL phase of a split aggregate.  For count(*) and
@@ -1456,16 +1936,20 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	Query	   *parse = root->parse;
 	RangeTblEntry *rte;
 	Index		rti;
-	Var		   *groupvar = NULL;
-	AttrNumber	groupattno = 0;
+	Var		   *groupvar[LION_MAX_GROUPCOLS] = {NULL, NULL};
+	AttrNumber	groupattno[LION_MAX_GROUPCOLS] = {0, 0};
+	Oid			groupeqop[LION_MAX_GROUPCOLS] = {InvalidOid, InvalidOid};
+	bool		groupvalueout[LION_MAX_GROUPCOLS] = {false, false};
+	double		groupest[LION_MAX_GROUPCOLS] = {1.0, 1.0};
+	int			ngroup = 0;
+	int			g;
 	AttrNumber	driveattno = 0; /* column whose index drives the entry scan */
-	Oid			groupeqop = InvalidOid;
 	bool		singlegroup = false;
 	bool		sumall = false;
 	bool		partitioned = false;
-	bool		groupvalueout = false;	/* the output prints the group key */
 	List	   *valueattnos = NIL;	/* pinned columns the output prints */
-	LionDriveInfo drive;
+	LionDriveInfo drive[LION_MAX_GROUPCOLS];
+	int			ndrive = 0;
 	PathTarget *partialtarget = NULL;	/* set for a partitioned GROUP BY */
 	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
 	List	   *clauseinfos = NIL;	/* LionClauseInfo, one per clause */
@@ -1474,6 +1958,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 									 * or a NULL placeholder for a null test */
 	List	   *wherekinds = NIL;	/* LION_CLAUSE_* */
 	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
+	List	   *whereinor = NIL;	/* 1 when the clause is a leaf of an OR */
+	List	   *ors = NIL;		/* one IntList per OR restriction (§19) */
 	List	   *posattnos = NIL;	/* columns with a positive clause */
 	List	   *eqattnos = NIL;		/* columns pinned to one value */
 	List	   *nonnullattnos = NIL;	/* columns a clause proves non-null */
@@ -1559,8 +2045,14 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			return;
 	}
 
-	/* ---- GROUP BY: nothing, or one indexed column ---- */
-	if (list_length(root->processed_groupClause) > 1)
+	/*
+	 * ---- GROUP BY: nothing, one indexed column, or two (DESIGN.md §20) ----
+	 *
+	 * Two columns are a nested loop over the two indexes' entries, so every
+	 * rule below is made per column: its own index, its own collation, its
+	 * own grouping equality, its own value-representation gate.
+	 */
+	if (list_length(root->processed_groupClause) > LION_MAX_GROUPCOLS)
 		return;
 
 	if (root->processed_groupClause == NIL)
@@ -1575,52 +2067,65 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 	else
 	{
-		SortGroupClause *sgc;
-		TargetEntry *tle;
-		Node	   *expr;
+		foreach(lc, root->processed_groupClause)
+		{
+			SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+			TargetEntry *tle = get_sortgroupclause_tle(sgc,
+													   root->processed_tlist);
+			Node	   *expr;
+			int			i;
 
-		sgc = (SortGroupClause *) linitial(root->processed_groupClause);
-		tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
-		if (tle == NULL)
-			return;
-		expr = lion_strip((Node *) tle->expr);
-		if (expr == NULL || !IsA(expr, Var))
-			return;
-		groupvar = (Var *) expr;
-		if (groupvar->varno != (int) rti || groupvar->varattno <= 0 ||
-			groupvar->varlevelsup != 0)
-			return;
+			if (tle == NULL)
+				return;
+			expr = lion_strip((Node *) tle->expr);
+			if (expr == NULL || !IsA(expr, Var))
+				return;
+			groupvar[ngroup] = (Var *) expr;
+			if (groupvar[ngroup]->varno != (int) rti ||
+				groupvar[ngroup]->varattno <= 0 ||
+				groupvar[ngroup]->varlevelsup != 0)
+				return;
 
-		/*
-		 * A nullable group column is fine now: NULL keys have an entry of
-		 * their own, so the NULL group is produced like any other
-		 * (DESIGN.md §14).
-		 */
-		groupattno = groupvar->varattno;
+			/*
+			 * A nullable group column is fine now: NULL keys have an entry of
+			 * their own, so the NULL group is produced like any other
+			 * (DESIGN.md §14).
+			 */
+			groupattno[ngroup] = groupvar[ngroup]->varattno;
 
-		/*
-		 * The equality the planner chose for this column is what the index
-		 * that drives the scan has to implement, whether there is one
-		 * relation or many (lion_collect_targets(), finding 3 of the
-		 * 2026-09-20 review), so a grouping clause without one is of no use
-		 * here.
-		 */
-		groupeqop = sgc->eqop;
-		if (!OidIsValid(groupeqop))
-			return;
+			/* The same column twice is not a grouping this node can drive. */
+			for (i = 0; i < ngroup; i++)
+			{
+				if (groupattno[i] == groupattno[ngroup])
+					return;
+			}
 
-		/*
-		 * A partitioned GROUP BY emits one PARTIAL aggregate per group per
-		 * partition and lets core's Finalize HashAggregate combine them
-		 * (DESIGN.md §16), so the column has to be hashable and the planner
-		 * has to consider the aggregates splittable at all.  count(*) and
-		 * count(col) always are, but the answer is the planner's to give.
-		 * One table needs neither: it streams its finished groups.
-		 */
-		if (partitioned &&
-			(!sgc->hashable || extra == NULL ||
-			 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0))
-			return;
+			/*
+			 * The equality the planner chose for this column is what the index
+			 * that drives the scan has to implement, whether there is one
+			 * relation or many (lion_collect_targets(), finding 3 of the
+			 * 2026-09-20 review), so a grouping clause without one is of no use
+			 * here.
+			 */
+			groupeqop[ngroup] = sgc->eqop;
+			if (!OidIsValid(groupeqop[ngroup]))
+				return;
+
+			/*
+			 * A partitioned GROUP BY emits one PARTIAL aggregate per group per
+			 * partition and lets core's Finalize HashAggregate combine them
+			 * (DESIGN.md §16), so the column has to be hashable and the planner
+			 * has to consider the aggregates splittable at all.  count(*) and
+			 * count(col) always are, but the answer is the planner's to give.
+			 * One table needs neither: it streams its finished groups.
+			 */
+			if (partitioned &&
+				(!sgc->hashable || extra == NULL ||
+				 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0))
+				return;
+
+			ngroup++;
+		}
 	}
 
 	/* ---- every WHERE clause must be one the posting sets can answer ---- */
@@ -1628,202 +2133,91 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 		Node	   *clause;
-		Var		   *var = NULL;
-		Node	   *val = NULL;	/* the value expression, or a placeholder */
-		Oid			opno = InvalidOid;	/* operator the index must know */
-		Oid			cmptype = InvalidOid;	/* type the index is compared with */
-		StrategyNumber strategy = 0;	/* multi-key clauses only */
-		Oid			extractquery = InvalidOid;
-		LionClauseInfo *ci;
-		int			kind;
+		LionLeafInfo leaf;
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
 			return;
 
 		clause = (Node *) rinfo->clause;
 
-		if (IsA(clause, OpExpr))
+		/*
+		 * ---- an OR across columns (DESIGN.md §19) ----
+		 *
+		 * Every arm has to be a positive clause the posting sets can answer,
+		 * or an AND of such clauses, each on a column of this relation.  The
+		 * whole restriction then becomes ONE source - the union of the arms -
+		 * which is ANDed with the other sources and with the GROUP BY driver
+		 * like any other.  A negated arm (`IS NOT NULL`, NOT) is declined:
+		 * the complement of a posting set is not a posting set, and under a
+		 * union there is nothing to subtract it from.
+		 *
+		 * The leaves are appended to the clause array like plain clauses, so
+		 * that an index is matched for each of them per partition and a Param
+		 * among them reaches custom_exprs; what marks them out is that they
+		 * are contiguous and named by an entry in `ors`.  They constrain no
+		 * column of the RESULT, so none of the attnum bookkeeping below
+		 * (posattnos, eqattnos, nonnullattnos, nullattnos) takes them: the
+		 * other arm may hold rows where this arm's column is NULL, or is
+		 * anything at all.
+		 */
+		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 		{
-			OpExpr	   *op = (OpExpr *) clause;
-			Node	   *left;
-			Node	   *right;
-			Oid			opfamily;
-			Oid			lefttype;
+			BoolExpr   *orexpr = (BoolExpr *) clause;
+			List	   *armlens = NIL;
+			int			first = list_length(whereattnos);
+			ListCell   *la;
 
-			if (list_length(op->args) != 2)
-				return;
-			if (!op_strict(op->opno))
+			if (list_length(orexpr->args) < 2)
 				return;
 
-			left = lion_strip((Node *) linitial(op->args));
-			right = lion_strip((Node *) lsecond(op->args));
-			if (left == NULL || right == NULL)
-				return;
-
-			strategy = lion_op_roaring_strategy(op->opno, &opfamily, &lefttype);
-
-			if (strategy == LION_STRAT_EQUAL)
+			foreach(la, orexpr->args)
 			{
-				/* Equality commutes, so either side may hold the column. */
-				if (IsA(left, Var) && lion_is_value_expr(right, false))
+				Node	   *arm = (Node *) lfirst(la);
+				int			nleaf = 0;
+
+				if (IsA(arm, BoolExpr) &&
+					((BoolExpr *) arm)->boolop == AND_EXPR)
 				{
-					var = (Var *) left;
-					val = right;
-				}
-				else if (lion_is_value_expr(left, false) && IsA(right, Var))
-				{
-					var = (Var *) right;
-					val = left;
+					ListCell   *lb;
+
+					foreach(lb, ((BoolExpr *) arm)->args)
+					{
+						if (!lion_analyze_leaf((Node *) lfirst(lb), rti, false,
+											  &leaf))
+							return;
+						lion_append_clause(&leaf, (Node *) lfirst(lb), true,
+										  &whereattnos, &clauseinfos,
+										  &whereclauses, &whereconsts,
+										  &wherekinds, &whereopnos,
+										  &whereinor);
+						nleaf++;
+					}
+					if (nleaf == 0)
+						return;
 				}
 				else
-					return;
+				{
+					if (!lion_analyze_leaf(arm, rti, false, &leaf))
+						return;
+					lion_append_clause(&leaf, arm, true,
+									  &whereattnos, &clauseinfos,
+									  &whereclauses, &whereconsts,
+									  &wherekinds, &whereopnos, &whereinor);
+					nleaf = 1;
+				}
 
-				/*
-				 * A literal NULL equals nothing.  A parameter that turns out
-				 * to be NULL is the same answer, but only the executor can
-				 * see it, so it selects no rows there instead.
-				 */
-				if (IsA(val, Const) && ((Const *) val)->constisnull)
-					return;
-
-				opno = op->opno;
-				cmptype = exprType(val);
-				kind = LION_CLAUSE_EQ;
+				armlens = lappend_int(armlens, nleaf);
 			}
-			else if (strategy == LION_STRAT_CONTAINS ||
-					 strategy == LION_STRAT_OVERLAP ||
-					 strategy == LION_STRAT_MATCH)
-			{
-				/*
-				 * A multi-key operator (DESIGN.md §17).  Unlike equality it
-				 * does not commute - `'{a}' @> tags` is a containment the
-				 * other way round, which is strategy 4 and not pushed down -
-				 * so the column has to be the left operand.
-				 */
-				/*
-				 * The QUERY, not just its value, decides whether the posting
-				 * sets can answer this clause at all, so it has to be
-				 * available now: a Param is refused here even though one is
-				 * accepted for equality (DESIGN.md §17).  `tags @> $1` with
-				 * `$1 = '{}'` extracts to ALL mode, which this node cannot
-				 * answer - it has no way to recheck the operator against the
-				 * heap - and by then there would be no plan left to fall back
-				 * to.
-				 */
-				if (!IsA(left, Var) || !IsA(right, Const))
-					return;
-				var = (Var *) left;
-				val = right;
-				if (((Const *) val)->constisnull)
-					return;
 
-				/*
-				 * Only an EXACT query is pushed down.  `tags @> '{}'`, `<@`,
-				 * a tsquery with NOT/phrase/prefix/weights and anything with
-				 * a NULL element all want every row rechecked in the heap,
-				 * which is what the ordinary plan does anyway.
-				 */
-				if (!lion_multikey_query_is_exact(opfamily, lefttype, strategy,
-												 (Const *) val, &extractquery))
-					return;
-
-				opno = op->opno;
-				cmptype = InvalidOid;	/* the query is not a key */
-				kind = LION_CLAUSE_MULTI;
-			}
-			else
-				return;			/* strategy 4 (`<@`), or not ours at all */
+			ors = lappend(ors,
+						  list_concat(list_make2_int(first,
+													 list_length(armlens)),
+									  armlens));
+			havepositive = true;
+			continue;
 		}
-		else if (IsA(clause, ScalarArrayOpExpr))
-		{
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
-			Node	   *left;
-			Node	   *right;
-			int			nelems;
 
-			/* `= ALL (...)` is not a union of keys (DESIGN.md §15). */
-			if (!saop->useOr)
-				return;
-			if (list_length(saop->args) != 2)
-				return;
-			if (!op_strict(saop->opno))
-				return;
-
-			left = lion_strip((Node *) linitial(saop->args));
-			right = lion_strip((Node *) lsecond(saop->args));
-			if (left == NULL || right == NULL)
-				return;
-			if (!IsA(left, Var) || !lion_is_value_expr(right, true))
-				return;
-			var = (Var *) left;
-			val = right;
-
-			/*
-			 * The length cap of DESIGN.md §15 applies to the lists whose
-			 * length is known now: a literal array and the ARRAY[...] a
-			 * generic plan keeps for `k IN ($1, $2)`.  A parameter that IS an
-			 * array has no length until the executor has it, and by then
-			 * there is no plan to decline in favour of, so it is answered
-			 * whatever its length.
-			 */
-			if (IsA(val, Const))
-			{
-				if (((Const *) val)->constisnull)
-					return;
-				nelems = lion_array_const_nelems((Const *) val);
-				if (nelems < 0 || nelems > LION_MAX_ARRAY_ELEMS)
-					return;
-			}
-			else if (IsA(val, ArrayExpr))
-			{
-				nelems = list_length(((ArrayExpr *) val)->elements);
-				if (nelems > LION_MAX_ARRAY_ELEMS)
-					return;
-			}
-
-			/*
-			 * `col op ANY (array)` is a union of single-key lookups, so the
-			 * operator has to be equality; `tags @> ANY (...)` would be a
-			 * union of multi-key queries, which nothing here builds.
-			 */
-			{
-				Oid			opfamily;
-				Oid			lefttype;
-
-				if (lion_op_roaring_strategy(saop->opno, &opfamily,
-											&lefttype) != LION_STRAT_EQUAL)
-					return;
-			}
-
-			opno = saop->opno;
-			cmptype = get_element_type(exprType(val));
-			if (!OidIsValid(cmptype))
-				return;
-			kind = LION_CLAUSE_ARRAY;
-		}
-		else if (IsA(clause, NullTest))
-		{
-			NullTest   *nt = (NullTest *) clause;
-			Node	   *arg;
-
-			if (nt->argisrow)
-				return;
-			arg = lion_strip((Node *) nt->arg);
-			if (arg == NULL || !IsA(arg, Var))
-				return;
-			var = (Var *) arg;
-
-			kind = (nt->nulltesttype == IS_NULL) ?
-				LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
-			/* The executor needs no value; keep the lists in step. */
-			val = (Node *) makeNullConst(var->vartype, var->vartypmod,
-										 var->varcollid);
-		}
-		else
-			return;
-
-		if (var->varno != (int) rti || var->varattno <= 0 ||
-			var->varlevelsup != 0)
+		if (!lion_analyze_leaf(clause, rti, true, &leaf))
 			return;
 
 		/*
@@ -1834,10 +2228,10 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * share an opclass (DESIGN.md §16).
 		 */
 
-		if (LION_CLAUSE_IS_POSITIVE(kind))
+		if (LION_CLAUSE_IS_POSITIVE(leaf.kind))
 			havepositive = true;
 
-		if (LION_CLAUSE_IS_POSITIVE(kind) && kind != LION_CLAUSE_MULTI)
+		if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)
 		{
 			/*
 			 * At most one positive clause per column: the same clause twice
@@ -1847,77 +2241,68 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			 * nothing by itself and is simply subtracted - and neither is a
 			 * multi-key clause, whose sources intersect exactly as two
 			 * clauses on different columns do (`tags @> '{a}' AND
-			 * tags && '{b,c}'` is one AND of three key sets).
+			 * tags && '{b,c}'` is one AND of three key sets).  Nor is a leaf
+			 * of an OR, which says nothing about the rows the OTHER arms
+			 * select and so cannot be compared with a clause that does.
 			 */
-			if (list_member_int(posattnos, (int) var->varattno))
+			if (list_member_int(posattnos, (int) leaf.var->varattno))
 			{
 				ListCell   *l1;
 				ListCell   *l2;
 				ListCell   *l3;
+				ListCell   *l4;
 				bool		same = false;
 
-				forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
+				forfour(l1, whereattnos, l2, whereconsts, l3, wherekinds,
+						l4, whereinor)
 				{
-					if (lfirst_int(l1) != (int) var->varattno ||
+					if (lfirst_int(l4) != 0 ||
+						lfirst_int(l1) != (int) leaf.var->varattno ||
 						lfirst_int(l3) == LION_CLAUSE_NOTNULL)
 						continue;
-					same = (lfirst_int(l3) == kind &&
-							equal(lfirst(l2), val));
+					same = (lfirst_int(l3) == leaf.kind &&
+							equal(lfirst(l2), leaf.val));
 					break;
 				}
 				if (!same)
 					return;
 				continue;
 			}
-			posattnos = lappend_int(posattnos, (int) var->varattno);
+			posattnos = lappend_int(posattnos, (int) leaf.var->varattno);
 		}
 
-		switch (kind)
+		switch (leaf.kind)
 		{
 			case LION_CLAUSE_EQ:
-				eqattnos = lappend_int(eqattnos, (int) var->varattno);
-				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
+				eqattnos = lappend_int(eqattnos, (int) leaf.var->varattno);
+				nonnullattnos = lappend_int(nonnullattnos,
+											(int) leaf.var->varattno);
 				break;
 			case LION_CLAUSE_NOTNULL:
 				if (notnullvar == NULL)
-					notnullvar = var;
-				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
+					notnullvar = leaf.var;
+				nonnullattnos = lappend_int(nonnullattnos,
+											(int) leaf.var->varattno);
 				break;
 			case LION_CLAUSE_ARRAY:
 			case LION_CLAUSE_MULTI:
 				/* a strict operator with a non-NULL constant */
-				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
+				nonnullattnos = lappend_int(nonnullattnos,
+											(int) leaf.var->varattno);
 				break;
 			case LION_CLAUSE_NULL:
-				nullattnos = lappend_int(nullattnos, (int) var->varattno);
+				nullattnos = lappend_int(nullattnos, (int) leaf.var->varattno);
 				break;
 		}
 
-		ci = (LionClauseInfo *) palloc0(sizeof(LionClauseInfo));
-		ci->attno = var->varattno;
-		ci->kind = kind;
-		ci->opno = opno;
-		ci->cmptype = cmptype;
-		ci->strategy = strategy;
-		ci->extractquery = extractquery;
-		if (IsA(clause, OpExpr))
-			ci->collation = ((OpExpr *) clause)->inputcollid;
-		else if (IsA(clause, ScalarArrayOpExpr))
-			ci->collation = ((ScalarArrayOpExpr *) clause)->inputcollid;
-		else
-			ci->collation = InvalidOid;
-
-		whereattnos = lappend_int(whereattnos, (int) var->varattno);
-		clauseinfos = lappend(clauseinfos, ci);
-		whereclauses = lappend(whereclauses, clause);
-		whereconsts = lappend(whereconsts, val);
-		wherekinds = lappend_int(wherekinds, kind);
-		whereopnos = lappend_oid(whereopnos, opno);
+		lion_append_clause(&leaf, clause, false,
+						  &whereattnos, &clauseinfos, &whereclauses,
+						  &whereconsts, &wherekinds, &whereopnos, &whereinor);
 	}
 
 	/* Something has to drive the count. */
-	driveattno = groupattno;
-	if (groupvar == NULL && !havepositive)
+	driveattno = groupattno[0];
+	if (ngroup == 0 && !havepositive)
 	{
 		/*
 		 * Only `IS NOT NULL` clauses: that column's index knows every row of
@@ -1962,8 +2347,13 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			 * per relation, once the indexes are known.  `IS NULL` is exempt:
 			 * NULL has one representation.
 			 */
-			if (groupvar != NULL && v->varattno == groupvar->varattno)
-				groupvalueout = true;
+			for (g = 0; g < ngroup; g++)
+			{
+				if (v->varattno == groupattno[g])
+					break;
+			}
+			if (g < ngroup)
+				groupvalueout[g] = true;
 			else if (list_member_int(eqattnos, (int) v->varattno))
 			{
 				if (!list_member_int(valueattnos, (int) v->varattno))
@@ -1975,7 +2365,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		else if (IsA(node, Aggref))
 		{
 			if (!lion_agg_is_count((Aggref *) node, rti, input_rel,
-								  groupattno, nonnullattnos, nullattnos))
+								  groupattno, ngroup, nonnullattnos,
+								  nullattnos))
 				return;
 			haveagg = true;
 		}
@@ -2007,14 +2398,63 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * onto each partition through its AppendRelInfo before looking an index
 	 * up, because partitions may number their columns differently.
 	 */
-	drive.attno = driveattno;
-	drive.var = (driveattno != 0) ?
-		((groupvar != NULL) ? groupvar : notnullvar) : NULL;
-	drive.collation = (groupvar != NULL) ? groupvar->varcollid : InvalidOid;
-	drive.eqop = (groupvar != NULL) ? groupeqop : InvalidOid;
-	drive.valueout = groupvalueout;
+	memset(drive, 0, sizeof(drive));
 
-	if (!lion_collect_targets(root, input_rel, &drive, whereattnos,
+	/*
+	 * How many entries each grouping column's index has, which is what
+	 * decides the outer/inner roles of the nested loop (DESIGN.md §20) and
+	 * what the cost model multiplies: the column with FEWER distinct values
+	 * drives the scan, so the other index's keys - which are read once and
+	 * probed per pair - are the ones whose bucket lookups are repeated.
+	 */
+	for (g = 0; g < ngroup; g++)
+		groupest[g] = estimate_num_groups(root, list_make1(groupvar[g]),
+										  input_rel->rows, NULL, NULL);
+	if (ngroup == 2 && groupest[1] < groupest[0])
+	{
+		Var		   *tv = groupvar[0];
+		AttrNumber	ta = groupattno[0];
+		Oid			te = groupeqop[0];
+		bool		tvo = groupvalueout[0];
+		double		tn = groupest[0];
+
+		groupvar[0] = groupvar[1];
+		groupattno[0] = groupattno[1];
+		groupeqop[0] = groupeqop[1];
+		groupvalueout[0] = groupvalueout[1];
+		groupest[0] = groupest[1];
+		groupvar[1] = tv;
+		groupattno[1] = ta;
+		groupeqop[1] = te;
+		groupvalueout[1] = tvo;
+		groupest[1] = tn;
+		driveattno = groupattno[0];
+	}
+
+	if (ngroup > 0)
+	{
+		for (g = 0; g < ngroup; g++)
+		{
+			drive[g].attno = groupattno[g];
+			drive[g].var = groupvar[g];
+			drive[g].collation = groupvar[g]->varcollid;
+			drive[g].eqop = groupeqop[g];
+			drive[g].valueout = groupvalueout[g];
+		}
+		ndrive = ngroup;
+	}
+	else if (driveattno != 0)
+	{
+		/* §14's sum-over-all: one index, and it groups nothing. */
+		drive[0].attno = driveattno;
+		drive[0].var = notnullvar;
+		drive[0].collation = InvalidOid;
+		drive[0].eqop = InvalidOid;
+		drive[0].valueout = false;
+		ndrive = 1;
+	}
+
+	if (!lion_collect_targets(root, input_rel, drive, ndrive, whereattnos,
 							 clauseinfos, &targets))
 		return;
 	if (targets == NIL)
@@ -2022,9 +2462,14 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	first = (LionCountTarget *) linitial(targets);
 
 	/* ---- build the path ---- */
-	if (groupvar != NULL)
-		numgroups = estimate_num_groups(root, list_make1(groupvar),
+	if (ngroup == 1)
+		numgroups = groupest[0];
+	else if (ngroup == 2)
+	{
+		numgroups = estimate_num_groups(root,
+										list_make2(groupvar[0], groupvar[1]),
 										input_rel->rows, NULL, NULL);
+	}
 	else if (sumall)
 	{
 		/* Every entry of the driving index is visited, one group or not. */
@@ -2042,7 +2487,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * that is the sum of the partitions' own group estimates, each made
 	 * against the partition's statistics and capped by its row count.
 	 */
-	if (groupvar == NULL)
+	if (ngroup == 0)
 		outrows = 1.0;
 	else if (!partitioned)
 		outrows = numgroups;
@@ -2055,9 +2500,15 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			double		relrows = Max(t->rel->rows, 1.0);
 			double		relgroups;
 
-			if (t->drivevar != NULL)
+			if (t->drivevar[0] != NULL && ngroup == 2 &&
+				t->drivevar[1] != NULL)
 				relgroups = estimate_num_groups(root,
-												list_make1(t->drivevar),
+												list_make2(t->drivevar[0],
+														   t->drivevar[1]),
+												relrows, NULL, NULL);
+			else if (t->drivevar[0] != NULL)
+				relgroups = estimate_num_groups(root,
+												list_make1(t->drivevar[0]),
 												relrows, NULL, NULL);
 			else
 				relgroups = numgroups;
@@ -2079,10 +2530,12 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * them invalid - there is no single index - and fills LION_PRIV_PARTS
 	 * instead, one OidList per partition in the same clause order.
 	 */
-	oids = list_make2_oid(rte->relid,
-						  (!partitioned && first->driveidx != NULL) ?
-						  first->driveidx->indexoid : InvalidOid);
-	ints = list_make3_int((int) rti, (int) groupattno,
+	oids = list_make3_oid(rte->relid,
+						  (!partitioned && first->driveidx[0] != NULL) ?
+						  first->driveidx[0]->indexoid : InvalidOid,
+						  (!partitioned && first->driveidx[1] != NULL) ?
+						  first->driveidx[1]->indexoid : InvalidOid);
+	ints = list_make4_int((int) rti, (int) groupattno[0], (int) groupattno[1],
 						  (singlegroup ? LION_FLAG_SINGLEGROUP : 0) |
 						  (sumall ? LION_FLAG_SUMALL : 0) |
 						  (driveattno != 0 ? LION_FLAG_GROUPIDX : 0));
@@ -2112,8 +2565,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			List	   *one;
 			ListCell   *l1;
 
-			one = list_make2_oid(t->heapoid,
-								 t->driveidx ? t->driveidx->indexoid : InvalidOid);
+			one = list_make3_oid(t->heapoid,
+								 t->driveidx[0] ? t->driveidx[0]->indexoid :
+								 InvalidOid,
+								 t->driveidx[1] ? t->driveidx[1]->indexoid :
+								 InvalidOid);
 			foreach(l1, t->whereidx)
 				one = lappend_oid(one, ((IndexOptInfo *) lfirst(l1))->indexoid);
 			parts = lappend(parts, one);
@@ -2151,10 +2607,12 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->custom_private = lappend(cpath->custom_private, ckinds);
 	cpath->custom_private = lappend(cpath->custom_private, parts);
 	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
+	cpath->custom_private = lappend(cpath->custom_private, ors);
 	cpath->methods = &lion_count_path_methods;
 
-	lion_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
-						numgroups, outrows);
+	lion_cost_count_path(root, cpath, targets, whereclauses, wherekinds, ors,
+						numgroups, groupest[0], (ngroup == 2) ? groupest[1] : 0,
+						outrows);
 
 	/*
 	 * A partitioned GROUP BY produces partial aggregates, so what goes into
@@ -2219,7 +2677,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *priv;
 	List	   *ints;
 	List	   *ckinds;
+	bool	   *inor;
 	AttrNumber	groupattno;
+	AttrNumber	groupattno2;
 	ListCell   *lc;
 
 	/*
@@ -2233,6 +2693,16 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	ints = (List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
 	ckinds = (List *) list_nth(best_path->custom_private, LION_PRIV_CLAUSEKINDS);
 	groupattno = (AttrNumber) lsecond_int(ints);
+	groupattno2 = (AttrNumber) lthird_int(ints);
+
+	/*
+	 * A leaf of an OR constrains no column of the result (DESIGN.md §19), so
+	 * it neither pins a value the target list may print nor makes a
+	 * `count(col)` zero: the other arms select rows it says nothing about.
+	 */
+	inor = lion_or_leaf_map((List *) list_nth(best_path->custom_private,
+											  LION_PRIV_ORS),
+							list_length(ckinds));
 
 	foreach(lc, tlist)
 	{
@@ -2265,12 +2735,15 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 				if (groupattno != 0 && attno == groupattno)
 					kind = LION_TL_COUNT_GROUPCOL;
+				else if (groupattno2 != 0 && attno == groupattno2)
+					kind = LION_TL_COUNT_GROUPCOL2;
 				else
 				{
 					for (i = 0; i < list_length(ckinds); i++)
 					{
-						if (list_nth_int(ckinds, i) == LION_CLAUSE_NULL &&
-							list_nth_int(ints, 3 + i) == (int) attno)
+						if (!inor[i] &&
+							list_nth_int(ckinds, i) == LION_CLAUSE_NULL &&
+							list_nth_int(ints, 4 + i) == (int) attno)
 						{
 							kind = LION_TL_COUNT_ZERO;
 							break;
@@ -2286,6 +2759,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 			if (groupattno != 0 && attno == groupattno)
 				kind = LION_TL_GROUPKEY;
+			else if (groupattno2 != 0 && attno == groupattno2)
+				kind = LION_TL_GROUPKEY2;
 			else
 			{
 				/*
@@ -2297,15 +2772,17 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				 * about the value.
 				 */
 				kind = -1;
-				for (i = 3; i < list_length(ints); i++)
+				for (i = 4; i < list_length(ints); i++)
 				{
-					int			ckind = list_nth_int(ckinds, i - 3);
+					int			ckind = list_nth_int(ckinds, i - 4);
 
+					if (inor[i - 4])
+						continue;	/* §19: an OR leaf pins nothing */
 					if (ckind != LION_CLAUSE_EQ && ckind != LION_CLAUSE_NULL)
 						continue;
 					if (list_nth_int(ints, i) == (int) attno)
 					{
-						kind = LION_TL_WHEREKEY + (i - 3);
+						kind = LION_TL_WHEREKEY + (i - 4);
 						break;
 					}
 				}
@@ -2335,6 +2812,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 										 false));
 		kinds = lappend_int(kinds, kind);
 	}
+	pfree(inor);
 
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = NIL;
@@ -2389,9 +2867,111 @@ lion_create_custom_scan_state(CustomScan *cscan)
  * range table for a cached plan), so nothing here takes a relation lock.  The
  * indexes are not range table entries and get their own AccessShareLock.
  */
+/*
+ * Read the KEYS of the inner index of a two-column GROUP BY, once for this
+ * relation (DESIGN.md §20).
+ *
+ * Only the keys: an entry's head block or INLINE payload would be worthless
+ * without the buffer pin that goes with it (DESIGN.md §9), and holding one pin
+ * per distinct inner value for the whole scan is exactly what the pin budget
+ * forbids.  So each pair re-locates its inner posting set with
+ * lion_posting_set_lookup(), which is one bucket page - and the bucket count
+ * is sized to the index's entry count, so that lookup is a hit in shared
+ * buffers for every index small enough for the cost model to have chosen this
+ * plan at all.
+ *
+ * The alternative, walking the inner index's entry scan once per OUTER group,
+ * needs no memory but re-reads every bucket page of the inner index
+ * outer_entries times.  It is kept as the fallback for the case the keys do
+ * not fit the work_mem budget - a grouping the cost model did not expect, the
+ * §16 lesson that a plan-time bound is only as good as estimate_num_groups -
+ * and then innerkey is left NULL.
+ */
+static void
+lion_load_inner_keys(LionCountScanState *st)
+{
+	LionEntryScan es;
+	LionState  *istate = lion_get_state(st->groupidx2);
+	MemoryContext oldcxt;
+	MemoryContext tmpcxt;
+	Size		budget = (Size) work_mem * INT64CONST(1024);
+	int			cap = 64;
+	int			n = 0;
+	Datum	   *keys;
+	bool	   *isnull;
+	bool		full = false;
+
+	Assert(st->innerkey == NULL);
+
+	MemoryContextReset(st->innercxt);
+	oldcxt = MemoryContextSwitchTo(st->innercxt);
+	keys = (Datum *) palloc(sizeof(Datum) * cap);
+	isnull = (bool *) palloc(sizeof(bool) * cap);
+	MemoryContextSwitchTo(oldcxt);
+
+	tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "LionCount inner entry scan",
+								   ALLOCSET_SMALL_SIZES);
+
+	lion_entry_scan_begin(&es, st->groupidx2);
+	for (;;)
+	{
+		LionPostingSet ps;
+		Datum		key;
+
+		CHECK_FOR_INTERRUPTS();
+
+		MemoryContextReset(tmpcxt);
+		oldcxt = MemoryContextSwitchTo(tmpcxt);
+		if (!lion_entry_scan_next(&es, &key, &ps))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			break;
+		}
+		MemoryContextSwitchTo(st->innercxt);
+		if (n >= cap)
+		{
+			cap *= 2;
+			keys = (Datum *) repalloc(keys, sizeof(Datum) * cap);
+			isnull = (bool *) repalloc(isnull, sizeof(bool) * cap);
+		}
+		isnull[n] = ps.keyisnull;
+		keys[n] = ps.keyisnull ? (Datum) 0 :
+			datumCopy(key, istate->typbyval, istate->typlen);
+		n++;
+		MemoryContextSwitchTo(oldcxt);
+
+		/* The set's pin goes now: only the key is kept. */
+		lion_posting_set_release(&ps);
+
+		if ((n & 0xff) == 0 &&
+			MemoryContextMemAllocated(st->innercxt, true) > budget)
+		{
+			full = true;
+			break;
+		}
+	}
+	lion_entry_scan_end(&es);
+	MemoryContextDelete(tmpcxt);
+
+	if (full)
+	{
+		/* Too many to keep: walk the inner index per outer group instead. */
+		MemoryContextReset(st->innercxt);
+		st->innerkey = NULL;
+		st->innerisnull = NULL;
+		st->ninnerkey = 0;
+		return;
+	}
+
+	st->innerkey = keys;
+	st->innerisnull = isnull;
+	st->ninnerkey = n;
+}
+
 static void
 lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
-				  const Oid *clauseidxoid)
+				  Oid groupidxoid2, const Oid *clauseidxoid)
 {
 	int			i;
 
@@ -2407,6 +2987,8 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 
 	if (OidIsValid(groupidxoid))
 		st->groupidx = index_open(groupidxoid, AccessShareLock);
+	if (OidIsValid(groupidxoid2))
+		st->groupidx2 = index_open(groupidxoid2, AccessShareLock);
 
 	/*
 	 * index_beginscan() would take a relation-level predicate lock on each of
@@ -2422,7 +3004,17 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 			PredicateLockRelation(st->clause[i].idx, snapshot);
 		if (st->groupidx != NULL)
 			PredicateLockRelation(st->groupidx, snapshot);
+		if (st->groupidx2 != NULL)
+			PredicateLockRelation(st->groupidx2, snapshot);
 	}
+
+	/*
+	 * A two-column GROUP BY reads the inner index's keys once for this
+	 * relation (DESIGN.md §20); the sets themselves are located per pair,
+	 * because each one holds a buffer pin.
+	 */
+	if (st->groupidx2 != NULL)
+		lion_load_inner_keys(st);
 }
 
 /*
@@ -2440,6 +3032,16 @@ lion_close_relation(LionCountScanState *st)
 		index_close(st->groupidx, AccessShareLock);
 		st->groupidx = NULL;
 	}
+	if (st->groupidx2 != NULL)
+	{
+		index_close(st->groupidx2, AccessShareLock);
+		st->groupidx2 = NULL;
+	}
+	st->innerkey = NULL;
+	st->innerisnull = NULL;
+	st->ninnerkey = 0;
+	if (st->innercxt != NULL)
+		MemoryContextReset(st->innercxt);
 	for (i = 0; i < st->nclause; i++)
 	{
 		if (st->clause[i].idx != NULL)
@@ -2467,9 +3069,11 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *ckinds;
 	List	   *partlist;
 	List	   *clauseops;
+	List	   *orlist;
 	List	   *kinds;
 	int			flags;
 	int			i;
+	int			k;
 
 	/*
 	 * custom_private is read positionally, so check that it is the list this
@@ -2492,13 +3096,16 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	exprs = cscan->custom_exprs;
 	partlist = (List *) list_nth(cscan->custom_private, LION_PRIV_PARTS);
 	clauseops = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEOPS);
+	orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
 	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
 
 	st->heapoid = linitial_oid(oids);
 	st->groupidxoid = lsecond_oid(oids);
+	st->groupidxoid2 = lthird_oid(oids);
 	st->scanrelid = (Index) linitial_int(ints);
 	st->groupattno = (AttrNumber) lsecond_int(ints);
-	flags = lthird_int(ints);
+	st->groupattno2 = (AttrNumber) lthird_int(ints);
+	flags = lfourth_int(ints);
 	st->singlegroup = (flags & LION_FLAG_SINGLEGROUP) != 0;
 	st->sumall = (flags & LION_FLAG_SUMALL) != 0;
 	st->hasgroupidx = (flags & LION_FLAG_GROUPIDX) != 0;
@@ -2525,8 +3132,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		LionClauseState *cl = &st->clause[i];
 
 		cl->kind = list_nth_int(ckinds, i);
-		cl->idxoid = list_nth_oid(oids, 2 + i);
-		cl->attno = (AttrNumber) list_nth_int(ints, 3 + i);
+		cl->idxoid = list_nth_oid(oids, 3 + i);
+		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
 		cl->opno = list_nth_oid(clauseops, i);
 		cl->strategy = 0;
 
@@ -2551,6 +3158,65 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		}
 	}
 
+	/*
+	 * The OR restrictions (DESIGN.md §19) and the sources the clauses make
+	 * up: one per plain clause, one per OR.  A clause that is an OR leaf has
+	 * no source of its own - its posting sets go into the OR's, which is the
+	 * union of the arms - and that is the only thing that tells the two apart
+	 * anywhere below.
+	 */
+	st->nor = list_length(orlist);
+	st->inor = lion_or_leaf_map(orlist, st->nclause);
+	if (st->nor > 0)
+	{
+		st->ors = (LionOrState *) palloc0(sizeof(LionOrState) * st->nor);
+		for (i = 0; i < st->nor; i++)
+		{
+			List	   *one = (List *) list_nth(orlist, i);
+			LionOrState *o = &st->ors[i];
+
+			o->first = linitial_int(one);
+			o->narms = lsecond_int(one);
+			o->armlen = (int *) palloc0(sizeof(int) * Max(o->narms, 1));
+			o->nleaves = 0;
+			for (k = 0; k < o->narms; k++)
+			{
+				o->armlen[k] = list_nth_int(one, 2 + k);
+				o->nleaves += o->armlen[k];
+			}
+			if (o->narms < 1 || o->nleaves < 1 ||
+				o->first < 0 || o->first + o->nleaves > st->nclause)
+				elog(ERROR, "LionCount: malformed OR structure");
+		}
+	}
+
+	st->item = (LionSourceItem *)
+		palloc0(sizeof(LionSourceItem) * Max(st->nclause + 1, 1));
+	st->nitem = 0;
+	for (i = 0; i < st->nclause; i++)
+	{
+		int			orno = -1;
+
+		if (st->inor[i])
+		{
+			/* Only the FIRST leaf of an OR opens a source, for the whole OR. */
+			for (k = 0; k < st->nor; k++)
+			{
+				if (st->ors[k].first == i)
+				{
+					orno = k;
+					break;
+				}
+			}
+			if (orno < 0)
+				continue;
+		}
+
+		st->item[st->nitem].clauseno = i;
+		st->item[st->nitem].orno = orno;
+		st->nitem++;
+	}
+
 	/* One target per live leaf partition, in the planner's order. */
 	st->npart = list_length(partlist);
 	if (st->npart > 0)
@@ -2563,10 +3229,11 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 			st->part[i].heapoid = linitial_oid(one);
 			st->part[i].groupidxoid = lsecond_oid(one);
+			st->part[i].groupidxoid2 = lthird_oid(one);
 			st->part[i].clauseidxoid = (Oid *)
 				palloc0(sizeof(Oid) * Max(st->nclause, 1));
 			for (j = 0; j < st->nclause; j++)
-				st->part[i].clauseidxoid[j] = list_nth_oid(one, 2 + j);
+				st->part[i].clauseidxoid[j] = list_nth_oid(one, 3 + j);
 		}
 	}
 
@@ -2581,6 +3248,12 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
+										 ALLOCSET_SMALL_SIZES);
+	st->outercxt = AllocSetContextCreate(estate->es_query_cxt,
+										 "LionCount outer group",
+										 ALLOCSET_SMALL_SIZES);
+	st->innercxt = AllocSetContextCreate(estate->es_query_cxt,
+										 "LionCount inner keys",
 										 ALLOCSET_SMALL_SIZES);
 	st->wherecxt = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount where keys",
@@ -2606,14 +3279,26 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * partition at a time (DESIGN.md §16).
 	 */
 	if (st->npart == 0)
-		lion_open_relation(st, st->heapoid, st->groupidxoid, NULL);
+		lion_open_relation(st, st->heapoid, st->groupidxoid, st->groupidxoid2,
+						  NULL);
 
-	/* slot 0 is the group's posting set, 1..nclause the WHERE clauses */
+	/*
+	 * Slot 0 is the (outer) group's posting set, 1 .. nitem the WHERE items,
+	 * and - for a two-column GROUP BY (DESIGN.md §20) - slot nitem + 1 the
+	 * inner group's.
+	 */
+	st->nsource = st->nitem + 1 + (st->groupattno2 != 0 ? 1 : 0);
 	st->sources = (LionCountSource *)
-		palloc0(sizeof(LionCountSource) * (st->nclause + 1));
+		palloc0(sizeof(LionCountSource) * st->nsource);
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	st->sources[0].negated = false;
+	if (st->groupattno2 != 0)
+	{
+		st->sources[st->nitem + 1].nsets = 1;
+		st->sources[st->nitem + 1].sets = &st->groupset2;
+		st->sources[st->nitem + 1].negated = false;
+	}
 }
 
 /*
@@ -2667,13 +3352,72 @@ lion_eval_clause_values(LionCountScanState *st)
 	MemoryContextSwitchTo(oldcxt);
 }
 
+/* ---------------------------------------------------------------------
+ * Locating the posting sets of one relation's WHERE clauses
+ *
+ * Each clause produces some located posting sets and a LionKeyNode tree over
+ * them, and the two go into a LionCountSource that the merge in lion_count.c
+ * evaluates.  A plain clause is one source; an OR restriction is one source
+ * over the sets of all its leaves (DESIGN.md §19).
+ * --------------------------------------------------------------------- */
+
+static LionKeyNode *
+lion_key_node(int keyno)
+{
+	LionKeyNode *n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+
+	n->kind = LION_KN_KEY;
+	n->keyno = keyno;
+	return n;
+}
+
+/*
+ * An AND or OR over nargs subtrees, or the subtree itself when there is only
+ * one of them.  args is consumed.
+ */
+static LionKeyNode *
+lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args, int nargs)
+{
+	LionKeyNode *n;
+
+	Assert(nargs >= 1);
+	if (nargs == 1)
+		return args[0];
+
+	n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+	n->kind = kind;
+	n->nargs = nargs;
+	n->args = args;
+	return n;
+}
+
+/*
+ * Renumber a tree's leaves, which name posting sets by position: the leaves
+ * of an OR's arms are concatenated into one array, so each clause's tree has
+ * to be moved to where its own sets ended up.
+ */
+static void
+lion_shift_keynos(LionKeyNode *node, int delta)
+{
+	int			i;
+
+	if (node == NULL || delta == 0)
+		return;
+	if (node->kind == LION_KN_KEY)
+	{
+		node->keyno += delta;
+		return;
+	}
+	for (i = 0; i < node->nargs; i++)
+		lion_shift_keynos(node->args[i], delta);
+}
+
 /*
  * Locate the posting sets of one `col = ANY (array)` clause (DESIGN.md §15):
  * one set per distinct non-NULL element, which the count then unions.
  */
-static void
-lion_locate_array(LionCountScanState *st, LionClauseState *cl,
-				 LionCountSource *src)
+static int
+lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 {
 	ArrayType  *arr = DatumGetArrayTypeP(cl->val);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
@@ -2684,14 +3428,12 @@ lion_locate_array(LionCountScanState *st, LionClauseState *cl,
 	bool	   *nulls;
 	int			nelems;
 	int			nsets;
-	int			nfound;
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
-	src->sets = (LionPostingSet *)
-		palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
+	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
 
 	/*
 	 * One call rather than a lookup per element: the values are hashed first
@@ -2704,17 +3446,14 @@ lion_locate_array(LionCountScanState *st, LionClauseState *cl,
 	 * would only cost the merge another sub-cursor.
 	 */
 	nsets = lion_posting_set_lookup_many(cl->idx, elemtype, nelems,
-										elems, nulls, src->sets, &nfound);
-	src->nsets = nsets;
-
-	/* An empty array, an all-NULL one, or no matching key: no rows at all. */
-	if (nfound == 0)
-		st->wheremissing = true;
+										elems, nulls, *sets, NULL);
 
 	pfree(elems);
 	pfree(nulls);
 	if ((Pointer) arr != DatumGetPointer(cl->val))
 		pfree(arr);
+
+	return nsets;
 }
 
 /*
@@ -2727,9 +3466,9 @@ lion_locate_array(LionCountScanState *st, LionClauseState *cl,
  * merge in lion_count.c evaluates it over the sets with the same cursors it
  * uses for an IN list, so the DESIGN.md §9 pin discipline is unchanged.
  */
-static void
-lion_locate_multikey(LionCountScanState *st, LionClauseState *cl,
-					LionCountSource *src)
+static int
+lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
+					LionKeyNode **tree)
 {
 	LionState   *istate = lion_get_state(cl->idx);
 	LionQuery	q;
@@ -2750,18 +3489,196 @@ lion_locate_multikey(LionCountScanState *st, LionClauseState *cl,
 		elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
 			 RelationGetRelationName(cl->idx));
 
-	src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * q.nkeys);
-	src->nsets = q.nkeys;
-	src->tree = q.tree;
+	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(q.nkeys, 1));
+	*tree = q.tree;
 
 	for (i = 0; i < q.nkeys; i++)
 	{
 		(void) lion_posting_set_lookup(cl->idx, q.keys[i], InvalidOid,
-									  &src->sets[i]);
+									  &(*sets)[i]);
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	/* An AND over a key with no entry at all selects nothing anywhere. */
+	return q.nkeys;
+}
+
+/*
+ * Locate one clause's posting sets into *sets and return the tree that
+ * combines them, its leaves numbered from 0.  NULL means the clause selects
+ * no rows at all - a NULL parameter, an empty IN list - and then *nsets is 0
+ * and nothing was located.
+ *
+ * This is the whole of a clause's run-time meaning, and it is the same
+ * whether the clause is a source of its own or a leaf of an OR (DESIGN.md
+ * §19).
+ */
+static LionKeyNode *
+lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
+{
+	LionKeyNode *tree = NULL;
+	int			n = 0;
+	int			i;
+
+	*sets = NULL;
+	*nsets = 0;
+
+	/*
+	 * A parameter that came out NULL selects no rows at all, whatever the
+	 * clause: `k = NULL`, `k = ANY (NULL)` and a NULL multi-key query are all
+	 * never true (every one of those operators is strict).  The clause is
+	 * then not looked up.
+	 */
+	if (cl->valisnull && LION_CLAUSE_IS_POSITIVE(cl->kind) &&
+		cl->kind != LION_CLAUSE_NULL)
+		return NULL;
+
+	switch (cl->kind)
+	{
+		case LION_CLAUSE_EQ:
+			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
+			n = 1;
+			(void) lion_posting_set_lookup(cl->idx, cl->val, cl->valtype,
+										  &(*sets)[0]);
+			tree = lion_key_node(0);
+			break;
+
+		case LION_CLAUSE_ARRAY:
+			n = lion_locate_array(cl, sets);
+			if (n > 0)
+			{
+				LionKeyNode **args = (LionKeyNode **)
+					palloc(sizeof(LionKeyNode *) * n);
+
+				for (i = 0; i < n; i++)
+					args[i] = lion_key_node(i);
+				tree = lion_bool_node(LION_KN_OR, args, n);
+			}
+			break;
+
+		case LION_CLAUSE_MULTI:
+			n = lion_locate_multikey(cl, sets, &tree);
+			if (n == 0)
+				tree = NULL;
+			break;
+
+		case LION_CLAUSE_NULL:
+		case LION_CLAUSE_NOTNULL:
+			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
+			n = 1;
+			if (lion_posting_set_lookup_null(cl->idx, &(*sets)[0]))
+				tree = lion_key_node(0);
+			else
+			{
+				/*
+				 * No NULL entry at all: `IS NULL` selects nothing, and
+				 * `IS NOT NULL` has nothing to subtract.
+				 */
+				n = 0;
+				tree = NULL;
+			}
+			break;
+
+		default:
+			elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
+	}
+
+	*nsets = n;
+	return tree;
+}
+
+/*
+ * Locate one OR restriction as a single source: the union of its arms, each
+ * arm the AND of its leaves (DESIGN.md §19).
+ *
+ * The leaves' sets are concatenated into one array, because a LionKeyNode
+ * names a set by its position in the source's array; each leaf's own tree is
+ * renumbered onto its slice of it.  An arm with a leaf that selects nothing
+ * selects nothing itself and is dropped; an OR with no arm left selects
+ * nothing at all.
+ *
+ * THE PIN RULE (DESIGN.md §9 and §19).  A source is only allowed to serve its
+ * containers from pinless private copies while some OTHER positive source is
+ * still read the pinned way, and `lion_source_pinned()` decides that per
+ * source: for an OR it needs EVERY child to hold a pin, because which of them
+ * contributed a given container key is not known in advance and a dead TID
+ * may have come from a single one of them.  That is what makes this source
+ * carry the interlock at all, and it is why the source is marked
+ * nomaterialize: the leaves of a union are never copied out.
+ */
+static void
+lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
+{
+	LionPostingSet **leafsets;
+	LionKeyNode **leaftree;
+	int		   *leafn;
+	LionKeyNode **arms;
+	int			narms = 0;
+	int			total = 0;
+	int			off = 0;
+	int			leaf = 0;
+	int			i;
+	int			j;
+
+	leafsets = (LionPostingSet **)
+		palloc0(sizeof(LionPostingSet *) * orst->nleaves);
+	leaftree = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->nleaves);
+	leafn = (int *) palloc0(sizeof(int) * orst->nleaves);
+
+	for (i = 0; i < orst->nleaves; i++)
+	{
+		leaftree[i] = lion_locate_leaf(&st->clause[orst->first + i],
+									  &leafsets[i], &leafn[i]);
+		total += leafn[i];
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* One array for the whole source, with every leaf's tree moved onto it. */
+	src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
+										   Max(total, 1));
+	src->nsets = total;
+	src->nomaterialize = true;
+	for (i = 0; i < orst->nleaves; i++)
+	{
+		if (leafn[i] > 0)
+			memcpy(&src->sets[off], leafsets[i],
+				   sizeof(LionPostingSet) * leafn[i]);
+		lion_shift_keynos(leaftree[i], off);
+		off += leafn[i];
+	}
+	Assert(off == total);
+
+	arms = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->narms);
+	for (i = 0; i < orst->narms; i++)
+	{
+		LionKeyNode **conj = (LionKeyNode **)
+			palloc0(sizeof(LionKeyNode *) * orst->armlen[i]);
+		int			nconj = 0;
+		bool		empty = false;
+
+		for (j = 0; j < orst->armlen[i]; j++, leaf++)
+		{
+			if (leaftree[leaf] == NULL)
+				empty = true;	/* an AND with a leaf that selects nothing */
+			else
+				conj[nconj++] = leaftree[leaf];
+		}
+
+		if (empty || nconj == 0)
+			continue;			/* this arm contributes nothing to the union */
+
+		arms[narms++] = lion_bool_node(LION_KN_AND, conj, nconj);
+	}
+
+	if (narms == 0)
+	{
+		src->tree = NULL;
+		st->wheremissing = true;
+		return;
+	}
+
+	src->tree = lion_bool_node(LION_KN_OR, arms, narms);
+
+	/* Every arm wants a key no entry holds: the union selects nothing. */
 	if (!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
 		st->wheremissing = true;
 }
@@ -2811,70 +3728,38 @@ static void
 lion_locate_where(LionCountScanState *st)
 {
 	MemoryContext oldcxt;
-	int			i;
+	int			k;
 
 	oldcxt = MemoryContextSwitchTo(st->wherecxt);
 
-	for (i = 0; i < st->nclause; i++)
+	for (k = 0; k < st->nitem; k++)
 	{
-		LionClauseState *cl = &st->clause[i];
-		LionCountSource *src = &st->sources[i + 1];
+		LionClauseState *cl = &st->clause[st->item[k].clauseno];
+		LionCountSource *src = &st->sources[k + 1];
 
-		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
 		src->nsets = 0;
 		src->sets = NULL;
+		src->tree = NULL;
+		src->negated = false;
+		src->nomaterialize = false;
 
-		/*
-		 * A parameter that came out NULL selects no rows at all, whatever the
-		 * clause: `k = NULL`, `k = ANY (NULL)` and a NULL multi-key query are
-		 * all never true (every one of those operators is strict).  The
-		 * clause is then not looked up.
-		 */
-		if (cl->valisnull && LION_CLAUSE_IS_POSITIVE(cl->kind) &&
-			cl->kind != LION_CLAUSE_NULL)
+		if (st->item[k].orno >= 0)
 		{
-			st->wheremissing = true;
+			lion_locate_or(st, &st->ors[st->item[k].orno], src);
 			continue;
 		}
 
-		switch (cl->kind)
-		{
-			case LION_CLAUSE_EQ:
-				src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
-				src->nsets = 1;
-				if (!lion_posting_set_lookup(cl->idx, cl->val, cl->valtype,
-											&src->sets[0]))
-					st->wheremissing = true;
-				break;
+		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
+		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
 
-			case LION_CLAUSE_ARRAY:
-				lion_locate_array(st, cl, src);
-				break;
-
-			case LION_CLAUSE_MULTI:
-				lion_locate_multikey(st, cl, src);
-				break;
-
-			case LION_CLAUSE_NULL:
-			case LION_CLAUSE_NOTNULL:
-				src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
-				src->nsets = 1;
-				if (!lion_posting_set_lookup_null(cl->idx, &src->sets[0]))
-				{
-					/*
-					 * No NULL entry at all: `IS NULL` selects nothing, and
-					 * `IS NOT NULL` has nothing to subtract.
-					 */
-					if (cl->kind == LION_CLAUSE_NULL)
-						st->wheremissing = true;
-					else
-						src->nsets = 0;
-				}
-				break;
-
-			default:
-				elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
-		}
+		/*
+		 * A positive clause that can select nothing makes the whole count 0,
+		 * and saying so here saves the merge - and, in the GROUP BY path,
+		 * every group of it.  A negated one simply has nothing to subtract.
+		 */
+		if (LION_CLAUSE_IS_POSITIVE(cl->kind) &&
+			!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
+			st->wheremissing = true;
 
 		/*
 		 * Only a clause that pins the column to ONE value can have its key
@@ -2897,7 +3782,7 @@ lion_release_where(LionCountScanState *st)
 	if (st->sources == NULL)
 		return;
 
-	for (i = 0; i < st->nclause; i++)
+	for (i = 0; i < st->nitem; i++)
 	{
 		LionCountSource *src = &st->sources[i + 1];
 
@@ -2906,6 +3791,7 @@ lion_release_where(LionCountScanState *st)
 		src->nsets = 0;
 		src->sets = NULL;
 		src->tree = NULL;		/* it lived in wherecxt, reset below */
+		src->nomaterialize = false;
 	}
 	if (st->wherecxt != NULL)
 		MemoryContextReset(st->wherecxt);
@@ -2914,7 +3800,8 @@ lion_release_where(LionCountScanState *st)
 }
 
 static TupleTableSlot *
-lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull, int64 count)
+lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
+			   Datum key2, bool key2isnull, int64 count)
 {
 	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
@@ -2933,6 +3820,11 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull, int64 count)
 				slot->tts_isnull[i] = keyisnull;
 				break;
 
+			case LION_TL_GROUPKEY2:
+				slot->tts_values[i] = key2;
+				slot->tts_isnull[i] = key2isnull;
+				break;
+
 			case LION_TL_COUNT:
 				slot->tts_values[i] = Int64GetDatum(count);
 				break;
@@ -2940,6 +3832,10 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull, int64 count)
 			case LION_TL_COUNT_GROUPCOL:
 				/* count(group column): 0 in the NULL group (DESIGN.md §14) */
 				slot->tts_values[i] = Int64GetDatum(keyisnull ? 0 : count);
+				break;
+
+			case LION_TL_COUNT_GROUPCOL2:
+				slot->tts_values[i] = Int64GetDatum(key2isnull ? 0 : count);
 				break;
 
 			case LION_TL_COUNT_ZERO:
@@ -3004,14 +3900,14 @@ lion_count_relation(LionCountScanState *st)
 	MemoryContext oldcxt;
 	int64		count;
 
-	Assert(st->nclause > 0);
+	Assert(st->nitem > 0);
 	if (st->wheremissing)
 		return 0;
 
 	MemoryContextReset(st->pergroup);
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
 	count = lion_count_sources_cached(st->heap, estate->es_snapshot,
-									 st->nclause, &st->sources[1],
+									 st->nitem, &st->sources[1],
 									 &st->stats, st->viscache);
 	MemoryContextSwitchTo(oldcxt);
 
@@ -3050,7 +3946,7 @@ lion_sumall_relation(LionCountScanState *st)
 		}
 
 		total += lion_count_sources_cached(st->heap, estate->es_snapshot,
-										  st->nclause + 1, st->sources,
+										  st->nsource, st->sources,
 										  &st->stats, st->viscache);
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
@@ -3103,7 +3999,7 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		}
 
 		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
-										 st->nclause + 1, st->sources,
+										 st->nsource, st->sources,
 										 &st->stats, st->viscache);
 		keyisnull = st->groupset.keyisnull;
 		lion_posting_set_release(&st->groupset);
@@ -3113,8 +4009,137 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		if (count == 0)
 			continue;
 
-		return lion_emit_tuple(st, key, keyisnull, count);
+		return lion_emit_tuple(st, key, keyisnull, (Datum) 0, true, count);
 	}
+}
+
+/*
+ * The same for a GROUP BY over TWO indexed columns (DESIGN.md §20).
+ *
+ * A nested loop over the two indexes' entries: the outer index - the one with
+ * fewer entries, chosen at plan time - drives the scan exactly as a single
+ * group column's does, and for each of its entries every key of the inner
+ * index is tried.  A pair's count is the intersection of the two groups'
+ * posting sets with the WHERE sources, and only a pair with at least one
+ * visible row is a group at all, so only those are emitted.
+ *
+ * Pins and memory (DESIGN.md §9).  The outer group's set is located once and
+ * held - with its pin - for the whole of its inner loop, in outercxt; each
+ * pair's inner set is located, counted and released inside pergroup, so at
+ * most two group pins exist at a time however many distinct values either
+ * column has.  The inner keys were read once per relation into innercxt
+ * (lion_load_inner_keys()); when they did not fit its budget, innerkey is
+ * NULL and the inner index's entry scan is walked once per outer group
+ * instead, which holds one pin at a time as well.
+ */
+static TupleTableSlot *
+lion_next_group2(LionCountScanState *st, bool *exhausted)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+
+	*exhausted = false;
+
+	for (;;)
+	{
+		Datum		ikey = (Datum) 0;
+		bool		ikeyisnull;
+		int64		count;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* ---- the outer group ---- */
+		if (!st->outeropen)
+		{
+			MemoryContextReset(st->outercxt);
+			oldcxt = MemoryContextSwitchTo(st->outercxt);
+			if (!lion_entry_scan_next(&st->escan, &st->outerkey, &st->groupset))
+			{
+				MemoryContextSwitchTo(oldcxt);
+				*exhausted = true;
+				return NULL;
+			}
+			MemoryContextSwitchTo(oldcxt);
+			st->outerisnull = st->groupset.keyisnull;
+			st->outeropen = true;
+			st->inneridx = 0;
+		}
+
+		/*
+		 * The row we returned last time may point into pergroup (the fallback
+		 * path's inner key does), and the caller is done with it by now: a
+		 * scan node's tuple is only guaranteed until its next call.
+		 */
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		/* ---- the next inner group of it ---- */
+		if (st->innerkey != NULL)
+		{
+			int			i = st->inneridx;
+
+			if (i >= st->ninnerkey)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				lion_posting_set_release(&st->groupset);
+				st->outeropen = false;
+				continue;
+			}
+			st->inneridx++;
+
+			ikey = st->innerkey[i];
+			ikeyisnull = st->innerisnull[i];
+			if (ikeyisnull)
+				(void) lion_posting_set_lookup_null(st->groupidx2,
+												   &st->groupset2);
+			else
+				(void) lion_posting_set_lookup(st->groupidx2, ikey, InvalidOid,
+											  &st->groupset2);
+		}
+		else
+		{
+			if (!st->scanning2)
+			{
+				lion_entry_scan_begin(&st->escan2, st->groupidx2);
+				st->scanning2 = true;
+			}
+			if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
+			{
+				MemoryContextSwitchTo(oldcxt);
+				lion_entry_scan_end(&st->escan2);
+				st->scanning2 = false;
+				lion_posting_set_release(&st->groupset);
+				st->outeropen = false;
+				continue;
+			}
+			ikeyisnull = st->groupset2.keyisnull;
+		}
+
+		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
+										 st->nsource, st->sources,
+										 &st->stats, st->viscache);
+		lion_posting_set_release(&st->groupset2);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* A group exists only if at least one of its rows is visible. */
+		if (count == 0)
+			continue;
+
+		return lion_emit_tuple(st, st->outerkey, st->outerisnull,
+							  ikey, ikeyisnull, count);
+	}
+}
+
+/*
+ * Whichever of the two the plan asks for.
+ */
+static TupleTableSlot *
+lion_next_group_any(LionCountScanState *st, bool *exhausted)
+{
+	if (st->groupattno2 != 0)
+		return lion_next_group2(st, exhausted);
+	return lion_next_group(st, exhausted);
 }
 
 /*
@@ -3127,7 +4152,7 @@ lion_run_partition(LionCountScanState *st, int p)
 	int64		count;
 
 	lion_open_relation(st, st->part[p].heapoid, st->part[p].groupidxoid,
-					  st->part[p].clauseidxoid);
+					  st->part[p].groupidxoid2, st->part[p].clauseidxoid);
 	lion_locate_where(st);
 
 	if (st->hasgroupidx)
@@ -3174,6 +4199,7 @@ lion_next_partial_group(LionCountScanState *st)
 
 			lion_open_relation(st, st->part[st->curpart].heapoid,
 							  st->part[st->curpart].groupidxoid,
+							  st->part[st->curpart].groupidxoid2,
 							  st->part[st->curpart].clauseidxoid);
 			lion_locate_where(st);
 			st->partopen = true;
@@ -3193,7 +4219,7 @@ lion_next_partial_group(LionCountScanState *st)
 		if (st->scanning)
 		{
 			bool		exhausted;
-			TupleTableSlot *slot = lion_next_group(st, &exhausted);
+			TupleTableSlot *slot = lion_next_group_any(st, &exhausted);
 
 			if (!exhausted)
 				return slot;
@@ -3236,7 +4262,7 @@ lion_exec_partitioned(LionCountScanState *st)
 	if (total == 0 && st->singlegroup)
 		return NULL;
 
-	return lion_emit_tuple(st, (Datum) 0, true, total);
+	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 }
 
 static TupleTableSlot *
@@ -3280,7 +4306,7 @@ lion_exec_custom_scan(CustomScanState *node)
 		if (count == 0 && st->singlegroup)
 			return NULL;
 
-		return lion_emit_tuple(st, (Datum) 0, true, count);
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
 	}
 
 	/* ---- the group index drives the count ---- */
@@ -3289,7 +4315,7 @@ lion_exec_custom_scan(CustomScanState *node)
 		st->done = true;
 		/* A sum over all entries still has to report its one row. */
 		if (st->sumall)
-			return lion_emit_tuple(st, (Datum) 0, true, 0);
+			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 0);
 		return NULL;
 	}
 
@@ -3319,20 +4345,20 @@ lion_exec_custom_scan(CustomScanState *node)
 			}
 
 			total += lion_count_sources_cached(st->heap, estate->es_snapshot,
-											  st->nclause + 1, st->sources,
+											  st->nsource, st->sources,
 											  &st->stats, st->viscache);
 			lion_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
 		}
 
 		st->done = true;
-		return lion_emit_tuple(st, (Datum) 0, true, total);
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 	}
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
 	{
 		bool		exhausted;
-		TupleTableSlot *slot = lion_next_group(st, &exhausted);
+		TupleTableSlot *slot = lion_next_group_any(st, &exhausted);
 
 		if (exhausted)
 			st->done = true;
@@ -3356,7 +4382,15 @@ lion_reset_run(LionCountScanState *st)
 		lion_entry_scan_end(&st->escan);
 		st->scanning = false;
 	}
+	if (st->scanning2)
+	{
+		lion_entry_scan_end(&st->escan2);
+		st->scanning2 = false;
+	}
 	lion_posting_set_release(&st->groupset);
+	lion_posting_set_release(&st->groupset2);
+	st->outeropen = false;
+	st->inneridx = 0;
 	lion_release_where(st);
 
 	if (st->npart > 0)
@@ -3364,6 +4398,8 @@ lion_reset_run(LionCountScanState *st)
 
 	if (st->pergroup != NULL)
 		MemoryContextReset(st->pergroup);
+	if (st->outercxt != NULL)
+		MemoryContextReset(st->outercxt);
 
 	for (i = 0; i < st->nclause; i++)
 	{
@@ -3425,6 +4461,19 @@ lion_end_custom_scan(CustomScanState *node)
 		MemoryContextDelete(st->pergroup);
 		st->pergroup = NULL;
 	}
+	if (st->outercxt != NULL)
+	{
+		MemoryContextDelete(st->outercxt);
+		st->outercxt = NULL;
+	}
+	if (st->innercxt != NULL)
+	{
+		MemoryContextDelete(st->innercxt);
+		st->innercxt = NULL;
+	}
+	st->innerkey = NULL;
+	st->innerisnull = NULL;
+	st->ninnerkey = 0;
 	if (st->wherecxt != NULL)
 	{
 		MemoryContextDelete(st->wherecxt);
@@ -3544,26 +4593,94 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 							 get_attname(st->heapoid, st->groupattno, false));
 		else
 			appendStringInfoString(&buf, "(all keys)");
+
+		/* The inner index of a two-column GROUP BY (DESIGN.md §20). */
+		if (st->groupattno2 != 0)
+		{
+			appendStringInfoString(&buf, ", ");
+			if (st->npart == 0)
+				appendStringInfo(&buf, "%s ", get_rel_name(st->groupidxoid2));
+			appendStringInfo(&buf, "(%s)",
+							 get_attname(st->heapoid, st->groupattno2, false));
+		}
 	}
 
-	for (i = 0; i < st->nclause; i++)
+	for (i = 0; i < st->nitem; i++)
 	{
+		int			orno = st->item[i].orno;
+
 		if (buf.len > 0)
 			appendStringInfoString(&buf, ", ");
-		if (st->npart == 0)
-			appendStringInfo(&buf, "%s ", get_rel_name(st->clause[i].idxoid));
-		appendStringInfoChar(&buf, '(');
-		lion_explain_clause(st, &st->clause[i], ancestors, es, &buf);
-		appendStringInfoChar(&buf, ')');
+
+		if (orno < 0)
+		{
+			if (st->npart == 0)
+				appendStringInfo(&buf, "%s ",
+								 get_rel_name(st->clause[st->item[i].clauseno].idxoid));
+			appendStringInfoChar(&buf, '(');
+			lion_explain_clause(st, &st->clause[st->item[i].clauseno],
+							   ancestors, es, &buf);
+			appendStringInfoChar(&buf, ')');
+		}
+		else
+		{
+			/*
+			 * An OR is one source over several indexes (DESIGN.md §19), so it
+			 * names all of them and then prints the boolean expression:
+			 * `ix_a, ix_b ((a = 1) OR (b = 2))`.
+			 */
+			LionOrState *o = &st->ors[orno];
+			int			leaf;
+			int			arm;
+			int			j;
+
+			if (st->npart == 0)
+			{
+				for (leaf = 0; leaf < o->nleaves; leaf++)
+					appendStringInfo(&buf, "%s%s",
+									 leaf > 0 ? ", " : "",
+									 get_rel_name(st->clause[o->first + leaf].idxoid));
+				appendStringInfoChar(&buf, ' ');
+			}
+
+			appendStringInfoChar(&buf, '(');
+			leaf = 0;
+			for (arm = 0; arm < o->narms; arm++)
+			{
+				if (arm > 0)
+					appendStringInfoString(&buf, " OR ");
+				if (o->armlen[arm] > 1)
+					appendStringInfoChar(&buf, '(');
+				for (j = 0; j < o->armlen[arm]; j++, leaf++)
+				{
+					if (j > 0)
+						appendStringInfoString(&buf, " AND ");
+					appendStringInfoChar(&buf, '(');
+					lion_explain_clause(st, &st->clause[o->first + leaf],
+									   ancestors, es, &buf);
+					appendStringInfoChar(&buf, ')');
+				}
+				if (o->armlen[arm] > 1)
+					appendStringInfoChar(&buf, ')');
+			}
+			appendStringInfoChar(&buf, ')');
+		}
 	}
 
 	ExplainPropertyText("Lion Indexes", buf.data, es);
 	pfree(buf.data);
 
 	if (st->hasgroupidx && st->groupattno != 0)
-		ExplainPropertyText("Group Key",
-							get_attname(st->heapoid, st->groupattno, false),
-							es);
+	{
+		initStringInfo(&buf);
+		appendStringInfoString(&buf,
+							   get_attname(st->heapoid, st->groupattno, false));
+		if (st->groupattno2 != 0)
+			appendStringInfo(&buf, ", %s",
+							 get_attname(st->heapoid, st->groupattno2, false));
+		ExplainPropertyText("Group Key", buf.data, es);
+		pfree(buf.data);
+	}
 
 	if (es->analyze)
 	{

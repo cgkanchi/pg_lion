@@ -161,6 +161,17 @@ typedef struct LionCountSource
 	 * A negated source is subtracted whatever its shape.
 	 */
 	LionKeyNode *tree;
+
+	/*
+	 * Keep every set of this source on the pinned path: never serve one from
+	 * a private copy, however often it is counted (DESIGN.md §19).  The count
+	 * pushdown sets this on the source an OR across columns becomes, where a
+	 * dead TID may be contributed by a single leaf and the interlock the
+	 * source carries is "every leaf holds a pin" (lion_source_pinned(): OR ->
+	 * every child).  Everything else is free to be materialized under the
+	 * rules on lion_posting_set_materialize().
+	 */
+	bool		nomaterialize;
 } LionCountSource;
 
 /*

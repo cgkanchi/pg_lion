@@ -441,6 +441,128 @@ phase1() {
 		die "no generic WAL record was ever replayed: the crash phase proved nothing"
 }
 
+# ------------------------------------------------------------- phase 1b
+
+# A crash that lands exactly between the two steps of a whole-chain free
+# (DESIGN.md §18): the entries are deleted and WAL-logged, their container
+# pages are unreachable but not yet marked LION_PAGE_DELETED, and the server
+# dies.  The pages are then leaked, which is harmless by construction -
+# nothing references them - and the leak sweep at the end of the next
+# ambulkdelete is what turns them into free pages again.
+#
+# The crash point is deterministic: an injection point parks the VACUUM in
+# that window and the server is pulled out from under it.  A dedicated table
+# is used so that the keys that must empty out are exactly the ones this test
+# deletes, and so that nothing of the phase 1 fixture is disturbed.
+phase1b() {
+	local before after freed parked vacpid off warn
+	log ""
+	log "=== phase 1b: a crash between entry deletion and page marking ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ log "phase 1b skipped: this server has no injection_points extension"
+		  SUMMARY+=("phase1b            skipped (no injection points)"); return 0; }
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1b: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_leak;
+		CREATE TABLE lion_leak (id int, k int NOT NULL);
+		CREATE INDEX lion_leak_k ON lion_leak USING lion (k)
+			WITH (inline_limit = 64);
+		INSERT INTO lion_leak SELECT i, i % 6 FROM generate_series(1, 120000) i;
+	SQL
+	psql_p -c "VACUUM (ANALYZE) lion_leak" >>"$RUNLOG" 2>&1
+	before=$(psql_p -tAc "select container_pages from lion_index_stats('lion_leak_k')")
+	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_leak WHERE k IN (0,1,2,3)" \
+		>>"$RUNLOG" 2>&1 || die "phase 1b: delete failed"
+
+	# Park the VACUUM in the window and crash the server under it.
+	psql_p -c "SELECT injection_points_attach('lion-vacuum-entries-deleted', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1b: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "VACUUM (INDEX_CLEANUP ON) lion_leak" >>"$RUNLOG" 2>&1 &
+	vacpid=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-vacuum-entries-deleted'" \
+		60 "the VACUUM to park between the entry deletion and the page marking"
+
+	# ambulkdelete's records belong to no transaction, so nothing has flushed
+	# them: a crash here would simply lose the whole index vacuum and VACUUM
+	# would redo it (correct, but it would test nothing).  A checkpoint makes
+	# the first of the two steps durable, so the crash really does land
+	# BETWEEN them.
+	psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
+	parked=$(psql_p -tAc "select entries from lion_index_stats('lion_leak_k')")
+	log "phase 1b: parked with $parked of 6 entries left"
+	[ "$parked" -lt 6 ] ||
+		die "phase 1b: the VACUUM parked before it had deleted an entry"
+
+	crash_immediate
+	wait "$vacpid" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+
+	# recovery_evidence() is deliberately NOT used here.  The checkpoint above
+	# is what makes this crash land between the two steps, and it also leaves
+	# redo almost nothing to do; what this round proves is the leak and the
+	# sweep, and phase 1 is what proves replay.
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
+		grep -q "database system was not properly shut down" ||
+		die "phase 1b: the restart did not report an unclean shutdown"
+
+	# The entries really are gone, the pages really are leaked (verify()
+	# tolerates unreferenced EMPTY container pages, with a WARNING), and the
+	# index still answers correctly.
+	after=$(psql_p -tAc "select entries from lion_index_stats('lion_leak_k')")
+	[ "$after" = "$parked" ] ||
+		die "phase 1b: the entry deletion did not survive the crash ($after entries, $parked before)"
+
+	# The pages of the chain that entry owned are now LEAKED: unreferenced,
+	# and not yet marked free.  verify() says so (a WARNING, not an error) and
+	# the index still answers correctly.
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_leak_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unused and unreachable' || true)
+	[ "$warn" -gt 0 ] ||
+		die "phase 1b: no page was leaked, so the crash did not land between the two steps"
+	run_check "phase 1b post-crash" psql_p \
+		"select (select entries from lion_index_stats('lion_leak_k')) < 6 as ok,
+				format('entries left: %s of 6, %s pages leaked',
+					   (select entries from lion_index_stats('lion_leak_k')), $warn) as detail
+		 union all
+		 select (select count(*) from lion_leak where k = 4) = 20000,
+				'k = 4 still answers 20000 rows'
+		 union all
+		 select (select count(*) from lion_leak where k = 0) = 0,
+				'k = 0 answers no rows'"
+
+	# The sweep recovers them: the next ambulkdelete reads the blocks its walk
+	# did not account for, turns the leaked ones into DELETED pages and
+	# records them in the free space map.  verify() then has nothing left to
+	# warn about, which is the assertion that the leak is gone.
+	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_leak WHERE k = 4" \
+		>>"$RUNLOG" 2>&1
+	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_leak" >>"$RUNLOG" 2>&1
+	freed=$(psql_p -tAc "select deleted_pages from lion_index_stats('lion_leak_k')")
+	[ "$freed" -gt 0 ] ||
+		die "phase 1b: the leak sweep recovered no pages (deleted_pages = $freed)"
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_leak_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unused and unreachable' || true)
+	[ "$warn" = 0 ] ||
+		die "phase 1b: $warn page(s) are still leaked after the sweep"
+
+	psql_p -c "SELECT injection_points_detach('lion-vacuum-entries-deleted')" \
+		>>"$RUNLOG" 2>&1 || true
+	psql_p -c "DROP TABLE lion_leak" >>"$RUNLOG" 2>&1
+
+	log "phase 1b: the entry deletion survived the crash and the sweep recovered $freed pages (of $before container pages)"
+	SUMMARY+=("phase1b            crash between the two steps; sweep recovered $freed pages")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -572,6 +694,111 @@ rr_variant() {
 	SUMMARY+=("phase2 catchup feedback=$feedback  fresh standby count of k4=$key is $fresh, primary $after")
 }
 
+# Chain free and page reuse, replayed on a standby while a reader works
+# through the very pages being recycled (DESIGN.md §18).
+#
+# On a standby, generic WAL cannot raise a recovery conflict, so replay may
+# reuse a page under a reader's feet.  What keeps that reader honest is the
+# owner in each container page's special area: a page that no longer claims
+# the chain a reader came from ends that reader's walk.  Here the primary
+# empties two keys (entries deleted, chains freed, pages recorded free) and
+# then fills two new ones, which take those pages back; a standby reader runs
+# against the index throughout, and afterwards the standby must answer exactly
+# what the primary answers for every key.
+standby_chain_reuse() {
+	local loop flag errf=$BASE/standby_reuse.err k p_out s_out freed
+	log ""
+	log "-- standby: chain free and page reuse under a reader"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_chain_reuse: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_reuse;
+		CREATE TABLE lion_reuse (id int, k int NOT NULL);
+		CREATE INDEX lion_reuse_k ON lion_reuse USING lion (k)
+			WITH (inline_limit = 64);
+		INSERT INTO lion_reuse SELECT i, i % 4 FROM generate_series(1, 40000) i;
+	SQL
+	psql_p -c "VACUUM (ANALYZE) lion_reuse" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	# A standby reader that keeps asking the index questions for as long as
+	# the primary is freeing and recycling pages underneath it.  One short
+	# query every 200 ms, not a tight loop: it has to coexist with replay,
+	# not starve it.  The flag file is what stops it, so that nothing is left
+	# spinning if a step below fails.
+	flag=$BASE/standby_reuse.run
+	: >"$flag"
+	: >"$errf"
+	(
+		while [ -f "$flag" ]; do
+			"$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -h "$SOCKDIR" \
+				-p "$STANDBY_PORT" -U postgres -d "$DBNAME" -tAc \
+				"SET enable_seqscan = off;
+				 SELECT count(*) FROM lion_reuse WHERE k = 2;
+				 SELECT count(*) FROM lion_reuse WHERE k = 3;
+				 SELECT lion_index_count('lion_reuse_k'::regclass, 2::int4)" \
+				>/dev/null 2>>"$errf" || true
+			command sleep 0.2
+		done
+	) &
+	loop=$!
+
+	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_reuse WHERE k IN (0, 1)" \
+		>>"$RUNLOG" 2>&1 || { rm -f "$flag"; die "standby_chain_reuse: delete failed"; }
+	# hot_standby_feedback is on here, so the primary's removal horizon is the
+	# standby's oldest snapshot as the standby last REPORTED it, and that
+	# report is only sent every wal_receiver_status_interval.  So the VACUUM
+	# may find nothing removable for a few seconds after the delete; retry it
+	# until the chains really are freed.
+	wait_catchup
+	freed=0
+	for i in $(seq 1 40); do
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_reuse" >>"$RUNLOG" 2>&1
+		freed=$(psql_p -tAc "select deleted_pages from lion_index_stats('lion_reuse_k')")
+		[ "${freed:-0}" -gt 0 ] && break
+		nap 0.5
+	done
+	psql_p -c "SET synchronous_commit = on;
+			   INSERT INTO lion_reuse SELECT i, 4 + (i % 2)
+				 FROM generate_series(100001, 120000) i" >>"$RUNLOG" 2>&1 ||
+		{ rm -f "$flag"; die "standby_chain_reuse: the reusing insert failed"; }
+	psql_p -c "VACUUM (ANALYZE) lion_reuse" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	rm -f "$flag"
+	wait "$loop" 2>/dev/null || true
+
+	[ "${freed:-0}" -gt 0 ] ||
+		die "standby_chain_reuse: the primary freed no pages (deleted_pages = $freed)"
+	if grep -q . "$errf" 2>/dev/null; then
+		head -10 "$errf" >&2
+		die "standby_chain_reuse: the standby reader hit errors (see $errf)"
+	fi
+
+	# Every key, primary against standby, through the index on both sides.
+	for k in 0 1 2 3 4 5; do
+		p_out=$(psql_p -tAc "set enable_seqscan=off;
+							 select count(*) from lion_reuse where k = $k")
+		s_out=$(psql_s -tAc "set enable_seqscan=off;
+							 select count(*) from lion_reuse where k = $k")
+		[ "$p_out" = "$s_out" ] ||
+			die "standby_chain_reuse: k = $k is $p_out on the primary and $s_out on the standby"
+	done
+
+	run_check "standby reuse" psql_s \
+		"select (select count(*) from lion_reuse where k = 0) = 0,
+				'freed key 0 answers no rows on the standby'
+		 union all
+		 select (select count(*) from lion_reuse where k = 4) = 10000,
+				'recycled pages answer key 4 correctly on the standby'"
+
+	psql_p -c "DROP TABLE lion_reuse" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	log "standby: $freed freed pages were recycled and replayed with a reader running"
+	SUMMARY+=("phase2 standby      chain free + reuse replayed under a reader ($freed pages)")
+}
+
 phase2() {
 	local probe_p probe_s ck
 	log ""
@@ -607,6 +834,8 @@ phase2() {
 	fi
 	log "standby: all $(wc -l <"$probe_s") index probes identical to the primary"
 	SUMMARY+=("phase2 standby      $(wc -l <"$probe_s") index probes identical to the primary")
+
+	standby_chain_reuse
 
 	rr_variant on 11
 	rr_variant off 7
@@ -659,6 +888,7 @@ run_check "baseline" psql_p "select * from lion_rec_check(true, true)"
 log "-- baseline: $NCHECKS checks ok"
 
 phase1
+phase1b
 phase2
 
 END=$(now_ms)

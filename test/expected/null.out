@@ -578,7 +578,7 @@ SELECT lion_index_verify('lion_null_k', true);
 SELECT entries, null_tids FROM lion_index_stats('lion_null_k');
  entries | null_tids 
 ---------+-----------
-       6 |         0
+       5 |         0
 (1 row)
 
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');

@@ -205,9 +205,16 @@ SELECT bitset_containers > 0 AS key2_has_bitsets
 DELETE FROM lion_mid WHERE k = 1;
 VACUUM lion_mid;
 INSERT INTO lion_mid SELECT i, 2 + (i % 2) FROM generate_series(300001, 400000) i;
--- the new containers do not fit where they belong, so pages were split
-SELECT (SELECT container_pages FROM lion_index_stats('lion_mid_k')) >
-	   (SELECT container_pages FROM lion_mid_before) AS pages_split;
+/*
+ * Key 1's posting set is empty after the VACUUM, so its entry is deleted and
+ * its whole chain is freed (DESIGN.md §18).  The pages the new containers
+ * need therefore come back out of the free space map instead of extending the
+ * relation: the index holds no MORE container pages than it did before, even
+ * though the containers that go in do not fit where they belong and split the
+ * pages they land on.
+ */
+SELECT (SELECT container_pages FROM lion_index_stats('lion_mid_k')) <=
+	   (SELECT container_pages FROM lion_mid_before) AS pages_reused;
 SELECT lion_index_verify('lion_mid_k', true);
 SELECT lion_cmp('lion_mid', 'k = 2');
 SELECT lion_cmp('lion_mid', 'k = 3');

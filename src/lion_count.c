@@ -727,11 +727,12 @@ lion_posting_set_materialize(LionPostingSet *ps)
 		pagebuf = ReadBuffer(ps->index, blkno);
 		LockBuffer(pagebuf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(pagebuf);
-		if (!LionPageIsContainer(page))
+
+		/* The chain-ownership check of DESIGN.md §18; see lion_cursor_next_item(). */
+		if (!lion_page_owns(page, ps->head))
 		{
 			UnlockReleaseBuffer(pagebuf);
-			elog(ERROR, "lion index: block %u is not a container page",
-				 blkno);
+			break;
 		}
 		memcpy(img, page, BLCKSZ);
 		UnlockReleaseBuffer(pagebuf);
@@ -937,11 +938,24 @@ lion_cursor_next_item(LionSetCursor *cur)
 		buf = ReadBuffer(cur->set->index, cur->nextblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (!LionPageIsContainer(page))
+
+		/*
+		 * DESIGN.md §18: every page reached through an entry's head or a
+		 * rightlink has to still claim that chain.  A head block is the one
+		 * block this index never recycles, so owner_head identifies the chain
+		 * for the whole life of the index and a mismatch can only mean that
+		 * the chain was freed after this posting set was located - which
+		 * VACUUM does only once the set held nothing visible to anyone.  The
+		 * cursor then simply ends here and contributes nothing further; it is
+		 * never an error outside verify().  This is also what keeps a standby
+		 * reader safe, where replay can reuse a page under a held pin because
+		 * generic WAL cannot raise a recovery conflict.
+		 */
+		if (!lion_page_owns(page, cur->set->head))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index: block %u is not a container page",
-				 cur->nextblk);
+			cur->nextblk = InvalidBlockNumber;
+			return NULL;
 		}
 
 		/*
@@ -2834,6 +2848,17 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 
 	for (i = 0; i < nsources; i++)
 	{
+		/*
+		 * Rule 3 (DESIGN.md §19): a source may forbid it outright.  An OR
+		 * across columns does, because a dead TID may be contributed by any
+		 * single leaf of the union and the interlock the source carries is
+		 * that EVERY leaf holds a pin (lion_source_pinned()); keeping that
+		 * property is simpler than reasoning about which other source
+		 * happened to carry the interlock at the container key in question.
+		 */
+		if (sources[i].nomaterialize)
+			continue;
+
 		for (j = 0; j < sources[i].nsets; j++)
 		{
 			LionPostingSet *ps = &sources[i].sets[j];
@@ -3164,6 +3189,25 @@ lion_entry_scan_begin(LionEntryScan *es, Relation index)
 	es->done = false;
 }
 
+/*
+ * Fetch the next entry of the index.
+ *
+ * The scan gives up its lock on a bucket page between calls and comes back to
+ * the offset it stopped at, so it depends on entry offsets being stable.
+ * They are: an entry is only ever overwritten in place
+ * (PageIndexTupleOverwrite keeps the offset) or deleted by VACUUM through
+ * lion_delete_entries(), which frees the item but leaves the line pointer
+ * array alone for exactly this reason (DESIGN.md §18).  A deleted entry
+ * therefore shows up as an unused line pointer and is skipped, and no other
+ * entry moves, so a concurrent VACUUM can neither make this scan skip a group
+ * nor return one twice.
+ *
+ * A group cannot be returned twice by the other route either - the entry
+ * deleted and the key inserted again further along the page - because VACUUM
+ * only deletes an entry whose posting set is EMPTY, and a posting set whose
+ * members are all dead to every snapshot has nothing this scan's snapshot
+ * could have counted before.
+ */
 bool
 lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 {
@@ -3176,6 +3220,19 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 		OffsetNumber maxoff;
 		BlockNumber next;
 		bool		got = false;
+
+		/*
+		 * Test hook: the scan is between two entries of one bucket page and
+		 * holds no lock on it at all, so a concurrent VACUUM is free to
+		 * delete entries from under it.  It fires once per bucket page (the
+		 * offsets of a page are consumed in ascending order), which is what
+		 * lets an isolation test park a GROUP BY here exactly once;
+		 * test/isolation/vacuum_entry_delete.spec proves that the resumed
+		 * scan neither skips a group nor returns one twice.  Compiles to
+		 * nothing without --enable-injection-points.
+		 */
+		if (es->off == OffsetNumberNext(FirstOffsetNumber))
+			INJECTION_POINT("lion-entry-scan-resumed", NULL);
 
 		buf = ReadBuffer(es->index, es->blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -3202,8 +3259,10 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 			entry = (LionEntryTuple *) PageGetItem(page, iid);
 
 			/*
-			 * VACUUM keeps entries whose posting set has become empty
-			 * (DESIGN.md section 5); they can never produce a group.
+			 * An entry whose posting set is empty can never produce a group.
+			 * VACUUM deletes those (DESIGN.md §18), but one can be seen here
+			 * between the moment its last TID was filtered out and the moment
+			 * the bucket page's final step removes it.
 			 */
 			if (entry->ntids == 0)
 				continue;

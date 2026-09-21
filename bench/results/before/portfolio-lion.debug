@@ -1,0 +1,8 @@
+DEBUG:  lion vacuum "ix_c2": total 34.3 ms (cleanup-lock wait 0.0, filter 19.9, apply 10.5, inline 0.0); pages 270 visited / 270 changed, 270 records, items 540 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "ix_c20": total 26.0 ms (cleanup-lock wait 0.0, filter 18.8, apply 3.5, inline 0.0); pages 274 visited / 271 changed, 271 records, items 4543 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "ix_c200": total 32.3 ms (cleanup-lock wait 0.0, filter 21.3, apply 5.2, inline 0.0); pages 400 visited / 400 changed, 400 records, items 9109 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "ix_c20k": total 132.2 ms (cleanup-lock wait 0.2, filter 0.0, apply 0.0, inline 117.8); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "ix_c1m": total 377.8 ms (cleanup-lock wait 0.7, filter 0.0, apply 0.0, inline 277.6); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "ix_clustered": total 18.1 ms (cleanup-lock wait 0.0, filter 0.0, apply 0.0, inline 17.4); pages 0 visited / 0 changed, 0 records, items 0 rewritten / 0 deleted, 0 regrown
+DEBUG:  lion vacuum "ix_skew": total 39.8 ms (cleanup-lock wait 0.0, filter 16.1, apply 1.8, inline 10.4); pages 54 visited / 54 changed, 54 records, items 270 rewritten / 0 deleted, 106 regrown
+DEBUG:  lion vacuum "ix_nullable": total 35.8 ms (cleanup-lock wait 0.1, filter 20.1, apply 8.6, inline 0.0); pages 427 visited / 427 changed, 427 records, items 8606 rewritten / 0 deleted, 0 regrown

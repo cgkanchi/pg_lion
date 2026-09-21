@@ -37,7 +37,7 @@
 PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_verify);
 
-#define LION_STATS_NCOLS		18
+#define LION_STATS_NCOLS		19
 
 typedef struct LionVerifyState
 {
@@ -118,6 +118,7 @@ typedef struct LionStats
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
 	int64		free_bytes;
+	int64		deleted_pages;	/* freed pages awaiting reuse (DESIGN.md §18) */
 } LionStats;
 
 /*
@@ -237,6 +238,18 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		}
 		else if (LionPageIsContainer(page))
 		{
+			/*
+			 * A DELETED page (DESIGN.md §18) holds nothing and is waiting in
+			 * the free space map to be handed out again; it is neither a
+			 * container page nor free space of one.
+			 */
+			if (LionPageIsDeleted(page))
+			{
+				st.deleted_pages++;
+				UnlockReleaseBuffer(buf);
+				continue;
+			}
+
 			st.container_pages++;
 			st.free_bytes += (int64) PageGetFreeSpace(page);
 
@@ -303,6 +316,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 	values[15] = Int64GetDatum(st.empty_tids);
 	values[16] = Int64GetDatum(st.slack_bytes);
 	values[17] = Int64GetDatum(st.max_bucket_pages);
+	values[18] = Int64GetDatum(st.deleted_pages);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -372,6 +386,12 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 		flags != LION_PAGE_CONTAINER)
 		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
 					RelationGetRelationName(vs->index), blk, opaque->flags);
+
+	/* Only a container page may ever carry the DELETED bit (DESIGN.md §18). */
+	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags != LION_PAGE_CONTAINER)
+		lion_corrupt("lion index \"%s\": block %u is marked deleted but is a %s page",
+					RelationGetRelationName(vs->index), blk,
+					flags == LION_PAGE_META ? "meta" : "bucket");
 
 	if (flags != kind)
 		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
@@ -453,10 +473,10 @@ lion_verify_item_slack(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 		lion_corrupt("lion index \"%s\": %s %u on block %u occupies %zu bytes, more than an item may ever take",
 					RelationGetRelationName(vs->index), what, off, blk, avail);
 
-	if (avail - size > LION_ITEM_SLACK_LIMIT)
+	if (avail - size > LION_ITEM_SLACK_BOUND)
 		lion_corrupt("lion index \"%s\": %s %u on block %u occupies %zu bytes, %zu more than its %zu bytes need (at most %d bytes of slack)",
 					RelationGetRelationName(vs->index), what, off, blk, avail,
-					avail - size, size, LION_ITEM_SLACK_LIMIT);
+					avail - size, size, LION_ITEM_SLACK_BOUND);
 }
 
 /*
@@ -584,6 +604,23 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
 		opaque = LionPageGetOpaque(page);
 		maxoff = PageGetMaxOffsetNumber(page);
+
+		/*
+		 * DESIGN.md §18.  A live entry must not reach a freed page at all,
+		 * and every page of a chain has to name that chain: readers rely on
+		 * both to tell a chain they still hold a link to from one whose pages
+		 * have been handed to somebody else.
+		 */
+		if (LionPageIsDeleted(page))
+			lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
+						RelationGetRelationName(vs->index), blk, eoff, eblk);
+
+		if (opaque->owner_head != entry->head ||
+			opaque->owner_hash != entry->hash)
+			lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is owned by hash %u at head %u, expected hash %u at head %u",
+						RelationGetRelationName(vs->index), blk, eoff, eblk,
+						opaque->owner_hash, opaque->owner_head,
+						entry->hash, entry->head);
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
@@ -763,6 +800,28 @@ lion_verify_entry(LionVerifyState *vs, uint32 bucket, BlockNumber blk,
 			ncontainers++;
 		}
 
+		/*
+		 * Whatever is left is the zeroed slack VACUUM leaves when it writes a
+		 * shrunken payload back into the bytes the entry already had
+		 * (DESIGN.md §18).  It is bounded so that it cannot hide a malformed
+		 * payload, and every byte of it has to really be zero.
+		 */
+		if (paylen - cur > LION_ENTRY_SLACK_BOUND)
+			lion_corrupt("lion index \"%s\": entry %u on block %u has %zu bytes of payload slack, at most %d allowed",
+						RelationGetRelationName(vs->index), off, blk,
+						paylen - cur, LION_ENTRY_SLACK_BOUND);
+		{
+			const char *pay = LionEntryGetPayload(entry);
+			Size		i;
+
+			for (i = cur; i < paylen; i++)
+			{
+				if (pay[i] != 0)
+					lion_corrupt("lion index \"%s\": entry %u on block %u has a non-zero byte at payload offset %zu, past its last item",
+								RelationGetRelationName(vs->index), off, blk, i);
+			}
+		}
+
 		if (card != entry->ntids)
 			lion_corrupt("lion index \"%s\": inline entry %u on block %u claims " UINT64_FORMAT " TIDs, but its payload holds " UINT64_FORMAT,
 						RelationGetRelationName(vs->index), off, blk,
@@ -920,6 +979,21 @@ lion_verify_reachable(LionVerifyState *vs)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 
+		/*
+		 * A DELETED page is the normal state of a freed one (DESIGN.md §18):
+		 * it is unreferenced on purpose, it is in the free space map, and the
+		 * next allocation whose safexid test it passes takes it.  Nothing to
+		 * report.
+		 */
+		if (!PageIsNew(page) &&
+			PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+			LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
+			LionPageIsDeleted(page))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
 		leaked = PageIsNew(page) ||
 			(PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
 			 LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
@@ -935,7 +1009,7 @@ lion_verify_reachable(LionVerifyState *vs)
 		ereport(WARNING,
 				(errmsg("lion index \"%s\": block %u is unused and unreachable",
 						RelationGetRelationName(vs->index), blk),
-				 errdetail("An interrupted page allocation leaks blocks; they are never reused in this version.")));
+				 errdetail("An interrupted page allocation leaks blocks; the next VACUUM turns them into free pages.")));
 	}
 }
 
@@ -992,8 +1066,9 @@ lion_verify_tid_present(LionVerifyState *vs, Datum key, uint16 reservedflag,
 		}
 		else
 		{
-			BlockNumber blk = lion_chain_find_page(index, entry->head,
-												  entry->tail, ckey);
+			BlockNumber blk = lion_chain_find_page(index, entry->hash,
+												  entry->head, entry->tail,
+												  ckey);
 			Buffer		cbuf;
 			Page		cpage;
 			OffsetNumber off;

@@ -502,17 +502,24 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt');
  not pushed down, 1 rows
 (1 row)
 
--- GROUP BY an unindexed column, and by more than one column
+-- GROUP BY an unindexed column, and by more than two columns
 SELECT lion_pd('SELECT id, count(*) FROM lion_pdt WHERE a = 3 GROUP BY id');
            lion_pd           
 -----------------------------
  not pushed down, 10000 rows
 (1 row)
 
+SELECT lion_pd('SELECT a, b, c, count(*) FROM lion_pdt GROUP BY a, b, c');
+          lion_pd          
+---------------------------
+ not pushed down, 140 rows
+(1 row)
+
+-- two indexed columns are the nested loop of DESIGN.md section 20, below
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
-         lion_pd          
---------------------------
- not pushed down, 70 rows
+       lion_pd        
+----------------------
+ pushed down, 70 rows
 (1 row)
 
 -- GROUP BY an expression
@@ -1430,6 +1437,921 @@ SELECT v.k, s.c FROM (VALUES (1), (3), (-1)) v(k),
 (3 rows)
 
 RESET pg_lion.enable_count_pushdown;
+-- ---- OR across columns (DESIGN.md section 19) ---------------------------
+/*
+ * `count(*) WHERE a = 17 OR b = 3` used to be declined and run as BitmapOr
+ * over a Bitmap Heap Scan, which at a few per cent selectivity touches nearly
+ * every heap page.  Now the whole restriction is ONE source - the union of
+ * its arms - which is ANDed with the other clauses and with a GROUP BY driver
+ * like any other.  Measured on a million rows of (c200, c20) on this
+ * assert-enabled build: 0.6 ms for the node against 18-30 ms for BitmapOr +
+ * heap (2026-09-21).
+ *
+ * Every arm has to be a positive clause the posting sets can answer, or an
+ * AND of such clauses, each on a column of the same relation with an index of
+ * its own; a negated arm is declined, because the complement of a posting set
+ * is not a posting set and under a union there is nothing to subtract it
+ * from.
+ */
+CREATE TABLE lion_pdo (id int NOT NULL, a int NOT NULL, b int NOT NULL,
+					   c text NOT NULL, n int);
+INSERT INTO lion_pdo
+SELECT i, i % 200, i % 20, 'c' || (i % 4),
+	   CASE WHEN i % 101 = 0 THEN NULL ELSE i % 5 END
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lion_pdo_a ON lion_pdo USING lion (a);
+CREATE INDEX lion_pdo_b ON lion_pdo USING lion (b);
+CREATE INDEX lion_pdo_c ON lion_pdo USING lion (c);
+CREATE INDEX lion_pdo_n ON lion_pdo USING lion (n);
+VACUUM ANALYZE lion_pdo;
+SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
+                          lion_plans                          
+--------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3))
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on lion_pdo
+         Recheck Cond: ((a = 17) OR (b = 3))
+         ->  BitmapOr
+               ->  Bitmap Index Scan on lion_pdo_a
+                     Index Cond: (a = 17)
+               ->  Bitmap Index Scan on lion_pdo_b
+                     Index Cond: (b = 3)
+(12 rows)
+
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- three arms
+SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3 OR c = 'c1'$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- an arm that is an AND
+SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 AND b = 3) OR c = 'c1'$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 AND b = 3) OR (c = 'c1' AND n = 2)$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_plans($$SELECT count(*) FROM lion_pdo WHERE (a = 17 AND b = 3) OR (c = 'c1' AND n = 2)$$);
+                                                    lion_plans                                                     
+-------------------------------------------------------------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_a, lion_pdo_b, lion_pdo_c, lion_pdo_n (((a = 17) AND (b = 3)) OR ((c = c1) AND (n = 2)))
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on lion_pdo
+         Recheck Cond: (((a = 17) AND (b = 3)) OR ((n = 2) AND (c = 'c1'::text)))
+         ->  BitmapOr
+               ->  BitmapAnd
+                     ->  Bitmap Index Scan on lion_pdo_a
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdo_b
+                           Index Cond: (b = 3)
+               ->  BitmapAnd
+                     ->  Bitmap Index Scan on lion_pdo_n
+                           Index Cond: (n = 2)
+                     ->  Bitmap Index Scan on lion_pdo_c
+                           Index Cond: (c = 'c1'::text)
+(18 rows)
+
+-- an OR next to a plain AND clause, and under a GROUP BY
+SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND c = 'c1'$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_plans($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND c = 'c1'$$);
+                                    lion_plans                                     
+-----------------------------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3)), lion_pdo_c (c = c1)
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on lion_pdo
+         Recheck Cond: ((a = 17) OR (b = 3))
+         Filter: (c = 'c1'::text)
+         ->  BitmapOr
+               ->  Bitmap Index Scan on lion_pdo_a
+                     Index Cond: (a = 17)
+               ->  Bitmap Index Scan on lion_pdo_b
+                     Index Cond: (b = 3)
+(13 rows)
+
+SELECT lion_pd('SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c');
+       lion_pd       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_plans('SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c');
+                                  lion_plans                                  
+------------------------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_c (c), lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3))
+   Group Key: c
+ -- off:
+ HashAggregate
+   Group Key: c
+   ->  Bitmap Heap Scan on lion_pdo
+         Recheck Cond: ((a = 17) OR (b = 3))
+         ->  BitmapOr
+               ->  Bitmap Index Scan on lion_pdo_a
+                     Index Cond: (a = 17)
+               ->  Bitmap Index Scan on lion_pdo_b
+                     Index Cond: (b = 3)
+(14 rows)
+
+-- two OR restrictions in one query are two sources
+SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND (c = 'c1' OR n = 2)$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_plans($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND (c = 'c1' OR n = 2)$$);
+                                                 lion_plans                                                 
+------------------------------------------------------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3)), lion_pdo_c, lion_pdo_n ((c = c1) OR (n = 2))
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on lion_pdo
+         Recheck Cond: ((a = 17) OR (b = 3))
+         Filter: ((c = 'c1'::text) OR (n = 2))
+         ->  BitmapOr
+               ->  Bitmap Index Scan on lion_pdo_a
+                     Index Cond: (a = 17)
+               ->  Bitmap Index Scan on lion_pdo_b
+                     Index Cond: (b = 3)
+(13 rows)
+
+-- IN and IS NULL arms
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a IN (17, 18) OR n IS NULL');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b IN (3, 4) OR n IS NULL');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a IN (17, 18) OR n IS NULL');
+                                 lion_plans                                  
+-----------------------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_a, lion_pdo_n ((a = ANY ({17,18})) OR (n IS NULL))
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on lion_pdo
+         Recheck Cond: ((a = ANY ('{17,18}'::integer[])) OR (n IS NULL))
+         ->  BitmapOr
+               ->  Bitmap Index Scan on lion_pdo_a
+                     Index Cond: (a = ANY ('{17,18}'::integer[]))
+               ->  Bitmap Index Scan on lion_pdo_n
+                     Index Cond: (n IS NULL)
+(12 rows)
+
+-- an arm whose value has no entry, and an OR none of whose arms has one
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 999 OR b = 3');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 999 OR b = 998');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- the results themselves
+SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3;
+ count 
+-------
+ 11000
+(1 row)
+
+SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c ORDER BY c;
+ c  | count 
+----+-------
+ c1 |  1000
+ c3 | 10000
+(2 rows)
+
+-- ---- ORs the node must decline -----------------------------------------
+-- a negated arm
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR n IS NOT NULL');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR NOT (b = 3)');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a = 17 OR n IS NOT NULL');
+                  lion_plans                   
+-----------------------------------------------
+ -- on:
+ Aggregate
+   ->  Seq Scan on lion_pdo
+         Filter: ((a = 17) OR (n IS NOT NULL))
+ -- off:
+ Aggregate
+   ->  Seq Scan on lion_pdo
+         Filter: ((a = 17) OR (n IS NOT NULL))
+(8 rows)
+
+-- an arm on a column with no lion index
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR id = 5');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- an arm the posting sets cannot answer without a recheck
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b > 3');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- one unusable leaf spoils its AND arm and with it the whole restriction
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE (a = 17 AND id = 5) OR b = 3');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+/*
+ * A column constrained only INSIDE an OR is constrained in no row of the
+ * result: the other arm selects rows it says nothing about.  So it makes no
+ * count(col) answerable, which is what these two check - the first would come
+ * out as count(*) and the second as 0 if an OR leaf were treated like a
+ * top-level clause.
+ */
+SELECT lion_pd('SELECT count(n) FROM lion_pdo WHERE n = 2 OR a = 17');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT count(n) FROM lion_pdo WHERE n IS NULL OR a = 17');
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ---- parameters inside the arms ----------------------------------------
+/*
+ * A Param stands wherever a Const may (DESIGN.md section 10), inside an arm
+ * as anywhere else, and an arm whose parameter comes out NULL selects nothing
+ * - the OR of the remaining arms is still the answer.
+ */
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdo WHERE a = $1 OR b = $2',
+				   '17, 3');
+    lion_pd_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdo WHERE a = $1 OR b = $2',
+				   'NULL::int, 3');
+    lion_pd_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdo WHERE a = $1 OR b = $2',
+				   '17, NULL::int');
+    lion_pd_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdo WHERE a = $1 OR b = $2',
+				   'NULL::int, NULL::int');
+    lion_pd_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd_prep('SELECT count(*) FROM lion_pdo WHERE a = ANY ($1) OR n IS NULL',
+				   'ARRAY[17,18]');
+    lion_pd_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd_prep('SELECT c, count(*) FROM lion_pdo WHERE a = $1 OR b = $2'
+				   ' GROUP BY c ORDER BY c', '17, 3');
+    lion_pd_prep     
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_ppo(int, int) AS
+	SELECT count(*) FROM lion_pdo WHERE a = $1 OR b = $2;
+EXPLAIN (COSTS OFF) EXECUTE lion_ppo(17, 3);
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = $1) OR (b = $2))
+(2 rows)
+
+EXECUTE lion_ppo(17, 3);
+ count 
+-------
+ 11000
+(1 row)
+
+EXECUTE lion_ppo(NULL, 3);
+ count 
+-------
+ 10000
+(1 row)
+
+EXECUTE lion_ppo(NULL, NULL);
+ count 
+-------
+     0
+(1 row)
+
+DEALLOCATE lion_ppo;
+RESET plan_cache_mode;
+-- an exec Param that changes between rescans
+EXPLAIN (COSTS OFF)
+SELECT v.k, s.c FROM (VALUES (17), (3), (-1)) v(k),
+	 LATERAL (SELECT count(*) AS c FROM lion_pdo WHERE a = v.k OR b = v.k) s;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Values Scan on "*VALUES*"
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_pdo_a, lion_pdo_b ((a = "*VALUES*".column1) OR (b = "*VALUES*".column1))
+(4 rows)
+
+SELECT v.k, s.c FROM (VALUES (17), (3), (-1)) v(k),
+	 LATERAL (SELECT count(*) AS c FROM lion_pdo WHERE a = v.k OR b = v.k) s
+	 ORDER BY v.k;
+ k  |   c   
+----+-------
+ -1 |     0
+  3 | 10000
+ 17 | 10000
+(3 rows)
+
+SET pg_lion.enable_count_pushdown = off;
+SELECT v.k, s.c FROM (VALUES (17), (3), (-1)) v(k),
+	 LATERAL (SELECT count(*) AS c FROM lion_pdo WHERE a = v.k OR b = v.k) s
+	 ORDER BY v.k;
+ k  |   c   
+----+-------
+ -1 |     0
+  3 | 10000
+ 17 | 10000
+(3 rows)
+
+RESET pg_lion.enable_count_pushdown;
+-- ---- a dirty heap, then an all-visible one ------------------------------
+/*
+ * Under a union a dead TID may be contributed by a single leaf, so every leaf
+ * of an OR is read the pinned way until the merged container has been through
+ * the visibility map (DESIGN.md section 19) and the TIDs the map cannot vouch
+ * for are resolved against the snapshot like any other.
+ */
+DELETE FROM lion_pdo WHERE id % 7 = 0;
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c');
+       lion_pd       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_pd_counters('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
+         lion_pd_counters          
+-----------------------------------
+ Heap Blocks Skipped via VM = 0
+ Heap TIDs Rechecked > 0
+ Heap Blocks Rechecked > 0
+ Containers Visited > 0
+ Heap Blocks From Cache = 0
+ Heap Blocks Past Cache Budget = 0
+(6 rows)
+
+VACUUM lion_pdo;
+SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c');
+       lion_pd       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_pd_counters('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
+         lion_pd_counters          
+-----------------------------------
+ Heap Blocks Skipped via VM > 0
+ Heap TIDs Rechecked = 0
+ Heap Blocks Rechecked = 0
+ Containers Visited > 0
+ Heap Blocks From Cache = 0
+ Heap Blocks Past Cache Budget = 0
+(6 rows)
+
+SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c ORDER BY c;
+ c  | count 
+----+-------
+ c1 |   857
+ c3 |  8571
+(2 rows)
+
+-- ---- a multi-key arm (DESIGN.md section 17) -----------------------------
+CREATE TABLE lion_pdmo (id int NOT NULL, k int NOT NULL, tags text[]);
+INSERT INTO lion_pdmo
+SELECT i, i % 50, ARRAY['t' || (i % 13), 't' || (i % 29)]
+  FROM generate_series(1, 50000) i;
+CREATE INDEX lion_pdmo_k ON lion_pdmo USING lion (k);
+CREATE INDEX lion_pdmo_tags ON lion_pdmo USING lion (tags);
+VACUUM ANALYZE lion_pdmo;
+SELECT lion_plans($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5}' OR k = 7$$);
+                               lion_plans                                
+-------------------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdmo_tags, lion_pdmo_k ((tags @> {t5}) OR (k = 7))
+ -- off:
+ Aggregate
+   ->  Bitmap Heap Scan on lion_pdmo
+         Recheck Cond: ((tags @> '{t5}'::text[]) OR (k = 7))
+         ->  BitmapOr
+               ->  Bitmap Index Scan on lion_pdmo_tags
+                     Index Cond: (tags @> '{t5}'::text[])
+               ->  Bitmap Index Scan on lion_pdmo_k
+                     Index Cond: (k = 7)
+(12 rows)
+
+SELECT lion_pd($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5}' OR k = 7$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5,t7}' OR k = 7$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd($$SELECT count(*) FROM lion_pdmo WHERE tags && '{t5,t7}' OR k = 7$$);
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- an ALL-mode query, and a parameter that has no shape at plan time: declined
+SELECT lion_pd($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{}' OR k = 7$$);
+         lion_pd         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd_prep($$SELECT count(*) FROM lion_pdmo WHERE tags @> $1 OR k = 7$$,
+				   $$'{t5}'::text[]$$);
+      lion_pd_prep       
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ---- a partitioned table (DESIGN.md section 16) -------------------------
+CREATE TABLE lion_pdpo (id int NOT NULL, a int NOT NULL, b int NOT NULL)
+	PARTITION BY RANGE (id);
+CREATE TABLE lion_pdpo1 PARTITION OF lion_pdpo FOR VALUES FROM (0) TO (50000);
+CREATE TABLE lion_pdpo2 PARTITION OF lion_pdpo FOR VALUES FROM (50000) TO (100000);
+INSERT INTO lion_pdpo SELECT i, i % 200, i % 20 FROM generate_series(0, 99999) i;
+CREATE INDEX ON lion_pdpo1 USING lion (a);
+CREATE INDEX ON lion_pdpo1 USING lion (b);
+CREATE INDEX ON lion_pdpo2 USING lion (a);
+CREATE INDEX ON lion_pdpo2 USING lion (b);
+VACUUM ANALYZE lion_pdpo;
+SELECT lion_plans('SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3');
+                          lion_plans                           
+---------------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Partitions: lion_pdpo1, lion_pdpo2
+   Lion Indexes: ((a = 17) OR (b = 3))
+ -- off:
+ Aggregate
+   ->  Append
+         ->  Bitmap Heap Scan on lion_pdpo1 lion_pdpo_1
+               Recheck Cond: ((a = 17) OR (b = 3))
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on lion_pdpo1_a_idx
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdpo1_b_idx
+                           Index Cond: (b = 3)
+         ->  Bitmap Heap Scan on lion_pdpo2 lion_pdpo_2
+               Recheck Cond: ((a = 17) OR (b = 3))
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on lion_pdpo2_a_idx
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdpo2_b_idx
+                           Index Cond: (b = 3)
+(21 rows)
+
+SELECT lion_pd('SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_plans('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP BY a');
+                          lion_plans                           
+---------------------------------------------------------------
+ -- on:
+ Finalize HashAggregate
+   Group Key: lion_pdpo.a
+   ->  Custom Scan (LionCount)
+         Partitions: lion_pdpo1, lion_pdpo2
+         Lion Indexes: (a), ((a = 17) OR (b = 3))
+         Group Key: a
+ -- off:
+ HashAggregate
+   Group Key: lion_pdpo.a
+   ->  Append
+         ->  Bitmap Heap Scan on lion_pdpo1 lion_pdpo_1
+               Recheck Cond: ((a = 17) OR (b = 3))
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on lion_pdpo1_a_idx
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdpo1_b_idx
+                           Index Cond: (b = 3)
+         ->  Bitmap Heap Scan on lion_pdpo2 lion_pdpo_2
+               Recheck Cond: ((a = 17) OR (b = 3))
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on lion_pdpo2_a_idx
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdpo2_b_idx
+                           Index Cond: (b = 3)
+(25 rows)
+
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP BY a');
+       lion_pd        
+----------------------
+ pushed down, 11 rows
+(1 row)
+
+SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3;
+ count 
+-------
+  5500
+(1 row)
+
+-- ---- GROUP BY two indexed columns (DESIGN.md section 20) ----------------
+/*
+ * A nested loop over the two indexes' entries: the column with FEWER distinct
+ * values drives the scan (it is the outer one, and EXPLAIN names it first),
+ * the other index's keys are read once per relation, and each (outer, inner)
+ * pair is counted as the intersection of the two groups' posting sets with
+ * the WHERE sources.  Only a pair with a visible row is a group.
+ *
+ * The cost of that is the product of the two cardinalities, and the estimate
+ * has to say so.  Measured on the 200k-row table further down (uncorrelated
+ * columns, 100-byte rows, assert build, 2026-09-21): 20 x 2 groups run in
+ * 5.6 ms against the sequential aggregate's 37.3 ms and 200 x 2 in 14.9
+ * against 39.3, while 200 x 20 is 60.7 against 36.8 and 20000 x 2 is 169.8
+ * against 51.6 - so the middle of that range is where the node stops winning,
+ * and the model must stop choosing it there.
+ */
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+       lion_pd        
+----------------------
+ pushed down, 63 rows
+(1 row)
+
+SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+                   lion_plans                   
+------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdt_b (b), lion_pdt_a (a)
+   Group Key: b, a
+ -- off:
+ HashAggregate
+   Group Key: a, b
+   ->  Seq Scan on lion_pdt
+(8 rows)
+
+SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' GROUP BY a, b$$);
+         lion_pd          
+--------------------------
+ not pushed down, 28 rows
+(1 row)
+
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a, b');
+       lion_pd       
+---------------------
+ pushed down, 9 rows
+(1 row)
+
+SELECT lion_pd('SELECT b, a, count(*) FROM lion_pdt GROUP BY b, a');
+       lion_pd        
+----------------------
+ pushed down, 63 rows
+(1 row)
+
+-- NULLs in either column: each one's NULL group is its index's NULL entry
+SELECT lion_pd('SELECT a, n, count(*) FROM lion_pdt GROUP BY a, n');
+       lion_pd        
+----------------------
+ pushed down, 18 rows
+(1 row)
+
+SELECT lion_pd('SELECT n, a, count(*) FROM lion_pdt GROUP BY n, a');
+       lion_pd        
+----------------------
+ pushed down, 18 rows
+(1 row)
+
+SELECT lion_pd('SELECT n, c, count(*) FROM lion_pdt GROUP BY n, c');
+       lion_pd        
+----------------------
+ pushed down, 22 rows
+(1 row)
+
+-- count(col) of a group column is 0 in that column's NULL group (section 14)
+SELECT lion_pd('SELECT a, n, count(n) FROM lion_pdt GROUP BY a, n');
+       lion_pd        
+----------------------
+ pushed down, 18 rows
+(1 row)
+
+SELECT lion_pd('SELECT a, n, count(a) FROM lion_pdt GROUP BY a, n');
+       lion_pd        
+----------------------
+ pushed down, 18 rows
+(1 row)
+
+-- an OR restriction under a two-column grouping
+SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' OR n = 2 GROUP BY a, b$$);
+       lion_pd        
+----------------------
+ pushed down, 35 rows
+(1 row)
+
+-- the results themselves
+SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b ORDER BY a, b LIMIT 8;
+ a | b | count 
+---+---+-------
+ 0 | 0 |   933
+ 0 | 1 |   933
+ 0 | 2 |   933
+ 0 | 3 |   933
+ 0 | 4 |   934
+ 0 | 5 |   933
+ 0 | 6 |   934
+ 1 | 0 |   952
+(8 rows)
+
+SELECT a, n, count(*) FROM lion_pdt GROUP BY a, n ORDER BY a, n NULLS LAST LIMIT 8;
+ a | n | count 
+---+---+-------
+ 0 | 0 |  6468
+ 0 |   |    65
+ 1 | 1 |  6601
+ 1 |   |    66
+ 2 | 2 |  6601
+ 2 |   |    66
+ 3 | 3 |  6600
+ 3 |   |    66
+(8 rows)
+
+-- a dirty heap, then a clean one
+DELETE FROM lion_pdt WHERE id % 11 = 0;
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+       lion_pd        
+----------------------
+ pushed down, 63 rows
+(1 row)
+
+SELECT lion_pd('SELECT a, n, count(*) FROM lion_pdt GROUP BY a, n');
+       lion_pd        
+----------------------
+ pushed down, 18 rows
+(1 row)
+
+SELECT lion_pd_counters('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+         lion_pd_counters          
+-----------------------------------
+ Heap Blocks Skipped via VM = 0
+ Heap TIDs Rechecked > 0
+ Heap Blocks Rechecked > 0
+ Containers Visited > 0
+ Heap Blocks From Cache > 0
+ Heap Blocks Past Cache Budget = 0
+(6 rows)
+
+VACUUM lion_pdt;
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+       lion_pd        
+----------------------
+ pushed down, 63 rows
+(1 row)
+
+SELECT lion_pd_counters('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+         lion_pd_counters          
+-----------------------------------
+ Heap Blocks Skipped via VM > 0
+ Heap TIDs Rechecked = 0
+ Heap Blocks Rechecked = 0
+ Containers Visited > 0
+ Heap Blocks From Cache = 0
+ Heap Blocks Past Cache Budget = 0
+(6 rows)
+
+SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b ORDER BY a, b LIMIT 8;
+ a | b | count 
+---+---+-------
+ 0 | 0 |   849
+ 0 | 1 |   849
+ 0 | 2 |   848
+ 0 | 3 |   848
+ 0 | 4 |   848
+ 0 | 5 |   848
+ 0 | 6 |   849
+ 1 | 0 |   866
+(8 rows)
+
+-- a partitioned table: one partial aggregate per pair per partition (§16)
+CREATE TABLE lion_pdq (id int NOT NULL, a int NOT NULL, b int NOT NULL)
+	PARTITION BY RANGE (id);
+CREATE TABLE lion_pdq1 PARTITION OF lion_pdq FOR VALUES FROM (0) TO (50000);
+CREATE TABLE lion_pdq2 PARTITION OF lion_pdq FOR VALUES FROM (50000) TO (100000);
+INSERT INTO lion_pdq SELECT i, i % 10, i % 4 FROM generate_series(0, 99999) i;
+CREATE INDEX ON lion_pdq1 USING lion (a);
+CREATE INDEX ON lion_pdq1 USING lion (b);
+CREATE INDEX ON lion_pdq2 USING lion (a);
+CREATE INDEX ON lion_pdq2 USING lion (b);
+VACUUM ANALYZE lion_pdq;
+SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdq GROUP BY a, b');
+                  lion_plans                  
+----------------------------------------------
+ -- on:
+ Finalize HashAggregate
+   Group Key: lion_pdq.a, lion_pdq.b
+   ->  Custom Scan (LionCount)
+         Partitions: lion_pdq1, lion_pdq2
+         Lion Indexes: (b), (a)
+         Group Key: b, a
+ -- off:
+ HashAggregate
+   Group Key: lion_pdq.a, lion_pdq.b
+   ->  Append
+         ->  Seq Scan on lion_pdq1 lion_pdq_1
+         ->  Seq Scan on lion_pdq2 lion_pdq_2
+(13 rows)
+
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdq GROUP BY a, b');
+       lion_pd        
+----------------------
+ pushed down, 20 rows
+(1 row)
+
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdq WHERE b = 2 GROUP BY a, b');
+       lion_pd       
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT a, b, count(*) FROM lion_pdq GROUP BY a, b ORDER BY a, b LIMIT 6;
+ a | b | count 
+---+---+-------
+ 0 | 0 |  5000
+ 0 | 2 |  5000
+ 1 | 1 |  5000
+ 1 | 3 |  5000
+ 2 | 0 |  5000
+ 2 | 2 |  5000
+(6 rows)
+
+-- ---- which cardinalities the cost model accepts -------------------------
+/*
+ * Nothing is disabled here: which plan the model picks IS the test.  The
+ * intersection of a pair scans the members of the smaller of the two groups,
+ * so summed over every pair that is Min(entries, entries) x rows - and it is
+ * that term, not the pair count alone, that has to refuse the wide cases.
+ */
+CREATE TABLE lion_pd2 (id int NOT NULL, c2 int NOT NULL, c20 int NOT NULL,
+					   c200 int NOT NULL, c20k int NOT NULL, pad text NOT NULL);
+INSERT INTO lion_pd2
+SELECT i, i % 2, i % 20, i % 200, i % 20000, repeat('x', 200)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX lion_pd2_c2 ON lion_pd2 USING lion (c2);
+CREATE INDEX lion_pd2_c20 ON lion_pd2 USING lion (c20);
+CREATE INDEX lion_pd2_c200 ON lion_pd2 USING lion (c200);
+CREATE INDEX lion_pd2_c20k ON lion_pd2 USING lion (c20k);
+VACUUM ANALYZE lion_pd2;
+-- 20 x 2 and 200 x 2 are worth it
+SELECT lion_pd('SELECT c20, c2, count(*) FROM lion_pd2 GROUP BY c20, c2');
+       lion_pd        
+----------------------
+ pushed down, 20 rows
+(1 row)
+
+SELECT lion_plans('SELECT c20, c2, count(*) FROM lion_pd2 GROUP BY c20, c2');
+                      lion_plans                      
+------------------------------------------------------
+ -- on:
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pd2_c2 (c2), lion_pd2_c20 (c20)
+   Group Key: c2, c20
+ -- off:
+ HashAggregate
+   Group Key: c20, c2
+   ->  Seq Scan on lion_pd2
+(8 rows)
+
+SELECT lion_pd('SELECT c200, c2, count(*) FROM lion_pd2 GROUP BY c200, c2');
+        lion_pd        
+-----------------------
+ pushed down, 200 rows
+(1 row)
+
+-- 200 x 20 and 20000 x 200 are not, and are refused
+SELECT lion_pd('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
+          lion_pd          
+---------------------------
+ not pushed down, 200 rows
+(1 row)
+
+SELECT lion_plans('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
+         lion_plans         
+----------------------------
+ -- on:
+ HashAggregate
+   Group Key: c200, c20
+   ->  Seq Scan on lion_pd2
+ -- off:
+ HashAggregate
+   Group Key: c200, c20
+   ->  Seq Scan on lion_pd2
+(8 rows)
+
+SELECT lion_pd('SELECT c20k, c200, count(*) FROM lion_pd2 GROUP BY c20k, c200');
+           lion_pd           
+-----------------------------
+ not pushed down, 20000 rows
+(1 row)
+
+SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
+           lion_pd           
+-----------------------------
+ not pushed down, 20000 rows
+(1 row)
+
+DROP TABLE lion_pd2;
+DROP TABLE lion_pdq;
+DROP TABLE lion_pdpo;
+DROP TABLE lion_pdmo;
+DROP TABLE lion_pdo;
 DROP FUNCTION lion_pd_prep(text, text);
 DROP TABLE lion_pdn;
 DROP TABLE lion_pdv;

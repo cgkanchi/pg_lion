@@ -1,0 +1,3 @@
+am	vacuum_ms	wal_bytes	idx_bytes_before	idx_bytes_after	wal_by_rmgr
+lion	728	144215384	75972608	76341248	XLOG 78 MB/78 MBfpi/10010; Generic 58 MB/49 MBfpi/10198; Heap2 1141 kB/8192 bytesfpi/20000; Heap 63 kB/54 kBfpi/33; Btree 2238 bytes/1620 bytesfpi/10; Transaction 34 bytes/0 bytesfpi/1
+btree	585	145059696	68829184	68829184	XLOG 78 MB/78 MBfpi/10009; Btree 58 MB/58 MBfpi/8311; Heap2 1141 kB/8192 bytesfpi/20002; Heap 54 kB/44 kBfpi/25; Transaction 34 bytes/0 bytesfpi/1

@@ -1,0 +1,207 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s2_delete s1_group s3_vacuum s2_wakeup s1_plain s3_stats s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) vgd;
+step s2_delete: DELETE FROM vgd WHERE k % 2 = 0;
+step s1_group: 
+	SELECT count(*) AS groups, count(DISTINCT k) AS distinct_groups,
+		   sum(c) AS rows_counted, min(c) AS min_rows, max(c) AS max_rows
+	  FROM (SELECT k, count(*) AS c FROM vgd GROUP BY k) g;
+ <waiting ...>
+step s3_vacuum: VACUUM vgd;
+step s2_wakeup: 
+	/*
+	 * Detach first, so that nothing can park at the point again, then
+	 * release whoever is parked now.  How MANY times the point is reached is
+	 * not fixed - the two-column driver runs more than one entry scan, and a
+	 * scan fires the point once per bucket page it consumes an entry from -
+	 * but after this step nobody is waiting on it, which is all the
+	 * permutation needs.  injection_points_wakeup() searches the WAITERS, so
+	 * it still works after the detach.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-resumed');
+	DO $$
+	DECLARE n int; zero int := 0;
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			SELECT count(*) INTO n FROM pg_stat_activity
+			 WHERE wait_event = 'lion-entry-scan-resumed';
+			IF n = 0 THEN
+				zero := zero + 1;
+				EXIT WHEN zero >= 10;
+			ELSE
+				zero := 0;
+				/*
+				 * The waiter clears its slot itself once it notices the
+				 * counter, so it can be gone between the poll above and
+				 * this call; that is a success, not a failure.
+				 */
+				BEGIN
+					PERFORM injection_points_wakeup('lion-entry-scan-resumed');
+				EXCEPTION WHEN OTHERS THEN NULL;
+				END;
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_group: <... completed>
+groups|distinct_groups|rows_counted|min_rows|max_rows
+------+---------------+------------+--------+--------
+    20|             20|        6000|     300|     300
+(1 row)
+
+step s1_plain: 
+	SET pg_lion.enable_count_pushdown = off;
+	SELECT count(*) AS groups, count(DISTINCT k) AS distinct_groups,
+		   sum(c) AS rows_counted
+	  FROM (SELECT k, count(*) AS c FROM vgd GROUP BY k) g;
+	SELECT count(*) AS groups2, count(DISTINCT (k, g)) AS distinct_groups2,
+		   sum(c) AS rows_counted2
+	  FROM (SELECT k, g, count(*) AS c FROM vgd GROUP BY k, g) x;
+	SET pg_lion.enable_count_pushdown = on;
+
+groups|distinct_groups|rows_counted
+------+---------------+------------
+    20|             20|        6000
+(1 row)
+
+groups2|distinct_groups2|rows_counted2
+-------+----------------+-------------
+     60|              60|         6000
+(1 row)
+
+step s3_stats: 
+	SELECT entries, ntids, deleted_pages > 0 AS chains_were_freed
+	  FROM lion_index_stats('vgd_k');
+
+entries|ntids|chains_were_freed
+-------+-----+-----------------
+     20| 6000|t                
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('vgd_k', true);
+				  SELECT lion_index_verify('vgd_g', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s2_delete s1_group2 s3_vacuum s2_wakeup s1_plain s3_stats s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) vgd;
+step s2_delete: DELETE FROM vgd WHERE k % 2 = 0;
+step s1_group2: 
+	SELECT count(*) AS groups, count(DISTINCT (k, g)) AS distinct_groups,
+		   sum(c) AS rows_counted
+	  FROM (SELECT k, g, count(*) AS c FROM vgd GROUP BY k, g) x;
+ <waiting ...>
+step s3_vacuum: VACUUM vgd;
+step s2_wakeup: 
+	/*
+	 * Detach first, so that nothing can park at the point again, then
+	 * release whoever is parked now.  How MANY times the point is reached is
+	 * not fixed - the two-column driver runs more than one entry scan, and a
+	 * scan fires the point once per bucket page it consumes an entry from -
+	 * but after this step nobody is waiting on it, which is all the
+	 * permutation needs.  injection_points_wakeup() searches the WAITERS, so
+	 * it still works after the detach.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-resumed');
+	DO $$
+	DECLARE n int; zero int := 0;
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			SELECT count(*) INTO n FROM pg_stat_activity
+			 WHERE wait_event = 'lion-entry-scan-resumed';
+			IF n = 0 THEN
+				zero := zero + 1;
+				EXIT WHEN zero >= 10;
+			ELSE
+				zero := 0;
+				/*
+				 * The waiter clears its slot itself once it notices the
+				 * counter, so it can be gone between the poll above and
+				 * this call; that is a success, not a failure.
+				 */
+				BEGIN
+					PERFORM injection_points_wakeup('lion-entry-scan-resumed');
+				EXCEPTION WHEN OTHERS THEN NULL;
+				END;
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_group2: <... completed>
+groups|distinct_groups|rows_counted
+------+---------------+------------
+    60|             60|        6000
+(1 row)
+
+step s1_plain: 
+	SET pg_lion.enable_count_pushdown = off;
+	SELECT count(*) AS groups, count(DISTINCT k) AS distinct_groups,
+		   sum(c) AS rows_counted
+	  FROM (SELECT k, count(*) AS c FROM vgd GROUP BY k) g;
+	SELECT count(*) AS groups2, count(DISTINCT (k, g)) AS distinct_groups2,
+		   sum(c) AS rows_counted2
+	  FROM (SELECT k, g, count(*) AS c FROM vgd GROUP BY k, g) x;
+	SET pg_lion.enable_count_pushdown = on;
+
+groups|distinct_groups|rows_counted
+------+---------------+------------
+    20|             20|        6000
+(1 row)
+
+groups2|distinct_groups2|rows_counted2
+-------+----------------+-------------
+     60|              60|         6000
+(1 row)
+
+step s3_stats: 
+	SELECT entries, ntids, deleted_pages > 0 AS chains_were_freed
+	  FROM lion_index_stats('vgd_k');
+
+entries|ntids|chains_were_freed
+-------+-----+-----------------
+     20| 6000|t                
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('vgd_k', true);
+				  SELECT lion_index_verify('vgd_g', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

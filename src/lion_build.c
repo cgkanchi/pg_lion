@@ -402,6 +402,8 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 		b->curblk = lion_build_alloc_block(bs);
 		b->head = b->curblk;
 		b->haspage = true;
+		/* DESIGN.md §18: every container page names the chain it belongs to. */
+		lion_page_set_owner((Page) b->pagebuf->data, b->hash, b->head);
 	}
 
 	img = (Page) b->pagebuf->data;
@@ -418,6 +420,7 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 		b->curblk = next;
 		b->pagebuf = lion_build_get_page(bs, LION_PAGE_CONTAINER);
 		img = (Page) b->pagebuf->data;
+		lion_page_set_owner(img, b->hash, b->head);
 	}
 
 	if (PageAddItemExtended(img, c, csize, InvalidOffsetNumber, 0) ==

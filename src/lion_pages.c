@@ -22,6 +22,8 @@
 #include "utils/builtins.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/freespace.h"
+#include "storage/indexfsm.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -32,7 +34,8 @@
 
 #include "lion.h"
 
-static void lion_split_and_place(Relation index, Buffer buf, OffsetNumber off,
+static void lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
+								OffsetNumber off,
 								bool replace, Buffer entrybuf,
 								OffsetNumber entryoff, LionEntryTuple *entry,
 								LionContainer **items, int nitems);
@@ -142,8 +145,126 @@ lion_init_page(Page page, uint16 flags)
 	opaque->rightlink = InvalidBlockNumber;
 	opaque->minckey = 0;
 	opaque->maxckey = 0;
+	opaque->owner_hash = 0;
+	opaque->owner_head = InvalidBlockNumber;
 	opaque->flags = flags;
 	opaque->page_id = LION_PAGE_ID;
+}
+
+/*
+ * Mark a container page free (DESIGN.md §18).
+ *
+ * Everything on the page goes except the special area, whose owner_hash and
+ * owner_head are deliberately kept: verify() uses them to say which chain a
+ * leaked page came from, and the leak sweep uses the flags.  The body holds
+ * the safexid, the transaction id from which on no scan can still be holding
+ * a link to this page - which is what lion_new_buffer() waits for before
+ * handing the block to somebody else.  This mirrors BTPageSetDeleted().
+ */
+void
+lion_page_set_deleted(Page page, FullTransactionId safexid)
+{
+	LionPageOpaque opaque = LionPageGetOpaque(page);
+	LionDeletedPageData *contents;
+
+	Assert((opaque->flags & LION_PAGE_CONTAINER) != 0);
+
+	/* Drop every item and the chain link; keep the owner. */
+	((PageHeader) page)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader) page)->pd_upper = ((PageHeader) page)->pd_special;
+	opaque->flags |= LION_PAGE_DELETED;
+	opaque->rightlink = InvalidBlockNumber;
+	opaque->minckey = 0;
+	opaque->maxckey = 0;
+
+	contents = (LionDeletedPageData *) PageGetContents(page);
+	contents->safexid = safexid;
+	((PageHeader) page)->pd_lower += sizeof(LionDeletedPageData);
+	Assert(((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper);
+}
+
+FullTransactionId
+lion_page_get_safexid(Page page)
+{
+	Assert(LionPageIsDeleted(page));
+
+	if (((PageHeader) page)->pd_lower <
+		SizeOfPageHeaderData + (int) sizeof(LionDeletedPageData))
+		return FirstNormalFullTransactionId;	/* corrupt: never recyclable */
+
+	return ((LionDeletedPageData *) PageGetContents(page))->safexid;
+}
+
+/*
+ * Is the page at hand one the index may hand out again?
+ *
+ * The nbtree rule (BTPageIsRecyclable): the page must be DELETED and its
+ * safexid must be old enough that no transaction which could still hold a
+ * link to it is running.  heaprel is what GlobalVisCheckRemovableFullXid()
+ * needs to compute that horizon.
+ */
+static bool
+lion_page_recyclable(Page page, Relation heaprel)
+{
+	Assert(heaprel != NULL);
+
+	if (PageIsNew(page))
+		return true;
+	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
+		return false;
+	if (!LionPageIsDeleted(page))
+		return false;
+
+	return GlobalVisCheckRemovableFullXid(heaprel, lion_page_get_safexid(page));
+}
+
+/*
+ * A block for the index: a recycled one when the free space map offers one
+ * that is safe to take, else a fresh one from extending the relation.
+ *
+ * The buffer comes back pinned and EXCLUSIVE, with an uninitialised page that
+ * the caller must lion_init_page() inside its own WAL record.
+ *
+ * Only a CONDITIONAL lock is ever taken on a recycled page, exactly as
+ * _bt_allocbuf() does and for the same reason: this is called with other
+ * pages of this index already locked (a split holds P, the bucket page, ...),
+ * and buffer content locks have no deadlock detection.  A page that cannot be
+ * locked, or that turns out not to be recyclable, is put straight back in the
+ * free space map and the relation is extended instead - which also keeps this
+ * loop from spinning on a block the map keeps offering.
+ *
+ * Note what is NOT here: nbtree writes an XLOG_BTREE_REUSE_PAGE record so
+ * that replay can cancel a standby query that might still hold a link to the
+ * block.  Generic WAL cannot raise a recovery conflict, so a standby reader
+ * is protected by the owner check in the page's special area instead
+ * (DESIGN.md §18).
+ */
+static Buffer
+lion_alloc_buffer(Relation index, Relation heaprel, bool reuse)
+{
+	if (reuse && heaprel != NULL)
+	{
+		BlockNumber blkno = GetFreeIndexPage(index);
+
+		if (BlockNumberIsValid(blkno))
+		{
+			Buffer		buf = ReadBuffer(index, blkno);
+
+			if (ConditionalLockBuffer(buf))
+			{
+				if (lion_page_recyclable(BufferGetPage(buf), heaprel))
+					return buf;
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			}
+
+			/* Not ours to take now; leave it for the next allocation. */
+			RecordFreeIndexPage(index, blkno);
+			ReleaseBuffer(buf);
+		}
+	}
+
+	return ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL, EB_LOCK_FIRST);
 }
 
 /*
@@ -170,23 +291,28 @@ lion_init_metapage(Page page, uint32 nbuckets, uint32 inline_limit)
 }
 
 /*
- * Extend the index by one block and register the new buffer in the caller's
+ * Take a block (recycled or fresh) and register it in the caller's
  * GenericXLog record, which logs the page initialisation as a full image.
  * The buffer comes back pinned and exclusively locked; *pagep (if not NULL)
  * receives the registered page image the caller has to work on.
  *
  * Allocating the page inside the record that links it into a chain is what
  * keeps a crash from leaving an initialised page that nothing points at.
+ *
+ * reuse = false forbids taking a recycled block.  A chain's HEAD page is
+ * allocated that way and nothing else is: head blocks then come only from
+ * extending the relation, which hands out a block number that has never been
+ * used before, so a head block is never reused as a head and owner_head is a
+ * chain identity that stays unique for the life of the index (DESIGN.md §18).
  */
 Buffer
-lion_new_buffer_xl(Relation index, GenericXLogState *xstate, uint16 flags,
-				  Page *pagep)
+lion_new_buffer_xl(Relation index, Relation heaprel, GenericXLogState *xstate,
+				  uint16 flags, bool reuse, Page *pagep)
 {
 	Buffer		buffer;
 	Page		page;
 
-	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
-							   EB_LOCK_FIRST);
+	buffer = lion_alloc_buffer(index, heaprel, reuse);
 
 	page = GenericXLogRegisterBuffer(xstate, buffer, GENERIC_XLOG_FULL_IMAGE);
 	lion_init_page(page, flags);
@@ -198,19 +324,18 @@ lion_new_buffer_xl(Relation index, GenericXLogState *xstate, uint16 flags,
 }
 
 /*
- * Extend the index by one block and return the new buffer, pinned and
- * exclusively locked, with the page already initialised.  The initialisation
- * is WAL-logged on its own so that a later GenericXLog delta against this
- * page replays correctly.
+ * The same in a record of its own, for a caller that has no record open.  The
+ * initialisation is WAL-logged by itself so that a later GenericXLog delta
+ * against this page replays correctly.
  */
 Buffer
-lion_new_buffer(Relation index, uint16 flags)
+lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
 {
 	Buffer		buffer;
 	GenericXLogState *xstate;
 
 	xstate = GenericXLogStart(index);
-	buffer = lion_new_buffer_xl(index, xstate, flags, NULL);
+	buffer = lion_new_buffer_xl(index, heaprel, xstate, flags, true, NULL);
 	GenericXLogFinish(xstate);
 
 	return buffer;
@@ -540,6 +665,14 @@ lion_keys_equal(LionState *state, Datum a, Datum b)
  * Fetch the item (container or sparse segment) at *off of an INLINE payload
  * into the aligned buffer buf and advance *off past it.  Returns the item
  * size, or 0 when the payload has been consumed.
+ *
+ * The payload may be followed by ZEROED SLACK: VACUUM writes a filtered
+ * payload back into the bytes the entry already has rather than shrinking the
+ * entry tuple, so that no other entry on the bucket page moves and the WAL
+ * delta is the handful of bytes that changed (DESIGN.md §18).  No real item
+ * has type 0 - the four item kinds are 1 .. 4 - so a zero item header is an
+ * unambiguous end marker and the payload needs no length of its own.  The
+ * same goes for a tail shorter than one header.
  */
 Size
 lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *buf)
@@ -551,11 +684,7 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	Assert(*off <= paylen);
 	avail = paylen - *off;
 	if (avail < LION_CONTAINER_HDRSZ)
-	{
-		if (avail != 0)
-			elog(ERROR, "lion index: malformed inline posting set");
-		return 0;
-	}
+		return 0;				/* end of the payload, or its zeroed slack */
 
 	/*
 	 * The item may be unaligned, so everything is read through the caller's
@@ -566,6 +695,8 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	 */
 	peek = Min(avail, LION_CONTAINER_HDRSZ + sizeof(uint16));
 	memcpy(buf, payload + *off, peek);
+	if (buf->type == 0)
+		return 0;				/* the slack VACUUM left behind */
 	if (buf->type != LION_CT_ARRAY && buf->type != LION_CT_BITSET &&
 		buf->type != LION_CT_RUN && buf->type != LION_CT_SPARSE)
 		elog(ERROR, "lion index: malformed inline item of type %u",
@@ -933,7 +1064,8 @@ lion_bucket_npages(Relation index, Buffer headbuf)
  * EXCLUSIVE by the caller).  Adds a bucket page if no existing page has room.
  */
 void
-lion_add_entry(Relation index, Buffer headbuf, LionEntryTuple *entry, Size size)
+lion_add_entry(Relation index, Relation heaprel, Buffer headbuf,
+			  LionEntryTuple *entry, Size size)
 {
 	Buffer		cur = headbuf;
 	Size		need = MAXALIGN(size);
@@ -986,7 +1118,8 @@ lion_add_entry(Relation index, Buffer headbuf, LionEntryTuple *entry, Size size)
 	{
 		Page		np;
 
-		nbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_BUCKET, &np);
+		nbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_BUCKET,
+								 true, &np);
 
 		if (PageAddItemExtended(np, entry, size,
 								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
@@ -998,6 +1131,52 @@ lion_add_entry(Relation index, Buffer headbuf, LionEntryTuple *entry, Size size)
 	UnlockReleaseBuffer(nbuf);
 	if (cur != headbuf)
 		UnlockReleaseBuffer(cur);
+}
+
+/*
+ * Delete entries from a bucket page in one WAL record (DESIGN.md §18).
+ *
+ * ENTRY OFFSETS ON A BUCKET PAGE NEVER CHANGE.  That is an invariant of this
+ * index and several readers depend on it: lion_entry_scan_next() (the GROUP
+ * BY driver) resumes a bucket page at the offset it stopped at, and VACUUM's
+ * own pass 2 refers to the entries pass 1 found by offset while the bucket
+ * page is unlocked.  So the deletion goes through
+ * PageIndexTupleDeleteNoCompact(), which frees the item's bytes but leaves
+ * the line pointer array alone, and NOT through PageIndexMultiDelete(), which
+ * would renumber every entry after the deleted one.  The freed line pointers
+ * are marked so that the next lion_add_entry() reuses them.
+ *
+ * The offsets must be ASCENDING; they are applied from the back, so that the
+ * ones still to come keep their meaning while the loop runs (deleting the
+ * last item of a page shortens the line pointer array, which is how a page
+ * that empties out gives its array back).
+ *
+ * VACUUM still calls this only once per bucket page, as the very last thing
+ * it does to it and with a cleanup lock held, because pass 2 has to be able
+ * to re-read the entries it is walking the chains of.
+ */
+void
+lion_delete_entries(Relation index, Buffer buf, OffsetNumber *offs, int noffs)
+{
+	GenericXLogState *xstate;
+	Page		p;
+	int			i;
+
+	Assert(noffs > 0);
+	Assert(LionPageIsBucket(BufferGetPage(buf)));
+
+	xstate = GenericXLogStart(index);
+	p = GenericXLogRegisterBuffer(xstate, buf, 0);
+
+	for (i = noffs - 1; i >= 0; i--)
+	{
+		Assert(i == 0 || offs[i - 1] < offs[i]);
+		PageIndexTupleDeleteNoCompact(p, offs[i]);
+	}
+
+	PageSetHasFreeLinePointers(p);
+
+	GenericXLogFinish(xstate);
 }
 
 /*
@@ -1067,13 +1246,15 @@ lion_page_update_minmax(Page page)
  * chain cannot change under it.
  */
 BlockNumber
-lion_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 ckey)
+lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
+					BlockNumber tail, uint32 ckey)
 {
 	BlockNumber blk;
 	Buffer		buf;
 	Page		page;
 	uint32		minckey;
 	OffsetNumber tailitems;
+	bool		owned;
 
 	Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
 
@@ -1086,10 +1267,14 @@ lion_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 
 	buf = ReadBuffer(index, tail);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	Assert(LionPageIsContainer(page));
+	owned = lion_page_owns_entry(page, hash, head);
 	minckey = LionPageGetOpaque(page)->minckey;
 	tailitems = PageGetMaxOffsetNumber(page);
 	UnlockReleaseBuffer(buf);
+
+	if (!owned)
+		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
+			 tail, head);
 
 	if (tailitems > 0 && ckey >= minckey)
 		return tail;
@@ -1099,6 +1284,11 @@ lion_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 
 	 * maxckey reaches ckey, or at the last page.  Empty pages (left behind by
 	 * VACUUM) are skipped: only a page that already holds a larger ckey can be
 	 * proven to own this one.
+	 *
+	 * Every page on the way has to claim this chain (DESIGN.md §18).  Every
+	 * caller of this function holds the entry's bucket page, so the chain
+	 * cannot be freed under it and a page that does not belong is corruption,
+	 * not a race.
 	 */
 	blk = head;
 	for (;;)
@@ -1110,11 +1300,15 @@ lion_chain_find_page(Relation index, BlockNumber head, BlockNumber tail, uint32 
 		buf = ReadBuffer(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		Assert(LionPageIsContainer(page));
+		owned = lion_page_owns_entry(page, hash, head);
 		maxckey = LionPageGetOpaque(page)->maxckey;
 		next = LionPageGetOpaque(page)->rightlink;
 		nitems = PageGetMaxOffsetNumber(page);
 		UnlockReleaseBuffer(buf);
+
+		if (!owned)
+			elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
+				 blk, head);
 
 		if (nitems > 0 && maxckey >= ckey)
 			return blk;
@@ -1291,7 +1485,8 @@ lion_item_zero_slack(LionContainer *item, Size size, Size alloc)
  * the counters from the containers.
  */
 void
-lion_chain_put_container_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
+lion_chain_put_container_locked_ext(Relation index, Relation heaprel, Buffer buf,
+								   Buffer entrybuf,
 								   OffsetNumber entryoff, LionEntryTuple *entry,
 								   LionContainer *c, int *ncontainers_delta,
 								   bool slack)
@@ -1306,17 +1501,18 @@ lion_chain_put_container_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 	off = lion_page_find_container(page, c->ckey, &found);
 	*ncontainers_delta = found ? 0 : 1;
 
-	lion_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
-								   found, &c, 1, slack);
+	lion_chain_put_items_locked_ext(index, heaprel, buf, entrybuf, entryoff,
+								   entry, off, found, &c, 1, slack);
 }
 
 void
-lion_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
+lion_chain_put_container_locked(Relation index, Relation heaprel, Buffer buf,
+							   Buffer entrybuf,
 							   OffsetNumber entryoff, LionEntryTuple *entry,
 							   LionContainer *c, int *ncontainers_delta)
 {
-	lion_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, entry, c,
-									   ncontainers_delta, false);
+	lion_chain_put_container_locked_ext(index, heaprel, buf, entrybuf, entryoff,
+									   entry, c, ncontainers_delta, false);
 }
 
 /*
@@ -1330,7 +1526,8 @@ lion_chain_put_container_locked(Relation index, Buffer buf, Buffer entrybuf,
  * container from being visible as two items holding the same ckey.
  */
 void
-lion_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
+lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
+							   Buffer entrybuf,
 							   OffsetNumber entryoff, LionEntryTuple *entry,
 							   OffsetNumber off, bool replace,
 							   LionContainer **items, int nitems, bool slack)
@@ -1367,27 +1564,27 @@ lion_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 		Size		writesz = sizes[0];
 
 		/*
-		 * With slack, prefer to leave the item's allocated length exactly as
-		 * it is: then PageIndexTupleOverwrite() moves no other item on the
-		 * page and the WAL delta covers the item alone.  An item that has far
-		 * more room than it can use - a segment replaced by the container one
-		 * of its container keys was promoted to - gives the excess back.
+		 * Prefer to leave the item's allocated length exactly as it is: then
+		 * PageIndexTupleOverwrite() moves no other item on the page and the
+		 * WAL delta covers the item alone.  That is the whole of "shrink in
+		 * place" (DESIGN.md §18) as well as the growth case: an item that has
+		 * lost members keeps its slot and the freed bytes become slack.  An
+		 * item that has far more room than it can use - a segment replaced by
+		 * the container one of its container keys was promoted to, or one
+		 * that lost most of its members - gives the excess back.
+		 *
+		 * cur comes off the page, and the item is copied out of a work buffer
+		 * of LION_CONTAINER_MAX_SIZE bytes, so a page that claims more than
+		 * that (only a corrupt one can) gets the exact size.
 		 */
-		if (slack)
-		{
-			/*
-			 * cur comes off the page, and the item is copied out of a work
-			 * buffer of LION_CONTAINER_MAX_SIZE bytes, so a page that claims
-			 * more than that (only a corrupt one can) gets the exact size.
-			 */
-			if (cur >= sizes[0] && cur <= (Size) LION_CONTAINER_MAX_SIZE &&
-				cur - sizes[0] <= LION_ITEM_SLACK_LIMIT)
-				writesz = cur;
-			else if (MAXALIGN(allocs[0]) <=
-					 MAXALIGN(cur) + PageGetExactFreeSpace(page))
-				writesz = allocs[0];
-			lion_item_zero_slack(items[0], sizes[0], writesz);
-		}
+		if (cur >= sizes[0] && cur <= (Size) LION_CONTAINER_MAX_SIZE &&
+			cur - sizes[0] <= LION_ITEM_SLACK_BOUND)
+			writesz = cur;
+		else if (slack &&
+				 MAXALIGN(allocs[0]) <=
+				 MAXALIGN(cur) + PageGetExactFreeSpace(page))
+			writesz = allocs[0];
+		lion_item_zero_slack(items[0], sizes[0], writesz);
 
 		{
 			GenericXLogState *xstate = GenericXLogStart(index);
@@ -1450,18 +1647,19 @@ lion_chain_put_items_locked_ext(Relation index, Buffer buf, Buffer entrybuf,
 	 * them at their exact size - a page that has just been split has room to
 	 * spare, and the items get their slack back the next time they grow.
 	 */
-	lion_split_and_place(index, buf, off, replace, entrybuf, entryoff, entry,
-						items, nitems);
+	lion_split_and_place(index, heaprel, buf, off, replace, entrybuf, entryoff,
+						entry, items, nitems);
 }
 
 void
-lion_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
+lion_chain_put_items_locked(Relation index, Relation heaprel, Buffer buf,
+						   Buffer entrybuf,
 						   OffsetNumber entryoff, LionEntryTuple *entry,
 						   OffsetNumber off, bool replace,
 						   LionContainer **items, int nitems)
 {
-	lion_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
-								   replace, items, nitems, false);
+	lion_chain_put_items_locked_ext(index, heaprel, buf, entrybuf, entryoff,
+								   entry, off, replace, items, nitems, false);
 }
 
 /*
@@ -1470,7 +1668,8 @@ lion_chain_put_items_locked(Relation index, Buffer buf, Buffer entrybuf,
  * lion_chain_put_container_locked() for the contract on entry.
  */
 void
-lion_chain_put_container(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+lion_chain_put_container(Relation index, Relation heaprel, Buffer entrybuf,
+						OffsetNumber entryoff,
 						LionEntryTuple *entry, LionContainer *c,
 						int *ncontainers_delta)
 {
@@ -1480,13 +1679,14 @@ lion_chain_put_container(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
 	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
 
-	blk = lion_chain_find_page(index, entry->head, entry->tail, c->ckey);
+	blk = lion_chain_find_page(index, entry->hash, entry->head, entry->tail,
+							  c->ckey);
 
 	buf = ReadBuffer(index, blk);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	lion_chain_put_container_locked(index, buf, entrybuf, entryoff, entry, c,
-								   ncontainers_delta);
+	lion_chain_put_container_locked(index, heaprel, buf, entrybuf, entryoff,
+								   entry, c, ncontainers_delta);
 
 	UnlockReleaseBuffer(buf);
 }
@@ -1502,8 +1702,9 @@ lion_chain_put_container(Relation index, Buffer entrybuf, OffsetNumber entryoff,
  * as the last container page.
  */
 void
-lion_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
-				LionEntryTuple *entry, const char *payload, Size paylen)
+lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
+				OffsetNumber entryoff, LionEntryTuple *entry,
+				const char *payload, Size paylen)
 {
 	GenericXLogState *xstate;
 	Buffer		curbuf;
@@ -1516,8 +1717,19 @@ lion_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
 	xstate = GenericXLogStart(index);
-	curbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER, &curpage);
+
+	/*
+	 * The head page of a chain is the one page this index never recycles
+	 * (reuse = false), so that head blocks come only from extending the
+	 * relation and no two chains can ever share one.  That is what makes
+	 * owner_head a chain identity a reader can trust with nothing else in
+	 * hand - which is exactly the situation the count cursor is in
+	 * (DESIGN.md §18).
+	 */
+	curbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
+							   false, &curpage);
 	head = BufferGetBlockNumber(curbuf);
+	lion_page_set_owner(curpage, entry->hash, head);
 
 	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
 	{
@@ -1530,8 +1742,9 @@ lion_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 			 * Link the next page in from the current one inside the same
 			 * record, then continue the walk in a new record.
 			 */
-			nextbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER,
-										&nextpage);
+			nextbuf = lion_new_buffer_xl(index, heaprel, xstate,
+										LION_PAGE_CONTAINER, true, &nextpage);
+			lion_page_set_owner(nextpage, entry->hash, head);
 			lion_page_update_minmax(curpage);
 			LionPageGetOpaque(curpage)->rightlink = BufferGetBlockNumber(nextbuf);
 			GenericXLogFinish(xstate);
@@ -1582,7 +1795,8 @@ lion_entry_spill(Relation index, Buffer entrybuf, OffsetNumber entryoff,
  * never move left and never move to an existing page.
  */
 static void
-lion_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
+lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
+					OffsetNumber off, bool replace,
 					Buffer entrybuf, OffsetNumber entryoff,
 					LionEntryTuple *entry, LionContainer **items, int nitems)
 {
@@ -1657,8 +1871,10 @@ lion_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	 */
 	if (nmove > 0)
 	{
-		nbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER, &pN);
+		nbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
+								 true, &pN);
 		nblk = BufferGetBlockNumber(nbuf);
+		lion_page_set_owner(pN, entry->hash, entry->head);
 	}
 
 	if (ndel > 0)
@@ -1678,8 +1894,10 @@ lion_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	else
 	{
 		/* The items get a page of their own, linked immediately after P. */
-		mbuf = lion_new_buffer_xl(index, xstate, LION_PAGE_CONTAINER, &pM);
+		mbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
+								 true, &pM);
 		mblk = BufferGetBlockNumber(mbuf);
+		lion_page_set_owner(pM, entry->hash, entry->head);
 		for (i = 0; i < nitems; i++)
 		{
 			if (PageAddItemExtended(pM, items[i], sizes[i],

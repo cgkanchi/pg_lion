@@ -20,10 +20,10 @@ Goals
 - Layered so that phase 2 can add: a visibility-map-interlocked `lion_index_count()` and a
   CustomScan that answers `count(*) ... GROUP BY key` from containers without visiting the heap.
 
-Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, §14 and §15)
+Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, §14 and §15;
+entry deletion and page recycling in §18)
 - Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple`, parallel build/scan,
-  page recycling (freed pages are not returned to the FSM), fine-grained write concurrency
-  (inserts serialize per hash bucket), key sizes above 2000 bytes.
+  fine-grained write concurrency (inserts serialize per hash bucket), key sizes above 2000 bytes.
 
 ## 2. TID encoding
 
@@ -87,14 +87,19 @@ All pages are standard PG pages (PageInit) with a special area:
         BlockNumber rightlink;     /* next page in this chain, or InvalidBlockNumber */
         uint32      minckey;       /* container pages: smallest ckey on page (0 if empty) */
         uint32      maxckey;       /* container pages: largest ckey on page (0 if empty) */
-        uint16      flags;         /* LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER */
+        uint32      owner_hash;    /* container pages: hash of the entry that owns the chain (§18) */
+        BlockNumber owner_head;    /* container pages: head block of that chain (§18) */
+        uint16      flags;         /* LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER,
+                                    * plus LION_PAGE_DELETED for a freed page (§18) */
         uint16      page_id;       /* LION_PAGE_ID = 0xFF87, for identification by inspection tools */
-    } LionPageOpaqueData;
+    } LionPageOpaqueData;          /* 24 bytes */
 
-Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 2, offset_bits,
-container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. Version 2 is the first that
-indexes NULL keys (§14); a version 1 index is structurally valid but has no NULL entry, so opening
-one is an ERROR that asks for a REINDEX rather than a wrong answer to `IS NULL`.
+Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 3, offset_bits,
+container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. Version 2 was the first that
+indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
+from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
+structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
+rather than a wrong answer.
 
 Blocks 1 .. nbuckets: bucket head pages. Bucket b for a key with 32-bit hash h is `h % nbuckets`
 (`lion_bucket_of()` in lion.h, the single place that mapping lives); its head page is block `1 + b`.
@@ -148,8 +153,11 @@ Growth (`lion_chain_put_container`): overwrite in place if the page has room; ot
 move the items at/after the insert position to a freshly allocated page N linked after P; if the
 container still does not fit on P, place it alone on a second new page M linked between P and N
 (P → M → N → old right). This guarantees progress in one WAL record (P, N, M, entry page = 4 buffers,
-the GenericXLog maximum). Items only ever move right and only to brand-new pages. Pages are never
-freed or unlinked in v0. `lion_chain_find_page` skips empty pages (VACUUM may leave them mid-chain).
+the GenericXLog maximum). Items only ever move right and only to pages that are linked immediately
+right of the page they came from - which is the property the §9/§11 interlock needs, and it holds
+whether the new page was extended onto the end of the relation or recycled out of the free space map
+(§18). A whole chain is freed when its entry is deleted (§18); individual pages of a live chain are
+never unlinked. `lion_chain_find_page` skips empty pages (VACUUM may leave them mid-chain).
 INLINE payloads are packed without padding, so containers inside them are unaligned: read them with
 `lion_inline_fetch()` into an aligned buffer; never cast into the payload. Containers stored as page
 items are MAXALIGNed and may be used in place.
@@ -197,11 +205,13 @@ reader copy an item out by ItemIdGetLength() into a fixed work buffer). lion_ind
 reports the total as `slack_bytes`; `container_bytes` counts logical bytes only, and `free_bytes`
 comes from PageGetFreeSpace(), which does not see intra-item slack at all.
 
-Page allocation: `lion_new_buffer()` extends the relation (ExtendBufferedRel), initialises the page
-and logs it in its own GenericXLog record; `lion_new_buffer_xl()` registers the new page in the
-caller's record instead, and is what lion_add_entry and the split path use, so a crash cannot leave an
-initialised page that nothing links to. No FSM use in v0; verify() reports unreferenced
-never-initialised or empty pages as WARNINGs (harmless, never reused) and anything else as an ERROR.
+Page allocation: `lion_new_buffer_xl()` takes a page - a recycled one from the free space map when
+one is safe to take, else a fresh block from ExtendBufferedRel - initialises it and registers it in
+the caller's GenericXLog record, so a crash cannot leave an initialised page that nothing links to;
+`lion_new_buffer()` is the same in a record of its own. The recycling rule, what `heaprel` is for and
+why a chain's head page never comes from the map are in §18. verify() reports DELETED pages as the
+ordinary free pages they are, unreferenced never-initialised or empty pages as WARNINGs (the next
+VACUUM's sweep turns them into free pages) and anything else as an ERROR.
 
 ## 5. Locking protocol (deliberately coarse in v0)
 
@@ -330,9 +340,10 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    the chain machinery (which may split the page); delete empty containers with one
    PageIndexMultiDelete per page (it compacts; no PageRepairFragmentation needed); update min/max.
    Empty pages stay in the chain. Every page record also carries the updated entry (ncontainers/ntids),
-   so a crash cannot desynchronise the counters. Entries whose ntids reaches 0 are kept (the key
-   remains known) — v0 does not delete entries.
-3. Report stats: num_pages, num_index_tuples = Σ ntids, pages_deleted = 0, tuples_removed.
+   so a crash cannot desynchronise the counters. An entry whose ntids reaches 0 is DELETED, and its
+   chain freed, in a final step for its bucket page (§18).
+3. Report stats: num_pages, num_index_tuples = Σ ntids, tuples_removed, and the pages this cycle
+   freed (pages_newly_deleted/pages_deleted/pages_free, §18).
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
    counting pages; otherwise pass it through.
 
@@ -435,7 +446,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint,
         OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint,
         OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint,
-        OUT empty_tids bigint) RETURNS record
+        OUT empty_tids bigint, OUT slack_bytes bigint, OUT max_bucket_pages bigint,
+        OUT deleted_pages bigint) RETURNS record
         -- container counts include INLINE containers; free_bytes sums bucket and container pages;
         -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
         -- the reserved no-key entry (§17)
@@ -622,7 +634,9 @@ Planner integration
     one clause per column (two different values on one column ⇒ bail; the same value twice ⇒
     dedupe, by `equal()`, so two different Params on one column bail). §15 adds
     `Var = ANY (array)` and §14 the two null tests to the shapes accepted here; an `IS NOT NULL`
-    clause is exempt from the one-clause-per-column rule, because it constrains no value.
+    clause is exempt from the one-clause-per-column rule, because it constrains no value. §19 adds a
+    top-level `OR` of such clauses, whose leaves are exempt from the rule as well and enter none of
+    the per-column bookkeeping, because they constrain no column of the result.
   - **A Param stands wherever a Const may** (2026-09-21 follow-up review). A prepared statement's
     GENERIC plan keeps `k = $1` as a Param - that is what a generic plan IS - and accepting only
     literals meant the node was never used by one: a dense count fell back to the ordinary plan and
@@ -641,7 +655,9 @@ Planner integration
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
     indexcollations[0] equals that collation, because the index hashed and compared keys under its
     own collation and the count never rechecks the predicate. Checked per partition.
-  - GROUP BY is empty, or exactly one plain Var of the rel with a lion index. The grouped column
+  - GROUP BY is empty, or exactly one plain Var of the rel with a lion index - or two of them,
+    which §20 answers as a nested loop over the two indexes' entries, applying every rule of this
+    section per column. A grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.
   - **The driving index's equality is the grouping equality** (2026-09-20 review, finding 3). An
@@ -744,8 +760,9 @@ Planner integration
 - PlanCustomPath produces a CustomScan with `scan.scanrelid = 0` (upper-level node),
   `custom_scan_tlist` = the output columns (group key Var(s) with their original varno/varattno, and
   the aggregate as a Const-shaped placeholder replaced at execution), and `custom_private` holding:
-  the heap relid, the list of (index oid, attnum) for WHERE, the group-by (index oid, attnum) or
-  none, and the aggregate kinds.  The clause VALUES travel in `custom_exprs` rather than in
+  the heap relid, the list of (index oid, attnum) for WHERE, the group-by (index oid, attnum) pairs
+  - two of them since §20 - or none, and the aggregate kinds.  The clause VALUES travel in
+  `custom_exprs` rather than in
   `custom_private`, because that is the only field of a CustomScan the planner's later passes look
   inside: `set_customscan_references()` fixes its expressions up and `SS_finalize_plan()` collects
   the Param ids it finds there into the plan's extParam/allParam, which is what makes the executor
@@ -755,7 +772,8 @@ Planner integration
   handling with INDEX_VAR references in the plan's targetlist as pg_strom/TimescaleDB do.
   `custom_private` is a POSITIONAL list (the `LION_PRIV_*` indexes), so its first member is a shape
   marker - an IntList of `LION_PRIV_MAGIC` and the number of members - which BeginCustomScan checks
-  before reading any offset and ERRORs on. Planner/executor drift, or a plan built by a differently
+  before reading any offset and ERRORs on. §16 added `LION_PRIV_PARTS` and §19 `LION_PRIV_ORS`, the
+  structure of each OR restriction over the flattened clause array. Planner/executor drift, or a plan built by a differently
   shaped build of the library, is then a message and not a misread Oid.
 
 Executor
@@ -812,10 +830,18 @@ content lock; a concurrent insert may then split P and move C to a brand-new pag
 immediately right of P. VACUUM must reach P before N, and P's cleanup lock is blocked by the
 reader's pin, so it cannot clean C on N until the reader has finished its visibility-map checks.
 If VACUUM had already passed P when the reader copied C, C had already been cleaned of this
-cycle's dead TIDs. Two properties make this sufficient: pages are never recycled (a new page is
-always linked right of its split origin and visited after it), and each VACUUM cycle's set of dead
-TIDs is fixed before index cleanup starts. If VACUUM only cleanup-locked pages it modified, it could
-walk past an emptied P and clean C on N while the reader still counts from its stale copy.
+cycle's dead TIDs. Two properties make this sufficient: a page is only ever linked into a chain
+immediately right of the page whose split or spill allocated it, so chain order and VACUUM's visit
+order agree, and each VACUUM cycle's set of dead TIDs is fixed before index cleanup starts. If
+VACUUM only cleanup-locked pages it modified, it could walk past an emptied P and clean C on N while
+the reader still counts from its stale copy.
+
+Page recycling (§18) does not weaken either property. A recycled block is still linked immediately
+right of its split origin, so it is still visited after it. A page only ever LEAVES a chain as part
+of a whole-chain free, which happens under a cleanup lock on that page after VACUUM has found it
+empty - so a reader pinning it blocks the free outright, and a reader that got past it is holding
+containers that VACUUM has already cleaned. And a page that a split moves items onto has had those
+items cleaned already, because they come from a page this cycle visited first.
 
 The guarantee readers may rely on is therefore: **a TID is never removed from any page of an index
 before VACUUM has held a cleanup lock on every page that precedes it in chain order, and the
@@ -881,7 +907,7 @@ v1 priorities, in order of measured impact:
 5. IN predicates in the AM and the count pushdown are DONE (§15, amsearcharray), and so are NULL
    keys (§14, amsearchnulls) and the multi-key opclasses of §17. Range predicates (which would need
    entry ordering, and a strategy number outside the 1..5 §17 now uses) are not.
-6. Page recycling and entry deletion (v0 never frees pages or entries).
+6. DONE (§18): page recycling and entry deletion.
 7. Params in the count pushdown; multi-column GROUP BY. Partitions are DONE (§16).
 The per-container visibility-map read (lion_vm_allvisible_mask) is already in: it turned the GROUP BY
 from O(heap blocks × keys) (1034 ms) into O(containers) (50 ms).
@@ -1598,3 +1624,347 @@ The bitmap paths are at parity with GIN, heap-bound as §12 measured for scalar 
 multi-key classes are for is the first column: the pushdown answers the 10031-row `&&` in 0.38 ms
 against 7.6 ms, because it never visits the heap - `Heap Blocks Skipped via VM: 9358, Heap TIDs
 Rechecked: 0, Containers Visited: 2071`.
+
+## 18. VACUUM cost, entry deletion, and page reuse (format version 3)
+
+Measured problems (bench/COMPARISON.md, bench/results/2026-09-21-stress): a VACUUM over the 1M-row,
+eight-index portfolio takes 1,141 ms and 316 MiB of WAL against btree's 380 ms / 137 MiB; in the
+changing-key churn test the fifth-cycle VACUUM takes 1,017 ms against btree's 41 ms, 600,000 historical
+entries remain for 100,000 live rows, and the two-index portfolio grows from 7.6 to 34 MiB until REINDEX.
+
+**Measured first** (bench/vacuum_micro.sh, assert build, relative numbers only; the raw runs are in
+bench/results/vacuum-micro-before and bench/results/vacuum-micro-after).  ambulkdelete reports its own breakdown at DEBUG1 -
+cleanup-lock waits, container filtering, GenericXLog apply, INLINE entry work, pages visited/changed,
+records, items rewritten/deleted - and pg_walinspect splits the WAL by resource manager.  On the
+1M-row eight-index portfolio with 1% of the rows deleted, the index side of the VACUUM was 696 ms of
+the 1,050 ms total, and it went:
+
+    INLINE entry handling                423 ms (61%)   ix_c1m alone 278 ms
+    container filtering (the callback)    96 ms (14%)
+    GenericXLog apply                     30 ms ( 4%)
+    bucket/chain page walking            147 ms (21%)
+    cleanup-lock waits                   1.0 ms
+
+with 82 MiB of generic WAL (49 MiB of it full-page images) in **20,222 records** against btree's
+58 MiB in 8,312.  Two things stood out and shaped everything below.
+
+1. *The INLINE work was almost all wasted.*  A VACUUM that removes 1% of the rows leaves 99% of the
+   entries unchanged, and the old code found that out only after copying the payload out, filtering
+   it into a StringInfo and building a new entry tuple.  632,130 entries × ~400 ns of allocation is
+   the 278 ms.  So the filter now runs a read-only PROBE first, straight out of the page (the
+   cleanup lock makes it stable) into the shared work buffer, and only an entry that really loses a
+   member pays for the second pass that builds its payload.
+2. *One WAL record per changed ENTRY, each carrying the whole tail of its page.*  20,222 records for
+   1,422 changed container pages: the rest were INLINE entries, one `lion_replace_entry()` record
+   each, and because the entry shrank, PageIndexTupleOverwrite() moved every entry after it and the
+   GenericXLog delta covered all of that - 33 MiB of deltas for a few hundred KiB of real change.
+   Hence the two rules below: an entry keeps its bytes, and a bucket page's entries are written in
+   ONE record.
+
+**Shrink in place.** Removing members from an ARRAY/RUN/segment item must not move the rest of the
+page: the item keeps the bytes the page has allotted it and the freed bytes become slack (§4 growth
+slack), so PageIndexTupleOverwrite() moves nothing and the GenericXLog delta is the item alone.  An
+item that has lost more than `LION_ITEM_SLACK_VACUUM` = 256 bytes gives the space back and pays the
+page-tail delta once; `LION_ITEM_SLACK_BOUND` is the larger of that and the insert path's bound, and
+is what verify() accepts and what lion_index_stats() reports as `slack_bytes`.  A page whose filter
+removes nothing is never registered for WAL (already the rule).  The same applies to an INLINE
+entry's payload on a bucket page: a filtered payload is written back into the entry's existing bytes
+with the remainder ZEROED, up to `LION_ENTRY_SLACK_BOUND` = 256 bytes.  No length field was needed
+for that - no item kind has type 0, so `lion_inline_fetch()` stops at the first zero item header and
+the padding is self-describing; verify() bounds it and checks that every byte of it really is zero.
+
+**One record per bucket page.** Pass 1 collects every INLINE entry of a bucket page that changed and
+writes them all in a single GenericXLog record.  Entry offsets survive PageIndexTupleOverwrite(), so
+the writes do not disturb each other.  A payload that outgrew its entry still spills onto container
+pages in a record of its own (rare: it needs a RUN container to become a BITSET while losing
+members).
+
+**Entry deletion.** An entry with ntids = 0 and ncontainers = 0 is deleted by VACUUM:
+- The deletion happens in a final step for that bucket page, after every chain of that page's
+  entries has been walked, under a cleanup lock, with all of the page's dead entries in ONE record.
+  Emptiness is re-decided *there*, not from what pass 1 or pass 2 saw: an insert may have put a TID
+  back, and then the entry stays.  An INLINE entry that pass 1 emptied is still written back empty
+  first - its dead TIDs have to leave the page under that cleanup lock - and deleted afterwards.
+  Reserved NULL/EMPTY entries are deleted like any other; inserts recreate them on demand.
+- **Entry offsets on a bucket page never change.**  This is the invariant readers rely on, and it is
+  what `lion_delete_entries()` buys by going through `PageIndexTupleDeleteNoCompact()` instead of
+  `PageIndexMultiDelete()`: the item's bytes are freed but the line pointer array is left alone, the
+  deleted entry shows up as an unused line pointer that every walk already skips, and nothing else
+  moves.  The freed line pointers are marked so that the next `lion_add_entry()` reuses them.
+  *(Deviation from the first draft of this section, which had readers copy the whole bucket page
+  under a SHARE lock and iterate the copy.  Offset stability is strictly cheaper - no BLCKSZ memcpy
+  per page per reader - and it is the only thing the copy was for: `lion_entry_scan_next()` gives up
+  its lock between two entries of one page and comes back to an offset.  An INLINE posting set still
+  keeps its bucket page PINNED until its containers have been through the visibility-map check, as
+  §9 requires; that was always separate from the copy.  It also needed no change to
+  LionPostingSet/LionEntryScan, which live in a header this wave does not own.)*
+- A group cannot come back twice by the other route either - the entry deleted and the key inserted
+  again further along the page - because only an EMPTY posting set is deleted, and a posting set
+  whose members are all dead to every snapshot has nothing the scan's snapshot could have counted
+  before.  test/isolation/vacuum_entry_delete.spec parks a one-column and a two-column GROUP BY
+  between two entries of a bucket page while a VACUUM deletes half of them.
+- Inserts are unaffected: they hold the bucket page EXCLUSIVE for the whole insert and look entries
+  up by key.
+
+**Whole-chain free.** When a CHAIN entry is deleted its chain is freed: (1) delete the entry (one
+record; from here the chain is unreachable for new readers and inserts), then (2) for each chain
+page, under ConditionalLockBufferForCleanup (skip the page on failure; it is merely leaked, and the
+walk stops because the rightlink cannot be read without the lock), check that the page still claims
+this chain and is empty, mark it LION_PAGE_DELETED, store `safexid = ReadNextFullTransactionId()` in
+the page body (as nbtree's BTDeletedPageData), WAL-log, and RecordFreeIndexPage().  Step 2 runs with
+the bucket page unlocked, because VACUUM never waits for a page while holding another LWLock (§11).
+A crash between (1) and (2) leaks pages, which is harmless: they are unreferenced and the sweep
+below finds them (test/recovery/run.sh phase 1b puts the crash exactly there).  Mid-chain unlinking
+of empty pages of a live key is NOT part of this version (documented limitation: a key whose oldest
+pages empty out keeps them until REINDEX).
+
+**Reuse.** `lion_new_buffer()`/`lion_new_buffer_xl()` first try GetFreeIndexPage(): take the page with
+ConditionalLockBuffer; it is reusable only if it is all-zero or LION_PAGE_DELETED with
+GlobalVisCheckRemovableFullXid(heaprel, safexid) true (the nbtree rule: no scan that could still hold
+a link to it is running); otherwise re-record it in the FSM and extend the relation (which also keeps
+the loop from spinning on a block the map keeps offering).  heaprel comes from `heapRel` in aminsert
+and `info->heaprel` in VACUUM; a NULL heaprel means "never recycle", which is what ambuildempty
+wants.  ambuild never reuses.  amvacuumcleanup calls IndexFreeSpaceMapVacuum().  Leak recovery:
+ambulkdelete keeps a bitmap of the blocks it accounted for - the meta page, every bucket page it
+walked, every container page it reached from a live entry, minus the ones it freed - and sweeps the
+rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into the FSM, and an
+unreferenced EMPTY container page becomes a DELETED one first.  In a healthy index nothing is
+unaccounted for, so the sweep reads no pages at all.  An empty container page of a LIVE chain is
+never mistaken for a leak, because pass 2 visits every page of every chain it found and a chain
+created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
+every page they allocate inside the record that allocates it, under the lock they hold throughout).
+stats report deleted_pages; pages_newly_deleted/pages_deleted/pages_free are reported to VACUUM.
+
+**Hot standby.** Generic WAL cannot raise recovery conflicts - nbtree's XLOG_BTREE_REUSE_PAGE has no
+equivalent - so on a standby a reader holding a stale chain link could land on a page that replay has
+already reused.  Every container page therefore carries its owner in the special area, and readers
+validate it:
+
+    typedef struct LionPageOpaqueData {       /* version 3: 24 bytes */
+        BlockNumber rightlink; uint32 minckey; uint32 maxckey;
+        uint32      owner_hash;   /* hash of the entry this chain belongs to (0 for reserved entries) */
+        BlockNumber owner_head;   /* head block of that chain, fixed for the life of the chain */
+        uint16 flags; uint16 page_id; }
+
+Every reader that reaches a container page through an entry's head or a rightlink (scan, count
+cursors, insert, VACUUM, verify) checks: CONTAINER flag set, DELETED clear, and the owner equal to
+the entry's.  A mismatch means the chain was freed after the reader copied the entry, which can only
+happen when the posting set held nothing visible to anyone: the reader treats it as the end of the
+chain (a count contributes nothing further).  It is never an error outside verify(), except on the
+paths that hold the entry's bucket page throughout - insert and VACUUM's own walk - where the chain
+cannot go away and a mismatch is corruption.
+
+**owner_head alone identifies a chain**, for the whole life of the index, and that is deliberate: a
+chain's HEAD page is the one page `lion_new_buffer()` never takes from the free space map
+(`lion_entry_spill()` passes reuse = false), so a head block always comes from extending the
+relation, is a block number that has never been handed out before, and is therefore never reused as
+a head.  A reused page always belongs to some other chain, whose head block differs.  *(Deviation
+from the first draft, which relied on the pair (owner_hash, owner_head) and accepted "a simultaneous
+32-bit hash and head-block coincidence".  The reason for the change is not the coincidence but
+reachability: the count cursor's LionPostingSet carries only the head block, not the entry's hash,
+and LionPostingSet lives in a header this wave does not own - so making owner_head sufficient is
+what lets the count path validate at all.  It is also strictly stronger than the pair check, since
+the freed head block is exactly the block the FSM is most likely to hand back.  The cost is that a
+freed head block can only ever come back as a non-head page.)*  owner_hash stays as the second half
+of the check for the readers that do have the entry in hand, and is what lets verify() prove that a
+chain belongs to its key.
+
+LION_VERSION becomes 3; older indexes are refused with the existing REINDEX hint.  The bump is
+unavoidable and not merely advisory this time: the special area grows from 16 to 24 bytes, which
+moves every item on every page.
+
+**Measured after** (same script, same cluster; bench/results/vacuum-micro-before and bench/results/vacuum-micro-after).  The
+78 MiB of XLOG/FPI_FOR_HINT in the WAL column is the heap's own, identical on both sides, so the
+column that matters is the index's:
+
+    portfolio, 1M rows, 8 indexes, DELETE id % 100 = 1, one VACUUM
+                          VACUUM ms   total WAL   index WAL (of which FPI)   index records
+      before (lion)          1050      162 MiB     82 MiB (49 MiB)              20,222
+      after  (lion)           728      138 MiB     58 MiB (49 MiB)              10,198
+      btree (control)         585      138 MiB     58 MiB (58 MiB)               8,311
+
+    ... of which ambulkdelete itself (sum of the DEBUG1 breakdowns)
+                          total    inline   filter   apply   walk   cleanup-lock wait
+      before                696 ms   423      96       30     147     1.0
+      after                 418 ms   186      89       28     115     0.6
+
+    churn, 100k rows, unique bigint key + two-valued key, UPDATE every key then VACUUM
+                       cycle 1                          cycle 5
+                   ms      WAL     size   entries    ms      WAL     size   entries
+      before      1343    428 MiB  14 MiB  200,000   1456   379 MiB  34 MiB  600,000
+      after        135    4.6 MiB  14 MiB  100,000    140   6.2 MiB  15 MiB  100,000
+      btree         58    3.3 MiB 5.8 MiB     -        60   3.3 MiB  10 MiB     -
+
+The index WAL of the portfolio VACUUM is now exactly at btree's, and all but 9 MiB of it is
+full-page images that the first touch of a page after a checkpoint costs whatever the AM is; the
+deltas went from 33 MiB to 9 MiB.  The churn index no longer grows: entries stay at one per live row
+instead of accumulating a cycle of history each time, the VACUUM is ten times faster and writes
+sixty times less WAL, and the pages the dead keys owned are handed straight back through the free
+space map (deleted_pages is 0 at the end of every cycle because the next cycle's inserts have
+already taken them).  What is left between lion and btree on the portfolio is ix_c1m, whose 628,508
+single-TID entries cost 196 ms of the 418: probing 990,000 dead-TID lookups in hash order, one
+bucket page at a time.
+
+**The §9/§11 proof is unchanged**: TIDs are still only removed under a cleanup lock taken in chain
+order on every page; a page is freed only after it has been cleaned and found empty under that
+lock, so a reader's pin on a page it took containers from still blocks everything that could make
+those TIDs' heap pages all-visible.
+
+## 19. OR across columns in the count pushdown (v1, implemented)
+
+`count(*) WHERE c200 = 17 OR c20 = 3` used to be declined and ran as BitmapOr + Bitmap Heap Scan
+(19 ms at 1M rows on the optimized build, the same as btree, because 5% selectivity touches nearly
+every heap page). The count evaluator already evaluates AND/OR trees over posting-set cursors
+(multi-key classes, IN lists), so the whole of this is a planner and a plumbing problem.
+
+**Planner.** A top-level `BoolExpr OR` in baserestrictinfo is accepted when every arm is an accepted
+positive clause (equality, IN, IS NULL, exact multi-key) or an `AND` of such clauses, each on a plain
+column of the same relation; the collation, opfamily, cross-type, Param, IN-list-cap and
+per-partition rules are exactly the ones a plain clause goes through, because the analysis IS the
+same function (`lion_analyze_leaf()`, with `allow_negated = false` under an OR). A negated arm
+(`IS NOT NULL`, `NOT`) is declined: the complement of a posting set is not a posting set, and under a
+union there is nothing to subtract it from. So is an arm that is not indexable, one that would need a
+recheck (`b > 3`, a non-roaring operator, an ALL-mode multi-key query), and an `AND` arm one of whose
+leaves is any of those.
+
+The OR is ONE count source whose expression tree has leaves in different indexes, and it is ANDed
+with the remaining clauses and with the GROUP BY driver exactly like any other source. Several OR
+restrictions in one query are several sources.
+
+**How it is carried.** The leaves are appended to the flattened clause array alongside the plain
+clauses, contiguous and in arm order, and the structure over them travels in a new `custom_private`
+member, `LION_PRIV_ORS`: one IntList per OR of `{first clause index, number of arms, leaves in each
+arm}` (shape marker bumped to 4, `LION_PRIV_NMEMBERS` 9). Flattening is what makes everything else
+free: `lion_collect_targets()` matches an index for each leaf per partition, a Param in a leaf lands
+in `custom_exprs` where `set_customscan_references()` and `SS_finalize_plan()` can see it, and the
+cost model prices each leaf's bucket page and chain. What the executor derives from the structure is
+`inor[]` (a clause is a leaf of an OR) and one *item* per source: a plain clause, or a whole OR.
+
+**Leaves constrain no column of the result.** The other arms select rows this arm says nothing
+about, so an OR leaf enters none of the per-column bookkeeping of §10/§14: not `posattnos` (so
+`a = 1 OR a = 2` is legal, and the one-positive-clause-per-column rule does not compare an OR leaf
+with a top-level clause), not `eqattnos` (so the pinned-column echo never prints a key from an OR
+leaf's entry), and not `nonnullattnos`/`nullattnos` (so `count(n) WHERE n = 2 OR a = 17` is NOT
+answerable and the query is declined - it would otherwise come out as `count(*)`).
+
+**Cost.** Each leaf is charged its own bucket page and container chain, as if it had been a separate
+clause, plus the §15 union term for the merge they take part in: `members × log2(nleaves)` at
+cpu_operator_cost, where members is the sum of the leaves' own selectivities times the relation's
+rows. `lion_cost_count_rel()` therefore takes the whole clause list and skips the negated ones
+itself, rather than being handed a filtered list, because the OR structure names its leaves by
+position.
+
+**Safety.** For a union a dead TID may be contributed by a single leaf, so EVERY leaf under an OR
+must be read the pinned way until the merged container has been through the visibility-map check
+(`lion_source_pinned()`: OR → every child, which is what decides whether the source carries the §9
+interlock at all). Leaves under an OR are therefore never materialized: `LionCountSource` gains
+`nomaterialize`, which `lion_locate_or()` sets and which is rule 3 of the materialization decision in
+`lion_count_sources_cached()`. The §9 argument would in fact still hold for a stale copy under a
+union - the intersection is only counted from the visibility map while some positive source is
+pinned, and a TID that survives into the counted container is in that source's set too, so its
+index's ambulkdelete is blocked - but keeping "every leaf of a union holds a pin" true by
+construction means the interlock can be checked by reading `lion_source_pinned()` alone. §15's IN
+lists are unaffected and may still be materialized.
+
+**Executor.** `lion_locate_leaf()` is one clause's whole run-time meaning: it locates that clause's
+posting sets and returns the tree over them, its leaves numbered from 0, or NULL when the clause
+selects nothing (a NULL Param, an empty IN list). `lion_locate_or()` calls it per leaf, concatenates
+the sets into one array for the source and renumbers each leaf's tree onto its slice
+(`lion_shift_keynos()`), then builds AND nodes for the arms and one OR node over them. An arm with a
+leaf that selects nothing is dropped - which is how **a NULL Param arm selects nothing while the OR
+of the rest remains** - and an OR with no arm left sets `wheremissing`. A leaf whose key simply has
+no entry keeps its set and its leaf node; `lion_sets_satisfiable()` then answers for the whole tree.
+Pins: the OR's sets are released by `lion_release_where()` with every other source's, on ReScan, at
+End, and at the end of each partition's turn.
+
+**EXPLAIN** prints the arms after the indexes of all the leaves:
+`Lion Indexes: ix_c200, ix_c20 ((c200 = 17) OR (c20 = 3))`, an AND arm as
+`((a = 1) AND (b = 2))`, and - on a partitioned scan, where there is one index per partition - the
+expression alone. A Param is deparsed as `$1` like any other clause value.
+
+**Measured** (2026-09-21, 1M rows of `(c200, c20)`, 18,182 heap pages all-visible, assert build):
+`count(*) WHERE c200 = 17 OR c20 = 3` returns 55,000 rows in **0.55-0.62 ms** against the BitmapOr +
+Bitmap Heap Scan's **18.3-30.8 ms**, reading 570 containers, skipping all 18,182 heap blocks via the
+visibility map and rechecking none. A three-arm form is 0.75 ms against 21.4 ms.
+`test/sql/pushdown.sql` covers two- and three-arm ORs, an AND arm, an OR beside a plain clause and
+under a GROUP BY, two ORs in one query, IN and IS NULL and multi-key arms, arms whose value has no
+entry, Params under `force_generic_plan` (including NULL ones), an exec Param under a LATERAL nested
+loop, a partitioned table, a dirty heap and an all-visible one, and the negative cases above - each
+compared against the same query with the pushdown off, as a multiset both ways round.
+
+## 20. GROUP BY two indexed columns (v1, implemented)
+
+`SELECT a, b, count(*) FROM t [WHERE ...] GROUP BY a, b` is a nested loop over the two indexes'
+entries. Everything §10 says about ONE grouping column is said again per column: its own scalar lion
+index, its own collation, its own grouping equality (`SortGroupClause.eqop` = strategy 1 of that
+index's opfamily), its own value-representation gate (`lion_index_can_emit_value()` when the key is
+printed), and - for a partitioned parent - all of that per partition. Three or more columns are
+declined; so is the same column twice.
+
+**Which one drives.** The column with FEWER estimated distinct values is the OUTER one: its entry
+scan drives the node exactly as a single group column's does, and the other index is the INNER one.
+The choice is made at plan time from `estimate_num_groups()` per column, and the two are swapped
+before anything else looks at them, so `groupattno`/`groupidxoid` are always the outer pair and
+EXPLAIN names them first. The choice does not change the total intersection work (below); what it
+decides is how many entry scans there are and whose keys are held in memory.
+
+**The loop** (`lion_next_group2()`). For each outer entry: hold its key and its posting set - and
+that set's pin - in `outercxt` for the whole of its inner loop; for each inner key, locate the inner
+posting set, count the AND of (outer group, WHERE sources, inner group) through
+`lion_count_sources_cached()`, release the inner set, and emit (outer key, inner key, count) when
+the count is above zero. At most two group pins exist at a time, however many distinct values either
+column has, which is the pin budget of §9. NULL groups are each column's reserved NULL entry (§14)
+and come out like any other; `count(col)` of a group column is 0 in THAT column's NULL group, which
+is why there are two target-list kinds for it.
+
+**The inner keys, and why only the keys** (`lion_load_inner_keys()`). The inner index's entries are
+read ONCE per relation and only their KEYS are kept, in `innercxt`. An entry's head block or INLINE
+payload would be worthless without the buffer pin that goes with it (§9), and holding one pin per
+distinct inner value for the length of the scan is exactly what the pin budget forbids - so each
+pair re-locates its inner posting set with `lion_posting_set_lookup()`, one bucket page, and the
+bucket count is sized to the index's entry count, so that lookup is a shared-buffer hit for every
+index small enough for the cost model to have chosen this plan. The alternative - walking the inner
+index's entry scan once per OUTER group - needs no memory but re-reads every bucket page of the
+inner index `outer_entries` times; it is kept as the FALLBACK for when the keys do not fit the
+`work_mem` budget (checked every 256 keys with `MemoryContextMemAllocated()`), because the §16
+lesson is that a plan-time bound is only as good as `estimate_num_groups`. `innerkey == NULL` selects
+that path, and then the inner key lives in the per-pair context like a single-column group's does.
+
+**Cost** (`lion_cost_count_rel()`). Three terms on top of §10's:
+
+- one `cpu_tuple_cost` per (outer, inner) PAIR, for the inner lookup and the per-pair bookkeeping;
+- the INTERSECTION, which is what decides. ANDing two containers costs about the members of the
+  smaller of them, so one pair costs about `Min(rows/outer_entries, rows/inner_entries)` member
+  steps and the sum over all `outer_entries × inner_entries` pairs is exactly
+  **`Min(outer_entries, inner_entries) × rows`** - independent of which column drives;
+- and both sides' container bookkeeping at every pair,
+  `pairs × (containers(outer group) + containers(inner group))`, which is what makes a pair of
+  widely SPREAD groups expensive even when their intersection is empty: two groups whose rows are
+  scattered over the whole heap have a container at nearly every container key and the merge steps
+  through all of them.
+
+Measured (2026-09-21, 200k rows of a 100-byte-wide table, uncorrelated columns, assert build), node
+against the sequential aggregate: **20 × 2 groups 5.6 ms against 37.3 ms**, **200 × 2 14.9 against
+39.3**, **200 × 20 60.7 against 36.8**, **20000 × 2 169.8 against 51.6**, and 20000 × 200 far worse.
+The model chooses the first two and refuses the rest, which is where the measurements say the
+crossover is. Note the deviation from this section's sketch, which expected 200 × 20 to win: on
+UNCORRELATED data it does not, because the member term above is 20 × 200,000 = 4M container-member
+steps against 200,000 heap tuples for the sequential scan. Clustered data would change that - a
+posting set confined to a few container keys makes most pairs' merges terminate at once - and the
+model does not model correlation, so it refuses those too. That is conservative, and it is the open
+item this section leaves.
+
+**Partitions** work exactly as §16's single-column case: one partial aggregate per (outer, inner)
+pair per partition, streamed as each partition is counted, with core's Finalize HashAggregate on top
+combining them; both grouping columns must be hashable. `LION_PRIV_PARTS` carries the inner index Oid
+per partition next to the outer one. Note that a partitioned plan leaves BOTH index Oids in
+`LION_PRIV_OIDS` invalid, so nothing in the executor may decide "is there a second group column?"
+from an Oid - `groupattno2 != 0` is the test, and getting that wrong was a real bug: the inner
+group's source was left out of the count and every pair came back with the outer group's count.
+
+**EXPLAIN** prints both indexes and both columns: `Lion Indexes: ix_b (b), ix_a (a)` and
+`Group Key: b, a`, in outer-then-inner order. `test/sql/pushdown.sql` covers the results against the
+ordinary plan (as a multiset both ways round) with and without a WHERE clause, with NULLs in either
+column, with `count(col)` of either, under an OR restriction, on a dirty heap and a clean one, on a
+partitioned table, and pins the plan choice for 20 × 2, 200 × 2, 200 × 20, 20000 × 200 and
+20000 × 2 with nothing disabled.

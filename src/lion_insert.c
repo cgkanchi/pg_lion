@@ -75,12 +75,14 @@
 
 #include "lion.h"
 
-static void lion_insert_new_entry(Relation index, LionState *state, Buffer headbuf,
+static void lion_insert_new_entry(Relation index, Relation heaprel,
+								 LionState *state, Buffer headbuf,
 								 Datum key, uint16 reservedflag, uint32 hash,
 								 uint32 ckey, uint16 lo);
-static void lion_insert_inline(Relation index, LionState *state, Buffer entrybuf,
+static void lion_insert_inline(Relation index, Relation heaprel,
+							  LionState *state, Buffer entrybuf,
 							  OffsetNumber entryoff, uint32 ckey, uint16 lo);
-static void lion_insert_chain(Relation index, Buffer entrybuf,
+static void lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 							 OffsetNumber entryoff, uint32 ckey, uint16 lo);
 static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 										 Buffer entrybuf, OffsetNumber entryoff,
@@ -90,7 +92,8 @@ static bool lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber
 									   Buffer entrybuf, OffsetNumber entryoff,
 									   LionEntryTuple *entry, Size entrysize,
 									   uint32 ckey, uint16 lo, bool *done);
-static void lion_insert_segment(Relation index, Buffer buf, OffsetNumber off,
+static void lion_insert_segment(Relation index, Relation heaprel, Buffer buf,
+							   OffsetNumber off,
 							   bool replace, Buffer entrybuf,
 							   OffsetNumber entryoff, LionEntryTuple *entry,
 							   uint32 ckey, uint16 lo);
@@ -251,7 +254,8 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
  * written in the same WAL record as the items.
  */
 static void
-lion_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
+lion_insert_segment(Relation index, Relation heaprel, Buffer buf,
+				   OffsetNumber off, bool replace,
 				   Buffer entrybuf, OffsetNumber entryoff,
 				   LionEntryTuple *entry, uint32 ckey, uint16 lo)
 {
@@ -289,8 +293,8 @@ lion_insert_segment(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	entry->ntids += 1;
 	entry->ncontainers += (uint32) (w.nitems - (replace ? 1 : 0));
 
-	lion_chain_put_items_locked_ext(index, buf, entrybuf, entryoff, entry, off,
-								   replace, w.items, w.nitems, true);
+	lion_chain_put_items_locked_ext(index, heaprel, buf, entrybuf, entryoff,
+								   entry, off, replace, w.items, w.nitems, true);
 }
 
 /*
@@ -454,7 +458,8 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
  * is the reserved NULL-key entry of bucket 0 (DESIGN.md §14).
  */
 static void
-lion_insert_new_entry(Relation index, LionState *state, Buffer headbuf,
+lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
+					 Buffer headbuf,
 					 Datum key, uint16 reservedflag, uint32 hash, uint32 ckey,
 					 uint16 lo)
 {
@@ -495,7 +500,7 @@ lion_insert_new_entry(Relation index, LionState *state, Buffer headbuf,
 			lion_warn_max_entries(index, estimate);
 	}
 
-	lion_add_entry(index, headbuf, entry, size);
+	lion_add_entry(index, heaprel, headbuf, entry, size);
 
 	pfree(entry);
 }
@@ -506,7 +511,8 @@ lion_insert_new_entry(Relation index, LionState *state, Buffer headbuf,
  * EXCLUSIVE.
  */
 static void
-lion_insert_inline(Relation index, LionState *state, Buffer entrybuf,
+lion_insert_inline(Relation index, Relation heaprel, LionState *state,
+				  Buffer entrybuf,
 				  OffsetNumber entryoff, uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(entrybuf);
@@ -573,14 +579,15 @@ lion_insert_inline(Relation index, LionState *state, Buffer entrybuf,
 		chain->ncontainers = ncontainers;
 		chain->ntids = ntids;
 
-		lion_entry_spill(index, entrybuf, entryoff, chain, oldpay, paylen);
+		lion_entry_spill(index, heaprel, entrybuf, entryoff, chain, oldpay,
+						paylen);
 		pfree(chain);
 	}
 
 	pfree(newpay);
 	pfree(oldpay);
 
-	lion_insert_chain(index, entrybuf, entryoff, ckey, lo);
+	lion_insert_chain(index, heaprel, entrybuf, entryoff, ckey, lo);
 }
 
 /*
@@ -764,8 +771,8 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
  * dropped first, so no page is ever locked before a page to its left.
  */
 static Buffer
-lion_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
-						   uint32 ckey)
+lion_insert_lock_chain_page(Relation index, uint32 hash, BlockNumber head,
+						   BlockNumber tail, uint32 ckey)
 {
 	Buffer		buf;
 	Page		page;
@@ -777,10 +784,18 @@ lion_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
 
-	if (!LionPageIsContainer(page))
+	/*
+	 * DESIGN.md §18: every page reached through an entry's head, tail or
+	 * rightlink has to claim that chain.  An insert holds the entry's bucket
+	 * page EXCLUSIVE and VACUUM only frees a chain under a cleanup lock on
+	 * that same page, so the chain cannot go away underneath this walk and a
+	 * page that does not belong to it is corruption, not a race.
+	 */
+	if (!lion_page_owns_entry(page, hash, head))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index: block %u is not a container page", tail);
+		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
+			 tail, head);
 	}
 
 	if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber &&
@@ -789,14 +804,15 @@ lion_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
 
 	UnlockReleaseBuffer(buf);
 
-	blk = lion_chain_find_page(index, head, tail, ckey);
+	blk = lion_chain_find_page(index, hash, head, tail, ckey);
 	buf = ReadBuffer(index, blk);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	if (!LionPageIsContainer(BufferGetPage(buf)))
+	if (!lion_page_owns_entry(BufferGetPage(buf), hash, head))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index: block %u is not a container page", blk);
+		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
+			 blk, head);
 	}
 
 	return buf;
@@ -807,7 +823,8 @@ lion_insert_lock_chain_page(Relation index, BlockNumber head, BlockNumber tail,
  * EXCLUSIVE.
  */
 static void
-lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
+				 OffsetNumber entryoff,
 				 uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(entrybuf);
@@ -829,7 +846,8 @@ lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-	buf = lion_insert_lock_chain_page(index, ecopy->head, ecopy->tail, ckey);
+	buf = lion_insert_lock_chain_page(index, ecopy->hash, ecopy->head,
+									 ecopy->tail, ckey);
 	blk = BufferGetBlockNumber(buf);
 	cpage = BufferGetPage(buf);
 
@@ -844,8 +862,8 @@ lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 		if (!lion_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
 										ecopy, esize, ckey, lo, &done))
-			lion_insert_segment(index, buf, off, true, entrybuf, entryoff,
-							   ecopy, ckey, lo);
+			lion_insert_segment(index, heaprel, buf, off, true, entrybuf,
+							   entryoff, ecopy, ckey, lo);
 		UnlockReleaseBuffer(buf);
 		pfree(cbuf);
 		pfree(ecopy);
@@ -879,7 +897,7 @@ lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 			if (!lion_insert_segment_inplace(index, buf, target, entrybuf,
 											entryoff, ecopy, esize, ckey, lo,
 											&done))
-				lion_insert_segment(index, buf, target, true, entrybuf,
+				lion_insert_segment(index, heaprel, buf, target, true, entrybuf,
 								   entryoff, ecopy, ckey, lo);
 			UnlockReleaseBuffer(buf);
 			pfree(cbuf);
@@ -888,8 +906,8 @@ lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 		}
 
 		/* No segment to join: the pair becomes a new one-pair segment. */
-		lion_insert_segment(index, buf, off, false, entrybuf, entryoff, ecopy,
-						   ckey, lo);
+		lion_insert_segment(index, heaprel, buf, off, false, entrybuf, entryoff,
+						   ecopy, ckey, lo);
 		UnlockReleaseBuffer(buf);
 		pfree(cbuf);
 		pfree(ecopy);
@@ -934,8 +952,8 @@ lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 
 	ecopy->ntids += 1;
 
-	lion_chain_put_container_locked_ext(index, buf, entrybuf, entryoff, ecopy,
-									   cbuf, &delta, true);
+	lion_chain_put_container_locked_ext(index, heaprel, buf, entrybuf, entryoff,
+									   ecopy, cbuf, &delta, true);
 	UnlockReleaseBuffer(buf);
 
 	Assert(delta == 0);
@@ -952,8 +970,8 @@ lion_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
  * key is meaningless and the bucket is 0.
  */
 static void
-lion_insert_one(Relation index, LionState *state, Datum key, uint16 reservedflag,
-			   uint32 ckey, uint16 lo)
+lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
+			   uint16 reservedflag, uint32 ckey, uint16 lo)
 {
 	uint32		hash;
 	Buffer		headbuf;
@@ -979,8 +997,8 @@ lion_insert_one(Relation index, LionState *state, Datum key, uint16 reservedflag
 
 	if (!found)
 	{
-		lion_insert_new_entry(index, state, headbuf, key, reservedflag, hash,
-							 ckey, lo);
+		lion_insert_new_entry(index, heaprel, state, headbuf, key, reservedflag,
+							 hash, ckey, lo);
 	}
 	else
 	{
@@ -991,9 +1009,10 @@ lion_insert_one(Relation index, LionState *state, Datum key, uint16 reservedflag
 															entryoff));
 
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
-			lion_insert_inline(index, state, entrybuf, entryoff, ckey, lo);
+			lion_insert_inline(index, heaprel, state, entrybuf, entryoff, ckey,
+							  lo);
 		else
-			lion_insert_chain(index, entrybuf, entryoff, ckey, lo);
+			lion_insert_chain(index, heaprel, entrybuf, entryoff, ckey, lo);
 
 		/* lion_find_entry() does not pin the head page twice. */
 		if (entrybuf != headbuf)
@@ -1060,7 +1079,8 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	 * puts the row in the reserved EMPTY entry the same way (DESIGN.md §17).
 	 */
 	if (isnull[0])
-		lion_insert_one(index, state, (Datum) 0, LION_ENTRY_NULLKEY, ckey, lo);
+		lion_insert_one(index, heapRel, state, (Datum) 0, LION_ENTRY_NULLKEY,
+					   ckey, lo);
 	else if (state->multikey)
 	{
 		Datum	   *keys;
@@ -1068,11 +1088,11 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		int			i;
 
 		if (nkeys == 0)
-			lion_insert_one(index, state, (Datum) 0, LION_ENTRY_EMPTYKEY,
-						   ckey, lo);
+			lion_insert_one(index, heapRel, state, (Datum) 0,
+						   LION_ENTRY_EMPTYKEY, ckey, lo);
 		for (i = 0; i < nkeys; i++)
 		{
-			lion_insert_one(index, state, keys[i], 0, ckey, lo);
+			lion_insert_one(index, heapRel, state, keys[i], 0, ckey, lo);
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
@@ -1082,7 +1102,7 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		if (!state->typbyval && state->typlen == -1)
 			key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-		lion_insert_one(index, state, key, 0, ckey, lo);
+		lion_insert_one(index, heapRel, state, key, 0, ckey, lo);
 	}
 
 	MemoryContextSwitchTo(oldcxt);
