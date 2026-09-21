@@ -1,0 +1,57 @@
+Time: 18.030 ms
+Time: 0.732 ms
+psql:/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/gen.sql:4: NOTICE:  table "fact" does not exist, skipping
+Time: 0.161 ms
+Time: 18938.093 ms (00:18.938)
+Time: 7005.951 ms (00:07.006)
+ heap_size | heap_pages 
+-----------+------------
+ 1776 MB   |     227328
+(1 row)
+
+Time: 0.333 ms
+Time: 6700.758 ms (00:06.701)
+Time: 9832.734 ms (00:09.833)
+Time: 10503.906 ms (00:10.504)
+Time: 9181.714 ms (00:09.182)
+Time: 7824.314 ms (00:07.824)
+Time: 4317.122 ms (00:04.317)
+Time: 5754.428 ms (00:05.754)
+Time: 3593.497 ms (00:03.593)
+Time: 4115.359 ms (00:04.115)
+Time: 5549.071 ms (00:05.549)
+Time: 9408.017 ms (00:09.408)
+Time: 21243.070 ms (00:21.243)
+Time: 4713.335 ms (00:04.713)
+Time: 5085.165 ms (00:05.085)
+psql:/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/gen.sql:32: NOTICE:  table "fact_tids" does not exist, skipping
+Time: 0.194 ms
+Time: 21648.094 ms (00:21.648)
+ max_offset | max_block |  count   
+------------+-----------+----------
+         88 |    227272 | 20000000
+(1 row)
+
+Time: 2759.333 ms (00:02.759)
+          relname          | pg_size_pretty 
+---------------------------+----------------
+ fact                      | 1776 MB
+ fact_c10_btree            | 132 MB
+ fact_c10_gin              | 23 MB
+ fact_c1m_btree            | 152 MB
+ fact_c1m_gin              | 199 MB
+ fact_c200_btree           | 132 MB
+ fact_c200_clustered_btree | 132 MB
+ fact_c200_clustered_gin   | 23 MB
+ fact_c200_gin             | 39 MB
+ fact_c20k_btree           | 138 MB
+ fact_c20k_gin             | 157 MB
+ fact_c2_btree             | 132 MB
+ fact_c2_gin               | 21 MB
+ fact_c_skew_btree         | 133 MB
+ fact_c_skew_gin           | 26 MB
+ fact_tids                 | 1611 MB
+(16 rows)
+
+Time: 1.504 ms
+GEN_DONE

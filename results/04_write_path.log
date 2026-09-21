@@ -1,0 +1,53 @@
+Time: 0.163 ms
+psql:/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/w.sql:3: NOTICE:  table "fact_w" does not exist, skipping
+Time: 0.343 ms
+Time: 636.287 ms
+Time: 807.739 ms
+Time: 1.032 ms
+=== baseline: no indexes: insert 200k / update ~20k
+Time: 266.274 ms
+Time: 337.875 ms
+=== 7 btree indexes
+Time: 682.154 ms
+Time: 830.389 ms
+Time: 844.357 ms
+Time: 703.854 ms
+Time: 684.497 ms
+Time: 660.084 ms
+Time: 549.981 ms
+--- btree: insert 200k
+Time: 2437.523 ms (00:02.438)
+--- btree: update ~20k
+Time: 925.146 ms
+Time: 7.825 ms
+Time: 4.561 ms
+Time: 4.767 ms
+Time: 8.113 ms
+Time: 4.532 ms
+Time: 4.197 ms
+Time: 4.044 ms
+Time: 0.746 ms
+=== 7 GIN indexes, fastupdate=off
+Time: 376.781 ms
+Time: 430.773 ms
+Time: 554.040 ms
+Time: 966.925 ms
+Time: 3036.646 ms (00:03.037)
+Time: 443.861 ms
+Time: 529.792 ms
+--- gin(fastupdate=off): insert 200k
+Time: 4030.365 ms (00:04.030)
+--- gin(fastupdate=off): update ~20k
+Time: 642.209 ms
+Time: 0.287 ms
+Time: 0.162 ms
+Time: 0.131 ms
+Time: 0.136 ms
+Time: 0.131 ms
+Time: 0.132 ms
+Time: 0.160 ms
+Time: 0.300 ms
+--- gin(fastupdate=on): insert 200k
+Time: 1656.513 ms (00:01.657)
+--- gin(fastupdate=on): update ~20k
+Time: 1034.970 ms (00:01.035)

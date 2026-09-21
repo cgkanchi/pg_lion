@@ -1,0 +1,17 @@
+p_c2_roaring_bitmap              1443.054 ms
+p_c200_roaring_bitmap              76.907 ms
+p_c200_clustered_roaring_bitmap        6.720 ms
+p_c20k_roaring_bitmap               0.842 ms
+p_c1m_roaring_bitmap                0.131 ms
+and3_roaring                       60.484 ms
+range_c20k_roaring_bitmap         936.291 ms
+fetch_c200_roaring                 78.395 ms
+p_c2_pushdown                       2.604 ms
+p_c200_pushdown                     0.346 ms
+p_c200_clustered_pushdown           0.114 ms
+p_c20k_pushdown                     0.149 ms
+p_c1m_pushdown                      0.117 ms
+and3_pushdown                       4.882 ms
+grp_c200_pushdown                  49.958 ms
+grp_c2_pushdown                     5.312 ms
+BENCH_DONE
