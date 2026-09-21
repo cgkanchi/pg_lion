@@ -495,7 +495,9 @@ Planner integration
   representative case) and `test/sql/pushdown.sql` (numeric, and a text GROUP BY that still pushes
   down).
 - Add a CustomPath with `flags = 0` (no parallel, no backward, no mark/restore), `pathtarget =
-  grouped_rel->reltarget`, rows = estimated groups (from estimate_num_groups, or 1 without GROUP BY),
+  grouped_rel->reltarget` (a partitioned GROUP BY uses a partially-grouped target instead and is
+  wrapped in a Finalize Agg: §16), rows = estimated groups (from estimate_num_groups, or 1 without
+  GROUP BY),
   startup/total cost = (index pages for the involved keys, estimated as the index size × selectivity,
   clamped ≥ 1) × random_page_cost + containers × cpu_operator_cost + expected recheck TIDs (the
   fraction of heap pages not all-visible from `pg_class.relallvisible/relpages`, times the rows the
@@ -509,6 +511,12 @@ Planner integration
   - with GROUP BY, `Min(numgroups × heap_pages × dirtyfrac, recheck_tids)`: each group's merge
     returns to a dirty block separately, which is what keeps a thousand groups of one TID per block
     on a heap that is not all-visible losing to the sequential scan that does the same work once.
+
+  The node streams: every row is emitted as it is counted, so the startup cost is 0 except for the
+  forms that produce a single row (a plain count, or a GROUP BY the planner folded to one group),
+  which cannot emit anything before the whole scan is done. There is no per-group memory to charge
+  beyond one group's iteration state, and nothing above the node is priced here - a partitioned
+  GROUP BY puts core's Finalize Agg on top and core costs that (§16).
 
   This is deliberately optimistic but proportional; document it. `test/sql/pushdown.sql` pins both
   ends: a 200k-row table vacuumed and then slightly extended (relallvisible just under relpages)
@@ -535,7 +543,9 @@ Executor
   bucket pages; copy each entry's key and head/inline payload while pinned as in §9). For each
   entry, count the AND of its posting set with the WHERE posting sets (§9). Emit (key, count) only
   when count > 0 (a group exists only if at least one row is visible). Output order is arbitrary;
-  the planner must not assume sortedness (pathkeys = NIL).
+  the planner must not assume sortedness (pathkeys = NIL). This is one function,
+  `rbi_next_group()`, and it is the whole of the GROUP BY executor: a partitioned scan runs it once
+  per partition (§16).
 - ReScanCustomScan: reset iteration state. EndCustomScan: close indexes, free.
 - ExplainCustomScan: print "Indexes: idx1 (col = const), ..." and "Group Key: col" and, with ANALYZE,
   the number of TIDs rechecked in the heap and heap blocks skipped via the visibility map.
@@ -841,40 +851,80 @@ Planning (`rbi_try_count_path`, `rbi_collect_targets`)
   partition fallback, because the node produces one result set.
 - No live partitions (everything pruned) adds no path at all: the planner's own dummy-rel handling
   gives the right answer.
-- One CustomPath on the parent's grouped rel. custom_private gains two members: RBI_PRIV_PARTS, a
+- One CustomPath per query - added to the grouped rel directly, or, for a GROUP BY, as the subpath
+  of the Finalize Agg that is added instead (below). custom_private gains one member: RBI_PRIV_PARTS, a
   list of one OidList per partition (heap Oid, driving index Oid or InvalidOid, then one index Oid
-  per WHERE clause in clause order), empty for a plain table; and RBI_PRIV_GROUPKEY, the group Var
-  plus the equality operator the planner chose for it. A partitioned plan leaves the index Oids in
-  RBI_PRIV_OIDS invalid - there is no single index - and keeps the parent's heap Oid there, which
-  is what EXPLAIN resolves column names against.
+  per WHERE clause in clause order), empty for a plain table. A partitioned plan leaves the index
+  Oids in RBI_PRIV_OIDS invalid - there is no single index - and keeps the parent's heap Oid there,
+  which is what EXPLAIN resolves column names against.
 - Cost: `rbi_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
   allvisfrac and rows and its own indexes; the path's cost is the sum over the leaves. numgroups
   comes from `estimate_num_groups` on the PARENT (a partition may hold rows of every group), and is
-  used unchanged for each of them. A partitioned GROUP BY adds the merge itself:
-  `numgroups × hashentrysize × cpu_operator_cost`, all of it startup cost, because the node emits
-  nothing until the last partition has been counted.
-- A partitioned GROUP BY needs a hashable grouping column (`SortGroupClause.hashable`), because the
-  partitions' groups are merged in a hash table; one table needs no merge and does not care.
-- **The merge has a memory budget, enforced at plan time** (2026-09-20 review, finding 6). The
-  TupleHashTable below holds every distinct group of every partition until the last one has been
-  counted, and it has no spill path: unlike HashAggregate it cannot fall back to batches on disk.
-  So the planner estimates it as
-  `hashentrysize = MAXALIGN(get_attavgwidth(), or the type's average width when there are no stats)
-  + 64` bytes per group - the key, the minimal tuple's header, the hash table's per-entry
-  bookkeeping and the int64 count - and declines the pushdown when
-  `numgroups × hashentrysize` exceeds `get_hash_memory_limit()`, which is the same
-  `work_mem × hash_mem_multiplier` budget HashAggregate respects. The ordinary Agg, which can
-  spill, then gets the query. Neither a count (no groups to merge) nor a single table (no merge)
-  is subject to it; `test/sql/partition.sql` shows all three with the other plan types disabled,
-  so that only the budget can decide. This bounds the merge, not the per-relation count: the TID
-  recheck list of §9 is a separate structure with its own bound. It is also a PLAN-time bound and
-  therefore only as good as `estimate_num_groups`: a bad underestimate still builds a table larger
-  than the budget at run time, which is the same exposure HashAggregate has before it decides to
-  spill. An executor-side cap would need the node to be able to finish differently (spill the
-  merge, or restart as a plain Agg) and is not v1.
-- Partitionwise aggregation is left alone: the existing `patype != PARTITIONWISE_AGGREGATE_NONE`
+  used unchanged for each of them. Nothing is added for a merge, because there is none, and the
+  Finalize Agg on top is costed by core's own `create_agg_path()`/`cost_agg()` - including its
+  spill. The node's `rows` is what it really emits: for a partitioned GROUP BY the SUM over the
+  partitions of that partition's own `estimate_num_groups` (made against the child Var, so against
+  the child's statistics, and capped by its row count), which is also what `cost_agg()` is then
+  handed as its input row count.
+- **A partitioned GROUP BY emits PARTIAL aggregates; core's Finalize HashAggregate combines them**
+  (2026-09-21 follow-up review). This is what bounds the memory, and it replaces the
+  cross-partition merge the node used to do itself.
+
+  The node used to hold every distinct group of every partition in a TupleHashTable until the last
+  partition had been counted, and that table had no spill path: unlike HashAggregate it could not
+  fall back to batches on disk. A plan-time budget guarded it - decline when
+  `numgroups × hashentrysize` exceeds `get_hash_memory_limit()` - but a plan-time bound is only as
+  good as `estimate_num_groups`, and a partitioned parent is never auto-analyzed. Ten estimated
+  groups against twenty thousand actual ones (reproduced: `work_mem = 64kB`, correct output, no
+  spill) built a table with no bound at all. So the merge is gone.
+
+  Instead the pushdown builds the plan shape core builds for a partial aggregation:
+
+  - the path's target is a partially-grouped PathTarget made by `rbi_make_partial_target()`, which
+    is `make_partial_grouping_target()` (src/backend/optimizer/plan/planner.c) applied to the
+    grouped rel's own target: the grouping column carried through with its sortgroupref, every
+    other column (one a WHERE clause pins, say) carried through as a plain column, and each Aggref
+    flat-copied and put through `mark_partial_aggref(AGGSPLIT_INITIAL_SERIAL)`. For `count(*)` and
+    the `count(col)` cases of §14 the transition type is int8 and nothing is serialized, so a
+    partial row is just (group key, int8 partial count). It has to be *that* function's output,
+    node for node: setrefs.c re-derives the partial Aggrefs from the Finalize Agg's own ones
+    (`convert_combining_aggrefs()`) and matches them against the subplan's target list with
+    `equal()`, so an Aggref differing in any field - the aggsplit above all - would not be found.
+    `custom_scan_tlist` is copied from that target list, which is what
+    `set_customscan_references()` then resolves the plan's INDEX_VAR references against;
+  - and what goes into the grouped rel is not the CustomPath but
+    `create_agg_path(root, output_rel, &cpath->path, output_rel->reltarget, AGG_HASHED,
+    AGGSPLIT_FINAL_DESERIAL, root->processed_groupClause, NIL, &agg_final_costs, numgroups)`, with
+    `agg_final_costs` from `get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, ...)`. EXPLAIN
+    therefore reads `Finalize HashAggregate -> Custom Scan (RoaringCount)`.
+
+  The Finalize node combines the partial counts with `int8pl` and spills to disk under
+  `work_mem × hash_mem_multiplier` like any HashAggregate, so a grouping that does not fit is
+  batched rather than refused, and a wrong estimate costs performance instead of memory. The node
+  itself keeps nothing between rows: one partition open, one entry scan, one group's iteration
+  state. Neither a count (no groups) nor a single table (its groups already stream) has anything
+  above it. `test/sql/partition.sql` pins the shape with EXPLAIN VERBOSE (`(PARTIAL count(*))` in
+  the node's output), shows `batches > 1` / `disk usage > 0` on the Finalize node at
+  `work_mem = 64kB` via EXPLAIN (FORMAT JSON), and replays the stale-statistics reproduction above:
+  20,010 exact groups out of a plan that estimated 10.
+- A partitioned GROUP BY needs a hashable grouping column (`SortGroupClause.hashable`) for the
+  Finalize HashAggregate, and needs the planner to consider the aggregates splittable
+  (`extra->flags & GROUPING_CAN_PARTIAL_AGG`); one table has nothing above it and cares about
+  neither.
+- Partitionwise aggregation is still left alone: the `patype != PARTITIONWISE_AGGREGATE_NONE`
   bail-out means that with `enable_partitionwise_aggregate = on` a partitioned table gets the
-  planner's own per-partition Aggs and not this node.
+  planner's own per-partition Aggs and not this node. Two things about that guard are worth
+  writing down now that the node produces partials itself:
+  - it is wider than its name suggests. `grouping_planner()` sets `extra.patype =
+    PARTITIONWISE_AGGREGATE_FULL` whenever the GUC is on and the query has no grouping sets, before
+    anything has asked whether the input rel is partitioned at all, so the bail-out currently turns
+    the count pushdown off for PLAIN tables too. The GUC defaults to off, so this only bites a
+    session that turned it on;
+  - and the shape reason for it is gone. The node's output is now exactly what core's own partial
+    aggregation produces, so letting the path compete with the partitionwise Aggs on cost would be
+    structurally sound; a child level doing `PARTITIONWISE_AGGREGATE_PARTIAL` never reaches the
+    hook anyway (`create_ordinary_grouping_paths()` returns before it). Lifting the guard is
+    therefore a costing decision, not a correctness one, and wants its own calibration and tests.
 
 Executor
 - `rbi_open_relation()` / `rbi_close_relation()` open and close ONE relation: a plain table once for
@@ -884,18 +934,23 @@ Executor
   table for a cached plan), and cassert builds check it with `CheckRelationLockedByMe` - and the
   indexes, which are not range table entries, with AccessShareLock.
 - Per relation the node then runs one of `rbi_count_relation()` (the intersection of the WHERE
-  clauses), `rbi_sumall_relation()` (§14's sum over every entry) or `rbi_group_relation_into_hash()`;
-  the single-table paths use the first two unchanged.
-- Without GROUP BY the partition counts are summed and one row is emitted, as §10 says.
-- With GROUP BY each partition's groups go into a TupleHashTable (`BuildTupleHashTable` over a
-  one-column TupleDesc of the group type, with the hash and equality functions
-  `execTuplesHashPrepare()` derives from the planner's equality operator, and the group's collation),
-  whose per-entry "additional" bytes hold the running int64 count. The NULL group merges like any
-  other. Nothing is emitted until every partition has been processed, because a group may have rows
-  in any of them; groups whose count is 0 are still not emitted. The table's own contexts (meta,
-  tuples, temp) live under the node's `es_query_cxt`; the per-partition work uses the same pergroup
-  context as before, reset per group, and the located WHERE payloads are released and their context
-  reset at the end of each partition.
+  clauses), `rbi_sumall_relation()` (§14's sum over every entry) or `rbi_next_group()` (§10's
+  streaming group loop); all three are the single-table code, unchanged.
+- Without GROUP BY the partition counts are summed and one row is emitted, as §10 says: nothing
+  comes out until the last partition has been counted, because the one row is the total.
+- With GROUP BY the node streams. `rbi_next_partial_group()` keeps two pieces of state, which
+  partition is open (`curpart`) and whether it is open (`partopen`), and on each call: open the
+  partition if it is not open and locate its WHERE clauses; ask `rbi_next_group()` for the next
+  group of it and return that row; and when its entry scan runs out, release its posting sets,
+  close it, and move to the next one. Each group is emitted as a partial aggregate the moment it
+  is counted, so a group with rows in three partitions comes out three times and the Finalize Agg
+  adds them up. The NULL group is emitted per partition like any other and hash aggregation groups
+  NULLs together. Groups whose count is 0 are still not emitted - there is no such group in that
+  partition - and a partition where a positive clause has no entry at all (`wheremissing`) is
+  skipped without an entry scan. The per-partition work uses the same pergroup context as before,
+  reset per group, and the located WHERE payloads are released and their context reset at the end
+  of each partition. There is no cross-partition state: no hash table, no per-node group memory
+  beyond one partition's iteration state.
 - The key a target list prints for a column a clause pins to one value is remembered on the clause
   (`RBIClauseState.storedkey`, copied into a small context of its own) the first time a relation's
   entry has it, because the posting set is gone by the time the row comes out. With partitions that
@@ -903,8 +958,10 @@ Executor
   index's own equality - and, since the planner only builds a value-producing node when every
   partition's index has the type's own representation-preserving equality (§10), "compares equal"
   there means "is the same bytes".
-- ReScan throws all of it away - entry scan, posting sets, the open partition, the merged hash table
-  and the remembered keys - and starts again.
+- ReScan throws all of it away - entry scan, posting sets, the open partition and the remembered
+  keys - and starts again from the first partition. A Finalize HashAggregate that has not spilled
+  re-reads its own table instead of rescanning the node (`ExecReScanAgg()`), so the case that
+  really exercises this is a nested loop over a spilling one, which `test/sql/partition.sql` has.
 - EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Roaring Indexes` line keeps
   its per-clause text but drops the index name for a partitioned scan (`(a), (b = 2)` rather than
   `idx_a (a), idx_b (b = 2)`), because there is one index per partition and no single name to give.
@@ -920,10 +977,10 @@ set is fixed at plan time), Params in the WHERE clauses (§10, not partition-spe
 execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation as above. Planning
 costs one `index_open` per clause per partition (`rbi_index_bucket_pages` reads the meta page), and
 EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
-Also not supported, and refused rather than attempted: a grouping whose merged hash table would
-not fit in `get_hash_memory_limit()` (above), a partition whose opclass groups rows differently
-from the query, and a value-producing grouping over a type whose equality does not preserve the
-representation (§10).
+Also not supported, and refused rather than attempted: a partition whose opclass groups rows
+differently from the query, and a value-producing grouping over a type whose equality does not
+preserve the representation (§10). A grouping too large for `hash_mem` is no longer among them:
+the Finalize HashAggregate spills.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
