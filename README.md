@@ -215,25 +215,29 @@ These are default-planner results. Clean rows follow VACUUM; dirty rows follow s
 updates to 1% of rows and ANALYZE, without VACUUM. Row-update percentage is not the percentage of
 heap pages that lose all-visible status.
 
-| Dataset | Query / state | B-tree ms | GIN ms | Lion ms |
-| --- | --- | --- | --- | --- |
-| 1M scalar | Count ~50% of rows / clean | 32.336 | 93.011 | 0.408 |
-| 1M scalar | Count ~0.5% of rows / clean | 0.318 | 2.827 | 0.028 |
-| 1M scalar | Count two equality predicates / clean | 2.764 | 33.469 | 0.357 |
-| 1M scalar | Count per 200 groups / clean | 85.142 | 142.057 † | 3.874 |
-| 1M scalar | Count per 200 groups / dirty | 142.221 † | 146.727 † | 3.699 |
-| 5M scalar | Count ~50% of rows / clean | 167.163 | 958.400 | 2.034 |
-| 5M scalar | Count ~0.5% of rows / clean | 1.530 | 110.119 | 0.103 |
-| 5M scalar | Count two equality predicates / clean | 16.193 | 178.657 | 1.643 |
-| 5M scalar | Count per 200 groups / clean | 417.244 | 1252.029 † | 18.645 |
-| 5M scalar | Count per 200 groups / dirty | 956.909 † | 934.408 † | 18.465 |
-| 200k documents | Array contains `t1` | — | 4.909 | 0.025 |
-| 200k documents | Array contains `t1` and `t17` | — | 0.956 | 0.115 |
-| 200k documents | Array overlaps `t1`, `t17`, `t123` | — | 8.040 | 0.277 |
-| 200k documents | Full-text `w1 & w17` count | — | 1.069 | 0.116 |
+| Dataset | Query / state | B-tree ms | GIN ms | Lion ms | Speedup vs B-tree / GIN |
+| --- | --- | --- | --- | --- | --- |
+| 1M scalar | Count ~50% of rows / clean | 32.336 | 93.011 | 0.408 | 79.3× / 228.0× |
+| 1M scalar | Count ~0.5% of rows / clean | 0.318 | 2.827 | 0.028 | 11.2× / 99.2× |
+| 1M scalar | Count two equality predicates / clean | 2.764 | 33.469 | 0.357 | 7.7× / 93.8× |
+| 1M scalar | Count per 200 groups / clean | 85.142 | 142.057 † | 3.874 | 22.0× / 36.7× |
+| 1M scalar | Count per 200 groups / dirty | 142.221 † | 146.727 † | 3.699 | 38.5× / 39.7× |
+| 5M scalar | Count ~50% of rows / clean | 167.163 | 958.400 | 2.034 | 82.2× / 471.3× |
+| 5M scalar | Count ~0.5% of rows / clean | 1.530 | 110.119 | 0.103 | 14.9× / 1,074.3× |
+| 5M scalar | Count two equality predicates / clean | 16.193 | 178.657 | 1.643 | 9.9× / 108.7× |
+| 5M scalar | Count per 200 groups / clean | 417.244 | 1252.029 † | 18.645 | 22.4× / 67.2× |
+| 5M scalar | Count per 200 groups / dirty | 956.909 † | 934.408 † | 18.465 | 51.8× / 50.6× |
+| 200k documents | Array contains `t1` | — | 4.909 | 0.025 | — / 200.3× |
+| 200k documents | Array contains `t1` and `t17` | — | 0.956 | 0.115 | — / 8.3× |
+| 200k documents | Array overlaps `t1`, `t17`, `t123` | — | 8.040 | 0.277 | — / 29.1× |
+| 200k documents | Full-text `w1 & w17` count | — | 1.069 | 0.116 | — / 9.2× |
+
+The speedup column gives **B-tree / GIN** multipliers, calculated as competitor median divided
+by Lion median using the unrounded measurements. Higher is better for Lion; the comparison includes
+the actual sequential fallbacks marked †. A dash means there is no matching B-tree measurement.
 
 At 5M rows, clean equality/intersection/grouping cases above are roughly **10–82× faster than
-B-tree**. In the document cases shown, Lion's membership counts are roughly **8–196× faster than
+B-tree**. In the document cases shown, Lion's membership counts are roughly **8–200× faster than
 GIN**. B-tree has no matching document index in this workload (—). This does not extend to arbitrary
 aggregates or retrieving all matching rows: the optimization answers the supported count shapes.
 
