@@ -1,0 +1,9 @@
+{
+  "status": "pass",
+  "samples": 2500,
+  "query_configurations": 250,
+  "correctness_checks": 250,
+  "writer_bursts": 21,
+  "writer_index_checks": 42,
+  "note": "Complete declared query matrix and indexed post-write checks; not an endurance test."
+}

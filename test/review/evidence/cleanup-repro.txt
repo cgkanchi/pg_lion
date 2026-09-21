@@ -1,0 +1,7 @@
+Startup exit: 1
+SQL attempted after failed startup: -X
+-q
+-v
+ON_ERROR_STOP=1
+-c
+update pg_index set indisvalid = true where indexrelid::regclass::text like 'fact\_%' and not indisvalid

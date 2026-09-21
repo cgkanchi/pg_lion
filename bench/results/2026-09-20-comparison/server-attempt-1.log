@@ -1,0 +1,665 @@
+2026-09-21 00:00:12.860 PDT [164232] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:12.864 PDT [164232] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:12.874 PDT [164237] LOG:  database system was shut down at 2026-09-21 00:00:12 PDT
+2026-09-21 00:00:12.880 PDT [164232] LOG:  database system is ready to accept connections
+2026-09-21 00:00:15.407 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:15.596 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 2260 buffers (3.4%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 10 recycled; write=0.040 s, sync=0.095 s, total=0.189 s; sync files=82, longest=0.033 s, average=0.002 s; distance=163294 kB, estimate=163294 kB; lsn=0/0B66A8F8, redo lsn=0/0B66A898
+2026-09-21 00:00:16.147 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:16.190 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 386 buffers (0.6%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.009 s, sync=0.020 s, total=0.043 s; sync files=18, longest=0.004 s, average=0.002 s; distance=2105 kB, estimate=147175 kB; lsn=0/0B878D08, redo lsn=0/0B878CA8
+2026-09-21 00:00:16.868 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:16.904 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 357 buffers (0.5%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.007 s, sync=0.018 s, total=0.037 s; sync files=17, longest=0.004 s, average=0.002 s; distance=2164 kB, estimate=132674 kB; lsn=0/0BA95D18, redo lsn=0/0BA95CB8
+2026-09-21 00:00:17.606 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:17.643 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 552 buffers (0.8%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.017 s, total=0.038 s; sync files=17, longest=0.005 s, average=0.001 s; distance=2997 kB, estimate=119706 kB; lsn=0/0BD83300, redo lsn=0/0BD832A0
+2026-09-21 00:00:18.334 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:18.377 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 1103 buffers (1.7%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.011 s, sync=0.017 s, total=0.044 s; sync files=17, longest=0.004 s, average=0.001 s; distance=8286 kB, estimate=108564 kB; lsn=0/0C59AD58, redo lsn=0/0C59ACF8
+2026-09-21 00:00:20.838 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:20.944 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 6120 buffers (9.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.054 s, sync=0.019 s, total=0.107 s; sync files=15, longest=0.005 s, average=0.002 s; distance=77656 kB, estimate=105473 kB; lsn=0/11170F88, redo lsn=0/11170F28
+2026-09-21 00:00:21.285 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:21.320 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 150 buffers (0.2%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.016 s, total=0.036 s; sync files=15, longest=0.005 s, average=0.002 s; distance=183 kB, estimate=94944 kB; lsn=0/1119EBA0, redo lsn=0/1119EB40
+2026-09-21 00:00:21.887 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:21.922 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 184 buffers (0.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.007 s, sync=0.016 s, total=0.035 s; sync files=15, longest=0.004 s, average=0.002 s; distance=1199 kB, estimate=85570 kB; lsn=0/112CA960, redo lsn=0/112CA900
+2026-09-21 00:00:22.679 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:22.710 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 17 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.013 s, total=0.031 s; sync files=15, longest=0.003 s, average=0.001 s; distance=3019 kB, estimate=77315 kB; lsn=0/115BD750, redo lsn=0/115BD6F0
+2026-09-21 00:00:23.220 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:23.258 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 381 buffers (0.6%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.015 s, total=0.039 s; sync files=15, longest=0.004 s, average=0.001 s; distance=2069 kB, estimate=69790 kB; lsn=0/117C2B58, redo lsn=0/117C2AF8
+2026-09-21 00:00:23.945 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:23.981 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 355 buffers (0.5%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.017 s, total=0.036 s; sync files=15, longest=0.004 s, average=0.002 s; distance=2152 kB, estimate=63026 kB; lsn=0/119DCC90, redo lsn=0/119DCC30
+2026-09-21 00:00:24.709 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:24.746 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 550 buffers (0.8%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.007 s, sync=0.018 s, total=0.038 s; sync files=15, longest=0.005 s, average=0.002 s; distance=2985 kB, estimate=57022 kB; lsn=0/11CC7450, redo lsn=0/11CC73F0
+2026-09-21 00:00:25.439 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:25.484 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 1101 buffers (1.7%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.012 s, sync=0.016 s, total=0.045 s; sync files=15, longest=0.004 s, average=0.002 s; distance=8277 kB, estimate=52148 kB; lsn=0/124DC9D8, redo lsn=0/124DC978
+2026-09-21 00:00:28.023 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:28.132 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 6120 buffers (9.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.058 s, sync=0.018 s, total=0.109 s; sync files=15, longest=0.006 s, average=0.002 s; distance=77663 kB, estimate=77663 kB; lsn=0/170B4858, redo lsn=0/170B47F8
+2026-09-21 00:00:28.473 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:28.509 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 150 buffers (0.2%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.036 s; sync files=15, longest=0.006 s, average=0.002 s; distance=189 kB, estimate=69916 kB; lsn=0/170E3CB8, redo lsn=0/170E3C58
+2026-09-21 00:00:29.070 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:29.105 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 184 buffers (0.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.036 s; sync files=15, longest=0.006 s, average=0.002 s; distance=1205 kB, estimate=63045 kB; lsn=0/172112D8, redo lsn=0/17211278
+2026-09-21 00:00:29.839 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:29.870 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.013 s, total=0.032 s; sync files=15, longest=0.005 s, average=0.001 s; distance=3001 kB, estimate=57040 kB; lsn=0/174FF9B8, redo lsn=0/174FF958
+2026-09-21 00:00:30.359 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:30.395 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 381 buffers (0.6%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.007 s, sync=0.016 s, total=0.036 s; sync files=15, longest=0.004 s, average=0.002 s; distance=2074 kB, estimate=51544 kB; lsn=0/17706260, redo lsn=0/17706200
+2026-09-21 00:00:31.040 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:31.076 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 355 buffers (0.5%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.017 s, total=0.036 s; sync files=15, longest=0.004 s, average=0.002 s; distance=2157 kB, estimate=46605 kB; lsn=0/17921868, redo lsn=0/17921808
+2026-09-21 00:00:31.734 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:31.771 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 550 buffers (0.8%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.016 s, total=0.037 s; sync files=15, longest=0.004 s, average=0.001 s; distance=2989 kB, estimate=42243 kB; lsn=0/17C0CF88, redo lsn=0/17C0CF28
+2026-09-21 00:00:32.463 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:32.506 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 1101 buffers (1.7%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.011 s, sync=0.016 s, total=0.043 s; sync files=15, longest=0.005 s, average=0.001 s; distance=8281 kB, estimate=38847 kB; lsn=0/18423458, redo lsn=0/184233F8
+2026-09-21 00:00:35.579 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:35.674 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 6120 buffers (9.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 4 recycled; write=0.048 s, sync=0.019 s, total=0.096 s; sync files=15, longest=0.006 s, average=0.002 s; distance=77667 kB, estimate=77667 kB; lsn=0/1CFFC180, redo lsn=0/1CFFC120
+2026-09-21 00:00:36.010 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:36.049 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 150 buffers (0.2%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.006 s, sync=0.017 s, total=0.039 s; sync files=15, longest=0.005 s, average=0.002 s; distance=193 kB, estimate=69919 kB; lsn=0/1D02C898, redo lsn=0/1D02C838
+2026-09-21 00:00:36.616 PDT [164235] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:00:36.660 PDT [164235] LOG:  checkpoint complete: fast force wait: wrote 184 buffers (0.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.026 s, total=0.045 s; sync files=15, longest=0.014 s, average=0.002 s; distance=1210 kB, estimate=63048 kB; lsn=0/1D15B148, redo lsn=0/1D15B0E8
+2026-09-21 00:00:54.141 PDT [164232] LOG:  received fast shutdown request
+2026-09-21 00:00:54.145 PDT [164232] LOG:  aborting any active transactions
+2026-09-21 00:00:54.145 PDT [164232] LOG:  background worker "logical replication launcher" (PID 164239) exited with exit code 1
+2026-09-21 00:00:54.153 PDT [164235] LOG:  shutting down
+2026-09-21 00:00:54.157 PDT [164235] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:00:54.198 PDT [164235] LOG:  checkpoint complete: shutdown fast: wrote 587 buffers (0.9%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.009 s, sync=0.021 s, total=0.046 s; sync files=18, longest=0.006 s, average=0.002 s; distance=3063 kB, estimate=57050 kB; lsn=0/1D458F08, redo lsn=0/1D458F08
+2026-09-21 00:00:54.296 PDT [164232] LOG:  database system is shut down
+2026-09-21 00:00:54.387 PDT [164290] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:54.391 PDT [164290] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:54.400 PDT [164295] LOG:  database system was shut down at 2026-09-21 00:00:54 PDT
+2026-09-21 00:00:54.406 PDT [164290] LOG:  database system is ready to accept connections
+2026-09-21 00:00:54.457 PDT [164290] LOG:  received fast shutdown request
+2026-09-21 00:00:54.461 PDT [164290] LOG:  aborting any active transactions
+2026-09-21 00:00:54.462 PDT [164290] LOG:  background worker "logical replication launcher" (PID 164297) exited with exit code 1
+2026-09-21 00:00:54.462 PDT [164293] LOG:  shutting down
+2026-09-21 00:00:54.465 PDT [164293] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:00:54.493 PDT [164293] LOG:  checkpoint complete: shutdown fast: wrote 3 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.010 s, sync=0.007 s, total=0.032 s; sync files=3, longest=0.003 s, average=0.003 s; distance=19 kB, estimate=19 kB; lsn=0/1D45DEA8, redo lsn=0/1D45DEA8
+2026-09-21 00:00:54.511 PDT [164290] LOG:  database system is shut down
+2026-09-21 00:00:54.598 PDT [164303] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:54.602 PDT [164303] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:54.614 PDT [164308] LOG:  database system was shut down at 2026-09-21 00:00:54 PDT
+2026-09-21 00:00:54.619 PDT [164303] LOG:  database system is ready to accept connections
+2026-09-21 00:00:54.672 PDT [164303] LOG:  received fast shutdown request
+2026-09-21 00:00:54.676 PDT [164303] LOG:  aborting any active transactions
+2026-09-21 00:00:54.676 PDT [164303] LOG:  background worker "logical replication launcher" (PID 164310) exited with exit code 1
+2026-09-21 00:00:54.676 PDT [164306] LOG:  shutting down
+2026-09-21 00:00:54.679 PDT [164306] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:00:54.704 PDT [164306] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.028 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45DF30, redo lsn=0/1D45DF30
+2026-09-21 00:00:54.719 PDT [164303] LOG:  database system is shut down
+2026-09-21 00:00:54.814 PDT [164316] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:54.817 PDT [164316] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:54.828 PDT [164321] LOG:  database system was shut down at 2026-09-21 00:00:54 PDT
+2026-09-21 00:00:54.833 PDT [164316] LOG:  database system is ready to accept connections
+2026-09-21 00:00:54.886 PDT [164316] LOG:  received fast shutdown request
+2026-09-21 00:00:54.890 PDT [164316] LOG:  aborting any active transactions
+2026-09-21 00:00:54.891 PDT [164316] LOG:  background worker "logical replication launcher" (PID 164323) exited with exit code 1
+2026-09-21 00:00:54.891 PDT [164319] LOG:  shutting down
+2026-09-21 00:00:54.894 PDT [164319] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:00:54.918 PDT [164319] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.028 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45DFB8, redo lsn=0/1D45DFB8
+2026-09-21 00:00:54.934 PDT [164316] LOG:  database system is shut down
+2026-09-21 00:00:55.031 PDT [164329] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:55.035 PDT [164329] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:55.046 PDT [164334] LOG:  database system was shut down at 2026-09-21 00:00:54 PDT
+2026-09-21 00:00:55.051 PDT [164329] LOG:  database system is ready to accept connections
+2026-09-21 00:00:55.130 PDT [164329] LOG:  received fast shutdown request
+2026-09-21 00:00:55.133 PDT [164329] LOG:  aborting any active transactions
+2026-09-21 00:00:55.134 PDT [164329] LOG:  background worker "logical replication launcher" (PID 164336) exited with exit code 1
+2026-09-21 00:00:55.134 PDT [164332] LOG:  shutting down
+2026-09-21 00:00:55.138 PDT [164332] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:00:55.161 PDT [164332] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E058, redo lsn=0/1D45E058
+2026-09-21 00:00:55.184 PDT [164329] LOG:  database system is shut down
+2026-09-21 00:00:55.276 PDT [164342] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:55.280 PDT [164342] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:55.291 PDT [164347] LOG:  database system was shut down at 2026-09-21 00:00:55 PDT
+2026-09-21 00:00:55.295 PDT [164342] LOG:  database system is ready to accept connections
+2026-09-21 00:00:55.369 PDT [164342] LOG:  received fast shutdown request
+2026-09-21 00:00:55.372 PDT [164342] LOG:  aborting any active transactions
+2026-09-21 00:00:55.372 PDT [164342] LOG:  background worker "logical replication launcher" (PID 164349) exited with exit code 1
+2026-09-21 00:00:55.373 PDT [164345] LOG:  shutting down
+2026-09-21 00:00:55.377 PDT [164345] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:00:55.400 PDT [164345] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E0E0, redo lsn=0/1D45E0E0
+2026-09-21 00:00:55.424 PDT [164342] LOG:  database system is shut down
+2026-09-21 00:00:55.510 PDT [164355] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:00:55.514 PDT [164355] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:00:55.527 PDT [164360] LOG:  database system was shut down at 2026-09-21 00:00:55 PDT
+2026-09-21 00:00:55.533 PDT [164355] LOG:  database system is ready to accept connections
+2026-09-21 00:01:56.084 PDT [164355] LOG:  received fast shutdown request
+2026-09-21 00:01:56.088 PDT [164355] LOG:  aborting any active transactions
+2026-09-21 00:01:56.088 PDT [164355] LOG:  background worker "logical replication launcher" (PID 164362) exited with exit code 1
+2026-09-21 00:01:56.089 PDT [164358] LOG:  shutting down
+2026-09-21 00:01:56.093 PDT [164358] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:01:56.117 PDT [164358] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E1A0, redo lsn=0/1D45E1A0
+2026-09-21 00:01:56.168 PDT [164355] LOG:  database system is shut down
+2026-09-21 00:01:56.227 PDT [164494] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:01:56.231 PDT [164494] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:01:56.242 PDT [164499] LOG:  database system was shut down at 2026-09-21 00:01:56 PDT
+2026-09-21 00:01:56.246 PDT [164494] LOG:  database system is ready to accept connections
+2026-09-21 00:01:56.322 PDT [164494] LOG:  received fast shutdown request
+2026-09-21 00:01:56.325 PDT [164494] LOG:  aborting any active transactions
+2026-09-21 00:01:56.325 PDT [164494] LOG:  background worker "logical replication launcher" (PID 164501) exited with exit code 1
+2026-09-21 00:01:56.325 PDT [164497] LOG:  shutting down
+2026-09-21 00:01:56.329 PDT [164497] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:01:56.354 PDT [164497] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.029 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E228, redo lsn=0/1D45E228
+2026-09-21 00:01:56.376 PDT [164494] LOG:  database system is shut down
+2026-09-21 00:01:56.463 PDT [164507] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:01:56.468 PDT [164507] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:01:56.480 PDT [164512] LOG:  database system was shut down at 2026-09-21 00:01:56 PDT
+2026-09-21 00:01:56.485 PDT [164507] LOG:  database system is ready to accept connections
+2026-09-21 00:01:56.560 PDT [164507] LOG:  received fast shutdown request
+2026-09-21 00:01:56.564 PDT [164507] LOG:  aborting any active transactions
+2026-09-21 00:01:56.564 PDT [164507] LOG:  background worker "logical replication launcher" (PID 164514) exited with exit code 1
+2026-09-21 00:01:56.565 PDT [164510] LOG:  shutting down
+2026-09-21 00:01:56.568 PDT [164510] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:01:56.592 PDT [164510] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.027 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E2B0, redo lsn=0/1D45E2B0
+2026-09-21 00:01:56.617 PDT [164507] LOG:  database system is shut down
+2026-09-21 00:01:56.702 PDT [164520] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:01:56.706 PDT [164520] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:01:56.718 PDT [164525] LOG:  database system was shut down at 2026-09-21 00:01:56 PDT
+2026-09-21 00:01:56.723 PDT [164520] LOG:  database system is ready to accept connections
+2026-09-21 00:01:56.797 PDT [164520] LOG:  received fast shutdown request
+2026-09-21 00:01:56.801 PDT [164520] LOG:  aborting any active transactions
+2026-09-21 00:01:56.802 PDT [164520] LOG:  background worker "logical replication launcher" (PID 164527) exited with exit code 1
+2026-09-21 00:01:56.802 PDT [164523] LOG:  shutting down
+2026-09-21 00:01:56.805 PDT [164523] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:01:56.830 PDT [164523] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.029 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E338, redo lsn=0/1D45E338
+2026-09-21 00:01:56.853 PDT [164520] LOG:  database system is shut down
+2026-09-21 00:01:56.939 PDT [164533] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:01:56.943 PDT [164533] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:01:56.953 PDT [164538] LOG:  database system was shut down at 2026-09-21 00:01:56 PDT
+2026-09-21 00:01:56.959 PDT [164533] LOG:  database system is ready to accept connections
+2026-09-21 00:01:57.034 PDT [164533] LOG:  received fast shutdown request
+2026-09-21 00:01:57.038 PDT [164533] LOG:  aborting any active transactions
+2026-09-21 00:01:57.038 PDT [164533] LOG:  background worker "logical replication launcher" (PID 164540) exited with exit code 1
+2026-09-21 00:01:57.039 PDT [164536] LOG:  shutting down
+2026-09-21 00:01:57.042 PDT [164536] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:01:57.066 PDT [164536] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.028 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E3C0, redo lsn=0/1D45E3C0
+2026-09-21 00:01:57.090 PDT [164533] LOG:  database system is shut down
+2026-09-21 00:01:57.175 PDT [164546] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:01:57.179 PDT [164546] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:01:57.189 PDT [164551] LOG:  database system was shut down at 2026-09-21 00:01:57 PDT
+2026-09-21 00:01:57.194 PDT [164546] LOG:  database system is ready to accept connections
+2026-09-21 00:01:57.272 PDT [164546] LOG:  received fast shutdown request
+2026-09-21 00:01:57.276 PDT [164546] LOG:  aborting any active transactions
+2026-09-21 00:01:57.276 PDT [164546] LOG:  background worker "logical replication launcher" (PID 164553) exited with exit code 1
+2026-09-21 00:01:57.276 PDT [164549] LOG:  shutting down
+2026-09-21 00:01:57.279 PDT [164549] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:01:57.305 PDT [164549] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.029 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/1D45E448, redo lsn=0/1D45E448
+2026-09-21 00:01:57.328 PDT [164546] LOG:  database system is shut down
+2026-09-21 00:01:57.418 PDT [164559] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:01:57.421 PDT [164559] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:01:57.432 PDT [164564] LOG:  database system was shut down at 2026-09-21 00:01:57 PDT
+2026-09-21 00:01:57.437 PDT [164559] LOG:  database system is ready to accept connections
+2026-09-21 00:03:09.403 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:09.741 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20309 buffers (31.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 26 recycled; write=0.198 s, sync=0.020 s, total=0.339 s; sync files=23, longest=0.004 s, average=0.001 s; distance=421863 kB, estimate=421863 kB; lsn=0/37058228, redo lsn=0/37058190
+2026-09-21 00:03:10.313 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:10.411 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 7574 buffers (11.6%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.053 s, sync=0.011 s, total=0.098 s; sync files=11, longest=0.004 s, average=0.001 s; distance=92720 kB, estimate=388949 kB; lsn=0/3CAE44F8, redo lsn=0/3CAE4498
+2026-09-21 00:03:11.115 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:11.224 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 8669 buffers (13.2%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 7 recycled; write=0.054 s, sync=0.015 s, total=0.110 s; sync files=12, longest=0.004 s, average=0.002 s; distance=114994 kB, estimate=361553 kB; lsn=0/43B30E48, redo lsn=0/43B30DE8
+2026-09-21 00:03:11.363 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:11.543 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 10515 buffers (16.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.132 s, sync=0.016 s, total=0.180 s; sync files=3, longest=0.014 s, average=0.006 s; distance=74732 kB, estimate=332871 kB; lsn=0/4842C198, redo lsn=0/4842C138
+2026-09-21 00:03:12.684 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:12.969 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 22268 buffers (34.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 20 recycled; write=0.176 s, sync=0.014 s, total=0.285 s; sync files=16, longest=0.003 s, average=0.001 s; distance=324089 kB, estimate=331993 kB; lsn=0/5C0AA5D0, redo lsn=0/5C0AA570
+2026-09-21 00:03:24.848 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.031 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 2054 buffers (3.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 15 recycled; write=0.021 s, sync=0.091 s, total=0.183 s; sync files=35, longest=0.066 s, average=0.003 s; distance=258482 kB, estimate=324642 kB; lsn=0/6BD16DD8, redo lsn=0/6BD16D78
+2026-09-21 00:03:25.087 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.119 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.017 s, total=0.033 s; sync files=16, longest=0.005 s, average=0.002 s; distance=137 kB, estimate=292191 kB; lsn=0/6BD39310, redo lsn=0/6BD392B0
+2026-09-21 00:03:25.180 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.212 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.017 s, total=0.032 s; sync files=16, longest=0.004 s, average=0.002 s; distance=137 kB, estimate=262986 kB; lsn=0/6BD5BA18, redo lsn=0/6BD5B9B8
+2026-09-21 00:03:25.267 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.299 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.013 s, total=0.032 s; sync files=16, longest=0.004 s, average=0.001 s; distance=138 kB, estimate=236701 kB; lsn=0/6BD7E460, redo lsn=0/6BD7E400
+2026-09-21 00:03:25.354 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.390 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.019 s, total=0.037 s; sync files=16, longest=0.006 s, average=0.002 s; distance=139 kB, estimate=213045 kB; lsn=0/6BDA11B8, redo lsn=0/6BDA1158
+2026-09-21 00:03:25.449 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.484 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.017 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.002 s; distance=140 kB, estimate=191754 kB; lsn=0/6BDC4250, redo lsn=0/6BDC41F0
+2026-09-21 00:03:25.544 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.580 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.017 s, total=0.036 s; sync files=16, longest=0.005 s, average=0.001 s; distance=140 kB, estimate=172593 kB; lsn=0/6BDE7600, redo lsn=0/6BDE75A0
+2026-09-21 00:03:25.641 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.675 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.017 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.001 s; distance=141 kB, estimate=155348 kB; lsn=0/6BE0ACF8, redo lsn=0/6BE0AC98
+2026-09-21 00:03:25.758 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.788 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.013 s, total=0.031 s; sync files=15, longest=0.004 s, average=0.001 s; distance=146 kB, estimate=139828 kB; lsn=0/6BE2F840, redo lsn=0/6BE2F7E0
+2026-09-21 00:03:25.843 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.878 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.016 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.001 s; distance=142 kB, estimate=125859 kB; lsn=0/6BE53118, redo lsn=0/6BE530B8
+2026-09-21 00:03:25.935 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:25.969 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.035 s; sync files=16, longest=0.005 s, average=0.002 s; distance=141 kB, estimate=113287 kB; lsn=0/6BE76770, redo lsn=0/6BE76710
+2026-09-21 00:03:26.023 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.054 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.014 s, total=0.032 s; sync files=16, longest=0.005 s, average=0.001 s; distance=142 kB, estimate=101973 kB; lsn=0/6BE9A0F8, redo lsn=0/6BE9A098
+2026-09-21 00:03:26.110 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.144 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.018 s, total=0.034 s; sync files=16, longest=0.004 s, average=0.002 s; distance=143 kB, estimate=91790 kB; lsn=0/6BEBDD90, redo lsn=0/6BEBDD30
+2026-09-21 00:03:26.206 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.241 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.017 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.001 s; distance=143 kB, estimate=82625 kB; lsn=0/6BEE1D68, redo lsn=0/6BEE1D08
+2026-09-21 00:03:26.302 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.336 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.017 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.002 s; distance=144 kB, estimate=74377 kB; lsn=0/6BF06088, redo lsn=0/6BF06028
+2026-09-21 00:03:26.398 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.434 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 22 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.018 s, total=0.037 s; sync files=16, longest=0.004 s, average=0.002 s; distance=145 kB, estimate=66954 kB; lsn=0/6BF2A858, redo lsn=0/6BF2A7F8
+2026-09-21 00:03:26.505 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.536 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.014 s, total=0.032 s; sync files=15, longest=0.003 s, average=0.001 s; distance=143 kB, estimate=60273 kB; lsn=0/6BF4E540, redo lsn=0/6BF4E4E0
+2026-09-21 00:03:26.588 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.622 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.017 s, total=0.034 s; sync files=16, longest=0.004 s, average=0.002 s; distance=139 kB, estimate=54259 kB; lsn=0/6BF714D8, redo lsn=0/6BF71478
+2026-09-21 00:03:26.672 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.706 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.017 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.002 s; distance=139 kB, estimate=48847 kB; lsn=0/6BF94208, redo lsn=0/6BF941A8
+2026-09-21 00:03:26.765 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.799 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.016 s, total=0.035 s; sync files=16, longest=0.004 s, average=0.001 s; distance=140 kB, estimate=43977 kB; lsn=0/6BFB7250, redo lsn=0/6BFB71F0
+2026-09-21 00:03:26.849 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.885 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.036 s; sync files=16, longest=0.005 s, average=0.002 s; distance=140 kB, estimate=39593 kB; lsn=0/6BFDA5D8, redo lsn=0/6BFDA578
+2026-09-21 00:03:26.937 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:26.972 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.016 s, total=0.036 s; sync files=16, longest=0.004 s, average=0.001 s; distance=141 kB, estimate=35648 kB; lsn=0/6BFFDC70, redo lsn=0/6BFFDC10
+2026-09-21 00:03:27.022 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:27.059 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.016 s, total=0.037 s; sync files=16, longest=0.004 s, average=0.001 s; distance=142 kB, estimate=32097 kB; lsn=0/6C0216B8, redo lsn=0/6C021658
+2026-09-21 00:03:27.112 PDT [164562] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:03:27.149 PDT [164562] LOG:  checkpoint complete: fast force wait: wrote 20 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.020 s, total=0.038 s; sync files=16, longest=0.007 s, average=0.002 s; distance=141 kB, estimate=28902 kB; lsn=0/6C044B48, redo lsn=0/6C044AE8
+2026-09-21 00:05:14.999 PDT [164559] LOG:  received fast shutdown request
+2026-09-21 00:05:15.003 PDT [164559] LOG:  aborting any active transactions
+2026-09-21 00:05:15.003 PDT [164559] LOG:  background worker "logical replication launcher" (PID 164566) exited with exit code 1
+2026-09-21 00:05:15.015 PDT [164562] LOG:  shutting down
+2026-09-21 00:05:15.019 PDT [164562] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:05:15.051 PDT [164562] LOG:  checkpoint complete: shutdown fast: wrote 22 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.016 s, total=0.037 s; sync files=18, longest=0.005 s, average=0.001 s; distance=156 kB, estimate=26027 kB; lsn=0/6C06BDD0, redo lsn=0/6C06BDD0
+2026-09-21 00:05:15.162 PDT [164559] LOG:  database system is shut down
+2026-09-21 00:05:15.242 PDT [165007] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:05:15.245 PDT [165007] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:05:15.256 PDT [165012] LOG:  database system was shut down at 2026-09-21 00:05:15 PDT
+2026-09-21 00:05:15.260 PDT [165007] LOG:  database system is ready to accept connections
+2026-09-21 00:05:15.428 PDT [165007] LOG:  received fast shutdown request
+2026-09-21 00:05:15.433 PDT [165007] LOG:  aborting any active transactions
+2026-09-21 00:05:15.433 PDT [165007] LOG:  background worker "logical replication launcher" (PID 165014) exited with exit code 1
+2026-09-21 00:05:15.433 PDT [165010] LOG:  shutting down
+2026-09-21 00:05:15.436 PDT [165010] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:05:15.466 PDT [165010] LOG:  checkpoint complete: shutdown fast: wrote 1 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.011 s, sync=0.007 s, total=0.033 s; sync files=3, longest=0.003 s, average=0.003 s; distance=8 kB, estimate=8 kB; lsn=0/6C06DEE0, redo lsn=0/6C06DEE0
+2026-09-21 00:05:15.511 PDT [165007] LOG:  database system is shut down
+2026-09-21 00:05:15.571 PDT [165020] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:05:15.575 PDT [165020] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:05:15.586 PDT [165025] LOG:  database system was shut down at 2026-09-21 00:05:15 PDT
+2026-09-21 00:05:15.591 PDT [165020] LOG:  database system is ready to accept connections
+2026-09-21 00:05:15.759 PDT [165020] LOG:  received fast shutdown request
+2026-09-21 00:05:15.763 PDT [165020] LOG:  aborting any active transactions
+2026-09-21 00:05:15.764 PDT [165020] LOG:  background worker "logical replication launcher" (PID 165027) exited with exit code 1
+2026-09-21 00:05:15.764 PDT [165023] LOG:  shutting down
+2026-09-21 00:05:15.768 PDT [165023] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:05:15.791 PDT [165023] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.027 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/6C06DF68, redo lsn=0/6C06DF68
+2026-09-21 00:05:15.839 PDT [165020] LOG:  database system is shut down
+2026-09-21 00:05:15.904 PDT [165033] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:05:15.907 PDT [165033] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:05:15.920 PDT [165038] LOG:  database system was shut down at 2026-09-21 00:05:15 PDT
+2026-09-21 00:05:15.925 PDT [165033] LOG:  database system is ready to accept connections
+2026-09-21 00:05:16.092 PDT [165033] LOG:  received fast shutdown request
+2026-09-21 00:05:16.096 PDT [165033] LOG:  aborting any active transactions
+2026-09-21 00:05:16.097 PDT [165033] LOG:  background worker "logical replication launcher" (PID 165040) exited with exit code 1
+2026-09-21 00:05:16.097 PDT [165036] LOG:  shutting down
+2026-09-21 00:05:16.101 PDT [165036] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:05:16.124 PDT [165036] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/6C06DFF0, redo lsn=0/6C06DFF0
+2026-09-21 00:05:16.171 PDT [165033] LOG:  database system is shut down
+2026-09-21 00:05:16.235 PDT [165046] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:05:16.239 PDT [165046] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:05:16.251 PDT [165051] LOG:  database system was shut down at 2026-09-21 00:05:16 PDT
+2026-09-21 00:05:16.256 PDT [165046] LOG:  database system is ready to accept connections
+2026-09-21 00:05:16.424 PDT [165046] LOG:  received fast shutdown request
+2026-09-21 00:05:16.428 PDT [165046] LOG:  aborting any active transactions
+2026-09-21 00:05:16.428 PDT [165046] LOG:  background worker "logical replication launcher" (PID 165053) exited with exit code 1
+2026-09-21 00:05:16.428 PDT [165049] LOG:  shutting down
+2026-09-21 00:05:16.432 PDT [165049] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:05:16.455 PDT [165049] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.027 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/6C06E090, redo lsn=0/6C06E090
+2026-09-21 00:05:16.503 PDT [165046] LOG:  database system is shut down
+2026-09-21 00:05:16.567 PDT [165059] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:05:16.572 PDT [165059] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:05:16.582 PDT [165064] LOG:  database system was shut down at 2026-09-21 00:05:16 PDT
+2026-09-21 00:05:16.587 PDT [165059] LOG:  database system is ready to accept connections
+2026-09-21 00:05:16.759 PDT [165059] LOG:  received fast shutdown request
+2026-09-21 00:05:16.763 PDT [165059] LOG:  aborting any active transactions
+2026-09-21 00:05:16.763 PDT [165059] LOG:  background worker "logical replication launcher" (PID 165066) exited with exit code 1
+2026-09-21 00:05:16.764 PDT [165062] LOG:  shutting down
+2026-09-21 00:05:16.768 PDT [165062] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:05:16.791 PDT [165062] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/6C06E118, redo lsn=0/6C06E118
+2026-09-21 00:05:16.839 PDT [165059] LOG:  database system is shut down
+2026-09-21 00:05:16.902 PDT [165072] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:05:16.905 PDT [165072] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:05:16.916 PDT [165077] LOG:  database system was shut down at 2026-09-21 00:05:16 PDT
+2026-09-21 00:05:16.920 PDT [165072] LOG:  database system is ready to accept connections
+2026-09-21 00:07:05.063 PDT [165075] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:07:05.301 PDT [165075] LOG:  checkpoint complete: fast force wait: wrote 11332 buffers (17.3%), wrote 3 SLRU buffers; 0 WAL file(s) added, 5 removed, 0 recycled; write=0.161 s, sync=0.033 s, total=0.239 s; sync files=19, longest=0.017 s, average=0.002 s; distance=89149 kB, estimate=89149 kB; lsn=0/7177D948, redo lsn=0/7177D8E8
+2026-09-21 00:07:05.327 PDT [165075] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:07:05.353 PDT [165075] LOG:  checkpoint complete: fast force wait: wrote 194 buffers (0.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.008 s, total=0.026 s; sync files=3, longest=0.006 s, average=0.003 s; distance=1585 kB, estimate=80393 kB; lsn=0/7190A0B0, redo lsn=0/7190A050
+2026-09-21 00:07:05.438 PDT [165075] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:07:05.471 PDT [165075] LOG:  checkpoint complete: fast force wait: wrote 710 buffers (1.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.011 s, total=0.033 s; sync files=4, longest=0.006 s, average=0.003 s; distance=4882 kB, estimate=72842 kB; lsn=0/71DCEAF0, redo lsn=0/71DCEA90
+2026-09-21 00:07:05.613 PDT [165075] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:07:05.810 PDT [165075] LOG:  checkpoint complete: fast force wait: wrote 10515 buffers (16.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 5 removed, 0 recycled; write=0.132 s, sync=0.022 s, total=0.197 s; sync files=3, longest=0.018 s, average=0.008 s; distance=74734 kB, estimate=74734 kB; lsn=0/766CA610, redo lsn=0/766CA5B0
+2026-09-21 00:07:06.103 PDT [165075] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:07:06.294 PDT [165075] LOG:  checkpoint complete: fast force wait: wrote 11645 buffers (17.8%), wrote 1 SLRU buffers; 0 WAL file(s) added, 4 removed, 1 recycled; write=0.126 s, sync=0.026 s, total=0.192 s; sync files=18, longest=0.011 s, average=0.002 s; distance=78600 kB, estimate=78600 kB; lsn=0/7B38C8B8, redo lsn=0/7B38C858
+2026-09-21 00:08:42.992 PDT [165072] LOG:  received fast shutdown request
+2026-09-21 00:08:42.996 PDT [165072] LOG:  aborting any active transactions
+2026-09-21 00:08:42.996 PDT [165072] LOG:  background worker "logical replication launcher" (PID 165079) exited with exit code 1
+2026-09-21 00:08:43.004 PDT [165075] LOG:  shutting down
+2026-09-21 00:08:43.008 PDT [165075] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:08:43.114 PDT [165075] LOG:  checkpoint complete: shutdown fast: wrote 2050 buffers (3.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 10 recycled; write=0.023 s, sync=0.027 s, total=0.110 s; sync files=35, longest=0.005 s, average=0.001 s; distance=161947 kB, estimate=161947 kB; lsn=0/851B3740, redo lsn=0/851B3740
+2026-09-21 00:08:43.194 PDT [165072] LOG:  database system is shut down
+2026-09-21 00:08:43.336 PDT [165365] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:08:43.340 PDT [165365] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:08:43.353 PDT [165370] LOG:  database system was shut down at 2026-09-21 00:08:43 PDT
+2026-09-21 00:08:43.357 PDT [165365] LOG:  database system is ready to accept connections
+2026-09-21 00:08:43.492 PDT [165365] LOG:  received fast shutdown request
+2026-09-21 00:08:43.495 PDT [165365] LOG:  aborting any active transactions
+2026-09-21 00:08:43.496 PDT [165365] LOG:  background worker "logical replication launcher" (PID 165372) exited with exit code 1
+2026-09-21 00:08:43.496 PDT [165368] LOG:  shutting down
+2026-09-21 00:08:43.500 PDT [165368] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:08:43.523 PDT [165368] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/851B37C8, redo lsn=0/851B37C8
+2026-09-21 00:08:43.540 PDT [165365] LOG:  database system is shut down
+2026-09-21 00:08:43.634 PDT [165378] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:08:43.637 PDT [165378] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:08:43.650 PDT [165383] LOG:  database system was shut down at 2026-09-21 00:08:43 PDT
+2026-09-21 00:08:43.655 PDT [165378] LOG:  database system is ready to accept connections
+2026-09-21 00:08:43.788 PDT [165378] LOG:  received fast shutdown request
+2026-09-21 00:08:43.791 PDT [165378] LOG:  aborting any active transactions
+2026-09-21 00:08:43.792 PDT [165378] LOG:  background worker "logical replication launcher" (PID 165385) exited with exit code 1
+2026-09-21 00:08:43.792 PDT [165381] LOG:  shutting down
+2026-09-21 00:08:43.796 PDT [165381] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:08:43.819 PDT [165381] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/851B3850, redo lsn=0/851B3850
+2026-09-21 00:08:43.836 PDT [165378] LOG:  database system is shut down
+2026-09-21 00:08:43.931 PDT [165391] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:08:43.934 PDT [165391] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:08:43.944 PDT [165396] LOG:  database system was shut down at 2026-09-21 00:08:43 PDT
+2026-09-21 00:08:43.950 PDT [165391] LOG:  database system is ready to accept connections
+2026-09-21 00:08:44.082 PDT [165391] LOG:  received fast shutdown request
+2026-09-21 00:08:44.086 PDT [165391] LOG:  aborting any active transactions
+2026-09-21 00:08:44.086 PDT [165391] LOG:  background worker "logical replication launcher" (PID 165398) exited with exit code 1
+2026-09-21 00:08:44.086 PDT [165394] LOG:  shutting down
+2026-09-21 00:08:44.091 PDT [165394] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:08:44.114 PDT [165394] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/851B38D8, redo lsn=0/851B38D8
+2026-09-21 00:08:44.131 PDT [165391] LOG:  database system is shut down
+2026-09-21 00:08:44.226 PDT [165404] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:08:44.229 PDT [165404] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:08:44.242 PDT [165409] LOG:  database system was shut down at 2026-09-21 00:08:44 PDT
+2026-09-21 00:08:44.246 PDT [165404] LOG:  database system is ready to accept connections
+2026-09-21 00:08:44.384 PDT [165404] LOG:  received fast shutdown request
+2026-09-21 00:08:44.387 PDT [165404] LOG:  aborting any active transactions
+2026-09-21 00:08:44.388 PDT [165404] LOG:  background worker "logical replication launcher" (PID 165411) exited with exit code 1
+2026-09-21 00:08:44.388 PDT [165407] LOG:  shutting down
+2026-09-21 00:08:44.392 PDT [165407] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:08:44.415 PDT [165407] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/851B3960, redo lsn=0/851B3960
+2026-09-21 00:08:44.433 PDT [165404] LOG:  database system is shut down
+2026-09-21 00:08:44.531 PDT [165417] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:08:44.534 PDT [165417] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:08:44.545 PDT [165422] LOG:  database system was shut down at 2026-09-21 00:08:44 PDT
+2026-09-21 00:08:44.550 PDT [165417] LOG:  database system is ready to accept connections
+2026-09-21 00:08:44.689 PDT [165417] LOG:  received fast shutdown request
+2026-09-21 00:08:44.693 PDT [165417] LOG:  aborting any active transactions
+2026-09-21 00:08:44.693 PDT [165417] LOG:  background worker "logical replication launcher" (PID 165424) exited with exit code 1
+2026-09-21 00:08:44.694 PDT [165420] LOG:  shutting down
+2026-09-21 00:08:44.697 PDT [165420] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:08:44.721 PDT [165420] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/851B39E8, redo lsn=0/851B39E8
+2026-09-21 00:08:44.739 PDT [165417] LOG:  database system is shut down
+2026-09-21 00:08:44.839 PDT [165430] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:08:44.842 PDT [165430] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:08:44.853 PDT [165435] LOG:  database system was shut down at 2026-09-21 00:08:44 PDT
+2026-09-21 00:08:44.857 PDT [165430] LOG:  database system is ready to accept connections
+2026-09-21 00:10:12.234 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:12.435 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 11323 buffers (17.3%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.152 s, sync=0.017 s, total=0.202 s; sync files=10, longest=0.004 s, average=0.002 s; distance=89104 kB, estimate=89104 kB; lsn=0/8A8B7E30, redo lsn=0/8A8B7DD0
+2026-09-21 00:10:12.455 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:12.479 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 194 buffers (0.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.007 s, total=0.024 s; sync files=3, longest=0.004 s, average=0.003 s; distance=1585 kB, estimate=80353 kB; lsn=0/8AA44598, redo lsn=0/8AA44538
+2026-09-21 00:10:12.551 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:12.579 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 710 buffers (1.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.007 s, total=0.029 s; sync files=4, longest=0.005 s, average=0.002 s; distance=4882 kB, estimate=72806 kB; lsn=0/8AF08FD8, redo lsn=0/8AF08F78
+2026-09-21 00:10:12.722 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:12.898 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 10515 buffers (16.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.122 s, sync=0.020 s, total=0.176 s; sync files=3, longest=0.018 s, average=0.007 s; distance=74734 kB, estimate=74734 kB; lsn=0/8F804AF8, redo lsn=0/8F804A98
+2026-09-21 00:10:13.128 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:13.305 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 11627 buffers (17.7%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.112 s, sync=0.020 s, total=0.177 s; sync files=9, longest=0.010 s, average=0.003 s; distance=77871 kB, estimate=77871 kB; lsn=0/94410988, redo lsn=0/94410928
+2026-09-21 00:10:19.610 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:19.755 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 2051 buffers (3.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 10 recycled; write=0.022 s, sync=0.072 s, total=0.146 s; sync files=28, longest=0.045 s, average=0.003 s; distance=161345 kB, estimate=161345 kB; lsn=0/9E1A0E50, redo lsn=0/9E1A0DF0
+2026-09-21 00:10:19.957 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:19.992 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.036 s; sync files=15, longest=0.007 s, average=0.002 s; distance=6188 kB, estimate=145829 kB; lsn=0/9E7ABFC8, redo lsn=0/9E7ABF68
+2026-09-21 00:10:20.227 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:20.262 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.019 s, total=0.036 s; sync files=15, longest=0.006 s, average=0.002 s; distance=6189 kB, estimate=131865 kB; lsn=0/9EDB73F8, redo lsn=0/9EDB7398
+2026-09-21 00:10:20.492 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:20.532 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.019 s, total=0.041 s; sync files=15, longest=0.007 s, average=0.002 s; distance=6193 kB, estimate=119298 kB; lsn=0/9F3C3800, redo lsn=0/9F3C37A0
+2026-09-21 00:10:20.733 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:20.768 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.036 s; sync files=15, longest=0.006 s, average=0.002 s; distance=6475 kB, estimate=108015 kB; lsn=0/9FA16630, redo lsn=0/9FA165D0
+2026-09-21 00:10:21.014 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:21.058 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.022 s, total=0.044 s; sync files=15, longest=0.009 s, average=0.002 s; distance=17478 kB, estimate=98962 kB; lsn=0/A0B28200, redo lsn=0/A0B281A0
+2026-09-21 00:10:21.242 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:21.280 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.018 s, total=0.039 s; sync files=15, longest=0.007 s, average=0.002 s; distance=6186 kB, estimate=89684 kB; lsn=0/A1132D18, redo lsn=0/A1132CB8
+2026-09-21 00:10:21.488 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:21.523 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.019 s, total=0.035 s; sync files=15, longest=0.006 s, average=0.002 s; distance=6193 kB, estimate=81335 kB; lsn=0/A173F468, redo lsn=0/A173F408
+2026-09-21 00:10:21.767 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:21.805 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.020 s, total=0.038 s; sync files=15, longest=0.009 s, average=0.002 s; distance=6191 kB, estimate=73821 kB; lsn=0/A1D4B0A8, redo lsn=0/A1D4B048
+2026-09-21 00:10:22.122 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:22.168 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.004 s, sync=0.026 s, total=0.046 s; sync files=15, longest=0.011 s, average=0.002 s; distance=6361 kB, estimate=67075 kB; lsn=0/A23815C0, redo lsn=0/A2381560
+2026-09-21 00:10:22.877 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:22.935 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 6 recycled; write=0.005 s, sync=0.016 s, total=0.059 s; sync files=15, longest=0.004 s, average=0.002 s; distance=99509 kB, estimate=99509 kB; lsn=0/A84AE9F0, redo lsn=0/A84AE990
+2026-09-21 00:10:23.138 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:23.175 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.020 s, total=0.037 s; sync files=15, longest=0.008 s, average=0.002 s; distance=6183 kB, estimate=90176 kB; lsn=0/A8AB86F0, redo lsn=0/A8AB8690
+2026-09-21 00:10:23.410 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:23.459 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.025 s, total=0.050 s; sync files=15, longest=0.013 s, average=0.002 s; distance=6182 kB, estimate=81777 kB; lsn=0/A90C20E0, redo lsn=0/A90C2080
+2026-09-21 00:10:23.684 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:23.722 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.021 s, total=0.039 s; sync files=15, longest=0.009 s, average=0.002 s; distance=6186 kB, estimate=74217 kB; lsn=0/A96CCA08, redo lsn=0/A96CC9A8
+2026-09-21 00:10:23.925 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:23.964 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.023 s, total=0.040 s; sync files=15, longest=0.010 s, average=0.002 s; distance=6474 kB, estimate=67443 kB; lsn=0/A9D1F388, redo lsn=0/A9D1F328
+2026-09-21 00:10:24.212 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:24.262 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.029 s, total=0.051 s; sync files=15, longest=0.018 s, average=0.002 s; distance=17477 kB, estimate=62447 kB; lsn=0/AAE30AC0, redo lsn=0/AAE30A60
+2026-09-21 00:10:24.434 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:24.475 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.020 s, total=0.042 s; sync files=15, longest=0.009 s, average=0.002 s; distance=6185 kB, estimate=56820 kB; lsn=0/AB43B1A0, redo lsn=0/AB43B140
+2026-09-21 00:10:24.669 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:24.708 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.022 s, total=0.039 s; sync files=15, longest=0.010 s, average=0.002 s; distance=6190 kB, estimate=51757 kB; lsn=0/ABA46CB0, redo lsn=0/ABA46C50
+2026-09-21 00:10:24.929 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:24.973 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.020 s, total=0.044 s; sync files=15, longest=0.009 s, average=0.002 s; distance=6188 kB, estimate=47200 kB; lsn=0/AC051E70, redo lsn=0/AC051E10
+2026-09-21 00:10:25.263 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:25.298 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.018 s, total=0.035 s; sync files=15, longest=0.008 s, average=0.002 s; distance=6356 kB, estimate=43116 kB; lsn=0/AC686F70, redo lsn=0/AC686F10
+2026-09-21 00:10:25.960 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:26.016 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 6 recycled; write=0.004 s, sync=0.013 s, total=0.056 s; sync files=15, longest=0.004 s, average=0.001 s; distance=99503 kB, estimate=99503 kB; lsn=0/B27B2F18, redo lsn=0/B27B2EB8
+2026-09-21 00:10:26.211 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:26.248 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.019 s, total=0.037 s; sync files=15, longest=0.008 s, average=0.002 s; distance=6186 kB, estimate=90172 kB; lsn=0/B2DBD7D8, redo lsn=0/B2DBD778
+2026-09-21 00:10:26.495 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:26.534 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.018 s, total=0.040 s; sync files=15, longest=0.007 s, average=0.002 s; distance=6185 kB, estimate=81773 kB; lsn=0/B33C7D80, redo lsn=0/B33C7D20
+2026-09-21 00:10:26.752 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:26.785 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.016 s, total=0.034 s; sync files=15, longest=0.007 s, average=0.002 s; distance=6189 kB, estimate=74215 kB; lsn=0/B39D3280, redo lsn=0/B39D3220
+2026-09-21 00:10:26.989 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:27.030 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.004 s, sync=0.018 s, total=0.041 s; sync files=15, longest=0.006 s, average=0.002 s; distance=6477 kB, estimate=67441 kB; lsn=0/B40267E0, redo lsn=0/B4026780
+2026-09-21 00:10:27.264 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:27.308 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.022 s, total=0.044 s; sync files=15, longest=0.010 s, average=0.002 s; distance=17480 kB, estimate=62445 kB; lsn=0/B5138AD8, redo lsn=0/B5138A78
+2026-09-21 00:10:27.476 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:27.513 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.020 s, total=0.038 s; sync files=15, longest=0.008 s, average=0.002 s; distance=6188 kB, estimate=56819 kB; lsn=0/B5743D60, redo lsn=0/B5743D00
+2026-09-21 00:10:27.703 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:27.740 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.021 s, total=0.038 s; sync files=15, longest=0.008 s, average=0.002 s; distance=6193 kB, estimate=51756 kB; lsn=0/B5D50448, redo lsn=0/B5D503E8
+2026-09-21 00:10:27.969 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:28.015 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.025 s, total=0.047 s; sync files=15, longest=0.009 s, average=0.002 s; distance=6191 kB, estimate=47200 kB; lsn=0/B635C100, redo lsn=0/B635C0A0
+2026-09-21 00:10:28.335 PDT [165433] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:10:28.374 PDT [165433] LOG:  checkpoint complete: fast force wait: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.004 s, sync=0.022 s, total=0.040 s; sync files=15, longest=0.009 s, average=0.002 s; distance=6361 kB, estimate=43116 kB; lsn=0/B69926A0, redo lsn=0/B6992640
+2026-09-21 00:10:52.738 PDT [165430] LOG:  received fast shutdown request
+2026-09-21 00:10:52.742 PDT [165430] LOG:  aborting any active transactions
+2026-09-21 00:10:52.743 PDT [165430] LOG:  background worker "logical replication launcher" (PID 165437) exited with exit code 1
+2026-09-21 00:10:52.749 PDT [165433] LOG:  shutting down
+2026-09-21 00:10:52.753 PDT [165433] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:10:52.846 PDT [165433] LOG:  checkpoint complete: shutdown fast: wrote 16 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 6 recycled; write=0.004 s, sync=0.053 s, total=0.097 s; sync files=17, longest=0.042 s, average=0.004 s; distance=99522 kB, estimate=99522 kB; lsn=0/BCAC31E0, redo lsn=0/BCAC31E0
+2026-09-21 00:10:52.930 PDT [165430] LOG:  database system is shut down
+2026-09-21 00:10:52.984 PDT [165737] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:10:52.988 PDT [165737] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:10:52.998 PDT [165742] LOG:  database system was shut down at 2026-09-21 00:10:52 PDT
+2026-09-21 00:10:53.004 PDT [165737] LOG:  database system is ready to accept connections
+2026-09-21 00:10:53.053 PDT [165737] LOG:  received fast shutdown request
+2026-09-21 00:10:53.057 PDT [165737] LOG:  aborting any active transactions
+2026-09-21 00:10:53.058 PDT [165737] LOG:  background worker "logical replication launcher" (PID 165744) exited with exit code 1
+2026-09-21 00:10:53.058 PDT [165740] LOG:  shutting down
+2026-09-21 00:10:53.061 PDT [165740] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:10:53.084 PDT [165740] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.026 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/BCAC3268, redo lsn=0/BCAC3268
+2026-09-21 00:10:53.100 PDT [165737] LOG:  database system is shut down
+2026-09-21 00:10:53.194 PDT [165750] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:10:53.197 PDT [165750] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:10:53.207 PDT [165755] LOG:  database system was shut down at 2026-09-21 00:10:53 PDT
+2026-09-21 00:10:53.212 PDT [165750] LOG:  database system is ready to accept connections
+2026-09-21 00:10:53.269 PDT [165750] LOG:  received fast shutdown request
+2026-09-21 00:10:53.273 PDT [165750] LOG:  aborting any active transactions
+2026-09-21 00:10:53.273 PDT [165750] LOG:  background worker "logical replication launcher" (PID 165757) exited with exit code 1
+2026-09-21 00:10:53.273 PDT [165753] LOG:  shutting down
+2026-09-21 00:10:53.277 PDT [165753] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:10:53.300 PDT [165753] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.027 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/BCAC32F0, redo lsn=0/BCAC32F0
+2026-09-21 00:10:53.316 PDT [165750] LOG:  database system is shut down
+2026-09-21 00:10:53.411 PDT [165763] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:10:53.414 PDT [165763] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:10:53.426 PDT [165768] LOG:  database system was shut down at 2026-09-21 00:10:53 PDT
+2026-09-21 00:10:53.431 PDT [165763] LOG:  database system is ready to accept connections
+2026-09-21 00:10:53.484 PDT [165763] LOG:  received fast shutdown request
+2026-09-21 00:10:53.487 PDT [165763] LOG:  aborting any active transactions
+2026-09-21 00:10:53.487 PDT [165763] LOG:  background worker "logical replication launcher" (PID 165770) exited with exit code 1
+2026-09-21 00:10:53.487 PDT [165766] LOG:  shutting down
+2026-09-21 00:10:53.491 PDT [165766] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:10:53.515 PDT [165766] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/BCAC3378, redo lsn=0/BCAC3378
+2026-09-21 00:10:53.531 PDT [165763] LOG:  database system is shut down
+2026-09-21 00:10:53.626 PDT [165776] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:10:53.629 PDT [165776] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:10:53.640 PDT [165781] LOG:  database system was shut down at 2026-09-21 00:10:53 PDT
+2026-09-21 00:10:53.645 PDT [165776] LOG:  database system is ready to accept connections
+2026-09-21 00:10:53.700 PDT [165776] LOG:  received fast shutdown request
+2026-09-21 00:10:53.703 PDT [165776] LOG:  aborting any active transactions
+2026-09-21 00:10:53.703 PDT [165776] LOG:  background worker "logical replication launcher" (PID 165783) exited with exit code 1
+2026-09-21 00:10:53.703 PDT [165779] LOG:  shutting down
+2026-09-21 00:10:53.708 PDT [165779] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:10:53.731 PDT [165779] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/BCAC3400, redo lsn=0/BCAC3400
+2026-09-21 00:10:53.747 PDT [165776] LOG:  database system is shut down
+2026-09-21 00:10:53.843 PDT [165789] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:10:53.847 PDT [165789] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:10:53.858 PDT [165794] LOG:  database system was shut down at 2026-09-21 00:10:53 PDT
+2026-09-21 00:10:53.862 PDT [165789] LOG:  database system is ready to accept connections
+2026-09-21 00:10:53.915 PDT [165789] LOG:  received fast shutdown request
+2026-09-21 00:10:53.918 PDT [165789] LOG:  aborting any active transactions
+2026-09-21 00:10:53.919 PDT [165789] LOG:  background worker "logical replication launcher" (PID 165796) exited with exit code 1
+2026-09-21 00:10:53.919 PDT [165792] LOG:  shutting down
+2026-09-21 00:10:53.923 PDT [165792] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:10:53.946 PDT [165792] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=0/BCAC3488, redo lsn=0/BCAC3488
+2026-09-21 00:10:53.963 PDT [165789] LOG:  database system is shut down
+2026-09-21 00:10:54.057 PDT [165802] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:10:54.061 PDT [165802] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:10:54.072 PDT [165807] LOG:  database system was shut down at 2026-09-21 00:10:53 PDT
+2026-09-21 00:10:54.078 PDT [165802] LOG:  database system is ready to accept connections
+2026-09-21 00:11:45.208 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:45.565 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 30085 buffers (45.9%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 16 recycled; write=0.259 s, sync=0.020 s, total=0.357 s; sync files=22, longest=0.006 s, average=0.001 s; distance=260584 kB, estimate=260584 kB; lsn=0/CC93D718, redo lsn=0/CC93D6B8
+2026-09-21 00:11:45.818 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:45.896 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 5883 buffers (9.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 3 recycled; write=0.040 s, sync=0.015 s, total=0.079 s; sync files=13, longest=0.005 s, average=0.002 s; distance=47136 kB, estimate=239239 kB; lsn=0/CF745940, redo lsn=0/CF7458E0
+2026-09-21 00:11:46.566 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:46.654 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 7664 buffers (11.7%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 3 recycled; write=0.050 s, sync=0.014 s, total=0.089 s; sync files=13, longest=0.005 s, average=0.002 s; distance=57755 kB, estimate=221091 kB; lsn=0/D2FAC8F8, redo lsn=0/D2FAC898
+2026-09-21 00:11:46.799 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:46.968 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 10515 buffers (16.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.115 s, sync=0.022 s, total=0.170 s; sync files=3, longest=0.020 s, average=0.008 s; distance=74660 kB, estimate=206448 kB; lsn=0/D7895C48, redo lsn=0/D7895BE8
+2026-09-21 00:11:47.674 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:48.006 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 31716 buffers (48.4%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 14 recycled; write=0.223 s, sync=0.041 s, total=0.333 s; sync files=19, longest=0.029 s, average=0.003 s; distance=230421 kB, estimate=230421 kB; lsn=0/E599B1F0, redo lsn=0/E599B190
+2026-09-21 00:11:54.239 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:54.427 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 2059 buffers (3.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 20 recycled; write=0.021 s, sync=0.079 s, total=0.189 s; sync files=40, longest=0.049 s, average=0.003 s; distance=327639 kB, estimate=327639 kB; lsn=0/F9991220, redo lsn=0/F9991188
+2026-09-21 00:11:55.042 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:55.089 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 18 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.027 s, total=0.048 s; sync files=18, longest=0.013 s, average=0.002 s; distance=19866 kB, estimate=296862 kB; lsn=0/FACF7A98, redo lsn=0/FACF7A38
+2026-09-21 00:11:55.783 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:55.832 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 2 recycled; write=0.005 s, sync=0.026 s, total=0.050 s; sync files=15, longest=0.014 s, average=0.002 s; distance=19845 kB, estimate=269160 kB; lsn=0/FC059010, redo lsn=0/FC058FB0
+2026-09-21 00:11:56.550 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:56.595 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.025 s, total=0.045 s; sync files=15, longest=0.013 s, average=0.002 s; distance=19846 kB, estimate=244229 kB; lsn=0/FD3BA900, redo lsn=0/FD3BA8A0
+2026-09-21 00:11:57.289 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:57.341 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.004 s, sync=0.030 s, total=0.052 s; sync files=15, longest=0.014 s, average=0.003 s; distance=19847 kB, estimate=221791 kB; lsn=0/FE71C548, redo lsn=0/FE71C4E8
+2026-09-21 00:11:57.989 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:58.037 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.004 s, sync=0.027 s, total=0.049 s; sync files=15, longest=0.014 s, average=0.002 s; distance=19847 kB, estimate=201596 kB; lsn=0/FFA7E510, redo lsn=0/FFA7E4B0
+2026-09-21 00:11:58.446 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:58.492 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.024 s, total=0.046 s; sync files=15, longest=0.013 s, average=0.002 s; distance=19848 kB, estimate=183422 kB; lsn=1/00DE0908, redo lsn=1/00DE08A8
+2026-09-21 00:11:59.142 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:11:59.193 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 2 recycled; write=0.005 s, sync=0.026 s, total=0.051 s; sync files=15, longest=0.013 s, average=0.002 s; distance=19849 kB, estimate=167064 kB; lsn=1/02142D70, redo lsn=1/02142D10
+2026-09-21 00:11:59.991 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:00.026 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.004 s, sync=0.014 s, total=0.036 s; sync files=15, longest=0.005 s, average=0.001 s; distance=19863 kB, estimate=152344 kB; lsn=1/034A8B68, redo lsn=1/034A8B08
+2026-09-21 00:12:00.702 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:00.747 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.023 s, total=0.046 s; sync files=15, longest=0.012 s, average=0.002 s; distance=19846 kB, estimate=139094 kB; lsn=1/0480A568, redo lsn=1/0480A508
+2026-09-21 00:12:01.485 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:01.533 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.004 s, sync=0.026 s, total=0.048 s; sync files=15, longest=0.014 s, average=0.002 s; distance=19845 kB, estimate=127169 kB; lsn=1/05B6BD10, redo lsn=1/05B6BCB0
+2026-09-21 00:12:02.280 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:02.330 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 17 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.028 s, total=0.050 s; sync files=15, longest=0.017 s, average=0.002 s; distance=19846 kB, estimate=116437 kB; lsn=1/06ECD890, redo lsn=1/06ECD830
+2026-09-21 00:12:03.050 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:03.101 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 2 removed, 0 recycled; write=0.005 s, sync=0.024 s, total=0.052 s; sync files=15, longest=0.011 s, average=0.002 s; distance=19840 kB, estimate=106777 kB; lsn=1/0822DAA0, redo lsn=1/0822DA40
+2026-09-21 00:12:03.802 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:03.847 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.024 s, total=0.046 s; sync files=15, longest=0.013 s, average=0.002 s; distance=19841 kB, estimate=98084 kB; lsn=1/0958E040, redo lsn=1/0958DFC8
+2026-09-21 00:12:04.251 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:04.296 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.024 s, total=0.046 s; sync files=15, longest=0.012 s, average=0.002 s; distance=19842 kB, estimate=90260 kB; lsn=1/0A8EE920, redo lsn=1/0A8EE8C0
+2026-09-21 00:12:04.960 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:05.006 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.025 s, total=0.047 s; sync files=15, longest=0.013 s, average=0.002 s; distance=19843 kB, estimate=83218 kB; lsn=1/0BC4F590, redo lsn=1/0BC4F530
+2026-09-21 00:12:05.776 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:05.810 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.012 s, total=0.035 s; sync files=15, longest=0.003 s, average=0.001 s; distance=19857 kB, estimate=76882 kB; lsn=1/0CFB3B28, redo lsn=1/0CFB3AC8
+2026-09-21 00:12:06.457 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:06.506 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 1 recycled; write=0.004 s, sync=0.021 s, total=0.049 s; sync files=15, longest=0.008 s, average=0.002 s; distance=19845 kB, estimate=71178 kB; lsn=1/0E314F40, redo lsn=1/0E314EE0
+2026-09-21 00:12:07.230 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:07.274 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 1 removed, 0 recycled; write=0.005 s, sync=0.021 s, total=0.045 s; sync files=15, longest=0.010 s, average=0.002 s; distance=19844 kB, estimate=66045 kB; lsn=1/0F676028, redo lsn=1/0F675FB0
+2026-09-21 00:12:08.012 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:08.058 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.004 s, sync=0.026 s, total=0.046 s; sync files=15, longest=0.014 s, average=0.002 s; distance=19845 kB, estimate=61425 kB; lsn=1/109D7488, redo lsn=1/109D7428
+2026-09-21 00:12:08.743 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:08.791 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 17 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.025 s, total=0.049 s; sync files=15, longest=0.014 s, average=0.002 s; distance=19854 kB, estimate=57268 kB; lsn=1/11D3ACF0, redo lsn=1/11D3AC90
+2026-09-21 00:12:09.474 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:09.528 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 2 removed, 0 recycled; write=0.004 s, sync=0.028 s, total=0.054 s; sync files=15, longest=0.015 s, average=0.002 s; distance=19842 kB, estimate=53525 kB; lsn=1/1309B8B0, redo lsn=1/1309B850
+2026-09-21 00:12:09.921 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:09.971 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 15 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.029 s, total=0.050 s; sync files=15, longest=0.017 s, average=0.002 s; distance=19847 kB, estimate=50157 kB; lsn=1/143FD5F8, redo lsn=1/143FD598
+2026-09-21 00:12:10.597 PDT [165805] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:12:10.643 PDT [165805] LOG:  checkpoint complete: fast force wait: wrote 14 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.025 s, total=0.047 s; sync files=15, longest=0.014 s, average=0.002 s; distance=19841 kB, estimate=47126 kB; lsn=1/1575DAD0, redo lsn=1/1575DA70
+2026-09-21 00:13:08.809 PDT [165802] LOG:  received fast shutdown request
+2026-09-21 00:13:08.813 PDT [165802] LOG:  aborting any active transactions
+2026-09-21 00:13:08.814 PDT [165802] LOG:  background worker "logical replication launcher" (PID 165809) exited with exit code 1
+2026-09-21 00:13:08.827 PDT [165805] LOG:  shutting down
+2026-09-21 00:13:08.830 PDT [165805] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:13:08.865 PDT [165805] LOG:  checkpoint complete: shutdown fast: wrote 17 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 1 recycled; write=0.005 s, sync=0.014 s, total=0.039 s; sync files=17, longest=0.004 s, average=0.001 s; distance=19869 kB, estimate=44400 kB; lsn=1/16AC4E88, redo lsn=1/16AC4E88
+2026-09-21 00:13:08.982 PDT [165802] LOG:  database system is shut down
+2026-09-21 00:13:09.051 PDT [165997] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:13:09.055 PDT [165997] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:13:09.067 PDT [166002] LOG:  database system was shut down at 2026-09-21 00:13:08 PDT
+2026-09-21 00:13:09.072 PDT [165997] LOG:  database system is ready to accept connections
+2026-09-21 00:13:09.125 PDT [165997] LOG:  received fast shutdown request
+2026-09-21 00:13:09.129 PDT [165997] LOG:  aborting any active transactions
+2026-09-21 00:13:09.129 PDT [165997] LOG:  background worker "logical replication launcher" (PID 166004) exited with exit code 1
+2026-09-21 00:13:09.129 PDT [166000] LOG:  shutting down
+2026-09-21 00:13:09.133 PDT [166000] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:13:09.160 PDT [166000] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.032 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=1/16AC4F10, redo lsn=1/16AC4F10
+2026-09-21 00:13:09.176 PDT [165997] LOG:  database system is shut down
+2026-09-21 00:13:09.267 PDT [166010] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:13:09.272 PDT [166010] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:13:09.282 PDT [166015] LOG:  database system was shut down at 2026-09-21 00:13:09 PDT
+2026-09-21 00:13:09.288 PDT [166010] LOG:  database system is ready to accept connections
+2026-09-21 00:13:09.341 PDT [166010] LOG:  received fast shutdown request
+2026-09-21 00:13:09.345 PDT [166010] LOG:  aborting any active transactions
+2026-09-21 00:13:09.345 PDT [166010] LOG:  background worker "logical replication launcher" (PID 166017) exited with exit code 1
+2026-09-21 00:13:09.345 PDT [166013] LOG:  shutting down
+2026-09-21 00:13:09.348 PDT [166013] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:13:09.372 PDT [166013] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.004 s, total=0.027 s; sync files=2, longest=0.003 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=1/16AC4F98, redo lsn=1/16AC4F98
+2026-09-21 00:13:09.388 PDT [166010] LOG:  database system is shut down
+2026-09-21 00:13:09.484 PDT [166023] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:13:09.488 PDT [166023] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:13:09.498 PDT [166028] LOG:  database system was shut down at 2026-09-21 00:13:09 PDT
+2026-09-21 00:13:09.503 PDT [166023] LOG:  database system is ready to accept connections
+2026-09-21 00:13:09.557 PDT [166023] LOG:  received fast shutdown request
+2026-09-21 00:13:09.561 PDT [166023] LOG:  aborting any active transactions
+2026-09-21 00:13:09.561 PDT [166023] LOG:  background worker "logical replication launcher" (PID 166030) exited with exit code 1
+2026-09-21 00:13:09.561 PDT [166026] LOG:  shutting down
+2026-09-21 00:13:09.564 PDT [166026] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:13:09.588 PDT [166026] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.005 s, total=0.027 s; sync files=2, longest=0.003 s, average=0.003 s; distance=0 kB, estimate=0 kB; lsn=1/16AC5020, redo lsn=1/16AC5020
+2026-09-21 00:13:09.604 PDT [166023] LOG:  database system is shut down
+2026-09-21 00:13:09.701 PDT [166036] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:13:09.705 PDT [166036] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:13:09.717 PDT [166041] LOG:  database system was shut down at 2026-09-21 00:13:09 PDT
+2026-09-21 00:13:09.722 PDT [166036] LOG:  database system is ready to accept connections
+2026-09-21 00:13:09.794 PDT [166036] LOG:  received fast shutdown request
+2026-09-21 00:13:09.798 PDT [166036] LOG:  aborting any active transactions
+2026-09-21 00:13:09.798 PDT [166036] LOG:  background worker "logical replication launcher" (PID 166043) exited with exit code 1
+2026-09-21 00:13:09.798 PDT [166039] LOG:  shutting down
+2026-09-21 00:13:09.802 PDT [166039] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:13:09.826 PDT [166039] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=1/16AC50A8, redo lsn=1/16AC50A8
+2026-09-21 00:13:09.849 PDT [166036] LOG:  database system is shut down
+2026-09-21 00:13:09.936 PDT [166049] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:13:09.940 PDT [166049] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:13:09.950 PDT [166054] LOG:  database system was shut down at 2026-09-21 00:13:09 PDT
+2026-09-21 00:13:09.955 PDT [166049] LOG:  database system is ready to accept connections
+2026-09-21 00:13:10.033 PDT [166049] LOG:  received fast shutdown request
+2026-09-21 00:13:10.036 PDT [166049] LOG:  aborting any active transactions
+2026-09-21 00:13:10.036 PDT [166049] LOG:  background worker "logical replication launcher" (PID 166056) exited with exit code 1
+2026-09-21 00:13:10.036 PDT [166052] LOG:  shutting down
+2026-09-21 00:13:10.040 PDT [166052] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:13:10.064 PDT [166052] LOG:  checkpoint complete: shutdown fast: wrote 0 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.003 s, total=0.028 s; sync files=2, longest=0.002 s, average=0.002 s; distance=0 kB, estimate=0 kB; lsn=1/16AC5130, redo lsn=1/16AC5130
+2026-09-21 00:13:10.089 PDT [166049] LOG:  database system is shut down
+2026-09-21 00:13:10.176 PDT [166062] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 00:13:10.180 PDT [166062] LOG:  listening on Unix socket "/tmp/rbi-comparison-mratcp6h/socket/.s.PGSQL.55449"
+2026-09-21 00:13:10.190 PDT [166067] LOG:  database system was shut down at 2026-09-21 00:13:10 PDT
+2026-09-21 00:13:10.195 PDT [166062] LOG:  database system is ready to accept connections
+2026-09-21 00:14:08.426 PDT [166065] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:14:08.849 PDT [166065] LOG:  checkpoint complete: fast force wait: wrote 46147 buffers (70.4%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 14 recycled; write=0.332 s, sync=0.022 s, total=0.423 s; sync files=20, longest=0.008 s, average=0.002 s; distance=230004 kB, estimate=230004 kB; lsn=1/24B62258, redo lsn=1/24B621F8
+2026-09-21 00:14:09.290 PDT [166065] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:14:09.433 PDT [166065] LOG:  checkpoint complete: fast force wait: wrote 12641 buffers (19.3%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 4 recycled; write=0.097 s, sync=0.019 s, total=0.144 s; sync files=11, longest=0.005 s, average=0.002 s; distance=61343 kB, estimate=213138 kB; lsn=1/2874A080, redo lsn=1/2874A020
+2026-09-21 00:14:09.885 PDT [166065] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:14:10.025 PDT [166065] LOG:  checkpoint complete: fast force wait: wrote 13203 buffers (20.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 4 recycled; write=0.095 s, sync=0.017 s, total=0.141 s; sync files=12, longest=0.005 s, average=0.002 s; distance=65428 kB, estimate=198367 kB; lsn=1/2C72F080, redo lsn=1/2C72F020
+2026-09-21 00:14:10.155 PDT [166065] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:14:10.328 PDT [166065] LOG:  checkpoint complete: fast force wait: wrote 10515 buffers (16.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 5 recycled; write=0.117 s, sync=0.024 s, total=0.173 s; sync files=3, longest=0.021 s, average=0.008 s; distance=74732 kB, estimate=186003 kB; lsn=1/3102A3D0, redo lsn=1/3102A370
+2026-09-21 00:14:10.895 PDT [166065] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:14:11.284 PDT [166065] LOG:  checkpoint complete: fast force wait: wrote 46562 buffers (71.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 14 recycled; write=0.302 s, sync=0.019 s, total=0.389 s; sync files=16, longest=0.007 s, average=0.002 s; distance=235178 kB, estimate=235178 kB; lsn=1/3F5D4ED8, redo lsn=1/3F5D4E78
+2026-09-21 00:14:22.057 PDT [166065] LOG:  checkpoint starting: fast force wait
+2026-09-21 00:14:22.259 PDT [166065] LOG:  checkpoint complete: fast force wait: wrote 2053 buffers (3.1%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 19 recycled; write=0.022 s, sync=0.091 s, total=0.203 s; sync files=36, longest=0.062 s, average=0.003 s; distance=319492 kB, estimate=319492 kB; lsn=1/52DD61C8, redo lsn=1/52DD6168
+2026-09-21 00:15:22.937 PDT [166070] ERROR:  canceling statement due to statement timeout
+2026-09-21 00:15:22.937 PDT [166070] STATEMENT:  CREATE INDEX ix_c2 ON fact USING hash (c2)
+2026-09-21 00:15:22.949 PDT [166062] LOG:  received fast shutdown request
+2026-09-21 00:15:22.953 PDT [166062] LOG:  aborting any active transactions
+2026-09-21 00:15:22.953 PDT [166062] LOG:  background worker "logical replication launcher" (PID 166069) exited with exit code 1
+2026-09-21 00:15:22.973 PDT [166065] LOG:  shutting down
+2026-09-21 00:15:22.977 PDT [166065] LOG:  checkpoint starting: shutdown fast
+2026-09-21 00:15:23.023 PDT [166065] LOG:  checkpoint complete: shutdown fast: wrote 13 buffers (0.0%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 4 recycled; write=0.004 s, sync=0.014 s, total=0.050 s; sync files=15, longest=0.004 s, average=0.001 s; distance=61186 kB, estimate=293662 kB; lsn=1/56996CE8, redo lsn=1/56996CE8
+2026-09-21 00:15:23.133 PDT [166062] LOG:  database system is shut down

@@ -9,3 +9,5 @@ test/unit/container_test
 regression.*
 log/
 test/unit/sparse_test
+__pycache__/
+*.pyc

@@ -1,0 +1,33 @@
+echo "# +++ regress install-check in  +++" && /home/cgkanchi/code/pg_roaring_index/.local/pg/lib/postgresql/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/home/cgkanchi/code/pg_roaring_index/.local/pg/bin'    --inputdir=test --outputdir=test --dbname=contrib_regression array basic citext count inlist insert large null options partition pushdown security sparse tsvector unlogged vacuum verify
+# +++ regress install-check in  +++
+# using postmaster on /tmp/rbi-followup/socket, port 55441
+ok 1         - array                                    1878 ms
+ok 2         - basic                                    4279 ms
+ok 3         - citext                                    173 ms
+ok 4         - count                                    3741 ms
+ok 5         - inlist                                   2225 ms
+ok 6         - insert                                  13148 ms
+ok 7         - large                                   21675 ms
+ok 8         - null                                     1788 ms
+ok 9         - options                                   384 ms
+ok 10        - partition                                3661 ms
+ok 11        - pushdown                                17000 ms
+ok 12        - security                                  110 ms
+ok 13        - sparse                                   5782 ms
+ok 14        - tsvector                                  375 ms
+ok 15        - unlogged                                  859 ms
+ok 16        - vacuum                                   7104 ms
+ok 17        - verify                                   6232 ms
+1..17
+# All 17 tests passed.
+echo "# +++ isolation install-check in  +++" && /home/cgkanchi/code/pg_roaring_index/.local/pg/lib/postgresql/pgxs/src/makefiles/../../src/test/isolation/pg_isolation_regress --inputdir=./ --outputdir=output_iso --bindir='/home/cgkanchi/code/pg_roaring_index/.local/pg/bin'    --inputdir=test/isolation --outputdir=test/isolation --dbname=isolation_regression count_checkxmin count_serializable count_snapshot count_vacuum_race insert_concurrent vacuum_scan
+# +++ isolation install-check in  +++
+# using postmaster on /tmp/rbi-followup/socket, port 55441
+ok 1         - count_checkxmin                            42 ms
+ok 2         - count_serializable                         35 ms
+ok 3         - count_snapshot                             76 ms
+ok 4         - count_vacuum_race                        6188 ms
+ok 5         - insert_concurrent                         190 ms
+ok 6         - vacuum_scan                               325 ms
+1..6
+# All 6 tests passed.

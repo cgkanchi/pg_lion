@@ -1,0 +1,19 @@
+Profile,State,Index,Buckets,Bucket pages,Entries,Container pages,TIDs
+growth,bulk_then_index,fact_k_idx,847,888,100000,0,100000
+growth,bulk_then_index,fact_h_idx,64,64,2,46,100000
+growth,index_then_insert,fact_k_idx,64,773,100000,0,100000
+growth,index_then_insert,fact_h_idx,64,64,2,46,100000
+churn,cycle 0,fact_k_idx,847,888,100000,0,100000
+churn,cycle 0,fact_h_idx,64,64,2,18,100000
+churn,cycle 1,fact_k_idx,847,1707,200000,0,100000
+churn,cycle 1,fact_h_idx,64,64,2,34,100000
+churn,cycle 2,fact_k_idx,847,2540,300000,0,100000
+churn,cycle 2,fact_h_idx,64,64,2,50,100000
+churn,cycle 3,fact_k_idx,847,3021,400000,0,100000
+churn,cycle 3,fact_h_idx,64,64,2,64,100000
+churn,cycle 4,fact_k_idx,847,3400,500000,0,100000
+churn,cycle 4,fact_h_idx,64,64,2,80,100000
+churn,cycle 5,fact_k_idx,847,4209,600000,0,100000
+churn,cycle 5,fact_h_idx,64,64,2,94,100000
+after_reindex,cycle 5,fact_k_idx,847,898,100000,0,100000
+after_reindex,cycle 5,fact_h_idx,64,64,2,18,100000

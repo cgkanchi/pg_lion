@@ -1,0 +1,56 @@
+LOAD
+SET
+SET
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 20000
+CREATE INDEX
+VACUUM
+INSERT 0 20000
+VACUUM
+SET
+SET
+SET
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Custom Scan (RoaringCount)  (cost=254.14..254.14 rows=10 width=12) (actual rows=20010.00 loops=1)
+   Partitions: review_groups_0, review_groups_1
+   Roaring Indexes: (k)
+   Group Key: k
+   Heap Blocks Skipped via VM: 20450
+   Heap TIDs Rechecked: 0
+   Heap Blocks Rechecked: 0
+   Containers Visited: 20010
+   Buffers: shared hit=40270
+ Planning:
+   Buffers: shared hit=66 read=4
+ Planning Time: 1.168 ms
+ Execution Time: 37.022 ms
+(13 rows)
+
+ work_mem | n | group_hash_allocated_bytes | group_hash_used_bytes 
+----------+---+----------------------------+-----------------------
+ 64kB     | 1 |                    1582144 |               1489680
+(1 row)
+
+SET
+                                                           QUERY PLAN                                                           
+--------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=971.36..971.46 rows=10 width=12) (actual rows=20010.00 loops=1)
+   Group Key: review_groups.k
+   Batches: 537  Memory Usage: 112kB  Disk Usage: 960kB
+   Buffers: shared hit=178, temp read=739 written=830
+   ->  Append  (cost=0.00..773.02 rows=39668 width=4) (actual rows=40000.00 loops=1)
+         Buffers: shared hit=178
+         ->  Seq Scan on review_groups_0 review_groups_1  (cost=0.00..287.34 rows=19834 width=4) (actual rows=20000.00 loops=1)
+               Disabled: true
+               Buffers: shared hit=89
+         ->  Seq Scan on review_groups_1 review_groups_2  (cost=0.00..287.34 rows=19834 width=4) (actual rows=20000.00 loops=1)
+               Disabled: true
+               Buffers: shared hit=89
+ Planning Time: 0.045 ms
+ Execution Time: 27.750 ms
+(14 rows)
+
+DROP TABLE

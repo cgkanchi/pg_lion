@@ -1,4 +1,14 @@
-Codebase review — 2026-09-20
+Codebase review — latest follow-up 2026-09-21
+
+**Current status:** reviewed the fixes in `7db8f11`. Original findings **1–4 and 7 are addressed** in the reviewed paths. Finding **5 is partially addressed**: the single-count dirty-page bound is corrected, but the benchmark exposes a 7–8× grouped-count plan-choice penalty from repeatedly charging cached dirty pages as random I/O. Finding **6 is partially addressed**: dirty-TID rechecks are bounded, but partitioned grouping still has no runtime memory bound. Finding **8 is partially addressed**: normal startup fails closed, but the cleanup trap still attempts catalog writes after failed startup. A new finding shows full multikey fallback scans are undercosted, producing 2.2–2.6× slower default phrase/prefix plans than sequential scans. **Four P2 findings remain**; not every finding is fixed.
+
+The new validation passes **all 17 SQL regression tests and all 6 isolation tests**, including the added snapshot-horizon isolation case. The remaining findings have bounded reproductions or recorded benchmark evidence. See [FOLLOWUP_REVIEW.md](FOLLOWUP_REVIEW.md) for current findings, evidence, architecture/performance reassessment, and the status of each earlier recommendation. See [the comparison suite](bench/comprehensive/README.md) for the new benchmark and measured reports. No extension implementation changes were made by this follow-up review.
+
+The rest of this document is the **historical review of `609babec`**, preserved as the record that motivated the fixes. Its findings, line numbers, and conclusions describe that earlier commit, not the current implementation.
+
+---
+
+Original codebase review — 2026-09-20
 
 Reviewed commit: `609babec0c097628ee339643d6d304cdc13432ba`.
 

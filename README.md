@@ -110,6 +110,20 @@ they stay correct there but are no longer O(1) per container. The SQL count func
 on the table or on the indexed columns and refuse tables where row-level security applies to the
 caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
 
+## Reproducible comparison and latest review
+
+The [comprehensive benchmark](bench/comprehensive/README.md) compares B-tree, hash, GIN, GiST,
+BRIN, sequential scans, and roaring with count pushdown enabled/disabled. It includes exact-result
+checks, recorded query plans, build/maintenance/WAL costs, visibility and memory stress, and concurrent
+reads. Start with the [results and interpretation](bench/COMPARISON.md), then explore the
+[searchable report](bench/results/2026-09-20-comparison/index.html),
+[full tables](bench/results/2026-09-20-comparison/REPORT.md), and
+[growth/churn/write supplement](bench/results/2026-09-21-stress/REPORT.md). The [follow-up review](FOLLOWUP_REVIEW.md)
+records which earlier findings are fixed and the four remaining reliability/performance gaps.
+
+The results below are historical measurements with different datasets and configurations; they are
+preserved for development history and are not additional samples from the new comparison.
+
 ## Index size after the v1 build policy (5M rows, 2026-09-20)
 
 Sparse segments (DESIGN.md §13) shrank the posting sets, but the index only got smaller once the

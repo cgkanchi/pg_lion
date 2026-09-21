@@ -1,0 +1,15 @@
+Family,Load order,Insert ms,Build ms,Recorded load+build ms,Insert WAL MiB,Indexes MiB,Heap MiB
+gin,bulk_then_index,193.763,173.320,367.083,13.025,5.492,11.531
+gin,index_then_insert,328.067,0.000,328.067,43.662,9.383,11.531
+hash,bulk_then_index,134.529,726.511,861.039,13.025,9.938,11.531
+hash,index_then_insert,981.063,0.000,981.063,29.780,10.469,11.531
+gist,bulk_then_index,120.007,89.945,209.952,13.022,4.641,11.531
+gist,index_then_insert,787.355,0.000,787.355,47.355,9.203,11.531
+brin,bulk_then_index,129.717,21.906,151.623,13.021,0.094,11.531
+brin,index_then_insert,145.711,0.000,145.711,13.179,0.094,11.531
+seq,bulk_then_index,104.850,0.001,104.851,13.028,0.000,11.531
+seq,index_then_insert,110.604,0.000,110.604,13.026,0.000,11.531
+btree,bulk_then_index,114.344,55.809,170.153,13.023,2.836,11.531
+btree,index_then_insert,304.058,0.000,304.058,25.545,2.797,11.531
+roaring,bulk_then_index,117.590,350.967,468.558,13.028,7.812,11.531
+roaring,index_then_insert,1191.573,0.000,1191.573,78.101,6.914,11.531
