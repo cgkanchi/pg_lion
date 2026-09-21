@@ -40,7 +40,10 @@
  * A NULL key is no different once its entry has been located: it lives in the
  * reserved NULL entry of bucket 0, which has no key bytes and is recognised
  * by RBI_ENTRY_NULLKEY (DESIGN.md §14), and its payload is an ordinary
- * INLINE payload that spills to a chain like any other.
+ * INLINE payload that spills to a chain like any other.  So is the reserved
+ * EMPTY entry a multi-key opclass uses for rows it extracts no key from
+ * (DESIGN.md §17); a row with several keys is simply several of these
+ * inserts, one per key.
  *
  * Splitting a segment produces up to three items where there was one, and
  * they are placed in a single WAL record (rbi_chain_put_items_locked): a
@@ -64,7 +67,7 @@
 #include "rbi.h"
 
 static void rbi_insert_new_entry(Relation index, RBIState *state, Buffer headbuf,
-								 Datum key, bool isnull, uint32 hash,
+								 Datum key, uint16 reservedflag, uint32 hash,
 								 uint32 ckey, uint16 lo);
 static void rbi_insert_inline(Relation index, RBIState *state, Buffer entrybuf,
 							  OffsetNumber entryoff, uint32 ckey, uint16 lo);
@@ -439,22 +442,45 @@ rbi_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
  */
 static void
 rbi_insert_new_entry(Relation index, RBIState *state, Buffer headbuf,
-					 Datum key, bool isnull, uint32 hash, uint32 ckey,
+					 Datum key, uint16 reservedflag, uint32 hash, uint32 ckey,
 					 uint16 lo)
 {
 	char		payload[RBI_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
 	RBIEntryTuple *entry;
 	Size		paylen;
 	Size		size;
+	int			max_entries = rbi_max_entries(index);
 
 	paylen = rbi_put_singleton(payload, ckey, lo);
 
-	entry = isnull ?
-		rbi_make_null_entry(RBI_ENTRY_INLINE, payload, paylen, &size) :
+	entry = (reservedflag != 0) ?
+		rbi_make_reserved_entry(reservedflag, RBI_ENTRY_INLINE, payload,
+								paylen, &size) :
 		rbi_make_entry(state, key, hash, RBI_ENTRY_INLINE,
 					   payload, paylen, &size);
 	entry->ncontainers = 1;
 	entry->ntids = 1;
+
+	/*
+	 * Cardinality guard (DESIGN.md §17), on the one path that can make the
+	 * index grow a key: a brand new entry.
+	 *
+	 * The estimate is deliberately crude - the entries of THIS bucket times
+	 * the bucket count - because counting the whole index would mean reading
+	 * every bucket page for every new key.  Hash values spread the keys
+	 * evenly enough for the product to have the right order of magnitude, and
+	 * an advisory warning is all it feeds.  The bucket is already locked
+	 * EXCLUSIVE by the caller, so the walk sees a consistent chain and costs
+	 * nothing but the pages the insert is about to touch anyway.
+	 */
+	if (max_entries > 0)
+	{
+		int64		nbucket = rbi_bucket_nentries(index, headbuf) + 1;
+		int64		estimate = nbucket * (int64) state->meta.nbuckets;
+
+		if (estimate > (int64) max_entries)
+			rbi_warn_max_entries(index, estimate);
+	}
 
 	rbi_add_entry(index, headbuf, entry, size);
 
@@ -737,77 +763,37 @@ rbi_insert_chain(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 }
 
 /*
- * aminsert
- *
- * checkUnique is irrelevant (amcanunique is false) and indexUnchanged is
- * ignored: a roaring index has no way of knowing whether it has seen this
- * TID before without looking, and the lookup is the bulk of the work anyway.
+ * Add one (key, code) pair to the index: locate or create the key's entry and
+ * put the member in it.  reservedflag is 0 for a real key, or the flag of the
+ * reserved entry the pair belongs to (DESIGN.md §14 and §17), in which case
+ * key is meaningless and the bucket is 0.
  */
-bool
-rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
-		  Relation heapRel, IndexUniqueCheck checkUnique, bool indexUnchanged,
-		  IndexInfo *indexInfo)
+static void
+rbi_insert_one(Relation index, RBIState *state, Datum key, uint16 reservedflag,
+			   uint32 ckey, uint16 lo)
 {
-	RBIState   *state;
-	MemoryContext insertcxt;
-	MemoryContext oldcxt;
-	Datum		key;
-	uint64		code;
 	uint32		hash;
-	uint32		ckey;
-	uint16		lo;
 	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
-	bool		keyisnull = isnull[0];
 	bool		found;
 
-	rbi_check_key_offset(ht_ctid);
-
-	state = rbi_get_state(index);
-
-	insertcxt = AllocSetContextCreate(CurrentMemoryContext,
-									  "roaring index insert",
-									  ALLOCSET_DEFAULT_SIZES);
-	oldcxt = MemoryContextSwitchTo(insertcxt);
-
-	/*
-	 * A NULL key belongs to the reserved NULL entry, which lives in bucket 0
-	 * and is found by its flag rather than by its (absent) key (DESIGN.md
-	 * §14).  Everything after the lookup is shared with real keys.
-	 */
-	if (keyisnull)
-	{
-		key = (Datum) 0;
-		hash = RBI_NULLKEY_HASH;
-	}
-	else
-	{
-		key = values[0];
-		if (!state->typbyval && state->typlen == -1)
-			key = PointerGetDatum(PG_DETOAST_DATUM(key));
-
-		hash = rbi_hash_key(state, key);
-	}
-
-	code = rbi_tid_to_code(ht_ctid);
-	ckey = rbi_code_ckey(code);
-	lo = rbi_code_lo(code);
+	hash = (reservedflag != 0) ? RBI_NULLKEY_HASH : rbi_hash_key(state, key);
 
 	headbuf = ReadBuffer(index,
 						 RBI_BUCKET_BLKNO(rbi_bucket_of(hash,
 														state->meta.nbuckets)));
 	LockBuffer(headbuf, BUFFER_LOCK_EXCLUSIVE);
 
-	found = keyisnull ?
-		rbi_find_null_entry(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
-							&entrybuf, &entryoff) :
+	found = (reservedflag != 0) ?
+		rbi_find_reserved_entry(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
+								reservedflag, &entrybuf, &entryoff) :
 		rbi_find_entry(index, state, headbuf, BUFFER_LOCK_EXCLUSIVE,
 					   key, hash, &entrybuf, &entryoff);
 
 	if (!found)
 	{
-		rbi_insert_new_entry(index, state, headbuf, key, keyisnull, hash,
+		rbi_insert_new_entry(index, state, headbuf, key, reservedflag, hash,
 							 ckey, lo);
 	}
 	else
@@ -829,6 +815,80 @@ rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	}
 
 	UnlockReleaseBuffer(headbuf);
+}
+
+/*
+ * aminsert
+ *
+ * checkUnique is irrelevant (amcanunique is false) and indexUnchanged is
+ * ignored: a roaring index has no way of knowing whether it has seen this
+ * TID before without looking, and the lookup is the bulk of the work anyway.
+ *
+ * A multi-key opclass (DESIGN.md §17) turns one row into several independent
+ * single-key inserts, each taking and releasing its own bucket lock.  They are
+ * not atomic with respect to a concurrent reader - a scan may see the row
+ * under some of its keys and not yet under the others - which is exactly the
+ * visibility the heap gives anyway: the inserting transaction has not
+ * committed, so no snapshot that can see the row can run before the last of
+ * them has been written.
+ */
+bool
+rbiinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
+		  Relation heapRel, IndexUniqueCheck checkUnique, bool indexUnchanged,
+		  IndexInfo *indexInfo)
+{
+	RBIState   *state;
+	MemoryContext insertcxt;
+	MemoryContext oldcxt;
+	Datum		key;
+	uint64		code;
+	uint32		ckey;
+	uint16		lo;
+
+	rbi_check_key_offset(ht_ctid);
+
+	state = rbi_get_state(index);
+
+	insertcxt = AllocSetContextCreate(CurrentMemoryContext,
+									  "roaring index insert",
+									  ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(insertcxt);
+
+	code = rbi_tid_to_code(ht_ctid);
+	ckey = rbi_code_ckey(code);
+	lo = rbi_code_lo(code);
+
+	/*
+	 * A NULL value belongs to the reserved NULL entry, which lives in bucket 0
+	 * and is found by its flag rather than by its (absent) key (DESIGN.md
+	 * §14).  A multi-key opclass that extracts nothing from a non-NULL value
+	 * puts the row in the reserved EMPTY entry the same way (DESIGN.md §17).
+	 */
+	if (isnull[0])
+		rbi_insert_one(index, state, (Datum) 0, RBI_ENTRY_NULLKEY, ckey, lo);
+	else if (state->multikey)
+	{
+		Datum	   *keys;
+		int			nkeys = rbi_extract_value(state, values[0], &keys);
+		int			i;
+
+		if (nkeys == 0)
+			rbi_insert_one(index, state, (Datum) 0, RBI_ENTRY_EMPTYKEY,
+						   ckey, lo);
+		for (i = 0; i < nkeys; i++)
+		{
+			rbi_insert_one(index, state, keys[i], 0, ckey, lo);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	else
+	{
+		key = values[0];
+		if (!state->typbyval && state->typlen == -1)
+			key = PointerGetDatum(PG_DETOAST_DATUM(key));
+
+		rbi_insert_one(index, state, key, 0, ckey, lo);
+	}
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(insertcxt);

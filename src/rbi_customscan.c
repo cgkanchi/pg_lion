@@ -38,6 +38,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_amop.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
@@ -60,6 +61,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -93,8 +95,18 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 #define RBI_CLAUSE_ARRAY	1	/* col = ANY (const array), DESIGN.md §15 */
 #define RBI_CLAUSE_NULL		2	/* col IS NULL */
 #define RBI_CLAUSE_NOTNULL	3	/* col IS NOT NULL */
+#define RBI_CLAUSE_MULTI	4	/* col @> / && / @@ const, DESIGN.md §17 */
 
 #define RBI_CLAUSE_IS_POSITIVE(k)	((k) != RBI_CLAUSE_NOTNULL)
+
+/*
+ * Which clause kinds pin their column to ONE value, so that a target list
+ * asking for that column can be answered with the key the entry stored.  A
+ * multi-key clause pins nothing: `tags @> '{a}'` says what the array
+ * contains, not what it is.
+ */
+#define RBI_CLAUSE_PINS_VALUE(k) \
+	((k) == RBI_CLAUSE_EQ || (k) == RBI_CLAUSE_NULL)
 
 /*
  * An `IN` list longer than this is not pushed down: every listed value needs
@@ -132,7 +144,9 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
  *		group Var (for its type, typmod and collation) and a one-element
  *		OidList holding the equality operator the planner chose for it.  That
  *		operator is what the cross-partition TupleHashTable groups by.
- *	6	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
+ *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
+ *		test), which is what EXPLAIN prints a multi-key clause with
+ *	7	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define RBI_PRIV_OIDS		0
@@ -141,7 +155,8 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 #define RBI_PRIV_CLAUSEKINDS 3
 #define RBI_PRIV_PARTS		4
 #define RBI_PRIV_GROUPKEY	5
-#define RBI_PRIV_TLKINDS	6
+#define RBI_PRIV_CLAUSEOPS	6
+#define RBI_PRIV_TLKINDS	7
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -157,8 +172,10 @@ typedef struct RBIClauseState
 {
 	int			kind;			/* RBI_CLAUSE_* */
 	Oid			idxoid;
+	Oid			opno;			/* the clause's operator (0 for a null test) */
 	AttrNumber	attno;
-	Const	   *con;			/* value, array, or a NULL placeholder */
+	Const	   *con;			/* value, array, query, or a NULL placeholder */
+	StrategyNumber strategy;	/* RBI_CLAUSE_MULTI: 2, 3 or 5 */
 	Relation	idx;
 	Datum		storedkey;
 	bool		hasstoredkey;
@@ -303,12 +320,30 @@ rbi_strip(Node *node)
 }
 
 /*
+ * Does this opfamily extract many keys from one value (DESIGN.md §17)?  The
+ * presence of support function 2 is the same test rbi_fill_state() makes.
+ */
+static bool
+rbi_opfamily_is_multikey(Oid opfamily, Oid opcintype)
+{
+	return OidIsValid(get_opfamily_proc(opfamily, opcintype, opcintype,
+										RBI_EXTRACTVALUE_PROC));
+}
+
+/*
  * A usable roaring index on one plain column of rel, or NULL.  Only indexes
  * the planner put in rel->indexlist are considered, which already excludes
  * invalid ones (get_relation_info() skips !indisvalid).
+ *
+ * multikey selects between the two shapes of opclass, and the caller always
+ * knows which one it needs: a multi-key index's ENTRIES are keys and not
+ * column values, so it can answer `tags @> '{a}'` but can neither drive a
+ * GROUP BY (the entries would be lexemes, not arrays) nor be summed over
+ * (a row appears under each of its keys, so the sum of the entries is not
+ * the number of rows - which is what DESIGN.md §14's sum-over-all rests on).
  */
 static IndexOptInfo *
-rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno)
+rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
 {
 	Oid			amoid = rbi_get_am_oid();
 	ListCell   *lc;
@@ -327,6 +362,9 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno)
 			continue;
 		if (idx->indexkeys[0] != attno)
 			continue;
+		if (rbi_opfamily_is_multikey(idx->opfamily[0],
+									 idx->opcintype[0]) != multikey)
+			continue;
 
 		return idx;
 	}
@@ -337,38 +375,156 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno)
 /*
  * The same, but for a column a particular clause is applied to.
  *
- * opno is the clause's operator, InvalidOid for a null test: it has to be
- * strategy 1 of the index's opfamily (the index's opfamily and the operator
- * Oid, so cross-type integer equality is fine).  cmptype is the type the
- * column is compared with, InvalidOid for a null test: the opfamily must be
- * able to compare it with the indexed type and to hash it, or the lookup in
- * rbi_count.c would fail at run time.
+ * For a scalar clause (`=`, `= ANY`, a null test) opno has to be strategy 1
+ * of the index's opfamily (the index's opfamily and the operator Oid, so
+ * cross-type integer equality is fine), and cmptype - the type the column is
+ * compared with, InvalidOid for a null test - has to be one the opfamily can
+ * compare with the indexed type and can hash, or the lookup in rbi_count.c
+ * would fail at run time.
+ *
+ * For a multi-key clause (DESIGN.md §17) the index must be a multi-key one
+ * whose opfamily gives opno the strategy the planner decided on, and whose
+ * extractQuery function is the very one the plan-time extraction used: the
+ * plan was only made because that function called the query exact, and a
+ * different function might not.
  *
  * Every partition is checked separately, because nothing stops one of them
  * from carrying a roaring index built with a different opclass.
  */
 static IndexOptInfo *
-rbi_match_index(RelOptInfo *rel, AttrNumber attno, Oid opno, Oid cmptype)
+rbi_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
+				Oid cmptype, StrategyNumber strategy, Oid extractquery)
 {
-	IndexOptInfo *idx = rbi_find_roaring_index(rel, attno);
+	bool		multikey = (kind == RBI_CLAUSE_MULTI);
+	IndexOptInfo *idx = rbi_find_roaring_index(rel, attno, multikey);
 
 	if (idx == NULL)
 		return NULL;
 
+	if (multikey)
+	{
+		if (get_op_opfamily_strategy(opno, idx->opfamily[0]) != strategy)
+			return NULL;
+		if (get_opfamily_proc(idx->opfamily[0], idx->opcintype[0],
+							  idx->opcintype[0],
+							  RBI_EXTRACTQUERY_PROC) != extractquery)
+			return NULL;
+		return idx;
+	}
+
 	if (OidIsValid(opno) &&
-		get_op_opfamily_strategy(opno, idx->opfamily[0]) != 1)
+		get_op_opfamily_strategy(opno, idx->opfamily[0]) != RBI_STRAT_EQUAL)
 		return NULL;
 
 	if (OidIsValid(cmptype))
 	{
 		if (!OidIsValid(get_opfamily_member(idx->opfamily[0],
-											idx->opcintype[0], cmptype, 1)))
+											idx->opcintype[0], cmptype,
+											RBI_STRAT_EQUAL)))
 			return NULL;
-		if (!OidIsValid(get_opfamily_proc(idx->opfamily[0], cmptype, cmptype, 1)))
+		if (!OidIsValid(get_opfamily_proc(idx->opfamily[0], cmptype, cmptype,
+										  RBI_HASH_PROC)))
 			return NULL;
 	}
 
 	return idx;
+}
+
+/*
+ * The strategy number an operator has in some roaring opfamily, with that
+ * family and the type its members are declared on.  Returns 0 when no roaring
+ * family knows the operator.
+ *
+ * The clause analysis has to tell a multi-key clause from an equality one
+ * BEFORE any index has been matched, because the parent of a partitioned
+ * table has no index list of its own (DESIGN.md §16) and the answer decides
+ * what the clause even means.  Taking it from the operator rather than from
+ * an index is safe because rbi_match_index() checks the strategy again
+ * against the index that will really answer the clause, per partition.
+ */
+static StrategyNumber
+rbi_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
+{
+	Oid			amoid = rbi_get_am_oid();
+	CatCList   *catlist;
+	StrategyNumber result = 0;
+	int			i;
+
+	*opfamily = InvalidOid;
+	*lefttype = InvalidOid;
+
+	catlist = SearchSysCacheList1(AMOPOPID, ObjectIdGetDatum(opno));
+	for (i = 0; i < catlist->n_members; i++)
+	{
+		Form_pg_amop amop =
+			(Form_pg_amop) GETSTRUCT(&catlist->members[i]->tuple);
+
+		if (amop->amopmethod != amoid || amop->amoppurpose != AMOP_SEARCH)
+			continue;
+
+		result = amop->amopstrategy;
+		*opfamily = amop->amopfamily;
+		*lefttype = amop->amoplefttype;
+		break;
+	}
+	ReleaseSysCacheList(catlist);
+
+	return result;
+}
+
+/*
+ * Extract a multi-key query at plan time and say whether the posting sets can
+ * answer it exactly (DESIGN.md §17).  Only then is the clause pushed down:
+ * an ALL-mode query would need every row rechecked against the heap, which is
+ * what the ordinary bitmap plan already does and does better.
+ *
+ * *extractquery receives the support function used, which rbi_match_index()
+ * then insists on finding on every index that will answer the clause, so that
+ * the run-time extraction cannot come out differently from this one.
+ */
+static bool
+rbi_multikey_query_is_exact(Oid opfamily, Oid lefttype,
+							StrategyNumber strategy, Const *con,
+							Oid *extractquery)
+{
+	FmgrInfo	flinfo;
+	RBIQuery	q;
+	RBIState	state;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	bool		exact;
+
+	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
+									  RBI_EXTRACTQUERY_PROC);
+	if (!OidIsValid(*extractquery))
+		return false;
+
+	/*
+	 * rbi_extract_query() wants an RBIState, but only for the extractQuery
+	 * FmgrInfo and the collation; nothing here touches an index.  The
+	 * collation of a query is the clause's own, which for the collatable key
+	 * types the multi-key classes use (text lexemes, text array elements) is
+	 * what the extraction functions ignore anyway - they take the query
+	 * apart, they do not compare it.
+	 */
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"roaring count query extract",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	memset(&state, 0, sizeof(state));
+	state.multikey = true;
+	state.collation = con->constcollid;
+	fmgr_info(*extractquery, &flinfo);
+	state.extractquery = flinfo;
+
+	rbi_extract_query(&state, con->constvalue, strategy, &q);
+	exact = (q.mode == RBI_QMODE_KEYS);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	return exact;
 }
 
 /*
@@ -431,16 +587,29 @@ rbi_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
  * means everything was pruned away; the caller leaves that to the planner's
  * own dummy-rel handling.
  */
+/*
+ * Everything rbi_match_index() needs about one clause, gathered once by the
+ * clause analysis and reused for every relation.
+ */
+typedef struct RBIClauseInfo
+{
+	AttrNumber	attno;			/* in the PARENT's numbering */
+	int			kind;			/* RBI_CLAUSE_* */
+	Oid			opno;			/* 0 for a null test */
+	Oid			cmptype;		/* the type the column is compared with */
+	StrategyNumber strategy;	/* multi-key clauses only */
+	Oid			extractquery;	/* multi-key clauses only */
+} RBIClauseInfo;
+
 static bool
 rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
-					List *whereattnos, List *whereopnos, List *wherecmptypes,
+					List *whereattnos, List *clauseinfos,
 					List **targets)
 {
 	RangeTblEntry *rte;
 	RBICountTarget *t;
 	ListCell   *l1;
 	ListCell   *l2;
-	ListCell   *l3;
 
 	/* Sub-partitioning nests, exactly as expand_partitioned_rtentry() does. */
 	check_stack_depth();
@@ -492,7 +661,7 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 			}
 
 			if (!rbi_collect_targets(root, child, cdrive, cattnos,
-									 whereopnos, wherecmptypes, targets))
+									 clauseinfos, targets))
 				return false;
 		}
 		return true;
@@ -513,17 +682,24 @@ rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
 	t->rel = rel;
 	t->heapoid = rte->relid;
 
+	/*
+	 * The driving index - a GROUP BY column's, or the one DESIGN.md §14 sums
+	 * over - must be a scalar one: its entries have to be the column's
+	 * values, one per row.
+	 */
 	if (driveattno != 0)
 	{
-		t->driveidx = rbi_match_index(rel, driveattno, InvalidOid, InvalidOid);
+		t->driveidx = rbi_find_roaring_index(rel, driveattno, false);
 		if (t->driveidx == NULL)
 			return false;
 	}
 
-	forthree(l1, whereattnos, l2, whereopnos, l3, wherecmptypes)
+	forboth(l1, whereattnos, l2, clauseinfos)
 	{
+		RBIClauseInfo *ci = (RBIClauseInfo *) lfirst(l2);
 		IndexOptInfo *idx = rbi_match_index(rel, (AttrNumber) lfirst_int(l1),
-											lfirst_oid(l2), lfirst_oid(l3));
+											ci->kind, ci->opno, ci->cmptype,
+											ci->strategy, ci->extractquery);
 
 		if (idx == NULL)
 			return false;
@@ -799,11 +975,11 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		sumall = false;
 	bool		partitioned = false;
 	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
-	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
-	List	   *wherecmptypes = NIL;	/* the type it compares with (0 likewise) */
+	List	   *clauseinfos = NIL;	/* RBIClauseInfo, one per clause */
 	List	   *whereclauses = NIL; /* the clause, for selectivity */
 	List	   *whereconsts = NIL;	/* its Const (a placeholder for a null test) */
 	List	   *wherekinds = NIL;	/* RBI_CLAUSE_* */
+	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
 	List	   *posattnos = NIL;	/* columns with a positive clause */
 	List	   *eqattnos = NIL;		/* columns pinned to one value */
 	List	   *nonnullattnos = NIL;	/* columns a clause proves non-null */
@@ -940,6 +1116,9 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		Const	   *con = NULL;
 		Oid			opno = InvalidOid;	/* operator the index must know */
 		Oid			cmptype = InvalidOid;	/* type the index is compared with */
+		StrategyNumber strategy = 0;	/* multi-key clauses only */
+		Oid			extractquery = InvalidOid;
+		RBIClauseInfo *ci;
 		int			kind;
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
@@ -952,6 +1131,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			OpExpr	   *op = (OpExpr *) clause;
 			Node	   *left;
 			Node	   *right;
+			Oid			opfamily;
+			Oid			lefttype;
 
 			if (list_length(op->args) != 2)
 				return;
@@ -963,25 +1144,64 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			if (left == NULL || right == NULL)
 				return;
 
-			if (IsA(left, Var) && IsA(right, Const))
+			strategy = rbi_op_roaring_strategy(op->opno, &opfamily, &lefttype);
+
+			if (strategy == RBI_STRAT_EQUAL)
 			{
+				/* Equality commutes, so either side may hold the column. */
+				if (IsA(left, Var) && IsA(right, Const))
+				{
+					var = (Var *) left;
+					con = (Const *) right;
+				}
+				else if (IsA(left, Const) && IsA(right, Var))
+				{
+					var = (Var *) right;
+					con = (Const *) left;
+				}
+				else
+					return;
+
+				if (con->constisnull)
+					return;
+
+				opno = op->opno;
+				cmptype = con->consttype;
+				kind = RBI_CLAUSE_EQ;
+			}
+			else if (strategy == RBI_STRAT_CONTAINS ||
+					 strategy == RBI_STRAT_OVERLAP ||
+					 strategy == RBI_STRAT_MATCH)
+			{
+				/*
+				 * A multi-key operator (DESIGN.md §17).  Unlike equality it
+				 * does not commute - `'{a}' @> tags` is a containment the
+				 * other way round, which is strategy 4 and not pushed down -
+				 * so the column has to be the left operand.
+				 */
+				if (!IsA(left, Var) || !IsA(right, Const))
+					return;
 				var = (Var *) left;
 				con = (Const *) right;
-			}
-			else if (IsA(left, Const) && IsA(right, Var))
-			{
-				var = (Var *) right;
-				con = (Const *) left;
+				if (con->constisnull)
+					return;
+
+				/*
+				 * Only an EXACT query is pushed down.  `tags @> '{}'`, `<@`,
+				 * a tsquery with NOT/phrase/prefix/weights and anything with
+				 * a NULL element all want every row rechecked in the heap,
+				 * which is what the ordinary plan does anyway.
+				 */
+				if (!rbi_multikey_query_is_exact(opfamily, lefttype, strategy,
+												 con, &extractquery))
+					return;
+
+				opno = op->opno;
+				cmptype = InvalidOid;	/* the query is not a key */
+				kind = RBI_CLAUSE_MULTI;
 			}
 			else
-				return;
-
-			if (con->constisnull)
-				return;
-
-			opno = op->opno;
-			cmptype = con->consttype;
-			kind = RBI_CLAUSE_EQ;
+				return;			/* strategy 4 (`<@`), or not ours at all */
 		}
 		else if (IsA(clause, ScalarArrayOpExpr))
 		{
@@ -1012,6 +1232,20 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			nelems = rbi_array_const_nelems(con);
 			if (nelems < 0 || nelems > RBI_MAX_ARRAY_ELEMS)
 				return;
+
+			/*
+			 * `col op ANY (array)` is a union of single-key lookups, so the
+			 * operator has to be equality; `tags @> ANY (...)` would be a
+			 * union of multi-key queries, which nothing here builds.
+			 */
+			{
+				Oid			opfamily;
+				Oid			lefttype;
+
+				if (rbi_op_roaring_strategy(saop->opno, &opfamily,
+											&lefttype) != RBI_STRAT_EQUAL)
+					return;
+			}
 
 			opno = saop->opno;
 			cmptype = get_element_type(con->consttype);
@@ -1052,13 +1286,19 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 */
 
 		if (RBI_CLAUSE_IS_POSITIVE(kind))
+			havepositive = true;
+
+		if (RBI_CLAUSE_IS_POSITIVE(kind) && kind != RBI_CLAUSE_MULTI)
 		{
 			/*
 			 * At most one positive clause per column: the same clause twice
 			 * is just a duplicate, two different ones mean the query selects
 			 * little or nothing and we would rather leave that to the normal
 			 * plan.  `IS NOT NULL` is not subject to this - it constrains
-			 * nothing by itself and is simply subtracted.
+			 * nothing by itself and is simply subtracted - and neither is a
+			 * multi-key clause, whose sources intersect exactly as two
+			 * clauses on different columns do (`tags @> '{a}' AND
+			 * tags && '{b,c}'` is one AND of three key sets).
 			 */
 			if (list_member_int(posattnos, (int) var->varattno))
 			{
@@ -1081,7 +1321,6 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				continue;
 			}
 			posattnos = lappend_int(posattnos, (int) var->varattno);
-			havepositive = true;
 		}
 
 		switch (kind)
@@ -1096,6 +1335,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
 				break;
 			case RBI_CLAUSE_ARRAY:
+			case RBI_CLAUSE_MULTI:
+				/* a strict operator with a non-NULL constant */
 				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
 				break;
 			case RBI_CLAUSE_NULL:
@@ -1103,12 +1344,20 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				break;
 		}
 
+		ci = (RBIClauseInfo *) palloc0(sizeof(RBIClauseInfo));
+		ci->attno = var->varattno;
+		ci->kind = kind;
+		ci->opno = opno;
+		ci->cmptype = cmptype;
+		ci->strategy = strategy;
+		ci->extractquery = extractquery;
+
 		whereattnos = lappend_int(whereattnos, (int) var->varattno);
-		whereopnos = lappend_oid(whereopnos, opno);
-		wherecmptypes = lappend_oid(wherecmptypes, cmptype);
+		clauseinfos = lappend(clauseinfos, ci);
 		whereclauses = lappend(whereclauses, clause);
 		whereconsts = lappend(whereconsts, con);
 		wherekinds = lappend_int(wherekinds, kind);
+		whereopnos = lappend_oid(whereopnos, opno);
 	}
 
 	/* Something has to drive the count. */
@@ -1180,7 +1429,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * up, because partitions may number their columns differently.
 	 */
 	if (!rbi_collect_targets(root, input_rel, driveattno, whereattnos,
-							 whereopnos, wherecmptypes, &targets))
+							 clauseinfos, &targets))
 		return;
 	if (targets == NIL)
 		return;					/* everything was pruned: leave it to the planner */
@@ -1257,6 +1506,12 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (groupvar != NULL)
 		groupkey = list_make2(copyObject(groupvar), list_make1_oid(groupeqop));
 
+	/*
+	 * The strategy of a multi-key clause travels with its operator: the
+	 * executor re-extracts the query and EXPLAIN prints the operator's name,
+	 * and both need the Oid.
+	 */
+
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = output_rel;
@@ -1271,6 +1526,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->custom_restrictinfo = NIL;
 	cpath->custom_private = list_make5(oids, ints, consts, ckinds, parts);
 	cpath->custom_private = lappend(cpath->custom_private, groupkey);
+	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
 	cpath->methods = &rbi_count_path_methods;
 
 	rbi_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
@@ -1596,6 +1852,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
 	List	   *partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
 	List	   *groupkey = (List *) list_nth(cscan->custom_private, RBI_PRIV_GROUPKEY);
+	List	   *clauseops = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEOPS);
 	List	   *kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
 	int			flags;
 	int			i;
@@ -1623,6 +1880,8 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->clause[i].idxoid = list_nth_oid(oids, 2 + i);
 		st->clause[i].attno = (AttrNumber) list_nth_int(ints, 3 + i);
 		st->clause[i].con = (Const *) list_nth(consts, i);
+		st->clause[i].opno = list_nth_oid(clauseops, i);
+		st->clause[i].strategy = 0;
 	}
 
 	/* One target per live leaf partition, in the planner's order. */
@@ -1772,6 +2031,55 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 }
 
 /*
+ * Locate the posting sets of one multi-key clause (DESIGN.md §17).
+ *
+ * The query is extracted again here, with the index's OWN extractQuery
+ * function - which rbi_match_index() has already insisted is the one the
+ * planner used - so the keys and the boolean tree are the same the plan was
+ * costed with.  The tree becomes the source's combining expression; the
+ * merge in rbi_count.c evaluates it over the sets with the same cursors it
+ * uses for an IN list, so the DESIGN.md §9 pin discipline is unchanged.
+ */
+static void
+rbi_locate_multikey(RBICountScanState *st, RBIClauseState *cl,
+					RBICountSource *src)
+{
+	RBIState   *istate = rbi_get_state(cl->idx);
+	RBIQuery	q;
+	int			i;
+
+	rbi_extract_query(istate, cl->con->constvalue,
+					  (StrategyNumber) get_op_opfamily_strategy(cl->opno,
+																cl->idx->rd_opfamily[0]),
+					  &q);
+
+	/*
+	 * The plan was only made because this extraction came out exact
+	 * (rbi_multikey_query_is_exact()), against this very function and this
+	 * very constant.  A different answer now would mean the count could
+	 * silently miss rows, so say so instead.
+	 */
+	if (q.mode != RBI_QMODE_KEYS)
+		elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+			 RelationGetRelationName(cl->idx));
+
+	src->sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * q.nkeys);
+	src->nsets = q.nkeys;
+	src->tree = q.tree;
+
+	for (i = 0; i < q.nkeys; i++)
+	{
+		(void) rbi_posting_set_lookup(cl->idx, q.keys[i], InvalidOid,
+									  &src->sets[i]);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* An AND over a key with no entry at all selects nothing anywhere. */
+	if (!rbi_sets_satisfiable(src->nsets, src->sets, src->tree))
+		st->wheremissing = true;
+}
+
+/*
  * Remember the key a clause's entry holds, so that a target list which prints
  * the pinned column can report it after the posting set is gone.  The first
  * relation that has the key wins; with partitions the others hold a key that
@@ -1843,6 +2151,10 @@ rbi_locate_where(RBICountScanState *st)
 				rbi_locate_array(st, cl, src);
 				break;
 
+			case RBI_CLAUSE_MULTI:
+				rbi_locate_multikey(st, cl, src);
+				break;
+
 			case RBI_CLAUSE_NULL:
 			case RBI_CLAUSE_NOTNULL:
 				src->sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet));
@@ -1868,8 +2180,7 @@ rbi_locate_where(RBICountScanState *st)
 		 * Only a clause that pins the column to ONE value can have its key
 		 * printed, and those are the ones with a single set.
 		 */
-		if ((cl->kind == RBI_CLAUSE_EQ || cl->kind == RBI_CLAUSE_NULL) &&
-			src->nsets == 1)
+		if (RBI_CLAUSE_PINS_VALUE(cl->kind) && src->nsets == 1)
 			rbi_save_clause_key(st, cl, &src->sets[0]);
 	}
 
@@ -1894,6 +2205,7 @@ rbi_release_where(RBICountScanState *st)
 			rbi_posting_set_release(&src->sets[j]);
 		src->nsets = 0;
 		src->sets = NULL;
+		src->tree = NULL;		/* it lived in wherecxt, reset below */
 	}
 	if (st->wherecxt != NULL)
 		MemoryContextReset(st->wherecxt);
@@ -2464,7 +2776,8 @@ rbi_end_custom_scan(CustomScanState *node)
 }
 
 /*
- * "col = 3", "col = ANY ('{1,2,3}')", "col IS NULL", "col IS NOT NULL".
+ * "col = 3", "col = ANY ('{1,2,3}')", "col IS NULL", "col IS NOT NULL",
+ * "tags @> {a,b}", "tsv @@ 'a' & 'b'".
  */
 static void
 rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, StringInfo buf)
@@ -2489,6 +2802,13 @@ rbi_explain_clause(RBICountScanState *st, RBIClauseState *cl, StringInfo buf)
 				val = OidOutputFunctionCall(outfunc, cl->con->constvalue);
 				if (cl->kind == RBI_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s = ANY (%s)", attname, val);
+				else if (cl->kind == RBI_CLAUSE_MULTI)
+				{
+					char	   *opname = get_opname(cl->opno);
+
+					appendStringInfo(buf, "%s %s %s", attname, opname, val);
+					pfree(opname);
+				}
 				else
 					appendStringInfo(buf, "%s = %s", attname, val);
 				pfree(val);

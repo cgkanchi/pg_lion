@@ -41,18 +41,22 @@ PG_MODULE_MAGIC_EXT(
 
 PG_FUNCTION_INFO_V1(roaring_handler);
 
-/* Number of strategies and support procedures of a roaring opclass */
-#define RBI_NSTRATEGIES		1
-#define RBI_NPROC			1
-#define RBI_HASH_PROC		1
-#define RBI_EQUAL_STRATEGY	1
+/*
+ * Strategies and support procedure numbers live in rbi.h, because build,
+ * insert, scan and count all need them.  The multi-key strategies of
+ * DESIGN.md §17 are 2 .. 5; a scalar opclass has only strategy 1.
+ */
+#define RBI_MULTI_STRATEGY_MASK \
+	((1 << RBI_STRAT_CONTAINS) | (1 << RBI_STRAT_OVERLAP) | \
+	 (1 << RBI_STRAT_CONTAINED) | (1 << RBI_STRAT_MATCH))
 
 /* Kind of relation options for roaring indexes */
 static relopt_kind rbi_relopt_kind;
 
 static const relopt_parse_elt rbi_relopt_tab[] = {
 	{"buckets", RELOPT_TYPE_INT, offsetof(RBIOptions, buckets)},
-	{"inline_limit", RELOPT_TYPE_INT, offsetof(RBIOptions, inline_limit)}
+	{"inline_limit", RELOPT_TYPE_INT, offsetof(RBIOptions, inline_limit)},
+	{"max_entries", RELOPT_TYPE_INT, offsetof(RBIOptions, max_entries)}
 };
 
 /*
@@ -79,6 +83,10 @@ _PG_init(void)
 					  RBI_DEFAULT_INLINE_LIMIT, RBI_MIN_INLINE_LIMIT,
 					  RBI_MAX_INLINE_LIMIT,
 					  AccessExclusiveLock);
+	add_int_reloption(rbi_relopt_kind, "max_entries",
+					  "Distinct keys above which the index warns once per backend (0 disables)",
+					  RBI_DEFAULT_MAX_ENTRIES, 0, INT_MAX,
+					  ShareUpdateExclusiveLock);
 
 	DefineCustomBoolVariable("roaring_index.enable_count_pushdown",
 							 "Answer count(*) over roaring indexes from the index and the visibility map.",
@@ -109,6 +117,14 @@ roaring_handler(PG_FUNCTION_ARGS)
 		.amcanorder = false,
 		.amcanorderbyop = false,
 		.amcanhash = false,
+
+		/*
+		 * Every operator of a roaring opfamily agrees on one equivalence
+		 * relation: a scalar family holds nothing but equality operators
+		 * (cross-type ones included), and a multi-key family holds nothing
+		 * but containment/match operators and no equality at all, so
+		 * equality_ops_are_compatible() is never asked about two of those.
+		 */
 		.amconsistentequality = true,
 		.amconsistentordering = false,
 		.amcanbackward = false,
@@ -117,7 +133,8 @@ roaring_handler(PG_FUNCTION_ARGS)
 		.amoptionalkey = false,
 		.amsearcharray = true,
 		.amsearchnulls = true,
-		.amstorage = false,
+		/* multi-key opclasses store the KEY type, not the column type (§17) */
+		.amstorage = true,
 		.amclusterable = false,
 		.ampredlocks = false,
 		.amcanparallel = false,
@@ -194,11 +211,25 @@ rbicostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 }
 
 /*
- * Validator for a roaring opclass.  Modelled on hashvalidate()/blvalidate():
- * support procedure 1 must be a hash function returning int4, and strategy 1
- * must be an equality operator.  The support function's argument type only
- * has to be binary-coercible from the opclass input type, so that e.g. a
- * varchar column can use text_ops.
+ * Validator for a roaring opclass.  Modelled on hashvalidate()/ginvalidate().
+ *
+ * There are two shapes of roaring opclass and they are validated differently
+ * (DESIGN.md §6 and §17):
+ *
+ *	scalar		support proc 1 is a hash function returning int4 and strategy
+ *				1 is equality, exactly as a hash opclass.  Its support
+ *				function's argument type only has to be binary-coercible from
+ *				the opclass input type, so that e.g. a varchar column can use
+ *				text_ops, and every type an operator mentions must have a hash
+ *				function in the family, which is what makes cross-type
+ *				equality usable.
+ *
+ *	multi-key	support procs 2 and 3 are GIN's extractValue and extractQuery
+ *				and the strategies are 2 .. 5.  The keys are of the STORAGE
+ *				type, so proc 1 - when there is one - hashes THAT and not the
+ *				opclass input type; a polymorphic STORAGE type (array_ops
+ *				stores anyelement) cannot name one function at all and the key
+ *				type's default hash opclass is used instead.
  */
 bool
 rbivalidate(Oid opclassoid)
@@ -216,6 +247,8 @@ rbivalidate(Oid opclassoid)
 	List	   *grouplist;
 	OpFamilyOpFuncGroup *opclassgroup;
 	List	   *hashabletypes = NIL;
+	bool		multikey = false;
+	bool		haveop = false;
 	int			i;
 	ListCell   *lc;
 
@@ -235,6 +268,22 @@ rbivalidate(Oid opclassoid)
 
 	oprlist = SearchSysCacheList1(AMOPSTRATEGY, ObjectIdGetDatum(opfamilyoid));
 	proclist = SearchSysCacheList1(AMPROCNUM, ObjectIdGetDatum(opfamilyoid));
+
+	/*
+	 * Which shape is this?  An extractValue procedure for the opclass's own
+	 * type is what makes an opclass multi-key, and it is the same test
+	 * rbi_fill_state() makes at run time (through index_getprocid()).
+	 */
+	for (i = 0; i < proclist->n_members; i++)
+	{
+		Form_pg_amproc procform =
+			(Form_pg_amproc) GETSTRUCT(&proclist->members[i]->tuple);
+
+		if (procform->amprocnum == RBI_EXTRACTVALUE_PROC &&
+			procform->amproclefttype == opcintype &&
+			procform->amprocrighttype == opcintype)
+			multikey = true;
+	}
 
 	/* Check individual support functions */
 	for (i = 0; i < proclist->n_members; i++)
@@ -256,8 +305,29 @@ rbivalidate(Oid opclassoid)
 		switch (procform->amprocnum)
 		{
 			case RBI_HASH_PROC:
-				ok = check_amproc_signature(procform->amproc, INT4OID, false,
-											1, 1, procform->amproclefttype);
+				if (multikey)
+					ok = check_amproc_signature(procform->amproc, INT4OID,
+												false, 1, 1, opckeytype);
+				else
+					ok = check_amproc_signature(procform->amproc, INT4OID,
+												false, 1, 1,
+												procform->amproclefttype);
+				break;
+			case RBI_EXTRACTVALUE_PROC:
+				/* GIN's extractValue; some opclasses omit nullFlags */
+				ok = check_amproc_signature(procform->amproc, INTERNALOID,
+											false, 2, 3,
+											procform->amproclefttype,
+											INTERNALOID, INTERNALOID);
+				break;
+			case RBI_EXTRACTQUERY_PROC:
+				/* GIN's extractQuery; some omit nullFlags and searchMode */
+				ok = check_amproc_signature(procform->amproc, INTERNALOID,
+											false, 5, 7,
+											procform->amproclefttype,
+											INTERNALOID, INT2OID, INTERNALOID,
+											INTERNALOID, INTERNALOID,
+											INTERNALOID);
 				break;
 			default:
 				ereport(INFO,
@@ -270,6 +340,24 @@ rbivalidate(Oid opclassoid)
 				continue;		/* don't want additional message */
 		}
 
+		/*
+		 * The two extraction procedures only make sense together: an opclass
+		 * with extractQuery but no extractValue would search for keys it
+		 * never stored.  Only the opclass's own type pair can be judged here,
+		 * for the same reason ginvalidate() gives.
+		 */
+		if (procform->amprocnum != RBI_HASH_PROC && !multikey &&
+			procform->amproclefttype == opcintype)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator class \"%s\" of access method %s has support function %s but no support function %d",
+							opclassname, "roaring",
+							format_procedure(procform->amproc),
+							RBI_EXTRACTVALUE_PROC)));
+			result = false;
+		}
+
 		if (!ok)
 		{
 			ereport(INFO,
@@ -280,7 +368,7 @@ rbivalidate(Oid opclassoid)
 							procform->amprocnum)));
 			result = false;
 		}
-		else
+		else if (procform->amprocnum == RBI_HASH_PROC && !multikey)
 			hashabletypes = list_append_unique_oid(hashabletypes,
 												   procform->amproclefttype);
 	}
@@ -290,9 +378,23 @@ rbivalidate(Oid opclassoid)
 	{
 		HeapTuple	oprtup = &oprlist->members[i]->tuple;
 		Form_pg_amop oprform = (Form_pg_amop) GETSTRUCT(oprtup);
+		bool		stratok;
 
-		if (oprform->amopstrategy < 1 ||
-			oprform->amopstrategy > RBI_NSTRATEGIES)
+		haveop = true;
+
+		/*
+		 * A scalar family answers equality and nothing else; a multi-key one
+		 * answers the containment/match strategies and never equality (the
+		 * keys of one row are not the row's value, so `=` could not be
+		 * answered from them).
+		 */
+		stratok = multikey ?
+			(oprform->amopstrategy >= 1 &&
+			 oprform->amopstrategy <= RBI_NSTRATEGIES &&
+			 (RBI_MULTI_STRATEGY_MASK & (1 << oprform->amopstrategy)) != 0) :
+			(oprform->amopstrategy == RBI_STRAT_EQUAL);
+
+		if (!stratok)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -326,9 +428,16 @@ rbivalidate(Oid opclassoid)
 			result = false;
 		}
 
-		/* Every type used by an operator must be hashable by this family */
-		if (!list_member_oid(hashabletypes, oprform->amoplefttype) ||
-			!list_member_oid(hashabletypes, oprform->amoprighttype))
+		/*
+		 * Every type used by an operator must be hashable by this family:
+		 * that is what lets a cross-type equality use the index, because the
+		 * search value is hashed with its OWN type's function.  A multi-key
+		 * family hashes keys and not the types its operators mention, so the
+		 * rule does not apply to it.
+		 */
+		if (!multikey &&
+			(!list_member_oid(hashabletypes, oprform->amoplefttype) ||
+			 !list_member_oid(hashabletypes, oprform->amoprighttype)))
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -350,7 +459,15 @@ rbivalidate(Oid opclassoid)
 			thisgroup->righttype == opcintype)
 			opclassgroup = thisgroup;
 
-		if (thisgroup->operatorset != (1 << RBI_EQUAL_STRATEGY))
+		/*
+		 * A scalar family must offer equality for every type pair it knows
+		 * about.  A multi-key family cannot be checked that way: its
+		 * operators and its support functions do not even share a type pair
+		 * (tsvector_ops has @@(tsvector,tsquery) and procs on
+		 * (tsvector,tsvector)), so the per-operator and per-class checks
+		 * above and below are all there is.
+		 */
+		if (!multikey && thisgroup->operatorset != (1 << RBI_STRAT_EQUAL))
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -363,22 +480,57 @@ rbivalidate(Oid opclassoid)
 	}
 
 	/* The opclass itself must be complete */
-	if (!opclassgroup ||
-		(opclassgroup->functionset & (((uint64) 1) << RBI_HASH_PROC)) == 0)
+	if (multikey)
 	{
-		ereport(INFO,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("operator class \"%s\" of access method %s is missing support function %d",
-						opclassname, "roaring", RBI_HASH_PROC)));
-		result = false;
+		uint64		want = (((uint64) 1) << RBI_EXTRACTVALUE_PROC) |
+			(((uint64) 1) << RBI_EXTRACTQUERY_PROC);
+
+		/*
+		 * A hash function for the key type is required unless the key type is
+		 * polymorphic, in which case there is no single function to name and
+		 * the key type's default hash opclass answers instead
+		 * (rbi_fill_state()).
+		 */
+		if (!IsPolymorphicType(opckeytype))
+			want |= ((uint64) 1) << RBI_HASH_PROC;
+
+		if (!opclassgroup || (opclassgroup->functionset & want) != want)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator class \"%s\" of access method %s is missing support function(s)",
+							opclassname, "roaring")));
+			result = false;
+		}
+
+		if (!haveop)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator class \"%s\" of access method %s is missing operator(s)",
+							opclassname, "roaring")));
+			result = false;
+		}
 	}
-	if (!opclassgroup)
+	else
 	{
-		ereport(INFO,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("operator class \"%s\" of access method %s is missing operator(s)",
-						opclassname, "roaring")));
-		result = false;
+		if (!opclassgroup ||
+			(opclassgroup->functionset & (((uint64) 1) << RBI_HASH_PROC)) == 0)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator class \"%s\" of access method %s is missing support function %d",
+							opclassname, "roaring", RBI_HASH_PROC)));
+			result = false;
+		}
+		if (!opclassgroup)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator class \"%s\" of access method %s is missing operator(s)",
+							opclassname, "roaring")));
+			result = false;
+		}
 	}
 
 	ReleaseCatCacheList(proclist);

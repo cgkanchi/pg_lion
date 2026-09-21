@@ -3,11 +3,16 @@
  * rbi_build.c
  *		ambuild for the roaring index (DESIGN.md section 5, BUILD).
  *
- * The heap is scanned once into a tuplesort of (hash int4, key, code int8)
- * sorted by (hash, code).  A first pass over the sorted data counts distinct
- * keys so that the bucket count can be chosen; a second pass groups the codes
- * of each key into containers and writes the posting sets out, either inline
- * in the entry tuple or as a chain of container pages.
+ * The heap is scanned once into a tuplesort of (hash int4, key, code int8,
+ * kind int2) sorted by (hash, code).  A first pass over the sorted data counts
+ * distinct keys so that the bucket count can be chosen; a second pass groups
+ * the codes of each key into containers and writes the posting sets out,
+ * either inline in the entry tuple or as a chain of container pages.
+ *
+ * A multi-key opclass (DESIGN.md §17) turns one heap row into one sort tuple
+ * per distinct key it extracts, all carrying the same code; nothing else in
+ * the build changes, because the sort orders the codes of each key
+ * ascending either way.
  *
  *-------------------------------------------------------------------------
  */
@@ -39,6 +44,24 @@
 #define RBI_BUCKET_FILL_BYTES	((Size) (BLCKSZ / 4 * 3))
 
 /*
+ * Which entry a sorted tuple belongs to.  A row contributes one tuple per
+ * distinct extracted key, or exactly one RBI_KEY_NULL / RBI_KEY_EMPTY tuple
+ * when it has no key at all; the two reserved kinds are told apart by this
+ * flag rather than by the (absent) key, and they share hash 0 with any real
+ * key that happens to hash there.
+ */
+#define RBI_KEY_REAL	0
+#define RBI_KEY_NULL	1		/* the indexed value is NULL (DESIGN.md §14) */
+#define RBI_KEY_EMPTY	2		/* no keys were extracted (DESIGN.md §17) */
+
+static inline uint16
+rbi_reserved_flag(int kind)
+{
+	Assert(kind == RBI_KEY_NULL || kind == RBI_KEY_EMPTY);
+	return (kind == RBI_KEY_NULL) ? RBI_ENTRY_NULLKEY : RBI_ENTRY_EMPTYKEY;
+}
+
+/*
  * One posting set under construction.  Items are produced in ascending ckey
  * order and kept in an inline buffer until they no longer fit in
  * inline_limit bytes; after that the entry spills to a chain of container
@@ -57,7 +80,7 @@
 typedef struct RBIBuilder
 {
 	Datum		key;			/* private copy of the key */
-	bool		isnull;			/* the reserved NULL key (DESIGN.md §14) */
+	int			keykind;		/* RBI_KEY_* */
 	uint32		hash;
 
 	bool		hasgroup;		/* curckey is a ckey group being collected */
@@ -89,6 +112,9 @@ typedef struct RBIBuildState
 	RBIState	state;
 	uint32		nbuckets;
 	uint32		inline_limit;
+
+	bool		multikey;		/* the opclass extracts keys (DESIGN.md §17) */
+	int			max_entries;	/* cardinality guard, 0 = unlimited */
 
 	Tuplesortstate *sortstate;
 	TupleDesc	sorttupdesc;
@@ -184,12 +210,12 @@ rbi_build_init_pages(Relation index, uint32 nbuckets, uint32 inline_limit)
  * --------------------------------------------------------------------- */
 
 static RBIBuilder *
-rbi_builder_create(RBIBuildState *bs, Datum key, bool isnull, uint32 hash)
+rbi_builder_create(RBIBuildState *bs, Datum key, int keykind, uint32 hash)
 {
 	RBIBuilder *b = (RBIBuilder *) palloc0(sizeof(RBIBuilder));
 
-	b->isnull = isnull;
-	b->key = isnull ? (Datum) 0 :
+	b->keykind = keykind;
+	b->key = (keykind != RBI_KEY_REAL) ? (Datum) 0 :
 		datumCopy(key, bs->state.typbyval, bs->state.typlen);
 	b->hash = hash;
 	b->cur = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
@@ -405,8 +431,9 @@ rbi_builder_flush(RBIBuildState *bs, RBIBuilder *b)
 		RBIPageGetOpaque(img)->rightlink = InvalidBlockNumber;
 		rbi_build_write_page(bs->index, b->curblk, b->pageimg->data);
 
-		entry = b->isnull ?
-			rbi_make_null_entry(RBI_ENTRY_CHAIN, NULL, 0, &size) :
+		entry = (b->keykind != RBI_KEY_REAL) ?
+			rbi_make_reserved_entry(rbi_reserved_flag(b->keykind),
+									RBI_ENTRY_CHAIN, NULL, 0, &size) :
 			rbi_make_entry(&bs->state, b->key, b->hash, RBI_ENTRY_CHAIN,
 						   NULL, 0, &size);
 		entry->head = b->head;
@@ -414,9 +441,10 @@ rbi_builder_flush(RBIBuildState *bs, RBIBuilder *b)
 	}
 	else
 	{
-		entry = b->isnull ?
-			rbi_make_null_entry(RBI_ENTRY_INLINE, b->inlinebuf, b->inlineused,
-								&size) :
+		entry = (b->keykind != RBI_KEY_REAL) ?
+			rbi_make_reserved_entry(rbi_reserved_flag(b->keykind),
+									RBI_ENTRY_INLINE, b->inlinebuf,
+									b->inlineused, &size) :
 			rbi_make_entry(&bs->state, b->key, b->hash, RBI_ENTRY_INLINE,
 						   b->inlinebuf, b->inlineused, &size);
 	}
@@ -447,6 +475,32 @@ rbi_flush_builders(RBIBuildState *bs)
  * The build itself
  * --------------------------------------------------------------------- */
 
+/*
+ * Push one (kind, key, code) tuple into the sort.  A reserved kind carries no
+ * key at all and hashes to 0.
+ */
+static void
+rbi_build_put(RBIBuildState *bs, int keykind, Datum key, uint64 code)
+{
+	uint32		hash = (keykind == RBI_KEY_REAL) ?
+		rbi_hash_key(&bs->state, key) : RBI_NULLKEY_HASH;
+
+	ExecClearTuple(bs->inslot);
+	bs->inslot->tts_values[0] = Int32GetDatum((int32) hash);
+	bs->inslot->tts_isnull[0] = false;
+	bs->inslot->tts_values[1] = key;
+	bs->inslot->tts_isnull[1] = (keykind != RBI_KEY_REAL);
+	bs->inslot->tts_values[2] = Int64GetDatum((int64) code);
+	bs->inslot->tts_isnull[2] = false;
+	bs->inslot->tts_values[3] = Int16GetDatum((int16) keykind);
+	bs->inslot->tts_isnull[3] = false;
+	ExecStoreVirtualTuple(bs->inslot);
+
+	tuplesort_puttupleslot(bs->sortstate, bs->inslot);
+
+	bs->indtuples += 1;
+}
+
 static void
 rbi_build_callback(Relation index, ItemPointer tid, Datum *values,
 				   bool *isnull, bool tupleIsAlive, void *arg)
@@ -454,7 +508,6 @@ rbi_build_callback(Relation index, ItemPointer tid, Datum *values,
 	RBIBuildState *bs = (RBIBuildState *) arg;
 	MemoryContext oldctx;
 	Datum		key;
-	uint32		hash;
 	uint64		code;
 
 	rbi_check_key_offset(tid);
@@ -463,15 +516,29 @@ rbi_build_callback(Relation index, ItemPointer tid, Datum *values,
 	oldctx = MemoryContextSwitchTo(bs->tmpctx);
 
 	/*
-	 * A NULL key goes into the sort like any other, with hash 0: it ends up
-	 * in the reserved NULL entry of bucket 0 (DESIGN.md §14), and the two
-	 * passes below tell it from a real key by the isnull flag of the key
-	 * column, never by comparing.
+	 * A NULL value goes into the sort like any other row, with hash 0: it
+	 * ends up in the reserved NULL entry of bucket 0 (DESIGN.md §14), and the
+	 * two passes below tell it from a real key by the kind column, never by
+	 * comparing.
 	 */
 	if (isnull[0])
+		rbi_build_put(bs, RBI_KEY_NULL, (Datum) 0, code);
+	else if (bs->multikey)
 	{
-		key = (Datum) 0;
-		hash = RBI_NULLKEY_HASH;
+		/*
+		 * DESIGN.md §17: one row, many keys.  A row the opclass extracts
+		 * nothing from - an empty array, a tsvector with no lexemes - goes
+		 * into the reserved EMPTY entry, so that a scan that has to look at
+		 * every indexed row (`tags @> '{}'`) can still find it.
+		 */
+		Datum	   *keys;
+		int			nkeys = rbi_extract_value(&bs->state, values[0], &keys);
+		int			i;
+
+		if (nkeys == 0)
+			rbi_build_put(bs, RBI_KEY_EMPTY, (Datum) 0, code);
+		for (i = 0; i < nkeys; i++)
+			rbi_build_put(bs, RBI_KEY_REAL, keys[i], code);
 	}
 	else
 	{
@@ -479,24 +546,11 @@ rbi_build_callback(Relation index, ItemPointer tid, Datum *values,
 		if (!bs->state.typbyval && bs->state.typlen == -1)
 			key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-		hash = rbi_hash_key(&bs->state, key);
+		rbi_build_put(bs, RBI_KEY_REAL, key, code);
 	}
-
-	ExecClearTuple(bs->inslot);
-	bs->inslot->tts_values[0] = Int32GetDatum((int32) hash);
-	bs->inslot->tts_isnull[0] = false;
-	bs->inslot->tts_values[1] = key;
-	bs->inslot->tts_isnull[1] = isnull[0];
-	bs->inslot->tts_values[2] = Int64GetDatum((int64) code);
-	bs->inslot->tts_isnull[2] = false;
-	ExecStoreVirtualTuple(bs->inslot);
-
-	tuplesort_puttupleslot(bs->sortstate, bs->inslot);
 
 	MemoryContextSwitchTo(oldctx);
 	MemoryContextReset(bs->tmpctx);
-
-	bs->indtuples += 1;
 }
 
 /*
@@ -505,7 +559,7 @@ rbi_build_callback(Relation index, ItemPointer tid, Datum *values,
 typedef struct RBIKeyStat
 {
 	Datum		key;
-	bool		isnull;			/* the reserved NULL key */
+	int			keykind;		/* RBI_KEY_* */
 	Size		keysize;		/* bytes rbi_store_key() would write */
 	int64		nmembers;		/* TIDs seen for this key */
 } RBIKeyStat;
@@ -570,10 +624,12 @@ rbi_build_scan_keys(RBIBuildState *bs, Size *totalbytes)
 		bool		isnull;
 		int32		hash;
 		Datum		key;
+		int			keykind;
 		RBIKeyStat *stat = NULL;
 
 		hash = DatumGetInt32(slot_getattr(bs->outslot, 1, &isnull));
 		key = slot_getattr(bs->outslot, 2, &isnull);
+		keykind = (int) DatumGetInt16(slot_getattr(bs->outslot, 4, &isnull));
 
 		if (!havehash || hash != curhash)
 		{
@@ -590,9 +646,10 @@ rbi_build_scan_keys(RBIBuildState *bs, Size *totalbytes)
 
 		for (i = 0; i < nkeys; i++)
 		{
-			if (keys[i].isnull != isnull)
+			if (keys[i].keykind != keykind)
 				continue;
-			if (isnull || rbi_keys_equal(&bs->state, keys[i].key, key))
+			if (keykind != RBI_KEY_REAL ||
+				rbi_keys_equal(&bs->state, keys[i].key, key))
 			{
 				stat = &keys[i];
 				break;
@@ -610,9 +667,9 @@ rbi_build_scan_keys(RBIBuildState *bs, Size *totalbytes)
 				MemoryContextSwitchTo(oldctx);
 			}
 			stat = &keys[nkeys++];
-			stat->isnull = isnull;
+			stat->keykind = keykind;
 			stat->nmembers = 0;
-			if (isnull)
+			if (keykind != RBI_KEY_REAL)
 			{
 				stat->key = (Datum) 0;
 				stat->keysize = 0;
@@ -664,14 +721,14 @@ rbi_build_write_entries(RBIBuildState *bs)
 		int32		hash;
 		Datum		key;
 		uint64		code;
+		int			keykind;
 		RBIBuilder *b = NULL;
 		int			i;
 
-		bool		keyisnull;
-
 		hash = DatumGetInt32(slot_getattr(bs->outslot, 1, &isnull));
-		key = slot_getattr(bs->outslot, 2, &keyisnull);
+		key = slot_getattr(bs->outslot, 2, &isnull);
 		code = (uint64) DatumGetInt64(slot_getattr(bs->outslot, 3, &isnull));
+		keykind = (int) DatumGetInt16(slot_getattr(bs->outslot, 4, &isnull));
 
 		if (!havehash || hash != curhash)
 		{
@@ -681,12 +738,12 @@ rbi_build_write_entries(RBIBuildState *bs)
 			havehash = true;
 		}
 
-		/* Group by the isnull flag first, then by key (DESIGN.md §14). */
+		/* Group by the kind first, then by key (DESIGN.md §14 and §17). */
 		for (i = 0; i < bs->nbuilders; i++)
 		{
-			if (bs->builders[i]->isnull != keyisnull)
+			if (bs->builders[i]->keykind != keykind)
 				continue;
-			if (keyisnull ||
+			if (keykind != RBI_KEY_REAL ||
 				rbi_keys_equal(&bs->state, bs->builders[i]->key, key))
 			{
 				b = bs->builders[i];
@@ -694,7 +751,7 @@ rbi_build_write_entries(RBIBuildState *bs)
 			}
 		}
 		if (b == NULL)
-			b = rbi_builder_create(bs, key, keyisnull, (uint32) hash);
+			b = rbi_builder_create(bs, key, keykind, (uint32) hash);
 
 		rbi_builder_add(bs, b, code);
 
@@ -730,6 +787,7 @@ rbibuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.index = index;
 	bs.indtuples = 0;
 	bs.inline_limit = opts ? (uint32) opts->inline_limit : RBI_DEFAULT_INLINE_LIMIT;
+	bs.max_entries = rbi_max_entries(index);
 
 	bs.buildctx = AllocSetContextCreate(CurrentMemoryContext,
 										"roaring index build",
@@ -749,19 +807,29 @@ rbibuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	meta.container_bits = RBI_CONTAINER_BITS;
 	meta.inline_limit = bs.inline_limit;
 	rbi_fill_state(index, &bs.state, &meta, bs.buildctx);
+	bs.multikey = bs.state.multikey;
 
 	bs.maxbuilders = 8;
 	bs.builders = (RBIBuilder **) MemoryContextAlloc(bs.buildctx,
 													 sizeof(RBIBuilder *) * bs.maxbuilders);
 	bs.nbuilders = 0;
 
-	/* Sort tuple: (hash int4, key, code int8), sorted by hash then code. */
+	/*
+	 * Sort tuple: (hash int4, key, code int8, kind int2), sorted by hash then
+	 * code.  The key column's type is the index's own, which core resolved
+	 * from the opclass: the element type for a multi-key class (DESIGN.md
+	 * §17), so one heap row's several keys sort as the values they are.  The
+	 * kind column is not a sort key - it is a function of the key being NULL
+	 * - but the two reserved kinds share that state and have to be told apart
+	 * when the passes group.
+	 */
 	keyatt = TupleDescAttr(RelationGetDescr(index), 0);
-	bs.sorttupdesc = CreateTemplateTupleDesc(3);
+	bs.sorttupdesc = CreateTemplateTupleDesc(4);
 	TupleDescInitEntry(bs.sorttupdesc, 1, "hash", INT4OID, -1, 0);
 	TupleDescInitEntry(bs.sorttupdesc, 2, "key", keyatt->atttypid,
 					   keyatt->atttypmod, 0);
 	TupleDescInitEntry(bs.sorttupdesc, 3, "code", INT8OID, -1, 0);
+	TupleDescInitEntry(bs.sorttupdesc, 4, "kind", INT2OID, -1, 0);
 	TupleDescInitEntryCollation(bs.sorttupdesc, 2, bs.state.collation);
 	TupleDescFinalize(bs.sorttupdesc);
 
@@ -814,6 +882,14 @@ rbibuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	elog(DEBUG1, "roaring index \"%s\": " INT64_FORMAT " distinct keys, %zu entry bytes, %u buckets",
 		 RelationGetRelationName(index), ndistinct, entrybytes, bs.nbuckets);
+
+	/*
+	 * Cardinality guard (DESIGN.md §17).  At build time the count is exact -
+	 * pass 1 has just counted the distinct keys - so the warning is too.  It
+	 * is only a warning: the index is built either way.
+	 */
+	if (bs.max_entries > 0 && ndistinct > (int64) bs.max_entries)
+		rbi_warn_max_entries(index, ndistinct);
 
 	rbi_build_init_pages(index, bs.nbuckets, bs.inline_limit);
 

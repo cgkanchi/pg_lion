@@ -37,7 +37,7 @@
 PG_FUNCTION_INFO_V1(roaring_index_stats);
 PG_FUNCTION_INFO_V1(roaring_index_verify);
 
-#define RBI_STATS_NCOLS		15
+#define RBI_STATS_NCOLS		16
 
 typedef struct RBIVerifyState
 {
@@ -48,6 +48,7 @@ typedef struct RBIVerifyState
 	uint8	   *refs;			/* how often each block is referenced */
 	RBIContainer *cbuf;			/* aligned container work buffer */
 	int64		nnullentries;	/* reserved NULL-key entries seen (at most 1) */
+	int64		nemptyentries;	/* reserved no-key entries seen (at most 1) */
 	Oid			keyoutfunc;		/* output function of the indexed type */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
 	int64		nheaptuples;
@@ -112,6 +113,7 @@ typedef struct RBIStats
 	int64		sparse_members;	/* (ckey, lo) pairs inside them */
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
+	int64		empty_tids;		/* members of the reserved EMPTY entry (§17) */
 	int64		container_bytes;
 	int64		free_bytes;
 } RBIStats;
@@ -202,6 +204,8 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 				st.ntids += (int64) entry->ntids;
 				if (RBIEntryIsNullKey(entry))
 					st.null_tids += (int64) entry->ntids;
+				if (RBIEntryIsEmptyKey(entry))
+					st.empty_tids += (int64) entry->ntids;
 
 				if ((entry->flags & RBI_ENTRY_INLINE) != 0)
 				{
@@ -257,6 +261,7 @@ roaring_index_stats(PG_FUNCTION_ARGS)
 	values[12] = Int64GetDatum(st.sparse_segments);
 	values[13] = Int64GetDatum(st.sparse_members);
 	values[14] = Int64GetDatum(st.null_tids);
+	values[15] = Int64GetDatum(st.empty_tids);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -603,31 +608,47 @@ rbi_verify_entry(RBIVerifyState *vs, uint32 bucket, BlockNumber blk,
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
 
 	if ((entry->flags & ~(uint16) (RBI_ENTRY_INLINE | RBI_ENTRY_CHAIN |
-								   RBI_ENTRY_NULLKEY)) != 0)
+								   RBI_ENTRY_RESERVED)) != 0)
 		rbi_corrupt("roaring index \"%s\": entry %u on block %u has unknown flag bits in 0x%04X",
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
 
-	if (RBIEntryIsNullKey(entry))
+	if ((entry->flags & RBI_ENTRY_RESERVED) == RBI_ENTRY_RESERVED)
+		rbi_corrupt("roaring index \"%s\": entry %u on block %u is both the null and the empty entry",
+					RelationGetRelationName(vs->index), off, blk);
+
+	if (RBIEntryIsReserved(entry))
 	{
 		/*
-		 * The reserved NULL-key entry (DESIGN.md §14): no key bytes, hash 0,
-		 * bucket 0, and one per index at most - a second one would split the
-		 * NULL rows between two entries that no reader looks for twice.
+		 * A reserved entry (DESIGN.md §14 and §17): no key bytes, hash 0,
+		 * bucket 0, and one of each per index at most - a second one would
+		 * split its rows between two entries that no reader looks for twice.
 		 */
+		const char *what = RBIEntryIsNullKey(entry) ? "null" : "empty";
+
 		if (entry->keylen != 0)
-			rbi_corrupt("roaring index \"%s\": null entry %u on block %u has a key of %u bytes",
-						RelationGetRelationName(vs->index), off, blk,
+			rbi_corrupt("roaring index \"%s\": %s entry %u on block %u has a key of %u bytes",
+						RelationGetRelationName(vs->index), what, off, blk,
 						entry->keylen);
 		if (entry->hash != RBI_NULLKEY_HASH)
-			rbi_corrupt("roaring index \"%s\": null entry %u on block %u stores hash %u, expected %d",
-						RelationGetRelationName(vs->index), off, blk,
+			rbi_corrupt("roaring index \"%s\": %s entry %u on block %u stores hash %u, expected %d",
+						RelationGetRelationName(vs->index), what, off, blk,
 						entry->hash, RBI_NULLKEY_HASH);
 		if (bucket != RBI_NULLKEY_BUCKET)
-			rbi_corrupt("roaring index \"%s\": null entry %u on block %u is in bucket %u, expected bucket %d",
-						RelationGetRelationName(vs->index), off, blk, bucket,
-						RBI_NULLKEY_BUCKET);
-		if (++vs->nnullentries > 1)
-			rbi_corrupt("roaring index \"%s\": entry %u on block %u is a second null entry",
+			rbi_corrupt("roaring index \"%s\": %s entry %u on block %u is in bucket %u, expected bucket %d",
+						RelationGetRelationName(vs->index), what, off, blk,
+						bucket, RBI_NULLKEY_BUCKET);
+		if (RBIEntryIsNullKey(entry) ? (++vs->nnullentries > 1) :
+			(++vs->nemptyentries > 1))
+			rbi_corrupt("roaring index \"%s\": entry %u on block %u is a second %s entry",
+						RelationGetRelationName(vs->index), off, blk, what);
+
+		/*
+		 * Only a multi-key opclass ever writes an empty entry; finding one in
+		 * a scalar index means the two flag bits have been confused
+		 * somewhere.
+		 */
+		if (RBIEntryIsEmptyKey(entry) && !vs->state->multikey)
+			rbi_corrupt("roaring index \"%s\": entry %u on block %u is an empty-key entry, but the operator class extracts no keys",
 						RelationGetRelationName(vs->index), off, blk);
 	}
 	else
@@ -859,11 +880,11 @@ rbi_verify_reachable(RBIVerifyState *vs)
  * --------------------------------------------------------------------- */
 
 /*
- * Is (ckey, lo) present in the posting set of key, or of the reserved NULL
- * entry when keyisnull (DESIGN.md §14)?
+ * Is (ckey, lo) present in the posting set of key, or of the reserved entry
+ * named by reservedflag when there is one (DESIGN.md §14 and §17)?
  */
 static bool
-rbi_verify_tid_present(RBIVerifyState *vs, Datum key, bool keyisnull,
+rbi_verify_tid_present(RBIVerifyState *vs, Datum key, uint16 reservedflag,
 					   uint32 hash, uint32 ckey, uint16 lo)
 {
 	Relation	index = vs->index;
@@ -878,9 +899,9 @@ rbi_verify_tid_present(RBIVerifyState *vs, Datum key, bool keyisnull,
 														state->meta.nbuckets)));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
 
-	if (keyisnull ?
-		rbi_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
-							&entrybuf, &entryoff) :
+	if ((reservedflag != 0) ?
+		rbi_find_reserved_entry(index, headbuf, BUFFER_LOCK_SHARE,
+								reservedflag, &entrybuf, &entryoff) :
 		rbi_find_entry(index, state, headbuf, BUFFER_LOCK_SHARE, key, hash,
 					   &entrybuf, &entryoff))
 	{
@@ -940,6 +961,30 @@ rbi_verify_tid_present(RBIVerifyState *vs, Datum key, bool keyisnull,
  * has to be indexed under its key.
  */
 static void
+rbi_verify_one_key(RBIVerifyState *vs, ItemPointer tid, Datum key,
+				   uint16 reservedflag, uint64 code)
+{
+	uint32		hash = (reservedflag != 0) ? RBI_NULLKEY_HASH :
+		rbi_hash_key(vs->state, key);
+
+	if (rbi_verify_tid_present(vs, key, reservedflag, hash,
+							   rbi_code_ckey(code), rbi_code_lo(code)))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("heap tuple (%u,%u) from table \"%s\" is not indexed in \"%s\"",
+					ItemPointerGetBlockNumber(tid),
+					ItemPointerGetOffsetNumber(tid),
+					RelationGetRelationName(vs->heap),
+					RelationGetRelationName(vs->index)),
+			 errdetail("The tuple's key is %s.",
+					   (reservedflag == RBI_ENTRY_NULLKEY) ? "NULL" :
+					   (reservedflag == RBI_ENTRY_EMPTYKEY) ? "absent" :
+					   OidOutputFunctionCall(vs->keyoutfunc, key))));
+}
+
+static void
 rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 						 bool *isnull, bool tupleIsAlive, void *arg)
 {
@@ -948,18 +993,34 @@ rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 	MemoryContext oldcxt;
 	Datum		key;
 	uint64		code;
-	uint32		hash;
-	bool		keyisnull = isnull[0];
 
 	oldcxt = MemoryContextSwitchTo(vs->heapcxt);
 
 	rbi_check_key_offset(tid);
+	code = rbi_tid_to_code(tid);
 
-	if (keyisnull)
+	if (isnull[0])
 	{
-		/* NULL keys live in the reserved entry of bucket 0 (DESIGN.md §14). */
-		key = (Datum) 0;
-		hash = RBI_NULLKEY_HASH;
+		/* NULL values live in the reserved entry of bucket 0 (DESIGN.md §14). */
+		rbi_verify_one_key(vs, tid, (Datum) 0, RBI_ENTRY_NULLKEY, code);
+	}
+	else if (state->multikey)
+	{
+		/*
+		 * DESIGN.md §17: the row has to be present under EVERY key its value
+		 * extracts to, and in the reserved EMPTY entry when it extracts to
+		 * none.  Extracting here rather than trusting the index is the whole
+		 * point of the check: it is the same call the build and the insert
+		 * make, so a row that is missing under one of several keys is found.
+		 */
+		Datum	   *keys;
+		int			nkeys = rbi_extract_value(state, values[0], &keys);
+		int			i;
+
+		if (nkeys == 0)
+			rbi_verify_one_key(vs, tid, (Datum) 0, RBI_ENTRY_EMPTYKEY, code);
+		for (i = 0; i < nkeys; i++)
+			rbi_verify_one_key(vs, tid, keys[i], 0, code);
 	}
 	else
 	{
@@ -967,22 +1028,8 @@ rbi_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 		if (!state->typbyval && state->typlen == -1)
 			key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-		hash = rbi_hash_key(state, key);
+		rbi_verify_one_key(vs, tid, key, 0, code);
 	}
-	code = rbi_tid_to_code(tid);
-
-	if (!rbi_verify_tid_present(vs, key, keyisnull, hash, rbi_code_ckey(code),
-								rbi_code_lo(code)))
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("heap tuple (%u,%u) from table \"%s\" is not indexed in \"%s\"",
-						ItemPointerGetBlockNumber(tid),
-						ItemPointerGetOffsetNumber(tid),
-						RelationGetRelationName(vs->heap),
-						RelationGetRelationName(vs->index)),
-				 errdetail("The tuple's key is %s.",
-						   keyisnull ? "NULL" :
-						   OidOutputFunctionCall(vs->keyoutfunc, key))));
 
 	vs->nheaptuples++;
 

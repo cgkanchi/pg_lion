@@ -856,150 +856,414 @@ rbi_cursor_close(RBISetCursor *cur)
 
 
 /* ---------------------------------------------------------------------
- * Union cursors: one source of the merge
+ * Expression cursors: one source of the merge
  * --------------------------------------------------------------------- */
 
 /*
- * A cursor over the UNION of the posting sets of one source (DESIGN.md §15,
- * `col = ANY (array)`), presenting one ascending run of container keys just
- * as a single set does, so that the merge below need not know how many sets
- * are behind a source.
+ * A cursor over a boolean expression of posting sets, presenting one
+ * ascending run of container keys just as a single set does, so that the
+ * merge below need not know what is behind a source.
  *
- * At a given moment the union stands at the SMALLEST container key any of its
- * sub-cursors has left, and its container is the OR of the containers of
- * every sub-cursor standing at that key.
+ * Three node kinds, which are exactly the three RBIKeyNode kinds:
  *
- * THE PIN RULE (DESIGN.md §9) IS UNCHANGED BY THE UNION.  Every sub-cursor
- * that contributed a container to the OR still pins the page that container
- * was copied from, because a sub-cursor is only advanced by
- * rbi_ucursor_next(), and the merge only calls that from
+ *	LEAF	one posting set, walked by an RBISetCursor.
+ *	OR		the union (DESIGN.md §15's IN lists, and `tags && '{a,b}'`): the
+ *			cursor stands at the SMALLEST container key any child has left,
+ *			and its container is the OR of the containers of every child
+ *			standing at that key.
+ *	AND		the intersection (`tags @> '{a,b}'`, and the AND nodes of a
+ *			tsquery, DESIGN.md §17): the children are wound forward until
+ *			they all stand at one container key, and the container is the AND
+ *			of theirs.  A container key whose intersection comes out empty is
+ *			skipped here rather than handed up.
+ *
+ * THE PIN RULE (DESIGN.md §9) IS UNCHANGED BY EITHER OPERATOR.  Every leaf
+ * that contributed a container to the result still pins the page that
+ * container was copied from, because a leaf is only advanced by
+ * rbi_ecursor_next(), and the merge only calls that from
  * rbi_count_container(), after the visibility map has been consulted for the
- * merged container.  Sub-cursors that are ahead of the current key hold their
- * own pins as well, which is harmless: a pin too many never makes a count
- * wrong, it only makes VACUUM wait.
+ * merged container.  Leaves that are ahead of the current key hold their own
+ * pins as well, which is harmless: a pin too many never makes a count wrong,
+ * it only makes VACUUM wait.
+ *
+ * Skipping is the one place a pin goes without anything having been counted
+ * from it - an AND winding a lagging child forward, or dropping a container
+ * key whose intersection is empty.  That is safe for the reason the merge's
+ * own `!alleq` branch is safe: nothing of that container key reaches the
+ * visibility map, so no answer rests on it.
  */
-typedef struct RBIUnionCursor
+typedef struct RBIExprCursor
 {
-	const RBICountSource *src;
-	int			nsub;			/* sub-cursors, one per set that was found */
-	RBISetCursor *sub;
-	bool		valid;			/* cur/ckey hold a container */
+	const RBIKeyNode *node;		/* NULL: an empty source, never valid */
+	RBIKeyNodeKind kind;
+
+	/* RBI_KN_KEY */
+	RBISetCursor leaf;
+
+	/* RBI_KN_AND / RBI_KN_OR */
+	int			nsub;
+	struct RBIExprCursor *sub;
+	RBIContainer *acc[2];		/* AND/OR accumulators, only when nsub > 1 */
+
+	/* the container the cursor currently stands on */
+	bool		valid;
 	uint32		ckey;
 	const RBIContainer *cur;
-	RBIContainer *orbuf[2];		/* OR accumulators, only when nsub > 1 */
-	bool		advance;		/* this source took part in the current key */
-} RBIUnionCursor;
+
+	bool		advance;		/* top level only: took part in this key */
+} RBIExprCursor;
+
+static void rbi_ecursor_build(RBIExprCursor *c);
+static void rbi_ecursor_next(RBIExprCursor *c);
+
+static void
+rbi_ecursor_init(RBIExprCursor *c, const RBIKeyNode *node,
+				 RBIPostingSet *sets, int nsets, RBICountCtx *cx)
+{
+	int			i;
+
+	check_stack_depth();
+
+	memset(c, 0, sizeof(RBIExprCursor));
+	c->node = node;
+	if (node == NULL)
+		return;					/* a source with no sets at all */
+
+	c->kind = node->kind;
+
+	if (node->kind == RBI_KN_KEY)
+	{
+		Assert(node->keyno >= 0 && node->keyno < nsets);
+		rbi_cursor_init(&c->leaf, &sets[node->keyno], cx);
+	}
+	else
+	{
+		Assert(node->nargs >= 1);
+		c->nsub = node->nargs;
+		c->sub = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * c->nsub);
+		for (i = 0; i < c->nsub; i++)
+			rbi_ecursor_init(&c->sub[i], node->args[i], sets, nsets, cx);
+
+		if (c->nsub > 1)
+		{
+			c->acc[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+			c->acc[1] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
+		}
+	}
+
+	rbi_ecursor_build(c);
+}
 
 /*
- * Recompute the union's current container from its sub-cursors.
+ * Recompute the cursor's current container from its children.
  */
 static void
-rbi_ucursor_build(RBIUnionCursor *u)
+rbi_ecursor_build(RBIExprCursor *c)
 {
-	const RBIContainer *acc = NULL;
-	uint32		minckey = 0;
-	bool		havemin = false;
+	const RBIContainer *acc;
 	int			w = 0;
 	int			i;
 
-	u->valid = false;
-	u->cur = NULL;
+	c->valid = false;
+	c->cur = NULL;
 
-	for (i = 0; i < u->nsub; i++)
+	if (c->node == NULL)
+		return;
+
+	if (c->kind == RBI_KN_KEY)
 	{
-		if (!u->sub[i].valid)
-			continue;
-		if (!havemin || u->sub[i].cur->ckey < minckey)
-		{
-			minckey = u->sub[i].cur->ckey;
-			havemin = true;
-		}
+		if (!c->leaf.valid)
+			return;
+		c->cur = c->leaf.cur;
+		c->ckey = c->cur->ckey;
+		c->valid = true;
+		return;
 	}
 
-	if (!havemin)
-		return;					/* every set is exhausted */
-
-	for (i = 0; i < u->nsub; i++)
+	if (c->kind == RBI_KN_OR)
 	{
-		if (!u->sub[i].valid || u->sub[i].cur->ckey != minckey)
-			continue;
+		uint32		minckey = 0;
+		bool		havemin = false;
 
-		if (acc == NULL)
-			acc = u->sub[i].cur;
-		else
+		for (i = 0; i < c->nsub; i++)
 		{
-			/* Same container key on both sides, so this is a plain OR. */
-			rbi_container_or(acc, u->sub[i].cur, u->orbuf[w]);
-			acc = u->orbuf[w];
+			if (!c->sub[i].valid)
+				continue;
+			if (!havemin || c->sub[i].ckey < minckey)
+			{
+				minckey = c->sub[i].ckey;
+				havemin = true;
+			}
+		}
+
+		if (!havemin)
+			return;				/* every child is exhausted */
+
+		acc = NULL;
+		for (i = 0; i < c->nsub; i++)
+		{
+			if (!c->sub[i].valid || c->sub[i].ckey != minckey)
+				continue;
+
+			if (acc == NULL)
+				acc = c->sub[i].cur;
+			else
+			{
+				/* Same container key on both sides, so this is a plain OR. */
+				rbi_container_or(acc, c->sub[i].cur, c->acc[w]);
+				acc = c->acc[w];
+				w ^= 1;
+			}
+		}
+
+		c->ckey = minckey;
+		c->cur = acc;
+		c->valid = true;
+		return;
+	}
+
+	Assert(c->kind == RBI_KN_AND);
+
+	for (;;)
+	{
+		uint32		maxckey;
+		bool		alleq = true;
+
+		for (i = 0; i < c->nsub; i++)
+		{
+			if (!c->sub[i].valid)
+				return;			/* a child ran out: so has the intersection */
+		}
+
+		maxckey = c->sub[0].ckey;
+		for (i = 1; i < c->nsub; i++)
+		{
+			if (c->sub[i].ckey > maxckey)
+				maxckey = c->sub[i].ckey;
+		}
+
+		/* Wind the laggards forward; their containers cannot contribute. */
+		for (i = 0; i < c->nsub; i++)
+		{
+			if (c->sub[i].ckey != maxckey)
+			{
+				alleq = false;
+				rbi_ecursor_next(&c->sub[i]);
+			}
+		}
+		if (!alleq)
+		{
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		acc = c->sub[0].cur;
+		w = 0;
+		for (i = 1; i < c->nsub; i++)
+		{
+			rbi_container_and(acc, c->sub[i].cur, c->acc[w]);
+			acc = c->acc[w];
 			w ^= 1;
 		}
+
+		if (rbi_container_cardinality(acc) > 0)
+		{
+			c->ckey = maxckey;
+			c->cur = acc;
+			c->valid = true;
+			return;
+		}
+
+		/*
+		 * Nothing of this container key survives the intersection, so nothing
+		 * will ask the visibility map about it and every child may move on.
+		 */
+		for (i = 0; i < c->nsub; i++)
+			rbi_ecursor_next(&c->sub[i]);
+
+		CHECK_FOR_INTERRUPTS();
 	}
-
-	u->ckey = minckey;
-	u->cur = acc;
-	u->valid = true;
-}
-
-static void
-rbi_ucursor_init(RBIUnionCursor *u, const RBICountSource *src, RBICountCtx *cx)
-{
-	int			n = 0;
-	int			i;
-
-	memset(u, 0, sizeof(RBIUnionCursor));
-	u->src = src;
-	u->sub = (RBISetCursor *) palloc0(sizeof(RBISetCursor) *
-									  Max(src->nsets, 1));
-
-	for (i = 0; i < src->nsets; i++)
-	{
-		/* A listed value with no entry at all contributes nothing. */
-		if (!src->sets[i].found)
-			continue;
-		rbi_cursor_init(&u->sub[n++], &src->sets[i], cx);
-	}
-	u->nsub = n;
-
-	if (n > 1)
-	{
-		u->orbuf[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
-		u->orbuf[1] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
-	}
-
-	rbi_ucursor_build(u);
 }
 
 /*
- * Move past the current container key.  Only the sub-cursors that stand at
- * it move; the ones that are ahead stay where they are.  This is the only
- * place a union lets go of a source page pin.
+ * Move past the current container key.  Only the children that stand at it
+ * move; the ones that are ahead (an OR's) stay where they are.  This is the
+ * only place a source lets go of a page pin that carried an answer.
  */
 static void
-rbi_ucursor_next(RBIUnionCursor *u)
+rbi_ecursor_next(RBIExprCursor *c)
 {
 	int			i;
 
-	if (!u->valid)
+	if (c->node == NULL || !c->valid)
 		return;
 
-	for (i = 0; i < u->nsub; i++)
+	switch (c->kind)
 	{
-		if (u->sub[i].valid && u->sub[i].cur->ckey == u->ckey)
-			rbi_cursor_next(&u->sub[i]);
+		case RBI_KN_KEY:
+			rbi_cursor_next(&c->leaf);
+			break;
+
+		case RBI_KN_OR:
+			for (i = 0; i < c->nsub; i++)
+			{
+				if (c->sub[i].valid && c->sub[i].ckey == c->ckey)
+					rbi_ecursor_next(&c->sub[i]);
+			}
+			break;
+
+		case RBI_KN_AND:
+			/* every child stands at c->ckey and contributed to the result */
+			for (i = 0; i < c->nsub; i++)
+				rbi_ecursor_next(&c->sub[i]);
+			break;
 	}
 
-	rbi_ucursor_build(u);
+	rbi_ecursor_build(c);
 }
 
 static void
-rbi_ucursor_close(RBIUnionCursor *u)
+rbi_ecursor_close(RBIExprCursor *c)
 {
 	int			i;
 
-	for (i = 0; i < u->nsub; i++)
-		rbi_cursor_close(&u->sub[i]);
-	u->valid = false;
-	u->cur = NULL;
+	if (c->node == NULL)
+		return;
+
+	if (c->kind == RBI_KN_KEY)
+		rbi_cursor_close(&c->leaf);
+	else
+	{
+		for (i = 0; i < c->nsub; i++)
+			rbi_ecursor_close(&c->sub[i]);
+	}
+
+	c->valid = false;
+	c->cur = NULL;
+}
+
+/* ---------------------------------------------------------------------
+ * Source expressions
+ * --------------------------------------------------------------------- */
+
+/*
+ * The tree a source combines its sets with: its own, or the implicit union of
+ * all of them.  NULL when the source has no sets at all, which only a negated
+ * source can have (a `col IS NOT NULL` on a column with no NULLs).
+ */
+static RBIKeyNode *
+rbi_source_tree(const RBICountSource *src)
+{
+	RBIKeyNode *node;
+	RBIKeyNode **args;
+	int			i;
+
+	if (src->tree != NULL)
+		return src->tree;
+	if (src->nsets == 0)
+		return NULL;
+
+	args = (RBIKeyNode **) palloc(sizeof(RBIKeyNode *) * src->nsets);
+	for (i = 0; i < src->nsets; i++)
+	{
+		args[i] = (RBIKeyNode *) palloc0(sizeof(RBIKeyNode));
+		args[i]->kind = RBI_KN_KEY;
+		args[i]->keyno = i;
+	}
+	if (src->nsets == 1)
+		return args[0];
+
+	node = (RBIKeyNode *) palloc0(sizeof(RBIKeyNode));
+	node->kind = RBI_KN_OR;
+	node->nargs = src->nsets;
+	node->args = args;
+	return node;
+}
+
+/*
+ * Can this expression select anything at all?  A key with no entry in the
+ * index selects nothing, and an AND of one such key selects nothing however
+ * many other keys it has.  Answering that up front is what lets a count over
+ * an impossible clause cost one bucket lookup per key and no merge.
+ */
+static bool
+rbi_source_satisfiable(const RBIKeyNode *node, const RBIPostingSet *sets)
+{
+	int			i;
+
+	if (node == NULL)
+		return false;
+
+	switch (node->kind)
+	{
+		case RBI_KN_KEY:
+			return sets[node->keyno].found;
+
+		case RBI_KN_AND:
+			for (i = 0; i < node->nargs; i++)
+			{
+				if (!rbi_source_satisfiable(node->args[i], sets))
+					return false;
+			}
+			return true;
+
+		case RBI_KN_OR:
+			for (i = 0; i < node->nargs; i++)
+			{
+				if (rbi_source_satisfiable(node->args[i], sets))
+					return true;
+			}
+			return false;
+	}
+
+	return false;
+}
+
+/*
+ * Does every container this expression can yield come with a live buffer pin
+ * on the page it was read from?  That is the DESIGN.md §9 interlock, and
+ * rbi_count_sources() has to keep at least one positive source that has it
+ * (see the comment on rbi_posting_set_materialize()).
+ *
+ *	- a leaf has it unless its set has been materialized; a leaf whose key has
+ *	  no entry yields nothing, so it has it vacuously;
+ *	- an AND has it if ANY child has it, because every child stands at the
+ *	  container key the result was built from and so every child's pin is
+ *	  still held when the result is counted;
+ *	- an OR has it only if EVERY child has it, because which children
+ *	  contributed to a given container key is not known in advance.
+ */
+static bool
+rbi_source_pinned(const RBIKeyNode *node, const RBIPostingSet *sets)
+{
+	int			i;
+
+	if (node == NULL)
+		return true;			/* yields nothing */
+
+	switch (node->kind)
+	{
+		case RBI_KN_KEY:
+			return !sets[node->keyno].found || sets[node->keyno].mat == NULL;
+
+		case RBI_KN_AND:
+			for (i = 0; i < node->nargs; i++)
+			{
+				if (rbi_source_pinned(node->args[i], sets))
+					return true;
+			}
+			return false;
+
+		case RBI_KN_OR:
+			for (i = 0; i < node->nargs; i++)
+			{
+				if (!rbi_source_pinned(node->args[i], sets))
+					return false;
+			}
+			return true;
+	}
+
+	return false;
 }
 
 
@@ -1334,7 +1598,7 @@ rbi_recheck_cb(uint16 lo, void *arg)
  */
 static void
 rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
-					RBIUnionCursor *cursors, int nsources)
+					RBIExprCursor *cursors, int nsources)
 {
 	BlockNumber firstblk = rbi_ckey_first_block(c->ckey);
 	uint64		members;		/* blocks of this container that have members */
@@ -1424,14 +1688,14 @@ rbi_count_container(RBICountCtx *cx, const RBIContainer *c,
 	/*
 	 * DESIGN.md section 9: every heap block of *c has now been checked
 	 * against the visibility map, so - and only now - the pins on the pages
-	 * the source containers came from may be released.  rbi_ucursor_next() is
+	 * the source containers came from may be released.  rbi_ecursor_next() is
 	 * what releases them, and only the sources that contributed to *c (the
 	 * ones the merge flagged) move on.
 	 */
 	for (i = 0; i < nsources; i++)
 	{
 		if (cursors[i].advance)
-			rbi_ucursor_next(&cursors[i]);
+			rbi_ecursor_next(&cursors[i]);
 	}
 }
 
@@ -1592,10 +1856,12 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	RBICountCtx cx;
-	RBIUnionCursor *cursors;
+	RBIExprCursor *cursors;
+	RBIKeyNode **trees;
 	RBIContainer *work[2];
 	int64		result;
-	int			npinned;
+	int			ncarry;
+	bool	   *carry;
 	int			npositive = 0;
 	int			i;
 	int			j;
@@ -1603,24 +1869,19 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	Assert(nsources >= 1);
 
 	/*
-	 * A positive source none of whose keys has an entry selects no rows at
-	 * all, and makes the whole intersection empty.  A negated source with no
-	 * entry (no NULLs in that column) simply subtracts nothing.
+	 * The shape of each source, and whether it can select anything at all: a
+	 * positive source that cannot makes the whole intersection empty, and a
+	 * negated one that cannot simply subtracts nothing.
 	 */
+	trees = (RBIKeyNode **) palloc0(sizeof(RBIKeyNode *) * nsources);
 	for (i = 0; i < nsources; i++)
 	{
-		int			nfound = 0;
-
-		for (j = 0; j < sources[i].nsets; j++)
-		{
-			if (sources[i].sets[j].found)
-				nfound++;
-		}
+		trees[i] = rbi_source_tree(&sources[i]);
 
 		if (sources[i].negated)
 			continue;
 		npositive++;
-		if (nfound == 0)
+		if (!rbi_source_satisfiable(trees[i], sources[i].sets))
 			return 0;
 	}
 	if (npositive == 0)
@@ -1638,34 +1899,38 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	 *	   their chains again per group is the dominant cost.  A one-shot
 	 *	   count never pays for a copy it would use once.
 	 *
-	 *	2. never all of the POSITIVE ones.  A set that is INLINE, or that is
-	 *	   walked page by page, holds a pin while its containers are counted
-	 *	   against the visibility map, and that pin is what keeps VACUUM from
-	 *	   having finished ambulkdelete() - on this index, and therefore from
-	 *	   having set all-visible on any heap page at all.  One such set is
-	 *	   enough, but there must be one, and it has to be a positive one
-	 *	   because only those are guaranteed to hold a container (and hence a
-	 *	   pin) at every container key that gets counted.
+	 *	2. never the last POSITIVE source that still carries the interlock.
+	 *	   A set that is INLINE, or that is walked page by page, holds a pin
+	 *	   while its containers are counted against the visibility map, and
+	 *	   that pin is what keeps VACUUM from having finished ambulkdelete() -
+	 *	   on this index, and therefore from having set all-visible on any
+	 *	   heap page at all.  One source is enough, but there must be one, and
+	 *	   it has to be a positive one that holds a pin at EVERY container key
+	 *	   it yields, which is what rbi_source_pinned() decides.
 	 *
 	 * A negated set may always be copied: a stale copy can only hold TIDs
 	 * whose rows are dead (a live row's key cannot change without the row
 	 * getting a new TID), and subtracting a dead TID cannot take a live row
 	 * out of the count.
 	 */
-	npinned = 0;
+	carry = (bool *) palloc0(sizeof(bool) * nsources);
+	ncarry = 0;
 	for (i = 0; i < nsources; i++)
 	{
 		for (j = 0; j < sources[i].nsets; j++)
 		{
-			RBIPostingSet *ps = &sources[i].sets[j];
-
-			if (!ps->found)
-				continue;
-			ps->nuses++;
-			if (!sources[i].negated && (ps->is_inline || ps->mat == NULL))
-				npinned++;
+			if (sources[i].sets[j].found)
+				sources[i].sets[j].nuses++;
 		}
+
+		if (sources[i].negated)
+			continue;
+		carry[i] = rbi_source_pinned(trees[i], sources[i].sets);
+		if (carry[i])
+			ncarry++;
 	}
+	Assert(ncarry > 0);
+
 	for (i = 0; i < nsources; i++)
 	{
 		for (j = 0; j < sources[i].nsets; j++)
@@ -1678,15 +1943,21 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 				continue;		/* nothing to gain: already a private copy */
 			if (ps->nuses < 2)
 				continue;		/* rule 1 */
-			if (!sources[i].negated && npinned <= 1)
-				continue;		/* rule 2 */
+			if (!sources[i].negated && carry[i] && ncarry <= 1)
+				continue;		/* rule 2: this is the last interlock */
 			if (ps->ncontainers > RBI_MATERIALIZE_MAX_CONTAINERS &&
 				ps->ntids > RBI_MATERIALIZE_MAX_BYTES / sizeof(uint16))
 				continue;		/* hopeless even as an ARRAY of members */
-			if (rbi_posting_set_materialize(ps) && !sources[i].negated)
-				npinned--;
+
+			if (rbi_posting_set_materialize(ps) && !sources[i].negated &&
+				carry[i] && !rbi_source_pinned(trees[i], sources[i].sets))
+			{
+				carry[i] = false;
+				ncarry--;
+			}
 		}
 	}
+	Assert(ncarry > 0);
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"roaring index count",
@@ -1702,17 +1973,18 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 	cx.serializable = IsolationIsSerializable();
 	cx.tids_sorted = true;
 
-	cursors = (RBIUnionCursor *) palloc0(sizeof(RBIUnionCursor) * nsources);
+	cursors = (RBIExprCursor *) palloc0(sizeof(RBIExprCursor) * nsources);
 	work[0] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
 	work[1] = (RBIContainer *) palloc(RBI_CONTAINER_MAX_SIZE);
 
 	for (i = 0; i < nsources; i++)
-		rbi_ucursor_init(&cursors[i], &sources[i], &cx);
+		rbi_ecursor_init(&cursors[i], trees[i], sources[i].sets,
+						 sources[i].nsets, &cx);
 
 	/*
 	 * Merge the sources by container key.  Containers are stored in ascending
-	 * ckey order both inline and along a chain, and a union cursor preserves
-	 * that, so a single forward pass over all of them is enough.
+	 * ckey order both inline and along a chain, and an expression cursor
+	 * preserves that, so a single forward pass over all of them is enough.
 	 */
 	for (;;)
 	{
@@ -1753,7 +2025,7 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 			for (i = 0; i < nsources; i++)
 			{
 				if (!sources[i].negated && cursors[i].ckey < maxckey)
-					rbi_ucursor_next(&cursors[i]);
+					rbi_ecursor_next(&cursors[i]);
 			}
 			CHECK_FOR_INTERRUPTS();
 			continue;
@@ -1781,7 +2053,7 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 			if (!sources[i].negated)
 				continue;
 			while (cursors[i].valid && cursors[i].ckey < maxckey)
-				rbi_ucursor_next(&cursors[i]);	/* nothing to subtract there */
+				rbi_ecursor_next(&cursors[i]);	/* nothing to subtract there */
 			if (!cursors[i].valid || cursors[i].ckey != maxckey)
 				continue;
 
@@ -1805,7 +2077,7 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 			for (i = 0; i < nsources; i++)
 			{
 				if (cursors[i].advance)
-					rbi_ucursor_next(&cursors[i]);
+					rbi_ecursor_next(&cursors[i]);
 			}
 		}
 		CHECK_FOR_INTERRUPTS();
@@ -1813,7 +2085,7 @@ rbi_count_sources(Relation heap, Snapshot snapshot, int nsources,
 
 merge_done:
 	for (i = 0; i < nsources; i++)
-		rbi_ucursor_close(&cursors[i]);
+		rbi_ecursor_close(&cursors[i]);
 
 	/*
 	 * Everything that could be answered from the visibility map has been;
@@ -1838,6 +2110,65 @@ merge_done:
 	}
 
 	return result;
+}
+
+bool
+rbi_sets_satisfiable(int nsets, RBIPostingSet *sets, RBIKeyNode *tree)
+{
+	RBICountSource src;
+
+	memset(&src, 0, sizeof(src));
+	src.nsets = nsets;
+	src.sets = sets;
+	src.tree = tree;
+
+	return rbi_source_satisfiable(rbi_source_tree(&src), sets);
+}
+
+/*
+ * Walk the containers of one expression over located posting sets, without
+ * any visibility-map interlock: what a bitmap scan of a multi-key opclass
+ * needs (DESIGN.md §17).  Every TID goes to the executor, which visits the
+ * heap for all of them, so no pin has anything to protect here - but the
+ * cursors take and drop their pins exactly as they do for a count, which is
+ * why the very same evaluator serves both.
+ */
+int64
+rbi_sets_iterate(int nsets, RBIPostingSet *sets, RBIKeyNode *tree,
+				 rbi_container_callback cb, void *arg)
+{
+	RBICountSource src;
+	RBIExprCursor cursor;
+	RBICountCtx cx;
+	RBIKeyNode *node;
+	int64		total = 0;
+
+	memset(&src, 0, sizeof(src));
+	src.nsets = nsets;
+	src.sets = sets;
+	src.tree = tree;
+
+	node = rbi_source_tree(&src);
+	if (node == NULL)
+		return 0;
+
+	memset(&cx, 0, sizeof(cx));
+	cx.vmbuf = InvalidBuffer;
+
+	rbi_ecursor_init(&cursor, node, sets, nsets, &cx);
+
+	while (cursor.valid)
+	{
+		total += (int64) rbi_container_cardinality(cursor.cur);
+		if (!cb(cursor.cur, arg))
+			break;
+		rbi_ecursor_next(&cursor);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	rbi_ecursor_close(&cursor);
+
+	return total;
 }
 
 /*

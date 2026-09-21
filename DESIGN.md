@@ -260,26 +260,28 @@ BUILD (`rbi_build.c`)
 
 ## 6. Handler settings (`rbi_am.c`)
 
-    amstrategies = 1 (equality)      amsupport = 1 (support proc 1 = hash function, same as hash AM)
+    amstrategies = 5 (1 equality, 2 @>, 3 &&, 4 <@, 5 @@ -- see §17)
+    amsupport = 3 (1 = hash function, same as hash AM; 2 and 3 = GIN's extraction procs, §17)
     amoptsprocnum = 0                amcanorder = false        amcanorderbyop = false
     amcanhash = false                amconsistentequality = true   amconsistentordering = false
     amcanbackward = false            amcanunique = false       amcanmulticol = false
     amoptionalkey = false            amsearcharray = true      amsearchnulls = true
-    amstorage = false                amclusterable = false     ampredlocks = false
+    amstorage = true (§17)           amclusterable = false     ampredlocks = false
     amcanparallel = false            amcanbuildparallel = false    amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
     amgettuple = NULL                amgetbitmap = rbigetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
     amoptions: reloptions `buckets` (int, 0 = auto, max 65536; any value, not rounded to a power of
-    two) and `inline_limit` (int bytes, 64..4096, default 4096) via add_reloption_kind /
-    add_int_reloption / build_reloptions.
-    amvalidate: opclass must have support proc 1 with signature (T) → int4 and operator strategy 1.
+    two), `inline_limit` (int bytes, 64..4096, default 4096) and `max_entries` (int, 0 = unlimited,
+    §17) via add_reloption_kind / add_int_reloption / build_reloptions.
+    amvalidate: a scalar opclass must have support proc 1 with signature (T) → int4 and operator
+    strategy 1; a multi-key one (§17) procs 2 and 3 and strategies within {2,3,4,5}.
     Handler follows contrib/bloom in master: `static const IndexAmRoutine amroutine = {...}` returned
     with PG_RETURN_POINTER.
 
 Operator classes (in `roaring_index--0.1.sql`): one DEFAULT opclass per type, reusing the hash AM's
-support-1 functions. Generate the list from the dev cluster with
+support-1 functions, plus the two multi-key classes of §17. Generate the list from the dev cluster with
 `SELECT ... FROM pg_amproc JOIN pg_opclass ... WHERE amname='hash' AND amprocnum=1` for at least:
 int2, int4, int8, oid, bool, "char", text, varchar (via text), bpchar, bytea, uuid, date, time,
 timestamp, timestamptz, interval, numeric, float4, float8, macaddr, inet, name, jsonb, enum types
@@ -291,9 +293,11 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint,
         OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint,
         OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint,
-        OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint) RETURNS record
+        OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint,
+        OUT empty_tids bigint) RETURNS record
         -- container counts include INLINE containers; free_bytes sums bucket and container pages;
-        -- null_tids is the member count of the reserved NULL entry (§14)
+        -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
+        -- the reserved no-key entry (§17)
     roaring_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
@@ -313,6 +317,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
     src/rbi_insert.c         aminsert                                                  (wave 2)
     src/rbi_vacuum.c         ambulkdelete/amvacuumcleanup                              (wave 2)
     src/rbi_funcs.c          stats/verify (+ count in phase 2)                         (wave 2)
+    src/rbi_multikey.c       GIN-style extraction and query trees (§17)                (wave 3)
     roaring_index.control, roaring_index--0.1.sql, Makefile, test/                    (am-core, then wave 2)
 
 Coding conventions: PostgreSQL C style (tabs, K&R braces on their own line for functions, /* */
@@ -513,7 +518,8 @@ v1 priorities, in order of measured impact:
 4. Insert cost: a container is copied out and back per insert (bitset fast path exists). Consider an
    in-place add for ARRAY containers with slack and a GIN-style pending list for bulk loads.
 5. IN predicates in the AM and the count pushdown are DONE (§15, amsearcharray), and so are NULL
-   keys (§14, amsearchnulls). Range predicates (strategy 2..5 via entry ordering) are not.
+   keys (§14, amsearchnulls) and the multi-key opclasses of §17. Range predicates (which would need
+   entry ordering, and a strategy number outside the 1..5 §17 now uses) are not.
 6. Page recycling and entry deletion (v0 never frees pages or entries).
 7. Params in the count pushdown; multi-column GROUP BY. Partitions are DONE (§16).
 The per-container visibility-map read (rbi_vm_allvisible_mask) is already in: it turned the GROUP BY
@@ -777,20 +783,275 @@ execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation 
 costs one `index_open` per clause per partition (`rbi_index_bucket_pages` reads the meta page), and
 EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
 
-## 17. Multi-key operator classes: arrays and tsvector (v1, after §13-§16)
+## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
-GIN-style extraction so one row can contribute many keys. Opclass support procs: 1 = hash of the
-key type; 2 = extractValue(datum) → keys[] (+ nulls); 3 = extractQuery(query, strategy) → keys[] and
-a mode: AND (every key must match; used by `anyarray @> anyarray`), OR (`anyarray && anyarray`),
-ALL_WITH_RECHECK (scan every indexed row and recheck the operator; used for `@> '{}'`, `<@`, and
-tsquery with NOT, phrase or prefix operators), or a boolean tree for tsquery AND/OR of plain
-lexemes. `amstorage = true`; the entry key type is the element type (text for tsvector lexemes).
-Strategies: 1 =, 2 @>, 3 &&, 4 <@, 5 @@ (tsvector). Build/insert produce (key, code) pairs per
-extracted key; a row with no keys produces nothing (so `@> '{}'` needs ALL_WITH_RECHECK). VACUUM is
-unchanged. Bitmap scans combine sets per the mode (AND via rbi_container_and per ckey, OR via
-rbi_container_or), recheck only in ALL_WITH_RECHECK mode. Count pushdown: `count(*) WHERE tags @>
-'{a,b}'` is the AND of element sets (exact), `&&` the union; tsquery trees of AND/OR over plain
-lexemes map onto the same cursors; anything needing recheck is not pushed down. Cardinality guard:
-reloption `max_entries` (default 0 = unlimited) emits one WARNING per backend when exceeded during
-build or insert; it never rejects rows. Sparse segments (§13) are what keep hundreds of thousands
-of lexeme entries at GIN-like size.
+GIN-style extraction so one row can contribute many keys: `array_ops` (DEFAULT FOR TYPE anyarray,
+STORAGE anyelement) and `tsvector_ops` (DEFAULT FOR TYPE tsvector, STORAGE text).  The entry key type
+is the element type / the lexeme; everything below the key - buckets, entries, containers, sparse
+segments, VACUUM, the visibility-map interlock - is unchanged.
+
+### Handler and opclass shape
+
+    amsupport = 3     amstrategies = 5     amstorage = true
+
+    proc 1   hash of the KEY type                 (absent when the key type is polymorphic)
+    proc 2   GIN extractValue(value, &nkeys, &nullFlags) -> Datum *keys
+    proc 3   GIN extractQuery(query, &nkeys, strategy, &pmatch, &extra_data, &nullFlags,
+                              &searchMode) -> Datum *keys
+
+    strategies   1 =      2 @>      3 &&      4 <@      5 @@
+
+The extraction functions are GIN's, named directly in `roaring_index--0.1.sql`:
+
+    CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING roaring AS
+        OPERATOR 2 @> (anyarray, anyarray),
+        OPERATOR 3 && (anyarray, anyarray),
+        OPERATOR 4 <@ (anyarray, anyarray),
+        FUNCTION 2 ginarrayextract(anyarray, internal, internal),
+        FUNCTION 3 ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
+        STORAGE  anyelement;
+
+    CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING roaring AS
+        OPERATOR 5 @@ (tsvector, tsquery),
+        FUNCTION 1 hashtext(text),
+        FUNCTION 2 gin_extract_tsvector(tsvector, internal, internal),
+        FUNCTION 3 gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal),
+        STORAGE  text;
+
+GIN's *consistent* function is deliberately NOT reused: it answers "given which keys matched, does
+this one row match", and a roaring scan never asks that - it combines whole posting sets.  The query
+side therefore builds a boolean tree of its own (below).
+
+Two consequences of borrowing GIN's functions, both binding on any future multi-key opclass:
+
+- `gin_extract_tsquery` is declared `(tsvector, internal, int2, ...)` in pg_proc even though its
+  first argument is really a tsquery; that is how GIN declares it (amproclefttype = opcintype), and
+  the opclass above copies it verbatim.
+- **the strategy number handed to proc 3 is GIN's, not ours.**  GIN numbers the array operators
+  1 &&, 2 @>, 3 <@, 4 =, and tsvector's @@ is its strategy 1.  `rbi_gin_strategy()` in
+  rbi_multikey.c is the single place that translation lives.  Getting it wrong is silent - the
+  extraction answers for the wrong operator and returns INCLUDE_EMPTY, which only costs a rechecking
+  full scan - so it is one function with one switch.
+
+`rbivalidate` has two shapes.  A scalar opclass is checked exactly as before (proc 1 with signature
+(T) -> int4, strategy 1 only, every operator's types hashable by the family).  An opclass is
+multi-key iff the family has proc 2 for (opcintype, opcintype); then procs 2 and 3 must have GIN's
+signatures, every operator's strategy must be in {2,3,4,5}, and proc 1 is required unless
+`opckeytype` is polymorphic.  The "every type an operator mentions must be hashable" rule does not
+apply to a multi-key family, whose operators mention anyarray and tsquery and whose hashing is of
+keys.  `amconsistentequality` stays true: a scalar roaring family holds nothing but equality
+operators and a multi-key one holds no equality operator at all, so `equality_ops_are_compatible()`
+is never asked about two members of the same roaring family that disagree.
+
+### Key type resolution (`rbi_fill_state`, rbi_pages.c)
+
+The index's own tuple descriptor already carries the resolved key type: `ConstructTupleDescriptor()`
+substitutes `opckeytype` for the column type and replaces ANYELEMENT under an ANYARRAY opcintype with
+`get_base_element_type()` of the column.  So `RBIState.typid` is still `TupleDescAttr(...)->atttypid`
+and a roaring array_ops index on `text[]` has a `text` key column.  (Deviation from the sketch this
+section started as, which said "opckeytype when set, else opcintype": taking it from the tuple
+descriptor is the same answer for every class, needs no polymorphism handling of its own, and keeps
+`enum_ops` - whose opcintype is the pseudo-type anyenum - working as it did.)
+
+- Collation: the index column's (`rd_indcollation[0]`), falling back to **C** when that is invalid
+  and the key type is collatable.  A tsvector is not collatable, so a tsvector_ops index has no
+  collation to offer, and `hashtext()` refuses to run without one; C is also the right answer,
+  because lexemes are byte strings and GIN's own `gin_cmp_tslexeme()` compares them bytewise.
+- Hash: support proc 1 when the opclass has one, else the key type's default hash opclass through
+  `lookup_type_cache(TYPECACHE_HASH_PROC_FINFO)` - which is how GIN's `initGinState()` resolves its
+  comparison function for a polymorphic key type.  ERROR when the type has no hash opclass.
+- Equality: strategy 1 of the opfamily for a scalar opclass; for a multi-key one the key type's
+  default equality (`TYPECACHE_EQ_OPR_FINFO`), because the family's strategies are about the indexed
+  value and not about two keys.  The two always agree: a type's default hash opclass hashes what its
+  default btree equality calls equal.
+
+### The reserved EMPTY entry
+
+A second key-less entry joins the NULL entry of §14: flag `RBI_ENTRY_EMPTYKEY`, hash 0, keylen 0,
+bucket 0, one per index.  It holds the rows a multi-key opclass extracted NO key from - an empty
+array, a tsvector with no lexemes - which are under no key at all and which an ALL-mode scan
+(`tags @> '{}'`) still has to find.  A NULL column value goes to the NULL entry as before; the two
+are mutually exclusive and verify() says so.  `rbi_find_entry_ext()` skips both, and
+`rbi_find_reserved_entry()` (with `rbi_find_null_entry()` as a wrapper) is the only way to either.
+
+The meta page version is NOT bumped.  A version 2 index built with a scalar opclass has no empty
+entry and needs none - only a multi-key opclass ever writes one, and those did not exist before this
+wave - so no existing index answers anything wrongly, which is the test §14 set for a version bump.
+
+`roaring_index_stats()` gains `empty_tids`, the member count of that entry, next to `null_tids`.
+
+### Build and insert
+
+Build (`rbi_build.c`): the tuplesort tuple grows a fourth column, `kind int2`
+(REAL / NULL / EMPTY), still sorted by (hash, code).  A multi-key row is pushed once per distinct
+extracted key, all with the same code; both passes group by (kind, key) instead of (isnull, key).
+Nothing else changes, because the codes of each key still arrive ascending.
+
+Insert (`rbi_insert.c`): `rbiinsert()` extracts and then performs one ordinary single-key insert per
+key, each taking and releasing its own bucket lock.  They are not atomic with respect to a reader,
+which is exactly the visibility the heap already gives: the inserting transaction has not committed,
+so no snapshot that can see the row can run before the last of them is written.
+
+Extraction (`rbi_extract_value()`, rbi_multikey.c) drops NULL keys and duplicates.  A row whose array
+holds a NULL element is indexed under its other elements; nothing ever looks for a NULL key, because
+a query with one falls back to a rechecking scan.  Duplicates must go, or `rbi_container_add()` would
+report "already indexed" and leave `ntids` wrong.  The dedupe is quadratic in the keys of ONE row
+(an equality call each), which needs no ordering operator the key type may not have.
+
+`ntids` therefore counts (key, row) pairs, and so does `IndexBuildResult.index_tuples`.  A row with
+no keys contributes one pair, in the EMPTY entry.  **VACUUM is unchanged**: its callback is per TID
+and a TID is removed from every entry that holds it.
+
+verify(heapallindexed) extracts each heap row's keys with the same function the build uses and checks
+that the TID is present under every one of them, or in the EMPTY entry when there are none.
+
+### Queries (`rbi_extract_query()`, rbi_multikey.c)
+
+`searchMode` starts at GIN_SEARCH_MODE_DEFAULT and an out-of-range answer is treated as
+GIN_SEARCH_MODE_ALL, as `ginNewScanKey()` does.  The result is one of three modes:
+
+    NONE   nothing matches            DEFAULT mode with zero keys: `tags && '{}'`, an empty tsquery
+    KEYS   a boolean tree over the keys, exact
+    ALL    every indexed row, with recheck
+
+ALL is the answer for: any searchMode but DEFAULT (INCLUDE_EMPTY and ALL, which is what
+`ginqueryarrayextract` returns for `@> '{}'` and for `<@`); any partial-match key (a prefix lexeme -
+the keys are hashed, so a range of them cannot be walked); any NULL key; more than
+RBI_MAX_QUERY_KEYS = 1000 keys; and a tsquery shape the tree builder rejects.
+
+KEYS trees:
+
+- `@>` an AND over every key, `&&` an OR over every key.
+- `@@`: the TSQuery's QueryItem array is walked directly.  It is in prefix order - an operator's
+  RIGHT operand is at item + 1 and its LEFT at item + qoperator.left (ts_type.h) - and
+  `gin_extract_tsquery()` numbers the keys it returns by scanning that array from 0 and counting
+  QI_VAL items, so the j'th key is the j'th QI_VAL in array order; the same item -> key map is
+  recomputed rather than fished out of extra_data.  QI_VAL with no prefix flag and weight mask 0
+  becomes a leaf; OP_AND and OP_OR become AND and OR nodes; **OP_NOT, OP_PHRASE, a prefix and a
+  weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is not
+  "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme positions
+  and a weight needs weights, neither of which the index stores.)
+- `<@` is unreachable (extractQuery says INCLUDE_EMPTY first) and would be ALL.
+
+### Bitmap scans (`rbi_scan.c`)
+
+`rbigetbitmap` dispatches on `RBIState.multikey`.  NONE emits nothing; ALL emits the union of every
+entry but the NULL one - the EMPTY entry included - with recheck = true (`rbi_emit_all_keys()`, which
+is the function `IS NOT NULL` already used); KEYS locates one posting set per key and hands the tree
+to the shared evaluator, emitting the result containers with recheck = false.
+
+**The scan reuses the count cursors.**  `rbi_sets_iterate()` (rbi_count.c) walks
+(tree over located posting sets) in ascending container-key order and calls back per container; the
+scan's callback is `rbi_container_to_tbm()`.  The alternative - one TIDBitmap per key combined with
+tbm_intersect/tbm_union - was not needed: the cursors already present a set as one ascending run of
+containers, the AND and OR nodes are twenty lines each, and using the same evaluator for the scan and
+the count means the two cannot drift apart.
+
+All the posting sets are located BEFORE any of them is walked, so every bucket-page lock the scan
+takes is taken before the first container page is pinned: the reader side of the §11 deadlock rule.
+`col op ANY (const array)` reaches a multi-key index too (amsearcharray is on for §15's sake); each
+element is a query of its own and the answers go into the same bitmap, which is their union.
+
+### The expression evaluator (`rbi_count.c`)
+
+§15's union cursor is generalised into `RBIExprCursor`, a cursor over an `RBIKeyNode` tree whose
+leaves are located posting sets.  `RBICountSource` gains a `tree` member; NULL still means "the union
+of all the sets", which is what every pre-§17 caller gets.
+
+    LEAF   one RBISetCursor, as before
+    OR     stands at the smallest container key any child has left; the container is the OR of the
+           children standing there (this is exactly §15's union cursor)
+    AND    winds the children forward until they all stand at one container key; the container is
+           the AND of theirs, and a container key whose intersection comes out empty is skipped
+           here rather than handed up
+
+The §9 pin rule survives both operators: a leaf is only advanced by `rbi_ecursor_next()`, and the
+merge only calls that from `rbi_count_container()`, after the visibility map has been consulted - so
+every leaf that contributed to a counted container still pins the page that container came from.
+The two places an AND lets a pin go without anything having been counted (winding a laggard forward,
+dropping an empty intersection) are safe for the same reason the merge's own `!alleq` branch is:
+nothing of that container key reaches the visibility map.
+
+Materialization (§9) needed a sharper rule, because with a tree "at least one participating set is
+read the pinned way" is no longer implied by counting pinned sets.  `rbi_source_pinned()` decides,
+per source, whether EVERY container it can yield comes with a live pin: a leaf has it unless its set
+is materialized, an AND has it if ANY child has it (all children stand at the key), an OR only if
+EVERY child has it (which children contributed is not known in advance).  A positive source's set is
+only materialized while some positive source still has it.
+
+### Count pushdown (`rbi_customscan.c`)
+
+A new clause kind, `RBI_CLAUSE_MULTI`: an OpExpr whose operator is strategy 2, 3 or 5 of some roaring
+opfamily, with the column on the LEFT (these operators do not commute: `'{a}' @> tags` is strategy 4)
+and a non-NULL Const on the right.  Strategy 4 and everything that is not a roaring operator bail.
+
+- The strategy is read from the OPERATOR (`rbi_op_roaring_strategy()`, a pg_amop lookup restricted to
+  the roaring AM), not from an index, because the parent of a partitioned table has no index list
+  (§16) and the clause kind has to be known before any index is matched.  `rbi_match_index()` then
+  re-checks the strategy against the index that will really answer the clause, per partition.
+- The query is extracted AT PLAN TIME and the clause is only pushed down when the mode is KEYS.  An
+  ALL-mode query would have every row rechecked in the heap, which is what the ordinary bitmap plan
+  already does, better.  `rbi_match_index()` additionally insists that each relation's index carries
+  the very extractQuery function the plan-time extraction used, so the run-time extraction cannot
+  come out differently.
+- At run time the clause's source is the tree over its keys' posting sets, ANDed with the other
+  clauses by the merge, exactly like an IN list's union.  Several multi-key clauses on ONE column are
+  allowed (the one-positive-clause-per-column rule of §10 is for clauses that pin a value;
+  `tags @> '{a}' AND tags && '{b,c}'` is just an AND of three key sets).
+- A multi-key clause pins no value, so the column it constrains cannot be printed by the target list;
+  it does make the column non-null, so `count(col)` is still answerable.
+- **A multi-key index can never DRIVE a count.**  Its entries are keys, not column values, so
+  neither §10's GROUP BY (the groups would be lexemes) nor §14's sum-over-all (a row appears under
+  each of its keys, so the sum of the entries is not the number of rows) is correct.
+  `rbi_find_roaring_index()` takes a `multikey` flag and the driving lookup passes false, which makes
+  `count(*) WHERE tags IS NOT NULL` fall back to the ordinary plan.  GROUP BY on a scalar roaring
+  column next to a multi-key WHERE clause is the supported and tested combination.
+- EXPLAIN prints the clause with its operator: `Roaring Indexes: idx (tags @> {t5,t7})`,
+  `idx (tsv @@ 'w1' & 'w2')`.
+
+### Cardinality guard
+
+Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a
+WARNING, once per backend per index (a static HTAB keyed by relation Oid), and never rejects a row.
+
+- Build: exact.  Pass 1 has just counted the distinct keys, so the test is `ndistinct > max_entries`.
+- Insert: a running estimate, and only on the one path that can add a key - creating a new entry.
+  **The heuristic is `entries on this bucket's chain + 1, times the bucket count`.**  Hashes spread
+  keys evenly enough for the product to have the right order of magnitude, and the bucket chain is
+  already locked and about to be walked anyway, so the guard costs nothing on the hot path.  It is
+  deliberately crude: counting the whole index per new key would read every bucket page.
+
+### Not supported
+
+`<@` from the posting sets (a row matches when it has no key OUTSIDE the query array, which the index
+cannot tell); prefix, phrase and weighted tsqueries from the posting sets; `col op ANY (...)` in the
+count pushdown (only in the bitmap scan); a multi-key index as the GROUP BY or sum-over-all driver;
+`roaring_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
+
+### Measured (2026-09-20, 1M rows, 521 MB heap, all-visible, warm cache)
+
+`tags text[]` of 5 tags out of 1000; `tsv tsvector` of 30 lexemes out of 20000 (4.99M and 29.98M
+(key, row) pairs).
+
+    column   roaring build   roaring size   GIN build   GIN size
+    tags          18.4 s         37 MB        2.9 s      23 MB
+    tsv          107.6 s        390 MB       19.3 s     157 MB
+
+The posting-set BYTES are competitive - 20.4 MB for tags and 177 MB for tsv against GIN's 23 and 157
+- and the size difference is entirely the page-granularity floor of §12 item 3: every one of the
+1000 / 20000 keys is too big to stay inline (5000 and 1500 members) and so owns whole container
+pages, 4 and 2 of them, leaving 10.8 MB and 214 MB of free space inside them.  Sharing a container
+page between keys is what would close that gap, and it is the same item that was already the top
+open one before this section.  The build time is the second half of the same story: 30M (key, row)
+pairs go through one tuplesort and then into 40000 pages that are each written once.
+
+    count(*) WHERE ...                     rows   pushdown   roaring bitmap+Agg   GIN bitmap+Agg
+    tags @> '{t17,t42}'                      16    0.14 ms        0.39 ms            0.72 ms
+    tags && '{t17,t42}'                   10031    0.38 ms        7.6 ms             8.0 ms
+    tsv  @@ to_tsquery('w17 & w42')            1    0.09 ms        0.11 ms            0.23 ms
+    tsv  @@ to_tsquery('w17 | w42')         2915    0.21 ms        2.3 ms             2.3 ms
+
+The bitmap paths are at parity with GIN, heap-bound as §12 measured for scalar keys.  What the
+multi-key classes are for is the first column: the pushdown answers the 10031-row `&&` in 0.38 ms
+against 7.6 ms, because it never visits the heap - `Heap Blocks Skipped via VM: 9358, Heap TIDs
+Rechecked: 0, Containers Visited: 2071`.

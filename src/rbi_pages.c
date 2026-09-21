@@ -16,13 +16,17 @@
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/typcache.h"
 #include "varatt.h"
 
 #include "rbi.h"
@@ -211,27 +215,112 @@ rbi_fill_state(Relation index, RBIState *state, const RBIMetaPageData *meta,
 		elog(ERROR, "roaring index \"%s\" must have exactly one key column",
 			 RelationGetRelationName(index));
 
+	/*
+	 * The index's own tuple descriptor already carries the KEY type, opclass
+	 * STORAGE and polymorphism resolved (see the comment on RBIState.typid),
+	 * so a multi-key class needs no extra type lookup here.
+	 */
 	att = TupleDescAttr(RelationGetDescr(index), 0);
 	state->typid = att->atttypid;
 	get_typlenbyvalalign(state->typid, &state->typlen, &state->typbyval,
 						 &state->typalign);
 	state->collation = index->rd_indcollation[0];
 
-	fmgr_info_copy(&state->hashproc, index_getprocinfo(index, 1, 1), cxt);
+	/*
+	 * A key type that cares about collations must have one: hashtext() and
+	 * the text equality operator both refuse to work without.  The index
+	 * column of a tsvector_ops index is text while the tsvector it is
+	 * extracted from is not collatable at all, so the index has no collation
+	 * to offer; lexemes are byte strings, and C is the collation that hashes
+	 * and compares them bytewise - which is exactly what GIN's
+	 * gin_cmp_tslexeme() does.
+	 */
+	if (!OidIsValid(state->collation) && type_is_collatable(state->typid))
+		state->collation = C_COLLATION_OID;
 
-	eqopr = get_opfamily_member(index->rd_opfamily[0],
-								index->rd_opcintype[0],
-								index->rd_opcintype[0],
-								1);
-	if (!OidIsValid(eqopr))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("operator class of index \"%s\" has no equality operator",
-						RelationGetRelationName(index))));
-	eqfunc = get_opcode(eqopr);
-	if (!OidIsValid(eqfunc))
-		elog(ERROR, "could not find function for operator %u", eqopr);
-	fmgr_info_cxt(eqfunc, &state->eqproc, cxt);
+	/* Multi-key opclass?  Support proc 2 is what says so (DESIGN.md §17). */
+	state->multikey =
+		OidIsValid(index_getprocid(index, 1, RBI_EXTRACTVALUE_PROC));
+
+	if (state->multikey)
+	{
+		if (!OidIsValid(index_getprocid(index, 1, RBI_EXTRACTQUERY_PROC)))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("operator class of index \"%s\" has support function %d but not %d",
+							RelationGetRelationName(index),
+							RBI_EXTRACTVALUE_PROC, RBI_EXTRACTQUERY_PROC)));
+
+		fmgr_info_copy(&state->extractvalue,
+					   index_getprocinfo(index, 1, RBI_EXTRACTVALUE_PROC), cxt);
+		fmgr_info_copy(&state->extractquery,
+					   index_getprocinfo(index, 1, RBI_EXTRACTQUERY_PROC), cxt);
+	}
+
+	/*
+	 * Hashing: the opclass's support function 1 when it has one.  A
+	 * polymorphic multi-key class cannot name a single function for the key
+	 * type (array_ops indexes anyelement), so its hash comes from the key
+	 * type's default hash opclass, the way GIN resolves its comparison
+	 * function in initGinState().
+	 */
+	if (OidIsValid(index_getprocid(index, 1, RBI_HASH_PROC)))
+		fmgr_info_copy(&state->hashproc,
+					   index_getprocinfo(index, 1, RBI_HASH_PROC), cxt);
+	else
+	{
+		TypeCacheEntry *typentry;
+
+		Assert(state->multikey);
+		typentry = lookup_type_cache(state->typid, TYPECACHE_HASH_PROC_FINFO);
+		if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("could not identify a hash function for type %s",
+							format_type_be(state->typid)),
+					 errdetail("Index \"%s\" extracts keys of that type.",
+							   RelationGetRelationName(index))));
+		fmgr_info_copy(&state->hashproc, &typentry->hash_proc_finfo, cxt);
+	}
+
+	/*
+	 * Equality: strategy 1 of the opfamily for a scalar opclass.  A multi-key
+	 * opclass's strategies are about the indexed VALUE (@>, &&, @@), not
+	 * about two keys, so its keys are compared with the key type's default
+	 * equality operator - which is the one its hash opclass agrees with.
+	 */
+	eqopr = state->multikey ? InvalidOid :
+		get_opfamily_member(index->rd_opfamily[0],
+							index->rd_opcintype[0],
+							index->rd_opcintype[0],
+							RBI_STRAT_EQUAL);
+	if (OidIsValid(eqopr))
+	{
+		eqfunc = get_opcode(eqopr);
+		if (!OidIsValid(eqfunc))
+			elog(ERROR, "could not find function for operator %u", eqopr);
+		fmgr_info_cxt(eqfunc, &state->eqproc, cxt);
+	}
+	else
+	{
+		TypeCacheEntry *typentry;
+
+		if (!state->multikey)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("operator class of index \"%s\" has no equality operator",
+							RelationGetRelationName(index))));
+
+		typentry = lookup_type_cache(state->typid, TYPECACHE_EQ_OPR_FINFO);
+		if (!OidIsValid(typentry->eq_opr_finfo.fn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("could not identify an equality operator for type %s",
+							format_type_be(state->typid)),
+					 errdetail("Index \"%s\" extracts keys of that type.",
+							   RelationGetRelationName(index))));
+		fmgr_info_copy(&state->eqproc, &typentry->eq_opr_finfo, cxt);
+	}
 }
 
 /*
@@ -465,20 +554,25 @@ rbi_make_entry(RBIState *state, Datum key, uint32 hash, uint16 flags,
 }
 
 /*
- * Build the reserved NULL-key entry tuple (DESIGN.md §14).
+ * Build a reserved entry tuple: the NULL-key one (DESIGN.md §14) or the
+ * no-key one a multi-key opclass needs for rows it extracts nothing from
+ * (DESIGN.md §17).
  *
- * It has no key at all: keylen 0, hash 0, and the RBI_ENTRY_NULLKEY flag,
- * which is how every reader recognises it.  Its payload is an ordinary
- * INLINE payload, so once it exists the insert, VACUUM and count paths treat
- * it exactly like any other entry.
+ * Neither has a key at all: keylen 0, hash 0, and the reservedflag bit, which
+ * is how every reader recognises them.  The payload is an ordinary INLINE
+ * payload, so once such an entry exists the insert, VACUUM and count paths
+ * treat it exactly like any other.
  */
 RBIEntryTuple *
-rbi_make_null_entry(uint16 flags, const char *payload, Size payloadlen,
-					Size *size)
+rbi_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
+						Size payloadlen, Size *size)
 {
 	RBIEntryTuple *entry;
 	Size		payoff = MAXALIGN(RBI_ENTRY_HDRSZ);
 	Size		total = payoff + payloadlen;
+
+	Assert(reservedflag == RBI_ENTRY_NULLKEY ||
+		   reservedflag == RBI_ENTRY_EMPTYKEY);
 
 	if (total > RBI_MAX_ITEM_SIZE)
 		ereport(ERROR,
@@ -488,7 +582,7 @@ rbi_make_null_entry(uint16 flags, const char *payload, Size payloadlen,
 
 	entry = (RBIEntryTuple *) palloc0(total);
 	entry->hash = RBI_NULLKEY_HASH;
-	entry->flags = flags | RBI_ENTRY_NULLKEY;
+	entry->flags = flags | reservedflag;
 	entry->keylen = 0;
 	entry->head = InvalidBlockNumber;
 	entry->tail = InvalidBlockNumber;
@@ -583,11 +677,11 @@ rbi_find_entry_ext(Relation index, RBIState *state, Buffer headbuf, int lockmode
 				continue;
 
 			/*
-			 * The NULL-key entry has no key to compare and hashes to 0, which
-			 * a real key may hash to as well: it is only ever found through
-			 * rbi_find_null_entry() (DESIGN.md §14).
+			 * A reserved entry has no key to compare and hashes to 0, which a
+			 * real key may hash to as well: they are only ever found through
+			 * rbi_find_reserved_entry() (DESIGN.md §14 and §17).
 			 */
-			if (RBIEntryIsNullKey(entry))
+			if (RBIEntryIsReserved(entry))
 				continue;
 
 			stored = rbi_fetch_key(state, RBIEntryGetKey(entry));
@@ -631,15 +725,18 @@ rbi_find_entry(Relation index, RBIState *state, Buffer headbuf, int lockmode,
 }
 
 /*
- * Find the reserved NULL-key entry (DESIGN.md §14).  It lives in bucket 0 and
- * is recognised by its flag; headbuf must be the head page of bucket 0, held
- * in lockmode by the caller, and is left locked.
+ * Find a reserved entry (DESIGN.md §14 and §17).  Both live in bucket 0 and
+ * are recognised by their flag; headbuf must be the head page of bucket 0,
+ * held in lockmode by the caller, and is left locked.
  */
 bool
-rbi_find_null_entry(Relation index, Buffer headbuf, int lockmode,
-					Buffer *buf, OffsetNumber *offnum)
+rbi_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
+						uint16 reservedflag, Buffer *buf, OffsetNumber *offnum)
 {
 	Buffer		cur = headbuf;
+
+	Assert(reservedflag == RBI_ENTRY_NULLKEY ||
+		   reservedflag == RBI_ENTRY_EMPTYKEY);
 
 	for (;;)
 	{
@@ -658,7 +755,7 @@ rbi_find_null_entry(Relation index, Buffer headbuf, int lockmode,
 			if (!ItemIdIsUsed(iid))
 				continue;
 			entry = (RBIEntryTuple *) PageGetItem(page, iid);
-			if (!RBIEntryIsNullKey(entry))
+			if ((entry->flags & reservedflag) == 0)
 				continue;
 
 			*buf = cur;
@@ -1384,4 +1481,103 @@ rbi_split_and_place(Relation index, Buffer buf, OffsetNumber off, bool replace,
 	}
 	if (delofs)
 		pfree(delofs);
+}
+
+/* ---------------------------------------------------------------------
+ * Cardinality guard (DESIGN.md §17)
+ *
+ * The `max_entries` reloption is advisory: an index that grows past it keeps
+ * working and keeps accepting rows, but says so once.  It exists because a
+ * multi-key opclass makes it easy to index a column with millions of distinct
+ * keys by accident (a tsvector of a whole document collection, an array of
+ * UUIDs), and an inverted index with one entry per row is a slow way of
+ * storing a table.
+ * --------------------------------------------------------------------- */
+
+/* Indexes this backend has already complained about, keyed by relation Oid. */
+static HTAB *rbi_warned_indexes = NULL;
+
+int
+rbi_max_entries(Relation index)
+{
+	RBIOptions *opts = (RBIOptions *) index->rd_options;
+
+	return opts ? opts->max_entries : RBI_DEFAULT_MAX_ENTRIES;
+}
+
+int64
+rbi_bucket_nentries(Relation index, Buffer headbuf)
+{
+	Buffer		cur = headbuf;
+	int64		n = 0;
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+		OffsetNumber off;
+		BlockNumber next;
+
+		Assert(RBIPageIsBucket(page));
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			if (ItemIdIsUsed(PageGetItemId(page, off)))
+				n++;
+		}
+
+		next = RBIPageGetOpaque(page)->rightlink;
+		if (!BlockNumberIsValid(next))
+			break;
+
+		{
+			Buffer		nbuf = ReadBuffer(index, next);
+
+			/*
+			 * The caller holds the head locked, which serialises this walk
+			 * against every writer of the bucket, so a SHARE lock on the
+			 * further pages is enough.
+			 */
+			LockBuffer(nbuf, BUFFER_LOCK_SHARE);
+			if (cur != headbuf)
+				UnlockReleaseBuffer(cur);
+			cur = nbuf;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (cur != headbuf)
+		UnlockReleaseBuffer(cur);
+
+	return n;
+}
+
+void
+rbi_warn_max_entries(Relation index, int64 nentries)
+{
+	Oid			relid = RelationGetRelid(index);
+	bool		found;
+
+	if (rbi_warned_indexes == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(Oid);
+		ctl.hcxt = TopMemoryContext;
+		rbi_warned_indexes = hash_create("roaring index max_entries warnings",
+										 16, &ctl,
+										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	(void) hash_search(rbi_warned_indexes, &relid, HASH_ENTER, &found);
+	if (found)
+		return;					/* this backend has said it once already */
+
+	ereport(WARNING,
+			(errmsg("roaring index \"%s\" has more than %d distinct keys",
+					RelationGetRelationName(index), rbi_max_entries(index)),
+			 errdetail("The index holds about " INT64_FORMAT " entries; its max_entries option is %d.",
+					   nentries, rbi_max_entries(index)),
+			 errhint("Raise max_entries, or index a column with fewer distinct keys.")));
 }

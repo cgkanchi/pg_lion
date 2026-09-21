@@ -114,6 +114,18 @@ typedef struct RBICountSource
 	int			nsets;
 	RBIPostingSet *sets;		/* nsets located posting sets */
 	bool		negated;
+
+	/*
+	 * How the sets combine (DESIGN.md §17).  NULL means the union of all of
+	 * them, which is what §15's IN lists want and what every caller written
+	 * before multi-key opclasses existed gets.  Otherwise it is a boolean
+	 * tree whose RBI_KN_KEY leaves name sets by their position in sets[]:
+	 * an AND for `tags @> '{a,b}'`, an OR for `&&`, and whatever shape a
+	 * tsquery of ANDs and ORs has.
+	 *
+	 * A negated source is subtracted whatever its shape.
+	 */
+	RBIKeyNode *tree;
 } RBICountSource;
 
 /*
@@ -164,6 +176,33 @@ extern int64 rbi_count_sources(Relation heap, Snapshot snapshot,
 extern int64 rbi_count_keys(Relation heap, Snapshot snapshot, int nkeys,
 							Relation *indexes, Datum *keys, Oid *keytypes,
 							RBICountStats *stats);
+
+/*
+ * Walk the containers of (tree over sets) in ascending container-key order,
+ * calling cb for each one; the container is only valid until cb returns, and
+ * cb returning false stops the walk.  tree may be NULL, which means the union
+ * of every set, exactly as in RBICountSource.
+ *
+ * This is the set algebra of rbi_count_sources() without the visibility map:
+ * what the bitmap scan of a multi-key opclass needs (DESIGN.md §17), where
+ * every matching TID is handed to the executor and no heap page is skipped.
+ * Returns the number of members emitted.
+ *
+ * The caller must have located every set and must release them afterwards.
+ */
+typedef bool (*rbi_container_callback) (const RBIContainer *c, void *arg);
+
+extern int64 rbi_sets_iterate(int nsets, RBIPostingSet *sets,
+							  RBIKeyNode *tree,
+							  rbi_container_callback cb, void *arg);
+
+/*
+ * Can (tree over sets) select anything at all?  False when a key the tree
+ * requires has no entry in the index, which lets a caller skip the whole
+ * merge - and, in the GROUP BY path, every group of it.
+ */
+extern bool rbi_sets_satisfiable(int nsets, RBIPostingSet *sets,
+								 RBIKeyNode *tree);
 
 /* ---------------------------------------------------------------------
  * Iterating every entry of an index (the GROUP BY path of section 10)

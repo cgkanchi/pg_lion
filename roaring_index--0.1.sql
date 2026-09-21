@@ -168,6 +168,40 @@ CREATE OPERATOR CLASS enum_ops DEFAULT FOR TYPE anyenum USING roaring AS
 	FUNCTION	1	hashenum(anyenum);
 
 /* ---------------------------------------------------------------------
+ * Multi-key operator classes (DESIGN.md §17)
+ *
+ * One indexed value contributes many keys.  The extraction is GIN's, reused
+ * verbatim: support function 2 is extractValue and 3 is extractQuery, with
+ * GIN's own signatures, so `ginarrayextract` and friends are named here
+ * directly.  What is NOT reused is GIN's consistent function - a roaring scan
+ * combines whole posting sets instead of testing one row at a time - so the
+ * strategy numbers and what they mean are the roaring AM's own:
+ *
+ *		1 =		2 @>	3 &&	4 <@	5 @@
+ *
+ * The STORAGE type is the key type.  array_ops stores anyelement, which is
+ * resolved to the column's element type when the index is created, and has
+ * no support function 1 for that reason: the element type's own default hash
+ * opclass is used instead (rbi_fill_state()).  tsvector_ops stores text and
+ * can name hashtext().
+ * --------------------------------------------------------------------- */
+
+CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING roaring AS
+	OPERATOR	2	@> (anyarray, anyarray),
+	OPERATOR	3	&& (anyarray, anyarray),
+	OPERATOR	4	<@ (anyarray, anyarray),
+	FUNCTION	2	ginarrayextract(anyarray, internal, internal),
+	FUNCTION	3	ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
+	STORAGE		anyelement;
+
+CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING roaring AS
+	OPERATOR	5	@@ (tsvector, tsquery),
+	FUNCTION	1	hashtext(text),
+	FUNCTION	2	gin_extract_tsvector(tsvector, internal, internal),
+	FUNCTION	3	gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal),
+	STORAGE		text;
+
+/* ---------------------------------------------------------------------
  * count functions (rbi_count.c)
  *
  * Heap-skipping count(*) over the posting sets of one or two roaring
@@ -224,13 +258,14 @@ CREATE FUNCTION roaring_index_stats(idx regclass,
 									OUT free_bytes int8,
 									OUT sparse_segments int8,
 									OUT sparse_members int8,
-									OUT null_tids int8)
+									OUT null_tids int8,
+									OUT empty_tids int8)
 RETURNS record
 AS 'MODULE_PATHNAME', 'roaring_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION roaring_index_stats(regclass) IS
-	'shape of a roaring index: pages, entries, containers by kind, sparse segments and NULL keys';
+	'shape of a roaring index: pages, entries, containers by kind, sparse segments, NULL keys and key-less rows';
 
 CREATE FUNCTION roaring_index_verify(idx regclass,
 									 heapallindexed bool DEFAULT false)

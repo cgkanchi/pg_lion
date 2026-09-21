@@ -48,6 +48,7 @@ generic-WAL records, and concurrent insert/delete/vacuum/read stress runs. Nothi
     src/rbi_funcs.c        roaring_index_stats(), roaring_index_verify()
     src/rbi_count.[ch]     rbi_count_keys(): VM-interlocked counting, per-block batched heap recheck
     src/rbi_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "RoaringCount"
+    src/rbi_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit
 
 ## Key types
@@ -59,25 +60,49 @@ One default operator class per type, reusing the hash access method's hash funct
 `oid`, and any enum. Case-insensitive text: `CREATE EXTENSION roaring_index_citext` (requires
 `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2000 bytes are rejected.
 
+## Multi-key columns: arrays and tsvector (DESIGN.md §17)
+
+`array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
+extraction functions, and answer
+
+    CREATE INDEX ON doc USING roaring (tags);       -- text[], int[], ...
+    CREATE INDEX ON doc USING roaring (tsv);        -- tsvector
+
+    tags @> '{a,b}'    the intersection of the elements' posting sets, exact
+    tags && '{a,b}'    their union, exact
+    tags <@ '{a,b}'    every indexed row, rechecked in the heap
+    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact
+
+`count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
+combined with a `GROUP BY` on a scalar roaring column. Everything a plain AND/OR of key sets cannot
+express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*` or weights - falls
+back to scanning every indexed row and rechecking it, which is correct but no faster than GIN. The
+reloption `max_entries` (default 0 = unlimited) makes the index warn once per backend when it grows
+past that many distinct keys; it never rejects a row.
+
 ## Reloptions
 
-`buckets` (0 = chosen by the build, otherwise the exact number of hash buckets, max 65536) and
+`buckets` (0 = chosen by the build, otherwise the exact number of hash buckets, max 65536),
+`max_entries` (0 = unlimited; the advisory cardinality guard above) and
 `inline_limit` (64 .. 4096 bytes, default 4096): how large a key's posting set may be before it
 moves out of its entry tuple onto container pages of its own. The build chooses the bucket count
 from the BYTES its entries need, at three quarters of a page per bucket - not from the number of
 distinct keys - because every bucket owns a head page whether it needs one or not. Bucket counts
 are no longer rounded to a power of two; a hash is mapped to its bucket with a modulo.
 `roaring_index_stats()` reports the bucket count, the pages and entries, the containers by kind,
-the sparse segments, and `null_tids`, the number of rows whose key is NULL.
+the sparse segments, `null_tids`, the number of rows whose key is NULL, and `empty_tids`, the number
+of rows a multi-key opclass extracted no key from.
 
 ## Known limitations
 
-Single column, equality and `IN` lists only (no ranges), no `amgettuple`/index-only scans, no
+Single column, equality, `IN` lists and the multi-key operators above (no ranges), no
+`amgettuple`/index-only scans, no
 parallel build or scan, no page recycling, inserts serialise per hash bucket and cost about 4x a
 btree insert (a container is copied out and back per insert, except bitsets), count pushdown handles
-`Const` keys only (no `Param`, partitions, or multi-column GROUP BY), `IN` lists of more than 1000
-values are left to the ordinary plan, and the cost model inherits the stale `relallvisible` blind
-spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
+`Const` keys only (no `Param` or multi-column GROUP BY), `IN` lists of more than 1000
+values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a
+sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
+stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
 with an error and have to be rebuilt with REINDEX.
 
 ## Index size after the v1 build policy (5M rows, 2026-09-20)

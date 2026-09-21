@@ -81,9 +81,9 @@ SELECT rbi_ins_check('single rows');
 (1 row)
 
 SELECT * FROM roaring_index_stats('rbi_ins_k');
- nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids 
-----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------
-       64 |           64 |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |     521224 |               4 |              5 |         0
+ nbuckets | bucket_pages | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids 
+----------+--------------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------
+       64 |           64 |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |     521224 |               4 |              5 |         0 |          0
 (1 row)
 
 -- Phase 2: multi-row VALUES.

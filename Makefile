@@ -1,7 +1,8 @@
 # roaring_index — build with: make PG_CONFIG=.local/pg/bin/pg_config
 MODULE_big = roaring_index
 OBJS = src/rbi_container.o src/rbi_sparse.o src/rbi_pages.o src/rbi_am.o src/rbi_build.o src/rbi_scan.o \
-       src/rbi_insert.o src/rbi_vacuum.o src/rbi_funcs.o src/rbi_count.o src/rbi_customscan.o
+       src/rbi_insert.o src/rbi_vacuum.o src/rbi_funcs.o src/rbi_count.o src/rbi_customscan.o \
+       src/rbi_multikey.o
 PGFILEDESC = "roaring_index - roaring bitmap inverted index"
 
 EXTENSION = roaring_index roaring_index_citext

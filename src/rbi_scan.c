@@ -8,6 +8,13 @@
  * `IS NOT NULL` (DESIGN.md §14, amsearchnulls).  The scan finds the entries
  * the qual selects and emits their posting sets into the caller's TIDBitmap.
  *
+ * A multi-key opclass (DESIGN.md §17) answers `@>`, `&&`, `<@` and `@@`
+ * instead.  The query is handed to the opclass's extractQuery function, which
+ * yields keys and a mode; an exact mode gives a boolean tree over those keys,
+ * whose posting sets are combined by the very evaluator the count pushdown
+ * uses (rbi_sets_iterate(), DESIGN.md §9 cursors), and anything else falls
+ * back to emitting every indexed row with recheck set.
+ *
  * Only one page lock is held at a time, and never across the TIDBitmap calls:
  * every page is copied into backend-local memory before its containers are
  * emitted.  The bucket page is always released before any container page is
@@ -25,9 +32,11 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "rbi.h"
+#include "rbi_count.h"
 
 typedef struct RBIScanOpaqueData
 {
@@ -422,11 +431,24 @@ rbi_emit_null(Relation index, RBIState *state, TIDBitmap *tbm, bool recheck)
 }
 
 /*
- * `col IS NOT NULL` (DESIGN.md §14): the union of every entry but the NULL
- * one, which means walking the whole index.  Correct, and expensive in
- * proportion to the number of distinct keys - the planner's cost estimate for
- * such a scan is the whole index, so it only happens when that is cheap or
- * when nothing else can answer the query.
+ * Every indexed row: the union of every entry but the NULL one, which means
+ * walking the whole index.  Correct, and expensive in proportion to the
+ * number of distinct keys - the planner's cost estimate for such a scan is
+ * the whole index, so it only happens when that is cheap or when nothing else
+ * can answer the query.
+ *
+ * Two quals need it:
+ *
+ *	- `col IS NOT NULL` (DESIGN.md §14), which is exactly "every row whose
+ *	  value is not NULL" and needs no recheck of its own;
+ *	- the ALL fallback of a multi-key query (DESIGN.md §17): `tags @> '{}'`,
+ *	  `<@`, a tsquery with NOT/phrase/prefix/weights.  Those ask for a
+ *	  superset and the caller passes recheck = true.
+ *
+ * The reserved EMPTY entry is emitted like any other, which is what it exists
+ * for: a row an opclass extracted no key from is under no key, and only a
+ * walk like this one can find it.  The NULL entry is left out, because a NULL
+ * value satisfies neither kind of qual (the multi-key operators are strict).
  *
  * Each bucket page is copied into backend-local memory and released before
  * its entries are emitted, so no bucket page is held while container pages
@@ -436,7 +458,7 @@ rbi_emit_null(Relation index, RBIState *state, TIDBitmap *tbm, bool recheck)
  * this scan can see.
  */
 static int64
-rbi_emit_not_null(Relation index, RBIState *state, TIDBitmap *tbm,
+rbi_emit_all_keys(Relation index, RBIState *state, TIDBitmap *tbm,
 				  bool recheck)
 {
 	PGAlignedBlock *copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
@@ -496,6 +518,166 @@ rbi_emit_not_null(Relation index, RBIState *state, TIDBitmap *tbm,
 
 	pfree(copy);
 	return ntids;
+}
+
+/* ---------------------------------------------------------------------
+ * Multi-key opclasses (DESIGN.md §17)
+ * --------------------------------------------------------------------- */
+
+/* State threaded through rbi_sets_iterate() by rbi_emit_query(). */
+typedef struct RBIQueryEmitState
+{
+	TIDBitmap  *tbm;
+	bool		recheck;
+	int64		ntids;
+} RBIQueryEmitState;
+
+static bool
+rbi_query_emit_cb(const RBIContainer *c, void *arg)
+{
+	RBIQueryEmitState *es = (RBIQueryEmitState *) arg;
+
+	es->ntids += rbi_container_to_tbm(c, es->tbm, es->recheck);
+	return true;
+}
+
+/*
+ * Answer one multi-key query (`tags @> '{a,b}'`, `tsv @@ 'a & b'`, ...).
+ *
+ * The opclass's extractQuery function says which keys the query needs and how
+ * exactly they answer it; rbi_extract_query() turns that into one of three
+ * shapes (DESIGN.md §17):
+ *
+ *	NONE	nothing can match - `tags && '{}'`, an empty tsquery;
+ *	KEYS	the rows are exactly the ones a boolean tree over the keys
+ *			selects, so the posting sets are located and combined and the
+ *			TIDs go out without a recheck of their own;
+ *	ALL		the index cannot decide, so every indexed row goes out with
+ *			recheck set and the bitmap heap scan re-applies the operator.
+ *
+ * The posting sets are ALL located before any of them is walked, which keeps
+ * the reader side of the DESIGN.md §11 deadlock rule: every bucket-page lock
+ * this function takes is taken before the first container page is pinned.
+ */
+static int64
+rbi_emit_query(Relation index, RBIState *state, StrategyNumber strategy,
+			   Datum query, TIDBitmap *tbm, bool recheck)
+{
+	RBIQuery	q;
+	RBIPostingSet *sets;
+	RBIQueryEmitState es;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	int			i;
+
+	/*
+	 * The extracted keys, the tree and the located payloads all live and die
+	 * with one query.  A scan of `col op ANY (...)` calls this once per
+	 * element, and a tsquery can carry hundreds of lexemes, so they get a
+	 * context of their own rather than the executor's.
+	 */
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"roaring index multikey scan",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	rbi_extract_query(state, query, strategy, &q);
+
+	if (q.mode != RBI_QMODE_KEYS)
+	{
+		int64		ntids = 0;
+
+		MemoryContextSwitchTo(oldcxt);
+		if (q.mode == RBI_QMODE_ALL)
+			ntids = rbi_emit_all_keys(index, state, tbm, true);
+		MemoryContextDelete(cxt);
+		return ntids;
+	}
+
+	Assert(q.nkeys > 0 && q.tree != NULL);
+
+	sets = (RBIPostingSet *) palloc0(sizeof(RBIPostingSet) * q.nkeys);
+	for (i = 0; i < q.nkeys; i++)
+	{
+		(void) rbi_posting_set_lookup(index, q.keys[i], InvalidOid, &sets[i]);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	es.tbm = tbm;
+	es.recheck = recheck;
+	es.ntids = 0;
+
+	(void) rbi_sets_iterate(q.nkeys, sets, q.tree, rbi_query_emit_cb, &es);
+
+	/* Every pin goes before the memory the sets live in does. */
+	for (i = 0; i < q.nkeys; i++)
+		rbi_posting_set_release(&sets[i]);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	return es.ntids;
+}
+
+/*
+ * The multi-key entry point of the scan.
+ *
+ * `col op ANY (const array)` reaches a multi-key index too (amsearcharray is
+ * on for the scalar classes of DESIGN.md §15), and there the array holds one
+ * QUERY per element - an array of arrays, or of tsqueries.  Each is answered
+ * separately and the results go into the same bitmap, which is their union
+ * and exactly what `ANY` means; a TIDBitmap is a set, so overlapping elements
+ * cost nothing but the second lookup.
+ */
+static int64
+rbi_emit_multikey(IndexScanDesc scan, RBIScanOpaque so, ScanKey skey,
+				  TIDBitmap *tbm)
+{
+	Relation	index = scan->indexRelation;
+	RBIState   *state = so->state;
+
+	/*
+	 * A strategy this file does not know is an ERROR and not an empty result:
+	 * the opclass would be claiming an operator the scan cannot answer, and
+	 * answering "no rows" would be a wrong answer rather than a missing
+	 * optimisation.  rbi_gin_strategy() raises it.
+	 */
+	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
+	{
+		ArrayType  *arr = DatumGetArrayTypeP(skey->sk_argument);
+		Oid			elemtype = ARR_ELEMTYPE(arr);
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		int64		ntids = 0;
+		int			i;
+
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+						  &elems, &nulls, &nelems);
+
+		for (i = 0; i < nelems; i++)
+		{
+			if (nulls[i])
+				continue;		/* a strict operator with a NULL is not true */
+			ntids += rbi_emit_query(index, state, skey->sk_strategy,
+									elems[i], tbm, so->recheck);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		pfree(elems);
+		pfree(nulls);
+		if ((Pointer) arr != DatumGetPointer(skey->sk_argument))
+			pfree(arr);
+
+		return ntids;
+	}
+
+	return rbi_emit_query(index, state, skey->sk_strategy, skey->sk_argument,
+						  tbm, so->recheck);
 }
 
 int64
@@ -567,12 +749,17 @@ rbigetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	if ((skey->sk_flags & SK_SEARCHNULL) != 0)
 		return rbi_emit_null(index, state, tbm, so->recheck);
 	if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
-		return rbi_emit_not_null(index, state, tbm, so->recheck);
+		return rbi_emit_all_keys(index, state, tbm, so->recheck);
 
 	/* `col = NULL` (or a NULL array) is never true. */
 	if ((skey->sk_flags & SK_ISNULL) != 0)
 		return 0;
-	if (skey->sk_strategy != 1)
+
+	/* A multi-key opclass answers the strategies of DESIGN.md §17. */
+	if (state->multikey)
+		return rbi_emit_multikey(scan, so, skey, tbm);
+
+	if (skey->sk_strategy != RBI_STRAT_EQUAL)
 		return 0;
 
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)

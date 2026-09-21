@@ -97,15 +97,28 @@ rbi_bucket_of(uint32 hash, uint32 nbuckets)
 #define RBI_ENTRY_INLINE	0x0001
 #define RBI_ENTRY_CHAIN		0x0002
 #define RBI_ENTRY_NULLKEY	0x0004	/* the reserved NULL-key entry, DESIGN.md §14 */
+#define RBI_ENTRY_EMPTYKEY	0x0008	/* the reserved no-key entry, DESIGN.md §17 */
+
+#define RBI_ENTRY_RESERVED	(RBI_ENTRY_NULLKEY | RBI_ENTRY_EMPTYKEY)
 
 /*
- * The posting set of the rows whose key is NULL lives in one reserved entry
- * per index: keylen 0, hash 0, always in bucket 0, and recognised by the
- * RBI_ENTRY_NULLKEY flag rather than by comparing keys (there is no key to
- * compare).  Everything that searches a bucket for a key must therefore skip
- * it, and everything that reads a stored key must ask first.
+ * Two entries per index have no key at all: keylen 0, hash 0, always in
+ * bucket 0, and recognised by a flag rather than by comparing keys.
+ *
+ *	- RBI_ENTRY_NULLKEY holds the rows whose indexed VALUE is NULL
+ *	  (DESIGN.md §14).
+ *	- RBI_ENTRY_EMPTYKEY holds the rows a multi-key opclass extracted no key
+ *	  from at all - an empty array, a tsvector with no lexemes (DESIGN.md
+ *	  §17).  A scalar opclass never creates it.
+ *
+ * Everything that searches a bucket for a key must skip both, and everything
+ * that reads a stored key must ask first.  They are reached only through
+ * rbi_find_reserved_entry() and its two wrappers.  A row is in exactly one of
+ * them or under its own keys, never in two.
  */
 #define RBIEntryIsNullKey(e)	(((e)->flags & RBI_ENTRY_NULLKEY) != 0)
+#define RBIEntryIsEmptyKey(e)	(((e)->flags & RBI_ENTRY_EMPTYKEY) != 0)
+#define RBIEntryIsReserved(e)	(((e)->flags & RBI_ENTRY_RESERVED) != 0)
 #define RBI_NULLKEY_HASH		0
 #define RBI_NULLKEY_BUCKET		0
 
@@ -140,21 +153,125 @@ typedef struct RBIOptions
 	int32		vl_len_;		/* varlena header (do not touch directly) */
 	int			buckets;		/* 0 = auto */
 	int			inline_limit;
+	int			max_entries;	/* 0 = unlimited (DESIGN.md §17) */
 } RBIOptions;
+
+#define RBI_DEFAULT_MAX_ENTRIES		0
 
 /* ---------- per-relation cached state (rd_amcache) ---------- */
 
 typedef struct RBIState
 {
 	RBIMetaPageData meta;		/* copy of the meta page */
-	Oid			typid;			/* key type */
+
+	/*
+	 * The KEY type: what an entry tuple stores, hashes and compares.  It is
+	 * the type of the index's own tuple descriptor column, which core has
+	 * already resolved from the opclass: the indexed column's type for a
+	 * scalar opclass, and the opclass STORAGE type - with a polymorphic
+	 * anyelement replaced by the column's element type - for a multi-key one
+	 * (ConstructTupleDescriptor() in catalog/index.c does that, so a
+	 * roaring array_ops index on text[] has a text key column).
+	 */
+	Oid			typid;
 	int16		typlen;
 	bool		typbyval;
 	char		typalign;
 	Oid			collation;
-	FmgrInfo	hashproc;		/* opclass support proc 1 */
-	FmgrInfo	eqproc;			/* function behind the strategy-1 operator */
+	FmgrInfo	hashproc;		/* opclass support proc 1, or the key type's
+								 * default hash opclass proc */
+	FmgrInfo	eqproc;			/* strategy-1 operator's function, or the key
+								 * type's default equality */
+
+	/*
+	 * Multi-key opclasses (DESIGN.md §17): one indexed value yields many
+	 * keys through GIN's extractValue, and a query yields keys and a mode
+	 * through GIN's extractQuery.  multikey is false for every scalar
+	 * opclass, and then neither FmgrInfo is valid.
+	 */
+	bool		multikey;
+	FmgrInfo	extractvalue;	/* support proc 2 */
+	FmgrInfo	extractquery;	/* support proc 3 */
 } RBIState;
+
+/* ---------- multi-key extraction (DESIGN.md §17, rbi_multikey.c) ---------- */
+
+/*
+ * Strategy numbers of the roaring AM.  1 is the only one a scalar opclass
+ * has; 2 .. 5 belong to the multi-key classes.
+ */
+#define RBI_STRAT_EQUAL			1
+#define RBI_STRAT_CONTAINS		2	/* anyarray @> anyarray */
+#define RBI_STRAT_OVERLAP		3	/* anyarray && anyarray */
+#define RBI_STRAT_CONTAINED		4	/* anyarray <@ anyarray */
+#define RBI_STRAT_MATCH			5	/* tsvector @@ tsquery */
+#define RBI_NSTRATEGIES			5
+
+/* Support procedure numbers. */
+#define RBI_HASH_PROC			1
+#define RBI_EXTRACTVALUE_PROC	2
+#define RBI_EXTRACTQUERY_PROC	3
+#define RBI_NPROC				3
+
+/*
+ * What a query over a multi-key index selects.
+ *
+ *	RBI_QMODE_NONE	nothing at all (`tags && '{}'`)
+ *	RBI_QMODE_KEYS	exactly the rows the key tree selects; no recheck
+ *	RBI_QMODE_ALL	every indexed row, with recheck (`tags @> '{}'`, `<@`,
+ *					a tsquery with NOT/phrase/prefix/weights, a NULL key)
+ */
+typedef enum RBIQueryMode
+{
+	RBI_QMODE_NONE = 0,
+	RBI_QMODE_KEYS,
+	RBI_QMODE_ALL
+} RBIQueryMode;
+
+/*
+ * A boolean tree over extracted keys.  A leaf names a key by its position in
+ * the array the extraction produced; the count code reuses the very same
+ * structure with keyno naming a located posting set instead, which is what
+ * lets one evaluator serve both the bitmap scan and the count pushdown.
+ */
+typedef enum RBIKeyNodeKind
+{
+	RBI_KN_KEY = 0,
+	RBI_KN_AND,
+	RBI_KN_OR
+} RBIKeyNodeKind;
+
+typedef struct RBIKeyNode
+{
+	RBIKeyNodeKind kind;
+	int			keyno;			/* RBI_KN_KEY only */
+	int			nargs;
+	struct RBIKeyNode **args;
+} RBIKeyNode;
+
+typedef struct RBIQuery
+{
+	RBIQueryMode mode;
+	int			nkeys;			/* keys the extraction produced */
+	Datum	   *keys;
+	RBIKeyNode *tree;			/* RBI_QMODE_KEYS only; over keys[] */
+} RBIQuery;
+
+/*
+ * Extract the keys of one indexed value with support proc 2, drop the NULL
+ * ones and the duplicates, and return them in *keys (palloc'd in the current
+ * context) with the count as the return value.  Zero keys means the row
+ * belongs in the reserved EMPTY entry.
+ */
+extern int rbi_extract_value(RBIState *state, Datum value, Datum **keys);
+
+/*
+ * Extract a query with support proc 3 and work out how its keys combine
+ * (DESIGN.md §17).  Everything is palloc'd in the current context.
+ */
+extern void rbi_extract_query(RBIState *state, Datum query,
+							  StrategyNumber strategy, RBIQuery *q);
+
 
 /* ---------- rbi_pages.c: primitives shared by build/insert/scan/vacuum ---------- */
 
@@ -185,19 +302,46 @@ extern RBIEntryTuple *rbi_make_entry(RBIState *state, Datum key, uint32 hash, ui
 									 const char *payload, Size payloadlen, Size *size);
 
 /*
- * The same for the reserved NULL-key entry (DESIGN.md §14): no key, hash 0,
- * RBI_ENTRY_NULLKEY set on top of the caller's INLINE/CHAIN flag.
+ * The same for a reserved entry (DESIGN.md §14 and §17): no key, hash 0, and
+ * reservedflag - exactly one of RBI_ENTRY_NULLKEY and RBI_ENTRY_EMPTYKEY -
+ * set on top of the caller's INLINE/CHAIN flag.
  */
-extern RBIEntryTuple *rbi_make_null_entry(uint16 flags, const char *payload,
-										  Size payloadlen, Size *size);
+extern RBIEntryTuple *rbi_make_reserved_entry(uint16 reservedflag, uint16 flags,
+											  const char *payload,
+											  Size payloadlen, Size *size);
 
 /*
- * Find the NULL-key entry in bucket 0, whose head page the caller holds
- * locked in lockmode (and keeps locked).  The buf and offnum outputs work
- * exactly as they do for rbi_find_entry().
+ * Find a reserved entry in bucket 0, whose head page the caller holds locked
+ * in lockmode (and keeps locked).  The buf and offnum outputs work exactly as
+ * they do for rbi_find_entry().
  */
-extern bool rbi_find_null_entry(Relation index, Buffer headbuf, int lockmode,
-								Buffer *buf, OffsetNumber *offnum);
+extern bool rbi_find_reserved_entry(Relation index, Buffer headbuf,
+									int lockmode, uint16 reservedflag,
+									Buffer *buf, OffsetNumber *offnum);
+
+static inline bool
+rbi_find_null_entry(Relation index, Buffer headbuf, int lockmode,
+					Buffer *buf, OffsetNumber *offnum)
+{
+	return rbi_find_reserved_entry(index, headbuf, lockmode,
+								   RBI_ENTRY_NULLKEY, buf, offnum);
+}
+
+/*
+ * Warn once per backend per index when an index has grown past its
+ * max_entries reloption (DESIGN.md §17).  nentries is an estimate; the
+ * warning never rejects a row.
+ */
+extern void rbi_warn_max_entries(Relation index, int64 nentries);
+
+/* The max_entries reloption of an index, 0 when unlimited. */
+extern int rbi_max_entries(Relation index);
+
+/*
+ * Number of entries on the bucket chain starting at headbuf, which the caller
+ * holds locked.  Only the cardinality guard calls this.
+ */
+extern int64 rbi_bucket_nentries(Relation index, Buffer headbuf);
 
 /*
  * Add a new entry to the bucket chain starting at headbuf (held EXCLUSIVE).
