@@ -1,6 +1,8 @@
 # Frequent progress benchmark
 
-Use [quick.py](quick.py) after building and installing the current extension. The `quick-v2` default covers **both 1,000,000 and 5,000,000 scalar rows**, plus **200,000 documents**, with two timing rounds. The [measured run](results/quick/2026-09-21-scales/REPORT.md) finished in **268.1 seconds (4 minutes 28 seconds)**, including cluster initialization and shutdown, with **320 timings and 160 exact-result checks**, all passing. This runtime validation used the same installed release PostgreSQL/extension binaries as the earlier small baseline. Runtime depends on hardware/build settings; the measurement deadline is five minutes.
+Use [quick.py](quick.py) after building and installing the current extension. The `quick-v2` default covers **both 1,000,000 and 5,000,000 scalar rows**, plus **200,000 documents**, with two timing rounds. The [current measured run at `481f876`](results/quick/2026-09-21-481f876/REPORT.md) finished in **231.4 seconds (3 minutes 51 seconds)**, including cluster initialization and shutdown, with **320 timings and 160 exact-result checks**, all passing. This used a freshly rebuilt release extension. Runtime depends on hardware/build settings; the measurement deadline is five minutes.
+
+The [pre-rename 1M/5M run](results/quick/2026-09-21-scales/REPORT.md) finished in 268.1 seconds and remains historical evidence. Renaming the access method in the SQL changes the workload hash, so automatic comparison with that run is rejected. Use the current run as a new baseline only with matching environment/workload settings. The `roaring` and `roaring_bitmap` portfolio labels are retained; both now use the `lion` access method.
 
 The earlier [500k/50k baseline](results/quick/2026-09-21-baseline/REPORT.md) remains a historical `quick-v1` run. The larger profile requires a new baseline; the runner rejects comparisons between these profiles.
 

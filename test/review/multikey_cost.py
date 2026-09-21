@@ -34,10 +34,10 @@ def settings(db, mode):
 try:
     cluster.start(initialize=True)
     db = cluster.db
-    db.query('CREATE EXTENSION roaring_index')
+    db.query('CREATE EXTENSION pg_lion')
     db.query('CREATE TABLE docs WITH (fillfactor=90) AS ' + doc_data(args.rows))
     db.query('VACUUM (FREEZE,ANALYZE) docs')
-    db.query('CREATE INDEX ix_tsv ON docs USING roaring(tsv)')
+    db.query('CREATE INDEX ix_tsv ON docs USING lion(tsv)')
     metadata['server'] = db.scalar('SELECT version()')
     metadata['heap_pages'] = db.scalar("SELECT pg_relation_size('docs')/8192")
     settings(db, 'sequential')

@@ -1,0 +1,51 @@
+{
+  "profile": "quick-v2",
+  "arguments": {
+    "prefix": "/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/pginst",
+    "output": "bench/results/quick/2026-09-21-481f876",
+    "baseline": null,
+    "report_only": null,
+    "rows": [
+      1000000,
+      5000000
+    ],
+    "documents": 200000,
+    "repeats": 2,
+    "warmups": 1,
+    "seed": 20260921,
+    "max_seconds": 300,
+    "resume": false,
+    "keep_cluster": false,
+    "build_repeats": 1
+  },
+  "status": "complete",
+  "started_utc": "2026-09-21T17:46:21Z",
+  "commit": "481f8769caf4b28ba228c865921fad0ca7cc80d9",
+  "source_diff": "diff --git a/test/review/partition_estimate.sql b/test/review/partition_estimate.sql\nindex 84c71bc..881ee21 100644\n--- a/test/review/partition_estimate.sql\n+++ b/test/review/partition_estimate.sql\n@@ -1,14 +1,14 @@\n--- Run only in a disposable database with roaring_index installed.\n--- Demonstrates a planner-estimate guard accepting a larger actual group hash.\n+-- Run only in a disposable database with pg_lion installed.\n+-- Stale parent statistics must still allow core final aggregation to spill.\n \\set ON_ERROR_STOP on\n-LOAD 'roaring_index';\n+LOAD 'pg_lion';\n SET statement_timeout = '60s';\n SET max_parallel_workers_per_gather = 0;\n CREATE TABLE review_groups (part int, k int) PARTITION BY LIST (part);\n CREATE TABLE review_groups_0 PARTITION OF review_groups FOR VALUES IN (0);\n CREATE TABLE review_groups_1 PARTITION OF review_groups FOR VALUES IN (1);\n INSERT INTO review_groups SELECT i%2, i%10 FROM generate_series(1,20000) i;\n-CREATE INDEX ON review_groups USING roaring (k);\n+CREATE INDEX ON review_groups USING lion (k);\n VACUUM (FREEZE, ANALYZE) review_groups;\n -- Keep inherited parent statistics at ten groups while cardinality grows.\n INSERT INTO review_groups SELECT i%2, i FROM generate_series(20001,40000) i;\n@@ -19,18 +19,28 @@ SET enable_seqscan = off;\n EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)\n SELECT k,count(*) FROM review_groups GROUP BY k;\n -- The lateral dependency delays inspection until the grouping node has emitted\n--- its first row, after it has accumulated all partition groups in memory.\n+-- its first row. The removed extension-owned hash contexts should be absent;\n+-- the EXPLAIN above is the evidence that core final aggregation spills.\n SELECT current_setting('work_mem') AS work_mem, groups.n,\n        memory.bytes AS group_hash_allocated_bytes, memory.used_bytes AS group_hash_used_bytes\n FROM (SELECT k,count(*) AS n FROM review_groups GROUP BY k) groups\n CROSS JOIN LATERAL (\n     SELECT sum(total_bytes) AS bytes, sum(used_bytes) AS used_bytes\n     FROM pg_backend_memory_contexts\n-    WHERE name LIKE 'RoaringCount group hash%'\n+    WHERE name LIKE 'RoaringCount group hash%' OR name LIKE 'LionCount group hash%'\n     OFFSET (groups.k-groups.k)\n ) memory\n LIMIT 1;\n-SET roaring_index.enable_count_pushdown = off;\n+CREATE TEMP TABLE actual_groups AS SELECT k,count(*) AS n FROM review_groups GROUP BY k;\n+SET pg_lion.enable_count_pushdown = off;\n EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)\n SELECT k,count(*) FROM review_groups GROUP BY k;\n-DROP TABLE review_groups;\n+CREATE TEMP TABLE expected_groups AS SELECT k,count(*) AS n FROM review_groups GROUP BY k;\n+DO $$ BEGIN\n+    IF EXISTS ((TABLE actual_groups EXCEPT ALL TABLE expected_groups)\n+               UNION ALL (TABLE expected_groups EXCEPT ALL TABLE actual_groups)) THEN\n+        RAISE EXCEPTION 'Partitioned aggregation disagrees with ordinary aggregation';\n+    END IF;\n+END $$;\n+SELECT count(*) AS exact_checked_groups FROM actual_groups;\n+DROP TABLE actual_groups, expected_groups, review_groups;\n",
+  "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpu_count": 16,
+  "cpu_model": "AMD Ryzen 7 5700X3D 8-Core Processor",
+  "pg_config": "'--prefix=/tmp/claude-1000/-home-cgkanchi-code-pg-roaring-index/3199cf92-508e-4cae-a569-3890bab7ee81/scratchpad/pginst' '--without-icu' '--without-zlib' '--without-readline' 'CFLAGS=-O2'",
+  "postgres_sha256": "96a7e5f96c821bc93f4b366f28268c5a58d2a18ba6891284375aeceb17118345",
+  "extension_sha256": "6818ca8ec52b3d61a75f1d8a44c9b664c546342e17c24fdbed06f43e09fc6b40",
+  "workload_sha256": "47e9a2146d15894dcfd3b77891481e8945c079075382249a5c7d6fbb4e9993e8",
+  "server_version": "PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "settings": {
+    "shared_buffers": "512MB",
+    "work_mem": "64MB",
+    "maintenance_work_mem": "512MB",
+    "max_parallel_workers_per_gather": "0",
+    "max_parallel_maintenance_workers": "2",
+    "jit": "off",
+    "fsync": "on",
+    "synchronous_commit": "on",
+    "full_page_writes": "on",
+    "autovacuum": "off",
+    "random_page_cost": "4",
+    "seq_page_cost": "1",
+    "effective_cache_size": "4GB",
+    "hash_mem_multiplier": "2"
+  },
+  "elapsed_seconds": 231.41025218303548,
+  "errors": 0
+}

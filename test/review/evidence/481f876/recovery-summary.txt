@@ -1,0 +1,72 @@
+pg_lion recovery tests
+prefix     /home/cgkanchi/code/pg_lion/.local/pg
+server     PostgreSQL 20devel
+clusters   /tmp/claude-1000/lion_recovery/primary (port 54340), /tmp/claude-1000/lion_recovery/standby (port 54341)
+socket dir /tmp/claude-1000/pgsk_rec
+
+-- building the extension into /home/cgkanchi/code/pg_lion/.local/pg
+-- initdb /tmp/claude-1000/lion_recovery/primary
+-- loading the fixture (test/recovery/schema.sql)
+-- index shapes after the load and before any crash
+lion_rec_k4|40000|200|0|2000|0|200|64|0|0
+lion_rec_t|40000|3000|3000|0|3000|0|67|0|0
+lion_rec_ct|40000|40|24|400|0|16|8|0|0
+lion_rec_b|40000|2|0|20|0|14|64|0|0
+lion_rec_nn|40000|31|30|310|0|1|13|3636|0
+lion_rec_arr|91578|25|0|250|0|33|16|3076|6154
+lion_rec_tsv|108506|39|6|390|0|33|64|2106|2105
+-- baseline: 59 checks ok
+
+=== phase 1: crash recovery under load (8 iterations) ===
+iter 1: crash=immediate vacuum_in_flight=0 redo_from=0/04C9A628 generic_wal_replayed=75915 rows=40000 checks=118 4s
+iter 2: crash=kill9 vacuum_in_flight=0 redo_from=0/09EFD980 generic_wal_replayed=68386 rows=40000 checks=118 4s
+iter 3: crash=immediate vacuum_in_flight=0 redo_from=0/0EF94678 generic_wal_replayed=67935 rows=40000 checks=118 5s
+iter 4: crash=kill9 vacuum_in_flight=0 redo_from=0/13D60810 generic_wal_replayed=64259 rows=40000 checks=118 4s
+iter 5: crash=immediate vacuum_in_flight=1 redo_from=0/184272F8 generic_wal_replayed=59628 rows=40000 checks=118 4s
+iter 6: crash=kill9 vacuum_in_flight=1 redo_from=0/1B58BE10 generic_wal_replayed=59717 rows=40000 checks=118 4s
+iter 7: crash=immediate vacuum_in_flight=0 redo_from=0/1EE2DA90 generic_wal_replayed=59188 rows=40000 checks=118 4s
+iter 8: crash=kill9 vacuum_in_flight=0 redo_from=0/22B8DFE0 generic_wal_replayed=56185 rows=40000 checks=118 4s
+
+=== phase 2: hot standby ===
+primary: 59 checks ok, and it does skip heap blocks via the visibility map
+-- pg_basebackup -R into /tmp/claude-1000/lion_recovery/standby
+standby: 59 checks ok (verify, counts, GROUP BY, ntids)
+standby: all 19 counts skipped 0 heap blocks and rechecked every TID
+standby: all 39 index probes identical to the primary
+
+-- recovery conflict: hot_standby_feedback = on, k4 = 11
+   primary VACUUM was held back: index still has 40000 TIDs for 39860 live rows
+   snapshot preserved: 140 -> 140, no conflict
+   fresh standby session sees the new count: 0 (primary 0)
+
+-- recovery conflict: hot_standby_feedback = off, k4 = 7
+   primary VACUUM removed the deleted TIDs: 39596 = 39596
+   cancelled by a recovery conflict after counting 264 (legal outcome)
+   fresh standby session sees the new count: 0 (primary 0)
+
+-- promoting the standby
+promoted standby: 59 checks ok, and it trusts the visibility map again
+
+=== summary ===
+  phase1 iter 1  crash=immediate vacuum_in_flight=0 generic_wal_replayed=75915 rows=40000 checks=118
+  phase1 iter 2  crash=kill9 vacuum_in_flight=0 generic_wal_replayed=68386 rows=40000 checks=118
+  phase1 iter 3  crash=immediate vacuum_in_flight=0 generic_wal_replayed=67935 rows=40000 checks=118
+  phase1 iter 4  crash=kill9 vacuum_in_flight=0 generic_wal_replayed=64259 rows=40000 checks=118
+  phase1 iter 5  crash=immediate vacuum_in_flight=1 generic_wal_replayed=59628 rows=40000 checks=118
+  phase1 iter 6  crash=kill9 vacuum_in_flight=1 generic_wal_replayed=59717 rows=40000 checks=118
+  phase1 iter 7  crash=immediate vacuum_in_flight=0 generic_wal_replayed=59188 rows=40000 checks=118
+  phase1 iter 8  crash=kill9 vacuum_in_flight=0 generic_wal_replayed=56185 rows=40000 checks=118
+  phase2 standby      59 checks ok in recovery
+  phase2 standby      19 counts skipped 0 blocks, rechecked every TID
+  phase2 standby      39 index probes identical to the primary
+  phase2 conflict feedback=on  snapshot preserved, 140 = 140
+  phase2 catchup feedback=on  fresh standby count of k4=11 is 0, primary 0
+  phase2 conflict feedback=off  cancelled by a recovery conflict after counting 264
+  phase2 catchup feedback=off  fresh standby count of k4=7 is 0, primary 0
+  phase2 promoted     59 checks ok after promotion, VM path back in use
+
+  generic WAL records replayed across all crashes: 511213
+  verify() warnings (unreferenced/empty pages, harmless by design): 0
+  total time: 62s
+
+ALL RECOVERY AND HOT-STANDBY CHECKS PASSED

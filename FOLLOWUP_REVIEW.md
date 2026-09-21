@@ -1,3 +1,69 @@
+# Review verification — 2026-09-21, `481f876`
+
+**Not all findings are fixed: one P2 remains in the legacy benchmark launcher.** Original findings 1–7 and the additional multikey-cost finding are addressed in the reviewed paths. Original finding 8 is partially addressed: startup and identity failures now prevent cleanup writes, but a failed original-state capture still permits unsafe restoration. This verification changes review documents and reproductions, not the extension implementation.
+
+## Remaining finding
+
+### [P2] Failed capture of original index validity permits unsafe cleanup
+
+Locations: [original-state capture](bench/lib.sh#L69), [restoration](bench/lib.sh#L24).
+
+`bench_start_cluster()` sets `BENCH_VERIFIED=1` before reading the initially invalid indexes. The capture command ends in `|| true`, so a failed query becomes an empty `BENCH_ORIG_INVALID`, indistinguishable from a successful query that found none. Execution continues. On exit, `bench_restore_indexes()` can reconnect and issue an unrestricted `UPDATE pg_index SET indisvalid=true` for every invalid `fact_%` index. A previously invalid or incomplete index can become eligible for query planning even though this run never invalidated it.
+
+The updated [stub reproducer](test/review/benchmark_cleanup.py) uses fake `pg_ctl` and `psql`, with no database connection. With startup and identity checks succeeding but the state-capture query failing, the benchmark body is reached, cleanup emits the broad catalog UPDATE, and the launcher exits successfully. The reproducer deliberately exits **1** to flag this unresolved finding. [Captured evidence](test/review/evidence/481f876/cleanup-repro.txt) also confirms that failed startup and wrong identity issue **no cleanup writes**, and successful state capture excludes the recorded preexisting invalid index.
+
+Fail closed when state capture fails, and gate restoration on successful capture as well as endpoint verification. Prefer tracking exactly the index OIDs/state transitions owned by the run, or separate portfolios without catalog edits. The legacy body's `valid()` helper in [bench/bench.sh](bench/bench.sh#L16) also still enables every matching family index; the captured initial invalid set only protects the cleanup query, not that helper. The comprehensive and quick runners use separate portfolios in fresh private clusters and do not use this catalog-toggling path.
+
+## Finding status and evidence
+
+| Finding | Status at `481f876` | Current evidence |
+| --- | --- | --- |
+| Original 1: reserved entry identity on spill | Addressed | Spill preserves `LION_ENTRY_RESERVED`; array, tsvector, NULL, insertion and verifier regressions pass. |
+| Original 2: direct count snapshot eligibility | Addressed | Shared `lion_index_usable()` checks validity/readiness and `indcheckxmin`; `count_checkxmin` and snapshot isolation tests pass. |
+| Original 3: incompatible grouping equality | Addressed | Grouping index selection checks compatible equality; incompatible-opclass regression passes. |
+| Original 4: nonvisible historical group representative | Addressed | Representation-safety guard remains; citext and pushdown regressions pass. |
+| Original 5 / follow-up 3: dirty grouped-count costing | Addressed for reproduced case | Cache-aware distinct-page costing and bounded visibility cache; default chooses LionCount on the original 5M/200-group fixture. |
+| Original 6 / follow-up 1: unbounded grouping/rechecks | Addressed | Bounded dirty-TID batches remain; partition node streams partial counts into core Finalize HashAggregate, which spills even with stale statistics. |
+| Original 7: stale cached AM OID | Addressed | Catalog lookup remains; drop/recreate regression passes. |
+| Original 8 / follow-up 2: benchmark endpoint/state safety | Partially addressed | Startup and identity failure cases pass; failed original-state capture remains unsafe as described above. |
+| Follow-up 4: multikey fallback costing | Addressed for reproduced cases | Full-walk index cost and full candidate coverage are charged; default phrase/prefix plans now use sequential scans. |
+
+The [stale-statistics partition reproduction](test/review/evidence/481f876/partition-estimate.txt), with an estimate of ten groups and 20,010 actual groups, now shows **Finalize HashAggregate over LionCount, 534 batches and 968 kB spilled**, with the same 112 kB reported memory usage as ordinary HashAggregate. This fixes the extension-owned unbounded hash; it does not claim PostgreSQL's reported aggregate memory is a strict 64 kB cap. The old group-hash contexts are absent, and all 20,010 result groups match ordinary aggregation exactly. The regression suite also covers partition spill/rescan behavior.
+
+## Focused performance verification
+
+Clean builds were installed separately into assertion-enabled and release PostgreSQL 20devel prefixes. Focused timings use the release build, ten randomized interleaved rounds per mode, identical fixtures to the earlier reproductions, and exact-result comparisons. [Build and binary provenance](test/review/evidence/481f876/provenance.json).
+
+| Case | Default route | Default median | Control median |
+| --- | --- | ---: | ---: |
+| 5M rows, 200 groups, first 5% updated | LionCount | 55.340 ms | 917.707 ms sequential; 53.341 ms with sequential scans discouraged |
+| 200k documents, `common <-> w1` | Sequential scan | 33.199 ms | 33.420 ms forced sequential |
+| 200k documents, `rare12:*` | Sequential scan | 24.426 ms | 24.748 ms forced sequential |
+
+The grouped-count case retains 91,345 all-visible pages out of 100,407. A default sample has 395,636 visibility-cache hits and zero shared-buffer reads; the sequential control reads more of the heap than fits in shared buffers. These are warmed runs without deliberate OS-cache eviction, not an all-pages-resident comparison. The planner now estimates LionCount at about 17,286 cost units against the sequential aggregate's 175,482. [Grouped-count timings and full plans](test/review/evidence/481f876/group-cost/results.json). Both document predicates have the same default and control scan route, with all heap buffers hit and zero shared-buffer reads in the captured samples. [Multikey timings and full plans](test/review/evidence/481f876/multikey-cost/results.json).
+
+These close the measured planner findings; they do not prove that every cardinality, cache size or operator combination is optimally costed. The 20k-group rejection regression also passes, so the improvement is not a blanket forced preference for LionCount.
+
+## Validation and scope
+
+- **17/17 SQL regressions and 6/6 isolation tests pass** on a fresh private assertion-enabled cluster. [Test log](test/review/evidence/481f876/installcheck.txt).
+- **Both unit suites pass:** 660,060 container checks and 290,234 sparse checks, with zero failures. [Unit log](test/review/evidence/481f876/unit.txt).
+- **Crash-recovery/hot-standby harness passes:** eight crashes, including two during VACUUM; 511,213 generic WAL records replayed; standby visibility checks, preserved/cancelled snapshots with feedback on/off, and promotion. Runtime 62 seconds. [Summary](test/review/evidence/481f876/recovery-summary.txt), [compressed full log](test/review/evidence/481f876/recovery-full.txt.gz).
+- The previously untested recovery axis now has fresh automated evidence. No new sanitizer run, sustained write soak, true cold-device campaign or alternate PostgreSQL-version testing was performed. Fixed bucket directories, historical-entry retention and hot-bucket contention remain architectural tradeoffs, not newly closed performance guarantees. The full comparison and stress suites were not rerun.
+- Review reproducers now use `pg_lion`/`lion`; old evidence remains unchanged. The grouped-cost reproducer now includes an explicitly forced sequential timing control, and partition results are checked with bidirectional `EXCEPT ALL`.
+
+## Current quick benchmark
+
+The default **1M/5M scalar + 200k-document** run completed in **231.4 seconds (3 minutes 51 seconds)**, including private-cluster initialization and shutdown: **160 exact-result checks, 320 timings, zero errors**. The matrix/cross-portfolio [audit passes](bench/results/quick/2026-09-21-481f876/AUDIT.json), and artifact checksums verify. It uses only B-tree, GIN, `roaring` and `roaring_bitmap`; these last two labels now refer to the `lion` access method with count pushdown enabled/disabled. All other test clusters were stopped before timing.
+
+[HTML tables](bench/results/quick/2026-09-21-481f876/index.html), [Markdown report](bench/results/quick/2026-09-21-481f876/REPORT.md), [CSV](bench/results/quick/2026-09-21-481f876/summary.csv). This is a fresh baseline at `481f876`. Automatic comparison with the historical `2026-09-21-scales` run is rejected because the rename changes the workload hash; that compatibility check was not bypassed. Two samples per configuration provide progress signals rather than stable performance bounds. One bucket-directory growth warning for the 5M `ix_c20k` index was logged; the run and correctness checks completed successfully.
+
+---
+
+# Historical follow-up at `7db8f11`
+
+Everything below describes the earlier commit and retains its original findings, timing evidence and validation limits. The current status above supersedes those conclusions.
+
 > Note: this document predates the rename to **pg_lion** (2026-09-21). Names map as: extension `roaring_index` -> `pg_lion`, access method `roaring` -> `lion`, functions `roaring_index_*` -> `lion_index_*`, GUC `roaring_index.*` -> `pg_lion.*`, C prefix `rbi_`/`RBI` -> `lion_`/`LION`/`Lion`, files `src/rbi_*.c` -> `src/lion_*.c`.
 
 # Follow-up code, architecture, and performance review — 2026-09-21

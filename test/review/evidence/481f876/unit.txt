@@ -1,0 +1,32 @@
+gcc -O1 -g -Wall -Wextra -Wno-unused-parameter -DFRONTEND -Isrc -I/home/cgkanchi/code/pg_lion/.local/pg/include/postgresql/server -I/home/cgkanchi/code/pg_lion/.local/pg/include -o test/unit/container_test test/unit/container_test.c src/lion_container.c -L/home/cgkanchi/code/pg_lion/.local/pg/lib -lpgcommon -lpgport -lm
+gcc -O1 -g -Wall -Wextra -Wno-unused-parameter -DFRONTEND -Isrc -I/home/cgkanchi/code/pg_lion/.local/pg/include/postgresql/server -I/home/cgkanchi/code/pg_lion/.local/pg/include -o test/unit/sparse_test test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c -L/home/cgkanchi/code/pg_lion/.local/pg/lib -lpgcommon -lpgport -lm
+./test/unit/container_test
+pg_lion container unit tests
+  LION_CONTAINER_HDRSZ=8 LION_ARRAY_MAX_CARD=2048 LION_RUN_MAX_NRUNS=1023 LION_CONTAINER_MAX_SIZE=4104
+
+representative container sizes (after optimize):
+  empty                                  0 members  ARRAY                 8 bytes
+  1 member                               1 members  ARRAY                10 bytes
+  2048 scattered members              2048 members  ARRAY              4104 bytes
+  2049 scattered members              2049 members  BITSET             4104 bytes
+  100 runs of 10                      1000 members  RUN     100 runs    410 bytes
+  1023 runs of 3 (largest RUN)        3069 members  RUN    1023 runs   4102 bytes
+  32768 members (full)               32768 members  RUN       1 runs     14 bytes
+
+660060 checks, 40042496 member comparisons against the reference, 0 failures
+ALL TESTS PASSED
+./test/unit/sparse_test
+pg_lion sparse segment unit tests
+  LION_SPARSE_MAX_PAIRS=682 LION_SPARSE_THRESHOLD=4 LION_SPARSE_PAIR_SIZE=6
+
+sizes (bytes):
+  segment header                                    8
+  one pair                                          6
+  1 pair                                           14
+  3 pairs (one ckey at the threshold - 1)          26
+  682 pairs (full)                               4100
+  3 one-member ARRAY containers instead            60
+  682 one-member ARRAY containers instead       13640
+
+290234 checks, 11154812 pair comparisons against the reference, 0 failures
+ALL TESTS PASSED

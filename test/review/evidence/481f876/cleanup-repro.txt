@@ -1,0 +1,4 @@
+{"scenario": "startup_failure", "exit": 1, "body_reached": false, "cleanup_writes": [], "unsafe": false}
+{"scenario": "identity_failure", "exit": 1, "body_reached": false, "cleanup_writes": [], "unsafe": false}
+{"scenario": "snapshot_failure", "exit": 0, "body_reached": true, "cleanup_writes": ["update pg_index set indisvalid = true where indexrelid::regclass::text like 'fact\\_%' and not indisvalid "], "unsafe": true}
+{"scenario": "success", "exit": 0, "body_reached": true, "cleanup_writes": ["update pg_index set indisvalid = true where indexrelid::regclass::text like 'fact\\_%' and not indisvalid and indexrelid::regclass::text not in ('fact_preexisting_invalid')"], "unsafe": false}

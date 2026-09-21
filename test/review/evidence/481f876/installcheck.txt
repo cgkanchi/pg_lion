@@ -1,0 +1,33 @@
+echo "# +++ regress install-check in  +++" && /home/cgkanchi/code/pg_lion/.local/pg/lib/postgresql/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/home/cgkanchi/code/pg_lion/.local/pg/bin'    --inputdir=test --outputdir=test --dbname=contrib_regression array basic citext count inlist insert large null options partition pushdown security sparse tsvector unlogged vacuum verify
+# +++ regress install-check in  +++
+# using postmaster on /tmp/lion-comparison-ck5ffo8_/socket, port 55449
+ok 1         - array                                    2086 ms
+ok 2         - basic                                    3771 ms
+ok 3         - citext                                    210 ms
+ok 4         - count                                    3143 ms
+ok 5         - inlist                                   2208 ms
+ok 6         - insert                                  13776 ms
+ok 7         - large                                   19918 ms
+ok 8         - null                                     1727 ms
+ok 9         - options                                   366 ms
+ok 10        - partition                                4138 ms
+ok 11        - pushdown                                18581 ms
+ok 12        - security                                  115 ms
+ok 13        - sparse                                   5517 ms
+ok 14        - tsvector                                  888 ms
+ok 15        - unlogged                                  866 ms
+ok 16        - vacuum                                   6878 ms
+ok 17        - verify                                   5992 ms
+1..17
+# All 17 tests passed.
+echo "# +++ isolation install-check in  +++" && /home/cgkanchi/code/pg_lion/.local/pg/lib/postgresql/pgxs/src/makefiles/../../src/test/isolation/pg_isolation_regress --inputdir=./ --outputdir=output_iso --bindir='/home/cgkanchi/code/pg_lion/.local/pg/bin'    --inputdir=test/isolation --outputdir=test/isolation --dbname=isolation_regression count_checkxmin count_serializable count_snapshot count_vacuum_race insert_concurrent vacuum_scan
+# +++ isolation install-check in  +++
+# using postmaster on /tmp/lion-comparison-ck5ffo8_/socket, port 55449
+ok 1         - count_checkxmin                            42 ms
+ok 2         - count_serializable                         38 ms
+ok 3         - count_snapshot                             84 ms
+ok 4         - count_vacuum_race                        6192 ms
+ok 5         - insert_concurrent                         185 ms
+ok 6         - vacuum_scan                               309 ms
+1..6
+# All 6 tests passed.

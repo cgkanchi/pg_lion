@@ -1,0 +1,133 @@
+2026-09-21 10:41:57.860 PDT [256072] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-21 10:41:57.864 PDT [256072] LOG:  listening on Unix socket "/tmp/lion-comparison-ck5ffo8_/socket/.s.PGSQL.55449"
+2026-09-21 10:41:57.875 PDT [256077] LOG:  database system was shut down at 2026-09-21 10:41:57 PDT
+2026-09-21 10:41:57.880 PDT [256072] LOG:  database system is ready to accept connections
+2026-09-21 10:42:06.744 PDT [256154] ERROR:  type text[] cannot be compared with index "lion_arr_tags"
+2026-09-21 10:42:06.744 PDT [256154] DETAIL:  The index is on type anyarray.
+2026-09-21 10:42:06.744 PDT [256154] STATEMENT:  SELECT lion_index_count('lion_arr_tags', '{t5}'::text[]);
+2026-09-21 10:42:07.999 PDT [256154] ERROR:  could not identify a hash function for type point
+2026-09-21 10:42:07.999 PDT [256154] DETAIL:  Index "lion_arr_odd_p_idx" extracts keys of that type.
+2026-09-21 10:42:07.999 PDT [256154] STATEMENT:  CREATE INDEX ON lion_arr_odd USING lion (p);
+2026-09-21 10:42:08.307 PDT [256154] WARNING:  lion index "lion_arr_many_a" has more than 100 distinct keys
+2026-09-21 10:42:08.307 PDT [256154] DETAIL:  The index holds about 2001 entries; its max_entries option is 100.
+2026-09-21 10:42:08.307 PDT [256154] HINT:  Raise max_entries, or index a column with fewer distinct keys.
+2026-09-21 10:42:08.331 PDT [256155] WARNING:  lion index "lion_arr_many_b" has more than 50 distinct keys
+2026-09-21 10:42:08.331 PDT [256155] DETAIL:  The index holds about 2304 entries; its max_entries option is 50.
+2026-09-21 10:42:08.331 PDT [256155] HINT:  Raise max_entries, or index a column with fewer distinct keys.
+2026-09-21 10:42:16.189 PDT [256167] ERROR:  type text cannot be compared with index "lion_cnt_c10"
+2026-09-21 10:42:16.189 PDT [256167] DETAIL:  The index is on type integer.
+2026-09-21 10:42:16.189 PDT [256167] STATEMENT:  /* Error cases. */
+	-- wrong key type
+	SELECT lion_index_count('lion_cnt_c10', 'nope'::text);
+2026-09-21 10:42:16.189 PDT [256167] ERROR:  type integer cannot be compared with index "lion_cnt_t1000"
+2026-09-21 10:42:16.189 PDT [256167] DETAIL:  The index is on type text.
+2026-09-21 10:42:16.189 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt_t1000', 1);
+2026-09-21 10:42:16.253 PDT [256167] ERROR:  index "lion_cnt_btree" is not a lion index
+2026-09-21 10:42:16.253 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt_btree', 0);
+2026-09-21 10:42:16.253 PDT [256167] ERROR:  "lion_cnt" is not an index
+2026-09-21 10:42:16.253 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt', 0);
+2026-09-21 10:42:16.258 PDT [256167] ERROR:  indexes "lion_cnt_c10" and "lion_cnt_other_k" are not on the same table
+2026-09-21 10:42:16.258 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt_c10', 0, 'lion_cnt_other_k', 0);
+2026-09-21 10:42:16.268 PDT [256167] ERROR:  cannot count through index "lion_cnt_elig_k" because the index is not valid
+2026-09-21 10:42:16.268 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt_elig_k', 1);
+2026-09-21 10:42:16.268 PDT [256167] ERROR:  cannot count through index "lion_cnt_elig_k" because the index is not valid
+2026-09-21 10:42:16.268 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt_elig_k', 1, 'lion_cnt_elig_k', 1);
+2026-09-21 10:42:16.269 PDT [256167] ERROR:  cannot verify index "lion_cnt_elig_k" against the heap because the index is not valid
+2026-09-21 10:42:16.269 PDT [256167] STATEMENT:  SELECT lion_index_verify('lion_cnt_elig_k', true);
+2026-09-21 10:42:16.272 PDT [256167] ERROR:  cannot count through index "lion_cnt_elig_k" because the index is not ready for queries
+2026-09-21 10:42:16.272 PDT [256167] STATEMENT:  SELECT lion_index_count('lion_cnt_elig_k', 1);
+2026-09-21 10:42:18.515 PDT [256172] ERROR:  type text cannot be compared with index "lion_in_a"
+2026-09-21 10:42:18.515 PDT [256172] DETAIL:  The index is on type integer.
+2026-09-21 10:42:18.515 PDT [256172] STATEMENT:  SELECT lion_index_count_any('lion_in_a', '{1}'::text[]);
+2026-09-21 10:42:18.516 PDT [256172] ERROR:  "lion_in" is not an index
+2026-09-21 10:42:18.516 PDT [256172] STATEMENT:  SELECT lion_index_count_any('lion_in', '{1}'::int[]);
+2026-09-21 10:42:31.039 PDT [256176] WARNING:  lion index "lion_grow_k" has outgrown its bucket directory
+2026-09-21 10:42:31.039 PDT [256176] DETAIL:  One bucket chain is 5 pages long; the index was built with 64 buckets, which is what a lookup of a key has to walk.
+2026-09-21 10:42:31.039 PDT [256176] HINT:  REINDEX the index: the bucket count is chosen at build time from the entries that exist then, and this index was built smaller (often on an empty table).
+2026-09-21 10:42:54.972 PDT [256231] ERROR:  value -1 out of bounds for option "buckets"
+2026-09-21 10:42:54.972 PDT [256231] DETAIL:  Valid values are between "0" and "65536".
+2026-09-21 10:42:54.972 PDT [256231] STATEMENT:  CREATE INDEX lion_opt_bad1 ON lion_opt USING lion (k) WITH (buckets = -1);
+2026-09-21 10:42:54.972 PDT [256231] ERROR:  value 65537 out of bounds for option "buckets"
+2026-09-21 10:42:54.972 PDT [256231] DETAIL:  Valid values are between "0" and "65536".
+2026-09-21 10:42:54.972 PDT [256231] STATEMENT:  CREATE INDEX lion_opt_bad2 ON lion_opt USING lion (k) WITH (buckets = 65537);
+2026-09-21 10:42:55.011 PDT [256231] ERROR:  value 63 out of bounds for option "inline_limit"
+2026-09-21 10:42:55.011 PDT [256231] DETAIL:  Valid values are between "64" and "4096".
+2026-09-21 10:42:55.011 PDT [256231] STATEMENT:  CREATE INDEX lion_opt_bad3 ON lion_opt USING lion (k) WITH (inline_limit = 63);
+2026-09-21 10:42:55.011 PDT [256231] ERROR:  value 4097 out of bounds for option "inline_limit"
+2026-09-21 10:42:55.011 PDT [256231] DETAIL:  Valid values are between "64" and "4096".
+2026-09-21 10:42:55.011 PDT [256231] STATEMENT:  CREATE INDEX lion_opt_bad4 ON lion_opt USING lion (k) WITH (inline_limit = 4097);
+2026-09-21 10:42:55.011 PDT [256231] ERROR:  unrecognized parameter "nosuchoption"
+2026-09-21 10:42:55.011 PDT [256231] STATEMENT:  CREATE INDEX lion_opt_bad5 ON lion_opt USING lion (k) WITH (nosuchoption = 1);
+2026-09-21 10:42:55.014 PDT [256231] ERROR:  value 65537 out of bounds for option "buckets"
+2026-09-21 10:42:55.014 PDT [256231] DETAIL:  Valid values are between "0" and "65536".
+2026-09-21 10:42:55.014 PDT [256231] STATEMENT:  ALTER INDEX lion_opt_b0 SET (buckets = 65537);
+2026-09-21 10:42:55.177 PDT [256231] ERROR:  access method "lion" does not support multicolumn indexes
+2026-09-21 10:42:55.177 PDT [256231] STATEMENT:  CREATE INDEX ON lion_opt USING lion (k, t);
+2026-09-21 10:42:55.177 PDT [256231] ERROR:  access method "lion" does not support included columns
+2026-09-21 10:42:55.177 PDT [256231] STATEMENT:  CREATE INDEX ON lion_opt USING lion (k) INCLUDE (t);
+2026-09-21 10:42:55.178 PDT [256231] ERROR:  access method "lion" does not support ASC/DESC options at character 38
+2026-09-21 10:42:55.178 PDT [256231] STATEMENT:  CREATE INDEX ON lion_opt USING lion (k DESC);
+2026-09-21 10:42:55.178 PDT [256231] ERROR:  access method "lion" does not support NULLS FIRST/LAST options at character 38
+2026-09-21 10:42:55.178 PDT [256231] STATEMENT:  CREATE INDEX ON lion_opt USING lion (k NULLS FIRST);
+2026-09-21 10:42:55.178 PDT [256231] ERROR:  access method "lion" does not support unique indexes
+2026-09-21 10:42:55.178 PDT [256231] STATEMENT:  CREATE UNIQUE INDEX ON lion_opt USING lion (k);
+2026-09-21 10:42:55.190 PDT [256231] ERROR:  data type point has no default operator class for access method "lion"
+2026-09-21 10:42:55.190 PDT [256231] HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+2026-09-21 10:42:55.190 PDT [256231] STATEMENT:  CREATE INDEX ON lion_noop USING lion (x);
+2026-09-21 10:43:17.977 PDT [256364] ERROR:  permission denied for table lion_sec
+2026-09-21 10:43:17.977 PDT [256364] STATEMENT:  SELECT lion_index_count('lion_sec_secret', 's1'::text);
+2026-09-21 10:43:17.977 PDT [256364] ERROR:  permission denied for table lion_sec
+2026-09-21 10:43:17.977 PDT [256364] STATEMENT:  SELECT lion_index_count('lion_sec_tenant', 't1'::text, 'lion_sec_secret', 's1'::text);
+2026-09-21 10:43:17.977 PDT [256364] ERROR:  permission denied for table lion_sec
+2026-09-21 10:43:17.977 PDT [256364] STATEMENT:  SELECT * FROM lion_index_count_stats('lion_sec_secret', 's1'::text);
+2026-09-21 10:43:17.981 PDT [256364] ERROR:  permission denied for table lion_sec
+2026-09-21 10:43:17.981 PDT [256364] STATEMENT:  SELECT lion_index_count('lion_sec_secret', 's1'::text);
+2026-09-21 10:43:17.981 PDT [256364] ERROR:  permission denied for table lion_sec
+2026-09-21 10:43:17.981 PDT [256364] STATEMENT:  SELECT lion_index_count('lion_sec_tenant', 't1'::text, 'lion_sec_secret', 's1'::text);
+2026-09-21 10:43:17.990 PDT [256364] ERROR:  cannot count through index "lion_sec_k" because row-level security is enabled on table "lion_sec"
+2026-09-21 10:43:17.990 PDT [256364] STATEMENT:  SELECT lion_index_count('lion_sec_k', 1);
+2026-09-21 10:43:25.288 PDT [256372] WARNING:  lion index "lion_ts_many_tsv" has more than 500 distinct keys
+2026-09-21 10:43:25.288 PDT [256372] DETAIL:  The index holds about 3001 entries; its max_entries option is 500.
+2026-09-21 10:43:25.288 PDT [256372] HINT:  Raise max_entries, or index a column with fewer distinct keys.
+2026-09-21 10:43:38.552 PDT [256413] ERROR:  INSERT has more expressions than target columns at character 61
+2026-09-21 10:43:38.552 PDT [256413] STATEMENT:  INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL, NULL);
+2026-09-21 10:43:38.552 PDT [256413] ERROR:  INSERT has more expressions than target columns at character 63
+2026-09-21 10:43:38.552 PDT [256413] STATEMENT:  INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL, NULL);
+2026-09-21 10:43:38.780 PDT [256413] ERROR:  INSERT has more expressions than target columns at character 62
+2026-09-21 10:43:38.780 PDT [256413] STATEMENT:  INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL, NULL);
+2026-09-21 10:43:39.040 PDT [256413] ERROR:  "lion_vfy_bt" is not a lion index
+2026-09-21 10:43:39.040 PDT [256413] STATEMENT:  SELECT lion_index_verify('lion_vfy_bt');
+2026-09-21 10:43:39.040 PDT [256413] ERROR:  "lion_vfy_bt" is not a lion index
+2026-09-21 10:43:39.040 PDT [256413] STATEMENT:  SELECT lion_index_stats('lion_vfy_bt');
+2026-09-21 10:43:39.040 PDT [256413] ERROR:  "lion_vfy_unl" is not an index
+2026-09-21 10:43:39.040 PDT [256413] STATEMENT:  SELECT lion_index_verify('lion_vfy_unl');
+2026-09-21 10:43:39.040 PDT [256413] ERROR:  "lion_vfy_unl" is not an index
+2026-09-21 10:43:39.040 PDT [256413] STATEMENT:  SELECT lion_index_stats('lion_vfy_unl');
+2026-09-21 10:43:39.040 PDT [256413] ERROR:  relation "no_such_relation" does not exist at character 26
+2026-09-21 10:43:39.040 PDT [256413] STATEMENT:  SELECT lion_index_verify('no_such_relation');
+2026-09-21 10:43:39.198 PDT [256446] ERROR:  cannot count through index "cnt_cx_k" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+2026-09-21 10:43:39.198 PDT [256446] STATEMENT:  SELECT lion_index_count('cnt_cx_k', 1);
+2026-09-21 10:43:39.199 PDT [256446] ERROR:  cannot count through index "cnt_cx_k" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+2026-09-21 10:43:39.199 PDT [256446] STATEMENT:  SELECT count FROM lion_index_count_stats('cnt_cx_k', 1);
+2026-09-21 10:43:39.199 PDT [256446] ERROR:  cannot count through index "cnt_cx_k" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+2026-09-21 10:43:39.199 PDT [256446] STATEMENT:  SELECT lion_index_count('cnt_cx_k', 1, 'cnt_cx_k', 1);
+2026-09-21 10:43:39.200 PDT [256446] ERROR:  cannot verify index "cnt_cx_k" against the heap because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+2026-09-21 10:43:39.200 PDT [256446] STATEMENT:  SELECT lion_index_verify('cnt_cx_k', true);
+2026-09-21 10:43:39.229 PDT [256453] ERROR:  could not serialize access due to read/write dependencies among transactions
+2026-09-21 10:43:39.229 PDT [256453] DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+2026-09-21 10:43:39.229 PDT [256453] HINT:  The transaction might succeed if retried.
+2026-09-21 10:43:39.229 PDT [256453] STATEMENT:  COMMIT;
+2026-09-21 10:43:39.241 PDT [256453] ERROR:  could not serialize access due to read/write dependencies among transactions
+2026-09-21 10:43:39.241 PDT [256453] DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+2026-09-21 10:43:39.241 PDT [256453] HINT:  The transaction might succeed if retried.
+2026-09-21 10:43:39.241 PDT [256453] STATEMENT:  COMMIT;
+2026-09-21 10:43:45.471 PDT [256467] ERROR:  canceling statement due to statement timeout
+2026-09-21 10:43:45.471 PDT [256467] CONTEXT:  while vacuuming index "cnt_race_k" of relation "public.cnt_race"
+2026-09-21 10:43:45.471 PDT [256467] STATEMENT:  VACUUM cnt_race;
+2026-09-21 10:43:46.584 PDT [256072] LOG:  received fast shutdown request
+2026-09-21 10:43:46.588 PDT [256072] LOG:  aborting any active transactions
+2026-09-21 10:43:46.588 PDT [256072] LOG:  background worker "logical replication launcher" (PID 256079) exited with exit code 1
+2026-09-21 10:43:46.590 PDT [256075] LOG:  shutting down
+2026-09-21 10:43:46.594 PDT [256075] LOG:  checkpoint starting: shutdown fast
+2026-09-21 10:43:47.857 PDT [256075] LOG:  checkpoint complete: shutdown fast: wrote 4708 buffers (7.2%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 119 recycled; write=0.071 s, sync=0.680 s, total=1.268 s; sync files=1062, longest=0.005 s, average=0.001 s; distance=1945191 kB, estimate=1945191 kB; lsn=0/7828CF80, redo lsn=0/7828CF80
+2026-09-21 10:43:47.957 PDT [256072] LOG:  database system is shut down

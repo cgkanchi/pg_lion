@@ -3,7 +3,7 @@
 For routine development, use the [quick progress benchmark](../QUICK.md). It keeps B-tree,
 GIN, roaring, and roaring_bitmap at 1M and 5M rows, uses two timing rounds and a reduced
 query/index matrix, and generates baseline query deltas automatically.
-The revised default finished in 4 minutes 28 seconds on the benchmark host.
+The latest default run at `481f876` finished in 3 minutes 51 seconds on the benchmark host.
 
 This suite measures the current extension against sequential scans, B-tree, a tuned B-tree portfolio, hash, GIN, GiST, and BRIN. Roaring is measured both with count pushdown and through the ordinary bitmap path. It creates its own temporary database cluster; it never changes `pg_index.indisvalid` or connects to a user-supplied database endpoint.
 

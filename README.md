@@ -13,30 +13,95 @@ visibility map, visiting the heap only for pages that are not all-visible. `DESI
 on-disk format, locking protocol, the VACUUM/visibility-map interlock argument (§9, §11), and the
 planner integration (§10).
 
-Status: prototype against PostgreSQL master (20devel). 10k lines of C, 13 pg_regress files, 4 isolation
-specs (including an injection-point proof that VACUUM waits behind a pinned container page and stays
-cancellable), a 660k-check unit suite for the container library, a crash-recovery check of the
-generic-WAL records, and concurrent insert/delete/vacuum/read stress runs. Nothing is committed to git.
+Status: prototype against PostgreSQL master (20devel). Latest validation passes 17 SQL regression
+files, 6 isolation specs (including an injection-point check of the VACUUM/container-page interlock),
+660k container and 290k sparse unit checks, and the crash-recovery/hot-standby harness.
+See the [latest review](FOLLOWUP_REVIEW.md) for evidence and remaining limitations.
+
+## When to use Lion
+
+Use the roaring index (`USING lion`) for read-heavy dashboards, facet counts, and aggregations over
+large tables: equality or NULL counts, intersections of indexed predicates, and grouping by a column
+with relatively few distinct values. It can count compressed posting sets without fetching every
+matching row when the visibility map allows it. Array membership and simple full-text AND/OR counts
+benefit from the same mechanism. Keep tables vacuumed and statistics current so the planner can
+estimate that benefit; dirty pages require visibility checks in the heap.
+
+| Your workload | Index choice and tradeoff |
+| --- | --- |
+| Count many matches, combine equality filters, or count groups | Consider Lion on the columns used by these queries. The largest measured gains come from `LionCount` pushdown. |
+| Fetch a handful of rows, or count a very selective key | B-tree is a strong default. The latest run shows practical parity for tiny equality counts and no consistent heap-fetch advantage from Lion. |
+| Range predicates, ordering, or uniqueness | Keep B-tree. Lion supports neither ordered access nor unique indexes; its range queries in the benchmark fall back to sequential scans. |
+| Array membership or exact-lexeme counts | Consider Lion when counts dominate; compare against GIN on your predicates and result sizes. |
+| Full-text phrase/prefix search, or searches returning documents | Prefer GIN for the measured phrase/prefix cases; ordinary document fetching shows no clear Lion advantage. |
+| Frequent inserts or indexed updates | B-tree/GIN were cheaper to build and maintain in this run. Lion's count gains must justify its extra write latency and WAL. GIN uses deferred updates, so include VACUUM costs in comparisons. |
+
+Lion, B-tree and GIN can coexist. Add Lion for queries that benefit, retain B-tree for transactional
+access/ranges and GIN for richer text search, and account for the storage and write cost of every
+additional index. The [latest quick results](#latest-benchmarks) below show where Lion wins, where
+there is practical parity, and where it loses. This remains a prototype; the measurements describe
+the tested workloads, not a general replacement recommendation.
 
 ## Build and test
 
     ./dev.sh reset                                   # initdb a private cluster in .local/data (needs .local/pg)
     make PG_CONFIG=.local/pg/bin/pg_config && make PG_CONFIG=.local/pg/bin/pg_config install
     eval "$(./dev.sh env)"
-    make PG_CONFIG=.local/pg/bin/pg_config installcheck   # 13 regress files + 4 isolation specs
-    make unit PG_CONFIG=.local/pg/bin/pg_config           # container library, no server needed
+    make PG_CONFIG=.local/pg/bin/pg_config installcheck   # 17 regress files + 6 isolation specs
+    make unit PG_CONFIG=.local/pg/bin/pg_config           # container and sparse libraries, no server needed
 
 `.local/pg` must be a PostgreSQL master install; for the isolation specs it needs
 `--enable-injection-points` and the `injection_points` test module installed, and
 `pg_isolation_regress` installed from `src/test/isolation`.
 
-    CREATE EXTENSION pg_lion;
-    CREATE INDEX ON fact USING lion (country) WITH (buckets = 256, inline_limit = 4096);
-    SELECT * FROM lion_index_stats('fact_country_idx');
-    SELECT lion_index_verify('fact_country_idx', heapallindexed => true);
-    SELECT lion_index_count('fact_country_idx', 'Japan');          -- VM-interlocked count
-    SET pg_lion.enable_count_pushdown = on;                       -- default on
-    EXPLAIN (ANALYZE) SELECT country, count(*) FROM fact GROUP BY country;   -- Custom Scan (LionCount)
+## How to use it
+
+For an existing `events` table with `country text`, `event_type text`, and
+`created_at timestamptz`, create separate Lion indexes on the count/filter columns. Start with
+default index options so the build chooses the bucket directory size from the existing data.
+
+```sql
+CREATE EXTENSION pg_lion;
+CREATE INDEX events_country_lion ON events USING lion (country);
+CREATE INDEX events_type_lion ON events USING lion (event_type);
+
+-- Refresh statistics and visibility after loading data; run outside a transaction block.
+VACUUM (ANALYZE) events;
+
+-- Equality count and intersection of two indexed filters.
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT count(*) FROM events WHERE country = 'Japan';
+
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT count(*) FROM events
+WHERE country = 'Japan' AND event_type = 'purchase';
+
+-- Counts per group.
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT country, count(*) FROM events GROUP BY country;
+
+-- Retain B-tree for a different access pattern: time ranges and ordered retrieval.
+CREATE INDEX events_created_at_btree ON events (created_at);
+```
+
+Count pushdown is enabled by default. Look for **`Custom Scan (LionCount)`** in EXPLAIN to confirm
+it was selected. The planner can choose an ordinary scan when pushdown is unsupported or estimated
+to cost more; measure the default plan before changing planner settings. A Bitmap Heap Scan still
+fetches heap tuples and does not have the same count shortcut. Normal SQL is sufficient; direct
+`lion_index_count()` calls are optional. Use `lion_index_stats('events_country_lion')` to inspect
+storage and `lion_index_verify('events_country_lion', heapallindexed => true)` for verification.
+
+For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
+
+```sql
+CREATE INDEX docs_tags_lion ON docs USING lion (tags);
+VACUUM (ANALYZE) docs;
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT count(*) FROM docs WHERE tags @> ARRAY['t1', 't17'];
+
+-- Choose GIN for phrase/prefix searches on the text-search column.
+CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
+```
 
 ## Source layout
 
@@ -79,8 +144,8 @@ extraction functions, and answer
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
 combined with a `GROUP BY` on a scalar roaring column. Everything a plain AND/OR of key sets cannot
 express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*` or weights - falls
-back to scanning every indexed row and rechecking it, which is correct but no faster than GIN. The
-reloption `max_entries` (default 0 = unlimited) makes the index warn once per backend when it grows
+back to scanning every indexed row and rechecking it if the Lion index is used. The planner may
+choose a sequential scan instead; GIN wins the measured phrase/prefix cases below. The reloption `max_entries` (default 0 = unlimited) makes the index warn once per backend when it grows
 past that many distinct keys; it never rejects a row.
 
 ## Reloptions
@@ -100,9 +165,9 @@ of rows a multi-key opclass extracted no key from.
 
 Single column, equality, `IN` lists and the multi-key operators above (no ranges), no
 `amgettuple`/index-only scans, no
-parallel build or scan, no page recycling, inserts serialise per hash bucket and cost about 4x a
-btree insert (a container is copied out and back per insert, except bitsets), count pushdown handles
-`Const` keys only (no `Param` or multi-column GROUP BY), `IN` lists of more than 1000
+parallel build or scan, no page recycling. Inserts serialise per hash bucket; see the measured
+[write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants and parameters
+but no multi-column GROUP BY. `IN` lists of more than 1000
 values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a
 sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
 stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
@@ -113,214 +178,170 @@ they stay correct there but are no longer O(1) per container. The SQL count func
 on the table or on the indexed columns and refuse tables where row-level security applies to the
 caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
 
-## Reproducible comparison and latest review
+## Latest benchmarks
 
-For frequent progress checks, use the [quick benchmark](bench/QUICK.md): B-tree, GIN,
-roaring, and roaring_bitmap, two timing rounds, and saved-baseline comparisons.
-It retains both 1M and 5M scalar rows plus 200k documents, using a reduced query/index matrix.
-The revised default finished in 4 minutes 28 seconds on the benchmark host.
+Measured on **2026-09-21 at `481f876`**, using the [quick benchmark](bench/QUICK.md):
+**1M and 5M scalar rows, 200k documents, 160 exact-result checks and 320 timings**, all passing.
+The entire run, including private-cluster setup and shutdown, took **231.4 seconds (3m 51s)**.
+[Full report](bench/results/quick/2026-09-21-481f876/REPORT.md) ·
+[HTML tables](bench/results/quick/2026-09-21-481f876/index.html) ·
+[CSV](bench/results/quick/2026-09-21-481f876/summary.csv) ·
+[Audit](bench/results/quick/2026-09-21-481f876/AUDIT.json).
 
-The [comprehensive benchmark](bench/comprehensive/README.md) compares B-tree, hash, GIN, GiST,
-BRIN, sequential scans, and roaring with count pushdown enabled/disabled. It includes exact-result
-checks, recorded query plans, build/maintenance/WAL costs, visibility and memory stress, and concurrent
-reads. Start with the [results and interpretation](bench/COMPARISON.md), then explore the
-[searchable report](bench/results/2026-09-20-comparison/index.html),
-[full tables](bench/results/2026-09-20-comparison/REPORT.md), and
-[growth/churn/write supplement](bench/results/2026-09-21-stress/REPORT.md). The [follow-up review](FOLLOWUP_REVIEW.md)
-records which earlier findings are fixed and the four remaining reliability/performance gaps.
+Lion's largest gains are in count pushdown: at 5M rows, the clean dense count is about **82× faster**
+and 200-group aggregation **22× faster** than the B-tree portfolio. Tiny B-tree/Lion equality probes
+are at practical parity. B-tree wins on ranges and the 100-value IN case; GIN wins on phrase/prefix
+searches. Lion costs more to build and write, and its
+five-index portfolio is smaller than B-tree's but larger than GIN's.
 
-The results below are historical measurements with different datasets and configurations; they are
-preserved for development history and are not additional samples from the new comparison.
+### Setup and interpretation
 
-## Index size after the v1 build policy (5M rows, 2026-09-20)
+Release PostgreSQL 20devel (`-O2`), AMD Ryzen 7 5700X3D, 16 logical CPUs, WSL2;
+512 MB shared buffers and 64 MB work_mem. Durability is enabled; parallel query, JIT and autovacuum
+are disabled. Each query has one warmup and two timed rounds. Tables below show median EXPLAIN
+execution time in **milliseconds**; planning time is separate in the full report. These are progress
+measurements, not confidence intervals. Warm means no deliberate cache eviction, not that all pages
+fit in shared buffers. [Recorded environment](bench/results/quick/2026-09-21-481f876/metadata.json).
 
-Sparse segments (DESIGN.md §13) shrank the posting sets, but the index only got smaller once the
-space policy followed: `inline_limit` now defaults to its maximum of 4096 bytes (a key that spills
-owns whole container pages, so spilling a 1.5 KB posting set wastes a page), and the build sizes the
-bucket array by the bytes its entries need rather than by the number of distinct keys.
+The scalar portfolios each have five single-column indexes: `c2`, `c20`, `c200`, `c20k`, and
+`nullable`. GIN uses `btree_gin` with `fastupdate=on`. Lion and **Lion (pushdown off)** share the same
+`USING lion` indexes; their artifact labels are `roaring` and `roaring_bitmap`. All query timings below
+use the default planner, so **† marks an actual sequential scan**, not index performance. Other cells may
+use LionCount, index-only scans or bitmap scans; every route is recorded in the full report.
 
-| column (5M rows) | roaring before | roaring after | GIN (btree_gin) | btree |
-|---|---|---|---|---|
-| c2 (2 keys) | 8488 kB | 8488 kB | 5280 kB | 33 MB |
-| c200 | 13 MB | 14 MB | 13 MB | 33 MB |
-| c20k | 164 MB | **37 MB** | 26 MB | 34 MB |
-| c1m (993k keys) | 256 MB | **116 MB** | 87 MB | 56 MB |
+### Where Lion wins: counts and grouping
 
-## Results with the real index (20M rows, optimized build, 15-bit containers)
+These are default-planner results. Clean rows follow VACUUM; dirty rows follow scattered payload
+updates to 1% of rows and ANALYZE, without VACUUM. Row-update percentage is not the percentage of
+heap pages that lose all-visible status.
 
-Index sizes. Roaring pays 12 bytes of header per container plus item alignment, and one 4104-byte
-bitset per page leaves half of each page empty, so dense random keys cost more than GIN; sparse
-high-cardinality keys cost 2-3x GIN because every member becomes its own container. Clustered keys
-are 10x smaller than GIN and 60x smaller than btree.
+| Dataset | Query / state | B-tree ms | GIN ms | Lion ms |
+| --- | --- | --- | --- | --- |
+| 1M scalar | Count ~50% of rows / clean | 32.336 | 93.011 | 0.408 |
+| 1M scalar | Count ~0.5% of rows / clean | 0.318 | 2.827 | 0.028 |
+| 1M scalar | Count two equality predicates / clean | 2.764 | 33.469 | 0.357 |
+| 1M scalar | Count per 200 groups / clean | 85.142 | 142.057 † | 3.874 |
+| 1M scalar | Count per 200 groups / dirty | 142.221 † | 146.727 † | 3.699 |
+| 5M scalar | Count ~50% of rows / clean | 167.163 | 958.400 | 2.034 |
+| 5M scalar | Count ~0.5% of rows / clean | 1.530 | 110.119 | 0.103 |
+| 5M scalar | Count two equality predicates / clean | 16.193 | 178.657 | 1.643 |
+| 5M scalar | Count per 200 groups / clean | 417.244 | 1252.029 † | 18.645 |
+| 5M scalar | Count per 200 groups / dirty | 956.909 † | 934.408 † | 18.465 |
+| 200k documents | Array contains `t1` | — | 4.909 | 0.025 |
+| 200k documents | Array contains `t1` and `t17` | — | 0.956 | 0.115 |
+| 200k documents | Array overlaps `t1`, `t17`, `t123` | — | 8.040 | 0.277 |
+| 200k documents | Full-text `w1 & w17` count | — | 1.069 | 0.116 |
 
-| column | btree | GIN | roaring, first format | roaring, current format (sparse segments, inline 4096, byte-sized buckets) |
-|---|---|---|---|---|
-| c2 | 132 MB | 21 MB | 56 MB | 56 MB |
-| c10 | 132 MB | 23 MB | 41 MB | 41 MB |
-| c200 | 132 MB | 39 MB | 51 MB | 51 MB |
-| c20k | 138 MB | 157 MB | 475 MB | 209 MB |
-| c1m | 152 MB | 199 MB | 337 MB | 240 MB |
-| c200_clustered | 132 MB | 23 MB | 2.1 MB | 2.7 MB |
-| c_skew | 133 MB | 26 MB | 41 MB | 30 MB |
+At 5M rows, clean equality/intersection/grouping cases above are roughly **10–82× faster than
+B-tree**. In the document cases shown, Lion's membership counts are roughly **8–196× faster than
+GIN**. B-tree has no matching document index in this workload (—). This does not extend to arbitrary
+aggregates or retrieving all matching rows: the optimization answers the supported count shapes.
 
-Build time per lion index: 11-19 s (btree 4-10 s, GIN 4-21 s). A 14-bit container experiment
-helped only the 2-valued column (56 to 38 MB) and hurt mid-cardinality keys by 18%, so 15 bits stays.
-What remains of the gap on c20k is that each key's 6 KB posting set exceeds the inline limit and owns
-a whole container page (20,000 pages, 95 MB of them empty); sharing container pages between keys is
-the next size item.
+The same Lion indexes with pushdown disabled show why the query shape matters:
 
-Bitmap-scan path (amgetbitmap, count pushdown disabled), pgbench average ms:
+| 5M-row query / clean | Lion ms | Lion, pushdown off ms |
+| --- | --- | --- |
+| Count ~50% of rows | 2.034 | 617.308 |
+| Count two equality predicates | 1.643 | 17.598 |
+| Count per 200 groups | 18.645 | 976.453 † |
 
-| query | btree | GIN | roaring |
-|---|---|---|---|
-| count(*) where c2 = 1 (10M rows) | 539 (index-only) | 1630 | 1062 |
-| count(*) where c200 = 17 (100k) | 5.4 (index-only) / 69 (bitmap) | 77 | 73 |
-| count(*) where c200_clustered = 17 | 5.2 | 12 | 6.8 |
-| count(*) where c20k = 123 (1k) | 0.17 | 0.86 | 0.82 |
-| count(*) where c1m = 12345 (20) | 0.12 | 0.13 | 0.13 |
-| 3-column AND, 5k rows | 84 | 176 | 59 |
-| sum(c1m) where c200 = 17 (fetch 100k rows) | 72 | 79 | 71 |
-| count(*) where c20k between 100 and 199 | 5.6 | 810 | unsupported (equality only) |
+### Where it is at practical parity: tiny probes and fetching rows
 
-The roaring bitmap-index-scan node itself is fast (500k TIDs in 4 ms) but every path that goes
-through Bitmap Heap Scan is heap-bound, exactly as the feasibility study predicted (the 10M-row
-count varied between 1.06 and 1.44 s across runs).
+For very selective equality counts, B-tree and Lion both finish in tens of microseconds. The
+absolute gap is too small to justify another index from these two samples alone. Fetching data
+requires heap access, so the count shortcut no longer applies.
 
-Count pushdown (`Custom Scan (LionCount)`: containers + visibility map, heap visited only for
-the ~120 pages of this table that are not all-visible), pgbench average ms, same 20M-row table:
+| Dataset | Query / state | B-tree ms | GIN ms | Lion ms |
+| --- | --- | --- | --- | --- |
+| 1M scalar | Count ~0.005% of rows | 0.021 | 0.051 | 0.017 |
+| 5M scalar | Count ~0.005% of rows | 0.033 | 1.146 | 0.025 |
+| 1M scalar | Sum ID/payload length for `c200=17` | 3.578 | 3.228 | 3.029 |
+| 200k documents | Sum ID/payload length for full-text `w1` | — | 4.903 | 5.700 |
 
-| query | seqscan / hashagg | btree index-only | LionCount | speedup vs btree |
-|---|---|---|---|---|
-| count(*) where c2 = 1 (10M rows) | ~2000 | 604 | **2.6** | 230x |
-| count(*) where c200 = 17 (100k) | | 5.7 | **0.38** | 15x |
-| count(*) where c200_clustered = 17 | | 5.2 | **0.11** | 45x |
-| count(*) where c20k = 123 (1k) | | 0.17 | 0.15 | 1x |
-| count(*) where c1m = 12345 (20) | | 0.12 | 0.12 | 1x |
-| count(*) where c10 = 3 and c200 = 17 and c2 = 1 | | 85 (BitmapAnd) | **4.9** | 17x |
-| c200, count(*) group by c200 | 2473 | 1409 | **56** | 25x (44x vs seqscan) |
-| c2, count(*) group by c2 | 2038 | 1407 | **5.6** | 250x |
+“Practical parity” here means similar scale or no demonstrated useful advantage, not statistical
+equivalence. The 5M payload-fetch measurements vary sharply even between Lion variants using the
+same bitmap plan (15.239 ms with pushdown enabled versus 127.818 ms disabled). That difference is
+not evidence of a pushdown benefit for fetching rows. Inspect the full report and repeat such cases.
 
-These are the numbers the 2022 demo hinted at, now produced by a transactionally correct index: the
-count honours the caller's snapshot, rechecks TIDs on non-all-visible pages in the heap, and holds
-the container page pin across the visibility-map check so VACUUM cannot overtake it (proven by an
-isolation test with an injection point). The cost is O(containers) in the all-visible case; before
-the per-container visibility-map read it was O(heap blocks × keys) and the GROUP BY took 1034 ms.
+### Where Lion loses: ranges, larger IN lists, phrase and prefix search
 
-Where it does not help: anything that must fetch rows (heap-bound, parity with btree), high-cardinality
-keys (parity with btree, 2-3x the space of GIN), range predicates (unsupported), and tables where
-few pages are all-visible (the recheck path is 1.8x faster than a seqscan at best and the cost model
-falls back to the seqscan when `relallvisible` says so).
+| Dataset | Query / state | B-tree ms | GIN ms | Lion ms |
+| --- | --- | --- | --- | --- |
+| 1M scalar | Count `c20k IN (0,...,99)` | 0.325 | 3.417 | 0.577 |
+| 1M scalar | Count `c20k BETWEEN 100 AND 199` | 0.298 | 38.532 | 119.384 † |
+| 5M scalar | Count `c20k IN (0,...,99)` | 1.635 | 255.224 | 2.454 |
+| 5M scalar | Count `c20k BETWEEN 100 AND 199` | 1.542 | 381.769 | 713.062 † |
+| 200k documents | Phrase `common <-> w1` count | — | 7.893 | 46.614 † |
+| 200k documents | Prefix `rare12:*` count | — | 1.720 | 29.463 † |
 
-Raw logs: `bench/logs/09_final_*` (this run, current format), `bench/logs/08_vmmask_*` (the run that
-introduced the per-container visibility-map read); earlier runs survive only as tables here.
+B-tree wins the tested 100-value IN queries and directly supports the range predicate, which
+Lion cannot index. GIN is about **6× faster for the phrase** and **17× faster for the prefix** here.
+Lion currently handles phrase/prefix predicates through full-index walks and heap rechecking;
+GIN can narrow the candidates through its index. Lion's default plan in this run is sequential (†).
+Retain B-tree/GIN for these
+access patterns. This single IN-list size does not establish a universal crossover point.
 
----
+The full report also includes NULL counts, three-predicate intersections, all dirty-read cases,
+and reads after maintenance. Exact SQL and data distributions are in the
+[workload manifest](bench/results/quick/2026-09-21-481f876/queries.json).
 
-# Feasibility benchmark (pre-implementation)
+### Build time and index storage
 
-Reproducible material behind the 2026-09-20 assessment of the idea posted to pgsql-hackers in June 2022
-("An inverted index using lion bitmaps"). Everything here ran against PostgreSQL master
-(20devel, commit 9e17d25e, built from source with `-O2`) and pg_roaringbitmap 1.3 (CRoaring 4.3.11),
-on WSL2, 16 cores, 23 GB RAM, private cluster with `fsync=off`, `jit=off`, no parallel query,
-`work_mem=256MB`, `autovacuum=off`.
+Times are the sum of one build per index; sizes are measured after build, before mutations.
+Scalar portfolios contain five indexes; document portfolios contain two. The pushdown setting
+changes neither construction nor storage. At 5M rows, Lion uses **45% less index space than B-tree**
+but **46% more than GIN**, and its build takes **3.3×** the B-tree time and **5.6×** the GIN time.
+These are portfolio totals, not a claim that Lion is smaller for every column or distribution.
 
-## Layout
+| Dataset | Family | Build seconds | Index MiB |
+| --- | --- | --- | --- |
+| 1M scalar | B-tree | 1.062 | 33.516 |
+| 1M scalar | GIN | 0.742 | 18.945 |
+| 1M scalar | Lion | 3.277 | 22.617 |
+| 5M scalar | B-tree | 5.839 | 166.812 |
+| 5M scalar | GIN | 3.401 | 62.703 |
+| 5M scalar | Lion | 19.013 | 91.406 |
+| 200k documents | GIN | 0.347 | 6.375 |
+| 200k documents | Lion | 1.606 | 8.055 |
 
-- `bench/gen.sql` — builds the 20M-row `fact` table (1.8 GB heap, 227,328 pages, max offset 88),
-  one btree and one GIN (`btree_gin`) index per column, and a `fact_tids` helper table.
-- `bench/sim.sql` — builds simulated roaring "indexes" (`rb_<col>` tables: key -> bitmap) under four
-  TID encodings, prints sizes next to the real indexes, and builds two visibility-map masks.
-- `bench/tidconv/` — 20-line C extension (`int8_to_tid`, `tid_to_int8`) so the roaring->heap paths
-  are not dominated by text parsing of ctids.
-- `bench/q/*.sql` — pgbench query files. `*_idx.sql` run against the real indexes,
-  `*_rb_naive.sql` read the bitmap only, `*_rb_vmall.sql` AND the bitmap with an all-visible VM mask,
-  `*_rb_vm95.sql` AND with a mask where 5% of heap pages are randomly "dirty" and recheck the
-  leftover TIDs in the heap via a TID scan (the honest cost model for a real index).
-- `bench/bench.sh` — runs each query once under EXPLAIN (ANALYZE, BUFFERS) and then under
-  `pgbench -M prepared -T <secs>`; forces btree-only / GIN-only phases by flipping `pg_index.indisvalid`.
-- `bench/w.sql` — write-path comparison on a 2M-row copy: 200k inserts and ~20k non-HOT updates
-  with 7 btree indexes, 7 GIN indexes (`fastupdate=off`), 7 GIN indexes (`fastupdate=on`).
-- `results/` — raw logs and result tables from the run.
+### Writes and maintenance: 5M rows
 
-## Columns in `fact`
+Each portfolio inserts 50k rows, updates `c200` in 50k existing rows, then runs VACUUM ANALYZE.
+A checkpoint precedes each measured operation. Times and WAL volumes are single observations,
+including all five indexes. GIN's fast updates defer work, so its subsequent VACUUM cost is shown too.
 
-| column | distinct keys | distribution |
-|---|---|---|
-| c2 | 2 | uniform random |
-| c10 | 10 | uniform random |
-| c200 | 200 | uniform random |
-| c20k | 20,000 | uniform random |
-| c1m | 1,000,000 | uniform random (~20 rows/key) |
-| c200_clustered | 200 | monotone in insertion order (runs of 100k rows) |
-| c_skew | 1,000 | 90% one value, rest uniform |
+| Family | Insert ms | Insert WAL MiB | Update ms | Update WAL MiB | VACUUM ms | VACUUM WAL MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| B-tree | 473.005 | 59.688 | 1111.647 | 77.010 | 421.067 | 20.733 |
+| GIN | 320.169 | 46.051 | 777.381 | 62.567 | 564.815 | 56.255 |
+| Lion | 1600.515 | 208.808 | 2020.713 | 271.021 | 429.944 | 20.729 |
 
-## TID encodings tried for the roaring bitmaps
+In this run, Lion's insert took **3.4×** and indexed update **1.8×** the B-tree time, with roughly
+**3.5×** the WAL for both. Against GIN with `fastupdate=on`, Lion's insert/update times are about
+**5.0× / 2.6×** higher, with **4.5× / 4.3×** the WAL; GIN's subsequent VACUUM is slower and writes more
+WAL than Lion's. The quick suite does not measure sustained concurrent write throughput.
+One bucket-directory growth warning for the 5M `ix_c20k` index was recorded; all checks still passed.
 
-| name | bits | mapping | notes |
-|---|---|---|---|
-| rb32_2048 | 32 | block*2048 + offset | the 2022 demo; caps a table at 2^21 pages = 16 GB |
-| rb32_292 | 32 | block*292 + offset | densest legal 32-bit packing (MaxHeapTuplesPerPage=291 at 8K); caps at ~112 GB |
-| rb64_11 | 64 | block<<11 \| offset | GIN's own encoding, no cap; each roaring container spans 32 heap pages |
-| rb64_16 | 64 | block<<16 \| offset | raw ItemPointer layout; one container per heap page |
+### Reproduce, review, and earlier measurements
 
-## Index size (20M rows)
+Build/install the current extension, then run `python3 bench/quick.py --prefix /path/to/postgresql`.
+See [QUICK.md](bench/QUICK.md) for setup and saved-baseline comparisons. The pre-rename quick run has
+a different workload hash and is not an automatic comparison baseline for this run.
 
-| column | btree | GIN | rb32_2048 raw | rb32_2048 run-opt | rb32_292 run-opt | rb64_11 run-opt | rb64_16 run-opt |
-|---|---|---|---|---|---|---|---|
-| c2 | 132 MB | 21 MB | 38 MB | 38 MB | 16 MB | 38 MB | 40 MB |
-| c10 | 132 MB | 23 MB | 39 MB | 39 MB | 38 MB | 39 MB | 56 MB |
-| c200 | 132 MB | 39 MB | 49 MB | 49 MB | 40 MB | 49 MB | 162 MB |
-| c20k | 138 MB | 157 MB | 181 MB | 181 MB | 135 MB | 181 MB | 191 MB |
-| c1m | 152 MB | 199 MB | 198 MB | 198 MB | 197 MB | 210 MB | 243 MB |
-| c200_clustered | 132 MB | 23 MB | 38 MB | **0.96 MB** | 0.90 MB | 0.96 MB | 3.1 MB |
-| c_skew | 133 MB | 26 MB | 52 MB | 25 MB | 18 MB | 25 MB | 29 MB |
+The [follow-up review](FOLLOWUP_REVIEW.md) records the verified fixes, fresh regression/isolation
+and recovery/standby checks, and the remaining P2 issue in the legacy benchmark cleanup path.
+The quick runner uses its own disposable cluster and does not use that cleanup helper.
 
-Roaring sizes are the sum of the portable serialized bitmaps (no page overhead, no entry tree), so they
-flatter roaring slightly. GIN sizes include its entry tree and posting trees; btree sizes include
-pivot tuples.
+The [comprehensive suite](bench/comprehensive/README.md) also compares hash, GiST, BRIN, tuned
+B-tree and timed sequential execution, with broader query, memory, maintenance and concurrency
+coverage. Its [comparison results](bench/COMPARISON.md) and
+[growth/churn/write supplement](bench/results/2026-09-21-stress/REPORT.md) describe older commits;
+those larger suites were not rerun at `481f876`. The former README's 20M-row experiments and
+pre-implementation simulation are preserved in the
+[historical benchmark archive](bench/HISTORICAL_README_BENCHMARKS.md).
 
-## Write path (2M-row copy, 7 single-column indexes)
+## License
 
-| index set | insert 200k rows | update ~20k rows (indexed column changes, non-HOT) |
-|---|---|---|
-| none | 0.27 s | 0.34 s |
-| 7 btree | 2.44 s | 0.93 s |
-| 7 GIN, fastupdate=off | 4.03 s | 0.64 s |
-| 7 GIN, fastupdate=on | 1.66 s (work deferred to pending-list cleanup) | 1.03 s |
+Copyright (c) 2026, Chinmay Kanchi.
 
-## Query latency
-
-See `results/03_queries_*.txt` (pgbench average latency, single client, warm cache) and the
-"Query latency" section appended below after the 10 GB shared_buffers re-run.
-
-### Query latency, 10 GB shared_buffers, all buffers hit (pgbench average, ms)
-
-Point `count(*)` on one key:
-
-| predicate (rows) | btree index-only | GIN bitmap heap scan | roaring, bitmap only | roaring AND all-visible mask | roaring AND 95% mask + heap recheck of rest |
-|---|---|---|---|---|---|
-| c2 = 1 (10.0M) | 562 | 1571 | 2.2 | 3.0 | 184 |
-| c200 = 17 (100k, scattered) | 5.4 | 80 | 0.16 | 0.65 | 5.0 |
-| c200_clustered = 17 (100k, contiguous) | 5.2 | 12 | 0.14 | 0.18 | 2.0 |
-| c20k = 123 (1k) | 0.18 | 0.94 | 0.12 | 0.20 | 0.43 |
-| c1m = 12345 (20) | 0.13 | 0.13 | 0.12 | 0.15 | 0.20 |
-
-Other shapes:
-
-| query | btree | GIN | roaring, bitmap only | roaring, 95% mask + recheck |
-|---|---|---|---|---|
-| count where c10=3 and c200=17 and c2=1 (5k rows; planner ANDs two indexes, filters the third in the heap) | 84 | 169 | 6.0 | 6.9 |
-| c200, count(*) group by c200 (seqscan+hashagg: 2427) | 1359 index-only + GroupAggregate | n/a | 7.3 | 94 (all-visible mask) / 891 (95% mask) |
-| c2, count(*) group by c2 (seqscan+hashagg: 2080) | 1340 | n/a | 4.7 | 6.5 / 352 |
-| count where c20k between 100 and 199 (100k rows, 100 keys) | 5.5 | 789 (btree_gin turns `>=` into a scan of every key above the bound) | 11.2 (OR of 100 bitmaps) | n/a |
-| sum(c1m) where c200 = 17 (must fetch 100k rows) | 76 bitmap heap scan | 84 | 55 via TID scan | n/a |
-
-The 4 GB shared_buffers run (`results/03_*`) gave the same numbers within noise, so none of the
-bitmap-heap-scan cost is buffer misses; it is heap page visits (81,398 pages for c200 = 17,
-227,273 pages for c2 = 1).
-
-Caveats of the simulation: the roaring "index" has no page structure, no entry tree beyond a btree on
-`key`, and must detoast whole bitmaps (the 19 MB c2 bitmap costs ~2 ms just to read), so it
-overstates roaring's cost on huge keys and understates it on tiny ones. The recheck path uses a TID
-scan, which is slightly cheaper per row than a bitmap heap scan. None of the roaring variants pay
-for the VACUUM/visibility-map interlock that a real index-only bitmap count would need.
+Licensed under the [PostgreSQL License](LICENSE) (SPDX: `PostgreSQL`).
