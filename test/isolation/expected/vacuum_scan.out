@@ -1,0 +1,77 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_count s2_delete s2_commit s3_count s3_vacuum s1_count s1_commit s1_count s3_check s3_verify
+step s1_begin: BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+step s1_count: SELECT count(*), max(i) FROM rbi_vsc WHERE k = 1;
+count|  max
+-----+-----
+10000|39997
+(1 row)
+
+step s2_delete: DELETE FROM rbi_vsc WHERE k = 1 AND i % 8 = 1;
+step s2_commit: COMMIT;
+step s3_count: SELECT count(*), max(i) FROM rbi_vsc WHERE k = 1;
+count|  max
+-----+-----
+ 5000|39997
+(1 row)
+
+step s3_vacuum: VACUUM rbi_vsc;
+step s1_count: SELECT count(*), max(i) FROM rbi_vsc WHERE k = 1;
+count|  max
+-----+-----
+10000|39997
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_count: SELECT count(*), max(i) FROM rbi_vsc WHERE k = 1;
+count|  max
+-----+-----
+ 5000|39997
+(1 row)
+
+step s3_check: SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_vsc WHERE k = 1) =
+					 (SELECT count(*) FROM rbi_vsc WHERE k + 0 = 1) AS matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_vsc WHERE k = 1) AS k1;
+matches_seqscan|  k1
+---------------+----
+t              |5000
+(1 row)
+
+step s3_verify: SELECT roaring_index_verify('rbi_vsc_k', true);
+roaring_index_verify
+--------------------
+                    
+(1 row)
+
+
+starting permutation: s2_delete s2_commit s3_stats s3_vacuum s3_stats s3_check s3_verify
+step s2_delete: DELETE FROM rbi_vsc WHERE k = 1 AND i % 8 = 1;
+step s2_commit: COMMIT;
+step s3_stats: SELECT entries, ntids FROM roaring_index_stats('rbi_vsc_k');
+entries|ntids
+-------+-----
+      4|40000
+(1 row)
+
+step s3_vacuum: VACUUM rbi_vsc;
+step s3_stats: SELECT entries, ntids FROM roaring_index_stats('rbi_vsc_k');
+entries|ntids
+-------+-----
+      4|35000
+(1 row)
+
+step s3_check: SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_vsc WHERE k = 1) =
+					 (SELECT count(*) FROM rbi_vsc WHERE k + 0 = 1) AS matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_vsc WHERE k = 1) AS k1;
+matches_seqscan|  k1
+---------------+----
+t              |5000
+(1 row)
+
+step s3_verify: SELECT roaring_index_verify('rbi_vsc_k', true);
+roaring_index_verify
+--------------------
+                    
+(1 row)
+

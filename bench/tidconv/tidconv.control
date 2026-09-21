@@ -1,0 +1,4 @@
+comment = 'tid <-> int8 helpers'
+default_version = '1.0'
+module_pathname = '$libdir/tidconv'
+relocatable = true

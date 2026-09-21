@@ -1,0 +1,11 @@
+.local/
+*.o
+*.so
+*.bc
+test/results/
+test/isolation/results/
+test/isolation/output_iso/
+test/unit/container_test
+regression.*
+log/
+test/unit/sparse_test

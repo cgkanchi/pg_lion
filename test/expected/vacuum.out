@@ -1,0 +1,579 @@
+-- VACUUM of a roaring index: ambulkdelete and amvacuumcleanup
+-- (DESIGN.md section 5, VACUUM, and section 11).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS roaring_index;
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE OR REPLACE FUNCTION rbi_cmp(tbl text, pred text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	q text := format('SELECT count(*) AS c, coalesce(sum(i), 0) AS s FROM %s WHERE %s', tbl, pred);
+	a record;
+	b record;
+	ln text;
+	used boolean := false;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', false);
+	PERFORM set_config('enable_bitmapscan', 'on', false);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Bitmap Index Scan%' THEN
+			used := true;
+		END IF;
+	END LOOP;
+	EXECUTE q INTO a;
+
+	PERFORM set_config('enable_seqscan', 'on', false);
+	PERFORM set_config('enable_bitmapscan', 'off', false);
+	EXECUTE q INTO b;
+	PERFORM set_config('enable_bitmapscan', 'on', false);
+
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH index=%s seqscan=%s', a::text, b::text);
+	END IF;
+	IF NOT used THEN
+		RETURN format('NO BITMAP INDEX SCAN (%s rows)', a.c);
+	END IF;
+	RETURN format('ok %s rows', a.c);
+END $$;
+/*
+ * Table 1.  k is clustered, so each of its keys is one long run inside one
+ * or two containers: tiny posting sets that live INLINE in their entry
+ * tuples.  t is spread over the whole table, so its keys are CHAIN entries
+ * with array containers.
+ */
+CREATE TABLE rbi_vac (i int4, k int4, t text);
+INSERT INTO rbi_vac
+SELECT i, i / 5000, 'v' || (i % 11) FROM generate_series(1, 200000) i;
+CREATE INDEX rbi_vac_k ON rbi_vac USING roaring (k);
+CREATE INDEX rbi_vac_t ON rbi_vac USING roaring (t);
+SELECT entries, inline_entries, run_containers > 0 AS has_runs, ntids
+  FROM roaring_index_stats('rbi_vac_k');
+ entries | inline_entries | has_runs | ntids  
+---------+----------------+----------+--------
+      41 |             41 | t        | 200000
+(1 row)
+
+SELECT entries, inline_entries, container_pages > 0 AS has_chains, ntids
+  FROM roaring_index_stats('rbi_vac_t');
+ entries | inline_entries | has_chains | ntids  
+---------+----------------+------------+--------
+      11 |              0 | t          | 200000
+(1 row)
+
+-- Every other row of a dense, clustered key: the runs split into singletons,
+-- which no longer fit inline, so the entries spill onto container pages.
+DELETE FROM rbi_vac WHERE i % 2 = 0;
+VACUUM rbi_vac;
+SELECT entries, inline_entries, bitset_containers > 0 AS has_bitsets, ntids
+  FROM roaring_index_stats('rbi_vac_k');
+ entries | inline_entries | has_bitsets | ntids  
+---------+----------------+-------------+--------
+      41 |              1 | t           | 100000
+(1 row)
+
+SELECT entries, ntids FROM roaring_index_stats('rbi_vac_t');
+ entries | ntids  
+---------+--------
+      11 | 100000
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_t', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 2500 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 39');
+   rbi_cmp    
+--------------
+ ok 2500 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 't = ''v3''');
+   rbi_cmp    
+--------------
+ ok 9091 rows
+(1 row)
+
+-- The index statistics VACUUM reported match what the index holds.
+SELECT (SELECT ntids FROM roaring_index_stats('rbi_vac_k')) =
+	   (SELECT reltuples::int8 FROM pg_class WHERE relname = 'rbi_vac_k')
+	   AS reltuples_matches_ntids;
+ reltuples_matches_ntids 
+-------------------------
+ t
+(1 row)
+
+-- Whole keys: the entries stay (the key remains known) but hold no TIDs.
+DELETE FROM rbi_vac WHERE k IN (3, 4);
+VACUUM rbi_vac;
+SELECT entries, ntids FROM roaring_index_stats('rbi_vac_k');
+ entries | ntids 
+---------+-------
+      41 | 95000
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 3');
+  rbi_cmp  
+-----------
+ ok 0 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 5');
+   rbi_cmp    
+--------------
+ ok 2500 rows
+(1 row)
+
+-- Scattered rows.
+DELETE FROM rbi_vac WHERE i % 7 = 0;
+VACUUM rbi_vac;
+SELECT ntids FROM roaring_index_stats('rbi_vac_k');
+ ntids 
+-------
+ 81429
+(1 row)
+
+SELECT ntids FROM roaring_index_stats('rbi_vac_t');
+ ntids 
+-------
+ 81429
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_t', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 2143 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 't = ''v3''');
+   rbi_cmp    
+--------------
+ ok 7402 rows
+(1 row)
+
+-- A second VACUUM has nothing to do and must change nothing.
+CREATE TEMP TABLE rbi_vac_snap AS
+	SELECT * FROM roaring_index_stats('rbi_vac_k');
+VACUUM rbi_vac;
+SELECT count(*) AS unchanged_stats_rows
+  FROM (SELECT * FROM roaring_index_stats('rbi_vac_k')
+		INTERSECT
+		SELECT * FROM rbi_vac_snap) s;
+ unchanged_stats_rows 
+----------------------
+                    1
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+-- VACUUM FREEZE walks the same code path with a different cutoff.
+VACUUM FREEZE rbi_vac;
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_t', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 2143 rows
+(1 row)
+
+-- Inserts after VACUUM reuse the heap pages it freed, so their container
+-- keys land in the middle of the chains that are already there.
+INSERT INTO rbi_vac
+SELECT i, i % 41, 'v' || (i % 11) FROM generate_series(200001, 260000) i;
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_t', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 3607 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 3');
+   rbi_cmp    
+--------------
+ ok 1464 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 't = ''v3''');
+    rbi_cmp    
+---------------
+ ok 12857 rows
+(1 row)
+
+SELECT ntids FROM roaring_index_stats('rbi_vac_k');
+ ntids  
+--------
+ 141429
+(1 row)
+
+-- ... and VACUUM after those inserts.
+DELETE FROM rbi_vac WHERE i > 240000;
+VACUUM rbi_vac;
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 3119 rows
+(1 row)
+
+-- A rebuilt index holds exactly the same TIDs under the same keys.
+CREATE TEMP TABLE rbi_vac_before AS
+	SELECT entries, ntids FROM roaring_index_stats('rbi_vac_k');
+REINDEX INDEX rbi_vac_k;
+SELECT (SELECT entries FROM roaring_index_stats('rbi_vac_k')) =
+	   (SELECT entries FROM rbi_vac_before) AS same_entries,
+	   (SELECT ntids FROM roaring_index_stats('rbi_vac_k')) =
+	   (SELECT ntids FROM rbi_vac_before) AS same_ntids;
+ same_entries | same_ntids 
+--------------+------------
+ t            | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_vac_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 7');
+   rbi_cmp    
+--------------
+ ok 3119 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vac', 'k = 3');
+   rbi_cmp   
+-------------
+ ok 976 rows
+(1 row)
+
+/*
+ * Table 2.  Half the rows of each key, in runs of 20: the build turns them
+ * into run containers of a few hundred runs, and deleting every other row
+ * splits every run into singletons, so every container has to grow into a
+ * bitset that no longer fits in its slot.  This is the container page split
+ * path of ambulkdelete.
+ */
+CREATE TABLE rbi_vacrun (i int4, k int4);
+INSERT INTO rbi_vacrun
+SELECT i, CASE WHEN (i % 40) < 20 THEN 1 ELSE 2 END
+  FROM generate_series(1, 200000) i;
+CREATE INDEX rbi_vacrun_k ON rbi_vacrun USING roaring (k)
+	WITH (inline_limit = 64);
+CREATE TEMP TABLE rbi_vacrun_before AS
+	SELECT container_pages, containers FROM roaring_index_stats('rbi_vacrun_k');
+SELECT run_containers, ntids FROM roaring_index_stats('rbi_vacrun_k');
+ run_containers | ntids  
+----------------+--------
+             28 | 200000
+(1 row)
+
+DELETE FROM rbi_vacrun WHERE i % 2 = 0;
+VACUUM rbi_vacrun;
+SELECT bitset_containers, run_containers, ntids
+  FROM roaring_index_stats('rbi_vacrun_k');
+ bitset_containers | run_containers | ntids  
+-------------------+----------------+--------
+                28 |              0 | 100000
+(1 row)
+
+SELECT (SELECT container_pages FROM roaring_index_stats('rbi_vacrun_k')) >
+	   (SELECT container_pages FROM rbi_vacrun_before) AS pages_split,
+	   (SELECT containers FROM roaring_index_stats('rbi_vacrun_k')) =
+	   (SELECT containers FROM rbi_vacrun_before) AS same_containers;
+ pages_split | same_containers 
+-------------+-----------------
+ t           | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacrun_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vacrun', 'k = 1');
+    rbi_cmp    
+---------------
+ ok 50000 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vacrun', 'k = 2');
+    rbi_cmp    
+---------------
+ ok 50000 rows
+(1 row)
+
+-- Delete everything: every container disappears, the entries stay.
+DELETE FROM rbi_vacrun;
+VACUUM rbi_vacrun;
+SELECT entries, containers, ntids FROM roaring_index_stats('rbi_vacrun_k');
+ entries | containers | ntids 
+---------+------------+-------
+       2 |          0 |     0
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacrun_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vacrun', 'k = 1');
+  rbi_cmp  
+-----------
+ ok 0 rows
+(1 row)
+
+-- The emptied chains still accept new rows.
+INSERT INTO rbi_vacrun SELECT i, 1 + (i % 3) FROM generate_series(1, 30000) i;
+SELECT entries, containers > 0 AS has_containers, ntids
+  FROM roaring_index_stats('rbi_vacrun_k');
+ entries | has_containers | ntids 
+---------+----------------+-------
+       3 | t              | 30000
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacrun_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vacrun', 'k = 1');
+    rbi_cmp    
+---------------
+ ok 10000 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vacrun', 'k = 3');
+    rbi_cmp    
+---------------
+ ok 10000 rows
+(1 row)
+
+/*
+ * Table 3.  Sparse segments (DESIGN.md section 13): a high-cardinality key
+ * whose posting sets are pairs, not containers.  VACUUM filters the pairs
+ * through the same TID callback, drops segments that lose every pair, and
+ * leaves a container that falls below the threshold a container.
+ */
+CREATE TABLE rbi_vacsp (i int4, k int4, d int4);
+INSERT INTO rbi_vacsp
+SELECT i, ((i::bigint * 7919) % 60000)::int4, i % 40
+  FROM generate_series(1, 120000) i;
+CREATE INDEX rbi_vacsp_k ON rbi_vacsp USING roaring (k) WITH (inline_limit = 64);
+CREATE INDEX rbi_vacsp_d ON rbi_vacsp USING roaring (d);
+-- k: two rows per key, never four in one container key, so all pairs
+SELECT containers, sparse_segments > 0 AS has_segments,
+	   sparse_members = ntids AS all_pairs, ntids
+  FROM roaring_index_stats('rbi_vacsp_k');
+ containers | has_segments | all_pairs | ntids  
+------------+--------------+-----------+--------
+          0 | t            | t         | 120000
+(1 row)
+
+-- d: 3000 rows per key spread over the heap, so containers everywhere
+SELECT containers > 0 AS has_containers, sparse_segments, ntids
+  FROM roaring_index_stats('rbi_vacsp_d');
+ has_containers | sparse_segments | ntids  
+----------------+-----------------+--------
+ t              |               0 | 120000
+(1 row)
+
+-- Delete most rows: segments shrink, and the ones that lose every pair go.
+CREATE TEMP TABLE rbi_vacsp_before AS
+	SELECT sparse_segments, sparse_members, containers
+	  FROM roaring_index_stats('rbi_vacsp_k');
+DELETE FROM rbi_vacsp WHERE i % 4 <> 0;
+VACUUM rbi_vacsp;
+SELECT (SELECT sparse_segments FROM roaring_index_stats('rbi_vacsp_k')) <
+	   (SELECT sparse_segments FROM rbi_vacsp_before) AS fewer_segments,
+	   (SELECT sparse_members FROM roaring_index_stats('rbi_vacsp_k')) <
+	   (SELECT sparse_members FROM rbi_vacsp_before) AS fewer_members;
+ fewer_segments | fewer_members 
+----------------+---------------
+ t              | t
+(1 row)
+
+SELECT sparse_members = ntids AS still_all_pairs,
+	   ntids = (SELECT count(*) FROM rbi_vacsp) AS ntids_matches_heap,
+	   entries AS entries_are_kept
+  FROM roaring_index_stats('rbi_vacsp_k');
+ still_all_pairs | ntids_matches_heap | entries_are_kept 
+-----------------+--------------------+------------------
+ t               | t                  |            60000
+(1 row)
+
+/*
+ * d keeps its containers even where they are now down to a handful of
+ * members: converting back to pairs is optional and VACUUM does not do it.
+ */
+SELECT containers > 0 AS still_containers, sparse_segments,
+	   ntids = (SELECT count(*) FROM rbi_vacsp) AS ntids_matches_heap
+  FROM roaring_index_stats('rbi_vacsp_d');
+ still_containers | sparse_segments | ntids_matches_heap 
+------------------+-----------------+--------------------
+ t                |               0 | t
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacsp_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacsp_d', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vacsp', 'k = 31676');	-- the row of i = 4, still there
+  rbi_cmp  
+-----------
+ ok 2 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vacsp', 'k = 7919');	-- the row of i = 1, deleted
+  rbi_cmp  
+-----------
+ ok 0 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vacsp', 'd = 8');		-- d = 8 is i % 40 = 8, i. e. i % 4 = 0
+   rbi_cmp    
+--------------
+ ok 3000 rows
+(1 row)
+
+SELECT rbi_cmp('rbi_vacsp', 'd = 7');		-- d = 7 needs an odd i: all gone
+  rbi_cmp  
+-----------
+ ok 0 rows
+(1 row)
+
+-- Delete the rest: every segment goes away, the entries stay.
+DELETE FROM rbi_vacsp;
+VACUUM rbi_vacsp;
+SELECT entries > 0 AS entries_are_kept, containers, sparse_segments,
+	   sparse_members, ntids
+  FROM roaring_index_stats('rbi_vacsp_k');
+ entries_are_kept | containers | sparse_segments | sparse_members | ntids 
+------------------+------------+-----------------+----------------+-------
+ t                |          0 |               0 |              0 |     0
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacsp_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacsp_d', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vacsp', 'k = 7919');
+  rbi_cmp  
+-----------
+ ok 0 rows
+(1 row)
+
+-- ... and the emptied posting sets accept new rows again
+INSERT INTO rbi_vacsp
+SELECT i, ((i::bigint * 7919) % 60000)::int4, i % 40
+  FROM generate_series(1, 20000) i;
+SELECT sparse_segments > 0 AS has_segments, ntids
+  FROM roaring_index_stats('rbi_vacsp_k');
+ has_segments | ntids 
+--------------+-------
+ t            | 20000
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacsp_k', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT roaring_index_verify('rbi_vacsp_d', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+SELECT rbi_cmp('rbi_vacsp', 'd = 7');
+   rbi_cmp   
+-------------
+ ok 500 rows
+(1 row)
+
+DROP TABLE rbi_vac, rbi_vacrun, rbi_vacsp;

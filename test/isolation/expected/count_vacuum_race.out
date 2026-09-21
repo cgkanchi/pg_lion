@@ -1,0 +1,121 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s2_predel s1_begin s1_plain s2_delete s1_count s3_vacuum s2_wakeup s1_commit s3_count s3_verify s2_detach
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM cnt_race;
+step s2_predel: DELETE FROM cnt_race WHERE id > 3800;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: SELECT count(*) FROM cnt_race WHERE k = 1;
+count
+-----
+  950
+(1 row)
+
+step s2_delete: DELETE FROM cnt_race WHERE k = 1 AND id <= 2000;
+step s1_count: SELECT roaring_index_count('cnt_race_k', 1); <waiting ...>
+step s3_vacuum: VACUUM cnt_race; <waiting ...>
+step s2_wakeup: 
+	SELECT cnt_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_wakeup('roaring-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+roaring_index_count
+-------------------
+                950
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: SELECT count(*) FROM cnt_race WHERE k = 1;
+count
+-----
+  450
+(1 row)
+
+step s3_verify: SELECT roaring_index_verify('cnt_race_k', true);
+roaring_index_verify
+--------------------
+                    
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('roaring-count-containers-pinned');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: s3_prep s2_predel s1_begin s1_plain s2_delete s1_count s3_limit s3_vacuum s2_watch s3_reset s2_release s1_commit s3_vacuum s3_count s3_verify s2_detach
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM cnt_race;
+step s2_predel: DELETE FROM cnt_race WHERE id > 3800;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: SELECT count(*) FROM cnt_race WHERE k = 1;
+count
+-----
+  950
+(1 row)
+
+step s2_delete: DELETE FROM cnt_race WHERE k = 1 AND id <= 2000;
+step s1_count: SELECT roaring_index_count('cnt_race_k', 1); <waiting ...>
+step s3_limit: SET statement_timeout = '1s';
+step s3_vacuum: VACUUM cnt_race; <waiting ...>
+step s2_watch: SELECT cnt_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+step s3_vacuum: <... completed>
+ERROR:  canceling statement due to statement timeout
+step s3_reset: RESET statement_timeout;
+step s2_release: SELECT injection_points_wakeup('roaring-count-containers-pinned');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+roaring_index_count
+-------------------
+                950
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_vacuum: VACUUM cnt_race;
+step s3_count: SELECT count(*) FROM cnt_race WHERE k = 1;
+count
+-----
+  450
+(1 row)
+
+step s3_verify: SELECT roaring_index_verify('cnt_race_k', true);
+roaring_index_verify
+--------------------
+                    
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('roaring-count-containers-pinned');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

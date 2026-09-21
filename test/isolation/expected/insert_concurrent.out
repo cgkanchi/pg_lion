@@ -1,0 +1,69 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_ins s2_ins s3_count s1_ins2 s2_ins2 s3_count s1_commit s2_commit s3_check s3_stats s3_verify
+step s1_ins: INSERT INTO rbi_conc SELECT i, 1 FROM generate_series(20001, 20500) i;
+step s2_ins: INSERT INTO rbi_conc SELECT i, 1 FROM generate_series(30001, 30500) i;
+step s3_count: SELECT count(*), max(i) FROM rbi_conc WHERE k = 1;
+count|  max
+-----+-----
+ 5000|19997
+(1 row)
+
+step s1_ins2: INSERT INTO rbi_conc SELECT i, 5 FROM generate_series(21001, 21100) i;
+step s2_ins2: INSERT INTO rbi_conc SELECT i, 5 FROM generate_series(31001, 31100) i;
+step s3_count: SELECT count(*), max(i) FROM rbi_conc WHERE k = 1;
+count|  max
+-----+-----
+ 5000|19997
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+step s3_check: SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 1) =
+					 (SELECT count(*) FROM rbi_conc WHERE k + 0 = 1) AS k1_matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 5) =
+					 (SELECT count(*) FROM rbi_conc WHERE k + 0 = 5) AS k5_matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 1) AS k1,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 5) AS k5;
+k1_matches_seqscan|k5_matches_seqscan|  k1| k5
+------------------+------------------+----+---
+t                 |t                 |6000|200
+(1 row)
+
+step s3_stats: SELECT entries, ntids FROM roaring_index_stats('rbi_conc_k');
+entries|ntids
+-------+-----
+      5|21200
+(1 row)
+
+step s3_verify: SELECT roaring_index_verify('rbi_conc_k', true);
+roaring_index_verify
+--------------------
+                    
+(1 row)
+
+
+starting permutation: s1_ins s1_ins2 s2_ins s2_ins2 s1_rollback s2_commit s3_check s3_verify
+step s1_ins: INSERT INTO rbi_conc SELECT i, 1 FROM generate_series(20001, 20500) i;
+step s1_ins2: INSERT INTO rbi_conc SELECT i, 5 FROM generate_series(21001, 21100) i;
+step s2_ins: INSERT INTO rbi_conc SELECT i, 1 FROM generate_series(30001, 30500) i;
+step s2_ins2: INSERT INTO rbi_conc SELECT i, 5 FROM generate_series(31001, 31100) i;
+step s1_rollback: ROLLBACK;
+step s2_commit: COMMIT;
+step s3_check: SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 1) =
+					 (SELECT count(*) FROM rbi_conc WHERE k + 0 = 1) AS k1_matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 5) =
+					 (SELECT count(*) FROM rbi_conc WHERE k + 0 = 5) AS k5_matches_seqscan,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 1) AS k1,
+					 (SELECT count(*) + 0 * coalesce(max(i), 0) FROM rbi_conc WHERE k = 5) AS k5;
+k1_matches_seqscan|k5_matches_seqscan|  k1| k5
+------------------+------------------+----+---
+t                 |t                 |5500|100
+(1 row)
+
+step s3_verify: SELECT roaring_index_verify('rbi_conc_k', true);
+roaring_index_verify
+--------------------
+                    
+(1 row)
+

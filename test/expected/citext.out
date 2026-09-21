@@ -1,0 +1,89 @@
+-- case-insensitive keys through the roaring_index_citext extension
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS roaring_index;
+RESET client_min_messages;
+CREATE EXTENSION citext;
+CREATE EXTENSION roaring_index_citext;
+-- async commits leave pages non-all-visible for VACUUM; the cost model then prefers the seqscan
+SET synchronous_commit = on;
+CREATE TABLE rbi_ci (id int, name citext NOT NULL);
+INSERT INTO rbi_ci SELECT g, (ARRAY['Alice','BOB','carol','Alice ','bob'])[1 + g % 5] FROM generate_series(1, 5000) g;
+CREATE INDEX rbi_ci_name ON rbi_ci USING roaring (name);
+VACUUM ANALYZE rbi_ci;
+SET enable_seqscan = off;
+-- 'alice' matches 'Alice' (case-insensitive) but not 'Alice ' (trailing space)
+SELECT count(*) FROM rbi_ci WHERE name = 'alice';
+ count 
+-------
+  1000
+(1 row)
+
+SELECT count(*) FROM rbi_ci WHERE name = 'BoB';
+ count 
+-------
+  2000
+(1 row)
+
+SELECT count(*) FROM rbi_ci WHERE name = 'nobody';
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
+                  QUERY PLAN                   
+-----------------------------------------------
+ Custom Scan (RoaringCount)
+   Roaring Indexes: rbi_ci_name (name = CAROL)
+(2 rows)
+
+SET roaring_index.enable_count_pushdown = off;
+SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
+ count 
+-------
+  1000
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM rbi_ci WHERE name = 'CAROL';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on rbi_ci
+         Recheck Cond: (name = 'CAROL'::citext)
+         ->  Bitmap Index Scan on rbi_ci_name
+               Index Cond: (name = 'CAROL'::citext)
+(5 rows)
+
+RESET roaring_index.enable_count_pushdown;
+-- distinct keys: 'Alice' and 'Alice ' are different, 'BOB'/'bob' are one key
+SELECT name, count(*) FROM rbi_ci GROUP BY name ORDER BY name;
+  name  | count 
+--------+-------
+ Alice  |  1000
+ Alice  |  1000
+ BOB    |  2000
+ carol  |  1000
+(4 rows)
+
+SELECT entries FROM roaring_index_stats('rbi_ci_name');
+ entries 
+---------
+       4
+(1 row)
+
+SELECT roaring_index_verify('rbi_ci_name', true);
+ roaring_index_verify 
+----------------------
+ 
+(1 row)
+
+INSERT INTO rbi_ci VALUES (0, 'aLiCe');
+SELECT count(*) FROM rbi_ci WHERE name = 'ALICE';
+ count 
+-------
+  1001
+(1 row)
+
+DROP TABLE rbi_ci;
+DROP EXTENSION roaring_index_citext;
+DROP EXTENSION citext;
