@@ -383,7 +383,9 @@ Planner integration
   stage UPPERREL_GROUP_AGG. GUC `roaring_index.enable_count_pushdown` (bool, default on).
 - Applicability, all required (bail out silently otherwise):
   - input_rel is a single base relation (RELOPT_BASEREL, RTE_RELATION, relkind ordinary table or
-    materialized view) — no joins, no subqueries, no inheritance/partition parents.
+    materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
+    partitioned parents, which are counted one live leaf partition at a time; everything this
+    section says about "the relation" then means "the partition being counted".
   - The query has no HAVING, DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
   - Every baserestrictinfo clause is `Var opeq Const` or `Const opeq Var` where Var is a plain column
@@ -513,7 +515,7 @@ v1 priorities, in order of measured impact:
 5. IN predicates in the AM and the count pushdown are DONE (§15, amsearcharray), and so are NULL
    keys (§14, amsearchnulls). Range predicates (strategy 2..5 via entry ordering) are not.
 6. Page recycling and entry deletion (v0 never frees pages or entries).
-7. Params and partitions in the count pushdown; multi-column GROUP BY.
+7. Params in the count pushdown; multi-column GROUP BY. Partitions are DONE (§16).
 The per-container visibility-map read (rbi_vm_allvisible_mask) is already in: it turned the GROUP BY
 from O(heap blocks × keys) (1034 ms) into O(containers) (50 ms).
 
@@ -687,18 +689,93 @@ intersected with the union, and a group outside the list counts 0 and is not emi
 `col = ANY (...)` with useOr = false (`= ALL`) is not pushed down. EXPLAIN prints the list as
 `idx (col = ANY ({1,2,3}))`.
 
-## 16. Partitioned tables (v1)
+## 16. Partitioned tables (v1, implemented)
 
-At UPPERREL_GROUP_AGG the input rel may be a partitioned parent (`rte->inh`, part_scheme set). Every
-live leaf partition (recursively through sub-partitioning, using the planner's pruned
-`part_rels`/live_parts) must have a usable roaring index on the same column, with attnos mapped
-through each partition's AppendRelInfo translated_vars (partitions may have different attnums), and
-all WHERE columns likewise. One CustomPath on the parent's grouped rel; custom_private lists
-(child relid, heap oid, group index oid, attno, WHERE index oids). Executor: for each partition,
-open its heap and indexes (the executor already locked every child RTE), count or group with the
-same code as a single table; GROUP BY merges counts across partitions in a TupleHashTable built with
-the group column's equality/hash operators (execGrouping.c), emitting when all partitions are done.
-No run-time pruning (Params are not supported anyway). EXPLAIN lists the partitions.
+At UPPERREL_GROUP_AGG the input rel may be a partitioned parent: `rte->inh`, relkind `p`,
+`IS_PARTITIONED_REL()` (part_scheme, boundinfo, nparts > 0, part_rels, not dummy), reloptkind
+RELOPT_BASEREL. The parent has no storage and, because `get_relation_info()` skips indexes for an
+inheritance parent, no `indexlist` either, so everything is resolved per leaf.
+
+Planning (`rbi_try_count_path`, `rbi_collect_targets`)
+- The query-level, GROUP BY, WHERE-clause and target-list checks of §10/§14/§15 are unchanged and
+  are made against the PARENT: the Vars, attnums and constants the node carries are the parent's.
+  Clause analysis no longer looks an index up as it goes; it records (attnum, operator, compared
+  type) and the indexes are matched afterwards, once per relation.
+- `rbi_collect_targets()` then walks the partition tree and produces one target - heap Oid, the
+  index whose entries drive the scan (GROUP BY or the sum-over-all of §14), one index per WHERE
+  clause, and the leaf's RelOptInfo for costing - per live leaf partition. It recurses through
+  sub-partitioned children, using the planner's already-pruned set (`part_rels[i]` non-NULL and
+  `i` in `live_parts`) and additionally skipping children the planner has proved empty
+  (`IS_DUMMY_REL`), which count nothing.
+- Column numbers are translated for every child through `root->append_rel_array[childrelid]->
+  translated_vars`, since partitions may number their columns differently or have dropped ones. A
+  column missing in some partition is a bail-out.
+- Every leaf must be a plain table (relkind `r`; a materialized view is accepted by the same code
+  path but cannot be a partition) with a usable roaring index - the rules of
+  `rbi_find_roaring_index` plus, per clause, strategy 1 of THAT index's opfamily for the clause's
+  operator and an opfamily member and hash function for the compared type, all checked per
+  partition because nothing stops two partitions from using different opclasses. A foreign table,
+  or a leaf without one of the indexes, bails out.
+- No live partitions (everything pruned) adds no path at all: the planner's own dummy-rel handling
+  gives the right answer.
+- One CustomPath on the parent's grouped rel. custom_private gains two members: RBI_PRIV_PARTS, a
+  list of one OidList per partition (heap Oid, driving index Oid or InvalidOid, then one index Oid
+  per WHERE clause in clause order), empty for a plain table; and RBI_PRIV_GROUPKEY, the group Var
+  plus the equality operator the planner chose for it. A partitioned plan leaves the index Oids in
+  RBI_PRIV_OIDS invalid - there is no single index - and keeps the parent's heap Oid there, which
+  is what EXPLAIN resolves column names against.
+- Cost: `rbi_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
+  allvisfrac and rows and its own indexes; the path's cost is the sum over the leaves. numgroups
+  comes from `estimate_num_groups` on the PARENT (a partition may hold rows of every group), and is
+  used unchanged for each of them.
+- A partitioned GROUP BY needs a hashable grouping column (`SortGroupClause.hashable`), because the
+  partitions' groups are merged in a hash table; one table needs no merge and does not care.
+- Partitionwise aggregation is left alone: the existing `patype != PARTITIONWISE_AGGREGATE_NONE`
+  bail-out means that with `enable_partitionwise_aggregate = on` a partitioned table gets the
+  planner's own per-partition Aggs and not this node.
+
+Executor
+- `rbi_open_relation()` / `rbi_close_relation()` open and close ONE relation: a plain table once for
+  the life of the node, a partition for the length of its own turn. The heap is opened with NoLock -
+  the executor holds a lock on every range table entry of the plan, partitions included (the planner
+  locked them when it expanded the parent, and `AcquireExecutorLocks()` relocks the whole flat range
+  table for a cached plan), and cassert builds check it with `CheckRelationLockedByMe` - and the
+  indexes, which are not range table entries, with AccessShareLock.
+- Per relation the node then runs one of `rbi_count_relation()` (the intersection of the WHERE
+  clauses), `rbi_sumall_relation()` (§14's sum over every entry) or `rbi_group_relation_into_hash()`;
+  the single-table paths use the first two unchanged.
+- Without GROUP BY the partition counts are summed and one row is emitted, as §10 says.
+- With GROUP BY each partition's groups go into a TupleHashTable (`BuildTupleHashTable` over a
+  one-column TupleDesc of the group type, with the hash and equality functions
+  `execTuplesHashPrepare()` derives from the planner's equality operator, and the group's collation),
+  whose per-entry "additional" bytes hold the running int64 count. The NULL group merges like any
+  other. Nothing is emitted until every partition has been processed, because a group may have rows
+  in any of them; groups whose count is 0 are still not emitted. The table's own contexts (meta,
+  tuples, temp) live under the node's `es_query_cxt`; the per-partition work uses the same pergroup
+  context as before, reset per group, and the located WHERE payloads are released and their context
+  reset at the end of each partition.
+- The key a target list prints for a column a clause pins to one value is remembered on the clause
+  (`RBIClauseState.storedkey`, copied into a small context of its own) the first time a relation's
+  entry has it, because the posting set is gone by the time the row comes out. With partitions that
+  is the first partition that holds the key; any other partition's key compares equal to it by the
+  index's own equality.
+- ReScan throws all of it away - entry scan, posting sets, the open partition, the merged hash table
+  and the remembered keys - and starts again.
+- EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Roaring Indexes` line keeps
+  its per-clause text but drops the index name for a partitioned scan (`(a), (b = 2)` rather than
+  `idx_a (a), idx_b (b = 2)`), because there is one index per partition and no single name to give.
+  `Group Key` and the ANALYZE counters are unchanged and are summed over the partitions.
+
+Locking and the §9 pin discipline are per partition and unchanged. A partition's posting sets are
+all released before its indexes are closed, so no partition's index pin outlives its turn, and a
+VACUUM of one partition cannot affect the count of another: the interlock argument of §9 is about
+one heap and its indexes, and each partition is its own.
+
+Not supported: run-time pruning (the node has no Append and no PartitionPruneInfo, so the partition
+set is fixed at plan time), Params in the WHERE clauses (§10, not partition-specific), parallel
+execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation as above. Planning
+costs one `index_open` per clause per partition (`rbi_index_bucket_pages` reads the meta page), and
+EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, after §13-§16)
 

@@ -23,6 +23,13 @@
  * and custom_scan_tlist describes the tuples it produces: the group key Var,
  * if the query asks for it, followed by the count aggregates.
  *
+ * The relation may also be a PARTITIONED table (DESIGN.md §16).  Then the
+ * node counts one live leaf partition at a time - each with its own heap and
+ * its own indexes, found through the planner's already-pruned part_rels and
+ * with the column numbers translated per partition - and adds the results up.
+ * Everything below that says "the relation" therefore means "the relation the
+ * node is currently counting": one table, or one partition of many.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -31,6 +38,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -99,30 +107,51 @@ create_upper_paths_hook_type rbi_prev_create_upper_paths_hook = NULL;
 /* Flag bits of the third integer of RBI_PRIV_INTS. */
 #define RBI_FLAG_SINGLEGROUP	0x01
 #define RBI_FLAG_SUMALL			0x02
+#define RBI_FLAG_GROUPIDX		0x04	/* an index drives the entry scan */
 
 /*
  * What the planner decided, in a form the executor can be handed through
  * custom_private.  Everything in there has to be a copyable/serialisable
- * node, so it is four plain lists plus one filled in at plan time:
+ * node, so it is six plain lists plus one filled in at plan time:
  *
  *	0	OidList: heap Oid, group index Oid (InvalidOid if none), then one
- *		Oid per WHERE clause, in the same order as the other lists
+ *		Oid per WHERE clause, in the same order as the other lists.  For a
+ *		partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
+ *		column names against it) and every index Oid is InvalidOid: the real
+ *		ones are per partition, in RBI_PRIV_PARTS.
  *	1	IntList: base RT index, group attnum (0 if none), the RBI_FLAG_* bits,
- *		then one attnum per WHERE clause
+ *		then one attnum per WHERE clause.  Attnums are the PARENT's
+ *		throughout; each partition's own numbering lives in its index Oids.
  *	2	List of Const: one per WHERE clause - the compared value, the array of
  *		an IN list, or a NULL placeholder for a null test
  *	3	IntList: RBI_CLAUSE_* for each WHERE clause
- *	4	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
+ *	4	List of OidList, one per live leaf partition and empty for a plain
+ *		table (DESIGN.md §16): heap Oid, group index Oid (InvalidOid if
+ *		none), then one index Oid per WHERE clause
+ *	5	The group column, when there is one: a two-element list holding the
+ *		group Var (for its type, typmod and collation) and a one-element
+ *		OidList holding the equality operator the planner chose for it.  That
+ *		operator is what the cross-partition TupleHashTable groups by.
+ *	6	IntList: RBI_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define RBI_PRIV_OIDS		0
 #define RBI_PRIV_INTS		1
 #define RBI_PRIV_CONSTS		2
 #define RBI_PRIV_CLAUSEKINDS 3
-#define RBI_PRIV_TLKINDS	4
+#define RBI_PRIV_PARTS		4
+#define RBI_PRIV_GROUPKEY	5
+#define RBI_PRIV_TLKINDS	6
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
+ *
+ * storedkey is the key the clause's entry holds, which is what a target list
+ * that prints the pinned column has to report (see rbi_emit_tuple()).  It is
+ * remembered here rather than read out of the posting set, because with
+ * partitions the set is released before the row is emitted; the first
+ * partition that has the key wins, and any other partition's key compares
+ * equal to it by the opclass equality.
  */
 typedef struct RBIClauseState
 {
@@ -131,7 +160,21 @@ typedef struct RBIClauseState
 	AttrNumber	attno;
 	Const	   *con;			/* value, array, or a NULL placeholder */
 	Relation	idx;
+	Datum		storedkey;
+	bool		hasstoredkey;
+	bool		keyisnull;
 } RBIClauseState;
+
+/*
+ * One relation the executor counts: a plain table, or one live leaf
+ * partition (DESIGN.md §16).  The index Oids are that relation's own.
+ */
+typedef struct RBIPartState
+{
+	Oid			heapoid;
+	Oid			groupidxoid;	/* InvalidOid when no index drives the scan */
+	Oid		   *clauseidxoid;	/* one per WHERE clause */
+} RBIPartState;
 
 typedef struct RBICountScanState
 {
@@ -146,12 +189,23 @@ typedef struct RBICountScanState
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
 								 * `col IS NOT NULL` with nothing else) */
+	bool		hasgroupidx;	/* an index's entries drive the count */
 	int			nclause;
 	RBIClauseState *clause;
 	int			ntlist;
 	int		   *tlkind;
 
-	/* runtime */
+	/*
+	 * The relations to count.  npart is 0 for a plain table, whose heap and
+	 * indexes are opened once for the life of the node; a partitioned one
+	 * (DESIGN.md §16) has one RBIPartState per live leaf partition and opens
+	 * them one partition at a time, so that no partition's buffer pin ever
+	 * outlives that partition's processing.
+	 */
+	int			npart;
+	RBIPartState *part;
+
+	/* runtime: the relation currently being counted */
 	Relation	heap;
 	Relation	groupidx;
 
@@ -170,8 +224,30 @@ typedef struct RBICountScanState
 	bool		done;
 	RBIEntryScan escan;
 
+	/*
+	 * GROUP BY over a partitioned table: the groups of the partitions are
+	 * merged here, by the equality and hash operators of the grouping column
+	 * (DESIGN.md §16).  Every partition is counted before the first row comes
+	 * out, because a group may have rows in any of them.  Each entry's
+	 * "additional" bytes hold the int64 running count.
+	 */
+	Oid			grouptype;
+	int32		grouptypmod;
+	Oid			groupcollid;
+	Oid			groupeqop;
+	TupleHashTable hashtab;
+	TupleTableSlot *hashslot;	/* virtual, for probing */
+	TupleTableSlot *hashoutslot;	/* minimal, for reading entries back */
+	TupleDesc	hashdesc;
+	MemoryContext hashmetacxt;
+	MemoryContext hashtuplescxt;
+	MemoryContext hashtempcxt;
+	bool		hashfilled;
+	TupleHashIterator hashiter;
+
 	MemoryContext pergroup;		/* reset before each group is counted */
 	MemoryContext wherecxt;		/* the located WHERE payload copies */
+	MemoryContext keycxt;		/* the clause keys a target list may print */
 	RBICountStats stats;
 } RBICountScanState;
 
@@ -259,6 +335,206 @@ rbi_find_roaring_index(RelOptInfo *rel, AttrNumber attno)
 }
 
 /*
+ * The same, but for a column a particular clause is applied to.
+ *
+ * opno is the clause's operator, InvalidOid for a null test: it has to be
+ * strategy 1 of the index's opfamily (the index's opfamily and the operator
+ * Oid, so cross-type integer equality is fine).  cmptype is the type the
+ * column is compared with, InvalidOid for a null test: the opfamily must be
+ * able to compare it with the indexed type and to hash it, or the lookup in
+ * rbi_count.c would fail at run time.
+ *
+ * Every partition is checked separately, because nothing stops one of them
+ * from carrying a roaring index built with a different opclass.
+ */
+static IndexOptInfo *
+rbi_match_index(RelOptInfo *rel, AttrNumber attno, Oid opno, Oid cmptype)
+{
+	IndexOptInfo *idx = rbi_find_roaring_index(rel, attno);
+
+	if (idx == NULL)
+		return NULL;
+
+	if (OidIsValid(opno) &&
+		get_op_opfamily_strategy(opno, idx->opfamily[0]) != 1)
+		return NULL;
+
+	if (OidIsValid(cmptype))
+	{
+		if (!OidIsValid(get_opfamily_member(idx->opfamily[0],
+											idx->opcintype[0], cmptype, 1)))
+			return NULL;
+		if (!OidIsValid(get_opfamily_proc(idx->opfamily[0], cmptype, cmptype, 1)))
+			return NULL;
+	}
+
+	return idx;
+}
+
+/*
+ * One relation the executor will count, with the indexes it will use: a
+ * plain table, or one live leaf partition (DESIGN.md §16).
+ */
+typedef struct RBICountTarget
+{
+	RelOptInfo *rel;			/* for the per-relation cost */
+	Oid			heapoid;
+	IndexOptInfo *driveidx;		/* the index whose entries are scanned, or NULL */
+	List	   *whereidx;		/* IndexOptInfo *, one per WHERE clause */
+} RBICountTarget;
+
+/*
+ * The attribute number a parent column has in one child, or 0 when the child
+ * does not have it (a column dropped in that partition).  Partitions may
+ * number their columns differently, so every attnum the pushdown carries
+ * across a partition boundary goes through here (DESIGN.md §16).
+ */
+static AttrNumber
+rbi_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
+{
+	AppendRelInfo *appinfo;
+	Var		   *cvar;
+
+	if (parentattno <= 0)
+		return 0;
+	if (childrelid == 0 || childrelid >= (Index) root->simple_rel_array_size)
+		return 0;
+	if (root->append_rel_array == NULL)
+		return 0;
+	appinfo = root->append_rel_array[childrelid];
+	if (appinfo == NULL)
+		return 0;
+	if ((int) parentattno > list_length(appinfo->translated_vars))
+		return 0;
+
+	cvar = (Var *) list_nth(appinfo->translated_vars, parentattno - 1);
+	if (cvar == NULL || !IsA(cvar, Var) || cvar->varattno <= 0)
+		return 0;
+
+	return cvar->varattno;
+}
+
+/*
+ * Collect one RBICountTarget per relation the node will count: just rel when
+ * it is an ordinary table, or one per live leaf partition when it is a
+ * partitioned parent, recursing through sub-partitioned children
+ * (DESIGN.md §16).
+ *
+ * The attribute numbers are rel's own and are translated for every child.
+ * The partition set is the planner's already-pruned one: part_rels entries
+ * that are non-NULL and in live_parts, minus the ones the planner has since
+ * proved empty.
+ *
+ * Returns false when the pushdown is impossible - a child that is not a plain
+ * table (a foreign table, say), a column dropped in some partition, or a leaf
+ * without a usable roaring index on one of the columns.  An empty *targets
+ * means everything was pruned away; the caller leaves that to the planner's
+ * own dummy-rel handling.
+ */
+static bool
+rbi_collect_targets(PlannerInfo *root, RelOptInfo *rel, AttrNumber driveattno,
+					List *whereattnos, List *whereopnos, List *wherecmptypes,
+					List **targets)
+{
+	RangeTblEntry *rte;
+	RBICountTarget *t;
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+
+	/* Sub-partitioning nests, exactly as expand_partitioned_rtentry() does. */
+	check_stack_depth();
+
+	if (rel == NULL || rel->relid == 0 ||
+		rel->relid >= (Index) root->simple_rel_array_size)
+		return false;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+	if (rte->securityQuals != NIL || rte->tablesample != NULL)
+		return false;
+
+	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		int			i;
+
+		/* Pruned down to nothing: no targets, but no reason to bail either. */
+		if (IS_DUMMY_REL(rel))
+			return true;
+		if (!IS_PARTITIONED_REL(rel))
+			return false;
+
+		for (i = 0; i < rel->nparts; i++)
+		{
+			RelOptInfo *child = rel->part_rels[i];
+			List	   *cattnos = NIL;
+			AttrNumber	cdrive = 0;
+
+			if (child == NULL || !bms_is_member(i, rel->live_parts))
+				continue;		/* pruned at plan time */
+			if (IS_DUMMY_REL(child))
+				continue;		/* provably empty: it counts nothing */
+
+			if (driveattno != 0)
+			{
+				cdrive = rbi_child_attno(root, child->relid, driveattno);
+				if (cdrive == 0)
+					return false;
+			}
+			foreach(l1, whereattnos)
+			{
+				AttrNumber	ca = rbi_child_attno(root, child->relid,
+												 (AttrNumber) lfirst_int(l1));
+
+				if (ca == 0)
+					return false;
+				cattnos = lappend_int(cattnos, (int) ca);
+			}
+
+			if (!rbi_collect_targets(root, child, cdrive, cattnos,
+									 whereopnos, wherecmptypes, targets))
+				return false;
+		}
+		return true;
+	}
+
+	/*
+	 * A leaf.  Anything whose rows do not live in a local heap this backend
+	 * can read - a foreign table above all - is out.  A materialized view
+	 * cannot be a partition; it is accepted here because the single-table
+	 * path goes through this function too.
+	 */
+	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+		return false;
+	if (rel->indexlist == NIL)
+		return false;
+
+	t = (RBICountTarget *) palloc0(sizeof(RBICountTarget));
+	t->rel = rel;
+	t->heapoid = rte->relid;
+
+	if (driveattno != 0)
+	{
+		t->driveidx = rbi_match_index(rel, driveattno, InvalidOid, InvalidOid);
+		if (t->driveidx == NULL)
+			return false;
+	}
+
+	forthree(l1, whereattnos, l2, whereopnos, l3, wherecmptypes)
+	{
+		IndexOptInfo *idx = rbi_match_index(rel, (AttrNumber) lfirst_int(l1),
+											lfirst_oid(l2), lfirst_oid(l3));
+
+		if (idx == NULL)
+			return false;
+		t->whereidx = lappend(t->whereidx, idx);
+	}
+
+	*targets = lappend(*targets, t);
+	return true;
+}
+
+/*
  * Can the aggregate be answered by counting a posting set?
  *
  * count(*) always can.  count(col) can when every row the node counts is
@@ -342,6 +618,11 @@ rbi_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  * It has to beat Agg-over-BitmapHeapScan when the pushdown really is cheaper
  * and lose when it is not; it is not meant to be comparable with core cost
  * estimates to the last decimal.
+ *
+ * A partitioned table is priced as the sum of its live leaf partitions, each
+ * with its own pages / allvisfrac / rows and its own indexes (DESIGN.md §16).
+ * numgroups is the parent's estimate throughout: a partition may hold rows of
+ * every group.
  */
 static double
 rbi_index_bucket_pages(IndexOptInfo *idx)
@@ -354,15 +635,14 @@ rbi_index_bucket_pages(IndexOptInfo *idx)
 	return nbuckets;
 }
 
-static void
-rbi_cost_count_path(PlannerInfo *root, RelOptInfo *input_rel,
-					CustomPath *cpath, IndexOptInfo *groupidx,
-					List *whereidx, List *whereclauses, double numgroups,
-					double outrows)
+static Cost
+rbi_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
+				   IndexOptInfo *groupidx,
+				   List *whereidx, List *whereclauses, double numgroups)
 {
-	double		heap_pages = Max((double) input_rel->pages, 1.0);
-	double		dirtyfrac = 1.0 - input_rel->allvisfrac;
-	double		matching = Max(input_rel->rows, 1.0);
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		matching = Max(rel->rows, 1.0);
 	double		containers_per_key;
 	double		random_pages = 0;	/* bucket page lookups */
 	double		seq_pages = 0;	/* container chains, read in order */
@@ -423,6 +703,47 @@ rbi_cost_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	run += recheck_tids * cpu_tuple_cost;
 	run += numgroups * cpu_tuple_cost;
 
+	return run;
+}
+
+/*
+ * Sum the per-relation costs over every relation the node will count and put
+ * the result on the path.  The WHERE clauses that do not select rows
+ * (`IS NOT NULL`, DESIGN.md §14) are left out of the per-relation estimate,
+ * as they were before partitions existed.
+ */
+static void
+rbi_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					List *whereclauses, List *wherekinds, double numgroups,
+					double outrows)
+{
+	Cost		run = 0;
+	ListCell   *lc;
+
+	foreach(lc, targets)
+	{
+		RBICountTarget *t = (RBICountTarget *) lfirst(lc);
+		List	   *costidx = NIL;
+		List	   *costclauses = NIL;
+		ListCell   *l1;
+		ListCell   *l2;
+		ListCell   *l3;
+
+		forthree(l1, t->whereidx, l2, whereclauses, l3, wherekinds)
+		{
+			if (!RBI_CLAUSE_IS_POSITIVE(lfirst_int(l3)))
+				continue;
+			costidx = lappend(costidx, lfirst(l1));
+			costclauses = lappend(costclauses, lfirst(l2));
+		}
+
+		run += rbi_cost_count_rel(root, t->rel, t->driveidx, costidx,
+								  costclauses, numgroups);
+
+		list_free(costidx);
+		list_free(costclauses);
+	}
+
 	cpath->path.rows = outrows;
 	cpath->path.disabled_nodes = 0;
 	/* Without GROUP BY the single output row needs the whole scan first. */
@@ -472,11 +793,14 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	Index		rti;
 	Var		   *groupvar = NULL;
 	AttrNumber	groupattno = 0;
-	IndexOptInfo *groupidx = NULL;
+	AttrNumber	driveattno = 0; /* column whose index drives the entry scan */
+	Oid			groupeqop = InvalidOid;
 	bool		singlegroup = false;
 	bool		sumall = false;
-	List	   *whereidx = NIL;		/* IndexOptInfo per clause */
-	List	   *whereattnos = NIL;	/* its column */
+	bool		partitioned = false;
+	List	   *whereattnos = NIL;	/* its column, in the PARENT's numbering */
+	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
+	List	   *wherecmptypes = NIL;	/* the type it compares with (0 likewise) */
 	List	   *whereclauses = NIL; /* the clause, for selectivity */
 	List	   *whereconsts = NIL;	/* its Const (a placeholder for a null test) */
 	List	   *wherekinds = NIL;	/* RBI_CLAUSE_* */
@@ -484,14 +808,15 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	List	   *eqattnos = NIL;		/* columns pinned to one value */
 	List	   *nonnullattnos = NIL;	/* columns a clause proves non-null */
 	List	   *nullattnos = NIL;	/* columns a clause pins to NULL */
-	List	   *costidx = NIL;		/* whereidx, positive clauses only */
-	List	   *costclauses = NIL;
-	Var		   *notnullvar = NULL;	/* the first `IS NOT NULL` column ... */
-	IndexOptInfo *notnullidx = NULL;	/* ... and its index */
+	List	   *targets = NIL;		/* RBICountTarget, one per counted relation */
+	RBICountTarget *first;
+	Var		   *notnullvar = NULL;	/* the first `IS NOT NULL` column */
 	List	   *oids;
 	List	   *ints;
 	List	   *consts = NIL;
 	List	   *ckinds = NIL;
+	List	   *parts = NIL;
+	List	   *groupkey = NIL;
 	CustomPath *cpath;
 	double		numgroups;
 	double		outrows;
@@ -517,7 +842,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (extra != NULL && extra->havingQual != NULL)
 		return;
 
-	/* ---- a single ordinary base relation ---- */
+	/* ---- a single base relation: one table, or one partitioned parent ---- */
 	if (input_rel->reloptkind != RELOPT_BASEREL)
 		return;
 	if (bms_membership(input_rel->relids) != BMS_SINGLETON)
@@ -526,14 +851,35 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (rti == 0 || rti >= (Index) root->simple_rel_array_size)
 		return;
 	rte = root->simple_rte_array[rti];
-	if (rte == NULL || rte->rtekind != RTE_RELATION || rte->inh)
-		return;
-	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
 		return;
 	if (rte->securityQuals != NIL || rte->tablesample != NULL)
 		return;
-	if (input_rel->indexlist == NIL)
-		return;
+	if (IS_DUMMY_REL(input_rel))
+		return;					/* the planner has already proved it empty */
+
+	if (rte->inh)
+	{
+		/*
+		 * A partitioned parent (DESIGN.md §16).  The parent itself has no
+		 * storage and no index list; every live leaf partition is counted in
+		 * turn, with its own heap and its own indexes.  Old-style inheritance
+		 * parents are not handled: their children are not required to have
+		 * the parent's columns at all.
+		 */
+		if (rte->relkind != RELKIND_PARTITIONED_TABLE)
+			return;
+		if (input_rel->part_scheme == NULL || !IS_PARTITIONED_REL(input_rel))
+			return;
+		partitioned = true;
+	}
+	else
+	{
+		if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+			return;
+		if (input_rel->indexlist == NIL)
+			return;
+	}
 
 	/* ---- GROUP BY: nothing, or one indexed column ---- */
 	if (list_length(root->processed_groupClause) > 1)
@@ -573,8 +919,15 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * (DESIGN.md §14).
 		 */
 		groupattno = groupvar->varattno;
-		groupidx = rbi_find_roaring_index(input_rel, groupattno);
-		if (groupidx == NULL)
+
+		/*
+		 * The groups of all the partitions are merged in a TupleHashTable
+		 * (DESIGN.md §16) built from the equality operator the planner chose
+		 * for this grouping column, so that column has to be hashable.  One
+		 * table needs no merging and does not care.
+		 */
+		groupeqop = sgc->eqop;
+		if (partitioned && (!sgc->hashable || !OidIsValid(groupeqop)))
 			return;
 	}
 
@@ -585,7 +938,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		Node	   *clause;
 		Var		   *var = NULL;
 		Const	   *con = NULL;
-		IndexOptInfo *idx;
+		Oid			opno = InvalidOid;	/* operator the index must know */
 		Oid			cmptype = InvalidOid;	/* type the index is compared with */
 		int			kind;
 
@@ -626,12 +979,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			if (con->constisnull)
 				return;
 
-			idx = rbi_find_roaring_index(input_rel, var->varattno);
-			if (idx == NULL)
-				return;
-			if (get_op_opfamily_strategy(op->opno, idx->opfamily[0]) != 1)
-				return;
-
+			opno = op->opno;
 			cmptype = con->consttype;
 			kind = RBI_CLAUSE_EQ;
 		}
@@ -665,12 +1013,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			if (nelems < 0 || nelems > RBI_MAX_ARRAY_ELEMS)
 				return;
 
-			idx = rbi_find_roaring_index(input_rel, var->varattno);
-			if (idx == NULL)
-				return;
-			if (get_op_opfamily_strategy(saop->opno, idx->opfamily[0]) != 1)
-				return;
-
+			opno = saop->opno;
 			cmptype = get_element_type(con->consttype);
 			if (!OidIsValid(cmptype))
 				return;
@@ -688,10 +1031,6 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				return;
 			var = (Var *) arg;
 
-			idx = rbi_find_roaring_index(input_rel, var->varattno);
-			if (idx == NULL)
-				return;
-
 			kind = (nt->nulltesttype == IS_NULL) ?
 				RBI_CLAUSE_NULL : RBI_CLAUSE_NOTNULL;
 			/* The executor needs no value; keep the lists in step. */
@@ -705,19 +1044,12 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			return;
 
 		/*
-		 * The opfamily must be able to hash the compared type and to compare
-		 * it with the indexed one, or the lookup in rbi_count.c would fail at
-		 * run time.  Cross-type integer equality passes this.
+		 * Which index answers the clause, whether its opfamily has the
+		 * operator as strategy 1, and whether it can hash and compare the
+		 * constant's type is settled per relation, in rbi_match_index():
+		 * with partitions there is one index per partition and they need not
+		 * share an opclass (DESIGN.md §16).
 		 */
-		if (OidIsValid(cmptype))
-		{
-			if (!OidIsValid(get_opfamily_member(idx->opfamily[0],
-												idx->opcintype[0], cmptype, 1)))
-				return;
-			if (!OidIsValid(get_opfamily_proc(idx->opfamily[0],
-											  cmptype, cmptype, 1)))
-				return;
-		}
 
 		if (RBI_CLAUSE_IS_POSITIVE(kind))
 		{
@@ -750,8 +1082,6 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			}
 			posattnos = lappend_int(posattnos, (int) var->varattno);
 			havepositive = true;
-			costidx = lappend(costidx, idx);
-			costclauses = lappend(costclauses, clause);
 		}
 
 		switch (kind)
@@ -762,10 +1092,7 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				break;
 			case RBI_CLAUSE_NOTNULL:
 				if (notnullvar == NULL)
-				{
 					notnullvar = var;
-					notnullidx = idx;
-				}
 				nonnullattnos = lappend_int(nonnullattnos, (int) var->varattno);
 				break;
 			case RBI_CLAUSE_ARRAY:
@@ -776,15 +1103,17 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				break;
 		}
 
-		whereidx = lappend(whereidx, idx);
 		whereattnos = lappend_int(whereattnos, (int) var->varattno);
+		whereopnos = lappend_oid(whereopnos, opno);
+		wherecmptypes = lappend_oid(wherecmptypes, cmptype);
 		whereclauses = lappend(whereclauses, clause);
 		whereconsts = lappend(whereconsts, con);
 		wherekinds = lappend_int(wherekinds, kind);
 	}
 
 	/* Something has to drive the count. */
-	if (groupidx == NULL && !havepositive)
+	driveattno = groupattno;
+	if (groupvar == NULL && !havepositive)
 	{
 		/*
 		 * Only `IS NOT NULL` clauses: that column's index knows every row of
@@ -795,8 +1124,8 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 */
 		if (notnullvar == NULL)
 			return;
-		groupidx = notnullidx;
 		sumall = true;
+		driveattno = notnullvar->varattno;
 	}
 	/* A group folded to a constant can only have come from a WHERE key. */
 	if (singlegroup && !havepositive)
@@ -842,6 +1171,21 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!haveagg)
 		return;
 
+	/*
+	 * ---- the relations to count, and the indexes on each of them ----
+	 *
+	 * One table, or one live leaf partition at a time (DESIGN.md §16).  The
+	 * column numbers above are the parent's; rbi_collect_targets() maps them
+	 * onto each partition through its AppendRelInfo before looking an index
+	 * up, because partitions may number their columns differently.
+	 */
+	if (!rbi_collect_targets(root, input_rel, driveattno, whereattnos,
+							 whereopnos, wherecmptypes, &targets))
+		return;
+	if (targets == NIL)
+		return;					/* everything was pruned: leave it to the planner */
+	first = (RBICountTarget *) linitial(targets);
+
 	/* ---- build the path ---- */
 	if (groupvar != NULL)
 		numgroups = estimate_num_groups(root, list_make1(groupvar),
@@ -858,25 +1202,60 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 	outrows = (groupvar != NULL) ? numgroups : 1.0;
 
+	/*
+	 * A plain table's own Oids go in RBI_PRIV_OIDS, which is where the
+	 * executor and EXPLAIN have always read them.  A partitioned one leaves
+	 * them invalid - there is no single index - and fills RBI_PRIV_PARTS
+	 * instead, one OidList per partition in the same clause order.
+	 */
 	oids = list_make2_oid(rte->relid,
-						  groupidx ? groupidx->indexoid : InvalidOid);
+						  (!partitioned && first->driveidx != NULL) ?
+						  first->driveidx->indexoid : InvalidOid);
 	ints = list_make3_int((int) rti, (int) groupattno,
 						  (singlegroup ? RBI_FLAG_SINGLEGROUP : 0) |
-						  (sumall ? RBI_FLAG_SUMALL : 0));
+						  (sumall ? RBI_FLAG_SUMALL : 0) |
+						  (driveattno != 0 ? RBI_FLAG_GROUPIDX : 0));
 	{
 		ListCell   *l1;
 		ListCell   *l2;
 		ListCell   *l3;
-		ListCell   *l4;
+		int			i = 0;
 
-		forfour(l1, whereidx, l2, whereattnos, l3, whereconsts, l4, wherekinds)
+		forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
 		{
-			oids = lappend_oid(oids, ((IndexOptInfo *) lfirst(l1))->indexoid);
-			ints = lappend_int(ints, lfirst_int(l2));
-			consts = lappend(consts, copyObject((Const *) lfirst(l3)));
-			ckinds = lappend_int(ckinds, lfirst_int(l4));
+			oids = lappend_oid(oids, partitioned ? InvalidOid :
+							   ((IndexOptInfo *) list_nth(first->whereidx,
+														  i))->indexoid);
+			ints = lappend_int(ints, lfirst_int(l1));
+			consts = lappend(consts, copyObject((Const *) lfirst(l2)));
+			ckinds = lappend_int(ckinds, lfirst_int(l3));
+			i++;
 		}
 	}
+
+	if (partitioned)
+	{
+		foreach(lc, targets)
+		{
+			RBICountTarget *t = (RBICountTarget *) lfirst(lc);
+			List	   *one;
+			ListCell   *l1;
+
+			one = list_make2_oid(t->heapoid,
+								 t->driveidx ? t->driveidx->indexoid : InvalidOid);
+			foreach(l1, t->whereidx)
+				one = lappend_oid(one, ((IndexOptInfo *) lfirst(l1))->indexoid);
+			parts = lappend(parts, one);
+		}
+	}
+
+	/*
+	 * The group column's type, typmod and collation (from the Var) and the
+	 * equality operator the planner chose for it: what the cross-partition
+	 * TupleHashTable of DESIGN.md §16 is built from.
+	 */
+	if (groupvar != NULL)
+		groupkey = list_make2(copyObject(groupvar), list_make1_oid(groupeqop));
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -890,11 +1269,12 @@ rbi_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	cpath->custom_restrictinfo = NIL;
-	cpath->custom_private = list_make4(oids, ints, consts, ckinds);
+	cpath->custom_private = list_make5(oids, ints, consts, ckinds, parts);
+	cpath->custom_private = lappend(cpath->custom_private, groupkey);
 	cpath->methods = &rbi_count_path_methods;
 
-	rbi_cost_count_path(root, input_rel, cpath, groupidx, costidx,
-						costclauses, numgroups, outrows);
+	rbi_cost_count_path(root, cpath, targets, whereclauses, wherekinds,
+						numgroups, outrows);
 
 	add_path(output_rel, &cpath->path);
 }
@@ -1080,6 +1460,131 @@ rbi_create_custom_scan_state(CustomScan *cscan)
 	return (Node *) st;
 }
 
+/*
+ * Open one relation's heap and indexes: a plain table once, or one partition
+ * for the length of its own processing (DESIGN.md §16).
+ *
+ * The executor holds a lock on every range table entry of the plan, and the
+ * partitions are range table entries too (the planner locked them when it
+ * expanded the parent, and AcquireExecutorLocks() relocks the whole flat
+ * range table for a cached plan), so nothing here takes a relation lock.  The
+ * indexes are not range table entries and get their own AccessShareLock.
+ */
+static void
+rbi_open_relation(RBICountScanState *st, Oid heapoid, Oid groupidxoid,
+				  const Oid *clauseidxoid)
+{
+	int			i;
+
+	Assert(st->heap == NULL);
+
+	st->heap = table_open(heapoid, NoLock);
+	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
+
+	for (i = 0; i < st->nclause; i++)
+		st->clause[i].idx = index_open(clauseidxoid != NULL ?
+									   clauseidxoid[i] : st->clause[i].idxoid,
+									   AccessShareLock);
+
+	if (OidIsValid(groupidxoid))
+		st->groupidx = index_open(groupidxoid, AccessShareLock);
+}
+
+/*
+ * The reverse.  Every posting set of this relation must already have been
+ * released: DESIGN.md §9 wants no pin to outlive the relation it belongs to,
+ * and a partition's pins must not outlive that partition's turn.
+ */
+static void
+rbi_close_relation(RBICountScanState *st)
+{
+	int			i;
+
+	if (st->groupidx != NULL)
+	{
+		index_close(st->groupidx, AccessShareLock);
+		st->groupidx = NULL;
+	}
+	for (i = 0; i < st->nclause; i++)
+	{
+		if (st->clause[i].idx != NULL)
+		{
+			index_close(st->clause[i].idx, AccessShareLock);
+			st->clause[i].idx = NULL;
+		}
+	}
+	if (st->heap != NULL)
+	{
+		table_close(st->heap, NoLock);
+		st->heap = NULL;
+	}
+}
+
+/*
+ * Build the TupleHashTable that merges the groups of the partitions
+ * (DESIGN.md §16).  One column - the grouping column - hashed and compared
+ * with the operators the planner chose for the GROUP BY clause, so that a
+ * NULL group merges like any other and a type whose equality is not bytewise
+ * (citext, say) groups the way the query says it should.
+ */
+static void
+rbi_build_group_hash(RBICountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	Oid		   *eqfuncoids;
+	FmgrInfo   *hashfunctions;
+	AttrNumber *keycol;
+	Oid		   *collations;
+	double		nelements;
+
+	Assert(OidIsValid(st->grouptype) && OidIsValid(st->groupeqop));
+
+	st->hashdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(st->hashdesc, (AttrNumber) 1, "groupkey",
+					   st->grouptype, st->grouptypmod, 0);
+	TupleDescInitEntryCollation(st->hashdesc, (AttrNumber) 1, st->groupcollid);
+	TupleDescFinalize(st->hashdesc);
+
+	st->hashslot = MakeSingleTupleTableSlot(st->hashdesc, &TTSOpsVirtual);
+	st->hashoutslot = MakeSingleTupleTableSlot(st->hashdesc, &TTSOpsMinimalTuple);
+
+	st->hashmetacxt = AllocSetContextCreate(estate->es_query_cxt,
+											"RoaringCount group hash meta",
+											ALLOCSET_SMALL_SIZES);
+	st->hashtuplescxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "RoaringCount group hash tuples",
+											  ALLOCSET_DEFAULT_SIZES);
+	st->hashtempcxt = AllocSetContextCreate(estate->es_query_cxt,
+											"RoaringCount group hash temp",
+											ALLOCSET_SMALL_SIZES);
+
+	execTuplesHashPrepare(1, &st->groupeqop, &eqfuncoids, &hashfunctions);
+
+	keycol = (AttrNumber *) palloc(sizeof(AttrNumber));
+	keycol[0] = 1;
+	collations = (Oid *) palloc(sizeof(Oid));
+	collations[0] = st->groupcollid;
+
+	nelements = st->css.ss.ps.plan->plan_rows;
+	if (!(nelements >= 16.0))
+		nelements = 16.0;
+
+	st->hashtab = BuildTupleHashTable(&st->css.ss.ps,
+									  st->hashdesc,
+									  &TTSOpsVirtual,
+									  1,
+									  keycol,
+									  eqfuncoids,
+									  hashfunctions,
+									  collations,
+									  nelements,
+									  sizeof(int64),
+									  st->hashmetacxt,
+									  st->hashtuplescxt,
+									  st->hashtempcxt,
+									  false);
+}
+
 static void
 rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -1089,6 +1594,8 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *ints = (List *) list_nth(cscan->custom_private, RBI_PRIV_INTS);
 	List	   *consts = (List *) list_nth(cscan->custom_private, RBI_PRIV_CONSTS);
 	List	   *ckinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_CLAUSEKINDS);
+	List	   *partlist = (List *) list_nth(cscan->custom_private, RBI_PRIV_PARTS);
+	List	   *groupkey = (List *) list_nth(cscan->custom_private, RBI_PRIV_GROUPKEY);
 	List	   *kinds = (List *) list_nth(cscan->custom_private, RBI_PRIV_TLKINDS);
 	int			flags;
 	int			i;
@@ -1100,6 +1607,7 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	flags = lthird_int(ints);
 	st->singlegroup = (flags & RBI_FLAG_SINGLEGROUP) != 0;
 	st->sumall = (flags & RBI_FLAG_SUMALL) != 0;
+	st->hasgroupidx = (flags & RBI_FLAG_GROUPIDX) != 0;
 	st->nclause = list_length(consts);
 
 	st->ntlist = list_length(kinds);
@@ -1117,10 +1625,40 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->clause[i].con = (Const *) list_nth(consts, i);
 	}
 
+	/* One target per live leaf partition, in the planner's order. */
+	st->npart = list_length(partlist);
+	if (st->npart > 0)
+	{
+		st->part = (RBIPartState *) palloc0(sizeof(RBIPartState) * st->npart);
+		for (i = 0; i < st->npart; i++)
+		{
+			List	   *one = (List *) list_nth(partlist, i);
+			int			j;
+
+			st->part[i].heapoid = linitial_oid(one);
+			st->part[i].groupidxoid = lsecond_oid(one);
+			st->part[i].clauseidxoid = (Oid *)
+				palloc0(sizeof(Oid) * Max(st->nclause, 1));
+			for (j = 0; j < st->nclause; j++)
+				st->part[i].clauseidxoid[j] = list_nth_oid(one, 2 + j);
+		}
+	}
+
+	if (groupkey != NIL)
+	{
+		Var		   *gv = (Var *) linitial(groupkey);
+
+		st->grouptype = gv->vartype;
+		st->grouptypmod = gv->vartypmod;
+		st->groupcollid = gv->varcollid;
+		st->groupeqop = linitial_oid((List *) lsecond(groupkey));
+	}
+
 	st->located = false;
 	st->wheremissing = false;
 	st->scanning = false;
 	st->done = false;
+	st->hashfilled = false;
 	memset(&st->stats, 0, sizeof(st->stats));
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
@@ -1129,23 +1667,24 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->wherecxt = AllocSetContextCreate(estate->es_query_cxt,
 										 "RoaringCount where keys",
 										 ALLOCSET_SMALL_SIZES);
+	st->keycxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "RoaringCount clause keys",
+									   ALLOCSET_SMALL_SIZES);
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
 
 	/*
-	 * The executor already holds locks on every range table entry, so the
-	 * heap is opened without taking another one.  The indexes are not range
-	 * table entries, so they get their own AccessShareLock.
+	 * A plain table is opened once and stays open.  The executor already
+	 * holds locks on every range table entry, so the heap is opened without
+	 * taking another one.  The indexes are not range table entries, so they
+	 * get their own AccessShareLock.
+	 *
+	 * A partitioned one opens nothing here: rbi_open_relation() opens one
+	 * partition at a time (DESIGN.md §16).
 	 */
-	st->heap = table_open(st->heapoid, NoLock);
-	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
-
-	for (i = 0; i < st->nclause; i++)
-		st->clause[i].idx = index_open(st->clause[i].idxoid, AccessShareLock);
-
-	if (OidIsValid(st->groupidxoid))
-		st->groupidx = index_open(st->groupidxoid, AccessShareLock);
+	if (st->npart == 0)
+		rbi_open_relation(st, st->heapoid, st->groupidxoid, NULL);
 
 	/* slot 0 is the group's posting set, 1..nclause the WHERE clauses */
 	st->sources = (RBICountSource *)
@@ -1153,6 +1692,10 @@ rbi_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	st->sources[0].negated = false;
+
+	/* The cross-partition group merge (DESIGN.md §16). */
+	if (st->npart > 0 && st->hasgroupidx && st->groupattno != 0)
+		rbi_build_group_hash(st);
 }
 
 /*
@@ -1229,10 +1772,45 @@ rbi_locate_array(RBICountScanState *st, RBIClauseState *cl,
 }
 
 /*
- * Locate the posting sets of every WHERE clause once for the whole node.
- * They keep their pins (for INLINE entries) until rbi_release_where(), which
- * is exactly the DESIGN.md section 9 discipline applied for the node's
- * lifetime rather than for one container.
+ * Remember the key a clause's entry holds, so that a target list which prints
+ * the pinned column can report it after the posting set is gone.  The first
+ * relation that has the key wins; with partitions the others hold a key that
+ * compares equal to it by the index's own equality, which is exactly the
+ * guarantee the printed value rests on in the single-table case as well.
+ */
+static void
+rbi_save_clause_key(RBICountScanState *st, RBIClauseState *cl,
+					const RBIPostingSet *ps)
+{
+	MemoryContext oldcxt;
+	RBIState   *istate;
+
+	if (cl->hasstoredkey || !ps->found || !ps->hasstoredkey)
+		return;
+
+	if (ps->keyisnull)
+	{
+		cl->storedkey = (Datum) 0;
+		cl->keyisnull = true;
+		cl->hasstoredkey = true;
+		return;
+	}
+
+	istate = rbi_get_state(cl->idx);
+	oldcxt = MemoryContextSwitchTo(st->keycxt);
+	cl->storedkey = datumCopy(ps->storedkey, istate->typbyval, istate->typlen);
+	MemoryContextSwitchTo(oldcxt);
+	cl->keyisnull = false;
+	cl->hasstoredkey = true;
+}
+
+/*
+ * Locate the posting sets of every WHERE clause of the relation the node is
+ * counting.  They keep their pins (for INLINE entries) until
+ * rbi_release_where(), which is exactly the DESIGN.md section 9 discipline
+ * applied for the length of that relation's processing rather than for one
+ * container.  With partitions that is one partition's turn; with a plain
+ * table it is the whole node execution.
  */
 static void
 rbi_locate_where(RBICountScanState *st)
@@ -1285,6 +1863,14 @@ rbi_locate_where(RBICountScanState *st)
 			default:
 				elog(ERROR, "RoaringCount: unknown clause kind %d", cl->kind);
 		}
+
+		/*
+		 * Only a clause that pins the column to ONE value can have its key
+		 * printed, and those are the ones with a single set.
+		 */
+		if ((cl->kind == RBI_CLAUSE_EQ || cl->kind == RBI_CLAUSE_NULL) &&
+			src->nsets == 1)
+			rbi_save_clause_key(st, cl, &src->sets[0]);
 	}
 
 	MemoryContextSwitchTo(oldcxt);
@@ -1356,19 +1942,18 @@ rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
 					 * index stored for it, which is the value the heap holds
 					 * (or NULL, for an `IS NULL` clause).
 					 */
-					RBICountSource *src =
-						&st->sources[1 + (kind - RBI_TL_WHEREKEY)];
+					RBIClauseState *cl = &st->clause[kind - RBI_TL_WHEREKEY];
 
 					/*
-					 * A clause with no entry at all counts zero rows, and a
+					 * A clause with no entry anywhere counts zero rows, and a
 					 * group of zero rows is never emitted, so the key is
 					 * always there by the time we get here.
 					 */
-					Assert(src->nsets == 1 && src->sets[0].hasstoredkey);
-					if (src->nsets == 1 && src->sets[0].hasstoredkey)
+					Assert(cl->hasstoredkey);
+					if (cl->hasstoredkey)
 					{
-						slot->tts_values[i] = src->sets[0].storedkey;
-						slot->tts_isnull[i] = src->sets[0].keyisnull;
+						slot->tts_values[i] = cl->storedkey;
+						slot->tts_isnull[i] = cl->keyisnull;
 					}
 					else
 					{
@@ -1387,6 +1972,266 @@ rbi_emit_tuple(RBICountScanState *st, Datum key, bool keyisnull, int64 count)
 	return slot;
 }
 
+/* ---------------------------------------------------------------------
+ * Counting one relation
+ *
+ * These three are what a plain table and one partition of a partitioned one
+ * have in common (DESIGN.md §16): the caller has opened the relation with
+ * rbi_open_relation() and located its WHERE clauses, and every posting set
+ * they take is released before they return, so no pin of this relation
+ * outlives its turn.
+ * --------------------------------------------------------------------- */
+
+/*
+ * The intersection of the WHERE clauses, with no index driving the count.
+ */
+static int64
+rbi_count_relation(RBICountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+	int64		count;
+
+	Assert(st->nclause > 0);
+	if (st->wheremissing)
+		return 0;
+
+	MemoryContextReset(st->pergroup);
+	oldcxt = MemoryContextSwitchTo(st->pergroup);
+	count = rbi_count_sources(st->heap, estate->es_snapshot,
+							  st->nclause, &st->sources[1], &st->stats);
+	MemoryContextSwitchTo(oldcxt);
+
+	return count;
+}
+
+/*
+ * The sum over every entry of the driving index (DESIGN.md §14,
+ * `col IS NOT NULL` with nothing else to drive the merge).
+ */
+static int64
+rbi_sumall_relation(RBICountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+	int64		total = 0;
+	Datum		key;
+
+	if (st->wheremissing)
+		return 0;
+
+	rbi_entry_scan_begin(&st->escan, st->groupidx);
+	st->scanning = true;
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			break;
+		}
+
+		total += rbi_count_sources(st->heap, estate->es_snapshot,
+								   st->nclause + 1, st->sources, &st->stats);
+		rbi_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	rbi_entry_scan_end(&st->escan);
+	st->scanning = false;
+	return total;
+}
+
+/*
+ * Add one group's count to the cross-partition hash table.
+ */
+static void
+rbi_hash_add_group(RBICountScanState *st, Datum key, bool keyisnull,
+				   int64 count)
+{
+	TupleHashEntry entry;
+	bool		isnew;
+	int64	   *slotcount;
+
+	ExecClearTuple(st->hashslot);
+	st->hashslot->tts_values[0] = key;
+	st->hashslot->tts_isnull[0] = keyisnull;
+	ExecStoreVirtualTuple(st->hashslot);
+
+	entry = LookupTupleHashEntry(st->hashtab, st->hashslot, &isnew, NULL);
+	slotcount = (int64 *) TupleHashEntryGetAdditional(st->hashtab, entry);
+	if (isnew)
+		*slotcount = count;
+	else
+		*slotcount += count;
+
+	/*
+	 * The entry (and the copy of the key inside it) lives in the table's own
+	 * context; everything the hash and equality functions allocated is in the
+	 * temp one and can go.
+	 */
+	ExecClearTuple(st->hashslot);
+	MemoryContextReset(st->hashtempcxt);
+}
+
+/*
+ * Count every group of one relation into the hash table.
+ */
+static void
+rbi_group_relation_into_hash(RBICountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+
+	if (st->wheremissing)
+		return;
+
+	rbi_entry_scan_begin(&st->escan, st->groupidx);
+	st->scanning = true;
+
+	for (;;)
+	{
+		Datum		key;
+		bool		keyisnull;
+		int64		count;
+
+		CHECK_FOR_INTERRUPTS();
+
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		if (!rbi_entry_scan_next(&st->escan, &key, &st->groupset))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			break;
+		}
+
+		count = rbi_count_sources(st->heap, estate->es_snapshot,
+								  st->nclause + 1, st->sources, &st->stats);
+		keyisnull = st->groupset.keyisnull;
+		rbi_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* A group exists only if at least one of its rows is visible. */
+		if (count == 0)
+			continue;
+
+		/* The key still lives in pergroup; the hash table takes a copy. */
+		rbi_hash_add_group(st, key, keyisnull, count);
+	}
+
+	rbi_entry_scan_end(&st->escan);
+	st->scanning = false;
+}
+
+/*
+ * Walk one partition: open it, locate its clauses, hand it to one of the
+ * three above, then let go of everything it owns (DESIGN.md §16).
+ */
+static int64
+rbi_run_partition(RBICountScanState *st, int p, bool intohash)
+{
+	int64		count = 0;
+
+	rbi_open_relation(st, st->part[p].heapoid, st->part[p].groupidxoid,
+					  st->part[p].clauseidxoid);
+	rbi_locate_where(st);
+
+	if (intohash)
+		rbi_group_relation_into_hash(st);
+	else if (st->hasgroupidx)
+	{
+		/* No group key of its own: the only driver left is a sum-over-all. */
+		Assert(st->sumall);
+		count = rbi_sumall_relation(st);
+	}
+	else
+		count = rbi_count_relation(st);
+
+	rbi_release_where(st);
+	rbi_close_relation(st);
+
+	return count;
+}
+
+/*
+ * Return the next merged group, or NULL when the table has been drained.
+ */
+static TupleTableSlot *
+rbi_next_hash_group(RBICountScanState *st)
+{
+	TupleHashEntry entry;
+
+	while ((entry = ScanTupleHashTable(st->hashtab, &st->hashiter)) != NULL)
+	{
+		int64	   *count = (int64 *) TupleHashEntryGetAdditional(st->hashtab,
+																 entry);
+		Datum		key;
+		bool		isnull;
+
+		if (*count <= 0)
+			continue;			/* only positive counts are ever inserted */
+
+		/*
+		 * The minimal tuple belongs to the hash table's context, so the key
+		 * stays valid for as long as the node does.
+		 */
+		ExecClearTuple(st->hashoutslot);
+		ExecStoreMinimalTuple(TupleHashEntryGetTuple(entry), st->hashoutslot,
+							  false);
+		key = slot_getattr(st->hashoutslot, 1, &isnull);
+
+		return rbi_emit_tuple(st, key, isnull, *count);
+	}
+
+	st->done = true;
+	return NULL;
+}
+
+/*
+ * The partitioned form of the node (DESIGN.md §16).  Nothing comes out until
+ * every partition has been counted: without GROUP BY because the one row is
+ * the sum over all of them, with GROUP BY because a group may have rows in
+ * any partition.
+ */
+static TupleTableSlot *
+rbi_exec_partitioned(RBICountScanState *st)
+{
+	int64		total = 0;
+	int			p;
+
+	if (st->hasgroupidx && st->groupattno != 0)
+	{
+		if (!st->hashfilled)
+		{
+			for (p = 0; p < st->npart; p++)
+				(void) rbi_run_partition(st, p, true);
+			st->hashfilled = true;
+			InitTupleHashIterator(st->hashtab, &st->hashiter);
+		}
+		return rbi_next_hash_group(st);
+	}
+
+	for (p = 0; p < st->npart; p++)
+		total += rbi_run_partition(st, p, false);
+
+	st->done = true;
+
+	/*
+	 * A plain aggregate always produces its one row; a GROUP BY whose columns
+	 * the planner folded to constants produces one only if the group exists.
+	 */
+	if (total == 0 && st->singlegroup)
+		return NULL;
+
+	return rbi_emit_tuple(st, (Datum) 0, true, total);
+}
+
 static TupleTableSlot *
 rbi_exec_custom_scan(CustomScanState *node)
 {
@@ -1398,27 +2243,19 @@ rbi_exec_custom_scan(CustomScanState *node)
 	if (st->done)
 		return NULL;
 
+	/* A partitioned table counts one partition at a time. */
+	if (st->npart > 0)
+		return rbi_exec_partitioned(st);
+
 	if (!st->located)
 		rbi_locate_where(st);
 
 	/* ---- no index to iterate: exactly one row ---- */
-	if (!OidIsValid(st->groupidxoid))
+	if (!st->hasgroupidx)
 	{
 		/* Without a group index a clause has to drive the count. */
-		Assert(st->nclause > 0);
 		st->done = true;
-
-		if (st->wheremissing)
-			count = 0;
-		else
-		{
-			MemoryContextReset(st->pergroup);
-			oldcxt = MemoryContextSwitchTo(st->pergroup);
-			count = rbi_count_sources(st->heap, estate->es_snapshot,
-									  st->nclause, &st->sources[1],
-									  &st->stats);
-			MemoryContextSwitchTo(oldcxt);
-		}
+		count = rbi_count_relation(st);
 
 		/*
 		 * A plain aggregate always produces its one row; a GROUP BY whose
@@ -1517,26 +2354,15 @@ rbi_exec_custom_scan(CustomScanState *node)
 	}
 }
 
+/*
+ * Everything the node built while running, undone.  A partitioned scan may be
+ * standing in the middle of a partition (a LIMIT above it, an error being
+ * unwound), so the relation it has open is closed here too; every posting set
+ * has been released before any of them, which is what DESIGN.md §9 requires.
+ */
 static void
-rbi_rescan_custom_scan(CustomScanState *node)
+rbi_reset_run(RBICountScanState *st)
 {
-	RBICountScanState *st = (RBICountScanState *) node;
-
-	if (st->scanning)
-	{
-		rbi_entry_scan_end(&st->escan);
-		st->scanning = false;
-	}
-	rbi_posting_set_release(&st->groupset);
-	rbi_release_where(st);
-	MemoryContextReset(st->pergroup);
-	st->done = false;
-}
-
-static void
-rbi_end_custom_scan(CustomScanState *node)
-{
-	RBICountScanState *st = (RBICountScanState *) node;
 	int			i;
 
 	if (st->scanning)
@@ -1547,24 +2373,63 @@ rbi_end_custom_scan(CustomScanState *node)
 	rbi_posting_set_release(&st->groupset);
 	rbi_release_where(st);
 
-	if (st->groupidx != NULL)
-	{
-		index_close(st->groupidx, AccessShareLock);
-		st->groupidx = NULL;
-	}
+	if (st->npart > 0)
+		rbi_close_relation(st);
+
+	if (st->pergroup != NULL)
+		MemoryContextReset(st->pergroup);
+
 	for (i = 0; i < st->nclause; i++)
 	{
-		if (st->clause[i].idx != NULL)
-		{
-			index_close(st->clause[i].idx, AccessShareLock);
-			st->clause[i].idx = NULL;
-		}
+		st->clause[i].hasstoredkey = false;
+		st->clause[i].keyisnull = false;
+		st->clause[i].storedkey = (Datum) 0;
 	}
-	if (st->heap != NULL)
+	if (st->keycxt != NULL)
+		MemoryContextReset(st->keycxt);
+
+	if (st->hashtab != NULL)
+		ResetTupleHashTable(st->hashtab);
+	if (st->hashtempcxt != NULL)
+		MemoryContextReset(st->hashtempcxt);
+	if (st->hashslot != NULL)
+		ExecClearTuple(st->hashslot);
+	if (st->hashoutslot != NULL)
+		ExecClearTuple(st->hashoutslot);
+	st->hashfilled = false;
+}
+
+static void
+rbi_rescan_custom_scan(CustomScanState *node)
+{
+	RBICountScanState *st = (RBICountScanState *) node;
+
+	rbi_reset_run(st);
+	st->done = false;
+}
+
+static void
+rbi_end_custom_scan(CustomScanState *node)
+{
+	RBICountScanState *st = (RBICountScanState *) node;
+
+	rbi_reset_run(st);
+
+	/* A plain table's relations were opened once and are closed once. */
+	if (st->npart == 0)
+		rbi_close_relation(st);
+
+	if (st->hashslot != NULL)
 	{
-		table_close(st->heap, NoLock);
-		st->heap = NULL;
+		ExecDropSingleTupleTableSlot(st->hashslot);
+		st->hashslot = NULL;
 	}
+	if (st->hashoutslot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(st->hashoutslot);
+		st->hashoutslot = NULL;
+	}
+	st->hashtab = NULL;
 
 	if (st->pergroup != NULL)
 	{
@@ -1575,6 +2440,26 @@ rbi_end_custom_scan(CustomScanState *node)
 	{
 		MemoryContextDelete(st->wherecxt);
 		st->wherecxt = NULL;
+	}
+	if (st->keycxt != NULL)
+	{
+		MemoryContextDelete(st->keycxt);
+		st->keycxt = NULL;
+	}
+	if (st->hashmetacxt != NULL)
+	{
+		MemoryContextDelete(st->hashmetacxt);
+		st->hashmetacxt = NULL;
+	}
+	if (st->hashtuplescxt != NULL)
+	{
+		MemoryContextDelete(st->hashtuplescxt);
+		st->hashtuplescxt = NULL;
+	}
+	if (st->hashtempcxt != NULL)
+	{
+		MemoryContextDelete(st->hashtempcxt);
+		st->hashtempcxt = NULL;
 	}
 }
 
@@ -1620,23 +2505,44 @@ rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
 	StringInfoData buf;
 	int			i;
 
+	/*
+	 * A partitioned scan uses one index per partition per clause, so there is
+	 * no single name to print: the entries are the clauses alone, and the
+	 * partitions get a line of their own (DESIGN.md §16).
+	 */
+	if (st->npart > 0)
+	{
+		initStringInfo(&buf);
+		for (i = 0; i < st->npart; i++)
+		{
+			if (i > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, get_rel_name(st->part[i].heapoid));
+		}
+		ExplainPropertyText("Partitions", buf.data, es);
+		pfree(buf.data);
+	}
+
 	initStringInfo(&buf);
 
-	if (OidIsValid(st->groupidxoid))
+	if (st->hasgroupidx)
 	{
-		appendStringInfoString(&buf, get_rel_name(st->groupidxoid));
+		if (st->npart == 0)
+			appendStringInfo(&buf, "%s ", get_rel_name(st->groupidxoid));
 		if (st->groupattno != 0)
-			appendStringInfo(&buf, " (%s)",
+			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->groupattno, false));
 		else
-			appendStringInfoString(&buf, " (all keys)");
+			appendStringInfoString(&buf, "(all keys)");
 	}
 
 	for (i = 0; i < st->nclause; i++)
 	{
 		if (buf.len > 0)
 			appendStringInfoString(&buf, ", ");
-		appendStringInfo(&buf, "%s (", get_rel_name(st->clause[i].idxoid));
+		if (st->npart == 0)
+			appendStringInfo(&buf, "%s ", get_rel_name(st->clause[i].idxoid));
+		appendStringInfoChar(&buf, '(');
 		rbi_explain_clause(st, &st->clause[i], &buf);
 		appendStringInfoChar(&buf, ')');
 	}
@@ -1644,7 +2550,7 @@ rbi_explain_custom_scan(CustomScanState *node, List *ancestors,
 	ExplainPropertyText("Roaring Indexes", buf.data, es);
 	pfree(buf.data);
 
-	if (OidIsValid(st->groupidxoid) && st->groupattno != 0)
+	if (st->hasgroupidx && st->groupattno != 0)
 		ExplainPropertyText("Group Key",
 							get_attname(st->heapoid, st->groupattno, false),
 							es);
