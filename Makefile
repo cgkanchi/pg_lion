@@ -40,3 +40,23 @@ unit: test/unit/container_test test/unit/sparse_test
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 $(OBJS): src/rbi.h src/rbi_container.h src/rbi_sparse.h src/rbi_tid.h
 src/rbi_count.o src/rbi_customscan.o src/rbi_am.o: src/rbi_count.h
+
+# Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
+# whole PostgreSQL *installation* to initdb their own private clusters into,
+# not just a pg_config, and they install the extension into it, so the prefix
+# is named separately rather than derived from PG_CONFIG:
+#
+#   make recovery-check PG_CONFIG=<prefix>/bin/pg_config RECOVERY_PREFIX=<prefix>
+#
+# With RECOVERY_PREFIX unset, run.sh uses the worktree install
+# (../pg_roaring_index-partial/.local/pg) - deliberately NOT the prefix
+# PG_CONFIG points at, so a bare "make recovery-check" cannot install into the
+# dev cluster's tree.  Nothing here touches the dev cluster either way: run.sh
+# creates its own clusters on a private socket directory and port and removes
+# them on exit.
+RECOVERY_PREFIX ?=
+EXTRA_CLEAN += test/recovery/log
+
+.PHONY: recovery-check
+recovery-check:
+	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)")
