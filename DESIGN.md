@@ -2233,3 +2233,41 @@ independent posting sets (order-insensitive, like GIN); a composite-tuple key is
 offered: a query with one fixed shape is btree's job. The recovery harness must cover
 directory splits and posting-tree splits under crash (an injection point between "split page" and
 "insert downlink", crash, restart, verify() shows the incomplete-split repair).
+
+## 23. Backlog (not urgent; ordered by when they should happen)
+
+- **HAVING on the count itself** (`GROUP BY k HAVING count(*) > n`): the node knows each group's
+  count before emitting it; accept a HAVING that references only the count aggregates and the group
+  columns and filter in the node. Today users must write the filter in an outer query.
+- **Range/zone-map opclass family**: bucket a continuous column into value ranges, one posting set per
+  bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
+  recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
+  ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
+- **FK-side join pushdown**: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK column
+  is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
+  Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
+  through the join.
+- **Citus and TimescaleDB compatibility (last, before any release).** These are the environments the
+  extension is most likely to run in. Verify, with a test matrix run against each:
+  - Citus: distributed and reference tables with lion indexes (CREATE INDEX propagation via the
+    normal DDL path; the opclasses, reloptions and the citext companion must be creatable on
+    workers); the count pushdown must run on the worker shard queries (the coordinator sees a
+    per-shard `count`/`GROUP BY` fragment, which is our single-table shape) and must be safe under
+    Citus's use of the `create_upper_paths_hook` and `set_rel_pathlist_hook` (chain, never replace);
+    shard rebalancing (indexes on moved shards rebuilt correctly); `citus.enable_repartition_joins`;
+    columnar-access-method tables are out of scope (no VM: the count path must decline them via the
+    table AM check already used for the heap-specific recheck).
+  - TimescaleDB: hypertables (indexes created per chunk through Timescale's DDL hooks; the pushdown's
+    partitioned-parent path in §16 sees a hypertable as an inheritance parent with chunks as
+    children — confirm the AppendRelInfo mapping and the `rte->inh` handling; Timescale also installs
+    planner hooks that must be chained with ours), compressed chunks (no lion index on compressed
+    chunks; the node must decline or the planner must not offer it for those children — compressed
+    chunks are a different table AM), continuous aggregates (their materialized hypertables are
+    ordinary hypertables), `timescaledb.enable_chunk_append`, and retention drops (a dropped chunk
+    takes its indexes with it; nothing to do but test). Time-bucketed columns are a natural lion
+    key (`time_bucket(...)` as an expression index is NOT supported — only plain columns — so this
+    means a stored bucket column; document that).
+  - Both: hook chaining order (load order via shared_preload_libraries vs LOAD-on-first-use), the
+    `pg_lion.*` GUC prefix under their GUC validation, EXPLAIN output through their custom nodes,
+    parallel-plan interaction (we are parallel-unsafe; their planners must respect it), and the
+    supported PostgreSQL major versions (they lag master; this decides which release to target).
