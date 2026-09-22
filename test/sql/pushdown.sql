@@ -228,7 +228,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt x, lion_pdt y WHERE x.a = 3 AND y.
  * statistics say matches nothing makes the bitmap plan look almost free.
  */
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 999');
--- ORDER BY is fine, but the node produces no ordering of its own
+-- ORDER BY on the group column needs no Sort any more: the entries come out
+-- in key order and the path says so (DESIGN.md §21).  `a` is NOT NULL, which
+-- is what lets the pathkeys be NULLS LAST like the ORDER BY.
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
 SELECT lion_plans('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
 
@@ -366,8 +368,8 @@ SELECT lion_pd_counters('SELECT k, count(*) FROM lion_pdg GROUP BY k');
 
 -- ---- a long IN list, priced per element ---------------------------------
 /*
- * Every element of an IN list is a bucket lookup and a container chain of its
- * own, and the estimate has to say so: charging a list as one bucket page made
+ * Every element of an IN list is a directory lookup and a container chain of
+ * its own, and the estimate has to say so: charging a list as one page made
  * a thousand-element list look four times cheaper than it is (the 2026-09-21
  * follow-up review).  What it is NOT charged for any more is a k-way union per
  * element, because since the disjoint-sum short-circuit of DESIGN.md §15 there

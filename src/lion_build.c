@@ -3,11 +3,20 @@
  * lion_build.c
  *		ambuild for the lion index (DESIGN.md section 5, BUILD).
  *
- * The heap is scanned once into a tuplesort of (hash int4, key, code int8,
- * kind int2) sorted by (hash, code).  A first pass over the sorted data counts
- * distinct keys so that the bucket count can be chosen; a second pass groups
- * the codes of each key into containers and writes the posting sets out,
- * either inline in the entry tuple or as a chain of container pages.
+ * The heap is scanned once into a tuplesort of (kind int4, hash int8,
+ * code int8, key) sorted into the DIRECTORY order of DESIGN.md
+ * §21 - (kind, key, hash) for an ordered opclass, (kind, hash, stored bytes)
+ * for one whose key type has no btree opclass - with the code last.  One pass
+ * over the sorted data groups the codes of each key into containers and
+ * writes the posting sets out, either inline in the entry tuple or as a chain
+ * of container pages, and the entries come out in exactly the order the
+ * directory wants them in.
+ *
+ * The directory itself is built bottom-up in that same pass, nbtree's
+ * _bt_buildadd shape: one open page per level, filled to `fillfactor` percent
+ * and written out when the next item does not fit, at which point its high
+ * key is that item's key and its downlink goes to the level above.  The level
+ * whose last page is also its first is the root.
  *
  * A multi-key opclass (DESIGN.md §17) turns one heap row into one sort tuple
  * per distinct key it extracts, all carrying the same code; nothing else in
@@ -26,15 +35,13 @@
  * records to fill 15,000 pages.
  *
  * Writing each page once means every page has to be final before it is
- * written, and a bucket page is only final when the last entry that hashes to
- * it has been added.  Bucket pages therefore live in memory - one 8 KB image
- * per bucket page that actually holds entries - until pass 2 is over
- * (lion_build_flush_buckets()).  That is the one cost of this route: the
- * bucket directory is sized at about three quarters of a page per bucket, so
- * the images are roughly 1.3 times the bytes the entry tuples need, bounded
- * by LION_MAX_BUCKETS pages (512 MB) in the worst case and by nothing else.
- * Container pages are final as soon as the next container does not fit, so
- * only one of those exists per open key at a time.
+ * written.  A directory page is final as soon as the item that does not fit
+ * on it arrives, because that item's key is its high key, so at most one page
+ * per level is open at a time - which is what the sorted directory buys over
+ * the hash one, whose pages could not be finished until the very last entry
+ * had been hashed and therefore all lived in memory at once.  Container pages
+ * are final as soon as the next container does not fit, so only one of those
+ * exists per open key at a time.
  *
  *-------------------------------------------------------------------------
  */
@@ -50,6 +57,7 @@
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
+#include "storage/bufpage.h"
 #include "storage/bulk_write.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -61,21 +69,18 @@
 #include "lion.h"
 
 /*
- * Bytes of entry tuples one bucket is expected to hold when ambuild chooses
- * the bucket count itself (DESIGN.md §5).  Three quarters of a page.
- */
-#define LION_BUCKET_FILL_BYTES	((Size) (BLCKSZ / 4 * 3))
-
-/*
  * Which entry a sorted tuple belongs to.  A row contributes one tuple per
- * distinct extracted key, or exactly one LION_KEY_NULL / LION_KEY_EMPTY tuple
- * when it has no key at all; the two reserved kinds are told apart by this
- * flag rather than by the (absent) key, and they share hash 0 with any real
- * key that happens to hash there.
+ * distinct extracted key, or exactly one NULL / EMPTY tuple when it has no
+ * key at all; the two reserved kinds are told apart by this column rather
+ * than by the (absent) key, and they share hash 0 with any real key that
+ * happens to hash there.
+ *
+ * The values are the directory kinds of DESIGN.md §21 (NULL < EMPTY < VALUE),
+ * so sorting the column ascending is already the order the directory wants.
  */
-#define LION_KEY_REAL	0
-#define LION_KEY_NULL	1		/* the indexed value is NULL (DESIGN.md §14) */
-#define LION_KEY_EMPTY	2		/* no keys were extracted (DESIGN.md §17) */
+#define LION_KEY_NULL	LION_KIND_NULL
+#define LION_KEY_EMPTY	LION_KIND_EMPTY
+#define LION_KEY_REAL	LION_KIND_VALUE
 
 static inline uint16
 lion_reserved_flag(int kind)
@@ -105,6 +110,8 @@ typedef struct LionBuilder
 	Datum		key;			/* private copy of the key */
 	int			keykind;		/* LION_KEY_* */
 	uint32		hash;
+	char	   *rawkey;			/* the key as the entry tuple stores it */
+	Size		rawlen;			/* ... which is the tail of the directory order */
 
 	bool		hasgroup;		/* curckey is a ckey group being collected */
 	uint32		curckey;
@@ -130,24 +137,34 @@ typedef struct LionBuilder
 } LionBuilder;
 
 /*
- * One bucket page under construction.  The image is a bulk-write buffer, so
- * that writing it out at the end of the build hands the very same memory to
- * the bulk writer instead of copying it.
+ * One level of the directory under construction (DESIGN.md §21).  Items are
+ * buffered until the page is final - which it is as soon as the item that
+ * does not fit arrives, because that item's key becomes the high key - and
+ * the page is then written and its downlink handed to the level above.
  */
-typedef struct LionBuildPage
+typedef struct LionBuildLevel
 {
-	struct LionBuildPage *next;	/* next page of this bucket's chain */
-	struct LionBuildPage *next2; /* next overflow page in block order */
-	BlockNumber blkno;
-	BulkWriteBuffer buf;		/* the image, NULL once it has been written */
-} LionBuildPage;
+	uint16		level;			/* 0 = leaves */
+	char	  **items;			/* private copies of the open page's items */
+	Size	   *sizes;
+	int			nitems;
+	int			maxitems;
+	Size		used;			/* what they cost on a page, line pointers in */
+	BlockNumber blkno;			/* block reserved for the open page */
+	BlockNumber leftblk;		/* the page written before it, if any */
+	int64		npages;			/* pages of this level written so far */
+	struct LionBuildLevel *parent;
+} LionBuildLevel;
 
 typedef struct LionBuildState
 {
 	Relation	index;
 	LionState	state;
-	uint32		nbuckets;
 	uint32		inline_limit;
+	int			fillfactor;
+	Size		leafbudget;		/* bytes of a page ambuild fills */
+
+	Size		dirbudget;		/* ... and of an internal one (§21) */
 
 	bool		multikey;		/* the opclass extracts keys (DESIGN.md §17) */
 	int			max_entries;	/* cardinality guard, 0 = unlimited */
@@ -167,10 +184,11 @@ typedef struct LionBuildState
 	 */
 	BulkWriteState *bulk;
 	BlockNumber nblocks;		/* blocks handed out so far */
-	struct LionBuildPage **bucketpages;	/* head page of each bucket, or NULL */
-	struct LionBuildPage *overflow;		/* bucket pages beyond the heads, in */
-	struct LionBuildPage *overflowlast;	/* block order */
-	int64		nbucketpages;
+	LionBuildLevel *leaf;		/* the bottom of the directory */
+	int64		ndirpages;
+	int64		ndistinct;		/* entries written, for the §17 guard */
+	BlockNumber root;
+	uint32		height;
 
 	LionBuilder **builders;		/* open builders of the current hash */
 	int			nbuilders;
@@ -190,11 +208,9 @@ static void lion_builder_close_segment(LionBuildState *bs, LionBuilder *b);
  * During a build nobody else can see the index, so pages are prepared in
  * backend-local memory and handed to the bulk writer, which writes each of
  * them exactly once and WAL-logs them in batches.  Block numbers come from a
- * counter: the meta page is block 0, the bucket directory takes blocks
- * 1 .. nbuckets, and container pages and further bucket pages are handed the
- * next free block as they are needed - the same order the buffer-manager
- * route extended the relation in, so an index built by either route has the
- * same page at the same block.
+ * counter: the meta page is block 0 and everything else takes the next free
+ * block as it is needed, so the leaves come out at the front of the file in
+ * key order and the internal pages follow.
  * --------------------------------------------------------------------- */
 
 static BlockNumber
@@ -202,6 +218,9 @@ lion_build_alloc_block(LionBuildState *bs)
 {
 	return bs->nblocks++;
 }
+
+static void lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
+								const LionEntryTuple *item, Size size);
 
 static BulkWriteBuffer
 lion_build_get_page(LionBuildState *bs, uint16 flags)
@@ -214,135 +233,301 @@ lion_build_get_page(LionBuildState *bs, uint16 flags)
 }
 
 /*
- * Write the meta page and reserve the bucket directory.  The head pages
- * themselves are written by lion_build_flush_buckets() once their entries are
- * all in; until then the directory is a hole in the file that the bulk writer
- * fills with zeroes if a container page is written past it, and overwrites
- * with the real pages afterwards.
+ * Write the meta page.  Its root is filled in at the end of the build, so the
+ * image is kept until then; the bulk writer is happy to take block 0 last.
  */
 static void
 lion_build_init_pages(LionBuildState *bs)
 {
-	BulkWriteBuffer meta = smgr_bulk_get_buf(bs->bulk);
-	BlockNumber blk;
+	BlockNumber blk PG_USED_FOR_ASSERTS_ONLY;
 
-	lion_init_metapage((Page) meta->data, bs->nbuckets, bs->inline_limit);
 	blk = lion_build_alloc_block(bs);
 	Assert(blk == LION_METAPAGE_BLKNO);
-	smgr_bulk_write(bs->bulk, blk, meta, true);
+}
 
-	bs->bucketpages = (LionBuildPage **)
-		MemoryContextAllocZero(bs->buildctx,
-							   sizeof(LionBuildPage *) * bs->nbuckets);
-	bs->nblocks = LION_BUCKET_BLKNO(bs->nbuckets);
+static LionBuildLevel *
+lion_build_level(LionBuildState *bs, uint16 level)
+{
+	LionBuildLevel *lv = (LionBuildLevel *)
+		MemoryContextAllocZero(bs->buildctx, sizeof(LionBuildLevel));
+
+	lv->level = level;
+	lv->maxitems = 64;
+	lv->items = (char **) MemoryContextAlloc(bs->buildctx,
+											 sizeof(char *) * lv->maxitems);
+	lv->sizes = (Size *) MemoryContextAlloc(bs->buildctx,
+											sizeof(Size) * lv->maxitems);
+	lv->blkno = InvalidBlockNumber;
+	lv->leftblk = InvalidBlockNumber;
+
+	return lv;
+}
+
+static LionBuildLevel *
+lion_build_parent(LionBuildState *bs, LionBuildLevel *lv)
+{
+	if (lv->parent == NULL)
+		lv->parent = lion_build_level(bs, lv->level + 1);
+	return lv->parent;
+}
+
+/* A pivot tuple carrying src's key: a high key, or a downlink to child. */
+static LionEntryTuple *
+lion_build_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
+				Size *size)
+{
+	Size		keylen = (src != NULL) ? src->keylen : 0;
+	Size		total = MAXALIGN(LION_ENTRY_HDRSZ + keylen);
+	LionEntryTuple *p = (LionEntryTuple *) palloc0(total);
+
+	p->hash = (src != NULL) ? src->hash : 0;
+	p->flags = pivotflag |
+		(uint16) ((src != NULL) ?
+				  (src->flags & (LION_ENTRY_RESERVED | LION_ENTRY_MINUSINF)) :
+				  LION_ENTRY_MINUSINF);
+	p->keylen = (uint16) keylen;
+	p->head = child;
+	p->tail = InvalidBlockNumber;
+	if (keylen > 0)
+		memcpy(LionEntryGetKey(p), LionEntryGetKey(src), keylen);
+
+	*size = total;
+	return p;
+}
+
+/* What a pivot copy of this item's key costs on a page. */
+static inline Size
+lion_build_pivot_need(const LionEntryTuple *item)
+{
+	return MAXALIGN(LION_ENTRY_HDRSZ + item->keylen) + sizeof(ItemIdData);
+}
+
+/* What this item costs on a page, line pointer in. */
+static inline Size
+lion_build_item_need(Size size)
+{
+	return MAXALIGN(size) + sizeof(ItemIdData);
 }
 
 /*
- * A new page for a bucket's chain.  prev is the page it is linked after, or
- * NULL for the bucket's head page, which owns a block of the directory.
+ * Write the open page of one level and start the next.  hkey is the key of
+ * the item that did not fit - the first key of the page to the right, and
+ * therefore this page's high key - or NULL when this is the last page of the
+ * level.  isroot marks it as the tree's root and suppresses the downlink.
+ *
+ * The high key may be much larger than anything already on the page (keys are
+ * variable length, and one of LION_MAX_KEY_SIZE arriving behind a page full of
+ * short ones is the case that used to overflow the page).  What makes the
+ * reserve exact is nbtree's rule in _bt_buildadd(): the item that becomes the
+ * FIRST of the next page is the one whose key becomes the high key, so when
+ * hkey does not fit, trailing items are moved to the next page instead and the
+ * first of THEM supplies the high key - a pivot copy of a key that was already
+ * on this page, which by construction is never larger than the item it came
+ * from.
  */
-static LionBuildPage *
-lion_build_new_bucket_page(LionBuildState *bs, uint32 bucket, LionBuildPage *prev)
+static void
+lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
+					  const LionEntryTuple *hkey, bool isroot)
 {
-	LionBuildPage *bp = (LionBuildPage *)
-		MemoryContextAllocZero(bs->buildctx, sizeof(LionBuildPage));
+	BulkWriteBuffer buf;
+	Page		page;
+	BlockNumber nextblk = InvalidBlockNumber;
+	BlockNumber thisblk;
+	LionEntryTuple *pivot;
+	Size		pivotsz;
+	const LionEntryTuple *hksrc = hkey;
+	Size		hkneed = 0;
+	int			nkeep = lv->nitems;
+	Size		keepused = lv->used;
+	int			i;
 
-	bp->buf = lion_build_get_page(bs, LION_PAGE_BUCKET);
-	bs->nbucketpages++;
+	if (lv->nitems == 0 && lv->npages > 0)
+		return;					/* nothing left over to write */
 
-	if (prev == NULL)
+	if (hksrc != NULL)
 	{
-		bp->blkno = LION_BUCKET_BLKNO(bucket);
-		bs->bucketpages[bucket] = bp;
+		hkneed = lion_build_pivot_need(hksrc);
+		while (nkeep > 1 && keepused + hkneed > LION_PAGE_CAPACITY)
+		{
+			nkeep--;
+			keepused -= lion_build_item_need(lv->sizes[nkeep]);
+			hksrc = (const LionEntryTuple *) lv->items[nkeep];
+			hkneed = lion_build_pivot_need(hksrc);
+		}
+		if (keepused + hkneed > LION_PAGE_CAPACITY)
+			elog(ERROR, "lion index: a directory page cannot hold one item of %zu bytes and its high key",
+				 lv->sizes[0]);
+	}
+	Assert(keepused + hkneed <= LION_PAGE_CAPACITY);
+	/*
+	 * Every internal page but the last of its level carries at least two
+	 * downlinks, which is what makes the level strictly smaller than the one
+	 * below it and lion_build_finish_dir() terminate.
+	 */
+	Assert(lv->level == 0 || hksrc == NULL || nkeep >= LION_ABS_MIN_DOWNLINKS);
+
+	if (!BlockNumberIsValid(lv->blkno))
+		lv->blkno = lion_build_alloc_block(bs);
+	thisblk = lv->blkno;
+	if (hksrc != NULL)
+		nextblk = lion_build_alloc_block(bs);
+
+	buf = smgr_bulk_get_buf(bs->bulk);
+	page = (Page) buf->data;
+	lion_init_page(page, (uint16) ((lv->level == 0 ? LION_PAGE_BUCKET :
+									LION_PAGE_DIR) |
+								   (isroot ? LION_PAGE_ROOT : 0)));
+	LionPageGetOpaque(page)->level = lv->level;
+	LionPageGetOpaque(page)->leftlink = lv->leftblk;
+	LionPageGetOpaque(page)->rightlink = nextblk;
+
+	if (hksrc != NULL)
+	{
+		pivot = lion_build_pivot(hksrc, LION_ENTRY_HIGHKEY, InvalidBlockNumber,
+								 &pivotsz);
+		if (PageAddItemExtended(page, (char *) pivot, pivotsz,
+								FirstOffsetNumber, 0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to place a high key");
+		pfree(pivot);
+	}
+
+	for (i = 0; i < nkeep; i++)
+	{
+		if (PageAddItemExtended(page, lv->items[i], lv->sizes[i],
+								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to place a directory item");
+	}
+
+	smgr_bulk_write(bs->bulk, thisblk, buf, true);
+	bs->ndirpages++;
+
+	/*
+	 * Hand the downlink up, unless this page is the root.  The first page of
+	 * every level gets the minus-infinity separator, which is what makes the
+	 * leftmost path of the tree reachable for any key at all.
+	 */
+	if (!isroot)
+	{
+		pivot = lion_build_pivot(lv->npages == 0 ? NULL :
+								 (const LionEntryTuple *) lv->items[0],
+								 LION_ENTRY_DOWNLINK, thisblk, &pivotsz);
+		lion_build_level_add(bs, lion_build_parent(bs, lv), pivot, pivotsz);
+		pfree(pivot);
 	}
 	else
 	{
-		bp->blkno = lion_build_alloc_block(bs);
-		LionPageGetOpaque((Page) prev->buf->data)->rightlink = bp->blkno;
-		prev->next = bp;
-
-		/* Overflow pages are written in the order they were allocated. */
-		if (bs->overflowlast == NULL)
-			bs->overflow = bp;
-		else
-			bs->overflowlast->next2 = bp;
-		bs->overflowlast = bp;
+		bs->root = thisblk;
+		bs->height = lv->level;
 	}
 
-	return bp;
+	/* The items that did not stay open the next page. */
+	for (i = 0; i < nkeep; i++)
+		pfree(lv->items[i]);
+	for (i = nkeep; i < lv->nitems; i++)
+	{
+		lv->items[i - nkeep] = lv->items[i];
+		lv->sizes[i - nkeep] = lv->sizes[i];
+	}
+	lv->nitems -= nkeep;
+	lv->used -= keepused;
+	lv->npages++;
+	lv->leftblk = thisblk;
+	lv->blkno = nextblk;
 }
 
 /*
- * Add one entry tuple to its bucket, appending a bucket page when no page of
- * the chain has room.  This is lion_add_entry() (lion_pages.c) without the
- * locking and the WAL record: same walk, same PageAddItemExtended(), so the
- * pages come out byte for byte the same.
+ * Add one item to a level, flushing the open page first when it no longer
+ * fits.
+ *
+ * The leaves are filled to `fillfactor`; the internal levels are NOT
+ * (DESIGN.md §21 and LION_NONLEAF_FILLFACTOR): a low fillfactor applied to an
+ * internal page can leave it with a single downlink, which makes every level
+ * as large as the one below and the bottom-up build never terminates.  An
+ * internal page therefore always takes at least LION_ABS_MIN_DOWNLINKS
+ * downlinks - it aims for LION_MIN_DOWNLINKS and settles for two when the
+ * keys are too large for three - whatever the fill target says.
  */
 static void
-lion_build_add_entry(LionBuildState *bs, uint32 bucket, LionEntryTuple *entry,
-					Size size)
+lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
+					const LionEntryTuple *item, Size size)
 {
-	Size		need = MAXALIGN(size);
-	LionBuildPage *bp = bs->bucketpages[bucket];
+	Size		need = lion_build_item_need(size);
+	Size		hkneed = lion_build_pivot_need(item);
+	Size		budget = (lv->level == 0) ? bs->leafbudget : bs->dirbudget;
+	int			minitems = (lv->level == 0) ? 1 : LION_MIN_DOWNLINKS;
+	MemoryContext oldctx;
 
-	if (bp == NULL)
-		bp = lion_build_new_bucket_page(bs, bucket, NULL);
+	/*
+	 * A flush may CARRY trailing items onto the next page (see there), so the
+	 * page this item lands on can still be too full for it; each flush writes
+	 * at least one item out, so this settles.
+	 */
+	while (lv->nitems > 0 && lv->used + need + hkneed > budget &&
+		   (lv->nitems >= minitems ||
+			lv->used + need + hkneed > LION_PAGE_CAPACITY))
+		lion_build_level_flush(bs, lv, item, false);
+
+	Assert(lv->nitems == 0 || lv->used + need <= LION_PAGE_CAPACITY);
+
+	if (lv->nitems >= lv->maxitems)
+	{
+		oldctx = MemoryContextSwitchTo(bs->buildctx);
+		lv->maxitems *= 2;
+		lv->items = (char **) repalloc(lv->items, sizeof(char *) * lv->maxitems);
+		lv->sizes = (Size *) repalloc(lv->sizes, sizeof(Size) * lv->maxitems);
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	if (!BlockNumberIsValid(lv->blkno))
+		lv->blkno = lion_build_alloc_block(bs);
+
+	lv->items[lv->nitems] = (char *) MemoryContextAlloc(bs->buildctx, size);
+	memcpy(lv->items[lv->nitems], item, size);
+	lv->sizes[lv->nitems] = size;
+	lv->nitems++;
+	lv->used += need;
+}
+
+/* One entry tuple, in directory order. */
+static void
+lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
+{
+	lion_build_level_add(bs, bs->leaf, entry, size);
+	bs->ndistinct++;
+}
+
+/*
+ * Close the directory: flush the last page of every level from the bottom up,
+ * and stop at the level whose last page is also its first - that page is the
+ * root.  An index with no entries at all gets one empty leaf, which is the
+ * root (DESIGN.md §21).
+ */
+static void
+lion_build_finish_dir(LionBuildState *bs)
+{
+	LionBuildLevel *lv = bs->leaf;
 
 	for (;;)
 	{
-		Page		page = (Page) bp->buf->data;
+		bool		isroot = (lv->npages == 0);
+		int64		below;
 
-		Assert(LionPageIsBucket(page));
-
-		if (PageGetFreeSpace(page) >= need)
-		{
-			if (PageAddItemExtended(page, entry, size, InvalidOffsetNumber,
-									0) == InvalidOffsetNumber)
-				elog(ERROR, "lion index: failed to add entry to bucket page");
+		lion_build_level_flush(bs, lv, NULL, isroot);
+		if (isroot)
 			return;
-		}
 
-		if (bp->next == NULL)
-			(void) lion_build_new_bucket_page(bs, bucket, bp);
-		bp = bp->next;
+		below = lv->npages;
+		lv = lion_build_parent(bs, lv);
 
-		CHECK_FOR_INTERRUPTS();
-	}
-}
-
-/*
- * Write every bucket page: the head pages in bucket order first (an empty
- * bucket still owns its head page), then the overflow pages in block order.
- */
-static void
-lion_build_flush_buckets(LionBuildState *bs)
-{
-	LionBuildPage *bp;
-	uint32		b;
-
-	for (b = 0; b < bs->nbuckets; b++)
-	{
-		bp = bs->bucketpages[b];
-
-		if (bp == NULL)
-			smgr_bulk_write(bs->bulk, LION_BUCKET_BLKNO(b),
-							lion_build_get_page(bs, LION_PAGE_BUCKET), true);
-		else
-		{
-			Assert(bp->blkno == LION_BUCKET_BLKNO(b));
-			smgr_bulk_write(bs->bulk, bp->blkno, bp->buf, true);
-			bp->buf = NULL;
-		}
-
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	for (bp = bs->overflow; bp != NULL; bp = bp->next2)
-	{
-		Assert(bp->buf != NULL);
-		smgr_bulk_write(bs->bulk, bp->blkno, bp->buf, true);
-		bp->buf = NULL;
-		CHECK_FOR_INTERRUPTS();
+		/*
+		 * Every level is strictly smaller than the one below it, because an
+		 * internal page carries at least two downlinks (lion_build_level_add()).
+		 * That is what makes this loop terminate, so it is checked rather than
+		 * assumed: a level as large as the one below would climb for ever.
+		 */
+		if (lv->npages + (lv->nitems > 0 ? 1 : 0) >= below)
+			elog(ERROR, "lion index: directory level %u has " INT64_FORMAT " pages, not fewer than the " INT64_FORMAT " below it",
+				 lv->level, lv->npages + (lv->nitems > 0 ? 1 : 0), below);
 	}
 }
 
@@ -359,6 +544,18 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 	b->key = (keykind != LION_KEY_REAL) ? (Datum) 0 :
 		datumCopy(key, bs->state.typbyval, bs->state.typlen);
 	b->hash = hash;
+	/*
+	 * The stored bytes, which are the tail of the directory order
+	 * (DESIGN.md §21): two keys whose prefixes tie - which for an unordered
+	 * opclass means two keys of one HASH - are ordered by them, and the
+	 * flush below has to put them out that way.
+	 */
+	if (keykind == LION_KEY_REAL)
+	{
+		b->rawlen = lion_key_datum_size(&bs->state, b->key);
+		b->rawkey = (char *) palloc(b->rawlen);
+		lion_store_key(&bs->state, b->key, b->rawkey);
+	}
 	b->cur = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	b->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	b->seg = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
@@ -598,15 +795,74 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 	entry->ncontainers = b->nitems;
 	entry->ntids = b->ntids;
 
-	lion_build_add_entry(bs, lion_bucket_of(b->hash, bs->nbuckets), entry, size);
+	lion_build_add_entry(bs, entry, size);
 
 	pfree(entry);
 }
 
+/*
+ * Two open builders, in the DIRECTORY order of DESIGN.md §21 - the same
+ * (kind, comparison, hash, stored bytes) that lion_cmp_entry() applies to two
+ * entries on a leaf.
+ */
+static int
+lion_builder_cmp(const void *a, const void *b, void *arg)
+{
+	LionBuildState *bs = (LionBuildState *) arg;
+	const LionBuilder *x = *(LionBuilder *const *) a;
+	const LionBuilder *y = *(LionBuilder *const *) b;
+	Size		n;
+	int			c;
+
+	if (x->keykind != y->keykind)
+		return x->keykind < y->keykind ? -1 : 1;
+	if (x->keykind != LION_KEY_REAL)
+		return 0;				/* one NULL and one EMPTY entry per index */
+
+	if (bs->state.ordered)
+	{
+		c = DatumGetInt32(FunctionCall2Coll(&bs->state.cmpproc,
+											bs->state.collation,
+											x->key, y->key));
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
+
+	if (x->hash != y->hash)
+		return x->hash < y->hash ? -1 : 1;
+
+	n = Min(x->rawlen, y->rawlen);
+	if (n > 0)
+	{
+		c = memcmp(x->rawkey, y->rawkey, n);
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
+	if (x->rawlen != y->rawlen)
+		return x->rawlen < y->rawlen ? -1 : 1;
+	return 0;
+}
+
+/*
+ * Close every open builder, in directory order.
+ *
+ * The sort is what a hash collision needs (DESIGN.md §21).  The tuplesort
+ * brings the tuples of one HASH together but says nothing about the order of
+ * the several distinct keys inside it, so the builders were created in the
+ * order the first TID of each key happened to arrive; writing them out that
+ * way would put the leaf items out of order, which breaks the binary search
+ * and the key-based resume of lion_entry_scan_next().  There are as many
+ * builders as there are distinct keys of one hash, which is one unless the
+ * hash function collides.
+ */
 static void
 lion_flush_builders(LionBuildState *bs)
 {
 	int			i;
+
+	if (bs->nbuilders > 1)
+		qsort_arg(bs->builders, bs->nbuilders, sizeof(LionBuilder *),
+				  lion_builder_cmp, bs);
 
 	for (i = 0; i < bs->nbuilders; i++)
 		lion_builder_flush(bs, bs->builders[i]);
@@ -628,14 +884,14 @@ lion_build_put(LionBuildState *bs, int keykind, Datum key, uint64 code)
 		lion_hash_key(&bs->state, key) : LION_NULLKEY_HASH;
 
 	ExecClearTuple(bs->inslot);
-	bs->inslot->tts_values[0] = Int32GetDatum((int32) hash);
+	bs->inslot->tts_values[0] = Int32GetDatum((int32) keykind);
 	bs->inslot->tts_isnull[0] = false;
-	bs->inslot->tts_values[1] = key;
-	bs->inslot->tts_isnull[1] = (keykind != LION_KEY_REAL);
+	bs->inslot->tts_values[1] = Int64GetDatum((int64) hash);
+	bs->inslot->tts_isnull[1] = false;
 	bs->inslot->tts_values[2] = Int64GetDatum((int64) code);
 	bs->inslot->tts_isnull[2] = false;
-	bs->inslot->tts_values[3] = Int16GetDatum((int16) keykind);
-	bs->inslot->tts_isnull[3] = false;
+	bs->inslot->tts_values[3] = key;
+	bs->inslot->tts_isnull[3] = (keykind != LION_KEY_REAL);
 	ExecStoreVirtualTuple(bs->inslot);
 
 	tuplesort_puttupleslot(bs->sortstate, bs->inslot);
@@ -696,189 +952,60 @@ lion_build_callback(Relation index, ItemPointer tid, Datum *values,
 }
 
 /*
- * One distinct key of the hash value pass 1 is currently looking at.
- */
-typedef struct LionKeyStat
-{
-	Datum		key;
-	int			keykind;		/* LION_KEY_* */
-	Size		keysize;		/* bytes lion_store_key() would write */
-	int64		nmembers;		/* TIDs seen for this key */
-} LionKeyStat;
-
-/*
- * Bytes the entry tuple of a key with nmembers members is expected to take up
- * on its bucket page, its line pointer included.
+ * The one pass over the sorted data: group by (kind, key) and write out the
+ * posting sets, which come out in exactly the directory order of DESIGN.md
+ * §21 because that is what the sort keys are.
  *
- * Pass 1 does not group the codes by container key, so the posting set is
- * estimated from the member count alone: a member costs LION_SPARSE_PAIR_SIZE
- * bytes while its container key stays sparse (DESIGN.md §13), and from
- * LION_SPARSE_THRESHOLD members on the key is assumed to gather them into
- * ARRAY containers, which cost two bytes per member plus one header.  Both
- * halves are rough - what a posting set really costs depends on how its TIDs
- * spread over the heap - but they have the right order of magnitude at both
- * extremes (one row per key, one key for the whole table), which is all the
- * bucket count needs.  A posting set that outgrows inline_limit spills onto
- * container pages and leaves only the entry header behind, so the estimate is
- * capped there.
- */
-static Size
-lion_build_entry_bytes(Size keysize, int64 nmembers, uint32 inline_limit)
-{
-	Size		payload;
-
-	Assert(nmembers >= 0);
-
-	if (nmembers < LION_SPARSE_THRESHOLD)
-		payload = (Size) nmembers * LION_SPARSE_PAIR_SIZE;
-	else
-		payload = LION_CONTAINER_HDRSZ + (Size) nmembers * sizeof(uint16);
-
-	payload = Min(payload, (Size) inline_limit);
-
-	return MAXALIGN(MAXALIGN(LION_ENTRY_HDRSZ + keysize) + payload) +
-		sizeof(ItemIdData);
-}
-
-/*
- * Pass 1: count distinct keys in the sorted input and add up the bytes their
- * entry tuples are expected to need.  *totalbytes receives the sum; the
- * return value is the number of distinct keys (the NULL key counts as one).
- */
-static int64
-lion_build_scan_keys(LionBuildState *bs, Size *totalbytes)
-{
-	int64		ndistinct = 0;
-	int32		curhash = 0;
-	bool		havehash = false;
-	LionKeyStat *keys = NULL;
-	int			nkeys = 0;
-	int			maxkeys = 8;
-	int			i;
-	MemoryContext oldctx;
-
-	*totalbytes = 0;
-	keys = (LionKeyStat *) MemoryContextAlloc(bs->buildctx,
-											 sizeof(LionKeyStat) * maxkeys);
-
-	while (tuplesort_gettupleslot(bs->sortstate, true, false, bs->outslot, NULL))
-	{
-		bool		isnull;
-		int32		hash;
-		Datum		key;
-		int			keykind;
-		LionKeyStat *stat = NULL;
-
-		hash = DatumGetInt32(slot_getattr(bs->outslot, 1, &isnull));
-		key = slot_getattr(bs->outslot, 2, &isnull);
-		keykind = (int) DatumGetInt16(slot_getattr(bs->outslot, 4, &isnull));
-
-		if (!havehash || hash != curhash)
-		{
-			/* The hash group is complete: charge for its keys. */
-			for (i = 0; i < nkeys; i++)
-				*totalbytes += lion_build_entry_bytes(keys[i].keysize,
-													 keys[i].nmembers,
-													 bs->inline_limit);
-			MemoryContextReset(bs->tmpctx);
-			curhash = hash;
-			havehash = true;
-			nkeys = 0;
-		}
-
-		for (i = 0; i < nkeys; i++)
-		{
-			if (keys[i].keykind != keykind)
-				continue;
-			if (keykind != LION_KEY_REAL ||
-				lion_keys_equal(&bs->state, keys[i].key, key))
-			{
-				stat = &keys[i];
-				break;
-			}
-		}
-
-		if (stat == NULL)
-		{
-			if (nkeys >= maxkeys)
-			{
-				oldctx = MemoryContextSwitchTo(bs->buildctx);
-				maxkeys *= 2;
-				keys = (LionKeyStat *) repalloc(keys,
-											   sizeof(LionKeyStat) * maxkeys);
-				MemoryContextSwitchTo(oldctx);
-			}
-			stat = &keys[nkeys++];
-			stat->keykind = keykind;
-			stat->nmembers = 0;
-			if (keykind != LION_KEY_REAL)
-			{
-				stat->key = (Datum) 0;
-				stat->keysize = 0;
-			}
-			else
-			{
-				oldctx = MemoryContextSwitchTo(bs->tmpctx);
-				stat->key = datumCopy(key, bs->state.typbyval,
-									  bs->state.typlen);
-				MemoryContextSwitchTo(oldctx);
-				stat->keysize = lion_key_datum_size(&bs->state, stat->key);
-			}
-			ndistinct++;
-		}
-
-		stat->nmembers++;
-
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	for (i = 0; i < nkeys; i++)
-		*totalbytes += lion_build_entry_bytes(keys[i].keysize,
-											 keys[i].nmembers,
-											 bs->inline_limit);
-
-	MemoryContextReset(bs->tmpctx);
-	pfree(keys);
-
-	return ndistinct;
-}
-
-/*
- * Pass 2: group by key and write out the posting sets.
+ * With an ordering the group boundary is "the key changed", and since equal
+ * keys sort together there is at most one open builder.  Without one the sort
+ * can only bring equal HASHES together, so a hash run may interleave several
+ * distinct keys and each gets a builder of its own, flushed in the order they
+ * were created - which is the order of their stored bytes, and therefore the
+ * directory order again.
  */
 static void
 lion_build_write_entries(LionBuildState *bs)
 {
-	int32		curhash = 0;
-	bool		havehash = false;
+	uint32		curhash = 0;
+	int			curkind = -1;
+	bool		havegroup = false;
 	MemoryContext oldctx;
-
-	tuplesort_rescan(bs->sortstate);
 
 	oldctx = MemoryContextSwitchTo(bs->tmpctx);
 
 	while (tuplesort_gettupleslot(bs->sortstate, true, false, bs->outslot, NULL))
 	{
 		bool		isnull;
-		int32		hash;
+		uint32		hash;
 		Datum		key;
 		uint64		code;
 		int			keykind;
 		LionBuilder *b = NULL;
+		bool		boundary;
 		int			i;
 
-		hash = DatumGetInt32(slot_getattr(bs->outslot, 1, &isnull));
-		key = slot_getattr(bs->outslot, 2, &isnull);
+		keykind = (int) DatumGetInt32(slot_getattr(bs->outslot, 1, &isnull));
+		hash = (uint32) DatumGetInt64(slot_getattr(bs->outslot, 2, &isnull));
 		code = (uint64) DatumGetInt64(slot_getattr(bs->outslot, 3, &isnull));
-		keykind = (int) DatumGetInt16(slot_getattr(bs->outslot, 4, &isnull));
+		key = slot_getattr(bs->outslot, 4, &isnull);
 
-		if (!havehash || hash != curhash)
+		if (!havegroup)
+			boundary = false;
+		else if (keykind != curkind)
+			boundary = true;
+		else if (bs->state.ordered && keykind == LION_KEY_REAL)
+			boundary = !lion_keys_equal(&bs->state, bs->builders[0]->key, key);
+		else
+			boundary = (hash != curhash);
+
+		if (boundary)
 		{
 			lion_flush_builders(bs);
 			MemoryContextReset(bs->tmpctx);
-			curhash = hash;
-			havehash = true;
 		}
+		curhash = hash;
+		curkind = keykind;
+		havegroup = true;
 
 		/* Group by the kind first, then by key (DESIGN.md §14 and §17). */
 		for (i = 0; i < bs->nbuilders; i++)
@@ -893,7 +1020,7 @@ lion_build_write_entries(LionBuildState *bs)
 			}
 		}
 		if (b == NULL)
-			b = lion_builder_create(bs, key, keykind, (uint32) hash);
+			b = lion_builder_create(bs, key, keykind, hash);
 
 		lion_builder_add(bs, b, code);
 
@@ -912,14 +1039,14 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	LionBuildState bs;
 	LionOptions *opts = (LionOptions *) index->rd_options;
 	LionMetaPageData meta;
-	AttrNumber	attNums[2];
-	Oid			sortOperators[2];
-	Oid			sortCollations[2];
-	bool		nullsFirstFlags[2];
-	int64		ndistinct;
-	Size		entrybytes;
+	AttrNumber	attNums[4];
+	Oid			sortOperators[4];
+	Oid			sortCollations[4];
+	bool		nullsFirstFlags[4];
+	int			nsortkeys;
 	double		reltuples;
 	Form_pg_attribute keyatt;
+	BulkWriteBuffer metabuf;
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
@@ -929,7 +1056,23 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.index = index;
 	bs.indtuples = 0;
 	bs.inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
+	bs.fillfactor = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
 	bs.max_entries = lion_max_entries(index);
+	bs.root = InvalidBlockNumber;
+	bs.height = 0;
+
+	/*
+	 * How full a directory page is packed (DESIGN.md §21).  A LEAF needs no
+	 * floor: lion_build_level_add() accepts the FIRST item of a page whatever
+	 * the budget says, and one entry plus the high key a split would give it
+	 * always fits a page by construction (LION_MAX_ENTRY_SIZE).  An INTERNAL
+	 * page keeps its own fill - `fillfactor` is about leaving room for later
+	 * inserts into the leaves - and a floor of two downlinks, without which a
+	 * low fillfactor makes every level as large as the one below and the build
+	 * never reaches a root.
+	 */
+	bs.leafbudget = Max(LION_PAGE_CAPACITY * (Size) bs.fillfactor / 100, 1);
+	bs.dirbudget = LION_PAGE_CAPACITY * (Size) LION_NONLEAF_FILLFACTOR / 100;
 
 	bs.buildctx = AllocSetContextCreate(CurrentMemoryContext,
 										"lion index build",
@@ -940,7 +1083,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	/*
 	 * The meta page does not exist yet, so build the relation state from the
-	 * options directly.  nbuckets is filled in once the data has been seen.
+	 * options directly.  The root is filled in once the tree has been built.
 	 */
 	memset(&meta, 0, sizeof(meta));
 	meta.magic = LION_MAGIC;
@@ -948,6 +1091,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	meta.offset_bits = LION_OFFSET_BITS;
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = bs.inline_limit;
+	meta.root = InvalidBlockNumber;
 	lion_fill_state(index, &bs.state, &meta, bs.buildctx);
 	bs.multikey = bs.state.multikey;
 
@@ -957,38 +1101,100 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.nbuilders = 0;
 
 	/*
-	 * Sort tuple: (hash int4, key, code int8, kind int2), sorted by hash then
-	 * code.  The key column's type is the index's own, which core resolved
-	 * from the opclass: the element type for a multi-key class (DESIGN.md
-	 * §17), so one heap row's several keys sort as the values they are.  The
-	 * kind column is not a sort key - it is a function of the key being NULL
-	 * - but the two reserved kinds share that state and have to be told apart
-	 * when the passes group.
+	 * Sort tuple: (kind int4, hash int8, code int8, key), sorted into the
+	 * DIRECTORY order of DESIGN.md §21 so that the entries come out ready to
+	 * be written left to right.
+	 *
+	 * The order the directory wants is (kind, key, hash) with NULL < EMPTY <
+	 * value, and the sort keys below say that WITHOUT putting `kind` first:
+	 *
+	 *	ordered	  (key ASC NULLS FIRST, code).  A reserved entry has no key at
+	 *			  all, so its NULL sorts before every value, and a real key is
+	 *			  never NULL.  The HASH is not a sort key here: the directory
+	 *			  order only consults it when the comparison TIES, and two keys
+	 *			  the comparison calls equal are one entry, so there is nothing
+	 *			  left to order.
+	 *	otherwise (hash, code) - all a type with no btree opclass offers.  The
+	 *			  reserved entries hash to 0, which is the minimum, so leading
+	 *			  with the hash gives the same sequence as leading with the
+	 *			  kind.
+	 *	either	  plus `kind`, but ONLY for a multi-key opclass, which is the
+	 *			  only kind that has an EMPTY entry to tell from the NULL one
+	 *			  (both have no key and hash 0).
+	 *
+	 * Why it matters which one leads: tuplesort compares the LEADING key from
+	 * a datum it precomputed at put time and every further key by fetching
+	 * the attribute out of the tuple.  A leading `kind` is the same value for
+	 * every real row, so every comparison would fall through to a fetch -
+	 * measured at 1.43 s of sort against 0.15 s for one million keys.  The
+	 * three fetched columns are therefore also the fixed-width ones, first in
+	 * the descriptor, so that their offsets are cached.
+	 *
+	 * The hash goes in as int8, zero-extended.  It is a uint32 and the
+	 * directory compares it as one (lion_cmp_prefix()), so sorting it as int4
+	 * would put everything above 2^31 first and the build would lay the
+	 * entries out in an order the search does not agree with - which is
+	 * exactly what an index whose key type has no btree opclass, and whose
+	 * order is therefore (kind, hash, bytes), is made of.
+	 *
+	 * The key column's type is the index's own, which core resolved from the
+	 * opclass: the element type for a multi-key class (DESIGN.md §17), so one
+	 * heap row's several keys sort as the values they are.
 	 */
 	keyatt = TupleDescAttr(RelationGetDescr(index), 0);
 	bs.sorttupdesc = CreateTemplateTupleDesc(4);
-	TupleDescInitEntry(bs.sorttupdesc, 1, "hash", INT4OID, -1, 0);
-	TupleDescInitEntry(bs.sorttupdesc, 2, "key", keyatt->atttypid,
-					   keyatt->atttypmod, 0);
+	TupleDescInitEntry(bs.sorttupdesc, 1, "kind", INT4OID, -1, 0);
+	TupleDescInitEntry(bs.sorttupdesc, 2, "hash", INT8OID, -1, 0);
 	TupleDescInitEntry(bs.sorttupdesc, 3, "code", INT8OID, -1, 0);
-	TupleDescInitEntry(bs.sorttupdesc, 4, "kind", INT2OID, -1, 0);
-	TupleDescInitEntryCollation(bs.sorttupdesc, 2, bs.state.collation);
+	TupleDescInitEntry(bs.sorttupdesc, 4, "key", keyatt->atttypid,
+					   keyatt->atttypmod, 0);
+	TupleDescInitEntryCollation(bs.sorttupdesc, 4, bs.state.collation);
 	TupleDescFinalize(bs.sorttupdesc);
 
-	attNums[0] = 1;
-	sortOperators[0] = Int4LessOperator;
-	sortCollations[0] = InvalidOid;
-	nullsFirstFlags[0] = false;
-	attNums[1] = 3;
-	sortOperators[1] = Int8LessOperator;
-	sortCollations[1] = InvalidOid;
-	nullsFirstFlags[1] = false;
+	nsortkeys = 0;
+	if (bs.state.ordered)
+	{
+		attNums[nsortkeys] = 4; /* key, NULLS FIRST: the reserved kinds */
+		sortOperators[nsortkeys] = bs.state.ltopr;
+		sortCollations[nsortkeys] = bs.state.collation;
+		nullsFirstFlags[nsortkeys++] = true;
+	}
+	else
+	{
+		attNums[nsortkeys] = 2; /* hash: the reserved kinds hash to 0 */
+		sortOperators[nsortkeys] = Int8LessOperator;
+		sortCollations[nsortkeys] = InvalidOid;
+		nullsFirstFlags[nsortkeys++] = false;
+	}
+	if (bs.multikey || !bs.state.ordered)
+	{
+		/*
+		 * `kind` separates the reserved entries from each other and from the
+		 * real keys that share their hash.  A multi-key class needs it because
+		 * it has an EMPTY entry as well as a NULL one and neither has a key.
+		 * An UNORDERED class needs it because its leading sort key is the
+		 * hash: the reserved entries hash to LION_NULLKEY_HASH, and a real key
+		 * that hashes there too would otherwise interleave with them, code by
+		 * code, and the grouping pass - which starts a new entry whenever the
+		 * kind changes - would write several entries for one reserved kind.
+		 * It goes AFTER the hash, which is the same sequence: the reserved
+		 * entries' hash is the minimum, so they still come first.
+		 */
+		attNums[nsortkeys] = 1;
+		sortOperators[nsortkeys] = Int4LessOperator;
+		sortCollations[nsortkeys] = InvalidOid;
+		nullsFirstFlags[nsortkeys++] = false;
+	}
+	attNums[nsortkeys] = 3;		/* code */
+	sortOperators[nsortkeys] = Int8LessOperator;
+	sortCollations[nsortkeys] = InvalidOid;
+	nullsFirstFlags[nsortkeys++] = false;
 
-	bs.sortstate = tuplesort_begin_heap(bs.sorttupdesc, 2, attNums,
+	bs.sortstate = tuplesort_begin_heap(bs.sorttupdesc, nsortkeys, attNums,
 										sortOperators, sortCollations,
 										nullsFirstFlags,
 										maintenance_work_mem, NULL,
-										TUPLESORT_RANDOMACCESS);
+										TUPLESORT_NONE);
 
 	bs.inslot = MakeSingleTupleTableSlot(bs.sorttupdesc, &TTSOpsVirtual);
 	bs.outslot = MakeSingleTupleTableSlot(bs.sorttupdesc, &TTSOpsMinimalTuple);
@@ -997,64 +1203,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 									   lion_build_callback, (void *) &bs, NULL);
 
 	tuplesort_performsort(bs.sortstate);
-
-	ndistinct = lion_build_scan_keys(&bs, &entrybytes);
-
-	if (opts && opts->buckets > 0)
-		bs.nbuckets = lion_clamp_buckets(opts->buckets);
-	else
-	{
-		/*
-		 * Auto-size by BYTES, not by key count (DESIGN.md §5).  Every bucket
-		 * owns a head page whether or not it needs one, so what the count has
-		 * to track is how many pages the entries want: aim at three quarters
-		 * of a page per bucket, which leaves the fuller-than-average buckets
-		 * room to grow inside their head page and does not spend a page on
-		 * every handful of keys.  Never fewer than LION_DEFAULT_BUCKETS,
-		 * because an index is very often built on an empty table and filled
-		 * afterwards, and a single bucket would make every later insert scan
-		 * the whole entry list.
-		 */
-		double		bytes = (double) entrybytes;
-		int64		want;
-
-		/*
-		 * The heap may already be known to hold more rows than this build put
-		 * in the index, and the directory is sized once and never resized
-		 * (DESIGN.md §5), so scale the estimate up by what pg_class.reltuples
-		 * says.  Only ever up, and only for an index over the whole table: a
-		 * partial index holds the rows its predicate selects, and sizing that
-		 * for the whole heap would spend pages on buckets that stay empty.
-		 * reltuples is -1 when nothing has analysed the heap yet, and an index
-		 * built on an empty table therefore still gets the floor above - which
-		 * is exactly the case the `buckets` reloption is for.
-		 */
-		if (bs.indtuples > 0 && indexInfo->ii_Predicate == NIL &&
-			heap->rd_rel->reltuples > bs.indtuples)
-		{
-			bytes *= (double) heap->rd_rel->reltuples / bs.indtuples;
-			elog(DEBUG1, "lion index \"%s\": heap has %.0f rows against %.0f indexed; sizing for %.0f entry bytes",
-				 RelationGetRelationName(index), (double) heap->rd_rel->reltuples,
-				 bs.indtuples, bytes);
-		}
-
-		want = (int64) ((bytes + LION_BUCKET_FILL_BYTES - 1) /
-						LION_BUCKET_FILL_BYTES);
-
-		bs.nbuckets = lion_clamp_buckets(Max(want, (int64) LION_DEFAULT_BUCKETS));
-	}
-	bs.state.meta.nbuckets = bs.nbuckets;
-
-	elog(DEBUG1, "lion index \"%s\": " INT64_FORMAT " distinct keys, %zu entry bytes, %u buckets",
-		 RelationGetRelationName(index), ndistinct, entrybytes, bs.nbuckets);
-
-	/*
-	 * Cardinality guard (DESIGN.md §17).  At build time the count is exact -
-	 * pass 1 has just counted the distinct keys - so the warning is too.  It
-	 * is only a warning: the index is built either way.
-	 */
-	if (bs.max_entries > 0 && ndistinct > (int64) bs.max_entries)
-		lion_warn_max_entries(index, ndistinct);
 
 	/*
 	 * Everything below writes pages, and all of it goes through one bulk
@@ -1073,12 +1221,30 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		MemoryContextSwitchTo(oldctx);
 	}
 	lion_build_init_pages(&bs);
+	bs.leaf = lion_build_level(&bs, 0);
 	lion_build_write_entries(&bs);
-	lion_build_flush_buckets(&bs);
+	lion_build_finish_dir(&bs);
+
+	Assert(BlockNumberIsValid(bs.root));
+	metabuf = smgr_bulk_get_buf(bs.bulk);
+	lion_init_metapage((Page) metabuf->data, bs.inline_limit, bs.root,
+					  bs.height, (uint32) bs.ndirpages);
+	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
+
 	smgr_bulk_finish(bs.bulk);
 
-	elog(DEBUG1, "lion index \"%s\": %u blocks, " INT64_FORMAT " bucket pages",
-		 RelationGetRelationName(index), bs.nblocks, bs.nbucketpages);
+	elog(DEBUG1, "lion index \"%s\": " INT64_FORMAT " entries, %u blocks, "
+		 INT64_FORMAT " directory pages, height %u, fillfactor %d",
+		 RelationGetRelationName(index), bs.ndistinct, bs.nblocks,
+		 bs.ndirpages, bs.height, bs.fillfactor);
+
+	/*
+	 * Cardinality guard (DESIGN.md §17).  At build time the count is exact -
+	 * the pass above grouped the keys - so the warning is too.  It is only a
+	 * warning: the index is built either way.
+	 */
+	if (bs.max_entries > 0 && bs.ndistinct > (int64) bs.max_entries)
+		lion_warn_max_entries(index, bs.ndistinct);
 
 	tuplesort_end(bs.sortstate);
 	ExecDropSingleTupleTableSlot(bs.inslot);

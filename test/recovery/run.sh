@@ -563,6 +563,123 @@ phase1b() {
 	SUMMARY+=("phase1b            crash between the two steps; sweep recovered $freed pages")
 }
 
+# ------------------------------------------------------------- phase 1c
+
+# A crash that lands exactly between the two records of a DIRECTORY SPLIT
+# (DESIGN.md §21): the leaf has been split and flagged LION_PAGE_INCOMPLETE_
+# SPLIT, its right sibling exists and is linked in, but the parent has no
+# downlink for it yet, and the server dies.  Readers never noticed (the right
+# link gets them there), and the first writer that descends to that page
+# finishes the split before touching it.
+#
+# The crash point is deterministic: an injection point parks the inserting
+# backend in that window and the server is pulled out from under it.
+phase1c() {
+	local off before after warn parked
+	log ""
+	log "=== phase 1c: a crash between a directory split and its downlink ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ log "phase 1c skipped: this server has no injection_points extension"
+		  SUMMARY+=("phase1c            skipped (no injection points)"); return 0; }
+
+	# A table whose index is created EMPTY and grown by inserts, so that the
+	# splits really happen through aminsert and not through ambuild.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1c: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_split;
+		CREATE TABLE lion_split (id int, k text NOT NULL);
+		CREATE INDEX lion_split_k ON lion_split USING lion (k);
+		INSERT INTO lion_split SELECT i, 'k' || lpad(i::text, 40, '0')
+			FROM generate_series(1, 4000) i;
+	SQL
+	psql_p -c "VACUUM (ANALYZE) lion_split" >>"$RUNLOG" 2>&1
+	before=$(psql_p -tAc "select leaf_pages from lion_index_stats('lion_split_k')")
+	[ "${before:-0}" -gt 1 ] ||
+		die "phase 1c: the fixture did not split the directory at all"
+
+	psql_p -c "SELECT injection_points_attach('lion-dir-split-incomplete', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1c: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "SET synchronous_commit = on;
+		    INSERT INTO lion_split SELECT 100000 + i, 'k' || lpad((100000 + i)::text, 40, '0')
+		      FROM generate_series(1, 4000) i" >>"$RUNLOG" 2>&1 &
+	parked=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-dir-split-incomplete'" \
+		60 "an insert to park between the split and its downlink"
+
+	# The split's record has been inserted but not flushed, and the crash would
+	# otherwise simply lose it (and with it the whole split, which would test
+	# nothing).  A COMMIT from another session with synchronous_commit = on
+	# flushes the WAL stream up to its own commit LSN, which is past the split
+	# record.  A CHECKPOINT would be the obvious way and is NOT usable here:
+	# the parked backend holds the leaf's content lock EXCLUSIVE and the
+	# checkpointer would block writing that very buffer.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE IF NOT EXISTS lion_split_flush (i int);
+		INSERT INTO lion_split_flush VALUES (1);
+	SQL
+
+	crash_immediate
+	wait "$parked" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
+		grep -q "database system was not properly shut down" ||
+		die "phase 1c: the restart did not report an unclean shutdown"
+
+	# The page really came back flagged: verify() says so, as a WARNING and
+	# not an error, and the index still answers correctly through the right
+	# link that makes an unfinished split invisible to readers.
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_split_k')" 2>&1 >>"$RUNLOG" |
+		grep -c 'unfinished split' || true)
+	[ "$warn" -gt 0 ] ||
+		die "phase 1c: no page came back with an unfinished split, so the crash missed the window"
+	log "phase 1c: $warn page(s) came back with an unfinished split"
+	run_check "phase 1c post-crash" psql_p \
+		"select (select count(*) from lion_split where k = 'k' || lpad('1', 40, '0')) = 1,
+				'the first key still answers'
+		 union all
+		 select (select count(*) from lion_split where k = 'k' || lpad('4000', 40, '0')) = 1,
+				'the last committed key still answers'"
+
+	# A WRITER's descent is what repairs it.  One insert is enough: the
+	# descent that lands on the flagged page finishes its split first.
+	psql_p -c "SET synchronous_commit = on;
+	           INSERT INTO lion_split SELECT 900000 + i, 'k' || lpad((900000 + i)::text, 40, '0')
+	             FROM generate_series(1, 400) i" >>"$RUNLOG" 2>&1 ||
+		die "phase 1c: the repairing insert failed"
+
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_split_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unfinished split' || true)
+	[ "$warn" = 0 ] ||
+		die "phase 1c: $warn page(s) still have an unfinished split after a writer descended"
+
+	after=$(psql_p -tAc "select leaf_pages from lion_index_stats('lion_split_k')")
+	run_check "phase 1c repaired" psql_p \
+		"select (select count(*) from lion_split where k = 'k' || lpad('900001', 40, '0')) = 1,
+				'the repairing insert is indexed'
+		 union all
+		 select (select count(*) from lion_split) = (select count(*) from lion_split where k like 'k%'),
+				'every row is still reachable through the index'"
+
+	psql_p -c "SELECT injection_points_detach('lion-dir-split-incomplete')" \
+		>>"$RUNLOG" 2>&1 || true
+	psql_p -c "DROP TABLE lion_split" >>"$RUNLOG" 2>&1
+	psql_p -c "DROP TABLE IF EXISTS lion_split_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1c: the unfinished split survived the crash and a writer's descent repaired it ($before -> $after leaves)"
+	SUMMARY+=("phase1c            crash between split and downlink; repaired on the next descent")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -882,13 +999,14 @@ psql_p -c "VACUUM (ANALYZE, INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
 # recovery_evidence() can read it.
 psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
 log "-- index shapes after the load and before any crash"
-psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, sparse_segments, container_pages, bucket_pages, null_tids, empty_tids from lion_rec_indexes(), lion_index_stats(idx::regclass)" |
+psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, sparse_segments, container_pages, leaf_pages, internal_pages, null_tids, empty_tids from lion_rec_indexes(), lion_index_stats(idx::regclass)" |
 	tee -a "$RUNLOG"
 run_check "baseline" psql_p "select * from lion_rec_check(true, true)"
 log "-- baseline: $NCHECKS checks ok"
 
 phase1
 phase1b
+phase1c
 phase2
 
 END=$(now_ms)

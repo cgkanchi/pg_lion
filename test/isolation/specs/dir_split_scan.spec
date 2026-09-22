@@ -1,0 +1,1 @@
+../dir_split_scan.spec

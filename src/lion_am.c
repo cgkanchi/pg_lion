@@ -58,7 +58,8 @@ static relopt_kind lion_relopt_kind;
 static const relopt_parse_elt lion_relopt_tab[] = {
 	{"buckets", RELOPT_TYPE_INT, offsetof(LionOptions, buckets)},
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
-	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)}
+	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)},
+	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)}
 };
 
 /*
@@ -76,9 +77,19 @@ _PG_init(void)
 {
 	lion_relopt_kind = add_reloption_kind();
 
+	/*
+	 * `buckets` is accepted and ignored since format 4 (DESIGN.md §21): the
+	 * hash directory it sized is gone, and refusing the option outright would
+	 * break every CREATE INDEX script that sets it.  lionoptions() says so
+	 * once, when the option is being set rather than merely read back.
+	 */
 	add_int_reloption(lion_relopt_kind, "buckets",
-					  "Number of hash buckets (0 selects it from the data)",
-					  0, 0, LION_MAX_BUCKETS,
+					  "Ignored since format 4; the entry directory is a B-tree",
+					  0, 0, 65536,
+					  AccessExclusiveLock);
+	add_int_reloption(lion_relopt_kind, "fillfactor",
+					  "Percentage of a directory leaf ambuild fills",
+					  LION_DEFAULT_FILLFACTOR, LION_MIN_FILLFACTOR, 100,
 					  AccessExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "inline_limit",
 					  "Maximum size in bytes of a posting set kept inside its entry tuple",
@@ -184,11 +195,27 @@ lion_handler(PG_FUNCTION_ARGS)
 bytea *
 lionoptions(Datum reloptions, bool validate)
 {
-	return (bytea *) build_reloptions(reloptions, validate,
-									  lion_relopt_kind,
-									  sizeof(LionOptions),
-									  lion_relopt_tab,
-									  lengthof(lion_relopt_tab));
+	LionOptions *opts;
+
+	opts = (LionOptions *) build_reloptions(reloptions, validate,
+											lion_relopt_kind,
+											sizeof(LionOptions),
+											lion_relopt_tab,
+											lengthof(lion_relopt_tab));
+
+	/*
+	 * DESIGN.md §21: the hash directory `buckets` sized no longer exists.  The
+	 * option is still parsed so that existing DDL keeps working, and setting
+	 * it to anything says so.  validate is true only when the option is being
+	 * set, not when the relcache reads it back.
+	 */
+	if (validate && opts != NULL && opts->buckets > 0)
+		ereport(NOTICE,
+				(errmsg("buckets is ignored since format 4"),
+				 errdetail("The entry directory is a B-tree keyed by the index key; it grows by splitting."),
+				 errhint("Use fillfactor to control how full ambuild packs its leaves.")));
+
+	return (bytea *) opts;
 }
 
 /*
@@ -592,7 +619,13 @@ lionvalidate(Oid opclassoid)
 		Form_pg_amproc procform = (Form_pg_amproc) GETSTRUCT(proctup);
 		bool		ok;
 
-		if (procform->amproclefttype != procform->amprocrighttype)
+		/*
+		 * Only the ordering function of DESIGN.md §21 may be cross-type: it is
+		 * what lets a search for an int8 value descend a directory of int4
+		 * keys, exactly as btree's own comparison functions do.
+		 */
+		if (procform->amproclefttype != procform->amprocrighttype &&
+			procform->amprocnum != LION_CMP_PROC)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -612,6 +645,24 @@ lionvalidate(Oid opclassoid)
 					ok = check_amproc_signature(procform->amproc, INT4OID,
 												false, 1, 1,
 												procform->amproclefttype);
+				break;
+			case LION_CMP_PROC:
+				/*
+				 * The ordering of DESIGN.md §21: a btree comparison of the KEY
+				 * type, which for a multi-key class is the STORAGE type.  It
+				 * is optional - an index whose key type has no btree opclass
+				 * is simply not ordered - and may be cross-type, for the
+				 * families that offer cross-type equality.
+				 */
+				if (multikey)
+					ok = check_amproc_signature(procform->amproc, INT4OID,
+												true, 2, 2, opckeytype,
+												opckeytype);
+				else
+					ok = check_amproc_signature(procform->amproc, INT4OID,
+												true, 2, 2,
+												procform->amproclefttype,
+												procform->amprocrighttype);
 				break;
 			case LION_EXTRACTVALUE_PROC:
 				/* GIN's extractValue; some opclasses omit nullFlags */
@@ -646,7 +697,8 @@ lionvalidate(Oid opclassoid)
 		 * never stored.  Only the opclass's own type pair can be judged here,
 		 * for the same reason ginvalidate() gives.
 		 */
-		if (procform->amprocnum != LION_HASH_PROC && !multikey &&
+		if (procform->amprocnum != LION_HASH_PROC &&
+			procform->amprocnum != LION_CMP_PROC && !multikey &&
 			procform->amproclefttype == opcintype)
 		{
 			ereport(INFO,
@@ -847,39 +899,30 @@ void
 lionbuildempty(Relation index)
 {
 	LionOptions *opts = (LionOptions *) index->rd_options;
-	uint32		nbuckets;
 	uint32		inline_limit;
-	uint32		b;
 	Buffer		buf;
 
-	nbuckets = lion_clamp_buckets((opts && opts->buckets > 0) ?
-								 opts->buckets : LION_DEFAULT_BUCKETS);
 	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
 
-	/* Meta page */
+	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
 	Assert(BufferGetBlockNumber(buf) == LION_METAPAGE_BLKNO);
 	START_CRIT_SECTION();
-	lion_init_metapage(BufferGetPage(buf), nbuckets, inline_limit);
+	lion_init_metapage(BufferGetPage(buf), inline_limit, LION_FIRST_BLKNO,
+					  0, 1);
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
 
-	/* Bucket head pages */
-	for (b = 0; b < nbuckets; b++)
-	{
-		buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
-								EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
-		Assert(BufferGetBlockNumber(buf) == LION_BUCKET_BLKNO(b));
-		START_CRIT_SECTION();
-		lion_init_page(BufferGetPage(buf), LION_PAGE_BUCKET);
-		MarkBufferDirty(buf);
-		log_newpage_buffer(buf, true);
-		END_CRIT_SECTION();
-		UnlockReleaseBuffer(buf);
-
-		CHECK_FOR_INTERRUPTS();
-	}
+	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
+							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+	Assert(BufferGetBlockNumber(buf) == LION_FIRST_BLKNO);
+	START_CRIT_SECTION();
+	lion_init_page(BufferGetPage(buf), LION_PAGE_BUCKET | LION_PAGE_ROOT);
+	MarkBufferDirty(buf);
+	log_newpage_buffer(buf, true);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
 }

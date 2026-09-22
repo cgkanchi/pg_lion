@@ -340,7 +340,7 @@ SELECT lion_sp_ccmp('sp_thr_k', 'sp_thr', 'k', '1');
  */
 CREATE TABLE sp_wide (i int4, k int4 NOT NULL, pad text);
 ALTER TABLE sp_wide ALTER COLUMN pad SET STORAGE PLAIN;
-CREATE INDEX sp_wide_k ON sp_wide USING lion (k) WITH (buckets = 4);
+CREATE INDEX sp_wide_k ON sp_wide USING lion (k);
 INSERT INTO sp_wide
 SELECT i,
 	   CASE WHEN i % 64 < 3 AND (i / 64) % 16 <> 0 THEN 1 ELSE 1000 + i END,

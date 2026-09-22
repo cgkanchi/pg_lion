@@ -76,7 +76,8 @@
 #include "lion.h"
 
 static void lion_insert_new_entry(Relation index, Relation heaprel,
-								 LionState *state, Buffer headbuf,
+								 LionState *state, Buffer *leafbuf,
+								 OffsetNumber off, bool movedright,
 								 Datum key, uint16 reservedflag, uint32 hash,
 								 uint32 ckey, uint16 lo);
 static void lion_insert_inline(Relation index, Relation heaprel,
@@ -453,13 +454,15 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 }
 
 /*
- * The key is not in the index yet: add an INLINE entry with a single
- * one-pair sparse segment.  headbuf is held EXCLUSIVE.  With isnull the entry
- * is the reserved NULL-key entry of bucket 0 (DESIGN.md §14).
+ * The key is not in the index yet: add an INLINE entry with a single one-pair
+ * sparse segment at the place the descent said it belongs (DESIGN.md §21).
+ * *leafbuf is held EXCLUSIVE and stays so, though a re-descent inside
+ * lion_dir_add_entry() may replace it with another leaf.  reservedflag makes
+ * it one of the two key-less entries of §14 and §17.
  */
 static void
 lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
-					 Buffer headbuf,
+					 Buffer *leafbuf, OffsetNumber off, bool movedright,
 					 Datum key, uint16 reservedflag, uint32 hash, uint32 ckey,
 					 uint16 lo)
 {
@@ -483,24 +486,28 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 	 * Cardinality guard (DESIGN.md §17), on the one path that can make the
 	 * index grow a key: a brand new entry.
 	 *
-	 * The estimate is deliberately crude - the entries of THIS bucket times
-	 * the bucket count - because counting the whole index would mean reading
-	 * every bucket page for every new key.  Hash values spread the keys
-	 * evenly enough for the product to have the right order of magnitude, and
-	 * an advisory warning is all it feeds.  The bucket is already locked
-	 * EXCLUSIVE by the caller, so the walk sees a consistent chain and costs
-	 * nothing but the pages the insert is about to touch anyway.
+	 * The estimate used to be "entries on this bucket's chain times the bucket
+	 * count"; with the sorted directory of §21 there is no bucket to count and
+	 * the same order-of-magnitude estimate comes from the shape of the tree
+	 * instead - the entries on THIS leaf times the number of leaves, which is
+	 * the number of blocks the index has minus its internal pages, bounded
+	 * below by one.  Both are crude by design: counting the whole index for
+	 * every new key would read every leaf, and all this feeds is a warning.
 	 */
 	if (max_entries > 0)
 	{
-		int64		nbucket = lion_bucket_nentries(index, headbuf) + 1;
-		int64		estimate = nbucket * (int64) state->meta.nbuckets;
+		Page		page = BufferGetPage(*leafbuf);
+		int64		perleaf = (int64) PageGetMaxOffsetNumber(page) + 1;
+		int64		nleaves = Max((int64) RelationGetNumberOfBlocks(index) - 1,
+								  1);
+		int64		estimate = perleaf * nleaves;
 
 		if (estimate > (int64) max_entries)
 			lion_warn_max_entries(index, estimate);
 	}
 
-	lion_add_entry(index, heaprel, headbuf, entry, size);
+	lion_dir_add_entry(index, heaprel, state, leafbuf, off, movedright, entry,
+					  size);
 
 	pfree(entry);
 }
@@ -544,26 +551,28 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		return;
 	}
 
-	if (newlen <= (Size) state->meta.inline_limit)
+	if (newlen <= (Size) state->meta.inline_limit &&
+		LionEntryPayloadOffset(entry) + newlen <= (Size) LION_MAX_ENTRY_SIZE)
 	{
 		LionEntryTuple *newentry;
 		Size		newsize;
-		bool		ok;
 
 		newentry = lion_entry_rebuild(entry, newpay, newlen, &newsize);
 		newentry->ncontainers = (uint32) ((int) ncontainers + ndelta);
 		newentry->ntids = ntids + 1;
 
-		ok = lion_replace_entry(index, NULL, entrybuf, entryoff, newentry,
-							   newsize);
+		/*
+		 * DESIGN.md §21: a grown entry that no longer fits its leaf splits the
+		 * leaf instead of spilling onto a container page, which is what the
+		 * hash directory had to do.  Note that `entry` points into the page
+		 * and is not valid after this call.
+		 */
+		lion_dir_place(index, heaprel, state, entrybuf, entryoff, true,
+					  newentry, newsize);
 		pfree(newentry);
-
-		if (ok)
-		{
-			pfree(newpay);
-			pfree(oldpay);
-			return;
-		}
+		pfree(newpay);
+		pfree(oldpay);
+		return;
 	}
 
 	/*
@@ -974,61 +983,49 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 			   uint16 reservedflag, uint32 ckey, uint16 lo)
 {
 	uint32		hash;
-	Buffer		headbuf;
-	Buffer		entrybuf;
+	LionSearchKey sk;
+	Buffer		leafbuf;
 	OffsetNumber entryoff;
+	bool		movedright;
 	bool		found;
-	int			npages = 0;
 
 	hash = (reservedflag != 0) ? LION_NULLKEY_HASH : lion_hash_key(state, key);
 
-	headbuf = ReadBuffer(index,
-						 LION_BUCKET_BLKNO(lion_bucket_of(hash,
-														state->meta.nbuckets)));
-	LockBuffer(headbuf, BUFFER_LOCK_EXCLUSIVE);
+	if (reservedflag == LION_ENTRY_NULLKEY)
+		lion_search_key_init(state, &sk, LION_KIND_NULL, (Datum) 0, hash);
+	else if (reservedflag == LION_ENTRY_EMPTYKEY)
+		lion_search_key_init(state, &sk, LION_KIND_EMPTY, (Datum) 0, hash);
+	else
+		lion_search_key_init(state, &sk, LION_KIND_VALUE, key, hash);
 
-	found = (reservedflag != 0) ?
-		lion_find_reserved_entry_counted(index, headbuf, BUFFER_LOCK_EXCLUSIVE,
-										reservedflag, &entrybuf, &entryoff,
-										&npages) :
-		lion_find_entry_counted(index, state, headbuf, BUFFER_LOCK_EXCLUSIVE,
-							   key, hash, NULL, InvalidOid, &entrybuf,
-							   &entryoff, &npages);
+	/*
+	 * One descent, with the leaf taken EXCLUSIVE, and it is held for the whole
+	 * insert: every writer of a key (inserts and VACUUM) serialises on the
+	 * leaf that holds its entry, exactly as they used to serialise on the
+	 * bucket head page (DESIGN.md §5, §21).
+	 */
+	found = lion_dir_find(index, heaprel, state, &sk, BUFFER_LOCK_EXCLUSIVE,
+						  true, &leafbuf, &entryoff, &movedright);
 
 	if (!found)
-	{
-		lion_insert_new_entry(index, heaprel, state, headbuf, key, reservedflag,
-							 hash, ckey, lo);
-	}
+		lion_insert_new_entry(index, heaprel, state, &leafbuf, entryoff,
+							 movedright, key, reservedflag, hash, ckey, lo);
 	else
 	{
 		LionEntryTuple *entry;
 
-		entry = (LionEntryTuple *) PageGetItem(BufferGetPage(entrybuf),
-											  PageGetItemId(BufferGetPage(entrybuf),
+		entry = (LionEntryTuple *) PageGetItem(BufferGetPage(leafbuf),
+											  PageGetItemId(BufferGetPage(leafbuf),
 															entryoff));
 
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
-			lion_insert_inline(index, heaprel, state, entrybuf, entryoff, ckey,
+			lion_insert_inline(index, heaprel, state, leafbuf, entryoff, ckey,
 							  lo);
 		else
-			lion_insert_chain(index, heaprel, entrybuf, entryoff, ckey, lo);
-
-		/* lion_find_entry() does not pin the head page twice. */
-		if (entrybuf != headbuf)
-			UnlockReleaseBuffer(entrybuf);
+			lion_insert_chain(index, heaprel, leafbuf, entryoff, ckey, lo);
 	}
 
-	UnlockReleaseBuffer(headbuf);
-
-	/*
-	 * The bucket directory guard (DESIGN.md §5): this insert has just walked
-	 * the chain of one bucket, and a chain that long means the index holds
-	 * several times the entry bytes its bucket count was chosen for.  Said
-	 * after the locks are gone, because ereport() can be interrupted.
-	 */
-	if (npages > LION_BUCKET_PAGES_WARN)
-		lion_warn_bucket_chain(index, npages);
+	UnlockReleaseBuffer(leafbuf);
 }
 
 /*

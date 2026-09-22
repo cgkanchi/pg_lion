@@ -121,8 +121,8 @@ SELECT lion_ins_check('cross-type values');
 SELECT lion_cmp('lion_ins', 'k = 3::int8');
 SELECT lion_cmp('lion_ins', 'k = 3::int2');
 
--- NULL keys are not indexed, and must not upset the entry that has the same
--- hash bucket.
+-- NULL keys live in a reserved entry that sorts before every value, and must
+-- not upset the entry next to it.
 INSERT INTO lion_ins VALUES (200005, NULL, NULL, NULL);
 SELECT lion_ins_check('null keys');
 SELECT count(*) FROM lion_ins WHERE k IS NULL;
@@ -131,15 +131,10 @@ SELECT count(*) FROM lion_ins WHERE k IS NULL;
  * An INLINE entry that spills.  inline_limit = 64 bytes holds four one-pair
  * sparse segments, so the first inserts of a key stay inside the entry tuple
  * and a later one moves the posting set onto container pages.
- *
- * buckets = 1 on purpose: the 97 keys inserted below then all land in the
- * same bucket, which is the only way aminsert reaches the long entry list
- * and the bucket page chain (auto-sizing gives an index built on an empty
- * table LION_DEFAULT_BUCKETS buckets, so nothing else here would).
  */
 CREATE TABLE lion_spill (i int4, k int4);
 CREATE INDEX lion_spill_k ON lion_spill USING lion (k)
-	WITH (buckets = 1, inline_limit = 64);
+	WITH (inline_limit = 64);
 INSERT INTO lion_spill VALUES (1, 1);
 -- the first TID of a key is one pair in one sparse segment (DESIGN.md 13)
 SELECT entries, inline_entries, containers, sparse_segments, sparse_members,
@@ -257,8 +252,8 @@ SELECT lion_cmp('lion_dense', 'k = 2');
  * page.  20 keys over 20000 rows put about 700 members in each container key
  * of each key: too many to stay a sparse segment, too few for a bitset, and
  * not consecutive, so every container is an ARRAY that grows two bytes at a
- * time.  inline_limit = 64 keeps the posting sets off the bucket pages, where
- * items have no slack.
+ * time.  inline_limit = 64 keeps the posting sets off the directory leaves,
+ * where items have no slack.
  */
 CREATE TABLE lion_slack (i int4, k int4);
 CREATE INDEX lion_slack_k ON lion_slack USING lion (k) WITH (inline_limit = 64);
@@ -291,42 +286,48 @@ SELECT array_containers > 0 AS has_arrays, slack_bytes AS bulk_slack_bytes
 SELECT lion_index_verify('lion_slack_b', true);
 
 /*
- * An index created empty and grown keeps the bucket count it was built with
- * (DESIGN.md section 5): 80000 distinct keys in 64 buckets make bucket chains
- * of several pages, which is what every lookup of a key has to walk.  The
- * insert path says so once per backend per index, and REINDEX sizes the
- * directory from the data that is there now.
+ * An index created empty and grown: with the sorted directory of DESIGN.md
+ * §21 that is no longer a problem to be warned about.  The tree splits as the
+ * keys arrive, so 80000 of them give it a height and a few hundred leaves,
+ * and a lookup costs one descent whatever the index was built from.  What a
+ * REINDEX buys is a shallower, denser tree, not a working one.
  */
 CREATE TABLE lion_grow (i int4, k int4);
 CREATE INDEX lion_grow_k ON lion_grow USING lion (k);
-SELECT nbuckets, max_bucket_pages FROM lion_index_stats('lion_grow_k');
+SELECT directory_height, leaf_pages, internal_pages, entries
+  FROM lion_index_stats('lion_grow_k');
 INSERT INTO lion_grow SELECT i, i FROM generate_series(1, 80000) i;
-SELECT nbuckets, max_bucket_pages > 4 AS outgrown
+SELECT directory_height > 0 AS grew_a_height, leaf_pages > 100 AS many_leaves,
+	   entries = 80000 AS all_keys
   FROM lion_index_stats('lion_grow_k');
 SELECT lion_index_verify('lion_grow_k', true);
 SELECT lion_cmp('lion_grow', 'k = 12345');
 CREATE TEMP TABLE lion_grow_before AS
-	SELECT nbuckets, max_bucket_pages FROM lion_index_stats('lion_grow_k');
+	SELECT directory_height, leaf_pages FROM lion_index_stats('lion_grow_k');
 REINDEX INDEX lion_grow_k;
-SELECT (SELECT nbuckets FROM lion_index_stats('lion_grow_k')) >
-	   (SELECT nbuckets FROM lion_grow_before) AS directory_grew,
-	   (SELECT max_bucket_pages FROM lion_index_stats('lion_grow_k')) <
-	   (SELECT max_bucket_pages FROM lion_grow_before) AS chains_shortened;
+/*
+ * Ascending keys fill their leaves COMPLETELY - a split of the rightmost page
+ * puts only the new key on the right one (DESIGN.md §21) - so a rebuild at
+ * the default fillfactor of 90 comes out slightly BIGGER, not smaller.  Both
+ * are within a few percent of the bytes the entries need, which is the thing
+ * the hash directory could not manage.
+ */
+SELECT (SELECT leaf_pages FROM lion_index_stats('lion_grow_k')) <
+	   (SELECT leaf_pages * 5 / 4 FROM lion_grow_before) AS rebuild_is_about_the_same,
+	   (SELECT entries FROM lion_index_stats('lion_grow_k')) = 80000 AS all_keys;
 SELECT lion_index_verify('lion_grow_k', true);
 SELECT lion_cmp('lion_grow', 'k = 12345');
--- An explicit bucket count is never warned about: it is what its owner asked
--- for (lion_spill_k above has buckets = 1 and 97 keys and says nothing).
+-- `buckets` is accepted and ignored since format 4 (DESIGN.md §21).
 CREATE INDEX lion_grow_x ON lion_grow USING lion (k) WITH (buckets = 4);
 INSERT INTO lion_grow VALUES (80001, 80001);
-SELECT nbuckets, max_bucket_pages > 4 AS outgrown
-  FROM lion_index_stats('lion_grow_x');
+SELECT entries = 80001 AS all_keys FROM lion_index_stats('lion_grow_x');
 DROP INDEX lion_grow_x;
 
 /*
- * ambuild sizes the directory for the heap it is told about: when
- * pg_class.reltuples says the table holds more rows than the build put in the
- * index, the estimate is scaled up by that ratio (DESIGN.md section 5), and a
- * partial index is sized for the rows its predicate selects instead.
+ * A partial index holds the rows its predicate selects and no more, whatever
+ * pg_class.reltuples says about the heap; since DESIGN.md §21 nothing is
+ * sized from that estimate at all - the tree is built from the entries that
+ * are really there - so the only thing to check is that both are correct.
  */
 CREATE TABLE lion_relt (i int4, k int4);
 INSERT INTO lion_relt SELECT i, i FROM generate_series(1, 40000) i;
@@ -334,16 +335,11 @@ ANALYZE lion_relt;
 DELETE FROM lion_relt WHERE i > 4000;
 CREATE INDEX lion_relt_k ON lion_relt USING lion (k);
 CREATE INDEX lion_relt_p ON lion_relt USING lion (k) WHERE i <= 2000;
-SELECT (SELECT nbuckets FROM lion_index_stats('lion_relt_k')) >
-	   (SELECT nbuckets FROM lion_index_stats('lion_relt_p'))
-	   AS whole_table_sized_larger;
-CREATE TEMP TABLE lion_relt_before AS
-	SELECT nbuckets FROM lion_index_stats('lion_relt_k');
--- once the statistics tell the truth, the same data wants a smaller directory
+SELECT (SELECT entries FROM lion_index_stats('lion_relt_k')) >
+	   (SELECT entries FROM lion_index_stats('lion_relt_p'))
+	   AS whole_table_has_more_entries;
 VACUUM (ANALYZE) lion_relt;
 REINDEX INDEX lion_relt_k;
-SELECT (SELECT nbuckets FROM lion_index_stats('lion_relt_k')) <
-	   (SELECT nbuckets FROM lion_relt_before) AS directory_shrank;
 SELECT lion_index_verify('lion_relt_k', true);
 SELECT lion_index_verify('lion_relt_p', true);
 SELECT lion_cmp('lion_relt', 'k = 1234');

@@ -35,7 +35,7 @@ step s2_wakeup:
 	 * Detach first, so that nothing can park at the point again, then
 	 * release whoever is parked now.  How MANY times the point is reached is
 	 * not fixed - the two-column driver runs more than one entry scan, and a
-	 * scan fires the point once per bucket page it consumes an entry from -
+	 * scan fires the point once per leaf it consumes an entry from -
 	 * but after this step nobody is waiting on it, which is all the
 	 * permutation needs.  injection_points_wakeup() searches the WAITERS, so
 	 * it still works after the detach.

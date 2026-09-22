@@ -64,12 +64,15 @@ SELECT count(*) = (SELECT count(*) FROM lion_sec WHERE k = 1 AND tenant = 't1') 
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sec WHERE k = 1;  -- no LionCount under security quals
-                     QUERY PLAN                      
------------------------------------------------------
+                 QUERY PLAN                  
+---------------------------------------------
  Aggregate
-   ->  Seq Scan on lion_sec
-         Filter: ((tenant = 't1'::text) AND (k = 1))
-(3 rows)
+   ->  Bitmap Heap Scan on lion_sec
+         Recheck Cond: (k = 1)
+         Filter: (tenant = 't1'::text)
+         ->  Bitmap Index Scan on lion_sec_k
+               Index Cond: (k = 1)
+(6 rows)
 
 RESET ROLE;
 SELECT lion_index_count('lion_sec_k', 1) = (SELECT count(*) FROM lion_sec WHERE k = 1) AS owner_bypasses_rls;

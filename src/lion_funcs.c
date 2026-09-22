@@ -37,7 +37,7 @@
 PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_verify);
 
-#define LION_STATS_NCOLS		19
+#define LION_STATS_NCOLS		20
 
 typedef struct LionVerifyState
 {
@@ -47,6 +47,8 @@ typedef struct LionVerifyState
 	BlockNumber nblocks;
 	uint8	   *refs;			/* how often each block is referenced */
 	LionContainer *cbuf;			/* aligned container work buffer */
+	BlockNumber root;			/* the directory root, from the meta page */
+	uint32		height;
 	int64		nnullentries;	/* reserved NULL-key entries seen (at most 1) */
 	int64		nemptyentries;	/* reserved no-key entries seen (at most 1) */
 	Oid			keyoutfunc;		/* output function of the indexed type */
@@ -103,7 +105,8 @@ lion_open_index(Oid relid, LOCKMODE lockmode)
 
 typedef struct LionStats
 {
-	int64		bucket_pages;
+	int64		leaf_pages;			/* directory leaves (DESIGN.md §21) */
+	int64		internal_pages;
 	int64		entries;
 	int64		inline_entries;
 	int64		container_pages;
@@ -114,7 +117,6 @@ typedef struct LionStats
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
 	int64		empty_tids;		/* members of the reserved EMPTY entry (§17) */
-	int64		max_bucket_pages;	/* longest bucket chain (DESIGN.md §5) */
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
 	int64		free_bytes;
@@ -170,6 +172,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 	Datum		values[LION_STATS_NCOLS];
 	bool		nulls[LION_STATS_NCOLS];
 	HeapTuple	tuple;
+	uint32		height = 0;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -201,12 +204,17 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 		maxoff = PageGetMaxOffsetNumber(page);
 
-		if (LionPageIsBucket(page))
+		if (LionPageIsDir(page))
 		{
-			st.bucket_pages++;
+			st.internal_pages++;
+			st.free_bytes += (int64) PageGetFreeSpace(page);
+		}
+		else if (LionPageIsBucket(page))
+		{
+			st.leaf_pages++;
 			st.free_bytes += (int64) PageGetFreeSpace(page);
 
-			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			for (off = lion_page_first_data(page); off <= maxoff; off++)
 			{
 				ItemId		iid = PageGetItemId(page, off);
 				LionEntryTuple *entry;
@@ -272,51 +280,29 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 	pfree(cbuf);
 
-	/*
-	 * The longest bucket chain, which is what a lookup of a key in the worst
-	 * bucket has to walk.  ambuild aims at one page per bucket, so a number
-	 * well above 1 means the index has outgrown the directory it was built
-	 * with and wants a REINDEX (DESIGN.md §5); inserts warn about the same
-	 * thing.  It needs a walk of its own: the page loop above visits blocks in
-	 * block order and cannot tell which bucket an overflow page belongs to.
-	 */
-	{
-		uint32		b;
-
-		for (b = 0; b < state->meta.nbuckets; b++)
-		{
-			Buffer		headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(b));
-			int			n;
-
-			LockBuffer(headbuf, BUFFER_LOCK_SHARE);
-			n = lion_bucket_npages(index, headbuf);
-			UnlockReleaseBuffer(headbuf);
-
-			st.max_bucket_pages = Max(st.max_bucket_pages, (int64) n);
-			CHECK_FOR_INTERRUPTS();
-		}
-	}
+	(void) lion_dir_root(index, state, &height);
 
 	memset(nulls, 0, sizeof(nulls));
-	values[0] = Int32GetDatum((int32) state->meta.nbuckets);
-	values[1] = Int64GetDatum(st.bucket_pages);
-	values[2] = Int64GetDatum(st.entries);
-	values[3] = Int64GetDatum(st.inline_entries);
-	values[4] = Int64GetDatum(st.container_pages);
-	values[5] = Int64GetDatum(st.containers);
-	values[6] = Int64GetDatum(st.by_type[LION_CT_ARRAY]);
-	values[7] = Int64GetDatum(st.by_type[LION_CT_BITSET]);
-	values[8] = Int64GetDatum(st.by_type[LION_CT_RUN]);
-	values[9] = Int64GetDatum(st.ntids);
-	values[10] = Int64GetDatum(st.container_bytes);
-	values[11] = Int64GetDatum(st.free_bytes);
-	values[12] = Int64GetDatum(st.sparse_segments);
-	values[13] = Int64GetDatum(st.sparse_members);
-	values[14] = Int64GetDatum(st.null_tids);
-	values[15] = Int64GetDatum(st.empty_tids);
-	values[16] = Int64GetDatum(st.slack_bytes);
-	values[17] = Int64GetDatum(st.max_bucket_pages);
-	values[18] = Int64GetDatum(st.deleted_pages);
+	values[0] = Int32GetDatum((int32) height);
+	values[1] = Int64GetDatum(st.leaf_pages);
+	values[2] = Int64GetDatum(st.internal_pages);
+	values[3] = BoolGetDatum(state->ordered);
+	values[4] = Int64GetDatum(st.entries);
+	values[5] = Int64GetDatum(st.inline_entries);
+	values[6] = Int64GetDatum(st.container_pages);
+	values[7] = Int64GetDatum(st.containers);
+	values[8] = Int64GetDatum(st.by_type[LION_CT_ARRAY]);
+	values[9] = Int64GetDatum(st.by_type[LION_CT_BITSET]);
+	values[10] = Int64GetDatum(st.by_type[LION_CT_RUN]);
+	values[11] = Int64GetDatum(st.ntids);
+	values[12] = Int64GetDatum(st.container_bytes);
+	values[13] = Int64GetDatum(st.free_bytes);
+	values[14] = Int64GetDatum(st.sparse_segments);
+	values[15] = Int64GetDatum(st.sparse_members);
+	values[16] = Int64GetDatum(st.null_tids);
+	values[17] = Int64GetDatum(st.empty_tids);
+	values[18] = Int64GetDatum(st.slack_bytes);
+	values[19] = Int64GetDatum(st.deleted_pages);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -381,9 +367,9 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 					RelationGetRelationName(vs->index), blk,
 					opaque->page_id, LION_PAGE_ID);
 
-	flags = opaque->flags & (LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER);
+	flags = opaque->flags & LION_PAGE_KINDS;
 	if (flags != LION_PAGE_META && flags != LION_PAGE_BUCKET &&
-		flags != LION_PAGE_CONTAINER)
+		flags != LION_PAGE_CONTAINER && flags != LION_PAGE_DIR)
 		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
 					RelationGetRelationName(vs->index), blk, opaque->flags);
 
@@ -391,15 +377,18 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags != LION_PAGE_CONTAINER)
 		lion_corrupt("lion index \"%s\": block %u is marked deleted but is a %s page",
 					RelationGetRelationName(vs->index), blk,
-					flags == LION_PAGE_META ? "meta" : "bucket");
+					flags == LION_PAGE_META ? "meta" :
+					flags == LION_PAGE_DIR ? "directory" : "leaf");
 
 	if (flags != kind)
 		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
 					RelationGetRelationName(vs->index), blk,
 					flags == LION_PAGE_META ? "meta" :
-					flags == LION_PAGE_BUCKET ? "bucket" : "container",
+					flags == LION_PAGE_BUCKET ? "leaf" :
+					flags == LION_PAGE_DIR ? "directory" : "container",
 					kind == LION_PAGE_META ? "meta" :
-					kind == LION_PAGE_BUCKET ? "bucket" : "container");
+					kind == LION_PAGE_BUCKET ? "leaf" :
+					kind == LION_PAGE_DIR ? "directory" : "container");
 
 	return page;
 }
@@ -692,13 +681,12 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  * Check one entry tuple.
  */
 static void
-lion_verify_entry(LionVerifyState *vs, uint32 bucket, BlockNumber blk,
+lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 				 OffsetNumber off, ItemId iid, Page page)
 {
 	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 	Size		itemsz = ItemIdGetLength(iid);
 	uint16		kind = entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN);
-	uint32		nbuckets = vs->state->meta.nbuckets;
 
 	if (itemsz < LION_ENTRY_HDRSZ)
 		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
@@ -734,10 +722,6 @@ lion_verify_entry(LionVerifyState *vs, uint32 bucket, BlockNumber blk,
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u stores hash %u, expected %d",
 						RelationGetRelationName(vs->index), what, off, blk,
 						entry->hash, LION_NULLKEY_HASH);
-		if (bucket != LION_NULLKEY_BUCKET)
-			lion_corrupt("lion index \"%s\": %s entry %u on block %u is in bucket %u, expected bucket %d",
-						RelationGetRelationName(vs->index), what, off, blk,
-						bucket, LION_NULLKEY_BUCKET);
 		if (LionEntryIsNullKey(entry) ? (++vs->nnullentries > 1) :
 			(++vs->nemptyentries > 1))
 			lion_corrupt("lion index \"%s\": entry %u on block %u is a second %s entry",
@@ -764,11 +748,6 @@ lion_verify_entry(LionVerifyState *vs, uint32 bucket, BlockNumber blk,
 			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
 						RelationGetRelationName(vs->index), off, blk,
 						entry->hash, hash);
-
-		if (lion_bucket_of(hash, nbuckets) != bucket)
-			lion_corrupt("lion index \"%s\": entry %u on block %u belongs to bucket %u, but was found in bucket %u",
-						RelationGetRelationName(vs->index), off, blk,
-						lion_bucket_of(hash, nbuckets), bucket);
 	}
 
 	if (itemsz < LionEntryPayloadOffset(entry))
@@ -843,58 +822,309 @@ lion_verify_entry(LionVerifyState *vs, uint32 bucket, BlockNumber blk,
 	}
 }
 
+/* ---------------------------------------------------------------------
+ * The directory (DESIGN.md §21)
+ *
+ * The tree is checked level by level from the leaves up.  Each level is
+ * walked along its right links, which proves the sibling links and the key
+ * order within and across its pages; the level above is then checked against
+ * what the walk of the level below collected, which proves that its downlinks
+ * name exactly those pages, in that order, with separators that bound them.
+ * Every page is passed through lion_verify_visit(), so a page reachable twice
+ * - or not at all - is reported by that and by lion_verify_reachable().
+ * --------------------------------------------------------------------- */
+
+typedef struct LionVerifyLevel
+{
+	int			npages;
+	int			maxpages;
+	BlockNumber *blocks;
+	LionEntryTuple **firstkey;	/* first data item of each page, or NULL */
+	LionEntryTuple **highkey;	/* its high key, or NULL when rightmost */
+} LionVerifyLevel;
+
+static void
+lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
+					 LionEntryTuple *firstkey, LionEntryTuple *highkey)
+{
+	if (lvl->npages >= lvl->maxpages)
+	{
+		bool		first = (lvl->maxpages == 0);
+
+		lvl->maxpages = first ? 64 : lvl->maxpages * 2;
+		if (first)
+		{
+			lvl->blocks = (BlockNumber *) palloc(sizeof(BlockNumber) * lvl->maxpages);
+			lvl->firstkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
+			lvl->highkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
+		}
+		else
+		{
+			lvl->blocks = (BlockNumber *) repalloc(lvl->blocks,
+												   sizeof(BlockNumber) * lvl->maxpages);
+			lvl->firstkey = (LionEntryTuple **) repalloc(lvl->firstkey,
+														 sizeof(LionEntryTuple *) * lvl->maxpages);
+			lvl->highkey = (LionEntryTuple **) repalloc(lvl->highkey,
+														sizeof(LionEntryTuple *) * lvl->maxpages);
+		}
+	}
+	lvl->blocks[lvl->npages] = blk;
+	lvl->firstkey[lvl->npages] = firstkey;
+	lvl->highkey[lvl->npages] = highkey;
+	lvl->npages++;
+}
+
+static LionEntryTuple *
+lion_verify_copy_item(Page page, OffsetNumber off)
+{
+	Size		sz = ItemIdGetLength(PageGetItemId(page, off));
+	LionEntryTuple *c = (LionEntryTuple *) palloc(sz);
+
+	memcpy(c, PageGetItem(page, PageGetItemId(page, off)), sz);
+	return c;
+}
+
 /*
- * Check one bucket: its chain of bucket pages and every entry on them.
+ * Walk one level of the directory along its right links.  For an internal
+ * level the downlinks and their separators are collected into *children.
  */
 static void
-lion_verify_bucket(LionVerifyState *vs, uint32 bucket)
+lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
+					  bool isleaf, LionVerifyLevel *out,
+					  LionVerifyLevel *children)
 {
-	BlockNumber headblk = LION_BUCKET_BLKNO(bucket);
-	Buffer		headbuf;
-	Buffer		curbuf;
-	Page		page;
-	BlockNumber blk = headblk;
+	BlockNumber blk = first;
+	BlockNumber prev = InvalidBlockNumber;
+	LionEntryTuple *prevhigh = NULL;
 
-	lion_verify_visit(vs, headblk, "a bucket head");
-	page = lion_verify_read_page(vs, headblk, LION_PAGE_BUCKET, &headbuf);
-	curbuf = headbuf;
-
-	for (;;)
+	while (BlockNumberIsValid(blk))
 	{
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+		Buffer		buf;
+		Page		page;
+		LionPageOpaque opaque;
+		OffsetNumber maxoff;
 		OffsetNumber off;
-		BlockNumber next;
+		OffsetNumber firstdata;
+		LionEntryTuple *prevkey = NULL;
+		LionEntryTuple *firstkey = NULL;
+		LionEntryTuple *highkey = NULL;
 
-		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		lion_verify_visit(vs, blk, "the directory");
+		page = lion_verify_read_page(vs, blk,
+									 isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR,
+									 &buf);
+		opaque = LionPageGetOpaque(page);
+
+		if (opaque->level != level)
+			lion_corrupt("lion index \"%s\": directory page %u is at level %u, expected %u",
+						RelationGetRelationName(vs->index), blk, opaque->level,
+						level);
+		if (opaque->leftlink != prev)
+			lion_corrupt("lion index \"%s\": directory page %u has left link %u, expected %u",
+						RelationGetRelationName(vs->index), blk, opaque->leftlink,
+						prev);
+		if (LionPageIsRoot(page) != (level == vs->height))
+			lion_corrupt("lion index \"%s\": directory page %u at level %u %s the root flag",
+						RelationGetRelationName(vs->index), blk, level,
+						LionPageIsRoot(page) ? "should not have" : "should have");
+
+		if (LionPageIncompleteSplit(page))
+			ereport(WARNING,
+					(errmsg("lion index \"%s\": directory page %u has an unfinished split",
+							RelationGetRelationName(vs->index), blk),
+					 errdetail("Its right sibling has no downlink in the parent yet."),
+					 errhint("The next INSERT that descends to this page repairs it.")));
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		firstdata = lion_page_first_data(page);
+
+		if (!LionPageIsRightmost(page))
+		{
+			if (maxoff < FirstOffsetNumber)
+				lion_corrupt("lion index \"%s\": directory page %u is not rightmost but has no high key",
+							RelationGetRelationName(vs->index), blk);
+			if (!LionEntryIsHighKey(lion_page_entry(page, FirstOffsetNumber)))
+				lion_corrupt("lion index \"%s\": the first item of directory page %u is not a high key",
+							RelationGetRelationName(vs->index), blk);
+			highkey = lion_verify_copy_item(page, FirstOffsetNumber);
+		}
+		else if (maxoff >= FirstOffsetNumber &&
+				 LionEntryIsHighKey(lion_page_entry(page, FirstOffsetNumber)))
+			lion_corrupt("lion index \"%s\": rightmost directory page %u carries a high key",
+						RelationGetRelationName(vs->index), blk);
+
+		for (off = firstdata; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
+			LionEntryTuple *item;
 
 			if (!ItemIdIsUsed(iid))
 				continue;
+			item = (LionEntryTuple *) PageGetItem(page, iid);
 
-			lion_verify_entry(vs, bucket, blk, off, iid, page);
+			if (LionEntryIsHighKey(item))
+				lion_corrupt("lion index \"%s\": item %u of directory page %u is a second high key",
+							RelationGetRelationName(vs->index), off, blk);
+			if (isleaf == LionEntryIsDownlink(item))
+				lion_corrupt("lion index \"%s\": item %u of directory page %u is %sa downlink",
+							RelationGetRelationName(vs->index), off, blk,
+							isleaf ? "" : "not ");
+
+			/* Strictly increasing within the page (DESIGN.md §21). */
+			if (prevkey != NULL &&
+				lion_cmp_entries(vs->state, prevkey, item) >= 0)
+				lion_corrupt("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
+							RelationGetRelationName(vs->index), off, blk);
+
+			if (firstkey == NULL)
+			{
+				firstkey = lion_verify_copy_item(page, off);
+				if (prevhigh != NULL &&
+					lion_cmp_entries(vs->state, prevhigh, firstkey) > 0)
+					lion_corrupt("lion index \"%s\": the high key of the page left of %u sorts after its first key",
+								RelationGetRelationName(vs->index), blk);
+			}
+			if (prevkey != NULL)
+				pfree(prevkey);
+			prevkey = lion_verify_copy_item(page, off);
+
+			if (isleaf)
+				lion_verify_entry(vs, blk, off, iid, page);
+			else
+			{
+				if (children != NULL)
+					lion_verify_level_add(children, item->head,
+										  lion_verify_copy_item(page, off),
+										  NULL);
+			}
+
 			CHECK_FOR_INTERRUPTS();
 		}
 
-		next = LionPageGetOpaque(page)->rightlink;
-		if (!BlockNumberIsValid(next))
-			break;
+		if (highkey != NULL && prevkey != NULL &&
+			lion_cmp_entries(vs->state, prevkey, highkey) >= 0)
+			lion_corrupt("lion index \"%s\": the last key of directory page %u is not below its high key",
+						RelationGetRelationName(vs->index), blk);
+		if (prevkey != NULL)
+			pfree(prevkey);
 
-		lion_verify_visit(vs, next, "a bucket chain");
+		lion_verify_level_add(out, blk, firstkey, highkey);
+
+		prev = blk;
+		prevhigh = highkey;		/* owned by *out; not freed here */
+		blk = opaque->rightlink;
+		UnlockReleaseBuffer(buf);
+
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Check the whole directory: every level, and every level against the one
+ * below it.
+ */
+static void
+lion_verify_directory(LionVerifyState *vs)
+{
+	BlockNumber *leftmost;
+	LionVerifyLevel *lvl;
+	uint32		h = vs->height;
+	uint32		i;
+	int			j;
+
+	/* The leftmost page of every level, from the root down. */
+	leftmost = (BlockNumber *) palloc(sizeof(BlockNumber) * (h + 1));
+	{
+		BlockNumber blk = vs->root;
+
+		for (i = 0; i <= h; i++)
 		{
-			Buffer		nextbuf;
+			Buffer		buf;
+			Page		page;
+			uint16		level = (uint16) (h - i);
 
-			page = lion_verify_read_page(vs, next, LION_PAGE_BUCKET, &nextbuf);
-			if (curbuf != headbuf)
-				UnlockReleaseBuffer(curbuf);
-			curbuf = nextbuf;
-			blk = next;
+			page = lion_verify_read_page(vs, blk,
+										 level == 0 ? LION_PAGE_BUCKET :
+										 LION_PAGE_DIR, &buf);
+			if (LionPageGetOpaque(page)->level != level)
+				lion_corrupt("lion index \"%s\": the leftmost page %u is at level %u, expected %u",
+							RelationGetRelationName(vs->index), blk,
+							LionPageGetOpaque(page)->level, level);
+			leftmost[level] = blk;
+			if (level > 0)
+			{
+				if (PageGetMaxOffsetNumber(page) < lion_page_first_data(page))
+					lion_corrupt("lion index \"%s\": internal page %u has no downlink",
+								RelationGetRelationName(vs->index), blk);
+				if (!LionEntryIsMinusInf(lion_page_entry(page,
+														 lion_page_first_data(page))))
+					lion_corrupt("lion index \"%s\": the leftmost downlink of page %u is not minus infinity",
+								RelationGetRelationName(vs->index), blk);
+				blk = lion_page_entry(page, lion_page_first_data(page))->head;
+			}
+			UnlockReleaseBuffer(buf);
 		}
 	}
 
-	if (curbuf != headbuf)
-		UnlockReleaseBuffer(curbuf);
-	UnlockReleaseBuffer(headbuf);
+	lvl = (LionVerifyLevel *) palloc0(sizeof(LionVerifyLevel) * (h + 1));
+
+	for (i = 0; i <= h; i++)
+	{
+		LionVerifyLevel children;
+
+		memset(&children, 0, sizeof(children));
+		lion_verify_walk_level(vs, leftmost[i], (uint16) i, i == 0, &lvl[i],
+							   i == 0 ? NULL : &children);
+
+		if (i > 0)
+		{
+			if (children.npages != lvl[i - 1].npages)
+				lion_corrupt("lion index \"%s\": level %u has %d downlinks but level %u has %d pages",
+							RelationGetRelationName(vs->index), i,
+							children.npages, i - 1, lvl[i - 1].npages);
+
+			for (j = 0; j < children.npages; j++)
+			{
+				LionEntryTuple *sep = children.firstkey[j];
+
+				if (children.blocks[j] != lvl[i - 1].blocks[j])
+					lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, but the %dth page of level %u is block %u",
+								RelationGetRelationName(vs->index), j, i,
+								children.blocks[j], j, i - 1,
+								lvl[i - 1].blocks[j]);
+
+				if (j == 0)
+				{
+					if (!LionEntryIsMinusInf(sep))
+						lion_corrupt("lion index \"%s\": the first downlink of level %u is not minus infinity",
+									RelationGetRelationName(vs->index), i);
+				}
+				else if (LionEntryIsMinusInf(sep))
+					lion_corrupt("lion index \"%s\": downlink %d of level %u is minus infinity",
+								RelationGetRelationName(vs->index), j, i);
+				else if (lvl[i - 1].firstkey[j] != NULL &&
+						 lion_cmp_entries(vs->state, sep,
+										  lvl[i - 1].firstkey[j]) > 0)
+					lion_corrupt("lion index \"%s\": the separator of block %u sorts after its own first key",
+								RelationGetRelationName(vs->index),
+								children.blocks[j]);
+
+				/*
+				 * A child's high key was the next separator when the split
+				 * made them; later splits of the child only lower it.
+				 */
+				if (j + 1 < children.npages &&
+					lvl[i - 1].highkey[j] != NULL &&
+					lion_cmp_entries(vs->state, lvl[i - 1].highkey[j],
+									 children.firstkey[j + 1]) > 0)
+					lion_corrupt("lion index \"%s\": the high key of block %u sorts after the separator of its right sibling",
+								RelationGetRelationName(vs->index),
+								lvl[i - 1].blocks[j]);
+			}
+		}
+	}
+
+	pfree(leftmost);
 }
 
 /*
@@ -922,37 +1152,29 @@ lion_verify_meta(LionVerifyState *vs)
 					RelationGetRelationName(vs->index), meta->offset_bits,
 					meta->container_bits, LION_OFFSET_BITS, LION_CONTAINER_BITS);
 
-	if (meta->nbuckets == 0 || meta->nbuckets > LION_MAX_BUCKETS)
-		lion_corrupt("lion index \"%s\": meta page has %u buckets, expected 1 .. %d",
-					RelationGetRelationName(vs->index), meta->nbuckets,
-					LION_MAX_BUCKETS);
-
 	if (meta->inline_limit < LION_MIN_INLINE_LIMIT ||
 		meta->inline_limit > LION_MAX_INLINE_LIMIT)
 		lion_corrupt("lion index \"%s\": meta page has inline_limit %u, expected %d .. %d",
 					RelationGetRelationName(vs->index), meta->inline_limit,
 					LION_MIN_INLINE_LIMIT, LION_MAX_INLINE_LIMIT);
 
-	if (meta->nbuckets != vs->state->meta.nbuckets)
-		lion_corrupt("lion index \"%s\": meta page has %u buckets, but the cached state has %u",
-					RelationGetRelationName(vs->index), meta->nbuckets,
-					vs->state->meta.nbuckets);
-
-	if (vs->nblocks < 1 + meta->nbuckets)
-		lion_corrupt("lion index \"%s\": %u blocks are too few for a meta page and %u buckets",
-					RelationGetRelationName(vs->index), vs->nblocks,
-					meta->nbuckets);
+	if (!BlockNumberIsValid(meta->root) || meta->root >= vs->nblocks)
+		lion_corrupt("lion index \"%s\": meta page names root block %u, but the index has %u blocks",
+					RelationGetRelationName(vs->index), meta->root, vs->nblocks);
 
 	if (LionPageGetOpaque(page)->rightlink != InvalidBlockNumber)
 		lion_corrupt("lion index \"%s\": the meta page has a right link to block %u",
 					RelationGetRelationName(vs->index),
 					LionPageGetOpaque(page)->rightlink);
 
+	vs->root = meta->root;
+	vs->height = meta->height;
+
 	UnlockReleaseBuffer(buf);
 }
 
 /*
- * Every block has to belong to the meta page, a bucket chain or exactly one
+ * Every block has to belong to the meta page, the directory or exactly one
  * key's container chain.
  *
  * Two kinds of unreferenced block are tolerated (with a warning), because a
@@ -1027,20 +1249,14 @@ lion_verify_tid_present(LionVerifyState *vs, Datum key, uint16 reservedflag,
 {
 	Relation	index = vs->index;
 	LionState   *state = vs->state;
-	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	bool		present = false;
 
-	headbuf = ReadBuffer(index,
-						 LION_BUCKET_BLKNO(lion_bucket_of(hash,
-														state->meta.nbuckets)));
-	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
-
 	if ((reservedflag != 0) ?
-		lion_find_reserved_entry(index, headbuf, BUFFER_LOCK_SHARE,
+		lion_find_reserved_entry(index, state, BUFFER_LOCK_SHARE,
 								reservedflag, &entrybuf, &entryoff) :
-		lion_find_entry(index, state, headbuf, BUFFER_LOCK_SHARE, key, hash,
+		lion_find_entry(index, state, BUFFER_LOCK_SHARE, key, hash,
 					   &entrybuf, &entryoff))
 	{
 		Page		page = BufferGetPage(entrybuf);
@@ -1086,11 +1302,10 @@ lion_verify_tid_present(LionVerifyState *vs, Datum key, uint16 reservedflag,
 			UnlockReleaseBuffer(cbuf);
 		}
 
-		if (entrybuf != headbuf)
-			UnlockReleaseBuffer(entrybuf);
+		UnlockReleaseBuffer(entrybuf);
 	}
-
-	UnlockReleaseBuffer(headbuf);
+	else if (BufferIsValid(entrybuf))
+		UnlockReleaseBuffer(entrybuf);
 
 	return present;
 }
@@ -1246,7 +1461,6 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	bool		heapallindexed = PG_GETARG_BOOL(1);
 	LionVerifyState vs;
 	Oid			heapoid;
-	uint32		b;
 
 	memset(&vs, 0, sizeof(vs));
 
@@ -1260,13 +1474,7 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	vs.refs = (uint8 *) palloc0(sizeof(uint8) * Max(vs.nblocks, 1));
 
 	lion_verify_meta(&vs);
-
-	for (b = 0; b < vs.state->meta.nbuckets; b++)
-	{
-		lion_verify_bucket(&vs, b);
-		CHECK_FOR_INTERRUPTS();
-	}
-
+	lion_verify_directory(&vs);
 	lion_verify_reachable(&vs);
 
 	if (heapallindexed)

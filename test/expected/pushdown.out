@@ -170,11 +170,14 @@ SELECT lion_plans($$SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2 AND c = 
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdt
-         Recheck Cond: (a = 3)
-         Filter: ((b = 2) AND (c = 'c1'::text))
-         ->  Bitmap Index Scan on lion_pdt_a
-               Index Cond: (a = 3)
-(10 rows)
+         Recheck Cond: ((a = 3) AND (b = 2))
+         Filter: (c = 'c1'::text)
+         ->  BitmapAnd
+               ->  Bitmap Index Scan on lion_pdt_a
+                     Index Cond: (a = 3)
+               ->  Bitmap Index Scan on lion_pdt_b
+                     Index Cond: (b = 2)
+(13 rows)
 
 SELECT lion_plans('SELECT a, count(*) FROM lion_pdt GROUP BY a');
            lion_plans           
@@ -546,7 +549,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 999');
  not pushed down, 1 rows
 (1 row)
 
--- ORDER BY is fine, but the node produces no ordering of its own
+-- ORDER BY on the group column needs no Sort any more: the entries come out
+-- in key order and the path says so (DESIGN.md §21).  `a` is NOT NULL, which
+-- is what lets the pathkeys be NULLS LAST like the ORDER BY.
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
        lion_pd        
 ----------------------
@@ -554,21 +559,19 @@ SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
 (1 row)
 
 SELECT lion_plans('SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a');
-              lion_plans              
---------------------------------------
+            lion_plans            
+----------------------------------
  -- on:
- Sort
-   Sort Key: a
-   ->  Custom Scan (LionCount)
-         Lion Indexes: lion_pdt_a (a)
-         Group Key: a
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdt_a (a)
+   Group Key: a
  -- off:
  Sort
    Sort Key: a
    ->  HashAggregate
          Group Key: a
          ->  Seq Scan on lion_pdt
-(12 rows)
+(10 rows)
 
 -- ---- the results themselves --------------------------------------------
 SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
@@ -959,8 +962,8 @@ SELECT lion_pd_counters('SELECT k, count(*) FROM lion_pdg GROUP BY k');
 
 -- ---- a long IN list, priced per element ---------------------------------
 /*
- * Every element of an IN list is a bucket lookup and a container chain of its
- * own, and the estimate has to say so: charging a list as one bucket page made
+ * Every element of an IN list is a directory lookup and a container chain of
+ * its own, and the estimate has to say so: charging a list as one page made
  * a thousand-element list look four times cheaper than it is (the 2026-09-21
  * follow-up review).  What it is NOT charged for any more is a k-way union per
  * element, because since the disjoint-sum short-circuit of DESIGN.md §15 there

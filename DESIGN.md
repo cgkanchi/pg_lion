@@ -23,7 +23,8 @@ Goals
 Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, §14 and §15;
 entry deletion and page recycling in §18)
 - Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple`, parallel build/scan,
-  fine-grained write concurrency (inserts serialize per hash bucket), key sizes above 2000 bytes.
+  fine-grained write concurrency (inserts serialize on the directory leaf that holds the key, §21),
+  key sizes above 2000 bytes.
 
 ## 2. TID encoding
 
@@ -100,6 +101,12 @@ indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which gr
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
 structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
 rather than a wrong answer.
+
+**Superseded by §21 (format version 4).** Everything in the next two paragraphs - the bucket
+directory, `nbuckets`, `lion_bucket_of()` - is gone: the entry directory is a B-tree keyed by the
+index key, entry tuples live on its LEAVES (which keep the flag name LION_PAGE_BUCKET), and the meta
+page holds `root`/`height`/`dirpages` where it held `nbuckets`. What is unchanged is the entry tuple
+itself and everything below it, so the paragraphs are kept for the entry layout they describe.
 
 Blocks 1 .. nbuckets: bucket head pages. Bucket b for a key with 32-bit hash h is `h % nbuckets`
 (`lion_bucket_of()` in lion.h, the single place that mapping lives); its head page is block `1 + b`.
@@ -215,8 +222,17 @@ VACUUM's sweep turns them into free pages) and anything else as an ERROR.
 
 ## 5. Locking protocol (deliberately coarse in v0)
 
-Lock ordering: bucket head page → other bucket pages → container pages (left to right) → new page.
-Never lock a page to the left of one you hold. The meta page is read once at relation open and cached.
+**Where this section says "bucket head page", read "the directory LEAF that holds the entry" (§21).**
+The directory is a B-tree now, so step 1 of INSERT is a descent rather than a modulo, step 2's walk
+of a bucket chain is a binary search plus a scan of the prefix run, the bucket-directory guard of
+step 2 is gone entirely (the tree grows by splitting), and ambuild sizes nothing. Everything else -
+the lock ordering, the one-record-per-atomic-step rule, the measured concurrency ceiling and why
+shortening the hold would not move it - is unchanged, and the leaf serialises the writers of a key
+exactly as the bucket head page did.
+
+Lock ordering: directory pages (root to leaf) → container pages (left to right) → new page.
+Never lock a page to the left of one you hold. The meta page is read once at relation open and
+cached (and re-read when a root split invalidates the cached root, §21).
 
 INSERT (`lion_insert.c`)
 1. Hash the key; lock the bucket head page EXCLUSIVE and hold it until the insert is complete.
@@ -413,7 +429,8 @@ BUILD (`lion_build.c`)
 ## 6. Handler settings (`lion_am.c`)
 
     amstrategies = 5 (1 equality, 2 @>, 3 &&, 4 <@, 5 @@ -- see §17)
-    amsupport = 3 (1 = hash function, same as hash AM; 2 and 3 = GIN's extraction procs, §17)
+    amsupport = 4 (1 = hash function, same as hash AM; 2 and 3 = GIN's extraction procs, §17;
+                   4 = btree comparison of the KEY type, optional, §21)
     amoptsprocnum = 0                amcanorder = false        amcanorderbyop = false
     amcanhash = false                amconsistentequality = true   amconsistentordering = false
     amcanbackward = false            amcanunique = false       amcanmulticol = false
@@ -424,16 +441,19 @@ BUILD (`lion_build.c`)
     amgettuple = NULL                amgetbitmap = liongetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
-    amoptions: reloptions `buckets` (int, 0 = auto, max 65536; any value, not rounded to a power of
-    two), `inline_limit` (int bytes, 64..4096, default 4096) and `max_entries` (int, 0 = unlimited,
-    §17) via add_reloption_kind / add_int_reloption / build_reloptions.
+    amoptions: reloptions `fillfactor` (int, 10..100, default 90, §21), `inline_limit` (int bytes,
+    64..4096, default 4096), `max_entries` (int, 0 = unlimited, §17) and `buckets`, which is
+    accepted and ignored with a NOTICE since format 4 (§21), via add_reloption_kind /
+    add_int_reloption / build_reloptions.
     amvalidate: a scalar opclass must have support proc 1 with signature (T) → int4 and operator
-    strategy 1; a multi-key one (§17) procs 2 and 3 and strategies within {2,3,4,5}.
+    strategy 1; a multi-key one (§17) procs 2 and 3 and strategies within {2,3,4,5}; proc 4 is
+    optional for both and is the only support function allowed to be cross-type (§21).
     Handler follows contrib/bloom in master: `static const IndexAmRoutine amroutine = {...}` returned
     with PG_RETURN_POINTER.
 
 Operator classes (in `pg_lion--0.1.sql`): one DEFAULT opclass per type, reusing the hash AM's
-support-1 functions, plus the two multi-key classes of §17. Generate the list from the dev cluster with
+support-1 functions and the btree AM's support-1 functions as proc 4 (§21), plus the two multi-key
+classes of §17. Generate the list from the dev cluster with
 `SELECT ... FROM pg_amproc JOIN pg_opclass ... WHERE amname='hash' AND amprocnum=1` for at least:
 int2, int4, int8, oid, bool, "char", text, varchar (via text), bpchar, bytea, uuid, date, time,
 timestamp, timestamptz, interval, numeric, float4, float8, macaddr, inet, name, jsonb, enum types
@@ -441,14 +461,17 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
 
 ## 7. SQL functions (`lion_funcs.c`)
 
-    lion_index_stats(regclass, OUT nbuckets int, OUT bucket_pages bigint, OUT entries bigint,
+    lion_index_stats(regclass, OUT directory_height int, OUT leaf_pages bigint,
+        OUT internal_pages bigint, OUT ordered bool, OUT entries bigint,
         OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint,
         OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint,
         OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint,
         OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint,
-        OUT empty_tids bigint, OUT slack_bytes bigint, OUT max_bucket_pages bigint,
+        OUT empty_tids bigint, OUT slack_bytes bigint,
         OUT deleted_pages bigint) RETURNS record
-        -- container counts include INLINE containers; free_bytes sums bucket and container pages;
+        -- the first four describe the entry directory of §21 (`ordered` false means the key type
+        -- has no btree opclass, so the entries are in a complete but arbitrary order);
+        -- container counts include INLINE containers; free_bytes sums directory and container pages;
         -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
         -- the reserved no-key entry (§17)
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
@@ -822,9 +845,17 @@ answers are checked too.
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
 ambulkdelete acquires a cleanup lock (an exclusive content lock that also waits for all other pins
-to drop) on **every page it visits** — every bucket page and every container page of every chain,
-whether or not it has anything to remove there — in chain order (bucket pages first, then each chain
-left to right). This is the same rule nbtree's btvacuumscan follows, and it is what closes the
+to drop) on **every page that can hold a TID** — every directory LEAF and every container page of
+every chain, whether or not it has anything to remove there — in chain order (the leaves left to
+right from the leftmost one, then each chain left to right).
+
+**Internal directory pages are not cleanup-locked, and need not be** (§21): they hold downlinks and
+separator keys and no TIDs at all, so no reader can be holding a container copy that came from one,
+and there is nothing on them for the §9 interlock to protect. The leaves are exactly the pages that
+used to be bucket pages, and VACUUM treats them the same way. A leaf SPLIT obeys the same rule the
+chain split does - the upper half goes to a brand new page immediately to the right - so an entry
+can only ever move onto a leaf the walk has not passed, and an entry that moves off a leaf the walk
+has already finished has by then been fully processed, chains and all. This is the same rule nbtree's btvacuumscan follows, and it is what closes the
 page-split hole in the §9 argument: a reader pins page P, copies container C out, and drops the
 content lock; a concurrent insert may then split P and move C to a brand-new page N linked
 immediately right of P. VACUUM must reach P before N, and P's cleanup lock is blocked by the
@@ -850,39 +881,43 @@ before dropping the pin on the page a container came from cannot be overtaken by
 
 VACUUM waiting rule (binding): VACUUM must never *wait* for a cleanup lock while holding any other
 LWLock, because holding an LWLock implies HOLD_INTERRUPTS and the wait becomes uncancellable (a
-cursor pinning one container page could then freeze VACUUM until the session ends). The bucket head
-lock is needed only while a page is actually modified (the entry counters are written in the same
-record), so ambulkdelete processes each bucket in two passes:
+cursor pinning one container page could then freeze VACUUM until the session ends). The leaf lock is
+needed only while a page is actually modified (the entry counters are written in the same record),
+so ambulkdelete processes each leaf in two passes:
 
-  Pass 1 (bucket pages): pin the head; LockBufferForCleanup(head) with nothing else held; process
-  every INLINE entry on it (filter, repack, spill if grown); note (offset, head block) of every CHAIN
-  entry; release the content lock but keep the head pinned; repeat for further bucket pages.
+  Pass 1 (directory leaves): pin the leaf; LockBufferForCleanup(leaf) with nothing else held;
+  process every INLINE entry on it (filter, repack, spill if grown); note the offset, the head block
+  and the KEY of every CHAIN entry; release the content lock but keep the leaf pinned; move to the
+  right link.
 
   Pass 2 (each CHAIN entry's chain, left to right, holding no page lock between steps): for EVERY
   page X of the chain, including pages with nothing to remove:
-    1. LockBuffer(head, EXCLUSIVE)  — blocking is fine, nothing else is held.
+    1. LockBuffer(leaf, EXCLUSIVE)  — blocking is fine, nothing else is held.
     2. if ConditionalLockBufferForCleanup(X): filter X; if anything changed, write the fresh entry
        copy (re-read from the page; inserts may have changed it) with the deltas in the same record;
-       release X, release head.
-    3. else: release head; LockBufferForCleanup(X) (blocking, cancellable, nothing else held);
-       if ConditionalLockBuffer(head, EXCLUSIVE): as in step 2; else release X and go to 1.
-  A page with nothing to remove still needs the cleanup lock (step 2/3) but no WAL record; the head
+       release X, release the leaf.
+    3. else: release the leaf; LockBufferForCleanup(X) (blocking, cancellable, nothing else
+       held); if ConditionalLockBuffer(leaf, EXCLUSIVE): as in step 2; else release X and go to 1.
+  A page with nothing to remove still needs the cleanup lock (step 2/3) but no WAL record; the leaf
   lock may be skipped for such pages only if the page is inspected under the cleanup lock first and
   found clean (then release and move on).
-  Inserts to the bucket may interleave between steps; that is safe because splits only move items
-  right to new pages (VACUUM revisits or re-filters them) and offsets of entries on bucket pages are
-  stable (entries are never deleted). Counters are always applied as deltas to the entry as it is at
-  the moment of the write, never as absolutes.
+  Inserts may interleave between steps; that is safe because splits only move items right to new
+  pages (VACUUM revisits or re-filters them). Offsets of entries are NOT stable any more - §21's
+  sorted directory inserts in the middle of a leaf and splits it - so every use of the offset pass 1
+  recorded is checked against the entry's kind and stored key first, and an entry that has moved is
+  found again by a descent made with NOTHING else held (a directory lock taken while holding a
+  container page would close exactly the cycle the waiting rule above avoids). Counters are always
+  applied as deltas to the entry as it is at the moment of the write, never as absolutes.
 
-This also removes the latent deadlock between a reader that pins a bucket page (INLINE entry) while
-taking a container-page SHARE lock and a VACUUM holding that container page while waiting for the
-bucket head: VACUUM never blocks on the head while holding a container page.
+This also removes the latent deadlock between a reader that pins a directory leaf (INLINE entry)
+while taking a container-page SHARE lock and a VACUUM holding that container page while waiting for
+the leaf: VACUUM never blocks on the leaf while holding a container page.
 
-Deadlock rule for readers: never acquire a bucket-page lock while holding a pin on a container page.
-VACUUM holds the bucket head and then waits for cleanup locks on that bucket's container pages; a
-reader holding a container pin and then asking for the bucket head closes the cycle, and buffer
-LWLocks have no deadlock detection. Finish with the bucket page (copy the entry out, drop its lock)
-before pinning container pages, and never go back. `lion_chain_find_page()` takes SHARE locks
+Deadlock rule for readers: never acquire a directory lock while holding a pin on a container page.
+VACUUM holds the leaf and then waits for cleanup locks on that entry's container pages; a reader
+holding a container pin and then asking for the leaf closes the cycle, and buffer LWLocks have no
+deadlock detection. Finish with the leaf (copy the entry out, drop its lock) before pinning
+container pages, and never go back. `lion_chain_find_page()` takes SHARE locks
 internally, so do not call it while holding a lock on any page of that chain.
 
 ## 12. Measured on 20M rows (2026-09-20) and v1 priorities
@@ -905,8 +940,9 @@ v1 priorities, in order of measured impact:
 4. Insert cost: a container is copied out and back per insert (bitset fast path exists). Consider an
    in-place add for ARRAY containers with slack and a GIN-style pending list for bulk loads.
 5. IN predicates in the AM and the count pushdown are DONE (§15, amsearcharray), and so are NULL
-   keys (§14, amsearchnulls) and the multi-key opclasses of §17. Range predicates (which would need
-   entry ordering, and a strategy number outside the 1..5 §17 now uses) are not.
+   keys (§14, amsearchnulls) and the multi-key opclasses of §17. Range predicates are still not -
+   but the entry ordering they need now exists (§21), so what is left is the strategy numbers
+   (outside the 1..5 §17 uses), the scan-key handling and a bounded entry walk.
 6. DONE (§18): page recycling and entry deletion.
 7. Params in the count pushdown; multi-column GROUP BY. Partitions are DONE (§16).
 The per-container visibility-map read (lion_vm_allvisible_mask) is already in: it turned the GROUP BY
@@ -2113,73 +2149,365 @@ column, with `count(col)` of either, under an OR restriction, on a dirty heap an
 partitioned table, and pins the plan choice for 20 × 2, 200 × 2, 200 × 20, 20000 × 200 and
 20000 × 2 with nothing disabled.
 
-## 21. Sorted key directory (format version 4)
+## 21. Sorted key directory (format version 4, implemented)
 
 Replaces the hash-bucket entry directory of §4 with a B-tree of entries keyed by the index key.
 
-Why. The hash directory has three measured costs: an index created empty keeps its 64 buckets
-forever (100k unique keys: 0.104 ms vs 0.321 ms per 100-key IN after growth), a large IN list is one
-random bucket page per value (1000 lookups ≈ 1.3 ms), and entry iteration (GROUP BY, IS NOT NULL,
-verify) is in hash order, so ordered output and range-bounded entry walks are impossible. A B-tree
-directory grows by splitting, makes a sorted IN list a near-sequential leaf walk, and gives GROUP BY
-output in key order (a Sort above the node disappears when the query's ORDER BY is the group key).
+Why. The hash directory had three measured costs: an index created empty kept its 64 buckets
+forever (100k unique keys: 0.104 ms vs 0.321 ms per 100-key IN after growth), a large IN list was one
+random bucket page per value, and entry iteration (GROUP BY, IS NOT NULL, verify) was in hash order,
+so ordered output and range-bounded entry walks were impossible. A B-tree directory grows by
+splitting, makes a sorted IN list a near-sequential leaf walk, and gives GROUP BY output in key order
+(the Sort above the node disappears when the query's ORDER BY is the group key).
 
-Structure. Meta page (block 0) points at a root. Directory pages carry LION_PAGE_DIR (internal) or
-LION_PAGE_BUCKET (leaf; the flag name is kept so verify/stats/page-inspection tools keep working) in
-the special area, plus `level` and left/right sibling links. Leaf pages hold LionEntryTuple items,
-exactly as bucket pages do today, sorted by (key, hash) under the opclass ordering; internal pages
-hold downlink tuples (separator key + child block), also LionEntryTuple-shaped with a new flag
-LION_ENTRY_DOWNLINK so that the key helpers apply unchanged. Reserved NULL and EMPTY entries sort
-first (before every value; NULL before EMPTY) via a 1-byte kind prefix in the comparison, not in the
-stored key. Multi-key classes: the key type is the STORAGE type (§17), which is what is compared.
+Structure. Meta page (block 0) points at a `root` and records the root's `height` and the number of
+`dirpages` the directory has; `nbuckets` is gone (the field is kept at zero for layout stability).
+Directory pages carry LION_PAGE_DIR (internal) or LION_PAGE_BUCKET (leaf; the flag name is kept so
+verify/stats/page-inspection tools keep working), plus LION_PAGE_ROOT on the current root and
+LION_PAGE_INCOMPLETE_SPLIT on a page whose split has not finished. The special area gains `level`
+and a `leftlink` (24 → 32 bytes after MAXALIGN, which is why every item on every page moves and the
+version has to be bumped). Leaf pages hold LionEntryTuple items in key order, exactly as bucket
+pages did; internal pages hold downlink pivots, LionEntryTuple-shaped with LION_ENTRY_DOWNLINK and
+`head` = the child block, so the key helpers apply unchanged. Every non-rightmost page's FIRST item
+is its high key (LION_ENTRY_HIGHKEY, key only), and the leftmost page of every level begins with a
+LION_ENTRY_MINUSINF downlink that compares below everything. Reserved NULL and EMPTY entries sort
+first (NULL < EMPTY < value) via a kind prefix in the comparison, not in the stored key, so they
+live on the leftmost leaf and are reached by the ordinary descent. Multi-key classes: the key type
+is the STORAGE type (§17), which is what is compared.
 
-Ordering. Every default opclass gains an ordering source: support proc 4 = a btree comparison
-function for the key type (the type's default btree opfamily proc 1, resolved at CREATE OPERATOR
-CLASS in the SQL script; for citext `citext_cmp`; for anyenum `enum_cmp`). Keys whose type has no
-btree opclass fall back to (hash, then bytewise memcmp of the stored datum), which is a total order
-that is merely not semantically meaningful; `lion_index_stats()` reports `ordered = false` for such
-an index and GROUP BY output is not sorted for it. `amcanorder` stays false (no ordered heap scans:
-the AM still emits bitmaps); only the planner's knowledge that a LionCount GROUP BY output is sorted
-by the group key is added (pathkeys on the CustomPath for ordered opclasses).
+**An entry tuple is capped at LION_MAX_ENTRY_SIZE**, which is the largest item a page can hold minus
+the largest pivot (`MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) + sizeof(ItemIdData)`), because a
+leaf that holds ONE entry must still have room for the high key a split would give it. A payload
+that would exceed it spills onto container pages exactly as one that exceeds `inline_limit` does.
+*(Not in the first draft of this section, which did not notice that a 2000-byte key with a
+4096-byte inline payload plus a 2000-byte high key is 40 bytes over a page.)*
 
-Operations.
-- Lookup: descend from the root with binary search per page (SHARE locks, lock coupling parent→child
-  as nbtree does, no pins kept above the leaf). The leaf page pin remains the §9 pin for INLINE sets.
-- Insert of a new entry: descend with the leaf EXCLUSIVE; on no room, split the leaf (right half to a
-  new page, high key to parent, nbtree's "split then insert downlink" ordering with the incomplete
-  split bit so a crash between the two records is repaired on the next descent), recursing upward;
-  root split creates a new root. Splits move items right only; a page's minimum key never decreases.
-  Concurrent readers use right-links: a reader that holds a leaf whose high key is below its search
-  key moves right (nbtree's move-right rule), which is what makes a leaf-pin reader safe across a
-  concurrent split.
-- Entry rewrite in place (payload growth/shrink, spill): as today, on the leaf, EXCLUSIVE; if the
-  grown entry no longer fits, split.
-- Delete (VACUUM, §18): entries are deleted with PageIndexTupleDeleteNoCompact as today (offsets
-  stable for readers parked on the page); an empty leaf is NOT unlinked in this version (leaf
-  deletion needs nbtree's half-dead protocol; documented limitation, pages are few).
-- Ordered iteration: leftmost leaf, then right-links (SHARE lock one page at a time, pin held while
-  an INLINE set from that page is being counted, exactly as the bucket walk does today).
-- Bulk build: entries are produced in sorted order by the tuplesort (sort key becomes (kind, key)
-  using the ordering proc, hash as tiebreaker), leaves are filled left to right at a fill factor,
-  and the internal levels are built bottom-up in the same pass (nbtree's _bt_buildadd shape) through
-  the bulk-write API.
+### The order
 
-IN lists and sums: `lion_posting_set_lookup_many()` sorts the values with the ordering proc and
-locates them in one left-to-right leaf walk (re-descend only when the next value is beyond the
-current leaf's high key). Disjoint-sum counting (§15) is unchanged.
+    kind (MINF < NULL < EMPTY < VALUE), then proc 4 under the index collation, then the hash,
+    then a bytewise comparison of the stored datum
 
-What goes away: `nbuckets`, `buckets` reloption (accepted and ignored with a NOTICE for one release),
-`lion_bucket_of`, bucket sizing in ambuild, the bucket-chain warning; `max_bucket_pages` in stats
-becomes `directory_height` and `leaf_pages`.
+The first three are the **prefix**. Two entries whose prefixes tie are candidates for being the same
+key, and only the opclass EQUALITY decides: a descent lands on the first item of the prefix run and
+scans it - across right links if it spans pages - applying strategy 1. That is what makes citext's
+`'Alice'` and `'alice'` ONE entry: `citext_cmp` returns 0 and `citext_hash` agrees, so they tie, and
+`citext`'s `=` says they are the same key. The bytewise tail exists so that the order is TOTAL even
+for a type with no btree opclass at all, where the prefix is only (kind, hash); it is never what
+decides that two entries are distinct, because entries in one prefix run are found by equality.
 
-Locking summary: directory pages: nbtree rules (lock coupling downward, move-right on the leaf,
-splits hold left then right then parent). Container chains: unchanged (§5, §11, §18). Lock order
-directory page → container pages is preserved; VACUUM's two-pass protocol addresses the leaf page
-holding the entry where it used the bucket head.
+*(Deviation from the first draft, which said the order was simply "kind, then cmpproc, then hash,
+then memcmp". Stopping at the bytewise tail would put citext's two spellings at two different
+positions and therefore in two entries - the very thing the section requires a test for. The run
+scan is what reconciles the two, and it is nbtree's own handling of duplicate keys.)*
 
-Format: LION_VERSION 4; version 3 indexes are refused with the REINDEX hint. verify() checks the
-tree: keys sorted within and across leaves, high keys consistent with children, every leaf
-reachable from the root exactly once, sibling links consistent, level numbers, downlink targets.
+A search key whose stored form is not available - every lookup, which has a Datum and not the bytes,
+and every cross-type lookup, which cannot produce them at all - compares as the SMALLEST member of
+its own run, which is exactly what positions it at the run's start. The INSERT path does have the
+bytes (it has just built the entry tuple), and uses them to place the new key at its exact position,
+which is what keeps the on-disk order total.
+
+**The ordering source.** Every default opclass gains support proc 4, the btree comparison of the KEY
+type: the type's default btree opclass's support function 1, named in the SQL script
+(`bttextcmp`, `numeric_cmp`, ...; `enum_cmp` for anyenum, `citext_cmp` for citext, `bttextcmp` for
+`tsvector_ops`, whose STORAGE type is text). `array_ops` has none - its STORAGE type is the
+polymorphic `anyelement` - and falls back to the element type's default btree comparison through
+`lookup_type_cache(TYPECACHE_CMP_PROC_FINFO)` at `lion_fill_state()`, exactly as its hash does, and
+under rule 2 below: its keys are compared with the element type's own default equality, which is the
+one that borrowed comparison agrees with.
+`lionvalidate()` accepts proc 4 as OPTIONAL, with signature (keytype, keytype) → int4, and is the one
+support function allowed to be cross-type.
+
+A type with no btree opclass at all - `xid`, `cid` - has no ordering: `LionState.ordered` is false,
+the directory is ordered by (kind, hash, bytes), which is a complete order but not the type's,
+`lion_index_stats()` reports `ordered = false` and the count pushdown claims no pathkeys.
+
+**Three rules decide what the directory is ordered by** (`lion_fill_state()`), and all three say the
+same thing: the order the BUILD lays entries out in and the order a SEARCH descends must be one and
+the same, and both must agree with the opclass EQUALITY, because the directory holds exactly one
+entry per equality class.
+
+1. An opclass WITH proc 4 is ordered by it.
+2. An opclass WITHOUT proc 4 may BORROW the key type's default btree comparison only when its own
+   equality operator IS the key type's default btree equality (compare the strategy-1 operator OID
+   against `get_opfamily_member()` of the type's default btree opfamily). Otherwise it is
+   UNORDERED. *(Deviation from the first draft, which borrowed unconditionally. The borrowed
+   comparison can be FINER than the opclass's equality, and then the two members of one equality
+   class sort to two different positions while the directory keeps only one entry: the
+   case-insensitive `lion_lower_ops` of `test/sql/pushdown.sql` stores `'A'` and `'a'` in one entry,
+   `bttextcmp` separates them, and a lookup for the spelling the entry was NOT created with
+   descended past it and found nothing. An unordered directory ties wherever the hash ties, which is
+   exactly where the run scan applies the opclass equality, so the same class works.)*
+3. Either way the ordering needs a `<` OPERATOR THAT SORTS WITH THE SAME FUNCTION, because ambuild's
+   tuplesort is driven by an operator. The key type's default `<` qualifies only when the comparison
+   is the key type's default one; a comparison of the opclass's own is looked for in the btree
+   opfamily that uses it as its `BTORDER_PROC` (a `pg_amproc` scan, once per relcache build, and
+   only for an opclass that names a comparison no built-in one does). The candidate is verified with
+   `get_ordering_op_properties()`, which is the same catalogue path
+   `PrepareSortSupportFromOrderingOp()` takes, so "the sort will use this function" is not a guess.
+   An ordering the build cannot reproduce is NO ordering: the index is unordered instead, which is
+   still correct. *(Deviation from the first draft, which took the type's default `<`
+   (`TYPECACHE_LT_OPR`) whatever the comparison was, so an opclass with a comparison of its own
+   sorted one way at build time and searched the other: every key ended up where no search looked
+   for it, and verify() said so.)*
+
+**The ordering must agree with strategy 1**: two keys the comparison calls equal must be equal to the
+opclass. The directory holds one entry per equality class and finds it by scanning the run the
+comparison ties, so a comparison FINER than the equality (one that separates two equal keys) would
+create two entries for one class. Rule 2 above is what keeps a BORROWED comparison inside that
+promise; a proc 4 an opclass names itself is still the author's responsibility, and the AM cannot
+detect a bad one.
+
+**Cross-type searches** (`int4col = 123::int8`) need an ordering of a STORED key against a value of
+another type, and it is resolved ONCE for both the single-value lookup and the batched one
+(`lion_probe_init()` in lion_count.c), because the two walk the same tree and a batched lookup that
+descended where the single one scans would read the directory in an order it is not in. Three
+outcomes, in this order:
+
+- the family's cross-type proc 4 (`btint48cmp` and friends; `integer_ops` and `float_ops`, the only
+  families with cross-type equality, carry them): descend as usual;
+- otherwise a BINARY or IMPLICIT coercion of the value to the key type (`find_coercion_pathway()`
+  with `COERCION_IMPLICIT`, one-argument cast functions only): the value becomes one of the index's
+  own and hash, equality and ordering are all the index's own, which is consistent by construction.
+  An assignment-only cast is not taken - `int8` → `int4` would raise a range error for a value that
+  simply is not in the index;
+- otherwise the leaves are walked with the cross-type EQUALITY (`lion_dir_find_by_scan()`), which is
+  correct and linear.
+
+*(Deviation from the first draft, which described only the walk and let
+`lion_posting_set_lookup_many()` call the descent directly: an `IN` list of `int8` values against an
+`int4` index whose family had no cross-type proc 4 descended a value-ordered tree comparing hashes
+and returned nothing at all. `test/sql/directory.sql` §12 builds such a family.)*
+
+### Operations
+
+- **Lookup**: descend from the root with a binary search per page, SHARE locks, **releasing the
+  parent BEFORE locking the child**. *(Deviation from the first draft, which said "lock coupling
+  parent→child as nbtree does". nbtree does not couple downwards - `_bt_relandgetbuf()` unlocks the
+  page it came from first - and the reason is not thrift: a split holds the CHILD while it locks the
+  parent, so coupling downwards would close a deadlock cycle that buffer locks have no detector for.
+  What makes the un-coupled descent safe is the right links: a searcher that lands on a page whose
+  high key no longer exceeds its key moves right, which is where the split put the items.)* The leaf
+  is taken in the caller's mode directly (the descent knows it is at level 1), so no lock is ever
+  upgraded. The leaf pin remains the §9 pin for INLINE sets.
+- **The root** is cached in `LionState` and validated by the LION_PAGE_ROOT flag, which a root split
+  clears on the page it demotes - nbtree's BTP_ROOT trick. A lookup therefore costs no meta-page
+  visit at all until the root really moves.
+- **Insert of a new entry**: descend with the leaf EXCLUSIVE; scan the prefix run for the key; if it
+  is absent, walk back to its exact bytewise position on that leaf and insert. (A run that spans
+  pages - which needs an opclass whose comparison ties for distinct entries, so essentially never -
+  re-descends with the exact key instead.) On no room, split.
+- **Split**: allocate the right sibling (`lion_alloc_buffer` with reuse = true is fine; directory
+  pages are never chain heads), rebuild both halves from a private copy of the page with the new item
+  inserted, cut at half the bytes - or, when the page is rightmost and the item goes at the very end,
+  put only the new item on the right and walk the cut back only as far as the high key the left page
+  now needs, so an ascending key sequence fills its leaves completely (without that walk-back the
+  cut is rejected outright, because the page being split is full, and an ascending build lands at
+  50%: measured 12.2 MB against 6.2 MB for 100k ascending bigint keys) - set
+  the high keys and the sibling links, flag the left page INCOMPLETE_SPLIT, and write ONE generic
+  record for (left, right, old right sibling, meta page) = 4 buffers. Then insert the downlink into
+  the parent, and clear the flag in a THIRD record.
+  *(Deviation from the first draft, which had two records with the flag cleared "in a second record"
+  together with the downlink, as nbtree does. GenericXLog takes at most four buffers and a parent
+  SPLIT already needs four of its own, so the child cannot join that record. Three records are safe
+  because the repair is idempotent: it looks for the downlink before inserting one. The left page is
+  held EXCLUSIVE from the first record to the last, which is the property nbtree's README says must
+  hold - two writers that both saw the flag would both insert the downlink.)*
+  The meta page is in the record because it counts the directory's pages, which is what lets the cost
+  model tell a directory page from a container page without reading the index.
+- **Root split** is ATOMIC instead: left, right, the new root and the meta page are four buffers, so
+  the meta page never names a root that does not exist and a root is never flagged. The old root
+  loses LION_PAGE_ROOT in the same record, which is what makes every other backend's cached root
+  detect the change.
+- **The repair rule**: any WRITE descent that lands on a page with INCOMPLETE_SPLIT finishes the
+  split before touching the page, and so does `lion_dir_find_parent()` when it lands on such a
+  parent. Finishing means: take the high key as the separator, find the parent by descending with a
+  key the page itself holds (or, for a page VACUUM has emptied, by scanning the level from its
+  leftmost page), insert the downlink unless it is already there, and clear the flag. Injection point
+  `lion-dir-split-incomplete` fires between the first record and the second;
+  `test/recovery/run.sh` phase 1c crashes the server there and proves the next insert repairs it.
+- **Entry rewrite in place**: as today, on the leaf, EXCLUSIVE. A grown entry that no longer fits
+  splits the leaf and is placed by the split, instead of spilling onto a container page as it had to
+  with the hash directory.
+- **Delete** (VACUUM, §18): entries are deleted with `PageIndexMultiDelete`, which compacts. *(The
+  `PageIndexTupleDeleteNoCompact` of §18 existed to keep entry offsets stable for readers parked on
+  a page; a sorted directory cannot offer that anyway - an insert in the middle of a leaf shifts
+  every offset after it - so the readers changed instead, below, and the compaction reclaims the line
+  pointers.)* An empty leaf is NOT unlinked in this version (leaf deletion needs nbtree's half-dead
+  protocol; documented limitation, and the pages are few).
+- **Ordered iteration**: leftmost leaf, then right links, SHARE lock one page at a time, pin held
+  while an INLINE set from that page is being counted exactly as the bucket walk did.
+
+### Offsets are not names any more
+
+The hash directory only ever APPENDED to a bucket page, so `(page, offset)` named an entry for its
+whole life, and two readers relied on it: `lion_entry_scan_next()`, which gives up its lock between
+two entries, and VACUUM's pass 2, which refers to the entries pass 1 found while the leaf is
+unlocked. A sorted directory inserts in the MIDDLE of a leaf, which shifts everything after it, and
+splits it, which moves the upper half away. Both readers therefore changed:
+
+- **The entry scan resumes at a KEY**: "the first key above the last one I returned". Nothing is
+  skipped or returned twice, because splits move entries only rightwards onto a page the walk has not
+  passed and their keys are still above the last one returned; a deleted entry is simply gone, and
+  only an EMPTY posting set is ever deleted, so its group had nothing the scan's snapshot could have
+  counted. An entry INSERTED behind the walk is missed, which is the same freedom the bucket walk
+  had. `test/isolation/dir_split_scan.spec` parks a GROUP BY between two entries and splits the leaf
+  under it.
+- **VACUUM carries the entry's KIND and KEY** next to the offset, and re-validates before every use:
+  one entry per key, so equal stored bytes mean the same entry. A hit at the remembered offset is the
+  common case, a scan of the page catches an insert that shifted it, and anything else means the
+  entry moved to another leaf and is found again by a descent - **with nothing else held**, because
+  taking a directory lock while holding a container page would close exactly the cycle §11's waiting
+  rule exists to avoid. The final delete step validates the same way and simply skips an entry that
+  has moved; the next VACUUM gets it.
+
+### Bulk build
+
+The tuplesort's sort keys are `(key ASC NULLS FIRST, [kind], code)` for an ordered opclass and
+`(hash, kind, code)` for an unordered one, so the entries come out in directory order. Neither
+LEADS with `kind`, although the directory order does, and that is deliberate: a reserved entry has
+no key at all, so its NULL sorts before every value with NULLS FIRST, and for an unordered opclass
+the reserved entries hash to LION_NULLKEY_HASH = 0 which is the minimum - so both give exactly the
+(kind, key, hash) sequence. Leading with `kind` gives the same ORDER and
+is much slower: tuplesort compares the leading key from a datum it precomputed and every further
+key by fetching the attribute out of the tuple, and `kind` is the same value for every real row, so
+every comparison would fall through to a fetch. Measured on one million distinct bigint keys: 1.43 s
+of sort with `kind` leading against 0.19 s with the key leading, and 2.04 s against 1.18 s for the
+whole build (HEAD's hash-directory build of the same index is 1.40 s). The three fetched columns are
+for the same reason the fixed-width ones, first in the tuple descriptor, so that their offsets are
+cached.
+
+**`kind` is a sort key whenever the leading one can TIE across kinds**: for a multi-key opclass,
+which has an EMPTY entry as well as a NULL one and neither has a key to tell them apart, and for
+every UNORDERED opclass, whose leading key is the hash. The grouping pass starts a new entry
+whenever the kind changes, so a real key that hashes to 0 interleaving with the reserved NULL rows
+- code by code, which is how the sort leaves them - wrote the NULL entry out several times over and
+`IS NULL` then answered from whichever of them the descent reached first. An ordered non-multikey
+class needs no such key: its only reserved kind is NULL, whose sort key is NULL, and no real key is.
+*(Not in the first draft, which added `kind` for a multi-key class only. `test/sql/directory.sql`
+§11 gives an `xid` class a deliberately coarse hash so that every value collides with the reserved
+entry.)*
+
+**The hash column is int8, zero-extended**: it is a uint32 and the directory compares it as one, and
+sorting it as int4 would put everything above 2^31 first - which for an unordered opclass IS the
+order, and verify() catches it.
+
+**A hash COLLISION is ordered at flush time.** The sort brings the tuples of one hash together but
+says nothing about the several distinct keys inside it, so the grouping pass opens a builder per key
+in the order the first TID of each happened to arrive. `lion_flush_builders()` sorts the open
+builders with the directory comparator - (kind, proc 4, hash, stored bytes), the same order
+`lion_cmp_entry()` applies to two entries on a leaf - before writing any of them out. There is one
+builder unless the hash function collides, so the sort costs nothing in the normal case. *(Not in
+the first draft, which flushed them in creation order: the leaf items came out unsorted, which
+breaks the binary search and lets the key-based resume of `lion_entry_scan_next()` skip entries.
+verify()'s "strictly increasing within a page" check is what catches it.)*
+
+Pass 1 of the old build is GONE. It existed only to count distinct keys so that the bucket count
+could be sized; the one remaining pass counts them as it groups, so the build reads the sorted data
+once instead of twice and the tuplesort no longer needs TUPLESORT_RANDOMACCESS.
+
+Leaves are filled left to right at `fillfactor` (reloption, 10..100, default 90), and the internal
+levels are built bottom-up in the same pass, nbtree's `_bt_buildadd` shape: one open page per level,
+written out when the item that does not fit arrives - that item's key is the page's high key, and the
+page's own first key is the downlink it hands to the level above. The first page of every level gets
+the minus-infinity separator. The level whose last page is also its first is the root. An empty table
+gets a single leaf that is also the root.
+
+**`fillfactor` is about the LEAVES only.** An internal level is packed to
+`LION_NONLEAF_FILLFACTOR` = 70, nbtree's own separate non-leaf fill, and takes at least
+`LION_ABS_MIN_DOWNLINKS` = 2 downlinks whatever the fill target says (it aims for 3 and settles for
+2 when the keys are too large - three LION_MAX_KEY_SIZE pivots plus a high key do not fit a block).
+Without that floor, `fillfactor = 10` and 512-byte keys leave ONE downlink on an internal page,
+every level is then as large as the one below it, and `lion_build_finish_dir()` climbs for ever
+without reaching a root. It now also checks the invariant it relies on - each level strictly smaller
+than the one below - and errors out rather than looping. *(Not in the first draft, which applied the
+leaf budget to every level and said no floor was needed.)*
+
+**The high key is accounted for with nbtree's "last item becomes the high key" rule.** A page's high
+key is a copy of the FIRST key of the page to its right, which is the item that did not fit; keys
+are variable length, so one of LION_MAX_KEY_SIZE arriving behind a page full of short ones needs
+room the page does not have, and reserving for the incoming key alone (what the first draft did)
+overflowed the page and failed the build outright. `lion_build_level_flush()` therefore moves
+trailing items to the next page until the high key fits, and the first of THEM supplies it - a pivot
+copy of a key that was already on the page, which is never larger than the item it came from, so the
+reserve is exact by construction. `test/sql/directory.sql` §8 puts a 2000-byte key behind short ones
+at every distance from a page boundary, at the default fill and at 100.
+
+### Readers
+
+`lion_posting_set_lookup()` is a descent. `lion_posting_set_lookup_many()` sorts the values into the
+directory order and locates them in ONE left-to-right leaf walk, stepping right while the next value
+is at most `LION_LOOKUP_WALK_MAX` = 8 pages ahead and descending again when it is further - so a
+dense list pays for the leaves it crosses and a sparse one for a descent each, instead of either
+always. Duplicates are dropped twice over: bytewise between neighbours (free, and it saves the
+lookup) and then by comparing the located entries' STORED KEYS with the index's own equality, which
+is what §15's disjoint sum needs and is stronger than the `(page, offset)` identity it used to use
+(offsets move now). The walk is only available when the values can be ORDERED against the stored
+keys: a cross-type list whose resolution came out as "walk the leaves" (above) takes that fallback
+per value here too, because the two lookups share one resolution. `lion_entry_scan`,
+`lion_emit_all_keys`, `IS NOT NULL`, verify and stats all walk
+the leftmost leaf and then the right links, so their output is in key order for an ordered opclass.
+
+EXPLAIN ANALYZE reports **Directory Pages Read**, the leaves and internal pages the node read, which
+is what `test/sql/directory.sql` uses to prove that a thousand-value IN list costs one pass over the
+leaves its values live on rather than a descent each.
+
+### Planner
+
+When the grouped column's index is `ordered`, the GROUP BY is a single column driven from that index
+(not the IN-list driver, not two columns, not a pinned single group), the table is not partitioned
+and the column is **NOT NULL**, the CustomPath gets pathkeys for the group column, so an
+`ORDER BY <group col>` above it needs no Sort.
+
+Three conditions are subtler than they look:
+
+- the NOT NULL requirement is not conservatism: the reserved NULL entry sorts FIRST and `ORDER BY
+  col` means NULLS LAST, so a nullable column would be claimed in an order the node does not produce.
+- the pathkeys are built for ASCENDING order from the KEY TYPE's own `<`, and not from the query's
+  own `SortGroupClause.sortop`: `standard_qp_callback()` rewrites the GROUP BY clause's sort
+  operators to match the query's ORDER BY when it can, so `ORDER BY k DESC` hands back a DESCENDING
+  clause and building pathkeys from it would claim an order the node does not produce. (That bug was
+  real and `test/sql/directory.sql` pins the `DESC` plan.)
+- and the index's ordering must BE the key type's default btree ordering, not merely some ordering,
+  because that is the order an `ORDER BY` asks for. A partitioned table gets none: each partition is
+  ordered, but the Finalize HashAggregate on top destroys it.
+
+### What goes away
+
+`nbuckets`, `lion_bucket_of`, bucket sizing in ambuild, the bucket-chain warning and
+`LION_BUCKET_PAGES_WARN`, `lion_clamp_buckets`, `lion_bucket_nentries`. The `buckets` reloption is
+still accepted and ignored, with a NOTICE ("buckets is ignored since format 4") when it is SET - not
+when the relcache reads it back. `max_bucket_pages`, `nbuckets` and `bucket_pages` in
+`lion_index_stats()` become `directory_height`, `leaf_pages`, `internal_pages` and `ordered`. The
+§17 cardinality guard's insert-side estimate becomes "the entries on this leaf times the number of
+leaves" instead of "the entries in this bucket times the bucket count"; both are crude by design.
+
+### Locking summary
+
+Directory pages: nbtree's rules - no coupling downwards, move right when the high key no longer
+exceeds the search key, splits hold left, then right, then the old right sibling, then the meta page,
+and an ascent holds the child while it locks the parent. Container chains: unchanged (§5, §11, §18).
+The lock order directory page → container page is preserved, and the one place that used to break it
+- VACUUM re-finding a moved entry - is done with nothing held. VACUUM's two-pass protocol addresses
+the LEAF that holds the entry where it used to address the bucket head.
+
+### Format
+
+LION_VERSION 4; version 3 indexes are refused with the REINDEX hint. verify() checks the tree level
+by level from the leaves up: page kinds and level numbers, sibling links, the high key present iff
+the page is not rightmost, keys strictly increasing within a page and the last key below the high
+key, the high key of a page not above the first key of the next, every downlink of a level naming
+exactly the pages of the level below in that order (which is "every leaf reachable from the root
+exactly once and the leaf right-link chain equals the in-order sequence"), the leftmost downlink of
+each level being minus infinity, each separator at or below its child's own first key, each child's
+high key at or below the next separator, and INCOMPLETE_SPLIT pages reported as a WARNING with the
+repair hint.
+
+### Not done in this version
+
+Leaf deletion and page reclaim for an empty leaf (nbtree's half-dead protocol); a backward scan
+(`leftlink` exists and verify() checks it, but nothing reads it yet - §22 and a future `amgettuple`
+will); parallel build; and online deduplication of a prefix run that spans pages, which an opclass
+with a comparison coarser than its equality could in principle produce.
 
 ## 22. Per-key posting tree (format version 4, same wave)
 
@@ -2225,6 +2553,34 @@ the number of sources (probes), instead of the sum of all sources' containers.
 
 Format: covered by LION_VERSION 4 with §21. verify(): tree shape per key (levels, downlinks, leaf
 right-link chain equals the in-order leaf sequence, minckey/maxckey consistent with separators).
+
+### What §21 leaves §22 (written after §21 was implemented)
+
+- **The entry's `head` is written under the leaf's EXCLUSIVE lock, in the same GenericXLog record as
+  the page that made it change** - which is exactly what a posting-tree root split needs. Every
+  writer of a key holds the directory LEAF that carries its entry from the descent to the last
+  record (`lion_insert_one()` takes it EXCLUSIVE and releases it at the end; VACUUM takes it per
+  window). `lion_put_entry()` / `lion_replace_entry()` are the only ways `head` ever changes, they
+  take the caller's open `GenericXLogState`, and an entry never changes size once it is a CHAIN
+  entry, so the write cannot fail. A posting-tree root split can therefore register (entry leaf, old
+  root, new root, new sibling) = 4 buffers and set `head` to the new root atomically with them, as
+  this section's Operations already plan.
+- **The buffer budget is the thing to watch.** The directory's own split already uses all four
+  buffers of a GenericXLog record (left, right, old right sibling, meta page), and the meta page is
+  in there only to keep `dirpages` exact for the cost model. A posting-tree split that also wants
+  the entry leaf has three buffers of its own left, which is why §21 put the "clear the incomplete
+  flag" step in a third record rather than joining it to the parent insert: the same trick - an
+  idempotent repair driven by a page flag - is available to §22 and is cheaper than a custom
+  resource manager.
+- **`lion_chain_find_page()` is already the only place a ckey is turned into a block**, and its two
+  callers (`lion_insert_lock_chain_page()` and the verifier) pass the entry's `hash`/`head`/`tail`,
+  so replacing the walk with a descent changes one function.
+- **Container pages have a free `level` field** in the special area since §21 (the directory needed
+  one and the special area grew to 32 bytes either way), so §22 needs no further format change to
+  the page header - only the internal posting page's item layout.
+- **The §11 proof text now says explicitly which pages are cleanup-locked and why** ("every page
+  that can hold a TID"), so §22's internal posting pages fall under the same sentence: they hold no
+  TIDs, and cleanup-locking them is optional rather than load-bearing.
 
 Order of work. §21 first (it changes where entries live; the posting tree hangs off the entry and
 is independent of the directory shape), §22 second, one format bump. Multicolumn indexes

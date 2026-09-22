@@ -17,7 +17,7 @@ SELECT setseed(0.42);
  */
 CREATE TABLE lion_vfy_empty (k int4);
 CREATE INDEX lion_vfy_empty_k ON lion_vfy_empty USING lion (k)
-	WITH (buckets = 4);
+	WITH (inline_limit = 512);
 SELECT * FROM lion_index_stats('lion_vfy_empty_k');
 SELECT lion_index_verify('lion_vfy_empty_k');
 SELECT lion_index_verify('lion_vfy_empty_k', true);
@@ -29,14 +29,14 @@ SELECT i, i % 997, 'v' || (i % 13), (i % 71)::numeric / 4,
   FROM generate_series(1, 100000) i;
 
 -- built by ambuild
-CREATE INDEX lion_vfy_k ON lion_vfy USING lion (k) WITH (buckets = 32);
+CREATE INDEX lion_vfy_k ON lion_vfy USING lion (k);
 CREATE INDEX lion_vfy_t ON lion_vfy USING lion (t);
 CREATE INDEX lion_vfy_n ON lion_vfy USING lion (n) WITH (inline_limit = 64);
 CREATE INDEX lion_vfy_u ON lion_vfy USING lion (u);
 
-SELECT nbuckets, entries, inline_entries, containers, ntids
+SELECT ordered, entries, inline_entries, containers, ntids
   FROM lion_index_stats('lion_vfy_k');
-SELECT nbuckets, entries, inline_entries, containers, ntids
+SELECT ordered, entries, inline_entries, containers, ntids
   FROM lion_index_stats('lion_vfy_t');
 SELECT entries, inline_entries, ntids FROM lion_index_stats('lion_vfy_n');
 SELECT entries, inline_entries, ntids FROM lion_index_stats('lion_vfy_u');
@@ -49,7 +49,7 @@ SELECT lion_index_verify('lion_vfy_u', true);
 -- container bytes and free bytes are consistent with the pages they live on
 SELECT container_bytes > 0 AS has_bytes,
 	   container_bytes + free_bytes <
-	   (bucket_pages + container_pages) * current_setting('block_size')::int8
+	   (leaf_pages + internal_pages + container_pages) * current_setting('block_size')::int8
 	   AS fits_in_its_pages
   FROM lion_index_stats('lion_vfy_t');
 

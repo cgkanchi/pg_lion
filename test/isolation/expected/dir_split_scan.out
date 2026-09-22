@@ -1,0 +1,91 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s1_group s2_split s2_wakeup s1_plain s3_shape s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) dsp;
+step s1_group: 
+	SELECT count(*) AS groups, count(DISTINCT k) AS distinct_groups,
+		   sum(c) AS rows_counted, min(c) AS min_rows, max(c) AS max_rows
+	  FROM (SELECT k, count(*) AS c FROM dsp GROUP BY k) g;
+ <waiting ...>
+step s2_split: 
+	BEGIN;
+	INSERT INTO dsp
+	SELECT 100000 + i, 'key-' || lpad((2 * i + 1)::text, 90, '0'),
+		   repeat('y', 200)
+	  FROM generate_series(1, 60) i;
+	ROLLBACK;
+
+step s2_wakeup: 
+	/*
+	 * Detach first, so that nothing can park at the point again, then
+	 * release whoever is parked now.  How MANY times the point is reached is
+	 * not fixed - the walk fires it once per leaf it consumes an entry from,
+	 * and the split makes more leaves - but after this step nobody is waiting
+	 * on it, which is all the permutation needs.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-resumed');
+	DO $$
+	DECLARE n int; zero int := 0;
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			SELECT count(*) INTO n FROM pg_stat_activity
+			 WHERE wait_event = 'lion-entry-scan-resumed';
+			IF n = 0 THEN
+				zero := zero + 1;
+				EXIT WHEN zero >= 10;
+			ELSE
+				zero := 0;
+				BEGIN
+					PERFORM injection_points_wakeup('lion-entry-scan-resumed');
+				EXCEPTION WHEN OTHERS THEN NULL;
+				END;
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_group: <... completed>
+groups|distinct_groups|rows_counted|min_rows|max_rows
+------+---------------+------------+--------+--------
+    30|             30|        6000|     200|     200
+(1 row)
+
+step s1_plain: 
+	SET pg_lion.enable_count_pushdown = off;
+	SELECT count(*) AS groups, count(DISTINCT k) AS distinct_groups,
+		   sum(c) AS rows_counted
+	  FROM (SELECT k, count(*) AS c FROM dsp GROUP BY k) g;
+	SET pg_lion.enable_count_pushdown = on;
+
+groups|distinct_groups|rows_counted
+------+---------------+------------
+    30|             30|        6000
+(1 row)
+
+step s3_shape: 
+	SELECT leaf_pages > 1 AS the_leaf_really_split,
+		   directory_height > 0 AS the_root_really_moved,
+		   entries = 90 AS aborted_entries_are_still_there
+	  FROM lion_index_stats('dsp_k');
+
+the_leaf_really_split|the_root_really_moved|aborted_entries_are_still_there
+---------------------+---------------------+-------------------------------
+t                    |t                    |t                              
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('dsp_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

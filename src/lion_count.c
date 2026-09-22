@@ -64,6 +64,7 @@
 #include "common/hashfn.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "parser/parse_coerce.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
@@ -72,6 +73,7 @@
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
+#include "utils/typcache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -283,8 +285,31 @@ typedef struct LionProbe
 	bool		crosstype;		/* the keys are not the index's own type */
 	FmgrInfo	eqproc;			/* crosstype: stored = search comparison */
 	FmgrInfo	hashinfo;		/* crosstype: the search type's own hash */
+	FmgrInfo	cmpproc;		/* crosstype: stored <=> search (§21) */
+	bool		hascmp;
+	FmgrInfo	sortproc;		/* two SEARCH values, for ordering a list */
+	bool		hassort;
 	int16		typlen;			/* the search type, for datumIsEqual() */
 	bool		typbyval;
+
+	/*
+	 * DESIGN.md §21, cross-type resolution.  A value of another type can be
+	 * turned into a probe of the index's own type in three ways, tried in this
+	 * order, and the SINGLE and the BATCHED lookup must agree on which one,
+	 * because they walk the same tree:
+	 *
+	 *	- the family's cross-type ordering function (hascmp): descend as usual;
+	 *	- an implicit or binary coercion to the KEY type (coerce): the value
+	 *	  becomes one of the index's own and everything - hash, equality,
+	 *	  ordering - is the index's own, which is exactly consistent;
+	 *	- neither (needscan): the tree is ordered by a comparison this value
+	 *	  cannot take part in, so the leaves are walked with the cross-type
+	 *	  EQUALITY instead (lion_dir_find()).  Correct and linear.
+	 */
+	bool		coerce;			/* probe with the value cast to the key type */
+	bool		coercebyfunc;	/* ... which takes a function, not a relabel */
+	FmgrInfo	coerceproc;
+	bool		needscan;		/* no ordering for these values: walk the leaves */
 } LionProbe;
 
 static void
@@ -301,6 +326,13 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 	{
 		probe->typlen = state->typlen;
 		probe->typbyval = state->typbyval;
+		if (state->ordered)
+		{
+			probe->cmpproc = state->cmpproc;
+			probe->hascmp = true;
+			probe->sortproc = state->cmpproc;
+			probe->hassort = true;
+		}
 		return;
 	}
 
@@ -326,6 +358,101 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 	fmgr_info(hashproc, &probe->hashinfo);
 	probe->crosstype = true;
 	get_typlenbyval(keytype, &probe->typlen, &probe->typbyval);
+
+	/*
+	 * DESIGN.md §21: descending the directory for a value of another type
+	 * needs the family's cross-type ordering function, and sorting a whole IN
+	 * list of them needs the search type's own.  A family that has neither is
+	 * not an error - the leaves are walked instead - so both are optional here.
+	 */
+	if (state->ordered)
+	{
+		Oid			cmpproc = get_opfamily_proc(opfamily, opcintype, keytype,
+												LION_CMP_PROC);
+		TypeCacheEntry *typentry;
+
+		if (OidIsValid(cmpproc))
+		{
+			fmgr_info(cmpproc, &probe->cmpproc);
+			probe->hascmp = true;
+		}
+
+		typentry = lookup_type_cache(keytype, TYPECACHE_CMP_PROC_FINFO);
+		if (OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+		{
+			fmgr_info_copy(&probe->sortproc, &typentry->cmp_proc_finfo,
+						   CurrentMemoryContext);
+			probe->hassort = true;
+		}
+	}
+
+	if (!state->ordered || probe->hascmp)
+		return;
+
+	/*
+	 * The tree is ordered by a comparison this value cannot take part in.
+	 * Casting it to the KEY type makes it one of the index's own values, and
+	 * then hash, equality and ordering are all the index's own - which is the
+	 * one resolution that is consistent by construction.  Only a BINARY
+	 * coercion or an IMPLICIT cast is taken: those are the ones PostgreSQL
+	 * itself would apply to the value in an expression.  A one-argument cast
+	 * function is required, because a length coercion is about a typmod this
+	 * code has none of.
+	 */
+	{
+		Oid			castfunc = InvalidOid;
+		CoercionPathType path;
+
+		path = find_coercion_pathway(opcintype, keytype, COERCION_IMPLICIT,
+									 &castfunc);
+		if (path == COERCION_PATH_RELABELTYPE)
+			probe->coerce = true;
+		else if (path == COERCION_PATH_FUNC && OidIsValid(castfunc) &&
+				 get_func_nargs(castfunc) == 1)
+		{
+			fmgr_info(castfunc, &probe->coerceproc);
+			probe->coerce = true;
+			probe->coercebyfunc = true;
+		}
+	}
+
+	if (probe->coerce)
+	{
+		/* From here on the probe values ARE the index's own type. */
+		probe->crosstype = false;
+		probe->typlen = state->typlen;
+		probe->typbyval = state->typbyval;
+		probe->cmpproc = state->cmpproc;
+		probe->hascmp = true;
+		probe->sortproc = state->cmpproc;
+		probe->hassort = true;
+	}
+	else
+		probe->needscan = true;
+}
+
+/*
+ * The Datum to probe with: the caller's value, or its cast to the key type.
+ */
+static inline Datum
+lion_probe_value(LionProbe *probe, Datum value)
+{
+	if (!probe->coercebyfunc)
+		return value;			/* binary coercion needs no work at all */
+	return FunctionCall1(&probe->coerceproc, value);
+}
+
+/* A search key for one probe value. */
+static void
+lion_probe_search_key(LionState *state, LionProbe *probe, Datum key,
+					 uint32 hash, LionSearchKey *sk)
+{
+	lion_search_key_init(state, sk, LION_KIND_VALUE, key, hash);
+	if (probe->crosstype)
+	{
+		sk->eqproc = &probe->eqproc;
+		sk->cmpproc = probe->hascmp ? &probe->cmpproc : NULL;
+	}
 }
 
 static inline uint32
@@ -409,46 +536,79 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 }
 
 /*
- * One key of an IN list, in the order its entry should be looked up in:
- * bucket first, so the bucket pages are visited in ascending block order,
- * then hash, so equal values (which hash equally) end up adjacent and the
- * duplicate check is a look at the neighbours.
+ * One key of an IN list, in the order its entry is looked up in: the
+ * DIRECTORY order (DESIGN.md §21), so that the whole list is located in one
+ * left-to-right walk of the leaves and duplicates - which sort together - are
+ * dropped by looking at the neighbours.
  */
 typedef struct LionProbeKey
 {
-	uint32		bucket;
 	uint32		hash;
 	int32		idx;			/* position in the caller's value array */
 } LionProbeKey;
 
+typedef struct LionProbeSort
+{
+	const Datum *values;
+	LionProbe  *probe;
+	Oid			collation;
+} LionProbeSort;
+
 static int
-lion_probe_key_cmp(const void *a, const void *b)
+lion_probe_key_cmp(const void *a, const void *b, void *arg)
 {
 	const LionProbeKey *x = (const LionProbeKey *) a;
 	const LionProbeKey *y = (const LionProbeKey *) b;
+	LionProbeSort *ctx = (LionProbeSort *) arg;
 
-	if (x->bucket != y->bucket)
-		return x->bucket < y->bucket ? -1 : 1;
+	if (ctx->probe->hassort)
+	{
+		int32		c = DatumGetInt32(FunctionCall2Coll(&ctx->probe->sortproc,
+														ctx->collation,
+														ctx->values[x->idx],
+														ctx->values[y->idx]));
+
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
 	if (x->hash != y->hash)
 		return x->hash < y->hash ? -1 : 1;
 	return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
 }
 
 /*
+ * Fill *ps from the entry the caller has located at (buf, offnum), which is a
+ * directory leaf held SHARE, and release the buffer - keeping its pin when the
+ * entry is INLINE, because that pin is the DESIGN.md §9 interlock.
+ */
+static void
+lion_posting_set_take(Relation index, LionState *state, Buffer buf,
+					 OffsetNumber offnum, LionPostingSet *ps)
+{
+	bool		keeppin;
+
+	lion_fill_posting_set(index, state, buf, offnum, ps, &keeppin);
+
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	if (keeppin)
+		ps->pinbuf = buf;
+	else
+		ReleaseBuffer(buf);
+}
+
+/*
  * Locate the entry of one key whose hash has already been computed.  This is
- * lion_posting_set_lookup() from the bucket read onwards, split out so that a
- * whole IN list can have its hashes taken - and its bucket pages visited in
- * order - before any page is read (lion_posting_set_lookup_many()).
+ * lion_posting_set_lookup() from the descent onwards, split out so that a
+ * whole IN list can be sorted before any page is read
+ * (lion_posting_set_lookup_many()).
  */
 static bool
 lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
-					   Datum key, uint32 hash, uint32 bucket,
-					   LionPostingSet *ps)
+					   Datum key, uint32 hash, LionPostingSet *ps)
 {
-	Buffer		headbuf;
-	Buffer		entrybuf;
-	OffsetNumber entryoff;
-	bool		keeppin;
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
@@ -457,40 +617,17 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 	ps->entryblk = InvalidBlockNumber;
 	ps->entryoff = InvalidOffsetNumber;
 
-	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(bucket));
-	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
+	lion_probe_search_key(state, probe, key, hash, &sk);
 
-	if (!lion_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
-							key, hash,
-							probe->crosstype ? &probe->eqproc : NULL,
-							state->collation,
-							&entrybuf, &entryoff))
+	if (!lion_dir_find(index, NULL, state, &sk, BUFFER_LOCK_SHARE, false,
+					   &buf, &off, NULL))
 	{
-		UnlockReleaseBuffer(headbuf);
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
 		return false;
 	}
 
-	lion_fill_posting_set(index, state, entrybuf, entryoff, ps, &keeppin);
-
-	if (keeppin)
-	{
-		/*
-		 * DESIGN.md section 9: an INLINE payload's interlock is a pin on the
-		 * bucket page it lives on, so drop the content lock but hold on to
-		 * the pin until lion_posting_set_release().
-		 */
-		LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
-		ps->pinbuf = entrybuf;
-		if (entrybuf != headbuf)
-			UnlockReleaseBuffer(headbuf);
-	}
-	else
-	{
-		if (entrybuf != headbuf)
-			UnlockReleaseBuffer(entrybuf);
-		UnlockReleaseBuffer(headbuf);
-	}
-
+	lion_posting_set_take(index, state, buf, off, ps);
 	return true;
 }
 
@@ -503,12 +640,19 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
 	uint32		hash;
 
 	lion_probe_init(index, state, keytype, &probe);
+	key = lion_probe_value(&probe, key);
 	hash = lion_probe_hash(state, &probe, key);
 
-	return lion_posting_set_locate(index, state, &probe, key, hash,
-								  lion_bucket_of(hash, state->meta.nbuckets),
-								  ps);
+	return lion_posting_set_locate(index, state, &probe, key, hash, ps);
 }
+
+/*
+ * How many leaves a walk may step right over before it is cheaper to descend
+ * again (DESIGN.md §21).  A dense list steps; a list of a handful of values
+ * spread over the whole index descends, instead of reading every leaf in
+ * between.
+ */
+#define LION_LOOKUP_WALK_MAX	8
 
 /*
  * Locate the posting sets of many keys of one index at once: the IN list of
@@ -516,30 +660,30 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  *
  * Two things are done here that a loop over lion_posting_set_lookup() cannot:
  *
- *	- the keys are hashed first and the entries are then located in (bucket,
- *	  hash) order, so the bucket pages are read in ascending block order and
- *	  each one that several keys land in is read once while it is hot, instead
- *	  of in whatever order the array happened to list its values;
+ *	- the values are sorted into the DIRECTORY order first and the leaves are
+ *	  then walked left to right, stepping right while the next value is only a
+ *	  few pages ahead and descending again when it is further, so a thousand
+ *	  values cost one pass over the leaves they live on instead of a thousand
+ *	  random page reads (DESIGN.md §21);
  *	- duplicates are dropped in one pass over that order instead of by
  *	  comparing every value with every earlier one, which at the 1000 values
- *	  the planner allows is half a million datumIsEqual() calls.  Equal values
- *	  hash equally, so they are adjacent in this order.
+ *	  the planner allows is half a million datumIsEqual() calls.
  *
  * Duplicates are dropped TWICE OVER, and the second pass is the one that
  * matters (DESIGN.md §15).  The bytewise comparison comes first because it is
  * free and saves the lookup, but it is not exhaustive: an opclass whose
- * equality is not byte equality - citext - has distinct values that hash alike
- * and reach ONE entry.  So every located entry is also compared with the
- * entries the same hash run has already found, by the (page, offset) the entry
- * tuple lives at, and a repeat is released again.  A union would not have
- * cared (a set ORed with itself is that set); the disjoint-SUM short-circuit
- * does, because it would add the entry's rows twice.
+ * equality is not byte equality - citext - has distinct values that reach ONE
+ * entry.  So every located entry's STORED KEY is also compared, with the
+ * index's own equality, against the ones the same run has already found, and
+ * a repeat is released again.  A union would not have cared (a set ORed with
+ * itself is that set); the disjoint-SUM short-circuit does, because it would
+ * add the entry's rows twice.
  *
  * *sets must have room for nvalues sets; the located ones come out packed at
- * the front, in bucket order, and the return value is how many there are.
- * Every one of them - found or not - must be handed to
- * lion_posting_set_release().  *nfound, if given, is how many of them have an
- * entry in the index at all: nfound == 0 means the union selects nothing.
+ * the front, in key order, and the return value is how many there are.  Every
+ * one of them - found or not - must be handed to lion_posting_set_release().
+ * *nfound, if given, is how many of them have an entry in the index at all:
+ * nfound == 0 means the union selects nothing.
  */
 int
 lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
@@ -548,12 +692,17 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 {
 	LionState   *state = lion_get_state(index);
 	LionProbe	probe;
+	LionProbeSort sortctx;
 	LionProbeKey *probes;
+	const Datum *vals;
+	Datum	   *coerced = NULL;
+	Buffer		buf = InvalidBuffer;
 	int			nprobe = 0;
 	int			nsets = 0;
 	int			found = 0;
-	int			runstart = 0;	/* first set located under this hash */
+	int			runstart = 0;	/* first set located under this sort run */
 	int			i;
+	int			j;
 
 	Assert(nvalues >= 0);
 	if (nfound != NULL)
@@ -561,65 +710,154 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 	if (nvalues == 0)
 		return 0;
 
+	/*
+	 * One resolution for both lookups (DESIGN.md §21).  Whatever
+	 * lion_probe_init() decides - the family's cross-type ordering, a cast to
+	 * the key type, or no ordering at all - applies here exactly as it does to
+	 * lion_posting_set_lookup(), because the two walk the same tree and a
+	 * batched lookup that descended where the single one scans would read the
+	 * directory in an order it is not in.
+	 */
 	lion_probe_init(index, state, keytype, &probe);
+
+	vals = values;
+	if (probe.coercebyfunc)
+	{
+		coerced = (Datum *) palloc(sizeof(Datum) * nvalues);
+		for (i = 0; i < nvalues; i++)
+			coerced[i] = (isnull != NULL && isnull[i]) ? (Datum) 0 :
+				lion_probe_value(&probe, values[i]);
+		vals = coerced;
+	}
 
 	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * nvalues);
 	for (i = 0; i < nvalues; i++)
 	{
 		if (isnull != NULL && isnull[i])
 			continue;			/* `col = NULL` is never true */
-		probes[nprobe].hash = lion_probe_hash(state, &probe, values[i]);
-		probes[nprobe].bucket = lion_bucket_of(probes[nprobe].hash,
-											  state->meta.nbuckets);
+		probes[nprobe].hash = lion_probe_hash(state, &probe, vals[i]);
 		probes[nprobe].idx = i;
 		nprobe++;
 	}
 
+	sortctx.values = vals;
+	sortctx.probe = &probe;
+	sortctx.collation = state->collation;
 	if (nprobe > 1)
-		qsort(probes, nprobe, sizeof(LionProbeKey), lion_probe_key_cmp);
+		qsort_arg(probes, nprobe, sizeof(LionProbeKey), lion_probe_key_cmp,
+				  &sortctx);
 
 	for (i = 0; i < nprobe; i++)
 	{
+		LionSearchKey sk;
+		OffsetNumber off;
 		bool		dup = false;
-		int			j;
-
-		/* A new hash starts a new run of possible duplicates. */
-		if (i > 0 && probes[i].hash != probes[i - 1].hash)
-			runstart = nsets;
+		bool		located;
+		int			steps;
 
 		/*
-		 * A duplicate can only be among the entries with this very hash, and
-		 * the sort has put those together; a run of them is as long as the
-		 * number of values that collide, which is one in practice.
+		 * A new sort run starts a new set of possible duplicates: with an
+		 * ordering that is the run of equal values, without one the run of
+		 * equal hashes.
 		 */
-		for (j = i - 1; j >= 0 && probes[j].hash == probes[i].hash; j--)
-		{
-			if (datumIsEqual(values[probes[i].idx], values[probes[j].idx],
-							 probe.typbyval, probe.typlen))
-			{
-				dup = true;
-				break;
-			}
-		}
-		if (dup)
+		if (i > 0 &&
+			(probe.hassort ?
+			 (lion_probe_key_cmp(&probes[i - 1], &probes[i], &sortctx) != 0 &&
+			  probes[i].hash != probes[i - 1].hash) :
+			 probes[i].hash != probes[i - 1].hash))
+			runstart = nsets;
+
+		/* The cheap half: bytewise-equal neighbours need no lookup at all. */
+		if (i > 0 &&
+			datumIsEqual(vals[probes[i].idx], vals[probes[i - 1].idx],
+						 probe.typbyval, probe.typlen))
 			continue;
 
-		if (lion_posting_set_locate(index, state, &probe,
-								   values[probes[i].idx], probes[i].hash,
-								   probes[i].bucket, &sets[nsets]))
+		lion_probe_search_key(state, &probe, vals[probes[i].idx],
+							 probes[i].hash, &sk);
+
+		memset(&sets[nsets], 0, sizeof(LionPostingSet));
+		sets[nsets].index = index;
+		sets[nsets].pinbuf = InvalidBuffer;
+		sets[nsets].head = InvalidBlockNumber;
+		sets[nsets].entryblk = InvalidBlockNumber;
+		sets[nsets].entryoff = InvalidOffsetNumber;
+
+		if (probe.needscan)
 		{
 			/*
-			 * Two values that are not bytewise equal may still be equal to the
-			 * opclass and so share an entry (citext).  Entry offsets are
-			 * stable, so (page, offset) names the entry; a repeat is dropped
-			 * here rather than counted twice by the disjoint-sum
-			 * short-circuit of DESIGN.md §15.
+			 * No ordering for these values at all: there is no walk to keep,
+			 * and every value takes the same fallback the single lookup takes.
+			 */
+			if (BufferIsValid(buf))
+			{
+				UnlockReleaseBuffer(buf);
+				buf = InvalidBuffer;
+			}
+			located = lion_dir_find(index, NULL, state, &sk, BUFFER_LOCK_SHARE,
+									false, &buf, &off, NULL);
+		}
+		else
+		{
+			/*
+			 * Stay on the leaf the last value was found on when the next one is
+			 * at most a few pages to the right; otherwise descend again.
+			 */
+			for (steps = 0; BufferIsValid(buf); steps++)
+			{
+				Page		page = BufferGetPage(buf);
+
+				if (LionPageIsRightmost(page) ||
+					lion_cmp_entry(state, lion_dir_highkey(page), &sk) > 0)
+					break;
+				if (steps >= LION_LOOKUP_WALK_MAX)
+				{
+					UnlockReleaseBuffer(buf);
+					buf = InvalidBuffer;
+					break;
+				}
+				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			}
+
+			if (!BufferIsValid(buf))
+				buf = lion_dir_search(index, NULL, state, &sk,
+									  BUFFER_LOCK_SHARE, false, &off);
+			else
+				off = lion_dir_binsrch(state, BufferGetPage(buf), &sk);
+
+			located = lion_dir_scan_run(index, state, &sk, BUFFER_LOCK_SHARE,
+										&buf, &off, NULL);
+		}
+
+		if (located)
+		{
+			bool		keeppin;
+
+			lion_fill_posting_set(index, state, buf, off, &sets[nsets],
+								  &keeppin);
+			if (keeppin)
+			{
+				/*
+				 * DESIGN.md §9: the INLINE payload just copied out needs a pin
+				 * of its own on this leaf, independent of the walk's position.
+				 */
+				IncrBufferRefCount(buf);
+				sets[nsets].pinbuf = buf;
+			}
+
+			/*
+			 * Two values that are not bytewise equal may still be the same
+			 * entry (citext).  The stored keys are of the index's own type, so
+			 * its own equality settles it exactly.
 			 */
 			for (j = runstart; j < nsets; j++)
 			{
-				if (sets[j].found &&
-					sets[j].entryblk == sets[nsets].entryblk &&
-					sets[j].entryoff == sets[nsets].entryoff)
+				if (sets[j].found && sets[j].hasstoredkey &&
+					sets[nsets].hasstoredkey &&
+					sets[j].keyisnull == sets[nsets].keyisnull &&
+					(sets[nsets].keyisnull ||
+					 lion_keys_equal(state, sets[j].storedkey,
+									 sets[nsets].storedkey)))
 				{
 					lion_posting_set_release(&sets[nsets]);
 					dup = true;
@@ -630,31 +868,36 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 				continue;
 			found++;
 		}
+
 		nsets++;
 
 		if ((i & 0x3f) == 0)
 			CHECK_FOR_INTERRUPTS();
 	}
 
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+
 	pfree(probes);
+	if (coerced != NULL)
+		pfree(coerced);
 	if (nfound != NULL)
 		*nfound = found;
 	return nsets;
 }
 
 /*
- * The same for the rows whose key is NULL (DESIGN.md §14).  The entry is
- * found by its flag in bucket 0; everything after that - the pin discipline
- * of DESIGN.md §9 included - is identical to a real key's.
+ * The same for the rows whose key is NULL (DESIGN.md §14).  The entry sorts
+ * before every real key (LION_KIND_NULL), so the descent finds it on the
+ * leftmost leaf; everything after that - the pin discipline of DESIGN.md §9
+ * included - is identical to a real key's.
  */
 bool
 lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
 {
 	LionState   *state = lion_get_state(index);
-	Buffer		headbuf;
-	Buffer		entrybuf;
-	OffsetNumber entryoff;
-	bool		keeppin;
+	Buffer		buf;
+	OffsetNumber off;
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
@@ -663,32 +906,14 @@ lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
 	ps->entryblk = InvalidBlockNumber;
 	ps->entryoff = InvalidOffsetNumber;
 
-	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(LION_NULLKEY_BUCKET));
-	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
-
-	if (!lion_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
-							 &entrybuf, &entryoff))
+	if (!lion_find_null_entry(index, state, BUFFER_LOCK_SHARE, &buf, &off))
 	{
-		UnlockReleaseBuffer(headbuf);
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
 		return false;
 	}
 
-	lion_fill_posting_set(index, state, entrybuf, entryoff, ps, &keeppin);
-
-	if (keeppin)
-	{
-		LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
-		ps->pinbuf = entrybuf;
-		if (entrybuf != headbuf)
-			UnlockReleaseBuffer(headbuf);
-	}
-	else
-	{
-		if (entrybuf != headbuf)
-			UnlockReleaseBuffer(entrybuf);
-		UnlockReleaseBuffer(headbuf);
-	}
-
+	lion_posting_set_take(index, state, buf, off, ps);
 	return true;
 }
 
@@ -3656,76 +3881,138 @@ lion_entry_scan_begin(LionEntryScan *es, Relation index)
 {
 	es->index = index;
 	es->state = lion_get_state(index);
-	es->bucket = 0;
-	es->blkno = LION_BUCKET_BLKNO(0);
-	es->off = FirstOffsetNumber;
+	es->blkno = lion_dir_leftmost_leaf(index, es->state);
+	es->haslast = false;
+	es->lastkind = LION_KIND_MINF;
+	es->lasthash = 0;
+	es->lastkey = NULL;
+	es->lastkeylen = 0;
+	es->onpage = 0;
+	es->cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"lion entry scan position",
+									ALLOCSET_SMALL_SIZES);
 	es->done = false;
 }
 
+/* Remember where to resume, as a KEY (see the comment on LionEntryScan). */
+static void
+lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
+{
+	MemoryContextReset(es->cxt);
+	es->lastkind = lion_entry_kind(entry);
+	es->lasthash = entry->hash;
+	es->lastkeylen = entry->keylen;
+
+	/*
+	 * Always a real pointer, even for the key-less reserved entries: a search
+	 * key whose `raw` is NULL compares as the SMALLEST member of its own run
+	 * (lion_cmp_entry()), and "resume after the last key" would then resume AT
+	 * it and hand the same entry out for ever.
+	 */
+	es->lastkey = (char *) MemoryContextAlloc(es->cxt,
+											  Max((Size) entry->keylen, 1));
+	if (entry->keylen > 0)
+		memcpy(es->lastkey, LionEntryGetKey(entry), entry->keylen);
+	es->haslast = true;
+}
+
 /*
- * Fetch the next entry of the index.
+ * Fetch the next entry of the index, in directory order.
  *
- * The scan gives up its lock on a bucket page between calls and comes back to
- * the offset it stopped at, so it depends on entry offsets being stable.
- * They are: an entry is only ever overwritten in place
- * (PageIndexTupleOverwrite keeps the offset) or deleted by VACUUM through
- * lion_delete_entries(), which frees the item but leaves the line pointer
- * array alone for exactly this reason (DESIGN.md §18).  A deleted entry
- * therefore shows up as an unused line pointer and is skipped, and no other
- * entry moves, so a concurrent VACUUM can neither make this scan skip a group
- * nor return one twice.
+ * The scan gives up its lock on a leaf between calls and comes back to the
+ * first key ABOVE the last one it returned, which is what makes it safe
+ * against everything a sorted directory does to offsets: an insert in the
+ * middle of a leaf shifts them, a split moves the upper half to a page
+ * further right, and VACUUM deletes entries outright (DESIGN.md §18, §21).
  *
- * A group cannot be returned twice by the other route either - the entry
- * deleted and the key inserted again further along the page - because VACUUM
- * only deletes an entry whose posting set is EMPTY, and a posting set whose
- * members are all dead to every snapshot has nothing this scan's snapshot
- * could have counted before.
+ * Nothing is therefore skipped or returned twice.  A split moves entries only
+ * rightwards onto a page this walk has not passed, and their keys are still
+ * above the last one returned, so they come out exactly once.  A deleted
+ * entry is simply gone, and only an EMPTY posting set is ever deleted, so its
+ * group had nothing this scan's snapshot could have counted.  An entry
+ * INSERTED behind the walk is missed, which is the same freedom the bucket
+ * walk had: it can only hold TIDs no older snapshot can see.
  */
 bool
 lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 {
-	LionState   *state = es->state;
+	LionState  *state = es->state;
 
-	while (!es->done)
+	while (!es->done && BlockNumberIsValid(es->blkno))
 	{
 		Buffer		buf;
 		Page		page;
 		OffsetNumber maxoff;
+		OffsetNumber off;
 		BlockNumber next;
 		bool		got = false;
+		LionSearchKey sk;
 
 		/*
-		 * Test hook: the scan is between two entries of one bucket page and
-		 * holds no lock on it at all, so a concurrent VACUUM is free to
-		 * delete entries from under it.  It fires once per bucket page (the
-		 * offsets of a page are consumed in ascending order), which is what
-		 * lets an isolation test park a GROUP BY here exactly once;
-		 * test/isolation/vacuum_entry_delete.spec proves that the resumed
-		 * scan neither skips a group nor returns one twice.  Compiles to
+		 * Test hook: the scan is between two entries of one leaf and holds no
+		 * lock on it at all, so a concurrent VACUUM is free to delete entries
+		 * and a concurrent insert to split the page.  It fires once per leaf,
+		 * which is what lets an isolation test park a GROUP BY here exactly
+		 * once; test/isolation/vacuum_entry_delete.spec and
+		 * test/isolation/dir_split_scan.spec are those two cases.  Compiles to
 		 * nothing without --enable-injection-points.
 		 */
-		if (es->off == OffsetNumberNext(FirstOffsetNumber))
+		if (es->onpage == 1)
 			INJECTION_POINT("lion-entry-scan-resumed", NULL);
 
 		buf = ReadBuffer(es->index, es->blkno);
+		lion_dir_pages_read++;
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (!LionPageIsBucket(page))
+		if (!LionPageIsLeaf(page))
 		{
 			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index: block %u is not a bucket page",
+			elog(ERROR, "lion index: block %u is not a directory leaf",
 				 es->blkno);
 		}
+
+		if (es->haslast)
+		{
+			sk.kind = es->lastkind;
+			sk.key = (es->lastkind == LION_KIND_VALUE) ?
+				lion_fetch_key(state, es->lastkey) : (Datum) 0;
+			sk.hash = es->lasthash;
+			sk.cmpproc = state->ordered ? &state->cmpproc : NULL;
+			sk.eqproc = &state->eqproc;
+			sk.collation = state->collation;
+			sk.raw = es->lastkey;
+			sk.rawlen = es->lastkeylen;
+
+			/*
+			 * Everything on this page may already be behind us, which is what
+			 * a split of the page we were on looks like from here.
+			 */
+			if (!LionPageIsRightmost(page) &&
+				lion_cmp_entry(state, lion_dir_highkey(page), &sk) <= 0)
+			{
+				next = LionPageGetOpaque(page)->rightlink;
+				UnlockReleaseBuffer(buf);
+				es->blkno = next;
+				es->onpage = 0;
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+
+			off = lion_dir_binsrch(state, page, &sk);
+			while (off <= PageGetMaxOffsetNumber(page) &&
+				   lion_cmp_entry(state, lion_page_entry(page, off), &sk) <= 0)
+				off = OffsetNumberNext(off);
+		}
+		else
+			off = lion_page_first_data(page);
+
 		maxoff = PageGetMaxOffsetNumber(page);
 
-		while (es->off <= maxoff)
+		for (; off <= maxoff; off++)
 		{
-			ItemId		iid = PageGetItemId(page, es->off);
+			ItemId		iid = PageGetItemId(page, off);
 			LionEntryTuple *entry;
-			OffsetNumber thisoff = es->off;
 			bool		keeppin;
-
-			es->off = OffsetNumberNext(es->off);
 
 			if (!ItemIdIsUsed(iid))
 				continue;
@@ -3735,24 +4022,29 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 			 * An entry whose posting set is empty can never produce a group.
 			 * VACUUM deletes those (DESIGN.md §18), but one can be seen here
 			 * between the moment its last TID was filtered out and the moment
-			 * the bucket page's final step removes it.
+			 * the leaf's final step removes it.
 			 */
 			if (entry->ntids == 0)
+			{
+				lion_entry_scan_remember(es, entry);
 				continue;
+			}
 
-			lion_fill_posting_set(es->index, state, buf, thisoff, ps, &keeppin);
+			lion_fill_posting_set(es->index, state, buf, off, ps, &keeppin);
 			*key = ps->storedkey;
 			if (keeppin)
 			{
 				/*
 				 * DESIGN.md section 9: the INLINE payload we just copied out
-				 * needs a pin of its own on this bucket page, independent of
-				 * the scan's position.
+				 * needs a pin of its own on this leaf, independent of the
+				 * scan's position.
 				 */
 				IncrBufferRefCount(buf);
 				ps->pinbuf = buf;
 			}
 
+			lion_entry_scan_remember(es, entry);
+			es->onpage++;
 			got = true;
 			break;
 		}
@@ -3763,21 +4055,12 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 		if (got)
 			return true;
 
-		/* This bucket page is done: next page of the chain, or next bucket. */
-		if (BlockNumberIsValid(next))
-			es->blkno = next;
-		else if (++es->bucket < state->meta.nbuckets)
-			es->blkno = LION_BUCKET_BLKNO(es->bucket);
-		else
-		{
-			es->done = true;
-			break;
-		}
-		es->off = FirstOffsetNumber;
-
+		es->blkno = next;
+		es->onpage = 0;
 		CHECK_FOR_INTERRUPTS();
 	}
 
+	es->done = true;
 	return false;
 }
 
@@ -3785,6 +4068,11 @@ void
 lion_entry_scan_end(LionEntryScan *es)
 {
 	es->done = true;
+	if (es->cxt != NULL)
+	{
+		MemoryContextDelete(es->cxt);
+		es->cxt = NULL;
+	}
 }
 
 

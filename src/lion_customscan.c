@@ -69,9 +69,11 @@
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
 #include "optimizer/cost.h"
+#include "parser/parse_oper.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
+#include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
@@ -442,6 +444,15 @@ typedef struct LionCountScanState
 	 */
 	LionVisCache *viscache;
 	LionCountStats stats;
+
+	/*
+	 * Directory pages this node's execution has read (DESIGN.md §21), as the
+	 * difference of the process-wide counter across each ExecCustomScan call.
+	 * It is what EXPLAIN ANALYZE prints as "Directory Pages Read", and what
+	 * test/sql/directory.sql uses to prove that a sorted IN list costs one
+	 * pass over the leaves it crosses instead of a descent per value.
+	 */
+	int64		dirpages;
 } LionCountScanState;
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
@@ -451,6 +462,7 @@ static Node *lion_create_custom_scan_state(CustomScan *cscan);
 static void lion_begin_custom_scan(CustomScanState *node, EState *estate,
 								  int eflags);
 static TupleTableSlot *lion_exec_custom_scan(CustomScanState *node);
+static TupleTableSlot *lion_exec_custom_scan_internal(CustomScanState *node);
 static void lion_end_custom_scan(CustomScanState *node);
 static void lion_rescan_custom_scan(CustomScanState *node);
 static void lion_explain_custom_scan(CustomScanState *node, List *ancestors,
@@ -1165,10 +1177,13 @@ lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  *
  * Proportional rather than exact.  What a count actually reads:
  *
- *	- for each WHERE key: ONE bucket page (a hash lookup), then that key's own
- *	  container chain, which was written sequentially and is a fraction of the
- *	  index's container pages proportional to the clause selectivity.  An IN
- *	  list is one such lookup per element (DESIGN.md §15);
+ *	- for each WHERE key: ONE DESCENT of the entry directory (height + 1
+ *	  pages, DESIGN.md §21), then that key's own container chain, which was
+ *	  written sequentially and is a fraction of the index's container pages
+ *	  proportional to the clause selectivity.  An IN list is one lookup per
+ *	  element (DESIGN.md §15), but its values are SORTED first and located in
+ *	  one left-to-right walk, so a long list pays for the leaves it crosses
+ *	  and not for a descent each;
  *	- for a GROUP BY: every page of the group index;
  *	- one O(1) step per container per participating source (the visibility map
  *	  is read per container);
@@ -1177,11 +1192,9 @@ lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  *	  each resolved against the snapshot, on as many distinct blocks as there
  *	  can be - each of them fetched once per query.
  *
- * The bucket pages are NOT charged wholesale: an index carries at least
- * LION_DEFAULT_BUCKETS of them, which would price a single-key count on a
- * small table above a sequential scan of the whole table.  The bucket count
- * comes from the index's meta page (cached in rd_amcache), as
- * btcostestimate reads the tree height from the metapage.
+ * The directory pages are NOT charged wholesale: they would price a
+ * single-key count on a small table above a sequential scan of the whole
+ * table.
  *
  * It has to beat Agg-over-BitmapHeapScan when the pushdown really is cheaper
  * and lose when it is not; it is not meant to be comparable with core cost
@@ -1192,15 +1205,61 @@ lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
  * numgroups is the parent's estimate throughout: a partition may hold rows of
  * every group.
  */
+/*
+ * The pages of the entry directory, and how deep it is (DESIGN.md §21).  Both
+ * come off the meta page, which lion_get_state() has cached in rd_amcache, as
+ * btcostestimate reads the tree height from btree's metapage; the directory
+ * page count is maintained exactly by ambuild and by every split.
+ */
 static double
-lion_index_bucket_pages(IndexOptInfo *idx)
+lion_index_dir_pages(IndexOptInfo *idx, double *height)
 {
 	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
-	LionState   *state = lion_get_state(indexrel);
-	double		nbuckets = (double) state->meta.nbuckets;
+	LionMetaPageData meta;
+	double		dirpages;
+
+	lion_read_meta(indexrel, &meta);
+	dirpages = (double) meta.dirpages;
+	if (height != NULL)
+		*height = (double) meta.height;
 
 	index_close(indexrel, AccessShareLock);
-	return nbuckets;
+	return Max(dirpages, 1.0);
+}
+
+/*
+ * Does this index order its entries by the KEY TYPE's own order (DESIGN.md
+ * §21)?  Two things have to hold, and both are about what the planner is
+ * allowed to conclude from the entry scan coming out in directory order:
+ *
+ *	- the index is ordered at all, i.e. its opclass has support function 4 (or
+ *	  its key type has a default btree opclass to borrow one from);
+ *	- and that ordering IS the key type's default btree ordering, because that
+ *	  is the order an `ORDER BY col` asks for.  An opclass free to define its
+ *	  own comparison is free to define a different one.
+ *
+ * The collation is not checked here: §10 already requires the index's
+ * collation to equal the grouping column's, which is the same rule the
+ * planner's IndexCollMatchesExprColl() applies to an index scan.
+ */
+static bool
+lion_index_orders_naturally(IndexOptInfo *idx)
+{
+	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
+	LionState  *state = lion_get_state(indexrel);
+	bool		ok = false;
+
+	if (state->ordered)
+	{
+		TypeCacheEntry *typentry = lookup_type_cache(state->typid,
+													 TYPECACHE_CMP_PROC);
+
+		ok = OidIsValid(typentry->cmp_proc) &&
+			typentry->cmp_proc == state->cmpproc.fn_oid;
+	}
+
+	index_close(indexrel, AccessShareLock);
+	return ok;
 }
 
 /*
@@ -1387,7 +1446,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		dirty_pages;
 	double		matching = Max(rel->rows, 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
-	double		random_pages = 0;	/* bucket page lookups */
+	double		random_pages = 0;	/* directory leaves, one per lookup */
+	Cost		descent_cost = 0;	/* comparisons on the way down (§21) */
 	double		seq_pages = 0;	/* container chains, read in order */
 	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
 	double		ncontainers = 0;
@@ -1417,7 +1477,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
 		Selectivity sel;
-		double		nbuckets;
+		double		dirpages;
+		double		height = 0;
 		double		container_pages;
 		double		nkeys = 1.0;
 
@@ -1433,9 +1494,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
 		clausesel[ci++] = sel;
-		nbuckets = Max(lion_index_bucket_pages(idx), 1.0);
+		dirpages = lion_index_dir_pages(idx, &height);
 
-		container_pages = (double) idx->pages - 1.0 - nbuckets;
+		container_pages = (double) idx->pages - 1.0 - dirpages;
 		container_pages = Max(container_pages, 0.0);
 
 		/*
@@ -1476,10 +1537,11 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		{
 			/*
 			 * A list's lookups are NOT a sequence of random reads.
-			 * lion_posting_set_lookup_many() hashes every value first and then
-			 * visits the bucket pages in ASCENDING BLOCK ORDER (DESIGN.md
-			 * §15), so the same argument lion_heap_page_cost() makes about a
-			 * recheck's heap pages applies to them: a set of pages that is
+			 * lion_posting_set_lookup_many() sorts the values into the
+			 * directory order and walks the leaves left to right (DESIGN.md
+			 * §21), so the same argument lion_heap_page_cost() makes about a
+			 * recheck's heap pages applies to them, and more strongly than it
+			 * did to the hash directory this replaced: a set of pages that is
 			 * dense in the index, or that fits in the cache, is read at
 			 * something near seq_page_cost.  Charging a thousand-element list
 			 * five hundred RANDOM reads of a one-megabyte index is what kept
@@ -1490,9 +1552,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 * list cannot read more of them than exist, and an index whose
 			 * entries are all INLINE (which is what a high-cardinality column
 			 * looks like since DESIGN.md §13) has none to read at all - its
-			 * payloads are on the bucket pages already charged.
+			 * payloads are on the leaves already charged.
 			 */
-			double		lookups = Min(nkeys, nbuckets);
+			double		lookups = Min(nkeys, dirpages);
 			double		idx_pages = Max((double) idx->pages, 1.0);
 
 			lookup_cost += lookups *
@@ -1502,7 +1564,16 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		}
 		else
 		{
+			/*
+			 * One descent.  Only the LEAF is charged as a page read: the root
+			 * and the internal pages above it are a handful of blocks that
+			 * every lookup touches, so they stay in cache, which is exactly
+			 * the argument btcostestimate() makes about a btree's upper
+			 * levels.  What the descent does cost is the comparisons, one
+			 * page's worth per level.
+			 */
 			random_pages += 1.0;
+			descent_cost += (height + 1.0) * 50.0 * cpu_operator_cost;
 			seq_pages += Max(1.0, container_pages * sel);
 		}
 		ncontainers += nkeys * lion_containers_for(heap_pages,
@@ -1656,6 +1727,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	recheck_pages = Min(recheck_tids, dirty_pages);
 
 	run = random_pages * random_page_cost;
+	run += descent_cost;
 	run += lookup_cost;
 	run += seq_pages * seq_page_cost;
 	run += ncontainers * cpu_operator_cost * 2.0;	/* block mask + VM mask */
@@ -2817,7 +2889,66 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->path.parallel_aware = false;
 	cpath->path.parallel_safe = false;
 	cpath->path.parallel_workers = 0;
-	cpath->path.pathkeys = NIL;	/* groups come out in bucket order */
+	/*
+	 * PATHKEYS (DESIGN.md §21).  A single-column GROUP BY driven by the
+	 * index's own entry scan emits its groups in DIRECTORY order, which for an
+	 * index that orders by the key type's own comparison is exactly what an
+	 * `ORDER BY <group col>` asks for - so the Sort above the node disappears.
+	 *
+	 * Four things disqualify it:
+	 *
+	 *	- two group columns: the nested loop of §20 emits (outer, inner) pairs,
+	 *	  which are sorted by the outer key alone and not by the pair;
+	 *	- an IN list driving the groups (§15): the node walks the located sets
+	 *	  rather than the index, and claiming an order for that would tie the
+	 *	  planner to a detail of how the list is located;
+	 *	- a partitioned table: each partition is ordered, but the Finalize
+	 *	  HashAggregate core puts on top destroys it (§16);
+	 *	- and a NULLABLE group column, because the reserved NULL entry sorts
+	 *	  FIRST and `ORDER BY col` means NULLS LAST.  A column the planner
+	 *	  knows is NOT NULL has no NULL group to emit, so the two agree.
+	 */
+	cpath->path.pathkeys = NIL;
+	if (ngroup == 1 && !partitioned && !sumall && !singlegroup &&
+		first->driveidx[0] != NULL &&
+		bms_is_member(groupattno[0], input_rel->notnullattnums) &&
+		lion_index_orders_naturally(first->driveidx[0]))
+	{
+		bool		sumshort;
+		bool		groupdrive;
+		Oid			sortop = InvalidOid;
+		Oid			eqop = InvalidOid;
+		bool		hashable;
+
+		(void) lion_inlist_shape(first->driveidx[0], first->driveidx[1],
+								 first->whereidx, whereclauses, wherekinds,
+								 ors, &sumshort, &groupdrive);
+		/*
+		 * The node emits ASCENDING, NULLS FIRST, always.  The query's own
+		 * GROUP BY clause is not a safe source for the direction:
+		 * standard_qp_callback() rewrites its sort operators to match the
+		 * query's ORDER BY when it can, so `ORDER BY k DESC` would hand us a
+		 * descending SortGroupClause and we would claim an order the node does
+		 * not produce.  So the ordering operator is the key type's own `<`,
+		 * and the clause is copied only for its sortgroupref and its equality.
+		 */
+		get_sort_group_operators(exprType((Node *) groupvar[0]),
+								 true, true, false,
+								 &sortop, &eqop, NULL, &hashable);
+
+		if (!groupdrive && OidIsValid(sortop))
+		{
+			SortGroupClause *sgc;
+
+			sgc = copyObject((SortGroupClause *)
+							 linitial(root->processed_groupClause));
+			sgc->sortop = sortop;
+			sgc->nulls_first = false;
+			cpath->path.pathkeys =
+				make_pathkeys_for_sortclauses(root, list_make1(sgc),
+											  root->processed_tlist);
+		}
+	}
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	cpath->custom_restrictinfo = NIL;
@@ -4708,10 +4839,23 @@ static TupleTableSlot *
 lion_exec_custom_scan(CustomScanState *node)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
-	int64		count;
+	int64		dirbefore = lion_dir_pages_read;
+	TupleTableSlot *slot;
 
 	if (st->done)
 		return NULL;
+
+	slot = lion_exec_custom_scan_internal(node);
+	st->dirpages += lion_dir_pages_read - dirbefore;
+
+	return slot;
+}
+
+static TupleTableSlot *
+lion_exec_custom_scan_internal(CustomScanState *node)
+{
+	LionCountScanState *st = (LionCountScanState *) node;
+	int64		count;
 
 	/*
 	 * The parameters first: a generic prepared plan's `k = $1` and a nested
@@ -5126,5 +5270,11 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		ExplainPropertyInteger("Posting Sets Summed", NULL,
 							   st->stats.sets_summed, es);
+		/*
+		 * Directory pages - leaves and internal pages both - this node read
+		 * (DESIGN.md §21).  A sorted IN list should cost about the leaves its
+		 * values live on plus one descent, not a descent per value.
+		 */
+		ExplainPropertyInteger("Directory Pages Read", NULL, st->dirpages, es);
 	}
 }

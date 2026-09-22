@@ -16,10 +16,15 @@
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
+#include "access/nbtree.h"
+#include "access/table.h"
+#include "catalog/pg_amproc.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
+#include "parser/parse_coerce.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/freespace.h"
@@ -113,25 +118,6 @@ lion_index_usable(Relation index, Snapshot snapshot, const char **why)
 }
 
 /*
- * Clamp a requested bucket count into [1, LION_MAX_BUCKETS].
- *
- * Bucket counts are not rounded to a power of two: a hash is mapped to its
- * bucket with a modulo (lion_bucket_of()), so any count works, and ambuild
- * picks one from the bytes the entries need rather than from a key count
- * (DESIGN.md §5).  The `buckets` reloption therefore means exactly what it
- * says.
- */
-uint32
-lion_clamp_buckets(int64 nbuckets)
-{
-	if (nbuckets <= 1)
-		return 1;
-	if (nbuckets >= LION_MAX_BUCKETS)
-		return LION_MAX_BUCKETS;
-	return (uint32) nbuckets;
-}
-
-/*
  * Initialise a page of the lion index.  Sets up the special area.
  */
 void
@@ -143,12 +129,15 @@ lion_init_page(Page page, uint16 flags)
 
 	opaque = LionPageGetOpaque(page);
 	opaque->rightlink = InvalidBlockNumber;
+	opaque->leftlink = InvalidBlockNumber;
 	opaque->minckey = 0;
 	opaque->maxckey = 0;
 	opaque->owner_hash = 0;
 	opaque->owner_head = InvalidBlockNumber;
+	opaque->level = 0;
 	opaque->flags = flags;
 	opaque->page_id = LION_PAGE_ID;
+	opaque->unused = 0;
 }
 
 /*
@@ -271,7 +260,8 @@ lion_alloc_buffer(Relation index, Relation heaprel, bool reuse)
  * Fill in a meta page image.
  */
 void
-lion_init_metapage(Page page, uint32 nbuckets, uint32 inline_limit)
+lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
+				  uint32 height, uint32 dirpages)
 {
 	LionMetaPageData *meta;
 
@@ -283,8 +273,11 @@ lion_init_metapage(Page page, uint32 nbuckets, uint32 inline_limit)
 	meta->version = LION_VERSION;
 	meta->offset_bits = LION_OFFSET_BITS;
 	meta->container_bits = LION_CONTAINER_BITS;
-	meta->nbuckets = nbuckets;
+	meta->unused_nbuckets = 0;
 	meta->inline_limit = inline_limit;
+	meta->root = root;
+	meta->height = height;
+	meta->dirpages = dirpages;
 
 	((PageHeader) page)->pd_lower += sizeof(LionMetaPageData);
 	Assert(((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper);
@@ -375,7 +368,8 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
-						   meta->magic, meta->version, LION_MAGIC, LION_VERSION)));
+						   meta->magic, meta->version, LION_MAGIC, LION_VERSION),
+				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.")));
 
 	if (meta->offset_bits != LION_OFFSET_BITS ||
 		meta->container_bits != LION_CONTAINER_BITS)
@@ -387,11 +381,95 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						   meta->offset_bits, meta->container_bits,
 						   LION_OFFSET_BITS, LION_CONTAINER_BITS)));
 
-	if (meta->nbuckets == 0 || meta->nbuckets > LION_MAX_BUCKETS)
+	if (!BlockNumberIsValid(meta->root))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" has an invalid bucket count %u",
-						RelationGetRelationName(index), meta->nbuckets)));
+				 errmsg("index \"%s\" has no directory root",
+						RelationGetRelationName(index))));
+}
+
+/*
+ * Does ltopr sort with cmpfunc?
+ *
+ * ambuild's tuplesort is driven by an OPERATOR and the directory by a
+ * FUNCTION, and DESIGN.md §21 requires them to be the same order exactly.
+ * PrepareSortSupportFromOrderingOp() resolves the operator to a btree
+ * opfamily and takes that family's comparison support function, so the
+ * question "will the sort use cmpfunc?" is answered by asking the same
+ * catalogue the same way.
+ */
+static bool
+lion_ltopr_sorts_with(Oid ltopr, Oid cmpfunc)
+{
+	Oid			opfamily;
+	Oid			opcintype;
+	CompareType cmptype;
+
+	if (!OidIsValid(ltopr) || !OidIsValid(cmpfunc))
+		return false;
+	if (!get_ordering_op_properties(ltopr, &opfamily, &opcintype, &cmptype))
+		return false;
+	if (cmptype != COMPARE_LT)
+		return false;
+
+	return get_opfamily_proc(opfamily, opcintype, opcintype,
+							 BTORDER_PROC) == cmpfunc;
+}
+
+/*
+ * A `<` operator that sorts with cmpfunc, for a comparison function that is
+ * NOT the key type's default one: find the btree operator family that uses it
+ * as its comparison support function and take that family's `<`.
+ *
+ * A comparison that belongs to no btree family at all cannot be handed to a
+ * tuplesort, and an ordering the BUILD cannot reproduce is no ordering
+ * (DESIGN.md §21): the caller then leaves the index unordered, which is still
+ * a complete directory order - (kind, hash, bytes) - just not the opclass's.
+ *
+ * pg_amproc is scanned rather than looked up because the family is what is
+ * being searched for.  It happens once per relcache build of an index whose
+ * opclass names a comparison of its own, which no built-in opclass does.
+ */
+static Oid
+lion_find_sort_operator(Oid cmpfunc, Oid typid)
+{
+	Relation	rel;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			result = InvalidOid;
+
+	rel = table_open(AccessMethodProcedureRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_amproc_amproc, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(cmpfunc));
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_amproc amp = (Form_pg_amproc) GETSTRUCT(tup);
+		Oid			ltopr;
+
+		if (amp->amprocnum != BTORDER_PROC ||
+			amp->amproclefttype != amp->amprocrighttype)
+			continue;
+		if (amp->amproclefttype != typid &&
+			!IsBinaryCoercible(typid, amp->amproclefttype))
+			continue;
+
+		ltopr = get_opfamily_member(amp->amprocfamily, amp->amproclefttype,
+									amp->amprocrighttype,
+									BTLessStrategyNumber);
+		if (lion_ltopr_sorts_with(ltopr, cmpfunc))
+		{
+			result = ltopr;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
 }
 
 /*
@@ -405,6 +483,7 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 	Form_pg_attribute att;
 	Oid			eqopr;
 	Oid			eqfunc;
+	Oid			eqoprused = InvalidOid;		/* the equality the entries use */
 
 	memset(state, 0, sizeof(LionState));
 	state->meta = *meta;
@@ -498,6 +577,7 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 		if (!OidIsValid(eqfunc))
 			elog(ERROR, "could not find function for operator %u", eqopr);
 		fmgr_info_cxt(eqfunc, &state->eqproc, cxt);
+		eqoprused = eqopr;
 	}
 	else
 	{
@@ -518,6 +598,87 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 					 errdetail("Index \"%s\" extracts keys of that type.",
 							   RelationGetRelationName(index))));
 		fmgr_info_copy(&state->eqproc, &typentry->eq_opr_finfo, cxt);
+		eqoprused = typentry->eq_opr;
+	}
+
+	/*
+	 * ORDERING (DESIGN.md §21).  Support proc 4 is the opclass's own btree
+	 * comparison of the KEY type.  Three rules decide what the directory is
+	 * ordered by, and all three are about the same thing: the order the
+	 * BUILD lays entries out in and the order a SEARCH descends must be one
+	 * and the same, and both must agree with the opclass EQUALITY, because
+	 * the directory holds one entry per equality class.
+	 *
+	 *	1. An opclass WITH proc 4 is ordered by it.
+	 *
+	 *	2. An opclass WITHOUT proc 4 - a polymorphic multi-key class, or one
+	 *	   that simply does not name one - may borrow the key type's default
+	 *	   btree comparison ONLY when its own equality operator IS the key
+	 *	   type's default btree equality.  Otherwise the borrowed comparison
+	 *	   can be FINER than the opclass equality, which would put the two
+	 *	   members of one equality class at two different positions and
+	 *	   therefore in two entries: a case-insensitive text class stores
+	 *	   'A' and 'a' in ONE entry, and bttextcmp separates them, so a
+	 *	   lookup for the spelling that is not the stored one would descend
+	 *	   past the entry and miss.  Such an opclass is UNORDERED: the
+	 *	   directory order is (kind, hash, bytes), which ties exactly where
+	 *	   the hash ties and lets the run scan apply the opclass equality.
+	 *
+	 *	3. Either way the ordering needs a `<` OPERATOR THAT SORTS WITH THE
+	 *	   SAME FUNCTION, because ambuild's tuplesort is driven by an
+	 *	   operator.  The key type's default `<` qualifies only when the
+	 *	   comparison is the key type's default one; a comparison of the
+	 *	   opclass's own is looked for in the btree family that uses it.  An
+	 *	   ordering the build cannot reproduce is no ordering.
+	 *
+	 * An unordered index is not a broken one: (kind, hash, bytes) is a
+	 * complete directory order, just not the type's, so lion_index_stats()
+	 * reports ordered = false and the count pushdown claims no pathkeys.
+	 */
+	state->ordered = false;
+	state->ltopr = InvalidOid;
+	{
+		Oid			cmpfunc = index_getprocid(index, 1, LION_CMP_PROC);
+		TypeCacheEntry *typentry =
+			lookup_type_cache(state->typid,
+							  TYPECACHE_CMP_PROC_FINFO | TYPECACHE_LT_OPR |
+							  TYPECACHE_BTREE_OPFAMILY);
+		bool		haveproc = false;
+
+		if (OidIsValid(cmpfunc))
+		{
+			fmgr_info_copy(&state->cmpproc,
+						   index_getprocinfo(index, 1, LION_CMP_PROC), cxt);
+			haveproc = true;
+		}
+		else if (OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+		{
+			/* Rule 2: borrow only when the equalities are provably the same. */
+			Oid			defaulteq =
+				OidIsValid(typentry->btree_opf) ?
+				get_opfamily_member(typentry->btree_opf,
+									typentry->btree_opintype,
+									typentry->btree_opintype,
+									BTEqualStrategyNumber) : InvalidOid;
+
+			if (OidIsValid(defaulteq) && eqoprused == defaulteq)
+			{
+				cmpfunc = typentry->cmp_proc_finfo.fn_oid;
+				fmgr_info_copy(&state->cmpproc, &typentry->cmp_proc_finfo, cxt);
+				haveproc = true;
+			}
+		}
+
+		if (haveproc)
+		{
+			/* Rule 3: the operator has to sort with that very function. */
+			if (lion_ltopr_sorts_with(typentry->lt_opr, cmpfunc))
+				state->ltopr = typentry->lt_opr;
+			else
+				state->ltopr = lion_find_sort_operator(cmpfunc, state->typid);
+
+			state->ordered = OidIsValid(state->ltopr);
+		}
 	}
 }
 
@@ -730,10 +891,10 @@ lion_make_entry(LionState *state, Datum key, uint32 hash, uint16 flags,
 	Size		payoff = MAXALIGN((LION_ENTRY_HDRSZ) + keylen);
 	Size		total = payoff + payloadlen;
 
-	if (total > LION_MAX_ITEM_SIZE)
+	if (total > LION_MAX_ENTRY_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a page",
+				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
 						total)));
 
 	entry = (LionEntryTuple *) palloc0(total);
@@ -778,10 +939,10 @@ lion_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
 	Assert(reservedflag == LION_ENTRY_NULLKEY ||
 		   reservedflag == LION_ENTRY_EMPTYKEY);
 
-	if (total > LION_MAX_ITEM_SIZE)
+	if (total > LION_MAX_ENTRY_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a page",
+				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
 						total)));
 
 	entry = (LionEntryTuple *) palloc0(total);
@@ -820,10 +981,10 @@ lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 	Size		total = payoff + payloadlen;
 	LionEntryTuple *copy;
 
-	if (total > LION_MAX_ITEM_SIZE)
+	if (total > LION_MAX_ENTRY_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a page",
+				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
 						total)));
 
 	copy = (LionEntryTuple *) palloc(total);
@@ -839,344 +1000,65 @@ lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 }
 
 /*
- * Find the entry for (hash, key) in the bucket chain starting at headbuf,
- * comparing keys with eqproc (NULL means state->eqproc/state->collation).
+ * Find the entry for (hash, key) in the directory, comparing stored keys with
+ * eqproc and ordering them with cmpproc (NULL for either means the index's
+ * own).  DESIGN.md §21 replaced the bucket chain this used to walk with a
+ * descent: on success *buf is a directory LEAF locked in lockmode, which the
+ * caller releases, and *offnum is the entry's offset on it.
  *
- * The caller holds headbuf locked in lockmode and keeps it locked.  On
- * success *buf is left locked in the same mode; it is headbuf itself when the
- * entry lives on the bucket head page, and an extra pinned buffer otherwise.
+ * On failure *buf is normally still a locked leaf - the one the key would go
+ * on, which is what the insert path wants - but it is InvalidBuffer when the
+ * cross-type fallback walk of lion_dir_find() ran, so a caller that uses it
+ * must be one that never searches cross-type.
  */
 bool
-lion_find_entry_counted(Relation index, LionState *state, Buffer headbuf,
-					   int lockmode, Datum key, uint32 hash, FmgrInfo *eqproc,
-					   Oid collation, Buffer *buf, OffsetNumber *offnum,
-					   int *npages)
+lion_find_entry_ext(Relation index, LionState *state, int lockmode, Datum key,
+				   uint32 hash, FmgrInfo *eqproc, FmgrInfo *cmpproc,
+				   Oid collation, Buffer *buf, OffsetNumber *offnum)
 {
-	Buffer		cur = headbuf;
+	LionSearchKey sk;
 
-	if (eqproc == NULL)
+	lion_search_key_init(state, &sk, LION_KIND_VALUE, key, hash);
+	if (eqproc != NULL)
 	{
-		eqproc = &state->eqproc;
-		collation = state->collation;
-	}
-	if (npages != NULL)
-		*npages = 0;
-
-	for (;;)
-	{
-		Page		page = BufferGetPage(cur);
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
-		OffsetNumber off;
-		BlockNumber next;
-
-		Assert(LionPageIsBucket(page));
-
-		if (npages != NULL)
-			(*npages)++;
-
-		for (off = FirstOffsetNumber; off <= maxoff; off++)
-		{
-			ItemId		iid = PageGetItemId(page, off);
-			LionEntryTuple *entry;
-			Datum		stored;
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			entry = (LionEntryTuple *) PageGetItem(page, iid);
-			if (entry->hash != hash)
-				continue;
-
-			/*
-			 * A reserved entry has no key to compare and hashes to 0, which a
-			 * real key may hash to as well: they are only ever found through
-			 * lion_find_reserved_entry() (DESIGN.md §14 and §17).
-			 */
-			if (LionEntryIsReserved(entry))
-				continue;
-
-			stored = lion_fetch_key(state, LionEntryGetKey(entry));
-			if (DatumGetBool(FunctionCall2Coll(eqproc, collation, stored, key)))
-			{
-				*buf = cur;
-				*offnum = off;
-				return true;
-			}
-		}
-
-		next = LionPageGetOpaque(page)->rightlink;
-		if (!BlockNumberIsValid(next))
-			break;
-
-		{
-			Buffer		nbuf = ReadBuffer(index, next);
-
-			LockBuffer(nbuf, lockmode);
-			if (cur != headbuf)
-				UnlockReleaseBuffer(cur);
-			cur = nbuf;
-		}
-		CHECK_FOR_INTERRUPTS();
+		sk.eqproc = eqproc;
+		sk.cmpproc = cmpproc;
+		sk.collation = collation;
 	}
 
-	if (cur != headbuf)
-		UnlockReleaseBuffer(cur);
-
-	*buf = InvalidBuffer;
-	*offnum = InvalidOffsetNumber;
-	return false;
+	return lion_dir_find(index, NULL, state, &sk, lockmode, false,
+						 buf, offnum, NULL);
 }
 
 bool
-lion_find_entry_ext(Relation index, LionState *state, Buffer headbuf, int lockmode,
-				   Datum key, uint32 hash, FmgrInfo *eqproc, Oid collation,
-				   Buffer *buf, OffsetNumber *offnum)
+lion_find_entry(Relation index, LionState *state, int lockmode, Datum key,
+			   uint32 hash, Buffer *buf, OffsetNumber *offnum)
 {
-	return lion_find_entry_counted(index, state, headbuf, lockmode, key, hash,
-								  eqproc, collation, buf, offnum, NULL);
-}
-
-bool
-lion_find_entry(Relation index, LionState *state, Buffer headbuf, int lockmode,
-			   Datum key, uint32 hash, Buffer *buf, OffsetNumber *offnum)
-{
-	return lion_find_entry_ext(index, state, headbuf, lockmode, key, hash,
-							  NULL, InvalidOid, buf, offnum);
+	return lion_find_entry_ext(index, state, lockmode, key, hash, NULL, NULL,
+							  InvalidOid, buf, offnum);
 }
 
 /*
- * Find a reserved entry (DESIGN.md §14 and §17).  Both live in bucket 0 and
- * are recognised by their flag; headbuf must be the head page of bucket 0,
- * held in lockmode by the caller, and is left locked.
+ * Find a reserved entry (DESIGN.md §14 and §17).  Both sort before every real
+ * key (LION_KIND_NULL and LION_KIND_EMPTY), so they live on the leftmost leaf
+ * and are reached by the same descent as anything else.
  */
 bool
-lion_find_reserved_entry_counted(Relation index, Buffer headbuf, int lockmode,
-								uint16 reservedflag, Buffer *buf,
-								OffsetNumber *offnum, int *npages)
+lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
+						uint16 reservedflag, Buffer *buf, OffsetNumber *offnum)
 {
-	Buffer		cur = headbuf;
+	LionSearchKey sk;
 
 	Assert(reservedflag == LION_ENTRY_NULLKEY ||
 		   reservedflag == LION_ENTRY_EMPTYKEY);
 
-	if (npages != NULL)
-		*npages = 0;
+	lion_search_key_init(state, &sk,
+						 (reservedflag == LION_ENTRY_NULLKEY) ?
+						 LION_KIND_NULL : LION_KIND_EMPTY,
+						 (Datum) 0, LION_NULLKEY_HASH);
 
-	for (;;)
-	{
-		Page		page = BufferGetPage(cur);
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
-		OffsetNumber off;
-		BlockNumber next;
-
-		Assert(LionPageIsBucket(page));
-
-		if (npages != NULL)
-			(*npages)++;
-
-		for (off = FirstOffsetNumber; off <= maxoff; off++)
-		{
-			ItemId		iid = PageGetItemId(page, off);
-			LionEntryTuple *entry;
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			entry = (LionEntryTuple *) PageGetItem(page, iid);
-			if ((entry->flags & reservedflag) == 0)
-				continue;
-
-			*buf = cur;
-			*offnum = off;
-			return true;
-		}
-
-		next = LionPageGetOpaque(page)->rightlink;
-		if (!BlockNumberIsValid(next))
-			break;
-
-		{
-			Buffer		nbuf = ReadBuffer(index, next);
-
-			LockBuffer(nbuf, lockmode);
-			if (cur != headbuf)
-				UnlockReleaseBuffer(cur);
-			cur = nbuf;
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	if (cur != headbuf)
-		UnlockReleaseBuffer(cur);
-
-	*buf = InvalidBuffer;
-	*offnum = InvalidOffsetNumber;
-	return false;
-}
-
-bool
-lion_find_reserved_entry(Relation index, Buffer headbuf, int lockmode,
-						uint16 reservedflag, Buffer *buf, OffsetNumber *offnum)
-{
-	return lion_find_reserved_entry_counted(index, headbuf, lockmode,
-										   reservedflag, buf, offnum, NULL);
-}
-
-/*
- * How many pages the bucket chain starting at headbuf has.  The caller holds
- * the head locked, which serialises this against every writer of the bucket.
- */
-int
-lion_bucket_npages(Relation index, Buffer headbuf)
-{
-	Buffer		cur = headbuf;
-	int			n = 0;
-
-	for (;;)
-	{
-		Page		page = BufferGetPage(cur);
-		BlockNumber next;
-
-		Assert(LionPageIsBucket(page));
-		n++;
-
-		next = LionPageGetOpaque(page)->rightlink;
-		if (!BlockNumberIsValid(next))
-			break;
-
-		{
-			Buffer		nbuf = ReadBuffer(index, next);
-
-			LockBuffer(nbuf, BUFFER_LOCK_SHARE);
-			if (cur != headbuf)
-				UnlockReleaseBuffer(cur);
-			cur = nbuf;
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	if (cur != headbuf)
-		UnlockReleaseBuffer(cur);
-
-	return n;
-}
-
-/*
- * Append a new entry tuple to the bucket chain starting at headbuf (held
- * EXCLUSIVE by the caller).  Adds a bucket page if no existing page has room.
- */
-void
-lion_add_entry(Relation index, Relation heaprel, Buffer headbuf,
-			  LionEntryTuple *entry, Size size)
-{
-	Buffer		cur = headbuf;
-	Size		need = MAXALIGN(size);
-	GenericXLogState *xstate;
-	Page		p;
-	Buffer		nbuf;
-
-	for (;;)
-	{
-		Page		page = BufferGetPage(cur);
-		BlockNumber next;
-
-		Assert(LionPageIsBucket(page));
-
-		if (PageGetFreeSpace(page) >= need)
-		{
-			xstate = GenericXLogStart(index);
-			p = GenericXLogRegisterBuffer(xstate, cur, 0);
-			if (PageAddItemExtended(p, entry, size,
-									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-				elog(ERROR, "lion index: failed to add entry to bucket page");
-			GenericXLogFinish(xstate);
-			if (cur != headbuf)
-				UnlockReleaseBuffer(cur);
-			return;
-		}
-
-		next = LionPageGetOpaque(page)->rightlink;
-		if (!BlockNumberIsValid(next))
-			break;
-
-		{
-			Buffer		nextbuf = ReadBuffer(index, next);
-
-			LockBuffer(nextbuf, BUFFER_LOCK_EXCLUSIVE);
-			if (cur != headbuf)
-				UnlockReleaseBuffer(cur);
-			cur = nextbuf;
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	/*
-	 * No room anywhere: append a new bucket page after cur.  The page is
-	 * allocated inside the record that links it in, so that a crash cannot
-	 * leave an initialised page nothing points at.
-	 */
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, cur, 0);
-	{
-		Page		np;
-
-		nbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_BUCKET,
-								 true, &np);
-
-		if (PageAddItemExtended(np, entry, size,
-								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-			elog(ERROR, "lion index: failed to add entry to new bucket page");
-		LionPageGetOpaque(p)->rightlink = BufferGetBlockNumber(nbuf);
-	}
-	GenericXLogFinish(xstate);
-
-	UnlockReleaseBuffer(nbuf);
-	if (cur != headbuf)
-		UnlockReleaseBuffer(cur);
-}
-
-/*
- * Delete entries from a bucket page in one WAL record (DESIGN.md §18).
- *
- * ENTRY OFFSETS ON A BUCKET PAGE NEVER CHANGE.  That is an invariant of this
- * index and several readers depend on it: lion_entry_scan_next() (the GROUP
- * BY driver) resumes a bucket page at the offset it stopped at, and VACUUM's
- * own pass 2 refers to the entries pass 1 found by offset while the bucket
- * page is unlocked.  So the deletion goes through
- * PageIndexTupleDeleteNoCompact(), which frees the item's bytes but leaves
- * the line pointer array alone, and NOT through PageIndexMultiDelete(), which
- * would renumber every entry after the deleted one.  The freed line pointers
- * are marked so that the next lion_add_entry() reuses them.
- *
- * The offsets must be ASCENDING; they are applied from the back, so that the
- * ones still to come keep their meaning while the loop runs (deleting the
- * last item of a page shortens the line pointer array, which is how a page
- * that empties out gives its array back).
- *
- * VACUUM still calls this only once per bucket page, as the very last thing
- * it does to it and with a cleanup lock held, because pass 2 has to be able
- * to re-read the entries it is walking the chains of.
- */
-void
-lion_delete_entries(Relation index, Buffer buf, OffsetNumber *offs, int noffs)
-{
-	GenericXLogState *xstate;
-	Page		p;
-	int			i;
-
-	Assert(noffs > 0);
-	Assert(LionPageIsBucket(BufferGetPage(buf)));
-
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, buf, 0);
-
-	for (i = noffs - 1; i >= 0; i--)
-	{
-		Assert(i == 0 || offs[i - 1] < offs[i]);
-		PageIndexTupleDeleteNoCompact(p, offs[i]);
-	}
-
-	PageSetHasFreeLinePointers(p);
-
-	GenericXLogFinish(xstate);
+	return lion_dir_find(index, NULL, state, &sk, lockmode, false,
+						 buf, offnum, NULL);
 }
 
 /*
@@ -1986,53 +1868,6 @@ lion_max_entries(Relation index)
 	return opts ? opts->max_entries : LION_DEFAULT_MAX_ENTRIES;
 }
 
-int64
-lion_bucket_nentries(Relation index, Buffer headbuf)
-{
-	Buffer		cur = headbuf;
-	int64		n = 0;
-
-	for (;;)
-	{
-		Page		page = BufferGetPage(cur);
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
-		OffsetNumber off;
-		BlockNumber next;
-
-		Assert(LionPageIsBucket(page));
-
-		for (off = FirstOffsetNumber; off <= maxoff; off++)
-		{
-			if (ItemIdIsUsed(PageGetItemId(page, off)))
-				n++;
-		}
-
-		next = LionPageGetOpaque(page)->rightlink;
-		if (!BlockNumberIsValid(next))
-			break;
-
-		{
-			Buffer		nbuf = ReadBuffer(index, next);
-
-			/*
-			 * The caller holds the head locked, which serialises this walk
-			 * against every writer of the bucket, so a SHARE lock on the
-			 * further pages is enough.
-			 */
-			LockBuffer(nbuf, BUFFER_LOCK_SHARE);
-			if (cur != headbuf)
-				UnlockReleaseBuffer(cur);
-			cur = nbuf;
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	if (cur != headbuf)
-		UnlockReleaseBuffer(cur);
-
-	return n;
-}
-
 void
 lion_warn_max_entries(Relation index, int64 nentries)
 {
@@ -2061,52 +1896,4 @@ lion_warn_max_entries(Relation index, int64 nentries)
 			 errdetail("The index holds about " INT64_FORMAT " entries; its max_entries option is %d.",
 					   nentries, lion_max_entries(index)),
 			 errhint("Raise max_entries, or index a column with fewer distinct keys.")));
-}
-
-/* ---------------------------------------------------------------------
- * Bucket directory guard (DESIGN.md §5)
- *
- * ambuild sizes the bucket directory once and nothing ever resizes it, so an
- * index created on an empty table keeps LION_DEFAULT_BUCKETS buckets for good
- * and answers every lookup by walking a long chain of bucket pages.  The
- * remedy is a REINDEX, which sizes the directory from the data that is
- * actually there - so the index says once per backend that it wants one.
- * --------------------------------------------------------------------- */
-
-/* Indexes this backend has already complained about, keyed by relation Oid. */
-static HTAB *lion_warned_buckets = NULL;
-
-void
-lion_warn_bucket_chain(Relation index, int npages)
-{
-	LionOptions *opts = (LionOptions *) index->rd_options;
-	Oid			relid = RelationGetRelid(index);
-	bool		found;
-
-	/* An explicit bucket count is what its owner asked for; leave it alone. */
-	if (opts != NULL && opts->buckets > 0)
-		return;
-
-	if (lion_warned_buckets == NULL)
-	{
-		HASHCTL		ctl;
-
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(Oid);
-		ctl.hcxt = TopMemoryContext;
-		lion_warned_buckets = hash_create("lion index bucket chain warnings",
-										 16, &ctl,
-										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
-
-	(void) hash_search(lion_warned_buckets, &relid, HASH_ENTER, &found);
-	if (found)
-		return;					/* this backend has said it once already */
-
-	ereport(WARNING,
-			(errmsg("lion index \"%s\" has outgrown its bucket directory",
-					RelationGetRelationName(index)),
-			 errdetail("One bucket chain is %d pages long; the index was built with %u buckets, which is what a lookup of a key has to walk.",
-					   npages, lion_get_state(index)->meta.nbuckets),
-			 errhint("REINDEX the index: the bucket count is chosen at build time from the entries that exist then, and this index was built smaller (often on an empty table).")));
 }

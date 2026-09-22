@@ -11,7 +11,7 @@ SELECT i, (i % 137)::int4 AS k, 'v' || (i % 137) AS t
 
 CREATE INDEX lion_unlogged_k ON lion_unlogged USING lion (k);
 CREATE INDEX lion_unlogged_t ON lion_unlogged USING lion (t)
-	WITH (buckets = 16, inline_limit = 128);
+	WITH (inline_limit = 128);
 ANALYZE lion_unlogged;
 
 SET enable_seqscan = off;

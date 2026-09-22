@@ -344,13 +344,29 @@ extern bool lion_sets_satisfiable(int nsets, LionPostingSet *sets,
  * Iterating every entry of an index (the GROUP BY path of section 10)
  * --------------------------------------------------------------------- */
 
+/*
+ * An ordered walk of every entry: the leftmost directory leaf, then the right
+ * links (DESIGN.md §21).  For an ordered opclass the entries therefore come
+ * out in key order, which is what lets the count pushdown claim pathkeys.
+ *
+ * The scan gives up its lock between two entries, and the position it comes
+ * back to is a KEY and not an offset: a sorted directory inserts in the
+ * middle of a leaf and splits it, so offsets are not stable the way they were
+ * on a bucket page.  Resuming at "the first key above the last one returned"
+ * is stable under both, and under the entry deletion of §18.
+ */
 typedef struct LionEntryScan
 {
 	Relation	index;
 	LionState   *state;
-	uint32		bucket;			/* bucket whose chain is being walked */
-	BlockNumber blkno;			/* bucket page to read next */
-	OffsetNumber off;			/* next item to look at on that page */
+	BlockNumber blkno;			/* directory leaf to read next */
+	bool		haslast;		/* the key below is valid */
+	int			lastkind;		/* LION_KIND_* of the last entry returned */
+	uint32		lasthash;
+	char	   *lastkey;		/* its stored bytes, in cxt */
+	Size		lastkeylen;
+	int			onpage;			/* entries returned from the current leaf */
+	MemoryContext cxt;
 	bool		done;
 } LionEntryScan;
 

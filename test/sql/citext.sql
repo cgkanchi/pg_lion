@@ -26,6 +26,35 @@ SELECT entries FROM lion_index_stats('lion_ci_name');
 SELECT lion_index_verify('lion_ci_name', true);
 INSERT INTO lion_ci VALUES (0, 'aLiCe');
 SELECT count(*) FROM lion_ci WHERE name = 'ALICE';
+
+/*
+ * The sorted directory of DESIGN.md §21 orders entries by support proc 4, and
+ * citext's is citext_cmp(), which returns 0 for two spellings that differ only
+ * in case.  So 'Alice' and 'alice' TIE in the order and the descent's run scan
+ * has to find the one entry they share by the opclass EQUALITY - if it stopped
+ * at the bytewise tail of the comparison instead, each spelling would get an
+ * entry of its own and the counts would split.  Four spellings of one name,
+ * inserted in an order that makes each of them the one the entry might have
+ * been created with: still ONE entry, and one group.
+ */
+CREATE TABLE lion_cimerge (name citext NOT NULL);
+CREATE INDEX lion_cimerge_name ON lion_cimerge USING lion (name);
+INSERT INTO lion_cimerge
+	SELECT (ARRAY['Alice','alice','ALICE','aLiCe'])[1 + g % 4]
+	  FROM generate_series(1, 400) g;
+SELECT ordered FROM lion_index_stats('lion_cimerge_name');
+SELECT entries AS one_entry_for_four_spellings, ntids
+  FROM lion_index_stats('lion_cimerge_name');
+SELECT count(*) AS one_group FROM (SELECT name FROM lion_cimerge GROUP BY name) g;
+SELECT count(*) FROM lion_cimerge WHERE name = 'ALICE';
+SELECT count(*) FROM lion_cimerge WHERE name = 'alice';
+SELECT lion_index_verify('lion_cimerge_name', true);
+-- the same through a bulk build, which groups by the same equality
+REINDEX INDEX lion_cimerge_name;
+SELECT entries AS one_entry_after_reindex FROM lion_index_stats('lion_cimerge_name');
+SELECT lion_index_verify('lion_cimerge_name', true);
+DROP TABLE lion_cimerge;
+
 DROP TABLE lion_ci;
 
 -- ---- the stored key is one representative of an equality class ----------

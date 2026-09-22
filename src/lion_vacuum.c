@@ -8,10 +8,13 @@
  *
  * 1. Cleanup lock on every page that is visited, in chain order.
  *
- *	  ambulkdelete takes LockBufferForCleanup() on every bucket page and on
+ *	  ambulkdelete takes LockBufferForCleanup() on every directory LEAF and on
  *	  every container page of every chain it walks, whether or not that page
- *	  has anything to remove, and it takes them in chain order (bucket pages
- *	  first, then each container chain left to right).  This is the rule
+ *	  has anything to remove, and it takes them in chain order (the leaves
+ *	  left to right from the leftmost one, then each container chain left to
+ *	  right).  Internal directory pages are NOT cleanup-locked, and need not
+ *	  be: they hold no TIDs, so no reader can be holding a container copy that
+ *	  came from one (DESIGN.md §11, §21).  This is the rule
  *	  nbtree's btvacuumscan follows, and it is what makes the interlock of
  *	  DESIGN.md section 9 airtight.  A reader pins page P, copies container C
  *	  out and drops the content lock; a concurrent insert may then split P and
@@ -45,13 +48,23 @@
  *
  * Hence each bucket is processed in two passes.
  *
- *	Pass 1 walks the bucket's pages.  Each page is cleanup-locked with nothing
- *	else held; its INLINE entries are filtered in place (a filtered payload
- *	can *grow* -- a run that loses every other member becomes a bitset -- so
- *	it may spill onto container pages exactly as an insert would); the offset
- *	and chain head of every CHAIN entry are noted; then the content lock is
- *	dropped while the pin is kept, so that pass 2 can re-lock the page
- *	cheaply.
+ *	Pass 1 walks the directory leaves.  Each leaf is cleanup-locked with
+ *	nothing else held; its INLINE entries are filtered in place (a filtered
+ *	payload can *grow* -- a run that loses every other member becomes a
+ *	bitset -- so it may spill onto container pages exactly as an insert
+ *	would); the offset, chain head and KEY of every CHAIN entry are noted;
+ *	then the content lock is dropped while the pin is kept, so that pass 2 can
+ *	re-lock the page cheaply.
+ *
+ *	The key is noted because an offset is no longer a stable name for an entry
+ *	(DESIGN.md §21): a sorted directory inserts in the middle of a leaf, which
+ *	shifts everything after it, and splits move the upper half away.  So every
+ *	time pass 2 re-locks the leaf it checks that the entry at the offset it
+ *	remembers is still the same one, by kind and stored key - one entry per
+ *	key, so equal bytes mean the same entry - and descends again for it when
+ *	it is not.  That re-descent happens with NOTHING else held, because taking
+ *	a directory lock while holding a container page would close exactly the
+ *	cycle rule 2 exists to avoid.
  *
  *	Pass 2 walks each CHAIN entry's container chain, holding nothing between
  *	steps.  For every page X of the chain, including pages with nothing to
@@ -212,12 +225,13 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
 }
 
 /*
- * One entry as pass 1 found it on a bucket page.
+ * One entry as pass 1 found it on a directory leaf.
  *
- * off is stable for the whole time this bucket page is being worked on:
- * nothing but VACUUM deletes an entry, and VACUUM does that once, in the
- * final step for the page, after every chain of the bucket has been walked
- * (DESIGN.md §18).
+ * off is a HINT: it is where the entry was when pass 1 looked, and every
+ * later use of it is checked against (kind, key) first, because an insert
+ * into the middle of the leaf or a split of it moves entries (DESIGN.md §21).
+ * The key is a private copy in vs->bucketcxt, which lives as long as this
+ * leaf is being worked on.
  */
 typedef struct LionVacEntry
 {
@@ -226,7 +240,21 @@ typedef struct LionVacEntry
 	bool		maydelete;		/* its posting set was emptied by pass 1/2 */
 	uint32		hash;
 	BlockNumber head;
+	int			kind;			/* LION_KIND_* */
+	uint16		keylen;
+	char	   *keydata;
 } LionVacEntry;
+
+/*
+ * Where an entry is right now: a pinned (not locked) directory leaf and the
+ * offset it was last seen at.  Pass 2 carries one of these per entry and
+ * re-validates it every time it locks the leaf.
+ */
+typedef struct LionVacEntryRef
+{
+	Buffer		buf;
+	OffsetNumber off;
+} LionVacEntryRef;
 
 /* Argument of the lion_container_remove_if() predicate. */
 typedef struct LionVacPred
@@ -279,22 +307,23 @@ typedef struct LionVacInline
 	bool		spill;			/* it no longer fits: move it to a chain */
 } LionVacInline;
 
-static void lion_vacuum_bucket(LionVacState *vs, uint32 bucket);
+static void lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk,
+								 BlockNumber *nextp);
 static void lion_vacuum_delete_entries(LionVacState *vs, Buffer buf,
 									  LionVacEntry *ents, int nents);
 static void lion_vacuum_chain(LionVacState *vs, Buffer entrybuf,
 							 LionVacEntry *ent);
-static BlockNumber lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
+static BlockNumber lion_vacuum_container_page(LionVacState *vs,
+											 LionVacEntryRef *ref,
 											 const LionVacEntry *ent,
 											 BlockNumber blk);
 static BlockNumber lion_vacuum_filter_page(LionVacState *vs, Buffer buf,
 										  LionVacWork *w,
 										  const LionVacEntry *ent);
-static void lion_vacuum_apply_page(LionVacState *vs, Buffer entrybuf,
-								  OffsetNumber entryoff, Buffer buf,
-								  LionVacWork *w, uint32 **grownp,
+static void lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref,
+								  Buffer buf, LionVacWork *w, uint32 **grownp,
 								  int *ngrownp);
-static void lion_vacuum_regrow(LionVacState *vs, Buffer entrybuf,
+static void lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 							  const LionVacEntry *ent, BlockNumber startblk,
 							  uint32 ckey);
 static LionEntryTuple *lion_vacuum_entry_copy(Buffer entrybuf,
@@ -370,7 +399,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	MemoryContext vaccxt;
 	MemoryContext oldcxt;
 	instr_time	started;
-	uint32		b;
+	BlockNumber blk;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -405,13 +434,23 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 										 "lion index vacuum bucket page",
 										 ALLOCSET_DEFAULT_SIZES);
 
-	for (b = 0; b < vs.state->meta.nbuckets; b++)
+	/*
+	 * The leaves, left to right (DESIGN.md §21).  Chain order and visit order
+	 * still agree, which is what the §11 interlock needs: a split of a leaf
+	 * moves entries only onto a brand new page immediately to its right, and
+	 * the walk has not passed that one yet.
+	 */
+	blk = lion_dir_leftmost_leaf(index, vs.state);
+	while (BlockNumberIsValid(blk))
 	{
+		BlockNumber next;
+
 		oldcxt = MemoryContextSwitchTo(vaccxt);
-		lion_vacuum_bucket(&vs, b);
+		lion_vacuum_leaf_page(&vs, blk, &next);
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextReset(vaccxt);
 
+		blk = next;
 		vacuum_delay_point(false);
 	}
 
@@ -610,14 +649,132 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	return true;
 }
 
+/* Is the entry at (page, off) the one pass 1 recorded? */
+static bool
+lion_vac_entry_matches(Page page, OffsetNumber off, const LionVacEntry *ent)
+{
+	ItemId		iid;
+	LionEntryTuple *e;
+
+	if (off < lion_page_first_data(page) || off > PageGetMaxOffsetNumber(page))
+		return false;
+	iid = PageGetItemId(page, off);
+	if (!ItemIdIsUsed(iid))
+		return false;
+	e = (LionEntryTuple *) PageGetItem(page, iid);
+	if (LionEntryIsPivot(e))
+		return false;
+	if (lion_entry_kind(e) != ent->kind || e->keylen != ent->keylen)
+		return false;
+
+	/*
+	 * One entry per key, so equal stored bytes mean the same entry.  That is
+	 * the whole identity check: offsets move, keys do not (DESIGN.md §21).
+	 */
+	return ent->keylen == 0 ||
+		memcmp(LionEntryGetKey(e), ent->keydata, ent->keylen) == 0;
+}
+
 /*
- * Vacuum one bucket page: pass 1 over its entries, pass 2 over the container
- * chains of the CHAIN entries it holds, then the final step that deletes the
- * entries whose posting sets are now empty (see the file header and
- * DESIGN.md §18).
+ * Is ref still pointing at ent?  The caller holds ref->buf locked.  A cheap
+ * hit at the remembered offset is the common case; a scan of the page catches
+ * an insert that shifted it; anything else means it moved to another leaf.
+ */
+static bool
+lion_vac_ref_valid(LionVacEntryRef *ref, const LionVacEntry *ent)
+{
+	Page		page = BufferGetPage(ref->buf);
+	OffsetNumber off;
+	OffsetNumber maxoff;
+
+	if (!LionPageIsLeaf(page))
+		return false;
+	if (lion_vac_entry_matches(page, ref->off, ent))
+		return true;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (off = lion_page_first_data(page); off <= maxoff; off++)
+	{
+		if (lion_vac_entry_matches(page, off, ent))
+		{
+			ref->off = off;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Find ent again after a split moved it off the leaf ref pointed at.  NOTHING
+ * may be held: this descends the directory, and taking a directory lock while
+ * holding a container page would close the very cycle rule 2 avoids.
  */
 static void
-lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
+lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
+					 const LionVacEntry *ent)
+{
+	LionSearchKey sk;
+	LionEntryTuple *probe;
+	Size		probesz = MAXALIGN(LION_ENTRY_HDRSZ + ent->keylen);
+	Buffer		buf;
+	OffsetNumber off;
+
+	if (BufferIsValid(ref->buf))
+	{
+		ReleaseBuffer(ref->buf);
+		ref->buf = InvalidBuffer;
+	}
+
+	probe = (LionEntryTuple *) palloc0(probesz);
+	probe->hash = ent->hash;
+	probe->flags = (uint16) ((ent->kind == LION_KIND_NULL) ? LION_ENTRY_NULLKEY :
+							 (ent->kind == LION_KIND_EMPTY) ? LION_ENTRY_EMPTYKEY :
+							 0);
+	probe->keylen = ent->keylen;
+	if (ent->keylen > 0)
+		memcpy(LionEntryGetKey(probe), ent->keydata, ent->keylen);
+	lion_search_key_exact(vs->state, &sk, probe);
+
+	if (!lion_dir_find(vs->index, vs->heaprel, vs->state, &sk,
+					   BUFFER_LOCK_SHARE, false, &buf, &off, NULL))
+	{
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		pfree(probe);
+		elog(ERROR, "lion index \"%s\": an entry VACUUM is working on has disappeared",
+			 RelationGetRelationName(vs->index));
+	}
+
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	ref->buf = buf;
+	ref->off = off;
+	pfree(probe);
+}
+
+/* Lock ref's leaf in mode, relocating the entry when it is no longer there. */
+static void
+lion_vac_ref_lock(LionVacState *vs, LionVacEntryRef *ref,
+				 const LionVacEntry *ent, int mode)
+{
+	for (;;)
+	{
+		LockBuffer(ref->buf, mode);
+		if (lion_vac_ref_valid(ref, ent))
+			return;
+		LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+		lion_vac_ref_relocate(vs, ref, ent);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Vacuum one directory leaf: pass 1 over its entries, pass 2 over the
+ * container chains of the CHAIN entries it holds, then the final step that
+ * deletes the entries whose posting sets are now empty (see the file header
+ * and DESIGN.md §18).
+ */
+static void
+lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 {
 	Buffer		buf;
 	Page		page;
@@ -635,9 +792,9 @@ lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	oldcxt = MemoryContextSwitchTo(vs->bucketcxt);
 
 	/*
-	 * Pass 1.  Every bucket page is cleanup-locked, whether or not it holds
-	 * an INLINE entry that changes, and the lock is taken with nothing else
-	 * held, so the wait for concurrent readers' pins is interruptible.
+	 * Pass 1.  Every leaf is cleanup-locked, whether or not it holds an INLINE
+	 * entry that changes, and the lock is taken with nothing else held, so the
+	 * wait for concurrent readers' pins is interruptible.
 	 */
 	buf = ReadBuffer(vs->index, blk);
 	INSTR_TIME_SET_CURRENT(t0);
@@ -646,10 +803,10 @@ lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	lion_vac_visit(vs, blk);
 	page = BufferGetPage(buf);
 
-	if (!LionPageIsBucket(page))
+	if (!LionPageIsLeaf(page))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index: block %u is not a bucket page", blk);
+		elog(ERROR, "lion index: block %u is not a directory leaf", blk);
 	}
 
 	*nextp = LionPageGetOpaque(page)->rightlink;
@@ -658,7 +815,7 @@ lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	inl = (LionVacInline *) palloc(sizeof(LionVacInline) * (maxoff + 1));
 
 	INSTR_TIME_SET_CURRENT(t0);
-	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	for (off = lion_page_first_data(page); off <= maxoff; off++)
 	{
 		ItemId		iid = PageGetItemId(page, off);
 		LionEntryTuple *entry;
@@ -673,6 +830,14 @@ lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		ent->hash = entry->hash;
 		ent->head = entry->head;
 		ent->maydelete = false;
+		ent->kind = lion_entry_kind(entry);
+		ent->keylen = entry->keylen;
+		ent->keydata = NULL;
+		if (entry->keylen > 0)
+		{
+			ent->keydata = (char *) palloc(entry->keylen);
+			memcpy(ent->keydata, LionEntryGetKey(entry), entry->keylen);
+		}
 
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
 		{
@@ -712,7 +877,7 @@ lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	 * Every INLINE entry that changed goes back in ONE record.  Entry offsets
 	 * survive PageIndexTupleOverwrite(), so the writes do not disturb each
 	 * other, and one record per PAGE instead of one per ENTRY is what keeps a
-	 * bucket page full of one-TID entries from costing thousands of records.
+	 * leaf full of one-TID entries from costing thousands of records.
 	 */
 	if (ninl > 0)
 	{
@@ -789,53 +954,41 @@ lion_vacuum_bucket_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 }
 
 /*
- * Vacuum one bucket: every page of its chain.
- */
-static void
-lion_vacuum_bucket(LionVacState *vs, uint32 bucket)
-{
-	BlockNumber blk = LION_BUCKET_BLKNO(bucket);
-
-	while (BlockNumberIsValid(blk))
-	{
-		BlockNumber next;
-
-		lion_vacuum_bucket_page(vs, blk, &next);
-		blk = next;
-	}
-}
-
-/*
  * Pass 2 for one CHAIN entry: walk its container chain from head, left to
- * right, holding no page lock between pages.  entrybuf is the entry's bucket
- * page, pinned by pass 1 and not locked; ent->off is stable because VACUUM is
- * the only thing that deletes entries and does so after this (DESIGN.md §18).
+ * right, holding no page lock between pages.  entrybuf is the directory leaf
+ * pass 1 found the entry on, pinned and not locked; the entry may MOVE while
+ * this runs (an insert splitting the leaf), which is what the reference and
+ * its validation are for (DESIGN.md §21).
  */
 static void
 lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 {
 	BlockNumber blk = ent->head;
+	LionVacEntryRef ref;
 	LionEntryTuple *entry;
+
+	ref.buf = entrybuf;
+	ref.off = ent->off;
+	IncrBufferRefCount(ref.buf);	/* the walk owns a pin of its own */
 
 	while (BlockNumberIsValid(blk))
 	{
-		blk = lion_vacuum_container_page(vs, entrybuf, ent, blk);
+		blk = lion_vacuum_container_page(vs, &ref, ent, blk);
 
 		vacuum_delay_point(false);
 	}
 
 	/* Report what the entry holds now that every page has been visited. */
-	LockBuffer(entrybuf, BUFFER_LOCK_SHARE);
-	entry = (LionEntryTuple *) PageGetItem(BufferGetPage(entrybuf),
-										  PageGetItemId(BufferGetPage(entrybuf),
-														ent->off));
+	lion_vac_ref_lock(vs, &ref, ent, BUFFER_LOCK_SHARE);
+	entry = lion_page_entry(BufferGetPage(ref.buf), ref.off);
 	vs->numtids += (double) entry->ntids;
 	ent->maydelete = (entry->ntids == 0 && entry->ncontainers == 0);
-	LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(ref.buf);
 }
 
 /*
- * The final step for one bucket page: delete every entry whose posting set is
+ * The final step for one directory leaf: delete every entry whose posting set is
  * empty, and free the container chains those entries owned (DESIGN.md §18).
  *
  * The emptiness is decided HERE, under the cleanup lock, and not from what
@@ -850,6 +1003,15 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
  * is gone the chain is unreachable for any new reader or insert, and a crash
  * in between merely leaks pages the sweep picks up.
  */
+static int
+lion_vac_cmp_offset(const void *a, const void *b)
+{
+	OffsetNumber x = *(const OffsetNumber *) a;
+	OffsetNumber y = *(const OffsetNumber *) b;
+
+	return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
 static void
 lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 						  int nents)
@@ -877,20 +1039,29 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 
 	for (i = 0; i < nents; i++)
 	{
-		ItemId		iid = PageGetItemId(page, ents[i].off);
+		LionVacEntryRef ref;
 		LionEntryTuple *entry;
 
 		if (!ents[i].maydelete)
 			continue;
-		if (!ItemIdIsUsed(iid))
-			continue;			/* cannot happen: only we delete entries */
 
-		entry = (LionEntryTuple *) PageGetItem(page, iid);
-		if (entry->hash != ents[i].hash || entry->ntids != 0 ||
-			entry->ncontainers != 0)
+		/*
+		 * The offset pass 1 recorded is only a hint (DESIGN.md §21).  An entry
+		 * that is no longer on this leaf at all has moved to a leaf further
+		 * right, which this VACUUM has not reached yet or will not reach; it
+		 * simply stays until the next one, and deleting the WRONG entry is
+		 * what the check prevents.
+		 */
+		ref.buf = buf;
+		ref.off = ents[i].off;
+		if (!lion_vac_ref_valid(&ref, &ents[i]))
 			continue;
 
-		delofs[ndel++] = ents[i].off;
+		entry = lion_page_entry(page, ref.off);
+		if (entry->ntids != 0 || entry->ncontainers != 0)
+			continue;
+
+		delofs[ndel++] = ref.off;
 
 		if ((entry->flags & LION_ENTRY_CHAIN) != 0)
 		{
@@ -902,7 +1073,9 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 
 	if (ndel > 0)
 	{
-		lion_delete_entries(vs->index, buf, delofs, ndel);
+		if (ndel > 1)
+			qsort(delofs, ndel, sizeof(OffsetNumber), lion_vac_cmp_offset);
+		lion_dir_delete(vs->index, buf, delofs, ndel);
 		vs->prof.records++;
 		vs->prof.entries_deleted += ndel;
 	}
@@ -922,7 +1095,7 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 
 	/*
 	 * Now that nothing points at them, the pages of the freed chains can go.
-	 * This takes cleanup locks, so it happens with the bucket page unlocked:
+	 * This takes cleanup locks, so it happens with the leaf unlocked:
 	 * VACUUM never waits for a page while holding another LWLock (§11).
 	 */
 	for (i = 0; i < nfree; i++)
@@ -1125,10 +1298,9 @@ lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
  * protocol this implements.
  */
 static BlockNumber
-lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
+lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 						  const LionVacEntry *ent, BlockNumber blk)
 {
-	OffsetNumber entryoff = ent->off;
 	Buffer		buf;
 	BlockNumber next;
 	LionVacWork	w;
@@ -1166,13 +1338,26 @@ lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
 			break;
 		}
 
-		if (ConditionalLockBuffer(entrybuf))
+		if (ConditionalLockBuffer(ref->buf))
 		{
+			if (!lion_vac_ref_valid(ref, ent))
+			{
+				/*
+				 * A concurrent insert split the leaf and took the entry with
+				 * it.  Let go of everything - a descent may not be made while
+				 * a container page is held - find it again, and start over.
+				 */
+				LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				lion_vac_ref_relocate(vs, ref, ent);
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+
 			INSTR_TIME_SET_CURRENT(t0);
-			lion_vacuum_apply_page(vs, entrybuf, entryoff, buf, &w,
-								  &grown, &ngrown);
+			lion_vacuum_apply_page(vs, ref, buf, &w, &grown, &ngrown);
 			lion_vac_tick(&vs->prof.apply, t0);
-			LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			break;
 		}
@@ -1183,7 +1368,15 @@ lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
 		 * with nothing held and try the cleanup lock again.
 		 */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBuffer(entrybuf, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(ref->buf, BUFFER_LOCK_EXCLUSIVE);
+
+		if (!lion_vac_ref_valid(ref, ent))
+		{
+			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+			lion_vac_ref_relocate(vs, ref, ent);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
 
 		if (ConditionalLockBufferForCleanup(buf))
 		{
@@ -1194,16 +1387,15 @@ lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
 			if (w.nwork > 0 || w.ndel > 0)
 			{
 				INSTR_TIME_SET_CURRENT(t0);
-				lion_vacuum_apply_page(vs, entrybuf, entryoff, buf, &w,
-									  &grown, &ngrown);
+				lion_vacuum_apply_page(vs, ref, buf, &w, &grown, &ngrown);
 				lion_vac_tick(&vs->prof.apply, t0);
 			}
-			LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			break;
 		}
 
-		LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
+		LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -1217,7 +1409,7 @@ lion_vacuum_container_page(LionVacState *vs, Buffer entrybuf,
 	for (i = 0; i < ngrown; i++)
 	{
 		vs->prof.regrows++;
-		lion_vacuum_regrow(vs, entrybuf, ent, blk, grown[i]);
+		lion_vacuum_regrow(vs, ref, ent, blk, grown[i]);
 	}
 
 	MemoryContextSwitchTo(oldcxt);
@@ -1331,10 +1523,12 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
  * they are dealt with by lion_vacuum_regrow() once both locks are gone.
  */
 static void
-lion_vacuum_apply_page(LionVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
-					  Buffer buf, LionVacWork *w, uint32 **grownp, int *ngrownp)
+lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
+					  LionVacWork *w, uint32 **grownp, int *ngrownp)
 {
 	Relation	index = vs->index;
+	Buffer		entrybuf = ref->buf;
+	OffsetNumber entryoff = ref->off;
 	LionEntryTuple *ecopy;
 	Size		esize;
 	GenericXLogState *xstate;
@@ -1426,7 +1620,8 @@ lion_vacuum_apply_page(LionVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
 
 /*
  * Re-place the container with this ckey, which no longer fits the slot it had
- * on page startblk.  Nothing is held on entry or on return.
+ * on page startblk.  Nothing is held on entry or on return (ref keeps its pin
+ * on the leaf, which it owns for the length of pass 2).
  *
  * The page the container lives on now is found by walking right from startblk
  * under a cleanup lock on each page, never by jumping to it: a concurrent
@@ -1440,11 +1635,12 @@ lion_vacuum_apply_page(LionVacState *vs, Buffer entrybuf, OffsetNumber entryoff,
  * may have added a TID to it since it was last read.
  */
 static void
-lion_vacuum_regrow(LionVacState *vs, Buffer entrybuf, const LionVacEntry *ent,
-				  BlockNumber startblk, uint32 ckey)
+lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
+				  const LionVacEntry *ent, BlockNumber startblk, uint32 ckey)
 {
 	Relation	index = vs->index;
-	OffsetNumber entryoff = ent->off;
+	Buffer		entrybuf = InvalidBuffer;
+	OffsetNumber entryoff = InvalidOffsetNumber;
 	BlockNumber blk = startblk;
 
 	for (;;)
@@ -1484,42 +1680,40 @@ lion_vacuum_regrow(LionVacState *vs, Buffer entrybuf, const LionVacEntry *ent,
 			 */
 			UnlockReleaseBuffer(buf);
 			if (!BlockNumberIsValid(next))
-				elog(ERROR, "lion index: container %u of entry %u on block %u vanished from its chain",
-					 ckey, entryoff, BufferGetBlockNumber(entrybuf));
+				elog(ERROR, "lion index: container %u of a chain at %u vanished from it",
+					 ckey, ent->head);
 			blk = next;
 			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
 
 		/* Changing it needs the entry page as well, and never a wait here. */
+		entrybuf = ref->buf;
 		if (!ConditionalLockBuffer(entrybuf))
 		{
+			/*
+			 * An insert holds the leaf.  Let go of the container page, take
+			 * the leaf with nothing else held so that somebody makes progress,
+			 * and try this page again.
+			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			LockBuffer(entrybuf, BUFFER_LOCK_EXCLUSIVE);
-
-			if (!ConditionalLockBufferForCleanup(buf))
-			{
-				LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
-				ReleaseBuffer(buf);
-				CHECK_FOR_INTERRUPTS();
-				continue;		/* start again at this same page */
-			}
-
-			/* The page was unlocked in between: locate the container again. */
-			off = lion_page_find_container(page, ckey, &found);
-			if (!found)
-			{
-				next = LionPageGetOpaque(page)->rightlink;
-				LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
-				UnlockReleaseBuffer(buf);
-				if (!BlockNumberIsValid(next))
-					elog(ERROR, "lion index: container %u of entry %u on block %u vanished from its chain",
-						 ckey, entryoff, BufferGetBlockNumber(entrybuf));
-				blk = next;
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
+			ReleaseBuffer(buf);
+			lion_vac_ref_lock(vs, ref, ent, BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+			CHECK_FOR_INTERRUPTS();
+			continue;			/* start again at this same page */
 		}
+		if (!lion_vac_ref_valid(ref, ent))
+		{
+			/* A split took the entry to another leaf; find it again. */
+			LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buf);
+			lion_vac_ref_relocate(vs, ref, ent);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+		entryoff = ref->off;
 
 		/* Everything read from here on is used inside this window only. */
 		ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
@@ -1586,8 +1780,8 @@ lion_vacuum_regrow(LionVacState *vs, Buffer entrybuf, const LionVacEntry *ent,
 											   entrybuf, entryoff,
 											   ecopy, vs->cbuf, &delta);
 				if (delta != 0)
-					elog(ERROR, "lion index: container %u of entry %u on block %u vanished from its chain",
-						 ckey, entryoff, BufferGetBlockNumber(entrybuf));
+					elog(ERROR, "lion index: container %u of a chain at %u vanished from it",
+						 ckey, ent->head);
 			}
 
 			vs->stats->tuples_removed += (double) nremoved;

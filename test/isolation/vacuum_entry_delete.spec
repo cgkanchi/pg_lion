@@ -1,35 +1,34 @@
 # A GROUP BY count running while VACUUM deletes entries (DESIGN.md §18).
 #
-# VACUUM now removes an entry whose posting set has become empty, and the
-# GROUP BY driver walks the entries of a bucket page by OFFSET, giving up its
-# lock on the page between two entries.  So the two have to agree on what an
-# offset means, or a group would be skipped (every entry after a deleted one
-# shifts down by one) or returned twice.
+# VACUUM removes an entry whose posting set has become empty, and the GROUP BY
+# driver walks the entries of a directory leaf giving up its lock on the page
+# between two of them.  So the two have to agree on where the walk resumes, or
+# a group would be skipped (every entry after a deleted one shifts down) or
+# returned twice.
 #
-# What makes them agree is that entry offsets on a bucket page NEVER change:
-# lion_delete_entries() frees the item through PageIndexTupleDeleteNoCompact(),
-# which leaves the line pointer array alone, instead of
-# PageIndexMultiDelete(), which would renumber it.  The deleted entry shows up
-# as an unused line pointer and is skipped; nothing else moves.
+# What makes them agree since DESIGN.md §21 is that the scan resumes at a KEY
+# and not at an offset: "the first key above the last one I returned".  A
+# deleted entry is simply gone, and only an EMPTY posting set is ever deleted,
+# so its group had nothing this scan's snapshot could have counted.
 #
 # The test:
 #
-#  * 40 keys, one bucket (`buckets = 1`) so that every entry is on ONE bucket
-#    page and a deletion really would shift the ones after it; the rows carry
-#    a 400-byte padding column so that each key's TIDs spread over enough heap
-#    blocks to need several container keys, and `inline_limit = 64` so that
-#    every entry is a CHAIN entry - a posting set the scan holds nothing of
-#    but a head block, which is what lets VACUUM run at all while the scan is
-#    parked (an INLINE payload keeps its bucket page pinned, and VACUUM would
-#    simply wait for that pin).
+#  * 40 keys, small enough that every entry is on ONE directory leaf and a
+#    deletion really would shift the ones after it; the rows carry a 400-byte
+#    padding column so that each key's TIDs spread over enough heap blocks to
+#    need several container keys, and `inline_limit = 64` so that every entry
+#    is a CHAIN entry - a posting set the scan holds nothing of but a head
+#    block, which is what lets VACUUM run at all while the scan is parked (an
+#    INLINE payload keeps its leaf pinned, and VACUUM would simply wait for
+#    that pin).
 #  * s2 deletes every even key's rows and commits BEFORE s1 takes its
 #    snapshot, so they are dead to everyone: s1 must not see them, and VACUUM
 #    is free to remove them.
 #  * s1 runs the grouped count and parks at 'lion-entry-scan-resumed', which
-#    fires once per bucket page, between the first entry and the second.
+#    fires once per leaf, between the first entry and the second.
 #  * s3 vacuums: 20 entries lose their last TID and are deleted, and their
 #    chains are freed.
-#  * s2 releases s1, which finishes its walk of the same page.
+#  * s2 releases s1, which finishes its walk of the same leaf.
 #
 # The expected output is the 20 odd keys, each exactly once, with 300 rows
 # each - and `groups` and `distinct_groups` being equal is the assertion that
@@ -44,7 +43,7 @@ setup
 	INSERT INTO vgd SELECT i, 1 + (i % 40), i % 3, repeat('x', 400)
 	  FROM generate_series(1, 12000) i;
 	CREATE INDEX vgd_g ON vgd USING lion (g);
-	CREATE INDEX vgd_k ON vgd USING lion (k) WITH (buckets = 1, inline_limit = 64);
+	CREATE INDEX vgd_k ON vgd USING lion (k) WITH (inline_limit = 64);
 }
 
 teardown
@@ -98,7 +97,7 @@ step s2_wakeup	{
 	 * Detach first, so that nothing can park at the point again, then
 	 * release whoever is parked now.  How MANY times the point is reached is
 	 * not fixed - the two-column driver runs more than one entry scan, and a
-	 * scan fires the point once per bucket page it consumes an entry from -
+	 * scan fires the point once per leaf it consumes an entry from -
 	 * but after this step nobody is waiting on it, which is all the
 	 * permutation needs.  injection_points_wakeup() searches the WAITERS, so
 	 * it still works after the detach.

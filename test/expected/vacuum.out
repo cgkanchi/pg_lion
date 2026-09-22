@@ -806,7 +806,7 @@ VACUUM lion_slackv;
 SELECT slack_bytes AS slack_after_build FROM lion_index_stats('lion_slackv_k');
  slack_after_build 
 -------------------
-              2048
+              1856
 (1 row)
 
 DELETE FROM lion_slackv WHERE i % 50 = 0;

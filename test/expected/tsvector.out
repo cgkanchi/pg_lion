@@ -183,15 +183,12 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 
 SELECT lion_tsplan($$SELECT grp, count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 & w2') GROUP BY grp$$);
-                          lion_tsplan                          
----------------------------------------------------------------
- HashAggregate
+                             lion_tsplan                             
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ts_grp (grp), lion_ts_tsv (tsv @@ 'w1' & 'w2')
    Group Key: grp
-   ->  Bitmap Heap Scan on lion_ts
-         Recheck Cond: (tsv @@ '''w1'' & ''w2'''::tsquery)
-         ->  Bitmap Index Scan on lion_ts_tsv
-               Index Cond: (tsv @@ '''w1'' & ''w2'''::tsquery)
-(6 rows)
+(3 rows)
 
 -- ---- AND, OR, nested parentheses ---------------------------------------
 SELECT lion_tscmp($$SELECT id FROM lion_ts WHERE tsv @@ to_tsquery('english', 'w1')$$);
@@ -443,9 +440,9 @@ SELECT count(*) FROM lion_ts WHERE tsv @@ to_tsquery('english', 'nosuchword');
 -- ---- GROUP BY a scalar column with a tsquery WHERE clause --------------
 SELECT lion_tscmp($$SELECT grp, count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'w1 & w2') GROUP BY grp$$);
-     lion_tscmp     
---------------------
- index scan, 6 rows
+     lion_tscmp      
+---------------------
+ pushed down, 6 rows
 (1 row)
 
 SELECT lion_tscmp($$SELECT grp, count(*) FROM lion_ts
@@ -549,9 +546,9 @@ SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 
 SELECT lion_tscmp($$SELECT grp, count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'w1 & w2') GROUP BY grp$$);
-     lion_tscmp     
---------------------
- index scan, 6 rows
+     lion_tscmp      
+---------------------
+ pushed down, 6 rows
 (1 row)
 
 SELECT lion_index_verify('lion_ts_tsv', true);

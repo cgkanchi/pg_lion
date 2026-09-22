@@ -57,8 +57,8 @@ the tested workloads, not a general replacement recommendation.
 ## How to use it
 
 For an existing `events` table with `country text`, `event_type text`, and
-`created_at timestamptz`, create separate Lion indexes on the count/filter columns. Start with
-default index options so the build chooses the bucket directory size from the existing data.
+`created_at timestamptz`, create separate Lion indexes on the count/filter columns. The default
+index options are the right ones to start with.
 
 ```sql
 CREATE EXTENSION pg_lion;
@@ -107,11 +107,12 @@ CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
     src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
-    src/lion.h, lion_pages.c on-disk structs; meta/bucket/entry/chain primitives, page splits, generic WAL
+    src/lion.h, lion_pages.c on-disk structs; meta/entry/chain primitives, page splits, generic WAL
+    src/lion_dir.c          the sorted entry directory: a Lehman & Yao B-tree keyed by the index key
     src/lion_am.c           handler, reloptions, amvalidate, cost estimate, buildempty, _PG_init hook/GUC
     src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key page chains
     src/lion_scan.c         amgetbitmap
-    src/lion_insert.c       aminsert (bucket-serialised; bitset in-place fast path)
+    src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
     src/lion_funcs.c        lion_index_stats(), lion_index_verify()
     src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
@@ -150,22 +151,24 @@ past that many distinct keys; it never rejects a row.
 
 ## Reloptions
 
-`buckets` (0 = chosen by the build, otherwise the exact number of hash buckets, max 65536),
+`fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
 `max_entries` (0 = unlimited; the advisory cardinality guard above) and
 `inline_limit` (64 .. 4096 bytes, default 4096): how large a key's posting set may be before it
-moves out of its entry tuple onto container pages of its own. The build chooses the bucket count
-from the BYTES its entries need, at three quarters of a page per bucket - not from the number of
-distinct keys - because every bucket owns a head page whether it needs one or not. Bucket counts
-are no longer rounded to a power of two; a hash is mapped to its bucket with a modulo.
-`lion_index_stats()` reports the bucket count, the pages and entries, the containers by kind,
-the sparse segments, `null_tids`, the number of rows whose key is NULL, and `empty_tids`, the number
-of rows a multi-key opclass extracted no key from.
+moves out of its entry tuple onto container pages of its own.
+`buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
+index key, and it grows by splitting instead of being sized once.
+`lion_index_stats()` reports the directory's height, its leaf and internal pages and whether it is
+`ordered` (false for a key type with no btree opclass, whose entries are then in a complete but
+arbitrary order), the entries, the containers by kind, the sparse segments, `null_tids`, the number
+of rows whose key is NULL, and `empty_tids`, the number of rows a multi-key opclass extracted no key
+from.
 
 ## Known limitations
 
 Single column, equality, `IN` lists and the multi-key operators above (no ranges), no
 `amgettuple`/index-only scans, no
-parallel build or scan, no page recycling. Inserts serialise per hash bucket; see the measured
+parallel build or scan, no reclaim of an emptied directory leaf. Inserts serialise on the directory
+leaf that holds the key; see the measured
 [write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants and parameters
 but no multi-column GROUP BY. `IN` lists of more than 1000
 values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a

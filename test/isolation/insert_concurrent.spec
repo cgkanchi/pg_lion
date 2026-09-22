@@ -1,9 +1,9 @@
-# Concurrent inserts into one hash bucket of a lion index.
+# Concurrent inserts into one directory leaf of a lion index.
 #
 # The counting queries carry a second aggregate on purpose: it keeps the
 # plans bitmap heap scans, which is what this spec is about.
 #
-# The index has a single bucket, so every key shares one bucket head page and
+# Every key here shares one directory leaf, so they share one page lock and
 # all writers serialise on it.  Two sessions insert rows with the same key
 # while a third scans; the scan must see exactly the committed rows, and the
 # index must still be structurally sound afterwards.
@@ -14,7 +14,7 @@ setup
 	CREATE TABLE lion_conc (i int4, k int4);
 	INSERT INTO lion_conc SELECT i, i % 4 FROM generate_series(1, 20000) i;
 	CREATE INDEX lion_conc_k ON lion_conc USING lion (k)
-		WITH (buckets = 1, inline_limit = 64);
+		WITH (inline_limit = 64);
 	ANALYZE lion_conc;
 }
 

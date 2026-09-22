@@ -44,6 +44,8 @@ typedef struct LionScanOpaqueData
 	LionState   *state;			/* cached relation state */
 	Oid			subtype;		/* type of the scan key argument */
 	FmgrInfo	subhashproc;	/* hash function for that type */
+	FmgrInfo	subcmpproc;		/* ordering of a stored key against it (§21) */
+	bool		subcmpvalid;
 	bool		subhashvalid;
 	bool		recheck;		/* the emitted TIDs are a superset */
 } LionScanOpaqueData;
@@ -261,13 +263,12 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 }
 
 /*
- * Emit the posting set of the entry at (entrybuf, entryoff), which the caller
- * holds SHARE-locked together with the bucket head headbuf (they may be the
- * same buffer).  Both are released here, before any container page is
- * touched.
+ * Emit the posting set of the entry at (entrybuf, entryoff), a directory leaf
+ * the caller holds SHARE-locked.  It is released here, before any container
+ * page is touched (the reader side of the DESIGN.md §11 deadlock rule).
  */
 static int64
-lion_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
+lion_emit_entry(Relation index, Buffer entrybuf,
 			   OffsetNumber entryoff, TIDBitmap *tbm, bool recheck)
 {
 	Page		page = BufferGetPage(entrybuf);
@@ -294,9 +295,7 @@ lion_emit_entry(Relation index, Buffer headbuf, Buffer entrybuf,
 		blkno = entry->head;
 	}
 
-	if (entrybuf != headbuf)
-		UnlockReleaseBuffer(entrybuf);
-	UnlockReleaseBuffer(headbuf);
+	UnlockReleaseBuffer(entrybuf);
 
 	if (payload != NULL)
 	{
@@ -350,10 +349,40 @@ lion_scankey_hash(IndexScanDesc scan, LionScanOpaque so, Oid subtype,
 		fmgr_info(hashproc, &so->subhashproc);
 		so->subtype = subtype;
 		so->subhashvalid = true;
+		so->subcmpvalid = false;
 	}
 
 	return DatumGetUInt32(FunctionCall1Coll(&so->subhashproc, collation,
 											value));
+}
+
+/*
+ * The ordering of a STORED key against a search value of subtype: support
+ * proc 4 of the opfamily for (opcintype, subtype), DESIGN.md §21.  NULL means
+ * the family has none, and lion_dir_find() then falls back to walking the
+ * leaves.
+ */
+static FmgrInfo *
+lion_scankey_cmp(IndexScanDesc scan, LionScanOpaque so, Oid subtype)
+{
+	Relation	index = scan->indexRelation;
+
+	if (!OidIsValid(subtype) || subtype == index->rd_opcintype[0])
+		return so->state->ordered ? &so->state->cmpproc : NULL;
+
+	if (!so->subcmpvalid)
+	{
+		Oid			cmpproc = get_opfamily_proc(index->rd_opfamily[0],
+												index->rd_opcintype[0],
+												subtype, LION_CMP_PROC);
+
+		if (!OidIsValid(cmpproc))
+			return NULL;
+		fmgr_info(cmpproc, &so->subcmpproc);
+		so->subcmpvalid = true;
+	}
+
+	return &so->subcmpproc;
 }
 
 /*
@@ -366,27 +395,23 @@ lion_emit_value(IndexScanDesc scan, LionScanOpaque so, ScanKey skey, Datum value
 	Relation	index = scan->indexRelation;
 	LionState   *state = so->state;
 	uint32		hash;
-	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 
 	hash = lion_scankey_hash(scan, so, skey->sk_subtype, skey->sk_collation,
 							value);
 
-	headbuf = ReadBuffer(index,
-						 LION_BUCKET_BLKNO(lion_bucket_of(hash,
-														state->meta.nbuckets)));
-	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
-
-	if (!lion_find_entry_ext(index, state, headbuf, BUFFER_LOCK_SHARE,
-							value, hash, &skey->sk_func, skey->sk_collation,
-							&entrybuf, &entryoff))
+	if (!lion_find_entry_ext(index, state, BUFFER_LOCK_SHARE, value, hash,
+							&skey->sk_func,
+							lion_scankey_cmp(scan, so, skey->sk_subtype),
+							skey->sk_collation, &entrybuf, &entryoff))
 	{
-		UnlockReleaseBuffer(headbuf);
+		if (BufferIsValid(entrybuf))
+			UnlockReleaseBuffer(entrybuf);
 		return 0;
 	}
 
-	return lion_emit_entry(index, headbuf, entrybuf, entryoff, tbm, so->recheck);
+	return lion_emit_entry(index, entrybuf, entryoff, tbm, so->recheck);
 }
 
 /*
@@ -435,21 +460,18 @@ lion_emit_array(IndexScanDesc scan, LionScanOpaque so, ScanKey skey,
 static int64
 lion_emit_null(Relation index, LionState *state, TIDBitmap *tbm, bool recheck)
 {
-	Buffer		headbuf;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 
-	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(LION_NULLKEY_BUCKET));
-	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
-
-	if (!lion_find_null_entry(index, headbuf, BUFFER_LOCK_SHARE,
+	if (!lion_find_null_entry(index, state, BUFFER_LOCK_SHARE,
 							 &entrybuf, &entryoff))
 	{
-		UnlockReleaseBuffer(headbuf);
+		if (BufferIsValid(entrybuf))
+			UnlockReleaseBuffer(entrybuf);
 		return 0;
 	}
 
-	return lion_emit_entry(index, headbuf, entrybuf, entryoff, tbm, recheck);
+	return lion_emit_entry(index, entrybuf, entryoff, tbm, recheck);
 }
 
 /*
@@ -472,12 +494,15 @@ lion_emit_null(Relation index, LionState *state, TIDBitmap *tbm, bool recheck)
  * walk like this one can find it.  The NULL entry is left out, because a NULL
  * value satisfies neither kind of qual (the multi-key operators are strict).
  *
- * Each bucket page is copied into backend-local memory and released before
- * its entries are emitted, so no bucket page is held while container pages
- * are pinned (DESIGN.md §11).  Working from the copy can miss an entry added
- * after the copy was taken, which is exactly as acceptable as it is for a
- * single key: such an entry can only hold TIDs that no snapshot older than
- * this scan can see.
+ * The walk is the leftmost leaf and then the right links (DESIGN.md §21), so
+ * for an ordered opclass the entries come out in key order.  Each leaf is
+ * copied into backend-local memory and released before its entries are
+ * emitted, so no directory page is held while container pages are pinned
+ * (DESIGN.md §11).  Working from the copy can miss an entry added after the
+ * copy was taken, which is exactly as acceptable as it is for a single key:
+ * such an entry can only hold TIDs that no snapshot older than this scan can
+ * see.  A concurrent split moves entries only to a page further right, which
+ * this walk has not passed yet, so nothing is seen twice either.
  */
 static int64
 lion_emit_all_keys(Relation index, LionState *state, TIDBitmap *tbm,
@@ -485,57 +510,52 @@ lion_emit_all_keys(Relation index, LionState *state, TIDBitmap *tbm,
 {
 	PGAlignedBlock *copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	Page		cpage = (Page) copy->data;
+	BlockNumber blkno = lion_dir_leftmost_leaf(index, state);
 	int64		ntids = 0;
-	uint32		b;
 
-	for (b = 0; b < state->meta.nbuckets; b++)
+	while (BlockNumberIsValid(blkno))
 	{
-		BlockNumber blkno = LION_BUCKET_BLKNO(b);
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
 
-		while (BlockNumberIsValid(blkno))
+		buf = ReadBuffer(index, blkno);
+		lion_dir_pages_read++;
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!LionPageIsLeaf(page))
 		{
-			Buffer		buf;
-			Page		page;
-			OffsetNumber maxoff;
-			OffsetNumber off;
-
-			buf = ReadBuffer(index, blkno);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			if (!LionPageIsBucket(page))
-			{
-				UnlockReleaseBuffer(buf);
-				elog(ERROR, "lion index: block %u is not a bucket page",
-					 blkno);
-			}
-			memcpy(cpage, page, BLCKSZ);
 			UnlockReleaseBuffer(buf);
+			elog(ERROR, "lion index: block %u is not a directory leaf", blkno);
+		}
+		memcpy(cpage, page, BLCKSZ);
+		UnlockReleaseBuffer(buf);
 
-			blkno = LionPageGetOpaque(cpage)->rightlink;
-			maxoff = PageGetMaxOffsetNumber(cpage);
+		blkno = LionPageGetOpaque(cpage)->rightlink;
+		maxoff = PageGetMaxOffsetNumber(cpage);
 
-			for (off = FirstOffsetNumber; off <= maxoff; off++)
-			{
-				ItemId		iid = PageGetItemId(cpage, off);
-				LionEntryTuple *entry;
+		for (off = lion_page_first_data(cpage); off <= maxoff; off++)
+		{
+			ItemId		iid = PageGetItemId(cpage, off);
+			LionEntryTuple *entry;
 
-				if (!ItemIdIsUsed(iid))
-					continue;
-				entry = (LionEntryTuple *) PageGetItem(cpage, iid);
-				if (LionEntryIsNullKey(entry))
-					continue;
+			if (!ItemIdIsUsed(iid))
+				continue;
+			entry = (LionEntryTuple *) PageGetItem(cpage, iid);
+			if (LionEntryIsNullKey(entry))
+				continue;
 
-				if ((entry->flags & LION_ENTRY_INLINE) != 0)
-					ntids += lion_emit_inline(LionEntryGetPayload(entry),
-											 LION_ENTRY_PAYLOAD_LEN(entry,
-																   ItemIdGetLength(iid)),
-											 tbm, recheck);
-				else
-					ntids += lion_emit_chain(index, entry->hash, entry->head,
-											tbm, recheck);
+			if ((entry->flags & LION_ENTRY_INLINE) != 0)
+				ntids += lion_emit_inline(LionEntryGetPayload(entry),
+										 LION_ENTRY_PAYLOAD_LEN(entry,
+															   ItemIdGetLength(iid)),
+										 tbm, recheck);
+			else
+				ntids += lion_emit_chain(index, entry->hash, entry->head,
+										tbm, recheck);
 
-				CHECK_FOR_INTERRUPTS();
-			}
+			CHECK_FOR_INTERRUPTS();
 		}
 	}
 

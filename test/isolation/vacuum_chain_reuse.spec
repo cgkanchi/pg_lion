@@ -1,7 +1,7 @@
 # A reader holding a chain's head block while VACUUM frees that chain and an
 # insert takes the pages back (DESIGN.md §18).
 #
-# liongetbitmap() copies the entry tuple, releases the bucket page, and only
+# liongetbitmap() copies the entry tuple, releases the directory leaf, and only
 # then walks the container chain.  Between those two it holds NOTHING of the
 # posting set but the head block number: no pin, no lock.  In that window
 # VACUUM may delete the entry, mark every page of the chain LION_PAGE_DELETED
@@ -87,7 +87,7 @@ step s2_wakeup	{
 	 * Detach first, so that nothing can park at the point again, then
 	 * release whoever is parked now.  How MANY times the point is reached is
 	 * not fixed - the two-column driver runs more than one entry scan, and a
-	 * scan fires the point once per bucket page it consumes an entry from -
+	 * scan fires the point once per leaf it consumes an entry from -
 	 * but after this step nobody is waiting on it, which is all the
 	 * permutation needs.  injection_points_wakeup() searches the WAITERS, so
 	 * it still works after the detach.

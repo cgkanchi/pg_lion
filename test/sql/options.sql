@@ -8,7 +8,8 @@ CREATE TABLE lion_opt AS
 SELECT i, (i % 97)::int4 AS k, 'v' || (i % 97) AS t
   FROM generate_series(1, 20000) i;
 
--- buckets: 0 (auto) up to 65536
+-- buckets: accepted and ignored since format 4 (DESIGN.md §21), still
+-- validated exactly as it was
 CREATE INDEX lion_opt_b0 ON lion_opt USING lion (k) WITH (buckets = 0);
 CREATE INDEX lion_opt_b1 ON lion_opt USING lion (k) WITH (buckets = 1);
 CREATE INDEX lion_opt_b4096 ON lion_opt USING lion (k) WITH (buckets = 4096);
@@ -50,13 +51,23 @@ RESET enable_seqscan;
 SELECT count(*) FROM lion_opt WHERE k = 42;
 
 /*
- * buckets is an exact count now, not rounded up to a power of two: a hash is
- * mapped to its bucket with a modulo (DESIGN.md section 4).
+ * buckets changes nothing at all since format 4: the entry directory is a
+ * B-tree that grows by splitting, so two indexes that differ only in that
+ * option are the same index (DESIGN.md §21).
  */
 CREATE INDEX lion_opt_b7 ON lion_opt USING lion (k) WITH (buckets = 7);
 CREATE INDEX lion_opt_b1000 ON lion_opt USING lion (k) WITH (buckets = 1000);
-SELECT nbuckets, bucket_pages, entries FROM lion_index_stats('lion_opt_b7');
-SELECT nbuckets, bucket_pages, entries FROM lion_index_stats('lion_opt_b1000');
+SELECT directory_height, leaf_pages, entries FROM lion_index_stats('lion_opt_b7');
+SELECT directory_height, leaf_pages, entries FROM lion_index_stats('lion_opt_b1000');
+
+-- fillfactor: 10 .. 100, default 90 (DESIGN.md §21)
+CREATE INDEX lion_opt_ff ON lion_opt USING lion (k) WITH (fillfactor = 50);
+CREATE INDEX lion_opt_ffbad1 ON lion_opt USING lion (k) WITH (fillfactor = 9);
+CREATE INDEX lion_opt_ffbad2 ON lion_opt USING lion (k) WITH (fillfactor = 101);
+SELECT reloptions FROM pg_class WHERE relname = 'lion_opt_ff';
+ALTER INDEX lion_opt_ff SET (fillfactor = 100);
+ALTER INDEX lion_opt_ff RESET (fillfactor);
+DROP INDEX lion_opt_ff;
 SELECT lion_index_verify('lion_opt_b7', true);
 SELECT lion_index_verify('lion_opt_b1000', true);
 SET enable_seqscan = off;

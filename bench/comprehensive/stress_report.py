@@ -84,12 +84,14 @@ Query medians, p95, and bootstrap intervals use the main report's method; they d
             d=drain[(r['method'],r['clients'])]
             writers.append([r['method'],r['clients'],r['rows'],f"{r['tps']:.1f}",f"{r['median_ms']:.3f}",f"{r['p95_ms']:.3f}",
                             f"{r['wal_bytes']/2**20:.3f}",f"{r['index_bytes']/2**20:.3f}",f"{d['elapsed_ms']:.3f}",f"{d['wal_bytes']/2**20:.3f}"])
-    stats_headers=['Profile','State','Index','Buckets','Bucket pages','Entries','Container pages','TIDs']
+    stats_headers=['Profile','State','Index','Height','Leaf pages','Entries','Container pages','TIDs']
     stats_rows=[]
     for r in records:
         if r['kind']=='roaring_stats':
             stats_rows.append([r['profile'],r.get('order',f"cycle {r.get('cycle')}"),r['index'],
-                               r['nbuckets'],r['bucket_pages'],r['entries'],r['container_pages'],r['ntids']])
+                               r.get('directory_height',r.get('nbuckets')),
+                               r.get('leaf_pages',r.get('bucket_pages')),
+                               r['entries'],r['container_pages'],r['ntids']])
     tables=[('Construction routes',growth_headers,growth),('Changing-key churn',churn_headers,churn),
             ('Concurrent inserts',writer_headers,writers),('Roaring storage structure',stats_headers,stats_rows),
             ('Every measured query',query_headers,query_rows)]
