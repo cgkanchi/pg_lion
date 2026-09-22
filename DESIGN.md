@@ -3250,3 +3250,75 @@ for a scalar column and an underestimate for a multi-key one (one entry per lexe
 and the directory HEIGHT is still the whole relation's. Reading a column's entry count off the meta
 page - one counter per column, maintained by build and by insert - would remove both
 approximations, and `lion_index_stats()` already computes it the expensive way.
+
+## 25. Custom WAL resource manager (replacing generic WAL)
+
+Why. Every page change is logged through GenericXLog today: register the buffer (an 8 KB image
+copy), modify, then GenericXLogFinish() diffs image against page and writes the delta (or a full
+image for a new page). Measured (§5): a single-TID insert moves ~48 KB of memory inside the lock
+window, and an unlogged control lifts hot-key throughput only from 643 to 868 tps, so the copy, not
+the logging, is the cost; mid-chain inserts carry 3x btree's WAL (quick-v3: 66 vs 25 MiB per 10k
+rows at 1M). A custom resource manager logs the bytes that changed with no image, no diff, and a
+lock hold that is one memcpy long. It also lets replay take the locks the §9/§11 argument needs on a
+standby (a cleanup lock when applying a removal), which would let the standby count from the
+visibility map again instead of rechecking every TID.
+
+Registration. `RegisterCustomRmgr(rmid, &lion_rmgr)` from `_PG_init`; requires
+`shared_preload_libraries = 'pg_lion'` (the API refuses registration after startup). rmid from a
+GUC `pg_lion.rmgr_id` (default: one of the reserved custom ids; document the collision rule and how
+to check `pg_get_wal_resource_managers()`). Without preload the extension keeps working on generic
+WAL: the rmgr is optional, chosen at index creation and recorded on the meta page (`wal_mode`), so a
+cluster can mix; an index created in rmgr mode refuses to be written by a backend whose server did
+not register the rmgr (ERROR with the preload hint) but can still be read.
+
+Record types (info bits), each with the minimum payload:
+- LION_XLOG_ITEM_SET: (block, offset, itemoff, len, bytes) — an in-place change inside an item:
+  bitset bit set, array/segment insert into slack, container shrink, entry counter update. One
+  buffer, a few bytes. This is the hot-key insert record.
+- LION_XLOG_ITEM_REPLACE: (block, offset, newlen, bytes) — PageIndexTupleOverwrite of one item.
+- LION_XLOG_ITEM_ADD / ITEM_DELETE(s): PageAddItemExtended at an offset / PageIndexTupleDeleteNoCompact
+  or MultiDelete with the offset list.
+- LION_XLOG_PAGE_INIT: a new page (flags, owner, level) — no image, the page is reconstructed.
+- LION_XLOG_SPLIT: the split's moved item range (source block, first/last offset, new block, new
+  page's special data) logged ONCE as the moved items' bytes — nbtree logs the whole new page;
+  either is acceptable, prefer logging items so the record is proportional to the moved half.
+- LION_XLOG_DOWNLINK / INCOMPLETE_SPLIT_CLEAR, LION_XLOG_META (root, height, counters),
+  LION_XLOG_VACUUM_PAGE (offsets deleted + per-item shrinks + entry deltas, one record per page as
+  today), LION_XLOG_PAGE_DELETED (safexid), LION_XLOG_ENTRY (add/replace/delete on a directory leaf).
+Multi-buffer records use registered blocks with REGBUF flags as core does; full-page images follow
+the normal FPW rule (XLogRegisterBuffer + XLogRecordBlockImage when needed), so torn-page safety is
+unchanged. Every record declares its blocks in the order they are locked.
+
+Redo. `lion_redo()` dispatches on info; each handler uses XLogReadBufferForRedo and applies exactly
+the change the writer applied; removals (VACUUM_PAGE, ITEM_DELETE) take the buffer with
+XLogReadBufferForRedoExtended(..., get_cleanup_lock = true), the standby half of §11; splits and
+downlinks replay in record order so the incomplete-split flag semantics hold. `rm_mask` masks
+pd_lsn/checksum and the slack bytes inside items (they are not logged), so
+`wal_consistency_checking = 'pg_lion'`-style checks pass — run the whole regression suite once with
+wal_consistency_checking on a custom-rmgr-enabled cluster to prove replay reproduces every page.
+`rm_desc`/`rm_identify` for pg_waldump. `rm_startup`/`rm_cleanup` not needed.
+
+Standby. With cleanup locks taken at redo for removals, the hot-standby count may use the visibility
+map again for rmgr-mode indexes (the §9 pin argument holds: replay cannot remove a TID from a pinned
+page); the in-recovery "recheck everything" rule stays for generic-WAL-mode indexes. Recovery
+conflicts: a removal record that would need a cleanup lock held by a standby reader waits like
+btree's, so max_standby_streaming_delay applies; `test/recovery` must cover both modes.
+
+Migration and testing. New reloption `wal_mode` (generic | rmgr) defaulting to rmgr when the rmgr is
+registered, else generic; REINDEX switches modes. Every writer path gets a mode switch at the point
+where it starts a record (a small `lion_wal_begin/register/finish` shim wrapping either GenericXLog or
+XLogBeginInsert/XLogRegisterBuffer/XLogInsert), so the storage code does not fork. Tests: the whole
+suite in both modes (the dev cluster gets a second config with shared_preload_libraries), the
+recovery harness in both modes plus wal_consistency_checking, pg_waldump output of each record type,
+crash between the two records of every multi-record operation (directory split, posting split,
+entry-delete-then-free) in rmgr mode. Measurements: bench/write_micro.sh 8-client hot-key burst
+(before: 643 tps, p95 16 ms), quick-v3 mid_insert (before: 435 ms / 66 MiB at 1M), WAL bytes per
+insert record (before: 122 B container path, 1505-2766 B INLINE path), VACUUM WAL, build WAL.
+
+Also in this wave (§23 items that need the same lock-window work):
+- INLINE entry slack: an entry's payload gets growth slack like items (§4), using the 2 spare header
+  bytes freed by §24's attno for a `payload_alloc` length or the zero-terminator rule already used
+  for VACUUM-created slack; an INLINE insert then becomes an ITEM_SET record.
+- Early exit in the AND merge (§22 concern 1): seek sources in ascending selectivity and stop probing
+  a container key as soon as the running intersection is empty; measure the page reads and let the
+  §22 cost formula follow (it charges probes; fewer probes, lower cost).
