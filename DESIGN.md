@@ -2256,7 +2256,8 @@ directory splits and posting-tree splits under crash (an injection point between
     Citus's use of the `create_upper_paths_hook` and `set_rel_pathlist_hook` (chain, never replace);
     shard rebalancing (indexes on moved shards rebuilt correctly); `citus.enable_repartition_joins`;
     `citus_columnar` tables are a separate item, below.
-  - citus_columnar (a table access method, not a planner layer). Two facts drive it: it has no
+  - citus_columnar — secondary; a bonus after bare Citus and TimescaleDB are verified (a table
+    access method, not a planner layer). Two facts drive it: it has no
     visibility map and its MVCC is stripe-level, so the heap-skipping count is unavailable as is;
     and its TIDs are synthetic (stripe row numbers), with offsets far beyond the heap's per-page
     maximum, so the 9-bit offset encoding of §2 cannot represent them and lion_check_key_offset()
@@ -2267,8 +2268,9 @@ directory splits and posting-tree splits under crash (an injection point between
     heap recheck already uses; (2) value — a count pushdown for columnar needs a visibility source
     in place of the VM: columnar's stripe metadata records fully visible stripes and stripes with
     deletions, which is a coarser equivalent; the §9 interlock would have to be re-derived against
-    columnar's own vacuum before any stripe is counted without a row visit. Level (1) is required
-    before release; level (2) decides whether lion is useful on columnar rather than tolerated.
+    columnar's own vacuum before any stripe is counted without a row visit. Level (1) should hold
+    before release (an index on a columnar table must not corrupt or error obscurely); level (2)
+    is optional and decides whether lion is useful on columnar rather than tolerated.
   - TimescaleDB: hypertables (indexes created per chunk through Timescale's DDL hooks; the pushdown's
     partitioned-parent path in §16 sees a hypertable as an inheritance parent with chunks as
     children — confirm the AppendRelInfo mapping and the `rte->inh` handling; Timescale also installs
