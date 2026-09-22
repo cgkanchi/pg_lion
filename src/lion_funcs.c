@@ -38,6 +38,7 @@
 PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_verify);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
+PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 
 #define LION_STATS_NCOLS		23
 
@@ -501,6 +502,33 @@ lion_index_stats(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
+}
+
+/* ---------------------------------------------------------------------
+ * lion_index_wal_mode()
+ * --------------------------------------------------------------------- */
+
+/*
+ * How this index is WAL-logged: "generic" or "rmgr" (DESIGN.md §25).
+ *
+ * The mode is a property of the INDEX, fixed at CREATE INDEX from the
+ * `wal_mode` reloption and whether the server had the resource manager, and
+ * recorded on the meta page - so a cluster can hold both kinds and this is
+ * how to tell which is which.  REINDEX is what changes it.
+ */
+Datum
+lion_index_wal_mode(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	index;
+	int			mode;
+
+	index = lion_open_index(relid, AccessShareLock);
+	mode = lion_wal_mode(index);
+	index_close(index, AccessShareLock);
+
+	PG_RETURN_TEXT_P(cstring_to_text((mode == LION_WAL_MODE_RMGR) ?
+									 "rmgr" : "generic"));
 }
 
 /* ---------------------------------------------------------------------

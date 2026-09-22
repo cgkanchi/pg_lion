@@ -24,6 +24,7 @@
 #include "lion_tid.h"
 #include "lion_container.h"
 #include "lion_sparse.h"
+#include "lion_wal.h"
 
 /* ---------- page special area ---------- */
 
@@ -279,8 +280,25 @@ typedef struct LionMetaPageData
 	BlockNumber root;			/* root of the entry directory (§21) */
 	uint32		height;			/* level of the root; 0 = the root is a leaf */
 	uint32		dirpages;		/* directory pages, leaves and internal both */
-	uint32		reserved[6];	/* pad to 64 bytes */
+
+	/*
+	 * How this index is WAL-logged (DESIGN.md §25): LION_WAL_MODE_GENERIC or
+	 * LION_WAL_MODE_RMGR.  It lives in what was reserved space, so the format
+	 * version did not have to move: a version 6 index written before §25 has
+	 * a zero here, which is exactly "generic", and reads and writes as it
+	 * always did.  REINDEX is what changes an index's mode.
+	 */
+	uint32		wal_mode;
+	uint32		reserved[5];	/* room for the next field to need none */
 } LionMetaPageData;
+
+/*
+ * §25 spent one of the reserved words, so the struct is exactly the size it
+ * has been since version 4 and a meta page written by either version reads as
+ * the other - which is what lets the format version stay at 6.
+ */
+StaticAssertDecl(sizeof(LionMetaPageData) == 56,
+				 "the lion meta page payload must not change size");
 
 #define LionPageGetMeta(page)	((LionMetaPageData *) PageGetContents(page))
 
@@ -466,7 +484,19 @@ typedef struct LionOptions
 	int			inline_limit;
 	int			max_entries;	/* 0 = unlimited (DESIGN.md §17) */
 	int			fillfactor;		/* directory leaf fill at build time (§21) */
+	int			wal_mode;		/* LION_WALOPT_*, DESIGN.md §25 */
 } LionOptions;
+
+/*
+ * The `wal_mode` reloption (DESIGN.md §25).  AUTO is the default and means
+ * "rmgr when this server registered the resource manager, generic when it did
+ * not", which is what lets the same CREATE INDEX script work on a cluster
+ * that preloads the library and on one that does not.  Asking for RMGR
+ * explicitly on a server without it is an ERROR with the preload hint.
+ */
+#define LION_WALOPT_AUTO		0
+#define LION_WALOPT_GENERIC		1
+#define LION_WALOPT_RMGR		2
 
 #define LION_DEFAULT_MAX_ENTRIES		0
 
@@ -678,9 +708,28 @@ extern void lion_init_page(Page page, uint16 flags);
  * The buffer comes back pinned and EXCLUSIVE with the page initialised.
  */
 extern Buffer lion_new_buffer(Relation index, Relation heaprel, uint16 flags);
+
+/*
+ * Take a block for the index WITHOUT starting a record: a recycled one from
+ * the free space map when one is safe to take, else a fresh one from
+ * extending the relation.  The buffer comes back pinned and EXCLUSIVE with an
+ * uninitialised page.
+ *
+ * This is the fallible half of allocating a page, and DESIGN.md §25 requires
+ * it to happen BEFORE lion_wal_begin(): in rmgr mode the record is written
+ * inside a critical section, where extending a relation would turn a full
+ * disk into a PANIC.  Every split therefore works out how many pages it needs
+ * from the page it already holds, takes them here, and only then opens its
+ * record.
+ */
+extern Buffer lion_alloc_page(Relation index, Relation heaprel, bool reuse);
+
+/* Give back a page taken by lion_alloc_page() and not used after all. */
+extern void lion_release_unused_page(Relation index, Buffer buf);
+
 extern void lion_init_metapage(Page page, uint32 inline_limit,
 							  BlockNumber root, uint32 height,
-							  uint32 dirpages);
+							  uint32 dirpages, uint32 wal_mode);
 
 /* Stamp a container page with the chain it belongs to (DESIGN.md §18). */
 static inline void
@@ -909,10 +958,10 @@ extern int lion_max_entries(Relation index);
  * Replace the entry at (buf, offnum) with a new version (buf held EXCLUSIVE).
  * Handles size changes; if the new tuple cannot fit even after defragmenting
  * the page, returns false and changes nothing (caller must spill).
- * Caller supplies the GenericXLogState if it wants the change batched with
- * other buffers (state may be NULL: then this function logs by itself).
+ * Caller supplies the open record if it wants the change batched with other
+ * buffers (state may be NULL: then this function logs by itself).
  */
-extern bool lion_replace_entry(Relation index, GenericXLogState *state, Buffer buf,
+extern bool lion_replace_entry(Relation index, LionWalState *state, Buffer buf,
 							  OffsetNumber offnum, LionEntryTuple *entry, Size size);
 
 /* ---------- lion_posting.c: the per-key posting tree (DESIGN.md §22) ------- */
@@ -1109,15 +1158,22 @@ extern bool lion_index_usable(Relation index, Snapshot snapshot,
 /* ---------- additive helpers (wave 2, insert/vacuum/verify) ---------- */
 
 /*
- * Extend the index by one page inside the caller's GenericXLog record (the
- * page initialisation is logged as a full image).  The buffer comes back
- * pinned and EXCLUSIVE; *pagep, if not NULL, receives the registered image.
- * Allocating a page in the record that links it into a chain is what keeps a
- * crash from leaving an initialised page nothing points at.
+ * Bring a page that lion_alloc_page() took into the caller's open record: it
+ * is registered as a page this record INITIALISES (a generic record logs a
+ * full image, an rmgr record a PAGE_INIT operation and no image at all) and
+ * initialised with `flags`.  Registering the new page in the record that
+ * links it into a chain is what keeps a crash from leaving an initialised
+ * page nothing points at.
  */
-extern Buffer lion_new_buffer_xl(Relation index, Relation heaprel,
-								GenericXLogState *xstate, uint16 flags,
-								bool reuse, Page *pagep);
+extern Page lion_wal_init_buffer(LionWalState *state, Buffer buf, uint16 flags);
+
+/*
+ * Log the page's special area as it now stands.  A caller that changes
+ * rightlink, level, owner stamps, min/max or the page flags calls this once,
+ * when they are final; in generic mode it does nothing, because the diff has
+ * them already.
+ */
+extern void lion_wal_log_special(LionWalState *state, Page page);
 
 /*
  * Private copy of an entry tuple (header, key and padding taken from entry,

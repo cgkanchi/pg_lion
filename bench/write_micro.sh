@@ -182,10 +182,15 @@ SELECT :'ms1', :'wal1',
        pg_wal_lsn_diff(pg_current_wal_insert_lsn(), :'lsn1'::pg_lsn)::bigint;
 SQL
 }
+# The access method was renamed roaring -> lion.  The metric LABELS keep the old
+# name on purpose, so that the numbers stay comparable with the files already in
+# bench/results/write-micro; only the SQL is translated.
+am_sql() { if [ "$1" = roaring ]; then echo lion; else echo "$1"; fi; }
+
 
 build_sql() {
 	local am=$1 cols=$2 out=""
-	for c in $cols; do out="$out CREATE INDEX ix_$c ON fact USING $am ($c);"; done
+	for c in $cols; do out="$out CREATE INDEX ix_$c ON fact USING $(am_sql "$am") ($c);"; done
 	echo "$out"
 }
 
@@ -265,7 +270,7 @@ burst_setup() {
 	q -d wm_burst <<SQL
 CREATE EXTENSION pg_lion;
 CREATE $([ "$BURST_UNLOGGED" = 1 ] && echo UNLOGGED) TABLE writes (k bigint, h int);
-$([ "$am" = none ] || echo "CREATE INDEX ix_h ON writes USING $am (h);")
+$([ "$am" = none ] || echo "CREATE INDEX ix_h ON writes USING $(am_sql "$am") (h);")
 CHECKPOINT;
 SQL
 }

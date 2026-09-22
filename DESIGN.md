@@ -228,10 +228,12 @@ reader copy an item out by ItemIdGetLength() into a fixed work buffer). lion_ind
 reports the total as `slack_bytes`; `container_bytes` counts logical bytes only, and `free_bytes`
 comes from PageGetFreeSpace(), which does not see intra-item slack at all.
 
-Page allocation: `lion_new_buffer_xl()` takes a page - a recycled one from the free space map when
-one is safe to take, else a fresh block from ExtendBufferedRel - initialises it and registers it in
-the caller's GenericXLog record, so a crash cannot leave an initialised page that nothing links to;
-`lion_new_buffer()` is the same in a record of its own. The recycling rule, what `heaprel` is for and
+Page allocation: `lion_alloc_page()` takes a page - a recycled one from the free space map when one
+is safe to take, else a fresh block from ExtendBufferedRel - and `lion_wal_init_buffer()`
+initialises it and registers it in the caller's record, so a crash cannot leave an initialised page
+that nothing links to; `lion_new_buffer()` is the same in a record of its own. The two are separate
+calls since §25: taking the page is the fallible half and has to happen before the record opens,
+because an rmgr-mode record is written inside a critical section. The recycling rule, what `heaprel` is for and
 why a chain's head page never comes from the map are in §18. verify() reports DELETED pages as the
 ordinary free pages they are, unreferenced never-initialised or empty pages as WARNINGs (the next
 VACUUM's sweep turns them into free pages) and anything else as an ERROR.
@@ -582,12 +584,24 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   has no ampredlocks; the count reads indexes without a scan, so it takes PredicateLockRelation on
   every index it opens, before any lookup, so that absent keys are covered. Without it two
   serializable transactions could each count an absent key, insert it, and both commit.
-- **Hot standby.** The pin interlock relies on ambulkdelete taking cleanup locks; WAL replay of
-  generic records takes only exclusive locks, so on a standby a reader's pin does not stop replay
-  from removing TIDs and the following heap records from setting all-visible. In recovery the count
-  therefore treats every heap block as not all-visible and rechecks every candidate TID (still
-  correct, no longer O(1) per container). Lifting this needs a custom resource manager whose redo
-  takes cleanup locks on container and bucket pages, the way btree_xlog_vacuum does.
+- **Hot standby.** The pin interlock relies on ambulkdelete taking cleanup locks, and what replay
+  takes depends on which resource manager wrote the record (§25).
+  *Generic WAL*: replay takes only exclusive locks, so on a standby a reader's pin does not stop
+  replay from removing TIDs and the following heap records from setting all-visible. In recovery a
+  count over such an index treats every heap block as not all-visible and rechecks every candidate
+  TID (still correct, no longer O(1) per container).
+  *The custom resource manager* (§25, implemented): every record that removes a TID or deletes an
+  item declares the page it removes them from, and `lion_redo()` takes that block with
+  `XLogReadBufferForRedoExtended(..., get_cleanup_lock = true)`, the way `btree_xlog_vacuum` does.
+  The argument above then reads on the standby word for word with "VACUUM" replaced by "the startup
+  process": while the count holds a pin on the page a container came from, replay cannot have
+  removed a TID from that page, so it cannot have replayed the heap record that set any of that
+  container's heap pages all-visible. The count uses the visibility map there exactly as on a
+  primary, and the standby reader is paid for the way a primary reader is - replay WAITS, which
+  `max_standby_streaming_delay` turns into a recovery conflict rather than a wrong answer.
+  The decision is per COUNT and not per index (`lion_sources_all_rmgr()`): a container of an
+  intersection carries the dead TIDs of every source it came from, so ONE generic-mode source puts
+  the whole count back on rechecking everything.
 
 Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
@@ -995,6 +1009,16 @@ The guarantee readers may rely on is therefore: **a TID is never removed from an
 before VACUUM has held a cleanup lock on every page that precedes it in chain order, and the
 removal itself happens under a cleanup lock on that page.** A reader that checks the visibility map
 before dropping the pin on the page a container came from cannot be overtaken by VACUUM (§9).
+
+**On a standby the same sentence holds for REPLAY of an rmgr-mode index** (§25). The startup
+process is the only writer there, it applies the primary's records in the order the primary wrote
+them - so it meets the pages in chain order for the same reason VACUUM did, and a page is still
+only ever linked in immediately right of the page whose split created it - and it takes a CLEANUP
+lock on every block a record removes TIDs or items from (VACUUM_PAGE, ITEM_DELETE, PAGE_DELETED,
+and the ENTRY record VACUUM deletes entries with). §11's WAITING RULE applies to it as well and is
+met the same way: the blocks that need a cleanup lock are the first ones a record declares, so the
+wait happens with no other buffer lock held. Replay of a GENERIC record takes an exclusive lock
+instead and offers none of this, which is why §9's last rule is per resource manager.
 
 VACUUM waiting rule (binding): VACUUM must never *wait* for a cleanup lock while holding any other
 LWLock, because holding an LWLock implies HOLD_INTERRUPTS and the wait becomes uncancellable (a
@@ -2029,7 +2053,7 @@ set was visited by pass 2 and is therefore never swept, and a page a concurrent 
 then is full of the items a split just put there. verify() reports such a page as the ordinary leak
 it is, with a WARNING.)*
 
-`lion_new_buffer()`/`lion_new_buffer_xl()` first try GetFreeIndexPage(): take the page with
+`lion_new_buffer()`/`lion_alloc_page()` (§25 split the second out of `lion_new_buffer_xl()`) first try GetFreeIndexPage(): take the page with
 ConditionalLockBuffer; it is reusable only if it is all-zero or LION_PAGE_DELETED with
 GlobalVisCheckRemovableFullXid(heaprel, safexid) true (the nbtree rule: no scan that could still hold
 a link to it is running); otherwise re-record it in the FSM and extend the relation (which also keeps
@@ -2779,12 +2803,21 @@ Operations.
   them a container at `key + 1` that the seek is about to skip anyway. The same holds inside an AND
   node of the expression evaluator (§17), where only the first child steps. Union and single-set
   counting keep the sequential walk.
+  **Since §25 the probes are ordered and abandoned early**: the non-driver sources are sorted by
+  ascending members (the same `ntids`), and a container key is abandoned - the remaining sources
+  neither sought nor read - the moment the running intersection empties or a seek lands past the
+  target. That is the executor half of the open item below, and it is measured there.
 - **The §9 pin discipline is unchanged.** A leaf stays pinned until the container taken from it has
   passed the visibility-map check, and a seek releases the previous leaf's pin only at that same
   point: the two callers of `seek` are the merge's "this container key is missing from some set"
   branch and an AND node's wind-forward, which are exactly the two places that used to call
   `lion_ecursor_next()` for the same reason - nothing of those container keys reaches the visibility
   map, so no answer rests on them.
+  **The early exit of §25 does not touch it either, for the same reason and one more**: a container
+  key that is abandoned contributes nothing to the answer, so no visibility-map question is asked
+  about it and there is nothing to discharge for any page it touched; and the sources that were not
+  sought are not stepped, so they simply KEEP the pins they were standing on. A pin too many never
+  makes a count wrong - it only makes VACUUM wait.
 - **Owner validation (§18) applies to internal pages as well**, and to the LEVEL: a leaf's right link
   always names another leaf, so a page above level 0 reached through one is treated exactly as a page
   whose owner no longer matches - the end of the set.
@@ -2882,12 +2915,14 @@ its competitor is, and no honest count of pages closes that.
 
 Two ways out, neither taken here:
 
-- **the executor could stop reading those pages.** The probes of a dense source are made by the
-  merge before it knows whether anything survives at that container key: at 40 of the 300 keys the
-  intersection of `c20k` and `c200` is already empty, and `c2` is sought - and its leaf read -
-  anyway. Seeking a source lazily, in selectivity order, with the intersection abandoned as soon as
-  the accumulator empties, would cut what this query reads to a handful of pages and the estimate
-  with it, because the estimate would then be counting probes that really happen.
+- **the executor could stop reading those pages.** DONE in §25's wave, and it did what this said it
+  would: probing in selectivity order and abandoning a container key as soon as the accumulator
+  empties takes this query from **112 buffer accesses to 11** at one million rows, and 0.095 ms to
+  0.040 ms. What it did NOT do is close the gap in the ESTIMATE, and §25's "also" item records the
+  experiment that says why: a discount built from a survival fraction per level is right when the
+  columns are independent and ten times optimistic when they are not, and nothing
+  `lion_cost_count_rel()` can see tells the two apart. So `pages = Min(walk, probes x (height + 1))`
+  stands, as an upper bound the executor can now beat.
 - **or the model could price a resident index page as a buffer hit.** `lion_heap_page_cost()`
   already argues residency from `effective_cache_size`, but its floor is seq_page_cost, because for
   HEAP pages the competing plan reads the same pages and the comparison is fair. For the container
@@ -3263,6 +3298,12 @@ lock hold that is one memcpy long. It also lets replay take the locks the §9/§
 standby (a cleanup lock when applying a removal), which would let the standby count from the
 visibility map again instead of rechecking every TID.
 
+**Status: implemented** (`src/lion_wal.[ch]`, and every write path in the extension converted). The
+resource manager is OPTIONAL and per index: a cluster can hold indexes of both kinds, a server
+without the preload keeps writing generic WAL, and REINDEX moves an index from one to the other.
+The subsections below say what was built, where it deviates from the paragraphs above, and what it
+measured.
+
 Registration. `RegisterCustomRmgr(rmid, &lion_rmgr)` from `_PG_init`; requires
 `shared_preload_libraries = 'pg_lion'` (the API refuses registration after startup). rmid from a
 GUC `pg_lion.rmgr_id` (default: one of the reserved custom ids; document the collision rule and how
@@ -3271,54 +3312,435 @@ WAL: the rmgr is optional, chosen at index creation and recorded on the meta pag
 cluster can mix; an index created in rmgr mode refuses to be written by a backend whose server did
 not register the rmgr (ERROR with the preload hint) but can still be read.
 
-Record types (info bits), each with the minimum payload:
-- LION_XLOG_ITEM_SET: (block, offset, itemoff, len, bytes) — an in-place change inside an item:
-  bitset bit set, array/segment insert into slack, container shrink, entry counter update. One
-  buffer, a few bytes. This is the hot-key insert record.
-- LION_XLOG_ITEM_REPLACE: (block, offset, newlen, bytes) — PageIndexTupleOverwrite of one item.
-- LION_XLOG_ITEM_ADD / ITEM_DELETE(s): PageAddItemExtended at an offset / PageIndexTupleDeleteNoCompact
-  or MultiDelete with the offset list.
-- LION_XLOG_PAGE_INIT: a new page (flags, owner, level) — no image, the page is reconstructed.
-- LION_XLOG_SPLIT: the split's moved item range (source block, first/last offset, new block, new
-  page's special data) logged ONCE as the moved items' bytes — nbtree logs the whole new page;
-  either is acceptable, prefer logging items so the record is proportional to the moved half.
-- LION_XLOG_DOWNLINK / INCOMPLETE_SPLIT_CLEAR, LION_XLOG_META (root, height, counters),
-  LION_XLOG_VACUUM_PAGE (offsets deleted + per-item shrinks + entry deltas, one record per page as
-  today), LION_XLOG_PAGE_DELETED (safexid), LION_XLOG_ENTRY (add/replace/delete on a directory leaf).
-Multi-buffer records use registered blocks with REGBUF flags as core does; full-page images follow
-the normal FPW rule (XLogRegisterBuffer + XLogRecordBlockImage when needed), so torn-page safety is
-unchanged. Every record declares its blocks in the order they are locked.
+### The shim (`lion_wal.[ch]`, implemented)
 
-Redo. `lion_redo()` dispatches on info; each handler uses XLogReadBufferForRedo and applies exactly
-the change the writer applied; removals (VACUUM_PAGE, ITEM_DELETE) take the buffer with
-XLogReadBufferForRedoExtended(..., get_cleanup_lock = true), the standby half of §11; splits and
-downlinks replay in record order so the incomplete-split flag semantics hold. `rm_mask` masks
-pd_lsn/checksum and the slack bytes inside items (they are not logged), so
-`wal_consistency_checking = 'pg_lion'`-style checks pass — run the whole regression suite once with
-wal_consistency_checking on a custom-rmgr-enabled cluster to prove replay reproduces every page.
-`rm_desc`/`rm_identify` for pg_waldump. `rm_startup`/`rm_cleanup` not needed.
+Four calls, and every write path in the extension goes through them:
 
-Standby. With cleanup locks taken at redo for removals, the hot-standby count may use the visibility
-map again for rmgr-mode indexes (the §9 pin argument holds: replay cannot remove a TID from a pinned
-page); the in-recovery "recheck everything" rule stays for generic-WAL-mode indexes. Recovery
-conflicts: a removal record that would need a cleanup lock held by a standby reader waits like
-btree's, so max_standby_streaming_delay applies; `test/recovery` must cover both modes.
+    LionWalState *lion_wal_begin(Relation index);
+    Page  lion_wal_register_buffer(LionWalState *, Buffer, int flags);
+    void  lion_wal_op(LionWalState *, Page, uint8 op, OffsetNumber off,
+                      uint16 aux, const void *data, Size len);
+    void  lion_wal_finish(LionWalState *, uint8 info);      /* and _abort() */
 
-Migration and testing. New reloption `wal_mode` (generic | rmgr) defaulting to rmgr when the rmgr is
-registered, else generic; REINDEX switches modes. Every writer path gets a mode switch at the point
-where it starts a record (a small `lion_wal_begin/register/finish` shim wrapping either GenericXLog or
-XLogBeginInsert/XLogRegisterBuffer/XLogInsert), so the storage code does not fork. Tests: the whole
-suite in both modes (the dev cluster gets a second config with shared_preload_libraries), the
-recovery harness in both modes plus wal_consistency_checking, pg_waldump output of each record type,
-crash between the two records of every multi-record operation (directory split, posting split,
-entry-delete-then-free) in rmgr mode. Measurements: bench/write_micro.sh 8-client hot-key burst
-(before: 643 tps, p95 16 ms), quick-v3 mid_insert (before: 435 ms / 66 MiB at 1M), WAL bytes per
-insert record (before: 122 B container path, 1505-2766 B INLINE path), VACUUM WAL, build WAL.
+`lion_wal_register_buffer()` hands back the page to work on: the SCRATCH IMAGE
+in generic mode, where everything is exactly as it was before this section, and
+the BUFFER'S OWN PAGE in rmgr mode. `lion_wal_op()` describes one change and is
+a no-op in generic mode, where the byte-wise diff describes it already. So a
+call site is written once and reads the same in both modes; what forks is four
+lines in one file. `lion_wal_register_data()` exists for record-level payload
+and is used for the record header alone.
+
+**The rule a call site must follow, and the deviation it forced.** In rmgr mode
+`lion_wal_begin()` opens a CRITICAL SECTION, because the page is modified in
+place and an ERROR between the first modification and XLogInsert() would leave a
+page in shared buffers that no record describes. Everything fallible therefore
+has to happen BEFORE the record opens. Three consequences, all of them
+deviations from what this section assumed:
+
+- `lion_new_buffer_xl()` is gone. Allocating a page is split into
+  `lion_alloc_page()` (fallible: the free space map, or extending the relation)
+  and `lion_wal_init_buffer()` (registers the page the caller already has with
+  REGBUF_WILL_INIT and initialises it). Every split therefore works out how many
+  pages it needs BEFORE it opens its record, and `lion_release_unused_page()`
+  gives back one it turns out not to need.
+- **A container split rehearses its own deletion.** `lion_split_and_place()`
+  used to ask "do the new items still fit on P?" after deleting the moved ones
+  from P, inside the record, and allocate the second new page M there if the
+  answer was no. It now asks the same question of a private copy of the page
+  that the deletion is rehearsed on, and allocates M before the record. A copy
+  rather than arithmetic because PageIndexMultiDelete() compacts, and what a
+  compaction recovers is exactly what the arithmetic would have to guess at. A
+  split copies a page once; the hot path copies nothing at all, which is the
+  whole point.
+- `lion_wal_abort()` is legal only while nothing has been modified, which it
+  asserts. All four callers qualify: each is a PageIndexTupleOverwrite() that
+  tests before it writes. The "can't happen" `elog(ERROR)`s that remain inside a
+  record become PANICs in rmgr mode, which is the honest answer for a page that
+  changed under a lock this backend holds.
+
+Nothing above changes generic mode, where GenericXLogFinish() opens its own
+critical section as it always did.
+
+### The record catalogue as implemented
+
+An rmgr record's payload is, per registered block, a packed stream of eight-byte
+operation headers `{op, off, aux, len}` each followed by `len` bytes. One
+`lion_redo_apply()` executes the stream; the record TYPE (the top four bits of
+`xl_info`) names the operation for `pg_waldump`/`pg_walinspect` and decides
+which blocks replay takes a cleanup lock on. That is a deviation from this
+section's first draft, which gave each record type a payload struct of its own:
+twelve bespoke redo handlers would have been twelve places for a replay bug,
+where an operation stream is one, and `wal_consistency_checking` checks the one.
+
+The main data is a two-byte header, `{initmask, cleanupmask}`, one bit per
+block. It travels in the record's own data rather than a block's so that redo
+can read it even when every block carries a full-page image.
+
+    record          info  buffers  payload
+    ITEM_SET        0x00  1-2      CONTAINER_ADD or SPARSE_INS on the container
+                                   page, MINMAX if a segment's range grew, and
+                                   the entry tuple on the directory leaf.  The
+                                   hot-key insert record: ~64 bytes.
+    ITEM_REPLACE    0x10  2        REPLACE (the item at its allotted length,
+                                   slack already zeroed) + MINMAX + the entry.
+                                   MEASURED REGRESSION: for a dense container
+                                   this is ~1.6 KB where a generic byte diff was
+                                   ~122 B; see the measurements below.
+    ITEM_ADD        0x20  1-2      DELETE (when replacing) + ADD per item +
+                                   MINMAX + the entry.  Also every record of an
+                                   INLINE spill.
+    ITEM_DELETE     0x30  2        MULTIDEL + MINMAX + the entry.  CLEANUP LOCK
+                                   on the container page.
+    PAGE_INIT       0x40  1        INIT + SPECIAL.  Written by lion_new_buffer()
+                                   alone, which nothing calls today: every page
+                                   is initialised inside the record that links
+                                   it in.  Kept because that is what the record
+                                   type is for.
+    SPLIT           0x50  2-4      Both halves as INIT + ADD/ADDMANY + SPECIAL,
+                                   the old right sibling's SPECIAL, and META or
+                                   the entry.  Covers the directory split, the
+                                   root split, the container split and the
+                                   posting-tree root push-down.
+    DOWNLINK        0x60  1        ADD of one LionPostingPivot into a parent.
+    SPLIT_CLEAR     0x70  1        FLAGS: clears LION_PAGE_INCOMPLETE_SPLIT.
+    META            0x80  1        META.  Reserved: the meta page only ever
+                                   changes inside a directory split today, so
+                                   that record carries the META operation and
+                                   this type is not written.
+    VACUUM_PAGE     0x90  1-2      MULTIDEL + REPLACE per shrunk item + MINMAX +
+                                   the entry, or a batch of REPLACEs on a
+                                   directory leaf's INLINE entries.  CLEANUP
+                                   LOCK on the page the TIDs leave.
+    PAGE_DELETED    0xA0  1        DELETED with the safexid, which is LOGGED and
+                                   not recomputed at redo.  CLEANUP LOCK.
+    ENTRY           0xB0  1        ADD, REPLACE or MULTIDEL of entry tuples on a
+                                   directory leaf.  CLEANUP LOCK when VACUUM
+                                   deletes entries.
+
+The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
+ADDMANY, REPLACE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS, META,
+DELETED, CONTAINER_ADD, SPARSE_INS.
+
+**Two operations log the writer's CALL rather than its bytes**, and that is
+where the hot record's size comes from. Adding a member to a sorted ARRAY shifts
+every element above it, so the bytes that change run to the end of the item -
+up to 4 KB - while "add member `lo` to the item at offset `off`" is four.
+CONTAINER_ADD calls `lion_container_add()` and SPARSE_INS calls
+`lion_sparse_insert()` at redo, on the same item, which is deterministic for the
+same reason every other operation is and is what `wal_consistency_checking`
+checks. Everything else logs bytes.
+
+**Offsets are always explicit.** A writer that calls PageAddItemExtended() with
+InvalidOffsetNumber logs the offset it GOT, so replay never has to reproduce the
+line-pointer search - a page whose unused line pointers differ would otherwise
+diverge silently.
+
+**A directory split logs BOTH halves**, which is a deviation: this section
+preferred logging only the moved half, and that is what a CONTAINER split does
+(P keeps its items, N and M get theirs). A directory split cannot, because both
+halves are rebuilt from scratch and the only page the other half could be
+derived from is the very page being re-initialised - whose pre-image a full-page
+image would destroy. Both halves are registered REGBUF_WILL_INIT instead, so
+neither pays for an image at all and the record is the page's live bytes.
+
+**One record type is not enough to decide the cleanup lock, and
+`wal_consistency_checking` did not find that one - reading the code did.**
+VACUUM's REGROW step (§18: a container that grew while it was being filtered
+and no longer fits its slot) re-places the item through the general machinery of
+lion_pages.c, the same code an INSERT goes down, so the record it writes is an
+ordinary ITEM_REPLACE or ITEM_ADD or SPLIT - and it removes TIDs. The fact is a
+property of the CALLER, not of the operation: VACUUM holds a cleanup lock on
+that page throughout. So `lion_wal_removal_begin()`/`_end()` bracket that window
+and every record written inside it marks its FIRST registered block - which on
+every one of those paths is the container page - as needing a cleanup lock at
+redo. It travels that way rather than through five function signatures because
+five signatures would have to carry a fact that only one caller in the tree
+knows.
+
+Redo. `lion_redo()` reads the header, then takes each registered block in the
+order the writer registered it, with RBM_ZERO_AND_LOCK for a block in
+`initmask` and `get_cleanup_lock = true` for a block in `cleanupmask`, and
+applies that block's operation stream when the action is BLK_NEEDS_REDO. Blocks
+that need a cleanup lock are always registered FIRST, so the wait happens with
+no other buffer lock held - §11's waiting rule, applied to the startup process.
+The reverse order (container page, then directory leaf) is safe against standby
+READERS because no reader ever holds two of these locks at once: a scan walks
+the leaves one shared lock at a time, a descent releases the parent before
+locking the child, and §11's rule for readers already forbids taking a directory
+lock while holding a container page.
+
+`rm_mask()` masks the page LSN and checksum, the hint bits, the free space
+between pd_lower and pd_upper, and **the MAXALIGN padding after every item**.
+
+That last one is the one thing this section got right for the wrong reason and
+is worth spelling out, because `wal_consistency_checking` found it on its very
+first run and nothing else would have. PageAddItemExtended() reserves
+MAXALIGN(size) bytes and copies `size` of them; the bytes in between keep
+whatever the page held there before. Core's own access methods do not care,
+because a core index tuple is MAXALIGNed by index_form_tuple() and there is no
+padding - but a lion entry tuple is MAXALIGN(header + key) plus a payload BYTE
+COUNT, and a container item's size comes out of its header, so both routinely
+end on an odd boundary. On the primary the padding holds whatever the page held;
+on a standby the page may have arrived as a full-page image, whose HOLE is
+restored as ZEROES, and the two pages then differ in bytes no record ever
+described and no reader ever reads. The first failure was a 54-byte entry tuple
+on a directory leaf, two bytes wide.
+
+The growth SLACK inside an item (§4) is a different thing and is NOT masked: an
+item is always logged at its ALLOCATED length with its slack already zeroed
+(`lion_item_zero_slack()`), and the three operations that change an item without
+rewriting it leave every byte outside the range they name untouched on both
+sides. Masking it would hide a real divergence. Generic mode never had either
+problem, because a byte-wise diff of the whole image covers padding and slack
+alike - which is the general shape of what this wave traded away.
+
+### Standby (implemented)
+
+With cleanup locks taken at redo for removals, the hot-standby count uses the
+visibility map again for rmgr-mode indexes. `lion_count.c` decides it per
+COUNT, not per index: `cx.in_recovery` is now
+`RecoveryInProgress() && !lion_sources_all_rmgr(...)`, because a container of an
+intersection carries the dead TIDs of every source it came from and the
+interlock has to hold for all of them - ONE generic-mode source loses it. The
+argument is written out next to the code and is §9's with "VACUUM" replaced by
+"the startup process": while the backend holds a pin on the page it took a
+container from, replay cannot have removed a TID from that page, so it cannot
+have replayed the heap record that set any of that container's heap pages
+all-visible. §11's split hole closes the same way - a page is only ever linked
+in immediately right of the page whose split created it, and replay applies
+those records in the order the primary wrote them.
+
+The reader pays for it the way a primary reader does: replay WAITS, which is a
+recovery conflict resolved by `max_standby_streaming_delay` rather than a wrong
+answer. `test/recovery/run.sh` phase 2 covers both halves in both modes - a
+generic-mode standby must report `blocks_skipped = 0` and recheck every TID, an
+rmgr-mode one must report `blocks_skipped > 0`, and the REPEATABLE READ standby
+session whose rows the primary deletes and vacuums must be either preserved
+(`hot_standby_feedback = on`) or cancelled by a recovery conflict, never
+silently answered with a different number.
+
+### Registration and migration (implemented)
+
+`RegisterCustomRmgr(lion_rmgr_id, &lion_rmgr)` from `_PG_init()`, and ONLY while
+`process_shared_preload_libraries_in_progress` - so a library that is merely
+`LOAD`ed does nothing. The `pg_lion.rmgr_id` GUC is PGC_POSTMASTER and is
+defined in the same guarded block, because core refuses to define a
+postmaster-level GUC after startup (pg_stat_statements returns from `_PG_init()`
+at exactly this point and for exactly this reason). Default 128,
+`RM_EXPERIMENTAL_ID`, which is the id the project reserves for development: a
+release has to either reserve an id on the wiki page the core documentation
+names or keep the GUC and say so. The GUC stays either way - the point of a
+reserved range is that a site can move out of a collision - and
+`pg_get_wal_resource_managers()` is where to look. Once an index has been
+written in rmgr mode the library must stay preloaded for as long as WAL that
+mentions it may be replayed, which is the rule core states for every custom
+resource manager.
+
+`wal_mode` lives in the META PAGE, in `reserved[0]`, so LION_VERSION stays 6 and
+a version-6 index written before this section has a zero there, which is exactly
+"generic". The reloption `wal_mode` is `auto | generic | rmgr` with auto the
+default: auto means rmgr when this server registered the manager and generic
+when it did not, which is what lets one CREATE INDEX script work on a cluster
+that preloads the library and on one that does not. Asking for `rmgr` by name on
+a server without it is an ERROR with the preload hint, at CREATE INDEX (from
+`lionoptions()`) and again at build. READING an rmgr-mode index works on any
+server; WRITING one without the manager ERRORs in `lion_wal_begin()`, which is
+the one place every write path passes through, with the preload hint and the
+REINDEX alternative. REINDEX is what changes an index's mode.
+`lion_index_wal_mode(idx)` reports it.
+
+### Testing (implemented)
+
+- `make installcheck` runs the whole suite in generic mode, which is what a
+  server without the preload gives, and `make installcheck-rmgr` restarts the
+  dev cluster with `shared_preload_libraries = 'pg_lion'` on pg_ctl's command
+  line, runs the same suite, and restarts it back. Nothing is written into
+  postgresql.conf, so an interrupted run leaves no trace. `WAL_CONSISTENCY=1`
+  adds `wal_consistency_checking = 'pg_lion'`.
+- `test/sql/walrecords.sql` drives every write path and reads the WAL back with
+  pg_walinspect. It has TWO expected files, because the point is that the output
+  differs: `walrecords.out` is the generic run and `walrecords_1.out` the rmgr
+  one, and pg_regress accepts either. It uses pg_walinspect and not pg_waldump
+  because pg_waldump does not load the module and therefore prints the manager
+  as `custom128` and every record type as `UNKNOWN`; pg_walinspect runs in the
+  backend, where `rm_identify()` and `rm_desc()` are ours.
+  One trap, found the hard way and now closed in `test/rmgr-check.sh`: `pg_ctl
+  restart` REUSES the options in postmaster.opts, so restarting after an `-o`
+  start keeps the preload and leaves the dev cluster in rmgr mode - and the
+  next plain `make installcheck` then silently tests the wrong mode and passes,
+  because walrecords.sql's two expected files make either answer acceptable.
+  Both directions stop and start instead, and the restore prints how many
+  resource managers are registered afterwards.
+- `test/recovery/run.sh` takes `--mode generic|rmgr` and a repeatable `--conf`.
+  `make recovery-check-rmgr` is `--mode rmgr --conf "wal_consistency_checking =
+  'pg_lion'"`, and THAT is where the "replay reproduces every page" proof
+  actually lands: `wal_consistency_checking` only compares during REPLAY, so
+  turning it on for a primary that never replays proves nothing. The harness's
+  standby replays everything phases 1 and 2 write, and every crash of phase 1
+  replays its own range; a mismatch is a FATAL in the startup process.
+
+### Measured (2026-09-22, release build, alternating arms, one binary and one cluster)
+
+The A/B lever is `shared_preload_libraries`: the benchmark cluster is restarted
+with and without it, so `wal_mode = auto` resolves to rmgr or generic and
+nothing else differs. Arms were alternated within every series. The box was NOT
+idle (the regression suite ran throughout), so the millisecond columns carry
+about +/-10% and the WAL columns - which were byte-identical across every
+repeat - do not. Times are from a `-O2` build and are therefore NOT comparable
+with the assert-build numbers elsewhere in this document; the WAL bytes are, and
+the generic arm reproduces §5's "before" to within noise, which is the
+cross-check that says so.
+
+    8-client hot-key burst, 2 key values, synchronous_commit on
+                      tps            p95
+      generic         765            14.8 ms
+      rmgr           1275             9.9 ms
+      btree          1632             7.8 ms
+      no index       2336-2371         -        (identical in both arms)
+
+    ... and by client count (tps / p95)
+                      1 client      4 clients     8 clients
+      generic        456 / 2.9     702 / 8.7     761 / 15.0
+      rmgr           515 / 2.7    1165 / 4.1    1313 /  9.5
+      btree          522 / 2.6    1185 / 4.0    1600 /  8.2
+
+**The hot-key ceiling of §5 is broken, and by more than §5 predicted was there
+to break.** §5 measured an UNLOGGED control at 868 tps and concluded that the
+8 KB page copy, not the logging, was the cost. rmgr reaches 1275-1313 tps -
+PAST that unlogged ceiling, at 66-72% of btree where generic is 47% - which says
+the copy was indeed the cost and that removing it also removed what the unlogged
+control still paid (GenericXLog copies and diffs the page whether or not it
+writes the record). At four clients rmgr is level with btree.
+
+    INSERT 10k rows into the 1M-row, 8-index portfolio
+                      after a checkpoint        steady state
+      generic         922 ms / 88.10 MiB        853 ms / 53.53 MiB
+      rmgr            254 ms / 64.53 MiB        142 ms / 29.21 MiB
+      btree           169 ms / 33.31 MiB        104 ms /  6.75 MiB
+
+    WAL per insert record (10,000 single-row inserts, one index, second batch)
+      column   path        generic              rmgr
+      c2       container   121.6 B  1.16 MiB    114 B ITEM_SET  1.62 MiB
+      c20k     INLINE     2918.7 B 27.83 MiB    422.4 B ENTRY    4.03 MiB
+      c1m      INLINE     1682.2 B 16.04 MiB    124.1 B ENTRY    1.18 MiB
+
+    8-index portfolio build      generic 4077 ms / 57.47 MiB
+                                 rmgr    4051 ms / 57.47 MiB
+                                 btree   2653 ms / 59.25 MiB
+    portfolio index size         generic 70,852,608 B = rmgr 70,852,608 B
+
+**Two of those rows say something this section did not expect.**
+
+*The build does not move at all, and cannot.* `wal_mode` has no effect on CREATE
+INDEX: ambuild writes through the bulk-write API (§5 step 4), which logs whole
+pages with `log_newpage`-style records and never touches the shim. 57.47 MiB in
+both arms, to the byte. That is worth saying out loud so nobody expects build WAL
+to move; lion's build already writes less WAL than btree's.
+
+*The container path writes MORE WAL, not less: 1.16 -> 1.62 MiB per 10k inserts,
++40%.* The cause is visible in the record histogram: 9,631 of the 10,000 inserts
+are a 114-byte ITEM_SET, which is the record this section was designed around and
+is 8 bytes cheaper than the generic delta - but 361 of them take the general path
+and emit an ITEM_REPLACE averaging **1658 bytes**, which is the whole rewritten
+container item, where GenericXLog's byte diff of the same operation cost about
+the same 122 bytes as everything else. §25 specified ITEM_REPLACE as "(block,
+offset, newlen, bytes)" and that is exactly what was built; for a 1.6 KB
+container it is the wrong trade. It costs no latency - the record is written
+outside the lock window that matters and the burst numbers above are what they
+are - but it is a real byte regression on dense keys, and the fix is known: an
+item that is being rewritten at the SAME allotted length differs from its
+predecessor in a handful of bytes, so ITEM_REPLACE should either carry a delta or
+be split into a shrink/grow plus an ITEM_SET. It is the first thing to do in this
+area and it is not done here.
+
+*The INLINE path is where the win is*, and it is the win §25 predicted for a
+feature it did not build: 2918.7 -> 422.4 B and 1682.2 -> 124.1 B per insert, 7x
+and 14x, purely from logging the rewritten entry tuple instead of a page diff
+that covers the whole tail of the leaf. INLINE entry slack (the "also" item
+below) would cut it again, to an ITEM_SET.
+
+Not measured, and honestly so: the quick-v3 `mid_insert` at 1M rows and the
+VACUUM micro-benchmark. Both harnesses build their own cluster in ways that have
+no hook for `shared_preload_libraries` (`bench/comprehensive/run.py` writes its
+own postgresql.conf; `bench/vacuum_micro.sh` points at the dev cluster), so
+neither can be run in rmgr mode without changing them. `mid_insert` is dominated
+by the same INLINE entry rewrites that dropped 7x above, so it should fall well
+below its 66 MiB, but that is a prediction and not a measurement.
+
+*(One trap for whoever repeats this: `pg_ctl restart` re-uses the previous
+postmaster's options out of postmaster.opts, so a plain restart after a preloaded
+start stays preloaded and the "generic" arm silently is not one. Pass `-o ""`,
+or stop and start. `test/rmgr-check.sh` had this bug and now stops and starts in
+both directions and prints how many resource managers are registered
+afterwards.)*
 
 Also in this wave (§23 items that need the same lock-window work):
-- INLINE entry slack: an entry's payload gets growth slack like items (§4), using the 2 spare header
-  bytes freed by §24's attno for a `payload_alloc` length or the zero-terminator rule already used
-  for VACUUM-created slack; an INLINE insert then becomes an ITEM_SET record.
-- Early exit in the AND merge (§22 concern 1): seek sources in ascending selectivity and stop probing
-  a container key as soon as the running intersection is empty; measure the page reads and let the
-  §22 cost formula follow (it charges probes; fewer probes, lower cost).
+
+- **INLINE entry slack: NOT DONE in this wave.** An entry's payload was to get
+  growth slack like an item's, so that an INLINE insert became an ITEM_SET
+  record instead of rewriting the whole entry (1.5-2.8 KB of WAL per insert on
+  c20k/c1m per §5). It is still the right thing and it is still shaped the way
+  this section says - the zero-terminator convention VACUUM already uses (§18)
+  is the one to take, because it needs no header field and `lion_inline_fetch()`
+  already stops at the first zero item header, and verify() already bounds the
+  trailing zeroes at LION_ENTRY_SLACK_BOUND. What it needs that the rest of this
+  section did not is a change to the INSERT path's shape rather than to its
+  logging: `lion_insert_inline()` rebuilds the payload in a work buffer and
+  replaces the entry, and an in-place path has to decide, before it touches
+  anything, whether the container the member lands in can take it inside the
+  bytes the entry already has - which is the same "decide before the critical
+  section" discipline the rest of this wave imposed, applied to a function that
+  does not have it yet. The record it would write already exists: ITEM_SET with
+  a SETBYTES operation, which is in the catalogue and is what the INLINE case
+  would use (the payload is unaligned, so CONTAINER_ADD cannot be called on it
+  in place).
+- **Early exit in the AND merge: DONE** (`lion_run_merge()` in lion_count.c).
+  The non-driver sources are ordered by ascending members - the same `ntids` §22
+  picks the driver from - and the merge seeks and folds them in that order,
+  abandoning a container key the moment the running intersection is empty or a
+  seek lands past the target. The sources that were not sought are not stepped
+  and keep their pins.
+  **§9 is untouched, and here is why**: an abandoned container key contributes
+  nothing to the answer, so no visibility-map question is asked about it, so
+  there is no obligation to discharge for any page it touched; a pin too many
+  never makes a count wrong, it only makes VACUUM wait. The pages of sources
+  that WERE sought are released by `lion_ecursor_seek()`, the same window at the
+  same kind of key as before.
+  A `Probes Avoided` counter is in `LionCountStats` and in EXPLAIN ANALYZE, and
+  `test/sql/pushdown.sql` pins three shapes: one where the two selective sets
+  are provably disjoint (200 divides 20000) and the third source is never
+  sought, and one where one set provably contains the other (20 divides 200) and
+  nothing may be skipped, before and after the heap is dirtied.
+  Measured at 1M rows: `c20k = 77 AND c200 = 17 AND c2 = 1` goes from **112 to
+  11 buffer accesses** and 104 to 70 containers, 0.095 to 0.040 ms; a four-source
+  AND goes from 127 to 14 buffers. Two-source ANDs and every GROUP BY are
+  unmoved, because there is no third source to skip - §22's "118 buffers probed
+  for c2" is the two-source shape and was never going to move. The all-dense
+  three-source case reads 4% MORE buffers (262 -> 273) while visiting 80 fewer
+  containers, which is `LION_POSTING_SEEK_STEPS = 2` biting: a source left
+  standing falls further behind and its next seek pays a descent where it used
+  to step one leaf right. It is a wash in wall time and the threshold was not
+  tuned for it.
+  **The §22 cost formula was deliberately NOT changed**, and the measurement is
+  the reason. The candidate - multiply `probes` by an expected survival fraction
+  per level - predicts the new behaviour accurately when the columns are
+  independent and is 10x optimistic when they are not, and the planner cannot
+  tell the two apart from the inputs `lion_cost_count_rel()` has. The decisive
+  pair, one table, two queries with IDENTICAL marginal statistics and the same
+  estimate of 245.25: `k1 = 17 AND k2 = 17 AND d = 1` where k1 and k2 are the
+  same column avoids **0** probes and reads 236 buffers, while `k1 = 17 AND
+  k2 = 18` avoids **223** and reads 13. A survival fraction built from the
+  marginals charges ~24 probes for both; for the disjoint query that is right
+  and for the correlated one it is ten times light. So `pages = Min(walk,
+  probes x (height + 1))` stays as it is: after this section it is an UPPER
+  BOUND the executor can only beat, and it is still exact for the second source,
+  which is probed at every driver key. If a discount is ever wanted, the
+  defensible form is to take the survival fraction from
+  `clauselist_selectivity()` over the conjunction of the already-folded clauses
+  rather than from a product of marginals - that is the one number in the
+  planner that consults extended statistics, so a user who declares the
+  correlation gets the full charge and one who does not gets the independence
+  assumption the rest of the planner already runs on. Keep the `Min(walk, ...)`
+  cap either way, and re-check every pin in `test/sql/pushdown.sql` (§10's
+  20000-group refusal and §20's 200x20 refusal are the ones to watch), because
+  it moves every AND estimate.

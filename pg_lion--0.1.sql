@@ -385,6 +385,18 @@ LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 COMMENT ON FUNCTION lion_index_posting_root(regclass, anyelement) IS
 	'root block of one key''s posting tree, or NULL when it is still inline';
 
+/*
+ * How an index is WAL-logged: "generic" or "rmgr" (DESIGN.md §25).  The mode
+ * is fixed at CREATE INDEX and recorded on the meta page; REINDEX changes it.
+ */
+CREATE FUNCTION lion_index_wal_mode(idx regclass)
+RETURNS text
+AS 'MODULE_PATHNAME', 'lion_index_wal_mode'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION lion_index_wal_mode(regclass) IS
+	'which WAL logger this index was built for: generic or rmgr';
+
 CREATE FUNCTION lion_index_verify(idx regclass,
 									 heapallindexed bool DEFAULT false)
 RETURNS void

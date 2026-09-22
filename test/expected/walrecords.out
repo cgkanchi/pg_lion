@@ -1,0 +1,108 @@
+/*
+ * The WAL records the index writes (DESIGN.md §25).
+ *
+ * The extension logs through one of two resource managers, chosen per index
+ * at CREATE INDEX and recorded on its meta page: PostgreSQL's own generic
+ * one, or pg_lion's, which can only be registered when the library is in
+ * shared_preload_libraries.  This test drives every write path and reads the
+ * WAL back with pg_walinspect to name the records they produced.
+ *
+ * It therefore has TWO expected files, because the whole point is that the
+ * output differs: walrecords.out is the generic-mode run (`make
+ * installcheck`) and walrecords_1.out is the rmgr-mode one (`make
+ * installcheck-rmgr`).  pg_regress accepts either.
+ *
+ * pg_waldump cannot name these records - it does not load the module, so it
+ * prints the resource manager as "custom128" and the record type as UNKNOWN -
+ * which is why this uses pg_walinspect, which runs in the backend, where
+ * rm_identify() and rm_desc() are ours.
+ */
+\set ECHO none
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pg_walinspect;
+/* VACUUM can only set all-visible for commits that reached disk. */
+SET synchronous_commit = on;
+CREATE TABLE lion_wr (id int, k int);
+CREATE INDEX lion_wr_k ON lion_wr USING lion (k);
+-- Which logger this index got, and whether this server has the resource
+-- manager at all.  Everything below reads one way or the other from here.
+SELECT lion_index_wal_mode('lion_wr_k') AS wal_mode;
+ wal_mode 
+----------
+ generic
+(1 row)
+
+SELECT count(*) = 1 AS rmgr_registered
+  FROM pg_get_wal_resource_managers() WHERE rm_name = 'pg_lion';
+ rmgr_registered 
+-----------------
+ f
+(1 row)
+
+SELECT pg_current_wal_lsn() AS lsn0 \gset
+-- A new key: the entry goes onto a directory leaf.
+INSERT INTO lion_wr VALUES (1, 1);
+-- Many rows under two keys: the payload spills onto container pages, the
+-- containers grow in place (the hot-key insert record), and the pages they
+-- live on split.
+INSERT INTO lion_wr SELECT i, i % 2 FROM generate_series(2, 20000) i;
+-- One more row under a key that is already there: nothing but the in-place
+-- member insert and the entry counter that travels with it.
+INSERT INTO lion_wr VALUES (20001, 1);
+-- Many distinct keys: the directory has to split, which is the record with
+-- the most buffers in it (left, right, old right sibling, meta page).
+INSERT INTO lion_wr SELECT i, i FROM generate_series(100000, 130000) i;
+-- Removal: VACUUM rewrites containers under a cleanup lock, deletes the
+-- entries it empties and hands the pages they owned back to the free space
+-- map.
+DELETE FROM lion_wr WHERE k >= 100000;
+VACUUM lion_wr;
+-- ... and a key whose posting set owns whole container pages, so that
+-- deleting it frees them: the entry goes, then its pages are marked deleted
+-- and recorded in the map.
+DELETE FROM lion_wr WHERE k < 2;
+VACUUM lion_wr;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched;
+ wal_switched 
+--------------
+ t
+(1 row)
+
+SELECT pg_current_wal_lsn() AS lsn1 \gset
+/*
+ * The record types those statements produced.  Only the NAMES are pinned:
+ * how many of each there are depends on page fill and on where the last
+ * checkpoint fell.
+ */
+SELECT record_type
+  FROM pg_get_wal_records_info(:'lsn0', :'lsn1')
+ WHERE resource_manager IN ('pg_lion', 'Generic')
+ GROUP BY record_type
+ ORDER BY record_type;
+ record_type 
+-------------
+ Generic
+(1 row)
+
+/*
+ * rm_desc(): pg_walinspect prints whatever the resource manager says about a
+ * record.  Only the SHAPE is pinned - every record has a description, and an
+ * rmgr-mode one names the blocks it touched - because the offsets in it
+ * depend on page fill.
+ */
+SELECT bool_and(description IS NOT NULL AND description <> '') AS all_described
+  FROM pg_get_wal_records_info(:'lsn0', :'lsn1')
+ WHERE resource_manager = 'pg_lion';
+ all_described 
+---------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_wr_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_wr;
+DROP EXTENSION pg_walinspect;

@@ -59,7 +59,16 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"buckets", RELOPT_TYPE_INT, offsetof(LionOptions, buckets)},
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
 	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)},
-	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)}
+	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)},
+	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)}
+};
+
+/* DESIGN.md §25: which WAL logger a new index is built for. */
+static relopt_enum_elt_def lion_wal_mode_options[] = {
+	{"auto", LION_WALOPT_AUTO},
+	{"generic", LION_WALOPT_GENERIC},
+	{"rmgr", LION_WALOPT_RMGR},
+	{(const char *) NULL}
 };
 
 /*
@@ -100,6 +109,28 @@ _PG_init(void)
 					  "Distinct keys above which the index warns once per backend (0 disables)",
 					  LION_DEFAULT_MAX_ENTRIES, 0, INT_MAX,
 					  ShareUpdateExclusiveLock);
+
+	/*
+	 * DESIGN.md §25.  The default is "auto" rather than "rmgr" so that one
+	 * CREATE INDEX script works on a cluster that preloads this library and
+	 * on one that does not; asking for "rmgr" by name on a server without the
+	 * resource manager is an ERROR with the preload hint.  The mode is read
+	 * once, at build time, and recorded on the meta page - so it is REINDEX
+	 * that moves an index from one mode to the other.
+	 */
+	add_enum_reloption(lion_relopt_kind, "wal_mode",
+					   "Which WAL logger this index is built for",
+					   lion_wal_mode_options, LION_WALOPT_AUTO,
+					   "Valid values are \"auto\", \"generic\" and \"rmgr\".",
+					   AccessExclusiveLock);
+
+	/*
+	 * The resource manager itself, which only registers while
+	 * shared_preload_libraries is being processed (DESIGN.md §25).  The GUC
+	 * it takes its id from is defined either way, so that
+	 * pg_lion.rmgr_id is visible in SHOW on every server.
+	 */
+	lion_wal_init();
 
 	DefineCustomBoolVariable("pg_lion.enable_count_pushdown",
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
@@ -217,6 +248,13 @@ lionoptions(Datum reloptions, bool validate)
 	 * it to anything says so.  validate is true only when the option is being
 	 * set, not when the relcache reads it back.
 	 */
+	if (validate && opts != NULL && opts->wal_mode == LION_WALOPT_RMGR &&
+		!lion_rmgr_registered())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("wal_mode = rmgr needs the pg_lion WAL resource manager, which this server has not registered"),
+				 errhint("Add \"pg_lion\" to shared_preload_libraries and restart the server, or leave wal_mode at \"auto\".")));
+
 	if (validate && opts != NULL && opts->buckets > 0)
 		ereport(NOTICE,
 				(errmsg("buckets is ignored since format 4"),
@@ -957,9 +995,11 @@ lionbuildempty(Relation index)
 {
 	LionOptions *opts = (LionOptions *) index->rd_options;
 	uint32		inline_limit;
+	uint32		wal_mode;
 	Buffer		buf;
 
 	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
+	wal_mode = lion_wal_mode_for_build(index);
 
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
@@ -967,7 +1007,7 @@ lionbuildempty(Relation index)
 	Assert(BufferGetBlockNumber(buf) == LION_METAPAGE_BLKNO);
 	START_CRIT_SECTION();
 	lion_init_metapage(BufferGetPage(buf), inline_limit, LION_FIRST_BLKNO,
-					  0, 1);
+					  0, 1, wal_mode);
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

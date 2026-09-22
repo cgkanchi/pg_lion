@@ -41,7 +41,7 @@
  *
  * 4. A SPLIT IS TWO RECORDS AND AN IDEMPOTENT REPAIR.  The first record splits
  *	  the page and flags it LION_PAGE_INCOMPLETE_SPLIT; the downlink goes into
- *	  the parent next, and a third, tiny record clears the flag.  GenericXLog
+ *	  the parent next, and a third, tiny record clears the flag.  A record
  *	  takes four buffers and a leaf split already needs (left, new right, a
  *	  second new page, the entry leaf), so the flag cannot ride along with the
  *	  parent insertion the way nbtree does it.  A crash anywhere in between
@@ -50,7 +50,8 @@
  *	  before adding one, so doing it twice is harmless.  Readers never notice:
  *	  the right link takes them to the items.
  *
- * Every page modification here goes through GenericXLog, and every buffer is
+ * Every page modification here goes through the WAL shim of DESIGN.md §25,
+ * which writes either a GenericXLog record or one of our own, and every buffer is
  * registered before it is touched.
  *
  *-------------------------------------------------------------------------
@@ -398,12 +399,13 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	Page		cpage;
 	OffsetNumber maxoff;
 	OffsetNumber off;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		pR;
 	Page		pC;
 	Buffer		cbuf;
 	BlockNumber cblk;
 	LionPostingPivot pivot;
+	int			nmoved;
 
 	Assert(LionPageIsContainer(page));
 	Assert(!LionPageIncompleteSplit(page));
@@ -416,41 +418,66 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	memcpy(cpage, page, BLCKSZ);
 	maxoff = PageGetMaxOffsetNumber(cpage);
 
-	xstate = GenericXLogStart(index);
-	pR = GenericXLogRegisterBuffer(xstate, buf, 0);
-	cbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
-							  true, &pC);
+	/* The child is allocated before the record opens (DESIGN.md §25). */
+	cbuf = lion_alloc_page(index, heaprel, true);
 	cblk = BufferGetBlockNumber(cbuf);
+
+	xstate = lion_wal_begin(index);
+
+	/*
+	 * The root block is REBUILT as the level above, so it is registered as a
+	 * page this record initialises: replay zeroes it and rebuilds it from the
+	 * one downlink below, with no full-page image at all.
+	 */
+	pR = lion_wal_register_buffer(xstate, buf, LION_WALBUF_INIT);
+	pC = lion_wal_init_buffer(xstate, cbuf, LION_PAGE_CONTAINER);
 
 	/* The child takes the root's items, at the bytes they were allotted. */
 	LionPageGetOpaque(pC)->level = level;
 	LionPageGetOpaque(pC)->rightlink = InvalidBlockNumber;
 	lion_page_set_owner(pC, hash, head);
+	nmoved = 0;
+	lion_wal_op(xstate, pC, LION_OP_ADDMANY, FirstOffsetNumber, 0, NULL, 0);
 	for (off = FirstOffsetNumber; off <= maxoff; off++)
 	{
 		ItemId		iid = PageGetItemId(cpage, off);
+		uint16		isz;
 
 		if (!ItemIdIsUsed(iid))
 			continue;
-		if (PageAddItemExtended(pC, PageGetItem(cpage, iid),
-								ItemIdGetLength(iid), InvalidOffsetNumber,
-								0) == InvalidOffsetNumber)
+		isz = (uint16) ItemIdGetLength(iid);
+		if (PageAddItemExtended(pC, PageGetItem(cpage, iid), isz,
+								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
 			elog(ERROR, "lion index \"%s\": could not push the root of the posting set at %u down",
 				 RelationGetRelationName(index), head);
+		lion_wal_op_append(xstate, pC, &isz, sizeof(uint16));
+		lion_wal_op_append(xstate, pC, PageGetItem(cpage, iid), isz);
+		nmoved++;
 	}
+	lion_wal_op_count(xstate, pC, (uint16) nmoved);
 	if (level == 0)
 		lion_page_update_minmax(pC);
+	lion_wal_log_special(xstate, pC);
 
 	/* ... and the root block becomes the level above, with one downlink. */
 	lion_init_page(pR, LION_PAGE_CONTAINER);
+	lion_wal_op(xstate, pR, LION_OP_INIT, 0, LION_PAGE_CONTAINER, NULL, 0);
 	LionPageGetOpaque(pR)->level = level + 1;
 	lion_page_set_owner(pR, hash, head);
 	pivot.ckey = 0;				/* minus infinity: it owns everything */
 	pivot.child = cblk;
-	if (PageAddItemExtended(pR, (char *) &pivot, LION_POSTING_PIVOT_SIZE,
-							InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-		elog(ERROR, "lion index \"%s\": could not build the new root of the posting set at %u",
-			 RelationGetRelationName(index), head);
+	{
+		OffsetNumber noff = PageAddItemExtended(pR, (char *) &pivot,
+												LION_POSTING_PIVOT_SIZE,
+												InvalidOffsetNumber, 0);
+
+		if (noff == InvalidOffsetNumber)
+			elog(ERROR, "lion index \"%s\": could not build the new root of the posting set at %u",
+				 RelationGetRelationName(index), head);
+		lion_wal_op(xstate, pR, LION_OP_ADD, noff, 0, &pivot,
+					LION_POSTING_PIVOT_SIZE);
+	}
+	lion_wal_log_special(xstate, pR);
 
 	if (level == 0)
 	{
@@ -462,7 +489,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 				 BufferGetBlockNumber(entrybuf), entryoff);
 	}
 
-	GenericXLogFinish(xstate);
+	lion_wal_finish(xstate, LION_XLOG_SPLIT);
 	UnlockReleaseBuffer(cbuf);
 	pfree(copy);
 
@@ -484,6 +511,45 @@ lion_posting_root_pushdown(Relation index, Relation heaprel, Buffer buf,
 /* ---------------------------------------------------------------------
  * Placing a downlink
  * --------------------------------------------------------------------- */
+
+/*
+ * Fill a freshly initialised INTERNAL posting page with hk (its high key, or
+ * NULL when it is rightmost) followed by items[from .. to), logging the lot as
+ * one ADDMANY operation (DESIGN.md §25).
+ */
+static void
+lion_posting_fill(Relation index, LionWalState *xstate, Page page,
+				  const LionPostingPivot *hk, LionPostingPivot *items,
+				  int from, int to)
+{
+	OffsetNumber off = FirstOffsetNumber;
+	uint16		isz = (uint16) LION_POSTING_PIVOT_SIZE;
+	int			i;
+
+	if (hk != NULL)
+	{
+		if (PageAddItemExtended(page, (char *) hk, LION_POSTING_PIVOT_SIZE,
+								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index \"%s\": could not place a posting high key",
+				 RelationGetRelationName(index));
+		lion_wal_op(xstate, page, LION_OP_ADD, FirstOffsetNumber, 0, hk,
+					LION_POSTING_PIVOT_SIZE);
+		off = OffsetNumberNext(off);
+	}
+
+	lion_wal_op(xstate, page, LION_OP_ADDMANY, off, (uint16) (to - from),
+				NULL, 0);
+	for (i = from; i < to; i++)
+	{
+		if (PageAddItemExtended(page, (char *) &items[i],
+								LION_POSTING_PIVOT_SIZE, InvalidOffsetNumber,
+								0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index \"%s\": could not place a posting downlink",
+				 RelationGetRelationName(index));
+		lion_wal_op_append(xstate, page, &isz, sizeof(uint16));
+		lion_wal_op_append(xstate, page, &items[i], LION_POSTING_PIVOT_SIZE);
+	}
+}
 
 /*
  * Split the internal page buf, which has no room for `newitem` at off.
@@ -511,8 +577,7 @@ lion_posting_split_internal(Relation index, Relation heaprel, uint32 hash,
 	LionPostingPivot oldhk;
 	int			nitems = 0;
 	int			k;
-	int			i;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		pP;
 	Page		pR;
 	Buffer		rbuf;
@@ -559,45 +624,37 @@ lion_posting_split_internal(Relation index, Relation heaprel, uint32 hash,
 	hk.ckey = items[k].ckey;
 	hk.child = InvalidBlockNumber;
 
-	xstate = GenericXLogStart(index);
-	pP = GenericXLogRegisterBuffer(xstate, buf, 0);
-	rbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
-							  true, &pR);
+	/* The sibling is allocated before the record opens (DESIGN.md §25). */
+	rbuf = lion_alloc_page(index, heaprel, true);
 	rblk = BufferGetBlockNumber(rbuf);
 
+	xstate = lion_wal_begin(index);
+
+	/*
+	 * Both halves are rebuilt from the pivots copied out above, so both are
+	 * registered as pages this record initialises and neither needs a
+	 * full-page image.
+	 */
+	pP = lion_wal_register_buffer(xstate, buf, LION_WALBUF_INIT);
+	pR = lion_wal_init_buffer(xstate, rbuf, LION_PAGE_CONTAINER);
+
 	lion_init_page(pP, LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT);
+	lion_wal_op(xstate, pP, LION_OP_INIT, 0,
+				LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT, NULL, 0);
 	LionPageGetOpaque(pP)->level = level;
 	LionPageGetOpaque(pP)->rightlink = rblk;
 	lion_page_set_owner(pP, hash, head);
-	if (PageAddItemExtended(pP, (char *) &hk, LION_POSTING_PIVOT_SIZE,
-							InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-		elog(ERROR, "lion index \"%s\": could not place a posting high key",
-			 RelationGetRelationName(index));
-	for (i = 0; i < k; i++)
-	{
-		if (PageAddItemExtended(pP, (char *) &items[i], LION_POSTING_PIVOT_SIZE,
-								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-			elog(ERROR, "lion index \"%s\": could not place a posting downlink",
-				 RelationGetRelationName(index));
-	}
+	lion_posting_fill(index, xstate, pP, &hk, items, 0, k);
+	lion_wal_log_special(xstate, pP);
 
 	LionPageGetOpaque(pR)->level = level;
 	LionPageGetOpaque(pR)->rightlink = oldright;
 	lion_page_set_owner(pR, hash, head);
-	if (!rightmost &&
-		PageAddItemExtended(pR, (char *) &oldhk, LION_POSTING_PIVOT_SIZE,
-							InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-		elog(ERROR, "lion index \"%s\": could not place a posting high key",
-			 RelationGetRelationName(index));
-	for (i = k; i < nitems; i++)
-	{
-		if (PageAddItemExtended(pR, (char *) &items[i], LION_POSTING_PIVOT_SIZE,
-								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-			elog(ERROR, "lion index \"%s\": could not place a posting downlink",
-				 RelationGetRelationName(index));
-	}
+	lion_posting_fill(index, xstate, pR, rightmost ? NULL : &oldhk, items, k,
+					  nitems);
+	lion_wal_log_special(xstate, pR);
 
-	GenericXLogFinish(xstate);
+	lion_wal_finish(xstate, LION_XLOG_SPLIT);
 	UnlockReleaseBuffer(rbuf);
 	pfree(items);
 
@@ -629,17 +686,16 @@ lion_posting_place_pivot(Relation index, Relation heaprel, uint32 hash,
 
 	if (PageGetFreeSpace(page) >= MAXALIGN(LION_POSTING_PIVOT_SIZE))
 	{
-		GenericXLogState *xstate = GenericXLogStart(index);
-		Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+		LionWalState *xstate = lion_wal_begin(index);
+		Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 
 		if (PageAddItemExtended(p, (char *) pivot, LION_POSTING_PIVOT_SIZE,
 								off, 0) == InvalidOffsetNumber)
-		{
-			GenericXLogAbort(xstate);
 			elog(ERROR, "lion index \"%s\": could not add a downlink to block %u",
 				 RelationGetRelationName(index), BufferGetBlockNumber(buf));
-		}
-		GenericXLogFinish(xstate);
+		lion_wal_op(xstate, p, LION_OP_ADD, off, 0, pivot,
+					LION_POSTING_PIVOT_SIZE);
+		lion_wal_finish(xstate, LION_XLOG_DOWNLINK);
 		return;
 	}
 
@@ -740,7 +796,7 @@ lion_posting_finish_split_sep(Relation index, Relation heaprel, uint32 hash,
 	uint32		leftsep;
 	Buffer		parent;
 	OffsetNumber off;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 
 	Assert(LionPageIncompleteSplit(ppage));
@@ -834,10 +890,12 @@ lion_posting_finish_split_sep(Relation index, Relation heaprel, uint32 hash,
 
 	UnlockReleaseBuffer(parent);
 
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, pbuf, 0);
+	xstate = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);
 	LionPageGetOpaque(p)->flags &= ~(uint16) LION_PAGE_INCOMPLETE_SPLIT;
-	GenericXLogFinish(xstate);
+	lion_wal_op(xstate, p, LION_OP_FLAGS, 0, LionPageGetOpaque(p)->flags,
+				NULL, 0);
+	lion_wal_finish(xstate, LION_XLOG_SPLIT_CLEAR);
 }
 
 /*

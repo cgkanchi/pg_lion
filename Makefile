@@ -1,6 +1,6 @@
 # pg_lion — build with: make PG_CONFIG=.local/pg/bin/pg_config
 MODULE_big = pg_lion
-OBJS = src/lion_container.o src/lion_sparse.o src/lion_pages.o src/lion_dir.o src/lion_posting.o src/lion_am.o \
+OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o src/lion_pages.o src/lion_dir.o src/lion_posting.o src/lion_am.o \
        src/lion_build.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o src/lion_funcs.o src/lion_count.o src/lion_customscan.o \
        src/lion_multikey.o
@@ -58,6 +58,37 @@ src/lion_count.o src/lion_customscan.o src/lion_am.o: src/lion_count.h
 RECOVERY_PREFIX ?=
 EXTRA_CLEAN += test/recovery/log
 
+# The whole suite with the custom WAL resource manager registered (DESIGN.md
+# §25).  The resource manager can only be registered from
+# shared_preload_libraries, and a preloaded library is loaded once at
+# postmaster start, so this RESTARTS the dev cluster with the option on the
+# command line, runs installcheck, and restarts it back into generic mode.
+# Nothing is written into postgresql.conf, so an interrupted run leaves no
+# trace.
+#
+#   make installcheck-rmgr
+#   make installcheck-rmgr WAL_CONSISTENCY=1   ... and replay every page and
+#                                                  compare it, which is the
+#                                                  proof that redo reproduces
+#                                                  them
+.PHONY: installcheck-rmgr
+installcheck-rmgr:
+	WAL_CONSISTENCY=$(if $(WAL_CONSISTENCY),$(WAL_CONSISTENCY),0) \
+		PG_CONFIG="$(PG_CONFIG)" ./test/rmgr-check.sh
+
 .PHONY: recovery-check
 recovery-check:
-	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)")
+	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
+		$(if $(RECOVERY_MODE),--mode $(RECOVERY_MODE)) \
+		$(if $(WAL_CONSISTENCY),--conf "wal_consistency_checking = 'pg_lion'")
+
+# The same harness with the custom WAL resource manager registered and every
+# page of every lion record replayed and compared (DESIGN.md §25).  This is
+# the proof that redo reproduces the writer's pages: the standby replays
+# everything phase 1 and phase 2 write, and a mismatch is a FATAL in the
+# startup process.
+.PHONY: recovery-check-rmgr
+recovery-check-rmgr:
+	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
+		--mode rmgr --conf "wal_consistency_checking = 'pg_lion'" \
+		--conf "wal_keep_size = 2GB" --conf "max_wal_size = 2GB"

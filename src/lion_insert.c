@@ -23,7 +23,7 @@
  * The last case has an in-place fast path, which is what makes repeated
  * inserts into one key cheap: when the item on the page can take the member
  * without changing the number of bytes the page has allotted it, the member
- * is added directly in the GenericXLog page image
+ * is added directly in the page
  * (lion_insert_container_inplace(), lion_insert_segment_inplace()) under the
  * same locks and in the same single record as the entry tuple.  Nothing else
  * on the page moves, so the WAL delta is a few bytes.  A BITSET container
@@ -58,7 +58,8 @@
  * they are placed in a single WAL record (lion_chain_put_items_locked): a
  * crash must never leave the same ckey in two items.
  *
- * Every page modification goes through GenericXLog, and the entry tuple is
+ * Every page modification goes through the WAL shim of DESIGN.md §25, and
+ * the entry tuple is
  * always updated in the same record as the items it describes.
  *
  *-------------------------------------------------------------------------
@@ -641,7 +642,7 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
 	Size		alloc = ItemIdGetLength(iid);
 	Size		need;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 	LionContainer *c;
 
@@ -676,8 +677,8 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	if (lion_container_contains(onpage, lo))
 		return true;
 
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, buf, 0);
+	xstate = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 	c = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
 
 	if (!lion_container_add(c, lo))
@@ -687,6 +688,16 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	/* The whole point: the item still ends where it ended. */
 	Assert(lion_container_size(c) <= alloc);
 
+	/*
+	 * This is the hot-key insert record of DESIGN.md §25, and it logs the
+	 * CALL rather than the bytes: adding a member to a sorted ARRAY shifts
+	 * every element above it, so the bytes that change run to the end of the
+	 * item, while "add member lo to the item at offset off" is four.  Replay
+	 * calls the same library function on the same item, which is what makes
+	 * the two pages identical to the byte.
+	 */
+	lion_wal_op(xstate, p, LION_OP_CONTAINER_ADD, off, lo, NULL, 0);
+
 	entry->ntids += 1;
 
 	/* The entry always travels with the container change. */
@@ -694,7 +705,7 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 		elog(ERROR, "lion index: could not update entry %u on block %u",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	GenericXLogFinish(xstate);
+	lion_wal_finish(xstate, LION_XLOG_ITEM_SET);
 
 	return true;
 }
@@ -722,7 +733,7 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	ItemId		iid = PageGetItemId(page, off);
 	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
 	Size		alloc = ItemIdGetLength(iid);
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 	LionContainer *s;
 	bool		dup = false;
@@ -741,8 +752,8 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	if (lion_sparse_contains(onpage, ckey, lo))
 		return true;
 
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, buf, 0);
+	xstate = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 	s = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
 
 	if (!lion_sparse_insert(s, ckey, lo, &dup) || dup)
@@ -751,8 +762,12 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 
 	Assert(lion_sparse_size(s) <= alloc);
 
+	/* The call, not the bytes: a pair shifts both halves of the segment. */
+	lion_wal_op(xstate, p, LION_OP_SPARSE_INS, off, lo, &ckey, sizeof(uint32));
+
 	/* A segment's range can grow in either direction. */
 	lion_page_update_minmax(p);
+	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
 	entry->ntids += 1;
 
@@ -760,7 +775,7 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 		elog(ERROR, "lion index: could not update entry %u on block %u",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	GenericXLogFinish(xstate);
+	lion_wal_finish(xstate, LION_XLOG_ITEM_SET);
 
 	return true;
 }

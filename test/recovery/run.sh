@@ -14,6 +14,18 @@
 #              and "make install" is never run in it.
 #   --iters    crash/recover iterations in phase 1 (default 8).
 #   --keep     leave the clusters and their logs in place on exit.
+#   --mode     generic (the default) or rmgr: rmgr preloads the library so
+#              that the custom WAL resource manager of DESIGN.md §25 is
+#              registered and every index built here is written through it.
+#              Phase 2 then expects the standby to TRUST the visibility map,
+#              which is the property §25 buys.
+#   --conf     an extra postgresql.conf line for the primary (repeatable),
+#              appended last so it wins.  This is how
+#              wal_consistency_checking = 'pg_lion' is turned on:
+#                  --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
+#              which makes the standby (and every crash recovery in phase 1)
+#              compare the page replay produced against the page the primary
+#              had, for every page of every lion record.
 #
 # Exit status is 0 only if every check passed.  A summary is printed at the
 # end; the full log is written to test/recovery/log/run.log, and on failure the
@@ -60,6 +72,8 @@ if [ -z "$PREFIX" ]; then
 fi
 ITERS=8
 KEEP=0
+MODE=generic
+EXTRA_CONF=()
 
 BASE=/tmp/claude-1000/lion_recovery
 SOCKDIR=/tmp/claude-1000/pgsk_rec
@@ -98,10 +112,23 @@ while [ $# -gt 0 ]; do
 		--prefix) PREFIX=${2:-}; shift 2 ;;
 		--iters)  ITERS=${2:-}; shift 2 ;;
 		--keep)   KEEP=1; shift ;;
+		--mode)   MODE=${2:-}; shift 2 ;;
+		--conf)   EXTRA_CONF+=("${2:-}"); shift 2 ;;
 		-h|--help) sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^#\{0,1\} \{0,1\}//'; exit 0 ;;
 		*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
+
+case $MODE in
+	generic) ;;
+	rmgr)
+		# DESIGN.md §25: the custom resource manager can only be registered
+		# from shared_preload_libraries, and an index built on such a server
+		# is written through it.
+		EXTRA_CONF+=("shared_preload_libraries = 'pg_lion'")
+		;;
+	*) die "--mode wants generic or rmgr" ;;
+esac
 
 [ -n "$PREFIX" ] || die "no --prefix given and the worktree install was not found"
 PREFIX=$(cd "$PREFIX" 2>/dev/null && pwd) || die "prefix does not exist"
@@ -244,6 +271,12 @@ write_primary_conf() {
 		log_line_prefix = '%m [%p] '
 		log_checkpoints = on
 	EOF
+
+	# --mode and --conf, last so that they win.
+	local line
+	for line in "${EXTRA_CONF[@]}"; do
+		printf '%s\n' "$line" >>"$PRIMARY_DATA/postgresql.conf"
+	done
 }
 
 write_standby_conf() {
@@ -359,13 +392,29 @@ recovery_evidence() {
 		sed -n 's/.*redo done at \([0-9A-F]*\/[0-9A-F]*\).*/\1/p' | head -1)
 	[ -n "$redo_end" ] ||
 		die "the restart printed no 'redo done at': recovery did not finish normally"
-	generic=$("$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" -r Generic \
+	# The write paths of this AM emit nothing but records of ONE resource
+	# manager, so a range that replayed none of them replayed no index change
+	# at all.  Both names are counted because which one it is depends on
+	# --mode: generic WAL is "Generic", and in rmgr mode pg_waldump prints
+	# "customNNN", since it does not load the module and cannot ask it for a
+	# name (DESIGN.md §25).
+	#
+	# pg_waldump reads the range off DISK, so a range longer than
+	# wal_keep_size is no longer there to be counted; that is a limit of the
+	# EVIDENCE, not of the test, so it is reported and skipped rather than
+	# treated as a failure.  wal_consistency_checking makes every record carry
+	# a full-page image and is what makes a range that long, so
+	# recovery-check-rmgr raises wal_keep_size to match.
+	generic=$("$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" \
 		-s "$redo_start" -e "$redo_end" 2>/dev/null |
-		grep -c 'rmgr: Generic' || true)
-	# The write paths of this AM emit nothing but generic records, so a range
-	# that replayed none of them replayed no index change at all.
-	[ "$generic" -gt 0 ] ||
-		die "the range $redo_start..$redo_end was replayed but holds no generic WAL record: this round tested no index change"
+		grep -cE 'rmgr: (Generic|custom[0-9]+)' || true)
+	if [ "$generic" -eq 0 ]; then
+		if "$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" -s "$redo_start" \
+			-e "$redo_end" >/dev/null 2>&1; then
+			die "the range $redo_start..$redo_end was replayed but holds no index WAL record: this round tested no index change"
+		fi
+		log "note: $redo_start..$redo_end is no longer on disk (wal_keep_size); the replay happened, the count did not"
+	fi
 	echo "$redo_start $generic"
 }
 
@@ -434,8 +483,8 @@ phase1() {
 
 		nrows=$(psql_p -tAc "select count(*) from lion_rec")
 		t1=$(now_ms)
-		log "iter $it: crash=$style vacuum_in_flight=$vacuum_crash redo_from=${ev% *} generic_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS)) $(( (t1 - t0) / 1000 ))s"
-		SUMMARY+=("phase1 iter $it  crash=$style vacuum_in_flight=$vacuum_crash generic_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS))")
+		log "iter $it: crash=$style vacuum_in_flight=$vacuum_crash redo_from=${ev% *} index_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS)) $(( (t1 - t0) / 1000 ))s"
+		SUMMARY+=("phase1 iter $it  crash=$style vacuum_in_flight=$vacuum_crash index_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS))")
 	done
 	[ "$GENERIC_TOTAL" -gt 0 ] ||
 		die "no generic WAL record was ever replayed: the crash phase proved nothing"
@@ -1072,9 +1121,20 @@ phase2() {
 	log "standby: $NCHECKS checks ok (verify, counts, GROUP BY, ntids)"
 	SUMMARY+=("phase2 standby      $NCHECKS checks ok in recovery")
 
-	run_check "standby count_stats" psql_s "select * from lion_rec_check_count_stats(true)"
-	log "standby: all $NCHECKS counts skipped 0 heap blocks and rechecked every TID"
-	SUMMARY+=("phase2 standby      $NCHECKS counts skipped 0 blocks, rechecked every TID")
+	if [ "$MODE" = rmgr ]; then
+		# DESIGN.md §25: replay of an rmgr-mode removal takes the cleanup
+		# lock the §9 interlock needs, so the standby may use the visibility
+		# map again - and this is where that is proved to HAPPEN, not merely
+		# to be allowed.
+		run_check "standby count_stats (rmgr: VM trusted)" psql_s \
+			"select * from lion_rec_check_count_stats(true, true)"
+		log "standby: counts skip heap blocks via the visibility map (rmgr mode)"
+		SUMMARY+=("phase2 standby      counts skip blocks via the VM (rmgr mode, §25)")
+	else
+		run_check "standby count_stats" psql_s "select * from lion_rec_check_count_stats(true)"
+		log "standby: all $NCHECKS counts skipped 0 heap blocks and rechecked every TID"
+		SUMMARY+=("phase2 standby      $NCHECKS counts skipped 0 blocks, rechecked every TID")
+	fi
 
 	psql_s -tAc "select * from lion_rec_probe()" >"$probe_s"
 	if ! diff -u "$probe_p" "$probe_s" >/dev/null 2>&1; then
@@ -1148,7 +1208,7 @@ log ""
 log "=== summary ==="
 for s in "${SUMMARY[@]}"; do log "  $s"; done
 log ""
-log "  generic WAL records replayed across all crashes: $GENERIC_TOTAL"
+log "  index WAL records replayed across all crashes ($MODE mode): $GENERIC_TOTAL"
 log "  verify() warnings (unreferenced/empty pages, harmless by design): $NWARN"
 log "  total time: $(( (END - START) / 1000 ))s"
 log ""

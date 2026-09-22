@@ -5,8 +5,10 @@
  *		bucket pages and entry tuples, container chains and their splits,
  *		page allocation.  See DESIGN.md sections 4 and 5.
  *
- * Every page modification in this file goes through GenericXLog: the buffer
- * is registered before it is touched and GenericXLogFinish() runs before any
+ * Every page modification in this file goes through the WAL shim of
+ * DESIGN.md §25 (lion_wal_begin/register_buffer/op/finish), which writes
+ * either a GenericXLog record or one of the extension's own: the buffer is
+ * registered before it is touched and lion_wal_finish() runs before any
  * lock is dropped.
  *
  *-------------------------------------------------------------------------
@@ -230,8 +232,8 @@ lion_page_recyclable(Page page, Relation heaprel)
  * is protected by the owner check in the page's special area instead
  * (DESIGN.md §18).
  */
-static Buffer
-lion_alloc_buffer(Relation index, Relation heaprel, bool reuse)
+Buffer
+lion_alloc_page(Relation index, Relation heaprel, bool reuse)
 {
 	if (reuse && heaprel != NULL)
 	{
@@ -258,11 +260,33 @@ lion_alloc_buffer(Relation index, Relation heaprel, bool reuse)
 }
 
 /*
+ * Give a page back that a caller took and did not use.
+ *
+ * Nothing was written to it, so there is nothing to log and nothing to undo:
+ * the block is either all-zero (it came from extending the relation) or still
+ * the DELETED page the free space map offered, and both are exactly what
+ * lion_alloc_page() accepts.  Recording it in the map hands it to the next
+ * allocation, so a split that turns out to need one page instead of two costs
+ * a page once and never again.
+ *
+ * DESIGN.md §25: the alternative - deciding inside the record - is not open
+ * any more, because an rmgr-mode record runs in a critical section.
+ */
+void
+lion_release_unused_page(Relation index, Buffer buf)
+{
+	BlockNumber blk = BufferGetBlockNumber(buf);
+
+	UnlockReleaseBuffer(buf);
+	RecordFreeIndexPage(index, blk);
+}
+
+/*
  * Fill in a meta page image.
  */
 void
 lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
-				  uint32 height, uint32 dirpages)
+				  uint32 height, uint32 dirpages, uint32 wal_mode)
 {
 	LionMetaPageData *meta;
 
@@ -279,58 +303,62 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 	meta->root = root;
 	meta->height = height;
 	meta->dirpages = dirpages;
+	meta->wal_mode = wal_mode;
 
 	((PageHeader) page)->pd_lower += sizeof(LionMetaPageData);
 	Assert(((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper);
 }
 
 /*
- * Take a block (recycled or fresh) and register it in the caller's
- * GenericXLog record, which logs the page initialisation as a full image.
- * The buffer comes back pinned and exclusively locked; *pagep (if not NULL)
- * receives the registered page image the caller has to work on.
+ * Bring a page the caller already took into its open record.
  *
- * Allocating the page inside the record that links it into a chain is what
- * keeps a crash from leaving an initialised page that nothing points at.
- *
- * reuse = false forbids taking a recycled block.  A chain's HEAD page is
- * allocated that way and nothing else is: head blocks then come only from
- * extending the relation, which hands out a block number that has never been
- * used before, so a head block is never reused as a head and owner_head is a
- * chain identity that stays unique for the life of the index (DESIGN.md §18).
+ * The buffer must come from lion_alloc_page(), which is the fallible half and
+ * has to happen before the record opens (DESIGN.md §25).  Registering it here
+ * as a page this record INITIALISES is what keeps a crash from leaving an
+ * initialised page that nothing points at: a generic record logs the
+ * initialisation as a full image, an rmgr record as a PAGE_INIT operation and
+ * no image at all.
  */
-Buffer
-lion_new_buffer_xl(Relation index, Relation heaprel, GenericXLogState *xstate,
-				  uint16 flags, bool reuse, Page *pagep)
+Page
+lion_wal_init_buffer(LionWalState *state, Buffer buf, uint16 flags)
 {
-	Buffer		buffer;
 	Page		page;
 
-	buffer = lion_alloc_buffer(index, heaprel, reuse);
-
-	page = GenericXLogRegisterBuffer(xstate, buffer, GENERIC_XLOG_FULL_IMAGE);
+	page = lion_wal_register_buffer(state, buf, LION_WALBUF_INIT);
 	lion_init_page(page, flags);
+	lion_wal_op(state, page, LION_OP_INIT, 0, flags, NULL, 0);
 
-	if (pagep != NULL)
-		*pagep = page;
-
-	return buffer;
+	return page;
 }
 
 /*
- * The same in a record of its own, for a caller that has no record open.  The
- * initialisation is WAL-logged by itself so that a later GenericXLog delta
- * against this page replays correctly.
+ * Log the special area of a page this record registered, as it now stands.
+ */
+void
+lion_wal_log_special(LionWalState *state, Page page)
+{
+	lion_wal_op(state, page, LION_OP_SPECIAL, 0, 0, LionPageGetOpaque(page),
+				sizeof(LionPageOpaqueData));
+}
+
+/*
+ * A fresh page in a record of its own, for a caller that has no record open.
+ *
+ * reuse is implied here; a chain's HEAD page, which must never come from the
+ * free space map (DESIGN.md §18), is allocated with lion_alloc_page(...,
+ * false) by the caller that links it in.
  */
 Buffer
 lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
 {
 	Buffer		buffer;
-	GenericXLogState *xstate;
+	LionWalState *state;
 
-	xstate = GenericXLogStart(index);
-	buffer = lion_new_buffer_xl(index, heaprel, xstate, flags, true, NULL);
-	GenericXLogFinish(xstate);
+	buffer = lion_alloc_page(index, heaprel, true);
+
+	state = lion_wal_begin(index);
+	lion_wal_init_buffer(state, buffer, flags);
+	lion_wal_finish(state, LION_XLOG_PAGE_INIT);
 
 	return buffer;
 }
@@ -1119,25 +1147,34 @@ lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
  * the new version does not fit.
  */
 bool
-lion_replace_entry(Relation index, GenericXLogState *state, Buffer buf,
+lion_replace_entry(Relation index, LionWalState *state, Buffer buf,
 				  OffsetNumber offnum, LionEntryTuple *entry, Size size)
 {
-	GenericXLogState *xstate = state;
+	LionWalState *wal = state;
 	Page		page;
 	bool		ok;
 
-	if (xstate == NULL)
-		xstate = GenericXLogStart(index);
+	if (wal == NULL)
+		wal = lion_wal_begin(index);
 
-	page = GenericXLogRegisterBuffer(xstate, buf, 0);
+	page = lion_wal_register_buffer(wal, buf, LION_WALBUF_STD);
+
+	/*
+	 * PageIndexTupleOverwrite() tests before it writes, so a failure here has
+	 * changed nothing - which is what lets an rmgr-mode record be abandoned
+	 * at this point even though it is inside a critical section (DESIGN.md
+	 * §25).
+	 */
 	ok = PageIndexTupleOverwrite(page, offnum, entry, size);
+	if (ok)
+		lion_wal_op(wal, page, LION_OP_REPLACE, offnum, 0, entry, size);
 
 	if (state == NULL)
 	{
 		if (ok)
-			GenericXLogFinish(xstate);
+			lion_wal_finish(wal, LION_XLOG_ENTRY);
 		else
-			GenericXLogAbort(xstate);
+			lion_wal_abort(wal);
 	}
 
 	return ok;
@@ -1270,7 +1307,7 @@ lion_page_find_container(Page page, uint32 ckey, bool *found)
  * once it is a CHAIN entry, so this cannot fail.
  */
 static void
-lion_put_entry(Relation index, GenericXLogState *xstate, Buffer entrybuf,
+lion_put_entry(Relation index, LionWalState *xstate, Buffer entrybuf,
 			  OffsetNumber entryoff, LionEntryTuple *entry)
 {
 	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry,
@@ -1443,17 +1480,20 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 		lion_item_zero_slack(items[0], sizes[0], writesz);
 
 		{
-			GenericXLogState *xstate = GenericXLogStart(index);
-			Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+			LionWalState *xstate = lion_wal_begin(index);
+			Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 
 			if (PageIndexTupleOverwrite(p, off, items[0], writesz))
 			{
+				lion_wal_op(xstate, p, LION_OP_REPLACE, off, 0, items[0],
+							writesz);
 				lion_page_update_minmax(p);
+				lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 				lion_put_entry(index, xstate, entrybuf, entryoff, entry);
-				GenericXLogFinish(xstate);
+				lion_wal_finish(xstate, LION_XLOG_ITEM_REPLACE);
 				return;
 			}
-			GenericXLogAbort(xstate);
+			lion_wal_abort(xstate);
 		}
 	}
 
@@ -1476,11 +1516,14 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 
 	if (have >= want)
 	{
-		GenericXLogState *xstate = GenericXLogStart(index);
-		Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+		LionWalState *xstate = lion_wal_begin(index);
+		Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 
 		if (replace)
+		{
 			PageIndexTupleDelete(p, off);
+			lion_wal_op(xstate, p, LION_OP_DELETE, off, 0, NULL, 0);
+		}
 
 		for (i = 0; i < nitems; i++)
 		{
@@ -1490,11 +1533,14 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 									0) == InvalidOffsetNumber)
 				elog(ERROR, "lion index: failed to add item to page %u",
 					 BufferGetBlockNumber(buf));
+			lion_wal_op(xstate, p, LION_OP_ADD, off + (OffsetNumber) i, 0,
+						items[i], allocs[i]);
 		}
 
 		lion_page_update_minmax(p);
+		lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
-		GenericXLogFinish(xstate);
+		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 		return;
 	}
 
@@ -1591,23 +1637,33 @@ lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
 	return n;
 }
 
+/*
+ * The most leaves a spill can need.  An INLINE payload is at most
+ * LION_MAX_ENTRY_SIZE bytes and a leaf holds LION_PAGE_CAPACITY, so two is
+ * already unreachable; the limit exists because DESIGN.md §25 requires every
+ * page to be ALLOCATED before the first record opens (an rmgr-mode record runs
+ * in a critical section), and an unbounded number of pinned buffers is not
+ * something to discover at run time.
+ */
+#define LION_SPILL_MAX_LEAVES	4
+
 void
 lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 				OffsetNumber entryoff, LionEntryTuple *entry,
 				const char *payload, Size paylen)
 {
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Buffer		headbuf;
 	Page		headpage;
-	Buffer		curbuf;
-	Page		curpage;
+	Buffer		leafbuf[LION_SPILL_MAX_LEAVES];
+	BlockNumber leafblk[LION_SPILL_MAX_LEAVES];
 	LionContainer *cbuf;
-	LionPostingPivot *pivots = NULL;
+	LionPostingPivot pivots[LION_SPILL_MAX_LEAVES];
 	BlockNumber head;
 	Size		off = 0;
 	Size		csize;
 	int			nleaves;
-	int			npivots = 0;
+	int			cur;
 	bool		multi;
 	int			i;
 
@@ -1615,76 +1671,126 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	nleaves = lion_spill_count_leaves(payload, paylen, cbuf);
 	multi = (nleaves > 1);
 
-	xstate = GenericXLogStart(index);
+	if (nleaves > LION_SPILL_MAX_LEAVES)
+		elog(ERROR, "lion index \"%s\": an inline payload of %zu bytes needs %d container pages",
+			 RelationGetRelationName(index), paylen, nleaves);
 
 	/*
-	 * The ROOT of a posting set is the one page this index never recycles
-	 * (reuse = false), so that root blocks come only from extending the
-	 * relation and no two sets can ever share one.  That is what makes
-	 * owner_head an identity a reader can trust with nothing else in hand -
-	 * which is exactly the situation the count cursor is in (DESIGN.md §18).
+	 * Every page this spill needs is taken HERE, before any record opens
+	 * (DESIGN.md §25).  The ROOT of a posting set is the one page this index
+	 * never recycles, so that root blocks come only from extending the
+	 * relation and no two sets can ever share one - which is what makes
+	 * owner_head an identity a reader can trust with nothing else in hand,
+	 * exactly the situation the count cursor is in (DESIGN.md §18).
 	 */
-	headbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
-								false, &headpage);
+	headbuf = lion_alloc_page(index, heaprel, false);
 	head = BufferGetBlockNumber(headbuf);
-	lion_page_set_owner(headpage, entry->hash, head);
 
-	if (multi)
+	for (i = 0; i < (multi ? nleaves : 0); i++)
+	{
+		leafbuf[i] = lion_alloc_page(index, heaprel, true);
+		leafblk[i] = BufferGetBlockNumber(leafbuf[i]);
+	}
+
+	if (!multi)
 	{
 		/*
-		 * The payload needs more than one leaf, so the head block is the
-		 * INTERNAL root above them and takes its downlinks in the last record
-		 * of this spill.  It is held EXCLUSIVE throughout; nothing can reach
-		 * it in between, because the entry still describes the INLINE payload.
+		 * One leaf, which IS the head: the whole spill is one record holding
+		 * the new page and the entry that starts pointing at it.
 		 */
-		LionPageGetOpaque(headpage)->level = 1;
-		pivots = (LionPostingPivot *)
-			palloc(sizeof(LionPostingPivot) * nleaves);
-		curbuf = lion_new_buffer_xl(index, heaprel, xstate,
-									LION_PAGE_CONTAINER, true, &curpage);
-		lion_page_set_owner(curpage, entry->hash, head);
-	}
-	else
-	{
-		curbuf = headbuf;
-		curpage = headpage;
-	}
+		xstate = lion_wal_begin(index);
+		headpage = lion_wal_init_buffer(xstate, headbuf, LION_PAGE_CONTAINER);
+		lion_page_set_owner(headpage, entry->hash, head);
 
-	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
-	{
-		if (PageGetFreeSpace(curpage) < MAXALIGN(csize))
+		while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
 		{
-			Buffer		nextbuf;
-			Page		nextpage;
+			OffsetNumber noff = PageAddItemExtended(headpage, cbuf, csize,
+													InvalidOffsetNumber, 0);
 
-			/*
-			 * Link the next page in from the current one inside the same
-			 * record, then continue the walk in a new record.
-			 */
-			Assert(multi);
-			nextbuf = lion_new_buffer_xl(index, heaprel, xstate,
-										LION_PAGE_CONTAINER, true, &nextpage);
-			lion_page_set_owner(nextpage, entry->hash, head);
-			lion_page_update_minmax(curpage);
-			LionPageGetOpaque(curpage)->rightlink = BufferGetBlockNumber(nextbuf);
-			pivots[npivots].ckey = LionPageGetOpaque(curpage)->minckey;
-			pivots[npivots].child = BufferGetBlockNumber(curbuf);
-			npivots++;
-			GenericXLogFinish(xstate);
-			UnlockReleaseBuffer(curbuf);
+			if (noff == InvalidOffsetNumber)
+				elog(ERROR, "lion index: failed to spill container to page %u",
+					 head);
+			lion_wal_op(xstate, headpage, LION_OP_ADD, noff, 0, cbuf, csize);
+		}
+		lion_page_update_minmax(headpage);
+		lion_wal_log_special(xstate, headpage);
 
-			curbuf = nextbuf;
-			xstate = GenericXLogStart(index);
-			curpage = GenericXLogRegisterBuffer(xstate, curbuf, 0);
+		entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
+		entry->head = head;
+		entry->tail = head;
+		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+
+		UnlockReleaseBuffer(headbuf);
+		pfree(cbuf);
+		return;
+	}
+
+	/*
+	 * Several leaves.  Each one is filled and linked to its successor in a
+	 * record of its own - the block numbers are all known, because the pages
+	 * were allocated above - and the ROOT that names them goes in with the
+	 * entry, last.  A crash before that last record leaks the leaves, which
+	 * is what §18 already says about a crash in the middle of a whole-chain
+	 * free: they are unreferenced, the entry still describes the INLINE
+	 * payload it always did, and the next VACUUM's sweep collects them.
+	 */
+	cur = 0;
+	xstate = lion_wal_begin(index);
+	{
+		Page		curpage = lion_wal_init_buffer(xstate, leafbuf[0],
+												   LION_PAGE_CONTAINER);
+
+		lion_page_set_owner(curpage, entry->hash, head);
+
+		while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+		{
+			OffsetNumber noff;
+
+			if (PageGetFreeSpace(curpage) < MAXALIGN(csize))
+			{
+				Assert(cur + 1 < nleaves);
+				lion_page_update_minmax(curpage);
+				LionPageGetOpaque(curpage)->rightlink = leafblk[cur + 1];
+				pivots[cur].ckey = LionPageGetOpaque(curpage)->minckey;
+				pivots[cur].child = leafblk[cur];
+				lion_wal_log_special(xstate, curpage);
+				lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+				UnlockReleaseBuffer(leafbuf[cur]);
+
+				cur++;
+				xstate = lion_wal_begin(index);
+				curpage = lion_wal_init_buffer(xstate, leafbuf[cur],
+											   LION_PAGE_CONTAINER);
+				lion_page_set_owner(curpage, entry->hash, head);
+			}
+
+			noff = PageAddItemExtended(curpage, cbuf, csize,
+									   InvalidOffsetNumber, 0);
+			if (noff == InvalidOffsetNumber)
+				elog(ERROR, "lion index: failed to spill container to page %u",
+					 leafblk[cur]);
+			lion_wal_op(xstate, curpage, LION_OP_ADD, noff, 0, cbuf, csize);
 		}
 
-		if (PageAddItemExtended(curpage, cbuf, csize,
-								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-			elog(ERROR, "lion index: failed to spill container to page %u",
-				 BufferGetBlockNumber(curbuf));
+		lion_page_update_minmax(curpage);
+		pivots[cur].ckey = LionPageGetOpaque(curpage)->minckey;
+		pivots[cur].child = leafblk[cur];
+		lion_wal_log_special(xstate, curpage);
+		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+		UnlockReleaseBuffer(leafbuf[cur]);
 	}
 
-	lion_page_update_minmax(curpage);
+	/*
+	 * A leaf the packing did not need after all goes straight back: nothing
+	 * was written to it, so there is nothing to log and nothing to undo.
+	 * lion_spill_count_leaves() agrees with the loop above by construction,
+	 * so this is the belt to its braces - and it is the shape DESIGN.md §25
+	 * requires, since a page cannot be allocated inside the record any more.
+	 */
+	for (i = cur + 1; i < nleaves; i++)
+		lion_release_unused_page(index, leafbuf[i]);
+	nleaves = cur + 1;
 
 	/*
 	 * Only the INLINE/CHAIN half of the flags changes: a reserved entry
@@ -1696,41 +1802,29 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	 */
 	entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
 	entry->head = head;
-	entry->tail = BufferGetBlockNumber(curbuf);
+	entry->tail = leafblk[nleaves - 1];
 
-	if (multi)
+	/* The root's downlinks and the entry, in one last record. */
+	xstate = lion_wal_begin(index);
+	headpage = lion_wal_init_buffer(xstate, headbuf, LION_PAGE_CONTAINER);
+	LionPageGetOpaque(headpage)->level = 1;
+	lion_page_set_owner(headpage, entry->hash, head);
+	pivots[0].ckey = 0;			/* the leftmost downlink is minus infinity */
+	for (i = 0; i < nleaves; i++)
 	{
-		pivots[npivots].ckey = LionPageGetOpaque(curpage)->minckey;
-		pivots[npivots].child = BufferGetBlockNumber(curbuf);
-		npivots++;
-		Assert(npivots == nleaves);
+		OffsetNumber noff = PageAddItemExtended(headpage, (char *) &pivots[i],
+												LION_POSTING_PIVOT_SIZE,
+												InvalidOffsetNumber, 0);
 
-		GenericXLogFinish(xstate);
-		UnlockReleaseBuffer(curbuf);
-
-		/* The root's downlinks and the entry, in one last record. */
-		xstate = GenericXLogStart(index);
-		headpage = GenericXLogRegisterBuffer(xstate, headbuf, 0);
-		pivots[0].ckey = 0;		/* the leftmost downlink is minus infinity */
-		for (i = 0; i < npivots; i++)
-		{
-			if (PageAddItemExtended(headpage, (char *) &pivots[i],
-									LION_POSTING_PIVOT_SIZE,
-									InvalidOffsetNumber,
-									0) == InvalidOffsetNumber)
-				elog(ERROR, "lion index: failed to build the root of a spilled posting set");
-		}
-		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
-		GenericXLogFinish(xstate);
-		UnlockReleaseBuffer(headbuf);
-		pfree(pivots);
+		if (noff == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to build the root of a spilled posting set");
+		lion_wal_op(xstate, headpage, LION_OP_ADD, noff, 0, &pivots[i],
+					LION_POSTING_PIVOT_SIZE);
 	}
-	else
-	{
-		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
-		GenericXLogFinish(xstate);
-		UnlockReleaseBuffer(headbuf);
-	}
+	lion_wal_log_special(xstate, headpage);
+	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+	UnlockReleaseBuffer(headbuf);
 
 	pfree(cbuf);
 }
@@ -1775,7 +1869,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	Size	   *movelen = NULL;
 	char	  **moveptr = NULL;
 	OffsetNumber *delofs = NULL;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		pP;
 	Page		pN = NULL;
 	Page		pM = NULL;
@@ -1785,6 +1879,8 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	BlockNumber nblk = InvalidBlockNumber;
 	BlockNumber mblk = InvalidBlockNumber;
 	uint32		firstmoved = 0;	/* first ckey of the items that move right */
+	PGAlignedBlock *trial = NULL;
+	bool		needm;
 	int			i;
 
 	Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
@@ -1873,61 +1969,105 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 			delofs[i] = delfirst + i;
 	}
 
-	xstate = GenericXLogStart(index);
-	pP = GenericXLogRegisterBuffer(xstate, buf, 0);
-
 	/*
-	 * The new page(s) are allocated inside this record, so that replay either
-	 * sees them linked into the chain or not at all.
+	 * Does P still hold the new items once the moved ones are gone?
+	 *
+	 * The question used to be asked of the page itself, in the middle of the
+	 * record, and the second new page was allocated there if the answer was
+	 * no.  DESIGN.md §25 does not allow that any more - an rmgr-mode record
+	 * runs in a critical section, where extending the relation would turn a
+	 * full disk into a PANIC - so it is asked HERE, of a private copy that
+	 * the deletion is rehearsed on.  A copy rather than arithmetic because
+	 * PageIndexMultiDelete() compacts, and what a compaction recovers is
+	 * exactly what the arithmetic would have to guess at.  A split copies a
+	 * page once; the hot path (an in-place member insert) copies nothing at
+	 * all, which is the whole point of the section.
 	 */
+	trial = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+	memcpy(trial->data, page, BLCKSZ);
+	if (ndel > 0)
+		PageIndexMultiDelete((Page) trial->data, delofs, ndel);
+	needm = PageGetExactFreeSpace((Page) trial->data) < need;
+
+	/* Every page this record needs, taken before the record opens (§25). */
 	if (nmove > 0)
 	{
-		nbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
-								 true, &pN);
+		nbuf = lion_alloc_page(index, heaprel, true);
 		nblk = BufferGetBlockNumber(nbuf);
+	}
+	if (needm)
+	{
+		mbuf = lion_alloc_page(index, heaprel, true);
+		mblk = BufferGetBlockNumber(mbuf);
+	}
+
+	xstate = lion_wal_begin(index);
+	pP = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+
+	if (BufferIsValid(nbuf))
+	{
+		pN = lion_wal_init_buffer(xstate, nbuf, LION_PAGE_CONTAINER);
 		lion_page_set_owner(pN, entry->hash, entry->head);
+	}
+	if (BufferIsValid(mbuf))
+	{
+		pM = lion_wal_init_buffer(xstate, mbuf, LION_PAGE_CONTAINER);
+		lion_page_set_owner(pM, entry->hash, entry->head);
 	}
 
 	if (ndel > 0)
-		PageIndexMultiDelete(pP, delofs, ndel);
-	lion_page_update_minmax(pP);
-
-	if (PageGetExactFreeSpace(pP) >= need)
 	{
+		PageIndexMultiDelete(pP, delofs, ndel);
+		lion_wal_op(xstate, pP, LION_OP_MULTIDEL, 0, (uint16) ndel, delofs,
+					sizeof(OffsetNumber) * ndel);
+	}
+
+	if (!needm)
+	{
+		Assert(PageGetExactFreeSpace(pP) >= need);
 		for (i = 0; i < nitems; i++)
 		{
-			if (PageAddItemExtended(pP, items[i], sizes[i],
-									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+			OffsetNumber noff = PageAddItemExtended(pP, items[i], sizes[i],
+													InvalidOffsetNumber, 0);
+
+			if (noff == InvalidOffsetNumber)
 				elog(ERROR, "lion index: failed to place item after split");
+			lion_wal_op(xstate, pP, LION_OP_ADD, noff, 0, items[i], sizes[i]);
 		}
-		lion_page_update_minmax(pP);
 	}
 	else
 	{
 		/* The items get a page of their own, linked immediately after P. */
-		mbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
-								 true, &pM);
-		mblk = BufferGetBlockNumber(mbuf);
-		lion_page_set_owner(pM, entry->hash, entry->head);
 		for (i = 0; i < nitems; i++)
 		{
-			if (PageAddItemExtended(pM, items[i], sizes[i],
-									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+			OffsetNumber noff = PageAddItemExtended(pM, items[i], sizes[i],
+													InvalidOffsetNumber, 0);
+
+			if (noff == InvalidOffsetNumber)
 				elog(ERROR, "lion index: failed to place item on new page");
+			lion_wal_op(xstate, pM, LION_OP_ADD, noff, 0, items[i], sizes[i]);
 		}
-		lion_page_update_minmax(pM);
 	}
 
 	if (nmove > 0)
 	{
 		for (i = 0; i < nmove; i++)
 		{
-			if (PageAddItemExtended(pN, moveptr[i], movelen[i],
-									InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+			OffsetNumber noff = PageAddItemExtended(pN, moveptr[i], movelen[i],
+													InvalidOffsetNumber, 0);
+
+			if (noff == InvalidOffsetNumber)
 				elog(ERROR, "lion index: failed to move container during split");
+			lion_wal_op(xstate, pN, LION_OP_ADD, noff, 0, moveptr[i],
+						movelen[i]);
 		}
-		lion_page_update_minmax(pN);
 	}
+
+	lion_page_update_minmax(pP);
+	if (pN != NULL)
+		lion_page_update_minmax(pN);
+	if (pM != NULL)
+		lion_page_update_minmax(pM);
 
 	/*
 	 * Relink: P -> [M] -> [N] -> oldright.  Each brand new page is one the
@@ -1956,6 +2096,12 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 			LionPageGetOpaque(pN)->rightlink = oldright;
 	}
 
+	lion_wal_log_special(xstate, pP);
+	if (pN != NULL)
+		lion_wal_log_special(xstate, pN);
+	if (pM != NULL)
+		lion_wal_log_special(xstate, pM);
+
 	/* If P was the tail, the chain has a new last page. */
 	if (entry->tail == blk)
 	{
@@ -1969,7 +2115,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	/* The entry always travels with the container change. */
 	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 
-	GenericXLogFinish(xstate);
+	lion_wal_finish(xstate, LION_XLOG_SPLIT);
 
 	if (BufferIsValid(nbuf))
 		UnlockReleaseBuffer(nbuf);
@@ -1982,6 +2128,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	}
 	if (delofs)
 		pfree(delofs);
+	pfree(trial);
 
 	/*
 	 * Test hook: the split is on disk and the left page says so, but its right

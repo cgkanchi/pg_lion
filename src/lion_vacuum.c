@@ -886,8 +886,9 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	 */
 	if (ninl > 0)
 	{
-		GenericXLogState *xstate = GenericXLogStart(vs->index);
-		Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+		LionWalState *xstate = lion_wal_begin(vs->index);
+		Page		p = lion_wal_register_buffer(xstate, buf,
+												 LION_WALBUF_CLEANUP);
 		int			nwritten = 0;
 
 		for (i = 0; i < ninl; i++)
@@ -896,19 +897,30 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 				continue;
 			if (PageIndexTupleOverwrite(p, inl[i].off, inl[i].tuple,
 										inl[i].writesz))
+			{
+				lion_wal_op(xstate, p, LION_OP_REPLACE, inl[i].off, 0,
+							inl[i].tuple, inl[i].writesz);
 				nwritten++;
+			}
 			else
 				inl[i].spill = true;	/* no room: it has to move to a chain */
 		}
 
 		if (nwritten > 0)
 		{
-			GenericXLogFinish(xstate);
+			lion_wal_finish(xstate, LION_XLOG_VACUUM_PAGE);
 			vs->prof.records++;
 			vs->prof.entries_rewritten += nwritten;
 		}
 		else
-			GenericXLogAbort(xstate);
+		{
+			/*
+			 * Nothing was written: PageIndexTupleOverwrite() tests before it
+			 * writes, so the record can still be abandoned even in rmgr mode,
+			 * where it is inside a critical section (DESIGN.md §25).
+			 */
+			lion_wal_abort(xstate);
+		}
 
 		/*
 		 * A payload that outgrew its entry moves onto container pages, one
@@ -1147,8 +1159,9 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 		Buffer		buf;
 		Page		page;
 		BlockNumber next;
-		GenericXLogState *xstate;
+		LionWalState *xstate;
 		Page		p;
+		FullTransactionId safexid;
 
 		buf = ReadBuffer(vs->index, blk);
 		if (!ConditionalLockBufferForCleanup(buf))
@@ -1176,10 +1189,13 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 
 		next = LionPageGetOpaque(page)->rightlink;
 
-		xstate = GenericXLogStart(vs->index);
-		p = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
-		lion_page_set_deleted(p, ReadNextFullTransactionId());
-		GenericXLogFinish(xstate);
+		safexid = ReadNextFullTransactionId();
+		xstate = lion_wal_begin(vs->index);
+		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
+		lion_page_set_deleted(p, safexid);
+		lion_wal_op(xstate, p, LION_OP_DELETED, 0, 0, &safexid,
+					sizeof(FullTransactionId));
+		lion_wal_finish(xstate, LION_XLOG_PAGE_DELETED);
 		UnlockReleaseBuffer(buf);
 
 		RecordFreeIndexPage(vs->index, blk);
@@ -1316,12 +1332,14 @@ lion_vac_children_deleted(LionVacState *vs, Page page)
 static void
 lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk)
 {
-	GenericXLogState *xstate = GenericXLogStart(vs->index);
-	Page		p = GenericXLogRegisterBuffer(xstate, buf,
-											  GENERIC_XLOG_FULL_IMAGE);
+	FullTransactionId safexid = ReadNextFullTransactionId();
+	LionWalState *xstate = lion_wal_begin(vs->index);
+	Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
 
-	lion_page_set_deleted(p, ReadNextFullTransactionId());
-	GenericXLogFinish(xstate);
+	lion_page_set_deleted(p, safexid);
+	lion_wal_op(xstate, p, LION_OP_DELETED, 0, 0, &safexid,
+				sizeof(FullTransactionId));
+	lion_wal_finish(xstate, LION_XLOG_PAGE_DELETED);
 	UnlockReleaseBuffer(buf);
 
 	RecordFreeIndexPage(vs->index, blk);
@@ -1704,7 +1722,7 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	OffsetNumber entryoff = ref->off;
 	LionEntryTuple *ecopy;
 	Size		esize;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 	uint32	   *grown;
 	int			ngrown = 0;
@@ -1722,8 +1740,17 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
 	grown = (uint32 *) palloc(sizeof(uint32) * (w->nwork + 1));
 
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, buf, 0);
+	/*
+	 * Replay takes a CLEANUP lock on the container page (block 0), because
+	 * this is where the TIDs leave the index and DESIGN.md §11 requires every
+	 * removal to wait for the pins - on a standby exactly as on the primary.
+	 * The entry leaf that follows gets an ordinary exclusive lock: nothing is
+	 * removed from it, only its counters change.  The container page is
+	 * registered FIRST so that the cleanup wait happens with no other buffer
+	 * lock held, which is §11's waiting rule applied to the startup process.
+	 */
+	xstate = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
 
 	/*
 	 * Empty containers go first, because the space they free may be what a
@@ -1735,6 +1762,8 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	if (w->ndel > 0)
 	{
 		PageIndexMultiDelete(p, w->delofs, w->ndel);
+		lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, (uint16) w->ndel,
+					w->delofs, sizeof(OffsetNumber) * w->ndel);
 
 		for (i = 0; i < w->nwork; i++)
 		{
@@ -1760,11 +1789,20 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 		Size		writesz = (w->ndel > 0) ? w->work[i].size : w->work[i].writesz;
 
 		if (PageIndexTupleOverwrite(p, w->work[i].off, w->work[i].c, writesz))
+		{
+			lion_wal_op(xstate, p, LION_OP_REPLACE, w->work[i].off, 0,
+						w->work[i].c, writesz);
 			removed += w->work[i].removed;
+		}
 		else if (w->work[i].c->type == LION_CT_SPARSE)
 		{
-			/* A segment only ever shrinks, so its slot always holds it. */
-			GenericXLogAbort(xstate);
+			/*
+			 * A segment only ever shrinks, so its slot always holds it.  The
+			 * record cannot be abandoned here - items have already been
+			 * deleted and rewritten - so this is a PANIC in rmgr mode, which
+			 * is the honest answer for a page that has changed under a
+			 * cleanup lock.
+			 */
 			elog(ERROR, "lion index: filtered sparse segment %u on block %u no longer fits",
 				 w->work[i].c->ckey, BufferGetBlockNumber(buf));
 		}
@@ -1773,6 +1811,7 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	}
 
 	lion_page_update_minmax(p);
+	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
 	Assert(ecopy->ntids >= removed);
 	ecopy->ntids -= removed;
@@ -1783,7 +1822,7 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 		elog(ERROR, "lion index: could not update entry %u on block %u",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	GenericXLogFinish(xstate);
+	lion_wal_finish(xstate, LION_XLOG_VACUUM_PAGE);
 
 	vs->stats->tuples_removed += (double) removed;
 
@@ -1934,12 +1973,16 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 
 			if (vs->cbuf->cardinality == 0)
 			{
-				GenericXLogState *xstate = GenericXLogStart(index);
-				Page		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+				LionWalState *xstate = lion_wal_begin(index);
+				Page		p = lion_wal_register_buffer(xstate, buf,
+														 LION_WALBUF_CLEANUP);
 				OffsetNumber delof = off;
 
 				PageIndexMultiDelete(p, &delof, 1);
+				lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, 1, &delof,
+							sizeof(OffsetNumber));
 				lion_page_update_minmax(p);
+				lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
 				Assert(ecopy->ncontainers >= 1);
 				ecopy->ncontainers -= 1;
@@ -1949,7 +1992,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 					elog(ERROR, "lion index: could not update entry %u on block %u",
 						 entryoff, BufferGetBlockNumber(entrybuf));
 
-				GenericXLogFinish(xstate);
+				lion_wal_finish(xstate, LION_XLOG_ITEM_DELETE);
 			}
 			else
 			{
@@ -1960,10 +2003,17 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 				/*
 				 * This writes the container and the entry in one record, and
 				 * splits the page if the container still does not fit.
+				 *
+				 * DESIGN.md §25: those records remove TIDs from a page this
+				 * VACUUM holds a cleanup lock on, and replay has to take the
+				 * same lock.  The machinery below is shared with the INSERT
+				 * path and cannot know that, so the window says so.
 				 */
+				lion_wal_removal_begin();
 				lion_chain_put_container_locked(index, vs->heaprel, buf,
 											   entrybuf, entryoff,
 											   ecopy, vs->cbuf, &delta);
+				lion_wal_removal_end();
 				if (delta != 0)
 					elog(ERROR, "lion index: container %u of a chain at %u vanished from it",
 						 ckey, ent->head);

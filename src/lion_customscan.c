@@ -5910,6 +5910,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 							   st->stats.blocks_rechecked, es);
 		ExplainPropertyInteger("Containers Visited", NULL,
 							   st->stats.containers_visited, es);
+		/*
+		 * Probes the AND merge did not make because the container key was
+		 * already ruled out (DESIGN.md §25).  Each one is a seek into another
+		 * source - a descent, or a step or two right - that the merge used to
+		 * make before it knew whether anything survived at that key.
+		 */
+		ExplainPropertyInteger("Probes Avoided", NULL,
+							   st->stats.probes_avoided, es);
 		ExplainPropertyInteger("Heap Blocks From Cache", NULL,
 							   st->stats.cache_hits, es);
 		ExplainPropertyInteger("Heap Blocks Past Cache Budget", NULL,

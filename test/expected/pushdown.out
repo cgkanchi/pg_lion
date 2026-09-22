@@ -2437,6 +2437,102 @@ SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE c20k = 77 AND c200 = 17 AND 
  not pushed down, 1 rows
 (1 row)
 
+-- ---- the early exit in the AND merge (§25) ------------------------------
+/*
+ * The merge probes the other sources in ascending selectivity and abandons a
+ * container key as soon as the running intersection is empty, so a dense
+ * source is not sought at a key the selective ones have already ruled out.
+ * The node is forced here, because the model does not pick it for these
+ * shapes (the open item of DESIGN.md §22), and the counter is reduced to
+ * zero / non-zero for the reason lion_pd_counters() gives: how many container
+ * keys there are depends on how the rows fall on heap pages, but whether any
+ * probe was avoided at all does not.  The answer is taken from the forced
+ * node and compared with the ordinary plan's, so the early exit cannot buy
+ * its pages by dropping a row.
+ */
+CREATE OR REPLACE FUNCTION lion_pd_probes(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	avoided bigint := -1;
+	pushed boolean := false;
+	non bigint;
+	noff bigint;
+BEGIN
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+		IF btrim(split_part(ln, ':', 1)) = 'Probes Avoided' THEN
+			avoided := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	IF NOT pushed THEN
+		RETURN 'NOT PUSHED DOWN';
+	END IF;
+
+	EXECUTE q INTO non;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	EXECUTE q INTO noff;
+	IF non IS DISTINCT FROM noff THEN
+		RETURN format('MISMATCH: node %s, ordinary plan %s', non, noff);
+	END IF;
+
+	RETURN format('Probes Avoided %s, answer %s',
+				  CASE WHEN avoided < 0 THEN 'NOT REPORTED'
+					   WHEN avoided = 0 THEN '= 0' ELSE '> 0' END, non);
+END $$;
+/*
+ * `c20k = 77` and `c200 = 17` select DISJOINT sets here: 20000 is a multiple
+ * of 200, so a row with i % 20000 = 77 has i % 200 = 77 and never 17.  Every
+ * container key the selective `c20k` produces therefore dies on the second
+ * source, and `c2` - half the table, and the one that costs pages to read -
+ * is never sought at any of them.
+ */
+SELECT lion_pd_probes($$SELECT count(*) FROM lion_pd2
+						WHERE c20k = 77 AND c200 = 17 AND c2 = 1$$);
+        lion_pd_probes        
+------------------------------
+ Probes Avoided > 0, answer 0
+(1 row)
+
+/*
+ * The control, where there is nothing to avoid: `c200 = 3` is a SUBSET of
+ * `c20 = 3` (20 divides 200), so the intersection survives at every container
+ * key the driver produces and all three sources are consulted at every one of
+ * them.  A count whose sources really do overlap everywhere must read exactly
+ * what it read before §25.
+ */
+SELECT lion_pd_probes($$SELECT count(*) FROM lion_pd2
+						WHERE c20 = 3 AND c200 = 3 AND c2 = 1$$);
+         lion_pd_probes         
+--------------------------------
+ Probes Avoided = 0, answer 500
+(1 row)
+
+/*
+ * A source that is not sought is one whose pin stays where it stood, which is
+ * a pin too many and never a missing answer (DESIGN.md §9, §25): the same
+ * query against a heap that is NOT all-visible has to go through the heap
+ * recheck and come out with the same number.
+ */
+UPDATE lion_pd2 SET pad = pad WHERE id % 1000 = 0;
+SELECT lion_pd_probes($$SELECT count(*) FROM lion_pd2
+						WHERE c20 = 3 AND c200 = 3 AND c2 = 1$$);
+         lion_pd_probes         
+--------------------------------
+ Probes Avoided = 0, answer 500
+(1 row)
+
+DROP FUNCTION lion_pd_probes(text);
 DROP TABLE lion_pd2;
 DROP TABLE lion_pdq;
 DROP TABLE lion_pdpo;

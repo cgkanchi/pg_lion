@@ -3538,40 +3538,56 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 {
 	LionExprCursor *cursors;
 	LionContainer *work[2];
-	int			driver = -1;
-	double		bestest = 0;
+	double	   *est;			/* members of each positive source */
+	int		   *probeord;		/* the positive sources, least first */
+	int			nprobe = 0;
+	int			driver;
 	int			i;
 
 	cursors = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * nsources);
 
 	/*
-	 * WHICH SOURCE DRIVES (DESIGN.md §22).  The merge is a leapfrog join now:
-	 * one source is walked sequentially and the others are PROBED at the
-	 * container keys it produces.  The driver has to be the most selective
-	 * one, because the work is its container count times the number of
-	 * sources; a dense driver would make every other source probe at every
-	 * container key of the heap, which is the walk this replaces.
+	 * WHICH SOURCE DRIVES, AND IN WHICH ORDER THE OTHERS ARE PROBED
+	 * (DESIGN.md §22, §25).  The merge is a leapfrog join: one source is
+	 * walked sequentially and the others are PROBED at the container keys it
+	 * produces.  The driver has to be the most selective one, because the work
+	 * is its container count times the number of sources; a dense driver would
+	 * make every other source probe at every container key of the heap, which
+	 * is the walk this replaces.
+	 *
+	 * The others are probed in ASCENDING SELECTIVITY, which is what lets the
+	 * loop below stop at the first one that empties the intersection: the
+	 * fewer members a source has, the likelier it is to be the one that kills
+	 * the container key, and everything after it in this order is then never
+	 * sought at all.  Ordering by anything else would still be correct and
+	 * would only read more pages.
 	 *
 	 * The estimate is the sum of the entries' own row counts, which the
 	 * located posting sets carry already (`ntids`), so no page is read to
 	 * decide it.  It is exact for the ordinary one-set source and an upper
 	 * bound for a union; a wrong guess costs performance and never an answer.
+	 * The sort is an insertion sort because a query has a handful of sources
+	 * and this runs once per count; it is STABLE, so probeord[0] is the first
+	 * source with the fewest members - the same one this used to pick with a
+	 * single `est < bestest` pass, and the same one the cost model picks.
 	 */
+	est = (double *) palloc0(sizeof(double) * nsources);
+	probeord = (int *) palloc(sizeof(int) * nsources);
 	for (i = 0; i < nsources; i++)
 	{
-		double		est = 0;
 		int			j;
 
 		if (sources[i].negated)
 			continue;
 		for (j = 0; j < sources[i].nsets; j++)
-			est += (double) sources[i].sets[j].ntids;
-		if (driver < 0 || est < bestest)
-		{
-			driver = i;
-			bestest = est;
-		}
+			est[i] += (double) sources[i].sets[j].ntids;
+
+		for (j = nprobe++; j > 0 && est[probeord[j - 1]] > est[i]; j--)
+			probeord[j] = probeord[j - 1];
+		probeord[j] = i;
 	}
+	Assert(nprobe > 0);
+	driver = probeord[0];
 
 	/*
 	 * Only an intersection needs a place to put one: a single source hands its
@@ -3597,31 +3613,24 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	 */
 	for (;;)
 	{
-		uint32		maxckey = 0;
-		bool		havemax = false;
-		bool		alleq = true;
+		uint32		maxckey;
 		const LionContainer *acc = NULL;
+		bool		abandoned = false;
 		int			w = 0;
+		int			k;
 
 		/* The positive sources drive the merge; all must still have data. */
-		for (i = 0; i < nsources; i++)
+		for (k = 0; k < nprobe; k++)
 		{
-			if (sources[i].negated)
-				continue;
-			if (!cursors[i].valid)
+			if (!cursors[probeord[k]].valid)
 				goto merge_done;
-			if (!havemax || cursors[i].ckey > maxckey)
-			{
-				maxckey = cursors[i].ckey;
-				havemax = true;
-			}
 		}
 
-		for (i = 0; i < nsources; i++)
+		maxckey = cursors[probeord[0]].ckey;
+		for (k = 1; k < nprobe; k++)
 		{
-			cursors[i].advance = false;
-			if (!sources[i].negated && cursors[i].ckey != maxckey)
-				alleq = false;
+			if (cursors[probeord[k]].ckey > maxckey)
+				maxckey = cursors[probeord[k]].ckey;
 		}
 
 		/*
@@ -3631,45 +3640,124 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 		 * keeps its place also keeps its pin, which is a pin too many and
 		 * never a wrong answer (see lion_ecursor_next()).
 		 */
+		for (i = 0; i < nsources; i++)
+			cursors[i].advance = false;
 		cursors[driver].advance = true;
 
-		if (!alleq)
+		/*
+		 * THE INTERSECTION OF THE POSITIVE SOURCES, BUILT AS THEY ARE SOUGHT
+		 * (DESIGN.md §25).  The sources are taken in probe order - the driver,
+		 * which stands at or below the target already, then the others least
+		 * selective-first - and each one is sought to the target and folded
+		 * into the accumulator before the next one is touched at all.  The
+		 * moment the accumulator is empty the container key is ABANDONED: the
+		 * sources after it in the order are not sought, and the pages their
+		 * probes would have read are not read.  Before this the whole round of
+		 * seeks was made first and the intersection looked at afterwards,
+		 * which read a dense source's leaf at every container key the driver
+		 * produced, including the ones where the selective sources had already
+		 * ruled the key out.
+		 *
+		 * THE DESIGN.md §9 PIN DISCIPLINE IS UNCHANGED, and this is the
+		 * argument.  The rule is that the visibility-map question about a
+		 * container's heap blocks is asked before the pin on the page that
+		 * container came from is released.  An abandoned container key asks NO
+		 * such question - nothing of it reaches lion_count_container(), so
+		 * nothing of it reaches the count - so there is no obligation to
+		 * discharge for any of the pages it touched, sought or not.  What the
+		 * sources that were not sought keep is their PINS, exactly where they
+		 * stood: a pin too many never makes a count wrong, it only makes
+		 * VACUUM wait (see lion_ecursor_next()).  The pages the sources that
+		 * WERE sought let go of are let go by lion_ecursor_seek(), which is
+		 * the same window, at the same kind of key, as before §25.
+		 */
+		for (k = 0; k < nprobe; k++)
 		{
-			/*
-			 * A ckey that is missing from some set contributes nothing, so
-			 * the lagging containers carry no visibility-map obligation and
-			 * their pages may be let go straight away.
-			 *
-			 * DESIGN.md §22: they SEEK to the largest key any positive source
-			 * stands at rather than stepping one container at a time.  That is
-			 * the leapfrog join the posting tree exists for, and it needs no
-			 * driver to be nominated: whichever source is most selective is
-			 * the one that keeps producing the largest key, so it advances
-			 * sequentially and the dense ones probe.  A source already at or
-			 * past the target is left alone by lion_ecursor_seek().
-			 */
-			for (i = 0; i < nsources; i++)
-			{
-				if (!sources[i].negated && cursors[i].ckey < maxckey)
-					lion_ecursor_seek(&cursors[i], maxckey);
-			}
-			CHECK_FOR_INTERRUPTS();
-			continue;
-		}
+			int			s = probeord[k];
+			int			m;
 
-		/* The intersection of the positive sources ... */
-		for (i = 0; i < nsources; i++)
-		{
-			if (sources[i].negated)
+			if (cursors[s].ckey < maxckey)
+			{
+				/*
+				 * DESIGN.md §22: a lagging source SEEKS to the largest key any
+				 * positive source stands at rather than stepping one container
+				 * at a time.  That is the leapfrog join the posting tree
+				 * exists for.
+				 */
+				lion_ecursor_seek(&cursors[s], maxckey);
+				if (!cursors[s].valid)
+					goto merge_done;
+			}
+
+			if (cursors[s].ckey > maxckey)
+			{
+				/*
+				 * This source has no container at the target at all, so the
+				 * intersection there is empty and the key is dead - the same
+				 * abandonment as an empty accumulator, one step earlier.  The
+				 * sources after it in the order are left standing; the round
+				 * starts again at the key this one found, which is the next
+				 * one that can possibly survive.
+				 */
+				for (m = k + 1; m < nprobe; m++)
+				{
+					if (cursors[probeord[m]].ckey < maxckey)
+						cx->stats.probes_avoided++;
+				}
+
+				maxckey = cursors[s].ckey;
+				acc = NULL;
+				w = 0;
+				k = -1;
+				CHECK_FOR_INTERRUPTS();
 				continue;
+			}
+
 			if (acc == NULL)
-				acc = cursors[i].cur;
+				acc = cursors[s].cur;
 			else
 			{
-				lion_container_and(acc, cursors[i].cur, work[w]);
+				lion_container_and(acc, cursors[s].cur, work[w]);
 				acc = work[w];
 				w ^= 1;
 			}
+
+			if (lion_container_cardinality(acc) == 0)
+			{
+				/*
+				 * Nothing can come back once the accumulator is empty, so the
+				 * rest of the order is not sought.  What that saves is one
+				 * seek each - a descent, or a step or two right - and it is
+				 * counted for EXPLAIN: a source standing at the target or
+				 * beyond it would not have been sought anyway, so only the
+				 * ones still below it count.
+				 */
+				for (m = k + 1; m < nprobe; m++)
+				{
+					if (cursors[probeord[m]].ckey < maxckey)
+						cx->stats.probes_avoided++;
+				}
+				abandoned = true;
+				break;
+			}
+		}
+
+		if (abandoned)
+		{
+			/*
+			 * Nothing of this container key survives, so no visibility-map
+			 * question is asked about it and the driver's page may go.  Only
+			 * the driver steps: the others are still standing at (or below)
+			 * the key it is leaving and are sought from there on the next
+			 * round.
+			 */
+			for (i = 0; i < nsources; i++)
+			{
+				if (cursors[i].advance)
+					lion_ecursor_next(&cursors[i]);
+			}
+			CHECK_FOR_INTERRUPTS();
+			continue;
 		}
 
 		/* ... minus the negated ones (DESIGN.md §14, `col IS NOT NULL`). */
@@ -3712,6 +3800,8 @@ merge_done:
 		lion_ecursor_close(&cursors[i]);
 
 	pfree(cursors);
+	pfree(est);
+	pfree(probeord);
 	if (work[0] != NULL)
 	{
 		pfree(work[0]);
@@ -3896,6 +3986,34 @@ lion_sum_is_cheaper(Relation heap, const LionCountSource *src)
 }
 
 /*
+ * Is every posting set of every source held in an index whose records replay
+ * under a cleanup lock (DESIGN.md §25)?  That is the condition for trusting
+ * the visibility map in recovery; see the comment at cx.in_recovery below.
+ */
+static bool
+lion_sources_all_rmgr(int nsources, LionCountSource *sources)
+{
+	int			i,
+				j;
+
+	for (i = 0; i < nsources; i++)
+	{
+		for (j = 0; j < sources[i].nsets; j++)
+		{
+			LionPostingSet *ps = &sources[i].sets[j];
+
+			if (!ps->found)
+				continue;		/* an absent key contributes no TID */
+			if (ps->index == NULL ||
+				lion_wal_mode(ps->index) != LION_WAL_MODE_RMGR)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/*
  * Does the whole count come down to ONE posting set?
  *
  * That is not the short-circuit above and needs none of its argument: there is
@@ -4073,15 +4191,45 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 * lets non-serializable counts skip the per-block PredicateLockPage loop. */
 	cx.serializable = IsolationIsSerializable();
 	/*
-	 * On a hot standby the §9 interlock does not exist: WAL replay of our
-	 * generic records takes ordinary exclusive locks, not cleanup locks, so a
-	 * reader's pin does not stop ambulkdelete's records from being replayed,
-	 * and the heap records that follow can set all-visible while this backend
-	 * still holds a copy of the old containers.  Until the AM has its own
-	 * resource manager whose redo takes cleanup locks, a standby rechecks
-	 * every candidate TID in the heap and never trusts the visibility map.
+	 * HOT STANDBY (DESIGN.md §9, §25).
+	 *
+	 * The §9 interlock is "a reader that holds a pin on the page a container
+	 * came from cannot be overtaken by whatever removes that container's dead
+	 * TIDs", and on the primary it holds because ambulkdelete takes a CLEANUP
+	 * lock on every page it removes a TID from (§11), and a cleanup lock waits
+	 * for pins.
+	 *
+	 * Replay of a GENERIC record takes an ordinary exclusive lock, which does
+	 * not wait for pins, so on a standby a reader's pin does not stop
+	 * ambulkdelete's records from being replayed and the heap records that
+	 * follow can set all-visible while this backend still holds a copy of the
+	 * old containers.  A generic-mode index therefore rechecks every candidate
+	 * TID in the heap on a standby and never trusts the visibility map.
+	 *
+	 * Replay of an RMGR-mode record does take the cleanup lock: every record
+	 * that removes a TID or deletes an item (VACUUM_PAGE, ITEM_DELETE,
+	 * PAGE_DELETED, and the ENTRY record VACUUM deletes entries with) declares
+	 * the page it removes them from in its cleanup mask, and lion_redo() takes
+	 * that block with XLogReadBufferForRedoExtended(..., get_cleanup_lock =
+	 * true).  §9's argument then reads on the standby exactly as it reads on
+	 * the primary, with "VACUUM" replaced by "the startup process": while this
+	 * backend holds a pin on the page it took a container from, replay cannot
+	 * have removed a TID from that page, so it cannot have replayed the heap
+	 * record that set any of that container's heap pages all-visible.  The
+	 * page-split hole of §11 closes the same way - a page is only ever linked
+	 * in immediately to the right of the page whose split created it, and
+	 * replay applies those records in the order the primary wrote them - and
+	 * the reader pays for it the way a primary reader does: the standby's
+	 * replay waits, which is a recovery conflict resolved by
+	 * max_standby_streaming_delay rather than a wrong answer.
+	 *
+	 * ONE generic-mode source is enough to lose it, because a container of the
+	 * intersection carries the dead TIDs of every source it came from, and the
+	 * interlock has to hold for all of them.  So the map is trusted only when
+	 * every index this count reads is in rmgr mode.
 	 */
-	cx.in_recovery = RecoveryInProgress();
+	cx.in_recovery = RecoveryInProgress() &&
+		!lion_sources_all_rmgr(nsources, sources);
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
 
@@ -4159,6 +4307,7 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 		stats->tids_rechecked += cx.stats.tids_rechecked;
 		stats->blocks_rechecked += cx.stats.blocks_rechecked;
 		stats->containers_visited += cx.stats.containers_visited;
+		stats->probes_avoided += cx.stats.probes_avoided;
 		stats->cache_hits += cx.stats.cache_hits;
 		stats->cache_full += cx.stats.cache_full;
 		stats->sets_summed += cx.stats.sets_summed;

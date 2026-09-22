@@ -47,8 +47,23 @@ the tested workloads, not a general replacement recommendation.
     ./dev.sh reset                                   # initdb a private cluster in .local/data (needs .local/pg)
     make PG_CONFIG=.local/pg/bin/pg_config && make PG_CONFIG=.local/pg/bin/pg_config install
     eval "$(./dev.sh env)"
-    make PG_CONFIG=.local/pg/bin/pg_config installcheck   # 17 regress files + 6 isolation specs
+    make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
     make unit PG_CONFIG=.local/pg/bin/pg_config           # container and sparse libraries, no server needed
+
+Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
+CREATE INDEX, so the suite has to pass in both:
+
+    make PG_CONFIG=.local/pg/bin/pg_config installcheck           # generic WAL (no preload)
+    make PG_CONFIG=.local/pg/bin/pg_config installcheck-rmgr      # the custom resource manager
+    make PG_CONFIG=.local/pg/bin/pg_config recovery-check       RECOVERY_PREFIX=<prefix>
+    make PG_CONFIG=.local/pg/bin/pg_config recovery-check-rmgr  RECOVERY_PREFIX=<prefix>
+
+`installcheck-rmgr` restarts the dev cluster with `shared_preload_libraries = 'pg_lion'` on
+pg_ctl's command line, runs the same suite, and restarts it back; nothing is written into
+postgresql.conf, so an interrupted run leaves no trace.  `recovery-check-rmgr` is the recovery
+harness with the resource manager registered AND `wal_consistency_checking = 'pg_lion'`, which is
+where "replay reproduces every page" is actually proved - the comparison only happens during
+replay, so turning it on for a primary that never replays proves nothing.
 
 `.local/pg` must be a PostgreSQL master install; for the isolation specs it needs
 `--enable-injection-points` and the `injection_points` test module installed, and
@@ -158,6 +173,26 @@ past that many distinct keys; it never rejects a row.
 moves out of its entry tuple onto container pages of its own.
 `buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
 index key, and it grows by splitting instead of being sized once.
+`wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
+logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
+from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
+1M-row eight-index portfolio from 922 ms / 88 MiB to 254 ms / 65 MiB, and an insert into a key whose
+posting set is still inside its entry tuple from 2919 to 422 bytes of WAL.  One case is worse: a
+dense key whose container has to be rewritten whole costs ~1.6 KB where a generic page diff cost
+~122 B, which is +40% of WAL on that path and is the first thing §25 lists to fix.  `auto` is `rmgr` when the server registered Lion's own resource
+manager and `generic` otherwise, so one CREATE INDEX script works on a cluster that preloads the
+library and on one that does not.  The mode is fixed at build time and recorded on the meta page;
+`SELECT lion_index_wal_mode(idx)` reports it and REINDEX is what changes it.  An rmgr-mode index can
+be READ on any server but can only be WRITTEN where the resource manager is registered, which needs
+
+    shared_preload_libraries = 'pg_lion'      # and a restart
+    # optional: pg_lion.rmgr_id = 128         # the id to register under
+
+`pg_lion.rmgr_id` defaults to 128, `RM_EXPERIMENTAL_ID`, the id the PostgreSQL project reserves for
+development: two extensions that both take it cannot be loaded together, so a production cluster
+should check `pg_get_wal_resource_managers()` and move one of them.  Once an index has been written
+in rmgr mode the library must stay in `shared_preload_libraries` for as long as WAL that mentions it
+may still be replayed - the rule core states for every custom resource manager.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
@@ -180,9 +215,14 @@ values are left to the ordinary plan, a multi-key index can never drive a `GROUP
 sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
 stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
 with an error and have to be rebuilt with REINDEX.
-On a hot standby the count paths recheck every candidate TID in the heap instead of trusting the
-visibility map (generic WAL replay does not take the cleanup locks the pin interlock relies on), so
-they stay correct there but are no longer O(1) per container. The SQL count functions require SELECT
+On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
+of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
+interlock relies on; they stay correct there but are no longer O(1) per container.  An rmgr-mode
+index does not pay that: its removal records replay under a cleanup lock, so the standby uses the
+visibility map again (DESIGN.md §25) - at the price that a standby reader holding a pin makes replay
+wait, which `max_standby_streaming_delay` resolves as a recovery conflict.  A count that reads even
+one generic-mode index falls back to rechecking everything, because the interlock has to hold for
+every source it intersects. The SQL count functions require SELECT
 on the table or on the indexed columns and refuse tables where row-level security applies to the
 caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
 

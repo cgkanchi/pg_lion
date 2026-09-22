@@ -57,6 +57,19 @@ typedef struct LionCountStats
 	int64		containers_visited; /* containers read from the indexes */
 
 	/*
+	 * Seeks the AND merge did NOT make (DESIGN.md §25).  At a container key
+	 * whose running intersection is already empty - or that one source simply
+	 * has no container at - the sources after it in the probe order are left
+	 * standing instead of being sought, and each one of them that was still
+	 * below the key is counted here.  Before the early exit every one of these
+	 * was a probe, and a probe is a descent or a step or two right, so this is
+	 * the index pages the merge did not have to read.  Zero means every source
+	 * had to be consulted at every container key the driver produced, which is
+	 * what a set of dense, uncorrelated sources looks like.
+	 */
+	int64		probes_avoided;
+
+	/*
 	 * The per-query visibility cache (LionVisCache below).  cache_hits counts
 	 * the heap block visits it answered without touching the buffer manager,
 	 * so cache_hits + blocks_rechecked is the number of block visits the

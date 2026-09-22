@@ -1535,7 +1535,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	Assert(BlockNumberIsValid(bs.root));
 	metabuf = smgr_bulk_get_buf(bs.bulk);
 	lion_init_metapage((Page) metabuf->data, bs.inline_limit, bs.root,
-					  bs.height, (uint32) bs.ndirpages);
+					  bs.height, (uint32) bs.ndirpages,
+					  lion_wal_mode_for_build(index));
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);

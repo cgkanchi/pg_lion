@@ -26,7 +26,7 @@
  *	- A split writes ONE generic record for (left, right, old right sibling),
  *	  leaving the left page flagged LION_PAGE_INCOMPLETE_SPLIT, a second one
  *	  for the downlink in the parent, and a third, tiny one that clears the
- *	  flag.  GenericXLog takes at most four buffers, which is why the flag
+ *	  flag.  A record takes at most four buffers, which is why the flag
  *	  cannot be cleared in the same record as the parent insertion the way
  *	  nbtree does it: a parent split already needs four.  A crash anywhere in
  *	  between leaves the flag set, and the next writer that lands on the page
@@ -41,7 +41,8 @@
  *	  buffers), so the meta page never names a root that does not exist and a
  *	  root is never flagged.
  *
- * Every page modification here goes through GenericXLog, and every buffer is
+ * Every page modification here goes through the WAL shim of DESIGN.md §25,
+ * which writes either a GenericXLog record or one of our own, and every buffer is
  * registered before it is touched.
  *
  *-------------------------------------------------------------------------
@@ -769,15 +770,23 @@ lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 void
 lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs, int noffs)
 {
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 
 	Assert(noffs > 0);
 
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, buf, 0);
+	/*
+	 * This is VACUUM deleting emptied entries, so replay takes a CLEANUP lock
+	 * on the leaf (DESIGN.md §25): it deletes items, and a standby reader
+	 * parked between two entries of the page has to be waited for exactly as
+	 * a reader on the primary is.
+	 */
+	xstate = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
 	PageIndexMultiDelete(p, offs, noffs);
-	GenericXLogFinish(xstate);
+	lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, (uint16) noffs, offs,
+				sizeof(OffsetNumber) * noffs);
+	lion_wal_finish(xstate, LION_XLOG_ENTRY);
 }
 
 void
@@ -785,7 +794,7 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 			   OffsetNumber off, bool replace, LionEntryTuple *item, Size size)
 {
 	Page		page = BufferGetPage(buf);
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 
 	/*
@@ -805,27 +814,33 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 
 	if (replace)
 	{
-		xstate = GenericXLogStart(index);
-		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+		xstate = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 		if (PageIndexTupleOverwrite(p, off, (char *) item, size))
 		{
-			GenericXLogFinish(xstate);
+			lion_wal_op(xstate, p, LION_OP_REPLACE, off, 0, item, size);
+			lion_wal_finish(xstate, LION_XLOG_ENTRY);
 			return;
 		}
-		GenericXLogAbort(xstate);
+
+		/*
+		 * Nothing was written - PageIndexTupleOverwrite() tests first - so
+		 * the record can still be abandoned, which DESIGN.md §25 requires of
+		 * every abort now that an rmgr-mode record is inside a critical
+		 * section.
+		 */
+		lion_wal_abort(xstate);
 	}
 	else if (PageGetFreeSpace(page) >= MAXALIGN(size))
 	{
-		xstate = GenericXLogStart(index);
-		p = GenericXLogRegisterBuffer(xstate, buf, 0);
+		xstate = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 		if (PageAddItemExtended(p, (char *) item, size, off, 0) ==
 			InvalidOffsetNumber)
-		{
-			GenericXLogAbort(xstate);
 			elog(ERROR, "lion index \"%s\": could not add an item to block %u",
 				 RelationGetRelationName(index), BufferGetBlockNumber(buf));
-		}
-		GenericXLogFinish(xstate);
+		lion_wal_op(xstate, p, LION_OP_ADD, off, 0, item, size);
+		lion_wal_finish(xstate, LION_XLOG_ENTRY);
 		return;
 	}
 
@@ -925,23 +940,45 @@ lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append,
 
 /* Fill a freshly initialised directory page image with items[from .. to). */
 static void
-lion_dir_fill_page(Relation index, Page page, LionEntryTuple *hk, Size hksz,
+lion_dir_fill_page(Relation index, LionWalState *xstate, Page page,
+				   LionEntryTuple *hk, Size hksz,
 				   LionDirItem *items, int from, int to)
 {
+	OffsetNumber off = FirstOffsetNumber;
 	int			i;
 
-	if (hk != NULL &&
-		PageAddItemExtended(page, (char *) hk, hksz, FirstOffsetNumber, 0) ==
-		InvalidOffsetNumber)
-		elog(ERROR, "lion index \"%s\": could not place a high key",
-			 RelationGetRelationName(index));
+	if (hk != NULL)
+	{
+		if (PageAddItemExtended(page, (char *) hk, hksz, FirstOffsetNumber,
+								0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index \"%s\": could not place a high key",
+				 RelationGetRelationName(index));
+		lion_wal_op(xstate, page, LION_OP_ADD, FirstOffsetNumber, 0, hk, hksz);
+		off = OffsetNumberNext(off);
+	}
+
+	/*
+	 * Both halves of a directory split are rebuilt from scratch, so both are
+	 * logged in full: one operation naming the first offset and the number of
+	 * items, followed by the items themselves.  DESIGN.md §25 preferred
+	 * logging only the moved half - which is what a CONTAINER split does - and
+	 * a directory split cannot, because the only page it could derive the
+	 * other half from is the very page it re-initialises (§25 records the
+	 * deviation).
+	 */
+	lion_wal_op(xstate, page, LION_OP_ADDMANY, off, (uint16) (to - from),
+				NULL, 0);
 
 	for (i = from; i < to; i++)
 	{
+		uint16		isz = (uint16) items[i].size;
+
 		if (PageAddItemExtended(page, (char *) items[i].item, items[i].size,
 								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
 			elog(ERROR, "lion index \"%s\": could not place a directory item",
 				 RelationGetRelationName(index));
+		lion_wal_op_append(xstate, page, &isz, sizeof(uint16));
+		lion_wal_op_append(xstate, page, items[i].item, isz);
 	}
 }
 
@@ -973,11 +1010,15 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	Size		lefthksz;
 	LionEntryTuple *sep;
 	Size		sepsz;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		pP;
 	Page		pR;
 	Buffer		rbuf;
 	Buffer		qbuf = InvalidBuffer;
+	Buffer		metabuf;
+	Buffer		newroot = InvalidBuffer;
+	LionEntryTuple *minf = NULL;
+	Size		minfsz = 0;
 	BlockNumber rblk;
 	bool		append;
 	bool		cutok;
@@ -1059,13 +1100,32 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	sep = lion_make_pivot(items[firstright].item, LION_ENTRY_DOWNLINK,
 						  InvalidBlockNumber, &sepsz);
 
-	xstate = GenericXLogStart(index);
-	pP = GenericXLogRegisterBuffer(xstate, buf, 0);
-	rbuf = lion_new_buffer_xl(index, heaprel, xstate,
-							  isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR,
-							  true, &pR);
+	/*
+	 * The minus-infinity downlink of a new root is built HERE rather than
+	 * where it is placed, because it is a palloc and the record it goes into
+	 * is a critical section (DESIGN.md §25).
+	 */
+	if (isroot)
+		minf = lion_make_pivot(NULL, LION_ENTRY_DOWNLINK, pblk, &minfsz);
+
+	/*
+	 * Everything fallible happens HERE, before the record opens: the sibling
+	 * (and, for a root split, the new root) are taken from the free space map
+	 * or the end of the relation, and the two further buffers the record
+	 * needs are read and locked.  DESIGN.md §25 requires it, because an
+	 * rmgr-mode record is written inside a critical section, where extending
+	 * a relation would turn a full disk into a PANIC.
+	 *
+	 * The order is the one the old code took inside the record - sibling,
+	 * then the old right sibling, then the meta page - so the lock ordering
+	 * of §21 is unchanged.
+	 */
+	rbuf = lion_alloc_page(index, heaprel, true);
 	rblk = BufferGetBlockNumber(rbuf);
 	sep->head = rblk;
+
+	if (isroot)
+		newroot = lion_alloc_page(index, heaprel, true);
 
 	if (BlockNumberIsValid(oldright))
 	{
@@ -1073,25 +1133,47 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		LockBuffer(qbuf, BUFFER_LOCK_EXCLUSIVE);
 	}
 
-	/* Rebuild the left page. */
+	metabuf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+
+	xstate = lion_wal_begin(index);
+
+	/*
+	 * The left page is REBUILT from scratch, so it is registered as a page
+	 * this record initialises: replay zeroes it and fills it from the log,
+	 * and no full-page image is needed for it at all.
+	 */
+	pP = lion_wal_register_buffer(xstate, buf, LION_WALBUF_INIT);
 	lion_init_page(pP, (uint16) ((isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR) |
 								 (isroot ? 0 : LION_PAGE_INCOMPLETE_SPLIT)));
+	lion_wal_op(xstate, pP, LION_OP_INIT, 0, LionPageGetOpaque(pP)->flags,
+				NULL, 0);
+	pR = lion_wal_init_buffer(xstate, rbuf,
+							  isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR);
+
+	/* Rebuild the left page. */
 	LionPageGetOpaque(pP)->level = level;
 	LionPageGetOpaque(pP)->leftlink = leftlink;
 	LionPageGetOpaque(pP)->rightlink = rblk;
-	lion_dir_fill_page(index, pP, lefthk, lefthksz, items, 0, firstright);
+	lion_dir_fill_page(index, xstate, pP, lefthk, lefthksz, items, 0,
+					   firstright);
+	lion_wal_log_special(xstate, pP);
 
 	/* ... and build the right one. */
 	LionPageGetOpaque(pR)->level = level;
 	LionPageGetOpaque(pR)->leftlink = pblk;
 	LionPageGetOpaque(pR)->rightlink = oldright;
-	lion_dir_fill_page(index, pR, oldhk, oldhksz, items, firstright, nitems);
+	lion_dir_fill_page(index, xstate, pR, oldhk, oldhksz, items, firstright,
+					   nitems);
+	lion_wal_log_special(xstate, pR);
 
 	if (BufferIsValid(qbuf))
 	{
-		Page		pQ = GenericXLogRegisterBuffer(xstate, qbuf, 0);
+		Page		pQ = lion_wal_register_buffer(xstate, qbuf,
+												  LION_WALBUF_STD);
 
 		LionPageGetOpaque(pQ)->leftlink = rblk;
+		lion_wal_log_special(xstate, pQ);
 	}
 
 	if (isroot)
@@ -1103,36 +1185,39 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		 * ROOT flag in the same record, which is what makes every other
 		 * backend's cached root block detect the change.
 		 */
-		Buffer		newroot;
 		Page		pN;
-		Buffer		metabuf;
 		Page		pM;
-		LionEntryTuple *minf;
-		Size		minfsz;
 		BlockNumber nblk;
+		OffsetNumber noff;
 
-		newroot = lion_new_buffer_xl(index, heaprel, xstate,
-									 LION_PAGE_DIR | LION_PAGE_ROOT, true, &pN);
+		pN = lion_wal_init_buffer(xstate, newroot,
+								  LION_PAGE_DIR | LION_PAGE_ROOT);
 		nblk = BufferGetBlockNumber(newroot);
 		LionPageGetOpaque(pN)->level = level + 1;
 
-		minf = lion_make_pivot(NULL, LION_ENTRY_DOWNLINK, pblk, &minfsz);
-		if (PageAddItemExtended(pN, (char *) minf, minfsz, InvalidOffsetNumber,
-								0) == InvalidOffsetNumber ||
-			PageAddItemExtended(pN, (char *) sep, sepsz, InvalidOffsetNumber,
-								0) == InvalidOffsetNumber)
+		noff = PageAddItemExtended(pN, (char *) minf, minfsz,
+								   InvalidOffsetNumber, 0);
+		if (noff == InvalidOffsetNumber)
 			elog(ERROR, "lion index \"%s\": could not build a new root",
 				 RelationGetRelationName(index));
-		pfree(minf);
+		lion_wal_op(xstate, pN, LION_OP_ADD, noff, 0, minf, minfsz);
 
-		metabuf = ReadBuffer(index, LION_METAPAGE_BLKNO);
-		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-		pM = GenericXLogRegisterBuffer(xstate, metabuf, 0);
+		noff = PageAddItemExtended(pN, (char *) sep, sepsz,
+								   InvalidOffsetNumber, 0);
+		if (noff == InvalidOffsetNumber)
+			elog(ERROR, "lion index \"%s\": could not build a new root",
+				 RelationGetRelationName(index));
+		lion_wal_op(xstate, pN, LION_OP_ADD, noff, 0, sep, sepsz);
+		lion_wal_log_special(xstate, pN);
+
+		pM = lion_wal_register_buffer(xstate, metabuf, LION_WALBUF_STD);
 		LionPageGetMeta(pM)->root = nblk;
 		LionPageGetMeta(pM)->height = level + 1;
 		LionPageGetMeta(pM)->dirpages += 2;		/* the sibling and the root */
+		lion_wal_op(xstate, pM, LION_OP_META, 0, 0, LionPageGetMeta(pM),
+					sizeof(LionMetaPageData));
 
-		GenericXLogFinish(xstate);
+		lion_wal_finish(xstate, LION_XLOG_SPLIT);
 
 		ix->meta.root = nblk;
 		ix->meta.height = level + 1;
@@ -1140,6 +1225,7 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		UnlockReleaseBuffer(metabuf);
 		UnlockReleaseBuffer(newroot);
 		UnlockReleaseBuffer(rbuf);
+		pfree(minf);
 		pfree(sep);
 		pfree(lefthk);
 		pfree(items);
@@ -1154,13 +1240,13 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	 * fourth and last buffer of this record.
 	 */
 	{
-		Buffer		metabuf = ReadBuffer(index, LION_METAPAGE_BLKNO);
-		Page		pM;
+		Page		pM = lion_wal_register_buffer(xstate, metabuf,
+												  LION_WALBUF_STD);
 
-		LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-		pM = GenericXLogRegisterBuffer(xstate, metabuf, 0);
 		LionPageGetMeta(pM)->dirpages++;
-		GenericXLogFinish(xstate);
+		lion_wal_op(xstate, pM, LION_OP_META, 0, 0, LionPageGetMeta(pM),
+					sizeof(LionMetaPageData));
+		lion_wal_finish(xstate, LION_XLOG_SPLIT);
 		UnlockReleaseBuffer(metabuf);
 	}
 
@@ -1281,7 +1367,7 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 	Size		sepsz;
 	Buffer		parent;
 	OffsetNumber off;
-	GenericXLogState *xstate;
+	LionWalState *xstate;
 	Page		p;
 
 	Assert(LionPageIncompleteSplit(ppage));
@@ -1315,10 +1401,12 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 	UnlockReleaseBuffer(parent);
 	pfree(sep);
 
-	xstate = GenericXLogStart(index);
-	p = GenericXLogRegisterBuffer(xstate, pbuf, 0);
+	xstate = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);
 	LionPageGetOpaque(p)->flags &= ~(uint16) LION_PAGE_INCOMPLETE_SPLIT;
-	GenericXLogFinish(xstate);
+	lion_wal_op(xstate, p, LION_OP_FLAGS, 0, LionPageGetOpaque(p)->flags,
+				NULL, 0);
+	lion_wal_finish(xstate, LION_XLOG_SPLIT_CLEAR);
 }
 
 /*

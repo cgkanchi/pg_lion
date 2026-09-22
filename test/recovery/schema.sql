@@ -547,7 +547,15 @@ END $$;
  * show the opposite - at least one block skipped via the map - or the standby
  * assertion would be vacuously true.
  */
-CREATE FUNCTION lion_rec_check_count_stats(recovery boolean)
+/*
+ * DESIGN.md §9 and §25.  `recovery` says whether this is expected to run on a
+ * standby; `vmtrusted` says whether the count may use the visibility map
+ * there, which is exactly "is every index in rmgr mode" - replay of an
+ * rmgr-mode removal takes the cleanup lock the §9 interlock needs, and replay
+ * of a generic record does not.
+ */
+CREATE FUNCTION lion_rec_check_count_stats(recovery boolean,
+										   vmtrusted boolean DEFAULT false)
 RETURNS TABLE (ok boolean, detail text)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -568,7 +576,7 @@ BEGIN
 					   r.idx, r.val)
 			INTO st;
 		anyskipped := anyskipped + st.blocks_skipped;
-		IF recovery THEN
+		IF recovery AND NOT vmtrusted THEN
 			ok := (st.blocks_skipped = 0 AND st.tids_rechecked = st.count);
 			detail := format('%s %s: count=%s blocks_skipped=%s tids_rechecked=%s%s',
 							 r.idx, r.val, st.count, st.blocks_skipped,
@@ -580,6 +588,20 @@ BEGIN
 			RETURN NEXT;
 		END IF;
 	END LOOP;
+
+	IF recovery AND vmtrusted THEN
+		/*
+		 * An rmgr-mode standby is allowed to skip heap blocks, and the point
+		 * of §25 is that it DOES: the same counts that skipped nothing on a
+		 * generic-mode standby now skip what the primary skips.
+		 */
+		ok := (anyskipped > 0);
+		detail := format('standby skipped %s heap blocks via the visibility map%s',
+						 anyskipped,
+						 CASE WHEN anyskipped > 0 THEN ''
+							  ELSE ' MISMATCH: an rmgr-mode standby should trust the VM (DESIGN.md §25)' END);
+		RETURN NEXT;
+	END IF;
 
 	IF NOT recovery THEN
 		ok := (anyskipped > 0);
