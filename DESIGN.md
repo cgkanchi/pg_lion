@@ -2239,10 +2239,6 @@ directory splits and posting-tree splits under crash (an injection point between
 - **HAVING on the count itself** (`GROUP BY k HAVING count(*) > n`): the node knows each group's
   count before emitting it; accept a HAVING that references only the count aggregates and the group
   columns and filter in the node. Today users must write the filter in an outer query.
-- **Range/zone-map opclass family**: bucket a continuous column into value ranges, one posting set per
-  bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
-  recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
-  ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
 - **FK-side join pushdown**: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK column
   is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
   Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
@@ -2310,3 +2306,7 @@ directory splits and posting-tree splits under crash (an injection point between
     `pg_lion.*` GUC prefix under their GUC validation, EXPLAIN output through their custom nodes,
     parallel-plan interaction (we are parallel-unsafe; their planners must respect it), and the
     supported PostgreSQL major versions (they lag master; this decides which release to target).
+- **Range/zone-map opclass family (last; limited value)**: bucket a continuous column into value ranges, one posting set per
+  bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
+  recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
+  ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
