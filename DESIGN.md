@@ -2255,8 +2255,20 @@ directory splits and posting-tree splits under crash (an injection point between
     per-shard `count`/`GROUP BY` fragment, which is our single-table shape) and must be safe under
     Citus's use of the `create_upper_paths_hook` and `set_rel_pathlist_hook` (chain, never replace);
     shard rebalancing (indexes on moved shards rebuilt correctly); `citus.enable_repartition_joins`;
-    columnar-access-method tables are out of scope (no VM: the count path must decline them via the
-    table AM check already used for the heap-specific recheck).
+    `citus_columnar` tables are a separate item, below.
+  - citus_columnar (a table access method, not a planner layer). Two facts drive it: it has no
+    visibility map and its MVCC is stripe-level, so the heap-skipping count is unavailable as is;
+    and its TIDs are synthetic (stripe row numbers), with offsets far beyond the heap's per-page
+    maximum, so the 9-bit offset encoding of §2 cannot represent them and lion_check_key_offset()
+    errors at build. Two levels of support, in order: (1) correctness — a lion index on a columnar
+    table must either be refused with a clear error or work through the ordinary bitmap path with
+    a TID encoding chosen per table AM (a wider offset field for non-heap AMs; containers cover
+    fewer "pages" then), while the count pushdown declines the table via the table-AM check the
+    heap recheck already uses; (2) value — a count pushdown for columnar needs a visibility source
+    in place of the VM: columnar's stripe metadata records fully visible stripes and stripes with
+    deletions, which is a coarser equivalent; the §9 interlock would have to be re-derived against
+    columnar's own vacuum before any stripe is counted without a row visit. Level (1) is required
+    before release; level (2) decides whether lion is useful on columnar rather than tolerated.
   - TimescaleDB: hypertables (indexes created per chunk through Timescale's DDL hooks; the pushdown's
     partitioned-parent path in §16 sees a hypertable as an inheritance parent with chunks as
     children — confirm the AppendRelInfo mapping and the `rte->inh` handling; Timescale also installs
