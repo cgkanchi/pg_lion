@@ -2227,6 +2227,9 @@ Format: covered by LION_VERSION 4 with §21. verify(): tree shape per key (level
 right-link chain equals the in-order leaf sequence, minckey/maxckey consistent with separators).
 
 Order of work. §21 first (it changes where entries live; the posting tree hangs off the entry and
-is independent of the directory shape), §22 second, one format bump. The recovery harness must cover
+is independent of the directory shape), §22 second, one format bump. Multicolumn indexes
+(`USING lion (a, b, c)`) come after both and mean one directory holding each column's keys as
+independent posting sets (order-insensitive, like GIN); a composite-tuple key is deliberately not
+offered: a query with one fixed shape is btree's job. The recovery harness must cover
 directory splits and posting-tree splits under crash (an injection point between "split page" and
 "insert downlink", crash, restart, verify() shows the incomplete-split repair).
