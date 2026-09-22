@@ -478,8 +478,8 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 	paylen = lion_put_singleton(payload, ckey, lo);
 
 	entry = (reservedflag != 0) ?
-		lion_make_reserved_entry(reservedflag, LION_ENTRY_INLINE, payload,
-								paylen, &size) :
+		lion_make_reserved_entry((AttrNumber) state->attno, reservedflag,
+								LION_ENTRY_INLINE, payload, paylen, &size) :
 		lion_make_entry(state, key, hash, LION_ENTRY_INLINE,
 					   payload, paylen, &size);
 	entry->ncontainers = 1;
@@ -509,8 +509,8 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 			lion_warn_max_entries(index, estimate);
 	}
 
-	lion_dir_add_entry(index, heaprel, state, leafbuf, off, movedright, entry,
-					  size);
+	lion_dir_add_entry(index, heaprel, state->ix, leafbuf, off, movedright,
+					  entry, size);
 
 	pfree(entry);
 }
@@ -554,7 +554,7 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		return;
 	}
 
-	if (newlen <= (Size) state->meta.inline_limit &&
+	if (newlen <= (Size) state->ix->meta.inline_limit &&
 		LionEntryPayloadOffset(entry) + newlen <= (Size) LION_MAX_ENTRY_SIZE)
 	{
 		LionEntryTuple *newentry;
@@ -570,7 +570,7 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		 * hash directory had to do.  Note that `entry` points into the page
 		 * and is not valid after this call.
 		 */
-		lion_dir_place(index, heaprel, state, entrybuf, entryoff, true,
+		lion_dir_place(index, heaprel, state->ix, entrybuf, entryoff, true,
 					  newentry, newsize);
 		pfree(newentry);
 		pfree(newpay);
@@ -1003,7 +1003,7 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 	 * leaf that holds its entry, exactly as they used to serialise on the
 	 * bucket head page (DESIGN.md §5, §21).
 	 */
-	found = lion_dir_find(index, heaprel, state, &sk, BUFFER_LOCK_EXCLUSIVE,
+	found = lion_dir_find(index, heaprel, state->ix, &sk, BUFFER_LOCK_EXCLUSIVE,
 						  true, &leafbuf, &entryoff, &movedright);
 
 	if (!found)
@@ -1041,23 +1041,29 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
  * visibility the heap gives anyway: the inserting transaction has not
  * committed, so no snapshot that can see the row can run before the last of
  * them has been written.
+ *
+ * A MULTICOLUMN index (DESIGN.md §24) is the same thing once more over: the
+ * columns are independent key sets in one relation, so one row is one insert
+ * per column - each under its own column's entry, on its own directory leaf -
+ * and the same visibility argument covers them.  A NULL in one column says
+ * nothing about the others.
  */
 bool
 lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		  Relation heapRel, IndexUniqueCheck checkUnique, bool indexUnchanged,
 		  IndexInfo *indexInfo)
 {
-	LionState   *state;
+	LionIndexState *ix;
 	MemoryContext insertcxt;
 	MemoryContext oldcxt;
-	Datum		key;
 	uint64		code;
 	uint32		ckey;
 	uint16		lo;
+	int			c;
 
 	lion_check_key_offset(ht_ctid);
 
-	state = lion_get_state(index);
+	ix = lion_get_index_state(index);
 
 	insertcxt = AllocSetContextCreate(CurrentMemoryContext,
 									  "lion index insert",
@@ -1068,37 +1074,46 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	ckey = lion_code_ckey(code);
 	lo = lion_code_lo(code);
 
-	/*
-	 * A NULL value belongs to the reserved NULL entry, which lives in bucket 0
-	 * and is found by its flag rather than by its (absent) key (DESIGN.md
-	 * §14).  A multi-key opclass that extracts nothing from a non-NULL value
-	 * puts the row in the reserved EMPTY entry the same way (DESIGN.md §17).
-	 */
-	if (isnull[0])
-		lion_insert_one(index, heapRel, state, (Datum) 0, LION_ENTRY_NULLKEY,
-					   ckey, lo);
-	else if (state->multikey)
+	for (c = 0; c < ix->ncolumns; c++)
 	{
-		Datum	   *keys;
-		int			nkeys = lion_extract_value(state, values[0], &keys);
-		int			i;
+		LionState  *state = &ix->cols[c];
+		Datum		key;
 
-		if (nkeys == 0)
+		/*
+		 * A NULL value belongs to that column's reserved NULL entry, which is
+		 * found by its flag rather than by its (absent) key (DESIGN.md §14).
+		 * A multi-key opclass that extracts nothing from a non-NULL value
+		 * puts the row in the column's reserved EMPTY entry the same way
+		 * (DESIGN.md §17).
+		 */
+		if (isnull[c])
 			lion_insert_one(index, heapRel, state, (Datum) 0,
-						   LION_ENTRY_EMPTYKEY, ckey, lo);
-		for (i = 0; i < nkeys; i++)
+						   LION_ENTRY_NULLKEY, ckey, lo);
+		else if (state->multikey)
 		{
-			lion_insert_one(index, heapRel, state, keys[i], 0, ckey, lo);
-			CHECK_FOR_INTERRUPTS();
-		}
-	}
-	else
-	{
-		key = values[0];
-		if (!state->typbyval && state->typlen == -1)
-			key = PointerGetDatum(PG_DETOAST_DATUM(key));
+			Datum	   *keys;
+			int			nkeys = lion_extract_value(state, values[c], &keys);
+			int			i;
 
-		lion_insert_one(index, heapRel, state, key, 0, ckey, lo);
+			if (nkeys == 0)
+				lion_insert_one(index, heapRel, state, (Datum) 0,
+							   LION_ENTRY_EMPTYKEY, ckey, lo);
+			for (i = 0; i < nkeys; i++)
+			{
+				lion_insert_one(index, heapRel, state, keys[i], 0, ckey, lo);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+		else
+		{
+			key = values[c];
+			if (!state->typbyval && state->typlen == -1)
+				key = PointerGetDatum(PG_DETOAST_DATUM(key));
+
+			lion_insert_one(index, heapRel, state, key, 0, ckey, lo);
+		}
+
+		CHECK_FOR_INTERRUPTS();
 	}
 
 	MemoryContextSwitchTo(oldcxt);

@@ -81,9 +81,9 @@ SELECT lion_ins_check('single rows');
 (1 row)
 
 SELECT * FROM lion_index_stats('lion_ins_k');
- directory_height | leaf_pages | internal_pages | ordered | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | deleted_pages | posting_internal_pages | max_posting_height 
-------------------+------------+----------------+---------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+---------------+------------------------+--------------------
-                0 |          1 |              0 | t       |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |       7884 |               4 |              5 |         0 |          0 |           0 |             0 |                      0 |                  0
+ attno | directory_height | leaf_pages | internal_pages | ordered | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | deleted_pages | posting_internal_pages | max_posting_height 
+-------+------------------+------------+----------------+---------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+---------------+------------------------+--------------------
+     1 |                0 |          1 |              0 | t       |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |       7884 |               4 |              5 |         0 |          0 |           0 |             0 |                      0 |                  0
 (1 row)
 
 -- Phase 2: multi-row VALUES.

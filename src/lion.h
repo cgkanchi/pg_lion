@@ -256,8 +256,17 @@ lion_posting_highkey(Page page)
  * because the two were meant to land together; §21 shipped first, so the bump
  * is separate.  Opening a version 4 index is the same ERROR with the same
  * REINDEX hint.
+ *
+ * Version 6 (DESIGN.md §24) gives every entry tuple the KEY COLUMN it belongs
+ * to, in four bytes the header had been padding out, and makes that column the
+ * leading term of the directory order.  A version 5 index has zeros there, so
+ * every one of its entries would read as column 0 and no descent would find
+ * anything; reading such an index by TREATING attno 0 as 1 was considered and
+ * rejected in §24, because the two formats would then be told apart by a field
+ * that means "column one" in one of them and "no column at all" in the other.
+ * Opening a version 5 index is the same ERROR with the same REINDEX hint.
  */
-#define LION_VERSION			5
+#define LION_VERSION			6
 
 typedef struct LionMetaPageData
 {
@@ -330,11 +339,19 @@ typedef struct LionMetaPageData
 #define LION_NULLKEY_HASH		0
 
 /*
- * THE DIRECTORY ORDER (DESIGN.md §21).
+ * THE DIRECTORY ORDER (DESIGN.md §21, §24).
  *
- * Entries sort by (kind, key, hash, stored bytes).  The kind puts the two
- * reserved entries first - they have no key to compare - and gives the
- * leftmost downlink of an internal page a value below every real one:
+ * Entries sort by (attno, kind, key, hash, stored bytes).  The KEY COLUMN
+ * leads (§24): one relation holds every key column's entries, as independent
+ * runs laid end to end, so a lookup is an (attno, key) descent and an entry
+ * scan bounded to one column is the leaf walk from its first entry to the
+ * first entry of the next column.  The leftmost downlink of an internal page
+ * carries attno 0 and therefore sorts below every real entry whatever its
+ * kind, which is what keeps the MINF rule of §21 intact.
+ *
+ * Within one column the kind puts the two reserved entries first - they have
+ * no key to compare - and gives the leftmost downlink of an internal page a
+ * value below every real one:
  *
  *		MINF < NULL < EMPTY < VALUE
  *
@@ -360,11 +377,26 @@ typedef struct LionEntryTuple
 	BlockNumber head;			/* CHAIN: first container page */
 	BlockNumber tail;			/* CHAIN: last container page */
 	uint32		ncontainers;	/* ITEMS: containers and sparse segments */
+	uint16		attno;			/* 1-based KEY COLUMN (DESIGN.md §24); 0 only
+								 * on a minus-infinity downlink */
+	uint16		unused;			/* the rest of what was alignment padding */
 	uint64		ntids;
 	/* key data (keylen bytes), MAXALIGN padding, then inline items */
 } LionEntryTuple;
 
 #define LION_ENTRY_HDRSZ			(offsetof(LionEntryTuple, ntids) + sizeof(uint64))	/* 32 */
+
+/*
+ * DESIGN.md §24 spends the four bytes the header was padding out before
+ * `ntids`, so the header is the same 32 bytes it has been since format 3 and
+ * no item on any page moves.  Both halves of that are checked here rather
+ * than trusted, because a compiler that laid the struct out differently would
+ * make every existing index unreadable without a word of warning.
+ */
+StaticAssertDecl(offsetof(LionEntryTuple, attno) == 20,
+				 "LionEntryTuple.attno must occupy the old header padding");
+StaticAssertDecl(sizeof(LionEntryTuple) == 32,
+				 "the lion entry header must stay 32 bytes");
 #define LionEntryGetKey(e)		((char *) (e) + LION_ENTRY_HDRSZ)
 #define LionEntryPayloadOffset(e) MAXALIGN(LION_ENTRY_HDRSZ + (e)->keylen)
 #define LionEntryGetPayload(e)	((char *) (e) + LionEntryPayloadOffset(e))
@@ -440,9 +472,33 @@ typedef struct LionOptions
 
 /* ---------- per-relation cached state (rd_amcache) ---------- */
 
+/*
+ * DESIGN.md §24 made the cached state TWO structs, because an index now has
+ * one key column per entry run and each of them has an opclass of its own:
+ *
+ *	LionState		everything about ONE key column - its key type, hash,
+ *					equality, ordering and multi-key extraction.  Every
+ *					function that looks a key up, builds an entry or compares
+ *					two of them takes the state of the column it is working
+ *					on, so the great majority of this extension did not have
+ *					to change at all.
+ *	LionIndexState	what belongs to the relation: the meta page (and with it
+ *					the cached directory root) and the array of columns.
+ *
+ * `ix` is the column's way back to the relation, and `attno` is the column
+ * number every entry tuple of that column carries.  lion_get_state() hands
+ * back column 1, which is what a single-column index has and all a caller
+ * that predates §24 ever means.
+ */
+typedef struct LionIndexState LionIndexState;
+
 typedef struct LionState
 {
-	LionMetaPageData meta;		/* copy of the meta page */
+	LionIndexState *ix;			/* the index this column belongs to; NULL in
+								 * the throw-away states the cost model and
+								 * the planner build for one extractQuery
+								 * call */
+	uint16		attno;			/* 1-based key column number (DESIGN.md §24) */
 
 	/*
 	 * The KEY type: what an entry tuple stores, hashes and compares.  It is
@@ -491,6 +547,21 @@ typedef struct LionState
 	FmgrInfo	extractvalue;	/* support proc 2 */
 	FmgrInfo	extractquery;	/* support proc 3 */
 } LionState;
+
+struct LionIndexState
+{
+	LionMetaPageData meta;		/* copy of the meta page */
+	int			ncolumns;		/* key columns, 1 .. INDEX_MAX_KEYS (§24) */
+	LionState  *cols;			/* [ncolumns]; cols[i] is key column i + 1 */
+};
+
+/* The state of one key column of an index whose state is already in hand. */
+static inline LionState *
+lion_column(LionIndexState *ix, AttrNumber attno)
+{
+	Assert(attno >= 1 && attno <= ix->ncolumns);
+	return &ix->cols[attno - 1];
+}
 
 /* ---------- multi-key extraction (DESIGN.md §17, lion_multikey.c) ---------- */
 
@@ -574,7 +645,23 @@ extern void lion_extract_query(LionState *state, Datum query,
 
 /* ---------- lion_pages.c: primitives shared by build/insert/scan/vacuum ---------- */
 
+/* The whole cached state of an index, built on first use (DESIGN.md §24). */
+extern LionIndexState *lion_get_index_state(Relation index);
+
+/*
+ * The state of one key column.  attno is the INDEX column number, 1-based, as
+ * it appears in a ScanKey's sk_attno and in IndexOptInfo->indexkeys[i] + 1 -
+ * never a heap attribute number.  ERRORs when the index has no such column.
+ */
+extern LionState *lion_index_column_state(Relation index, AttrNumber attno);
+
+/* Column 1, which is all a single-column index has. */
 extern LionState *lion_get_state(Relation index);
+
+/* Key columns of an index, without building its state. */
+#define lion_index_ncolumns(index) \
+	((int) IndexRelationGetNumberOfKeyAttributes(index))
+
 extern void lion_init_page(Page page, uint16 flags);
 
 /*
@@ -626,6 +713,13 @@ extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
 /*
  * What a descent compares stored entries against.
  *
+ *	attno		the KEY COLUMN being searched (DESIGN.md §24), which is the
+ *				leading term of the order
+ *	col			that column's state: what fetches a stored key, and where a
+ *				caller that did not override them took cmpproc/eqproc from.
+ *				It may be the state of ANOTHER index's column only in the
+ *				sense that the caller owns it; nothing here reads the meta
+ *				page through it
  *	kind		LION_KIND_NULL / EMPTY / VALUE
  *	key, hash	the value being looked for, and its hash (the hash must be the
  *				one the index would have stored for it, which for a cross-type
@@ -645,6 +739,8 @@ extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
  */
 typedef struct LionSearchKey
 {
+	uint16		attno;
+	LionState  *col;
 	int			kind;
 	Datum		key;
 	uint32		hash;
@@ -655,28 +751,46 @@ typedef struct LionSearchKey
 	Size		rawlen;
 } LionSearchKey;
 
-/* A search key for a value of the index's own key type. */
+/* A search key for a value of that column's own key type. */
 extern void lion_search_key_init(LionState *state, LionSearchKey *sk,
 								int kind, Datum key, uint32 hash);
-/* ... and one that positions exactly, from a built entry tuple. */
-extern void lion_search_key_exact(LionState *state, LionSearchKey *sk,
+
+/*
+ * ... and one that positions exactly, from a built entry tuple.  The COLUMN
+ * comes from the entry, which is why this takes the index state and not one
+ * column's: a directory page holds entries of every column, and the repair of
+ * an unfinished split builds this from whatever item the page happens to
+ * carry (DESIGN.md §24).
+ */
+extern void lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 								 const LionEntryTuple *entry);
 
-/* Compare a stored entry tuple with a search key.  <0: the item sorts first. */
-extern int	lion_cmp_entry(LionState *state, const LionEntryTuple *item,
-						   const LionSearchKey *sk);
+/*
+ * Compare a stored entry tuple with a search key.  <0: the item sorts first.
+ * Everything the comparison needs is in the search key, the column state it
+ * carries included, so an item of ANOTHER column is answered by the leading
+ * attno term without touching a single opclass function.
+ */
+extern int	lion_cmp_entry(const LionEntryTuple *item, const LionSearchKey *sk);
 /* The same, stopping before the bytewise tail (DESIGN.md §21). */
-extern int	lion_cmp_prefix(LionState *state, const LionEntryTuple *item,
-							const LionSearchKey *sk);
+extern int	lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk);
 /* Compare two stored entry tuples in full; used by verify() and the build. */
-extern int	lion_cmp_entries(LionState *state, const LionEntryTuple *a,
+extern int	lion_cmp_entries(LionIndexState *ix, const LionEntryTuple *a,
 							 const LionEntryTuple *b);
 
 /* The root block of the directory, refreshing the cached copy if need be. */
-extern BlockNumber lion_dir_root(Relation index, LionState *state,
+extern BlockNumber lion_dir_root(Relation index, LionIndexState *ix,
 								uint32 *height);
 /* The leftmost leaf, where an ordered walk of every entry starts. */
-extern BlockNumber lion_dir_leftmost_leaf(Relation index, LionState *state);
+extern BlockNumber lion_dir_leftmost_leaf(Relation index, LionIndexState *ix);
+
+/*
+ * The leaf where key column `col`'s run of entries begins, and the offset of
+ * its first entry on that leaf (DESIGN.md §24).  The run ends at the first
+ * entry of the next column, which a walk recognises by its attno.
+ */
+extern BlockNumber lion_dir_column_first(Relation index, LionState *col,
+										 OffsetNumber *offp);
 
 /* The first data item of a directory page (offset 1, or 2 under a high key). */
 static inline OffsetNumber
@@ -699,7 +813,7 @@ lion_page_entry(Page page, OffsetNumber off)
  * (DESIGN.md §21) and lockmode must be BUFFER_LOCK_EXCLUSIVE.
  */
 extern Buffer lion_dir_search(Relation index, Relation heaprel,
-							 LionState *state, const LionSearchKey *sk,
+							 LionIndexState *ix, const LionSearchKey *sk,
 							 int lockmode, bool forwrite, OffsetNumber *offp);
 
 /*
@@ -709,18 +823,16 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
  * scan had to follow a right link, in which case the caller must ask for the
  * position again with an exact search key.  movedright may be NULL.
  */
-extern bool lion_dir_find(Relation index, Relation heaprel, LionState *state,
+extern bool lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 						 const LionSearchKey *sk, int lockmode, bool forwrite,
 						 Buffer *buf, OffsetNumber *offnum, bool *movedright);
 
 /* The pieces of the above, for a caller that walks the leaves itself. */
 extern LionEntryTuple *lion_dir_highkey(Page page);
 extern Buffer lion_dir_step_right(Relation index, Buffer buf, int lockmode);
-extern OffsetNumber lion_dir_binsrch(LionState *state, Page page,
-									const LionSearchKey *sk);
-extern bool lion_dir_scan_run(Relation index, LionState *state,
-							 const LionSearchKey *sk, int lockmode,
-							 Buffer *bufp, OffsetNumber *offp,
+extern OffsetNumber lion_dir_binsrch(Page page, const LionSearchKey *sk);
+extern bool lion_dir_scan_run(Relation index, const LionSearchKey *sk,
+							 int lockmode, Buffer *bufp, OffsetNumber *offp,
 							 bool *movedright);
 
 /*
@@ -728,7 +840,7 @@ extern bool lion_dir_scan_run(Relation index, LionState *state,
  * held EXCLUSIVE and stays so, but may be replaced by another leaf.
  */
 extern void lion_dir_add_entry(Relation index, Relation heaprel,
-							  LionState *state, Buffer *bufp,
+							  LionIndexState *ix, Buffer *bufp,
 							  OffsetNumber off, bool movedright,
 							  LionEntryTuple *entry, Size size);
 
@@ -738,7 +850,7 @@ extern void lion_dir_add_entry(Relation index, Relation heaprel,
  * it does not fit.  buf stays locked and pinned; after a split the item may
  * live on the new right sibling instead.
  */
-extern void lion_dir_place(Relation index, Relation heaprel, LionState *state,
+extern void lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix,
 						  Buffer buf, OffsetNumber off, bool replace,
 						  LionEntryTuple *item, Size size);
 
@@ -753,9 +865,11 @@ extern LionEntryTuple *lion_make_entry(LionState *state, Datum key, uint32 hash,
 /*
  * The same for a reserved entry (DESIGN.md §14 and §17): no key, hash 0, and
  * reservedflag - exactly one of LION_ENTRY_NULLKEY and LION_ENTRY_EMPTYKEY -
- * set on top of the caller's INLINE/CHAIN flag.
+ * set on top of the caller's INLINE/CHAIN flag.  There is one of each PER KEY
+ * COLUMN (DESIGN.md §24), which is why the column has to be named here.
  */
-extern LionEntryTuple *lion_make_reserved_entry(uint16 reservedflag, uint16 flags,
+extern LionEntryTuple *lion_make_reserved_entry(AttrNumber attno,
+											  uint16 reservedflag, uint16 flags,
 											  const char *payload,
 											  Size payloadlen, Size *size);
 
@@ -958,12 +1072,13 @@ extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
 #define LION_ENTRY_PAYLOAD_LEN(e, itemsz)	((Size) (itemsz) - LionEntryPayloadOffset(e))
 
 /*
- * Fill *state for index, using the supplied meta page image.  ambuild uses
- * this before the meta page exists; lion_get_state() uses it afterwards.
- * FmgrInfos are allocated in cxt.
+ * Fill *ix - every key column of it - using the supplied meta page image.
+ * ambuild uses this before the meta page exists; lion_get_index_state() uses
+ * it afterwards.  The column array and the FmgrInfos are allocated in cxt.
  */
-extern void lion_fill_state(Relation index, LionState *state,
-						   const LionMetaPageData *meta, MemoryContext cxt);
+extern void lion_fill_index_state(Relation index, LionIndexState *ix,
+								 const LionMetaPageData *meta,
+								 MemoryContext cxt);
 
 /*
  * Like lion_find_entry(), but with the comparison functions the caller wants:

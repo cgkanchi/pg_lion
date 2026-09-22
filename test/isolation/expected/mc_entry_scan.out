@@ -1,0 +1,102 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s1_group s2_fill s2_wakeup s1_plain s1_group2 s3_shape s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) mces;
+step s1_group: 
+	SELECT groups, count FROM lion_index_count_group_stats('mces_go', true, 1::int2);
+ <waiting ...>
+step s2_fill: 
+	BEGIN;
+	INSERT INTO mces
+	SELECT 100000 + i,
+		   'g-' || lpad((i % 30)::text, 90, '0'),		-- existing g keys
+		   'o-new-' || lpad(i::text, 86, '0'),			-- brand new o keys
+		   repeat('y', 200)
+	  FROM generate_series(1, 120) i;
+	ROLLBACK;
+
+step s2_wakeup: 
+	/*
+	 * Detach first, so that nothing can park at the point again, then
+	 * release whoever is parked now.  How MANY times the point is reached is
+	 * not fixed - the walk fires it once per leaf it consumes an entry from,
+	 * and the split makes more leaves - but after this step nobody is waiting
+	 * on it, which is all the permutation needs.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-resumed');
+	DO $$
+	DECLARE n int; zero int := 0;
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			SELECT count(*) INTO n FROM pg_stat_activity
+			 WHERE wait_event = 'lion-entry-scan-resumed';
+			IF n = 0 THEN
+				zero := zero + 1;
+				EXIT WHEN zero >= 10;
+			ELSE
+				zero := 0;
+				BEGIN
+					PERFORM injection_points_wakeup('lion-entry-scan-resumed');
+				EXCEPTION WHEN OTHERS THEN NULL;
+				END;
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_group: <... completed>
+groups|count
+------+-----
+    30| 6000
+(1 row)
+
+step s1_plain: 
+	SELECT count(*) AS groups, sum(c) AS count
+	  FROM (SELECT g, count(*) AS c FROM mces GROUP BY g) x;
+
+groups|count
+------+-----
+    30| 6000
+(1 row)
+
+step s1_group2: 
+	SELECT groups, count FROM lion_index_count_group_stats('mces_go', true, 2::int2);
+
+groups|count
+------+-----
+    10| 6000
+(1 row)
+
+step s3_shape: 
+	SELECT leaf_pages > 1 AS the_shared_leaf_really_split,
+		   directory_height > 0 AS the_root_really_moved
+	  FROM lion_index_stats('mces_go') WHERE attno = 1;
+	SELECT attno, entries FROM lion_index_stats('mces_go') ORDER BY attno;
+
+the_shared_leaf_really_split|the_root_really_moved
+----------------------------+---------------------
+t                           |t                    
+(1 row)
+
+attno|entries
+-----+-------
+    1|     30
+    2|    130
+(2 rows)
+
+step s3_verify: SELECT lion_index_verify('mces_go', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

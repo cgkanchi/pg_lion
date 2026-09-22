@@ -91,6 +91,17 @@ CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn) WITH (buckets = 8);
 CREATE INDEX lion_rec_tsv ON lion_rec USING lion (tsv);
 
 /*
+ * A MULTICOLUMN index (DESIGN.md §24), so that every crash round exercises
+ * the shared directory: four key columns of four different shapes - a dense
+ * scalar, a thin text one, a nullable scalar and a multi-key array - whose
+ * entry runs lie end to end in one tree and whose inserts all land on the
+ * leaves of that one tree.  inline_limit = 64 makes the spills and splits of
+ * §4 and §22 frequent in every one of them.
+ */
+CREATE INDEX lion_rec_mc ON lion_rec USING lion (k4, t, nn, arr)
+	WITH (inline_limit = 64);
+
+/*
  * The writer's id stream.  Each pgbench client c only ever touches rows with
  * id % 8 = c, so four clients never contend for a row and the run cannot
  * produce a deadlock or a serialization failure that would abort a client.
@@ -167,7 +178,13 @@ LANGUAGE sql IMMUTABLE AS $$
 		   ('select count(*) from lion_rec where arr @> ''{}''::int4[]'),
 		   ('select count(*) from lion_rec where tsv @@ ''w1''::tsquery'),
 		   ('select count(*) from lion_rec where tsv @@ ''w2 & w3''::tsquery'),
-		   ('select count(*) from lion_rec where tsv @@ ''w5 | w7''::tsquery')
+		   ('select count(*) from lion_rec where tsv @@ ''w5 | w7''::tsquery'),
+		   /* DESIGN.md §24: two and three columns of ONE index intersected. */
+		   ('select count(*) from lion_rec where k4 = 5 and t = ''v13'''),
+		   ('select count(*) from lion_rec where k4 = 5 and nn = 7'),
+		   ('select count(*) from lion_rec where t = ''v13'' and arr @> array[3]'),
+		   ('select count(*) from lion_rec where k4 = 5 and t = ''v13'' and nn is null'),
+		   ('select count(*) from lion_rec where k4 in (1,2,3) and nn in (4,5)')
 $$;
 
 /* Every lion index on the table, with what its ntids must add up to. */
@@ -181,6 +198,13 @@ LANGUAGE sql IMMUTABLE AS $$
 	  ('lion_rec_ct', 'select count(*) from lion_rec'),
 	  ('lion_rec_b',  'select count(*) from lion_rec'),
 	  ('lion_rec_nn', 'select count(*) from lion_rec'),
+	  /* The multicolumn index (DESIGN.md §24): ntids over ALL its columns.
+	   * The per-column totals are checked by lion_rec_mc_columns() below. */
+	  ('lion_rec_mc',
+	   'select 3 * (select count(*) from lion_rec) + '
+	   '(select coalesce(sum(greatest(1, cardinality(u))), 0) from '
+	   '(select array(select distinct e from unnest(arr) x(e) where e is not null) u '
+	   'from lion_rec) s)'),
 	  /* A multi-key opclass stores one TID per (key, row) pair, and one in
 	   * the reserved EMPTY entry for a row it extracted no key from. */
 	  ('lion_rec_arr',
@@ -190,6 +214,24 @@ LANGUAGE sql IMMUTABLE AS $$
 	  ('lion_rec_tsv',
 	   'select coalesce(sum(greatest(1, coalesce(array_length(tsvector_to_array(tsv), 1), 0))), 0) '
 	   'from lion_rec')
+$$;
+
+/*
+ * The multicolumn index of DESIGN.md §24, one row per key column: each column
+ * is an independent key set, so each has its own TID total and its own
+ * reserved entries.  It is checked separately because lion_index_stats() now
+ * returns a row per column and the totals above are per index.
+ */
+CREATE FUNCTION lion_rec_mc_columns()
+RETURNS TABLE (attno int2, col text, ntids_q text)
+LANGUAGE sql IMMUTABLE AS $$
+	VALUES (1::int2, 'k4'::text, 'select count(*) from lion_rec'::text),
+		   (2::int2, 't',  'select count(*) from lion_rec'),
+		   (3::int2, 'nn', 'select count(*) from lion_rec'),
+		   (4::int2, 'arr',
+			'select coalesce(sum(greatest(1, cardinality(u))), 0) from '
+			'(select array(select distinct e from unnest(arr) x(e) where e is not null) u '
+			'from lion_rec) s')
 $$;
 
 /* ------------------------------------------------------------------ */
@@ -357,7 +399,8 @@ BEGIN
 
 	/* 2. ntids against the heap. */
 	FOR r IN SELECT * FROM lion_rec_indexes() LOOP
-		EXECUTE format('SELECT ntids FROM lion_index_stats(%L::regclass)', r.idx)
+		EXECUTE format('SELECT sum(ntids) FROM lion_index_stats(%L::regclass)',
+					   r.idx)
 			INTO got;
 		EXECUTE r.ntids_q INTO want;
 		IF exact_ntids THEN
@@ -404,6 +447,43 @@ BEGIN
 						 CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
 		RETURN NEXT;
 	END LOOP;
+
+	/*
+	 * 3b. the multicolumn index, column by column (DESIGN.md §24).  Each key
+	 * column is an independent key set, so each has its own TID total; a
+	 * column whose entries went to the wrong run, or a run the entry scan
+	 * walked past the end of, shows up as a per-column mismatch even when the
+	 * index-wide total above happens to add up.
+	 */
+	FOR r IN SELECT * FROM lion_rec_mc_columns() LOOP
+		EXECUTE format('SELECT ntids FROM lion_index_stats(''lion_rec_mc'') '
+					   'WHERE attno = %s', r.attno)
+			INTO got;
+		EXECUTE r.ntids_q INTO want;
+		ok := (got >= want) AND (NOT exact_ntids OR got = want);
+		detail := format('lion_rec_mc column %s (%s) ntids = %s, heap wants %s%s',
+						 r.attno, r.col, got, want,
+						 CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+		RETURN NEXT;
+	END LOOP;
+
+	/* The nullable and the multi-key column each keep their own NULL entry. */
+	EXECUTE 'select null_tids from lion_index_stats(''lion_rec_mc'') where attno = 3'
+		INTO got;
+	EXECUTE 'select count(*) from lion_rec where nn is null' INTO want;
+	ok := (got >= want) AND (NOT exact_ntids OR got = want);
+	detail := format('lion_rec_mc column 3 (nn) null_tids = %s, heap wants %s%s',
+					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+	RETURN NEXT;
+
+	EXECUTE 'select empty_tids from lion_index_stats(''lion_rec_mc'') where attno = 4'
+		INTO got;
+	EXECUTE 'select count(*) from lion_rec where arr is not null and not exists '
+			'(select 1 from unnest(arr) e where e is not null)' INTO want;
+	ok := (got >= want) AND (NOT exact_ntids OR got = want);
+	detail := format('lion_rec_mc column 4 (arr) empty_tids = %s, heap wants %s%s',
+					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+	RETURN NEXT;
 
 	/* 4. single-key counts: index vs seqscan vs count() vs pushdown. */
 	FOR r IN SELECT * FROM lion_rec_keys() LOOP

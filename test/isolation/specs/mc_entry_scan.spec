@@ -1,0 +1,1 @@
+../mc_entry_scan.spec

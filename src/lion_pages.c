@@ -474,35 +474,31 @@ lion_find_sort_operator(Oid cmpfunc, Oid typid)
 }
 
 /*
- * Fill in *state for index.  The meta page image is supplied by the caller
- * because ambuild needs a state before the meta page exists.
+ * Fill in the state of ONE key column of index (DESIGN.md §24).  attno is
+ * 1-based and names an index column, not a heap attribute.
  */
-void
-lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
-			   MemoryContext cxt)
+static void
+lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
+					   MemoryContext cxt)
 {
 	Form_pg_attribute att;
+	int			i = attno - 1;
 	Oid			eqopr;
 	Oid			eqfunc;
 	Oid			eqoprused = InvalidOid;		/* the equality the entries use */
 
-	memset(state, 0, sizeof(LionState));
-	state->meta = *meta;
-
-	if (IndexRelationGetNumberOfKeyAttributes(index) != 1)
-		elog(ERROR, "lion index \"%s\" must have exactly one key column",
-			 RelationGetRelationName(index));
+	state->attno = (uint16) attno;
 
 	/*
 	 * The index's own tuple descriptor already carries the KEY type, opclass
 	 * STORAGE and polymorphism resolved (see the comment on LionState.typid),
 	 * so a multi-key class needs no extra type lookup here.
 	 */
-	att = TupleDescAttr(RelationGetDescr(index), 0);
+	att = TupleDescAttr(RelationGetDescr(index), i);
 	state->typid = att->atttypid;
 	get_typlenbyvalalign(state->typid, &state->typlen, &state->typbyval,
 						 &state->typalign);
-	state->collation = index->rd_indcollation[0];
+	state->collation = index->rd_indcollation[i];
 
 	/*
 	 * A key type that cares about collations must have one: hashtext() and
@@ -518,21 +514,23 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 
 	/* Multi-key opclass?  Support proc 2 is what says so (DESIGN.md §17). */
 	state->multikey =
-		OidIsValid(index_getprocid(index, 1, LION_EXTRACTVALUE_PROC));
+		OidIsValid(index_getprocid(index, attno, LION_EXTRACTVALUE_PROC));
 
 	if (state->multikey)
 	{
-		if (!OidIsValid(index_getprocid(index, 1, LION_EXTRACTQUERY_PROC)))
+		if (!OidIsValid(index_getprocid(index, attno, LION_EXTRACTQUERY_PROC)))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("operator class of index \"%s\" has support function %d but not %d",
-							RelationGetRelationName(index),
+					 errmsg("operator class of column %d of index \"%s\" has support function %d but not %d",
+							attno, RelationGetRelationName(index),
 							LION_EXTRACTVALUE_PROC, LION_EXTRACTQUERY_PROC)));
 
 		fmgr_info_copy(&state->extractvalue,
-					   index_getprocinfo(index, 1, LION_EXTRACTVALUE_PROC), cxt);
+					   index_getprocinfo(index, attno, LION_EXTRACTVALUE_PROC),
+					   cxt);
 		fmgr_info_copy(&state->extractquery,
-					   index_getprocinfo(index, 1, LION_EXTRACTQUERY_PROC), cxt);
+					   index_getprocinfo(index, attno, LION_EXTRACTQUERY_PROC),
+					   cxt);
 	}
 
 	/*
@@ -542,9 +540,9 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 	 * type's default hash opclass, the way GIN resolves its comparison
 	 * function in initGinState().
 	 */
-	if (OidIsValid(index_getprocid(index, 1, LION_HASH_PROC)))
+	if (OidIsValid(index_getprocid(index, attno, LION_HASH_PROC)))
 		fmgr_info_copy(&state->hashproc,
-					   index_getprocinfo(index, 1, LION_HASH_PROC), cxt);
+					   index_getprocinfo(index, attno, LION_HASH_PROC), cxt);
 	else
 	{
 		TypeCacheEntry *typentry;
@@ -568,9 +566,9 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 	 * equality operator - which is the one its hash opclass agrees with.
 	 */
 	eqopr = state->multikey ? InvalidOid :
-		get_opfamily_member(index->rd_opfamily[0],
-							index->rd_opcintype[0],
-							index->rd_opcintype[0],
+		get_opfamily_member(index->rd_opfamily[i],
+							index->rd_opcintype[i],
+							index->rd_opcintype[i],
 							LION_STRAT_EQUAL);
 	if (OidIsValid(eqopr))
 	{
@@ -587,8 +585,8 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 		if (!state->multikey)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("operator class of index \"%s\" has no equality operator",
-							RelationGetRelationName(index))));
+					 errmsg("operator class of column %d of index \"%s\" has no equality operator",
+							attno, RelationGetRelationName(index))));
 
 		typentry = lookup_type_cache(state->typid, TYPECACHE_EQ_OPR_FINFO);
 		if (!OidIsValid(typentry->eq_opr_finfo.fn_oid))
@@ -639,7 +637,7 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 	state->ordered = false;
 	state->ltopr = InvalidOid;
 	{
-		Oid			cmpfunc = index_getprocid(index, 1, LION_CMP_PROC);
+		Oid			cmpfunc = index_getprocid(index, attno, LION_CMP_PROC);
 		TypeCacheEntry *typentry =
 			lookup_type_cache(state->typid,
 							  TYPECACHE_CMP_PROC_FINFO | TYPECACHE_LT_OPR |
@@ -649,7 +647,7 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 		if (OidIsValid(cmpfunc))
 		{
 			fmgr_info_copy(&state->cmpproc,
-						   index_getprocinfo(index, 1, LION_CMP_PROC), cxt);
+						   index_getprocinfo(index, attno, LION_CMP_PROC), cxt);
 			haveproc = true;
 		}
 		else if (OidIsValid(typentry->cmp_proc_finfo.fn_oid))
@@ -684,25 +682,76 @@ lion_fill_state(Relation index, LionState *state, const LionMetaPageData *meta,
 }
 
 /*
+ * Fill in *ix for index: the meta page image the caller supplies (ambuild
+ * needs a state before the meta page exists) and every key column.
+ */
+void
+lion_fill_index_state(Relation index, LionIndexState *ix,
+					  const LionMetaPageData *meta, MemoryContext cxt)
+{
+	int			ncols = lion_index_ncolumns(index);
+	int			i;
+
+	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
+		elog(ERROR, "lion index \"%s\" has %d key columns",
+			 RelationGetRelationName(index), ncols);
+
+	memset(ix, 0, sizeof(LionIndexState));
+	ix->meta = *meta;
+	ix->ncolumns = ncols;
+	ix->cols = (LionState *) MemoryContextAllocZero(cxt,
+													sizeof(LionState) * ncols);
+
+	for (i = 0; i < ncols; i++)
+	{
+		ix->cols[i].ix = ix;
+		lion_fill_column_state(index, &ix->cols[i], (AttrNumber) (i + 1), cxt);
+	}
+}
+
+/*
  * Get the cached per-relation state, building it on first use.
  */
-LionState *
-lion_get_state(Relation index)
+LionIndexState *
+lion_get_index_state(Relation index)
 {
-	LionState   *state;
+	LionIndexState *ix;
 	LionMetaPageData meta;
 
 	if (index->rd_amcache != NULL)
-		return (LionState *) index->rd_amcache;
+		return (LionIndexState *) index->rd_amcache;
 
 	lion_read_meta(index, &meta);
 
-	state = (LionState *) MemoryContextAlloc(index->rd_indexcxt,
-											sizeof(LionState));
-	lion_fill_state(index, state, &meta, index->rd_indexcxt);
+	ix = (LionIndexState *) MemoryContextAlloc(index->rd_indexcxt,
+											   sizeof(LionIndexState));
+	lion_fill_index_state(index, ix, &meta, index->rd_indexcxt);
 
-	index->rd_amcache = (void *) state;
-	return state;
+	index->rd_amcache = (void *) ix;
+	return ix;
+}
+
+/*
+ * The state of one key column.  attno is an INDEX column number (DESIGN.md
+ * §24), which is what a ScanKey's sk_attno and an entry tuple's attno are.
+ */
+LionState *
+lion_index_column_state(Relation index, AttrNumber attno)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+
+	if (attno < 1 || attno > ix->ncolumns)
+		elog(ERROR, "lion index \"%s\" has no key column %d",
+			 RelationGetRelationName(index), attno);
+
+	return &ix->cols[attno - 1];
+}
+
+/* Column 1, which is all a single-column index has. */
+LionState *
+lion_get_state(Relation index)
+{
+	return &lion_get_index_state(index)->cols[0];
 }
 
 /*
@@ -905,6 +954,7 @@ lion_make_entry(LionState *state, Datum key, uint32 hash, uint16 flags,
 	entry->head = InvalidBlockNumber;
 	entry->tail = InvalidBlockNumber;
 	entry->ncontainers = 0;
+	entry->attno = state->attno;
 	entry->ntids = 0;
 
 	lion_store_key(state, key, LionEntryGetKey(entry));
@@ -930,8 +980,8 @@ lion_make_entry(LionState *state, Datum key, uint32 hash, uint16 flags,
  * treat it exactly like any other.
  */
 LionEntryTuple *
-lion_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
-						Size payloadlen, Size *size)
+lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
+						const char *payload, Size payloadlen, Size *size)
 {
 	LionEntryTuple *entry;
 	Size		payoff = MAXALIGN(LION_ENTRY_HDRSZ);
@@ -939,6 +989,7 @@ lion_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
 
 	Assert(reservedflag == LION_ENTRY_NULLKEY ||
 		   reservedflag == LION_ENTRY_EMPTYKEY);
+	Assert(attno >= 1);
 
 	if (total > LION_MAX_ENTRY_SIZE)
 		ereport(ERROR,
@@ -953,6 +1004,7 @@ lion_make_reserved_entry(uint16 reservedflag, uint16 flags, const char *payload,
 	entry->head = InvalidBlockNumber;
 	entry->tail = InvalidBlockNumber;
 	entry->ncontainers = 0;
+	entry->attno = (uint16) attno;
 	entry->ntids = 0;
 
 	if (payloadlen > 0)
@@ -1027,7 +1079,7 @@ lion_find_entry_ext(Relation index, LionState *state, int lockmode, Datum key,
 		sk.collation = collation;
 	}
 
-	return lion_dir_find(index, NULL, state, &sk, lockmode, false,
+	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
 						 buf, offnum, NULL);
 }
 
@@ -1058,7 +1110,7 @@ lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
 						 LION_KIND_NULL : LION_KIND_EMPTY,
 						 (Datum) 0, LION_NULLKEY_HASH);
 
-	return lion_dir_find(index, NULL, state, &sk, lockmode, false,
+	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
 						 buf, offnum, NULL);
 }
 

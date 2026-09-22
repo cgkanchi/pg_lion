@@ -95,7 +95,12 @@ All pages are standard PG pages (PageInit) with a special area:
         uint16      page_id;       /* LION_PAGE_ID = 0xFF87, for identification by inspection tools */
     } LionPageOpaqueData;          /* 24 bytes */
 
-Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 5, offset_bits,
+**Superseded in part by §24 (format version 6).** An entry tuple carries the KEY COLUMN it belongs
+to in a `uint16 attno` at offset 20, where the 32-byte header had four bytes of alignment padding, so
+the header and every item on every page stay exactly where they were. A `attno` of 0 belongs to the
+minus-infinity downlink alone.
+
+Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 6, offset_bits,
 container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
@@ -240,6 +245,12 @@ step 2 is gone entirely (the tree grows by splitting), and ambuild sizes nothing
 the lock ordering, the one-record-per-atomic-step rule, the measured concurrency ceiling and why
 shortening the hold would not move it - is unchanged, and the leaf serialises the writers of a key
 exactly as the bucket head page did.
+
+**A MULTICOLUMN index changes none of it (§24).** One relation holds every key column's entries in
+one directory, so one aminsert is n independent single-key inserts - one per column, each taking and
+releasing the leaf that holds ITS entry - and two columns of one index contend exactly as two
+single-column indexes would, except that they may land on the same leaf. The lock ordering below is
+unchanged because a directory leaf is a directory leaf whatever column's entry is on it.
 
 Lock ordering: directory pages (root to leaf) → container pages (left to right) → new page.
 Never lock a page to the left of one you hold. The meta page is read once at relation open and
@@ -475,7 +486,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
 
 ## 7. SQL functions (`lion_funcs.c`)
 
-    lion_index_stats(regclass, OUT directory_height int, OUT leaf_pages bigint,
+    lion_index_stats(regclass, OUT attno int2, OUT directory_height int, OUT leaf_pages bigint,
         OUT internal_pages bigint, OUT ordered bool, OUT entries bigint,
         OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint,
         OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint,
@@ -483,9 +494,17 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint,
         OUT empty_tids bigint, OUT slack_bytes bigint,
         OUT deleted_pages bigint,
-        OUT posting_internal_pages bigint, OUT max_posting_height int) RETURNS record
-        -- the first four describe the entry directory of §21 (`ordered` false means the key type
-        -- has no btree opclass, so the entries are in a complete but arbitrary order);
+        OUT posting_internal_pages bigint, OUT max_posting_height int) RETURNS SETOF record
+        -- ONE ROW PER KEY COLUMN (§24), in attno order.  Counters that describe an entry or a
+        -- posting set - entries, inline_entries, ntids, null_tids, empty_tids, the container and
+        -- sparse counts, container_bytes, slack_bytes, container_pages, posting_internal_pages -
+        -- are that column's own; counters that describe the RELATION - directory_height,
+        -- leaf_pages, internal_pages, free_bytes, deleted_pages, max_posting_height - are repeated
+        -- on every row, because one directory leaf holds whatever columns' entries land on it.
+        -- A container page IS attributed to its column, through the owner_head stamp of §18 and
+        -- the attno of the entry that owns that head.
+        -- `ordered` is per column, and false means that column's key type has no btree opclass, so
+        -- its entries are in a complete but arbitrary order;
         -- container counts include INLINE containers; free_bytes sums directory and container pages;
         -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
         -- the reserved no-key entry (§17); container_pages counts posting-tree LEAVES and
@@ -496,11 +515,14 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
         -- the identity every page of the set is stamped with (§18).
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
-        -- ERRORs on any structural inconsistency: page ids/flags, meta values, entry flags,
+        -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
+        -- never below the column of the entry before it, §24), at most one reserved NULL and one
+        -- reserved EMPTY entry PER COLUMN, page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container, ntids/ncontainers sums; with heapallindexed, scans the heap with a
-        -- fresh snapshot and checks that every visible tuple's TID is present under its key -
-        -- refusing (lion_index_usable(), §9) when this transaction's snapshot may not use the index.
+        -- fresh snapshot and checks that every visible tuple's TID is present under its key in
+        -- EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
+        -- snapshot may not use the index.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
@@ -681,6 +703,19 @@ Planner integration
     clause is exempt from the one-clause-per-column rule, because it constrains no value. §19 adds a
     top-level `OR` of such clauses, whose leaves are exempt from the rule as well and enter none of
     the per-column bookkeeping, because they constrain no column of the result.
+  - **An index is an (index, KEY COLUMN) pair since §24.** A multicolumn lion index holds each of
+    its columns' keys as an independent set of entries, so `lion_find_roaring_index()` accepts a
+    match on ANY key column and returns its number `i` beside the index; every opclass question in
+    this section is then asked of THAT column - `opfamily[i]`, `opcintype[i]`,
+    `indexcollations[i]` - and every lookup, entry scan and `datumCopy()` of that clause names the
+    column (`lion_posting_set_lookup_col()`, `lion_entry_scan_begin_col()`,
+    `lion_index_column_state()`). Two clauses of one query may name the same index; a query
+    constraining three columns of one index is three posting-set sources located through one
+    relcache entry, ANDed exactly as three separate indexes would be. The column is NOT carried in
+    `custom_private`: the executor derives it in `lion_open_relation()` from the index it really
+    opened and the clause's heap attnum, because a partition's index may put the same heap column
+    at a different position from the parent's (§16) - and may number the heap column differently
+    too, which is resolved by name.
   - **A Param stands wherever a Const may** (2026-09-21 follow-up review). A prepared statement's
     GENERIC plan keeps `k = $1` as a Param - that is what a generic plan IS - and accepting only
     literals meant the node was never used by one: a dense count fell back to the ordinary plan and
@@ -697,11 +732,15 @@ Planner integration
     agrees with by being strict.
   - Collations follow the planner's IndexCollMatchesExprColl() rule: a collation-sensitive clause
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
-    indexcollations[0] equals that collation, because the index hashed and compared keys under its
-    own collation and the count never rechecks the predicate. Checked per partition.
+    indexcollations[i] - of the KEY COLUMN that indexes the clause's column (§24) - equals that
+    collation, because the index hashed and compared keys under its own collation and the count
+    never rechecks the predicate. Checked per partition.
   - GROUP BY is empty, or exactly one plain Var of the rel with a lion index - or two of them,
     which §20 answers as a nested loop over the two indexes' entries, applying every rule of this
-    section per column. A grouped column
+    section per column. Since §24 the two may be two KEY COLUMNS of ONE multicolumn index, which is
+    that feature's natural use: the relation is opened twice, each side walks its own column's
+    entries, and the outer/inner choice is made from the columns' cardinalities exactly as it is
+    between two indexes. A grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.
   - **The driving index's equality is the grouping equality** (2026-09-20 review, finding 3). An
@@ -711,7 +750,8 @@ Planner integration
     2026-09-20 review built one: 50k `'A'` and 50k `'a'` came out as one group of 100k). So the
     equality operator the planner chose for the grouping column - `SortGroupClause.eqop`, which is
     the type's own - must be exactly the operator
-    `get_opfamily_member(idx->opfamily[0], opcintype, opcintype, 1)` returns, compared by Oid;
+    `get_opfamily_member(idx->opfamily[i], opcintype[i], opcintype[i], 1)` returns for the driving
+    KEY COLUMN i (§24), compared by Oid;
     cross-type equality does not arise for a group column. Matching collation is NOT enough. The
     check is per relation, so every partition's own index is checked (§16), and it covers the
     `count(col)` cases of §14 that read the group column's entries, since those are only reached
@@ -752,8 +792,33 @@ Planner integration
   - **one bucket page per looked-up key** at random_page_cost, and that key's own container chain -
     written sequentially, so its share of the index's container pages, at least one page - at
     seq_page_cost. An IN list is one such lookup per element (§15) and the bucket pages are shared
-    once the list is longer than the index has buckets, so the pages are `Min(nelems, nbuckets)`;
+    once the list is longer than the index has buckets, so the pages are `Min(nelems, nbuckets)`.
+    Since §22 only the source that DRIVES the merge pays for its whole chain: the others are SOUGHT
+    to the driver's container keys and pay for the leaves those probes touch, which is the formula
+    in §22's cost model and never more than the chain itself;
   - **every page of the group index** for a GROUP BY, at seq_page_cost: its entries are all walked;
+  - **and all of those page terms are scaled to ONE KEY COLUMN of a multicolumn index** (§24).
+    `idx->pages` and `lion_index_dir_pages()` are per RELATION, and a multicolumn index is one
+    relation holding n independent sets of entries, so charging a column the whole directory and
+    the whole page count prices `WHERE b = 1` on `(a, b, c)` at three times what the same query on
+    a single-column index of `b` costs - and the node is then refused for a query it answers
+    exactly as fast. The share is that column's estimated fraction of the relation's entries,
+    `n_distinct(col) / sum of n_distinct over the index's key columns`, taken through
+    `examine_variable()`/`get_variable_numdistinct()` on a Var of this relation's own attribute
+    numbers (the partition's, for a partition). It scales the clause's directory and container page
+    terms and the entry scan of a driving column, and nothing else: the directory HEIGHT is not
+    scaled, because a descent passes through the upper levels the columns share, and neither is the
+    index's own size where `lion_heap_page_cost()` uses it to decide how much of it is cached,
+    which is a property of the relation. **The limitation** is that n_distinct is not an entry
+    count: a multi-key column (§17) has one entry per LEXEME rather than per row value, so its
+    share is understated and the scalar columns beside it are charged for its directory; a column
+    with no statistics falls back to DEFAULT_NUM_DISTINCT for itself alone, which makes the split
+    equal when NO column has statistics and biased when only some do. Both errors are bounded by
+    the number of columns, which is exactly the error the correction removes - without it, the
+    factor is the column count, always, and always against the node. `test/sql/multicolumn.sql`
+    pins it by asking the same question of one multicolumn index and of n single-column ones and
+    requiring the same plan choice; the five-clause case there is refused over the multicolumn
+    index with the correction disabled and accepted with it (2026-09-22);
   - **one O(1) step per container per participating source**, twice cpu_operator_cost (a block mask
     and a visibility-map mask), where a source's containers are `Min(heap_pages /
     LION_BLOCKS_PER_CONTAINER, its members)`, so a GROUP BY pays numgroups of them;
@@ -842,7 +907,10 @@ Executor
   `lion_next_group()`, and it is the whole of the GROUP BY executor: a partitioned scan runs it once
   per partition (§16).
 - ReScanCustomScan: reset iteration state. EndCustomScan: close indexes, free.
-- ExplainCustomScan: print "Indexes: idx1 (col = const), ..." and "Group Key: col" and, with ANALYZE,
+- ExplainCustomScan: print "Indexes: idx1 (col = const), ..." - with the index's KEY COLUMN
+  appended as `idx1.col` when, and only when, the index is a MULTICOLUMN one (§24), so that two
+  clauses answered by one index can be told apart and every plan written before §24 is unchanged -
+  and "Group Key: col" and, with ANALYZE,
   the number of TIDs rechecked in the heap, the heap blocks skipped via the visibility map, the
   containers visited, and the block visits the visibility cache answered or had to let past its
   budget ("Heap Blocks From Cache" / "Heap Blocks Past Cache Budget", §9). A clause whose value is
@@ -861,7 +929,14 @@ LATERAL nested loop whose inner side is rescanned with a new exec Param for ever
 compared against the same query with the pushdown switched off, as a multiset both ways round. `test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
-answers are checked too.
+answers are checked too. Section 11 of `test/sql/multicolumn.sql` runs the whole of this section
+over ONE multicolumn index (§24): a count and a GROUP BY per column, several columns ANDed, a
+two-column GROUP BY out of one index, IN lists on the group column and on another column of the
+same index, the null tests including two `IS NOT NULL`s over one index, an OR across two of its
+columns, parameters, a partitioned table whose partitions order their index columns differently
+and number their heap columns differently again, a dirty heap and a clean one - each against the
+same query with the pushdown off, as a multiset both ways round - and it pins the plan CHOICE
+against a twin table carrying one single-column index per column.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
@@ -1309,7 +1384,13 @@ bucket page each - but read in ascending block order, so at `lion_heap_page_cost
 page cost rather than at random_page_cost, and shared once the list is longer than the index has
 buckets (`Min(nelems, nbuckets)`); one chain page each at seq_page_cost, capped at the container
 pages the index actually has; one container step per element per container key; and, when the merge
-runs at all, `lion_merge_ops()`. Three things were wrong here and all three refused a query the node
+runs at all, `lion_merge_ops()`. Since §22 the chain pages are what the list really reads: a list
+that is one source of an AND and does not drive it is SOUGHT - the merge seeks every sub-cursor of
+the union - so each of its k sets is priced by §22's probed bound, and only a list that drives the
+merge (or is the only source) pays for all k chains in full. Which one drives is decided from the
+MEMBERS, as the executor decides it: a thousand-element list of a high-cardinality column has fewer
+members than a dense equality and therefore drives, even though its k sets lie in many more
+containers between them. Three things were wrong here and all three refused a query the node
 answers several times faster:
 
 - charging a list as a SINGLE bucket page made a thousand-element list look four times cheaper than
@@ -2175,6 +2256,12 @@ that path, and then the inner key lives in the per-pair context like a single-co
   scattered over the whole heap have a container at nearly every container key and the merge steps
   through all of them.
 
+A WHERE source under either grouping is priced as §22 prices a probed source, which for a grouping
+means one read of it and nothing per pair: the pairs probe it far more often than it has pages, and
+the copy §9 makes of it on its second use is probed in memory. So none of the three terms above
+moved when §22 recalibrated the pages, and neither did any cardinality this section accepts or
+refuses.
+
 Measured (2026-09-21, 200k rows of a 100-byte-wide table, uncorrelated columns, assert build), node
 against the sequential aggregate: **20 × 2 groups 5.6 ms against 37.3 ms**, **200 × 2 14.9 against
 39.3**, **200 × 20 60.7 against 36.8**, **20000 × 2 169.8 against 51.6**, and 20000 × 200 far worse.
@@ -2236,10 +2323,18 @@ that would exceed it spills onto container pages exactly as one that exceeds `in
 
 ### The order
 
-    kind (MINF < NULL < EMPTY < VALUE), then proc 4 under the index collation, then the hash,
-    then a bytewise comparison of the stored datum
+    KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < VALUE), then proc 4 under the column's
+    collation, then the hash, then a bytewise comparison of the stored datum
 
-The first three are the **prefix**. Two entries whose prefixes tie are candidates for being the same
+The leading key-column term is §24's; a single-column index has one value for it and everything
+below reads as it was written. It comes FIRST so that each column's entries are one contiguous run:
+a lookup is an (attno, key) descent, an entry scan bounded to one column is the leaf walk from its
+first entry to the first entry of the next column, and an item of another column is settled by that
+one comparison without calling a single opclass function - which is what lets one descent cross the
+entries of columns whose key types it knows nothing about. The minus-infinity downlink carries
+column 0 and therefore still sorts below everything.
+
+The kind and what follows it are the **prefix** within one column. Two entries whose prefixes tie are candidates for being the same
 key, and only the opclass EQUALITY decides: a descent lands on the first item of the prefix run and
 scans it - across right links if it spans pages - applying strategy 1. That is what makes citext's
 `'Alice'` and `'alice'` ONE entry: `citext_cmp` returns 0 and `citext_hash` agrees, so they tie, and
@@ -2257,6 +2352,11 @@ and every cross-type lookup, which cannot produce them at all - compares as the 
 its own run, which is exactly what positions it at the run's start. The INSERT path does have the
 bytes (it has just built the entry tuple), and uses them to place the new key at its exact position,
 which is what keeps the on-disk order total.
+
+Every rule below is **per key column** (§24): each column has its own opclass, so its own key type,
+hash, equality, comparison, collation, multi-key extraction and its own answer to "ordered?".
+`LionState` is that per-column state and `LionIndexState` holds the meta page and the array of them;
+`lion_get_state()` hands back column 1, which is all a single-column index has.
 
 **The ordering source.** Every default opclass gains support proc 4, the btree comparison of the KEY
 type: the type's default btree opclass's support function 1, named in the SQL script
@@ -2508,9 +2608,10 @@ lookup) and then by comparing the located entries' STORED KEYS with the index's 
 is what §15's disjoint sum needs and is stronger than the `(page, offset)` identity it used to use
 (offsets move now). The walk is only available when the values can be ORDERED against the stored
 keys: a cross-type list whose resolution came out as "walk the leaves" (above) takes that fallback
-per value here too, because the two lookups share one resolution. `lion_entry_scan`,
-`lion_emit_all_keys`, `IS NOT NULL`, verify and stats all walk
-the leftmost leaf and then the right links, so their output is in key order for an ordered opclass.
+per value here too, because the two lookups share one resolution. `lion_entry_scan` and
+`lion_emit_all_keys` walk from the first leaf of THEIR key column to the first entry of the next one
+(§24), and `IS NOT NULL`, verify and stats walk the leftmost leaf and then the right links, so their
+output is in key order for an ordered opclass.
 
 EXPLAIN ANALYZE reports **Directory Pages Read**, the leaves and internal pages the node read, which
 is what `test/sql/directory.sql` uses to prove that a thousand-value IN list costs one pass over the
@@ -2694,11 +2795,107 @@ Operations.
   build reserves a block for the ROOT and re-stamps the first leaf with it - the first leaf's image
   is still in memory, and every page of a set has to carry the root's block as its owner (§18).
 
-Cost model: an AND source's containers term is the selective source's container count times the
-number of sources (probes), instead of the sum of all sources' containers
-(`lion_cost_count_rel()`). OR leaves and an IN list that drives the groups keep their own term -
-neither is an AND source - and the GROUP BY driver's term is unchanged, because what changed in the
-executor is the intersection of the WHERE clauses and nothing else.
+### Cost model (`lion_cost_count_rel()`)
+
+The leapfrog changes two terms, and both say the same thing: only the DRIVER is read end to end.
+
+- **Containers.** An AND source's containers term is the selective source's container count times
+  the number of sources (probes), instead of the sum of all sources' containers. OR leaves and an
+  IN list that drives the groups keep their own term - neither is an AND source - and the GROUP BY
+  driver's term is unchanged, because what changed in the executor is the intersection of the WHERE
+  clauses and nothing else.
+- **Pages.** The driver pays its whole share of the index's container pages, as every source did
+  before the posting tree. Every other source pays only for the pages its probes touch, and never
+  for more than that share: it is sought, not walked.
+
+Which source drives is decided here as the executor decides it, from the MEMBERS (`lion_run_merge()`
+sums the entries' `ntids`) and not from the containers - a union of k sets lies in up to k times as
+many containers as it has container KEYS, and counting those would hand the merge to the wrong
+source. The sources are the ones the executor merges: one per OR restriction (a union is ONE source,
+§19), one per positive clause outside them, and none for an IN list that drives the groups, which is
+not intersected with anything (§15). What the driver then costs the others is its container KEYS, of
+which there are never more than the heap has.
+
+**How many pages a probed source reads.** One seek is a descent - one internal page per level plus
+the leaf the container key lives on - or, when the key is a page or two ahead, a walk right, which
+the seek takes only while it is no dearer than the descent it saves (`LION_POSTING_SEEK_STEPS`, 2
+pages). So
+
+    pages = Min(walk, probes x (height + 1))
+
+where `walk` is the source's share of the index's container pages, what it cost before this section.
+`height` is not stored anywhere the planner can reach - the meta page carries the DIRECTORY's
+height, not a per-key posting tree's - so it is derived from the fanout the tree is built with (679
+pivots to a page), which is exact for a bulk-built tree. A probed source is charged at the
+interpolated page cost of `lion_heap_page_cost()` against its own index's size, as §15's IN list
+lookups are, so a probe into an index far larger than the cache is still random I/O.
+
+Measured against the executor, counting buffer accesses on the benchmark's one-million-row `fact`
+(release build, 2026-09-22): `c2 = 1` walks its 151 container pages and touches **154** buffers.
+Probed by `c1m = 12345`, which has one container key, it touches **2** - the root and the leaf, which
+is where `height + 1` comes from. Probed by `c20k = 77`, which has a container at about 40 of the
+heap's 301 container keys, it touches **118**, against the 100 this charges and the 154 a walk
+takes: 40 descents plus the page or so of stepping each, since 40 keys leave a gap of under four
+leaves and the seek walks two of them before it gives up and descends. The estimate is therefore
+about right at both ends of the range and a little optimistic in the middle, where the leaves the
+seek crosses and abandons are what it does not count.
+
+An IN list inside an AND is k sets sought k times over, and an OR leaf is sought like any other set
+(`lion_ecursor_seek()` descends into each arm), so the bound applies per set of the source. A GROUP
+BY probes the WHERE sets once per group, so `probes` is counted over all the groups together - which
+is many times more probes than a WHERE set has pages, so the formula charges one read of each WHERE
+set and a grouped count is priced exactly as it was. That is also what it really costs: the sets a
+GROUP BY intersects with every group are copied out of the index on their second use and probed in
+memory after that (§9), so nothing but the first read is ever paid.
+
+**Measured** (2026-09-22, 1M rows of the benchmark's `fact`, 19231 heap pages all-visible, release
+build, nothing disabled - which plan the model picks IS the measurement; times are the median of
+five `EXPLAIN ANALYZE` runs of the node and of the best plan without it):
+
+    count(*) WHERE ...                     cost before -> after   chosen      node / other ms
+    c20k = 77 AND c200 = 17 AND c2 = 1       168.8 -> 117.6       BitmapAnd     0.25 / 0.88
+    c20k = 77 AND c2 = 1                     161.3 -> 110.1       node          0.25 / 0.18
+    c200 = 17 AND c20 = 3 AND c2 = 1         186.2 -> 186.2       node          0.51 / 4.41
+    c200 = 17 AND c2 = 1                     165.7 -> 165.7       node          0.60 / 9.75
+    c200 = 17                                  8.8 ->   8.8       node          0.15 / 0.43
+    c200 IN (17,18,19) AND c20 IN (3,4,5)    733.5 -> 733.5       node          2.19 / 9.73
+    c200 = 17 OR c20 = 3                     165.6 -> 165.6       node          0.41 / 26.2
+    GROUP BY c200                            906.5 -> 906.5       node          3.98 / 87.0
+    GROUP BY c20 WHERE c200 = 17             335.9 -> 335.9       node          3.16 / 8.33
+
+Only the two ANDs with a SELECTIVE source move, by a third; the IN lists, the OR, the NULL shapes,
+both GROUP BY forms and the two-column grouping are priced to the cent as they were, because in
+every one of them the driver is either the only source or has a container at nearly every container
+key. The quick benchmark at one and five million rows confirms it from the other side: no case
+changes plan and every case is at its baseline within run-to-run noise.
+
+### The open item: the node is charged for pages, its competitor for tuples
+
+`c20k = 77 AND c200 = 17 AND c2 = 1` is still NOT the node's, and it should be: 117.6 against the
+BitmapAnd's 62.1, for a count the node answers in 0.25 ms against 0.88. The remaining gap is not the
+count of pages - 100 against the 118 buffer accesses measured above - it is what a page is worth
+here. The node's 100 pages are a resident part of a 306-page index (`ix_c2` is read by every query
+that touches `c2`), charged at seq_page_cost, which stands for a page read from a DEVICE; what the
+BitmapAnd is charged is CPU per TID, 4957 of them at cpu_index_tuple_cost, for work that measurably
+takes three times longer. Per microsecond of real time the node is charged about thirty times what
+its competitor is, and no honest count of pages closes that.
+
+Two ways out, neither taken here:
+
+- **the executor could stop reading those pages.** The probes of a dense source are made by the
+  merge before it knows whether anything survives at that container key: at 40 of the 300 keys the
+  intersection of `c20k` and `c200` is already empty, and `c2` is sought - and its leaf read -
+  anyway. Seeking a source lazily, in selectivity order, with the intersection abandoned as soon as
+  the accumulator empties, would cut what this query reads to a handful of pages and the estimate
+  with it, because the estimate would then be counting probes that really happen.
+- **or the model could price a resident index page as a buffer hit.** `lion_heap_page_cost()`
+  already argues residency from `effective_cache_size`, but its floor is seq_page_cost, because for
+  HEAP pages the competing plan reads the same pages and the comparison is fair. For the container
+  pages of a small hot index it is not fair, and a third rung below seq_page_cost would say so. It
+  would have to apply to walked pages as much as to probed ones, which moves every estimate in this
+  model, so it needs its own pass over every pin in `test/sql/pushdown.sql` - the 20000-group
+  refusal of §10 and the 200x20 refusal of §20 are the ones to watch, since both are refusals the
+  node deserves.
 
 Format: LION_VERSION 5. *(Deviation: this section planned to share §21's version 4, because the two
 were meant to land in one wave; §21 shipped first, so the bump is separate. The page HEADER did not
@@ -2903,7 +3100,7 @@ does anything the section changed except write and walk one more page per multi-
   recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
   ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
 
-## 24. Multicolumn indexes: independent per-column key sets in one relation
+## 24. Multicolumn indexes: independent per-column key sets in one relation (format version 6, implemented)
 
 `CREATE INDEX ON t USING lion (a, b, c)` builds one relation whose directory holds, for each
 column, that column's keys as independent posting sets. It is order-insensitive by construction: a
@@ -2915,35 +3112,141 @@ Why one relation rather than n indexes: one build pass over the heap instead of 
 inputs from one scan), one VACUUM pass, one relcache entry and one planner IndexOptInfo, and a natural
 home for the count pushdown to find every column's posting sets without matching n indexes.
 
-Directory. The directory key becomes (column number, key): the tuplesort's sort key is
-(attno, kind, key, hash, ...) and the directory comparator compares attno first. Every entry tuple
-carries its attno (a new `uint16 attno` in the header; the header is 32 bytes today with 4 unused
-padding bytes at offset 20: use them, no size change). Reserved NULL and EMPTY entries exist per
-column. Each column has its own opclass (as today, per key column), so LionState becomes per-column:
-key type, hash, equality, comparison, collation, multi-key extraction, `ordered`. Multi-key columns
-(arrays, tsvector) are allowed alongside scalars.
+**Directory.** The directory key is (column number, key): the directory comparator compares attno
+first, and every entry tuple carries its attno in a `uint16` at offset 20 of the header, where the
+32 bytes had four of alignment padding - so the header did not grow and no item on any page moved.
+Reserved NULL and EMPTY entries exist per column. The leading attno term is compared before any
+opclass function is called, which is what lets one descent walk past the entries of columns whose
+key type it knows nothing about; the minus-infinity downlink of an internal page carries attno 0 and
+still sorts below everything.
 
-Lookup: (attno, key) descent. Entry scan for a GROUP BY: from the first entry of that attno to the
-first entry of attno+1 (a bounded leaf walk, still sorted for an ordered opclass). IN lists: per
-column. Build: one heap scan feeding one tuplesort of (attno, kind, key, hash, code) rows, n
-extracted keys per heap row (one per scalar column plus the multi-key extraction for multi-key
-columns); the sorted stream produces the directory in order, so the bulk build is unchanged apart
-from the leading attno. Insert: one aminsert call produces n key inserts (each its own posting-set
-update under the entry's directory leaf, as today); VACUUM is unchanged (chains are per entry).
-Stats: per-column `entries`, `ntids`, `null_tids`, `empty_tids`.
+Each column has its own opclass, so the cached state became two structs: `LionState` is ONE key
+column - key type, collation, hash, equality, ordering, `ordered`, multi-key extraction, plus its
+attno and a pointer back to the index - and `LionIndexState` holds the meta page and the array of
+them. `lion_get_state()` returns column 1, so every caller that predates this section compiles and
+means what it meant. A `LionSearchKey` carries the column it is searching and that column's state,
+which is what makes the comparator a pure function of (item, search key).
 
-Scans (amgetbitmap): the scan keys arrive with `sk_attno`; each key resolves to its column's posting
-set; several keys are ANDed through the expression evaluator (as multi-key queries already are).
-Count pushdown: `lion_find_roaring_index()` returns the index and the attno for a column; the WHERE
-clause / GROUP BY / IN / OR / multi-key rules are per (index, attno); a query constraining a, b and
-c of one multicolumn index becomes three posting-set sources from one index (the same as three
-indexes today, but located through one relcache entry). The cost model treats each column's set as
-it treats a single-column index of that column (its own container and page terms).
+**Lookup**: (attno, key) descent. **Entry scan** for a GROUP BY: from the first entry of that attno
+to the first entry of attno+1 - a descent to (attno, MINF), a bounded leaf walk that stops at the
+first entry of the next column, still sorted for an ordered opclass. **IN lists**: per column.
 
-Not in scope: INCLUDE columns, expression columns, per-column reloptions. `amcanmulticol` limits:
-32 columns (INDEX_MAX_KEYS); a NULL in one column does not affect the other columns' entries.
+**Build**: one heap scan feeding ONE TUPLESORT PER KEY COLUMN, drained into the shared directory in
+attno order. *(Deviation from the first draft, which said "one tuplesort of (attno, kind, key, hash,
+code)". One tuplesort needs one tuple descriptor and one sort operator per sort key, and the columns
+of a multicolumn index have DIFFERENT key types, so there is no single `key` column to describe. n
+sorts from one scan is what this section's own rationale asks for, it compares nothing across
+columns, and it keeps each column's sort keys exactly what §21 chose for that column;
+maintenance_work_mem is split between them.)* The directory order leads with the column, so the
+columns' entry runs laid end to end are already sorted and the bottom-up level builder of §21 never
+learns that more than one column exists.
 
-Format: entry header field reuse only; LION_VERSION stays 5 if a single-column version-5 index is
-bit-identical (attno = 1 written where the padding was zero: a version-5 index has zeros there, so
-treat attno 0 as 1 when reading, or bump to 6 and refuse — bump, the REINDEX hint is cheap and
-mixed semantics are not).
+**Insert**: one aminsert call produces n key inserts, each its own posting-set update under its own
+entry's directory leaf, exactly as a multi-key opclass already produced several. **VACUUM** is
+unchanged (posting sets are per entry); it carries the entry's attno next to its kind and key in the
+identity check that survives a leaf split. **Stats**: `lion_index_stats()` returns ONE ROW PER KEY
+COLUMN with a leading `attno`; entry- and posting-set-derived counters are that column's own and
+relation-wide ones (the directory's shape, free and deleted pages) are repeated on every row. A
+container page is attributed to a column through its owner_head stamp (§18) and the attno of the
+entry that owns that head, accumulated per posting set and folded in at the end; a single-column
+index skips that and attributes everything to column 1. **verify()** checks the attno of every entry
+(in range, never below the entry before it), at most one reserved NULL and one reserved EMPTY entry
+per column, and - with heapallindexed - every heap row under every key of every column.
+
+**Scans (amgetbitmap)**: the scan keys arrive with `sk_attno`; each key resolves to its column, one
+qual per column is answered (the most selective-looking one, as §15 already chose among several on
+one column) and the columns are ANDed through the expression evaluator of `lion_count.c` - the same
+evaluator a multi-key query's AND/OR tree goes through, because "the sets of a and the sets of b" is
+an AND of set trees whatever produced them. A qual the sets cannot express is DROPPED and the TIDs
+are marked for recheck, which is always correct because the bitmap heap scan re-applies the original
+quals: `IS NOT NULL` (the complement of a set), a multi-key query the extractor answers with
+LION_QMODE_ALL, and any second qual on a column. `IS NULL` per column is that column's reserved
+entry.
+
+**`amoptionalkey` is TRUE** (it was false). Without it the planner refuses any path that does not
+constrain the FIRST index column, which for independent key sets is meaningless - `WHERE b = 1` on
+`(a, b)` would not use the index at all. GIN sets it for the same reason. It also lets a PARTIAL
+index whose predicate the query implies be scanned with no quals at all, and `liongetbitmap()`
+answers that by emitting every row one key column holds, the reserved NULL entry included, with no
+recheck.
+
+**Count pushdown** (implemented, §10). `lion_find_roaring_index()` returns the index AND the key
+column for a heap column - any key column, not just the first - and the WHERE clause / GROUP BY /
+IN / OR / multi-key rules are all per (index, key column): every `opfamily[0]`, `opcintype[0]` and
+`indexcollations[0]` became `[i]`, every lookup and entry scan its `_col` form, and
+`lion_extract_query()` and the `datumCopy()` of a printed key take
+`lion_index_column_state(index, attno)`. A query constraining a, b and c of one multicolumn index
+becomes three posting-set sources from one index (the same as three indexes, but located through
+one relcache entry), and a two-column GROUP BY may take BOTH columns from one index, which is this
+section's natural use.
+
+The column does NOT travel in `custom_private`. The executor derives it in `lion_open_relation()`
+from the index it really opened and the clause's heap attnum (`lion_index_col_for()`), because a
+partition's index may order the same columns differently from the parent's - and may number the
+heap column differently too, which is resolved by name (`lion_heap_attno_in()`). So the planner has
+only to be right about WHICH index. The one thing the executor cannot derive is the driving column
+of a sum-over-all (§14), which has no group column at all: it is the column of the first
+`IS NOT NULL` clause, which is exactly the clause the planner drove from. Two `IS NOT NULL` clauses
+over one index made that distinction load-bearing - the driver's own clause is DROPPED and the
+other column's NULL set must still be subtracted, and before this the two were told apart by the
+index Oid alone.
+
+The cost model treats each column's set as it treats a single-column index of that column: the
+directory and container page terms are scaled by that column's share of the relation's entries,
+estimated from the heap columns' n_distinct (the bullet in §10 has the formula and its
+limitations). EXPLAIN prints `idx.col` for a multicolumn index and nothing for a single-column one.
+The AM-side API for all of it is `lion_index_column_state(index, attno)`, the `attno` a
+`LionPostingSet` now carries, and the `_col` forms of `lion_posting_set_lookup{,_many,_null}` and
+`lion_entry_scan_begin`; the wrappers without a column are that column being 1.
+
+One thing the node must NOT do is sum across columns. The disjoint-sum short-circuit of §15 counts
+the entries of a union separately and adds them up, which is only the count of the union because
+the entries of one SCALAR key column are disjoint; two COLUMNS of one index are not, and
+`lion_sources_disjoint_sum()` refuses a source whose sets differ in attno for that reason. Nothing
+in the pushdown can build such a source today - only an IN list is marked `disjoint`, and one
+clause is one column - but an OR across two columns of one index is exactly the shape the guard is
+about, and `test/sql/multicolumn.sql` pins it from both ends: the count equals the union and not
+the sum, and EXPLAIN ANALYZE reports no posting set summed.
+
+**Not in scope**: INCLUDE columns (`amcaninclude` is false and core refuses them) and per-column
+reloptions. `amcanmulticol` limits: 32 columns (INDEX_MAX_KEYS, core's own error); a NULL in one
+column does not affect the other columns' entries. *(Deviation: expression columns and duplicate
+columns were listed as out of scope and turned out to need no code at all - the column number an
+entry carries is the INDEX column's, never a heap attribute's - so both work and
+`test/sql/multicolumn.sql` pins that rather than an error.)*
+
+**Format**: LION_VERSION 6. Reading a version 5 index by treating attno 0 as 1 was considered and
+rejected: the two formats would then be told apart by a field that means "column one" in one of them
+and "no column at all" in the other. A version 5 index is refused with the same REINDEX hint every
+earlier version gets.
+
+### Measured (2026-09-22, 1M rows of the quick-v3 scalar heap, assert build)
+
+One 3-column lion index on `(c2, c200, c20k)` against three single-column lion indexes on the same
+columns and against three btrees, plus 10,000 inserts with each portfolio in place:
+
+| portfolio | build | size | insert 10k rows |
+| --- | --- | --- | --- |
+| lion, one 3-column index | 3.01 s | 15532032 (15 MB) | 0.41 s |
+| lion, three single-column indexes | 3.07 s | 15572992 (15 MB) | 0.41 s |
+| btree, three single-column indexes | 1.48 s | 21135360 (20 MB) | 0.12 s |
+| btree, one 3-column index | 1.99 s | 30711808 (29 MB) | - |
+
+The two lion portfolios are the same index in one relation or in three: the same entries, the same
+posting sets, the same page count to within 40 KB (three meta pages and three roots instead of one),
+and neither the build nor the insert path can tell them apart, which is the point - the win is one
+heap scan, one VACUUM, one relcache entry and one IndexOptInfo, not a denser index. What a 3-column
+BTREE costs by comparison is the composite key it stores: twice the size of all three lion columns
+together, for an index that answers one leading-column order.
+
+*(Numbers from an assertion-enabled server, so they are comparable with each other and not with a
+release build.)*
+
+### Not done in this version
+
+Per-column reloptions. A cost model that knows a column's real ENTRY count: the page terms are
+scaled by the column's share of the heap columns' n_distinct, which is the right order of magnitude
+for a scalar column and an underestimate for a multi-key one (one entry per lexeme, not per value),
+and the directory HEIGHT is still the whole relation's. Reading a column's entry count off the meta
+page - one counter per column, maintained by build and by insert - would remove both
+approximations, and `lion_index_stats()` already computes it the expensive way.

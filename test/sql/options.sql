@@ -95,8 +95,12 @@ SELECT pg_relation_size('lion_opt_inl_d') < pg_relation_size('lion_opt_inl_s')
 	   AS inline_is_smaller;
 DROP TABLE lion_opt_inl;
 
--- Things a lion index cannot do.
+-- Multicolumn indexes are supported since DESIGN.md §24; test/sql/multicolumn.sql
+-- is where they are exercised.  Here just prove the DDL is accepted.
 CREATE INDEX ON lion_opt USING lion (k, t);
+DROP INDEX lion_opt_k_t_idx;
+
+-- Things a lion index cannot do.
 CREATE INDEX ON lion_opt USING lion (k) INCLUDE (t);
 CREATE INDEX ON lion_opt USING lion (k DESC);
 CREATE INDEX ON lion_opt USING lion (k NULLS FIRST);

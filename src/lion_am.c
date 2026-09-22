@@ -142,8 +142,16 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amconsistentordering = false,
 		.amcanbackward = false,
 		.amcanunique = false,
-		.amcanmulticol = false,
-		.amoptionalkey = false,
+		.amcanmulticol = true,	/* DESIGN.md §24 */
+		/*
+		 * DESIGN.md §24: the key columns are INDEPENDENT key sets, so a query
+		 * that constrains only the second one is as good as one that
+		 * constrains the first - which is what this flag tells the planner,
+		 * exactly as GIN does.  It also lets a PARTIAL index whose predicate
+		 * the query implies be scanned with no quals at all, and
+		 * liongetbitmap() answers that by emitting every row the index holds.
+		 */
+		.amoptionalkey = true,
 		.amsearcharray = true,
 		.amsearchnulls = true,
 		/* multi-key opclasses store the KEY type, not the column type (§17) */
@@ -235,11 +243,11 @@ lion_cost_strip(Node *node)
  * The presence of support function 2 is the same test lion_fill_state() makes.
  */
 static bool
-lion_index_is_multikey(IndexOptInfo *index)
+lion_index_is_multikey(IndexOptInfo *index, int col)
 {
-	return OidIsValid(get_opfamily_proc(index->opfamily[0],
-										index->opcintype[0],
-										index->opcintype[0],
+	return OidIsValid(get_opfamily_proc(index->opfamily[col],
+										index->opcintype[col],
+										index->opcintype[col],
 										LION_EXTRACTVALUE_PROC));
 }
 
@@ -253,7 +261,7 @@ lion_index_is_multikey(IndexOptInfo *index)
  * as the expensive answer.
  */
 static bool
-lion_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
+lion_query_is_full_scan(IndexOptInfo *index, int col, StrategyNumber strategy,
 					   Datum query)
 {
 	Oid			proc;
@@ -264,8 +272,8 @@ lion_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 	MemoryContext oldcxt;
 	bool		full;
 
-	proc = get_opfamily_proc(index->opfamily[0], index->opcintype[0],
-							 index->opcintype[0], LION_EXTRACTQUERY_PROC);
+	proc = get_opfamily_proc(index->opfamily[col], index->opcintype[col],
+							 index->opcintype[col], LION_EXTRACTQUERY_PROC);
 	if (!OidIsValid(proc))
 		return true;
 
@@ -276,7 +284,7 @@ lion_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 
 	memset(&state, 0, sizeof(state));
 	state.multikey = true;
-	state.collation = index->indexcollations[0];
+	state.collation = index->indexcollations[col];
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
 
@@ -296,8 +304,8 @@ lion_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
  * assumed to contain such an element.
  */
 static bool
-lion_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
-							 Node *arraynode)
+lion_array_query_is_full_scan(IndexOptInfo *index, int col,
+							 StrategyNumber strategy, Node *arraynode)
 {
 	Const	   *con = (Const *) arraynode;
 	ArrayType  *arr;
@@ -326,7 +334,7 @@ lion_array_query_is_full_scan(IndexOptInfo *index, StrategyNumber strategy,
 	{
 		if (nulls[i])
 			continue;			/* never true, nothing is scanned for it */
-		full = lion_query_is_full_scan(index, strategy, elems[i]);
+		full = lion_query_is_full_scan(index, col, strategy, elems[i]);
 	}
 
 	pfree(elems);
@@ -376,21 +384,33 @@ static bool
 lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 {
 	IndexOptInfo *index = path->indexinfo;
-	Node	   *chosen = NULL;
-	int			bestrank = 3;
+	Node	   *chosen[INDEX_MAX_KEYS];
+	int			bestrank[INDEX_MAX_KEYS];
+	int			ncols = index->nkeycolumns;
+	int			nchosen = 0;
+	int			firstcol = -1;
+	bool		anyselective = false;
 	ListCell   *lc;
+	int			c;
 
 	*emits_all_rows = false;
 
-	if (index->nkeycolumns != 1)
+	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
 		return false;
+
+	for (c = 0; c < ncols; c++)
+	{
+		chosen[c] = NULL;
+		bestrank[c] = 3;
+	}
 
 	foreach(lc, path->indexclauses)
 	{
 		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		int			col = iclause->indexcol;
 		ListCell   *lc2;
 
-		if (iclause->indexcol != 0)
+		if (col < 0 || col >= ncols)
 			continue;
 
 		foreach(lc2, iclause->indexquals)
@@ -408,73 +428,110 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 			else
 				continue;
 
-			if (rank < bestrank)
+			if (rank < bestrank[col])
 			{
-				bestrank = rank;
-				chosen = clause;
+				bestrank[col] = rank;
+				chosen[col] = clause;
 			}
 		}
 	}
 
-	if (chosen == NULL)
-		return false;
-
-	if (IsA(chosen, NullTest))
-		return ((NullTest *) chosen)->nulltesttype == IS_NOT_NULL;
-
-	/* A scalar opclass looks ONE key up, whatever the operator's operand. */
-	if (!lion_index_is_multikey(index))
-		return false;
-
-	if (IsA(chosen, OpExpr))
+	/*
+	 * Per column, would that column alone make the scan walk the whole
+	 * column's entries?  The answers combine the way the scan does
+	 * (DESIGN.md §24): the columns are INTERSECTED, so one column that
+	 * selects from its posting sets keeps the scan off the full walk however
+	 * the others are answered - liongetbitmap() drops those and rechecks.
+	 */
+	for (c = 0; c < ncols; c++)
 	{
-		OpExpr	   *op = (OpExpr *) chosen;
-		StrategyNumber strategy;
-		Node	   *arg;
+		bool		colfull;
+		bool		colall = false;
+		Node	   *cl = chosen[c];
 
-		*emits_all_rows = true;
-		if (list_length(op->args) != 2)
-			return true;
-		strategy = (StrategyNumber) get_op_opfamily_strategy(op->opno,
-															index->opfamily[0]);
-		if (strategy == 0)
-			return true;
-		arg = lion_cost_strip((Node *) lsecond(op->args));
-		if (arg == NULL || !IsA(arg, Const))
-			return true;
-		if (((Const *) arg)->constisnull)
+		if (cl == NULL)
+			continue;
+		nchosen++;
+		if (firstcol < 0)
+			firstcol = c;
+
+		if (IsA(cl, NullTest))
+			colfull = (((NullTest *) cl)->nulltesttype == IS_NOT_NULL);
+		else if (!lion_index_is_multikey(index, c))
 		{
-			/* a strict operator: never true, so nothing is scanned */
-			*emits_all_rows = false;
-			return false;
+			/* A scalar opclass looks ONE key up, whatever the operand. */
+			colfull = false;
 		}
-		if (lion_query_is_full_scan(index, strategy,
-								   ((Const *) arg)->constvalue))
-			return true;
-		*emits_all_rows = false;
-		return false;
+		else if (IsA(cl, OpExpr))
+		{
+			OpExpr	   *op = (OpExpr *) cl;
+			StrategyNumber strategy;
+			Node	   *arg;
+
+			colall = true;
+			colfull = true;
+			if (list_length(op->args) == 2 &&
+				(strategy = (StrategyNumber)
+				 get_op_opfamily_strategy(op->opno, index->opfamily[c])) != 0 &&
+				(arg = lion_cost_strip((Node *) lsecond(op->args))) != NULL &&
+				IsA(arg, Const))
+			{
+				if (((Const *) arg)->constisnull)
+				{
+					/* a strict operator: never true, so nothing is scanned */
+					colall = false;
+					colfull = false;
+				}
+				else if (!lion_query_is_full_scan(index, c, strategy,
+												  ((Const *) arg)->constvalue))
+				{
+					colall = false;
+					colfull = false;
+				}
+			}
+		}
+		else
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) cl;
+			StrategyNumber strategy;
+
+			colall = true;
+			colfull = true;
+			if (list_length(saop->args) == 2 &&
+				(strategy = (StrategyNumber)
+				 get_op_opfamily_strategy(saop->opno,
+										  index->opfamily[c])) != 0 &&
+				(strategy == LION_STRAT_EQUAL ||
+				 !lion_array_query_is_full_scan(index, c, strategy,
+												lion_cost_strip((Node *) lsecond(saop->args)))))
+			{
+				/* a union of single-key lookups, or of exact queries */
+				colall = false;
+				colfull = false;
+			}
+		}
+
+		if (!colfull)
+			anyselective = true;
+		else if (c == firstcol)
+			*emits_all_rows = colall;
 	}
 
+	/*
+	 * No clause at all: a partial index whose predicate the query implies,
+	 * which liongetbitmap() answers by emitting every row it holds.  The rows
+	 * are exactly the ones the scan selects, so the heap side keeps the
+	 * predicate's own selectivity (*emits_all_rows stays false).
+	 */
+	if (nchosen == 0)
+		return true;
+	if (anyselective)
 	{
-		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) chosen;
-		StrategyNumber strategy;
-
-		*emits_all_rows = true;
-		if (list_length(saop->args) != 2)
-			return true;
-		strategy = (StrategyNumber) get_op_opfamily_strategy(saop->opno,
-															index->opfamily[0]);
-		if (strategy == 0)
-			return true;
-		if (strategy != LION_STRAT_EQUAL &&
-			lion_array_query_is_full_scan(index, strategy,
-										 lion_cost_strip((Node *) lsecond(saop->args))))
-			return true;
-
-		/* a union of single-key lookups, or of exact multi-key queries */
 		*emits_all_rows = false;
 		return false;
 	}
+
+	return true;
 }
 
 /*

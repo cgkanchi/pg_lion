@@ -172,7 +172,7 @@ typedef struct LionVacState
 {
 	Relation	index;
 	Relation	heaprel;		/* what page reuse needs, may be NULL */
-	LionState   *state;
+	LionIndexState *ix;
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
 	IndexBulkDeleteResult *stats;
@@ -240,6 +240,7 @@ typedef struct LionVacEntry
 	bool		maydelete;		/* its posting set was emptied by pass 1/2 */
 	uint32		hash;
 	BlockNumber head;
+	uint16		attno;			/* its key column (DESIGN.md §24) */
 	int			kind;			/* LION_KIND_* */
 	uint16		keylen;
 	char	   *keydata;
@@ -409,7 +410,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	memset(&vs, 0, sizeof(vs));
 	vs.index = index;
 	vs.heaprel = info->heaprel;
-	vs.state = lion_get_state(index);
+	vs.ix = lion_get_index_state(index);
 	vs.callback = callback;
 	vs.callback_state = callback_state;
 	vs.stats = stats;
@@ -440,7 +441,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * moves entries only onto a brand new page immediately to its right, and
 	 * the walk has not passed that one yet.
 	 */
-	blk = lion_dir_leftmost_leaf(index, vs.state);
+	blk = lion_dir_leftmost_leaf(index, vs.ix);
 	while (BlockNumberIsValid(blk))
 	{
 		BlockNumber next;
@@ -614,7 +615,7 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	 * TIDs have to leave the page under this cleanup lock - and the final
 	 * step for this page then deletes it.
 	 */
-	if (res->paylen <= (Size) vs->state->meta.inline_limit && need <= itemsz)
+	if (res->paylen <= (Size) vs->ix->meta.inline_limit && need <= itemsz)
 	{
 		res->writesz = (itemsz - need <= LION_ENTRY_SLACK_BOUND) ? itemsz : need;
 		res->tuple = (LionEntryTuple *) palloc0(res->writesz);
@@ -633,7 +634,7 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	 * pages exactly as an insert would.  Try the plain overwrite first; the
 	 * spill is decided when that fails.
 	 */
-	if (res->paylen <= (Size) vs->state->meta.inline_limit)
+	if (res->paylen <= (Size) vs->ix->meta.inline_limit)
 	{
 		res->tuple = lion_entry_rebuild(entry, res->payload, res->paylen,
 									   &res->writesz);
@@ -664,6 +665,8 @@ lion_vac_entry_matches(Page page, OffsetNumber off, const LionVacEntry *ent)
 	e = (LionEntryTuple *) PageGetItem(page, iid);
 	if (LionEntryIsPivot(e))
 		return false;
+	if (e->attno != ent->attno)
+		return false;			/* another key column (DESIGN.md §24) */
 	if (lion_entry_kind(e) != ent->kind || e->keylen != ent->keylen)
 		return false;
 
@@ -731,11 +734,12 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 							 (ent->kind == LION_KIND_EMPTY) ? LION_ENTRY_EMPTYKEY :
 							 0);
 	probe->keylen = ent->keylen;
+	probe->attno = ent->attno;
 	if (ent->keylen > 0)
 		memcpy(LionEntryGetKey(probe), ent->keydata, ent->keylen);
-	lion_search_key_exact(vs->state, &sk, probe);
+	lion_search_key_exact(vs->ix, &sk, probe);
 
-	if (!lion_dir_find(vs->index, vs->heaprel, vs->state, &sk,
+	if (!lion_dir_find(vs->index, vs->heaprel, vs->ix, &sk,
 					   BUFFER_LOCK_SHARE, false, &buf, &off, NULL))
 	{
 		if (BufferIsValid(buf))
@@ -830,6 +834,7 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		ent->hash = entry->hash;
 		ent->head = entry->head;
 		ent->maydelete = false;
+		ent->attno = entry->attno;
 		ent->kind = lion_entry_kind(entry);
 		ent->keylen = entry->keylen;
 		ent->keydata = NULL;

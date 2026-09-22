@@ -340,8 +340,10 @@ typedef struct LionProbe
 static void
 lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 {
-	Oid			opfamily = index->rd_opfamily[0];
-	Oid			opcintype = index->rd_opcintype[0];
+	/* The opclass of the KEY COLUMN this probe is for (DESIGN.md §24). */
+	int			ci = state->attno - 1;
+	Oid			opfamily = index->rd_opfamily[ci];
+	Oid			opcintype = index->rd_opcintype[ci];
 	Oid			eqopr;
 	Oid			hashproc;
 
@@ -511,6 +513,7 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
+	ps->attno = entry->attno;
 	ps->pinbuf = InvalidBuffer;
 	ps->found = true;
 	ps->ntids = entry->ntids;
@@ -637,6 +640,7 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
+	ps->attno = state->attno;
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
 	ps->entryblk = InvalidBlockNumber;
@@ -644,7 +648,7 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 
 	lion_probe_search_key(state, probe, key, hash, &sk);
 
-	if (!lion_dir_find(index, NULL, state, &sk, BUFFER_LOCK_SHARE, false,
+	if (!lion_dir_find(index, NULL, state->ix, &sk, BUFFER_LOCK_SHARE, false,
 					   &buf, &off, NULL))
 	{
 		if (BufferIsValid(buf))
@@ -657,10 +661,10 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 }
 
 bool
-lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
-					   LionPostingSet *ps)
+lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
+						   Oid keytype, LionPostingSet *ps)
 {
-	LionState   *state = lion_get_state(index);
+	LionState   *state = lion_index_column_state(index, attno);
 	LionProbe	probe;
 	uint32		hash;
 
@@ -711,11 +715,12 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * nfound == 0 means the union selects nothing.
  */
 int
-lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
-							const Datum *values, const bool *isnull,
-							LionPostingSet *sets, int *nfound)
+lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
+								int nvalues, const Datum *values,
+								const bool *isnull, LionPostingSet *sets,
+								int *nfound)
 {
-	LionState   *state = lion_get_state(index);
+	LionState   *state = lion_index_column_state(index, attno);
 	LionProbe	probe;
 	LionProbeSort sortctx;
 	LionProbeKey *probes;
@@ -803,6 +808,7 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 
 		memset(&sets[nsets], 0, sizeof(LionPostingSet));
 		sets[nsets].index = index;
+		sets[nsets].attno = state->attno;
 		sets[nsets].pinbuf = InvalidBuffer;
 		sets[nsets].head = InvalidBlockNumber;
 		sets[nsets].entryblk = InvalidBlockNumber;
@@ -819,8 +825,9 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 				UnlockReleaseBuffer(buf);
 				buf = InvalidBuffer;
 			}
-			located = lion_dir_find(index, NULL, state, &sk, BUFFER_LOCK_SHARE,
-									false, &buf, &off, NULL);
+			located = lion_dir_find(index, NULL, state->ix, &sk,
+									BUFFER_LOCK_SHARE, false, &buf, &off,
+									NULL);
 		}
 		else
 		{
@@ -833,7 +840,7 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 				Page		page = BufferGetPage(buf);
 
 				if (LionPageIsRightmost(page) ||
-					lion_cmp_entry(state, lion_dir_highkey(page), &sk) > 0)
+					lion_cmp_entry(lion_dir_highkey(page), &sk) > 0)
 					break;
 				if (steps >= LION_LOOKUP_WALK_MAX)
 				{
@@ -845,12 +852,12 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 			}
 
 			if (!BufferIsValid(buf))
-				buf = lion_dir_search(index, NULL, state, &sk,
+				buf = lion_dir_search(index, NULL, state->ix, &sk,
 									  BUFFER_LOCK_SHARE, false, &off);
 			else
-				off = lion_dir_binsrch(state, BufferGetPage(buf), &sk);
+				off = lion_dir_binsrch(BufferGetPage(buf), &sk);
 
-			located = lion_dir_scan_run(index, state, &sk, BUFFER_LOCK_SHARE,
+			located = lion_dir_scan_run(index, &sk, BUFFER_LOCK_SHARE,
 										&buf, &off, NULL);
 		}
 
@@ -918,14 +925,16 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
  * included - is identical to a real key's.
  */
 bool
-lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
+lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
+								LionPostingSet *ps)
 {
-	LionState   *state = lion_get_state(index);
+	LionState   *state = lion_index_column_state(index, attno);
 	Buffer		buf;
 	OffsetNumber off;
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
+	ps->attno = state->attno;
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
 	ps->entryblk = InvalidBlockNumber;
@@ -3782,6 +3791,7 @@ lion_sources_disjoint_sum(int nsources, const LionCountSource *sources)
 {
 	const LionCountSource *src = &sources[0];
 	Relation	index = NULL;
+	AttrNumber	attno = 0;
 	int			i;
 
 	if (nsources != 1)
@@ -3798,14 +3808,19 @@ lion_sources_disjoint_sum(int nsources, const LionCountSource *sources)
 		if (!src->sets[i].found)
 			continue;
 		if (index == NULL)
+		{
 			index = src->sets[i].index;
+			attno = (AttrNumber) src->sets[i].attno;
+		}
 		else if (src->sets[i].index != index)
 			return false;		/* entries of two indexes are not disjoint */
+		else if ((AttrNumber) src->sets[i].attno != attno)
+			return false;		/* nor are two COLUMNS of one index (§24) */
 	}
 	if (index == NULL)
 		return false;
 
-	return !lion_get_state(index)->multikey;
+	return !lion_index_column_state(index, attno)->multikey;
 }
 
 /*
@@ -4251,9 +4266,9 @@ lion_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * nkeys);
 
 	for (i = 0; i < nkeys; i++)
-		lion_posting_set_lookup(indexes[i], keys[i],
-							   keytypes ? keytypes[i] : InvalidOid,
-							   &sets[i]);
+		lion_posting_set_lookup_col(indexes[i], 1, keys[i],
+								   keytypes ? keytypes[i] : InvalidOid,
+								   &sets[i]);
 
 	result = lion_count_posting_sets(heap, snapshot, nkeys, sets, stats);
 
@@ -4270,20 +4285,30 @@ lion_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
  * --------------------------------------------------------------------- */
 
 void
-lion_entry_scan_begin(LionEntryScan *es, Relation index)
+lion_entry_scan_begin_col(LionEntryScan *es, Relation index, AttrNumber attno)
 {
 	es->index = index;
-	es->state = lion_get_state(index);
-	es->blkno = lion_dir_leftmost_leaf(index, es->state);
-	es->haslast = false;
-	es->lastkind = LION_KIND_MINF;
-	es->lasthash = 0;
-	es->lastkey = NULL;
-	es->lastkeylen = 0;
-	es->onpage = 0;
+	es->state = lion_index_column_state(index, attno);
+	es->attno = es->state->attno;
 	es->cxt = AllocSetContextCreate(CurrentMemoryContext,
 									"lion entry scan position",
 									ALLOCSET_SMALL_SIZES);
+
+	/*
+	 * The walk starts at (attno, MINF), a position below every entry of this
+	 * column and above every entry of the columns before it, and ends at the
+	 * first entry whose attno is not this one (DESIGN.md §24).  MINF is not a
+	 * kind any stored entry has, so "resume after the last key returned" -
+	 * which is what every later call does - starts at the column's first
+	 * entry without a special case.
+	 */
+	es->lastkind = LION_KIND_MINF;
+	es->lasthash = 0;
+	es->lastkeylen = 0;
+	es->lastkey = (char *) MemoryContextAllocZero(es->cxt, 1);
+	es->haslast = true;
+	es->blkno = lion_dir_column_first(index, es->state, NULL);
+	es->onpage = 0;
 	es->done = false;
 }
 
@@ -4366,6 +4391,8 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 
 		if (es->haslast)
 		{
+			sk.attno = es->attno;
+			sk.col = state;
 			sk.kind = es->lastkind;
 			sk.key = (es->lastkind == LION_KIND_VALUE) ?
 				lion_fetch_key(state, es->lastkey) : (Datum) 0;
@@ -4381,7 +4408,7 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 			 * a split of the page we were on looks like from here.
 			 */
 			if (!LionPageIsRightmost(page) &&
-				lion_cmp_entry(state, lion_dir_highkey(page), &sk) <= 0)
+				lion_cmp_entry(lion_dir_highkey(page), &sk) <= 0)
 			{
 				next = LionPageGetOpaque(page)->rightlink;
 				UnlockReleaseBuffer(buf);
@@ -4391,9 +4418,9 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 				continue;
 			}
 
-			off = lion_dir_binsrch(state, page, &sk);
+			off = lion_dir_binsrch(page, &sk);
 			while (off <= PageGetMaxOffsetNumber(page) &&
-				   lion_cmp_entry(state, lion_page_entry(page, off), &sk) <= 0)
+				   lion_cmp_entry(lion_page_entry(page, off), &sk) <= 0)
 				off = OffsetNumberNext(off);
 		}
 		else
@@ -4410,6 +4437,18 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 			if (!ItemIdIsUsed(iid))
 				continue;
 			entry = (LionEntryTuple *) PageGetItem(page, iid);
+
+			/*
+			 * The walk is bounded to one key column (DESIGN.md §24): the
+			 * entries are sorted by attno, so the first entry of the next
+			 * column ends the scan.
+			 */
+			if (entry->attno != es->attno)
+			{
+				UnlockReleaseBuffer(buf);
+				es->done = true;
+				return false;
+			}
 
 			/*
 			 * An entry whose posting set is empty can never produce a group.
@@ -4494,7 +4533,8 @@ typedef struct LionCountCall
  */
 static void
 lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
-					   const Oid *keytype, LionCountCall *call)
+					   const Oid *keytype, AttrNumber wantcol,
+					   LionCountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	int			i;
@@ -4543,11 +4583,27 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("index \"%s\" is not a lion index",
 							RelationGetRelationName(index))));
-		if (IndexRelationGetNumberOfKeyAttributes(index) != 1)
+		/*
+		 * wantcol = 0 means the caller names an index and a key but no COLUMN,
+		 * so a multicolumn index (DESIGN.md §24) has nothing to tell it which
+		 * key set is meant.  The planner's pushdown has the column from the
+		 * clause and is not restricted this way.
+		 */
+		if (wantcol == 0)
+		{
+			if (IndexRelationGetNumberOfKeyAttributes(index) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("lion index \"%s\" has %d key columns, and this function needs exactly one",
+								RelationGetRelationName(index),
+								IndexRelationGetNumberOfKeyAttributes(index))));
+		}
+		else if (wantcol < 1 ||
+				 wantcol > IndexRelationGetNumberOfKeyAttributes(index))
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("lion index \"%s\" must have exactly one key column",
-							RelationGetRelationName(index))));
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("lion index \"%s\" has no key column %d",
+							RelationGetRelationName(index), wantcol)));
 
 		/*
 		 * The key must be the index's own type, or a type the opfamily can
@@ -4579,13 +4635,20 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	{
 		for (i = 0; i < nidx; i++)
 		{
-			AttrNumber	attnum = call->index[i]->rd_index->indkey.values[0];
+			Relation	index = call->index[i];
+			int			c;
 
-			if (pg_attribute_aclcheck(heapoid, attnum, GetUserId(),
-									  ACL_SELECT) != ACLCHECK_OK)
-				aclcheck_error(ACLCHECK_NO_PRIV,
-							   get_relkind_objtype(call->heap->rd_rel->relkind),
-							   RelationGetRelationName(call->heap));
+			/* EVERY key column is referenced, not just the first (§24). */
+			for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
+			{
+				AttrNumber	attnum = index->rd_index->indkey.values[c];
+
+				if (pg_attribute_aclcheck(heapoid, attnum, GetUserId(),
+										  ACL_SELECT) != ACLCHECK_OK)
+					aclcheck_error(ACLCHECK_NO_PRIV,
+								   get_relkind_objtype(call->heap->rd_rel->relkind),
+								   RelationGetRelationName(call->heap));
+			}
 		}
 	}
 
@@ -4647,7 +4710,7 @@ lion_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 			elog(ERROR, "could not determine the type of the search key");
 	}
 
-	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, call);
+	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, 0, call);
 
 	for (i = 0; i < nkeys; i++)
 		call->key[i] = key[i];
@@ -4773,7 +4836,7 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
-	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &call);
+	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, 0, &call);
 	PredicateLockRelation(call.index[0], snapshot);
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
@@ -4781,8 +4844,9 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 					  &elems, &nulls, &nelems);
 
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
-	nsets = lion_posting_set_lookup_many(call.index[0], elemtype, nelems,
-										elems, nulls, sets, &nfound);
+	nsets = lion_posting_set_lookup_many_col(call.index[0], 1, elemtype,
+											nelems, elems, nulls, sets,
+											&nfound);
 
 	/* An empty array, an all-NULL one, or no listed value with an entry. */
 	if (nfound > 0)
@@ -4828,6 +4892,7 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 {
 	Oid			idxoid = PG_GETARG_OID(0);
 	bool		usecache = PG_GETARG_BOOL(1);
+	AttrNumber	attno = (AttrNumber) PG_GETARG_INT16(2);
 	LionCountCall call;
 	Snapshot	snapshot;
 	LionCountStats stats;
@@ -4849,23 +4914,23 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
-	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, &call);
+	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, attno, &call);
 
 	/*
 	 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted key,
 	 * so its entries are not column values and a row appears under several of
 	 * them: the sum over the entries is not a row count and neither is any
 	 * single entry a group.  lion_customscan.c refuses to drive a GROUP BY
-	 * from such an index for the same reason.
+	 * from such a column for the same reason.
 	 */
-	if (OidIsValid(get_opfamily_proc(call.index[0]->rd_opfamily[0],
-									 call.index[0]->rd_opcintype[0],
-									 call.index[0]->rd_opcintype[0],
+	if (OidIsValid(get_opfamily_proc(call.index[0]->rd_opfamily[attno - 1],
+									 call.index[0]->rd_opcintype[attno - 1],
+									 call.index[0]->rd_opcintype[attno - 1],
 									 LION_EXTRACTVALUE_PROC)))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("index \"%s\" has a multi-key operator class, whose entries are not column values",
-						RelationGetRelationName(call.index[0]))));
+				 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
+						attno, RelationGetRelationName(call.index[0]))));
 
 	PredicateLockRelation(call.index[0], snapshot);
 
@@ -4876,7 +4941,7 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 								   "lion index group count",
 								   ALLOCSET_SMALL_SIZES);
 
-	lion_entry_scan_begin(&es, call.index[0]);
+	lion_entry_scan_begin_col(&es, call.index[0], attno);
 
 	for (;;)
 	{

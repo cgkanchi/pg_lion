@@ -23,6 +23,23 @@
  * the build changes, because the sort orders the codes of each key
  * ascending either way.
  *
+ * A MULTICOLUMN index (DESIGN.md §24) is ONE heap scan feeding ONE TUPLESORT
+ * PER KEY COLUMN, and the directory is then built from the sorts in column
+ * order: the directory order leads with the column number, so the entries of
+ * column 1 followed by the entries of column 2 are already the order the
+ * leaves want, and the bottom-up level builder never has to know that more
+ * than one column exists.
+ *
+ * *(Deviation from the first draft of §24, which said "one tuplesort of
+ * (attno, kind, key, hash, code) rows".  One tuplesort needs one tuple
+ * descriptor and one sort operator per sort key, and the columns of a
+ * multicolumn index have DIFFERENT key types - int4, text, an array's element
+ * type - so there is no `key` column to describe.  n sorts fed by one scan is
+ * what §24's own rationale asks for ("n tuplesort inputs from one scan"), it
+ * compares nothing across columns, and it keeps each column's sort keys
+ * exactly what §21 chose for it.  maintenance_work_mem is split between
+ * them.)*
+ *
  * Every page is written through the bulk-write API (storage/bulk_write.h),
  * which is what nbtree and GiST builds use: pages are prepared in
  * backend-local memory, written straight to the file without going through
@@ -190,23 +207,35 @@ typedef struct LionBuildLevel
 	struct LionBuildLevel *parent;
 } LionBuildLevel;
 
+/*
+ * One key column's input to the build (DESIGN.md §24): its own tuplesort, fed
+ * by the one heap scan and drained into the shared directory when the columns
+ * before it are done.
+ */
+typedef struct LionBuildCol
+{
+	LionState  *state;			/* the column's state, from bs->ix */
+	bool		multikey;		/* the opclass extracts keys (DESIGN.md §17) */
+	Tuplesortstate *sortstate;
+	TupleDesc	sorttupdesc;
+	TupleTableSlot *inslot;
+	TupleTableSlot *outslot;
+} LionBuildCol;
+
 typedef struct LionBuildState
 {
 	Relation	index;
-	LionState	state;
+	LionIndexState ix;			/* every key column's state (DESIGN.md §24) */
 	uint32		inline_limit;
 	int			fillfactor;
 	Size		leafbudget;		/* bytes of a page ambuild fills */
 
 	Size		dirbudget;		/* ... and of an internal one (§21) */
 
-	bool		multikey;		/* the opclass extracts keys (DESIGN.md §17) */
 	int			max_entries;	/* cardinality guard, 0 = unlimited */
 
-	Tuplesortstate *sortstate;
-	TupleDesc	sorttupdesc;
-	TupleTableSlot *inslot;
-	TupleTableSlot *outslot;
+	LionBuildCol *cols;			/* [ix.ncolumns] */
+	LionBuildCol *cur;			/* the column being drained, or NULL */
 
 	MemoryContext buildctx;		/* lives for the whole build */
 	MemoryContext tmpctx;		/* reset per heap tuple / per key group */
@@ -322,6 +351,8 @@ lion_build_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 	p->keylen = (uint16) keylen;
 	p->head = child;
 	p->tail = InvalidBlockNumber;
+	/* A pivot routes to the column its source key belongs to (§24). */
+	p->attno = (src != NULL) ? src->attno : 0;
 	if (keylen > 0)
 		memcpy(LionEntryGetKey(p), LionEntryGetKey(src), keylen);
 
@@ -573,10 +604,11 @@ static LionBuilder *
 lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 {
 	LionBuilder *b = (LionBuilder *) palloc0(sizeof(LionBuilder));
+	LionState  *cs = bs->cur->state;
 
 	b->keykind = keykind;
 	b->key = (keykind != LION_KEY_REAL) ? (Datum) 0 :
-		datumCopy(key, bs->state.typbyval, bs->state.typlen);
+		datumCopy(key, cs->typbyval, cs->typlen);
 	b->hash = hash;
 	/*
 	 * The stored bytes, which are the tail of the directory order
@@ -586,9 +618,9 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 	 */
 	if (keykind == LION_KEY_REAL)
 	{
-		b->rawlen = lion_key_datum_size(&bs->state, b->key);
+		b->rawlen = lion_key_datum_size(cs, b->key);
 		b->rawkey = (char *) palloc(b->rawlen);
-		lion_store_key(&bs->state, b->key, b->rawkey);
+		lion_store_key(cs, b->key, b->rawkey);
 	}
 	b->cur = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	b->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
@@ -1005,9 +1037,10 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 			lion_builder_finish_tree(bs, b);
 
 		entry = (b->keykind != LION_KEY_REAL) ?
-			lion_make_reserved_entry(lion_reserved_flag(b->keykind),
+			lion_make_reserved_entry((AttrNumber) bs->cur->state->attno,
+									lion_reserved_flag(b->keykind),
 									LION_ENTRY_CHAIN, NULL, 0, &size) :
-			lion_make_entry(&bs->state, b->key, b->hash, LION_ENTRY_CHAIN,
+			lion_make_entry(bs->cur->state, b->key, b->hash, LION_ENTRY_CHAIN,
 						   NULL, 0, &size);
 		entry->head = b->head;
 		entry->tail = b->curblk;
@@ -1015,10 +1048,11 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 	else
 	{
 		entry = (b->keykind != LION_KEY_REAL) ?
-			lion_make_reserved_entry(lion_reserved_flag(b->keykind),
+			lion_make_reserved_entry((AttrNumber) bs->cur->state->attno,
+									lion_reserved_flag(b->keykind),
 									LION_ENTRY_INLINE, b->inlinebuf,
 									b->inlineused, &size) :
-			lion_make_entry(&bs->state, b->key, b->hash, LION_ENTRY_INLINE,
+			lion_make_entry(bs->cur->state, b->key, b->hash, LION_ENTRY_INLINE,
 						   b->inlinebuf, b->inlineused, &size);
 	}
 
@@ -1039,6 +1073,7 @@ static int
 lion_builder_cmp(const void *a, const void *b, void *arg)
 {
 	LionBuildState *bs = (LionBuildState *) arg;
+	LionState  *cs = bs->cur->state;
 	const LionBuilder *x = *(LionBuilder *const *) a;
 	const LionBuilder *y = *(LionBuilder *const *) b;
 	Size		n;
@@ -1047,12 +1082,11 @@ lion_builder_cmp(const void *a, const void *b, void *arg)
 	if (x->keykind != y->keykind)
 		return x->keykind < y->keykind ? -1 : 1;
 	if (x->keykind != LION_KEY_REAL)
-		return 0;				/* one NULL and one EMPTY entry per index */
+		return 0;				/* one NULL and one EMPTY entry per column */
 
-	if (bs->state.ordered)
+	if (cs->ordered)
 	{
-		c = DatumGetInt32(FunctionCall2Coll(&bs->state.cmpproc,
-											bs->state.collation,
+		c = DatumGetInt32(FunctionCall2Coll(&cs->cmpproc, cs->collation,
 											x->key, y->key));
 		if (c != 0)
 			return c < 0 ? -1 : 1;
@@ -1104,27 +1138,28 @@ lion_flush_builders(LionBuildState *bs)
  * --------------------------------------------------------------------- */
 
 /*
- * Push one (kind, key, code) tuple into the sort.  A reserved kind carries no
- * key at all and hashes to 0.
+ * Push one (kind, key, code) tuple into one column's sort.  A reserved kind
+ * carries no key at all and hashes to 0.
  */
 static void
-lion_build_put(LionBuildState *bs, int keykind, Datum key, uint64 code)
+lion_build_put(LionBuildState *bs, LionBuildCol *col, int keykind, Datum key,
+			   uint64 code)
 {
 	uint32		hash = (keykind == LION_KEY_REAL) ?
-		lion_hash_key(&bs->state, key) : LION_NULLKEY_HASH;
+		lion_hash_key(col->state, key) : LION_NULLKEY_HASH;
 
-	ExecClearTuple(bs->inslot);
-	bs->inslot->tts_values[0] = Int32GetDatum((int32) keykind);
-	bs->inslot->tts_isnull[0] = false;
-	bs->inslot->tts_values[1] = Int64GetDatum((int64) hash);
-	bs->inslot->tts_isnull[1] = false;
-	bs->inslot->tts_values[2] = Int64GetDatum((int64) code);
-	bs->inslot->tts_isnull[2] = false;
-	bs->inslot->tts_values[3] = key;
-	bs->inslot->tts_isnull[3] = (keykind != LION_KEY_REAL);
-	ExecStoreVirtualTuple(bs->inslot);
+	ExecClearTuple(col->inslot);
+	col->inslot->tts_values[0] = Int32GetDatum((int32) keykind);
+	col->inslot->tts_isnull[0] = false;
+	col->inslot->tts_values[1] = Int64GetDatum((int64) hash);
+	col->inslot->tts_isnull[1] = false;
+	col->inslot->tts_values[2] = Int64GetDatum((int64) code);
+	col->inslot->tts_isnull[2] = false;
+	col->inslot->tts_values[3] = key;
+	col->inslot->tts_isnull[3] = (keykind != LION_KEY_REAL);
+	ExecStoreVirtualTuple(col->inslot);
 
-	tuplesort_puttupleslot(bs->sortstate, bs->inslot);
+	tuplesort_puttupleslot(col->sortstate, col->inslot);
 
 	bs->indtuples += 1;
 }
@@ -1135,46 +1170,54 @@ lion_build_callback(Relation index, ItemPointer tid, Datum *values,
 {
 	LionBuildState *bs = (LionBuildState *) arg;
 	MemoryContext oldctx;
-	Datum		key;
 	uint64		code;
+	int			c;
 
 	lion_check_key_offset(tid);
 	code = lion_tid_to_code(tid);
 
 	oldctx = MemoryContextSwitchTo(bs->tmpctx);
 
-	/*
-	 * A NULL value goes into the sort like any other row, with hash 0: it
-	 * ends up in the reserved NULL entry of bucket 0 (DESIGN.md §14), and the
-	 * two passes below tell it from a real key by the kind column, never by
-	 * comparing.
-	 */
-	if (isnull[0])
-		lion_build_put(bs, LION_KEY_NULL, (Datum) 0, code);
-	else if (bs->multikey)
+	/* One row contributes to every key column (DESIGN.md §24). */
+	for (c = 0; c < bs->ix.ncolumns; c++)
 	{
+		LionBuildCol *col = &bs->cols[c];
+		Datum		key;
+
 		/*
-		 * DESIGN.md §17: one row, many keys.  A row the opclass extracts
-		 * nothing from - an empty array, a tsvector with no lexemes - goes
-		 * into the reserved EMPTY entry, so that a scan that has to look at
-		 * every indexed row (`tags @> '{}'`) can still find it.
+		 * A NULL value goes into the sort like any other row, with hash 0: it
+		 * ends up in that column's reserved NULL entry (DESIGN.md §14), and
+		 * the pass below tells it from a real key by the kind column, never
+		 * by comparing.
 		 */
-		Datum	   *keys;
-		int			nkeys = lion_extract_value(&bs->state, values[0], &keys);
-		int			i;
+		if (isnull[c])
+			lion_build_put(bs, col, LION_KEY_NULL, (Datum) 0, code);
+		else if (col->multikey)
+		{
+			/*
+			 * DESIGN.md §17: one row, many keys.  A row the opclass extracts
+			 * nothing from - an empty array, a tsvector with no lexemes -
+			 * goes into the reserved EMPTY entry, so that a scan that has to
+			 * look at every indexed row (`tags @> '{}'`) can still find it.
+			 */
+			Datum	   *keys;
+			int			nkeys = lion_extract_value(col->state, values[c],
+												   &keys);
+			int			i;
 
-		if (nkeys == 0)
-			lion_build_put(bs, LION_KEY_EMPTY, (Datum) 0, code);
-		for (i = 0; i < nkeys; i++)
-			lion_build_put(bs, LION_KEY_REAL, keys[i], code);
-	}
-	else
-	{
-		key = values[0];
-		if (!bs->state.typbyval && bs->state.typlen == -1)
-			key = PointerGetDatum(PG_DETOAST_DATUM(key));
+			if (nkeys == 0)
+				lion_build_put(bs, col, LION_KEY_EMPTY, (Datum) 0, code);
+			for (i = 0; i < nkeys; i++)
+				lion_build_put(bs, col, LION_KEY_REAL, keys[i], code);
+		}
+		else
+		{
+			key = values[c];
+			if (!col->state->typbyval && col->state->typlen == -1)
+				key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-		lion_build_put(bs, LION_KEY_REAL, key, code);
+			lion_build_put(bs, col, LION_KEY_REAL, key, code);
+		}
 	}
 
 	MemoryContextSwitchTo(oldctx);
@@ -1194,16 +1237,19 @@ lion_build_callback(Relation index, ItemPointer tid, Datum *values,
  * directory order again.
  */
 static void
-lion_build_write_entries(LionBuildState *bs)
+lion_build_write_entries(LionBuildState *bs, LionBuildCol *col)
 {
+	LionState  *cs = col->state;
 	uint32		curhash = 0;
 	int			curkind = -1;
 	bool		havegroup = false;
 	MemoryContext oldctx;
 
+	bs->cur = col;
 	oldctx = MemoryContextSwitchTo(bs->tmpctx);
 
-	while (tuplesort_gettupleslot(bs->sortstate, true, false, bs->outslot, NULL))
+	while (tuplesort_gettupleslot(col->sortstate, true, false, col->outslot,
+								  NULL))
 	{
 		bool		isnull;
 		uint32		hash;
@@ -1214,17 +1260,17 @@ lion_build_write_entries(LionBuildState *bs)
 		bool		boundary;
 		int			i;
 
-		keykind = (int) DatumGetInt32(slot_getattr(bs->outslot, 1, &isnull));
-		hash = (uint32) DatumGetInt64(slot_getattr(bs->outslot, 2, &isnull));
-		code = (uint64) DatumGetInt64(slot_getattr(bs->outslot, 3, &isnull));
-		key = slot_getattr(bs->outslot, 4, &isnull);
+		keykind = (int) DatumGetInt32(slot_getattr(col->outslot, 1, &isnull));
+		hash = (uint32) DatumGetInt64(slot_getattr(col->outslot, 2, &isnull));
+		code = (uint64) DatumGetInt64(slot_getattr(col->outslot, 3, &isnull));
+		key = slot_getattr(col->outslot, 4, &isnull);
 
 		if (!havegroup)
 			boundary = false;
 		else if (keykind != curkind)
 			boundary = true;
-		else if (bs->state.ordered && keykind == LION_KEY_REAL)
-			boundary = !lion_keys_equal(&bs->state, bs->builders[0]->key, key);
+		else if (cs->ordered && keykind == LION_KEY_REAL)
+			boundary = !lion_keys_equal(cs, bs->builders[0]->key, key);
 		else
 			boundary = (hash != curhash);
 
@@ -1243,7 +1289,7 @@ lion_build_write_entries(LionBuildState *bs)
 			if (bs->builders[i]->keykind != keykind)
 				continue;
 			if (keykind != LION_KEY_REAL ||
-				lion_keys_equal(&bs->state, bs->builders[i]->key, key))
+				lion_keys_equal(cs, bs->builders[i]->key, key))
 			{
 				b = bs->builders[i];
 				break;
@@ -1260,6 +1306,7 @@ lion_build_write_entries(LionBuildState *bs)
 	lion_flush_builders(bs);
 	MemoryContextSwitchTo(oldctx);
 	MemoryContextReset(bs->tmpctx);
+	bs->cur = NULL;
 }
 
 IndexBuildResult *
@@ -1269,14 +1316,11 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	LionBuildState bs;
 	LionOptions *opts = (LionOptions *) index->rd_options;
 	LionMetaPageData meta;
-	AttrNumber	attNums[4];
-	Oid			sortOperators[4];
-	Oid			sortCollations[4];
-	bool		nullsFirstFlags[4];
-	int			nsortkeys;
 	double		reltuples;
-	Form_pg_attribute keyatt;
 	BulkWriteBuffer metabuf;
+	int			ncols;
+	int			sortmem;
+	int			c;
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
@@ -1322,8 +1366,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = bs.inline_limit;
 	meta.root = InvalidBlockNumber;
-	lion_fill_state(index, &bs.state, &meta, bs.buildctx);
-	bs.multikey = bs.state.multikey;
+	lion_fill_index_state(index, &bs.ix, &meta, bs.buildctx);
+	ncols = bs.ix.ncolumns;
 
 	bs.maxbuilders = 8;
 	bs.builders = (LionBuilder **) MemoryContextAlloc(bs.buildctx,
@@ -1370,69 +1414,94 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * The key column's type is the index's own, which core resolved from the
 	 * opclass: the element type for a multi-key class (DESIGN.md §17), so one
 	 * heap row's several keys sort as the values they are.
+	 *
+	 * All of that is PER KEY COLUMN (DESIGN.md §24): every column has its own
+	 * key type, its own opclass and therefore its own answer to "ordered?", so
+	 * it gets a tuplesort of its own, and they share maintenance_work_mem.
 	 */
-	keyatt = TupleDescAttr(RelationGetDescr(index), 0);
-	bs.sorttupdesc = CreateTemplateTupleDesc(4);
-	TupleDescInitEntry(bs.sorttupdesc, 1, "kind", INT4OID, -1, 0);
-	TupleDescInitEntry(bs.sorttupdesc, 2, "hash", INT8OID, -1, 0);
-	TupleDescInitEntry(bs.sorttupdesc, 3, "code", INT8OID, -1, 0);
-	TupleDescInitEntry(bs.sorttupdesc, 4, "key", keyatt->atttypid,
-					   keyatt->atttypmod, 0);
-	TupleDescInitEntryCollation(bs.sorttupdesc, 4, bs.state.collation);
-	TupleDescFinalize(bs.sorttupdesc);
+	bs.cols = (LionBuildCol *) MemoryContextAllocZero(bs.buildctx,
+													  sizeof(LionBuildCol) * ncols);
+	bs.cur = NULL;
+	sortmem = Max(maintenance_work_mem / ncols, 64);
 
-	nsortkeys = 0;
-	if (bs.state.ordered)
+	for (c = 0; c < ncols; c++)
 	{
-		attNums[nsortkeys] = 4; /* key, NULLS FIRST: the reserved kinds */
-		sortOperators[nsortkeys] = bs.state.ltopr;
-		sortCollations[nsortkeys] = bs.state.collation;
-		nullsFirstFlags[nsortkeys++] = true;
-	}
-	else
-	{
-		attNums[nsortkeys] = 2; /* hash: the reserved kinds hash to 0 */
+		LionBuildCol *col = &bs.cols[c];
+		LionState  *cs = &bs.ix.cols[c];
+		Form_pg_attribute keyatt = TupleDescAttr(RelationGetDescr(index), c);
+		AttrNumber	attNums[4];
+		Oid			sortOperators[4];
+		Oid			sortCollations[4];
+		bool		nullsFirstFlags[4];
+		int			nsortkeys = 0;
+
+		col->state = cs;
+		col->multikey = cs->multikey;
+
+		col->sorttupdesc = CreateTemplateTupleDesc(4);
+		TupleDescInitEntry(col->sorttupdesc, 1, "kind", INT4OID, -1, 0);
+		TupleDescInitEntry(col->sorttupdesc, 2, "hash", INT8OID, -1, 0);
+		TupleDescInitEntry(col->sorttupdesc, 3, "code", INT8OID, -1, 0);
+		TupleDescInitEntry(col->sorttupdesc, 4, "key", keyatt->atttypid,
+						   keyatt->atttypmod, 0);
+		TupleDescInitEntryCollation(col->sorttupdesc, 4, cs->collation);
+		TupleDescFinalize(col->sorttupdesc);
+
+		if (cs->ordered)
+		{
+			attNums[nsortkeys] = 4; /* key, NULLS FIRST: the reserved kinds */
+			sortOperators[nsortkeys] = cs->ltopr;
+			sortCollations[nsortkeys] = cs->collation;
+			nullsFirstFlags[nsortkeys++] = true;
+		}
+		else
+		{
+			attNums[nsortkeys] = 2; /* hash: the reserved kinds hash to 0 */
+			sortOperators[nsortkeys] = Int8LessOperator;
+			sortCollations[nsortkeys] = InvalidOid;
+			nullsFirstFlags[nsortkeys++] = false;
+		}
+		if (cs->multikey || !cs->ordered)
+		{
+			/*
+			 * `kind` separates the reserved entries from each other and from
+			 * the real keys that share their hash.  A multi-key class needs
+			 * it because it has an EMPTY entry as well as a NULL one and
+			 * neither has a key.  An UNORDERED class needs it because its
+			 * leading sort key is the hash: the reserved entries hash to
+			 * LION_NULLKEY_HASH, and a real key that hashes there too would
+			 * otherwise interleave with them, code by code, and the grouping
+			 * pass - which starts a new entry whenever the kind changes -
+			 * would write several entries for one reserved kind.  It goes
+			 * AFTER the hash, which is the same sequence: the reserved
+			 * entries' hash is the minimum, so they still come first.
+			 */
+			attNums[nsortkeys] = 1;
+			sortOperators[nsortkeys] = Int4LessOperator;
+			sortCollations[nsortkeys] = InvalidOid;
+			nullsFirstFlags[nsortkeys++] = false;
+		}
+		attNums[nsortkeys] = 3;		/* code */
 		sortOperators[nsortkeys] = Int8LessOperator;
 		sortCollations[nsortkeys] = InvalidOid;
 		nullsFirstFlags[nsortkeys++] = false;
-	}
-	if (bs.multikey || !bs.state.ordered)
-	{
-		/*
-		 * `kind` separates the reserved entries from each other and from the
-		 * real keys that share their hash.  A multi-key class needs it because
-		 * it has an EMPTY entry as well as a NULL one and neither has a key.
-		 * An UNORDERED class needs it because its leading sort key is the
-		 * hash: the reserved entries hash to LION_NULLKEY_HASH, and a real key
-		 * that hashes there too would otherwise interleave with them, code by
-		 * code, and the grouping pass - which starts a new entry whenever the
-		 * kind changes - would write several entries for one reserved kind.
-		 * It goes AFTER the hash, which is the same sequence: the reserved
-		 * entries' hash is the minimum, so they still come first.
-		 */
-		attNums[nsortkeys] = 1;
-		sortOperators[nsortkeys] = Int4LessOperator;
-		sortCollations[nsortkeys] = InvalidOid;
-		nullsFirstFlags[nsortkeys++] = false;
-	}
-	attNums[nsortkeys] = 3;		/* code */
-	sortOperators[nsortkeys] = Int8LessOperator;
-	sortCollations[nsortkeys] = InvalidOid;
-	nullsFirstFlags[nsortkeys++] = false;
 
-	bs.sortstate = tuplesort_begin_heap(bs.sorttupdesc, nsortkeys, attNums,
-										sortOperators, sortCollations,
-										nullsFirstFlags,
-										maintenance_work_mem, NULL,
-										TUPLESORT_NONE);
+		col->sortstate = tuplesort_begin_heap(col->sorttupdesc, nsortkeys,
+											  attNums, sortOperators,
+											  sortCollations, nullsFirstFlags,
+											  sortmem, NULL, TUPLESORT_NONE);
 
-	bs.inslot = MakeSingleTupleTableSlot(bs.sorttupdesc, &TTSOpsVirtual);
-	bs.outslot = MakeSingleTupleTableSlot(bs.sorttupdesc, &TTSOpsMinimalTuple);
+		col->inslot = MakeSingleTupleTableSlot(col->sorttupdesc,
+											   &TTSOpsVirtual);
+		col->outslot = MakeSingleTupleTableSlot(col->sorttupdesc,
+												&TTSOpsMinimalTuple);
+	}
 
 	reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
 									   lion_build_callback, (void *) &bs, NULL);
 
-	tuplesort_performsort(bs.sortstate);
+	for (c = 0; c < ncols; c++)
+		tuplesort_performsort(bs.cols[c].sortstate);
 
 	/*
 	 * Everything below writes pages, and all of it goes through one bulk
@@ -1452,7 +1521,15 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	}
 	lion_build_init_pages(&bs);
 	bs.leaf = lion_build_level(&bs, 0);
-	lion_build_write_entries(&bs);
+
+	/*
+	 * Column by column, in attno order: the directory order leads with the
+	 * key column (DESIGN.md §24), so the columns' entry runs laid end to end
+	 * are already sorted and the level builder needs no notion of columns.
+	 */
+	for (c = 0; c < ncols; c++)
+		lion_build_write_entries(&bs, &bs.cols[c]);
+
 	lion_build_finish_dir(&bs);
 
 	Assert(BlockNumberIsValid(bs.root));
@@ -1463,9 +1540,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	smgr_bulk_finish(bs.bulk);
 
-	elog(DEBUG1, "lion index \"%s\": " INT64_FORMAT " entries, %u blocks, "
-		 INT64_FORMAT " directory pages, height %u, fillfactor %d",
-		 RelationGetRelationName(index), bs.ndistinct, bs.nblocks,
+	elog(DEBUG1, "lion index \"%s\": %d key columns, " INT64_FORMAT " entries, "
+		 "%u blocks, " INT64_FORMAT " directory pages, height %u, fillfactor %d",
+		 RelationGetRelationName(index), ncols, bs.ndistinct, bs.nblocks,
 		 bs.ndirpages, bs.height, bs.fillfactor);
 
 	/*
@@ -1476,10 +1553,13 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (bs.max_entries > 0 && bs.ndistinct > (int64) bs.max_entries)
 		lion_warn_max_entries(index, bs.ndistinct);
 
-	tuplesort_end(bs.sortstate);
-	ExecDropSingleTupleTableSlot(bs.inslot);
-	ExecDropSingleTupleTableSlot(bs.outslot);
-	FreeTupleDesc(bs.sorttupdesc);
+	for (c = 0; c < ncols; c++)
+	{
+		tuplesort_end(bs.cols[c].sortstate);
+		ExecDropSingleTupleTableSlot(bs.cols[c].inslot);
+		ExecDropSingleTupleTableSlot(bs.cols[c].outslot);
+		FreeTupleDesc(bs.cols[c].sorttupdesc);
+	}
 	MemoryContextDelete(bs.buildctx);
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));

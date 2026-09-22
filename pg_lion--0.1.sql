@@ -321,6 +321,7 @@ COMMENT ON FUNCTION lion_index_count_stats(regclass, anyelement) IS
  */
 CREATE FUNCTION lion_index_count_group_stats(idx regclass,
 												use_cache boolean DEFAULT true,
+												attno int2 DEFAULT 1,
 												OUT groups bigint,
 												OUT count bigint,
 												OUT blocks_skipped bigint,
@@ -332,14 +333,15 @@ RETURNS record
 AS 'MODULE_PATHNAME', 'lion_index_count_group_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION lion_index_count_group_stats(regclass, boolean) IS
-	'count every key of a lion index, as the GROUP BY pushdown does, and report the heap visits';
+COMMENT ON FUNCTION lion_index_count_group_stats(regclass, boolean, int2) IS
+	'count every key of one key column of a lion index, as the GROUP BY pushdown does, and report the heap visits';
 
 /* ------------------------------------------------------------------ */
 -- stats/verify functions (lion_funcs.c)
 /* ------------------------------------------------------------------ */
 
 CREATE FUNCTION lion_index_stats(idx regclass,
+									OUT attno int2,
 									OUT directory_height int4,
 									OUT leaf_pages int8,
 									OUT internal_pages int8,
@@ -362,12 +364,12 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT deleted_pages int8,
 									OUT posting_internal_pages int8,
 									OUT max_posting_height int4)
-RETURNS record
+RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index: directory shape, entries, containers by kind, sparse segments, posting trees, NULL keys and key-less rows';
+	'shape of a lion index, one row per key column: directory shape, entries, containers by kind, sparse segments, posting trees, NULL keys and key-less rows';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key

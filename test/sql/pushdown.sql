@@ -86,6 +86,30 @@ BEGIN
 END $$;
 
 /*
+ * What the model charges for the node itself, with every other plan
+ * discouraged so that the node is the plan whatever the estimate says.  The
+ * number is never printed - it moves whenever the model is recalibrated -
+ * only ever compared with another one of these, which is how a statement
+ * ABOUT the shape of the estimate can be pinned without pinning the estimate.
+ */
+CREATE OR REPLACE FUNCTION lion_pd_cost(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	IF p -> 0 -> 'Plan' ->> 'Custom Plan Provider' IS DISTINCT FROM 'LionCount' THEN
+		RAISE EXCEPTION 'not the node: %', p -> 0 -> 'Plan' ->> 'Node Type';
+	END IF;
+	RETURN (p -> 0 -> 'Plan' ->> 'Total Cost')::float8;
+END $$;
+
+/*
  * The instrumentation EXPLAIN ANALYZE prints for the custom node, reduced to
  * zero / non-zero: the exact counts depend on how the rows fall on heap
  * pages, but whether the heap had to be visited at all does not.
@@ -863,6 +887,48 @@ SELECT lion_pd('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
 SELECT lion_plans('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
 SELECT lion_pd('SELECT c20k, c200, count(*) FROM lion_pd2 GROUP BY c20k, c200');
 SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
+
+-- ---- an AND with a selective source is priced as probes (§22) ----------
+/*
+ * The leapfrog join walks the source with the FEWEST members and seeks the
+ * others to the container keys it produces, so a dense set that is ANDed with
+ * a selective one is no longer read end to end - it is read at the places the
+ * selective one has a container, one descent each.  Two orderings pin that
+ * without pinning any one number, and both were FALSE while every source was
+ * charged its whole share of the index whatever drove the merge:
+ *
+ *	- `id = 77 AND c2 = 1` must cost less than `c2 = 1` alone.  `id` is unique,
+ *	  so it has a container at exactly one key and half the table's posting set
+ *	  is read at exactly that one place - against the fifteen pages a walk of
+ *	  it takes here (11.5 against 21.3 cost units; before, 26.5 against 21.3);
+ *	- and adding that clause to a count that already intersects two sets must
+ *	  make it CHEAPER, not dearer: the selective source takes over as the
+ *	  driver and the other two stop being walked (16.8 against 26.8; before,
+ *	  31.7 against 26.8).
+ *
+ * What the bound is worth where it matters needs a table far too big for this
+ * suite to build.  At one million rows of the benchmark's `fact`,
+ * `c20k = 77 AND c200 = 17 AND c2 = 1` goes from 168.8 cost units to 117.6,
+ * of which 100 is the fifty descents into `c2` that the count really makes -
+ * measured as 118 buffer accesses against the 154 a walk of that set takes
+ * (2026-09-22, release build).  It is still not the plan the model picks
+ * there: the BitmapAnd over the same two indexes is priced at 62.1 although it
+ * runs in 0.88 ms against the node's 0.25, because what it is charged for is
+ * CPU per TID while the node is charged for resident index pages at
+ * seq_page_cost.  DESIGN.md §22 records that as the open item.
+ */
+CREATE INDEX lion_pd2_id ON lion_pd2 USING lion (id);
+VACUUM ANALYZE lion_pd2;
+SELECT lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c2 = 1')
+	 < lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE c2 = 1')
+	AS probing_beats_walking;
+SELECT lion_pd_cost($$SELECT count(*) FROM lion_pd2
+					  WHERE id = 77 AND c200 = 17 AND c2 = 1$$)
+	 < lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE c200 = 17 AND c2 = 1')
+	AS selective_clause_makes_it_cheaper;
+-- the answers themselves, from the node and from the ordinary plan
+SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c200 = 17 AND c2 = 1');
+SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE c20k = 77 AND c200 = 17 AND c2 = 1');
 DROP TABLE lion_pd2;
 DROP TABLE lion_pdq;
 
@@ -888,6 +954,7 @@ DROP TABLE lion_pde;
 DROP TABLE lion_pdt;
 DROP FUNCTION lion_pd(text);
 DROP FUNCTION lion_pd_counters(text);
+DROP FUNCTION lion_pd_cost(text);
 DROP FUNCTION lion_plans(text);
 -- enable_partitionwise_aggregate must not switch the pushdown off for a plain table
 CREATE TABLE lion_pwa (k int NOT NULL);

@@ -158,16 +158,19 @@ past that many distinct keys; it never rejects a row.
 moves out of its entry tuple onto container pages of its own.
 `buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
 index key, and it grows by splitting instead of being sized once.
-`lion_index_stats()` reports the directory's height, its leaf and internal pages and whether it is
-`ordered` (false for a key type with no btree opclass, whose entries are then in a complete but
-arbitrary order), the entries, the containers by kind, the sparse segments, the posting trees'
-internal pages and tallest height, `null_tids`, the number of rows whose key is NULL, and
-`empty_tids`, the number of rows a multi-key opclass extracted no key from.
+`lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
+directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
+key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
+column's entries, its containers by kind, its sparse segments, its posting trees' internal pages and
+tallest height, `null_tids`, the number of rows whose key in that column is NULL, and `empty_tids`,
+the number of rows a multi-key opclass extracted no key from.  The counters that describe the
+relation rather than a column - the directory's shape, free and deleted pages - are repeated on
+every row.
 
 ## Known limitations
 
-Single column, equality, `IN` lists and the multi-key operators above (no ranges), no
-`amgettuple`/index-only scans, no
+Equality, `IN` lists and the multi-key operators above (no ranges), no
+`amgettuple`/index-only scans, no INCLUDE columns, no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured

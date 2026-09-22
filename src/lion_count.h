@@ -126,6 +126,9 @@ struct LionMatSet;				/* private to lion_count.c */
 typedef struct LionPostingSet
 {
 	Relation	index;			/* index the set belongs to */
+	uint16		attno;			/* and which of its KEY COLUMNS (§24): what
+								 * the located entry tuple carries, so a
+								 * caller that has the set has the column */
 	bool		found;			/* false: the key has no entry at all */
 	bool		is_inline;		/* payload/paylen valid, else head valid */
 	BlockNumber head;			/* CHAIN: first container page */
@@ -230,10 +233,22 @@ typedef struct LionCountSource
 } LionCountSource;
 
 /*
- * Locate the posting set of the rows whose key is NULL: the reserved entry of
- * bucket 0 (DESIGN.md §14).  Returns false when the index holds no NULLs.
+ * Locate the posting set of the rows whose key column `attno` is NULL: that
+ * column's reserved entry (DESIGN.md §14, §24).  Returns false when the
+ * column holds no NULLs.
+ *
+ * Every lookup below names an INDEX COLUMN, 1-based, exactly as a ScanKey's
+ * sk_attno and an IndexOptInfo's indexkeys[i] + 1 do.  The wrappers without
+ * the column are that column being 1, which is all a single-column index has.
  */
-extern bool lion_posting_set_lookup_null(Relation index, LionPostingSet *ps);
+extern bool lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
+											LionPostingSet *ps);
+
+static inline bool
+lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
+{
+	return lion_posting_set_lookup_null_col(index, 1, ps);
+}
 
 /*
  * Locate the posting set of key in index.  Returns false (and fills *ps with
@@ -242,8 +257,16 @@ extern bool lion_posting_set_lookup_null(Relation index, LionPostingSet *ps);
  * operator and a hash function for it; InvalidOid means "the index's own
  * type".  ERRORs when the type cannot be used with this index.
  */
-extern bool lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
-								   LionPostingSet *ps);
+extern bool lion_posting_set_lookup_col(Relation index, AttrNumber attno,
+									   Datum key, Oid keytype,
+									   LionPostingSet *ps);
+
+static inline bool
+lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
+					   LionPostingSet *ps)
+{
+	return lion_posting_set_lookup_col(index, 1, key, keytype, ps);
+}
 
 /*
  * Locate the posting sets of nvalues keys of one index at once: the IN list
@@ -264,10 +287,20 @@ extern bool lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * caller must release.  *nfound (optional) is how many have an entry at all,
  * so *nfound == 0 means the union selects no rows.
  */
-extern int lion_posting_set_lookup_many(Relation index, Oid keytype,
-									   int nvalues, const Datum *values,
-									   const bool *isnull,
-									   LionPostingSet *sets, int *nfound);
+extern int lion_posting_set_lookup_many_col(Relation index, AttrNumber attno,
+										   Oid keytype, int nvalues,
+										   const Datum *values,
+										   const bool *isnull,
+										   LionPostingSet *sets, int *nfound);
+
+static inline int
+lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
+							const Datum *values, const bool *isnull,
+							LionPostingSet *sets, int *nfound)
+{
+	return lion_posting_set_lookup_many_col(index, 1, keytype, nvalues, values,
+										   isnull, sets, nfound);
+}
 
 /* Drop whatever pin/memory the posting set holds.  Idempotent. */
 extern void lion_posting_set_release(LionPostingSet *ps);
@@ -358,7 +391,9 @@ extern bool lion_sets_satisfiable(int nsets, LionPostingSet *sets,
 typedef struct LionEntryScan
 {
 	Relation	index;
-	LionState   *state;
+	LionState   *state;			/* the key column being walked (§24) */
+	uint16		attno;			/* ... and its number; the walk ends at the
+								 * first entry of the next column */
 	BlockNumber blkno;			/* directory leaf to read next */
 	bool		haslast;		/* the key below is valid */
 	int			lastkind;		/* LION_KIND_* of the last entry returned */
@@ -370,7 +405,14 @@ typedef struct LionEntryScan
 	bool		done;
 } LionEntryScan;
 
-extern void lion_entry_scan_begin(LionEntryScan *es, Relation index);
+extern void lion_entry_scan_begin_col(LionEntryScan *es, Relation index,
+									 AttrNumber attno);
+
+static inline void
+lion_entry_scan_begin(LionEntryScan *es, Relation index)
+{
+	lion_entry_scan_begin_col(es, index, 1);
+}
 
 /*
  * Fetch the next entry.  On true, *key is a private copy of the entry's key

@@ -26,6 +26,7 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -38,22 +39,24 @@ PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_verify);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
 
-#define LION_STATS_NCOLS		22
+#define LION_STATS_NCOLS		23
 
 typedef struct LionVerifyState
 {
 	Relation	index;
 	Relation	heap;
-	LionState   *state;
+	LionIndexState *ix;
 	BlockNumber nblocks;
 	uint8	   *refs;			/* how often each block is referenced */
 	LionContainer *cbuf;			/* aligned container work buffer */
 	BlockNumber root;			/* the directory root, from the meta page */
 	uint32		height;
-	int64		nnullentries;	/* reserved NULL-key entries seen (at most 1) */
-	int64		nemptyentries;	/* reserved no-key entries seen (at most 1) */
+	/* per key column (DESIGN.md §24): at most one of each, per column */
+	int64		nnullentries[INDEX_MAX_KEYS];
+	int64		nemptyentries[INDEX_MAX_KEYS];
+	uint16		lastattno;		/* attno of the last leaf entry seen */
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */
-	Oid			keyoutfunc;		/* output function of the indexed type */
+	Oid			keyoutfunc;		/* output function of the column being checked */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
 	int64		nheaptuples;
 } LionVerifyState;
@@ -103,29 +106,102 @@ lion_open_index(Oid relid, LOCKMODE lockmode)
 
 /* ---------------------------------------------------------------------
  * lion_index_stats()
+ *
+ * One row per KEY COLUMN (DESIGN.md §24).  Counters that describe an entry or
+ * a posting set are that column's own; counters that describe the RELATION -
+ * the directory's shape, the free and deleted pages - are the index's and are
+ * repeated on every row, because a directory leaf holds the entries of
+ * whatever columns happen to land on it and there is nothing to divide.
+ *
+ * A container page IS attributable: its owner_head is the head block of the
+ * entry that owns it, and entries carry their column.  The two are met in
+ * whichever order the block walk finds them, so a multicolumn index
+ * accumulates per posting set in a hash keyed by the head block and adds the
+ * totals up at the end.  A single-column index skips all of that: everything
+ * it holds belongs to column 1.
  * --------------------------------------------------------------------- */
 
-typedef struct LionStats
+/* Per-column counters. */
+typedef struct LionColStats
 {
-	int64		leaf_pages;			/* directory leaves (DESIGN.md §21) */
-	int64		internal_pages;
 	int64		entries;
 	int64		inline_entries;
-	int64		container_pages;	/* posting-tree LEAVES (DESIGN.md §22) */
-	int64		posting_internal_pages;	/* ... and the pages above them */
-	int32		max_posting_height;	/* the tallest posting tree */
 	int64		containers;
 	int64		by_type[4];		/* indexed by LionContainerType */
 	int64		sparse_segments;	/* items of type LION_CT_SPARSE */
-	int64		sparse_members;	/* (ckey, lo) pairs inside them */
+	int64		sparse_members; /* (ckey, lo) pairs inside them */
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
 	int64		empty_tids;		/* members of the reserved EMPTY entry (§17) */
+	int64		container_pages;	/* posting-tree LEAVES (DESIGN.md §22) */
+	int64		posting_internal_pages; /* ... and the pages above them */
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
+} LionColStats;
+
+/* What one posting set contributed, before its column is known. */
+typedef struct LionSetStats
+{
+	BlockNumber head;			/* hash key: the set's root block */
+	uint16		attno;			/* 0 until the owning entry is seen */
+	LionColStats st;
+} LionSetStats;
+
+typedef struct LionStats
+{
+	uint32		height;			/* directory height (DESIGN.md §21) */
+	int64		leaf_pages;			/* directory leaves */
+	int64		internal_pages;
+	int32		max_posting_height;	/* the tallest posting tree */
 	int64		free_bytes;
 	int64		deleted_pages;	/* freed pages awaiting reuse (DESIGN.md §18) */
+
+	int			ncolumns;
+	LionColStats *cols;			/* [ncolumns] */
+	bool	   *ordered;		/* [ncolumns]: the column's own opclass (§21) */
+	HTAB	   *sets;			/* head block -> LionSetStats, or NULL */
 } LionStats;
+
+/*
+ * Where one container page's counters go: straight into its column for a
+ * single-column index, into the per-set bucket otherwise.
+ */
+static LionColStats *
+lion_stats_bucket(LionStats *st, BlockNumber head)
+{
+	LionSetStats *ent;
+	bool		found;
+
+	if (st->sets == NULL)
+		return &st->cols[0];
+
+	ent = (LionSetStats *) hash_search(st->sets, &head, HASH_ENTER, &found);
+	if (!found)
+	{
+		ent->attno = 0;
+		memset(&ent->st, 0, sizeof(LionColStats));
+	}
+	return &ent->st;
+}
+
+/* ... and the same for an entry, whose column is known right away. */
+static void
+lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno)
+{
+	LionSetStats *ent;
+	bool		found;
+
+	if (st->sets == NULL || !BlockNumberIsValid(head))
+		return;
+
+	ent = (LionSetStats *) hash_search(st->sets, &head, HASH_ENTER, &found);
+	if (!found)
+	{
+		ent->attno = 0;
+		memset(&ent->st, 0, sizeof(LionColStats));
+	}
+	ent->attno = attno;
+}
 
 /*
  * Account for one item of a posting set.  The container counters count real
@@ -134,20 +210,20 @@ typedef struct LionStats
  * every item, whatever its kind.
  */
 static void
-lion_stats_item(LionStats *st, const LionContainer *c, Size itemlen)
+lion_stats_item(LionColStats *cs, const LionContainer *c, Size itemlen)
 {
 	Size		size = lion_item_size(c);
 
 	if (c->type == LION_CT_SPARSE)
 	{
-		st->sparse_segments++;
-		st->sparse_members += (int64) c->cardinality;
+		cs->sparse_segments++;
+		cs->sparse_members += (int64) c->cardinality;
 	}
 	else
 	{
-		st->containers++;
+		cs->containers++;
 		if (c->type >= LION_CT_ARRAY && c->type <= LION_CT_RUN)
-			st->by_type[c->type]++;
+			cs->by_type[c->type]++;
 	}
 
 	/*
@@ -157,182 +233,274 @@ lion_stats_item(LionStats *st, const LionContainer *c, Size itemlen)
 	 * anything else (DESIGN.md §4) - are reported separately.  An item inside
 	 * an INLINE payload never has any.
 	 */
-	st->container_bytes += (int64) size;
+	cs->container_bytes += (int64) size;
 	if (itemlen > size)
-		st->slack_bytes += (int64) (itemlen - size);
+		cs->slack_bytes += (int64) (itemlen - size);
 }
 
 Datum
 lion_index_stats(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	index;
-	LionState   *state;
-	LionStats	st;
-	LionContainer *cbuf;
-	BlockNumber nblocks;
-	BlockNumber blk;
-	TupleDesc	tupdesc;
-	Datum		values[LION_STATS_NCOLS];
-	bool		nulls[LION_STATS_NCOLS];
-	HeapTuple	tuple;
-	uint32		height = 0;
+	FuncCallContext *funcctx;
+	LionStats  *st;
+	int			call;
 
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-	tupdesc = BlessTupleDesc(tupdesc);
-
-	index = lion_open_index(relid, AccessShareLock);
-	state = lion_get_state(index);
-
-	memset(&st, 0, sizeof(st));
-	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-
-	nblocks = RelationGetNumberOfBlocks(index);
-	for (blk = 1; blk < nblocks; blk++)
+	if (SRF_IS_FIRSTCALL())
 	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber maxoff;
-		OffsetNumber off;
+		MemoryContext oldcxt;
+		TupleDesc	tupdesc;
+		Relation	index;
+		LionIndexState *ix;
+		LionContainer *cbuf;
+		BlockNumber nblocks;
+		BlockNumber blk;
+		uint32		height = 0;
+		int			i;
 
-		buf = ReadBuffer(index, blk);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		index = lion_open_index(relid, AccessShareLock);
+		ix = lion_get_index_state(index);
+
+		st = (LionStats *) palloc0(sizeof(LionStats));
+		st->ncolumns = ix->ncolumns;
+		st->cols = (LionColStats *) palloc0(sizeof(LionColStats) *
+											st->ncolumns);
+		st->ordered = (bool *) palloc0(sizeof(bool) * st->ncolumns);
+		for (i = 0; i < st->ncolumns; i++)
+			st->ordered[i] = ix->cols[i].ordered;
+		st->sets = NULL;
+		if (st->ncolumns > 1)
 		{
-			UnlockReleaseBuffer(buf);
-			continue;
+			HASHCTL		ctl;
+
+			ctl.keysize = sizeof(BlockNumber);
+			ctl.entrysize = sizeof(LionSetStats);
+			ctl.hcxt = CurrentMemoryContext;
+			st->sets = hash_create("lion index stats posting sets", 256, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		}
 
-		maxoff = PageGetMaxOffsetNumber(page);
+		cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-		if (LionPageIsDir(page))
+		nblocks = RelationGetNumberOfBlocks(index);
+		for (blk = 1; blk < nblocks; blk++)
 		{
-			st.internal_pages++;
-			st.free_bytes += (int64) PageGetFreeSpace(page);
-		}
-		else if (LionPageIsBucket(page))
-		{
-			st.leaf_pages++;
-			st.free_bytes += (int64) PageGetFreeSpace(page);
+			Buffer		buf;
+			Page		page;
+			OffsetNumber maxoff;
+			OffsetNumber off;
 
-			for (off = lion_page_first_data(page); off <= maxoff; off++)
+			buf = ReadBuffer(index, blk);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+
+			if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
 			{
-				ItemId		iid = PageGetItemId(page, off);
-				LionEntryTuple *entry;
+				UnlockReleaseBuffer(buf);
+				continue;
+			}
 
-				if (!ItemIdIsUsed(iid))
-					continue;
+			maxoff = PageGetMaxOffsetNumber(page);
 
-				entry = (LionEntryTuple *) PageGetItem(page, iid);
-				st.entries++;
-				st.ntids += (int64) entry->ntids;
-				if (LionEntryIsNullKey(entry))
-					st.null_tids += (int64) entry->ntids;
-				if (LionEntryIsEmptyKey(entry))
-					st.empty_tids += (int64) entry->ntids;
+			if (LionPageIsDir(page))
+			{
+				st->internal_pages++;
+				st->free_bytes += (int64) PageGetFreeSpace(page);
+			}
+			else if (LionPageIsBucket(page))
+			{
+				st->leaf_pages++;
+				st->free_bytes += (int64) PageGetFreeSpace(page);
 
-				if ((entry->flags & LION_ENTRY_INLINE) != 0)
+				for (off = lion_page_first_data(page); off <= maxoff; off++)
 				{
-					Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry,
-															   ItemIdGetLength(iid));
-					Size		cur = 0;
-					Size		csize;
+					ItemId		iid = PageGetItemId(page, off);
+					LionEntryTuple *entry;
+					LionColStats *cs;
 
-					st.inline_entries++;
-					while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
-													 paylen, &cur, cbuf)) > 0)
-						lion_stats_item(&st, cbuf, csize);
+					if (!ItemIdIsUsed(iid))
+						continue;
+
+					entry = (LionEntryTuple *) PageGetItem(page, iid);
+					if (entry->attno < 1 || entry->attno > st->ncolumns)
+						continue;	/* corrupt; verify() is what reports it */
+					cs = &st->cols[entry->attno - 1];
+
+					cs->entries++;
+					cs->ntids += (int64) entry->ntids;
+					if (LionEntryIsNullKey(entry))
+						cs->null_tids += (int64) entry->ntids;
+					if (LionEntryIsEmptyKey(entry))
+						cs->empty_tids += (int64) entry->ntids;
+
+					if ((entry->flags & LION_ENTRY_INLINE) != 0)
+					{
+						Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry,
+																   ItemIdGetLength(iid));
+						Size		cur = 0;
+						Size		csize;
+
+						cs->inline_entries++;
+						while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
+														 paylen, &cur, cbuf)) > 0)
+							lion_stats_item(cs, cbuf, csize);
+					}
+					else
+						lion_stats_claim(st, entry->head, entry->attno);
 				}
 			}
-		}
-		else if (LionPageIsContainer(page))
-		{
-			/*
-			 * A DELETED page (DESIGN.md §18) holds nothing and is waiting in
-			 * the free space map to be handed out again; it is neither a
-			 * container page nor free space of one.
-			 */
-			if (LionPageIsDeleted(page))
+			else if (LionPageIsContainer(page))
 			{
-				st.deleted_pages++;
-				UnlockReleaseBuffer(buf);
-				continue;
-			}
+				LionColStats *cs;
 
-			st.free_bytes += (int64) PageGetFreeSpace(page);
-
-			/*
-			 * An INTERNAL posting page (DESIGN.md §22) holds downlinks, not
-			 * containers.  It is counted on its own so that container_pages
-			 * still means "pages that hold a posting set's items", and the
-			 * tallest tree is the largest level any page claims - a set that
-			 * fits one page has height 0.
-			 */
-			if (LionPageIsPostingInternal(page))
-			{
-				st.posting_internal_pages++;
-				if ((int32) LionPageGetOpaque(page)->level >
-					st.max_posting_height)
-					st.max_posting_height = (int32) LionPageGetOpaque(page)->level;
-				UnlockReleaseBuffer(buf);
-				continue;
-			}
-
-			st.container_pages++;
-
-			for (off = FirstOffsetNumber; off <= maxoff; off++)
-			{
-				ItemId		iid = PageGetItemId(page, off);
-
-				if (!ItemIdIsUsed(iid))
+				/*
+				 * A DELETED page (DESIGN.md §18) holds nothing and is waiting
+				 * in the free space map to be handed out again; it is neither
+				 * a container page nor free space of one.
+				 */
+				if (LionPageIsDeleted(page))
+				{
+					st->deleted_pages++;
+					UnlockReleaseBuffer(buf);
 					continue;
+				}
 
-				lion_stats_item(&st,
-							   (LionContainer *) PageGetItem(page, iid),
-							   ItemIdGetLength(iid));
+				st->free_bytes += (int64) PageGetFreeSpace(page);
+				cs = lion_stats_bucket(st, LionPageGetOpaque(page)->owner_head);
+
+				/*
+				 * An INTERNAL posting page (DESIGN.md §22) holds downlinks,
+				 * not containers.  It is counted on its own so that
+				 * container_pages still means "pages that hold a posting
+				 * set's items", and the tallest tree is the largest level any
+				 * page claims - a set that fits one page has height 0.
+				 */
+				if (LionPageIsPostingInternal(page))
+				{
+					cs->posting_internal_pages++;
+					if ((int32) LionPageGetOpaque(page)->level >
+						st->max_posting_height)
+						st->max_posting_height =
+							(int32) LionPageGetOpaque(page)->level;
+					UnlockReleaseBuffer(buf);
+					continue;
+				}
+
+				cs->container_pages++;
+
+				for (off = FirstOffsetNumber; off <= maxoff; off++)
+				{
+					ItemId		iid = PageGetItemId(page, off);
+
+					if (!ItemIdIsUsed(iid))
+						continue;
+
+					lion_stats_item(cs,
+								   (LionContainer *) PageGetItem(page, iid),
+								   ItemIdGetLength(iid));
+				}
 			}
+
+			UnlockReleaseBuffer(buf);
+			CHECK_FOR_INTERRUPTS();
 		}
 
-		UnlockReleaseBuffer(buf);
-		CHECK_FOR_INTERRUPTS();
+		pfree(cbuf);
+
+		/* Fold each posting set's counters into the column that owns it. */
+		if (st->sets != NULL)
+		{
+			HASH_SEQ_STATUS seq;
+			LionSetStats *ent;
+
+			hash_seq_init(&seq, st->sets);
+			while ((ent = (LionSetStats *) hash_seq_search(&seq)) != NULL)
+			{
+				LionColStats *cs;
+				int			k;
+
+				/*
+				 * attno 0 means no live entry claimed this set: a page an
+				 * interrupted allocation or a crash leaked (verify() reports
+				 * those).  It belongs to no column and is left out.
+				 */
+				if (ent->attno < 1 || ent->attno > st->ncolumns)
+					continue;
+				cs = &st->cols[ent->attno - 1];
+
+				cs->containers += ent->st.containers;
+				for (k = 0; k < 4; k++)
+					cs->by_type[k] += ent->st.by_type[k];
+				cs->sparse_segments += ent->st.sparse_segments;
+				cs->sparse_members += ent->st.sparse_members;
+				cs->container_pages += ent->st.container_pages;
+				cs->posting_internal_pages += ent->st.posting_internal_pages;
+				cs->container_bytes += ent->st.container_bytes;
+				cs->slack_bytes += ent->st.slack_bytes;
+			}
+			hash_destroy(st->sets);
+			st->sets = NULL;
+		}
+
+		(void) lion_dir_root(index, ix, &height);
+		st->height = height;
+
+		index_close(index, AccessShareLock);
+
+		funcctx->user_fctx = (void *) st;
+		funcctx->max_calls = st->ncolumns;
+
+		MemoryContextSwitchTo(oldcxt);
 	}
 
-	pfree(cbuf);
+	funcctx = SRF_PERCALL_SETUP();
+	st = (LionStats *) funcctx->user_fctx;
+	call = (int) funcctx->call_cntr;
 
-	(void) lion_dir_root(index, state, &height);
+	if (call < (int) funcctx->max_calls)
+	{
+		LionColStats *cs = &st->cols[call];
+		Datum		values[LION_STATS_NCOLS];
+		bool		nulls[LION_STATS_NCOLS];
+		HeapTuple	tuple;
 
-	memset(nulls, 0, sizeof(nulls));
-	values[0] = Int32GetDatum((int32) height);
-	values[1] = Int64GetDatum(st.leaf_pages);
-	values[2] = Int64GetDatum(st.internal_pages);
-	values[3] = BoolGetDatum(state->ordered);
-	values[4] = Int64GetDatum(st.entries);
-	values[5] = Int64GetDatum(st.inline_entries);
-	values[6] = Int64GetDatum(st.container_pages);
-	values[7] = Int64GetDatum(st.containers);
-	values[8] = Int64GetDatum(st.by_type[LION_CT_ARRAY]);
-	values[9] = Int64GetDatum(st.by_type[LION_CT_BITSET]);
-	values[10] = Int64GetDatum(st.by_type[LION_CT_RUN]);
-	values[11] = Int64GetDatum(st.ntids);
-	values[12] = Int64GetDatum(st.container_bytes);
-	values[13] = Int64GetDatum(st.free_bytes);
-	values[14] = Int64GetDatum(st.sparse_segments);
-	values[15] = Int64GetDatum(st.sparse_members);
-	values[16] = Int64GetDatum(st.null_tids);
-	values[17] = Int64GetDatum(st.empty_tids);
-	values[18] = Int64GetDatum(st.slack_bytes);
-	values[19] = Int64GetDatum(st.deleted_pages);
-	values[20] = Int64GetDatum(st.posting_internal_pages);
-	values[21] = Int32GetDatum(st.max_posting_height);
+		memset(nulls, 0, sizeof(nulls));
+		values[0] = Int16GetDatum((int16) (call + 1));
+		values[1] = Int32GetDatum((int32) st->height);
+		values[2] = Int64GetDatum(st->leaf_pages);
+		values[3] = Int64GetDatum(st->internal_pages);
+		values[4] = BoolGetDatum(st->ordered[call]);
+		values[5] = Int64GetDatum(cs->entries);
+		values[6] = Int64GetDatum(cs->inline_entries);
+		values[7] = Int64GetDatum(cs->container_pages);
+		values[8] = Int64GetDatum(cs->containers);
+		values[9] = Int64GetDatum(cs->by_type[LION_CT_ARRAY]);
+		values[10] = Int64GetDatum(cs->by_type[LION_CT_BITSET]);
+		values[11] = Int64GetDatum(cs->by_type[LION_CT_RUN]);
+		values[12] = Int64GetDatum(cs->ntids);
+		values[13] = Int64GetDatum(cs->container_bytes);
+		values[14] = Int64GetDatum(st->free_bytes);
+		values[15] = Int64GetDatum(cs->sparse_segments);
+		values[16] = Int64GetDatum(cs->sparse_members);
+		values[17] = Int64GetDatum(cs->null_tids);
+		values[18] = Int64GetDatum(cs->empty_tids);
+		values[19] = Int64GetDatum(cs->slack_bytes);
+		values[20] = Int64GetDatum(st->deleted_pages);
+		values[21] = Int64GetDatum(cs->posting_internal_pages);
+		values[22] = Int32GetDatum(st->max_posting_height);
 
-	tuple = heap_form_tuple(tupdesc, values, nulls);
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
 
-	index_close(index, AccessShareLock);
-
-	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+	SRF_RETURN_DONE(funcctx);
 }
 
 /* ---------------------------------------------------------------------
@@ -478,10 +646,9 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
  * so that hashing it cannot run off the end of the item.
  */
 static void
-lion_verify_keylen(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
-				  const LionEntryTuple *entry)
+lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
+				  OffsetNumber off, const LionEntryTuple *entry)
 {
-	LionState   *state = vs->state;
 	Size		keylen = entry->keylen;
 	const char *key = LionEntryGetKey(entry);
 
@@ -1103,6 +1270,29 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 	Size		itemsz = ItemIdGetLength(iid);
 	uint16		kind = entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN);
+	LionState  *state;
+
+	/*
+	 * The KEY COLUMN (DESIGN.md §24).  Everything below - the key length, the
+	 * hash, whether an EMPTY entry may exist at all - is decided by that
+	 * column's opclass, and the columns' entry runs must come out in attno
+	 * order, which the directory comparator enforces item by item and this
+	 * checks again across pages.
+	 */
+	if (entry->attno < 1 || entry->attno > vs->ix->ncolumns)
+		lion_corrupt("lion index \"%s\": entry %u on block %u belongs to key column %u, but the index has %d",
+					RelationGetRelationName(vs->index), off, blk, entry->attno,
+					vs->ix->ncolumns);
+	if (entry->attno < vs->lastattno)
+		lion_corrupt("lion index \"%s\": entry %u on block %u belongs to key column %u, below the column %u of the entry before it",
+					RelationGetRelationName(vs->index), off, blk, entry->attno,
+					vs->lastattno);
+	vs->lastattno = entry->attno;
+	state = lion_column(vs->ix, (AttrNumber) entry->attno);
+
+	if (entry->unused != 0)
+		lion_corrupt("lion index \"%s\": entry %u on block %u has a non-zero reserved header field",
+					RelationGetRelationName(vs->index), off, blk);
 
 	if (itemsz < LION_ENTRY_HDRSZ)
 		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
@@ -1138,28 +1328,31 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u stores hash %u, expected %d",
 						RelationGetRelationName(vs->index), what, off, blk,
 						entry->hash, LION_NULLKEY_HASH);
-		if (LionEntryIsNullKey(entry) ? (++vs->nnullentries > 1) :
-			(++vs->nemptyentries > 1))
-			lion_corrupt("lion index \"%s\": entry %u on block %u is a second %s entry",
-						RelationGetRelationName(vs->index), off, blk, what);
+		if (LionEntryIsNullKey(entry) ?
+			(++vs->nnullentries[entry->attno - 1] > 1) :
+			(++vs->nemptyentries[entry->attno - 1] > 1))
+			lion_corrupt("lion index \"%s\": entry %u on block %u is a second %s entry for key column %u",
+						RelationGetRelationName(vs->index), off, blk, what,
+						entry->attno);
 
 		/*
 		 * Only a multi-key opclass ever writes an empty entry; finding one in
 		 * a scalar index means the two flag bits have been confused
 		 * somewhere.
 		 */
-		if (LionEntryIsEmptyKey(entry) && !vs->state->multikey)
-			lion_corrupt("lion index \"%s\": entry %u on block %u is an empty-key entry, but the operator class extracts no keys",
-						RelationGetRelationName(vs->index), off, blk);
+		if (LionEntryIsEmptyKey(entry) && !state->multikey)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is an empty-key entry, but the operator class of key column %u extracts no keys",
+						RelationGetRelationName(vs->index), off, blk,
+						entry->attno);
 	}
 	else
 	{
 		uint32		hash;
 
-		lion_verify_keylen(vs, blk, off, entry);
+		lion_verify_keylen(vs, state, blk, off, entry);
 
-		hash = lion_hash_key(vs->state,
-							lion_fetch_key(vs->state, LionEntryGetKey(entry)));
+		hash = lion_hash_key(state,
+							lion_fetch_key(state, LionEntryGetKey(entry)));
 		if (hash != entry->hash)
 			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
 						RelationGetRelationName(vs->index), off, blk,
@@ -1388,7 +1581,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 
 			/* Strictly increasing within the page (DESIGN.md §21). */
 			if (prevkey != NULL &&
-				lion_cmp_entries(vs->state, prevkey, item) >= 0)
+				lion_cmp_entries(vs->ix, prevkey, item) >= 0)
 				lion_corrupt("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
 							RelationGetRelationName(vs->index), off, blk);
 
@@ -1396,7 +1589,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			{
 				firstkey = lion_verify_copy_item(page, off);
 				if (prevhigh != NULL &&
-					lion_cmp_entries(vs->state, prevhigh, firstkey) > 0)
+					lion_cmp_entries(vs->ix, prevhigh, firstkey) > 0)
 					lion_corrupt("lion index \"%s\": the high key of the page left of %u sorts after its first key",
 								RelationGetRelationName(vs->index), blk);
 			}
@@ -1418,7 +1611,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		}
 
 		if (highkey != NULL && prevkey != NULL &&
-			lion_cmp_entries(vs->state, prevkey, highkey) >= 0)
+			lion_cmp_entries(vs->ix, prevkey, highkey) >= 0)
 			lion_corrupt("lion index \"%s\": the last key of directory page %u is not below its high key",
 						RelationGetRelationName(vs->index), blk);
 		if (prevkey != NULL)
@@ -1519,7 +1712,7 @@ lion_verify_directory(LionVerifyState *vs)
 					lion_corrupt("lion index \"%s\": downlink %d of level %u is minus infinity",
 								RelationGetRelationName(vs->index), j, i);
 				else if (lvl[i - 1].firstkey[j] != NULL &&
-						 lion_cmp_entries(vs->state, sep,
+						 lion_cmp_entries(vs->ix, sep,
 										  lvl[i - 1].firstkey[j]) > 0)
 					lion_corrupt("lion index \"%s\": the separator of block %u sorts after its own first key",
 								RelationGetRelationName(vs->index),
@@ -1531,7 +1724,7 @@ lion_verify_directory(LionVerifyState *vs)
 				 */
 				if (j + 1 < children.npages &&
 					lvl[i - 1].highkey[j] != NULL &&
-					lion_cmp_entries(vs->state, lvl[i - 1].highkey[j],
+					lion_cmp_entries(vs->ix, lvl[i - 1].highkey[j],
 									 children.firstkey[j + 1]) > 0)
 					lion_corrupt("lion index \"%s\": the high key of block %u sorts after the separator of its right sibling",
 								RelationGetRelationName(vs->index),
@@ -1668,11 +1861,11 @@ lion_verify_reachable(LionVerifyState *vs)
  * named by reservedflag when there is one (DESIGN.md §14 and §17)?
  */
 static bool
-lion_verify_tid_present(LionVerifyState *vs, Datum key, uint16 reservedflag,
-					   uint32 hash, uint32 ckey, uint16 lo)
+lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
+					   uint16 reservedflag, uint32 hash, uint32 ckey,
+					   uint16 lo)
 {
 	Relation	index = vs->index;
-	LionState   *state = vs->state;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	bool		present = false;
@@ -1739,15 +1932,18 @@ lion_verify_tid_present(LionVerifyState *vs, Datum key, uint16 reservedflag,
  * has to be indexed under its key.
  */
 static void
-lion_verify_one_key(LionVerifyState *vs, ItemPointer tid, Datum key,
-				   uint16 reservedflag, uint64 code)
+lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
+				   Datum key, uint16 reservedflag, uint64 code)
 {
 	uint32		hash = (reservedflag != 0) ? LION_NULLKEY_HASH :
-		lion_hash_key(vs->state, key);
+		lion_hash_key(state, key);
+	bool		typisvarlena;
 
-	if (lion_verify_tid_present(vs, key, reservedflag, hash,
+	if (lion_verify_tid_present(vs, state, key, reservedflag, hash,
 							   lion_code_ckey(code), lion_code_lo(code)))
 		return;
+
+	getTypeOutputInfo(state->typid, &vs->keyoutfunc, &typisvarlena);
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -1756,57 +1952,71 @@ lion_verify_one_key(LionVerifyState *vs, ItemPointer tid, Datum key,
 					ItemPointerGetOffsetNumber(tid),
 					RelationGetRelationName(vs->heap),
 					RelationGetRelationName(vs->index)),
-			 errdetail("The tuple's key is %s.",
+			 errdetail("Key column %u of the tuple is %s.", state->attno,
 					   (reservedflag == LION_ENTRY_NULLKEY) ? "NULL" :
 					   (reservedflag == LION_ENTRY_EMPTYKEY) ? "absent" :
 					   OidOutputFunctionCall(vs->keyoutfunc, key))));
 }
 
+/*
+ * table_index_build_scan() callback: every heap tuple visible to our snapshot
+ * has to be indexed under its key, in EVERY key column (DESIGN.md §24).
+ */
 static void
 lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 						 bool *isnull, bool tupleIsAlive, void *arg)
 {
 	LionVerifyState *vs = (LionVerifyState *) arg;
-	LionState   *state = vs->state;
 	MemoryContext oldcxt;
-	Datum		key;
 	uint64		code;
+	int			c;
 
 	oldcxt = MemoryContextSwitchTo(vs->heapcxt);
 
 	lion_check_key_offset(tid);
 	code = lion_tid_to_code(tid);
 
-	if (isnull[0])
+	for (c = 0; c < vs->ix->ncolumns; c++)
 	{
-		/* NULL values live in the reserved entry of bucket 0 (DESIGN.md §14). */
-		lion_verify_one_key(vs, tid, (Datum) 0, LION_ENTRY_NULLKEY, code);
-	}
-	else if (state->multikey)
-	{
-		/*
-		 * DESIGN.md §17: the row has to be present under EVERY key its value
-		 * extracts to, and in the reserved EMPTY entry when it extracts to
-		 * none.  Extracting here rather than trusting the index is the whole
-		 * point of the check: it is the same call the build and the insert
-		 * make, so a row that is missing under one of several keys is found.
-		 */
-		Datum	   *keys;
-		int			nkeys = lion_extract_value(state, values[0], &keys);
-		int			i;
+		LionState  *state = &vs->ix->cols[c];
+		Datum		key;
 
-		if (nkeys == 0)
-			lion_verify_one_key(vs, tid, (Datum) 0, LION_ENTRY_EMPTYKEY, code);
-		for (i = 0; i < nkeys; i++)
-			lion_verify_one_key(vs, tid, keys[i], 0, code);
-	}
-	else
-	{
-		key = values[0];
-		if (!state->typbyval && state->typlen == -1)
-			key = PointerGetDatum(PG_DETOAST_DATUM(key));
+		if (isnull[c])
+		{
+			/* NULL values live in the column's reserved entry (§14). */
+			lion_verify_one_key(vs, state, tid, (Datum) 0,
+							   LION_ENTRY_NULLKEY, code);
+		}
+		else if (state->multikey)
+		{
+			/*
+			 * DESIGN.md §17: the row has to be present under EVERY key its
+			 * value extracts to, and in the reserved EMPTY entry when it
+			 * extracts to none.  Extracting here rather than trusting the
+			 * index is the whole point of the check: it is the same call the
+			 * build and the insert make, so a row that is missing under one
+			 * of several keys is found.
+			 */
+			Datum	   *keys;
+			int			nkeys = lion_extract_value(state, values[c], &keys);
+			int			i;
 
-		lion_verify_one_key(vs, tid, key, 0, code);
+			if (nkeys == 0)
+				lion_verify_one_key(vs, state, tid, (Datum) 0,
+								   LION_ENTRY_EMPTYKEY, code);
+			for (i = 0; i < nkeys; i++)
+				lion_verify_one_key(vs, state, tid, keys[i], 0, code);
+		}
+		else
+		{
+			key = values[c];
+			if (!state->typbyval && state->typlen == -1)
+				key = PointerGetDatum(PG_DETOAST_DATUM(key));
+
+			lion_verify_one_key(vs, state, tid, key, 0, code);
+		}
+
+		CHECK_FOR_INTERRUPTS();
 	}
 
 	vs->nheaptuples++;
@@ -1825,9 +2035,6 @@ lion_verify_heapallindexed(LionVerifyState *vs)
 	IndexInfo  *indexinfo = BuildIndexInfo(vs->index);
 	TableScanDesc scan;
 	Snapshot	snapshot;
-	bool		typisvarlena;
-
-	getTypeOutputInfo(vs->state->typid, &vs->keyoutfunc, &typisvarlena);
 
 	vs->heapcxt = AllocSetContextCreate(CurrentMemoryContext,
 										"lion index verify heap tuple",
@@ -1892,7 +2099,7 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	heapoid = IndexGetRelation(relid, false);
 	vs.heap = table_open(heapoid, AccessShareLock);
 
-	vs.state = lion_get_state(vs.index);
+	vs.ix = lion_get_index_state(vs.index);
 	vs.nblocks = RelationGetNumberOfBlocks(vs.index);
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.refs = (uint8 *) palloc0(sizeof(uint8) * Max(vs.nblocks, 1));

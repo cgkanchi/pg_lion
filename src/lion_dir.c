@@ -61,17 +61,17 @@
 int64		lion_dir_pages_read = 0;
 
 static Buffer lion_dir_find_parent(Relation index, Relation heaprel,
-								  LionState *state, const LionSearchKey *sk,
+								  LionIndexState *ix, const LionSearchKey *sk,
 								  BlockNumber childblk, uint16 childlevel,
 								  OffsetNumber *offp);
-static void lion_dir_split(Relation index, Relation heaprel, LionState *state,
+static void lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix,
 						  Buffer buf, OffsetNumber off, bool replace,
 						  LionEntryTuple *newitem, Size newsize);
 static void lion_dir_place_again(Relation index, Relation heaprel,
-								 LionState *state, Buffer buf, bool replace,
+								 LionIndexState *ix, Buffer buf, bool replace,
 								 LionEntryTuple *item, Size size);
 static void lion_dir_finish_split(Relation index, Relation heaprel,
-								 LionState *state, Buffer pbuf);
+								 LionIndexState *ix, Buffer pbuf);
 
 /* ---------------------------------------------------------------------
  * Small page helpers
@@ -142,19 +142,29 @@ lion_dir_step_right(Relation index, Buffer buf, int lockmode)
  * --------------------------------------------------------------------- */
 
 int
-lion_cmp_prefix(LionState *state, const LionEntryTuple *item,
-				const LionSearchKey *sk)
+lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 {
-	int			ikind = lion_entry_kind(item);
+	int			ikind;
 
+	/*
+	 * The KEY COLUMN leads (DESIGN.md §24).  An item of another column is
+	 * settled here, before any opclass function is called - which is what
+	 * makes it safe for one descent to cross the entries of columns whose key
+	 * types it knows nothing about.  A minus-infinity downlink carries column
+	 * 0 and therefore sorts below every entry of every column.
+	 */
+	if (item->attno != sk->attno)
+		return item->attno < sk->attno ? -1 : 1;
+
+	ikind = lion_entry_kind(item);
 	if (ikind != sk->kind)
 		return ikind < sk->kind ? -1 : 1;
 	if (ikind != LION_KIND_VALUE)
-		return 0;					/* one NULL and one EMPTY entry per index */
+		return 0;					/* one NULL and one EMPTY entry per column */
 
 	if (sk->cmpproc != NULL)
 	{
-		Datum		stored = lion_fetch_key(state, LionEntryGetKey(item));
+		Datum		stored = lion_fetch_key(sk->col, LionEntryGetKey(item));
 		int32		c = DatumGetInt32(FunctionCall2Coll(sk->cmpproc,
 														sk->collation,
 														stored, sk->key));
@@ -170,10 +180,9 @@ lion_cmp_prefix(LionState *state, const LionEntryTuple *item,
 }
 
 int
-lion_cmp_entry(LionState *state, const LionEntryTuple *item,
-			   const LionSearchKey *sk)
+lion_cmp_entry(const LionEntryTuple *item, const LionSearchKey *sk)
 {
-	int			c = lion_cmp_prefix(state, item, sk);
+	int			c = lion_cmp_prefix(item, sk);
 	Size		n;
 
 	if (c != 0)
@@ -201,19 +210,21 @@ lion_cmp_entry(LionState *state, const LionEntryTuple *item,
 }
 
 int
-lion_cmp_entries(LionState *state, const LionEntryTuple *a,
+lion_cmp_entries(LionIndexState *ix, const LionEntryTuple *a,
 				 const LionEntryTuple *b)
 {
 	LionSearchKey sk;
 
-	lion_search_key_exact(state, &sk, b);
-	return lion_cmp_entry(state, a, &sk);
+	lion_search_key_exact(ix, &sk, b);
+	return lion_cmp_entry(a, &sk);
 }
 
 void
 lion_search_key_init(LionState *state, LionSearchKey *sk, int kind, Datum key,
 					 uint32 hash)
 {
+	sk->attno = state->attno;
+	sk->col = state;
 	sk->kind = kind;
 	sk->key = key;
 	sk->hash = hash;
@@ -225,16 +236,34 @@ lion_search_key_init(LionState *state, LionSearchKey *sk, int kind, Datum key,
 }
 
 void
-lion_search_key_exact(LionState *state, LionSearchKey *sk,
+lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 					  const LionEntryTuple *entry)
 {
 	int			kind = lion_entry_kind(entry);
 
-	lion_search_key_init(state, sk, kind,
-						 kind == LION_KIND_VALUE ?
-						 lion_fetch_key(state, LionEntryGetKey(entry)) :
-						 (Datum) 0,
-						 entry->hash);
+	/*
+	 * A minus-infinity downlink has no column and no key at all; it compares
+	 * below everything on the attno term alone, so the column state it is
+	 * given is never consulted (DESIGN.md §24).
+	 */
+	if (entry->attno == 0 || kind == LION_KIND_MINF)
+	{
+		lion_search_key_init(lion_column(ix, 1), sk, LION_KIND_MINF, (Datum) 0,
+							 entry->hash);
+		sk->attno = 0;
+		sk->cmpproc = NULL;
+	}
+	else
+	{
+		LionState  *col = lion_column(ix, (AttrNumber) entry->attno);
+
+		lion_search_key_init(col, sk, kind,
+							 kind == LION_KIND_VALUE ?
+							 lion_fetch_key(col, LionEntryGetKey(entry)) :
+							 (Datum) 0,
+							 entry->hash);
+	}
+
 	sk->raw = LionEntryGetKey(entry);
 	sk->rawlen = entry->keylen;
 }
@@ -244,8 +273,7 @@ lion_search_key_exact(LionState *state, LionSearchKey *sk,
  * before sk (strict: does not sort before or equal to it).
  */
 static OffsetNumber
-lion_page_binsrch_ext(LionState *state, Page page, const LionSearchKey *sk,
-					  bool strict)
+lion_page_binsrch_ext(Page page, const LionSearchKey *sk, bool strict)
 {
 	OffsetNumber lo = lion_page_first_data(page);
 	OffsetNumber hi = OffsetNumberNext(PageGetMaxOffsetNumber(page));
@@ -253,7 +281,7 @@ lion_page_binsrch_ext(LionState *state, Page page, const LionSearchKey *sk,
 	while (lo < hi)
 	{
 		OffsetNumber mid = lo + (hi - lo) / 2;
-		int			c = lion_cmp_entry(state, lion_page_item(page, mid), sk);
+		int			c = lion_cmp_entry(lion_page_item(page, mid), sk);
 
 		if (c > 0 || (!strict && c == 0))
 			hi = mid;
@@ -266,17 +294,17 @@ lion_page_binsrch_ext(LionState *state, Page page, const LionSearchKey *sk,
 
 /* The first item that does not sort before sk, for a leaf search. */
 OffsetNumber
-lion_dir_binsrch(LionState *state, Page page, const LionSearchKey *sk)
+lion_dir_binsrch(Page page, const LionSearchKey *sk)
 {
-	return lion_page_binsrch_ext(state, page, sk, false);
+	return lion_page_binsrch_ext(page, sk, false);
 }
 
 /* The downlink of the child sk belongs to, on an internal page. */
 static OffsetNumber
-lion_page_downlink(LionState *state, Page page, const LionSearchKey *sk)
+lion_page_downlink(Page page, const LionSearchKey *sk)
 {
 	OffsetNumber first = lion_page_first_data(page);
-	OffsetNumber off = lion_page_binsrch_ext(state, page, sk, true);
+	OffsetNumber off = lion_page_binsrch_ext(page, sk, true);
 
 	/*
 	 * Normally the leftmost downlink of a page compares below every key - the
@@ -296,7 +324,7 @@ lion_page_downlink(LionState *state, Page page, const LionSearchKey *sk)
  * --------------------------------------------------------------------- */
 
 BlockNumber
-lion_dir_root(Relation index, LionState *state, uint32 *height)
+lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 {
 	Buffer		buf;
 	Page		page;
@@ -322,8 +350,8 @@ lion_dir_root(Relation index, LionState *state, uint32 *height)
 		elog(ERROR, "lion index \"%s\": the meta page has no root",
 			 RelationGetRelationName(index));
 
-	state->meta.root = root;
-	state->meta.height = h;
+	ix->meta.root = root;
+	ix->meta.height = h;
 	if (height != NULL)
 		*height = h;
 
@@ -337,13 +365,13 @@ lion_dir_root(Relation index, LionState *state, uint32 *height)
  * meta-page visit at all.
  */
 static Buffer
-lion_dir_get_root(Relation index, LionState *state)
+lion_dir_get_root(Relation index, LionIndexState *ix)
 {
 	bool		refreshed = false;
 	BlockNumber blk;
 
-	blk = BlockNumberIsValid(state->meta.root) ? state->meta.root :
-		lion_dir_root(index, state, NULL);
+	blk = BlockNumberIsValid(ix->meta.root) ? ix->meta.root :
+		lion_dir_root(index, ix, NULL);
 
 	for (;;)
 	{
@@ -361,15 +389,15 @@ lion_dir_get_root(Relation index, LionState *state)
 		if (refreshed)
 			elog(ERROR, "lion index \"%s\": block %u is not the root page",
 				 RelationGetRelationName(index), blk);
-		blk = lion_dir_root(index, state, NULL);
+		blk = lion_dir_root(index, ix, NULL);
 		refreshed = true;
 	}
 }
 
 BlockNumber
-lion_dir_leftmost_leaf(Relation index, LionState *state)
+lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
 {
-	Buffer		buf = lion_dir_get_root(index, state);
+	Buffer		buf = lion_dir_get_root(index, ix);
 
 	for (;;)
 	{
@@ -405,7 +433,7 @@ lion_dir_leftmost_leaf(Relation index, LionState *state)
  * --------------------------------------------------------------------- */
 
 Buffer
-lion_dir_search(Relation index, Relation heaprel, LionState *state,
+lion_dir_search(Relation index, Relation heaprel, LionIndexState *ix,
 				const LionSearchKey *sk, int lockmode, bool forwrite,
 				OffsetNumber *offp)
 {
@@ -414,7 +442,7 @@ lion_dir_search(Relation index, Relation heaprel, LionState *state,
 	Assert(!forwrite || lockmode == BUFFER_LOCK_EXCLUSIVE);
 
 restart:
-	buf = lion_dir_get_root(index, state);
+	buf = lion_dir_get_root(index, ix);
 
 	if (LionPageIsLeaf(BufferGetPage(buf)) && lockmode != BUFFER_LOCK_SHARE)
 	{
@@ -466,7 +494,7 @@ restart:
 					LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 				}
 				if (LionPageIncompleteSplit(BufferGetPage(buf)))
-					lion_dir_finish_split(index, heaprel, state, buf);
+					lion_dir_finish_split(index, heaprel, ix, buf);
 				if (pagelock != BUFFER_LOCK_EXCLUSIVE)
 				{
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -475,7 +503,7 @@ restart:
 				continue;
 			}
 
-			if (lion_cmp_entry(state, lion_page_highkey(page), sk) > 0)
+			if (lion_cmp_entry(lion_page_highkey(page), sk) > 0)
 				break;
 
 			buf = lion_dir_step_right(index, buf, pagelock);
@@ -484,11 +512,11 @@ restart:
 
 		if (LionPageIsLeaf(page))
 		{
-			*offp = lion_page_binsrch_ext(state, page, sk, false);
+			*offp = lion_page_binsrch_ext(page, sk, false);
 			return buf;
 		}
 
-		off = lion_page_downlink(state, page, sk);
+		off = lion_page_downlink(page, sk);
 		child = lion_page_item(page, off)->head;
 		childlock = (LionPageGetOpaque(page)->level == 1) ? lockmode :
 			BUFFER_LOCK_SHARE;
@@ -510,10 +538,11 @@ restart:
  * directory; none of pg_lion's own opclasses take this path.
  */
 static bool
-lion_dir_find_by_scan(Relation index, LionState *state, const LionSearchKey *sk,
-					 int lockmode, Buffer *bufp, OffsetNumber *offnum)
+lion_dir_find_by_scan(Relation index, LionIndexState *ix,
+					 const LionSearchKey *sk, int lockmode, Buffer *bufp,
+					 OffsetNumber *offnum)
 {
-	BlockNumber blk = lion_dir_leftmost_leaf(index, state);
+	BlockNumber blk = lion_dir_leftmost_leaf(index, ix);
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -535,11 +564,13 @@ lion_dir_find_by_scan(Relation index, LionState *state, const LionSearchKey *sk,
 			if (!ItemIdIsUsed(iid))
 				continue;
 			e = (LionEntryTuple *) PageGetItem(page, iid);
+			if (e->attno != sk->attno)
+				continue;		/* another key column (DESIGN.md §24) */
 			if (lion_entry_kind(e) != sk->kind)
 				continue;
 			if (sk->kind == LION_KIND_VALUE &&
 				!DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
-												lion_fetch_key(state,
+												lion_fetch_key(sk->col,
 															   LionEntryGetKey(e)),
 												sk->key)))
 				continue;
@@ -566,7 +597,7 @@ lion_dir_find_by_scan(Relation index, LionState *state, const LionSearchKey *sk,
  * page further right.  On false, *offp is where the scan stopped.
  */
 bool
-lion_dir_scan_run(Relation index, LionState *state, const LionSearchKey *sk,
+lion_dir_scan_run(Relation index, const LionSearchKey *sk,
 				  int lockmode, Buffer *bufp, OffsetNumber *offp,
 				  bool *movedright)
 {
@@ -589,7 +620,7 @@ lion_dir_scan_run(Relation index, LionState *state, const LionSearchKey *sk,
 				continue;
 			e = (LionEntryTuple *) PageGetItem(page, iid);
 
-			c = lion_cmp_prefix(state, e, sk);
+			c = lion_cmp_prefix(e, sk);
 			if (c > 0)
 				goto notfound;
 			if (c < 0)
@@ -602,7 +633,7 @@ lion_dir_scan_run(Relation index, LionState *state, const LionSearchKey *sk,
 			 */
 			if (sk->kind != LION_KIND_VALUE ||
 				DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
-											   lion_fetch_key(state,
+											   lion_fetch_key(sk->col,
 															  LionEntryGetKey(e)),
 											   sk->key)))
 			{
@@ -617,7 +648,7 @@ lion_dir_scan_run(Relation index, LionState *state, const LionSearchKey *sk,
 		/* The run of prefix-equal keys may continue on the right sibling. */
 		if (LionPageIsRightmost(page))
 			break;
-		if (lion_cmp_prefix(state, lion_page_highkey(page), sk) > 0)
+		if (lion_cmp_prefix(lion_page_highkey(page), sk) > 0)
 			break;
 
 		/*
@@ -628,7 +659,7 @@ lion_dir_scan_run(Relation index, LionState *state, const LionSearchKey *sk,
 		 */
 		if (lockmode == BUFFER_LOCK_EXCLUSIVE && LionPageIncompleteSplit(page))
 		{
-			lion_dir_finish_split(index, NULL, state, buf);
+			lion_dir_finish_split(index, NULL, sk->col->ix, buf);
 			continue;
 		}
 
@@ -646,7 +677,7 @@ notfound:
 }
 
 bool
-lion_dir_find(Relation index, Relation heaprel, LionState *state,
+lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 			  const LionSearchKey *sk, int lockmode, bool forwrite,
 			  Buffer *bufp, OffsetNumber *offnum, bool *movedright)
 {
@@ -656,18 +687,47 @@ lion_dir_find(Relation index, Relation heaprel, LionState *state,
 	if (movedright != NULL)
 		*movedright = false;
 
-	if (state->ordered && sk->cmpproc == NULL && sk->kind == LION_KIND_VALUE)
+	if (sk->col->ordered && sk->cmpproc == NULL && sk->kind == LION_KIND_VALUE)
 	{
 		Assert(!forwrite);
-		return lion_dir_find_by_scan(index, state, sk, lockmode, bufp, offnum);
+		return lion_dir_find_by_scan(index, ix, sk, lockmode, bufp, offnum);
 	}
 
-	buf = lion_dir_search(index, heaprel, state, sk, lockmode, forwrite, &off);
+	buf = lion_dir_search(index, heaprel, ix, sk, lockmode, forwrite, &off);
 
 	*bufp = buf;
 	*offnum = off;
-	return lion_dir_scan_run(index, state, sk, lockmode, bufp, offnum,
-							 movedright);
+	return lion_dir_scan_run(index, sk, lockmode, bufp, offnum, movedright);
+}
+
+/*
+ * The leaf where one key column's run of entries begins (DESIGN.md §24).
+ *
+ * Every entry of that column sorts at or above (attno, MINF), which is a
+ * position no stored item can occupy - MINF belongs to downlinks - so the
+ * descent lands exactly on the first entry of the column, or on the first
+ * entry of a LATER column when this one has none at all.  The caller walks
+ * right from there and stops at the first entry whose attno is not its own.
+ */
+BlockNumber
+lion_dir_column_first(Relation index, LionState *col, OffsetNumber *offp)
+{
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
+	BlockNumber blk;
+
+	lion_search_key_init(col, &sk, LION_KIND_MINF, (Datum) 0, 0);
+	sk.cmpproc = NULL;			/* MINF never reaches the key comparison */
+
+	buf = lion_dir_search(index, NULL, col->ix, &sk, BUFFER_LOCK_SHARE, false,
+						  &off);
+	blk = BufferGetBlockNumber(buf);
+	UnlockReleaseBuffer(buf);
+
+	if (offp != NULL)
+		*offp = off;
+	return blk;
 }
 
 /* ---------------------------------------------------------------------
@@ -696,6 +756,8 @@ lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 	p->head = child;
 	p->tail = InvalidBlockNumber;
 	p->ncontainers = 0;
+	/* A pivot routes to the column its source key belongs to (§24). */
+	p->attno = (src != NULL) ? src->attno : 0;
 	p->ntids = 0;
 	if (keylen > 0)
 		memcpy(LionEntryGetKey(p), LionEntryGetKey(src), keylen);
@@ -719,7 +781,7 @@ lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs, int noffs)
 }
 
 void
-lion_dir_place(Relation index, Relation heaprel, LionState *state, Buffer buf,
+lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 			   OffsetNumber off, bool replace, LionEntryTuple *item, Size size)
 {
 	Page		page = BufferGetPage(buf);
@@ -734,7 +796,7 @@ lion_dir_place(Relation index, Relation heaprel, LionState *state, Buffer buf,
 	 */
 	if (LionPageIncompleteSplit(page))
 	{
-		lion_dir_finish_split(index, heaprel, state, buf);
+		lion_dir_finish_split(index, heaprel, ix, buf);
 		page = BufferGetPage(buf);
 	}
 
@@ -767,7 +829,7 @@ lion_dir_place(Relation index, Relation heaprel, LionState *state, Buffer buf,
 		return;
 	}
 
-	lion_dir_split(index, heaprel, state, buf, off, replace, item, size);
+	lion_dir_split(index, heaprel, ix, buf, off, replace, item, size);
 }
 
 /* ---------------------------------------------------------------------
@@ -884,7 +946,7 @@ lion_dir_fill_page(Relation index, Page page, LionEntryTuple *hk, Size hksz,
 }
 
 static void
-lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
+lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 			   OffsetNumber off, bool replace, LionEntryTuple *newitem,
 			   Size newsize)
 {
@@ -985,9 +1047,9 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 		Assert(newitem != NULL);
 		pfree(items);
 		pfree(copy);
-		lion_dir_split(index, heaprel, state, buf, InvalidOffsetNumber, false,
+		lion_dir_split(index, heaprel, ix, buf, InvalidOffsetNumber, false,
 					   NULL, 0);
-		lion_dir_place_again(index, heaprel, state, buf, replace, newitem,
+		lion_dir_place_again(index, heaprel, ix, buf, replace, newitem,
 							 newsize);
 		return;
 	}
@@ -1072,8 +1134,8 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 
 		GenericXLogFinish(xstate);
 
-		state->meta.root = nblk;
-		state->meta.height = level + 1;
+		ix->meta.root = nblk;
+		ix->meta.height = level + 1;
 
 		UnlockReleaseBuffer(metabuf);
 		UnlockReleaseBuffer(newroot);
@@ -1118,7 +1180,7 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 	 */
 	INJECTION_POINT("lion-dir-split-incomplete", NULL);
 
-	lion_dir_finish_split(index, heaprel, state, buf);
+	lion_dir_finish_split(index, heaprel, ix, buf);
 }
 
 /*
@@ -1132,16 +1194,16 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
  * cannot close a cycle with it.
  */
 static void
-lion_dir_place_again(Relation index, Relation heaprel, LionState *state,
+lion_dir_place_again(Relation index, Relation heaprel, LionIndexState *ix,
 					 Buffer buf, bool replace, LionEntryTuple *item, Size size)
 {
 	LionSearchKey sk;
 	Page		page = BufferGetPage(buf);
 
-	lion_search_key_exact(state, &sk, item);
+	lion_search_key_exact(ix, &sk, item);
 
 	if (!LionPageIsRightmost(page) &&
-		lion_cmp_entry(state, lion_page_highkey(page), &sk) <= 0)
+		lion_cmp_entry(lion_page_highkey(page), &sk) <= 0)
 	{
 		BlockNumber next = LionPageGetOpaque(page)->rightlink;
 		Buffer		rbuf = lion_dir_readbuf(index, next);
@@ -1149,14 +1211,14 @@ lion_dir_place_again(Relation index, Relation heaprel, LionState *state,
 
 		LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
 		lion_dir_check_page(index, BufferGetPage(rbuf), next);
-		roff = lion_dir_binsrch(state, BufferGetPage(rbuf), &sk);
-		lion_dir_place(index, heaprel, state, rbuf, roff, replace, item, size);
+		roff = lion_dir_binsrch(BufferGetPage(rbuf), &sk);
+		lion_dir_place(index, heaprel, ix, rbuf, roff, replace, item, size);
 		UnlockReleaseBuffer(rbuf);
 		return;
 	}
 
-	lion_dir_place(index, heaprel, state, buf,
-				   lion_dir_binsrch(state, page, &sk), replace, item, size);
+	lion_dir_place(index, heaprel, ix, buf,
+				   lion_dir_binsrch(page, &sk), replace, item, size);
 }
 
 /*
@@ -1205,7 +1267,7 @@ lion_dir_downlink_present(Relation index, Buffer pbuf, OffsetNumber off,
  * not one, and the relation is extended instead.
  */
 static void
-lion_dir_finish_split(Relation index, Relation heaprel, LionState *state,
+lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 					  Buffer pbuf)
 {
 	Page		ppage = BufferGetPage(pbuf);
@@ -1240,14 +1302,14 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionState *state,
 	 */
 	if (first <= PageGetMaxOffsetNumber(ppage))
 	{
-		lion_search_key_exact(state, &sk, lion_page_item(ppage, first));
+		lion_search_key_exact(ix, &sk, lion_page_item(ppage, first));
 		skp = &sk;
 	}
 
-	parent = lion_dir_find_parent(index, heaprel, state, skp, pblk, level, &off);
+	parent = lion_dir_find_parent(index, heaprel, ix, skp, pblk, level, &off);
 
 	if (!lion_dir_downlink_present(index, parent, off, rblk))
-		lion_dir_place(index, heaprel, state, parent, OffsetNumberNext(off),
+		lion_dir_place(index, heaprel, ix, parent, OffsetNumberNext(off),
 					   false, sep, sepsz);
 
 	UnlockReleaseBuffer(parent);
@@ -1265,7 +1327,7 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionState *state,
  * the leftmost page of that level.
  */
 static Buffer
-lion_dir_find_parent(Relation index, Relation heaprel, LionState *state,
+lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 					 const LionSearchKey *sk, BlockNumber childblk,
 					 uint16 childlevel, OffsetNumber *offp)
 {
@@ -1273,7 +1335,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionState *state,
 	BlockNumber blk;
 
 	/* Descend to the level above the child, reading only. */
-	buf = lion_dir_get_root(index, state);
+	buf = lion_dir_get_root(index, ix);
 	if (LionPageGetOpaque(BufferGetPage(buf))->level <= childlevel)
 	{
 		UnlockReleaseBuffer(buf);
@@ -1293,12 +1355,12 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionState *state,
 		if (sk != NULL)
 		{
 			while (!LionPageIsRightmost(page) &&
-				   lion_cmp_entry(state, lion_page_highkey(page), sk) <= 0)
+				   lion_cmp_entry(lion_page_highkey(page), sk) <= 0)
 			{
 				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buf);
 			}
-			off = lion_page_downlink(state, page, sk);
+			off = lion_page_downlink(page, sk);
 		}
 		else
 			off = lion_page_first_data(page);
@@ -1339,7 +1401,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionState *state,
 		 */
 		if (LionPageIncompleteSplit(page))
 		{
-			lion_dir_finish_split(index, heaprel, state, buf);
+			lion_dir_finish_split(index, heaprel, ix, buf);
 			page = BufferGetPage(buf);
 		}
 
@@ -1372,14 +1434,14 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionState *state,
  * so, though a re-descent may replace it with another leaf.
  */
 void
-lion_dir_add_entry(Relation index, Relation heaprel, LionState *state,
+lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 				   Buffer *bufp, OffsetNumber off, bool movedright,
 				   LionEntryTuple *entry, Size size)
 {
 	LionSearchKey exact;
 	Buffer		buf = *bufp;
 
-	lion_search_key_exact(state, &exact, entry);
+	lion_search_key_exact(ix, &exact, entry);
 
 	if (movedright)
 	{
@@ -1390,7 +1452,7 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionState *state,
 		 * distinct entries, so this is vanishingly rare; ask again, exactly.
 		 */
 		UnlockReleaseBuffer(buf);
-		buf = lion_dir_search(index, heaprel, state, &exact,
+		buf = lion_dir_search(index, heaprel, ix, &exact,
 							  BUFFER_LOCK_EXCLUSIVE, true, &off);
 		*bufp = buf;
 	}
@@ -1400,10 +1462,10 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionState *state,
 		OffsetNumber first = lion_page_first_data(page);
 
 		while (off > first &&
-			   lion_cmp_entry(state, lion_page_item(page, OffsetNumberPrev(off)),
+			   lion_cmp_entry(lion_page_item(page, OffsetNumberPrev(off)),
 							  &exact) > 0)
 			off = OffsetNumberPrev(off);
 	}
 
-	lion_dir_place(index, heaprel, state, buf, off, false, entry, size);
+	lion_dir_place(index, heaprel, ix, buf, off, false, entry, size);
 }

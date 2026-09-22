@@ -170,6 +170,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	1	OidList: heap Oid, the outer and inner group index Oids (InvalidOid if
  *		none; the inner one only for a two-column GROUP BY, DESIGN.md §20),
  *		then one Oid per WHERE clause, in the same order as the other lists.
+ *		An index may be a MULTICOLUMN one (DESIGN.md §24); which of its key
+ *		columns each of these is read for is NOT carried here but derived at
+ *		execution time from the opened index and the attnum in member 2.
  *		For a partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
  *		column names against it) and every index Oid is InvalidOid: the real
  *		ones are per partition, in LION_PRIV_PARTS.
@@ -217,8 +220,17 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * Param among them reaches setrefs.c and SS_finalize_plan() (DESIGN.md §10).
  * Shape 4 added the OR structure of DESIGN.md §19, and shape 5 the second
  * GROUP BY column of DESIGN.md §20.
+ *
+ * Shape 6 changed no member's POSITION, which is exactly what the marker is
+ * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
+ * the key column it is read for is not in the list at all - the executor
+ * derives it from the index it really opened and the clause's heap attnum
+ * (lion_index_col_for()), because a partition's index may put the same column
+ * at a different position from the parent's.  A plan built before that would
+ * have been made by a planner that never chose a multicolumn index, so it
+ * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x52424905
+#define LION_PRIV_MAGIC		0x52424906
 #define LION_PRIV_NMEMBERS	9
 
 /*
@@ -236,7 +248,12 @@ typedef struct LionClauseState
 	int			kind;			/* LION_CLAUSE_* */
 	Oid			idxoid;
 	Oid			opno;			/* the clause's operator (0 for a null test) */
-	AttrNumber	attno;
+	AttrNumber	attno;			/* the HEAP column (the parent's, with §16's
+								 * partitions) */
+	AttrNumber	idxcol;			/* and its KEY COLUMN in `idx` (DESIGN.md
+								 * §24), derived from the index that was really
+								 * opened - which for a partition is that
+								 * partition's own numbering */
 
 	/*
 	 * The compared value: its expression (from custom_exprs), the expression
@@ -308,6 +325,18 @@ typedef struct LionCountScanState
 	Oid			groupidxoid2;	/* the inner index of a two-column GROUP BY */
 	AttrNumber	groupattno;
 	AttrNumber	groupattno2;
+
+	/*
+	 * The HEAP column whose entries drive the scan: groupattno, or - for the
+	 * sum-over-all of DESIGN.md §14, which has no group column at all - the
+	 * column of the `IS NOT NULL` clause the planner chose as its driver.  It
+	 * is what the driving index's KEY COLUMN is derived from (§24), and it is
+	 * NOT groupattno: the target list, EXPLAIN and the partitioned dispatch
+	 * all ask `groupattno != 0` to mean "there is a GROUP BY".
+	 */
+	AttrNumber	driveattno;
+	AttrNumber	groupidxcol;	/* key column of groupidx (§24) */
+	AttrNumber	groupidxcol2;	/* ... and of groupidx2 */
 	bool		singlegroup;	/* GROUP BY over constant columns only */
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
@@ -529,9 +558,16 @@ lion_opfamily_is_multikey(Oid opfamily, Oid opcintype)
  * GROUP BY (the entries would be lexemes, not arrays) nor be summed over
  * (a row appears under each of its keys, so the sum of the entries is not
  * the number of rows - which is what DESIGN.md §14's sum-over-all rests on).
+ *
+ * *colp receives the INDEX COLUMN (1-based) that indexes `attno` (DESIGN.md
+ * §24).  A multicolumn lion index holds each column's keys as an independent
+ * set of entries, so ANY of its columns will do and the rest of this file
+ * carries that number beside the index; colp may be NULL for a caller that
+ * only asks whether such an index exists.
  */
 static IndexOptInfo *
-lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
+lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
+					   AttrNumber *colp)
 {
 	Oid			amoid = lion_get_am_oid();
 	ListCell   *lc;
@@ -539,22 +575,40 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
 	foreach(lc, rel->indexlist)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			i;
 
 		if (idx->relam != amoid)
 			continue;
 		if (idx->hypothetical)
 			continue;
-		if (idx->ncolumns != 1 || idx->nkeycolumns != 1)
-			continue;
 		if (idx->indpred != NIL || idx->indexprs != NIL)
 			continue;
-		if (idx->indexkeys[0] != attno)
-			continue;
-		if (lion_opfamily_is_multikey(idx->opfamily[0],
-									 idx->opcintype[0]) != multikey)
-			continue;
 
-		return idx;
+		/*
+		 * ANY key column, not just the first (DESIGN.md §24).  INCLUDE columns
+		 * (ncolumns > nkeycolumns) cannot happen - amcaninclude is false - but
+		 * the loop is bounded by nkeycolumns anyway, because an INCLUDE column
+		 * has no opclass to ask about.
+		 *
+		 * `indexprs`: an expression column has indexkeys[i] == 0 and can never
+		 * match a heap attno, so the skip above could in principle be relaxed
+		 * to "skip the expression COLUMNS".  It is left as it is: the count
+		 * pushdown has no way to evaluate the expression for its output.
+		 * `indpred` likewise - a partial index would need its predicate
+		 * applied, which this node does not do.
+		 */
+		for (i = 0; i < idx->nkeycolumns; i++)
+		{
+			if (idx->indexkeys[i] != attno)
+				continue;
+			if (lion_opfamily_is_multikey(idx->opfamily[i],
+										 idx->opcintype[i]) != multikey)
+				continue;
+
+			if (colp != NULL)
+				*colp = (AttrNumber) (i + 1);
+			return idx;
+		}
 	}
 
 	return NULL;
@@ -566,12 +620,18 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey)
  * has it (the AM requires strategy 1), but an opfamily that only declares
  * cross-type members for (opcintype, opcintype) would not, and then nothing
  * below can be proved about the index.
+ *
+ * col is the index's KEY COLUMN (DESIGN.md §24): every column of a
+ * multicolumn index has an opclass of its own, so every question about an
+ * opclass has to name one.
  */
 static Oid
-lion_index_equality_op(IndexOptInfo *idx)
+lion_index_equality_op(IndexOptInfo *idx, AttrNumber col)
 {
-	return get_opfamily_member(idx->opfamily[0], idx->opcintype[0],
-							   idx->opcintype[0], LION_STRAT_EQUAL);
+	int			i = col - 1;
+
+	return get_opfamily_member(idx->opfamily[i], idx->opcintype[i],
+							   idx->opcintype[i], LION_STRAT_EQUAL);
 }
 
 /*
@@ -644,10 +704,10 @@ lion_type_equalimage(Oid typid, Oid collation)
  * value the target list prints - come through here.
  */
 static bool
-lion_index_can_emit_value(IndexOptInfo *idx)
+lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col)
 {
-	Oid			typid = idx->opcintype[0];
-	Oid			idxeq = lion_index_equality_op(idx);
+	Oid			typid = idx->opcintype[col - 1];
+	Oid			idxeq = lion_index_equality_op(idx, col);
 	TypeCacheEntry *typentry;
 	Oid			typeeq;
 
@@ -663,7 +723,7 @@ lion_index_can_emit_value(IndexOptInfo *idx)
 	if (!OidIsValid(typeeq) || typeeq != idxeq)
 		return false;
 
-	return lion_type_equalimage(typid, idx->indexcollations[0]);
+	return lion_type_equalimage(typid, idx->indexcollations[col - 1]);
 }
 
 /*
@@ -688,13 +748,16 @@ lion_index_can_emit_value(IndexOptInfo *idx)
 static IndexOptInfo *
 lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
-				Oid exprcoll)
+				Oid exprcoll, AttrNumber *colp)
 {
 	bool		multikey = (kind == LION_CLAUSE_MULTI);
-	IndexOptInfo *idx = lion_find_roaring_index(rel, attno, multikey);
+	AttrNumber	col = 1;
+	IndexOptInfo *idx = lion_find_roaring_index(rel, attno, multikey, &col);
+	int			i;
 
 	if (idx == NULL)
 		return NULL;
+	i = col - 1;				/* the KEY COLUMN's opclass (DESIGN.md §24) */
 
 	/*
 	 * The planner's own rule, IndexCollMatchesExprColl(): a collation-
@@ -704,35 +767,39 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	 * insensitive index under a case-sensitive query) would count rows the
 	 * query does not select.
 	 */
-	if (OidIsValid(exprcoll) && idx->indexcollations[0] != exprcoll)
+	if (OidIsValid(exprcoll) && idx->indexcollations[i] != exprcoll)
 		return NULL;
 
 	if (multikey)
 	{
-		if (get_op_opfamily_strategy(opno, idx->opfamily[0]) != strategy)
+		if (get_op_opfamily_strategy(opno, idx->opfamily[i]) != strategy)
 			return NULL;
-		if (get_opfamily_proc(idx->opfamily[0], idx->opcintype[0],
-							  idx->opcintype[0],
+		if (get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
+							  idx->opcintype[i],
 							  LION_EXTRACTQUERY_PROC) != extractquery)
 			return NULL;
+		if (colp != NULL)
+			*colp = col;
 		return idx;
 	}
 
 	if (OidIsValid(opno) &&
-		get_op_opfamily_strategy(opno, idx->opfamily[0]) != LION_STRAT_EQUAL)
+		get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_EQUAL)
 		return NULL;
 
 	if (OidIsValid(cmptype))
 	{
-		if (!OidIsValid(get_opfamily_member(idx->opfamily[0],
-											idx->opcintype[0], cmptype,
+		if (!OidIsValid(get_opfamily_member(idx->opfamily[i],
+											idx->opcintype[i], cmptype,
 											LION_STRAT_EQUAL)))
 			return NULL;
-		if (!OidIsValid(get_opfamily_proc(idx->opfamily[0], cmptype, cmptype,
+		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], cmptype, cmptype,
 										  LION_HASH_PROC)))
 			return NULL;
 	}
 
+	if (colp != NULL)
+		*colp = col;
 	return idx;
 }
 
@@ -846,7 +913,13 @@ typedef struct LionCountTarget
 												 * outer one, [1] the inner
 												 * one of a two-column GROUP
 												 * BY (DESIGN.md §20) */
+	AttrNumber	drivecol[LION_MAX_GROUPCOLS];	/* and which KEY COLUMN of
+												 * each of them (§24): the two
+												 * may be columns of ONE
+												 * multicolumn index */
 	List	   *whereidx;		/* IndexOptInfo *, one per WHERE clause */
+	List	   *wherecol;		/* int list, that index's key column (§24),
+								 * one per WHERE clause */
 	Var		   *drivevar[LION_MAX_GROUPCOLS];	/* the driving columns in THIS
 												 * relation's own numbering,
 												 * which is what a per-relation
@@ -1051,12 +1124,15 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		if (drive[d].attno == 0)
 			continue;
 
-		t->driveidx[d] = lion_find_roaring_index(rel, drive[d].attno, false);
+		t->drivecol[d] = 1;
+		t->driveidx[d] = lion_find_roaring_index(rel, drive[d].attno, false,
+											   &t->drivecol[d]);
 		if (t->driveidx[d] == NULL)
 			return false;
 		/* Grouping under one collation, index built under another: no. */
 		if (OidIsValid(drive[d].collation) &&
-			t->driveidx[d]->indexcollations[0] != drive[d].collation)
+			t->driveidx[d]->indexcollations[t->drivecol[d] - 1] !=
+			drive[d].collation)
 			return false;
 
 		/*
@@ -1074,33 +1150,37 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		 * because they are only reached through a grouping index.
 		 */
 		if (OidIsValid(drive[d].eqop) &&
-			lion_index_equality_op(t->driveidx[d]) != drive[d].eqop)
+			lion_index_equality_op(t->driveidx[d], t->drivecol[d]) !=
+			drive[d].eqop)
 			return false;
 
 		/*
 		 * Printing the group key means printing a key this index stored, so
 		 * it has to be a representation the rows really have (finding 4).
 		 */
-		if (drive[d].valueout && !lion_index_can_emit_value(t->driveidx[d]))
+		if (drive[d].valueout &&
+			!lion_index_can_emit_value(t->driveidx[d], t->drivecol[d]))
 			return false;
 	}
 
 	forboth(l1, whereattnos, l2, clauseinfos)
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l2);
+		AttrNumber	col = 1;
 		IndexOptInfo *idx = lion_match_index(rel, (AttrNumber) lfirst_int(l1),
 											ci->kind, ci->opno, ci->cmptype,
 											ci->strategy, ci->extractquery,
-											ci->collation);
+											ci->collation, &col);
 
 		if (idx == NULL)
 			return false;
 
 		/* Same rule for a pinned column whose value the output prints. */
-		if (ci->valueout && !lion_index_can_emit_value(idx))
+		if (ci->valueout && !lion_index_can_emit_value(idx, col))
 			return false;
 
 		t->whereidx = lappend(t->whereidx, idx);
+		t->wherecol = lappend_int(t->wherecol, (int) col);
 	}
 
 	*targets = lappend(*targets, t);
@@ -1228,6 +1308,89 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 }
 
 /*
+ * ONE KEY COLUMN's share of a multicolumn lion index (DESIGN.md §24).
+ *
+ * Everything the model prices an index by - `idx->pages` and
+ * lion_index_dir_pages() - is PER RELATION, and a multicolumn index is one
+ * relation holding n independent sets of entries.  Charging a column the whole
+ * directory and the whole page count would price `WHERE b = 1` on `(a, b, c)`
+ * as three times what the same query on a single-column index of `b` costs,
+ * and the node would be refused for a query it answers exactly as fast.  §24
+ * says a column's set should be priced "as a single-column index of that
+ * column", so the page terms are scaled by this column's share of the
+ * relation's entries.
+ *
+ * The planner cannot count a column's entries: the meta page carries the
+ * directory's shape for the whole relation and nothing per column.  What it
+ * does have is the HEAP column's n_distinct, which is the same order of
+ * magnitude as that column's entry count (a scalar opclass makes one entry per
+ * distinct value, plus the reserved ones), so the share is
+ *
+ *		n_distinct(this column) / sum of n_distinct over the index's columns
+ *
+ * taken through examine_variable()/get_variable_numdistinct(), the same pair
+ * estimate_num_groups() uses, against a Var built from this relation's own
+ * attribute numbers - which for a partition are the partition's (§16).
+ *
+ * THE LIMITATION, and it is a real one: n_distinct is not entries.  A
+ * multi-key column (§17) has one entry per LEXEME and not per row value, so
+ * its share is understated - usually far - and the scalar columns beside it
+ * are charged for its directory.  A column with no statistics at all falls
+ * back to DEFAULT_NUM_DISTINCT for that column alone, which makes the split
+ * equal when NO column has statistics and biased when only some do.  Both
+ * errors are bounded by the number of columns, which is why this correction is
+ * worth making at all: without it the error is exactly that factor, always,
+ * and always against the node.
+ */
+static double
+lion_index_column_share(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					   AttrNumber col)
+{
+	RangeTblEntry *rte;
+	double		total = 0;
+	double		mine = 0;
+	int			i;
+
+	if (idx->nkeycolumns <= 1)
+		return 1.0;
+	if (rel->relid == 0 || rel->relid >= (Index) root->simple_rel_array_size)
+		return 1.0;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return 1.0;
+
+	for (i = 0; i < idx->nkeycolumns; i++)
+	{
+		AttrNumber	attno = idx->indexkeys[i];
+		VariableStatData vardata;
+		Var		   *var;
+		double		nd;
+		bool		isdefault;
+
+		/* An expression column has no heap attribute to ask about. */
+		if (attno <= 0)
+			return 1.0 / (double) idx->nkeycolumns;
+
+		var = makeVar(rel->relid, attno, get_atttype(rte->relid, attno), -1,
+					  get_typcollation(get_atttype(rte->relid, attno)), 0);
+		examine_variable(root, (Node *) var, 0, &vardata);
+		nd = get_variable_numdistinct(&vardata, &isdefault);
+		ReleaseVariableStats(vardata);
+		pfree(var);
+
+		nd = Max(nd, 1.0);
+		total += nd;
+		if (i == col - 1)
+			mine = nd;
+	}
+
+	if (total <= 0.0 || mine <= 0.0)
+		return 1.0 / (double) idx->nkeycolumns;
+
+	return Min(mine / total, 1.0);
+}
+
+/*
  * Does this index order its entries by the KEY TYPE's own order (DESIGN.md
  * §21)?  Two things have to hold, and both are about what the planner is
  * allowed to conclude from the entry scan coming out in directory order:
@@ -1243,10 +1406,10 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
  * planner's IndexCollMatchesExprColl() applies to an index scan.
  */
 static bool
-lion_index_orders_naturally(IndexOptInfo *idx)
+lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col)
 {
 	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
-	LionState  *state = lion_get_state(indexrel);
+	LionState  *state = lion_index_column_state(indexrel, col);
 	bool		ok = false;
 
 	if (state->ordered)
@@ -1270,6 +1433,60 @@ static double
 lion_containers_for(double heap_pages, double members)
 {
 	return Max(1.0, Min(heap_pages / LION_BLOCKS_PER_CONTAINER, members));
+}
+
+/*
+ * How tall the posting tree of a set that occupies `leaves` container pages is
+ * (DESIGN.md §22): 0 while it fits on one page, and one level for every
+ * LION_POSTING_FANOUT pages above that.
+ *
+ * The planner cannot read it anywhere: the meta page carries the height of the
+ * entry DIRECTORY, not of any one key's posting tree, and asking a key's own
+ * root for it would be a page read per estimate.  So it is derived from the
+ * shape the tree is built with - an internal page holds
+ * LION_PAGE_CAPACITY / (MAXALIGN(sizeof(LionPostingPivot)) + sizeof(ItemIdData))
+ * = 679 downlinks (lion_posting.c) - which is exact for a bulk-built tree and
+ * an underestimate of at most one level for a tree grown by splits.
+ */
+#define LION_POSTING_FANOUT \
+	((double) (LION_PAGE_CAPACITY / (MAXALIGN(LION_POSTING_PIVOT_SIZE) + \
+									 sizeof(ItemIdData))))
+
+static double
+lion_posting_height(double leaves)
+{
+	double		height = 0;
+
+	for (leaves = Max(leaves, 1.0); leaves > 1.0; leaves /= LION_POSTING_FANOUT)
+		height += 1.0;
+
+	return height;
+}
+
+/*
+ * How many pages of one posting tree that occupies `leaves` container pages
+ * `probes` seeks into it read (DESIGN.md §22).
+ *
+ * A source that does not drive the leapfrog join is never walked: it is sought
+ * to the container keys the driver produces, and one seek is a descent - one
+ * internal page per level and the leaf the key lives on - or, when the key is
+ * a page or two ahead, a step right, which the seek takes only while it is no
+ * dearer than the descent it saves (`LION_POSTING_SEEK_STEPS`).  So a probe
+ * costs `height + 1` pages and the source as a whole costs that many times the
+ * probes, never more than its whole chain, which is what a walk reads.
+ *
+ * Measured on the benchmark's one-million-row `fact` (release build,
+ * 2026-09-22), counting the node's buffer accesses: `c2 = 1` alone walks its
+ * 151 container pages and touches 154 buffers; probed by `c20k = 77`, which
+ * has a container at about 40 of the heap's 301 container keys, it touches 118
+ * - a descent's worth per probe and a page or so of stepping - against the 100
+ * this charges and the 151 a walk would.  Probed by `c1m = 12345`, which has
+ * one container key, it touches 2.
+ */
+static double
+lion_probed_pages(double leaves, double probes, double height)
+{
+	return Min(Max(leaves, 1.0), Max(probes, 0.0) * (height + 1.0));
 }
 
 /*
@@ -1362,6 +1579,7 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 }
 
 static bool *lion_or_leaf_map(List *ors, int nclause);
+static int *lion_or_group_map(List *ors, int nclause);
 
 /*
  * Does an IN list's source take the disjoint-sum short-circuit of DESIGN.md
@@ -1383,24 +1601,28 @@ static bool *lion_or_leaf_map(List *ors, int nclause);
  * Returns the clause index of the list, or -1 when neither applies.
  */
 static int
-lion_inlist_shape(IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
-				 List *whereidx, List *whereclauses, List *wherekinds,
+lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
+				 IndexOptInfo *groupidx2,
+				 List *whereidx, List *wherecol, List *whereclauses,
+				 List *wherekinds,
 				 List *ors, bool *sumshort, bool *groupdrive)
 {
 	int			nclause = list_length(whereclauses);
 	bool	   *inor = lion_or_leaf_map(ors, nclause);
 	IndexOptInfo *arrayidx = NULL;
+	AttrNumber	arraycol = 1;
 	int			arrayci = -1;
 	int			npos = 0;
 	int			ci = 0;
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
+	ListCell   *lc4;
 
 	*sumshort = false;
 	*groupdrive = false;
 
-	forthree(lc1, whereidx, lc2, whereclauses, lc3, wherekinds)
+	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
 	{
 		if (!inor[ci] && LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
 		{
@@ -1413,6 +1635,7 @@ lion_inlist_shape(IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
 				{
 					arrayci = ci;
 					arrayidx = (IndexOptInfo *) lfirst(lc1);
+					arraycol = (AttrNumber) lfirst_int(lc4);
 				}
 			}
 		}
@@ -1423,10 +1646,18 @@ lion_inlist_shape(IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
 	if (arrayci < 0)
 		return -1;
 
+	/*
+	 * The list drives the groups only when its entries ARE the groups: the
+	 * same index AND the same key column (DESIGN.md §24).  Two columns of one
+	 * multicolumn index are two independent sets of entries, so a list on `b`
+	 * says nothing about the groups of `a` - which is also how the executor
+	 * decides it (lion_locate_where(), by index and by heap attno).
+	 */
 	if (groupidx == NULL && groupidx2 == NULL && ors == NIL && npos == 1)
 		*sumshort = true;
 	else if (groupidx != NULL && groupidx2 == NULL && arrayidx != NULL &&
-			 arrayidx->indexoid == groupidx->indexoid)
+			 arrayidx->indexoid == groupidx->indexoid &&
+			 arraycol == groupcol)
 		*groupdrive = true;
 	else
 		return -1;
@@ -1436,8 +1667,10 @@ lion_inlist_shape(IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
 
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
-				   IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
-				   List *whereidx, List *whereclauses, List *wherekinds,
+				   IndexOptInfo *groupidx, AttrNumber groupcol,
+				   IndexOptInfo *groupidx2, AttrNumber groupcol2,
+				   List *whereidx, List *wherecol, List *whereclauses,
+				   List *wherekinds,
 				   List *ors, double numgroups,
 				   double outer_entries, double inner_entries)
 {
@@ -1450,16 +1683,29 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	Cost		descent_cost = 0;	/* comparisons on the way down (§21) */
 	double		seq_pages = 0;	/* container chains, read in order */
 	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
+	Cost		probe_cost = 0; /* what the SOUGHT sources read (§22) */
 	double		ncontainers = 0;
 	double	   *andc;			/* containers of each top-level AND source */
 	int			nand = 0;
-	bool	   *inor;
+	int		   *orgrp;			/* each clause's OR restriction, or -1 */
 	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
 	double		recheck_pages;
 	double	   *clausesel;		/* each clause's own selectivity, for §19 */
+	double	   *clausepages;	/* what a WALK of its sets would read */
+	double	   *clauseleaves;	/* leaves of ONE of its sets */
+	double	   *clauseheight;	/* how tall that set's posting tree is */
+	double	   *clausekeys;		/* how many sets it looks up */
+	double	   *clauseidx;		/* the pages of the index it reads */
+	int		   *clausesrc;		/* the AND source it is part of, or -1 */
+	double	   *srcmembers;		/* members of each AND source */
+	double	   *srccontainers;	/* and the containers they lie in */
+	int			nsrc;
+	int			driver = -1;	/* the source that drives the leapfrog */
+	double		probes = 0;		/* how often the others are sought */
 	int			nclause = list_length(whereclauses);
 	int			ci = 0;
+	int			i;
 	Cost		pair_cost = 0;	/* §20: the (outer, inner) group pairs */
 	Cost		run;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
@@ -1469,19 +1715,41 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
+	ListCell   *lc4;
 
-	inlistci = lion_inlist_shape(groupidx, groupidx2, whereidx, whereclauses,
+	inlistci = lion_inlist_shape(groupidx, groupcol, groupidx2,
+								whereidx, wherecol, whereclauses,
 								wherekinds, ors, &sumshort, &groupdrive);
 
 	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clausepages = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clauseleaves = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clauseheight = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clausekeys = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clauseidx = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clausesrc = (int *) palloc0(sizeof(int) * Max(nclause, 1));
+	srcmembers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	srccontainers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 	andc = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	inor = lion_or_leaf_map(ors, nclause);
+	orgrp = lion_or_group_map(ors, nclause);
 
-	forthree(lc1, whereidx, lc2, whereclauses, lc3, wherekinds)
+	/*
+	 * The sources of the AND: one per OR restriction (a union is one source,
+	 * DESIGN.md §19) and one per positive clause outside them.  Which of them
+	 * drives the leapfrog join decides what the others read, so they are
+	 * numbered here and the page terms are charged once the driver is known.
+	 */
+	nsrc = list_length(ors);
+	for (ci = 0; ci < nclause; ci++)
+		clausesrc[ci] = -1;
+	ci = 0;
+
+	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
 		Selectivity sel;
+		double		share;
 		double		dirpages;
 		double		height = 0;
 		double		container_pages;
@@ -1499,10 +1767,23 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
 		clausesel[ci++] = sel;
+
+		/*
+		 * The page terms belong to ONE KEY COLUMN of this index (DESIGN.md
+		 * §24): the directory it descends is its own share of the relation's,
+		 * and so are the container pages its chains lie on.  The DEPTH is not
+		 * scaled - the descent passes through the upper levels the columns
+		 * share - and neither is the index's own size below, which is what the
+		 * caching argument of lion_heap_page_cost() is about and is a property
+		 * of the relation.
+		 */
+		share = lion_index_column_share(root, rel, idx,
+										(AttrNumber) lfirst_int(lc4));
 		dirpages = lion_index_dir_pages(idx, &height);
 
-		container_pages = (double) idx->pages - 1.0 - dirpages;
+		container_pages = ((double) idx->pages - 1.0 - dirpages) * share;
 		container_pages = Max(container_pages, 0.0);
+		dirpages = Max(dirpages * share, 1.0);
 
 		/*
 		 * An IN list costs one lookup per element (DESIGN.md §15).  Each of
@@ -1564,8 +1845,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 			lookup_cost += lookups *
 				lion_heap_page_cost(root, rel, lookups, idx_pages);
-			seq_pages += Min(Max(nkeys, container_pages * sel),
-							 container_pages);
+			clausepages[ci - 1] = Min(Max(nkeys, container_pages * sel),
+									  container_pages);
 		}
 		else
 		{
@@ -1579,8 +1860,22 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 */
 			random_pages += 1.0;
 			descent_cost += (height + 1.0) * 50.0 * cpu_operator_cost;
-			seq_pages += Max(1.0, container_pages * sel);
+			clausepages[ci - 1] = Max(1.0, container_pages * sel);
 		}
+
+		/*
+		 * What a walk of this clause's sets would read is on the books; how
+		 * much of it is really read depends on whether its source drives the
+		 * leapfrog join, which is not known until every clause has been seen
+		 * (the page terms are charged below).  One of its sets - a list has
+		 * nkeys of them - occupies this many container pages, and its posting
+		 * tree is that tall.
+		 */
+		clauseleaves[ci - 1] = Max(clausepages[ci - 1] / nkeys, 1.0);
+		clauseheight[ci - 1] = lion_posting_height(clauseleaves[ci - 1]);
+		clausekeys[ci - 1] = nkeys;
+		clauseidx[ci - 1] = Max((double) idx->pages, 1.0);
+
 		{
 			double		clc = nkeys * lion_containers_for(heap_pages,
 														  tuples * sel / nkeys);
@@ -1594,10 +1889,25 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 * arms has a container at a key - and neither is a list that
 			 * drives the groups, so both keep their own term.
 			 */
-			if (inor[ci - 1] || (groupdrive && ci - 1 == inlistci))
+			if (orgrp[ci - 1] >= 0 || (groupdrive && ci - 1 == inlistci))
 				ncontainers += clc;
 			else
 				andc[nand++] = clc;
+
+			/*
+			 * Which source of the AND this clause belongs to: the union of its
+			 * OR restriction, or one of its own.  A list that drives the groups
+			 * is not a source at all - each group IS one of its entries - so it
+			 * neither drives the leapfrog nor is sought by it.
+			 */
+			if (groupdrive && ci - 1 == inlistci)
+				clausesrc[ci - 1] = -1;
+			else
+			{
+				clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
+				srcmembers[clausesrc[ci - 1]] += tuples * sel;
+				srccontainers[clausesrc[ci - 1]] += clc;
+			}
 		}
 
 		/*
@@ -1649,7 +1959,6 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		int			narms = lsecond_int(one);
 		double		members = 0;
 		int			nleaves = 0;
-		int			i;
 
 		for (i = 0; i < narms; i++)
 			nleaves += list_nth_int(one, 2 + i);
@@ -1660,7 +1969,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			merge_ops += members * log2((double) nleaves);
 	}
 	pfree(clausesel);
-	pfree(inor);
+	pfree(orgrp);
 
 	/*
 	 * The AND of the clauses (DESIGN.md §22).  With the posting tree the merge
@@ -1686,6 +1995,87 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	pfree(andc);
 
 	/*
+	 * WHAT THE SOURCES READ (DESIGN.md §22).  The same leapfrog decides it: the
+	 * DRIVER - the source with the fewest members - is the only one walked end
+	 * to end, and it pays for its whole share of the index's container pages,
+	 * as every source did before the posting tree existed.  Every other source
+	 * is SOUGHT to the container keys the driver produces, so it pays for the
+	 * pages those probes touch (lion_probed_pages()) and never for more than a
+	 * walk of it would have cost.
+	 *
+	 * That bound is the whole of this section's planner change.  `c20k = 77 AND
+	 * c200 = 17 AND c2 = 1` at one million rows probes `c2` at about 50 of the
+	 * heap's 300 container keys, a descent each, and the count really does
+	 * touch 118 of that index's buffers rather than the 154 a walk of the set
+	 * takes; charging it the whole 152-page walk asked 168.8 cost units for a
+	 * count the node answers in 0.25 ms, against 117.6 now.  The BitmapAnd it
+	 * still loses to is priced at 62.1 and takes 0.88 ms - what remains between
+	 * them is the unit and not the count of pages, which DESIGN.md §22 records
+	 * as the open item.
+	 *
+	 * With a GROUP BY the probing happens once per group - the group's own
+	 * posting set is a source like any other, and the smaller one of it and the
+	 * WHERE sources drives - so the probes are counted over all the groups
+	 * together.  That is more probes than a WHERE set has pages many times
+	 * over, which is exactly why a grouped count is priced as it was: one read
+	 * of each WHERE set, which is also what the materialized copy of it costs
+	 * (DESIGN.md §9 - the sets a GROUP BY intersects with every group are
+	 * copied out on their second use and are probed in memory after that).
+	 */
+	if (nsrc > 0)
+	{
+		int			s;
+
+		/*
+		 * Which one drives is decided from the MEMBERS, as lion_run_merge()
+		 * decides it from the entries' `ntids` - not from the containers, which
+		 * for a union of k sets are counted k times over and would hand the
+		 * merge to whichever source happens to lie in the fewest of them.  What
+		 * the driver then costs the others is its CONTAINER KEYS, of which
+		 * there are no more than the heap has.
+		 */
+		for (s = 0; s < nsrc; s++)
+			if (driver < 0 || srcmembers[s] < srcmembers[driver])
+				driver = s;
+		probes = Min(srccontainers[driver],
+					 Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0));
+
+		if (groupidx != NULL)
+			probes = Max(ingroups, 1.0) *
+				Min(lion_containers_for(heap_pages,
+										matching / Max(numgroups, 1.0)),
+					probes);
+	}
+
+	for (i = 0; i < nclause; i++)
+	{
+		double		pages = clausepages[i];
+
+		if (pages <= 0.0)
+			continue;			/* a negated clause, or nothing to read */
+
+		if (clausesrc[i] < 0 || clausesrc[i] == driver)
+			seq_pages += pages; /* walked: the driver, and a group's own list */
+		else
+		{
+			pages = Min(pages,
+						clausekeys[i] * lion_probed_pages(clauseleaves[i],
+														  probes,
+														  clauseheight[i]));
+			probe_cost += pages *
+				lion_heap_page_cost(root, rel, pages, clauseidx[i]);
+		}
+	}
+	pfree(clausepages);
+	pfree(clauseleaves);
+	pfree(clauseheight);
+	pfree(clausekeys);
+	pfree(clauseidx);
+	pfree(clausesrc);
+	pfree(srcmembers);
+	pfree(srccontainers);
+
+	/*
 	 * The entry scan of the driving index - unless an IN list on that very
 	 * column drives the groups instead (DESIGN.md §15), in which case its
 	 * elements' lookups and containers, charged above, ARE the per-group work
@@ -1693,7 +2083,14 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (groupidx != NULL && !groupdrive)
 	{
-		seq_pages += Max(1.0, (double) groupidx->pages);
+		/*
+		 * The entry scan walks ONE key column's entries and stops at the first
+		 * entry of the next (DESIGN.md §24), so what it reads of a multicolumn
+		 * index is that column's share of it and not the whole relation.
+		 */
+		seq_pages += Max(1.0, (double) groupidx->pages *
+						 lion_index_column_share(root, rel, groupidx,
+												 groupcol));
 		ncontainers += numgroups *
 			lion_containers_for(heap_pages, matching / Max(numgroups, 1.0));
 	}
@@ -1733,7 +2130,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		double		oe = Max(outer_entries, 1.0);
 		double		ie = Max(inner_entries, 1.0);
 
-		seq_pages += Max(1.0, (double) groupidx2->pages);
+		seq_pages += Max(1.0, (double) groupidx2->pages *
+						 lion_index_column_share(root, rel, groupidx2,
+												 groupcol2));
 		pair_cost = Max(oe * ie, numgroups) * cpu_tuple_cost;
 		merge_ops += Min(oe, ie) * tuples;
 		ncontainers += oe * ie * (lion_containers_for(heap_pages, tuples / oe) +
@@ -1775,6 +2174,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += descent_cost;
 	run += lookup_cost;
 	run += seq_pages * seq_page_cost;
+	run += probe_cost;
 	run += ncontainers * cpu_operator_cost * 2.0;	/* block mask + VM mask */
 	run += merge_ops * cpu_operator_cost;
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
@@ -1807,8 +2207,10 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
 
-		run += lion_cost_count_rel(root, t->rel, t->driveidx[0],
-								  t->driveidx[1], t->whereidx,
+		run += lion_cost_count_rel(root, t->rel,
+								  t->driveidx[0], t->drivecol[0],
+								  t->driveidx[1], t->drivecol[1],
+								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
 								  outer_entries, inner_entries);
 	}
@@ -2186,6 +2588,41 @@ lion_or_leaf_map(List *ors, int nclause)
 			nleaves += list_nth_int(one, 2 + i);
 		for (i = first; i < first + nleaves && i < nclause; i++)
 			map[i] = true;
+	}
+
+	return map;
+}
+
+/*
+ * The same map, but naming WHICH OR restriction each clause is a leaf of (-1
+ * for a clause that is not one).  The cost model needs the identity and not
+ * just the fact: a union is ONE source of the AND (DESIGN.md §19), and which
+ * source a clause belongs to is what decides whether it is walked or sought
+ * (DESIGN.md §22).
+ */
+static int *
+lion_or_group_map(List *ors, int nclause)
+{
+	int		   *map = (int *) palloc(sizeof(int) * Max(nclause, 1));
+	int			group = 0;
+	int			i;
+	ListCell   *lc;
+
+	for (i = 0; i < Max(nclause, 1); i++)
+		map[i] = -1;
+
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			nleaves = 0;
+
+		for (i = 0; i < narms; i++)
+			nleaves += list_nth_int(one, 2 + i);
+		for (i = first; i < first + nleaves && i < nclause; i++)
+			map[i] = group;
+		group++;
 	}
 
 	return map;
@@ -2957,7 +3394,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (ngroup == 1 && !partitioned && !sumall && !singlegroup &&
 		first->driveidx[0] != NULL &&
 		bms_is_member(groupattno[0], input_rel->notnullattnums) &&
-		lion_index_orders_naturally(first->driveidx[0]))
+		lion_index_orders_naturally(first->driveidx[0], first->drivecol[0]))
 	{
 		bool		sumshort;
 		bool		groupdrive;
@@ -2965,8 +3402,10 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		Oid			eqop = InvalidOid;
 		bool		hashable;
 
-		(void) lion_inlist_shape(first->driveidx[0], first->driveidx[1],
-								 first->whereidx, whereclauses, wherekinds,
+		(void) lion_inlist_shape(first->driveidx[0], first->drivecol[0],
+								 first->driveidx[1],
+								 first->whereidx, first->wherecol,
+								 whereclauses, wherekinds,
 								 ors, &sumshort, &groupdrive);
 		/*
 		 * The node emits ASCENDING, NULLS FIRST, always.  The query's own
@@ -3293,7 +3732,8 @@ static void
 lion_load_inner_keys(LionCountScanState *st)
 {
 	LionEntryScan es;
-	LionState  *istate = lion_get_state(st->groupidx2);
+	LionState  *istate = lion_index_column_state(st->groupidx2,
+												st->groupidxcol2);
 	MemoryContext oldcxt;
 	MemoryContext tmpcxt;
 	Size		budget = (Size) work_mem * INT64CONST(1024);
@@ -3315,7 +3755,7 @@ lion_load_inner_keys(LionCountScanState *st)
 								   "LionCount inner entry scan",
 								   ALLOCSET_SMALL_SIZES);
 
-	lion_entry_scan_begin(&es, st->groupidx2);
+	lion_entry_scan_begin_col(&es, st->groupidx2, st->groupidxcol2);
 	for (;;)
 	{
 		LionPostingSet ps;
@@ -3371,6 +3811,57 @@ lion_load_inner_keys(LionCountScanState *st)
 	st->ninnerkey = n;
 }
 
+/*
+ * The KEY COLUMN (1-based) of `index` that holds heap column `heapattno`
+ * (DESIGN.md §24).  A single-column index answers 1 for its own column and
+ * nothing else; a multicolumn one is searched, because the columns may be in
+ * any order - and, with partitions, in a DIFFERENT order in each of them.
+ */
+static AttrNumber
+lion_index_col_for(Relation index, AttrNumber heapattno)
+{
+	int			c;
+
+	for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
+	{
+		if (index->rd_index->indkey.values[c] == heapattno)
+			return (AttrNumber) (c + 1);
+	}
+
+	elog(ERROR, "lion index \"%s\" does not index column %d of \"%s\"",
+		 RelationGetRelationName(index), (int) heapattno,
+		 get_rel_name(index->rd_index->indrelid));
+	return 0;					/* keep the compiler quiet */
+}
+
+/*
+ * The attribute number heap column `parentattno` of `parentoid` has in `heap`.
+ *
+ * Everything the plan carries is in the PARENT's numbering (DESIGN.md §16),
+ * and a partition may number its columns differently - so the column an
+ * index's indkey names has to be translated before it can be looked for
+ * there.  Partitions match their parent's columns BY NAME, which is the same
+ * mapping the executor's own tuple conversion uses.
+ */
+static AttrNumber
+lion_heap_attno_in(Relation heap, Oid parentoid, AttrNumber parentattno)
+{
+	char	   *name;
+	AttrNumber	attno;
+
+	if (RelationGetRelid(heap) == parentoid || parentattno <= 0)
+		return parentattno;
+
+	name = get_attname(parentoid, parentattno, false);
+	attno = get_attnum(RelationGetRelid(heap), name);
+	if (attno == InvalidAttrNumber)
+		elog(ERROR, "relation \"%s\" has no column \"%s\"",
+			 RelationGetRelationName(heap), name);
+	pfree(name);
+
+	return attno;
+}
+
 static void
 lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 				  Oid groupidxoid2, const Oid *clauseidxoid)
@@ -3383,14 +3874,38 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
 
 	for (i = 0; i < st->nclause; i++)
+	{
 		st->clause[i].idx = index_open(clauseidxoid != NULL ?
 									   clauseidxoid[i] : st->clause[i].idxoid,
 									   AccessShareLock);
+		st->clause[i].idxcol =
+			lion_index_col_for(st->clause[i].idx,
+							   lion_heap_attno_in(st->heap, st->heapoid,
+												  st->clause[i].attno));
+	}
 
+	/*
+	 * The driving index's key column comes from the index that was really
+	 * opened rather than from the plan (DESIGN.md §24): the planner only has
+	 * to be right about WHICH index, and a partition's own index may put the
+	 * same heap column at a different position from the parent's.
+	 */
 	if (OidIsValid(groupidxoid))
+	{
 		st->groupidx = index_open(groupidxoid, AccessShareLock);
+		st->groupidxcol =
+			lion_index_col_for(st->groupidx,
+							   lion_heap_attno_in(st->heap, st->heapoid,
+												  st->driveattno));
+	}
 	if (OidIsValid(groupidxoid2))
+	{
 		st->groupidx2 = index_open(groupidxoid2, AccessShareLock);
+		st->groupidxcol2 =
+			lion_index_col_for(st->groupidx2,
+							   lion_heap_attno_in(st->heap, st->heapoid,
+												  st->groupattno2));
+	}
 
 	/*
 	 * index_beginscan() would take a relation-level predicate lock on each of
@@ -3433,11 +3948,13 @@ lion_close_relation(LionCountScanState *st)
 	{
 		index_close(st->groupidx, AccessShareLock);
 		st->groupidx = NULL;
+		st->groupidxcol = 0;
 	}
 	if (st->groupidx2 != NULL)
 	{
 		index_close(st->groupidx2, AccessShareLock);
 		st->groupidx2 = NULL;
+		st->groupidxcol2 = 0;
 	}
 	st->innerkey = NULL;
 	st->innerisnull = NULL;
@@ -3450,6 +3967,7 @@ lion_close_relation(LionCountScanState *st)
 		{
 			index_close(st->clause[i].idx, AccessShareLock);
 			st->clause[i].idx = NULL;
+			st->clause[i].idxcol = 0;
 		}
 	}
 	if (st->heap != NULL)
@@ -3558,6 +4076,31 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			cl->con = NULL;
 			cl->valstate = ExecInitExpr(cl->valexpr, &node->ss.ps);
 		}
+	}
+
+	/*
+	 * Which HEAP column the driving index's entries belong to (DESIGN.md §24
+	 * needs it to name that index's KEY COLUMN).  With a GROUP BY it is the
+	 * outer group column; a sum-over-all (§14) has none, and its driver is the
+	 * index of the FIRST `IS NOT NULL` clause - which is exactly the clause
+	 * the planner took its driving column from (`notnullvar`, set at the first
+	 * such leaf of the same list this array was built from, and an OR leaf can
+	 * never be one).
+	 */
+	st->driveattno = st->groupattno;
+	if (st->sumall)
+	{
+		st->driveattno = 0;
+		for (i = 0; i < st->nclause; i++)
+		{
+			if (st->clause[i].kind == LION_CLAUSE_NOTNULL)
+			{
+				st->driveattno = st->clause[i].attno;
+				break;
+			}
+		}
+		if (st->driveattno == 0)
+			elog(ERROR, "LionCount: sum-over-all without an IS NOT NULL clause");
 	}
 
 	/*
@@ -3858,8 +4401,8 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 	 * answer either way, because a union of a set with itself is that set; it
 	 * would only cost the merge another sub-cursor.
 	 */
-	nsets = lion_posting_set_lookup_many(cl->idx, elemtype, nelems,
-										elems, nulls, *sets, NULL);
+	nsets = lion_posting_set_lookup_many_col(cl->idx, cl->idxcol, elemtype,
+											nelems, elems, nulls, *sets, NULL);
 
 	pfree(elems);
 	pfree(nulls);
@@ -3883,13 +4426,13 @@ static int
 lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 					LionKeyNode **tree)
 {
-	LionState   *istate = lion_get_state(cl->idx);
+	LionState   *istate = lion_index_column_state(cl->idx, cl->idxcol);
 	LionQuery	q;
 	int			i;
 
 	lion_extract_query(istate, cl->val,
 					  (StrategyNumber) get_op_opfamily_strategy(cl->opno,
-																cl->idx->rd_opfamily[0]),
+																cl->idx->rd_opfamily[cl->idxcol - 1]),
 					  &q);
 
 	/*
@@ -3907,8 +4450,8 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 
 	for (i = 0; i < q.nkeys; i++)
 	{
-		(void) lion_posting_set_lookup(cl->idx, q.keys[i], InvalidOid,
-									  &(*sets)[i]);
+		(void) lion_posting_set_lookup_col(cl->idx, cl->idxcol, q.keys[i],
+										  InvalidOid, &(*sets)[i]);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -3950,8 +4493,8 @@ lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
 		case LION_CLAUSE_EQ:
 			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
 			n = 1;
-			(void) lion_posting_set_lookup(cl->idx, cl->val, cl->valtype,
-										  &(*sets)[0]);
+			(void) lion_posting_set_lookup_col(cl->idx, cl->idxcol, cl->val,
+											  cl->valtype, &(*sets)[0]);
 			tree = lion_key_node(0);
 			break;
 
@@ -3978,7 +4521,8 @@ lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
 		case LION_CLAUSE_NOTNULL:
 			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
 			n = 1;
-			if (lion_posting_set_lookup_null(cl->idx, &(*sets)[0]))
+			if (lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+												&(*sets)[0]))
 				tree = lion_key_node(0);
 			else
 			{
@@ -4121,7 +4665,7 @@ lion_save_clause_key(LionCountScanState *st, LionClauseState *cl,
 		return;
 	}
 
-	istate = lion_get_state(cl->idx);
+	istate = lion_index_column_state(cl->idx, cl->idxcol);
 	oldcxt = MemoryContextSwitchTo(st->keycxt);
 	cl->storedkey = datumCopy(ps->storedkey, istate->typbyval, istate->typlen);
 	MemoryContextSwitchTo(oldcxt);
@@ -4217,7 +4761,8 @@ lion_locate_where(LionCountScanState *st)
 			cl = &st->clause[st->item[k].clauseno];
 			if (cl->kind != LION_CLAUSE_ARRAY ||
 				cl->attno != st->groupattno ||
-				cl->idxoid != st->groupidxoid)
+				cl->idxoid != st->groupidxoid ||
+				cl->idxcol != st->groupidxcol)
 				continue;
 			st->ingroupitem = k;
 			break;
@@ -4227,8 +4772,12 @@ lion_locate_where(LionCountScanState *st)
 	/*
 	 * And the sum-over-all's own `IS NOT NULL` (DESIGN.md §14, the sumallitem
 	 * half of the comment on the field).  The clause has to be the one on the
-	 * DRIVING index: another column's NULL entry is a different index's set
-	 * and says nothing about this one's entries.
+	 * DRIVING index AND on its driving KEY COLUMN: another column's NULL entry
+	 * says nothing about this column's entries, and since DESIGN.md §24 the
+	 * two may live in one relation, so the Oid alone no longer tells them
+	 * apart (`a IS NOT NULL AND b IS NOT NULL` over one index on (a, b) would
+	 * otherwise drop b's NULL set and subtract a's from a's own entries,
+	 * which removes nothing: every b NULL would be counted).
 	 */
 	st->sumallitem = -1;
 	if (st->sumall && st->hasgroupidx)
@@ -4241,7 +4790,9 @@ lion_locate_where(LionCountScanState *st)
 				continue;
 			cl = &st->clause[st->item[k].clauseno];
 			if (cl->kind != LION_CLAUSE_NOTNULL ||
-				cl->idxoid != st->groupidxoid)
+				cl->attno != st->driveattno ||
+				cl->idxoid != st->groupidxoid ||
+				cl->idxcol != st->groupidxcol)
 				continue;
 			st->sumallitem = k;
 			break;
@@ -4463,7 +5014,7 @@ lion_sumall_relation(LionCountScanState *st)
 		nsource = st->nsource;
 	}
 
-	lion_entry_scan_begin(&st->escan, st->groupidx);
+	lion_entry_scan_begin_col(&st->escan, st->groupidx, st->groupidxcol);
 	st->scanning = true;
 
 	for (;;)
@@ -4704,17 +5255,20 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 			ikey = st->innerkey[i];
 			ikeyisnull = st->innerisnull[i];
 			if (ikeyisnull)
-				(void) lion_posting_set_lookup_null(st->groupidx2,
-												   &st->groupset2);
+				(void) lion_posting_set_lookup_null_col(st->groupidx2,
+													   st->groupidxcol2,
+													   &st->groupset2);
 			else
-				(void) lion_posting_set_lookup(st->groupidx2, ikey, InvalidOid,
-											  &st->groupset2);
+				(void) lion_posting_set_lookup_col(st->groupidx2,
+												  st->groupidxcol2, ikey,
+												  InvalidOid, &st->groupset2);
 		}
 		else
 		{
 			if (!st->scanning2)
 			{
-				lion_entry_scan_begin(&st->escan2, st->groupidx2);
+				lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
+										 st->groupidxcol2);
 				st->scanning2 = true;
 			}
 			if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
@@ -4826,7 +5380,8 @@ lion_next_partial_group(LionCountScanState *st)
 			 */
 			if (!st->wheremissing)
 			{
-				lion_entry_scan_begin(&st->escan, st->groupidx);
+				lion_entry_scan_begin_col(&st->escan, st->groupidx,
+										 st->groupidxcol);
 				st->scanning = true;
 			}
 		}
@@ -4962,7 +5517,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	 */
 	if (!st->scanning && st->ingroupitem < 0)
 	{
-		lion_entry_scan_begin(&st->escan, st->groupidx);
+		lion_entry_scan_begin_col(&st->escan, st->groupidx, st->groupidxcol);
 		st->scanning = true;
 	}
 
@@ -5167,6 +5722,45 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 	}
 }
 
+/*
+ * The KEY COLUMN an index answers one clause with, as ".col" (DESIGN.md §24).
+ *
+ * A SINGLE-column index prints nothing at all, so every plan the regression
+ * suite had before multicolumn indexes existed is unchanged; a multicolumn one
+ * has to say which of its columns it is being read for, because two clauses of
+ * one query may now name the same index.
+ *
+ * The index is opened here rather than read from the executor state: EXPLAIN
+ * without ANALYZE never opens anything (EXEC_FLAG_EXPLAIN_ONLY), and it is the
+ * one case where the name is wanted and the relation is not in hand.  The heap
+ * attribute number is the one the plan carries; a partitioned scan prints no
+ * index name at all, so it never gets here with a parent's numbering.
+ */
+static const char *
+lion_explain_col(Oid idxoid, AttrNumber heapattno)
+{
+	static char buf[NAMEDATALEN + 2];
+	Relation	idx;
+	AttrNumber	col;
+
+	if (!OidIsValid(idxoid) || heapattno <= 0)
+		return "";
+
+	idx = index_open(idxoid, AccessShareLock);
+	if (IndexRelationGetNumberOfKeyAttributes(idx) <= 1)
+	{
+		index_close(idx, AccessShareLock);
+		return "";
+	}
+
+	col = lion_index_col_for(idx, heapattno);
+	snprintf(buf, sizeof(buf), ".%s",
+			 NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
+	index_close(idx, AccessShareLock);
+
+	return buf;
+}
+
 static void
 lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 						ExplainState *es)
@@ -5198,7 +5792,9 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	if (st->hasgroupidx)
 	{
 		if (st->npart == 0)
-			appendStringInfo(&buf, "%s ", get_rel_name(st->groupidxoid));
+			appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid),
+							 lion_explain_col(st->groupidxoid,
+											  st->driveattno));
 		if (st->groupattno != 0)
 			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->groupattno, false));
@@ -5210,7 +5806,9 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		{
 			appendStringInfoString(&buf, ", ");
 			if (st->npart == 0)
-				appendStringInfo(&buf, "%s ", get_rel_name(st->groupidxoid2));
+				appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid2),
+								 lion_explain_col(st->groupidxoid2,
+												  st->groupattno2));
 			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->groupattno2, false));
 		}
@@ -5226,8 +5824,12 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (orno < 0)
 		{
 			if (st->npart == 0)
-				appendStringInfo(&buf, "%s ",
-								 get_rel_name(st->clause[st->item[i].clauseno].idxoid));
+			{
+				LionClauseState *cl = &st->clause[st->item[i].clauseno];
+
+				appendStringInfo(&buf, "%s%s ", get_rel_name(cl->idxoid),
+								 lion_explain_col(cl->idxoid, cl->attno));
+			}
 			appendStringInfoChar(&buf, '(');
 			lion_explain_clause(st, &st->clause[st->item[i].clauseno],
 							   ancestors, es, &buf);
@@ -5248,9 +5850,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			if (st->npart == 0)
 			{
 				for (leaf = 0; leaf < o->nleaves; leaf++)
-					appendStringInfo(&buf, "%s%s",
+				{
+					LionClauseState *cl = &st->clause[o->first + leaf];
+
+					appendStringInfo(&buf, "%s%s%s",
 									 leaf > 0 ? ", " : "",
-									 get_rel_name(st->clause[o->first + leaf].idxoid));
+									 get_rel_name(cl->idxoid),
+									 lion_explain_col(cl->idxoid, cl->attno));
+				}
 				appendStringInfoChar(&buf, ' ');
 			}
 
