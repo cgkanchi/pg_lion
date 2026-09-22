@@ -2247,6 +2247,29 @@ directory splits and posting-tree splits under crash (an injection point between
   is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
   Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
   through the join.
+- **Coexistence with other extensions, including pgrx-built ones (before the Citus/TimescaleDB
+  work).** pg_lion is C, but it will live in servers alongside extensions written with pgrx
+  (pgvector-style AMs, pg_search, VectorChord, pg_graphql, plrust) and other C extensions that install
+  the same hooks. Verify with a test matrix that loads pg_lion together with a representative set:
+  - Hook chaining: `create_upper_paths_hook` (ours) must call the previous hook and tolerate being
+    called in any position; pgrx registers hooks through its `PgHooks` trait and expects the same;
+    test both load orders (`shared_preload_libraries` order, and LOAD-on-first-use where the other
+    extension is preloaded and ours is not, and vice versa). Same for any future
+    `set_rel_pathlist_hook`, `ExecutorStart/End` and `ProcessUtility` hooks.
+  - GUC namespace: `MarkGUCPrefixReserved("pg_lion")` must not collide; pgrx extensions reserve
+    theirs the same way; check `SET pg_lion.enable_count_pushdown` works before the library is
+    loaded (placeholder GUC promotion) in the presence of other reserved prefixes.
+  - Shared memory and rmgr: today pg_lion uses neither; the planned custom rmgr (§5) must register
+    a resource-manager id that does not collide (custom rmgr ids are a small fixed range; pgrx
+    extensions with WAL, and Citus/Timescale, may take some), and any shmem request must go through
+    `shmem_request_hook` chaining.
+  - Injection points and test hooks are compiled out in non-assert builds; confirm no test-only
+    symbol leaks into a release build.
+  - Index AM coexistence: two AMs with a `CustomScan` each (pg_search, our LionCount) on the same
+    table and query; EXPLAIN through both; parallel-plan flags respected.
+  - Build matrix: PGXS against packaged PostgreSQL headers for the supported majors, not only
+    master; `pg_upgrade` across a major with lion indexes present (format version checks fire, not
+    crashes); `CREATE EXTENSION ... VERSION`/`ALTER EXTENSION UPDATE` scripts once there is a 0.2.
 - **Citus and TimescaleDB compatibility (last, before any release).** These are the environments the
   extension is most likely to run in. Verify, with a test matrix run against each:
   - Citus: distributed and reference tables with lion indexes (CREATE INDEX propagation via the
