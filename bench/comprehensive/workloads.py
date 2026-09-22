@@ -51,6 +51,7 @@ def scalar_cases():
               Case('in_and','intersection','SELECT count(*) FROM fact WHERE c200 IN (17,18,19) AND c20 IN (3,4,5)',True),
               Case('and2','intersection','SELECT count(*) FROM fact WHERE c200=17 AND c2=1',True),
               Case('and3','intersection','SELECT count(*) FROM fact WHERE c200=17 AND c20=3 AND c2=1',True),
+              Case('and3_selective','intersection','SELECT count(*) FROM fact WHERE c20k=77 AND c200=17 AND c2=1',True),
               Case('or_columns','union','SELECT count(*) FROM fact WHERE c200=17 OR c20=3'),
               Case('is_null','null','SELECT count(*) FROM fact WHERE nullable IS NULL',True),
               Case('not_null','null','SELECT count(*) FROM fact WHERE nullable IS NOT NULL'),

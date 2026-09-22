@@ -19,9 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'comprehensive'))
 from run import ROOT, Suite, command
 from workloads import scalar_cases, doc_cases, scalar_data, doc_data, index_specs
 
-PROFILE = 'quick-v2'
+PROFILE = 'quick-v3'
 FAMILIES = ['btree', 'gin', 'roaring']
-CLEAN = ['eq_c2_0', 'eq_c200_17', 'eq_c20k_123', 'in_c20k_100', 'and2', 'and3',
+CLEAN = ['eq_c2_0', 'eq_c200_17', 'eq_c20k_123', 'in_c20k_100', 'and2', 'and3', 'and3_selective',
          'is_null', 'fetch_medium', 'range_random', 'group_c200']
 DIRTY = ['eq_c2_0', 'eq_c200_17', 'and2', 'group_c200']
 AFTER = ['eq_c200_17', 'group_c200']
@@ -130,6 +130,12 @@ class QuickSuite(Suite):
                             ('insert', 'INSERT INTO fact ' + scalar_data(max(1, n // 100), start=n + 1)),
                             ('indexed_update', f'UPDATE fact SET c200=(c200+1)%200 WHERE id<={max(1,n//100)}'),
                             ('vacuum', 'VACUUM (ANALYZE) fact'),
+                            # Mid-chain inserts: free every hundredth row's slot across the whole
+                            # heap, let VACUUM hand those pages back, then insert rows whose TIDs
+                            # land in them (container keys in the middle of every posting set).
+                            ('delete', 'DELETE FROM fact WHERE id%100=1'),
+                            ('vacuum_after_delete', 'VACUUM (ANALYZE) fact'),
+                            ('mid_insert', 'INSERT INTO fact ' + scalar_data(max(1, n // 100), start=2 * n + 1)),
                         ]:
                             self.db.query('CHECKPOINT')
                             self.timed_operation(label, sql, suite=suite, rows=n, family=family)
@@ -144,7 +150,31 @@ class QuickSuite(Suite):
                         raise RuntimeError('Query or correctness check failed; refusing an invalid quick baseline')
                 last_phase = phase
             self.db.query(f'DROP TABLE {table}')
+            if suite == 'scalar' and n == min(self.args.rows) and family in ('btree', 'roaring'):
+                self.churn(family)
             self.event(kind='dataset_complete', suite=suite, rows=n, family=family)
+
+    def churn(self, family, rows=100000, cycles=2):
+        """Changing-key churn at fixed live cardinality: every unique key is rewritten, then VACUUM.
+        Records per-cycle time and WAL as operations and the index size after each cycle; for lion
+        also the entry count (it must stay at one per live row once VACUUM deletes empty entries)."""
+        method = 'lion' if family == 'roaring' else family
+        self.db.query(f'CREATE TABLE churn AS SELECT i AS id, i::bigint*7919 AS k FROM generate_series(1,{rows}) i')
+        self.db.query(f'CREATE INDEX churn_k ON churn USING {method} (k)')
+        self.db.query('VACUUM (FREEZE, ANALYZE) churn')
+        self.settings(family)
+        for cycle in range(1, cycles + 1):
+            self.db.query('CHECKPOINT')
+            self.timed_operation('churn_update', f'UPDATE churn SET k = k + {rows * 7919}',
+                                 suite='churn', rows=rows, family=family, cycle=cycle)
+            self.timed_operation('churn_vacuum', 'VACUUM (ANALYZE) churn',
+                                 suite='churn', rows=rows, family=family, cycle=cycle)
+            extra = {}
+            if family == 'roaring':
+                extra['entries'] = int(self.db.scalar("SELECT entries FROM lion_index_stats('churn_k')"))
+            self.event(kind='churn_size', suite='churn', rows=rows, family=family, cycle=cycle,
+                       index_bytes=int(self.db.scalar("SELECT pg_relation_size('churn_k')")), **extra)
+        self.db.query('DROP TABLE churn')
 
     def run_owned(self):
         started = time.monotonic()
@@ -293,7 +323,7 @@ def report(directory, baseline=None):
     sizes = [[r['suite'], r['rows'], r['family'], builds[(r['suite'], r['rows'], r['family'])], r['index_bytes']/2**20]
              for r in events if r['kind'] == 'portfolio']
     maintenance = [[r['rows'], r['family'], r['kind'], r['elapsed_ms'], r['wal_bytes']/2**20]
-                   for r in events if r['kind'] in ['insert', 'indexed_update', 'vacuum']]
+                   for r in events if r['kind'] in ['insert', 'indexed_update', 'vacuum', 'delete', 'vacuum_after_delete', 'mid_insert', 'churn_update', 'churn_vacuum']]
     intro = (f"# Quick index progress benchmark\n\nCommit `{meta['commit']}`. Profile `{meta['profile']}`. "
              f"Completed in **{meta['elapsed_seconds']:.1f} seconds**, with **{len(rows)} exact-result checks** "
              f"and **{sum(r['n'] for r in rows)} timings**. All checks pass.\n\n"
