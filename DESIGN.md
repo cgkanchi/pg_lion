@@ -2236,6 +2236,17 @@ directory splits and posting-tree splits under crash (an injection point between
 
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
+- **Insert batching, only if the custom rmgr leaves hot-key throughput short.** A GIN-style pending
+  list was considered and rejected: GIN's per-row cost is the number of extracted keys (30 posting
+  trees per tsvector row), which batching amortises; ours is one posting-set update per scalar row,
+  and the measured bottleneck is the generic-WAL page copy inside the lock window (unlogged control:
+  643 → 868 tps only), which a pending list moves rather than removes. It would also put TIDs outside
+  the pinned-page protocol of §9, forcing every count to scan and snapshot-check an unordered list
+  (pg_roaring_index's count path pays exactly this) and adding a merge phase to VACUUM. If batching
+  is still needed after the rmgr: per-key deferred appends kept inside the entry tuple (a small
+  sorted TID tail merged into the containers on the next insert that finds it full, or by VACUUM),
+  which stays inside the pinned-page protocol and keeps counts exact. Multi-key classes are the one
+  place a real pending list might pay; revisit only with a measured tsvector ingestion case.
 - **HAVING on the count itself** (`GROUP BY k HAVING count(*) > n`): the node knows each group's
   count before emitting it; accept a HAVING that references only the count aggregates and the group
   columns and filter in the node. Today users must write the filter in an outer query.
