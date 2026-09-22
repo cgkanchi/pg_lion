@@ -208,39 +208,39 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 			   bool recheck)
 {
 	PGAlignedBlock *copy;
-	BlockNumber blkno = head;
+	BlockNumber blkno;
+	Buffer		buf;
 	int64		ntids = 0;
 
-	if (!BlockNumberIsValid(blkno))
+	if (!BlockNumberIsValid(head))
+		return 0;
+
+	/*
+	 * DESIGN.md §22: `head` is the ROOT of the posting tree, which is the
+	 * single leaf only while the set fits one page.  The leaves are still one
+	 * rightlinked list in ckey order, so the walk below is unchanged once it
+	 * has descended to the leftmost one - and the descent hands that leaf back
+	 * LOCKED, which is what keeps a root push-down from slipping in between
+	 * (the block would then be an internal page and this walk would find no
+	 * containers on it at all).
+	 */
+	buf = lion_posting_search(index, NULL, hash, head, 0, BUFFER_LOCK_SHARE,
+							  false);
+	if (!BufferIsValid(buf))
 		return 0;
 
 	copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 
-	while (BlockNumberIsValid(blkno))
+	for (;;)
 	{
-		Buffer		buf;
 		Page		page;
 		Page		cpage = (Page) copy->data;
 		OffsetNumber maxoff;
 		OffsetNumber off;
-		bool		owned;
 
-		buf = ReadBuffer(index, blkno);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		owned = lion_page_owns_entry(page, hash, head);
-		if (owned)
-			memcpy(cpage, page, BLCKSZ);
+		memcpy(cpage, page, BLCKSZ);
 		UnlockReleaseBuffer(buf);
-
-		/*
-		 * DESIGN.md §18: a page that no longer claims this chain means the
-		 * chain was freed after the entry was copied out, which can only
-		 * happen once its posting set held nothing visible to anyone.  The
-		 * scan stops there; outside verify() this is never an error.
-		 */
-		if (!owned)
-			break;
 
 		blkno = LionPageGetOpaque(cpage)->rightlink;
 
@@ -256,6 +256,27 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 		}
 
 		CHECK_FOR_INTERRUPTS();
+
+		if (!BlockNumberIsValid(blkno))
+			break;
+
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+		/*
+		 * DESIGN.md §18: a page that no longer claims this posting set means
+		 * the set was freed after the entry was copied out, which can only
+		 * happen once it held nothing visible to anyone.  The scan stops
+		 * there; outside verify() this is never an error.  A leaf's rightlink
+		 * always names another leaf, so a page at a level above zero is the
+		 * same kind of accident and is treated the same way.
+		 */
+		if (!lion_page_owns_entry(BufferGetPage(buf), hash, head) ||
+			!LionPageIsPostingLeaf(BufferGetPage(buf)))
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
 	}
 
 	pfree(copy);

@@ -10,10 +10,10 @@ SELECT setseed(0.42);
 
 -- What the functions look like.
 \df lion_index_stats
-                                                                                                                                                                                                                                                                                     List of functions
- Schema |       Name       | Result data type |                                                                                                                                                                                                                                                         Argument data types                                                                                                                                                                                                                                                          | Type 
---------+------------------+------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------
- public | lion_index_stats | record           | idx regclass, OUT directory_height integer, OUT leaf_pages bigint, OUT internal_pages bigint, OUT ordered boolean, OUT entries bigint, OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint, OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint, OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint, OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint, OUT empty_tids bigint, OUT slack_bytes bigint, OUT deleted_pages bigint | func
+                                                                                                                                                                                                                                                                                                                       List of functions
+ Schema |       Name       | Result data type |                                                                                                                                                                                                                                                                                           Argument data types                                                                                                                                                                                                                                                                                           | Type 
+--------+------------------+------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------
+ public | lion_index_stats | record           | idx regclass, OUT directory_height integer, OUT leaf_pages bigint, OUT internal_pages bigint, OUT ordered boolean, OUT entries bigint, OUT inline_entries bigint, OUT container_pages bigint, OUT containers bigint, OUT array_containers bigint, OUT bitset_containers bigint, OUT run_containers bigint, OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint, OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint, OUT empty_tids bigint, OUT slack_bytes bigint, OUT deleted_pages bigint, OUT posting_internal_pages bigint, OUT max_posting_height integer | func
 (1 row)
 
 \df lion_index_verify
@@ -32,9 +32,9 @@ CREATE TABLE lion_vfy_empty (k int4);
 CREATE INDEX lion_vfy_empty_k ON lion_vfy_empty USING lion (k)
 	WITH (inline_limit = 512);
 SELECT * FROM lion_index_stats('lion_vfy_empty_k');
- directory_height | leaf_pages | internal_pages | ordered | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | deleted_pages 
-------------------+------------+----------------+---------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+---------------
-                0 |          1 |              0 | t       |       0 |              0 |               0 |          0 |                0 |                 0 |              0 |     0 |               0 |       8132 |               0 |              0 |         0 |          0 |           0 |             0
+ directory_height | leaf_pages | internal_pages | ordered | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | deleted_pages | posting_internal_pages | max_posting_height 
+------------------+------------+----------------+---------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+---------------+------------------------+--------------------
+                0 |          1 |              0 | t       |       0 |              0 |               0 |          0 |                0 |                 0 |              0 |     0 |               0 |       8132 |               0 |              0 |         0 |          0 |           0 |             0 |                      0 |                  0
 (1 row)
 
 SELECT lion_index_verify('lion_vfy_empty_k');
@@ -112,7 +112,8 @@ SELECT lion_index_verify('lion_vfy_u', true);
 -- container bytes and free bytes are consistent with the pages they live on
 SELECT container_bytes > 0 AS has_bytes,
 	   container_bytes + free_bytes <
-	   (leaf_pages + internal_pages + container_pages) * current_setting('block_size')::int8
+	   (leaf_pages + internal_pages + container_pages + posting_internal_pages)
+	   * current_setting('block_size')::int8
 	   AS fits_in_its_pages
   FROM lion_index_stats('lion_vfy_t');
  has_bytes | fits_in_its_pages 

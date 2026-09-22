@@ -107,10 +107,11 @@ CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
     src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
-    src/lion.h, lion_pages.c on-disk structs; meta/entry/chain primitives, page splits, generic WAL
+    src/lion.h, lion_pages.c on-disk structs; meta/entry/leaf primitives, page splits, generic WAL
     src/lion_dir.c          the sorted entry directory: a Lehman & Yao B-tree keyed by the index key
+    src/lion_posting.c      the per-key posting tree: a B-tree over container keys, GIN's shape
     src/lion_am.c           handler, reloptions, amvalidate, cost estimate, buildempty, _PG_init hook/GUC
-    src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key page chains
+    src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key posting trees
     src/lion_scan.c         amgetbitmap
     src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
@@ -159,15 +160,16 @@ moves out of its entry tuple onto container pages of its own.
 index key, and it grows by splitting instead of being sized once.
 `lion_index_stats()` reports the directory's height, its leaf and internal pages and whether it is
 `ordered` (false for a key type with no btree opclass, whose entries are then in a complete but
-arbitrary order), the entries, the containers by kind, the sparse segments, `null_tids`, the number
-of rows whose key is NULL, and `empty_tids`, the number of rows a multi-key opclass extracted no key
-from.
+arbitrary order), the entries, the containers by kind, the sparse segments, the posting trees'
+internal pages and tallest height, `null_tids`, the number of rows whose key is NULL, and
+`empty_tids`, the number of rows a multi-key opclass extracted no key from.
 
 ## Known limitations
 
 Single column, equality, `IN` lists and the multi-key operators above (no ranges), no
 `amgettuple`/index-only scans, no
-parallel build or scan, no reclaim of an emptied directory leaf. Inserts serialise on the directory
+parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
+(both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
 [write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants and parameters
 but no multi-column GROUP BY. `IN` lists of more than 1000

@@ -67,6 +67,9 @@ static Buffer lion_dir_find_parent(Relation index, Relation heaprel,
 static void lion_dir_split(Relation index, Relation heaprel, LionState *state,
 						  Buffer buf, OffsetNumber off, bool replace,
 						  LionEntryTuple *newitem, Size newsize);
+static void lion_dir_place_again(Relation index, Relation heaprel,
+								 LionState *state, Buffer buf, bool replace,
+								 LionEntryTuple *item, Size size);
 static void lion_dir_finish_split(Relation index, Relation heaprel,
 								 LionState *state, Buffer pbuf);
 
@@ -783,9 +786,30 @@ typedef struct LionDirItem
  * Where to cut the item list.  Aim at half the bytes, then pull the cut
  * towards whichever side does not fit: the left half has to hold its new high
  * key (a copy of items[firstright]'s key) and the right half the old one.
+ *
+ * The two walk-backs can pull in OPPOSITE directions, and then there is no cut
+ * at all: an 8 KiB page holding two ~4000-byte entries under a short high key
+ * has room for neither half once a 6000-byte entry is inserted between them
+ * (the largest entry is 6088 bytes and the largest pivot 2036, so one item
+ * plus one pivot is 8128 and two items plus a pivot is not).  That is reported
+ * with *ok = false rather than as an error: the caller then splits the page as
+ * it STANDS - which always has a cut, because k = 1 puts one item plus its
+ * high key on the left and a suffix of what the page already held plus its old
+ * high key on the right - and places the item again afterwards, which
+ * terminates because every split moves at least one item off the page and a
+ * page holding one item plus the new one always splits.
+ *
+ * *(This replaces an error branch, reported by the 2026-09-22 review of §21.
+ * With today's size caps the shape is in fact unreachable - a fresh entry is
+ * at most 2052 bytes on a page and a replacement grows by at most a few dozen,
+ * and either way a cut exists - but that rests on three independent constants
+ * (LION_MAX_ENTRY_SIZE, LION_MAX_PIVOT_SIZE and how much one insert can add),
+ * and none of them should be load-bearing for whether an INSERT errors out.
+ * DESIGN.md §21 "Split" carries the arithmetic.)*
  */
 static int
-lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append)
+lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append,
+					  bool *ok)
 {
 	Size		budget = LION_PAGE_CAPACITY;
 	Size	   *prefix;			/* prefix[i] = bytes of items[0 .. i) */
@@ -794,6 +818,7 @@ lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append)
 	int			i;
 
 	Assert(nitems >= 2);
+	*ok = true;
 
 	prefix = (Size *) palloc(sizeof(Size) * (nitems + 1));
 	prefix[0] = 0;
@@ -829,7 +854,7 @@ lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append)
 
 	if (prefix[k] + items[k].pivot > budget ||
 		(total - prefix[k]) + oldhk > budget)
-		elog(ERROR, "lion index: a directory page split cannot make progress");
+		*ok = false;
 
 	pfree(prefix);
 	Assert(k >= 1 && k < nitems);
@@ -893,6 +918,7 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 	Buffer		qbuf = InvalidBuffer;
 	BlockNumber rblk;
 	bool		append;
+	bool		cutok;
 
 	Assert(!LionPageIncompleteSplit(page));
 	if (isroot && BlockNumberIsValid(oldright))
@@ -915,7 +941,7 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 
 	for (o = first; o <= maxoff + 1; o++)
 	{
-		if (o == off)
+		if (newitem != NULL && o == off)
 		{
 			items[nitems].item = newitem;
 			items[nitems].size = newsize;
@@ -923,7 +949,7 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 		}
 		if (o > maxoff)
 			break;
-		if (replace && o == off)
+		if (newitem != NULL && replace && o == off)
 			continue;				/* the stale version goes away */
 		if (!ItemIdIsUsed(PageGetItemId(cpage, o)))
 			continue;
@@ -943,8 +969,28 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 		elog(ERROR, "lion index \"%s\": block %u cannot hold a single item of %zu bytes",
 			 RelationGetRelationName(index), pblk, newsize);
 
-	append = !BlockNumberIsValid(oldright) && !replace && off > maxoff;
-	firstright = lion_dir_choose_split(items, nitems, oldhkneed, append);
+	append = newitem != NULL && !BlockNumberIsValid(oldright) && !replace &&
+		off > maxoff;
+	firstright = lion_dir_choose_split(items, nitems, oldhkneed, append, &cutok);
+
+	if (!cutok)
+	{
+		/*
+		 * No cut can hold both halves WITH the new item (see
+		 * lion_dir_choose_split()).  Split the page as it stands, which always
+		 * has one, and then place the item again on whichever half now owns
+		 * it.  Every split moves at least one item off this page, so the retry
+		 * terminates: a page that holds one item always takes a second.
+		 */
+		Assert(newitem != NULL);
+		pfree(items);
+		pfree(copy);
+		lion_dir_split(index, heaprel, state, buf, InvalidOffsetNumber, false,
+					   NULL, 0);
+		lion_dir_place_again(index, heaprel, state, buf, replace, newitem,
+							 newsize);
+		return;
+	}
 
 	lefthk = lion_make_pivot(items[firstright].item, LION_ENTRY_HIGHKEY,
 							 InvalidBlockNumber, &lefthksz);
@@ -1073,6 +1119,44 @@ lion_dir_split(Relation index, Relation heaprel, LionState *state, Buffer buf,
 	INJECTION_POINT("lion-dir-split-incomplete", NULL);
 
 	lion_dir_finish_split(index, heaprel, state, buf);
+}
+
+/*
+ * Place an item again after the page it belonged on was split without it.
+ *
+ * buf is the LEFT half, held EXCLUSIVE, and stays so; the item goes there or
+ * on the brand new right sibling, which this decides with the high key the
+ * split just gave buf.  Locking the sibling while holding buf is the allowed
+ * direction (left to right, DESIGN.md §5), and nothing ever holds a parent
+ * while waiting for a child, so the sibling's own split - which goes upwards -
+ * cannot close a cycle with it.
+ */
+static void
+lion_dir_place_again(Relation index, Relation heaprel, LionState *state,
+					 Buffer buf, bool replace, LionEntryTuple *item, Size size)
+{
+	LionSearchKey sk;
+	Page		page = BufferGetPage(buf);
+
+	lion_search_key_exact(state, &sk, item);
+
+	if (!LionPageIsRightmost(page) &&
+		lion_cmp_entry(state, lion_page_highkey(page), &sk) <= 0)
+	{
+		BlockNumber next = LionPageGetOpaque(page)->rightlink;
+		Buffer		rbuf = lion_dir_readbuf(index, next);
+		OffsetNumber roff;
+
+		LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
+		lion_dir_check_page(index, BufferGetPage(rbuf), next);
+		roff = lion_dir_binsrch(state, BufferGetPage(rbuf), &sk);
+		lion_dir_place(index, heaprel, state, rbuf, roff, replace, item, size);
+		UnlockReleaseBuffer(rbuf);
+		return;
+	}
+
+	lion_dir_place(index, heaprel, state, buf,
+				   lion_dir_binsrch(state, page, &sk), replace, item, size);
 }
 
 /*

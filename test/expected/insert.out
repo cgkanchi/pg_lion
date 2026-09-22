@@ -81,9 +81,9 @@ SELECT lion_ins_check('single rows');
 (1 row)
 
 SELECT * FROM lion_index_stats('lion_ins_k');
- directory_height | leaf_pages | internal_pages | ordered | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | deleted_pages 
-------------------+------------+----------------+---------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+---------------
-                0 |          1 |              0 | t       |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |       7884 |               4 |              5 |         0 |          0 |           0 |             0
+ directory_height | leaf_pages | internal_pages | ordered | entries | inline_entries | container_pages | containers | array_containers | bitset_containers | run_containers | ntids | container_bytes | free_bytes | sparse_segments | sparse_members | null_tids | empty_tids | slack_bytes | deleted_pages | posting_internal_pages | max_posting_height 
+------------------+------------+----------------+---------+---------+----------------+-----------------+------------+------------------+-------------------+----------------+-------+-----------------+------------+-----------------+----------------+-----------+------------+-------------+---------------+------------------------+--------------------
+                0 |          1 |              0 | t       |       4 |              4 |               0 |          0 |                0 |                 0 |              0 |     5 |              62 |       7884 |               4 |              5 |         0 |          0 |           0 |             0 |                      0 |                  0
 (1 row)
 
 -- Phase 2: multi-row VALUES.
@@ -353,6 +353,26 @@ SELECT (SELECT container_pages FROM lion_index_stats('lion_mid_k')) <=
 	   (SELECT container_pages FROM lion_mid_before) AS pages_reused;
  pages_reused 
 --------------
+ t
+(1 row)
+
+/*
+ * DESIGN.md §22: those posting sets are TREES - the entry's head is a root
+ * with downlinks and the leaves are the container pages - so the inserts above
+ * found their page by descending rather than by walking from the head, and the
+ * whole shape survives verify().
+ */
+SELECT posting_internal_pages > 0 AS has_internal_pages,
+	   max_posting_height = 1 AS two_levels
+  FROM lion_index_stats('lion_mid_k');
+ has_internal_pages | two_levels 
+--------------------+------------
+ t                  | t
+(1 row)
+
+SELECT lion_index_posting_root('lion_mid_k', 2) IS NOT NULL AS key2_has_a_root;
+ key2_has_a_root 
+-----------------
  t
 (1 row)
 

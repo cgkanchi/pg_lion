@@ -963,9 +963,20 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 static void
 lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 {
-	BlockNumber blk = ent->head;
+	BlockNumber blk;
 	LionVacEntryRef ref;
 	LionEntryTuple *entry;
+
+	/*
+	 * DESIGN.md §22: the entry's head block is the ROOT of the posting tree,
+	 * and the leaves - the only pages that hold TIDs - are still one
+	 * rightlinked list in ckey order, so the walk below is what it always was
+	 * once it has descended to the leftmost of them.  Internal pages are not
+	 * cleanup-locked and need not be (§11: they hold no TIDs), and they are
+	 * never empty while the set lives, so the leak sweep leaves them alone.
+	 */
+	blk = lion_posting_leftmost_leaf(vs->index, ent->hash, ent->head);
+	lion_vac_visit(vs, ent->head);
 
 	ref.buf = entrybuf;
 	ref.off = ent->off;
@@ -1121,9 +1132,10 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
  * rightlink cannot be read without the lock.
  */
 static void
-lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
+lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
+					   BlockNumber first)
 {
-	BlockNumber blk = head;
+	BlockNumber blk = first;
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -1143,13 +1155,15 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
 		page = BufferGetPage(buf);
 
 		/*
-		 * Only ever free a page that still says it belongs to this chain and
-		 * that really is empty.  Neither can fail as things stand - the entry
-		 * was deleted with ncontainers == 0 - but freeing a page that is in
-		 * use would be unrecoverable, so it is checked rather than asserted.
+		 * Only ever free a page that still says it belongs to this set and, if
+		 * it is a LEAF, that really is empty.  Neither can fail as things
+		 * stand - the entry was deleted with ncontainers == 0 - but freeing a
+		 * page that is in use would be unrecoverable, so it is checked rather
+		 * than asserted.  An INTERNAL page holds downlinks and no TIDs, so
+		 * "empty" says nothing about it; it goes when its whole subtree does.
 		 */
 		if (!lion_page_owns_entry(page, hash, head) ||
-			PageGetMaxOffsetNumber(page) != 0)
+			(LionPageIsPostingLeaf(page) && PageGetMaxOffsetNumber(page) != 0))
 		{
 			UnlockReleaseBuffer(buf);
 			return;
@@ -1172,6 +1186,56 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
 		blk = next;
 		CHECK_FOR_INTERRUPTS();
 	}
+}
+
+static void
+lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
+{
+	BlockNumber levelfirst[LION_POSTING_MAX_HEIGHT + 1];
+	BlockNumber blk = head;
+	int			nlevels = 0;
+	int			i;
+
+	/*
+	 * DESIGN.md §22: the leftmost page of every level, from the root down.
+	 * The entry is already gone, so nothing can reach these pages except a
+	 * reader that copied the entry before the delete - which the owner stamp
+	 * and safexid handle - and a SHARE lock is enough to read the shape.
+	 */
+	while (BlockNumberIsValid(blk) && nlevels <= LION_POSTING_MAX_HEIGHT)
+	{
+		Buffer		buf = ReadBuffer(vs->index, blk);
+		Page		page;
+		BlockNumber child = InvalidBlockNumber;
+		uint16		level;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_page_owns_entry(page, hash, head))
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		level = LionPageGetOpaque(page)->level;
+		if (level > 0)
+		{
+			OffsetNumber f = lion_posting_first_data(page);
+
+			if (f <= PageGetMaxOffsetNumber(page))
+				child = lion_posting_pivot(page, f)->child;
+		}
+		UnlockReleaseBuffer(buf);
+
+		levelfirst[nlevels++] = blk;
+		if (level == 0)
+			break;
+		blk = child;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* Bottom up, so that a level is only unreachable once it is empty. */
+	for (i = nlevels - 1; i >= 0; i--)
+		lion_vacuum_free_level(vs, hash, head, levelfirst[i]);
 }
 
 /*
@@ -1199,71 +1263,157 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
  * Nothing here ever waits: an unreferenced page nobody can reach should not
  * be locked by anyone, and if it somehow is, the next VACUUM will find it.
  */
+/*
+ * Are all of this internal posting page's children already DELETED pages?
+ *
+ * That is what makes an unreferenced INTERNAL page provably dead (DESIGN.md
+ * §22).  A LIVE internal page cannot pass it: every leaf of a live posting set
+ * was visited by pass 2 and is therefore never swept, and a page a concurrent
+ * insert created since then is full of items a split just put there - either
+ * way its children are not DELETED.  The children are only ever
+ * CONDITIONALLY locked, so this never waits and cannot invert a lock order.
+ */
+static bool
+lion_vac_children_deleted(LionVacState *vs, Page page)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber off;
+
+	for (off = lion_posting_first_data(page); off <= maxoff; off++)
+	{
+		BlockNumber child = lion_posting_pivot(page, off)->child;
+		Buffer		cbuf;
+		bool		deleted;
+
+		if (!BlockNumberIsValid(child) || child >= vs->nblocks)
+			return false;
+
+		cbuf = ReadBuffer(vs->index, child);
+		if (!ConditionalLockBuffer(cbuf))
+		{
+			ReleaseBuffer(cbuf);
+			return false;
+		}
+		deleted = !PageIsNew(BufferGetPage(cbuf)) &&
+			PageGetSpecialSize(BufferGetPage(cbuf)) == LION_SPECIAL_SIZE &&
+			LionPageGetOpaque(BufferGetPage(cbuf))->page_id == LION_PAGE_ID &&
+			LionPageIsDeleted(BufferGetPage(cbuf));
+		UnlockReleaseBuffer(cbuf);
+
+		if (!deleted)
+			return false;
+	}
+
+	return true;
+}
+
+/* Mark blk DELETED and hand it to the free space map.  buf is cleanup-locked. */
+static void
+lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk)
+{
+	GenericXLogState *xstate = GenericXLogStart(vs->index);
+	Page		p = GenericXLogRegisterBuffer(xstate, buf,
+											  GENERIC_XLOG_FULL_IMAGE);
+
+	lion_page_set_deleted(p, ReadNextFullTransactionId());
+	GenericXLogFinish(xstate);
+	UnlockReleaseBuffer(buf);
+
+	RecordFreeIndexPage(vs->index, blk);
+	lion_vac_visit(vs, blk);
+	vs->pages_newly_deleted++;
+	vs->pages_deleted++;
+	vs->prof.records++;
+}
+
 static void
 lion_vacuum_sweep(LionVacState *vs)
 {
-	BlockNumber blk;
+	int			round;
 
-	for (blk = 1; blk < vs->nblocks; blk++)
+	/*
+	 * Rounds, because a leaked posting TREE has to go bottom up (§22): the
+	 * leaves are empty and go in the first round, and an internal page becomes
+	 * provably dead only once its own children have.  The loop is bounded by
+	 * the tallest tree there can be and stops as soon as a round frees
+	 * nothing, so a healthy index - where nothing is unaccounted for - reads
+	 * no pages at all and runs the outer loop twice.
+	 */
+	for (round = 0; round <= LION_POSTING_MAX_HEIGHT; round++)
 	{
-		Buffer		buf;
-		Page		page;
+		BlockNumber blk;
+		bool		progress = false;
 
-		if (lion_vac_visited(vs, blk))
-			continue;
-
-		buf = ReadBuffer(vs->index, blk);
-		if (!ConditionalLockBufferForCleanup(buf))
+		for (blk = 1; blk < vs->nblocks; blk++)
 		{
-			ReleaseBuffer(buf);
-			continue;
-		}
-		page = BufferGetPage(buf);
+			Buffer		buf;
+			Page		page;
 
-		if (PageIsNew(page))
-		{
-			/* An extension whose WAL record never happened. */
+			if (lion_vac_visited(vs, blk))
+				continue;
+
+			buf = ReadBuffer(vs->index, blk);
+			if (!ConditionalLockBufferForCleanup(buf))
+			{
+				ReleaseBuffer(buf);
+				continue;
+			}
+			page = BufferGetPage(buf);
+
+			if (PageIsNew(page))
+			{
+				/* An extension whose WAL record never happened. */
+				UnlockReleaseBuffer(buf);
+				RecordFreeIndexPage(vs->index, blk);
+				lion_vac_visit(vs, blk);
+				vs->pages_deleted++;
+				progress = true;
+				continue;
+			}
+
+			if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+				LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
+				!LionPageIsContainer(page))
+			{
+				UnlockReleaseBuffer(buf);
+				continue;		/* not ours to reason about */
+			}
+
+			if (LionPageIsDeleted(page))
+			{
+				UnlockReleaseBuffer(buf);
+				RecordFreeIndexPage(vs->index, blk);
+				lion_vac_visit(vs, blk);
+				vs->pages_deleted++;
+				progress = true;
+				continue;
+			}
+
+			if (LionPageIsPostingInternal(page))
+			{
+				if (!lion_vac_children_deleted(vs, page))
+				{
+					UnlockReleaseBuffer(buf);
+					continue;
+				}
+				lion_vac_free_page(vs, buf, blk);
+				progress = true;
+				continue;
+			}
+
+			if (PageGetMaxOffsetNumber(page) == 0)
+			{
+				lion_vac_free_page(vs, buf, blk);
+				progress = true;
+				continue;
+			}
+
 			UnlockReleaseBuffer(buf);
-			RecordFreeIndexPage(vs->index, blk);
-			vs->pages_deleted++;
-			continue;
+			CHECK_FOR_INTERRUPTS();
 		}
 
-		if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
-			LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
-			!LionPageIsContainer(page))
-		{
-			UnlockReleaseBuffer(buf);
-			continue;			/* not ours to reason about */
-		}
-
-		if (LionPageIsDeleted(page))
-		{
-			UnlockReleaseBuffer(buf);
-			RecordFreeIndexPage(vs->index, blk);
-			vs->pages_deleted++;
-			continue;
-		}
-
-		if (PageGetMaxOffsetNumber(page) == 0)
-		{
-			GenericXLogState *xstate = GenericXLogStart(vs->index);
-			Page		p = GenericXLogRegisterBuffer(xstate, buf,
-													  GENERIC_XLOG_FULL_IMAGE);
-
-			lion_page_set_deleted(p, ReadNextFullTransactionId());
-			GenericXLogFinish(xstate);
-			UnlockReleaseBuffer(buf);
-
-			RecordFreeIndexPage(vs->index, blk);
-			vs->pages_newly_deleted++;
-			vs->pages_deleted++;
-			vs->prof.records++;
-			continue;
-		}
-
-		UnlockReleaseBuffer(buf);
-		CHECK_FOR_INTERRUPTS();
+		if (!progress)
+			break;
 	}
 }
 
@@ -1326,6 +1476,24 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 		lion_vac_tick(&vs->prof.cleanup_wait, t0);
 		lion_vac_visit(vs, blk);
 		vs->prof.pages_visited++;
+
+		/*
+		 * DESIGN.md §22: the only page that can stop being a leaf is the ROOT,
+		 * and only by being pushed down - an insert moving its containers onto
+		 * a brand new child.  The walk then restarts at the new leftmost leaf,
+		 * which is safe for exactly the reason the split hole of §11 is safe:
+		 * this cleanup lock waited for every pin on the page those containers
+		 * came from, so no reader can be holding a stale copy of them, and the
+		 * page they moved to did not exist a moment ago.
+		 */
+		if (!LionPageIsPostingLeaf(BufferGetPage(buf)))
+		{
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buf);
+			MemoryContextSwitchTo(oldcxt);
+			MemoryContextReset(vs->pagecxt);
+			return lion_posting_leftmost_leaf(vs->index, ent->hash, ent->head);
+		}
 
 		INSTR_TIME_SET_CURRENT(t0);
 		next = lion_vacuum_filter_page(vs, buf, &w, ent);
@@ -1667,6 +1835,18 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			UnlockReleaseBuffer(buf);
 			elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
 				 blk, ent->head);
+		}
+
+		/* A root pushed down under us; start again at the leftmost leaf. */
+		if (!LionPageIsPostingLeaf(page))
+		{
+			UnlockReleaseBuffer(buf);
+			blk = lion_posting_leftmost_leaf(index, ent->hash, ent->head);
+			if (!BlockNumberIsValid(blk))
+				elog(ERROR, "lion index: container %u of a posting set at %u vanished from it",
+					 ckey, ent->head);
+			CHECK_FOR_INTERRUPTS();
+			continue;
 		}
 
 		off = lion_page_find_container(page, ckey, &found);

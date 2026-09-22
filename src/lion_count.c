@@ -228,6 +228,21 @@ typedef struct LionSetCursor
 	PGAlignedBlock *imgbuf;		/* private copy of the current container page */
 	Page		img;
 
+	/*
+	 * SEEKING (DESIGN.md §22).  `descend` says the next leaf must come from a
+	 * descent of the posting tree for `seekckey` rather than from a rightlink;
+	 * it is how a cursor jumps forward instead of streaming, and it is also
+	 * how the FIRST leaf is found, because the entry's head block is the tree's
+	 * ROOT and is only a leaf while the set fits one page.
+	 *
+	 * `mintarget` is the container key a seek asked for.  It only ever moves
+	 * forward, and it is what makes a sparse segment that STARTS below the
+	 * target skip to the right pair instead of replaying the whole segment.
+	 */
+	bool		descend;
+	uint32		seekckey;
+	uint32		mintarget;
+
 	/* the sparse segment being expanded, and how far into its pairs */
 	const LionContainer *seg;
 	uint32		segpos;
@@ -245,7 +260,17 @@ typedef struct LionSetCursor
 } LionSetCursor;
 
 static void lion_cursor_next(LionSetCursor *cur);
+static void lion_cursor_seek(LionSetCursor *cur, uint32 target);
 static void lion_recheck_flush(LionCountCtx *cx);
+
+/*
+ * How far a cursor walks right before it gives up and descends instead
+ * (DESIGN.md §22).  Stepping right is one buffer read per page; a descent is
+ * `height` reads and a binary search per level, so the two are about even at
+ * two pages and the descent wins from there.  The number only decides how
+ * much work a seek does, never what it finds.
+ */
+#define LION_POSTING_SEEK_STEPS		2
 
 
 /* ---------------------------------------------------------------------
@@ -1004,25 +1029,29 @@ lion_posting_set_materialize(LionPostingSet *ps)
 	imgbuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	img = (Page) imgbuf->data;
 
-	for (blkno = ps->head; BlockNumberIsValid(blkno);)
+	/*
+	 * DESIGN.md §22: the walk starts at the leftmost LEAF, which the descent
+	 * hands back locked - the entry's head block is the tree's root and is
+	 * only a leaf while the set fits one page.
+	 */
 	{
-		Buffer		pagebuf;
-		Page		page;
+		Buffer		firstbuf = lion_posting_search(ps->index, NULL, 0, ps->head,
+												   0, BUFFER_LOCK_SHARE, false);
+
+		if (!BufferIsValid(firstbuf))
+			blkno = InvalidBlockNumber;
+		else
+		{
+			blkno = BufferGetBlockNumber(firstbuf);
+			memcpy(img, BufferGetPage(firstbuf), BLCKSZ);
+			UnlockReleaseBuffer(firstbuf);
+		}
+	}
+
+	while (BlockNumberIsValid(blkno))
+	{
 		OffsetNumber off;
 		OffsetNumber maxoff;
-
-		pagebuf = ReadBuffer(ps->index, blkno);
-		LockBuffer(pagebuf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(pagebuf);
-
-		/* The chain-ownership check of DESIGN.md §18; see lion_cursor_next_item(). */
-		if (!lion_page_owns(page, ps->head))
-		{
-			UnlockReleaseBuffer(pagebuf);
-			break;
-		}
-		memcpy(img, page, BLCKSZ);
-		UnlockReleaseBuffer(pagebuf);
 
 		blkno = LionPageGetOpaque(img)->rightlink;
 		maxoff = PageGetMaxOffsetNumber(img);
@@ -1068,10 +1097,27 @@ lion_posting_set_materialize(LionPostingSet *ps)
 			used += MAXALIGN(sz);
 		}
 
-		if (!ok)
+		if (!ok || !BlockNumberIsValid(blkno))
 			break;
 
 		CHECK_FOR_INTERRUPTS();
+
+		{
+			Buffer		pagebuf = ReadBuffer(ps->index, blkno);
+			Page		page;
+
+			LockBuffer(pagebuf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(pagebuf);
+
+			/* The ownership check of DESIGN.md §18; see lion_cursor_next_item(). */
+			if (!lion_page_owns(page, ps->head) || !LionPageIsPostingLeaf(page))
+			{
+				UnlockReleaseBuffer(pagebuf);
+				break;
+			}
+			memcpy(img, page, BLCKSZ);
+			UnlockReleaseBuffer(pagebuf);
+		}
 	}
 
 	pfree(imgbuf);
@@ -1162,12 +1208,38 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	}
 	else
 	{
+		/*
+		 * The entry's head block is the ROOT of the posting tree (DESIGN.md
+		 * §22), so the first leaf comes from a descent for container key 0 -
+		 * which is also how a root push-down cannot be raced: the descent
+		 * hands back a page that WAS a leaf under the lock it read it with.
+		 */
 		cur->imgbuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 		cur->img = (Page) cur->imgbuf->data;
-		cur->nextblk = set->head;
+		cur->nextblk = InvalidBlockNumber;
+		cur->descend = true;
+		cur->seekckey = 0;
 	}
 
 	lion_cursor_next(cur);
+}
+
+/*
+ * Take over a leaf the caller holds SHARE-locked: copy the page - items and
+ * rightlink together, as lion_scan.c does - then drop the content lock but
+ * keep the pin (DESIGN.md §9).
+ */
+static void
+lion_cursor_take_page(LionSetCursor *cur, Buffer buf)
+{
+	memcpy(cur->img, BufferGetPage(buf), BLCKSZ);
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	cur->pinbuf = buf;
+	cur->ownpin = true;
+
+	cur->nextblk = LionPageGetOpaque(cur->img)->rightlink;
+	cur->off = FirstOffsetNumber;
+	cur->maxoff = PageGetMaxOffsetNumber(cur->img);
 }
 
 /*
@@ -1219,6 +1291,29 @@ lion_cursor_next_item(LionSetCursor *cur)
 		/* Its items have all been consumed: the pin may go. */
 		lion_cursor_unpin(cur);
 
+		if (cur->descend)
+		{
+			bool		found;
+
+			/*
+			 * A descent for seekckey: the first leaf of the set, or the leaf a
+			 * seek jumped to (DESIGN.md §22).  It comes back locked, so no
+			 * root push-down and no split can slip in between.
+			 */
+			cur->descend = false;
+			buf = lion_posting_search(cur->set->index, NULL, 0, cur->set->head,
+									  cur->seekckey, BUFFER_LOCK_SHARE, false);
+			if (!BufferIsValid(buf))
+			{
+				cur->nextblk = InvalidBlockNumber;
+				return NULL;
+			}
+			lion_cursor_take_page(cur, buf);
+			cur->off = lion_page_find_item(cur->img, cur->seekckey, &found);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
 		if (!BlockNumberIsValid(cur->nextblk))
 			return NULL;
 
@@ -1228,35 +1323,28 @@ lion_cursor_next_item(LionSetCursor *cur)
 
 		/*
 		 * DESIGN.md §18: every page reached through an entry's head or a
-		 * rightlink has to still claim that chain.  A head block is the one
-		 * block this index never recycles, so owner_head identifies the chain
-		 * for the whole life of the index and a mismatch can only mean that
-		 * the chain was freed after this posting set was located - which
-		 * VACUUM does only once the set held nothing visible to anyone.  The
-		 * cursor then simply ends here and contributes nothing further; it is
-		 * never an error outside verify().  This is also what keeps a standby
-		 * reader safe, where replay can reuse a page under a held pin because
-		 * generic WAL cannot raise a recovery conflict.
+		 * rightlink has to still claim that posting set.  A root block is the
+		 * one block this index never recycles, so owner_head identifies the
+		 * set for the whole life of the index and a mismatch can only mean
+		 * that the set was freed after it was located - which VACUUM does only
+		 * once the set held nothing visible to anyone.  The cursor then simply
+		 * ends here and contributes nothing further; it is never an error
+		 * outside verify().  This is also what keeps a standby reader safe,
+		 * where replay can reuse a page under a held pin because generic WAL
+		 * cannot raise a recovery conflict.
+		 *
+		 * A leaf's rightlink always names another leaf, so a page above level
+		 * zero is the same kind of accident and ends the walk the same way.
 		 */
-		if (!lion_page_owns(page, cur->set->head))
+		if (!lion_page_owns(page, cur->set->head) ||
+			!LionPageIsPostingLeaf(page))
 		{
 			UnlockReleaseBuffer(buf);
 			cur->nextblk = InvalidBlockNumber;
 			return NULL;
 		}
 
-		/*
-		 * Copy the page - items and rightlink together, as lion_scan.c does -
-		 * then drop the content lock but keep the pin (DESIGN.md section 9).
-		 */
-		memcpy(cur->img, page, BLCKSZ);
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		cur->pinbuf = buf;
-		cur->ownpin = true;
-
-		cur->nextblk = LionPageGetOpaque(cur->img)->rightlink;
-		cur->off = FirstOffsetNumber;
-		cur->maxoff = PageGetMaxOffsetNumber(cur->img);
+		lion_cursor_take_page(cur, buf);
 
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1279,6 +1367,16 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	const uint16 *los = LION_SPARSE_LOS_CONST(seg);
 	uint32		n = seg->cardinality;
 	uint32		ckey;
+
+	/*
+	 * A seek may have asked for a container key inside this segment's range
+	 * (DESIGN.md §22).  Its pairs are sorted, so the ones below the target are
+	 * skipped here rather than presented and thrown away by the merge; when no
+	 * seek has happened mintarget is 0 or already behind us and this is a
+	 * no-op.
+	 */
+	while (cur->segpos < n && ckeys[cur->segpos] < cur->mintarget)
+		cur->segpos++;
 
 	if (cur->segpos >= n)
 		return false;
@@ -1305,27 +1403,10 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	return true;
 }
 
-/*
- * Advance to the next container of the set, expanding sparse segments one
- * container key at a time (see the comment on LionSetCursor).
- */
+/* Pull items until one of them yields a container. */
 static void
-lion_cursor_next(LionSetCursor *cur)
+lion_cursor_advance(LionSetCursor *cur)
 {
-	cur->valid = false;
-	cur->cur = NULL;
-
-	if (cur->set == NULL || !cur->set->found)
-		return;
-
-	/* Still inside a segment?  Its next container key is the next container. */
-	if (cur->seg != NULL)
-	{
-		if (lion_cursor_emit_segment(cur))
-			return;
-		cur->seg = NULL;
-	}
-
 	for (;;)
 	{
 		const LionContainer *item = lion_cursor_next_item(cur);
@@ -1347,6 +1428,192 @@ lion_cursor_next(LionSetCursor *cur)
 			return;
 		cur->seg = NULL;		/* an empty segment: nothing to present */
 	}
+}
+
+/*
+ * Advance to the next container of the set, expanding sparse segments one
+ * container key at a time (see the comment on LionSetCursor).
+ */
+static void
+lion_cursor_next(LionSetCursor *cur)
+{
+	cur->valid = false;
+	cur->cur = NULL;
+
+	if (cur->set == NULL || !cur->set->found)
+		return;
+
+	/* Still inside a segment?  Its next container key is the next container. */
+	if (cur->seg != NULL)
+	{
+		if (lion_cursor_emit_segment(cur))
+			return;
+		cur->seg = NULL;
+	}
+
+	lion_cursor_advance(cur);
+}
+
+/*
+ * Skip a packed INLINE payload forward to the first item that can hold
+ * `target`, leaving *off in front of it.
+ *
+ * DEVIATION from DESIGN.md §22, which said an INLINE set would seek by binary
+ * search: an inline payload is a sequence of items packed without padding and
+ * carries no offsets to search, so this walks the item headers instead.  It
+ * costs nothing over the sequential walk it replaces - one forward pass over
+ * the payload either way - and an offset index built to allow a binary search
+ * would have to make that very pass to build itself.
+ */
+static void
+lion_inline_skip(const char *payload, Size paylen, Size *off, uint32 target,
+				 LionContainer *buf)
+{
+	Size		prev = *off;
+
+	while (lion_inline_fetch(payload, paylen, off, buf) > 0)
+	{
+		if (lion_item_last_ckey(buf) >= target)
+		{
+			*off = prev;		/* leave it for the walk to pick up */
+			return;
+		}
+		prev = *off;
+	}
+}
+
+/*
+ * Position a CHAIN cursor's leaf on `target`: step right while the current
+ * leaf cannot hold it and the walk is short, else descend (DESIGN.md §22).
+ *
+ * THE §9 PIN RULE.  This drops the pin on the leaf the cursor is standing on,
+ * so it may only be called where lion_cursor_next() may: at a container key
+ * whose container has already been through the visibility-map check, or whose
+ * container carried no visibility-map obligation at all because nothing of it
+ * reached the count.  All three callers are of the second kind, and all three
+ * are the very places that used to call lion_ecursor_next() for the same
+ * reason: lion_run_merge()'s `!alleq` branch, the AND node's wind-forward
+ * loop, and the merge winding a NEGATED source up to the key it is about to
+ * subtract at - everything such a source passes over is below that key and
+ * contributes nothing to it.
+ */
+static void
+lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
+{
+	int			steps = 0;
+
+	for (;;)
+	{
+		BlockNumber blk;
+		Buffer		buf;
+		Page		page;
+		bool		found;
+
+		if (!BufferIsValid(cur->pinbuf))
+		{
+			/* nothing in hand: let the next page come from a descent */
+			cur->descend = true;
+			cur->seekckey = target;
+			return;
+		}
+
+		if (LionPageGetOpaque(cur->img)->maxckey >= target ||
+			!BlockNumberIsValid(cur->nextblk))
+		{
+			/*
+			 * The target is at or before the end of this page, or there is no
+			 * page after it.  Either way this is where the walk resumes; an
+			 * offset past the last item simply ends the cursor.
+			 */
+			cur->off = lion_page_find_item(cur->img, target, &found);
+			return;
+		}
+
+		if (steps >= LION_POSTING_SEEK_STEPS)
+		{
+			cur->descend = true;
+			cur->seekckey = target;
+			lion_cursor_unpin(cur);
+			cur->off = OffsetNumberNext(cur->maxoff);
+			return;
+		}
+
+		blk = cur->nextblk;
+		lion_cursor_unpin(cur);
+		cur->off = OffsetNumberNext(cur->maxoff);
+
+		buf = ReadBuffer(cur->set->index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_page_owns(page, cur->set->head) ||
+			!LionPageIsPostingLeaf(page))
+		{
+			UnlockReleaseBuffer(buf);
+			cur->nextblk = InvalidBlockNumber;
+			return;
+		}
+		lion_cursor_take_page(cur, buf);
+		steps++;
+
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Move the cursor to the first container whose key is at or above `target`
+ * (DESIGN.md §22).  A no-op when it is already there or past it, and when the
+ * set is exhausted.
+ *
+ * This is what turns an intersection from a stream into a set of probes: the
+ * merge advances whichever source has the largest container key and seeks the
+ * others to it, so the work tracks the most selective side instead of the sum
+ * of all of them.  See lion_cursor_seek_leaf() for the §9 pin rule it obeys.
+ */
+static void
+lion_cursor_seek(LionSetCursor *cur, uint32 target)
+{
+	if (cur->set == NULL || !cur->set->found || !cur->valid)
+		return;
+	if (cur->cur->ckey >= target)
+		return;
+
+	cur->mintarget = target;
+	cur->valid = false;
+	cur->cur = NULL;
+
+	/* Still inside a segment?  emit_segment() skips its pairs for us. */
+	if (cur->seg != NULL)
+	{
+		if (lion_cursor_emit_segment(cur))
+			return;
+		cur->seg = NULL;
+	}
+
+	if (cur->set->mat != NULL)
+	{
+		const LionMatSet *mat = cur->set->mat;
+		int			lo = cur->matidx;
+		int			hi = mat->ncontainers;
+
+		/* a private copy is an array: binary search it */
+		while (lo < hi)
+		{
+			int			mid = lo + (hi - lo) / 2;
+
+			if (lion_item_last_ckey(mat->containers[mid]) < target)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		cur->matidx = lo;
+	}
+	else if (cur->set->is_inline)
+		lion_inline_skip(cur->set->payload, cur->set->paylen, &cur->payoff,
+						 target, cur->cbuf);
+	else
+		lion_cursor_seek_leaf(cur, target);
+
+	lion_cursor_advance(cur);
 }
 
 static void
@@ -1458,6 +1725,7 @@ typedef struct LionExprCursor
 
 static void lion_ecursor_build(LionExprCursor *c);
 static void lion_ecursor_next(LionExprCursor *c);
+static void lion_ecursor_seek(LionExprCursor *c, uint32 target);
 
 /* ---- the OR node's min-heap of children, keyed by container key ---- */
 
@@ -1783,13 +2051,20 @@ lion_ecursor_build(LionExprCursor *c)
 				maxckey = c->sub[i].ckey;
 		}
 
-		/* Wind the laggards forward; their containers cannot contribute. */
+		/*
+		 * Wind the laggards forward; their containers cannot contribute.
+		 * DESIGN.md §22: a laggard SEEKS to the key the others stand at
+		 * instead of stepping through everything in between, which is the
+		 * whole point of the posting tree.  Nothing of the keys it skips ever
+		 * reaches the visibility map, so the §9 rule is untouched - this is
+		 * the same window the code used to call lion_ecursor_next() in.
+		 */
 		for (i = 0; i < c->nsub; i++)
 		{
 			if (c->sub[i].ckey != maxckey)
 			{
 				alleq = false;
-				lion_ecursor_next(&c->sub[i]);
+				lion_ecursor_seek(&c->sub[i], maxckey);
 			}
 		}
 		if (!alleq)
@@ -1865,9 +2140,76 @@ lion_ecursor_next(LionExprCursor *c)
 			break;
 
 		case LION_KN_AND:
-			/* every child stands at c->ckey and contributed to the result */
+
+			/*
+			 * Every child stands at c->ckey, but only ONE of them has to step:
+			 * lion_ecursor_build() then finds it ahead of the others and SEEKS
+			 * them to it (DESIGN.md §22), which is one probe each instead of a
+			 * walk.  Stepping all of them would cost every child a container
+			 * at c->ckey + 1 that the seek is about to skip anyway.
+			 */
+			lion_ecursor_next(&c->sub[0]);
+			break;
+	}
+
+	lion_ecursor_build(c);
+}
+
+/*
+ * Move past every container key below `target` (DESIGN.md §22).
+ *
+ * This is lion_ecursor_next() with a destination instead of a step, and it
+ * obeys the same §9 rule: it is only ever called at a container key whose
+ * containers carried no visibility-map obligation - a key the intersection
+ * cannot use - so the pins it lets go had nothing counted from them.
+ */
+static void
+lion_ecursor_seek(LionExprCursor *c, uint32 target)
+{
+	int			i;
+
+	if (c->node == NULL || !c->valid || c->ckey >= target)
+		return;
+
+	switch (c->kind)
+	{
+		case LION_KN_KEY:
+			lion_cursor_seek(&c->leaf, target);
+			break;
+
+		case LION_KN_OR:
+
+			/*
+			 * The children standing at the current key move to the target, and
+			 * so does every child the heap still holds below it; the ones
+			 * already at or above it stay where they are.  Popping from a
+			 * min-heap while its root is below the target touches exactly
+			 * those and no more.
+			 */
+			for (i = 0; i < c->nhot; i++)
+			{
+				int			child = c->hot[i].child;
+
+				lion_ecursor_seek(&c->sub[child], target);
+				if (c->sub[child].valid)
+					lion_or_heap_push(c, child);
+			}
+			c->nhot = 0;
+
+			while (c->nheap > 0 && c->heap[0].ckey < target)
+			{
+				LionOrHeapEnt ent = lion_or_heap_pop(c);
+
+				lion_ecursor_seek(&c->sub[ent.child], target);
+				if (c->sub[ent.child].valid)
+					lion_or_heap_push(c, ent.child);
+			}
+			break;
+
+		case LION_KN_AND:
+			/* every child stands at c->ckey, and the result needs all of them */
 			for (i = 0; i < c->nsub; i++)
-				lion_ecursor_next(&c->sub[i]);
+				lion_ecursor_seek(&c->sub[i], target);
 			break;
 	}
 
@@ -2899,8 +3241,13 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
  * DESIGN.md section 9: every heap block of *c has been checked against the
  * visibility map by the time the loop below runs, so - and only now - the pins
  * on the pages the source containers came from may be released.
- * lion_ecursor_next() is what releases them, and only the sources that
- * contributed to *c (the ones the merge flagged) move on.
+ * lion_ecursor_next() is what releases them.
+ *
+ * Only the DRIVER is flagged to move on (DESIGN.md §22).  The others stay
+ * where they are and are SOUGHT to wherever the driver gets to on the next
+ * round of the merge, which is what makes their work one probe per container
+ * key of the driver rather than a walk; a cursor that keeps its place also
+ * keeps its pin, which is a pin too many and never a wrong answer.
  */
 static void
 lion_count_container(LionCountCtx *cx, const LionContainer *c,
@@ -3182,9 +3529,40 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 {
 	LionExprCursor *cursors;
 	LionContainer *work[2];
+	int			driver = -1;
+	double		bestest = 0;
 	int			i;
 
 	cursors = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * nsources);
+
+	/*
+	 * WHICH SOURCE DRIVES (DESIGN.md §22).  The merge is a leapfrog join now:
+	 * one source is walked sequentially and the others are PROBED at the
+	 * container keys it produces.  The driver has to be the most selective
+	 * one, because the work is its container count times the number of
+	 * sources; a dense driver would make every other source probe at every
+	 * container key of the heap, which is the walk this replaces.
+	 *
+	 * The estimate is the sum of the entries' own row counts, which the
+	 * located posting sets carry already (`ntids`), so no page is read to
+	 * decide it.  It is exact for the ordinary one-set source and an upper
+	 * bound for a union; a wrong guess costs performance and never an answer.
+	 */
+	for (i = 0; i < nsources; i++)
+	{
+		double		est = 0;
+		int			j;
+
+		if (sources[i].negated)
+			continue;
+		for (j = 0; j < sources[i].nsets; j++)
+			est += (double) sources[i].sets[j].ntids;
+		if (driver < 0 || est < bestest)
+		{
+			driver = i;
+			bestest = est;
+		}
+	}
 
 	/*
 	 * Only an intersection needs a place to put one: a single source hands its
@@ -3237,17 +3615,34 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 				alleq = false;
 		}
 
+		/*
+		 * Past this container key only the DRIVER steps; the others are left
+		 * standing where they are and the next round of this loop seeks them
+		 * to wherever the driver has got to (DESIGN.md §22).  A cursor that
+		 * keeps its place also keeps its pin, which is a pin too many and
+		 * never a wrong answer (see lion_ecursor_next()).
+		 */
+		cursors[driver].advance = true;
+
 		if (!alleq)
 		{
 			/*
 			 * A ckey that is missing from some set contributes nothing, so
 			 * the lagging containers carry no visibility-map obligation and
 			 * their pages may be let go straight away.
+			 *
+			 * DESIGN.md §22: they SEEK to the largest key any positive source
+			 * stands at rather than stepping one container at a time.  That is
+			 * the leapfrog join the posting tree exists for, and it needs no
+			 * driver to be nominated: whichever source is most selective is
+			 * the one that keeps producing the largest key, so it advances
+			 * sequentially and the dense ones probe.  A source already at or
+			 * past the target is left alone by lion_ecursor_seek().
 			 */
 			for (i = 0; i < nsources; i++)
 			{
 				if (!sources[i].negated && cursors[i].ckey < maxckey)
-					lion_ecursor_next(&cursors[i]);
+					lion_ecursor_seek(&cursors[i], maxckey);
 			}
 			CHECK_FOR_INTERRUPTS();
 			continue;
@@ -3258,7 +3653,6 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 		{
 			if (sources[i].negated)
 				continue;
-			cursors[i].advance = true;
 			if (acc == NULL)
 				acc = cursors[i].cur;
 			else
@@ -3274,12 +3668,11 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 		{
 			if (!sources[i].negated)
 				continue;
-			while (cursors[i].valid && cursors[i].ckey < maxckey)
-				lion_ecursor_next(&cursors[i]);	/* nothing to subtract there */
+			if (cursors[i].valid && cursors[i].ckey < maxckey)
+				lion_ecursor_seek(&cursors[i], maxckey);	/* nothing to subtract there */
 			if (!cursors[i].valid || cursors[i].ckey != maxckey)
 				continue;
 
-			cursors[i].advance = true;
 			if (lion_container_cardinality(acc) > 0)
 			{
 				lion_container_andnot(acc, cursors[i].cur, work[w]);

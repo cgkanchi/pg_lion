@@ -210,6 +210,16 @@ INSERT INTO lion_mid SELECT i, 2 + (i % 2) FROM generate_series(300001, 400000) 
  */
 SELECT (SELECT container_pages FROM lion_index_stats('lion_mid_k')) <=
 	   (SELECT container_pages FROM lion_mid_before) AS pages_reused;
+/*
+ * DESIGN.md §22: those posting sets are TREES - the entry's head is a root
+ * with downlinks and the leaves are the container pages - so the inserts above
+ * found their page by descending rather than by walking from the head, and the
+ * whole shape survives verify().
+ */
+SELECT posting_internal_pages > 0 AS has_internal_pages,
+	   max_posting_height = 1 AS two_levels
+  FROM lion_index_stats('lion_mid_k');
+SELECT lion_index_posting_root('lion_mid_k', 2) IS NOT NULL AS key2_has_a_root;
 SELECT lion_index_verify('lion_mid_k', true);
 SELECT lion_cmp('lion_mid', 'k = 2');
 SELECT lion_cmp('lion_mid', 'k = 3');

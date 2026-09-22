@@ -680,6 +680,138 @@ phase1c() {
 	SUMMARY+=("phase1c            crash between split and downlink; repaired on the next descent")
 }
 
+
+# ------------------------------------------------------------- phase 1d
+
+# A crash that lands exactly between the two records of a POSTING-TREE LEAF
+# SPLIT (DESIGN.md §22): the leaf has been split and flagged
+# LION_PAGE_INCOMPLETE_SPLIT, its right sibling exists and is linked in, but
+# the parent has no downlink for it yet, and the server dies.  Readers never
+# noticed (the right link gets them there, and a sequential walk of the leaves
+# is all they do), and the first writer that descends to that page finishes the
+# split before touching it.
+#
+# The crash point is deterministic: an injection point parks the inserting
+# backend in that window and the server is pulled out from under it.
+phase1d() {
+	local off before after warn parked
+	log ""
+	log "=== phase 1d: a crash between a posting-tree split and its downlink ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ log "phase 1d skipped: this server has no injection_points extension"
+		  SUMMARY+=("phase1d            skipped (no injection points)"); return 0; }
+
+	# Two keys taking alternate TIDs, so each container key is a dense bitset
+	# and fills a leaf by itself: the set is a tree after a few thousand rows.
+	# The index is created EMPTY, so every split really happens in aminsert.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_psplit;
+		CREATE TABLE lion_psplit (id int, k int NOT NULL);
+		CREATE INDEX lion_psplit_k ON lion_psplit USING lion (k);
+		INSERT INTO lion_psplit SELECT i, i % 2 FROM generate_series(1, 60000) i;
+	SQL
+	psql_p -c "VACUUM (ANALYZE) lion_psplit" >>"$RUNLOG" 2>&1
+	before=$(psql_p -tAc "select container_pages from lion_index_stats('lion_psplit_k')")
+	[ "${before:-0}" -gt 2 ] ||
+		die "phase 1d: the fixture did not split a posting page at all"
+
+	psql_p -c "SELECT injection_points_attach('lion-posting-split-incomplete', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1d: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "SET synchronous_commit = on;
+		    INSERT INTO lion_psplit SELECT 100000 + i, i % 2
+		      FROM generate_series(1, 60000) i" >>"$RUNLOG" 2>&1 &
+	parked=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-posting-split-incomplete'" \
+		60 "an insert to park between the posting split and its downlink"
+
+	# The split's record has been inserted but not flushed, and the crash would
+	# otherwise simply lose it (and with it the whole split, which would test
+	# nothing).  A COMMIT from another session with synchronous_commit = on
+	# flushes the WAL stream up to its own commit LSN, which is past the split
+	# record.  A CHECKPOINT would be the obvious way and is NOT usable here:
+	# the parked backend holds the leaf's content lock EXCLUSIVE and the
+	# checkpointer would block writing that very buffer.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE IF NOT EXISTS lion_psplit_flush (i int);
+		INSERT INTO lion_psplit_flush VALUES (1);
+	SQL
+
+	crash_immediate
+	wait "$parked" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
+		grep -q "database system was not properly shut down" ||
+		die "phase 1d: the restart did not report an unclean shutdown"
+
+	# The page really came back flagged: verify() says so, as a WARNING and
+	# not an error, and the index still answers correctly - a reader walks the
+	# leaves by their right links and an unfinished split is invisible to it.
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_psplit_k')" 2>&1 >>"$RUNLOG" |
+		grep -c 'unfinished split' || true)
+	[ "$warn" -gt 0 ] ||
+		die "phase 1d: no posting page came back with an unfinished split, so the crash missed the window"
+	log "phase 1d: $warn posting page(s) came back with an unfinished split"
+	run_check "phase 1d post-crash" psql_p \
+		"select (select count(*) from lion_psplit where k = 0) =
+				(select count(*) from lion_psplit where id % 2 = 0),
+				'k = 0 still answers exactly'
+		 union all
+		 select (select count(*) from lion_psplit where k = 1) =
+				(select count(*) from lion_psplit where id % 2 = 1),
+				'k = 1 still answers exactly'"
+
+	# A WRITER's descent is what repairs it - the descent that lands on the
+	# flagged page finishes its split before touching the page - but only a
+	# descent that ROUTES there does, and an append does not descend at all
+	# (it takes the set's last leaf directly, which is the point of the append
+	# hint).  So the rows below are made to land all over the heap instead:
+	# a third of them is deleted, VACUUM frees those line pointers on every
+	# page, and the inserts that refill them have container keys in every
+	# leaf's range, including the flagged one's.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: the repairing insert failed"
+		SET synchronous_commit = on;
+		DELETE FROM lion_psplit WHERE id % 3 = 0;
+		VACUUM lion_psplit;
+		INSERT INTO lion_psplit SELECT 900000 + i, i % 2
+		  FROM generate_series(1, 20000) i;
+	SQL
+
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_psplit_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unfinished split' || true)
+	[ "$warn" = 0 ] ||
+		die "phase 1d: $warn posting page(s) still have an unfinished split after a writer descended"
+
+	after=$(psql_p -tAc "select container_pages from lion_index_stats('lion_psplit_k')")
+	run_check "phase 1d repaired" psql_p \
+		"select (select count(*) from lion_psplit) =
+				(select count(*) from lion_psplit where k in (0, 1)),
+				'every row is still reachable through the index'
+		 union all
+		 select (select ntids from lion_index_stats('lion_psplit_k')) =
+				(select count(*) from lion_psplit),
+				'ntids agrees with the heap'"
+
+	psql_p -c "SELECT injection_points_detach('lion-posting-split-incomplete')" \
+		>>"$RUNLOG" 2>&1 || true
+	psql_p -c "DROP TABLE lion_psplit" >>"$RUNLOG" 2>&1
+	psql_p -c "DROP TABLE IF EXISTS lion_psplit_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1d: the unfinished posting split survived the crash and a writer's descent repaired it ($before -> $after leaves)"
+	SUMMARY+=("phase1d            crash between posting split and downlink; repaired on the next descent")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -1007,6 +1139,7 @@ log "-- baseline: $NCHECKS checks ok"
 phase1
 phase1b
 phase1c
+phase1d
 phase2
 
 END=$(now_ms)

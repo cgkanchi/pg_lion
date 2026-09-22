@@ -105,6 +105,29 @@ lion_reserved_flag(int kind)
  * breaking the ordering of the items.  Emitting a container therefore closes
  * the open segment first, which is what keeps item ranges from interleaving.
  */
+/*
+ * One INTERNAL level of a posting tree under construction (DESIGN.md §22).
+ *
+ * Built bottom-up in the same pass as the leaves, nbtree's _bt_buildadd shape
+ * and the same shape §21 uses for the directory: one open page per level,
+ * written out when the downlink that does not fit arrives - that downlink's
+ * separator is the page's high key, and the page's own first separator is the
+ * downlink it hands to the level above.  The level whose last page is also its
+ * first is the root, and it is written at the block the set reserved for its
+ * root, because the root block is the set's identity (DESIGN.md §18).
+ */
+typedef struct LionPostLevel
+{
+	uint16		level;			/* 1 = the level just above the leaves */
+	LionPostingPivot *items;	/* the open page's downlinks */
+	int			nitems;
+	int			maxitems;
+	Size		used;			/* what they cost on a page, line pointers in */
+	BlockNumber blkno;			/* block reserved for the open page */
+	int64		npages;			/* pages of this level written so far */
+	struct LionPostLevel *parent;
+} LionPostLevel;
+
 typedef struct LionBuilder
 {
 	Datum		key;			/* private copy of the key */
@@ -127,10 +150,21 @@ typedef struct LionBuilder
 	Size		inlineused;
 
 	bool		spilled;		/* posting set lives on container pages */
-	BlockNumber head;
+	BlockNumber head;			/* the set's ROOT block (DESIGN.md §22) */
 	BlockNumber curblk;			/* block pagebuf will be written to */
 	BulkWriteBuffer pagebuf;	/* container page under construction */
 	bool		haspage;
+
+	/*
+	 * The posting tree above the leaves (DESIGN.md §22).  A set that fits one
+	 * leaf has none at all and `head` is that leaf; the moment a second leaf
+	 * is needed, a block is reserved for the ROOT, the first leaf is re-stamped
+	 * with it, and the internal levels are filled bottom-up.
+	 */
+	bool		hastree;
+	BlockNumber rootblk;
+	LionPostLevel *plevel;		/* the level just above the leaves */
+	uint32		height;
 
 	uint32		nitems;			/* containers and segments (entry.ncontainers) */
 	uint64		ntids;
@@ -584,6 +618,183 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 	return b;
 }
 
+/* ---------------------------------------------------------------------
+ * The posting tree above a key's leaves (DESIGN.md §22)
+ * --------------------------------------------------------------------- */
+
+static void lion_post_level_add(LionBuildState *bs, LionBuilder *b,
+								LionPostLevel *lv, uint32 ckey,
+								BlockNumber child);
+
+static LionPostLevel *
+lion_post_level(LionBuildState *bs, uint16 level)
+{
+	LionPostLevel *lv = (LionPostLevel *) palloc0(sizeof(LionPostLevel));
+
+	lv->level = level;
+	lv->maxitems = 64;
+	lv->items = (LionPostingPivot *)
+		palloc(sizeof(LionPostingPivot) * lv->maxitems);
+	lv->blkno = InvalidBlockNumber;
+
+	return lv;
+}
+
+static LionPostLevel *
+lion_post_parent(LionBuildState *bs, LionPostLevel *lv)
+{
+	if (lv->parent == NULL)
+	{
+		if (lv->level >= LION_POSTING_MAX_HEIGHT)
+			elog(ERROR, "lion index: posting tree is deeper than %d levels",
+				 LION_POSTING_MAX_HEIGHT);
+		lv->parent = lion_post_level(bs, lv->level + 1);
+	}
+	return lv->parent;
+}
+
+/*
+ * Write the open page of one internal level and start the next.  hk is the
+ * separator of the downlink that did not fit - the first key of the page to
+ * the right, and therefore this page's high key - or NULL when this is the
+ * last page of the level.  isroot writes it at the block the set reserved for
+ * its root and suppresses the downlink.
+ */
+static void
+lion_post_level_flush(LionBuildState *bs, LionBuilder *b, LionPostLevel *lv,
+					  const uint32 *hk, bool isroot)
+{
+	BulkWriteBuffer buf;
+	Page		page;
+	BlockNumber thisblk;
+	BlockNumber nextblk = InvalidBlockNumber;
+	LionPostingPivot pivot;
+	int			i;
+
+	if (lv->nitems == 0 && lv->npages > 0)
+		return;					/* nothing left over to write */
+
+	if (BlockNumberIsValid(lv->blkno))
+		thisblk = lv->blkno;
+	else if (isroot)
+		thisblk = b->rootblk;
+	else
+		thisblk = lion_build_alloc_block(bs);
+	if (hk != NULL)
+		nextblk = lion_build_alloc_block(bs);
+
+	buf = lion_build_get_page(bs, LION_PAGE_CONTAINER);
+	page = (Page) buf->data;
+	LionPageGetOpaque(page)->level = lv->level;
+	LionPageGetOpaque(page)->rightlink = nextblk;
+	lion_page_set_owner(page, b->hash, b->head);
+
+	if (hk != NULL)
+	{
+		pivot.ckey = *hk;
+		pivot.child = InvalidBlockNumber;
+		if (PageAddItemExtended(page, (char *) &pivot, LION_POSTING_PIVOT_SIZE,
+								FirstOffsetNumber, 0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to place a posting high key");
+	}
+
+	for (i = 0; i < lv->nitems; i++)
+	{
+		if (PageAddItemExtended(page, (char *) &lv->items[i],
+								LION_POSTING_PIVOT_SIZE, InvalidOffsetNumber,
+								0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to place a posting downlink");
+	}
+
+	smgr_bulk_write(bs->bulk, thisblk, buf, true);
+
+	if (isroot)
+		b->height = lv->level;
+	else
+		lion_post_level_add(bs, b, lion_post_parent(bs, lv),
+							lv->items[0].ckey, thisblk);
+
+	lv->nitems = 0;
+	lv->used = 0;
+	lv->npages++;
+	lv->blkno = nextblk;
+}
+
+static void
+lion_post_level_add(LionBuildState *bs, LionBuilder *b, LionPostLevel *lv,
+					uint32 ckey, BlockNumber child)
+{
+	Size		need = MAXALIGN(LION_POSTING_PIVOT_SIZE) + sizeof(ItemIdData);
+
+	/* Room for the downlink AND for the high key the page may still need. */
+	if (lv->nitems >= LION_ABS_MIN_DOWNLINKS &&
+		lv->used + 2 * need > (Size) LION_PAGE_CAPACITY)
+		lion_post_level_flush(bs, b, lv, &ckey, false);
+
+	if (lv->nitems >= lv->maxitems)
+	{
+		lv->maxitems *= 2;
+		lv->items = (LionPostingPivot *)
+			repalloc(lv->items, sizeof(LionPostingPivot) * lv->maxitems);
+	}
+
+	/* The first downlink of every level's first page is minus infinity. */
+	lv->items[lv->nitems].ckey =
+		(lv->npages == 0 && lv->nitems == 0) ? 0 : ckey;
+	lv->items[lv->nitems].child = child;
+	lv->nitems++;
+	lv->used += need;
+}
+
+/*
+ * The set needs a second leaf, so it needs a ROOT above them.  Reserve its
+ * block and re-stamp the first leaf, whose image has not been written yet.
+ */
+static void
+lion_builder_start_tree(LionBuildState *bs, LionBuilder *b, Page firstleaf)
+{
+	Assert(!b->hastree);
+
+	b->rootblk = lion_build_alloc_block(bs);
+	b->head = b->rootblk;
+	b->hastree = true;
+	b->plevel = lion_post_level(bs, 1);
+	lion_page_set_owner(firstleaf, b->hash, b->head);
+}
+
+/*
+ * Close the posting tree: flush the last page of every internal level from
+ * the bottom up, and stop at the level whose last page is also its first -
+ * that page is the root, and it goes to the reserved block.
+ */
+static void
+lion_builder_finish_tree(LionBuildState *bs, LionBuilder *b)
+{
+	LionPostLevel *lv = b->plevel;
+
+	for (;;)
+	{
+		bool		isroot = (lv->npages == 0);
+		int64		below;
+
+		lion_post_level_flush(bs, b, lv, NULL, isroot);
+		if (isroot)
+			return;
+
+		below = lv->npages;
+		lv = lion_post_parent(bs, lv);
+
+		/*
+		 * Every level is strictly smaller than the one below it, because an
+		 * internal page carries at least LION_ABS_MIN_DOWNLINKS downlinks.
+		 * That is what makes this loop terminate, so it is checked.
+		 */
+		if (lv->npages + (lv->nitems > 0 ? 1 : 0) >= below)
+			elog(ERROR, "lion index: posting level %u has " INT64_FORMAT " pages, not fewer than the " INT64_FORMAT " below it",
+				 lv->level, lv->npages + (lv->nitems > 0 ? 1 : 0), below);
+	}
+}
+
 /*
  * Append one finished container to the posting set under construction.
  */
@@ -599,7 +810,7 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 		b->curblk = lion_build_alloc_block(bs);
 		b->head = b->curblk;
 		b->haspage = true;
-		/* DESIGN.md §18: every container page names the chain it belongs to. */
+		/* DESIGN.md §18: every container page names the set it belongs to. */
 		lion_page_set_owner((Page) b->pagebuf->data, b->hash, b->head);
 	}
 
@@ -607,10 +818,22 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 
 	if (PageGetFreeSpace(img) < MAXALIGN(csize))
 	{
-		BlockNumber next = lion_build_alloc_block(bs);
+		BlockNumber next;
 
+		/*
+		 * The page is final, and a second leaf means the set is a TREE: the
+		 * root block is reserved now and this first leaf is re-stamped with
+		 * it before it goes out, because every page of a set carries its root
+		 * block as the owner stamp (DESIGN.md §18, §22).
+		 */
+		if (!b->hastree)
+			lion_builder_start_tree(bs, b, img);
+
+		next = lion_build_alloc_block(bs);
 		lion_page_update_minmax(img);
 		LionPageGetOpaque(img)->rightlink = next;
+		lion_post_level_add(bs, b, b->plevel,
+							LionPageGetOpaque(img)->minckey, b->curblk);
 		/* the page is final: hand the image itself to the bulk writer */
 		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
 
@@ -770,9 +993,16 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 		Assert(b->haspage);
 		lion_page_update_minmax(img);
 		LionPageGetOpaque(img)->rightlink = InvalidBlockNumber;
+		if (b->hastree)
+			lion_post_level_add(bs, b, b->plevel,
+								LionPageGetOpaque(img)->minckey, b->curblk);
 		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
 		b->pagebuf = NULL;
 		b->haspage = false;
+
+		/* The internal levels, bottom-up; the root lands on b->head. */
+		if (b->hastree)
+			lion_builder_finish_tree(bs, b);
 
 		entry = (b->keykind != LION_KEY_REAL) ?
 			lion_make_reserved_entry(lion_reserved_flag(b->keykind),

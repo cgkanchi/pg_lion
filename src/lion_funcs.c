@@ -36,8 +36,9 @@
 
 PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_verify);
+PG_FUNCTION_INFO_V1(lion_index_posting_root);
 
-#define LION_STATS_NCOLS		20
+#define LION_STATS_NCOLS		22
 
 typedef struct LionVerifyState
 {
@@ -51,6 +52,7 @@ typedef struct LionVerifyState
 	uint32		height;
 	int64		nnullentries;	/* reserved NULL-key entries seen (at most 1) */
 	int64		nemptyentries;	/* reserved no-key entries seen (at most 1) */
+	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */
 	Oid			keyoutfunc;		/* output function of the indexed type */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
 	int64		nheaptuples;
@@ -109,7 +111,9 @@ typedef struct LionStats
 	int64		internal_pages;
 	int64		entries;
 	int64		inline_entries;
-	int64		container_pages;
+	int64		container_pages;	/* posting-tree LEAVES (DESIGN.md §22) */
+	int64		posting_internal_pages;	/* ... and the pages above them */
+	int32		max_posting_height;	/* the tallest posting tree */
 	int64		containers;
 	int64		by_type[4];		/* indexed by LionContainerType */
 	int64		sparse_segments;	/* items of type LION_CT_SPARSE */
@@ -258,8 +262,26 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				continue;
 			}
 
-			st.container_pages++;
 			st.free_bytes += (int64) PageGetFreeSpace(page);
+
+			/*
+			 * An INTERNAL posting page (DESIGN.md §22) holds downlinks, not
+			 * containers.  It is counted on its own so that container_pages
+			 * still means "pages that hold a posting set's items", and the
+			 * tallest tree is the largest level any page claims - a set that
+			 * fits one page has height 0.
+			 */
+			if (LionPageIsPostingInternal(page))
+			{
+				st.posting_internal_pages++;
+				if ((int32) LionPageGetOpaque(page)->level >
+					st.max_posting_height)
+					st.max_posting_height = (int32) LionPageGetOpaque(page)->level;
+				UnlockReleaseBuffer(buf);
+				continue;
+			}
+
+			st.container_pages++;
 
 			for (off = FirstOffsetNumber; off <= maxoff; off++)
 			{
@@ -303,12 +325,70 @@ lion_index_stats(PG_FUNCTION_ARGS)
 	values[17] = Int64GetDatum(st.empty_tids);
 	values[18] = Int64GetDatum(st.slack_bytes);
 	values[19] = Int64GetDatum(st.deleted_pages);
+	values[20] = Int64GetDatum(st.posting_internal_pages);
+	values[21] = Int32GetDatum(st.max_posting_height);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
 	index_close(index, AccessShareLock);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* ---------------------------------------------------------------------
+ * lion_index_posting_root()
+ * --------------------------------------------------------------------- */
+
+/*
+ * The ROOT block of one key's posting tree, or NULL when the key has no entry
+ * or its posting set is still INLINE (DESIGN.md §22).
+ *
+ * This exists for the tests: the root block is the identity of a posting set -
+ * it is the entry's `head` and the owner stamp of every page of the set - and
+ * §22 requires it never to move, which is what a root split's push-down buys.
+ * Nothing else in the extension needs it, and no plan depends on it.
+ */
+Datum
+lion_index_posting_root(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Datum		key = PG_GETARG_DATUM(1);
+	Oid			keytype = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	Relation	index;
+	LionState  *state;
+	Buffer		buf = InvalidBuffer;
+	OffsetNumber off;
+	int64		root = -1;
+
+	index = lion_open_index(relid, AccessShareLock);
+	state = lion_get_state(index);
+
+	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0])
+	{
+		index_close(index, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("type %s cannot be compared with index \"%s\"",
+						format_type_be(keytype),
+						RelationGetRelationName(index))));
+	}
+
+	if (lion_find_entry(index, state, BUFFER_LOCK_SHARE, key,
+						lion_hash_key(state, key), &buf, &off))
+	{
+		LionEntryTuple *entry = lion_page_entry(BufferGetPage(buf), off);
+
+		if ((entry->flags & LION_ENTRY_CHAIN) != 0)
+			root = (int64) entry->head;
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+
+	index_close(index, AccessShareLock);
+
+	if (root < 0)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64(root);
 }
 
 /* ---------------------------------------------------------------------
@@ -561,23 +641,119 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 }
 
 /*
- * Walk and check the container chain of a CHAIN entry.
+ * One level of a posting tree, as the walk of that level found it
+ * (DESIGN.md §22).
+ */
+typedef struct LionVerifyPLevel
+{
+	int			npages;
+	int			maxpages;
+	BlockNumber *blocks;
+	uint32	   *firstkey;		/* first separator, or first container key */
+	bool	   *hasfirst;		/* false for an empty leaf */
+	uint32	   *lastkey;		/* last container key of a leaf */
+	uint32	   *highkey;		/* internal pages only */
+	bool	   *hashigh;
+} LionVerifyPLevel;
+
+static void
+lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
+					   bool hasfirst, uint32 lastkey, uint32 highkey,
+					   bool hashigh)
+{
+	if (lvl->npages >= lvl->maxpages)
+	{
+		bool		first = (lvl->maxpages == 0);
+
+		lvl->maxpages = first ? 64 : lvl->maxpages * 2;
+		if (first)
+		{
+			lvl->blocks = (BlockNumber *) palloc(sizeof(BlockNumber) * lvl->maxpages);
+			lvl->firstkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
+			lvl->hasfirst = (bool *) palloc(sizeof(bool) * lvl->maxpages);
+			lvl->lastkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
+			lvl->highkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
+			lvl->hashigh = (bool *) palloc(sizeof(bool) * lvl->maxpages);
+		}
+		else
+		{
+			lvl->blocks = (BlockNumber *) repalloc(lvl->blocks, sizeof(BlockNumber) * lvl->maxpages);
+			lvl->firstkey = (uint32 *) repalloc(lvl->firstkey, sizeof(uint32) * lvl->maxpages);
+			lvl->hasfirst = (bool *) repalloc(lvl->hasfirst, sizeof(bool) * lvl->maxpages);
+			lvl->lastkey = (uint32 *) repalloc(lvl->lastkey, sizeof(uint32) * lvl->maxpages);
+			lvl->highkey = (uint32 *) repalloc(lvl->highkey, sizeof(uint32) * lvl->maxpages);
+			lvl->hashigh = (bool *) repalloc(lvl->hashigh, sizeof(bool) * lvl->maxpages);
+		}
+	}
+	lvl->blocks[lvl->npages] = blk;
+	lvl->firstkey[lvl->npages] = firstkey;
+	lvl->hasfirst[lvl->npages] = hasfirst;
+	lvl->lastkey[lvl->npages] = lastkey;
+	lvl->highkey[lvl->npages] = highkey;
+	lvl->hashigh[lvl->npages] = hashigh;
+	lvl->npages++;
+}
+
+/* The page kind and owner checks every page of a posting set goes through. */
+static Page
+lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
+						 BlockNumber eblk, OffsetNumber eoff,
+						 const LionEntryTuple *entry, uint16 level,
+						 Buffer *bufp)
+{
+	Page		page;
+	LionPageOpaque opaque;
+
+	lion_verify_visit(vs, blk, "a posting tree");
+	page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, bufp);
+	opaque = LionPageGetOpaque(page);
+
+	/*
+	 * DESIGN.md §18.  A live entry must not reach a freed page at all, and
+	 * every page of a posting set has to name that set: readers rely on both
+	 * to tell a set they still hold a link to from one whose pages have been
+	 * handed to somebody else.
+	 */
+	if (LionPageIsDeleted(page))
+		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
+					RelationGetRelationName(vs->index), blk, eoff, eblk);
+
+	if (opaque->owner_head != entry->head ||
+		opaque->owner_hash != entry->hash)
+		lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is owned by hash %u at head %u, expected hash %u at head %u",
+					RelationGetRelationName(vs->index), blk, eoff, eblk,
+					opaque->owner_hash, opaque->owner_head,
+					entry->hash, entry->head);
+
+	if (opaque->level != level)
+		lion_corrupt("lion index \"%s\": posting page %u of chain entry %u on block %u is at level %u, expected %u",
+					RelationGetRelationName(vs->index), blk, eoff, eblk,
+					opaque->level, level);
+
+	if (LionPageIncompleteSplit(page))
+		ereport(WARNING,
+				(errmsg("lion index \"%s\": posting page %u has an unfinished split",
+						RelationGetRelationName(vs->index), blk),
+				 errdetail("Its right sibling has no downlink in the parent yet."),
+				 errhint("The next INSERT into that key repairs it.")));
+
+	return page;
+}
+
+/*
+ * Walk the LEAF chain of a posting set, left to right: the items of each page
+ * and the ascending ckey order within and across pages.
  */
 static void
-lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
-				 const LionEntryTuple *entry)
+lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
+						   OffsetNumber eoff, const LionEntryTuple *entry,
+						   BlockNumber first, LionVerifyPLevel *out,
+						   uint64 *cardp, uint32 *ncontainersp)
 {
-	BlockNumber blk = entry->head;
+	BlockNumber blk = first;
 	BlockNumber last = InvalidBlockNumber;
 	bool		haveprev = false;
 	uint32		prevckey = 0;
-	uint64		card = 0;
-	uint32		ncontainers = 0;
-
-	if (!BlockNumberIsValid(entry->head) || !BlockNumberIsValid(entry->tail))
-		lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
-					RelationGetRelationName(vs->index), eoff, eblk,
-					entry->head, entry->tail);
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -588,28 +764,12 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		OffsetNumber off;
 		OffsetNumber firstused = InvalidOffsetNumber;
 		OffsetNumber lastused = InvalidOffsetNumber;
+		uint32		minckey = 0;
+		uint32		maxckey = 0;
 
-		lion_verify_visit(vs, blk, "a container chain");
-		page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
+		page = lion_verify_posting_page(vs, blk, eblk, eoff, entry, 0, &buf);
 		opaque = LionPageGetOpaque(page);
 		maxoff = PageGetMaxOffsetNumber(page);
-
-		/*
-		 * DESIGN.md §18.  A live entry must not reach a freed page at all,
-		 * and every page of a chain has to name that chain: readers rely on
-		 * both to tell a chain they still hold a link to from one whose pages
-		 * have been handed to somebody else.
-		 */
-		if (LionPageIsDeleted(page))
-			lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
-						RelationGetRelationName(vs->index), blk, eoff, eblk);
-
-		if (opaque->owner_head != entry->head ||
-			opaque->owner_hash != entry->hash)
-			lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is owned by hash %u at head %u, expected hash %u at head %u",
-						RelationGetRelationName(vs->index), blk, eoff, eblk,
-						opaque->owner_hash, opaque->owner_head,
-						entry->hash, entry->head);
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
@@ -623,8 +783,8 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			lion_verify_container(vs, blk, off, c, ItemIdGetLength(iid),
 								 &haveprev, &prevckey);
 
-			card += c->cardinality;
-			ncontainers++;
+			*cardp += c->cardinality;
+			(*ncontainersp)++;
 
 			if (firstused == InvalidOffsetNumber)
 				firstused = off;
@@ -641,10 +801,10 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		}
 		else
 		{
-			uint32		minckey =
+			minckey =
 				lion_item_first_ckey((LionContainer *)
 									PageGetItem(page, PageGetItemId(page, firstused)));
-			uint32		maxckey =
+			maxckey =
 				lion_item_last_ckey((LionContainer *)
 								   PageGetItem(page, PageGetItemId(page, lastused)));
 
@@ -653,6 +813,10 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 							RelationGetRelationName(vs->index), blk,
 							opaque->minckey, opaque->maxckey, minckey, maxckey);
 		}
+
+		lion_verify_plevel_add(out, blk, minckey,
+							   firstused != InvalidOffsetNumber, maxckey, 0,
+							   false);
 
 		last = blk;
 		blk = opaque->rightlink;
@@ -665,6 +829,258 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, last,
 					entry->tail);
+}
+
+/* Walk one INTERNAL level of a posting set, collecting its downlinks. */
+static void
+lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
+						  OffsetNumber eoff, const LionEntryTuple *entry,
+						  BlockNumber first, uint16 level,
+						  LionVerifyPLevel *out, LionVerifyPLevel *children)
+{
+	BlockNumber blk = first;
+
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+		OffsetNumber firstdata;
+		uint32		highkey = 0;
+		bool		hashigh = false;
+		uint32		firstkey = 0;
+		bool		hasfirst = false;
+		uint32		prevkey = 0;
+
+		page = lion_verify_posting_page(vs, blk, eblk, eoff, entry, level, &buf);
+		maxoff = PageGetMaxOffsetNumber(page);
+		firstdata = lion_posting_first_data(page);
+
+		if (!LionPageIsRightmost(page))
+		{
+			if (maxoff < FirstOffsetNumber)
+				lion_corrupt("lion index \"%s\": internal posting page %u is not rightmost but has no high key",
+							RelationGetRelationName(vs->index), blk);
+			if (BlockNumberIsValid(lion_posting_pivot(page, FirstOffsetNumber)->child))
+				lion_corrupt("lion index \"%s\": the first item of internal posting page %u is a downlink, not a high key",
+							RelationGetRelationName(vs->index), blk);
+			highkey = lion_posting_pivot(page, FirstOffsetNumber)->ckey;
+			hashigh = true;
+		}
+		else if (maxoff >= FirstOffsetNumber &&
+				 !BlockNumberIsValid(lion_posting_pivot(page, FirstOffsetNumber)->child))
+			lion_corrupt("lion index \"%s\": rightmost internal posting page %u carries a high key",
+						RelationGetRelationName(vs->index), blk);
+
+		if (firstdata > maxoff)
+			lion_corrupt("lion index \"%s\": internal posting page %u has no downlink",
+						RelationGetRelationName(vs->index), blk);
+
+		for (off = firstdata; off <= maxoff; off++)
+		{
+			LionPostingPivot *piv = lion_posting_pivot(page, off);
+
+			if (ItemIdGetLength(PageGetItemId(page, off)) !=
+				LION_POSTING_PIVOT_SIZE)
+				lion_corrupt("lion index \"%s\": item %u of internal posting page %u is %zu bytes, expected %zu",
+							RelationGetRelationName(vs->index), off, blk,
+							(Size) ItemIdGetLength(PageGetItemId(page, off)),
+							LION_POSTING_PIVOT_SIZE);
+			if (!BlockNumberIsValid(piv->child))
+				lion_corrupt("lion index \"%s\": item %u of internal posting page %u is a second high key",
+							RelationGetRelationName(vs->index), off, blk);
+
+			/*
+			 * Separators are non-decreasing rather than strictly increasing: a
+			 * split whose two halves are both empty by the time its repair runs
+			 * gives the right one the left one's separator, which is a range of
+			 * zero keys and routes everything to the right page (DESIGN.md §22).
+			 */
+			if (hasfirst && piv->ckey < prevkey)
+				lion_corrupt("lion index \"%s\": downlink %u of internal posting page %u has separator %u, below the one before it (%u)",
+							RelationGetRelationName(vs->index), off, blk,
+							piv->ckey, prevkey);
+			if (hashigh && piv->ckey >= highkey)
+				lion_corrupt("lion index \"%s\": downlink %u of internal posting page %u has separator %u, not below its high key %u",
+							RelationGetRelationName(vs->index), off, blk,
+							piv->ckey, highkey);
+
+			if (!hasfirst)
+			{
+				firstkey = piv->ckey;
+				hasfirst = true;
+			}
+			prevkey = piv->ckey;
+
+			if (children != NULL)
+				lion_verify_plevel_add(children, piv->child, piv->ckey, true,
+									   piv->ckey, 0, false);
+
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		lion_verify_plevel_add(out, blk, firstkey, hasfirst, prevkey, highkey,
+							   hashigh);
+
+		blk = LionPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Walk and check the posting tree of a CHAIN entry (DESIGN.md §22).
+ *
+ * The tree is checked level by level from the leaves up, exactly as §21's
+ * directory is: each level is walked along its right links, which proves the
+ * sibling chain and the key order within and across its pages, and the level
+ * above is then checked against what that walk collected, which proves that
+ * its downlinks name exactly those pages in that order - which is the same
+ * statement as "the leaf right-link chain equals the in-order leaf sequence".
+ */
+static void
+lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
+				 const LionEntryTuple *entry)
+{
+	BlockNumber leftmost[LION_POSTING_MAX_HEIGHT + 1];
+	LionVerifyPLevel *lvl;
+	uint64		card = 0;
+	uint32		ncontainers = 0;
+	uint32		height = 0;
+	uint32		i;
+	int			j;
+
+	if (!BlockNumberIsValid(entry->head) || !BlockNumberIsValid(entry->tail))
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
+					RelationGetRelationName(vs->index), eoff, eblk,
+					entry->head, entry->tail);
+
+	/* The leftmost page of every level, from the root down. */
+	{
+		BlockNumber blk = entry->head;
+		int			steps = 0;
+
+		for (i = 0; i <= LION_POSTING_MAX_HEIGHT; i++)
+			leftmost[i] = InvalidBlockNumber;
+
+		for (;;)
+		{
+			Buffer		buf;
+			Page		page;
+			uint16		level;
+
+			if (steps++ > LION_POSTING_MAX_HEIGHT)
+				lion_corrupt("lion index \"%s\": the posting tree of chain entry %u on block %u is deeper than %d levels",
+							RelationGetRelationName(vs->index), eoff, eblk,
+							LION_POSTING_MAX_HEIGHT);
+
+			buf = ReadBuffer(vs->index, blk);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+				LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
+				!LionPageIsContainer(page))
+			{
+				UnlockReleaseBuffer(buf);
+				lion_corrupt("lion index \"%s\": block %u is not a container page of chain entry %u on block %u",
+							RelationGetRelationName(vs->index), blk, eoff, eblk);
+			}
+			level = LionPageGetOpaque(page)->level;
+			if (level > LION_POSTING_MAX_HEIGHT)
+			{
+				UnlockReleaseBuffer(buf);
+				lion_corrupt("lion index \"%s\": posting page %u claims level %u",
+							RelationGetRelationName(vs->index), blk, level);
+			}
+			if (blk == entry->head)
+				height = level;
+			if (!LionPageIsRightmost(page) && blk == entry->head)
+			{
+				UnlockReleaseBuffer(buf);
+				lion_corrupt("lion index \"%s\": the root %u of chain entry %u on block %u has a right sibling",
+							RelationGetRelationName(vs->index), blk, eoff, eblk);
+			}
+			leftmost[level] = blk;
+			if (level == 0)
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+			if (lion_posting_first_data(page) > PageGetMaxOffsetNumber(page))
+			{
+				UnlockReleaseBuffer(buf);
+				lion_corrupt("lion index \"%s\": internal posting page %u has no downlink",
+							RelationGetRelationName(vs->index), blk);
+			}
+			blk = lion_posting_pivot(page,
+									 lion_posting_first_data(page))->child;
+			UnlockReleaseBuffer(buf);
+		}
+	}
+
+	lvl = (LionVerifyPLevel *) palloc0(sizeof(LionVerifyPLevel) * (height + 1));
+
+	lion_verify_posting_leaves(vs, eblk, eoff, entry, leftmost[0], &lvl[0],
+							   &card, &ncontainers);
+
+	for (i = 1; i <= height; i++)
+	{
+		LionVerifyPLevel children;
+
+		memset(&children, 0, sizeof(children));
+		lion_verify_posting_level(vs, eblk, eoff, entry, leftmost[i],
+								  (uint16) i, &lvl[i], &children);
+
+		if (children.npages != lvl[i - 1].npages)
+			lion_corrupt("lion index \"%s\": posting level %u of chain entry %u on block %u has %d downlinks but level %u has %d pages",
+						RelationGetRelationName(vs->index), i, eoff, eblk,
+						children.npages, i - 1, lvl[i - 1].npages);
+
+		for (j = 0; j < children.npages; j++)
+		{
+			uint32		sep = children.firstkey[j];
+
+			if (children.blocks[j] != lvl[i - 1].blocks[j])
+				lion_corrupt("lion index \"%s\": downlink %d of posting level %u points at block %u, but the %dth page of level %u is block %u",
+							RelationGetRelationName(vs->index), j, i,
+							children.blocks[j], j, i - 1,
+							lvl[i - 1].blocks[j]);
+
+			if (j == 0 && sep != 0)
+				lion_corrupt("lion index \"%s\": the first downlink of posting level %u has separator %u, expected minus infinity",
+							RelationGetRelationName(vs->index), i, sep);
+
+			/* the separator is at or below its child's own first key */
+			if (lvl[i - 1].hasfirst[j] && sep > lvl[i - 1].firstkey[j])
+				lion_corrupt("lion index \"%s\": the separator %u of posting block %u sorts after its own first container key %u",
+							RelationGetRelationName(vs->index), sep,
+							children.blocks[j], lvl[i - 1].firstkey[j]);
+
+			/* ... and the child's own upper bound is below the next one */
+			if (j + 1 < children.npages)
+			{
+				uint32		next = children.firstkey[j + 1];
+
+				if (i == 1)
+				{
+					if (lvl[0].hasfirst[j] && lvl[0].lastkey[j] >= next)
+						lion_corrupt("lion index \"%s\": leaf %u holds container key %u, at or above the separator %u of its right sibling",
+									RelationGetRelationName(vs->index),
+									lvl[0].blocks[j], lvl[0].lastkey[j], next);
+				}
+				else if (lvl[i - 1].hashigh[j] && lvl[i - 1].highkey[j] > next)
+					lion_corrupt("lion index \"%s\": the high key %u of posting block %u sorts after the separator %u of its right sibling",
+								RelationGetRelationName(vs->index),
+								lvl[i - 1].highkey[j], lvl[i - 1].blocks[j],
+								next);
+			}
+		}
+	}
+
+	if (height > vs->max_posting_height)
+		vs->max_posting_height = height;
 
 	if (card != entry->ntids)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims " UINT64_FORMAT " TIDs, but its containers hold " UINT64_FORMAT,
@@ -672,7 +1088,7 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 					entry->ntids, card);
 
 	if (ncontainers != entry->ncontainers)
-		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims %u containers, but its chain holds %u",
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims %u containers, but its posting tree holds %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
 					entry->ncontainers, ncontainers);
 }
@@ -1216,11 +1632,19 @@ lion_verify_reachable(LionVerifyState *vs)
 			continue;
 		}
 
+		/*
+		 * An INTERNAL posting page is leaked as a whole page rather than as an
+		 * empty one (DESIGN.md §22): a posting set is freed leaves-first, so a
+		 * crash between deleting the entry and marking its pages free can
+		 * leave the root of the set behind with its downlinks still on it.
+		 * The next VACUUM's sweep recovers it once its children are gone.
+		 */
 		leaked = PageIsNew(page) ||
 			(PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
 			 LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
 			 LionPageIsContainer(page) &&
-			 PageGetMaxOffsetNumber(page) == 0);
+			 (PageGetMaxOffsetNumber(page) == 0 ||
+			  LionPageIsPostingInternal(page)));
 
 		UnlockReleaseBuffer(buf);
 

@@ -95,7 +95,7 @@ All pages are standard PG pages (PageInit) with a special area:
         uint16      page_id;       /* LION_PAGE_ID = 0xFF87, for identification by inspection tools */
     } LionPageOpaqueData;          /* 24 bytes */
 
-Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 3, offset_bits,
+Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 5, offset_bits,
 container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
@@ -146,15 +146,23 @@ never convert back from CHAIN to INLINE. The default is the maximum on purpose: 
 owns whole container pages, so a key whose set is a few hundred bytes costs a whole page once it
 spills (§13 measured a 20000-key index at 164 MB with a 1024-byte limit against 35 MB with 4096).
 
+**Superseded in part by §22 (format version 5).** A CHAIN entry's container pages are the LEAVES of
+a B-tree over container keys now: the entry's `head` is that tree's ROOT, and internal posting pages
+(the same page kind, told apart by `level` > 0) hold downlinks above them. Everything the next three
+paragraphs say about a leaf - the items, the ordering, min/max, splits, free space, growth slack -
+is unchanged, and so is the right-link list they form; what changes is only how a container key is
+turned into a block, and §22 says so where it does.
+
 Container pages (per key, CHAIN entries): items are LionContainer structs, ascending ckey within a
 page; all ckeys on page P are smaller than all ckeys on P.rightlink. `minckey`/`maxckey` in the
 special area are maintained on every change. Page P owns free space like any heap/index page; use
 PageAddItemExtended (with explicit offset to keep order), PageIndexTupleOverwrite (handles size
 change), PageIndexTupleDeleteNoCompact/PageIndexMultiDelete + PageRepairFragmentation as needed.
 
-Locating the page for a ckey (`lion_chain_find_page`): if the tail is non-empty and ckey ≥ tail.minckey
-use tail (the append case; an empty tail has minckey 0 and must not be trusted); otherwise walk from
-head and stop at the first non-empty page with maxckey ≥ ckey, or the last page.
+Locating the page for a ckey (`lion_chain_find_page`): a DESCENT of the posting tree since §22. The
+insert path still tries the append case first - the set's last leaf, taken with the exclusive lock
+the insert needs anyway - and falls back to the descent for anything else; an empty tail has minckey
+0 and must not be trusted, so it falls through too.
 
 Growth (`lion_chain_put_container`): overwrite in place if the page has room; otherwise *split* page P:
 move the items at/after the insert position to a freshly allocated page N linked after P; if the
@@ -163,8 +171,11 @@ container still does not fit on P, place it alone on a second new page M linked 
 the GenericXLog maximum). Items only ever move right and only to pages that are linked immediately
 right of the page they came from - which is the property the §9/§11 interlock needs, and it holds
 whether the new page was extended onto the end of the relation or recycled out of the free space map
-(§18). A whole chain is freed when its entry is deleted (§18); individual pages of a live chain are
-never unlinked. `lion_chain_find_page` skips empty pages (VACUUM may leave them mid-chain).
+(§18). Since §22 the split also puts a downlink for each new page into the parent, in a record of
+its own, with the page to its left flagged LION_PAGE_INCOMPLETE_SPLIT in between; and a split of the
+ROOT is a push-down that keeps the root at its block. A whole posting set is freed when its entry is
+deleted (§18); individual pages of a live one are never unlinked, so a leaf VACUUM has emptied stays
+in the list and still owns the range its parent gave it.
 INLINE payloads are packed without padding, so containers inside them are unaligned: read them with
 `lion_inline_fetch()` into an aligned buffer; never cast into the payload. Containers stored as page
 items are MAXALIGNed and may be used in place.
@@ -327,10 +338,12 @@ SCAN (`lion_scan.c`, amgetbitmap)
 1. Lock bucket head SHARED, walk the bucket chain (lock coupling not required for bucket pages:
    hold one page at a time; entries are only ever appended to bucket pages or overwritten in place).
 2. On finding the entry: INLINE → copy the payload out, release, emit. CHAIN → copy head, release the
-   bucket page, then walk the container chain holding one SHARED page lock at a time: read all items
-   and the rightlink under the lock, release, lock the rightlink. Splits only move items to a new
-   page immediately to the right and require an EXCLUSIVE lock on the source, so a reader sees every
-   container exactly once (it read the items and the rightlink atomically).
+   bucket page, then descend to the leftmost LEAF (§22: head is the posting tree's root) and walk the
+   leaves holding one SHARED page lock at a time: read all items and the rightlink under the lock,
+   release, lock the rightlink. Splits only move items to a new page immediately to the right and
+   require an EXCLUSIVE lock on the source, so a reader sees every container exactly once (it read
+   the items and the rightlink atomically). The descent hands the first leaf back LOCKED, which is
+   what keeps a root push-down from slipping in between.
 3. Emit each container into the TIDBitmap: for each of the ≤ 64 heap blocks the container covers,
    collect its offsets into an ItemPointerData array and call tbm_add_tuples once per heap block
    (never one call per TID). Return the number of TIDs.
@@ -349,7 +362,8 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
 2. For each entry: INLINE → filter the payload through the callback and repack. Note that removal can
    GROW a container (every-other-member deletion turns a RUN into a 4104-byte BITSET), so a filtered
    INLINE payload may exceed inline_limit or the page: then the entry spills to a chain during VACUUM.
-   CHAIN → walk the chain; each container page is locked with LockBufferForCleanup (this is the
+   CHAIN → walk the posting tree's leaves, left to right from the leftmost one; each leaf is locked
+   with LockBufferForCleanup (this is the
    interlock that phase 2 relies on: a heap-skipping reader keeps the page pinned while it consults
    the visibility map). Filter every container with lion_container_remove_if, run
    lion_container_optimize, write back in place or, if it grew and no longer fits, re-place it through
@@ -468,12 +482,19 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT ntids bigint, OUT container_bytes bigint, OUT free_bytes bigint,
         OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint,
         OUT empty_tids bigint, OUT slack_bytes bigint,
-        OUT deleted_pages bigint) RETURNS record
+        OUT deleted_pages bigint,
+        OUT posting_internal_pages bigint, OUT max_posting_height int) RETURNS record
         -- the first four describe the entry directory of §21 (`ordered` false means the key type
         -- has no btree opclass, so the entries are in a complete but arbitrary order);
         -- container counts include INLINE containers; free_bytes sums directory and container pages;
         -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
-        -- the reserved no-key entry (§17)
+        -- the reserved no-key entry (§17); container_pages counts posting-tree LEAVES and
+        -- posting_internal_pages the pages above them, with max_posting_height the tallest
+        -- posting tree in the index (§22; 0 means every set fits one page)
+    lion_index_posting_root(regclass, key anyelement) RETURNS bigint
+        -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
+        -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
+        -- the identity every page of the set is stamped with (§18).
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
@@ -845,31 +866,52 @@ answers are checked too.
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
 ambulkdelete acquires a cleanup lock (an exclusive content lock that also waits for all other pins
-to drop) on **every page that can hold a TID** — every directory LEAF and every container page of
-every chain, whether or not it has anything to remove there — in chain order (the leaves left to
-right from the leftmost one, then each chain left to right).
+to drop) on **every page that can hold a TID** — every directory LEAF and every LEAF of every key's
+posting tree, whether or not it has anything to remove there — in chain order (the directory leaves
+left to right from the leftmost one, then each posting set's leaves left to right from ITS leftmost
+one).
 
-**Internal directory pages are not cleanup-locked, and need not be** (§21): they hold downlinks and
-separator keys and no TIDs at all, so no reader can be holding a container copy that came from one,
-and there is nothing on them for the §9 interlock to protect. The leaves are exactly the pages that
-used to be bucket pages, and VACUUM treats them the same way. A leaf SPLIT obeys the same rule the
-chain split does - the upper half goes to a brand new page immediately to the right - so an entry
-can only ever move onto a leaf the walk has not passed, and an entry that moves off a leaf the walk
-has already finished has by then been fully processed, chains and all. This is the same rule nbtree's btvacuumscan follows, and it is what closes the
-page-split hole in the §9 argument: a reader pins page P, copies container C out, and drops the
-content lock; a concurrent insert may then split P and move C to a brand-new page N linked
+**Chain order is leaf right-link order** (§22). A posting set is a B-tree over container keys now,
+but its leaves are the container pages that were the chain, they are still rightlinked in ckey
+order, and VACUUM still walks exactly that list — it only has to DESCEND to the leftmost leaf
+instead of starting at the entry's `head`, which is the tree's root.
+
+**Internal pages are not cleanup-locked, and need not be** — neither the directory's (§21) nor a
+posting tree's (§22): they hold downlinks and separator keys and no TIDs at all, so no reader can be
+holding a container copy that came from one, and there is nothing on them for the §9 interlock to
+protect. The directory leaves are exactly the pages that used to be bucket pages, and VACUUM treats
+them the same way. A leaf SPLIT obeys the same rule the chain split does - the upper half goes to a
+brand new page immediately to the right - so an entry can only ever move onto a leaf the walk has not
+passed, and an entry that moves off a leaf the walk has already finished has by then been fully
+processed, posting sets and all. This is the same rule nbtree's btvacuumscan follows, and it is what
+closes the page-split hole in the §9 argument: a reader pins page P, copies container C out, and
+drops the content lock; a concurrent insert may then split P and move C to a brand-new page N linked
 immediately right of P. VACUUM must reach P before N, and P's cleanup lock is blocked by the
 reader's pin, so it cannot clean C on N until the reader has finished its visibility-map checks.
 If VACUUM had already passed P when the reader copied C, C had already been cleaned of this
-cycle's dead TIDs. Two properties make this sufficient: a page is only ever linked into a chain
-immediately right of the page whose split or spill allocated it, so chain order and VACUUM's visit
-order agree, and each VACUUM cycle's set of dead TIDs is fixed before index cleanup starts. If
+cycle's dead TIDs. Two properties make this sufficient: a page is only ever linked into the leaf
+list immediately right of the page whose split or spill allocated it, so chain order and VACUUM's
+visit order agree, and each VACUUM cycle's set of dead TIDs is fixed before index cleanup starts. If
 VACUUM only cleanup-locked pages it modified, it could walk past an emptied P and clean C on N while
 the reader still counts from its stale copy.
 
+**A reader that SEEKS rather than walks does not weaken any of that** (§22). The argument was never
+about which pages the reader has visited; it is about the page the container it is holding came
+from. A cursor that descends straight to leaf Z and takes container C from it pins Z, and VACUUM
+cannot have cleaned Z - it has to hold Z's cleanup lock to remove a TID from it, and that lock waits
+for the pin. If a split then moves C to a page right of Z, VACUUM reaches Z first, and is blocked
+there. The internal pages the descent reads on the way hold no TIDs.
+
+**A ROOT PUSH-DOWN is the one page transition VACUUM can meet** (§22): an insert turns a one-page
+posting set's root into an internal page and moves its containers to a brand new child. VACUUM,
+holding the cleanup lock on that page, finds it is no longer a leaf and restarts at the new leftmost
+leaf. That is safe for the reason above: the cleanup lock it holds waited for every pin on the page
+those containers came from, so no reader holds a stale copy of them, and the page they moved to did
+not exist a moment ago.
+
 Page recycling (§18) does not weaken either property. A recycled block is still linked immediately
-right of its split origin, so it is still visited after it. A page only ever LEAVES a chain as part
-of a whole-chain free, which happens under a cleanup lock on that page after VACUUM has found it
+right of its split origin, so it is still visited after it. A page only ever LEAVES the leaf list as
+part of a whole-set free, which happens under a cleanup lock on that page after VACUUM has found it
 empty - so a reader pinning it blocks the free outright, and a reader that got past it is holding
 containers that VACUUM has already cleaned. And a page that a split moves items onto has had those
 items cleaned already, because they come from a page this cycle visited first.
@@ -1898,7 +1940,15 @@ below finds them (test/recovery/run.sh phase 1b puts the crash exactly there).  
 of empty pages of a live key is NOT part of this version (documented limitation: a key whose oldest
 pages empty out keeps them until REINDEX).
 
-**Reuse.** `lion_new_buffer()`/`lion_new_buffer_xl()` first try GetFreeIndexPage(): take the page with
+**Reuse.** *(§22 adds one thing to the sweep below: a leaked posting set's ROOT is an INTERNAL page
+with downlinks on it, not an empty one, so the sweep runs in ROUNDS - an unreferenced internal
+posting page is freed once every one of its downlinks names a DELETED page, which the round before
+made true of its leaves. A LIVE internal page can never pass that test: every leaf of a live posting
+set was visited by pass 2 and is therefore never swept, and a page a concurrent insert created since
+then is full of the items a split just put there. verify() reports such a page as the ordinary leak
+it is, with a WARNING.)*
+
+`lion_new_buffer()`/`lion_new_buffer_xl()` first try GetFreeIndexPage(): take the page with
 ConditionalLockBuffer; it is reusable only if it is all-zero or LION_PAGE_DELETED with
 GlobalVisCheckRemovableFullXid(heaprel, safexid) true (the nbtree rule: no scan that could still hold
 a link to it is running); otherwise re-record it in the FSM and extend the relation (which also keeps
@@ -1938,7 +1988,9 @@ cannot go away and a mismatch is corruption.
 chain's HEAD page is the one page `lion_new_buffer()` never takes from the free space map
 (`lion_entry_spill()` passes reuse = false), so a head block always comes from extending the
 relation, is a block number that has never been handed out before, and is therefore never reused as
-a head.  A reused page always belongs to some other chain, whose head block differs.  *(Deviation
+a head. Since §22 the head is the posting tree's ROOT rather than its first leaf, and the rule is
+unchanged because a root split is a PUSH-DOWN that keeps the root at its block: `head` never moves
+for the life of the set, so owner_head is still an identity nothing else can collide with.  A reused page always belongs to some other chain, whose head block differs.  *(Deviation
 from the first draft, which relied on the pair (owner_hash, owner_head) and accepted "a simultaneous
 32-bit hash and head-block coincidence".  The reason for the change is not the coincidence but
 reachability: the count cursor's LionPostingSet carries only the head block, not the entry's hash,
@@ -2297,8 +2349,8 @@ and returned nothing at all. `test/sql/directory.sql` §12 builds such a family.
   pages - which needs an opclass whose comparison ties for distinct entries, so essentially never -
   re-descends with the exact key instead.) On no room, split.
 - **Split**: allocate the right sibling (`lion_alloc_buffer` with reuse = true is fine; directory
-  pages are never chain heads), rebuild both halves from a private copy of the page with the new item
-  inserted, cut at half the bytes - or, when the page is rightmost and the item goes at the very end,
+  pages are never posting-set roots), rebuild both halves from a private copy of the page with the new
+  item inserted, cut at half the bytes - or, when the page is rightmost and the item goes at the very end,
   put only the new item on the right and walk the cut back only as far as the high key the left page
   now needs, so an ascending key sequence fills its leaves completely (without that walk-back the
   cut is rejected outright, because the page being split is full, and an ascending build lands at
@@ -2314,6 +2366,19 @@ and returned nothing at all. `test/sql/directory.sql` §12 builds such a family.
   hold - two writers that both saw the flag would both insert the downlink.)*
   The meta page is in the record because it counts the directory's pages, which is what lets the cost
   model tell a directory page from a container page without reading the index.
+  **The two walk-backs can pull in OPPOSITE directions and leave no cut at all**, and that is no
+  longer an error (2026-09-22 review of this section). An 8 KiB page has room for one item plus one
+  pivot (6092 + 2036 = 8128) but not for two items plus a pivot, so a page holding two large entries
+  under a large high key would have no two-way cut for a third large item between them. The split
+  then runs in two steps: the page is split as it STANDS, which always has a cut - k = 1 puts one item
+  plus its high key on the left and a suffix of what the page already held plus its old high key on
+  the right, and both were on the page a moment ago - and the item is then placed again on whichever
+  half now owns it. That terminates, because every split moves at least one item off the page and a
+  page holding one item always takes a second. With today's size caps the shape is in fact
+  unreachable - a fresh entry is at most 2052 bytes on a page and a replacement grows by at most a
+  few dozen - but the caps are three independent constants and none of them should be load-bearing
+  for whether an INSERT errors out. **A posting-tree internal page needs none of this** (§22): its
+  pivots are fixed size, so the middle cut always fits.
 - **Root split** is ATOMIC instead: left, right, the new root and the meta page are four buffers, so
   the meta page never names a root that does not exist and a root is never flagged. The old root
   loses LION_PAGE_ROOT in the same record, which is what makes every other backend's cached root
@@ -2485,14 +2550,17 @@ leaves" instead of "the entries in this bucket times the bucket count"; both are
 
 Directory pages: nbtree's rules - no coupling downwards, move right when the high key no longer
 exceeds the search key, splits hold left, then right, then the old right sibling, then the meta page,
-and an ascent holds the child while it locks the parent. Container chains: unchanged (§5, §11, §18).
-The lock order directory page → container page is preserved, and the one place that used to break it
+and an ascent holds the child while it locks the parent. Posting pages: the same rules again (§22),
+with no old-right-sibling and no meta page in the record, and with all WRITERS of one key serialised
+by the very directory leaf below. The lock order directory page → posting page is preserved, and the one place that used to break it
 - VACUUM re-finding a moved entry - is done with nothing held. VACUUM's two-pass protocol addresses
 the LEAF that holds the entry where it used to address the bucket head.
 
 ### Format
 
-LION_VERSION 4; version 3 indexes are refused with the REINDEX hint. verify() checks the tree level
+LION_VERSION 4 at the time this section was written; §22 bumped it to 5 in the next wave, and a
+version 4 index is refused with the same REINDEX hint for the reason given there. verify() checks
+the tree level
 by level from the leaves up: page kinds and level numbers, sibling links, the high key present iff
 the page is not rightmost, keys strictly increasing within a page and the last key below the high
 key, the high key of a page not above the first key of the next, every downlink of a level naming
@@ -2505,11 +2573,12 @@ repair hint.
 ### Not done in this version
 
 Leaf deletion and page reclaim for an empty leaf (nbtree's half-dead protocol); a backward scan
-(`leftlink` exists and verify() checks it, but nothing reads it yet - §22 and a future `amgettuple`
-will); parallel build; and online deduplication of a prefix run that spans pages, which an opclass
+(`leftlink` exists on DIRECTORY pages and verify() checks it, but nothing reads it yet - a future
+`amgettuple` will; §22 turned out not to need it, and posting pages therefore keep no left link at
+all); parallel build; and online deduplication of a prefix run that spans pages, which an opclass
 with a comparison coarser than its equality could in principle produce.
 
-## 22. Per-key posting tree (format version 4, same wave)
+## 22. Per-key posting tree (format version 5, implemented)
 
 Replaces the linked chain of container pages per CHAIN entry (§4) with a B-tree over container keys
 (ckey), GIN's posting-tree shape.
@@ -2521,40 +2590,153 @@ its containers, the other sets are probed by ckey (descend, or step right from t
 Cost tracks the selective side. Inserts into the middle of a chain stop being a linear walk from the
 head (the churn tests' mid-chain inserts).
 
-Structure. The entry's `head` becomes the posting-tree root (a container page when the tree is one
-page: no separate root format, exactly as GIN). Container pages keep their layout (items sorted by
-first ckey, minckey/maxckey, owner stamps, DELETED marking) and gain `level` in the special area
-(24 → 28 bytes, rounded to 32 by MAXALIGN; adjust LION_SPECIAL_SIZE); internal posting pages hold
-(ckey, child block) pairs. Right-links stay, so the sequential walk used by scans, counts and VACUUM
-is unchanged: leaves are still a rightlinked list in ckey order.
+Structure. The entry's `head` is the posting-tree ROOT (a container page when the tree is one page:
+no separate root format, exactly as GIN). Container pages keep their layout (items sorted by first
+ckey, minckey/maxckey, owner stamps, growth slack, DELETED marking) and use the `level` §21 had
+already put in the special area: leaves are level 0, internal posting pages level 1 and up. They
+carry LION_PAGE_CONTAINER like the leaves - the level is what tells the two apart - so the owner
+check, the DELETED marking and the leak sweep apply to them unchanged. Right links stay at the leaf
+level, so every sequential walk (scans, single-set counts, VACUUM) is what it was: the leaves are
+still one rightlinked list in ckey order. **`leftlink` stays unused on posting pages**, which is
+what keeps a split inside the four buffers a GenericXLog record allows.
+
+An internal page's items are `LionPostingPivot { uint32 ckey; BlockNumber child; }`, 8 bytes, so a
+page holds 679 of them. The convention is §21's, not GIN's: `ckey` is a SEPARATOR - a lower bound on
+the child's subtree - and the FIRST item of every non-rightmost internal page is its HIGH KEY, a
+strict upper bound with `child` = InvalidBlockNumber. Separators are non-decreasing rather than
+strictly increasing (see the repair below). The leftmost downlink of a level is 0, which is minus
+infinity for an unsigned ckey. **Leaves carry no high key** - they hold containers, not pivots - and
+use `maxckey` instead; the next paragraph is why that is enough.
+
+**Writers of one key serialise on that key's directory leaf**, and everything below rests on it.
+Every path that changes a posting tree - aminsert, an INLINE spill, VACUUM's apply and regrow steps -
+holds the directory leaf that carries the entry EXCLUSIVE while it does (§5, §11, §21), and VACUUM
+re-validates that the entry is still on the leaf it holds before every write. So no split of a
+posting tree can be in flight while another WRITER descends it, and a write descent needs no
+move-right at the leaf level at all: the separators say exactly which leaf owns a container key,
+which is also what keeps "a leaf's keys are all below its right sibling's" true when the key lands
+in a gap. Only READERS race with splits, and a reader that lands on a leaf whose maxckey no longer
+reaches its key moves right, which is where the split put the items.
 
 Operations.
-- Descent by ckey (SHARE, lock coupling) to the leaf owning the range; `lion_chain_find_page()`
-  becomes a descent instead of a head-to-tail walk; the tail hint stays for appends.
-- Leaf split: as today (upper half or insert-position split to a new page linked right), plus a
-  downlink insert into the parent with the incomplete-split repair rule; root split allocates a new
-  root and the entry's `head` is updated in the same record (entry page, old root, new root, new
-  sibling = 4 buffers, the GenericXLog maximum: keep the split's page count at that bound or split
-  the record into "split leaf + mark incomplete" and "insert downlink + clear", nbtree-style).
-- VACUUM: leaves are visited in ckey order via right-links as today (cleanup lock on every leaf, §11);
-  internal pages are cleanup-locked too when traversed; a freed chain frees its internal pages as
-  well; internal pages are never deleted while the tree lives (documented limitation).
-- Cursors (`LionSetCursor`) gain `seek(ckey)`: descend from the root (or step right while the current
-  leaf's maxckey < ckey) and position at the first item with first-ckey ≥ ckey. The AND merge uses it:
-  advance the smallest-cardinality cursor sequentially and seek the others. Union and single-set
-  counting keep the sequential walk. The §9 pin discipline is unchanged: a leaf stays pinned until
-  the container taken from it has passed the visibility-map check; a seek releases the previous
-  leaf's pin only after that point (the cursor already has this ordering; seek must use the same
-  release point).
-- Owner validation (§18) applies to internal pages as well.
+- **Descent** by ckey with SHARE locks, releasing the parent BEFORE locking the child - *not* lock
+  coupling, which is a deviation from this section's first draft and the same one §21 records: a
+  split holds the child while it locks the parent, so coupling downwards would close a cycle buffer
+  locks have no detector for. The leaf is taken in the caller's mode directly, so no lock is
+  upgraded. `lion_chain_find_page()` is that descent (`lion_posting_search()` in the new
+  `lion_posting.c`); the tail hint stays for appends and is now decided with the EXCLUSIVE lock the
+  insert needs anyway, without descending at all, when the tail is still the rightmost leaf.
+- **Leaf split**: as today (items at and after the insert position move to a brand new page N linked
+  right; when the new items still do not fit on P they get a second new page M linked between them),
+  plus a downlink insert into the parent. Each new page's LEFT neighbour is flagged
+  LION_PAGE_INCOMPLETE_SPLIT in the split record and held EXCLUSIVE until its downlink is in and the
+  flag cleared, so a P → M → N split flags both P and M and inserts M's downlink first - a descent
+  cannot reach M before M has one. Records: (P, M, N, entry leaf) = 4 buffers for the split, one for
+  each downlink, one tiny one for each flag. Injection point `lion-posting-split-incomplete` fires
+  between the first record and the downlink; `test/recovery/run.sh` phase 1d crashes the server there
+  and proves the next writer's descent repairs it.
+- **Root split is a PUSH-DOWN**, and this is the deviation that matters most from the first draft,
+  which had it allocate a new root and rewrite the entry's `head`. The root block never moves: its
+  items go to a brand new child and the root block itself becomes the level above, holding one
+  downlink to that child (nbtree and GIN both keep their root in place). Three things fall out of
+  it. `head` never changes, so the entry is never rewritten for a root split and the four-buffer
+  budget is never the binding constraint - the push-down is (root, child, entry leaf) = 3, and the
+  entry is only there because `tail` moves. "A head block is never recycled as a head" (§18) stays
+  true without any new rule, so owner_head remains the identity a reader holding nothing but a head
+  block can validate against. And the child is a verbatim copy of the old root, so the operation
+  that overflowed simply runs again at the same offset on the child - the root lock is dropped for
+  that window, because the child's own split has to take the root to insert ITS downlink and buffer
+  locks are not reentrant, which is safe precisely because writers of one key serialise.
+- **VACUUM**: the leaves are visited in ckey order via right links exactly as before, with a cleanup
+  lock on every one of them (§11 unchanged); pass 2 starts by descending to the leftmost leaf instead
+  of starting at `head`. Internal pages hold no TIDs, so they are NOT cleanup-locked on the ordinary
+  walk and need not be (§11 says so in as many words); they are never empty while the set lives, so
+  the leak sweep leaves them alone and they need not be marked visited either. Freeing a whole set
+  frees its internal pages too, bottom up, under ConditionalLockBufferForCleanup like the leaves.
+  Internal pages are never deleted while the set lives (documented limitation), and neither are
+  empty leaves - both wait for the whole set to go, as §18 already said of mid-chain pages.
+  One case is new: a root that is pushed down while VACUUM is walking it. VACUUM finds a page that
+  is no longer a leaf, and restarts at the new leftmost leaf. That is safe for the reason §11's
+  split hole is safe - the cleanup lock it holds on the old root waited for every pin on the page
+  those containers came from, so no reader can hold a stale copy of them, and the page they moved to
+  did not exist a moment ago.
+- **Cursors** (`LionSetCursor`) gain `seek(ckey)`: from the current leaf, step right while the leaf's
+  maxckey is below the target and the walk is short (`LION_POSTING_SEEK_STEPS` = 2 pages, about
+  where a descent's `height` reads and binary searches become cheaper), otherwise descend from the
+  root; then position at the first item that can hold the target. A sparse segment covers a RANGE of
+  container keys, so a seek into one skips its PAIRS rather than the item. A materialized set is an
+  array and is binary-searched. *(Deviation: an INLINE set is NOT binary-searched, as the first draft
+  said. An inline payload is a sequence of items packed without padding and carries no offsets to
+  search; the seek skips forward over item headers instead, which costs what the sequential walk it
+  replaces costs - one forward pass over the payload - and an offset index built to allow a binary
+  search would have to make that very pass to build itself.)*
+- **The merge is a leapfrog join.** One source is walked sequentially and the others are probed at
+  the container keys it produces: the driver is the positive source with the fewest members, read
+  off the entries' own `ntids`, and only the driver steps past a container key that has been
+  counted - the others are left standing and are sought forward on the next round. Leaving them
+  standing is what makes the probe a probe: stepping every source by one first would cost each of
+  them a container at `key + 1` that the seek is about to skip anyway. The same holds inside an AND
+  node of the expression evaluator (§17), where only the first child steps. Union and single-set
+  counting keep the sequential walk.
+- **The §9 pin discipline is unchanged.** A leaf stays pinned until the container taken from it has
+  passed the visibility-map check, and a seek releases the previous leaf's pin only at that same
+  point: the two callers of `seek` are the merge's "this container key is missing from some set"
+  branch and an AND node's wind-forward, which are exactly the two places that used to call
+  `lion_ecursor_next()` for the same reason - nothing of those container keys reaches the visibility
+  map, so no answer rests on them.
+- **Owner validation (§18) applies to internal pages as well**, and to the LEVEL: a leaf's right link
+  always names another leaf, so a page above level 0 reached through one is treated exactly as a page
+  whose owner no longer matches - the end of the set.
+- **Bulk build**: leaves are written left to right as before, and the internal levels are built
+  bottom-up in the same pass, one open page per level, through the bulk-write API (nbtree's
+  `_bt_buildadd` shape, which is what §21's directory build already does). A set that fits one page
+  has no internal level and its single leaf IS the head. The moment a second leaf is needed the
+  build reserves a block for the ROOT and re-stamps the first leaf with it - the first leaf's image
+  is still in memory, and every page of a set has to carry the root's block as its owner (§18).
 
-Cost model: an AND source's containers term becomes the selective source's container count times
-the number of sources (probes), instead of the sum of all sources' containers.
+Cost model: an AND source's containers term is the selective source's container count times the
+number of sources (probes), instead of the sum of all sources' containers
+(`lion_cost_count_rel()`). OR leaves and an IN list that drives the groups keep their own term -
+neither is an AND source - and the GROUP BY driver's term is unchanged, because what changed in the
+executor is the intersection of the WHERE clauses and nothing else.
 
-Format: covered by LION_VERSION 4 with §21. verify(): tree shape per key (levels, downlinks, leaf
-right-link chain equals the in-order leaf sequence, minckey/maxckey consistent with separators).
+Format: LION_VERSION 5. *(Deviation: this section planned to share §21's version 4, because the two
+were meant to land in one wave; §21 shipped first, so the bump is separate. The page HEADER did not
+have to change - §21 had already given container pages a `level` - but a version 4 posting set of
+more than one page is a flat rightlinked chain with no root above it, which this code cannot descend
+and therefore cannot write to. Opening one is the existing ERROR with the existing REINDEX hint.)*
 
-### What §21 leaves §22 (written after §21 was implemented)
+verify(): per key, the tree is checked level by level from the leaves up, exactly as §21's directory
+is. Page kinds, levels and owner stamps; the leaf right-link chain and ascending ckeys within and
+across leaves, with minckey/maxckey describing the items; on internal pages a high key present iff
+the page is not rightmost, separators non-decreasing and below the high key, the leftmost downlink of
+each level being minus infinity, every downlink of a level naming exactly the pages of the level
+below in that order - which is the same statement as "the leaf right-link chain equals the in-order
+leaf sequence" - each separator at or below its child's own first container key, and each child's
+own upper bound below the next separator. INCOMPLETE_SPLIT pages are a WARNING with the repair hint,
+as §21's are. `lion_index_stats()` gains `posting_internal_pages` and `max_posting_height`;
+`container_pages` counts leaves only. `lion_index_posting_root(idx, key)` is a test helper that
+returns one key's root block, which is how the regression test asserts that a root split did not
+move it.
+
+### The one shape the regression suite cannot reach
+
+A split of an INTERNAL posting page. A page holds 679 downlinks, so an internal split needs a key
+with 680 leaves, and a leaf covers at least one container key of 64 heap blocks: about 340 MB of
+heap for one key, which `make installcheck` has no business building. `test/sql/posting_tree.sql`
+says so where it stops, and the path was exercised by hand instead:
+
+    CREATE TABLE bigtree (id int, k int, pad char(60));    -- ~100-byte rows, so 64 heap blocks
+    INSERT INTO bigtree SELECT i, i % 2, '' FROM generate_series(1, 3600000) i;   -- hold ~5000 rows
+
+3.6M rows of about 100 bytes give 44,500 heap pages and 695 container keys, and two alternating keys
+put 2,500+ members at each of them - a BITSET, so exactly one container per LEAF, 694 leaves per
+key. Built by CREATE INDEX and grown from empty by 3.6M inserts, the two come out identical and both
+verify clean: **1388 leaves, 6 internal pages, height 2** (per key: a root, two level-1 pages
+because 694 downlinks do not fit on one, and its leaves). That is the internal split, the level-1
+root push-down and the bulk build's second internal level, all three.
+
+### What §21 left §22 (written after §21 was implemented, kept for the record)
 
 - **The entry's `head` is written under the leaf's EXCLUSIVE lock, in the same GenericXLog record as
   the page that made it change** - which is exactly what a posting-tree root split needs. Every
@@ -2562,33 +2744,76 @@ right-link chain equals the in-order leaf sequence, minckey/maxckey consistent w
   record (`lion_insert_one()` takes it EXCLUSIVE and releases it at the end; VACUUM takes it per
   window). `lion_put_entry()` / `lion_replace_entry()` are the only ways `head` ever changes, they
   take the caller's open `GenericXLogState`, and an entry never changes size once it is a CHAIN
-  entry, so the write cannot fail. A posting-tree root split can therefore register (entry leaf, old
-  root, new root, new sibling) = 4 buffers and set `head` to the new root atomically with them, as
-  this section's Operations already plan.
+  entry, so the write cannot fail. In the end the root push-down made this moot for the root split
+  itself - `head` never changes at all - but it is still what lets `tail` travel with the same
+  record, and it is the property that makes writers of a key serialise.
 - **The buffer budget is the thing to watch.** The directory's own split already uses all four
   buffers of a GenericXLog record (left, right, old right sibling, meta page), and the meta page is
   in there only to keep `dirpages` exact for the cost model. A posting-tree split that also wants
   the entry leaf has three buffers of its own left, which is why §21 put the "clear the incomplete
   flag" step in a third record rather than joining it to the parent insert: the same trick - an
-  idempotent repair driven by a page flag - is available to §22 and is cheaper than a custom
-  resource manager.
+  idempotent repair driven by a page flag - is what §22 uses, and it is cheaper than a custom
+  resource manager. Posting pages keep no `leftlink`, which is what buys the fourth buffer for the
+  entry leaf.
 - **`lion_chain_find_page()` is already the only place a ckey is turned into a block**, and its two
   callers (`lion_insert_lock_chain_page()` and the verifier) pass the entry's `hash`/`head`/`tail`,
-  so replacing the walk with a descent changes one function.
+  so replacing the walk with a descent changed one function.
 - **Container pages have a free `level` field** in the special area since §21 (the directory needed
-  one and the special area grew to 32 bytes either way), so §22 needs no further format change to
+  one and the special area grew to 32 bytes either way), so §22 needed no further format change to
   the page header - only the internal posting page's item layout.
 - **The §11 proof text now says explicitly which pages are cleanup-locked and why** ("every page
   that can hold a TID"), so §22's internal posting pages fall under the same sentence: they hold no
   TIDs, and cleanup-locking them is optional rather than load-bearing.
 
 Order of work. §21 first (it changes where entries live; the posting tree hangs off the entry and
-is independent of the directory shape), §22 second, one format bump. Multicolumn indexes
+is independent of the directory shape), §22 second. Multicolumn indexes
 (`USING lion (a, b, c)`) come after both and mean one directory holding each column's keys as
 independent posting sets (order-insensitive, like GIN); a composite-tuple key is deliberately not
-offered: a query with one fixed shape is btree's job. The recovery harness must cover
-directory splits and posting-tree splits under crash (an injection point between "split page" and
-"insert downlink", crash, restart, verify() shows the incomplete-split repair).
+offered: a query with one fixed shape is btree's job.
+
+### Measured (2026-09-22, 1M rows, 12352 heap pages all-visible, assert build)
+
+`fact(c2, c10, c200, c20k, c200_clustered)`, the same binary pair measured in one session. The
+number that moves is CONTAINERS VISITED; the wall times at this scale are a few hundred
+microseconds either way and are dominated by everything but the merge.
+
+    count(*) WHERE ...                        containers before -> after   ms before -> after
+    c10 = 3 AND c200 = 17 AND c2 = 1                579 ->  579            0.414 -> 0.435
+    c10 = 3 AND c200 = 17                           386 ->  386            0.315 -> 0.319
+    c20k = 77 AND c200 = 17 AND c2 = 1              424 ->  140            0.243 -> 0.203
+    c20k = 77 AND c200 = 17                         231 ->   93            0.149 -> 0.149
+    c200_clustered = 7 AND c2 = 1                    11 ->    5            0.157 -> 0.158
+    c200 = 17 (one set)                             193 ->  193            0.197 -> 0.199
+    GROUP BY c200                                 38600 -> 38600          12.40 -> 12.46
+
+The three-column AND on UNCORRELATED dense columns cannot improve and does not: c2, c10 and c200
+each have a container at every one of the heap's 193 container keys, so every key is common to all
+three and 3 x 193 is the minimum any algorithm can read. The gain is the whole point of the section
+and shows up exactly where the section said it would - when one source is SELECTIVE in container
+keys: `c20k = 77` has 48 of the 193, and the AND goes from reading both dense sets in full to
+probing them 48 times each. A clustered key is the extreme of the same thing. The wall times at this
+scale are a few hundred microseconds either way and are dominated by everything but the merge; the
+containers are what the section changes.
+
+Writes and maintenance, same session:
+
+    mid-chain insert of 20k rows      662 / 692 / 731 ms   ->   155 / 134 / 142 ms
+    portfolio build, 8 indexes            8348 ms          ->       8221 ms  (163 -> 165 MB)
+    VACUUM, portfolio (bench/vacuum_micro.sh)
+        wall / index WAL / index records   764 ms / 59 MiB / 10155
+                                       ->  760 ms / 59 MiB / 10245
+    VACUUM, churn cycles 1..3          119 / 114 / 123 ms  ->   121 / 116 / 115 ms
+    GROUP BY c200 on a 5% dirty heap        99.5 ms        ->       95.6 ms
+
+The mid-chain insert is the write-side point of the section, and it is the largest single win here:
+finding the page for a container key in the middle of a 277-page posting set used to be a walk from
+the head - about 140 pages, each SHARE-locked, inside the window that holds the entry's directory
+leaf - and is now a two-level descent. 4.8x, on a 4M-row table with a DELETE + VACUUM in the middle
+of its id range and 20,000 rows inserted into the freed heap pages.
+
+The index grows by 2 MB over the portfolio (163 -> 165 MB): one internal page per posting set with
+more than one leaf. The build and the VACUUM are unmoved, which is what they should be - neither
+does anything the section changed except write and walk one more page per multi-leaf set.
 
 ## 23. Backlog (not urgent; ordered by when they should happen)
 

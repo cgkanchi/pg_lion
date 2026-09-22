@@ -366,6 +366,23 @@ SELECT lion_sp_ccmp('sp_hi_k', 'sp_hi', 'k', '3');
 SELECT lion_sp_ccmp('sp_hi_k', 'sp_hi', 'k', '999');
 SELECT lion_index_verify('sp_hi_k', true);
 
+/*
+ * DESIGN.md §22: a SEEK has to be able to land INSIDE a sparse segment, not
+ * merely on one.  A segment covers a RANGE of container keys, so the cursor
+ * skips its PAIRS to the one the merge asked for instead of replaying the
+ * whole segment; the AND below is the shape that makes the merge do it - a
+ * selective set driving, a segmented one probed - and its answer must be the
+ * same as the heap's.  (test/sql/posting_tree.sql covers the tree above the
+ * leaves; here every entry of interest is still INLINE, which is the other
+ * side of the same seek.)
+ */
+SELECT lion_index_count('sp_hi_few', 157, 'sp_hi_k', 3) =
+	   (SELECT count(*) FROM sp_hi WHERE k = 3 AND few = 157)
+	   AS seek_into_a_segment_matches;
+SELECT lion_index_count('sp_hi_few', 7, 'sp_hi_k', 999) =
+	   (SELECT count(*) FROM sp_hi WHERE k = 999 AND few = 7)
+	   AS seek_past_a_segment_matches;
+
 -- and again once the heap is all-visible
 VACUUM (ANALYZE) sp_hi;
 SELECT lion_sp_pd('SELECT count(*) FROM sp_hi WHERE k = 3');

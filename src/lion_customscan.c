@@ -1451,6 +1451,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		seq_pages = 0;	/* container chains, read in order */
 	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
 	double		ncontainers = 0;
+	double	   *andc;			/* containers of each top-level AND source */
+	int			nand = 0;
+	bool	   *inor;
 	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
 	double		recheck_pages;
@@ -1471,6 +1474,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 								wherekinds, ors, &sumshort, &groupdrive);
 
 	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	andc = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	inor = lion_or_leaf_map(ors, nclause);
 
 	forthree(lc1, whereidx, lc2, whereclauses, lc3, wherekinds)
 	{
@@ -1576,8 +1581,24 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			descent_cost += (height + 1.0) * 50.0 * cpu_operator_cost;
 			seq_pages += Max(1.0, container_pages * sel);
 		}
-		ncontainers += nkeys * lion_containers_for(heap_pages,
-												  tuples * sel / nkeys);
+		{
+			double		clc = nkeys * lion_containers_for(heap_pages,
+														  tuples * sel / nkeys);
+
+			/*
+			 * A source that is ANDed with the others is PROBED at their
+			 * container keys since DESIGN.md §22, so the intersection costs
+			 * the most selective source's containers once per source rather
+			 * than the sum of all of them.  An OR leaf is not an AND source -
+			 * it is part of one union, which is driven by whichever of its
+			 * arms has a container at a key - and neither is a list that
+			 * drives the groups, so both keep their own term.
+			 */
+			if (inor[ci - 1] || (groupdrive && ci - 1 == inlistci))
+				ncontainers += clc;
+			else
+				andc[nand++] = clc;
+		}
 
 		/*
 		 * Does the merge build this clause's union?  A list that drives the
@@ -1639,6 +1660,30 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			merge_ops += members * log2((double) nleaves);
 	}
 	pfree(clausesel);
+	pfree(inor);
+
+	/*
+	 * The AND of the clauses (DESIGN.md §22).  With the posting tree the merge
+	 * is a leapfrog join: whichever source keeps producing the largest
+	 * container key advances sequentially and the others SEEK to it, so the
+	 * work is the most selective source's containers times the number of
+	 * sources - one probe each - and not the sum over all of them, which is
+	 * what a walk of every chain cost.  Measured at one million rows,
+	 * `c20k = 77 AND c200 = 17 AND c2 = 1` visits 424 containers as a walk and
+	 * 140 as probes.  One source is its own minimum, so a single clause is
+	 * priced exactly as before.
+	 */
+	if (nand > 0)
+	{
+		double		andmin = andc[0];
+		int			k;
+
+		for (k = 1; k < nand; k++)
+			andmin = Min(andmin, andc[k]);
+
+		ncontainers += andmin * nand;
+	}
+	pfree(andc);
 
 	/*
 	 * The entry scan of the driving index - unless an IN list on that very

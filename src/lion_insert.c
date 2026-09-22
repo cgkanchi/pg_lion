@@ -89,6 +89,9 @@ static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumb
 										 Buffer entrybuf, OffsetNumber entryoff,
 										 LionEntryTuple *entry, Size entrysize,
 										 uint16 lo, bool *done);
+static Buffer lion_insert_lock_chain_page(Relation index, Relation heaprel,
+										  uint32 hash, BlockNumber head,
+										  BlockNumber tail, uint32 ckey);
 static bool lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 									   Buffer entrybuf, OffsetNumber entryoff,
 									   LionEntryTuple *entry, Size entrysize,
@@ -763,29 +766,33 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 }
 
 /*
- * Lock the container page that owns ckey EXCLUSIVE, for the CHAIN insert path.
+ * Lock the posting-tree leaf that owns ckey EXCLUSIVE, for the CHAIN insert
+ * path.
  *
- * The append case - the ckey belongs on the chain's tail page, which is where
+ * The append case - the ckey belongs on the set's LAST leaf, which is where
  * every insert into a growing posting set lands - is decided with the
- * exclusive lock the insert needs anyway.  lion_chain_find_page() would take a
- * SHARE lock on that very page first, only to read its minckey and drop it
- * again, and on a hot key that is one more handoff of the page's lock between
+ * exclusive lock the insert needs anyway, without descending at all.  The
+ * descent would take SHARE locks on the way down and then a lock on that very
+ * page, and on a hot key that is one more handoff of the page's lock between
  * the waiters for nothing: the measured ceiling of concurrent inserts into
- * one key is set by how often the page lock changes hands, not by how long
- * any one holder keeps it (DESIGN.md §5).
+ * one key is set by how often the page lock changes hands, not by how long any
+ * one holder keeps it (DESIGN.md §5).
  *
- * An empty tail page owns nothing (its minckey is 0, which would swallow
- * every ckey), so it falls through to the walk, exactly as in
- * lion_chain_find_page().  Nothing is held while walking: the tail lock is
- * dropped first, so no page is ever locked before a page to its left.
+ * The tail qualifies when it is still the RIGHTMOST leaf of the set and holds
+ * a container key at or below ckey: then nothing to its right can own ckey and
+ * nothing to its left can either.  An empty tail owns nothing as far as its
+ * own bounds go (minckey is 0, which would swallow every ckey), so it falls
+ * through to the descent, which routes by the parent's separators instead.
+ *
+ * Nothing is held while descending: the tail lock is dropped first, so no page
+ * is ever locked before a page to its left (DESIGN.md §22 rule 3).
  */
 static Buffer
-lion_insert_lock_chain_page(Relation index, uint32 hash, BlockNumber head,
-						   BlockNumber tail, uint32 ckey)
+lion_insert_lock_chain_page(Relation index, Relation heaprel, uint32 hash,
+						   BlockNumber head, BlockNumber tail, uint32 ckey)
 {
 	Buffer		buf;
 	Page		page;
-	BlockNumber blk;
 
 	Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
 
@@ -795,36 +802,28 @@ lion_insert_lock_chain_page(Relation index, uint32 hash, BlockNumber head,
 
 	/*
 	 * DESIGN.md §18: every page reached through an entry's head, tail or
-	 * rightlink has to claim that chain.  An insert holds the entry's bucket
-	 * page EXCLUSIVE and VACUUM only frees a chain under a cleanup lock on
-	 * that same page, so the chain cannot go away underneath this walk and a
+	 * rightlink has to claim that posting set.  An insert holds the entry's
+	 * directory leaf EXCLUSIVE and VACUUM only frees a set under a cleanup
+	 * lock on that same page, so the set cannot go away underneath this and a
 	 * page that does not belong to it is corruption, not a race.
 	 */
 	if (!lion_page_owns_entry(page, hash, head))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
+		elog(ERROR, "lion index: block %u is not a container page of the posting set at %u",
 			 tail, head);
 	}
 
-	if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber &&
+	if (LionPageIsPostingLeaf(page) && LionPageIsRightmost(page) &&
+		!LionPageIncompleteSplit(page) &&
+		PageGetMaxOffsetNumber(page) >= FirstOffsetNumber &&
 		ckey >= LionPageGetOpaque(page)->minckey)
 		return buf;
 
 	UnlockReleaseBuffer(buf);
 
-	blk = lion_chain_find_page(index, hash, head, tail, ckey);
-	buf = ReadBuffer(index, blk);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-	if (!lion_page_owns_entry(BufferGetPage(buf), hash, head))
-	{
-		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
-			 blk, head);
-	}
-
-	return buf;
+	return lion_posting_search(index, heaprel, hash, head, ckey,
+							   BUFFER_LOCK_EXCLUSIVE, true);
 }
 
 /*
@@ -855,7 +854,7 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-	buf = lion_insert_lock_chain_page(index, ecopy->hash, ecopy->head,
+	buf = lion_insert_lock_chain_page(index, heaprel, ecopy->hash, ecopy->head,
 									 ecopy->tail, ckey);
 	blk = BufferGetBlockNumber(buf);
 	cpage = BufferGetPage(buf);

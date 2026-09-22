@@ -359,13 +359,29 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT null_tids int8,
 									OUT empty_tids int8,
 									OUT slack_bytes int8,
-									OUT deleted_pages int8)
+									OUT deleted_pages int8,
+									OUT posting_internal_pages int8,
+									OUT max_posting_height int4)
 RETURNS record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index: directory shape, entries, containers by kind, sparse segments, NULL keys and key-less rows';
+	'shape of a lion index: directory shape, entries, containers by kind, sparse segments, posting trees, NULL keys and key-less rows';
+
+/*
+ * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key
+ * has no entry or its posting set is still INLINE.  For tests: the root block
+ * is the identity of a posting set and must never move, which is what a root
+ * split's push-down buys.
+ */
+CREATE FUNCTION lion_index_posting_root(idx regclass, key anyelement)
+RETURNS int8
+AS 'MODULE_PATHNAME', 'lion_index_posting_root'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION lion_index_posting_root(regclass, anyelement) IS
+	'root block of one key''s posting tree, or NULL when it is still inline';
 
 CREATE FUNCTION lion_index_verify(idx regclass,
 									 heapallindexed bool DEFAULT false)

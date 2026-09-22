@@ -69,8 +69,15 @@
  * leaves are level 0 and the root is level `height`, and every directory page
  * is linked to both of its siblings so that a reader that had to move right
  * can tell a concurrent split from corruption and so that VACUUM can walk the
- * leaves in key order.  Container pages leave `level` at 0 and `leftlink` at
- * InvalidBlockNumber; §22 will give them a level of their own.
+ * leaves in key order.
+ *
+ * A CONTAINER page uses `level` too, since DESIGN.md §22: a posting set is a
+ * B-tree over container keys whose LEAVES are the container pages of §4
+ * (level 0, still rightlinked in ckey order) and whose INTERNAL pages hold
+ * LionPostingPivot downlinks (level > 0).  Container pages leave `leftlink`
+ * at InvalidBlockNumber: a posting page's left sibling is never followed, and
+ * leaving it out is what keeps a posting-page split inside the four buffers
+ * GenericXLog allows.
  */
 typedef struct LionPageOpaqueData
 {
@@ -148,6 +155,76 @@ lion_page_owns_entry(Page page, uint32 hash, BlockNumber head)
 		LionPageGetOpaque(page)->owner_hash == hash;
 }
 
+/* ---------- the per-key posting tree (DESIGN.md §22) ---------- */
+
+/*
+ * A CHAIN entry's posting set is a B-tree over container keys, GIN's
+ * posting-tree shape.  Its LEAVES are the container pages of §4 - items sorted
+ * by first ckey, minckey/maxckey, owner stamps, growth slack, DELETED marking,
+ * and still linked left to right in ckey order, so every sequential walk
+ * (scans, counts, VACUUM) is what it always was.  Its INTERNAL pages hold
+ * these pivots and let an intersection SEEK instead of stream.
+ *
+ * `ckey` is a SEPARATOR: every container key in the child's subtree is at or
+ * above it.  `child` is InvalidBlockNumber on the one pivot that is not a
+ * downlink, the HIGH KEY: the first item of every non-rightmost internal page
+ * is a strict upper bound on the container keys of its whole subtree, which is
+ * what lets a reader tell "my key moved right in a split that has not finished"
+ * from "my key is simply not here" (nbtree's rule, and §21's).  Leaves carry
+ * no high key - they hold containers, not pivots - and use `maxckey` in the
+ * special area instead; that is enough for them because every WRITER of a key
+ * holds that key's directory leaf EXCLUSIVE (§5, §21) and therefore no leaf
+ * split can be in flight while another writer descends.
+ */
+typedef struct LionPostingPivot
+{
+	uint32		ckey;
+	BlockNumber child;
+} LionPostingPivot;
+
+#define LION_POSTING_PIVOT_SIZE		((Size) sizeof(LionPostingPivot))
+
+/* The greatest level a posting tree can reach; verify() and the descent bound
+ * themselves by it so that a corrupt `level` cannot loop for ever. */
+#define LION_POSTING_MAX_HEIGHT		16
+
+static inline bool
+LionPageIsPostingLeaf(Page page)
+{
+	return LionPageIsContainer(page) && LionPageGetOpaque(page)->level == 0;
+}
+
+static inline bool
+LionPageIsPostingInternal(Page page)
+{
+	return LionPageIsContainer(page) && LionPageGetOpaque(page)->level > 0;
+}
+
+/*
+ * The first item of a posting page that is not its high key.  Leaves have no
+ * high key at all, so only a non-rightmost INTERNAL page skips one.
+ */
+static inline OffsetNumber
+lion_posting_first_data(Page page)
+{
+	return (LionPageGetOpaque(page)->level > 0 && !LionPageIsRightmost(page)) ?
+		OffsetNumberNext(FirstOffsetNumber) : FirstOffsetNumber;
+}
+
+static inline LionPostingPivot *
+lion_posting_pivot(Page page, OffsetNumber off)
+{
+	return (LionPostingPivot *) PageGetItem(page, PageGetItemId(page, off));
+}
+
+/* The high key of a non-rightmost internal posting page. */
+static inline LionPostingPivot *
+lion_posting_highkey(Page page)
+{
+	Assert(LionPageGetOpaque(page)->level > 0 && !LionPageIsRightmost(page));
+	return lion_posting_pivot(page, FirstOffsetNumber);
+}
+
 /* ---------- meta page ---------- */
 
 #define LION_METAPAGE_BLKNO	0
@@ -168,8 +245,19 @@ lion_page_owns_entry(Page page, uint32 hash, BlockNumber head)
  * level), the meta page points at a root instead of counting buckets, and
  * entry tuples live on directory leaves in key order.  Nothing of a version 3
  * index is readable, so opening one is the same ERROR with the same hint.
+ *
+ * Version 5 (DESIGN.md §22) makes each key's posting set a B-tree over
+ * container keys: the entry's `head` is its ROOT, which is an internal page
+ * of LionPostingPivot downlinks as soon as the set outgrows one page.  The
+ * page HEADER did not have to change (§21 had already given container pages a
+ * `level`), but a version 4 posting set of more than one page is a flat
+ * rightlinked chain with no root above it, which this code cannot descend and
+ * therefore cannot write to.  §22 planned to share §21's version number
+ * because the two were meant to land together; §21 shipped first, so the bump
+ * is separate.  Opening a version 4 index is the same ERROR with the same
+ * REINDEX hint.
  */
-#define LION_VERSION			4
+#define LION_VERSION			5
 
 typedef struct LionMetaPageData
 {
@@ -713,14 +801,73 @@ extern int lion_max_entries(Relation index);
 extern bool lion_replace_entry(Relation index, GenericXLogState *state, Buffer buf,
 							  OffsetNumber offnum, LionEntryTuple *entry, Size size);
 
+/* ---------- lion_posting.c: the per-key posting tree (DESIGN.md §22) ------- */
+
 /*
- * Container chain navigation.  hash/head identify the chain and are checked
- * against every page the walk touches (DESIGN.md §18); a page that does not
- * belong to the chain ends the walk.
+ * Posting-tree navigation.  hash/head identify the set - head is its ROOT,
+ * and the root block never changes for the life of the set, which is what
+ * makes owner_head the identity DESIGN.md §18 relies on - and are checked
+ * against every page the descent touches; a page that does not belong ends
+ * the walk (the set was deleted after the caller copied the entry).
+ *
+ * lion_posting_search() hands back the LEAF that owns ckey, locked in
+ * lockmode, or InvalidBuffer when the set is gone.  Internal pages are always
+ * taken SHARE and released before the child is locked (no coupling: a split
+ * holds the child while it locks the parent, so coupling downwards would close
+ * a cycle buffer locks have no detector for - §21 makes the same argument for
+ * the directory).  With forwrite the descent finishes every unfinished split
+ * it meets and starts again, and lockmode must be BUFFER_LOCK_EXCLUSIVE.
  */
+extern Buffer lion_posting_search(Relation index, Relation heaprel,
+								  uint32 hash, BlockNumber head, uint32 ckey,
+								  int lockmode, bool forwrite);
+
+/* The leftmost leaf, where every sequential walk of a posting set starts. */
+extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,
+											  BlockNumber head);
+
+/* The same, as DESIGN.md §4 named it; now a descent rather than a walk. */
 extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,
 									   BlockNumber head, BlockNumber tail,
 									   uint32 ckey);
+
+/*
+ * Turn the one-page posting set whose root is `buf` into a two-level tree
+ * WITHOUT moving the root: its items go to a brand new child, and the root
+ * block - which is the entry's `head` and the owner stamp of every page of
+ * the set - becomes an internal page with one downlink.  *childp receives the
+ * child's block, and the entry's `tail` is updated in the same record.
+ *
+ * nbtree and GIN both keep the root in place on a root split, and §22 needs
+ * it for a second reason: `head` is the set's identity, so an entry never has
+ * to be rewritten for a root split and the four-buffer budget of a
+ * GenericXLog record is never the binding constraint.
+ */
+extern void lion_posting_root_pushdown(Relation index, Relation heaprel,
+									   Buffer buf, Buffer entrybuf,
+									   OffsetNumber entryoff,
+									   LionEntryTuple *entry,
+									   BlockNumber *childp);
+
+/*
+ * Finish the split of the posting page pbuf, which the caller holds EXCLUSIVE
+ * and keeps: put the downlink of its right sibling into the parent and clear
+ * LION_PAGE_INCOMPLETE_SPLIT.  Idempotent, so a crash between the two records
+ * costs nothing but the next writer's repair.
+ */
+extern void lion_posting_finish_split(Relation index, Relation heaprel,
+									  uint32 hash, BlockNumber head,
+									  Buffer pbuf);
+
+/*
+ * The same with the separator supplied.  A split knows it - it is the first
+ * container key it put on the new sibling - and saying so spares a read of a
+ * page the caller may still be holding EXCLUSIVE.  NULL is the repair case,
+ * which has to work it out from the pages.
+ */
+extern void lion_posting_finish_split_sep(Relation index, Relation heaprel,
+										  uint32 hash, BlockNumber head,
+										  Buffer pbuf, const uint32 *knownsep);
 
 /*
  * Locate a container by ckey on a container page.  Returns the offset of the

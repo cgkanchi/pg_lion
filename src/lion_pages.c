@@ -30,6 +30,7 @@
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -1123,85 +1124,6 @@ lion_page_update_minmax(Page page)
 }
 
 /*
- * Find the container page that owns ckey (DESIGN.md section 4).  No locks are
- * held on return; the caller must be holding the bucket head page so that the
- * chain cannot change under it.
- */
-BlockNumber
-lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
-					BlockNumber tail, uint32 ckey)
-{
-	BlockNumber blk;
-	Buffer		buf;
-	Page		page;
-	uint32		minckey;
-	OffsetNumber tailitems;
-	bool		owned;
-
-	Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
-
-	/*
-	 * Append fast path: does the tail own this ckey?  An empty tail (VACUUM
-	 * may have deleted every container on it) owns nothing: its minckey is 0,
-	 * which would swallow every ckey and break the ordering across pages, so
-	 * fall through to the walk in that case.
-	 */
-	buf = ReadBuffer(index, tail);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	owned = lion_page_owns_entry(page, hash, head);
-	minckey = LionPageGetOpaque(page)->minckey;
-	tailitems = PageGetMaxOffsetNumber(page);
-	UnlockReleaseBuffer(buf);
-
-	if (!owned)
-		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
-			 tail, head);
-
-	if (tailitems > 0 && ckey >= minckey)
-		return tail;
-
-	/*
-	 * Otherwise walk from the head and stop at the first non-empty page whose
-	 * maxckey reaches ckey, or at the last page.  Empty pages (left behind by
-	 * VACUUM) are skipped: only a page that already holds a larger ckey can be
-	 * proven to own this one.
-	 *
-	 * Every page on the way has to claim this chain (DESIGN.md §18).  Every
-	 * caller of this function holds the entry's bucket page, so the chain
-	 * cannot be freed under it and a page that does not belong is corruption,
-	 * not a race.
-	 */
-	blk = head;
-	for (;;)
-	{
-		BlockNumber next;
-		uint32		maxckey;
-		OffsetNumber nitems;
-
-		buf = ReadBuffer(index, blk);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		owned = lion_page_owns_entry(page, hash, head);
-		maxckey = LionPageGetOpaque(page)->maxckey;
-		next = LionPageGetOpaque(page)->rightlink;
-		nitems = PageGetMaxOffsetNumber(page);
-		UnlockReleaseBuffer(buf);
-
-		if (!owned)
-			elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
-				 blk, head);
-
-		if (nitems > 0 && maxckey >= ckey)
-			return blk;
-		if (!BlockNumberIsValid(next))
-			return blk;
-		blk = next;
-		CHECK_FOR_INTERRUPTS();
-	}
-}
-
-/*
  * Binary search a container page for the item that covers ckey: a container
  * whose ckey it is, or a sparse segment whose range it falls in.
  *
@@ -1555,17 +1477,17 @@ lion_chain_put_container(Relation index, Relation heaprel, Buffer entrybuf,
 						LionEntryTuple *entry, LionContainer *c,
 						int *ncontainers_delta)
 {
-	BlockNumber blk;
 	Buffer		buf;
 
 	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
 	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
 
-	blk = lion_chain_find_page(index, entry->hash, entry->head, entry->tail,
-							  c->ckey);
-
-	buf = ReadBuffer(index, blk);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	/*
+	 * A write descent, which takes the leaf EXCLUSIVE straight away and
+	 * repairs any unfinished split on the way (DESIGN.md §22).
+	 */
+	buf = lion_posting_search(index, heaprel, entry->hash, entry->head,
+							  c->ckey, BUFFER_LOCK_EXCLUSIVE, true);
 
 	lion_chain_put_container_locked(index, heaprel, buf, entrybuf, entryoff,
 								   entry, c, ncontainers_delta);
@@ -1583,35 +1505,98 @@ lion_chain_put_container(Relation index, Relation heaprel, Buffer entrybuf,
  * held EXCLUSIVE by the caller and is rewritten here, in the same WAL record
  * as the last container page.
  */
+/*
+ * How many LEAVES an INLINE payload needs once it is on container pages.
+ *
+ * This has to agree exactly with the packing loop below, because the answer
+ * decides whether the page the entry's `head` names is the single leaf or the
+ * ROOT above several of them - and a root has to be allocated BEFORE the
+ * leaves, since every page of a posting set is stamped with the root's block
+ * (DESIGN.md §18, §22).  An inline payload is at most `inline_limit` bytes and
+ * the smallest item is ten, so this is at most two in practice; the loop is
+ * written for any number anyway.
+ */
+static int
+lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
+{
+	Size		off = 0;
+	Size		csize;
+	Size		used = 0;
+	int			n = 1;
+
+	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+	{
+		Size		need = MAXALIGN(csize) + sizeof(ItemIdData);
+
+		if (used > 0 && used + need > (Size) LION_PAGE_CAPACITY)
+		{
+			n++;
+			used = 0;
+		}
+		used += need;
+	}
+
+	return n;
+}
+
 void
 lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 				OffsetNumber entryoff, LionEntryTuple *entry,
 				const char *payload, Size paylen)
 {
 	GenericXLogState *xstate;
+	Buffer		headbuf;
+	Page		headpage;
 	Buffer		curbuf;
 	Page		curpage;
 	LionContainer *cbuf;
+	LionPostingPivot *pivots = NULL;
 	BlockNumber head;
 	Size		off = 0;
 	Size		csize;
+	int			nleaves;
+	int			npivots = 0;
+	bool		multi;
+	int			i;
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	nleaves = lion_spill_count_leaves(payload, paylen, cbuf);
+	multi = (nleaves > 1);
 
 	xstate = GenericXLogStart(index);
 
 	/*
-	 * The head page of a chain is the one page this index never recycles
-	 * (reuse = false), so that head blocks come only from extending the
-	 * relation and no two chains can ever share one.  That is what makes
-	 * owner_head a chain identity a reader can trust with nothing else in
-	 * hand - which is exactly the situation the count cursor is in
-	 * (DESIGN.md §18).
+	 * The ROOT of a posting set is the one page this index never recycles
+	 * (reuse = false), so that root blocks come only from extending the
+	 * relation and no two sets can ever share one.  That is what makes
+	 * owner_head an identity a reader can trust with nothing else in hand -
+	 * which is exactly the situation the count cursor is in (DESIGN.md §18).
 	 */
-	curbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
-							   false, &curpage);
-	head = BufferGetBlockNumber(curbuf);
-	lion_page_set_owner(curpage, entry->hash, head);
+	headbuf = lion_new_buffer_xl(index, heaprel, xstate, LION_PAGE_CONTAINER,
+								false, &headpage);
+	head = BufferGetBlockNumber(headbuf);
+	lion_page_set_owner(headpage, entry->hash, head);
+
+	if (multi)
+	{
+		/*
+		 * The payload needs more than one leaf, so the head block is the
+		 * INTERNAL root above them and takes its downlinks in the last record
+		 * of this spill.  It is held EXCLUSIVE throughout; nothing can reach
+		 * it in between, because the entry still describes the INLINE payload.
+		 */
+		LionPageGetOpaque(headpage)->level = 1;
+		pivots = (LionPostingPivot *)
+			palloc(sizeof(LionPostingPivot) * nleaves);
+		curbuf = lion_new_buffer_xl(index, heaprel, xstate,
+									LION_PAGE_CONTAINER, true, &curpage);
+		lion_page_set_owner(curpage, entry->hash, head);
+	}
+	else
+	{
+		curbuf = headbuf;
+		curpage = headpage;
+	}
 
 	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
 	{
@@ -1624,11 +1609,15 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 			 * Link the next page in from the current one inside the same
 			 * record, then continue the walk in a new record.
 			 */
+			Assert(multi);
 			nextbuf = lion_new_buffer_xl(index, heaprel, xstate,
 										LION_PAGE_CONTAINER, true, &nextpage);
 			lion_page_set_owner(nextpage, entry->hash, head);
 			lion_page_update_minmax(curpage);
 			LionPageGetOpaque(curpage)->rightlink = BufferGetBlockNumber(nextbuf);
+			pivots[npivots].ckey = LionPageGetOpaque(curpage)->minckey;
+			pivots[npivots].child = BufferGetBlockNumber(curbuf);
+			npivots++;
 			GenericXLogFinish(xstate);
 			UnlockReleaseBuffer(curbuf);
 
@@ -1656,16 +1645,46 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
 	entry->head = head;
 	entry->tail = BufferGetBlockNumber(curbuf);
-	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 
-	GenericXLogFinish(xstate);
-	UnlockReleaseBuffer(curbuf);
+	if (multi)
+	{
+		pivots[npivots].ckey = LionPageGetOpaque(curpage)->minckey;
+		pivots[npivots].child = BufferGetBlockNumber(curbuf);
+		npivots++;
+		Assert(npivots == nleaves);
+
+		GenericXLogFinish(xstate);
+		UnlockReleaseBuffer(curbuf);
+
+		/* The root's downlinks and the entry, in one last record. */
+		xstate = GenericXLogStart(index);
+		headpage = GenericXLogRegisterBuffer(xstate, headbuf, 0);
+		pivots[0].ckey = 0;		/* the leftmost downlink is minus infinity */
+		for (i = 0; i < npivots; i++)
+		{
+			if (PageAddItemExtended(headpage, (char *) &pivots[i],
+									LION_POSTING_PIVOT_SIZE,
+									InvalidOffsetNumber,
+									0) == InvalidOffsetNumber)
+				elog(ERROR, "lion index: failed to build the root of a spilled posting set");
+		}
+		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+		GenericXLogFinish(xstate);
+		UnlockReleaseBuffer(headbuf);
+		pfree(pivots);
+	}
+	else
+	{
+		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+		GenericXLogFinish(xstate);
+		UnlockReleaseBuffer(headbuf);
+	}
 
 	pfree(cbuf);
 }
 
 /*
- * Split page buf and place the caller's items, all in one WAL record.
+ * Split leaf page P (buf) and place the caller's items, all in one WAL record.
  *
  * Items at offsets off..maxoff (excluding the stale item at off when replace
  * is true, which is dropped) move to a brand new page N linked immediately
@@ -1675,6 +1694,15 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
  * LION_MAX_PUT_ITEMS items of at most LION_CONTAINER_MAX_SIZE bytes, and a
  * segment split only ever adds a few bytes to what was one item).  Items
  * never move left and never move to an existing page.
+ *
+ * DESIGN.md §22 adds the tree above them.  The new page - or, when there are
+ * two, each of them - has no downlink in the parent when the record lands, so
+ * the page to its LEFT is flagged LION_PAGE_INCOMPLETE_SPLIT and is held
+ * EXCLUSIVE until its downlink has been inserted and the flag cleared.  A
+ * crash in between costs nothing but the next write descent's repair.
+ *
+ * The ROOT is split by pushing it down instead, so that the root block - the
+ * entry's `head`, and the owner stamp of every page of the set - never moves.
  */
 static void
 lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
@@ -1704,10 +1732,56 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	BlockNumber oldright = LionPageGetOpaque(page)->rightlink;
 	BlockNumber nblk = InvalidBlockNumber;
 	BlockNumber mblk = InvalidBlockNumber;
+	uint32		firstmoved = 0;	/* first ckey of the items that move right */
 	int			i;
 
 	Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
 	Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+	Assert(LionPageIsPostingLeaf(page));
+	Assert(!LionPageIncompleteSplit(page));
+
+	if (blk == entry->head)
+	{
+		/*
+		 * The whole set is this one page, so there is no parent to take a
+		 * downlink.  Push the root down - its items go to a new child, the
+		 * root block becomes the level above - and place the items on the
+		 * child, which is a verbatim copy and therefore wants them at the
+		 * very same offset.
+		 *
+		 * The root's lock is dropped while that happens, because the child's
+		 * own split will have to take it to insert ITS downlink and buffer
+		 * locks are not reentrant.  Writers of one key serialise on the
+		 * entry's directory leaf (DESIGN.md §22), so nothing else can be in
+		 * this tree; a reader that looks in between sees the push-down, which
+		 * is already on disk, and descends.  The caller gets its buffer back
+		 * locked as it handed it over - with an EXCLUSIVE lock, which is what
+		 * a cleanup lock decays to here: the page it holds is the new ROOT,
+		 * an internal page that holds no TIDs at all, and the TIDs this call
+		 * writes go to a page nobody can have pinned because it did not exist
+		 * a moment ago (DESIGN.md §11).
+		 */
+		BlockNumber cblk;
+		Buffer		cbuf;
+
+		lion_posting_root_pushdown(index, heaprel, buf, entrybuf, entryoff,
+								   entry, &cblk);
+
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		cbuf = ReadBuffer(index, cblk);
+		LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+		if (!lion_page_owns_entry(BufferGetPage(cbuf), entry->hash, entry->head))
+			elog(ERROR, "lion index: block %u is not a page of the posting set at %u",
+				 cblk, entry->head);
+
+		lion_chain_put_items_locked_ext(index, heaprel, cbuf, entrybuf,
+										entryoff, entry, off, replace, items,
+										nitems, false);
+
+		UnlockReleaseBuffer(cbuf);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		return;
+	}
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -1735,6 +1809,9 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 			movelen[i] = sz;
 			used += MAXALIGN(sz);
 		}
+
+		/* the separator of the page those items go to */
+		firstmoved = lion_item_first_ckey((const LionContainer *) moveptr[0]);
 	}
 
 	if (ndel > 0)
@@ -1800,7 +1877,11 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		lion_page_update_minmax(pN);
 	}
 
-	/* Relink: P -> [M] -> [N] -> oldright */
+	/*
+	 * Relink: P -> [M] -> [N] -> oldright.  Each brand new page is one the
+	 * parent has no downlink for yet, so the page to its LEFT is flagged and
+	 * stays EXCLUSIVE until that downlink is in (DESIGN.md §22).
+	 */
 	{
 		BlockNumber after_m = BlockNumberIsValid(nblk) ? nblk : oldright;
 
@@ -1808,9 +1889,16 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		{
 			LionPageGetOpaque(pM)->rightlink = after_m;
 			LionPageGetOpaque(pP)->rightlink = mblk;
+			LionPageGetOpaque(pP)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
+			if (BlockNumberIsValid(nblk))
+				LionPageGetOpaque(pM)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
 		}
 		else
+		{
 			LionPageGetOpaque(pP)->rightlink = after_m;
+			if (BlockNumberIsValid(nblk))
+				LionPageGetOpaque(pP)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
+		}
 
 		if (BlockNumberIsValid(nblk))
 			LionPageGetOpaque(pN)->rightlink = oldright;
@@ -1831,8 +1919,6 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 
 	GenericXLogFinish(xstate);
 
-	if (BufferIsValid(mbuf))
-		UnlockReleaseBuffer(mbuf);
 	if (BufferIsValid(nbuf))
 		UnlockReleaseBuffer(nbuf);
 
@@ -1844,6 +1930,39 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	}
 	if (delofs)
 		pfree(delofs);
+
+	/*
+	 * Test hook: the split is on disk and the left page says so, but its right
+	 * sibling has no downlink yet.  test/recovery/run.sh crashes the server
+	 * here and proves that the next writer's descent repairs it.  Compiles to
+	 * nothing without --enable-injection-points.
+	 */
+	if (LionPageIncompleteSplit(BufferGetPage(buf)))
+		INJECTION_POINT("lion-posting-split-incomplete", NULL);
+
+	/*
+	 * The downlinks, left to right: M's first, because a descent cannot reach
+	 * M before M has one and therefore cannot repair M before P.  Each
+	 * separator is the first container key the split put on the sibling, and
+	 * is handed over rather than read back off the page, because M is still
+	 * held EXCLUSIVE here.
+	 */
+	if (LionPageIncompleteSplit(BufferGetPage(buf)))
+	{
+		uint32		sep = BlockNumberIsValid(mblk) ?
+			lion_item_first_ckey(items[0]) : firstmoved;
+
+		lion_posting_finish_split_sep(index, heaprel, entry->hash, entry->head,
+									  buf, &sep);
+	}
+
+	if (BufferIsValid(mbuf))
+	{
+		if (LionPageIncompleteSplit(BufferGetPage(mbuf)))
+			lion_posting_finish_split_sep(index, heaprel, entry->hash,
+										  entry->head, mbuf, &firstmoved);
+		UnlockReleaseBuffer(mbuf);
+	}
 }
 
 /* ---------------------------------------------------------------------

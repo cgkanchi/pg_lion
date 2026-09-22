@@ -49,7 +49,8 @@ SELECT lion_index_verify('lion_vfy_u', true);
 -- container bytes and free bytes are consistent with the pages they live on
 SELECT container_bytes > 0 AS has_bytes,
 	   container_bytes + free_bytes <
-	   (leaf_pages + internal_pages + container_pages) * current_setting('block_size')::int8
+	   (leaf_pages + internal_pages + container_pages + posting_internal_pages)
+	   * current_setting('block_size')::int8
 	   AS fits_in_its_pages
   FROM lion_index_stats('lion_vfy_t');
 
