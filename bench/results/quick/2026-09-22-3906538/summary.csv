@@ -1,0 +1,161 @@
+suite,rows,variant,phase,mode,memory,case,n,median_ms,min_ms,max_ms,planning_median_ms,plan,baseline_median_ms,change_pct,baseline_plan,plan_changed
+documents,200000,gin,clean,default,64MB,array_and,2,0.869,0.86,0.878,0.058,"Bitmap Heap Scan, Bitmap Index Scan",0.9564999999999999,-9.147935180345002,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,gin,clean,default,64MB,array_common,2,3.9939999999999998,3.901,4.087,0.0535,"Bitmap Heap Scan, Bitmap Index Scan",4.9085,-18.630946317612306,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,gin,clean,default,64MB,array_or,2,6.6165,6.608,6.625,0.056,"Bitmap Heap Scan, Bitmap Index Scan",8.0405,-17.710341396679308,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,gin,clean,default,64MB,ts_and,2,1.0295,1.001,1.058,0.0475,"Bitmap Heap Scan, Bitmap Index Scan",1.069,-3.6950420954162677,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,gin,clean,default,64MB,ts_common,2,29.555,29.021,30.089,0.045,Seq Scan,35.2435,-16.14056492686594,Seq Scan,False
+documents,200000,gin,clean,default,64MB,ts_fetch,2,4.4565,4.336,4.577,0.053,"Bitmap Heap Scan, Bitmap Index Scan",4.9030000000000005,-9.10666938609016,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,gin,clean,default,64MB,ts_phrase,2,7.0885,6.804,7.373,0.0555,"Bitmap Heap Scan, Bitmap Index Scan",7.8934999999999995,-10.198264394755174,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,gin,clean,default,64MB,ts_prefix,2,1.673,1.664,1.682,0.051,"Bitmap Heap Scan, Bitmap Index Scan",1.7205,-2.7608253414704964,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring,clean,default,64MB,array_and,2,0.14900000000000002,0.128,0.17,0.078,LionCount,0.11499999999999999,29.565217391304376,LionCount,False
+documents,200000,roaring,clean,default,64MB,array_common,2,0.025,0.025,0.025,0.0795,LionCount,0.0245,2.0408163265306145,LionCount,False
+documents,200000,roaring,clean,default,64MB,array_or,2,0.2445,0.242,0.247,0.089,LionCount,0.2765,-11.573236889692595,LionCount,False
+documents,200000,roaring,clean,default,64MB,ts_and,2,0.1345,0.131,0.138,0.0815,LionCount,0.11599999999999999,15.948275862068972,LionCount,False
+documents,200000,roaring,clean,default,64MB,ts_common,2,0.0315,0.031,0.032,0.067,LionCount,0.03,5.000000000000004,LionCount,False
+documents,200000,roaring,clean,default,64MB,ts_fetch,2,4.0680000000000005,3.853,4.283,0.053,"Bitmap Heap Scan, Bitmap Index Scan",5.6995000000000005,-28.625318010351787,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring,clean,default,64MB,ts_phrase,2,35.391000000000005,33.276,37.506,0.0565,Seq Scan,46.614000000000004,-24.076457716565834,Seq Scan,False
+documents,200000,roaring,clean,default,64MB,ts_prefix,2,27.441000000000003,25.925,28.957,0.0495,Seq Scan,29.4635,-6.8644254755884315,Seq Scan,False
+documents,200000,roaring_bitmap,clean,default,64MB,array_and,2,0.208,0.204,0.212,0.055999999999999994,"Bitmap Heap Scan, Bitmap Index Scan",0.1885,10.344827586206895,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring_bitmap,clean,default,64MB,array_common,2,3.4735,3.376,3.571,0.0565,"Bitmap Heap Scan, Bitmap Index Scan",3.4785,-0.14374011786689733,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring_bitmap,clean,default,64MB,array_or,2,5.5235,5.187,5.86,0.063,"Bitmap Heap Scan, Bitmap Index Scan",5.773,-4.321843062532471,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring_bitmap,clean,default,64MB,ts_and,2,0.21500000000000002,0.201,0.229,0.051000000000000004,"Bitmap Heap Scan, Bitmap Index Scan",0.1815,18.457300275482112,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring_bitmap,clean,default,64MB,ts_common,2,28.9105,28.384,29.437,0.045,Seq Scan,31.3825,-7.877001513582416,Seq Scan,False
+documents,200000,roaring_bitmap,clean,default,64MB,ts_fetch,2,3.763,3.755,3.771,0.0555,"Bitmap Heap Scan, Bitmap Index Scan",4.202999999999999,-10.468712824173199,"Bitmap Heap Scan, Bitmap Index Scan",False
+documents,200000,roaring_bitmap,clean,default,64MB,ts_phrase,2,32.6935,31.49,33.897,0.045,Seq Scan,36.467,-10.34771162969259,Seq Scan,False
+documents,200000,roaring_bitmap,clean,default,64MB,ts_prefix,2,25.601,24.798,26.404,0.0595,Seq Scan,26.9135,-4.876734724209042,Seq Scan,False
+scalar,1000000,btree,after_maintenance,default,64MB,eq_c200_17,2,0.345,0.34,0.35,0.0415,Index Only Scan,0.355,-2.8169014084507116,Index Only Scan,False
+scalar,1000000,btree,after_maintenance,default,64MB,group_c200,2,88.2745,82.022,94.527,0.0345,Index Only Scan,86.8295,1.664180952326122,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,and2,2,2.6390000000000002,2.614,2.664,0.0375,"Bitmap Heap Scan, Bitmap Index Scan",2.7635,-4.505156504432783,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,btree,clean,default,64MB,and3,2,2.6045,2.59,2.619,0.044,"Bitmap Heap Scan, Bitmap Index Scan",2.5655,1.5201715065289223,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,btree,clean,default,64MB,eq_c200_17,2,0.34550000000000003,0.325,0.366,0.033,Index Only Scan,0.318,8.647798742138368,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,eq_c20k_123,2,0.022,0.022,0.022,0.033,Index Only Scan,0.0215,2.3255813953488413,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,eq_c2_0,2,33.816500000000005,30.817,36.816,0.0325,Index Only Scan,32.336,4.578488372093048,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,fetch_medium,2,3.6109999999999998,3.469,3.753,0.0385,"Bitmap Heap Scan, Bitmap Index Scan",3.5775,0.9364081062194218,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,btree,clean,default,64MB,group_c200,2,80.8185,79.496,82.141,0.035,Index Only Scan,85.142,-5.077987362288883,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,in_c20k_100,2,0.323,0.318,0.328,0.087,Index Only Scan,0.3245,-0.46224961479198745,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,is_null,2,6.743,6.726,6.76,0.028,Index Only Scan,7.7575,-13.077666774089591,Index Only Scan,False
+scalar,1000000,btree,clean,default,64MB,range_random,2,0.313,0.31,0.316,0.051,Index Only Scan,0.2985,4.8576214405360085,Index Only Scan,False
+scalar,1000000,btree,dirty_scattered,default,64MB,and2,2,3.1494999999999997,3.026,3.273,0.041499999999999995,"Bitmap Heap Scan, Bitmap Index Scan",3.0244999999999997,4.132914531327492,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,btree,dirty_scattered,default,64MB,eq_c200_17,2,0.33999999999999997,0.334,0.346,0.0475,Index Only Scan,0.348,-2.298850574712641,Index Only Scan,False
+scalar,1000000,btree,dirty_scattered,default,64MB,eq_c2_0,2,68.3995,68.161,68.638,0.049,"Bitmap Heap Scan, Bitmap Index Scan",72.7825,-6.02205200425926,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,btree,dirty_scattered,default,64MB,group_c200,2,143.0235,142.198,143.849,0.044,Seq Scan,142.2215,0.56390911360098,Seq Scan,False
+scalar,1000000,btree,dirty_scattered,prefer_index,64MB,group_c200,2,80.267,79.864,80.67,0.036000000000000004,Index Only Scan,78.75,1.9263492063491983,Index Only Scan,False
+scalar,1000000,gin,after_maintenance,default,64MB,eq_c200_17,2,3.2315,3.22,3.243,0.065,"Bitmap Heap Scan, Bitmap Index Scan",3.128,3.308823529411753,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,after_maintenance,default,64MB,group_c200,2,155.277,152.492,158.062,0.035,Seq Scan,150.6455,3.074436342273734,Seq Scan,False
+scalar,1000000,gin,clean,default,64MB,and2,2,32.556,32.286,32.826,0.0525,"Bitmap Heap Scan, Bitmap Index Scan",33.4695,-2.7293506027876058,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,and3,2,5.067,5.031,5.103,0.0505,"Bitmap Heap Scan, Bitmap Index Scan",5.069,-0.0394555139080599,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,eq_c200_17,2,3.2005,3.117,3.284,0.037,"Bitmap Heap Scan, Bitmap Index Scan",2.827,13.211885390873723,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,eq_c20k_123,2,0.0495,0.047,0.052,0.037500000000000006,"Bitmap Heap Scan, Bitmap Index Scan",0.0505,-1.980198019801982,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,eq_c2_0,2,93.52000000000001,92.072,94.968,0.037000000000000005,"Bitmap Heap Scan, Bitmap Index Scan",93.01050000000001,0.5477876153767713,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,fetch_medium,2,3.132,3.067,3.197,0.0405,"Bitmap Heap Scan, Bitmap Index Scan",3.2285,-2.9890041815084367,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,group_c200,2,140.827,140.186,141.468,0.0405,Seq Scan,142.057,-0.8658496237425761,Seq Scan,False
+scalar,1000000,gin,clean,default,64MB,in_c20k_100,2,3.503,3.421,3.585,0.10450000000000001,"Bitmap Heap Scan, Bitmap Index Scan",3.417,2.516827626573037,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,clean,default,64MB,is_null,2,61.439,58.462,64.416,0.0265,Seq Scan,56.189499999999995,9.34249281449382,Seq Scan,False
+scalar,1000000,gin,clean,default,64MB,range_random,2,41.853,39.011,44.695,0.054,"Bitmap Heap Scan, Bitmap Index Scan",38.5325,8.617400895348082,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,dirty_scattered,default,64MB,and2,2,33.7995,33.194,34.405,0.0695,"Bitmap Heap Scan, Bitmap Index Scan",34.0355,-0.6933936624994419,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,dirty_scattered,default,64MB,eq_c200_17,2,3.2640000000000002,3.15,3.378,0.047,"Bitmap Heap Scan, Bitmap Index Scan",3.01,8.438538205980084,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,dirty_scattered,default,64MB,eq_c2_0,2,90.3125,89.843,90.782,0.058499999999999996,"Bitmap Heap Scan, Bitmap Index Scan",88.2225,2.3690101731417723,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,gin,dirty_scattered,default,64MB,group_c200,2,144.748,138.648,150.848,0.034,Seq Scan,146.72699999999998,-1.348763349622073,Seq Scan,False
+scalar,1000000,gin,dirty_scattered,prefer_index,64MB,group_c200,2,148.52,145.883,151.157,0.0505,Seq Scan,141.8125,4.729836932569431,Seq Scan,False
+scalar,1000000,roaring,after_maintenance,default,64MB,eq_c200_17,2,0.0385,0.038,0.039,0.0365,LionCount,0.049,-21.42857142857143,LionCount,False
+scalar,1000000,roaring,after_maintenance,default,64MB,group_c200,2,4.550000000000001,4.546,4.554,0.033,LionCount,4.4635,1.937941077629679,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,and2,2,0.372,0.363,0.381,0.043,LionCount,0.357,4.201680672268915,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,and3,2,0.317,0.31,0.324,0.063,LionCount,0.29500000000000004,7.457627118644061,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,eq_c200_17,2,0.027,0.026,0.028,0.035500000000000004,LionCount,0.028499999999999998,-5.263157894736836,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,eq_c20k_123,2,0.014499999999999999,0.013,0.016,0.038,LionCount,0.0165,-12.121212121212132,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,eq_c2_0,2,0.3565,0.356,0.357,0.0395,LionCount,0.40800000000000003,-12.622549019607854,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,fetch_medium,2,3.1955,3.158,3.233,0.0485,"Bitmap Heap Scan, Bitmap Index Scan",3.0285,5.514280997193333,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring,clean,default,64MB,group_c200,2,3.7535,3.724,3.783,0.0325,LionCount,3.8739999999999997,-3.1104801239029367,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,in_c20k_100,2,0.16,0.159,0.161,0.132,LionCount,0.5765,-72.24631396357329,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,is_null,2,0.0925,0.092,0.093,0.038000000000000006,LionCount,0.114,-18.85964912280702,LionCount,False
+scalar,1000000,roaring,clean,default,64MB,range_random,2,111.055,110.4,111.71,0.035,Seq Scan,119.384,-6.976646786839103,Seq Scan,False
+scalar,1000000,roaring,dirty_scattered,default,64MB,and2,2,0.433,0.377,0.489,0.045,LionCount,0.3525,22.836879432624112,LionCount,False
+scalar,1000000,roaring,dirty_scattered,default,64MB,eq_c200_17,2,0.0375,0.029,0.046,0.039,LionCount,0.0305,22.95081967213115,LionCount,False
+scalar,1000000,roaring,dirty_scattered,default,64MB,eq_c2_0,2,0.364,0.363,0.365,0.0375,LionCount,0.3975,-8.427672955974852,LionCount,False
+scalar,1000000,roaring,dirty_scattered,default,64MB,group_c200,2,3.646,3.634,3.658,0.035500000000000004,LionCount,3.6985,-1.419494389617415,LionCount,False
+scalar,1000000,roaring,dirty_scattered,prefer_index,64MB,group_c200,2,3.6405000000000003,3.611,3.67,0.033,LionCount,3.89,-6.4138817480719705,LionCount,False
+scalar,1000000,roaring_bitmap,after_maintenance,default,64MB,eq_c200_17,2,2.9205,2.851,2.99,0.056999999999999995,"Bitmap Heap Scan, Bitmap Index Scan",3.0515,-4.292970670162211,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,after_maintenance,default,64MB,group_c200,2,148.00150000000002,145.74,150.263,0.032,Seq Scan,145.2405,1.9009849181185867,Seq Scan,False
+scalar,1000000,roaring_bitmap,clean,default,64MB,and2,2,7.008,6.913,7.103,0.0565,"Bitmap Heap Scan, Bitmap Index Scan",6.678,4.941599281221931,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,and3,2,2.4130000000000003,2.387,2.439,0.064,"Bitmap Heap Scan, Bitmap Index Scan",2.34,3.119658119658131,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,eq_c200_17,2,3.0535,2.766,3.341,0.048,"Bitmap Heap Scan, Bitmap Index Scan",2.6355,15.860368051603114,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,eq_c20k_123,2,0.0555,0.046,0.065,0.048,"Bitmap Heap Scan, Bitmap Index Scan",0.0475,16.842105263157904,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,eq_c2_0,2,74.3075,69.123,79.492,0.05550000000000001,"Bitmap Heap Scan, Bitmap Index Scan",62.757999999999996,18.403231460530932,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,fetch_medium,2,3.0525,3.018,3.087,0.0375,"Bitmap Heap Scan, Bitmap Index Scan",2.8064999999999998,8.765366114377349,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,group_c200,2,145.1735,141.774,148.573,0.033,Seq Scan,142.688,1.7419124243103878,Seq Scan,False
+scalar,1000000,roaring_bitmap,clean,default,64MB,in_c20k_100,2,3.154,2.706,3.602,0.09,"Bitmap Heap Scan, Bitmap Index Scan",3.3865,-6.865495349180573,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,is_null,2,26.939500000000002,25.663,28.216,0.028,"Bitmap Heap Scan, Bitmap Index Scan",26.0415,3.4483420693892652,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,clean,default,64MB,range_random,2,53.296499999999995,52.638,53.955,0.037,Seq Scan,55.235,-3.509550104100667,Seq Scan,False
+scalar,1000000,roaring_bitmap,dirty_scattered,default,64MB,and2,2,6.7835,6.71,6.857,0.05,"Bitmap Heap Scan, Bitmap Index Scan",3.1545,115.04200348708196,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,dirty_scattered,default,64MB,eq_c200_17,2,2.753,2.73,2.776,0.035500000000000004,"Bitmap Heap Scan, Bitmap Index Scan",2.7824999999999998,-1.0601976639712407,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,dirty_scattered,default,64MB,eq_c2_0,2,66.17349999999999,62.568,69.779,0.0315,"Bitmap Heap Scan, Bitmap Index Scan",66.3565,-0.2757830807833539,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,1000000,roaring_bitmap,dirty_scattered,default,64MB,group_c200,2,140.1515,138.02,142.283,0.035500000000000004,Seq Scan,142.659,-1.7576879131355194,Seq Scan,False
+scalar,1000000,roaring_bitmap,dirty_scattered,prefer_index,64MB,group_c200,2,145.09199999999998,144.763,145.421,0.0525,Seq Scan,139.688,3.868621499341396,Seq Scan,False
+scalar,5000000,btree,after_maintenance,default,64MB,eq_c200_17,2,1.6615,1.642,1.681,0.0555,Index Only Scan,1.773,-6.2887760857303965,Index Only Scan,False
+scalar,5000000,btree,after_maintenance,default,64MB,group_c200,2,432.4925,426.493,438.492,0.036500000000000005,Index Only Scan,464.946,-6.9800578991969005,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,and2,2,15.5885,13.66,17.517,0.07050000000000001,"Bitmap Heap Scan, Bitmap Index Scan",16.193,-3.7330945470265053,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,btree,clean,default,64MB,and3,2,13.883500000000002,13.326,14.441,0.0485,"Bitmap Heap Scan, Bitmap Index Scan",13.888,-0.03240207373270687,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,btree,clean,default,64MB,eq_c200_17,2,1.522,1.52,1.524,0.034,Index Only Scan,1.5295,-0.49035632559660813,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,eq_c20k_123,2,0.04,0.032,0.048,0.033,Index Only Scan,0.0325,23.076923076923084,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,eq_c2_0,2,166.32999999999998,165.396,167.264,0.034,Index Only Scan,167.1635,-0.4986136327607471,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,fetch_medium,2,15.44,14.276,16.604,0.04,"Bitmap Heap Scan, Bitmap Index Scan",18.3965,-16.07099176473786,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,btree,clean,default,64MB,group_c200,2,414.257,409.613,418.901,0.047,Index Only Scan,417.244,-0.7158880654964506,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,in_c20k_100,2,1.607,1.583,1.631,0.092,Index Only Scan,1.6355,-1.7425863650259887,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,is_null,2,33.9875,33.72,34.255,0.027999999999999997,Index Only Scan,36.3065,-6.387286023163908,Index Only Scan,False
+scalar,5000000,btree,clean,default,64MB,range_random,2,1.9625,1.682,2.243,0.0665,Index Only Scan,1.5415,27.311060655205964,Index Only Scan,False
+scalar,5000000,btree,dirty_scattered,default,64MB,and2,2,220.59300000000002,219.247,221.939,0.08499999999999999,"Bitmap Heap Scan, Bitmap Index Scan",224.4345,-1.7116352432446913,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,btree,dirty_scattered,default,64MB,eq_c200_17,2,1.867,1.58,2.154,0.064,Index Only Scan,1.945,-4.010282776349616,Index Only Scan,False
+scalar,5000000,btree,dirty_scattered,default,64MB,eq_c2_0,2,638.3755,631.447,645.304,0.0495,"Bitmap Heap Scan, Bitmap Index Scan",651.8815,-2.0718489480066493,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,btree,dirty_scattered,default,64MB,group_c200,2,947.0595000000001,942.825,951.294,0.0475,Seq Scan,956.9085,-1.029252013123505,Seq Scan,False
+scalar,5000000,btree,dirty_scattered,prefer_index,64MB,group_c200,2,415.1025,406.451,423.754,0.061,Index Only Scan,415.94100000000003,-0.20159109104416206,Index Only Scan,False
+scalar,5000000,gin,after_maintenance,default,64MB,eq_c200_17,2,17.548000000000002,15.296,19.8,0.051500000000000004,"Bitmap Heap Scan, Bitmap Index Scan",18.4055,-4.658933470973336,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,after_maintenance,default,64MB,group_c200,2,1019.433,1005.215,1033.651,0.033,Seq Scan,1022.826,-0.3317279771926085,Seq Scan,False
+scalar,5000000,gin,clean,default,64MB,and2,2,183.4435,174.739,192.148,0.062,"Bitmap Heap Scan, Bitmap Index Scan",178.6575,2.678868785245503,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,and3,2,26.451999999999998,26.124,26.78,0.086,"Bitmap Heap Scan, Bitmap Index Scan",28.8925,-8.446828761789394,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,eq_c200_17,2,108.29,66.852,149.728,0.063,"Bitmap Heap Scan, Bitmap Index Scan",110.119,-1.6609304479699216,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,eq_c20k_123,2,0.978,0.232,1.724,0.053,"Bitmap Heap Scan, Bitmap Index Scan",1.1464999999999999,-14.696903619712154,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,eq_c2_0,2,923.2925,898.428,948.157,0.05600000000000001,"Bitmap Heap Scan, Bitmap Index Scan",958.4,-3.6631364774624364,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,fetch_medium,2,75.1345,18.035,132.234,0.044,"Bitmap Heap Scan, Bitmap Index Scan",79.97349999999999,-6.050754312365958,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,group_c200,2,1231.8425,1145.311,1318.374,0.033,Seq Scan,1252.029,-1.6123029099166297,Seq Scan,False
+scalar,5000000,gin,clean,default,64MB,in_c20k_100,2,247.93400000000003,222.33,273.538,0.14300000000000002,"Bitmap Heap Scan, Bitmap Index Scan",255.224,-2.856314453186204,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,clean,default,64MB,is_null,2,734.407,681.023,787.791,0.0495,Seq Scan,746.335,-1.5982099191381827,Seq Scan,False
+scalar,5000000,gin,clean,default,64MB,range_random,2,379.02750000000003,272.869,485.186,0.0625,"Bitmap Heap Scan, Bitmap Index Scan",381.769,-0.7181044034481499,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,dirty_scattered,default,64MB,and2,2,178.31150000000002,173.085,183.538,0.0765,"Bitmap Heap Scan, Bitmap Index Scan",177.71550000000002,0.33536748342153366,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,dirty_scattered,default,64MB,eq_c200_17,2,96.13149999999999,62.319,129.944,0.07150000000000001,"Bitmap Heap Scan, Bitmap Index Scan",97.88399999999999,-1.7903845367986615,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,dirty_scattered,default,64MB,eq_c2_0,2,809.815,785.128,834.502,0.076,"Bitmap Heap Scan, Bitmap Index Scan",802.671,0.8900284176206696,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,gin,dirty_scattered,default,64MB,group_c200,2,942.1065,872.903,1011.31,0.07150000000000001,Seq Scan,934.408,0.8238906344979924,Seq Scan,False
+scalar,5000000,gin,dirty_scattered,prefer_index,64MB,group_c200,2,993.2905000000001,989.114,997.467,0.057,Seq Scan,1016.5740000000001,-2.290389091202416,Seq Scan,False
+scalar,5000000,roaring,after_maintenance,default,64MB,eq_c200_17,2,0.1595,0.158,0.161,0.0365,LionCount,0.152,4.9342105263157965,LionCount,False
+scalar,5000000,roaring,after_maintenance,default,64MB,group_c200,2,21.5465,21.127,21.966,0.0335,LionCount,22.009,-2.1014130582943324,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,and2,2,1.7915,1.771,1.812,0.0475,LionCount,1.6435,9.005171889260733,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,and3,2,1.294,1.266,1.322,0.059,LionCount,1.1345,14.059056853239316,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,eq_c200_17,2,0.1195,0.113,0.126,0.05499999999999999,LionCount,0.10250000000000001,16.58536585365853,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,eq_c20k_123,2,0.025,0.019,0.031,0.08099999999999999,LionCount,0.025,0.0,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,eq_c2_0,2,1.811,1.78,1.842,0.036500000000000005,LionCount,2.0335,-10.941726088025582,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,fetch_medium,2,15.6635,14.038,17.289,0.037,"Bitmap Heap Scan, Bitmap Index Scan",15.2385,2.788988417495175,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring,clean,default,64MB,group_c200,2,19.688000000000002,17.559,21.817,0.035500000000000004,LionCount,18.645,5.593993027621358,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,in_c20k_100,2,0.869,0.637,1.101,0.1535,LionCount,2.4539999999999997,-64.5884270578647,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,is_null,2,0.4185,0.417,0.42,0.0315,LionCount,0.4515,-7.3089700996677776,LionCount,False
+scalar,5000000,roaring,clean,default,64MB,range_random,2,705.309,685.367,725.251,0.0495,Seq Scan,713.0625,-1.0873520904549072,Seq Scan,False
+scalar,5000000,roaring,dirty_scattered,default,64MB,and2,2,1.8955000000000002,1.776,2.015,0.0455,LionCount,1.8615,1.8264840182648623,LionCount,False
+scalar,5000000,roaring,dirty_scattered,default,64MB,eq_c200_17,2,0.098,0.098,0.098,0.04,LionCount,0.19949999999999998,-50.87719298245613,LionCount,False
+scalar,5000000,roaring,dirty_scattered,default,64MB,eq_c2_0,2,1.802,1.781,1.823,0.0375,LionCount,1.9805000000000001,-9.012875536480692,LionCount,False
+scalar,5000000,roaring,dirty_scattered,default,64MB,group_c200,2,18.1285,17.299,18.958,0.032,LionCount,18.4655,-1.8250250467087281,LionCount,False
+scalar,5000000,roaring,dirty_scattered,prefer_index,64MB,group_c200,2,17.8465,17.32,18.373,0.0325,LionCount,20.389000000000003,-12.469959291774991,LionCount,False
+scalar,5000000,roaring_bitmap,after_maintenance,default,64MB,eq_c200_17,2,19.255,15.007,23.503,0.05,"Bitmap Heap Scan, Bitmap Index Scan",17.528,9.852806937471481,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,after_maintenance,default,64MB,group_c200,2,1030.0819999999999,1023.865,1036.299,0.0455,Seq Scan,1068.235,-3.571592393059586,Seq Scan,False
+scalar,5000000,roaring_bitmap,clean,default,64MB,and2,2,39.047,38.829,39.265,0.0665,"Bitmap Heap Scan, Bitmap Index Scan",17.5975,121.88947293649663,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,and3,2,17.564,13.453,21.675,0.07350000000000001,"Bitmap Heap Scan, Bitmap Index Scan",19.6335,-10.540657549596355,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,eq_c200_17,2,114.026,19.196,208.856,0.048,"Bitmap Heap Scan, Bitmap Index Scan",114.7585,-0.6382969453243126,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,eq_c20k_123,2,2.297,1.837,2.757,0.07300000000000001,"Bitmap Heap Scan, Bitmap Index Scan",2.3874999999999997,-3.7905759162303543,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,eq_c2_0,2,624.2545,484.206,764.303,0.0525,"Bitmap Heap Scan, Bitmap Index Scan",617.3075,1.1253710670937833,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,fetch_medium,2,129.8075,25.562,234.053,0.075,"Bitmap Heap Scan, Bitmap Index Scan",127.818,1.5565100377098684,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,group_c200,2,971.446,949.59,993.302,0.047,Seq Scan,976.453,-0.5127742963562998,Seq Scan,False
+scalar,5000000,roaring_bitmap,clean,default,64MB,in_c20k_100,2,217.4415,214.51,220.373,0.0975,"Bitmap Heap Scan, Bitmap Index Scan",224.8305,-3.286475811778211,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,is_null,2,511.1045,448.179,574.03,0.041,"Bitmap Heap Scan, Bitmap Index Scan",546.985,-6.559686280245347,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,clean,default,64MB,range_random,2,508.948,493.485,524.411,0.0405,Seq Scan,511.04049999999995,-0.4094587415283124,Seq Scan,False
+scalar,5000000,roaring_bitmap,dirty_scattered,default,64MB,and2,2,38.429500000000004,37.491,39.368,0.068,"Bitmap Heap Scan, Bitmap Index Scan",39.4725,-2.6423459370447544,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,dirty_scattered,default,64MB,eq_c200_17,2,139.9075,64.461,215.354,0.0665,"Bitmap Heap Scan, Bitmap Index Scan",138.9255,0.7068536733716879,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,dirty_scattered,default,64MB,eq_c2_0,2,676.956,629.6,724.312,0.0415,"Bitmap Heap Scan, Bitmap Index Scan",683.1635,-0.9086404645447188,"Bitmap Heap Scan, Bitmap Index Scan",False
+scalar,5000000,roaring_bitmap,dirty_scattered,default,64MB,group_c200,2,859.7615000000001,788.038,931.485,0.0485,Seq Scan,927.7825,-7.331567474057765,Seq Scan,False
+scalar,5000000,roaring_bitmap,dirty_scattered,prefer_index,64MB,group_c200,2,938.481,929.948,947.014,0.059,Seq Scan,960.9585,-2.3390708339642075,Seq Scan,False
