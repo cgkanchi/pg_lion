@@ -25,6 +25,26 @@
  * --------------------------------------------------------------------- */
 
 /*
+ * Two thresholds of the k-way union that the COST MODEL has to know as well as
+ * the executor, so that a path is priced as the path it will take (DESIGN.md
+ * §15).  The arguments for the numbers are where they are used, in
+ * lion_count.c: lion_ecursor_build() for the first and lion_sum_is_cheaper()
+ * for both.
+ *
+ *	LION_OR_BITSET_MIN		containers at one container key above which an OR
+ *							node accumulates them in a bitset image instead of
+ *							folding them pairwise.
+ *	LION_SUM_MAX_DENSITY	rows per container key in one entry up to which the
+ *							disjoint sum is cheaper than the union.
+ */
+#ifndef LION_OR_BITSET_MIN
+#define LION_OR_BITSET_MIN	32
+#endif
+#ifndef LION_SUM_MAX_DENSITY
+#define LION_SUM_MAX_DENSITY	4
+#endif
+
+/*
  * Instrumentation, reported by lion_index_count_stats() and by
  * EXPLAIN ANALYZE of the LionCount node.
  */
@@ -45,6 +65,14 @@ typedef struct LionCountStats
 	 */
 	int64		cache_hits;
 	int64		cache_full;
+
+	/*
+	 * Posting sets counted on their own and added up instead of being merged
+	 * (the disjoint-sum short-circuit of DESIGN.md §15).  Zero means every
+	 * container key went through the k-way union, which is what a multi-key
+	 * clause and an IN list ANDed with something else still do.
+	 */
+	int64		sets_summed;
 } LionCountStats;
 
 /*
@@ -107,6 +135,17 @@ typedef struct LionPostingSet
 	uint64		ntids;			/* entry's recorded member count (a hint) */
 	uint32		ncontainers;	/* entry's recorded ITEM count (a hint):
 								 * containers and sparse segments */
+
+	/*
+	 * Where the entry tuple itself lives: its bucket page and the offset on
+	 * it.  That pair identifies the entry inside the index - entry offsets are
+	 * stable (DESIGN.md §18, lion_entry_scan_next()) - which is how
+	 * lion_posting_set_lookup_many() proves that two values of an IN list
+	 * found DIFFERENT entries, and therefore disjoint posting sets, even when
+	 * the values themselves are not bytewise equal (DESIGN.md §15).
+	 */
+	BlockNumber entryblk;
+	OffsetNumber entryoff;
 
 	/*
 	 * Bookkeeping for materialization.  cxt is the memory context the set was
@@ -172,6 +211,22 @@ typedef struct LionCountSource
 	 * rules on lion_posting_set_materialize().
 	 */
 	bool		nomaterialize;
+
+	/*
+	 * The sets are pairwise DISJOINT: they are distinct entries of one SCALAR
+	 * lion index, so no row can be a member of two of them (DESIGN.md §15).
+	 * The count of their union is then the SUM of their counts and no merge is
+	 * needed, which is what lion_count_sources_cached() short-circuits when
+	 * this is the only positive source.
+	 *
+	 * Only the caller that located the sets can know it: an IN list located
+	 * through lion_posting_set_lookup_many() has it, because that function
+	 * drops duplicates BY ENTRY and not merely by value.  It is a promise, not
+	 * a hint - setting it on sets that may overlap double-counts rows - and
+	 * lion_count_sources_cached() re-checks the cheap half of it (one index,
+	 * not multi-key) before acting on it.
+	 */
+	bool		disjoint;
 } LionCountSource;
 
 /*
@@ -197,6 +252,12 @@ extern bool lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * their entries located in (bucket, hash) order, so the bucket pages are read
  * in ascending block order, and duplicates are dropped in one pass over that
  * order rather than by comparing every value with every earlier one.
+ *
+ * No two of the located sets are the same entry.  That is stronger than
+ * "no two values were bytewise equal", and it is what the disjoint-sum
+ * short-circuit of DESIGN.md §15 rests on: an opclass whose equality is not
+ * byte equality (citext) has distinct values that reach ONE entry, and summing
+ * that entry twice would count its rows twice.
  *
  * sets must have room for nvalues; the located sets come out packed at the
  * front and the return value is how many there are - every one of which the

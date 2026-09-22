@@ -101,16 +101,33 @@ PG_FUNCTION_INFO_V1(lion_index_count_any);
 #define LION_RECHECK_MAX_BATCH	((int) (MaxAllocSize / sizeof(ItemPointerData) / 2))
 
 /*
- * Above this many containers at one container key, an OR node stops folding
- * them pairwise and accumulates them in a bitset image instead (see
+ * LION_OR_BITSET_MIN (lion_count.h, because the cost model needs the same
+ * number): above this many containers at one container key, an OR node stops
+ * folding them pairwise and accumulates them in a bitset image instead (see
  * lion_ecursor_build()).  Pairwise is cheaper while the containers are few and
  * small, because it touches only their members; the image costs a fixed pass
- * over the whole container key's range however few members arrive.  Measured
- * on 1M rows with IN lists of 3, 10, 100 and 1000 values.
+ * over the whole container key's range however few members arrive.  It is not a
+ * small effect in either direction: forcing the pairwise fold at every key
+ * (LION_OR_BITSET_MIN raised past any list length) took `c20k IN (1000 values)
+ * AND c2 = 1` from 11.1 ms to 21.0 and `c200 IN (1000 values) AND c2 = 1` from
+ * 7.7 ms to 263 - the fold is quadratic in the containers at a key - and the
+ * threshold is also what decides whether the SUM or the MERGE is cheaper for a
+ * dense list (lion_sum_is_cheaper()).
+ *
+ * A third way of building the union was tried and REJECTED, which is recorded
+ * because the shape that suggests it is the common one.  A union over SPARSE
+ * SEGMENTS (DESIGN.md §13) arrives at every container key as a hundred or two
+ * throw-away ARRAYs of one member each, and the image looks wasteful for that:
+ * 4 KiB of memset and a 512-word pass to produce two hundred members.
+ * Gathering the members into one buffer, sorting and writing them out as an
+ * ARRAY instead cannot win more than the image's FIXED cost, and that cost is
+ * per CONTAINER KEY: the heap has only `heap_pages / LION_BLOCKS_PER_CONTAINER`
+ * of them - 241 at one million rows, and the count scales with the heap, so the
+ * ratio does not improve with size - which puts the whole image path at well
+ * under a millisecond of that eleven-millisecond query.  What the query spends
+ * its time on is the per-CHILD work: 45006 sub-cursor advances and their heap
+ * sifts.  Anything that makes the ANDed case faster has to come off that.
  */
-#ifndef LION_OR_BITSET_MIN
-#define LION_OR_BITSET_MIN	32
-#endif
 
 /*
  * A posting set is worth materializing (DESIGN.md section 9 and the comment
@@ -128,6 +145,10 @@ PG_FUNCTION_INFO_V1(lion_index_count_any);
  */
 typedef struct LionCountCtx
 {
+	MemoryContext cxt;			/* lives for the whole count: the recheck list
+								 * goes here, because the merge itself may run
+								 * under a context that is reset between the
+								 * passes of a disjoint sum (DESIGN.md §15) */
 	Relation	heap;
 	Snapshot	snapshot;
 	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
@@ -342,6 +363,8 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 	ps->found = true;
 	ps->ntids = entry->ntids;
 	ps->ncontainers = entry->ncontainers;
+	ps->entryblk = BufferGetBlockNumber(buf);
+	ps->entryoff = offnum;
 	ps->cxt = CurrentMemoryContext;
 	ps->nuses = 0;
 	ps->mat = NULL;
@@ -431,6 +454,8 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 	ps->index = index;
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
+	ps->entryblk = InvalidBlockNumber;
+	ps->entryoff = InvalidOffsetNumber;
 
 	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(bucket));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
@@ -498,9 +523,17 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  *	- duplicates are dropped in one pass over that order instead of by
  *	  comparing every value with every earlier one, which at the 1000 values
  *	  the planner allows is half a million datumIsEqual() calls.  Equal values
- *	  hash equally, so they are adjacent in this order; the comparison is the
- *	  bytewise one, so two values that compare equal without being identical
- *	  still get a set each, which is harmless (a union does not double-count).
+ *	  hash equally, so they are adjacent in this order.
+ *
+ * Duplicates are dropped TWICE OVER, and the second pass is the one that
+ * matters (DESIGN.md §15).  The bytewise comparison comes first because it is
+ * free and saves the lookup, but it is not exhaustive: an opclass whose
+ * equality is not byte equality - citext - has distinct values that hash alike
+ * and reach ONE entry.  So every located entry is also compared with the
+ * entries the same hash run has already found, by the (page, offset) the entry
+ * tuple lives at, and a repeat is released again.  A union would not have
+ * cared (a set ORed with itself is that set); the disjoint-SUM short-circuit
+ * does, because it would add the entry's rows twice.
  *
  * *sets must have room for nvalues sets; the located ones come out packed at
  * the front, in bucket order, and the return value is how many there are.
@@ -519,6 +552,7 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 	int			nprobe = 0;
 	int			nsets = 0;
 	int			found = 0;
+	int			runstart = 0;	/* first set located under this hash */
 	int			i;
 
 	Assert(nvalues >= 0);
@@ -549,6 +583,10 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 		bool		dup = false;
 		int			j;
 
+		/* A new hash starts a new run of possible duplicates. */
+		if (i > 0 && probes[i].hash != probes[i - 1].hash)
+			runstart = nsets;
+
 		/*
 		 * A duplicate can only be among the entries with this very hash, and
 		 * the sort has put those together; a run of them is as long as the
@@ -569,7 +607,29 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 		if (lion_posting_set_locate(index, state, &probe,
 								   values[probes[i].idx], probes[i].hash,
 								   probes[i].bucket, &sets[nsets]))
+		{
+			/*
+			 * Two values that are not bytewise equal may still be equal to the
+			 * opclass and so share an entry (citext).  Entry offsets are
+			 * stable, so (page, offset) names the entry; a repeat is dropped
+			 * here rather than counted twice by the disjoint-sum
+			 * short-circuit of DESIGN.md §15.
+			 */
+			for (j = runstart; j < nsets; j++)
+			{
+				if (sets[j].found &&
+					sets[j].entryblk == sets[nsets].entryblk &&
+					sets[j].entryoff == sets[nsets].entryoff)
+				{
+					lion_posting_set_release(&sets[nsets]);
+					dup = true;
+					break;
+				}
+			}
+			if (dup)
+				continue;
 			found++;
+		}
 		nsets++;
 
 		if ((i & 0x3f) == 0)
@@ -600,6 +660,8 @@ lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
 	ps->index = index;
 	ps->pinbuf = InvalidBuffer;
 	ps->head = InvalidBlockNumber;
+	ps->entryblk = InvalidBlockNumber;
+	ps->entryoff = InvalidOffsetNumber;
 
 	headbuf = ReadBuffer(index, LION_BUCKET_BLKNO(LION_NULLKEY_BUCKET));
 	LockBuffer(headbuf, BUFFER_LOCK_SHARE);
@@ -1121,6 +1183,7 @@ typedef struct LionOrHeapEnt
 {
 	uint32		ckey;			/* sub[child].ckey when it was pushed */
 	int32		child;
+	const LionContainer *cur;	/* sub[child].cur when it was pushed */
 } LionOrHeapEnt;
 
 typedef struct LionExprCursor
@@ -1144,17 +1207,19 @@ typedef struct LionExprCursor
 	 * carry the §9 interlock.  bits is the accumulator for a union of many of
 	 * them.
 	 *
-	 * The heap carries each child's container key INSIDE the entry rather
-	 * than reading sub[i].ckey while it sifts: a thousand-element IN list is
-	 * a thousand LionExprCursors, a third of a megabyte, and chasing them
-	 * through the heap's random access pattern cost more than the linear scan
-	 * over all children that the heap replaced (measured: +4 ms on a
-	 * 1000-value list at 1M rows).  A child's key only changes when the child
-	 * is advanced, which is also when it is pushed back on.
+	 * The heap carries each child's container key AND its container INSIDE the
+	 * entry rather than reading sub[i] while it sifts and again while it
+	 * unions: a thousand-element IN list is a thousand LionExprCursors, a
+	 * third of a megabyte, and chasing them through the heap's random access
+	 * pattern cost more than the linear scan over all children that the heap
+	 * replaced (measured: +4 ms on a 1000-value list at 1M rows).  Both fields
+	 * only change when the child is advanced, which is also when it is pushed
+	 * back on, so the copy is never stale; hot[] is the same entry moved
+	 * across.
 	 */
 	struct LionOrHeapEnt *heap;
 	int			nheap;
-	int		   *hot;
+	struct LionOrHeapEnt *hot;
 	int			nhot;
 	uint64	   *bits;
 
@@ -1180,6 +1245,7 @@ lion_or_heap_push(LionExprCursor *c, int child)
 	Assert(c->sub[child].valid);
 	ent.ckey = c->sub[child].ckey;
 	ent.child = child;
+	ent.cur = c->sub[child].cur;
 
 	while (i > 0)
 	{
@@ -1193,10 +1259,10 @@ lion_or_heap_push(LionExprCursor *c, int child)
 	c->heap[i] = ent;
 }
 
-static inline int
+static inline LionOrHeapEnt
 lion_or_heap_pop(LionExprCursor *c)
 {
-	int			top = c->heap[0].child;
+	LionOrHeapEnt top = c->heap[0];
 	LionOrHeapEnt last;
 	int			i = 0;
 
@@ -1374,8 +1440,8 @@ lion_ecursor_init(LionExprCursor *c, const LionKeyNode *node,
 
 		if (node->kind == LION_KN_OR)
 		{
+			c->hot = (LionOrHeapEnt *) palloc(sizeof(LionOrHeapEnt) * c->nsub);
 			c->heap = (LionOrHeapEnt *) palloc(sizeof(LionOrHeapEnt) * c->nsub);
-			c->hot = (int *) palloc(sizeof(int) * c->nsub);
 			if (c->nsub > 2)
 				c->bits = (uint64 *) palloc(LION_BITSET_BYTES);
 
@@ -1433,6 +1499,7 @@ lion_ecursor_build(LionExprCursor *c)
 		 * long as the result is being counted.
 		 */
 		Assert(c->nhot == 0);
+
 		if (c->nheap == 0)
 			return;				/* every child is exhausted */
 
@@ -1443,14 +1510,14 @@ lion_ecursor_build(LionExprCursor *c)
 		} while (c->nheap > 0 && c->heap[0].ckey == minckey);
 
 		if (c->nhot == 1)
-			c->cur = c->sub[c->hot[0]].cur;
+			c->cur = c->hot[0].cur;
 		else if (c->nhot < LION_OR_BITSET_MIN)
 		{
-			const LionContainer *a = c->sub[c->hot[0]].cur;
+			const LionContainer *a = c->hot[0].cur;
 
 			for (i = 1; i < c->nhot; i++)
 			{
-				lion_container_or(a, c->sub[c->hot[i]].cur, c->acc[w]);
+				lion_container_or(a, c->hot[i].cur, c->acc[w]);
 				a = c->acc[w];
 				w ^= 1;
 			}
@@ -1461,7 +1528,7 @@ lion_ecursor_build(LionExprCursor *c)
 			/* One pass over the containers, one container built at the end. */
 			memset(c->bits, 0, LION_BITSET_BYTES);
 			for (i = 0; i < c->nhot; i++)
-				lion_bits_or_container(c->bits, c->sub[c->hot[i]].cur);
+				lion_bits_or_container(c->bits, c->hot[i].cur);
 			lion_bits_to_container(c->bits, minckey, c->acc[0]);
 			c->cur = c->acc[0];
 		}
@@ -1563,7 +1630,7 @@ lion_ecursor_next(LionExprCursor *c)
 			 */
 			for (i = 0; i < c->nhot; i++)
 			{
-				int			child = c->hot[i];
+				int			child = c->hot[i].child;
 
 				lion_ecursor_next(&c->sub[child]);
 				if (c->sub[child].valid)
@@ -1770,7 +1837,10 @@ StaticAssertDecl(LION_VM_HEAPBLOCKS_PER_PAGE % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
 /*
  * The all-visible bits of the LION_BLOCKS_PER_CONTAINER consecutive heap blocks
  * a container covers, as one mask: bit i is set iff heap block firstblk + i is
- * marked all-visible.  *vmbuf is the caller's visibility map pin; it is moved
+ * marked all-visible.  Only the bits of `wanted` are answered for - the caller
+ * never looks at the others, and skipping them is what keeps a one-member
+ * container to a single map byte.  *vmbuf is the caller's visibility map pin;
+ * it is moved
  * to whatever map page is needed and left pinned for the next call, exactly as
  * visibilitymap_get_status() leaves it.
  *
@@ -1804,66 +1874,126 @@ StaticAssertDecl(LION_VM_HEAPBLOCKS_PER_PAGE % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
  * simply not all-visible.  That also covers the blocks past the end of the heap
  * that a container's range may include: they have no members, so nothing the
  * mask says about them is ever read.
+ *
+ * The work is split in three so that what the compiler sees at the call site is
+ * the case that happens.  This runs once per container - tens of thousands of
+ * times for one IN list - and all but one container in five hundred is answered
+ * by reading a run of bytes off ONE map page; the loop that used to be here
+ * spelled out the two-page case inline, and whether gcc inlined the whole thing
+ * or none of it moved this query by a third in an -O1 build, in whichever
+ * direction an unrelated edit to the file happened to push it.  Now the common
+ * path is small and always inlined, and the straddling case is out of line.
  */
-static uint64
-lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, Buffer *vmbuf)
+
+/*
+ * The blocks of one map page: `seg`, the wanted bits shifted down so that bit 0
+ * is block blk, whose answers belong at bit `b` of the result.  seg != 0.
+ */
+static pg_always_inline uint64
+lion_vm_allvisible_page(Relation heap, BlockNumber blk, uint64 seg, int b,
+					   Buffer *vmbuf)
 {
 	uint64		mask = 0;
-	int			b = 0;
+	const char *map;
+	uint32		mapbyte;
+	int			jlo;
+	int			jhi;
+	int			j;
 
-	Assert(firstblk % LION_BLOCKS_PER_CONTAINER == 0);
+	Assert(seg != 0);
 
 	/*
-	 * Usually one pass.  LION_VM_HEAPBLOCKS_PER_PAGE (32672 at 8K) is NOT a
-	 * multiple of LION_BLOCKS_PER_CONTAINER, so roughly one container in five
-	 * hundred straddles two map pages and needs two - which is why this is a
-	 * loop and not sixteen bytes read in one go.
+	 * Take the pin the way visibilitymap_get_status() does: same buffer reuse,
+	 * same refusal to extend the fork.  Its return value is the status of blk
+	 * itself, which the byte read below repeats.
 	 */
-	while (b < LION_BLOCKS_PER_CONTAINER)
+	if (!visibilitymap_pin_ok(blk, *vmbuf))
+		(void) visibilitymap_get_status(heap, blk, vmbuf);
+
+	/* the fork stops short of these blocks: none of them is all-visible */
+	if (!BufferIsValid(*vmbuf))
+		return 0;
+
+	map = (const char *) PageGetContents(BufferGetPage(*vmbuf));
+	mapbyte = LION_VM_HEAPBLK_TO_MAPBYTE(blk);
+
+	/*
+	 * Only the map bytes that hold a block the caller asked about.  A container
+	 * built from a sparse segment (DESIGN.md §13) has its members on ONE of the
+	 * sixty-four heap blocks it covers, so that is one byte instead of sixteen
+	 * - and a disjoint sum (§15) asks this question once per entry per
+	 * container key, tens of thousands of times for one IN list.  A container
+	 * with members everywhere, which is what a low-cardinality column has,
+	 * still reads its sixteen bytes in one unbroken run.
+	 */
+	jlo = pg_rightmost_one_pos64(seg) / LION_VM_HEAPBLOCKS_PER_BYTE;
+	jhi = pg_leftmost_one_pos64(seg) / LION_VM_HEAPBLOCKS_PER_BYTE;
+
+	for (j = jlo; j <= jhi; j++)
 	{
-		BlockNumber blk = firstblk + (BlockNumber) b;
-		int			n;
-
-		/* how many of the blocks still wanted live on blk's map page */
-		n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
-				   (blk % LION_VM_HEAPBLOCKS_PER_PAGE));
-		n = Min(n, LION_BLOCKS_PER_CONTAINER - b);
-		Assert(n > 0 && n % LION_VM_HEAPBLOCKS_PER_BYTE == 0);
-
 		/*
-		 * Take the pin the way visibilitymap_get_status() does: same buffer
-		 * reuse, same refusal to extend the fork.  Its return value is the
-		 * status of blk itself, which the byte read below repeats.
+		 * Squeeze the four all-visible bits of the byte - the low bit of each
+		 * pair - down into a nibble of the result.
 		 */
-		if (!visibilitymap_pin_ok(blk, *vmbuf))
-			(void) visibilitymap_get_status(heap, blk, vmbuf);
+		uint8		v = (uint8) (map[mapbyte + j] & 0x55);
 
-		if (BufferIsValid(*vmbuf))
-		{
-			const char *map = (const char *) PageGetContents(BufferGetPage(*vmbuf));
-			uint32		mapbyte = LION_VM_HEAPBLK_TO_MAPBYTE(blk);
-			int			nbytes = n / LION_VM_HEAPBLOCKS_PER_BYTE;
-			int			j;
-
-			for (j = 0; j < nbytes; j++)
-			{
-				/*
-				 * Squeeze the four all-visible bits of the byte - the low bit
-				 * of each pair - down into a nibble of the result.
-				 */
-				uint8		v = (uint8) (map[mapbyte + j] & 0x55);
-
-				v = (uint8) ((v | (v >> 1)) & 0x33);
-				v = (uint8) ((v | (v >> 2)) & 0x0f);
-				mask |= ((uint64) v) << (b + j * LION_VM_HEAPBLOCKS_PER_BYTE);
-			}
-		}
-		/* else the fork stops short of these blocks: none of them is all-visible */
-
-		b += n;
+		v = (uint8) ((v | (v >> 1)) & 0x33);
+		v = (uint8) ((v | (v >> 2)) & 0x0f);
+		mask |= ((uint64) v) << (b + j * LION_VM_HEAPBLOCKS_PER_BYTE);
 	}
 
 	return mask;
+}
+
+/*
+ * The rare container whose blocks straddle two map pages.
+ * LION_VM_HEAPBLOCKS_PER_PAGE (32672 at 8K) is not a multiple of
+ * LION_BLOCKS_PER_CONTAINER, so roughly one container in five hundred does; it
+ * can never be three pages, a map page holding five hundred times a
+ * container's worth of blocks.  `n` is how many of the container's blocks are
+ * on the first of the two.
+ */
+static pg_noinline uint64
+lion_vm_allvisible_mask_split(Relation heap, BlockNumber firstblk, uint64 wanted,
+							 int n, Buffer *vmbuf)
+{
+	uint64		mask = 0;
+	uint64		seg;
+
+	Assert(n > 0 && n < LION_BLOCKS_PER_CONTAINER);
+	Assert(n % LION_VM_HEAPBLOCKS_PER_BYTE == 0);
+
+	seg = wanted & ((UINT64CONST(1) << n) - 1);
+	if (seg != 0)
+		mask |= lion_vm_allvisible_page(heap, firstblk, seg, 0, vmbuf);
+
+	seg = wanted >> n;
+	if (seg != 0)
+		mask |= lion_vm_allvisible_page(heap, firstblk + (BlockNumber) n, seg,
+									   n, vmbuf);
+
+	return mask;
+}
+
+static pg_always_inline uint64
+lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, uint64 wanted,
+					   Buffer *vmbuf)
+{
+	int			n;
+
+	Assert(firstblk % LION_BLOCKS_PER_CONTAINER == 0);
+
+	/* No member on any of these blocks: not even the pin is needed. */
+	if (wanted == 0)
+		return 0;
+
+	/* how many of the container's blocks live on firstblk's map page */
+	n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
+			   (firstblk % LION_VM_HEAPBLOCKS_PER_PAGE));
+	if (unlikely(n < LION_BLOCKS_PER_CONTAINER))
+		return lion_vm_allvisible_mask_split(heap, firstblk, wanted, n, vmbuf);
+
+	return lion_vm_allvisible_page(heap, firstblk, wanted, 0, vmbuf);
 }
 
 /*
@@ -1977,7 +2107,7 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 			expect |= UINT64CONST(1) << b;
 	}
 
-	if (lion_vm_allvisible_mask(heap, firstblk, vmbuf) == allvis)
+	if (lion_vm_allvisible_mask(heap, firstblk, members, vmbuf) == allvis)
 		Assert((allvis & members) == expect);
 }
 #endif
@@ -2374,6 +2504,7 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 
 	if (cx->ntids >= cx->maxtids)
 	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(cx->cxt);
 		int			newmax;
 
 		if (cx->maxtids == 0)
@@ -2390,6 +2521,7 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 			cx->tids = (ItemPointerData *)
 				repalloc(cx->tids, sizeof(ItemPointerData) * newmax);
 		cx->maxtids = newmax;
+		MemoryContextSwitchTo(oldcxt);
 	}
 
 	cx->tids[cx->ntids] = tid;
@@ -2423,32 +2555,31 @@ lion_recheck_cb(uint16 lo, void *arg)
 }
 
 /*
- * Count one container of the intersection, then let the cursors move on.
+ * Step 1 of counting a container: ask the visibility map about every heap
+ * block that has members, and either count the members outright (plus a
+ * predicate lock, as an index-only scan would take) or queue the block's TIDs
+ * for a heap recheck under the caller's snapshot.
  *
- * This function is the heart of DESIGN.md section 9.  On entry every cursor
- * still pins the page its current container was copied from; *c was computed
- * from exactly those containers.  The two things that must happen in this
- * order are both here, adjacent, and nowhere else:
+ * THIS IS THE HEART OF DESIGN.md SECTION 9, and its contract is an ordering
+ * one: on entry the page every source container was copied from is still
+ * PINNED, and the caller may only let those pins go - which means advancing a
+ * cursor - after this function has returned.  Doing it the other way round
+ * would let a concurrent VACUUM finish ambulkdelete on the page just read,
+ * prune the heap and set all-visible, after which this would count dead
+ * tuples.
  *
- *	1. ask the visibility map about every heap block that has members, and
- *	   either count the members outright (plus a predicate lock, as an
- *	   index-only scan would take) or queue the block's TIDs for a heap
- *	   recheck under the caller's snapshot;
- *	2. advance the cursors, which is what releases the source page pins.
- *
- * Doing (2) before (1) would let a concurrent VACUUM finish ambulkdelete on
- * the page we just read, prune the heap and set all-visible, after which
- * step (1) would count dead tuples.
+ * Two callers, and both are written so that the order can be checked by
+ * reading them: lion_count_container() below, which advances the merge's
+ * cursors straight afterwards, and lion_count_one_set(), the inner loop of
+ * the disjoint sum of DESIGN.md §15, which advances its single cursor.
  */
 static void
-lion_count_container(LionCountCtx *cx, const LionContainer *c,
-					LionExprCursor *cursors, int nsources)
+lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 {
 	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
 	uint64		members;		/* blocks of this container that have members */
 	uint64		allvis;			/* blocks marked all-visible in the VM */
 	uint64		dirty;			/* blocks with members that need a heap recheck */
-	int			i;
 
 	/*
 	 * Test hook: the containers have been copied out, the source pages are
@@ -2473,7 +2604,8 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
 		allvis = 0;				/* see lion_count_sources(): no interlock on a standby */
 	else
 	{
-		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, &cx->vmbuf);
+		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, members,
+										&cx->vmbuf);
 #ifdef LION_VM_MASK_CHECK
 		lion_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
 #endif
@@ -2534,18 +2666,62 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
 		}
 	}
 
-	/*
-	 * DESIGN.md section 9: every heap block of *c has now been checked
-	 * against the visibility map, so - and only now - the pins on the pages
-	 * the source containers came from may be released.  lion_ecursor_next() is
-	 * what releases them, and only the sources that contributed to *c (the
-	 * ones the merge flagged) move on.
-	 */
+}
+
+/*
+ * The merge's form: count the container, then let the cursors move on.
+ *
+ * DESIGN.md section 9: every heap block of *c has been checked against the
+ * visibility map by the time the loop below runs, so - and only now - the pins
+ * on the pages the source containers came from may be released.
+ * lion_ecursor_next() is what releases them, and only the sources that
+ * contributed to *c (the ones the merge flagged) move on.
+ */
+static void
+lion_count_container(LionCountCtx *cx, const LionContainer *c,
+					LionExprCursor *cursors, int nsources)
+{
+	int			i;
+
+	lion_count_container_vm(cx, c);
+
 	for (i = 0; i < nsources; i++)
 	{
 		if (cursors[i].advance)
 			lion_ecursor_next(&cursors[i]);
 	}
+}
+
+/*
+ * Count ONE posting set on its own.
+ *
+ * Three callers, all of them counts that have nothing to merge: each entry of
+ * the disjoint sum of DESIGN.md §15, each entry of the sum-over-all of §14, and
+ * any count that comes down to a single set - a plain `WHERE k = 5`, or one
+ * group of a GROUP BY with no other clause.  It is lion_run_merge() with every
+ * source but one removed, written out because that takes an expression cursor,
+ * a tree node and a per-container pass over the source array out of a loop that
+ * runs tens of thousands of times for one IN list.
+ *
+ * The DESIGN.md §9 ordering is the same and is visible in the same two adjacent
+ * statements: consult the visibility map, and only then advance the cursor,
+ * which is the one thing that unpins the page the container was copied from.
+ * The set's OWN pin (an inline entry's) is the caller's and is not touched
+ * here: lion_cursor_init() borrows it and lion_cursor_close() leaves it.
+ */
+static void
+lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
+{
+	LionSetCursor cur;
+
+	lion_cursor_init(&cur, ps, cx);
+	while (cur.valid)
+	{
+		lion_count_container_vm(cx, cur.cur);
+		lion_cursor_next(&cur);
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_cursor_close(&cur);
 }
 
 static int
@@ -2763,169 +2939,44 @@ lion_count_sources(Relation heap, Snapshot snapshot, int nsources,
 									NULL);
 }
 
-int64
-lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
-						 LionCountSource *sources, LionCountStats *stats,
-						 LionVisCache *cache)
+/*
+ * One pass of the merge: intersect the positive sources container key by
+ * container key, subtract the negated ones, and count what is left against the
+ * visibility map.  Everything the caller set up in *cx - the recheck batch, the
+ * visibility map pin, the visibility cache, the statistics - is accumulated
+ * into, so this may be called more than once for one count.  The disjoint-sum
+ * short-circuit below is the caller that does.
+ *
+ * This is where DESIGN.md §9 lives; nothing about the interlock changes with
+ * how often it runs, because each pass takes its pins, asks the visibility map
+ * and drops them again inside lion_count_container().
+ */
+static void
+lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
+			  LionKeyNode **trees)
 {
-	MemoryContext cxt;
-	MemoryContext oldcxt;
-	LionCountCtx cx;
 	LionExprCursor *cursors;
-	LionKeyNode **trees;
 	LionContainer *work[2];
-	int64		result;
-	int			ncarry;
-	bool	   *carry;
-	int			npositive = 0;
 	int			i;
-	int			j;
-
-	Assert(nsources >= 1);
-
-	/*
-	 * The shape of each source, and whether it can select anything at all: a
-	 * positive source that cannot makes the whole intersection empty, and a
-	 * negated one that cannot simply subtracts nothing.
-	 */
-	trees = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * nsources);
-	for (i = 0; i < nsources; i++)
-	{
-		trees[i] = lion_source_tree(&sources[i]);
-
-		if (sources[i].negated)
-			continue;
-		npositive++;
-		if (!lion_source_satisfiable(trees[i], sources[i].sets))
-			return 0;
-	}
-	if (npositive == 0)
-		elog(ERROR, "lion index count needs at least one positive source");
-
-	/*
-	 * Decide which sets to serve from a private copy this time (DESIGN.md
-	 * section 9; the argument is on lion_posting_set_materialize()).
-	 *
-	 * Two rules, and the safety of the whole thing rests on the second:
-	 *
-	 *	1. only a set that has been counted before, which in practice means
-	 *	   the WHERE sets of the GROUP BY path in lion_customscan.c, where the
-	 *	   same sets are intersected with every group in turn and walking
-	 *	   their chains again per group is the dominant cost.  A one-shot
-	 *	   count never pays for a copy it would use once.
-	 *
-	 *	2. never the last POSITIVE source that still carries the interlock.
-	 *	   A set that is INLINE, or that is walked page by page, holds a pin
-	 *	   while its containers are counted against the visibility map, and
-	 *	   that pin is what keeps VACUUM from having finished ambulkdelete() -
-	 *	   on this index, and therefore from having set all-visible on any
-	 *	   heap page at all.  One source is enough, but there must be one, and
-	 *	   it has to be a positive one that holds a pin at EVERY container key
-	 *	   it yields, which is what lion_source_pinned() decides.
-	 *
-	 * A negated set may always be copied: a stale copy can only hold TIDs
-	 * whose rows are dead (a live row's key cannot change without the row
-	 * getting a new TID), and subtracting a dead TID cannot take a live row
-	 * out of the count.
-	 */
-	carry = (bool *) palloc0(sizeof(bool) * nsources);
-	ncarry = 0;
-	for (i = 0; i < nsources; i++)
-	{
-		for (j = 0; j < sources[i].nsets; j++)
-		{
-			if (sources[i].sets[j].found)
-				sources[i].sets[j].nuses++;
-		}
-
-		if (sources[i].negated)
-			continue;
-		carry[i] = lion_source_pinned(trees[i], sources[i].sets);
-		if (carry[i])
-			ncarry++;
-	}
-	Assert(ncarry > 0);
-
-	for (i = 0; i < nsources; i++)
-	{
-		/*
-		 * Rule 3 (DESIGN.md §19): a source may forbid it outright.  An OR
-		 * across columns does, because a dead TID may be contributed by any
-		 * single leaf of the union and the interlock the source carries is
-		 * that EVERY leaf holds a pin (lion_source_pinned()); keeping that
-		 * property is simpler than reasoning about which other source
-		 * happened to carry the interlock at the container key in question.
-		 */
-		if (sources[i].nomaterialize)
-			continue;
-
-		for (j = 0; j < sources[i].nsets; j++)
-		{
-			LionPostingSet *ps = &sources[i].sets[j];
-
-			if (!ps->found)
-				continue;
-			if (ps->is_inline || ps->mat != NULL)
-				continue;		/* nothing to gain: already a private copy */
-			if (ps->nuses < 2)
-				continue;		/* rule 1 */
-			if (!sources[i].negated && carry[i] && ncarry <= 1)
-				continue;		/* rule 2: this is the last interlock */
-			if (ps->ncontainers > LION_MATERIALIZE_MAX_CONTAINERS &&
-				ps->ntids > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16))
-				continue;		/* hopeless even as an ARRAY of members */
-
-			if (lion_posting_set_materialize(ps) && !sources[i].negated &&
-				carry[i] && !lion_source_pinned(trees[i], sources[i].sets))
-			{
-				carry[i] = false;
-				ncarry--;
-			}
-		}
-	}
-	Assert(ncarry > 0);
-
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
-								"lion index count",
-								ALLOCSET_DEFAULT_SIZES);
-	oldcxt = MemoryContextSwitchTo(cxt);
-
-	memset(&cx, 0, sizeof(cx));
-	cx.heap = heap;
-	cx.snapshot = snapshot;
-	cx.vmbuf = InvalidBuffer;
-	/* SerializationNeededForRead() begins with exactly this test; hoisting it
-	 * lets non-serializable counts skip the per-block PredicateLockPage loop. */
-	cx.serializable = IsolationIsSerializable();
-	/*
-	 * On a hot standby the §9 interlock does not exist: WAL replay of our
-	 * generic records takes ordinary exclusive locks, not cleanup locks, so a
-	 * reader's pin does not stop ambulkdelete's records from being replayed,
-	 * and the heap records that follow can set all-visible while this backend
-	 * still holds a copy of the old containers.  Until the AM has its own
-	 * resource manager whose redo takes cleanup locks, a standby rechecks
-	 * every candidate TID in the heap and never trusts the visibility map.
-	 */
-	cx.in_recovery = RecoveryInProgress();
-	cx.tids_sorted = true;
-	cx.batchmax = lion_recheck_budget();
-
-	/*
-	 * The visibility cache, if the caller keeps one for this node execution.
-	 * It is emptied here if it holds answers for another relation or another
-	 * snapshot, so a partitioned count may hand the same handle to every
-	 * partition (DESIGN.md §9 and §16).
-	 */
-	lion_vis_cache_begin(cache, heap, snapshot);
-	cx.cache = cache;
 
 	cursors = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * nsources);
-	work[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-	work[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+
+	/*
+	 * Only an intersection needs a place to put one: a single source hands its
+	 * own container straight to lion_count_container(), and the disjoint sum
+	 * of DESIGN.md §15 runs this once per entry, where two 4 KiB buffers per
+	 * pass are the bulk of the work.
+	 */
+	work[0] = work[1] = NULL;
+	if (nsources > 1)
+	{
+		work[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		work[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	}
 
 	for (i = 0; i < nsources; i++)
 		lion_ecursor_init(&cursors[i], trees[i], sources[i].sets,
-						 sources[i].nsets, &cx);
+						 sources[i].nsets, cx);
 
 	/*
 	 * Merge the sources by container key.  Containers are stored in ascending
@@ -3013,7 +3064,7 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 		}
 
 		if (lion_container_cardinality(acc) > 0)
-			lion_count_container(&cx, acc, cursors, nsources);
+			lion_count_container(cx, acc, cursors, nsources);
 		else
 		{
 			/*
@@ -3032,6 +3083,427 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 merge_done:
 	for (i = 0; i < nsources; i++)
 		lion_ecursor_close(&cursors[i]);
+
+	pfree(cursors);
+	if (work[0] != NULL)
+	{
+		pfree(work[0]);
+		pfree(work[1]);
+	}
+}
+
+/*
+ * Is this tree the plain union of every one of the source's sets, each set
+ * appearing exactly once?  That is the shape lion_locate_leaf() gives an IN
+ * list and lion_source_tree() gives a source with no tree of its own, and it
+ * is the only shape the disjoint-sum short-circuit below may be applied to: a
+ * set that appears twice in the tree, or an AND anywhere in it, would make the
+ * union something other than the sum.
+ */
+static bool
+lion_tree_is_flat_union(const LionKeyNode *node, int nsets)
+{
+	int			i;
+
+	if (node == NULL)
+		return true;			/* the implicit union of all the sets */
+	if (node->kind == LION_KN_KEY)
+		return nsets == 1 && node->keyno == 0;
+	if (node->kind != LION_KN_OR || node->nargs != nsets)
+		return false;
+	for (i = 0; i < nsets; i++)
+	{
+		if (node->args[i]->kind != LION_KN_KEY || node->args[i]->keyno != i)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * THE DISJOINT-SUM SHORT-CIRCUIT (DESIGN.md §15)
+ * ==============================================
+ * The count of a union is not in general the sum of the counts - a row in two
+ * of the sets would be counted twice - but for the posting sets of DIFFERENT
+ * entries of one SCALAR lion index it is, because those sets are disjoint by
+ * construction:
+ *
+ *	- a scalar opclass extracts exactly ONE key from a row's column value, so
+ *	  the build and the insert path put that row's TID under exactly one entry:
+ *	  the entry of its value, or the reserved NULL entry of DESIGN.md §14 when
+ *	  the value is NULL, or (for a multi-key opclass only) the reserved EMPTY
+ *	  entry of §17;
+ *	- the reserved entries are therefore disjoint from every value entry as
+ *	  well, and from each other;
+ *	- so no TID is in two entries, and the union of any set of entries has
+ *	  exactly as many members as their counts add up to.
+ *
+ * DESIGN.md §14 already relies on exactly this: `col IS NOT NULL` with nothing
+ * else to drive the merge is answered by summing the counts of every entry of
+ * the column's index, and that is only the count of their union because the
+ * entries are disjoint.  This is the same argument applied to the entries an
+ * IN list names instead of to all of them.
+ *
+ * A MULTI-KEY opclass (DESIGN.md §17) is excluded, and this is the whole
+ * reason the test below asks the index rather than trusting the caller: one
+ * row yields many keys there, so it appears under several entries and the sum
+ * over them is not a row count.  §17 refuses such an index as a GROUP BY or
+ * sum-over-all driver for the same reason.
+ *
+ * What the caller has to promise, because this code cannot see it, is that no
+ * two of the sets are the SAME entry: `src->disjoint`.
+ * lion_posting_set_lookup_many() keeps that promise by dropping duplicates by
+ * entry identity and not merely by value.
+ *
+ * Finally, the short-circuit only applies while this source is the ONLY
+ * positive one.  An intersection has to be evaluated container key by
+ * container key, and for that the union has to be materialised per key, which
+ * is precisely the merge.
+ */
+static bool
+lion_sources_disjoint_sum(int nsources, const LionCountSource *sources)
+{
+	const LionCountSource *src = &sources[0];
+	Relation	index = NULL;
+	int			i;
+
+	if (nsources != 1)
+		return false;
+	if (src->negated || !src->disjoint)
+		return false;
+	if (src->nsets < 2)
+		return false;			/* one set is its own union already */
+	if (!lion_tree_is_flat_union(src->tree, src->nsets))
+		return false;
+
+	for (i = 0; i < src->nsets; i++)
+	{
+		if (!src->sets[i].found)
+			continue;
+		if (index == NULL)
+			index = src->sets[i].index;
+		else if (src->sets[i].index != index)
+			return false;		/* entries of two indexes are not disjoint */
+	}
+	if (index == NULL)
+		return false;
+
+	return !lion_get_state(index)->multikey;
+}
+
+/*
+ * ... and is it FASTER?  The short-circuit above is about whether summing is
+ * the RIGHT answer; this is about whether it is the cheap one, and the two are
+ * independent.
+ *
+ * Both paths read every container of every set exactly once and count the same
+ * members.  What they do not share is where the per-container overheads land:
+ *
+ *	- the SUM asks the visibility map once per (set, container key), because
+ *	  each set is counted on its own;
+ *	- the MERGE asks it once per container key, for the union, and pays instead
+ *	  a heap sift and a union step per container.
+ *
+ * So the sum wins exactly when there is little to amortize.  Two things say
+ * there is, and either one is enough to send the count back to the merge:
+ *
+ *	- DENSE sets.  If an entry has many rows in the SAME container key, the
+ *	  merge folds all the sets' members at that key into one container and asks
+ *	  the visibility map about it once.  Measured at 1M rows (15385 heap pages,
+ *	  241 container keys), `k IN (1000 values)` with the sum against the merge:
+ *	  20000 distinct keys (1.0 rows per key per container key) 3.6 ms against
+ *	  9.9, 5000 keys (1.0) 11.5 against 21.5, 2000 keys (2.1) 25.1 against 32.2,
+ *	  500 keys (8.3) 21.2 against 9.0, and 200 keys (20.7) 14.0 against 6.5.
+ *	  The crossover is between two and eight rows per container key, so the
+ *	  test is four.
+ *	- and MANY of them, because the merge only becomes good at dense sets once
+ *	  it reaches its bitset image (LION_OR_BITSET_MIN containers at one key);
+ *	  below that it folds them pairwise, which is quadratic in the sets.  On the
+ *	  200-key column above, sum against merge at 5 values is 0.49 ms against
+ *	  0.64, at 15 values 1.14 against 2.37, at 30 values 2.15 against 7.6 - and
+ *	  at 50, where the image takes over, 3.5 against 2.5.
+ *
+ * The density is read off the entries' own row counts, which the posting sets
+ * carry already (`ntids`), against the number of container keys the heap has;
+ * no extra page is touched to decide this.  lion_cost_count_rel() makes the
+ * same test from the planner's estimates, so that the price the node is chosen
+ * on is the price of the path it will take; LION_SUM_MAX_DENSITY and
+ * LION_OR_BITSET_MIN live in lion_count.h for that reason.
+ */
+static bool
+lion_sum_is_cheaper(Relation heap, const LionCountSource *src)
+{
+	double		ckeys;
+	double		density;
+	int64		ntids = 0;
+	int			nfound = 0;
+	int			i;
+
+	/* Too few sets for the merge's bitset image: it would fold them pairwise. */
+	if (src->nsets < LION_OR_BITSET_MIN)
+		return true;
+
+	for (i = 0; i < src->nsets; i++)
+	{
+		if (!src->sets[i].found)
+			continue;
+		ntids += src->sets[i].ntids;
+		nfound++;
+	}
+	if (nfound < LION_OR_BITSET_MIN)
+		return true;
+
+	ckeys = (double) RelationGetNumberOfBlocks(heap) / LION_BLOCKS_PER_CONTAINER;
+	if (ckeys < 1.0)
+		ckeys = 1.0;
+
+	/* rows per container key in the average entry */
+	density = ((double) ntids / nfound) / ckeys;
+
+	return density <= LION_SUM_MAX_DENSITY;
+}
+
+/*
+ * Does the whole count come down to ONE posting set?
+ *
+ * That is not the short-circuit above and needs none of its argument: there is
+ * no union to take apart, so nothing about disjointness, about the opclass or
+ * about how the caller found the set comes into it.  It is only worth asking
+ * because it is the shape of every group of a GROUP BY, of every entry of the
+ * sum-over-all of DESIGN.md §14, and of a plain `WHERE k = 5` - and because
+ * lion_count_one_set() answers it without an expression cursor, a tree node or
+ * a per-container pass over a one-element source array.
+ */
+static bool
+lion_sources_one_set(int nsources, const LionCountSource *sources)
+{
+	return (nsources == 1 &&
+			!sources[0].negated &&
+			sources[0].nsets == 1 &&
+			lion_tree_is_flat_union(sources[0].tree, 1));
+}
+
+int64
+lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
+						 LionCountSource *sources, LionCountStats *stats,
+						 LionVisCache *cache)
+{
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionCountCtx cx;
+	LionKeyNode **trees;
+	int64		result;
+	int			ncarry;
+	bool	   *carry;
+	bool		summed;
+	bool		oneset;
+	int			npositive = 0;
+	int			i;
+	int			j;
+
+	Assert(nsources >= 1);
+
+	/*
+	 * The shape of each source, and whether it can select anything at all: a
+	 * positive source that cannot makes the whole intersection empty, and a
+	 * negated one that cannot simply subtracts nothing.
+	 */
+	trees = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * nsources);
+	for (i = 0; i < nsources; i++)
+	{
+		trees[i] = lion_source_tree(&sources[i]);
+
+		if (sources[i].negated)
+			continue;
+		npositive++;
+		if (!lion_source_satisfiable(trees[i], sources[i].sets))
+			return 0;
+	}
+	if (npositive == 0)
+		elog(ERROR, "lion index count needs at least one positive source");
+
+	/*
+	 * The disjoint-sum short-circuit: count each entry's posting set on its own
+	 * and add the results up, instead of merging a thousand sub-cursors into
+	 * one union.  Nothing else about the count changes - each set goes through
+	 * the same single-set machinery below, with the same visibility-map check
+	 * per container and the same recheck queue - so DESIGN.md §9 reads exactly
+	 * as it does for a one-key count, one set at a time.
+	 *
+	 * Two questions, and both have to be yes: is the sum the same answer as the
+	 * union (lion_sources_disjoint_sum(), which carries the argument) and is it
+	 * the cheaper way to get it (lion_sum_is_cheaper(), which is where the
+	 * measurements are).
+	 */
+	summed = (lion_sources_disjoint_sum(nsources, sources) &&
+			  lion_sum_is_cheaper(heap, &sources[0]));
+	oneset = !summed && lion_sources_one_set(nsources, sources);
+
+	/*
+	 * Decide which sets to serve from a private copy this time (DESIGN.md
+	 * section 9; the argument is on lion_posting_set_materialize()).
+	 *
+	 * Two rules, and the safety of the whole thing rests on the second:
+	 *
+	 *	1. only a set that has been counted before, which in practice means
+	 *	   the WHERE sets of the GROUP BY path in lion_customscan.c, where the
+	 *	   same sets are intersected with every group in turn and walking
+	 *	   their chains again per group is the dominant cost.  A one-shot
+	 *	   count never pays for a copy it would use once.
+	 *
+	 *	2. never the last POSITIVE source that still carries the interlock.
+	 *	   A set that is INLINE, or that is walked page by page, holds a pin
+	 *	   while its containers are counted against the visibility map, and
+	 *	   that pin is what keeps VACUUM from having finished ambulkdelete() -
+	 *	   on this index, and therefore from having set all-visible on any
+	 *	   heap page at all.  One source is enough, but there must be one, and
+	 *	   it has to be a positive one that holds a pin at EVERY container key
+	 *	   it yields, which is what lion_source_pinned() decides.
+	 *
+	 * A negated set may always be copied: a stale copy can only hold TIDs
+	 * whose rows are dead (a live row's key cannot change without the row
+	 * getting a new TID), and subtracting a dead TID cannot take a live row
+	 * out of the count.
+	 */
+	carry = (bool *) palloc0(sizeof(bool) * nsources);
+	ncarry = 0;
+	for (i = 0; i < nsources; i++)
+	{
+		for (j = 0; j < sources[i].nsets; j++)
+		{
+			if (sources[i].sets[j].found)
+				sources[i].sets[j].nuses++;
+		}
+
+		if (sources[i].negated)
+			continue;
+		carry[i] = lion_source_pinned(trees[i], sources[i].sets);
+		if (carry[i])
+			ncarry++;
+	}
+	Assert(ncarry > 0);
+
+	/*
+	 * A summed source counts every set exactly once, so there is nothing a
+	 * private copy could save; skipping the decision also keeps the one
+	 * positive source of each pass on the pinned path by construction.
+	 */
+	for (i = 0; !summed && i < nsources; i++)
+	{
+		/*
+		 * Rule 3 (DESIGN.md §19): a source may forbid it outright.  An OR
+		 * across columns does, because a dead TID may be contributed by any
+		 * single leaf of the union and the interlock the source carries is
+		 * that EVERY leaf holds a pin (lion_source_pinned()); keeping that
+		 * property is simpler than reasoning about which other source
+		 * happened to carry the interlock at the container key in question.
+		 */
+		if (sources[i].nomaterialize)
+			continue;
+
+		for (j = 0; j < sources[i].nsets; j++)
+		{
+			LionPostingSet *ps = &sources[i].sets[j];
+
+			if (!ps->found)
+				continue;
+			if (ps->is_inline || ps->mat != NULL)
+				continue;		/* nothing to gain: already a private copy */
+			if (ps->nuses < 2)
+				continue;		/* rule 1 */
+			if (!sources[i].negated && carry[i] && ncarry <= 1)
+				continue;		/* rule 2: this is the last interlock */
+			if (ps->ncontainers > LION_MATERIALIZE_MAX_CONTAINERS &&
+				ps->ntids > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16))
+				continue;		/* hopeless even as an ARRAY of members */
+
+			if (lion_posting_set_materialize(ps) && !sources[i].negated &&
+				carry[i] && !lion_source_pinned(trees[i], sources[i].sets))
+			{
+				carry[i] = false;
+				ncarry--;
+			}
+		}
+	}
+	Assert(ncarry > 0);
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index count",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	memset(&cx, 0, sizeof(cx));
+	cx.cxt = cxt;
+	cx.heap = heap;
+	cx.snapshot = snapshot;
+	cx.vmbuf = InvalidBuffer;
+	/* SerializationNeededForRead() begins with exactly this test; hoisting it
+	 * lets non-serializable counts skip the per-block PredicateLockPage loop. */
+	cx.serializable = IsolationIsSerializable();
+	/*
+	 * On a hot standby the §9 interlock does not exist: WAL replay of our
+	 * generic records takes ordinary exclusive locks, not cleanup locks, so a
+	 * reader's pin does not stop ambulkdelete's records from being replayed,
+	 * and the heap records that follow can set all-visible while this backend
+	 * still holds a copy of the old containers.  Until the AM has its own
+	 * resource manager whose redo takes cleanup locks, a standby rechecks
+	 * every candidate TID in the heap and never trusts the visibility map.
+	 */
+	cx.in_recovery = RecoveryInProgress();
+	cx.tids_sorted = true;
+	cx.batchmax = lion_recheck_budget();
+
+	/*
+	 * The visibility cache, if the caller keeps one for this node execution.
+	 * It is emptied here if it holds answers for another relation or another
+	 * snapshot, so a partitioned count may hand the same handle to every
+	 * partition (DESIGN.md §9 and §16).
+	 */
+	lion_vis_cache_begin(cache, heap, snapshot);
+	cx.cache = cache;
+
+	if (summed)
+	{
+		/*
+		 * One pass per entry, each with the source reduced to that one set.
+		 * The passes share the recheck queue, the visibility-map pin and the
+		 * visibility cache, so a dirty heap page is still visited once for the
+		 * whole list and the batching of DESIGN.md §9 still bounds the memory.
+		 */
+		MemoryContext setcxt;
+
+		/*
+		 * One pass allocates a cursor, a staging buffer for the inline
+		 * payload or a whole page image for a chain, and a buffer for the
+		 * sparse segment it expands: twelve kilobytes or so, a thousand times
+		 * over for the longest list the planner allows.  A context that is
+		 * RESET after each pass hands the same twelve kilobytes out again, so
+		 * the pass runs in cache instead of walking a dozen megabytes of fresh
+		 * memory.  The keeper block is sized to hold all of it, which is what
+		 * makes the reset free.
+		 */
+		setcxt = AllocSetContextCreate(cxt, "lion index count entry",
+									   32 * 1024, 32 * 1024,
+									   ALLOCSET_DEFAULT_MAXSIZE);
+
+		for (j = 0; j < sources[0].nsets; j++)
+		{
+			if (!sources[0].sets[j].found)
+				continue;
+
+			MemoryContextSwitchTo(setcxt);
+			lion_count_one_set(&cx, &sources[0].sets[j]);
+			MemoryContextSwitchTo(cxt);
+			MemoryContextReset(setcxt);
+
+			cx.stats.sets_summed++;
+			CHECK_FOR_INTERRUPTS();
+		}
+		MemoryContextDelete(setcxt);
+	}
+	else if (oneset)
+		lion_count_one_set(&cx, &sources[0].sets[0]);
+	else
+		lion_run_merge(&cx, nsources, sources, trees);
 
 	/*
 	 * Everything that could be answered from the visibility map has been;
@@ -3056,6 +3528,7 @@ merge_done:
 		stats->containers_visited += cx.stats.containers_visited;
 		stats->cache_hits += cx.stats.cache_hits;
 		stats->cache_full += cx.stats.cache_full;
+		stats->sets_summed += cx.stats.sets_summed;
 	}
 
 	return result;
@@ -3636,6 +4109,14 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 		memset(&src, 0, sizeof(src));
 		src.nsets = nsets;
 		src.sets = sets;
+
+		/*
+		 * lion_posting_set_lookup_many() dropped duplicate ENTRIES, so the sets
+		 * are distinct entries of one index and their union is their sum
+		 * whenever the opclass is scalar: the disjoint-sum short-circuit of
+		 * DESIGN.md §15, which lion_count_sources() takes from here.
+		 */
+		src.disjoint = true;
 		count = lion_count_sources(call.heap, snapshot, 1, &src, NULL);
 	}
 

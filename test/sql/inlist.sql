@@ -284,8 +284,213 @@ VACUUM ANALYZE lion_in_empty;
 SELECT lion_incmp('SELECT count(*) FROM lion_in_empty WHERE k IN (1, 2)');
 SELECT lion_incmp('SELECT k, count(*) FROM lion_in_empty WHERE k IN (1, 2) GROUP BY k');
 
-DROP TABLE lion_in, lion_in_empty;
+-- ---- long lists: the disjoint-sum short-circuit (DESIGN.md §15) ---------
+/*
+ * The posting sets of two different entries of a SCALAR index are disjoint -
+ * a row has one value in the column, so its TID is under exactly one entry -
+ * so the count of an IN list's union is the SUM of the per-entry counts and
+ * no union has to be built at all.  It applies when the list is the only
+ * positive source, and when the list is on the very column a GROUP BY drives;
+ * it must NOT apply when the list is intersected with something else (the
+ * union has to be materialised per container key to be intersected), nor for
+ * a multi-key opclass (DESIGN.md §17), where one row is under many entries
+ * and the sum over them is not a row count.
+ *
+ * Every query below is still answered twice and compared as a multiset, which
+ * is what proves the sum and the merge agree; lion_insum() then reports which
+ * of the two the node took, from the EXPLAIN counter.
+ */
+CREATE FUNCTION lion_insum(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	nm text;
+	pushed boolean := false;
+	summed bigint := 0;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF,'
+					  ' BUFFERS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+		nm := btrim(split_part(ln, ':', 1));
+		IF nm = 'Posting Sets Summed' THEN
+			summed := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	IF NOT pushed THEN
+		RETURN 'NOT PUSHED DOWN';
+	END IF;
+	RETURN format('posting sets summed %s',
+				  CASE WHEN summed = 0 THEN '= 0' ELSE '> 0' END);
+END $$;
+
+/* Does the planner pick the node on cost, with nothing disabled? */
+CREATE FUNCTION lion_inpick(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN 'pushed down';
+		END IF;
+	END LOOP;
+	RETURN 'not pushed down';
+END $$;
+
+CREATE TABLE lion_inbig (
+	id		int			NOT NULL,
+	k		int			NOT NULL,	-- 2000 distinct values, high cardinality
+	t		text		NOT NULL,	-- the same values as text
+	lo		int			NOT NULL,	-- 4 distinct values, low cardinality
+	md		int			NOT NULL,	-- 50 distinct values: DENSE, and enough of
+									-- them for the merge's bitset image
+	n		int,					-- nullable, 2000 values and NULL
+	tags	text[]					-- multi-key (DESIGN.md §17)
+);
+INSERT INTO lion_inbig
+SELECT i, i % 2000, 't' || (i % 2000), i % 4, i % 50,
+	   CASE WHEN i % 7 = 0 THEN NULL ELSE i % 2000 END,
+	   ARRAY['g' || (i % 50), 'g' || (i % 97)]
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lion_inbig_k ON lion_inbig USING lion (k);
+CREATE INDEX lion_inbig_t ON lion_inbig USING lion (t);
+CREATE INDEX lion_inbig_lo ON lion_inbig USING lion (lo);
+CREATE INDEX lion_inbig_md ON lion_inbig USING lion (md);
+CREATE INDEX lion_inbig_n ON lion_inbig USING lion (n);
+CREATE INDEX lion_inbig_tags ON lion_inbig USING lion (tags);
+VACUUM ANALYZE lion_inbig;
+SELECT lion_index_verify('lion_inbig_k', true);
+SELECT lion_index_verify('lion_inbig_tags', true);
+
+-- a thousand values on an int column, and the same list on a text column
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_incmp(format($$SELECT count(*) FROM lion_inbig WHERE t = ANY ('%s'::text[])$$,
+						(SELECT '{' || string_agg('t' || g, ',') || '}'
+						   FROM generate_series(0, 999) g)));
+SELECT lion_insum(format($$SELECT count(*) FROM lion_inbig WHERE t = ANY ('%s'::text[])$$,
+						(SELECT '{' || string_agg('t' || g, ',') || '}'
+						   FROM generate_series(0, 999) g)));
+
+-- duplicates (every value four times) and values with no entry at all
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 250)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 250)));
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(3000, 3999, 100000)));
+
+-- NULLs in the list, and a nullable column (the NULL entry is not a value)
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE n = ANY (''{NULL,%s}''::int[])',
+						(SELECT string_agg(g::text, ',') FROM generate_series(0, 998) g)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE n = ANY (''{NULL,%s}''::int[])',
+						(SELECT string_agg(g::text, ',') FROM generate_series(0, 998) g)));
+
+-- a GROUP BY on the very column the list constrains: the groups are the values
+SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY k',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_insum(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY k',
+						lion_inlist(0, 999, 100000)));
+-- ... including with a second clause, which the groups are intersected with
+SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1 GROUP BY k',
+						lion_inlist(0, 999, 100000)));
+-- ... and a GROUP BY on a DIFFERENT column, which the entry scan still drives
+SELECT lion_incmp(format('SELECT lo, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY lo',
+						lion_inlist(0, 999, 100000)));
+
+-- ANDed with another clause: the merge, not the sum
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1',
+						lion_inlist(0, 999, 100000)));
+-- an IN list under an OR is one leaf of a union, and never summed
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) OR lo = 1',
+						lion_inlist(0, 99, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) OR lo = 1',
+						lion_inlist(0, 99, 100000)));
+-- a multi-key column: one row is under many entries, so the sum would be wrong
+SELECT lion_incmp($$SELECT count(*) FROM lion_inbig WHERE tags && ARRAY['g1','g2','g3']$$);
+SELECT lion_insum($$SELECT count(*) FROM lion_inbig WHERE tags && ARRAY['g1','g2','g3']$$);
+SELECT lion_insum($$SELECT count(*) FROM lion_inbig WHERE tags @> ARRAY['g1']$$);
+
+/*
+ * The sum is also declined when it would be SLOWER, which is a question about
+ * the data and not about correctness (lion_sum_is_cheaper()): entries dense
+ * enough that the merge's union amortizes the visibility-map check over all of
+ * them, and enough entries for the merge to reach its bitset image.  `md` has
+ * fifty values of four thousand rows each, so a list of all fifty is both;
+ * ten of them is not, because the merge would fold them pairwise.
+ */
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE md = ANY (''%s''::int[])',
+						lion_inlist(0, 49, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE md = ANY (''%s''::int[])',
+						lion_inlist(0, 49, 100000)));
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE md = ANY (''%s''::int[])',
+						lion_inlist(0, 9, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE md = ANY (''%s''::int[])',
+						lion_inlist(0, 9, 100000)));
+
+-- ---- a dirty heap, then an all-visible one -----------------------------
+DELETE FROM lion_inbig WHERE id % 5 = 0;
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY k',
+						lion_inlist(0, 999, 100000)));
+VACUUM lion_inbig;
+SELECT lion_index_verify('lion_inbig_k', true);
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+
+-- ---- a partitioned table (DESIGN.md §16) -------------------------------
+CREATE TABLE lion_inpart (id int NOT NULL, k int NOT NULL) PARTITION BY RANGE (id);
+CREATE TABLE lion_inpart1 PARTITION OF lion_inpart FOR VALUES FROM (1) TO (50000);
+CREATE TABLE lion_inpart2 PARTITION OF lion_inpart FOR VALUES FROM (50000) TO (200000);
+/* 20000 distinct keys, so that each partition's entries are sparse enough for
+ * the sum: a partition is a relation of its own and the choice is made per
+ * partition, over that partition's heap. */
+INSERT INTO lion_inpart SELECT i, i % 20000 FROM generate_series(1, 199999) i;
+CREATE INDEX lion_inpart1_k ON lion_inpart1 USING lion (k);
+CREATE INDEX lion_inpart2_k ON lion_inpart2 USING lion (k);
+VACUUM ANALYZE lion_inpart;
+SELECT lion_incmp(format('SELECT count(*) FROM lion_inpart WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_insum(format('SELECT count(*) FROM lion_inpart WHERE k = ANY (''%s''::int[])',
+						lion_inlist(0, 999, 100000)));
+SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inpart WHERE k = ANY (''%s''::int[]) GROUP BY k',
+						lion_inlist(0, 999, 100000)));
+
+-- ---- plan choice, with nothing disabled --------------------------------
+/*
+ * A list over MANY distinct keys used to lose to the B-tree above a handful of
+ * values, because every element was another sub-cursor in the union; with the
+ * sum there is no union and the node wins at every length (DESIGN.md §15).  A
+ * list over FEW distinct keys wins by a wide margin either way, because the
+ * B-tree has to read an index tuple per row.
+ */
+CREATE INDEX lion_inbig_kb ON lion_inbig (k);
+CREATE INDEX lion_inbig_lob ON lion_inbig (lo);
+VACUUM ANALYZE lion_inbig;
+SELECT n, lion_inpick(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
+							lion_inlist(0, n - 1, 100000)))
+  FROM (VALUES (3), (10), (100), (1000)) v(n);
+SELECT n, lion_inpick(format('SELECT count(*) FROM lion_inbig WHERE lo = ANY (''%s''::int[])',
+							lion_inlist(0, n - 1, 4)))
+  FROM (VALUES (3), (10), (100), (1000)) v(n);
+
+DROP TABLE lion_in, lion_in_empty, lion_inbig, lion_inpart;
 DROP FUNCTION lion_incmp(text);
+DROP FUNCTION lion_insum(text);
+DROP FUNCTION lion_inpick(text);
 DROP FUNCTION lion_anycmp(text, text, text, text);
 DROP FUNCTION lion_inlist(int, int, int);
 DROP FUNCTION lion_inplan(text);

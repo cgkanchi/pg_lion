@@ -383,6 +383,38 @@ typedef struct LionCountScanState
 	bool		scanning2;
 
 	/*
+	 * A WHERE item that the DRIVER makes redundant, because the entries of a
+	 * scalar lion index are disjoint (DESIGN.md §15).  There are two shapes of
+	 * it and they are mutually exclusive; in both, dsources is st->sources with
+	 * that item left out and slot 0 pointed at the driver's set, and ndsource
+	 * is how many of it are in use.
+	 *
+	 *	ingroupitem	an IN list on the very column a GROUP BY drives.  The
+	 *				groups are then exactly the listed values and each one's
+	 *				rows are that value's own entry, so the node walks the
+	 *				clause's already-located posting sets instead of every entry
+	 *				of the index - a thousand sets instead of twenty thousand on
+	 *				`c20k` - and the clause is not intersected with them,
+	 *				because `entry ∩ (entry ∪ the rest of the list)` is the
+	 *				entry.  ingroupset is how far that walk has got.
+	 *	sumallitem	the `col IS NOT NULL` of a sum-over-all (DESIGN.md §14) on
+	 *				the very index that drives it.  That clause is a NEGATED
+	 *				source - the column's NULL entry, subtracted - and
+	 *				subtracting it from another entry of the same index removes
+	 *				nothing, while subtracting it from ITSELF leaves nothing.
+	 *				So the driver skips the NULL entry and drops the source,
+	 *				which takes an andnot against a dense posting set off every
+	 *				container key of every entry.
+	 *
+	 * Both are -1 when the shape does not apply.
+	 */
+	int			ingroupitem;
+	int			ingroupset;		/* next set of that item */
+	int			sumallitem;
+	LionCountSource *dsources;
+	int			ndsource;
+
+	/*
 	 * GROUP BY over a partitioned table (DESIGN.md §16): the partitions are
 	 * walked one at a time and each one's groups are emitted as PARTIAL
 	 * aggregates as they are counted, so the node's only state between rows
@@ -1182,6 +1214,40 @@ lion_containers_for(double heap_pages, double members)
 }
 
 /*
+ * What the k-way union of `nkeys` posting sets holding `members` rows between
+ * them costs, in cpu_operator_cost units (DESIGN.md §15).
+ *
+ * Two terms, because lion_ecursor_build() does two different things:
+ *
+ *	- a MIN-HEAP sift per container, log2(k) deep.  The heap holds the
+ *	  sub-cursors, not the members, so this is counted per container and not
+ *	  per row: a set of `members / nkeys` rows has that many containers at most,
+ *	  and never more than the heap has container keys;
+ *	- and the UNION of the containers standing at one key, which is a bitset
+ *	  image once there are LION_OR_BITSET_MIN of them - a fixed pass over the
+ *	  key's range, plus one bit set per member - and a pairwise fold below
+ *	  that, which touches the members once per fold.
+ *
+ * Charging `members x log2(k)` for all of it, as if every row were compared
+ * its way through the heap, asked 24750 of the 26481 cost units for `c200 IN
+ * (1000 values)` at one million rows - a query the node answers in 6.3 ms
+ * against the B-tree index-only scan's 68 - and refused it.
+ */
+static double
+lion_merge_ops(double heap_pages, double members, double nkeys)
+{
+	double		containers = nkeys * lion_containers_for(heap_pages,
+														members / nkeys);
+	double		sifts = containers * log2(nkeys);
+
+	if (nkeys >= (double) LION_OR_BITSET_MIN)
+		return sifts + lion_containers_for(heap_pages, members) *
+			LION_BITSET_WORDS + members;
+
+	return sifts + members * log2(nkeys);
+}
+
+/*
  * The cost of ONE fetch of each of `pages` distinct heap pages of a relation
  * that has `heap_pages` pages altogether, per page.
  *
@@ -1236,6 +1302,79 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 		(spc_random_page_cost - spc_seq_page_cost) * seqness;
 }
 
+static bool *lion_or_leaf_map(List *ors, int nclause);
+
+/*
+ * Does an IN list's source take the disjoint-sum short-circuit of DESIGN.md
+ * §15, and does it drive the groups?  Both questions are about the SHAPE of
+ * the query and are answered here so that the price matches what the executor
+ * will do (lion_count_sources_cached(), lion_next_group_inlist()).
+ *
+ *	*sumshort	the list is the only positive source and nothing else drives
+ *				the count, so its union MAY never be built: each entry is
+ *				counted on its own and the counts are added up.  Whether that is
+ *				also the cheaper way depends on the entries' density and is
+ *				decided by the caller, which has the estimates.
+ *	*groupdrive	the list is on the very column the GROUP BY drives, so the
+ *				listed values ARE the groups: the index's entry scan does not
+ *				happen, there are at most as many groups as listed values, and
+ *				the list is not a source (a group intersected with the union of
+ *				a disjoint list is the group).
+ *
+ * Returns the clause index of the list, or -1 when neither applies.
+ */
+static int
+lion_inlist_shape(IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
+				 List *whereidx, List *whereclauses, List *wherekinds,
+				 List *ors, bool *sumshort, bool *groupdrive)
+{
+	int			nclause = list_length(whereclauses);
+	bool	   *inor = lion_or_leaf_map(ors, nclause);
+	IndexOptInfo *arrayidx = NULL;
+	int			arrayci = -1;
+	int			npos = 0;
+	int			ci = 0;
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+
+	*sumshort = false;
+	*groupdrive = false;
+
+	forthree(lc1, whereidx, lc2, whereclauses, lc3, wherekinds)
+	{
+		if (!inor[ci] && LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
+		{
+			npos++;
+			if (IsA((Node *) lfirst(lc2), ScalarArrayOpExpr))
+			{
+				if (arrayci >= 0)
+					arrayci = -2;	/* two lists: neither is "the" one */
+				else if (arrayci == -1)
+				{
+					arrayci = ci;
+					arrayidx = (IndexOptInfo *) lfirst(lc1);
+				}
+			}
+		}
+		ci++;
+	}
+	pfree(inor);
+
+	if (arrayci < 0)
+		return -1;
+
+	if (groupidx == NULL && groupidx2 == NULL && ors == NIL && npos == 1)
+		*sumshort = true;
+	else if (groupidx != NULL && groupidx2 == NULL && arrayidx != NULL &&
+			 arrayidx->indexoid == groupidx->indexoid)
+		*groupdrive = true;
+	else
+		return -1;
+
+	return arrayci;
+}
+
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx, IndexOptInfo *groupidx2,
@@ -1250,6 +1389,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		tuples = Max(rel->tuples, 1.0);
 	double		random_pages = 0;	/* bucket page lookups */
 	double		seq_pages = 0;	/* container chains, read in order */
+	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
 	double		ncontainers = 0;
 	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
@@ -1259,9 +1399,16 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	int			ci = 0;
 	Cost		pair_cost = 0;	/* §20: the (outer, inner) group pairs */
 	Cost		run;
+	bool		sumshort;		/* §15: the IN list is summed, not merged */
+	bool		groupdrive;		/* §15: the IN list is the GROUP BY driver */
+	int			inlistci;
+	double		ingroups = numgroups;	/* groups the node really emits */
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
+
+	inlistci = lion_inlist_shape(groupidx, groupidx2, whereidx, whereclauses,
+								wherekinds, ors, &sumshort, &groupdrive);
 
 	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 
@@ -1305,6 +1452,16 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * anyway, because every element was priced as one bucket page (the
 		 * 2026-09-21 follow-up review).  A single-key clause has k = 1 and
 		 * pays nothing for a merge it does not make.
+		 *
+		 * ... unless there is no union to build.  When the list is the only
+		 * positive source, or when it drives the groups, the entries are
+		 * counted one at a time and added up (the disjoint-sum short-circuit,
+		 * DESIGN.md §15): what is left is the per-element lookup and the
+		 * per-element container work, both already priced above, and nothing
+		 * at all for a merge that does not happen.  Dropping the term is what
+		 * lets a thousand-value list on a high-cardinality column be chosen
+		 * again, which it should be: 1.5 ms against the B-tree's 4.5 at one
+		 * million rows.
 		 */
 		if (IsA(clause, ScalarArrayOpExpr))
 		{
@@ -1315,12 +1472,74 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 						1.0);
 		}
 
-		random_pages += Min(nkeys, nbuckets);
-		seq_pages += Max(nkeys, container_pages * sel);
+		if (nkeys > 1.0)
+		{
+			/*
+			 * A list's lookups are NOT a sequence of random reads.
+			 * lion_posting_set_lookup_many() hashes every value first and then
+			 * visits the bucket pages in ASCENDING BLOCK ORDER (DESIGN.md
+			 * §15), so the same argument lion_heap_page_cost() makes about a
+			 * recheck's heap pages applies to them: a set of pages that is
+			 * dense in the index, or that fits in the cache, is read at
+			 * something near seq_page_cost.  Charging a thousand-element list
+			 * five hundred RANDOM reads of a one-megabyte index is what kept
+			 * the node from being chosen for a query it answers in 2.9 ms
+			 * against the B-tree index-only scan's 3.7.
+			 *
+			 * The chain is capped at the container pages the index has: a
+			 * list cannot read more of them than exist, and an index whose
+			 * entries are all INLINE (which is what a high-cardinality column
+			 * looks like since DESIGN.md §13) has none to read at all - its
+			 * payloads are on the bucket pages already charged.
+			 */
+			double		lookups = Min(nkeys, nbuckets);
+			double		idx_pages = Max((double) idx->pages, 1.0);
+
+			lookup_cost += lookups *
+				lion_heap_page_cost(root, rel, lookups, idx_pages);
+			seq_pages += Min(Max(nkeys, container_pages * sel),
+							 container_pages);
+		}
+		else
+		{
+			random_pages += 1.0;
+			seq_pages += Max(1.0, container_pages * sel);
+		}
 		ncontainers += nkeys * lion_containers_for(heap_pages,
 												  tuples * sel / nkeys);
+
+		/*
+		 * Does the merge build this clause's union?  A list that drives the
+		 * groups is not a source at all, and a list that is the only positive
+		 * source is SUMMED instead - but only while the sum is the cheaper of
+		 * the two, which is lion_sum_is_cheaper() in the executor and the same
+		 * test from estimates here: dense entries, enough of them for the
+		 * merge's bitset image, and the merge runs after all.
+		 */
 		if (nkeys > 1.0)
-			merge_ops += tuples * sel * log2(nkeys);
+		{
+			double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+			bool		merged = true;
+
+			if (ci - 1 == inlistci)
+				merged = (!groupdrive &&
+						  nkeys >= (double) LION_OR_BITSET_MIN &&
+						  (tuples * sel / nkeys) / ckeys >
+						  (double) LION_SUM_MAX_DENSITY);
+
+			if (merged)
+				merge_ops += lion_merge_ops(heap_pages, tuples * sel, nkeys);
+		}
+
+		/*
+		 * A list that drives the groups is not a source: each group is one of
+		 * its entries, and the rest of the list has nothing to say about that
+		 * group's rows.  So it is not intersected with anything, and the
+		 * per-group work below is over the listed values rather than over
+		 * every entry of the index.
+		 */
+		if (groupdrive && ci - 1 == inlistci)
+			ingroups = Min(nkeys, ingroups);
 	}
 
 	/*
@@ -1350,7 +1569,13 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	}
 	pfree(clausesel);
 
-	if (groupidx != NULL)
+	/*
+	 * The entry scan of the driving index - unless an IN list on that very
+	 * column drives the groups instead (DESIGN.md §15), in which case its
+	 * elements' lookups and containers, charged above, ARE the per-group work
+	 * and the index's entries are never walked.
+	 */
+	if (groupidx != NULL && !groupdrive)
 	{
 		seq_pages += Max(1.0, (double) groupidx->pages);
 		ncontainers += numgroups *
@@ -1431,13 +1656,14 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	recheck_pages = Min(recheck_tids, dirty_pages);
 
 	run = random_pages * random_page_cost;
+	run += lookup_cost;
 	run += seq_pages * seq_page_cost;
 	run += ncontainers * cpu_operator_cost * 2.0;	/* block mask + VM mask */
 	run += merge_ops * cpu_operator_cost;
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											  heap_pages);
 	run += recheck_tids * cpu_tuple_cost;
-	run += numgroups * cpu_tuple_cost;
+	run += ingroups * cpu_tuple_cost;
 	run += pair_cost;
 
 	return run;
@@ -3299,6 +3525,17 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->sources[st->nitem + 1].sets = &st->groupset2;
 		st->sources[st->nitem + 1].negated = false;
 	}
+
+	/*
+	 * The alternative source list of a driver that makes one WHERE item
+	 * redundant (DESIGN.md §14 and §15; see the comment on ingroupitem).  It is
+	 * never longer than st->sources, and lion_locate_where() fills it in per
+	 * relation.
+	 */
+	st->ingroupitem = -1;
+	st->sumallitem = -1;
+	st->dsources = (LionCountSource *)
+		palloc0(sizeof(LionCountSource) * st->nsource);
 }
 
 /*
@@ -3742,6 +3979,7 @@ lion_locate_where(LionCountScanState *st)
 		src->tree = NULL;
 		src->negated = false;
 		src->nomaterialize = false;
+		src->disjoint = false;
 
 		if (st->item[k].orno >= 0)
 		{
@@ -3751,6 +3989,16 @@ lion_locate_where(LionCountScanState *st)
 
 		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
 		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
+
+		/*
+		 * An IN list is one scalar index's entries, one per distinct listed
+		 * value: disjoint by construction, so a count of their union is the
+		 * SUM of their counts and lion_count_sources() may skip the k-way
+		 * merge entirely (DESIGN.md §15).  Only a clause that is a source of
+		 * its own may say so; under an OR the source's sets are several
+		 * clauses' and overlap freely.
+		 */
+		src->disjoint = (cl->kind == LION_CLAUSE_ARRAY);
 
 		/*
 		 * A positive clause that can select nothing makes the whole count 0,
@@ -3770,6 +4018,76 @@ lion_locate_where(LionCountScanState *st)
 	}
 
 	MemoryContextSwitchTo(oldcxt);
+
+	/*
+	 * Can an IN list drive the groups instead of the index's entry scan
+	 * (DESIGN.md §15)?  Only when the clause's index IS the index that would
+	 * drive them - same relation, same column, so the entries are the same
+	 * entries - and the grouping is the plain one-column form.  A two-column
+	 * GROUP BY (§20) and a sum-over-all (§14) both walk the entries for
+	 * reasons of their own and are left alone.
+	 */
+	st->ingroupitem = -1;
+	st->ingroupset = 0;
+	if (st->hasgroupidx && st->groupattno != 0 && st->groupattno2 == 0 &&
+		!st->sumall)
+	{
+		for (k = 0; k < st->nitem; k++)
+		{
+			LionClauseState *cl;
+
+			if (st->item[k].orno >= 0)
+				continue;
+			cl = &st->clause[st->item[k].clauseno];
+			if (cl->kind != LION_CLAUSE_ARRAY ||
+				cl->attno != st->groupattno ||
+				cl->idxoid != st->groupidxoid)
+				continue;
+			st->ingroupitem = k;
+			break;
+		}
+	}
+
+	/*
+	 * And the sum-over-all's own `IS NOT NULL` (DESIGN.md §14, the sumallitem
+	 * half of the comment on the field).  The clause has to be the one on the
+	 * DRIVING index: another column's NULL entry is a different index's set
+	 * and says nothing about this one's entries.
+	 */
+	st->sumallitem = -1;
+	if (st->sumall && st->hasgroupidx)
+	{
+		for (k = 0; k < st->nitem; k++)
+		{
+			LionClauseState *cl;
+
+			if (st->item[k].orno >= 0)
+				continue;
+			cl = &st->clause[st->item[k].clauseno];
+			if (cl->kind != LION_CLAUSE_NOTNULL ||
+				cl->idxoid != st->groupidxoid)
+				continue;
+			st->sumallitem = k;
+			break;
+		}
+	}
+
+	if (st->ingroupitem >= 0 || st->sumallitem >= 0)
+	{
+		int			drop = (st->ingroupitem >= 0) ? st->ingroupitem
+			: st->sumallitem;
+		int			n = 1;		/* slot 0 is the driver's own set */
+
+		st->dsources[0] = st->sources[0];
+		for (k = 0; k < st->nitem; k++)
+		{
+			if (k == drop)
+				continue;
+			st->dsources[n++] = st->sources[k + 1];
+		}
+		st->ndsource = n;
+	}
+
 	st->located = true;
 }
 
@@ -3792,11 +4110,15 @@ lion_release_where(LionCountScanState *st)
 		src->sets = NULL;
 		src->tree = NULL;		/* it lived in wherecxt, reset below */
 		src->nomaterialize = false;
+		src->disjoint = false;
 	}
 	if (st->wherecxt != NULL)
 		MemoryContextReset(st->wherecxt);
 	st->located = false;
 	st->wheremissing = false;
+	st->ingroupitem = -1;
+	st->ingroupset = 0;
+	st->sumallitem = -1;
 }
 
 static TupleTableSlot *
@@ -3917,17 +4239,53 @@ lion_count_relation(LionCountScanState *st)
 /*
  * The sum over every entry of the driving index (DESIGN.md §14,
  * `col IS NOT NULL` with nothing else to drive the merge).
+ *
+ * The entries of one SCALAR index are DISJOINT - a row has one value in the
+ * column, so its TID is under exactly one of them - which is what makes a sum
+ * over them the count of their union at all (DESIGN.md §15 states the argument
+ * in full; §14 has always rested on it).  The same disjointness is what lets
+ * the driver's own `IS NOT NULL` be dropped instead of subtracted, which
+ * st->sumallitem says and lion_locate_where() decides: that clause is the
+ * column's NULL entry as a negated source, and
+ *
+ *	- subtracting it from ANOTHER entry of the same index removes nothing, the
+ *	  two being disjoint, and
+ *	- subtracting it from ITSELF leaves nothing, so that entry contributes 0
+ *	  and skipping it outright is the same answer.
+ *
+ * What that saves is not bookkeeping: the NULL entry of a column with many
+ * NULLs has a container at every container key, so the merge was running a
+ * lion_container_andnot() against a dense bitset at each of the entry's
+ * container keys, for every entry of the index.  A `IS NOT NULL` on another
+ * column is a different index's set and keeps its source.
+ *
+ * The caller owns the entry scan (this walks it to the end) and every posting
+ * set it takes is released before the next one is located, so the §9 pin
+ * budget is one entry's.
  */
 static int64
 lion_sumall_relation(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *sources;
 	MemoryContext oldcxt;
 	int64		total = 0;
+	int			nsource;
 	Datum		key;
 
 	if (st->wheremissing)
 		return 0;
+
+	if (st->sumallitem >= 0)
+	{
+		sources = st->dsources;
+		nsource = st->ndsource;
+	}
+	else
+	{
+		sources = st->sources;
+		nsource = st->nsource;
+	}
 
 	lion_entry_scan_begin(&st->escan, st->groupidx);
 	st->scanning = true;
@@ -3945,9 +4303,18 @@ lion_sumall_relation(LionCountScanState *st)
 			break;
 		}
 
+		/* The NULL entry's rows are the ones `IS NOT NULL` excludes. */
+		if (st->sumallitem >= 0 && st->groupset.keyisnull)
+		{
+			lion_posting_set_release(&st->groupset);
+			MemoryContextSwitchTo(oldcxt);
+			continue;
+		}
+
 		total += lion_count_sources_cached(st->heap, estate->es_snapshot,
-										  st->nsource, st->sources,
+										  nsource, sources,
 										  &st->stats, st->viscache);
+		st->stats.sets_summed++;
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -4010,6 +4377,76 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 			continue;
 
 		return lion_emit_tuple(st, key, keyisnull, (Datum) 0, true, count);
+	}
+}
+
+/*
+ * The same when an IN list on the grouping column drives the groups
+ * (DESIGN.md §15): the groups are the listed values, so the node steps through
+ * that clause's located posting sets instead of the index's entries.
+ *
+ * Each group's rows are its own entry's, intersected with whatever else the
+ * WHERE says: the IN clause itself is not intersected, because the entries of
+ * a scalar index are disjoint and `entry ∩ (entry ∪ the rest of the list)` is
+ * the entry.  With no other clause that leaves ONE source, which is the plain
+ * single-key count, and the answer for the whole query is then the same sum
+ * the ungrouped form short-circuits to - split into its terms.
+ *
+ * Pins and memory (DESIGN.md §9).  The sets belong to the clause and were
+ * located once for this relation, with their pins, by lion_locate_where(); the
+ * group loop neither takes nor releases any, and the key it emits is the copy
+ * the set already holds, which outlives the row.
+ */
+static TupleTableSlot *
+lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *src = &st->sources[st->ingroupitem + 1];
+	MemoryContext oldcxt;
+
+	*exhausted = false;
+
+	for (;;)
+	{
+		LionPostingSet *ps;
+		int64		count;
+
+		CHECK_FOR_INTERRUPTS();
+
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+
+		if (st->ingroupset >= src->nsets)
+		{
+			*exhausted = true;
+			return NULL;
+		}
+		ps = &src->sets[st->ingroupset++];
+		if (!ps->found)
+			continue;			/* a listed value with no entry: no group */
+
+		Assert(ps->hasstoredkey && !ps->keyisnull);
+
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		st->dsources[0].nsets = 1;
+		st->dsources[0].sets = ps;
+		st->dsources[0].tree = NULL;
+		st->dsources[0].negated = false;
+		st->dsources[0].nomaterialize = false;
+		st->dsources[0].disjoint = false;
+
+		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
+										 st->ndsource, st->dsources,
+										 &st->stats, st->viscache);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* A group exists only if at least one of its rows is visible. */
+		if (count == 0)
+			continue;
+
+		return lion_emit_tuple(st, ps->storedkey, false, (Datum) 0, true,
+							  count);
 	}
 }
 
@@ -4139,6 +4576,8 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 {
 	if (st->groupattno2 != 0)
 		return lion_next_group2(st, exhausted);
+	if (st->ingroupitem >= 0)
+		return lion_next_group_inlist(st, exhausted);
 	return lion_next_group(st, exhausted);
 }
 
@@ -4269,8 +4708,6 @@ static TupleTableSlot *
 lion_exec_custom_scan(CustomScanState *node)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
-	EState	   *estate = node->ss.ps.state;
-	MemoryContext oldcxt;
 	int64		count;
 
 	if (st->done)
@@ -4319,40 +4756,25 @@ lion_exec_custom_scan(CustomScanState *node)
 		return NULL;
 	}
 
-	if (!st->scanning)
-	{
-		lion_entry_scan_begin(&st->escan, st->groupidx);
-		st->scanning = true;
-	}
-
 	/* ---- every entry of the index, summed into one row ---- */
 	if (st->sumall)
 	{
-		int64		total = 0;
-		Datum		key;
-
-		for (;;)
-		{
-			CHECK_FOR_INTERRUPTS();
-
-			MemoryContextReset(st->pergroup);
-			oldcxt = MemoryContextSwitchTo(st->pergroup);
-
-			if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
-			{
-				MemoryContextSwitchTo(oldcxt);
-				break;
-			}
-
-			total += lion_count_sources_cached(st->heap, estate->es_snapshot,
-											  st->nsource, st->sources,
-											  &st->stats, st->viscache);
-			lion_posting_set_release(&st->groupset);
-			MemoryContextSwitchTo(oldcxt);
-		}
+		int64		total = lion_sumall_relation(st);
 
 		st->done = true;
 		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
+	}
+
+	/*
+	 * An IN list on the grouping column drives the groups itself (DESIGN.md
+	 * §15) and never looks at the index's entries, so there is no entry scan to
+	 * begin.  (The partitioned path opens one per partition either way; a scan
+	 * that is only begun holds nothing, so it costs the flag it sets.)
+	 */
+	if (!st->scanning && st->ingroupitem < 0)
+	{
+		lion_entry_scan_begin(&st->escan, st->groupidx);
+		st->scanning = true;
 	}
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
@@ -4696,5 +5118,13 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 							   st->stats.cache_hits, es);
 		ExplainPropertyInteger("Heap Blocks Past Cache Budget", NULL,
 							   st->stats.cache_full, es);
+		/*
+		 * Posting sets counted on their own and added up instead of merged:
+		 * the disjoint-sum short-circuit of DESIGN.md §15.  Zero means every
+		 * container key went through the k-way union, which is what an IN list
+		 * ANDed with another clause, and every multi-key clause, still do.
+		 */
+		ExplainPropertyInteger("Posting Sets Summed", NULL,
+							   st->stats.sets_summed, es);
 	}
 }

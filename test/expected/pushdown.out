@@ -957,18 +957,21 @@ SELECT lion_pd_counters('SELECT k, count(*) FROM lion_pdg GROUP BY k');
  Heap Blocks Past Cache Budget = 0
 (6 rows)
 
--- ---- an IN list long enough to belong to a B-tree ----------------------
+-- ---- a long IN list, priced per element ---------------------------------
 /*
- * Every element of an IN list is a bucket lookup, a container chain of its
- * own and one more sub-cursor in the union the merge evaluates, and the
- * estimate has to say so: a B-tree descends once per element and then reads
- * its leaves in order, which is less work per element by a factor that grows
- * with the list.  Measured on this table, three values take 0.021 ms through
- * the node against the B-tree index-only scan's 0.063 ms, and a thousand
- * values 14.1 ms against 13.9 ms - and at one million rows of the benchmark's
- * wider table a thousand values took 15.4 ms against 3.1 ms and were pushed
- * down anyway, because each element was priced as a single bucket page (the
- * 2026-09-21 follow-up review).
+ * Every element of an IN list is a bucket lookup and a container chain of its
+ * own, and the estimate has to say so: charging a list as one bucket page made
+ * a thousand-element list look four times cheaper than it is (the 2026-09-21
+ * follow-up review).  What it is NOT charged for any more is a k-way union per
+ * element, because since the disjoint-sum short-circuit of DESIGN.md §15 there
+ * may be no union at all - and when there is one, it costs a heap sift per
+ * CONTAINER and a bitset image per container key, not log2(k) comparisons per
+ * row.
+ *
+ * So all three lengths belong to the node here, and the thousand-value case is
+ * the one that says the merge term is no longer wild: 4.3 ms against the
+ * B-tree index-only scan's 13.4 on this table (2026-09-21, assert build), where
+ * the old estimate refused it.
  */
 CREATE TABLE lion_pdi (id int NOT NULL, k int NOT NULL);
 INSERT INTO lion_pdi SELECT i, i % 1000 FROM generate_series(1, 200000) i;
@@ -997,9 +1000,9 @@ SELECT lion_pd_in(10);
 (1 row)
 
 SELECT lion_pd_in(1000);
-       lion_pd_in        
--------------------------
- not pushed down, 1 rows
+     lion_pd_in      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 DROP FUNCTION lion_pd_in(int);

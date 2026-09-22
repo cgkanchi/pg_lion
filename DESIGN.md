@@ -1053,8 +1053,13 @@ as, both to keep the buffer-pin budget of §9 bounded:
   Any number of `IS NOT NULL` clauses cost one extra cursor each, and no inclusion-exclusion.
 - `col IS NOT NULL` with no other clause and no GROUP BY has nothing to drive the merge, so the
   node instead iterates every entry of that column's index and sums the counts (the entries of one
-  index are disjoint - a row has one value per column - so the sum is the count of their union),
-  with the null entry subtracted as above. EXPLAIN shows this driver as `idx (all keys)`.
+  index are disjoint - a row has one value per column - so the sum is the count of their union;
+  §15 states the argument in full). The same disjointness means the clause's own negated source has
+  nothing to subtract from any OTHER entry of that index, and nothing to leave of the null entry
+  itself, so the driver skips the null entry and drops the source rather than subtracting it at
+  every container key of every entry (§15, `st->sumallitem`: 36.9 ms to 13.0 on a 1M-row nullable
+  column). A `IS NOT NULL` on a different column keeps its source. EXPLAIN shows this driver as
+  `idx (all keys)`, and `EXPLAIN ANALYZE` counts the entries in `Posting Sets Summed`.
 - GROUP BY on a nullable column no longer bails: the NULL group is the null entry's count, emitted
   with a NULL datum.
 - count(col) is answered when col is declared NOT NULL, or is the group column (count(*) for a real
@@ -1069,11 +1074,112 @@ filtered there - set semantics make them harmless, they only cost a second looku
 
 Count pushdown: accept `ScalarArrayOpExpr` with useOr = true whose operator is strategy 1 of the
 index opfamily and whose array is a non-NULL Const of at most LION_MAX_ARRAY_ELEMS = 1000 elements;
-the clause's posting set is the UNION of the elements' sets. Values are deduped (bytewise, which is
-allowed to miss equal-but-not-identical values: a union does not double-count, so a missed duplicate
-only costs work). An empty array, an all-NULL one, or a list none of whose values has an entry means
+the clause's posting set is the UNION of the elements' sets. Values are deduped, and since the
+disjoint-sum short-circuit below they are deduped **by entry** and not merely bytewise (see there).
+An empty array, an all-NULL one, or a list none of whose values has an entry means
 zero rows. Longer lists are left to the ordinary plan, because every listed value needs a posting
 set of its own and each may hold a buffer pin for as long as the node runs.
+
+### The disjoint-sum short-circuit
+
+The count of a union is not in general the sum of the counts, but for the posting sets of DIFFERENT
+entries of one SCALAR index it is. A scalar opclass extracts exactly one key from a row's column
+value, so the build and the insert path put that row's TID under exactly one entry - the entry of
+its value, or the reserved NULL entry of §14 - and no TID is therefore in two entries. §14 already
+rests on precisely this: `col IS NOT NULL` with nothing else to drive the merge is answered by
+summing the counts of every entry of that column's index, and that is only the count of their union
+because the entries are disjoint. The short-circuit is the same argument applied to the entries an
+IN list names instead of to all of them.
+
+`lion_count_sources_cached()` therefore counts each entry's posting set on its own -
+`lion_count_one_set()`, one pass of the ordinary single-key machinery per entry, sharing the
+visibility-map pin, the recheck batch and the visibility cache - and adds the results up, whenever
+
+- the IN list is the ONLY positive source (`count(*) WHERE k IN (...)`, the common shape), and
+- there is no GROUP BY driver, and
+- every set belongs to one index and that index is not multi-key, and
+- the sum is the CHEAPER of the two, which is a question about the data rather than about
+  correctness and is answered separately below.
+
+**§9 is unchanged and needs no new argument**: the sets are counted one at a time, so at every
+container key exactly one leaf cursor is live, it pins the page its container came from, the
+visibility map is consulted (`lion_count_container_vm()`) and only then is the cursor advanced.
+Nothing is materialised - each set is read once - so the interlock is carried by construction.
+
+Two conditions on the input, both enforced rather than assumed:
+
+- **Multi-key opclasses never take it** (§17). One row yields many keys there, so it is under
+  several entries and the sum over them is not a row count - the same reason §17 refuses such an
+  index as a GROUP BY or sum-over-all driver. `lion_sources_disjoint_sum()` asks the index
+  (`LionState.multikey`) rather than trusting the caller.
+- **No two sets may be the SAME entry.** The bytewise dedupe in `lion_posting_set_lookup_many()` is
+  not enough: an opclass whose equality is not byte equality - `citext` - has distinct values that
+  hash alike and reach one entry, and summing it twice would count its rows twice. Every located
+  entry is therefore also compared, by the (page, offset) its entry tuple lives at, with the entries
+  the same hash run has already found; `LionPostingSet` carries that pair. The caller states the
+  result in `LionCountSource.disjoint`, which only a caller that used that function may set - an IN
+  list under an OR (§19) shares one set array with the other leaves and does not.
+
+#### ... and when it is FASTER
+
+Whether the sum is the right answer and whether it is the cheap one are different questions, and
+`lion_sum_is_cheaper()` answers the second. Both paths read every container of every set exactly
+once and count the same members; what they do not share is where the per-container overheads land.
+The SUM asks the visibility map once per (set, container key), because each set is counted on its
+own. The MERGE asks it once per container key, for the union, and pays instead a heap sift and a
+union step per container. So the sum wins exactly when there is nothing to amortize, and two things
+say there is - either one sends the count back to the merge:
+
+- **DENSE sets.** If an entry has many rows at the SAME container key, the merge folds all the sets'
+  members at that key into one container and asks the visibility map about it once. Measured at 1M
+  rows (15385 heap pages, so 241 container keys), `k IN (1000 values)` with the sum against the same
+  binary forced to merge: 20000 distinct keys (1.0 rows per key per container key) 3.6 ms against
+  9.9, 5000 keys (1.0) 11.5 against 21.5, 2000 keys (2.1) 25.1 against 32.2, 500 keys (8.3) 21.2
+  against 9.0, 200 keys (20.7) 14.0 against 6.5. The crossover is between two and eight rows per
+  container key, so `LION_SUM_MAX_DENSITY` is four.
+- **MANY of them**, because the merge only becomes good at dense sets once it reaches its bitset
+  image (`LION_OR_BITSET_MIN` containers at one key); below that it folds them pairwise, which is
+  quadratic in the sets. On the 200-key column above, sum against merge at 5 values is 0.49 ms
+  against 0.64, at 15 values 1.14 against 2.37, at 30 values 2.15 against 7.6 - and at 50, where the
+  image takes over, 3.5 against 2.5.
+
+The density is read off the entries' own row counts, which the located posting sets carry already
+(`ntids`), against the number of container keys the heap has; no extra page is read to decide it.
+`lion_cost_count_rel()` makes the same test from the planner's estimates, which is why both
+thresholds live in `lion_count.h` rather than in `lion_count.c`.
+
+#### The GROUP BY driver
+
+A GROUP BY on the very column the list constrains takes the short-circuit too, in a different shape:
+the listed values ARE the groups, so the node walks the clause's located sets instead of the index's
+entries (`lion_next_group_inlist()`) - a thousand sets instead of twenty thousand entries on `c20k`
+- and the clause stops being a source of the merge, because a group intersected with the union of a
+disjoint list is the group. Any other clause is still intersected with each group, so this is the
+group DRIVER half and applies whether or not the sum half does; it is not subject to the density
+test above, because a GROUP BY counts each group on its own whatever happens. It is the difference
+between a plan and no plan: `SELECT c20k, count(*) ... WHERE c20k IN (1000 values) GROUP BY c20k`
+took **about three minutes** when forced before this (182 and 189 s over two runs) - intersecting
+all twenty thousand entries with the thousand-way union, which is why the cost model rightly refused
+it - and takes 4.6 ms now against the B-tree's 5.1, which it is chosen over.
+
+`EXPLAIN ANALYZE` reports `Posting Sets Summed`: how many posting sets had their counts added into a
+total instead of being merged - the entries of a summed IN list, or the entries of a sum-over-all
+(§14). Zero means the k-way union below ran, which is what an IN list ANDed with another clause, an
+IN list under an OR, a list the density test declined, and every multi-key clause still do. A GROUP
+BY reports zero as well: its groups are emitted, not summed.
+
+#### §14's sum-over-all is the same argument
+
+`col IS NOT NULL` with nothing else (§14) sums the counts of every entry of that column's index, and
+the reason it may is the one above. The same disjointness also says that the clause's own NEGATED
+source - the column's NULL entry, subtracted - has nothing to do: subtracting it from another entry
+of the same index removes nothing, and subtracting it from itself leaves nothing, so the driver
+skips the NULL entry and drops the source (`st->sumallitem`). That is not bookkeeping: the NULL
+entry of a column with many NULLs has a container at every container key, so the merge was running
+a `lion_container_andnot()` against a dense bitset at every container key of every entry. A
+`IS NOT NULL` on a DIFFERENT column is a different index's set and keeps its source. Measured, 1M
+rows, `nullable` (200 values plus 10% NULL): 36.9 ms before, 13.0 ms now, against the sequential
+aggregate's 69.1.
 
 The array may also be a Param, or an `ArrayExpr` over literals and Params, which is what `k IN
 ($1, $2)` and `k = ANY ($1)` keep in a generic plan (§10). The length cap then applies only when the
@@ -1093,47 +1199,85 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   their current container key. The ones standing at the root's key come off the heap into a "hot"
   list and go back on as they are advanced, so the per-container-key cost is proportional to the
   sub-cursors that take part rather than to k. The heap entry carries a COPY of the child's
-  container key: reading it out of the child while sifting chases a thousand ~300-byte cursors in a
-  random access pattern, which measured *slower* than the linear scan it replaced (+4 ms on a
-  1000-value list at 1M rows).
+  container key and of its container: reading them out of the child while sifting chases a thousand
+  ~300-byte cursors in a random access pattern, which measured *slower* than the linear scan it
+  replaced (+4 ms on a 1000-value list at 1M rows). Both fields change only when the child is
+  advanced, which is also when it is pushed back on, so the copy cannot be stale.
 - **The union itself**: folding m containers pairwise builds and re-optimizes m-1 intermediate
-  containers, which is quadratic in the members. Above `LION_OR_BITSET_MIN` (32, measured) of them at
-  one container key, they are ORed into one bitset image of the key's range instead and the result
-  container is built from it once. Below that the pairwise fold is cheaper, because the image costs
-  a fixed pass over the whole 32768-value range however few members arrive.
+  containers, which is quadratic in them. Above `LION_OR_BITSET_MIN` (32) of them at one container
+  key, they are ORed into one bitset image of the key's range instead and the result container is
+  built from it once. Below that the pairwise fold is cheaper, because the image costs a fixed pass
+  over the whole 32768-value range however few members arrive. The threshold is worth a lot in both
+  directions: raising it past any list length, so that the fold runs everywhere, took `c20k IN (1000
+  values) AND c2 = 1` from 11.1 ms to 21.0 and `c200 IN (1000 values) AND c2 = 1` from 7.6 to
+  **263**.
+  A third construction was tried and **rejected**, and it is recorded because the shape that
+  suggests it is the common one: a union over sparse segments (§13) arrives at every container key
+  as a hundred or two throw-away one-member ARRAYs, for which the image's 4 KiB memset and 512-word
+  pass look absurd. Gathering those members into one buffer, sorting and writing them out as an
+  ARRAY cannot win more than the image's FIXED cost, and that cost is per CONTAINER KEY - the heap
+  has only `heap_pages / LION_BLOCKS_PER_CONTAINER` of them, 241 at a million rows, and that count
+  grows with the heap exactly as the member count does, so the ratio never improves. It is under a
+  millisecond of that eleven-millisecond query. What the query spends its time on is the per-CHILD
+  work: 45006 sub-cursor advances and their heap sifts.
 - **Locating the entries**: `lion_posting_set_lookup_many()` hashes every value first and then looks
   the entries up in (bucket, hash) order, so the bucket pages are read in ascending block order and
   duplicates - which hash equally and are therefore adjacent in that order - are dropped in one pass
   instead of by comparing every value with every earlier one (half a million `datumIsEqual()` calls
   at 1000 values). `lion_index_count_any(idx, keys)` is the SQL form of the whole path.
 
-Measured at 1M rows, all-visible heap, assert build: `count(*) WHERE c20k IN (...)` through this
-path against the same query on a btree (20000 distinct values, 50 rows each) - 3 values 0.13 vs
-0.08 ms, 10 values 0.26 vs 0.11 ms, 100 values 1.80 vs 0.51 ms, 1000 values 14.7 vs 4.4 ms. The
-1000-value case was 24.7 ms with the pairwise fold and the linear scan over all sub-cursors; the
-shorter lists are unchanged, which is the point of the two thresholds.
+**Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one
+bucket page each - but read in ascending block order, so at `lion_heap_page_cost()`'s interpolated
+page cost rather than at random_page_cost, and shared once the list is longer than the index has
+buckets (`Min(nelems, nbuckets)`); one chain page each at seq_page_cost, capped at the container
+pages the index actually has; one container step per element per container key; and, when the merge
+runs at all, `lion_merge_ops()`. Three things were wrong here and all three refused a query the node
+answers several times faster:
 
-**Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one bucket
-page each at random_page_cost, shared once the list is longer than the index has buckets
-(`Min(nelems, nbuckets)`); one chain page each at seq_page_cost, or the clause's share of the
-container pages if that is larger; one container step per element per container key; and
-`members × log2(nelems)` at cpu_operator_cost for the k-way merge above. Charging a list as a single
-bucket page made a thousand-element list look four times cheaper than it is and the planner chose it
-anyway: at 1M rows 15.4 ms against the B-tree index-only scan's 3.1 ms, and at 5M rows 67 against 16
-(the 2026-09-21 follow-up review). With the per-element model, and after the k-way merge above, the
-crossover falls where the measurements do for a list over MANY distinct keys - 5M rows, `c20k`, one
-prepared statement per length: 3 values 0.098 ms against the B-tree's 0.066, 10 values 0.49 against
-0.18, 100 values 3.18 against 1.77 (refused), 1000 values 32.3 against 17.4 (refused) - and it keeps
-the node for a list over FEW distinct keys, where it wins by a lot and the B-tree has to read an
-index tuple per row: `c200` with 3 values 1.58 ms against 5.47, 10 values 6.8 against 17.1, 100
-values 20.8 against 173.9, and `c2 IN (0, 1)` 14.4 ms against 364.9. The two shortest high-
-cardinality lists are the model's remaining mispredictions, by 0.03 and 0.31 ms; `test/sql/
-pushdown.sql` pins the choice at 3, 10 and 1000 values on a table of its own.
+- charging a list as a SINGLE bucket page made a thousand-element list look four times cheaper than
+  it is, and the planner chose it anyway (the 2026-09-21 follow-up review);
+- charging every element a RANDOM read of a one-megabyte index then refused it;
+- and charging the merge `members × log2(nelems)`, as if every row were compared its way through the
+  heap, asked 24750 of the 26481 cost units for `c200 IN (1000 values)` at 1M rows - a query the
+  node answers in 6.3 ms against the B-tree index-only scan's 66 - and refused that.
+  `lion_merge_ops()` charges what `lion_ecursor_build()` does instead: a heap sift per CONTAINER,
+  log2(k) deep, plus the union of the containers at one key, which is a bitset image per container
+  key above `LION_OR_BITSET_MIN` and the members once per fold below it. And when the disjoint sum
+  applies there is no merge term at all.
 
-A GROUP BY over the same column restricts the groups to the listed values (the group's set is
-intersected with the union, and a group outside the list counts 0 and is not emitted).
-`col = ANY (...)` with useOr = false (`= ALL`) is not pushed down. EXPLAIN prints the list as
-`idx (col = ANY ({1,2,3}))`.
+Measured at 1M rows, all-visible heap, warm cache, assert build, `pgbench -M prepared`: the node
+with the other scan types disabled, against the same query with
+`pg_lion.enable_count_pushdown = off`, which picks a B-tree index-only scan. Unless a row says
+otherwise, the planner picks the node on cost with nothing disabled.
+
+| query | lion | B-tree | before (§15 as of 081e067) |
+|---|---|---|---|
+| `c20k IN (3)` | 0.15 ms | 0.16 | 0.17 |
+| `c20k IN (10)` | 0.18 | 0.19 | 0.24 |
+| `c20k IN (100)` | 0.50 | 0.50 | 1.49 |
+| `c20k IN (1000)` | 3.76 | 3.52 | 10.99 |
+| `c20k IN (1000) AND c2 = 1` | 11.14 | 18.77 | 11.50 |
+| `c20k IN (1000) GROUP BY c20k` | 4.63 | 5.07 | ~185000 (refused) |
+| `t20k IN (1000 texts)` | 3.70 | 18.16 | 10.47 |
+| `c200 IN (3)` | 0.34 | 1.13 | 0.43 |
+| `c200 IN (10)` | 0.83 | 3.45 | 1.40 |
+| `c200 IN (100)` | 3.07 | 34.26 | 3.11 |
+| `c200 IN (1000)` | 6.27 | 65.98 | 6.64 (refused) |
+| `c2 IN (0, 1)` | 0.89 | 64.73 | 2.57 |
+| `nullable IS NOT NULL` | 13.04 | 69.06 | 36.69 |
+
+The two remaining mispredictions are ties the planner resolves the wrong way by a hair: `c20k IN
+(1000)` at 1.07x of the B-tree and `c20k IN (3) AND c2 = 1` at 1.11x. `test/sql/pushdown.sql` pins
+the choice at 3, 10 and 1000 values on a table of its own, and `test/sql/inlist.sql` at 3, 10, 100
+and 1000 on a high- and a low-cardinality column.
+
+Absolute numbers from this build are worth less than the ratios: it is an -O1 assert build, and one
+intermediate binary of identical source measured `c20k IN (1000)` at 2.75 ms where every clean
+rebuild of it measures 3.8-4.0. Every comparison above is between two runs of the SAME binary.
+
+A GROUP BY over the same column restricts the groups to the listed values (a group outside the list
+counts 0 and is not emitted). `col = ANY (...)` with useOr = false (`= ALL`) is not pushed down.
+EXPLAIN prints the list as `idx (col = ANY ({1,2,3}))`.
 
 ## 16. Partitioned tables (v1, implemented)
 
@@ -1968,3 +2112,121 @@ ordinary plan (as a multiset both ways round) with and without a WHERE clause, w
 column, with `count(col)` of either, under an OR restriction, on a dirty heap and a clean one, on a
 partitioned table, and pins the plan choice for 20 × 2, 200 × 2, 200 × 20, 20000 × 200 and
 20000 × 2 with nothing disabled.
+
+## 21. Sorted key directory (format version 4)
+
+Replaces the hash-bucket entry directory of §4 with a B-tree of entries keyed by the index key.
+
+Why. The hash directory has three measured costs: an index created empty keeps its 64 buckets
+forever (100k unique keys: 0.104 ms vs 0.321 ms per 100-key IN after growth), a large IN list is one
+random bucket page per value (1000 lookups ≈ 1.3 ms), and entry iteration (GROUP BY, IS NOT NULL,
+verify) is in hash order, so ordered output and range-bounded entry walks are impossible. A B-tree
+directory grows by splitting, makes a sorted IN list a near-sequential leaf walk, and gives GROUP BY
+output in key order (a Sort above the node disappears when the query's ORDER BY is the group key).
+
+Structure. Meta page (block 0) points at a root. Directory pages carry LION_PAGE_DIR (internal) or
+LION_PAGE_BUCKET (leaf; the flag name is kept so verify/stats/page-inspection tools keep working) in
+the special area, plus `level` and left/right sibling links. Leaf pages hold LionEntryTuple items,
+exactly as bucket pages do today, sorted by (key, hash) under the opclass ordering; internal pages
+hold downlink tuples (separator key + child block), also LionEntryTuple-shaped with a new flag
+LION_ENTRY_DOWNLINK so that the key helpers apply unchanged. Reserved NULL and EMPTY entries sort
+first (before every value; NULL before EMPTY) via a 1-byte kind prefix in the comparison, not in the
+stored key. Multi-key classes: the key type is the STORAGE type (§17), which is what is compared.
+
+Ordering. Every default opclass gains an ordering source: support proc 4 = a btree comparison
+function for the key type (the type's default btree opfamily proc 1, resolved at CREATE OPERATOR
+CLASS in the SQL script; for citext `citext_cmp`; for anyenum `enum_cmp`). Keys whose type has no
+btree opclass fall back to (hash, then bytewise memcmp of the stored datum), which is a total order
+that is merely not semantically meaningful; `lion_index_stats()` reports `ordered = false` for such
+an index and GROUP BY output is not sorted for it. `amcanorder` stays false (no ordered heap scans:
+the AM still emits bitmaps); only the planner's knowledge that a LionCount GROUP BY output is sorted
+by the group key is added (pathkeys on the CustomPath for ordered opclasses).
+
+Operations.
+- Lookup: descend from the root with binary search per page (SHARE locks, lock coupling parent→child
+  as nbtree does, no pins kept above the leaf). The leaf page pin remains the §9 pin for INLINE sets.
+- Insert of a new entry: descend with the leaf EXCLUSIVE; on no room, split the leaf (right half to a
+  new page, high key to parent, nbtree's "split then insert downlink" ordering with the incomplete
+  split bit so a crash between the two records is repaired on the next descent), recursing upward;
+  root split creates a new root. Splits move items right only; a page's minimum key never decreases.
+  Concurrent readers use right-links: a reader that holds a leaf whose high key is below its search
+  key moves right (nbtree's move-right rule), which is what makes a leaf-pin reader safe across a
+  concurrent split.
+- Entry rewrite in place (payload growth/shrink, spill): as today, on the leaf, EXCLUSIVE; if the
+  grown entry no longer fits, split.
+- Delete (VACUUM, §18): entries are deleted with PageIndexTupleDeleteNoCompact as today (offsets
+  stable for readers parked on the page); an empty leaf is NOT unlinked in this version (leaf
+  deletion needs nbtree's half-dead protocol; documented limitation, pages are few).
+- Ordered iteration: leftmost leaf, then right-links (SHARE lock one page at a time, pin held while
+  an INLINE set from that page is being counted, exactly as the bucket walk does today).
+- Bulk build: entries are produced in sorted order by the tuplesort (sort key becomes (kind, key)
+  using the ordering proc, hash as tiebreaker), leaves are filled left to right at a fill factor,
+  and the internal levels are built bottom-up in the same pass (nbtree's _bt_buildadd shape) through
+  the bulk-write API.
+
+IN lists and sums: `lion_posting_set_lookup_many()` sorts the values with the ordering proc and
+locates them in one left-to-right leaf walk (re-descend only when the next value is beyond the
+current leaf's high key). Disjoint-sum counting (§15) is unchanged.
+
+What goes away: `nbuckets`, `buckets` reloption (accepted and ignored with a NOTICE for one release),
+`lion_bucket_of`, bucket sizing in ambuild, the bucket-chain warning; `max_bucket_pages` in stats
+becomes `directory_height` and `leaf_pages`.
+
+Locking summary: directory pages: nbtree rules (lock coupling downward, move-right on the leaf,
+splits hold left then right then parent). Container chains: unchanged (§5, §11, §18). Lock order
+directory page → container pages is preserved; VACUUM's two-pass protocol addresses the leaf page
+holding the entry where it used the bucket head.
+
+Format: LION_VERSION 4; version 3 indexes are refused with the REINDEX hint. verify() checks the
+tree: keys sorted within and across leaves, high keys consistent with children, every leaf
+reachable from the root exactly once, sibling links consistent, level numbers, downlink targets.
+
+## 22. Per-key posting tree (format version 4, same wave)
+
+Replaces the linked chain of container pages per CHAIN entry (§4) with a B-tree over container keys
+(ckey), GIN's posting-tree shape.
+
+Why. A chain can only be walked. Every intersection therefore streams the dense sets in full: the
+3-column AND at 5M rows visits 570 containers for a 590-row answer, and dirty-heap grouping
+re-walks chains per group. With a tree, the AND is driven by the most selective set: for each of
+its containers, the other sets are probed by ckey (descend, or step right from the last position).
+Cost tracks the selective side. Inserts into the middle of a chain stop being a linear walk from the
+head (the churn tests' mid-chain inserts).
+
+Structure. The entry's `head` becomes the posting-tree root (a container page when the tree is one
+page: no separate root format, exactly as GIN). Container pages keep their layout (items sorted by
+first ckey, minckey/maxckey, owner stamps, DELETED marking) and gain `level` in the special area
+(24 → 28 bytes, rounded to 32 by MAXALIGN; adjust LION_SPECIAL_SIZE); internal posting pages hold
+(ckey, child block) pairs. Right-links stay, so the sequential walk used by scans, counts and VACUUM
+is unchanged: leaves are still a rightlinked list in ckey order.
+
+Operations.
+- Descent by ckey (SHARE, lock coupling) to the leaf owning the range; `lion_chain_find_page()`
+  becomes a descent instead of a head-to-tail walk; the tail hint stays for appends.
+- Leaf split: as today (upper half or insert-position split to a new page linked right), plus a
+  downlink insert into the parent with the incomplete-split repair rule; root split allocates a new
+  root and the entry's `head` is updated in the same record (entry page, old root, new root, new
+  sibling = 4 buffers, the GenericXLog maximum: keep the split's page count at that bound or split
+  the record into "split leaf + mark incomplete" and "insert downlink + clear", nbtree-style).
+- VACUUM: leaves are visited in ckey order via right-links as today (cleanup lock on every leaf, §11);
+  internal pages are cleanup-locked too when traversed; a freed chain frees its internal pages as
+  well; internal pages are never deleted while the tree lives (documented limitation).
+- Cursors (`LionSetCursor`) gain `seek(ckey)`: descend from the root (or step right while the current
+  leaf's maxckey < ckey) and position at the first item with first-ckey ≥ ckey. The AND merge uses it:
+  advance the smallest-cardinality cursor sequentially and seek the others. Union and single-set
+  counting keep the sequential walk. The §9 pin discipline is unchanged: a leaf stays pinned until
+  the container taken from it has passed the visibility-map check; a seek releases the previous
+  leaf's pin only after that point (the cursor already has this ordering; seek must use the same
+  release point).
+- Owner validation (§18) applies to internal pages as well.
+
+Cost model: an AND source's containers term becomes the selective source's container count times
+the number of sources (probes), instead of the sum of all sources' containers.
+
+Format: covered by LION_VERSION 4 with §21. verify(): tree shape per key (levels, downlinks, leaf
+right-link chain equals the in-order leaf sequence, minckey/maxckey consistent with separators).
+
+Order of work. §21 first (it changes where entries live; the posting tree hangs off the entry and
+is independent of the directory shape), §22 second, one format bump. The recovery harness must cover
+directory splits and posting-tree splits under crash (an injection point between "split page" and
+"insert downlink", crash, restart, verify() shows the incomplete-split repair).
