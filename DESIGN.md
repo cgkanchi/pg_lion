@@ -2902,3 +2902,48 @@ does anything the section changed except write and walk one more page per multi-
   bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
   recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
   ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
+
+## 24. Multicolumn indexes: independent per-column key sets in one relation
+
+`CREATE INDEX ON t USING lion (a, b, c)` builds one relation whose directory holds, for each
+column, that column's keys as independent posting sets. It is order-insensitive by construction: a
+query on any subset of the columns intersects the matching columns' posting sets, exactly as separate
+single-column indexes would, and it is GIN's multicolumn model (`amcanmulticol = true`). A composite
+tuple key is deliberately NOT offered: a query with one fixed shape is btree's job.
+
+Why one relation rather than n indexes: one build pass over the heap instead of n (n tuplesort
+inputs from one scan), one VACUUM pass, one relcache entry and one planner IndexOptInfo, and a natural
+home for the count pushdown to find every column's posting sets without matching n indexes.
+
+Directory. The directory key becomes (column number, key): the tuplesort's sort key is
+(attno, kind, key, hash, ...) and the directory comparator compares attno first. Every entry tuple
+carries its attno (a new `uint16 attno` in the header; the header is 32 bytes today with 4 unused
+padding bytes at offset 20: use them, no size change). Reserved NULL and EMPTY entries exist per
+column. Each column has its own opclass (as today, per key column), so LionState becomes per-column:
+key type, hash, equality, comparison, collation, multi-key extraction, `ordered`. Multi-key columns
+(arrays, tsvector) are allowed alongside scalars.
+
+Lookup: (attno, key) descent. Entry scan for a GROUP BY: from the first entry of that attno to the
+first entry of attno+1 (a bounded leaf walk, still sorted for an ordered opclass). IN lists: per
+column. Build: one heap scan feeding one tuplesort of (attno, kind, key, hash, code) rows, n
+extracted keys per heap row (one per scalar column plus the multi-key extraction for multi-key
+columns); the sorted stream produces the directory in order, so the bulk build is unchanged apart
+from the leading attno. Insert: one aminsert call produces n key inserts (each its own posting-set
+update under the entry's directory leaf, as today); VACUUM is unchanged (chains are per entry).
+Stats: per-column `entries`, `ntids`, `null_tids`, `empty_tids`.
+
+Scans (amgetbitmap): the scan keys arrive with `sk_attno`; each key resolves to its column's posting
+set; several keys are ANDed through the expression evaluator (as multi-key queries already are).
+Count pushdown: `lion_find_roaring_index()` returns the index and the attno for a column; the WHERE
+clause / GROUP BY / IN / OR / multi-key rules are per (index, attno); a query constraining a, b and
+c of one multicolumn index becomes three posting-set sources from one index (the same as three
+indexes today, but located through one relcache entry). The cost model treats each column's set as
+it treats a single-column index of that column (its own container and page terms).
+
+Not in scope: INCLUDE columns, expression columns, per-column reloptions. `amcanmulticol` limits:
+32 columns (INDEX_MAX_KEYS); a NULL in one column does not affect the other columns' entries.
+
+Format: entry header field reuse only; LION_VERSION stays 5 if a single-column version-5 index is
+bit-identical (attno = 1 written where the padding was zero: a version-5 index has zeros there, so
+treat attno 0 as 1 when reading, or bump to 6 and refuse — bump, the REINDEX hint is cheap and
+mixed semantics are not).
