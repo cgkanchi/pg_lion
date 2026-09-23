@@ -1,0 +1,466 @@
+-- count(DISTINCT k) in the LionCount pushdown (DESIGN.md §26).
+--
+-- Two shapes: `count(DISTINCT k)` over the WHERE (one existence test per
+-- entry of k's index) and `g, count(DISTINCT k) ... GROUP BY g` (the §20
+-- nested loop over (g, k) with an existence test per pair).  Every answer is
+-- checked against a SEQUENTIAL SCAN with the pushdown off, as a multiset in
+-- both directions, so a wrong answer fails even if it happens to be stable.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+-- the plan-choice pins below must not depend on ANALYZE's sample
+SET default_statistics_target = 1000;
+
+/*
+ * lion_dc() runs a query through the pushdown - with every other scan
+ * disabled when force is set, so that a shape the cost model would not pick
+ * is still EXERCISED - and again as a plain sequential scan with the pushdown
+ * off, and compares the two.  It reports whether the node was used.  The rows
+ * are compared as text, which also lets a target list repeat a column name.
+ */
+CREATE FUNCTION lion_dc(q text, force boolean DEFAULT true) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	IF force THEN
+		PERFORM set_config('enable_seqscan', 'off', true);
+		PERFORM set_config('enable_bitmapscan', 'off', true);
+		PERFORM set_config('enable_indexscan', 'off', true);
+		PERFORM set_config('enable_indexonlyscan', 'off', true);
+	END IF;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_dc_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	/* the reference: the heap, read sequentially */
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_dc_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_dc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_dc_on EXCEPT ALL SELECT * FROM lion_dc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_dc_off EXCEPT ALL SELECT * FROM lion_dc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_dc_on, lion_dc_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+
+/* Which plan the cost model picks, with nothing disabled. */
+CREATE FUNCTION lion_dc_pick(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN 'pushed down';
+		END IF;
+	END LOOP;
+	RETURN 'not pushed down';
+END $$;
+
+/*
+ * A prepared statement under a generic plan, which keeps $n a Param.  Two
+ * statements, because the plan is made once and cached: one prepared with the
+ * pushdown on and the other scans discouraged, the reference prepared with
+ * the pushdown off, as a sequential scan.
+ */
+CREATE FUNCTION lion_dc_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_dcp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_dcp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_dc_on AS EXECUTE lion_dcp_on(%s)', args);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE lion_dcp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_dc_off AS EXECUTE lion_dcp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_dcp_on';
+	EXECUTE 'DEALLOCATE lion_dcp_off';
+
+	EXECUTE 'SELECT count(*) FROM lion_dc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_dc_on EXCEPT ALL SELECT * FROM lion_dc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_dc_off EXCEPT ALL SELECT * FROM lion_dc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_dc_on, lion_dc_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+
+/*
+ * One counter of the node's EXPLAIN ANALYZE output, as a number, with every
+ * other scan disabled; NULL when the node is not in the plan.
+ */
+CREATE FUNCTION lion_dc_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+
+-- EXPLAIN in a form every supported release prints the same way (the
+-- definition test/sql/citext.sql uses: 18's "Disabled: true" lines dropped,
+-- subplans named "expr_N", integer actual row counts, sorting off while it
+-- plans).
+CREATE OR REPLACE FUNCTION lion_explain_norm(q text, opts text DEFAULT 'COSTS OFF')
+RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (' || opts || ') ' || q LOOP
+		CONTINUE WHEN l ~ '^\s*Disabled: true$';
+		l := regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+	PERFORM set_config('enable_sort', 'on', true);
+END
+$$;
+
+/*
+ * g: 8 values and NULLs; k: 50 values and NULLs, laid out so that half of the
+ * (g, k) pairs never occur (g and k always have the parity of i); a: 10
+ * values; t: 20 texts; u: no index.  Group g = 100 has rows, all with k NULL,
+ * and k = 999 lives in group 3 only.
+ */
+CREATE TABLE lion_dt (
+	id	int		NOT NULL,
+	g	int,
+	k	int,
+	a	int		NOT NULL,
+	t	text,
+	u	int
+);
+INSERT INTO lion_dt
+SELECT i,
+	   CASE WHEN i % 97 = 0 THEN NULL ELSE i % 8 END,
+	   CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 7) % 50 END,
+	   i % 10,
+	   't' || (i % 20),
+	   i % 13
+  FROM generate_series(1, 20000) i;
+INSERT INTO lion_dt SELECT 20000 + i, 100, NULL, i % 10, 'tx', 0
+  FROM generate_series(1, 30) i;
+INSERT INTO lion_dt SELECT 20100 + i, 3, 999, 3, 't3', 0
+  FROM generate_series(1, 5) i;
+CREATE INDEX lion_dt_g ON lion_dt USING lion (g);
+CREATE INDEX lion_dt_k ON lion_dt USING lion (k);
+CREATE INDEX lion_dt_a ON lion_dt USING lion (a);
+CREATE INDEX lion_dt_t ON lion_dt USING lion (t);
+VACUUM ANALYZE lion_dt;
+
+-- ---- 1. count(DISTINCT k) over the WHERE (shape 1) ------------------------
+SELECT count(DISTINCT k) FROM lion_dt;
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 3');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 3 AND t = ''t13''');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 3 AND t = ''t4''');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 77');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a IN (1, 2, 77)');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE g IS NULL');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE g = 100');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE g IS NOT NULL AND a = 4');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 3 OR t = ''t0''');
+SELECT lion_dc('SELECT count(DISTINCT t) FROM lion_dt WHERE g = 5');
+-- the WHERE pins k itself: its own entries drive, so the answer is 0 or 1
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k = 7');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k = 7 AND a = 2');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k = 12345');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (1, 2, 3, 999, 12345)');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (1, 2, 3, 999) AND g = 3');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IS NULL');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IS NOT NULL');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IS NOT NULL AND a = 5');
+-- mixed target lists: the total, count(k) and count of a NOT NULL column
+SELECT lion_dc('SELECT count(*), count(k), count(DISTINCT k), count(a) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT k), count(*) FROM lion_dt WHERE a = 6');
+SELECT lion_dc('SELECT count(k), count(DISTINCT k) FROM lion_dt WHERE g = 100');
+SELECT lion_dc('SELECT count(*), count(DISTINCT k) FROM lion_dt WHERE k IS NOT NULL AND t = ''t7''');
+-- the same aggregate twice, and HAVING on the one row
+SELECT lion_dc('SELECT count(DISTINCT k) AS x, count(DISTINCT k) AS y FROM lion_dt WHERE a = 1');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt HAVING count(DISTINCT k) > 10');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 1 HAVING count(DISTINCT k) > 100');
+-- a GROUP BY the planner folds to one constant group: no row when nothing
+-- matches, and a row with 0 when every match has k NULL
+SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dt WHERE a = 3 GROUP BY a');
+SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dt WHERE a = 77 GROUP BY a');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE g = 100 GROUP BY g');
+SELECT g, count(DISTINCT k) FROM lion_dt WHERE g = 100 GROUP BY g;
+SELECT lion_dc('SELECT g, count(*), count(DISTINCT k) FROM lion_dt WHERE g = 100 GROUP BY g');
+
+-- ---- 2. per group (shape 2) ----------------------------------------------
+SELECT g, count(DISTINCT k) FROM lion_dt GROUP BY g ORDER BY g;
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt GROUP BY g');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE a = 3 GROUP BY g');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE a IN (3, 4) AND t = ''t3'' GROUP BY g');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE k IN (1, 2, 3, 999) GROUP BY g');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE g IN (1, 3, 100) GROUP BY g');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE a = 3 OR t = ''t1'' GROUP BY g');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt WHERE a = 77 GROUP BY g');
+SELECT lion_dc('SELECT g, count(*), count(g), count(k), count(DISTINCT k) FROM lion_dt GROUP BY g');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt GROUP BY g');
+SELECT lion_dc('SELECT t, count(DISTINCT k) FROM lion_dt WHERE a = 2 GROUP BY t');
+SELECT lion_dc('SELECT k, count(DISTINCT g) FROM lion_dt GROUP BY k');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt GROUP BY g HAVING count(DISTINCT k) > 20');
+SELECT lion_dc('SELECT g FROM lion_dt GROUP BY g HAVING count(DISTINCT k) < 5');
+SELECT lion_dc('SELECT g, count(*) FROM lion_dt GROUP BY g HAVING count(DISTINCT k) = 0');
+-- the output order is g's directory order, which ORDER BY g can use when g
+-- is NOT NULL
+SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dt GROUP BY a ORDER BY a');
+SELECT a, count(DISTINCT k) FROM lion_dt GROUP BY a ORDER BY a;
+-- inside a subquery rescanned with a new parameter for every outer row
+SELECT lion_dc('SELECT x, (SELECT count(DISTINCT k) FROM lion_dt WHERE a = x) FROM generate_series(0, 4) x');
+SELECT lion_dc('SELECT x, s.* FROM generate_series(0, 3) x, LATERAL (SELECT g, count(DISTINCT k) FROM lion_dt WHERE a = x GROUP BY g) s');
+
+-- ---- 3. parameters under a generic plan ----------------------------------
+SELECT lion_dc_prep('SELECT count(DISTINCT k) FROM lion_dt WHERE a = $1', '3');
+SELECT lion_dc_prep('SELECT count(DISTINCT k) FROM lion_dt WHERE a = $1', 'NULL');
+SELECT lion_dc_prep('SELECT count(DISTINCT k) FROM lion_dt WHERE k = $1', '7');
+SELECT lion_dc_prep('SELECT count(DISTINCT k) FROM lion_dt WHERE k = ANY ($1)', '''{1,2,999}''::int[]');
+SELECT lion_dc_prep('SELECT g, count(DISTINCT k) FROM lion_dt WHERE a = $1 GROUP BY g', '5');
+SELECT lion_dc_prep('SELECT g, count(DISTINCT k) FROM lion_dt WHERE a IN ($1, $2) GROUP BY g', '5, 6');
+
+-- ---- 4. EXPLAIN ----------------------------------------------------------
+SET enable_seqscan = off;
+SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 3') AS p("QUERY PLAN");
+SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (1, 2) AND a = 3') AS p("QUERY PLAN");
+SELECT * FROM lion_explain_norm('SELECT g, count(*), count(DISTINCT k) FROM lion_dt WHERE t = ''t1'' GROUP BY g') AS p("QUERY PLAN");
+SELECT * FROM lion_explain_norm('SELECT g, count(DISTINCT k) FROM lion_dt GROUP BY g HAVING count(DISTINCT k) > 20', 'COSTS OFF, VERBOSE') AS p("QUERY PLAN");
+RESET enable_seqscan;
+-- one test per entry of k (50 values and 999; the NULL entry is not a value),
+-- one for a pinned k, one per listed value with an entry
+SELECT lion_dc_counter('SELECT count(DISTINCT k) FROM lion_dt', 'Distinct Keys Tested');
+SELECT lion_dc_counter('SELECT count(DISTINCT k) FROM lion_dt WHERE k = 7', 'Distinct Keys Tested');
+SELECT lion_dc_counter('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (1, 2, 12345)', 'Distinct Keys Tested');
+-- 10 groups (8 values, 100 and NULL): a test of the group each, and one per
+-- group per value of k (51)
+SELECT lion_dc_counter('SELECT g, count(DISTINCT k) FROM lion_dt GROUP BY g', 'Distinct Keys Tested');
+-- the early exit: an existence test reads the first container of each entry
+-- and stops, while count(k) beside it needs every container counted
+SELECT lion_dc_counter('SELECT count(DISTINCT k) FROM lion_dt', 'Containers Visited')
+	 < lion_dc_counter('SELECT count(DISTINCT k), count(k) FROM lion_dt', 'Containers Visited')
+	   AS existence_reads_less;
+SELECT lion_dc_counter('SELECT count(DISTINCT k) FROM lion_dt', 'Heap Blocks Rechecked') AS clean_heap_rechecks;
+
+-- ---- 5. a dirty heap: deletes and updates not yet vacuumed ----------------
+-- every row of k = 6 gone (a key with an entry and no visible row), k = 8
+-- only in part, and k moved to a new value on some rows
+DELETE FROM lion_dt WHERE k = 6;
+DELETE FROM lion_dt WHERE k = 8 AND a < 5;
+UPDATE lion_dt SET k = 777 WHERE id IN (101, 202, 303);
+UPDATE lion_dt SET k = NULL WHERE g = 1 AND k = 11;
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a = 3');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (6, 8, 777)');
+SELECT lion_dc('SELECT count(*), count(k), count(DISTINCT k) FROM lion_dt WHERE a IN (1, 2, 3, 4) OR g = 1');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dt GROUP BY g');
+SELECT lion_dc('SELECT g, count(*), count(k), count(DISTINCT k) FROM lion_dt WHERE a = 1 GROUP BY g');
+SELECT lion_dc_counter('SELECT count(DISTINCT k) FROM lion_dt', 'Heap Blocks Rechecked') > 0 AS dirty_heap_rechecks;
+-- ... and once more after VACUUM has cleaned the index and the heap
+VACUUM ANALYZE lion_dt;
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (6, 8, 777)');
+SELECT lion_dc('SELECT g, count(*), count(k), count(DISTINCT k) FROM lion_dt GROUP BY g');
+SELECT count(DISTINCT k) FROM lion_dt;
+
+-- ---- 6. a multicolumn index: shape 2 out of ONE index ---------------------
+CREATE TABLE lion_dtm AS SELECT * FROM lion_dt;
+CREATE INDEX lion_dtm_gk ON lion_dtm USING lion (g, k);
+CREATE INDEX lion_dtm_a ON lion_dtm USING lion (a);
+VACUUM ANALYZE lion_dtm;
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtm');
+SELECT lion_dc('SELECT count(DISTINCT g) FROM lion_dtm WHERE a = 2');
+SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dtm GROUP BY g');
+SELECT lion_dc('SELECT k, count(DISTINCT g) FROM lion_dtm WHERE a = 4 GROUP BY k');
+SET enable_seqscan = off;
+SELECT * FROM lion_explain_norm('SELECT g, count(DISTINCT k) FROM lion_dtm WHERE a = 1 GROUP BY g') AS p("QUERY PLAN");
+RESET enable_seqscan;
+DROP TABLE lion_dtm;
+
+-- ---- 7. declined ---------------------------------------------------------
+-- a column with no lion index, and a column that is not the only DISTINCT
+SELECT lion_dc('SELECT count(DISTINCT u) FROM lion_dt WHERE a = 3');
+SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt');
+-- DISTINCT on the grouping column, and two grouping columns
+SELECT lion_dc('SELECT k, count(DISTINCT k) FROM lion_dt GROUP BY k');
+SELECT lion_dc('SELECT g, a, count(DISTINCT k) FROM lion_dt GROUP BY g, a');
+-- not a plain column, a FILTER, another aggregate, a count(col) we cannot answer
+SELECT lion_dc('SELECT count(DISTINCT k + 1) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT (k, a)) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT k) FILTER (WHERE a = 1) FROM lion_dt');
+SELECT lion_dc('SELECT sum(DISTINCT k) FROM lion_dt');
+SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
+-- a WHERE clause the posting sets cannot answer
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
+-- a collation other than the index's: DISTINCT would compare differently
+SELECT lion_dc('SELECT count(DISTINCT t COLLATE "C") FROM lion_dt WHERE a = 3');
+CREATE INDEX lion_dt_tc ON lion_dt USING lion (t COLLATE "C");
+DROP INDEX lion_dt_t;
+SELECT lion_dc('SELECT count(DISTINCT t) FROM lion_dt WHERE a = 3');
+SELECT lion_dc('SELECT count(DISTINCT t COLLATE "C") FROM lion_dt WHERE a = 3');
+
+-- an opclass whose equality is coarser than the type's: its entries are not
+-- the classes DISTINCT counts
+CREATE FUNCTION lion_dc_lower_eq(text, text) RETURNS boolean
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT lower($1) = lower($2) $$;
+CREATE OPERATOR ==== (LEFTARG = text, RIGHTARG = text,
+					  FUNCTION = lion_dc_lower_eq, COMMUTATOR = ====);
+CREATE FUNCTION lion_dc_lower_hash(text) RETURNS integer
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT hashtext(lower($1)) $$;
+CREATE OPERATOR CLASS lion_dc_lower_ops FOR TYPE text USING lion AS
+	OPERATOR 1 ==== (text, text),
+	FUNCTION 1 lion_dc_lower_hash(text);
+CREATE TABLE lion_dtl (id int, v text);
+INSERT INTO lion_dtl SELECT i, (ARRAY['A','a','B','b','c'])[1 + i % 5]
+  FROM generate_series(1, 1000) i;
+CREATE INDEX lion_dtl_v ON lion_dtl USING lion (v lion_dc_lower_ops);
+VACUUM ANALYZE lion_dtl;
+SELECT lion_dc('SELECT count(DISTINCT v) FROM lion_dtl');
+SELECT count(DISTINCT v) FROM lion_dtl;
+DROP TABLE lion_dtl;
+DROP OPERATOR CLASS lion_dc_lower_ops USING lion;
+DROP OPERATOR ==== (text, text);
+DROP FUNCTION lion_dc_lower_eq(text, text);
+DROP FUNCTION lion_dc_lower_hash(text);
+
+-- an array column: count(DISTINCT tags) counts distinct ARRAYS, and the
+-- index's entries are elements
+CREATE TABLE lion_dta (id int, tags int[], b int);
+INSERT INTO lion_dta SELECT i, ARRAY[i % 5, i % 7], i % 3 FROM generate_series(1, 2000) i;
+CREATE INDEX lion_dta_tags ON lion_dta USING lion (tags);
+CREATE INDEX lion_dta_b ON lion_dta USING lion (b);
+VACUUM ANALYZE lion_dta;
+SELECT lion_dc('SELECT count(DISTINCT tags) FROM lion_dta');
+SELECT lion_dc('SELECT b, count(DISTINCT tags) FROM lion_dta GROUP BY b');
+-- ... while a multi-key WHERE clause is as good as any other
+SELECT lion_dc('SELECT count(DISTINCT b) FROM lion_dta WHERE tags @> ''{3}''');
+DROP TABLE lion_dta;
+
+-- a partitioned table: distinct counts do not add up across partitions
+CREATE TABLE lion_dtp (id int, k int, a int) PARTITION BY RANGE (id);
+CREATE TABLE lion_dtp1 PARTITION OF lion_dtp FOR VALUES FROM (0) TO (1000);
+CREATE TABLE lion_dtp2 PARTITION OF lion_dtp FOR VALUES FROM (1000) TO (2000);
+INSERT INTO lion_dtp SELECT i, i % 30, i % 4 FROM generate_series(0, 1999) i;
+CREATE INDEX lion_dtp_k ON lion_dtp USING lion (k);
+CREATE INDEX lion_dtp_a ON lion_dtp USING lion (a);
+VACUUM ANALYZE lion_dtp;
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp');
+SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dtp GROUP BY a');
+-- one partition by itself is a plain table
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp1 WHERE a = 1');
+DROP TABLE lion_dtp;
+
+-- ---- 8. the plan choice, with nothing disabled -----------------------------
+/*
+ * 100k rows, uncorrelated columns: g8 has 8 values, k50 50, g200 200, g2k
+ * 2000 and k1k 1000.  Without a GROUP BY a distinct count over 50 entries is
+ * 50 existence tests against a scan and a sort of every row (0.7 ms against
+ * 18 ms on the assert build).  Per group, the (g, k) pairs are what is
+ * charged: 8 x 50 of them win (5.4 ms against 52), while 200 x 50 lose (58 ms
+ * against 38) and 2000 x 1000 lose by two orders of magnitude.
+ */
+CREATE TABLE lion_dtc (
+	id		int		NOT NULL,
+	g8		int		NOT NULL,
+	k50		int		NOT NULL,
+	g200	int		NOT NULL,
+	g2k		int		NOT NULL,
+	k1k		int		NOT NULL
+);
+INSERT INTO lion_dtc
+SELECT i, i % 8, (i::bigint * 7919) % 50, (i::bigint * 17) % 200,
+	   (i::bigint * 31) % 2000, (i::bigint * 104729) % 1000
+  FROM generate_series(1, 100000) i;
+CREATE INDEX lion_dtc_g8 ON lion_dtc USING lion (g8);
+CREATE INDEX lion_dtc_k50 ON lion_dtc USING lion (k50);
+CREATE INDEX lion_dtc_g200 ON lion_dtc USING lion (g200);
+CREATE INDEX lion_dtc_g2k ON lion_dtc USING lion (g2k);
+CREATE INDEX lion_dtc_k1k ON lion_dtc USING lion (k1k);
+VACUUM ANALYZE lion_dtc;
+SELECT lion_dc_pick('SELECT count(DISTINCT k50) FROM lion_dtc');
+SELECT lion_dc_pick('SELECT g8, count(DISTINCT k50) FROM lion_dtc GROUP BY g8');
+SELECT lion_dc_pick('SELECT g200, count(DISTINCT k50) FROM lion_dtc GROUP BY g200');
+SELECT lion_dc_pick('SELECT g2k, count(DISTINCT k1k) FROM lion_dtc GROUP BY g2k');
+SELECT lion_dc('SELECT count(DISTINCT k50) FROM lion_dtc', false);
+SELECT lion_dc('SELECT g8, count(DISTINCT k50) FROM lion_dtc GROUP BY g8', false);
+DROP TABLE lion_dtc;
+
+-- ---- 9. citext: the opclass equality IS citext's own ----------------------
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
+CREATE TABLE lion_dtci (id int, name citext, a int);
+INSERT INTO lion_dtci
+SELECT i, (ARRAY['Alice','BOB','carol','Alice ','bob','ALICE', NULL])[1 + i % 7], i % 3
+  FROM generate_series(1, 3000) i;
+CREATE INDEX lion_dtci_name ON lion_dtci USING lion (name);
+CREATE INDEX lion_dtci_a ON lion_dtci USING lion (a);
+VACUUM ANALYZE lion_dtci;
+SELECT count(DISTINCT name) FROM lion_dtci;
+SELECT lion_dc('SELECT count(DISTINCT name) FROM lion_dtci');
+SELECT lion_dc('SELECT a, count(DISTINCT name) FROM lion_dtci GROUP BY a');
+SELECT lion_dc('SELECT count(DISTINCT name) FROM lion_dtci WHERE name IN (''alice'', ''Bob'')');
+DROP TABLE lion_dtci;
+DROP EXTENSION pg_lion_citext;
+DROP EXTENSION citext;
+
+DROP TABLE lion_dt;
+DROP FUNCTION lion_dc(text, boolean);
+DROP FUNCTION lion_dc_pick(text);
+DROP FUNCTION lion_dc_prep(text, text);
+DROP FUNCTION lion_dc_counter(text, text);

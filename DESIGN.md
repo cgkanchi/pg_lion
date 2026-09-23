@@ -3287,36 +3287,12 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
   Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
   through the join.
-- **`count(DISTINCT k)` in the pushdown (after the FK join).** Both shapes below are refused today
-  (`lion_agg_is_count()` rejects any `aggdistinct`; pushdown.sql checks that
-  `count(DISTINCT b) ... WHERE a = 3` is not pushed down):
-  1. `SELECT count(DISTINCT k) FROM t WHERE <pushdown quals>`, with `k` a scalar key column of a
-     lion index (any column of a multicolumn one, §24). The answer is the number of `k` entries,
-     the reserved NULL and EMPTY entries excluded, whose posting set, intersected with the WHERE
-     sets, holds at least one row visible to the snapshot. This is the §10 GROUP BY-`k` walk with
-     an EXISTENCE test per group instead of a count, and existence can stop early: the first
-     member on an all-visible page (pinned, as §9 requires) settles the group with no heap visit,
-     and a dirty group needs rechecks only until one row is visible. `k` pinned by the WHERE
-     (`k = c`) answers 0 or 1; `k = ANY (list)` walks the located sets of §15.
-  2. `SELECT g, count(DISTINCT k) FROM t WHERE ... GROUP BY g`, with `g` and `k` both lion-indexed
-     (the same index or two): the §20 nested loop over (outer `g`, inner `k`) entries, emitting per
-     `g` the number of inner `k` whose pair intersection is non-empty and visible, again with the
-     early-exit existence test. The work is up to |G| x |K| intersections, so the cost model must
-     charge pairs and not groups, and the node must decline where the pair count makes the plain
-     HashAggregate cheaper; the §17 cardinality guard is the precedent.
-  Rules for both: DISTINCT's equality is the key type's default btree equality, so the opclass
-  equality must be the same equivalence relation (the grouping-equality check from the
-  2026-09-20 review applies unchanged: citext_ops over citext is fine, a collation mismatch
-  declines); NULLs are never counted; multi-key columns decline, because `count(DISTINCT tags)`
-  counts distinct arrays, not elements; `count(*)`, `count(col)` and `count(DISTINCT k)` may
-  appear together in one target list when each one is answerable; HAVING on the distinct count
-  reuses the plan.qual path from dff300f. Partitioned tables decline in the first version,
-  because distinct counts are not additive across partitions (the §16 partial/Finalize shape
-  sums them); a later version could emit per-partition (g, k) pairs for core to deduplicate.
-  Tests: answers against the sequential scan with NULLs, deletes, dirty and all-visible pages,
-  citext and collations, plus the declines (arrays, partitions, collation); the §11 VACUUM
-  interlock argument is unchanged, since existence is read from the same pinned containers as a
-  count, but count_vacuum_race should gain a distinct-count variant that proves it.
+- **`count(DISTINCT k)` in the pushdown: implemented, see §26.** Both shapes (`count(DISTINCT k)`
+  over the WHERE, and per `GROUP BY g`) with the rules this item set: existence tests with early
+  exit, NULLs never counted, the grouping-equality check, multi-key columns and partitioned tables
+  declined, mixed target lists, HAVING through plan.qual, pairs charged for shape 2, and a
+  distinct-count variant of count_vacuum_race (`count_distinct_vacuum_race.spec`). It was done
+  before the FK-side join pushdown, not after it as first planned.
 - **PGXN packaging (before the Citus/TimescaleDB work).** Distribution through the PostgreSQL
   Extension Network is how the two environments below will install it, so it comes first:
   - `META.json` (PGXN Meta Spec v1.0.0): name `pg_lion`, abstract, license `postgresql`, version
@@ -4195,3 +4171,187 @@ standby rechecks every TID, §9) and pays only for the cleanup locks of the
 posting-tree descents, which are not measurable here. Replay pays one buffer
 lookup and one uncontended cleanup lock per barrier block, and only in hot
 standby.
+
+## 26. `count(DISTINCT k)` in the pushdown (v1, implemented)
+
+Formerly the §23 backlog item of the same name. Two shapes, with `k` - and `g` - scalar key columns
+of lion indexes (any column of a multicolumn one, §24):
+
+1. `SELECT count(DISTINCT k) FROM t [WHERE <pushdown quals>]`
+2. `SELECT g, count(DISTINCT k) FROM t [WHERE <pushdown quals>] GROUP BY g`
+
+**What is counted.** A scalar index puts every row under exactly one entry of `k` - its value's, or
+the reserved NULL entry (§14, and §15 for the argument) - so the distinct non-NULL values of `k`
+among the rows the WHERE selects are exactly the non-NULL entries of `k` whose posting set,
+intersected with the WHERE sources (and, in shape 2, with the group's set), holds at least one row
+visible to the snapshot. The NULL entry is never counted (`count(DISTINCT k)` ignores NULLs), and
+the reserved EMPTY entry of §17 cannot occur because multi-key columns are refused. Shape 1 is
+therefore §10's GROUP BY-`k` walk with each group's count replaced by an EXISTENCE test and the
+groups summed into one row; shape 2 is §20's nested loop over (outer `g`, inner `k`) with each
+pair's count replaced by an existence test and the inner loop summed into one row per outer group.
+
+### The existence test (`lion_exists_sources_cached()`, lion_count.c)
+
+The same merge as a count - the same sources, the same set algebra, the same visibility-map check
+per container, the same recheck batch and visibility cache - with one difference: it stops as soon
+as the answer is known.
+
+- After every container the merge has put through the visibility map (the VM check itself,
+  `lion_count_container_vm()`, is unchanged) the test asks whether anything has been counted. A
+  member on an all-visible block settles it at once, and the recheck TIDs the container queued, if
+  any, are dropped unread.
+- Otherwise the container's dirty-block TIDs are rechecked right there - the ordinary
+  `lion_recheck_flush()`, called at a container boundary, which is a heap-block boundary - and one
+  visible row settles the test.
+- Only when the sets run out is the answer no. A group whose rows are all on dirty pages therefore
+  rechecks container by container until its first visible row and never more than one container
+  past it; a group on an all-visible heap costs the first container of its intersection and
+  nothing else.
+
+The disjoint sum of §15 and the single-set path stop the same way, between two sets and between
+two containers respectively. The heap recheck and the visibility cache are called, not changed.
+
+**Why §9 and §11 cover existence exactly as they cover counting.** An existence test is a count
+compared with zero, computed from the same containers read the same way; the only change is that
+the count stops growing early, and stopping reads less, never differently. Every "yes" is one of
+the two things a count adds a row for: a member of a container on a block the visibility map
+reported all-visible WHILE the page that container was copied from was still pinned - the rule of
+§9, which the unchanged `lion_count_container_vm()` enforces: VACUUM cannot have finished
+ambulkdelete on that page, so it cannot have set all-visible on a block holding a dead TID of that
+container - or a TID the heap recheck found visible under the snapshot, which needs no pin at all
+(§9 step 5). Every "no" is a count of zero. Dropping queued recheck TIDs after a VM hit discards
+candidates that could only have added to an answer already known to be positive. So the §11 VACUUM
+rule needs no addition. `test/isolation/count_distinct_vacuum_race.spec` proves it the way
+`count_vacuum_race.spec` proves it for a count: the key whose rows are all dead comes first in the
+entry walk, the distinct count parks at the existing `lion-count-containers-pinned` injection point
+with that key's container pinned, the VACUUM that would remove those rows and mark their pages
+all-visible is seen waiting for the pin, and the answer - for both shapes - excludes the dead key
+and includes the key deleted after the snapshot.
+
+### Executor
+
+- Shape 1 (`lion_distinct_relation()`): walk `k`'s entries - or, when the WHERE pins `k` itself with
+  `k = c` or `k = ANY (list)`, that clause's located sets, exactly as §15's GROUP BY driver does
+  (the clause is then not intersected: an entry intersected with a union of disjoint entries that
+  contains it is the entry), so `k = c` answers 0 or 1 in one test. A `k IS NOT NULL` clause on
+  the driving column is dropped and the NULL entry skipped, as for §14's sum-over-all. One test
+  per non-NULL entry, one row out.
+- Shape 2 (`lion_next_group_distinct()`): for each outer `g` entry, first the group itself - does
+  `g ∩ WHERE` hold a visible row? A group with none is not emitted, and a group whose rows all have
+  `k` NULL is emitted with `count(DISTINCT k) = 0`, as SQL requires. Then one test per non-NULL
+  inner key: the inner keys are read once per relation and each inner set is located per pair,
+  which is §20's pin budget (two group pins at a time). One row per group. The outer set and the
+  WHERE sets are the ones every pair reuses, so §9's materialization applies to them as in §20.
+  An IN list on `g` does not drive the groups here (the entry scan does), which keeps the output
+  in `g`'s directory order and the pathkeys of §21 valid.
+- Mixed target lists. `count(*)` and `count(col)` (under §14's rules) may stand beside
+  `count(DISTINCT k)`, and so may `count(k)` - the number of non-NULL `k` - which a nullable `k`
+  would not otherwise allow. Whether a test must COUNT rather than stop early is decided from the
+  target list's kinds: in shape 1 any other count makes every entry test a full count (the total
+  is the sum over all entries, the NULL entry included - §15's disjointness again - and `count(k)`
+  the sum over the non-NULL ones); in shape 2, `count(*)` and `count(g)` make the GROUP test a
+  count and `count(k)` makes the PAIR tests counts. A pure distinct count is existence tests only.
+- A GROUP BY the planner folded to constants (`WHERE g = 3 GROUP BY g`) is shape 1 under §10's
+  single-group rule - no row when nothing matches. Whether a row matches when every matching row
+  has `k` NULL is one more existence test, on `k`'s NULL entry, made only when no distinct value
+  was found.
+- HAVING on the distinct count is the plan.qual of dff300f unchanged: the distinct count is a
+  column of the node's scan tuple like any other count.
+
+### Planner acceptance (`lion_try_count_path()`)
+
+- Each `count(DISTINCT x)` must be `count(any)` of one argument that is a plain column of the
+  relation (relabels stripped), with no FILTER and no ORDER BY, not variadic and not split, and
+  every distinct aggregate of the target list and the HAVING must name the same column with the
+  same equality and collation. `count(DISTINCT (a, b))`, `count(DISTINCT a + 1)`, other DISTINCT
+  aggregates and two different distinct columns decline.
+- `k` must not be a GROUP BY column, and there may be at most one GROUP BY column (so at most two
+  driving columns, `LION_MAX_GROUPCOLS`).
+- `k` goes through `lion_collect_targets()` as a driving column, so every per-column rule of §10
+  applies to it unchanged: a SCALAR lion index (a multi-key one is never found, so
+  `count(DISTINCT tags)` - which counts distinct ARRAYS, not elements - declines); the index's
+  collation must be the DISTINCT's (`exprCollation()` of the argument, which is what nodeAgg sorts
+  and compares with, so `count(DISTINCT t COLLATE "C")` over a default-collation index declines);
+  and strategy 1 of the index's opfamily must be the DISTINCT's own equality operator
+  (`SortGroupClause.eqop` of `aggdistinct`, compared by Oid - the grouping-equality check of the
+  2026-09-20 review, finding 3), so a coarser opclass declines and `citext_ops` over citext is
+  accepted. No value of `k` is printed, so the representation gate of finding 4 does not apply.
+- Partitioned tables decline: distinct counts are not additive across partitions, and §16's shape
+  (partial aggregates added up by a Finalize Agg) would add them. A later version could emit
+  per-partition (g, k) pairs for core to deduplicate.
+- Everything else - WHERE clause kinds, OR, IN lists, Params, HAVING, privileges, RLS - is §10 as it
+  stands. A query with no WHERE clause at all is accepted: `k`'s entries drive it.
+
+`custom_private` gains `LION_PRIV_DISTINCT` (IntList: the distinct column's attnum, or empty) in
+front of the target-list kinds - shape 8, `LION_PRIV_NMEMBERS` 11 - and the target-list kinds gain
+`LION_TL_COUNT_DISTINCT` and `LION_TL_COUNT_DISTCOL` (`count(k)`). `k`'s index travels in the
+existing Oid slots, the driving one in shape 1 and the inner one in shape 2; `groupattno2` stays 0,
+because `k` is not a grouping column, and the executor calls the inner column `innerattno`.
+
+### Cost
+
+`lion_cost_count_rel()` prices shape 1 as §10 prices a GROUP BY over `k` - one entry scan, and the
+per-group container work for every entry, because every entry is tested whether or not the WHERE
+leaves it a row (the entries are `n_distinct(k)` over the whole table) - and shape 2 exactly as §20
+prices the (g, k) nested loop: one `cpu_tuple_cost` per PAIR, the intersection term
+`Min(|G|, |K|) x rows` and both sides' container bookkeeping per pair. That is what charges pairs
+and not groups, and what makes a large `|G| x |K|` lose to the sorting aggregate core builds for a
+distinct count - the decline the backlog item asked for, with the cost model as the guard, as in
+§20. On top of that:
+
+- **A fixed cost per test**, `LION_DISTINCT_TEST_COST` (50 x `cpu_tuple_cost`), for every entry
+  test, group test and pair test: a merge set up and torn down, and for a pair the inner set's
+  lookup. Measured on the assert build at 100k rows, a test costs about 2 us with nothing to
+  intersect and 3.4 us with a WHERE set to seek, against about 0.2 us per row for the sort-based
+  aggregate, whose model charges about 0.1 per row: a test is worth some ten of its rows. Without
+  it, a walk of 1000 entries of `k` under a WHERE that leaves 500 rows was chosen, and took 3.4 ms
+  against the bitmap scan and sort's 0.56.
+- **The early exit is discounted only where it is real.** In shape 1 each entry test reads the
+  share of its intersection `lion_exists_fraction()` expects: a test whose intersection is expected
+  to hold `s >= 1` rows over `D` containers stops after about `D/s + 1` of them, and one expected to
+  be empty (`s < 1`) reads everything, as a count would. The recheck candidates are scaled the
+  same way, in both shapes, because a test rechecks one container at a time and stops with them.
+  The pair terms of shape 2 are NOT discounted: a pair's time is its lookup and its merge setup
+  far more than its members - measured per pair, an existence test took 6.5 us against 7.7 for
+  §20's count of the same 200 x 50 pairs - and discounting them chose 200 x 50 pairs at 64.6 ms
+  against the sort's 43.
+- Tests that must COUNT (the mixed target lists above) are charged in full.
+
+Measured with the final model (100k rows, uncorrelated columns, warm cache, assert build - ratios,
+not absolute numbers; `test/sql/distinct.sql` pins the rows marked *):
+
+| query | LionCount | core plan | chosen |
+|---|---|---|---|
+| `count(DISTINCT k50)` * | 0.68 ms | 18.4 ms | node |
+| `count(DISTINCT k1k)` | 2.04 | 15.7 | node |
+| `count(DISTINCT g2k)` | 3.26 | 16.0 | node |
+| `count(DISTINCT k50) WHERE g8 = 3` | 0.90 | 2.69 | node |
+| `count(DISTINCT k1k) WHERE g200 = 3` | 3.16 | 0.39 | core |
+| `g8, count(DISTINCT k50)` * | 5.41 | 51.9 | node |
+| `g8, count(DISTINCT k1k)` | 35.8 | 60.0 | node |
+| `g200, count(DISTINCT k50)` * | 57.5 | 37.8 | core |
+| `g2k, count(DISTINCT k50)` | 401 | 40.8 | core |
+| `g200, count(DISTINCT k1k)` | 693 | 44.1 | core |
+| `g2k, count(DISTINCT k1k)` * | 5699 | 39.2 | core |
+
+Every choice in the table is the faster plan. The open item is the one §20 records: the model does
+not model correlation, so clustered data, where most pairs' merges end at once, is priced as if it
+were not.
+
+### EXPLAIN
+
+`Lion Indexes` names `k`'s index like a group index - `ix_k (k)` first in shape 1, after the outer
+group's index in shape 2 - then the WHERE indexes; `Group Key` is `g` alone; a new line
+`Distinct Key: k` says which column is counted. With ANALYZE, `Distinct Keys Tested` counts the
+entry and pair tests made.
+
+### Tests
+
+`test/sql/distinct.sql`: every query against a forced sequential scan with the pushdown off, as a
+multiset both ways round - NULLs in `k` and in `g`, deletes on dirty pages and after VACUUM, IN
+lists on `k` itself and on another column, `k = c`, `k IS NOT NULL`, an OR, Params under a generic
+plan, the mixed target lists, HAVING, a folded GROUP BY, citext, a multicolumn index (shape 2 out
+of one index) - and the declines: an array column, a partitioned table, a collation mismatch, a
+coarser opclass, an unindexed column, two distinct columns, `k` as the group column and two GROUP
+BY columns. The plan choice for shape 2 is pinned at a small and a large pair count, and EXPLAIN
+ANALYZE shows the early exit reading fewer containers than the same walk with `count(k)` beside it.
