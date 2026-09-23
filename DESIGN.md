@@ -625,9 +625,14 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   CustomScan path is covered by the executor's own ExecCheckPermissions on the range table, and a
   partial index reaches it only when the query implies the predicate, i.e. references it. The
   diagnostic functions check neither privileges nor RLS - `lion_index_posting_root()` answers key
-  membership, `lion_index_stats()` gives counts, `lion_index_verify()` reads the heap - so they are
-  revoked from PUBLIC like pageinspect's and amcheck's (`lion_index_stats()` is granted to
-  `pg_stat_scan_tables`, as pgstattuple's functions are).
+  membership, `lion_index_stats()` gives counts, `lion_index_verify()` reads the heap,
+  `lion_index_wal_mode()` locks whatever it is handed - so they are revoked from PUBLIC like
+  pageinspect's and amcheck's (`lion_index_stats()` is granted to `pg_stat_scan_tables`, as
+  pgstattuple's functions are). `lion_index_verify()` names a missing row's key value only to a
+  superuser; a role it is granted to gets the TID (test/sql/hardening.sql).
+- **Install scripts.** Every support function a script names is found in pg_catalog or, for
+  citext, through `@extschema:citext@` - never in the target schema, where a role with CREATE could
+  plant one that then runs as whoever inserts into the index (test/sql/hardening.sql).
 - **Row-level security.** The SQL functions refuse a table on which RLS applies to the caller
   (policies would have to be evaluated per row); the CustomScan declines relations with security
   quals, so the ordinary plan applies the policies.

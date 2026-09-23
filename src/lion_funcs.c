@@ -2078,6 +2078,23 @@ lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
 							   lion_code_ckey(code), lion_code_lo(code)))
 		return;
 
+	/*
+	 * The key's value goes into the message only for a superuser.  The
+	 * function may be granted to roles without SELECT on the table, and it
+	 * reads past column privileges and row-level security; the message would
+	 * hand them the value, and put it in the server log.  The TID is enough
+	 * to find the row.
+	 */
+	if (reservedflag == 0 && !superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("heap tuple (%u,%u) from table \"%s\" is not indexed in \"%s\"",
+						ItemPointerGetBlockNumber(tid),
+						ItemPointerGetOffsetNumber(tid),
+						RelationGetRelationName(vs->heap),
+						RelationGetRelationName(vs->index)),
+				 errdetail("Key column %u of the tuple is not NULL.", state->attno)));
+
 	getTypeOutputInfo(state->typid, &vs->keyoutfunc, &typisvarlena);
 
 	ereport(ERROR,

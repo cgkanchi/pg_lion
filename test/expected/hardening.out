@@ -1,0 +1,88 @@
+-- Install-time and diagnostic hardening (2026-09-23 security review, third round).
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS citext;
+DROP EXTENSION IF EXISTS pg_lion_citext CASCADE;
+RESET client_min_messages;
+SET synchronous_commit = on;
+CREATE ROLE lion_hard_mallory;
+-- ---------- the install scripts do not resolve names in the target schema ----------
+-- A role with CREATE on the schema the extension is installed into plants a
+-- function under the name a support function is looked up by.  If the script
+-- picked it, it would run as whoever inserts into the index - here, it would
+-- make the planter a superuser.  (The pre-18 helper of pg_lion's own script
+-- has the same shape, but only a server without the new hash functions can
+-- show it, so the citext script stands for both.)
+CREATE SCHEMA lion_hard;
+GRANT CREATE, USAGE ON SCHEMA lion_hard TO lion_hard_mallory;
+SET ROLE lion_hard_mallory;
+CREATE FUNCTION lion_hard.citext_hash(x citext) RETURNS int4 LANGUAGE plpgsql AS $$
+BEGIN
+	IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+		EXECUTE 'ALTER ROLE lion_hard_mallory SUPERUSER';
+	END IF;
+	RETURN hashtext(lower(x::text));
+END $$;
+RESET ROLE;
+CREATE EXTENSION pg_lion_citext SCHEMA lion_hard;
+SELECT p.amprocnum, p.amproc::regprocedure::text LIKE 'lion_hard.%' AS planted
+  FROM pg_amproc p JOIN pg_opfamily f ON f.oid = p.amprocfamily
+ WHERE f.opfname = 'citext_ops' AND f.opfmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
+ ORDER BY 1;
+ amprocnum | planted 
+-----------+---------
+         1 | f
+         4 | f
+(2 rows)
+
+CREATE TABLE lion_hard_ci (n citext);
+INSERT INTO lion_hard_ci VALUES ('Alice');
+CREATE INDEX lion_hard_ci_n ON lion_hard_ci USING lion (n);
+SELECT rolsuper AS mallory_is_superuser FROM pg_roles WHERE rolname = 'lion_hard_mallory';
+ mallory_is_superuser 
+----------------------
+ f
+(1 row)
+
+DROP TABLE lion_hard_ci;
+DROP EXTENSION pg_lion_citext;
+DROP SCHEMA lion_hard CASCADE;
+NOTICE:  drop cascades to function lion_hard.citext_hash(citext)
+-- ---------- lion_index_wal_mode() is a diagnostic like the others ----------
+CREATE TABLE lion_hard_t (k int NOT NULL);
+INSERT INTO lion_hard_t SELECT g % 10 FROM generate_series(1, 1000) g;
+CREATE INDEX lion_hard_t_k ON lion_hard_t USING lion (k);
+SET ROLE lion_hard_mallory;
+SELECT lion_index_wal_mode('lion_hard_t_k') IS NOT NULL;      -- denied: no grant on anything
+ERROR:  permission denied for function lion_index_wal_mode
+RESET ROLE;
+-- ---------- lion_index_verify() does not print values to whom it is granted ----------
+-- A predicate that claims to be immutable and is not stands in for a damaged
+-- index: a row the build left out is one verify expects once the setting
+-- changes, and verify reports it missing.
+CREATE FUNCTION lion_hard_pred(int4) RETURNS bool IMMUTABLE LANGUAGE sql AS
+	$$SELECT current_setting('lion_hard.salt', true) = '1'$$;
+CREATE TABLE lion_hard_v (k int4 NOT NULL);
+INSERT INTO lion_hard_v VALUES (424242);
+CREATE INDEX lion_hard_v_k ON lion_hard_v USING lion (k) WHERE lion_hard_pred(k);
+SET lion_hard.salt = '1';
+\set VERBOSITY default
+SELECT lion_index_verify('lion_hard_v_k', true);                -- superuser: the value is shown
+ERROR:  heap tuple (0,1) from table "lion_hard_v" is not indexed in "lion_hard_v_k"
+DETAIL:  Key column 1 of the tuple is 424242.
+GRANT EXECUTE ON FUNCTION lion_index_verify(regclass, bool) TO lion_hard_mallory;
+SET ROLE lion_hard_mallory;
+SELECT lion_index_verify('lion_hard_v_k', true);                -- granted role: the TID only
+ERROR:  heap tuple (0,1) from table "lion_hard_v" is not indexed in "lion_hard_v_k"
+DETAIL:  Key column 1 of the tuple is not NULL.
+RESET ROLE;
+RESET lion_hard.salt;
+REVOKE EXECUTE ON FUNCTION lion_index_verify(regclass, bool) FROM lion_hard_mallory;
+DROP TABLE lion_hard_v;
+DROP FUNCTION lion_hard_pred(int4);
+DROP TABLE lion_hard_t;
+-- leave citext's opclass installed for whatever follows, as the tests before did
+SET client_min_messages = warning;
+CREATE EXTENSION pg_lion_citext;
+RESET client_min_messages;
+DROP ROLE lion_hard_mallory;
