@@ -1,0 +1,91 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s3_root s2_predel s3_before s1_vacuum s2_grow s3_wake1 s3_after s3_wake2 s1_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE) vrp;
+step s3_root: 
+	CREATE TABLE vrp_root AS SELECT lion_index_posting_root('vrp_k', 1) AS root;
+
+step s2_predel: DELETE FROM vrp WHERE k = 1 AND id <= 2000;
+step s3_before: 
+	SELECT max_posting_height AS height_before FROM lion_index_stats('vrp_k');
+
+height_before
+-------------
+            0
+(1 row)
+
+step s1_vacuum: VACUUM (INDEX_CLEANUP ON) vrp; <waiting ...>
+step s2_grow: 
+	INSERT INTO vrp SELECT 100000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
+	  FROM generate_series(1, 40000) i;
+ <waiting ...>
+step s3_wake1: 
+	SELECT vrp_wait_for_insert() AS insert_blocked_on_vacuum;
+	SELECT injection_points_detach('lion-vacuum-page-filtered');
+	SELECT injection_points_wakeup('lion-vacuum-page-filtered');
+
+insert_blocked_on_vacuum
+------------------------
+t                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_grow: <... completed>
+step s3_after: 
+	SELECT max_posting_height AS height_after,
+		   lion_index_posting_root('vrp_k', 1) = (SELECT root FROM vrp_root)
+			 AS root_block_kept
+	  FROM lion_index_stats('vrp_k');
+
+height_after|root_block_kept
+------------+---------------
+           1|t              
+(1 row)
+
+step s3_wake2: 
+	SELECT injection_points_detach('lion-vacuum-entry-busy');
+	SELECT injection_points_wakeup('lion-vacuum-entry-busy');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: <... completed>
+step s1_check: 
+	SELECT (SELECT sum(ntids) FROM lion_index_stats('vrp_k')) AS ntids,
+		   (SELECT count(*) FROM vrp) AS rows,
+		   (SELECT count(*) FROM vrp WHERE k = 1) AS k1_seq,
+		   lion_index_count('vrp_k', 1) AS k1_index;
+	SELECT lion_index_verify('vrp_k', true);
+	DROP TABLE vrp_root;
+
+ntids| rows|k1_seq|k1_index
+-----+-----+------+--------
+43500|43500| 20500|   20500
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

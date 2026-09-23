@@ -1686,6 +1686,12 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 			break;
 		}
 
+		/*
+		 * Test hook: the page is filtered and still cleanup-locked, the entry
+		 * page not yet tried (test/isolation/vacuum_retry_pushdown.spec).
+		 */
+		INJECTION_POINT("lion-vacuum-page-filtered", NULL);
+
 		if (ConditionalLockBuffer(ref->buf))
 		{
 			if (!lion_vac_ref_valid(ref, ent))
@@ -1716,6 +1722,12 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 		 * with nothing held and try the cleanup lock again.
 		 */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		/*
+		 * Test hook: nothing is held here but the pin on buf; an insert that
+		 * owns the entry page is free to push this root down before the
+		 * cleanup lock is retried (test/isolation/vacuum_retry_pushdown.spec).
+		 */
+		INJECTION_POINT("lion-vacuum-entry-busy", NULL);
 		LockBuffer(ref->buf, BUFFER_LOCK_EXCLUSIVE);
 
 		if (!lion_vac_ref_valid(ref, ent))
@@ -1728,7 +1740,28 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 
 		if (ConditionalLockBufferForCleanup(buf))
 		{
-			/* The page was unlocked in between, so filter it again. */
+			/*
+			 * The page was unlocked in between, so anything may have happened
+			 * to it - including a push-down of this root (DESIGN.md §22): an
+			 * insert may have moved its containers onto a new child and left
+			 * an internal page of downlinks here.  Filtering that as if it
+			 * were a leaf would read pivots as containers.  The restart is the
+			 * same one the first acquisition takes above, and it is safe for
+			 * the same reason: this cleanup lock waited for every pin on the
+			 * page the containers came from.
+			 */
+			if (!LionPageIsPostingLeaf(BufferGetPage(buf)))
+			{
+				LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				ReleaseBuffer(buf);
+				lion_wal_visit(vs->index, blk);
+				MemoryContextSwitchTo(oldcxt);
+				MemoryContextReset(vs->pagecxt);
+				return lion_vacuum_descend(vs, ent);
+			}
+
+			/* Filter it again: its contents may have changed as well. */
 			INSTR_TIME_SET_CURRENT(t0);
 			next = lion_vacuum_filter_page(vs, buf, &w, ent);
 			lion_vac_tick(&vs->prof.filter, t0);

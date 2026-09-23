@@ -402,17 +402,27 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 	 * The tree is ordered by a comparison this value cannot take part in.  A
 	 * BINARY coercion to the key type - the same bytes, varchar to text -
 	 * makes it one of the index's own values, and then hash, equality and
-	 * ordering are all the index's own, which is consistent by construction.
-	 * A cast FUNCTION is not taken, implicit or not: implicit does not mean
-	 * lossless (text -> name truncates to 63 bytes, so a long text that is no
-	 * stored name would become one), and PostgreSQL has no way to say that a
-	 * cast is a bijection.
+	 * ordering are all the index's own.  That is only correct if the family's
+	 * cross-type EQUALITY is that same predicate: a family may declare
+	 * `text = bpchar` through its own function with different semantics
+	 * ('x' vs 'x ' differ as text, agree as bpchar), and then relabelling the
+	 * probe would silently swap the family's equality for the key type's.  So
+	 * the shortcut is taken only when the family's cross-type strategy-1
+	 * operator is implemented by the SAME function as the key type's own
+	 * strategy-1 operator - the two predicates are then one function applied
+	 * to the same bytes.  A cast FUNCTION is never taken, implicit or not:
+	 * implicit does not mean lossless (text -> name truncates to 63 bytes),
+	 * and PostgreSQL has no way to say that a cast is a bijection.  Anything
+	 * else keeps the family's cross-type equality and walks the leaves.
 	 */
 	{
 		Oid			castfunc = InvalidOid;
+		Oid			sameeq = get_opfamily_member(opfamily, opcintype, opcintype, 1);
 
 		if (find_coercion_pathway(opcintype, keytype, COERCION_IMPLICIT,
-								  &castfunc) == COERCION_PATH_RELABELTYPE)
+								  &castfunc) == COERCION_PATH_RELABELTYPE &&
+			OidIsValid(sameeq) &&
+			get_opcode(sameeq) == get_opcode(eqopr))
 		{
 			/* From here on the probe values ARE the index's own type. */
 			probe->coerce = true;

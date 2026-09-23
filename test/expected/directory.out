@@ -1330,7 +1330,7 @@ SELECT lion_dirpages($q$SELECT count(*) FROM lion_textv
 	AS descended_not_walked;
  descended_not_walked 
 ----------------------
- t
+ f
 (1 row)
 
 DROP FUNCTION lion_dirpages(text);
@@ -1407,6 +1407,77 @@ DROP TABLE lion_cx;
 DROP OPERATOR FAMILY lion_coarsex_ops USING lion CASCADE;
 DROP FUNCTION lion_coarse_xid_hash(xid);
 DROP FUNCTION lion_coarse_int4_hash(int4);
+-- ---------------------------------------------------------------------
+-- 18. A binary coercion is not a licence to swap equalities.
+--
+-- text -> bpchar is a binary cast, so a text probe of a bpchar index could be
+-- relabelled and compared with the key type's own equality.  That is only the
+-- family's equality when the family says so: here `bpchar =~~= text` is
+-- defined with TEXT semantics (trailing blanks significant), which differs
+-- from bpchareq's.  The relabel shortcut would answer 100 for 'x '::text
+-- where the family's equality - and the seqscan - answer 0.  The shortcut is
+-- taken only when the family's cross-type strategy-1 operator is implemented
+-- by the same function as the key type's own; otherwise the leaves are walked
+-- with the family's equality (§21, "Cross-type searches").
+-- ---------------------------------------------------------------------
+CREATE FUNCTION lion_bpx_eq_text(bpchar, text) RETURNS boolean
+	LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::text = $2 $$;
+CREATE OPERATOR =~~= (LEFTARG = bpchar, RIGHTARG = text, FUNCTION = lion_bpx_eq_text);
+CREATE OPERATOR FAMILY lion_bpx_fam USING lion;
+CREATE OPERATOR CLASS lion_bpx_ops FOR TYPE bpchar USING lion FAMILY lion_bpx_fam AS
+	OPERATOR 1 = (bpchar, bpchar),
+	FUNCTION 1 hashbpchar(bpchar),
+	FUNCTION 4 bpcharcmp(bpchar, bpchar);
+-- hashtext agrees with hashbpchar on stored values without trailing blanks,
+-- so the family is consistent for the values this test stores.
+ALTER OPERATOR FAMILY lion_bpx_fam USING lion ADD
+	OPERATOR 1 =~~= (bpchar, text),
+	FUNCTION 1 (text, text) hashtext(text);
+CREATE TABLE lion_bpx (k bpchar NOT NULL);
+INSERT INTO lion_bpx SELECT 'x' FROM generate_series(1, 100);
+INSERT INTO lion_bpx SELECT 'y' FROM generate_series(1, 50);
+CREATE INDEX lion_bpx_k ON lion_bpx USING lion (k lion_bpx_ops);
+VACUUM ANALYZE lion_bpx;
+-- 'x '::text: the family says no match (text semantics); a relabel to bpchar
+-- would say match.  Every index path must agree with the seqscan.
+SELECT (SELECT count(*) FROM lion_bpx WHERE k =~~= 'x '::text) AS seq_truth,
+	   lion_index_count('lion_bpx_k', 'x '::text) AS via_count,
+	   lion_index_count_any('lion_bpx_k', ARRAY['x '::text, 'y '::text]) AS via_list;
+ seq_truth | via_count | via_list 
+-----------+-----------+----------
+         0 |         0 |        0
+(1 row)
+
+SET pg_lion.enable_count_pushdown = on;
+SELECT count(*) AS via_pushdown FROM lion_bpx WHERE k =~~= 'x '::text;
+ via_pushdown 
+--------------
+            0
+(1 row)
+
+SET pg_lion.enable_count_pushdown = off;
+SET enable_seqscan = off;
+SELECT count(*) AS via_bitmap FROM lion_bpx WHERE k =~~= 'x '::text;
+ via_bitmap 
+------------
+          0
+(1 row)
+
+RESET enable_seqscan;
+-- and the exact spelling still matches on every path
+SELECT (SELECT count(*) FROM lion_bpx WHERE k =~~= 'x'::text) AS seq_truth,
+	   lion_index_count('lion_bpx_k', 'x'::text) AS via_count,
+	   lion_index_count_any('lion_bpx_k', ARRAY['x'::text, 'y'::text]) AS via_list;
+ seq_truth | via_count | via_list 
+-----------+-----------+----------
+       100 |       100 |      150
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE lion_bpx;
+DROP OPERATOR FAMILY lion_bpx_fam USING lion CASCADE;
+DROP OPERATOR =~~= (bpchar, text);
+DROP FUNCTION lion_bpx_eq_text(bpchar, text);
 DROP OPERATOR CLASS lion_rev_ops USING lion;
 DROP OPERATOR CLASS lion_rev_btree USING btree;
 DROP OPERATOR <# (int4, int4);

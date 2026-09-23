@@ -3197,6 +3197,31 @@ The index grows by 2 MB over the portfolio (163 -> 165 MB): one internal page pe
 more than one leaf. The build and the VACUUM are unmoved, which is what they should be - neither
 does anything the section changed except write and walk one more page per multi-leaf set.
 
+### §22 addendum: the entry-page retry re-checks the page type
+
+VACUUM's pass 2 holds a container page's cleanup lock while it filters it, then needs the entry
+page for the counters. If an insert holds the entry page, VACUUM lets the container page go (waiting
+for a directory leaf while holding a container page would invert the lock order), takes the entry
+page blocking, and retries the cleanup lock. In that unlocked window the insert that held the entry
+page may have overflowed this one-page set and pushed its root down (§22), leaving an INTERNAL page
+at the block VACUUM is about to re-filter. The retry therefore re-checks `LionPageIsPostingLeaf`
+after reacquiring the cleanup lock and restarts the descent exactly as the first acquisition does;
+filtering an internal page as a leaf would read pivots as containers (an assertion on a cassert
+build, dead TIDs left behind on a release build). Injection points `lion-vacuum-page-filtered` and
+`lion-vacuum-entry-busy` make the window deterministic; test/isolation/vacuum_retry_pushdown.spec
+parks VACUUM on either side of it while an insert pushes the root down, and asserts that every dead
+TID is gone afterwards (ntids = rows) and verify() is clean. Before the re-check the spec crashed the
+backend.
+
+### §21 addendum: binary coercion requires the same equality function
+
+The cross-type probe shortcut (relabel a binary-coercible probe to the key type and use the key
+type's own hash/equality/ordering) is taken only when the family's cross-type strategy-1 operator is
+implemented by the same function as the key type's own strategy-1 operator; otherwise the family has
+stated a different equality (e.g. `bpchar =~~= text` with text semantics on a bpchar index, where
+'x' and 'x ' differ) and the probe walks the leaves with that equality. test/sql/directory.sql §18
+shows the shortcut answering 100 where the family and the seqscan answer 0.
+
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
 - **Insert batching, only if the custom rmgr leaves hot-key throughput short.** A GIN-style pending
