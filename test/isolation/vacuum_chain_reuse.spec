@@ -126,13 +126,17 @@ step s3_prep	{ VACUUM (FREEZE, ANALYZE) vcr; }
 step s3_vacuum	{ VACUUM vcr; }
 step s3_verify	{ SELECT lion_index_verify('vcr_k', true); }
 
-# The (*) marker tells isolationtester that the step blocks on something it
-# cannot see (an injection point is not a heavyweight lock), and the second
-# marker pins the report of its completion after the step that releases it.
+# The parked step carries no (*) marker: isolationtester sees a session
+# waiting on an injection point as blocked (pg_isolation_test_session_is_blocked
+# checks for it), so it moves on only once the step has really parked.  (*)
+# would move on at once, and the next step could then race the park - a slow
+# backend reached the point only after VACUUM had already run.  The marker in
+# parentheses pins the report of its completion after the step that releases
+# it.
 permutation
 	s3_prep					# make the heap all-visible
 	s2_delete				# key 1 is dead to everyone from here on
-	s1_scan(*, s2_wakeup)	# parks holding nothing but the head block
+	s1_scan(s2_wakeup)	# parks holding nothing but the head block
 	s3_vacuum				# entry deleted, chain freed, pages in the FSM
 	s2_freed
 	s2_insert				# key 9 spills into the pages key 1 gave up

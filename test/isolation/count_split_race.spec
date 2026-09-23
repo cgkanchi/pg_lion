@@ -127,16 +127,20 @@ step s3_note	{
 }
 step s3_verify	{ SELECT lion_index_verify('psr_k', true); }
 
-# The (*) marker tells isolationtester that the step blocks on something it
-# cannot see (an injection point is not a heavyweight lock), and the second
-# marker pins the report of its completion after the step that releases it.
+# The parked step carries no (*) marker: isolationtester sees a session
+# waiting on an injection point as blocked (pg_isolation_test_session_is_blocked
+# checks for it), so it moves on only once the step has really parked.  (*)
+# would move on at once, and the next step could then race the park - a slow
+# backend reached the point only after VACUUM had already run.  The marker in
+# parentheses pins the report of its completion after the step that releases
+# it.
 permutation
 	s3_prep					# make the heap all-visible
 	s2_delete				# k = 0's rows at the front of the heap
 	s3_vacuum				# ... so those pages have room again
 	s3_leaves
 	s3_note					# how many leaves the set has before the split
-	s1_count(*, s2_wakeup)	# parks holding a pin on the leftmost leaf
+	s1_count(s2_wakeup)	# parks holding a pin on the leftmost leaf
 	s2_insert				# grows that leaf's containers until it splits
 	s2_wakeup				# releases s1, which finishes its walk
 	s1_plain				# the truth now: s1's 50,000 plus the new 10,000

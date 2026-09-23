@@ -133,7 +133,7 @@ permutation
 	s3_root					# the root's block number
 	s2_predel				# 500 dead rows under k = 1, heap not vacuumed
 	s3_before				# a one-page set: the root is the leaf
-	s1_vacuum(*, s3_wake2)	# parks holding the cleanup lock on that page
+	s1_vacuum(s3_wake2)	# parks holding the cleanup lock on that page
 	s2_grow(*, s3_wake1)	# takes the entry page, blocks on the cleanup lock
 	s3_wake1				# VACUUM finds the entry page busy, parks unlocked
 	s3_after				# s2 has pushed the root down: internal, same block

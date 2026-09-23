@@ -132,7 +132,7 @@ permutation
 	s3_root					# the root's block number
 	s2_predel				# 500 rows dead to everyone, heap not vacuumed
 	s3_before				# a one-page set: the root is the leaf
-	s1_count(*, s2_wakeup)	# parks holding a pin on that root, with a copy
+	s1_count(s2_wakeup)	# parks holding a pin on that root, with a copy
 							# of the container holding the 500 dead TIDs
 	s2_grow					# overflows the page: the root is pushed down
 	s3_after				# the root is internal now, at the same block

@@ -165,7 +165,7 @@ permutation
 	s4_prep						# all-visible heap
 	s2_delete					# 966 rows of the RUN container, dead to all
 	s4_before					# k = 1 on one page, k = 2 on two leaves
-	s1_count(*, s2_wake_pinned)	# copies the entry, parks before the descent
+	s1_count(s2_wake_pinned)	# copies the entry, parks before the descent
 	s3_vacuum(s2_wake_both)		# regrow pushes k = 1's root down, parks with
 								# the stale container on the child
 	s2_wake_both				# the count descends to the child and waits

@@ -134,12 +134,16 @@ step s3_shape	{
 }
 step s3_verify	{ SELECT lion_index_verify('mces_go', true); }
 
-# The (*) marker tells isolationtester that the step blocks on something it
-# cannot see (an injection point is not a heavyweight lock), and the second
-# marker pins the report of its completion after the step that releases it.
+# The parked step carries no (*) marker: isolationtester sees a session
+# waiting on an injection point as blocked (pg_isolation_test_session_is_blocked
+# checks for it), so it moves on only once the step has really parked.  (*)
+# would move on at once, and the next step could then race the park - a slow
+# backend reached the point only after VACUUM had already run.  The marker in
+# parentheses pins the report of its completion after the step that releases
+# it.
 permutation
 	s3_prep					# make the heap all-visible
-	s1_group(*, s2_wakeup)	# parks between the first and second entry
+	s1_group(s2_wakeup)	# parks between the first and second entry
 	s2_fill					# fills column 2 and splits the shared leaf
 	s2_wakeup				# detaches the point and releases s1
 	s1_plain				# the heap's own answer
