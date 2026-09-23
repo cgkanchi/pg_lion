@@ -428,4 +428,19 @@ LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 COMMENT ON FUNCTION lion_index_verify(regclass, bool) IS
 	'check a lion index for structural damage, optionally also checking that every heap tuple is indexed';
 
+/*
+ * Who may call the diagnostic functions.  None of them checks table
+ * privileges or row-level security: lion_index_posting_root() answers "is
+ * this key in the index" for any key, lion_index_stats() gives row and key
+ * counts, and lion_index_verify() reads the whole heap (2026-09-23 review).
+ * So, like pageinspect's and amcheck's functions, they are not executable by
+ * PUBLIC, and as with pgstattuple the statistics are granted to
+ * pg_stat_scan_tables.  A superuser can GRANT the others where wanted.  The
+ * counting functions stay public: they check what the equivalent query would.
+ */
+REVOKE EXECUTE ON FUNCTION lion_index_posting_root(regclass, anyelement) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION lion_index_verify(regclass, bool) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION lion_index_stats(regclass) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION lion_index_stats(regclass) TO pg_stat_scan_tables;
+
 DROP FUNCTION lion_create_opclass_pre18(text, text, text);

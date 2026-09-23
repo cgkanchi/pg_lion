@@ -81,6 +81,49 @@ SELECT * FROM lion_explain_norm('SELECT name, count(*) FROM lion_coll GROUP BY n
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE k = 2;
 RESET enable_seqscan;
 DROP TABLE lion_coll;
+-- ---------- a PARTIAL index's predicate is read too (2026-09-23 review, finding 1) ----------
+-- The count of a partial index is the count of rows that satisfy its
+-- predicate, so it needs SELECT on the predicate's columns exactly as the
+-- query it stands for does; SELECT(id) alone would reveal `secret` a row at a
+-- time.
+CREATE TABLE lion_sec_p (id int NOT NULL, secret boolean NOT NULL);
+INSERT INTO lion_sec_p SELECT g, g % 2 = 0 FROM generate_series(1, 1000) g;
+CREATE INDEX lion_sec_p_id ON lion_sec_p USING lion (id) WHERE secret;
+VACUUM ANALYZE lion_sec_p;
+GRANT SELECT (id) ON lion_sec_p TO lion_sec_reader;
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_p_id', 2);                 -- denied: the predicate reads secret
+SELECT count(*) FROM lion_sec_p WHERE secret AND id = 2;         -- as the query it stands for is
+SELECT * FROM lion_index_count_group_stats('lion_sec_p_id');     -- and the grouped form
+RESET ROLE;
+GRANT SELECT (secret) ON lion_sec_p TO lion_sec_reader;
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_p_id', 2) AS even, lion_index_count('lion_sec_p_id', 3) AS odd;
+RESET ROLE;
+DROP TABLE lion_sec_p;
+-- ---------- the diagnostic functions are not for every role (2026-09-23 review, finding 2) ----------
+-- lion_index_posting_root() answers "is this key in the index" for any key,
+-- lion_index_stats() gives row and key counts, lion_index_verify() reads the
+-- whole heap: none of them checks table privileges or RLS, so like
+-- pageinspect's and amcheck's functions they are not executable by PUBLIC.
+CREATE TABLE lion_sec_d (k int NOT NULL);
+INSERT INTO lion_sec_d SELECT 1 FROM generate_series(1, 5000);
+CREATE INDEX lion_sec_d_k ON lion_sec_d USING lion (k) WITH (inline_limit = 64);
+SELECT lion_index_posting_root('lion_sec_d_k', 1) IS NOT NULL AS superuser_sees_the_root;
+SET ROLE lion_sec_reader;
+SELECT lion_index_posting_root('lion_sec_d_k', 1);
+SELECT lion_index_posting_root('lion_sec_d_k', 2);
+SELECT entries, ntids FROM lion_index_stats('lion_sec_d_k');
+SELECT lion_index_verify('lion_sec_d_k');
+RESET ROLE;
+-- pg_stat_scan_tables may read the statistics, as it may pgstattuple's
+GRANT pg_stat_scan_tables TO lion_sec_reader;
+SET ROLE lion_sec_reader;
+SELECT entries, ntids FROM lion_index_stats('lion_sec_d_k');
+SELECT lion_index_posting_root('lion_sec_d_k', 1);           -- still not the probe
+RESET ROLE;
+REVOKE pg_stat_scan_tables FROM lion_sec_reader;
+DROP TABLE lion_sec_d;
 DROP TABLE lion_sec;
 DROP ROLE lion_sec_reader;
 DROP ROLE lion_sec_other;

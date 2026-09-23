@@ -64,6 +64,7 @@
 #include "common/hashfn.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
@@ -4959,23 +4960,47 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 
 	/*
 	 * Privileges: exactly what the equivalent query needs.  SELECT count(*)
-	 * FROM t WHERE col = key references only col, so SELECT on the table or
-	 * on every indexed column is required; with less than that the count
-	 * would let a caller probe values it is not allowed to read.
+	 * FROM t WHERE col = key references col, so SELECT on the table or on
+	 * every column the index reads is required; with less than that the
+	 * count would let a caller probe values it is not allowed to read.
+	 *
+	 * "Every column the index reads" is more than its key columns.  The count
+	 * of a PARTIAL index is the count of the rows that satisfy its predicate,
+	 * so the query it stands for is `... WHERE pred AND col = key` and reads
+	 * the predicate's columns too - with SELECT(id) alone, a partial index
+	 * `(id) WHERE secret` answers 1 or 0 and so reveals `secret` a row at a
+	 * time (2026-09-23 review).  An expression column reads whatever its
+	 * expression does, and a whole-row reference reads every column, which
+	 * only a table-level grant covers.
 	 */
 	if (pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
 	{
 		for (i = 0; i < nidx; i++)
 		{
 			Relation	index = call->index[i];
+			Bitmapset  *cols = NULL;
 			int			c;
+			int			m;
 
 			/* EVERY key column is referenced, not just the first (§24). */
 			for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
 			{
 				AttrNumber	attnum = index->rd_index->indkey.values[c];
 
-				if (pg_attribute_aclcheck(heapoid, attnum, GetUserId(),
+				if (attnum != 0)
+					cols = bms_add_member(cols,
+										  attnum - FirstLowInvalidHeapAttributeNumber);
+			}
+			pull_varattnos((Node *) RelationGetIndexExpressions(index), 1, &cols);
+			pull_varattnos((Node *) RelationGetIndexPredicate(index), 1, &cols);
+
+			m = -1;
+			while ((m = bms_next_member(cols, m)) >= 0)
+			{
+				AttrNumber	attnum = m + FirstLowInvalidHeapAttributeNumber;
+
+				if (attnum == InvalidAttrNumber ||
+					pg_attribute_aclcheck(heapoid, attnum, GetUserId(),
 										  ACL_SELECT) != ACLCHECK_OK)
 					aclcheck_error(ACLCHECK_NO_PRIV,
 								   get_relkind_objtype(call->heap->rd_rel->relkind),

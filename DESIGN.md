@@ -614,8 +614,16 @@ Why this is safe (the argument reviewers will check — keep the code shaped lik
 Four rules added after the 2026-09-20 adversarial review (all implemented and regression-tested in
 test/sql/security.sql and test/isolation/count_serializable.spec):
 - **Privileges.** The SQL count functions require what the equivalent query requires: SELECT on the
-  table, or SELECT on every indexed column they touch; otherwise `permission denied`. The CustomScan
-  path is covered by the executor's own ExecCheckPermissions on the range table.
+  table, or SELECT on every column the index reads - its key columns, the columns of its
+  expressions and of its PREDICATE (a partial index's count is `... WHERE pred AND col = key`, so
+  SELECT(id) alone on `(id) WHERE secret` would reveal `secret` a row at a time; a whole-row
+  reference needs the table-level grant); otherwise `permission denied` (2026-09-23 review). The
+  CustomScan path is covered by the executor's own ExecCheckPermissions on the range table, and a
+  partial index reaches it only when the query implies the predicate, i.e. references it. The
+  diagnostic functions check neither privileges nor RLS - `lion_index_posting_root()` answers key
+  membership, `lion_index_stats()` gives counts, `lion_index_verify()` reads the heap - so they are
+  revoked from PUBLIC like pageinspect's and amcheck's (`lion_index_stats()` is granted to
+  `pg_stat_scan_tables`, as pgstattuple's functions are).
 - **Row-level security.** The SQL functions refuse a table on which RLS applies to the caller
   (policies would have to be evaluated per row); the CustomScan declines relations with security
   quals, so the ordinary plan applies the policies.
