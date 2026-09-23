@@ -62,7 +62,7 @@ jobs:
           .local/pg/bin/pg_config --version
 
       - name: Build
-        run: make -j4
+        run: make -j4 WERROR=1
 
       - name: Install
         run: sudo make install PG_CONFIG="$PWD/$PG_CONFIG"
@@ -141,7 +141,7 @@ jobs:
           .local/pg/bin/pg_config --version
 
       - name: Build
-        run: make -j4
+        run: make -j4 WERROR=1
 
       - name: Install
         run: make install
@@ -232,7 +232,7 @@ jobs:
           cd "$RUNNER_TEMP"/dist/pg_lion-*/
           mkdir -p .local
           ln -sfn "/usr/lib/postgresql/$PG" .local/pg
-          make -j4
+          make -j4 WERROR=1
           sudo make install PG_CONFIG="$PWD/.local/pg/bin/pg_config"
           make unit
           ./dev.sh reset

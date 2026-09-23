@@ -16,6 +16,12 @@ ISOLATION = $(patsubst test/isolation/%.spec,%,$(sort $(wildcard test/isolation/
 ISOLATION_OPTS = --inputdir=test/isolation --outputdir=test/isolation
 
 PG_CFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Isrc
+# `make WERROR=1` makes every warning an error, here and in the unit tests; CI
+# builds that way on every supported major.  The two -Wno- flags stay: the
+# PostgreSQL headers themselves trip both.
+ifeq ($(WERROR),1)
+PG_CFLAGS += -Werror
+endif
 EXTRA_CLEAN = test/unit/container_test test/unit/sparse_test test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
@@ -36,6 +42,9 @@ include $(PGXS)
 # Standalone unit tests for the container library (no server needed).
 UNIT_CFLAGS = -O1 -g -Wall -Wextra -Wno-unused-parameter -DFRONTEND -Isrc \
               -I$(shell $(PG_CONFIG) --includedir-server) -I$(shell $(PG_CONFIG) --includedir)
+ifeq ($(WERROR),1)
+UNIT_CFLAGS += -Werror
+endif
 # pkglibdir first: the Debian/Ubuntu packages put the server's own
 # libpgcommon.a and libpgport.a there, while libdir holds libpq-dev's copies,
 # which are of whatever major libpq-dev is at.  Source builds have them in
