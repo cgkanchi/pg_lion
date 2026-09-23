@@ -15,7 +15,8 @@ import tempfile
 import time
 
 from db import DB, DatabaseError, digest, nodes
-from workloads import FAMILIES, scalar_data, scalar_cases, doc_data, doc_cases, index_specs
+from workloads import (FAMILIES, FOCUSED_FAMILIES, AFTER_MAINTENANCE, scalar_data,
+                       doc_data, profile_cases, profile_indexes, measurement_matrix)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -87,6 +88,8 @@ class Suite:
         if args.resume:
             self.previous = json.loads((self.output/'metadata.json').read_text())
             previous_args = self.previous['arguments']
+            if previous_args.get('profile', 'full') != args.profile:
+                raise ValueError('Cannot resume with a different benchmark profile')
             for key,value in vars(args).items():
                 if key != 'resume' and key in previous_args and value != previous_args[key]:
                     raise ValueError(f'Cannot resume with changed {key}: {value} != {previous_args[key]}')
@@ -94,6 +97,9 @@ class Suite:
                 raise ValueError('Cannot resume measurements against a different source commit')
             old_events=[json.loads(line) for line in (self.output/'operations.jsonl').read_text().splitlines()]
             old_samples=[json.loads(line) for line in (self.output/'samples.jsonl').read_text().splitlines()]
+            from audit import expected_configurations
+            expected_warm, expected_cold = expected_configurations(
+                self.previous, json.loads((self.output/'queries.json').read_text()))
             self.completed={(e['suite'],e['rows'],e['family']) for e in old_events if e['kind']=='dataset_complete'}
             # Compatibility with the first run, before explicit completion checkpoints existed.
             for e in old_events:
@@ -101,8 +107,9 @@ class Suite:
                     continue
                 suite,n,family=e['suite'],e['rows'],e['family']
                 variants=['roaring','roaring_bitmap'] if family=='roaring' else [family]
-                warm_configs=42 if suite=='documents' else 166+(4 if args.maintenance else 0)
-                expected=(warm_configs*args.repeats+(2*args.cold_repeats if suite=='scalar' else 0))*len(variants)
+                warm = {k for k in expected_warm if k[0] == suite and k[1] == n and k[2] in variants}
+                cold = {k for k in expected_cold if k[0] == suite and k[1] == n and k[2] in variants}
+                expected = len(warm)*args.repeats + len(cold)*args.cold_repeats
                 actual=sum(s['suite']==suite and s['rows']==n and s['variant'] in variants for s in old_samples)
                 if actual==expected:
                     self.completed.add((suite,n,family))
@@ -113,7 +120,7 @@ class Suite:
                           op.get('rows') == n and op.get('family') == family and
                           op['kind'] in ['insert','indexed_update','delete','vacuum','reindex'] and
                           op.get('status') == 'error']
-                before_maintenance = (166 * args.repeats + 2 * args.cold_repeats) * len(variants)
+                before_maintenance = sum(k[3] != 'after_maintenance' for k in warm)*args.repeats + len(cold)*args.cold_repeats
                 if suite == 'scalar' and failed and actual == before_maintenance:
                     self.completed.add((suite,n,family))
                     if not any(op['kind']=='skipped_configuration' and op.get('suite')==suite and
@@ -184,7 +191,7 @@ class Suite:
 
     def indexes(self, suite, family, n):
         table = 'fact' if suite == 'scalar' else 'docs'
-        specs = index_specs(suite, family)
+        specs = profile_indexes(suite, family, self.args.profile)
         failed=set()
         for rep in range(self.args.build_repeats):
             for name, sql in specs:
@@ -305,7 +312,9 @@ class Suite:
                        driver='Python threads + synchronous libpq; includes client/result overhead')
 
     def run_dataset(self, suite, n):
-        cases = scalar_cases() if suite == 'scalar' else doc_cases()
+        cases = profile_cases(suite, self.args.profile)
+        by_id = {c.id: c for c in cases}
+        matrix = measurement_matrix(suite, self.args.profile, self.args.maintenance)
         families = list(self.args.families if suite == 'scalar' else
                         [x for x in self.args.families if x in ['seq','gin','gist','roaring']])
         self.rng.shuffle(families)
@@ -323,9 +332,12 @@ class Suite:
             self.db.query(f'VACUUM (FREEZE, ANALYZE) {table}')
             self.indexes(suite, family, n)
             variants = ['roaring','roaring_bitmap'] if family == 'roaring' else [family]
-            phases = ['clean', 'dirty_clustered_5pct', 'dirty_scattered'] if suite == 'scalar' else ['clean']
+            phases = list(dict.fromkeys(config['phase'] for config in matrix
+                                       if config['phase'] not in ['low_work_mem', 'after_maintenance']))
             for phase in phases:
-                selected = cases if phase == 'clean' else [c for c in cases if c.stress]
+                configs = [c for c in matrix if c['phase'] == phase or
+                           (phase == 'clean' and c['phase'] == 'low_work_mem')]
+                selected = [by_id[name] for name in dict.fromkeys(name for c in configs for name in c['cases'])]
                 if phase == 'dirty_clustered_5pct':
                     self.db.query(f"UPDATE {table} SET payload=reverse(payload) WHERE id <= {max(1,n//20)}")
                     self.db.query(f'ANALYZE {table}')
@@ -336,10 +348,11 @@ class Suite:
                 expected = self.reference(selected)
                 self.log(f'{suite} rows={n} family={family}: {phase}, {len(selected)} cases')
                 for variant in variants:
-                    self.measure(suite,n,variant,phase,selected,expected)
+                    for config in configs:
+                        self.measure(suite,n,variant,config['phase'],
+                                     [by_id[name] for name in config['cases']], expected,
+                                     modes=[config['mode']], memory=config['memory'])
                     if phase == 'clean' and suite == 'scalar':
-                        stress = [c for c in cases if c.id in ['eq_c2_0','in_c20k_1000','group_c200','fetch_medium']]
-                        self.measure(suite,n,variant,'low_work_mem',stress,expected,modes=['prefer_index'],memory='64kB')
                         if self.args.cold_repeats:
                             self.cold(suite,n,variant,[c for c in cases if c.id in ['eq_c200_17','fetch_medium']])
                         if self.args.duration:
@@ -350,8 +363,9 @@ class Suite:
                 operations = [('insert',f'INSERT INTO fact {scalar_data(max(1,n//100),start=n+1)}'),
                               ('indexed_update',f'UPDATE fact SET c200=(c200+1)%200 WHERE id<={max(1,n//100)}'),
                               ('delete',f'DELETE FROM fact WHERE id%100=1'),
-                              ('vacuum','VACUUM (ANALYZE) fact'),
-                              ('reindex','REINDEX TABLE fact')]
+                              ('vacuum','VACUUM (ANALYZE) fact')]
+                if self.args.profile == 'full':
+                    operations.append(('reindex','REINDEX TABLE fact'))
                 failed_operation = None
                 for label,sql in operations:
                     self.db.query('CHECKPOINT')
@@ -362,7 +376,7 @@ class Suite:
                         failed_operation = label
                         self.log(f'{suite} rows={n} family={family}: {label} failed; dependent maintenance checks skipped')
                         break
-                check = [c for c in cases if c.id in ['eq_c200_17','and2','is_null','group_c200']]
+                check = [by_id[name] for name in AFTER_MAINTENANCE]
                 if failed_operation:
                     for variant in variants:
                         for case in check:
@@ -397,15 +411,23 @@ class Suite:
                 note='Fresh owned cluster; retained completed portfolios; shuffled rounds restart from the configured seed')]
         try:
             self.cluster.start(initialize=True)
-            for ext in ['pg_lion','btree_gin','btree_gist','pg_visibility']:
+            extensions = ['pg_lion', 'pg_visibility']
+            if 'gin' in self.args.families:
+                extensions.append('btree_gin')
+            if 'gist' in self.args.families:
+                extensions.append('btree_gist')
+            for ext in extensions:
                 self.db.query(f'CREATE EXTENSION {ext}')
             metadata['server_version'] = self.db.scalar('SELECT version()')
             metadata['settings'] = self.db.query('SELECT name,setting,unit,source FROM pg_settings ORDER BY name',dictionaries=True)
             (self.output/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
             (self.output/'queries.json').write_text(json.dumps({
-                'scalar':[c.record() for c in scalar_cases()],
-                'documents':[c.record() for c in doc_cases()],
-                'indexes':{s:{f:index_specs(s,f) for f in (FAMILIES if s=='scalar' else ['seq','gin','gist','roaring'])}
+                'scalar':[c.record() for c in profile_cases('scalar', self.args.profile)],
+                'documents':[c.record() for c in profile_cases('documents', self.args.profile)],
+                'matrix':{s:measurement_matrix(s, self.args.profile, self.args.maintenance)
+                          for s in ['scalar', 'documents']},
+                'indexes':{s:{f:profile_indexes(s,f,self.args.profile) for f in self.args.families
+                             if s == 'scalar' or f in ['seq','gin','gist','roaring']}
                            for s in ['scalar','documents']}},indent=2)+'\n')
             for n in self.args.rows:
                 self.run_dataset('scalar',n)
@@ -426,27 +448,40 @@ class Suite:
             self.log(f"artifacts: {self.output}; recorded errors: {self.errors}")
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--prefix',required=True,help='Installed PostgreSQL with pg_lion, btree_gin, btree_gist, pg_visibility')
+    p.add_argument('--prefix',required=True,help='Installed PostgreSQL with pg_lion, pg_visibility and support extensions for selected families')
     p.add_argument('--output',required=True,help='New output directory (refuses overwrite)')
+    p.add_argument('--profile', choices=['focused', 'full'], default='focused',
+                   help='focused (default): relevant competitors and representative cases; full: legacy exhaustive matrix')
     p.add_argument('--rows',type=int,nargs='+',default=[1000000,5000000])
     p.add_argument('--documents',type=int,default=200000)
-    p.add_argument('--families',nargs='+',choices=FAMILIES,default=FAMILIES)
-    p.add_argument('--repeats',type=int,default=10)
-    p.add_argument('--warmups',type=int,default=2)
-    p.add_argument('--build-repeats',type=int,default=3)
-    p.add_argument('--cold-repeats',type=int,default=3)
+    p.add_argument('--families',nargs='+',choices=FAMILIES,help='Default: btree gin roaring; full profile: all families. roaring also measures roaring_bitmap')
+    p.add_argument('--repeats',type=int,help='Timing rounds: focused 3, full 10')
+    p.add_argument('--warmups',type=int,help='Warmups: focused 1, full 2')
+    p.add_argument('--build-repeats',type=int,help='Build trials: focused 1, full 3')
+    p.add_argument('--cold-repeats',type=int,help='Restart trials per selected query: focused 0, full 3')
     p.add_argument('--clients',type=int,nargs='+',default=[1,4,8])
-    p.add_argument('--duration',type=float,default=5,help='Seconds per concurrency point; 0 disables')
+    p.add_argument('--duration',type=float,help='Seconds per concurrency point: focused 0 (disabled), full 5')
     p.add_argument('--maintenance',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--keep-cluster',action='store_true')
     p.add_argument('--resume',action='store_true',help='Resume a stopped run at a completed portfolio boundary, with identical arguments')
     p.add_argument('--seed',type=int,default=20260920)
     p.add_argument('--preload',action='store_true',help="Start the cluster with shared_preload_libraries='pg_lion' so lion indexes use the custom WAL resource manager (wal_mode=auto -> rmgr)")
-    args = p.parse_args()
+    args = p.parse_args(argv)
+    full = args.profile == 'full'
+    defaults = dict(families=FAMILIES if full else FOCUSED_FAMILIES,
+                    repeats=10 if full else 3, warmups=2 if full else 1,
+                    build_repeats=3 if full else 1, cold_repeats=3 if full else 0,
+                    duration=5 if full else 0)
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
     if min(args.rows)<1 or args.documents<0 or args.repeats<1 or args.build_repeats<1 or args.warmups<0 or args.cold_repeats<0 or args.duration<0 or min(args.clients)<1:
         p.error('Rows, repeats, builds, and clients must be positive; optional counts must be nonnegative')
+    for name in ('rows', 'families', 'clients'):
+        if len(getattr(args, name)) != len(set(getattr(args, name))):
+            p.error(f'--{name} must not contain duplicates')
     return args
 
 

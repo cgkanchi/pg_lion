@@ -7,6 +7,61 @@ from dataclasses import dataclass, asdict
 
 SCALAR_COLUMNS = ['c2', 'c20', 'c200', 'c20k', 'c1m', 'clustered', 'skew', 'nullable']
 FAMILIES = ['seq', 'btree', 'btree_tuned', 'hash', 'gin', 'gist', 'brin', 'roaring']
+FOCUSED_FAMILIES = ['btree', 'gin', 'roaring']
+FOCUSED_SCALAR = [
+    'eq_c2_0', 'eq_c200_17', 'eq_c20k_123', 'eq_c1m_12345', 'eq_skew_0', 'eq_skew_17',
+    'in_c20k_10', 'in_c20k_1000', 'and2', 'and3_selective', 'in_and', 'or_columns',
+    'is_null', 'fetch_medium', 'range_random', 'ordered_limit',
+    'group_c2', 'group_c200', 'group_filtered',
+]
+FOCUSED_DOCS = [
+    'array_common', 'array_and', 'array_or', 'ts_common', 'ts_rare', 'ts_and',
+    'ts_tree', 'ts_phrase', 'ts_prefix', 'ts_fetch',
+]
+AFTER_MAINTENANCE = ['eq_c200_17', 'and2', 'is_null', 'group_c200']
+
+
+def profile_cases(suite, profile):
+    cases = scalar_cases() if suite == 'scalar' else doc_cases()
+    if profile == 'full':
+        return cases
+    names = FOCUSED_SCALAR if suite == 'scalar' else FOCUSED_DOCS
+    by_id = {c.id: c for c in cases}
+    return [by_id[name] for name in names]
+
+
+def profile_indexes(suite, family, profile):
+    specs = index_specs(suite, family)
+    if profile == 'full':
+        return specs
+    # Same full-width heaps; pay only for indexes exercised by the selected cases.
+    unused = {'ix_clustered'} if suite == 'scalar' else {'ix_grp'}
+    return [(name, sql) for name, sql in specs if name not in unused]
+
+
+def measurement_matrix(suite, profile, maintenance=True):
+    """The warm configurations, saved with each run for independent auditing."""
+    cases = profile_cases(suite, profile)
+    matrix = []
+
+    def add(phase, names, modes=('default',), memory='64MB'):
+        for mode in modes:
+            matrix.append(dict(phase=phase, cases=list(names), mode=mode, memory=memory))
+
+    modes = ('default', 'prefer_index') if profile == 'full' else ('default',)
+    add('clean', [c.id for c in cases], modes)
+    if suite == 'scalar':
+        add('low_work_mem', ['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium'],
+            ('prefer_index',), '64kB')
+        if profile == 'full':
+            for phase in ('dirty_clustered_5pct', 'dirty_scattered'):
+                add(phase, [c.id for c in cases if c.stress], modes)
+        else:
+            add('dirty_scattered', ['eq_c2_0', 'eq_c200_17', 'and2', 'group_c200'])
+            add('dirty_scattered', ['group_c200'], ('prefer_index',))
+        if maintenance:
+            add('after_maintenance', AFTER_MAINTENANCE)
+    return matrix
 
 
 @dataclass(frozen=True)

@@ -229,11 +229,16 @@ class Stress:
     def run(self):
         try:
             self.cluster.start(initialize=True)
-            for ext in ['pg_lion','btree_gin','btree_gist','pg_visibility']:
+            extensions = ['pg_lion', 'pg_visibility']
+            if 'gin' in self.args.families:
+                extensions.append('btree_gin')
+            if 'gist' in self.args.families:
+                extensions.append('btree_gist')
+            for ext in extensions:
                 self.db.query(f'CREATE EXTENSION {ext}')
             self.metadata['server_version']=self.db.scalar('SELECT version()')
             self.metadata['settings']=self.db.query('SELECT name,setting,unit FROM pg_settings ORDER BY name',dictionaries=True)
-            methods=list(METHODS)
+            methods=list(self.args.families)
             self.rng.shuffle(methods)
             for method in methods:
                 self.growth(method)
@@ -257,12 +262,15 @@ if __name__=='__main__':
     p.add_argument('--prefix',required=True)
     p.add_argument('--output',required=True)
     p.add_argument('--rows',type=int,default=100000)
-    p.add_argument('--cycles',type=int,default=5)
-    p.add_argument('--repeats',type=int,default=10)
-    p.add_argument('--clients',type=int,nargs='+',default=[1,4,8])
+    p.add_argument('--families',nargs='+',choices=METHODS,default=['btree','gin','roaring'])
+    p.add_argument('--cycles',type=int,default=2)
+    p.add_argument('--repeats',type=int,default=3)
+    p.add_argument('--clients',type=int,nargs='+',default=[1,4])
     p.add_argument('--duration',type=float,default=3)
     p.add_argument('--seed',type=int,default=20260921)
     args=p.parse_args()
     if args.rows<100 or args.cycles<1 or args.repeats<1 or args.duration<0 or min(args.clients)<1:
         p.error('Rows >= 100, cycles/repeats/clients >= 1, duration >= 0 required')
+    if len(args.families) != len(set(args.families)) or len(args.clients) != len(set(args.clients)):
+        p.error('Families and client counts must not contain duplicates')
     Stress(args).run()

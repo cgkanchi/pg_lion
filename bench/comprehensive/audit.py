@@ -21,6 +21,14 @@ def expected_configurations(meta, queries):
                 continue
             variants = ['roaring', 'roaring_bitmap'] if family == 'roaring' else [family]
             for variant in variants:
+                if 'matrix' in queries:
+                    for config in queries['matrix'][suite]:
+                        for case in config['cases']:
+                            warm.add((suite, n, variant, config['phase'], config['mode'], config['memory'], case))
+                    if suite == 'scalar' and args['cold_repeats']:
+                        for case in ['eq_c200_17', 'fetch_medium']:
+                            cold.add((suite, n, variant, 'shared_buffers_cold', 'default', '64MB', case))
+                    continue
                 for case in queries[suite]:
                     for mode in ['default', 'prefer_index']:
                         warm.add((suite, n, variant, 'clean', mode, '64MB', case['id']))
@@ -57,7 +65,7 @@ def manifest(directory):
 def audit_stress(directory, meta):
     args = meta['arguments']
     records = [json.loads(x) for x in (directory / 'stress.jsonl').read_text().splitlines()]
-    methods = ['seq', 'btree', 'hash', 'gin', 'gist', 'brin', 'roaring']
+    methods = args.get('families', ['seq', 'btree', 'hash', 'gin', 'gist', 'brin', 'roaring'])
     expected = set()
     for method in methods:
         variants = ['roaring', 'roaring_bitmap'] if method == 'roaring' else [method]
