@@ -2692,6 +2692,10 @@ leaf that holds ONE entry must still have room for the high key a split would gi
 that would exceed it spills onto container pages exactly as one that exceeds `inline_limit` does.
 *(Not in the first draft of this section, which did not notice that a 2000-byte key with a
 4096-byte inline payload plus a 2000-byte high key is 40 bytes over a page.)*
+*(Nor did the first build: ambuild spilled at `inline_limit` alone, so an INSERTer could leave a
+posting set that INSERT had spilled but REINDEX, VACUUM FULL or a restore kept INLINE and could not
+write - 3900 rows of one 1990-byte key made a 6092-byte entry. Build and INSERT now take the bound
+from one function, lion_inline_max(); the 2026-09-23 review found it.)*
 
 ### The order
 

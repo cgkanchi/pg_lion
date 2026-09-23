@@ -1214,6 +1214,20 @@ extern Size lion_entry_alloc_size(Size payoff, Size paylen, Size inline_limit,
 								  Size maxsize);
 
 /*
+ * The largest INLINE payload an entry whose payload starts at `payoff` may
+ * carry: inline_limit, unless the key leaves less than that of
+ * LION_MAX_ENTRY_SIZE.  A posting set past it spills onto container pages.
+ * ambuild and INSERT both decide with this, so that every set an INSERT
+ * could produce, a rebuild can write again.
+ */
+static inline Size
+lion_inline_max(Size payoff, Size inline_limit)
+{
+	Assert(payoff < (Size) LION_MAX_ENTRY_SIZE);
+	return Min(inline_limit, (Size) LION_MAX_ENTRY_SIZE - payoff);
+}
+
+/*
  * Like lion_chain_put_container(), but for a container page the caller has
  * already located and locked EXCLUSIVE (a cleanup lock counts); the buffer
  * stays locked.  The page must be the one that owns c->ckey.
