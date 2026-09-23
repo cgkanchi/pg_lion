@@ -594,6 +594,91 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 SELECT v, count(*) FROM lion_pdn GROUP BY v ORDER BY v;
 
+-- ---- bpchar: an equalimage function that is not enough -----------------
+/*
+ * bpchar registers btvarstrequalimage, which says yes under a deterministic
+ * collation, yet 'a   ' = 'a' and the two are different values: unconstrained
+ * bpchar keeps the blanks it was given, and bpchar's output prints them.  The
+ * entry kept the spelling of a row that has since been deleted, and printing
+ * it leaked that row's value (the 2026-09-23 review).  lion_pd() cannot see
+ * the difference - EXCEPT ALL compares with bpchareq - so the value is printed
+ * through format() under both settings.  Counting is still pushed down.
+ */
+CREATE TABLE lion_pdb (c bpchar, k int);
+INSERT INTO lion_pdb VALUES ('a   ', 1);
+CREATE INDEX lion_pdb_c ON lion_pdb USING lion (c);
+CREATE INDEX lion_pdb_k ON lion_pdb USING lion (k);
+DELETE FROM lion_pdb;
+INSERT INTO lion_pdb VALUES ('a', 1);
+ANALYZE lion_pdb;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT lion_pd('SELECT c, count(*) FROM lion_pdb GROUP BY c');
+SELECT lion_pd('SELECT c, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY c');
+SELECT lion_pd('SELECT k, c, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY k, c');
+SELECT lion_pd('SELECT count(*) FROM lion_pdb WHERE c = ''a''');
+SELECT lion_pd('SELECT k, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY k');
+SET pg_lion.enable_count_pushdown = on;
+SELECT format('[%s]', c) AS c, n FROM (SELECT c, count(*) AS n FROM lion_pdb GROUP BY c) s;
+SELECT format('[%s]', c) AS c, n FROM (SELECT c, count(*) AS n FROM lion_pdb WHERE c = 'a' GROUP BY c) s;
+SELECT k, format('[%s]', c) AS c, n FROM (SELECT k, c, count(*) AS n FROM lion_pdb WHERE c = 'a' GROUP BY k, c) s;
+SET pg_lion.enable_count_pushdown = off;
+SELECT format('[%s]', c) AS c, n FROM (SELECT c, count(*) AS n FROM lion_pdb GROUP BY c) s;
+RESET pg_lion.enable_count_pushdown;
+/*
+ * The other core types whose equality is coarser than their bytes - float8
+ * (-0 and 0), interval ('1 day' and '24 hours'), numeric above - register no
+ * equalimage function at all and were refused already; they stay refused.
+ */
+CREATE TABLE lion_pdf (f float8, i interval);
+INSERT INTO lion_pdf VALUES ('-0', '1 day');
+CREATE INDEX lion_pdf_f ON lion_pdf USING lion (f);
+CREATE INDEX lion_pdf_i ON lion_pdf USING lion (i);
+DELETE FROM lion_pdf;
+INSERT INTO lion_pdf VALUES ('0', '24 hours');
+ANALYZE lion_pdf;
+SELECT lion_pd('SELECT f, count(*) FROM lion_pdf GROUP BY f');
+SELECT lion_pd('SELECT i, count(*) FROM lion_pdf GROUP BY i');
+SELECT f, i FROM (SELECT f, count(*) FROM lion_pdf GROUP BY f) a,
+	(SELECT i, count(*) FROM lion_pdf GROUP BY i) b;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- ---- an unpopulated materialized view --------------------------------
+/*
+ * Core refuses to scan a materialized view created WITH NO DATA
+ * (ExecOpenScanRelation()), and the node has to as well rather than count
+ * the empty heap: every shape errors the same way, EXPLAIN without ANALYZE
+ * and CREATE TABLE AS ... WITH NO DATA do not, and a REFRESH brings the
+ * pushdown back.
+ */
+CREATE MATERIALIZED VIEW lion_pdm AS
+	SELECT g % 3 AS k, g % 5 AS j FROM generate_series(1, 10) g WITH NO DATA;
+CREATE INDEX lion_pdm_k ON lion_pdm USING lion (k);
+CREATE INDEX lion_pdm_j ON lion_pdm USING lion (j);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_pdm GROUP BY k;
+SELECT k, count(*) FROM lion_pdm GROUP BY k;
+SELECT count(*) FROM lion_pdm WHERE k = 1;
+SELECT count(*) FROM lion_pdm WHERE k IS NOT NULL;
+SELECT count(DISTINCT k) FROM lion_pdm;
+SELECT j, count(DISTINCT k) FROM lion_pdm GROUP BY j;
+SET pg_lion.enable_count_pushdown = off;
+SELECT k, count(*) FROM lion_pdm GROUP BY k;
+RESET pg_lion.enable_count_pushdown;
+CREATE TEMP TABLE lion_pdm_nd AS SELECT k, count(*) FROM lion_pdm GROUP BY k WITH NO DATA;
+DROP TABLE lion_pdm_nd;
+REFRESH MATERIALIZED VIEW lion_pdm;
+SELECT lion_pd('SELECT k, count(*) FROM lion_pdm GROUP BY k');
+SELECT lion_pd('SELECT count(*) FROM lion_pdm WHERE k = 1');
+SELECT lion_pd('SELECT j, count(DISTINCT k) FROM lion_pdm GROUP BY j');
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP MATERIALIZED VIEW lion_pdm;
+DROP TABLE lion_pdf;
+DROP TABLE lion_pdb;
+
 -- ---- prepared statements: a parameter where a literal may stand -------
 /*
  * A GENERIC plan keeps `a = $1` as a Param, and the pushdown used to accept
