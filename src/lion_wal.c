@@ -604,10 +604,7 @@ lion_wal_op_replace(LionWalState *state, Page page, OffsetNumber off,
 	 * runs inside the critical section on every insert.
 	 */
 	if (len > oldlen)
-	{
 		memset(state->savebuf + oldlen, 0, len - oldlen);
-		oldlen = len;
-	}
 
 	b = lion_wal_find_block(state, page);
 	startpos = (Size) b->ops.len;

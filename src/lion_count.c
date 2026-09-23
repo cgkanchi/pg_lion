@@ -4868,6 +4868,9 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	Oid			heapoid = InvalidOid;
 	int			i;
 
+	/* index[] and keytype[] hold two; every caller opens one or two */
+	Assert(nidx >= 1 && nidx <= lengthof(call->index));
+
 	call->nkeys = nidx;
 	call->heap = NULL;
 	for (i = 0; i < 2; i++)

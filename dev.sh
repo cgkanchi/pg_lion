@@ -6,13 +6,13 @@ export PGHOST=${LION_SOCK:-/tmp/claude-1000/pgsk} PGPORT=${LION_PORT:-54329} PGU
 export PATH=$P/.local/pg/bin:$PATH
 D=$P/.local/data
 case "$1" in
-  start)   mkdir -p $PGHOST; pg_ctl -D $D -l $P/.local/pg.log start ;;
-  stop)    pg_ctl -D $D stop -m fast ;;
-  restart) pg_ctl -D $D -l $P/.local/pg.log restart -m fast ;;
+  start)   mkdir -p "$PGHOST"; pg_ctl -D "$D" -l "$P/.local/pg.log" start ;;
+  stop)    pg_ctl -D "$D" stop -m fast ;;
+  restart) pg_ctl -D "$D" -l "$P/.local/pg.log" restart -m fast ;;
   psql)    shift; exec psql -X "$@" ;;
   env)     printf "export PGHOST=%q PGPORT=%q PGUSER=%q PGDATABASE=%q PATH=%q\n" "$PGHOST" "$PGPORT" "$PGUSER" "$PGDATABASE" "$PATH" ;;
-  reset)   pg_ctl -D $D stop -m fast >/dev/null 2>&1; rm -rf $D; initdb -D $D -U postgres --no-locale -E UTF8 >/dev/null
-           cat >> $D/postgresql.conf <<CONF
+  reset)   pg_ctl -D "$D" stop -m fast >/dev/null 2>&1; rm -rf "$D"; initdb -D "$D" -U postgres --no-locale -E UTF8 >/dev/null
+           cat >> "$D/postgresql.conf" <<CONF
 port = $PGPORT
 unix_socket_directories = '$PGHOST'
 listen_addresses = ''
@@ -29,6 +29,6 @@ autovacuum = off
 jit = off
 log_min_messages = warning
 CONF
-           mkdir -p $PGHOST; pg_ctl -D $D -l $P/.local/pg.log start >/dev/null && echo "cluster reset and started on $PGHOST:$PGPORT" ;;
+           mkdir -p "$PGHOST"; pg_ctl -D "$D" -l "$P/.local/pg.log" start >/dev/null && echo "cluster reset and started on $PGHOST:$PGPORT" ;;
   *) echo "usage: $0 {start|stop|restart|psql|reset|env}"; exit 1 ;;
 esac

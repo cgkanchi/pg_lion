@@ -43,7 +43,7 @@ jobs:
       PG: ${{ matrix.pg }}
       PG_CONFIG: .local/pg/bin/pg_config
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install PostgreSQL ${{ matrix.pg }} from apt.postgresql.org
         run: |
@@ -102,7 +102,7 @@ jobs:
       # Fail rather than skip if the injection_points module is missing.
       INJECTION_POINTS: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve the upstream commit
         id: upstream
@@ -113,7 +113,7 @@ jobs:
 
       - name: Cache the PostgreSQL build
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.PGPREFIX }}
           key: pg-${{ runner.os }}-${{ matrix.branch }}-${{ steps.upstream.outputs.sha }}-cassert-inj-v1
@@ -190,7 +190,7 @@ jobs:
     env:
       PG: "18"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Validate META.json
         run: |
