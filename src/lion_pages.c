@@ -32,7 +32,6 @@
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
 #include "utils/hsearch.h"
-#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -432,13 +431,10 @@ lion_ltopr_sorts_with(Oid ltopr, Oid cmpfunc)
 {
 	Oid			opfamily;
 	Oid			opcintype;
-	CompareType cmptype;
 
 	if (!OidIsValid(ltopr) || !OidIsValid(cmpfunc))
 		return false;
-	if (!get_ordering_op_properties(ltopr, &opfamily, &opcintype, &cmptype))
-		return false;
-	if (cmptype != COMPARE_LT)
+	if (!lion_ordering_op_is_lt(ltopr, &opfamily, &opcintype))
 		return false;
 
 	return get_opfamily_proc(opfamily, opcintype, opcintype,
@@ -2020,7 +2016,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		 * child is not (see above).  test/isolation/vacuum_regrow_pushdown.spec
 		 * parks VACUUM's regrow here and sends a count's descent at the child.
 		 */
-		INJECTION_POINT("lion-posting-pushdown-child", NULL);
+		LION_INJECTION_POINT("lion-posting-pushdown-child");
 
 		lion_chain_put_items_locked_ext(index, heaprel, cbuf, entrybuf,
 										entryoff, entry, off, replace, items,
@@ -2237,7 +2233,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	 * nothing without --enable-injection-points.
 	 */
 	if (LionPageIncompleteSplit(BufferGetPage(buf)))
-		INJECTION_POINT("lion-posting-split-incomplete", NULL);
+		LION_INJECTION_POINT("lion-posting-split-incomplete");
 
 	/*
 	 * The downlinks, left to right: M's first, because a descent cannot reach

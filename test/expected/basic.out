@@ -220,24 +220,27 @@ SELECT lion_cmp('lion_basic', 'd10 = DATE ''1999-01-01''');
 
 -- NULL keys are not indexed: the scan must return nothing and not fail.
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE cnull = (SELECT NULL::int4);
-                         QUERY PLAN                         
-------------------------------------------------------------
+-- The NULL arrives at run time, through a generic plan's parameter.
+PREPARE lion_nullkey(int4) AS SELECT count(*) FROM lion_basic WHERE cnull = $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE lion_nullkey(NULL);
+                 QUERY PLAN                  
+---------------------------------------------
  Aggregate
-   InitPlan expr_1
-     ->  Result
    ->  Bitmap Heap Scan on lion_basic
-         Recheck Cond: (cnull = (InitPlan expr_1).col1)
+         Recheck Cond: (cnull = $1)
          ->  Bitmap Index Scan on lion_cnull
-               Index Cond: (cnull = (InitPlan expr_1).col1)
-(7 rows)
+               Index Cond: (cnull = $1)
+(5 rows)
 
-SELECT count(*) FROM lion_basic WHERE cnull = (SELECT NULL::int4);
+EXECUTE lion_nullkey(NULL);
  count 
 -------
      0
 (1 row)
 
+RESET plan_cache_mode;
+DEALLOCATE lion_nullkey;
 RESET enable_seqscan;
 SELECT lion_cmp('lion_basic', 'cnull = 3');
    lion_cmp    

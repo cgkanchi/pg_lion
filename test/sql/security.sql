@@ -47,15 +47,36 @@ INSERT INTO lion_coll SELECT g, (ARRAY['a','B','c'])[1 + g % 3], g % 4 FROM gene
 CREATE INDEX lion_coll_name_c ON lion_coll USING lion (name COLLATE "C");
 CREATE INDEX lion_coll_k ON lion_coll USING lion (k);
 VACUUM ANALYZE lion_coll;
+-- EXPLAIN in a form every supported release prints the same way: subplans
+-- are named "expr_N" as in PostgreSQL 19 ("N" before), 18's "Disabled: true"
+-- lines are dropped, actual row counts are integers (18 adds ".00"), and
+-- sorting is off while it plans, so that a query the pushdown must refuse gets
+-- the same core plan whether disabled paths are counted (18) or priced (16,
+-- 17).  LionCount never sorts, so this cannot hide it.
+CREATE OR REPLACE FUNCTION lion_explain_norm(q text, opts text DEFAULT 'COSTS OFF')
+RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (' || opts || ') ' || q LOOP
+		CONTINUE WHEN l ~ '^\s*Disabled: true$';
+		l := regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+	PERFORM set_config('enable_sort', 'on', true);
+END
+$$;
 SET enable_seqscan = off;
 -- clause collation (default) differs from the index collation ("C"): no pushdown, no index use
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE name = 'B';
+SELECT * FROM lion_explain_norm($q$SELECT count(*) FROM lion_coll WHERE name = 'B'$q$) AS p("QUERY PLAN");
 SELECT count(*) FROM lion_coll WHERE name = 'B';
 -- matching collation: pushed down
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE name = 'B' COLLATE "C";
 SELECT count(*) FROM lion_coll WHERE name = 'B' COLLATE "C";
 -- GROUP BY under the column's collation cannot drive from the "C" index
-EXPLAIN (COSTS OFF) SELECT name, count(*) FROM lion_coll GROUP BY name;
+SELECT * FROM lion_explain_norm('SELECT name, count(*) FROM lion_coll GROUP BY name') AS p("QUERY PLAN");
 -- a collation-insensitive column is unaffected
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE k = 2;
 RESET enable_seqscan;

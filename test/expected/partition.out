@@ -105,7 +105,8 @@ BEGIN
 	RETURN NEXT format('child: %s',
 					   coalesce(child ->> 'Custom Plan Provider',
 								child ->> 'Node Type', 'none'));
-	RETURN NEXT format('rows: %s', top ->> 'Actual Rows');
+	-- 18 prints actual rows with two decimals, earlier releases as integers
+	RETURN NEXT format('rows: %s', round((top ->> 'Actual Rows')::numeric));
 	RETURN NEXT format('batches > 1: %s', batches > 1);
 	RETURN NEXT format('disk usage > 0: %s', disk > 0);
 END $$;
@@ -1070,7 +1071,7 @@ SELECT lion_pspill('SELECT g, count(*) FROM lion_pbig GROUP BY g');
 --------------------------------
  top: Finalize Hashed Aggregate
  child: LionCount
- rows: 5000.00
+ rows: 5000
  batches > 1: t
  disk usage > 0: t
 (5 rows)
@@ -1098,7 +1099,7 @@ SELECT lion_pspill('SELECT g, count(*) FROM lion_pbig GROUP BY g');
 --------------------------------
  top: Finalize Hashed Aggregate
  child: LionCount
- rows: 5000.00
+ rows: 5000
  batches > 1: f
  disk usage > 0: f
 (5 rows)
@@ -1232,7 +1233,7 @@ SELECT lion_pspill('SELECT g, count(*) FROM lion_pstale GROUP BY g');
 --------------------------------
  top: Finalize Hashed Aggregate
  child: LionCount
- rows: 20010.00
+ rows: 20010
  batches > 1: t
  disk usage > 0: t
 (5 rows)

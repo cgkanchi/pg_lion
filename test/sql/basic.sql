@@ -112,8 +112,13 @@ SELECT lion_cmp('lion_basic', 'd10 = DATE ''1999-01-01''');
 
 -- NULL keys are not indexed: the scan must return nothing and not fail.
 SET enable_seqscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE cnull = (SELECT NULL::int4);
-SELECT count(*) FROM lion_basic WHERE cnull = (SELECT NULL::int4);
+-- The NULL arrives at run time, through a generic plan's parameter.
+PREPARE lion_nullkey(int4) AS SELECT count(*) FROM lion_basic WHERE cnull = $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE lion_nullkey(NULL);
+EXECUTE lion_nullkey(NULL);
+RESET plan_cache_mode;
+DEALLOCATE lion_nullkey;
 RESET enable_seqscan;
 SELECT lion_cmp('lion_basic', 'cnull = 3');
 -- IS NULL cannot use the index but must still be right

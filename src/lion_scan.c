@@ -34,8 +34,9 @@
 #include "postgres.h"
 
 #include "access/relscan.h"
+#if PG_VERSION_NUM >= 190000
 #include "executor/instrument_node.h"
-#include "utils/injection_point.h"
+#endif
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -355,7 +356,7 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 	 * here and does exactly that to it.  Compiles to nothing without
 	 * --enable-injection-points.
 	 */
-	INJECTION_POINT("lion-scan-chain-entered", NULL);
+	LION_INJECTION_POINT("lion-scan-chain-entered");
 
 	return lion_emit_chain(index, hash, blkno, tbm, recheck);
 }
@@ -1086,8 +1087,10 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	ncols = so->ix->ncolumns;
 
 	pgstat_count_index_scan(index);
+#if PG_VERSION_NUM >= 180000
 	if (scan->instrument)
 		scan->instrument->nsearches++;
+#endif
 
 	/*
 	 * No scan key at all: a PARTIAL index whose predicate the query implies

@@ -10,6 +10,8 @@
 
 #include "postgres.h"
 
+#include "lion_compat.h"
+
 #include "access/amapi.h"
 #include "access/genam.h"
 #include "access/generic_xlog.h"

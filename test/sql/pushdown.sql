@@ -75,11 +75,14 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	RETURN NEXT '-- on:';
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		-- 18 marks a disabled node; 16 and 17 do not
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	RETURN NEXT '-- off:';
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
@@ -239,10 +242,31 @@ SELECT lion_pd('SELECT n, count(*) FROM lion_pdt GROUP BY n HAVING count(n) = 0'
 SELECT lion_pd('SELECT n FROM lion_pdt GROUP BY n HAVING count(n) < count(*)');
 -- the count compared with a pinned column and with an InitPlan's value
 SELECT lion_pd('SELECT b, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a, b HAVING count(*) > a * 400 + (SELECT 228)');
+-- EXPLAIN in a form every supported release prints the same way: subplans
+-- are named "expr_N" as in PostgreSQL 19 ("N" before), 18's "Disabled: true"
+-- lines are dropped, actual row counts are integers (18 adds ".00"), and
+-- sorting is off while it plans, so that a query the pushdown must refuse gets
+-- the same core plan whether disabled paths are counted (18) or priced (16,
+-- 17).  LionCount never sorts, so this cannot hide it.
+CREATE OR REPLACE FUNCTION lion_explain_norm(q text, opts text DEFAULT 'COSTS OFF')
+RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (' || opts || ') ' || q LOOP
+		CONTINUE WHEN l ~ '^\s*Disabled: true$';
+		l := regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+	PERFORM set_config('enable_sort', 'on', true);
+END
+$$;
 -- the filter is the plan's qual: EXPLAIN prints it, ANALYZE counts what it removed
 EXPLAIN (COSTS OFF) SELECT a FROM lion_pdt GROUP BY a HAVING count(*) > 10000;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a HAVING count(*) > 1428;
+SELECT * FROM lion_explain_norm('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a HAVING count(*) > 1428',
+								'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS p("QUERY PLAN");
 -- a parameter in the HAVING, under a generic plan
 PREPARE lion_ph(bigint) AS SELECT a FROM lion_pdt GROUP BY a HAVING count(*) >= $1;
 SET plan_cache_mode = force_generic_plan;
@@ -257,8 +281,7 @@ DEALLOCATE lion_ph;
 SELECT lion_pd('SELECT count(n) FROM lion_pdt WHERE a = 3');
 -- a HAVING that needs a subquery per group (a correlated SubPlan): the
 -- grouping stays with core, though the subquery's own count is ours
-EXPLAIN (COSTS OFF)
-SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > (SELECT count(*) FROM lion_pdt x WHERE x.b = lion_pdt.a);
+SELECT * FROM lion_explain_norm('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > (SELECT count(*) FROM lion_pdt x WHERE x.b = lion_pdt.a)') AS p("QUERY PLAN");
 -- a HAVING without an aggregate is a WHERE by the time the planner asks us,
 -- and an inequality on the key is not a shape the index answers
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING a > 3');
@@ -559,7 +582,11 @@ SELECT lion_pd('SELECT v, count(*) FROM lion_pdn WHERE v = 1.000 GROUP BY v');
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+-- (and no Sort, so that core's own plan for the refused grouping is the same
+-- whether disabled paths are counted, as in 18, or priced, as in 16 and 17)
+SET enable_sort = off;
 SELECT lion_plans('SELECT v, count(*) FROM lion_pdn GROUP BY v');
+RESET enable_sort;
 SELECT lion_plans('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 SELECT lion_pd('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 RESET enable_seqscan;

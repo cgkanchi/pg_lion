@@ -53,7 +53,6 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "utils/injection_point.h"
 #include "utils/rel.h"
 
 #include "lion.h"
@@ -1356,7 +1355,7 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	 * here and proves that the next writer's descent repairs it.  Compiles to
 	 * nothing without --enable-injection-points.
 	 */
-	INJECTION_POINT("lion-dir-split-incomplete", NULL);
+	LION_INJECTION_POINT("lion-dir-split-incomplete");
 
 	lion_dir_finish_split(index, heaprel, ix, buf);
 }
@@ -1646,7 +1645,7 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 		 * insert, which test/isolation/dir_insert_race.spec parks a writer in
 		 * while a second one inserts the same key.
 		 */
-		INJECTION_POINT("lion-dir-add-entry-spanning", NULL);
+		LION_INJECTION_POINT("lion-dir-add-entry-spanning");
 
 		for (;;)
 		{

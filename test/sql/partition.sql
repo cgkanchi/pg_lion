@@ -110,7 +110,8 @@ BEGIN
 	RETURN NEXT format('child: %s',
 					   coalesce(child ->> 'Custom Plan Provider',
 								child ->> 'Node Type', 'none'));
-	RETURN NEXT format('rows: %s', top ->> 'Actual Rows');
+	-- 18 prints actual rows with two decimals, earlier releases as integers
+	RETURN NEXT format('rows: %s', round((top ->> 'Actual Rows')::numeric));
 	RETURN NEXT format('batches > 1: %s', batches > 1);
 	RETURN NEXT format('disk usage > 0: %s', disk > 0);
 END $$;

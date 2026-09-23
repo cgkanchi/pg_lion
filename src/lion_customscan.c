@@ -59,7 +59,9 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
+#endif
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -78,6 +80,7 @@
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
+#include "parser/parsetree.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -1201,6 +1204,46 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * The columns of rel declared NOT NULL: RelOptInfo.notnullattnums, which 17
+ * added.  On 16 it is read from the relation the same way 17's
+ * get_relation_info() fills it in, including leaving it empty for an
+ * inheritance parent that is not partitioned, whose children may disagree.
+ */
+static Bitmapset *
+lion_notnullattnums(PlannerInfo *root, RelOptInfo *rel)
+{
+#if PG_VERSION_NUM >= 170000
+	return rel->notnullattnums;
+#else
+	RangeTblEntry *rte;
+	Relation	relation;
+	Bitmapset  *result = NULL;
+
+	if (rel->reloptkind != RELOPT_BASEREL &&
+		rel->reloptkind != RELOPT_OTHER_MEMBER_REL)
+		return NULL;
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte->rtekind != RTE_RELATION)
+		return NULL;
+
+	relation = table_open(rte->relid, NoLock);
+	if (!rte->inh || relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		for (int i = 0; i < relation->rd_att->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(relation->rd_att, i);
+
+			if (attr->attnotnull && !attr->attisdropped)
+				result = bms_add_member(result, attr->attnum);
+		}
+	}
+	table_close(relation, NoLock);
+
+	return result;
+#endif
+}
+
+/*
  * Can the aggregate be answered by counting a posting set?
  *
  * count(*) always can.  count(col) can when every row the node counts is
@@ -1216,7 +1259,7 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
  *	- a clause says `col IS NULL`: then it is 0 for every group.
  */
 static bool
-lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
+lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti, RelOptInfo *rel,
 				 const AttrNumber *groupattno, int ngroup,
 				 const List *nonnullattnos, const List *nullattnos)
 {
@@ -1262,7 +1305,7 @@ lion_agg_is_count(Aggref *agg, Index rti, RelOptInfo *rel,
 	if (list_member_int((List *) nonnullattnos, (int) var->varattno))
 		return true;
 
-	return bms_is_member(var->varattno, rel->notnullattnums);
+	return bms_is_member(var->varattno, lion_notnullattnums(root, rel));
 }
 
 /*
@@ -1827,9 +1870,14 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
 
+#if PG_VERSION_NUM >= 170000
 			nkeys = Max(estimate_array_length(root,
 											  (Node *) lsecond(saop->args)),
 						1.0);
+#else
+			nkeys = Max(estimate_array_length((Node *) lsecond(saop->args)),
+						1.0);
+#endif
 		}
 
 		if (nkeys > 1.0)
@@ -2229,7 +2277,9 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	}
 
 	cpath->path.rows = outrows;
+#if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = 0;
+#endif
 
 	/*
 	 * Every form of the node streams its rows as it counts them - one per
@@ -3193,7 +3243,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 		else if (IsA(node, Aggref))
 		{
-			if (!lion_agg_is_count((Aggref *) node, rti, input_rel,
+			if (!lion_agg_is_count(root, (Aggref *) node, rti, input_rel,
 								  groupattno, ngroup, nonnullattnos,
 								  nullattnos))
 				return;
@@ -3443,7 +3493,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->path.pathkeys = NIL;
 	if (ngroup == 1 && !partitioned && !sumall && !singlegroup &&
 		first->driveidx[0] != NULL &&
-		bms_is_member(groupattno[0], input_rel->notnullattnums) &&
+		bms_is_member(groupattno[0], lion_notnullattnums(root, input_rel)) &&
 		lion_index_orders_naturally(first->driveidx[0], first->drivecol[0]))
 	{
 		bool		sumshort;
@@ -3485,7 +3535,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
+#endif
 	/*
 	 * The shape marker comes first, so that lion_begin_custom_scan() can
 	 * refuse a list it does not recognise instead of reading it positionally.

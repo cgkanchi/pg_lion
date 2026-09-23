@@ -75,7 +75,6 @@
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/bulk_write.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -84,6 +83,158 @@
 #include "varatt.h"
 
 #include "lion.h"
+
+#if PG_VERSION_NUM < 170000
+#include "access/xloginsert.h"
+#include "storage/smgr.h"
+
+/*
+ * The bulk-write API of PostgreSQL 17 (storage/bulk_write.h), reduced to what
+ * this file uses, for 16 (lion_compat.h).  It follows 17's bulk_write.c: the
+ * page buffers belong to the memory context that was current when the writer
+ * started, up to LION_BULK_PENDING pages are queued and then written in block
+ * order after one log_newpages() record for the batch, a block beyond the
+ * current end is reached by zero-extending (the zero pages are not logged:
+ * the real page's image overwrites them), and the fork is fsynced at the end
+ * unless the relation is temporary, because none of these writes went through
+ * shared buffers and a checkpoint during the build cannot know about them.
+ */
+#define LION_BULK_PENDING	64
+
+typedef struct LionPendingWrite
+{
+	BulkWriteBuffer buf;
+	BlockNumber blkno;
+	bool		page_std;
+} LionPendingWrite;
+
+struct BulkWriteState
+{
+	SMgrRelation smgr;
+	ForkNumber	forknum;
+	RelFileLocator locator;
+	bool		use_wal;
+	bool		need_sync;
+	int			npending;
+	LionPendingWrite pending[LION_BULK_PENDING];
+	BlockNumber pages_written;
+	PGIOAlignedBlock *zeropage;
+	MemoryContext memcxt;
+};
+
+#define ST_SORT sort_lion_pending_writes
+#define ST_ELEMENT_TYPE LionPendingWrite
+#define ST_COMPARE(a, b) \
+	((int) ((a)->blkno > (b)->blkno) - (int) ((a)->blkno < (b)->blkno))
+#define ST_SCOPE static
+#define ST_DEFINE
+#include "lib/sort_template.h"
+
+BulkWriteState *
+smgr_bulk_start_rel(Relation rel, ForkNumber forknum)
+{
+	BulkWriteState *bw = palloc0(sizeof(BulkWriteState));
+
+	bw->smgr = RelationGetSmgr(rel);
+	bw->forknum = forknum;
+	bw->locator = rel->rd_locator;
+	bw->use_wal = RelationNeedsWAL(rel) || forknum == INIT_FORKNUM;
+	bw->need_sync = !RelationUsesLocalBuffers(rel);
+	bw->pages_written = smgrnblocks(bw->smgr, forknum);
+	bw->memcxt = CurrentMemoryContext;
+
+	return bw;
+}
+
+BulkWriteBuffer
+smgr_bulk_get_buf(BulkWriteState *bw)
+{
+	return MemoryContextAllocAligned(bw->memcxt, BLCKSZ, PG_IO_ALIGN_SIZE, 0);
+}
+
+static void
+lion_bulk_flush(BulkWriteState *bw)
+{
+	int			n = bw->npending;
+
+	if (n == 0)
+		return;
+
+	sort_lion_pending_writes(bw->pending, n);
+
+	if (bw->use_wal)
+	{
+		BlockNumber blknos[LION_BULK_PENDING];
+		Page		pages[LION_BULK_PENDING];
+		bool		page_std = true;
+
+		for (int i = 0; i < n; i++)
+		{
+			blknos[i] = bw->pending[i].blkno;
+			pages[i] = (Page) bw->pending[i].buf->data;
+			/* one non-standard page makes the whole batch non-standard */
+			if (!bw->pending[i].page_std)
+				page_std = false;
+		}
+		log_newpages(&bw->locator, bw->forknum, n, blknos, pages, page_std);
+	}
+
+	for (int i = 0; i < n; i++)
+	{
+		BlockNumber blkno = bw->pending[i].blkno;
+		Page		page = (Page) bw->pending[i].buf->data;
+
+		while (blkno > bw->pages_written)
+		{
+			if (bw->zeropage == NULL)
+				bw->zeropage = MemoryContextAllocAligned(bw->memcxt, BLCKSZ,
+														 PG_IO_ALIGN_SIZE,
+														 MCXT_ALLOC_ZERO);
+			smgrextend(bw->smgr, bw->forknum, bw->pages_written++,
+					   bw->zeropage->data, true);
+		}
+
+		PageSetChecksumInplace(page, blkno);
+
+		if (blkno == bw->pages_written)
+		{
+			smgrextend(bw->smgr, bw->forknum, blkno, page, true);
+			bw->pages_written++;
+		}
+		else
+			smgrwrite(bw->smgr, bw->forknum, blkno, page, true);
+
+		pfree(page);
+	}
+
+	bw->npending = 0;
+}
+
+void
+smgr_bulk_write(BulkWriteState *bw, BlockNumber blkno, BulkWriteBuffer buf,
+				bool page_std)
+{
+	LionPendingWrite *w = &bw->pending[bw->npending++];
+
+	w->buf = buf;
+	w->blkno = blkno;
+	w->page_std = page_std;
+
+	if (bw->npending == LION_BULK_PENDING)
+		lion_bulk_flush(bw);
+}
+
+void
+smgr_bulk_finish(BulkWriteState *bw)
+{
+	lion_bulk_flush(bw);
+	if (bw->need_sync)
+		smgrimmedsync(bw->smgr, bw->forknum);
+	if (bw->zeropage != NULL)
+		pfree(bw->zeropage);
+	pfree(bw);
+}
+#endif							/* PG_VERSION_NUM < 170000 */
 
 /*
  * Which entry a sorted tuple belongs to.  A row contributes one tuple per

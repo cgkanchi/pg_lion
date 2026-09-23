@@ -10,9 +10,9 @@
 # parked at the injection point MUST block.
 #
 # cnt_race_wait_for_vacuum() watches pg_stat_activity until the VACUUM is seen
-# parked on wait_event 'BufferCleanup'.  It returns false if the VACUUM
-# finishes without ever being seen there, and a false in the expected output
-# means the interlock is gone -- a count could then be told a heap page is
+# parked on wait_event 'BufferCleanup' ('BufferPin' before PostgreSQL 19).
+# It returns false if the VACUUM finishes without ever being seen there, and
+# a false in the expected output means the interlock is gone -- a count could then be told a heap page is
 # all-visible after VACUUM removed the dead TIDs it had already read out of
 # the index, which is exactly how this would produce a wrong answer.
 #
@@ -75,7 +75,7 @@ setup
 		FOR i IN 1 .. 3000 LOOP
 			/* pg_stat_activity is otherwise read once per transaction */
 			PERFORM pg_stat_clear_snapshot();
-			SELECT count(*) FILTER (WHERE wait_event = 'BufferCleanup') > 0,
+			SELECT count(*) FILTER (WHERE wait_event IN ('BufferCleanup', 'BufferPin')) > 0,
 				   count(*) > 0
 			  INTO waited, active
 			  FROM pg_stat_activity

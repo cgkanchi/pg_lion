@@ -64,6 +64,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		-- 18 marks the disabled scan; 16 and 17 do not
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
@@ -138,9 +140,8 @@ SELECT lion_inplan('SELECT count(*) FROM lion_in WHERE a = ALL (ARRAY[1, 2])');
 ------------------------------------------------
  Aggregate
    ->  Seq Scan on lion_in
-         Disabled: true
          Filter: (a = ALL ('{1,2}'::integer[]))
-(4 rows)
+(3 rows)
 
 -- ---- bitmap scans (amsearcharray) --------------------------------------
 SET pg_lion.enable_count_pushdown = off;

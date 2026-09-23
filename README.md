@@ -13,9 +13,12 @@ visibility map, visiting the heap only for pages that are not all-visible. `DESI
 on-disk format, locking protocol, the VACUUM/visibility-map interlock argument (§9, §11), and the
 planner integration (§10).
 
-Status: prototype against PostgreSQL master (20devel). Latest validation passes 17 SQL regression
-files, 6 isolation specs (including an injection-point check of the VACUUM/container-page interlock),
-660k container and 290k sparse unit checks, and the crash-recovery/hot-standby harness.
+Status: prototype.  Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version
+differences live in `src/lion_compat.h`.  Validated on 16.15, 17.11, 18.6, 19beta4 and master: 21 SQL
+regression files and 15 isolation specs (including injection-point checks of the VACUUM/container-page
+interlock) in both WAL modes, 660k container and 290k sparse unit checks, and the crash-recovery/
+hot-standby harness in both modes.  PostgreSQL 16 has no injection points, so there the 10 specs that
+need them are skipped (the Makefile says so) and the interlock is covered by the code, not by a test.
 See the [latest review](FOLLOWUP_REVIEW.md) for evidence and remaining limitations.
 
 ## When to use Lion
@@ -65,9 +68,10 @@ harness with the resource manager registered AND `wal_consistency_checking = 'pg
 where "replay reproduces every page" is actually proved - the comparison only happens during
 replay, so turning it on for a primary that never replays proves nothing.
 
-`.local/pg` must be a PostgreSQL master install; for the isolation specs it needs
-`--enable-injection-points` and the `injection_points` test module installed, and
-`pg_isolation_regress` installed from `src/test/isolation`.
+`.local/pg` can be any PostgreSQL 16 or later install.  The isolation specs need
+`pg_isolation_regress` installed from `src/test/isolation`; the ones that park a backend on an
+injection point also need `--enable-injection-points` (17 or later) and the `injection_points` test
+module installed, and are skipped when the module is missing (`INJECTION_POINTS=1` forces them).
 
 ## How to use it
 

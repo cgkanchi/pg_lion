@@ -68,6 +68,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		-- 18 marks the disabled scan; 16 and 17 do not
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);

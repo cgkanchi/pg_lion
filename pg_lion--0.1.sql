@@ -100,10 +100,31 @@ CREATE OPERATOR CLASS oid_ops DEFAULT FOR TYPE oid USING lion AS
 	FUNCTION	1	hashoid(oid),
 	FUNCTION	4	btoidcmp(oid, oid);
 
-CREATE OPERATOR CLASS bool_ops DEFAULT FOR TYPE bool USING lion AS
+/*
+ * PostgreSQL 18 gave seven types a hash function of their own (hashbool,
+ * hashbytea, hashdate, hashxid, hashxid8, hashcid, timestamptz_hash).  Before
+ * that their hash opclasses borrowed a physically compatible function -
+ * hashchar, hashvarlena, hashint4, hashint8, timestamp_hash - which computes
+ * the same value, and hashvalidate() kept a list of those substitutions;
+ * lionvalidate() keeps the same list on those servers.  The classes of these
+ * types are therefore created through this helper, which names the new
+ * function where the server has it and the old one where it does not.
+ */
+CREATE FUNCTION lion_create_opclass_pre18(stmt text, newfn text, oldfn text)
+RETURNS void LANGUAGE plpgsql AS $f$
+BEGIN
+	IF to_regprocedure(newfn) IS NOT NULL THEN
+		EXECUTE format(stmt, newfn);
+	ELSE
+		EXECUTE format(stmt, oldfn);
+	END IF;
+END
+$f$;
+
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS bool_ops DEFAULT FOR TYPE bool USING lion AS
 	OPERATOR	1	= (bool, bool),
-	FUNCTION	1	hashbool(bool),
-	FUNCTION	4	btboolcmp(bool, bool);
+	FUNCTION	1	%s,
+	FUNCTION	4	btboolcmp(bool, bool)', 'hashbool(bool)', 'hashchar("char")');
 
 CREATE OPERATOR CLASS char_ops DEFAULT FOR TYPE "char" USING lion AS
 	OPERATOR	1	= ("char", "char"),
@@ -126,20 +147,20 @@ CREATE OPERATOR CLASS bpchar_ops DEFAULT FOR TYPE bpchar USING lion AS
 	FUNCTION	1	hashbpchar(bpchar),
 	FUNCTION	4	bpcharcmp(bpchar, bpchar);
 
-CREATE OPERATOR CLASS bytea_ops DEFAULT FOR TYPE bytea USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS bytea_ops DEFAULT FOR TYPE bytea USING lion AS
 	OPERATOR	1	= (bytea, bytea),
-	FUNCTION	1	hashbytea(bytea),
-	FUNCTION	4	byteacmp(bytea, bytea);
+	FUNCTION	1	%s,
+	FUNCTION	4	byteacmp(bytea, bytea)', 'hashbytea(bytea)', 'hashvarlena(internal)');
 
 CREATE OPERATOR CLASS uuid_ops DEFAULT FOR TYPE uuid USING lion AS
 	OPERATOR	1	= (uuid, uuid),
 	FUNCTION	1	uuid_hash(uuid),
 	FUNCTION	4	uuid_cmp(uuid, uuid);
 
-CREATE OPERATOR CLASS date_ops DEFAULT FOR TYPE date USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS date_ops DEFAULT FOR TYPE date USING lion AS
 	OPERATOR	1	= (date, date),
-	FUNCTION	1	hashdate(date),
-	FUNCTION	4	date_cmp(date, date);
+	FUNCTION	1	%s,
+	FUNCTION	4	date_cmp(date, date)', 'hashdate(date)', 'hashint4(int4)');
 
 CREATE OPERATOR CLASS time_ops DEFAULT FOR TYPE time USING lion AS
 	OPERATOR	1	= (time, time),
@@ -156,10 +177,10 @@ CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion AS
 	FUNCTION	1	timestamp_hash(timestamp),
 	FUNCTION	4	timestamp_cmp(timestamp, timestamp);
 
-CREATE OPERATOR CLASS timestamptz_ops DEFAULT FOR TYPE timestamptz USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT FOR TYPE timestamptz USING lion AS
 	OPERATOR	1	= (timestamptz, timestamptz),
-	FUNCTION	1	timestamptz_hash(timestamptz),
-	FUNCTION	4	timestamptz_cmp(timestamptz, timestamptz);
+	FUNCTION	1	%s,
+	FUNCTION	4	timestamptz_cmp(timestamptz, timestamptz)', 'timestamptz_hash(timestamptz)', 'timestamp_hash(timestamp)');
 
 CREATE OPERATOR CLASS interval_ops DEFAULT FOR TYPE interval USING lion AS
 	OPERATOR	1	= (interval, interval),
@@ -201,18 +222,18 @@ CREATE OPERATOR CLASS pg_lsn_ops DEFAULT FOR TYPE pg_lsn USING lion AS
  * directories are ordered by (hash, stored bytes) alone, which is a complete
  * order but not the type's, and lion_index_stats() reports ordered = false.
  */
-CREATE OPERATOR CLASS xid_ops DEFAULT FOR TYPE xid USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS xid_ops DEFAULT FOR TYPE xid USING lion AS
 	OPERATOR	1	= (xid, xid),
-	FUNCTION	1	hashxid(xid);
+	FUNCTION	1	%s', 'hashxid(xid)', 'hashint4(int4)');
 
-CREATE OPERATOR CLASS xid8_ops DEFAULT FOR TYPE xid8 USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS xid8_ops DEFAULT FOR TYPE xid8 USING lion AS
 	OPERATOR	1	= (xid8, xid8),
-	FUNCTION	1	hashxid8(xid8),
-	FUNCTION	4	xid8cmp(xid8, xid8);
+	FUNCTION	1	%s,
+	FUNCTION	4	xid8cmp(xid8, xid8)', 'hashxid8(xid8)', 'hashint8(int8)');
 
-CREATE OPERATOR CLASS cid_ops DEFAULT FOR TYPE cid USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS cid_ops DEFAULT FOR TYPE cid USING lion AS
 	OPERATOR	1	= (cid, cid),
-	FUNCTION	1	hashcid(cid);
+	FUNCTION	1	%s', 'hashcid(cid)', 'hashint4(int4)');
 
 CREATE OPERATOR CLASS tid_ops DEFAULT FOR TYPE tid USING lion AS
 	OPERATOR	1	= (tid, tid),
@@ -406,3 +427,5 @@ LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_verify(regclass, bool) IS
 	'check a lion index for structural damage, optionally also checking that every heap tuple is indexed';
+
+DROP FUNCTION lion_create_opclass_pre18(text, text, text);

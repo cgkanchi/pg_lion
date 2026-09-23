@@ -19,6 +19,17 @@ EXTRA_CLEAN = test/unit/container_test test/unit/sparse_test test/results test/i
 
 PG_CONFIG ?= .local/pg/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
+
+# The isolation specs that park a backend on an injection point need a server
+# configured with --enable-injection-points (PostgreSQL 17 or later) and the
+# injection_points test module installed.  Where that module is missing they
+# are left out, and the run says so; INJECTION_POINTS=1/0 overrides the guess.
+INJECTION_SPECS = $(patsubst test/isolation/%.spec,%,$(shell grep -l injection_points test/isolation/*.spec))
+INJECTION_POINTS ?= $(if $(wildcard $(shell $(PG_CONFIG) --sharedir)/extension/injection_points.control),1,0)
+ifneq ($(INJECTION_POINTS),1)
+ISOLATION := $(filter-out $(INJECTION_SPECS),$(ISOLATION))
+$(info pg_lion: no injection_points module in this installation; skipping isolation specs: $(INJECTION_SPECS))
+endif
 include $(PGXS)
 
 # Standalone unit tests for the container library (no server needed).
@@ -39,7 +50,7 @@ unit: test/unit/container_test test/unit/sparse_test
 	./test/unit/sparse_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
-$(OBJS): src/lion.h src/lion_container.h src/lion_sparse.h src/lion_tid.h
+$(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src/lion_tid.h
 src/lion_count.o src/lion_customscan.o src/lion_am.o: src/lion_count.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a

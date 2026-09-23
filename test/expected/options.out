@@ -192,10 +192,13 @@ DROP INDEX lion_opt_k_t_idx;
 -- Things a lion index cannot do.
 CREATE INDEX ON lion_opt USING lion (k) INCLUDE (t);
 ERROR:  access method "lion" does not support included columns
-CREATE INDEX ON lion_opt USING lion (k DESC);
-ERROR:  access method "lion" does not support ASC/DESC options at character 38
-CREATE INDEX ON lion_opt USING lion (k NULLS FIRST);
-ERROR:  access method "lion" does not support NULLS FIRST/LAST options at character 38
+-- (as WARNINGs: PostgreSQL 19 reports the ERROR's position and 18 does not)
+DO $$ BEGIN CREATE INDEX ON lion_opt USING lion (k DESC);
+EXCEPTION WHEN feature_not_supported THEN RAISE WARNING '%', SQLERRM; END $$;
+WARNING:  access method "lion" does not support ASC/DESC options
+DO $$ BEGIN CREATE INDEX ON lion_opt USING lion (k NULLS FIRST);
+EXCEPTION WHEN feature_not_supported THEN RAISE WARNING '%', SQLERRM; END $$;
+WARNING:  access method "lion" does not support NULLS FIRST/LAST options
 CREATE UNIQUE INDEX ON lion_opt USING lion (k);
 ERROR:  access method "lion" does not support unique indexes
 CREATE INDEX ON lion_opt USING lion (i) WHERE k = 1;   -- partial: allowed

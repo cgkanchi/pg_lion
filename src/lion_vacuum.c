@@ -138,7 +138,6 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
-#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -472,7 +471,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		MemoryContextReset(vaccxt);
 
 		blk = next;
-		vacuum_delay_point(false);
+		lion_vacuum_delay_point();
 	}
 
 	/*
@@ -994,7 +993,7 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	/* The page keeps its pin: pass 2 locks it again for every window. */
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
-	vacuum_delay_point(false);
+	lion_vacuum_delay_point();
 
 	/* Pass 2, holding no page lock between its steps. */
 	for (i = 0; i < nents; i++)
@@ -1149,7 +1148,7 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	{
 		blk = lion_vacuum_container_page(vs, &ref, ent, blk);
 
-		vacuum_delay_point(false);
+		lion_vacuum_delay_point();
 	}
 
 	/* Report what the entry holds now that every page has been visited. */
@@ -1265,7 +1264,7 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 	 * under it.  Compiles to nothing without --enable-injection-points.
 	 */
 	if (nfree > 0)
-		INJECTION_POINT("lion-vacuum-entries-deleted", NULL);
+		LION_INJECTION_POINT("lion-vacuum-entries-deleted");
 
 	/*
 	 * Now that nothing points at them, the pages of the freed chains can go.
@@ -1690,7 +1689,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 		 * Test hook: the page is filtered and still cleanup-locked, the entry
 		 * page not yet tried (test/isolation/vacuum_retry_pushdown.spec).
 		 */
-		INJECTION_POINT("lion-vacuum-page-filtered", NULL);
+		LION_INJECTION_POINT("lion-vacuum-page-filtered");
 
 		if (ConditionalLockBuffer(ref->buf))
 		{
@@ -1727,7 +1726,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 		 * owns the entry page is free to push this root down before the
 		 * cleanup lock is retried (test/isolation/vacuum_retry_pushdown.spec).
 		 */
-		INJECTION_POINT("lion-vacuum-entry-busy", NULL);
+		LION_INJECTION_POINT("lion-vacuum-entry-busy");
 		LockBuffer(ref->buf, BUFFER_LOCK_EXCLUSIVE);
 
 		if (!lion_vac_ref_valid(ref, ent))

@@ -71,7 +71,6 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
-#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/memutils.h"
@@ -1250,7 +1249,7 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 		 * sends the descent into a VACUUM that is in the middle of pushing
 		 * that root down.  Compiles to nothing without injection points.
 		 */
-		INJECTION_POINT("lion-count-chain-entered", NULL);
+		LION_INJECTION_POINT("lion-count-chain-entered");
 	}
 
 	lion_cursor_next(cur);
@@ -3187,7 +3186,7 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	 * on the cleanup lock; test/isolation/count_vacuum_race.spec proves it.
 	 * Compiles to nothing without --enable-injection-points.
 	 */
-	INJECTION_POINT("lion-count-containers-pinned", NULL);
+	LION_INJECTION_POINT("lion-count-containers-pinned");
 
 	/*
 	 * One pass over the container and one read of the visibility map for all
@@ -3367,7 +3366,7 @@ lion_recheck_heap_am(LionCountCtx *cx)
 			lastblk = blk;
 		}
 
-		if (table_fetch_tid(cx->heap, &tid, cx->snapshot, NULL))
+		if (lion_table_fetch_tid(cx->heap, &tid, cx->snapshot, NULL))
 			visible++;
 
 		if ((i & 0x3ff) == 0)
@@ -4564,7 +4563,7 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 		 * nothing without --enable-injection-points.
 		 */
 		if (es->onpage == 1)
-			INJECTION_POINT("lion-entry-scan-resumed", NULL);
+			LION_INJECTION_POINT("lion-entry-scan-resumed");
 
 		buf = ReadBuffer(es->index, es->blkno);
 		lion_dir_pages_read++;

@@ -82,11 +82,32 @@ SELECT left(name::text, 1) AS first_letter, count(*) FROM lion_cirep GROUP BY na
 EXPLAIN (COSTS OFF)
 SELECT name, count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
 SELECT name, count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING' GROUP BY name;
+-- EXPLAIN in a form every supported release prints the same way: subplans
+-- are named "expr_N" as in PostgreSQL 19 ("N" before), 18's "Disabled: true"
+-- lines are dropped, actual row counts are integers (18 adds ".00"), and
+-- sorting is off while it plans, so that a query the pushdown must refuse gets
+-- the same core plan whether disabled paths are counted (18) or priced (16,
+-- 17).  LionCount never sorts, so this cannot hide it.
+CREATE OR REPLACE FUNCTION lion_explain_norm(q text, opts text DEFAULT 'COSTS OFF')
+RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (' || opts || ') ' || q LOOP
+		CONTINUE WHEN l ~ '^\s*Disabled: true$';
+		l := regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+	PERFORM set_config('enable_sort', 'on', true);
+END
+$$;
 -- counting needs no representative: still the custom node
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
 SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep GROUP BY name;
+SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_cirep GROUP BY name') AS p("QUERY PLAN");
 SELECT count(*) FROM lion_cirep GROUP BY name;
 RESET enable_seqscan;
 DROP TABLE lion_cirep;

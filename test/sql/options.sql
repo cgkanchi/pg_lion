@@ -102,8 +102,11 @@ DROP INDEX lion_opt_k_t_idx;
 
 -- Things a lion index cannot do.
 CREATE INDEX ON lion_opt USING lion (k) INCLUDE (t);
-CREATE INDEX ON lion_opt USING lion (k DESC);
-CREATE INDEX ON lion_opt USING lion (k NULLS FIRST);
+-- (as WARNINGs: PostgreSQL 19 reports the ERROR's position and 18 does not)
+DO $$ BEGIN CREATE INDEX ON lion_opt USING lion (k DESC);
+EXCEPTION WHEN feature_not_supported THEN RAISE WARNING '%', SQLERRM; END $$;
+DO $$ BEGIN CREATE INDEX ON lion_opt USING lion (k NULLS FIRST);
+EXCEPTION WHEN feature_not_supported THEN RAISE WARNING '%', SQLERRM; END $$;
 CREATE UNIQUE INDEX ON lion_opt USING lion (k);
 CREATE INDEX ON lion_opt USING lion (i) WHERE k = 1;   -- partial: allowed
 DROP INDEX lion_opt_i_idx;

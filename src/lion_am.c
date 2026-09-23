@@ -25,6 +25,7 @@
 #include "storage/indexfsm.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -36,10 +37,14 @@
 #include "lion.h"
 #include "lion_count.h"
 
+#if PG_VERSION_NUM >= 180000
 PG_MODULE_MAGIC_EXT(
 					.name = "pg_lion",
 					.version = PG_VERSION
 );
+#else
+PG_MODULE_MAGIC;
+#endif
 
 PG_FUNCTION_INFO_V1(lion_handler);
 
@@ -160,6 +165,7 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amoptsprocnum = 0,
 		.amcanorder = false,
 		.amcanorderbyop = false,
+#if PG_VERSION_NUM >= 180000
 		.amcanhash = false,
 
 		/*
@@ -171,6 +177,7 @@ lion_handler(PG_FUNCTION_ARGS)
 		 */
 		.amconsistentequality = true,
 		.amconsistentordering = false,
+#endif
 		.amcanbackward = false,
 		.amcanunique = false,
 		.amcanmulticol = true,	/* DESIGN.md §24 */
@@ -190,7 +197,9 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amclusterable = false,
 		.ampredlocks = false,
 		.amcanparallel = false,
+#if PG_VERSION_NUM >= 170000
 		.amcanbuildparallel = false,
+#endif
 		.amcaninclude = false,
 		.amusemaintenanceworkmem = true,
 		.amsummarizing = false,
@@ -200,12 +209,16 @@ lion_handler(PG_FUNCTION_ARGS)
 		.ambuild = lionbuild,
 		.ambuildempty = lionbuildempty,
 		.aminsert = lioninsert,
+#if PG_VERSION_NUM >= 170000
 		.aminsertcleanup = NULL,
+#endif
 		.ambulkdelete = lionbulkdelete,
 		.amvacuumcleanup = lionvacuumcleanup,
 		.amcanreturn = NULL,
 		.amcostestimate = lioncostestimate,
+#if PG_VERSION_NUM >= 180000
 		.amgettreeheight = NULL,
+#endif
 		.amoptions = lionoptions,
 		.amproperty = NULL,
 		.ambuildphasename = NULL,
@@ -221,11 +234,26 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amestimateparallelscan = NULL,
 		.aminitparallelscan = NULL,
 		.amparallelrescan = NULL,
+#if PG_VERSION_NUM >= 180000
 		.amtranslatestrategy = NULL,
 		.amtranslatecmptype = NULL,
+#endif
 	};
 
+#if PG_VERSION_NUM >= 190000
 	PG_RETURN_POINTER(&amroutine);
+#else
+	{
+		/*
+		 * Before 19 the caller owns the result and pfree()s it after copying
+		 * it into the relcache, so it has to be palloc'd.
+		 */
+		IndexAmRoutine *copy = makeNode(IndexAmRoutine);
+
+		*copy = amroutine;
+		PG_RETURN_POINTER(copy);
+	}
+#endif
 }
 
 /*
@@ -633,6 +661,38 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 }
 
 /*
+ * Before PostgreSQL 18, bool, bytea, date, xid, xid8, cid and timestamptz had
+ * no hash function of their own: their hash opclasses used a physically
+ * compatible function of another type, and hashvalidate() accepted exactly
+ * those pairs.  The extension script names the same functions on those
+ * servers (pg_lion--0.1.sql), so the same pairs are accepted here, and only
+ * there.  The function identity is tested rather than its argument type, for
+ * hashvalidate()'s reason: hashvarlena() takes `internal`.
+ */
+static bool
+lion_hash_substitution_ok(Oid funcid, Oid argtype)
+{
+#if PG_VERSION_NUM < 180000
+	switch (argtype)
+	{
+		case DATEOID:
+		case XIDOID:
+		case CIDOID:
+			return funcid == F_HASHINT4;
+		case XID8OID:
+			return funcid == F_HASHINT8;
+		case TIMESTAMPTZOID:
+			return funcid == F_TIMESTAMP_HASH;
+		case BOOLOID:
+			return funcid == F_HASHCHAR;
+		case BYTEAOID:
+			return funcid == F_HASHVARLENA;
+	}
+#endif
+	return false;
+}
+
+/*
  * Validator for a roaring opclass.  Modelled on hashvalidate()/ginvalidate().
  *
  * There are two shapes of roaring opclass and they are validated differently
@@ -739,7 +799,9 @@ lionvalidate(Oid opclassoid)
 				else
 					ok = check_amproc_signature(procform->amproc, INT4OID,
 												false, 1, 1,
-												procform->amproclefttype);
+												procform->amproclefttype) ||
+						lion_hash_substitution_ok(procform->amproc,
+												  procform->amproclefttype);
 				break;
 			case LION_CMP_PROC:
 				/*
