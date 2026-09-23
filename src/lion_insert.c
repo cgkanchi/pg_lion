@@ -529,7 +529,9 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
 	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
-	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+	Size		itemsz = ItemIdGetLength(iid);
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
 	uint32		ncontainers = entry->ncontainers;
 	uint64		ntids = entry->ntids;
 	char	   *oldpay;
@@ -556,12 +558,43 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	}
 
 	if (newlen <= (Size) state->ix->meta.inline_limit &&
-		LionEntryPayloadOffset(entry) + newlen <= (Size) LION_MAX_ENTRY_SIZE)
+		payoff + newlen <= (Size) LION_MAX_ENTRY_SIZE)
 	{
 		LionEntryTuple *newentry;
 		Size		newsize;
+		Size		need = payoff + newlen;
+		Size		writesz;
 
-		newentry = lion_entry_rebuild(entry, newpay, newlen, &newsize);
+		/*
+		 * GROWTH SLACK, the INLINE half of DESIGN.md §4.
+		 *
+		 * The payload this key had may already have room for the member that
+		 * was just added to it, because the last insert-driven rewrite left
+		 * some: then the entry KEEPS the bytes the page has allotted it and
+		 * only its own bytes change.  PageIndexTupleOverwrite() then moves no
+		 * other entry on the leaf - which is what an INLINE insert used to pay
+		 * for every time, 1.5-2.9 KB of it in generic mode - and the record is
+		 * a delta of the counters and the tail of the payload.
+		 *
+		 * Otherwise the entry is written at its new length PLUS fresh slack,
+		 * which is what puts the next few inserts on the cheap path.  Only
+		 * what fits on the leaf as it stands: slack is never worth a split,
+		 * and never worth compacting an entry that has too much of it either.
+		 */
+		if (itemsz >= need && itemsz - need <= LION_ENTRY_SLACK_BOUND)
+			writesz = itemsz;
+		else
+		{
+			Size		maxsize = MAXALIGN_DOWN(MAXALIGN(itemsz) +
+												PageGetExactFreeSpace(page));
+
+			writesz = lion_entry_alloc_size(payoff, newlen,
+											(Size) state->ix->meta.inline_limit,
+											Max(maxsize, need));
+		}
+
+		newentry = lion_entry_rebuild_slack(entry, newpay, newlen, writesz,
+											&newsize);
 		newentry->ncontainers = (uint32) ((int) ncontainers + ndelta);
 		newentry->ntids = ntids + 1;
 

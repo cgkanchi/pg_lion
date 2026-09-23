@@ -296,6 +296,62 @@ SELECT array_containers > 0 AS has_arrays, slack_bytes AS bulk_slack_bytes
 SELECT lion_index_verify('lion_slack_b', true);
 
 /*
+ * GROWTH SLACK INSIDE AN INLINE ENTRY (DESIGN.md §4).
+ *
+ * An INLINE entry an insert rewrites is allotted a few bytes more than its
+ * payload needs, zeroed - which is also what terminates the payload, so
+ * nothing else has to know they are there.  The next insert into that key
+ * then writes INSIDE the entry: no other entry on the leaf moves, and the WAL
+ * record is the bytes that changed instead of the whole payload.
+ */
+CREATE TABLE lion_islack (i int4, k int4);
+CREATE INDEX lion_islack_k ON lion_islack USING lion (k);
+INSERT INTO lion_islack SELECT i, i % 50 FROM generate_series(1, 5000) i;
+SELECT inline_entries, container_pages,
+	   inline_slack_bytes > 0 AS has_inline_slack,
+	   inline_slack_bytes <= 72 * inline_entries AS slack_within_bound
+  FROM lion_index_stats('lion_islack_k');
+SELECT lion_index_verify('lion_islack_k', true);
+SELECT lion_cmp('lion_islack', 'k = 7');
+
+-- More rows under the same keys: they go into the slack, and the index does
+-- not have to grow a page for them.
+CREATE TEMP TABLE lion_islack_size AS
+	SELECT pg_relation_size('lion_islack_k') AS bytes;
+INSERT INTO lion_islack SELECT i, i % 50 FROM generate_series(5001, 5200) i;
+SELECT pg_relation_size('lion_islack_k') <= (SELECT bytes FROM lion_islack_size)
+	   AS grew_into_the_slack;
+SELECT ntids, inline_slack_bytes <= 72 * inline_entries AS slack_within_bound
+  FROM lion_index_stats('lion_islack_k');
+SELECT lion_index_verify('lion_islack_k', true);
+SELECT lion_cmp('lion_islack', 'k = 7');
+
+-- A bulk build adds none of it, exactly as for items.
+CREATE INDEX lion_islack_b ON lion_islack USING lion (k);
+SELECT inline_entries > 0 AS has_inline, inline_slack_bytes AS bulk_inline_slack
+  FROM lion_index_stats('lion_islack_b');
+SELECT lion_index_verify('lion_islack_b', true);
+
+/*
+ * ... and the slack is not what decides a spill: the payload test is made on
+ * the bytes the payload really uses, so a key still spills onto container
+ * pages at inline_limit and not before it.
+ */
+CREATE TABLE lion_ispill (i int4, k int4);
+CREATE INDEX lion_ispill_k ON lion_ispill USING lion (k)
+	WITH (inline_limit = 256);
+INSERT INTO lion_ispill SELECT i, i % 3 FROM generate_series(1, 60) i;
+SELECT inline_entries, container_pages,
+	   inline_slack_bytes <= 72 * inline_entries AS slack_within_bound
+  FROM lion_index_stats('lion_ispill_k');
+INSERT INTO lion_ispill SELECT i, i % 3 FROM generate_series(61, 20000) i;
+SELECT inline_entries, container_pages > 0 AS spilled, ntids
+  FROM lion_index_stats('lion_ispill_k');
+SELECT lion_index_verify('lion_ispill_k', true);
+SELECT lion_cmp('lion_ispill', 'k = 1');
+DROP TABLE lion_islack, lion_ispill;
+
+/*
  * An index created empty and grown: with the sorted directory of DESIGN.md
  * §21 that is no longer a problem to be warned about.  The tree splits as the
  * keys arrive, so 80000 of them give it a height and a few hundred leaves,

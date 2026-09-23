@@ -34,19 +34,41 @@
 #   bench/write_micro.sh wal LABEL [COLS]  # WAL composition per record type
 #   bench/write_micro.sh {start|stop|psql|drop|reload}
 #
+# Environment:
+#   LION_WM_PGBIN=<prefix>/bin   the PostgreSQL to measure with (default: the
+#                                dev tree's assert build, which is fine for
+#                                WAL bytes and wrong for milliseconds)
+#   LION_WM_PRELOAD=1            start the cluster with
+#                                shared_preload_libraries = 'pg_lion', so that
+#                                wal_mode = auto resolves to rmgr (§25)
+#
 # The extension must be installed into .local/pg first:
 #   make PG_CONFIG=.local/pg/bin/pg_config -s && make PG_CONFIG=... install
 #
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-PGBIN=$ROOT/.local/pg/bin
+# The PostgreSQL install to measure with.  The default is the dev tree's
+# assert-enabled one, which is NOT what a headline number should come from;
+# point LION_WM_PGBIN at a release prefix (bench/lib.sh's
+# bench_build_extension installs the extension into one) for anything that
+# goes into DESIGN.md.
+PGBIN=${LION_WM_PGBIN:-$ROOT/.local/pg/bin}
 DATA=${LION_WM_DATA:-$ROOT/.local/data-wm}
 SOCK=${LION_WM_SOCK:-/tmp/claude-1000/pgsk-wm}
 PORT=${LION_WM_PORT:-54330}
 OUT=$ROOT/bench/results/write-micro
 export PATH=$PGBIN:$PATH
 export PGHOST=$SOCK PGPORT=$PORT PGUSER=postgres PGDATABASE=postgres
+
+# The A/B lever of DESIGN.md §25: with LION_WM_PRELOAD=1 the private cluster
+# starts with shared_preload_libraries = 'pg_lion', so every index built in it
+# gets wal_mode = rmgr; without it they get generic WAL.  Nothing else differs,
+# and the option is passed on pg_ctl's command line, so the data directory
+# carries no trace of which arm last ran.
+PRELOAD=${LION_WM_PRELOAD:-0}
+PGOPTS=""
+[ "$PRELOAD" = 1 ] && PGOPTS="-c shared_preload_libraries=pg_lion"
 
 ROWS=${LION_WM_ROWS:-1000000}
 NINS=${LION_WM_NINS:-10000}
@@ -90,12 +112,15 @@ log_min_messages = warning
 log_checkpoints = on
 track_io_timing = on
 CONF
-	pg_ctl -D "$DATA" -l "$DATA/server.log" -w start >/dev/null
+	pg_ctl -D "$DATA" -l "$DATA/server.log" -o "$PGOPTS" -w start >/dev/null
 	wm_load_template
 	echo "write_micro cluster ready on $SOCK:$PORT"
 }
 
-wm_start() { pg_ctl -D "$DATA" -l "$DATA/server.log" -w start >/dev/null; }
+# STOP and START, never `pg_ctl restart`, which reuses the previous
+# postmaster's options out of postmaster.opts and would keep the preload of a
+# previous rmgr arm (DESIGN.md §25 records the trap).
+wm_start() { pg_ctl -D "$DATA" -l "$DATA/server.log" -o "$PGOPTS" -w start >/dev/null; }
 wm_stop() { pg_ctl -D "$DATA" -m fast -w stop >/dev/null 2>&1 || true; }
 wm_drop() { wm_stop; rm -rf "$DATA"; }
 

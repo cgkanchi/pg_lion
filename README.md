@@ -198,7 +198,10 @@ directory's height, its leaf and internal pages and whether that column is `orde
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
 column's entries, its containers by kind, its sparse segments, its posting trees' internal pages and
 tallest height, `null_tids`, the number of rows whose key in that column is NULL, and `empty_tids`,
-the number of rows a multi-key opclass extracted no key from.  The counters that describe the
+the number of rows a multi-key opclass extracted no key from.  `slack_bytes` and
+`inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
+payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
+bulk-built index has none of either.  The counters that describe the
 relation rather than a column - the directory's shape, free and deleted pages - are repeated on
 every row.
 

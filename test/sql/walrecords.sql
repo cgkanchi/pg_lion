@@ -93,5 +93,60 @@ SELECT bool_and(description IS NOT NULL AND description <> '') AS all_described
 
 SELECT lion_index_verify('lion_wr_k', true);
 
-DROP TABLE lion_wr;
+/*
+ * ITEM_REPLACE AS A DELTA (DESIGN.md §25).
+ *
+ * A container that has used up its growth slack is rewritten through the
+ * general path.  That record used to carry the WHOLE rewritten item - 1.6 KB
+ * for a dense ARRAY, which is what made the container path cost more WAL than
+ * a generic byte diff of the same change - and now carries the byte ranges
+ * that differ from what the page already holds.
+ *
+ * What is pinned is the shape: the delta operation appears, and the records
+ * that use it stay small.  How many there are depends on page fill, and a
+ * rewrite that really does change most of the item (an ARRAY that turns into
+ * a BITSET) still goes in whole, which is why the bound is on the records
+ * that carry a delta rather than on every ITEM_REPLACE.  A full-page image
+ * is not part of what the record says, so it is subtracted: the first touch
+ * of a page after a checkpoint carries one whatever the operation is.
+ */
+CREATE TABLE lion_wd (id int, k int);
+CREATE INDEX lion_wd_k ON lion_wd USING lion (k) WITH (inline_limit = 64);
+INSERT INTO lion_wd SELECT i, i % 4 FROM generate_series(1, 20000) i;
+CHECKPOINT;
+SELECT pg_current_wal_lsn() AS lsn2 \gset
+INSERT INTO lion_wd SELECT i, i % 4 FROM generate_series(20001, 20400) i;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_again;
+SELECT pg_current_wal_lsn() AS lsn3 \gset
+
+SELECT count(*) > 0 AS wrote_deltas,
+	   coalesce(max(record_length - fpi_length), 0) <= 512 AS deltas_are_small
+  FROM pg_get_wal_records_info(:'lsn2', :'lsn3')
+ WHERE resource_manager = 'pg_lion' AND record_type = 'ITEM_REPLACE'
+   AND description LIKE '%delta off%';
+
+/*
+ * INLINE ENTRY SLACK (DESIGN.md §4).  An insert into a key whose payload
+ * still has room writes inside the entry: no other entry on the leaf moves,
+ * and the record is a delta of the counters and the tail of the payload.
+ */
+CREATE TABLE lion_wi (id int, k int);
+CREATE INDEX lion_wi_k ON lion_wi USING lion (k);
+INSERT INTO lion_wi SELECT i, i % 400 FROM generate_series(1, 20000) i;
+CHECKPOINT;
+SELECT pg_current_wal_lsn() AS lsn4 \gset
+INSERT INTO lion_wi SELECT i, i % 400 FROM generate_series(20001, 20400) i;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_thrice;
+SELECT pg_current_wal_lsn() AS lsn5 \gset
+
+SELECT count(*) > 0 AS wrote_entry_deltas,
+	   coalesce(max(record_length - fpi_length), 0) <= 512 AS entry_deltas_are_small
+  FROM pg_get_wal_records_info(:'lsn4', :'lsn5')
+ WHERE resource_manager = 'pg_lion' AND record_type = 'ENTRY'
+   AND description LIKE '%delta off%';
+
+SELECT lion_index_verify('lion_wd_k', true);
+SELECT lion_index_verify('lion_wi_k', true);
+
+DROP TABLE lion_wr, lion_wd, lion_wi;
 DROP EXTENSION pg_walinspect;

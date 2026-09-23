@@ -363,7 +363,8 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT slack_bytes int8,
 									OUT deleted_pages int8,
 									OUT posting_internal_pages int8,
-									OUT max_posting_height int4)
+									OUT max_posting_height int4,
+									OUT inline_slack_bytes int8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;

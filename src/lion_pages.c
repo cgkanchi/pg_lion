@@ -1081,6 +1081,89 @@ lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 }
 
 /*
+ * The same, but with the entry ALLOCATED at `allocsz` bytes and everything
+ * past the payload zeroed: growth slack for the next insert into this key
+ * (DESIGN.md §4, applied to an INLINE payload).
+ *
+ * The slack needs no length field, because lion_inline_fetch() stops at the
+ * first zero item header - no item kind is 0 - which is the convention
+ * VACUUM's shrink-in-place already relies on (DESIGN.md §18).  So the payload
+ * is self-terminating and every reader of it, the spill included, sees exactly
+ * the items that are there.
+ */
+LionEntryTuple *
+lion_entry_rebuild_slack(const LionEntryTuple *entry, const char *payload,
+						 Size payloadlen, Size allocsz, Size *size)
+{
+	Size		payoff = LionEntryPayloadOffset(entry);
+	LionEntryTuple *copy;
+
+	Assert(allocsz >= payoff + payloadlen);
+
+	if (allocsz > LION_MAX_ENTRY_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
+						allocsz)));
+
+	copy = (LionEntryTuple *) palloc0(allocsz);
+	memcpy(copy, entry, payoff);
+	if (payloadlen > 0)
+	{
+		Assert(payload != NULL);
+		memcpy(((char *) copy) + payoff, payload, payloadlen);
+	}
+
+	*size = allocsz;
+	return copy;
+}
+
+/*
+ * Allocated length for an INLINE entry an INSERT is rewriting, so that the
+ * next few members land inside the bytes it already has (DESIGN.md §4).
+ *
+ * The rule is the one items use - payload/8, clamped into
+ * [LION_ITEM_SLACK_MIN, LION_ITEM_SLACK_MAX] - with two caps of its own.  The
+ * slack is payload BYTES THAT HOLD NO PAYLOAD, so it may never push the stored
+ * payload past `inline_limit`, and it may never be worth splitting the leaf
+ * for: `maxsize` is the largest the entry may become without one, and the
+ * caller works it out from the free space on the page.
+ *
+ * What this must NOT do is make a key spill early.  The spill test is made on
+ * the REAL payload length before this is called, so an entry whose payload is
+ * still inside inline_limit stays INLINE however much slack it carries; and an
+ * entry whose payload has reached inline_limit gets none, because it is about
+ * to spill anyway.  Only inserts add it: ambuild and VACUUM write entries at
+ * the length they need (VACUUM keeps the length it finds, which is the same
+ * slack seen from the other side).
+ */
+Size
+lion_entry_alloc_size(Size payoff, Size paylen, Size inline_limit, Size maxsize)
+{
+	Size		extra;
+	Size		alloc;
+
+	extra = paylen / LION_ITEM_SLACK_FRACTION;
+	extra = Max(extra, (Size) LION_ITEM_SLACK_MIN);
+	extra = Min(extra, (Size) LION_ITEM_SLACK_MAX);
+	extra = MAXALIGN(extra);
+
+	if (paylen + extra > inline_limit)
+		extra = (inline_limit > paylen) ? inline_limit - paylen : 0;
+
+	alloc = payoff + paylen + extra;
+	if (alloc > (Size) LION_MAX_ENTRY_SIZE)
+		alloc = (Size) LION_MAX_ENTRY_SIZE;
+	if (alloc > maxsize)
+		alloc = maxsize;
+	if (alloc < payoff + paylen)
+		alloc = payoff + paylen;	/* no room for slack, or none wanted */
+
+	Assert(alloc - (payoff + paylen) <= LION_ENTRY_SLACK_BOUND);
+	return alloc;
+}
+
+/*
  * Find the entry for (hash, key) in the directory, comparing stored keys with
  * eqproc and ordering them with cmpproc (NULL for either means the index's
  * own).  DESIGN.md §21 replaced the bucket chain this used to walk with a
@@ -1165,9 +1248,10 @@ lion_replace_entry(Relation index, LionWalState *state, Buffer buf,
 	 * at this point even though it is inside a critical section (DESIGN.md
 	 * §25).
 	 */
+	lion_wal_save_item(wal, page, offnum);
 	ok = PageIndexTupleOverwrite(page, offnum, entry, size);
 	if (ok)
-		lion_wal_op(wal, page, LION_OP_REPLACE, offnum, 0, entry, size);
+		lion_wal_op_replace(wal, page, offnum, entry, size);
 
 	if (state == NULL)
 	{
@@ -1483,10 +1567,17 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 			LionWalState *xstate = lion_wal_begin(index);
 			Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 
+			lion_wal_save_item(xstate, p, off);
 			if (PageIndexTupleOverwrite(p, off, items[0], writesz))
 			{
-				lion_wal_op(xstate, p, LION_OP_REPLACE, off, 0, items[0],
-							writesz);
+				/*
+				 * An item that is rewritten at (or near) the length it already
+				 * has differs from its predecessor in a handful of bytes - one
+				 * more member of an ARRAY, the two-byte cardinality - so the
+				 * record carries those bytes and not the 1.6 KB item
+				 * (DESIGN.md §25, LION_OP_DELTA).
+				 */
+				lion_wal_op_replace(xstate, p, off, items[0], writesz);
 				lion_page_update_minmax(p);
 				lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 				lion_put_entry(index, xstate, entrybuf, entryoff, entry);

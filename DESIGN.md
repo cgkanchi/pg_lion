@@ -228,6 +228,39 @@ reader copy an item out by ItemIdGetLength() into a fixed work buffer). lion_ind
 reports the total as `slack_bytes`; `container_bytes` counts logical bytes only, and `free_bytes`
 comes from PageGetFreeSpace(), which does not see intra-item slack at all.
 
+**Growth slack inside an INLINE payload** (implemented; §25 left it undone and said what shape it
+should take). An INLINE entry's payload is packed, so adding a member to a container inside it
+moves every byte above that container - and, before this, the entry itself was rebuilt at its new
+length and written back with PageIndexTupleOverwrite(), which moved every OTHER entry on the
+directory leaf as well. That is 1.5-2.9 KB of WAL per insert in generic mode, where the record is a
+byte diff of the page, and a memmove of the page tail in both modes. An entry an insert rewrites is
+therefore allotted a few bytes MORE than its payload needs, by the same rule as an item
+(`lion_entry_alloc_size()`: paylen/8 clamped into [LION_ITEM_SLACK_MIN, LION_ITEM_SLACK_MAX]), and
+the next insert whose payload still fits inside them keeps the entry's allocated length exactly as
+it is: no other entry on the leaf moves, and the record covers this entry alone.
+
+The slack needs no header field, and deliberately does not use the two spare bytes of §24: it is
+ZEROED, and `lion_inline_fetch()` already stops at the first zero item header because no item kind
+is 0. That is the convention VACUUM's shrink-in-place has used since §18, so the two kinds of slack
+meet in one entry with no further rule, and verify() bounds both at LION_ENTRY_SLACK_BOUND and
+requires every byte of them to really be zero.
+
+Two caps keep it from changing anything else. Slack may never push the STORED payload past
+`inline_limit`, and it is never worth a leaf split: the entry grows only into the free space the
+page already has (`PageGetExactFreeSpace()`), else it is written at its exact size and
+`lion_dir_place()` splits as it always did. And the SPILL decision is made on the payload the key
+really uses, before the allocation is chosen, so slack can never make a posting set spill early -
+the test in `lion_insert_inline()` is on `newlen`, not on what the entry is allotted. As for items,
+only inserts add it: ambuild writes entries at their exact size and VACUUM keeps the length it
+finds. lion_index_stats() reports it as `inline_slack_bytes`, apart from `slack_bytes`, because it
+is an entry's and not an item's.
+
+Measured (release, 1M rows, 10,000 single-row inserts into one index, §25's harness): the c20k
+column falls from 2918.7 to 173.0 bytes of WAL per insert in generic mode and from 422.4 to 180.5
+in rmgr mode, and c1m from 1682.2 to 106.8 and from 124.1 to 82.0. The 8-index portfolio insert
+falls from 53.53 to 9.48 MiB (generic) and from 29.21 to 9.08 MiB (rmgr) in steady state, and the
+index is the same size afterwards to the byte - the slack lands in space the leaves already had.
+
 Page allocation: `lion_alloc_page()` takes a page - a recycled one from the free space map when one
 is safe to take, else a fresh block from ExtendBufferedRel - and `lion_wal_init_buffer()`
 initialises it and registers it in the caller's record, so a crash cannot leave an initialised page
@@ -3381,11 +3414,13 @@ can read it even when every block carries a full-page image.
                                    page, MINMAX if a segment's range grew, and
                                    the entry tuple on the directory leaf.  The
                                    hot-key insert record: ~64 bytes.
-    ITEM_REPLACE    0x10  2        REPLACE (the item at its allotted length,
-                                   slack already zeroed) + MINMAX + the entry.
-                                   MEASURED REGRESSION: for a dense container
-                                   this is ~1.6 KB where a generic byte diff was
-                                   ~122 B; see the measurements below.
+    ITEM_REPLACE    0x10  2        DELTA (the ranges of the item at its allotted
+                                   length that differ from what the page holds)
+                                   + MINMAX + the entry.  98 B for the dense
+                                   container that used to cost 1658; a rewrite
+                                   that changes more than half the item falls
+                                   back to REPLACE, which is the whole item at
+                                   its allotted length with its slack zeroed.
     ITEM_ADD        0x20  1-2      DELETE (when replacing) + ADD per item +
                                    MINMAX + the entry.  Also every record of an
                                    INLINE spill.
@@ -3418,8 +3453,32 @@ can read it even when every block carries a full-page image.
                                    deletes entries.
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
-ADDMANY, REPLACE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS, META,
-DELETED, CONTAINER_ADD, SPARSE_INS.
+ADDMANY, REPLACE, DELTA, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS,
+META, DELETED, CONTAINER_ADD, SPARSE_INS.
+
+**DELTA is what a rewrite of one item costs now**, and it is the one operation
+whose payload is a function of the page as well as of the record. It says: the
+item at `off` becomes `aux` bytes long, and here are the ranges
+(`{uint16 at, uint16 len, bytes}`) in which it differs from the item that is
+there now, taken as the BASE IMAGE truncated to `aux` bytes or zero-extended to
+them. The writer computes those ranges against exactly that base before it
+overwrites the item - `lion_wal_save_item()` copies the image, the
+PageIndexTupleOverwrite() happens, `lion_wal_op_replace()` does the comparison -
+so replay reconstructs the writer's item byte for byte and
+`wal_consistency_checking` proves it does. Redo patches the item where it lies
+when the length has not changed, and otherwise rebuilds it in a scratch buffer
+and puts it back through the same PageIndexTupleOverwrite() the primary called,
+which is what keeps the page identical when an item moves.
+
+The allocated length may change, and that is the point of `aux`: an item that
+has used up its growth slack (§4) is rewritten LONGER, and the new slack is
+zeroed on both sides so it costs nothing in the delta. Every call site that
+overwrites an item uses the pair - a container item, an entry tuple on a
+directory leaf, VACUUM's shrunken items and INLINE payloads - and the fallback
+is automatic: when the ranges would come to more than half the item, the
+operation is dropped and a plain REPLACE takes its place, so an ARRAY that turns
+into a BITSET still goes in whole. Nothing about masking changes, because the
+bytes outside the named ranges are the bytes the page already had.
 
 **Two operations log the writer's CALL rather than its bytes**, and that is
 where the hot record's size comes from. Adding a member to a sorted ARRAY shifts
@@ -3650,14 +3709,14 @@ outside the lock window that matters and the burst numbers above are what they
 are - but it is a real byte regression on dense keys, and the fix is known: an
 item that is being rewritten at the SAME allotted length differs from its
 predecessor in a handful of bytes, so ITEM_REPLACE should either carry a delta or
-be split into a shrink/grow plus an ITEM_SET. It is the first thing to do in this
-area and it is not done here.
+be split into a shrink/grow plus an ITEM_SET. **It was the first thing to do in
+this area and it is done: LION_OP_DELTA above, and the re-measurement below.**
 
 *The INLINE path is where the win is*, and it is the win §25 predicted for a
 feature it did not build: 2918.7 -> 422.4 B and 1682.2 -> 124.1 B per insert, 7x
 and 14x, purely from logging the rewritten entry tuple instead of a page diff
 that covers the whole tail of the leaf. INLINE entry slack (the "also" item
-below) would cut it again, to an ITEM_SET.
+below) would cut it again - and it does, in both arms, below.
 
 Not measured, and honestly so: the quick-v3 `mid_insert` at 1M rows and the
 VACUUM micro-benchmark. Both harnesses build their own cluster in ways that have
@@ -3674,26 +3733,93 @@ or stop and start. `test/rmgr-check.sh` had this bug and now stops and starts in
 both directions and prints how many resource managers are registered
 afterwards.)*
 
+### Measured again after the delta and the INLINE slack (2026-09-22)
+
+Same box, same release prefix, same 1M-row cluster and the same two arms; the
+A/B swaps only the installed `pg_lion.so` (`base` is the commit above, `new` is
+this one) and restarts the cluster with or without the preload.
+`bench/write_micro.sh` grew `LION_WM_PGBIN` and `LION_WM_PRELOAD` so that this
+is one command per cell. WAL bytes were byte-identical across repeats; the
+millisecond columns are medians of 2-5 runs on a box that was not idle.
+
+    WAL per insert record (10,000 single-row inserts, one index, second batch)
+      column  path        generic  before -> after   rmgr  before -> after
+      c2      container   121.6 B  -> 121.6 B        114.0 B ->  79.0 B  ITEM_SET
+                                                    1657.8 B ->  98.4 B  ITEM_REPLACE
+      c20k    INLINE     2918.7 B  -> 173.0 B        422.4 B -> 180.5 B  ENTRY
+      c1m     INLINE     1682.2 B  -> 106.8 B        124.1 B ->  82.0 B  ENTRY
+
+    ... per 10k-row batch, the same thing in MiB of index WAL
+      c2       generic 1.16 -> 1.16     rmgr 1.62 -> 0.76
+      c20k     generic 27.83 -> 1.65    rmgr 4.03 -> 1.72
+      c1m      generic 16.04 -> 1.02    rmgr 1.18 -> 0.78
+      (btree on c200, for scale: 0.63 MiB, 64 B per leaf insert)
+
+    INSERT 10k rows into the 1M-row, 8-index portfolio (before -> after)
+                    after a checkpoint            steady state
+      generic    893 -> 935 ms  88.10 -> 90.82   851 -> 768 ms  53.53 -> 9.48 MiB
+      rmgr       285 -> 289 ms  64.53 -> 51.68   143 -> 130 ms  29.21 ->  9.08 MiB
+      btree      150 ms         33.31            93 ms           6.75 MiB
+    index size after 20k inserts: 70,967,296 B in BOTH arms, to the byte
+
+    8-client hot-key burst, 2 key values, synchronous_commit on, rmgr mode
+                       tps          p95        WAL/row   of which the index
+      before          1328         9.31 ms      238.8 B      166 B
+      after           1290         9.64 ms      159.0 B       86 B
+      btree           1642/1644    7.9  ms      143.1 B       70 B
+      no index        2394/2461    3.9  ms       72.6 B        -
+    (the index share is the row minus the no-index control, which is the same
+    heap in every arm).  The btree and no-index arms moved under 1% between the
+    two runs, so the 3% the lion arm lost is probably real: it is what the delta
+    comparison costs inside the critical section, against half the index WAL.
+
+**The +40% is gone and the container path is now cheaper than generic WAL.**
+1.62 -> 0.76 MiB against generic's 1.16: the 361 general-path rewrites fell from
+1658 to 98 bytes, which is 16.8x, and the 9,631 hot-key records fell from 114 to
+79 because the entry tuple that travels with every one of them is now a delta of
+its `ntids` counter instead of a copy of the whole 40-byte tuple. That second
+number is the one to remember about DELTA: it pays on the SMALL records too.
+
+**The INLINE slack pays most where the rmgr could not reach**: generic mode,
+where the record is a diff of the page and the old code moved every entry after
+the one it grew. 2918.7 -> 173.0 B on c20k is 16.9x and brings generic-mode
+INLINE inserts within 2.7x of btree's leaf insert. In rmgr mode the same change
+is 2.3x (422.4 -> 180.5), because the record was already the entry alone; what
+is left is a sparse segment's own shape - inserting a pair shifts both the
+`ckeys[]` and the `los[]` array inside the payload, so the delta covers the tail
+of both. An operation that replayed `lion_sparse_insert()` against an unaligned
+payload (redo would have to copy it out, call the library function and copy it
+back) would cut that to a dozen bytes, and it is the obvious next step; it is
+not done here. It is also why generic (173.0 B) is now marginally CHEAPER than
+rmgr (180.5 B) on c20k: a byte diff of a page describes that shift in fewer
+bytes than four-byte range headers do.
+
+*Two costs, both small and both real.* The steady-state portfolio insert is
+unchanged to slightly faster in rmgr mode (143 -> 130 ms) - the delta comparison
+runs inside the critical section, so it is written to skip equal bytes eight at
+a time, and the page-tail memmove it removes is worth more than it costs - but
+the first batch after a CHECKPOINT writes 2.7 MiB MORE in generic mode
+(88.10 -> 90.82), which is full-page images: entries that carry slack fill a leaf
+a little sooner, so a batch touches a few more pages the first time round. The
+index itself is the same size, to the byte, after the same inserts.
+
 Also in this wave (§23 items that need the same lock-window work):
 
-- **INLINE entry slack: NOT DONE in this wave.** An entry's payload was to get
-  growth slack like an item's, so that an INLINE insert became an ITEM_SET
-  record instead of rewriting the whole entry (1.5-2.8 KB of WAL per insert on
-  c20k/c1m per §5). It is still the right thing and it is still shaped the way
-  this section says - the zero-terminator convention VACUUM already uses (§18)
-  is the one to take, because it needs no header field and `lion_inline_fetch()`
-  already stops at the first zero item header, and verify() already bounds the
-  trailing zeroes at LION_ENTRY_SLACK_BOUND. What it needs that the rest of this
-  section did not is a change to the INSERT path's shape rather than to its
-  logging: `lion_insert_inline()` rebuilds the payload in a work buffer and
-  replaces the entry, and an in-place path has to decide, before it touches
-  anything, whether the container the member lands in can take it inside the
-  bytes the entry already has - which is the same "decide before the critical
-  section" discipline the rest of this wave imposed, applied to a function that
-  does not have it yet. The record it would write already exists: ITEM_SET with
-  a SETBYTES operation, which is in the catalogue and is what the INLINE case
-  would use (the payload is unaligned, so CONTAINER_ADD cannot be called on it
-  in place).
+- **INLINE entry slack: DONE**, in the wave after this one, and §4 carries it
+  (see "Growth slack inside an INLINE payload"). It took the shape this section
+  predicted - the zero-terminator convention of §18, no header field, no use of
+  §24's two spare bytes - and one thing it did not: the record is not an
+  ITEM_SET with a SETBYTES, it is the ordinary ENTRY record with the DELTA
+  operation above, because that operation had to exist anyway for ITEM_REPLACE
+  and it describes this change exactly (the counters in the header, and the
+  payload from the insertion point up). `lion_insert_inline()` still rebuilds
+  the payload in a work buffer and still decides everything before the record
+  opens; what changed is the LENGTH it writes the entry at. When the new payload
+  fits the bytes the entry already has, the allocated length does not change, so
+  PageIndexTupleOverwrite() moves no other entry on the leaf - which is where
+  the generic-mode 16.9x comes from - and when it does not, the entry is written
+  with fresh slack, bounded by inline_limit, by the page's free space and by
+  LION_ENTRY_SLACK_BOUND.
 - **Early exit in the AND merge: DONE** (`lion_run_merge()` in lion_count.c).
   The non-driver sources are ordered by ascending members - the same `ntids` §22
   picks the driver from - and the merge seeks and folds them in that order,

@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s3_prep s2_delete s1_group s3_vacuum s2_wakeup s1_plain s3_stats s3_verify
+starting permutation: s3_prep s2_delete s1_group s3_vacuum s2_wakeup s1_plain s3_stats s3_vacuum2 s3_stats2 s3_verify
 injection_points_attach
 -----------------------
                        
@@ -82,12 +82,21 @@ groups2|distinct_groups2|rows_counted2
 (1 row)
 
 step s3_stats: 
-	SELECT entries, ntids, deleted_pages > 0 AS chains_were_freed
+	SELECT entries BETWEEN 20 AND 40 AS entries_in_range,
+		   ntids BETWEEN 6000 AND 6020 AS ntids_in_range,
+		   deleted_pages > 0 AS chains_were_freed
 	  FROM lion_index_stats('vgd_k');
 
-entries|ntids|chains_were_freed
--------+-----+-----------------
-     20| 6000|t                
+entries_in_range|ntids_in_range|chains_were_freed
+----------------+--------------+-----------------
+t               |t             |t                
+(1 row)
+
+step s3_vacuum2: VACUUM vgd;
+step s3_stats2: SELECT entries, ntids FROM lion_index_stats('vgd_k');
+entries|ntids
+-------+-----
+     20| 6000
 (1 row)
 
 step s3_verify: SELECT lion_index_verify('vgd_k', true);
@@ -103,7 +112,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s3_prep s2_delete s1_group2 s3_vacuum s2_wakeup s1_plain s3_stats s3_verify
+starting permutation: s3_prep s2_delete s1_group2 s3_vacuum s2_wakeup s1_plain s3_stats s3_vacuum2 s3_stats2 s3_verify
 injection_points_attach
 -----------------------
                        
@@ -185,12 +194,21 @@ groups2|distinct_groups2|rows_counted2
 (1 row)
 
 step s3_stats: 
-	SELECT entries, ntids, deleted_pages > 0 AS chains_were_freed
+	SELECT entries BETWEEN 20 AND 40 AS entries_in_range,
+		   ntids BETWEEN 6000 AND 6020 AS ntids_in_range,
+		   deleted_pages > 0 AS chains_were_freed
 	  FROM lion_index_stats('vgd_k');
 
-entries|ntids|chains_were_freed
--------+-----+-----------------
-     20| 6000|t                
+entries_in_range|ntids_in_range|chains_were_freed
+----------------+--------------+-----------------
+t               |t             |t                
+(1 row)
+
+step s3_vacuum2: VACUUM vgd;
+step s3_stats2: SELECT entries, ntids FROM lion_index_stats('vgd_k');
+entries|ntids
+-------+-----
+     20| 6000
 (1 row)
 
 step s3_verify: SELECT lion_index_verify('vgd_k', true);

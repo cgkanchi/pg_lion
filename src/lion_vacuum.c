@@ -895,11 +895,12 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		{
 			if (inl[i].spill)
 				continue;
+			lion_wal_save_item(xstate, p, inl[i].off);
 			if (PageIndexTupleOverwrite(p, inl[i].off, inl[i].tuple,
 										inl[i].writesz))
 			{
-				lion_wal_op(xstate, p, LION_OP_REPLACE, inl[i].off, 0,
-							inl[i].tuple, inl[i].writesz);
+				lion_wal_op_replace(xstate, p, inl[i].off, inl[i].tuple,
+									inl[i].writesz);
 				nwritten++;
 			}
 			else
@@ -1788,10 +1789,11 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 		 */
 		Size		writesz = (w->ndel > 0) ? w->work[i].size : w->work[i].writesz;
 
+		lion_wal_save_item(xstate, p, w->work[i].off);
 		if (PageIndexTupleOverwrite(p, w->work[i].off, w->work[i].c, writesz))
 		{
-			lion_wal_op(xstate, p, LION_OP_REPLACE, w->work[i].off, 0,
-						w->work[i].c, writesz);
+			lion_wal_op_replace(xstate, p, w->work[i].off, w->work[i].c,
+								writesz);
 			removed += w->work[i].removed;
 		}
 		else if (w->work[i].c->type == LION_CT_SPARSE)

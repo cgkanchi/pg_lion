@@ -114,6 +114,34 @@ StaticAssertDecl(sizeof(xl_lion_op) == 8, "xl_lion_op must be 8 bytes");
 #define LION_OP_DELETED		13	/* lion_page_set_deleted(), payload = xid */
 #define LION_OP_CONTAINER_ADD 14	/* lion_container_add(item at off, aux) */
 #define LION_OP_SPARSE_INS	15	/* lion_sparse_insert(off, payload ckey, aux) */
+#define LION_OP_DELTA		16	/* REPLACE at off by aux bytes, as a diff */
+
+/*
+ * LION_OP_DELTA: the item at `off` becomes `aux` bytes long, and the bytes
+ * that differ from what it holds now travel as a list of RANGES.
+ *
+ * The base image is the item AS THE PAGE HOLDS IT, truncated to `aux` bytes or
+ * zero-extended to them; the payload is a packed sequence of
+ * {uint16 at, uint16 len, len bytes} that is memcpy'd over it in order.  The
+ * writer computes the ranges against exactly that base before it overwrites
+ * the item (lion_wal_save_item() takes the image, lion_wal_op_replace() does
+ * the comparison), so replay reproduces the writer's item byte for byte.
+ *
+ * This is what keeps an in-place growth of one item off the WAL: a 1.6 KB
+ * ARRAY container that gains one member differs from its predecessor in the
+ * two-byte cardinality and the bytes from the insertion point up, which for
+ * an ascending TID stream is two more.  A rewrite that changes more than half
+ * of the item is logged as a plain LION_OP_REPLACE instead (DESIGN.md §25).
+ */
+typedef struct xl_lion_range
+{
+	uint16		at;				/* byte offset inside the item */
+	uint16		len;			/* bytes following */
+} xl_lion_range;
+
+#define SizeOfLionRange			((Size) sizeof(xl_lion_range))
+
+StaticAssertDecl(sizeof(xl_lion_range) == 4, "xl_lion_range must be 4 bytes");
 
 /*
  * The record header, which always travels in the main data so that redo can
@@ -166,6 +194,25 @@ extern void lion_wal_op(LionWalState *state, Page page, uint8 op,
 /* Append bytes to the payload of the operation most recently described. */
 extern void lion_wal_op_append(LionWalState *state, Page page,
 							   const void *data, Size len);
+
+/*
+ * Remember the current image of the item at `off`, so that the overwrite that
+ * follows can be logged as a DELTA against it (DESIGN.md §25).  A no-op in
+ * generic mode, where the byte-wise diff of the page does the same job.  The
+ * image is kept until the next save or the end of the record, so a call site
+ * that rewrites several items saves and logs each of them in turn.
+ */
+extern void lion_wal_save_item(LionWalState *state, Page page,
+							   OffsetNumber off);
+
+/*
+ * Log a PageIndexTupleOverwrite() that has just succeeded: a LION_OP_DELTA
+ * against the image lion_wal_save_item() took, or a plain LION_OP_REPLACE when
+ * no image was saved or the delta would be no cheaper.  The caller must have
+ * saved the image BEFORE it modified the item.
+ */
+extern void lion_wal_op_replace(LionWalState *state, Page page,
+								OffsetNumber off, const void *item, Size len);
 
 /*
  * Set the `aux` field of the operation most recently described.  An ADDMANY

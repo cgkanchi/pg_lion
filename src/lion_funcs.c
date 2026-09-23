@@ -40,7 +40,7 @@ PG_FUNCTION_INFO_V1(lion_index_verify);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
 PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 
-#define LION_STATS_NCOLS		23
+#define LION_STATS_NCOLS		24
 
 typedef struct LionVerifyState
 {
@@ -138,6 +138,7 @@ typedef struct LionColStats
 	int64		posting_internal_pages; /* ... and the pages above them */
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
+	int64		inline_slack_bytes; /* ... and inside INLINE payloads (§4) */
 } LionColStats;
 
 /* What one posting set contributed, before its column is known. */
@@ -352,6 +353,17 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
 														 paylen, &cur, cbuf)) > 0)
 							lion_stats_item(cs, cbuf, csize);
+
+						/*
+						 * What the payload does not use is growth slack: the
+						 * zeroed tail an insert leaves so that the next member
+						 * fits without rewriting the entry, or the one VACUUM
+						 * leaves when it writes a filtered payload back into
+						 * the bytes the entry already had (DESIGN.md §4, §18).
+						 * It is reported apart from an item's own slack
+						 * because it is an entry's, not an item's.
+						 */
+						cs->inline_slack_bytes += (int64) (paylen - cur);
 					}
 					else
 						lion_stats_claim(st, entry->head, entry->attno);
@@ -496,6 +508,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		values[20] = Int64GetDatum(st->deleted_pages);
 		values[21] = Int64GetDatum(cs->posting_internal_pages);
 		values[22] = Int32GetDatum(st->max_posting_height);
+		values[23] = Int64GetDatum(cs->inline_slack_bytes);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
@@ -1417,10 +1430,13 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		}
 
 		/*
-		 * Whatever is left is the zeroed slack VACUUM leaves when it writes a
-		 * shrunken payload back into the bytes the entry already had
-		 * (DESIGN.md §18).  It is bounded so that it cannot hide a malformed
-		 * payload, and every byte of it has to really be zero.
+		 * Whatever is left is the payload's growth slack: the zeroed tail an
+		 * INSERT leaves so that the next member fits without rewriting the
+		 * entry (DESIGN.md §4), or the one VACUUM leaves when it writes a
+		 * shrunken payload back into the bytes the entry already had (§18).
+		 * Both are bounded by the same constant, so that slack cannot hide a
+		 * malformed payload, and every byte of it has to really be zero -
+		 * which is also what makes it a terminator.
 		 */
 		if (paylen - cur > LION_ENTRY_SLACK_BOUND)
 			lion_corrupt("lion index \"%s\": entry %u on block %u has %zu bytes of payload slack, at most %d allowed",

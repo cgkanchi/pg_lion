@@ -1186,6 +1186,26 @@ extern LionEntryTuple *lion_entry_rebuild(const LionEntryTuple *entry,
 										Size *size);
 
 /*
+ * The same with the result ALLOCATED at allocsz bytes and the tail past the
+ * payload zeroed: an INLINE entry's growth slack (DESIGN.md §4).  The zeroes
+ * terminate the payload - lion_inline_fetch() stops at the first zero item
+ * header - so nothing else has to know the slack is there.
+ */
+extern LionEntryTuple *lion_entry_rebuild_slack(const LionEntryTuple *entry,
+												const char *payload,
+												Size payloadlen, Size allocsz,
+												Size *size);
+
+/*
+ * How many bytes to give an INLINE entry an INSERT is rewriting: its payload
+ * plus growth slack by the rule of DESIGN.md §4, capped by inline_limit (so
+ * that slack can never make a key spill) and by maxsize (so that it can never
+ * be worth splitting a leaf for).
+ */
+extern Size lion_entry_alloc_size(Size payoff, Size paylen, Size inline_limit,
+								  Size maxsize);
+
+/*
  * Like lion_chain_put_container(), but for a container page the caller has
  * already located and locked EXCLUSIVE (a cleanup lock counts); the buffer
  * stays locked.  The page must be the one that owns c->ckey.

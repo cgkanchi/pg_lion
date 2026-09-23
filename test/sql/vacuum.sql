@@ -391,4 +391,31 @@ SELECT pg_relation_size('lion_slackv_k') <= (SELECT bytes FROM lion_slackv_size)
 	   AS grew_into_the_slack;
 SELECT lion_index_verify('lion_slackv_k', true);
 
-DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv;
+/*
+ * The same for the slack an INSERT leaves inside an INLINE entry (DESIGN.md
+ * §4): VACUUM filters such a payload and writes it back into the bytes the
+ * entry already has, so the two kinds of slack meet in one entry.  verify()
+ * bounds both and requires every byte of them to be zero, so a passing
+ * verify() is the assertion; what is pinned here is that the entries stay
+ * INLINE and keep answering correctly.
+ */
+CREATE TABLE lion_slacki (i int4, k int4);
+CREATE INDEX lion_slacki_k ON lion_slacki USING lion (k);
+INSERT INTO lion_slacki SELECT i, i % 40 FROM generate_series(1, 4000) i;
+SELECT inline_entries, inline_slack_bytes > 0 AS insert_left_slack
+  FROM lion_index_stats('lion_slacki_k');
+DELETE FROM lion_slacki WHERE i % 5 = 0;
+VACUUM lion_slacki;
+SELECT inline_entries, ntids,
+	   inline_slack_bytes > 0 AS still_has_slack
+  FROM lion_index_stats('lion_slacki_k');
+SELECT lion_index_verify('lion_slacki_k', true);
+SELECT lion_cmp('lion_slacki', 'k = 3');
+
+-- ... and the next inserts go back into it.
+INSERT INTO lion_slacki SELECT i, i % 40 FROM generate_series(4001, 4200) i;
+SELECT lion_index_verify('lion_slacki_k', true);
+SELECT lion_cmp('lion_slacki', 'k = 3');
+
+DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv,
+	lion_slacki;

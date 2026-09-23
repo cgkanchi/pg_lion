@@ -816,9 +816,16 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	{
 		xstate = lion_wal_begin(index);
 		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+		lion_wal_save_item(xstate, p, off);
 		if (PageIndexTupleOverwrite(p, off, (char *) item, size))
 		{
-			lion_wal_op(xstate, p, LION_OP_REPLACE, off, 0, item, size);
+			/*
+			 * An INLINE entry that gains one member differs from its
+			 * predecessor in its counters and the bytes from the insertion
+			 * point up, so the record carries a DELTA rather than the whole
+			 * payload (DESIGN.md §25).
+			 */
+			lion_wal_op_replace(xstate, p, off, item, size);
 			lion_wal_finish(xstate, LION_XLOG_ENTRY);
 			return;
 		}
