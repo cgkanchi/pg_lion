@@ -109,14 +109,20 @@ CREATE OPERATOR CLASS oid_ops DEFAULT FOR TYPE oid USING lion AS
  * lionvalidate() keeps the same list on those servers.  The classes of these
  * types are therefore created through this helper, which names the new
  * function where the server has it and the old one where it does not.
+ *
+ * Both names are looked up in pg_catalog ONLY.  Unqualified, a server without
+ * the new function would find it in the target schema instead, and a role
+ * with CREATE there could plant e.g. hashbool(bool) before CREATE EXTENSION:
+ * it becomes support function 1, which then runs as whoever inserts into or
+ * builds a lion index on that type - a superuser included.
  */
 CREATE FUNCTION lion_create_opclass_pre18(stmt text, newfn text, oldfn text)
 RETURNS void LANGUAGE plpgsql AS $f$
 BEGIN
-	IF to_regprocedure(newfn) IS NOT NULL THEN
-		EXECUTE format(stmt, newfn);
+	IF pg_catalog.to_regprocedure('pg_catalog.' || newfn) IS NOT NULL THEN
+		EXECUTE pg_catalog.format(stmt, 'pg_catalog.' || newfn);
 	ELSE
-		EXECUTE format(stmt, oldfn);
+		EXECUTE pg_catalog.format(stmt, 'pg_catalog.' || oldfn);
 	END IF;
 END
 $f$;
