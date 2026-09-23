@@ -294,11 +294,17 @@ static bool lion_exists_settled(LionCountCtx *cx);
  * a different Oid.  A process-local cache would then reject every index as
  * "not a lion index".  get_am_oid() is a GetSysCacheOid1(AMNAME) lookup,
  * which the syscache invalidates correctly and answers from memory.
+ *
+ * InvalidOid, not an error, where the access method does not exist: with the
+ * library in shared_preload_libraries the planner hooks run in every
+ * database, including those without CREATE EXTENSION pg_lion (template1 and
+ * postgres, where pg_upgrade's own count(*) queries run), and there no index
+ * or operator can match - which is what every caller does with InvalidOid.
  */
 Oid
 lion_get_am_oid(void)
 {
-	return get_am_oid("lion", false);
+	return get_am_oid("lion", true);
 }
 
 /*

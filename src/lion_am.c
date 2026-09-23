@@ -665,14 +665,17 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
  * no hash function of their own: their hash opclasses used a physically
  * compatible function of another type, and hashvalidate() accepted exactly
  * those pairs.  The extension script names the same functions on those
- * servers (pg_lion--0.1.sql), so the same pairs are accepted here, and only
- * there.  The function identity is tested rather than its argument type, for
- * hashvalidate()'s reason: hashvarlena() takes `internal`.
+ * servers (pg_lion--0.1.sql), so the same pairs are accepted here.  They are
+ * accepted on EVERY major, not only below 18: pg_upgrade from 16 or 17 carries
+ * the old pg_amproc rows onto an 18+ server (DESIGN.md §23 addendum), and the
+ * substitutes compute the same hash as the new functions, so those indexes
+ * are exactly as valid there.  The function identity is tested rather than
+ * its argument type, for hashvalidate()'s reason: hashvarlena() takes
+ * `internal`.
  */
 static bool
 lion_hash_substitution_ok(Oid funcid, Oid argtype)
 {
-#if PG_VERSION_NUM < 180000
 	switch (argtype)
 	{
 		case DATEOID:
@@ -688,7 +691,6 @@ lion_hash_substitution_ok(Oid funcid, Oid argtype)
 		case BYTEAOID:
 			return funcid == F_HASHVARLENA;
 	}
-#endif
 	return false;
 }
 
