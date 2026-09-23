@@ -46,8 +46,9 @@ for scenario in ['startup_failure', 'identity_failure', 'snapshot_failure', 'suc
         print(json.dumps(dict(scenario=scenario, exit=result.returncode,
                               body_reached='BENCH_BODY_REACHED' in result.stdout,
                               cleanup_writes=writes, unsafe=unsafe)), flush=True)
-        if scenario in ['startup_failure', 'identity_failure']:
+        if scenario in ['startup_failure', 'identity_failure', 'snapshot_failure']:
             assert result.returncode != 0 and not writes
+            assert 'BENCH_BODY_REACHED' not in result.stdout
         if scenario == 'success':
             assert result.returncode == 0 and len(writes) == 1
             assert "not in ('fact_preexisting_invalid')" in writes[0]

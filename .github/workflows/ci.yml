@@ -166,11 +166,23 @@ jobs:
           eval "$(./dev.sh env)"
           make installcheck-rmgr WAL_CONSISTENCY=1
 
+      # wal_consistency_checking compares pages only when a record is REPLAYED,
+      # so the step above (a primary that never replays) proves little about
+      # redo.  The recovery harness crashes the primary under load and builds
+      # a hot standby from it, which replays every record both phases write,
+      # and a mismatch is a FATAL in the startup process (test/recovery/README.md).
+      - name: Crash recovery and standby replay (custom resource manager, consistency checked)
+        run: make recovery-check-rmgr RECOVERY_PREFIX="$PGPREFIX"
+
+      - name: Crash recovery and standby replay (generic WAL, consistency checked)
+        run: ./test/recovery/run.sh --prefix "$PGPREFIX" --conf "wal_consistency_checking = 'generic'"
+
       - name: Show regression diffs
         if: failure()
         run: |
           find test -name regression.diffs -exec cat {} + || true
           tail -n 100 .local/pg.log || true
+          tail -n 200 test/recovery/log/*.log || true
 
   dist:
     name: PGXN archive (build and test from the zip)

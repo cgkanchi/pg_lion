@@ -15,14 +15,19 @@ BENCH_VERIFIED=0         # SHOW data_directory matched the requested directory
 BENCH_PREFIX=""
 BENCH_DATA=""
 BENCH_ORIG_INVALID=""    # fact_% indexes that were ALREADY invalid before this run
+BENCH_CAPTURED=0         # BENCH_ORIG_INVALID was actually read from the server
 
 bench_psql() { "$BENCH_PREFIX/bin/psql" -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 # Put back exactly the indexes this run flipped: every fact_% index that is
 # invalid now and was not invalid when the run began.  Never runs against an
-# endpoint whose identity has not been verified.
+# endpoint whose identity has not been verified, nor when the original state
+# could not be read: an empty BENCH_ORIG_INVALID then means "unknown", not
+# "none were invalid", and restoring would validate indexes someone else left
+# invalid on purpose.
 bench_restore_indexes() {
 	[ "$BENCH_VERIFIED" = 1 ] || return 0
+	[ "$BENCH_CAPTURED" = 1 ] || return 0
 	local excl=""
 	[ -n "$BENCH_ORIG_INVALID" ] && excl="and indexrelid::regclass::text not in ($BENCH_ORIG_INVALID)"
 	bench_psql -c "update pg_index set indisvalid = true where indexrelid::regclass::text like 'fact\\_%' and not indisvalid $excl" >/dev/null 2>&1 || true
@@ -67,7 +72,11 @@ bench_start_cluster() {
 		exit 1
 	fi
 	BENCH_VERIFIED=1
-	BENCH_ORIG_INVALID=$(bench_psql -tA -c "select coalesce(string_agg(quote_literal(indexrelid::regclass::text), ','), '') from pg_index where indexrelid::regclass::text like 'fact\\_%' and not indisvalid" 2>/dev/null || true)
+	if ! BENCH_ORIG_INVALID=$(bench_psql -tA -c "select coalesce(string_agg(quote_literal(indexrelid::regclass::text), ','), '') from pg_index where indexrelid::regclass::text like 'fact\\_%' and not indisvalid"); then
+		echo "could not read which fact_% indexes are already invalid; aborting before any change" >&2
+		exit 1
+	fi
+	BENCH_CAPTURED=1
 }
 
 # bench_build_extension <prefix> <project dir>  -> builds a clean copy against <prefix>
