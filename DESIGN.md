@@ -3258,6 +3258,36 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
   Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
   through the join.
+- **`count(DISTINCT k)` in the pushdown (after the FK join).** Both shapes below are refused today
+  (`lion_agg_is_count()` rejects any `aggdistinct`; pushdown.sql checks that
+  `count(DISTINCT b) ... WHERE a = 3` is not pushed down):
+  1. `SELECT count(DISTINCT k) FROM t WHERE <pushdown quals>`, with `k` a scalar key column of a
+     lion index (any column of a multicolumn one, §24). The answer is the number of `k` entries,
+     the reserved NULL and EMPTY entries excluded, whose posting set, intersected with the WHERE
+     sets, holds at least one row visible to the snapshot. This is the §10 GROUP BY-`k` walk with
+     an EXISTENCE test per group instead of a count, and existence can stop early: the first
+     member on an all-visible page (pinned, as §9 requires) settles the group with no heap visit,
+     and a dirty group needs rechecks only until one row is visible. `k` pinned by the WHERE
+     (`k = c`) answers 0 or 1; `k = ANY (list)` walks the located sets of §15.
+  2. `SELECT g, count(DISTINCT k) FROM t WHERE ... GROUP BY g`, with `g` and `k` both lion-indexed
+     (the same index or two): the §20 nested loop over (outer `g`, inner `k`) entries, emitting per
+     `g` the number of inner `k` whose pair intersection is non-empty and visible, again with the
+     early-exit existence test. The work is up to |G| x |K| intersections, so the cost model must
+     charge pairs and not groups, and the node must decline where the pair count makes the plain
+     HashAggregate cheaper; the §17 cardinality guard is the precedent.
+  Rules for both: DISTINCT's equality is the key type's default btree equality, so the opclass
+  equality must be the same equivalence relation (the grouping-equality check from the
+  2026-09-20 review applies unchanged: citext_ops over citext is fine, a collation mismatch
+  declines); NULLs are never counted; multi-key columns decline, because `count(DISTINCT tags)`
+  counts distinct arrays, not elements; `count(*)`, `count(col)` and `count(DISTINCT k)` may
+  appear together in one target list when each one is answerable; HAVING on the distinct count
+  reuses the plan.qual path from dff300f. Partitioned tables decline in the first version,
+  because distinct counts are not additive across partitions (the §16 partial/Finalize shape
+  sums them); a later version could emit per-partition (g, k) pairs for core to deduplicate.
+  Tests: answers against the sequential scan with NULLs, deletes, dirty and all-visible pages,
+  citext and collations, plus the declines (arrays, partitions, collation); the §11 VACUUM
+  interlock argument is unchanged, since existence is read from the same pinned containers as a
+  count, but count_vacuum_race should gain a distinct-count variant that proves it.
 - **PGXN packaging (before the Citus/TimescaleDB work).** Distribution through the PostgreSQL
   Extension Network is how the two environments below will install it, so it comes first:
   - `META.json` (PGXN Meta Spec v1.0.0): name `pg_lion`, abstract, license `postgresql`, version
@@ -3275,9 +3305,9 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
     `ALTER EXTENSION UPDATE`; format-version bumps that need REINDEX must say so in the upgrade
     script's NOTICE and in the release notes.
   - Build matrix against packaged PostgreSQL headers for every supported major (not only master):
-    a CI job per major running `make installcheck`; decide the minimum supported major (the bulk
-    write API needs 17; generic WAL and the CustomScan APIs used are older) and state it in
-    `META.json`.
+    a CI job per major running `make installcheck`. The minimum supported major is 16 (eb1579e:
+    `src/lion_compat.h`; 15 would need RelFileNode, pre-ExtendBufferedRel extension and no
+    varatt.h); state it in `META.json`.
   - `pg_upgrade` across majors with lion indexes present must fail cleanly at the format-version
     check or work, never crash; document REINDEX as the upgrade path for format bumps.
   - Also cover hook coexistence in the same matrix, since PGXN users load pg_lion beside other
