@@ -1,4 +1,5 @@
-# pg_lion — build with: make PG_CONFIG=.local/pg/bin/pg_config
+# pg_lion — build with: make PG_CONFIG=<path to pg_config>
+# (the default is .local/pg/bin/pg_config when that exists, else pg_config on PATH)
 MODULE_big = pg_lion
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o src/lion_pages.o src/lion_dir.o src/lion_posting.o src/lion_am.o \
        src/lion_build.o src/lion_scan.o \
@@ -17,7 +18,7 @@ ISOLATION_OPTS = --inputdir=test/isolation --outputdir=test/isolation
 PG_CFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Isrc
 EXTRA_CLEAN = test/unit/container_test test/unit/sparse_test test/results test/isolation/results
 
-PG_CONFIG ?= .local/pg/bin/pg_config
+PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
 # The isolation specs that park a backend on an injection point need a server
@@ -35,7 +36,11 @@ include $(PGXS)
 # Standalone unit tests for the container library (no server needed).
 UNIT_CFLAGS = -O1 -g -Wall -Wextra -Wno-unused-parameter -DFRONTEND -Isrc \
               -I$(shell $(PG_CONFIG) --includedir-server) -I$(shell $(PG_CONFIG) --includedir)
-UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --libdir) -lpgcommon -lpgport -lm
+# pkglibdir first: the Debian/Ubuntu packages put the server's own
+# libpgcommon.a and libpgport.a there, while libdir holds libpq-dev's copies,
+# which are of whatever major libpq-dev is at.  Source builds have them in
+# libdir only.
+UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libdir) -lpgcommon -lpgport -lm
 
 test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
@@ -103,3 +108,22 @@ recovery-check-rmgr:
 	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
 		--mode rmgr --conf "wal_consistency_checking = 'pg_lion'" \
 		--conf "wal_keep_size = 2GB" --conf "max_wal_size = 2GB"
+
+# The PGXN release archive: pg_lion-<version>.zip, made by git archive from
+# the committed HEAD, so it holds exactly the tracked files named here - what
+# PGXS needs, the documentation and the test suites - and nothing from the
+# working tree (.local, benchmark results, build products, .deps).  The
+# version is META.json's; the extension's own version is the control files'
+# default_version, and the two map as DESIGN.md section 23 says.
+DIST_VERSION = $(shell sed -n 's/^   "version": "\(.*\)",$$/\1/p' META.json)
+DIST_NAME = pg_lion-$(DIST_VERSION)
+DIST_FILES = META.json README.md LICENSE DESIGN.md Makefile dev.sh \
+             $(addsuffix .control,$(EXTENSION)) $(DATA) src \
+             test/sql test/expected test/isolation test/unit test/recovery test/rmgr-check.sh
+
+.PHONY: dist
+dist:
+	@test -n "$(DIST_VERSION)" || { echo "no version in META.json" >&2; exit 1; }
+	@git diff --quiet HEAD -- $(DIST_FILES) || \
+		echo "warning: uncommitted changes are not in $(DIST_NAME).zip, which is built from HEAD" >&2
+	git archive --format=zip --prefix=$(DIST_NAME)/ -o $(DIST_NAME).zip HEAD -- $(DIST_FILES)

@@ -1,0 +1,228 @@
+# Build and test pg_lion against every supported PostgreSQL major.
+#
+#   pgdg    16, 17, 18 and 19 (beta) from apt.postgresql.org: the packaged
+#           server and postgresql-server-dev-N headers a PGXN user builds
+#           against.  Packaged servers have no injection_points module, so the
+#           Makefile skips the specs that need it and says so.
+#   source  REL_19_STABLE and master built from source with --enable-cassert
+#           and --enable-injection-points, the injection_points module and the
+#           isolation tester installed, so every isolation spec runs.  The
+#           build is cached per upstream commit.
+#   dist    make dist, META.json validated against the PGXN Meta Spec, and the
+#           archive built and tested on its own, outside the checkout.
+#
+# Every server job runs the suite twice, as DESIGN.md section 25 requires:
+# installcheck in generic-WAL mode and installcheck-rmgr with the custom
+# resource manager preloaded.  Both use ./dev.sh's private cluster, pointed
+# at a socket directory and port of the job's own through LION_SOCK and
+# LION_PORT, and .local/pg is a symlink to the installation under test.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LION_SOCK: /tmp/lion-sock
+  LION_PORT: "55432"
+
+jobs:
+  pgdg:
+    name: PostgreSQL ${{ matrix.pg }} (PGDG packages)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17", "18", "19"]
+    env:
+      PG: ${{ matrix.pg }}
+      PG_CONFIG: .local/pg/bin/pg_config
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} from apt.postgresql.org
+        run: |
+          # No auto-created cluster: the tests run their own.
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          # Beta majors live in a component named after the version.
+          if [ "$PG" -ge 19 ]; then
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -c "$PG"
+          else
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          fi
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG"
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          .local/pg/bin/pg_config --version
+
+      - name: Build
+        run: make -j4
+
+      - name: Install
+        run: sudo make install PG_CONFIG="$PWD/$PG_CONFIG"
+
+      - name: Unit tests
+        run: make unit
+
+      - name: Start a private cluster
+        run: ./dev.sh reset
+
+      - name: installcheck (generic WAL)
+        run: |
+          eval "$(./dev.sh env)"
+          make installcheck
+
+      - name: installcheck-rmgr (custom resource manager preloaded)
+        run: |
+          eval "$(./dev.sh env)"
+          make installcheck-rmgr
+
+      - name: Show regression diffs
+        if: failure()
+        run: |
+          find test -name regression.diffs -exec cat {} + || true
+          tail -n 100 .local/pg.log || true
+
+  source:
+    name: PostgreSQL ${{ matrix.branch }} (source, cassert, injection points)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [REL_19_STABLE, master]
+    env:
+      PGPREFIX: /home/runner/pg-${{ matrix.branch }}
+      PG_CONFIG: .local/pg/bin/pg_config
+      # Fail rather than skip if the injection_points module is missing.
+      INJECTION_POINTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the upstream commit
+        id: upstream
+        run: |
+          sha=$(git ls-remote https://github.com/postgres/postgres.git "refs/heads/${{ matrix.branch }}" | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the PostgreSQL build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PGPREFIX }}
+          key: pg-${{ runner.os }}-${{ matrix.branch }}-${{ steps.upstream.outputs.sha }}-cassert-inj-v1
+
+      - name: Build PostgreSQL ${{ matrix.branch }}
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bison flex
+          git clone -q --depth 1 --branch "${{ matrix.branch }}" \
+            https://github.com/postgres/postgres.git "$RUNNER_TEMP/postgres"
+          cd "$RUNNER_TEMP/postgres"
+          ./configure -q --prefix="$PGPREFIX" --without-icu --without-zlib --without-readline \
+            --enable-cassert --enable-debug --enable-injection-points CFLAGS="-O1 -g"
+          make -s -j4
+          make -s install
+          make -s -C src/test/isolation install
+          make -s -C src/test/modules/injection_points install
+          make -s -C contrib install
+
+      - name: Link the installation
+        run: |
+          mkdir -p .local
+          ln -sfn "$PGPREFIX" .local/pg
+          .local/pg/bin/pg_config --version
+
+      - name: Build
+        run: make -j4
+
+      - name: Install
+        run: make install
+
+      - name: Unit tests
+        run: make unit
+
+      - name: Start a private cluster
+        run: ./dev.sh reset
+
+      - name: installcheck (generic WAL, all isolation specs)
+        run: |
+          eval "$(./dev.sh env)"
+          set -o pipefail
+          make installcheck 2>&1 | tee installcheck.log
+          if grep -q 'skipping isolation specs' installcheck.log; then
+            echo "injection-point specs were skipped"; exit 1
+          fi
+
+      - name: installcheck-rmgr with wal_consistency_checking
+        run: |
+          eval "$(./dev.sh env)"
+          make installcheck-rmgr WAL_CONSISTENCY=1
+
+      - name: Show regression diffs
+        if: failure()
+        run: |
+          find test -name regression.diffs -exec cat {} + || true
+          tail -n 100 .local/pg.log || true
+
+  dist:
+    name: PGXN archive (build and test from the zip)
+    runs-on: ubuntu-24.04
+    env:
+      PG: "18"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate META.json
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cpanminus
+          cpanm -q -n -l "$RUNNER_TEMP/perl5" PGXN::Meta::Validator
+          PERL5LIB="$RUNNER_TEMP/perl5/lib/perl5" perl "$RUNNER_TEMP/perl5/bin/validate_pgxn_meta" META.json
+
+      - name: Check that the control files and META.json agree
+        run: |
+          # PGXN version X.Y.0 is extension version X.Y (DESIGN.md section 23).
+          meta=$(sed -n 's/^   "version": "\(.*\)",$/\1/p' META.json)
+          for c in pg_lion pg_lion_citext; do
+            ctl=$(sed -n "s/^default_version = '\(.*\)'$/\1/p" $c.control)
+            test "$ctl.0" = "$meta" || { echo "$c.control default_version $ctl vs META.json $meta"; exit 1; }
+            test -f "$c--$ctl.sql"
+          done
+
+      - name: Install PostgreSQL ${{ env.PG }} from apt.postgresql.org
+        run: |
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG"
+
+      - name: make dist
+        run: |
+          make dist PG_CONFIG="/usr/lib/postgresql/$PG/bin/pg_config"
+          unzip -l pg_lion-*.zip
+          # Nothing from the working tree or the benchmark harness.
+          if unzip -Z1 pg_lion-*.zip | grep -E '(^|/)(\.local|bench|\.deps|\.github)/|\.(o|so|bc)$'; then
+            echo "unexpected files in the archive"; exit 1
+          fi
+
+      - name: Build, install and test from the extracted archive
+        run: |
+          mkdir "$RUNNER_TEMP/dist"
+          unzip -q pg_lion-*.zip -d "$RUNNER_TEMP/dist"
+          cd "$RUNNER_TEMP"/dist/pg_lion-*/
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          make -j4
+          sudo make install PG_CONFIG="$PWD/.local/pg/bin/pg_config"
+          make unit
+          ./dev.sh reset
+          eval "$(./dev.sh env)"
+          make installcheck || { find test -name regression.diffs -exec cat {} +; exit 1; }

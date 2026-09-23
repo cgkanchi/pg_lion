@@ -3317,31 +3317,56 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   citext and collations, plus the declines (arrays, partitions, collation); the §11 VACUUM
   interlock argument is unchanged, since existence is read from the same pinned containers as a
   count, but count_vacuum_race should gain a distinct-count variant that proves it.
-- **PGXN packaging (before the Citus/TimescaleDB work).** Distribution through the PostgreSQL
-  Extension Network is how the two environments below will install it, so it comes first:
-  - `META.json` (PGXN Meta Spec v1.0.0): name `pg_lion`, abstract, license `postgresql`, version
-    following semver (start at 0.1.0 and bump the control file's `default_version` in step),
-    `provides` for both `pg_lion` and `pg_lion_citext` with their control files and SQL scripts,
-    `prereqs` (PostgreSQL major range; `citext` for the companion), `resources` (repository,
-    bugtracker), tags (index, bitmap, roaring, analytics, count). Validate with `pgxn-utils`
-    (`pgxn validate-meta`) or the online validator.
-  - Release archive: `make dist` (or `git archive`) producing `pg_lion-<version>.zip` containing
-    only what PGXS needs plus README, LICENSE, DESIGN.md and the tests; no `.local`, no benchmark
-    results, no `.deps`. `pgxn install pg_lion` must work end to end on a clean machine with the
-    packaged `postgresql-server-dev-<N>` headers: no dependency on the source tree, no
-    `--enable-injection-points` (test hooks compiled out), no cassert assumptions.
-  - Version scripts: once there is a 0.2, `pg_lion--0.1.0--0.2.0.sql` upgrade paths and
-    `ALTER EXTENSION UPDATE`; format-version bumps that need REINDEX must say so in the upgrade
-    script's NOTICE and in the release notes.
-  - Build matrix against packaged PostgreSQL headers for every supported major (not only master):
-    a CI job per major running `make installcheck`. The minimum supported major is 16 (eb1579e:
-    `src/lion_compat.h`; 15 would need RelFileNode, pre-ExtendBufferedRel extension and no
-    varatt.h); state it in `META.json`.
-  - `pg_upgrade` across majors with lion indexes present must fail cleanly at the format-version
-    check or work, never crash; document REINDEX as the upgrade path for format bumps.
-  - Also cover hook coexistence in the same matrix, since PGXN users load pg_lion beside other
-    extensions: `create_upper_paths_hook` chaining in both load orders, the reserved GUC prefix,
-    and, once the custom rmgr exists, a resource-manager id that does not collide.
+- **PGXN packaging (done 2026-09-23 up to the release steps; before the Citus/TimescaleDB work).**
+  Distribution through the PostgreSQL Extension Network is how the two environments below will
+  install it, so it comes first. Done:
+  - `META.json` (PGXN Meta Spec 1.0.0; `validate_pgxn_meta` from PGXN::Meta::Validator 0.16 says
+    OK, and CI runs it): distribution `pg_lion` 0.1.0, `release_status` unstable (prototype),
+    license `postgresql`, `provides` pg_lion and pg_lion_citext, PostgreSQL >= 16.0.0 as a build
+    and runtime prerequisite (the minimum since eb1579e, `src/lion_compat.h`), `citext` runtime-
+    recommended and test-required (only the companion needs it, and its control file's
+    `requires = 'pg_lion, citext'` enforces that at CREATE EXTENSION), resources and tags.
+  - Versions: PGXN's semver `X.Y.0` is the extension version `X.Y`. The control files keep
+    `default_version = '0.1'` and `pg_lion--0.1.sql`: renaming to 0.1.0 buys nothing before a
+    first release and would break the scripts and sections that name `pg_lion--0.1.sql`
+    (bench/run_container_bits_experiment.sh, §6, §8, §17) and `ALTER EXTENSION` on existing dev
+    clusters. The next SQL change ships as `pg_lion--0.1--0.2.sql` with META.json 0.2.0; the CI
+    dist job fails if a control file's version plus `.0` differs from META.json's.
+  - `make dist`: `git archive` of the committed HEAD into `pg_lion-<version>.zip` (META.json,
+    README, LICENSE, DESIGN, Makefile, control and SQL files, `src/`, `test/{sql,expected,isolation,
+    unit,recovery}`, `test/rmgr-check.sh`, `dev.sh`; no `.local`, bench, review evidence or build
+    products). Built and tested from the extracted archive, outside the checkout, against 16, 18,
+    19beta4 and master from source and against the PGDG packages 16.15 and 19~beta3 (non-cassert,
+    unpacked from the .debs): unit, installcheck and installcheck-rmgr all green. Two Makefile
+    changes for packaged installs: `PG_CONFIG` falls back to `pg_config` on PATH when `.local/pg`
+    does not exist, and the unit tests link `pkglibdir` first, because Debian keeps the server's
+    own `libpgcommon.a` there and `libdir` holds libpq-dev's, which is of another major.
+  - CI (`.github/workflows/ci.yml`): PGDG packages for 16, 17, 18 and 19 beta (the injection-point
+    specs are skipped there, since packaged servers have no injection_points module); REL_19_STABLE
+    and master from source with cassert and injection points, cached per upstream commit, failing
+    if any spec is skipped, rmgr run with `wal_consistency_checking`; and a dist job (validate,
+    `make dist`, build and test from the zip). Each server job runs unit, installcheck and
+    installcheck-rmgr through `./dev.sh` with `LION_SOCK`/`LION_PORT`. Checked with actionlint
+    1.7.7 and shellcheck 0.10 and the steps dry-run locally; not yet run on GitHub.
+  - `pg_upgrade`: works across majors, and found a preload bug (§23 addendum below).
+  Remaining:
+  - The WAL resource manager id, before any release. `pg_lion.rmgr_id` (`lion_wal_init()`,
+    `src/lion_wal.c`) defaults to `RM_EXPERIMENTAL_ID` (128), the id core sets aside for
+    development: two extensions that both use it cannot be preloaded together. A release must
+    reserve an id on https://wiki.postgresql.org/wiki/CustomWALResourceManagers, make it the
+    default, and keep the GUC so a site can move out of a collision. Document the rule for
+    changing it: WAL written under one id replays only under that id, so change it only after a
+    clean shutdown with every standby and archive consumer caught up (pg_upgrade carries no WAL,
+    so an upgrade may change it freely).
+  - Publishing: a PGXN account and upload of the zip, `release_status` raised when the prototype
+    label goes, the first CI run on GitHub, and a README install section (`pgxn install pg_lion`).
+  - Version scripts: from 0.2, `pg_lion--0.1--0.2.sql` upgrade paths and `ALTER EXTENSION
+    UPDATE`; format-version bumps that need REINDEX must say so in the upgrade script's NOTICE and
+    in the release notes. The same script is where the seven pre-18 opclasses of the addendum
+    below can be repaired.
+  - Hook coexistence in the matrix, since PGXN users load pg_lion beside other extensions:
+    `create_upper_paths_hook` chaining in both load orders, the reserved GUC prefix, and a
+    resource-manager id that does not collide.
 - **Citus and TimescaleDB compatibility (last, before any release).** These are the environments the
   extension is most likely to run in. Verify, with a test matrix run against each:
   - Citus: distributed and reference tables with lion indexes (CREATE INDEX propagation via the
@@ -3384,6 +3409,40 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
   recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
   ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
+
+### §23 addendum: pg_upgrade with lion indexes (verified 2026-09-23)
+
+pg_upgrade restores the catalogs with `pg_dump --binary-upgrade` and copies the index files as
+they are. Nothing in the on-disk format (version 6: meta page, directory, entry and container
+pages, WAL mode recorded per index) depends on the server major, so the new server's meta-page
+check accepts them and no REINDEX is needed. Run 16 -> 19beta4 and 18 -> master (20devel), both
+clusters with `shared_preload_libraries = 'pg_lion'`, over a 200k-row table with ten lion indexes
+(int, text, citext, bool, date, bytea, int[], a multicolumn one, and one each built with
+`wal_mode = rmgr` and `generic`), after deletes, VACUUM and a dirty update:
+
+- `lion_index_verify(idx, true)` passes on every index after the upgrade, entry and TID totals
+  are unchanged, and the LionCount answers (equality, GROUP BY, multicolumn, citext, arrays) are
+  identical before and after. Inserts, deletes and VACUUM on the new server, then
+  `lion_index_verify` again, a LionCount answer checked against a sequential scan, and a new
+  index build all pass. Both WAL modes keep working: WAL does not cross pg_upgrade, so the
+  resource manager id does not matter to it.
+- Bug found and fixed: with the library preloaded, pg_upgrade failed at "Checking database user
+  is the install user" with `access method "lion" does not exist`. The planner hooks run in every
+  database, and `lion_get_am_oid()` looked the access method up with `missing_ok = false`, so any
+  aggregate with a WHERE or GROUP BY in a database without the extension (template1 here) raised
+  an ERROR. It failed cleanly, but it also broke every such database of a server that preloads
+  pg_lion for rmgr mode. The lookup now returns InvalidOid there, and no index or operator
+  matches; `test/sql/noextension.sql` covers it under installcheck-rmgr.
+- Upgrading from 16 or 17 to 18 or later keeps the seven opclasses that `pg_lion--0.1.sql`
+  creates through `lion_create_opclass_pre18()` (bool, bytea, date, timestamptz, xid, xid8, cid)
+  on their pre-18 substitute hash functions (hashchar, hashvarlena, hashint4, timestamp_hash,
+  hashint8), because the dump carries the old catalog rows. The indexes are correct: the
+  substitutes compute the same hash, which is why core accepted them before 18. But `amvalidate()`
+  reports those seven as invalid on the new server, since lionvalidate() accepts the substitutes
+  only below 18, and the function cannot be changed in place: `ALTER OPERATOR FAMILY ... DROP
+  FUNCTION 1` refuses because the opclass requires it. Fix before release: accept the substitutes
+  on every major (they are hash-identical), or rewrite the `pg_amproc` rows in the 0.2 upgrade
+  script. 18 -> master has no such difference; amvalidate is clean there.
 
 ## 24. Multicolumn indexes: independent per-column key sets in one relation (format version 6, implemented)
 

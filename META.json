@@ -1,0 +1,75 @@
+{
+   "name": "pg_lion",
+   "abstract": "Roaring-bitmap inverted index access method with count(*) and GROUP BY pushdown",
+   "description": "pg_lion adds the lion index access method: one compressed posting set of roaring-style containers per distinct key, serving bitmap scans for equality, IN lists and NULL tests, and a custom scan that answers count(*) with equality filters and GROUP BY from the posting sets plus the visibility map. pg_lion_citext adds an operator class for citext.",
+   "version": "0.1.0",
+   "maintainer": "Chinmay Kanchi <cgkanchi@gmail.com>",
+   "license": "postgresql",
+   "provides": {
+      "pg_lion": {
+         "abstract": "Roaring-bitmap inverted index access method (USING lion)",
+         "file": "pg_lion--0.1.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      },
+      "pg_lion_citext": {
+         "abstract": "lion operator class for citext (case-insensitive equality)",
+         "file": "pg_lion_citext--0.1.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "16.0.0"
+         },
+         "recommends": {
+            "citext": "0"
+         }
+      },
+      "build": {
+         "requires": {
+            "PostgreSQL": "16.0.0"
+         }
+      },
+      "test": {
+         "requires": {
+            "citext": "0"
+         }
+      }
+   },
+   "resources": {
+      "homepage": "https://github.com/cgkanchi/pg_lion",
+      "bugtracker": {
+         "web": "https://github.com/cgkanchi/pg_lion/issues"
+      },
+      "repository": {
+         "url": "git://github.com/cgkanchi/pg_lion.git",
+         "web": "https://github.com/cgkanchi/pg_lion",
+         "type": "git"
+      }
+   },
+   "generated_by": "Chinmay Kanchi",
+   "tags": [
+      "index",
+      "access method",
+      "bitmap",
+      "roaring",
+      "inverted index",
+      "analytics",
+      "count"
+   ],
+   "release_status": "unstable",
+   "no_index": {
+      "directory": [
+         "bench",
+         "scripts",
+         "test"
+      ]
+   },
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   }
+}
