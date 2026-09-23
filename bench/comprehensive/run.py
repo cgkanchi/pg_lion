@@ -25,7 +25,8 @@ def command(args, **kwargs):
 
 
 class Cluster:
-    def __init__(self, prefix, output):
+    def __init__(self, prefix, output, preload=False):
+        self.preload = preload
         self.prefix, self.output = Path(prefix).resolve(), output
         self.root = Path(tempfile.mkdtemp(prefix='lion-comparison-', dir='/tmp'))
         self.data, self.socket = self.root/'data', self.root/'socket'
@@ -44,6 +45,10 @@ class Cluster:
                         "max_parallel_workers_per_gather=0\njit=off\nautovacuum=off\n"
                         "checkpoint_timeout='1h'\nmax_wal_size='8GB'\ntrack_io_timing=on\n"
                         "fsync=on\nsynchronous_commit=on\nfull_page_writes=on\n")
+                if self.preload:
+                    # pg_lion's WAL resource manager registers only from shared_preload_libraries;
+                    # with it loaded, wal_mode=auto resolves to rmgr for every lion index built here.
+                    f.write("shared_preload_libraries='pg_lion'\n")
         command([self.prefix/'bin/pg_ctl', '-D', self.data, '-l', self.root/'server.log', '-w', 'start'])
         self.started = True
         self.connect()
@@ -124,7 +129,7 @@ class Suite:
                 raise ValueError(f'Partly measured portfolios need a separate output directory: {unfinished}')
         else:
             self.output.mkdir(parents=True, exist_ok=False)
-        self.cluster = Cluster(args.prefix, self.output)
+        self.cluster = Cluster(args.prefix, self.output, preload=args.preload)
         self.rng = random.Random(args.seed)
         mode='a' if args.resume else 'w'
         self.samples = (self.output/'samples.jsonl').open(mode, buffering=1)
@@ -438,6 +443,7 @@ def parse_args():
     p.add_argument('--keep-cluster',action='store_true')
     p.add_argument('--resume',action='store_true',help='Resume a stopped run at a completed portfolio boundary, with identical arguments')
     p.add_argument('--seed',type=int,default=20260920)
+    p.add_argument('--preload',action='store_true',help="Start the cluster with shared_preload_libraries='pg_lion' so lion indexes use the custom WAL resource manager (wal_mode=auto -> rmgr)")
     args = p.parse_args()
     if min(args.rows)<1 or args.documents<0 or args.repeats<1 or args.build_repeats<1 or args.warmups<0 or args.cold_repeats<0 or args.duration<0 or min(args.clients)<1:
         p.error('Rows, repeats, builds, and clients must be positive; optional counts must be nonnegative')
