@@ -632,6 +632,17 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   container's heap pages all-visible. The count uses the visibility map there exactly as on a
   primary, and the standby reader is paid for the way a primary reader is - replay WAITS, which
   `max_standby_streaming_delay` turns into a recovery conflict rather than a wrong answer.
+  *That sentence is only half of it* (2026-09-22 review): the TIDs a reader copied can MOVE - a
+  split to the right sibling, a root push-down to a new child (§22), an INLINE spill off the
+  directory leaf - and be removed from the page they moved to, which the reader does not pin. On
+  the primary that removal waits anyway, because VACUUM cleanup-locks every page in chain order
+  (§11), but a page VACUUM locks and leaves unchanged writes no record, so replay used to take no
+  lock on it at all. VACUUM therefore hands every such page to the next record that takes a
+  cleanup lock at redo, as a BARRIER that redo cleanup-locks first (§25, `xl_lion_visit`), and
+  the argument holds on the standby for moved TIDs as well. `test/recovery/run.sh` phase 3 parks a
+  standby reader with its page pinned and has the primary split, push down or spill that page and
+  then VACUUM: before the barrier all three answered the dead rows (50000 for 48548, 1000 for 500,
+  200 for 100); with it replay blocks on the reader's pin and every answer is right.
   The decision is per COUNT and not per index (`lion_sources_all_rmgr()`): a container of an
   intersection carries the dead TIDs of every source it came from, so ONE generic-mode source puts
   the whole count back on rechecking everything.
@@ -998,11 +1009,22 @@ but its leaves are the container pages that were the chain, they are still right
 order, and VACUUM still walks exactly that list — it only has to DESCEND to the leftmost leaf
 instead of starting at the entry's `head`, which is the tree's root.
 
-**Internal pages are not cleanup-locked, and need not be** — neither the directory's (§21) nor a
-posting tree's (§22): they hold downlinks and separator keys and no TIDs at all, so no reader can be
-holding a container copy that came from one, and there is nothing on them for the §9 interlock to
-protect. The directory leaves are exactly the pages that used to be bucket pages, and VACUUM treats
-them the same way. A leaf SPLIT obeys the same rule the chain split does - the upper half goes to a
+**Internal DIRECTORY pages are not cleanup-locked, and need not be** (§21): they hold downlinks and
+separator keys and no TIDs at all, and a directory page never changes level - a root split keeps
+the old root as the left half at its own level - so no reader can be holding a container copy that
+came from one. The directory leaves are exactly the pages that used to be bucket pages, and VACUUM
+treats them the same way. **A posting tree's descent IS cleanup-locked, root first** (§22, and a
+deviation from this section's first version, which said internal posting pages "need not be"
+either): a posting set's root is a LEAF for as long as the set fits one page, a reader that copied
+containers out of it pins it, and an insert that overflows it pushes it down - moving those very
+containers to a brand new child - under an exclusive lock the pin does not stop. A VACUUM that
+walked from the leftmost leaf would never ask for the old root at all, clean the child, and let the
+heap phase mark the rows all-visible under the reader
+(`test/isolation/count_root_pushdown_race.spec` answered 1000 for 500). So pass 2 descends from the
+root to the leftmost leaf with a cleanup lock on every page of the way (`lion_vacuum_descend()`),
+and the reader's pin on the old root stops it before it reaches the page the containers moved to.
+The root is the only page that ever changes level; the internal pages below it are locked for
+uniformity, and there is one of them per several hundred leaves. A leaf SPLIT obeys the same rule the chain split does - the upper half goes to a
 brand new page immediately to the right - so an entry can only ever move onto a leaf the walk has not
 passed, and an entry that moves off a leaf the walk has already finished has by then been fully
 processed, posting sets and all. This is the same rule nbtree's btvacuumscan follows, and it is what
@@ -1026,10 +1048,19 @@ there. The internal pages the descent reads on the way hold no TIDs.
 
 **A ROOT PUSH-DOWN is the one page transition VACUUM can meet** (§22): an insert turns a one-page
 posting set's root into an internal page and moves its containers to a brand new child. VACUUM,
-holding the cleanup lock on that page, finds it is no longer a leaf and restarts at the new leftmost
-leaf. That is safe for the reason above: the cleanup lock it holds waited for every pin on the page
-those containers came from, so no reader holds a stale copy of them, and the page they moved to did
-not exist a moment ago.
+holding the cleanup lock on that page, finds it is no longer a leaf and descends again from the
+root, cleanup-locking the way down. That is safe for the reason above: the cleanup lock it holds
+waited for every pin on the page those containers came from, so no reader holds a stale copy of
+them, and the page they moved to did not exist a moment ago. The push-down VACUUM itself causes -
+its REGROW step (§18) re-placing a filtered container that no longer fits a one-page set - keeps
+the new child EXCLUSIVE from its allocation until the filtered container is on it
+(`lion_posting_root_pushdown()` returns it locked): the push-down has just copied the UNFILTERED
+container there, and a reader that could lock the child in between would copy the dead TIDs, keep
+its pin, and have the write that follows - which takes no cleanup lock - remove them under it.
+(Found while auditing every record VACUUM writes through shared placement code;
+`test/isolation/vacuum_regrow_pushdown.spec` parks the regrow between the push-down and the write
+and sends a count's descent at the child: with the child unlocked there it answered 5,307 for
+4,341, with it held the descent waits for the child and answers 4,341.)
 
 Page recycling (§18) does not weaken either property. A recycled block is still linked immediately
 right of its split origin, so it is still visited after it. A page only ever LEAVES the leaf list as
@@ -1039,19 +1070,30 @@ containers that VACUUM has already cleaned. And a page that a split moves items 
 items cleaned already, because they come from a page this cycle visited first.
 
 The guarantee readers may rely on is therefore: **a TID is never removed from any page of an index
-before VACUUM has held a cleanup lock on every page that precedes it in chain order, and the
-removal itself happens under a cleanup lock on that page.** A reader that checks the visibility map
-before dropping the pin on the page a container came from cannot be overtaken by VACUUM (§9).
+before VACUUM has held a cleanup lock on every page that precedes it in chain order - the pages of
+each posting tree's descent included - and the removal itself happens under a cleanup lock on that
+page.** A reader that checks the visibility map before dropping the pin on the page a container
+came from cannot be overtaken by VACUUM (§9).
 
 **On a standby the same sentence holds for REPLAY of an rmgr-mode index** (§25). The startup
 process is the only writer there, it applies the primary's records in the order the primary wrote
 them - so it meets the pages in chain order for the same reason VACUUM did, and a page is still
 only ever linked in immediately right of the page whose split created it - and it takes a CLEANUP
 lock on every block a record removes TIDs or items from (VACUUM_PAGE, ITEM_DELETE, PAGE_DELETED,
-and the ENTRY record VACUUM deletes entries with). §11's WAITING RULE applies to it as well and is
-met the same way: the blocks that need a cleanup lock are the first ones a record declares, so the
-wait happens with no other buffer lock held. Replay of a GENERIC record takes an exclusive lock
-instead and offers none of this, which is why §9's last rule is per resource manager.
+the ENTRY record VACUUM deletes entries with, and every record VACUUM writes through shared
+placement code: the regrow of §18 and an INLINE spill its filtering causes). **And on every page
+VACUUM cleanup-locked without writing to it**: those write no record of their own, so VACUUM
+collects them and the next record whose replay takes a cleanup lock carries them as a barrier -
+ranges of blocks redo cleanup-locks one at a time before it touches the record's own blocks (§25,
+`xl_lion_visit`). Without it the "every page that precedes it" half of the sentence above has no
+standby counterpart, and a split, a root push-down or a spill that moved a standby reader's TIDs
+off its pinned page lets replay remove them elsewhere. Pages visited after the last removal of an
+ambulkdelete need no barrier - every dead TID of the cycle is gone by then - and are dropped.
+§11's WAITING RULE applies to the startup process as well and is met the same way: the barrier
+comes first, then the blocks that need a cleanup lock (the shim puts them FIRST in the record
+whatever order the writer registered them in), so every wait happens with no other buffer lock
+held. Replay of a GENERIC record takes an exclusive lock instead and offers none of this, which is
+why §9's last rule is per resource manager.
 
 VACUUM waiting rule (binding): VACUUM must never *wait* for a cleanup lock while holding any other
 LWLock, because holding an LWLock implies HOLD_INTERRUPTS and the wait becomes uncancellable (a
@@ -2467,18 +2509,21 @@ promise; a proc 4 an opclass names itself is still the author's responsibility, 
 detect a bad one.
 
 **Cross-type searches** (`int4col = 123::int8`) need an ordering of a STORED key against a value of
-another type, and it is resolved ONCE for both the single-value lookup and the batched one
-(`lion_probe_init()` in lion_count.c), because the two walk the same tree and a batched lookup that
-descended where the single one scans would read the directory in an order it is not in. Three
-outcomes, in this order:
+another type, and it is resolved ONCE for the single-value lookup, the batched one AND the bitmap
+scan (`lion_probe_init()` / `lion_probe_find()` in lion_count.c, declared in lion_count.h and used by
+lion_scan.c), because all three walk the same tree and a path that descended where another scans
+would read the directory in an order it is not in. The outcomes, in this order:
 
+- an UNORDERED column (rule 3 below can make one even when its family names comparisons): the hash
+  and the cross-type equality only. No comparison of any kind is used on a directory in
+  (kind, hash, bytes) order - the family's cross-type proc 4 included - and the family's
+  cross-type hash agrees with the stored keys' by the family's contract, so the descent is exact;
 - the family's cross-type proc 4 (`btint48cmp` and friends; `integer_ops` and `float_ops`, the only
   families with cross-type equality, carry them): descend as usual;
-- otherwise a BINARY or IMPLICIT coercion of the value to the key type (`find_coercion_pathway()`
-  with `COERCION_IMPLICIT`, one-argument cast functions only): the value becomes one of the index's
-  own and hash, equality and ordering are all the index's own, which is consistent by construction.
-  An assignment-only cast is not taken - `int8` → `int4` would raise a range error for a value that
-  simply is not in the index;
+- otherwise a BINARY coercion of the value to the key type (`find_coercion_pathway()` returning
+  `COERCION_PATH_RELABELTYPE`: the same bytes, varchar to text): the value becomes one of the
+  index's own and hash, equality and ordering are all the index's own, which is consistent by
+  construction;
 - otherwise the leaves are walked with the cross-type EQUALITY (`lion_dir_find_by_scan()`), which is
   correct and linear.
 
@@ -2486,6 +2531,15 @@ outcomes, in this order:
 `lion_posting_set_lookup_many()` call the descent directly: an `IN` list of `int8` values against an
 `int4` index whose family had no cross-type proc 4 descended a value-ordered tree comparing hashes
 and returned nothing at all. `test/sql/directory.sql` §12 builds such a family.)*
+
+*(Three further deviations, from the 2026-09-22 review. (1) The coercion step used to take any
+IMPLICIT cast function too. Implicit is not lossless: `text` → `name` truncates to 63 bytes, so for
+a family with `name = text` equality and no cross-type ordering a long text that is no stored name
+became one and was counted. PostgreSQL cannot say that a cast is a bijection, so only a binary
+coercion is taken; §16 of `directory.sql`. (2) The bitmap scan resolved its own comparison and used
+the family's cross-type proc 4 without asking whether the column was ordered, binary-searching a
+hash-ordered directory in value order; it now goes through the shared resolution; §15. (3) See
+Readers, below, for how a LIST of cross-type values is sorted.)*
 
 ### Operations
 
@@ -2502,9 +2556,38 @@ and returned nothing at all. `test/sql/directory.sql` §12 builds such a family.
   clears on the page it demotes - nbtree's BTP_ROOT trick. A lookup therefore costs no meta-page
   visit at all until the root really moves.
 - **Insert of a new entry**: descend with the leaf EXCLUSIVE; scan the prefix run for the key; if it
-  is absent, walk back to its exact bytewise position on that leaf and insert. (A run that spans
-  pages - which needs an opclass whose comparison ties for distinct entries, so essentially never -
-  re-descends with the exact key instead.) On no room, split.
+  is absent, walk back to its exact bytewise position on that leaf and insert. On no room, split.
+  **Find-or-create is one serialised operation**: the directory holds one entry per equality class,
+  so no second writer of the same key may run its lookup between this writer's unsuccessful lookup
+  and its insert. On one leaf that is automatic - the leaf is held from the lookup to the insert. A
+  prefix run that SPANS pages (which needs an opclass whose comparison ties for distinct entries: an
+  unordered class whose hash collides, as `test/sql/directory.sql` §11 and
+  `test/isolation/dir_insert_race.spec` build) is handled by the **guard**: the leaf the run is
+  entered from - the leaf a descent for the run's prefix lands on, which the lookup started on - is
+  NOT released when the scan steps right; the scan couples its steps (next page locked before the
+  current one is released) and, if the key is absent, gives up the leaf it ended on and hands the
+  guard back to the insert, which walks right from it under the same coupling to the key's exact
+  bytewise position, finishing any split it steps into, and inserts there. Every INSERT of a key of
+  that prefix - one that creates it or one that adds to an existing entry of the run - descends to
+  the guard first, so while it is held nobody else can look the key up, and the insert needs no
+  second existence check. (VACUUM re-finds entries with an exact key and may land further right,
+  but it only ever rewrites or deletes an entry, never creates one.) The guard is a fixed point while it is held: it cannot split (it is locked), a
+  page to its left can only split into pages whose high keys are still below the prefix, and a
+  descent always ends on the first leaf whose high key's prefix is at or above the search key's.
+  *(Deviation from the first draft, which RELEASED the leaf and re-descended with the exact key and
+  inserted without looking again: two writers of one new key could both miss and both insert, and
+  the rows under the entry no lookup returned were lost to counts and scans. verify() now reports
+  two entries of one equality class, byte-identical or not, as corruption.)*
+  **Lock order.** The guard and the page the walk is on are both leaves, taken left to right - the
+  order every directory writer already uses (`lion_dir_place_again()`, a split's old right
+  sibling) - and nothing ever waits for a leaf to its LEFT while holding one; a descent holds
+  nothing, an ascent (a split's parent insertion, a repair) holds leaves and waits only for
+  internal pages and the meta page, and nobody holding those waits for a leaf. So a writer holding
+  the guard and splitting the target page further right is nbtree's "hold the child, lock the
+  parent" with one more leaf held on the left, and it cannot close a cycle. Container pages still
+  come after directory pages, and the guard is released before any of them is touched on the
+  update path. Injection point `lion-dir-add-entry-spanning` fires with the guard held, between the
+  unsuccessful lookup and the insert.
 - **Split**: allocate the right sibling (`lion_alloc_buffer` with reuse = true is fine; directory
   pages are never posting-set roots), rebuild both halves from a private copy of the page with the new
   item inserted, cut at half the bytes - or, when the page is rightmost and the item goes at the very end,
@@ -2663,9 +2746,27 @@ dense list pays for the leaves it crosses and a sparse one for a descent each, i
 always. Duplicates are dropped twice over: bytewise between neighbours (free, and it saves the
 lookup) and then by comparing the located entries' STORED KEYS with the index's own equality, which
 is what §15's disjoint sum needs and is stronger than the `(page, offset)` identity it used to use
-(offsets move now). The walk is only available when the values can be ORDERED against the stored
-keys: a cross-type list whose resolution came out as "walk the leaves" (above) takes that fallback
-per value here too, because the two lookups share one resolution. `lion_entry_scan` and
+(offsets move now).
+
+**The walk only steps right, so the sort must BE the directory order.** Values of the index's own
+type (or binary-coerced to it) are sorted with the column's comparison, or by hash for an unordered
+column, whose directory leads with the hash. A cross-type list resolved through the family's
+cross-type proc 4 cannot be sorted by that function - it compares a stored key with a value, not
+two values - so it is sorted with the family's OWN proc 4 for (value type, value type), the
+family's statement of how it orders that type; a family without one gets no walk, and every value
+descends by itself. The value type's DEFAULT btree order is never used: it is the directory order
+only when the opclass happens to sort that way, and against a reverse comparison every value but
+the first was looked for to the right of where it lives (`directory.sql` §14). A list whose
+resolution came out as "walk the leaves" takes that fallback per value, as the single lookup does.
+*(Deviation from the first draft, which sorted every cross-type list with the value type's default
+comparison.)*
+
+**A walk that followed a prefix run across a page boundary descends again for the next value.** It
+then stands to the right of where the run begins, and the next value may be a hash collision of the
+same run stored on a page it has passed; otherwise the leaf a lookup lands on is the one its run
+begins on, so a value sorted after it is there or further right. *(Not in the first draft: a list
+over a coarse-hash unordered class lost every value stored left of where the previous one was found,
+`directory.sql` §17.)* `lion_entry_scan` and
 `lion_emit_all_keys` walk from the first leaf of THEIR key column to the first entry of the next one
 (§24), and `IS NOT NULL`, verify and stats walk the leftmost leaf and then the right links, so their
 output is in key order for an ordered opclass.
@@ -2708,7 +2809,10 @@ leaves" instead of "the entries in this bucket times the bucket count"; both are
 
 Directory pages: nbtree's rules - no coupling downwards, move right when the high key no longer
 exceeds the search key, splits hold left, then right, then the old right sibling, then the meta page,
-and an ascent holds the child while it locks the parent. Posting pages: the same rules again (§22),
+and an ascent holds the child while it locks the parent. The insert path's guard (Operations,
+above) adds only more left-to-right holding at the leaf level: the leaf a spanning prefix run is
+entered from stays locked while the writer couples rightwards through the run and places the new
+entry, splitting it if need be. Posting pages: the same rules again (§22),
 with no old-right-sibling and no meta page in the record, and with all WRITERS of one key serialised
 by the very directory leaf below. The lock order directory page → posting page is preserved, and the one place that used to break it
 - VACUUM re-finding a moved entry - is done with nothing held. VACUUM's two-pass protocol addresses
@@ -2726,7 +2830,10 @@ exactly the pages of the level below in that order (which is "every leaf reachab
 exactly once and the leaf right-link chain equals the in-order sequence"), the leftmost downlink of
 each level being minus infinity, each separator at or below its child's own first key, each child's
 high key at or below the next separator, and INCOMPLETE_SPLIT pages reported as a WARNING with the
-repair hint.
+repair hint. At the leaf level it also checks that no two entries of one prefix run - the same
+column, kind, comparison and hash, across page boundaries too - are equal under the opclass
+equality: two entries for one key would leave the rows of the one no lookup returns uncounted, and
+the ordering checks alone only catch byte-identical twins (`directory.sql` §13).
 
 ### Not done in this version
 
@@ -2806,18 +2913,26 @@ Operations.
   that window, because the child's own split has to take the root to insert ITS downlink and buffer
   locks are not reentrant, which is safe precisely because writers of one key serialise.
 - **VACUUM**: the leaves are visited in ckey order via right links exactly as before, with a cleanup
-  lock on every one of them (§11 unchanged); pass 2 starts by descending to the leftmost leaf instead
-  of starting at `head`. Internal pages hold no TIDs, so they are NOT cleanup-locked on the ordinary
-  walk and need not be (§11 says so in as many words); they are never empty while the set lives, so
-  the leak sweep leaves them alone and they need not be marked visited either. Freeing a whole set
-  frees its internal pages too, bottom up, under ConditionalLockBufferForCleanup like the leaves.
-  Internal pages are never deleted while the set lives (documented limitation), and neither are
-  empty leaves - both wait for the whole set to go, as §18 already said of mid-chain pages.
-  One case is new: a root that is pushed down while VACUUM is walking it. VACUUM finds a page that
-  is no longer a leaf, and restarts at the new leftmost leaf. That is safe for the reason §11's
-  split hole is safe - the cleanup lock it holds on the old root waited for every pin on the page
-  those containers came from, so no reader can hold a stale copy of them, and the page they moved to
-  did not exist a moment ago.
+  lock on every one of them (§11); pass 2 starts by DESCENDING from `head` to the leftmost leaf,
+  and the descent takes a cleanup lock on every page it passes, the root first
+  (`lion_vacuum_descend()`). *(Deviation from this section's first version, which walked straight
+  to the leftmost leaf and said internal pages "are NOT cleanup-locked on the ordinary walk and need
+  not be". They hold no TIDs, but the root of a one-page set is a LEAF a reader may have copied
+  containers from, and the push-down below turns it into an internal page with those containers on
+  a child VACUUM would then clean without ever asking for the reader's pin - §11 and
+  `test/isolation/count_root_pushdown_race.spec`.)* Internal pages are never empty while the set
+  lives, so the leak sweep leaves them alone. Freeing a whole set frees its internal pages too,
+  bottom up, under ConditionalLockBufferForCleanup like the leaves. Internal pages are never
+  deleted while the set lives (documented limitation), and neither are empty leaves - both wait for
+  the whole set to go, as §18 already said of mid-chain pages.
+  A root that is pushed down while VACUUM is walking it: VACUUM finds a page that is no longer a
+  leaf, and descends again. That is safe for the reason §11's split hole is safe - the cleanup lock
+  it holds on the old root waited for every pin on the page those containers came from, so no
+  reader can hold a stale copy of them, and the page they moved to did not exist a moment ago.
+  **An internal page's own split changes nothing here**: it moves pivots, not TIDs, to a brand new
+  page at the same level, and a page's level never changes except the root's; the leftmost downlink
+  of every level stays where the descent looks for it. An INTERNAL root's push-down likewise moves
+  only pivots.
 - **Cursors** (`LionSetCursor`) gain `seek(ckey)`: from the current leaf, step right while the leaf's
   maxckey is below the target and the walk is short (`LION_POSTING_SEEK_STEPS` = 2 pages, about
   where a descent's `height` reads and binary searches become cheaper), otherwise descend from the
@@ -3028,7 +3143,9 @@ root push-down and the bulk build's second internal level, all three.
   the page header - only the internal posting page's item layout.
 - **The §11 proof text now says explicitly which pages are cleanup-locked and why** ("every page
   that can hold a TID"), so §22's internal posting pages fall under the same sentence: they hold no
-  TIDs, and cleanup-locking them is optional rather than load-bearing.
+  TIDs, and cleanup-locking them is optional rather than load-bearing. *(Wrong for the ROOT, which
+  is a page that can hold TIDs until it is pushed down; see the VACUUM bullet above and §11. Kept as
+  written because this list is the record of what §21 handed over.)*
 
 Order of work. §21 first (it changes where entries live; the posting tree hangs off the entry and
 is independent of the directory shape), §22 second. Multicolumn indexes
@@ -3405,9 +3522,11 @@ section's first draft, which gave each record type a payload struct of its own:
 twelve bespoke redo handlers would have been twelve places for a replay bug,
 where an operation stream is one, and `wal_consistency_checking` checks the one.
 
-The main data is a two-byte header, `{initmask, cleanupmask}`, one bit per
-block. It travels in the record's own data rather than a block's so that redo
-can read it even when every block carries a full-page image.
+The main data is a four-byte header, `{initmask, cleanupmask, nvisit}`: one bit
+per block for the first two, and the number of barrier ranges that follow the
+header (below, VACUUM_VISIT). It travels in the record's own data rather than a
+block's so that redo can read it even when every block carries a full-page
+image.
 
     record          info  buffers  payload
     ITEM_SET        0x00  1-2      CONTAINER_ADD or SPARSE_INS on the container
@@ -3451,6 +3570,13 @@ can read it even when every block carries a full-page image.
     ENTRY           0xB0  1        ADD, REPLACE or MULTIDEL of entry tuples on a
                                    directory leaf.  CLEANUP LOCK when VACUUM
                                    deletes entries.
+    VACUUM_VISIT    0xC0  0        The standby barrier on its own: the header,
+                                   the relation's RelFileLocator and `nvisit`
+                                   block ranges, no registered block.  Written
+                                   only when VACUUM has collected
+                                   `pg_lion.vacuum_barrier_ranges` (1024)
+                                   ranges with no removal record to carry
+                                   them.
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
 ADDMANY, REPLACE, DELTA, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS,
@@ -3516,12 +3642,62 @@ redo. It travels that way rather than through five function signatures because
 five signatures would have to carry a fact that only one caller in the tree
 knows.
 
-Redo. `lion_redo()` reads the header, then takes each registered block in the
-order the writer registered it, with RBM_ZERO_AND_LOCK for a block in
-`initmask` and `get_cleanup_lock = true` for a block in `cleanupmask`, and
-applies that block's operation stream when the action is BLK_NEEDS_REDO. Blocks
-that need a cleanup lock are always registered FIRST, so the wait happens with
-no other buffer lock held - §11's waiting rule, applied to the startup process.
+**The same holds for an INLINE spill that VACUUM's filtering causes, and there
+the page TIDs leave is NOT the first block** (2026-09-22 review). A filtered
+payload can outgrow its entry (a RUN that loses every other member becomes an
+ARRAY), and pass 1 then spills it through `lion_entry_spill()` - the INSERT
+path's code, which registers the posting set's new root first and the
+directory leaf last, with no cleanup mark. When every changed entry of the leaf
+spilled, the cleanup-marked VACUUM_PAGE record pass 1 had opened was abandoned
+and the spill's records were the only ones that said the entry's dead TIDs had
+left the leaf - so replay took no cleanup lock on it, and a standby reader
+pinning that leaf for its INLINE copy was overtaken (`test/recovery/run.sh`
+phase 3, "spill": 200 for 100). `lion_wal_removal_begin(Buffer also)` therefore
+names the buffer as well: inside the window, every record marks its first block
+AND any block that is `also`, and pass 1 wraps each spill in a window naming
+the leaf. `lion_wal_finish()` then puts the cleanup blocks FIRST in the record
+(existing pages before pages the record initialises), whatever order the writer
+registered them in - the block ids are assigned only at XLogRegisterBuffer(),
+so this is a permutation of the shim's state - which keeps §11's waiting rule
+for the startup process without asking the shared placement code to know about
+VACUUM. Every record VACUUM writes is now one of: VACUUM_PAGE/ITEM_DELETE/
+PAGE_DELETED/ENTRY with its cleanup mark set by VACUUM itself, or a record of
+the shared placement code written inside a removal window (regrow, spill); the
+re-descent that finds a moved entry writes nothing.
+
+**The standby BARRIER, and why the cleanup mask alone is not enough**
+(2026-09-22 review). ambulkdelete cleanup-locks every page that can hold a TID
+in chain order, and every page of each posting tree's descent (§11), whether or
+not it removes anything there; that is what stops it from overtaking a reader
+whose TIDs a split, a root push-down or a spill has since moved off the page it
+pins. A page it locks and leaves unchanged writes NO record, so replay never
+waited for a standby reader's pin on it, and the removal replay did wait on was
+on the page the TIDs had moved TO. Phase 3 of `test/recovery/run.sh` got 50000
+for 48548 (split) and 1000 for 500 (push-down) from exactly that. So VACUUM
+hands every page it cleanup-locks without writing to it to
+`lion_wal_visit()`, which keeps a list of block RANGES (consecutive blocks
+merge), and `lion_wal_finish()` attaches the list to the next record whose
+`cleanupmask` is not empty: `nvisit` `{uint32 start, uint32 count}` pairs right
+after the header. Redo cleanup-locks every block of the list, one at a time and
+releasing each, with nothing else held, before it takes the record's own
+blocks - only while `InHotStandby`, since there is no reader to wait for in
+crash recovery. This is nbtree's old XLOG_BTREE_VACUUM `lastBlockVacuumed`
+in its economical form: no record of its own in the common case, eight bytes a
+range, and the record type VACUUM_VISIT only for a list that grows past the
+limit with nothing to ride on. Replay meets the barrier for a page before the
+removal that could hurt a reader pinning it, because VACUUM visits the page
+before it removes anything from a page right of it and the record is written
+after the visit; pages visited after the last removal of an ambulkdelete are
+dropped (every dead TID of the cycle has been removed by then, and a TID that
+moved off a page later in the walk moved onto a page later still).
+
+Redo. `lion_redo()` reads the header, applies the barrier if there is one, then
+takes each registered block in the order the record lists it, with
+RBM_ZERO_AND_LOCK for a block in `initmask` and `get_cleanup_lock = true` for a
+block in `cleanupmask`, and applies that block's operation stream when the
+action is BLK_NEEDS_REDO. Blocks that need a cleanup lock are always FIRST (the
+shim reorders them, above), so the wait happens with no other buffer lock held
+- §11's waiting rule, applied to the startup process.
 The reverse order (container page, then directory leaf) is safe against standby
 READERS because no reader ever holds two of these locks at once: a scan walks
 the leaves one shared lock at a time, a descent releases the parent before
@@ -3567,7 +3743,16 @@ container from, replay cannot have removed a TID from that page, so it cannot
 have replayed the heap record that set any of that container's heap pages
 all-visible. §11's split hole closes the same way - a page is only ever linked
 in immediately right of the page whose split created it, and replay applies
-those records in the order the primary wrote them.
+those records in the order the primary wrote them - **but only with the
+barrier above**. *(Deviation, found by the 2026-09-22 review: this paragraph
+first claimed the split hole closed by itself. It does not: the primary's
+VACUUM passes the page the reader pins without writing to it, and replay used
+to take no lock on it. Until the barrier existed an rmgr-mode standby could
+count a dead row from a copy whose TIDs had moved; the shipped rule stays
+"trust the map in rmgr mode" because phase 3 below now proves the barrier
+under `wal_consistency_checking`. WAL written by a binary without the barrier
+carries none, and a standby replaying such WAL keeps the old exposure until it
+has replayed past the upgrade.)*
 
 The reader pays for it the way a primary reader does: replay WAITS, which is a
 recovery conflict resolved by `max_standby_streaming_delay` rather than a wrong
@@ -3576,7 +3761,19 @@ generic-mode standby must report `blocks_skipped = 0` and recheck every TID, an
 rmgr-mode one must report `blocks_skipped > 0`, and the REPEATABLE READ standby
 session whose rows the primary deletes and vacuums must be either preserved
 (`hot_standby_feedback = on`) or cancelled by a recovery conflict, never
-silently answered with a different number.
+silently answered with a different number. **Phase 3** attacks the pin itself:
+a standby reader parks at `lion-count-containers-pinned` (containers copied,
+page pinned, map not consulted), the primary moves the copied TIDs off that
+page - a leaf split, a root push-down, a VACUUM-made INLINE spill - and
+VACUUMs, and the standby has `max_standby_streaming_delay = -1`. In rmgr mode
+replay must be seen BLOCKED on the reader's pin (the startup process waiting
+for a cleanup lock) and the reader, released then, must answer the count its
+snapshot sees; in generic mode replay catches up and the reader must still be
+right, because it rechecked every TID. The split case runs with
+`pg_lion.vacuum_barrier_ranges = 1`, so its barrier travels in stand-alone
+VACUUM_VISIT records; the push-down and spill cases carry it on removal
+records. All three answered wrong before the barrier and the removal window of
+the spill (50000/48548, 1000/500, 200/100).
 
 ### Registration and migration (implemented)
 
@@ -3636,7 +3833,9 @@ REINDEX alternative. REINDEX is what changes an index's mode.
   actually lands: `wal_consistency_checking` only compares during REPLAY, so
   turning it on for a primary that never replays proves nothing. The harness's
   standby replays everything phases 1 and 2 write, and every crash of phase 1
-  replays its own range; a mismatch is a FATAL in the startup process.
+  replays its own range; a mismatch is a FATAL in the startup process. Phase 3
+  (the pinned standby reader, above) makes a standby of its own and replays
+  VACUUM_VISIT and barrier-carrying records under the same check.
 
 ### Measured (2026-09-22, release build, alternating arms, one binary and one cluster)
 
@@ -3870,3 +4069,29 @@ Also in this wave (§23 items that need the same lock-window work):
   cap either way, and re-check every pin in `test/sql/pushdown.sql` (§10's
   20000-group refusal and §20's 200x20 refusal are the ones to watch), because
   it moves every AND estimate.
+
+### Measured: what the standby barrier costs (2026-09-22)
+
+`bench/vacuum_micro.sh --only portfolio` (1M rows, eight indexes, `DELETE ...
+id % 100 = 1`, one VACUUM) on a private cluster of the assert build, alternating
+arms of the binary before the barrier (HEAD 453fa32) and after, same data
+directory, same settings:
+
+                           VACUUM ms        index WAL        index records
+    rmgr     before         686, 678        51 MB (50 FPI)       10,245
+    rmgr     after          688, 649        51 MB (50 FPI)       10,245
+    generic  before         780             59 MB (50 FPI)       10,245
+    generic  after          775             59 MB (50 FPI)       10,245
+
+No record is added: at a 1% delete nearly every page VACUUM visits is one it
+changes, and the 1,420 visited-but-unchanged blocks ride on 1,255 of the
+existing removal records as 10,128 bytes of ranges - 0.02% of the index WAL -
+with no stand-alone VACUUM_VISIT record at all. A sparse VACUUM is the
+unfavourable case: `DELETE ... id % 10000 = 8` (100 rows) then `VACUUM
+(INDEX_CLEANUP ON)` wrote 1,046 VACUUM_PAGE records, 749 of which carried a
+barrier of 7,488 blocks in 11,960 bytes, 0.15% of its 7.8 MB of index WAL, and
+still no stand-alone record. The generic arm writes no barrier (a generic-mode
+standby rechecks every TID, §9) and pays only for the cleanup locks of the
+posting-tree descents, which are not measurable here. Replay pays one buffer
+lookup and one uncontended cleanup lock per barrier block, and only in hot
+standby.

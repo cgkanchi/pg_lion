@@ -385,11 +385,22 @@ lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
  * entrybuf/entry are only needed when the root is a LEAF, because then the
  * set's last leaf changes and `tail` travels in the same record; an internal
  * root's push-down touches no entry field at all and passes InvalidBuffer.
+ *
+ * The child is returned still EXCLUSIVE-locked.  Both callers go on to write
+ * to it with the root unlocked, and the one that matters is VACUUM's regrow
+ * (DESIGN.md §18): there the root was a leaf VACUUM holds a CLEANUP lock on,
+ * the container being re-placed is the FILTERED one, and the copy the push-down
+ * just moved onto the child still holds the dead TIDs.  Were the child
+ * unlocked in between, a reader could descend to it, copy that stale
+ * container and keep its pin, and the write that follows - under an ordinary
+ * exclusive lock - would remove the dead TIDs from under it, breaking the §11
+ * interlock on the primary.  A page nobody else has ever been able to lock
+ * cannot be pinned-and-copied by anyone.
  */
-static void
+static Buffer
 lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 					  Buffer entrybuf, OffsetNumber entryoff,
-					  LionEntryTuple *entry, BlockNumber *childp)
+					  LionEntryTuple *entry)
 {
 	Page		page = BufferGetPage(buf);
 	BlockNumber head = BufferGetBlockNumber(buf);
@@ -490,22 +501,21 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	}
 
 	lion_wal_finish(xstate, LION_XLOG_SPLIT);
-	UnlockReleaseBuffer(cbuf);
 	pfree(copy);
 
-	*childp = cblk;
+	return cbuf;
 }
 
-void
+Buffer
 lion_posting_root_pushdown(Relation index, Relation heaprel, Buffer buf,
 						   Buffer entrybuf, OffsetNumber entryoff,
-						   LionEntryTuple *entry, BlockNumber *childp)
+						   LionEntryTuple *entry)
 {
 	Assert(LionPageIsPostingLeaf(BufferGetPage(buf)));
 	Assert(BufferGetBlockNumber(buf) == entry->head);
 
-	lion_posting_pushdown(index, heaprel, buf, entrybuf, entryoff, entry,
-						  childp);
+	return lion_posting_pushdown(index, heaprel, buf, entrybuf, entryoff,
+								 entry);
 }
 
 /* ---------------------------------------------------------------------
@@ -711,15 +721,12 @@ lion_posting_place_pivot(Relation index, Relation heaprel, uint32 hash,
 		 * letting go of the root for that window changes nothing a reader can
 		 * see beyond the push-down itself, which is already on disk.
 		 */
-		BlockNumber cblk;
 		Buffer		cbuf;
 
-		lion_posting_pushdown(index, heaprel, buf, InvalidBuffer,
-							  InvalidOffsetNumber, NULL, &cblk);
+		cbuf = lion_posting_pushdown(index, heaprel, buf, InvalidBuffer,
+									 InvalidOffsetNumber, NULL);
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		cbuf = lion_posting_getbuf(index, cblk, head, BUFFER_LOCK_EXCLUSIVE,
-								   true);
 		lion_posting_place_pivot(index, heaprel, hash, head, cbuf, off, pivot);
 		UnlockReleaseBuffer(cbuf);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);

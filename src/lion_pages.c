@@ -1996,22 +1996,31 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		 * is already on disk, and descends.  The caller gets its buffer back
 		 * locked as it handed it over - with an EXCLUSIVE lock, which is what
 		 * a cleanup lock decays to here: the page it holds is the new ROOT,
-		 * an internal page that holds no TIDs at all, and the TIDs this call
-		 * writes go to a page nobody can have pinned because it did not exist
-		 * a moment ago (DESIGN.md §11).
+		 * an internal page that holds no TIDs at all.
+		 *
+		 * The CHILD, on the other hand, comes back from the push-down still
+		 * locked, and stays locked until the items are placed: when this is
+		 * VACUUM re-placing a container it filtered (lion_vacuum_regrow()),
+		 * the push-down has just copied the UNFILTERED container onto the
+		 * child, and a reader that could lock the child in between would copy
+		 * the dead TIDs, keep its pin, and have them removed under it by the
+		 * write below, which takes no cleanup lock (DESIGN.md §11).  Nobody
+		 * but this backend has ever locked the child, so nobody holds a copy
+		 * of what is on it.
 		 */
-		BlockNumber cblk;
 		Buffer		cbuf;
 
-		lion_posting_root_pushdown(index, heaprel, buf, entrybuf, entryoff,
-								   entry, &cblk);
+		cbuf = lion_posting_root_pushdown(index, heaprel, buf, entrybuf,
+										  entryoff, entry);
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		cbuf = ReadBuffer(index, cblk);
-		LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
-		if (!lion_page_owns_entry(BufferGetPage(cbuf), entry->hash, entry->head))
-			elog(ERROR, "lion index: block %u is not a page of the posting set at %u",
-				 cblk, entry->head);
+
+		/*
+		 * Test hook: the push-down is on disk and the root is unlocked; the
+		 * child is not (see above).  test/isolation/vacuum_regrow_pushdown.spec
+		 * parks VACUUM's regrow here and sends a count's descent at the child.
+		 */
+		INJECTION_POINT("lion-posting-pushdown-child", NULL);
 
 		lion_chain_put_items_locked_ext(index, heaprel, cbuf, entrybuf,
 										entryoff, entry, off, replace, items,

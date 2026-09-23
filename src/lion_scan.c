@@ -49,18 +49,17 @@
 #include "lion_count.h"
 
 /*
- * Per key column: the cross-type support functions resolved for the last scan
- * key seen on that column.  They are cached per column because a multicolumn
- * scan has one scan key per column and they would otherwise evict each other
- * on every rescan (DESIGN.md §24).
+ * Per key column: the probe resolved for the last scan key type seen on that
+ * column - lion_probe_init(), the same resolution the count path makes
+ * (DESIGN.md §21), so the two can never descend differently for one value.
+ * Cached per column because a multicolumn scan has one scan key per column
+ * and they would otherwise evict each other on every rescan (DESIGN.md §24).
  */
 typedef struct LionScanCol
 {
 	Oid			subtype;		/* type of the scan key argument */
-	FmgrInfo	subhashproc;	/* hash function for that type */
-	FmgrInfo	subcmpproc;		/* ordering of a stored key against it (§21) */
-	bool		subcmpvalid;
-	bool		subhashvalid;
+	bool		probevalid;
+	LionProbe	probe;
 } LionScanCol;
 
 typedef struct LionScanOpaqueData
@@ -362,77 +361,6 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 }
 
 /*
- * Hash a search value.  Cross-type equality (int4 column = int8 constant)
- * needs the hash function of the value's own type, exactly as the hash AM
- * does in _hash_datum2hashkey_type().  subtype is the scan key's sk_subtype,
- * which for an array key is the type of its elements.
- */
-static uint32
-lion_scankey_hash(IndexScanDesc scan, LionScanOpaque so, LionState *col,
-				 Oid subtype, Oid collation, Datum value)
-{
-	Relation	index = scan->indexRelation;
-	int			ci = col->attno - 1;
-	LionScanCol *sc = &so->cols[ci];
-
-	if (!OidIsValid(subtype) || subtype == index->rd_opcintype[ci])
-		return lion_hash_key(col, value);
-
-	if (!sc->subhashvalid || sc->subtype != subtype)
-	{
-		Oid			hashproc;
-
-		hashproc = get_opfamily_proc(index->rd_opfamily[ci],
-									 subtype, subtype, 1);
-		if (!OidIsValid(hashproc))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_FUNCTION),
-					 errmsg("missing support function 1 for type %s in operator family \"%s\"",
-							format_type_be(subtype),
-							get_opfamily_name(index->rd_opfamily[ci], false))));
-		fmgr_info(hashproc, &sc->subhashproc);
-		sc->subtype = subtype;
-		sc->subhashvalid = true;
-		sc->subcmpvalid = false;
-	}
-
-	return DatumGetUInt32(FunctionCall1Coll(&sc->subhashproc, collation,
-											value));
-}
-
-/*
- * The ordering of a STORED key against a search value of subtype: support
- * proc 4 of the opfamily for (opcintype, subtype), DESIGN.md §21.  NULL means
- * the family has none, and lion_dir_find() then falls back to walking the
- * leaves.
- */
-static FmgrInfo *
-lion_scankey_cmp(IndexScanDesc scan, LionScanOpaque so, LionState *col,
-				Oid subtype)
-{
-	Relation	index = scan->indexRelation;
-	int			ci = col->attno - 1;
-	LionScanCol *sc = &so->cols[ci];
-
-	if (!OidIsValid(subtype) || subtype == index->rd_opcintype[ci])
-		return col->ordered ? &col->cmpproc : NULL;
-
-	if (!sc->subcmpvalid)
-	{
-		Oid			cmpproc = get_opfamily_proc(index->rd_opfamily[ci],
-												index->rd_opcintype[ci],
-												subtype, LION_CMP_PROC);
-
-		if (!OidIsValid(cmpproc))
-			return NULL;
-		fmgr_info(cmpproc, &sc->subcmpproc);
-		sc->subcmpvalid = true;
-	}
-
-	return &sc->subcmpproc;
-}
-
-/*
  * Emit the posting set of one search value on one key column.
  */
 static int64
@@ -440,17 +368,23 @@ lion_emit_value(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 			   ScanKey skey, Datum value, TIDBitmap *tbm)
 {
 	Relation	index = scan->indexRelation;
-	uint32		hash;
+	LionScanCol *sc = &so->cols[col->attno - 1];
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 
-	hash = lion_scankey_hash(scan, so, col, skey->sk_subtype,
-							skey->sk_collation, value);
+	if (!sc->probevalid || sc->subtype != skey->sk_subtype)
+	{
+		/* the probe's FmgrInfos live as long as the scan */
+		MemoryContext oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(so));
 
-	if (!lion_find_entry_ext(index, col, BUFFER_LOCK_SHARE, value, hash,
-							&skey->sk_func,
-							lion_scankey_cmp(scan, so, col, skey->sk_subtype),
-							skey->sk_collation, &entrybuf, &entryoff))
+		lion_probe_init(index, col, skey->sk_subtype, &sc->probe);
+		MemoryContextSwitchTo(oldcxt);
+		sc->subtype = skey->sk_subtype;
+		sc->probevalid = true;
+	}
+
+	if (!lion_probe_find(index, col, &sc->probe, value, BUFFER_LOCK_SHARE,
+						 &entrybuf, &entryoff))
 	{
 		if (BufferIsValid(entrybuf))
 			UnlockReleaseBuffer(entrybuf);

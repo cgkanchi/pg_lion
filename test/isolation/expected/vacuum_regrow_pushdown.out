@@ -1,0 +1,91 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s4_prep s2_delete s4_before s1_count s3_vacuum s2_wake_both s2_wake_pinned s4_after s4_count s4_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s4_prep: VACUUM (FREEZE) rgp;
+step s2_delete: DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3);
+step s4_before: 
+	SELECT container_pages, posting_internal_pages FROM lion_index_stats('rgp_k');
+
+container_pages|posting_internal_pages
+---------------+----------------------
+              3|                     1
+(1 row)
+
+step s1_count: SELECT lion_index_count('rgp_k', 1); <waiting ...>
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) rgp; <waiting ...>
+step s2_wake_both: 
+	SELECT rgp_release('lion-count-chain-entered');
+	SELECT rgp_reader_waits('lion-count-containers-pinned', true)
+		AS reader_waits_on;
+	SELECT rgp_release('lion-posting-pushdown-child');
+
+rgp_release
+-----------
+           
+(1 row)
+
+reader_waits_on
+---------------
+a page lock    
+(1 row)
+
+rgp_release
+-----------
+           
+(1 row)
+
+step s3_vacuum: <... completed>
+step s2_wake_pinned: 
+	SELECT rgp_reader_waits('lion-count-containers-pinned', false)
+		AS reader_waits_on;
+	SELECT rgp_release('lion-count-containers-pinned');
+
+reader_waits_on             
+----------------------------
+lion-count-containers-pinned
+(1 row)
+
+rgp_release
+-----------
+           
+(1 row)
+
+step s1_count: <... completed>
+lion_index_count
+----------------
+            4341
+(1 row)
+
+step s4_after: 
+	SELECT container_pages, posting_internal_pages FROM lion_index_stats('rgp_k');
+
+container_pages|posting_internal_pages
+---------------+----------------------
+              4|                     2
+(1 row)
+
+step s4_count: 
+	SET enable_bitmapscan = off; SET enable_indexscan = off;
+	SELECT count(*) FROM rgp WHERE k = 1;
+
+count
+-----
+ 4341
+(1 row)
+
+step s4_verify: SELECT lion_index_verify('rgp_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

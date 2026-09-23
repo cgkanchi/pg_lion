@@ -869,8 +869,11 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
  * Locate the entry for sk.  On true *buf is a leaf locked in lockmode and
  * *offnum its offset.  On false *buf is still a locked leaf and *offnum is
  * the offset the entry would be inserted at, EXCEPT when *movedright says the
- * scan had to follow a right link, in which case the caller must ask for the
- * position again with an exact search key.  movedright may be NULL.
+ * scan had to follow a right link.  With forwrite that leaf is then the one
+ * the prefix run is entered from, held since the lookup so that no other
+ * writer can create the key meanwhile, and *offnum is invalid:
+ * lion_dir_add_entry() walks right from it to the exact position (DESIGN.md
+ * §21).  movedright may be NULL.
  */
 extern bool lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 						 const LionSearchKey *sk, int lockmode, bool forwrite,
@@ -885,8 +888,9 @@ extern bool lion_dir_scan_run(Relation index, const LionSearchKey *sk,
 							 bool *movedright);
 
 /*
- * Insert a brand new entry where lion_dir_find() said it belongs.  *bufp is
- * held EXCLUSIVE and stays so, but may be replaced by another leaf.
+ * Insert a brand new entry where lion_dir_find() with forwrite said it
+ * belongs.  *bufp is held EXCLUSIVE and stays so; it is the caller's to
+ * release.
  */
 extern void lion_dir_add_entry(Relation index, Relation heaprel,
 							  LionIndexState *ix, Buffer *bufp,
@@ -998,19 +1002,21 @@ extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,
  * Turn the one-page posting set whose root is `buf` into a two-level tree
  * WITHOUT moving the root: its items go to a brand new child, and the root
  * block - which is the entry's `head` and the owner stamp of every page of
- * the set - becomes an internal page with one downlink.  *childp receives the
- * child's block, and the entry's `tail` is updated in the same record.
+ * the set - becomes an internal page with one downlink.  The child comes back
+ * pinned and still EXCLUSIVE-locked - it has never been unlocked since it was
+ * allocated, so no reader can have copied the items it now holds before the
+ * caller has finished with them (DESIGN.md §11, §22) - and the entry's `tail`
+ * is updated in the same record.
  *
  * nbtree and GIN both keep the root in place on a root split, and §22 needs
  * it for a second reason: `head` is the set's identity, so an entry never has
  * to be rewritten for a root split and the four-buffer budget of a
  * GenericXLog record is never the binding constraint.
  */
-extern void lion_posting_root_pushdown(Relation index, Relation heaprel,
-									   Buffer buf, Buffer entrybuf,
-									   OffsetNumber entryoff,
-									   LionEntryTuple *entry,
-									   BlockNumber *childp);
+extern Buffer lion_posting_root_pushdown(Relation index, Relation heaprel,
+										 Buffer buf, Buffer entrybuf,
+										 OffsetNumber entryoff,
+										 LionEntryTuple *entry);
 
 /*
  * Finish the split of the posting page pbuf, which the caller holds EXCLUSIVE

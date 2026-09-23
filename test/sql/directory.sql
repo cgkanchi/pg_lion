@@ -412,19 +412,7 @@ SELECT count(*) AS keys_not_found FROM generate_series(0, 499) g
 DROP TABLE lion_odd;
 DROP OPERATOR CLASS lion_odd_ops USING lion;
 DROP FUNCTION lion_odd_cmp(int4, int4);
-DROP OPERATOR CLASS lion_rev_ops USING lion;
-DROP OPERATOR CLASS lion_rev_btree USING btree;
-DROP OPERATOR <# (int4, int4);
-DROP OPERATOR <=# (int4, int4);
-DROP OPERATOR =# (int4, int4);
-DROP OPERATOR >=# (int4, int4);
-DROP OPERATOR ># (int4, int4);
-DROP FUNCTION lion_rev_cmp(int4, int4);
-DROP FUNCTION lion_rev_lt(int4, int4);
-DROP FUNCTION lion_rev_le(int4, int4);
-DROP FUNCTION lion_rev_eq(int4, int4);
-DROP FUNCTION lion_rev_ge(int4, int4);
-DROP FUNCTION lion_rev_gt(int4, int4);
+-- (lion_rev_btree and its comparison are used again by §14.)
 
 -- ---------------------------------------------------------------------
 -- 11. Hash collisions under an UNORDERED opclass.
@@ -559,5 +547,353 @@ SELECT count(*) FROM lion_noxcmp
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE lion_noxcmp;
 DROP OPERATOR FAMILY lion_noxcmp_ops USING lion CASCADE;
+
+-- ---------------------------------------------------------------------
+-- 13. verify() treats two entries of ONE equality class as corruption.
+--
+-- The directory holds exactly one entry per equality class, and a lookup
+-- returns the first entry of the class it meets - so a second one holds rows
+-- that no lookup ever finds.  Two concurrent writers creating the same key
+-- used to be able to make one (test/isolation/dir_insert_race.spec); verify()
+-- must say so whenever it happens.  The class here has an equality that a
+-- setting switches, which is how the test manufactures the two shapes a
+-- duplicate can take: byte-identical twins, and two different spellings of
+-- one class (the citext shape), which the per-page ordering check alone
+-- cannot see.
+-- ---------------------------------------------------------------------
+
+CREATE FUNCTION lion_dup_eq(text, text) RETURNS boolean
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+	SELECT CASE current_setting('lion_test.eq_mode', true)
+		WHEN 'never' THEN false
+		WHEN 'fold' THEN lower($1) = lower($2)
+		ELSE $1 = $2 END $$;
+CREATE FUNCTION lion_dup_hash(text) RETURNS integer
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT hashtext(lower($1)) $$;
+CREATE OPERATOR ##= (LEFTARG = text, RIGHTARG = text,
+					 FUNCTION = lion_dup_eq, COMMUTATOR = ##=);
+CREATE OPERATOR CLASS lion_dup_ops FOR TYPE text USING lion AS
+	OPERATOR 1 ##= (text, text),
+	FUNCTION 1 lion_dup_hash(text);
+
+-- 'A' and 'a' are two keys while the equality is exact ...
+CREATE TABLE lion_dup (v text NOT NULL);
+INSERT INTO lion_dup SELECT 'A' FROM generate_series(1, 10);
+INSERT INTO lion_dup SELECT 'a' FROM generate_series(1, 10);
+INSERT INTO lion_dup SELECT 'k' || i FROM generate_series(1, 500) i;
+CREATE INDEX lion_dup_v ON lion_dup USING lion (v lion_dup_ops);
+SELECT ordered, entries FROM lion_index_stats('lion_dup_v');
+SELECT lion_index_verify('lion_dup_v');
+-- ... and one class, held in two entries, once it folds case
+SET lion_test.eq_mode = 'fold';
+SELECT lion_index_verify('lion_dup_v');
+RESET lion_test.eq_mode;
+-- an equality that never matches makes every insert a new entry: byte-identical twins
+SET lion_test.eq_mode = 'never';
+INSERT INTO lion_dup VALUES ('k7');
+RESET lion_test.eq_mode;
+SELECT entries FROM lion_index_stats('lion_dup_v');
+SELECT lion_index_verify('lion_dup_v');
+DROP TABLE lion_dup;
+DROP OPERATOR CLASS lion_dup_ops USING lion;
+DROP OPERATOR ##= (text, text);
+DROP FUNCTION lion_dup_eq(text, text);
+DROP FUNCTION lion_dup_hash(text);
+
+-- ---------------------------------------------------------------------
+-- 14. A cross-type IN list on a directory that is NOT in the value type's
+-- order.
+--
+-- A batched lookup sorts its values into the directory order and then walks
+-- the leaves left to right, only ever stepping right.  The values are of
+-- another type, so the directory's own comparison cannot sort them; sorting
+-- them with the VALUE type's default order (what the code used to do) is the
+-- directory order only when the opclass happens to sort that way too.  Here
+-- it sorts in reverse: every value after the first one was looked for to the
+-- right of where it lives, and the list came back with almost nothing.
+--
+-- The family's cross-type comparison is what descends for a value of the
+-- other type.  A list of them is sorted with the family's OWN comparison of
+-- the value type when there is one, and otherwise not walked at all: each
+-- value descends on its own.
+-- ---------------------------------------------------------------------
+
+CREATE FUNCTION lion_rev_cmp48(int4, int8) RETURNS int4
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT btint84cmp($2, $1) $$;
+CREATE FUNCTION lion_rev_cmp88(int8, int8) RETURNS int4
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT btint8cmp($2, $1) $$;
+CREATE OPERATOR FAMILY lion_revx_ops USING lion;
+CREATE OPERATOR CLASS lion_revx_int4_ops FOR TYPE int4 USING lion
+	FAMILY lion_revx_ops AS
+	OPERATOR 1 = (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_rev_cmp(int4, int4);
+ALTER OPERATOR FAMILY lion_revx_ops USING lion ADD
+	OPERATOR 1 = (int4, int8),
+	FUNCTION 1 (int8, int8) hashint8(int8),
+	FUNCTION 4 (int4, int8) lion_rev_cmp48(int4, int8);
+
+CREATE TABLE lion_revx (k int NOT NULL, v int);
+INSERT INTO lion_revx SELECT i % 5000, i FROM generate_series(1, 50000) i;
+CREATE INDEX lion_revx_k ON lion_revx USING lion (k lion_revx_int4_ops);
+VACUUM (ANALYZE) lion_revx;
+SELECT ordered, leaf_pages > 20 AS many_leaves FROM lion_index_stats('lion_revx_k');
+SELECT lion_index_verify('lion_revx_k', true);
+
+-- The values arrive in no order and live all over the directory.
+CREATE TEMP TABLE lion_revx_vals AS
+	SELECT ((i * 37) % 5000)::int8 AS v FROM generate_series(1, 400) i;
+INSERT INTO lion_revx_vals VALUES (4999), (0), (2500), (7), (7);
+SET pg_lion.enable_count_pushdown = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT count(*) AS expected FROM lion_revx
+	WHERE k = ANY (ARRAY(SELECT v FROM lion_revx_vals));
+SELECT count(*) AS expected_in FROM lion_revx
+	WHERE k IN (4999::int8, 10::int8, 2500::int8, 7::int8, 3333::int8, 4000::int8);
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+-- the bitmap path, one value at a time
+SET enable_seqscan = off;
+SELECT count(*) AS bitmap_scan FROM lion_revx
+	WHERE k = ANY (ARRAY(SELECT v FROM lion_revx_vals));
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+-- no comparison of int8 against int8 in the family: every value descends alone
+SELECT lion_index_count_any('lion_revx_k', ARRAY(SELECT v FROM lion_revx_vals))
+	AS count_any;
+SELECT count(*) AS pushdown FROM lion_revx
+	WHERE k = ANY (ARRAY(SELECT v FROM lion_revx_vals));
+SELECT count(*) AS pushdown_in FROM lion_revx
+	WHERE k IN (4999::int8, 10::int8, 2500::int8, 7::int8, 3333::int8, 4000::int8);
+-- with the family's own int8 order, the list is sorted by it and walked
+ALTER OPERATOR FAMILY lion_revx_ops USING lion ADD
+	FUNCTION 4 (int8, int8) lion_rev_cmp88(int8, int8);
+SELECT lion_index_count_any('lion_revx_k', ARRAY(SELECT v FROM lion_revx_vals))
+	AS count_any_walked;
+SELECT count(*) AS pushdown_walked FROM lion_revx
+	WHERE k = ANY (ARRAY(SELECT v FROM lion_revx_vals));
+DROP TABLE lion_revx_vals;
+DROP TABLE lion_revx;
+DROP OPERATOR FAMILY lion_revx_ops USING lion CASCADE;
+DROP FUNCTION lion_rev_cmp48(int4, int8);
+DROP FUNCTION lion_rev_cmp88(int8, int8);
+
+-- ---------------------------------------------------------------------
+-- 15. A cross-type ordering on an UNORDERED directory is not used.
+--
+-- The same reverse comparison, but in no btree family, so the build cannot
+-- sort by it and the directory is ordered by (hash, bytes) instead (§21 rule
+-- 3).  A cross-type proc 4 in the family must then be ignored: descending a
+-- hash-ordered tree in value order finds nothing.  The bitmap scan used to
+-- resolve its own comparison without asking whether the column was ordered;
+-- it now shares the count path's resolution.
+-- ---------------------------------------------------------------------
+
+CREATE FUNCTION lion_odd2_cmp(int4, int4) RETURNS int4
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT btint4cmp($2, $1) $$;
+CREATE FUNCTION lion_odd2_cmp48(int4, int8) RETURNS int4
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT btint84cmp($2, $1) $$;
+CREATE OPERATOR FAMILY lion_oddx_ops USING lion;
+CREATE OPERATOR CLASS lion_oddx_int4_ops FOR TYPE int4 USING lion
+	FAMILY lion_oddx_ops AS
+	OPERATOR 1 = (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_odd2_cmp(int4, int4);
+ALTER OPERATOR FAMILY lion_oddx_ops USING lion ADD
+	OPERATOR 1 = (int4, int8),
+	FUNCTION 1 (int8, int8) hashint8(int8),
+	FUNCTION 4 (int4, int8) lion_odd2_cmp48(int4, int8);
+CREATE TABLE lion_oddx (k int NOT NULL, v int);
+INSERT INTO lion_oddx SELECT i % 5000, i FROM generate_series(1, 50000) i;
+CREATE INDEX lion_oddx_k ON lion_oddx USING lion (k lion_oddx_int4_ops);
+VACUUM (ANALYZE) lion_oddx;
+SELECT ordered FROM lion_index_stats('lion_oddx_k');
+SET pg_lion.enable_count_pushdown = off;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_oddx WHERE k = 7::int8;
+SELECT count(*) AS bitmap_one FROM lion_oddx WHERE k = 7::int8;
+SELECT count(*) AS bitmap_many FROM lion_oddx
+	WHERE k = ANY (ARRAY(SELECT ((i * 37) % 5000)::int8 FROM generate_series(1, 300) i));
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT count(*) AS expected_many FROM lion_oddx
+	WHERE k = ANY (ARRAY(SELECT ((i * 37) % 5000)::int8 FROM generate_series(1, 300) i));
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+SELECT lion_index_count('lion_oddx_k', 7::int8) AS count_one,
+	   lion_index_count_any('lion_oddx_k',
+			ARRAY(SELECT ((i * 37) % 5000)::int8 FROM generate_series(1, 300) i)) AS count_any;
+DROP TABLE lion_oddx;
+DROP OPERATOR FAMILY lion_oddx_ops USING lion CASCADE;
+DROP FUNCTION lion_odd2_cmp(int4, int4);
+DROP FUNCTION lion_odd2_cmp48(int4, int8);
+
+-- ---------------------------------------------------------------------
+-- 16. A cast is not a comparison: text probes of a `name` index.
+--
+-- A family with `name = text` equality but no cross-type ordering used to
+-- have its text values CAST to name and then looked up as names - through an
+-- implicit cast, which is not lossless: text -> name truncates to 63 bytes,
+-- so a text that differs from a stored name only past byte 63 found it.  Only
+-- a BINARY coercion (same bytes) is taken now; anything else walks the leaves
+-- with the family's cross-type equality, exactly as the bitmap scan always
+-- did.
+-- ---------------------------------------------------------------------
+
+CREATE OPERATOR FAMILY lion_namex_ops USING lion;
+CREATE OPERATOR CLASS lion_namex_name_ops FOR TYPE name USING lion
+	FAMILY lion_namex_ops AS
+	OPERATOR 1 = (name, name),
+	FUNCTION 1 hashname(name),
+	FUNCTION 4 btnamecmp(name, name);
+ALTER OPERATOR FAMILY lion_namex_ops USING lion ADD
+	OPERATOR 1 = (name, text),
+	FUNCTION 1 (text, text) hashtext(text);
+CREATE TABLE lion_namex (n name NOT NULL, v int);
+INSERT INTO lion_namex SELECT repeat('n', 60) || lpad((i % 100)::text, 3, '0'), i
+	FROM generate_series(1, 2000) i;
+CREATE INDEX lion_namex_n ON lion_namex USING lion (n lion_namex_name_ops);
+VACUUM (ANALYZE) lion_namex;
+SELECT ordered, entries FROM lion_index_stats('lion_namex_n');
+-- 63 bytes of these texts are a stored name; the texts themselves are not
+SELECT lion_index_count('lion_namex_n', (repeat('n', 60) || '007tail')::text) AS one_long,
+	   lion_index_count_any('lion_namex_n',
+			ARRAY[repeat('n', 60) || '007tail', repeat('n', 60) || '008xyz']) AS any_long;
+SELECT count(*) AS pushdown_any FROM lion_namex
+	WHERE n = ANY (ARRAY[repeat('n', 60) || '007tail', repeat('n', 60) || '008xyz']);
+-- (an IN list of texts is resolved by the PARSER to `name = ANY (name[])`,
+-- truncating the constants itself, so it matches here and in the heap alike)
+SELECT count(*) AS pushdown_in FROM lion_namex
+	WHERE n IN ((repeat('n', 60) || '007tail')::text, (repeat('n', 60) || '008xyz')::text);
+-- ... while a text that IS a stored name still finds it
+SELECT lion_index_count('lion_namex_n', (repeat('n', 60) || '007')::text) AS one_exact,
+	   lion_index_count_any('lion_namex_n',
+			ARRAY[repeat('n', 60) || '007', repeat('n', 60) || '008tail']) AS any_exact;
+SET pg_lion.enable_count_pushdown = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT count(*) AS expected FROM lion_namex
+	WHERE n = ANY (ARRAY[repeat('n', 60) || '007tail', repeat('n', 60) || '008xyz']);
+SELECT count(*) AS expected_in FROM lion_namex
+	WHERE n IN ((repeat('n', 60) || '007tail')::text, (repeat('n', 60) || '008xyz')::text);
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE lion_namex;
+DROP OPERATOR FAMILY lion_namex_ops USING lion CASCADE;
+
+-- A BINARY coercion is still taken: a family whose cross-type equality
+-- compares text with varchar descends for the varchar values as if they were
+-- text (same bytes, so the same hash, equality and order), instead of walking
+-- every leaf for each of them.
+CREATE FUNCTION lion_text_eq_varchar(text, varchar) RETURNS boolean
+	LANGUAGE internal IMMUTABLE STRICT PARALLEL SAFE AS 'texteq';
+CREATE OPERATOR =~~= (LEFTARG = text, RIGHTARG = varchar,
+					  FUNCTION = lion_text_eq_varchar);
+CREATE OPERATOR FAMILY lion_textv_ops USING lion;
+CREATE OPERATOR CLASS lion_textv_text_ops FOR TYPE text USING lion
+	FAMILY lion_textv_ops AS
+	OPERATOR 1 = (text, text),
+	FUNCTION 1 hashtext(text),
+	FUNCTION 4 bttextcmp(text, text);
+ALTER OPERATOR FAMILY lion_textv_ops USING lion ADD
+	OPERATOR 1 =~~= (text, varchar),
+	FUNCTION 1 (varchar, varchar) hashtext(text);
+CREATE TABLE lion_textv (k text NOT NULL);
+INSERT INTO lion_textv SELECT 'v' || lpad((i % 20000)::text, 6, '0')
+	FROM generate_series(1, 40000) i;
+CREATE INDEX lion_textv_k ON lion_textv USING lion (k lion_textv_text_ops);
+VACUUM (ANALYZE) lion_textv;
+SELECT ordered, leaf_pages > 100 AS many_leaves FROM lion_index_stats('lion_textv_k');
+SELECT lion_index_count_any('lion_textv_k',
+		ARRAY['v000001', 'v019999', 'v010000', 'nope']::varchar[]) AS count_any;
+SELECT count(*) AS pushdown FROM lion_textv
+	WHERE k =~~= ANY (ARRAY['v000001', 'v019999', 'v010000', 'nope']::varchar[]);
+CREATE FUNCTION lion_dirpages(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	j json;
+BEGIN
+	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, BUFFERS OFF, FORMAT JSON) '
+		|| q INTO j;
+	RETURN (j -> 0 -> 'Plan' ->> 'Directory Pages Read')::bigint;
+END $$;
+SELECT lion_dirpages($q$SELECT count(*) FROM lion_textv
+	WHERE k =~~= ANY (ARRAY['v000001', 'v019999', 'v010000', 'nope']::varchar[])$q$)
+	   < (SELECT leaf_pages FROM lion_index_stats('lion_textv_k'))
+	AS descended_not_walked;
+DROP FUNCTION lion_dirpages(text);
+DROP TABLE lion_textv;
+DROP OPERATOR FAMILY lion_textv_ops USING lion CASCADE;
+DROP OPERATOR =~~= (text, varchar);
+DROP FUNCTION lion_text_eq_varchar(text, varchar);
+
+-- ---------------------------------------------------------------------
+-- 17. A list whose values share a hash run that spans several leaves.
+--
+-- The batched lookup keeps the leaf its last value was found on and only
+-- steps right from there.  A value found on the SECOND leaf of a prefix run
+-- left the walk standing to the right of where the run begins, and the next
+-- value of the same run - sorted after it, but stored before it - was then
+-- looked for from there and missed.  After a lookup that had to follow the
+-- run across a page boundary the walk descends afresh.
+-- ---------------------------------------------------------------------
+
+CREATE FUNCTION lion_coarse_xid_hash(xid) RETURNS integer
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT (($1::text)::int8 % 7)::int4 $$;
+CREATE FUNCTION lion_coarse_int4_hash(int4) RETURNS integer
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT ($1::int8 % 7)::int4 $$;
+CREATE OPERATOR FAMILY lion_coarsex_ops USING lion;
+CREATE OPERATOR CLASS lion_coarsex_xid_ops FOR TYPE xid USING lion
+	FAMILY lion_coarsex_ops AS
+	OPERATOR 1 = (xid, xid),
+	FUNCTION 1 lion_coarse_xid_hash(xid);
+ALTER OPERATOR FAMILY lion_coarsex_ops USING lion ADD
+	OPERATOR 1 = (xid, int4),
+	FUNCTION 1 (int4, int4) lion_coarse_int4_hash(int4);
+CREATE TABLE lion_cx (x xid NOT NULL, v int);
+INSERT INTO lion_cx SELECT (i % 3000 + 1)::text::xid, i
+	FROM generate_series(1, 30000) i;
+CREATE INDEX lion_cx_x ON lion_cx USING lion (x lion_coarsex_xid_ops);
+VACUUM (ANALYZE) lion_cx;
+-- seven hash runs of ~430 entries each, every one of them several leaves long
+SELECT ordered, leaf_pages > 20 AS many_leaves, entries
+	FROM lion_index_stats('lion_cx_x');
+-- every key, in descending order: xid values, and int4 values (cross-type)
+SELECT lion_index_count_any('lion_cx_x',
+		ARRAY(SELECT (3001 - i)::text::xid FROM generate_series(1, 3000) i)) AS xid_list,
+	   lion_index_count_any('lion_cx_x',
+		ARRAY(SELECT 3001 - i FROM generate_series(1, 3000) i)) AS int4_list;
+SELECT count(*) AS pushdown FROM lion_cx
+	WHERE x = ANY (ARRAY(SELECT 3001 - i FROM generate_series(1, 3000) i));
+SET pg_lion.enable_count_pushdown = off;
+SET enable_seqscan = off;
+SELECT count(*) AS bitmap_scan FROM lion_cx
+	WHERE x = ANY (ARRAY(SELECT 3001 - i FROM generate_series(1, 3000) i));
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE lion_cx;
+DROP OPERATOR FAMILY lion_coarsex_ops USING lion CASCADE;
+DROP FUNCTION lion_coarse_xid_hash(xid);
+DROP FUNCTION lion_coarse_int4_hash(int4);
+
+DROP OPERATOR CLASS lion_rev_ops USING lion;
+DROP OPERATOR CLASS lion_rev_btree USING btree;
+DROP OPERATOR <# (int4, int4);
+DROP OPERATOR <=# (int4, int4);
+DROP OPERATOR =# (int4, int4);
+DROP OPERATOR >=# (int4, int4);
+DROP OPERATOR ># (int4, int4);
+DROP FUNCTION lion_rev_cmp(int4, int4);
+DROP FUNCTION lion_rev_lt(int4, int4);
+DROP FUNCTION lion_rev_le(int4, int4);
+DROP FUNCTION lion_rev_eq(int4, int4);
+DROP FUNCTION lion_rev_ge(int4, int4);
+DROP FUNCTION lion_rev_gt(int4, int4);
 
 DROP FUNCTION lion_groups_monotonic(text, bool);

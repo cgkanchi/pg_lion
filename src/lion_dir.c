@@ -592,19 +592,51 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 }
 
 /*
+ * Step from buf to its right sibling holding buf until the sibling is locked
+ * (lock coupling, left to right), and then release buf unless keep says the
+ * caller still needs it.
+ */
+static Buffer
+lion_dir_step_right_coupled(Relation index, Buffer buf, int lockmode, bool keep)
+{
+	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+	Buffer		nbuf;
+
+	Assert(BlockNumberIsValid(next));
+	nbuf = lion_dir_readbuf(index, next);
+	LockBuffer(nbuf, lockmode);
+	lion_dir_check_page(index, BufferGetPage(nbuf), next);
+	if (!keep)
+		UnlockReleaseBuffer(buf);
+
+	CHECK_FOR_INTERRUPTS();
+	return nbuf;
+}
+
+/*
  * Scan the run of prefix-equal keys that starts at (*bufp, *offp) for the one
  * sk names, following right links while the run continues.  *bufp is a leaf
  * locked in lockmode and stays locked, though the scan may replace it with a
  * page further right.  On false, *offp is where the scan stopped.
+ *
+ * guardp is for the insert path's find-or-create (DESIGN.md §21, "Insert of
+ * a new entry"): when it is given and the run crosses a page boundary, the
+ * page the scan STARTED on is not released but handed back in *guardp, still
+ * locked, and the scan couples its steps right.  Every writer of a key of
+ * this prefix starts on that same page, so holding it serialises them.
+ * *guardp is InvalidBuffer when the scan never left its first page.
  */
-bool
-lion_dir_scan_run(Relation index, const LionSearchKey *sk,
-				  int lockmode, Buffer *bufp, OffsetNumber *offp,
-				  bool *movedright)
+static bool
+lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
+					  int lockmode, Buffer *bufp, OffsetNumber *offp,
+					  bool *movedright, Buffer *guardp)
 {
 	Buffer		buf = *bufp;
 	OffsetNumber off = *offp;
 	bool		moved = false;
+
+	if (guardp != NULL)
+		*guardp = InvalidBuffer;
 
 	for (;;)
 	{
@@ -664,7 +696,16 @@ lion_dir_scan_run(Relation index, const LionSearchKey *sk,
 			continue;
 		}
 
-		buf = lion_dir_step_right(index, buf, lockmode);
+		if (guardp != NULL)
+		{
+			bool		keep = !BufferIsValid(*guardp);
+
+			if (keep)
+				*guardp = buf;
+			buf = lion_dir_step_right_coupled(index, buf, lockmode, keep);
+		}
+		else
+			buf = lion_dir_step_right(index, buf, lockmode);
 		off = lion_page_first_data(BufferGetPage(buf));
 		moved = true;
 	}
@@ -675,6 +716,15 @@ notfound:
 	if (movedright != NULL)
 		*movedright = moved;
 	return false;
+}
+
+bool
+lion_dir_scan_run(Relation index, const LionSearchKey *sk,
+				  int lockmode, Buffer *bufp, OffsetNumber *offp,
+				  bool *movedright)
+{
+	return lion_dir_scan_run_ext(index, sk, lockmode, bufp, offp, movedright,
+								 NULL);
 }
 
 bool
@@ -698,6 +748,41 @@ lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 
 	*bufp = buf;
 	*offnum = off;
+
+	if (forwrite)
+	{
+		Buffer		guard;
+		bool		found;
+		bool		moved;
+
+		/*
+		 * The insert path's find-or-create (DESIGN.md §21).  When the lookup
+		 * stays on one leaf, that leaf is held from here to the insert and
+		 * nothing more is needed.  When the prefix run crosses a page
+		 * boundary, the leaf the run is entered from - the one every writer
+		 * of a key of this prefix descends to - is kept locked (the guard) and
+		 * handed back INSTEAD of the leaf the scan ended on, so that no other
+		 * writer can run the same lookup, miss as well, and create the key a
+		 * second time before this one has placed it.
+		 */
+		found = lion_dir_scan_run_ext(index, sk, lockmode, bufp, offnum,
+									  &moved, &guard);
+		if (movedright != NULL)
+			*movedright = moved;
+		if (!BufferIsValid(guard))
+			return found;
+		if (found)
+		{
+			UnlockReleaseBuffer(guard);
+			return true;
+		}
+		UnlockReleaseBuffer(*bufp);
+		*bufp = guard;
+		*offnum = InvalidOffsetNumber;
+		Assert(moved);
+		return false;
+	}
+
 	return lion_dir_scan_run(index, sk, lockmode, bufp, offnum, movedright);
 }
 
@@ -1525,8 +1610,14 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 
 /*
  * Insert a brand new entry.  (*bufp, off, movedright) are what lion_dir_find()
- * left behind when it did not find the key; *bufp is held EXCLUSIVE and stays
- * so, though a re-descent may replace it with another leaf.
+ * with forwrite left behind when it did not find the key; *bufp is held
+ * EXCLUSIVE and stays so - it is the caller's to release - and a page further
+ * right the entry ends up on is released here.
+ *
+ * Find-or-create is ONE serialised operation (DESIGN.md §21): whatever leaf
+ * *bufp is, it has been held since the unsuccessful lookup, and every writer
+ * of a key of this prefix has to lock it first, so no one can have created
+ * the key in the meantime and the insert needs no second existence check.
  */
 void
 lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
@@ -1534,22 +1625,46 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 				   LionEntryTuple *entry, Size size)
 {
 	LionSearchKey exact;
-	Buffer		buf = *bufp;
+	Buffer		guard = *bufp;
+	Buffer		buf = guard;
 
 	lion_search_key_exact(ix, &exact, entry);
 
 	if (movedright)
 	{
 		/*
-		 * The lookup crossed a page boundary inside one prefix run, so where
-		 * it stopped is not where the bytewise order puts this key.  Runs
-		 * longer than one item need an opclass whose comparison ties for
-		 * distinct entries, so this is vanishingly rare; ask again, exactly.
+		 * The lookup crossed a page boundary inside one prefix run, so *bufp
+		 * is the GUARD - the leaf the run is entered from, still locked - and
+		 * the key's exact bytewise position may be on any page of the run.
+		 * Walk right to it with the guard held, coupling each step (left to
+		 * right, the lock order of DESIGN.md §5), and finishing any split
+		 * whose right half the walk is about to enter, as every writer must.
+		 * Runs longer than one item need an opclass whose comparison ties for
+		 * distinct entries, so this is rare; the guard makes it correct.
+		 *
+		 * Test hook: the window between the unsuccessful lookup and the
+		 * insert, which test/isolation/dir_insert_race.spec parks a writer in
+		 * while a second one inserts the same key.
 		 */
-		UnlockReleaseBuffer(buf);
-		buf = lion_dir_search(index, heaprel, ix, &exact,
-							  BUFFER_LOCK_EXCLUSIVE, true, &off);
-		*bufp = buf;
+		INJECTION_POINT("lion-dir-add-entry-spanning", NULL);
+
+		for (;;)
+		{
+			Page		page = BufferGetPage(buf);
+
+			if (LionPageIsRightmost(page) ||
+				lion_cmp_entry(lion_page_highkey(page), &exact) > 0)
+				break;
+			if (LionPageIncompleteSplit(page))
+			{
+				lion_dir_finish_split(index, heaprel, ix, buf);
+				continue;
+			}
+			buf = lion_dir_step_right_coupled(index, buf,
+											  BUFFER_LOCK_EXCLUSIVE,
+											  buf == guard);
+		}
+		off = lion_dir_binsrch(BufferGetPage(buf), &exact);
 	}
 	else
 	{
@@ -1562,5 +1677,15 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 			off = OffsetNumberPrev(off);
 	}
 
+	/*
+	 * A split of buf takes its right sibling, the meta page and then the
+	 * parent; nothing to the right of buf is held, and the guard (if it is not
+	 * buf itself) is to its LEFT, so the split's lock order is the ordinary
+	 * one with one more page held on the left - the same shape as
+	 * lion_dir_place_again().
+	 */
 	lion_dir_place(index, heaprel, ix, buf, off, false, entry, size);
+
+	if (buf != guard)
+		UnlockReleaseBuffer(buf);
 }

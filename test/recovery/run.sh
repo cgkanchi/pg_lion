@@ -19,6 +19,9 @@
 #              registered and every index built here is written through it.
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
+#   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
+#              "1 1b 1c 1d 2 3").  For development; `make recovery-check`
+#              always runs everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
 #              wal_consistency_checking = 'pg_lion' is turned on:
@@ -73,6 +76,7 @@ fi
 ITERS=8
 KEEP=0
 MODE=generic
+PHASES="1 1b 1c 1d 2 3"
 EXTRA_CONF=()
 
 BASE=/tmp/claude-1000/lion_recovery
@@ -99,6 +103,7 @@ VACPID=""
 RRPID=""
 GENERIC_TOTAL=0
 SUMMARY=()
+PHASE3_FAILS=()
 
 nap() { command sleep "$1"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -114,6 +119,7 @@ while [ $# -gt 0 ]; do
 		--keep)   KEEP=1; shift ;;
 		--mode)   MODE=${2:-}; shift 2 ;;
 		--conf)   EXTRA_CONF+=("${2:-}"); shift 2 ;;
+		--phases) PHASES=${2:-}; shift 2 ;;
 		-h|--help) sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^#\{0,1\} \{0,1\}//'; exit 0 ;;
 		*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
@@ -885,9 +891,13 @@ restart_standby() {
 	verify_node psql_s "$STANDBY_DATA"
 }
 
+# The INSERT position, not pg_current_wal_lsn(), which is the WRITE position:
+# a VACUUM assigns no transaction id and commits nothing, so its records can
+# sit in the WAL buffers - unsent - behind a write pointer the standby has
+# already passed.
 wait_catchup() {
 	wait_true psql_p \
-		"select coalesce(bool_or(replay_lsn >= pg_current_wal_lsn()), false) from pg_stat_replication" \
+		"select coalesce(bool_or(replay_lsn >= pg_current_wal_insert_lsn()), false) from pg_stat_replication" \
 		120 "the standby to replay everything the primary has written"
 }
 
@@ -1163,6 +1173,243 @@ phase2() {
 	SUMMARY+=("phase2 promoted     $ck checks ok after promotion, VM path back in use")
 }
 
+# ---------------------------------------------------------------- phase 3
+
+# The standby half of the §9/§11 interlock, attacked where it is thinnest
+# (DESIGN.md §9 "Hot standby", §11 "On a standby", §25 "Standby").
+#
+# A standby reader copies containers out of an index page, keeps the PIN, and
+# only then asks the visibility map about their heap blocks - exactly as on a
+# primary.  In rmgr mode it trusts the map, on the argument that replay of
+# every removal takes a CLEANUP lock.  Each case below parks such a reader at
+# the injection point 'lion-count-containers-pinned' (containers copied, page
+# pinned, map not yet consulted) and then has the PRIMARY move the TIDs the
+# reader copied onto a page it is not pinning, and VACUUM them there:
+#
+#   split     an insert splits the leaf the reader pins; the containers with
+#             the dead TIDs move to the new right sibling, and the VACUUM
+#             removes them there.  The pinned leaf itself has nothing left to
+#             remove, so the primary's VACUUM cleanup-locks it but writes no
+#             record for it.
+#   pushdown  the reader pins a one-page posting set's ROOT; an insert pushes
+#             the root down (§22), so the containers move to a new child and
+#             the root becomes an internal page.
+#   spill     the reader pins a directory leaf holding an INLINE posting set;
+#             the VACUUM's own filtering makes the payload outgrow the entry
+#             and spill onto container pages, which rewrites the entry on the
+#             pinned leaf.
+#
+# In every case the primary's VACUUM ends by marking the deleted rows' heap
+# pages all-visible, and replay of those heap records follows replay of the
+# index records.  So unless replay of the index side WAITS for the reader's
+# pin, the reader - woken once the standby has caught up - counts the dead
+# rows from its copy.  The legal outcomes are: replay blocks on the pin (the
+# startup process shows up waiting for a cleanup lock - the barrier of §25,
+# carried by a stand-alone VACUUM_VISIT record in the split case and riding on
+# the removal record in the other two) and the reader, released
+# then, answers the right number; or the standby rechecks every TID (generic
+# mode) and answers the right number without blocking anything.  A standby
+# that catches up while the reader is parked, and a reader that then answers
+# anything else, is the bug.
+
+# PHASE3_CASES (environment, a development aid) runs a subset of the cases.
+want_case() { case " ${PHASE3_CASES:-split pushdown spill} " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# standby_pin_case <label> <index> <key> <expected> <sql to run on the primary>
+standby_pin_case() {
+	local label=$1 idx=$2 key=$3 expected=$4 sql=$5 out err rc=0 n i state="" rpid plsn
+	out=$BASE/pin_$label.out
+	err=$BASE/pin_$label.err
+
+	"$PGBIN/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$STANDBY_PORT" \
+		-U postgres -d "$DBNAME" >"$out" 2>"$err" <<-SQL &
+		SET pg_lion.enable_count_pushdown = off;
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('lion-count-containers-pinned', 'wait');
+		SELECT 'count ' || lion_index_count('$idx'::regclass, $key::int4);
+	SQL
+	rpid=$!
+	RRPID=$rpid
+	wait_true psql_s \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-count-containers-pinned'" \
+		30 "$label: the standby reader to park with its page pinned"
+
+	# The trailing xid makes a commit record, whose synchronous flush takes the
+	# VACUUM's own records (which commit nothing) to the standby with it.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: the primary's writes failed"
+		SET synchronous_commit = on;
+		$sql
+		SELECT pg_current_xact_id();
+	SQL
+
+	# Either replay blocks on the reader's pin, or it catches up.  Both are
+	# asked of the standby itself: the primary's view of replay_lsn is only as
+	# fresh as the last status message.
+	plsn=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	for i in $(seq 1 300); do
+		if [ "$(psql_s -tAc "select count(*) > 0 from pg_stat_activity where backend_type = 'startup' and wait_event in ('BufferPin', 'BufferCleanup')")" = t ]; then
+			state=blocked
+			break
+		fi
+		if [ "$(psql_s -tAc "select pg_last_wal_replay_lsn() >= '$plsn'::pg_lsn")" = t ]; then
+			state=caughtup
+			break
+		fi
+		nap 0.1
+	done
+	if [ -z "$state" ]; then
+		psql_s -c "select backend_type, state, wait_event_type, wait_event, left(query, 60) from pg_stat_activity" >&2 || true
+		die "$label: replay neither blocked nor caught up within 30s"
+	fi
+
+	psql_s -tAc "select injection_points_detach('lion-count-containers-pinned')" >/dev/null 2>&1 || true
+	for i in $(seq 1 100); do
+		n=$(psql_s -tAc "select count(*) from pg_stat_activity where wait_event = 'lion-count-containers-pinned'")
+		[ "$n" = 0 ] && break
+		psql_s -tAc "select injection_points_wakeup('lion-count-containers-pinned')" >/dev/null 2>&1 || true
+		nap 0.1
+	done
+	wait "$rpid" || rc=$?
+	RRPID=""
+	{ echo "---- standby pin case $label (exit $rc, replay $state)"; cat "$out" "$err"; } >>"$RUNLOG"
+	[ "$rc" = 0 ] || die "$label: the standby reader failed: $(tail -3 "$err")"
+	n=$(sed -n 's/^count //p' "$out" | head -1)
+
+	# A failure is recorded and the other cases still run, so that one run
+	# says which of the three shapes is open.
+	wait_catchup
+	{ echo "---- $label: count_stats and ntids after catching up, standby then primary";
+	  psql_s -tAc "select *, (select ntids from lion_index_stats('$idx')) from lion_index_count_stats('$idx'::regclass, $key::int4)";
+	  psql_p -tAc "select *, (select ntids from lion_index_stats('$idx')) from lion_index_count_stats('$idx'::regclass, $key::int4)"; } >>"$RUNLOG" 2>&1
+	if [ "$n" != "$expected" ]; then
+		log "   BUG ($label): a standby count parked with its page pinned answered $n, the right answer for its snapshot is $expected (replay $state while it was parked, mode $MODE)"
+		PHASE3_FAILS+=("$label")
+	elif [ "$MODE" = rmgr ] && [ "$state" != blocked ]; then
+		log "   BUG ($label): replay caught up past the primary's VACUUM while a standby reader held a pin on the page its containers came from (the answer happened to be right: $n)"
+		PHASE3_FAILS+=("$label")
+	else
+		log "   $label: parked reader answered $n (expected $expected), replay $state while it was parked"
+		SUMMARY+=("phase3 $label  standby reader $n = $expected, replay $state")
+	fi
+}
+
+phase3() {
+	local exp pages
+	log ""
+	log "=== phase 3: standby barriers for pinned readers (§9/§11/§25) ==="
+	psql_p -tAc "select count(*) from pg_available_extensions where name = 'injection_points'" |
+		grep -q '^1$' ||
+		{ log "phase 3 skipped: this server has no injection_points extension"
+		  SUMMARY+=("phase3             skipped (no injection points)"); return 0; }
+
+	# A standby of its own: phase 2 promotes the one it made.
+	stop_hard "$STANDBY_DATA"
+	rm -rf "$STANDBY_DATA"
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 3: fixture failed"
+		SET synchronous_commit = on;
+		CREATE EXTENSION IF NOT EXISTS injection_points;
+
+		-- split: five ~1.5 KB ARRAY containers per leaf (count_split_race.spec)
+		DROP TABLE IF EXISTS pin_split;
+		CREATE TABLE pin_split (id int, k int NOT NULL, pad char(300));
+		INSERT INTO pin_split SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
+		CREATE INDEX pin_split_k ON pin_split USING lion (k);
+
+		-- pushdown: one container on one page (count_root_pushdown_race.spec)
+		DROP TABLE IF EXISTS pin_push;
+		CREATE TABLE pin_push (id int, k int NOT NULL);
+		INSERT INTO pin_push SELECT i, i % 4 FROM generate_series(1, 4000) i;
+		CREATE INDEX pin_push_k ON pin_push USING lion (k) WITH (inline_limit = 64);
+
+		-- spill: k = 1 is 200 consecutive offsets of heap block 0, one RUN
+		-- container of a few bytes, INLINE; every other one deleted, it is a
+		-- 100-member ARRAY that no longer fits inline_limit
+		DROP TABLE IF EXISTS pin_spill;
+		CREATE TABLE pin_spill (id int, k int NOT NULL);
+		INSERT INTO pin_spill SELECT i, CASE WHEN i <= 200 THEN 1 ELSE 2 + i % 50 END
+		  FROM generate_series(1, 3000) i;
+		CREATE INDEX pin_spill_k ON pin_spill USING lion (k) WITH (inline_limit = 64);
+	SQL
+	psql_p -c "VACUUM (FREEZE, ANALYZE) pin_split" >>"$RUNLOG" 2>&1
+	psql_p -c "VACUUM (FREEZE, ANALYZE) pin_push" >>"$RUNLOG" 2>&1
+	psql_p -c "VACUUM (FREEZE, ANALYZE) pin_spill" >>"$RUNLOG" 2>&1
+	# Free line pointers in heap blocks 0..63 only, so that the inserts of the
+	# split case land there and grow the FIRST container of the first leaf.
+	psql_p -c "SET synchronous_commit = on; DELETE FROM pin_split WHERE k = 0 AND (ctid::text::point)[0] < 64" >>"$RUNLOG" 2>&1
+	# INDEX_CLEANUP ON: with fewer than 2% of the pages affected VACUUM would
+	# otherwise bypass index vacuuming, leave the line pointers dead and never
+	# tell the free space map about those pages.
+	psql_p -c "VACUUM (INDEX_CLEANUP ON) pin_split" >>"$RUNLOG" 2>&1
+
+	[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('pin_push_k')")" = 0 ] ||
+		die "phase 3: the pushdown fixture is not a one-page posting set"
+	[ "$(psql_p -tAc "select inline_entries from lion_index_stats('pin_spill_k')")" = 1 ] ||
+		die "phase 3: the spill fixture does not have exactly one INLINE entry"
+
+	# Rows dead to everyone - deleted before the standby reader takes its
+	# snapshot - and not vacuumed yet.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 3: deletes failed"
+		SET synchronous_commit = on;
+		-- containers 1 and 2 of the first leaf (heap blocks 70..190)
+		DELETE FROM pin_split WHERE k = 1 AND (ctid::text::point)[0] BETWEEN 70 AND 190;
+		DELETE FROM pin_push WHERE k = 1 AND id <= 2000;
+		DELETE FROM pin_spill WHERE k = 1 AND id % 2 = 0;
+	SQL
+
+	basebackup_standby
+	write_standby_conf on -1
+	restart_standby
+	wait_catchup
+
+	if want_case split; then
+		exp=$(psql_p -tAc "select count(*) from pin_split where k = 1")
+		pages=$(psql_p -tAc "select container_pages from lion_index_stats('pin_split_k')")
+		# One range per stand-alone VACUUM_VISIT record, so that the barrier
+		# this case depends on travels in that record type and not riding on
+		# a removal record, which the other two cases cover.
+		standby_pin_case split pin_split_k 1 "$exp" "
+			INSERT INTO pin_split SELECT 1000000 + i, 1, '' FROM generate_series(1, 700) i;
+			SET pg_lion.vacuum_barrier_ranges = 1;
+			VACUUM (INDEX_CLEANUP ON) pin_split;
+			RESET pg_lion.vacuum_barrier_ranges;"
+		[ "$(psql_p -tAc "select container_pages from lion_index_stats('pin_split_k')")" -gt "$pages" ] ||
+			die "phase 3: the split case did not split a leaf"
+	fi
+
+	if want_case pushdown; then
+		exp=$(psql_p -tAc "select count(*) from pin_push where k = 1")
+		standby_pin_case pushdown pin_push_k 1 "$exp" "
+			INSERT INTO pin_push SELECT 100000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
+			  FROM generate_series(1, 40000) i;
+			VACUUM (INDEX_CLEANUP ON) pin_push;"
+		[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('pin_push_k')")" -ge 1 ] ||
+			die "phase 3: the pushdown case did not push the root down"
+	fi
+
+	if want_case spill; then
+		exp=$(psql_p -tAc "select count(*) from pin_spill where k = 1")
+		standby_pin_case spill pin_spill_k 1 "$exp" "
+			VACUUM (INDEX_CLEANUP ON) pin_spill;"
+		[ "$(psql_p -tAc "select inline_entries from lion_index_stats('pin_spill_k')")" = 0 ] ||
+			die "phase 3: the spill case did not spill"
+	fi
+
+	run_check "phase 3 standby" psql_s "
+		select lion_index_verify(i::regclass, true) is not null, 'verify ' || i
+		  from unnest(array['pin_split_k', 'pin_push_k', 'pin_spill_k']) i
+		union all
+		select (select count(*) from pin_split where k = 1) = $(psql_p -tAc "select count(*) from pin_split where k = 1"), 'pin_split count'
+		union all
+		select (select count(*) from pin_push where k = 1) = $(psql_p -tAc "select count(*) from pin_push where k = 1"), 'pin_push count'
+		union all
+		select (select count(*) from pin_spill where k = 1) = $(psql_p -tAc "select count(*) from pin_spill where k = 1"), 'pin_spill count'"
+
+	stop_hard "$STANDBY_DATA"
+	psql_p -c "DROP TABLE pin_split, pin_push, pin_spill" >>"$RUNLOG" 2>&1
+	[ "${#PHASE3_FAILS[@]}" = 0 ] ||
+		die "phase 3: a standby reader was overtaken by replay in: ${PHASE3_FAILS[*]}"
+}
+
 # ---------------------------------------------------------------- main
 
 mkdir -p "$LOGDIR"
@@ -1196,11 +1443,13 @@ psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, spa
 run_check "baseline" psql_p "select * from lion_rec_check(true, true)"
 log "-- baseline: $NCHECKS checks ok"
 
-phase1
-phase1b
-phase1c
-phase1d
-phase2
+want_phase() { case " $PHASES " in *" $1 "*) return 0 ;; esac; return 1; }
+want_phase 1 && phase1
+want_phase 1b && phase1b
+want_phase 1c && phase1c
+want_phase 1d && phase1d
+want_phase 2 && phase2
+want_phase 3 && phase3
 
 END=$(now_ms)
 NWARN=$(wc -l <"$BASE/warnings.txt")

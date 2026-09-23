@@ -1,0 +1,80 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s3_root s2_predel s3_before s1_count s2_grow s3_after s3_vacuum s2_wakeup s3_count s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE) rpd;
+step s3_root: 
+	CREATE TABLE rpd_root AS SELECT lion_index_posting_root('rpd_k', 1) AS root;
+
+step s2_predel: DELETE FROM rpd WHERE k = 1 AND id <= 2000;
+step s3_before: 
+	SELECT max_posting_height AS height_before FROM lion_index_stats('rpd_k');
+
+height_before
+-------------
+            0
+(1 row)
+
+step s1_count: SELECT lion_index_count('rpd_k', 1); <waiting ...>
+step s2_grow: 
+	INSERT INTO rpd SELECT 100000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
+	  FROM generate_series(1, 40000) i;
+
+step s3_after: 
+	SELECT max_posting_height AS height_after,
+		   lion_index_posting_root('rpd_k', 1) = (SELECT root FROM rpd_root)
+			 AS root_block_kept
+	  FROM lion_index_stats('rpd_k');
+
+height_after|root_block_kept
+------------+---------------
+           1|t              
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) rpd; <waiting ...>
+step s2_wakeup: 
+	SELECT rpd_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+lion_index_count
+----------------
+             500
+(1 row)
+
+step s3_vacuum: <... completed>
+step s3_count: 
+	SET enable_seqscan = on; SET enable_bitmapscan = off;
+	SELECT count(*) FROM rpd WHERE k = 1;
+
+count
+-----
+20500
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('rpd_k', true); DROP TABLE rpd_root;
+lion_index_verify
+-----------------
+                 
+(1 row)
+

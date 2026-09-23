@@ -789,6 +789,70 @@ SELECT lion_cmp('lion_relt', 'k = 1234');
  ok 1 rows
 (1 row)
 
+/*
+ * An in-place insert that MERGES two runs of a RUN container (DESIGN.md §4,
+ * growth slack; §25, the in-place member add).  Filling the one-row gap
+ * between two runs turns them into one, so the container's logical size
+ * SHRINKS by a run while the item keeps the bytes the page allotted it; a
+ * stream of such inserts used to grow the unused tail of the item without
+ * bound, until verify() rejected the container for holding more than
+ * LION_ITEM_SLACK_BOUND (256) bytes of slack.  An insert whose merge would
+ * take the slack past that bound now rewrites the item through the ordinary
+ * path, which gives it back its logical size plus normal growth slack.
+ *
+ * The fixture: 20,000 rows of one key in heap order, so every heap block is
+ * one run of consecutive line pointers; every 16th row is deleted and
+ * vacuumed away, which leaves runs of 15 (14 runs a block, 896 a container:
+ * still a RUN container, the smallest representation); then single-row
+ * inserts reuse the freed line pointers lowest first, each one closing the
+ * gap between two runs.  400 of them are 400 merges.
+ */
+SET synchronous_commit = on;
+CREATE TABLE lion_runmerge (id int, k int NOT NULL);
+INSERT INTO lion_runmerge SELECT i, 1 FROM generate_series(1, 20000) i;
+CREATE INDEX lion_runmerge_k ON lion_runmerge USING lion (k)
+	WITH (inline_limit = 64);
+DELETE FROM lion_runmerge WHERE id % 16 = 0;
+VACUUM (INDEX_CLEANUP ON) lion_runmerge;
+DO $$ BEGIN
+	FOR i IN 1 .. 400 LOOP
+		INSERT INTO lion_runmerge VALUES (100000 + i, 1);
+	END LOOP;
+END $$;
+-- the inserts really did fill gaps at the front of the heap
+SELECT count(*) AS refilled FROM lion_runmerge
+ WHERE id > 100000 AND (ctid::text::point)[0] < 64;
+ refilled 
+----------
+      400
+(1 row)
+
+SELECT containers, slack_bytes <= 256 * containers AS slack_within_bound
+  FROM lion_index_stats('lion_runmerge_k');
+ containers | slack_within_bound 
+------------+--------------------
+          2 | t
+(1 row)
+
+SELECT lion_index_verify('lion_runmerge_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT count(*) FROM lion_runmerge WHERE k = 1;
+ count 
+-------
+ 19150
+(1 row)
+
+SELECT lion_index_count('lion_runmerge_k', 1);
+ lion_index_count 
+------------------
+            19150
+(1 row)
+
+RESET synchronous_commit;
 DROP TABLE lion_ins, lion_spill, lion_dense, lion_mid, lion_inlmid, lion_slack,
-		   lion_grow, lion_relt;
+		   lion_grow, lion_relt, lion_runmerge;
 DROP FUNCTION lion_ins_check(text);

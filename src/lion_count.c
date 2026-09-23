@@ -294,50 +294,12 @@ lion_get_am_oid(void)
 }
 
 /*
- * Everything needed to probe an index with keys of one search type: the hash
- * function to use, and, when the type is not the index's own, the cross-type
- * equality function to compare stored keys against it.  This is the same
- * dance lion_scan.c does for scan keys: the hash must come from the argument
- * type's own support function, the comparison from the opfamily's strategy-1
- * operator with the stored type on the left.
- *
- * It is a struct rather than a call per key because an IN list probes one
- * index with up to LION_MAX_ARRAY_ELEMS keys of the same type (DESIGN.md §15),
- * and the catalogue lookups behind it are the same every time.
+ * LionProbe, the one cross-type resolution of DESIGN.md §21, is declared in
+ * lion_count.h: the bitmap scan (lion_scan.c) resolves its scan keys through
+ * lion_probe_init() and lion_probe_find() as well, so the two paths cannot
+ * come to different conclusions about how to descend for a value.
  */
-typedef struct LionProbe
-{
-	bool		crosstype;		/* the keys are not the index's own type */
-	FmgrInfo	eqproc;			/* crosstype: stored = search comparison */
-	FmgrInfo	hashinfo;		/* crosstype: the search type's own hash */
-	FmgrInfo	cmpproc;		/* crosstype: stored <=> search (§21) */
-	bool		hascmp;
-	FmgrInfo	sortproc;		/* two SEARCH values, for ordering a list */
-	bool		hassort;
-	int16		typlen;			/* the search type, for datumIsEqual() */
-	bool		typbyval;
-
-	/*
-	 * DESIGN.md §21, cross-type resolution.  A value of another type can be
-	 * turned into a probe of the index's own type in three ways, tried in this
-	 * order, and the SINGLE and the BATCHED lookup must agree on which one,
-	 * because they walk the same tree:
-	 *
-	 *	- the family's cross-type ordering function (hascmp): descend as usual;
-	 *	- an implicit or binary coercion to the KEY type (coerce): the value
-	 *	  becomes one of the index's own and everything - hash, equality,
-	 *	  ordering - is the index's own, which is exactly consistent;
-	 *	- neither (needscan): the tree is ordered by a comparison this value
-	 *	  cannot take part in, so the leaves are walked with the cross-type
-	 *	  EQUALITY instead (lion_dir_find()).  Correct and linear.
-	 */
-	bool		coerce;			/* probe with the value cast to the key type */
-	bool		coercebyfunc;	/* ... which takes a function, not a relabel */
-	FmgrInfo	coerceproc;
-	bool		needscan;		/* no ordering for these values: walk the leaves */
-} LionProbe;
-
-static void
+void
 lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 {
 	/* The opclass of the KEY COLUMN this probe is for (DESIGN.md §24). */
@@ -346,6 +308,8 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 	Oid			opcintype = index->rd_opcintype[ci];
 	Oid			eqopr;
 	Oid			hashproc;
+	Oid			cmpproc;
+	Oid			sortproc;
 
 	memset(probe, 0, sizeof(LionProbe));
 
@@ -360,6 +324,8 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 			probe->sortproc = state->cmpproc;
 			probe->hassort = true;
 		}
+		/* sorted by the directory's comparison, or by the hash it leads with */
+		probe->walk = true;
 		return;
 	}
 
@@ -387,86 +353,96 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 	get_typlenbyval(keytype, &probe->typlen, &probe->typbyval);
 
 	/*
-	 * DESIGN.md §21: descending the directory for a value of another type
-	 * needs the family's cross-type ordering function, and sorting a whole IN
-	 * list of them needs the search type's own.  A family that has neither is
-	 * not an error - the leaves are walked instead - so both are optional here.
+	 * An UNORDERED directory is in (kind, hash, bytes) order whatever the
+	 * family offers: no comparison may be used on it, the family's cross-type
+	 * proc 4 included, because descending a hash-ordered tree in value order
+	 * finds nothing (§21 rule 3 can leave a column unordered although its
+	 * family names comparisons).  The value's own hash is the family's
+	 * cross-type hash, which agrees with the stored keys' by the family's
+	 * contract, so a descent - and a list sorted by hash - is exact.
 	 */
-	if (state->ordered)
+	if (!state->ordered)
 	{
-		Oid			cmpproc = get_opfamily_proc(opfamily, opcintype, keytype,
-												LION_CMP_PROC);
-		TypeCacheEntry *typentry;
-
-		if (OidIsValid(cmpproc))
-		{
-			fmgr_info(cmpproc, &probe->cmpproc);
-			probe->hascmp = true;
-		}
-
-		typentry = lookup_type_cache(keytype, TYPECACHE_CMP_PROC_FINFO);
-		if (OidIsValid(typentry->cmp_proc_finfo.fn_oid))
-		{
-			fmgr_info_copy(&probe->sortproc, &typentry->cmp_proc_finfo,
-						   CurrentMemoryContext);
-			probe->hassort = true;
-		}
+		probe->walk = true;
+		return;
 	}
 
-	if (!state->ordered || probe->hascmp)
+	/*
+	 * The family's cross-type ordering (proc 4 for the pair): descend as
+	 * usual.  A LIST of such values must be sorted into the directory order
+	 * before it can be walked, and the cross-type function cannot compare two
+	 * values of the search type with each other.  The family's own proc 4 for
+	 * (keytype, keytype) can: it is the family's statement of how it orders
+	 * that type, the same promise that makes its cross-type proc 4 usable at
+	 * all.  The search type's DEFAULT btree order is not used: it is the
+	 * directory's order only when the opclass happens to sort that way (a
+	 * reverse comparison does not), and a list sorted against the direction
+	 * of the leaves loses every value but the first to the walk, which only
+	 * steps right.  Without a comparison of its own the list is not walked:
+	 * every value descends by itself.
+	 */
+	cmpproc = get_opfamily_proc(opfamily, opcintype, keytype, LION_CMP_PROC);
+	if (OidIsValid(cmpproc))
+	{
+		fmgr_info(cmpproc, &probe->cmpproc);
+		probe->hascmp = true;
+
+		sortproc = get_opfamily_proc(opfamily, keytype, keytype,
+									 LION_CMP_PROC);
+		if (OidIsValid(sortproc))
+		{
+			fmgr_info(sortproc, &probe->sortproc);
+			probe->hassort = true;
+			probe->walk = true;
+		}
 		return;
+	}
 
 	/*
-	 * The tree is ordered by a comparison this value cannot take part in.
-	 * Casting it to the KEY type makes it one of the index's own values, and
-	 * then hash, equality and ordering are all the index's own - which is the
-	 * one resolution that is consistent by construction.  Only a BINARY
-	 * coercion or an IMPLICIT cast is taken: those are the ones PostgreSQL
-	 * itself would apply to the value in an expression.  A one-argument cast
-	 * function is required, because a length coercion is about a typmod this
-	 * code has none of.
+	 * The tree is ordered by a comparison this value cannot take part in.  A
+	 * BINARY coercion to the key type - the same bytes, varchar to text -
+	 * makes it one of the index's own values, and then hash, equality and
+	 * ordering are all the index's own, which is consistent by construction.
+	 * A cast FUNCTION is not taken, implicit or not: implicit does not mean
+	 * lossless (text -> name truncates to 63 bytes, so a long text that is no
+	 * stored name would become one), and PostgreSQL has no way to say that a
+	 * cast is a bijection.
 	 */
 	{
 		Oid			castfunc = InvalidOid;
-		CoercionPathType path;
 
-		path = find_coercion_pathway(opcintype, keytype, COERCION_IMPLICIT,
-									 &castfunc);
-		if (path == COERCION_PATH_RELABELTYPE)
-			probe->coerce = true;
-		else if (path == COERCION_PATH_FUNC && OidIsValid(castfunc) &&
-				 get_func_nargs(castfunc) == 1)
+		if (find_coercion_pathway(opcintype, keytype, COERCION_IMPLICIT,
+								  &castfunc) == COERCION_PATH_RELABELTYPE)
 		{
-			fmgr_info(castfunc, &probe->coerceproc);
+			/* From here on the probe values ARE the index's own type. */
 			probe->coerce = true;
-			probe->coercebyfunc = true;
+			probe->crosstype = false;
+			probe->typlen = state->typlen;
+			probe->typbyval = state->typbyval;
+			probe->cmpproc = state->cmpproc;
+			probe->hascmp = true;
+			probe->sortproc = state->cmpproc;
+			probe->hassort = true;
+			probe->walk = true;
+			return;
 		}
 	}
 
-	if (probe->coerce)
-	{
-		/* From here on the probe values ARE the index's own type. */
-		probe->crosstype = false;
-		probe->typlen = state->typlen;
-		probe->typbyval = state->typbyval;
-		probe->cmpproc = state->cmpproc;
-		probe->hascmp = true;
-		probe->sortproc = state->cmpproc;
-		probe->hassort = true;
-	}
-	else
-		probe->needscan = true;
+	/*
+	 * Neither: the leaves are walked with the family's cross-type EQUALITY
+	 * (lion_dir_find()), per value.  Correct and linear.
+	 */
+	probe->needscan = true;
 }
 
 /*
- * The Datum to probe with: the caller's value, or its cast to the key type.
+ * The Datum to probe with: the caller's value, which a binary coercion to the
+ * key type (the only one lion_probe_init() takes) leaves as it is.
  */
 static inline Datum
 lion_probe_value(LionProbe *probe, Datum value)
 {
-	if (!probe->coercebyfunc)
-		return value;			/* binary coercion needs no work at all */
-	return FunctionCall1(&probe->coerceproc, value);
+	return value;				/* a binary coercion needs no work at all */
 }
 
 /* A search key for one probe value. */
@@ -489,6 +465,27 @@ lion_probe_hash(LionState *state, LionProbe *probe, Datum key)
 		return lion_hash_key(state, key);
 	return DatumGetUInt32(FunctionCall1Coll(&probe->hashinfo, state->collation,
 											key));
+}
+
+/*
+ * Locate the entry of one value through a resolved probe: lion_dir_find()
+ * with the search key lion_probe_init() decided on.  On true *buf is the leaf
+ * locked in lockmode and *off the entry; on false *buf may be a locked leaf
+ * or InvalidBuffer, and the caller releases it when it is valid.
+ */
+bool
+lion_probe_find(Relation index, LionState *state, LionProbe *probe,
+				Datum value, int lockmode, Buffer *buf, OffsetNumber *off)
+{
+	LionSearchKey sk;
+	uint32		hash;
+
+	value = lion_probe_value(probe, value);
+	hash = lion_probe_hash(state, probe, value);
+	lion_probe_search_key(state, probe, value, hash, &sk);
+
+	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
+						 buf, off, NULL);
 }
 
 
@@ -725,8 +722,8 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	LionProbeSort sortctx;
 	LionProbeKey *probes;
 	const Datum *vals;
-	Datum	   *coerced = NULL;
 	Buffer		buf = InvalidBuffer;
+	bool		lastmoved = false;
 	int			nprobe = 0;
 	int			nsets = 0;
 	int			found = 0;
@@ -750,15 +747,8 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	 */
 	lion_probe_init(index, state, keytype, &probe);
 
+	/* A binary coercion - the only one taken - changes no value. */
 	vals = values;
-	if (probe.coercebyfunc)
-	{
-		coerced = (Datum *) palloc(sizeof(Datum) * nvalues);
-		for (i = 0; i < nvalues; i++)
-			coerced[i] = (isnull != NULL && isnull[i]) ? (Datum) 0 :
-				lion_probe_value(&probe, values[i]);
-		vals = coerced;
-	}
 
 	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * nvalues);
 	for (i = 0; i < nvalues; i++)
@@ -814,11 +804,13 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		sets[nsets].entryblk = InvalidBlockNumber;
 		sets[nsets].entryoff = InvalidOffsetNumber;
 
-		if (probe.needscan)
+		if (!probe.walk)
 		{
 			/*
-			 * No ordering for these values at all: there is no walk to keep,
-			 * and every value takes the same fallback the single lookup takes.
+			 * The values are not sorted in the directory's order (no ordering
+			 * for them at all, or a cross-type one that cannot sort a list):
+			 * there is no walk to keep, and every value is located exactly as
+			 * the single lookup locates it - a descent, or the leaf walk.
 			 */
 			if (BufferIsValid(buf))
 			{
@@ -834,7 +826,21 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 			/*
 			 * Stay on the leaf the last value was found on when the next one is
 			 * at most a few pages to the right; otherwise descend again.
+			 *
+			 * Not when the last lookup followed its prefix run across a page
+			 * boundary, though: the walk then stands to the RIGHT of where
+			 * that run begins, and the next value may belong to the same run
+			 * (a hash collision) and be stored on one of the pages it has
+			 * passed.  The leaf a lookup lands on otherwise is the one its
+			 * run begins on, so a value sorted after it can only be there or
+			 * further right.
 			 */
+			if (lastmoved && BufferIsValid(buf))
+			{
+				UnlockReleaseBuffer(buf);
+				buf = InvalidBuffer;
+			}
+
 			for (steps = 0; BufferIsValid(buf); steps++)
 			{
 				Page		page = BufferGetPage(buf);
@@ -858,7 +864,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 				off = lion_dir_binsrch(BufferGetPage(buf), &sk);
 
 			located = lion_dir_scan_run(index, &sk, BUFFER_LOCK_SHARE,
-										&buf, &off, NULL);
+										&buf, &off, &lastmoved);
 		}
 
 		if (located)
@@ -911,8 +917,6 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		UnlockReleaseBuffer(buf);
 
 	pfree(probes);
-	if (coerced != NULL)
-		pfree(coerced);
 	if (nfound != NULL)
 		*nfound = found;
 	return nsets;
@@ -1228,6 +1232,15 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 		cur->nextblk = InvalidBlockNumber;
 		cur->descend = true;
 		cur->seekckey = 0;
+
+		/*
+		 * Test hook: the entry has been copied and its leaf released, and
+		 * nothing of the posting set is pinned yet - all this cursor holds is
+		 * the root's block number.  test/isolation/vacuum_regrow_pushdown.spec
+		 * sends the descent into a VACUUM that is in the middle of pushing
+		 * that root down.  Compiles to nothing without injection points.
+		 */
+		INJECTION_POINT("lion-count-chain-entered", NULL);
 	}
 
 	lion_cursor_next(cur);
@@ -4215,13 +4228,29 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 * the primary, with "VACUUM" replaced by "the startup process": while this
 	 * backend holds a pin on the page it took a container from, replay cannot
 	 * have removed a TID from that page, so it cannot have replayed the heap
-	 * record that set any of that container's heap pages all-visible.  The
-	 * page-split hole of §11 closes the same way - a page is only ever linked
-	 * in immediately to the right of the page whose split created it, and
-	 * replay applies those records in the order the primary wrote them - and
-	 * the reader pays for it the way a primary reader does: the standby's
-	 * replay waits, which is a recovery conflict resolved by
-	 * max_standby_streaming_delay rather than a wrong answer.
+	 * record that set any of that container's heap pages all-visible.
+	 *
+	 * That alone is NOT enough, and the reason is the page-split hole of
+	 * §11: the TIDs this backend copied may since have MOVED - a split of the
+	 * leaf to its right sibling, a root push-down (§22) to a new child, an
+	 * INLINE payload spilled off the directory leaf - and be removed from the
+	 * page they moved to, which this backend does not pin.  On the primary
+	 * the removal cannot happen before VACUUM has held a cleanup lock on the
+	 * page they came from, because VACUUM visits every page (and every page
+	 * of a posting tree's descent) in chain order; but a page VACUUM visits
+	 * without changing writes no record of its own.  So VACUUM carries those
+	 * visits as a BARRIER on its next removal record (or in a VACUUM_VISIT
+	 * record of their own), and redo cleanup-locks every page of it, one at a
+	 * time with nothing else held, before it applies the removal (§25,
+	 * xl_lion_visit in lion_wal.h).  A page is only ever linked in to the
+	 * right of the page whose split created it and replay applies records in
+	 * the order the primary wrote them, so replay meets the barrier for the
+	 * page this backend pins before the removal that could hurt it -
+	 * test/recovery/run.sh phase 3 parks a standby reader in exactly that
+	 * window for the split, the push-down and the spill.  The reader pays for
+	 * it the way a primary reader does: the standby's replay waits, which is
+	 * a recovery conflict resolved by max_standby_streaming_delay rather than
+	 * a wrong answer.
 	 *
 	 * ONE generic-mode source is enough to lose it, because a container of the
 	 * intersection carries the dead TIDs of every source it came from, and the

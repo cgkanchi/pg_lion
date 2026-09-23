@@ -1538,6 +1538,91 @@ lion_verify_copy_item(Page page, OffsetNumber off)
 }
 
 /*
+ * One equality class, one entry (DESIGN.md §21).  The entries whose prefixes
+ * tie - (column, kind, proc 4, hash) - are the candidates for being the same
+ * key, and they are contiguous in the leaf order, across page boundaries too,
+ * so the check keeps the current prefix run and compares each new entry with
+ * every member of it under the opclass equality.  Byte-identical twins are
+ * caught by the ordering checks already; this also catches two spellings of
+ * one class (the citext shape), which sort apart inside their run.  Runs are
+ * a single entry unless the hash collides, so this is linear in practice.
+ */
+typedef struct LionVerifyRun
+{
+	int			n;
+	int			max;
+	LionEntryTuple **items;		/* copies */
+	BlockNumber *blocks;
+} LionVerifyRun;
+
+static void
+lion_verify_run_add(LionVerifyState *vs, LionVerifyRun *run,
+					LionEntryTuple *item, BlockNumber blk, OffsetNumber off)
+{
+	int			i;
+
+	if (run->n > 0)
+	{
+		LionSearchKey sk;
+
+		lion_search_key_exact(vs->ix, &sk, run->items[0]);
+		if (lion_cmp_prefix(item, &sk) != 0)
+		{
+			for (i = 0; i < run->n; i++)
+				pfree(run->items[i]);
+			run->n = 0;
+		}
+	}
+
+	for (i = 0; i < run->n; i++)
+	{
+		LionEntryTuple *other = run->items[i];
+		bool		same;
+
+		if (lion_entry_kind(item) != LION_KIND_VALUE)
+			same = true;		/* a second reserved entry of its kind */
+		else
+		{
+			LionState  *col = lion_column(vs->ix, (AttrNumber) item->attno);
+
+			same = lion_keys_equal(col,
+								   lion_fetch_key(col, LionEntryGetKey(other)),
+								   lion_fetch_key(col, LionEntryGetKey(item)));
+		}
+		if (same)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is a second entry for the key of an entry on block %u",
+						RelationGetRelationName(vs->index), off, blk,
+						run->blocks[i]);
+	}
+
+	if (run->n >= run->max)
+	{
+		run->max = (run->max == 0) ? 8 : run->max * 2;
+		if (run->items == NULL)
+		{
+			run->items = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * run->max);
+			run->blocks = (BlockNumber *) palloc(sizeof(BlockNumber) * run->max);
+		}
+		else
+		{
+			run->items = (LionEntryTuple **) repalloc(run->items,
+													  sizeof(LionEntryTuple *) * run->max);
+			run->blocks = (BlockNumber *) repalloc(run->blocks,
+												   sizeof(BlockNumber) * run->max);
+		}
+	}
+	{
+		Size		sz = MAXALIGN(LION_ENTRY_HDRSZ + item->keylen);
+		LionEntryTuple *c = (LionEntryTuple *) palloc(sz);
+
+		memcpy(c, item, LION_ENTRY_HDRSZ + item->keylen);
+		run->items[run->n] = c;
+		run->blocks[run->n] = blk;
+		run->n++;
+	}
+}
+
+/*
  * Walk one level of the directory along its right links.  For an internal
  * level the downlinks and their separators are collected into *children.
  */
@@ -1549,6 +1634,9 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 	BlockNumber blk = first;
 	BlockNumber prev = InvalidBlockNumber;
 	LionEntryTuple *prevhigh = NULL;
+	LionVerifyRun run;
+
+	memset(&run, 0, sizeof(run));
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -1642,7 +1730,10 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			prevkey = lion_verify_copy_item(page, off);
 
 			if (isleaf)
+			{
 				lion_verify_entry(vs, blk, off, iid, page);
+				lion_verify_run_add(vs, &run, item, blk, off);
+			}
 			else
 			{
 				if (children != NULL)

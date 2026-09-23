@@ -319,6 +319,55 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 extern void lion_posting_set_release(LionPostingSet *ps);
 
 /*
+ * Everything needed to probe one key column with values of one search type:
+ * DESIGN.md §21's cross-type resolution, made ONCE and shared by every path
+ * that looks values up - the single and the batched lookup of lion_count.c
+ * and the bitmap scan of lion_scan.c - because they walk the same tree, and a
+ * path that descended where another scans would read the directory in an
+ * order it is not in.
+ *
+ * A value of the index's own type uses the column's hash, equality and (when
+ * the column is ordered) comparison.  A value of another type resolves, in
+ * this order:
+ *
+ *	- UNORDERED column: hash and cross-type equality only - no comparison of
+ *	  any kind, the family's cross-type proc 4 included, may be used on a
+ *	  directory in (kind, hash, bytes) order;
+ *	- the family's cross-type proc 4 (hascmp): descend as usual.  A list is
+ *	  walked only when the family also orders the search type itself (proc 4
+ *	  for (keytype, keytype)), which is what it is sorted with; otherwise each
+ *	  value descends alone (walk = false);
+ *	- a BINARY coercion to the key type (coerce): the value becomes one of the
+ *	  index's own.  A cast function is never taken - implicit is not lossless;
+ *	- neither (needscan): the leaves are walked with the cross-type equality.
+ *
+ * walk says that a list sorted with lion_probe_key_cmp() - sortproc when
+ * hassort, else the hash - is in the directory's order, so it may be located
+ * in one left-to-right leaf walk.
+ */
+typedef struct LionProbe
+{
+	bool		crosstype;		/* the keys are not the index's own type */
+	FmgrInfo	eqproc;			/* crosstype: stored = search comparison */
+	FmgrInfo	hashinfo;		/* crosstype: the search type's own hash */
+	FmgrInfo	cmpproc;		/* stored <=> search (§21) */
+	bool		hascmp;
+	FmgrInfo	sortproc;		/* two SEARCH values, in directory order */
+	bool		hassort;
+	bool		walk;			/* the sorted list is in directory order */
+	int16		typlen;			/* the search type, for datumIsEqual() */
+	bool		typbyval;
+	bool		coerce;			/* binary-coerced to the key type */
+	bool		needscan;		/* no ordering for these values: walk leaves */
+} LionProbe;
+
+extern void lion_probe_init(Relation index, LionState *state, Oid keytype,
+							LionProbe *probe);
+extern bool lion_probe_find(Relation index, LionState *state, LionProbe *probe,
+							Datum value, int lockmode, Buffer *buf,
+							OffsetNumber *off);
+
+/*
  * Count the members of the intersection of nsets already located posting
  * sets, applying snapshot to every heap block that is not all-visible.
  * *stats is accumulated into (not reset) when it is not NULL.

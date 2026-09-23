@@ -1,0 +1,80 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_shape s1_ins s2_ins s3_wakeup s1_check s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_shape: 
+	SELECT ordered, leaf_pages > 2 AS run_spans_leaves, entries
+	  FROM lion_index_stats('dir_race_k');
+
+ordered|run_spans_leaves|entries
+-------+----------------+-------
+f      |t               |    300
+(1 row)
+
+step s1_ins: INSERT INTO dir_race VALUES (1001, 'key-' || lpad('301', 120, '0')); <waiting ...>
+step s2_ins: INSERT INTO dir_race VALUES (1002, 'key-' || lpad('301', 120, '0')); <waiting ...>
+s3: NOTICE:  s2 is waiting for a directory leaf
+step s3_wakeup: 
+	DO $$
+	DECLARE st text;
+	BEGIN
+		FOR i IN 1 .. 3000 LOOP
+			SELECT CASE WHEN state = 'idle' THEN 'finished'
+						WHEN wait_event_type IN ('Buffer', 'LWLock')
+						THEN 'waiting for a directory leaf'
+						ELSE NULL END INTO st
+			  FROM pg_stat_activity
+			 WHERE pid <> pg_backend_pid() AND datname = current_database()
+			   AND query LIKE 'INSERT INTO dir_race VALUES (1002%';
+			EXIT WHEN st IS NOT NULL;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+		RAISE NOTICE 's2 is %', coalesce(st, 'unknown');
+	END $$;
+	SELECT injection_points_detach('lion-dir-add-entry-spanning');
+	SELECT injection_points_wakeup('lion-dir-add-entry-spanning');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_ins: <... completed>
+step s2_ins: <... completed>
+step s1_check: 
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 3000 LOOP
+			EXIT WHEN NOT EXISTS (SELECT FROM pg_stat_activity
+								   WHERE pid <> pg_backend_pid()
+									 AND datname = current_database()
+									 AND state <> 'idle'
+									 AND query LIKE 'INSERT INTO dir_race VALUES (1002%');
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+	SELECT entries,
+		   lion_index_count('dir_race_k', 'key-' || lpad('301', 120, '0')) AS new_key_rows,
+		   lion_index_count('dir_race_k', 'key-' || lpad('300', 120, '0')) AS old_key_rows
+	  FROM lion_index_stats('dir_race_k');
+
+entries|new_key_rows|old_key_rows
+-------+------------+------------
+    301|           2|           1
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('dir_race_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

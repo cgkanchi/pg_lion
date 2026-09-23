@@ -21,7 +21,12 @@
  *	  standby reader that holds a pin therefore blocks replay of the removal
  *	  exactly as it blocks VACUUM on the primary, and the count pushdown may
  *	  trust the visibility map in recovery again (§9's last rule, which the
- *	  generic-WAL path still has to obey);
+ *	  generic-WAL path still has to obey).  The pages VACUUM cleanup-locks
+ *	  WITHOUT changing them travel as a barrier on its next such record
+ *	  (lion_wal_visit(), xl_lion_visit), which redo cleanup-locks first -
+ *	  without it a split, a root push-down or a spill that moved a standby
+ *	  reader's TIDs off the page it pins would let replay remove them
+ *	  elsewhere (§11);
  *	- redo reproduces every page byte for byte, which
  *	  `wal_consistency_checking = 'pg_lion'` proves for the whole regression
  *	  suite.
@@ -43,6 +48,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "access/xact.h"
+#include "storage/relfilelocator.h"
 
 #include "lion.h"
 #include "lion_wal.h"
@@ -60,6 +66,7 @@ typedef struct LionWalBlock
 	Buffer		buf;
 	Page		page;			/* what the caller was handed */
 	uint8		regflags;		/* REGBUF_* */
+	uint8		lflags;			/* LION_WALBUF_* as they apply to this record */
 	StringInfoData ops;			/* the operation stream (rmgr mode only) */
 	Size		lastop;			/* offset of the last op header in ops */
 } LionWalBlock;
@@ -93,7 +100,20 @@ struct LionWalState
 static LionWalState lion_wal_cur;
 static bool lion_wal_open = false;
 static bool lion_wal_removal = false;
+static Buffer lion_wal_removal_buf = InvalidBuffer;
 static MemoryContext lion_wal_cxt = NULL;
+
+/*
+ * The blocks VACUUM cleanup-locked and wrote nothing to since the last record
+ * that carried such a list (lion_wal_visit(), DESIGN.md §11 and §25).  One
+ * relation at a time: ambulkdelete processes one index, and a list for another
+ * relation is simply dropped when a new one starts.
+ */
+static int	lion_wal_visit_flush_at = LION_WAL_VISIT_FLUSH;	/* GUC */
+static RelFileLocator lion_wal_visit_rel;
+static bool lion_wal_visit_have = false;
+static xl_lion_visit *lion_wal_visits = NULL;
+static int	lion_wal_nvisits = 0;
 
 /*
  * An ERROR between lion_wal_begin() and lion_wal_finish() unwinds past both,
@@ -111,6 +131,9 @@ lion_wal_xact_callback(XactEvent event, void *arg)
 	{
 		lion_wal_open = false;
 		lion_wal_removal = false;
+		lion_wal_removal_buf = InvalidBuffer;
+		lion_wal_nvisits = 0;
+		lion_wal_visit_have = false;
 	}
 }
 
@@ -122,6 +145,9 @@ lion_wal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	{
 		lion_wal_open = false;
 		lion_wal_removal = false;
+		lion_wal_removal_buf = InvalidBuffer;
+		lion_wal_nvisits = 0;
+		lion_wal_visit_have = false;
 	}
 }
 
@@ -170,6 +196,8 @@ lion_wal_setup_buffers(void)
 			enlargeStringInfo(&lion_wal_cur.blk[i].ops, LION_WAL_OPS_INITSZ);
 		}
 		lion_wal_cur.savebuf = (char *) palloc(BLCKSZ);
+		lion_wal_visits = (xl_lion_visit *)
+			palloc(sizeof(xl_lion_visit) * LION_WAL_VISIT_FLUSH);
 		MemoryContextSwitchTo(old);
 	}
 }
@@ -188,16 +216,102 @@ lion_wal_mode(Relation index)
 }
 
 void
-lion_wal_removal_begin(void)
+lion_wal_removal_begin(Buffer also)
 {
 	Assert(!lion_wal_removal);
 	lion_wal_removal = true;
+	lion_wal_removal_buf = also;
 }
 
 void
 lion_wal_removal_end(void)
 {
 	lion_wal_removal = false;
+	lion_wal_removal_buf = InvalidBuffer;
+}
+
+/* ---------------------------------------------------------------------
+ * The standby barrier: blocks VACUUM cleanup-locked without changing them
+ * --------------------------------------------------------------------- */
+
+void
+lion_wal_visits_reset(void)
+{
+	lion_wal_nvisits = 0;
+	lion_wal_visit_have = false;
+}
+
+/*
+ * Write the pending list on its own (LION_XLOG_VACUUM_VISIT).  Only reached
+ * when LION_WAL_VISIT_FLUSH ranges have piled up with no removal record to
+ * carry them.  Nothing is modified, so no critical section and no buffer.
+ */
+static void
+lion_wal_visit_flush(void)
+{
+	xl_lion_header hdr;
+
+	Assert(!lion_wal_open);
+	Assert(lion_wal_visit_have && lion_wal_nvisits > 0);
+
+	hdr.initmask = 0;
+	hdr.cleanupmask = 0;
+	hdr.nvisit = (uint16) lion_wal_nvisits;
+
+	XLogBeginInsert();
+	XLogRegisterData(&hdr, (uint32) SizeOfLionHeader);
+	XLogRegisterData(&lion_wal_visit_rel, (uint32) sizeof(RelFileLocator));
+	XLogRegisterData(lion_wal_visits,
+					 (uint32) (SizeOfLionVisit * lion_wal_nvisits));
+	(void) XLogInsert((RmgrId) lion_rmgr_id, LION_XLOG_VACUUM_VISIT);
+
+	lion_wal_nvisits = 0;
+}
+
+void
+lion_wal_visit(Relation index, BlockNumber blk)
+{
+	xl_lion_visit *last;
+
+	Assert(!lion_wal_open);
+
+	/*
+	 * A generic-mode index gives a standby no interlock at all - replay of a
+	 * generic record takes no cleanup lock anywhere - and the count on a
+	 * standby rechecks every TID for it (DESIGN.md §9), so there is nothing
+	 * to carry.  Neither is there for an index whose changes are not logged.
+	 */
+	if (lion_wal_mode(index) != LION_WAL_MODE_RMGR || !RelationNeedsWAL(index))
+		return;
+
+	lion_wal_setup_buffers();
+
+	if (!lion_wal_visit_have ||
+		!RelFileLocatorEquals(lion_wal_visit_rel, index->rd_locator))
+	{
+		lion_wal_visit_rel = index->rd_locator;
+		lion_wal_visit_have = true;
+		lion_wal_nvisits = 0;
+	}
+
+	if (lion_wal_nvisits > 0)
+	{
+		last = &lion_wal_visits[lion_wal_nvisits - 1];
+		if (blk >= last->start && blk - last->start < last->count)
+			return;				/* the same page again */
+		if (last->start + last->count == blk)
+		{
+			last->count++;
+			return;
+		}
+	}
+
+	if (lion_wal_nvisits >= lion_wal_visit_flush_at)
+		lion_wal_visit_flush();
+
+	last = &lion_wal_visits[lion_wal_nvisits++];
+	last->start = blk;
+	last->count = 1;
 }
 
 bool
@@ -224,7 +338,7 @@ lion_wal_begin(Relation index)
 	state->needwal = RelationNeedsWAL(index);
 	state->hdr.initmask = 0;
 	state->hdr.cleanupmask = 0;
-	state->hdr.unused = 0;
+	state->hdr.nvisit = 0;
 	state->savepage = NULL;
 	state->saveoff = InvalidOffsetNumber;
 	state->savelen = 0;
@@ -234,6 +348,7 @@ lion_wal_begin(Relation index)
 		state->blk[i].buf = InvalidBuffer;
 		state->blk[i].page = NULL;
 		state->blk[i].regflags = 0;
+		state->blk[i].lflags = 0;
 		state->blk[i].lastop = 0;
 		resetStringInfo(&state->blk[i].ops);
 	}
@@ -289,13 +404,16 @@ lion_wal_register_buffer(LionWalState *state, Buffer buf, int flags)
 	b->buf = buf;
 
 	/*
-	 * VACUUM's regrow window: the first block of every record written there
+	 * VACUUM's removal window: the first block of every record written there
 	 * is the container page TIDs are leaving, whatever the operation looks
-	 * like (see lion_wal_removal_begin()).
+	 * like, and so is the buffer the window names (see
+	 * lion_wal_removal_begin()).
 	 */
-	if (lion_wal_removal && state->nblocks == 0)
+	if (lion_wal_removal &&
+		(state->nblocks == 0 || buf == lion_wal_removal_buf))
 		flags |= LION_WALBUF_CLEANUP;
 
+	b->lflags = (uint8) flags;
 	if ((flags & LION_WALBUF_INIT) != 0)
 		state->hdr.initmask |= (uint8) (1 << state->nblocks);
 	if ((flags & LION_WALBUF_CLEANUP) != 0)
@@ -573,6 +691,58 @@ lion_wal_register_data(LionWalState *state, const void *ptr, Size len)
 	appendBinaryStringInfo(&state->main, (const char *) ptr, (int) len);
 }
 
+/*
+ * Put the blocks that need a CLEANUP lock at redo first, keeping the order
+ * of each group, and recompute the masks to match.
+ *
+ * Redo takes the blocks in block-id order and holds each until the end of
+ * the record, so a cleanup wait on a block registered after another one would
+ * happen with that other one locked - which §11's waiting rule forbids the
+ * startup process as much as VACUUM.  Every caller but one registers the page
+ * TIDs leave first anyway; the exception is an INLINE spill made by VACUUM,
+ * where that page is the directory leaf and is registered after the posting
+ * set's new root.  Among the cleanup blocks, an existing page comes before a
+ * page this record initialises.  The block ids are only assigned below, at
+ * XLogRegisterBuffer(), so this is a permutation of the state and nothing else.
+ */
+static void
+lion_wal_order_blocks(LionWalState *state)
+{
+	LionWalBlock tmp[LION_WAL_MAX_BLOCKS];
+	int			n = 0;
+	int			pass;
+	int			i;
+
+	if (state->hdr.cleanupmask == 0 || state->hdr.cleanupmask == 1)
+		return;					/* nothing to move, the common case */
+
+	for (pass = 0; pass < 3; pass++)
+	{
+		for (i = 0; i < state->nblocks; i++)
+		{
+			uint8		f = state->blk[i].lflags;
+			bool		cleanup = (f & LION_WALBUF_CLEANUP) != 0;
+			bool		init = (f & LION_WALBUF_INIT) != 0;
+			int			grp = cleanup ? (init ? 1 : 0) : 2;
+
+			if (grp == pass)
+				tmp[n++] = state->blk[i];
+		}
+	}
+	Assert(n == state->nblocks);
+
+	state->hdr.initmask = 0;
+	state->hdr.cleanupmask = 0;
+	for (i = 0; i < n; i++)
+	{
+		state->blk[i] = tmp[i];
+		if ((tmp[i].lflags & LION_WALBUF_INIT) != 0)
+			state->hdr.initmask |= (uint8) (1 << i);
+		if ((tmp[i].lflags & LION_WALBUF_CLEANUP) != 0)
+			state->hdr.cleanupmask |= (uint8) (1 << i);
+	}
+}
+
 void
 lion_wal_finish(LionWalState *state, uint8 info)
 {
@@ -593,9 +763,28 @@ lion_wal_finish(LionWalState *state, uint8 info)
 	if (state->needwal)
 	{
 		XLogRecPtr	recptr;
+		bool		carryvisits = false;
+
+		lion_wal_order_blocks(state);
+
+		/*
+		 * The standby barrier (DESIGN.md §11, §25): a record whose replay
+		 * takes a cleanup lock carries every block VACUUM cleanup-locked and
+		 * left alone since the last such record, and redo locks those first.
+		 */
+		if (state->hdr.cleanupmask != 0 && lion_wal_nvisits > 0 &&
+			lion_wal_visit_have &&
+			RelFileLocatorEquals(lion_wal_visit_rel, state->index->rd_locator))
+		{
+			state->hdr.nvisit = (uint16) lion_wal_nvisits;
+			carryvisits = true;
+		}
 
 		XLogBeginInsert();
 		XLogRegisterData(&state->hdr, (uint32) SizeOfLionHeader);
+		if (carryvisits)
+			XLogRegisterData(lion_wal_visits,
+							 (uint32) (SizeOfLionVisit * lion_wal_nvisits));
 		if (state->main.len > 0)
 			XLogRegisterData(state->main.data, (uint32) state->main.len);
 
@@ -614,6 +803,9 @@ lion_wal_finish(LionWalState *state, uint8 info)
 
 		for (i = 0; i < state->nblocks; i++)
 			PageSetLSN(state->blk[i].page, recptr);
+
+		if (carryvisits)
+			lion_wal_nvisits = 0;
 	}
 
 	END_CRIT_SECTION();
@@ -949,6 +1141,47 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
  * §11's waiting rule, which applies to the startup process exactly as it
  * applies to VACUUM.
  */
+/*
+ * The standby barrier of DESIGN.md §11 and §25: take a CLEANUP lock on every
+ * block of the ranges, one at a time and with nothing else held, and let it
+ * go again.  A standby reader that copied containers out of one of those
+ * pages and still pins it has not finished its visibility-map checks; the
+ * record this barrier travels with (and every heap record after it) waits
+ * until it has, exactly as the primary's VACUUM waited for the same reader's
+ * pin at the same point of its walk.
+ *
+ * Only while hot standby is possible: there is nobody to wait for during
+ * crash recovery or archive recovery before a consistent state.  A block that
+ * does not exist (any more) has nothing to protect.
+ */
+static void
+lion_redo_barrier(RelFileLocator rloc, const char *data, int nvisit)
+{
+	int			i;
+
+	if (!InHotStandby)
+		return;
+
+	for (i = 0; i < nvisit; i++)
+	{
+		xl_lion_visit v;
+		uint32		k;
+
+		memcpy(&v, data + i * SizeOfLionVisit, SizeOfLionVisit);
+		for (k = 0; k < v.count; k++)
+		{
+			Buffer		buf;
+
+			buf = XLogReadBufferExtended(rloc, MAIN_FORKNUM, v.start + k,
+										 RBM_NORMAL_NO_LOG, InvalidBuffer);
+			if (!BufferIsValid(buf))
+				continue;
+			LockBufferForCleanup(buf);
+			UnlockReleaseBuffer(buf);
+		}
+	}
+}
+
 static void
 lion_redo(XLogReaderState *record)
 {
@@ -959,12 +1192,44 @@ lion_redo(XLogReaderState *record)
 	int			maxblk = XLogRecMaxBlockId(record);
 	int			i;
 
-	if (info > LION_XLOG_ENTRY || (info & 0x0F) != 0)
+	if (info > LION_XLOG_VACUUM_VISIT || (info & 0x0F) != 0)
 		elog(PANIC, "pg_lion: unknown record type %u", info);
 
 	if (XLogRecGetDataLen(record) < SizeOfLionHeader)
 		elog(PANIC, "pg_lion: record has no header");
 	memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
+
+	/*
+	 * The barrier first, before any block of this record is locked (see
+	 * xl_lion_visit in lion_wal.h).  A stand-alone VACUUM_VISIT names its
+	 * relation; a barrier riding on a removal record is about the relation
+	 * of that record's blocks.
+	 */
+	if (hdr.nvisit > 0 || info == LION_XLOG_VACUUM_VISIT)
+	{
+		const char *p = XLogRecGetData(record) + SizeOfLionHeader;
+		Size		need = SizeOfLionHeader + SizeOfLionVisit * hdr.nvisit;
+		RelFileLocator rloc;
+
+		if (info == LION_XLOG_VACUUM_VISIT)
+		{
+			need += sizeof(RelFileLocator);
+			if (XLogRecGetDataLen(record) < need)
+				elog(PANIC, "pg_lion: truncated VACUUM_VISIT record");
+			memcpy(&rloc, p, sizeof(RelFileLocator));
+			p += sizeof(RelFileLocator);
+		}
+		else
+		{
+			if (XLogRecGetDataLen(record) < need || maxblk < 0 ||
+				!XLogRecHasBlockRef(record, 0))
+				elog(PANIC, "pg_lion: truncated barrier in record type %u", info);
+			XLogRecGetBlockTag(record, 0, &rloc, NULL, NULL);
+		}
+		lion_redo_barrier(rloc, p, hdr.nvisit);
+		if (info == LION_XLOG_VACUUM_VISIT)
+			return;
+	}
 
 	for (i = 0; i <= maxblk; i++)
 		bufs[i] = InvalidBuffer;
@@ -1076,6 +1341,27 @@ lion_desc(StringInfo buf, XLogReaderState *record)
 	memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
 
 	appendStringInfo(buf, "init %u, cleanup %u", hdr.initmask, hdr.cleanupmask);
+	if (hdr.nvisit > 0)
+	{
+		const char *p = XLogRecGetData(record) + SizeOfLionHeader;
+		uint32		nblk = 0;
+		int			k;
+
+		if ((XLogRecGetInfo(record) & ~XLR_INFO_MASK) == LION_XLOG_VACUUM_VISIT)
+			p += sizeof(RelFileLocator);
+		if (XLogRecGetDataLen(record) >=
+			(p - XLogRecGetData(record)) + SizeOfLionVisit * hdr.nvisit)
+		{
+			for (k = 0; k < hdr.nvisit; k++)
+			{
+				xl_lion_visit v;
+
+				memcpy(&v, p + k * SizeOfLionVisit, SizeOfLionVisit);
+				nblk += v.count;
+			}
+		}
+		appendStringInfo(buf, ", barrier %u ranges %u blocks", hdr.nvisit, nblk);
+	}
 
 	for (i = 0; i <= maxblk; i++)
 	{
@@ -1141,6 +1427,8 @@ lion_identify(uint8 info)
 			return "PAGE_DELETED";
 		case LION_XLOG_ENTRY:
 			return "ENTRY";
+		case LION_XLOG_VACUUM_VISIT:
+			return "VACUUM_VISIT";
 		default:
 			return NULL;
 	}
@@ -1273,6 +1561,23 @@ static const RmgrData lion_rmgr = {
 void
 lion_wal_init(void)
 {
+	/*
+	 * How many ranges of visited blocks VACUUM holds back for the next removal
+	 * record to carry before it writes them in a VACUUM_VISIT record of their
+	 * own (DESIGN.md §25).  A testing knob more than a tuning one: setting it
+	 * to 1 makes every visited block but the first go out stand-alone, which
+	 * is how the recovery harness replays that record type at all.  Defined
+	 * before the preload test below because it is not a postmaster setting.
+	 */
+	DefineCustomIntVariable("pg_lion.vacuum_barrier_ranges",
+							"Visited-block ranges VACUUM batches before writing them on their own.",
+							"The standby barrier of DESIGN.md section 25; rmgr-mode indexes only.",
+							&lion_wal_visit_flush_at,
+							LION_WAL_VISIT_FLUSH, 1, LION_WAL_VISIT_FLUSH,
+							PGC_SUSET,
+							GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
+
 	/*
 	 * Everything here is PGC_POSTMASTER, which core refuses to define once
 	 * the postmaster is up, so a library that is merely LOADed on demand has

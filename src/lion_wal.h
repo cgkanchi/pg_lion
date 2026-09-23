@@ -77,6 +77,7 @@
 #define LION_XLOG_VACUUM_PAGE		0x90	/* VACUUM's per-page removals */
 #define LION_XLOG_PAGE_DELETED		0xA0	/* a page handed to the FSM */
 #define LION_XLOG_ENTRY				0xB0	/* entry add/replace/delete */
+#define LION_XLOG_VACUUM_VISIT		0xC0	/* cleanup-lock barrier, no change */
 
 /* ---------- the per-block operation stream ---------- */
 
@@ -151,10 +152,44 @@ typedef struct xl_lion_header
 {
 	uint8		initmask;		/* bit b: block b is initialised by this record */
 	uint8		cleanupmask;	/* bit b: redo needs a CLEANUP lock on block b */
-	uint16		unused;
+	uint16		nvisit;			/* xl_lion_visit ranges following the header */
 } xl_lion_header;
 
 #define SizeOfLionHeader		((Size) sizeof(xl_lion_header))
+
+/*
+ * VACUUM's cleanup-lock BARRIER on a standby (DESIGN.md §11, §25).
+ *
+ * ambulkdelete takes a cleanup lock on every page that can hold a TID and on
+ * every page of each posting tree's descent, in chain order, whether or not
+ * it removes anything there - and a page it changes nothing on writes no
+ * record.  Replay would then never wait for a standby reader's pin on such a
+ * page, and a split (or a root push-down, or an INLINE spill) that moved the
+ * TIDs that reader copied onto a page VACUUM does change would let replay
+ * remove them under it.
+ *
+ * So VACUUM remembers the blocks it cleanup-locked without writing to them
+ * (lion_wal_visit()), and the next record it writes that takes a cleanup lock
+ * at redo carries them: `nvisit` ranges of consecutive blocks right after the
+ * header, which redo cleanup-locks one at a time, with nothing else held,
+ * BEFORE it touches the record's own blocks.  This is the economical form of
+ * nbtree's old XLOG_BTREE_VACUUM lastBlockVacuumed: no record of its own in
+ * the common case, and a page range per run of consecutive blocks.  A list
+ * that grows past LION_WAL_VISIT_FLUSH ranges before anything carries it goes
+ * out on its own in a LION_XLOG_VACUUM_VISIT record, whose main data is the
+ * header, the relation's RelFileLocator and the ranges, and which has no
+ * registered block.  Blocks visited after the last removal of an ambulkdelete
+ * need no barrier - every dead TID of this cycle has been removed by then -
+ * and are dropped.
+ */
+typedef struct xl_lion_visit
+{
+	uint32		start;			/* first block */
+	uint32		count;			/* consecutive blocks from start */
+} xl_lion_visit;
+
+#define SizeOfLionVisit			((Size) sizeof(xl_lion_visit))
+#define LION_WAL_VISIT_FLUSH	1024	/* ranges per stand-alone record */
 
 /* ---------- flags for lion_wal_register_buffer() ---------- */
 
@@ -251,8 +286,27 @@ extern void lion_wal_abort(LionWalState *state);
  * function signatures because it is a property of the CALLER (VACUUM holds a
  * cleanup lock on that page throughout) and not of the operation.
  */
-extern void lion_wal_removal_begin(void);
+extern void lion_wal_removal_begin(Buffer also);
 extern void lion_wal_removal_end(void);
+
+/*
+ * `also`, when valid, is a buffer TIDs leave although it is not the first one
+ * a record registers: the directory leaf of an INLINE entry that VACUUM's
+ * filtering made spill (DESIGN.md §18, §25), whose rewrite is the last buffer
+ * of the spill's record.  Every record inside the window that registers it
+ * marks it too.  Whatever the order of registration, lion_wal_finish() puts
+ * the blocks that need a cleanup lock at redo FIRST, so that the wait happens
+ * with no other buffer lock held.
+ */
+
+/*
+ * The standby barrier (see xl_lion_visit above).  lion_wal_visit() records a
+ * block VACUUM holds a cleanup lock on and writes nothing to; a no-op for a
+ * generic-mode or unlogged index.  lion_wal_visits_reset() forgets the list,
+ * at the start and the end of ambulkdelete.
+ */
+extern void lion_wal_visit(Relation index, BlockNumber blk);
+extern void lion_wal_visits_reset(void);
 
 /* The wal_mode of an index, from its (cached) meta page. */
 extern int lion_wal_mode(Relation index);

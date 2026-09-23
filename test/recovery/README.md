@@ -154,6 +154,33 @@ finish a half-applied two-pass bulkdelete. After every restart:
   battery again on the promoted node, exact `ntids` after a `VACUUM`, and
   `lion_index_count_stats()` showing it trusting the visibility map again.
 
+**Phase 3, a standby reader holding its pin** (DESIGN.md §9, §11, §25). A
+standby of its own (phase 2 promoted the first one), with
+`max_standby_streaming_delay = -1`, and three cases, each of which parks a
+standby `lion_index_count()` at the injection point
+`lion-count-containers-pinned` - containers copied, page pinned, visibility map
+not yet consulted - and then has the primary move the TIDs it copied off that
+page and VACUUM them there:
+
+* **split**: the reader pins the leftmost leaf of a posting tree; inserts grow
+  that leaf's first container until it splits, which moves the containers
+  holding dead TIDs to the new right sibling, and the VACUUM removes them
+  there. The primary's VACUUM cleanup-locks the pinned leaf but writes nothing
+  for it. Runs with `pg_lion.vacuum_barrier_ranges = 1`, so the barrier goes
+  out in stand-alone VACUUM_VISIT records.
+* **pushdown**: the reader pins a one-page posting set's root; an insert
+  pushes it down and the VACUUM cleans the child.
+* **spill**: the reader pins a directory leaf for an INLINE set; the VACUUM's
+  own filtering makes the payload outgrow the entry and spill.
+
+The run then waits until replay is either BLOCKED (the startup process waiting
+for a cleanup lock) or has replayed past the primary's last record, releases
+the reader and compares its count with the one its snapshot must see. In rmgr
+mode replay must have blocked; in generic mode it catches up and the count must
+still be right (the standby rechecks every TID). A failing case is reported and
+the other cases still run. `PHASE3_CASES="split spill"` in the environment runs
+a subset, and `--phases 3` skips phases 1 and 2.
+
 ## What is not covered
 
 * **No torn-page test.** Nothing here interrupts a page write in the middle.

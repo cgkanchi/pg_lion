@@ -460,8 +460,9 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 /*
  * The key is not in the index yet: add an INLINE entry with a single one-pair
  * sparse segment at the place the descent said it belongs (DESIGN.md §21).
- * *leafbuf is held EXCLUSIVE and stays so, though a re-descent inside
- * lion_dir_add_entry() may replace it with another leaf.  reservedflag makes
+ * *leafbuf is held EXCLUSIVE and stays so - it has been held since the
+ * unsuccessful lookup, which is what makes find-or-create one serialised
+ * operation (lion_dir_add_entry()).  reservedflag makes
  * it one of the two key-less entries of §14 and §17.
  */
 static void
@@ -695,6 +696,27 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 			if (LION_RUN_NRUNS(onpage) >= LION_RUN_MAX_NRUNS)
 				return false;	/* would become a bitset */
 			need = lion_container_size(onpage) + sizeof(LionRun);
+
+			/*
+			 * A member that closes the one-value gap between two runs MERGES
+			 * them, and the container comes out a run SHORTER while the item
+			 * keeps its allotment.  In place, a stream of such inserts would
+			 * grow the unused tail of the item without bound; the slack an
+			 * item may carry is LION_ITEM_SLACK_BOUND, the rule VACUUM's
+			 * shrink-in-place already follows (DESIGN.md §4, §18).  So a
+			 * merge that would take the item past it is left to the general
+			 * path, which rewrites the item at its logical size plus normal
+			 * growth slack.  Nothing else shrinks a container in place: an
+			 * ARRAY and a new run only grow, an extended run and a BITSET
+			 * keep their size.
+			 */
+			if (lo > 0 && lo < LION_LO_MASK &&
+				lion_container_contains(onpage, (uint16) (lo - 1)) &&
+				lion_container_contains(onpage, (uint16) (lo + 1)) &&
+				!lion_container_contains(onpage, lo) &&
+				alloc > lion_container_size(onpage) - sizeof(LionRun) +
+				LION_ITEM_SLACK_BOUND)
+				return false;
 			break;
 
 		default:

@@ -11,10 +11,21 @@
  *	  ambulkdelete takes LockBufferForCleanup() on every directory LEAF and on
  *	  every container page of every chain it walks, whether or not that page
  *	  has anything to remove, and it takes them in chain order (the leaves
- *	  left to right from the leftmost one, then each container chain left to
- *	  right).  Internal directory pages are NOT cleanup-locked, and need not
- *	  be: they hold no TIDs, so no reader can be holding a container copy that
- *	  came from one (DESIGN.md §11, §21).  This is the rule
+ *	  left to right from the leftmost one, then each posting tree top-down
+ *	  from its ROOT to its leftmost leaf and then its leaves left to right).
+ *	  Internal directory pages are NOT cleanup-locked, and need not be: they
+ *	  hold no TIDs and a directory page never changes level, so no reader can
+ *	  be holding a container copy that came from one (DESIGN.md §11, §21).
+ *	  The pages of a posting tree's descent ARE, because a posting set's root
+ *	  is a leaf while the set fits one page and stops being one when an insert
+ *	  pushes it down (§22): a reader's pin on it must stop VACUUM before it
+ *	  reaches the child the containers moved to (lion_vacuum_descend()).
+ *
+ *	  A page VACUUM cleanup-locks and leaves unchanged writes no WAL, so on a
+ *	  hot standby replay would never wait for a reader's pin on it; every such
+ *	  page is therefore handed to lion_wal_visit(), and the next record that
+ *	  takes a cleanup lock at redo carries the list as a BARRIER that redo
+ *	  cleanup-locks first (DESIGN.md §25).  This is the rule
  *	  nbtree's btvacuumscan follows, and it is what makes the interlock of
  *	  DESIGN.md section 9 airtight.  A reader pins page P, copies container C
  *	  out and drops the content lock; a concurrent insert may then split P and
@@ -314,6 +325,8 @@ static void lion_vacuum_delete_entries(LionVacState *vs, Buffer buf,
 									  LionVacEntry *ents, int nents);
 static void lion_vacuum_chain(LionVacState *vs, Buffer entrybuf,
 							 LionVacEntry *ent);
+static BlockNumber lion_vacuum_descend(LionVacState *vs,
+									   const LionVacEntry *ent);
 static BlockNumber lion_vacuum_container_page(LionVacState *vs,
 											 LionVacEntryRef *ref,
 											 const LionVacEntry *ent,
@@ -421,6 +434,13 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	lion_vac_visit(&vs, LION_METAPAGE_BLKNO);
 
 	/*
+	 * The standby barrier (DESIGN.md §11, §25) starts empty for this index;
+	 * whatever is left of it at the end - blocks visited after the last
+	 * removal - protects nothing and is dropped.
+	 */
+	lion_wal_visits_reset();
+
+	/*
 	 * VACUUM does not run in a short-lived context, so all per-bucket work
 	 * goes into a context that is reset between buckets, and the (possibly
 	 * long) walk of a container chain into one that is reset per page.
@@ -462,6 +482,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * blocks the walk accounted for, which in a healthy index is all of them.
 	 */
 	lion_vacuum_sweep(&vs);
+	lion_wal_visits_reset();
 
 	MemoryContextDelete(vs.bucketcxt);
 	MemoryContextDelete(vs.pagecxt);
@@ -890,6 +911,7 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		Page		p = lion_wal_register_buffer(xstate, buf,
 												 LION_WALBUF_CLEANUP);
 		int			nwritten = 0;
+		int			nspill = 0;
 
 		for (i = 0; i < ninl; i++)
 		{
@@ -928,16 +950,44 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		 * record of its own each.  This is rare (it needs a RUN container to
 		 * turn into a BITSET while losing members), so it is not worth
 		 * batching, and lion_entry_spill() rewrites the entry itself.
+		 *
+		 * The payload it spills is the FILTERED one, so the rewrite of the
+		 * entry on this leaf is where this entry's dead TIDs leave the
+		 * index - and when every changed entry spills, the record above was
+		 * abandoned and this is the only record that says so.  The spill
+		 * machinery is the INSERT path's and cannot know it, so the removal
+		 * window marks this leaf for a CLEANUP lock at redo in every record
+		 * the spill writes (DESIGN.md §25): a standby reader pinning the
+		 * leaf for its INLINE copy then holds replay off exactly as it holds
+		 * this VACUUM off here.
 		 */
 		for (i = 0; i < ninl; i++)
 		{
 			if (!inl[i].spill)
 				continue;
+			lion_wal_removal_begin(buf);
 			lion_entry_spill(vs->index, vs->heaprel, buf, inl[i].off,
 							inl[i].tuple, inl[i].payload, inl[i].paylen);
+			lion_wal_removal_end();
+			nspill++;
 			vs->prof.records++;
 			vs->prof.entries_rewritten++;
 		}
+
+		if (nwritten == 0 && nspill == 0)
+			lion_wal_visit(vs->index, blk);
+	}
+	else
+	{
+		/*
+		 * Nothing on this leaf changed, so nothing about it goes into the WAL
+		 * - but a standby reader may be pinning it for an INLINE posting set
+		 * whose TIDs an insert has since moved elsewhere (a spill, a split of
+		 * the leaf), and replay must not remove them there before that reader
+		 * is done: the leaf joins the barrier the next removal record
+		 * carries (DESIGN.md §11, §25).
+		 */
+		lion_wal_visit(vs->index, blk);
 	}
 	lion_vac_tick(&vs->prof.inlinework, t0);
 
@@ -972,6 +1022,97 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 }
 
 /*
+ * Descend ent's posting tree from its root to the leftmost leaf, taking a
+ * CLEANUP lock on every internal page on the way, and return the leaf's
+ * block.  Nothing is held on entry or on return, so every wait is
+ * interruptible (rule 2 of the file header).
+ *
+ * Why the internal pages, which hold no TIDs (DESIGN.md §11, §22): the ROOT
+ * of a posting set is a leaf for as long as the set fits one page, and a
+ * reader that copied containers out of it pins it until its visibility-map
+ * checks are done.  An insert that overflows it pushes it down - the
+ * containers go to a brand new child and the root block becomes an internal
+ * page - and only needs an exclusive content lock to do so, which the pin does
+ * not stop.  A VACUUM that took no lock on the root would then clean those
+ * containers on the child and finish while the reader still holds its copy,
+ * and the heap would be marked all-visible under it.  With the cleanup lock
+ * the reader's pin stops this VACUUM at the root, before it can reach the
+ * child, which is the §11 argument applied to the one page that can change
+ * from leaf to internal.  Every other page keeps its level for life (a split
+ * creates a new page at the level of the page it splits), so the internal
+ * pages below the root are locked for uniformity and cost: there are one per
+ * several hundred leaves.
+ *
+ * The leaf the descent ends on is let go again and returned:
+ * lion_vacuum_container_page() takes its own cleanup lock on it, and notices
+ * if it has been pushed down in between.  The internal pages join the
+ * standby barrier (lion_wal_visit()): replay has to wait for a standby
+ * reader's pin on an old root exactly as this VACUUM does.
+ */
+static BlockNumber
+lion_vacuum_descend(LionVacState *vs, const LionVacEntry *ent)
+{
+	BlockNumber blk = ent->head;
+	int			depth = 0;
+
+	for (;;)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber first;
+		BlockNumber child;
+		instr_time	t0;
+
+		buf = ReadBuffer(vs->index, blk);
+		INSTR_TIME_SET_CURRENT(t0);
+		LockBufferForCleanup(buf);
+		lion_vac_tick(&vs->prof.cleanup_wait, t0);
+		page = BufferGetPage(buf);
+
+		/*
+		 * VACUUM is the only thing that frees a posting set, and it does not
+		 * free the one it is walking, so a page that no longer claims the set
+		 * is corruption rather than a race (as in lion_vacuum_filter_page()).
+		 */
+		if (!lion_page_owns_entry(page, ent->hash, ent->head))
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR, "lion index \"%s\": block %u is not a page of the posting set at %u",
+				 RelationGetRelationName(vs->index), blk, ent->head);
+		}
+
+		if (LionPageIsPostingLeaf(page))
+		{
+			UnlockReleaseBuffer(buf);
+			return blk;
+		}
+
+		/*
+		 * The leftmost downlink: the first item after the high key, whose
+		 * separator is minus infinity on the leftmost page of every level.
+		 * A split of this page moves its UPPER half away, so the leftmost
+		 * downlink stays here.
+		 */
+		first = lion_posting_first_data(page);
+		if (first > PageGetMaxOffsetNumber(page) ||
+			depth > LION_POSTING_MAX_HEIGHT)
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR, "lion index \"%s\": internal posting page %u of the set at %u has no downlink",
+				 RelationGetRelationName(vs->index), blk, ent->head);
+		}
+		child = lion_posting_pivot(page, first)->child;
+		lion_vac_visit(vs, blk);
+		UnlockReleaseBuffer(buf);
+		lion_wal_visit(vs->index, blk);
+
+		blk = child;
+		depth++;
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
  * Pass 2 for one CHAIN entry: walk its container chain from head, left to
  * right, holding no page lock between pages.  entrybuf is the directory leaf
  * pass 1 found the entry on, pinned and not locked; the entry may MOVE while
@@ -989,11 +1130,15 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	 * DESIGN.md §22: the entry's head block is the ROOT of the posting tree,
 	 * and the leaves - the only pages that hold TIDs - are still one
 	 * rightlinked list in ckey order, so the walk below is what it always was
-	 * once it has descended to the leftmost of them.  Internal pages are not
-	 * cleanup-locked and need not be (§11: they hold no TIDs), and they are
-	 * never empty while the set lives, so the leak sweep leaves them alone.
+	 * once it has descended to the leftmost of them.  The descent itself
+	 * takes a CLEANUP lock on every page it passes, the root first: a root
+	 * that was a LEAF when a reader copied its containers may have been
+	 * pushed down since, and the reader's pin on it is what has to stop this
+	 * VACUUM before it reaches the child those containers moved to
+	 * (DESIGN.md §11).  Internal pages are never empty while the set lives,
+	 * so the leak sweep leaves them alone.
 	 */
-	blk = lion_posting_leftmost_leaf(vs->index, ent->hash, ent->head);
+	blk = lion_vacuum_descend(vs, ent);
 	lion_vac_visit(vs, ent->head);
 
 	ref.buf = entrybuf;
@@ -1512,11 +1657,16 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 		 */
 		if (!LionPageIsPostingLeaf(BufferGetPage(buf)))
 		{
+			/*
+			 * On a standby the same holds only if replay waits for the same
+			 * pins, so the old root joins the barrier (DESIGN.md §25).
+			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			ReleaseBuffer(buf);
+			lion_wal_visit(vs->index, blk);
 			MemoryContextSwitchTo(oldcxt);
 			MemoryContextReset(vs->pagecxt);
-			return lion_posting_leftmost_leaf(vs->index, ent->hash, ent->head);
+			return lion_vacuum_descend(vs, ent);
 		}
 
 		INSTR_TIME_SET_CURRENT(t0);
@@ -1525,8 +1675,14 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 
 		if (w.nwork == 0 && w.ndel == 0)
 		{
-			/* Nothing to remove: no WAL record, and no entry page needed. */
+			/*
+			 * Nothing to remove: no WAL record, and no entry page needed.
+			 * The page still joins the standby barrier: a reader pinning it
+			 * may hold a copy of containers a split has since moved right,
+			 * onto a page this VACUUM is about to clean (DESIGN.md §11, §25).
+			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			lion_wal_visit(vs->index, blk);
 			break;
 		}
 
@@ -1584,6 +1740,8 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 			}
 			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			if (w.nwork == 0 && w.ndel == 0)
+				lion_wal_visit(vs->index, blk);
 			break;
 		}
 
@@ -1887,7 +2045,8 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		if (!LionPageIsPostingLeaf(page))
 		{
 			UnlockReleaseBuffer(buf);
-			blk = lion_posting_leftmost_leaf(index, ent->hash, ent->head);
+			lion_wal_visit(index, blk);
+			blk = lion_vacuum_descend(vs, ent);
 			if (!BlockNumberIsValid(blk))
 				elog(ERROR, "lion index: container %u of a posting set at %u vanished from it",
 					 ckey, ent->head);
@@ -1902,9 +2061,11 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		{
 			/*
 			 * A split moved the container to the right.  Containers are only
-			 * ever removed by this vacuum, so it is still in the chain.
+			 * ever removed by this vacuum, so it is still in the chain.  The
+			 * page it moved off joins the standby barrier (DESIGN.md §25).
 			 */
 			UnlockReleaseBuffer(buf);
+			lion_wal_visit(index, blk);
 			if (!BlockNumberIsValid(next))
 				elog(ERROR, "lion index: container %u of a chain at %u vanished from it",
 					 ckey, ent->head);
@@ -2011,7 +2172,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 				 * same lock.  The machinery below is shared with the INSERT
 				 * path and cannot know that, so the window says so.
 				 */
-				lion_wal_removal_begin();
+				lion_wal_removal_begin(buf);
 				lion_chain_put_container_locked(index, vs->heaprel, buf,
 											   entrybuf, entryoff,
 											   ecopy, vs->cbuf, &delta);
@@ -2026,6 +2187,8 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 
 		LockBuffer(entrybuf, BUFFER_LOCK_UNLOCK);
 		UnlockReleaseBuffer(buf);
+		if (nremoved == 0)
+			lion_wal_visit(index, blk);
 		pfree(ecopy);
 		return;
 	}
