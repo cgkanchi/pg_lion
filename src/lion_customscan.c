@@ -6014,10 +6014,10 @@ lion_distinct_test(LionCountScanState *st, int nsource,
 	if (count)
 		return lion_count_sources_cached(st->heap, estate->es_snapshot,
 										 nsource, sources, &st->stats,
-										 st->viscache);
+										 st->viscache, st->rel_read_only);
 	return lion_exists_sources_cached(st->heap, estate->es_snapshot,
 									  nsource, sources, &st->stats,
-									  st->viscache) ? 1 : 0;
+									  st->viscache, st->rel_read_only) ? 1 : 0;
 }
 
 /*

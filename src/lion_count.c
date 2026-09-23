@@ -4164,7 +4164,8 @@ lion_sources_one_set(int nsources, const LionCountSource *sources)
 static int64 lion_count_sources_run(Relation heap, Snapshot snapshot,
 									int nsources, LionCountSource *sources,
 									LionCountStats *stats,
-									LionVisCache *cache, bool exists);
+									LionVisCache *cache, bool rel_read_only,
+									bool exists);
 
 int64
 lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
@@ -4172,22 +4173,22 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 						 LionVisCache *cache, bool rel_read_only)
 {
 	return lion_count_sources_run(heap, snapshot, nsources, sources, stats,
-								  cache, false);
+								  cache, rel_read_only, false);
 }
 
 bool
 lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 						  LionCountSource *sources, LionCountStats *stats,
-						  LionVisCache *cache)
+						  LionVisCache *cache, bool rel_read_only)
 {
 	return lion_count_sources_run(heap, snapshot, nsources, sources, stats,
-								  cache, true) > 0;
+								  cache, rel_read_only, true) > 0;
 }
 
 static int64
 lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 					   LionCountSource *sources, LionCountStats *stats,
-					   LionVisCache *cache, bool exists)
+					   LionVisCache *cache, bool rel_read_only, bool exists)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;

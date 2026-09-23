@@ -415,7 +415,8 @@ extern int64 lion_count_sources_cached(Relation heap, Snapshot snapshot,
 extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
 									   int nsources, LionCountSource *sources,
 									   LionCountStats *stats,
-									   LionVisCache *cache);
+									   LionVisCache *cache,
+									   bool rel_read_only);
 
 /*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and
