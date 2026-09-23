@@ -59,11 +59,15 @@
 #include "catalog/index.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "port/pg_bitutils.h"
@@ -4861,6 +4865,69 @@ typedef struct LionCountCall
  * be NULL, which means the caller has no search key at all (the grouped form
  * below, which walks every entry instead of looking one up).
  */
+/*
+ * An index's expressions or predicate AS STORED in pg_index, NIL when it has
+ * none.  RelationGetIndexExpressions()/RelationGetIndexPredicate() hand back
+ * the planner's simplified form, in which an inlinable SQL function has
+ * already been replaced by its body - which is right for evaluating it and
+ * wrong for asking which functions the query calls.
+ */
+static List *
+lion_index_stored_exprs(Relation index, int attnum)
+{
+	HeapTuple	tup;
+	Datum		d;
+	bool		isnull;
+	List	   *result = NIL;
+
+	tup = SearchSysCache1(INDEXRELID,
+						  ObjectIdGetDatum(RelationGetRelid(index)));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for index %u",
+			 RelationGetRelid(index));
+	d = SysCacheGetAttr(INDEXRELID, tup, attnum, &isnull);
+	if (!isnull)
+	{
+		void	   *node = stringToNode(TextDatumGetCString(d));
+
+		result = (attnum == Anum_pg_index_indpred) ?
+			make_ands_implicit((Expr *) node) : (List *) node;
+	}
+	ReleaseSysCache(tup);
+
+	return result;
+}
+
+/*
+ * EXECUTE on every function an index expression or predicate calls
+ * (lion_count_open_indexes()): the same question the executor asks of the
+ * query the count stands for, in the same walk core uses to find the
+ * functions of an expression.
+ */
+static bool
+lion_check_function_acl(Oid funcid, void *context)
+{
+	if (object_aclcheck(ProcedureRelationId, funcid, GetUserId(),
+						ACL_EXECUTE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_FUNCTION,
+					   get_func_name(funcid));
+	return false;
+}
+
+static bool
+lion_check_functions_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	/* the stored form has not been through the planner's fix_opfuncids() */
+	if (IsA(node, OpExpr) || IsA(node, DistinctExpr) || IsA(node, NullIfExpr))
+		set_opfuncid((OpExpr *) node);
+	else if (IsA(node, ScalarArrayOpExpr))
+		set_sa_opfuncid((ScalarArrayOpExpr *) node);
+	(void) check_functions_in_node(node, lion_check_function_acl, context);
+	return expression_tree_walker(node, lion_check_functions_walker, context);
+}
+
 static void
 lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					   const Oid *keytype, AttrNumber wantcol,
@@ -4971,16 +5038,34 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	 * `(id) WHERE secret` answers 1 or 0 and so reveals `secret` a row at a
 	 * time (2026-09-23 review).  An expression column reads whatever its
 	 * expression does, and a whole-row reference reads every column, which
-	 * only a table-level grant covers.
+	 * only a table-level grant covers.  An index that reads NO column at all
+	 * - one on a constant - stands for `SELECT count(*) FROM t`, which needs
+	 * SELECT on the table or on at least one of its columns, and the same
+	 * rule applies here.
+	 *
+	 * And the query CALLS every function in the index's expressions and
+	 * predicate, which needs EXECUTE on each of them whatever the table
+	 * grants say; so does the count, or it would let a caller probe the
+	 * results of a function it may not run.
 	 */
-	if (pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
 	{
+		bool		tablesel = pg_class_aclcheck(heapoid, GetUserId(),
+												 ACL_SELECT) == ACLCHECK_OK;
+
 		for (i = 0; i < nidx; i++)
 		{
 			Relation	index = call->index[i];
+			List	   *exprs = lion_index_stored_exprs(index, Anum_pg_index_indexprs);
+			List	   *pred = lion_index_stored_exprs(index, Anum_pg_index_indpred);
 			Bitmapset  *cols = NULL;
 			int			c;
 			int			m;
+
+			(void) lion_check_functions_walker((Node *) exprs, NULL);
+			(void) lion_check_functions_walker((Node *) pred, NULL);
+
+			if (tablesel)
+				continue;
 
 			/* EVERY key column is referenced, not just the first (§24). */
 			for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
@@ -4991,8 +5076,18 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					cols = bms_add_member(cols,
 										  attnum - FirstLowInvalidHeapAttributeNumber);
 			}
-			pull_varattnos((Node *) RelationGetIndexExpressions(index), 1, &cols);
-			pull_varattnos((Node *) RelationGetIndexPredicate(index), 1, &cols);
+			pull_varattnos((Node *) exprs, 1, &cols);
+			pull_varattnos((Node *) pred, 1, &cols);
+
+			if (bms_is_empty(cols))
+			{
+				if (pg_attribute_aclcheck_all(heapoid, GetUserId(), ACL_SELECT,
+											  ACLMASK_ANY) != ACLCHECK_OK)
+					aclcheck_error(ACLCHECK_NO_PRIV,
+								   get_relkind_objtype(call->heap->rd_rel->relkind),
+								   RelationGetRelationName(call->heap));
+				continue;
+			}
 
 			m = -1;
 			while ((m = bms_next_member(cols, m)) >= 0)

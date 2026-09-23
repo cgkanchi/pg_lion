@@ -101,6 +101,43 @@ SET ROLE lion_sec_reader;
 SELECT lion_index_count('lion_sec_p_id', 2) AS even, lion_index_count('lion_sec_p_id', 3) AS odd;
 RESET ROLE;
 DROP TABLE lion_sec_p;
+-- ---------- an index that reads NO column, and functions in index expressions ----------
+-- A query that references no column at all (SELECT count(*) FROM t) needs
+-- SELECT on the table or on at least one column, and so does the count of
+-- an index on a constant.  An index expression or predicate that calls a
+-- function makes the query call it too, which needs EXECUTE on it whatever
+-- the table grants say (2026-09-23 review, second round).
+CREATE TABLE lion_sec_c (id int NOT NULL, other int NOT NULL);
+INSERT INTO lion_sec_c SELECT g, g FROM generate_series(1, 1000) g;
+CREATE INDEX lion_sec_c_one ON lion_sec_c USING lion ((1));
+CREATE FUNCTION lion_sec_fn(int) RETURNS int IMMUTABLE LANGUAGE sql AS 'SELECT $1 % 7';
+REVOKE EXECUTE ON FUNCTION lion_sec_fn(int) FROM PUBLIC;
+CREATE INDEX lion_sec_c_fn ON lion_sec_c USING lion (lion_sec_fn(id));
+CREATE INDEX lion_sec_c_pred ON lion_sec_c USING lion (other) WHERE lion_sec_fn(id) = 3;
+VACUUM ANALYZE lion_sec_c;
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_c_one', 1);                -- denied: no privilege at all
+SELECT lion_index_count_any('lion_sec_c_one', ARRAY[1]);
+SELECT * FROM lion_index_count_group_stats('lion_sec_c_one');
+SELECT count(*) FROM lion_sec_c;                              -- as the plain count is
+RESET ROLE;
+GRANT SELECT (other) ON lion_sec_c TO lion_sec_reader;      -- any one column will do
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_c_one', 1) AS constant_index;
+RESET ROLE;
+GRANT SELECT ON lion_sec_c TO lion_sec_reader;              -- the whole table, but no EXECUTE
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_c_fn', 3);                  -- denied: the expression calls lion_sec_fn
+SELECT count(*) FROM lion_sec_c WHERE lion_sec_fn(id) = 3;    -- as the query does
+SELECT lion_index_count('lion_sec_c_pred', 3);                -- and through a predicate
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION lion_sec_fn(int) TO lion_sec_reader;
+SET ROLE lion_sec_reader;
+SELECT lion_index_count('lion_sec_c_fn', 3) = (SELECT count(*) FROM lion_sec_c WHERE lion_sec_fn(id) = 3) AS expression_ok,
+       lion_index_count('lion_sec_c_pred', 3) = (SELECT count(*) FROM lion_sec_c WHERE lion_sec_fn(id) = 3 AND other = 3) AS predicate_ok;
+RESET ROLE;
+DROP TABLE lion_sec_c;
+DROP FUNCTION lion_sec_fn(int);
 -- ---------- the diagnostic functions are not for every role (2026-09-23 review, finding 2) ----------
 -- lion_index_posting_root() answers "is this key in the index" for any key,
 -- lion_index_stats() gives row and key counts, lion_index_verify() reads the

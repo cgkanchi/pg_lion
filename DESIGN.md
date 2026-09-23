@@ -617,7 +617,11 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   table, or SELECT on every column the index reads - its key columns, the columns of its
   expressions and of its PREDICATE (a partial index's count is `... WHERE pred AND col = key`, so
   SELECT(id) alone on `(id) WHERE secret` would reveal `secret` a row at a time; a whole-row
-  reference needs the table-level grant); otherwise `permission denied` (2026-09-23 review). The
+  reference needs the table-level grant; an index that reads no column at all, one on a constant,
+  needs SELECT on at least one column, as `SELECT count(*) FROM t` does); otherwise `permission
+  denied` (2026-09-23 review). EXECUTE is required on every function the index's expressions and
+  predicate call, read from pg_index as stored - the relcache's copies are planner-simplified,
+  with inlinable SQL functions already replaced by their bodies - whatever the table grants. The
   CustomScan path is covered by the executor's own ExecCheckPermissions on the range table, and a
   partial index reaches it only when the query implies the predicate, i.e. references it. The
   diagnostic functions check neither privileges nor RLS - `lion_index_posting_root()` answers key
