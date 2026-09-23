@@ -168,6 +168,12 @@ typedef struct LionCountCtx
 	int			batchmax;		/* flush the list once it holds this many */
 	bool		tids_sorted;	/* they came out in order (they always do) */
 	int64		recheck_count;	/* rows counted by the batches flushed so far */
+
+	/*
+	 * An EXISTENCE test rather than a count (DESIGN.md §26): stop at the first
+	 * row known to be visible.  lion_exists_settled() is the only reader.
+	 */
+	bool		exists;
 } LionCountCtx;
 
 /*
@@ -263,6 +269,7 @@ typedef struct LionSetCursor
 static void lion_cursor_next(LionSetCursor *cur);
 static void lion_cursor_seek(LionSetCursor *cur, uint32 target);
 static void lion_recheck_flush(LionCountCtx *cx);
+static bool lion_exists_settled(LionCountCtx *cx);
 
 /*
  * How far a cursor walks right before it gives up and descends instead
@@ -3315,6 +3322,10 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
  * which is the one thing that unpins the page the container was copied from.
  * The set's OWN pin (an inline entry's) is the caller's and is not touched
  * here: lion_cursor_init() borrows it and lion_cursor_close() leaves it.
+ *
+ * An existence test (DESIGN.md §26) stops after the first container that
+ * settles it; the cursor has moved on by then, which is where the §9 ordering
+ * says it may.
  */
 static void
 lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
@@ -3326,9 +3337,50 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 	{
 		lion_count_container_vm(cx, cur.cur);
 		lion_cursor_next(&cur);
+		if (lion_exists_settled(cx))
+			break;
 		CHECK_FOR_INTERRUPTS();
 	}
 	lion_cursor_close(&cur);
+}
+
+/*
+ * Is an EXISTENCE test answered yet (DESIGN.md §26)?  Always false for a
+ * count.  Called by the merge after each container it has put through the
+ * visibility map - so after lion_count_container_vm() has asked its question
+ * under the source pins, which is the whole of the DESIGN.md §9 obligation -
+ * and never anywhere else.
+ *
+ *	- A member on an all-visible block (cx->count > 0) is a visible row, by
+ *	  exactly the argument that lets a count add it: the settle is immediate,
+ *	  and the recheck TIDs the same container may have queued are dropped
+ *	  unread.  They could only have added to an answer already known.
+ *	- Otherwise whatever this container queued is rechecked now instead of at
+ *	  the end of the merge.  The flush is the ordinary one (its argument is on
+ *	  lion_recheck_add(): a recheck needs no index pin), and a container
+ *	  boundary is a heap-block boundary, so no block is split across batches.
+ *	  One visible row settles the test.
+ *
+ * So a test on an all-visible heap reads the first container of the
+ * intersection and stops, and one on a dirty heap rechecks container by
+ * container until its first visible row - never more than one container past
+ * it.
+ */
+static bool
+lion_exists_settled(LionCountCtx *cx)
+{
+	if (!cx->exists)
+		return false;
+
+	if (cx->count > 0)
+	{
+		cx->ntids = 0;
+		cx->tids_sorted = true;
+		return true;
+	}
+
+	lion_recheck_flush(cx);
+	return cx->recheck_count > 0;
 }
 
 static int
@@ -3837,7 +3889,18 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 		}
 
 		if (lion_container_cardinality(acc) > 0)
+		{
 			lion_count_container(cx, acc, cursors, nsources);
+
+			/*
+			 * An existence test (DESIGN.md §26) is done at the first container
+			 * that shows a visible row.  The VM question about this one has
+			 * been asked under its pins, and the cursors have moved on; what
+			 * they still pin is released below, as at the end of any merge.
+			 */
+			if (lion_exists_settled(cx))
+				goto merge_done;
+		}
 		else
 		{
 			/*
@@ -4091,10 +4154,40 @@ lion_sources_one_set(int nsources, const LionCountSource *sources)
 			lion_tree_is_flat_union(sources[0].tree, 1));
 }
 
+/*
+ * The count - or, with exists set, the existence test of DESIGN.md §26 - of
+ * (intersection of the positive sources) minus (the negated ones).  Both
+ * public forms below are this one function, so that an existence test reads
+ * containers, asks the visibility map and rechecks the heap exactly the way a
+ * count does, and differs only in where it stops (lion_exists_settled()).
+ */
+static int64 lion_count_sources_run(Relation heap, Snapshot snapshot,
+									int nsources, LionCountSource *sources,
+									LionCountStats *stats,
+									LionVisCache *cache, bool exists);
+
 int64
 lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 						 LionCountSource *sources, LionCountStats *stats,
 						 LionVisCache *cache, bool rel_read_only)
+{
+	return lion_count_sources_run(heap, snapshot, nsources, sources, stats,
+								  cache, false);
+}
+
+bool
+lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
+						  LionCountSource *sources, LionCountStats *stats,
+						  LionVisCache *cache)
+{
+	return lion_count_sources_run(heap, snapshot, nsources, sources, stats,
+								  cache, true) > 0;
+}
+
+static int64
+lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
+					   LionCountSource *sources, LionCountStats *stats,
+					   LionVisCache *cache, bool exists)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;
@@ -4307,6 +4400,7 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	cx.rel_read_only = rel_read_only;
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
+	cx.exists = exists;
 
 	/*
 	 * The visibility cache, if the caller keeps one for this node execution.
@@ -4352,6 +4446,10 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 			MemoryContextReset(setcxt);
 
 			cx.stats.sets_summed++;
+
+			/* An existence test needs one entry with a visible row (§26). */
+			if (lion_exists_settled(&cx))
+				break;
 			CHECK_FOR_INTERRUPTS();
 		}
 		MemoryContextDelete(setcxt);

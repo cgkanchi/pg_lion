@@ -1,0 +1,215 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s1_plan s2_predel s1_begin s1_plain s2_delete s1_count s3_vacuum s2_wakeup s1_commit s3_count s3_pushed s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM cnt_d;
+step s1_plan: 
+	EXPLAIN (COSTS OFF) SELECT count(DISTINCT k) FROM cnt_d;
+	EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT k) FROM cnt_d GROUP BY g;
+
+QUERY PLAN                 
+---------------------------
+Custom Scan (LionCount)    
+  Lion Indexes: cnt_d_k (k)
+  Distinct Key: k          
+(3 rows)
+
+QUERY PLAN                              
+----------------------------------------
+Custom Scan (LionCount)                 
+  Lion Indexes: cnt_d_g (g), cnt_d_k (k)
+  Group Key: g                          
+  Distinct Key: k                       
+(4 rows)
+
+step s2_predel: DELETE FROM cnt_d WHERE k = 0;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(DISTINCT k) FROM cnt_d;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+count
+-----
+    3
+(1 row)
+
+step s2_delete: DELETE FROM cnt_d WHERE k = 2;
+step s1_count: SELECT count(DISTINCT k) FROM cnt_d; <waiting ...>
+step s3_vacuum: VACUUM cnt_d; <waiting ...>
+step s2_wakeup: 
+	SELECT cnt_d_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+count
+-----
+    3
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(DISTINCT k) FROM cnt_d;
+	SELECT g, count(DISTINCT k) FROM cnt_d GROUP BY g ORDER BY g;
+
+count
+-----
+    2
+(1 row)
+
+g|count
+-+-----
+0|    2
+1|    2
+(2 rows)
+
+step s3_pushed: 
+	SET pg_lion.enable_count_pushdown = on;
+	SELECT count(DISTINCT k) FROM cnt_d;
+	SELECT g, count(DISTINCT k) FROM cnt_d GROUP BY g ORDER BY g;
+	RESET pg_lion.enable_count_pushdown;
+
+count
+-----
+    2
+(1 row)
+
+g|count
+-+-----
+0|    2
+1|    2
+(2 rows)
+
+step s3_verify: 
+	SELECT lion_index_verify('cnt_d_k', true);
+	SELECT lion_index_verify('cnt_d_g', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s2_predel s1_begin s1_plain s2_delete s1_group s3_vacuum s2_wakeup s1_commit s3_count s3_pushed s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM cnt_d;
+step s2_predel: DELETE FROM cnt_d WHERE k = 0;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(DISTINCT k) FROM cnt_d;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+count
+-----
+    3
+(1 row)
+
+step s2_delete: DELETE FROM cnt_d WHERE k = 2;
+step s1_group: SELECT g, count(DISTINCT k) FROM cnt_d GROUP BY g ORDER BY g; <waiting ...>
+step s3_vacuum: VACUUM cnt_d; <waiting ...>
+step s2_wakeup: 
+	SELECT cnt_d_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_group: <... completed>
+g|count
+-+-----
+0|    3
+1|    3
+(2 rows)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(DISTINCT k) FROM cnt_d;
+	SELECT g, count(DISTINCT k) FROM cnt_d GROUP BY g ORDER BY g;
+
+count
+-----
+    2
+(1 row)
+
+g|count
+-+-----
+0|    2
+1|    2
+(2 rows)
+
+step s3_pushed: 
+	SET pg_lion.enable_count_pushdown = on;
+	SELECT count(DISTINCT k) FROM cnt_d;
+	SELECT g, count(DISTINCT k) FROM cnt_d GROUP BY g ORDER BY g;
+	RESET pg_lion.enable_count_pushdown;
+
+count
+-----
+    2
+(1 row)
+
+g|count
+-+-----
+0|    2
+1|    2
+(2 rows)
+
+step s3_verify: 
+	SELECT lion_index_verify('cnt_d_k', true);
+	SELECT lion_index_verify('cnt_d_g', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

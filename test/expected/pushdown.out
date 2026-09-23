@@ -655,10 +655,11 @@ SELECT lion_pd('SELECT sum(id) FROM lion_pdt WHERE a = 3');
  not pushed down, 1 rows
 (1 row)
 
+-- ... while count(DISTINCT) is answered since DESIGN.md §26 (distinct.sql)
 SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3');

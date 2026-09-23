@@ -44,6 +44,12 @@
  * "the relation the node is currently counting": one table, or one partition
  * of many.
  *
+ * `count(DISTINCT k)` (DESIGN.md §26) is answered by the same machinery with
+ * EXISTENCE tests in place of counts: over the WHERE, one test per entry of
+ * k's index, walked like a GROUP BY k whose groups are summed into one row;
+ * per `GROUP BY g`, one test per (g, k) pair of the §20 nested loop, summed
+ * into one row per g.  k is a driving column there and never a grouping one.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -114,8 +120,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 									 * group, the count otherwise (§14) */
 #define LION_TL_COUNT_GROUPCOL2	4	/* the same for the second group column */
 #define LION_TL_COUNT_ZERO	5	/* count(col) where a clause pins col to NULL */
+#define LION_TL_COUNT_DISTINCT	6	/* count(DISTINCT k), DESIGN.md §26 */
+#define LION_TL_COUNT_DISTCOL	7	/* count(k) of that same k: its non-NULL
+									 * rows, which a nullable k allows nowhere
+									 * else */
 /* LION_TL_WHEREKEY + i: the key stored in the i'th clause's entry */
-#define LION_TL_WHEREKEY		6
+#define LION_TL_WHEREKEY		8
 
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
@@ -154,6 +164,29 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * the ordinary bitmap plan does well.
  */
 #define LION_MAX_ARRAY_ELEMS		1000
+
+/*
+ * What the tests of a count(DISTINCT k) walk are (DESIGN.md §26), as far as
+ * the cost model is concerned: none at all, existence tests that stop at the
+ * first visible row, or full counts because the target list wants rows too.
+ */
+#define LION_DISTINCT_NONE		0
+#define LION_DISTINCT_EXISTS	1
+#define LION_DISTINCT_COUNT		2
+
+/*
+ * The fixed cost of one test of a count(DISTINCT k) walk - one entry of k, or
+ * one (g, k) pair - over and above the containers it reads: a merge set up
+ * and torn down (a memory context, the cursors, the visibility-map state) and,
+ * for a pair, the inner set's lookup.  Measured on the assert build at 100k
+ * rows: about 2 us per test with nothing to intersect and 3.4 us with a WHERE
+ * set to seek, against 0.2 us per row for the sorting aggregate core builds
+ * for a distinct count (whose model charges about 0.1 per row), which makes a
+ * test worth some ten of that aggregate's rows.  It is what refuses a walk
+ * over many entries when the WHERE leaves few rows to sort - 1000 entries of
+ * k against 500 matching rows measured 3.4 ms against 0.56 (DESIGN.md §26).
+ */
+#define LION_DISTINCT_TEST_COST	(50.0 * cpu_tuple_cost)
 
 /* Flag bits of the third integer of LION_PRIV_INTS. */
 #define LION_FLAG_SINGLEGROUP	0x01
@@ -212,7 +245,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		node's own count columns - and leaves this member empty.  Empty for
  *		a partitioned table, whose HAVING is applied by the Finalize Agg
  *		above the node (§16)
- *	9	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	9	IntList: the attnum of the column a count(DISTINCT k) counts, or
+ *		empty (DESIGN.md §26).  Its index is in member 1: in the outer group
+ *		slot when there is no GROUP BY (k's entries drive the scan), in the
+ *		inner slot beside a GROUP BY g (the (g, k) nested loop).  k is not a
+ *		grouping column, so the inner group attnum of member 2 stays 0
+ *	10	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -224,7 +262,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_CLAUSEOPS	6
 #define LION_PRIV_ORS		7
 #define LION_PRIV_HAVING		8
-#define LION_PRIV_TLKINDS	9
+#define LION_PRIV_DISTINCT	9
+#define LION_PRIV_TLKINDS	10
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -235,7 +274,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * Shape 4 added the OR structure of DESIGN.md §19, and shape 5 the second
  * GROUP BY column of DESIGN.md §20.
  *
- * Shape 7 added the HAVING member (8) in front of the target-list kinds.
+ * Shape 7 added the HAVING member (8) in front of the target-list kinds, and
+ * shape 8 the DISTINCT member (9) there, with two new target-list kinds that
+ * moved LION_TL_WHEREKEY (DESIGN.md §26).
  *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
@@ -246,8 +287,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x52424907
-#define LION_PRIV_NMEMBERS	10
+#define LION_PRIV_MAGIC		0x52424908
+#define LION_PRIV_NMEMBERS	11
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -353,6 +394,31 @@ typedef struct LionCountScanState
 	AttrNumber	driveattno;
 	AttrNumber	groupidxcol;	/* key column of groupidx (§24) */
 	AttrNumber	groupidxcol2;	/* ... and of groupidx2 */
+
+	/*
+	 * count(DISTINCT k) (DESIGN.md §26).  distattno is k, or 0.  Without a
+	 * GROUP BY k's index is groupidx and drives the scan (driveattno is k);
+	 * beside a GROUP BY g it is groupidx2, the INNER side of the nested loop.
+	 * innerattno is the heap column of groupidx2 in either use - the second
+	 * grouping column of §20, or k - and is what everything that reads the
+	 * inner index asks, while groupattno2 keeps meaning "a second GROUP BY
+	 * column".
+	 *
+	 * distfull says a test has to COUNT rather than stop at the first visible
+	 * row, because the target list wants rows as well: without a GROUP BY any
+	 * other count does (the total is the sum over k's entries), with one only
+	 * count(k) does - count(*) and count(g) need the GROUP's count, which is
+	 * distgroupcount.  distcount and distcolcount are the finished group's
+	 * count(DISTINCT k) and count(k), read by lion_emit_tuple(), and
+	 * disttests is what EXPLAIN ANALYZE reports as "Distinct Keys Tested".
+	 */
+	AttrNumber	distattno;
+	AttrNumber	innerattno;
+	bool		distfull;
+	bool		distgroupcount;
+	int64		distcount;
+	int64		distcolcount;
+	int64		disttests;
 	bool		singlegroup;	/* GROUP BY over constant columns only */
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
@@ -1322,6 +1388,59 @@ lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti, RelOptInfo *rel,
 }
 
 /*
+ * Is the aggregate a count(DISTINCT col) of a plain column of rti (DESIGN.md
+ * §26)?  Then *var is the column, *eqop the equality the DISTINCT compares
+ * with and *collation the collation it compares under, which is what the
+ * column's index has to agree with - checked per relation in
+ * lion_collect_targets(), exactly as for a grouping column.
+ *
+ * The equality is the aggregate's own SortGroupClause's, the type's default
+ * btree equality that nodeAgg deduplicates with, and the collation is the
+ * ARGUMENT's (exprCollation(), before any relabel is stripped): that is what
+ * nodeAgg sorts and compares the inputs under, so `count(DISTINCT t COLLATE
+ * "C")` asks for "C" whatever the column itself says.
+ */
+static bool
+lion_agg_distinct_var(Aggref *agg, Index rti, Var **var, Oid *eqop,
+					  Oid *collation)
+{
+	TargetEntry *tle;
+	SortGroupClause *sgc;
+	Node	   *arg;
+
+	if (agg->aggfnoid != F_COUNT_ANY || agg->aggdistinct == NIL)
+		return false;
+	if (agg->aggorder != NIL || agg->aggfilter != NULL || agg->aggvariadic ||
+		agg->aggstar)
+		return false;
+	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->aggkind != AGGKIND_NORMAL)
+		return false;
+	if (list_length(agg->args) != 1 || list_length(agg->aggdistinct) != 1)
+		return false;
+
+	tle = (TargetEntry *) linitial(agg->args);
+	sgc = (SortGroupClause *) linitial(agg->aggdistinct);
+	if (!IsA(tle, TargetEntry) || !IsA(sgc, SortGroupClause))
+		return false;
+	if (sgc->tleSortGroupRef != tle->ressortgroupref ||
+		!OidIsValid(sgc->eqop))
+		return false;
+
+	arg = lion_strip((Node *) tle->expr);
+	if (arg == NULL || !IsA(arg, Var))
+		return false;
+	*var = (Var *) arg;
+	if ((*var)->varno != (int) rti || (*var)->varattno <= 0 ||
+		(*var)->varlevelsup != 0)
+		return false;
+
+	*eqop = sgc->eqop;
+	*collation = exprCollation((Node *) tle->expr);
+	return true;
+}
+
+/*
  * Cost the pushdown (DESIGN.md section 10).
  *
  * Proportional rather than exact.  What a count actually reads:
@@ -1505,6 +1624,26 @@ lion_containers_for(double heap_pages, double members)
 }
 
 /*
+ * The share of an intersection's work an EXISTENCE test does (DESIGN.md §26).
+ *
+ * The test stops at the first container that shows a visible row.  An
+ * intersection expected to hold `survivors` rows spread over `containers`
+ * containers has a row in about one container in containers/survivors, so the
+ * test reads about containers/survivors + 1 of them - the whole thing when it
+ * is expected to be empty, which is also when it has to be read to the end to
+ * say so.  The same share applies to the recheck candidates the test queues,
+ * because it rechecks one container at a time and stops with them.
+ */
+static double
+lion_exists_fraction(double containers, double survivors)
+{
+	containers = Max(containers, 1.0);
+	if (survivors < 1.0)
+		return 1.0;
+	return Min(1.0, (containers / survivors + 1.0) / containers);
+}
+
+/*
  * How tall the posting tree of a set that occupies `leaves` container pages is
  * (DESIGN.md §22): 0 while it fits on one page, and one level for every
  * LION_POSTING_FANOUT pages above that.
@@ -1667,6 +1806,11 @@ static int *lion_or_group_map(List *ors, int nclause);
  *				the list is not a source (a group intersected with the union of
  *				a disjoint list is the group).
  *
+ * eqdrives says that an EQUALITY on the driving column drives the entries as
+ * a list of one would, which is what the count(DISTINCT k) walk of DESIGN.md
+ * §26 does with `k = c` (a GROUP BY never sees one: the planner folds a
+ * grouping column an equality pins).
+ *
  * Returns the clause index of the list, or -1 when neither applies.
  */
 static int
@@ -1674,7 +1818,7 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 				 IndexOptInfo *groupidx2,
 				 List *whereidx, List *wherecol, List *whereclauses,
 				 List *wherekinds,
-				 List *ors, bool *sumshort, bool *groupdrive)
+				 List *ors, bool eqdrives, bool *sumshort, bool *groupdrive)
 {
 	int			nclause = list_length(whereclauses);
 	bool	   *inor = lion_or_leaf_map(ors, nclause);
@@ -1696,7 +1840,11 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 		if (!inor[ci] && LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
 		{
 			npos++;
-			if (IsA((Node *) lfirst(lc2), ScalarArrayOpExpr))
+			if (IsA((Node *) lfirst(lc2), ScalarArrayOpExpr) ||
+				(eqdrives && lfirst_int(lc3) == LION_CLAUSE_EQ &&
+				 groupidx != NULL &&
+				 ((IndexOptInfo *) lfirst(lc1))->indexoid == groupidx->indexoid &&
+				 (AttrNumber) lfirst_int(lc4) == groupcol))
 			{
 				if (arrayci >= 0)
 					arrayci = -2;	/* two lists: neither is "the" one */
@@ -1741,7 +1889,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *whereidx, List *wherecol, List *whereclauses,
 				   List *wherekinds,
 				   List *ors, double numgroups,
-				   double outer_entries, double inner_entries)
+				   double outer_entries, double inner_entries, int distinct)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -1781,14 +1929,22 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	bool		groupdrive;		/* §15: the IN list is the GROUP BY driver */
 	int			inlistci;
 	double		ingroups = numgroups;	/* groups the node really emits */
+	double		recheckshare = 1.0; /* §26: what the existence tests recheck */
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
 	ListCell   *lc4;
 
+	/*
+	 * A count(DISTINCT k) without a GROUP BY walks k's entries, and a WHERE
+	 * equality on k itself drives that walk as a list of one would (DESIGN.md
+	 * §26).
+	 */
 	inlistci = lion_inlist_shape(groupidx, groupcol, groupidx2,
 								whereidx, wherecol, whereclauses,
-								wherekinds, ors, &sumshort, &groupdrive);
+								wherekinds, ors,
+								distinct != LION_DISTINCT_NONE && groupidx2 == NULL,
+								&sumshort, &groupdrive);
 
 	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 	clausepages = (double *) palloc0(sizeof(double) * Max(nclause, 1));
@@ -2162,11 +2318,31 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * entry of the next (DESIGN.md §24), so what it reads of a multicolumn
 		 * index is that column's share of it and not the whole relation.
 		 */
+		double		pergroup = lion_containers_for(heap_pages,
+												   matching / Max(numgroups, 1.0));
+		double		share = 1.0;
+
 		seq_pages += Max(1.0, (double) groupidx->pages *
 						 lion_index_column_share(root, rel, groupidx,
 												 groupcol));
-		ncontainers += numgroups *
-			lion_containers_for(heap_pages, matching / Max(numgroups, 1.0));
+
+		/*
+		 * The count(DISTINCT k) walk over k's entries (DESIGN.md §26) tests
+		 * each entry for ONE visible row and stops there, so it reads the
+		 * share of each entry's intersection lion_exists_fraction() expects
+		 * - one container or two when the entries are dense, all of it when
+		 * the WHERE leaves most of them empty - and rechecks that share of
+		 * the candidates.  Beside a GROUP BY this is the group's own test,
+		 * which the pairs below come on top of.
+		 */
+		if (distinct != LION_DISTINCT_NONE &&
+			(distinct == LION_DISTINCT_EXISTS || groupidx2 != NULL))
+		{
+			share = lion_exists_fraction(pergroup,
+										 matching / Max(numgroups, 1.0));
+			recheckshare = share;
+		}
+		ncontainers += numgroups * pergroup * share;
 	}
 
 	/*
@@ -2204,15 +2380,46 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		double		oe = Max(outer_entries, 1.0);
 		double		ie = Max(inner_entries, 1.0);
 
+		double		co = lion_containers_for(heap_pages, tuples / oe);
+		double		cinner = lion_containers_for(heap_pages, tuples / ie);
+
 		seq_pages += Max(1.0, (double) groupidx2->pages *
 						 lion_index_column_share(root, rel, groupidx2,
 												 groupcol2));
 		pair_cost = Max(oe * ie, numgroups) * cpu_tuple_cost;
 		merge_ops += Min(oe, ie) * tuples;
-		ncontainers += oe * ie * (lion_containers_for(heap_pages, tuples / oe) +
-								  lion_containers_for(heap_pages, tuples / ie));
+		ncontainers += oe * ie * (co + cinner);
+
+		/*
+		 * The (g, k) pairs of a count(DISTINCT k) per group (DESIGN.md §26)
+		 * are these same pairs and are charged exactly as above - that is
+		 * what makes a large |G| x |K| lose to the sorting aggregate core
+		 * builds for a distinct count - plus the fixed cost of a test on
+		 * each.  The early exit is NOT discounted from the pair terms: a
+		 * pair's time is its lookup and its merge's setup far more than its
+		 * members, and measured per pair an existence test was 6.5 us
+		 * against 7.7 for a count (100k rows, 200 x 50 pairs, assert build).
+		 * What it does save is heap rechecks, one container's worth per test
+		 * instead of all of them, and that is charged as such below.
+		 */
+		if (distinct != LION_DISTINCT_NONE)
+		{
+			pair_cost += oe * ie * LION_DISTINCT_TEST_COST;
+			recheckshare += (distinct == LION_DISTINCT_EXISTS) ?
+				lion_exists_fraction(Min(co, cinner), matching / (oe * ie)) :
+				1.0;
+		}
 	}
 	ncontainers = Max(ncontainers, 1.0);
+
+	/*
+	 * ... and the fixed cost of the tests of a count(DISTINCT k) that are not
+	 * pairs (DESIGN.md §26): one per entry of k the walk visits - or per
+	 * listed value, when a list on k drives it - and beside a GROUP BY one
+	 * per group, the group's own test.
+	 */
+	if (distinct != LION_DISTINCT_NONE)
+		pair_cost += ingroups * LION_DISTINCT_TEST_COST;
 
 	/*
 	 * Rechecking is what makes the pushdown expensive, and the estimate has
@@ -2241,7 +2448,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * physical reads (the 2026-09-21 follow-up review).
 	 */
 	dirty_pages = Min(heap_pages * dirtyfrac, heap_pages);
-	recheck_tids = matching * dirtyfrac;
+	recheck_tids = matching * dirtyfrac * recheckshare;
 	recheck_pages = Min(recheck_tids, dirty_pages);
 
 	run = random_pages * random_page_cost;
@@ -2272,7 +2479,7 @@ static void
 lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, List *ors,
 					double numgroups, double outer_entries,
-					double inner_entries, double outrows)
+					double inner_entries, double outrows, int distinct)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -2286,7 +2493,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->driveidx[1], t->drivecol[1],
 								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
-								  outer_entries, inner_entries);
+								  outer_entries, inner_entries, distinct);
 	}
 
 	cpath->path.rows = outrows;
@@ -2843,6 +3050,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		havepositive = false;
 	List	   *having;
 	List	   *checkexprs;
+	Var		   *distvar = NULL;	/* the column count(DISTINCT) counts (§26) */
+	Oid			disteqop = InvalidOid;
+	Oid			distcoll = InvalidOid;
+	bool		distcounts = false; /* its walk must count, not test (§26) */
+	double		distest = 0;
 	ListCell   *lc;
 
 	/* ---- the query as a whole ---- */
@@ -3176,26 +3388,6 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						  &whereconsts, &wherekinds, &whereopnos, &whereinor);
 	}
 
-	/* Something has to drive the count. */
-	driveattno = groupattno[0];
-	if (ngroup == 0 && !havepositive)
-	{
-		/*
-		 * Only `IS NOT NULL` clauses: that column's index knows every row of
-		 * the table, so the count is the sum over all of its entries with the
-		 * NULL one subtracted (DESIGN.md §14).  The entries of one index are
-		 * disjoint - a row has one value per column - so summing them is the
-		 * count of their union.
-		 */
-		if (notnullvar == NULL)
-			return;
-		sumall = true;
-		driveattno = notnullvar->varattno;
-	}
-	/* A group folded to a constant can only have come from a WHERE key. */
-	if (singlegroup && !havepositive)
-		return;
-
 	/* ---- the grouped relation's target, and the HAVING that filters it ---- */
 	checkexprs = list_copy(output_rel->reltarget->exprs);
 	if (having != NIL)
@@ -3213,6 +3405,51 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 												 PVC_RECURSE_WINDOWFUNCS |
 												 PVC_INCLUDE_PLACEHOLDERS));
 	}
+
+	/*
+	 * ---- count(DISTINCT k) (DESIGN.md §26) ----
+	 *
+	 * Found first, because it decides what drives the scan: k's own entries
+	 * when there is no GROUP BY, and the inner side of the (g, k) nested loop
+	 * when there is one.  Every distinct aggregate has to be over the same
+	 * plain column, with the same equality and collation - one k, one walk -
+	 * and k may be neither a grouping column (its entries would be groups and
+	 * distinct values at once) nor the third driving column of a two-column
+	 * GROUP BY.  A partitioned table declines: distinct counts do not add up
+	 * across partitions, and the partial aggregates of §16 would add them.
+	 */
+	foreach(lc, checkexprs)
+	{
+		Aggref	   *agg = (Aggref *) lfirst(lc);
+		Var		   *dv;
+		Oid			deq;
+		Oid			dcoll;
+
+		if (!IsA(agg, Aggref) || agg->aggdistinct == NIL)
+			continue;
+		if (!lion_agg_distinct_var(agg, rti, &dv, &deq, &dcoll))
+			return;
+		if (distvar == NULL)
+		{
+			distvar = dv;
+			disteqop = deq;
+			distcoll = dcoll;
+		}
+		else if (dv->varattno != distvar->varattno || deq != disteqop ||
+				 dcoll != distcoll)
+			return;
+	}
+	if (distvar != NULL)
+	{
+		if (partitioned || ngroup > 1)
+			return;
+		for (g = 0; g < ngroup; g++)
+		{
+			if (groupattno[g] == distvar->varattno)
+				return;
+		}
+	}
+
 	foreach(lc, checkexprs)
 	{
 		Node	   *node = (Node *) lfirst(lc);
@@ -3256,16 +3493,79 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 		else if (IsA(node, Aggref))
 		{
-			if (!lion_agg_is_count(root, (Aggref *) node, rti, input_rel,
-								  groupattno, ngroup, nonnullattnos,
+			Aggref	   *agg = (Aggref *) node;
+			AttrNumber	countcols[LION_MAX_GROUPCOLS + 1];
+			int			ncountcols = ngroup;
+
+			if (agg->aggdistinct != NIL)
+			{
+				/* checked above; a distinct count needs no other test */
+				haveagg = true;
+				continue;
+			}
+
+			/*
+			 * count(k) of the distinct column is answered too, whatever k's
+			 * nullability: it is the rows of k's non-NULL entries, which the
+			 * walk visits anyway (DESIGN.md §26) - so for this purpose k is
+			 * one more column whose entries are known, like a group column.
+			 */
+			memcpy(countcols, groupattno, sizeof(AttrNumber) * ngroup);
+			if (distvar != NULL)
+				countcols[ncountcols++] = distvar->varattno;
+			if (!lion_agg_is_count(root, agg, rti, input_rel,
+								  countcols, ncountcols, nonnullattnos,
 								  nullattnos))
 				return;
 			haveagg = true;
+
+			/*
+			 * Does the walk have to COUNT rather than test for existence?
+			 * Without a GROUP BY every other count is a sum over k's entries;
+			 * beside one, only count(k) is a sum over the pairs, and count(*)
+			 * and count(g) are the group's own count.
+			 */
+			if (distvar != NULL)
+			{
+				Node	   *arg = (agg->args != NIL) ?
+					lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr) :
+					NULL;
+				bool		ofk = (arg != NULL && IsA(arg, Var) &&
+								   ((Var *) arg)->varattno == distvar->varattno);
+
+				if (ngroup == 0 || ofk)
+					distcounts = true;
+			}
 		}
 		else
 			return;
 	}
 	if (!haveagg)
+		return;
+
+	/* Something has to drive the count. */
+	driveattno = groupattno[0];
+	if (distvar != NULL && ngroup == 0)
+	{
+		/* k's entries drive it, whatever the WHERE says (DESIGN.md §26). */
+		driveattno = distvar->varattno;
+	}
+	else if (ngroup == 0 && !havepositive)
+	{
+		/*
+		 * Only `IS NOT NULL` clauses: that column's index knows every row of
+		 * the table, so the count is the sum over all of its entries with the
+		 * NULL one subtracted (DESIGN.md §14).  The entries of one index are
+		 * disjoint - a row has one value per column - so summing them is the
+		 * count of their union.
+		 */
+		if (notnullvar == NULL)
+			return;
+		sumall = true;
+		driveattno = notnullvar->varattno;
+	}
+	/* A group folded to a constant can only have come from a WHERE key. */
+	if (singlegroup && !havepositive)
 		return;
 
 	/*
@@ -3335,7 +3635,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 		ndrive = ngroup;
 	}
-	else if (driveattno != 0)
+	else if (sumall)
 	{
 		/* §14's sum-over-all: one index, and it groups nothing. */
 		drive[0].attno = driveattno;
@@ -3344,6 +3644,34 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		drive[0].eqop = InvalidOid;
 		drive[0].valueout = false;
 		ndrive = 1;
+	}
+
+	/*
+	 * The column count(DISTINCT) counts is one more driving column (DESIGN.md
+	 * §26): the only one without a GROUP BY, the inner one beside it.  Every
+	 * per-column rule of lion_collect_targets() applies to it as to a grouping
+	 * column - a SCALAR index (a multi-key one is never found, and
+	 * count(DISTINCT tags) counts arrays, not elements), the DISTINCT's
+	 * collation, and the DISTINCT's own equality as strategy 1 of the index's
+	 * opfamily, so that its entries are exactly the classes DISTINCT counts.
+	 * No value of it is ever printed.
+	 */
+	if (distvar != NULL)
+	{
+		Assert(ndrive == ngroup && ndrive < LION_MAX_GROUPCOLS);
+		drive[ndrive].attno = distvar->varattno;
+		drive[ndrive].var = distvar;
+		drive[ndrive].collation = distcoll;
+		drive[ndrive].eqop = disteqop;
+		drive[ndrive].valueout = false;
+		ndrive++;
+
+		/*
+		 * Every entry of k is tested, whether or not the WHERE leaves it any
+		 * row, so the walk is n_distinct(k) of the whole table long.
+		 */
+		distest = estimate_num_groups(root, list_make1(distvar),
+									  Max(input_rel->tuples, 1.0), NULL, NULL);
 	}
 
 	if (!lion_collect_targets(root, input_rel, drive, ndrive, whereattnos,
@@ -3368,6 +3696,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		Assert(notnullvar != NULL);
 		numgroups = estimate_num_groups(root, list_make1(notnullvar),
 										input_rel->rows, NULL, NULL);
+	}
+	else if (distvar != NULL)
+	{
+		/* ... and so is every entry of k's (DESIGN.md §26). */
+		numgroups = distest;
 	}
 	else
 		numgroups = 1.0;
@@ -3519,7 +3852,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								 first->driveidx[1],
 								 first->whereidx, first->wherecol,
 								 whereclauses, wherekinds,
-								 ors, &sumshort, &groupdrive);
+								 ors, false, &sumshort, &groupdrive);
 		/*
 		 * The node emits ASCENDING, NULLS FIRST, always.  The query's own
 		 * GROUP BY clause is not a safe source for the direction:
@@ -3566,11 +3899,25 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->custom_private = lappend(cpath->custom_private, ors);
 	cpath->custom_private = lappend(cpath->custom_private,
 									(partialtarget != NULL) ? NIL : having);
+	cpath->custom_private = lappend(cpath->custom_private,
+									(distvar != NULL) ?
+									list_make1_int((int) distvar->varattno) :
+									NIL);
 	cpath->methods = &lion_count_path_methods;
 
+	/*
+	 * Beside a GROUP BY, count(DISTINCT k) is the (g, k) nested loop of
+	 * DESIGN.md §20, g outer and k inner, and is priced as those pairs
+	 * (DESIGN.md §26); without one, k's entries are the "groups" of the walk.
+	 */
 	lion_cost_count_path(root, cpath, targets, whereclauses, wherekinds, ors,
-						numgroups, groupest[0], (ngroup == 2) ? groupest[1] : 0,
-						outrows);
+						numgroups, groupest[0],
+						(ngroup == 2) ? groupest[1] :
+						(distvar != NULL && ngroup == 1) ? distest : 0,
+						outrows,
+						(distvar == NULL) ? LION_DISTINCT_NONE :
+						distcounts ? LION_DISTINCT_COUNT :
+						LION_DISTINCT_EXISTS);
 
 	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
@@ -3661,6 +4008,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	bool	   *inor;
 	AttrNumber	groupattno;
 	AttrNumber	groupattno2;
+	AttrNumber	distattno;
+	List	   *dist;
 	ListCell   *lc;
 
 	/*
@@ -3675,6 +4024,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	ckinds = (List *) list_nth(best_path->custom_private, LION_PRIV_CLAUSEKINDS);
 	groupattno = (AttrNumber) lsecond_int(ints);
 	groupattno2 = (AttrNumber) lthird_int(ints);
+	dist = (List *) list_nth(best_path->custom_private, LION_PRIV_DISTINCT);
+	distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
 
 	/*
 	 * A leaf of an OR constrains no column of the result (DESIGN.md §19), so
@@ -3727,7 +4078,13 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 * a column a clause pins to NULL is always 0.
 			 */
 			kind = LION_TL_COUNT;
-			if (agg->args != NIL)
+			if (agg->aggdistinct != NIL)
+			{
+				/* the one column the planner accepted (DESIGN.md §26) */
+				Assert(distattno != 0);
+				kind = LION_TL_COUNT_DISTINCT;
+			}
+			else if (agg->args != NIL)
 			{
 				Node	   *arg = lion_strip((Node *)
 											((TargetEntry *) linitial(agg->args))->expr);
@@ -3737,7 +4094,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				Assert(arg != NULL && IsA(arg, Var));
 				attno = ((Var *) arg)->varattno;
 
-				if (groupattno != 0 && attno == groupattno)
+				if (distattno != 0 && attno == distattno)
+					kind = LION_TL_COUNT_DISTCOL;	/* §26: k's non-NULL rows */
+				else if (groupattno != 0 && attno == groupattno)
 					kind = LION_TL_COUNT_GROUPCOL;
 				else if (groupattno2 != 0 && attno == groupattno2)
 					kind = LION_TL_COUNT_GROUPCOL2;
@@ -4142,7 +4501,7 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->groupidxcol2 =
 			lion_index_col_for(st->groupidx2,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->groupattno2));
+												  st->innerattno));
 	}
 
 	/*
@@ -4229,6 +4588,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *clauseops;
 	List	   *orlist;
 	List	   *kinds;
+	List	   *dist;
 	int			flags;
 	int			i;
 	int			k;
@@ -4255,6 +4615,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	partlist = (List *) list_nth(cscan->custom_private, LION_PRIV_PARTS);
 	clauseops = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEOPS);
 	orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
+	dist = (List *) list_nth(cscan->custom_private, LION_PRIV_DISTINCT);
 	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
 
 	st->heapoid = linitial_oid(oids);
@@ -4268,6 +4629,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->sumall = (flags & LION_FLAG_SUMALL) != 0;
 	st->hasgroupidx = (flags & LION_FLAG_GROUPIDX) != 0;
 	st->nclause = list_length(ckinds);
+	st->distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
 
 	/*
 	 * One value expression per clause, in custom_exprs (see the shape marker
@@ -4282,6 +4644,35 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->tlkind = (int *) palloc(sizeof(int) * Max(st->ntlist, 1));
 	for (i = 0; i < st->ntlist; i++)
 		st->tlkind[i] = list_nth_int(kinds, i);
+
+	/*
+	 * Which tests of a count(DISTINCT k) walk have to COUNT rather than stop
+	 * at the first visible row (DESIGN.md §26), from what the target list -
+	 * the HAVING's counts included - asks for.  Without a GROUP BY every
+	 * other count is a sum over k's entries; beside one, count(k) is a sum
+	 * over the (g, k) pairs, and count(*) and count(g) are the group's own.
+	 */
+	st->distfull = false;
+	st->distgroupcount = false;
+	for (i = 0; st->distattno != 0 && i < st->ntlist; i++)
+	{
+		switch (st->tlkind[i])
+		{
+			case LION_TL_COUNT_DISTCOL:
+				st->distfull = true;
+				break;
+			case LION_TL_COUNT:
+			case LION_TL_COUNT_GROUPCOL:
+			case LION_TL_COUNT_GROUPCOL2:
+				if (st->groupattno == 0)
+					st->distfull = true;
+				else
+					st->distgroupcount = true;
+				break;
+			default:
+				break;
+		}
+	}
 
 	st->clause = (LionClauseState *)
 		palloc0(sizeof(LionClauseState) * Max(st->nclause, 1));
@@ -4340,6 +4731,22 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		if (st->driveattno == 0)
 			elog(ERROR, "LionCount: sum-over-all without an IS NOT NULL clause");
 	}
+
+	/*
+	 * count(DISTINCT k) (DESIGN.md §26): without a GROUP BY k's own entries
+	 * drive the scan; beside one, k's index is the inner side of the nested
+	 * loop, which is also what a second grouping column's is (§20).
+	 */
+	if (st->distattno != 0 && st->groupattno == 0)
+		st->driveattno = st->distattno;
+	if (st->groupattno2 != 0)
+		st->innerattno = st->groupattno2;
+	else if (st->distattno != 0 && st->groupattno != 0)
+		st->innerattno = st->distattno;
+	else
+		st->innerattno = 0;
+	if (st->distattno != 0 && !st->hasgroupidx)
+		elog(ERROR, "LionCount: count(DISTINCT) without its index");
 
 	/*
 	 * The OR restrictions (DESIGN.md §19) and the sources the clauses make
@@ -4469,16 +4876,16 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 	/*
 	 * Slot 0 is the (outer) group's posting set, 1 .. nitem the WHERE items,
-	 * and - for a two-column GROUP BY (DESIGN.md §20) - slot nitem + 1 the
-	 * inner group's.
+	 * and - for a two-column GROUP BY (DESIGN.md §20), or the (g, k) pairs of
+	 * a count(DISTINCT k) per group (§26) - slot nitem + 1 the inner one's.
 	 */
-	st->nsource = st->nitem + 1 + (st->groupattno2 != 0 ? 1 : 0);
+	st->nsource = st->nitem + 1 + (st->innerattno != 0 ? 1 : 0);
 	st->sources = (LionCountSource *)
 		palloc0(sizeof(LionCountSource) * st->nsource);
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	st->sources[0].negated = false;
-	if (st->groupattno2 != 0)
+	if (st->innerattno != 0)
 	{
 		st->sources[st->nitem + 1].nsets = 1;
 		st->sources[st->nitem + 1].sets = &st->groupset2;
@@ -4495,6 +4902,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->sumallitem = -1;
 	st->dsources = (LionCountSource *)
 		palloc0(sizeof(LionCountSource) * st->nsource);
+	st->disttests = 0;
 }
 
 /*
@@ -4985,11 +5393,18 @@ lion_locate_where(LionCountScanState *st)
 	 * drive them - same relation, same column, so the entries are the same
 	 * entries - and the grouping is the plain one-column form.  A two-column
 	 * GROUP BY (§20) and a sum-over-all (§14) both walk the entries for
-	 * reasons of their own and are left alone.
+	 * reasons of their own and are left alone, and so does the (g, k) loop of
+	 * a count(DISTINCT k) per group (§26), whose groups are emitted in g's
+	 * directory order, which the planner may have claimed as pathkeys.
+	 *
+	 * The count(DISTINCT k) walk WITHOUT a GROUP BY is driven like a GROUP BY
+	 * k whose groups are summed (§26), and takes a list on k the same way -
+	 * and an equality on k as a list of one, which a GROUP BY never sees
+	 * (the planner folds the grouping column it pins).
 	 */
 	st->ingroupitem = -1;
 	st->ingroupset = 0;
-	if (st->hasgroupidx && st->groupattno != 0 && st->groupattno2 == 0 &&
+	if (st->hasgroupidx && st->driveattno != 0 && st->innerattno == 0 &&
 		!st->sumall)
 	{
 		for (k = 0; k < st->nitem; k++)
@@ -4999,8 +5414,9 @@ lion_locate_where(LionCountScanState *st)
 			if (st->item[k].orno >= 0)
 				continue;
 			cl = &st->clause[st->item[k].clauseno];
-			if (cl->kind != LION_CLAUSE_ARRAY ||
-				cl->attno != st->groupattno ||
+			if (!(cl->kind == LION_CLAUSE_ARRAY ||
+				  (cl->kind == LION_CLAUSE_EQ && st->distattno != 0)) ||
+				cl->attno != st->driveattno ||
 				cl->idxoid != st->groupidxoid ||
 				cl->idxcol != st->groupidxcol)
 				continue;
@@ -5018,9 +5434,15 @@ lion_locate_where(LionCountScanState *st)
 	 * apart (`a IS NOT NULL AND b IS NOT NULL` over one index on (a, b) would
 	 * otherwise drop b's NULL set and subtract a's from a's own entries,
 	 * which removes nothing: every b NULL would be counted).
+	 *
+	 * The count(DISTINCT k) walk without a GROUP BY (§26) drops a
+	 * `k IS NOT NULL` the same way, for the same reason: the NULL entry is
+	 * the only one it removes anything from, and that entry is never a
+	 * distinct value.
 	 */
 	st->sumallitem = -1;
-	if (st->sumall && st->hasgroupidx)
+	if ((st->sumall || (st->distattno != 0 && st->groupattno == 0)) &&
+		st->hasgroupidx)
 	{
 		for (k = 0; k < st->nitem; k++)
 		{
@@ -5138,6 +5560,16 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 			case LION_TL_COUNT_ZERO:
 				/* count(col) where a clause pins col to NULL */
 				slot->tts_values[i] = Int64GetDatum(0);
+				break;
+
+			case LION_TL_COUNT_DISTINCT:
+				/* count(DISTINCT k) of the finished group (DESIGN.md §26) */
+				slot->tts_values[i] = Int64GetDatum(st->distcount);
+				break;
+
+			case LION_TL_COUNT_DISTCOL:
+				/* count(k): the rows of k's non-NULL entries (§26) */
+				slot->tts_values[i] = Int64GetDatum(st->distcolcount);
 				break;
 
 			default:
@@ -5565,11 +5997,329 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 }
 
 /*
- * Whichever of the two the plan asks for.
+ * One test of a count(DISTINCT k) walk (DESIGN.md §26): the rows of
+ * (sources) when the target list needs them counted, and otherwise 1 or 0 for
+ * whether there is at least one visible row at all - which is where the walk
+ * saves its work, because an existence test stops at the first container that
+ * shows one (lion_exists_sources_cached()).  Runs in pergroup, like a group's
+ * count.
+ */
+static int64
+lion_distinct_test(LionCountScanState *st, int nsource,
+				   LionCountSource *sources, bool count)
+{
+	EState	   *estate = st->css.ss.ps.state;
+
+	st->disttests++;
+	if (count)
+		return lion_count_sources_cached(st->heap, estate->es_snapshot,
+										 nsource, sources, &st->stats,
+										 st->viscache);
+	return lion_exists_sources_cached(st->heap, estate->es_snapshot,
+									  nsource, sources, &st->stats,
+									  st->viscache) ? 1 : 0;
+}
+
+/*
+ * count(DISTINCT k) without a GROUP BY (DESIGN.md §26): the one row.
+ *
+ * A scalar index puts every row under exactly one entry of k - its value's,
+ * or the reserved NULL entry (§14, §15) - so the distinct non-NULL values of k
+ * among the rows the WHERE selects are exactly the non-NULL entries whose set,
+ * intersected with the WHERE sources, has a visible row.  So this is the
+ * GROUP BY k walk of lion_next_group() with each group's count replaced by
+ * an existence test and the groups summed into one row:
+ *
+ *	- the entries are k's index's, or - when the WHERE pins k itself to a
+ *	  value or a list - that clause's own located sets, which are then not
+ *	  intersected (st->ingroupitem, the §15 driver);
+ *	- the NULL entry is never a distinct value.  It is skipped, except that
+ *	  a total over every row (count(*)) counts it, and that a GROUP BY the
+ *	  planner folded to one constant group asks it, at the end and only if
+ *	  nothing else matched, whether the group exists at all;
+ *	- when the target list wants rows as well (count(*), count(k), ...) each
+ *	  test is a full count, summed: the entries are disjoint, so their counts
+ *	  add up to the rows of their union.
+ *
+ * Pins (DESIGN.md §9): one entry's set at a time, released before the next
+ * is located, exactly as in the GROUP BY walk; a list's sets belong to the
+ * clause and were located once by lion_locate_where().
+ */
+static TupleTableSlot *
+lion_distinct_relation(LionCountScanState *st)
+{
+	LionCountSource *sources;
+	MemoryContext oldcxt;
+	int			nsource;
+	int64		ndistinct = 0;
+	int64		nonnull = 0;
+	int64		total = 0;
+	bool		found = false;
+	bool		listdrive = (st->ingroupitem >= 0);
+	Datum		key;
+
+	if (st->ingroupitem >= 0 || st->sumallitem >= 0)
+	{
+		sources = st->dsources;
+		nsource = st->ndsource;
+	}
+	else
+	{
+		sources = st->sources;
+		nsource = st->nsource;
+	}
+
+	if (!listdrive)
+	{
+		lion_entry_scan_begin_col(&st->escan, st->groupidx, st->groupidxcol);
+		st->scanning = true;
+	}
+
+	for (;;)
+	{
+		LionPostingSet *ps;
+		int64		n;
+
+		CHECK_FOR_INTERRUPTS();
+
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		if (listdrive)
+		{
+			LionCountSource *src = &st->sources[st->ingroupitem + 1];
+
+			if (st->ingroupset >= src->nsets)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				break;
+			}
+			ps = &src->sets[st->ingroupset++];
+			if (!ps->found)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				continue;		/* a listed value with no entry */
+			}
+			sources[0].nsets = 1;
+			sources[0].sets = ps;
+			sources[0].tree = NULL;
+			sources[0].negated = false;
+			sources[0].nomaterialize = false;
+			sources[0].disjoint = false;
+		}
+		else
+		{
+			if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
+			{
+				MemoryContextSwitchTo(oldcxt);
+				break;
+			}
+			ps = &st->groupset;
+		}
+
+		if (ps->keyisnull)
+		{
+			/*
+			 * Not a value.  Its rows are part of the total, unless the WHERE
+			 * says `k IS NOT NULL` (st->sumallitem), which excludes exactly
+			 * them.
+			 */
+			if (st->distfull && st->sumallitem < 0)
+				total += lion_distinct_test(st, nsource, sources, true);
+		}
+		else
+		{
+			n = lion_distinct_test(st, nsource, sources, st->distfull);
+			if (n > 0)
+			{
+				ndistinct++;
+				nonnull += n;
+				total += n;
+			}
+		}
+
+		if (!listdrive)
+			lion_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	if (!listdrive)
+	{
+		lion_entry_scan_end(&st->escan);
+		st->scanning = false;
+	}
+
+	found = (ndistinct > 0 || total > 0);
+
+	/*
+	 * A folded GROUP BY has a row only if some row matches, and a row whose k
+	 * is NULL matches too.  Only asked when nothing else answered it, and
+	 * never under a list on k, which no NULL satisfies.
+	 */
+	if (st->singlegroup && !found && !listdrive && st->sumallitem < 0)
+	{
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+		if (lion_posting_set_lookup_null_col(st->groupidx, st->groupidxcol,
+											 &st->groupset))
+			found = (lion_distinct_test(st, nsource, sources, false) > 0);
+		lion_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	st->done = true;
+	if (st->singlegroup && !found)
+		return NULL;
+
+	st->distcount = ndistinct;
+	st->distcolcount = nonnull;
+	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
+}
+
+/*
+ * count(DISTINCT k) per GROUP BY g (DESIGN.md §26): the (g, k) nested loop of
+ * lion_next_group2(), g outer and k inner, with one row per GROUP rather than
+ * per pair.
+ *
+ * For each entry of g, first the group itself: is there a visible row in
+ * g ∩ WHERE at all?  (Counted, when the target list asks for count(*) or
+ * count(g).)  A group without one is not emitted - a group exists only if one
+ * of its rows is visible - and a group whose rows all have k NULL is emitted
+ * with a distinct count of 0, which is what SQL says it is.  Then one test per
+ * non-NULL key of k, of g ∩ WHERE ∩ k, and the row.
+ *
+ * Pins and memory are §20's: the outer set is located once and held for the
+ * group's whole inner loop (in outercxt), each pair's inner set is located,
+ * tested and released inside pergroup, so at most two group pins exist at a
+ * time; the inner keys were read once per relation (lion_load_inner_keys()),
+ * or, when they did not fit, k's entry scan is walked once per group.
+ */
+static TupleTableSlot *
+lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
+{
+	MemoryContext oldcxt;
+
+	*exhausted = false;
+
+	for (;;)
+	{
+		int64		count;
+		int64		ndistinct = 0;
+		int64		nonnull = 0;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* the previous group's key lived in outercxt; its row is consumed */
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+		MemoryContextReset(st->outercxt);
+		oldcxt = MemoryContextSwitchTo(st->outercxt);
+		if (!lion_entry_scan_next(&st->escan, &st->outerkey, &st->groupset))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			*exhausted = true;
+			return NULL;
+		}
+		MemoryContextSwitchTo(oldcxt);
+		st->outerisnull = st->groupset.keyisnull;
+		st->outeropen = true;
+
+		/* ---- the group: slot 0 and the WHERE items, not the inner slot ---- */
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+		count = lion_distinct_test(st, st->nsource - 1, st->sources,
+								   st->distgroupcount);
+		MemoryContextSwitchTo(oldcxt);
+		if (count == 0)
+		{
+			lion_posting_set_release(&st->groupset);
+			st->outeropen = false;
+			continue;
+		}
+
+		/* ---- every non-NULL key of k ---- */
+		if (st->innerkey != NULL)
+		{
+			int			i;
+
+			for (i = 0; i < st->ninnerkey; i++)
+			{
+				int64		n;
+
+				CHECK_FOR_INTERRUPTS();
+				if (st->innerisnull[i])
+					continue;
+
+				MemoryContextReset(st->pergroup);
+				oldcxt = MemoryContextSwitchTo(st->pergroup);
+				(void) lion_posting_set_lookup_col(st->groupidx2,
+												   st->groupidxcol2,
+												   st->innerkey[i], InvalidOid,
+												   &st->groupset2);
+				n = lion_distinct_test(st, st->nsource, st->sources,
+									   st->distfull);
+				lion_posting_set_release(&st->groupset2);
+				MemoryContextSwitchTo(oldcxt);
+
+				if (n > 0)
+				{
+					ndistinct++;
+					nonnull += n;
+				}
+			}
+		}
+		else
+		{
+			lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
+									 st->groupidxcol2);
+			st->scanning2 = true;
+			for (;;)
+			{
+				Datum		ikey;
+				int64		n;
+
+				CHECK_FOR_INTERRUPTS();
+				MemoryContextReset(st->pergroup);
+				oldcxt = MemoryContextSwitchTo(st->pergroup);
+				if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
+				{
+					MemoryContextSwitchTo(oldcxt);
+					break;
+				}
+				n = 0;
+				if (!st->groupset2.keyisnull)
+					n = lion_distinct_test(st, st->nsource, st->sources,
+										   st->distfull);
+				lion_posting_set_release(&st->groupset2);
+				MemoryContextSwitchTo(oldcxt);
+
+				if (n > 0)
+				{
+					ndistinct++;
+					nonnull += n;
+				}
+			}
+			lion_entry_scan_end(&st->escan2);
+			st->scanning2 = false;
+		}
+
+		lion_posting_set_release(&st->groupset);
+		st->outeropen = false;
+
+		st->distcount = ndistinct;
+		st->distcolcount = nonnull;
+		return lion_emit_tuple(st, st->outerkey, st->outerisnull,
+							  (Datum) 0, true, count);
+	}
+}
+
+/*
+ * Whichever of them the plan asks for.
  */
 static TupleTableSlot *
 lion_next_group_any(LionCountScanState *st, bool *exhausted)
 {
+	if (st->distattno != 0)
+		return lion_next_group_distinct(st, exhausted);
 	if (st->groupattno2 != 0)
 		return lion_next_group2(st, exhausted);
 	if (st->ingroupitem >= 0)
@@ -5773,11 +6523,22 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	if (st->wheremissing)
 	{
 		st->done = true;
-		/* A sum over all entries still has to report its one row. */
-		if (st->sumall)
+		/*
+		 * A sum over all entries still has to report its one row, and so does
+		 * a count(DISTINCT k) without a GROUP BY (DESIGN.md §26) - unless the
+		 * planner folded a GROUP BY to one group, which does not exist then.
+		 */
+		st->distcount = 0;
+		st->distcolcount = 0;
+		if (st->sumall ||
+			(st->distattno != 0 && st->groupattno == 0 && !st->singlegroup))
 			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 0);
 		return NULL;
 	}
+
+	/* ---- count(DISTINCT k) over the WHERE: one row (DESIGN.md §26) ---- */
+	if (st->distattno != 0 && st->groupattno == 0)
+		return lion_distinct_relation(st);
 
 	/* ---- every entry of the index, summed into one row ---- */
 	if (st->sumall)
@@ -6074,22 +6835,25 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid),
 							 lion_explain_col(st->groupidxoid,
 											  st->driveattno));
-		if (st->groupattno != 0)
+		if (st->groupattno != 0 || st->distattno != 0)
 			appendStringInfo(&buf, "(%s)",
-							 get_attname(st->heapoid, st->groupattno, false));
+							 get_attname(st->heapoid, st->driveattno, false));
 		else
 			appendStringInfoString(&buf, "(all keys)");
 
-		/* The inner index of a two-column GROUP BY (DESIGN.md §20). */
-		if (st->groupattno2 != 0)
+		/*
+		 * The inner index of a two-column GROUP BY (DESIGN.md §20), or of the
+		 * (g, k) pairs of a count(DISTINCT k) per group (§26).
+		 */
+		if (st->innerattno != 0)
 		{
 			appendStringInfoString(&buf, ", ");
 			if (st->npart == 0)
 				appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid2),
 								 lion_explain_col(st->groupidxoid2,
-												  st->groupattno2));
+												  st->innerattno));
 			appendStringInfo(&buf, "(%s)",
-							 get_attname(st->heapoid, st->groupattno2, false));
+							 get_attname(st->heapoid, st->innerattno, false));
 		}
 	}
 
@@ -6179,6 +6943,11 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		pfree(buf.data);
 	}
 
+	/* The column count(DISTINCT) counts (DESIGN.md §26). */
+	if (st->distattno != 0)
+		ExplainPropertyText("Distinct Key",
+							get_attname(st->heapoid, st->distattno, false), es);
+
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Heap Blocks Skipped via VM", NULL,
@@ -6215,5 +6984,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 * values live on plus one descent, not a descent per value.
 		 */
 		ExplainPropertyInteger("Directory Pages Read", NULL, st->dirpages, es);
+
+		/*
+		 * The existence (or count) tests a count(DISTINCT k) made: one per
+		 * entry of k without a GROUP BY, one per group and one per (g, k) pair
+		 * with one (DESIGN.md §26).
+		 */
+		if (st->distattno != 0)
+			ExplainPropertyInteger("Distinct Keys Tested", NULL, st->disttests,
+								   es);
 	}
 }

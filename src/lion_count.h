@@ -407,6 +407,17 @@ extern int64 lion_count_sources_cached(Relation heap, Snapshot snapshot,
 									  bool rel_read_only);
 
 /*
+ * Does the same expression hold at least ONE row visible to snapshot?  The
+ * existence test of count(DISTINCT k) (DESIGN.md §26): the very merge of
+ * lion_count_sources_cached(), with the same visibility-map interlock and the
+ * same recheck, stopped at the first container that shows a visible row.
+ */
+extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
+									   int nsources, LionCountSource *sources,
+									   LionCountStats *stats,
+									   LionVisCache *cache);
+
+/*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and
  * count the intersection of their posting sets.  keytypes may be NULL, which
  * means every key already has its index's opcintype.
