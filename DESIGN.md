@@ -877,6 +877,12 @@ Planner integration
     called under the INDEX's collation - which is how `btequalimage`/`btvarstrequalimage` decide
     determinism. A missing support function or a false answer (citext, numeric `1.0`/`1.00`,
     nondeterministic collations) means no.
+  - and, before either is asked, the type is on an explicit list of core types whose equality
+    compares every byte the output function prints (2026-09-23 security review):
+    `lion_type_equalimage()` names them and argues each. equalimage only promises that equal
+    values are interchangeable for deduplication, which is weaker: bpchar registers
+    `btvarstrequalimage`, yet `'a   '` and `'a'` are equal and print differently, so a GROUP BY
+    printed a deleted row's padding. bpchar and every extension type are refused.
 
   A count-only pushdown - no group column in the output and no pinned column echoed - is unaffected:
   every member of the class is counted whatever it is spelled like. `IS NULL` is exempt as well:
