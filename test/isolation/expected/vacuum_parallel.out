@@ -1,0 +1,53 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_prep s2_delete s1_attach s1_vacuum s2_wake s1_check
+step s2_prep: VACUUM (FREEZE) vpar;
+step s2_delete: DELETE FROM vpar WHERE id % 3 = 0;
+step s1_attach: SELECT injection_points_attach('lion-vacuum-page-filtered', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: VACUUM (PARALLEL 2, INDEX_CLEANUP ON) vpar; <waiting ...>
+step s2_wake: 
+	SELECT vpar_wait_for_worker() AS worker_ran_lion_bulkdelete;
+	SELECT vpar_wake_all();
+
+worker_ran_lion_bulkdelete
+--------------------------
+t                         
+(1 row)
+
+vpar_wake_all
+-------------
+             
+(1 row)
+
+step s1_vacuum: <... completed>
+step s1_check: 
+	SELECT (SELECT sum(ntids) FROM lion_index_stats('vpar_a')) AS a_ntids,
+		   (SELECT sum(ntids) FROM lion_index_stats('vpar_b')) AS b_ntids,
+		   (SELECT count(*) FROM vpar) AS rows,
+		   (SELECT count(*) FROM vpar WHERE a = 1) AS a1_seq,
+		   lion_index_count('vpar_a', 1) AS a1_index,
+		   (SELECT count(*) FROM vpar WHERE b = 2) AS b2_seq,
+		   lion_index_count('vpar_b', 2) AS b2_index;
+	SELECT lion_index_verify('vpar_a', true);
+	SELECT lion_index_verify('vpar_b', true);
+
+a_ntids|b_ntids| rows|a1_seq|a1_index|b2_seq|b2_index
+-------+-------+-----+------+--------+------+--------
+  13334|  13334|13334|  3334|    3334|  2667|    2667
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

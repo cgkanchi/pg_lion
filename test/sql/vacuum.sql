@@ -417,5 +417,75 @@ INSERT INTO lion_slacki SELECT i, i % 40 FROM generate_series(4001, 4200) i;
 SELECT lion_index_verify('lion_slacki_k', true);
 SELECT lion_cmp('lion_slacki', 'k = 3');
 
+/*
+ * INLINE entries whose FIRST items lose nothing (DESIGN.md §18, "Measured,
+ * 2026-09-23").  The filter makes one pass and asks the dead-TID callback
+ * about every member once; the unchanged items in front of the first one that
+ * loses a member are copied into the new payload from the page when that item
+ * turns up.  So the deletes below touch only the LAST container of every
+ * entry (the rows past 48000), or empty one container in the MIDDLE of an
+ * entry and leave the ones after it alone, and every kind of item is there:
+ * ARRAY containers (k), sparse segments (s) and RUN containers (r).
+ */
+CREATE TABLE lion_vacpre (i int4, k int4, s int4, r int4);
+INSERT INTO lion_vacpre
+SELECT i, i % 50, i % 3000, i / 1000 FROM generate_series(1, 60000) i;
+CREATE INDEX lion_vacpre_k ON lion_vacpre USING lion (k);
+CREATE INDEX lion_vacpre_s ON lion_vacpre USING lion (s);
+CREATE INDEX lion_vacpre_r ON lion_vacpre USING lion (r);
+VACUUM lion_vacpre;
+SELECT entries, inline_entries, containers, array_containers, ntids
+  FROM lion_index_stats('lion_vacpre_k');
+SELECT entries, inline_entries, sparse_segments > 0 AS has_segments, ntids
+  FROM lion_index_stats('lion_vacpre_s');
+SELECT entries, inline_entries, run_containers > 0 AS has_runs, ntids
+  FROM lion_index_stats('lion_vacpre_r');
+DELETE FROM lion_vacpre WHERE i > 48000 AND i % 7 = 0;
+DELETE FROM lion_vacpre WHERE k = 5 AND i BETWEEN 12001 AND 36000;
+VACUUM lion_vacpre;
+SELECT entries, inline_entries, containers, ntids,
+	   ntids = (SELECT count(*) FROM lion_vacpre) AS ntids_matches_heap
+  FROM lion_index_stats('lion_vacpre_k');
+SELECT entries, inline_entries,
+	   ntids = (SELECT count(*) FROM lion_vacpre) AS ntids_matches_heap
+  FROM lion_index_stats('lion_vacpre_s');
+SELECT entries, inline_entries,
+	   ntids = (SELECT count(*) FROM lion_vacpre) AS ntids_matches_heap
+  FROM lion_index_stats('lion_vacpre_r');
+SELECT lion_index_verify('lion_vacpre_k', true);
+SELECT lion_index_verify('lion_vacpre_s', true);
+SELECT lion_index_verify('lion_vacpre_r', true);
+SELECT lion_cmp('lion_vacpre', 'k = 5');
+SELECT lion_cmp('lion_vacpre', 'k = 6');
+SELECT lion_cmp('lion_vacpre', 's = 17');
+SELECT lion_cmp('lion_vacpre', 'r = 55');
+SELECT lion_cmp('lion_vacpre', 'r = 20');
+
+/*
+ * The same table vacuumed by parallel workers (DESIGN.md §18): lion indexes
+ * declare VACUUM_OPTION_PARALLEL_BULKDEL, so with the size threshold out of
+ * the way each of the three can be vacuumed by a worker.  Whether a worker is
+ * actually free is up to the server, and the result must not depend on it;
+ * test/isolation/vacuum_parallel.spec is where a worker is made to run one.
+ */
+SET min_parallel_index_scan_size = 0;
+SET max_parallel_maintenance_workers = 2;
+DELETE FROM lion_vacpre WHERE i % 11 = 0;
+VACUUM (PARALLEL 2) lion_vacpre;
+RESET min_parallel_index_scan_size;
+RESET max_parallel_maintenance_workers;
+SELECT ntids = (SELECT count(*) FROM lion_vacpre) AS k_ntids_matches_heap
+  FROM lion_index_stats('lion_vacpre_k');
+SELECT ntids = (SELECT count(*) FROM lion_vacpre) AS s_ntids_matches_heap
+  FROM lion_index_stats('lion_vacpre_s');
+SELECT ntids = (SELECT count(*) FROM lion_vacpre) AS r_ntids_matches_heap
+  FROM lion_index_stats('lion_vacpre_r');
+SELECT lion_index_verify('lion_vacpre_k', true);
+SELECT lion_index_verify('lion_vacpre_s', true);
+SELECT lion_index_verify('lion_vacpre_r', true);
+SELECT lion_cmp('lion_vacpre', 'k = 5');
+SELECT lion_cmp('lion_vacpre', 's = 17');
+SELECT lion_cmp('lion_vacpre', 'r = 55');
+
 DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv,
-	lion_slacki;
+	lion_slacki, lion_vacpre;

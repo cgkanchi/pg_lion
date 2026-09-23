@@ -498,6 +498,7 @@ BUILD (`lion_build.c`)
     amstorage = true (§17)           amclusterable = false     ampredlocks = false
     amcanparallel = false            amcanbuildparallel = false    amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
+    amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL (§11, §18; cleanup stays with the leader)
     amgettuple = NULL                amgetbitmap = liongetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
@@ -1152,6 +1153,22 @@ so ambulkdelete processes each leaf in two passes:
 This also removes the latent deadlock between a reader that pins a directory leaf (INLINE entry)
 while taking a container-page SHARE lock and a VACUUM holding that container page while waiting for
 the leaf: VACUUM never blocks on the leaf while holding a container page.
+
+**Parallel VACUUM does not change any of this** (§18, "Measured, 2026-09-23"). Since then lion
+declares `VACUUM_OPTION_PARALLEL_BULKDEL`, so a VACUUM of a table with several indexes hands each
+index's ambulkdelete to whichever participant - the leader or a parallel worker - claims it first.
+Everything above is a statement about ONE index, and one index is still vacuumed start to finish by
+one process: the same chain order, the same cleanup lock on every page, the same waiting rule, the
+same per-process standby barrier (`lion_wal_visit()` keeps one list per backend and one index at a
+time). Two things could have made the process matter, and neither does. The dead-TID set is still
+fixed before any index is cleaned (the workers read the leader's store and nobody adds to it until
+every index is done), and the heap is still only marked all-visible after `lazy_vacuum_all_indexes()`
+has waited for every participant, so a reader's pin still holds the whole cycle off from making its
+TIDs' heap pages all-visible - whichever process it is blocking. A reader that holds pins in two
+indexes (an AND across two columns) can now block two participants at once instead of one after the
+other, which is the same wait. `amvacuumcleanup` stays with the leader: it only vacuums the free
+space map. `test/isolation/vacuum_parallel.spec` makes a worker run a lion ambulkdelete and checks
+what it leaves.
 
 Deadlock rule for readers: never acquire a directory lock while holding a pin on a container page.
 VACUUM holds the leaf and then waits for cleanup locks on that entry's container pages; a reader
@@ -2374,6 +2391,97 @@ bucket page at a time.
 order on every page; a page is freed only after it has been cleaned and found empty under that
 lock, so a reader's pin on a page it took containers from still blocks everything that could make
 those TIDs' heap pages all-visible.
+
+### Measured, 2026-09-23: parallel VACUUM, and the callback asked once per TID
+
+The focused benchmark of 2026-09-23 (PostgreSQL 18.6, release build,
+bench/results/2026-09-23-eb1579e-pg18-focused) had `VACUUM (ANALYZE)` of the 5M-row, seven-index
+scalar table after its maintenance sequence at B-tree 3,399 ms, GIN 3,823 ms and lion 4,374 ms. **Most of that gap was not lion's code at all: lion
+declared `VACUUM_OPTION_NO_PARALLEL`**, and the benchmark runs VACUUM with the default
+`max_parallel_maintenance_workers = 2`, so B-tree's seven indexes were vacuumed by three processes and
+lion's by one. Measured separately (below), lion's serial VACUUM was 14-20% slower than B-tree's
+serial one, and its default (parallel for B-tree only) one 38-47% slower.
+
+*Set-up* (release builds, -O2 and no assertions, PostgreSQL 19beta4; shared_buffers 512MB,
+maintenance_work_mem 512MB, max_wal_size 8GB, checkpoint_timeout 1h, fsync and synchronous_commit on,
+autovacuum off, max_parallel_maintenance_workers left at 2 - the benchmark's settings). Two clusters,
+one without and one with `shared_preload_libraries = 'pg_lion'`, so every index is generic-WAL in
+the first and rmgr-WAL in the second (§25). One run is: `CREATE TABLE fact AS SELECT * FROM fact0`
+(fact0 is the benchmark generator's table, `bench/comprehensive/workloads.py` scalar_data(), built
+once), `VACUUM (FREEZE, ANALYZE) fact`, the seven single-column indexes of ONE family (c2, c20,
+c200, c20k, c1m, skew, nullable; `none` for the heap alone), the benchmark's maintenance sequence
+(`INSERT` of 1% new rows, `UPDATE fact SET c200 = (c200 + 1) % 200 WHERE id <= rows/100`,
+`DELETE FROM fact WHERE id % 100 = 1`), `CHECKPOINT`, and then the timed statement, `VACUUM fact` or
+`VACUUM (PARALLEL 0) fact`, with `client_min_messages = debug1` to collect ambulkdelete's own
+breakdown. The old and the new `pg_lion.so` were swapped (rename, restart) between every round, the
+configurations alternate inside a round, and the machine was shared with other work, so each cell is
+a median with its [min-max] and anything under 10% is noise. (The driver was a throwaway shell
+script around exactly these statements and is not in the tree; bench/vacuum_micro.sh measures the
+older eight-index portfolio above.)
+
+*Where the time goes* (5M rows, rmgr, serial, old code; ms, sum over the seven indexes):
+1,224 ms of ambulkdelete, of which chain-page filtering 400, INLINE entry work 618, WAL apply 94,
+cleanup-lock waits 1, and the walk itself the rest. Filtering is almost all the dead-TID callback:
+c2's 5M TIDs filter in 82 ms, 16 ns a TID, and every index has 5M TIDs, so the callback alone is
+about half of ambulkdelete. nbtree asks the same callback about the same TIDs, and the API gives no
+cheaper question to ask (it is opaque; a range test against the dead-TID store would need the
+store, which is not the AM's), so that half is the floor. The INLINE work had one real waste: an
+entry that changes was filtered TWICE, a probe pass to find out whether anything changes and then a
+second pass - asking the callback again - to build the new payload, and on c20k (twenty thousand
+entries of 250 TIDs) every entry changes. A cycle-counter split of pass 1 (temporary, on the new
+code) shows what is left: on c1m (a million entries of five TIDs) 40% is filtering the unchanged
+entries, 41% writing the changed leaves - one record per leaf, each with its full-page image after
+the checkpoint, the same as nbtree pays per leaf - and 9% the 95k entries that change; on c20k 62%
+is filtering the entries that change, now once, and 30% writing them.
+
+What changed:
+
+1. **`amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL`** (§6, `lion_am.c`). §11 has the
+   argument for why the interlock holds whatever process runs an index's ambulkdelete;
+   `test/isolation/vacuum_parallel.spec` makes a worker run one (it reports `f` with the old
+   setting) and checks the result. amvacuumcleanup stays with the leader: it only vacuums the FSM.
+2. **One pass over an INLINE payload**: the callback is asked about every member once
+   (`lion_vacuum_inline_filter()`). The items in front of the first one that loses a member are
+   copied from the page when it turns up; `lion_container_optimize()` is a function of the member
+   set, so the payload built is byte for byte the old one (`test/sql/vacuum.sql`, "INLINE entries
+   whose FIRST items lose nothing", drives the prefix copy through ARRAY, RUN and sparse items).
+3. An INLINE entry that is not about to be deleted is not kept past pass 1 and its key is not
+   copied: one allocation less per entry. Not measurable on its own.
+
+Neither protocol nor WAL changed: the WAL of every run is identical before and after (the column).
+
+    VACUUM wall ms, median [min-max]       old lion              new lion              btree          WAL MiB (lion / btree)
+    1M rows (5 rounds)
+      rmgr,    default (parallel)       561 [492-619]         471 [451-501]         370-392 [354-454]   139 / 136
+      generic, default (parallel)       658 [640-694]         505 [497-552]            -                147
+      rmgr,    PARALLEL 0               596 [568-651]         537 [520-596]         483-504 [452-544]
+      generic, PARALLEL 0               654 [590-718]         662 [611-2027]           -
+      heap alone (no index)             301-329 [275-375]
+    5M rows (3 rounds)
+      rmgr,    default (parallel)     3,350 [3061-4012]     2,638 [2568-2794]     2,314-2,544 [2223-3628]  579 / 644
+      generic, default (parallel)     3,347 [3283-4027]     2,648 [2551-3062]          -                580
+      rmgr,    PARALLEL 0             3,391 [2991-3466]     3,775 [3422-4837]*    2,888-2,983 [2791-4800]
+      heap alone (no index)           1,781 [1650-3370]     (1,509 min)
+
+    ambulkdelete, sum over the seven indexes (serial runs), median ms
+                     old rmgr   new rmgr   old generic   new generic     of which c20k (rmgr)
+      1M rows          293        262          372           350             44 -> 32
+      5M rows        1,224      1,143        1,329         1,256            278 -> 200
+
+(*) the new serial 5M cell and the second heap-alone cell were hit by other work on the machine -
+their minima are in line with the old ones; the ambulkdelete sums, which only time the index, went
+down. A B-tree cell gives two medians: its runs alternated with the old and with the new lion build,
+and it is the same B-tree both times.
+
+So the VACUUM of the benchmark's portfolio is now 16-23% faster in both WAL modes: 4-14% slower
+than B-tree's at 5M rows (from 38%), 20-27% at 1M (from 47%). What is left is shape, not overhead:
+with three participants the wall time is bounded below by the longest index, and c1m - 632k INLINE
+entries at 1M rows - is that index there (133 ms of the parallel run's 471). Its cost is one callback per TID, one pass over each
+entry and one full-page image per leaf, which is what nbtree pays for the same column. Not done:
+the REGROW path (§18, `lion_vacuum_regrow()`) filters a container that outgrew its slot a second
+time - on skew, 561 containers at 5M rows, about 30 ms of that index's 128 - and could instead reuse
+the first result when the container's bytes on the page are unchanged; below the noise here, and
+it touches the one path that re-places containers, so it waits for a workload where it matters.
 
 ## 19. OR across columns in the count pushdown (v1, implemented)
 
