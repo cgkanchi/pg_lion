@@ -79,9 +79,14 @@ CREATE TABLE lion_vfy_hot (i int4, k int4, payload text) WITH (fillfactor = 50);
 INSERT INTO lion_vfy_hot
 SELECT i, i % 97, 'p' || i FROM generate_series(1, 50000) i;
 CREATE INDEX lion_vfy_hot_k ON lion_vfy_hot USING lion (k);
+-- (the xact counters are read inside the updating transaction: after it
+-- commits they are pending only until the backend flushes them, which a slow
+-- backend does before the next statement arrives)
+BEGIN;
 UPDATE lion_vfy_hot SET payload = 'q' || i WHERE i % 3 = 0;
 SELECT pg_stat_get_xact_tuples_hot_updated('lion_vfy_hot'::regclass) > 0
 	   AS had_hot_updates;
+COMMIT;
 SELECT lion_index_verify('lion_vfy_hot_k', true);
 SELECT entries, ntids FROM lion_index_stats('lion_vfy_hot_k');
 -- the HOT chains survive a VACUUM (which prunes them) unchanged
