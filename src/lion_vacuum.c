@@ -57,6 +57,13 @@
  *	  entry tuple's counters travel in the same WAL record as the containers
  *	  they count, so a crash can never desynchronise them.
  *
+ * None of the three cares which process runs ambulkdelete, and since lion
+ * declares VACUUM_OPTION_PARALLEL_BULKDEL (lion_am.c) it may be a parallel
+ * vacuum worker: one index is still vacuumed start to finish by one process,
+ * everything this file keeps lives in its LionVacState or in that process's
+ * standby barrier list (lion_wal_visit()), and the heap is only marked
+ * all-visible after every participant has finished (DESIGN.md §11).
+ *
  * Hence each bucket is processed in two passes.
  *
  *	Pass 1 walks the directory leaves.  Each leaf is cleanup-locked with
@@ -188,6 +195,9 @@ typedef struct LionVacState
 	IndexBulkDeleteResult *stats;
 	double		numtids;		/* sum of ntids over every entry */
 	LionContainer *cbuf;			/* aligned container work buffer */
+	LionContainer *cbuf2;		/* and a second one, for the unchanged items
+								 * in front of the first INLINE item that
+								 * loses a member (lion_vacuum_inline_filter) */
 	MemoryContext pagecxt;		/* reset per container page */
 	MemoryContext bucketcxt;	/* reset per bucket page: pass 1 keeps its
 								 * findings across pass 2, which resets
@@ -235,7 +245,9 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
 }
 
 /*
- * One entry as pass 1 found it on a directory leaf.
+ * One entry as pass 1 found it on a directory leaf: every CHAIN entry, and
+ * every INLINE entry whose posting set is empty (the only INLINE entries a
+ * later step looks at again).
  *
  * off is a HINT: it is where the entry was when pass 1 looked, and every
  * later use of it is checked against (kind, key) first, because an insert
@@ -428,6 +440,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.stats = stats;
 	vs.numtids = 0;
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	vs.cbuf2 = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.nblocks = RelationGetNumberOfBlocks(index);
 	vs.visited = (uint8 *) palloc0((vs.nblocks + 7) / 8 + 1);
 	lion_vac_visit(&vs, LION_METAPAGE_BLKNO);
@@ -487,6 +500,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	MemoryContextDelete(vs.pagecxt);
 	MemoryContextDelete(vaccxt);
 	pfree(vs.visited);
+	pfree(vs.cbuf2);
 	pfree(vs.cbuf);
 
 	stats->num_pages = RelationGetNumberOfBlocks(index);
@@ -549,6 +563,24 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 }
 
 /*
+ * Append one item, filtered or unchanged, to the payload being built for an
+ * INLINE entry, in its smallest form; an item that has lost every member is
+ * dropped.
+ */
+static void
+lion_vac_inline_append(StringInfo newpay, LionContainer *item,
+					   uint32 *ncontainers, uint64 *ntids)
+{
+	if (item->cardinality == 0)
+		return;					/* drop empty containers and segments */
+
+	lion_vac_optimize_item(item);
+	appendBinaryStringInfo(newpay, (char *) item, lion_item_size(item));
+	(*ncontainers)++;
+	*ntids += item->cardinality;
+}
+
+/*
  * Filter the payload of one INLINE entry, which pass 1 has under a cleanup
  * lock, and say what has to happen to it.  Nothing is written here.
  *
@@ -556,10 +588,25 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * removes 1% of the rows leaves 99% of the entries untouched, and finding
  * that out must not cost a single allocation.  So the payload is filtered
  * straight out of the page (the cleanup lock makes it stable) into the shared
- * work buffer, and only an entry that really loses a member pays for the
- * second pass that builds its new payload.  Before this split, a 632k-entry
- * index spent 278 ms of a 378 ms ambulkdelete here, nearly all of it on
- * palloc/StringInfo work for entries that then turned out to be unchanged.
+ * work buffer, and only an entry that really loses a member starts building a
+ * new payload.  Before that, a 632k-entry index spent 278 ms of a 378 ms
+ * ambulkdelete here, nearly all of it on palloc/StringInfo work for entries
+ * that then turned out to be unchanged.
+ *
+ * It is ONE pass, and the dead-TID callback is asked about every member
+ * exactly once (DESIGN.md §18, "Measured, 2026-09-23").  The callback is the
+ * largest single cost of an ambulkdelete - one dead-TID lookup per TID, as
+ * nbtree pays too - and an earlier version probed the payload and then
+ * filtered all of it a SECOND time to build the new one, which doubled that
+ * cost for every entry that changes; on a column with a few hundred TIDs per
+ * key every entry loses one.  The items in front of the first one that loses
+ * a member are unchanged, so when that item turns up they are re-read from
+ * the page into a second buffer and appended without asking the callback
+ * again; everything from there on is filtered once and appended as it goes.
+ * Every appended item goes through lion_vac_optimize_item() exactly as
+ * before: a container's optimal form is a function of its members alone
+ * (lion_container_optimize()), so the new payload is byte for byte the one
+ * the two-pass version built.
  *
  * Returns false when nothing changes.  Otherwise *res describes the write,
  * with everything allocated in vs->pagecxt, which lives until this bucket
@@ -576,7 +623,9 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	const char *onpage = LionEntryGetPayload(entry);
 	LionVacPred	pred;
 	StringInfoData newpay;
+	bool		building = false;
 	Size		cur = 0;
+	Size		csize;
 	Size		payoff;
 	Size		need;
 	uint64		removed = 0;
@@ -586,31 +635,40 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	pred.callback = vs->callback;
 	pred.callback_state = vs->callback_state;
 
-	/* Probe: does this entry lose anything at all? */
-	while (lion_inline_fetch(onpage, paylen, &cur, vs->cbuf) > 0)
-		removed += lion_vac_filter_item(vs->cbuf, &pred);
+	while ((csize = lion_inline_fetch(onpage, paylen, &cur, vs->cbuf)) > 0)
+	{
+		uint32		r = lion_vac_filter_item(vs->cbuf, &pred);
+
+		if (!building)
+		{
+			Size		prefix = cur - csize;
+			Size		pcur = 0;
+
+			if (r == 0)
+				continue;		/* nothing has changed yet: allocate nothing */
+
+			/*
+			 * The first item that loses a member.  Everything in front of it
+			 * is unchanged and goes into the new payload straight from the
+			 * page, through the second buffer: vs->cbuf holds this item's
+			 * filtered form.
+			 */
+			building = true;
+			initStringInfo(&newpay);
+			while (pcur < prefix &&
+				   lion_inline_fetch(onpage, prefix, &pcur, vs->cbuf2) > 0)
+				lion_vac_inline_append(&newpay, vs->cbuf2, &ncontainers,
+									   &ntids);
+		}
+
+		removed += r;
+		lion_vac_inline_append(&newpay, vs->cbuf, &ncontainers, &ntids);
+	}
 
 	if (removed == 0)
 	{
 		vs->numtids += (double) entry->ntids;
 		return false;
-	}
-
-	/* It does, so build the payload that replaces it. */
-	initStringInfo(&newpay);
-	cur = 0;
-	while (lion_inline_fetch(onpage, paylen, &cur, vs->cbuf) > 0)
-	{
-		(void) lion_vac_filter_item(vs->cbuf, &pred);
-
-		if (vs->cbuf->cardinality == 0)
-			continue;			/* drop empty containers and segments */
-
-		lion_vac_optimize_item(vs->cbuf);
-		appendBinaryStringInfo(&newpay, (char *) vs->cbuf,
-							   lion_item_size(vs->cbuf));
-		ncontainers++;
-		ntids += vs->cbuf->cardinality;
 	}
 
 	vs->stats->tuples_removed += (double) removed;
@@ -858,11 +916,6 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		ent->kind = lion_entry_kind(entry);
 		ent->keylen = entry->keylen;
 		ent->keydata = NULL;
-		if (entry->keylen > 0)
-		{
-			ent->keydata = (char *) palloc(entry->keylen);
-			memcpy(ent->keydata, LionEntryGetKey(entry), entry->keylen);
-		}
 
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
 		{
@@ -874,6 +927,20 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 			}
 			else
 				ent->maydelete = (entry->ntids == 0);
+
+			/*
+			 * An INLINE entry that is not about to be deleted is finished
+			 * with: nothing after pass 1 looks at it again, so it is not
+			 * kept, and its key is not copied.  On a column of one or two
+			 * TIDs per key that is nearly every entry of the index, and the
+			 * copy was an allocation per entry.
+			 */
+			if (!ent->maydelete)
+			{
+				nents--;
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
 		}
 		else if ((entry->flags & LION_ENTRY_CHAIN) != 0)
 		{
@@ -893,6 +960,13 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 			UnlockReleaseBuffer(buf);
 			elog(ERROR, "lion index: entry %u on block %u has invalid flags %u",
 				 off, blk, flags);
+		}
+
+		/* Later steps find the entry again by its key (DESIGN.md §21). */
+		if (entry->keylen > 0)
+		{
+			ent->keydata = (char *) palloc(entry->keylen);
+			memcpy(ent->keydata, LionEntryGetKey(entry), entry->keylen);
 		}
 
 		CHECK_FOR_INTERRUPTS();
