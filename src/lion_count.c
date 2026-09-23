@@ -155,6 +155,8 @@ typedef struct LionCountCtx
 	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
 	bool		serializable;	/* IsolationIsSerializable() at start: take page predicate locks */
 	bool		in_recovery;	/* hot standby: the pin interlock does not hold, recheck everything */
+	bool		rel_read_only;	/* the statement does not modify heap: on-access
+								 * pruning may set the VM (DESIGN.md §11) */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
 	int64		count;			/* members counted straight from the VM */
 	LionCountStats stats;
@@ -2892,7 +2894,9 @@ lion_vis_entry_visible(const LionVisEntry *e, OffsetNumber off)
  *	1. The tuple we found could be removed.  It is visible to our snapshot,
  *	   which is registered, so it is not dead to all: neither HOT pruning nor
  *	   VACUUM may remove it or its root line pointer.
- *	2. HOT pruning could rewrite the chain under us.  It may: it can turn the
+ *	2. HOT pruning could rewrite the chain under us - a core scan's, or on 19
+ *	   and later the count's own, just before it reads the block (see
+ *	   lion_recheck_heap_heap()).  It may: it can turn the
  *	   root line pointer into a redirect and drop intermediate versions.  But
  *	   it only removes versions that are dead to ALL snapshots - therefore
  *	   invisible to ours - and it keeps every surviving version reachable from
@@ -3413,6 +3417,31 @@ lion_recheck_heap_am(LionCountCtx *cx)
  * all, and the blocks that are left are fetched once each, as they always
  * were.  lion_vis_cache_lookup() carries the argument for why a remembered
  * answer is still the right one.
+ *
+ * PRUNING ON ACCESS (PostgreSQL 19 and later; DESIGN.md §11, "On-access
+ * pruning sets the visibility map too").  Every block that is read is first
+ * offered to heap_page_prune_opt(), exactly as a bitmap heap scan offers it
+ * (BitmapHeapScanNextBlock()): pinned, not locked, with the count's own
+ * visibility map pin to reuse.  If the page qualifies - something prunable,
+ * little free space, the cleanup lock free right now - it is pruned, and when
+ * the statement does not modify the relation (cx->rel_read_only) and what is
+ * left is visible to every snapshot, it is marked all-visible, so that the
+ * next count, or the next group of this one, reads it from the map instead of
+ * rechecking it.  That a map bit set this way is as good as one VACUUM set -
+ * a pinned container's TID on an all-visible page is exactly one visible row -
+ * is the argument of that DESIGN.md subsection, checked against pruneheap.c.
+ * Here it only has to be safe to call:
+ *
+ *	- no lock is held that it could wait behind: the index pages of the merge
+ *	  are pinned, never locked, at a flush, the heap cleanup lock is only ever
+ *	  tried, and the VM page is pinned before that and locked only briefly,
+ *	  as by every core scan;
+ *	- the answers below are taken after it, from the pruned page, and pruning
+ *	  removes only versions no snapshot can see and never moves a root line
+ *	  pointer, which is all the per-TID recheck and the cache rely on (point 2
+ *	  of the argument on lion_vis_cache_lookup());
+ *	- it does nothing in recovery (its own first test), and on 16-18 the call
+ *	  compiles to nothing (lion_compat.h), where core's scans still prune.
  */
 static int64
 lion_recheck_heap_heap(LionCountCtx *cx)
@@ -3446,6 +3475,7 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 		e = lion_vis_cache_prepare(cx, blk, e);
 
 		buf = ReadBuffer(cx->heap, blk);
+		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		cx->stats.blocks_rechecked++;
 
@@ -3534,12 +3564,18 @@ lion_recheck_flush(LionCountCtx *cx)
  * The merge
  * --------------------------------------------------------------------- */
 
+/*
+ * The SQL-callable counts come through here and cannot see the statement that
+ * called them, which may be modifying the relation: they prune on access but
+ * never ask pruning to set the visibility map (rel_read_only = false, as core
+ * passes for a scan of a result relation; DESIGN.md §11).
+ */
 int64
 lion_count_sources(Relation heap, Snapshot snapshot, int nsources,
 				  LionCountSource *sources, LionCountStats *stats)
 {
 	return lion_count_sources_cached(heap, snapshot, nsources, sources, stats,
-									NULL);
+									NULL, false);
 }
 
 /*
@@ -4058,7 +4094,7 @@ lion_sources_one_set(int nsources, const LionCountSource *sources)
 int64
 lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 						 LionCountSource *sources, LionCountStats *stats,
-						 LionVisCache *cache)
+						 LionVisCache *cache, bool rel_read_only)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;
@@ -4268,6 +4304,7 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.in_recovery = RecoveryInProgress() &&
 		!lion_sources_all_rmgr(nsources, sources);
+	cx.rel_read_only = rel_read_only;
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
 
@@ -5153,7 +5190,7 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 		src.sets = &ps;
 
 		n = lion_count_sources_cached(call.heap, snapshot, 1, &src, &stats,
-									 cache);
+									 cache, false);
 		lion_posting_set_release(&ps);
 		MemoryContextSwitchTo(oldcxt);
 

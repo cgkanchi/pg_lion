@@ -589,6 +589,11 @@ Why this is safe (the argument reviewers will check — keep the code shaped lik
 - A TID that is in the index but whose tuple is dead can be counted wrongly only if the heap page is
   all-visible in the VM at the moment we check. VACUUM sets all-visible only after it has removed the
   dead TIDs from *every* index (ambulkdelete) and then from the heap page.
+  (Since PostgreSQL 19 on-access pruning sets all-visible too, so VACUUM is one of two writers.
+  What the argument really rests on is narrower and holds for both: a page holding a dead root
+  line pointer - LP_DEAD - is never marked all-visible by anyone, and only VACUUM, after
+  ambulkdelete, turns LP_DEAD into LP_UNUSED. §11's last subsection proves it against 19's
+  pruneheap.c.)
 - Our ambulkdelete takes `LockBufferForCleanup` on every container page and on every bucket page
   whose INLINE entries it rewrites. Cleanup locks wait for all pins to drop.
 - Therefore: while the counting code holds a *pin* on the page it took a container from, VACUUM
@@ -1154,6 +1159,135 @@ holding a container pin and then asking for the leaf closes the cycle, and buffe
 deadlock detection. Finish with the leaf (copy the entry out, drop its lock) before pinning
 container pages, and never go back. `lion_chain_find_page()` takes SHARE locks
 internally, so do not call it while holding a lock on any page of that chain.
+
+### On-access pruning sets the visibility map too (PostgreSQL 19+)
+
+§9 was written when VACUUM was the only thing that set a VM bit. PostgreSQL 19's
+`heap_page_prune_opt(rel, buf, &vmbuf, rel_read_only)` (pruneheap.c) passes
+`HEAP_PAGE_PRUNE_SET_VM` when the scan's relation is read-only for the query, and
+`heap_page_prune_and_freeze()` then marks the page all-visible if what is left after pruning is.
+Seq, bitmap-heap, index and index-only scans all call it (heapam.c `heap_prepare_pagescan()`,
+heapam_handler.c `BitmapHeapScanNextBlock()`, heapam_indexscan.c), so on 19 pages our
+counts read are made all-visible by core scans whatever pg_lion does, and since this section the
+count's own heap recheck does it too. The claim §9 needs, and that this section proves, is:
+
+> **At any moment at which a heap page is all-visible, every TID that a lion index holds for that
+> page and that the counting reader holds a pin for (§9) is exactly one row visible to every
+> snapshot, the reader's included.**
+
+On 16-18 on-access pruning never sets the VM (the function has no `vmbuffer` argument there), so
+this section is about 19 and later; checked against 19's and 20devel's pruneheap.c, which differ
+only in one `visibilitymap_clear()` call.
+
+**What the index holds.** A lion TID is always a ROOT line pointer: the index is not summarizing,
+so a HOT update inserts no index entry and a heap-only tuple is never pointed at. (A heap-only
+tuple's slot may later be freed and reused, but reuse means a new tuple inserted with its own
+index entries, not an existing entry now naming it; see "LP_UNUSED" below.)
+
+**What an all-visible page may contain after on-access pruning.** `heap_page_prune_and_freeze()`
+plans every line pointer (`prune_freeze_plan()`) and sets the page all-visible only if
+`set_all_visible` survives all of the following, each of which clears it:
+- an LP_NORMAL tuple left on the page that is not `HEAPTUPLE_LIVE`
+  (`heap_prune_record_unchanged_lp_normal()`: RECENTLY_DEAD, INSERT_IN_PROGRESS and
+  DELETE_IN_PROGRESS all clear it), or is LIVE but not yet hinted xmin-committed;
+- the newest xmin of the live tuples still being considered running by any snapshot
+  (`GlobalVisTestXidConsideredRunning(vistest, newest_live_xid)`, after the plan) - the
+  reader's registered snapshot advertises its xmin in its PGPROC, so a row committed after the
+  reader's snapshot keeps the page off the map;
+- **any LP_DEAD item at all**, whether pruning made it just now or it was there already:
+  `heap_prune_record_dead()` and `heap_prune_record_unchanged_lp_dead()` both append to
+  `deadoffsets`/`lpdead_items`, and `if (prstate.lpdead_items > 0) set_all_visible = false`
+  runs before `heap_page_will_set_vm()`, with `Assert(!set_all_visible || lpdead_items == 0)` after
+  it and a `heap_page_is_all_visible()` cross-check on assert builds.
+DEAD tuples themselves never survive into the all-visible page: a DEAD root (an aborted insert, a
+deleted or non-HOT-updated row whose deleter is older than every snapshot) becomes LP_DEAD, which
+by the last bullet blocks the bit; a chain whose root is followed by dead versions is redirected
+to its first live member, and the dead HEAP-ONLY members become LP_UNUSED.
+So on an all-visible page every root line pointer is one of: LP_UNUSED; LP_NORMAL holding a tuple
+visible to all; LP_REDIRECT to a chain whose surviving members are all visible to all.
+
+**Each of those, as a TID in the index.**
+- *LP_NORMAL, visible to all*: one row, visible to the reader. It cannot also be HOT-updated to
+  another visible version: a committed updater makes it at least RECENTLY_DEAD, and an aborted
+  updater leaves a DEAD heap-only successor that `prune_freeze_plan()` frees separately.
+- *LP_REDIRECT*: `heap_prune_chain()` redirects the root to the first non-DEAD member and frees
+  the dead ones before it; for the page to be all-visible that member is LIVE, and it is the only
+  live one for the reason in the previous point. One row. (A redirect whose target is gone becomes
+  LP_DEAD, `heap_prune_chain()`'s `nchain < 2` case, and blocks the bit.)
+- *LP_UNUSED*: the one case that would count a row that does not exist, so it must not happen
+  while the reader's pin is held. On-access pruning never makes a root LP_UNUSED: it frees only
+  heap-only tuples - the members after the root in `heap_prune_chain()` and the unchained DEAD
+  heap-only tuples in `prune_freeze_plan()`'s last loop, and `heap_page_prune_execute()` asserts
+  exactly that - while a dead ROOT goes through `heap_prune_record_dead_or_unused()`, which picks
+  LP_DEAD unless `HEAP_PAGE_PRUNE_MARK_UNUSED_NOW` was passed. `heap_page_prune_opt()` never
+  passes it ("cannot safely determine that during on-access pruning"), and VACUUM passes it only
+  when the relation has no indexes (`vacrel->nindexes == 0`), which a relation with a lion index is
+  not. LP_DEAD to LP_UNUSED is VACUUM's second heap pass (`lazy_vacuum_heap_page()`, the
+  `lp_truncate_only` path), which runs only after every index's ambulkdelete for that cycle -
+  and ambulkdelete cannot pass the page our container came from while we pin it (§11 above). So a
+  pinned container's TID is never LP_UNUSED, and nothing about that changed in 19.
+- *LP_DEAD*: excluded by the page being all-visible.
+- *A heap-only tuple*: excluded by "what the index holds".
+
+**Every other path to the bit.** Besides on-access pruning, 19 sets the VM in VACUUM's first pass
+(the same `heap_page_prune_and_freeze()`, with the same LP_DEAD rule), in its second pass (after
+ambulkdelete), for empty pages, and in `heap_multi_insert()` for COPY FREEZE into a table created
+in the same transaction - none of which depend on who pruned. Nothing else calls
+`visibilitymap_set()`. `heap_page_fix_vm_corruption()` and the fast path for already all-visible
+pages only ever clear. An insert, update or delete still clears the bit under the heap page's
+exclusive lock, so the "stale true" case of §9 is unchanged.
+
+**The cases asked about, one by one.** Aborted insert: the root is DEAD, becomes LP_DEAD, no bit
+until VACUUM has removed the TID. Aborted HOT update: the new version is a DEAD heap-only tuple,
+freed; the old one is LIVE (its xmax aborted) and is the one row. HOT chain with committed
+updates: redirect to the live member, one row; while the replaced version is still RECENTLY_DEAD
+to some snapshot - the reader's included - the page is not all-visible. In-progress insert, update
+or delete: INSERT_/DELETE_IN_PROGRESS, no bit (and the writer cleared it anyway). The reader's own
+earlier writes: its XID is running, so the same. Frozen tuples: visible to all, one row each.
+
+**The standby.** `heap_page_prune_opt()` returns at once in recovery, so a standby never prunes
+on access; it replays the primary's `XLOG_HEAP2_PRUNE_ON_ACCESS` records, whose VM bit is set with
+the page state the primary had - no LP_DEAD - and whose `snapshot_conflict_horizon`
+(`newest_live_xid`) makes `ResolveRecoveryConflictWithSnapshot()` cancel any standby query that
+could still see the page as not visible to all, exactly as for VACUUM's VM records. The LP_DEAD
+to LP_UNUSED step is replayed from VACUUM's own records, which follow its index records in WAL
+order, and in rmgr mode those take the cleanup locks of §9's standby rule. The argument therefore
+reads on the standby word for word; in generic-WAL mode the standby rechecks every TID anyway.
+
+**Conclusion.** The claim holds on 19 and 20devel: on-access VM setting never exposes a TID of a
+pinned container that is not exactly one visible row. That covers the pages core cleans on access
+today with no change of ours, and the count's own pruning below. Index-only scans depend on the
+same property (they too count a TID on an all-visible page without a heap visit), which is some
+reassurance, but it is not the argument: the bitmap-heap-scan skip-fetch that core removed in 18
+failed on the TIDs a scan holds WITHOUT a pin, which is what §9's pin rule is for.
+
+**The count prunes on access too (`lion_recheck_heap_heap()`, 19+ only).** Before share-locking a
+heap block it rechecks, the count calls `heap_page_prune_opt(heap, buf, &vmbuf, rel_read_only)`
+once, exactly as `BitmapHeapScanNextBlock()` does: buffer pinned and NOT locked (the
+function takes the cleanup lock itself, conditionally, and pins the VM page before trying), the
+count's own `vmbuf` pin reused and released where it always was. It takes no lock it could wait
+on while holding another: the index pages the merge still holds are pinned, not locked, and the
+cleanup lock is conditional. `rel_read_only` is decided when the LionCount node starts, as
+`ScanRelIsReadOnly()` decides it for core's scans, but by relation and not by range-table index:
+the node's own RTE is never a result relation (it is only planted in a SELECT with no row marks),
+so the question is whether the statement modifies or row-locks the counted relation, a partition
+of it, or an ancestor of that partition anywhere else - a scalar subquery counting `t` in an
+`UPDATE t` must not set bits the UPDATE is about to clear. The SQL-callable counts
+(`lion_index_count()` and friends) cannot see their statement and pass false: they prune, as any
+core scan of a modified relation does, and never set the VM. The flag is a heuristic about wasted
+work only; the argument above does not depend on it.
+- *The per-query visibility cache* (§9 step 6) stays valid: pruning only removes versions dead to
+  every snapshot, keeps survivors reachable from the root, and never moves a root line pointer,
+  which is the argument the cache already rests on (its point 2); a block answered from the cache
+  is not read at all and is not pruned.
+- *A grouped count* may now meet, in a later group, a page that an earlier group's recheck just
+  made all-visible, and count it from the map: that is the claim above, applied to a container
+  whose page is pinned at the time of the VM check, like any other.
+- *SERIALIZABLE* is unchanged: pruning takes no predicate locks and removes only versions no
+  snapshot can see; the tuple locks of the recheck and the page locks of the VM path are what they
+  were.
+- *The trade*: a count may dirty heap pages and write WAL (a prune record), as core's scans on 19
+  already do; it never does so in recovery.
 
 ## 12. Measured on 20M rows (2026-09-20) and v1 priorities
 
@@ -3243,35 +3377,25 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
 
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
-- **Prune on access in the count's heap recheck (PostgreSQL 19+; next).** PostgreSQL 19's
-  `heap_page_prune_opt()` sets the visibility map when a read-only scan prunes a page
-  (`HEAP_PAGE_PRUNE_SET_VM`); seq, index and bitmap heap scans all call it, so after HOT updates
-  the first core scan of a page makes it all-visible again. LionCount reads the same dirty pages in
-  `lion_recheck_heap_heap()` and does not call it, so it keeps paying the recheck until VACUUM or a
-  core scan cleans the page. Call `heap_page_prune_opt(heap, buf, &vmbuf, rel_read_only)` once per
-  dirty block it reads, as core's scans do, with `rel_read_only` decided at plan time the way
-  `ScanRelIsReadOnly()` decides it (the count never modifies its relation; the same query's
-  other nodes might). On 16-18 the call prunes but cannot set the VM, so it is compiled only for
-  19+ (`lion_compat.h`). The trade: a count can dirty heap pages and write WAL, as core's scans
-  on 19 already do, and it never runs in recovery.
-  **The interlock must be re-argued first (§9, §11), in writing and with a test.** Those sections
-  assume the VM bit is set only by VACUUM, which must take a cleanup lock on our pinned container
-  pages first. The claim to prove is that on-access VM setting preserves "a set container bit on an
-  all-visible page is exactly one visible row": pruning marks a page all-visible only when it has
-  no LP_DEAD items, it never frees a root line pointer (only heap-only tuples, which no index
-  points to), and only VACUUM turns LP_DEAD into LP_UNUSED, after ambulkdelete. Index-only scans
-  depend on the same property, but this is the class of VM race that removed bitmap-heap-scan
-  skip-fetch from core, so it needs an isolation spec (HOT update, count prunes and sets the VM,
-  concurrent VACUUM parked at the existing injection points, exact count asserted) and a check
-  against PostgreSQL 19's pruneheap.c. The argument also covers pages CORE cleaned on access,
-  which already happens on 19 today with no change of ours.
-  Limits: helps only HOT updates (non-indexed columns); deletes and indexed-column updates leave
-  LP_DEAD items and need VACUUM. Measured motivation: the 2026-09-23 PostgreSQL 19 focused run had
-  its dirty pages cleaned by the untimed correctness scan before timing (all but one heap block
-  skipped via the VM; 1.95 ms vs 79.7 ms on 18 for the 5M dense count), so that run's "dirty"
-  rows are clean measurements. Page-at-a-time visibility for dirty pages was considered alongside
-  and deferred past v1: it re-implements HOT-chain visibility outside heapam for a gain on
-  16-18 and on non-HOT churn only.
+- **Prune on access in the count's heap recheck (PostgreSQL 19+) - implemented.** The argument
+  that on-access VM setting keeps "a set container bit on an all-visible page is exactly one
+  visible row", checked against 19's and 20devel's pruneheap.c, and the implementation notes, are
+  in §11's last subsection ("On-access pruning sets the visibility map too"); the claim holds, so
+  the pages core already cleans on access on 19 were never a correctness problem either.
+  `lion_recheck_heap_heap()` calls `heap_page_prune_opt()` once per heap block it reads, with
+  `rel_read_only` decided when the LionCount node starts (the SQL-callable counts pass false).
+  Tests: test/sql/prune.sql (after HOT updates the first pushed-down count leaves the pages
+  all-visible on 19+ and the second rechecks nothing; a GROUP BY meets pages an earlier group
+  cleaned; exact answers everywhere) and test/isolation/count_prune_race.spec (a count parked
+  with its container pinned while VACUUM waits for the pin and core and the count prune around
+  it; exact answers). Limits: helps only HOT updates (non-indexed columns) on pages that are
+  nearly full (pruning's own free-space heuristic); deletes and indexed-column updates leave
+  LP_DEAD items and still need VACUUM. Measured motivation: the 2026-09-23 PostgreSQL 19 focused
+  run had its dirty pages cleaned by the untimed correctness scan before timing (all but one heap
+  block skipped via the VM; 1.95 ms vs 79.7 ms on 18 for the 5M dense count), so that run's
+  "dirty" rows are clean measurements. Page-at-a-time visibility for dirty pages was considered
+  alongside and deferred past v1: it re-implements HOT-chain visibility outside heapam for a gain
+  on 16-18 and on non-HOT churn only.
 - **Insert batching, only if the custom rmgr leaves hot-key throughput short.** A GIN-style pending
   list was considered and rejected: GIN's per-row cost is the number of extracted keys (30 posting
   trees per tsvector row), which batching amortises; ours is one posting-set update per scalar row,

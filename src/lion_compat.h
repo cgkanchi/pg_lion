@@ -86,6 +86,52 @@ lion_ordering_op_is_lt(Oid ltopr, Oid *opfamily, Oid *opcintype)
 	table_index_fetch_tuple_check(rel, tid, snapshot, all_dead)
 #endif
 
+/*
+ * On-access pruning of a heap page the count's recheck is about to read
+ * (DESIGN.md §11, "On-access pruning sets the visibility map too").  19 gave
+ * heap_page_prune_opt() a visibility map pin and a rel_read_only flag, with
+ * which it marks the page all-visible when what is left after pruning is;
+ * that is the whole reason the count calls it.  16-18 have the two-argument
+ * form, which only prunes - core's own scans do that already, so the count
+ * leaves it to them and this is nothing at all there.
+ *
+ * The contract is core's: buf pinned and NOT locked (the function takes the
+ * cleanup lock itself, conditionally), *vmbuf the caller's reusable pin.
+ */
+#if PG_VERSION_NUM >= 190000
+#include "access/heapam.h"
+#define lion_heap_page_prune_opt(rel, buf, vmbuf, rel_read_only) \
+	heap_page_prune_opt(rel, buf, vmbuf, rel_read_only)
+#else
+#define lion_heap_page_prune_opt(rel, buf, vmbuf, rel_read_only) \
+	((void) (rel), (void) (buf), (void) (vmbuf), (void) (rel_read_only))
+#endif
+
+/*
+ * The range table indexes a statement modifies or row-locks - what
+ * ScanRelIsReadOnly() (19) tests a scan's relation against.  19 keeps them as
+ * PlannedStmt.resultRelationRelids and .rowMarkRelids; before, they are the
+ * resultRelations list and the rti of each PlanRowMark.
+ */
+#include "nodes/plannodes.h"
+
+static inline Bitmapset *
+lion_pstmt_written_rtis(const PlannedStmt *pstmt)
+{
+#if PG_VERSION_NUM >= 190000
+	return bms_union(pstmt->resultRelationRelids, pstmt->rowMarkRelids);
+#else
+	Bitmapset  *rtis = NULL;
+	ListCell   *lc;
+
+	foreach(lc, pstmt->resultRelations)
+		rtis = bms_add_member(rtis, lfirst_int(lc));
+	foreach(lc, pstmt->rowMarks)
+		rtis = bms_add_member(rtis, (int) ((PlanRowMark *) lfirst(lc))->rti);
+	return rtis;
+#endif
+}
+
 /* 19 requires TupleDescFinalize() on a hand-built descriptor; before, nothing. */
 #if PG_VERSION_NUM < 190000
 #define TupleDescFinalize(tupdesc)	((void) (tupdesc))

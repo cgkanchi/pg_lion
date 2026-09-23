@@ -393,11 +393,18 @@ extern int64 lion_count_sources(Relation heap, Snapshot snapshot,
  * is what a driver that counts the same relation many times under one
  * snapshot - the GROUP BY path of §10, one call per group - should use; cache
  * may be NULL, and then this is exactly lion_count_sources().
+ *
+ * rel_read_only says that the statement neither modifies nor row-locks heap,
+ * decided the way ScanRelIsReadOnly() decides it for core's scans; on
+ * PostgreSQL 19 and later it lets the on-access pruning of the heap recheck
+ * mark the pages it cleans all-visible (DESIGN.md §11).  It is a hint about
+ * wasted work, never about correctness; pass false when in doubt.
  */
 extern int64 lion_count_sources_cached(Relation heap, Snapshot snapshot,
 									  int nsources, LionCountSource *sources,
 									  LionCountStats *stats,
-									  LionVisCache *cache);
+									  LionVisCache *cache,
+									  bool rel_read_only);
 
 /*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and

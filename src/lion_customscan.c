@@ -54,6 +54,7 @@
 #include "access/nbtree.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "catalog/partition.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_class.h"
@@ -489,6 +490,18 @@ typedef struct LionCountScanState
 	 */
 	LionVisCache *viscache;
 	LionCountStats stats;
+
+	/*
+	 * Whether the statement leaves the relation being counted alone
+	 * (DESIGN.md §11, "On-access pruning sets the visibility map too").  On
+	 * PostgreSQL 19 and later that is what lets the heap recheck's on-access
+	 * pruning mark the pages it cleans all-visible.  writtenrels is every
+	 * relation the statement modifies or row-locks, collected once when the
+	 * node starts; rel_read_only is decided from it whenever a relation (a
+	 * table, or one partition) is opened.
+	 */
+	List	   *writtenrels;
+	bool		rel_read_only;
 
 	/*
 	 * Directory pages this node's execution has read (DESIGN.md §21), as the
@@ -4013,6 +4026,79 @@ lion_heap_attno_in(Relation heap, Oid parentoid, AttrNumber parentattno)
 	return attno;
 }
 
+/*
+ * The relations the statement this node runs in modifies or row-locks, by
+ * Oid: its result relations and its row marks, which are exactly the range
+ * table entries ScanRelIsReadOnly() tests a core scan's relation against.
+ */
+static List *
+lion_statement_written_rels(EState *estate)
+{
+	PlannedStmt *pstmt = estate->es_plannedstmt;
+	Bitmapset  *rtis;
+	List	   *oids = NIL;
+	int			rti = -1;
+
+	if (pstmt == NULL)
+		return NIL;
+
+	rtis = lion_pstmt_written_rtis(pstmt);
+	while ((rti = bms_next_member(rtis, rti)) >= 0)
+	{
+		RangeTblEntry *rte = exec_rt_fetch((Index) rti, estate);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
+			oids = list_append_unique_oid(oids, rte->relid);
+	}
+	bms_free(rtis);
+	return oids;
+}
+
+/*
+ * Is heap read-only for this statement, in the sense of ScanRelIsReadOnly()?
+ * (DESIGN.md §11, "On-access pruning sets the visibility map too.")
+ *
+ * Core asks whether the SCAN's range table entry is a result relation or has
+ * a row mark.  Ours never is: the node is only planted in a SELECT with no
+ * row marks, and a relation the statement also modifies - `UPDATE t SET x =
+ * (SELECT count(*) FROM t WHERE ...)`, a data-modifying CTE, INSERT ...
+ * SELECT - is a different entry of the same table.  So the question is asked
+ * by relation instead: the counted table, or for a partition that partition
+ * or any of its ancestors (an INSERT routed through the parent names only the
+ * parent), must not be among the relations the statement writes or locks.
+ * Setting all-visible bits the same statement is about to clear would be
+ * wasted work, and that is all this decides: the correctness argument does
+ * not depend on it.
+ */
+static bool
+lion_rel_read_only(LionCountScanState *st, Relation heap)
+{
+	Oid			relid = RelationGetRelid(heap);
+	bool		result = true;
+
+	if (st->writtenrels == NIL)
+		return true;
+	if (list_member_oid(st->writtenrels, relid) ||
+		list_member_oid(st->writtenrels, st->heapoid))
+		return false;
+	if (heap->rd_rel->relispartition)
+	{
+		List	   *ancestors = get_partition_ancestors(relid);
+		ListCell   *lc;
+
+		foreach(lc, ancestors)
+		{
+			if (list_member_oid(st->writtenrels, lfirst_oid(lc)))
+			{
+				result = false;
+				break;
+			}
+		}
+		list_free(ancestors);
+	}
+	return result;
+}
+
 static void
 lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 				  Oid groupidxoid2, const Oid *clauseidxoid)
@@ -4023,6 +4109,7 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 
 	st->heap = table_open(heapoid, NoLock);
 	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
+	st->rel_read_only = lion_rel_read_only(st, st->heap);
 
 	for (i = 0; i < st->nclause; i++)
 	{
@@ -4361,6 +4448,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 									   "LionCount clause values",
 									   ALLOCSET_SMALL_SIZES);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
+	st->writtenrels = lion_statement_written_rels(estate);
+	st->rel_read_only = false;
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
@@ -5129,7 +5218,8 @@ lion_count_relation(LionCountScanState *st)
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
 	count = lion_count_sources_cached(st->heap, estate->es_snapshot,
 									 st->nitem, &st->sources[1],
-									 &st->stats, st->viscache);
+									 &st->stats, st->viscache,
+									 st->rel_read_only);
 	MemoryContextSwitchTo(oldcxt);
 
 	return count;
@@ -5212,7 +5302,8 @@ lion_sumall_relation(LionCountScanState *st)
 
 		total += lion_count_sources_cached(st->heap, estate->es_snapshot,
 										  nsource, sources,
-										  &st->stats, st->viscache);
+										  &st->stats, st->viscache,
+										  st->rel_read_only);
 		st->stats.sets_summed++;
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
@@ -5266,7 +5357,8 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 
 		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
 										 st->nsource, st->sources,
-										 &st->stats, st->viscache);
+										 &st->stats, st->viscache,
+										 st->rel_read_only);
 		keyisnull = st->groupset.keyisnull;
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
@@ -5337,7 +5429,8 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 
 		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
 										 st->ndsource, st->dsources,
-										 &st->stats, st->viscache);
+										 &st->stats, st->viscache,
+										 st->rel_read_only);
 		MemoryContextSwitchTo(oldcxt);
 
 		/* A group exists only if at least one of its rows is visible. */
@@ -5457,7 +5550,8 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 
 		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
 										 st->nsource, st->sources,
-										 &st->stats, st->viscache);
+										 &st->stats, st->viscache,
+										 st->rel_read_only);
 		lion_posting_set_release(&st->groupset2);
 		MemoryContextSwitchTo(oldcxt);
 
