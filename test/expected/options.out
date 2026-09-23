@@ -208,4 +208,28 @@ CREATE TABLE lion_noop (x point);
 CREATE INDEX ON lion_noop USING lion (x);
 ERROR:  data type point has no default operator class for access method "lion"
 DROP TABLE lion_noop;
+-- An index carried by pg_upgrade from 16 or 17 onto a later server keeps the
+-- pre-18 hash substitute its opclass was created with (DESIGN.md §23
+-- addendum); it must validate on every major, as it did before the upgrade.
+CREATE OPERATOR FAMILY lion_pre18_bool USING lion;
+CREATE OPERATOR CLASS lion_pre18_bool_ops FOR TYPE bool USING lion
+	FAMILY lion_pre18_bool AS
+	OPERATOR	1	= (bool, bool),
+	FUNCTION	1	hashchar("char"),
+	FUNCTION	4	btboolcmp(bool, bool);
+CREATE OPERATOR CLASS lion_pre18_date_ops FOR TYPE date USING lion AS
+	OPERATOR	1	= (date, date),
+	FUNCTION	1	hashint4(int4),
+	FUNCTION	4	date_cmp(date, date);
+SELECT opcname, amvalidate(oid) FROM pg_opclass
+ WHERE opcname IN ('lion_pre18_bool_ops', 'lion_pre18_date_ops') ORDER BY opcname;
+       opcname       | amvalidate 
+---------------------+------------
+ lion_pre18_bool_ops | t
+ lion_pre18_date_ops | t
+(2 rows)
+
+DROP OPERATOR FAMILY lion_pre18_bool USING lion;
+DROP OPERATOR CLASS lion_pre18_date_ops USING lion;
+DROP OPERATOR FAMILY lion_pre18_date_ops USING lion;
 DROP TABLE lion_opt;
