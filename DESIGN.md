@@ -2006,10 +2006,15 @@ Extraction (`lion_extract_value()`, lion_multikey.c) drops NULL keys and duplica
 holds a NULL element is indexed under its other elements; nothing ever looks for a NULL key, because
 a query with one falls back to a rechecking scan.  Duplicates must go, or `lion_container_add()` would
 report "already indexed" and leave `ntids` wrong.  The dedupe hashes every key once and sorts the
-keys BY THEIR HASH, so the only candidates for equality are adjacent and each key is compared (with
-the equality proc, the only ordering-free tool the opclass promises) against the distinct keys of its
-own hash run - one of them, except on a hash collision.  A row with n keys therefore costs n hashes,
-one sort and about n equality calls; the keys come out in hash order, which nothing depends on.
+keys by (hash, the key type's btree order when it has one, §21), so the only candidates for equality
+are adjacent, and each key is compared with the equality proc against the distinct keys of its own
+run of neighbours that tie on both - one of them.  A row with n keys therefore costs n hashes, one
+sort and about 2n comparisons; the keys come out in that order, which nothing depends on.  Sorting
+by the hash ALONE made a run every key of one hash, and n distinct keys chosen to share one (int8
+`(i << 32) | i`, which `hashint8()` folds to one word) cost n²/2 equality calls: 80000 such
+elements took 17 s per INSERT.  A key type with no ordering (xid, cid) still has only the hash, so
+there a run is quadratic in the keys that genuinely collide, which the built-in hash functions
+keep small.
 
 `ntids` therefore counts (key, row) pairs, and so does `IndexBuildResult.index_tuples`.  A row with
 no keys contributes one pair, in the EMPTY entry.  **VACUUM is unchanged**: its callback is per TID

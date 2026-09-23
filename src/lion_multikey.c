@@ -150,9 +150,9 @@ lion_keynode_flat(LionKeyNodeKind kind, int nkeys)
 
 /*
  * One extracted key's hash and its position in the extraction function's
- * array, sorted by hash so that equal keys become adjacent.  The position is
- * the tie-break, so the order is deterministic whatever qsort does with equal
- * elements.
+ * array.  The keys are sorted by hash, then - when the key type has an
+ * ordering - by that ordering, and the position is the last tie-break, so
+ * the order is deterministic whatever qsort does with equal elements.
  */
 typedef struct LionHashPos
 {
@@ -160,16 +160,33 @@ typedef struct LionHashPos
 	int32		pos;
 } LionHashPos;
 
+typedef struct LionHashPosArg
+{
+	LionState  *state;
+	Datum	   *raw;
+} LionHashPosArg;
+
 static int
-lion_hashpos_cmp(const void *a, const void *b)
+lion_hashpos_cmp(const void *a, const void *b, void *arg)
 {
 	const LionHashPos *x = (const LionHashPos *) a;
 	const LionHashPos *y = (const LionHashPos *) b;
+	LionHashPosArg *ha = (LionHashPosArg *) arg;
 
 	if (x->hash < y->hash)
 		return -1;
 	if (x->hash > y->hash)
 		return 1;
+	if (ha->state->ordered)
+	{
+		int32		c = DatumGetInt32(FunctionCall2Coll(&ha->state->cmpproc,
+														ha->state->collation,
+														ha->raw[x->pos],
+														ha->raw[y->pos]));
+
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
 	return (x->pos < y->pos) ? -1 : ((x->pos > y->pos) ? 1 : 0);
 }
 
@@ -183,19 +200,35 @@ lion_hashpos_cmp(const void *a, const void *b)
  * because a posting set is a set and adding the same TID twice would make
  * lion_container_add() report "already indexed" and leave ntids wrong.
  *
- * Deduplication needs no ordering operator the key type may not have (the
- * opclass only promises a hash and an equality): every key is hashed once and
- * the keys are sorted BY THEIR HASH, which puts the only candidates for
- * equality - the keys with the same hash - next to each other.  Each key is
- * then compared with the equality proc against the distinct keys of its own
- * hash run only, which is one key in every case but a hash collision.  So a
- * tsvector of n lexemes costs n hashes, one sort and about n equality calls,
- * rather than the n^2/2 hash comparisons the first implementation of this
- * function did (a three-hundred-lexeme document: 45000 of them).
+ * Every key is hashed once and the keys are sorted by (hash, ordering), where
+ * the ordering is the key type's btree comparison (DESIGN.md §21) when it has
+ * one.  Equal keys have equal hashes and compare equal, so they end up in the
+ * same RUN of neighbours that tie on both; each key is compared with the
+ * equality proc against the distinct keys of its own run only.
  *
- * The keys come out in hash order rather than in the order the extraction
- * function returned them.  Nothing depends on the order: each key is inserted
- * into its own bucket, and the build sorts by (hash, code) anyway.
+ * With an ordering a run is one distinct key - two keys that compare equal
+ * but are not equal would be an opclass bug - so a value with n keys costs n
+ * hashes, one O(n log n) sort and about 2n comparisons whatever the keys are.
+ * Sorting by the ordering matters: by the hash alone a run is every key of
+ * that hash, and a caller who picks n distinct keys with one hash (int8
+ * values (i << 32) | i, which hashint8() folds to the same word) makes the
+ * pairwise check n^2/2 equality calls - 20000 such elements took a second,
+ * 80000 seventeen, and any role that may INSERT could spend that as often as
+ * it liked.
+ *
+ * Without an ordering (xid, cid: key types with a hash opclass and no btree
+ * one) the hash is all there is, and the run is every key of one hash.  That
+ * stays quadratic in the number of distinct keys that COLLIDE, which for the
+ * built-in types is bounded by the hash function (a 4-byte key hashed by
+ * hash_uint32() does not have thousands of preimages of one value), and the
+ * inner loop checks for interrupts so that statement_timeout still applies.
+ * An opclass whose hash collides freely is its author's choice, and pays the
+ * same price in every same-hash run of the directory as well.
+ *
+ * The keys come out in (hash, ordering) order rather than in the order the
+ * extraction function returned them.  Nothing depends on the order: each key
+ * is inserted into its own entry, and the build sorts by the directory order
+ * anyway.
  *
  * Returns the number of distinct non-NULL keys and puts them in *keys, which
  * is palloc'd in the current context (NULL when there are none).  Zero means
@@ -209,9 +242,10 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 	bool	   *nulls = NULL;
 	Datum	   *out;
 	LionHashPos *ord;
+	LionHashPosArg ha;
 	int			nlive = 0;
 	int			nout = 0;
-	int			runstart = 0;	/* where this hash's distinct keys start */
+	int			runstart = 0;	/* where this run's distinct keys start */
 	int			i;
 	int			j;
 
@@ -227,7 +261,7 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 	if (nraw <= 0 || raw == NULL)
 		return 0;
 
-	/* Hash every non-NULL key once, then sort those hashes. */
+	/* Hash every non-NULL key once, then sort. */
 	ord = (LionHashPos *) palloc(sizeof(LionHashPos) * nraw);
 	for (i = 0; i < nraw; i++)
 	{
@@ -243,8 +277,11 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 		pfree(ord);
 		return 0;
 	}
+	ha.state = state;
+	ha.raw = raw;
 	if (nlive > 1)
-		qsort(ord, (size_t) nlive, sizeof(LionHashPos), lion_hashpos_cmp);
+		qsort_arg(ord, (size_t) nlive, sizeof(LionHashPos), lion_hashpos_cmp,
+				  &ha);
 
 	out = (Datum *) palloc(sizeof(Datum) * nlive);
 
@@ -253,8 +290,17 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 		Datum		key = raw[ord[i].pos];
 		bool		dup = false;
 
-		/* A new hash value starts a new run of possible equals. */
-		if (i > 0 && ord[i].hash != ord[i - 1].hash)
+		/*
+		 * A new hash value, or a key the ordering puts after the previous
+		 * one, starts a new run of possible equals.
+		 */
+		if (i > 0 &&
+			(ord[i].hash != ord[i - 1].hash ||
+			 (state->ordered &&
+			  DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
+											  state->collation,
+											  raw[ord[i - 1].pos],
+											  key)) != 0)))
 			runstart = nout;
 
 		for (j = runstart; j < nout; j++)
@@ -266,6 +312,7 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 				dup = true;
 				break;
 			}
+			CHECK_FOR_INTERRUPTS();
 		}
 		if (!dup)
 			out[nout++] = key;
