@@ -749,12 +749,62 @@ lion_index_equality_op(IndexOptInfo *idx, AttrNumber col)
  * index compared its keys with - which is how btequalimage/btvarstrequalimage
  * decide determinism.  No support function means no (that is btree's rule as
  * well).
+ *
+ * That answer is necessary but not sufficient.  equalimage promises that
+ * equal values are "interchangeable without loss of semantic information",
+ * which is what deduplication needs, and bpchar - whose trailing blanks carry
+ * no meaning to it - registers btvarstrequalimage although 'a   ' = 'a' and
+ * bpcharout prints the blanks: an entry indexed as 'a   ' then printed a
+ * deleted row's spelling for a visible 'a' (the 2026-09-23 review).  An
+ * extension's function is only its author's word, on the same weaker
+ * promise.  So the type also has to be one of the core types below, each of
+ * whose equality compares every byte its output function prints: fixed-width
+ * integers and the date/time types (timetz compares the zone as well as the
+ * instant), uuid, bytea, bit strings (their lengths too), MAC addresses,
+ * inet (family, prefix length and the whole address; cidr is indexed as inet),
+ * enums, and text and name, whose equality under a deterministic collation -
+ * which the support function still decides - is a byte comparison.  bpchar
+ * is left out on purpose; numeric, the floats (-0 and 0), interval ('1 day'
+ * and '24 hours'), jsonb, arrays and ranges have no support function and are
+ * refused either way.  A domain is indexed under its base type's opclass.
  */
 static bool
 lion_type_equalimage(Oid typid, Oid collation)
 {
 	TypeCacheEntry *typentry;
 	Oid			proc;
+
+	switch (typid)
+	{
+		case BOOLOID:
+		case CHAROID:
+		case NAMEOID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case OIDOID:
+		case OIDVECTOROID:
+		case XID8OID:
+		case MONEYOID:
+		case PG_LSNOID:
+		case TEXTOID:
+		case BYTEAOID:
+		case BITOID:
+		case VARBITOID:
+		case DATEOID:
+		case TIMEOID:
+		case TIMETZOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case UUIDOID:
+		case INETOID:
+		case MACADDROID:
+		case MACADDR8OID:
+		case ANYENUMOID:
+			break;
+		default:
+			return false;
+	}
 
 	typentry = lookup_type_cache(typid, TYPECACHE_BTREE_OPFAMILY);
 	if (!OidIsValid(typentry->btree_opf) || !OidIsValid(typentry->btree_opintype))
