@@ -1,0 +1,200 @@
+-- Multi-key extraction when many distinct keys share one hash (DESIGN.md
+-- section 17).
+--
+-- lion_extract_value() drops duplicate keys before a row is indexed under
+-- them.  Keys are brought together by their hash, so a value whose keys all
+-- share one hash is the case that decides whether de-duplication is correct
+-- (every distinct key kept, every repeat dropped) and whether it stays
+-- O(n log n) rather than comparing every pair.  This file checks the first;
+-- the second is what the ordering-aware de-duplication is for, and is not
+-- asserted here because timings are not stable enough to test.
+--
+-- int8 is the ordered case: hashint8() folds the high half into the low one,
+-- so (i << 32) | i hashes the same for every i.  xid is the unordered one: it
+-- has no btree opclass, and a class with a deliberately coarse hash makes its
+-- keys collide.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+
+/* VACUUM can only set all-visible for commits that reached disk (citext.sql). */
+SET synchronous_commit = on;
+
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+
+/*
+ * Run one query through the index and through a plain sequential scan and
+ * prove the two results are equal as multisets.
+ */
+CREATE FUNCTION lion_colcmp(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_c_idx AS %s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_c_seq AS %s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_c_idx' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_c_idx EXCEPT ALL SELECT * FROM lion_c_seq) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_c_seq EXCEPT ALL SELECT * FROM lion_c_idx) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_c_idx, lion_c_seq';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s rows', nrows);
+END $$;
+
+-- ---- int8[]: ordered keys, one hash -------------------------------------
+CREATE FUNCTION lion_samehash(int8) RETURNS int8
+	LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ($1 << 32) | $1 $$;
+
+-- the premise: they really are one hash
+SELECT count(DISTINCT hashint8(lion_samehash(i))) AS hashes
+  FROM generate_series(1, 5000) i;
+
+/*
+ * Row r holds k = 1..300 except the multiples of 3 offset by r, EACH TWICE,
+ * in a scrambled order, so the two copies of a key are rarely neighbours in
+ * the array and every key of the row is in the same hash run.  Row 0 is one
+ * key repeated, row 1000 is 3000 distinct keys and their repeats.
+ */
+CREATE FUNCTION lion_collrow(r int) RETURNS int8[]
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT CASE
+		WHEN r = 0 THEN array_fill(lion_samehash(7), ARRAY[50])
+		WHEN r = 1000 THEN
+			(SELECT array_agg(lion_samehash(k) ORDER BY md5(r || ':' || k || ':' || c))
+			   FROM generate_series(1, 3000) k, generate_series(1, 2) c)
+		ELSE
+			(SELECT array_agg(lion_samehash(k) ORDER BY md5(r || ':' || k || ':' || c))
+			   FROM generate_series(1, 300) k, generate_series(1, 2) c
+			  WHERE (k + r) % 3 <> 0)
+	END $$;
+
+-- the number of (key, row) pairs the index must hold: distinct keys per row
+CREATE FUNCTION lion_collpairs(tab regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+	EXECUTE format('SELECT sum((SELECT count(DISTINCT e::text) FROM unnest(a) e)) FROM %s', tab)
+		INTO n;
+	RETURN n;
+END $$;
+
+-- built by ambuild ...
+CREATE TABLE lion_coll8 (id int, a int8[]);
+INSERT INTO lion_coll8 SELECT r, lion_collrow(r) FROM generate_series(0, 40) r;
+INSERT INTO lion_coll8 VALUES (1000, lion_collrow(1000));
+CREATE INDEX lion_coll8_a ON lion_coll8 USING lion (a);
+
+-- ... and by aminsert, one row at a time
+CREATE TABLE lion_coll8i (id int, a int8[]);
+CREATE INDEX lion_coll8i_a ON lion_coll8i USING lion (a);
+INSERT INTO lion_coll8i SELECT * FROM lion_coll8;
+VACUUM ANALYZE lion_coll8;
+VACUUM ANALYZE lion_coll8i;
+
+-- one entry per distinct key and one TID per distinct key of a row: a
+-- dropped key or a kept repeat would show here, or make verify fail
+SELECT ordered, entries, ntids, ntids = lion_collpairs('lion_coll8') AS pairs_ok
+  FROM lion_index_stats('lion_coll8_a');
+SELECT ordered, entries, ntids, ntids = lion_collpairs('lion_coll8i') AS pairs_ok
+  FROM lion_index_stats('lion_coll8i_a');
+SELECT lion_index_verify('lion_coll8_a', true);
+SELECT lion_index_verify('lion_coll8i_a', true);
+
+-- the answers are the heap's, and they come from the index
+SET enable_seqscan = off;
+SET pg_lion.enable_count_pushdown = off;
+EXPLAIN (COSTS OFF) SELECT id FROM lion_coll8
+	WHERE a @> ARRAY[lion_samehash(1), lion_samehash(2)];
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+SELECT lion_colcmp($$SELECT id FROM lion_coll8
+					  WHERE a @> ARRAY[lion_samehash(1), lion_samehash(2)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8
+					  WHERE a @> ARRAY[lion_samehash(7), lion_samehash(7)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8
+					  WHERE a @> ARRAY[lion_samehash(2999)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8
+					  WHERE a && ARRAY[lion_samehash(3), lion_samehash(301)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8
+					  WHERE a <@ ARRAY[lion_samehash(7), lion_samehash(8)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8i
+					  WHERE a @> ARRAY[lion_samehash(1), lion_samehash(2)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8i
+					  WHERE a && ARRAY[lion_samehash(3), lion_samehash(301)]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_coll8i
+					  WHERE a <@ ARRAY[lion_samehash(7), lion_samehash(8)]$$);
+SELECT count(*) FROM lion_coll8 WHERE a @> ARRAY[lion_samehash(1), lion_samehash(2)];
+SELECT count(*) FROM lion_coll8i WHERE a && ARRAY[lion_samehash(3), lion_samehash(301)];
+
+-- REINDEX goes through the same extraction
+REINDEX INDEX lion_coll8_a;
+SELECT entries, ntids = lion_collpairs('lion_coll8') AS pairs_ok
+  FROM lion_index_stats('lion_coll8_a');
+SELECT lion_index_verify('lion_coll8_a', true);
+
+DROP TABLE lion_coll8, lion_coll8i;
+
+-- ---- xid[]: no ordering, a coarse hash ----------------------------------
+CREATE FUNCTION lion_coll_xid_hash(xid) RETURNS integer
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT (($1::text)::int8 % 3)::int4 $$;
+CREATE OPERATOR CLASS lion_coll_xida_ops FOR TYPE xid[] USING lion AS
+	OPERATOR	2	@> (anyarray, anyarray),
+	OPERATOR	3	&& (anyarray, anyarray),
+	OPERATOR	4	<@ (anyarray, anyarray),
+	FUNCTION	1	lion_coll_xid_hash(xid),
+	FUNCTION	2	ginarrayextract(anyarray, internal, internal),
+	FUNCTION	3	ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
+	STORAGE		xid;
+
+CREATE TABLE lion_collx (id int, a xid[]);
+INSERT INTO lion_collx
+SELECT r, (SELECT array_agg(k::text::xid ORDER BY md5(r || ':' || k || ':' || c))
+			 FROM generate_series(1, 60) k, generate_series(1, 3) c
+			WHERE (k + r) % 4 <> 0)
+  FROM generate_series(1, 30) r;
+CREATE INDEX lion_collx_a ON lion_collx USING lion (a lion_coll_xida_ops);
+CREATE TABLE lion_collxi (id int, a xid[]);
+CREATE INDEX lion_collxi_a ON lion_collxi USING lion (a lion_coll_xida_ops);
+INSERT INTO lion_collxi SELECT * FROM lion_collx;
+VACUUM ANALYZE lion_collx;
+VACUUM ANALYZE lion_collxi;
+
+SELECT ordered, entries, ntids, ntids = lion_collpairs('lion_collx') AS pairs_ok
+  FROM lion_index_stats('lion_collx_a');
+SELECT ordered, entries, ntids, ntids = lion_collpairs('lion_collxi') AS pairs_ok
+  FROM lion_index_stats('lion_collxi_a');
+SELECT lion_index_verify('lion_collx_a', true);
+SELECT lion_index_verify('lion_collxi_a', true);
+
+SELECT lion_colcmp($$SELECT id FROM lion_collx WHERE a @> '{1,2,3}'::xid[]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_collx WHERE a && '{4,8}'::xid[]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_collx WHERE a <@ '{1,2,3}'::xid[]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_collx
+					  WHERE a <@ (SELECT array_agg(k::text::xid)
+									FROM generate_series(1, 60) k)$$);
+SELECT lion_colcmp($$SELECT id FROM lion_collxi WHERE a @> '{1,2,3}'::xid[]$$);
+SELECT lion_colcmp($$SELECT id FROM lion_collxi WHERE a && '{4,8}'::xid[]$$);
+
+DROP TABLE lion_collx, lion_collxi;
+DROP OPERATOR CLASS lion_coll_xida_ops USING lion;
+DROP FUNCTION lion_coll_xid_hash(xid);
+DROP FUNCTION lion_collrow(int);
+DROP FUNCTION lion_collpairs(regclass);
+DROP FUNCTION lion_samehash(int8);
+DROP FUNCTION lion_colcmp(text);
