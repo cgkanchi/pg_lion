@@ -141,13 +141,18 @@ step s3_vacuum	{ VACUUM vgd; }
 # the interlock assertion is s1's output above.  So the first VACUUM must have
 # freed AT LEAST one chain and removed the bulk of the dead TIDs; a second
 # VACUUM after s1 has finished must reach exactly 20 entries / 6000 TIDs.
+# That second VACUUM forces index vacuuming: the leftovers sit on the one heap
+# page s1 had pinned, far below 2% of the table's pages, and a plain VACUUM
+# then takes core's bypass (lazy_vacuum(), BYPASS_THRESHOLD_PAGES) and leaves
+# their TIDs in every index - the 29/6009 this test used to fail with now and
+# then, depending on which page s1 happened to pin.
 step s3_stats	{
 	SELECT entries BETWEEN 20 AND 40 AS entries_in_range,
 		   ntids BETWEEN 6000 AND 6020 AS ntids_in_range,
 		   deleted_pages > 0 AS chains_were_freed
 	  FROM lion_index_stats('vgd_k');
 }
-step s3_vacuum2	{ VACUUM vgd; }
+step s3_vacuum2	{ VACUUM (INDEX_CLEANUP ON) vgd; }
 step s3_stats2	{ SELECT entries, ntids FROM lion_index_stats('vgd_k'); }
 step s3_verify	{ SELECT lion_index_verify('vgd_k', true);
 				  SELECT lion_index_verify('vgd_g', true); }

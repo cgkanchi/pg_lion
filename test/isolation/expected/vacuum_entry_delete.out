@@ -92,7 +92,7 @@ entries_in_range|ntids_in_range|chains_were_freed
 t               |t             |t                
 (1 row)
 
-step s3_vacuum2: VACUUM vgd;
+step s3_vacuum2: VACUUM (INDEX_CLEANUP ON) vgd;
 step s3_stats2: SELECT entries, ntids FROM lion_index_stats('vgd_k');
 entries|ntids
 -------+-----
@@ -204,7 +204,7 @@ entries_in_range|ntids_in_range|chains_were_freed
 t               |t             |t                
 (1 row)
 
-step s3_vacuum2: VACUUM vgd;
+step s3_vacuum2: VACUUM (INDEX_CLEANUP ON) vgd;
 step s3_stats2: SELECT entries, ntids FROM lion_index_stats('vgd_k');
 entries|ntids
 -------+-----
