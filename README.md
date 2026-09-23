@@ -212,8 +212,9 @@ Equality, `IN` lists and the multi-key operators above (no ranges), no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
-[write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants and parameters
-but no multi-column GROUP BY. `IN` lists of more than 1000
+[write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants and parameters,
+a `GROUP BY` of one or two indexed columns, and a `HAVING` over the counts it computes (a `HAVING`
+with a correlated subquery, or a `GROUP BY` of three or more columns, goes to the ordinary plan). `IN` lists of more than 1000
 values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a
 sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
 stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused

@@ -68,6 +68,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "parser/parse_oper.h"
 #include "optimizer/optimizer.h"
@@ -199,7 +200,15 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		each arm}.  Its leaves are the clauses [first, first + sum) of the
  *		lists above, contiguous and in arm order; they are not sources of
  *		their own and pin no value the target list may print
- *	8	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	8	List of Expr: the HAVING clause as an implicit-AND list, the same
+ *		columns and count aggregates as the target list, applied by the node
+ *		to each finished group (DESIGN.md §10).  The PATH carries it here;
+ *		lion_plan_custom_path() moves it into the CustomScan's plan.qual -
+ *		where setrefs.c rewrites its aggregates into references to the
+ *		node's own count columns - and leaves this member empty.  Empty for
+ *		a partitioned table, whose HAVING is applied by the Finalize Agg
+ *		above the node (§16)
+ *	9	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -210,7 +219,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_PARTS		5
 #define LION_PRIV_CLAUSEOPS	6
 #define LION_PRIV_ORS		7
-#define LION_PRIV_TLKINDS	8
+#define LION_PRIV_HAVING		8
+#define LION_PRIV_TLKINDS	9
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -221,6 +231,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * Shape 4 added the OR structure of DESIGN.md §19, and shape 5 the second
  * GROUP BY column of DESIGN.md §20.
  *
+ * Shape 7 added the HAVING member (8) in front of the target-list kinds.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -230,8 +242,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x52424906
-#define LION_PRIV_NMEMBERS	9
+#define LION_PRIV_MAGIC		0x52424907
+#define LION_PRIV_NMEMBERS	10
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -391,6 +403,7 @@ typedef struct LionCountScanState
 	bool		wheremissing;	/* a positive clause selects nothing at all */
 	bool		scanning;
 	bool		done;
+	bool		filtered;		/* the last group failed HAVING, fetch the next */
 	LionEntryScan escan;
 
 	/*
@@ -2647,7 +2660,8 @@ lion_or_group_map(List *ors, int nclause)
  * needs no SRF or window handling here.
  */
 static PathTarget *
-lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target)
+lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target,
+						 List *having)
 {
 	PathTarget *partial_target = create_empty_pathtarget();
 	List	   *non_group_cols = NIL;
@@ -2677,6 +2691,13 @@ lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target)
 		i++;
 	}
 
+	/*
+	 * A count the HAVING alone mentions has to be produced as well, or the
+	 * Finalize Agg would have nothing to combine for it; core's version does
+	 * the same with the havingQual.
+	 */
+	if (having != NIL)
+		non_group_cols = lappend(non_group_cols, having);
 	non_group_exprs = pull_var_clause((Node *) non_group_cols,
 									  PVC_INCLUDE_AGGREGATES |
 									  PVC_RECURSE_WINDOWFUNCS |
@@ -2757,6 +2778,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	double		outrows;
 	bool		haveagg = false;
 	bool		havepositive = false;
+	List	   *having;
+	List	   *checkexprs;
 	ListCell   *lc;
 
 	/* ---- the query as a whole ---- */
@@ -2764,16 +2787,26 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 	if (!parse->hasAggs)
 		return;
-	if (parse->groupingSets != NIL || parse->havingQual != NULL ||
-		root->hasHavingQual)
+	if (parse->groupingSets != NIL)
 		return;
 	if (parse->hasWindowFuncs || parse->hasTargetSRFs ||
 		parse->hasDistinctOn || parse->distinctClause != NIL)
 		return;
 	if (parse->rowMarks != NIL || root->rowMarks != NIL)
 		return;
-	if (extra != NULL && extra->havingQual != NULL)
-		return;
+
+	/*
+	 * HAVING (DESIGN.md §10).  By now it is an implicit-AND list of the
+	 * clauses that mention an aggregate (or are volatile, or contain a
+	 * subquery): the planner has already moved every other clause into WHERE
+	 * (subquery_planner()).  The node knows each group's count before it
+	 * emits the group, so a HAVING over the counts it computes and the
+	 * columns it can print is a filter on its output - checked below against
+	 * the same rules as the target list, and applied by the node itself or,
+	 * for a partitioned table, by the Finalize Agg above it.
+	 */
+	having = (extra != NULL) ? (List *) extra->havingQual :
+		(List *) parse->havingQual;
 
 	/* ---- a single base relation: one table, or one partitioned parent ---- */
 	if (input_rel->reloptkind != RELOPT_BASEREL)
@@ -3100,8 +3133,24 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (singlegroup && !havepositive)
 		return;
 
-	/* ---- the grouped relation's target ---- */
-	foreach(lc, output_rel->reltarget->exprs)
+	/* ---- the grouped relation's target, and the HAVING that filters it ---- */
+	checkexprs = list_copy(output_rel->reltarget->exprs);
+	if (having != NIL)
+	{
+		/*
+		 * A SubPlan would need the node to run a subquery per group; an
+		 * uncorrelated one is an InitPlan by now and arrives as a Param,
+		 * which is a plain value here.
+		 */
+		if (contain_subplans((Node *) having))
+			return;
+		checkexprs = list_concat(checkexprs,
+								 pull_var_clause((Node *) having,
+												 PVC_INCLUDE_AGGREGATES |
+												 PVC_RECURSE_WINDOWFUNCS |
+												 PVC_INCLUDE_PLACEHOLDERS));
+	}
+	foreach(lc, checkexprs)
 	{
 		Node	   *node = (Node *) lfirst(lc);
 
@@ -3301,7 +3350,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * the partially-grouped one and the grouped rel gets a Finalize Agg
 		 * over it further down.
 		 */
-		partialtarget = lion_make_partial_target(root, output_rel->reltarget);
+		partialtarget = lion_make_partial_target(root, output_rel->reltarget,
+												 having);
 	}
 
 	/*
@@ -3449,11 +3499,34 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	cpath->custom_private = lappend(cpath->custom_private, parts);
 	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
 	cpath->custom_private = lappend(cpath->custom_private, ors);
+	cpath->custom_private = lappend(cpath->custom_private,
+									(partialtarget != NULL) ? NIL : having);
 	cpath->methods = &lion_count_path_methods;
 
 	lion_cost_count_path(root, cpath, targets, whereclauses, wherekinds, ors,
 						numgroups, groupest[0], (ngroup == 2) ? groupest[1] : 0,
 						outrows);
+
+	/*
+	 * The HAVING the node applies itself costs an evaluation per group and
+	 * lets a fraction of the groups through: the same accounting cost_agg()
+	 * does for an Agg's quals, so that the two plans stay comparable.  A
+	 * partitioned table's HAVING is the Finalize Agg's and is priced there.
+	 */
+	if (having != NIL && partialtarget == NULL)
+	{
+		QualCost	qual_cost;
+		double		groups = cpath->path.rows;
+
+		cost_qual_eval(&qual_cost, having, root);
+		cpath->path.startup_cost += qual_cost.startup;
+		cpath->path.total_cost += qual_cost.startup +
+			groups * qual_cost.per_tuple;
+		cpath->path.rows = clamp_row_est(groups *
+										 clauselist_selectivity(root, having,
+																0, JOIN_INNER,
+																NULL));
+	}
 
 	/*
 	 * A partitioned GROUP BY produces partial aggregates, so what goes into
@@ -3474,7 +3547,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								 output_rel->reltarget,
 								 AGG_HASHED, AGGSPLIT_FINAL_DESERIAL,
 								 root->processed_groupClause,
-								 NIL,	/* HAVING was refused above */
+								 having,
 								 &agg_final_costs,
 								 numgroups));
 		return;
@@ -3518,6 +3591,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *priv;
 	List	   *ints;
 	List	   *ckinds;
+	List	   *having;
+	List	   *want;
 	bool	   *inor;
 	AttrNumber	groupattno;
 	AttrNumber	groupattno2;
@@ -3545,7 +3620,30 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 											  LION_PRIV_ORS),
 							list_length(ckinds));
 
-	foreach(lc, tlist)
+	/*
+	 * The tuple the node produces has to hold every column and count the
+	 * target list prints AND every one the HAVING compares: setrefs.c
+	 * rewrites both into references to custom_scan_tlist, and an aggregate
+	 * it cannot find there would be left as an Aggref, which no executor
+	 * node but Agg can evaluate.  A count the HAVING alone mentions becomes
+	 * a column the projection above simply does not print.
+	 */
+	having = (List *) list_nth(best_path->custom_private, LION_PRIV_HAVING);
+	want = list_copy(tlist);
+	if (having != NIL)
+	{
+		List	   *refs = pull_var_clause((Node *) having,
+										   PVC_INCLUDE_AGGREGATES |
+										   PVC_RECURSE_WINDOWFUNCS |
+										   PVC_INCLUDE_PLACEHOLDERS);
+
+		foreach(lc, refs)
+			want = lappend(want, makeTargetEntry((Expr *) lfirst(lc),
+												 list_length(want) + 1,
+												 NULL, true));
+	}
+
+	foreach(lc, want)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 		Node	   *expr = (Node *) tle->expr;
@@ -3656,7 +3754,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	pfree(inor);
 
 	cscan->scan.plan.targetlist = tlist;
-	cscan->scan.plan.qual = NIL;
+	cscan->scan.plan.qual = having;
 	cscan->scan.scanrelid = 0;
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = NIL;
@@ -3674,6 +3772,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 											LION_PRIV_CONSTS);
 	priv = list_copy(best_path->custom_private);
 	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
+	lfirst(list_nth_cell(priv, LION_PRIV_HAVING)) = NIL;
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
@@ -4856,6 +4955,14 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	int			i;
 
+	/*
+	 * What the previous group's projection and HAVING allocated is dead once
+	 * the executor asks for the next tuple (ExecScan() resets at the same
+	 * point).  Nothing of the node's own lives in this memory: the clause
+	 * values were copied out of it (lion_eval_clause_values()).
+	 */
+	ResetExprContext(econtext);
+
 	ExecClearTuple(slot);
 	for (i = 0; i < st->ntlist; i++)
 	{
@@ -4924,6 +5031,19 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 	ExecStoreVirtualTuple(slot);
 
 	econtext->ecxt_scantuple = slot;
+
+	/*
+	 * HAVING (DESIGN.md §10): the plan's qual, rewritten by setrefs.c to read
+	 * the counts and keys of this very tuple.  A group that fails it is
+	 * consumed like any other; the caller fetches the next one.
+	 */
+	if (st->css.ss.ps.qual != NULL && !ExecQual(st->css.ss.ps.qual, econtext))
+	{
+		InstrCountFiltered1(st, 1);
+		st->filtered = true;
+		return NULL;
+	}
+
 	if (st->css.ss.ps.ps_ProjInfo != NULL)
 		return ExecProject(st->css.ss.ps.ps_ProjInfo);
 	return slot;
@@ -5442,10 +5562,23 @@ lion_exec_custom_scan(CustomScanState *node)
 	int64		dirbefore = lion_dir_pages_read;
 	TupleTableSlot *slot;
 
-	if (st->done)
-		return NULL;
-
-	slot = lion_exec_custom_scan_internal(node);
+	/*
+	 * One group per call, except that a group the HAVING rejects is not a
+	 * result: keep going until one passes or the groups run out.
+	 */
+	for (;;)
+	{
+		if (st->done)
+		{
+			slot = NULL;
+			break;
+		}
+		st->filtered = false;
+		slot = lion_exec_custom_scan_internal(node);
+		if (slot != NULL || !st->filtered)
+			break;
+		CHECK_FOR_INTERRUPTS();
+	}
 	st->dirpages += lion_dir_pages_read - dirbefore;
 
 	return slot;

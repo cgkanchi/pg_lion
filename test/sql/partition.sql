@@ -275,6 +275,19 @@ SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a');
 SELECT lion_pp('SELECT count(*) FROM lion_part WHERE a = 3');
 RESET enable_partitionwise_aggregate;
 
+-- ---- HAVING on the count --------------------------------------------------
+-- The node emits partial counts, so the HAVING belongs to the Finalize Agg
+-- above it - which also needs the count a HAVING alone mentions, produced as
+-- a partial column the query never prints (DESIGN.md section 10).
+EXPLAIN (VERBOSE, COSTS OFF) SELECT a, count(*) FROM lion_part GROUP BY a HAVING count(*) > 10000;
+EXPLAIN (VERBOSE, COSTS OFF) SELECT a FROM lion_part GROUP BY a HAVING count(*) > 10000;
+SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a HAVING count(*) > 10000');
+SELECT lion_pp('SELECT a FROM lion_part GROUP BY a HAVING count(*) > 10000');
+SELECT lion_pp('SELECT a FROM lion_part GROUP BY a HAVING count(*) > 10000000');
+SELECT lion_pp('SELECT b, count(*) FROM lion_part WHERE s = ''x'' GROUP BY b HAVING count(*) > 10000');
+SELECT lion_pp('SELECT n FROM lion_part GROUP BY n HAVING count(n) < count(*)');
+SELECT lion_pp('SELECT count(*) FROM lion_part WHERE a = 3 HAVING count(*) > 0');
+
 -- ---- the answers themselves ----------------------------------------------
 SELECT count(*) FROM lion_part;
 SELECT a, count(*) FROM lion_part GROUP BY a ORDER BY a;

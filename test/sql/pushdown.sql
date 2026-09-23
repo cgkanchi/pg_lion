@@ -220,11 +220,48 @@ SELECT lion_pd('SELECT count(*) AS c1, count(a) AS c2, count(*) AS c3 FROM lion_
  */
 SELECT lion_pd('SELECT n, count(*) FROM lion_pdt GROUP BY n');
 
+-- ---- HAVING on the count (DESIGN.md section 10) --------------------------
+-- The node knows a group's count before it emits the group, so a HAVING over
+-- the counts and the columns it can print is a filter on its own output.
+-- Every group of lion_pdt.a has exactly 10000 rows.
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) >= 10000');
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > 10000');
+-- a count the HAVING alone mentions is a column the projection does not print
+SELECT lion_pd('SELECT a FROM lion_pdt GROUP BY a HAVING count(*) >= 10000');
+SELECT lion_pd('SELECT a FROM lion_pdt GROUP BY a HAVING count(*) > 10000');
+-- the plain aggregate is one row, which a HAVING may drop
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 HAVING count(*) = 10000');
+SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 HAVING count(*) > 10000');
+-- a two-column group, and two conditions on the count
+SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b HAVING count(*) >= 1429 AND count(*) < 2000');
+-- count(n) of the group column is 0 in the NULL group (section 14)
+SELECT lion_pd('SELECT n, count(*) FROM lion_pdt GROUP BY n HAVING count(n) = 0');
+SELECT lion_pd('SELECT n FROM lion_pdt GROUP BY n HAVING count(n) < count(*)');
+-- the count compared with a pinned column and with an InitPlan's value
+SELECT lion_pd('SELECT b, count(*) FROM lion_pdt WHERE a = 3 GROUP BY a, b HAVING count(*) > a * 400 + (SELECT 228)');
+-- the filter is the plan's qual: EXPLAIN prints it, ANALYZE counts what it removed
+EXPLAIN (COSTS OFF) SELECT a FROM lion_pdt GROUP BY a HAVING count(*) > 10000;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a HAVING count(*) > 1428;
+-- a parameter in the HAVING, under a generic plan
+PREPARE lion_ph(bigint) AS SELECT a FROM lion_pdt GROUP BY a HAVING count(*) >= $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE lion_ph(10000);
+EXECUTE lion_ph(10000);
+EXECUTE lion_ph(10001);
+RESET plan_cache_mode;
+DEALLOCATE lion_ph;
+
 -- ---- shapes that must NOT push down ------------------------------------
 -- count() of a column that neither the GROUP BY nor a WHERE clause constrains
 SELECT lion_pd('SELECT count(n) FROM lion_pdt WHERE a = 3');
--- HAVING
-SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > 9000');
+-- a HAVING that needs a subquery per group (a correlated SubPlan): the
+-- grouping stays with core, though the subquery's own count is ours
+EXPLAIN (COSTS OFF)
+SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > (SELECT count(*) FROM lion_pdt x WHERE x.b = lion_pdt.a);
+-- a HAVING without an aggregate is a WHERE by the time the planner asks us,
+-- and an inequality on the key is not a shape the index answers
+SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING a > 3');
 -- an aggregate we cannot answer
 SELECT lion_pd('SELECT sum(id) FROM lion_pdt WHERE a = 3');
 SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
@@ -303,6 +340,7 @@ SELECT count(*) FROM lion_pde WHERE k = 1;
 
 -- ---- the node inside a larger plan --------------------------------------
 SELECT lion_pd('SELECT x, c FROM (VALUES (1), (2)) v(x), LATERAL (SELECT count(*) c FROM lion_pdt WHERE a = 3) s');
+-- an outer WHERE on the count becomes the subquery's HAVING, and pushes down with it
 SELECT lion_pd('SELECT * FROM (SELECT a, count(*) AS c FROM lion_pdt GROUP BY a) s WHERE c > 0');
 
 -- ---- what EXPLAIN ANALYZE reports ---------------------------------------

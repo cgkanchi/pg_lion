@@ -749,8 +749,27 @@ Planner integration
     materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
     partitioned parents, which are counted one live leaf partition at a time; everything this
     section says about "the relation" then means "the partition being counted".
-  - The query has no HAVING, DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
+  - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
+  - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
+    `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
+    volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
+    so `HAVING a > 3` reaches us as a WHERE inequality and is refused like any other. Of what is
+    left, every Var must satisfy the target-list rule below (a group column, or a column a clause
+    pins to one value, whose printed value is the stored key) and every aggregate must pass the
+    `count` test of §14; a SubPlan (a correlated subquery, evaluated per group) is refused, while an
+    uncorrelated one is an InitPlan by then and arrives as a Param, which is a plain value. The
+    accepted list becomes the CustomScan's `plan.qual`; setrefs.c rewrites its Aggrefs and Vars into
+    INDEX_VAR references against `custom_scan_tlist`, which is why the plan step adds every column
+    and count the HAVING mentions to that list even when the target list does not print it (an
+    Aggref left unmatched there would reach `ExecInitExpr`, which only an Agg node may do).
+    `lion_emit_tuple()` evaluates the qual on the finished group's scan tuple; a group that fails
+    is consumed like any other and the outer fetch loop asks for the next one, counting it in
+    `Rows Removed by Filter`. The cost adds the qual's evaluation per group and scales the row
+    estimate by `clauselist_selectivity()`, as `cost_agg()` does for an Agg's quals. A partitioned
+    table's node emits partial counts, so its HAVING goes to the Finalize Agg above it instead
+    (§16), and the partial target carries the HAVING's counts as well - core's
+    `make_partial_grouping_target()` does the same with the havingQual.
   - Every baserestrictinfo clause is `Var opeq Const` or `Const opeq Var` where Var is a plain column
     of the rel with a *valid* lion index whose opfamily contains that operator as strategy 1 (use
     the index's opfamily and the operator OID; cross-type integer equality is fine because the
@@ -3235,9 +3254,6 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   sorted TID tail merged into the containers on the next insert that finds it full, or by VACUUM),
   which stays inside the pinned-page protocol and keeps counts exact. Multi-key classes are the one
   place a real pending list might pay; revisit only with a measured tsvector ingestion case.
-- **HAVING on the count itself** (`GROUP BY k HAVING count(*) > n`): the node knows each group's
-  count before emitting it; accept a HAVING that references only the count aggregates and the group
-  columns and filter in the node. Today users must write the filter in an outer query.
 - **FK-side join pushdown**: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK column
   is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
   Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
