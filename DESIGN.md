@@ -3243,6 +3243,35 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
 
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
+- **Prune on access in the count's heap recheck (PostgreSQL 19+; next).** PostgreSQL 19's
+  `heap_page_prune_opt()` sets the visibility map when a read-only scan prunes a page
+  (`HEAP_PAGE_PRUNE_SET_VM`); seq, index and bitmap heap scans all call it, so after HOT updates
+  the first core scan of a page makes it all-visible again. LionCount reads the same dirty pages in
+  `lion_recheck_heap_heap()` and does not call it, so it keeps paying the recheck until VACUUM or a
+  core scan cleans the page. Call `heap_page_prune_opt(heap, buf, &vmbuf, rel_read_only)` once per
+  dirty block it reads, as core's scans do, with `rel_read_only` decided at plan time the way
+  `ScanRelIsReadOnly()` decides it (the count never modifies its relation; the same query's
+  other nodes might). On 16-18 the call prunes but cannot set the VM, so it is compiled only for
+  19+ (`lion_compat.h`). The trade: a count can dirty heap pages and write WAL, as core's scans
+  on 19 already do, and it never runs in recovery.
+  **The interlock must be re-argued first (§9, §11), in writing and with a test.** Those sections
+  assume the VM bit is set only by VACUUM, which must take a cleanup lock on our pinned container
+  pages first. The claim to prove is that on-access VM setting preserves "a set container bit on an
+  all-visible page is exactly one visible row": pruning marks a page all-visible only when it has
+  no LP_DEAD items, it never frees a root line pointer (only heap-only tuples, which no index
+  points to), and only VACUUM turns LP_DEAD into LP_UNUSED, after ambulkdelete. Index-only scans
+  depend on the same property, but this is the class of VM race that removed bitmap-heap-scan
+  skip-fetch from core, so it needs an isolation spec (HOT update, count prunes and sets the VM,
+  concurrent VACUUM parked at the existing injection points, exact count asserted) and a check
+  against PostgreSQL 19's pruneheap.c. The argument also covers pages CORE cleaned on access,
+  which already happens on 19 today with no change of ours.
+  Limits: helps only HOT updates (non-indexed columns); deletes and indexed-column updates leave
+  LP_DEAD items and need VACUUM. Measured motivation: the 2026-09-23 PostgreSQL 19 focused run had
+  its dirty pages cleaned by the untimed correctness scan before timing (all but one heap block
+  skipped via the VM; 1.95 ms vs 79.7 ms on 18 for the 5M dense count), so that run's "dirty"
+  rows are clean measurements. Page-at-a-time visibility for dirty pages was considered alongside
+  and deferred past v1: it re-implements HOT-chain visibility outside heapam for a gain on
+  16-18 and on non-HOT churn only.
 - **Insert batching, only if the custom rmgr leaves hot-key throughput short.** A GIN-style pending
   list was considered and rejected: GIN's per-row cost is the number of extracted keys (30 posting
   trees per tsvector row), which batching amortises; ours is one posting-set update per scalar row,
