@@ -644,6 +644,38 @@ SELECT f, i FROM (SELECT f, count(*) FROM lion_pdf GROUP BY f) a,
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
+-- ---- an unpopulated materialized view --------------------------------
+/*
+ * Core refuses to scan a materialized view created WITH NO DATA
+ * (ExecOpenScanRelation()), and the node has to as well rather than count
+ * the empty heap: every shape errors the same way, EXPLAIN without ANALYZE
+ * and CREATE TABLE AS ... WITH NO DATA do not, and a REFRESH brings the
+ * pushdown back.
+ */
+CREATE MATERIALIZED VIEW lion_pdm AS
+	SELECT g % 3 AS k, g % 5 AS j FROM generate_series(1, 10) g WITH NO DATA;
+CREATE INDEX lion_pdm_k ON lion_pdm USING lion (k);
+CREATE INDEX lion_pdm_j ON lion_pdm USING lion (j);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_pdm GROUP BY k;
+SELECT k, count(*) FROM lion_pdm GROUP BY k;
+SELECT count(*) FROM lion_pdm WHERE k = 1;
+SELECT count(*) FROM lion_pdm WHERE k IS NOT NULL;
+SELECT count(DISTINCT k) FROM lion_pdm;
+SELECT j, count(DISTINCT k) FROM lion_pdm GROUP BY j;
+SET pg_lion.enable_count_pushdown = off;
+SELECT k, count(*) FROM lion_pdm GROUP BY k;
+RESET pg_lion.enable_count_pushdown;
+CREATE TEMP TABLE lion_pdm_nd AS SELECT k, count(*) FROM lion_pdm GROUP BY k WITH NO DATA;
+DROP TABLE lion_pdm_nd;
+REFRESH MATERIALIZED VIEW lion_pdm;
+SELECT lion_pd('SELECT k, count(*) FROM lion_pdm GROUP BY k');
+SELECT lion_pd('SELECT count(*) FROM lion_pdm WHERE k = 1');
+SELECT lion_pd('SELECT j, count(DISTINCT k) FROM lion_pdm GROUP BY j');
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP MATERIALIZED VIEW lion_pdm;
 DROP TABLE lion_pdf;
 DROP TABLE lion_pdb;
 

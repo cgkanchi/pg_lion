@@ -4921,8 +4921,27 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * partition at a time (DESIGN.md §16).
 	 */
 	if (st->npart == 0)
+	{
 		lion_open_relation(st, st->heapoid, st->groupidxoid, st->groupidxoid2,
 						  NULL);
+
+		/*
+		 * A materialized view created WITH NO DATA has an empty heap and
+		 * empty indexes, and counting them would answer 0 where core's scan
+		 * refuses to run at all.  So refuse exactly as ExecOpenScanRelation()
+		 * does, and under the same exemption for CREATE TABLE AS ... WITH NO
+		 * DATA (EXPLAIN without ANALYZE has returned above).  Nothing in the
+		 * planner looks at relispopulated, and a REFRESH invalidates the
+		 * plan.  A partition is never a materialized view.
+		 */
+		if ((eflags & EXEC_FLAG_WITH_NO_DATA) == 0 &&
+			!RelationIsScannable(st->heap))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("materialized view \"%s\" has not been populated",
+							RelationGetRelationName(st->heap)),
+					 errhint("Use the REFRESH MATERIALIZED VIEW command.")));
+	}
 
 	/*
 	 * Slot 0 is the (outer) group's posting set, 1 .. nitem the WHERE items,
