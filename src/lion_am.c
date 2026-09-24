@@ -13,11 +13,13 @@
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/pathnodes.h"
@@ -1057,6 +1059,49 @@ lionvalidate(Oid opclassoid)
 	ReleaseSysCache(classtup);
 
 	return result;
+}
+
+/*
+ * The table access methods a lion index may sit on: the heap's, and no other
+ * (DESIGN.md §2 and §23).  Everything here assumes a heap underneath - the
+ * TID encoding has room for the heap's per-page line pointers and no more,
+ * and the count reads the heap's visibility map and relies on the interlock
+ * of DESIGN.md §9, which is a statement about heap VACUUM.  Another table AM
+ * may hand out TIDs of any shape (citus_columnar's are stripe row numbers,
+ * with offsets far past LION_MAX_OFFSET) and keeps no visibility map, or one
+ * that means something else.
+ *
+ * The test is the routine, not the access method's name or Oid: a table AM
+ * created with `HANDLER heap_tableam_handler` is the heap under another name,
+ * and is accepted; a handler that returns anything else - even a copy of the
+ * heap's callbacks - is not, because nothing here can tell what it changed.
+ */
+bool
+lion_table_am_supported(Relation heap)
+{
+	return heap->rd_tableam == GetHeapamTableAmRoutine();
+}
+
+/*
+ * The same as an ERROR, for ambuild and the SQL-callable counts.  ambuild is
+ * the gate that matters: a table changes its access method only by being
+ * rewritten (ALTER TABLE ... SET ACCESS METHOD), which rebuilds its indexes,
+ * and a partition gets its copy of a partitioned index through ambuild as
+ * well, whether it is created, attached or indexed later.  So no lion index
+ * can exist on another table AM, and the checks in the count paths are there
+ * for an index that got there some other way.
+ */
+void
+lion_check_table_am(Relation heap)
+{
+	if (!lion_table_am_supported(heap))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("access method \"lion\" does not support table access method \"%s\"",
+						get_am_name(heap->rd_rel->relam)),
+				 errdetail("Table \"%s\" is not stored in the heap; lion indexes encode heap tuple identifiers and count through the heap's visibility map.",
+						   RelationGetRelationName(heap)),
+				 errhint("Use a table with the heap access method.")));
 }
 
 /*

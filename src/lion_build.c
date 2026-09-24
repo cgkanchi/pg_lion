@@ -1480,6 +1480,13 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	int			sortmem;
 	int			c;
 
+	/*
+	 * Before anything else, and whether or not the table has rows: an index
+	 * that happens to build on an empty table of another table AM would fail
+	 * at the first insert instead, or count wrongly (lion_am.c).
+	 */
+	lion_check_table_am(heap);
+
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));

@@ -13,9 +13,10 @@
 #
 # Every server job runs the suite twice, as DESIGN.md section 25 requires:
 # installcheck in generic-WAL mode and installcheck-rmgr with the custom
-# resource manager preloaded.  Both use ./dev.sh's private cluster, pointed
-# at a socket directory and port of the job's own through LION_SOCK and
-# LION_PORT, and .local/pg is a symlink to the installation under test.
+# resource manager preloaded - and then make hookcheck (DESIGN.md section
+# 23).  All of them use ./dev.sh's private cluster, pointed at a socket
+# directory and port of the job's own through LION_SOCK and LION_PORT, and
+# .local/pg is a symlink to the installation under test.
 
 name: CI
 
@@ -82,6 +83,17 @@ jobs:
         run: |
           eval "$(./dev.sh env)"
           make installcheck-rmgr
+
+      # pg_lion beside another extension on the same planner hook and with
+      # its own resource manager, in both load orders, and the non-heap
+      # table AM refusals (test/hook-check.sh).
+      # The test module goes into the packaged installation with sudo, like
+      # pg_lion itself.
+      - name: hookcheck (hook coexistence, table AMs)
+        run: |
+          sudo make -C test/modules/lion_hooktest install PG_CONFIG="$PWD/$PG_CONFIG" WERROR=1
+          eval "$(./dev.sh env)"
+          make hookcheck HOOKCHECK_SKIP_INSTALL=1
 
       - name: Show regression diffs
         if: failure()
@@ -165,6 +177,11 @@ jobs:
         run: |
           eval "$(./dev.sh env)"
           make installcheck-rmgr WAL_CONSISTENCY=1
+
+      - name: hookcheck (hook coexistence, table AMs)
+        run: |
+          eval "$(./dev.sh env)"
+          make hookcheck WERROR=1
 
       # wal_consistency_checking compares pages only when a record is REPLAYED,
       # so the step above (a primary that never replays) proves little about

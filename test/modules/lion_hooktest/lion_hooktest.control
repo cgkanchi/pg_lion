@@ -1,0 +1,5 @@
+# lion_hooktest: test-only companion for pg_lion's hook-coexistence checks
+comment = 'test-only: a second extension that chains pg_lion''s planner hook'
+default_version = '1.0'
+module_pathname = '$libdir/lion_hooktest'
+relocatable = true

@@ -1254,6 +1254,21 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	if (rel->indexlist == NIL)
 		return false;
 
+	/*
+	 * Nor a table of another table AM (lion_table_am_supported()): the count
+	 * reads the heap's visibility map.  ambuild refuses to put a lion index
+	 * there, so this only declines what got past it; partitions may each have
+	 * their own table AM, and one such leaf declines the whole parent.
+	 */
+	{
+		Relation	relation = table_open(rte->relid, NoLock);
+		bool		supported = lion_table_am_supported(relation);
+
+		table_close(relation, NoLock);
+		if (!supported)
+			return false;
+	}
+
 	t = (LionCountTarget *) palloc0(sizeof(LionCountTarget));
 	t->rel = rel;
 	t->heapoid = rte->relid;
@@ -4518,6 +4533,7 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 
 	st->heap = table_open(heapoid, NoLock);
 	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
+	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
 
 	for (i = 0; i < st->nclause; i++)
