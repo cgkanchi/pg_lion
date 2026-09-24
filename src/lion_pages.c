@@ -34,6 +34,7 @@
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -501,6 +502,43 @@ lion_find_sort_operator(Oid cmpfunc, Oid typid)
 }
 
 /*
+ * Does this function have a SQL-standard (`RETURN`) body?  See
+ * lion_proc_ident() for why a comparison with one is not ordered by.
+ */
+static bool
+lion_proc_has_sqlbody(Oid procoid)
+{
+	HeapTuple	tup;
+	bool		isnull;
+
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(procoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for function %u", procoid);
+	(void) SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosqlbody, &isnull);
+	ReleaseSysCache(tup);
+
+	return !isnull;
+}
+
+/*
+ * How many pg_proc invalidations this backend has seen (DESIGN.md §21).  A
+ * cached index state is kept in the index's relcache entry, and replacing
+ * the comparison it was built with invalidates pg_proc and NOT the index, so
+ * lion_get_index_state() checks the recorded order's comparisons again
+ * whenever this has moved since the state last passed the check.  The
+ * callback only counts: it runs while invalidations are being processed,
+ * where no catalog may be read.
+ */
+static uint64 lion_proc_generation = 1;
+static bool lion_proc_callback_registered = false;
+
+static void
+lion_proc_inval_callback(Datum arg, LionSysCacheId cacheid, uint32 hashvalue)
+{
+	lion_proc_generation++;
+}
+
+/*
  * Fill in the state of ONE key column of index (DESIGN.md §24).  attno is
  * 1-based and names an index column, not a heap attribute.
  */
@@ -695,6 +733,23 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 			}
 		}
 
+		/*
+		 * A comparison with a SQL-standard body keeps it parsed, in
+		 * prosqlbody, with no prosrc: nothing the recorded order could
+		 * recognise it by (lion_proc_ident() - the tree embeds Oids that
+		 * pg_upgrade does not keep, and its deparse depends on the session's
+		 * search_path).  So a build does not order by it: the column is laid
+		 * out in hash order, which no later change of the comparison can
+		 * make wrong, and lion_meta_record_order() says so.  Ranges on it
+		 * then test every entry of the column (§28), and the count pushdown
+		 * claims no pathkeys; both are correct.
+		 */
+		if (haveproc && lion_proc_has_sqlbody(cmpfunc))
+		{
+			state->sqlbodycmp = true;
+			haveproc = false;
+		}
+
 		if (haveproc)
 		{
 			/* Rule 3: the operator has to sort with that very function. */
@@ -739,8 +794,8 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
  * What a comparison function DOES, for LionMetaPageData.order_ident: the
  * source it runs, not the name it is called by.  That is prosrc - the C
  * symbol of an internal or C-language function (`btint4cmp`, `citext_cmp`),
- * the body of a SQL or PL one - and probin, the library a C function lives
- * in ('$libdir/citext').
+ * the body of a SQL or PL one given as a string - and probin, the library a
+ * C function lives in ('$libdir/citext').
  *
  * Neither a name nor an Oid would do.  Oids do not survive pg_upgrade, which
  * keeps an index's files but recreates its user functions.  A name keyed by
@@ -748,13 +803,22 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
  * relocatable, and so are its type and citext_cmp - into an index that
  * refuses to open, and an unqualified one would do the same to `ALTER
  * FUNCTION ... RENAME`, although nothing about the order changed.  The source
- * survives all three and still tells a DIFFERENT comparison apart: a proc 4
- * swapped for another function, a body replaced with CREATE OR REPLACE, a
- * borrowed comparison (rule 2) that now comes from another default btree
- * class.  Two functions with the same source compare the same way, so the
- * one thing it cannot tell apart is a difference that does not matter.  The
- * argument types are left out on purpose: they are the key type, which the
- * index fixes, and a relocated or renamed type is the same type.
+ * survives all three and still tells a DIFFERENT comparison apart in the
+ * common cases: a proc 4 swapped for another function, a string body replaced
+ * with CREATE OR REPLACE, a borrowed comparison (rule 2) that now comes from
+ * another default btree class.  The argument types are left out on purpose:
+ * they are the key type, which the index fixes, and a relocated or renamed
+ * type is the same type.
+ *
+ * WHAT IT CANNOT SEE, and it is a best-effort guard for that reason, not a
+ * proof.  A function's source does not include what it calls: a string body
+ * that calls another user function which is replaced later compares
+ * differently with the same source, and so does a C function whose library
+ * is swapped under the same symbol.  Core's btree has the same exposure - its
+ * rule is that changing what an opclass function does requires a REINDEX -
+ * and so does this index.  A SQL-standard (`RETURN`) body has no prosrc at
+ * all; a build never orders by one (lion_fill_column_state()), and a body
+ * that becomes one later changes prosrc to the empty string, which this sees.
  */
 static uint32
 lion_proc_ident(Oid procoid)
@@ -786,6 +850,9 @@ lion_proc_ident(Oid procoid)
 									   (int) strlen(bin)));
 		pfree(bin);
 	}
+	(void) SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosqlbody, &isnull);
+	if (!isnull)
+		h = hash_combine(h, hash_bytes_uint32(0x5153424f));	/* a RETURN body */
 	ReleaseSysCache(tup);
 
 	return h;
@@ -831,6 +898,11 @@ lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix)
 	{
 		if (ix->cols[i].ordered)
 			meta->ordered_cols |= ((uint32) 1) << i;
+		else if (ix->cols[i].sqlbodycmp)
+			ereport(NOTICE,
+					(errmsg("key column %d of lion index is laid out in hash order", i + 1),
+					 errdetail("Its comparison function has a SQL-standard body, which the index cannot recognise again after a change."),
+					 errhint("Give the comparison a string body or write it in C to have the column ordered.")));
 	}
 	meta->order_ident = lion_order_ident(ix);
 }
@@ -867,8 +939,10 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 	 * was added to the family on its own can be dropped and another function
 	 * added in its place, and a borrowed comparison follows the key type's
 	 * default btree class, which can change too.  The directory is in the
-	 * order of the one it was built with, so a different one is an ERROR and
-	 * not a quietly different order.
+	 * order of the one it was built with, so a different one - as far as
+	 * lion_proc_ident() can tell, which is a best-effort answer - is an ERROR
+	 * and not a quietly different order.  lion_get_index_state() makes the
+	 * same check again for a cached state once a function has changed.
 	 */
 	if ((meta->order_flags & LION_META_ORDER_RECORDED) != 0 &&
 		lion_order_ident(ix) != meta->order_ident)
@@ -887,15 +961,54 @@ lion_get_index_state(Relation index)
 {
 	LionIndexState *ix;
 	LionMetaPageData meta;
+	uint64		gen;
 
+	if (!lion_proc_callback_registered)
+	{
+		CacheRegisterSyscacheCallback(PROCOID, lion_proc_inval_callback,
+									  (Datum) 0);
+		lion_proc_callback_registered = true;
+	}
+
+	/*
+	 * A cached state is good until a function has changed since it was last
+	 * checked (lion_proc_generation).  Then the recorded order's comparisons
+	 * are resolved and compared again - in a throw-away state, which is all
+	 * lion_fill_index_state() needs to raise its ERROR, so that the cached one
+	 * keeps its memory and every pointer into it stays valid - and a state
+	 * that passes is good until the next change.  The count is read BEFORE
+	 * the check, whose own catalog reads may process more invalidations: one
+	 * that arrives meanwhile makes the next call check again.
+	 */
 	if (index->rd_amcache != NULL)
-		return (LionIndexState *) index->rd_amcache;
+	{
+		ix = (LionIndexState *) index->rd_amcache;
+		gen = lion_proc_generation;
+		if (ix->procgen != gen)
+		{
+			if ((ix->meta.order_flags & LION_META_ORDER_RECORDED) != 0 &&
+				ix->meta.ordered_cols != 0)
+			{
+				MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+														  "lion order recheck",
+														  ALLOCSET_SMALL_SIZES);
+				LionIndexState check;
 
+				lion_fill_index_state(index, &check, &ix->meta, cxt);
+				MemoryContextDelete(cxt);
+			}
+			ix->procgen = gen;
+		}
+		return ix;
+	}
+
+	gen = lion_proc_generation;
 	lion_read_meta(index, &meta);
 
 	ix = (LionIndexState *) MemoryContextAlloc(index->rd_indexcxt,
 											   sizeof(LionIndexState));
 	lion_fill_index_state(index, ix, &meta, index->rd_indexcxt);
+	ix->procgen = gen;
 
 	index->rd_amcache = (void *) ix;
 	return ix;

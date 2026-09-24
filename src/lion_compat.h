@@ -132,6 +132,16 @@ lion_pstmt_written_rtis(const PlannedStmt *pstmt)
 #endif
 }
 
+/*
+ * A syscache callback's cache argument is a SysCacheIdentifier since 19, an
+ * int before.
+ */
+#if PG_VERSION_NUM >= 190000
+typedef SysCacheIdentifier LionSysCacheId;
+#else
+typedef int LionSysCacheId;
+#endif
+
 /* 19 requires TupleDescFinalize() on a hand-built descriptor; before, nothing. */
 #if PG_VERSION_NUM < 190000
 #define TupleDescFinalize(tupdesc)	((void) (tupdesc))

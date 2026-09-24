@@ -2989,18 +2989,59 @@ nor a name would do. pg_upgrade keeps an index's files but recreates its user fu
 Oids; a schema-qualified name made `ALTER EXTENSION citext SET SCHEMA` - citext is relocatable, and
 its type and `citext_cmp` move with it - brick every citext lion index until REINDEX (the first
 version of this fix did exactly that, the coordinator's review caught it); an unqualified one would
-do the same to `ALTER FUNCTION ... RENAME`. The source survives all three and still catches a
-DIFFERENT comparison: a loose proc 4 swapped for another function, a body replaced by `CREATE OR
-REPLACE`, a borrowed comparison now taken from another default btree class. Two functions with the
-same source compare alike, so what it cannot tell apart is a difference that does not matter. The
-argument types are left out on purpose: they are the key type, which the index fixes, and a moved
-or renamed type is the same type. A RENAME of a user opclass's proc 4 therefore changes nothing,
-and replacing its body is an ERROR until REINDEX, which is the intended pair. `lion_fill_column_state()` still resolves the comparison from the catalog, but the
+do the same to `ALTER FUNCTION ... RENAME`. The source survives all three and still catches the
+common ways of changing a comparison: a loose proc 4 swapped for another function, a string body
+replaced by `CREATE OR REPLACE`, a borrowed comparison now taken from another default btree class.
+The argument types are left out on purpose: they are the key type, which the index fixes, and a
+moved or renamed type is the same type. A RENAME of a user opclass's proc 4 therefore changes
+nothing, and replacing its body is an ERROR until REINDEX, which is the intended pair.
+
+**It is a best-effort guard, not a guarantee** (the 2026-09-24 external review of 118f623 found two
+gaps, both fixed below, and the limits are stated here). A function's source does not include what
+it CALLS: a string body that calls another user function, and that function replaced later,
+compares differently with an unchanged source; so does a C function whose shared library is
+swapped under the same symbol. Nothing short of knowing what a function does could catch that, and
+core's btree has exactly the same exposure - PostgreSQL's rule is that changing the behaviour of an
+operator class's function requires a REINDEX of every index that uses it - so that is this index's
+rule too. The guard catches the common, direct changes; it does not certify the rest.
+
+- **SQL-standard bodies are never ordered by.** A `RETURN` function keeps its parsed body in
+  `prosqlbody` with an empty `prosrc`, so replacing an ascending body with a descending one left
+  the identity unchanged and an existing index answered 0 for 10. The tree cannot be hashed as it
+  stands - it embeds Oids that pg_upgrade does not keep for user objects - and neither can its
+  deparse, which depends on the session's `search_path`, so two sessions would disagree. A
+  normalised hash that replaced every user-object Oid by a stable identity would work and is far
+  more code than the case deserves. So a BUILD whose comparison has a SQL-standard body lays that
+  column out in HASH order, with a NOTICE naming the column and the fix (a string body or a C
+  function). That is chosen over an ERROR because a hash-ordered column is still a correct and
+  fully usable index - equality descends by hash, ranges take §28's test-every-entry walk, only the
+  count pushdown's pathkeys are lost - and no later change of the comparison can make a hash
+  order wrong; refusing the CREATE INDEX would only take the index away. A body that BECOMES
+  SQL-standard later is seen, since `prosrc` changes to the empty string. The one flip left is an
+  index built before the order was recorded (`order_flags` = 0) with a SQL-standard comparison: it
+  is read from the catalog, which now says hash order; REINDEX it.
+- **A backend that already has the index open checks too.** The state is cached in the index's
+  relcache entry (`rd_amcache`), and `CREATE OR REPLACE FUNCTION` invalidates pg_proc, not the
+  index, so an open backend went on reading an ascending directory with a descending comparison
+  (0 for 10, even with `prosrc` changed). A syscache callback on PROCOID, registered once per
+  backend, now only counts pg_proc invalidations - it runs while invalidations are processed, where
+  no catalog may be read - and `lion_get_index_state()` resolves and checks the recorded
+  comparisons again, in a throw-away state, whenever the count has moved since the cached state
+  last passed; a state that passes is good until the next change. The check therefore runs at the
+  next use of the index in that backend after the change is seen. A query already running when
+  another session commits the change is not protected: its plan and its FmgrInfos were set up
+  before, and a SQL function's cached plan follows the new body at its next call - the same
+  window a btree scan has, closed by the same rule. `test/isolation/order_ident_cache.spec` counts
+  in a backend, replaces the comparison from another (a string body, and a SQL-standard one), and
+  requires the REINDEX error in the first backend and the right answer once the body is restored.
+
+`lion_fill_column_state()` still resolves the comparison from the catalog, but the
 RECORDED bit decides whether the column is ordered: a directory built in hash order stays in hash
 order whatever btree opclass appears later, and one built in value order is read in value order
 without the sort operator, which only the build's tuplesort ever needed. If an ordered column's
-comparison no longer resolves at all, or resolves to a different function than the recorded one,
-opening the index is an ERROR with a REINDEX hint - never a quietly different order. Readers and
+comparison no longer resolves at all, or resolves to a function with a different source than the
+recorded one, opening the index is an ERROR with a REINDEX hint rather than a quietly different
+order (within the limits of the guard, above). Readers and
 writers use the same stored order, so backends whose relcache entries were built at different
 moments cannot disagree any more. REINDEX asks the catalog again. `ambuildempty()` records the
 order of the empty directory the same way. The meta page reaches WAL as it always has - the build's
@@ -3011,8 +3052,9 @@ one. An index built before the record existed has `order_flags` = 0 and is read 
 catalog; REINDEX records its order. `test/sql/ordering.sql` is the review's repro both ways round
 (hash order kept after the btree opclass appears, value order kept after it goes), with inserts in
 between and verify, a swapped loose proc 4 refused, a renamed proc 4 accepted and a re-bodied one
-refused, and a citext index that keeps answering exactly (equality, ranges, inserts, verify) after
-`ALTER EXTENSION citext SET SCHEMA` - moved back afterwards for the tests that follow.
+refused, a SQL-standard comparison built hash-ordered (NOTICE) and still exact after its body is
+reversed, and a citext index that keeps answering exactly (equality, ranges, inserts, verify)
+after `ALTER EXTENSION citext SET SCHEMA` - moved back afterwards for the tests that follow.
 
 **The opclass's functions run under a leaf's share lock.** A descent's binary search, the run scan
 and the range walk of §28 call proc 4, the equality, and - on an unordered column - the range
@@ -5303,8 +5345,11 @@ A column's range clauses become one `LionRange`, resolved once per scan (per par
   that resolution finds no comparison - an UNORDERED column, or a family with a cross-type `<` and no
   cross-type proc 4, which the validator refuses but a hand-edited catalogue could hold - is tested
   with the OPERATOR itself instead, entry by entry over the column's whole run: correct and linear,
-  and never what a shipped class does. Whether the column is ordered is the RECORDED order of §21
-  ("The order is the index's"), never the catalog's of the moment. Like every comparison of a
+  and never what a shipped class does - but it is what a user class whose proc 4 has a SQL-standard
+  body gets, since a build lays such a column out in hash order (§21). Whether the column is
+  ordered is the RECORDED order of §21 ("The order is the index's"), never the catalog's of the
+  moment; §21 also says why that record is a best-effort guard against a comparison changed after
+  the build, as it is for btree, and not a guarantee. Like every comparison of a
   descent, these calls run with a leaf share-locked; §21 says why a SQL-language operator that
   reads the same index can hang its own backend there, and why that is a superuser's concern.
 - **Positioning.** When every bound has a comparison and the column is ordered, the walk descends to

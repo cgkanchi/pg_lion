@@ -297,6 +297,87 @@ SELECT count(*) FROM lion_ord2 WHERE a = 7;
 
 RESET enable_seqscan;
 DROP TABLE lion_ord2;
+-- ---------- a comparison with a SQL-standard body ----------
+-- A `RETURN` body is kept parsed, in prosqlbody, with an empty prosrc, and the
+-- tree embeds Oids that pg_upgrade does not keep: it has no stable source to
+-- recognise it by.  A column compared by one is built HASH-ordered instead,
+-- with a NOTICE, and a hash-ordered directory does not care what the
+-- comparison says later (§21).
+CREATE FUNCTION lion_ostd(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint4cmp($1, $2);
+CREATE OPERATOR FAMILY lion_ofam3 USING lion;
+CREATE OPERATOR CLASS lion_oops3 FOR TYPE int4 USING lion FAMILY lion_ofam3 AS
+	OPERATOR 1 = (int4, int4),
+	OPERATOR 6 < (int4, int4),
+	OPERATOR 9 > (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_ostd(int4, int4);
+CREATE OPERATOR CLASS lion_obt3 FOR TYPE int4 USING btree AS
+	OPERATOR 1 <<<,
+	OPERATOR 2 <<=,
+	OPERATOR 3 ===,
+	OPERATOR 4 >>=,
+	OPERATOR 5 >>>,
+	FUNCTION 1 lion_ostd(int4, int4);
+CREATE TABLE lion_ord3 (id int, a int);
+INSERT INTO lion_ord3 SELECT i, i % 5000 FROM generate_series(1, 50000) i;
+\set VERBOSITY default
+CREATE INDEX lion_ord3_a ON lion_ord3 USING lion (a lion_oops3);
+NOTICE:  key column 1 of lion index is laid out in hash order
+DETAIL:  Its comparison function has a SQL-standard body, which the index cannot recognise again after a change.
+HINT:  Give the comparison a string body or write it in C to have the column ordered.
+\set VERBOSITY terse
+SELECT ordered FROM lion_index_stats('lion_ord3_a');
+ ordered 
+---------
+ f
+(1 row)
+
+SELECT lion_ocheck('SELECT count(*) FROM lion_ord3 WHERE a = 7');
+           lion_ocheck           
+---------------------------------
+ 10 rows, as the sequential scan
+(1 row)
+
+CREATE OR REPLACE FUNCTION lion_ostd(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint4cmp($2, $1);
+\c
+\set VERBOSITY terse
+SET synchronous_commit = on;
+SELECT ordered FROM lion_index_stats('lion_ord3_a');
+ ordered 
+---------
+ f
+(1 row)
+
+SELECT lion_index_count('lion_ord3_a', 7);
+ lion_index_count 
+------------------
+               10
+(1 row)
+
+SELECT lion_ocheck('SELECT count(*) FROM lion_ord3 WHERE a = 7');
+           lion_ocheck           
+---------------------------------
+ 10 rows, as the sequential scan
+(1 row)
+
+SELECT lion_ocheck('SELECT count(*) FROM lion_ord3 WHERE a < 100');
+            lion_ocheck            
+-----------------------------------
+ 1000 rows, as the sequential scan
+(1 row)
+
+SELECT lion_index_verify('lion_ord3_a', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_ord3;
+DROP OPERATOR CLASS lion_obt3 USING btree;
+DROP OPERATOR FAMILY lion_ofam3 USING lion;
+DROP FUNCTION lion_ostd(int4, int4);
 -- ---------- a relocatable extension moves its comparison ----------
 -- citext_cmp moves with citext; the citext index was built in its order and
 -- is still in it, wherever the function lives now

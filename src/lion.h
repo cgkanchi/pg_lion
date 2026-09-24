@@ -308,8 +308,10 @@ typedef struct LionMetaPageData
 	 *	order_ident		a hash of WHICH comparison each ordered column was
 	 *					built with - the source it runs (lion_proc_ident()),
 	 *					which survives pg_upgrade, a schema move and a rename
-	 *					where an Oid or a name does not - so that a comparison
-	 *					replaced since is noticed rather than used.
+	 *					where an Oid or a name does not - so that the common
+	 *					ways of replacing a comparison since are noticed
+	 *					rather than used.  A best-effort guard, not a proof:
+	 *					what the function CALLS is not in its source (§21).
 	 *
 	 * They live in what was reserved space, zero on every index written
 	 * before, so the format version stays at 6, as it did for wal_mode.
@@ -603,6 +605,13 @@ typedef struct LionState
 	Oid			ltopr;			/* valid iff ordered */
 
 	/*
+	 * The comparison has a SQL-standard (`RETURN`) body, which has no source
+	 * the recorded order could recognise it by, so a BUILD lays this column
+	 * out in hash order instead and says so (DESIGN.md §21).
+	 */
+	bool		sqlbodycmp;
+
+	/*
 	 * Multi-key opclasses (DESIGN.md §17): one indexed value yields many
 	 * keys through GIN's extractValue, and a query yields keys and a mode
 	 * through GIN's extractQuery.  multikey is false for every scalar
@@ -618,6 +627,13 @@ struct LionIndexState
 	LionMetaPageData meta;		/* copy of the meta page */
 	int			ncolumns;		/* key columns, 1 .. INDEX_MAX_KEYS (§24) */
 	LionState  *cols;			/* [ncolumns]; cols[i] is key column i + 1 */
+
+	/*
+	 * The backend's pg_proc invalidation count when the recorded order's
+	 * comparisons were last checked against the catalog (§21): a cached
+	 * state is checked again once a function has changed since.
+	 */
+	uint64		procgen;
 };
 
 /* The state of one key column of an index whose state is already in hand. */

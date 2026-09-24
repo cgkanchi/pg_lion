@@ -1,0 +1,55 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_ordered s1_count s2_desc s1_count s2_restore s1_count
+step s1_ordered: SELECT ordered FROM lion_index_stats('oic_k');
+ordered
+-------
+t      
+(1 row)
+
+step s1_count: SELECT lion_index_count('oic_k', 7);
+lion_index_count
+----------------
+              10
+(1 row)
+
+step s2_desc: 
+	CREATE OR REPLACE FUNCTION oic_cmp(int4, int4) RETURNS int4 LANGUAGE sql
+		IMMUTABLE STRICT AS 'SELECT btint4cmp($2, $1)';
+
+step s1_count: SELECT lion_index_count('oic_k', 7);
+ERROR:  index "oic_k" was built in the order of a comparison function its operator class no longer uses
+step s2_restore: 
+	CREATE OR REPLACE FUNCTION oic_cmp(int4, int4) RETURNS int4 LANGUAGE sql
+		IMMUTABLE STRICT AS 'SELECT btint4cmp($1, $2)';
+
+step s1_count: SELECT lion_index_count('oic_k', 7);
+lion_index_count
+----------------
+              10
+(1 row)
+
+
+starting permutation: s1_count s2_std s1_count s2_restore s1_count
+step s1_count: SELECT lion_index_count('oic_k', 7);
+lion_index_count
+----------------
+              10
+(1 row)
+
+step s2_std: 
+	CREATE OR REPLACE FUNCTION oic_cmp(int4, int4) RETURNS int4 LANGUAGE sql
+		IMMUTABLE STRICT RETURN btint4cmp($1, $2);
+
+step s1_count: SELECT lion_index_count('oic_k', 7);
+ERROR:  index "oic_k" was built in the order of a comparison function its operator class no longer uses
+step s2_restore: 
+	CREATE OR REPLACE FUNCTION oic_cmp(int4, int4) RETURNS int4 LANGUAGE sql
+		IMMUTABLE STRICT AS 'SELECT btint4cmp($1, $2)';
+
+step s1_count: SELECT lion_index_count('oic_k', 7);
+lion_index_count
+----------------
+              10
+(1 row)
+
