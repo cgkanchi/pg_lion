@@ -1655,16 +1655,33 @@ array_agg(k) ...))` and the multicolumn bitmap scan of the same clause all faile
 buffers available" at shared_buffers = 16MB and 9000 keys - and a list one short of that would have
 starved every other backend of buffers instead.
 
-So `lion_posting_set_lookup_many()` keeps pins on at most a BUDGET of distinct leaves: this
-backend's remaining share of shared_buffers (`GetAdditionalPinLimit()`; lion_compat.h computes it on
-16 and 17), and never more than `LION_LOOKUP_MAX_PINS` = 1000, the longest list the planner takes
-as a literal - so a literal list never pins fewer leaves than it used to unless the share is
-smaller. Pins on the leaf the previous set already pins cost no buffer and are not counted. An
-INLINE set found past the budget comes out **NOPIN**: its payload copied, its leaf let go, exactly
-like a materialized set (§9). A single lookup does the same when the backend already holds its
-share (`lion_posting_set_take()`), because callers loop over lookups - one per key of a tsquery -
-and nothing else would bound that (17 and later: 16's bufmgr cannot say what a backend already
-pins, so there only the list lookup is budgeted).
+So `lion_posting_set_lookup_many()` keeps pins on at most a BUDGET of distinct leaves, and the
+budget is the BACKEND's: every list it has located and not yet released draws on the same one, so
+two unbounded lists in a query share it rather than taking one each. It is the smaller of
+`LION_LOOKUP_MAX_PINS` = 1000, the longest list the planner takes as a literal, and an eighth of
+shared_buffers. The eighth is what keeps one backend from exhausting the pool - the failure above
+was 9000 leaves against 2048 buffers, where an eighth is 256 and leaves seven eighths to the query's
+own heap, visibility-map and chain pages and to every other backend - and it only binds below 64MB,
+so on any ordinary configuration a literal list pins exactly the leaves it always did. Pins on the
+leaf the previous set already pins cost no buffer and are not counted. Every set that took a new
+leaf is marked `budgeted` and returns it when released; a set abandoned by an error never is, so
+the count is zeroed at the end of each top-level transaction, and until then it can only be too
+high - sets go NOPIN early, which is slower and never wrong. An INLINE set found past the budget
+comes out **NOPIN**: its payload copied, its leaf let go, exactly like a materialized set (§9).
+
+The first version of this budget (2fb790e) was this backend's "fair share" of the pool,
+`GetAdditionalPinLimit()`, which is NBuffers / MaxBackends: 86 buffers on a stock 128MB,
+100-connection server. That sent ordinary queries off the visibility map - a thousand-value literal
+`k IN (...) OR x = 1` over a 963-leaf index rechecked 20783 TIDs on 3540 heap blocks (9.9 ms) where
+the map answered before - and 18's function returns 0 outright once the share is at most eight,
+which made the same version drop the pin of EVERY single lookup (`lion_posting_set_take()`) on a
+small pool with many connections, so a plain `k = 5 AND x = 5` over two INLINE sets lost the map.
+Single lookups keep their pin unconditionally now. What a caller's loop of them holds is bounded by
+the query rather than by the data: a multi-key clause extracts at most `LION_MAX_QUERY_KEYS` = 1000
+keys (lion_multikey.c; beyond that the query is answered as ALL and rechecked), so one `@>` or `@@`
+clause of the pushdown pins at most 1000 leaves, and a query with many such clauses holds 1000 per
+clause - the residual, and the one place a query's text rather than its data sets the number. The
+bitmap scan holds none of them past the lookup (below).
 
 A NOPIN set carries no §9 interlock of its own, and the count restores one in each of its shapes:
 
@@ -1691,8 +1708,17 @@ The bitmap scan needs no interlock at all - every TID it emits is visited by the
 lion_scan.c drops the pins of its per-key lookups at once (`lion_posting_set_unpin()`), and its IN
 lists are budgeted by the lookup like everyone's. test/sql/pinbudget.sql parks a GROUP BY count
 with a cursor, whose WHERE sets stay located from the first group to the last, and counts the
-index's pinned buffers in pg_buffercache: 1500 before the budget, at most 1000 with it; and it
-proves every shape above still exact, and which of them still answer from the map.
+index's pinned buffers in pg_buffercache: 1500 before the budget, at most 1000 with it; it proves
+every shape above still exact and which of them still answer from the map, and it pins down that a
+list within the budget under an OR and a plain AND of two INLINE sets DO answer from the map.
+
+Measured on a stock PostgreSQL 20 server (shared_buffers = 128MB, max_connections = 100), 800000
+rows, a 963-page index on `k` (40000 keys, 20 rows each, INLINE), a thousand-value literal list:
+
+| query | 2fb790e (fair-share budget, 86) | now (budget 1000) |
+|---|---|---|
+| `k IN (1000) OR x = 1` | 9.9 ms, 20783 TIDs rechecked on 3540 blocks | 8.1 ms, all 3540 blocks from the map |
+| `k IN (1000)` (disjoint sum) | 4.6 ms | 3.7 ms |
 
 The merge's sources are therefore unions: k sub-cursors merged by container key, yielding the union
 of the containers that share the smallest key any of them still has. The §9 pin rule is per

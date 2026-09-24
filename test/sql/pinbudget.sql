@@ -21,10 +21,11 @@ SET synchronous_commit = on;
  * spread over some 1500 leaves; x is a second key column and a
  * second index for the merge and the GROUP BY driver.
  */
-CREATE TABLE lion_pin (k text NOT NULL, x int NOT NULL);
-INSERT INTO lion_pin SELECT repeat(md5(i::text), 59) || i, i % 2 FROM generate_series(1, 3000) i;
+CREATE TABLE lion_pin (k text NOT NULL, x int NOT NULL, y int NOT NULL);
+INSERT INTO lion_pin SELECT repeat(md5(i::text), 59) || i, i % 2, i % 1000 FROM generate_series(1, 3000) i;
 CREATE INDEX lion_pin_k ON lion_pin USING lion (k);
 CREATE INDEX lion_pin_x ON lion_pin USING lion (x);
+CREATE INDEX lion_pin_y ON lion_pin USING lion (y);
 CREATE INDEX lion_pin_kx ON lion_pin USING lion (k, x);
 VACUUM ANALYZE lion_pin;
 SELECT pg_relation_size('lion_pin_k') / current_setting('block_size')::int > 1200 AS many_leaves;
@@ -88,6 +89,18 @@ SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_a
 SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_agg(k) FROM lion_pin)::text[]) AND x = 1');
 SELECT lion_pinsrc('SELECT k, count(*) FROM lion_pin WHERE k = ANY ((SELECT array_agg(k) FROM lion_pin)::text[]) GROUP BY k');
 SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_agg(k) FROM lion_pin WHERE x = 0)::text[]) OR x = 1');
+/*
+ * ... while what fits in the budget keeps the map (the budget's first
+ * version, the backend's fair share of the pool - 86 buffers on a stock
+ * server - sent both of these to the heap, and single lookups too): a list of
+ * a hundred values under the same OR, and a plain AND of two INLINE sets.
+ */
+SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_agg(k) FROM (SELECT k FROM lion_pin ORDER BY k LIMIT 100) s)::text[]) OR x = 1');
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT lion_pinsrc($q$SELECT count(*) FROM lion_pin WHERE k = repeat(md5('7'), 59) || '7' AND y = 7$q$);
+RESET enable_seqscan;
+RESET enable_bitmapscan;
 DROP FUNCTION lion_pinsrc(text);
 -- the multicolumn bitmap scan
 SET pg_lion.enable_count_pushdown = off;

@@ -153,6 +153,7 @@ typedef struct LionPostingSet
 	Size		paylen;
 	Buffer		pinbuf;			/* INLINE: pinned bucket page, else Invalid */
 	bool		nopin;			/* INLINE, but located without its pin */
+	bool		budgeted;		/* its pin took a leaf of the list budget */
 	uint64		ntids;			/* entry's recorded member count (a hint) */
 	uint32		ncontainers;	/* entry's recorded ITEM count (a hint):
 								 * containers and sparse segments */

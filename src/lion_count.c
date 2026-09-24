@@ -637,28 +637,22 @@ lion_probe_key_cmp(const void *a, const void *b, void *arg)
  * directory leaf held SHARE, and release the buffer - keeping its pin when the
  * entry is INLINE, because that pin is the DESIGN.md §9 interlock.
  *
- * Not when this backend already pins its share of shared_buffers, though,
- * unless the caller says the pin is a must: the set is then NOPIN, which the
- * count knows how to do without (DESIGN.md §15).  One lookup is one pin, but
- * callers loop - one lookup per key of a tsquery, say - and nothing else
- * would bound what such a loop holds.
+ * Always: one lookup is one pin, and what a caller's loop of them holds is
+ * bounded by the query, not by the data (DESIGN.md §15).
  */
 static void
 lion_posting_set_take(Relation index, LionState *state, Buffer buf,
-					 OffsetNumber offnum, LionPostingSet *ps, bool mustpin)
+					 OffsetNumber offnum, LionPostingSet *ps)
 {
 	bool		keeppin;
 
 	lion_fill_posting_set(index, state, buf, offnum, ps, &keeppin);
 
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	if (keeppin && (mustpin || GetAdditionalPinLimit() > 0))
+	if (keeppin)
 		ps->pinbuf = buf;
 	else
-	{
-		ps->nopin = keeppin;
 		ReleaseBuffer(buf);
-	}
 }
 
 /*
@@ -669,8 +663,7 @@ lion_posting_set_take(Relation index, LionState *state, Buffer buf,
  */
 static bool
 lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
-					   Datum key, uint32 hash, LionPostingSet *ps,
-					   bool mustpin)
+					   Datum key, uint32 hash, LionPostingSet *ps)
 {
 	LionSearchKey sk;
 	Buffer		buf;
@@ -694,7 +687,7 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 		return false;
 	}
 
-	lion_posting_set_take(index, state, buf, off, ps, mustpin);
+	lion_posting_set_take(index, state, buf, off, ps);
 	return true;
 }
 
@@ -710,7 +703,7 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 	key = lion_probe_value(&probe, key);
 	hash = lion_probe_hash(state, &probe, key);
 
-	return lion_posting_set_locate(index, state, &probe, key, hash, ps, false);
+	return lion_posting_set_locate(index, state, &probe, key, hash, ps);
 }
 
 /*
@@ -722,12 +715,80 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 #define LION_LOOKUP_WALK_MAX	8
 
 /*
- * The most leaves one IN list keeps pinned, whatever this backend's share of
- * shared_buffers (DESIGN.md §15).  It is the longest list the planner accepts
- * as a literal, which is what a list could always pin: the budget changes
- * nothing for those unless the share is smaller.
+ * THE LIST PIN BUDGET (DESIGN.md §15): how many distinct leaves the IN lists
+ * this backend has located and not yet released may keep pinned, all of them
+ * together.  It is the smaller of
+ *
+ *	- LION_LOOKUP_MAX_PINS, 1000: the longest list the planner accepts as a
+ *	  literal, so that a literal list pins exactly what it always did - a set
+ *	  that is NOPIN costs a second descent in the disjoint sum and the visibility
+ *	  map in an OR, and an ordinary query must not pay either;
+ *	- an EIGHTH of shared_buffers, so that one backend never pins more than a
+ *	  modest fraction of the pool however many lists its query has.  The
+ *	  failure this budget exists for was 9000 leaves against a 2048-buffer pool
+ *	  (16MB): the query ran itself out of buffers, and one short of that it
+ *	  would have starved everyone else.  With an eighth, 256 there, the query
+ *	  keeps seven eighths for its own heap, visibility-map and chain pages and
+ *	  for every other backend.  It only binds below 64MB of shared_buffers.
+ *
+ * Neither depends on the backend's "fair share" (GetAdditionalPinLimit() of
+ * 18): that is NBuffers / MaxBackends, 86 buffers on a stock 128MB server, and
+ * a budget of it sent ordinary thousand-value lists to the heap.
+ *
+ * The count is backend-wide because the budget is: two unbounded lists in one
+ * query share it instead of taking one budget each.  Every set that took a
+ * NEW leaf for it is marked `budgeted` and gives it back when released or
+ * unpinned; a set abandoned by an error is not released, so the count is
+ * zeroed at the end of every top-level transaction, when no set can be left.
+ * Between an error and that point it can only be too high, which makes sets
+ * NOPIN early - slower, never wrong.
  */
 #define LION_LOOKUP_MAX_PINS	1000
+
+static uint32 lion_list_pins = 0;
+static bool lion_list_pins_cb = false;
+
+static void
+lion_list_pins_xact(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			lion_list_pins = 0;
+			break;
+		default:
+			break;
+	}
+}
+
+static uint32
+lion_list_pin_budget(void)
+{
+	uint32		limit = Min(LION_LOOKUP_MAX_PINS, Max(NBuffers / 8, 1));
+
+	if (!lion_list_pins_cb)
+	{
+		RegisterXactCallback(lion_list_pins_xact, NULL);
+		lion_list_pins_cb = true;
+	}
+	return (lion_list_pins < limit) ? limit - lion_list_pins : 0;
+}
+
+/* A set that took a leaf of the budget gives it back. */
+static inline void
+lion_list_pin_return(LionPostingSet *ps)
+{
+	if (ps->budgeted)
+	{
+		if (lion_list_pins > 0)
+			lion_list_pins--;
+		ps->budgeted = false;
+	}
+}
 
 /*
  * Locate the posting sets of many keys of one index at once: the IN list of
@@ -764,8 +825,7 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * keeps a pin on the leaf its payload was copied from, the §9 interlock, and
  * nothing bounded how many leaves that came to: an array parameter over an
  * index with more leaves than shared_buffers ran out of buffers.  So at most
- * `budget` distinct leaves keep pins - this backend's remaining share of
- * shared_buffers, and never more than LION_LOOKUP_MAX_PINS - and the INLINE
+ * what is left of the backend's list pin budget (above) - and the INLINE
  * sets found past that come out NOPIN: their payload is copied and their leaf
  * let go.  The count copes with those without weakening §9 - see
  * lion_count_sources_run(), which either locates such a set again under a pin
@@ -811,7 +871,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	 */
 	lion_probe_init(index, state, keytype, &probe);
 
-	budget = Min(GetAdditionalPinLimit(), LION_LOOKUP_MAX_PINS);
+	budget = lion_list_pin_budget();
 
 	/* A binary coercion - the only one taken - changes no value. */
 	vals = values;
@@ -955,7 +1015,11 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 				else
 				{
 					if (buf != lastpinned)
+					{
 						npinned++;
+						lion_list_pins++;
+						sets[nsets].budgeted = true;
+					}
 					lastpinned = buf;
 					IncrBufferRefCount(buf);
 					sets[nsets].pinbuf = buf;
@@ -976,6 +1040,15 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 					 lion_keys_equal(state, sets[j].storedkey,
 									 sets[nsets].storedkey)))
 				{
+					/*
+					 * If it took a new leaf, forget the leaf too: with its
+					 * pin gone the buffer may be another page by the time the
+					 * walk lands on it again.  Sets before it may still pin
+					 * the leaf, and the next set there counts it once more -
+					 * early, never over.
+					 */
+					if (sets[nsets].budgeted)
+						lastpinned = InvalidBuffer;
 					lion_posting_set_release(&sets[nsets]);
 					dup = true;
 					break;
@@ -1030,7 +1103,7 @@ lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 		return false;
 	}
 
-	lion_posting_set_take(index, state, buf, off, ps, false);
+	lion_posting_set_take(index, state, buf, off, ps);
 	return true;
 }
 
@@ -1043,11 +1116,12 @@ lion_posting_set_unpin(LionPostingSet *ps)
 		ps->pinbuf = InvalidBuffer;
 		ps->nopin = true;
 	}
+	lion_list_pin_return(ps);
 }
 
 /*
- * Locate the entry of a NOPIN set again, this time keeping the pin whatever
- * the budget says: what lion_count_one_set() counts a NOPIN set from.  The
+ * Locate the entry of a NOPIN set again, this time keeping the pin (a single
+ * lookup always does): what lion_count_one_set() counts a NOPIN set from.  The
  * stored key is of the index's own type, so this is a plain lookup of it -
  * the same entry, since a column has one entry per key, as it is NOW, which
  * is all a count that reads the index after locating the entry ever gets (a
@@ -1081,7 +1155,7 @@ lion_posting_set_relocate(const LionPostingSet *ps, LionPostingSet *fresh)
 				UnlockReleaseBuffer(buf);
 			return false;
 		}
-		lion_posting_set_take(ps->index, state, buf, off, fresh, true);
+		lion_posting_set_take(ps->index, state, buf, off, fresh);
 		return true;
 	}
 
@@ -1089,8 +1163,7 @@ lion_posting_set_relocate(const LionPostingSet *ps, LionPostingSet *fresh)
 	key = lion_probe_value(&probe, ps->storedkey);
 
 	return lion_posting_set_locate(ps->index, state, &probe, key,
-								   lion_probe_hash(state, &probe, key), fresh,
-								   true);
+								   lion_probe_hash(state, &probe, key), fresh);
 }
 
 void
@@ -1098,6 +1171,7 @@ lion_posting_set_release(LionPostingSet *ps)
 {
 	if (BufferIsValid(ps->pinbuf))
 		ReleaseBuffer(ps->pinbuf);
+	lion_list_pin_return(ps);
 	ps->pinbuf = InvalidBuffer;
 	ps->nopin = false;
 	ps->payload = NULL;			/* the memory belongs to the caller's context */
