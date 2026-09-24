@@ -5579,6 +5579,24 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
+	/*
+	 * Column 0 is no column, and it is refused before anything else happens.
+	 * lion_count_open_indexes() takes wantcol = 0 to mean "the caller names
+	 * none", which a one-column index satisfies, so attno = 0 used to go on
+	 * to read the operator class of column -1 (2026-09-23 review).
+	 */
+	if (attno < 1)
+	{
+		char	   *idxname = get_rel_name(idxoid);
+
+		if (idxname == NULL)
+			lion_count_no_relation(idxoid);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("lion index \"%s\" has no key column %d",
+						idxname, attno)));
+	}
+
 	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, attno, &call);
 
 	/*

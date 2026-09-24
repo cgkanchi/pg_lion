@@ -162,6 +162,24 @@ RESET ROLE;
 REVOKE pg_stat_scan_tables FROM lion_sec_reader;
 DROP TABLE lion_sec_d;
 -- ---------- argument checks of the SQL count functions (2026-09-23 review, third round) ----------
+-- Key column 0 is no key column: lion_index_count_group_stats() took it for
+-- "no column", which a one-column index satisfies, and then read the
+-- operator class of column -1 before anything noticed.  It is refused up
+-- front now, as a bad argument (the handler catches only that SQLSTATE).
+CREATE FUNCTION lion_sec_attno(idx regclass, attno int2) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM lion_index_count_group_stats(idx, false, attno);
+	RETURN 'accepted';
+EXCEPTION WHEN invalid_parameter_value THEN
+	RETURN SQLERRM;
+END
+$$;
+SELECT lion_sec_attno('lion_sec_k', 0::int2);
+SELECT lion_sec_attno('lion_sec_k', (-1)::int2);
+SELECT lion_sec_attno('lion_sec_k', 2::int2);
+SELECT lion_sec_attno('lion_sec_k', 1::int2);
+DROP FUNCTION lion_sec_attno(regclass, int2);
 -- A relation that does not exist (dropped, or never there) is named by its
 -- OID, not as "(null)".
 SELECT lion_index_count(4294967295::oid::regclass, 1);
