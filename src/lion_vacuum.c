@@ -628,6 +628,7 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	Size		csize;
 	Size		payoff;
 	Size		need;
+	Size		inlinemax;
 	uint64		removed = 0;
 	uint64		ntids = 0;
 	uint32		ncontainers = 0;
@@ -681,6 +682,7 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 
 	payoff = LionEntryPayloadOffset(entry);
 	need = payoff + res->paylen;
+	inlinemax = lion_inline_max(payoff, (Size) vs->ix->meta.inline_limit);
 
 	/*
 	 * A filtered payload that still fits inside the bytes this entry already
@@ -693,7 +695,7 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	 * TIDs have to leave the page under this cleanup lock - and the final
 	 * step for this page then deletes it.
 	 */
-	if (res->paylen <= (Size) vs->ix->meta.inline_limit && need <= itemsz)
+	if (res->paylen <= inlinemax && need <= itemsz)
 	{
 		res->writesz = (itemsz - need <= LION_ENTRY_SLACK_BOUND) ? itemsz : need;
 		res->tuple = (LionEntryTuple *) palloc0(res->writesz);
@@ -708,11 +710,12 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	/*
 	 * It grew.  Removal can do that - a RUN that loses every other member
 	 * becomes a BITSET - so the entry may no longer fit the page, or may have
-	 * outgrown inline_limit, and then its posting set spills onto container
-	 * pages exactly as an insert would.  Try the plain overwrite first; the
-	 * spill is decided when that fails.
+	 * outgrown inline_limit - or, next to a long key, LION_MAX_ENTRY_SIZE,
+	 * which lion_inline_max() also bounds - and then its posting set spills
+	 * onto container pages exactly as an insert would.  Try the plain
+	 * overwrite first; the spill is decided when that fails.
 	 */
-	if (res->paylen <= (Size) vs->ix->meta.inline_limit)
+	if (res->paylen <= inlinemax)
 	{
 		res->tuple = lion_entry_rebuild(entry, res->payload, res->paylen,
 									   &res->writesz);

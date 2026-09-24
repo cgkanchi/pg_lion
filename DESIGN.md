@@ -408,6 +408,10 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
 2. For each entry: INLINE → filter the payload through the callback and repack. Note that removal can
    GROW a container (every-other-member deletion turns a RUN into a 4104-byte BITSET), so a filtered
    INLINE payload may exceed inline_limit or the page: then the entry spills to a chain during VACUUM.
+   The bound is lion_inline_max(), as for INSERT and ambuild: next to a ~2000-byte key a payload
+   inside inline_limit can still overflow LION_MAX_ENTRY_SIZE (an ARRAY that a 2030-member deletion
+   made out of a RUN, say), and VACUUM tested inline_limit alone and failed on it every run until
+   the 2026-09-23 review.
    CHAIN → walk the posting tree's leaves, left to right from the leftmost one; each leaf is locked
    with LockBufferForCleanup (this is the
    interlock that phase 2 relies on: a heap-skipping reader keeps the page pinned while it consults
