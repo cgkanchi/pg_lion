@@ -441,6 +441,9 @@ SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 50 AND x = 3 AND y = 4 AND
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 50 AND x = 11');   -- a source with no entry
 SELECT lion_rc('SELECT count(y) FROM lion_r WHERE k < 50 AND y IS NOT NULL');
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_r WHERE k BETWEEN 20 AND 40 AND x = 3') AS p("QUERY PLAN");
+-- a GROUP BY the planner folds to one group has no row when it is empty
+SELECT lion_rc('SELECT x, count(*) FROM lion_r WHERE x = 3 AND k < 50 GROUP BY x');
+SELECT lion_rc('SELECT x, count(*) FROM lion_r WHERE x = 3 AND k > 1000 GROUP BY x');
 
 -- ---------- 7. GROUP BY k WHERE <range on k>, and count(DISTINCT) ----------
 SELECT lion_rc('SELECT k, count(*) FROM lion_r WHERE k < 20 GROUP BY k');
@@ -546,6 +549,34 @@ VACUUM ANALYZE lion_rpi;
 SELECT lion_rq('SELECT id FROM lion_rpi WHERE a < 30 AND flag');
 SELECT lion_rq('SELECT id FROM lion_rpi WHERE a BETWEEN 30 AND 70 AND flag');
 SELECT lion_rq('SELECT id FROM lion_rpi WHERE a < 30');                 -- predicate not implied
+
+-- ---------- 11b. an UNORDERED column: every entry is tested with the operator ----------
+-- A proc 4 no btree family sorts with leaves the directory in hash order
+-- (DESIGN.md §21, rule 3), so the walk cannot be bounded; it tests each
+-- entry of the column with the range's operator instead (§28).
+CREATE FUNCTION lion_rcmp(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	AS 'SELECT btint4cmp($1, $2)';
+CREATE OPERATOR FAMILY lion_runord USING lion;
+CREATE OPERATOR CLASS lion_runord_ops FOR TYPE int4 USING lion FAMILY lion_runord AS
+	OPERATOR 1 = (int4, int4),
+	OPERATOR 6 < (int4, int4),
+	OPERATOR 7 <= (int4, int4),
+	OPERATOR 8 >= (int4, int4),
+	OPERATOR 9 > (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_rcmp(int4, int4);
+CREATE TABLE lion_ru (id int NOT NULL, a int NOT NULL);
+INSERT INTO lion_ru SELECT i, i % 97 FROM generate_series(1, 5000) i;
+CREATE INDEX lion_ru_a ON lion_ru USING lion (a lion_runord_ops);
+VACUUM ANALYZE lion_ru;
+SELECT ordered FROM lion_index_stats('lion_ru_a');
+SELECT lion_rq('SELECT id FROM lion_ru WHERE a BETWEEN 10 AND 20');
+SELECT lion_rq('SELECT id FROM lion_ru WHERE a > 90');
+SELECT lion_rc('SELECT count(*) FROM lion_ru WHERE a < 30');
+SELECT lion_rc('SELECT a, count(*) FROM lion_ru WHERE a >= 50 AND a < 60 GROUP BY a');
+DROP TABLE lion_ru;
+DROP OPERATOR FAMILY lion_runord USING lion;
+DROP FUNCTION lion_rcmp(int4, int4);
 
 -- ---------- 12. a partitioned table ----------
 CREATE TABLE lion_rpt (id int NOT NULL, k int NOT NULL, x int NOT NULL) PARTITION BY RANGE (id);
