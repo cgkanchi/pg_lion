@@ -50,6 +50,15 @@
  * per `GROUP BY g`, one test per (g, k) pair of the §20 nested loop, summed
  * into one row per g.  k is a driving column there and never a grouping one.
  *
+ * One JOIN shape is answered too (DESIGN.md §27): a fact table joined to a
+ * dimension table on a lion-indexed fk, `SELECT d.attr, count(*) FROM f JOIN
+ * d ON f.fk = d.pk ... GROUP BY d.attr`.  The dimension side is the node's
+ * child plan; for each of its rows the node counts the fk posting set of that
+ * row's key ANDed with the fact's WHERE clauses and emits a PARTIAL count
+ * beside the dimension columns, and core's Finalize Agg groups them.  "The
+ * relation" is then the fact table, and the join key is one more equality
+ * clause whose value comes from the child's current row.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -107,6 +116,7 @@
 
 #include "lion.h"
 #include "lion_count.h"
+#include "lion_fkjoin.h"
 
 /* GUC and the previous hook, both owned here and installed by _PG_init. */
 bool		lion_enable_count_pushdown = true;
@@ -126,6 +136,38 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 									 * else */
 /* LION_TL_WHEREKEY + i: the key stored in the i'th clause's entry */
 #define LION_TL_WHEREKEY		8
+
+/*
+ * A column of the FK-side join's child plan (DESIGN.md §27): the dimension
+ * column at position `resno` of the child's target list, read from the child's
+ * current row.  Negative, so that it can never collide with the kinds above.
+ */
+#define LION_TL_CHILDCOL(resno)		(-(resno))
+#define LION_TL_IS_CHILDCOL(kind)	((kind) < 0)
+#define LION_TL_CHILDRESNO(kind)		((AttrNumber) -(kind))
+
+/*
+ * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
+ * dimension row - over and above the containers it reads and the lookup that
+ * locates its set: a merge set up and torn down.  It is the same work §26's
+ * per-test cost measures, and the same number.
+ */
+#define LION_FKJOIN_COUNT_COST	(50.0 * cpu_tuple_cost)
+
+/*
+ * ... and one PROBE of such a count into a fact filter's set: a seek of the
+ * filter's (materialized, §9) set to one of the fk set's container keys and
+ * the AND of the two containers there.  Measured on the assert build at two
+ * million fact rows and a thousand dimension rows (DESIGN.md §27): the
+ * thousand counts ANDed with a 10% filter read 708,160 containers in 157 ms
+ * against 354,076 in 54 ms without it, about 0.3 us per probe.  §10's two
+ * cpu_operator_cost per container understate that tenfold, and with them the
+ * node was chosen for that query at 157 ms against the ordinary plan's 63.
+ * 20 still chose it (23,378 against 28,057); 30 refuses it (about 32,000) and
+ * keeps the same query over a quarter of the dimension, 39 ms against 67,
+ * chosen (about 8,000).
+ */
+#define LION_FKJOIN_PROBE_COST	(30.0 * cpu_operator_cost)
 
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
@@ -250,7 +292,13 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		slot when there is no GROUP BY (k's entries drive the scan), in the
  *		inner slot beside a GROUP BY g (the (g, k) nested loop).  k is not a
  *		grouping column, so the inner group attnum of member 2 stays 0
- *	10	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	10	IntList: the FK-side join (DESIGN.md §27), or empty: the number of
+ *		the clause that is the join key - an equality on the fact's fk whose
+ *		value expression is the dimension's column - and, added at plan time
+ *		once the child plan exists, the position of that column in the
+ *		child's target list.  The join key clause is not a source: the node
+ *		looks it up once per child row, in source slot 0
+ *	11	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -263,7 +311,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_ORS		7
 #define LION_PRIV_HAVING		8
 #define LION_PRIV_DISTINCT	9
-#define LION_PRIV_TLKINDS	10
+#define LION_PRIV_JOIN		10
+#define LION_PRIV_TLKINDS	11
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -278,6 +327,10 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * shape 8 the DISTINCT member (9) there, with two new target-list kinds that
  * moved LION_TL_WHEREKEY (DESIGN.md §26).
  *
+ * Shape 9 added the JOIN member (10) of DESIGN.md §27 in front of the
+ * target-list kinds, and the negative target-list kinds that name a column of
+ * the child plan.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -287,8 +340,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x52424908
-#define LION_PRIV_NMEMBERS	11
+#define LION_PRIV_MAGIC		0x52424909
+#define LION_PRIV_NMEMBERS	12
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -577,6 +630,21 @@ typedef struct LionCountScanState
 	 * pass over the leaves it crosses instead of a descent per value.
 	 */
 	int64		dirpages;
+
+	/*
+	 * The FK-side join (DESIGN.md §27).  joinclause is the clause that is the
+	 * join key, or -1 for every other shape; its value is column joinkeyresno
+	 * of the child plan's current row, childslot, which is also where the
+	 * target list's dimension columns are read from.  The key's posting set is
+	 * located into groupset and counted as source slot 0, once per child row.
+	 * joinlookups and joinmissing are what EXPLAIN ANALYZE reports.
+	 */
+	int			joinclause;
+	AttrNumber	joinkeyresno;
+	PlanState  *child;
+	TupleTableSlot *childslot;
+	int64		joinlookups;
+	int64		joinmissing;
 } LionCountScanState;
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
@@ -2578,6 +2646,145 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 }
 
 /*
+ * Cost the FK-side join (DESIGN.md §27) over the fact relation `rel`, for
+ * `dimrows` dimension rows; the child plan's own cost is the caller's to add.
+ *
+ * What the node does per dimension row: one lookup of the key in the fk
+ * index - a directory descent, whose leaf is charged at lion_heap_page_cost()'s
+ * interpolated cost over as many distinct leaves as the lookups can touch,
+ * because the dimension's rows arrive in its own order and not in key order -
+ * then one count of that key's set ANDed with the fact filters: a merge set up
+ * and torn down (LION_FKJOIN_COUNT_COST), the set's containers at §10's two
+ * cpu_operator_cost each, a PROBE into each fact filter source at the
+ * container keys the two have in common (LION_FKJOIN_PROBE_COST each), and
+ * the set's chain pages, which are none at all when the fk entries are
+ * INLINE.  Then a row out.
+ *
+ * The fact filters are located once for the whole scan and materialized on
+ * their second use (§9), so each is one lookup and one walk of its chain, as
+ * a single count prices it.
+ *
+ * And the heap the visibility map cannot vouch for, exactly as §10 prices it:
+ * the candidates are the fact rows the dimension rows reach, which is their
+ * keys' rows - `rows per fk value` each, and never more than the table - times
+ * what the fact filters leave of them, on dirty pages fetched once per query.
+ * Nothing here charges the whole fact heap: that is what the node exists not
+ * to read.
+ */
+static Cost
+lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
+					 Var *fkvar, int joinclause, List *whereclauses,
+					 List *wherekinds, List *ors, double dimrows)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		tuples = Max(rel->tuples, 1.0);
+	double		wheresel = Min(Max(rel->rows, 1.0) / tuples, 1.0);
+	IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(t->whereidx, joinclause);
+	AttrNumber	fkcol = (AttrNumber) list_nth_int(t->wherecol, joinclause);
+	bool	   *inor = lion_or_leaf_map(ors, list_length(whereclauses));
+	double		nd;
+	double		perkey;
+	double		share;
+	double		height = 0;
+	double		dirpages;
+	double		container_pages;
+	double		lookups;
+	double		cfk;
+	double		probes = 0;
+	double		matched;
+	double		recheck_tids;
+	double		recheck_pages;
+	Cost		run = 0;
+	int			ci = 0;
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+	ListCell   *lc4;
+
+	dimrows = Max(dimrows, 1.0);
+
+	/* How many rows one key of the fk column has, and in how many containers. */
+	nd = estimate_num_groups(root, list_make1(fkvar), tuples, NULL, NULL);
+	nd = Max(nd, 1.0);
+	perkey = tuples / nd;
+	cfk = lion_containers_for(heap_pages, perkey);
+
+	/* ---- one lookup and one count per dimension row ---- */
+	share = lion_index_column_share(root, rel, fkidx, fkcol);
+	dirpages = lion_index_dir_pages(fkidx, &height);
+	container_pages = Max(((double) fkidx->pages - 1.0 - dirpages) * share, 0.0);
+	dirpages = Max(dirpages * share, 1.0);
+
+	lookups = Min(dimrows, dirpages);
+	run += lookups * lion_heap_page_cost(root, rel, lookups,
+										 Max((double) fkidx->pages, 1.0));
+	run += dimrows * (height + 1.0) * 50.0 * cpu_operator_cost;
+	run += Min(dimrows * container_pages / nd, container_pages) * seq_page_cost;
+	run += dimrows * LION_FKJOIN_COUNT_COST;
+
+	/* ---- the fact filters: located once, each a source of every count ---- */
+	forfour(lc1, t->whereidx, lc2, whereclauses, lc3, wherekinds,
+			lc4, t->wherecol)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
+		Selectivity sel;
+		double		cshare;
+		double		cdir;
+		double		cheight = 0;
+		double		cpages;
+
+		if (ci == joinclause || !LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
+		{
+			ci++;
+			continue;
+		}
+		ci++;
+
+		sel = clause_selectivity(root, (Node *) lfirst(lc2), 0, JOIN_INNER,
+								 NULL);
+
+		/*
+		 * Every count seeks this clause's sets at the container keys the fk
+		 * set has - the leaves of an OR one by one, since the union's
+		 * sub-cursors are each sought - and a seek finds a container only
+		 * where the clause has one.
+		 */
+		probes += Min(cfk, lion_containers_for(heap_pages, tuples * sel));
+
+		cshare = lion_index_column_share(root, rel, idx,
+										 (AttrNumber) lfirst_int(lc4));
+		cdir = lion_index_dir_pages(idx, &cheight);
+		cpages = Max(((double) idx->pages - 1.0 - cdir) * cshare, 0.0);
+
+		run += random_page_cost + (cheight + 1.0) * 50.0 * cpu_operator_cost;
+		run += Max(1.0, cpages * sel) * seq_page_cost;
+	}
+	pfree(inor);
+
+	/*
+	 * The containers: the fk set's own at every count, as §10 charges a
+	 * container (a block mask and a visibility-map mask), and the probes into
+	 * the fact filters' sets at the keys the fk set has.
+	 */
+	run += dimrows * cfk * cpu_operator_cost * 2.0;
+	run += dimrows * probes * LION_FKJOIN_PROBE_COST;
+
+	/* ---- the heap the visibility map cannot vouch for ---- */
+	matched = Min(dimrows * perkey, tuples) * wheresel;
+	recheck_tids = matched * dirtyfrac;
+	recheck_pages = Min(recheck_tids, heap_pages * dirtyfrac);
+	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
+											   heap_pages);
+	run += recheck_tids * cpu_tuple_cost;
+
+	/* ---- a partial row per dimension row ---- */
+	run += dimrows * cpu_tuple_cost;
+
+	return run;
+}
+
+/*
  * Is this expression a value the node can compare a column with - a literal,
  * or a parameter it evaluates at the start of the scan (DESIGN.md §10)?
  *
@@ -3061,13 +3268,306 @@ lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target,
 }
 
 /*
+ * Is the aggregate one the FK-side join can answer (DESIGN.md §27)?  Its
+ * partial value per dimension row is that row's count of joined fact rows,
+ * which is count(*) - and count(x) for any x that is non-NULL in every joined
+ * row: a non-NULL constant (`count(1)`), or either side of the join key, which
+ * a strict equality never matches when NULL.
+ */
+static bool
+lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
+{
+	TargetEntry *tle;
+	Node	   *arg;
+
+	if (agg->aggfnoid != F_COUNT_ && agg->aggfnoid != F_COUNT_ANY)
+		return false;
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->aggvariadic)
+		return false;
+	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->aggkind != AGGKIND_NORMAL)
+		return false;
+
+	if (agg->aggfnoid == F_COUNT_)
+		return agg->aggstar && agg->args == NIL;
+
+	if (list_length(agg->args) != 1)
+		return false;
+	tle = (TargetEntry *) linitial(agg->args);
+	if (!IsA(tle, TargetEntry))
+		return false;
+	arg = lion_strip((Node *) tle->expr);
+	if (arg == NULL)
+		return false;
+	if (IsA(arg, Const))
+		return !((Const *) arg)->constisnull;
+	if (IsA(arg, Var))
+	{
+		Var		   *v = (Var *) arg;
+
+		if (v->varlevelsup != 0)
+			return false;
+		return (v->varno == fj->fkvar->varno &&
+				v->varattno == fj->fkvar->varattno) ||
+			(v->varno == fj->pkvar->varno &&
+			 v->varattno == fj->pkvar->varattno);
+	}
+	return false;
+}
+
+/*
+ * The rest of lion_try_count_path() for the FK-side join (DESIGN.md §27).
+ *
+ * The caller has analysed the FACT rel's WHERE clauses exactly as it does for
+ * a single table and hands their lists over; `rel` is the fact rel.  What is
+ * added here:
+ *
+ *	- the join key, as one more LION_CLAUSE_EQ clause on the fact's fk column
+ *	  whose value expression is the dimension's column.  lion_collect_targets()
+ *	  then matches an index for it like any clause - strategy 1 of its
+ *	  opfamily for the join operator, a cross-type equality and hash for the
+ *	  dimension key's type, the clause's collation - which is everything a
+ *	  lookup needs to answer `f.fk = <that row's key>` exactly (§10);
+ *	- the target list: the dimension's columns (in any non-volatile
+ *	  expression) and count aggregates, nothing of the fact rel's.  The groups
+ *	  are the dimension's and are formed by core's Finalize Agg, so neither
+ *	  the grouping-equality rule nor the value-representation rule of §10 has
+ *	  anything to check: no index drives the groups and no index key is
+ *	  printed;
+ *	- the path: a CustomPath whose child is the dimension's cheapest path and
+ *	  whose target is the partially-grouped one, under a Finalize Agg - hashed
+ *	  for a GROUP BY, sorted over no columns for a GROUP BY the planner folded
+ *	  to constants (an empty join has no group then), plain without one.
+ */
+static void
+lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
+					 RelOptInfo *output_rel, GroupPathExtraData *extra,
+					 const LionFkJoin *fj, List *having,
+					 List *whereattnos, List *clauseinfos, List *whereclauses,
+					 List *whereconsts, List *wherekinds, List *whereopnos,
+					 List *whereinor, List *ors)
+{
+	Query	   *parse = root->parse;
+	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
+	List	   *exprs;
+	List	   *items;
+	LionLeafInfo leaf;
+	LionDriveInfo nodrive[LION_MAX_GROUPCOLS];
+	int			joinclause;
+	List	   *targets = NIL;
+	LionCountTarget *first;
+	PathTarget *partialtarget;
+	CustomPath *cpath;
+	List	   *oids;
+	List	   *ints;
+	List	   *consts = NIL;
+	List	   *ckinds = NIL;
+	double		dimrows;
+	double		numgroups;
+	AggStrategy aggstrategy;
+	AggClauseCosts agg_final_costs;
+	bool		haveagg = false;
+	ListCell   *lc;
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+	int			i;
+
+	/*
+	 * The grouping is done above the node, from partial counts, so the
+	 * planner has to consider the aggregates splittable and a GROUP BY has to
+	 * be hashable (a sorted Finalize Agg would need a Sort over the node,
+	 * which v1 does not build).
+	 */
+	if (extra == NULL || (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0)
+		return;
+	if (root->processed_groupClause != NIL &&
+		!grouping_is_hashable(root->processed_groupClause))
+		return;
+
+	/* ---- the target and the HAVING: dimension columns and counts ---- */
+	exprs = list_copy(output_rel->reltarget->exprs);
+	if (having != NIL)
+		exprs = lappend(exprs, having);
+	if (contain_subplans((Node *) exprs))
+		return;
+
+	/*
+	 * A volatile expression would be evaluated once per DIMENSION row by the
+	 * node's projection instead of once per join row, which is a different
+	 * query.
+	 */
+	if (contain_volatile_functions((Node *) exprs))
+		return;
+
+	items = pull_var_clause((Node *) exprs,
+							PVC_INCLUDE_AGGREGATES |
+							PVC_RECURSE_WINDOWFUNCS |
+							PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, items)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+
+		if (IsA(node, Var))
+		{
+			Var		   *v = (Var *) node;
+
+			/*
+			 * Only the dimension's own columns: they come out of the child's
+			 * rows.  A fact column would have to be a group of the posting
+			 * sets under each dimension row, which v1 does not build.
+			 */
+			if (v->varno != (int) fj->dimrel->relid || v->varattno <= 0 ||
+				v->varlevelsup != 0)
+				return;
+		}
+		else if (IsA(node, Aggref))
+		{
+			if (!lion_fkjoin_agg_is_count((Aggref *) node, fj))
+				return;
+			haveagg = true;
+		}
+		else
+			return;
+	}
+	if (!haveagg)
+		return;
+
+	/* ---- the join key: one more equality clause on the fact rel ---- */
+	memset(&leaf, 0, sizeof(leaf));
+	leaf.var = fj->fkvar;
+	leaf.val = (Node *) copyObject(fj->pkexpr);
+	leaf.opno = fj->opno;
+	leaf.cmptype = exprType(fj->pkexpr);
+	leaf.strategy = LION_STRAT_EQUAL;
+	leaf.extractquery = InvalidOid;
+	leaf.collation = fj->collation;
+	leaf.kind = LION_CLAUSE_EQ;
+	joinclause = list_length(whereattnos);
+	lion_append_clause(&leaf, fj->clause, false,
+					  &whereattnos, &clauseinfos, &whereclauses,
+					  &whereconsts, &wherekinds, &whereopnos, &whereinor);
+
+	/*
+	 * ---- the fact rel and its indexes ----
+	 *
+	 * Nothing drives an entry scan: the child's rows drive the counts.  A
+	 * partitioned fact rel was refused by the caller, so there is one target.
+	 */
+	memset(nodrive, 0, sizeof(nodrive));
+	if (!lion_collect_targets(root, rel, nodrive, 0, whereattnos, clauseinfos,
+							 &targets))
+		return;
+	if (list_length(targets) != 1)
+		return;
+	first = (LionCountTarget *) linitial(targets);
+
+	/* ---- the path ---- */
+	dimrows = clamp_row_est(fj->dimpath->rows);
+	partialtarget = lion_make_partial_target(root, output_rel->reltarget,
+											 having);
+
+	oids = list_make3_oid(rte->relid, InvalidOid, InvalidOid);
+	ints = list_make4_int((int) rel->relid, 0, 0, 0);
+	i = 0;
+	forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
+	{
+		oids = lappend_oid(oids,
+						   ((IndexOptInfo *) list_nth(first->whereidx,
+													  i))->indexoid);
+		ints = lappend_int(ints, lfirst_int(l1));
+		consts = lappend(consts, copyObject((Node *) lfirst(l2)));
+		ckinds = lappend_int(ckinds, lfirst_int(l3));
+		i++;
+	}
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = partialtarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.pathkeys = NIL;
+	cpath->flags = 0;
+	cpath->custom_paths = list_make1(fj->dimpath);
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	cpath->custom_private = list_make1(list_make2_int(LION_PRIV_MAGIC,
+													  LION_PRIV_NMEMBERS));
+	cpath->custom_private = lappend(cpath->custom_private, oids);
+	cpath->custom_private = lappend(cpath->custom_private, ints);
+	cpath->custom_private = lappend(cpath->custom_private, consts);
+	cpath->custom_private = lappend(cpath->custom_private, ckinds);
+	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* parts */
+	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
+	cpath->custom_private = lappend(cpath->custom_private, ors);
+	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* having */
+	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* distinct */
+	cpath->custom_private = lappend(cpath->custom_private,
+									list_make1_int(joinclause));
+	cpath->methods = &lion_count_path_methods;
+
+	/*
+	 * The node streams one partial row per dimension row that has fact rows,
+	 * so it starts when its child does, and it costs the child plus what it
+	 * does per dimension row.  At most one row per dimension row comes out;
+	 * the dimension key is unique, so that is also at most one per fk value.
+	 */
+	cpath->path.rows = dimrows;
+	cpath->path.startup_cost = fj->dimpath->startup_cost;
+	cpath->path.total_cost = fj->dimpath->total_cost +
+		lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
+							 whereclauses, wherekinds, ors, dimrows);
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = fj->dimpath->disabled_nodes;
+#endif
+
+	/* ---- the Finalize Agg that groups the partial counts ---- */
+	if (root->processed_groupClause != NIL)
+	{
+		aggstrategy = AGG_HASHED;
+		numgroups = estimate_num_groups(root,
+										get_sortgrouplist_exprs(root->processed_groupClause,
+																root->processed_tlist),
+										dimrows, NULL, NULL);
+	}
+	else
+	{
+		aggstrategy = (parse->groupClause != NIL) ? AGG_SORTED : AGG_PLAIN;
+		numgroups = 1.0;
+	}
+
+	MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
+	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
+
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, &cpath->path,
+							 output_rel->reltarget,
+							 aggstrategy, AGGSPLIT_FINAL_DESERIAL,
+							 root->processed_groupClause,
+							 having,
+							 &agg_final_costs,
+							 numgroups));
+}
+
+/*
  * Decide whether count(*) over input_rel can be answered from roaring
  * posting sets and, if so, add a CustomPath to output_rel.  Every failed
  * check simply returns: the normal plan is always available.
+ *
+ * fj is the FK-side join of DESIGN.md §27, or NULL.  With it, input_rel is
+ * the JOIN rel and everything below about "the relation" - its WHERE clauses
+ * and their indexes - is asked of the FACT rel, fj->factrel, unchanged; what
+ * differs (the join key, the target list, the path) is lion_try_fkjoin_path().
  */
 static void
 lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
-				   RelOptInfo *output_rel, GroupPathExtraData *extra)
+				   RelOptInfo *output_rel, GroupPathExtraData *extra,
+				   const LionFkJoin *fj)
 {
 	Query	   *parse = root->parse;
 	RangeTblEntry *rte;
@@ -3148,6 +3648,10 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	having = (extra != NULL) ? (List *) extra->havingQual :
 		(List *) parse->havingQual;
 
+	/* The FK-side join counts the fact rel's posting sets (DESIGN.md §27). */
+	if (fj != NULL)
+		input_rel = fj->factrel;
+
 	/* ---- a single base relation: one table, or one partitioned parent ---- */
 	if (input_rel->reloptkind != RELOPT_BASEREL)
 		return;
@@ -3177,6 +3681,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			return;
 		if (input_rel->part_scheme == NULL || !IS_PARTITIONED_REL(input_rel))
 			return;
+		/* ... but not as the fact side of a join, in v1 (DESIGN.md §27) */
+		if (fj != NULL)
+			return;
 
 		/*
 		 * With partitionwise aggregation the planner builds its own per-child
@@ -3204,8 +3711,12 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Two columns are a nested loop over the two indexes' entries, so every
 	 * rule below is made per column: its own index, its own collation, its
 	 * own grouping equality, its own value-representation gate.
+	 *
+	 * None of it applies to the FK-side join (DESIGN.md §27), whose groups are
+	 * the dimension's and are formed by the Finalize Agg above the node.
 	 */
-	if (list_length(root->processed_groupClause) > LION_MAX_GROUPCOLS)
+	if (fj == NULL &&
+		list_length(root->processed_groupClause) > LION_MAX_GROUPCOLS)
 		return;
 
 	if (root->processed_groupClause == NIL)
@@ -3218,7 +3729,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 */
 		singlegroup = (parse->groupClause != NIL);
 	}
-	else
+	else if (fj == NULL)
 	{
 		foreach(lc, root->processed_groupClause)
 		{
@@ -3451,6 +3962,21 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		lion_append_clause(&leaf, clause, false,
 						  &whereattnos, &clauseinfos, &whereclauses,
 						  &whereconsts, &wherekinds, &whereopnos, &whereinor);
+	}
+
+	/*
+	 * ---- the FK-side join (DESIGN.md §27) ----
+	 *
+	 * The fact rel's clauses are all ones the posting sets answer; the join
+	 * key, the target list and the path are the join's own business.
+	 */
+	if (fj != NULL)
+	{
+		lion_try_fkjoin_path(root, input_rel, output_rel, extra, fj, having,
+							 whereattnos, clauseinfos, whereclauses,
+							 whereconsts, wherekinds, whereopnos, whereinor,
+							 ors);
+		return;
 	}
 
 	/* ---- the grouped relation's target, and the HAVING that filters it ---- */
@@ -3968,6 +4494,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 									(distvar != NULL) ?
 									list_make1_int((int) distvar->varattno) :
 									NIL);
+	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* join */
 	cpath->methods = &lion_count_path_methods;
 
 	/*
@@ -4047,8 +4574,154 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (!lion_enable_count_pushdown)
 		return;
 
+	/*
+	 * A join of two tables may be the FK-side join of DESIGN.md §27, either
+	 * way round; each orientation that qualifies is tried, and the cost model
+	 * chooses among them and the ordinary plan.
+	 */
+	if (input_rel->reloptkind == RELOPT_JOINREL)
+	{
+		LionFkJoin	fj[2];
+		int			nfj = lion_fkjoin_recognize(root, input_rel, fj);
+		int			i;
+
+		for (i = 0; i < nfj; i++)
+			lion_try_count_path(root, input_rel, output_rel,
+							   (GroupPathExtraData *) extra, &fj[i]);
+		return;
+	}
+
 	lion_try_count_path(root, input_rel, output_rel,
-					   (GroupPathExtraData *) extra);
+					   (GroupPathExtraData *) extra, NULL);
+}
+
+/*
+ * The position of a dimension column in the child plan's target list, which
+ * the executor reads it from (DESIGN.md §27).  The child was planned with
+ * CP_EXACT_TLIST from the dimension rel's own target, which holds every
+ * dimension column anything above the scan needs, so a column that is not
+ * there is planner drift and not a query to decline.
+ */
+static AttrNumber
+lion_child_resno(Plan *child, Var *var)
+{
+	ListCell   *lc;
+
+	foreach(lc, child->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Var		   *cv = (Var *) tle->expr;
+
+		if (cv != NULL && IsA(cv, Var) && cv->varno == var->varno &&
+			cv->varattno == var->varattno && cv->varlevelsup == 0)
+			return tle->resno;
+	}
+
+	elog(ERROR, "LionCount: column %d of relation %d is not in the join's child plan",
+		 (int) var->varattno, (int) var->varno);
+	return 0;					/* keep the compiler quiet */
+}
+
+/*
+ * Turn an FK-side join path (DESIGN.md §27) into a CustomScan.
+ *
+ * The node's own tuple - custom_scan_tlist - is every dimension column the
+ * target list uses (and the join key's, which the join clause's value
+ * expression references), each read from the child's current row, plus the
+ * partial counts.  The target list itself is the partially-grouped target and
+ * may compute expressions over those columns (`upper(d.name)`); setrefs.c
+ * rewrites it, and the key's value expression in custom_exprs, into INDEX_VAR
+ * references against custom_scan_tlist, and the node's projection evaluates
+ * it per row.  HAVING is the Finalize Agg's, so there is no qual here.
+ */
+static Plan *
+lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
+					  CustomPath *best_path, List *tlist, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	Plan	   *child;
+	List	   *consts;
+	List	   *want;
+	List	   *ctlist = NIL;
+	List	   *kinds = NIL;
+	List	   *priv;
+	int			joinclause;
+	Node	   *keyexpr;
+	Var		   *keyvar;
+	ListCell   *lc;
+
+	if (list_length(custom_plans) != 1)
+		elog(ERROR, "LionCount: a join needs exactly one child plan");
+	child = (Plan *) linitial(custom_plans);
+
+	joinclause = linitial_int((List *) list_nth(best_path->custom_private,
+												LION_PRIV_JOIN));
+	consts = (List *) list_nth(best_path->custom_private, LION_PRIV_CONSTS);
+	keyexpr = (Node *) list_nth(consts, joinclause);
+	keyvar = (Var *) lion_strip(keyexpr);
+	Assert(keyvar != NULL && IsA(keyvar, Var));
+
+	want = pull_var_clause((Node *) tlist,
+						   PVC_INCLUDE_AGGREGATES |
+						   PVC_RECURSE_WINDOWFUNCS |
+						   PVC_INCLUDE_PLACEHOLDERS);
+	want = lappend(want, keyvar);
+
+	foreach(lc, want)
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+		int			kind;
+		ListCell   *l2;
+		bool		dup = false;
+
+		if (IsA(expr, Var))
+			kind = LION_TL_CHILDCOL(lion_child_resno(child, (Var *) expr));
+		else if (IsA(expr, Aggref))
+			kind = LION_TL_COUNT;	/* every count the planner accepted */
+		else
+		{
+			elog(ERROR, "unexpected expression in LionCount join target list");
+			kind = 0;			/* keep the compiler quiet */
+		}
+
+		foreach(l2, ctlist)
+		{
+			if (equal(((TargetEntry *) lfirst(l2))->expr, expr))
+			{
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+
+		ctlist = lappend(ctlist,
+						 makeTargetEntry((Expr *) copyObject(expr),
+										 list_length(ctlist) + 1,
+										 NULL, false));
+		kinds = lappend_int(kinds, kind);
+	}
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = NIL;
+	cscan->scan.scanrelid = 0;
+	cscan->flags = best_path->flags;
+	cscan->custom_plans = custom_plans;
+
+	/* The clause values go to custom_exprs, as for every other shape. */
+	cscan->custom_exprs = consts;
+	priv = list_copy(best_path->custom_private);
+	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
+	lfirst(list_nth_cell(priv, LION_PRIV_HAVING)) = NIL;
+	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
+		list_make2_int(joinclause, (int) lion_child_resno(child, keyvar));
+
+	cscan->custom_scan_tlist = ctlist;
+	cscan->custom_relids = rel->relids;
+	cscan->custom_private = lappend(priv, kinds);
+	cscan->methods = &lion_count_scan_methods;
+
+	return &cscan->scan.plan;
 }
 
 /*
@@ -4085,7 +4758,10 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (GetCustomScanMethods("LionCount", true) == NULL)
 		RegisterCustomScanMethods(&lion_count_scan_methods);
 
-	ints = (List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
+	if ((List *) list_nth(best_path->custom_private, LION_PRIV_JOIN) != NIL)
+		return lion_plan_fkjoin_path(root, rel, best_path, tlist, custom_plans);
+
+	ints =(List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
 	ckinds = (List *) list_nth(best_path->custom_private, LION_PRIV_CLAUSEKINDS);
 	groupattno = (AttrNumber) lsecond_int(ints);
 	groupattno2 = (AttrNumber) lthird_int(ints);
@@ -4655,6 +5331,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *orlist;
 	List	   *kinds;
 	List	   *dist;
+	List	   *join;
 	int			flags;
 	int			i;
 	int			k;
@@ -4682,6 +5359,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	clauseops = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEOPS);
 	orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
 	dist = (List *) list_nth(cscan->custom_private, LION_PRIV_DISTINCT);
+	join = (List *) list_nth(cscan->custom_private, LION_PRIV_JOIN);
 	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
 
 	st->heapoid = linitial_oid(oids);
@@ -4706,10 +5384,33 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		elog(ERROR, "LionCount: %d clauses but %d value expressions",
 			 st->nclause, list_length(exprs));
 
+	/*
+	 * The FK-side join (DESIGN.md §27): which clause is the join key, and
+	 * which column of the child's rows carries its value.  Every other shape
+	 * has neither, and no child.
+	 */
+	st->joinclause = -1;
+	st->joinkeyresno = 0;
+	if (join != NIL)
+	{
+		if (list_length(join) != 2 ||
+			list_length(cscan->custom_plans) != 1)
+			elog(ERROR, "LionCount: malformed join");
+		st->joinclause = linitial_int(join);
+		st->joinkeyresno = (AttrNumber) lsecond_int(join);
+		if (st->joinclause < 0 || st->joinclause >= st->nclause ||
+			st->joinkeyresno <= 0)
+			elog(ERROR, "LionCount: malformed join");
+	}
+
 	st->ntlist = list_length(kinds);
 	st->tlkind = (int *) palloc(sizeof(int) * Max(st->ntlist, 1));
 	for (i = 0; i < st->ntlist; i++)
+	{
 		st->tlkind[i] = list_nth_int(kinds, i);
+		if (LION_TL_IS_CHILDCOL(st->tlkind[i]) && st->joinclause < 0)
+			elog(ERROR, "LionCount: a child column without a join");
+	}
 
 	/*
 	 * Which tests of a count(DISTINCT k) walk have to COUNT rather than stop
@@ -4760,6 +5461,20 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		 */
 		cl->valexpr = (Expr *) list_nth(exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
+
+		/*
+		 * The join key's value is not evaluated at all: it is a column of the
+		 * child's current row, read per row (lion_next_join_row()).  Its
+		 * expression is kept for EXPLAIN, which deparses it as the dimension
+		 * column it references.
+		 */
+		if (i == st->joinclause)
+		{
+			cl->con = NULL;
+			cl->valstate = NULL;
+			continue;
+		}
+
 		if (IsA(cl->valexpr, Const))
 		{
 			cl->con = (Const *) cl->valexpr;
@@ -4853,6 +5568,10 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	{
 		int			orno = -1;
 
+		/* The join key is looked up per child row, into slot 0, not here. */
+		if (i == st->joinclause)
+			continue;
+
 		if (st->inor[i])
 		{
 			/* Only the FIRST leaf of an OR opens a source, for the whole OR. */
@@ -4923,6 +5642,22 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	st->rel_read_only = false;
+
+	/*
+	 * The FK-side join's dimension side (DESIGN.md §27) is an ordinary plan,
+	 * initialised here - EXPLAIN without ANALYZE prints it too - and run
+	 * under the same snapshot as the counts.
+	 */
+	st->child = NULL;
+	st->childslot = NULL;
+	st->joinlookups = 0;
+	st->joinmissing = 0;
+	if (st->joinclause >= 0)
+	{
+		st->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
+								 estate, eflags);
+		node->custom_ps = list_make1(st->child);
+	}
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
@@ -5615,6 +6350,15 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 	for (i = 0; i < st->ntlist; i++)
 	{
 		int			kind = st->tlkind[i];
+
+		/* A dimension column of the FK-side join, from the child's row. */
+		if (LION_TL_IS_CHILDCOL(kind))
+		{
+			slot->tts_values[i] = slot_getattr(st->childslot,
+											   LION_TL_CHILDRESNO(kind),
+											   &slot->tts_isnull[i]);
+			continue;
+		}
 
 		slot->tts_isnull[i] = false;
 		switch (kind)
@@ -6413,6 +7157,92 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 }
 
 /*
+ * The FK-side join (DESIGN.md §27): the next dimension row with fact rows, as
+ * one partial row - its dimension columns and its count.
+ *
+ * Each row of the child plan - the dimension side, under the query's snapshot,
+ * with its quals, RLS and privileges applied by core - carries a key.  A NULL
+ * key joins nothing, since the join operator is strict.  Any other is looked
+ * up in the fk index, and its posting set, ANDed with the fact's WHERE
+ * sources, is counted exactly as §15's GROUP BY driver counts one group: the
+ * set is source slot 0, located, counted and released inside pergroup before
+ * the next child row is fetched, so one fk set and the WHERE sets are all the
+ * pins there are (DESIGN.md §9), and a lookup over the pin budget comes out
+ * NOPIN and is taken care of by the count (§15).  A key with no entry, or
+ * whose rows the fact filters and the snapshot leave none of, produces no row:
+ * an inner join has no pair for it.
+ *
+ * The row is PARTIAL: core's Finalize Agg above groups them by the dimension
+ * columns and adds the counts, which is the join's count for each group
+ * because that count is a sum over the group's dimension rows.
+ */
+static TupleTableSlot *
+lion_next_join_row(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionClauseState *jcl = &st->clause[st->joinclause];
+	MemoryContext oldcxt;
+
+	/* A fact clause that selects nothing leaves no dimension row a count. */
+	if (st->wheremissing)
+	{
+		st->done = true;
+		return NULL;
+	}
+
+	for (;;)
+	{
+		TupleTableSlot *childslot;
+		Datum		key;
+		bool		isnull;
+		bool		found;
+		int64		count;
+
+		CHECK_FOR_INTERRUPTS();
+
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+		childslot = ExecProcNode(st->child);
+		if (TupIsNull(childslot))
+		{
+			st->childslot = NULL;
+			st->done = true;
+			return NULL;
+		}
+
+		key = slot_getattr(childslot, st->joinkeyresno, &isnull);
+		if (isnull)
+			continue;
+		st->joinlookups++;
+
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		found = lion_posting_set_lookup_col(jcl->idx, jcl->idxcol, key,
+										   jcl->valtype, &st->groupset);
+		if (!found)
+		{
+			lion_posting_set_release(&st->groupset);
+			MemoryContextSwitchTo(oldcxt);
+			st->joinmissing++;
+			continue;
+		}
+
+		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
+										 st->nsource, st->sources,
+										 &st->stats, st->viscache,
+										 st->rel_read_only);
+		lion_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+
+		if (count == 0)
+			continue;
+
+		st->childslot = childslot;
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
+	}
+}
+
+/*
  * Walk one partition without a group key: open it, locate its clauses, count
  * it, then let go of everything it owns (DESIGN.md §16).
  */
@@ -6586,6 +7416,10 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	if (!st->located)
 		lion_locate_where(st);
 
+	/* ---- the FK-side join: one partial row per dimension row ---- */
+	if (st->joinclause >= 0)
+		return lion_next_join_row(st);
+
 	/* ---- no index to iterate: exactly one row ---- */
 	if (!st->hasgroupidx)
 	{
@@ -6734,6 +7568,21 @@ lion_rescan_custom_scan(CustomScanState *node)
 
 	lion_reset_run(st);
 	st->done = false;
+
+	/*
+	 * The join's child (DESIGN.md §27) starts over too.  Core propagates a
+	 * changed parameter to outer and inner plans but not to custom_ps, so it
+	 * is handed on here; a child that has one rescans itself on its next
+	 * ExecProcNode().
+	 */
+	if (st->child != NULL)
+	{
+		if (node->ss.ps.chgParam != NULL)
+			UpdateChangedParamSet(st->child, node->ss.ps.chgParam);
+		if (st->child->chgParam == NULL)
+			ExecReScan(st->child);
+	}
+	st->childslot = NULL;
 }
 
 static void
@@ -6742,6 +7591,13 @@ lion_end_custom_scan(CustomScanState *node)
 	LionCountScanState *st = (LionCountScanState *) node;
 
 	lion_reset_run(st);
+
+	if (st->child != NULL)
+	{
+		ExecEndNode(st->child);
+		st->child = NULL;
+	}
+	st->childslot = NULL;
 
 	/* A plain table's relations were opened once and are closed once. */
 	if (st->npart == 0)
@@ -6822,8 +7678,15 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 												 st->css.ss.ps.plan,
 												 ancestors);
 
+					/*
+					 * The FK-side join's key is a column of the OTHER table
+					 * (DESIGN.md §27), so it is printed qualified: `fk =
+					 * d.pk`, as core prints a join clause.
+					 */
 					val = deparse_expression((Node *) cl->valexpr, context,
-											 false, false);
+											 st->joinclause >= 0 &&
+											 cl == &st->clause[st->joinclause],
+											 false);
 				}
 				else
 				{
@@ -6940,6 +7803,20 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->innerattno, false));
 		}
+	}
+
+	/*
+	 * The FK-side join's key first (DESIGN.md §27): the fk index and the
+	 * clause, whose value prints as the dimension column it is read from.
+	 */
+	if (st->joinclause >= 0)
+	{
+		LionClauseState *cl = &st->clause[st->joinclause];
+
+		appendStringInfo(&buf, "%s%s (", get_rel_name(cl->idxoid),
+						 lion_explain_col(cl->idxoid, cl->attno));
+		lion_explain_clause(st, cl, ancestors, es, &buf);
+		appendStringInfoChar(&buf, ')');
 	}
 
 	for (i = 0; i < st->nitem; i++)
@@ -7078,5 +7955,18 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->distattno != 0)
 			ExplainPropertyInteger("Distinct Keys Tested", NULL, st->disttests,
 								   es);
+
+		/*
+		 * The FK-side join (DESIGN.md §27): the dimension rows whose key was
+		 * looked up (a NULL key joins nothing and is not), and how many of
+		 * those keys have no entry in the fk index at all.
+		 */
+		if (st->joinclause >= 0)
+		{
+			ExplainPropertyInteger("Join Keys Looked Up", NULL,
+								   st->joinlookups, es);
+			ExplainPropertyInteger("Join Keys Without Entry", NULL,
+								   st->joinmissing, es);
+		}
 	}
 }
