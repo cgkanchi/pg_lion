@@ -3665,9 +3665,7 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
     UPDATE`; format-version bumps that need REINDEX must say so in the upgrade script's NOTICE and
     in the release notes. (The seven pre-18 opclasses of the addendum below need no repair
     there: lionvalidate() accepts their hash functions on every major.)
-  - Hook coexistence in the matrix, since PGXN users load pg_lion beside other extensions:
-    `create_upper_paths_hook` chaining in both load orders, the reserved GUC prefix, and a
-    resource-manager id that does not collide.
+  - ~~Hook coexistence in the matrix~~ - done 2026-09-23, see "Hook coexistence" below.
 - **Citus and TimescaleDB compatibility (last, before any release).** These are the environments the
   extension is most likely to run in. Verify, with a test matrix run against each:
   - Citus: distributed and reference tables with lion indexes (CREATE INDEX propagation via the
@@ -3710,6 +3708,46 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
   recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
   ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
+
+### §23 addendum: hook coexistence (verified 2026-09-23)
+
+What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, lion_wal.c):
+`create_upper_paths_hook` and nothing else among the hooks - no `set_rel_pathlist_hook`, no
+planner, executor, ProcessUtility or object-access hook -; a custom WAL resource manager, only
+while `shared_preload_libraries` is processed; its GUCs, with the `pg_lion` prefix reserved by
+`MarkGUCPrefixReserved()`. The hook saves the previous value and calls it FIRST, then adds its own
+path (`lion_create_upper_paths()`), so whichever extension was loaded before pg_lion has already
+added its paths when pg_lion adds its own, and an extension loaded after pg_lion reaches pg_lion
+through its own chaining. Nothing is ever uninstalled: core has not unloaded a library since
+PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
+case beyond the two load orders. No chaining bug was found.
+
+`make hookcheck` (test/hook-check.sh, in CI on every server job) checks it against
+`test/modules/lion_hooktest`, a test-only module that chains the same hook, counts its calls,
+notes whether a LionCount path was already in the grouped rel when the previous hook returned
+(which tells which of the two hooks was installed first), registers a resource manager of its
+own when preloaded (id 128 by default, pg_lion's default too) and reserves its own GUC prefix.
+Against the dev cluster, restarted with the options on pg_ctl's command line:
+
+- nothing preloaded, lion_hooktest LOADed and pg_lion then loaded on first use, by the planner in
+  the middle of planning the first query over a lion index; and the other way round;
+- `shared_preload_libraries = 'pg_lion,lion_hooktest'` and `'lion_hooktest,pg_lion'`, with
+  `pg_lion.rmgr_id = 129`: both resource managers registered, an index built in rmgr mode, written,
+  vacuumed and verified next to the other;
+- in each of those four, the other hook runs on every query, sees pg_lion's path exactly when it
+  was installed after pg_lion (6 times per test file, or 0), LionCount is in the plan for a plain
+  count, a GROUP BY and a partitioned GROUP BY, the answers equal those with the pushdown off,
+  and `SET pg_lion.<anything else>` and `SET lion_hooktest.<anything else>` are errors;
+- both preloaded on id 128: the postmaster refuses to start with core's `failed to register
+  custom resource manager "lion_hooktest" with ID 128` / `Custom resource manager "pg_lion"
+  already registered with the same ID` - the collision the `pg_lion.rmgr_id` GUC exists to move
+  out of;
+- `HOOKCHECK_FULL=1` also runs the whole regression and isolation suite in both preload orders
+  (done once, on 18: green).
+
+Green on 16, 17, 18, 19 and master. What this does not show is how Citus or TimescaleDB use the
+hook - whether either replaces paths, or plans the query elsewhere, before pg_lion sees it; that
+is still the Citus and TimescaleDB item's to test.
 
 ### §23 addendum: pg_upgrade with lion indexes (verified 2026-09-23)
 

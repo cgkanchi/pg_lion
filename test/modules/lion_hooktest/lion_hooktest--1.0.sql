@@ -1,0 +1,10 @@
+\echo Use "CREATE EXTENSION lion_hooktest" to load this file. \quit
+
+CREATE FUNCTION lion_hooktest_calls() RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION lion_hooktest_saw_lion() RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION lion_hooktest_reset() RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

@@ -1,0 +1,22 @@
+-- Shared setup of the hook-order tests (test/hook-check.sh).  CREATE
+-- EXTENSION loads both libraries into THIS session (the C-function validator
+-- does), which is why the order-sensitive tests are separate files: each runs
+-- in a session of its own that starts with neither library loaded unless the
+-- server preloads it.
+SET client_min_messages = warning;
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS lion_hooktest;
+
+CREATE TABLE hk (k int, g int, v int);
+INSERT INTO hk SELECT i % 20, i % 4, i FROM generate_series(1, 20000) i;
+CREATE INDEX hk_k ON hk USING lion (k);
+CREATE INDEX hk_g ON hk USING lion (g);
+
+CREATE TABLE hk_p (k int, v int) PARTITION BY RANGE (v);
+CREATE TABLE hk_p1 PARTITION OF hk_p FOR VALUES FROM (0) TO (10000);
+CREATE TABLE hk_p2 PARTITION OF hk_p FOR VALUES FROM (10000) TO (20000);
+INSERT INTO hk_p SELECT i % 20, i FROM generate_series(0, 19999) i;
+CREATE INDEX hk_p_k ON hk_p USING lion (k);
+
+VACUUM ANALYZE hk, hk_p;

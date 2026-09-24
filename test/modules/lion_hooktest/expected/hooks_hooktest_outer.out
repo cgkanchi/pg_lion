@@ -1,0 +1,102 @@
+-- Another extension's create_upper_paths_hook installed AFTER pg_lion's, so
+-- the other one is called by core and chains to pg_lion.  Without a preload,
+-- pg_lion is loaded on first use by the first query below and lion_hooktest
+-- is LOADed after it; with shared_preload_libraries = 'pg_lion,
+-- lion_hooktest' the order is the same and the LOAD is a no-op.
+\set VERBOSITY terse
+SELECT count(*) FROM hk WHERE k = 3;
+ count 
+-------
+  1000
+(1 row)
+
+LOAD 'lion_hooktest';
+SELECT lion_hooktest_reset();
+ lion_hooktest_reset 
+---------------------
+ 
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM hk WHERE k = 3;
+          QUERY PLAN          
+------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: hk_k (k = 3)
+(2 rows)
+
+SELECT count(*) FROM hk WHERE k = 3;
+ count 
+-------
+  1000
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM hk WHERE k IN (1, 2) GROUP BY g;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: hk_g (g), hk_k (k = ANY ({1,2}))
+   Group Key: g
+(3 rows)
+
+SELECT g, count(*) FROM hk WHERE k IN (1, 2) GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 1 |  1000
+ 2 |  1000
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM hk_p GROUP BY k;
+            QUERY PLAN            
+----------------------------------
+ Finalize HashAggregate
+   Group Key: hk_p.k
+   ->  Custom Scan (LionCount)
+         Partitions: hk_p1, hk_p2
+         Lion Indexes: (k)
+         Group Key: k
+(6 rows)
+
+SELECT k, count(*) FROM hk_p WHERE k IN (0, 7, 19) GROUP BY k ORDER BY k;
+ k  | count 
+----+-------
+  0 |  1000
+  7 |  1000
+ 19 |  1000
+(3 rows)
+
+-- the other hook ran, and found pg_lion's path already there each time the
+-- previous hook - pg_lion's - returned from a grouped rel it could answer
+SELECT lion_hooktest_calls() > 0 AS hooktest_ran,
+	   lion_hooktest_saw_lion() AS hooktest_saw_lion_path;
+ hooktest_ran | hooktest_saw_lion_path 
+--------------+------------------------
+ t            |                      6
+(1 row)
+
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM hk WHERE k = 3;
+ count 
+-------
+  1000
+(1 row)
+
+SELECT g, count(*) FROM hk WHERE k IN (1, 2) GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 1 |  1000
+ 2 |  1000
+(2 rows)
+
+SELECT k, count(*) FROM hk_p WHERE k IN (0, 7, 19) GROUP BY k ORDER BY k;
+ k  | count 
+----+-------
+  0 |  1000
+  7 |  1000
+ 19 |  1000
+(3 rows)
+
+RESET pg_lion.enable_count_pushdown;
+SET pg_lion.no_such_setting = 1;
+ERROR:  invalid configuration parameter name "pg_lion.no_such_setting"
+SET lion_hooktest.no_such_setting = 1;
+ERROR:  invalid configuration parameter name "lion_hooktest.no_such_setting"

@@ -101,6 +101,20 @@ installcheck-rmgr:
 	WAL_CONSISTENCY=$(if $(WAL_CONSISTENCY),$(WAL_CONSISTENCY),0) \
 		PG_CONFIG="$(PG_CONFIG)" ./test/rmgr-check.sh
 
+# pg_lion beside another extension that chains the same planner hook and
+# registers its own WAL resource manager, in both load orders (DESIGN.md §23).
+# Builds and installs the test-only test/modules/lion_hooktest into the
+# installation PG_CONFIG names, and restarts the dev cluster as
+# installcheck-rmgr does.
+#
+#   make hookcheck
+#   make hookcheck HOOKCHECK_FULL=1   ... and the whole suite in both preload
+#                                         orders
+.PHONY: hookcheck
+hookcheck:
+	HOOKCHECK_FULL=$(if $(HOOKCHECK_FULL),$(HOOKCHECK_FULL),0) WERROR=$(if $(WERROR),$(WERROR),0) \
+		PG_CONFIG="$(PG_CONFIG)" ./test/hook-check.sh
+
 .PHONY: recovery-check
 recovery-check:
 	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
@@ -128,7 +142,8 @@ DIST_VERSION = $(shell sed -n 's/^   "version": "\(.*\)",$$/\1/p' META.json)
 DIST_NAME = pg_lion-$(DIST_VERSION)
 DIST_FILES = META.json README.md LICENSE DESIGN.md Makefile dev.sh \
              $(addsuffix .control,$(EXTENSION)) $(DATA) src \
-             test/sql test/expected test/isolation test/unit test/recovery test/rmgr-check.sh
+             test/sql test/expected test/isolation test/unit test/recovery test/rmgr-check.sh \
+             test/hook-check.sh test/modules
 
 .PHONY: dist
 dist:
