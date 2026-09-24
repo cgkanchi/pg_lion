@@ -118,6 +118,24 @@ INSERT INTO lion_ord SELECT i, 0, 6000 + i % 300 FROM generate_series(1, 3000) i
 SELECT lion_ocheck('SELECT count(*) FROM lion_ord WHERE b > 5990');
 SELECT lion_ocheck('SELECT count(*) FROM lion_ord WHERE b = 6123');
 SELECT lion_index_verify('lion_ord_b', true);
+-- the comparison is known by what it runs, not by its name: a rename is the
+-- same comparison, a new body is not
+ALTER FUNCTION lion_ocmp(int4, int4) RENAME TO lion_ocmp_renamed;
+\c
+\set VERBOSITY terse
+SELECT lion_ocheck('SELECT count(*) FROM lion_ord WHERE b BETWEEN 100 AND 2000');
+ALTER FUNCTION lion_ocmp_renamed(int4, int4) RENAME TO lion_ocmp;
+CREATE OR REPLACE FUNCTION lion_ocmp(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	AS 'SELECT btint4cmp($2, $1)';
+\c
+\set VERBOSITY terse
+SELECT count(*) FROM lion_ord WHERE b = 7;
+CREATE OR REPLACE FUNCTION lion_ocmp(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	AS 'SELECT btint4cmp($1, $2)';
+\c
+\set VERBOSITY terse
+SET synchronous_commit = on;
+SELECT lion_ocheck('SELECT count(*) FROM lion_ord WHERE b = 7');
 -- REINDEX asks the catalog again
 REINDEX INDEX lion_ord_b;
 SELECT ordered FROM lion_index_stats('lion_ord_b');
@@ -156,6 +174,38 @@ SET enable_seqscan = off;
 SELECT count(*) FROM lion_ord2 WHERE a = 7;
 RESET enable_seqscan;
 DROP TABLE lion_ord2;
+
+-- ---------- a relocatable extension moves its comparison ----------
+-- citext_cmp moves with citext; the citext index was built in its order and
+-- is still in it, wherever the function lives now
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
+RESET client_min_messages;
+SELECT n.nspname AS citext_schema FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+ WHERE e.extname = 'citext' \gset
+CREATE TABLE lion_ordci (id int, n citext);
+INSERT INTO lion_ordci SELECT i, CASE WHEN i % 2 = 0 THEN upper(chr(97 + i % 26)) ELSE chr(97 + i % 26) END || (i % 50)
+  FROM generate_series(1, 5000) i;
+CREATE INDEX lion_ordci_n ON lion_ordci USING lion (n);
+SELECT ordered FROM lion_index_stats('lion_ordci_n');
+CREATE SCHEMA lion_ordmoved;
+ALTER EXTENSION citext SET SCHEMA lion_ordmoved;
+\c
+\set VERBOSITY terse
+SET synchronous_commit = on;
+SET search_path = public, lion_ordmoved;
+SELECT ordered FROM lion_index_stats('lion_ordci_n');
+SELECT lion_ocheck('SELECT count(*) FROM lion_ordci WHERE n = ''m12''');
+SELECT lion_ocheck('SELECT count(*) FROM lion_ordci WHERE n BETWEEN ''c'' AND ''K3''');
+SELECT lion_ocheck('SELECT count(*) FROM lion_ordci WHERE n > ''x''');
+INSERT INTO lion_ordci SELECT i, 'Q' || i FROM generate_series(1, 300) i;
+SELECT lion_ocheck('SELECT count(*) FROM lion_ordci WHERE n >= ''q''');
+SELECT lion_index_verify('lion_ordci_n', true);
+DROP TABLE lion_ordci;
+ALTER EXTENSION citext SET SCHEMA :"citext_schema";
+RESET search_path;
+DROP SCHEMA lion_ordmoved;
 
 DROP OPERATOR FAMILY lion_ofam2 USING lion;
 DROP OPERATOR FAMILY lion_ofam USING lion;

@@ -306,9 +306,10 @@ typedef struct LionMetaPageData
 	 *					existed, which is read the old way.
 	 *	ordered_cols	bit i - 1: key column i is in its comparison's order.
 	 *	order_ident		a hash of WHICH comparison each ordered column was
-	 *					built with - its qualified name and argument types,
-	 *					which survive pg_upgrade where Oids do not - so that a
-	 *					comparison replaced since is noticed rather than used.
+	 *					built with - the source it runs (lion_proc_ident()),
+	 *					which survives pg_upgrade, a schema move and a rename
+	 *					where an Oid or a name does not - so that a comparison
+	 *					replaced since is noticed rather than used.
 	 *
 	 * They live in what was reserved space, zero on every index written
 	 * before, so the format version stays at 6, as it did for wal_mode.

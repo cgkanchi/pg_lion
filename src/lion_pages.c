@@ -22,6 +22,7 @@
 #include "access/table.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
@@ -35,9 +36,9 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "varatt.h"
 
@@ -735,11 +736,65 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 }
 
 /*
+ * What a comparison function DOES, for LionMetaPageData.order_ident: the
+ * source it runs, not the name it is called by.  That is prosrc - the C
+ * symbol of an internal or C-language function (`btint4cmp`, `citext_cmp`),
+ * the body of a SQL or PL one - and probin, the library a C function lives
+ * in ('$libdir/citext').
+ *
+ * Neither a name nor an Oid would do.  Oids do not survive pg_upgrade, which
+ * keeps an index's files but recreates its user functions.  A name keyed by
+ * its schema turned `ALTER EXTENSION citext SET SCHEMA` - citext is
+ * relocatable, and so are its type and citext_cmp - into an index that
+ * refuses to open, and an unqualified one would do the same to `ALTER
+ * FUNCTION ... RENAME`, although nothing about the order changed.  The source
+ * survives all three and still tells a DIFFERENT comparison apart: a proc 4
+ * swapped for another function, a body replaced with CREATE OR REPLACE, a
+ * borrowed comparison (rule 2) that now comes from another default btree
+ * class.  Two functions with the same source compare the same way, so the
+ * one thing it cannot tell apart is a difference that does not matter.  The
+ * argument types are left out on purpose: they are the key type, which the
+ * index fixes, and a relocated or renamed type is the same type.
+ */
+static uint32
+lion_proc_ident(Oid procoid)
+{
+	HeapTuple	tup;
+	Datum		d;
+	bool		isnull;
+	uint32		h = 0;
+
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(procoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for function %u", procoid);
+
+	d = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc, &isnull);
+	if (!isnull)
+	{
+		char	   *src = TextDatumGetCString(d);
+
+		h = hash_combine(h, hash_bytes((const unsigned char *) src,
+									   (int) strlen(src)));
+		pfree(src);
+	}
+	d = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_probin, &isnull);
+	if (!isnull)
+	{
+		char	   *bin = TextDatumGetCString(d);
+
+		h = hash_combine(h, hash_bytes((const unsigned char *) bin,
+									   (int) strlen(bin)));
+		pfree(bin);
+	}
+	ReleaseSysCache(tup);
+
+	return h;
+}
+
+/*
  * Which comparison each ORDERED key column of ix is read by, as one hash
- * (LionMetaPageData.order_ident).  The functions are named by their
- * schema-qualified signature rather than by Oid, because pg_upgrade keeps an
- * index's files but not its user functions' Oids.  Zero when no column is
- * ordered.
+ * (LionMetaPageData.order_ident, lion_proc_ident() for what "which" means).
+ * Zero when no column is ordered.
  */
 static uint32
 lion_order_ident(LionIndexState *ix)
@@ -750,15 +805,11 @@ lion_order_ident(LionIndexState *ix)
 	for (i = 0; i < ix->ncolumns; i++)
 	{
 		LionState  *col = &ix->cols[i];
-		char	   *name;
 
 		if (!col->ordered)
 			continue;
-		name = format_procedure_qualified(col->cmpproc.fn_oid);
 		h = hash_combine(h, hash_bytes_uint32((uint32) col->attno));
-		h = hash_combine(h, hash_bytes((const unsigned char *) name,
-									   (int) strlen(name)));
-		pfree(name);
+		h = hash_combine(h, lion_proc_ident(col->cmpproc.fn_oid));
 	}
 
 	return h;

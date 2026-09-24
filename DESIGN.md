@@ -2982,9 +2982,20 @@ the key type's default btree class, which can change too.
 
 So the build RECORDS the order on the meta page, in three words of what was reserved space
 (`order_flags`, `ordered_cols`, `order_ident`; format version unchanged, as for §25's `wal_mode`):
-which key columns are ordered, and a hash of the comparison each ordered one was built with, named
-by its schema-qualified signature because pg_upgrade keeps an index's files but not its user
-functions' Oids. `lion_fill_column_state()` still resolves the comparison from the catalog, but the
+which key columns are ordered, and a hash of the comparison each ordered one was built with -
+of what the function RUNS (`lion_proc_ident()`): `prosrc`, which is the C symbol of an internal or C
+function and the body of a SQL or PL one, and `probin`, the library of a C function. Neither an Oid
+nor a name would do. pg_upgrade keeps an index's files but recreates its user functions under new
+Oids; a schema-qualified name made `ALTER EXTENSION citext SET SCHEMA` - citext is relocatable, and
+its type and `citext_cmp` move with it - brick every citext lion index until REINDEX (the first
+version of this fix did exactly that, the coordinator's review caught it); an unqualified one would
+do the same to `ALTER FUNCTION ... RENAME`. The source survives all three and still catches a
+DIFFERENT comparison: a loose proc 4 swapped for another function, a body replaced by `CREATE OR
+REPLACE`, a borrowed comparison now taken from another default btree class. Two functions with the
+same source compare alike, so what it cannot tell apart is a difference that does not matter. The
+argument types are left out on purpose: they are the key type, which the index fixes, and a moved
+or renamed type is the same type. A RENAME of a user opclass's proc 4 therefore changes nothing,
+and replacing its body is an ERROR until REINDEX, which is the intended pair. `lion_fill_column_state()` still resolves the comparison from the catalog, but the
 RECORDED bit decides whether the column is ordered: a directory built in hash order stays in hash
 order whatever btree opclass appears later, and one built in value order is read in value order
 without the sort operator, which only the build's tuplesort ever needed. If an ordered column's
@@ -2999,7 +3010,9 @@ checks every leaf and every pivot against the order the index is READ in, which 
 one. An index built before the record existed has `order_flags` = 0 and is read as it was, from the
 catalog; REINDEX records its order. `test/sql/ordering.sql` is the review's repro both ways round
 (hash order kept after the btree opclass appears, value order kept after it goes), with inserts in
-between and verify, and a swapped loose proc 4 refused.
+between and verify, a swapped loose proc 4 refused, a renamed proc 4 accepted and a re-bodied one
+refused, and a citext index that keeps answering exactly (equality, ranges, inserts, verify) after
+`ALTER EXTENSION citext SET SCHEMA` - moved back afterwards for the tests that follow.
 
 **The opclass's functions run under a leaf's share lock.** A descent's binary search, the run scan
 and the range walk of §28 call proc 4, the equality, and - on an unordered column - the range
