@@ -291,13 +291,45 @@ typedef struct LionMetaPageData
 	 * always did.  REINDEX is what changes an index's mode.
 	 */
 	uint32		wal_mode;
-	uint32		reserved[5];	/* room for the next field to need none */
+
+	/*
+	 * THE ORDER OF THE DIRECTORY, as the build laid it out (DESIGN.md §21,
+	 * "The order is the index's").  Whether a key column's entries are in its
+	 * comparison's order is a property of the directory, fixed when the index
+	 * is built; recomputing it from the catalog at every relcache build let a
+	 * btree opclass created (or dropped) later flip an existing directory
+	 * between hash order and value order, and every descent then read it in
+	 * an order it is not in.
+	 *
+	 *	order_flags		LION_META_ORDER_RECORDED once the two words below
+	 *					mean something.  Zero on an index built before they
+	 *					existed, which is read the old way.
+	 *	ordered_cols	bit i - 1: key column i is in its comparison's order.
+	 *	order_ident		a hash of WHICH comparison each ordered column was
+	 *					built with - its qualified name and argument types,
+	 *					which survive pg_upgrade where Oids do not - so that a
+	 *					comparison replaced since is noticed rather than used.
+	 *
+	 * They live in what was reserved space, zero on every index written
+	 * before, so the format version stays at 6, as it did for wal_mode.
+	 */
+	uint32		order_flags;
+	uint32		ordered_cols;
+	uint32		order_ident;
+	uint32		reserved[2];	/* room for the next field to need none */
 } LionMetaPageData;
 
+#define LION_META_ORDER_RECORDED	0x0001
+
+/* ordered_cols has one bit per key column. */
+StaticAssertDecl(INDEX_MAX_KEYS <= 32,
+				 "lion's meta page records the order of at most 32 key columns");
+
 /*
- * §25 spent one of the reserved words, so the struct is exactly the size it
- * has been since version 4 and a meta page written by either version reads as
- * the other - which is what lets the format version stay at 6.
+ * §25 and §21's order record spent four of the reserved words, so the struct
+ * is exactly the size it has been since version 4 and a meta page written by
+ * either version reads as the other - which is what lets the format version
+ * stay at 6.
  */
 StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 				 "the lion meta page payload must not change size");
@@ -1150,6 +1182,8 @@ extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
 extern void lion_fill_index_state(Relation index, LionIndexState *ix,
 								 const LionMetaPageData *meta,
 								 MemoryContext cxt);
+/* Record on a meta page image the order a build laid the directory out in (§21). */
+extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
 
 /*
  * Like lion_find_entry(), but with the comparison functions the caller wants:

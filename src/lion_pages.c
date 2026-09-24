@@ -23,6 +23,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
@@ -34,6 +35,7 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/typcache.h"
@@ -703,6 +705,83 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 			state->ordered = OidIsValid(state->ltopr);
 		}
 	}
+
+	/*
+	 * ... and all of that is only how a BUILD decides it.  The directory an
+	 * existing index has is in the order its build chose, whatever the
+	 * catalog would choose today (§21, "The order is the index's"): a btree
+	 * opclass created since can make proc 4 sortable and so "ordered" (rule
+	 * 3), dropping it can do the reverse, and reading a hash-ordered
+	 * directory in value order - or the other way round - finds keys where
+	 * they are not.  So once the meta page records the order, it decides.
+	 * An ordered column needs only its comparison for that, never the sort
+	 * operator, which only the build's tuplesort uses; whether the
+	 * comparison is still the one the build used is checked for the whole
+	 * index in lion_fill_index_state().
+	 */
+	if ((state->ix->meta.order_flags & LION_META_ORDER_RECORDED) != 0)
+	{
+		bool		stored = (state->ix->meta.ordered_cols &
+							  (((uint32) 1) << i)) != 0;
+
+		if (stored && !OidIsValid(state->cmpproc.fn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("index \"%s\" was built in the order of a comparison function that key column %d no longer has",
+							RelationGetRelationName(index), attno),
+					 errhint("REINDEX the index.")));
+		state->ordered = stored;
+	}
+}
+
+/*
+ * Which comparison each ORDERED key column of ix is read by, as one hash
+ * (LionMetaPageData.order_ident).  The functions are named by their
+ * schema-qualified signature rather than by Oid, because pg_upgrade keeps an
+ * index's files but not its user functions' Oids.  Zero when no column is
+ * ordered.
+ */
+static uint32
+lion_order_ident(LionIndexState *ix)
+{
+	uint32		h = 0;
+	int			i;
+
+	for (i = 0; i < ix->ncolumns; i++)
+	{
+		LionState  *col = &ix->cols[i];
+		char	   *name;
+
+		if (!col->ordered)
+			continue;
+		name = format_procedure_qualified(col->cmpproc.fn_oid);
+		h = hash_combine(h, hash_bytes_uint32((uint32) col->attno));
+		h = hash_combine(h, hash_bytes((const unsigned char *) name,
+									   (int) strlen(name)));
+		pfree(name);
+	}
+
+	return h;
+}
+
+/*
+ * Record on a meta page image the order the build laid ix's directory out in:
+ * which key columns are ordered, and by which comparisons (§21).  ix is the
+ * state the build computed from the catalog, with no order recorded yet.
+ */
+void
+lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix)
+{
+	int			i;
+
+	meta->order_flags |= LION_META_ORDER_RECORDED;
+	meta->ordered_cols = 0;
+	for (i = 0; i < ix->ncolumns; i++)
+	{
+		if (ix->cols[i].ordered)
+			meta->ordered_cols |= ((uint32) 1) << i;
+	}
+	meta->order_ident = lion_order_ident(ix);
 }
 
 /*
@@ -731,6 +810,22 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 		ix->cols[i].ix = ix;
 		lion_fill_column_state(index, &ix->cols[i], (AttrNumber) (i + 1), cxt);
 	}
+
+	/*
+	 * The recorded order names its comparisons as well (§21): a proc 4 that
+	 * was added to the family on its own can be dropped and another function
+	 * added in its place, and a borrowed comparison follows the key type's
+	 * default btree class, which can change too.  The directory is in the
+	 * order of the one it was built with, so a different one is an ERROR and
+	 * not a quietly different order.
+	 */
+	if ((meta->order_flags & LION_META_ORDER_RECORDED) != 0 &&
+		lion_order_ident(ix) != meta->order_ident)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" was built in the order of a comparison function its operator class no longer uses",
+						RelationGetRelationName(index)),
+				 errhint("REINDEX the index.")));
 }
 
 /*

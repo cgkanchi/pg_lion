@@ -2969,6 +2969,47 @@ create two entries for one class. Rule 2 above is what keeps a BORROWED comparis
 promise; a proc 4 an opclass names itself is still the author's responsibility, and the AM cannot
 detect a bad one.
 
+**The order is the index's, not the catalog's** (2026-09-24 review of §28). The three rules above
+decide how a BUILD lays the directory out; they used to be applied again at every relcache build,
+from the catalog as it stands, and nothing stored the answer with the index. The catalog can change
+under an existing index: a btree opclass created later whose support function 1 is a lion
+opclass's proc 4 makes that proc 4 sortable (rule 3), so a directory built in HASH order was read
+in value order - `a BETWEEN 100 AND 2000` counted 10 rows for 19,010, `a = 1234` 0 for 10, and an
+insert put its entry where no later search looked - and dropping that btree opclass does the
+reverse. A proc 4 added to a family by `ALTER OPERATOR FAMILY ... ADD FUNCTION` is a loose member
+that can be dropped and replaced by another function, and a borrowed comparison (rule 2) follows
+the key type's default btree class, which can change too.
+
+So the build RECORDS the order on the meta page, in three words of what was reserved space
+(`order_flags`, `ordered_cols`, `order_ident`; format version unchanged, as for §25's `wal_mode`):
+which key columns are ordered, and a hash of the comparison each ordered one was built with, named
+by its schema-qualified signature because pg_upgrade keeps an index's files but not its user
+functions' Oids. `lion_fill_column_state()` still resolves the comparison from the catalog, but the
+RECORDED bit decides whether the column is ordered: a directory built in hash order stays in hash
+order whatever btree opclass appears later, and one built in value order is read in value order
+without the sort operator, which only the build's tuplesort ever needed. If an ordered column's
+comparison no longer resolves at all, or resolves to a different function than the recorded one,
+opening the index is an ERROR with a REINDEX hint - never a quietly different order. Readers and
+writers use the same stored order, so backends whose relcache entries were built at different
+moments cannot disagree any more. REINDEX asks the catalog again. `ambuildempty()` records the
+order of the empty directory the same way. The meta page reaches WAL as it always has - the build's
+bulk write and `ambuildempty()` log it as a full page image in either WAL mode, and a later split's
+meta update carries the whole struct - so replay needs nothing new. `lion_index_verify()` already
+checks every leaf and every pivot against the order the index is READ in, which is now the recorded
+one. An index built before the record existed has `order_flags` = 0 and is read as it was, from the
+catalog; REINDEX records its order. `test/sql/ordering.sql` is the review's repro both ways round
+(hash order kept after the btree opclass appears, value order kept after it goes), with inserts in
+between and verify, and a swapped loose proc 4 refused.
+
+**The opclass's functions run under a leaf's share lock.** A descent's binary search, the run scan
+and the range walk of §28 call proc 4, the equality, and - on an unordered column - the range
+operator itself while holding a directory leaf SHARE-locked. A SQL-language function that reads
+the same index would ask for that leaf's lock again from the same backend, and buffer LWLocks have
+no deadlock detection: an EXCLUSIVE request queues behind our own share lock and the backend hangs.
+Core's own btree has the same exposure with its support functions. Only a superuser can create an
+operator class, so this is a property of the opclasses one installs, not an attack surface; the
+shipped classes call C functions that read no relation.
+
 **Cross-type searches** (`int4col = 123::int8`) need an ordering of a STORED key against a value of
 another type, and it is resolved ONCE for the single-value lookup, the batched one AND the bitmap
 scan (`lion_probe_init()` / `lion_probe_find()` in lion_count.c, declared in lion_count.h and used by
@@ -5249,7 +5290,10 @@ A column's range clauses become one `LionRange`, resolved once per scan (per par
   that resolution finds no comparison - an UNORDERED column, or a family with a cross-type `<` and no
   cross-type proc 4, which the validator refuses but a hand-edited catalogue could hold - is tested
   with the OPERATOR itself instead, entry by entry over the column's whole run: correct and linear,
-  and never what a shipped class does.
+  and never what a shipped class does. Whether the column is ordered is the RECORDED order of §21
+  ("The order is the index's"), never the catalog's of the moment. Like every comparison of a
+  descent, these calls run with a leaf share-locked; §21 says why a SQL-language operator that
+  reads the same index can hang its own backend there, and why that is a superuser's concern.
 - **Positioning.** When every bound has a comparison and the column is ordered, the walk descends to
   the first entry of the column that does not sort below the first LOWER bound: a search key of kind
   VALUE with that bound as its key, hash 0 and no stored form, which compares as the smallest member

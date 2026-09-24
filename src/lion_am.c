@@ -1256,9 +1256,20 @@ lionbuildempty(Relation index)
 	uint32		inline_limit;
 	uint32		wal_mode;
 	Buffer		buf;
+	LionMetaPageData meta;
+	LionIndexState ix;
 
 	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
 	wal_mode = lion_wal_mode_for_build(index);
+
+	/*
+	 * The order an empty directory is in is the one every later insert will
+	 * keep, so it is decided and recorded now, as a build does (§21): from
+	 * the catalog, with a state no meta page has recorded anything in yet.
+	 */
+	memset(&meta, 0, sizeof(meta));
+	lion_fill_index_state(index, &ix, &meta, CurrentMemoryContext);
+	lion_meta_record_order(&meta, &ix);	/* not in the critical section */
 
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
@@ -1267,6 +1278,9 @@ lionbuildempty(Relation index)
 	START_CRIT_SECTION();
 	lion_init_metapage(BufferGetPage(buf), inline_limit, LION_FIRST_BLKNO,
 					  0, 1, wal_mode);
+	LionPageGetMeta(BufferGetPage(buf))->order_flags = meta.order_flags;
+	LionPageGetMeta(BufferGetPage(buf))->ordered_cols = meta.ordered_cols;
+	LionPageGetMeta(BufferGetPage(buf))->order_ident = meta.order_ident;
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

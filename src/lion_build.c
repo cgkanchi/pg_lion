@@ -1702,6 +1702,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	lion_init_metapage((Page) metabuf->data, bs.inline_limit, bs.root,
 					  bs.height, (uint32) bs.ndirpages,
 					  lion_wal_mode_for_build(index));
+	/* ... and the order the directory was just laid out in (§21). */
+	lion_meta_record_order(LionPageGetMeta((Page) metabuf->data), &bs.ix);
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);
