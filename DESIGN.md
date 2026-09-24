@@ -3836,7 +3836,17 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   - `min(k)` / `max(k)`: walk from either end of the column to the first entry with a visible row
     (§26's existence test), printing its key under the value-representation contract; max needs the
     backward walk §21's leftlink was kept for;
-  - cross-type date/timestamp members (`datecol < now()`), with their equality.
+  - cross-type date/timestamp members (`datecol < now()`), with their equality;
+  - carry the recheck batch across the entries of a range SUM, as §15's disjoint sum carries it
+    across a list's sets: the entries' counts are only added up, so their dirty TIDs may be
+    rechecked together, one visit per page per batch, instead of per entry (§28's measured 68,384
+    visits for 37,133 pages, and a model that has to charge them);
+  - a STABLE bound expression in the count pushdown (`ts > now() - interval '1 day'`, the commonest
+    range of all): the node takes a Const or a Param, as for equality (§10), and this is neither.
+    Evaluated once per scan like a Param it would mean the same thing - a stable function returns
+    one answer per statement - so this is only a matter of widening `lion_is_value_expr()` to
+    pseudo-constant expressions for RANGE clauses and EXPLAINing them. The bitmap scan already
+    takes them: the executor evaluates a pseudo-constant index qual as a run-time key.
 
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 
@@ -5382,6 +5392,23 @@ same work and does not pay this one too. *(Deviation from this section's first d
 expected the unbounded walk's per-entry terms to be enough; the unbounded group walk of §10 keeps its
 own calibration, which its own tests pin.)*
 
+**The dirty heap is priced per entry too.** §10 charges each dirty page ONCE per query, because the
+visibility cache answers every later visit - but the cache resolves a page on its SECOND visit, and a
+range walk counts entry by entry, each count flushing its own recheck batch, so a page holding rows
+of several entries is fetched for each of them until the cache has it. At five million rows with
+every heap page dirty, a 30-day range over randomly placed days rechecked 68,384 block visits for
+37,133 pages (166 ms, against the bitmap heap scan's 46 ms) and was chosen; the same range over days
+stored in order rechecked 581 (3.8 ms, against the btree's 11.5) and was refused. So for a ranged
+walk the recheck pages are `entries x the pages one entry's candidates lie on x dirtyfrac`, the
+per-entry pages interpolated between one per row (values scattered) and the rows' share of the heap
+(values in heap order) by the squared correlation, as `cost_index()` does, and never more than twice
+§10's figure, since the cache stops a page being fetched a third time while it has room. Both
+choices above are now the faster plan. The correlation's square is harsh on NEARLY ordered data: a
+100k-row column whose correlation updates had brought down to 0.96 was priced at 960 page visits
+against the 154 measured, and btree's 1.7 ms was chosen over the node's 0.55. That is the safe side
+of the error, and the §23 fix below - carrying the recheck batch across a sum's entries, as §15's
+disjoint sum does across a list - would make the question moot.
+
 **EXPLAIN** prints the driver with its range in place of `(k)` / `(all keys)`:
 `Lion Indexes: ix_d (d >= '2024-01-01'::date AND d < '2024-02-01'::date), ix_s (s = 3)` - a Param
 as `$1` - and `Group Key` and `Distinct Key` as before. `Directory Pages Read` (§21) shows the walk
@@ -5391,6 +5418,44 @@ is bounded.
 functions, so `lion_replaced_functions()` already lists them in `LION_PRIV_EXECUTE`, and the node
 checks EXECUTE on them at startup as the ordinary plan's scan does. `test/sql/range.sql` revokes
 `int4lt` from PUBLIC and gets core's error from both plans.
+
+### Measured (2026-09-24, the distinct slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
+
+Five million rows over 37,133 heap pages, all-visible after VACUUM: `d` - about 2000 days stored in
+order (2500 rows a day), `dr` - the same days in random order, `status` - 20 values, `ts` - a
+timestamp unique per row and in heap order, each with a lion and a btree index (lion `d` 320 kB
+against btree's 33 MB, `dr` 47 MB against 33, `status` 10 MB against 33, `ts` 325 MB against 107).
+Best of five `EXPLAIN ANALYZE` runs, milliseconds; "chosen" is the plan with nothing disabled, the
+other columns force one path each (the btree column is its best plan, an index-only scan for a
+count):
+
+| query | chosen | LionCount | lion bitmap | btree | seq |
+|---|---|---|---|---|---|
+| `count(*) WHERE d` 1 day | node 0.19 | 0.19 | 0.47 | 0.26 | 237 |
+| `count(*) WHERE d` 30 days | node 0.24 | 0.23 | 7.14 | 5.78 | 236 |
+| `count(*) WHERE d` 365 days | node 0.93 | 0.90 | 85.6 | 69.9 | 263 |
+| `count(*) WHERE d` 2000 days | node 3.08 | 3.00 | 351 | 288 | 354 |
+| `count(*) WHERE dr` 1 day | node 0.25 | 0.24 | 8.48 | 0.26 | 252 |
+| `count(*) WHERE dr` 30 days | node 2.31 | 2.43 | 57.3 | 5.84 | 253 |
+| `count(*) WHERE dr` 365 days | node 25.9 | 26.0 | 187 | 70.7 | 286 |
+| `count(*) WHERE dr` 2000 days | node 106 | 105 | 480 | 285 | 372 |
+| `... dr` 30 days `AND status = 3` | node 4.42 | 4.41 | 30.4 | 32.5 | 261 |
+| `dr, count(*) ... GROUP BY dr`, 30 days | node 2.21 | 2.14 | 68.6 | 7.55 | 266 |
+| `count(DISTINCT dr)`, 365 days | node 1.33 | 1.29 | 267 | 73.3 | 357 |
+| `sum(x) WHERE d` 7 days | btree index scan 2.66 | - | 2.07 | 2.59 | 237 |
+| `sum(x) WHERE dr` 7 days | btree bitmap 27.1 | - | 27.2 | 26.8 | 250 |
+| `count(*) WHERE ts` 1 hour | btree IOS 0.10 | 0.41 | 0.32 | 0.09 | 258 |
+| `count(*) WHERE ts` 1 day | btree IOS 0.48 | 3.88 | 0.98 | 0.47 | 256 |
+| `count(*) WHERE ts` 30 days | btree IOS 11.2 | 109 | 20.4 | 11.1 | 261 |
+
+The count pushdown is chosen wherever it wins - by one to three orders of magnitude over the btree
+for a clustered column and three to thirty times for a scattered one - and a near-unique column goes
+to the btree, where the node would be four to ten times slower. The lion BITMAP scan is at parity
+with the btree's where the heap dominates (a `sum(x)`), and the planner picks between them on cost.
+With 1% of the rows updated so that every heap page is dirty: `d` 30 days, the node 3.5 ms (chosen)
+against the btree's 11.5; `dr` 30 days, the node 157 ms against the bitmap heap scan's 58 (chosen);
+`dr` 30 days `AND status = 3`, the node 18 ms (chosen) against 30; `count(DISTINCT dr)` over 365
+days, the node 22 ms (chosen) against 263.
 
 ### Tests
 

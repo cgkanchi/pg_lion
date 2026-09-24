@@ -666,6 +666,13 @@ SELECT lion_rpick('SELECT lo, count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30 G
 SELECT lion_rpick('SELECT uq, count(*) FROM lion_rp WHERE uq BETWEEN ''2024-01-01 01:00'' AND ''2024-01-01 02:00'' GROUP BY uq');
 SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30', false);
 SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE uq BETWEEN ''2024-01-01 01:00'' AND ''2024-01-01 02:00''');
+-- every page dirty, and lo's rows scattered over all of them: each entry of
+-- the walk rechecks pages the others recheck too, which the model charges
+-- (DESIGN.md §28), so the bitmap scan answers the count
+UPDATE lion_rp SET pad = 'y' || pad WHERE id % 50 = 7;
+ANALYZE lion_rp;
+SELECT lion_rpick('SELECT count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30');
+SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30');
 
 DROP FUNCTION lion_rpinned(regclass);
 DROP TABLE lion_r, lion_rd, lion_rm, lion_rpi, lion_rpt, lion_rp;

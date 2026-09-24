@@ -73,6 +73,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
 #if PG_VERSION_NUM >= 180000
@@ -1859,6 +1860,35 @@ lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
 }
 
 /*
+ * The correlation between `var`'s values and the heap's physical order, from
+ * its statistics, as btcostestimate() reads it; 0 when there is none.
+ */
+static double
+lion_var_correlation(PlannerInfo *root, RelOptInfo *rel, Var *var)
+{
+	VariableStatData vardata;
+	double		corr = 0.0;
+
+	examine_variable(root, (Node *) var, rel->relid, &vardata);
+	if (HeapTupleIsValid(vardata.statsTuple))
+	{
+		AttStatsSlot sslot;
+
+		if (get_attstatsslot(&sslot, vardata.statsTuple,
+							 STATISTIC_KIND_CORRELATION, InvalidOid,
+							 ATTSTATSSLOT_NUMBERS))
+		{
+			if (sslot.nnumbers > 0)
+				corr = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+	}
+	ReleaseVariableStats(vardata);
+
+	return corr;
+}
+
+/*
  * How many containers a posting set of `members` members can span: one per
  * LION_BLOCKS_PER_CONTAINER heap pages, and never more than one per member.
  */
@@ -2135,7 +2165,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *wherekinds,
 				   List *ors, double numgroups,
 				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac)
+				   double drivefrac, Var *rangevar)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -2699,6 +2729,40 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	recheck_tids = matching * dirtyfrac * recheckshare;
 	recheck_pages = Min(recheck_tids, dirty_pages);
 
+	/*
+	 * ... except that a RANGE-bounded walk (DESIGN.md §28) does not visit a
+	 * dirty page once per query: it counts entry by entry, each count flushes
+	 * its own recheck batch, and the visibility cache only answers a page from
+	 * its second visit on - so a page that holds rows of several entries is
+	 * fetched for each of them.  How many pages one entry's candidates lie on
+	 * depends on how the column follows the heap order, which is what
+	 * cost_index() interpolates with the correlation's square: at most one per
+	 * row when the values are scattered, and the rows' share of the heap when
+	 * they are stored in order.  Measured at five million rows with every heap
+	 * page dirty: a 30-day range over randomly placed days rechecked 68,384
+	 * block visits for 37,133 pages (166 ms, against the bitmap heap scan's
+	 * 46), and the same range over days stored in order 581 (3.8 ms, against
+	 * the btree's 11.5).  Priced as one visit per dirty page the first was
+	 * chosen and the second refused.  The cache does bound it: a page is
+	 * resolved on its second visit and answered from memory after that, so
+	 * while the cache has room no page is fetched more than twice - 2,454
+	 * block visits for 1,148 pages when 21 entries of a 200-value column share
+	 * every page of a small table.
+	 */
+	if (rangevar != NULL && recheck_tids > 0.0)
+	{
+		double		entries = lion_range_entries(root, rel, rangevar,
+												 drivefrac);
+		double		rowsper = matching / entries;
+		double		corr = lion_var_correlation(root, rel, rangevar);
+		double		scattered = Min(rowsper, heap_pages);
+		double		inorder = Max(1.0, rowsper * heap_pages / tuples);
+		double		perentry = scattered + (inorder - scattered) * corr * corr;
+
+		recheck_pages = Min(Min(recheck_tids, entries * perentry * dirtyfrac),
+							2.0 * recheck_pages);
+	}
+
 	run = random_pages * random_page_cost;
 	run += descent_cost;
 	run += lookup_cost;
@@ -2743,7 +2807,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
 								  outer_entries, inner_entries, distinct,
-								  drivefrac);
+								  drivefrac, ranged ? t->drivevar[0] : NULL);
 
 		/*
 		 * A range-bounded walk (DESIGN.md §28) pays a fixed cost per entry it
