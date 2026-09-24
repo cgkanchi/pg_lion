@@ -651,17 +651,30 @@ lion_emit_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 /*
  * `col < ANY (array)` and its siblings: amsearcharray hands the planner's
  * ScalarArrayOpExpr to us for every strategy of the family, so the range
- * comparisons of DESIGN.md §28 arrive here as arrays too.  `ANY` is the
- * union of the elements' answers, so each non-NULL element is one walk of
- * its own - `k < ANY ('{3, 50}')` is the walk of `k < 50` and that of
- * `k < 3` - into the same bitmap, which is a set.  (Only `ANY` is ever an
- * index qual; `ALL` is not.)
+ * comparisons of DESIGN.md §28 arrive here as arrays too.  (Only `ANY` is ever
+ * an index qual; `ALL` is not.)
+ *
+ * `ANY` is the union of the elements' answers, and the union of `k < e` over
+ * the elements is `k < max(e)` - the walk of the WIDEST bound, the largest
+ * element for `<` and `<=` and the smallest for `>=` and `>` - so the scan
+ * makes ONE walk, whatever the array holds.  Walking every element's range
+ * into the same bitmap gives the same answer but emits the overlap again for
+ * each element: two hundred near-equal bounds over a million-row unique
+ * column emitted ten million TIDs and took 1.4 s against 20 ms.  The widest
+ * element is found with the comparison §21's probe resolution gives values of
+ * the array's type among themselves (the probe's sortproc: the column's own
+ * proc 4, or the family's proc 4 for that type); a column that has none - an
+ * unordered one - walks element by element as before.  A NULL element makes
+ * no row true (a strict comparison with NULL is NULL, and `ANY` of NULLs and
+ * falses is not true), so it is skipped; an array of nothing else, or an
+ * empty one, selects nothing.
  */
 static int64
 lion_emit_array_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 					 ScanKey skey, TIDBitmap *tbm)
 {
 	Relation	index = scan->indexRelation;
+	LionScanCol *sc = &so->cols[col->attno - 1];
 	ArrayType  *arr = DatumGetArrayTypeP(skey->sk_argument);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
 	int16		elmlen;
@@ -671,11 +684,23 @@ lion_emit_array_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 	bool	   *nulls;
 	int			nelems;
 	int64		ntids = 0;
+	int			widest = -1;
 	int			i;
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
+
+	if (!sc->probevalid || sc->subtype != skey->sk_subtype)
+	{
+		/* the probe's FmgrInfos live as long as the scan */
+		MemoryContext oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+
+		lion_probe_init(index, col, skey->sk_subtype, &sc->probe);
+		MemoryContextSwitchTo(oldcxt);
+		sc->subtype = skey->sk_subtype;
+		sc->probevalid = true;
+	}
 
 	for (i = 0; i < nelems; i++)
 	{
@@ -684,6 +709,24 @@ lion_emit_array_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 		if (nulls[i])
 			continue;			/* a strict comparison with NULL is not true */
 
+		if (sc->probe.hassort)
+		{
+			int32		c;
+
+			if (widest < 0)
+			{
+				widest = i;
+				continue;
+			}
+			c = DatumGetInt32(FunctionCall2Coll(&sc->probe.sortproc,
+												col->collation,
+												elems[i], elems[widest]));
+			if (LION_STRAT_IS_LOWER(skey->sk_strategy) ? (c < 0) : (c > 0))
+				widest = i;
+			continue;
+		}
+
+		/* No order among the elements: one walk each. */
 		lion_range_init(&range, index, (AttrNumber) col->attno);
 		lion_range_add(&range, index, skey->sk_strategy, skey->sk_func.fn_oid,
 					   skey->sk_subtype, elems[i], false, skey->sk_collation);
@@ -691,6 +734,19 @@ lion_emit_array_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 									   &range);
 		pfree(range.bounds);
 		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (widest >= 0)
+	{
+		LionRange	range;
+
+		lion_range_init(&range, index, (AttrNumber) col->attno);
+		lion_range_add(&range, index, skey->sk_strategy, skey->sk_func.fn_oid,
+					   skey->sk_subtype, elems[widest], false,
+					   skey->sk_collation);
+		ntids = lion_emit_all_keys_ext(index, col, tbm, so->recheck, false,
+									  &range);
+		pfree(range.bounds);
 	}
 
 	pfree(elems);

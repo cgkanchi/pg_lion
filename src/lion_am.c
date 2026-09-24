@@ -433,11 +433,17 @@ lion_array_query_is_full_scan(IndexOptInfo *index, int col,
  * `<=`, `>=` or `>`, strategies 6 .. 9 of a SCALAR column's opfamily?
  */
 static bool
-lion_cost_is_range(IndexOptInfo *index, int col, OpExpr *op)
+lion_cost_is_range_op(IndexOptInfo *index, int col, Oid opno)
 {
 	return !lion_index_is_multikey(index, col) &&
-		LION_STRAT_IS_RANGE(get_op_opfamily_strategy(op->opno,
+		LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
 													 index->opfamily[col]));
+}
+
+static bool
+lion_cost_is_range(IndexOptInfo *index, int col, OpExpr *op)
+{
+	return lion_cost_is_range_op(index, col, op->opno);
 }
 
 /*
@@ -643,8 +649,11 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
  * few hundred entries, which is nothing; on a near-unique one every row is
  * an entry, and this is the term - with the index's own size, an entry header
  * per row against btree's tuple - that leaves such a column to btree.  Only
- * a column whose chosen qual IS its range pays it (the ranking of
- * lion_scan_walks_whole_index(), which has already been applied to `chosen`).
+ * a column whose chosen qual IS its range pays it, ranked as liongetbitmap()
+ * ranks them: an equality outranks everything, then an `op ANY (array)` -
+ * which for a range operator is ONE walk to the widest element
+ * (lion_emit_array_range()) and pays for the entries that walk visits - then
+ * the column's plain range comparisons, all of them one walk.
  */
 static Cost
 lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
@@ -656,6 +665,8 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
 	for (c = 0; c < index->nkeycolumns; c++)
 	{
 		List	   *ranges = NIL;
+		RestrictInfo *arrayrange = NULL;
+		bool		outranked = false;
 		ListCell   *lc;
 
 		foreach(lc, path->indexclauses)
@@ -670,22 +681,31 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
 				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
 				Node	   *clause = (Node *) rinfo->clause;
 
-				if (!IsA(clause, OpExpr) ||
-					!lion_cost_is_range(index, c, (OpExpr *) clause))
+				if (IsA(clause, OpExpr) &&
+					lion_cost_is_range(index, c, (OpExpr *) clause))
+					ranges = lappend(ranges, rinfo);
+				else if (IsA(clause, ScalarArrayOpExpr) &&
+						 lion_cost_is_range_op(index, c,
+											   ((ScalarArrayOpExpr *) clause)->opno))
 				{
-					/* an equality or a list outranks the range: no walk */
-					if (!IsA(clause, NullTest))
-					{
-						list_free(ranges);
-						ranges = NIL;
-						break;
-					}
-					continue;
+					if (arrayrange == NULL)
+						arrayrange = rinfo;
 				}
-				ranges = lappend(ranges, rinfo);
+				else if (!IsA(clause, NullTest))
+					outranked = true;	/* an equality or a list: no walk */
 			}
-			if (lc2 != NULL)
-				break;
+		}
+
+		/* An array range outranks the plain ones and is one walk alone. */
+		if (outranked)
+		{
+			list_free(ranges);
+			ranges = NIL;
+		}
+		else if (arrayrange != NULL)
+		{
+			list_free(ranges);
+			ranges = list_make1(arrayrange);
 		}
 
 		if (ranges != NIL)

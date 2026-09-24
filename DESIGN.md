@@ -5338,8 +5338,16 @@ scan needs no §9 interlock at all, since the executor visits every TID it emits
 the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing.
 
 `k < ANY (array)` arrives as an array key with a range strategy (amsearcharray is on for the whole
-family), and is the union of one walk per non-NULL element into the same bitmap; only `ANY` is ever
-an index qual.
+family); only `ANY` is ever an index qual. The union of `k < e` over the elements is `k < max(e)`, so
+it is ONE walk to the widest element - the largest for `<` and `<=`, the smallest for `>=` and `>`,
+found with the probe's comparison of the array's type (§21) - and only a column with no such
+comparison walks once per element. NULL elements are skipped (a strict comparison with NULL is never
+true, and neither is `ANY` of NULLs and falses); an empty or all-NULL array selects nothing.
+*(Deviation from the first version, which walked every element into the same bitmap: 200
+near-equal bounds over a million-row unique column emitted ten million TIDs, 1.4 s against 20 ms
+(2026-09-24 review). One walk now emits the 432,200 matching rows once, at the cost of the single
+widest bound, 108 ms on the assert build.)* `lioncostestimate()` charges such a column the entries
+of that one walk, as it does a plain range.
 
 On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - its answer is a union
 of an unbounded number of entries - so it is answered into a TIDBitmap of its own and INTERSECTED

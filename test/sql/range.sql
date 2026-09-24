@@ -332,6 +332,19 @@ SELECT lion_rq('SELECT id FROM lion_r WHERE i4 > ANY (''{}''::int[])');
 SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < ANY (''{3, 50}'') AND i4 > 40');
 SELECT lion_rq('SELECT id FROM lion_r WHERE i4 <= ALL (''{3, 50}'')');
 SELECT lion_rq('SELECT id FROM lion_r WHERE i8 > ANY (''{2000, 40000}''::int4[])');
+-- ... which is ONE walk, to the widest element: the largest for < and <=,
+-- the smallest for >= and >, whatever the order and NULLs of the array
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 <= ANY (ARRAY[NULL, 40, 7, 63, 12]::int4[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 > ANY (ARRAY[70, NULL, 55, 90]::int4[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < ANY (ARRAY[NULL, NULL]::int4[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 >= ANY (ARRAY[70, 5000000000, -3]::int8[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < ANY (ARRAY(SELECT g FROM generate_series(1, 60) g))');
+SELECT lion_rq('SELECT id FROM lion_r WHERE t < ANY (''{c, k2, b}''::text[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE t >= ANY (''{x, m, y}''::text[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE f8 > ANY (''{NaN, 1, -Infinity}''::float8[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE d < ANY (''{2024-01-05, 2024-02-01, 2024-01-20}''::date[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE ci > ANY (''{m, B, x}''::citext[])');
+SELECT lion_rq('SELECT id FROM lion_r WHERE e < ANY (''{ok, happy}''::lion_mood[])');
 SELECT * FROM lion_explain_norm('SELECT id FROM lion_r WHERE i4 BETWEEN 10 AND 20') AS p("QUERY PLAN");
 
 -- ---------- 2. cross-type integer bounds: int2, int4, int8 ----------
@@ -666,6 +679,18 @@ SELECT lion_rpick('SELECT lo, count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30 G
 SELECT lion_rpick('SELECT uq, count(*) FROM lion_rp WHERE uq BETWEEN ''2024-01-01 01:00'' AND ''2024-01-01 02:00'' GROUP BY uq');
 SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30', false);
 SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE uq BETWEEN ''2024-01-01 01:00'' AND ''2024-01-01 02:00''');
+-- `< ANY` over a unique column: the bitmap index scan emits each matching row
+-- once, not once per element (200 near-equal bounds used to emit 200 times)
+BEGIN;
+DROP INDEX lion_rp_uq_bt;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_indexscan = off;
+SELECT regexp_replace(l, 'rows=(\d+)(\.00)? ', 'rows=\1 ') AS line
+  FROM lion_explain_norm('SELECT id FROM lion_rp WHERE uq <= ANY (ARRAY(SELECT timestamp ''2024-01-01 01:00'' + g * interval ''1 second'' FROM generate_series(1, 200) g))',
+						 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l
+ WHERE l ~ 'Bitmap Index Scan';
+SELECT lion_rq('SELECT id FROM lion_rp WHERE uq <= ANY (ARRAY(SELECT timestamp ''2024-01-01 01:00'' + g * interval ''1 second'' FROM generate_series(1, 200) g))');
+ROLLBACK;
 -- every page dirty, and lo's rows scattered over all of them: each entry of
 -- the walk rechecks pages the others recheck too, which the model charges
 -- (DESIGN.md §28), so the bitmap scan answers the count

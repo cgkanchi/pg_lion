@@ -521,6 +521,74 @@ SELECT lion_rq('SELECT id FROM lion_r WHERE i8 > ANY (''{2000, 40000}''::int4[])
  bitmap, 14978 rows
 (1 row)
 
+-- ... which is ONE walk, to the widest element: the largest for < and <=,
+-- the smallest for >= and >, whatever the order and NULLs of the array
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 <= ANY (ARRAY[NULL, 40, 7, 63, 12]::int4[])');
+      lion_rq       
+--------------------
+ bitmap, 12128 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 > ANY (ARRAY[70, NULL, 55, 90]::int4[])');
+      lion_rq      
+-------------------
+ bitmap, 8336 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < ANY (ARRAY[NULL, NULL]::int4[])');
+    lion_rq     
+----------------
+ bitmap, 0 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 >= ANY (ARRAY[70, 5000000000, -3]::int8[])');
+      lion_rq       
+--------------------
+ bitmap, 18948 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < ANY (ARRAY(SELECT g FROM generate_series(1, 60) g))');
+      lion_rq       
+--------------------
+ bitmap, 11370 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE t < ANY (''{c, k2, b}''::text[])');
+      lion_rq      
+-------------------
+ bitmap, 7643 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE t >= ANY (''{x, m, y}''::text[])');
+      lion_rq       
+--------------------
+ bitmap, 10396 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE f8 > ANY (''{NaN, 1, -Infinity}''::float8[])');
+      lion_rq       
+--------------------
+ bitmap, 16615 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE d < ANY (''{2024-01-05, 2024-02-01, 2024-01-20}''::date[])');
+      lion_rq      
+-------------------
+ bitmap, 6716 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE ci > ANY (''{m, B, x}''::citext[])');
+      lion_rq       
+--------------------
+ bitmap, 18069 rows
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_r WHERE e < ANY (''{ok, happy}''::lion_mood[])');
+      lion_rq      
+-------------------
+ bitmap, 9768 rows
+(1 row)
+
 SELECT * FROM lion_explain_norm('SELECT id FROM lion_r WHERE i4 BETWEEN 10 AND 20') AS p("QUERY PLAN");
                    QUERY PLAN                    
 -------------------------------------------------
@@ -1908,6 +1976,28 @@ SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE uq BETWEEN ''2024-01-01 01:00
  pushed down, 1 rows
 (1 row)
 
+-- `< ANY` over a unique column: the bitmap index scan emits each matching row
+-- once, not once per element (200 near-equal bounds used to emit 200 times)
+BEGIN;
+DROP INDEX lion_rp_uq_bt;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_indexscan = off;
+SELECT regexp_replace(l, 'rows=(\d+)(\.00)? ', 'rows=\1 ') AS line
+  FROM lion_explain_norm('SELECT id FROM lion_rp WHERE uq <= ANY (ARRAY(SELECT timestamp ''2024-01-01 01:00'' + g * interval ''1 second'' FROM generate_series(1, 200) g))',
+						 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l
+ WHERE l ~ 'Bitmap Index Scan';
+                                 line                                  
+-----------------------------------------------------------------------
+   ->  Bitmap Index Scan on lion_rp_uq_lion (actual rows=3800 loops=1)
+(1 row)
+
+SELECT lion_rq('SELECT id FROM lion_rp WHERE uq <= ANY (ARRAY(SELECT timestamp ''2024-01-01 01:00'' + g * interval ''1 second'' FROM generate_series(1, 200) g))');
+      lion_rq      
+-------------------
+ bitmap, 3800 rows
+(1 row)
+
+ROLLBACK;
 -- every page dirty, and lo's rows scattered over all of them: each entry of
 -- the walk rechecks pages the others recheck too, which the model charges
 -- (DESIGN.md §28), so the bitmap scan answers the count
