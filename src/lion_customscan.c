@@ -88,6 +88,7 @@
 #include "nodes/plannodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -198,8 +199,15 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_CLAUSE_NULL		2	/* col IS NULL */
 #define LION_CLAUSE_NOTNULL	3	/* col IS NOT NULL */
 #define LION_CLAUSE_MULTI	4	/* col @> / && / @@ const, DESIGN.md §17 */
+#define LION_CLAUSE_RANGE	5	/* col < / <= / >= / > const, DESIGN.md §28 */
 
-#define LION_CLAUSE_IS_POSITIVE(k)	((k) != LION_CLAUSE_NOTNULL)
+/*
+ * A RANGE clause is neither: it is not a source of the count at all, but a
+ * bound on the entry walk that drives it (DESIGN.md §28), so it is never
+ * located, never merged and never priced as a lookup.
+ */
+#define LION_CLAUSE_IS_POSITIVE(k) \
+	((k) != LION_CLAUSE_NOTNULL && (k) != LION_CLAUSE_RANGE)
 
 /*
  * Which clause kinds pin their column to ONE value, so that a target list
@@ -241,10 +249,27 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  */
 #define LION_DISTINCT_TEST_COST	(50.0 * cpu_tuple_cost)
 
+/*
+ * The fixed cost of one ENTRY of a range-bounded walk (DESIGN.md §28) - the
+ * sum over a range, and a GROUP BY over one - over and above the containers
+ * it reads: the walk resumes at a key (a leaf read and a binary search), the
+ * entry is copied out, and its count sets up and tears down a merge.
+ * Measured on the assert build at 100k rows over a unique timestamp: 3601
+ * entries in 6.7 ms summed and 5.2 ms grouped, 1.4 to 1.9 us each, against
+ * the btree index-only scan's 0.64 ms for the same 3601 rows at 171 cost
+ * units.  Without it both were chosen, at about a tenth of that estimate;
+ * with it a near-unique column goes to btree, and a range over a column of
+ * 200 values (21 entries, 0.18 ms against btree's 0.9) stays with the node.
+ * The unbounded group walk of §10 keeps its own calibration.
+ */
+#define LION_RANGE_ENTRY_COST	(40.0 * cpu_tuple_cost)
+
 /* Flag bits of the third integer of LION_PRIV_INTS. */
 #define LION_FLAG_SINGLEGROUP	0x01
 #define LION_FLAG_SUMALL			0x02
 #define LION_FLAG_GROUPIDX		0x04	/* an index drives the entry scan */
+#define LION_FLAG_RANGE			0x08	/* its walk is bounded by the RANGE
+										 * clauses (DESIGN.md §28) */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -354,6 +379,11 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * (the 2026-09-23 review: a pushed-down count ran after EXECUTE on count() or
  * on the clause's operator had been revoked).
  *
+ * Shape 11 moved no member but gave two of them a new meaning: the RANGE
+ * clause kind of DESIGN.md §28, whose clauses are bounds on the driving entry
+ * walk and not sources, and the LION_FLAG_RANGE bit that says so.  A build
+ * that knows neither would take such a clause for a source.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -363,7 +393,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x5242490a
+#define LION_PRIV_MAGIC		0x5242490b
 #define LION_PRIV_NMEMBERS	13
 
 /*
@@ -500,6 +530,16 @@ typedef struct LionCountScanState
 								 * index is counted and summed (DESIGN.md §14,
 								 * `col IS NOT NULL` with nothing else) */
 	bool		hasgroupidx;	/* an index's entries drive the count */
+
+	/*
+	 * The RANGE clauses of DESIGN.md §28: they bound the driving index's
+	 * entry walk instead of being sources, all of them on its column and
+	 * ANDed into `range`, which lion_locate_where() resolves against the
+	 * relation being counted (a partition's own index, §16) and every begin
+	 * of the driver's walk hands to lion_entry_scan_begin_range().
+	 */
+	bool		hasrange;
+	LionRange	range;
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -1019,8 +1059,34 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 		return idx;
 	}
 
-	if (OidIsValid(opno) &&
-		get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_EQUAL)
+	/*
+	 * A range comparison (DESIGN.md §28) has to be one of the index's range
+	 * strategies, with the ordering its walk needs - proc 4 for the pair - in
+	 * the same family; lionvalidate() insists on both together, and this is
+	 * where a catalogue that disagrees is declined rather than walked
+	 * linearly.  The equality and hash checks below apply to it as well: the
+	 * executor resolves the bound's comparison through lion_probe_init(),
+	 * which needs them.
+	 */
+	if (kind == LION_CLAUSE_RANGE)
+	{
+		/*
+		 * A class declared on a polymorphic type (enum_ops is FOR TYPE
+		 * anyenum) names its members on that type, and the bound is of the
+		 * column's own enum: that is the class's own type, not another one.
+		 */
+		if (IsPolymorphicType(idx->opcintype[i]) &&
+			IsBinaryCoercible(cmptype, idx->opcintype[i]))
+			cmptype = idx->opcintype[i];
+		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
+														  idx->opfamily[i])))
+			return NULL;
+		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
+										  cmptype, LION_CMP_PROC)))
+			return NULL;
+	}
+	else if (OidIsValid(opno) &&
+			 get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_EQUAL)
 		return NULL;
 
 	if (OidIsValid(cmptype))
@@ -1770,6 +1836,29 @@ lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col)
 }
 
 /*
+ * How many entries of `var`'s index a range walk visits (DESIGN.md §28): the
+ * column's n_distinct over the WHOLE table - a walk visits an entry whatever
+ * the other clauses leave of it - times the range's own selectivity, at least
+ * one.  n_distinct is taken as examine_variable() gives it rather than
+ * through estimate_num_groups(), which would scale it down by every clause of
+ * the relation, the range included, and count the range twice.
+ */
+static double
+lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
+				  Selectivity sel)
+{
+	VariableStatData vardata;
+	double		ndistinct;
+	bool		isdefault;
+
+	examine_variable(root, (Node *) var, rel->relid, &vardata);
+	ndistinct = get_variable_numdistinct(&vardata, &isdefault);
+	ReleaseVariableStats(vardata);
+
+	return Max(1.0, ndistinct * sel);
+}
+
+/*
  * How many containers a posting set of `members` members can span: one per
  * LION_BLOCKS_PER_CONTAINER heap pages, and never more than one per member.
  */
@@ -2045,7 +2134,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *whereidx, List *wherecol, List *whereclauses,
 				   List *wherekinds,
 				   List *ors, double numgroups,
-				   double outer_entries, double inner_entries, int distinct)
+				   double outer_entries, double inner_entries, int distinct,
+				   double drivefrac)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -2472,7 +2562,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		/*
 		 * The entry scan walks ONE key column's entries and stops at the first
 		 * entry of the next (DESIGN.md §24), so what it reads of a multicolumn
-		 * index is that column's share of it and not the whole relation.
+		 * index is that column's share of it and not the whole relation - and
+		 * a range bounds the walk to drivefrac of those (§28), the share of
+		 * the column's entries it selects.
 		 */
 		double		pergroup = lion_containers_for(heap_pages,
 												   matching / Max(numgroups, 1.0));
@@ -2480,7 +2572,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		seq_pages += Max(1.0, (double) groupidx->pages *
 						 lion_index_column_share(root, rel, groupidx,
-												 groupcol));
+												 groupcol) * drivefrac);
 
 		/*
 		 * The count(DISTINCT k) walk over k's entries (DESIGN.md §26) tests
@@ -2635,7 +2727,8 @@ static void
 lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, List *ors,
 					double numgroups, double outer_entries,
-					double inner_entries, double outrows, int distinct)
+					double inner_entries, double outrows, int distinct,
+					bool ranged, double drivefrac)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -2649,7 +2742,19 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->driveidx[1], t->drivecol[1],
 								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
-								  outer_entries, inner_entries, distinct);
+								  outer_entries, inner_entries, distinct,
+								  drivefrac);
+
+		/*
+		 * A range-bounded walk (DESIGN.md §28) pays a fixed cost per entry it
+		 * visits, in each relation it walks - a partition's entries are its
+		 * own.  A count(DISTINCT) walk already pays its per-test cost for
+		 * each of them (§26), which is the same work.
+		 */
+		if (ranged && distinct == LION_DISTINCT_NONE &&
+			t->drivevar[0] != NULL)
+			run += lion_range_entries(root, t->rel, t->drivevar[0],
+									  drivefrac) * LION_RANGE_ENTRY_COST;
 	}
 
 	cpath->path.rows = outrows;
@@ -2966,10 +3071,15 @@ typedef struct LionLeafInfo
  * an OR it is not: the union of the arms would have to be the union of one
  * arm's complement with the others', and the complement of a posting set is
  * not a posting set (DESIGN.md §19).
+ *
+ * allow_range says the same of a range comparison (DESIGN.md §28), which
+ * bounds the entry walk that drives the count and is not a source at all: an
+ * OR's arms are sources of one union, and a range would have to be the union
+ * of its entries there.
  */
 static bool
 lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
-				 LionLeafInfo *out)
+				 bool allow_range, LionLeafInfo *out)
 {
 	memset(out, 0, sizeof(LionLeafInfo));
 	out->opno = InvalidOid;
@@ -3027,6 +3137,46 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 			out->opno = op->opno;
 			out->cmptype = exprType(out->val);
 			out->kind = LION_CLAUSE_EQ;
+		}
+		else if (LION_STRAT_IS_RANGE(out->strategy))
+		{
+			Oid			rangeop = op->opno;
+
+			/*
+			 * A range comparison (DESIGN.md §28).  The column may be on either
+			 * side: `5 < k` is `k > 5`, and the commutator is what the index's
+			 * opfamily has to know - a family that has `<(int8, int4)` but not
+			 * `>(int4, int8)` cannot answer it, and is not asked to.
+			 */
+			if (!allow_range)
+				return false;
+			if (IsA(left, Var) && lion_is_value_expr(right, false))
+			{
+				out->var = (Var *) left;
+				out->val = right;
+			}
+			else if (IsA(right, Var) && lion_is_value_expr(left, false))
+			{
+				rangeop = get_commutator(op->opno);
+				if (!OidIsValid(rangeop))
+					return false;
+				out->var = (Var *) right;
+				out->val = left;
+				out->strategy = lion_op_roaring_strategy(rangeop, &opfamily,
+														 &lefttype);
+			}
+			else
+				return false;
+			if (!LION_STRAT_IS_RANGE(out->strategy) || !op_strict(rangeop))
+				return false;
+
+			/* A literal NULL bound compares with nothing, as for equality. */
+			if (IsA(out->val, Const) && ((Const *) out->val)->constisnull)
+				return false;
+
+			out->opno = rangeop;
+			out->cmptype = exprType(out->val);
+			out->kind = LION_CLAUSE_RANGE;
 		}
 		else if (out->strategy == LION_STRAT_CONTAINS ||
 				 out->strategy == LION_STRAT_OVERLAP ||
@@ -3817,6 +3967,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	List	   *targets = NIL;		/* LionCountTarget, one per counted relation */
 	LionCountTarget *first;
 	Var		   *notnullvar = NULL;	/* the first `IS NOT NULL` column */
+	Var		   *rangevar = NULL;	/* the column the RANGE clauses bound (§28) */
+	List	   *rangeclauses = NIL; /* ... and those clauses' RestrictInfos */
+	Selectivity rangesel = 1.0; /* the share of its entries they select */
 	List	   *oids;
 	List	   *ints;
 	List	   *consts = NIL;
@@ -4061,7 +4214,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 					foreach(lb, ((BoolExpr *) arm)->args)
 					{
 						if (!lion_analyze_leaf((Node *) lfirst(lb), rti, false,
-											  &leaf))
+											  false, &leaf))
 							return;
 						lion_append_clause(&leaf, (Node *) lfirst(lb), true,
 										  &whereattnos, &clauseinfos,
@@ -4075,7 +4228,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				}
 				else
 				{
-					if (!lion_analyze_leaf(arm, rti, false, &leaf))
+					if (!lion_analyze_leaf(arm, rti, false, false, &leaf))
 						return;
 					lion_append_clause(&leaf, arm, true,
 									  &whereattnos, &clauseinfos,
@@ -4095,8 +4248,32 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			continue;
 		}
 
-		if (!lion_analyze_leaf(clause, rti, true, &leaf))
+		if (!lion_analyze_leaf(clause, rti, true, true, &leaf))
 			return;
+
+		/*
+		 * A range comparison (DESIGN.md §28) is not a source: it bounds the
+		 * entry walk that DRIVES the count, which is decided once everything
+		 * else is known.  Any number of them may name the one column - they
+		 * are ANDed into one walk - and none may name another; the column
+		 * must have no positive clause of its own besides (checked below,
+		 * once all of them are known).  A strict comparison is never true of
+		 * NULL, so the column is non-NULL in every row counted.
+		 */
+		if (leaf.kind == LION_CLAUSE_RANGE)
+		{
+			if (rangevar != NULL && rangevar->varattno != leaf.var->varattno)
+				return;
+			rangevar = leaf.var;
+			rangeclauses = lappend(rangeclauses, rinfo);
+			nonnullattnos = lappend_int(nonnullattnos,
+										(int) leaf.var->varattno);
+			lion_append_clause(&leaf, clause, false,
+							  &whereattnos, &clauseinfos, &whereclauses,
+							  &whereconsts, &wherekinds, &whereopnos,
+							  &whereinor);
+			continue;
+		}
 
 		/*
 		 * Which index answers the clause, whether its opfamily has the
@@ -4177,6 +4354,16 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						  &whereattnos, &clauseinfos, &whereclauses,
 						  &whereconsts, &wherekinds, &whereopnos, &whereinor);
 	}
+
+	/*
+	 * A range and an equality, a list or a null test on one column are two
+	 * positive clauses on it, which §10 leaves to the ordinary plan.  And a
+	 * range is never a source (DESIGN.md §28): the FK-side join's fact
+	 * filters all are, ANDed with every fk set, so it declines one.
+	 */
+	if (rangevar != NULL &&
+		(list_member_int(posattnos, (int) rangevar->varattno) || fj != NULL))
+		return;
 
 	/*
 	 * ---- the FK-side join (DESIGN.md §27) ----
@@ -4355,6 +4542,18 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		/* k's entries drive it, whatever the WHERE says (DESIGN.md §26). */
 		driveattno = distvar->varattno;
 	}
+	else if (ngroup == 0 && rangevar != NULL)
+	{
+		/*
+		 * A range on k with no GROUP BY (DESIGN.md §28): the sum over k's
+		 * entries in the range, each intersected with the other clauses -
+		 * §14's sum-over-all with the walk bounded.  The entries of one
+		 * scalar index are disjoint, so the sum is the count of their union,
+		 * which is exactly the rows whose k is in the range.
+		 */
+		sumall = true;
+		driveattno = rangevar->varattno;
+	}
 	else if (ngroup == 0 && !havepositive)
 	{
 		/*
@@ -4371,6 +4570,18 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 	/* A group folded to a constant can only have come from a WHERE key. */
 	if (singlegroup && !havepositive)
+		return;
+
+	/*
+	 * The range has to bound the walk that DRIVES the count (DESIGN.md §28):
+	 * k's entries under a GROUP BY k, a count(DISTINCT k) or the sum above,
+	 * or g's under `g, count(DISTINCT k) ... GROUP BY g`.  Anywhere else it
+	 * would have to be intersected with the driver as a source - the union of
+	 * however many entries the range holds - which is declined, and so is a
+	 * range beside a two-column GROUP BY.
+	 */
+	if (rangevar != NULL &&
+		(ngroup > 1 || driveattno != rangevar->varattno))
 		return;
 
 	/*
@@ -4444,7 +4655,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	{
 		/* §14's sum-over-all: one index, and it groups nothing. */
 		drive[0].attno = driveattno;
-		drive[0].var = notnullvar;
+		drive[0].var = (rangevar != NULL) ? rangevar : notnullvar;
 		drive[0].collation = InvalidOid;
 		drive[0].eqop = InvalidOid;
 		drive[0].valueout = false;
@@ -4479,6 +4690,21 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 									  Max(input_rel->tuples, 1.0), NULL, NULL);
 	}
 
+	/*
+	 * The share of the driving column's entries the range walks (DESIGN.md
+	 * §28): the selectivity of the range clauses alone, which for a column
+	 * whose rows spread evenly over its values is also the share of its
+	 * values, and overstates the walk for a skewed one.  A count(DISTINCT k)
+	 * over a range on k tests exactly those entries.
+	 */
+	if (rangevar != NULL)
+	{
+		rangesel = clauselist_selectivity(root, rangeclauses, rti,
+										  JOIN_INNER, NULL);
+		if (distvar != NULL && ngroup == 0)
+			distest = lion_range_entries(root, input_rel, distvar, rangesel);
+	}
+
 	if (!lion_collect_targets(root, input_rel, drive, ndrive, whereattnos,
 							 clauseinfos, &targets))
 		return;
@@ -4494,6 +4720,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		numgroups = estimate_num_groups(root,
 										list_make2(groupvar[0], groupvar[1]),
 										input_rel->rows, NULL, NULL);
+	}
+	else if (sumall && rangevar != NULL)
+	{
+		/* Every entry in the range is visited (DESIGN.md §28). */
+		numgroups = lion_range_entries(root, input_rel, rangevar, rangesel);
 	}
 	else if (sumall)
 	{
@@ -4569,7 +4800,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	ints = list_make4_int((int) rti, (int) groupattno[0], (int) groupattno[1],
 						  (singlegroup ? LION_FLAG_SINGLEGROUP : 0) |
 						  (sumall ? LION_FLAG_SUMALL : 0) |
-						  (driveattno != 0 ? LION_FLAG_GROUPIDX : 0));
+						  (driveattno != 0 ? LION_FLAG_GROUPIDX : 0) |
+						  (rangevar != NULL ? LION_FLAG_RANGE : 0));
 	{
 		ListCell   *l1;
 		ListCell   *l2;
@@ -4729,7 +4961,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						outrows,
 						(distvar == NULL) ? LION_DISTINCT_NONE :
 						distcounts ? LION_DISTINCT_COUNT :
-						LION_DISTINCT_EXISTS);
+						LION_DISTINCT_EXISTS,
+						rangevar != NULL, rangesel);
 
 	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
@@ -5629,6 +5862,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->singlegroup = (flags & LION_FLAG_SINGLEGROUP) != 0;
 	st->sumall = (flags & LION_FLAG_SUMALL) != 0;
 	st->hasgroupidx = (flags & LION_FLAG_GROUPIDX) != 0;
+	st->hasrange = (flags & LION_FLAG_RANGE) != 0;
 	st->nclause = list_length(ckinds);
 	st->distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
 
@@ -5757,17 +5991,25 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->driveattno = st->groupattno;
 	if (st->sumall)
 	{
+		/*
+		 * ... or, when the plan has RANGE clauses (DESIGN.md §28), the column
+		 * they bound, which is the one the planner drove the sum from: they
+		 * all name it.
+		 */
+		int			drivekind = st->hasrange ? LION_CLAUSE_RANGE :
+			LION_CLAUSE_NOTNULL;
+
 		st->driveattno = 0;
 		for (i = 0; i < st->nclause; i++)
 		{
-			if (st->clause[i].kind == LION_CLAUSE_NOTNULL)
+			if (st->clause[i].kind == drivekind)
 			{
 				st->driveattno = st->clause[i].attno;
 				break;
 			}
 		}
 		if (st->driveattno == 0)
-			elog(ERROR, "LionCount: sum-over-all without an IS NOT NULL clause");
+			elog(ERROR, "LionCount: sum-over-all without an IS NOT NULL or range clause");
 	}
 
 	/*
@@ -5785,6 +6027,20 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->innerattno = 0;
 	if (st->distattno != 0 && !st->hasgroupidx)
 		elog(ERROR, "LionCount: count(DISTINCT) without its index");
+
+	/*
+	 * RANGE clauses bound the driving walk (DESIGN.md §28), so there has to
+	 * be one, and they have to be on its column: anything else is planner
+	 * drift, said here rather than counted wrong.
+	 */
+	for (i = 0; i < st->nclause; i++)
+	{
+		if (st->clause[i].kind != LION_CLAUSE_RANGE)
+			continue;
+		if (!st->hasrange || !st->hasgroupidx ||
+			st->clause[i].attno != st->driveattno)
+			elog(ERROR, "LionCount: a range clause that does not bound the driving walk");
+	}
 
 	/*
 	 * The OR restrictions (DESIGN.md §19) and the sources the clauses make
@@ -5827,6 +6083,10 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 		/* The join key is looked up per child row, into slot 0, not here. */
 		if (i == st->joinclause)
+			continue;
+
+		/* A range bounds the driving walk and is no source (DESIGN.md §28). */
+		if (st->clause[i].kind == LION_CLAUSE_RANGE)
 			continue;
 
 		if (st->inor[i])
@@ -6462,6 +6722,39 @@ lion_locate_where(LionCountScanState *st)
 			lion_save_clause_key(st, cl, &src->sets[0]);
 	}
 
+	/*
+	 * The RANGE clauses, as one bound on the driving walk (DESIGN.md §28),
+	 * resolved against THIS relation's driving index: a partition's may be
+	 * another index, put its column elsewhere and compare the bounds through
+	 * a family of its own (§16).  The planner found every one of them on the
+	 * driving index, and the executor opened both by the plan's Oids, so a
+	 * clause on another index or column is drift and not a query.  A NULL
+	 * bound - a Param that came out NULL - selects nothing.
+	 */
+	if (st->hasrange)
+	{
+		lion_range_init(&st->range, st->groupidx, st->groupidxcol);
+		for (k = 0; k < st->nclause; k++)
+		{
+			LionClauseState *cl = &st->clause[k];
+			StrategyNumber strategy;
+
+			if (cl->kind != LION_CLAUSE_RANGE)
+				continue;
+			if (RelationGetRelid(cl->idx) != RelationGetRelid(st->groupidx) ||
+				cl->idxcol != st->groupidxcol)
+				elog(ERROR, "LionCount: range clause on another index than the driving one");
+			strategy = get_op_opfamily_strategy(cl->opno,
+												st->groupidx->rd_opfamily[st->groupidxcol - 1]);
+			lion_range_add(&st->range, st->groupidx, strategy,
+						   get_opcode(cl->opno), cl->valtype, cl->val,
+						   cl->valisnull,
+						   st->groupidx->rd_indcollation[st->groupidxcol - 1]);
+		}
+		if (st->range.empty)
+			st->wheremissing = true;
+	}
+
 	MemoryContextSwitchTo(oldcxt);
 
 	/*
@@ -6794,7 +7087,8 @@ lion_sumall_relation(LionCountScanState *st)
 		nsource = st->nsource;
 	}
 
-	lion_entry_scan_begin_col(&st->escan, st->groupidx, st->groupidxcol);
+	lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
+								st->hasrange ? &st->range : NULL);
 	st->scanning = true;
 
 	for (;;)
@@ -7157,7 +7451,8 @@ lion_distinct_relation(LionCountScanState *st)
 
 	if (!listdrive)
 	{
-		lion_entry_scan_begin_col(&st->escan, st->groupidx, st->groupidxcol);
+		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
+									st->hasrange ? &st->range : NULL);
 		st->scanning = true;
 	}
 
@@ -7240,9 +7535,11 @@ lion_distinct_relation(LionCountScanState *st)
 	/*
 	 * A folded GROUP BY has a row only if some row matches, and a row whose k
 	 * is NULL matches too.  Only asked when nothing else answered it, and
-	 * never under a list on k, which no NULL satisfies.
+	 * never under a list or a range on k (DESIGN.md §28), which no NULL
+	 * satisfies.
 	 */
-	if (st->singlegroup && !found && !listdrive && st->sumallitem < 0)
+	if (st->singlegroup && !found && !listdrive && st->sumallitem < 0 &&
+		!st->hasrange)
 	{
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
@@ -7568,8 +7865,9 @@ lion_next_partial_group(LionCountScanState *st)
 			 */
 			if (!st->wheremissing)
 			{
-				lion_entry_scan_begin_col(&st->escan, st->groupidx,
-										 st->groupidxcol);
+				lion_entry_scan_begin_range(&st->escan, st->groupidx,
+											st->groupidxcol,
+											st->hasrange ? &st->range : NULL);
 				st->scanning = true;
 			}
 		}
@@ -7706,8 +8004,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		 */
 		st->distcount = 0;
 		st->distcolcount = 0;
-		if (st->sumall ||
-			(st->distattno != 0 && st->groupattno == 0 && !st->singlegroup))
+		if ((st->sumall || (st->distattno != 0 && st->groupattno == 0)) &&
+			!st->singlegroup)
 			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 0);
 		return NULL;
 	}
@@ -7722,6 +8020,14 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		int64		total = lion_sumall_relation(st);
 
 		st->done = true;
+
+		/*
+		 * A GROUP BY the planner folded to one group has no row when the group
+		 * is empty - which a range-bounded sum (DESIGN.md §28) can be:
+		 * `... WHERE g = 3 AND k < 20 GROUP BY g`.
+		 */
+		if (total == 0 && st->singlegroup)
+			return NULL;
 		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 	}
 
@@ -7733,7 +8039,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	 */
 	if (!st->scanning && st->ingroupitem < 0)
 	{
-		lion_entry_scan_begin_col(&st->escan, st->groupidx, st->groupidxcol);
+		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
+									st->hasrange ? &st->range : NULL);
 		st->scanning = true;
 	}
 
@@ -7902,7 +8209,8 @@ lion_end_custom_scan(CustomScanState *node)
 
 /*
  * "col = 3", "col = ANY ('{1,2,3}')", "col IS NULL", "col IS NOT NULL",
- * "tags @> {a,b}", "tsv @@ 'a' & 'b'".
+ * "tags @> {a,b}", "tsv @@ 'a' & 'b'", "col >= 10" (a range, DESIGN.md §28,
+ * with the column on the left whichever side the query had it on).
  *
  * A clause whose value is not a literal is printed as the expression the plan
  * carries, which for a prepared statement's parameter is `$1` - the same text
@@ -7952,7 +8260,8 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				}
 				if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s = ANY (%s)", attname, val);
-				else if (cl->kind == LION_CLAUSE_MULTI)
+				else if (cl->kind == LION_CLAUSE_MULTI ||
+						 cl->kind == LION_CLAUSE_RANGE)
 				{
 					char	   *opname = get_opname(cl->opno);
 
@@ -8040,7 +8349,24 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid),
 							 lion_explain_col(st->groupidxoid,
 											  st->driveattno));
-		if (st->groupattno != 0 || st->distattno != 0)
+		if (st->hasrange)
+		{
+			bool		firstrange = true;
+
+			/* The walk's bounds (DESIGN.md §28): `(k >= 10 AND k < 20)`. */
+			appendStringInfoChar(&buf, '(');
+			for (i = 0; i < st->nclause; i++)
+			{
+				if (st->clause[i].kind != LION_CLAUSE_RANGE)
+					continue;
+				if (!firstrange)
+					appendStringInfoString(&buf, " AND ");
+				lion_explain_clause(st, &st->clause[i], ancestors, es, &buf);
+				firstrange = false;
+			}
+			appendStringInfoChar(&buf, ')');
+		}
+		else if (st->groupattno != 0 || st->distattno != 0)
 			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->driveattno, false));
 		else

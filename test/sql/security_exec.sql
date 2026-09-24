@@ -137,6 +137,21 @@ SELECT groups, count FROM lion_index_count_group_stats('lion_ex_t');   -- allowe
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION int4eq(int4, int4) TO PUBLIC;
 
+-- ---------- a range's operators (DESIGN.md §28): int4lt ----------
+REVOKE EXECUTE ON FUNCTION int4lt(int4, int4) FROM PUBLIC;
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k < 5');
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE 5 > k');                -- int4gt, as written: allowed
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k >= 2 AND k < 5 AND g = 1');
+SELECT lion_ex('SELECT k, count(*) FROM lion_ex WHERE k < 5 GROUP BY k');
+SELECT lion_ex('SELECT count(DISTINCT k) FROM lion_ex WHERE k < 5');
+SELECT lion_ex('SELECT count(*) FROM lion_exp WHERE k < 5');
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k BETWEEN 2 AND 5');  -- int4ge, int4le: allowed
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k < 5::int8');        -- int48lt: allowed
+SET ROLE lion_exec_user;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ex WHERE k < 5;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION int4lt(int4, int4) TO PUBLIC;
+
 -- ---------- a hashed IN list is checked for its hash function as well ----------
 REVOKE EXECUTE ON FUNCTION hashint4(int4) FROM PUBLIC;
 SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)');
@@ -228,6 +243,7 @@ SELECT lion_ex('SELECT g, count(*) FROM lion_ex GROUP BY g');
 SELECT lion_ex('SELECT t, g, count(*) FROM lion_ex GROUP BY t, g');
 SELECT lion_ex('SELECT g, count(DISTINCT k) FROM lion_ex GROUP BY g');
 SELECT lion_ex('SELECT g, count(*) FROM lion_exp WHERE k = 1 GROUP BY g');
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k < 5 AND g = 1');
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
@@ -245,7 +261,8 @@ RESET ROLE;
 -- nothing in pg_catalog is left revoked from PUBLIC by this file
 SELECT p.oid::regprocedure
   FROM pg_proc p
- WHERE p.oid IN ('int4eq(int4,int4)'::regprocedure, 'hashint4(int4)'::regprocedure,
+ WHERE p.oid IN ('int4eq(int4,int4)'::regprocedure, 'int4lt(int4,int4)'::regprocedure,
+                 'hashint4(int4)'::regprocedure,
                  'count()'::regprocedure, 'count("any")'::regprocedure)
    AND NOT has_function_privilege('public', p.oid, 'EXECUTE');
 

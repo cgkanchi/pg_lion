@@ -5181,7 +5181,7 @@ entries VACUUM deleted); EXPLAIN through `lion_explain_norm()`. No new concurren
 introduced - the fact side is §9 per dimension row and the dimension side is a core scan under the
 same snapshot - so no isolation spec is added.
 
-## 28. Range predicates over the sorted directory (v1)
+## 28. Range predicates over the sorted directory (v1, implemented)
 
 Formerly §12 item 5. `k < v`, `k <= v`, `k >= v`, `k > v` and `BETWEEN` on a scalar lion column,
 answered by the bitmap scan and by the count pushdown. What §21 made possible is the order: within
@@ -5200,7 +5200,10 @@ is unreleased - to every SCALAR class of `pg_lion--0.1.sql` that has proc 4, and
   `int4col < 5000000000::int8` descends exactly as `int4col = 5::int8` does;
 - every other ordered class gets its own type's four: oid, bool, char, name, text (varchar through
   binary coercion, as for `=`), bpchar, bytea, uuid, date, time, timetz, timestamp, timestamptz,
-  interval, numeric, macaddr, macaddr8, inet, jsonb, pg_lsn, xid8, tid, enum; and citext;
+  interval, numeric, macaddr, macaddr8, inet, jsonb, pg_lsn, xid8, tid, enum; and citext. enum_ops
+  is declared FOR TYPE anyenum, so a bound of the column's own enum type is the class's own type,
+  not a cross-type search (`lion_range_add()`, `lion_match_index()`); the count pushdown of an enum
+  EQUALITY still does not make that step and is declined, as it was before this section;
 - `xid_ops` and `cid_ops` get none: they have no proc 4, their directory is in hash order and a range
   has no run to walk. `array_ops` and `tsvector_ops` get none: their entries are extracted keys, not
   column values, and `tags < '{a}'` compares whole ARRAYS.
@@ -5279,6 +5282,10 @@ The walk emits entry by entry: an INLINE payload from the leaf's private copy, a
 therefore holds at most one index pin at a time and draws nothing from §15's pin budget - the bitmap
 scan needs no §9 interlock at all, since the executor visits every TID it emits - and its memory is
 the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing.
+
+`k < ANY (array)` arrives as an array key with a range strategy (amsearcharray is on for the whole
+family), and is the union of one walk per non-NULL element into the same bitmap; only `ANY` is ever
+an index qual.
 
 On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - its answer is a union
 of an unbounded number of entries - so it is answered into a TIDBitmap of its own and INTERSECTED
@@ -5363,9 +5370,17 @@ column's entries in range - the combined selectivity of the range clauses alone
 (`clauselist_selectivity()`), which is the right fraction for a column whose rows are spread evenly
 over its values and an overestimate of the walk for a skewed one - and the entries walked
 (`numgroups` of the sum-over-all and distinct walks) by the same fraction of `n_distinct(k)`.
-Everything per entry is then priced exactly as the unbounded walk prices it, which is what makes a
-wide range over a near-unique column lose (a million entries are a million merges) and a range over
-a low-cardinality one win.
+Everything per entry is then priced as the unbounded walk prices it, plus a fixed cost per entry
+walked, `LION_RANGE_ENTRY_COST` (40 `cpu_tuple_cost`): the walk resumes at a key (a leaf read and a
+binary search), copies the entry out and sets up and tears down a merge for it. Measured on the
+assert build at 100k rows over a unique timestamp, 3601 entries took 6.7 ms summed and 5.2 ms
+grouped - 1.4 to 1.9 us each - against the btree index-only scan's 0.64 ms for the same rows at 171
+cost units; without the term both were chosen at about a tenth of that estimate, with it the
+near-unique column goes to btree and a range over a 200-value column (21 entries, 0.18 ms against
+btree's 0.9) stays with the node. A count(DISTINCT) walk already pays §26's per-test cost for the
+same work and does not pay this one too. *(Deviation from this section's first draft, which
+expected the unbounded walk's per-entry terms to be enough; the unbounded group walk of §10 keeps its
+own calibration, which its own tests pin.)*
 
 **EXPLAIN** prints the driver with its range in place of `(k)` / `(all keys)`:
 `Lion Indexes: ix_d (d >= '2024-01-01'::date AND d < '2024-02-01'::date), ix_s (s = 3)` - a Param

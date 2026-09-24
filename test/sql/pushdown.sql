@@ -283,7 +283,8 @@ SELECT lion_pd('SELECT count(n) FROM lion_pdt WHERE a = 3');
 -- grouping stays with core, though the subquery's own count is ours
 SELECT * FROM lion_explain_norm('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING count(*) > (SELECT count(*) FROM lion_pdt x WHERE x.b = lion_pdt.a)') AS p("QUERY PLAN");
 -- a HAVING without an aggregate is a WHERE by the time the planner asks us,
--- and an inequality on the key is not a shape the index answers
+-- and since DESIGN.md §28 an inequality on the key bounds the group walk
+-- (test/sql/range.sql)
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING a > 3');
 -- an aggregate we cannot answer
 SELECT lion_pd('SELECT sum(id) FROM lion_pdt WHERE a = 3');
@@ -292,6 +293,7 @@ SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
 SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3');
 -- a qual that is not an indexed equality to a constant
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');
+-- ... which a range on an indexed column is, since DESIGN.md §28
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
 -- two different constants on one column

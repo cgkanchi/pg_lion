@@ -1,0 +1,193 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s1_plan s2_predel s1_begin s1_plain s2_delete s1_count s3_vacuum s2_wakeup s1_commit s3_count s3_pushed s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM cnt_r;
+step s1_plan: 
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	EXPLAIN (COSTS OFF) SELECT k, count(*) FROM cnt_r WHERE k < 3 GROUP BY k ORDER BY k;
+
+QUERY PLAN                                 
+-------------------------------------------
+Custom Scan (LionCount)                    
+  Lion Indexes: cnt_r_k (k >= 0 AND k <= 2)
+(2 rows)
+
+QUERY PLAN                     
+-------------------------------
+Custom Scan (LionCount)        
+  Lion Indexes: cnt_r_k (k < 3)
+  Group Key: k                 
+(3 rows)
+
+step s2_predel: DELETE FROM cnt_r WHERE k = 0;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+count
+-----
+ 2000
+(1 row)
+
+step s2_delete: DELETE FROM cnt_r WHERE k = 2;
+step s1_count: SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2; <waiting ...>
+step s3_vacuum: VACUUM cnt_r; <waiting ...>
+step s2_wakeup: 
+	SELECT cnt_r_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+count
+-----
+ 2000
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	SELECT k, count(*) FROM cnt_r WHERE k < 3 GROUP BY k ORDER BY k;
+
+count
+-----
+ 1000
+(1 row)
+
+k|count
+-+-----
+1| 1000
+(1 row)
+
+step s3_pushed: 
+	SET pg_lion.enable_count_pushdown = on;
+	SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	SELECT k, count(*) FROM cnt_r WHERE k < 3 GROUP BY k ORDER BY k;
+	RESET pg_lion.enable_count_pushdown;
+
+count
+-----
+ 1000
+(1 row)
+
+k|count
+-+-----
+1| 1000
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('cnt_r_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s2_predel s1_begin s1_plain s2_delete s1_group s3_vacuum s2_wakeup s1_commit s3_count s3_pushed s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM cnt_r;
+step s2_predel: DELETE FROM cnt_r WHERE k = 0;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+count
+-----
+ 2000
+(1 row)
+
+step s2_delete: DELETE FROM cnt_r WHERE k = 2;
+step s1_group: SELECT k, count(*) FROM cnt_r WHERE k < 3 GROUP BY k ORDER BY k; <waiting ...>
+step s3_vacuum: VACUUM cnt_r; <waiting ...>
+step s2_wakeup: 
+	SELECT cnt_r_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_group: <... completed>
+k|count
+-+-----
+1| 1000
+2| 1000
+(2 rows)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	SELECT k, count(*) FROM cnt_r WHERE k < 3 GROUP BY k ORDER BY k;
+
+count
+-----
+ 1000
+(1 row)
+
+k|count
+-+-----
+1| 1000
+(1 row)
+
+step s3_pushed: 
+	SET pg_lion.enable_count_pushdown = on;
+	SELECT count(*) FROM cnt_r WHERE k BETWEEN 0 AND 2;
+	SELECT k, count(*) FROM cnt_r WHERE k < 3 GROUP BY k ORDER BY k;
+	RESET pg_lion.enable_count_pushdown;
+
+count
+-----
+ 1000
+(1 row)
+
+k|count
+-+-----
+1| 1000
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('cnt_r_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

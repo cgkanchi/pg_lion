@@ -641,11 +641,12 @@ SELECT * FROM lion_explain_norm('SELECT a, count(*) FROM lion_pdt GROUP BY a HAV
 (7 rows)
 
 -- a HAVING without an aggregate is a WHERE by the time the planner asks us,
--- and an inequality on the key is not a shape the index answers
+-- and since DESIGN.md §28 an inequality on the key bounds the group walk
+-- (test/sql/range.sql)
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING a > 3');
-         lion_pd         
--------------------------
- not pushed down, 6 rows
+       lion_pd       
+---------------------
+ pushed down, 6 rows
 (1 row)
 
 -- an aggregate we cannot answer
@@ -675,10 +676,11 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');
  not pushed down, 1 rows
 (1 row)
 
+-- ... which a range on an indexed column is, since DESIGN.md §28
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
