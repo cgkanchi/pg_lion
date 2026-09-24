@@ -784,7 +784,9 @@ Planner integration
   - input_rel is a single base relation (RELOPT_BASEREL, RTE_RELATION, relkind ordinary table or
     materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
     partitioned parents, which are counted one live leaf partition at a time; everything this
-    section says about "the relation" then means "the partition being counted".
+    section says about "the relation" then means "the partition being counted". §27 added one
+    join shape - a fact table joined to a dimension on a lion-indexed fk - where "the relation"
+    is the fact table and the dimension side is a child plan.
   - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
@@ -3608,10 +3610,12 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   sorted TID tail merged into the containers on the next insert that finds it full, or by VACUUM),
   which stays inside the pinned-page protocol and keeps counts exact. Multi-key classes are the one
   place a real pending list might pay; revisit only with a measured tsvector ingestion case.
-- **FK-side join pushdown**: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK column
-  is, per dimension group, the union of the member keys' posting sets ANDed with the fact filters.
-  Needs the pushdown to accept a subquery-produced key set and the planner to push the aggregate
-  through the join.
+- **FK-side join pushdown: implemented, see §27.** `GROUP BY dim.attr` over a fact table joined on
+  a lion-indexed FK column. The sketch here - per dimension group, the union of the member keys'
+  posting sets ANDed with the fact filters - became a count per DIMENSION ROW emitted as a partial
+  aggregate, with core's Finalize Agg doing the grouping: the join count is additive over dimension
+  rows, so no per-group key set (and no memory bound on one) is needed, and the "subquery-produced
+  key set" is the dimension side's own plan, run as the node's child.
 - **`count(DISTINCT k)` in the pushdown: implemented, see §26.** Both shapes (`count(DISTINCT k)`
   over the WHERE, and per `GROUP BY g`) with the rules this item set: existence tests with early
   exit, NULLs never counted, the grouping-equality check, multi-key columns and partitioned tables
@@ -4739,3 +4743,207 @@ of one index) - and the declines: an array column, a partitioned table, a collat
 coarser opclass, an unindexed column, two distinct columns, `k` as the group column and two GROUP
 BY columns. The plan choice for shape 2 is pinned at a small and a large pair count, and EXPLAIN
 ANALYZE shows the early exit reading fewer containers than the same walk with `count(k)` beside it.
+
+## 27. FK-side join pushdown: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK (v1, implemented)
+
+Formerly the §23 backlog item of the same name. The shape is the star-schema aggregate
+
+    SELECT d.attr, count(*)
+    FROM fact f JOIN dim d ON f.fk = d.pk
+    [WHERE <pushdown clauses on f>] [AND <anything on d>]
+    GROUP BY d.attr [HAVING ...]
+
+and its ungrouped form, `SELECT count(*) FROM fact f JOIN dim d ON f.fk = d.pk WHERE d.attr = c`,
+a semi-join-like count over the fk keys of the matching dimension rows. The ordinary plan reads
+every fact row the fact filters leave, probes the dimension for each and aggregates; the posting
+sets already hold the fact rows of every fk value, partitioned by value.
+
+### What is computed, and why it is exact
+
+Let `D` be the dimension rows that survive the dimension-side quals under the query's snapshot, and
+for one of them, `d`, let `F(d)` be the fact rows that satisfy the fact filters and `f.fk = d.pk`
+under the join's operator. The inner join's `count(*)` for a group `G` of `d.attr` is the number of
+join PAIRS `(f, d)` with `d` in `G`, which is `sum over d in D ∩ G of |F(d)|`. So the node never
+builds the per-group key set the backlog item sketched:
+
+- it runs the dimension side as an ordinary child plan (below) and, for EACH dimension row, looks
+  `d.pk` up in the fact's lion index on `fk` and counts that one posting set ANDed with the fact
+  filters - the §9 count of `f.fk = <value> AND <fact filters>`, with the value taken from the
+  dimension row instead of from the query;
+- it emits one PARTIAL aggregate per dimension row whose count is not zero - `(the dimension
+  columns the query needs, partial count)` - and core's Finalize Agg above it groups those rows by
+  `d.attr` with `d.attr`'s own equality and adds the counts, exactly as §16's partitioned GROUP BY
+  hands its per-partition partials to it.
+
+Consequences, each of them a rule rather than an optimisation:
+
+- **No per-group union, so no memory bound to enforce on one.** The node holds one dimension row,
+  one fk posting set (located, counted and released per row, like a §20 inner pair's) and the fact
+  filters' sets for the whole scan. The grouping state lives in core's Finalize HashAggregate,
+  which spills under `hash_mem` (§16's argument, unchanged). A dimension of a million rows is not
+  refused for memory; it is refused by the cost model, because a million lookups lose to a hash
+  join.
+- **Grouping equality and value representation are core's.** `d.attr` is never read from an index:
+  its value comes out of the dimension's own tuples through the child plan, and the Finalize Agg
+  groups it with the `SortGroupClause` the parser chose. Neither §10 finding 3 (the driving index's
+  equality is the grouping equality) nor finding 4 (the value-representation contract) applies,
+  because no index key is printed and no index drives the groups. Any grouping over dimension
+  columns - `GROUP BY d.a, d.b`, `GROUP BY upper(d.name)` - is therefore fine: the node's
+  projection computes it per dimension row from the child's columns. A VOLATILE one is refused,
+  since evaluated per dimension row instead of per join row it would mean something else.
+- **HAVING belongs to the Finalize Agg**, as for a partitioned GROUP BY (§16): any HAVING core can
+  evaluate over the grouped target is accepted, as long as every aggregate in it passes the count
+  test below.
+- **NULLs.** A NULL `d.pk` joins nothing (the join operator must be strict) and is skipped without
+  a lookup; a NULL `f.fk` lives in the fk index's reserved NULL entry (§14), which no lookup of a
+  value reaches. A NULL `d.attr` is a group like any other, formed by the Finalize Agg.
+- **A dimension row with no fact rows emits nothing**, so an inner join's absent group stays absent;
+  the ungrouped form's plain Finalize Agg then answers 0 for an empty input, as `count(*)` over an
+  empty join does. A GROUP BY the planner folded to constants (`WHERE d.attr = 3 GROUP BY d.attr`)
+  gets a zero-column sorted Finalize Agg, as core builds itself, so an empty join has no row.
+
+### Uniqueness of the dimension key
+
+The sum above is the join count whatever `d.pk` holds - a duplicated key is two dimension rows,
+each counted with its own multiplicity, which is exactly what the join does - so, unlike the
+backlog sketch's union (where two rows of one group with one key would have been counted once),
+this design does not need uniqueness to be RIGHT. v1 requires it anyway, as a scope decision:
+
+- the ordinary star schema has it (the dimension's primary key), and it bounds the node's work by
+  the dimension's KEY count, which is what the cost model assumes: every lookup finds a different
+  fk entry, so no fact row is read twice;
+- a non-unique key is the shape where a hash join over the fact wins in any case, because the
+  lookups multiply, and it is kept out of the tested surface.
+
+The proof is `lion_fkjoin_dim_unique()`: a single-column, UNIQUE, immediately enforced, non-partial
+btree index on the dimension's join column whose opfamily contains the join operator as its
+equality strategy and whose collation equals the join clause's input collation (or the type is not
+collatable). It is written against the index list rather than through core's
+`relation_has_unique_index_for()`, because before PostgreSQL 19 that function does not compare
+collations (its own `XXX`): a unique index under `"C"` does not make a join under a
+case-insensitive collation unique. Lifting the rule is a costing change, not a correctness one.
+
+### The join semantics the lookup must reproduce
+
+The count for one dimension row is the §10 count of `f.fk = v` with `v = d.pk` of that row, and a
+lookup answers that clause exactly when the clause is one the pushdown already accepts:
+
+- the join operator is strategy 1 of the fk index's opfamily, the compared type (`d.pk`'s) has a
+  cross-type equality and a hash function in that family, and the collations agree - exactly
+  `lion_match_index()` for a `LION_CLAUSE_EQ` clause, which the join key is fed through, per
+  relation. Cross-type keys (`int4` fk against `int8` pk) work wherever `int4col = 8::int8` works,
+  and an opclass on `fk` whose equality is not the join operator never matches;
+- the operator is strict, so a NULL key joins nothing;
+- the join is the ONLY join clause: one equality between a plain column of the fact rel and a plain
+  column of the dimension rel, from an equivalence class or from `joininfo`. A second join clause
+  (`AND f.a < d.b`, a composite key), a pseudoconstant qual anywhere in the query, an outer, semi or
+  anti join (`join_info_list` must be empty), a LATERAL reference or a PlaceHolderVar all decline.
+  An equivalence class with a constant (`d.pk = 5`) generates no join clause at all - both sides
+  are restricted to the constant - and is left to the ordinary plan.
+
+### Visibility and the §9 interlock
+
+- **The dimension side is an ordinary plan**: the dimension rel's cheapest total path, planned by
+  core with its restriction clauses and its RLS security quals (with core's leakproofness rules),
+  carried as the CustomPath's `custom_paths` child and run by the node under the query's snapshot.
+  Only rows that passed it are ever looked up. Privileges on both tables are the executor's
+  range-table check, as before. The fact side keeps §10's rule: a fact rel with security quals
+  (RLS) or TABLESAMPLE declines, and so does a partitioned fact table in v1.
+- **The fact side is the §9 count, unchanged.** Each dimension row's fk set is located with
+  `lion_posting_set_lookup_col()`, counted with `lion_count_sources_cached()` beside the fact
+  filters' sources, and released before the next dimension row, so at any moment one fk set and
+  the WHERE sets hold pins. The pin budget of §15 applies to that lookup as to every single lookup
+  (a NOPIN set is re-located, or covered by another source, by the count itself), and no argument
+  of §9, §11 or §15 changes: the fk set is to this node what one group's set is to §15's GROUP BY
+  driver. The visibility cache is shared across dimension rows as it is across groups, and the fk
+  index takes the `PredicateLockRelation()` every index the node opens takes.
+- **One snapshot for both sides.** The child and the count both read `es_snapshot`, so a fact row
+  is counted for a dimension row exactly when both are visible to it - which is the join.
+
+### Planner integration
+
+`create_upper_paths_hook` at UPPERREL_GROUP_AGG, as today, with the input rel a JOIN rel of exactly
+two plain base tables. `lion_fkjoin_recognize()` (src/lion_fkjoin.c) finds the one join clause and
+proves the dimension key unique, for each orientation in turn, and hands `lion_try_count_path()` a
+`LionFkJoin`. That function then runs over the FACT rel, unchanged for everything about the fact
+side - the WHERE analysis of §10/§14/§15/§17/§19, Params, index matching per clause - with the join
+key appended as one more `LION_CLAUSE_EQ` clause whose value expression is the dimension's Var, so
+that `lion_collect_targets()` finds and checks the fk index for it like any clause. It differs only
+in what it lets through the target list:
+
+- the grouped target and the HAVING may reference only dimension Vars (in any non-volatile
+  expression) and count aggregates: `count(*)`, and `count(x)` where `x` is a non-NULL constant or
+  either side of the join key (non-NULL in every joined row). Other aggregates, DISTINCT, window
+  functions, SRFs, grouping sets and row marks decline, as for a single table;
+- the aggregates must be splittable (`GROUPING_CAN_PARTIAL_AGG`) and every grouping column
+  hashable. The node's target is `lion_make_partial_target()` of the grouped target, and what goes
+  into the grouped rel is `create_agg_path(AGG_HASHED, or AGG_SORTED over zero columns for a folded
+  GROUP BY, or AGG_PLAIN; AGGSPLIT_FINAL_DESERIAL)` over the node.
+
+Executor encoding: the join key clause travels in the clause lists like any other - its value, the
+dimension Var, lands in `custom_exprs`, where setrefs.c rewrites it into an INDEX_VAR reference to
+`custom_scan_tlist`, which is how EXPLAIN deparses it as `fk = d.pk` - but it is not a source and
+is never located with the WHERE clauses. A new member `LION_PRIV_JOIN` names it and the child-plan
+column that carries its value; the node reads the key straight from the child's tuple, and the fk
+set occupies source slot 0 (the group slot, unused without an index-driven GROUP BY).
+`custom_scan_tlist` holds every dimension Var the target needs, the key's, and the partial counts;
+a dimension column's target-list kind is its position in the child's target list. Shape marker 9,
+`LION_PRIV_NMEMBERS` 12.
+
+**Cost** (`lion_cost_fkjoin_rel()`): the child's total cost, plus per dimension row one directory
+descent (the leaf at `lion_heap_page_cost()`'s interpolated cost, capped by the directory's pages:
+dimension rows come in heap order, not key order), a fixed per-count cost for a merge set up and
+torn down (`LION_FKJOIN_COUNT_COST`, 50 `cpu_tuple_cost`, the order §26 measured per test), the fk
+set's containers - `lion_containers_for(heap_pages, rows per fk value)` - once for the set and once
+more per fact filter source it is intersected with, its chain pages (none when its entries are
+INLINE), and a `cpu_tuple_cost` per emitted row; each fact filter's lookup and chain once (located
+once, materialized on second use, §9); and §10's recheck term for the fact rows the dimension rows
+reach - `min(D × rows per fk value, fact rows) × filter selectivity × dirtyfrac` candidates, on
+dirty pages fetched once per query. Nothing charges the whole fact heap: that is what the node
+exists not to read. The Finalize Agg is costed by core.
+
+**Parallelism**: `parallel_safe = false` like the rest; the child may itself be a Gather, which is
+fine below a non-parallel node.
+
+**EXPLAIN**:
+
+    Finalize HashAggregate
+      Group Key: d.attr
+      ->  Custom Scan (LionCount)
+            Lion Indexes: fact_fk_idx (fk = d.pk), fact_x_idx (x = 1)
+            ->  Seq Scan on dim d
+                  Filter: (region = 'eu'::text)
+
+and with ANALYZE, besides §10's counters, `Join Keys Looked Up` (dimension rows with a non-NULL
+key) and `Join Keys Without Entry`.
+
+### Declined in v1, and why
+
+- **A non-unique dimension key** (above: a scope and costing decision, not a correctness one).
+- **A partitioned fact table.** §16 opens one partition at a time, so the join would have to re-run
+  the dimension child per partition or look every key up in every partition's index; both are
+  straightforward but double the tested surface. A partitioned, inheritance or subquery DIMENSION
+  is declined for want of an index list to prove uniqueness from; `innerrel_is_unique()` would
+  prove some of those and is the natural v2.
+- **More than two relations**, composite keys, snowflake chains: the dimension would be a join
+  itself.
+- **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
+  over `f.x`, which composes, but is not in v1.
+- **`count(f.col)` of a nullable column, and every non-count aggregate**, as for a single table.
+- **Semi and anti joins** (`WHERE f.fk IN (SELECT pk FROM d WHERE ...)`): the IN form is this count
+  over the subquery's distinct keys, but it arrives as a SpecialJoinInfo and is left for later.
+
+### Tests
+
+`test/sql/fkjoin.sql`: every query against the same query with the pushdown off, as a multiset both
+ways round, on a clean heap and on a dirty one (deletes and updates of fact and of dimension rows
+before VACUUM) - GROUP BY one and two dimension columns and an expression, the ungrouped count with
+a dimension filter, fact filters (`=`, IN, `IS NULL` on another column, OR), NULL fks, NULL
+dimension keys and a NULL group, HAVING, ORDER BY and LIMIT on top, cross-type keys (`int4` fk
+against `int8` pk), text keys, a generic plan with a Param fact filter; the declines - a non-unique
+dimension key, a second join clause, an outer join, fact RLS, a fact column in the output, a
+volatile grouping expression, a partitioned fact; dimension RLS applied (a policy hiding rows
+changes the answer exactly as it does the ordinary plan's) and column privileges on `d.attr`
+enforced; EXPLAIN through `lion_explain_norm()`. No new concurrency argument is introduced - the
+fact side is §9 per dimension row and the dimension side is a core scan under the same snapshot -
+so no isolation spec is added.
