@@ -633,7 +633,11 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   `lion_index_wal_mode()` locks whatever it is handed - so they are revoked from PUBLIC like
   pageinspect's and amcheck's (`lion_index_stats()` is granted to `pg_stat_scan_tables`, as
   pgstattuple's functions are). `lion_index_verify()` names a missing row's key value only to a
-  superuser; a role it is granted to gets the TID (test/sql/hardening.sql).
+  superuser; a role it is granted to gets the TID (test/sql/hardening.sql). The cheap half of the
+  count functions' check - SELECT on the table or on at least one column - comes BEFORE any lock
+  is taken, so a role with no privilege cannot queue behind (and hold up) locks on a table it
+  cannot read; the exact check follows under the lock, where the index definition can be trusted
+  (third round of the 2026-09-23 review, test/isolation/count_lock_privilege.spec).
 - **Install scripts.** Every support function a script names is found in pg_catalog or, for
   citext, through `@extschema:citext@` - never in the target schema, where a role with CREATE could
   plant one that then runs as whoever inserts into the index (test/sql/hardening.sql).
@@ -676,7 +680,9 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
 
 Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
-   entries copy the payload while holding the pin; for CHAIN entries note head).
+   entries copy the payload while holding the pin; for CHAIN entries note head). Pins are
+   budgeted: an INLINE set located past the budget holds none, and §15's "The pin budget" says
+   how the count keeps this section's rule for it.
 2. Merge-iterate the k posting sets by ckey (they are sorted). For the AND of k containers with the
    same ckey use lion_container_and into a work buffer (k-1 times). Containers whose ckey is missing
    from any set contribute nothing.
@@ -748,6 +754,9 @@ SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS b
 `lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
 Both verify the key type matches the index's opcintype, open the heap via IndexGetRelation with
 AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
+They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
+its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
+entry's meaning and used to be hashed and compared as if it did.
 Nobody vetted the index they were handed, so they also make the decision the planner makes in
 get_relation_info() before looking anything up: `lion_index_usable(index, snapshot, &why)` (lion.h,
 implemented in lion_pages.c, shared with lion_index_verify's heapallindexed pass) requires
@@ -1634,8 +1643,56 @@ The array may also be a Param, or an `ArrayExpr` over literals and Params, which
 ($1, $2)` and `k = ANY ($1)` keep in a generic plan (§10). The length cap then applies only when the
 length is known at plan time - a literal array's and an ArrayExpr's. A Param that IS an array has no
 length until the executor has it, and by then there is no plan left to decline in favour of, so it
-is answered whatever its length; the pin budget the cap protects is bounded by the index's bucket
-pages instead, since every element's entry lives on one of those.
+is answered whatever its length, and the pins are bounded by the lookup instead (below).
+
+### The pin budget (2026-09-23 review)
+
+This section used to say that an unbounded list's pins were "bounded by the index's bucket pages,
+since every element's entry lives on one of those". Since §21 that is the number of directory
+LEAVES, which grows with the index, and the bound was no bound: with 1.9 kB keys, a few per leaf,
+`lion_index_count_any(idx, (SELECT array_agg(k) FROM t))`, the pushdown's `k = ANY ((SELECT
+array_agg(k) ...))` and the multicolumn bitmap scan of the same clause all failed with "no unpinned
+buffers available" at shared_buffers = 16MB and 9000 keys - and a list one short of that would have
+starved every other backend of buffers instead.
+
+So `lion_posting_set_lookup_many()` keeps pins on at most a BUDGET of distinct leaves: this
+backend's remaining share of shared_buffers (`GetAdditionalPinLimit()`; lion_compat.h computes it on
+16 and 17), and never more than `LION_LOOKUP_MAX_PINS` = 1000, the longest list the planner takes
+as a literal - so a literal list never pins fewer leaves than it used to unless the share is
+smaller. Pins on the leaf the previous set already pins cost no buffer and are not counted. An
+INLINE set found past the budget comes out **NOPIN**: its payload copied, its leaf let go, exactly
+like a materialized set (§9). A single lookup does the same when the backend already holds its
+share (`lion_posting_set_take()`), because callers loop over lookups - one per key of a tsquery -
+and nothing else would bound that (17 and later: 16's bufmgr cannot say what a backend already
+pins, so there only the list lookup is budgeted).
+
+A NOPIN set carries no §9 interlock of its own, and the count restores one in each of its shapes:
+
+- **The disjoint sum** (the common case, the list the only positive source). Counting the sets one
+  at a time needs only one of them pinned at a time, so `lion_count_one_set()` locates a NOPIN
+  set's entry AGAIN, by its stored key, keeps that pin, and counts the fresh copy under it - the
+  ordinary §9 order, one set per pass. A list with NOPIN sets takes the sum whatever
+  `lion_sum_is_cheaper()` says, because the union would have nothing to carry the interlock.
+  Locating again is sound for the reason a chain may be read page by page after its entry was
+  found: the entry is the same one (a column has one entry per key), read later under the same
+  snapshot, and an entry VACUUM deleted in between held nothing visible to anyone. One count of a
+  single set - a group of the §15 GROUP BY driver - does the same.
+- **An intersection** (`k = ANY ($1) AND x = 1`): the rule that already lets a set be materialized
+  applies unchanged - the count of an intersection may be taken from the visibility map while ONE
+  positive source holds a pin at every container key (`lion_source_pinned()`, which now counts a
+  NOPIN leaf as unpinned), and the argument on `lion_posting_set_materialize()` is exactly the
+  argument for a stale copy. x's set carries it.
+- **Nothing carries it** (an OR across columns, §19, whose leaf is a list past the budget; or an
+  intersection of sources that are all NOPIN or materialized): the count trusts no visibility map
+  (`cx.novm`) and rechecks every candidate in the heap, as a standby with a generic-WAL index does.
+  Correct, and slower only for lists over the budget.
+
+The bitmap scan needs no interlock at all - every TID it emits is visited by the executor - so
+lion_scan.c drops the pins of its per-key lookups at once (`lion_posting_set_unpin()`), and its IN
+lists are budgeted by the lookup like everyone's. test/sql/pinbudget.sql parks a GROUP BY count
+with a cursor, whose WHERE sets stay located from the first group to the last, and counts the
+index's pinned buffers in pg_buffercache: 1500 before the budget, at most 1000 with it; and it
+proves every shape above still exact, and which of them still answer from the map.
 
 The merge's sources are therefore unions: k sub-cursors merged by container key, yielding the union
 of the containers that share the smallest key any of them still has. The §9 pin rule is per

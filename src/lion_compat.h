@@ -203,4 +203,29 @@ extern void smgr_bulk_write(BulkWriteState *bulkstate, BlockNumber blocknum,
 extern void smgr_bulk_finish(BulkWriteState *bulkstate);
 #endif
 
+/*
+ * How many more shared buffers this backend may pin without taking more than
+ * its share of them (18).  17 offers the same limit as a clamp only,
+ * LimitAdditionalPins(); 16 has neither, and the share is computed the way
+ * bufmgr.c computes it, without knowing what the backend already pins.
+ */
+#if PG_VERSION_NUM < 180000
+#include "miscadmin.h"
+#include "storage/bufmgr.h"
+#include "storage/proc.h"
+
+static inline uint32
+GetAdditionalPinLimit(void)
+{
+#if PG_VERSION_NUM >= 170000
+	uint32		limit = PG_UINT32_MAX;
+
+	LimitAdditionalPins(&limit);
+	return limit;
+#else
+	return (uint32) (NBuffers / (MaxBackends + NUM_AUXILIARY_PROCS));
+#endif
+}
+#endif
+
 #endif							/* LION_COMPAT_H */

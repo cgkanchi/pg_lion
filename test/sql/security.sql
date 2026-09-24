@@ -161,6 +161,58 @@ SELECT lion_index_posting_root('lion_sec_d_k', 1);           -- still not the pr
 RESET ROLE;
 REVOKE pg_stat_scan_tables FROM lion_sec_reader;
 DROP TABLE lion_sec_d;
+-- ---------- argument checks of the SQL count functions (2026-09-23 review, third round) ----------
+-- Key column 0 is no key column: lion_index_count_group_stats() took it for
+-- "no column", which a one-column index satisfies, and then read the
+-- operator class of column -1 before anything noticed.  It is refused up
+-- front now, as a bad argument (the handler catches only that SQLSTATE).
+CREATE FUNCTION lion_sec_attno(idx regclass, attno int2) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM lion_index_count_group_stats(idx, false, attno);
+	RETURN 'accepted';
+EXCEPTION WHEN invalid_parameter_value THEN
+	RETURN SQLERRM;
+END
+$$;
+SELECT lion_sec_attno('lion_sec_k', 0::int2);
+SELECT lion_sec_attno('lion_sec_k', (-1)::int2);
+SELECT lion_sec_attno('lion_sec_k', 2::int2);
+SELECT lion_sec_attno('lion_sec_k', 1::int2);
+DROP FUNCTION lion_sec_attno(regclass, int2);
+-- A relation that does not exist (dropped, or never there) is named by its
+-- OID, not as "(null)".
+SELECT lion_index_count(4294967295::oid::regclass, 1);
+SELECT lion_index_count_any(4294967295::oid::regclass, ARRAY[1]);
+-- A role with no privilege on the table is refused before any lock is taken
+-- on it (test/isolation/count_lock_privilege.spec shows the lock); a role
+-- with some column privilege gets as far as the exact check, and the same
+-- error.
+CREATE ROLE lion_sec_none;
+SET ROLE lion_sec_none;
+SELECT lion_index_count('lion_sec_k', 1);
+SELECT lion_index_count_any('lion_sec_k', ARRAY[1]);
+SELECT * FROM lion_index_count_group_stats('lion_sec_k');
+RESET ROLE;
+GRANT SELECT (id) ON lion_sec TO lion_sec_none;
+SET ROLE lion_sec_none;
+SELECT lion_index_count('lion_sec_k', 1);
+RESET ROLE;
+REVOKE SELECT (id) ON lion_sec FROM lion_sec_none;
+DROP ROLE lion_sec_none;
+-- A key of a multi-key column (DESIGN.md §17) is not a column value: the
+-- keyed functions hashed a whole tsvector as if it were one and answered a
+-- meaningless count.  They refuse it, as the grouped form always did.
+CREATE TABLE lion_sec_mk (d tsvector NOT NULL);
+INSERT INTO lion_sec_mk SELECT to_tsvector('simple', 'w' || (g % 5)) FROM generate_series(1, 100) g;
+CREATE INDEX lion_sec_mk_d ON lion_sec_mk USING lion (d);
+SELECT lion_index_count('lion_sec_mk_d', 'w1'::tsvector);
+SELECT lion_index_count('lion_sec_mk_d', 'w1'::tsvector, 'lion_sec_mk_d', 'w2'::tsvector);
+SELECT * FROM lion_index_count_stats('lion_sec_mk_d', 'w1'::tsvector);
+SELECT lion_index_count_any('lion_sec_mk_d', ARRAY['w1'::tsvector]);
+SELECT * FROM lion_index_count_group_stats('lion_sec_mk_d');
+SELECT count(*) FROM lion_sec_mk WHERE d @@ 'w1'::tsquery;   -- the question the operator answers
+DROP TABLE lion_sec_mk;
 DROP TABLE lion_sec;
 DROP ROLE lion_sec_reader;
 DROP ROLE lion_sec_other;

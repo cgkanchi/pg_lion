@@ -278,6 +278,94 @@ ERROR:  permission denied for function lion_index_posting_root
 RESET ROLE;
 REVOKE pg_stat_scan_tables FROM lion_sec_reader;
 DROP TABLE lion_sec_d;
+-- ---------- argument checks of the SQL count functions (2026-09-23 review, third round) ----------
+-- Key column 0 is no key column: lion_index_count_group_stats() took it for
+-- "no column", which a one-column index satisfies, and then read the
+-- operator class of column -1 before anything noticed.  It is refused up
+-- front now, as a bad argument (the handler catches only that SQLSTATE).
+CREATE FUNCTION lion_sec_attno(idx regclass, attno int2) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM lion_index_count_group_stats(idx, false, attno);
+	RETURN 'accepted';
+EXCEPTION WHEN invalid_parameter_value THEN
+	RETURN SQLERRM;
+END
+$$;
+SELECT lion_sec_attno('lion_sec_k', 0::int2);
+               lion_sec_attno                
+---------------------------------------------
+ lion index "lion_sec_k" has no key column 0
+(1 row)
+
+SELECT lion_sec_attno('lion_sec_k', (-1)::int2);
+                lion_sec_attno                
+----------------------------------------------
+ lion index "lion_sec_k" has no key column -1
+(1 row)
+
+SELECT lion_sec_attno('lion_sec_k', 2::int2);
+               lion_sec_attno                
+---------------------------------------------
+ lion index "lion_sec_k" has no key column 2
+(1 row)
+
+SELECT lion_sec_attno('lion_sec_k', 1::int2);
+ lion_sec_attno 
+----------------
+ accepted
+(1 row)
+
+DROP FUNCTION lion_sec_attno(regclass, int2);
+-- A relation that does not exist (dropped, or never there) is named by its
+-- OID, not as "(null)".
+SELECT lion_index_count(4294967295::oid::regclass, 1);
+ERROR:  relation with OID 4294967295 does not exist
+SELECT lion_index_count_any(4294967295::oid::regclass, ARRAY[1]);
+ERROR:  relation with OID 4294967295 does not exist
+-- A role with no privilege on the table is refused before any lock is taken
+-- on it (test/isolation/count_lock_privilege.spec shows the lock); a role
+-- with some column privilege gets as far as the exact check, and the same
+-- error.
+CREATE ROLE lion_sec_none;
+SET ROLE lion_sec_none;
+SELECT lion_index_count('lion_sec_k', 1);
+ERROR:  permission denied for table lion_sec
+SELECT lion_index_count_any('lion_sec_k', ARRAY[1]);
+ERROR:  permission denied for table lion_sec
+SELECT * FROM lion_index_count_group_stats('lion_sec_k');
+ERROR:  permission denied for table lion_sec
+RESET ROLE;
+GRANT SELECT (id) ON lion_sec TO lion_sec_none;
+SET ROLE lion_sec_none;
+SELECT lion_index_count('lion_sec_k', 1);
+ERROR:  permission denied for table lion_sec
+RESET ROLE;
+REVOKE SELECT (id) ON lion_sec FROM lion_sec_none;
+DROP ROLE lion_sec_none;
+-- A key of a multi-key column (DESIGN.md §17) is not a column value: the
+-- keyed functions hashed a whole tsvector as if it were one and answered a
+-- meaningless count.  They refuse it, as the grouped form always did.
+CREATE TABLE lion_sec_mk (d tsvector NOT NULL);
+INSERT INTO lion_sec_mk SELECT to_tsvector('simple', 'w' || (g % 5)) FROM generate_series(1, 100) g;
+CREATE INDEX lion_sec_mk_d ON lion_sec_mk USING lion (d);
+SELECT lion_index_count('lion_sec_mk_d', 'w1'::tsvector);
+ERROR:  key column 1 of index "lion_sec_mk_d" has a multi-key operator class, whose entries are not column values
+SELECT lion_index_count('lion_sec_mk_d', 'w1'::tsvector, 'lion_sec_mk_d', 'w2'::tsvector);
+ERROR:  key column 1 of index "lion_sec_mk_d" has a multi-key operator class, whose entries are not column values
+SELECT * FROM lion_index_count_stats('lion_sec_mk_d', 'w1'::tsvector);
+ERROR:  key column 1 of index "lion_sec_mk_d" has a multi-key operator class, whose entries are not column values
+SELECT lion_index_count_any('lion_sec_mk_d', ARRAY['w1'::tsvector]);
+ERROR:  key column 1 of index "lion_sec_mk_d" has a multi-key operator class, whose entries are not column values
+SELECT * FROM lion_index_count_group_stats('lion_sec_mk_d');
+ERROR:  key column 1 of index "lion_sec_mk_d" has a multi-key operator class, whose entries are not column values
+SELECT count(*) FROM lion_sec_mk WHERE d @@ 'w1'::tsquery;   -- the question the operator answers
+ count 
+-------
+    20
+(1 row)
+
+DROP TABLE lion_sec_mk;
 DROP TABLE lion_sec;
 DROP ROLE lion_sec_reader;
 DROP ROLE lion_sec_other;

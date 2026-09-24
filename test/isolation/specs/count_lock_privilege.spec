@@ -1,0 +1,1 @@
+../count_lock_privilege.spec

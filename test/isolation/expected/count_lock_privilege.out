@@ -1,0 +1,11 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_lock s2_count s2_any s2_group s1_commit
+step s1_lock: BEGIN; LOCK TABLE cnt_lp IN ACCESS EXCLUSIVE MODE;
+step s2_count: SELECT lion_index_count('cnt_lp_k', 1);
+ERROR:  permission denied for table cnt_lp
+step s2_any: SELECT lion_index_count_any('cnt_lp_k', ARRAY[1, 2]);
+ERROR:  permission denied for table cnt_lp
+step s2_group: SELECT groups FROM lion_index_count_group_stats('cnt_lp_k');
+ERROR:  permission denied for table cnt_lp
+step s1_commit: COMMIT;

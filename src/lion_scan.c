@@ -641,11 +641,19 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 
 	Assert(q.nkeys > 0 && q.tree != NULL);
 
+	/*
+	 * A query may carry any number of keys, and every INLINE set would keep
+	 * a pin on its leaf until the end (2026-09-23 review).  Those pins are
+	 * the count's visibility-map interlock (DESIGN.md §9) and protect nothing
+	 * here - every TID goes to the bitmap heap scan, which visits the heap
+	 * for it - so each one is dropped as soon as its payload is copied.
+	 */
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * q.nkeys);
 	for (i = 0; i < q.nkeys; i++)
 	{
 		(void) lion_posting_set_lookup_col(index, (AttrNumber) col->attno,
 										  q.keys[i], InvalidOid, &sets[i]);
+		lion_posting_set_unpin(&sets[i]);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -898,12 +906,14 @@ lion_scan_col_tree(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 				return NULL;
 			}
 
+			/* No pins to keep: see lion_emit_query(). */
 			base = lion_sets_reserve(acc, q.nkeys);
 			for (k = 0; k < q.nkeys; k++)
 			{
 				(void) lion_posting_set_lookup_col(index, attno, q.keys[k],
 												  InvalidOid,
 												  &acc->sets[base + k]);
+				lion_posting_set_unpin(&acc->sets[base + k]);
 				CHECK_FOR_INTERRUPTS();
 			}
 			lion_scan_shift(q.tree, base);
@@ -952,6 +962,7 @@ lion_scan_col_tree(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 			return NULL;
 		}
 
+		/* The lookup keeps its pins within a budget (DESIGN.md §15). */
 		base = lion_sets_reserve(acc, nelems);
 		nsets = lion_posting_set_lookup_many_col(index, attno, elemtype,
 												nelems, elems, nulls,
