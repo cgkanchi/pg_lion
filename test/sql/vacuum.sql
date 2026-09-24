@@ -487,5 +487,34 @@ SELECT lion_cmp('lion_vacpre', 'k = 5');
 SELECT lion_cmp('lion_vacpre', 's = 17');
 SELECT lion_cmp('lion_vacpre', 'r = 55');
 
+/*
+ * A filtered INLINE payload that grows past what a long key leaves of
+ * LION_MAX_ENTRY_SIZE.  VACUUM kept a payload INLINE as long as it was within
+ * inline_limit, and a ~2000-byte key leaves less than that: here 4060 rows on
+ * 18 heap pages are one RUN container of 18 runs, and losing every other row
+ * turns it into a 2030-member ARRAY, a 4068-byte payload next to a
+ * 2032-byte header and key.  That VACUUM failed ("lion index entry of 6100
+ * bytes is too large"), and failed again every time: a role that can only
+ * INSERT and DELETE could so stop the table's VACUUMs, and with them
+ * relfrozenxid, for good.  The set spills onto a container page instead,
+ * exactly as an INSERT would spill it.
+ */
+CREATE TABLE lion_vacbig (i int4 NOT NULL);
+INSERT INTO lion_vacbig SELECT i FROM generate_series(1, 4060) i;
+CREATE INDEX lion_vacbig_k ON lion_vacbig
+	USING lion ((lpad('', 1990, 'y') || (i * 0)::text));
+SELECT inline_entries, run_containers, ntids FROM lion_index_stats('lion_vacbig_k');
+DELETE FROM lion_vacbig WHERE i % 2 = 0;
+VACUUM lion_vacbig;
+SELECT inline_entries, array_containers, ntids FROM lion_index_stats('lion_vacbig_k');
+SELECT lion_index_verify('lion_vacbig_k', true);
+SELECT lion_index_count('lion_vacbig_k', lpad('', 1990, 'y') || '0') AS n;
+-- ... and the spilled set takes the next rows and VACUUMs like any other
+INSERT INTO lion_vacbig SELECT i FROM generate_series(4061, 4100) i;
+DELETE FROM lion_vacbig WHERE i % 3 = 0;
+VACUUM lion_vacbig;
+SELECT inline_entries, ntids FROM lion_index_stats('lion_vacbig_k');
+SELECT lion_index_verify('lion_vacbig_k', true);
+
 DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv,
-	lion_slacki, lion_vacpre;
+	lion_slacki, lion_vacpre, lion_vacbig;

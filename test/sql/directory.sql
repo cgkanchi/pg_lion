@@ -934,6 +934,47 @@ DROP OPERATOR FAMILY lion_bpx_fam USING lion CASCADE;
 DROP OPERATOR =~~= (bpchar, text);
 DROP FUNCTION lion_bpx_eq_text(bpchar, text);
 
+-- ---------------------------------------------------------------------
+-- 19. A long key whose posting set is just under inline_limit.
+--
+-- An entry is its header, its key and its INLINE payload, and must fit in
+-- LION_MAX_ENTRY_SIZE.  With a ~2000-byte key, a payload inside inline_limit
+-- does not always fit next to it: the insert path spilled such a set onto a
+-- container page, but ambuild kept it INLINE and then failed to make the
+-- entry.  Any role that could INSERT could so make REINDEX, VACUUM FULL,
+-- CLUSTER and a restore of the index fail for good.  3900 rows of one
+-- 1990-byte key produced a 4060-byte payload and a 6092-byte entry.
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_bigset (id int NOT NULL, g int NOT NULL, k text NOT NULL);
+CREATE INDEX lion_bigset_k ON lion_bigset USING lion (k);
+CREATE INDEX lion_bigset_gk ON lion_bigset USING lion (g, k);
+INSERT INTO lion_bigset SELECT i, 0, repeat('y', 1990)
+	FROM generate_series(1, 3900) i;
+-- the inserts spilled it ...
+SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1990)) IS NOT NULL
+	AS spilled_by_insert;
+-- ... and every rebuild has to be able to write it again
+REINDEX INDEX lion_bigset_k;
+SELECT lion_index_verify('lion_bigset_k', true);
+SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1990)) IS NOT NULL
+	AS spilled_by_build;
+REINDEX INDEX lion_bigset_gk;
+SELECT lion_index_verify('lion_bigset_gk', true);
+VACUUM FULL lion_bigset;
+SELECT lion_index_verify('lion_bigset_k', true);
+SELECT lion_index_verify('lion_bigset_gk', true);
+SELECT lion_index_count('lion_bigset_k', repeat('y', 1990)) AS n;
+-- the sizes around the one above, each built from scratch
+DO $$
+BEGIN
+	FOR n IN 3850 .. 3950 BY 2 LOOP
+		EXECUTE format('CREATE INDEX lion_bigset_p ON lion_bigset USING lion (k) WHERE id <= %s', n);
+		PERFORM lion_index_verify('lion_bigset_p', true);
+		DROP INDEX lion_bigset_p;
+	END LOOP;
+END $$;
+DROP TABLE lion_bigset;
+
 DROP OPERATOR CLASS lion_rev_ops USING lion;
 DROP OPERATOR CLASS lion_rev_btree USING btree;
 DROP OPERATOR <# (int4, int4);

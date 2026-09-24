@@ -259,8 +259,9 @@ lion_reserved_flag(int kind)
 
 /*
  * One posting set under construction.  Items are produced in ascending ckey
- * order and kept in an inline buffer until they no longer fit in
- * inline_limit bytes; after that the entry spills to a chain of container
+ * order and kept in an inline buffer until they no longer fit in `inlinemax`
+ * bytes - inline_limit, or less for a key too long to leave inline_limit of
+ * LION_MAX_ENTRY_SIZE - after that the entry spills to a chain of container
  * pages that is written out page by page.
  *
  * Sparse segments (DESIGN.md §13) make the grouping two-stage.  The codes of
@@ -316,6 +317,7 @@ typedef struct LionBuilder
 
 	char	   *inlinebuf;		/* buffered items, packed without padding */
 	Size		inlineused;
+	Size		inlinemax;		/* lion_inline_max() for this key */
 
 	bool		spilled;		/* posting set lives on container pages */
 	BlockNumber head;			/* the set's ROOT block (DESIGN.md §22) */
@@ -781,6 +783,11 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 	b->hasgroup = false;
 	b->inlinebuf = (char *) palloc0(bs->inline_limit);
 	b->inlineused = 0;
+	/* the bound lion_insert.c spills at, so that a rebuild can write it too */
+	b->inlinemax = lion_inline_max((keykind == LION_KEY_REAL) ?
+								   MAXALIGN(LION_ENTRY_HDRSZ + b->rawlen) :
+								   MAXALIGN(LION_ENTRY_HDRSZ),
+								   (Size) bs->inline_limit);
 	b->spilled = false;
 	b->head = InvalidBlockNumber;
 	b->curblk = InvalidBlockNumber;
@@ -1038,7 +1045,7 @@ lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 
 	if (!b->spilled)
 	{
-		if (b->inlineused + csize <= (Size) bs->inline_limit)
+		if (b->inlineused + csize <= b->inlinemax)
 		{
 			/* INLINE payloads are packed without padding, as on disk. */
 			memcpy(b->inlinebuf + b->inlineused, c, csize);

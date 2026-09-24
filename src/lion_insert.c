@@ -558,8 +558,8 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		return;
 	}
 
-	if (newlen <= (Size) state->ix->meta.inline_limit &&
-		payoff + newlen <= (Size) LION_MAX_ENTRY_SIZE)
+	if (newlen <= lion_inline_max(payoff,
+								  (Size) state->ix->meta.inline_limit))
 	{
 		LionEntryTuple *newentry;
 		Size		newsize;

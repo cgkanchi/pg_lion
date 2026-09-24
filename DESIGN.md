@@ -408,6 +408,10 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
 2. For each entry: INLINE → filter the payload through the callback and repack. Note that removal can
    GROW a container (every-other-member deletion turns a RUN into a 4104-byte BITSET), so a filtered
    INLINE payload may exceed inline_limit or the page: then the entry spills to a chain during VACUUM.
+   The bound is lion_inline_max(), as for INSERT and ambuild: next to a ~2000-byte key a payload
+   inside inline_limit can still overflow LION_MAX_ENTRY_SIZE (an ARRAY that a 2030-member deletion
+   made out of a RUN, say), and VACUUM tested inline_limit alone and failed on it every run until
+   the 2026-09-23 review.
    CHAIN → walk the posting tree's leaves, left to right from the leftmost one; each leaf is locked
    with LockBufferForCleanup (this is the
    interlock that phase 2 relies on: a heap-skipping reader keeps the page pinned while it consults
@@ -2708,6 +2712,10 @@ leaf that holds ONE entry must still have room for the high key a split would gi
 that would exceed it spills onto container pages exactly as one that exceeds `inline_limit` does.
 *(Not in the first draft of this section, which did not notice that a 2000-byte key with a
 4096-byte inline payload plus a 2000-byte high key is 40 bytes over a page.)*
+*(Nor did the first build: ambuild spilled at `inline_limit` alone, so an INSERTer could leave a
+posting set that INSERT had spilled but REINDEX, VACUUM FULL or a restore kept INLINE and could not
+write - 3900 rows of one 1990-byte key made a 6092-byte entry. Build and INSERT now take the bound
+from one function, lion_inline_max(); the 2026-09-23 review found it.)*
 
 ### The order
 
