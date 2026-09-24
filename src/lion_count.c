@@ -5182,6 +5182,7 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	call->heap = try_table_open(heapoid, AccessShareLock);
 	if (call->heap == NULL)
 		lion_count_no_relation(heapoid);
+	lion_check_table_am(call->heap);	/* the visibility map is the heap's */
 
 	for (i = 0; i < nidx; i++)
 	{

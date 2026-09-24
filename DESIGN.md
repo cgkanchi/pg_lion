@@ -41,6 +41,47 @@ Every heap TID is mapped to a 64-bit code and split into a container key and a 1
 Offsets ≥ (1 << LION_OFFSET_BITS) are an ERROR at insert/build time ("table AM not supported").
 The meta page records offset_bits and container_bits; opening an index with a mismatch is an ERROR.
 
+**Table access methods: the heap only (implemented 2026-09-23).** The encoding has room for the
+heap's line pointers and nothing else, and the count of §9 reads the heap's visibility map under
+an interlock that is a statement about heap VACUUM. Another table AM may hand out TIDs of any
+shape (citus_columnar's are stripe row numbers, with offsets far past 511) and keeps no visibility
+map, or one that means something else. So a lion index may only sit on a table whose table AM
+ROUTINE is the heap's: `lion_table_am_supported()` (lion_am.c) tests
+`rel->rd_tableam == GetHeapamTableAmRoutine()`, the test the count's heap recheck already made to
+choose its per-block path. The routine and not the AM's name or Oid, because
+`CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler` is the heap under another
+name and works unchanged, while a handler that returns anything else - even a copy of the heap's
+callbacks - may have changed anything.
+
+- **ambuild is the gate**: `lionbuild()` refuses first thing, rows or no rows, with
+  FEATURE_NOT_SUPPORTED, `access method "lion" does not support table access method "<am>"`, a
+  detail naming the table and a hint to use the heap. Every way an index comes to sit on a table
+  builds it: CREATE INDEX, REINDEX, ALTER TABLE ... SET ACCESS METHOD (a rewrite that rebuilds the
+  indexes, so a heap table with a lion index cannot move to another AM and the ALTER rolls back),
+  a partition created, attached or indexed under a partitioned lion index (each leaf is built on
+  its own, so one leaf of another AM fails the CREATE INDEX on the parent, the CREATE TABLE ...
+  PARTITION OF ... USING, and the ATTACH), and on 17+ a partitioned table's SET ACCESS METHOD,
+  which only sets the default for partitions created later. aminsert needs no check: a table's AM
+  cannot change without that rewrite. Before this check an index build on a non-heap table failed
+  somewhere inside: at lion_check_key_offset() for columnar's TIDs, in heap_getnext() ("only heap
+  AM is supported") for a copied heap routine, or not at all for an AM with small offsets.
+- **The count paths refuse as well**, for an index that got past the gate (none can today; the
+  catalogs can be edited, and a later release may loosen the build rule): the planner declines a
+  leaf of another AM in `lion_collect_targets()`, so one such partition declines the whole
+  partitioned query (§10, §16); the executor's `lion_open_relation()` and the SQL counts'
+  `lion_count_open_indexes()` raise the ambuild error.
+- The other option the §23 citus_columnar item named, a per-AM TID encoding with the bitmap path
+  only, was not taken: no table AM other than the heap is known to hand out heap-shaped TIDs, and
+  a wider offset field is a format change that belongs with level (2) of that item, which needs
+  its own visibility source anyway.
+- Tests: `test/sql/tableam.sql` (the heap under another name: builds, pushdown and SQL counts on
+  clean and dirty pages, SET ACCESS METHOD in both directions with the index rebuilt and verified,
+  partitions of both AMs under one index) and `test/modules/lion_hooktest`'s `tableam` test under
+  `make hookcheck`, whose `lion_heapcopy` AM returns a copy of the heap routine: every refusal
+  above, and the three count paths declining or refusing after a table with lion indexes is moved
+  to it by editing `pg_class.relam`. Not tested: a real non-heap AM (citus_columnar and
+  TimescaleDB's compressed chunks are not in the test installs; §23).
+
 Why not GIN's 11 offset bits: bitset containers would be 86% empty. Why 15 container bits and not 16:
 a 16-bit bitset is 8192 bytes and cannot be a page item; 15 bits gives a 4096-byte bitset, so every
 container fits on any page, and VACUUM can always fall back to a bitset when a run split would
@@ -510,6 +551,7 @@ BUILD (`lion_build.c`)
     64..4096, default 4096), `max_entries` (int, 0 = unlimited, §17) and `buckets`, which is
     accepted and ignored with a NOTICE since format 4 (§21), via add_reloption_kind /
     add_int_reloption / build_reloptions.
+    ambuild: refuses a table whose table AM is not the heap, by routine (§2).
     amvalidate: a scalar opclass must have support proc 1 with signature (T) → int4 and operator
     strategy 1; a multi-key one (§17) procs 2 and 3 and strategies within {2,3,4,5}; proc 4 is
     optional for both and is the only support function allowed to be cross-type (§21).
@@ -644,6 +686,9 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
 - **Row-level security.** The SQL functions refuse a table on which RLS applies to the caller
   (policies would have to be evaluated per row); the CustomScan declines relations with security
   quals, so the ordinary plan applies the policies.
+- **Table access method.** Everything here reads the heap's visibility map; the SQL functions
+  refuse, and the CustomScan declines, a table whose table AM is not the heap, which ambuild has
+  already refused to index (§2).
 - **SERIALIZABLE.** index_beginscan() takes a relation-level predicate lock on any index whose AM
   has no ampredlocks; the count reads indexes without a scan, so it takes PredicateLockRelation on
   every index it opens, before any lookup, so that absent keys are covered. Without it two
@@ -785,6 +830,9 @@ Planner integration
     materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
     partitioned parents, which are counted one live leaf partition at a time; everything this
     section says about "the relation" then means "the partition being counted".
+  - The relation's table AM is the heap, by routine (§2). ambuild already refuses any other, so
+    this only declines an index that got past it; the executor checks again when it opens the
+    relation.
   - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
@@ -1812,7 +1860,8 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
 - Column numbers are translated for every child through `root->append_rel_array[childrelid]->
   translated_vars`, since partitions may number their columns differently or have dropped ones. A
   column missing in some partition is a bail-out.
-- Every leaf must be a plain table (relkind `r`; a materialized view is accepted by the same code
+- Every leaf must be a plain heap table (relkind `r`, and a heap by table-AM routine, §2 -
+  partitions may each have their own table AM; a materialized view is accepted by the same code
   path but cannot be a partition) with a usable lion index - the rules of
   `lion_find_roaring_index` plus, per clause, strategy 1 of THAT index's opfamily for the clause's
   operator and an opfamily member and hash function for the compared type, all checked per
@@ -3690,6 +3739,14 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
     columnar's own vacuum before any stripe is counted without a row visit. Level (1) should hold
     before release (an index on a columnar table must not corrupt or error obscurely); level (2)
     is optional and decides whether lion is useful on columnar rather than tolerated.
+    **Level (1) done (2026-09-23), as the refusal**: ambuild refuses every table AM whose routine
+    is not the heap's, with a clear FEATURE_NOT_SUPPORTED error, and the count pushdown and the
+    SQL counts decline or refuse such a table too; the rules, the reasons and the tests are in §2.
+    Verified against a copied-heap test AM (`test/modules/lion_hooktest`), not against
+    citus_columnar itself, which still has to be run once when the Citus matrix exists. The same
+    rule applies to a TimescaleDB chunk kept in another table AM (its hypercore AM): the index
+    fails to build on that chunk rather than skipping it, and whether that is the behaviour
+    wanted there is for the TimescaleDB item below to decide.
   - TimescaleDB: hypertables (indexes created per chunk through Timescale's DDL hooks; the pushdown's
     partitioned-parent path in §16 sees a hypertable as an inheritance parent with chunks as
     children — confirm the AppendRelInfo mapping and the `rte->inh` handling; Timescale also installs

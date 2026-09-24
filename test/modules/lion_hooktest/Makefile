@@ -3,11 +3,11 @@
 MODULES = lion_hooktest
 EXTENSION = lion_hooktest
 DATA = lion_hooktest--1.0.sql
-PGFILEDESC = "lion_hooktest - test-only hook companion for pg_lion"
+PGFILEDESC = "lion_hooktest - test-only hook and table-AM companion for pg_lion"
 
 # The tests are chosen per server configuration by test/hook-check.sh, which
 # passes REGRESS itself; this default is what runs with nothing preloaded.
-REGRESS ?= hooks_setup hooks_lion_outer
+REGRESS ?= tableam hooks_setup hooks_lion_outer
 REGRESS_OPTS = --inputdir=. --outputdir=.
 
 PG_CPPFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers

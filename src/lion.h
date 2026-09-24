@@ -751,6 +751,8 @@ lion_page_set_owner(Page page, uint32 hash, BlockNumber head)
 extern void lion_page_set_deleted(Page page, FullTransactionId safexid);
 extern FullTransactionId lion_page_get_safexid(Page page);
 extern void lion_check_key_offset(ItemPointer tid);	/* ERROR if offset > LION_MAX_OFFSET */
+extern bool lion_table_am_supported(Relation heap);	/* the heap AM only (lion_am.c) */
+extern void lion_check_table_am(Relation heap);	/* ERROR if not supported */
 
 /* Key handling */
 extern uint32 lion_hash_key(LionState *state, Datum key);

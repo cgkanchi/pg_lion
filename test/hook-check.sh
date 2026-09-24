@@ -2,9 +2,10 @@
 #
 # Hook coexistence (DESIGN.md §23, "hook coexistence"): pg_lion next to
 # another extension that uses the same planner hook and its own WAL resource
-# manager, in both load orders.  The other extension is
-# test/modules/lion_hooktest, which this script builds and installs into the
-# same installation.
+# manager, in both load orders; and the table-AM refusals of DESIGN.md §2,
+# which need a table AM other than the heap.  The other extension is
+# test/modules/lion_hooktest, which provides that table AM as well, and which
+# this script builds and installs into the same installation.
 #
 #   make hookcheck                    the checks below
 #   make hookcheck HOOKCHECK_FULL=1   ... and the whole regression suite in
@@ -15,8 +16,8 @@
 # postgresql.conf: an interrupted run leaves no trace, and the cluster is put
 # back in generic mode on exit.
 #
-#   1. nothing preloaded: LOAD-on-first-use in both orders - lion_hooktest
-#      LOADed before pg_lion's first use, and after;
+#   1. nothing preloaded: the table-AM test, then LOAD-on-first-use in both
+#      orders - lion_hooktest LOADed before pg_lion's first use, and after;
 #   2. shared_preload_libraries = 'pg_lion,lion_hooktest' (the other hook
 #      outermost) and 'lion_hooktest,pg_lion' (pg_lion's outermost), with
 #      pg_lion.rmgr_id moved to 129 so the two resource managers coexist;
@@ -95,6 +96,7 @@ eval "$("$ROOT/dev.sh" env)"
 
 # ---- 1. nothing preloaded -------------------------------------------------
 start_with "" || exit 1
+run "no preload, table AMs" tableam
 run "no preload, lion_hooktest LOADed first" hooks_setup hooks_lion_outer
 run "no preload, pg_lion loaded first" hooks_setup hooks_hooktest_outer
 

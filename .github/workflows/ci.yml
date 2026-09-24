@@ -85,10 +85,11 @@ jobs:
           make installcheck-rmgr
 
       # pg_lion beside another extension on the same planner hook and with
-      # its own resource manager, in both load orders (test/hook-check.sh).
+      # its own resource manager, in both load orders, and the non-heap
+      # table AM refusals (test/hook-check.sh).
       # The test module goes into the packaged installation with sudo, like
       # pg_lion itself.
-      - name: hookcheck (hook coexistence)
+      - name: hookcheck (hook coexistence, table AMs)
         run: |
           sudo make -C test/modules/lion_hooktest install PG_CONFIG="$PWD/$PG_CONFIG" WERROR=1
           eval "$(./dev.sh env)"
@@ -177,7 +178,7 @@ jobs:
           eval "$(./dev.sh env)"
           make installcheck-rmgr WAL_CONSISTENCY=1
 
-      - name: hookcheck (hook coexistence)
+      - name: hookcheck (hook coexistence, table AMs)
         run: |
           eval "$(./dev.sh env)"
           make hookcheck WERROR=1

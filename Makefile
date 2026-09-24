@@ -102,7 +102,8 @@ installcheck-rmgr:
 		PG_CONFIG="$(PG_CONFIG)" ./test/rmgr-check.sh
 
 # pg_lion beside another extension that chains the same planner hook and
-# registers its own WAL resource manager, in both load orders (DESIGN.md §23).
+# registers its own WAL resource manager, in both load orders (DESIGN.md §23),
+# and the table-AM refusals that need a table AM other than the heap (§2).
 # Builds and installs the test-only test/modules/lion_hooktest into the
 # installation PG_CONFIG names, and restarts the dev cluster as
 # installcheck-rmgr does.

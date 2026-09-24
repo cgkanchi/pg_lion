@@ -17,10 +17,16 @@
  *	  default, so that the collision is the default case;
  *	- a GUC prefix of its own, reserved the way pg_lion reserves "pg_lion".
  *
+ * It also provides lion_hooktest_heapcopy_handler(), a table access method
+ * whose routine is a copy of the heap's: a table AM that stores heap tuples
+ * but is not, by pointer, the heap, which is the only kind of "other" table
+ * AM a test can create without shipping a real one.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/tableam.h"
 #include "access/xlog_internal.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -34,11 +40,13 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(lion_hooktest_calls);
 PG_FUNCTION_INFO_V1(lion_hooktest_saw_lion);
 PG_FUNCTION_INFO_V1(lion_hooktest_reset);
+PG_FUNCTION_INFO_V1(lion_hooktest_heapcopy_handler);
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
 static int64 hook_calls = 0;
 static int64 hook_saw_lion = 0;
 static int	hooktest_rmgr_id = RM_EXPERIMENTAL_ID;
+static TableAmRoutine heapcopy_routine;
 
 static void
 hooktest_redo(XLogReaderState *record)
@@ -127,4 +135,11 @@ lion_hooktest_reset(PG_FUNCTION_ARGS)
 	hook_calls = 0;
 	hook_saw_lion = 0;
 	PG_RETURN_VOID();
+}
+
+Datum
+lion_hooktest_heapcopy_handler(PG_FUNCTION_ARGS)
+{
+	heapcopy_routine = *GetHeapamTableAmRoutine();
+	PG_RETURN_POINTER(&heapcopy_routine);
 }
