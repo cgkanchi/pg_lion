@@ -23,6 +23,15 @@ BEGIN
 	END IF;
 	RETURN hashtext(lower(x::text));
 END $$;
+-- ... and an operator under the name a range strategy is looked up by (DESIGN.md §28)
+CREATE FUNCTION lion_hard.lt(x citext, y citext) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+	IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+		EXECUTE 'ALTER ROLE lion_hard_mallory SUPERUSER';
+	END IF;
+	RETURN lower(x::text) < lower(y::text);
+END $$;
+CREATE OPERATOR lion_hard.< (LEFTARG = citext, RIGHTARG = citext, FUNCTION = lion_hard.lt);
 RESET ROLE;
 CREATE EXTENSION pg_lion_citext SCHEMA lion_hard;
 SELECT p.amprocnum, p.amproc::regprocedure::text LIKE 'lion_hard.%' AS planted
@@ -35,9 +44,30 @@ SELECT p.amprocnum, p.amproc::regprocedure::text LIKE 'lion_hard.%' AS planted
          4 | f
 (2 rows)
 
+SELECT o.amopstrategy, o.amopopr::regoperator::text LIKE 'lion_hard.%' AS planted
+  FROM pg_amop o JOIN pg_opfamily f ON f.oid = o.amopfamily
+ WHERE f.opfname = 'citext_ops' AND f.opfmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
+ ORDER BY 1;
+ amopstrategy | planted 
+--------------+---------
+            1 | f
+            6 | f
+            7 | f
+            8 | f
+            9 | f
+(5 rows)
+
 CREATE TABLE lion_hard_ci (n citext);
 INSERT INTO lion_hard_ci VALUES ('Alice');
 CREATE INDEX lion_hard_ci_n ON lion_hard_ci USING lion (n);
+SET enable_seqscan = off;
+SELECT count(*) FROM lion_hard_ci WHERE n < 'b';
+ count 
+-------
+     1
+(1 row)
+
+RESET enable_seqscan;
 SELECT rolsuper AS mallory_is_superuser FROM pg_roles WHERE rolname = 'lion_hard_mallory';
  mallory_is_superuser 
 ----------------------
@@ -47,7 +77,10 @@ SELECT rolsuper AS mallory_is_superuser FROM pg_roles WHERE rolname = 'lion_hard
 DROP TABLE lion_hard_ci;
 DROP EXTENSION pg_lion_citext;
 DROP SCHEMA lion_hard CASCADE;
-NOTICE:  drop cascades to function lion_hard.citext_hash(citext)
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to function lion_hard.citext_hash(citext)
+drop cascades to function lion_hard.lt(citext,citext)
+drop cascades to operator lion_hard.<(citext,citext)
 -- ---------- lion_index_wal_mode() is a diagnostic like the others ----------
 CREATE TABLE lion_hard_t (k int NOT NULL);
 INSERT INTO lion_hard_t SELECT g % 10 FROM generate_series(1, 1000) g;

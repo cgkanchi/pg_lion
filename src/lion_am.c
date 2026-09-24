@@ -22,7 +22,10 @@
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/optimizer.h"
+#include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
 #include "utils/array.h"
@@ -53,11 +56,15 @@ PG_FUNCTION_INFO_V1(lion_handler);
 /*
  * Strategies and support procedure numbers live in lion.h, because build,
  * insert, scan and count all need them.  The multi-key strategies of
- * DESIGN.md §17 are 2 .. 5; a scalar opclass has only strategy 1.
+ * DESIGN.md §17 are 2 .. 5; a scalar opclass has strategy 1, and an ordered
+ * one the range strategies 6 .. 9 of §28 as well.
  */
 #define LION_MULTI_STRATEGY_MASK \
 	((1 << LION_STRAT_CONTAINS) | (1 << LION_STRAT_OVERLAP) | \
 	 (1 << LION_STRAT_CONTAINED) | (1 << LION_STRAT_MATCH))
+#define LION_RANGE_STRATEGY_MASK \
+	((1 << LION_STRAT_LT) | (1 << LION_STRAT_LE) | \
+	 (1 << LION_STRAT_GE) | (1 << LION_STRAT_GT))
 
 /* Kind of relation options for lion indexes */
 static relopt_kind lion_relopt_kind;
@@ -422,13 +429,28 @@ lion_array_query_is_full_scan(IndexOptInfo *index, int col,
 }
 
 /*
+ * Is this index qual one of the range comparisons of DESIGN.md §28 - `<`,
+ * `<=`, `>=` or `>`, strategies 6 .. 9 of a SCALAR column's opfamily?
+ */
+static bool
+lion_cost_is_range(IndexOptInfo *index, int col, OpExpr *op)
+{
+	return !lion_index_is_multikey(index, col) &&
+		LION_STRAT_IS_RANGE(get_op_opfamily_strategy(op->opno,
+													 index->opfamily[col]));
+}
+
+/*
  * Will liongetbitmap() have to walk the WHOLE index for this path - read every
  * bucket, every entry and every posting of every entry?
  *
  * liongetbitmap() answers ONE qual per scan and marks the rest for recheck,
  * choosing the most selective-looking one: a plain operator first, then a
- * ScalarArrayOp, then a null test.  The cost of the scan is the cost of the
- * qual it answers, so the choice is mirrored here.
+ * ScalarArrayOp, then a range (DESIGN.md §28), then a null test.  The cost of
+ * the scan is the cost of the qual it answers, so the choice is mirrored
+ * here.  A range walks only the entries between its bounds, so it never
+ * makes the scan a full one; what it costs per entry is
+ * lion_range_entry_cost()'s.
  *
  * A full walk is what the AM does for:
  *
@@ -477,7 +499,7 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 	for (c = 0; c < ncols; c++)
 	{
 		chosen[c] = NULL;
-		bestrank[c] = 3;
+		bestrank[c] = 4;
 	}
 
 	foreach(lc, path->indexclauses)
@@ -496,11 +518,11 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 			int			rank;
 
 			if (IsA(clause, NullTest))
-				rank = 2;
+				rank = 3;
 			else if (IsA(clause, ScalarArrayOpExpr))
 				rank = 1;
 			else if (IsA(clause, OpExpr))
-				rank = 0;
+				rank = lion_cost_is_range(index, col, (OpExpr *) clause) ? 2 : 0;
 			else
 				continue;
 
@@ -611,10 +633,102 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 }
 
 /*
- * Cost estimate: the generic estimate, with two corrections.  A lion index
- * has no correlation with the heap order (contrib/bloom does the same), and a
+ * What the ENTRIES of the range walks of this path cost (DESIGN.md §28), on
+ * top of the pages and the postings genericcostestimate() prorates by the
+ * selectivity.
+ *
+ * A range is one walk per key column, over the entries between its bounds:
+ * about n_distinct(col) x the range's selectivity of them, each decoded and
+ * compared with every bound.  On a low- or mid-cardinality column that is a
+ * few hundred entries, which is nothing; on a near-unique one every row is
+ * an entry, and this is the term - with the index's own size, an entry header
+ * per row against btree's tuple - that leaves such a column to btree.  Only
+ * a column whose chosen qual IS its range pays it (the ranking of
+ * lion_scan_walks_whole_index(), which has already been applied to `chosen`).
+ */
+static Cost
+lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	Cost		cost = 0;
+	int			c;
+
+	for (c = 0; c < index->nkeycolumns; c++)
+	{
+		List	   *ranges = NIL;
+		ListCell   *lc;
+
+		foreach(lc, path->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			ListCell   *lc2;
+
+			if (iclause->indexcol != c)
+				continue;
+			foreach(lc2, iclause->indexquals)
+			{
+				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+				Node	   *clause = (Node *) rinfo->clause;
+
+				if (!IsA(clause, OpExpr) ||
+					!lion_cost_is_range(index, c, (OpExpr *) clause))
+				{
+					/* an equality or a list outranks the range: no walk */
+					if (!IsA(clause, NullTest))
+					{
+						list_free(ranges);
+						ranges = NIL;
+						break;
+					}
+					continue;
+				}
+				ranges = lappend(ranges, rinfo);
+			}
+			if (lc2 != NULL)
+				break;
+		}
+
+		if (ranges != NIL)
+		{
+			Selectivity sel = clauselist_selectivity(root, ranges,
+													 index->rel->relid,
+													 JOIN_INNER, NULL);
+			double		ndistinct = DEFAULT_NUM_DISTINCT;
+			double		entries;
+
+			if (index->indexkeys[c] > 0)
+			{
+				RangeTblEntry *rte = planner_rt_fetch(index->rel->relid, root);
+				VariableStatData vardata;
+				bool		isdefault;
+				Var		   *var = makeVar(index->rel->relid,
+										  index->indexkeys[c],
+										  get_atttype(rte->relid,
+													  index->indexkeys[c]),
+										  -1, index->indexcollations[c], 0);
+
+				examine_variable(root, (Node *) var, index->rel->relid,
+								 &vardata);
+				ndistinct = get_variable_numdistinct(&vardata, &isdefault);
+				ReleaseVariableStats(vardata);
+			}
+
+			entries = Max(1.0, ndistinct * sel);
+			cost += entries * (cpu_index_tuple_cost +
+							   list_length(ranges) * cpu_operator_cost);
+			list_free(ranges);
+		}
+	}
+
+	return cost;
+}
+
+/*
+ * Cost estimate: the generic estimate, with three corrections.  A lion index
+ * has no correlation with the heap order (contrib/bloom does the same), a
  * scan that has to walk the whole index is priced as one rather than as the
- * selective lookup its predicate's output selectivity suggests.
+ * selective lookup its predicate's output selectivity suggests, and a range
+ * pays for the entries it walks (lion_range_entry_cost()).
  */
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -662,6 +776,8 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		if (emits_all_rows)
 			costs.indexSelectivity = 1.0;
 	}
+
+	costs.indexTotalCost += lion_range_entry_cost(root, path);
 
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
@@ -716,7 +832,8 @@ lion_hash_substitution_ok(Oid funcid, Oid argtype)
  *				the opclass input type, so that e.g. a varchar column can use
  *				text_ops, and every type an operator mentions must have a hash
  *				function in the family, which is what makes cross-type
- *				equality usable.
+ *				equality usable.  The range comparisons 6 .. 9 of DESIGN.md
+ *				§28 are allowed for a type pair that has support function 4.
  *
  *	multi-key	support procs 2 and 3 are GIN's extractValue and extractQuery
  *				and the strategies are 2 .. 5.  The keys are of the STORAGE
@@ -904,16 +1021,19 @@ lionvalidate(Oid opclassoid)
 		haveop = true;
 
 		/*
-		 * A scalar family answers equality and nothing else; a multi-key one
-		 * answers the containment/match strategies and never equality (the
-		 * keys of one row are not the row's value, so `=` could not be
-		 * answered from them).
+		 * A scalar family answers equality and, where it can order its keys,
+		 * the range comparisons of DESIGN.md §28 - whether it CAN is a
+		 * question about the type pair's support function 4, asked with the
+		 * groups below; a multi-key one answers the containment/match
+		 * strategies and never equality or a range (the keys of one row are
+		 * not the row's value, so neither could be answered from them).
 		 */
 		stratok = multikey ?
 			(oprform->amopstrategy >= 1 &&
 			 oprform->amopstrategy <= LION_NSTRATEGIES &&
 			 (LION_MULTI_STRATEGY_MASK & (1 << oprform->amopstrategy)) != 0) :
-			(oprform->amopstrategy == LION_STRAT_EQUAL);
+			(oprform->amopstrategy == LION_STRAT_EQUAL ||
+			 LION_STRAT_IS_RANGE(oprform->amopstrategy));
 
 		if (!stratok)
 		{
@@ -988,7 +1108,8 @@ lionvalidate(Oid opclassoid)
 		 * (tsvector,tsvector)), so the per-operator and per-class checks
 		 * above and below are all there is.
 		 */
-		if (!multikey && thisgroup->operatorset != (1 << LION_STRAT_EQUAL))
+		if (!multikey &&
+			(thisgroup->operatorset & (1 << LION_STRAT_EQUAL)) == 0)
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -996,6 +1117,27 @@ lionvalidate(Oid opclassoid)
 							opfamilyname, "lion",
 							format_type_be(thisgroup->lefttype),
 							format_type_be(thisgroup->righttype))));
+			result = false;
+		}
+
+		/*
+		 * A range comparison (DESIGN.md §28) is answered by walking the run of
+		 * entries the ORDERING puts between its bounds, so it needs support
+		 * function 4 for the very same type pair: without it the only answer
+		 * would be to test every entry, which is not an operator an index
+		 * should claim.
+		 */
+		if (!multikey &&
+			(thisgroup->operatorset & LION_RANGE_STRATEGY_MASK) != 0 &&
+			(thisgroup->functionset & (((uint64) 1) << LION_CMP_PROC)) == 0)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s has range operator(s) for types %s and %s but no support function %d",
+							opfamilyname, "lion",
+							format_type_be(thisgroup->lefttype),
+							format_type_be(thisgroup->righttype),
+							LION_CMP_PROC)));
 			result = false;
 		}
 	}

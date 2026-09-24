@@ -7,6 +7,10 @@
 -- case, so 'Alice' and 'alice' tie in the directory and the descent's run scan
 -- finds the ONE entry they share.
 --
+-- Strategies 6 .. 9 are the range comparisons of DESIGN.md §28 (<, <=, >=,
+-- >), citext's own, which order by citext_cmp() and so agree with support
+-- proc 4: `n < 'M'` walks the directory run between its bounds.
+--
 -- Every citext object is named through @extschema:citext@.  None of them is in
 -- pg_catalog, so unqualified they would be found in this extension's target
 -- schema first, where a role with CREATE could plant its own citext_hash() or
@@ -15,5 +19,9 @@
 CREATE OPERATOR CLASS citext_ops
     DEFAULT FOR TYPE @extschema:citext@.citext USING lion AS
         OPERATOR 1 @extschema:citext@.= (@extschema:citext@.citext, @extschema:citext@.citext),
+        OPERATOR 6 @extschema:citext@.< (@extschema:citext@.citext, @extschema:citext@.citext),
+        OPERATOR 7 @extschema:citext@.<= (@extschema:citext@.citext, @extschema:citext@.citext),
+        OPERATOR 8 @extschema:citext@.>= (@extschema:citext@.citext, @extschema:citext@.citext),
+        OPERATOR 9 @extschema:citext@.> (@extschema:citext@.citext, @extschema:citext@.citext),
         FUNCTION 1 @extschema:citext@.citext_hash(@extschema:citext@.citext),
         FUNCTION 4 @extschema:citext@.citext_cmp(@extschema:citext@.citext, @extschema:citext@.citext);

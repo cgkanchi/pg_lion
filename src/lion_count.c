@@ -4856,6 +4856,202 @@ lion_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
 
 
 /* ---------------------------------------------------------------------
+ * Range restrictions (DESIGN.md §28)
+ * --------------------------------------------------------------------- */
+
+void
+lion_range_init(LionRange *range, Relation index, AttrNumber attno)
+{
+	memset(range, 0, sizeof(LionRange));
+	range->state = lion_index_column_state(index, attno);
+	range->ordered = range->state->ordered;
+	range->lower = -1;
+	range->empty = false;
+}
+
+/*
+ * Add one bound, `key <strategy> value`, to the range.  opfuncid is the
+ * function of the operator the clause names, and valtype the type of value;
+ * isnull says the value is NULL, which no strict comparison is satisfied by,
+ * so the range is then empty.
+ *
+ * The comparison is the one §21's probe resolution finds for a value of this
+ * type (lion_probe_init()), so the walk reads the directory in exactly the
+ * order a lookup of the same value would: the column's own proc 4 for its own
+ * type and for a binary coercion to it, the family's cross-type proc 4
+ * otherwise - btint48cmp for an int8 bound on an int4 column, which compares
+ * the two widths exactly, so a bound outside the column's domain needs no
+ * special case.  Where that resolution finds none, the bound is tested with
+ * the operator itself and the walk can no longer be bounded at all.
+ */
+void
+lion_range_add(LionRange *range, Relation index, StrategyNumber strategy,
+			   Oid opfuncid, Oid valtype, Datum value, bool isnull,
+			   Oid collation)
+{
+	LionRangeBound *b;
+	LionProbe	probe;
+
+	if (!LION_STRAT_IS_RANGE(strategy))
+		elog(ERROR, "lion index: strategy %d is not a range comparison",
+			 (int) strategy);
+
+	if (isnull)
+	{
+		range->empty = true;
+		return;
+	}
+
+	if (range->nbounds >= range->maxbounds)
+	{
+		range->maxbounds = Max(4, range->maxbounds * 2);
+		range->bounds = (range->bounds == NULL) ?
+			(LionRangeBound *) palloc0(sizeof(LionRangeBound) * range->maxbounds) :
+			(LionRangeBound *) repalloc(range->bounds,
+										sizeof(LionRangeBound) * range->maxbounds);
+	}
+	b = &range->bounds[range->nbounds];
+	memset(b, 0, sizeof(LionRangeBound));
+	b->strategy = strategy;
+	b->value = value;
+	b->collation = collation;
+
+	/*
+	 * A class declared on a polymorphic type (enum_ops, FOR TYPE anyenum)
+	 * compares its keys with values of the column's own type, whatever that
+	 * type is called: they are the class's own, not a cross-type search.
+	 */
+	if (IsPolymorphicType(index->rd_opcintype[range->state->attno - 1]))
+		valtype = InvalidOid;
+
+	lion_probe_init(index, range->state, valtype, &probe);
+	if (probe.hascmp && !probe.needscan)
+	{
+		fmgr_info_copy(&b->cmpproc, &probe.cmpproc, CurrentMemoryContext);
+		b->hascmp = true;
+	}
+	else
+	{
+		fmgr_info(opfuncid, &b->opproc);
+		b->hascmp = false;
+		range->ordered = false;
+	}
+
+	if (LION_STRAT_IS_LOWER(strategy) && range->lower < 0)
+		range->lower = range->nbounds;
+	range->nbounds++;
+}
+
+/*
+ * Does one entry of the range's column satisfy every bound?
+ *
+ * The reserved entries never do: a NULL key satisfies no comparison and the
+ * EMPTY entry has no key at all.  In an ORDERED range the first entry that
+ * fails an UPPER bound ends the walk - every later entry sorts at or above it
+ * (the order leads with proc 4 within a column and a kind, §21) and so fails
+ * that bound too - while one that fails only a LOWER bound is skipped, and the
+ * entries that do are a prefix of what the walk visits: those of the landing
+ * leaf below the bound it descended to, and those below any other lower bound.
+ * Without an order nothing ends the walk early.
+ *
+ * The caller has checked the entry's column and holds the page it is on.
+ */
+int
+lion_range_test(LionRange *range, const LionEntryTuple *entry)
+{
+	LionState  *state = range->state;
+	Datum		key;
+	bool		skip = false;
+	int			i;
+
+	if (range->empty)
+		return LION_RANGE_END;
+	if (lion_entry_kind(entry) != LION_KIND_VALUE)
+		return LION_RANGE_SKIP;
+
+	key = lion_fetch_key(state, LionEntryGetKey(entry));
+
+	for (i = 0; i < range->nbounds; i++)
+	{
+		LionRangeBound *b = &range->bounds[i];
+		bool		ok;
+
+		if (b->hascmp)
+		{
+			int32		c = DatumGetInt32(FunctionCall2Coll(&b->cmpproc,
+															state->collation,
+															key, b->value));
+
+			switch (b->strategy)
+			{
+				case LION_STRAT_LT:
+					ok = (c < 0);
+					break;
+				case LION_STRAT_LE:
+					ok = (c <= 0);
+					break;
+				case LION_STRAT_GE:
+					ok = (c >= 0);
+					break;
+				default:
+					ok = (c > 0);
+					break;
+			}
+		}
+		else
+			ok = DatumGetBool(FunctionCall2Coll(&b->opproc,
+												b->collation, key, b->value));
+
+		if (ok)
+			continue;
+		if (range->ordered && !LION_STRAT_IS_LOWER(b->strategy))
+			return LION_RANGE_END;
+		skip = true;
+	}
+
+	return skip ? LION_RANGE_SKIP : LION_RANGE_MATCH;
+}
+
+/*
+ * The directory leaf a walk of the range starts on: where the first entry at
+ * or above its lower bound lives, or - without a lower bound, or without an
+ * order to descend by - where the column's entries begin.
+ *
+ * The descent is an ordinary lookup's (lion_dir_search()) with a search key
+ * of kind VALUE whose key is the bound, whose hash is 0 and which has no
+ * stored form, so it compares as the SMALLEST member of its own run (§21):
+ * the leaf it lands on is the first one that can hold an entry whose proc 4
+ * is not below the bound.  The walk re-reads that leaf with nothing held in
+ * between, which is safe for the reason every resumed entry scan is: a split
+ * moves entries only rightwards, onto a page the walk has yet to reach, and a
+ * directory leaf is never unlinked (§21).
+ */
+BlockNumber
+lion_range_first_leaf(Relation index, LionRange *range)
+{
+	LionRangeBound *b;
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
+	BlockNumber blk;
+
+	if (!range->ordered || range->lower < 0)
+		return lion_dir_column_first(index, range->state, NULL);
+
+	b = &range->bounds[range->lower];
+	lion_search_key_init(range->state, &sk, LION_KIND_VALUE, b->value, 0);
+	sk.cmpproc = &b->cmpproc;
+
+	buf = lion_dir_search(index, NULL, range->state->ix, &sk,
+						  BUFFER_LOCK_SHARE, false, &off);
+	blk = BufferGetBlockNumber(buf);
+	UnlockReleaseBuffer(buf);
+
+	return blk;
+}
+
+
+/* ---------------------------------------------------------------------
  * Iterating every entry of an index
  * --------------------------------------------------------------------- */
 
@@ -4884,7 +5080,32 @@ lion_entry_scan_begin_col(LionEntryScan *es, Relation index, AttrNumber attno)
 	es->haslast = true;
 	es->blkno = lion_dir_column_first(index, es->state, NULL);
 	es->onpage = 0;
+	es->range = NULL;
 	es->done = false;
+}
+
+/*
+ * The walk of one column bounded by a range (DESIGN.md §28).  Only where it
+ * STARTS differs from lion_entry_scan_begin_col(): the leaf the range's lower
+ * bound lives on instead of the column's first.  The resume position is still
+ * the column's (attno, MINF), so the entries of an earlier column that share
+ * that leaf are passed by the ordinary resume comparison, and the entries of
+ * this column below the bound by lion_range_test().
+ */
+void
+lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
+							AttrNumber attno, LionRange *range)
+{
+	lion_entry_scan_begin_col(es, index, attno);
+	if (range == NULL)
+		return;
+
+	Assert(range->state == es->state);
+	es->range = range;
+	if (range->empty)
+		es->done = true;
+	else
+		es->blkno = lion_range_first_leaf(index, range);
 }
 
 /* Remember where to resume, as a KEY (see the comment on LionEntryScan). */
@@ -5023,6 +5244,27 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 				UnlockReleaseBuffer(buf);
 				es->done = true;
 				return false;
+			}
+
+			/*
+			 * A bounded walk (DESIGN.md §28) returns only the entries its range
+			 * selects, and ends at the first one past an upper bound.
+			 */
+			if (es->range != NULL)
+			{
+				int			r = lion_range_test(es->range, entry);
+
+				if (r == LION_RANGE_END)
+				{
+					UnlockReleaseBuffer(buf);
+					es->done = true;
+					return false;
+				}
+				if (r == LION_RANGE_SKIP)
+				{
+					lion_entry_scan_remember(es, entry);
+					continue;
+				}
 			}
 
 			/*

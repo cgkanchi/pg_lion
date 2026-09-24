@@ -4,7 +4,9 @@
  *		Bitmap scan support for the lion index (DESIGN.md section 5, SCAN).
  *
  * A lion index answers one qual per key column: an equality to a value,
- * `= ANY (array)` (DESIGN.md §15, amsearcharray), `IS NULL` or `IS NOT NULL`
+ * `= ANY (array)` (DESIGN.md §15, amsearcharray), a range - every `<`,
+ * `<=`, `>=` and `>` on the column at once, as one bounded walk of the
+ * sorted directory (DESIGN.md §28) - or `IS NULL` or `IS NOT NULL`
  * (DESIGN.md §14, amsearchnulls).  The scan finds the entries the qual
  * selects and emits their posting sets into the caller's TIDBitmap.
  *
@@ -489,13 +491,26 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
  */
 static int64
 lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
-					  bool recheck, bool withnull)
+					  bool recheck, bool withnull, LionRange *range)
 {
 	PGAlignedBlock *copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	Page		cpage = (Page) copy->data;
-	BlockNumber blkno = lion_dir_column_first(index, col, NULL);
+	BlockNumber blkno;
 	int64		ntids = 0;
 	bool		done = false;
+
+	/*
+	 * A range starts at the leaf its lower bound lives on (DESIGN.md §28);
+	 * the entries of an earlier column and those below the bound that share
+	 * the leaf are passed over below, like everything else the walk skips.
+	 */
+	if (range != NULL && range->empty)
+	{
+		pfree(copy);
+		return 0;
+	}
+	blkno = (range != NULL) ? lion_range_first_leaf(index, range) :
+		lion_dir_column_first(index, col, NULL);
 
 	while (!done && BlockNumberIsValid(blkno))
 	{
@@ -540,6 +555,20 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 			if (LionEntryIsNullKey(entry) && !withnull)
 				continue;
 
+			/* Only the entries the range selects, up to its end (§28). */
+			if (range != NULL)
+			{
+				int			r = lion_range_test(range, entry);
+
+				if (r == LION_RANGE_END)
+				{
+					done = true;
+					break;
+				}
+				if (r == LION_RANGE_SKIP)
+					continue;
+			}
+
 			if ((entry->flags & LION_ENTRY_INLINE) != 0)
 				ntids += lion_emit_inline(LionEntryGetPayload(entry),
 										 LION_ENTRY_PAYLOAD_LEN(entry,
@@ -561,7 +590,115 @@ static int64
 lion_emit_all_keys(Relation index, LionState *col, TIDBitmap *tbm,
 				  bool recheck)
 {
-	return lion_emit_all_keys_ext(index, col, tbm, recheck, false);
+	return lion_emit_all_keys_ext(index, col, tbm, recheck, false, NULL);
+}
+
+/*
+ * Is this scan key one of the range comparisons of DESIGN.md §28?  Only a
+ * SCALAR column has them: a multi-key class's strategies are §17's, and its
+ * validator refuses 6 .. 9 anyway.
+ */
+static bool
+lion_scankey_is_range(LionState *col, ScanKey skey)
+{
+	return !col->multikey &&
+		(skey->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
+						   SK_SEARCHARRAY)) == 0 &&
+		LION_STRAT_IS_RANGE(skey->sk_strategy);
+}
+
+/*
+ * Every `<`, `<=`, `>=` and `>` of the scan on one key column, as ONE bounded
+ * walk of that column's entries (DESIGN.md §28): `BETWEEN a AND b` descends
+ * to `a` once and stops past `b`, and needs no recheck of its own.
+ *
+ * The walk is lion_emit_all_keys()'s: each leaf is copied and let go before
+ * its entries are emitted, an INLINE posting set from the copy and a posting
+ * tree one page at a time, so nothing is pinned between two entries however
+ * wide the range is.  No pin budget is drawn on - a bitmap scan needs no
+ * visibility-map interlock, since the executor visits every TID it emits -
+ * and the memory is the TIDBitmap's own, which goes lossy under work_mem
+ * rather than growing.
+ */
+static int64
+lion_emit_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+			   TIDBitmap *tbm)
+{
+	Relation	index = scan->indexRelation;
+	LionRange	range;
+	int64		ntids;
+	int			i;
+
+	lion_range_init(&range, index, (AttrNumber) col->attno);
+	for (i = 0; i < scan->numberOfKeys; i++)
+	{
+		ScanKey		k = &scan->keyData[i];
+
+		if (k->sk_attno != col->attno || !lion_scankey_is_range(col, k))
+			continue;
+		lion_range_add(&range, index, k->sk_strategy, k->sk_func.fn_oid,
+					   k->sk_subtype, k->sk_argument,
+					   (k->sk_flags & SK_ISNULL) != 0, k->sk_collation);
+	}
+
+	ntids = lion_emit_all_keys_ext(index, col, tbm, so->recheck, false,
+								   &range);
+	if (range.bounds != NULL)
+		pfree(range.bounds);
+	return ntids;
+}
+
+/*
+ * `col < ANY (array)` and its siblings: amsearcharray hands the planner's
+ * ScalarArrayOpExpr to us for every strategy of the family, so the range
+ * comparisons of DESIGN.md §28 arrive here as arrays too.  `ANY` is the
+ * union of the elements' answers, so each non-NULL element is one walk of
+ * its own - `k < ANY ('{3, 50}')` is the walk of `k < 50` and that of
+ * `k < 3` - into the same bitmap, which is a set.  (Only `ANY` is ever an
+ * index qual; `ALL` is not.)
+ */
+static int64
+lion_emit_array_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+					 ScanKey skey, TIDBitmap *tbm)
+{
+	Relation	index = scan->indexRelation;
+	ArrayType  *arr = DatumGetArrayTypeP(skey->sk_argument);
+	Oid			elemtype = ARR_ELEMTYPE(arr);
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int64		ntids = 0;
+	int			i;
+
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	for (i = 0; i < nelems; i++)
+	{
+		LionRange	range;
+
+		if (nulls[i])
+			continue;			/* a strict comparison with NULL is not true */
+
+		lion_range_init(&range, index, (AttrNumber) col->attno);
+		lion_range_add(&range, index, skey->sk_strategy, skey->sk_func.fn_oid,
+					   skey->sk_subtype, elems[i], false, skey->sk_collation);
+		ntids += lion_emit_all_keys_ext(index, col, tbm, so->recheck, false,
+									   &range);
+		pfree(range.bounds);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	pfree(elems);
+	pfree(nulls);
+	if ((Pointer) arr != DatumGetPointer(skey->sk_argument))
+		pfree(arr);
+
+	return ntids;
 }
 
 /* ---------------------------------------------------------------------
@@ -1076,6 +1213,68 @@ lion_emit_columns(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
 	return es.ntids;
 }
 
+/*
+ * Answer a scan whose keys span several key columns when at least one of them
+ * is answered by a RANGE (DESIGN.md §28): the other columns' set trees into
+ * one TIDBitmap, each range column's walk into one of its own, all of them
+ * intersected - which is what core's BitmapAnd does, inside one index scan -
+ * and the result ORed into the caller's bitmap, which a BitmapOr above may be
+ * sharing with its other arms.  Each private bitmap has work_mem of its own,
+ * as each input of a BitmapAnd does, and goes lossy rather than growing past
+ * it; tbm_intersect() and tbm_union() carry the recheck flags across.
+ */
+static int64
+lion_emit_intersect(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
+				   int nkeys, LionState **rangecol, int nrange,
+				   TIDBitmap *tbm)
+{
+	TIDBitmap  *acc = NULL;
+	int64		ntids = -1;
+	int			i;
+
+	if (nkeys > 0)
+	{
+		acc = tbm_create((Size) work_mem * 1024, NULL);
+		ntids = lion_emit_columns(scan, so, keys, nkeys, acc);
+		if (ntids < 0)
+		{
+			/* Nothing expressible there: the ranges alone, rechecked. */
+			tbm_free(acc);
+			acc = NULL;
+			so->recheck = true;
+		}
+	}
+
+	for (i = 0; i < nrange; i++)
+	{
+		TIDBitmap  *one;
+		int64		n;
+
+		/* One input selects nothing, so the intersection does not either. */
+		if (acc != NULL && tbm_is_empty(acc))
+			break;
+
+		one = tbm_create((Size) work_mem * 1024, NULL);
+		n = lion_emit_range(scan, so, rangecol[i], one);
+		ntids = (ntids < 0) ? n : Min(ntids, n);
+		if (acc == NULL)
+			acc = one;
+		else
+		{
+			tbm_intersect(acc, one);
+			tbm_free(one);
+		}
+	}
+
+	if (acc != NULL)
+	{
+		tbm_union(tbm, acc);
+		tbm_free(acc);
+	}
+
+	return Max(ntids, 0);
+}
+
 int64
 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
@@ -1083,6 +1282,8 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	LionScanOpaque so = (LionScanOpaque) scan->opaque;
 	ScanKey		best[INDEX_MAX_KEYS];
 	int			bestrank[INDEX_MAX_KEYS];
+	int			nkeys[INDEX_MAX_KEYS];
+	int			nrangekeys[INDEX_MAX_KEYS];
 	int			ncols;
 	int			nchosen = 0;
 	int			ndropped = 0;
@@ -1115,7 +1316,7 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	{
 		so->recheck = false;
 		return lion_emit_all_keys_ext(index, lion_column(so->ix, 1), tbm,
-									 false, true);
+									 false, true, NULL);
 	}
 
 	/*
@@ -1124,14 +1325,18 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 * equality next to a null test); the most selective-looking one is
 	 * answered and the rest are left to the heap recheck, which is correct
 	 * because the others only shrink the result.  The ranking is a plain
-	 * equality first, then a list, then a null test - and it is mirrored in
-	 * lion_scan_walks_whole_index() so that the path is priced as the path it
-	 * takes.
+	 * equality first, then a list, then a range, then a null test - and it
+	 * is mirrored in lion_scan_walks_whole_index() so that the path is priced
+	 * as the path it takes.  A range is every `<`, `<=`, `>=` and `>` of the
+	 * column at once (DESIGN.md §28): the walk answers all of them, so when
+	 * the range is the chosen qual none of them is dropped.
 	 */
 	for (i = 0; i < ncols; i++)
 	{
 		best[i] = NULL;
-		bestrank[i] = 3;
+		bestrank[i] = 4;
+		nkeys[i] = 0;
+		nrangekeys[i] = 0;
 	}
 
 	for (i = 0; i < scan->numberOfKeys; i++)
@@ -1144,16 +1349,20 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			continue;			/* not a key column of this index */
 
 		if ((k->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL)) != 0)
-			rank = 2;
+			rank = 3;
 		else if ((k->sk_flags & SK_SEARCHARRAY) != 0)
 			rank = 1;
+		else if (lion_scankey_is_range(lion_column(so->ix, k->sk_attno), k))
+		{
+			rank = 2;
+			nrangekeys[ci]++;
+		}
 		else
 			rank = 0;
 
 		if (best[ci] == NULL)
 			nchosen++;
-		else
-			ndropped++;
+		nkeys[ci]++;
 
 		if (rank < bestrank[ci])
 		{
@@ -1165,25 +1374,43 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	if (nchosen == 0)
 		return 0;
 
+	for (i = 0; i < ncols; i++)
+	{
+		if (best[i] != NULL)
+			ndropped += nkeys[i] - (bestrank[i] == 2 ? nrangekeys[i] : 1);
+	}
 	so->recheck = (ndropped > 0);
 
 	/*
 	 * Several columns: intersect their set trees.  A column whose qual the
 	 * sets cannot express is dropped there and rechecked; when NONE of them
 	 * can be expressed the answer falls through to the single-column path
-	 * below, which knows how to walk a whole column.
+	 * below, which knows how to walk a whole column.  A RANGE column is not a
+	 * set tree at all - its answer is a union of however many entries the
+	 * range holds (DESIGN.md §28) - so it is answered into a bitmap of its
+	 * own and intersected with the others' (lion_emit_intersect()).
 	 */
 	if (nchosen > 1)
 	{
 		ScanKey		chosen[INDEX_MAX_KEYS];
+		LionState  *rangecol[INDEX_MAX_KEYS];
 		int			n = 0;
+		int			nrange = 0;
 		int64		ntids;
 
 		for (i = 0; i < ncols; i++)
 		{
-			if (best[i] != NULL)
+			if (best[i] == NULL)
+				continue;
+			if (bestrank[i] == 2)
+				rangecol[nrange++] = lion_column(so->ix, (AttrNumber) (i + 1));
+			else
 				chosen[n++] = best[i];
 		}
+
+		if (nrange > 0)
+			return lion_emit_intersect(scan, so, chosen, n, rangecol, nrange,
+									   tbm);
 
 		ntids = lion_emit_columns(scan, so, chosen, n, tbm);
 		if (ntids >= 0)
@@ -1216,8 +1443,23 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	if (col->multikey)
 		return lion_emit_multikey(scan, so, col, skey, tbm);
 
+	/* Every range key of the column, as one walk (DESIGN.md §28). */
+	if (lion_scankey_is_range(col, skey))
+		return lion_emit_range(scan, so, col, tbm);
+
+	/* ... and `col < ANY (array)`, one walk per element. */
+	if ((skey->sk_flags & SK_SEARCHARRAY) != 0 &&
+		LION_STRAT_IS_RANGE(skey->sk_strategy))
+		return lion_emit_array_range(scan, so, col, skey, tbm);
+
+	/*
+	 * A strategy this file does not know is an ERROR and not an empty result:
+	 * the opclass would be claiming an operator the scan cannot answer, and
+	 * "no rows" would be a wrong answer rather than a missing optimisation.
+	 */
 	if (skey->sk_strategy != LION_STRAT_EQUAL)
-		return 0;
+		elog(ERROR, "lion index \"%s\": unsupported strategy %d",
+			 RelationGetRelationName(index), (int) skey->sk_strategy);
 
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
 		return lion_emit_array(scan, so, col, skey, tbm);

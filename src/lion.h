@@ -598,15 +598,27 @@ lion_column(LionIndexState *ix, AttrNumber attno)
 /* ---------- multi-key extraction (DESIGN.md §17, lion_multikey.c) ---------- */
 
 /*
- * Strategy numbers of the roaring AM.  1 is the only one a scalar opclass
- * has; 2 .. 5 belong to the multi-key classes.
+ * Strategy numbers of the roaring AM.  1 is equality, which every scalar
+ * opclass has; 2 .. 5 belong to the multi-key classes; 6 .. 9 are the range
+ * comparisons of DESIGN.md §28, in btree's order, which an ORDERED scalar
+ * class has beside its proc 4.
  */
 #define LION_STRAT_EQUAL			1
 #define LION_STRAT_CONTAINS		2	/* anyarray @> anyarray */
 #define LION_STRAT_OVERLAP		3	/* anyarray && anyarray */
 #define LION_STRAT_CONTAINED		4	/* anyarray <@ anyarray */
 #define LION_STRAT_MATCH			5	/* tsvector @@ tsquery */
-#define LION_NSTRATEGIES			5
+#define LION_STRAT_LT			6	/* key < value (§28) */
+#define LION_STRAT_LE			7	/* key <= value */
+#define LION_STRAT_GE			8	/* key >= value */
+#define LION_STRAT_GT			9	/* key > value */
+#define LION_NSTRATEGIES			9
+
+#define LION_STRAT_IS_RANGE(s) \
+	((s) >= LION_STRAT_LT && (s) <= LION_STRAT_GT)
+/* a LOWER bound (>=, >) as opposed to an upper one (<, <=) */
+#define LION_STRAT_IS_LOWER(s) \
+	((s) == LION_STRAT_GE || (s) == LION_STRAT_GT)
 
 /* Support procedure numbers. */
 #define LION_HASH_PROC			1

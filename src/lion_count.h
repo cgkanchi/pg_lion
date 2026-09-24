@@ -471,6 +471,69 @@ extern bool lion_sets_satisfiable(int nsets, LionPostingSet *sets,
 								 LionKeyNode *tree);
 
 /* ---------------------------------------------------------------------
+ * Range restrictions on one key column (DESIGN.md §28)
+ * --------------------------------------------------------------------- */
+
+/*
+ * One bound of a range: `key <strategy> value`, strategy one of
+ * LION_STRAT_LT .. LION_STRAT_GT.
+ *
+ * It is compared the way §21's probe resolution says a value of its type is
+ * compared with the stored keys (lion_probe_init()): the column's own proc 4,
+ * or the family's cross-type one (hascmp).  A bound that resolution finds no
+ * comparison for - an unordered column, or a family that names a cross-type
+ * range operator and no cross-type proc 4, which lionvalidate() refuses but a
+ * catalogue may still hold - is tested with the operator itself (opproc).
+ */
+typedef struct LionRangeBound
+{
+	StrategyNumber strategy;
+	Datum		value;
+	bool		hascmp;
+	FmgrInfo	cmpproc;		/* hascmp: stored key <=> value */
+	FmgrInfo	opproc;			/* otherwise: stored key <op> value */
+	Oid			collation;		/* ... called under the clause's collation */
+} LionRangeBound;
+
+/*
+ * Every range clause of one key column, ANDed: what one bounded walk of that
+ * column's entries returns (DESIGN.md §28).
+ *
+ *	ordered	every bound has a comparison and the column's directory is in
+ *			its order, so the walk may DESCEND to its first lower bound and
+ *			STOP at the first entry past an upper one.  Otherwise it tests
+ *			every entry of the column, which is correct and linear.
+ *	lower	the lower bound the walk descends to, or -1 for none: the walk
+ *			then starts where the column does.
+ *	empty	a bound is NULL, so nothing can satisfy the range.
+ *
+ * The bound values are the caller's and must outlive the range.
+ */
+typedef struct LionRange
+{
+	LionState  *state;			/* the key column */
+	int			nbounds;
+	int			maxbounds;
+	LionRangeBound *bounds;
+	bool		ordered;
+	int			lower;
+	bool		empty;
+} LionRange;
+
+/* What lion_range_test() says about one entry. */
+#define LION_RANGE_MATCH	0	/* the entry satisfies every bound */
+#define LION_RANGE_SKIP		1	/* it does not; a later entry may */
+#define LION_RANGE_END		2	/* it does not, and no later entry will */
+
+extern void lion_range_init(LionRange *range, Relation index,
+							AttrNumber attno);
+extern void lion_range_add(LionRange *range, Relation index,
+						   StrategyNumber strategy, Oid opfuncid, Oid valtype,
+						   Datum value, bool isnull, Oid collation);
+extern int	lion_range_test(LionRange *range, const LionEntryTuple *entry);
+extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
+
+/* ---------------------------------------------------------------------
  * Iterating every entry of an index (the GROUP BY path of section 10)
  * --------------------------------------------------------------------- */
 
@@ -498,6 +561,8 @@ typedef struct LionEntryScan
 	char	   *lastkey;		/* its stored bytes, in cxt */
 	Size		lastkeylen;
 	int			onpage;			/* entries returned from the current leaf */
+	LionRange  *range;			/* the entries returned are bounded by this
+								 * (DESIGN.md §28), or NULL */
 	MemoryContext cxt;
 	bool		done;
 } LionEntryScan;
@@ -510,6 +575,15 @@ lion_entry_scan_begin(LionEntryScan *es, Relation index)
 {
 	lion_entry_scan_begin_col(es, index, 1);
 }
+
+/*
+ * The same walk, returning only the entries a range selects (DESIGN.md §28):
+ * it starts at the leaf the range's lower bound lives on and ends at the first
+ * entry past an upper bound.  The reserved NULL and EMPTY entries never come
+ * out of it.  range may be NULL, which is lion_entry_scan_begin_col().
+ */
+extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
+									   AttrNumber attno, LionRange *range);
 
 /*
  * Fetch the next entry.  On true, *key is a private copy of the entry's key

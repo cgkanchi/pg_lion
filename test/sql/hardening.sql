@@ -23,15 +23,31 @@ BEGIN
 	END IF;
 	RETURN hashtext(lower(x::text));
 END $$;
+-- ... and an operator under the name a range strategy is looked up by (DESIGN.md §28)
+CREATE FUNCTION lion_hard.lt(x citext, y citext) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+	IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+		EXECUTE 'ALTER ROLE lion_hard_mallory SUPERUSER';
+	END IF;
+	RETURN lower(x::text) < lower(y::text);
+END $$;
+CREATE OPERATOR lion_hard.< (LEFTARG = citext, RIGHTARG = citext, FUNCTION = lion_hard.lt);
 RESET ROLE;
 CREATE EXTENSION pg_lion_citext SCHEMA lion_hard;
 SELECT p.amprocnum, p.amproc::regprocedure::text LIKE 'lion_hard.%' AS planted
   FROM pg_amproc p JOIN pg_opfamily f ON f.oid = p.amprocfamily
  WHERE f.opfname = 'citext_ops' AND f.opfmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
  ORDER BY 1;
+SELECT o.amopstrategy, o.amopopr::regoperator::text LIKE 'lion_hard.%' AS planted
+  FROM pg_amop o JOIN pg_opfamily f ON f.oid = o.amopfamily
+ WHERE f.opfname = 'citext_ops' AND f.opfmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
+ ORDER BY 1;
 CREATE TABLE lion_hard_ci (n citext);
 INSERT INTO lion_hard_ci VALUES ('Alice');
 CREATE INDEX lion_hard_ci_n ON lion_hard_ci USING lion (n);
+SET enable_seqscan = off;
+SELECT count(*) FROM lion_hard_ci WHERE n < 'b';
+RESET enable_seqscan;
 SELECT rolsuper AS mallory_is_superuser FROM pg_roles WHERE rolname = 'lion_hard_mallory';
 DROP TABLE lion_hard_ci;
 DROP EXTENSION pg_lion_citext;
