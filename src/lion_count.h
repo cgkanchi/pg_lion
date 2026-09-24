@@ -120,6 +120,10 @@ extern void lion_vis_cache_destroy(LionVisCache *cache);
  * and that bucket page stays PINNED for the whole life of the LionPostingSet:
  * DESIGN.md section 9 makes the pin the interlock against ambulkdelete, and
  * ambulkdelete rewrites INLINE payloads under a cleanup lock (section 11).
+ * Unless the lookup was over its pin budget (DESIGN.md §15): the set is then
+ * NOPIN, a private copy exactly like a materialized one below, and the count
+ * either locates it again under a pin of its own when it gets to it or lets
+ * another source carry the interlock (lion_count_sources_cached()).
  *
  * For a CHAIN entry only the head block is remembered here; pins on the
  * container pages are taken and released by the cursor that walks the chain,
@@ -148,6 +152,7 @@ typedef struct LionPostingSet
 	char	   *payload;		/* INLINE: private copy of the payload */
 	Size		paylen;
 	Buffer		pinbuf;			/* INLINE: pinned bucket page, else Invalid */
+	bool		nopin;			/* INLINE, but located without its pin */
 	uint64		ntids;			/* entry's recorded member count (a hint) */
 	uint32		ncontainers;	/* entry's recorded ITEM count (a hint):
 								 * containers and sparse segments */
@@ -299,6 +304,9 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * front and the return value is how many there are - every one of which the
  * caller must release.  *nfound (optional) is how many have an entry at all,
  * so *nfound == 0 means the union selects no rows.
+ *
+ * The pins the located INLINE sets keep are BOUNDED, however long the list:
+ * past a budget of distinct leaves the sets come out NOPIN (DESIGN.md §15).
  */
 extern int lion_posting_set_lookup_many_col(Relation index, AttrNumber attno,
 										   Oid keytype, int nvalues,
@@ -317,6 +325,13 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 
 /* Drop whatever pin/memory the posting set holds.  Idempotent. */
 extern void lion_posting_set_release(LionPostingSet *ps);
+
+/*
+ * Drop an INLINE set's pin but keep its payload: the set becomes NOPIN.  For
+ * callers that need no visibility-map interlock at all - a bitmap scan, whose
+ * every TID is checked in the heap by the executor.
+ */
+extern void lion_posting_set_unpin(LionPostingSet *ps);
 
 /*
  * Everything needed to probe one key column with values of one search type:

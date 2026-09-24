@@ -160,6 +160,8 @@ typedef struct LionCountCtx
 	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
 	bool		serializable;	/* IsolationIsSerializable() at start: take page predicate locks */
 	bool		in_recovery;	/* hot standby: the pin interlock does not hold, recheck everything */
+	bool		novm;			/* no source carries the interlock (NOPIN
+								 * sets, DESIGN.md §15): recheck everything */
 	bool		rel_read_only;	/* the statement does not modify heap: on-access
 								 * pruning may set the VM (DESIGN.md §11) */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
@@ -634,20 +636,29 @@ lion_probe_key_cmp(const void *a, const void *b, void *arg)
  * Fill *ps from the entry the caller has located at (buf, offnum), which is a
  * directory leaf held SHARE, and release the buffer - keeping its pin when the
  * entry is INLINE, because that pin is the DESIGN.md §9 interlock.
+ *
+ * Not when this backend already pins its share of shared_buffers, though,
+ * unless the caller says the pin is a must: the set is then NOPIN, which the
+ * count knows how to do without (DESIGN.md §15).  One lookup is one pin, but
+ * callers loop - one lookup per key of a tsquery, say - and nothing else
+ * would bound what such a loop holds.
  */
 static void
 lion_posting_set_take(Relation index, LionState *state, Buffer buf,
-					 OffsetNumber offnum, LionPostingSet *ps)
+					 OffsetNumber offnum, LionPostingSet *ps, bool mustpin)
 {
 	bool		keeppin;
 
 	lion_fill_posting_set(index, state, buf, offnum, ps, &keeppin);
 
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	if (keeppin)
+	if (keeppin && (mustpin || GetAdditionalPinLimit() > 0))
 		ps->pinbuf = buf;
 	else
+	{
+		ps->nopin = keeppin;
 		ReleaseBuffer(buf);
+	}
 }
 
 /*
@@ -658,7 +669,8 @@ lion_posting_set_take(Relation index, LionState *state, Buffer buf,
  */
 static bool
 lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
-					   Datum key, uint32 hash, LionPostingSet *ps)
+					   Datum key, uint32 hash, LionPostingSet *ps,
+					   bool mustpin)
 {
 	LionSearchKey sk;
 	Buffer		buf;
@@ -682,7 +694,7 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 		return false;
 	}
 
-	lion_posting_set_take(index, state, buf, off, ps);
+	lion_posting_set_take(index, state, buf, off, ps, mustpin);
 	return true;
 }
 
@@ -698,7 +710,7 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 	key = lion_probe_value(&probe, key);
 	hash = lion_probe_hash(state, &probe, key);
 
-	return lion_posting_set_locate(index, state, &probe, key, hash, ps);
+	return lion_posting_set_locate(index, state, &probe, key, hash, ps, false);
 }
 
 /*
@@ -708,6 +720,14 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * between.
  */
 #define LION_LOOKUP_WALK_MAX	8
+
+/*
+ * The most leaves one IN list keeps pinned, whatever this backend's share of
+ * shared_buffers (DESIGN.md §15).  It is the longest list the planner accepts
+ * as a literal, which is what a list could always pin: the budget changes
+ * nothing for those unless the share is smaller.
+ */
+#define LION_LOOKUP_MAX_PINS	1000
 
 /*
  * Locate the posting sets of many keys of one index at once: the IN list of
@@ -739,6 +759,18 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * one of them - found or not - must be handed to lion_posting_set_release().
  * *nfound, if given, is how many of them have an entry in the index at all:
  * nfound == 0 means the union selects nothing.
+ *
+ * The pins are BUDGETED (DESIGN.md §15, 2026-09-23 review).  Each INLINE set
+ * keeps a pin on the leaf its payload was copied from, the §9 interlock, and
+ * nothing bounded how many leaves that came to: an array parameter over an
+ * index with more leaves than shared_buffers ran out of buffers.  So at most
+ * `budget` distinct leaves keep pins - this backend's remaining share of
+ * shared_buffers, and never more than LION_LOOKUP_MAX_PINS - and the INLINE
+ * sets found past that come out NOPIN: their payload is copied and their leaf
+ * let go.  The count copes with those without weakening §9 - see
+ * lion_count_sources_run(), which either locates such a set again under a pin
+ * of its own when it gets to it, or counts it in an intersection another
+ * source carries the interlock for, or trusts no visibility map at all.
  */
 int
 lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
@@ -752,7 +784,10 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	LionProbeKey *probes;
 	const Datum *vals;
 	Buffer		buf = InvalidBuffer;
+	Buffer		lastpinned = InvalidBuffer;
 	bool		lastmoved = false;
+	uint32		budget;
+	uint32		npinned = 0;
 	int			nprobe = 0;
 	int			nsets = 0;
 	int			found = 0;
@@ -775,6 +810,8 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	 * directory in an order it is not in.
 	 */
 	lion_probe_init(index, state, keytype, &probe);
+
+	budget = Min(GetAdditionalPinLimit(), LION_LOOKUP_MAX_PINS);
 
 	/* A binary coercion - the only one taken - changes no value. */
 	vals = values;
@@ -906,10 +943,23 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 			{
 				/*
 				 * DESIGN.md §9: the INLINE payload just copied out needs a pin
-				 * of its own on this leaf, independent of the walk's position.
+				 * of its own on this leaf, independent of the walk's position
+				 * - if the leaf is one of the first `budget`.  Another pin on
+				 * the leaf the last set pinned costs no buffer; a new leaf is
+				 * counted.  Without a walk the leaves come in hash order and
+				 * may repeat, which counts some twice: the budget can only be
+				 * reached early, never overrun.
 				 */
-				IncrBufferRefCount(buf);
-				sets[nsets].pinbuf = buf;
+				if (buf != lastpinned && npinned >= budget)
+					sets[nsets].nopin = true;
+				else
+				{
+					if (buf != lastpinned)
+						npinned++;
+					lastpinned = buf;
+					IncrBufferRefCount(buf);
+					sets[nsets].pinbuf = buf;
+				}
 			}
 
 			/*
@@ -980,8 +1030,67 @@ lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 		return false;
 	}
 
-	lion_posting_set_take(index, state, buf, off, ps);
+	lion_posting_set_take(index, state, buf, off, ps, false);
 	return true;
+}
+
+void
+lion_posting_set_unpin(LionPostingSet *ps)
+{
+	if (BufferIsValid(ps->pinbuf))
+	{
+		ReleaseBuffer(ps->pinbuf);
+		ps->pinbuf = InvalidBuffer;
+		ps->nopin = true;
+	}
+}
+
+/*
+ * Locate the entry of a NOPIN set again, this time keeping the pin whatever
+ * the budget says: what lion_count_one_set() counts a NOPIN set from.  The
+ * stored key is of the index's own type, so this is a plain lookup of it -
+ * the same entry, since a column has one entry per key, as it is NOW, which
+ * is all a count that reads the index after locating the entry ever gets (a
+ * chain is read page by page as the count goes, too).  An entry that has gone
+ * meanwhile held nothing visible to anyone, because VACUUM deletes an entry
+ * only once its set is empty; false then, with *fresh not found.
+ */
+static bool
+lion_posting_set_relocate(const LionPostingSet *ps, LionPostingSet *fresh)
+{
+	LionState   *state = lion_index_column_state(ps->index, ps->attno);
+	LionProbe	probe;
+	Datum		key;
+
+	Assert(ps->found && ps->nopin && ps->hasstoredkey);
+
+	if (ps->keyisnull)
+	{
+		Buffer		buf;
+		OffsetNumber off;
+
+		memset(fresh, 0, sizeof(LionPostingSet));
+		fresh->index = ps->index;
+		fresh->attno = ps->attno;
+		fresh->pinbuf = InvalidBuffer;
+		fresh->head = InvalidBlockNumber;
+		if (!lion_find_null_entry(ps->index, state, BUFFER_LOCK_SHARE, &buf,
+								  &off))
+		{
+			if (BufferIsValid(buf))
+				UnlockReleaseBuffer(buf);
+			return false;
+		}
+		lion_posting_set_take(ps->index, state, buf, off, fresh, true);
+		return true;
+	}
+
+	lion_probe_init(ps->index, state, InvalidOid, &probe);
+	key = lion_probe_value(&probe, ps->storedkey);
+
+	return lion_posting_set_locate(ps->index, state, &probe, key,
+								   lion_probe_hash(state, &probe, key), fresh,
+								   true);
 }
 
 void
@@ -990,6 +1099,7 @@ lion_posting_set_release(LionPostingSet *ps)
 	if (BufferIsValid(ps->pinbuf))
 		ReleaseBuffer(ps->pinbuf);
 	ps->pinbuf = InvalidBuffer;
+	ps->nopin = false;
 	ps->payload = NULL;			/* the memory belongs to the caller's context */
 	ps->paylen = 0;
 	ps->mat = NULL;				/* ... and so does the materialized copy */
@@ -2372,8 +2482,9 @@ lion_source_satisfiable(const LionKeyNode *node, const LionPostingSet *sets)
  * lion_count_sources() has to keep at least one positive source that has it
  * (see the comment on lion_posting_set_materialize()).
  *
- *	- a leaf has it unless its set has been materialized; a leaf whose key has
- *	  no entry yields nothing, so it has it vacuously;
+ *	- a leaf has it unless its set has been materialized or was located
+ *	  without its pin (NOPIN, DESIGN.md §15); a leaf whose key has no entry
+ *	  yields nothing, so it has it vacuously;
  *	- an AND has it if ANY child has it, because every child stands at the
  *	  container key the result was built from and so every child's pin is
  *	  still held when the result is counted;
@@ -2391,7 +2502,8 @@ lion_source_pinned(const LionKeyNode *node, const LionPostingSet *sets)
 	switch (node->kind)
 	{
 		case LION_KN_KEY:
-			return !sets[node->keyno].found || sets[node->keyno].mat == NULL;
+			return (!sets[node->keyno].found ||
+					(sets[node->keyno].mat == NULL && !sets[node->keyno].nopin));
 
 		case LION_KN_AND:
 			for (i = 0; i < node->nargs; i++)
@@ -3220,8 +3332,8 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	 * visibilitymap_get_status and lion_vm_allvisible_mask).
 	 */
 	members = lion_container_block_mask(c);
-	if (cx->in_recovery)
-		allvis = 0;				/* see lion_count_sources(): no interlock on a standby */
+	if (cx->in_recovery || cx->novm)
+		allvis = 0;				/* see lion_count_sources(): no interlock */
 	else
 	{
 		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, members,
@@ -3334,6 +3446,11 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
  * The set's OWN pin (an inline entry's) is the caller's and is not touched
  * here: lion_cursor_init() borrows it and lion_cursor_close() leaves it.
  *
+ * A NOPIN set has no such pin, and nothing else is counted with it to carry
+ * the interlock, so its entry is located again here and counted from that
+ * copy, under the pin the new lookup keeps until the count of it is done
+ * (DESIGN.md §15).  One set at a time: the pass holds that one pin.
+ *
  * An existence test (DESIGN.md §26) stops after the first container that
  * settles it; the cursor has moved on by then, which is where the §9 ordering
  * says it may.
@@ -3341,7 +3458,15 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
 static void
 lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 {
+	LionPostingSet fresh;
 	LionSetCursor cur;
+
+	if (ps->nopin)
+	{
+		if (!lion_posting_set_relocate(ps, &fresh))
+			return;
+		ps = &fresh;
+	}
 
 	lion_cursor_init(&cur, ps, cx);
 	while (cur.valid)
@@ -3353,6 +3478,9 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		CHECK_FOR_INTERRUPTS();
 	}
 	lion_cursor_close(&cur);
+
+	if (ps == &fresh)
+		lion_posting_set_release(&fresh);
 }
 
 /*
@@ -4146,6 +4274,23 @@ lion_sources_all_rmgr(int nsources, LionCountSource *sources)
 }
 
 /*
+ * Does this source hold a set that was located without its pin (DESIGN.md
+ * §15)?
+ */
+static bool
+lion_source_has_nopin(const LionCountSource *src)
+{
+	int			j;
+
+	for (j = 0; j < src->nsets; j++)
+	{
+		if (src->sets[j].found && src->sets[j].nopin)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Does the whole count come down to ONE posting set?
  *
  * That is not the short-circuit above and needs none of its argument: there is
@@ -4247,9 +4392,17 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 * union (lion_sources_disjoint_sum(), which carries the argument) and is it
 	 * the cheaper way to get it (lion_sum_is_cheaper(), which is where the
 	 * measurements are).
+	 *
+	 * Or the list was longer than the lookup's pin budget and some of its sets
+	 * are NOPIN (DESIGN.md §15).  The sum is then taken however the costs
+	 * compare, because it is the one way to count them that keeps the §9
+	 * interlock: one set at a time, each located again under a pin of its own
+	 * (lion_count_one_set()).  The union would have nothing to carry it - the
+	 * list is the only positive source - and could only recheck every TID.
 	 */
 	summed = (lion_sources_disjoint_sum(nsources, sources) &&
-			  lion_sum_is_cheaper(heap, &sources[0]));
+			  (lion_source_has_nopin(&sources[0]) ||
+			   lion_sum_is_cheaper(heap, &sources[0])));
 	oneset = !summed && lion_sources_one_set(nsources, sources);
 
 	/*
@@ -4294,7 +4447,6 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 		if (carry[i])
 			ncarry++;
 	}
-	Assert(ncarry > 0);
 
 	/*
 	 * A summed source counts every set exactly once, so there is nothing a
@@ -4338,7 +4490,6 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 			}
 		}
 	}
-	Assert(ncarry > 0);
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"lion index count",
@@ -4409,6 +4560,19 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.in_recovery = RecoveryInProgress() &&
 		!lion_sources_all_rmgr(nsources, sources);
+
+	/*
+	 * NOPIN sets (DESIGN.md §15).  Materializing never takes the last carrier
+	 * away (rule 2), so a merge with no positive source that holds a pin at
+	 * every container key is one whose sets were located over the pin budget:
+	 * an IN list under an OR across columns, say, or intersected only with
+	 * sets that are themselves NOPIN.  Nothing then stops VACUUM from having
+	 * removed a TID the copies still list and set its heap page all-visible,
+	 * so the map is not asked at all and every candidate goes to the heap,
+	 * as on a standby.  The sum and the one-set count do not need this: they
+	 * locate a NOPIN set again, pinned, before they count it.
+	 */
+	cx.novm = (ncarry == 0 && !summed && !oneset);
 	cx.rel_read_only = rel_read_only;
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
@@ -5258,10 +5422,10 @@ lion_index_count_stats(PG_FUNCTION_ARGS)
  *
  * The values are located with lion_posting_set_lookup_many(), so the bucket
  * pages are read in order and duplicates cost nothing, and the union is the
- * k-way merge of lion_ecursor_build().  Unlike the pushdown, this has no limit
- * on the number of values other than the pins it holds - one bucket page per
- * INLINE entry - so a caller that hands it a very long list should expect to
- * hold that many buffer pins for the duration.
+ * k-way merge of lion_ecursor_build() or the disjoint sum.  Unlike the
+ * pushdown's literal lists, this has no limit on the number of values: the
+ * pins the lookup keeps are budgeted instead (DESIGN.md §15), and the sets
+ * past the budget are counted one at a time.
  */
 Datum
 lion_index_count_any(PG_FUNCTION_ARGS)
