@@ -161,6 +161,27 @@ SELECT lion_index_posting_root('lion_sec_d_k', 1);           -- still not the pr
 RESET ROLE;
 REVOKE pg_stat_scan_tables FROM lion_sec_reader;
 DROP TABLE lion_sec_d;
+-- ---------- argument checks of the SQL count functions (2026-09-23 review, third round) ----------
+-- A relation that does not exist (dropped, or never there) is named by its
+-- OID, not as "(null)".
+SELECT lion_index_count(4294967295::oid::regclass, 1);
+SELECT lion_index_count_any(4294967295::oid::regclass, ARRAY[1]);
+-- A role with no privilege on the table is refused before any lock is taken
+-- on it (test/isolation/count_lock_privilege.spec shows the lock); a role
+-- with some column privilege gets as far as the exact check, and the same
+-- error.
+CREATE ROLE lion_sec_none;
+SET ROLE lion_sec_none;
+SELECT lion_index_count('lion_sec_k', 1);
+SELECT lion_index_count_any('lion_sec_k', ARRAY[1]);
+SELECT * FROM lion_index_count_group_stats('lion_sec_k');
+RESET ROLE;
+GRANT SELECT (id) ON lion_sec TO lion_sec_none;
+SET ROLE lion_sec_none;
+SELECT lion_index_count('lion_sec_k', 1);
+RESET ROLE;
+REVOKE SELECT (id) ON lion_sec FROM lion_sec_none;
+DROP ROLE lion_sec_none;
 DROP TABLE lion_sec;
 DROP ROLE lion_sec_reader;
 DROP ROLE lion_sec_other;

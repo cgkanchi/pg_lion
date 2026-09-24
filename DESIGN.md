@@ -627,7 +627,11 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   diagnostic functions check neither privileges nor RLS - `lion_index_posting_root()` answers key
   membership, `lion_index_stats()` gives counts, `lion_index_verify()` reads the heap - so they are
   revoked from PUBLIC like pageinspect's and amcheck's (`lion_index_stats()` is granted to
-  `pg_stat_scan_tables`, as pgstattuple's functions are).
+  `pg_stat_scan_tables`, as pgstattuple's functions are). The cheap half of the check - SELECT on
+  the table or on at least one column - comes BEFORE any lock is taken, so a role with no
+  privilege cannot queue behind (and hold up) locks on a table it cannot read; the exact check
+  follows under the lock, where the index definition can be trusted (third round of the
+  2026-09-23 review, test/isolation/count_lock_privilege.spec).
 - **Row-level security.** The SQL functions refuse a table on which RLS applies to the caller
   (policies would have to be evaluated per row); the CustomScan declines relations with security
   quals, so the ordinary plan applies the policies.

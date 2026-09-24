@@ -5024,12 +5024,6 @@ typedef struct LionCountCall
 } LionCountCall;
 
 /*
- * Open and vet the indexes of one SQL count: relkind, access method, key
- * type, privileges, row-level security and snapshot eligibility.  keytype may
- * be NULL, which means the caller has no search key at all (the grouped form
- * below, which walks every entry instead of looking one up).
- */
-/*
  * An index's expressions or predicate AS STORED in pg_index, NIL when it has
  * none.  RelationGetIndexExpressions()/RelationGetIndexPredicate() hand back
  * the planner's simplified form, in which an inlinable SQL function has
@@ -5092,12 +5086,32 @@ lion_check_functions_walker(Node *node, void *context)
 	return expression_tree_walker(node, lion_check_functions_walker, context);
 }
 
+/*
+ * The error for a relation named by an OID that has no relation behind it:
+ * one dropped since the caller named it, or one that never existed (a
+ * regclass argument accepts any number).
+ */
+static void
+lion_count_no_relation(Oid relid)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_TABLE),
+			 errmsg("relation with OID %u does not exist", relid)));
+}
+
+/*
+ * Open and vet the indexes of one SQL count: relkind, access method, key
+ * type, privileges, row-level security and snapshot eligibility.  keytype may
+ * be NULL, which means the caller has no search key at all (the grouped form
+ * below, which walks every entry instead of looking one up).
+ */
 static void
 lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					   const Oid *keytype, AttrNumber wantcol,
 					   LionCountCall *call)
 {
 	Oid			heapoid = InvalidOid;
+	char	   *heapname;
 	int			i;
 
 	/* index[] and keytype[] hold two; every caller opens one or two */
@@ -5111,35 +5125,70 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 		call->keytype[i] = InvalidOid;
 	}
 
+	/*
+	 * Nothing is locked yet, so every catalog answer below may be about a
+	 * relation that is being dropped: a relation that is gone is reported by
+	 * its OID, never as "(null)" or as a failed cache lookup.
+	 */
 	for (i = 0; i < nidx; i++)
 	{
+		char	   *idxname = get_rel_name(idxoid[i]);
+		char		relkind = get_rel_relkind(idxoid[i]);
 		Oid			hoid;
 
 		if (keytype != NULL)
 			call->keytype[i] = keytype[i];
 
-		if (get_rel_relkind(idxoid[i]) != RELKIND_INDEX)
+		if (idxname == NULL || relkind == '\0')
+			lion_count_no_relation(idxoid[i]);
+		if (relkind != RELKIND_INDEX)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("\"%s\" is not an index", get_rel_name(idxoid[i]))));
+					 errmsg("\"%s\" is not an index", idxname)));
 
-		hoid = IndexGetRelation(idxoid[i], false);
+		hoid = IndexGetRelation(idxoid[i], true);
+		if (!OidIsValid(hoid))
+			lion_count_no_relation(idxoid[i]);
 		if (i == 0)
 			heapoid = hoid;
 		else if (hoid != heapoid)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("indexes \"%s\" and \"%s\" are not on the same table",
-							get_rel_name(idxoid[0]),
-							get_rel_name(idxoid[i]))));
+							get_rel_name(idxoid[0]), idxname)));
 	}
 
-	call->heap = table_open(heapoid, AccessShareLock);
+	/*
+	 * The cheap half of the privilege check, BEFORE any lock (2026-09-23
+	 * review): the caller must hold SELECT on the table or on at least one of
+	 * its columns, which is the least any count through any of its indexes
+	 * needs.  Without it a role with no privilege at all could take - or
+	 * queue for - a lock on any table that has a lion index, and hold up
+	 * everything that queues behind it.  The exact check, which reads the
+	 * index definition, follows once the locks are held, because only then
+	 * can that definition be trusted.  A table dropped meanwhile makes
+	 * pg_class_aclcheck() raise "does not exist".
+	 */
+	heapname = get_rel_name(heapoid);
+	if (heapname == NULL)
+		lion_count_no_relation(heapoid);
+	if (pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT) != ACLCHECK_OK &&
+		pg_attribute_aclcheck_all(heapoid, GetUserId(), ACL_SELECT,
+								  ACLMASK_ANY) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV,
+					   get_relkind_objtype(get_rel_relkind(heapoid)),
+					   heapname);
+
+	call->heap = try_table_open(heapoid, AccessShareLock);
+	if (call->heap == NULL)
+		lion_count_no_relation(heapoid);
 
 	for (i = 0; i < nidx; i++)
 	{
-		Relation	index = index_open(idxoid[i], AccessShareLock);
+		Relation	index = try_index_open(idxoid[i], AccessShareLock);
 
+		if (index == NULL)
+			lion_count_no_relation(idxoid[i]);
 		call->index[i] = index;
 
 		if (index->rd_rel->relam != lion_get_am_oid())
