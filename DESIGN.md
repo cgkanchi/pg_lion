@@ -669,7 +669,36 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   predicate call, read from pg_index as stored - the relcache's copies are planner-simplified,
   with inlinable SQL functions already replaced by their bodies - whatever the table grants. The
   CustomScan path is covered by the executor's own ExecCheckPermissions on the range table, and a
-  partial index reaches it only when the query implies the predicate, i.e. references it. The
+  partial index reaches it only when the query implies the predicate, i.e. references it.
+  **EXECUTE on what a count replaces** (2026-09-23 review: a pushed-down `count(*) WHERE k = 1`
+  answered after `REVOKE EXECUTE ON FUNCTION count()` or `int4eq` from PUBLIC, and so did the SQL
+  functions). The rule is the one above - ask exactly what the replaced plan asks, no more, no
+  less - and what core asks was read from nodeAgg.c/execExpr.c and verified against the ordinary
+  plan on 16 and 20: ExecInitAgg checks EXECUTE on each aggregate for the current user and on its
+  transition and final functions for the AGGREGATE'S OWNER; ExecInitFunc checks every function
+  and operator of an initialised expression - the scan's quals, including a hashed IN list's hash
+  function and a hash or nested-loop join's clause - for the current user; the grouping equality of
+  a GROUP BY is checked (ExecBuildGroupingEqual), its hash and sort support functions are not, and
+  `count(DISTINCT k)` compares k through an unchecked FmgrInfo, so it runs with `int4eq` revoked.
+  Each check fires InvokeFunctionExecuteHook. So the planner records, in custom_private member
+  `LION_PRIV_EXECUTE` (shape 10), the aggregates of the target list and the HAVING (setrefs.c
+  turns the HAVING's into references to the node's own columns, so core never sees them), the
+  functions of every WHERE clause - OR trees and IN lists included, from the parent's quals for a
+  partitioned table - and of an FK-side join's clause (§27), and the GROUP BY's equality
+  functions; `lion_begin_custom_scan()` checks them for GetUserId() with core's errors
+  (`permission denied for function int4eq`, `... for aggregate count`) before it opens anything,
+  every time the plan starts, so a cached plan answers a REVOKE or a SET ROLE as the ordinary one
+  does. Plain EXPLAIN initialises the plan too and core then checks the quals and the aggregates
+  but not a HashAggregate's grouping equality (its hash table is not built), so the node skips
+  that one under EXEC_FLAG_EXPLAIN_ONLY. One deliberate difference: a merge join compares through
+  the btree support function unchecked, so a join the planner would have merged runs with its
+  operator revoked while the node refuses it - the node keeps the SQL meaning, the query calls `=`.
+  The SQL functions stand for `SELECT count(*) FROM t WHERE col = key` (or `= ANY (keys)`, or
+  `GROUP BY col`), so they require EXECUTE on count() - checked as an aggregate, as above - and on
+  the equality function they look up with: strategy 1 of the key column's opfamily for (opcintype,
+  the key's type), which is `int48eq` for an int8 key on an int4 column exactly as in the query,
+  and (opcintype, opcintype) for the grouped form. These checks follow the exact SELECT check,
+  under the lock (test/sql/security_exec.sql). The
   diagnostic functions check neither privileges nor RLS - `lion_index_posting_root()` answers key
   membership, `lion_index_stats()` gives counts, `lion_index_verify()` reads the heap,
   `lion_index_wal_mode()` locks whatever it is handed - so they are revoked from PUBLIC like
@@ -4973,7 +5002,9 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   core with its restriction clauses and its RLS security quals (with core's leakproofness rules),
   carried as the CustomPath's `custom_paths` child and run by the node under the query's snapshot.
   Only rows that passed it are ever looked up. Privileges on both tables are the executor's
-  range-table check, as before. The fact side keeps §10's rule: a fact rel with security quals
+  range-table check, as before; EXECUTE on the join operator, which the node evaluates in place of
+  a hash or nested-loop join, is the node's own check at executor startup (§9, "Privileges"). The
+  fact side keeps §10's rule: a fact rel with security quals
   (RLS) or TABLESAMPLE declines, and so does a partitioned fact table in v1.
 - **The fact side is the §9 count, unchanged.** Each dimension row's fk set is located with
   `lion_posting_set_lookup_col()`, counted with `lion_count_sources_cached()` beside the fact

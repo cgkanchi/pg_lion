@@ -1,0 +1,566 @@
+-- EXECUTE privileges on the functions the count paths stand in for (2026-09-23
+-- review).  LionCount replaces an Agg and a scan's quals, and the SQL count
+-- functions replace a whole query, so each must ask for the EXECUTE
+-- privileges the executor would have asked for on the plan it replaces - the
+-- aggregate, the operators of the WHERE clause, the grouping equality, the
+-- join operator - no more and no less (DESIGN.md §9, "Privileges").
+--
+-- Revoking a pg_catalog function from PUBLIC affects the whole database, so
+-- every REVOKE here is paired with a GRANT a few lines below it, and the file
+-- ends by checking that nothing is left revoked.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+CREATE ROLE lion_exec_user;
+CREATE ROLE lion_exec_other;
+-- nullable columns (holding no NULL), so that PostgreSQL 19+ does not turn
+-- count(k) into count(*) before either plan sees it
+CREATE TABLE lion_ex (k int, g int, t text);
+INSERT INTO lion_ex SELECT i % 10, i % 3, 't' || (i % 4) FROM generate_series(1, 3000) i;
+CREATE INDEX lion_ex_k ON lion_ex USING lion (k);
+CREATE INDEX lion_ex_g ON lion_ex USING lion (g);
+CREATE INDEX lion_ex_t ON lion_ex USING lion (t);
+-- the dimension of an FK-side join (DESIGN.md §27) on lion_ex.k
+CREATE TABLE lion_exd (pk int PRIMARY KEY, name text NOT NULL);
+INSERT INTO lion_exd SELECT i, 'n' || (i % 2) FROM generate_series(0, 9) i;
+-- a partitioned table, partitioned on a column no query below constrains
+CREATE TABLE lion_exp (p int NOT NULL, k int NOT NULL, g int NOT NULL) PARTITION BY RANGE (p);
+CREATE TABLE lion_exp_1 PARTITION OF lion_exp FOR VALUES FROM (0) TO (2);
+CREATE TABLE lion_exp_2 PARTITION OF lion_exp FOR VALUES FROM (2) TO (4);
+INSERT INTO lion_exp SELECT i % 4, i % 10, i % 3 FROM generate_series(1, 3000) i;
+CREATE INDEX lion_exp_k ON lion_exp USING lion (k);
+CREATE INDEX lion_exp_g ON lion_exp USING lion (g);
+VACUUM ANALYZE lion_ex;
+VACUUM ANALYZE lion_exd;
+VACUUM ANALYZE lion_exp;
+GRANT SELECT ON lion_ex, lion_exd, lion_exp TO lion_exec_user, lion_exec_other;
+/*
+ * lion_ex_try() runs a query and returns its rows as one sorted string, or
+ * the error it raised.  lion_ex() says whether the pushdown plans the query
+ * (asked as the caller, who holds every privilege), then runs it as role r
+ * through the pushdown and through the ordinary plan, and prints the first
+ * answer and whether the second is the same.
+ */
+CREATE FUNCTION lion_ex_try(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO r;
+	RETURN r;
+EXCEPTION WHEN insufficient_privilege THEN
+	RETURN 'ERROR: ' || SQLERRM;
+END $$;
+CREATE FUNCTION lion_ex(q text, r text DEFAULT 'lion_exec_user') RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	ron text;
+	roff text;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	PERFORM set_config('role', r, true);
+	ron := lion_ex_try(q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	/* the ordinary plan gets every join method back */
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	roff := lion_ex_try(q);
+	RETURN CASE WHEN pushed THEN 'pushed: ' ELSE 'NOT PUSHED: ' END || ron ||
+		CASE WHEN ron = roff THEN ' (as the ordinary plan)'
+			 ELSE ' | the ordinary plan: ' || roff END;
+END $$;
+-- ---------- the WHERE clause's operator: int4eq ----------
+REVOKE EXECUTE ON FUNCTION int4eq(int4, int4) FROM PUBLIC;
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = ANY (''{1,2}'')');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1 OR t = ''t1''');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE t = ''t1'' OR (t = ''t2'' AND g = 2)');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE t = ''t1''');      -- texteq only: allowed
+               lion_ex                
+--------------------------------------
+ pushed: (750) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1::int8');     -- int48eq: allowed
+               lion_ex                
+--------------------------------------
+ pushed: (300) (as the ordinary plan)
+(1 row)
+
+-- the grouping equality, as HashAggregate and GroupAggregate check it
+SELECT lion_ex('SELECT g, count(*) FROM lion_ex GROUP BY g');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT t, count(*) FROM lion_ex GROUP BY t');         -- allowed
+                              lion_ex                               
+--------------------------------------------------------------------
+ pushed: (t0,750) (t1,750) (t2,750) (t3,750) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT t, g, count(*) FROM lion_ex GROUP BY t, g');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT t, count(*) FROM lion_ex WHERE g = 1 GROUP BY t');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+-- count(DISTINCT k) compares k with nodeAgg's unchecked equalfnOne, so core
+-- runs it without int4eq; so does the pushdown, and with a GROUP BY neither
+SELECT lion_ex('SELECT count(DISTINCT k) FROM lion_ex');
+               lion_ex               
+-------------------------------------
+ pushed: (10) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT t, count(DISTINCT k) FROM lion_ex GROUP BY t');
+                          lion_ex                           
+------------------------------------------------------------
+ pushed: (t0,5) (t1,5) (t2,5) (t3,5) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(DISTINCT k) FROM lion_ex GROUP BY g');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(DISTINCT t) FROM lion_ex WHERE k = 2');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+-- a partitioned table: the clause runs in every partition
+SELECT lion_ex('SELECT count(*) FROM lion_exp WHERE k = 1');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(*) FROM lion_exp GROUP BY g');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+-- the FK-side join eliminates the join clause's operator; forced, so that the
+-- node is what runs, against the ordinary join
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT lion_ex('SELECT count(*) FROM lion_ex f JOIN lion_exd d ON f.k = d.pk');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT d.name, count(*) FROM lion_ex f JOIN lion_exd d ON f.k = d.pk GROUP BY d.name');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT d.name, count(*) FROM lion_ex f JOIN lion_exd d ON f.k = d.pk WHERE f.t = ''t1'' GROUP BY d.name');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function int4eq (as the ordinary plan)
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+-- plain EXPLAIN initialises the plan, which asks for the privilege too
+SET ROLE lion_exec_user;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ex WHERE k = 1;
+ERROR:  permission denied for function int4eq
+-- ... except the grouping equality, which HashAggregate only checks when it runs
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lion_ex GROUP BY g;
+          QUERY PLAN           
+-------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ex_g (g)
+   Group Key: g
+(3 rows)
+
+-- the SQL count functions ask what `SELECT count(*) FROM t WHERE col = key` does
+SELECT lion_index_count('lion_ex_k', 1);
+ERROR:  permission denied for function int4eq
+SELECT lion_index_count('lion_ex_g', 1, 'lion_ex_k', 1);
+ERROR:  permission denied for function int4eq
+SELECT count FROM lion_index_count_stats('lion_ex_k', 1);
+ERROR:  permission denied for function int4eq
+SELECT lion_index_count_any('lion_ex_k', ARRAY[1, 2]);
+ERROR:  permission denied for function int4eq
+SELECT groups, count FROM lion_index_count_group_stats('lion_ex_g');
+ERROR:  permission denied for function int4eq
+SELECT lion_index_count('lion_ex_k', 1::int8);                         -- int48eq: allowed
+ lion_index_count 
+------------------
+              300
+(1 row)
+
+SELECT groups, count FROM lion_index_count_group_stats('lion_ex_t');   -- allowed
+ groups | count 
+--------+-------
+      4 |  3000
+(1 row)
+
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION int4eq(int4, int4) TO PUBLIC;
+-- ---------- a hashed IN list is checked for its hash function as well ----------
+REVOKE EXECUTE ON FUNCTION hashint4(int4) FROM PUBLIC;
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)');
+                                    lion_ex                                    
+-------------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function hashint4 (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k IN (1, 2)');      -- not hashed: allowed
+               lion_ex                
+--------------------------------------
+ pushed: (600) (as the ordinary plan)
+(1 row)
+
+GRANT EXECUTE ON FUNCTION hashint4(int4) TO PUBLIC;
+-- ---------- the aggregates: count() and count("any") ----------
+REVOKE EXECUTE ON FUNCTION count() FROM PUBLIC;
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(k) FROM lion_ex WHERE k = 1');             -- count("any"): allowed
+               lion_ex                
+--------------------------------------
+ pushed: (300) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(*) FROM lion_ex GROUP BY g');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(g) FROM lion_ex GROUP BY g HAVING count(*) > 0');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_exp WHERE k = 1');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT lion_ex('SELECT d.name, count(*) FROM lion_ex f JOIN lion_exd d ON f.k = d.pk GROUP BY d.name');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET ROLE lion_exec_user;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ex WHERE k = 1;
+ERROR:  permission denied for aggregate count
+SELECT lion_index_count('lion_ex_k', 1);
+ERROR:  permission denied for aggregate count
+SELECT lion_index_count_any('lion_ex_k', ARRAY[1, 2]);
+ERROR:  permission denied for aggregate count
+SELECT groups, count FROM lion_index_count_group_stats('lion_ex_g');
+ERROR:  permission denied for aggregate count
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION count() TO PUBLIC;
+REVOKE EXECUTE ON FUNCTION count("any") FROM PUBLIC;
+SELECT lion_ex('SELECT count(DISTINCT k) FROM lion_ex');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT t, count(DISTINCT k) FROM lion_ex GROUP BY t');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(k) FROM lion_ex WHERE k = 1');
+                                   lion_ex                                   
+-----------------------------------------------------------------------------
+ pushed: ERROR: permission denied for aggregate count (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1');             -- count(): allowed
+               lion_ex                
+--------------------------------------
+ pushed: (300) (as the ordinary plan)
+(1 row)
+
+GRANT EXECUTE ON FUNCTION count("any") TO PUBLIC;
+-- ---------- cached plans and role changes: checked when the plan starts ----------
+SET plan_cache_mode = force_generic_plan;
+SET ROLE lion_exec_user;
+PREPARE lion_ex_q(int) AS SELECT count(*) FROM lion_ex WHERE k = $1;
+PREPARE lion_ex_qg AS SELECT g, count(*) FROM lion_ex GROUP BY g ORDER BY g;
+EXPLAIN (COSTS OFF) EXECUTE lion_ex_q(1);
+             QUERY PLAN             
+------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ex_k (k = $1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) EXECUTE lion_ex_qg;
+             QUERY PLAN              
+-------------------------------------
+ Sort
+   Sort Key: g
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_ex_g (g)
+         Group Key: g
+(5 rows)
+
+EXECUTE lion_ex_q(1);
+ count 
+-------
+   300
+(1 row)
+
+EXECUTE lion_ex_qg;
+ g | count 
+---+-------
+ 0 |  1000
+ 1 |  1000
+ 2 |  1000
+(3 rows)
+
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION int4eq(int4, int4) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION int4eq(int4, int4) TO lion_exec_other;
+SET ROLE lion_exec_user;
+EXECUTE lion_ex_q(1);                   -- the plan prepared before the REVOKE
+ERROR:  permission denied for function int4eq
+EXECUTE lion_ex_qg;
+ERROR:  permission denied for function int4eq
+SET ROLE lion_exec_other;
+EXECUTE lion_ex_q(1);                   -- same statement, a role that holds it
+ count 
+-------
+   300
+(1 row)
+
+EXECUTE lion_ex_qg;
+ g | count 
+---+-------
+ 0 |  1000
+ 1 |  1000
+ 2 |  1000
+(3 rows)
+
+SET ROLE lion_exec_user;
+EXECUTE lion_ex_q(1);
+ERROR:  permission denied for function int4eq
+SET ROLE lion_exec_other;
+EXECUTE lion_ex_q(1);
+ count 
+-------
+   300
+(1 row)
+
+RESET ROLE;
+-- a SECURITY DEFINER function runs with its owner's privileges
+CREATE FUNCTION lion_ex_def_other(int) RETURNS bigint SECURITY DEFINER
+LANGUAGE sql AS 'SELECT count(*) FROM lion_ex WHERE k = $1';
+ALTER FUNCTION lion_ex_def_other(int) OWNER TO lion_exec_other;
+CREATE FUNCTION lion_ex_def_user(int) RETURNS bigint SECURITY DEFINER
+LANGUAGE sql AS 'SELECT count(*) FROM lion_ex WHERE k = $1';
+ALTER FUNCTION lion_ex_def_user(int) OWNER TO lion_exec_user;
+SET ROLE lion_exec_user;
+SELECT lion_ex_def_other(1);            -- owner holds int4eq
+ lion_ex_def_other 
+-------------------
+               300
+(1 row)
+
+SELECT lion_ex_def_user(1);
+ERROR:  permission denied for function int4eq
+SET ROLE lion_exec_other;
+SELECT lion_ex_def_user(1);             -- owner does not
+ERROR:  permission denied for function int4eq
+SELECT lion_ex_def_other(1);
+ lion_ex_def_other 
+-------------------
+               300
+(1 row)
+
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION int4eq(int4, int4) FROM lion_exec_other;
+GRANT EXECUTE ON FUNCTION int4eq(int4, int4) TO PUBLIC;
+-- granted again: the same prepared plans answer
+SET ROLE lion_exec_user;
+EXECUTE lion_ex_q(1);
+ count 
+-------
+   300
+(1 row)
+
+EXECUTE lion_ex_qg;
+ g | count 
+---+-------
+ 0 |  1000
+ 1 |  1000
+ 2 |  1000
+(3 rows)
+
+RESET ROLE;
+DEALLOCATE lion_ex_q;
+DEALLOCATE lion_ex_qg;
+RESET plan_cache_mode;
+-- ---------- positive controls: every privilege back, every answer exact ----------
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1');
+               lion_ex                
+--------------------------------------
+ pushed: (300) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)');
+                lion_ex                
+---------------------------------------
+ pushed: (2700) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1 OR t = ''t1''');
+               lion_ex                
+--------------------------------------
+ pushed: (900) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(*) FROM lion_ex GROUP BY g');
+                          lion_ex                          
+-----------------------------------------------------------
+ pushed: (0,1000) (1,1000) (2,1000) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT t, g, count(*) FROM lion_ex GROUP BY t, g');
+                                                                              lion_ex                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ pushed: (t0,0,250) (t0,1,250) (t0,2,250) (t1,0,250) (t1,1,250) (t1,2,250) (t2,0,250) (t2,1,250) (t2,2,250) (t3,0,250) (t3,1,250) (t3,2,250) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(DISTINCT k) FROM lion_ex GROUP BY g');
+                       lion_ex                       
+-----------------------------------------------------
+ pushed: (0,10) (1,10) (2,10) (as the ordinary plan)
+(1 row)
+
+SELECT lion_ex('SELECT g, count(*) FROM lion_exp WHERE k = 1 GROUP BY g');
+                        lion_ex                         
+--------------------------------------------------------
+ pushed: (0,100) (1,100) (2,100) (as the ordinary plan)
+(1 row)
+
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT lion_ex('SELECT d.name, count(*) FROM lion_ex f JOIN lion_exd d ON f.k = d.pk GROUP BY d.name');
+                      lion_ex                       
+----------------------------------------------------
+ pushed: (n0,1500) (n1,1500) (as the ordinary plan)
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET ROLE lion_exec_user;
+SELECT lion_index_count('lion_ex_k', 1) = (SELECT count(*) FROM lion_ex WHERE k = 1) AS ok;
+ ok 
+----
+ t
+(1 row)
+
+SELECT lion_index_count('lion_ex_g', 1, 'lion_ex_k', 1) = (SELECT count(*) FROM lion_ex WHERE g = 1 AND k = 1) AS ok;
+ ok 
+----
+ t
+(1 row)
+
+SELECT lion_index_count_any('lion_ex_k', ARRAY[1, 2]) = (SELECT count(*) FROM lion_ex WHERE k IN (1, 2)) AS ok;
+ ok 
+----
+ t
+(1 row)
+
+SELECT groups, count FROM lion_index_count_group_stats('lion_ex_g');
+ groups | count 
+--------+-------
+      3 |  3000
+(1 row)
+
+RESET ROLE;
+-- nothing in pg_catalog is left revoked from PUBLIC by this file
+SELECT p.oid::regprocedure
+  FROM pg_proc p
+ WHERE p.oid IN ('int4eq(int4,int4)'::regprocedure, 'hashint4(int4)'::regprocedure,
+                 'count()'::regprocedure, 'count("any")'::regprocedure)
+   AND NOT has_function_privilege('public', p.oid, 'EXECUTE');
+ oid 
+-----
+(0 rows)
+
+DROP FUNCTION lion_ex_def_other(int);
+DROP FUNCTION lion_ex_def_user(int);
+DROP FUNCTION lion_ex(text, text);
+DROP FUNCTION lion_ex_try(text);
+DROP TABLE lion_ex, lion_exd, lion_exp;
+DROP ROLE lion_exec_user;
+DROP ROLE lion_exec_other;

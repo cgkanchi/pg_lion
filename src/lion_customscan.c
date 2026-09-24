@@ -309,7 +309,14 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		once the child plan exists, the position of that column in the
  *		child's target list.  The join key clause is not a source: the node
  *		looks it up once per child row, in source slot 0
- *	11	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	11	List of three OidLists: the functions whose evaluation the node
+ *		replaces, for the EXECUTE checks the executor would have made on the
+ *		plan it stands for (DESIGN.md §9, "Privileges"; checked at executor
+ *		startup by lion_check_replaced_execute(), never at plan time): the
+ *		aggregates of the target list and the HAVING; the functions of the
+ *		WHERE clauses and of the FK-side join clause; and the equality
+ *		functions of the GROUP BY
+ *	12	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -323,7 +330,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_HAVING		8
 #define LION_PRIV_DISTINCT	9
 #define LION_PRIV_JOIN		10
-#define LION_PRIV_TLKINDS	11
+#define LION_PRIV_EXECUTE	11
+#define LION_PRIV_TLKINDS	12
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -342,6 +350,10 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * target-list kinds, and the negative target-list kinds that name a column of
  * the child plan.
  *
+ * Shape 10 added the EXECUTE member (11) in front of the target-list kinds
+ * (the 2026-09-23 review: a pushed-down count ran after EXECUTE on count() or
+ * on the clause's operator had been revoked).
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -351,8 +363,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x52424909
-#define LION_PRIV_NMEMBERS	12
+#define LION_PRIV_MAGIC		0x5242490a
+#define LION_PRIV_NMEMBERS	13
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -3335,6 +3347,118 @@ lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target,
 }
 
 /*
+ * The functions of an expression the executor would check EXECUTE on when it
+ * initialised it, found as ExecInitExprRec() finds them: a function call's,
+ * an operator's (OpExpr, DistinctExpr, NullIfExpr), and a ScalarArrayOpExpr's
+ * comparison - its negator's for a hashed NOT IN - plus the hash function of
+ * a hashed one.  Every clause the node answers is made of these, Vars and
+ * values.
+ */
+static bool
+lion_replaced_funcs_walker(Node *node, List **funcs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr))
+		*funcs = list_append_unique_oid(*funcs, ((FuncExpr *) node)->funcid);
+	else if (IsA(node, OpExpr) || IsA(node, DistinctExpr) ||
+			 IsA(node, NullIfExpr))
+	{
+		OpExpr	   *op = (OpExpr *) node;
+
+		*funcs = list_append_unique_oid(*funcs,
+										OidIsValid(op->opfuncid) ?
+										op->opfuncid : get_opcode(op->opno));
+	}
+	else if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
+
+		if (OidIsValid(saop->negfuncid))
+			*funcs = list_append_unique_oid(*funcs, saop->negfuncid);
+		else
+			*funcs = list_append_unique_oid(*funcs,
+											OidIsValid(saop->opfuncid) ?
+											saop->opfuncid :
+											get_opcode(saop->opno));
+		if (OidIsValid(saop->hashfuncid))
+			*funcs = list_append_unique_oid(*funcs, saop->hashfuncid);
+	}
+	else if (IsA(node, Aggref))
+		return false;			/* lion_replaced_aggs_walker()'s */
+	return expression_tree_walker(node, lion_replaced_funcs_walker,
+								  (void *) funcs);
+}
+
+/* The aggregates of an expression, which ExecInitAgg() would check. */
+static bool
+lion_replaced_aggs_walker(Node *node, List **aggs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		*aggs = list_append_unique_oid(*aggs, ((Aggref *) node)->aggfnoid);
+		return false;
+	}
+	return expression_tree_walker(node, lion_replaced_aggs_walker,
+								  (void *) aggs);
+}
+
+/*
+ * What the node stands in for, as custom_private member LION_PRIV_EXECUTE:
+ * the functions the executor would have asked EXECUTE on for the plan the
+ * node replaces, so that lion_check_replaced_execute() can ask the same of
+ * whoever runs it (DESIGN.md §9, "Privileges"; the 2026-09-23 review found a
+ * pushed-down count answering after REVOKE EXECUTE on count() or int4eq).
+ * Verified against core on every supported release:
+ *
+ *	- the Agg checks each aggregate (tlexprs, having) for the current user,
+ *	  and its transition and final functions for the aggregate's owner;
+ *	- the scan initialises its quals, rel's baserestrictinfo - every one of
+ *	  which the node answers, OR trees and IN lists included - and so checks
+ *	  each operator's function (and a hashed IN list's hash function);
+ *	- a GROUP BY's Agg checks each grouping column's equality function
+ *	  (ExecBuildGroupingEqual(), hashed or sorted), but not the hash or sort
+ *	  support functions;
+ *	- a hash or nested-loop join initialises its join clause, so an FK-side
+ *	  join (fj) adds the join operator's function.  A merge join compares
+ *	  through the btree support function unchecked, so a query the planner
+ *	  would have merge-joined asks one privilege more of the node; the SQL
+ *	  meaning of the query - it calls `=` - is the one kept.
+ *
+ * Not included: count(DISTINCT k)'s equality, which nodeAgg calls through an
+ * unchecked FmgrInfo for a single column, so core runs the query with that
+ * function revoked and so does the node; and the projection and the HAVING
+ * evaluated over the finished counts, and a non-literal clause value, which
+ * are initialised with ExecInitExpr() and so checked by core as they stand.
+ * (A clause value is a literal or a parameter, possibly in an ARRAY[], and
+ * calls nothing anyway.)
+ */
+static List *
+lion_replaced_functions(RelOptInfo *rel, List *tlexprs, List *having,
+						List *groupclause, const LionFkJoin *fj)
+{
+	List	   *aggs = NIL;
+	List	   *funcs = NIL;
+	List	   *groupfuncs = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+		(void) lion_replaced_funcs_walker((Node *) ((RestrictInfo *) lfirst(lc))->clause,
+										  &funcs);
+	if (fj != NULL)
+		funcs = list_append_unique_oid(funcs, get_opcode(fj->opno));
+	foreach(lc, groupclause)
+		groupfuncs = list_append_unique_oid(groupfuncs,
+											get_opcode(((SortGroupClause *) lfirst(lc))->eqop));
+	(void) lion_replaced_aggs_walker((Node *) tlexprs, &aggs);
+	(void) lion_replaced_aggs_walker((Node *) having, &aggs);
+
+	return list_make3(aggs, funcs, groupfuncs);
+}
+
+/*
  * Is the aggregate one the FK-side join can answer (DESIGN.md §27)?  Its
  * partial value per dimension row is that row's count of joined fact rows,
  * which is count(*) - and count(x) for any x that is non-NULL in every joined
@@ -3594,6 +3718,11 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* distinct */
 	cpath->custom_private = lappend(cpath->custom_private,
 									list_make1_int(joinclause));
+	/* the dimension's GROUP BY is the Finalize Agg's, which checks it */
+	cpath->custom_private = lappend(cpath->custom_private,
+									lion_replaced_functions(rel,
+															output_rel->reltarget->exprs,
+															having, NIL, fj));
 	cpath->methods = &lion_count_path_methods;
 
 	/*
@@ -4580,6 +4709,12 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 									list_make1_int((int) distvar->varattno) :
 									NIL);
 	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* join */
+	cpath->custom_private = lappend(cpath->custom_private,
+									lion_replaced_functions(input_rel,
+															output_rel->reltarget->exprs,
+															having,
+															root->processed_groupClause,
+															NULL));
 	cpath->methods = &lion_count_path_methods;
 
 	/*
@@ -5401,6 +5536,38 @@ lion_close_relation(LionCountScanState *st)
 	}
 }
 
+/*
+ * The EXECUTE checks of the plan the node replaces (LION_PRIV_EXECUTE,
+ * lion_replaced_functions()), made for the current user every time the node
+ * is initialised, as ExecInitNode() makes them for that plan - so a cached
+ * plan answers a REVOKE and a SET ROLE the way the ordinary one does.  In
+ * core's order: the scan's quals, then the Agg's grouping equality, then its
+ * aggregates.
+ *
+ * Plain EXPLAIN initialises the plan too, and core checks the quals and the
+ * aggregates then as well; the grouping equality it checks only when a
+ * HashAggregate - the plan a grouped count competes with - builds its hash
+ * table, which EXPLAIN does not, so neither does this.
+ */
+static void
+lion_check_replaced_execute(List *exec, int eflags)
+{
+	ListCell   *lc;
+
+	if (exec == NIL || !IsA(exec, List) || list_length(exec) != 3)
+		elog(ERROR, "LionCount: malformed EXECUTE list");
+
+	foreach(lc, (List *) lsecond(exec))
+		lion_check_execute(lfirst_oid(lc));
+	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+	{
+		foreach(lc, (List *) lthird(exec))
+			lion_check_execute(lfirst_oid(lc));
+	}
+	foreach(lc, (List *) linitial(exec))
+		lion_check_aggregate_execute(lfirst_oid(lc));
+}
+
 static void
 lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -5435,6 +5602,11 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		lsecond_int(shape) != LION_PRIV_NMEMBERS)
 		elog(ERROR, "LionCount: unrecognized custom_private shape (%d members)",
 			 list_length(cscan->custom_private));
+
+	/* Before anything is opened or read (DESIGN.md §9, "Privileges"). */
+	lion_check_replaced_execute((List *) list_nth(cscan->custom_private,
+												  LION_PRIV_EXECUTE),
+								eflags);
 
 	oids = (List *) list_nth(cscan->custom_private, LION_PRIV_OIDS);
 	ints = (List *) list_nth(cscan->custom_private, LION_PRIV_INTS);

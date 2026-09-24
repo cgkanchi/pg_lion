@@ -533,6 +533,15 @@ extern void lion_entry_scan_end(LionEntryScan *es);
  */
 extern Oid	lion_get_am_oid(void);
 
+/*
+ * EXECUTE on a function, or on an aggregate and its support functions, that
+ * the query a count stands for would call - the checks ExecInitFunc() and
+ * ExecInitAgg() make, with the same errors and the object-access hook.  Made
+ * when the count starts, never at plan time (DESIGN.md §9, "Privileges").
+ */
+extern void lion_check_execute(Oid funcid);
+extern void lion_check_aggregate_execute(Oid aggfnoid);
+
 /* ---------------------------------------------------------------------
  * lion_customscan.c (DESIGN.md section 10)
  * --------------------------------------------------------------------- */

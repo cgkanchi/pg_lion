@@ -57,7 +57,9 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/index.h"
+#include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_proc.h"
@@ -76,6 +78,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/memutils.h"
@@ -5131,6 +5134,77 @@ lion_index_stored_exprs(Relation index, int attnum)
 }
 
 /*
+ * EXECUTE on a function the query a count stands for would call, asked as
+ * ExecInitFunc() asks it: of the current user, failing with core's own
+ * "permission denied for function", then the object-access hook core fires
+ * for every function it is about to run (DESIGN.md §9, "Privileges").  The
+ * pushdown asks at executor startup and the SQL functions when called, never
+ * at plan time: a cached plan outlives both a REVOKE and a SET ROLE.
+ */
+void
+lion_check_execute(Oid funcid)
+{
+	AclResult	aclresult;
+
+	aclresult = object_aclcheck(ProcedureRelationId, funcid, GetUserId(),
+								ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(funcid));
+	InvokeFunctionExecuteHook(funcid);
+}
+
+/*
+ * The same for an aggregate, as ExecInitAgg() asks it: EXECUTE on the
+ * aggregate for the current user ("permission denied for aggregate"), then
+ * EXECUTE on its final and transition functions for the aggregate's OWNER.
+ * count()'s are the bootstrap superuser's, so the second half cannot fail for
+ * it; it is here so that the node asks what the Agg it replaces asks, hooks
+ * included.
+ */
+void
+lion_check_aggregate_execute(Oid aggfnoid)
+{
+	AclResult	aclresult;
+	HeapTuple	tup;
+	Oid			transfn;
+	Oid			finalfn;
+	Oid			owner;
+
+	aclresult = object_aclcheck(ProcedureRelationId, aggfnoid, GetUserId(),
+								ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_AGGREGATE, get_func_name(aggfnoid));
+	InvokeFunctionExecuteHook(aggfnoid);
+
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for aggregate %u", aggfnoid);
+	transfn = ((Form_pg_aggregate) GETSTRUCT(tup))->aggtransfn;
+	finalfn = ((Form_pg_aggregate) GETSTRUCT(tup))->aggfinalfn;
+	ReleaseSysCache(tup);
+
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for function %u", aggfnoid);
+	owner = ((Form_pg_proc) GETSTRUCT(tup))->proowner;
+	ReleaseSysCache(tup);
+
+	if (OidIsValid(finalfn))
+	{
+		aclresult = object_aclcheck(ProcedureRelationId, finalfn, owner,
+									ACL_EXECUTE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(finalfn));
+		InvokeFunctionExecuteHook(finalfn);
+	}
+	aclresult = object_aclcheck(ProcedureRelationId, transfn, owner,
+								ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(transfn));
+	InvokeFunctionExecuteHook(transfn);
+}
+
+/*
  * EXECUTE on every function an index expression or predicate calls
  * (lion_count_open_indexes()): the same question the executor asks of the
  * query the count stands for, in the same walk core uses to find the
@@ -5139,10 +5213,7 @@ lion_index_stored_exprs(Relation index, int attnum)
 static bool
 lion_check_function_acl(Oid funcid, void *context)
 {
-	if (object_aclcheck(ProcedureRelationId, funcid, GetUserId(),
-						ACL_EXECUTE) != ACLCHECK_OK)
-		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_FUNCTION,
-					   get_func_name(funcid));
+	lion_check_execute(funcid);
 	return false;
 }
 
@@ -5412,6 +5483,38 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 			}
 		}
 	}
+
+	/*
+	 * The query also CALLS count() and the equality the key is looked up
+	 * with, so the count asks for EXECUTE on both, as the executor would of
+	 * that query (2026-09-23 review).  `col = key` is strategy 1 of the key
+	 * column's opfamily for (opcintype, the key's type) - int48eq for an int8
+	 * key on an int4 column, exactly as in the query - and `col = ANY (keys)`
+	 * calls the same function per element.  The grouped form stands for
+	 * `SELECT col, count(*) ... GROUP BY col`, whose Agg compares groups with
+	 * the type's equality; the pushdown only groups by an index whose
+	 * strategy 1 IS that equality (DESIGN.md §10), so strategy 1 for
+	 * (opcintype, opcintype) is the function there.
+	 */
+	for (i = 0; i < nidx; i++)
+	{
+		Relation	index = call->index[i];
+		AttrNumber	col = (wantcol == 0) ? 1 : wantcol;
+		Oid			opfamily = index->rd_opfamily[col - 1];
+		Oid			opcintype = index->rd_opcintype[col - 1];
+		Oid			eqop = InvalidOid;
+
+		if (OidIsValid(call->keytype[i]))
+			eqop = get_opfamily_member(opfamily, opcintype,
+									   call->keytype[i], 1);
+		if (!OidIsValid(eqop))
+			eqop = get_opfamily_member(opfamily, opcintype, opcintype, 1);
+		if (!OidIsValid(eqop))
+			elog(ERROR, "missing equality operator for type %u in opfamily %u",
+				 opcintype, opfamily);
+		lion_check_execute(get_opcode(eqop));
+	}
+	lion_check_aggregate_execute(F_COUNT_);
 
 	/*
 	 * Row-level security: the policies would have to be evaluated per row,
