@@ -1441,9 +1441,10 @@ v1 priorities, in order of measured impact:
 4. Insert cost: a container is copied out and back per insert (bitset fast path exists). Consider an
    in-place add for ARRAY containers with slack and a GIN-style pending list for bulk loads.
 5. IN predicates in the AM and the count pushdown are DONE (§15, amsearcharray), and so are NULL
-   keys (§14, amsearchnulls) and the multi-key opclasses of §17. Range predicates are still not -
-   but the entry ordering they need now exists (§21), so what is left is the strategy numbers
-   (outside the 1..5 §17 uses), the scan-key handling and a bounded entry walk.
+   keys (§14, amsearchnulls) and the multi-key opclasses of §17. Range predicates are §28:
+   strategies 6..9 on every ordered scalar class, a bounded walk of the sorted directory (§21) in
+   the bitmap scan, and in the count pushdown a range that bounds the entry walk driving the count
+   rather than a source of its own.
 6. DONE (§18): page recycling and entry deletion.
 7. Params in the count pushdown; multi-column GROUP BY. Partitions are DONE (§16).
 The per-container visibility-map read (lion_vm_allvisible_mask) is already in: it turned the GROUP BY
@@ -3824,6 +3825,18 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
   recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
   ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
+- **Range predicates on the scalar classes: see §28.** `<`, `<=`, `>=`, `>` and `BETWEEN` as a
+  bounded walk of the sorted directory, in the bitmap scan and - bounding the driving entry walk -
+  in the count pushdown. Its follow-ups, in order of value:
+  - a range on a column that does NOT drive the count (`g, count(*) ... WHERE <range on k> GROUP BY
+    g`, the commonest shape of all; a range under an OR; a range as an FK-join fact filter): either
+    the range as a union SOURCE, built per container key into §15's bitset image so that no entry
+    has to stay located, or §20's (g, k) pair loop with the pair counts summed per group; each with
+    its own cost terms (entries in range per count, or |G| x entries in range pairs);
+  - `min(k)` / `max(k)`: walk from either end of the column to the first entry with a visible row
+    (§26's existence test), printing its key under the value-representation contract; max needs the
+    backward walk §21's leftlink was kept for;
+  - cross-type date/timestamp members (`datecol < now()`), with their equality.
 
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 
@@ -5167,3 +5180,217 @@ answer exactly as it does the ordinary plan's) and column privileges on `d.attr`
 entries VACUUM deleted); EXPLAIN through `lion_explain_norm()`. No new concurrency argument is
 introduced - the fact side is §9 per dimension row and the dimension side is a core scan under the
 same snapshot - so no isolation spec is added.
+
+## 28. Range predicates over the sorted directory (v1)
+
+Formerly §12 item 5. `k < v`, `k <= v`, `k >= v`, `k > v` and `BETWEEN` on a scalar lion column,
+answered by the bitmap scan and by the count pushdown. What §21 made possible is the order: within
+one key column and one kind the directory is sorted by proc 4 first (`(attno, kind, proc 4, hash,
+bytes)`), so the entries a range selects are one contiguous run of VALUE entries, and a range is a
+descent to where that run begins and a leaf walk to where it ends.
+
+### Strategies and opclasses
+
+Four new strategy numbers, in btree's order and after the five §17 uses: **6 `<`, 7 `<=`, 8 `>=`,
+9 `>`** (`LION_STRAT_LT` .. `LION_STRAT_GT`; `amstrategies` 5 -> 9). They are added in place - 0.1
+is unreleased - to every SCALAR class of `pg_lion--0.1.sql` that has proc 4, and to `citext_ops`:
+
+- `integer_ops` and `float_ops` get the four operators for every type pair they already have an
+  equality and a cross-type proc 4 for (`<(int4, int8)` beside `btint48cmp`, and so on), so
+  `int4col < 5000000000::int8` descends exactly as `int4col = 5::int8` does;
+- every other ordered class gets its own type's four: oid, bool, char, name, text (varchar through
+  binary coercion, as for `=`), bpchar, bytea, uuid, date, time, timetz, timestamp, timestamptz,
+  interval, numeric, macaddr, macaddr8, inet, jsonb, pg_lsn, xid8, tid, enum; and citext;
+- `xid_ops` and `cid_ops` get none: they have no proc 4, their directory is in hash order and a range
+  has no run to walk. `array_ops` and `tsvector_ops` get none: their entries are extracted keys, not
+  column values, and `tags < '{a}'` compares whole ARRAYS.
+
+The script rules of 7c6e439 hold: the operators are core's, which an unqualified operator name in an
+extension script finds in pg_catalog first; citext's are named `@extschema:citext@.<` and so on,
+never through the target schema (`test/sql/hardening.sql` plants a `<` there and shows it is not
+the one chosen). Cross-type date/timestamp comparisons (`datecol < now()`) are not added: the lion
+date and timestamp classes have no cross-type EQUALITY either, and a family gains a type pair whole
+or not at all.
+
+**`lionvalidate()`** accepts strategies 6..9 in a scalar family only for a type pair that ALSO has
+proc 4 - the walk needs the comparison, and an operator the index could only answer by testing every
+entry is a promise the AM should not make - and never in a multi-key family. Equality stays required
+for every type pair the family knows, so a range-only pair is still refused.
+
+**What `k op v` means to the index** is what it means to btree: the rows whose key compares so under
+the family's proc 4 for (key type, v's type), under the INDEX's collation. For these families that
+comparison IS the operator's (both are core's btree support), which is the promise §21 already asks
+of proc 4 about strategy 1; an opclass author whose proc 4 disagrees with its `<` gets wrong answers
+from btree as well. Collation is the planner's rule for equality, unchanged: the bitmap scan is only
+offered where `IndexCollMatchesExprColl()` holds, and the pushdown makes the same test in
+`lion_match_index()`. NULL keys never satisfy a range: the walk visits VALUE entries only, so the
+reserved NULL (and EMPTY) entries are never in one.
+
+### The bounded walk (`LionRange`, lion_count.c)
+
+A column's range clauses become one `LionRange`, resolved once per scan (per partition, §16):
+
+- **Each bound's comparison** comes from §21's probe resolution, `lion_probe_init()` for the bound's
+  type, so the walk and the lookups cannot disagree about the order: the column's own proc 4 for its
+  own type or a binary coercion to it, the family's cross-type proc 4 otherwise. A bound for which
+  that resolution finds no comparison - an UNORDERED column, or a family with a cross-type `<` and no
+  cross-type proc 4, which the validator refuses but a hand-edited catalogue could hold - is tested
+  with the OPERATOR itself instead, entry by entry over the column's whole run: correct and linear,
+  and never what a shipped class does.
+- **Positioning.** When every bound has a comparison and the column is ordered, the walk descends to
+  the first entry of the column that does not sort below the first LOWER bound: a search key of kind
+  VALUE with that bound as its key, hash 0 and no stored form, which compares as the smallest member
+  of its run (§21), so the descent lands on the first entry whose proc 4 is at or above the bound.
+  Without a lower bound it starts where the column starts. Either way the scan's resume position is
+  the column's (attno, MINF), so the entries of an earlier column on the landing leaf are passed by
+  the ordinary resume comparison and the bound needs no special case there.
+- **The test per entry.** A reserved entry is skipped. An entry failing a LOWER bound is skipped - the
+  order leads with proc 4, so those are a prefix of what is walked: the landing leaf's entries below
+  the bound, and those below any lower bound other than the one descended with. The first entry
+  failing an UPPER bound ends the walk. With operator tests nothing ends it early.
+- **Several bounds on one column are ANDed into one walk**: `BETWEEN a AND b` is `k >= a AND k <= b`,
+  one descent to `a` and a walk that stops past `b`. An empty range (`k > 5 AND k < 5`), an inverted
+  one (`BETWEEN 9 AND 3`) and bounds outside the key domain need no special case: the walk starts
+  past its end, or runs off the column, or the cross-type comparison says every key is below
+  (`btint48cmp` compares an int4 key with an int8 bound exactly, so `int4col < 5000000000` is every
+  row and `int4col > 5000000000` none, as with btree). NaN sorts above every float in
+  `btfloat8cmp`, as `float8lt` orders it, and -0 ties with 0, whose entry is one (hashfloat8
+  agrees). A NULL bound - a Param that came out NULL - selects nothing, every operator involved being
+  strict.
+
+Resuming, splits, deletes: the walk IS §21's entry scan (`lion_entry_scan_begin_range()`), which
+resumes at "the first key above the last one returned" and so already survives splits and VACUUM's
+entry deletion; what differs is only the leaf it reads first, which a descent chose and which may
+have split since - its entries then moved right, where the walk goes next, and a directory leaf is
+never unlinked (§21). The bitmap walk is `lion_emit_all_keys()`'s copy-a-leaf walk with a start and a
+stop. So there is **no new concurrency argument**. An isolation spec is added all the same
+(`count_range_vacuum_race.spec`, below), because the per-entry §9 argument of the count is the thing
+a reviewer will want to see exercised under a range.
+
+### Bitmap scans (`liongetbitmap()`)
+
+A scan key with strategy 6..9 on a scalar column is a RANGE key. The per-column ranking of §24
+becomes: equality 0, list 1, range 2, null tests 3 - and every range key of the chosen column is
+consumed by the one walk, so `BETWEEN` needs no recheck. A column with an equality or a list as well
+answers that and leaves its range keys to the heap recheck (they can only shrink the result).
+
+The walk emits entry by entry: an INLINE payload from the leaf's private copy, a posting tree through
+`lion_emit_chain()` one page at a time, with nothing pinned between entries. A range of any width
+therefore holds at most one index pin at a time and draws nothing from §15's pin budget - the bitmap
+scan needs no §9 interlock at all, since the executor visits every TID it emits - and its memory is
+the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing.
+
+On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - its answer is a union
+of an unbounded number of entries - so it is answered into a TIDBitmap of its own and INTERSECTED
+(`tbm_intersect()`) with the bitmap of the other columns' tree, and the result is OR-ed into the
+caller's bitmap, which a BitmapOr above may share with its other arms. Two range columns are two such
+bitmaps. It is what core's BitmapAnd does, inside one index scan.
+
+### amcostestimate
+
+`genericcostestimate()` already charges what the walk reads in proportion to the selectivity - that
+share of the index's pages at random_page_cost and of its tuples at cpu_index_tuple_cost - which is
+about the leaves and the posting pages in the range. On top of that the walk is charged per ENTRY:
+`n_distinct(k) x selectivity` of them, each a decode and one comparison per bound. On a low- or
+mid-cardinality column that term is small and the index is a fraction of a btree's, so the lion
+bitmap scan wins; on a near-unique column every row is an entry, the index is larger than the btree
+(an entry header per row) and the entry term adds to the per-row charge, so btree - which also has a
+correlation to exploit, and a lion scan never has one - wins. `test/sql/range.sql` pins both choices.
+
+### Count pushdown: a range BOUNDS the driver, it is never a source
+
+The design question was whether a range should be a count SOURCE - the union of its entries, merged
+k-way like an IN list (§15) - or a restriction on the entry walk that DRIVES the count. It is the
+second, and the reason is §15's own argument: the entries of one scalar column are disjoint, so the
+rows whose `k` is in a range are the disjoint union of the range's entries, and
+
+    count(*) WHERE k IN range AND F  =  sum over the entries e in the range of |e ∩ F|
+
+which is §14's sum-over-all with the walk bounded, while `GROUP BY k WHERE k IN range AND F` is
+§10's group walk bounded the same way. The union has no plan-time size (an IN list's is capped at
+1000 at plan time; a range has whatever entries the data holds), needs every entry located - a pin
+each under §15's budget, NOPIN re-locates and all - and pays a k-way heap per count. The driver form
+holds ONE entry's pin at a time plus the WHERE sources', which is §10's GROUP BY and needs no new §9
+argument: each entry is counted as a single-key count is, intersected with the WHERE sources, and the
+pin on the page its containers came from is kept until they have been through the visibility map.
+The WHERE sets are materialized on their second use as for any GROUP BY (§9), so a selective filter
+is probed in memory, entry after entry.
+
+Accepted (`lion_try_count_path()`), every other rule of §10, §14 and §16 unchanged:
+
+1. **`count(*)`, `count(k)` or `count(col)` under §14's rules, `WHERE <range on k> [AND ...]`**
+   without a GROUP BY: the sum-over-all driver (`LION_FLAG_SUMALL`) with `k` as the driving column
+   and the walk bounded (`LION_FLAG_RANGE`). `count(k)` is answerable because a range proves `k`
+   non-NULL (the operators are strict). Clauses on other columns are the ordinary sources, an
+   `IS NOT NULL` on another column included, and a `k IS NOT NULL` beside the range is dropped as
+   §14 drops the driver's own.
+2. **`GROUP BY k WHERE <range on k> [AND ...]`**: the group walk bounded. The value-representation
+   contract of §10 applies to emitting `k` as it does without a range, and so do the pathkeys of §21
+   - the walk is still in key order.
+3. **`count(DISTINCT k) WHERE <range on k> [AND ...]`** (§26 shape 1, bounded), and
+   **`g, count(DISTINCT k) ... WHERE <range on g> GROUP BY g`** (§26 shape 2 with its OUTER walk
+   bounded). A folded single group does not ask k's NULL entry whether the group exists when the
+   range is on k, because the range excludes exactly those rows.
+4. **Partitioned tables** (§16): shapes 1 and 2, with the range resolved against each partition's own
+   index, key column and heap numbering.
+5. **Params as bounds** (generic plans, nested-loop exec Params): evaluated at scan start with the
+   other clause values (§10); a NULL one makes the count 0, and a GROUP BY empty.
+6. Any number of range clauses on the SAME column, combined into one walk. They are exempt from the
+   one-positive-clause-per-column rule among themselves, and from nothing else.
+
+Declined, and why:
+
+- **A range on a column that does not drive**: `g, count(*) ... WHERE <range on k> GROUP BY g`,
+  `count(DISTINCT g) WHERE <range on k>`, a range beside a two-column GROUP BY, two range columns.
+  Each needs the range as an intersected SOURCE - the union above, or a §20-style (g, k) pair loop
+  summed per group - which are both real designs with their own costs (pairs = |G| x entries in
+  range) and are §23 follow-ups rather than something to ship half-priced. The ordinary plan answers
+  them, now with a lion bitmap scan for the range.
+- **A range under an OR** (§19): the same union, inside another union.
+- **A range beside `=`, `IN` or `IS NULL` on the same column**: two positive clauses on one column,
+  which §10 already leaves to the ordinary plan.
+- **A range as an FK-join fact filter** (§27): the fact filters are sources ANDed with every fk set,
+  so this is the union again.
+- **min(k)/max(k)** (§23). Core's own min/max optimisation (planagg.c) needs an ORDERED index scan -
+  `amcanorder` and `amgettuple` - which lion does not have. Doing it here means a new node shape that
+  PRINTS a value (the value-representation contract), walks from either end to the first entry with a
+  visible row (an existence test per entry, §26), and for max walks backwards, which §21's leftlink
+  allows on paper and nothing reads yet. It fits, but not cleanly enough to ride along with this.
+
+**Cost** (`lion_cost_count_rel()`). The range clauses are not sources: no lookup, no chain and no
+container term of their own. They scale the DRIVER: the entry scan's pages by the fraction of the
+column's entries in range - the combined selectivity of the range clauses alone
+(`clauselist_selectivity()`), which is the right fraction for a column whose rows are spread evenly
+over its values and an overestimate of the walk for a skewed one - and the entries walked
+(`numgroups` of the sum-over-all and distinct walks) by the same fraction of `n_distinct(k)`.
+Everything per entry is then priced exactly as the unbounded walk prices it, which is what makes a
+wide range over a near-unique column lose (a million entries are a million merges) and a range over
+a low-cardinality one win.
+
+**EXPLAIN** prints the driver with its range in place of `(k)` / `(all keys)`:
+`Lion Indexes: ix_d (d >= '2024-01-01'::date AND d < '2024-02-01'::date), ix_s (s = 3)` - a Param
+as `$1` - and `Group Key` and `Distinct Key` as before. `Directory Pages Read` (§21) shows the walk
+is bounded.
+
+**Privileges** (§9). The range operators' functions (`int4lt`, `date_ge`, ...) are WHERE-clause
+functions, so `lion_replaced_functions()` already lists them in `LION_PRIV_EXECUTE`, and the node
+checks EXECUTE on them at startup as the ordinary plan's scan does. `test/sql/range.sql` revokes
+`int4lt` from PUBLIC and gets core's error from both plans.
+
+### Tests
+
+`test/sql/range.sql`, written before the code and shown failing first: every strategy and
+combination (`<`, `<=`, `>`, `>=`, `BETWEEN`, open-ended, empty, inverted, equal bounds, bounds
+outside the key domain), commuted forms (`5 < k`), cross-type int2/int4/int8 and float4/float8 with
+-0, NaN and Infinity, text under the default collation and under `"C"` with a mismatched collation
+declined, citext, numeric, date/timestamp/timestamptz, uuid, bool, enum; NULL keys excluded; a
+multicolumn index (a range on one column and an equality on another, and two ranges); a partial
+index; after deletes and updates (a dirty heap) and after VACUUM (a clean one); every answer equal to
+a sequential scan's. The count pushdown for each accepted shape with its plan and exact answers, each
+decline, Params under `force_generic_plan` (a NULL one included), a partitioned table, the index pins
+of a GROUP BY parked mid-walk (pg_buffercache: one entry's, however wide the range), EXECUTE revoked
+on a range operator, and plan choice with nothing disabled: a lion bitmap scan over btree for a range
+on a low-cardinality column, and btree or a sequential scan over lion on a near-unique one. EXPLAIN
+goes through `lion_explain_norm()`. `test/isolation/count_range_vacuum_race.spec` parks a range count
+with an entry's container pinned while the VACUUM of that entry's dead rows waits, as
+count_vacuum_race.spec does for an equality.
