@@ -4894,13 +4894,40 @@ a dimension column's target-list kind is its position in the child's target list
 descent (the leaf at `lion_heap_page_cost()`'s interpolated cost, capped by the directory's pages:
 dimension rows come in heap order, not key order), a fixed per-count cost for a merge set up and
 torn down (`LION_FKJOIN_COUNT_COST`, 50 `cpu_tuple_cost`, the order §26 measured per test), the fk
-set's containers - `lion_containers_for(heap_pages, rows per fk value)` - once for the set and once
-more per fact filter source it is intersected with, its chain pages (none when its entries are
-INLINE), and a `cpu_tuple_cost` per emitted row; each fact filter's lookup and chain once (located
-once, materialized on second use, §9); and §10's recheck term for the fact rows the dimension rows
-reach - `min(D × rows per fk value, fact rows) × filter selectivity × dirtyfrac` candidates, on
-dirty pages fetched once per query. Nothing charges the whole fact heap: that is what the node
-exists not to read. The Finalize Agg is costed by core.
+set's containers - `lion_containers_for(heap_pages, rows per fk value)` - at §10's two
+`cpu_operator_cost` each, a PROBE into each fact filter's set at the container keys the two have in
+common (`LION_FKJOIN_PROBE_COST`, 30 `cpu_operator_cost`, measured below), the set's chain pages
+(none when its entries are INLINE), and a `cpu_tuple_cost` per emitted row; each fact filter's
+lookup and chain once (located once, materialized on second use, §9); and §10's recheck term for
+the fact rows the dimension rows reach - `min(D × rows per fk value, fact rows) × filter
+selectivity × dirtyfrac` candidates, on dirty pages fetched once per query. Nothing charges the
+whole fact heap: that is what the node exists not to read. The Finalize Agg is costed by core.
+
+The probe term is the one that decides against the node, and it had to be measured: a probe (a
+seek of the materialized filter set and the AND of two containers) costs about ten times what §10
+charges a container. Priced like a container, the node was chosen for `... WHERE f.x = 3 GROUP BY
+d.attr` below at 157 ms against the ordinary plan's 63; at 20 `cpu_operator_cost` it still was
+(23,378 against 28,057); at 30 it is refused, while the same query over a quarter of the
+dimension (39 ms against 67) is still chosen.
+
+**Measured** (2026-09-23, prune slot's PostgreSQL 20devel install - assert-enabled, so ratios and
+not absolute numbers; two million fact rows over 22,728 heap pages with a 40-byte pad, `fk` = a
+hash of the row number over 1..1000, `x` 10 values; a 1000-row dimension with 20 `attr` groups and
+a quarter of its rows `region = 'eu'`; lion indexes on `fk` and `x`; warm cache, best of five,
+`max_parallel_workers_per_gather = 0`). "Ordinary" is the plan the planner makes with the pushdown
+off - on 20devel a hash join over a sequential scan, or with `x = 3` a partial aggregate below the
+join over a bitmap heap scan:
+
+| query | all-visible heap: node | ordinary | every page dirty (5% of rows updated): node | ordinary |
+|---|---|---|---|---|
+| `d.attr, count(*) ... GROUP BY d.attr` | **53.8 ms** | 339 | **272** | 350 |
+| `... WHERE f.x = 3 GROUP BY d.attr` | 157 (refused) | **66** | refused | **73** |
+| `... WHERE f.x = 3 AND d.region = 'eu' GROUP BY d.attr` | **39.8** | 68 | refused | **75** |
+| `count(*) ... WHERE d.attr = 5` (50 dimension rows) | **2.7** | 176 | **101** | 193 |
+
+Bold is the plan the cost model picks. The dirty column is the recheck of §9 at work: every heap
+page holds an updated row, so every candidate TID is resolved against the snapshot, once per page
+per query through the visibility cache.
 
 **Parallelism**: `parallel_safe = false` like the rest; the child may itself be a Gather, which is
 fine below a non-parallel node.
@@ -4940,10 +4967,18 @@ ways round, on a clean heap and on a dirty one (deletes and updates of fact and 
 before VACUUM) - GROUP BY one and two dimension columns and an expression, the ungrouped count with
 a dimension filter, fact filters (`=`, IN, `IS NULL` on another column, OR), NULL fks, NULL
 dimension keys and a NULL group, HAVING, ORDER BY and LIMIT on top, cross-type keys (`int4` fk
-against `int8` pk), text keys, a generic plan with a Param fact filter; the declines - a non-unique
-dimension key, a second join clause, an outer join, fact RLS, a fact column in the output, a
-volatile grouping expression, a partitioned fact; dimension RLS applied (a policy hiding rows
-changes the answer exactly as it does the ordinary plan's) and column privileges on `d.attr`
-enforced; EXPLAIN through `lion_explain_norm()`. No new concurrency argument is introduced - the
-fact side is §9 per dimension row and the dimension side is a core scan under the same snapshot -
-so no isolation spec is added.
+against `int8` pk and `int8` against `int4`), text keys, `count(1)` and `count` of either join
+column, generic plans with Param fact and dimension filters (a NULL one included), and a correlated
+subquery whose dimension filter is an exec Param, so that the node and its child are rescanned per
+outer row; the declines - a non-unique dimension key, a key unique only under another collation
+than the join's (and accepted once a unique index under the join's own exists), a second join
+clause, an outer join, three relations, a fact filter the posting sets cannot answer, a dimension
+key pinned to a constant, fact RLS, a fact column in the output, a volatile grouping expression,
+another aggregate, `count` of a nullable fact column, a partitioned fact and a partitioned
+dimension; the cost model's choice with nothing disabled, including a 50,000-row dimension it must
+refuse unless its own quals leave few rows; dimension RLS applied (a policy hiding rows changes the
+answer exactly as it does the ordinary plan's) and column privileges on `d.attr` enforced; the
+`Join Keys Looked Up` / `Join Keys Without Entry` counters (NULL keys not looked up; keys whose
+entries VACUUM deleted); EXPLAIN through `lion_explain_norm()`. No new concurrency argument is
+introduced - the fact side is §9 per dimension row and the dimension side is a core scan under the
+same snapshot - so no isolation spec is added.
