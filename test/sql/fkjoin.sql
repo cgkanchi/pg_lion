@@ -245,6 +245,14 @@ SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON
 SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k WHERE d.k < 60 GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k WHERE d.k < 60 GROUP BY d.attr', false);
 DROP TABLE lion_fdbig;
+-- a long IN list among the fact filters: every count rebuilds the list's
+-- union, so the node is refused with nothing disabled (the 2026-09-23 review:
+-- priced as one set, 1000 values over 300 dimension rows were chosen at 1.2 s
+-- against 2 ms); forced, it still answers exactly
+SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
+	(SELECT string_agg(quote_literal('k' || i), ', ') FROM generate_series(1, 60) i) || ')') AS p("QUERY PLAN");
+SELECT lion_fj('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
+	(SELECT string_agg(quote_literal('k' || i), ', ') FROM generate_series(1, 60) i) || ')');
 
 -- ---- 3. EXPLAIN ---------------------------------------------------------------
 SET enable_hashjoin = off;
@@ -286,6 +294,10 @@ SELECT lion_fj_counter('SELECT count(*) FROM lion_ff8 f JOIN lion_fd4 d ON f.fk8
 SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = $1 GROUP BY d.attr', '3');
 SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = $1 AND d.region = $2 GROUP BY d.attr', '4, ''eu''');
 SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = $1', 'NULL');
+-- `IN ($1, $2)` has its length at plan time; `= ANY ($1)` does not, and every
+-- count would rebuild a union of however many values it brings: refused
+SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x IN ($1, $2)', '1, 2');
+SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY ($1)', '''{1,2}''');
 -- a correlated subquery: the dimension filter is an exec Param, so the node
 -- (and its child) is rescanned with a new value for every outer row
 SELECT lion_fj('SELECT g, (SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.attr = g.g AND f.x = 2) FROM generate_series(0, 7) g');

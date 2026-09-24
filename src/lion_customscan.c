@@ -170,6 +170,17 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_FKJOIN_PROBE_COST	(30.0 * cpu_operator_cost)
 
 /*
+ * ... and, per count, each SET of a fact filter that is a union (an IN list,
+ * an OR across columns): the count builds its k-way union again (§15), and
+ * each sub-cursor is set up and positioned whether or not the fk set's keys
+ * find anything in it.  Measured as above, 1.5M fact rows and 300 dimension
+ * rows: `t IN (n values)` took 57 ms at n = 30, 199 at 100, 599 at 300 and
+ * 1195 at 1000 - 4 to 6 us per set per count, about 0.8 of the units the
+ * ordinary plan's estimate spends per millisecond of the same run.
+ */
+#define LION_FKJOIN_SET_COST	(80.0 * cpu_tuple_cost)
+
+/*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
  * driven by that index's entry scan; two are the nested loop of
  * lion_next_group2(), whose cost is the product of the two entry counts.
@@ -2660,6 +2671,15 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
  * the set's chain pages, which are none at all when the fk entries are
  * INLINE.  Then a row out.
  *
+ * A fact filter source that is a UNION - an IN list, or an OR across columns,
+ * whose sets are the leaves' and their lists' elements together - is not
+ * located once and then probed like one set: every count builds its k-way
+ * union again (§15), so every count pays for each of its sets
+ * (LION_FKJOIN_SET_COST) and for the union of their containers at the keys it
+ * probes - lion_merge_ops() of the whole source, prorated to those keys.
+ * That was the review's finding: charged as one set, a thousand-value IN list
+ * over 300 dimension rows was chosen at 1.2 s against the hash join's 2 ms.
+ *
  * The fact filters are located once for the whole scan and materialized on
  * their second use (§9), so each is one lookup and one walk of its chain, as
  * a single count prices it.
@@ -2682,7 +2702,12 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	double		wheresel = Min(Max(rel->rows, 1.0) / tuples, 1.0);
 	IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(t->whereidx, joinclause);
 	AttrNumber	fkcol = (AttrNumber) list_nth_int(t->wherecol, joinclause);
-	bool	   *inor = lion_or_leaf_map(ors, list_length(whereclauses));
+	int			nclause = list_length(whereclauses);
+	int		   *orgrp = lion_or_group_map(ors, nclause);
+	int			nsrc = list_length(ors);
+	double	   *srcsets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	double	   *srcmembers = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		nd;
 	double		perkey;
 	double		share;
@@ -2697,6 +2722,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	double		recheck_pages;
 	Cost		run = 0;
 	int			ci = 0;
+	int			sno;
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
@@ -2728,7 +2754,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 			lc4, t->wherecol)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
+		Node	   *clause = (Node *) lfirst(lc2);
 		Selectivity sel;
+		double		nkeys = 1.0;
 		double		cshare;
 		double		cdir;
 		double		cheight = 0;
@@ -2739,28 +2767,67 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 			ci++;
 			continue;
 		}
-		ci++;
 
-		sel = clause_selectivity(root, (Node *) lfirst(lc2), 0, JOIN_INNER,
-								 NULL);
+		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		if (IsA(clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+#if PG_VERSION_NUM >= 170000
+			nkeys = Max(estimate_array_length(root,
+											  (Node *) lsecond(saop->args)),
+						1.0);
+#else
+			nkeys = Max(estimate_array_length((Node *) lsecond(saop->args)),
+						1.0);
+#endif
+		}
 
 		/*
-		 * Every count seeks this clause's sets at the container keys the fk
-		 * set has - the leaves of an OR one by one, since the union's
-		 * sub-cursors are each sought - and a seek finds a container only
-		 * where the clause has one.
+		 * Which source of the AND the clause's sets belong to: its OR's, or
+		 * one of its own (numbered after the ORs).
 		 */
-		probes += Min(cfk, lion_containers_for(heap_pages, tuples * sel));
+		sno = (orgrp[ci] >= 0) ? orgrp[ci] : nsrc + ci;
+		srcsets[sno] += nkeys;
+		srcmembers[sno] += tuples * sel;
+		ci++;
 
+		/* Located once: a lookup per set, and the walk of their chains. */
 		cshare = lion_index_column_share(root, rel, idx,
 										 (AttrNumber) lfirst_int(lc4));
 		cdir = lion_index_dir_pages(idx, &cheight);
 		cpages = Max(((double) idx->pages - 1.0 - cdir) * cshare, 0.0);
 
-		run += random_page_cost + (cheight + 1.0) * 50.0 * cpu_operator_cost;
-		run += Max(1.0, cpages * sel) * seq_page_cost;
+		run += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
+			nkeys * (cheight + 1.0) * 50.0 * cpu_operator_cost;
+		run += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
 	}
-	pfree(inor);
+
+	/*
+	 * Every count seeks each source at the container keys the fk set has, and
+	 * a seek finds a container only where the source has one.  A union source
+	 * builds its k-way union again at every count: each of its sets is set up
+	 * (LION_FKJOIN_SET_COST), and the containers standing at the probed keys
+	 * are merged - lion_merge_ops() of the whole source, prorated to the
+	 * share of the heap's container keys the probes touch.
+	 */
+	for (sno = 0; sno < nclause + nsrc; sno++)
+	{
+		double		cs;
+
+		if (srcsets[sno] <= 0.0)
+			continue;
+		cs = Min(cfk, lion_containers_for(heap_pages, srcmembers[sno]));
+		probes += cs;
+		if (srcsets[sno] > 1.0)
+			run += dimrows *
+				(srcsets[sno] * LION_FKJOIN_SET_COST +
+				 lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
+				 Min(cs / ckeys, 1.0) * cpu_operator_cost);
+	}
+	pfree(orgrp);
+	pfree(srcsets);
+	pfree(srcmembers);
 
 	/*
 	 * The containers: the fk set's own at every count, as §10 charges a
@@ -3433,6 +3500,24 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	}
 	if (!haveagg)
 		return;
+
+	/*
+	 * An IN list whose array is a parameter has no length until the executor
+	 * has it (§15), and every count of this node rebuilds the list's union -
+	 * so its work per dimension row is proportional to a length the cost model
+	 * cannot see.  A single table answers such a list once; here a 43,000-value
+	 * `= ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
+	 * review), so the shape is refused.  Literal lists and `IN ($1, $2)` have
+	 * their length at plan time and are priced per set.
+	 */
+	forboth(l1, wherekinds, l2, whereconsts)
+	{
+		Node	   *val = (Node *) lfirst(l2);
+
+		if (lfirst_int(l1) == LION_CLAUSE_ARRAY &&
+			!IsA(val, Const) && !IsA(val, ArrayExpr))
+			return;
+	}
 
 	/* ---- the join key: one more equality clause on the fact rel ---- */
 	memset(&leaf, 0, sizeof(leaf));

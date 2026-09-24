@@ -4944,6 +4944,11 @@ collatable). It is written against the index list rather than through core's
 collations (its own `XXX`): a unique index under `"C"` does not make a join under a
 case-insensitive collation unique. Lifting the rule is a costing change, not a correctness one.
 
+The proof is therefore a COSTING AND SCOPE GUARD ONLY, and nothing about correctness rests on it
+(2026-09-23 review): because the per-dimension-row sum is exact with duplicates, a unique index that
+is later dropped, becomes invalid, or is deferrable and violated inside the current transaction can
+make the node do more lookups than it was priced for, never give a wrong answer.
+
 ### The join semantics the lookup must reproduce
 
 The count for one dimension row is the §10 count of `f.fk = v` with `v = d.pk` of that row, and a
@@ -4980,6 +4985,14 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   index takes the `PredicateLockRelation()` every index the node opens takes.
 - **One snapshot for both sides.** The child and the count both read `es_snapshot`, so a fact row
   is counted for a dimension row exactly when both are visible to it - which is the join.
+- **The WHERE sets' pins are held across the child.** The fact filters are located once per scan
+  and keep their pins (§9) while the node calls `ExecProcNode()` on the dimension child between
+  counts. A child that runs user code - a slow function in a dimension qual, a `pg_sleep()` - can
+  therefore keep a manual VACUUM of the fact table waiting on its cleanup lock on those index pages
+  for the whole query (2026-09-23 review). That is the exposure every scan that holds a pin while
+  the query runs has - a core index scan parked under a slow qual, or §10's streaming GROUP BY
+  node, whose WHERE pins live from its first group to its last - and not a correctness issue: the
+  VACUUM waits (autovacuum skips the page), and the query ends.
 
 ### Planner integration
 
@@ -5030,6 +5043,26 @@ charges a container. Priced like a container, the node was chosen for `... WHERE
 d.attr` below at 157 ms against the ordinary plan's 63; at 20 `cpu_operator_cost` it still was
 (23,378 against 28,057); at 30 it is refused, while the same query over a quarter of the
 dimension (39 ms against 67) is still chosen.
+
+**A fact filter that is a UNION** - an IN list, or an OR across columns, whose leaves and their
+lists' elements are the union's sets - is priced per SET, per count (2026-09-23 review). It is
+located once, but every count builds its k-way union again (§15): each sub-cursor is set up and
+positioned whether or not the fk set's keys find anything in it, and the containers standing at the
+probed keys are merged. So every count pays `LION_FKJOIN_SET_COST` (80 `cpu_tuple_cost`) per set,
+measured - `t IN (n values)` over 300 dimension rows of a 1.5M-row fact took 57 ms at n = 30, 199
+at 100, 599 at 300 and 1195 at 1000, 4 to 6 us per set per count - plus `lion_merge_ops()` of the
+whole source prorated to the share of the heap's container keys its probes touch. Priced as one
+set, the review's `WHERE f.t IN (1000 texts) AND d.pk < 300` was chosen at 1.2 s against the nested
+loop's 2 ms, and forced with `d.pk < 2000` estimated 7,500 against 10,000 and ran 8.1 s against
+38 ms; it is now refused (326,000 against 10,180), and so are the dense-list shapes where the
+per-count union is worst (`x IN (1, 2)` over 1000 dimension rows: 957 ms, refused, against 108).
+The rows of the table below are unchanged by it.
+
+An IN list whose array is a PARAMETER (`= ANY ($1)`) is refused outright: its length is not known
+until the executor has it (§15), and the node's work per dimension row is proportional to it - a
+43,000-value array over 20,000 dimension rows ran for minutes in the review. A single table
+answers such a list once and keeps accepting it; `IN ($1, $2)` keeps its length at plan time and
+is priced like a literal list.
 
 **Measured** (2026-09-23, prune slot's PostgreSQL 20devel install - assert-enabled, so ratios and
 not absolute numbers; two million fact rows over 22,728 heap pages with a 40-byte pad, `fk` = a

@@ -393,6 +393,32 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk
 (1 row)
 
 DROP TABLE lion_fdbig;
+-- a long IN list among the fact filters: every count rebuilds the list's
+-- union, so the node is refused with nothing disabled (the 2026-09-23 review:
+-- priced as one set, 1000 values over 300 dimension rows were chosen at 1.2 s
+-- against 2 ms); forced, it still answers exactly
+SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
+	(SELECT string_agg(quote_literal('k' || i), ', ') FROM generate_series(1, 60) i) || ')') AS p("QUERY PLAN");
+                                                                                                                                           QUERY PLAN                                                                                                                                            
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Hash Join
+         Hash Cond: (f.fk = d.pk)
+         ->  Bitmap Heap Scan on lion_ff f
+               Recheck Cond: (tk = ANY ('{k1,k2,k3,k4,k5,k6,k7,k8,k9,k10,k11,k12,k13,k14,k15,k16,k17,k18,k19,k20,k21,k22,k23,k24,k25,k26,k27,k28,k29,k30,k31,k32,k33,k34,k35,k36,k37,k38,k39,k40,k41,k42,k43,k44,k45,k46,k47,k48,k49,k50,k51,k52,k53,k54,k55,k56,k57,k58,k59,k60}'::text[]))
+               ->  Bitmap Index Scan on lion_ff_tk
+                     Index Cond: (tk = ANY ('{k1,k2,k3,k4,k5,k6,k7,k8,k9,k10,k11,k12,k13,k14,k15,k16,k17,k18,k19,k20,k21,k22,k23,k24,k25,k26,k27,k28,k29,k30,k31,k32,k33,k34,k35,k36,k37,k38,k39,k40,k41,k42,k43,k44,k45,k46,k47,k48,k49,k50,k51,k52,k53,k54,k55,k56,k57,k58,k59,k60}'::text[]))
+         ->  Hash
+               ->  Seq Scan on lion_fd d
+(9 rows)
+
+SELECT lion_fj('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
+	(SELECT string_agg(quote_literal('k' || i), ', ') FROM generate_series(1, 60) i) || ')');
+       lion_fj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
 -- ---- 3. EXPLAIN ---------------------------------------------------------------
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
@@ -516,6 +542,20 @@ SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.p
     lion_fj_prep     
 ---------------------
  pushed down, 1 rows
+(1 row)
+
+-- `IN ($1, $2)` has its length at plan time; `= ANY ($1)` does not, and every
+-- count would rebuild a union of however many values it brings: refused
+SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x IN ($1, $2)', '1, 2');
+    lion_fj_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY ($1)', '''{1,2}''');
+      lion_fj_prep       
+-------------------------
+ not pushed down, 1 rows
 (1 row)
 
 -- a correlated subquery: the dimension filter is an exec Param, so the node
