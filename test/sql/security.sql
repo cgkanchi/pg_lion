@@ -200,6 +200,19 @@ SELECT lion_index_count('lion_sec_k', 1);
 RESET ROLE;
 REVOKE SELECT (id) ON lion_sec FROM lion_sec_none;
 DROP ROLE lion_sec_none;
+-- A key of a multi-key column (DESIGN.md §17) is not a column value: the
+-- keyed functions hashed a whole tsvector as if it were one and answered a
+-- meaningless count.  They refuse it, as the grouped form always did.
+CREATE TABLE lion_sec_mk (d tsvector NOT NULL);
+INSERT INTO lion_sec_mk SELECT to_tsvector('simple', 'w' || (g % 5)) FROM generate_series(1, 100) g;
+CREATE INDEX lion_sec_mk_d ON lion_sec_mk USING lion (d);
+SELECT lion_index_count('lion_sec_mk_d', 'w1'::tsvector);
+SELECT lion_index_count('lion_sec_mk_d', 'w1'::tsvector, 'lion_sec_mk_d', 'w2'::tsvector);
+SELECT * FROM lion_index_count_stats('lion_sec_mk_d', 'w1'::tsvector);
+SELECT lion_index_count_any('lion_sec_mk_d', ARRAY['w1'::tsvector]);
+SELECT * FROM lion_index_count_group_stats('lion_sec_mk_d');
+SELECT count(*) FROM lion_sec_mk WHERE d @@ 'w1'::tsquery;   -- the question the operator answers
+DROP TABLE lion_sec_mk;
 DROP TABLE lion_sec;
 DROP ROLE lion_sec_reader;
 DROP ROLE lion_sec_other;

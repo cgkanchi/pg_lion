@@ -5236,6 +5236,27 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 							RelationGetRelationName(index)),
 					 errdetail("The index is on type %s.",
 							   format_type_be(index->rd_opcintype[0]))));
+
+		/*
+		 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted
+		 * key, so its entries are not column values: a search key of the
+		 * column's own type - a whole tsvector - is not what any entry holds,
+		 * and hashing and comparing it as if it were answered a meaningless
+		 * count; and a row appears under several entries, so the sum over
+		 * them is not a row count and no single entry is a group either.  The
+		 * keyed functions and the grouped one refuse such a column alike;
+		 * lion_customscan.c refuses to drive a GROUP BY from one for the same
+		 * reason, and answers `@>` or `@@` through lion_extract_query().
+		 */
+		{
+			AttrNumber	col = (wantcol == 0) ? 1 : wantcol;
+
+			if (lion_index_column_state(index, col)->multikey)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
+								col, RelationGetRelationName(index))));
+		}
 	}
 
 	/*
@@ -5598,22 +5619,6 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 	}
 
 	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, attno, &call);
-
-	/*
-	 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted key,
-	 * so its entries are not column values and a row appears under several of
-	 * them: the sum over the entries is not a row count and neither is any
-	 * single entry a group.  lion_customscan.c refuses to drive a GROUP BY
-	 * from such a column for the same reason.
-	 */
-	if (OidIsValid(get_opfamily_proc(call.index[0]->rd_opfamily[attno - 1],
-									 call.index[0]->rd_opcintype[attno - 1],
-									 call.index[0]->rd_opcintype[attno - 1],
-									 LION_EXTRACTVALUE_PROC)))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
-						attno, RelationGetRelationName(call.index[0]))));
 
 	PredicateLockRelation(call.index[0], snapshot);
 
