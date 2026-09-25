@@ -3717,13 +3717,60 @@ lion_container_block_mask(const LionContainer *c)
 
 #ifdef LION_VM_MASK_CHECK
 /*
+ * The comparison below on the blocks of ONE map page, with that page SHARE
+ * locked.  `seg` are the wanted bits, shifted so that bit 0 is block blk.
+ */
+static void
+lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg)
+{
+	Buffer		vmbuf = InvalidBuffer;
+	uint64		expect = 0;
+	uint64		got;
+	uint64		m = seg;
+
+	if (seg == 0)
+		return;
+
+	/* pin the map page, the way visibilitymap_get_status() does */
+	(void) visibilitymap_get_status(heap, blk, &vmbuf);
+	if (!BufferIsValid(vmbuf))
+		return;					/* the fork does not reach it: nothing set */
+
+	LockBuffer(vmbuf, BUFFER_LOCK_SHARE);
+	got = lion_vm_allvisible_page(heap, blk, seg, 0, &vmbuf);
+	while (m != 0)
+	{
+		int			b = pg_rightmost_one_pos64(m);
+
+		m &= m - 1;
+		/* the same page: visibilitymap_get_status() keeps the pin, reads */
+		if ((visibilitymap_get_status(heap, blk + (BlockNumber) b, &vmbuf) &
+			 VISIBILITYMAP_ALL_VISIBLE) != 0)
+			expect |= UINT64CONST(1) << b;
+	}
+	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(vmbuf);
+
+	/* the mask answers whole map bytes: only the wanted bits are compared */
+	Assert((got & seg) == expect);
+}
+
+/*
  * visibilitymap_get_status() for every block that has members - the only bits
  * of the mask the count looks at - must agree with the mask.
  *
- * It legitimately might not, if a concurrent VACUUM or DML changed a bit
- * between the two reads, so the comparison is only made when a fresh read of
- * the whole mask still matches the one under test.  That second read is what
- * keeps this assertion from being a race.
+ * It legitimately might not: both read the map without a lock, and a
+ * concurrent VACUUM or DML may change a bit between the two reads - even
+ * twice, all-visible to not and back (A to B to A), which a second unlocked
+ * read of the mask cannot tell from no change at all, so re-reading the mask
+ * and comparing only when it came out the same was not enough (2026-09-25
+ * review).  So a disagreement is settled by comparing the two again with the
+ * map page SHARE locked: every writer of a map bit - visibilitymap_set(),
+ * visibilitymap_clear(), 19's visibilitymap_set_vmbits() - holds the page
+ * EXCLUSIVE, so under the share lock both read the same bytes and must agree,
+ * and what is compared is what the check is for, the two functions.  The lock
+ * is only ever taken in an assert build, on a disagreement, with no other
+ * buffer locked; a pin on the heap's index pages is all the caller holds.
  */
 static void
 lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
@@ -3731,6 +3778,7 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 {
 	uint64		expect = 0;
 	uint64		m = members;
+	int			n;
 
 	while (m != 0)
 	{
@@ -3742,8 +3790,21 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 			expect |= UINT64CONST(1) << b;
 	}
 
-	if (lion_vm_allvisible_mask(heap, firstblk, members, vmbuf) == allvis)
-		Assert((allvis & members) == expect);
+	if ((allvis & members) == expect)
+		return;
+
+	/* a container's blocks lie on one map page, or on two (see above) */
+	n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
+			   (firstblk % LION_VM_HEAPBLOCKS_PER_PAGE));
+	if (n >= LION_BLOCKS_PER_CONTAINER)
+		lion_vm_mask_check_page(heap, firstblk, members);
+	else
+	{
+		lion_vm_mask_check_page(heap, firstblk,
+								members & ((UINT64CONST(1) << n) - 1));
+		lion_vm_mask_check_page(heap, firstblk + (BlockNumber) n,
+								members >> n);
+	}
 }
 #endif
 
@@ -4356,6 +4417,17 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
  * copy, under the pin the new lookup keeps until the count of it is done
  * (DESIGN.md §15).  One set at a time: the pass holds that one pin.
  *
+ * A MATERIALIZED set has none either: it is a private copy, which is only
+ * ever counted while another source of the same intersection carries the
+ * interlock (lion_posting_set_materialize()).  No caller hands one over on
+ * its own today - the copies are made for the WHERE sets of a GROUP BY, and a
+ * lone set is never copied - but nothing would stop one (2026-09-25 review),
+ * and counting it from the visibility map would be exactly the stale read §9
+ * forbids.  So it is counted from its CHAIN instead, walked page by page
+ * under the cursor's own pins as any located CHAIN set is: the head is the
+ * posting tree's root, which a set keeps for the life of the index (§18),
+ * and a page that no longer belongs to the set ends the walk.
+ *
  * An existence test (DESIGN.md §26) stops after the first container that
  * settles it; the cursor has moved on by then, which is where the §9 ordering
  * says it may.
@@ -4365,11 +4437,21 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 {
 	LionPostingSet fresh;
 	LionSetCursor cur;
+	bool		relocated = false;
 
 	if (ps->nopin)
 	{
 		if (!lion_posting_set_relocate(ps, &fresh))
 			return;
+		ps = &fresh;
+		relocated = true;
+	}
+	else if (ps->mat != NULL)
+	{
+		Assert(ps->found && !ps->is_inline);
+		fresh = *ps;
+		fresh.mat = NULL;		/* the chain itself, not the copy */
+		fresh.budgeted = false;	/* nothing of it is the list's to return */
 		ps = &fresh;
 	}
 
@@ -4384,7 +4466,7 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 	}
 	lion_cursor_close(&cur);
 
-	if (ps == &fresh)
+	if (relocated)
 		lion_posting_set_release(&fresh);
 }
 
