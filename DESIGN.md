@@ -114,14 +114,29 @@ Payloads (all little values are host-endian uint16/uint64, like every other PG o
 
 Representation policy
 - Insert into ARRAY beyond 2048 members ⇒ convert to BITSET. Insert into RUN that would exceed
-  1023 runs ⇒ convert to BITSET.
+  1023 runs ⇒ convert to ARRAY if the members, the new one included, fit one (≤ 2048), else BITSET.
 - Remove from BITSET leaving ≤ 2048 members ⇒ convert to ARRAY. Remove from RUN that would exceed
-  1023 runs (split) ⇒ convert to BITSET. Cardinality may reach 0; the caller deletes empty containers.
+  1023 runs (split) ⇒ the same: ARRAY if the members fit one, else BITSET, which the removal shrinks
+  to ARRAY if it can. Cardinality may reach 0; the caller deletes empty containers.
+  *(The RUN insert used to go straight to BITSET, 2026-09-25 review: 20 runs of 10 (a 90-byte RUN)
+  plus 1003 scattered inserts are 1023 runs of 1203 members, and the next isolated insert made a
+  4104-byte BITSET where a 2416-byte ARRAY holds the same - an ARRAY that fits is never larger than a
+  bitset - and the insert path does not optimize afterwards, so the bitset stayed, and a 4104-byte
+  item cannot share an 8K page with another. The split already ended as an ARRAY, through a bitset;
+  it now converts the same way the insert does.)*
 - `lion_container_optimize()` picks the smallest of the three representations. It is called at bulk
   build time for every container and by VACUUM after modifying a container. It is *not* called on
   every insert (inserts only enforce the size invariant), matching CRoaring's runOptimize semantics.
 - Mutators operate on a caller-supplied buffer of LION_CONTAINER_MAX_SIZE bytes. Page code copies a
   container out of the page into such a buffer, mutates, and writes it back (in place when it fits).
+  The one exception is **growth in place**: the hot-key insert (`lion_insert_container_inplace()`)
+  and its redo (`LION_OP_CONTAINER_ADD`, §25) call `lion_container_add()` on the page item itself,
+  whose allotted length is only its size plus slack. What they rely on, and all they rely on, is
+  that add() writes at most 2 bytes past the size of an ARRAY below 2048 members, 4 past a RUN below
+  1023 runs, and nothing past a BITSET, and never changes the representation of any of them; the
+  conversions above happen only at those limits, which the in-place path checks and refuses. The
+  sparse insert has the same shape: 6 bytes past a segment below 682 pairs (§13). Stated in
+  lion_container.h and lion_sparse.h, and tested on exact-size heap allocations (test/unit).
 
 **Damaged containers** (2026-09-25 review). A container read from disk is data, and a reader checks
 its header and its size (`lion_inline_fetch()`) - not its payload: `lion_container_check()` costs as

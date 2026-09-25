@@ -984,7 +984,7 @@ test_check_rejects(void)
 }
 
 /* ----------------------------------------------------------------
- *					damaged segments (DESIGN.md §13)
+ *		damaged segments, and growth in place (DESIGN.md §13)
  *
  * As in container_test.c: every buffer is a heap allocation of exactly the
  * size under test, so that -fsanitize=address reports any access past it,
@@ -1200,6 +1200,62 @@ test_damaged(uint32 iters, uint64 seed)
 }
 
 /*
+ * lion_sparse.h's contract for the in-place insert and its WAL redo
+ * (lion_insert_segment_inplace(), LION_OP_SPARSE_INS): insert() into a segment
+ * below LION_SPARSE_MAX_PAIRS pairs needs LION_SPARSE_PAIR_SIZE bytes past
+ * its size.  Each insert runs on an allocation of exactly that, and must
+ * leave the bytes an insert into a full-size buffer does.
+ */
+static void
+test_inplace_growth(void)
+{
+	SBuf		full;
+	SBuf		ref;
+	uint32		k;
+	uint32		i;
+
+	phase("insert() within the in-place growth contract");
+	rng_seed(UINT64CONST(0x5EED2100));
+	for (k = 0; k < 200; k++)
+	{
+		uint32		n = (k < 4) ? LION_SPARSE_MAX_PAIRS - 1 - k : rng_below(LION_SPARSE_MAX_PAIRS);
+		Size		alloc;
+		LionContainer *p;
+		uint32		ckey;
+		uint16		lo;
+		bool		dup1 = false;
+		bool		dup2 = false;
+		bool		r1;
+		bool		r2;
+
+		lion_sparse_init(&ref.c, 0);
+		while (ref.c.cardinality < n)
+			(void) lion_sparse_insert(&ref.c, 1000 + rng_below(2 * n + 1),
+									  (uint16) rng_below(LION_CONTAINER_RANGE), NULL);
+		alloc = lion_sparse_size(&ref.c) + LION_SPARSE_PAIR_SIZE;
+
+		for (i = 0; i < 4; i++)
+		{
+			/* before, among and after the ckeys there are */
+			ckey = (i == 0) ? 999 : ((i == 3) ? 1000 + 2 * n + 1 : 1000 + rng_below(2 * n + 1));
+			lo = (uint16) rng_below(LION_CONTAINER_RANGE);
+
+			p = exact_alloc(alloc);
+			memcpy(p, &ref.c, lion_sparse_size(&ref.c));
+			memcpy(&full, &ref, sizeof(full));
+			r1 = lion_sparse_insert(p, ckey, lo, &dup1);
+			r2 = lion_sparse_insert(&full.c, ckey, lo, &dup2);
+			CHECK(r1 && r2 && dup1 == dup2, "insert() in place succeeds as it does in a full buffer");
+			CHECK(lion_sparse_size(p) <= alloc, "insert() in place stays inside the item");
+			CHECK(guard_ok(p, alloc), "insert() in place writes nothing past the item");
+			CHECK(memcmp(p, &full, lion_sparse_size(p)) == 0,
+				  "insert() in place leaves the bytes it leaves in a full buffer");
+			free(p);
+		}
+	}
+}
+
+/*
  * Randomized insert/remove/extract/split/merge sequences against the
  * reference.
  */
@@ -1403,6 +1459,7 @@ main(void)
 	test_iterate_early_stop();
 	test_check_rejects();
 	test_damaged(3000, UINT64CONST(0x5EED2200));
+	test_inplace_growth();
 
 	test_random_ops("random ops, 8 ckeys (dense)", 8, 20000,
 					UINT64CONST(0x5EED2001));

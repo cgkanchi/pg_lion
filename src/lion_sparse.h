@@ -44,6 +44,13 @@
  *	  unaligned and must be copied out with lion_inline_fetch() first, exactly
  *	  like a container.
  *
+ *	  GROWTH IN PLACE: lion_sparse_insert() into a segment of fewer than
+ *	  LION_SPARSE_MAX_PAIRS pairs writes at most lion_sparse_size() +
+ *	  LION_SPARSE_PAIR_SIZE bytes, which is what the in-place insert
+ *	  (lion_insert_segment_inplace()) and its WAL redo (LION_OP_SPARSE_INS)
+ *	  check for before calling it on a page item.  Nothing else may be called
+ *	  on an item in place.
+ *
  *	  DAMAGED INPUT, as for containers (lion_container.h): every function is
  *	  memory-safe for any pairs behind a LION_CT_SPARSE header, never looks
  *	  at more than lion_sparse_npairs() pairs - 4100 bytes - and never leaves

@@ -319,6 +319,37 @@ build_by_append(CBuf *b, const Ref *r)
 			lion_container_append_sorted(&b->c, (uint16) i);
 }
 
+/*
+ * Write the RUN encoding of a reference directly, whatever optimize() would
+ * pick: for shapes where an ARRAY is as small or smaller, which the mutators
+ * can still meet as a RUN (a RUN that grew by insertion is never optimized).
+ */
+static void
+build_run_direct(CBuf *b, const Ref *r)
+{
+	LionRun    *runs = LION_RUN_DATA(&b->c);
+	uint32		n = 0;
+	uint32		i;
+
+	lion_container_init(&b->c, TEST_CKEY);
+	b->c.type = LION_CT_RUN;
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+	{
+		if (!r->m[i])
+			continue;
+		if (i > 0 && r->m[i - 1])
+			runs[n - 1].len_minus_1++;
+		else
+		{
+			runs[n].start = (uint16) i;
+			runs[n].len_minus_1 = 0;
+			n++;
+		}
+	}
+	LION_RUN_NRUNS(&b->c) = (uint16) n;
+	b->c.cardinality = (uint16) r->card;
+}
+
 /* Shared work objects (a Ref is 32KB, so keep them out of the stack). */
 static Ref	ref_a;
 static Ref	ref_b;
@@ -638,6 +669,117 @@ test_run_overflow(void)
 	CHECK(buf_a.c.type == LION_CT_BITSET, "remove_range split overflow -> BITSET");
 	verify_full(&buf_a.c, &ref_a);
 
+	/*
+	 * --- the same overflows when the members fit an ARRAY ---
+	 *
+	 * DESIGN.md §3: 20 runs of 10 are a 90-byte RUN; 1003 scattered inserts
+	 * make it 1023 runs of 1203 members (4102 bytes), and the next isolated
+	 * member needs a 1024th run.  1204 members fit an ARRAY of 2416 bytes,
+	 * which is what the container must become - not a 4104-byte BITSET,
+	 * which the insert path would then have kept (it does not optimize).
+	 */
+	phase("RUN add overflow -> ARRAY when the members fit one");
+	ref_init(&ref_a);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < 20; i++)
+		for (j = 0; j < 10; j++)
+		{
+			(void) lion_container_add(&buf_a.c, (uint16) (i * 20 + j));
+			(void) ref_add(&ref_a, i * 20 + j);
+		}
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN, "20 runs of 10 optimize to RUN");
+	CHECK(lion_container_size(&buf_a.c) == 90, "20 runs of 10 are 90 bytes");
+	for (i = 0; i < 1003; i++)
+	{
+		uint32		lo = 1000 + 2 * i;	/* isolated: every other value */
+
+		CHECK(lion_container_add(&buf_a.c, (uint16) lo), "add a scattered member");
+		(void) ref_add(&ref_a, lo);
+		verify_light(&buf_a.c, &ref_a);
+	}
+	CHECK(buf_a.c.type == LION_CT_RUN, "still a RUN at 1023 runs");
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == LION_RUN_MAX_NRUNS, "1023 runs");
+	CHECK(buf_a.c.cardinality == 1203, "1203 members");
+	CHECK(lion_container_size(&buf_a.c) == 4102, "4102 bytes");
+	verify_full(&buf_a.c, &ref_a);
+
+	CHECK(lion_container_add(&buf_a.c, 30000), "the 1024th run");
+	(void) ref_add(&ref_a, 30000);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "run overflow with 1204 members converts to ARRAY");
+	CHECK(lion_container_size(&buf_a.c) == 2416, "an ARRAY of 1204 members is 2416 bytes");
+	verify_full(&buf_a.c, &ref_a);
+
+	/*
+	 * The boundary: 2047 members plus the new one still fit an ARRAY ...
+	 * (1023 runs of 2, one of them of 3, four apart)
+	 */
+	phase("RUN add overflow at the ARRAY boundary");
+	ref_init(&ref_a);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+	{
+		uint32		len = (i < 1) ? 3 : 2;
+
+		for (j = 0; j < len; j++)
+			(void) ref_add(&ref_a, 4 * i + j);
+	}
+	build_run_direct(&buf_a, &ref_a);
+	CHECK(ref_a.card == 2047, "1023 runs holding 2047 members");
+	verify_full(&buf_a.c, &ref_a);
+	CHECK(lion_container_add(&buf_a.c, 30000), "the 1024th run, 2048th member");
+	(void) ref_add(&ref_a, 30000);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "2048 members after the overflow: ARRAY");
+	verify_full(&buf_a.c, &ref_a);
+
+	/* ... and 2048 plus the new one do not */
+	ref_init(&ref_a);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+	{
+		uint32		len = (i < 2) ? 3 : 2;
+
+		for (j = 0; j < len; j++)
+			(void) ref_add(&ref_a, 4 * i + j);
+	}
+	build_run_direct(&buf_a, &ref_a);
+	CHECK(ref_a.card == 2048, "1023 runs holding 2048 members");
+	verify_full(&buf_a.c, &ref_a);
+	CHECK(lion_container_add(&buf_a.c, 30000), "the 1024th run, 2049th member");
+	(void) ref_add(&ref_a, 30000);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "2049 members after the overflow: BITSET");
+	verify_full(&buf_a.c, &ref_a);
+
+	/* a split that needs a 1024th run with few members goes to ARRAY too */
+	phase("RUN split overflow -> ARRAY when the members fit one");
+	ref_init(&ref_a);
+	for (j = 0; j < 3; j++)
+		(void) ref_add(&ref_a, j);
+	for (i = 1; i < LION_RUN_MAX_NRUNS; i++)
+		(void) ref_add(&ref_a, 4 * i);
+	build_run_direct(&buf_a, &ref_a);
+	CHECK(LION_RUN_NRUNS(&buf_a.c) == LION_RUN_MAX_NRUNS,
+		  "one run of 3 and 1022 singletons are 1023 runs");
+	verify_full(&buf_a.c, &ref_a);
+	CHECK(lion_container_remove(&buf_a.c, 1), "remove the middle of the run of 3");
+	(void) ref_remove(&ref_a, 1);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "the split overflow leaves an ARRAY of 1024");
+	verify_full(&buf_a.c, &ref_a);
+
+	/* 2049 members: the split goes through a BITSET, which shrinks to ARRAY */
+	ref_init(&ref_a);
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+	{
+		uint32		len = (i < 3) ? 3 : 2;
+
+		for (j = 0; j < len; j++)
+			(void) ref_add(&ref_a, 4 * i + j);
+	}
+	build_run_direct(&buf_a, &ref_a);
+	CHECK(ref_a.card == 2049, "1023 runs holding 2049 members");
+	verify_full(&buf_a.c, &ref_a);
+	CHECK(lion_container_remove(&buf_a.c, 1), "remove the middle of the run of 3");
+	(void) ref_remove(&ref_a, 1);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "2048 members after the split: ARRAY");
+	verify_full(&buf_a.c, &ref_a);
 }
 
 static void
@@ -1983,7 +2125,7 @@ test_check_rejects(void)
 }
 
 /* ----------------------------------------------------------------
- *				exact-size buffers (damaged containers)
+ *			exact-size buffers (damaged containers, growth in place)
  *
  * A heap buffer of exactly the size under test, so that a build with
  * -fsanitize=address reports any access past it.  Without the sanitizer a
@@ -2376,6 +2518,104 @@ test_damaged_random(uint32 iters, uint64 seed)
 }
 
 /* ----------------------------------------------------------------
+ *						growth in place
+ *
+ * lion_container.h's contract for the in-place insert and its WAL redo
+ * (lion_insert_container_inplace(), LION_OP_CONTAINER_ADD): add() on an
+ * ARRAY below LION_ARRAY_MAX_CARD members needs 2 bytes past its size, on a
+ * RUN below LION_RUN_MAX_NRUNS runs 4, and a BITSET none.  Each add here
+ * runs on an allocation of exactly that, and must also leave the same bytes
+ * an add in a full-size buffer does - redo depends on the two agreeing.
+ * ----------------------------------------------------------------
+ */
+
+static void
+inplace_add_one(const LionContainer *c, Size alloc, uint16 lo)
+{
+	LionContainer *p = exact_alloc(alloc);
+	Size		size = lion_container_size(c);
+	bool		r1;
+	bool		r2;
+
+	memcpy(p, c, size);
+	memcpy(&buf_e, c, size);
+	r1 = lion_container_add(p, lo);
+	r2 = lion_container_add(&buf_e.c, lo);
+	CHECK(r1 == r2, "add() in place returns what it returns in a full buffer");
+	CHECK(p->type == c->type, "add() in place keeps the representation");
+	CHECK(lion_container_size(p) <= alloc, "add() in place stays inside the item");
+	CHECK(guard_ok(p, alloc), "add() in place writes nothing past the item");
+	CHECK(lion_container_size(p) == lion_container_size(&buf_e.c) &&
+		  memcmp(p, &buf_e, lion_container_size(p)) == 0,
+		  "add() in place leaves the bytes it leaves in a full buffer");
+	free(p);
+}
+
+static void
+test_inplace_growth(void)
+{
+	uint32		i;
+	uint32		k;
+
+	phase("add() within the in-place growth contract");
+	rng_seed(UINT64CONST(0x5EED3001));
+
+	/* ARRAYs from empty to one below the limit */
+	for (k = 0; k < 60; k++)
+	{
+		uint32		n = (k < 3) ? k : ((k < 6) ? LION_ARRAY_MAX_CARD - 1 - (k - 3) :
+									   rng_below(LION_ARRAY_MAX_CARD));
+
+		gen_random(&ref_a, n);
+		build_by_append(&buf_a, &ref_a);
+		CHECK(buf_a.c.type == LION_CT_ARRAY, "an ARRAY below the limit");
+		for (i = 0; i < 8; i++)
+			inplace_add_one(&buf_a.c, lion_container_size(&buf_a.c) + sizeof(uint16),
+							(uint16) (i < 2 ? (i == 0 ? 0 : LION_CONTAINER_RANGE - 1) :
+									  rng_below(LION_CONTAINER_RANGE)));
+	}
+
+	/* RUNs up to one run below the limit, adding in gaps, at ends and next to runs */
+	for (k = 0; k < 60; k++)
+	{
+		uint32		nruns = (k < 4) ? LION_RUN_MAX_NRUNS - 1 : 1 + rng_below(LION_RUN_MAX_NRUNS - 1);
+
+		ref_init(&ref_a);
+		for (i = 0; i < nruns; i++)
+		{
+			uint32		base = 32 * i;
+			uint32		len = 1 + rng_below(8);
+			uint32		j;
+
+			for (j = 0; j < len; j++)
+				(void) ref_add(&ref_a, base + 4 + j);
+		}
+		build_run_direct(&buf_a, &ref_a);
+		CHECK(LION_RUN_NRUNS(&buf_a.c) == nruns, "a RUN below the run limit");
+		for (i = 0; i < 16; i++)
+		{
+			uint32		lo;
+
+			if (i < 4)
+				lo = 32 * rng_below(nruns) + (i == 0 ? 3 : (i == 1 ? 4 : 20));
+			else
+				lo = rng_below(LION_CONTAINER_RANGE);
+			inplace_add_one(&buf_a.c, lion_container_size(&buf_a.c) + sizeof(LionRun),
+							(uint16) lo);
+		}
+	}
+
+	/* BITSETs are always their full size */
+	for (k = 0; k < 10; k++)
+	{
+		gen_typed(&ref_a, &buf_a, LION_CT_BITSET);
+		for (i = 0; i < 8; i++)
+			inplace_add_one(&buf_a.c, LION_CONTAINER_MAX_SIZE,
+							(uint16) rng_below(LION_CONTAINER_RANGE));
+	}
+}
+
+/* ----------------------------------------------------------------
  *					representative sizes (informational)
  * ----------------------------------------------------------------
  */
@@ -2506,6 +2746,7 @@ main(void)
 	rng_seed(UINT64CONST(0x5EED3000));
 	test_damaged_reported();
 	test_damaged_random(3000, UINT64CONST(0x5EED3002));
+	test_inplace_growth();
 
 	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001));
 	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002));
