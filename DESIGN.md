@@ -3026,9 +3026,14 @@ rule too. The guard catches the common, direct changes; it does not certify the 
   index, so an open backend went on reading an ascending directory with a descending comparison
   (0 for 10, even with `prosrc` changed). A syscache callback on PROCOID, registered once per
   backend, now only counts pg_proc invalidations - it runs while invalidations are processed, where
-  no catalog may be read - and `lion_get_index_state()` resolves and checks the recorded
-  comparisons again, in a throw-away state, whenever the count has moved since the cached state
-  last passed; a state that passes is good until the next change. The check therefore runs at the
+  no catalog may be read - and `lion_get_index_state()` checks the cached state's OWN comparisons
+  (the functions its FmgrInfos call) against the recorded identity whenever the count has moved
+  since it last passed; a state that passes is good until the next change. A comparison the catalog
+  would resolve differently today but this state does not call cannot hurt it, and the next state
+  built is checked in full by `lion_fill_index_state()`. The check is skipped while the caller holds
+  a buffer lock or is in a critical section (`InterruptHoldoffCount`, `CritSectionCount`): it reads
+  the catalog, which is no business of a page change half-way through, and the next call made with
+  nothing held does it. The check therefore runs at the
   next use of the index in that backend after the change is seen. A query already running when
   another session commits the change is not protected: its plan and its FmgrInfos were set up
   before, and a SQL function's cached plan follows the new body at its next call - the same
@@ -3056,6 +3061,34 @@ between and verify, a swapped loose proc 4 refused, a renamed proc 4 accepted an
 refused, a SQL-standard comparison built hash-ordered (NOTICE) and still exact after its body is
 reversed, and a citext index that keeps answering exactly (equality, ranges, inserts, verify)
 after `ALTER EXTENSION citext SET SCHEMA` - moved back afterwards for the tests that follow.
+
+**A relcache flush must not free the state, and must not make the write path read the meta page**
+(2026-09-24, found under `debug_discard_caches`, which flushes on every catalog read; ordinary
+invalidation traffic can do the same at any lock acquisition, only rarely). Two things went wrong.
+A flush of an index's relcache entry `pfree()`s `rd_amcache`, and `rd_amcache` WAS the
+`LionIndexState`: every caller that took the state and then read the catalog before it was done -
+the order check itself, a scan resolving a cross-type probe, `lion_index_verify()` comparing text
+keys under a collation - held a pointer into freed memory; the order check read a garbage identity
+and refused every index, and verify crashed. `rd_amcache` is now a HANDLE (`LionAmCache`) on a
+state allocated beside it in `rd_indexcxt`, so a flush frees only the handle and a pointer taken
+earlier stays valid - no longer the entry's current state, and the next `lion_get_index_state()`
+builds a new one, as it always did after a flush. That holds because a flush of an OPEN index entry
+with its support info loaded is, on every release from 16 to 20, the in-place reload
+(`RelationReloadIndexInfo()`: the index branch of 16's and 17's `RelationClearRelation()`, 18-20's
+`RelationRebuildRelation()`), which frees `rd_amcache` and keeps `rd_indexcxt`; the context goes
+only with the entry, in `RelationDestroyRelation()`, which asserts a reference count of zero. So the rule is that a state is valid
+while the caller holds the index open - every caller does, and none keeps one across
+`index_close()` - and a stale state is a correct one: its content is what was built, only no
+longer the entry's. A flush therefore leaves one state behind in `rd_indexcxt` per flush of an open
+index until the entry is destroyed, as it already did for the column states. And `lion_wal_mode()`, asked for when a record
+begins - in a split, with the meta page held EXCLUSIVE - rebuilt the state after a flush, which
+reads the meta page: a second lock on a buffer the backend already holds, an assertion failure on
+a cassert build and a wait for ever on a production one. The mode never changes for a
+relfilenode, so it is remembered per relfilenode the first time a meta page is read
+(`lion_index_meta_wal_mode()`), and the write path never reads one. `test/sql/discard_caches.sql`
+runs counts, ranges, bitmap and plain index scans, a GROUP BY, a count(DISTINCT), an insert and
+verify on text, int, citext and a custom ordered opclass under `debug_discard_caches = 1` where the
+build allows it (assert builds) and without it elsewhere, with one expected output.
 
 **The opclass's functions run under a leaf's share lock.** A descent's binary search, the run scan
 and the range walk of §28 call proc 4, the equality, and - on an unordered column - the range

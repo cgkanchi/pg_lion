@@ -2522,14 +2522,13 @@ lion_source_next(LionSource *src)
 		case LION_SRC_WALK:
 
 			/*
-			 * The walk's column state belongs to the index's relcache entry:
-			 * the LionIndexState is rd_amcache, which a relcache invalidation
-			 * frees - and the executor may accept one between two calls,
-			 * whenever it takes a lock for something else while the scan is
-			 * paused.  The column states themselves live on in rd_indexcxt,
-			 * but not the state they point back to.  So it is looked up again
-			 * here, and the walk and its ranges re-pointed at the rebuilt
-			 * one.  Nothing else the source holds points into it: the
+			 * The walk's column state belongs to the index's relcache entry,
+			 * and a relcache invalidation replaces it - the executor may
+			 * accept one between two calls, whenever it takes a lock for
+			 * something else while the scan is paused.  The old state stays
+			 * valid memory (LionAmCache, lion_pages.c) but is no longer the
+			 * current one, so it is looked up again here, and the walk and its
+			 * ranges re-pointed at the rebuilt one.  Nothing else the source holds points into it: the
 			 * ranges' comparison functions are copies, and the posting-set
 			 * cursors name the index and a block.
 			 */

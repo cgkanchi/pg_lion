@@ -1207,6 +1207,9 @@ extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
 extern void lion_fill_index_state(Relation index, LionIndexState *ix,
 								 const LionMetaPageData *meta,
 								 MemoryContext cxt);
+/* The meta page's wal_mode, remembered per relfilenode (§25; lion_pages.c). */
+extern uint32 lion_index_meta_wal_mode(Relation index);
+
 /* Record on a meta page image the order a build laid the directory out in (§21). */
 extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
 
