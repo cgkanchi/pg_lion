@@ -1,0 +1,78 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s2_predel s1_begin s1_snap s2_delete s1_count s2_pins s3_vacuum s2_wakeup s1_commit s3_count s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM batch_race;
+step s2_predel: DELETE FROM batch_race WHERE id > 190000;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snap: SELECT count(*) FROM batch_race WHERE id < 0;
+count
+-----
+    0
+(1 row)
+
+step s2_delete: DELETE FROM batch_race WHERE k < 50 AND id <= 100000;
+step s1_count: 
+	SELECT count(*) FROM batch_race
+	 WHERE k = ANY (array(SELECT g FROM generate_series(1, 400) g));
+ <waiting ...>
+step s2_pins: 
+	SELECT count(*) BETWEEN 1 AND 64 AS pins_bounded
+	  FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode = pg_relation_filenode('batch_race_k')
+	   AND pinning_backends > 0;
+
+pins_bounded
+------------
+t           
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) batch_race; <waiting ...>
+step s2_wakeup: 
+	SELECT batch_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+count
+-----
+38000
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(*) FROM batch_race
+	 WHERE k = ANY (array(SELECT g FROM generate_series(1, 400) g));
+
+count
+-----
+35550
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('batch_race_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
