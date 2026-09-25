@@ -144,8 +144,11 @@ _PG_init(void)
 	/*
 	 * The resource manager itself, which only registers while
 	 * shared_preload_libraries is being processed (DESIGN.md §25).  The GUC
-	 * it takes its id from is defined either way, so that
-	 * pg_lion.rmgr_id is visible in SHOW on every server.
+	 * it takes its id from, pg_lion.rmgr_id, is a postmaster setting, which
+	 * core refuses to define once the postmaster is up, so it is defined only
+	 * then as well: on a server without the preload SHOW pg_lion.rmgr_id is
+	 * an unknown setting.  lion_wal_init() says which of its GUCs are defined
+	 * either way.
 	 */
 	lion_wal_init();
 
@@ -187,11 +190,17 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amcanhash = false,
 
 		/*
-		 * Every operator of a roaring opfamily agrees on one equivalence
-		 * relation: a scalar family holds nothing but equality operators
-		 * (cross-type ones included), and a multi-key family holds nothing
-		 * but containment/match operators and no equality at all, so
-		 * equality_ops_are_compatible() is never asked about two of those.
+		 * equality_ops_are_compatible() trusts two operators that share a
+		 * family of such an AM to agree on equality.  Every EQUALITY operator
+		 * of a roaring opfamily does: a scalar family's equality operators
+		 * (cross-type ones included) are core's, from one btree family, and
+		 * its range operators - strategies 6 .. 9, DESIGN.md §28 - are
+		 * btree's too and order values consistently with that equality; a
+		 * multi-key family holds containment/match operators and no equality
+		 * at all, so the question is never asked about two of those.
+		 * Ordering is not claimed: lion is not an ordered AM (amcanorder is
+		 * false, §29.8), and the btree families these operators come from
+		 * already answer comparison_ops_are_compatible() for them.
 		 */
 		.amconsistentequality = true,
 		.amconsistentordering = false,
