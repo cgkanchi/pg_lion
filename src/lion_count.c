@@ -80,6 +80,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/memutils.h"
@@ -192,6 +193,33 @@ typedef struct LionCountCtx
 } LionCountCtx;
 
 /*
+ * What the cursors of ONE expression node may hold open at once (DESIGN.md
+ * §15, "Bounded cursors"): memory and buffer pins.  lion_open_budget_init()
+ * sets it from work_mem and from the list pin budget; lion_plan_node() is
+ * what obeys it.
+ */
+typedef struct LionOpenBudget
+{
+	Size		mem;			/* bytes of cursors, staging buffers, images */
+	int			pins;			/* posting pages pinned by cursors */
+} LionOpenBudget;
+
+/*
+ * Floors of the budget.  work_mem may be as small as 64 kB and the list pin
+ * budget may be spent entirely by the lists' own INLINE leaves; a batch of
+ * a few dozen sets still has to fit, or a list would be counted a set or two
+ * at a time.  LION_BATCH_MIN_SETS is the fewest found sets one batch of a
+ * disjoint list takes, and it fits both floors - which is what keeps a batch
+ * from ever being planned as a windowed union.
+ */
+#define LION_OPEN_MIN_BYTES		(256 * 1024)
+#define LION_OPEN_MIN_PINS		16
+#define LION_BATCH_MIN_SETS		16
+
+StaticAssertDecl(LION_BATCH_MIN_SETS <= LION_OPEN_MIN_PINS,
+				 "pg_lion: a minimal batch must fit the pin floor");
+
+/*
  * A posting set's containers copied out of the index, private to the backend
  * and holding no pin.  Containers are MAXALIGNed inside buf so that a BITSET
  * payload keeps its uint64 alignment, and are in ascending ckey order, which
@@ -201,6 +229,7 @@ typedef struct LionMatSet
 {
 	int			ncontainers;
 	Size		bytes;
+	Size		held;			/* what the copy takes from its context */
 	char	   *buf;
 	LionContainer **containers;
 } LionMatSet;
@@ -236,9 +265,17 @@ typedef struct LionSetCursor
 	bool		valid;			/* cur points at a container */
 	const LionContainer *cur;
 
-	/* INLINE sets: offset into the payload copy */
+	/*
+	 * INLINE sets: offset into the payload copy, and the aligned buffer an
+	 * item is copied into (payloads are packed).  The buffer is sized for the
+	 * PAYLOAD, not for the largest item there is: lion_inline_fetch() never
+	 * copies more than is left of the payload, so an entry of three rows
+	 * needs a few dozen bytes where LION_CONTAINER_MAX_SIZE - 4104 bytes, which
+	 * the allocator rounds up to 8 kB - was a whole page per value of an IN
+	 * list (lion_inline_stage_size()).
+	 */
 	Size		payoff;
-	LionContainer *cbuf;			/* aligned staging buffer (payloads are packed) */
+	LionContainer *cbuf;
 
 	/* materialized sets: index into set->mat->containers */
 	int			matidx;
@@ -268,18 +305,33 @@ typedef struct LionSetCursor
 	uint32		seekckey;
 	uint32		mintarget;
 
-	/* the sparse segment being expanded, and how far into its pairs */
+	/*
+	 * The sparse segment being expanded, and how far into its pairs.  segbuf
+	 * receives one container key's members at a time, which a well-formed
+	 * segment keeps below LION_SPARSE_THRESHOLD; it is sized for that and
+	 * grown only if a segment ever holds more (segcap is its capacity).
+	 */
 	const LionContainer *seg;
 	uint32		segpos;
-	LionContainer *segbuf;		/* one container key's members, built here */
+	LionContainer *segbuf;
+	Size		segcap;
 
 	/*
 	 * Pin on the source page of the current container.  For an INLINE set
 	 * this is the LionPostingSet's own bucket-page pin, which the cursor
 	 * borrows and must not release (ownpin is false).
+	 *
+	 * droppins: this cursor carries no DESIGN.md §9 interlock for anyone, so
+	 * it lets go of every posting leaf as soon as it has copied it - because
+	 * the whole walk needs none (cx->droppins), or because the expression
+	 * above it has decided that another cursor carries the interlock or that
+	 * none can (the plan of lion_plan_node(): an AND past the pin budget, a
+	 * windowed union).  A pin that carries no interlock only makes VACUUM
+	 * wait and uses up a buffer.
 	 */
 	Buffer		pinbuf;
 	bool		ownpin;
+	bool		droppins;
 
 	LionCountCtx *cx;			/* for statistics */
 } LionSetCursor;
@@ -608,6 +660,7 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 	ps->cxt = CurrentMemoryContext;
 	ps->nuses = 0;
 	ps->mat = NULL;
+	ps->matfailed = false;
 
 	/*
 	 * lion_fetch_key() points into the page for by-reference types, so copy
@@ -828,13 +881,17 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  *	  literal, so that a literal list pins exactly what it always did - a set
  *	  that is NOPIN costs a second descent in the disjoint sum and the visibility
  *	  map in an OR, and an ordinary query must not pay either;
- *	- an EIGHTH of shared_buffers, so that one backend never pins more than a
- *	  modest fraction of the pool however many lists its query has.  The
- *	  failure this budget exists for was 9000 leaves against a 2048-buffer pool
- *	  (16MB): the query ran itself out of buffers, and one short of that it
- *	  would have starved everyone else.  With an eighth, 256 there, the query
- *	  keeps seven eighths for its own heap, visibility-map and chain pages and
- *	  for every other backend.  It only binds below 64MB of shared_buffers.
+ *	- an EIGHTH of the buffer pool the index is read into, so that one
+ *	  backend never pins more than a modest fraction of the pool however many
+ *	  lists its query has.  The failure this budget exists for was 9000 leaves
+ *	  against a 2048-buffer pool (16MB): the query ran itself out of buffers,
+ *	  and one short of that it would have starved everyone else.  With an
+ *	  eighth, 256 there, the query keeps seven eighths for its own heap,
+ *	  visibility-map and chain pages and for every other backend.  It only
+ *	  binds below 64MB of shared_buffers.  The pool of a TEMPORARY index is
+ *	  the backend's own local buffers, temp_buffers (1024 by default, and as
+ *	  few as 100), which nothing else shares and which run out just the same:
+ *	  "no empty local buffer available" (lion_pin_pool()).
  *
  * Neither depends on the backend's "fair share" (GetAdditionalPinLimit() of
  * 18): that is NBuffers / MaxBackends, 86 buffers on a stock 128MB server, and
@@ -847,11 +904,36 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * zeroed at the end of every top-level transaction, when no set can be left.
  * Between an error and that point it can only be too high, which makes sets
  * NOPIN early - slower, never wrong.
+ *
+ * The CURSORS that read the located sets draw on what is left of the same
+ * limit (lion_open_budget_init()): a CHAIN set pins the posting page its
+ * current container came from, and a list of CHAIN entries located no leaf
+ * pin at all and then pinned a page per value when its cursors were built.
  */
 #define LION_LOOKUP_MAX_PINS	1000
 
 static uint32 lion_list_pins = 0;
 static bool lion_list_pins_cb = false;
+
+/*
+ * The buffer pool a relation's pages are pinned in: the backend's local
+ * buffers for a temporary relation, shared_buffers otherwise.  temp_buffers
+ * cannot change once the session has touched a temporary table, so the
+ * setting is the pool.
+ */
+static int
+lion_pin_pool(Relation rel)
+{
+	if (rel != NULL && RelationUsesLocalBuffers(rel))
+		return num_temp_buffers;
+	return NBuffers;
+}
+
+static uint32
+lion_pin_limit(Relation rel)
+{
+	return (uint32) Min(LION_LOOKUP_MAX_PINS, Max(lion_pin_pool(rel) / 8, 1));
+}
 
 static void
 lion_list_pins_xact(XactEvent event, void *arg)
@@ -871,9 +953,9 @@ lion_list_pins_xact(XactEvent event, void *arg)
 }
 
 static uint32
-lion_list_pin_budget(void)
+lion_list_pin_budget(Relation index)
 {
-	uint32		limit = Min(LION_LOOKUP_MAX_PINS, Max(NBuffers / 8, 1));
+	uint32		limit = lion_pin_limit(index);
 
 	if (!lion_list_pins_cb)
 	{
@@ -881,6 +963,32 @@ lion_list_pin_budget(void)
 		lion_list_pins_cb = true;
 	}
 	return (lion_list_pins < limit) ? limit - lion_list_pins : 0;
+}
+
+/*
+ * The open budget of one count, or of one bitmap walk (DESIGN.md §15,
+ * "Bounded cursors").
+ *
+ *	mem		work_mem: the executor's answer to "how much may one node keep",
+ *			which is what the recheck batch and the visibility cache are
+ *			bounded by as well.  Each is a separate allowance, as the inputs
+ *			of a hash join each get one.
+ *	pins	what the lists this backend has located have left of the list pin
+ *			budget above, so that the leaves a list keeps pinned and the
+ *			pages its cursors pin come out of ONE limit per backend - an
+ *			eighth of the pool, at most a thousand buffers.
+ *
+ * rel names the pool (lion_pin_pool()): the heap for a count, whose indexes
+ * share its persistence, the index for a bitmap walk.
+ */
+static void
+lion_open_budget_init(LionOpenBudget *budget, Relation rel)
+{
+	uint32		limit = lion_pin_limit(rel);
+	uint32		left = (lion_list_pins < limit) ? limit - lion_list_pins : 0;
+
+	budget->mem = Max((Size) work_mem * 1024, (Size) LION_OPEN_MIN_BYTES);
+	budget->pins = (int) Max(left, (uint32) LION_OPEN_MIN_PINS);
 }
 
 /* A set that took a leaf of the budget gives it back. */
@@ -976,7 +1084,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	 */
 	lion_probe_init(index, state, keytype, &probe);
 
-	budget = lion_list_pin_budget();
+	budget = lion_list_pin_budget(index);
 
 	/* A binary coercion - the only one taken - changes no value. */
 	vals = values;
@@ -1282,6 +1390,7 @@ lion_posting_set_release(LionPostingSet *ps)
 	ps->payload = NULL;			/* the memory belongs to the caller's context */
 	ps->paylen = 0;
 	ps->mat = NULL;				/* ... and so does the materialized copy */
+	ps->matfailed = false;
 	ps->nuses = 0;
 	ps->hasstoredkey = false;
 	ps->keyisnull = false;
@@ -1331,9 +1440,14 @@ lion_posting_set_release(LionPostingSet *ps)
  * and rightlink read together under one SHARE lock - so a concurrent page
  * split (which only ever moves items to a new page to the right) cannot make
  * us miss or duplicate a container.
+ *
+ * maxbytes is what the copy may take at most: what is left of the budget of
+ * all the copies one count's sources hold (lion_count_sources_run(); DESIGN.md
+ * §15, "Bounded cursors").  A set that does not fit is given up on for good
+ * (ps->matfailed) and keeps being walked page by page.
  */
 static bool
-lion_posting_set_materialize(LionPostingSet *ps)
+lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 {
 	MemoryContext oldcxt;
 	PGAlignedBlock *imgbuf;
@@ -1412,6 +1526,18 @@ lion_posting_set_materialize(LionPostingSet *ps)
 				break;
 			}
 
+			/*
+			 * ... and whatever it is, once the count's copies are spent.  The
+			 * copy is kept at its exact size (below), so this is what it will
+			 * hold.
+			 */
+			if (sizeof(LionMatSet) + MAXALIGN(used + sz) +
+				sizeof(LionContainer *) * (noffs + 1) > maxbytes)
+			{
+				ok = false;
+				break;
+			}
+
 			while (used + sz > cap)
 			{
 				cap *= 2;
@@ -1457,8 +1583,25 @@ lion_posting_set_materialize(LionPostingSet *ps)
 	{
 		LionMatSet  *mat = (LionMatSet *) palloc(sizeof(LionMatSet));
 
+		/*
+		 * The buffer grew by doubling from a page; what is kept is the exact
+		 * size, because a GROUP BY may keep hundreds of these for as long as
+		 * the relation is counted, and a set of one small segment would
+		 * otherwise hold eight kilobytes.
+		 */
+		if (cap > used)
+		{
+			char	   *exact = (char *) palloc(Max(used, (Size) 1));
+
+			memcpy(exact, buf, used);
+			pfree(buf);
+			buf = exact;
+		}
+
 		mat->ncontainers = noffs;
 		mat->bytes = used;
+		mat->held = sizeof(LionMatSet) + MAXALIGN(Max(used, (Size) 1)) +
+			sizeof(LionContainer *) * Max(noffs, 1);
 		mat->buf = buf;
 		mat->containers = (LionContainer **)
 			palloc(sizeof(LionContainer *) * Max(noffs, 1));
@@ -1486,6 +1629,7 @@ lion_posting_set_materialize(LionPostingSet *ps)
 	else
 	{
 		pfree(buf);
+		ps->matfailed = true;
 	}
 
 	pfree(offs);
@@ -1513,14 +1657,32 @@ lion_cursor_unpin(LionSetCursor *cur)
 	cur->haspage = false;
 }
 
+/*
+ * The staging buffer an INLINE cursor copies its items into.
+ * lion_inline_fetch() copies at most what is left of the payload, header
+ * peek included, so the payload's own length is always enough; it is never
+ * more than LION_CONTAINER_MAX_SIZE, the largest item there is.  palloc()
+ * MAXALIGNs the buffer whatever its length, which is what a BITSET item's
+ * uint64 words need.
+ */
+static inline Size
+lion_inline_stage_size(Size paylen)
+{
+	Size		size = Max(paylen, LION_CONTAINER_HDRSZ + sizeof(uint16));
+
+	return MAXALIGN(Min(size, LION_CONTAINER_MAX_SIZE));
+}
+
 static void
-lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx)
+lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx,
+				 bool droppins)
 {
 	memset(cur, 0, sizeof(LionSetCursor));
 	cur->set = set;
 	cur->cx = cx;
 	cur->pinbuf = InvalidBuffer;
 	cur->nextblk = InvalidBlockNumber;
+	cur->droppins = droppins || cx->droppins;
 
 	if (!set->found)
 		return;
@@ -1532,7 +1694,7 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	}
 	else if (set->is_inline)
 	{
-		cur->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		cur->cbuf = (LionContainer *) palloc(lion_inline_stage_size(set->paylen));
 		cur->payoff = 0;
 		/* borrowed, not owned: the LionPostingSet releases it */
 		cur->pinbuf = set->pinbuf;
@@ -1582,9 +1744,11 @@ lion_cursor_take_page(LionSetCursor *cur, Buffer buf)
 	 * image and nothing else.  Everything the cursor does next - the items,
 	 * the right link, maxckey for a seek - is read from the image, so the pin
 	 * was only ever the §9 interlock, and a pin held across a paused scan
-	 * would make every VACUUM of the table wait for it.
+	 * would make every VACUUM of the table wait for it.  The same holds for
+	 * a cursor the expression above it has told to carry no interlock
+	 * (cur->droppins, see LionSetCursor).
 	 */
-	if (cur->cx->droppins)
+	if (cur->droppins)
 	{
 		UnlockReleaseBuffer(buf);
 		cur->pinbuf = InvalidBuffer;
@@ -1727,6 +1891,8 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	const uint16 *los = LION_SPARSE_LOS_CONST(seg);
 	uint32		n = seg->cardinality;
 	uint32		ckey;
+	uint32		end;
+	Size		need;
 
 	/*
 	 * A seek may have asked for a container key inside this segment's range
@@ -1741,15 +1907,35 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	if (cur->segpos >= n)
 		return false;
 
+	ckey = ckeys[cur->segpos];
+
 	/*
 	 * Allocated on first use, not per cursor: an IN list of a thousand values
 	 * (DESIGN.md §15) is a thousand cursors, and most posting sets hold no
-	 * sparse segment at all.
+	 * sparse segment at all.  And sized for what one container key of a
+	 * segment holds, fewer than LION_SPARSE_THRESHOLD members, rather than
+	 * for the largest container: a sparse column's IN list used to cost a
+	 * second 8 kB per value here.  A segment is not trusted to keep that
+	 * promise, though - the buffer grows to whatever this key's pairs need,
+	 * which an ARRAY container of up to LION_ARRAY_MAX_CARD members and
+	 * LION_CONTAINER_MAX_SIZE beyond that (lion_container_append_sorted()
+	 * turns it into a BITSET) always covers.
 	 */
-	if (cur->segbuf == NULL)
-		cur->segbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	for (end = cur->segpos; end < n && ckeys[end] == ckey; end++)
+		;
+	if (end - cur->segpos > LION_ARRAY_MAX_CARD)
+		need = LION_CONTAINER_MAX_SIZE;
+	else
+		need = LION_CONTAINER_HDRSZ +
+			Max(end - cur->segpos, LION_SPARSE_THRESHOLD) * sizeof(uint16);
+	if (cur->segbuf == NULL || cur->segcap < need)
+	{
+		/* (the old one, if any, goes with the context: only a malformed
+		 * segment can get here twice) */
+		cur->segcap = MAXALIGN(need);
+		cur->segbuf = (LionContainer *) palloc(cur->segcap);
+	}
 
-	ckey = ckeys[cur->segpos];
 	lion_container_init(cur->segbuf, ckey);
 	do
 	{
@@ -2030,6 +2216,15 @@ lion_cursor_close(LionSetCursor *cur)
  * key whose intersection is empty.  That is safe for the reason the merge's
  * own `!alleq` branch is safe: nothing of that container key reaches the
  * visibility map, so no answer rests on it.
+ *
+ * Two shapes keep FEWER pins than that, and both are chosen by the plan
+ * (lion_plan_node(), DESIGN.md §15 "Bounded cursors") only when a node's
+ * children would hold more than the open budget: an AND that keeps pins on
+ * the one child the rule needs (the intersection's members are all in that
+ * child's container, whose page it pins), and a WIDE OR, a windowed union
+ * that holds none (lion_wide_fill()).  The plan says which, and says so in
+ * the same `pinned` the count trusts the visibility map by - a wide union is
+ * never pinned - so no shape can weaken the rule without the count knowing.
  */
 typedef struct LionOrHeapEnt
 {
@@ -2038,13 +2233,74 @@ typedef struct LionOrHeapEnt
 	const LionContainer *cur;	/* sub[child].cur when it was pushed */
 } LionOrHeapEnt;
 
+/*
+ * THE CURSOR PLAN (DESIGN.md §15, "Bounded cursors").
+ *
+ * An expression cursor opens every leaf below it at once, and each open leaf
+ * costs memory - its LionExprCursor and a staging buffer, or a whole page
+ * image for a CHAIN set - and, for a CHAIN set read the pinned way, a buffer
+ * pin from the moment the cursor is built until it moves past its current
+ * page.  Nothing about the query bounded how many leaves that was: an IN list
+ * whose length is a parameter is a leaf per value, and a list of 50000 values
+ * held 880 MB and, over a temporary table, ran out of local buffers.
+ *
+ * So a tree is PLANNED against a budget (LionOpenBudget) before any of its
+ * cursors is built, and the plan says, node by node, how the node's cursor is
+ * built:
+ *
+ *	- an OR whose children would together hold more memory or more pins than
+ *	  the budget is WIDE: a windowed union that opens its children one at a
+ *	  time and holds no pin at all between them (lion_wide_fill());
+ *	- an AND whose children would together hold more PINS than the budget
+ *	  keeps them on ONE child - the first whose containers all come pinned -
+ *	  and every other child lets go of each posting leaf as soon as it has
+ *	  copied it.  §9 asks one pin of an intersection, not one per input, and
+ *	  that is the one it keeps;
+ *	- everything else is built exactly as it was before the budget existed.
+ *
+ * The plan also says whether every container the node yields comes with a
+ * live pin on the page it was copied from - `pinned`, the DESIGN.md §9
+ * property of which lion_count_sources_run() needs one positive source - and
+ * it is decided by the very function that decides the shape, so the two
+ * cannot disagree: a WIDE union is never pinned, and a trimmed AND is pinned
+ * exactly when its designated child is, which is when any child is.
+ *
+ * With no budget (NULL) nothing is ever wide or trimmed.  That is what a
+ * plain index scan's stream gets - §29.5 relies on the pins of every OR child
+ * under a non-MVCC snapshot, and its lists are batched by lion_scan.c
+ * already - and it is how the disjoint-list batching of
+ * lion_count_sources_run() prices a whole list opened at once.
+ */
+typedef struct LionNodePlan
+{
+	const LionKeyNode *node;	/* NULL: a source with no sets, never valid */
+	int			nsub;
+	struct LionNodePlan *sub;	/* the children's plans, nsub of them */
+	bool		wide;			/* OR: a windowed union (lion_wide_fill()) */
+	int			maximg;			/* wide: images one window may hold */
+	int			keep;			/* AND: LION_KEEP_ALL, the child that keeps
+								 * its pins, or LION_KEEP_NONE */
+	bool		pinned;			/* every container comes with a live pin */
+	Size		mem;			/* what its cursors hold open, estimated */
+	int			pins;			/* posting pages its cursors pin at once */
+} LionNodePlan;
+
+#define LION_KEEP_ALL	(-1)
+#define LION_KEEP_NONE	(-2)
+
+struct LionWideOr;				/* a windowed union, below */
+
 typedef struct LionExprCursor
 {
 	const LionKeyNode *node;		/* NULL: an empty source, never valid */
+	const LionNodePlan *plan;	/* how it was built (lion_plan_node()) */
 	LionKeyNodeKind kind;
 
 	/* LION_KN_KEY */
 	LionSetCursor leaf;
+
+	/* LION_KN_OR planned wide: everything is in here instead */
+	struct LionWideOr *wide;
 
 	/* LION_KN_AND / LION_KN_OR */
 	int			nsub;
@@ -2083,9 +2339,480 @@ typedef struct LionExprCursor
 	bool		advance;		/* top level only: took part in this key */
 } LionExprCursor;
 
+static void lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
+							  LionPostingSet *sets, int nsets,
+							  LionCountCtx *cx, bool droppins);
 static void lion_ecursor_build(LionExprCursor *c);
 static void lion_ecursor_next(LionExprCursor *c);
 static void lion_ecursor_seek(LionExprCursor *c, uint32 target);
+static void lion_ecursor_close(LionExprCursor *c);
+
+/* ---- planning a tree against the open budget ---- */
+
+/*
+ * What an allocation of `size` bytes really takes from an AllocSet: small
+ * chunks are rounded up to a power of two, and each carries a header.  An
+ * estimate - the plan needs the order of magnitude, and the rounding is what
+ * made a 4104-byte staging buffer cost 8 kB.
+ */
+static inline Size
+lion_alloc_size(Size size)
+{
+	if (size <= 8192)
+		size = pg_nextpower2_size_t(Max(size, (Size) 8));
+	return size + 16;
+}
+
+/* One leaf: its cursor, and what it copies into or pins. */
+static void
+lion_leaf_cost(const LionPostingSet *ps, bool droppins, Size *mem, int *pins)
+{
+	*mem = sizeof(LionExprCursor);
+	*pins = 0;
+	if (!ps->found || ps->mat != NULL)
+		return;					/* nothing to walk, or a private copy */
+
+	/* the segment buffer, on the first sparse segment (small either way) */
+	*mem += lion_alloc_size(LION_CONTAINER_HDRSZ +
+							LION_SPARSE_THRESHOLD * sizeof(uint16));
+	if (ps->is_inline)
+	{
+		/* the payload is the set's own; the cursor borrows its leaf pin */
+		*mem += lion_alloc_size(lion_inline_stage_size(ps->paylen));
+		return;
+	}
+	*mem += lion_alloc_size(sizeof(PGAlignedBlock));	/* the page image */
+	if (!droppins)
+		*pins = 1;
+}
+
+/* What an OR or AND node of nargs children adds to them. */
+static inline Size
+lion_node_overhead(LionKeyNodeKind kind, int nargs)
+{
+	Size		mem = sizeof(LionExprCursor);
+
+	if (nargs > 1)
+		mem += 2 * lion_alloc_size(LION_CONTAINER_MAX_SIZE);	/* acc[] */
+	if (kind == LION_KN_OR)
+	{
+		mem += 2 * (Size) nargs * sizeof(LionOrHeapEnt);	/* heap, hot */
+		if (nargs > 2)
+			mem += lion_alloc_size(LION_BITSET_BYTES);	/* bits */
+	}
+	return mem;
+}
+
+/*
+ * A windowed union holds its images, their keys, the container it hands out
+ * and two memory contexts' first blocks; the image count is what the budget
+ * pays for, half of it, so that the child open at the time has the other
+ * half.
+ */
+#define LION_WIDE_MIN_IMAGES	8
+
+static int
+lion_wide_images(const LionOpenBudget *budget)
+{
+	Size		n = (budget->mem / 2) / lion_alloc_size(LION_BITSET_BYTES);
+
+	return (int) Min(Max(n, (Size) LION_WIDE_MIN_IMAGES), (Size) (INT_MAX / 2));
+}
+
+static inline Size
+lion_wide_mem(int maximg)
+{
+	return sizeof(LionExprCursor) + 2 * ALLOCSET_DEFAULT_INITSIZE +
+		lion_alloc_size(LION_CONTAINER_MAX_SIZE) +
+		(Size) maximg * (lion_alloc_size(LION_BITSET_BYTES) +
+						 sizeof(uint32) + sizeof(uint64 *));
+}
+
+/*
+ * Plan one node (the comment on LionNodePlan).  With build, p->sub is
+ * allocated and every child is planned into it, which is what a cursor is
+ * then built from; without, the children are evaluated into a scratch plan
+ * and only *p's own fields are filled, which is what the questions below ask
+ * (is it pinned, what would it cost) without allocating a plan per leaf of a
+ * fifty-thousand-value list.  One pass over the tree either way.
+ *
+ * droppins says the cursors of this node will not keep their pins whatever
+ * the plan says (a bitmap walk, a child of a wide union or a trimmed AND):
+ * they cost no pins then, and only memory can make an OR wide.
+ */
+static void
+lion_plan_node(LionNodePlan *p, const LionKeyNode *node,
+			   const LionPostingSet *sets, const LionOpenBudget *budget,
+			   bool droppins, bool build)
+{
+	LionNodePlan scratch;
+	Size		summem;
+	Size		maxmem = 0;
+	int			sumpins = 0;
+	int			firstpinned = -1;
+	int			firstpins = 0;
+	bool		allpinned = true;
+	bool		anypinned = false;
+	int			i;
+
+	check_stack_depth();
+
+	p->node = node;
+	p->nsub = 0;
+	p->sub = NULL;
+	p->wide = false;
+	p->maximg = 0;
+	p->keep = LION_KEEP_ALL;
+	p->pinned = true;
+	p->mem = 0;
+	p->pins = 0;
+
+	if (node == NULL)
+		return;					/* yields nothing: pinned vacuously */
+
+	if (node->kind == LION_KN_KEY)
+	{
+		const LionPostingSet *ps = &sets[node->keyno];
+
+		lion_leaf_cost(ps, droppins, &p->mem, &p->pins);
+		/* the leaf rule of lion_source_pinned() */
+		p->pinned = (!ps->found || (ps->mat == NULL && !ps->nopin));
+		return;
+	}
+
+	Assert(node->nargs >= 1);
+	if (build)
+		p->sub = (LionNodePlan *) palloc0(sizeof(LionNodePlan) * node->nargs);
+	p->nsub = node->nargs;
+
+	summem = lion_node_overhead(node->kind, node->nargs);
+	for (i = 0; i < node->nargs; i++)
+	{
+		LionNodePlan *cp = build ? &p->sub[i] : &scratch;
+
+		lion_plan_node(cp, node->args[i], sets, budget, droppins, build);
+		summem += cp->mem;
+		maxmem = Max(maxmem, cp->mem);
+		sumpins += cp->pins;
+		if (cp->pinned)
+		{
+			anypinned = true;
+			if (firstpinned < 0)
+			{
+				firstpinned = i;
+				firstpins = cp->pins;
+			}
+		}
+		else
+			allpinned = false;
+	}
+
+	if (node->kind == LION_KN_OR)
+	{
+		if (budget != NULL && node->nargs > 1 &&
+			(summem > budget->mem || sumpins > budget->pins))
+		{
+			/*
+			 * Too wide to open at once: a windowed union.  Its children are
+			 * opened one at a time, with no pin kept, so it holds its window
+			 * and the largest child and nothing else - and no container it
+			 * yields has a pin behind it, whatever its children would have
+			 * had (lion_wide_fill()).
+			 */
+			p->wide = true;
+			p->maximg = lion_wide_images(budget);
+			p->mem = lion_wide_mem(p->maximg) + maxmem;
+			p->pins = 0;
+			p->pinned = false;
+		}
+		else
+		{
+			p->mem = summem;
+			p->pins = sumpins;
+			/* which children contributed is not known in advance: all */
+			p->pinned = allpinned;
+		}
+		return;
+	}
+
+	Assert(node->kind == LION_KN_AND);
+	p->mem = summem;
+	/* every child stands at the key the result was built from: any one */
+	p->pinned = anypinned;
+	if (budget != NULL && !droppins && sumpins > budget->pins)
+	{
+		/*
+		 * One pin is all the intersection needs, so only the first child that
+		 * has one at every key keeps its pins; with none that does, no child
+		 * does, because nothing they hold could carry the interlock anyway.
+		 */
+		p->keep = (firstpinned >= 0) ? firstpinned : LION_KEEP_NONE;
+		p->pins = (firstpinned >= 0) ? firstpins : 0;
+	}
+	else
+		p->pins = sumpins;
+}
+
+/* A node's plan, children and all, allocated in the current context. */
+static LionNodePlan *
+lion_plan_build(const LionKeyNode *node, const LionPostingSet *sets,
+				const LionOpenBudget *budget, bool droppins)
+{
+	LionNodePlan *p = (LionNodePlan *) palloc0(sizeof(LionNodePlan));
+
+	lion_plan_node(p, node, sets, budget, droppins, true);
+	return p;
+}
+
+/* ---- the windowed union: an OR too wide to open at once ---- */
+
+/*
+ * A WIDE OR NODE (DESIGN.md §15, "Bounded cursors").
+ *
+ * The k-way merge below opens every child for the whole walk.  A wide union
+ * opens them ONE AT A TIME instead: for a window of container keys it reads
+ * each child, in turn, from the window's first key up to its end, ORs what it
+ * finds into one bitset image per container key, and closes the child before
+ * the next is opened.  The images then come out in ascending key order,
+ * exactly as the merge would have produced them, and the next window starts
+ * at the smallest key any child had past this one.  What it holds is the
+ * window and one child's cursors, whatever the number of children: the
+ * window's images are at most maximg - half the budget - and its END is
+ * not fixed in advance but moves down to whatever key the images run out at,
+ * so a sparse union over a vast heap is still ONE window and a dense one is
+ * as many as it has to be.
+ *
+ * The price is that a child is opened once per window instead of once, and
+ * the pins.  Every child is walked with droppins, so a container the union
+ * yields has no pin behind it at all: a wide union is never `pinned`, and
+ * DESIGN.md §9 needs another positive source to carry the interlock for it,
+ * or the count rechecks every candidate in the heap (cx.novm), exactly as it
+ * does for a set located past the list pin budget.  The disjoint lists that
+ * make most wide unions are not left to this: lion_count_sources_run()
+ * counts them in pinned batches instead, and a union only goes wide where a
+ * batch would not be exact - an OR across columns (§19), a multi-key OR
+ * (§17), the bitmap walk of a multicolumn index.
+ *
+ * Correctness of the window, the part worth arguing:
+ *
+ *	- every child's containers below wend were ORed into the images, because
+ *	  a child is only abandoned at its first key at or past wend;
+ *	- wend only ever moves DOWN while the window is filled.  When the images
+ *	  are all in use and a key arrives that has none, the largest key the
+ *	  window holds is evicted and becomes wend - or, if the new key is larger
+ *	  still, the new key does - so every image left is below the new wend,
+ *	  and whatever an earlier child had between the new wend and the old one
+ *	  was that evicted key alone (it was the largest image);
+ *	- nextkey is the smallest key at or past wend that any child had: each
+ *	  child reports the key it stopped at, and an eviction reports the
+ *	  evicted key, which is below every key an earlier child stopped at.
+ *
+ * So the next window, started at nextkey, misses nothing, and no key is ever
+ * handed out twice because windows never overlap.
+ */
+#define LION_WIDE_END	(((uint64) PG_UINT32_MAX) + 1)	/* past every key */
+
+typedef struct LionWideOr
+{
+	MemoryContext cxt;			/* this struct, the images, the arrays */
+	MemoryContext childcxt;		/* the one child cursor open at a time */
+	LionPostingSet *sets;
+	int			nsets;
+	LionCountCtx *cx;
+	int			maximg;
+	int			nimg;			/* images of this window, keys ascending */
+	int			nalloc;			/* images allocated; img[nimg..] are free */
+	uint32	   *keys;
+	uint64	  **img;
+	int			pos;			/* the image the cursor stands on */
+	uint64		wend;			/* the window ends before this key */
+	uint64		nextkey;		/* where the next window starts, or END */
+	LionContainer *out;			/* img[pos] as a container */
+} LionWideOr;
+
+/*
+ * The image of `key`, made if it has none; NULL when the window is full and
+ * the key is past everything it holds, in which case the key is the new end.
+ */
+static uint64 *
+lion_wide_image(LionWideOr *w, uint32 key)
+{
+	int			lo = 0;
+	int			hi = w->nimg;
+	uint64	   *img;
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (w->keys[mid] < key)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo < w->nimg && w->keys[lo] == key)
+		return w->img[lo];
+
+	if (w->nimg >= w->maximg)
+	{
+		uint32		last = w->keys[w->nimg - 1];
+
+		if (key > last)
+		{
+			/* the window ends here; this key starts the next one */
+			w->wend = key;
+			if (key < w->nextkey)
+				w->nextkey = key;
+			return NULL;
+		}
+
+		/* the largest key leaves the window and ends it; its image is free */
+		w->wend = last;
+		if (last < w->nextkey)
+			w->nextkey = last;
+		w->nimg--;
+	}
+
+	if (w->nimg < w->nalloc)
+		img = w->img[w->nimg];	/* the first free image */
+	else
+	{
+		img = (uint64 *) MemoryContextAlloc(w->cxt, LION_BITSET_BYTES);
+		w->nalloc++;
+	}
+	memset(img, 0, LION_BITSET_BYTES);
+
+	memmove(&w->keys[lo + 1], &w->keys[lo], sizeof(uint32) * (w->nimg - lo));
+	memmove(&w->img[lo + 1], &w->img[lo], sizeof(uint64 *) * (w->nimg - lo));
+	w->keys[lo] = key;
+	w->img[lo] = img;
+	w->nimg++;
+	return img;
+}
+
+/*
+ * Fill the window that starts at `start` (see the comment on LionWideOr).
+ * Each child is built in childcxt with droppins, read up to the window's end,
+ * closed, and its memory reset before the next one is built.
+ */
+static void
+lion_wide_fill(LionExprCursor *c, uint64 start)
+{
+	LionWideOr *w = c->wide;
+	const LionNodePlan *plan = c->plan;
+	int			i;
+
+	Assert(start < LION_WIDE_END);
+	w->nimg = 0;
+	w->pos = 0;
+	w->wend = LION_WIDE_END;
+	w->nextkey = LION_WIDE_END;
+
+	for (i = 0; i < plan->nsub; i++)
+	{
+		LionExprCursor sub;
+		MemoryContext oldcxt = MemoryContextSwitchTo(w->childcxt);
+
+		lion_ecursor_init(&sub, &plan->sub[i], w->sets, w->nsets, w->cx, true);
+		if (sub.valid && (uint64) sub.ckey < start)
+			lion_ecursor_seek(&sub, (uint32) start);
+
+		while (sub.valid)
+		{
+			uint64	   *img;
+
+			if ((uint64) sub.ckey >= w->wend)
+			{
+				if ((uint64) sub.ckey < w->nextkey)
+					w->nextkey = sub.ckey;
+				break;
+			}
+			img = lion_wide_image(w, sub.ckey);
+			if (img == NULL)
+				break;			/* the key is the new end, and next */
+			lion_bits_or_container(img, sub.cur);
+			lion_ecursor_next(&sub);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		lion_ecursor_close(&sub);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextReset(w->childcxt);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+static void
+lion_wide_init(LionExprCursor *c, LionPostingSet *sets, int nsets,
+			   LionCountCtx *cx)
+{
+	MemoryContext cxt;
+	LionWideOr *w;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index union window",
+								ALLOCSET_DEFAULT_SIZES);
+	w = (LionWideOr *) MemoryContextAllocZero(cxt, sizeof(LionWideOr));
+	w->cxt = cxt;
+	w->childcxt = AllocSetContextCreate(cxt, "lion index union child",
+										ALLOCSET_DEFAULT_SIZES);
+	w->sets = sets;
+	w->nsets = nsets;
+	w->cx = cx;
+	w->maximg = Max(c->plan->maximg, 1);
+	w->keys = (uint32 *) MemoryContextAlloc(cxt, sizeof(uint32) * w->maximg);
+	w->img = (uint64 **) MemoryContextAllocZero(cxt,
+												sizeof(uint64 *) * w->maximg);
+	w->out = (LionContainer *) MemoryContextAlloc(cxt, LION_CONTAINER_MAX_SIZE);
+	c->wide = w;
+
+	lion_wide_fill(c, 0);
+}
+
+/* Stand on the first non-empty image at or after pos, filling as needed. */
+static void
+lion_wide_build(LionExprCursor *c)
+{
+	LionWideOr *w = c->wide;
+
+	for (;;)
+	{
+		for (; w->pos < w->nimg; w->pos++)
+		{
+			lion_bits_to_container(w->img[w->pos], w->keys[w->pos], w->out);
+			if (lion_container_cardinality(w->out) > 0)
+			{
+				c->ckey = w->keys[w->pos];
+				c->cur = w->out;
+				c->valid = true;
+				return;
+			}
+		}
+		if (w->nextkey >= LION_WIDE_END)
+			return;				/* every child is exhausted */
+		lion_wide_fill(c, w->nextkey);
+	}
+}
+
+/* Skip every key below target; lion_ecursor_seek() rebuilds afterwards. */
+static void
+lion_wide_seek(LionExprCursor *c, uint32 target)
+{
+	LionWideOr *w = c->wide;
+
+	if ((uint64) target < w->wend)
+	{
+		while (w->pos < w->nimg && w->keys[w->pos] < target)
+			w->pos++;
+	}
+	else
+	{
+		/* past this window: the next one starts at the target, or later */
+		w->pos = w->nimg;
+		if (w->nextkey < LION_WIDE_END && w->nextkey < (uint64) target)
+			w->nextkey = target;
+	}
+}
 
 /* ---- the OR node's min-heap of children, keyed by container key ---- */
 
@@ -2257,16 +2984,24 @@ lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
 #endif
 }
 
+/*
+ * Build the cursor of one planned node (lion_plan_node()).  droppins: carry
+ * no interlock anywhere below - a child of a wide union, a child of a
+ * trimmed AND other than the one that keeps its pins.
+ */
 static void
-lion_ecursor_init(LionExprCursor *c, const LionKeyNode *node,
-				 LionPostingSet *sets, int nsets, LionCountCtx *cx)
+lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
+				 LionPostingSet *sets, int nsets, LionCountCtx *cx,
+				 bool droppins)
 {
+	const LionKeyNode *node = plan->node;
 	int			i;
 
 	check_stack_depth();
 
 	memset(c, 0, sizeof(LionExprCursor));
 	c->node = node;
+	c->plan = plan;
 	if (node == NULL)
 		return;					/* a source with no sets at all */
 
@@ -2275,15 +3010,22 @@ lion_ecursor_init(LionExprCursor *c, const LionKeyNode *node,
 	if (node->kind == LION_KN_KEY)
 	{
 		Assert(node->keyno >= 0 && node->keyno < nsets);
-		lion_cursor_init(&c->leaf, &sets[node->keyno], cx);
+		lion_cursor_init(&c->leaf, &sets[node->keyno], cx, droppins);
+	}
+	else if (plan->wide)
+	{
+		Assert(node->kind == LION_KN_OR);
+		lion_wide_init(c, sets, nsets, cx);
 	}
 	else
 	{
-		Assert(node->nargs >= 1);
+		Assert(node->nargs >= 1 && plan->nsub == node->nargs);
 		c->nsub = node->nargs;
 		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * c->nsub);
 		for (i = 0; i < c->nsub; i++)
-			lion_ecursor_init(&c->sub[i], node->args[i], sets, nsets, cx);
+			lion_ecursor_init(&c->sub[i], &plan->sub[i], sets, nsets, cx,
+							  droppins ||
+							  (plan->keep != LION_KEEP_ALL && plan->keep != i));
 
 		if (c->nsub > 1)
 		{
@@ -2328,6 +3070,12 @@ lion_ecursor_build(LionExprCursor *c)
 
 	if (c->node == NULL)
 		return;
+
+	if (c->wide != NULL)
+	{
+		lion_wide_build(c);
+		return;
+	}
 
 	if (c->kind == LION_KN_KEY)
 	{
@@ -2474,6 +3222,14 @@ lion_ecursor_next(LionExprCursor *c)
 	if (c->node == NULL || !c->valid)
 		return;
 
+	if (c->wide != NULL)
+	{
+		/* the next image; it holds no pin to let go of */
+		c->wide->pos++;
+		lion_ecursor_build(c);
+		return;
+	}
+
 	switch (c->kind)
 	{
 		case LION_KN_KEY:
@@ -2531,6 +3287,13 @@ lion_ecursor_seek(LionExprCursor *c, uint32 target)
 	if (c->node == NULL || !c->valid || c->ckey >= target)
 		return;
 
+	if (c->wide != NULL)
+	{
+		lion_wide_seek(c, target);
+		lion_ecursor_build(c);
+		return;
+	}
+
 	switch (c->kind)
 	{
 		case LION_KN_KEY:
@@ -2584,7 +3347,13 @@ lion_ecursor_close(LionExprCursor *c)
 	if (c->node == NULL)
 		return;
 
-	if (c->kind == LION_KN_KEY)
+	if (c->wide != NULL)
+	{
+		/* no child is open between two calls, and none holds a pin */
+		MemoryContextDelete(c->wide->cxt);
+		c->wide = NULL;
+	}
+	else if (c->kind == LION_KN_KEY)
 		lion_cursor_close(&c->leaf);
 	else
 	{
@@ -2688,40 +3457,24 @@ lion_source_satisfiable(const LionKeyNode *node, const LionPostingSet *sets)
  *	  container key the result was built from and so every child's pin is
  *	  still held when the result is counted;
  *	- an OR has it only if EVERY child has it, because which children
- *	  contributed to a given container key is not known in advance.
+ *	  contributed to a given container key is not known in advance;
+ *	- and an OR too wide for the open budget has it never: it is read as a
+ *	  windowed union whose children keep no pin (DESIGN.md §15, "Bounded
+ *	  cursors").
+ *
+ * That is lion_plan_node()'s `pinned`, and it is asked of it rather than
+ * computed again here, so that what the count trusts and how the cursors are
+ * built are one decision.  budget is the one the cursors will be built with;
+ * NULL means the whole tree opened at once, as a batch of a disjoint list is.
  */
 static bool
-lion_source_pinned(const LionKeyNode *node, const LionPostingSet *sets)
+lion_source_pinned(const LionKeyNode *node, const LionPostingSet *sets,
+				   const LionOpenBudget *budget)
 {
-	int			i;
+	LionNodePlan p;
 
-	if (node == NULL)
-		return true;			/* yields nothing */
-
-	switch (node->kind)
-	{
-		case LION_KN_KEY:
-			return (!sets[node->keyno].found ||
-					(sets[node->keyno].mat == NULL && !sets[node->keyno].nopin));
-
-		case LION_KN_AND:
-			for (i = 0; i < node->nargs; i++)
-			{
-				if (lion_source_pinned(node->args[i], sets))
-					return true;
-			}
-			return false;
-
-		case LION_KN_OR:
-			for (i = 0; i < node->nargs; i++)
-			{
-				if (!lion_source_pinned(node->args[i], sets))
-					return false;
-			}
-			return true;
-	}
-
-	return false;
+	lion_plan_node(&p, node, sets, budget, false, false);
+	return p.pinned;
 }
 
 
@@ -3011,13 +3764,60 @@ lion_container_block_mask(const LionContainer *c)
 
 #ifdef LION_VM_MASK_CHECK
 /*
+ * The comparison below on the blocks of ONE map page, with that page SHARE
+ * locked.  `seg` are the wanted bits, shifted so that bit 0 is block blk.
+ */
+static void
+lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg)
+{
+	Buffer		vmbuf = InvalidBuffer;
+	uint64		expect = 0;
+	uint64		got;
+	uint64		m = seg;
+
+	if (seg == 0)
+		return;
+
+	/* pin the map page, the way visibilitymap_get_status() does */
+	(void) visibilitymap_get_status(heap, blk, &vmbuf);
+	if (!BufferIsValid(vmbuf))
+		return;					/* the fork does not reach it: nothing set */
+
+	LockBuffer(vmbuf, BUFFER_LOCK_SHARE);
+	got = lion_vm_allvisible_page(heap, blk, seg, 0, &vmbuf);
+	while (m != 0)
+	{
+		int			b = pg_rightmost_one_pos64(m);
+
+		m &= m - 1;
+		/* the same page: visibilitymap_get_status() keeps the pin, reads */
+		if ((visibilitymap_get_status(heap, blk + (BlockNumber) b, &vmbuf) &
+			 VISIBILITYMAP_ALL_VISIBLE) != 0)
+			expect |= UINT64CONST(1) << b;
+	}
+	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(vmbuf);
+
+	/* the mask answers whole map bytes: only the wanted bits are compared */
+	Assert((got & seg) == expect);
+}
+
+/*
  * visibilitymap_get_status() for every block that has members - the only bits
  * of the mask the count looks at - must agree with the mask.
  *
- * It legitimately might not, if a concurrent VACUUM or DML changed a bit
- * between the two reads, so the comparison is only made when a fresh read of
- * the whole mask still matches the one under test.  That second read is what
- * keeps this assertion from being a race.
+ * It legitimately might not: both read the map without a lock, and a
+ * concurrent VACUUM or DML may change a bit between the two reads - even
+ * twice, all-visible to not and back (A to B to A), which a second unlocked
+ * read of the mask cannot tell from no change at all, so re-reading the mask
+ * and comparing only when it came out the same was not enough (2026-09-25
+ * review).  So a disagreement is settled by comparing the two again with the
+ * map page SHARE locked: every writer of a map bit - visibilitymap_set(),
+ * visibilitymap_clear(), 19's visibilitymap_set_vmbits() - holds the page
+ * EXCLUSIVE, so under the share lock both read the same bytes and must agree,
+ * and what is compared is what the check is for, the two functions.  The lock
+ * is only ever taken in an assert build, on a disagreement, with no other
+ * buffer locked; a pin on the heap's index pages is all the caller holds.
  */
 static void
 lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
@@ -3025,6 +3825,7 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 {
 	uint64		expect = 0;
 	uint64		m = members;
+	int			n;
 
 	while (m != 0)
 	{
@@ -3036,8 +3837,21 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 			expect |= UINT64CONST(1) << b;
 	}
 
-	if (lion_vm_allvisible_mask(heap, firstblk, members, vmbuf) == allvis)
-		Assert((allvis & members) == expect);
+	if ((allvis & members) == expect)
+		return;
+
+	/* a container's blocks lie on one map page, or on two (see above) */
+	n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
+			   (firstblk % LION_VM_HEAPBLOCKS_PER_PAGE));
+	if (n >= LION_BLOCKS_PER_CONTAINER)
+		lion_vm_mask_check_page(heap, firstblk, members);
+	else
+	{
+		lion_vm_mask_check_page(heap, firstblk,
+								members & ((UINT64CONST(1) << n) - 1));
+		lion_vm_mask_check_page(heap, firstblk + (BlockNumber) n,
+								members >> n);
+	}
 }
 #endif
 
@@ -3650,6 +4464,17 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
  * copy, under the pin the new lookup keeps until the count of it is done
  * (DESIGN.md §15).  One set at a time: the pass holds that one pin.
  *
+ * A MATERIALIZED set has none either: it is a private copy, which is only
+ * ever counted while another source of the same intersection carries the
+ * interlock (lion_posting_set_materialize()).  No caller hands one over on
+ * its own today - the copies are made for the WHERE sets of a GROUP BY, and a
+ * lone set is never copied - but nothing would stop one (2026-09-25 review),
+ * and counting it from the visibility map would be exactly the stale read §9
+ * forbids.  So it is counted from its CHAIN instead, walked page by page
+ * under the cursor's own pins as any located CHAIN set is: the head is the
+ * posting tree's root, which a set keeps for the life of the index (§18),
+ * and a page that no longer belongs to the set ends the walk.
+ *
  * An existence test (DESIGN.md §26) stops after the first container that
  * settles it; the cursor has moved on by then, which is where the §9 ordering
  * says it may.
@@ -3659,15 +4484,25 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 {
 	LionPostingSet fresh;
 	LionSetCursor cur;
+	bool		relocated = false;
 
 	if (ps->nopin)
 	{
 		if (!lion_posting_set_relocate(ps, &fresh))
 			return;
 		ps = &fresh;
+		relocated = true;
+	}
+	else if (ps->mat != NULL)
+	{
+		Assert(ps->found && !ps->is_inline);
+		fresh = *ps;
+		fresh.mat = NULL;		/* the chain itself, not the copy */
+		fresh.budgeted = false;	/* nothing of it is the list's to return */
+		ps = &fresh;
 	}
 
-	lion_cursor_init(&cur, ps, cx);
+	lion_cursor_init(&cur, ps, cx, false);
 	while (cur.valid)
 	{
 		lion_count_container_vm(cx, cur.cur);
@@ -3678,7 +4513,7 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 	}
 	lion_cursor_close(&cur);
 
-	if (ps == &fresh)
+	if (relocated)
 		lion_posting_set_release(&fresh);
 }
 
@@ -3973,8 +4808,10 @@ lion_count_sources(Relation heap, Snapshot snapshot, int nsources,
  * container key, subtract the negated ones, and count what is left against the
  * visibility map.  Everything the caller set up in *cx - the recheck batch, the
  * visibility map pin, the visibility cache, the statistics - is accumulated
- * into, so this may be called more than once for one count.  The disjoint-sum
- * short-circuit below is the caller that does.
+ * into, so this may be called more than once for one count: the batches of a
+ * disjoint list below are the caller that does (lion_run_batches()).  Each
+ * source's cursor is built from its plan (lion_plan_node()); cx->novm must
+ * already say whether any positive source's plan is pinned.
  *
  * This is where DESIGN.md §9 lives; nothing about the interlock changes with
  * how often it runs, because each pass takes its pins, asks the visibility map
@@ -3982,7 +4819,7 @@ lion_count_sources(Relation heap, Snapshot snapshot, int nsources,
  */
 static void
 lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
-			  LionKeyNode **trees)
+			  LionNodePlan **plans)
 {
 	LionExprCursor *cursors;
 	LionContainer *work[2];
@@ -4051,8 +4888,8 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	}
 
 	for (i = 0; i < nsources; i++)
-		lion_ecursor_init(&cursors[i], trees[i], sources[i].sets,
-						 sources[i].nsets, cx);
+		lion_ecursor_init(&cursors[i], plans[i], sources[i].sets,
+						 sources[i].nsets, cx, false);
 
 	/*
 	 * Merge the sources by container key.  Containers are stored in ascending
@@ -4333,18 +5170,17 @@ lion_tree_is_flat_union(const LionKeyNode *node, int nsets)
  * Finally, the short-circuit only applies while this source is the ONLY
  * positive one.  An intersection has to be evaluated container key by
  * container key, and for that the union has to be materialised per key, which
- * is precisely the merge.
+ * is precisely the merge - but the same disjointness still lets the merge take
+ * the list a BATCH of entries at a time and add the passes up
+ * (lion_run_batches()).
  */
 static bool
-lion_sources_disjoint_sum(int nsources, const LionCountSource *sources)
+lion_source_disjoint_list(const LionCountSource *src)
 {
-	const LionCountSource *src = &sources[0];
 	Relation	index = NULL;
 	AttrNumber	attno = 0;
 	int			i;
 
-	if (nsources != 1)
-		return false;
 	if (src->negated || !src->disjoint)
 		return false;
 	if (src->nsets < 2)
@@ -4370,6 +5206,12 @@ lion_sources_disjoint_sum(int nsources, const LionCountSource *sources)
 		return false;
 
 	return !lion_index_column_state(index, attno)->multikey;
+}
+
+static bool
+lion_sources_disjoint_sum(int nsources, const LionCountSource *sources)
+{
+	return nsources == 1 && lion_source_disjoint_list(&sources[0]);
 }
 
 /*
@@ -4510,6 +5352,214 @@ lion_sources_one_set(int nsources, const LionCountSource *sources)
 }
 
 /*
+ * THE BATCHED DISJOINT LIST (DESIGN.md §15, "Bounded cursors").
+ *
+ * The disjoint sum counts a list's entries one at a time, and only when the
+ * list is the only positive source.  Anywhere else - `k = ANY ($1) AND x = 1`,
+ * a dense list the sum would be slow for, a GROUP BY on another column - the
+ * list is a source of the merge, and the merge used to build a cursor for
+ * every entry at once: 17 kB each (8 since the staging buffers were sized)
+ * and, for a CHAIN entry, a buffer pin from the moment it was built.  A list
+ * of 50000 values held 880 MB whatever work_mem said, and a temporary table's
+ * list of 1100 CHAIN entries ran out of local buffers.
+ *
+ * The disjointness that makes the sum exact makes batches exact too.  With
+ * the list's sets S_1 .. S_n pairwise disjoint and cut into batches whose
+ * unions are U_1 .. U_m, R the intersection of the other positive sources and
+ * N the union of the negated ones,
+ *
+ *		|((U_1 ∪ ... ∪ U_m) ∩ R) \ N|  =  Σ_j |(U_j ∩ R) \ N|
+ *
+ * because the (U_j ∩ R) \ N are pairwise disjoint and together make up the
+ * left side.  So the ordinary merge runs once per batch, with the list
+ * replaced by that batch's union, and the passes add up - into cx, which
+ * every pass accumulates into anyway.
+ *
+ * DESIGN.md §9 needs no new argument.  Each pass is an ordinary merge: it
+ * builds its cursors, asks the visibility map under their pins and closes
+ * them before the next pass builds any.  A batch is sized to fit the open
+ * budget, so it is never planned wide, and its union is pinned exactly when
+ * each of its sets is; whether a pass may trust the map is decided per pass,
+ * from that pass's plans.  Across passes the count shares only what the
+ * disjoint sum already shares - the recheck queue, the visibility-map pin,
+ * the visibility cache - and no TID is in two batches, a scalar index holding
+ * a row under exactly one entry.  (A line pointer VACUUM frees between two
+ * passes and an insert reuses under another entry is a row inserted after our
+ * snapshot: invisible to the heap recheck, and its page cannot be all-visible
+ * while our snapshot is registered.)
+ *
+ * The price is that every other source is read once per pass.  A batch is as
+ * large as the budget allows, so an ordinary list is one pass - no batching at
+ * all, lion_batch_source() says -1 - and nothing about it changes.
+ */
+
+/*
+ * The source, if any, that is a disjoint list too large to open at once: the
+ * one whose cursors would hold the most memory, opened whole.  -1 if none.
+ */
+static int
+lion_batch_source(int nsources, const LionCountSource *sources,
+				  LionKeyNode **trees, const LionOpenBudget *budget)
+{
+	int			best = -1;
+	Size		bestmem = 0;
+	int			i;
+
+	for (i = 0; i < nsources; i++)
+	{
+		LionNodePlan p;
+
+		if (!lion_source_disjoint_list(&sources[i]))
+			continue;
+		lion_plan_node(&p, trees[i], sources[i].sets, NULL, false, false);
+		if (p.mem <= budget->mem && p.pins <= budget->pins)
+			continue;
+		if (best < 0 || p.mem > bestmem)
+		{
+			best = i;
+			bestmem = p.mem;
+		}
+	}
+	return best;
+}
+
+/*
+ * Where the batch that starts at sets[start] ends: as many sets as the open
+ * budget allows, and at least LION_BATCH_MIN_SETS that have an entry.  The
+ * sets without one are left out of the batch's union and cost nothing.  The
+ * price is what lion_plan_node() charges for an OR over the found ones, plus
+ * the accumulators it charges only from two or three children on, so that a
+ * batch that fits is never planned wide.
+ */
+static int
+lion_batch_end(const LionCountSource *src, int start,
+			   const LionOpenBudget *budget)
+{
+	Size		mem = lion_node_overhead(LION_KN_OR, 3) -
+		3 * 2 * sizeof(LionOrHeapEnt);
+	int			pins = 0;
+	int			n = 0;
+	int			end;
+
+	for (end = start; end < src->nsets; end++)
+	{
+		Size		m;
+		int			p;
+
+		if (!src->sets[end].found)
+			continue;
+		lion_leaf_cost(&src->sets[end], false, &m, &p);
+		m += 2 * sizeof(LionOrHeapEnt);
+		if (n >= LION_BATCH_MIN_SETS &&
+			(mem + m > budget->mem || pins + p > budget->pins))
+			break;
+		mem += m;
+		pins += p;
+		n++;
+	}
+	return end;
+}
+
+/*
+ * Count the merge of sources[] with sources[b], a disjoint list, taken a
+ * batch at a time (see above).  trees[] are the sources' own; the list's is
+ * rebuilt per batch over the batch's found sets.
+ */
+static void
+lion_run_batches(LionCountCtx *cx, int nsources, LionCountSource *sources,
+				 LionKeyNode **trees, int b, const LionOpenBudget *budget)
+{
+	LionCountSource *list = &sources[b];
+	LionCountSource *pass;
+	LionNodePlan **plans;
+	MemoryContext passcxt;
+	int			start = 0;
+	int			i;
+
+	/* The other sources are planned once: their plans do not change. */
+	plans = (LionNodePlan **) palloc0(sizeof(LionNodePlan *) * nsources);
+	for (i = 0; i < nsources; i++)
+	{
+		if (i != b)
+			plans[i] = lion_plan_build(trees[i], sources[i].sets, budget, false);
+	}
+	pass = (LionCountSource *) palloc(sizeof(LionCountSource) * nsources);
+	memcpy(pass, sources, sizeof(LionCountSource) * nsources);
+
+	/*
+	 * Everything one pass builds - the batch's tree and plan, and every
+	 * cursor of the merge - lives here and is gone before the next pass.
+	 */
+	passcxt = AllocSetContextCreate(CurrentMemoryContext,
+									"lion index count batch",
+									ALLOCSET_DEFAULT_SIZES);
+
+	while (start < list->nsets)
+	{
+		int			end = lion_batch_end(list, start, budget);
+		MemoryContext oldcxt;
+		LionKeyNode **args;
+		int			nargs = 0;
+		int			ncarry = 0;
+
+		oldcxt = MemoryContextSwitchTo(passcxt);
+
+		/* the batch's union, over the sets that have an entry */
+		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (end - start));
+		for (i = start; i < end; i++)
+		{
+			if (!list->sets[i].found)
+				continue;
+			args[nargs] = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+			args[nargs]->kind = LION_KN_KEY;
+			args[nargs]->keyno = i - start;
+			nargs++;
+		}
+
+		if (nargs > 0)
+		{
+			LionKeyNode *tree = args[0];
+
+			if (nargs > 1)
+			{
+				tree = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+				tree->kind = LION_KN_OR;
+				tree->nargs = nargs;
+				tree->args = args;
+			}
+			pass[b].sets = &list->sets[start];
+			pass[b].nsets = end - start;
+			pass[b].tree = tree;
+			plans[b] = lion_plan_build(tree, pass[b].sets, budget, false);
+			Assert(!plans[b]->wide);
+
+			/* §9: does this pass have a positive source that carries it? */
+			for (i = 0; i < nsources; i++)
+			{
+				if (!pass[i].negated && plans[i]->pinned)
+					ncarry++;
+			}
+			cx->novm = (ncarry == 0);
+
+			lion_run_merge(cx, nsources, pass, plans);
+		}
+
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextReset(passcxt);
+		start = end;
+
+		/* An existence test needs one batch with a visible row (§26). */
+		if (lion_exists_settled(cx))
+			break;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	MemoryContextDelete(passcxt);
+	pfree(pass);
+	pfree(plans);
+}
+
+/*
  * The count - or, with exists set, the existence test of DESIGN.md §26 - of
  * (intersection of the positive sources) minus (the negated ones).  Both
  * public forms below are this one function, so that an existence test reads
@@ -4549,11 +5599,15 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	MemoryContext oldcxt;
 	LionCountCtx cx;
 	LionKeyNode **trees;
+	LionOpenBudget budget;
 	int64		result;
 	int			ncarry;
 	bool	   *carry;
 	bool		summed;
 	bool		oneset;
+	int			batchsrc;
+	Size		matheld;
+	Size		matbudget = (Size) work_mem * 1024;
 	int			npositive = 0;
 	int			i;
 	int			j;
@@ -4605,6 +5659,19 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	oneset = !summed && lion_sources_one_set(nsources, sources);
 
 	/*
+	 * Everything else is a merge, and a merge builds every cursor of every
+	 * source at once.  What they may hold open is budgeted (DESIGN.md §15,
+	 * "Bounded cursors"): a disjoint list too big for the budget is taken a
+	 * batch at a time (lion_run_batches()), and any other union too big for
+	 * it is read as a windowed union, pinless (lion_plan_node()).  Both only
+	 * happen past the budget, so an ordinary query is planned exactly as it
+	 * always was.
+	 */
+	lion_open_budget_init(&budget, heap);
+	batchsrc = (summed || oneset) ? -1 :
+		lion_batch_source(nsources, sources, trees, &budget);
+
+	/*
 	 * Decide which sets to serve from a private copy this time (DESIGN.md
 	 * section 9; the argument is on lion_posting_set_materialize()).
 	 *
@@ -4623,26 +5690,42 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 *	   on this index, and therefore from having set all-visible on any
 	 *	   heap page at all.  One source is enough, but there must be one, and
 	 *	   it has to be a positive one that holds a pin at EVERY container key
-	 *	   it yields, which is what lion_source_pinned() decides.
+	 *	   it yields, which is what lion_source_pinned() decides - under the
+	 *	   open budget the cursors will be built with, which makes a union too
+	 *	   wide for it no carrier at all.  A list taken in batches is priced
+	 *	   whole instead: each batch of it is pinned exactly when all of its
+	 *	   sets are.
 	 *
 	 * A negated set may always be copied: a stale copy can only hold TIDs
 	 * whose rows are dead (a live row's key cannot change without the row
 	 * getting a new TID), and subtracting a dead TID cannot take a live row
 	 * out of the count.
+	 *
+	 * And the copies are BUDGETED (DESIGN.md §15, "Bounded cursors").  They
+	 * live as long as the sets do - for a GROUP BY, the whole of a relation's
+	 * turn - and a list on another column made every one of its CHAIN sets a
+	 * copy, up to 256 kB each, with nothing bounding the total.  So all the
+	 * copies this count's sources hold, those made by earlier counts of the
+	 * same sets included, stay within work_mem; a set that does not fit is
+	 * walked page by page, as a set too big to copy always was.
 	 */
 	carry = (bool *) palloc0(sizeof(bool) * nsources);
 	ncarry = 0;
+	matheld = 0;
 	for (i = 0; i < nsources; i++)
 	{
 		for (j = 0; j < sources[i].nsets; j++)
 		{
 			if (sources[i].sets[j].found)
 				sources[i].sets[j].nuses++;
+			if (sources[i].sets[j].mat != NULL)
+				matheld += sources[i].sets[j].mat->held;
 		}
 
 		if (sources[i].negated)
 			continue;
-		carry[i] = lion_source_pinned(trees[i], sources[i].sets);
+		carry[i] = lion_source_pinned(trees[i], sources[i].sets,
+									  i == batchsrc ? NULL : &budget);
 		if (carry[i])
 			ncarry++;
 	}
@@ -4680,9 +5763,18 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 			if (ps->ncontainers > LION_MATERIALIZE_MAX_CONTAINERS &&
 				ps->ntids > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16))
 				continue;		/* hopeless even as an ARRAY of members */
+			if (ps->matfailed)
+				continue;		/* tried, and too big for what was left */
+			if (matheld >= matbudget)
+				continue;		/* the budget is spent */
 
-			if (lion_posting_set_materialize(ps) && !sources[i].negated &&
-				carry[i] && !lion_source_pinned(trees[i], sources[i].sets))
+			if (!lion_posting_set_materialize(ps, matbudget - matheld))
+				continue;
+			matheld += ps->mat->held;
+
+			if (!sources[i].negated && carry[i] &&
+				!lion_source_pinned(trees[i], sources[i].sets,
+									i == batchsrc ? NULL : &budget))
 			{
 				carry[i] = false;
 				ncarry--;
@@ -4770,8 +5862,14 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 * so the map is not asked at all and every candidate goes to the heap,
 	 * as on a standby.  The sum and the one-set count do not need this: they
 	 * locate a NOPIN set again, pinned, before they count it.
+	 *
+	 * The same goes for a union too wide for the open budget, which is read
+	 * without pins (lion_wide_fill()).  Whether any positive source carries
+	 * the interlock is therefore asked of the plans the cursors are built
+	 * from, after the materialization above, by the merge path below - once,
+	 * or once per batch of a list (lion_run_batches()).
 	 */
-	cx.novm = (ncarry == 0 && !summed && !oneset);
+	cx.novm = false;
 	cx.rel_read_only = rel_read_only;
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
@@ -4799,10 +5897,10 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 		/*
 		 * One pass allocates a cursor, a staging buffer for the inline
 		 * payload or a whole page image for a chain, and a buffer for the
-		 * sparse segment it expands: twelve kilobytes or so, a thousand times
-		 * over for the longest list the planner allows.  A context that is
-		 * RESET after each pass hands the same twelve kilobytes out again, so
-		 * the pass runs in cache instead of walking a dozen megabytes of fresh
+		 * sparse segment it expands: up to ten kilobytes or so, a thousand
+		 * times over for the longest list the planner allows.  A context that
+		 * is RESET after each pass hands the same memory out again, so the
+		 * pass runs in cache instead of walking a dozen megabytes of fresh
 		 * memory.  The keeper block is sized to hold all of it, which is what
 		 * makes the reset free.
 		 */
@@ -4831,8 +5929,24 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	}
 	else if (oneset)
 		lion_count_one_set(&cx, &sources[0].sets[0]);
+	else if (batchsrc >= 0)
+		lion_run_batches(&cx, nsources, sources, trees, batchsrc, &budget);
 	else
-		lion_run_merge(&cx, nsources, sources, trees);
+	{
+		LionNodePlan **plans;
+		int			ncarried = 0;
+
+		plans = (LionNodePlan **) palloc(sizeof(LionNodePlan *) * nsources);
+		for (i = 0; i < nsources; i++)
+		{
+			plans[i] = lion_plan_build(trees[i], sources[i].sets, &budget,
+									   false);
+			if (!sources[i].negated && plans[i]->pinned)
+				ncarried++;
+		}
+		cx.novm = (ncarried == 0);
+		lion_run_merge(&cx, nsources, sources, plans);
+	}
 
 	/*
 	 * Everything that could be answered from the visibility map has been;
@@ -4899,9 +6013,15 @@ struct LionSetStream
 								 * which has not been handed out yet */
 };
 
-LionSetStream *
-lion_stream_begin(int nsets, LionPostingSet *sets, LionKeyNode *tree,
-				  bool keeppins)
+/*
+ * budget NULL: every node built as it always was (a plain index scan's
+ * stream, DESIGN.md §29.5, whose pins a non-MVCC snapshot relies on and
+ * whose long lists lion_scan.c batches itself); otherwise the tree is planned
+ * against it (lion_plan_node()), which is what the bitmap walk below wants.
+ */
+static LionSetStream *
+lion_stream_begin_budget(int nsets, LionPostingSet *sets, LionKeyNode *tree,
+						 bool keeppins, const LionOpenBudget *budget)
 {
 	LionSetStream *st = (LionSetStream *) palloc0(sizeof(LionSetStream));
 	LionCountSource src;
@@ -4922,9 +6042,18 @@ lion_stream_begin(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 		return st;
 	}
 
-	lion_ecursor_init(&st->cursor, node, sets, nsets, &st->cx);
+	lion_ecursor_init(&st->cursor,
+					  lion_plan_build(node, sets, budget, !keeppins),
+					  sets, nsets, &st->cx, false);
 	st->first = true;
 	return st;
+}
+
+LionSetStream *
+lion_stream_begin(int nsets, LionPostingSet *sets, LionKeyNode *tree,
+				  bool keeppins)
+{
+	return lion_stream_begin_budget(nsets, sets, tree, keeppins, NULL);
 }
 
 /*
@@ -4972,18 +6101,33 @@ lion_stream_end(LionSetStream *st)
 /*
  * Walk the containers of one expression over located posting sets, without
  * any visibility-map interlock: what a bitmap scan of a multi-key opclass
- * needs (DESIGN.md §17).  Every TID goes to the executor, which visits the
- * heap for all of them, so no pin has anything to protect here - but the
- * cursors take and drop their pins exactly as they do for a count, which is
- * why the very same evaluator serves both.
+ * (DESIGN.md §17) or of several key columns (§24) needs.  Every TID goes to
+ * the executor, which visits the heap for all of them, so no pin has anything
+ * to protect here: the cursors let go of every posting leaf as soon as they
+ * have copied it (they used to keep them, one per CHAIN set of an IN list, for
+ * nothing).  And the tree is planned against work_mem (DESIGN.md §15,
+ * "Bounded cursors"), so a union too wide to open at once - the multicolumn
+ * scan of `k = ANY ($1) AND x = 1` over a list of 100000 values held 1.7 GB -
+ * is read as a windowed union, in ascending container key like any other.
  */
 int64
 lion_sets_iterate(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 				 lion_container_callback cb, void *arg)
 {
-	LionSetStream *st = lion_stream_begin(nsets, sets, tree, true);
+	LionOpenBudget budget;
+	LionSetStream *st;
 	const LionContainer *c;
+	Relation	rel = NULL;
 	int64		total = 0;
+	int			i;
+
+	for (i = 0; i < nsets && rel == NULL; i++)
+	{
+		if (sets[i].found)
+			rel = sets[i].index;
+	}
+	lion_open_budget_init(&budget, rel);
+	st = lion_stream_begin_budget(nsets, sets, tree, false, &budget);
 
 	while ((c = lion_stream_next(st)) != NULL)
 	{
