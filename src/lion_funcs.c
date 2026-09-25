@@ -2,13 +2,19 @@
  *
  * lion_funcs.c
  *		SQL-callable helpers for the lion index (DESIGN.md section 7):
- *		lion_index_stats() and lion_index_verify().
+ *		lion_index_stats(), lion_index_verify(), lion_index_posting_root()
+ *		and lion_index_wal_mode().
  *
  * Both open the index with AccessShareLock and read one page at a time under
  * a SHARE lock, so they run concurrently with inserts; lion_index_verify()
  * additionally holds the SHARE lock of a bucket head page for as long as it
  * is checking that bucket, which pins down the whole bucket (every reader and
  * writer of a key enters through its bucket head) and gives it a stable view.
+ *
+ * With heapallindexed, lion_index_verify() evaluates the index's expressions
+ * and predicate, which are the table owner's code; it runs them as the table
+ * owner, in a security-restricted operation, exactly as amcheck does since
+ * CVE-2022-1552.
  *
  *-------------------------------------------------------------------------
  */
@@ -19,6 +25,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xlog.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
 #include "funcapi.h"
@@ -26,6 +33,7 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -60,6 +68,8 @@ typedef struct LionVerifyState
 	Oid			keyoutfunc;		/* output function of the column being checked */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
 	int64		nheaptuples;
+	bool		showvalues;		/* the CALLER is a superuser; decided before
+								 * the switch to the table owner */
 } LionVerifyState;
 
 /*
@@ -2084,8 +2094,13 @@ lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
 	 * reads past column privileges and row-level security; the message would
 	 * hand them the value, and put it in the server log.  The TID is enough
 	 * to find the row.
+	 *
+	 * "A superuser" means the CALLER, which lion_index_verify() asked before
+	 * it became the table owner: superuser() here would ask about the owner,
+	 * and a table a superuser owns would then show its values to whoever the
+	 * function was granted to.
 	 */
-	if (reservedflag == 0 && !superuser())
+	if (reservedflag == 0 && !vs->showvalues)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("heap tuple (%u,%u) from table \"%s\" is not indexed in \"%s\"",
@@ -2237,19 +2252,75 @@ lion_verify_heapallindexed(LionVerifyState *vs)
 	vs->heapcxt = NULL;
 }
 
+/*
+ * lion_index_verify(regclass, heapallindexed bool)
+ *
+ * The locking and the change of identity are amcheck's
+ * (amcheck_lock_relation_and_check()), for amcheck's reasons.
+ *
+ * THE TABLE IS LOCKED BEFORE THE INDEX, which is the order every command that
+ * takes both follows (DROP INDEX, REINDEX, the executor).  Locking the index
+ * first deadlocks with a transaction that has locked the table and goes on to
+ * drop the index: it waits for our index lock while we wait for its table
+ * lock.  The index's table is therefore looked up before either is locked,
+ * and the lookup is repeated once both are held, because a concurrent DROP
+ * INDEX and CREATE INDEX could have given the Oid to another index meanwhile.
+ * A relation that is not an index has no table at all; opening it as one is
+ * then what reports that.
+ *
+ * THE TABLE OWNER'S CODE RUNS AS THE TABLE OWNER.  With heapallindexed, the
+ * heap scan evaluates the index's expressions and its predicate, and those
+ * are functions the owner chose - and can replace after CREATE INDEX with
+ * anything at all, IMMUTABLE label included.  Run as the caller, which is
+ * normally a superuser checking somebody else's table, they would do whatever
+ * the owner wrote with the superuser's rights (the class of CVE-2022-1552,
+ * which amcheck and REINDEX fixed).  So everything from opening the index on
+ * runs as the table owner, inside a SECURITY_RESTRICTED_OPERATION, with the
+ * GUC changes those functions make confined to a nest level that is rolled
+ * back when the check is over, and - on 17 and later, where the server's own
+ * maintenance commands do the same - with search_path restricted to
+ * pg_catalog and pg_temp.  On an ERROR the (sub)transaction abort restores
+ * the identity and the settings; on the normal path this function does.
+ *
+ * The one decision that has to be the CALLER's is whether the error messages
+ * may carry key values, so it is taken before the switch (showvalues).
+ */
 Datum
 lion_index_verify(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	bool		heapallindexed = PG_GETARG_BOOL(1);
+	LOCKMODE	lockmode = AccessShareLock;
 	LionVerifyState vs;
 	Oid			heapoid;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 
 	memset(&vs, 0, sizeof(vs));
+	vs.showvalues = superuser();
 
-	vs.index = lion_open_index(relid, AccessShareLock);
-	heapoid = IndexGetRelation(relid, false);
-	vs.heap = table_open(heapoid, AccessShareLock);
+	heapoid = IndexGetRelation(relid, true);
+	if (!OidIsValid(heapoid))
+	{
+		/* Not an index: opening it as one raises the error that says so. */
+		index_close(lion_open_index(relid, lockmode), lockmode);
+		elog(ERROR, "could not find the table of index %u", relid);
+	}
+	vs.heap = table_open(heapoid, lockmode);
+
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(vs.heap->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+	RestrictSearchPath();
+
+	vs.index = lion_open_index(relid, lockmode);
+	if (IndexGetRelation(relid, false) != heapoid)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("could not open the table of index \"%s\"",
+						RelationGetRelationName(vs.index))));
 
 	vs.ix = lion_get_index_state(vs.index);
 	vs.nblocks = RelationGetNumberOfBlocks(vs.index);
@@ -2266,8 +2337,13 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	pfree(vs.refs);
 	pfree(vs.cbuf);
 
-	table_close(vs.heap, AccessShareLock);
-	index_close(vs.index, AccessShareLock);
+	/* Undo whatever settings the owner's functions changed, and ... */
+	AtEOXact_GUC(false, save_nestlevel);
+	/* ... be the caller again. */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	index_close(vs.index, lockmode);
+	table_close(vs.heap, lockmode);
 
 	PG_RETURN_VOID();
 }

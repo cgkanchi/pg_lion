@@ -58,6 +58,20 @@
 #define LION_IS_MVCC_LIKE(snapshot)	IsMVCCSnapshot(snapshot)
 #endif
 
+/*
+ * RestrictSearchPath() (17) sets search_path to "pg_catalog, pg_temp" for the
+ * current GUC nest level; 17's maintenance commands - CREATE INDEX, REINDEX,
+ * VACUUM, amcheck - evaluate the table owner's index expressions under it.
+ * 16's evaluate them under the session's search_path, and so does
+ * lion_index_verify() there, which is what makes it evaluate an expression
+ * exactly as that server's own CREATE INDEX did.
+ */
+#include "utils/guc.h"
+
+#if PG_VERSION_NUM < 170000
+#define RestrictSearchPath()	((void) 0)
+#endif
+
 /* vacuum_delay_point() took is_analyze in 18. */
 #if PG_VERSION_NUM >= 180000
 #define lion_vacuum_delay_point()	vacuum_delay_point(false)
