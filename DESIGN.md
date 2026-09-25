@@ -3819,6 +3819,21 @@ stated a different equality (e.g. `bpchar =~~= text` with text semantics on a bp
 'x' and 'x ' differ) and the probe walks the leaves with that equality. test/sql/directory.sql §18
 shows the shortcut answering 100 where the family and the seqscan answer 0.
 
+**Before any of the outcomes above, a value of the column's OWN type needs no resolution** - and
+for a class declared on a POLYMORPHIC type the class's input type does not say what that is
+(2026-09-25 review). `enum_ops` is FOR TYPE anyenum: a scan key names its member by that type
+(`sk_subtype` = anyenum), but the elements of `m IN ('a', 'b')` are of the column's enum, because
+the operator is polymorphic and the parser leaves the array as it is (`make_scalar_array_op()`).
+`lion_probe_init()` took `keytype == opcintype` for the only way to say "own type", so every path
+that probes with the ARRAY's element type - a plain index scan's set tree and its LIST batches
+(§29.3, §29.4), a multicolumn bitmap scan (§24) - looked up an (anyenum, mood) member, found none
+and raised "type mood cannot be compared with index"; only the single-column bitmap scan, which
+probes with `sk_subtype`, worked. For a polymorphic class the own type is now also the column's
+actual type, read from the key column (`LionState.typid`), with domains looked through on both
+sides; a different enum is still not one (its OIDs mean nothing to this column) and still refused.
+`lion_range_add()` had made the same step for range bounds since §28. test/sql/keytypes.sql runs
+every scan shape against a sequential scan on an enum column, a list longer than a batch included.
+
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
 - **Prune on access in the count's heap recheck (PostgreSQL 19+) - implemented.** The argument
