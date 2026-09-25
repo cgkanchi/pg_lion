@@ -6015,7 +6015,13 @@ On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - 
 of an unbounded number of entries - so it is answered into a TIDBitmap of its own and INTERSECTED
 (`tbm_intersect()`) with the bitmap of the other columns' tree, and the result is OR-ed into the
 caller's bitmap, which a BitmapOr above may share with its other arms. Two range columns are two such
-bitmaps. It is what core's BitmapAnd does, inside one index scan.
+bitmaps. It is what core's BitmapAnd does, inside one index scan. `k < ANY (array)` is such a column
+too - its one walk to the widest element goes into a bitmap of its own - although it ranks as a list
+in the per-column choice. *(Deviation from the first version, which sorted columns into set trees
+and walks by that rank alone: the array range went to the set trees, which cannot express it, and was
+dropped for the heap recheck while `lioncostestimate()` and the plain scan both counted it as
+answered - `a < ANY ('{-40,-45}') AND b = 3` handed the heap every row of `b = 3` to throw away
+(2026-09-25 review). `test/sql/range.sql` shows no row removed by the recheck now.)*
 
 ### amcostestimate
 
@@ -6027,6 +6033,13 @@ mid-cardinality column that term is small and the index is a fraction of a btree
 bitmap scan wins; on a near-unique column every row is an entry, the index is larger than the btree
 (an entry header per row) and the entry term adds to the per-row charge, so btree - which also has a
 correlation to exploit, and a lion scan never has one - wins. `test/sql/range.sql` pins both choices.
+
+On a MULTICOLUMN path `genericcostestimate()` prorates by every column's selectivity together,
+while the range column is walked whole whatever the others select; the postings of the range that
+the prorating leaves out are charged on top, and the entries once per window of the plain scan's
+WINDOW shape (§29.11). *(Added 2026-09-25: before it, `a BETWEEN 1 AND 900000 AND b = 5` over a
+million unique `a` was priced at two thirds of the sequential scan and ran 1.4 to 1.6 times as
+long.)*
 
 ### Count pushdown: a range BOUNDS the driver, it is never a source
 
@@ -6252,19 +6265,46 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   Equality, IN, `IS NULL`, multicolumn ANDs and multi-key queries (arrays, tsvector) in mode KEYS
   all take this shape.
 - **WALK**: one scalar column's chosen qual is a range (§28, including `op ANY (array)`), an
-  `IS NOT NULL`, or the scan has no key at all (a partial index whose predicate the query implies,
-  §24, which walks column 1 with its NULL entry). The column's entries are walked in directory
-  order exactly as the bitmap walk does (`lion_emit_all_keys_ext()`: copy a leaf, release it,
-  test each entry with `lion_range_test()`, stop at the first entry past an upper bound or of the
-  next column), and each selected entry is streamed as `AND(entry, rest)`, where `rest` is the set
-  tree of the other columns' chosen quals (empty for a one-column scan). Within one entry the TIDs
-  come out in heap order; across entries in key order. A second walk column is dropped and
-  rechecked: a range column cannot be a set-tree node (its answer is a union of an unbounded
-  number of entries), and the bitmap path's answer for two range columns - one TIDBitmap each,
-  intersected - is not a stream. An `op ANY (array)` range walks to the widest element (§28) when
-  the column orders the elements; an UNORDERED column walks ONCE, testing each entry against every
-  element's range (the bitmap path walks once per element and lets the bitmap absorb the overlap,
-  which a stream cannot).
+  `IS NOT NULL` that nothing else answers, or the scan has no key at all (a partial index whose
+  predicate the query implies, §24, which walks column 1 with its NULL entry). The column's
+  entries are walked in directory order exactly as the bitmap walk does
+  (`lion_emit_all_keys_ext()`: copy a leaf, release it, test each entry with `lion_range_test()`,
+  stop at the first entry past an upper bound or of the next column), and each selected entry is
+  streamed as `AND(entry, rest)`, where `rest` is the set tree of the other columns' chosen quals
+  (empty for a one-column scan). Within one entry the TIDs come out in heap order; across entries
+  in key order. A second walk column is dropped and rechecked: a range column cannot be a set-tree
+  node (its answer is a union of an unbounded number of entries), and the bitmap path's answer for
+  two range columns - one TIDBitmap each, intersected - is not a stream. An `op ANY (array)` range
+  walks to the widest element (§28) when the column orders the elements; an UNORDERED column walks
+  ONCE, testing each entry against every element's range (the bitmap path walks once per element
+  and lets the bitmap absorb the overlap, which a stream cannot). `IS NOT NULL` next to any column
+  that answers - a set tree, a range, a long list - is dropped and rechecked, as the bitmap path
+  drops it; it walks only alone.
+  *(Deviation from this section's first version, where `IS NOT NULL` always drove a walk: every
+  entry of its column ANDed with the other columns' stream - `a IS NOT NULL AND b = 5` over a
+  million unique `a` took 4.37M buffer hits and 1.8 s against the bitmap scan's 19 ms, while the
+  cost model priced it by `b` alone, 2026-09-25 review.)*
+- **WINDOW**: a WALK beside the other columns' set trees that is LONG - more entries than those
+  sets have posting pages, and at least 16 (`lion_source_walk_is_long()`, which counts them from the
+  directory leaves alone and stops there). Restarting `AND(entry, rest)` for every entry
+  re-descends each of the rest's posting trees per entry; a WINDOW reads them once. The rest is
+  ONE stream, and a window is its next `lion_walk_window()` containers, each ORed into a bitset
+  image; the range is then walked once for the window, each entry sought to the window's first
+  container key and read up to its last - an INLINE entry straight from the walk's copy of the
+  leaf, item by item, a posting tree through a stream - and ORed into a second image wherever the
+  rest has a container. The two images' AND is the answer for the window, handed out in container
+  key order, so the whole scan is one ascending stream and the heap is visited in physical order,
+  as by a bitmap scan. Each window walks the range again, so the window is wide:
+  `max(pg_lion.scan_window_floor, work_mem) / 8 kB` containers, 512 at the default floor of 4 MB
+  (32768 heap blocks if the rest has a container at every key), up to 65536. Built only for a
+  scan that drops its pins (§29.5); one that keeps them keeps the entry-by-entry WALK, whose pins
+  are the ones it needs. A short walk stays a WALK too: its restarts cost no more than reading
+  the rest once. *(Deviation from this section's first version, which had only the WALK:
+  `a BETWEEN 1 AND 400000 AND b = 5` over a million rows, `a` unique, took 1.06M buffer hits and
+  818 ms where the bitmap scan read 5481 buffers in 72 ms, and the planner chose that plain scan
+  for the 200000-row range, 409 ms against 38 (2026-09-25 review). As a WINDOW it reads 5485
+  buffers in 36 ms, and the 200000-row range 2751 in 17 ms; an INLINE entry read through a stream
+  of its own, as the first cut of the WINDOW did, took 113 ms for those 200000 entries.)*
 - **LIST**: an IN list on a scalar column longer than a batch (§29.4) is located and streamed a
   batch at a time, each batch the SETS shape with the other columns' trees ANDed in. It outranks a
   walk, which is then left to the recheck, and a second long list is left to the recheck too.
@@ -6276,13 +6316,17 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   bitset image per container key of the window; the next window starts at the smallest key any
   entry had past this one. Each window walks the column's entries once, so the work is windows x
   entries, and the window is therefore WIDE whatever `work_mem` says: `lion_union_window()` =
-  `max(1024, work_mem / 4 kB)` container keys (1024 are 65536 heap blocks, 512 MB of heap), up to
-  65536, and a key's 4 kB image is made only when an entry has a container there, so a window
-  costs what it holds - at most 4 MB at the floor, which is the one place this scan may exceed a
-  tiny `work_mem`. Always rechecked (the quals of mode ALL need it). Correct and expensive, which
-  is what the cost model already says about these quals; `lioncostestimate()` also charges each
-  window past the first another read of the index (the IndexPath is shared with the bitmap scan,
-  which is overcharged by that, only on a heap past 512 MB).
+  `max(pg_lion.scan_window_floor, work_mem) / 4 kB` container keys, 1024 at the default floor of
+  4 MB (65536 heap blocks, 512 MB of heap), up to 65536, and a key's 4 kB image is made only when
+  an entry has a container there, so a window costs what it holds - at most 4 MB at the floor,
+  which with the WINDOW's is where this scan may exceed a tiny `work_mem`. The floor is a
+  setting so that the regression suite can cross window boundaries on a table of a few megabytes
+  (`test/sql/indexscan.sql` §10 and §11 lower it to 64 kB: 16 keys, or 8 containers); it is a
+  testing knob more than a tuning one. Always rechecked (the quals of mode ALL need it). Correct
+  and expensive, which is what the cost model already says about these quals;
+  `lioncostestimate()` also charges each window past the first another read of the index (the
+  IndexPath is shared with the bitmap scan, which is overcharged by that, only on a heap past
+  512 MB).
   *(Deviation from the version before it, whose window was `max(16, work_mem / 4 kB)` keys: at
   64 kB that is 1024 heap blocks, and a 2M-row table with 200k distinct keys took 17 windows and
   1.40 s for an index-only count(*) against 0.48 s at 64 MB - and the planner picked that scan at
@@ -6302,7 +6346,8 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   The rule that fixes it is §29.6's first one: no shape returns a TID the index does not hold.)*
 
 Scalar entries of one column are disjoint (one entry per equality class, §21), so a WALK never
-returns a TID twice either, and neither does SETS, whose OR node merges by container key.
+returns a TID twice either, and neither does SETS, whose OR node merges by container key, nor a
+WINDOW, whose windows are disjoint runs of the rest's container keys and whose images are sets.
 
 **Why an IN list is a union and not a walk of its entries.** With no order to keep (§29.8), the
 union is strictly better for a plain scan: it visits each heap page once, in physical order, while
@@ -6323,7 +6368,7 @@ of this section missed: a located set with the cursor that reads it takes ~20 kB
 `c1m = any(array(select ... 300000 ...)) LIMIT 10`, planned as a plain Index Scan, peaked at
 1.37 GB to return ten rows (2026-09-24 review). The bitmap path never had it: `lion_emit_array()`
 looks its values up one at a time. So a list longer than a BATCH - `max(32, work_mem / 32 kB)`
-values, which keeps a batch's cursors inside `work_mem` - is the LIST shape: its values are sorted
+values, a batch's cursors near 60% of `work_mem` (below) - is the LIST shape: its values are sorted
 once into lookup order (`lion_probe_sort()`: the probe's comparison, then the hash), and located
 and streamed a batch at a time, the previous batch's sets and pins gone before the next is located
 (the §11 order). A batch is cut only where the HASH changes, and every value of one equality class
@@ -6341,19 +6386,40 @@ since §15's "Bounded cursors" it walks it within work_mem, as a windowed union,
 The same section sized a cursor's staging buffer by its entry's payload, so the ~20 kB per set above
 is what a CHAIN set's cursor (a page image) still comes near and an INLINE one no longer does.
 
+**What a batch takes, measured.** A located set and its cursor take up to ~19 kB in the source's
+entry context: two 8 kB allocator chunks - the cursor's 4104-byte staging container and, for a set
+with a sparse segment (§13), the segment's buffer of the same size, each rounded up to a power of
+two, or a posting-tree cursor's 8 kB page image - and the set, its share of the OR node and the
+context's slack. At 32 kB of `work_mem` a set, a batch is ~60% of `work_mem`, and the scan as a
+whole - the sorted list's 12 bytes a value included - stays inside `work_mem` for a list of up to
+one value per 36 bytes of it, 29,000 values at 1 MB: the 20,000-value list of the tests takes
+905 kB at 1 MB, 2.7 MB at 4 MB and 10.1 MB at 16 MB. The entry context has blocks of one size,
+64 kB, so what it takes is what it holds give or take one block (and a walk's per-entry stream,
+which fits one block, is reset from entry to entry with no allocation between); the floor of 32
+sets, ~620 kB, is the bound below 1 MB. *(Deviation from the first version, whose comment said
+~19 kB a set but whose entry context grew by doubling blocks, the last one half empty: a batch
+took twice what it used, 1073 kB at 1 MB of `work_mem`, 4180 kB at 4 MB and 16.9 MB at 16 MB, and
+the test that was meant to show it inside `work_mem` compared with the server's own `work_mem`,
+64 MB on the development servers, so it only failed on a server whose default was 16 MB or less,
+PostgreSQL's 4 MB included (2026-09-25 review). `test/sql/indexscan.sql` §9 now sets 4 MB and
+16 MB itself.)*
+
 `amgettuple` returns TIDs out of a BATCH: the members of the container the stream is standing on,
 expanded into an array of at most `LION_CONTAINER_RANGE` lo values (`lion_container_to_array()`,
 turned into a TID one at a time, in the per-heap-block order `lion_container_to_tbm()` emits). The
 next container is pulled only when the batch is used up. What the scan holds between two calls is
-therefore bounded by `work_mem` (save a UNION window's floor) and the query, never by the data: one container's members; one
-8 KB image per posting-set cursor of the tree (the page its current container came from), for at
-most a batch of an IN list's sets (above); the INLINE payload copies of those sets (at most an
-entry each, `LION_MAX_ENTRY_SIZE`); for a WALK one directory leaf image; for a UNION the bitset images
-of its window (made on first use; up to 4 MB at the floor, §29.3); and a long list's values, sorted. A posting set of any size is
-STREAMED container by container - a 5M-row entry is never materialized - and a walk of any width
-holds one entry's stream at a time. Memory lives in a per-scan context reset by `amrescan`, and a
-walk's per-entry cursors in a per-entry context reset before the next entry, so a nested-loop inner
-scan rescanned a million times and a range over a million entries both run in constant memory.
+therefore bounded by `work_mem` (save the windows' floor) and the query, never by the data: one
+container's members; one 8 KB image per posting-set cursor of the tree (the page its current
+container came from), for at most a batch of an IN list's sets (above); the INLINE payload copies
+of those sets (at most an entry each, `LION_MAX_ENTRY_SIZE`); for a WALK one directory leaf image;
+for a UNION the bitset images of its window (made on first use; up to 4 MB at the floor, §29.3);
+for a WINDOW two images per container of its window, the rest's and the walk's (up to 4 MB at the
+floor, `work_mem` above it), and the rest's one stream; and a long list's values, sorted. A
+posting set of any size is STREAMED container by container - a 5M-row entry is never
+materialized - and a walk of any width holds one entry's stream at a time. Memory lives in a
+per-scan context reset by `amrescan`, and a walk's per-entry cursors in a per-entry context reset
+before the next entry, so a nested-loop inner scan rescanned a million times and a range over a
+million entries both run in constant memory.
 
 ### 29.5 Pins, and what a scan paused between calls may hold
 
@@ -6442,13 +6508,21 @@ key keeps its own - the same rules §9 states for the count (`lion_source_pinned
   the one residual effect - the same matching row twice through two stale entries - needs a
   thousand-leaf IN list under a dirty snapshot, which no caller in core builds (below).
 - The UNION shape (§29.3) holds no pins in either mode (its windows copy containers out of many
-  pages) and is always rechecked; a union cannot return a TID twice. A multi-key query's sets are located unpinned in either
-  mode too (the tree builder the bitmap path shares drops their pins), and a multi-key scan is
-  always rechecked (§29.6); `EXCLUDE USING lion (tags WITH &&)` is such a scan, and a conflict it
-  reports through a recycled slot is a row that really overlaps.
+  pages) and is always rechecked; a union cannot return a TID twice. The WINDOW shape copies out
+  of many pages too, and is simply never built with `keeppins`: a scan that must hold the page of
+  each batch walks a long range beside other columns entry by entry, as a WALK, whose pins are
+  the ones this section needs. Paused between two calls, a WINDOW holds its images, the rest's
+  stream (copied leaves with their right links, cases 4 to 7) and nothing else; the next window
+  walks the directory afresh, as a UNION's does, so what changed in between is cases 1 to 3, 7
+  and 8. A multi-key query's sets are located unpinned in either mode too (the tree builder the
+  bitmap path shares drops their pins), and a multi-key scan is always rechecked (§29.6);
+  `EXCLUDE USING lion (tags WITH &&)` is such a scan, and a conflict it reports through a
+  recycled slot is a row that really overlaps.
 - The §11 deadlock rule for readers holds in both modes: every set is located - every directory
   lock taken - before the first container page is pinned, and a WALK takes the next directory leaf
-  only after the previous entry's stream has been closed and its container pins dropped. Holding
+  only after the previous entry's stream has been closed and its container pins dropped. A
+  WINDOW's walks, and the count that decides whether a walk is long, lock directory leaves while
+  the rest's stream is paused, which holds no pin (it is never opened with `keeppins`). Holding
   directory-leaf PINS (INLINE sets, the walk's own leaf) while locking directory pages is what the
   count's GROUP BY walk has always done; pins do not block share locks, and VACUUM never waits for
   a cleanup lock while holding any lock (§11).
@@ -6491,8 +6565,8 @@ Then `xs_recheck` is set, for every TID of the scan, when any of these holds; ot
 are exact:
 
 - a qual was not answered: a second qual on a column (§29.2's ranking), a second WALK column, a
-  multi-key column in mode ALL next to another column that does answer (dropped, as in the bitmap
-  path);
+  multi-key column in mode ALL or an `IS NOT NULL` next to another column that does answer
+  (dropped, as in the bitmap path; `IS NOT NULL` is then the recheck of a null test per row);
 - a MULTI-KEY column's query was answered at all (strategies 2 .. 5, §17). The bitmap path passes
   mode KEYS through unrechecked because `lion_extract_query()` classifies it as exact; the plain
   path is chosen for selective lookups, where one operator call per fetched row costs nothing next
@@ -6500,10 +6574,10 @@ are exact:
 - the UNION shape (§29.3), always;
 - a non-MVCC scan with a NOPIN set (§29.5).
 
-A range is exact (the walk applies every bound of the column), an IN list is exact (a union of
-whole entries), `IS NULL` and `IS NOT NULL` are exact, and so is a cross-type or binary-coerced
-equality (§21's probe). A collation the index cannot answer never reaches the AM (the planner
-matches `IndexCollMatchesExprColl()` first).
+A range is exact (the walk applies every bound of the column, as a WALK or a WINDOW), an IN list
+is exact (a union of whole entries), `IS NULL` and a walked `IS NOT NULL` are exact, and so is a
+cross-type or binary-coerced equality (§21's probe). A collation the index cannot answer never
+reaches the AM (the planner matches `IndexCollMatchesExprColl()` first).
 
 ### 29.7 Rescans, keys that change, and cleanup
 
@@ -6636,6 +6710,38 @@ are scattered, the rows' share of the heap when they are stored in order, interp
 correlation's square (`lion_cost_count_rel()`, `lion_single_eq_var()`). Only ever lower, and only
 for that shape; a range already had the rule (§28), and other WHERE shapes keep the old bound.
 
+**A range beside other columns' sets is priced as walked** (2026-09-25 review). Because the two
+paths share the IndexPath, the index side has to be what both of them read, and a plain scan that
+read far more than the bitmap scan - a WALK restarting the other columns' stream for every entry,
+§29.3 - was priced as though it did not: the planner chose it for `a BETWEEN 1 AND 200000 AND
+b = 5` over a million unique `a` at 409 ms against the bitmap scan's 38. The executor fix (the
+WINDOW shape, and `IS NOT NULL` dropped beside anything that answers) makes both paths read the
+same, and the model now charges what that is:
+
+- the range's entries once per WINDOW (`lion_range_entry_cost()`): the heap's container keys over
+  `lion_walk_window()`, 1 below 32768 heap blocks at the default floor - an upper bound, since the
+  other columns may have containers at fewer keys, and an overcharge of the bitmap scan on a heap
+  that large, the UNION's trade;
+- and the postings of the range itself. `genericcostestimate()` prorates a multicolumn path's
+  index by every column's selectivity together, which is about what an AND of set trees reads
+  (they leapfrog, §22), but a range column is walked whole whatever the others select (§28): it
+  reads the postings of every row in its range. The rows the prorating left out are charged a
+  tuple cost each and their share of the index's pages at `seq_page_cost` - the walk reads
+  directory leaves in key order through their right links, laid out in that order by ambuild.
+  Charged at `random_page_cost`, as `genericcostestimate()` charges its own pages, the
+  400,000-row range of the example went to the sequential scan at 133 ms against the plain
+  scan's 43; without the term the 900,000-row range went to the bitmap scan at 1.4 to 1.6 times
+  the sequential scan's time. A one-column path is prorated by the range already and pays
+  nothing more.
+
+On that million-row table with nothing disabled: the 2000-, 200000- and 400000-row ranges beside
+`b = 5` choose the plain scan (0.2 ms), the plain scan (17-33 ms, was 409) and the bitmap scan
+(70-140 ms on a loaded machine, where the plain scan takes 36-70 and the sequential scan
+108-200); the 900000-row range the sequential scan; `a IS NOT NULL AND b = 5` the bitmap scan
+(15-19 ms, the plain scan now the same). `test/sql/indexscan.sql` §11 pins three such choices on
+a smaller table and shows the plain scan reading within twice the bitmap scan's buffers, where it
+read 36 to 390 times as many.
+
 ### 29.12 Tests
 
 `test/sql/indexscan.sql`, written before the code and failing on HEAD (no plan can show an Index
@@ -6649,8 +6755,14 @@ a posting set far larger than one batch with its memory flat; an exclusion const
 pushdown still chosen for its shapes, a clustered value under a stale visibility map included; a
 partial multi-key index read whole at 64 kB of work_mem, by a plain scan and by index-only scans
 with nothing disabled, clean and dirty (the review's repros: rows the index does not hold came
-back); a 20,000-value Param list read through a cursor within work_mem, and long lists with
-duplicates, NULLs, citext spellings, a range and another column beside them, at 32 values a batch; index-only scans of no-column queries (a column's walk, a
+back); a 20,000-value Param list read through a cursor within a `work_mem` of 4 MB and of 16 MB,
+set by the test, and long lists with duplicates, NULLs, citext spellings, a range and another
+column beside them, at 32 values a batch; a multi-key union across windows at the least
+`pg_lion.scan_window_floor`; ranges and `IS NOT NULL` beside other columns' sets (§11: one-row
+INLINE entries, sparse segments and posting trees walked in WINDOWs, one window and several,
+`< ANY`, a short walk, empty sides, a dropped `IS NOT NULL` with the rows its recheck removes, a
+dirty heap and after VACUUM), the plain scan's buffers within twice the bitmap scan's, the window's
+memory, and three plan choices; index-only scans of no-column queries (a column's walk, a
 partial index, a multi-key column's bitmap), clean and dirty. Existing tests whose helpers exist to
 exercise the BITMAP path, or to force the count pushdown by disabling every other scan, now disable
 plain index scans as well; the plan pins that changed are one-row multi-key lookups, which are now
@@ -6658,8 +6770,10 @@ plain Index Scans. Isolation: `gettuple_pause.spec` (cursors - the pause the exe
 between two `amgettuple` calls - so it runs on every major) parks a scan after five rows while the
 posting leaves under it split, the INLINE set it copied spills, the directory leaf under a range
 walk splits, and VACUUM deletes the NEXT entry of the walk and frees its posting tree, whose pages
-an insert then takes back; each drains to exactly the rows its snapshot sees, none twice, and
-pg_buffercache shows the paused scan pinning no index page, so the VACUUM completes under it.
+an insert then takes back, or - a WINDOW parked in the first of two windows - the entries its
+next window walks, whose heap slots an insert takes back under the same keys; each drains to
+exactly the rows its snapshot sees, none twice, and pg_buffercache shows the paused scan pinning
+no index page, so the VACUUM completes under it.
 `gettuple_dirty_pin.spec` (injection point `lion-gettuple-batch`, 17+) parks an exclusion-
 constraint check with its batch loaded and shows VACUUM waiting for its pin, and a plain MVCC scan
 parked at the same point holding none while the same VACUUM completes.

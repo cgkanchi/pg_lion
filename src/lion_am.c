@@ -39,6 +39,7 @@
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -144,10 +145,29 @@ _PG_init(void)
 	/*
 	 * The resource manager itself, which only registers while
 	 * shared_preload_libraries is being processed (DESIGN.md §25).  The GUC
-	 * it takes its id from is defined either way, so that
-	 * pg_lion.rmgr_id is visible in SHOW on every server.
+	 * it takes its id from, pg_lion.rmgr_id, is a postmaster setting, which
+	 * core refuses to define once the postmaster is up, so it is defined only
+	 * then as well: on a server without the preload SHOW pg_lion.rmgr_id is
+	 * an unknown setting.  lion_wal_init() says which of its GUCs are defined
+	 * either way.
 	 */
 	lion_wal_init();
+
+	/*
+	 * DESIGN.md §29.3: the least memory a plain scan's window of container
+	 * keys takes, whatever work_mem says.  A testing knob more than a tuning
+	 * one: every window walks the entries again, which is why the default is
+	 * wide, and the regression suite lowers it to cross window boundaries on
+	 * a table of a few megabytes.
+	 */
+	DefineCustomIntVariable("pg_lion.scan_window_floor",
+							"Least memory a window of a plain lion index scan takes.",
+							"Every window walks the index entries again, so below this a window does not shrink with work_mem.",
+							&lion_scan_window_floor,
+							LION_SCAN_WINDOW_FLOOR, 64, MAX_KILOBYTES,
+							PGC_USERSET,
+							GUC_UNIT_KB | GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pg_lion.enable_count_pushdown",
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
@@ -187,11 +207,17 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amcanhash = false,
 
 		/*
-		 * Every operator of a roaring opfamily agrees on one equivalence
-		 * relation: a scalar family holds nothing but equality operators
-		 * (cross-type ones included), and a multi-key family holds nothing
-		 * but containment/match operators and no equality at all, so
-		 * equality_ops_are_compatible() is never asked about two of those.
+		 * equality_ops_are_compatible() trusts two operators that share a
+		 * family of such an AM to agree on equality.  Every EQUALITY operator
+		 * of a roaring opfamily does: a scalar family's equality operators
+		 * (cross-type ones included) are core's, from one btree family, and
+		 * its range operators - strategies 6 .. 9, DESIGN.md §28 - are
+		 * btree's too and order values consistently with that equality; a
+		 * multi-key family holds containment/match operators and no equality
+		 * at all, so the question is never asked about two of those.
+		 * Ordering is not claimed: lion is not an ordered AM (amcanorder is
+		 * false, §29.8), and the btree families these operators come from
+		 * already answer comparison_ops_are_compatible() for them.
 		 */
 		.amconsistentequality = true,
 		.amconsistentordering = false,
@@ -647,6 +673,59 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 	return true;
 }
 
+/* Does a column other than col have an index qual at all? */
+static bool
+lion_cost_other_column(IndexPath *path, int col)
+{
+	ListCell   *lc;
+
+	foreach(lc, path->indexclauses)
+	{
+		if (((IndexClause *) lfirst(lc))->indexcol != col)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Does a column other than col have a qual the scan answers with a set tree
+ * (lion_scan_col_tree()), which a range walk on col is then ANDed with?
+ */
+static bool
+lion_cost_sets_beside(IndexPath *path, int col)
+{
+	ListCell   *lc;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (iclause->indexcol == col)
+			continue;
+		foreach(lc2, iclause->indexquals)
+		{
+			Node	   *clause = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+
+			/*
+			 * An equality, a list, `IS NULL` or a multi-key query is a set;
+			 * another range is a second walk and `IS NOT NULL` is dropped,
+			 * neither of which the scan streams beside this one.
+			 */
+			if (IsA(clause, NullTest) ?
+				((NullTest *) clause)->nulltesttype == IS_NULL :
+				!((IsA(clause, OpExpr) &&
+				   lion_cost_is_range(path->indexinfo, iclause->indexcol,
+									  (OpExpr *) clause)) ||
+				  (IsA(clause, ScalarArrayOpExpr) &&
+				   lion_cost_is_range_op(path->indexinfo, iclause->indexcol,
+										 ((ScalarArrayOpExpr *) clause)->opno))))
+				return true;
+		}
+	}
+	return false;
+}
+
 /*
  * What the ENTRIES of the range walks of this path cost (DESIGN.md §28), on
  * top of the pages and the postings genericcostestimate() prorates by the
@@ -663,9 +742,28 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
  * which for a range operator is ONE walk to the widest element
  * (lion_emit_array_range()) and pays for the entries that walk visits - then
  * the column's plain range comparisons, all of them one walk.
+ *
+ * Beside another column's sets, a plain scan walks a long range once per
+ * WINDOW of those sets' containers (DESIGN.md §29.3, lion_walk_window()), so
+ * the entries are paid once per window: the heap's container keys over the
+ * window, which is 1 below 32768 heap blocks at the default floor and an
+ * upper bound above it (the sets may have containers at fewer keys).  The
+ * bitmap scan, which shares the path, walks once and is overcharged by that
+ * on a heap that large - the UNION's trade in lioncostestimate().  The plain
+ * scan used to restart the other columns' stream for every entry instead, a
+ * descent of each of their posting trees, and that was never charged at all
+ * (2026-09-25 review).
+ *
+ * *walkrows is what the walks read beyond that, for lioncostestimate() to
+ * charge: on a MULTICOLUMN path genericcostestimate() prorates the index by
+ * the selectivity of every column's quals together, which is what an AND of
+ * set trees - leapfrogging each other (§22) - reads about, but a range
+ * column is walked whole whatever the others select (§28, §29.3), so it
+ * reads the postings of every row in its range: its own selectivity's share.
+ * A one-column path is prorated by that already and adds nothing.
  */
 static Cost
-lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
+lion_range_entry_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 {
 	IndexOptInfo *index = path->indexinfo;
 	Cost		cost = 0;
@@ -743,8 +841,17 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
 			}
 
 			entries = Max(1.0, ndistinct * sel);
+			if (lion_cost_sets_beside(path, c))
+			{
+				double		containers = ceil((double) index->rel->pages /
+											  LION_BLOCKS_PER_CONTAINER);
+
+				entries *= Max(1.0, ceil(containers / lion_walk_window()));
+			}
 			cost += entries * (cpu_index_tuple_cost +
 							   list_length(ranges) * cpu_operator_cost);
+			if (lion_cost_other_column(path, c))
+				*walkrows += sel * Max(index->rel->tuples, 0.0);
 			list_free(ranges);
 		}
 	}
@@ -836,6 +943,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	GenericCosts costs = {0};
 	bool		emits_all_rows;
 	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
+	double		walkrows = 0.0;
 
 	/*
 	 * A full walk visits every index tuple - every (key, row) posting, which
@@ -874,7 +982,38 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			costs.indexSelectivity = 1.0;
 	}
 
-	costs.indexTotalCost += lion_range_entry_cost(root, path);
+	costs.indexTotalCost += lion_range_entry_cost(root, path, &walkrows);
+
+	/*
+	 * A range walked beside other columns reads the postings of its own
+	 * range, which genericcostestimate() prorated by every column's
+	 * selectivity together (lion_range_entry_cost()): charge the rest of
+	 * them, a share of the index's pages and a tuple cost each.  The pages
+	 * are those of a walk - directory leaves in key order through their right
+	 * links, which ambuild lays out in that order - so they are charged as
+	 * sequential reads.  Without the term `a BETWEEN 1 AND 900000 AND b = 5`
+	 * over a million unique a was priced at two thirds of the sequential scan
+	 * and ran 1.4 to 1.6 times as long as it; charged at random_page_cost,
+	 * the 400000-row range went to the sequential scan at 2.5 times the plain
+	 * scan's time (2026-09-25 review).
+	 */
+	if (walkrows > costs.numIndexTuples)
+	{
+		IndexOptInfo *index = path->indexinfo;
+		double		extra = walkrows - costs.numIndexTuples;
+		double		pages = ceil(extra * (double) index->pages /
+								 Max(index->tuples, 1.0));
+		double		spc_random_page_cost;
+		double		spc_seq_page_cost;
+
+		get_tablespace_page_costs(index->reltablespace, &spc_random_page_cost,
+								  &spc_seq_page_cost);
+		pages = Min(pages, Max((double) index->pages - costs.numIndexPages, 0.0));
+		costs.indexTotalCost += pages * spc_seq_page_cost +
+			extra * cpu_index_tuple_cost;
+		costs.numIndexPages += pages;
+		costs.numIndexTuples = walkrows;
+	}
 
 	/*
 	 * A plain scan that reads a multi-key column whole streams the union of

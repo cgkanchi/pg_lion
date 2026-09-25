@@ -1157,11 +1157,16 @@ extern int64 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool liongettuple(IndexScanDesc scan, ScanDirection dir);	/* DESIGN.md §29 */
 
 /*
- * Container keys per window of a plain scan that reads a multi-key column
- * whole (DESIGN.md §29.3): 1024 container keys, 65536 heap blocks, at least.
+ * The windows of a plain scan (DESIGN.md §29.3): container keys per window of
+ * one that reads a multi-key column whole, and the other columns' containers
+ * per window of a long range beside them.  Each is sized by work_mem, and by
+ * pg_lion.scan_window_floor at least - 4 MB by default: 1024 container keys,
+ * 65536 heap blocks, for the first, 512 containers for the second.
  */
-#define LION_UNION_MIN_WINDOW	1024
+#define LION_SCAN_WINDOW_FLOOR	4096	/* kB */
+extern PGDLLIMPORT int lion_scan_window_floor;
 extern int	lion_union_window(void);
+extern int	lion_walk_window(void);
 extern bytea *lionoptions(Datum reloptions, bool validate);
 extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
