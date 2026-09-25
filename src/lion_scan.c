@@ -1,7 +1,16 @@
 /*-------------------------------------------------------------------------
  *
  * lion_scan.c
- *		Bitmap scan support for the lion index (DESIGN.md section 5, SCAN).
+ *		Bitmap scans (DESIGN.md section 5, SCAN) and plain index scans
+ *		(DESIGN.md §29) of the lion index.
+ *
+ * The plain scan, liongettuple() at the end of this file, answers the same
+ * quals with the same choice of which to answer (lion_scan_choose()) and the
+ * same set trees, but pulls them as a stream of containers - one container's
+ * TIDs at a time - from a SOURCE that lion_source_open() also offers to other
+ * callers.  Between two calls it holds no pin under an MVCC snapshot and the
+ * page of its current batch under any other (§29.5).  The rest of this
+ * comment is about the bitmap scan, whose walk and trees the source shares.
  *
  * A lion index answers one qual per key column: an equality to a value,
  * `= ANY (array)` (DESIGN.md §15, amsearcharray), a range - every `<`,
@@ -1781,6 +1790,8 @@ struct LionSource
 	LionLeafWalk walk;
 	LionRange  *ranges;
 	int			nranges;
+	LionIndexState *ix;			/* the state walk.col and ranges[] point into */
+	AttrNumber	walkattno;		/* ... and the walked column's number */
 
 	/* BITMAP */
 	TIDBitmap  *tbm;
@@ -2118,6 +2129,8 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
 		src->entrycxt = AllocSetContextCreate(cxt, "lion index scan entry",
 											  ALLOCSET_DEFAULT_SIZES);
+		src->ix = so->ix;
+		src->walkattno = (AttrNumber) col->attno;
 		lion_walk_begin(&src->walk, so->index, col, withnull, src->ranges,
 						src->nranges, keeppins);
 	}
@@ -2227,6 +2240,34 @@ lion_source_next(LionSource *src)
 			return lion_source_tbm_next(src);
 
 		case LION_SRC_WALK:
+
+			/*
+			 * The walk's column state belongs to the index's relcache entry:
+			 * the LionIndexState is rd_amcache, which a relcache invalidation
+			 * frees - and the executor may accept one between two calls,
+			 * whenever it takes a lock for something else while the scan is
+			 * paused.  The column states themselves live on in rd_indexcxt,
+			 * but not the state they point back to.  So it is looked up again
+			 * here, and the walk and its ranges re-pointed at the rebuilt
+			 * one.  Nothing else the source holds points into it: the
+			 * ranges' comparison functions are copies, and the posting-set
+			 * cursors name the index and a block.
+			 */
+			{
+				LionIndexState *ix = lion_get_index_state(src->index);
+
+				if (ix != src->ix)
+				{
+					int			r;
+
+					src->walk.col = lion_column(ix, src->walkattno);
+					for (r = 0; r < src->nranges; r++)
+						src->ranges[r].state = src->walk.col;
+					src->ix = ix;
+					src->so->ix = ix;
+				}
+			}
+
 			for (;;)
 			{
 				LionEntryTuple *entry;
