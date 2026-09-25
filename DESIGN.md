@@ -1961,10 +1961,16 @@ So `lion_posting_set_lookup_many()` keeps pins on at most a BUDGET of distinct l
 budget is the BACKEND's: every list it has located and not yet released draws on the same one, so
 two unbounded lists in a query share it rather than taking one each. It is the smaller of
 `LION_LOOKUP_MAX_PINS` = 1000, the longest list the planner takes as a literal, and an eighth of
-shared_buffers. The eighth is what keeps one backend from exhausting the pool - the failure above
+the pool the index is read into: shared_buffers, or for a TEMPORARY index the backend's own
+temp_buffers (as few as 100), which the first version of this budget did not tell apart - a list
+over a temporary table pinned up to a thousand local buffers of 1024 and failed with "no empty
+local buffer available" (2026-09-25 review). The eighth is what keeps one backend from exhausting
+the pool - the failure above
 was 9000 leaves against 2048 buffers, where an eighth is 256 and leaves seven eighths to the query's
 own heap, visibility-map and chain pages and to every other backend - and it only binds below 64MB,
-so on any ordinary configuration a literal list pins exactly the leaves it always did. Pins on the
+so on any ordinary configuration a literal list pins exactly the leaves it always did. The CURSORS
+that read the located sets draw on what the lists leave of the same limit ("Bounded cursors",
+below). Pins on the
 leaf the previous set already pins cost no buffer and are not counted. Every set that took a new
 leaf is marked `budgeted` and returns it when released; a set abandoned by an error never is, so
 the count is zeroed at the end of each top-level transaction, and until then it can only be too
@@ -2004,11 +2010,14 @@ A NOPIN set carries no §9 interlock of its own, and the count restores one in e
 - **Nothing carries it** (an OR across columns, §19, whose leaf is a list past the budget; or an
   intersection of sources that are all NOPIN or materialized): the count trusts no visibility map
   (`cx.novm`) and rechecks every candidate in the heap, as a standby with a generic-WAL index does.
-  Correct, and slower only for lists over the budget.
+  Correct, and slower only for lists over the budget. A union read as a WINDOWED union ("Bounded
+  cursors", below) is in the same position: it holds no pin at all.
 
 The bitmap scan needs no interlock at all - every TID it emits is visited by the executor - so
 lion_scan.c drops the pins of its per-key lookups at once (`lion_posting_set_unpin()`), and its IN
-lists are budgeted by the lookup like everyone's. test/sql/pinbudget.sql parks a GROUP BY count
+lists are budgeted by the lookup like everyone's; since "Bounded cursors" the multicolumn walk
+drops its lists' leaf pins as soon as every set is located, and its cursors keep none either.
+test/sql/pinbudget.sql parks a GROUP BY count
 with a cursor, whose WHERE sets stay located from the first group to the last, and counts the
 index's pinned buffers in pg_buffercache: 1500 before the budget, at most 1000 with it; it proves
 every shape above still exact and which of them still answer from the map, and it pins down that a
@@ -2118,6 +2127,139 @@ rebuild of it measures 3.8-4.0. Every comparison above is between two runs of th
 A GROUP BY over the same column restricts the groups to the listed values (a group outside the list
 counts 0 and is not emitted). `col = ANY (...)` with useOr = false (`= ALL`) is not pushed down.
 EXPLAIN prints the list as `idx (col = ANY ({1,2,3}))`.
+
+### Bounded cursors (2026-09-25 review)
+
+The pin budget above bounds what a list's LOOKUP keeps. Nothing bounded the CURSORS that then read
+the located sets, and those were all built at once: the evaluator (§17) opens a cursor for every
+leaf of a source's tree when the merge starts, and an IN list is a leaf per value. Each held ~17 kB
+- an 8 kB staging buffer for an INLINE entry (`LION_CONTAINER_MAX_SIZE`, 4104 bytes, which aset
+rounds up), a page image for a CHAIN one, a second 8 kB the first time it expanded a sparse segment
+- and each CHAIN cursor a buffer pin, from the moment it was built until it moved past its page.
+Only the disjoint sum, one set at a time, escaped it; an IN list ANDed with another clause, a dense
+list (`lion_sum_is_cheaper()` sends it to the merge), a list under an OR, a GROUP BY with a list on
+another column (its copies too, below) and the bitmap walk of a multicolumn index all paid it, and
+work_mem never came into it. Measured on 18.6 (assert build), 300k rows, work_mem 4MB:
+`k = ANY (50000 values) AND x = 1` peaked at 857 MB of VmHWM in 4.2 s (300k values: 5 GB, 39 s),
+the multicolumn bitmap scan of 100k values at 1.7 GB, and over a TEMPORARY table a list of 1100
+CHAIN entries (`inline_limit = 64`) failed with "no empty local buffer available" - a shared table
+has no such error, its backends just take the pool from everyone else.
+
+What changed, each where the cost was:
+
+- **Staging buffers sized for their items.** `lion_inline_fetch()` never copies more than is left of
+  the payload, so an INLINE cursor's buffer is the payload's length (at most the largest item); the
+  segment buffer holds one container key's pairs, fewer than `LION_SPARSE_THRESHOLD` in a
+  well-formed segment and grown if one ever holds more. Most of the 17 kB was allocator rounding
+  and most of the 4.2 s was touching it: that change alone took the query to 59 MB and 0.25 s.
+- **An open budget, and a plan against it.** Before a merge builds its cursors, each source's tree
+  is PLANNED (`lion_plan_node()`) against an open budget: work_mem of cursor memory (at least
+  256 kB) and, in pins, what this backend's lists have left of the list pin limit above (at least
+  16), so that a list's leaf pins and its cursors' page pins come out of ONE limit per backend. The
+  plan estimates bottom-up what each node's cursors would hold - the `LionExprCursor`, the staging
+  buffer or page image, an OR's heap entries and accumulators - and decides the three shapes below.
+  An ordinary query is under the budget everywhere and is built exactly as before; the plan also
+  carries each node's `pinned`, the §9 property the count needs of one positive source, so the
+  shape and the interlock are one decision.
+- **A disjoint list is counted in BATCHES** (`lion_run_batches()`). A source that is a disjoint
+  list (the §15 short-circuit's test, minus "the only source") and would not fit the budget opened
+  whole is cut into batches of consecutive entries that do fit, and the merge runs once per batch
+  with the list replaced by that batch's union. With the list's sets pairwise disjoint and U_1 ..
+  U_m the batches' unions, R the intersection of the other positive sources and N the union of the
+  negated ones, `|((U_1 ∪ ... ∪ U_m) ∩ R) \ N| = Σ_j |(U_j ∩ R) \ N|`, the terms being disjoint -
+  the sum's own argument, one batch at a time instead of one set. Every pass accumulates into the
+  same recheck queue, visibility-map pin and visibility cache, as the sum's passes do. A list that
+  fits is one pass, and nothing changes for it.
+- **Any other union too wide is WINDOWED** (`lion_wide_fill()`). A union that is not disjoint -
+  an OR across columns (§19), a multi-key OR (§17), a list under an OR - cannot be cut into batches
+  that add up, so an OR node too big for the budget opens its children ONE AT A TIME: for a window
+  of container keys each child is read from the window's first key to its end and ORed into one
+  bitset image per key, and closed before the next is opened; the images come out in ascending key
+  order, as the merge's would. The window holds at most half the budget in images and its end moves
+  DOWN to where they run out (an image full: the largest key is evicted and becomes the end, and the
+  next window starts there), so a sparse union over any heap is one window and a dense one as many
+  as it must be. The children are walked pinless, so a windowed union is never pinned.
+- **An AND over the pin budget keeps one child's pins.** A multi-key `@>` of many CHAIN keys pins a
+  page per key; the intersection needs only the pages of ONE input, so the first child that has a
+  pin at every key keeps its pins and the others let go of each posting leaf as they copy it.
+- **The bitmap walk keeps no pin.** `lion_sets_iterate()` used to keep the §9 pins for a bitmap
+  scan, which needs none; it now walks pinless, planned against work_mem, and the multicolumn scan
+  drops its lists' leaf pins once every set is located (`lion_emit_columns()`).
+- **The copies of a GROUP BY's WHERE sets are budgeted.** `lion_posting_set_materialize()` copies a
+  CHAIN set counted more than once (§9), up to 256 kB each, and a list on another column made every
+  one of its sets a copy, kept for the relation's whole turn with no total. All the copies one
+  count's sources hold, those of earlier groups included, now stay within work_mem; a copy is kept
+  at its exact size (it grew by doubling from a page), and a set that does not fit is walked page by
+  page as a set too big to copy always was, without being tried again at every group.
+
+**§9 is untouched, shape by shape.** A batch pass is an ordinary merge: its cursors pin the page
+each current container came from, the map is asked under those pins, and they are closed before
+the next pass builds any; a batch is sized to fit, so it is never windowed, and whether a pass may
+trust the map is decided per pass from that pass's plans (a batch holding a NOPIN set is not
+pinned). No TID is in two batches - a scalar index holds a row under one entry - and a line pointer
+VACUUM frees between two passes and an insert reuses under another entry is a row inserted after
+our snapshot: invisible to the recheck, and its page cannot be all-visible while our snapshot is
+registered, the case the sum's passes already live with. A trimmed AND is the materialization
+argument of §9: every member of the intersection is in the kept child's container, whose page is
+pinned, so VACUUM cannot have finished ambulkdelete on that index. A windowed union carries nothing,
+and says so: its plan is never `pinned`, so another positive source carries the interlock or the
+count trusts no map at all (`cx.novm`) and rechecks every candidate, as for a NOPIN list under an OR.
+The pins dropped are pins that carried no interlock; a pin too many never made a count right.
+
+**What is still per value.** The located sets themselves: a `LionPostingSet`, its INLINE payload
+copy and a tree node, about 200 bytes a value, which is what the executor spends on the array
+anyway (a 30000-value list costs 7.8 MB of VmHWM with the pushdown off, 15.6 MB with it on at
+work_mem 4MB, 499 MB before). Locating a list a batch at a time, as the plain scan does (§29.4),
+would need the pushdown to keep the values instead of the sets, and the GROUP BY list driver walks
+them. And the query's own text: a multi-key AND of 1000 CHAIN keys (the extraction's cap) still
+holds 1000 page images, 8 MB, though past the pin budget only one child's pins.
+
+Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
+
+| query | before | after |
+|---|---|---|
+| `k = ANY (50000 values) AND x = 1`, 300k rows | 857 MB VmHWM, 4.2 s | 48 MB, 0.22 s |
+| the same, 300k values | 5 GB, 39 s | 102 MB, 0.54 s |
+| the multicolumn bitmap scan of it, 100k values | 1.7 GB | 59 MB, 0.34 s |
+| temporary table, `k = ANY (1100 CHAIN entries) AND x = 1` | "no empty local buffer available" | 29 ms |
+| GROUP BY x, `k = ANY (3000 CHAIN entries)`: copies held after three groups (work_mem 1MB) | 24 MB | 1.6 MB |
+| a batched count parked at its first visibility-map question: posting pages pinned | 400 | 28 (one batch) |
+
+(the VmHWM figures include the shared buffers the query touches, about 10 MB here). And what an
+ordinary list costs, 1M rows, 8334 heap pages, `c20k` INLINE (50 rows a key), `c200` CHAIN (5000):
+backend CPU time per execution (utime + stime over thousands of executions in one session,
+libraries alternated, median of four to six sessions each - wall-clock timings on the shared
+machine this ran on swung by half between two runs of ONE binary, so CPU time is the figure):
+
+| query | before | after |
+|---|---|---|
+| `c20k = 77 AND c2 = 1` | 0.19 ms | 0.20 |
+| `c20k IN (3)` (the sum) | 0.08 | 0.08 |
+| `c20k IN (10) AND c2 = 1` | 0.48 | 0.35 |
+| `c20k IN (100)` | 1.23 | 1.17 |
+| `c20k IN (1000)` | 9.9 | 8.8 |
+| `c20k IN (1000) AND c2 = 1` | 28.1 | 13.1 |
+| `c200 IN (3)` | 0.35 | 0.34 |
+| `c200 IN (3) AND c2 = 0` | 0.43 | 0.43 |
+| `c200 IN (100)` (the merge) | 3.0 | 3.1 |
+| `c200 IN (100) AND c2 = 1` | 4.3 | 4.3 |
+| `c20k IN (100) OR c200 = 5` | 1.9 | 1.9 |
+| `c20k = ANY (5000 values) AND c2 = 1` (wall, pgbench median) | 337 | 122 |
+
+Nothing an ordinary list does got slower; what got faster did so because it no longer allocates and
+touches 8 kB per INLINE value. A list over the budget pays its batches - the other sources read once
+per pass - where it used to pay its memory.
+
+`test/sql/countbudget.sql` proves the lists exact at every length across several batch and window
+boundaries (CHAIN and INLINE entries, NULLs and repeats, a negated source, two lists, GROUP BY on
+the list's own column and another, count(DISTINCT), OR across columns, multi-key `&&` and `@>`, the
+multicolumn bitmap scan) on an all-visible and a dirty heap; that VmHWM grows by less than 16 MB for
+5000 CHAIN sets ANDed with another clause and for the bitmap walk of them, and by less than 48 MB
+for 30000 INLINE ones (Linux only: elsewhere /proc is missing and the checks pass vacuously); that
+a GROUP BY's copies of its WHERE sets stay within work_mem; and that a temporary table in 100 local
+buffers answers what failed before. On the old code every one of those checks fails.
+`test/isolation/count_batch_race.spec` parks a batched count at its first visibility-map question:
+one batch's pages are pinned where the whole list's were, and a VACUUM waits for them.
 
 ## 16. Partitioned tables (v1, implemented)
 
@@ -2528,6 +2670,15 @@ per source, whether EVERY container it can yield comes with a live pin: a leaf h
 is materialized, an AND has it if ANY child has it (all children stand at the key), an OR only if
 EVERY child has it (which children contributed is not known in advance).  A positive source's set is
 only materialized while some positive source still has it.
+
+Since §15's "Bounded cursors" a tree is PLANNED against an open budget before its cursors are built
+(`lion_plan_node()`), and the plan decides two shapes the rules above did not have.  An OR whose
+children would together hold more memory or pins than the budget is read as a WINDOWED union
+(`lion_wide_fill()`): its children are opened one at a time, pinless, and it is never pinned.  An AND
+whose children would hold more pins than the budget keeps them on its first child that has them at
+every key and has the others drop theirs, which leaves the AND rule - any child - exactly as it was.
+`lion_source_pinned()` asks the plan, so what the count trusts and how the cursors are built are one
+decision.
 
 ### Count pushdown (`lion_customscan.c`)
 
@@ -6185,7 +6336,10 @@ does per value. No new cost term: with batches the plain scan's work is linear i
 the bitmap's, and a list that is a Param - the reviewed case - has no length the planner could
 price anyway. Not covered: a multi-key column's `op ANY (array of queries)` still extracts every
 query up front (per query, not per row; arrays of queries are rare), and the BITMAP path's
-multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as it always has.
+multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as it always has - but
+since §15's "Bounded cursors" it walks it within work_mem, as a windowed union, and keeps no pin.
+The same section sized a cursor's staging buffer by its entry's payload, so the ~20 kB per set above
+is what a CHAIN set's cursor (a page image) still comes near and an INLINE one no longer does.
 
 `amgettuple` returns TIDs out of a BATCH: the members of the container the stream is standing on,
 expanded into an array of at most `LION_CONTAINER_RANGE` lo values (`lion_container_to_array()`,
