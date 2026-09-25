@@ -235,9 +235,17 @@ typedef struct LionSetCursor
 	bool		valid;			/* cur points at a container */
 	const LionContainer *cur;
 
-	/* INLINE sets: offset into the payload copy */
+	/*
+	 * INLINE sets: offset into the payload copy, and the aligned buffer an
+	 * item is copied into (payloads are packed).  The buffer is sized for the
+	 * PAYLOAD, not for the largest item there is: lion_inline_fetch() never
+	 * copies more than is left of the payload, so an entry of three rows
+	 * needs a few dozen bytes where LION_CONTAINER_MAX_SIZE - 4104 bytes, which
+	 * the allocator rounds up to 8 kB - was a whole page per value of an IN
+	 * list (lion_inline_stage_size()).
+	 */
 	Size		payoff;
-	LionContainer *cbuf;			/* aligned staging buffer (payloads are packed) */
+	LionContainer *cbuf;
 
 	/* materialized sets: index into set->mat->containers */
 	int			matidx;
@@ -267,18 +275,33 @@ typedef struct LionSetCursor
 	uint32		seekckey;
 	uint32		mintarget;
 
-	/* the sparse segment being expanded, and how far into its pairs */
+	/*
+	 * The sparse segment being expanded, and how far into its pairs.  segbuf
+	 * receives one container key's members at a time, which a well-formed
+	 * segment keeps below LION_SPARSE_THRESHOLD; it is sized for that and
+	 * grown only if a segment ever holds more (segcap is its capacity).
+	 */
 	const LionContainer *seg;
 	uint32		segpos;
-	LionContainer *segbuf;		/* one container key's members, built here */
+	LionContainer *segbuf;
+	Size		segcap;
 
 	/*
 	 * Pin on the source page of the current container.  For an INLINE set
 	 * this is the LionPostingSet's own bucket-page pin, which the cursor
 	 * borrows and must not release (ownpin is false).
+	 *
+	 * droppins: this cursor carries no DESIGN.md §9 interlock for anyone, so
+	 * it lets go of every posting leaf as soon as it has copied it - because
+	 * the whole walk needs none (cx->droppins), or because the expression
+	 * above it has decided that another cursor carries the interlock or that
+	 * none can (the plan of lion_plan_node(): an AND past the pin budget, a
+	 * windowed union).  A pin that carries no interlock only makes VACUUM
+	 * wait and uses up a buffer.
 	 */
 	Buffer		pinbuf;
 	bool		ownpin;
+	bool		droppins;
 
 	LionCountCtx *cx;			/* for statistics */
 } LionSetCursor;
@@ -1466,14 +1489,32 @@ lion_cursor_unpin(LionSetCursor *cur)
 	cur->haspage = false;
 }
 
+/*
+ * The staging buffer an INLINE cursor copies its items into.
+ * lion_inline_fetch() copies at most what is left of the payload, header
+ * peek included, so the payload's own length is always enough; it is never
+ * more than LION_CONTAINER_MAX_SIZE, the largest item there is.  palloc()
+ * MAXALIGNs the buffer whatever its length, which is what a BITSET item's
+ * uint64 words need.
+ */
+static inline Size
+lion_inline_stage_size(Size paylen)
+{
+	Size		size = Max(paylen, LION_CONTAINER_HDRSZ + sizeof(uint16));
+
+	return MAXALIGN(Min(size, LION_CONTAINER_MAX_SIZE));
+}
+
 static void
-lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx)
+lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx,
+				 bool droppins)
 {
 	memset(cur, 0, sizeof(LionSetCursor));
 	cur->set = set;
 	cur->cx = cx;
 	cur->pinbuf = InvalidBuffer;
 	cur->nextblk = InvalidBlockNumber;
+	cur->droppins = droppins || cx->droppins;
 
 	if (!set->found)
 		return;
@@ -1485,7 +1526,7 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	}
 	else if (set->is_inline)
 	{
-		cur->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		cur->cbuf = (LionContainer *) palloc(lion_inline_stage_size(set->paylen));
 		cur->payoff = 0;
 		/* borrowed, not owned: the LionPostingSet releases it */
 		cur->pinbuf = set->pinbuf;
@@ -1535,9 +1576,11 @@ lion_cursor_take_page(LionSetCursor *cur, Buffer buf)
 	 * image and nothing else.  Everything the cursor does next - the items,
 	 * the right link, maxckey for a seek - is read from the image, so the pin
 	 * was only ever the §9 interlock, and a pin held across a paused scan
-	 * would make every VACUUM of the table wait for it.
+	 * would make every VACUUM of the table wait for it.  The same holds for
+	 * a cursor the expression above it has told to carry no interlock
+	 * (cur->droppins, see LionSetCursor).
 	 */
-	if (cur->cx->droppins)
+	if (cur->droppins)
 	{
 		UnlockReleaseBuffer(buf);
 		cur->pinbuf = InvalidBuffer;
@@ -1680,6 +1723,8 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	const uint16 *los = LION_SPARSE_LOS_CONST(seg);
 	uint32		n = seg->cardinality;
 	uint32		ckey;
+	uint32		end;
+	Size		need;
 
 	/*
 	 * A seek may have asked for a container key inside this segment's range
@@ -1694,15 +1739,35 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	if (cur->segpos >= n)
 		return false;
 
+	ckey = ckeys[cur->segpos];
+
 	/*
 	 * Allocated on first use, not per cursor: an IN list of a thousand values
 	 * (DESIGN.md §15) is a thousand cursors, and most posting sets hold no
-	 * sparse segment at all.
+	 * sparse segment at all.  And sized for what one container key of a
+	 * segment holds, fewer than LION_SPARSE_THRESHOLD members, rather than
+	 * for the largest container: a sparse column's IN list used to cost a
+	 * second 8 kB per value here.  A segment is not trusted to keep that
+	 * promise, though - the buffer grows to whatever this key's pairs need,
+	 * which an ARRAY container of up to LION_ARRAY_MAX_CARD members and
+	 * LION_CONTAINER_MAX_SIZE beyond that (lion_container_append_sorted()
+	 * turns it into a BITSET) always covers.
 	 */
-	if (cur->segbuf == NULL)
-		cur->segbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	for (end = cur->segpos; end < n && ckeys[end] == ckey; end++)
+		;
+	if (end - cur->segpos > LION_ARRAY_MAX_CARD)
+		need = LION_CONTAINER_MAX_SIZE;
+	else
+		need = LION_CONTAINER_HDRSZ +
+			Max(end - cur->segpos, LION_SPARSE_THRESHOLD) * sizeof(uint16);
+	if (cur->segbuf == NULL || cur->segcap < need)
+	{
+		/* (the old one, if any, goes with the context: only a malformed
+		 * segment can get here twice) */
+		cur->segcap = MAXALIGN(need);
+		cur->segbuf = (LionContainer *) palloc(cur->segcap);
+	}
 
-	ckey = ckeys[cur->segpos];
 	lion_container_init(cur->segbuf, ckey);
 	do
 	{
@@ -2228,7 +2293,7 @@ lion_ecursor_init(LionExprCursor *c, const LionKeyNode *node,
 	if (node->kind == LION_KN_KEY)
 	{
 		Assert(node->keyno >= 0 && node->keyno < nsets);
-		lion_cursor_init(&c->leaf, &sets[node->keyno], cx);
+		lion_cursor_init(&c->leaf, &sets[node->keyno], cx, false);
 	}
 	else
 	{
@@ -3620,7 +3685,7 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		ps = &fresh;
 	}
 
-	lion_cursor_init(&cur, ps, cx);
+	lion_cursor_init(&cur, ps, cx, false);
 	while (cur.valid)
 	{
 		lion_count_container_vm(cx, cur.cur);
