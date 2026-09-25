@@ -174,11 +174,16 @@ typedef struct LionPostingSet
 	 * Bookkeeping for materialization.  cxt is the memory context the set was
 	 * located in, which is where the copies go; nuses counts the calls of
 	 * lion_count_posting_sets() this set has taken part in, and is what tells
-	 * a one-shot count apart from a set the GROUP BY path reuses.
+	 * a one-shot count apart from a set the GROUP BY path reuses.  matfailed
+	 * says a copy was tried and given up on - the set is too big, or the
+	 * copies its count's sources already hold have spent their budget
+	 * (DESIGN.md §15, "Bounded cursors") - so it is not walked again for a
+	 * copy that would fail the same way at every group.
 	 */
 	MemoryContext cxt;
 	int			nuses;
 	struct LionMatSet *mat;		/* materialized containers, or NULL */
+	bool		matfailed;
 
 	/*
 	 * A private copy of the key exactly as the index stored it.  Callers that

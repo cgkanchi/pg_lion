@@ -151,6 +151,27 @@ SELECT lion_cbcmp('SELECT x, count(*) FROM lion_cb WHERE k = ANY (array(SELECT g
 SELECT lion_cbcmp(format('SELECT count(*) FROM lion_cb WHERE tags && %L::int[]',
 						 (SELECT array_agg(g) FROM generate_series(1, 600) g)));
 
+-- ---------- the copies a GROUP BY keeps of its WHERE sets ----------
+/*
+ * From its second group on, a GROUP BY serves its WHERE sets from private
+ * copies (DESIGN.md §9), kept in the node's "LionCount where keys" context
+ * until the relation's last group.  A list on another column made a copy of
+ * every one of its CHAIN sets - each at least a page, since the copy grew by
+ * doubling from one - with no total: 3000 sets held 24 MB.  They share
+ * work_mem now, at their exact size.  A cursor stops the GROUP BY after a
+ * few groups, with its sets located and their copies made.
+ */
+SET work_mem = '1MB';
+SELECT lion_cbcmp('SELECT x, count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY x');
+BEGIN;
+DECLARE lion_cb_cur CURSOR FOR
+	SELECT x, count(*) FROM lion_cb
+	 WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY x;
+FETCH 3 FROM lion_cb_cur;
+SELECT sum(total_bytes) BETWEEN 1 AND 4 * 1024 * 1024 AS copies_within_budget
+  FROM pg_backend_memory_contexts WHERE name = 'LionCount where keys';
+FETCH ALL FROM lion_cb_cur;
+COMMIT;
 RESET work_mem;
 
 -- ---------- memory ----------

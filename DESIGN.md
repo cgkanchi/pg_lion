@@ -1923,7 +1923,7 @@ rounds up), a page image for a CHAIN one, a second 8 kB the first time it expand
 - and each CHAIN cursor a buffer pin, from the moment it was built until it moved past its page.
 Only the disjoint sum, one set at a time, escaped it; an IN list ANDed with another clause, a dense
 list (`lion_sum_is_cheaper()` sends it to the merge), a list under an OR, a GROUP BY with a list on
-another column and the bitmap walk of a multicolumn index all paid it, and
+another column (its copies too, below) and the bitmap walk of a multicolumn index all paid it, and
 work_mem never came into it. Measured on 18.6 (assert build), 300k rows, work_mem 4MB:
 `k = ANY (50000 values) AND x = 1` peaked at 857 MB of VmHWM in 4.2 s (300k values: 5 GB, 39 s),
 the multicolumn bitmap scan of 100k values at 1.7 GB, and over a TEMPORARY table a list of 1100
@@ -1970,6 +1970,12 @@ What changed, each where the cost was:
 - **The bitmap walk keeps no pin.** `lion_sets_iterate()` used to keep the §9 pins for a bitmap
   scan, which needs none; it now walks pinless, planned against work_mem, and the multicolumn scan
   drops its lists' leaf pins once every set is located (`lion_emit_columns()`).
+- **The copies of a GROUP BY's WHERE sets are budgeted.** `lion_posting_set_materialize()` copies a
+  CHAIN set counted more than once (§9), up to 256 kB each, and a list on another column made every
+  one of its sets a copy, kept for the relation's whole turn with no total. All the copies one
+  count's sources hold, those of earlier groups included, now stay within work_mem; a copy is kept
+  at its exact size (it grew by doubling from a page), and a set that does not fit is walked page by
+  page as a set too big to copy always was, without being tried again at every group.
 
 **§9 is untouched, shape by shape.** A batch pass is an ordinary merge: its cursors pin the page
 each current container came from, the map is asked under those pins, and they are closed before
@@ -2001,6 +2007,7 @@ Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
 | the same, 300k values | 5 GB, 39 s | 102 MB, 0.54 s |
 | the multicolumn bitmap scan of it, 100k values | 1.7 GB | 59 MB, 0.34 s |
 | temporary table, `k = ANY (1100 CHAIN entries) AND x = 1` | "no empty local buffer available" | 29 ms |
+| GROUP BY x, `k = ANY (3000 CHAIN entries)`: copies held after three groups (work_mem 1MB) | 24 MB | 1.6 MB |
 | a batched count parked at its first visibility-map question: posting pages pinned | 400 | 28 (one batch) |
 
 (the VmHWM figures include the shared buffers the query touches, about 10 MB here). And what an
@@ -2033,9 +2040,9 @@ boundaries (CHAIN and INLINE entries, NULLs and repeats, a negated source, two l
 the list's own column and another, count(DISTINCT), OR across columns, multi-key `&&` and `@>`, the
 multicolumn bitmap scan) on an all-visible and a dirty heap; that VmHWM grows by less than 16 MB for
 5000 CHAIN sets ANDed with another clause and for the bitmap walk of them, and by less than 48 MB
-for 30000 INLINE ones (Linux only: elsewhere /proc is missing and the checks pass vacuously); and
-that a temporary table in 100 local buffers answers what failed before. On the old code every one
-of those checks fails.
+for 30000 INLINE ones (Linux only: elsewhere /proc is missing and the checks pass vacuously); that
+a GROUP BY's copies of its WHERE sets stay within work_mem; and that a temporary table in 100 local
+buffers answers what failed before. On the old code every one of those checks fails.
 `test/isolation/count_batch_race.spec` parks a batched count at its first visibility-map question:
 one batch's pages are pinned where the whole list's were, and a VACUUM waits for them.
 

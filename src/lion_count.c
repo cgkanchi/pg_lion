@@ -228,6 +228,7 @@ typedef struct LionMatSet
 {
 	int			ncontainers;
 	Size		bytes;
+	Size		held;			/* what the copy takes from its context */
 	char	   *buf;
 	LionContainer **containers;
 } LionMatSet;
@@ -612,6 +613,7 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 	ps->cxt = CurrentMemoryContext;
 	ps->nuses = 0;
 	ps->mat = NULL;
+	ps->matfailed = false;
 
 	/*
 	 * lion_fetch_key() points into the page for by-reference types, so copy
@@ -1341,6 +1343,7 @@ lion_posting_set_release(LionPostingSet *ps)
 	ps->payload = NULL;			/* the memory belongs to the caller's context */
 	ps->paylen = 0;
 	ps->mat = NULL;				/* ... and so does the materialized copy */
+	ps->matfailed = false;
 	ps->nuses = 0;
 	ps->hasstoredkey = false;
 	ps->keyisnull = false;
@@ -1390,9 +1393,14 @@ lion_posting_set_release(LionPostingSet *ps)
  * and rightlink read together under one SHARE lock - so a concurrent page
  * split (which only ever moves items to a new page to the right) cannot make
  * us miss or duplicate a container.
+ *
+ * maxbytes is what the copy may take at most: what is left of the budget of
+ * all the copies one count's sources hold (lion_count_sources_run(); DESIGN.md
+ * §15, "Bounded cursors").  A set that does not fit is given up on for good
+ * (ps->matfailed) and keeps being walked page by page.
  */
 static bool
-lion_posting_set_materialize(LionPostingSet *ps)
+lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 {
 	MemoryContext oldcxt;
 	PGAlignedBlock *imgbuf;
@@ -1471,6 +1479,18 @@ lion_posting_set_materialize(LionPostingSet *ps)
 				break;
 			}
 
+			/*
+			 * ... and whatever it is, once the count's copies are spent.  The
+			 * copy is kept at its exact size (below), so this is what it will
+			 * hold.
+			 */
+			if (sizeof(LionMatSet) + MAXALIGN(used + sz) +
+				sizeof(LionContainer *) * (noffs + 1) > maxbytes)
+			{
+				ok = false;
+				break;
+			}
+
 			while (used + sz > cap)
 			{
 				cap *= 2;
@@ -1516,8 +1536,25 @@ lion_posting_set_materialize(LionPostingSet *ps)
 	{
 		LionMatSet  *mat = (LionMatSet *) palloc(sizeof(LionMatSet));
 
+		/*
+		 * The buffer grew by doubling from a page; what is kept is the exact
+		 * size, because a GROUP BY may keep hundreds of these for as long as
+		 * the relation is counted, and a set of one small segment would
+		 * otherwise hold eight kilobytes.
+		 */
+		if (cap > used)
+		{
+			char	   *exact = (char *) palloc(Max(used, (Size) 1));
+
+			memcpy(exact, buf, used);
+			pfree(buf);
+			buf = exact;
+		}
+
 		mat->ncontainers = noffs;
 		mat->bytes = used;
+		mat->held = sizeof(LionMatSet) + MAXALIGN(Max(used, (Size) 1)) +
+			sizeof(LionContainer *) * Max(noffs, 1);
 		mat->buf = buf;
 		mat->containers = (LionContainer **)
 			palloc(sizeof(LionContainer *) * Max(noffs, 1));
@@ -1545,6 +1582,7 @@ lion_posting_set_materialize(LionPostingSet *ps)
 	else
 	{
 		pfree(buf);
+		ps->matfailed = true;
 	}
 
 	pfree(offs);
@@ -5439,6 +5477,8 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	bool		summed;
 	bool		oneset;
 	int			batchsrc;
+	Size		matheld;
+	Size		matbudget = (Size) work_mem * 1024;
 	int			npositive = 0;
 	int			i;
 	int			j;
@@ -5531,15 +5571,26 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 * whose rows are dead (a live row's key cannot change without the row
 	 * getting a new TID), and subtracting a dead TID cannot take a live row
 	 * out of the count.
+	 *
+	 * And the copies are BUDGETED (DESIGN.md §15, "Bounded cursors").  They
+	 * live as long as the sets do - for a GROUP BY, the whole of a relation's
+	 * turn - and a list on another column made every one of its CHAIN sets a
+	 * copy, up to 256 kB each, with nothing bounding the total.  So all the
+	 * copies this count's sources hold, those made by earlier counts of the
+	 * same sets included, stay within work_mem; a set that does not fit is
+	 * walked page by page, as a set too big to copy always was.
 	 */
 	carry = (bool *) palloc0(sizeof(bool) * nsources);
 	ncarry = 0;
+	matheld = 0;
 	for (i = 0; i < nsources; i++)
 	{
 		for (j = 0; j < sources[i].nsets; j++)
 		{
 			if (sources[i].sets[j].found)
 				sources[i].sets[j].nuses++;
+			if (sources[i].sets[j].mat != NULL)
+				matheld += sources[i].sets[j].mat->held;
 		}
 
 		if (sources[i].negated)
@@ -5583,9 +5634,16 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 			if (ps->ncontainers > LION_MATERIALIZE_MAX_CONTAINERS &&
 				ps->ntids > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16))
 				continue;		/* hopeless even as an ARRAY of members */
+			if (ps->matfailed)
+				continue;		/* tried, and too big for what was left */
+			if (matheld >= matbudget)
+				continue;		/* the budget is spent */
 
-			if (lion_posting_set_materialize(ps) && !sources[i].negated &&
-				carry[i] &&
+			if (!lion_posting_set_materialize(ps, matbudget - matheld))
+				continue;
+			matheld += ps->mat->held;
+
+			if (!sources[i].negated && carry[i] &&
 				!lion_source_pinned(trees[i], sources[i].sets,
 									i == batchsrc ? NULL : &budget))
 			{
