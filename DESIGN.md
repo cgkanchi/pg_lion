@@ -835,25 +835,32 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
 SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
 `lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anycompatible) RETURNS bigint`,
 whose keys are of two unrelated polymorphic types because each is compared with its own index's
-column and the two columns need not share a type. Both open the heap via IndexGetRelation with AccessShareLock, use
-GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
+column and the two columns need not share a type. Both open the heap via IndexGetRelation with
+AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
+SELECT.
 **The key's type is resolved as `col = key` would resolve it** (`lion_count_key_type()`, 2026-09-25
 review; before it the key had to BE the index's opcintype or have a cross-type member, so enum_ops, a
 DEFAULT class, could not be counted at all and neither could a varchar key on the varchar column it
-indexes): a domain is its base type; then the class's own type, or a type the family has a
-strategy-1 member for with it (int8 on int4: `int48eq`, which §21's probe resolves further); lacking
-one, a BINARY coercion to the class's type (varchar on text_ops - the parser relabels it and calls
-`texteq`), never a cast function (§21); and for a class on a POLYMORPHIC type (enum_ops) the
-column's actual type and nothing else, since a different enum would pass for "an enum" and its OIDs
-mean nothing to this column (DETAIL names the column's type, not anyenum). The resolved type is what
-the lookup is made as and what the EXECUTE check names the equality by (enum_eq, texteq;
-test/sql/security_exec.sql). `lion_index_count_any()` resolves its array's element type the same way.
+indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
+the column's actual type and nothing else: a different enum would pass for "an enum", and its OIDs
+mean nothing to this column (the DETAIL names the column's type, not anyenum). Otherwise the key is
+of the class's own type, or of a type the family has a strategy-1 member for with it (int8 on int4:
+`int48eq`, which §21's probe resolves further), or - lacking one - BINARY-coercible to the class's
+type where the parser makes that coercion itself: its `=` for (column type, key type) must be the
+class's own (opcintype, opcintype) operator reached without a cast function (`compatible_oper()`),
+as for varchar on text_ops, which the parser relabels to call `texteq`. A cast function is never
+taken (§21), and a coercion merely existing is not enough: text is binary-coercible to bpchar, but
+`bpcharcol = 'x '::text` is `text = text` on the column cast by rtrim1(), and matches none of the
+rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
+the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
+`lion_index_count_any()` resolves its array's element type the same way.
 **A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
 STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
 argument - a NULL constant folds the call away when the query is planned - so no count is made,
-nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding what a keyless count checks, and the query it would
-stand for does not settle it: the planner folds `col = NULL` to a constant-false filter, so that
-query reads no index, calls no equality and never asks whether a materialized view is populated.
+nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding
+what a keyless count checks, and the query it would stand for does not settle it: the planner folds
+`col = NULL` to a constant-false filter, so that query reads no index, calls no equality and never
+asks whether a materialized view is populated.
 A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY (...)`, and counts
 0; a NULL array is a NULL argument.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
