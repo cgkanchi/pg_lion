@@ -267,3 +267,60 @@ lion_index_verify
                  
 (1 row)
 
+
+starting permutation: s2_delw s1_w s3_pinsw s3_vacw s2_addw s1_rest s1_check_w s3_verifyw
+step s2_delw: DELETE FROM gw WHERE a BETWEEN 30000 AND 36000;
+step s1_w: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SET LOCAL pg_lion.scan_window_floor = '64kB';
+	SET LOCAL work_mem = '64kB';
+	DECLARE c CURSOR FOR SELECT id FROM gw WHERE a BETWEEN 100 AND 39000 AND b = 1;
+	SELECT gp_take('c', 5) AS first;
+
+first
+-----
+    5
+(1 row)
+
+step s3_pinsw: 
+	SELECT count(*) AS index_pages_pinned FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode = pg_relation_filenode('gw_ab') AND pinning_backends > 0;
+
+index_pages_pinned
+------------------
+                 0
+(1 row)
+
+step s3_vacw: VACUUM (INDEX_CLEANUP ON) gw;
+step s2_addw: 
+	INSERT INTO gw SELECT 100000 + i, 30000 + i % 6000, 1, 'new'
+	  FROM generate_series(1, 6000) i;
+
+step s1_rest: SELECT gp_take('c', NULL) AS rest;
+rest
+----
+8220
+(1 row)
+
+step s1_check_w: 
+	SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+	SELECT (SELECT count(*) FROM gp_got) AS got,
+		   (SELECT count(DISTINCT id) FROM gp_got) AS distinct_ids,
+		   (SELECT count(*) FROM gw WHERE a BETWEEN 100 AND 39000 AND b = 1) AS expected,
+		   (SELECT count(*) FROM gp_got g WHERE NOT EXISTS
+			 (SELECT 1 FROM gw WHERE gw.id = g.id AND gw.a BETWEEN 100 AND 39000
+				 AND gw.b = 1)) AS wrong;
+	COMMIT;
+
+ got|distinct_ids|expected|wrong
+----+------------+--------+-----
+8225|        8225|    8225|    0
+(1 row)
+
+step s3_verifyw: SELECT lion_index_verify('gw_ab', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

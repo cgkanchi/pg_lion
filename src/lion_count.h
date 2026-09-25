@@ -503,8 +503,9 @@ extern void lion_stream_end(LionSetStream *st);
  * as a stream - or as a set to probe - can open one.  lion_source_next()
  * hands out one container at a time, and never a TID the index does not
  * hold; when lion_source_sorted() the whole answer is one strictly ascending
- * run of container keys, each TID exactly once (SETS, UNION); a WALK streams
- * entry by entry and a long IN list batch by batch, ascending within each.
+ * run of container keys, each TID exactly once (SETS, UNION, WINDOW); a WALK
+ * streams entry by entry and a long IN list batch by batch, ascending within
+ * each.
  * lion_source_exact() is false when the TIDs are a superset that the caller
  * must recheck (§29.6).  keys must stay valid while the source is open.
  */
