@@ -399,6 +399,75 @@ INSERT INTO lis_ex4 VALUES (5, '{2,5}');
 INSERT INTO lis_ex4 VALUES (6, '{4,5}'), (7, '{}');
 SELECT id, tags FROM lis_ex4 ORDER BY id;
 
+-- ---------- 8. a partial multi-key index scanned whole, at a tiny work_mem ----------
+-- A multi-key column that has to be read whole is streamed as the exact
+-- union of its entries (DESIGN.md §29.3).  It used to be a private bitmap,
+-- whose lossy pages named every offset - rows the partial index does not
+-- hold, which neither a plain scan (the predicate is not rechecked) nor an
+-- index-only scan (nothing is) could tell apart: 140216 rows with flag false
+-- came back below, and a count of 175076 for 100000.
+CREATE TABLE lis_pr (id int, tags int[], flag bool);
+INSERT INTO lis_pr SELECT g, ARRAY[g % 10], g % 2 = 0 FROM generate_series(1, 400000) g;
+CREATE INDEX lis_pr_tags ON lis_pr USING lion (tags) WHERE flag;
+VACUUM ANALYZE lis_pr;
+SET work_mem = '64kB';
+SET pg_lion.enable_count_pushdown = off;
+SET enable_bitmapscan = off;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT flag, count(*) FROM (SELECT id, flag FROM lis_pr
+	WHERE flag AND tags <@ '{0,1,2,3,4,5,6,7,8,9}') s GROUP BY flag;
+SELECT flag, count(*) FROM (SELECT id, flag FROM lis_pr
+	WHERE flag AND tags <@ '{0,1,2,3,4,5,6,7,8,9}') s GROUP BY flag ORDER BY flag;
+SELECT flag, count(*) FROM (SELECT id, flag FROM lis_pr
+	WHERE flag AND tags IS NOT NULL) s GROUP BY flag ORDER BY flag;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+CREATE TABLE lis_pt (id int, tags int[], flag bool, pad text);
+INSERT INTO lis_pt SELECT g, ARRAY[g % 10], g % 2 = 0, repeat('x', 200)
+  FROM generate_series(1, 200000) g;
+CREATE INDEX lis_pt_tags ON lis_pt USING lion (tags) WHERE flag;
+VACUUM ANALYZE lis_pt;
+-- with nothing disabled: an index-only scan of the partial multi-key index
+SELECT lion_top('SELECT count(*) FROM lis_pt WHERE flag');
+SELECT count(*) FROM lis_pt WHERE flag;
+SELECT lion_ios('SELECT count(*) FROM lis_pt WHERE flag');
+SELECT lion_ios('SELECT count(*) FROM lis_pr WHERE flag');
+-- ... and after the heap is dirtied, so the index-only scan visits the heap
+UPDATE lis_pt SET pad = 'y' WHERE id % 50 = 0;
+DELETE FROM lis_pt WHERE id % 70 = 0;
+SELECT lion_ios('SELECT count(*) FROM lis_pt WHERE flag');
+RESET work_mem;
+DROP TABLE lis_pr, lis_pt;
+
+-- ---------- 9. a long IN list, located a batch at a time ----------
+-- Every value of an IN list used to be located up front with a cursor of its
+-- own, eleven kilobytes each: 20000 values held 220 MB.  Past a batch
+-- (work_mem / 32 kB values, at least 32) the plain scan locates and streams
+-- the list a batch at a time (DESIGN.md §29.4).
+BEGIN;
+SET LOCAL pg_lion.enable_count_pushdown = off;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SELECT lion_top('SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g))');
+DECLARE lst CURSOR FOR
+	SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g));
+FETCH 5 FROM lst;
+SELECT count(*) > 0 AS scan_contexts,
+	   sum(total_bytes) < pg_size_bytes(current_setting('work_mem')) AS within_work_mem
+  FROM pg_backend_memory_contexts WHERE name LIKE 'lion index scan%';
+MOVE FORWARD ALL IN lst;
+COMMIT;
+-- the answers: duplicates, NULLs, a spelling per batch boundary, other columns
+SET work_mem = '64kB';
+SELECT lion_iq('SELECT id FROM lis WHERE u = ANY (array(SELECT (g % 250) * 3 FROM generate_series(1, 600) g))');
+SELECT lion_iq('SELECT id FROM lis WHERE u = ANY (array(SELECT CASE WHEN g % 9 = 0 THEN NULL ELSE g * 11 END FROM generate_series(1, 600) g)) AND u > 2000');
+SELECT lion_iq('SELECT id FROM lis WHERE ci = ANY (array(SELECT CASE g % 4 WHEN 0 THEN ''alice'' WHEN 1 THEN ''ALICE'' WHEN 2 THEN ''Bob'' || (g % 5) ELSE ''bOB'' || (g % 5) END::citext FROM generate_series(1, 500) g))');
+SELECT lion_iq('SELECT id FROM lis WHERE g = 3 AND kk = ANY (array(SELECT g % 200 FROM generate_series(1, 400) g))');
+SELECT lion_iq('SELECT id FROM lis WHERE k = ANY (array(SELECT g % 250 FROM generate_series(1, 700) g)) AND n IS NULL');
+RESET work_mem;
+
 DROP TABLE lis, lis_outer, lis_big, lis_f, lis_ex, lis_ex2, lis_ex3, lis_ex4;
 DROP FUNCTION lion_iq(text);
 DROP FUNCTION lion_ir(text);

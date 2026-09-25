@@ -643,6 +643,54 @@ lion_probe_key_cmp(const void *a, const void *b, void *arg)
 }
 
 /*
+ * Sort the non-NULL values of a list into the order a lookup locates them in
+ * (lion_probe_key_cmp(): the probe's own comparison, then the hash), and hand
+ * back each one's hash.  Returns how many there are.  Two values of one
+ * equality class compare equal and hash alike, so they come out adjacent and
+ * with equal hashes: a caller that cuts the list only where the hash changes
+ * never splits a class between two pieces, which is what lets a plain scan
+ * locate a long list piece by piece without ever returning an entry twice
+ * (DESIGN.md §29.4).
+ */
+int
+lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
+				const Datum *values, const bool *isnull, Datum *sorted,
+				uint32 *hashes)
+{
+	LionState   *state = lion_index_column_state(index, attno);
+	LionProbe	probe;
+	LionProbeSort sortctx;
+	LionProbeKey *probes;
+	int			n = 0;
+	int			i;
+
+	lion_probe_init(index, state, keytype, &probe);
+	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * Max(nvalues, 1));
+	for (i = 0; i < nvalues; i++)
+	{
+		if (isnull != NULL && isnull[i])
+			continue;
+		probes[n].hash = lion_probe_hash(state, &probe, values[i]);
+		probes[n].idx = i;
+		n++;
+	}
+
+	sortctx.values = values;
+	sortctx.probe = &probe;
+	sortctx.collation = state->collation;
+	if (n > 1)
+		qsort_arg(probes, n, sizeof(LionProbeKey), lion_probe_key_cmp, &sortctx);
+
+	for (i = 0; i < n; i++)
+	{
+		sorted[i] = values[probes[i].idx];
+		hashes[i] = probes[i].hash;
+	}
+	pfree(probes);
+	return n;
+}
+
+/*
  * Fill *ps from the entry the caller has located at (buf, offnum), which is a
  * directory leaf held SHARE, and release the buffer - keeping its pin when the
  * entry is INLINE, because that pin is the DESIGN.md §9 interlock.
@@ -2061,7 +2109,7 @@ lion_or_heap_pop(LionExprCursor *c)
  * k containers is this file's problem (DESIGN.md §15) and the shape of a
  * container payload is lion_container.h's published interface.
  */
-static void
+void
 lion_bits_or_container(uint64 *w, const LionContainer *c)
 {
 	const char *payload = (const char *) c + LION_CONTAINER_HDRSZ;
@@ -2126,7 +2174,7 @@ lion_bits_or_container(uint64 *w, const LionContainer *c)
  * LION_CONTAINER_MAX_SIZE), in the smallest representation, exactly as
  * lion_container_or() would have left it.
  */
-static void
+void
 lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
 {
 	uint64		card = 0;
@@ -4830,6 +4878,19 @@ lion_stream_begin(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 	lion_ecursor_init(&st->cursor, node, sets, nsets, &st->cx);
 	st->first = true;
 	return st;
+}
+
+/*
+ * Skip every container key below target.  Only before the first
+ * lion_stream_next(): the stream then starts at the first container at or
+ * above target, reached by the cursors' seeks (§22) rather than a walk.
+ */
+void
+lion_stream_seek(LionSetStream *st, uint32 target)
+{
+	Assert(st->first);
+	if (!st->empty && st->cursor.valid && st->cursor.ckey < target)
+		lion_ecursor_seek(&st->cursor, target);
 }
 
 /*

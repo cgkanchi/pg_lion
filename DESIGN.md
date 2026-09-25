@@ -5645,7 +5645,7 @@ answer is delivered: into a TIDBitmap, or as a stream the executor pulls one TID
 ### 29.3 The TID source (`LionSource`, lion_scan.c)
 
 A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgettuple` call after
-`amrescan`. It has one of four shapes:
+`amrescan`. It has one of five shapes:
 
 - **NONE**: a chosen qual selects nothing (`col = NULL`, an empty or all-NULL list, a key absent
   from the index, a multi-key query in mode NONE). `amgettuple` returns false at once.
@@ -5670,13 +5670,26 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   the column orders the elements; an UNORDERED column walks ONCE, testing each entry against every
   element's range (the bitmap path walks once per element and lets the bitmap absorb the overlap,
   which a stream cannot).
-- **BITMAP**: a MULTI-KEY column would have to be walked - `IS NOT NULL`, a query in mode ALL
+- **LIST**: an IN list on a scalar column longer than a batch (§29.4) is located and streamed a
+  batch at a time, each batch the SETS shape with the other columns' trees ANDed in. It outranks a
+  walk, which is then left to the recheck, and a second long list is left to the recheck too.
+- **UNION**: a MULTI-KEY column would have to be read whole - `IS NOT NULL`, a query in mode ALL
   (§17) with nothing else expressible, or a no-key scan whose first column is multi-key. A row is
   under several entries of such a column, so walking them would return it several times. The
-  scan then runs `liongetbitmap()` into a private TIDBitmap (`work_mem`, lossy past it, like any
-  bitmap) and iterates it; a lossy page returns every offset up to `MaxHeapTuplesPerPage` with
-  recheck set, and the heap fetch finds nothing at the ones that hold no tuple. Always rechecked.
-  Correct and expensive, which is what the cost model already says about these quals.
+  scan streams the exact UNION of the column's entries instead, a WINDOW of container keys at a
+  time: every entry is sought to the window's first key and read to its end, and ORed into one
+  bitset image per container key of the window (`max(16, work_mem / 4 kB)` of them); the next
+  window starts at the smallest key any entry had past this one. Each window walks the column's
+  entries once. Always rechecked (the quals of mode ALL need it). Correct and expensive, which is
+  what the cost model already says about these quals.
+  *(Deviation from this section's first version, which ran `liongetbitmap()` into a private
+  TIDBitmap and, on a LOSSY page, returned every offset up to `MaxHeapTuplesPerPage` "with recheck
+  set". That is right for a bitmap heap scan, which re-applies the index PREDICATE to a lossy
+  page (bitmapqualorig), and wrong for a plain Index Scan, whose recheck quals are the index quals
+  minus what the predicate implies, and for an index-only scan, which rechecks nothing: on a
+  partial `(tags) WHERE flag` index at 64 kB of work_mem, `count(*) WHERE flag` answered 175,076
+  for 100,000 and a plain scan returned 140,216 rows with `flag` false - the 2026-09-24 review.
+  The rule that fixes it is §29.6's first one: no shape returns a TID the index does not hold.)*
 
 Scalar entries of one column are disjoint (one entry per equality class, §21), so a WALK never
 returns a TID twice either, and neither does SETS, whose OR node merges by container key.
@@ -5694,14 +5707,36 @@ points into the walk's private copy of the leaf, a CHAIN entry's `head` is its p
 
 ### 29.4 Batches and memory
 
+**Every located set costs its cursor, and an IN list is located whole** - which the first version
+of this section missed: a located set with the cursor that reads it takes ~20 kB (the cursor's
+4 kB staging container, its share of the OR node, the set), so a 20,000-value list held 220 MB and
+`c1m = any(array(select ... 300000 ...)) LIMIT 10`, planned as a plain Index Scan, peaked at
+1.37 GB to return ten rows (2026-09-24 review). The bitmap path never had it: `lion_emit_array()`
+looks its values up one at a time. So a list longer than a BATCH - `max(32, work_mem / 32 kB)`
+values, which keeps a batch's cursors inside `work_mem` - is the LIST shape: its values are sorted
+once into lookup order (`lion_probe_sort()`: the probe's comparison, then the hash), and located
+and streamed a batch at a time, the previous batch's sets and pins gone before the next is located
+(the §11 order). A batch is cut only where the HASH changes, and every value of one equality class
+compares equal and hashes alike, so the class's values sit next to each other and never straddle
+two batches: no entry is located twice, and since distinct entries of a scalar column are
+disjoint, no TID is returned twice - citext's `'Alice'` and `'alice'` included. What stays is the
+list itself, sorted: 12 bytes per value next to the executor's own array. The heap is visited in
+physical order within a batch and restarts per batch, which is what a btree scan of the same list
+does per value. No new cost term: with batches the plain scan's work is linear in the list, like
+the bitmap's, and a list that is a Param - the reviewed case - has no length the planner could
+price anyway. Not covered: a multi-key column's `op ANY (array of queries)` still extracts every
+query up front (per query, not per row; arrays of queries are rare), and the BITMAP path's
+multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as it always has.
+
 `amgettuple` returns TIDs out of a BATCH: the members of the container the stream is standing on,
-expanded into an array of at most `LION_CONTAINER_RANGE` TIDs (`lion_container_to_tids()`, the
-same per-heap-block order `lion_container_to_tbm()` emits). The next container is pulled only when
-the batch is used up. What the scan holds between two calls is therefore bounded by the query and
-never by the data: one container's TIDs; one 8 KB image per posting-set cursor of the tree (the
-page its current container came from - an IN list of k CHAIN keys holds k of them, exactly as the
-bitmap path's merge does); the INLINE payload copies of the located sets (at most an entry each,
-`LION_MAX_ENTRY_SIZE`); and for a WALK one directory leaf image. A posting set of any size is
+expanded into an array of at most `LION_CONTAINER_RANGE` lo values (`lion_container_to_array()`,
+turned into a TID one at a time, in the per-heap-block order `lion_container_to_tbm()` emits). The
+next container is pulled only when the batch is used up. What the scan holds between two calls is
+therefore bounded by `work_mem` and the query, never by the data: one container's members; one
+8 KB image per posting-set cursor of the tree (the page its current container came from), for at
+most a batch of an IN list's sets (above); the INLINE payload copies of those sets (at most an
+entry each, `LION_MAX_ENTRY_SIZE`); for a WALK one directory leaf image; for a UNION its window of
+bitset images; and a long list's values, sorted. A posting set of any size is
 STREAMED container by container - a 5M-row entry is never materialized - and a walk of any width
 holds one entry's stream at a time. Memory lives in a per-scan context reset by `amrescan`, and a
 walk's per-entry cursors in a per-entry context reset before the next entry, so a nested-loop inner
@@ -5793,8 +5828,8 @@ key keeps its own - the same rules §9 states for the count (`lion_source_pinned
   that has one sets `xs_recheck`, which filters a recycled slot whose new tuple does not match;
   the one residual effect - the same matching row twice through two stale entries - needs a
   thousand-leaf IN list under a dirty snapshot, which no caller in core builds (below).
-- The BITMAP shape (§29.3) holds no pins in either mode and is always rechecked; a TIDBitmap is a
-  set, so it cannot return a TID twice. A multi-key query's sets are located unpinned in either
+- The UNION shape (§29.3) holds no pins in either mode (its windows copy containers out of many
+  pages) and is always rechecked; a union cannot return a TID twice. A multi-key query's sets are located unpinned in either
   mode too (the tree builder the bitmap path shares drops their pins), and a multi-key scan is
   always rechecked (§29.6); `EXCLUDE USING lion (tags WITH &&)` is such a scan, and a conflict it
   reports through a recycled slot is a row that really overlaps.
@@ -5829,7 +5864,18 @@ Who scans a lion index with a non-MVCC snapshot, and the decision for each:
 
 ### 29.6 `xs_recheck`
 
-Set, for every TID of the scan, when any of these holds; otherwise the TIDs are exact:
+**First, the rule every shape keeps: no TID the index does not hold is ever returned** - only TIDs
+that some entry's posting set held when the scan read it, each at most once. `xs_recheck` is a
+statement about the QUALS the index was asked to answer, and it is not a license to return a
+superset of the index: a plain Index Scan of a partial index has the quals its predicate implies
+removed from its recheck, and an index-only scan evaluates no recheck qual at all (the planner only
+builds one for a query that references no column, so there is none to evaluate). A row that the
+index does not hold therefore comes back as a row. A TIDBitmap's lossy page is the one superset
+source lion ever had, and the UNION shape (§29.3) replaced it; every other source is a stream of
+posting-set containers.
+
+Then `xs_recheck` is set, for every TID of the scan, when any of these holds; otherwise the TIDs
+are exact:
 
 - a qual was not answered: a second qual on a column (§29.2's ranking), a second WALK column, a
   multi-key column in mode ALL next to another column that does answer (dropped, as in the bitmap
@@ -5838,7 +5884,7 @@ Set, for every TID of the scan, when any of these holds; otherwise the TIDs are 
   mode KEYS through unrechecked because `lion_extract_query()` classifies it as exact; the plain
   path is chosen for selective lookups, where one operator call per fetched row costs nothing next
   to the fetch, and it does not have to rest on that classification;
-- the BITMAP shape (§29.3), always;
+- the UNION shape (§29.3), always;
 - a non-MVCC scan with a NOPIN set (§29.5).
 
 A range is exact (the walk applies every bound of the column), an IN list is exact (a union of
@@ -5912,11 +5958,12 @@ none; `amoptionalkey` lets the planner scan a lion index with no key at all, and
   the posting leaf of each container pinned until the next batch - the §9 interlock, which is
   what makes the executor's visibility-map test of each returned TID safe, exactly as for the
   count;
-- the BITMAP shape (a multi-key first column) was built without pins and names every offset of a
-  lossy page, so each of its TIDs is looked up in the heap under the scan's snapshot first
-  (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays visible to that
-  snapshot, so nothing can take it away before the executor's own test. Slow and exact; the
-  count pushdown answers the common shapes instead anyway.
+- the UNION shape (a multi-key first column) returns only TIDs the index holds (§29.6) but pins
+  none of the pages they came from, so each of them is looked up in the heap under the scan's
+  snapshot first (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays
+  visible to that snapshot, so nothing can take it away before the executor's own test. A visible
+  tuple at a TID the index holds is a row of the index: a HOT chain cannot change a column the
+  predicate reads. Slow and exact; the count pushdown answers the common shapes instead anyway.
 
 What a real `amcanreturn` would need from this scan:
 
@@ -5960,7 +6007,7 @@ btree's: one row goes to the plain scan (no bitmap to build, no bitmap heap over
 thousand scattered rows go to the bitmap at a normal `work_mem` (sorted page visits), and at a
 `work_mem` so low that the bitmap is priced lossy - every tuple of every lossy page rechecked,
 compute_bitmap_pages() - the plain scan wins again. The count pushdown competes at the upper rel
-with its own cost (§10) and is unaffected; the regression suite pins its choices.
+with its own cost (§10); the regression suite pins its choices.
 
 ### 29.12 Tests
 
@@ -5972,7 +6019,11 @@ and `IS NOT NULL`, multicolumn ANDs, arrays and tsvector with recheck, cross-typ
 collation mismatch declined; nested-loop inner scans with rescans; cursors (FETCH forward, SCROLL
 over a Material, NO SCROLL refusing backward); a dirty heap after updates and deletes, then VACUUM;
 a posting set far larger than one batch with its memory flat; an exclusion constraint; the count
-pushdown still chosen for its shapes; index-only scans of no-column queries (a column's walk, a
+pushdown still chosen for its shapes; a
+partial multi-key index read whole at 64 kB of work_mem, by a plain scan and by index-only scans
+with nothing disabled, clean and dirty (the review's repros: rows the index does not hold came
+back); a 20,000-value Param list read through a cursor within work_mem, and long lists with
+duplicates, NULLs, citext spellings, a range and another column beside them, at 32 values a batch; index-only scans of no-column queries (a column's walk, a
 partial index, a multi-key column's bitmap), clean and dirty. Existing tests whose helpers exist to
 exercise the BITMAP path, or to force the count pushdown by disabling every other scan, now disable
 plain index scans as well; the plan pins that changed are one-row multi-key lookups, which are now

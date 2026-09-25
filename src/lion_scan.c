@@ -1751,7 +1751,6 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	return lion_getbitmap_so(so, tbm);
 }
 
-
 /* ---------------------------------------------------------------------
  * Plain index scans (DESIGN.md §29): the TID source and amgettuple
  * --------------------------------------------------------------------- */
@@ -1759,31 +1758,41 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 /*
  * The shapes of §29.3.  NONE selects nothing; SETS is one stream over the
  * columns' set trees; WALK streams the entries of one column's walk, each
- * ANDed with the other columns' trees; BITMAP runs the bitmap scan into a
- * private TIDBitmap and hands its pages out as containers.
+ * ANDed with the other columns' trees; LIST streams a long IN list a batch of
+ * its sets at a time (§29.4); UNION streams every entry of a multi-key column
+ * as their exact union, a window of container keys at a time.
+ *
+ * No shape ever returns a TID the index does not hold (§29.6): an index-only
+ * scan evaluates no recheck qual, and a plain scan of a partial index has the
+ * quals its predicate implies taken out of its recheck, so a superset TID -
+ * a lossy bitmap page's every offset, say - would come back as a row.
  */
 typedef enum LionSourceShape
 {
 	LION_SRC_NONE,
 	LION_SRC_SETS,
 	LION_SRC_WALK,
-	LION_SRC_BITMAP
+	LION_SRC_LIST,
+	LION_SRC_UNION
 } LionSourceShape;
 
 struct LionSource
 {
 	LionScanOpaque so;			/* the keys and the probe cache */
 	Relation	index;
-	MemoryContext cxt;			/* everything below, but the entry's streams */
-	MemoryContext entrycxt;		/* WALK: one entry's stream and cursors */
+	MemoryContext cxt;			/* everything below, but what entrycxt holds */
+	MemoryContext entrycxt;		/* one entry's or one batch's stream */
 	bool		keeppins;		/* §29.5: a non-MVCC scan keeps its pins */
 	bool		recheck;		/* §29.6 */
 	LionSourceShape shape;
 
-	/* the located sets of the SETS tree, or of a WALK's other columns */
+	/* the located sets of the SETS tree, or of the other columns' trees */
 	LionPostingSet *sets;		/* nsets of them, + 1 slot for a WALK entry */
 	int			nsets;
-	LionKeyNode *tree;			/* over sets[]; a WALK's names sets[nsets] */
+	LionKeyNode *tree;			/* SETS, WALK: over sets[] (WALK's names
+								 * sets[nsets] for the entry) */
+	LionKeyNode **restargs;		/* LIST: the other columns' trees */
+	int			nrestargs;
 	LionSetStream *stream;		/* the current one */
 
 	/* WALK */
@@ -1793,20 +1802,41 @@ struct LionSource
 	LionIndexState *ix;			/* the state walk.col and ranges[] point into */
 	AttrNumber	walkattno;		/* ... and the walked column's number */
 
-	/* BITMAP */
-	TIDBitmap  *tbm;
-#if PG_VERSION_NUM >= 180000
-	TBMPrivateIterator *tbmit;
-#else
-	TBMIterator *tbmit;
-#endif
-	bool		tbmdone;
-	bool		tbmpending;		/* a page is waiting to start the next container */
-	BlockNumber pendblk;
-	int			npend;			/* -1: lossy */
-	OffsetNumber pendoffs[MaxHeapTuplesPerPage];
+	/* LIST: the list's values in lookup order, located a batch at a time */
+	AttrNumber	listattno;
+	Oid			listtype;
+	Datum	   *lvalues;
+	uint32	   *lhashes;
+	int			nlvalues;
+	int			lpos;			/* the first value not located yet */
+	LionPostingSet *bsets;		/* the batch's sets, in entrycxt */
+	int			nbsets;
+
+	/* UNION: a window of container keys, ORed from every entry */
+	AttrNumber	unionattno;
+	bool		withnull;
+	int			uwidth;			/* container keys per window */
+	uint64	   *ubits;			/* [uwidth][LION_BITSET_WORDS] */
+	bool	   *utouched;		/* [uwidth] */
+	uint64		ustart;			/* the window's first container key */
+	uint64		unext;			/* the smallest key seen past the window */
+	int			uemit;			/* the next slot to hand out */
+	bool		ufirst;
+	bool		udone;
 	LionContainer *cbuf;		/* the container handed out */
 };
+
+/* How many sets of one IN list a plain scan holds cursors for at once (§29.4). */
+static int
+lion_scan_list_batch(void)
+{
+	/*
+	 * A located set and the cursor that reads it take ~19 kB (the cursor's
+	 * 4 kB staging container, the OR node's share, the set itself): 32 kB of
+	 * work_mem per set keeps a batch inside work_mem, and at least 32.
+	 */
+	return Max(32, work_mem / 32);
+}
 
 /* The probe of a scan key's type on one column, cached per column. */
 static LionProbe *
@@ -1928,9 +1958,27 @@ lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
 }
 
 /*
+ * A scalar `col = ANY (array)` long enough to be located a batch at a time
+ * (§29.4): how many non-NULL-or-not elements the array has, or -1 when the key
+ * is not such a list at all.
+ */
+static int
+lion_scankey_list_length(LionState *col, ScanKey skey)
+{
+	if (col->multikey ||
+		(skey->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL |
+						   SK_ISNULL)) != SK_SEARCHARRAY ||
+		skey->sk_strategy != LION_STRAT_EQUAL)
+		return -1;
+	return ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(skey->sk_argument)),
+						  ARR_DIMS(DatumGetArrayTypeP(skey->sk_argument)));
+}
+
+/*
  * Build the source for so->keys (DESIGN.md §29.3).  Every set is located -
  * every directory lock taken - before any posting page is pinned, which is
- * the reader side of the §11 deadlock rule.
+ * the reader side of the §11 deadlock rule; a LIST locates each batch before
+ * it pins a posting page for it, with the previous batch's pins gone.
  */
 static LionSource *
 lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
@@ -1943,10 +1991,12 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	LionKeyNode **args;
 	int			nargs = 0;
 	int			walkcol = -1;
+	int			listcol = -1;
+	int			unioncol = -1;
 	bool		withnull = false;
 	bool		nomatch = false;
-	bool		mkfallback = false;
 	int			ncols = so->ix->ncolumns;
+	int			batch = lion_scan_list_batch();
 	int			i;
 
 	cxt = AllocSetContextCreate(parent, "lion index scan",
@@ -1959,6 +2009,8 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	src->cxt = cxt;
 	src->keeppins = keeppins;
 	src->shape = LION_SRC_NONE;
+	src->entrycxt = AllocSetContextCreate(cxt, "lion index scan entry",
+										  ALLOCSET_DEFAULT_SIZES);
 
 	memset(&ch, 0, sizeof(ch));
 	acc.maxsets = 8;
@@ -1971,15 +2023,14 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		/*
 		 * No key at all: a partial index whose predicate the query implies
 		 * (§24).  Every row the index holds is under column 1, NULL entry
-		 * included - streamed by a walk, unless that column is multi-key.
+		 * included - streamed by a walk, or as a union when that column is
+		 * multi-key and a walk would repeat rows.
 		 */
+		withnull = true;
 		if (lion_column(so->ix, 1)->multikey)
-			mkfallback = true;
+			unioncol = 0;
 		else
-		{
 			walkcol = 0;
-			withnull = true;
-		}
 	}
 	else
 	{
@@ -2006,20 +2057,24 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				src->recheck = true;
 				if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
 				{
-					mkfallback = true;	/* a walk would repeat rows */
+					if (unioncol < 0)
+						unioncol = i;	/* a walk would repeat rows */
 					continue;
 				}
 				node = lion_scan_col_tree(so, col, skey, &acc, &ok, &none);
 				if (none)
 					nomatch = true;
 				else if (!ok)
-					mkfallback = true;	/* mode ALL: every row */
+				{
+					if (unioncol < 0)
+						unioncol = i;	/* mode ALL: every row */
+				}
 				else
 					args[nargs++] = node;
 				continue;
 			}
 
-			/* A scalar column: a walk, or a set tree. */
+			/* A scalar column: a walk, a long list, or a set tree. */
 			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0 ||
 				ch.bestrank[i] == 2 ||
 				((skey->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL)) == SK_SEARCHARRAY &&
@@ -2029,6 +2084,15 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 					walkcol = i;
 				else
 					src->recheck = true;	/* a second walk is not answered */
+				continue;
+			}
+
+			if (lion_scankey_list_length(col, skey) > batch)
+			{
+				if (listcol < 0)
+					listcol = i;
+				else
+					src->recheck = true;	/* a second long list, too */
 				continue;
 			}
 
@@ -2049,12 +2113,18 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		}
 
 		/*
-		 * A multi-key column that needs every row, next to a column that
-		 * does answer: dropped and rechecked, as the bitmap path does.  Only
-		 * when nothing else answers does the scan need its bitmap.
+		 * One driver: a long list outranks a walk, which is then left to the
+		 * recheck.  A multi-key column that needs every row, next to a column
+		 * that does answer, is dropped and rechecked, as the bitmap path does;
+		 * only when nothing else answers is it streamed as a union.
 		 */
-		if (mkfallback && (nargs > 0 || walkcol >= 0))
-			mkfallback = false;
+		if (listcol >= 0 && walkcol >= 0)
+		{
+			walkcol = -1;
+			src->recheck = true;
+		}
+		if (unioncol >= 0 && (nargs > 0 || walkcol >= 0 || listcol >= 0))
+			unioncol = -1;
 	}
 
 	if (!nomatch && walkcol >= 0 && !withnull)
@@ -2067,7 +2137,34 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			nomatch = true;
 	}
 
-	if (nomatch || mkfallback)
+	if (!nomatch && listcol >= 0)
+	{
+		ScanKey		best = ch.best[listcol];
+		ArrayType  *arr = DatumGetArrayTypeP(best->sk_argument);
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+
+		src->listattno = (AttrNumber) (listcol + 1);
+		src->listtype = ARR_ELEMTYPE(arr);
+		get_typlenbyvalalign(src->listtype, &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arr, src->listtype, elmlen, elmbyval, elmalign,
+						  &elems, &nulls, &nelems);
+		src->lvalues = (Datum *) palloc(sizeof(Datum) * Max(nelems, 1));
+		src->lhashes = (uint32 *) palloc(sizeof(uint32) * Max(nelems, 1));
+		src->nlvalues = lion_probe_sort(so->index, src->listattno,
+										src->listtype, nelems, elems, nulls,
+										src->lvalues, src->lhashes);
+		pfree(elems);
+		pfree(nulls);
+		if (src->nlvalues == 0)
+			nomatch = true;
+	}
+
+	if (nomatch || unioncol >= 0)
 	{
 		for (i = 0; i < acc.nsets; i++)
 			lion_posting_set_release(&acc.sets[i]);
@@ -2080,17 +2177,18 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		return src;
 	}
 
-	if (mkfallback)
+	if (unioncol >= 0)
 	{
-		src->shape = LION_SRC_BITMAP;
+		src->shape = LION_SRC_UNION;
 		src->recheck = true;
-		src->tbm = tbm_create((Size) work_mem * 1024, NULL);
-		(void) lion_getbitmap_so(so, src->tbm);
-#if PG_VERSION_NUM >= 180000
-		src->tbmit = tbm_begin_private_iterate(src->tbm);
-#else
-		src->tbmit = tbm_begin_iterate(src->tbm);
-#endif
+		src->unionattno = (AttrNumber) (unioncol + 1);
+		src->withnull = withnull;
+		src->uwidth = (int) Max(16.0, Min((double) work_mem * 1024.0 / LION_BITSET_BYTES,
+										  65536.0));
+		src->ubits = (uint64 *) palloc0((Size) src->uwidth * LION_BITSET_BYTES);
+		src->utouched = (bool *) palloc0(sizeof(bool) * src->uwidth);
+		src->uemit = src->uwidth;
+		src->ufirst = true;
 		src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		MemoryContextSwitchTo(oldcxt);
 		return src;
@@ -2113,7 +2211,13 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			src->recheck = true;
 	}
 
-	if (walkcol < 0)
+	if (listcol >= 0)
+	{
+		src->shape = LION_SRC_LIST;
+		src->restargs = args;
+		src->nrestargs = nargs;
+	}
+	else if (walkcol < 0)
 	{
 		src->shape = LION_SRC_SETS;
 		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
@@ -2127,8 +2231,6 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		src->shape = LION_SRC_WALK;
 		args[nargs++] = lion_scan_leaf(src->nsets);
 		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
-		src->entrycxt = AllocSetContextCreate(cxt, "lion index scan entry",
-											  ALLOCSET_DEFAULT_SIZES);
 		src->ix = so->ix;
 		src->walkattno = (AttrNumber) col->attno;
 		lion_walk_begin(&src->walk, so->index, col, withnull, src->ranges,
@@ -2139,85 +2241,225 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	return src;
 }
 
+/* A walked entry as a located set, without a lookup (§29.3). */
+static void
+lion_source_entry_set(Relation index, LionEntryTuple *entry, Size itemlen,
+					  MemoryContext cxt, LionPostingSet *ps)
+{
+	memset(ps, 0, sizeof(LionPostingSet));
+	ps->index = index;
+	ps->attno = entry->attno;
+	ps->found = true;
+	ps->pinbuf = InvalidBuffer;
+	ps->ntids = entry->ntids;
+	ps->ncontainers = entry->ncontainers;
+	ps->entryblk = InvalidBlockNumber;
+	ps->entryoff = InvalidOffsetNumber;
+	ps->keyisnull = LionEntryIsNullKey(entry);
+	ps->cxt = cxt;
+	if ((entry->flags & LION_ENTRY_INLINE) != 0)
+	{
+		ps->is_inline = true;
+		ps->head = InvalidBlockNumber;
+		ps->payload = LionEntryGetPayload(entry);
+		ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
+	}
+	else
+		ps->head = entry->head;
+}
+
+/* Let go of a LIST batch's sets: their pins, then their memory. */
+static void
+lion_source_end_batch(LionSource *src)
+{
+	int			i;
+
+	if (src->stream != NULL)
+		lion_stream_end(src->stream);
+	src->stream = NULL;
+	for (i = 0; i < src->nbsets; i++)
+		lion_posting_set_release(&src->bsets[i]);
+	src->bsets = NULL;
+	src->nbsets = 0;
+	MemoryContextReset(src->entrycxt);
+}
+
 /*
- * The BITMAP shape's next container: the private TIDBitmap's pages, grouped
- * by the container key their blocks fall under.  A lossy page stands for
- * every offset a heap page can have; the fetch finds nothing where there is
- * no tuple, and the scan is rechecked anyway.
+ * The next batch of a LIST (§29.4): at most lion_scan_list_batch() values, and
+ * more only to keep the values of one hash - which include every value of one
+ * equality class - together, so that no entry is located by two batches and
+ * returned twice.  Returns false at the end of the list.
  */
 static bool
-lion_source_tbm_page(LionSource *src)
+lion_source_list_batch(LionSource *src)
 {
-#if PG_VERSION_NUM >= 180000
-	TBMIterateResult res;
+	MemoryContext oldcxt;
+	LionPostingSet *all;
+	LionKeyNode **leaves;
+	LionKeyNode **args;
+	int			batch = lion_scan_list_batch();
+	int			start;
+	int			end;
+	int			nb;
+	int			nfound;
+	int			i;
 
-	if (!tbm_private_iterate(src->tbmit, &res))
-		return false;
-	src->pendblk = res.blockno;
-	if (res.lossy)
-		src->npend = -1;
-	else
-		src->npend = tbm_extract_page_tuple(&res, src->pendoffs,
-											MaxHeapTuplesPerPage);
-#else
-	TBMIterateResult *res = tbm_iterate(src->tbmit);
+	for (;;)
+	{
+		if (src->lpos >= src->nlvalues)
+			return false;
 
-	if (res == NULL)
+		start = src->lpos;
+		end = Min(start + batch, src->nlvalues);
+		while (end < src->nlvalues && src->lhashes[end] == src->lhashes[end - 1])
+			end++;
+		src->lpos = end;
+
+		oldcxt = MemoryContextSwitchTo(src->entrycxt);
+		all = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
+										 (src->nsets + (end - start)));
+		if (src->nsets > 0)
+			memcpy(all, src->sets, sizeof(LionPostingSet) * src->nsets);
+		nb = lion_posting_set_lookup_many_col(src->index, src->listattno,
+											 src->listtype, end - start,
+											 &src->lvalues[start], NULL,
+											 &all[src->nsets], &nfound);
+		src->bsets = &all[src->nsets];
+		src->nbsets = nb;
+
+		for (i = 0; i < nb; i++)
+		{
+			if (!src->keeppins)
+				lion_posting_set_unpin(&src->bsets[i]);
+			else if (src->bsets[i].found && src->bsets[i].is_inline &&
+					 !BufferIsValid(src->bsets[i].pinbuf))
+				src->recheck = true;
+		}
+
+		if (nfound == 0)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			lion_source_end_batch(src);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		leaves = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nb);
+		for (i = 0; i < nb; i++)
+			leaves[i] = lion_scan_leaf(src->nsets + i);
+		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (src->nrestargs + 1));
+		for (i = 0; i < src->nrestargs; i++)
+			args[i] = src->restargs[i];
+		args[src->nrestargs] = lion_scan_op(LION_KN_OR, leaves, nb);
+
+		src->stream = lion_stream_begin(src->nsets + nb, all,
+										lion_scan_op(LION_KN_AND, args,
+													 src->nrestargs + 1),
+										src->keeppins);
+		MemoryContextSwitchTo(oldcxt);
+		return true;
+	}
+}
+
+/*
+ * The next window of a UNION: every entry of the column, each sought to the
+ * window's first container key and read up to its end, ORed into one bitset
+ * image per container key.  Exact - every TID it holds is one the index holds
+ * - and bounded: uwidth images, whatever the column holds.  Each window walks
+ * the column's entries once; the next window starts at the smallest container
+ * key any entry had past this one, so empty stretches of the heap cost
+ * nothing.  Returns false when there is nothing past the last window.
+ */
+static bool
+lion_source_union_window(LionSource *src)
+{
+	LionIndexState *ix;
+	LionLeafWalk w;
+	LionEntryTuple *entry;
+	Size		itemlen;
+	bool		havenext = false;
+	uint64		next = PG_UINT64_MAX;
+	uint64		end;
+	MemoryContext oldcxt;
+
+	if (src->udone)
 		return false;
-	src->pendblk = res->blockno;
-	src->npend = res->ntuples;
-	if (res->ntuples > 0)
-		memcpy(src->pendoffs, res->offsets, sizeof(OffsetNumber) * res->ntuples);
-#endif
+	if (!src->ufirst && src->unext == PG_UINT64_MAX)
+	{
+		src->udone = true;
+		return false;
+	}
+	src->ustart = src->ufirst ? 0 : src->unext;
+	src->ufirst = false;
+	end = src->ustart + (uint64) src->uwidth;
+
+	/* The state is looked up per window: see lion_source_next(). */
+	ix = lion_get_index_state(src->index);
+	oldcxt = MemoryContextSwitchTo(src->cxt);
+	lion_walk_begin(&w, src->index, lion_column(ix, src->unionattno),
+					src->withnull, NULL, 0, false);
+	MemoryContextSwitchTo(oldcxt);
+
+	while ((entry = lion_walk_next(&w, &itemlen)) != NULL)
+	{
+		LionPostingSet ps;
+		LionSetStream *st;
+		const LionContainer *c;
+
+		oldcxt = MemoryContextSwitchTo(src->entrycxt);
+		lion_source_entry_set(src->index, entry, itemlen, src->entrycxt, &ps);
+		st = lion_stream_begin(1, &ps, NULL, false);
+		lion_stream_seek(st, (uint32) Min(src->ustart, (uint64) PG_UINT32_MAX));
+		while ((c = lion_stream_next(st)) != NULL)
+		{
+			uint64		k = c->ckey;
+
+			if (k >= end)
+			{
+				if (k < next)
+					next = k;
+				havenext = true;
+				break;
+			}
+			if (k < src->ustart)
+				continue;		/* a sparse segment's keys below the seek */
+			lion_bits_or_container(src->ubits + (k - src->ustart) * LION_BITSET_WORDS,
+								   c);
+			src->utouched[k - src->ustart] = true;
+		}
+		lion_stream_end(st);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextReset(src->entrycxt);
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_walk_end(&w);
+	pfree(w.copy);
+
+	src->unext = havenext ? next : PG_UINT64_MAX;
+	src->uemit = 0;
 	return true;
 }
 
 static const LionContainer *
-lion_source_tbm_next(LionSource *src)
+lion_source_union_next(LionSource *src)
 {
-	uint32		ckey = 0;
-	bool		started = false;
-
 	for (;;)
 	{
-		uint64		code;
-		int			j;
-
-		if (!src->tbmpending)
+		while (src->uemit < src->uwidth)
 		{
-			if (src->tbmdone || !lion_source_tbm_page(src))
-			{
-				src->tbmdone = true;
-				return started ? src->cbuf : NULL;
-			}
-			src->tbmpending = true;
-		}
+			int			k = src->uemit++;
+			uint64	   *w = src->ubits + (Size) k * LION_BITSET_WORDS;
 
-		code = ((uint64) src->pendblk) << LION_OFFSET_BITS;
-		if (started && lion_code_ckey(code) != ckey)
-			return src->cbuf;	/* the pending page starts the next one */
-
-		if (!started)
-		{
-			ckey = lion_code_ckey(code);
-			lion_container_init(src->cbuf, ckey);
-			started = true;
+			if (!src->utouched[k])
+				continue;
+			src->utouched[k] = false;
+			lion_bits_to_container(w, (uint32) (src->ustart + k), src->cbuf);
+			memset(w, 0, LION_BITSET_BYTES);
+			if (src->cbuf->cardinality > 0)
+				return src->cbuf;
 		}
-
-		if (src->npend < 0)
-		{
-			for (j = FirstOffsetNumber; j <= MaxHeapTuplesPerPage; j++)
-				lion_container_append_sorted(src->cbuf,
-											 lion_code_lo(code | (uint64) j));
-		}
-		else
-		{
-			for (j = 0; j < src->npend; j++)
-				lion_container_append_sorted(src->cbuf,
-											 lion_code_lo(code | (uint64) src->pendoffs[j]));
-		}
-		src->tbmpending = false;
-		CHECK_FOR_INTERRUPTS();
+		if (!lion_source_union_window(src))
+			return NULL;
 	}
 }
 
@@ -2228,6 +2470,8 @@ lion_source_tbm_next(LionSource *src)
 const LionContainer *
 lion_source_next(LionSource *src)
 {
+	const LionContainer *c;
+
 	switch (src->shape)
 	{
 		case LION_SRC_NONE:
@@ -2236,8 +2480,28 @@ lion_source_next(LionSource *src)
 		case LION_SRC_SETS:
 			return lion_stream_next(src->stream);
 
-		case LION_SRC_BITMAP:
-			return lion_source_tbm_next(src);
+		case LION_SRC_UNION:
+			return lion_source_union_next(src);
+
+		case LION_SRC_LIST:
+			for (;;)
+			{
+				if (src->stream != NULL)
+				{
+					c = lion_stream_next(src->stream);
+					if (c != NULL)
+						return c;
+
+					/*
+					 * The batch is done: its cursors' pins and its sets go,
+					 * and only then is the next batch located (the §11 rule).
+					 */
+					lion_source_end_batch(src);
+				}
+				if (!lion_source_list_batch(src))
+					return NULL;
+				CHECK_FOR_INTERRUPTS();
+			}
 
 		case LION_SRC_WALK:
 
@@ -2271,14 +2535,12 @@ lion_source_next(LionSource *src)
 			for (;;)
 			{
 				LionEntryTuple *entry;
-				LionPostingSet *ps;
 				Size		itemlen;
 				MemoryContext oldcxt;
 
 				if (src->stream != NULL)
 				{
-					const LionContainer *c = lion_stream_next(src->stream);
-
+					c = lion_stream_next(src->stream);
 					if (c != NULL)
 						return c;
 
@@ -2296,33 +2558,13 @@ lion_source_next(LionSource *src)
 					return NULL;
 
 				/*
-				 * The entry as a located set, without a lookup: an INLINE
-				 * payload read straight out of the walk's copy of the leaf
-				 * (which stays put until this entry's stream is over), a
-				 * posting tree through its root.  Under a non-MVCC snapshot
-				 * the walk keeps that leaf pinned (§29.5).
+				 * An INLINE payload is read straight out of the walk's copy of
+				 * the leaf, which stays put until this entry's stream is over;
+				 * under a non-MVCC snapshot the walk keeps that leaf pinned
+				 * (§29.5).
 				 */
-				ps = &src->sets[src->nsets];
-				memset(ps, 0, sizeof(LionPostingSet));
-				ps->index = src->index;
-				ps->attno = entry->attno;
-				ps->found = true;
-				ps->pinbuf = InvalidBuffer;
-				ps->ntids = entry->ntids;
-				ps->ncontainers = entry->ncontainers;
-				ps->entryblk = InvalidBlockNumber;
-				ps->entryoff = InvalidOffsetNumber;
-				ps->keyisnull = LionEntryIsNullKey(entry);
-				ps->cxt = src->entrycxt;
-				if ((entry->flags & LION_ENTRY_INLINE) != 0)
-				{
-					ps->is_inline = true;
-					ps->head = InvalidBlockNumber;
-					ps->payload = LionEntryGetPayload(entry);
-					ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
-				}
-				else
-					ps->head = entry->head;
+				lion_source_entry_set(src->index, entry, itemlen,
+									  src->entrycxt, &src->sets[src->nsets]);
 
 				oldcxt = MemoryContextSwitchTo(src->entrycxt);
 				src->stream = lion_stream_begin(src->nsets + 1, src->sets,
@@ -2341,6 +2583,8 @@ lion_source_release(LionSource *src)
 {
 	int			i;
 
+	if (src->shape == LION_SRC_LIST)
+		lion_source_end_batch(src);
 	if (src->stream != NULL)
 		lion_stream_end(src->stream);
 	src->stream = NULL;
@@ -2349,20 +2593,6 @@ lion_source_release(LionSource *src)
 	for (i = 0; i < src->nsets; i++)
 		lion_posting_set_release(&src->sets[i]);
 	src->nsets = 0;
-	if (src->tbmit != NULL)
-	{
-#if PG_VERSION_NUM >= 180000
-		tbm_end_private_iterate(src->tbmit);
-#else
-		tbm_end_iterate(src->tbmit);
-#endif
-		src->tbmit = NULL;
-	}
-	if (src->tbm != NULL)
-	{
-		tbm_free(src->tbm);
-		src->tbm = NULL;
-	}
 	src->shape = LION_SRC_NONE;
 }
 
@@ -2387,7 +2617,8 @@ lion_source_open(Relation index, ScanKey keys, int nkeys, bool keeppins,
 bool
 lion_source_sorted(LionSource *src)
 {
-	return src->shape != LION_SRC_WALK;
+	return src->shape == LION_SRC_SETS || src->shape == LION_SRC_UNION ||
+		src->shape == LION_SRC_NONE;
 }
 
 bool
@@ -2504,16 +2735,18 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 			{
 				/*
 				 * An index-only scan trusts the visibility map for every TID
-				 * it is handed.  The SETS and WALK shapes keep the page each
-				 * batch came from pinned until the next one (xs_want_itup
-				 * turned dropPin off), which is the §9 interlock the count
-				 * relies on.  The BITMAP shape was built without pins, and a
-				 * lossy page names offsets that hold nothing: its TIDs are
-				 * checked in the heap here, and only a tuple visible to the
-				 * snapshot is handed on - which stays visible to it, so no
-				 * VACUUM can take it away before the executor looks.
+				 * it is handed.  The SETS, LIST and WALK shapes keep the page
+				 * each batch came from pinned until the next one
+				 * (xs_want_itup turned dropPin off), which is the §9
+				 * interlock the count relies on.  The UNION shape copies
+				 * containers out of many pages into its window and pins none
+				 * of them: its TIDs are checked in the heap here, and only a
+				 * tuple visible to the snapshot is handed on - which stays
+				 * visible to it, so no VACUUM can take it away before the
+				 * executor looks.  Every TID is one the index holds (§29.6),
+				 * so a visible one is a row the scan selects.
 				 */
-				if (so->src->shape == LION_SRC_BITMAP)
+				if (so->src->shape == LION_SRC_UNION)
 				{
 					ItemPointerData tid = scan->xs_heaptid;
 
