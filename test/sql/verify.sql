@@ -136,24 +136,39 @@ SELECT sparse_members = ntids AS still_all_segments,
 	   ntids = (SELECT count(*) FROM lion_vfy WHERE i IS NOT NULL) AS ntids_matches_heap
   FROM lion_index_stats('lion_vfy_i');
 
--- a partial index only has to contain the rows its predicate selects
+-- a partial index only has to contain the rows its predicate selects: the
+-- first row below is one it selects (a new key, 'vpart'), the second is not
 CREATE INDEX lion_vfy_part ON lion_vfy USING lion (t) WHERE k < 100;
 SELECT lion_index_verify('lion_vfy_part', true);
 SELECT entries, ntids FROM lion_index_stats('lion_vfy_part');
-INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL, NULL);
-INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL, NULL);
+INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL);
+INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL);
 SELECT lion_index_verify('lion_vfy_part', true);
-SELECT ntids FROM lion_index_stats('lion_vfy_part');
+SELECT entries, ntids FROM lion_index_stats('lion_vfy_part');
 
 -- an expression index is verified through the same path
 CREATE INDEX lion_vfy_expr ON lion_vfy USING lion ((k % 10));
 SELECT lion_index_verify('lion_vfy_expr', true);
 SELECT entries FROM lion_index_stats('lion_vfy_expr');
 
--- NULL keys are not indexed and must not be reported as missing
-INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL, NULL);
+/*
+ * NULL keys ARE indexed, in the column's reserved NULL entry (DESIGN.md §14),
+ * and heapallindexed looks for such a row there.  The first row is NULL in
+ * every column; the second is NULL only in t and satisfies the partial
+ * index's predicate, so the partial index gets a NULL entry too, and the
+ * expression index gets one for the NULL k of the first.
+ */
+INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL);
+INSERT INTO lion_vfy VALUES (200004, 7, NULL, 2.0, NULL);
 SELECT lion_index_verify('lion_vfy_k', true);
 SELECT lion_index_verify('lion_vfy_t', true);
+SELECT lion_index_verify('lion_vfy_n', true);
+SELECT lion_index_verify('lion_vfy_part', true);
+SELECT lion_index_verify('lion_vfy_expr', true);
+SELECT null_tids FROM lion_index_stats('lion_vfy_k');
+SELECT null_tids FROM lion_index_stats('lion_vfy_t');
+SELECT null_tids FROM lion_index_stats('lion_vfy_part');
+SELECT null_tids FROM lion_index_stats('lion_vfy_expr');
 
 -- unlogged relations work the same way
 CREATE UNLOGGED TABLE lion_vfy_unl (i int4, k int4);
