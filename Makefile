@@ -80,8 +80,12 @@ unit: test/unit/container_test test/unit/sparse_test
 	./test/unit/sparse_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
-$(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src/lion_tid.h
-src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o: src/lion_count.h
+# (every header lion.h includes, and each of the others' includers; a missing
+# line leaves a stale object with an old struct layout after a header change)
+$(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src/lion_tid.h \
+         src/lion_wal.h
+src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o src/lion_scan.o: src/lion_count.h
+src/lion_customscan.o src/lion_fkjoin.o: src/lion_fkjoin.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,
