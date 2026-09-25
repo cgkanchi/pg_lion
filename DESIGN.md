@@ -5464,7 +5464,13 @@ On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - 
 of an unbounded number of entries - so it is answered into a TIDBitmap of its own and INTERSECTED
 (`tbm_intersect()`) with the bitmap of the other columns' tree, and the result is OR-ed into the
 caller's bitmap, which a BitmapOr above may share with its other arms. Two range columns are two such
-bitmaps. It is what core's BitmapAnd does, inside one index scan.
+bitmaps. It is what core's BitmapAnd does, inside one index scan. `k < ANY (array)` is such a column
+too - its one walk to the widest element goes into a bitmap of its own - although it ranks as a list
+in the per-column choice. *(Deviation from the first version, which sorted columns into set trees
+and walks by that rank alone: the array range went to the set trees, which cannot express it, and was
+dropped for the heap recheck while `lioncostestimate()` and the plain scan both counted it as
+answered - `a < ANY ('{-40,-45}') AND b = 3` handed the heap every row of `b = 3` to throw away
+(2026-09-25 review). `test/sql/range.sql` shows no row removed by the recheck now.)*
 
 ### amcostestimate
 
