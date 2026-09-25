@@ -11,9 +11,10 @@
  *
  *	  Representation policy (DESIGN.md §3), enforced by the mutators:
  *		- adding to a full ARRAY (2048 members)			=> BITSET
- *		- adding to a RUN that would need a 1024th run	=> BITSET
+ *		- adding to a RUN that would need a 1024th run	=> ARRAY when the
+ *				members, the new one included, fit one (<= 2048), else BITSET
  *		- removing from a RUN so that a split would need a 1024th run
- *														=> BITSET
+ *														=> the same
  *		- removing from a BITSET leaving <= 2048 members	=> ARRAY
  *
  *	  lion_container_optimize() is the only function that searches for the
@@ -1118,13 +1119,30 @@ run_add(LionContainer *c, uint32 lo)
 		return true;
 	}
 
-	/* a brand new one-element run is needed */
+	/*
+	 * A brand new one-element run is needed.  When there is no room for a
+	 * 1024th run, DESIGN.md §3: the container becomes an ARRAY if the members
+	 * fit one with the new member in, which is always smaller than a BITSET
+	 * (8 + 2 * 2048 = 4104 at worst), and a BITSET otherwise.  Converting
+	 * straight to a BITSET, as this did before, turned 20 runs of 10 plus
+	 * 1003 scattered inserts - a 4102-byte RUN of 1203 members - into a
+	 * 4104-byte BITSET on the 1004th, where a 2416-byte ARRAY would do, and
+	 * the insert path does not optimize afterwards.
+	 *
+	 * Neither conversion is ever made on a page item in place: the in-place
+	 * insert (lion_insert_container_inplace()) and its redo
+	 * (LION_OP_CONTAINER_ADD) only take a RUN below LION_RUN_MAX_NRUNS runs,
+	 * which never gets here (lion_container.h, "growth in place").  The
+	 * general path works in a LION_CONTAINER_MAX_SIZE buffer and writes back
+	 * whatever size results.
+	 */
 	if (nruns >= (int32) LION_RUN_MAX_NRUNS)
 	{
-		container_make_bitset(c);
-		bits_set(bitset_mdata(c), lo);
-		c->cardinality++;
-		return true;
+		if (c->cardinality < LION_ARRAY_MAX_CARD)
+			container_make_array(c);
+		if (c->type == LION_CT_RUN)		/* too many members, or damaged */
+			container_make_bitset(c);
+		return lion_container_add(c, (uint16) lo);
 	}
 	memmove(&runs[idx + 2], &runs[idx + 1],
 			(size_t) (nruns - idx - 1) * sizeof(LionRun));
@@ -1170,14 +1188,21 @@ run_remove(LionContainer *c, uint32 lo)
 	}
 	else
 	{
-		/* the run splits in two */
+		/*
+		 * The run splits in two.  With no room for a 1024th run the container
+		 * changes representation exactly as run_add() does: an ARRAY if the
+		 * members fit one before the removal, and otherwise a BITSET, which
+		 * the removal then shrinks to an ARRAY if it can
+		 * (container_shrink_bitset()).  Either way a RUN of 1023 runs never
+		 * becomes a BITSET of <= 2048 members.
+		 */
 		if (nruns >= (int32) LION_RUN_MAX_NRUNS)
 		{
-			container_make_bitset(c);
-			bits_clear(bitset_mdata(c), lo);
-			c->cardinality--;
-			container_shrink_bitset(c);
-			return true;
+			if (c->cardinality <= LION_ARRAY_MAX_CARD)
+				container_make_array(c);
+			if (c->type == LION_CT_RUN)
+				container_make_bitset(c);
+			return lion_container_remove(c, (uint16) lo);
 		}
 		memmove(&runs[idx + 2], &runs[idx + 1],
 				(size_t) (nruns - idx - 1) * sizeof(LionRun));

@@ -24,6 +24,21 @@
  *	  least LION_CONTAINER_MAX_SIZE bytes of capacity, because a mutation may
  *	  change the representation and therefore the size.  Read-only functions
  *	  accept a pointer directly into a page.
+ *
+ *	  GROWTH IN PLACE, the one exception, which the in-place insert
+ *	  (lion_insert_container_inplace()) and its WAL redo (LION_OP_CONTAINER_ADD)
+ *	  rely on to call lion_container_add() on a page item whose allotted
+ *	  length is short of LION_CONTAINER_MAX_SIZE.  add() writes at most:
+ *
+ *		ARRAY with fewer than LION_ARRAY_MAX_CARD members	size + 2 bytes
+ *		RUN with fewer than LION_RUN_MAX_NRUNS runs			size + 4 bytes
+ *		BITSET												its 4104 bytes
+ *
+ *	  and in those cases never changes the representation.  An ARRAY at
+ *	  LION_ARRAY_MAX_CARD members, or a RUN at LION_RUN_MAX_NRUNS runs that
+ *	  needs a new one, converts (to a BITSET, and to an ARRAY or a BITSET),
+ *	  which needs the full buffer; callers check the count first.  Nothing
+ *	  else may be called on an item in place.
  *-------------------------------------------------------------------------
  */
 #ifndef LION_CONTAINER_H
