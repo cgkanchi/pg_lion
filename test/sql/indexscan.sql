@@ -458,16 +458,29 @@ DROP TABLE lis_pr, lis_pt;
 -- Every value of an IN list used to be located up front with a cursor of its
 -- own, eleven kilobytes each: 20000 values held 220 MB.  Past a batch
 -- (work_mem / 32 kB values, at least 32) the plain scan locates and streams
--- the list a batch at a time (DESIGN.md §29.4).
+-- the list a batch at a time (DESIGN.md §29.4).  The scan, the sorted list
+-- included, stays inside work_mem - set here, since a batch's memory follows
+-- it: it used to take 1.05 times work_mem, which only a server default of
+-- more than 16 MB hid.
 BEGIN;
 SET LOCAL pg_lion.enable_count_pushdown = off;
 SET LOCAL enable_seqscan = off;
 SET LOCAL enable_bitmapscan = off;
+SET LOCAL work_mem = '4MB';
 SELECT lion_top('SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g))');
 DECLARE lst CURSOR FOR
 	SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g));
 FETCH 5 FROM lst;
-SELECT count(*) > 0 AS scan_contexts,
+SELECT current_setting('work_mem') AS work_mem, count(*) > 0 AS scan_contexts,
+	   sum(total_bytes) < pg_size_bytes(current_setting('work_mem')) AS within_work_mem
+  FROM pg_backend_memory_contexts WHERE name LIKE 'lion index scan%';
+MOVE FORWARD ALL IN lst;
+CLOSE lst;
+SET LOCAL work_mem = '16MB';
+DECLARE lst CURSOR FOR
+	SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g));
+FETCH 5 FROM lst;
+SELECT current_setting('work_mem') AS work_mem, count(*) > 0 AS scan_contexts,
 	   sum(total_bytes) < pg_size_bytes(current_setting('work_mem')) AS within_work_mem
   FROM pg_backend_memory_contexts WHERE name LIKE 'lion index scan%';
 MOVE FORWARD ALL IN lst;
