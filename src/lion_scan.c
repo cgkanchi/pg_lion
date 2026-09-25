@@ -44,6 +44,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/itup.h"
 #include "access/relscan.h"
 #if PG_VERSION_NUM >= 190000
@@ -1792,7 +1794,10 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 /*
  * The shapes of §29.3.  NONE selects nothing; SETS is one stream over the
  * columns' set trees; WALK streams the entries of one column's walk, each
- * ANDed with the other columns' trees; LIST streams a long IN list a batch of
+ * ANDed with the other columns' trees; WINDOW is the same answer for a walk
+ * too long to restart the other columns' stream for every entry: the walked
+ * entries ORed together a window of the other columns' containers at a time
+ * and ANDed with ONE stream of those; LIST streams a long IN list a batch of
  * its sets at a time (§29.4); UNION streams every entry of a multi-key column
  * as their exact union, a window of container keys at a time.
  *
@@ -1806,6 +1811,7 @@ typedef enum LionSourceShape
 	LION_SRC_NONE,
 	LION_SRC_SETS,
 	LION_SRC_WALK,
+	LION_SRC_WINDOW,
 	LION_SRC_LIST,
 	LION_SRC_UNION
 } LionSourceShape;
@@ -1829,12 +1835,30 @@ struct LionSource
 	int			nrestargs;
 	LionSetStream *stream;		/* the current one */
 
-	/* WALK */
+	/* WALK, and WINDOW's walk of each window */
 	LionLeafWalk walk;
 	LionRange  *ranges;
 	int			nranges;
 	LionIndexState *ix;			/* the state walk.col and ranges[] point into */
 	AttrNumber	walkattno;		/* ... and the walked column's number */
+
+	/*
+	 * WINDOW: the other columns' stream (over sets[] and tree), and a window
+	 * of its next containers - each as a bitset image, beside the image the
+	 * walked entries are ORed into at the same container key - made on first
+	 * use and reused by every later window.
+	 */
+	LionSetStream *reststream;
+	bool		restdone;		/* reststream has returned NULL */
+	int			wwidth;			/* slots per window */
+	int			wn;				/* slots the current window fills */
+	int			wemit;			/* the next slot to hand out */
+	uint32	   *wkeys;			/* [wwidth] the slots' container keys */
+	uint64	  **wrest;			/* [wwidth] the other columns' images */
+	uint64	  **wwalk;			/* [wwidth] the walked entries' images */
+	bool	   *wtouched;		/* [wwidth] an entry had a container there */
+	MemoryContext walkcxt;		/* one window's walk */
+	LionContainer *ibuf;		/* an INLINE entry's item, aligned */
 
 	/* LIST: the list's values in lookup order, located a batch at a time */
 	AttrNumber	listattno;
@@ -1861,18 +1885,45 @@ struct LionSource
 };
 
 /*
- * How many container keys one UNION window gathers (§29.3): at least
- * LION_UNION_MIN_WINDOW whatever work_mem says, because every window walks
- * every entry of the column again, and more when work_mem allows, up to
- * 65536.  A container key's bitset image is 4 kB and made only when an entry
- * has a container there, so a window costs what it holds, at most 4 MB at the
- * floor.  lioncostestimate() prices the windows with the same number.
+ * pg_lion.scan_window_floor, in kB: the least memory a window below may take,
+ * whatever work_mem says, because every window walks the entries again - a
+ * window never shrinks with work_mem past it.  4 MB by default; the
+ * regression suite lowers it to cross window boundaries on a small table.
+ */
+int			lion_scan_window_floor = LION_SCAN_WINDOW_FLOOR;
+
+static double
+lion_scan_window_bytes(void)
+{
+	return Max((double) lion_scan_window_floor, (double) work_mem) * 1024.0;
+}
+
+/*
+ * How many container keys one UNION window gathers (§29.3): a 4 kB bitset
+ * image each, so the window memory over 4 kB - 1024 at the default floor
+ * whatever work_mem says, and more when work_mem allows, up to 65536.  An
+ * image is made only when an entry has a container there, so a window costs
+ * what it holds.  lioncostestimate() prices the windows with the same number.
  */
 int
 lion_union_window(void)
 {
-	return (int) Max((double) LION_UNION_MIN_WINDOW,
-					 Min((double) work_mem * 1024.0 / LION_BITSET_BYTES, 65536.0));
+	return (int) Max(1.0, Min(lion_scan_window_bytes() / LION_BITSET_BYTES,
+							  65536.0));
+}
+
+/*
+ * How many of the other columns' containers one WINDOW gathers (§29.3): two
+ * bitset images each, the other columns' and the walked entries', so the
+ * window memory over 8 kB - 512 at the default floor, for the UNION's reason:
+ * every window walks the range again.  At most 4 MB at the floor, work_mem
+ * above it.  lioncostestimate() prices the windows with the same number.
+ */
+int
+lion_walk_window(void)
+{
+	return (int) Max(1.0, Min(lion_scan_window_bytes() / (2 * LION_BITSET_BYTES),
+							  65536.0));
 }
 
 /* How many sets of one IN list a plain scan holds cursors for at once (§29.4). */
@@ -2024,6 +2075,65 @@ lion_scankey_list_length(LionState *col, ScanKey skey)
 }
 
 /*
+ * About how many posting pages the located sets fill - what one stream over
+ * them reads at most (an AND leapfrogs past some of it).  Each set's ntids
+ * and ncontainers are its entry's own hints; a container's members take two
+ * bytes each up to LION_BITSET_BYTES.  An INLINE set is inside its entry and
+ * reads no page of its own.
+ */
+static double
+lion_source_rest_pages(LionSource *src)
+{
+	double		pages = 0.0;
+	int			i;
+
+	for (i = 0; i < src->nsets; i++)
+	{
+		LionPostingSet *ps = &src->sets[i];
+		double		bytes;
+
+		if (!ps->found || ps->is_inline)
+			continue;
+		bytes = Min(2.0 * (double) ps->ntids,
+					(double) LION_BITSET_BYTES * ps->ncontainers) +
+			(double) LION_CONTAINER_HDRSZ * ps->ncontainers;
+		pages += Max(1.0, ceil(bytes / BLCKSZ));
+	}
+	return pages;
+}
+
+/*
+ * Is the walk of col, beside the other columns' sets, too long to restart
+ * their stream for every entry (§29.3)?  A restart costs a descent of each of
+ * their posting trees; the WINDOW shape instead reads their posting pages
+ * once and walks the range once per window.  So a walk is long when it has
+ * more entries than those sets have posting pages, and at least
+ * LION_WALK_SHORT: counted here, from the directory leaves alone, and never
+ * further than that.
+ */
+#define LION_WALK_SHORT		16
+
+static bool
+lion_source_walk_is_long(LionSource *src, LionState *col)
+{
+	LionLeafWalk w;
+	Size		itemlen;
+	double		limit = Max((double) LION_WALK_SHORT, lion_source_rest_pages(src));
+	double		n = 0.0;
+	MemoryContext oldcxt = MemoryContextSwitchTo(src->entrycxt);
+
+	lion_walk_begin(&w, src->index, col, false, src->ranges, src->nranges,
+					false);
+	while (n <= limit && lion_walk_next(&w, &itemlen) != NULL)
+		n += 1.0;
+	lion_walk_end(&w);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(src->entrycxt);
+
+	return n > limit;
+}
+
+/*
  * Build the source for so->keys (DESIGN.md §29.3).  Every set is located -
  * every directory lock taken - before any posting page is pinned, which is
  * the reader side of the §11 deadlock rule; a LIST locates each batch before
@@ -2040,6 +2150,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	LionKeyNode **args;
 	int			nargs = 0;
 	int			walkcol = -1;
+	int			notnullcol = -1;
 	int			listcol = -1;
 	int			unioncol = -1;
 	bool		withnull = false;
@@ -2123,11 +2234,21 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				continue;
 			}
 
-			/* A scalar column: a walk, a long list, or a set tree. */
-			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0 ||
-				ch.bestrank[i] == 2 ||
-				((skey->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL)) == SK_SEARCHARRAY &&
-				 LION_STRAT_IS_RANGE(skey->sk_strategy)))
+			/*
+			 * A scalar column: `IS NOT NULL`, a walk, a long list, or a set
+			 * tree.  `IS NOT NULL` is every entry of the column but its NULL
+			 * one - a walk of the whole column - and it only drives the scan
+			 * when nothing else answers it (below).
+			 */
+			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
+			{
+				if (notnullcol < 0)
+					notnullcol = i;
+				else
+					src->recheck = true;	/* a second one is not answered */
+				continue;
+			}
+			if (ch.bestrank[i] == 2 || lion_scankey_is_array_range(col, skey))
 			{
 				if (walkcol < 0)
 					walkcol = i;
@@ -2171,6 +2292,24 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		{
 			walkcol = -1;
 			src->recheck = true;
+		}
+
+		/*
+		 * `IS NOT NULL` the same way: dropped and rechecked next to anything
+		 * that answers - the bitmap path drops it too, and the cost model
+		 * prices such a scan by the other columns' selectivity - and walked
+		 * only when nothing does.  It used to drive a WALK whenever it was
+		 * there, every entry of its column ANDed with the other columns'
+		 * stream, restarted per entry: `a IS NOT NULL AND b = 5` over a
+		 * million unique a took 4.37M buffer hits and 1.8 s against the
+		 * bitmap's 19 ms (2026-09-25 review).
+		 */
+		if (notnullcol >= 0)
+		{
+			if (nargs > 0 || walkcol >= 0 || listcol >= 0)
+				src->recheck = true;
+			else
+				walkcol = notnullcol;
 		}
 		if (unioncol >= 0 && (nargs > 0 || walkcol >= 0 || listcol >= 0))
 			unioncol = -1;
@@ -2271,6 +2410,33 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
 		src->stream = lion_stream_begin(src->nsets, src->sets, src->tree,
 										keeppins);
+	}
+	else if (nargs > 0 && !keeppins &&
+			 lion_source_walk_is_long(src,
+									  lion_column(so->ix, (AttrNumber) (walkcol + 1))))
+	{
+		/*
+		 * A long walk beside the other columns' sets: their ONE stream, and
+		 * the walk ORed into windows of it (§29.3).  Only without pins - a
+		 * window copies containers out of many pages, as the UNION does, so
+		 * a scan that must hold the page of each batch (§29.5) keeps the
+		 * entry-by-entry WALK, whose pins are the ones it needs.
+		 */
+		src->shape = LION_SRC_WINDOW;
+		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
+		src->ix = so->ix;
+		src->walkattno = (AttrNumber) (walkcol + 1);
+		src->reststream = lion_stream_begin(src->nsets, src->sets, src->tree,
+											false);
+		src->wwidth = lion_walk_window();
+		src->wkeys = (uint32 *) palloc(sizeof(uint32) * src->wwidth);
+		src->wrest = (uint64 **) palloc0(sizeof(uint64 *) * src->wwidth);
+		src->wwalk = (uint64 **) palloc0(sizeof(uint64 *) * src->wwidth);
+		src->wtouched = (bool *) palloc0(sizeof(bool) * src->wwidth);
+		src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		src->ibuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		src->walkcxt = AllocSetContextCreate(cxt, "lion index scan window",
+											 ALLOCSET_SMALL_SIZES);
 	}
 	else
 	{
@@ -2514,6 +2680,233 @@ lion_source_union_next(LionSource *src)
 }
 
 /*
+ * One walked entry's position in a WINDOW, as its items come by in ascending
+ * container key: the first slot whose key is not below the last item's.
+ */
+typedef struct LionWindowPos
+{
+	LionSource *src;
+	int			p;
+} LionWindowPos;
+
+/* The slot of ckey in the window, or -1; false once ckey is past the window. */
+static inline bool
+lion_window_slot(LionWindowPos *pos, uint32 ckey, int *slot)
+{
+	LionSource *src = pos->src;
+
+	*slot = -1;
+	if (ckey > src->wkeys[src->wn - 1])
+		return false;
+	/* both ascend; this stops at the window's last slot at the latest */
+	while (src->wkeys[pos->p] < ckey)
+		pos->p++;
+	if (src->wkeys[pos->p] == ckey)
+	{
+		*slot = pos->p;
+		if (src->wwalk[*slot] == NULL)
+			src->wwalk[*slot] = (uint64 *)
+				MemoryContextAllocZero(src->cxt, LION_BITSET_BYTES);
+		src->wtouched[*slot] = true;
+	}
+	return true;
+}
+
+static bool
+lion_window_pair_cb(uint32 ckey, uint16 lo, void *arg)
+{
+	LionWindowPos *pos = (LionWindowPos *) arg;
+	int			slot;
+
+	if (!lion_window_slot(pos, ckey, &slot))
+		return false;
+	if (slot >= 0)
+		pos->src->wwalk[slot][lo >> 6] |= UINT64CONST(1) << (lo & 63);
+	return true;
+}
+
+/*
+ * OR one item of a walked entry - a container, or a sparse segment of an
+ * INLINE payload (DESIGN.md §13) - into the window's image at its container
+ * key, where the other columns have one; anything else is none of the
+ * window's business: below it (the seek's granularity, or a segment that
+ * starts there) or at a key the other columns do not have.  Returns false
+ * once the item is past the window, which ends the entry.
+ */
+static bool
+lion_window_or_item(LionWindowPos *pos, const LionContainer *c)
+{
+	LionSource *src = pos->src;
+	int			slot;
+
+	/* A segment's header carries its first container key (§13). */
+	if (c->ckey > src->wkeys[src->wn - 1])
+		return false;
+	if (c->type == LION_CT_SPARSE)
+	{
+		lion_sparse_iterate(c, lion_window_pair_cb, pos);
+		return true;			/* the next item says whether it is past */
+	}
+	if (!lion_window_slot(pos, c->ckey, &slot))
+		return false;
+	if (slot >= 0)
+		lion_bits_or_container(pos->src->wwalk[slot], c);
+	return true;
+}
+
+/*
+ * The next window of a WINDOW source (§29.3): the other columns' next wwidth
+ * containers, each ORed into a bitset image of its own, and then ONE walk of
+ * the range, every entry sought to the window's first container key and read
+ * up to its last, ORed into a second image wherever the other columns have a
+ * container.  Their AND is the answer for the window, handed out in container
+ * key order by lion_source_window_next().  Returns false when the other
+ * columns have no container left.
+ *
+ * The walk takes a directory leaf's lock only while it copies the leaf, and
+ * with no posting page pinned: the other columns' stream copies every leaf it
+ * reads and holds no pin between two calls (it is never opened with
+ * keeppins), and each entry's stream is closed before the next leaf is read -
+ * the reader side of the §11 rule, as for the UNION.
+ */
+static bool
+lion_source_window(LionSource *src)
+{
+	LionIndexState *ix;
+	LionState  *col;
+	LionEntryTuple *entry;
+	Size		itemlen;
+	uint32		first;
+	MemoryContext oldcxt;
+	int			r;
+
+	src->wn = 0;
+	src->wemit = 0;
+
+	/* What the rest's cursors allocate as they go lives with the source. */
+	oldcxt = MemoryContextSwitchTo(src->cxt);
+	while (!src->restdone && src->wn < src->wwidth)
+	{
+		const LionContainer *c = lion_stream_next(src->reststream);
+		int			k = src->wn;
+
+		if (c == NULL)
+		{
+			src->restdone = true;
+			break;
+		}
+		if (c->cardinality == 0)
+			continue;
+		if (src->wrest[k] == NULL)
+			src->wrest[k] = (uint64 *) palloc(LION_BITSET_BYTES);
+		memset(src->wrest[k], 0, LION_BITSET_BYTES);
+		lion_bits_or_container(src->wrest[k], c);
+		src->wkeys[k] = c->ckey;
+		src->wn++;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	if (src->wn == 0)
+		return false;
+	first = src->wkeys[0];
+
+	/*
+	 * The walked column's state is looked up per window, and the ranges
+	 * re-pointed at it, for the reason lion_source_next() gives for a WALK.
+	 */
+	ix = lion_get_index_state(src->index);
+	col = lion_column(ix, src->walkattno);
+	for (r = 0; r < src->nranges; r++)
+		src->ranges[r].state = col;
+	src->ix = ix;
+	src->so->ix = ix;
+
+	MemoryContextReset(src->walkcxt);
+	oldcxt = MemoryContextSwitchTo(src->walkcxt);
+	lion_walk_begin(&src->walk, src->index, col, false, src->ranges,
+					src->nranges, false);
+	MemoryContextSwitchTo(oldcxt);
+
+	while ((entry = lion_walk_next(&src->walk, &itemlen)) != NULL)
+	{
+		LionWindowPos pos;
+
+		pos.src = src;
+		pos.p = 0;
+
+		if ((entry->flags & LION_ENTRY_INLINE) != 0)
+		{
+			/*
+			 * Read straight out of the walk's copy of the leaf, item by item:
+			 * a near-unique column's range is a run of one-row INLINE
+			 * entries, and a stream set up and torn down for each of them
+			 * cost more than the rest of the scan - 200k of them took 113 ms
+			 * against the bitmap scan's 35, and 17 ms read this way.
+			 */
+			const char *payload = LionEntryGetPayload(entry);
+			Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
+			Size		off = 0;
+
+			while (lion_inline_fetch(payload, paylen, &off, src->ibuf) > 0)
+			{
+				if (!lion_window_or_item(&pos, src->ibuf))
+					break;
+			}
+		}
+		else
+		{
+			/* A posting tree: sought to the window, one page at a time. */
+			LionPostingSet ps;
+			LionSetStream *st;
+			const LionContainer *c;
+
+			oldcxt = MemoryContextSwitchTo(src->entrycxt);
+			lion_source_entry_set(src->index, entry, itemlen, src->entrycxt,
+								  &ps);
+			st = lion_stream_begin(1, &ps, NULL, false);
+			lion_stream_seek(st, first);
+			while ((c = lion_stream_next(st)) != NULL)
+			{
+				if (!lion_window_or_item(&pos, c))
+					break;
+			}
+			lion_stream_end(st);
+			MemoryContextSwitchTo(oldcxt);
+			MemoryContextReset(src->entrycxt);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_walk_end(&src->walk);
+	return true;
+}
+
+static const LionContainer *
+lion_source_window_next(LionSource *src)
+{
+	for (;;)
+	{
+		while (src->wemit < src->wn)
+		{
+			int			k = src->wemit++;
+			uint64	   *walk = src->wwalk[k];
+			const uint64 *rest = src->wrest[k];
+			int			j;
+
+			if (!src->wtouched[k])
+				continue;
+			src->wtouched[k] = false;
+			for (j = 0; j < LION_BITSET_WORDS; j++)
+				walk[j] &= rest[j];
+			lion_bits_to_container(walk, src->wkeys[k], src->cbuf);
+			memset(walk, 0, LION_BITSET_BYTES);
+			if (src->cbuf->cardinality > 0)
+				return src->cbuf;
+		}
+		if (!lion_source_window(src))
+			return NULL;
+	}
+}
+
+/*
  * The next container of the source, or NULL at the end.  Valid until the
  * next call, which is where the pins it was read under - if any - go.
  */
@@ -2532,6 +2925,9 @@ lion_source_next(LionSource *src)
 
 		case LION_SRC_UNION:
 			return lion_source_union_next(src);
+
+		case LION_SRC_WINDOW:
+			return lion_source_window_next(src);
 
 		case LION_SRC_LIST:
 			for (;;)
@@ -2637,6 +3033,9 @@ lion_source_release(LionSource *src)
 	if (src->stream != NULL)
 		lion_stream_end(src->stream);
 	src->stream = NULL;
+	if (src->reststream != NULL)
+		lion_stream_end(src->reststream);
+	src->reststream = NULL;
 	if (src->shape == LION_SRC_WALK)
 		lion_walk_end(&src->walk);
 	for (i = 0; i < src->nsets; i++)
@@ -2667,7 +3066,7 @@ bool
 lion_source_sorted(LionSource *src)
 {
 	return src->shape == LION_SRC_SETS || src->shape == LION_SRC_UNION ||
-		src->shape == LION_SRC_NONE;
+		src->shape == LION_SRC_WINDOW || src->shape == LION_SRC_NONE;
 }
 
 bool
@@ -2793,8 +3192,11 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 				 * tuple visible to the snapshot is handed on - which stays
 				 * visible to it, so no VACUUM can take it away before the
 				 * executor looks.  Every TID is one the index holds (§29.6),
-				 * so a visible one is a row the scan selects.
+				 * so a visible one is a row the scan selects.  A WINDOW,
+				 * which pins nothing either, is only ever built without
+				 * keeppins, so it never gets here.
 				 */
+				Assert(so->src->shape != LION_SRC_WINDOW);
 				if (so->src->shape == LION_SRC_UNION)
 				{
 					ItemPointerData tid = scan->xs_heaptid;

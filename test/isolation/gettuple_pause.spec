@@ -22,6 +22,13 @@
 #    has to COMPLETE while the cursor is open, which it could not if the
 #    paused scan held a pin on the set it stands in (§11 cleanup-locks every
 #    page) - the isolation tester would wait on it until it timed out.
+#  * window: a range on a beside b = 1 of a multicolumn index is a WINDOW
+#    (§29.3), eight of b's containers a window at the least
+#    pg_lion.scan_window_floor.  The cursor parks in the first window, VACUUM
+#    deletes the entries of a that the NEXT window walks and frees their
+#    slots, and an insert takes the slots back under the same a values: the
+#    next window walks the directory afresh and finds only rows the snapshot
+#    cannot see.  The VACUUM completes: a paused WINDOW pins nothing.
 
 setup
 {
@@ -50,6 +57,12 @@ setup
 	  FROM generate_series(1, 3000) i;
 	CREATE INDEX gpt_k ON gpt USING lion (k) WITH (inline_limit = 64);
 
+	/* b = 1 has a container at each of the heap's 14 container keys: two windows. */
+	CREATE TABLE gw (id int, a int, b int, pad text)
+		WITH (fillfactor = 50, autovacuum_enabled = off);
+	INSERT INTO gw SELECT i, i, i % 4, repeat('w', 40) FROM generate_series(1, 40000) i;
+	CREATE INDEX gw_ab ON gw USING lion (a, b) WITH (inline_limit = 64);
+
 	CREATE TABLE gp_got (id int);
 
 	/* Move up to n rows (all of them for NULL) of a cursor into gp_got. */
@@ -74,7 +87,7 @@ setup
 teardown
 {
 	DROP FUNCTION gp_take(text, int);
-	DROP TABLE gp, gpt, gp_got;
+	DROP TABLE gp, gpt, gw, gp_got;
 }
 
 # The reader: a plain index scan in a cursor, REPEATABLE READ so that the
@@ -106,6 +119,13 @@ step s1_t		{
 	BEGIN ISOLATION LEVEL REPEATABLE READ;
 	DECLARE c CURSOR FOR SELECT id FROM gpt
 	 WHERE k BETWEEN 'key-' || lpad('10', 90, '0') AND 'key-' || lpad('50', 90, '0');
+	SELECT gp_take('c', 5) AS first;
+}
+step s1_w		{
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SET LOCAL pg_lion.scan_window_floor = '64kB';
+	SET LOCAL work_mem = '64kB';
+	DECLARE c CURSOR FOR SELECT id FROM gw WHERE a BETWEEN 100 AND 39000 AND b = 1;
 	SELECT gp_take('c', 5) AS first;
 }
 step s1_rest	{ SELECT gp_take('c', NULL) AS rest; }
@@ -145,6 +165,16 @@ step s1_check_t	{
 								  AND 'key-' || lpad('50', 90, '0')) AS expected;
 	COMMIT;
 }
+step s1_check_w	{
+	SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+	SELECT (SELECT count(*) FROM gp_got) AS got,
+		   (SELECT count(DISTINCT id) FROM gp_got) AS distinct_ids,
+		   (SELECT count(*) FROM gw WHERE a BETWEEN 100 AND 39000 AND b = 1) AS expected,
+		   (SELECT count(*) FROM gp_got g WHERE NOT EXISTS
+			 (SELECT 1 FROM gw WHERE gw.id = g.id AND gw.a BETWEEN 100 AND 39000
+				 AND gw.b = 1)) AS wrong;
+	COMMIT;
+}
 
 # The writer.
 session s2
@@ -178,6 +208,11 @@ step s2_reuse	{
 	INSERT INTO gp SELECT 60000 + i, 9, 'nine' FROM generate_series(1, 20000) i;
 }
 step s2_free	{ SELECT deleted_pages AS pages_left_free FROM lion_index_stats('gp_k'); }
+step s2_delw	{ DELETE FROM gw WHERE a BETWEEN 30000 AND 36000; }
+step s2_addw	{
+	INSERT INTO gw SELECT 100000 + i, 30000 + i % 6000, 1, 'new'
+	  FROM generate_series(1, 6000) i;
+}
 
 # The vacuum.
 session s3
@@ -197,8 +232,16 @@ step s3_verify	{
 	SELECT lion_index_verify('gp_k', true);
 	SELECT lion_index_verify('gpt_k', true);
 }
+step s3_vacw	{ VACUUM (INDEX_CLEANUP ON) gw; }
+step s3_pinsw	{
+	SELECT count(*) AS index_pages_pinned FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode = pg_relation_filenode('gw_ab') AND pinning_backends > 0;
+}
+step s3_verifyw	{ SELECT lion_index_verify('gw_ab', true); }
 
 permutation s2_pages s1_k1 s3_pins s2_grow s2_pages s1_rest s1_check_k1 s3_verify
 permutation s1_k5 s2_spill s1_rest s1_check_k5 s3_verify
 permutation s1_t s2_split s1_rest s1_check_t s3_verify
 permutation s2_del4 s1_k34 s3_pins s3_vacuum s3_gone s2_reuse s2_free s1_rest s1_check_k34 s3_verify
+permutation s2_delw s1_w s3_pinsw s3_vacw s2_addw s1_rest s1_check_w s3_verifyw

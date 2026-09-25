@@ -1197,8 +1197,260 @@ SELECT (SELECT blks FROM lis_pw_blks WHERE wm = '64kB') - (SELECT blks FROM lis_
  t
 (1 row)
 
+-- ... and across windows: at the least pg_lion.scan_window_floor a window is
+-- 16 container keys, a thousand heap blocks, and this union takes five
+SET pg_lion.scan_window_floor = '64kB';
+SET work_mem = '64kB';
+SELECT lion_ios('SELECT count(*) FROM lis_pw WHERE flag');
+                lion_ios                
+----------------------------------------
+ index-only scan on lis_pw_tags: 300000
+(1 row)
+
+SELECT lion_iq('SELECT id FROM lis_pw WHERE flag AND tags IS NOT NULL');
+                lion_iq                 
+----------------------------------------
+ index scan on lis_pw_tags, 300000 rows
+(1 row)
+
+RESET work_mem;
+RESET pg_lion.scan_window_floor;
 DROP TABLE lis_pw, lis_pw_blks;
 DROP FUNCTION lis_pw_blks();
+-- ---------- 11. a range, or IS NOT NULL, beside another column's sets ----------
+-- A range on one column of a multicolumn index beside an equality on another
+-- was streamed entry by entry, each entry ANDed with the other column's
+-- stream restarted for it - a descent of b's posting tree per entry of a:
+-- `a BETWEEN 1 AND 400000 AND b = 5` over a million rows took 1.06M buffer
+-- hits and 818 ms where the bitmap scan read 5481 buffers in 72 ms, and the
+-- planner chose the plain scan for the 200000-row range (2026-09-25 review).
+-- A walk longer than the other columns' posting pages is now ORed into
+-- windows of their containers and ANDed with ONE stream of them, and
+-- `a IS NOT NULL` beside `b = 5` - which walked every entry of a the same way,
+-- 4.37M buffer hits - is dropped and rechecked, as the bitmap scan does
+-- (DESIGN.md §29.3).  a is unique and in heap order, b has 50 values, d 20000
+-- scattered ones (INLINE sparse segments spanning the heap), and a few rows
+-- have a NULL a.
+CREATE TABLE lis_w (a int, b int, d int, c int);
+INSERT INTO lis_w SELECT g, g % 50, (g::int8 * 7919 % 20000)::int, g
+  FROM generate_series(1, 200000) g;
+INSERT INTO lis_w SELECT NULL, g % 50, g, -g FROM generate_series(1, 500) g;
+CREATE INDEX lis_w_abd ON lis_w USING lion (a, b, d);
+VACUUM ANALYZE lis_w;
+/*
+ * lion_bufs() runs a query as a plain index scan, or as a bitmap scan, under
+ * EXPLAIN (ANALYZE, BUFFERS) and returns the shared buffers its top node
+ * touched, hits and reads together.
+ */
+CREATE FUNCTION lion_bufs(q text, plain boolean) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	res bigint := NULL;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', CASE WHEN plain THEN 'off' ELSE 'on' END, true);
+	PERFORM set_config('enable_indexscan', CASE WHEN plain THEN 'on' ELSE 'off' END, true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF res IS NULL AND ln ~ 'Buffers: shared' THEN
+			res := coalesce(substring(ln from 'hit=(\d+)')::bigint, 0) +
+				   coalesce(substring(ln from 'read=(\d+)')::bigint, 0);
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN res;
+END $$;
+-- the answers, in one window of the other columns' containers and in several
+CREATE TABLE lis_w_q (q text);
+INSERT INTO lis_w_q VALUES
+	('SELECT c FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 5'),	-- one-row INLINE entries
+	('SELECT c FROM lis_w WHERE d BETWEEN 100 AND 15000 AND b = 7'),	-- sparse segments across windows
+	('SELECT c FROM lis_w WHERE b BETWEEN 0 AND 30 AND d IN (1, 2, 3, 500, 7000)'),	-- posting trees walked
+	('SELECT c FROM lis_w WHERE a < ANY (''{5000, 90000}'') AND b = 3'),	-- one walk to the widest
+	('SELECT c FROM lis_w WHERE a > 100 AND a <= 180000 AND b IN (1, 2) AND d < 10000'),
+	('SELECT c FROM lis_w WHERE a BETWEEN 1 AND 10 AND b = 5'),	-- short: entry by entry
+	('SELECT c FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 999'),	-- b selects nothing
+	('SELECT c FROM lis_w WHERE a > 5000000 AND b = 5'),	-- the range selects nothing
+	('SELECT c FROM lis_w WHERE a BETWEEN 1 AND 150000 AND d BETWEEN 5 AND 50 AND b = 4'),	-- d left to the recheck
+	('SELECT c FROM lis_w WHERE a IS NOT NULL AND b = 5'),	-- dropped, rechecked
+	('SELECT c FROM lis_w WHERE a IS NOT NULL AND b > 45'),	-- the range walks
+	('SELECT c FROM lis_w WHERE a IS NOT NULL AND d IS NOT NULL'),	-- one walks, one rechecked
+	('SELECT c FROM lis_w WHERE a IS NOT NULL');
+SELECT lion_iq(q) FROM lis_w_q;
+               lion_iq                
+--------------------------------------
+ index scan on lis_w_abd, 2980 rows
+ index scan on lis_w_abd, 2988 rows
+ index scan on lis_w_abd, 44 rows
+ index scan on lis_w_abd, 1800 rows
+ index scan on lis_w_abd, 3598 rows
+ index scan on lis_w_abd, 1 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 7 rows
+ index scan on lis_w_abd, 4000 rows
+ index scan on lis_w_abd, 16000 rows
+ index scan on lis_w_abd, 200000 rows
+ index scan on lis_w_abd, 200000 rows
+(13 rows)
+
+SET pg_lion.scan_window_floor = '64kB';
+SET work_mem = '64kB';
+SELECT lion_iq(q) FROM lis_w_q;
+               lion_iq                
+--------------------------------------
+ index scan on lis_w_abd, 2980 rows
+ index scan on lis_w_abd, 2988 rows
+ index scan on lis_w_abd, 44 rows
+ index scan on lis_w_abd, 1800 rows
+ index scan on lis_w_abd, 3598 rows
+ index scan on lis_w_abd, 1 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 7 rows
+ index scan on lis_w_abd, 4000 rows
+ index scan on lis_w_abd, 16000 rows
+ index scan on lis_w_abd, 200000 rows
+ index scan on lis_w_abd, 200000 rows
+(13 rows)
+
+RESET work_mem;
+RESET pg_lion.scan_window_floor;
+-- a NULL a is not a row of `a IS NOT NULL`: the heap recheck removes them
+SELECT lion_ir('SELECT c FROM lis_w WHERE a IS NOT NULL AND b = 5');
+              lion_ir              
+-----------------------------------
+ Index Scan using lis_w_abd
+ Rows Removed by Index Recheck: 10
+(2 rows)
+
+SELECT lion_ir('SELECT c FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 5');
+          lion_ir           
+----------------------------
+ Index Scan using lis_w_abd
+(1 row)
+
+-- a plain scan reads about what the bitmap scan does, where it used to read
+-- a descent of b's posting tree for every entry walked: 147, 36 and 390
+-- times the bitmap scan's buffers here, 581, 128 and 807 ms against its 54,
+-- 18 and 12
+SELECT lion_bufs(q, true) <= 2 * lion_bufs(q, false) AS plain_reads_about_the_bitmaps
+  FROM (VALUES ('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 5'),
+			   ('SELECT sum(c) FROM lis_w WHERE d BETWEEN 100 AND 15000 AND b = 7'),
+			   ('SELECT sum(c) FROM lis_w WHERE a IS NOT NULL AND b = 5')) v(q);
+ plain_reads_about_the_bitmaps 
+-------------------------------
+ t
+ t
+ t
+(3 rows)
+
+-- the window's memory is bounded: two 4 kB images per container of b's, at
+-- most eight of them at the least floor and work_mem
+BEGIN;
+SET LOCAL pg_lion.enable_count_pushdown = off;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL pg_lion.scan_window_floor = '64kB';
+SET LOCAL work_mem = '64kB';
+DECLARE w CURSOR FOR SELECT c FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 5;
+FETCH 3 FROM w;
+  c   
+------
+ 1005
+ 1055
+ 1105
+(3 rows)
+
+SELECT count(*) > 0 AS scan_contexts,
+	   sum(total_bytes) < 512 * 1024 AS under_512kB
+  FROM pg_backend_memory_contexts WHERE name LIKE 'lion index scan%';
+ scan_contexts | under_512kb 
+---------------+-------------
+ t             | t
+(1 row)
+
+MOVE FORWARD ALL IN w;
+COMMIT;
+-- plan choice with nothing disabled: a short range beside b = 5 goes to the
+-- plain scan, which now reads what the bitmap scan reads; a range of nearly
+-- every a pays for its own walk (DESIGN.md §29.11) where it was prorated by
+-- b's selectivity too, and goes to the sequential scan rather than to a
+-- bitmap scan half as slow again; `a IS NOT NULL AND b = 5` is priced by b
+-- alone and goes to the bitmap scan
+SET pg_lion.enable_count_pushdown = off;
+SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 5000 AND b = 5');
+              lion_top               
+-------------------------------------
+ Index Scan using lis_w_abd on lis_w
+(1 row)
+
+SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 190000 AND b = 5');
+     lion_top      
+-------------------
+ Seq Scan on lis_w
+(1 row)
+
+SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a IS NOT NULL AND b = 5');
+                          lion_top                          
+------------------------------------------------------------
+ Bitmap Heap Scan on lis_w / Bitmap Index Scan on lis_w_abd
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+-- a dirty heap, then VACUUM
+UPDATE lis_w SET b = (b + 1) % 50 WHERE c % 7 = 0;
+DELETE FROM lis_w WHERE c % 11 = 0;
+UPDATE lis_w SET a = NULL WHERE c % 13 = 0;
+SELECT lion_iq(q) FROM lis_w_q;
+               lion_iq                
+--------------------------------------
+ index scan on lis_w_abd, 2500 rows
+ index scan on lis_w_abd, 2717 rows
+ index scan on lis_w_abd, 42 rows
+ index scan on lis_w_abd, 1511 rows
+ index scan on lis_w_abd, 3015 rows
+ index scan on lis_w_abd, 1 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 7 rows
+ index scan on lis_w_abd, 3356 rows
+ index scan on lis_w_abd, 13426 rows
+ index scan on lis_w_abd, 167833 rows
+ index scan on lis_w_abd, 167833 rows
+(13 rows)
+
+VACUUM lis_w;
+SET pg_lion.scan_window_floor = '64kB';
+SET work_mem = '64kB';
+SELECT lion_iq(q) FROM lis_w_q;
+               lion_iq                
+--------------------------------------
+ index scan on lis_w_abd, 2500 rows
+ index scan on lis_w_abd, 2717 rows
+ index scan on lis_w_abd, 42 rows
+ index scan on lis_w_abd, 1511 rows
+ index scan on lis_w_abd, 3015 rows
+ index scan on lis_w_abd, 1 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 0 rows
+ index scan on lis_w_abd, 7 rows
+ index scan on lis_w_abd, 3356 rows
+ index scan on lis_w_abd, 13426 rows
+ index scan on lis_w_abd, 167833 rows
+ index scan on lis_w_abd, 167833 rows
+(13 rows)
+
+RESET work_mem;
+RESET pg_lion.scan_window_floor;
+DROP TABLE lis_w, lis_w_q;
+DROP FUNCTION lion_bufs(text, boolean);
 DROP TABLE lis, lis_outer, lis_big, lis_f, lis_ex, lis_ex2, lis_ex3, lis_ex4;
 DROP FUNCTION lion_iq(text);
 DROP FUNCTION lion_ir(text);
