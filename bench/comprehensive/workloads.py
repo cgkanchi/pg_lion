@@ -12,6 +12,7 @@ FOCUSED_SCALAR = [
     'eq_c2_0', 'eq_c200_17', 'eq_c20k_123', 'eq_c1m_12345', 'eq_skew_0', 'eq_skew_17',
     'in_c20k_10', 'in_c20k_1000', 'and2', 'and3_selective', 'in_and', 'or_columns',
     'is_null', 'fetch_medium', 'range_random', 'ordered_limit',
+    'fetch_c1m', 'fetch_rare', 'fetch_broad', 'fetch_and2', 'fetch_and3', 'fetch_in_and',
     'group_c2', 'group_c200', 'group_filtered',
 ]
 FOCUSED_DOCS = [
@@ -19,6 +20,11 @@ FOCUSED_DOCS = [
     'ts_tree', 'ts_phrase', 'ts_prefix', 'ts_fetch',
 ]
 AFTER_MAINTENANCE = ['eq_c200_17', 'and2', 'is_null', 'group_c200']
+LOW_MEMORY = ['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium']
+# Row fetches that need the heap whatever the index: selectivity from a few rows to
+# thousands, and multi-predicate ANDs.  Low memory is where a plain index scan
+# (btree) and a lossy bitmap (lion, which has no amgettuple) part ways.
+LOW_MEMORY_FETCH = ['fetch_c1m', 'fetch_rare', 'fetch_and3']
 
 
 def profile_cases(suite, profile):
@@ -51,8 +57,7 @@ def measurement_matrix(suite, profile, maintenance=True):
     modes = ('default', 'prefer_index') if profile == 'full' else ('default',)
     add('clean', [c.id for c in cases], modes)
     if suite == 'scalar':
-        add('low_work_mem', ['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium'],
-            ('prefer_index',), '64kB')
+        add('low_work_mem', LOW_MEMORY + LOW_MEMORY_FETCH, ('prefer_index',), '64kB')
         if profile == 'full':
             for phase in ('dirty_clustered_5pct', 'dirty_scattered'):
                 add(phase, [c.id for c in cases if c.stress], modes)
@@ -113,6 +118,11 @@ def scalar_cases():
               Case('null_and','null','SELECT count(*) FROM fact WHERE nullable IS NULL AND c200=17'),
               Case('fetch_medium','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c200=17',True),
               Case('fetch_rare','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c20k=123'),
+              Case('fetch_c1m','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c1m=12345',True),
+              Case('fetch_broad','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c20=3'),
+              Case('fetch_and2','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c200=17 AND c20=3',True),
+              Case('fetch_and3','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c200=17 AND c20=3 AND c2=1',True),
+              Case('fetch_in_and','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE c200 IN (17,18,19) AND c20 IN (3,4,5)'),
               Case('fetch_clustered','heap_fetch','SELECT sum(id),sum(length(payload)) FROM fact WHERE clustered=17'),
               Case('range_random','range','SELECT count(*) FROM fact WHERE c20k BETWEEN 100 AND 199',True),
               Case('range_clustered','range','SELECT count(*) FROM fact WHERE clustered BETWEEN 17 AND 26'),

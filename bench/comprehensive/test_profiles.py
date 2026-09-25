@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 from audit import expected_configurations
 from run import Suite, parse_args
-from workloads import measurement_matrix, profile_cases, profile_indexes
+from workloads import LOW_MEMORY_FETCH, measurement_matrix, profile_cases, profile_indexes
 
 
 class Profiles(unittest.TestCase):
@@ -75,6 +75,11 @@ class Profiles(unittest.TestCase):
         args = self.args('--profile', 'full')
         queries = {s: [c.record() for c in profile_cases(s, 'full')] for s in ['scalar', 'documents']}
         legacy = expected_configurations({'arguments': vars(args)}, queries)
+        # The saved matrix adds low-memory row fetches the legacy audit never had.
+        variants = [v for f in args.families
+                    for v in (['roaring', 'roaring_bitmap'] if f == 'roaring' else [f])]
+        legacy[0].update(('scalar', n, v, 'low_work_mem', 'prefer_index', '64kB', case)
+                         for n in args.rows for v in variants for case in LOW_MEMORY_FETCH)
         queries['matrix'] = {s: measurement_matrix(s, 'full') for s in queries}
         self.assertEqual(legacy, expected_configurations({'arguments': vars(args)}, queries))
 

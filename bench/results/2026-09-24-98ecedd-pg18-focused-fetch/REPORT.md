@@ -1,0 +1,552 @@
+# Index comparison: measured results
+
+Commit `98eceddde2fff1281117a7570592a5567e8964d6`. Profile: **focused**. Run status: **complete**. Started 2026-09-25T02:01:27Z; completed 2026-09-25T02:08:53Z.
+
+1,074 timed observations, 358 successful exact result-multiset checks, **0 recorded errors**, and **0 explicitly unmeasured configurations** after maintenance failures. A correctness check is separate from EXPLAIN timing; the suite does not mistake an aggregate's output row count for a proof of correctness. An operation timeout is a failed attempt, not a successful duration; dependent checks are skipped and identified below.
+
+**Build failures:** 0 recorded failed index builds. Statements have a 60-second limit. A failed index is omitted from the remaining portfolio and is not retried in subsequent build rounds; the family remains explicitly partial. Query results for that family use its surviving indexes or a planner fallback. They are **not measurements of the missing index**. See the completeness column and individual-index status below. Resume history and any earlier fatal attempt are preserved in metadata.
+
+Hardware: **AMD Ryzen 7 5700X3D 8-Core Processor**, 16 logical CPUs, 23.47 GiB visible RAM. Server: `PostgreSQL 18.6 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit`. Platform: `Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39`. See [metadata.json](metadata.json) for compiler flags, all server settings, seed, and run arguments. Shared buffers are 512 MB; normal work_mem is 64 MB and maintenance_work_mem is 512 MB. Parallel query and JIT are disabled to isolate access paths; index builds use the recorded maintenance-worker setting. Durability is enabled. Autovacuum is disabled; vacuum and visibility transitions are explicit.
+
+This is a synthetic, single-machine comparison, inspired by the presentation of the [Biscuit benchmark](https://biscuit.readthedocs.io/en/latest/benchmark.html). It measures this extension's integer, array, and full-text workloads, not Biscuit's wildcard workload. The data and workload SQL are in [queries.json](queries.json); generation and execution are in the [runner](../../comprehensive/run.py).
+
+## Interpretation and fairness
+
+Each selected scalar family attempts the same single-column portfolio on a freshly generated heap: seven indexes in the focused profile, eight in the full profile. The focused profile omits `clustered`; its document portfolio omits `grp`. Exact definitions are saved in `queries.json`. If selected, `btree_tuned` additionally receives a composite `(c200,c20,c2)` index and a covering `(c200) INCLUDE (id,payload)` index; its larger portfolio is charged in build time, bytes, and maintenance. Scalar GIN and GiST use `btree_gin` and `btree_gist`. GIN fastupdate is on; BRIN uses 32-page ranges. Roaring uses extension defaults. `roaring_bitmap` reuses the roaring portfolio with count pushdown disabled.
+
+Focused document comparisons use GIN and roaring for text arrays and full-text search. The full profile also includes GiST text search; GiST has no text[] containment opclass here, so its array queries are fallbacks. The range and ordered-LIMIT cases measure distinct access patterns: consult the recorded plans for LionCount, bitmap scans, or sequential fallbacks. Lion does not provide ordered row retrieval. Sequential execution is always the correctness reference, but is timed as a separate portfolio only when `seq` is selected. This suite does not claim coverage of geometric, vector, JSON, wildcard, or arbitrary extension indexes.
+
+`default` uses normal planner preferences. `prefer_index` disables sequential scans as a diagnostic; it is not a production tuning recommendation and does not guarantee use of an index. The access column and raw plans identify the actual route. A fallback is a query execution result, not a successful measurement of the named index algorithm.
+
+Each query is verified against a forced sequential-scan result, warmed independently, and measured in randomized complete rounds within a portfolio. Families are shuffled with a fixed seed. Families run sequentially; there is no interleaved cross-family crossover trial. Warm means no deliberate cache eviction, **not a guarantee that the working set fits shared buffers**. `shared_buffers_cold` restarts the dedicated server before each measured query; the OS page cache remains warm, and planning can warm metadata pages before execution. No claim about cold physical-disk performance is made.
+
+`clean` follows VACUUM FREEZE. The focused profile dirties every hundredth row's non-indexed payload directly from the clean state. The full profile first measures `dirty_clustered_5pct` (the first 5% of rows updated), then adds scattered updates. Dirty-state timings from the two profiles are not interchangeable. [operations.jsonl](operations.jsonl) records measured all-visible and heap-page counts. `low_work_mem` uses 64 kB and records lossy bitmap/temp-block evidence in [samples.jsonl](samples.jsonl). The normal setting is 64 MB. Maintenance is measured once per portfolio, with a checkpoint before each operation; WAL includes full-page images and index WAL. Insert batches contain 1% of initial rows; indexed updates affect the first 1%, and deletes use `id % 100 = 1`. Both profiles measure VACUUM; only the full profile adds REINDEX. Build repeats are recorded separately.
+
+Read latency is server EXPLAIN ANALYZE execution time with per-node timing off, including EXPLAIN instrumentation but excluding planning and result transfer. Planning time and full buffer/WAL plans are retained in [samples.jsonl](samples.jsonl) and [plans.jsonl.gz](plans.jsonl.gz). Medians, interpolated p95, sample CV, and a seeded 2,000-resample percentile bootstrap 95% CI of the median are shown. With few samples, especially cold samples, intervals and p95 are descriptive and imprecise. Speedups divide matching sequential-scan medians by the variant median; they are not cross-workload averages. Sub-millisecond ratios are especially sensitive to timer resolution and instrumentation overhead. Timeout/error observations remain errors and are excluded from latency summaries, never converted to zero.
+
+Concurrency measures closed-loop SELECTs through Python threads and synchronous libpq, including client dispatch, result transfer, and decoding. It can become client-bound for very fast counts; it is not a maximum server-throughput claim. The separate [growth/churn/write supplement](../2026-09-21-stress/REPORT.md) covers empty-index growth, changing-key churn, prepared statements, fully dirty low-memory counts, and short concurrent-write bursts. Crash recovery, replication, filesystem cache eviction, repeated maintenance trials, variable GIN pending-list settings, and tuning sweeps remain outside these runs. The benchmark is exhaustive over its published matrix, not every PostgreSQL workload.
+
+Storage columns labeled Heap MiB use `pg_table_size`, including auxiliary forks and any TOAST storage; portfolio bytes use `pg_indexes_size`. Individual-index bytes use `pg_relation_size` (main fork). MiB means 1,048,576 bytes. Consult the [results guide](../../COMPARISON.md) for selected comparisons and their practical limits.
+
+## Size and build cost
+
+| Suite | Rows | Family | Heap MiB | Indexes MiB | Median build seconds | Build rounds | Completeness / omitted indexes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| documents | 200000 | gin | 52.05 | 6.38 | 0.311 | 1 | complete |
+| documents | 200000 | roaring | 52.05 | 7.67 | 1.683 | 1 | complete |
+| scalar | 1000000 | btree | 150.57 | 58.98 | 1.755 | 1 | complete |
+| scalar | 1000000 | gin | 150.57 | 58.68 | 2.049 | 1 | complete |
+| scalar | 1000000 | roaring | 150.57 | 67.80 | 4.843 | 1 | complete |
+| scalar | 5000000 | btree | 751.73 | 256.29 | 9.172 | 1 | complete |
+| scalar | 5000000 | gin | 751.73 | 156.96 | 7.659 | 1 | complete |
+| scalar | 5000000 | roaring | 751.73 | 192.48 | 25.941 | 1 | complete |
+
+## Every individual index
+
+| Suite | Rows | Family | Index | MiB | Median attempt ms | Min–max attempt ms | Median WAL MiB | Attempts | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| documents | 200000 | gin | ix_tags | 2.070 | 106.763 | 106.763–106.763 | 1.350 | 1 | built |
+| documents | 200000 | gin | ix_tsv | 4.305 | 204.515 | 204.515–204.515 | 2.675 | 1 | built |
+| documents | 200000 | roaring | ix_tags | 2.789 | 562.988 | 562.988–562.988 | 2.213 | 1 | built |
+| documents | 200000 | roaring | ix_tsv | 4.883 | 1119.624 | 1119.624–1119.624 | 4.074 | 1 | built |
+| scalar | 1000000 | btree | ix_c1m | 18.812 | 276.487 | 276.487–276.487 | 17.055 | 1 | built |
+| scalar | 1000000 | btree | ix_c2 | 6.633 | 251.353 | 251.353–251.353 | 6.027 | 1 | built |
+| scalar | 1000000 | btree | ix_c20 | 6.641 | 258.348 | 258.348–258.348 | 6.043 | 1 | built |
+| scalar | 1000000 | btree | ix_c200 | 6.719 | 245.099 | 245.099–245.099 | 6.046 | 1 | built |
+| scalar | 1000000 | btree | ix_c20k | 6.805 | 241.617 | 241.617–241.617 | 6.325 | 1 | built |
+| scalar | 1000000 | btree | ix_nullable | 6.719 | 253.233 | 253.233–253.233 | 6.031 | 1 | built |
+| scalar | 1000000 | btree | ix_skew | 6.656 | 228.615 | 228.615–228.615 | 6.034 | 1 | built |
+| scalar | 1000000 | gin | ix_c1m | 38.195 | 1203.617 | 1203.617–1203.617 | 19.483 | 1 | built |
+| scalar | 1000000 | gin | ix_c2 | 1.094 | 92.825 | 92.825–92.825 | 1.136 | 1 | built |
+| scalar | 1000000 | gin | ix_c20 | 1.578 | 119.138 | 119.138–119.138 | 1.417 | 1 | built |
+| scalar | 1000000 | gin | ix_c200 | 4.703 | 136.025 | 136.025–136.025 | 2.066 | 1 | built |
+| scalar | 1000000 | gin | ix_c20k | 6.734 | 248.833 | 248.833–248.833 | 3.583 | 1 | built |
+| scalar | 1000000 | gin | ix_nullable | 4.836 | 131.821 | 131.821–131.821 | 2.025 | 1 | built |
+| scalar | 1000000 | gin | ix_skew | 1.539 | 116.369 | 116.369–116.369 | 1.299 | 1 | built |
+| scalar | 1000000 | roaring | ix_c1m | 44.266 | 920.397 | 920.397–920.397 | 39.881 | 1 | built |
+| scalar | 1000000 | roaring | ix_c2 | 2.391 | 615.278 | 615.278–615.278 | 2.036 | 1 | built |
+| scalar | 1000000 | roaring | ix_c20 | 2.359 | 713.538 | 713.538–713.538 | 2.097 | 1 | built |
+| scalar | 1000000 | roaring | ix_c200 | 4.719 | 689.969 | 689.969–689.969 | 2.904 | 1 | built |
+| scalar | 1000000 | roaring | ix_c20k | 7.898 | 630.058 | 630.058–630.058 | 7.018 | 1 | built |
+| scalar | 1000000 | roaring | ix_nullable | 4.938 | 706.689 | 706.689–706.689 | 2.915 | 1 | built |
+| scalar | 1000000 | roaring | ix_skew | 1.227 | 566.858 | 566.858–566.858 | 1.129 | 1 | built |
+| scalar | 5000000 | btree | ix_c1m | 56.258 | 1320.779 | 1320.779–1320.779 | 51.025 | 1 | built |
+| scalar | 5000000 | btree | ix_c2 | 33.062 | 1340.265 | 1340.265–1340.265 | 29.932 | 1 | built |
+| scalar | 5000000 | btree | ix_c20 | 33.070 | 1387.994 | 1387.994–1387.994 | 29.933 | 1 | built |
+| scalar | 5000000 | btree | ix_c200 | 33.148 | 1324.303 | 1324.303–1324.303 | 29.929 | 1 | built |
+| scalar | 5000000 | btree | ix_c20k | 34.383 | 1295.433 | 1295.433–1295.433 | 30.078 | 1 | built |
+| scalar | 5000000 | btree | ix_nullable | 33.148 | 1343.894 | 1343.894–1343.894 | 29.932 | 1 | built |
+| scalar | 5000000 | btree | ix_skew | 33.219 | 1159.729 | 1159.729–1159.729 | 29.938 | 1 | built |
+| scalar | 5000000 | gin | ix_c1m | 87.367 | 3851.238 | 3851.238–3851.238 | 44.603 | 1 | built |
+| scalar | 5000000 | gin | ix_c2 | 5.297 | 429.371 | 429.371–429.371 | 5.223 | 1 | built |
+| scalar | 5000000 | gin | ix_c20 | 7.055 | 532.896 | 532.896–532.896 | 6.802 | 1 | built |
+| scalar | 5000000 | gin | ix_c200 | 12.516 | 619.016 | 619.016–619.016 | 10.009 | 1 | built |
+| scalar | 5000000 | gin | ix_c20k | 26.281 | 1041.454 | 1041.454–1041.454 | 15.408 | 1 | built |
+| scalar | 5000000 | gin | ix_nullable | 11.562 | 616.928 | 616.928–616.928 | 9.779 | 1 | built |
+| scalar | 5000000 | gin | ix_skew | 6.883 | 568.092 | 568.092–568.092 | 6.097 | 1 | built |
+| scalar | 5000000 | roaring | ix_c1m | 92.164 | 3710.936 | 3710.936–3710.936 | 82.836 | 1 | built |
+| scalar | 5000000 | roaring | ix_c2 | 11.797 | 3337.292 | 3337.292–3337.292 | 9.782 | 1 | built |
+| scalar | 5000000 | roaring | ix_c20 | 10.484 | 4273.386 | 4273.386–4273.386 | 10.179 | 1 | built |
+| scalar | 5000000 | roaring | ix_c200 | 15.742 | 3989.443 | 3989.443–3989.443 | 14.119 | 1 | built |
+| scalar | 5000000 | roaring | ix_c20k | 39.289 | 3567.882 | 3567.882–3567.882 | 30.585 | 1 | built |
+| scalar | 5000000 | roaring | ix_nullable | 16.695 | 4194.921 | 4194.921–4194.921 | 14.153 | 1 | built |
+| scalar | 5000000 | roaring | ix_skew | 6.312 | 2867.616 | 2867.616–2867.616 | 5.139 | 1 | built |
+
+## Measured visibility
+
+| Suite | Rows | Family | State | Heap pages | All-visible pages | All-visible % |
+| --- | --- | --- | --- | --- | --- | --- |
+| scalar | 1000000 | btree | clean | 19264 | 19231 | 99.83 |
+| scalar | 1000000 | btree | dirty_scattered | 19264 | 9231 | 47.92 |
+| scalar | 1000000 | gin | clean | 19264 | 19231 | 99.83 |
+| scalar | 1000000 | gin | dirty_scattered | 19264 | 9231 | 47.92 |
+| scalar | 1000000 | roaring | clean | 19264 | 19231 | 99.83 |
+| scalar | 1000000 | roaring | dirty_scattered | 19264 | 9231 | 47.92 |
+| scalar | 5000000 | roaring | clean | 96192 | 96154 | 99.96 |
+| scalar | 5000000 | roaring | dirty_scattered | 96192 | 46154 | 47.98 |
+| scalar | 5000000 | btree | clean | 96192 | 96154 | 99.96 |
+| scalar | 5000000 | btree | dirty_scattered | 96192 | 46154 | 47.98 |
+| scalar | 5000000 | gin | clean | 96192 | 96154 | 99.96 |
+| scalar | 5000000 | gin | dirty_scattered | 96192 | 46154 | 47.98 |
+| documents | 200000 | gin | clean | 6656 | 6628 | 99.58 |
+| documents | 200000 | roaring | clean | 6656 | 6628 | 99.58 |
+
+## Selected plots
+
+![Scalar portfolio size, 1,000,000 rows (lower is smaller)](size-1000000.svg)
+
+![eq_c2_0, 1,000,000 clean rows, default planner (lower is faster)](eq_c2_0-1000000.svg)
+
+![eq_c200_17, 1,000,000 clean rows, default planner (lower is faster)](eq_c200_17-1000000.svg)
+
+![group_c200, 1,000,000 clean rows, default planner (lower is faster)](group_c200-1000000.svg)
+
+![range_random, 1,000,000 clean rows, default planner (lower is faster)](range_random-1000000.svg)
+
+![fetch_medium, 1,000,000 clean rows, default planner (lower is faster)](fetch_medium-1000000.svg)
+
+![fetch_c1m, 1,000,000 clean rows, default planner (lower is faster)](fetch_c1m-1000000.svg)
+
+![fetch_and3, 1,000,000 clean rows, default planner (lower is faster)](fetch_and3-1000000.svg)
+
+![Scalar portfolio size, 5,000,000 rows (lower is smaller)](size-5000000.svg)
+
+![eq_c2_0, 5,000,000 clean rows, default planner (lower is faster)](eq_c2_0-5000000.svg)
+
+![eq_c200_17, 5,000,000 clean rows, default planner (lower is faster)](eq_c200_17-5000000.svg)
+
+![group_c200, 5,000,000 clean rows, default planner (lower is faster)](group_c200-5000000.svg)
+
+![range_random, 5,000,000 clean rows, default planner (lower is faster)](range_random-5000000.svg)
+
+![fetch_medium, 5,000,000 clean rows, default planner (lower is faster)](fetch_medium-5000000.svg)
+
+![fetch_c1m, 5,000,000 clean rows, default planner (lower is faster)](fetch_c1m-5000000.svg)
+
+![fetch_and3, 5,000,000 clean rows, default planner (lower is faster)](fetch_and3-5000000.svg)
+
+
+## Maintenance (single observations)
+
+| Rows | Family | Operation | Elapsed attempt ms | WAL MiB | Indexes MiB after | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1000000 | btree | insert | 208.673 | 32.628 | 59.383 | ok |
+| 1000000 | btree | indexed_update | 249.340 | 36.890 | 59.750 | ok |
+| 1000000 | btree | delete | 143.283 | 73.227 | 59.750 | ok |
+| 1000000 | btree | vacuum | 378.551 | 133.803 | 59.750 | ok |
+| 1000000 | gin | insert | 77.235 | 12.297 | 60.055 | ok |
+| 1000000 | gin | indexed_update | 130.316 | 15.618 | 61.430 | ok |
+| 1000000 | gin | delete | 141.488 | 73.227 | 61.430 | ok |
+| 1000000 | gin | vacuum | 488.904 | 141.277 | 61.734 | ok |
+| 1000000 | roaring | insert | 284.070 | 51.022 | 67.820 | ok |
+| 1000000 | roaring | indexed_update | 300.241 | 59.913 | 69.102 | ok |
+| 1000000 | roaring | delete | 211.942 | 73.227 | 69.102 | ok |
+| 1000000 | roaring | vacuum | 633.523 | 137.662 | 69.102 | ok |
+| 5000000 | roaring | insert | 1221.611 | 176.908 | 193.938 | ok |
+| 5000000 | roaring | indexed_update | 1657.629 | 209.367 | 198.266 | ok |
+| 5000000 | roaring | delete | 1249.019 | 366.125 | 198.266 | ok |
+| 5000000 | roaring | vacuum | 3691.953 | 569.326 | 198.266 | ok |
+| 5000000 | btree | insert | 883.032 | 119.585 | 260.078 | ok |
+| 5000000 | btree | indexed_update | 2563.281 | 138.523 | 263.102 | ok |
+| 5000000 | btree | delete | 2026.765 | 366.125 | 263.102 | ok |
+| 5000000 | btree | vacuum | 3420.142 | 634.377 | 263.102 | ok |
+| 5000000 | gin | insert | 417.736 | 61.368 | 163.727 | ok |
+| 5000000 | gin | indexed_update | 936.946 | 77.891 | 170.492 | ok |
+| 5000000 | gin | delete | 1385.588 | 366.125 | 170.492 | ok |
+| 5000000 | gin | vacuum | 4098.637 | 587.328 | 172.297 | ok |
+
+## Concurrent reads
+
+| Rows | Variant | Clients | Query | Transactions/s | Median ms | p95 ms | Duration s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+## Every query and configuration
+
+| Suite | Rows | State | Planner | work_mem | Query | Variant | n | Execution median ms | 95% CI ms | p95 ms | CV | Speedup vs seq | Access | Planning median ms | Plan+execution median ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| documents | 200000 | clean | default | 64MB | array_and | gin | 3 | 0.881 | 0.846–0.915 | 0.912 | 3.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 0.936 |
+| documents | 200000 | clean | default | 64MB | array_and | roaring | 3 | 0.126 | 0.119–0.127 | 0.127 | 3.5% | — | LionCount | 0.073 | 0.196 |
+| documents | 200000 | clean | default | 64MB | array_and | roaring_bitmap | 3 | 0.205 | 0.194–0.226 | 0.224 | 7.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 0.260 |
+| documents | 200000 | clean | default | 64MB | array_common | gin | 3 | 3.963 | 3.915–4.164 | 4.144 | 3.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 4.014 |
+| documents | 200000 | clean | default | 64MB | array_common | roaring | 3 | 0.024 | 0.024–0.025 | 0.025 | 2.4% | — | LionCount | 0.079 | 0.103 |
+| documents | 200000 | clean | default | 64MB | array_common | roaring_bitmap | 3 | 3.399 | 3.374–3.426 | 3.423 | 0.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.053 | 3.451 |
+| documents | 200000 | clean | default | 64MB | array_or | gin | 3 | 6.635 | 6.622–7.016 | 6.978 | 3.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 6.688 |
+| documents | 200000 | clean | default | 64MB | array_or | roaring | 3 | 0.224 | 0.222–0.247 | 0.245 | 6.0% | — | LionCount | 0.079 | 0.326 |
+| documents | 200000 | clean | default | 64MB | array_or | roaring_bitmap | 3 | 5.377 | 5.225–5.871 | 5.822 | 6.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 5.436 |
+| documents | 200000 | clean | default | 64MB | ts_and | gin | 3 | 0.977 | 0.956–0.984 | 0.983 | 1.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 1.024 |
+| documents | 200000 | clean | default | 64MB | ts_and | roaring | 3 | 0.128 | 0.128–0.143 | 0.141 | 6.5% | — | LionCount | 0.069 | 0.207 |
+| documents | 200000 | clean | default | 64MB | ts_and | roaring_bitmap | 3 | 0.202 | 0.180–0.240 | 0.236 | 14.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 0.249 |
+| documents | 200000 | clean | default | 64MB | ts_common | gin | 3 | 30.020 | 29.865–30.427 | 30.386 | 1.0% | — | Seq Scan (fallback) | 0.045 | 30.067 |
+| documents | 200000 | clean | default | 64MB | ts_common | roaring | 3 | 0.032 | 0.032–0.038 | 0.037 | 10.2% | — | LionCount | 0.072 | 0.104 |
+| documents | 200000 | clean | default | 64MB | ts_common | roaring_bitmap | 3 | 29.006 | 28.612–30.003 | 29.903 | 2.5% | — | Seq Scan (fallback) | 0.046 | 29.052 |
+| documents | 200000 | clean | default | 64MB | ts_fetch | gin | 3 | 4.436 | 4.431–4.518 | 4.510 | 1.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 4.488 |
+| documents | 200000 | clean | default | 64MB | ts_fetch | roaring | 3 | 3.839 | 3.782–3.943 | 3.933 | 2.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 3.888 |
+| documents | 200000 | clean | default | 64MB | ts_fetch | roaring_bitmap | 3 | 3.876 | 3.807–4.120 | 4.096 | 4.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 3.926 |
+| documents | 200000 | clean | default | 64MB | ts_phrase | gin | 3 | 7.077 | 7.067–7.182 | 7.171 | 0.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.046 | 7.123 |
+| documents | 200000 | clean | default | 64MB | ts_phrase | roaring | 3 | 31.338 | 30.671–32.412 | 32.305 | 2.8% | — | Seq Scan (fallback) | 0.066 | 31.405 |
+| documents | 200000 | clean | default | 64MB | ts_phrase | roaring_bitmap | 3 | 31.665 | 31.245–31.870 | 31.849 | 1.0% | — | Seq Scan (fallback) | 0.047 | 31.711 |
+| documents | 200000 | clean | default | 64MB | ts_prefix | gin | 3 | 1.606 | 1.560–2.193 | 2.134 | 19.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.048 | 1.654 |
+| documents | 200000 | clean | default | 64MB | ts_prefix | roaring | 3 | 24.039 | 23.671–24.615 | 24.557 | 2.0% | — | Seq Scan (fallback) | 0.049 | 24.088 |
+| documents | 200000 | clean | default | 64MB | ts_prefix | roaring_bitmap | 3 | 24.249 | 23.799–25.570 | 25.438 | 3.8% | — | Seq Scan (fallback) | 0.047 | 24.296 |
+| documents | 200000 | clean | default | 64MB | ts_rare | gin | 3 | 0.034 | 0.034–0.038 | 0.038 | 6.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.046 | 0.080 |
+| documents | 200000 | clean | default | 64MB | ts_rare | roaring | 3 | 0.014 | 0.013–0.014 | 0.014 | 4.2% | — | LionCount | 0.070 | 0.084 |
+| documents | 200000 | clean | default | 64MB | ts_rare | roaring_bitmap | 3 | 0.038 | 0.038–0.039 | 0.039 | 1.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 0.085 |
+| documents | 200000 | clean | default | 64MB | ts_tree | gin | 3 | 3.536 | 3.485–3.628 | 3.619 | 2.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.048 | 3.584 |
+| documents | 200000 | clean | default | 64MB | ts_tree | roaring | 3 | 0.491 | 0.489–0.500 | 0.499 | 1.2% | — | LionCount | 0.073 | 0.564 |
+| documents | 200000 | clean | default | 64MB | ts_tree | roaring_bitmap | 3 | 0.779 | 0.762–0.782 | 0.782 | 1.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 0.823 |
+| scalar | 1000000 | after_maintenance | default | 64MB | and2 | btree | 3 | 2.952 | 2.865–4.021 | 3.914 | 19.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.044 | 2.996 |
+| scalar | 1000000 | after_maintenance | default | 64MB | and2 | gin | 3 | 32.914 | 32.454–33.138 | 33.116 | 1.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.054 | 32.969 |
+| scalar | 1000000 | after_maintenance | default | 64MB | and2 | roaring | 3 | 0.348 | 0.347–0.386 | 0.382 | 6.2% | — | LionCount | 0.046 | 0.393 |
+| scalar | 1000000 | after_maintenance | default | 64MB | and2 | roaring_bitmap | 3 | 6.538 | 6.375–6.702 | 6.686 | 2.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.062 | 6.600 |
+| scalar | 1000000 | after_maintenance | default | 64MB | eq_c200_17 | btree | 3 | 0.341 | 0.333–0.344 | 0.344 | 1.7% | — | Index Only Scan | 0.033 | 0.375 |
+| scalar | 1000000 | after_maintenance | default | 64MB | eq_c200_17 | gin | 3 | 3.272 | 3.131–3.688 | 3.646 | 8.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 3.310 |
+| scalar | 1000000 | after_maintenance | default | 64MB | eq_c200_17 | roaring | 3 | 0.028 | 0.028–0.029 | 0.029 | 2.0% | — | LionCount | 0.038 | 0.066 |
+| scalar | 1000000 | after_maintenance | default | 64MB | eq_c200_17 | roaring_bitmap | 3 | 2.762 | 2.555–2.838 | 2.830 | 5.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.032 | 2.829 |
+| scalar | 1000000 | after_maintenance | default | 64MB | group_c200 | btree | 3 | 75.989 | 74.596–78.358 | 78.121 | 2.5% | — | Index Only Scan | 0.036 | 76.032 |
+| scalar | 1000000 | after_maintenance | default | 64MB | group_c200 | gin | 3 | 144.045 | 143.764–145.695 | 145.530 | 0.7% | — | Seq Scan (fallback) | 0.031 | 144.076 |
+| scalar | 1000000 | after_maintenance | default | 64MB | group_c200 | roaring | 3 | 3.814 | 3.745–3.825 | 3.824 | 1.1% | — | LionCount | 0.033 | 3.846 |
+| scalar | 1000000 | after_maintenance | default | 64MB | group_c200 | roaring_bitmap | 3 | 146.412 | 144.363–154.521 | 153.710 | 3.6% | — | Seq Scan (fallback) | 0.033 | 146.445 |
+| scalar | 1000000 | after_maintenance | default | 64MB | is_null | btree | 3 | 6.234 | 6.175–6.840 | 6.779 | 5.7% | — | Index Only Scan | 0.031 | 6.266 |
+| scalar | 1000000 | after_maintenance | default | 64MB | is_null | gin | 3 | 57.139 | 56.568–57.364 | 57.341 | 0.7% | — | Seq Scan (fallback) | 0.030 | 57.169 |
+| scalar | 1000000 | after_maintenance | default | 64MB | is_null | roaring | 3 | 0.090 | 0.089–0.091 | 0.091 | 1.1% | — | LionCount | 0.032 | 0.123 |
+| scalar | 1000000 | after_maintenance | default | 64MB | is_null | roaring_bitmap | 3 | 22.612 | 21.592–22.614 | 22.614 | 2.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.027 | 22.641 |
+| scalar | 1000000 | clean | default | 64MB | and2 | btree | 3 | 3.258 | 2.746–3.426 | 3.409 | 11.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 3.298 |
+| scalar | 1000000 | clean | default | 64MB | and2 | gin | 3 | 34.014 | 31.981–37.074 | 36.768 | 7.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.053 | 34.067 |
+| scalar | 1000000 | clean | default | 64MB | and2 | roaring | 3 | 0.391 | 0.360–0.397 | 0.396 | 5.2% | — | LionCount | 0.048 | 0.437 |
+| scalar | 1000000 | clean | default | 64MB | and2 | roaring_bitmap | 3 | 2.679 | 2.636–2.756 | 2.748 | 2.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 2.727 |
+| scalar | 1000000 | clean | default | 64MB | and3_selective | btree | 3 | 0.356 | 0.319–0.509 | 0.494 | 25.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.043 | 0.400 |
+| scalar | 1000000 | clean | default | 64MB | and3_selective | gin | 3 | 0.566 | 0.549–0.625 | 0.619 | 6.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 0.615 |
+| scalar | 1000000 | clean | default | 64MB | and3_selective | roaring | 3 | 0.319 | 0.315–0.327 | 0.326 | 1.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.057 | 0.376 |
+| scalar | 1000000 | clean | default | 64MB | and3_selective | roaring_bitmap | 3 | 0.365 | 0.326–0.367 | 0.367 | 6.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 0.414 |
+| scalar | 1000000 | clean | default | 64MB | eq_c1m_12345 | btree | 3 | 0.018 | 0.016–0.018 | 0.018 | 6.7% | — | Index Only Scan | 0.034 | 0.052 |
+| scalar | 1000000 | clean | default | 64MB | eq_c1m_12345 | gin | 3 | 0.024 | 0.021–0.031 | 0.030 | 20.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.034 | 0.058 |
+| scalar | 1000000 | clean | default | 64MB | eq_c1m_12345 | roaring | 3 | 0.014 | 0.012–0.015 | 0.015 | 11.2% | — | LionCount | 0.042 | 0.056 |
+| scalar | 1000000 | clean | default | 64MB | eq_c1m_12345 | roaring_bitmap | 3 | 0.027 | 0.022–0.028 | 0.028 | 12.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.035 | 0.062 |
+| scalar | 1000000 | clean | default | 64MB | eq_c200_17 | btree | 3 | 0.330 | 0.327–0.332 | 0.332 | 0.8% | — | Index Only Scan | 0.034 | 0.365 |
+| scalar | 1000000 | clean | default | 64MB | eq_c200_17 | gin | 3 | 3.096 | 3.016–3.129 | 3.126 | 1.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.035 | 3.132 |
+| scalar | 1000000 | clean | default | 64MB | eq_c200_17 | roaring | 3 | 0.030 | 0.028–0.030 | 0.030 | 3.9% | — | LionCount | 0.039 | 0.069 |
+| scalar | 1000000 | clean | default | 64MB | eq_c200_17 | roaring_bitmap | 3 | 2.673 | 2.508–2.887 | 2.866 | 7.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.031 | 2.704 |
+| scalar | 1000000 | clean | default | 64MB | eq_c20k_123 | btree | 3 | 0.020 | 0.019–0.021 | 0.021 | 5.0% | — | Index Only Scan | 0.033 | 0.053 |
+| scalar | 1000000 | clean | default | 64MB | eq_c20k_123 | gin | 3 | 0.048 | 0.043–0.053 | 0.052 | 10.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.033 | 0.081 |
+| scalar | 1000000 | clean | default | 64MB | eq_c20k_123 | roaring | 3 | 0.013 | 0.012–0.014 | 0.014 | 7.7% | — | LionCount | 0.041 | 0.054 |
+| scalar | 1000000 | clean | default | 64MB | eq_c20k_123 | roaring_bitmap | 3 | 0.044 | 0.039–0.053 | 0.052 | 15.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.034 | 0.078 |
+| scalar | 1000000 | clean | default | 64MB | eq_c2_0 | btree | 3 | 31.408 | 31.357–32.076 | 32.009 | 1.3% | — | Index Only Scan | 0.035 | 31.440 |
+| scalar | 1000000 | clean | default | 64MB | eq_c2_0 | gin | 3 | 109.159 | 107.696–112.123 | 111.827 | 2.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 109.208 |
+| scalar | 1000000 | clean | default | 64MB | eq_c2_0 | roaring | 3 | 0.377 | 0.364–0.388 | 0.387 | 3.2% | — | LionCount | 0.038 | 0.415 |
+| scalar | 1000000 | clean | default | 64MB | eq_c2_0 | roaring_bitmap | 3 | 57.866 | 57.800–58.741 | 58.654 | 0.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.034 | 57.898 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_0 | btree | 3 | 56.974 | 56.590–58.969 | 58.770 | 2.2% | — | Index Only Scan | 0.033 | 57.007 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_0 | gin | 3 | 84.352 | 83.576–86.794 | 86.550 | 2.0% | — | Seq Scan (fallback) | 0.038 | 84.393 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_0 | roaring | 3 | 0.156 | 0.155–0.227 | 0.220 | 23.0% | — | LionCount | 0.044 | 0.199 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_0 | roaring_bitmap | 3 | 83.807 | 83.595–86.021 | 85.800 | 1.6% | — | Seq Scan (fallback) | 0.036 | 83.844 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_17 | btree | 3 | 0.025 | 0.024–0.034 | 0.033 | 19.9% | — | Index Only Scan | 0.035 | 0.060 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_17 | gin | 3 | 0.110 | 0.101–0.112 | 0.112 | 5.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.054 | 0.157 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_17 | roaring | 3 | 0.014 | 0.014–0.015 | 0.015 | 4.0% | — | LionCount | 0.039 | 0.053 |
+| scalar | 1000000 | clean | default | 64MB | eq_skew_17 | roaring_bitmap | 3 | 0.088 | 0.080–0.117 | 0.114 | 20.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.034 | 0.122 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and2 | btree | 3 | 2.533 | 2.505–2.538 | 2.537 | 0.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.046 | 2.579 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and2 | gin | 3 | 5.027 | 5.018–5.077 | 5.072 | 0.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 5.075 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and2 | roaring | 3 | 2.285 | 2.283–2.329 | 2.325 | 1.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.046 | 2.329 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and2 | roaring_bitmap | 3 | 2.237 | 2.216–2.283 | 2.278 | 1.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.044 | 2.279 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and3 | btree | 3 | 2.518 | 2.495–2.580 | 2.574 | 1.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.051 | 2.569 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and3 | gin | 3 | 5.082 | 4.955–5.312 | 5.289 | 3.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.060 | 5.170 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and3 | roaring | 3 | 2.279 | 2.259–2.332 | 2.327 | 1.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.050 | 2.329 |
+| scalar | 1000000 | clean | default | 64MB | fetch_and3 | roaring_bitmap | 3 | 2.268 | 2.258–2.294 | 2.291 | 0.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 2.315 |
+| scalar | 1000000 | clean | default | 64MB | fetch_broad | btree | 3 | 19.052 | 16.128–19.617 | 19.561 | 10.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.037 | 19.088 |
+| scalar | 1000000 | clean | default | 64MB | fetch_broad | gin | 3 | 20.575 | 20.352–21.126 | 21.071 | 1.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.043 | 20.615 |
+| scalar | 1000000 | clean | default | 64MB | fetch_broad | roaring | 3 | 17.686 | 17.425–17.984 | 17.954 | 1.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 17.728 |
+| scalar | 1000000 | clean | default | 64MB | fetch_broad | roaring_bitmap | 3 | 17.943 | 17.268–18.869 | 18.776 | 4.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.035 | 17.978 |
+| scalar | 1000000 | clean | default | 64MB | fetch_c1m | btree | 3 | 0.023 | 0.022–0.026 | 0.026 | 8.8% | — | Index Scan | 0.038 | 0.061 |
+| scalar | 1000000 | clean | default | 64MB | fetch_c1m | gin | 3 | 0.030 | 0.027–0.033 | 0.033 | 10.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.041 | 0.071 |
+| scalar | 1000000 | clean | default | 64MB | fetch_c1m | roaring | 3 | 0.027 | 0.027–0.029 | 0.029 | 4.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 0.067 |
+| scalar | 1000000 | clean | default | 64MB | fetch_c1m | roaring_bitmap | 3 | 0.026 | 0.025–0.028 | 0.028 | 5.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.036 | 0.062 |
+| scalar | 1000000 | clean | default | 64MB | fetch_in_and | btree | 3 | 6.893 | 6.588–8.347 | 8.202 | 12.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.050 | 6.946 |
+| scalar | 1000000 | clean | default | 64MB | fetch_in_and | gin | 3 | 14.098 | 13.974–15.055 | 14.959 | 4.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 14.150 |
+| scalar | 1000000 | clean | default | 64MB | fetch_in_and | roaring | 3 | 5.928 | 5.924–5.971 | 5.967 | 0.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 5.979 |
+| scalar | 1000000 | clean | default | 64MB | fetch_in_and | roaring_bitmap | 3 | 5.994 | 5.915–6.447 | 6.402 | 4.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.053 | 6.045 |
+| scalar | 1000000 | clean | default | 64MB | fetch_medium | btree | 3 | 2.945 | 2.785–2.957 | 2.956 | 3.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.037 | 2.982 |
+| scalar | 1000000 | clean | default | 64MB | fetch_medium | gin | 3 | 3.280 | 3.245–4.262 | 4.164 | 16.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 3.318 |
+| scalar | 1000000 | clean | default | 64MB | fetch_medium | roaring | 3 | 3.053 | 3.004–3.173 | 3.161 | 2.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 3.091 |
+| scalar | 1000000 | clean | default | 64MB | fetch_medium | roaring_bitmap | 3 | 2.987 | 2.720–3.149 | 3.133 | 7.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 3.026 |
+| scalar | 1000000 | clean | default | 64MB | fetch_rare | btree | 3 | 0.054 | 0.053–0.056 | 0.056 | 2.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 0.092 |
+| scalar | 1000000 | clean | default | 64MB | fetch_rare | gin | 3 | 0.057 | 0.053–0.057 | 0.057 | 4.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 0.097 |
+| scalar | 1000000 | clean | default | 64MB | fetch_rare | roaring | 3 | 0.054 | 0.050–0.055 | 0.055 | 5.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 0.092 |
+| scalar | 1000000 | clean | default | 64MB | fetch_rare | roaring_bitmap | 3 | 0.058 | 0.051–0.061 | 0.061 | 9.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.041 | 0.099 |
+| scalar | 1000000 | clean | default | 64MB | group_c2 | btree | 3 | 75.075 | 74.929–75.310 | 75.287 | 0.3% | — | Index Only Scan | 0.036 | 75.109 |
+| scalar | 1000000 | clean | default | 64MB | group_c2 | gin | 3 | 118.197 | 117.007–119.456 | 119.330 | 1.0% | — | Seq Scan (fallback) | 0.031 | 118.226 |
+| scalar | 1000000 | clean | default | 64MB | group_c2 | roaring | 3 | 0.715 | 0.708–0.731 | 0.729 | 1.6% | — | LionCount | 0.034 | 0.751 |
+| scalar | 1000000 | clean | default | 64MB | group_c2 | roaring_bitmap | 3 | 121.674 | 118.805–124.695 | 124.393 | 2.4% | — | Seq Scan (fallback) | 0.044 | 121.757 |
+| scalar | 1000000 | clean | default | 64MB | group_c200 | btree | 3 | 78.014 | 77.405–78.384 | 78.347 | 0.6% | — | Index Only Scan | 0.036 | 78.049 |
+| scalar | 1000000 | clean | default | 64MB | group_c200 | gin | 3 | 144.757 | 141.201–147.007 | 146.782 | 2.0% | — | Seq Scan (fallback) | 0.030 | 144.787 |
+| scalar | 1000000 | clean | default | 64MB | group_c200 | roaring | 3 | 3.877 | 3.743–3.909 | 3.906 | 2.3% | — | LionCount | 0.033 | 3.914 |
+| scalar | 1000000 | clean | default | 64MB | group_c200 | roaring_bitmap | 3 | 146.516 | 144.367–148.710 | 148.491 | 1.5% | — | Seq Scan (fallback) | 0.033 | 146.549 |
+| scalar | 1000000 | clean | default | 64MB | group_filtered | btree | 3 | 3.117 | 3.027–3.865 | 3.790 | 13.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.045 | 3.161 |
+| scalar | 1000000 | clean | default | 64MB | group_filtered | gin | 3 | 3.475 | 3.438–3.495 | 3.493 | 0.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.044 | 3.529 |
+| scalar | 1000000 | clean | default | 64MB | group_filtered | roaring | 3 | 2.784 | 2.764–2.872 | 2.863 | 2.0% | — | LionCount | 0.048 | 2.831 |
+| scalar | 1000000 | clean | default | 64MB | group_filtered | roaring_bitmap | 3 | 3.801 | 3.475–4.025 | 4.003 | 7.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.063 | 3.843 |
+| scalar | 1000000 | clean | default | 64MB | in_and | btree | 3 | 6.344 | 6.265–6.683 | 6.649 | 3.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.045 | 6.389 |
+| scalar | 1000000 | clean | default | 64MB | in_and | gin | 3 | 13.964 | 13.684–15.197 | 15.074 | 5.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 14.011 |
+| scalar | 1000000 | clean | default | 64MB | in_and | roaring | 3 | 1.937 | 1.918–1.948 | 1.947 | 0.8% | — | LionCount | 0.055 | 1.992 |
+| scalar | 1000000 | clean | default | 64MB | in_and | roaring_bitmap | 3 | 6.051 | 5.827–6.661 | 6.600 | 7.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.051 | 6.102 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_10 | btree | 3 | 0.050 | 0.050–0.051 | 0.051 | 1.1% | — | Index Only Scan | 0.042 | 0.092 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_10 | gin | 3 | 0.387 | 0.385–0.407 | 0.405 | 3.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.045 | 0.436 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_10 | roaring | 3 | 0.030 | 0.029–0.031 | 0.031 | 3.3% | — | LionCount | 0.052 | 0.081 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_10 | roaring_bitmap | 3 | 0.379 | 0.334–0.532 | 0.517 | 25.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.045 | 0.424 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_1000 | btree | 3 | 3.217 | 3.175–3.371 | 3.356 | 3.2% | — | Index Only Scan | 0.473 | 3.682 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_1000 | gin | 3 | 20.275 | 18.879–20.354 | 20.346 | 4.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.698 | 20.973 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_1000 | roaring | 3 | 1.681 | 1.660–1.709 | 1.706 | 1.5% | — | LionCount | 0.898 | 2.579 |
+| scalar | 1000000 | clean | default | 64MB | in_c20k_1000 | roaring_bitmap | 3 | 16.647 | 16.511–22.845 | 22.225 | 19.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.474 | 17.121 |
+| scalar | 1000000 | clean | default | 64MB | is_null | btree | 3 | 6.307 | 6.171–6.443 | 6.429 | 2.2% | — | Index Only Scan | 0.030 | 6.339 |
+| scalar | 1000000 | clean | default | 64MB | is_null | gin | 3 | 56.677 | 55.966–61.858 | 61.340 | 5.5% | — | Seq Scan (fallback) | 0.027 | 56.702 |
+| scalar | 1000000 | clean | default | 64MB | is_null | roaring | 3 | 0.112 | 0.103–0.124 | 0.123 | 9.3% | — | LionCount | 0.036 | 0.160 |
+| scalar | 1000000 | clean | default | 64MB | is_null | roaring_bitmap | 3 | 21.497 | 21.405–23.125 | 22.962 | 4.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.029 | 21.526 |
+| scalar | 1000000 | clean | default | 64MB | or_columns | btree | 3 | 16.631 | 15.923–17.292 | 17.226 | 4.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 16.669 |
+| scalar | 1000000 | clean | default | 64MB | or_columns | gin | 3 | 18.859 | 18.642–20.327 | 20.180 | 4.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.045 | 18.898 |
+| scalar | 1000000 | clean | default | 64MB | or_columns | roaring | 3 | 0.260 | 0.244–0.267 | 0.266 | 4.6% | — | LionCount | 0.051 | 0.311 |
+| scalar | 1000000 | clean | default | 64MB | or_columns | roaring_bitmap | 3 | 16.665 | 15.169–16.820 | 16.805 | 5.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 16.703 |
+| scalar | 1000000 | clean | default | 64MB | ordered_limit | btree | 3 | 0.019 | 0.019–0.019 | 0.019 | 0.0% | — | Index Only Scan | 0.049 | 0.068 |
+| scalar | 1000000 | clean | default | 64MB | ordered_limit | gin | 3 | 86.329 | 85.999–87.879 | 87.724 | 1.2% | — | Seq Scan (fallback) | 0.049 | 86.390 |
+| scalar | 1000000 | clean | default | 64MB | ordered_limit | roaring | 3 | 89.121 | 88.151–90.412 | 90.283 | 1.3% | — | Seq Scan (fallback) | 0.037 | 89.160 |
+| scalar | 1000000 | clean | default | 64MB | ordered_limit | roaring_bitmap | 3 | 88.466 | 88.327–89.453 | 89.354 | 0.7% | — | Seq Scan (fallback) | 0.038 | 88.503 |
+| scalar | 1000000 | clean | default | 64MB | range_random | btree | 3 | 0.343 | 0.324–0.396 | 0.391 | 10.5% | — | Index Only Scan | 0.051 | 0.392 |
+| scalar | 1000000 | clean | default | 64MB | range_random | gin | 3 | 38.450 | 38.259–39.040 | 38.981 | 1.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.046 | 38.496 |
+| scalar | 1000000 | clean | default | 64MB | range_random | roaring | 3 | 0.200 | 0.198–0.205 | 0.204 | 1.8% | — | LionCount | 0.044 | 0.244 |
+| scalar | 1000000 | clean | default | 64MB | range_random | roaring_bitmap | 3 | 2.726 | 2.633–2.995 | 2.968 | 6.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.041 | 2.766 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | and2 | btree | 3 | 3.473 | 2.944–4.190 | 4.118 | 17.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.054 | 3.527 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | and2 | gin | 3 | 31.992 | 31.888–32.213 | 32.191 | 0.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.050 | 32.042 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | and2 | roaring | 3 | 0.770 | 0.723–0.797 | 0.794 | 4.9% | — | LionCount | 0.055 | 0.820 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | and2 | roaring_bitmap | 3 | 2.787 | 2.621–3.499 | 3.428 | 15.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.044 | 2.831 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c200_17 | btree | 3 | 0.993 | 0.977–0.997 | 0.997 | 1.1% | — | Index Only Scan | 0.037 | 1.030 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c200_17 | gin | 3 | 3.418 | 3.378–3.655 | 3.631 | 4.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 3.475 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c200_17 | roaring | 3 | 0.621 | 0.612–0.916 | 0.887 | 24.1% | — | LionCount | 0.041 | 0.662 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c200_17 | roaring_bitmap | 3 | 2.852 | 2.517–2.856 | 2.856 | 7.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.037 | 2.889 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c2_0 | btree | 3 | 64.453 | 64.072–65.070 | 65.008 | 0.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.034 | 64.487 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c2_0 | gin | 3 | 108.720 | 108.474–110.076 | 109.940 | 0.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.036 | 108.755 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c2_0 | roaring | 3 | 13.522 | 13.360–13.660 | 13.646 | 1.1% | — | LionCount | 0.042 | 13.564 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | eq_c2_0 | roaring_bitmap | 3 | 58.971 | 58.211–59.658 | 59.589 | 1.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 59.009 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | group_c200 | btree | 3 | 154.675 | 146.312–155.028 | 154.993 | 3.2% | — | Seq Scan (fallback) | 0.046 | 154.721 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | group_c200 | gin | 3 | 155.338 | 155.042–156.782 | 156.638 | 0.6% | — | Seq Scan (fallback) | 0.036 | 155.374 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | group_c200 | roaring | 3 | 52.523 | 51.119–55.526 | 55.226 | 4.2% | — | LionCount | 0.036 | 52.591 |
+| scalar | 1000000 | dirty_scattered | default | 64MB | group_c200 | roaring_bitmap | 3 | 154.271 | 148.582–154.624 | 154.589 | 2.2% | — | Seq Scan (fallback) | 0.032 | 154.304 |
+| scalar | 1000000 | dirty_scattered | prefer_index | 64MB | group_c200 | btree | 3 | 236.303 | 233.713–249.080 | 247.802 | 3.4% | — | Index Only Scan | 0.063 | 236.361 |
+| scalar | 1000000 | dirty_scattered | prefer_index | 64MB | group_c200 | gin | 3 | 155.626 | 154.369–155.767 | 155.753 | 0.5% | — | Seq Scan (fallback) | 0.047 | 155.672 |
+| scalar | 1000000 | dirty_scattered | prefer_index | 64MB | group_c200 | roaring | 3 | 52.778 | 51.485–53.779 | 53.679 | 2.2% | — | LionCount | 0.044 | 52.820 |
+| scalar | 1000000 | dirty_scattered | prefer_index | 64MB | group_c200 | roaring_bitmap | 3 | 149.307 | 147.941–150.412 | 150.302 | 0.8% | — | Seq Scan (fallback) | 0.050 | 149.345 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | btree | 3 | 31.452 | 31.407–34.000 | 33.745 | 4.6% | — | Index Only Scan | 0.033 | 31.485 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | gin | 3 | 145.555 | 145.107–149.286 | 148.913 | 1.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.037 | 145.591 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | roaring | 3 | 0.363 | 0.354–0.365 | 0.365 | 1.6% | — | LionCount | 0.040 | 0.403 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | roaring_bitmap | 3 | 95.274 | 94.475–96.261 | 96.162 | 0.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 95.340 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | btree | 3 | 15.729 | 15.494–15.802 | 15.795 | 1.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.051 | 15.780 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | gin | 3 | 18.199 | 18.099–18.357 | 18.341 | 0.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.062 | 18.256 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | roaring | 3 | 14.489 | 14.431–14.844 | 14.808 | 1.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.051 | 14.538 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | roaring_bitmap | 3 | 15.924 | 15.693–16.777 | 16.692 | 3.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.056 | 15.980 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | btree | 3 | 0.021 | 0.020–0.022 | 0.022 | 4.8% | — | Index Scan | 0.035 | 0.056 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | gin | 3 | 0.027 | 0.025–0.029 | 0.029 | 7.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.043 | 0.072 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | roaring | 3 | 0.025 | 0.025–0.047 | 0.045 | 39.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 0.063 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | roaring_bitmap | 3 | 0.029 | 0.029–0.032 | 0.032 | 5.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 0.069 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_medium | btree | 3 | 1.839 | 1.665–2.516 | 2.448 | 22.4% | — | Index Scan | 0.038 | 1.874 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_medium | gin | 3 | 15.711 | 15.374–15.781 | 15.774 | 1.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 15.749 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_medium | roaring | 3 | 14.047 | 14.036–15.193 | 15.078 | 4.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 14.085 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_medium | roaring_bitmap | 3 | 15.230 | 15.090–16.314 | 16.206 | 4.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.054 | 15.265 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_rare | btree | 3 | 0.058 | 0.043–0.061 | 0.061 | 17.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 0.097 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_rare | gin | 3 | 0.070 | 0.063–0.074 | 0.074 | 8.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.060 | 0.130 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_rare | roaring | 3 | 0.061 | 0.051–0.074 | 0.073 | 18.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 0.105 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | fetch_rare | roaring_bitmap | 3 | 0.068 | 0.062–0.122 | 0.117 | 39.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 0.117 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | group_c200 | btree | 3 | 75.202 | 75.119–75.394 | 75.375 | 0.2% | — | Index Only Scan | 0.036 | 75.239 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | group_c200 | gin | 3 | 143.935 | 143.544–150.403 | 149.756 | 2.6% | — | Seq Scan (fallback) | 0.037 | 143.972 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | group_c200 | roaring | 3 | 3.656 | 3.639–3.963 | 3.932 | 4.9% | — | LionCount | 0.035 | 3.691 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | group_c200 | roaring_bitmap | 3 | 149.277 | 144.116–150.025 | 149.950 | 2.2% | — | Seq Scan (fallback) | 0.033 | 149.310 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | btree | 3 | 3.193 | 3.162–3.224 | 3.221 | 1.0% | — | Index Only Scan | 0.463 | 3.654 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | gin | 3 | 98.054 | 97.361–98.515 | 98.469 | 0.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.716 | 98.785 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | roaring | 3 | 1.618 | 1.598–1.689 | 1.682 | 2.9% | — | LionCount | 0.841 | 2.487 |
+| scalar | 1000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | roaring_bitmap | 3 | 96.180 | 95.165–98.820 | 98.556 | 2.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.501 | 96.684 |
+| scalar | 5000000 | after_maintenance | default | 64MB | and2 | btree | 3 | 20.105 | 17.764–20.393 | 20.364 | 7.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 20.147 |
+| scalar | 5000000 | after_maintenance | default | 64MB | and2 | gin | 3 | 167.945 | 167.277–169.813 | 169.626 | 0.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.048 | 168.020 |
+| scalar | 5000000 | after_maintenance | default | 64MB | and2 | roaring | 3 | 1.668 | 1.599–1.684 | 1.682 | 2.7% | — | LionCount | 0.049 | 1.715 |
+| scalar | 5000000 | after_maintenance | default | 64MB | and2 | roaring_bitmap | 3 | 34.980 | 32.012–44.141 | 43.225 | 17.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.056 | 35.036 |
+| scalar | 5000000 | after_maintenance | default | 64MB | eq_c200_17 | btree | 3 | 1.605 | 1.572–1.630 | 1.627 | 1.8% | — | Index Only Scan | 0.057 | 1.669 |
+| scalar | 5000000 | after_maintenance | default | 64MB | eq_c200_17 | gin | 3 | 20.808 | 17.235–21.521 | 21.450 | 11.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.067 | 20.876 |
+| scalar | 5000000 | after_maintenance | default | 64MB | eq_c200_17 | roaring | 3 | 0.099 | 0.098–0.100 | 0.100 | 1.0% | — | LionCount | 0.039 | 0.138 |
+| scalar | 5000000 | after_maintenance | default | 64MB | eq_c200_17 | roaring_bitmap | 3 | 21.988 | 14.561–127.183 | 116.663 | 115.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 22.028 |
+| scalar | 5000000 | after_maintenance | default | 64MB | group_c200 | btree | 3 | 383.629 | 381.274–386.453 | 386.171 | 0.7% | — | Index Only Scan | 0.039 | 383.668 |
+| scalar | 5000000 | after_maintenance | default | 64MB | group_c200 | gin | 3 | 1347.403 | 1320.313–1391.878 | 1387.430 | 2.7% | — | Seq Scan (fallback) | 0.047 | 1347.457 |
+| scalar | 5000000 | after_maintenance | default | 64MB | group_c200 | roaring | 3 | 17.844 | 17.799–17.931 | 17.922 | 0.4% | — | LionCount | 0.033 | 17.878 |
+| scalar | 5000000 | after_maintenance | default | 64MB | group_c200 | roaring_bitmap | 3 | 995.139 | 983.390–995.525 | 995.486 | 0.7% | — | Seq Scan (fallback) | 0.035 | 995.172 |
+| scalar | 5000000 | after_maintenance | default | 64MB | is_null | btree | 3 | 31.148 | 30.549–31.180 | 31.177 | 1.1% | — | Index Only Scan | 0.029 | 31.196 |
+| scalar | 5000000 | after_maintenance | default | 64MB | is_null | gin | 3 | 825.165 | 804.599–830.904 | 830.330 | 1.7% | — | Seq Scan (fallback) | 0.049 | 825.236 |
+| scalar | 5000000 | after_maintenance | default | 64MB | is_null | roaring | 3 | 0.402 | 0.397–0.413 | 0.412 | 2.0% | — | LionCount | 0.034 | 0.437 |
+| scalar | 5000000 | after_maintenance | default | 64MB | is_null | roaring_bitmap | 3 | 489.041 | 470.922–530.565 | 526.413 | 6.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 489.094 |
+| scalar | 5000000 | clean | default | 64MB | and2 | btree | 3 | 160.722 | 18.673–199.049 | 195.216 | 75.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 160.764 |
+| scalar | 5000000 | clean | default | 64MB | and2 | gin | 3 | 228.808 | 168.869–241.392 | 240.134 | 18.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.075 | 228.878 |
+| scalar | 5000000 | clean | default | 64MB | and2 | roaring | 3 | 1.745 | 1.739–3.782 | 3.578 | 48.6% | — | LionCount | 0.051 | 1.801 |
+| scalar | 5000000 | clean | default | 64MB | and2 | roaring_bitmap | 3 | 40.500 | 39.644–61.288 | 59.209 | 26.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.062 | 40.574 |
+| scalar | 5000000 | clean | default | 64MB | and3_selective | btree | 3 | 1.623 | 1.595–1.626 | 1.626 | 1.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.045 | 1.667 |
+| scalar | 5000000 | clean | default | 64MB | and3_selective | gin | 3 | 2.909 | 2.725–3.186 | 3.158 | 7.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.088 | 2.976 |
+| scalar | 5000000 | clean | default | 64MB | and3_selective | roaring | 3 | 1.555 | 1.472–1.574 | 1.572 | 3.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.057 | 1.612 |
+| scalar | 5000000 | clean | default | 64MB | and3_selective | roaring_bitmap | 3 | 1.598 | 1.534–1.698 | 1.688 | 5.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.073 | 1.678 |
+| scalar | 5000000 | clean | default | 64MB | eq_c1m_12345 | btree | 3 | 0.035 | 0.018–0.042 | 0.041 | 39.0% | — | Index Only Scan | 0.034 | 0.069 |
+| scalar | 5000000 | clean | default | 64MB | eq_c1m_12345 | gin | 3 | 0.429 | 0.219–0.635 | 0.614 | 48.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.084 | 0.513 |
+| scalar | 5000000 | clean | default | 64MB | eq_c1m_12345 | roaring | 3 | 0.014 | 0.012–0.022 | 0.021 | 33.1% | — | LionCount | 0.046 | 0.060 |
+| scalar | 5000000 | clean | default | 64MB | eq_c1m_12345 | roaring_bitmap | 3 | 0.389 | 0.352–0.924 | 0.871 | 57.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.072 | 0.464 |
+| scalar | 5000000 | clean | default | 64MB | eq_c200_17 | btree | 3 | 1.636 | 1.607–1.843 | 1.822 | 7.6% | — | Index Only Scan | 0.056 | 1.699 |
+| scalar | 5000000 | clean | default | 64MB | eq_c200_17 | gin | 3 | 165.169 | 20.688–202.427 | 198.701 | 74.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.058 | 165.227 |
+| scalar | 5000000 | clean | default | 64MB | eq_c200_17 | roaring | 3 | 0.098 | 0.097–0.100 | 0.100 | 1.6% | — | LionCount | 0.037 | 0.135 |
+| scalar | 5000000 | clean | default | 64MB | eq_c200_17 | roaring_bitmap | 3 | 133.713 | 17.155–177.325 | 172.964 | 75.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.035 | 133.775 |
+| scalar | 5000000 | clean | default | 64MB | eq_c20k_123 | btree | 3 | 0.041 | 0.035–0.052 | 0.051 | 20.2% | — | Index Only Scan | 0.064 | 0.116 |
+| scalar | 5000000 | clean | default | 64MB | eq_c20k_123 | gin | 3 | 1.407 | 0.255–1.509 | 1.499 | 65.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.068 | 1.504 |
+| scalar | 5000000 | clean | default | 64MB | eq_c20k_123 | roaring | 3 | 0.018 | 0.018–0.019 | 0.019 | 3.1% | — | LionCount | 0.041 | 0.059 |
+| scalar | 5000000 | clean | default | 64MB | eq_c20k_123 | roaring_bitmap | 3 | 0.231 | 0.204–2.247 | 2.045 | 131.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.062 | 0.293 |
+| scalar | 5000000 | clean | default | 64MB | eq_c2_0 | btree | 3 | 169.786 | 163.807–170.977 | 170.858 | 2.3% | — | Index Only Scan | 0.038 | 169.824 |
+| scalar | 5000000 | clean | default | 64MB | eq_c2_0 | gin | 3 | 992.656 | 938.026–993.538 | 993.450 | 3.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.066 | 992.690 |
+| scalar | 5000000 | clean | default | 64MB | eq_c2_0 | roaring | 3 | 1.827 | 1.771–3.784 | 3.588 | 46.6% | — | LionCount | 0.057 | 1.899 |
+| scalar | 5000000 | clean | default | 64MB | eq_c2_0 | roaring_bitmap | 3 | 608.777 | 508.714–641.808 | 638.505 | 11.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.061 | 608.838 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_0 | btree | 3 | 302.650 | 300.791–304.356 | 304.185 | 0.6% | — | Index Only Scan | 0.060 | 302.711 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_0 | gin | 3 | 736.685 | 710.342–792.820 | 787.207 | 5.6% | — | Seq Scan (fallback) | 0.041 | 736.758 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_0 | roaring | 3 | 1.647 | 0.704–1.665 | 1.663 | 41.1% | — | LionCount | 0.041 | 1.686 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_0 | roaring_bitmap | 3 | 703.758 | 628.838–724.309 | 722.254 | 7.3% | — | Seq Scan (fallback) | 0.034 | 703.819 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_17 | btree | 3 | 0.058 | 0.051–0.066 | 0.065 | 12.9% | — | Index Only Scan | 0.032 | 0.090 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_17 | gin | 3 | 3.292 | 2.879–3.998 | 3.927 | 16.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.075 | 3.504 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_17 | roaring | 3 | 0.037 | 0.036–0.044 | 0.043 | 11.2% | — | LionCount | 0.053 | 0.090 |
+| scalar | 5000000 | clean | default | 64MB | eq_skew_17 | roaring_bitmap | 3 | 4.191 | 3.382–4.256 | 4.250 | 12.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.061 | 4.252 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and2 | btree | 3 | 14.533 | 13.469–14.755 | 14.733 | 4.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.068 | 14.610 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and2 | gin | 3 | 27.418 | 25.890–27.483 | 27.477 | 3.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.069 | 27.487 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and2 | roaring | 3 | 11.224 | 11.115–11.854 | 11.791 | 3.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 11.269 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and2 | roaring_bitmap | 3 | 16.764 | 13.148–18.913 | 18.698 | 17.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.053 | 16.817 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and3 | btree | 3 | 14.789 | 14.294–16.961 | 16.744 | 9.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.065 | 14.854 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and3 | gin | 3 | 28.625 | 25.672–34.258 | 33.695 | 14.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.088 | 28.713 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and3 | roaring | 3 | 11.318 | 11.102–11.470 | 11.455 | 1.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 11.370 |
+| scalar | 5000000 | clean | default | 64MB | fetch_and3 | roaring_bitmap | 3 | 12.603 | 11.882–22.287 | 21.319 | 37.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 12.655 |
+| scalar | 5000000 | clean | default | 64MB | fetch_broad | btree | 3 | 534.568 | 527.946–560.746 | 558.128 | 3.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.043 | 534.605 |
+| scalar | 5000000 | clean | default | 64MB | fetch_broad | gin | 3 | 495.958 | 344.635–652.856 | 637.166 | 31.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.041 | 495.999 |
+| scalar | 5000000 | clean | default | 64MB | fetch_broad | roaring | 3 | 470.683 | 391.178–558.068 | 549.329 | 17.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.038 | 470.721 |
+| scalar | 5000000 | clean | default | 64MB | fetch_broad | roaring_bitmap | 3 | 354.455 | 344.510–589.282 | 565.799 | 32.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.067 | 354.524 |
+| scalar | 5000000 | clean | default | 64MB | fetch_c1m | btree | 3 | 0.061 | 0.045–0.061 | 0.061 | 16.6% | — | Index Scan | 0.041 | 0.102 |
+| scalar | 5000000 | clean | default | 64MB | fetch_c1m | gin | 3 | 0.141 | 0.138–0.307 | 0.290 | 49.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.058 | 0.199 |
+| scalar | 5000000 | clean | default | 64MB | fetch_c1m | roaring | 3 | 0.152 | 0.030–0.370 | 0.348 | 93.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 0.191 |
+| scalar | 5000000 | clean | default | 64MB | fetch_c1m | roaring_bitmap | 3 | 0.345 | 0.306–0.352 | 0.351 | 7.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.037 | 0.382 |
+| scalar | 5000000 | clean | default | 64MB | fetch_in_and | btree | 3 | 111.394 | 40.878–131.993 | 129.933 | 50.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 111.451 |
+| scalar | 5000000 | clean | default | 64MB | fetch_in_and | gin | 3 | 140.440 | 81.209–144.448 | 144.047 | 29.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.088 | 140.513 |
+| scalar | 5000000 | clean | default | 64MB | fetch_in_and | roaring | 3 | 33.814 | 32.138–110.688 | 103.001 | 76.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 33.866 |
+| scalar | 5000000 | clean | default | 64MB | fetch_in_and | roaring_bitmap | 3 | 101.229 | 69.158–108.215 | 107.516 | 22.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.080 | 101.310 |
+| scalar | 5000000 | clean | default | 64MB | fetch_medium | btree | 3 | 166.112 | 100.048–194.379 | 191.552 | 31.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 166.151 |
+| scalar | 5000000 | clean | default | 64MB | fetch_medium | gin | 3 | 111.759 | 110.518–156.681 | 152.189 | 20.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.070 | 111.829 |
+| scalar | 5000000 | clean | default | 64MB | fetch_medium | roaring | 3 | 158.897 | 18.102–190.113 | 186.991 | 74.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.059 | 158.968 |
+| scalar | 5000000 | clean | default | 64MB | fetch_medium | roaring_bitmap | 3 | 170.323 | 20.378–179.473 | 178.558 | 72.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.054 | 170.377 |
+| scalar | 5000000 | clean | default | 64MB | fetch_rare | btree | 3 | 1.564 | 1.426–2.184 | 2.122 | 23.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 1.635 |
+| scalar | 5000000 | clean | default | 64MB | fetch_rare | gin | 3 | 1.760 | 1.279–1.913 | 1.898 | 20.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.055 | 1.815 |
+| scalar | 5000000 | clean | default | 64MB | fetch_rare | roaring | 3 | 1.490 | 0.168–1.882 | 1.843 | 76.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.039 | 1.529 |
+| scalar | 5000000 | clean | default | 64MB | fetch_rare | roaring_bitmap | 3 | 1.003 | 0.246–1.181 | 1.163 | 61.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 1.073 |
+| scalar | 5000000 | clean | default | 64MB | group_c2 | btree | 3 | 401.532 | 392.074–408.737 | 408.017 | 2.1% | — | Index Only Scan | 0.063 | 401.597 |
+| scalar | 5000000 | clean | default | 64MB | group_c2 | gin | 3 | 904.529 | 884.727–927.709 | 925.391 | 2.4% | — | Seq Scan (fallback) | 0.033 | 904.563 |
+| scalar | 5000000 | clean | default | 64MB | group_c2 | roaring | 3 | 5.906 | 3.534–7.555 | 7.390 | 35.7% | — | LionCount | 0.035 | 5.942 |
+| scalar | 5000000 | clean | default | 64MB | group_c2 | roaring_bitmap | 3 | 903.271 | 808.787–920.287 | 918.585 | 6.8% | — | Seq Scan (fallback) | 0.061 | 903.321 |
+| scalar | 5000000 | clean | default | 64MB | group_c200 | btree | 3 | 400.605 | 393.861–401.174 | 401.117 | 1.0% | — | Index Only Scan | 0.050 | 400.645 |
+| scalar | 5000000 | clean | default | 64MB | group_c200 | gin | 3 | 1044.517 | 886.254–1114.915 | 1107.875 | 11.5% | — | Seq Scan (fallback) | 0.068 | 1044.607 |
+| scalar | 5000000 | clean | default | 64MB | group_c200 | roaring | 3 | 23.305 | 17.670–24.260 | 24.165 | 16.4% | — | LionCount | 0.036 | 23.369 |
+| scalar | 5000000 | clean | default | 64MB | group_c200 | roaring_bitmap | 3 | 952.933 | 933.916–1074.351 | 1062.209 | 7.7% | — | Seq Scan (fallback) | 0.036 | 952.969 |
+| scalar | 5000000 | clean | default | 64MB | group_filtered | btree | 3 | 121.481 | 22.541–243.801 | 231.569 | 85.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.051 | 121.532 |
+| scalar | 5000000 | clean | default | 64MB | group_filtered | gin | 3 | 125.596 | 20.696–154.907 | 151.976 | 70.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.043 | 125.637 |
+| scalar | 5000000 | clean | default | 64MB | group_filtered | roaring | 3 | 16.871 | 16.803–17.142 | 17.115 | 1.1% | — | LionCount | 0.050 | 16.916 |
+| scalar | 5000000 | clean | default | 64MB | group_filtered | roaring_bitmap | 3 | 162.850 | 46.183–177.477 | 176.014 | 55.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.046 | 162.892 |
+| scalar | 5000000 | clean | default | 64MB | in_and | btree | 3 | 104.710 | 99.188–113.808 | 112.898 | 7.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.047 | 104.781 |
+| scalar | 5000000 | clean | default | 64MB | in_and | gin | 3 | 123.687 | 76.327–145.392 | 143.221 | 30.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.059 | 123.738 |
+| scalar | 5000000 | clean | default | 64MB | in_and | roaring | 3 | 9.546 | 9.540–9.661 | 9.649 | 0.7% | — | LionCount | 0.059 | 9.608 |
+| scalar | 5000000 | clean | default | 64MB | in_and | roaring_bitmap | 3 | 98.488 | 85.897–111.536 | 110.231 | 13.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.052 | 98.579 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_10 | btree | 3 | 0.178 | 0.175–0.230 | 0.225 | 15.9% | — | Index Only Scan | 0.043 | 0.221 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_10 | gin | 3 | 17.245 | 11.896–19.850 | 19.590 | 24.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.048 | 17.290 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_10 | roaring | 3 | 0.088 | 0.080–0.105 | 0.103 | 14.0% | — | LionCount | 0.078 | 0.173 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_10 | roaring_bitmap | 3 | 19.358 | 18.276–19.813 | 19.767 | 4.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.068 | 19.400 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_1000 | btree | 3 | 18.081 | 17.895–18.361 | 18.333 | 1.3% | — | Index Only Scan | 0.492 | 18.562 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_1000 | gin | 3 | 509.461 | 364.973–512.997 | 512.643 | 18.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.692 | 510.121 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_1000 | roaring | 3 | 7.348 | 6.590–7.604 | 7.578 | 7.3% | — | LionCount | 0.912 | 8.276 |
+| scalar | 5000000 | clean | default | 64MB | in_c20k_1000 | roaring_bitmap | 3 | 409.493 | 394.129–472.236 | 465.962 | 9.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.500 | 409.993 |
+| scalar | 5000000 | clean | default | 64MB | is_null | btree | 3 | 33.226 | 31.810–34.352 | 34.239 | 3.8% | — | Index Only Scan | 0.029 | 33.255 |
+| scalar | 5000000 | clean | default | 64MB | is_null | gin | 3 | 573.638 | 570.897–636.385 | 630.110 | 6.2% | — | Seq Scan (fallback) | 0.037 | 573.675 |
+| scalar | 5000000 | clean | default | 64MB | is_null | roaring | 3 | 0.435 | 0.421–0.802 | 0.765 | 39.1% | — | LionCount | 0.033 | 0.468 |
+| scalar | 5000000 | clean | default | 64MB | is_null | roaring_bitmap | 3 | 367.722 | 363.529–542.939 | 525.417 | 24.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.049 | 367.767 |
+| scalar | 5000000 | clean | default | 64MB | or_columns | btree | 3 | 484.559 | 468.867–489.652 | 489.143 | 2.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.050 | 484.609 |
+| scalar | 5000000 | clean | default | 64MB | or_columns | gin | 3 | 439.811 | 294.444–463.852 | 461.448 | 23.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.071 | 439.854 |
+| scalar | 5000000 | clean | default | 64MB | or_columns | roaring | 3 | 1.140 | 1.113–1.186 | 1.181 | 3.2% | — | LionCount | 0.050 | 1.190 |
+| scalar | 5000000 | clean | default | 64MB | or_columns | roaring_bitmap | 3 | 525.349 | 461.339–535.325 | 534.327 | 7.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 525.389 |
+| scalar | 5000000 | clean | default | 64MB | ordered_limit | btree | 3 | 0.019 | 0.018–0.026 | 0.025 | 20.8% | — | Index Only Scan | 0.055 | 0.074 |
+| scalar | 5000000 | clean | default | 64MB | ordered_limit | gin | 3 | 723.266 | 722.036–808.923 | 800.357 | 6.6% | — | Seq Scan (fallback) | 0.070 | 723.339 |
+| scalar | 5000000 | clean | default | 64MB | ordered_limit | roaring | 3 | 767.646 | 767.061–824.728 | 819.020 | 4.2% | — | Seq Scan (fallback) | 0.037 | 767.683 |
+| scalar | 5000000 | clean | default | 64MB | ordered_limit | roaring_bitmap | 3 | 646.556 | 546.220–737.216 | 728.150 | 14.9% | — | Seq Scan (fallback) | 0.065 | 646.623 |
+| scalar | 5000000 | clean | default | 64MB | range_random | btree | 3 | 2.666 | 2.606–2.667 | 2.667 | 1.3% | — | Index Only Scan | 0.049 | 2.715 |
+| scalar | 5000000 | clean | default | 64MB | range_random | gin | 3 | 426.676 | 410.159–432.453 | 431.875 | 2.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.044 | 426.720 |
+| scalar | 5000000 | clean | default | 64MB | range_random | roaring | 3 | 0.691 | 0.663–0.735 | 0.731 | 5.2% | — | LionCount | 0.049 | 0.745 |
+| scalar | 5000000 | clean | default | 64MB | range_random | roaring_bitmap | 3 | 178.909 | 155.073–206.058 | 203.343 | 14.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 178.951 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | and2 | btree | 3 | 120.258 | 20.424–137.949 | 136.180 | 68.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.072 | 120.405 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | and2 | gin | 3 | 173.414 | 166.951–198.524 | 196.013 | 9.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.076 | 173.460 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | and2 | roaring | 3 | 4.563 | 4.314–4.567 | 4.567 | 3.2% | — | LionCount | 0.078 | 4.641 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | and2 | roaring_bitmap | 3 | 35.774 | 34.518–42.705 | 42.012 | 11.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.065 | 35.827 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c200_17 | btree | 3 | 5.496 | 4.688–27.770 | 25.543 | 103.5% | — | Index Only Scan | 0.050 | 5.546 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c200_17 | gin | 3 | 116.687 | 16.685–175.354 | 169.487 | 78.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.063 | 116.750 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c200_17 | roaring | 3 | 4.299 | 4.103–4.955 | 4.889 | 10.0% | — | LionCount | 0.057 | 4.342 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c200_17 | roaring_bitmap | 3 | 115.794 | 102.689–169.764 | 164.367 | 27.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.061 | 115.829 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c2_0 | btree | 3 | 789.365 | 676.701–799.181 | 798.199 | 9.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 789.407 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c2_0 | gin | 3 | 951.016 | 950.313–1066.872 | 1055.286 | 6.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.066 | 951.082 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c2_0 | roaring | 3 | 85.669 | 85.203–91.185 | 90.633 | 3.8% | — | LionCount | 0.045 | 85.745 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | eq_c2_0 | roaring_bitmap | 3 | 687.408 | 593.584–744.216 | 738.535 | 11.3% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.063 | 687.471 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | group_c200 | btree | 3 | 928.111 | 904.594–988.088 | 982.090 | 4.6% | — | Seq Scan (fallback) | 0.063 | 928.174 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | group_c200 | gin | 3 | 998.824 | 996.995–1009.871 | 1008.766 | 0.7% | — | Seq Scan (fallback) | 0.056 | 998.867 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | group_c200 | roaring | 3 | 302.872 | 299.086–303.276 | 303.236 | 0.8% | — | LionCount | 0.046 | 302.935 |
+| scalar | 5000000 | dirty_scattered | default | 64MB | group_c200 | roaring_bitmap | 3 | 1010.457 | 947.802–1016.288 | 1015.705 | 3.8% | — | Seq Scan (fallback) | 0.055 | 1010.512 |
+| scalar | 5000000 | dirty_scattered | prefer_index | 64MB | group_c200 | btree | 3 | 1316.928 | 1302.410–1327.342 | 1326.301 | 1.0% | — | Index Only Scan | 0.065 | 1316.992 |
+| scalar | 5000000 | dirty_scattered | prefer_index | 64MB | group_c200 | gin | 3 | 1007.049 | 998.254–1007.571 | 1007.519 | 0.5% | — | Seq Scan (fallback) | 0.055 | 1007.104 |
+| scalar | 5000000 | dirty_scattered | prefer_index | 64MB | group_c200 | roaring | 3 | 306.418 | 299.780–308.206 | 308.027 | 1.5% | — | LionCount | 0.062 | 306.483 |
+| scalar | 5000000 | dirty_scattered | prefer_index | 64MB | group_c200 | roaring_bitmap | 3 | 1003.409 | 999.403–1013.122 | 1012.151 | 0.7% | — | Seq Scan (fallback) | 0.057 | 1003.464 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | btree | 3 | 164.758 | 160.321–172.100 | 171.366 | 3.6% | — | Index Only Scan | 0.060 | 164.818 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | gin | 3 | 1095.076 | 989.608–1293.188 | 1273.377 | 13.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.066 | 1095.142 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | roaring | 3 | 1.850 | 1.824–1.855 | 1.855 | 0.9% | — | LionCount | 0.042 | 1.893 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | eq_c2_0 | roaring_bitmap | 3 | 902.497 | 833.649–1033.002 | 1019.951 | 11.0% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.061 | 902.547 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | btree | 3 | 147.467 | 146.604–152.350 | 151.862 | 2.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.077 | 147.546 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | gin | 3 | 270.042 | 267.692–423.024 | 407.726 | 27.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.096 | 270.136 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | roaring | 3 | 110.408 | 110.090–110.590 | 110.572 | 0.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.053 | 110.461 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_and3 | roaring_bitmap | 3 | 117.851 | 116.638–274.444 | 258.785 | 53.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.079 | 117.939 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | btree | 3 | 0.029 | 0.027–0.031 | 0.031 | 6.9% | — | Index Scan | 0.048 | 0.079 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | gin | 3 | 0.225 | 0.043–0.306 | 0.298 | 70.4% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.079 | 0.304 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | roaring | 3 | 0.031 | 0.031–0.036 | 0.035 | 8.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.042 | 0.073 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_c1m | roaring_bitmap | 3 | 0.301 | 0.038–0.317 | 0.315 | 71.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.064 | 0.339 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_medium | btree | 3 | 13.061 | 11.885–13.953 | 13.864 | 8.0% | — | Index Scan | 0.040 | 13.101 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_medium | gin | 3 | 151.563 | 89.815–258.137 | 247.480 | 51.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.072 | 151.635 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_medium | roaring | 3 | 86.293 | 86.141–87.067 | 86.990 | 0.6% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 86.331 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_medium | roaring_bitmap | 3 | 261.093 | 148.007–283.899 | 281.618 | 31.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.040 | 261.132 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_rare | btree | 3 | 0.240 | 0.224–0.260 | 0.258 | 7.5% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.041 | 0.279 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_rare | gin | 3 | 0.874 | 0.270–1.042 | 1.025 | 55.7% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.043 | 0.958 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_rare | roaring | 3 | 0.204 | 0.194–0.223 | 0.221 | 7.1% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.044 | 0.248 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | fetch_rare | roaring_bitmap | 3 | 0.858 | 0.240–1.190 | 1.157 | 63.2% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.081 | 0.939 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | group_c200 | btree | 3 | 391.053 | 388.840–393.241 | 393.022 | 0.6% | — | Index Only Scan | 0.051 | 391.092 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | group_c200 | gin | 3 | 985.164 | 953.363–1024.060 | 1020.170 | 3.6% | — | Seq Scan (fallback) | 0.033 | 985.212 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | group_c200 | roaring | 3 | 18.115 | 17.682–18.304 | 18.285 | 1.8% | — | LionCount | 0.038 | 18.151 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | group_c200 | roaring_bitmap | 3 | 964.230 | 820.554–964.967 | 964.893 | 9.1% | — | Seq Scan (fallback) | 0.057 | 964.265 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | btree | 3 | 16.331 | 16.232–18.197 | 18.010 | 6.5% | — | Index Only Scan | 0.499 | 16.830 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | gin | 3 | 1121.826 | 1012.760–1127.390 | 1126.834 | 5.9% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.724 | 1122.556 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | roaring | 3 | 6.651 | 6.612–6.736 | 6.728 | 1.0% | — | LionCount | 0.919 | 7.570 |
+| scalar | 5000000 | low_work_mem | prefer_index | 64kB | in_c20k_1000 | roaring_bitmap | 3 | 935.389 | 819.924–1100.074 | 1083.606 | 14.8% | — | Bitmap Heap Scan, Bitmap Index Scan | 0.510 | 935.899 |
+
+## Errors
+
+None.
+
+## Explicitly unmeasured configurations
+
+None.

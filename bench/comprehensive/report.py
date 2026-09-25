@@ -187,7 +187,7 @@ Storage columns labeled Heap MiB use `pg_table_size`, including auxiliary forks 
         name=f'size-{n}.svg'
         (directory/name).write_text(svg)
         charts.append((title,name,svg))
-        for case in ['eq_c2_0','eq_c200_17','and3','group_c200','range_random','fetch_medium']:
+        for case in ['eq_c2_0','eq_c200_17','and3','group_c200','range_random','fetch_medium','fetch_c1m','fetch_and3']:
             values=[(key[-1]+(' (partial)' if (key[0],key[1],key[-1]) in partial else ''),st['median']) for key,st in stats.items()
                     if key[:6]==('scalar',n,'clean','default','64MB',case)]
             if not values:
