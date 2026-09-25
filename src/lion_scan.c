@@ -1926,14 +1926,31 @@ lion_walk_window(void)
 							  65536.0));
 }
 
+/*
+ * The blocks of a source's entry context, which holds one walked entry's
+ * stream or one LIST batch at a time: all of one size, so that what the
+ * context takes is what it holds, give or take one block.  With the default
+ * doubling blocks a batch took twice what it used, the last block half empty
+ * - 1073 kB at 1 MB of work_mem, 4180 kB at 4 MB, 16.9 MB at 16 MB for 17.6
+ * kB a set (2026-09-25 review).  A walk's entry stream fits one block, so it
+ * resets to that one block from entry to entry, with no malloc between.
+ */
+#define LION_SCAN_ENTRY_BLOCK	(64 * 1024)
+
 /* How many sets of one IN list a plain scan holds cursors for at once (§29.4). */
 static int
 lion_scan_list_batch(void)
 {
 	/*
-	 * A located set and the cursor that reads it take ~19 kB (the cursor's
-	 * 4 kB staging container, the OR node's share, the set itself): 32 kB of
-	 * work_mem per set keeps a batch inside work_mem, and at least 32.
+	 * A located set and the cursor that reads it take up to ~19 kB in the
+	 * entry context: two allocator chunks of 8 kB - the cursor's staging
+	 * container and, for a set with a sparse segment (§13), the segment's
+	 * buffer, 4104 bytes each, or a posting-tree cursor's page image - and
+	 * the set itself, its OR node share and the blocks' slack.  32 kB of
+	 * work_mem per set keeps a batch near 60% of work_mem, which leaves the
+	 * rest for the list itself (12 bytes a value, in the source's own
+	 * context) and the fixed parts.  At least 32 sets, ~620 kB, whatever
+	 * work_mem says: below 1 MB that floor is the bound.
 	 */
 	return Max(32, work_mem / 32);
 }
@@ -2170,7 +2187,9 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	src->keeppins = keeppins;
 	src->shape = LION_SRC_NONE;
 	src->entrycxt = AllocSetContextCreate(cxt, "lion index scan entry",
-										  ALLOCSET_DEFAULT_SIZES);
+										  0,
+										  LION_SCAN_ENTRY_BLOCK,
+										  LION_SCAN_ENTRY_BLOCK);
 
 	memset(&ch, 0, sizeof(ch));
 	acc.maxsets = 8;

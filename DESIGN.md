@@ -5817,7 +5817,7 @@ of this section missed: a located set with the cursor that reads it takes ~20 kB
 `c1m = any(array(select ... 300000 ...)) LIMIT 10`, planned as a plain Index Scan, peaked at
 1.37 GB to return ten rows (2026-09-24 review). The bitmap path never had it: `lion_emit_array()`
 looks its values up one at a time. So a list longer than a BATCH - `max(32, work_mem / 32 kB)`
-values, which keeps a batch's cursors inside `work_mem` - is the LIST shape: its values are sorted
+values, a batch's cursors near 60% of `work_mem` (below) - is the LIST shape: its values are sorted
 once into lookup order (`lion_probe_sort()`: the probe's comparison, then the hash), and located
 and streamed a batch at a time, the previous batch's sets and pins gone before the next is located
 (the §11 order). A batch is cut only where the HASH changes, and every value of one equality class
@@ -5831,6 +5831,24 @@ the bitmap's, and a list that is a Param - the reviewed case - has no length the
 price anyway. Not covered: a multi-key column's `op ANY (array of queries)` still extracts every
 query up front (per query, not per row; arrays of queries are rare), and the BITMAP path's
 multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as it always has.
+
+**What a batch takes, measured.** A located set and its cursor take up to ~19 kB in the source's
+entry context: two 8 kB allocator chunks - the cursor's 4104-byte staging container and, for a set
+with a sparse segment (§13), the segment's buffer of the same size, each rounded up to a power of
+two, or a posting-tree cursor's 8 kB page image - and the set, its share of the OR node and the
+context's slack. At 32 kB of `work_mem` a set, a batch is ~60% of `work_mem`, and the scan as a
+whole - the sorted list's 12 bytes a value included - stays inside `work_mem` for a list of up to
+one value per 36 bytes of it, 29,000 values at 1 MB: the 20,000-value list of the tests takes
+905 kB at 1 MB, 2.7 MB at 4 MB and 10.1 MB at 16 MB. The entry context has blocks of one size,
+64 kB, so what it takes is what it holds give or take one block (and a walk's per-entry stream,
+which fits one block, is reset from entry to entry with no allocation between); the floor of 32
+sets, ~620 kB, is the bound below 1 MB. *(Deviation from the first version, whose comment said
+~19 kB a set but whose entry context grew by doubling blocks, the last one half empty: a batch
+took twice what it used, 1073 kB at 1 MB of `work_mem`, 4180 kB at 4 MB and 16.9 MB at 16 MB, and
+the test that was meant to show it inside `work_mem` compared with the server's own `work_mem`,
+64 MB on the development servers, so it only failed on a server whose default was 16 MB or less,
+PostgreSQL's 4 MB included (2026-09-25 review). `test/sql/indexscan.sql` §9 now sets 4 MB and
+16 MB itself.)*
 
 `amgettuple` returns TIDs out of a BATCH: the members of the container the stream is standing on,
 expanded into an array of at most `LION_CONTAINER_RANGE` lo values (`lion_container_to_array()`,
@@ -6183,9 +6201,9 @@ a posting set far larger than one batch with its memory flat; an exclusion const
 pushdown still chosen for its shapes, a clustered value under a stale visibility map included; a
 partial multi-key index read whole at 64 kB of work_mem, by a plain scan and by index-only scans
 with nothing disabled, clean and dirty (the review's repros: rows the index does not hold came
-back); a 20,000-value Param list read through a cursor within work_mem, and long lists with
-duplicates, NULLs, citext spellings, a range and another column beside them, at 32 values a
-batch; a multi-key union across windows at the least
+back); a 20,000-value Param list read through a cursor within a `work_mem` of 4 MB and of 16 MB,
+set by the test, and long lists with duplicates, NULLs, citext spellings, a range and another
+column beside them, at 32 values a batch; a multi-key union across windows at the least
 `pg_lion.scan_window_floor`; ranges and `IS NOT NULL` beside other columns' sets (§11: one-row
 INLINE entries, sparse segments and posting trees walked in WINDOWs, one window and several,
 `< ANY`, a short walk, empty sides, a dropped `IS NOT NULL` with the rows its recheck removes, a
