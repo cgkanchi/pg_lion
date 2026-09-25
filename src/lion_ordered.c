@@ -2072,7 +2072,8 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 							   (int64) st->walked, es);
 		ExplainPropertyInteger("Lion Set Hits", NULL, (int64) st->hits, es);
 		ExplainPropertyInteger("Heap Fetches", NULL, (int64) st->fetched, es);
-		if (st->removed > 0 || !st->exact)
+		/* a node that never built its set has no exactness to report */
+		if (st->removed > 0 || (st->builds > 0 && !st->exact))
 			ExplainPropertyInteger("Rows Removed by Lion Recheck", NULL,
 								   (int64) st->removed, es);
 		if (st->builds > 0)

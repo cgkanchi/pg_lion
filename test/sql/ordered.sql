@@ -240,6 +240,9 @@ SELECT * FROM lion_ord_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND c2 = 1 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND length(note) = 5 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_run($$SELECT id FROM lo WHERE tags @> ARRAY['t3', 'u5'] ORDER BY k, id LIMIT 10$$);
+-- a node that never ran built no set, and rechecked nothing (it used to
+-- print "Rows Removed by Lion Recheck: 0", as if its set were inexact)
+SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 0');
 
 -- 8. Cursors: forward, a SCROLL cursor (a Material under it), NO SCROLL.
 SET enable_seqscan = off; SET enable_bitmapscan = off;
