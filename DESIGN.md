@@ -22,7 +22,7 @@ Goals
 
 Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, §14 and §15;
 entry deletion and page recycling in §18)
-- Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple`, parallel build/scan,
+- Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple` (arrived in §29), parallel build/scan,
   fine-grained write concurrency (inserts serialize on the directory leaf that holds the key, §21),
   key sizes above 2000 bytes.
 
@@ -544,7 +544,7 @@ BUILD (`lion_build.c`)
     amcanparallel = false            amcanbuildparallel = false    amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
     amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL (§11, §18; cleanup stays with the leader)
-    amgettuple = NULL                amgetbitmap = liongetbitmap    amcanreturn = NULL
+    amgettuple = liongettuple (§29)  amgetbitmap = liongetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
     amoptions: reloptions `fillfactor` (int, 10..100, default 90, §21), `inline_limit` (int bytes,
@@ -3921,6 +3921,15 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   bucket; a range predicate becomes the sum of the fully covered buckets' cardinalities plus a heap
   recheck of the two edge buckets' rows; `GROUP BY width_bucket(...)` is a header read per bucket.
   ORDER BY is not served (bitmaps deliver heap order). A bitmap zone map, not a btree substitute.
+- **Plain index scans: implemented, see §29.** `amgettuple` on every major (16 .. 20): the scan
+  streams the bitmap path's own set algebra one container at a time, drops every pin between calls
+  under an MVCC snapshot and keeps the batch's page pinned under any other (exclusion constraints
+  become possible). Its follow-ups, in the order the user set on 2026-09-24:
+  - a CustomScan that walks a BTREE on the ORDER BY column and tests each TID against lion's exact
+    WHERE set, stopping at LIMIT n (PG16+, DESC and multi-column order from the btree) - the next
+    piece; §29.8 says what of the scan's source it can use;
+  - ordered lion scans (`amcanorder`, 18+): deferred, §29.8 records what they would take;
+  - index-only scans (`amcanreturn`, §29.9) and backward scans (§29.10).
 - **Range predicates on the scalar classes: see §28.** `<`, `<=`, `>=`, `>` and `BETWEEN` as a
   bounded walk of the sorted directory, in the bitmap scan and - bounding the driving entry walk -
   in the count pushdown. Its follow-ups, in order of value:
@@ -5584,3 +5593,364 @@ on a low-cardinality column, and btree or a sequential scan over lion on a near-
 goes through `lion_explain_norm()`. `test/isolation/count_range_vacuum_race.spec` parks a range count
 with an entry's container pinned while the VACUUM of that entry's dead rows waits, as
 count_vacuum_race.spec does for an equality.
+
+## 29. Index scans: amgettuple, ordered scans, index-only scans
+
+Until this section lion answered only bitmap scans. Measured on release PG18.6 at 98ecedd
+(bench/results/2026-09-24-98ecedd-*), row fetches that visit the heap anyway were at parity with
+btree except in two shapes that only a plain Index Scan serves: a very selective lookup
+(`WHERE c1m = ...`, one row: btree 0.023 ms against lion's bitmap 0.027 ms at 1M rows, the
+difference being the bitmap's fixed setup) and a low `work_mem` (64 kB: `WHERE c200 = 17`, 0.5% of
+5M rows, btree Index Scan 13 ms against a LOSSY lion bitmap 92 ms, which rechecks every row of
+every lossy page). A lion index could not do better because it had no `amgettuple`. This section
+adds it (step 1, implemented), and records what ordered scans (step 2, deferred to the backlog) and
+index-only scans (step 3) would need from it, so that neither has to redesign the scan.
+
+### 29.1 Handler settings (step 1)
+
+    amgettuple = liongettuple (every supported major, 16 .. 20)
+    amcanbackward = false       ammarkpos/amrestrpos = NULL     amcanparallel = false
+    amcanorder = false          amcanreturn = NULL              amsearcharray = true (unchanged)
+    amsearchnulls = true (unchanged)                            amoptionalkey = true (unchanged)
+
+- **No backward scans.** `amcanbackward = false` is what `ExecSupportsBackwardScan()` reads, so a
+  SCROLL cursor over a lion Index Scan gets a Material node from the planner, and a NO SCROLL one
+  refuses `FETCH BACKWARD` in the executor before the AM is asked. The only other source of a
+  backward index scan is an ORDERED index (indxpath.c builds a backward path for every index with
+  a sort order, whatever `amcanbackward` says), which lion is not; `liongettuple()` therefore
+  raises an internal error for any direction but forward, and nothing can reach it.
+- **No mark/restore.** A merge join over a lion Index Scan would need one only if lion claimed an
+  order, and it claims none; with `ammarkpos` NULL the planner puts a Material node under a merge
+  join that needs to restore anyway.
+- **`kill_prior_tuple` is ignored** in this version. btree uses it to set LP_DEAD on index tuples
+  whose heap tuples are dead to everyone; lion has no per-TID flag to set (a TID is a bit in a
+  container), and removing the bit would be a write under a share lock on a page other scans are
+  reading. VACUUM removes them. Known cost: a plain scan over a hot key with many dead versions
+  keeps visiting their heap slots until the next VACUUM, as a bitmap scan does today.
+- **No parallel scan.** `amcanparallel` stays false; the parallel callbacks stay NULL.
+
+### 29.2 The scan plan, shared with the bitmap path
+
+Both entry points begin with the same per-column choice `liongetbitmap()` always made (§5 SCAN
+step 5, §24, §28), factored out as `lion_scan_choose()`: per key column the most selective-looking
+qual - equality (rank 0), list (1), range (2), null test (3) - is answered, every other qual of
+that column is left to the heap recheck, and all range keys of a column are ONE walk when the
+range is the chosen qual. The per-column set trees (`lion_scan_col_tree()`: an equality is a leaf,
+an IN list an OR over its located sets, `IS NULL` the reserved NULL entry, a multi-key query its
+extracted tree, §17) are built by the same function for both paths. What differs is only how the
+answer is delivered: into a TIDBitmap, or as a stream the executor pulls one TID at a time.
+
+### 29.3 The TID source (`LionSource`, lion_scan.c)
+
+A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgettuple` call after
+`amrescan`. It has one of four shapes:
+
+- **NONE**: a chosen qual selects nothing (`col = NULL`, an empty or all-NULL list, a key absent
+  from the index, a multi-key query in mode NONE). `amgettuple` returns false at once.
+- **SETS**: every chosen qual is a set tree. The columns' trees are ANDed (§24) and the whole
+  expression is ONE stream of containers in ascending container key, produced by the very
+  evaluator the count and the bitmap path already share (§9 cursors, §15 k-way OR, §22 leapfrog
+  AND: `LionExprCursor`). An IN list is the OR of its sets - a union by container key - so the TIDs
+  come out in HEAP order, each exactly once, and the heap is visited in physical order, one pass.
+  Equality, IN, `IS NULL`, multicolumn ANDs and multi-key queries (arrays, tsvector) in mode KEYS
+  all take this shape.
+- **WALK**: one scalar column's chosen qual is a range (§28, including `op ANY (array)`), an
+  `IS NOT NULL`, or the scan has no key at all (a partial index whose predicate the query implies,
+  §24, which walks column 1 with its NULL entry). The column's entries are walked in directory
+  order exactly as the bitmap walk does (`lion_emit_all_keys_ext()`: copy a leaf, release it,
+  test each entry with `lion_range_test()`, stop at the first entry past an upper bound or of the
+  next column), and each selected entry is streamed as `AND(entry, rest)`, where `rest` is the set
+  tree of the other columns' chosen quals (empty for a one-column scan). Within one entry the TIDs
+  come out in heap order; across entries in key order. A second walk column is dropped and
+  rechecked: a range column cannot be a set-tree node (its answer is a union of an unbounded
+  number of entries), and the bitmap path's answer for two range columns - one TIDBitmap each,
+  intersected - is not a stream. An `op ANY (array)` range walks to the widest element (§28) when
+  the column orders the elements; an UNORDERED column walks ONCE, testing each entry against every
+  element's range (the bitmap path walks once per element and lets the bitmap absorb the overlap,
+  which a stream cannot).
+- **BITMAP**: a MULTI-KEY column would have to be walked - `IS NOT NULL`, a query in mode ALL
+  (§17) with nothing else expressible, or a no-key scan whose first column is multi-key. A row is
+  under several entries of such a column, so walking them would return it several times. The
+  scan then runs `liongetbitmap()` into a private TIDBitmap (`work_mem`, lossy past it, like any
+  bitmap) and iterates it; a lossy page returns every offset up to `MaxHeapTuplesPerPage` with
+  recheck set, and the heap fetch finds nothing at the ones that hold no tuple. Always rechecked.
+  Correct and expensive, which is what the cost model already says about these quals.
+
+Scalar entries of one column are disjoint (one entry per equality class, §21), so a WALK never
+returns a TID twice either, and neither does SETS, whose OR node merges by container key.
+
+**Why an IN list is a union and not a walk of its entries.** With no order to keep (§29.8), the
+union is strictly better for a plain scan: it visits each heap page once, in physical order, while
+an entry-by-entry list restarts at the beginning of the heap for every value; and it is already the
+shape the bitmap path evaluates. An ordered scan would need the other one (§29.8).
+
+**The stream** (`LionSetStream`, lion_count.c: `lion_stream_begin()`, `lion_stream_next()`,
+`lion_stream_end()`) is the `LionExprCursor` behind a pull interface - `lion_sets_iterate()`, the
+push form the bitmap path uses, is now a loop over it - with one new switch, `keeppins`, described
+in §29.5. A walked entry becomes a `LionPostingSet` without a lookup: an INLINE entry's payload
+points into the walk's private copy of the leaf, a CHAIN entry's `head` is its posting tree's root.
+
+### 29.4 Batches and memory
+
+`amgettuple` returns TIDs out of a BATCH: the members of the container the stream is standing on,
+expanded into an array of at most `LION_CONTAINER_RANGE` TIDs (`lion_container_to_tids()`, the
+same per-heap-block order `lion_container_to_tbm()` emits). The next container is pulled only when
+the batch is used up. What the scan holds between two calls is therefore bounded by the query and
+never by the data: one container's TIDs; one 8 KB image per posting-set cursor of the tree (the
+page its current container came from - an IN list of k CHAIN keys holds k of them, exactly as the
+bitmap path's merge does); the INLINE payload copies of the located sets (at most an entry each,
+`LION_MAX_ENTRY_SIZE`); and for a WALK one directory leaf image. A posting set of any size is
+STREAMED container by container - a 5M-row entry is never materialized - and a walk of any width
+holds one entry's stream at a time. Memory lives in a per-scan context reset by `amrescan`, and a
+walk's per-entry cursors in a per-entry context reset before the next entry, so a nested-loop inner
+scan rescanned a million times and a range over a million entries both run in constant memory.
+
+### 29.5 Pins, and what a scan paused between calls may hold
+
+The executor returns a row to its caller between two `amgettuple` calls, so a scan can be paused for
+any length of time - a cursor held open by a client, a nested loop's outer side, a LIMIT that never
+comes back. The rules: no LWLock is held across calls, ever; a PIN may be, and whether it is
+depends on the snapshot, as in btree.
+
+**MVCC snapshots drop every pin** (`dropPin`, mirroring nbtree's `so->dropPin`, set in btrescan,
+and `_bt_drop_lock_and_maybe_pin()`; nbtree/README "Making concurrent TID recycling safe"): the
+scan copies what it needs and holds no pin at all while the executor has the row. With `keeppins`
+off every cursor releases a posting leaf the moment it has copied it, and a located or walked
+INLINE set is unpinned as soon as its payload is copied (`lion_posting_set_unpin()`, as the bitmap
+path already does). The condition is btree's: `IsMVCCLikeSnapshot()` (`IsMVCCSnapshot()` before
+19, which already included historic snapshots), `!xs_want_itup` (always true in step 1: there is
+no `amcanreturn`) and a heap relation. This matters beyond speed: a cursor that pinned a posting
+leaf would make every VACUUM of the table wait for it (§11 takes a cleanup lock on every page), for
+as long as the client leaves the cursor open.
+
+Why an MVCC scan needs no pin, case by case. What it holds across a pause is private memory only:
+copies of posting leaves (each with the right link it had when copied), INLINE payload copies, the
+posting-tree root of each CHAIN set, a directory leaf image with its right link, and a batch.
+
+1. *TIDs VACUUM removes after the scan copied them* - the heap fetch applies the snapshot: the
+   tuple is dead to it, or its slot is LP_UNUSED, or it was reused by a tuple inserted after the
+   old one became dead to EVERY snapshot, ours included, which our snapshot cannot see either.
+   That is nbtree's argument verbatim (README, "Making concurrent TID recycling safe": "An MVCC
+   snapshot is only sufficient to avoid problems during plain index scans because they must access
+   granular visibility information from the heap proper"); a plain lion scan fetches every TID it
+   returns, and `xs_recheck` is irrelevant to it.
+2. *TIDs VACUUM removes before the scan copies them* were dead to every snapshot, so missing them
+   is right.
+3. *TIDs inserted after the scan copied a page* belong to transactions our snapshot cannot see
+   (an index entry is written before its inserting transaction commits, so every row visible to the
+   snapshot was in the index before the scan read it). Missing them is right, and so is seeing them.
+4. *A posting leaf splits under a paused cursor* (it holds an image of P with right link R): the
+   split moves P's upper items to a new page N between P and R. The cursor already has them in its
+   image of P, follows R, and never visits N - nothing missed, nothing twice; what N gains later is
+   case 3. R itself splitting is found through R's own right link when the cursor reads R. This is
+   §4/§22's rule that items only ever move right, onto a page linked immediately right of their
+   source, and it holds whether the new page was extended or recycled (§18).
+5. *A root push-down* (§22) moves a one-page set's items to a brand new child: a cursor that copied
+   the old root as a leaf has its items; a cursor that has not started (or has a seek pending)
+   descends from the root, which `lion_posting_search()` handles at any level.
+6. *An INLINE entry spills to a CHAIN* (§4): the scan's payload copy is complete as of the copy;
+   case 3 covers the rest.
+7. *VACUUM deletes an entry and frees its posting tree* (§18), and the pages are reused by another
+   key's set: a cursor that follows its stale right link or descends from its stale root lands on
+   a page that is DELETED or claims another owner, and ends the set there - the owner check every
+   cursor already makes (`lion_page_owns()`, §18). Ending there is right because VACUUM deletes an
+   entry only once its set holds no TID at all. Pages of a LIVE set are never freed (§18: only a
+   whole set is), so a set that still has a visible row never loses a page under the scan. (While
+   an MVCC snapshot is registered, the freed pages cannot even be handed out again:
+   `lion_alloc_page()` takes a DELETED page only once its `safexid` is older than every snapshot,
+   §18. The owner check is what the argument rests on; the horizon is a second fence.)
+8. *The directory leaf under a paused WALK splits, or loses entries to VACUUM*: the walk holds an
+   image of the leaf and its right link, exactly as the bitmap walk does between leaves (§21
+   "Ordered iteration", §28): entries moved right are in the image and are not visited again on
+   the new page; a deleted entry had an empty set; an entry inserted after the image was taken is
+   case 3. Directory leaves are never unlinked or freed (§21), so the right link always names a
+   leaf.
+9. *The scan's own INLINE copies taken at locate time* (SETS: every set is located at the first
+   call) are cases 1 to 3 again.
+
+**Non-MVCC snapshots keep the pin on the page the current batch came from**, as btree's
+`!so->dropPin` scans do. `keeppins` on: every cursor keeps the pin on the posting leaf its current
+container came from until the stream moves past that container (§9's cursor rule, unchanged), a
+located INLINE set keeps its leaf pin for the life of the scan, and a WALK keeps its current
+directory leaf pinned while that leaf's entries are streamed. The batch is the current container,
+and the stream moves past it only inside the NEXT `amgettuple` call, so every TID is returned and
+fetched from the heap while the page it was read from is pinned. VACUUM cannot remove a TID from a
+page without a cleanup lock on it, nor from any page after it in chain order before it has had
+that page's cleanup lock (§11's guarantee, which is what makes a split or a spill that moves the
+TID harmless), and the heap's second pass - the only thing that makes a line pointer reusable -
+runs only after `ambulkdelete` has finished on every index. So no TID the scan holds can be
+recycled under it: the same property btree gets from its leaf pin, obtained from the protocol §9
+already proves for the count. Why it matters: a non-MVCC snapshot (`SnapshotDirty`, `SnapshotSelf`,
+`SnapshotAny`) can see the tuple a recycled slot now holds, so without the pin a scan could return
+a row under a key it does not have, or return one row twice (once under the old TID's entry, once
+under its own). For an AND of several sets one pin suffices (the TID is in all of them, and
+`ambulkdelete` has to pass every page of the index), for an OR every child standing at the current
+key keeps its own - the same rules §9 states for the count (`lion_source_pinned()`).
+
+- An IN-list set located past the §15 pin budget is NOPIN and carries no interlock. A non-MVCC scan
+  that has one sets `xs_recheck`, which filters a recycled slot whose new tuple does not match;
+  the one residual effect - the same matching row twice through two stale entries - needs a
+  thousand-leaf IN list under a dirty snapshot, which no caller in core builds (below).
+- The BITMAP shape (§29.3) holds no pins in either mode and is always rechecked; a TIDBitmap is a
+  set, so it cannot return a TID twice.
+- The §11 deadlock rule for readers holds in both modes: every set is located - every directory
+  lock taken - before the first container page is pinned, and a WALK takes the next directory leaf
+  only after the previous entry's stream has been closed and its container pins dropped. Holding
+  directory-leaf PINS (INLINE sets, the walk's own leaf) while locking directory pages is what the
+  count's GROUP BY walk has always done; pins do not block share locks, and VACUUM never waits for
+  a cleanup lock while holding any lock (§11).
+
+Who scans a lion index with a non-MVCC snapshot, and the decision for each:
+
+- **Exclusion constraints** (`check_exclusion_or_unique_constraint()`, SnapshotDirty). DefineIndex
+  refuses `EXCLUDE USING <am>` for an AM without `amgettuple`, so `EXCLUDE USING lion (k WITH =)`
+  becomes possible with this section - an equality-only exclusion constraint, i.e. a unique
+  constraint served by lion's single-key lookups. It is allowed: its scan is exactly the pinned
+  mode above (one equality key per column, no arrays), the constraint code rescans after waiting
+  for an in-progress conflict, and it re-applies the operator whenever `xs_recheck` is set.
+  `test/sql/indexscan.sql` tests it, and `test/isolation/gettuple_dirty_pin.spec` shows that the
+  pin is held (VACUUM waits for it) where an MVCC scan at the same point holds none.
+- **Logical replication, REPLICA IDENTITY FULL** (`RelationFindReplTupleByIndex()`, SnapshotDirty).
+  On 16 and 17 `IsIndexUsableForReplicaIdentityFull()` accepts only btree and hash, by AM Oid.
+  From 18 it asks `IndexAmTranslateCompareType(COMPARE_EQ, ...)` for every key column and requires
+  `amgettuple`; lion has no `amtranslatecmptype`, so today it is never chosen on any version. If
+  §29.8 ever adds one, lion becomes eligible, and that is fine: the scan keys are one equality (or
+  `IS NULL`, `SK_SEARCHNULL`) per column, which is the pinned SETS shape, and the apply worker
+  compares the whole tuple (`tuples_equal()`) for any index that is not the replica identity index.
+  Nothing to refuse; a note for whoever adds the translation.
+- **SnapshotAny**: CLUSTER needs `amclusterable` (false); nothing else in core scans a user index
+  with it. **`get_actual_variable_range()`** (SnapshotNonVacuumable) needs an ordered index with
+  `amcanreturn`; lion has neither.
+
+### 29.6 `xs_recheck`
+
+Set, for every TID of the scan, when any of these holds; otherwise the TIDs are exact:
+
+- a qual was not answered: a second qual on a column (§29.2's ranking), a second WALK column, a
+  multi-key column in mode ALL next to another column that does answer (dropped, as in the bitmap
+  path);
+- a MULTI-KEY column's query was answered at all (strategies 2 .. 5, §17). The bitmap path passes
+  mode KEYS through unrechecked because `lion_extract_query()` classifies it as exact; the plain
+  path is chosen for selective lookups, where one operator call per fetched row costs nothing next
+  to the fetch, and it does not have to rest on that classification;
+- the BITMAP shape (§29.3), always;
+- a non-MVCC scan with a NOPIN set (§29.5).
+
+A range is exact (the walk applies every bound of the column), an IN list is exact (a union of
+whole entries), `IS NULL` and `IS NOT NULL` are exact, and so is a cross-type or binary-coerced
+equality (§21's probe). A collation the index cannot answer never reaches the AM (the planner
+matches `IndexCollMatchesExprColl()` first).
+
+### 29.7 Rescans, keys that change, and cleanup
+
+- `amrescan` copies the new keys, closes the stream, releases every located set (their pins and
+  their pin-budget share, §15), drops the walk's leaf pin, and resets the per-scan context; the
+  source is opened again, from the new keys, by the next `amgettuple`. A nested loop's inner index
+  scan with a Param (`t.k = outer.x`) is exactly that: one rescan per outer row, one descent per
+  rescan. The per-column probe cache (`LionScanCol`, keyed by the key's subtype) survives
+  rescans, as it did for the bitmap path.
+- `ScalarArrayOpExpr` arrives as ONE key with `SK_SEARCHARRAY`, as for the bitmap path:
+  `amsearcharray` stays true because `amgettuple` answers every array key the bitmap path answers
+  (equality lists as a union, range arrays as one walk, multi-key query arrays as an OR of their
+  trees) - the executor never has to iterate the elements with rescans.
+- `pgstat_count_index_scan()` and, on 18+, `instrument->nsearches` are counted once per source
+  opened, i.e. once per rescan, as btree counts one per primitive scan.
+- `amendscan` does everything `amrescan` does and frees the contexts. An ERROR in the middle of a
+  scan leaves pins to the resource owner, which releases them, and the list pin budget is zeroed
+  at the end of the transaction (§15).
+
+### 29.8 Ordered scans (step 2): deferred
+
+*Deferred to the backlog (§23) on 2026-09-24, in favour of an ORDER BY node built on a btree
+(below). What it would take, so that the step is not re-derived:* `amcanorder` on 18+ only, where
+the planner maps an index's `<` through `amtranslatecmptype` (strategies 6..9 to COMPARE_LT..GT, 1
+to COMPARE_EQ; scalar families only) - on 16 and 17 core looks for btree strategy 1, which is
+lion's `=`, and so could never see an order; a `get_relation_info_hook` that trims `sortopfamily`
+for a column whose RECORDED order is hash order (§21, "The order is the index's"), for multi-key
+columns, for multicolumn indexes (lion orders one column at a time) and for DESC/NULLS FIRST
+indoptions, which `amcanorder` makes CREATE INDEX accept; NULLs returned last (the reserved NULL
+entry sorts first, §21); IN lists walked entry by entry in directory order instead of the union of
+§29.3, because the AM is never told whether the plan needs the order (the executor passes only a
+direction), so an ordered AM has to produce it always; backward paths, which indxpath.c builds for
+every ordered index regardless of `amcanbackward`, either served by a descending walk (§21's
+leftlink) or pruned; and ordered-scan costing with a startup cost that lets LIMIT stop early.
+Everything else - the walk, the per-entry stream, the batch, the pin rules - would carry over
+unchanged, since a WALK is already in key order.
+
+**What the btree-ordered node planned next can use.** That node walks a btree on the ORDER BY
+column and tests each heap TID against lion's exact answer to the WHERE clause. The source above is
+that answer: `LionSource` opened on the WHERE clause's scan keys in the SETS shape is one
+ascending, duplicate-free stream of containers (container keys strictly increasing), so "build
+once, then `contains(tid)`" is a copy of the containers the stream produces into an array - memory
+equal to the answer's container bytes - searched by container key and tested with
+`lion_container_contains()`; or, if that is too large, a TIDBitmap filled from the same stream. A
+WALK source (a range) streams entry by entry, so its union has to be accumulated (a TIDBitmap, or
+container keys ORed as §15 does) before it can be probed. `lion_source_exact()` says whether the
+set is exact (§29.6). The entry points are `lion_source_open()`, `lion_source_next()` and
+`lion_source_close()` in lion_scan.c, declared in lion_count.h; they take an index, scan keys and
+the `keeppins` switch of §29.5, and no IndexScanDesc.
+
+### 29.9 Index-only scans (step 3), for later
+
+What `amcanreturn` would need from this scan:
+
+- **A value to return.** A lion column's stored key is the value only under the §10
+  value-representation contract (`BTEQUALIMAGE_PROC`, the bpchar allowlist): citext's two
+  spellings share an entry, so the stored key is not every row's value. `amcanreturn` is per
+  column and has to apply that contract; multi-key columns can never return (their keys are
+  extracted, not the column). The value comes from the ENTRY, not from a TID, so the scan sets
+  `xs_itup` (or `xs_hitup`) once per entry and returns it with every TID of that entry - which
+  needs the WALK shape or a per-entry list, since a SETS union by container key does not know
+  which entry a TID came from. A single-key equality knows it trivially.
+- **The §9 interlock.** An index-only scan skips the heap for all-visible pages, which is exactly
+  the count's situation: the pin on the page a container came from has to be held until the
+  executor has checked the visibility map for that container's TIDs. `xs_want_itup` therefore turns
+  `dropPin` off (btree does the same, nbtree README above), and the batch rule of §29.5 already
+  holds the pin until the next batch is pulled - i.e. until every TID of the current container has
+  been returned and its VM bit tested. Nothing else changes; a NOPIN set then has to be relocated
+  under a pin (`lion_posting_set_relocate()`, as the count does) rather than rechecked.
+- **Costing**: cost_index() applies the all-visible fraction itself once `canreturn` is set.
+
+### 29.10 Backward scans and more (step 4, later)
+
+A descending walk (directory leaves by leftlink, which §21 keeps and verify() checks; posting
+leaves have none, so a descending container order needs the tree's pivots or a reversed batch),
+`(a, b)` order on multicolumn indexes, and - if ever wanted on 16/17 - an ordered CustomScan.
+
+### 29.11 Cost (`lioncostestimate()`)
+
+Plain and bitmap index paths are the same IndexPath and share `amcostestimate`; the planner prices
+the heap side of each (cost_index() for a plain scan, cost_bitmap_heap_scan() for a bitmap one).
+The only input that differs is `indexCorrelation`, which only cost_index() reads, and lion used to
+return 0 for it. It now returns what btcostestimate() returns: the ANALYZE correlation of the
+column whose qual the scan answers (`STATISTIC_KIND_CORRELATION` for the type's default `<`, the
+operator ANALYZE computes it with), times 0.75 for a multicolumn index as btree does; 0 for a
+multi-key column and whenever no statistic exists. That is the right number for the same reason it
+is for btree: within one key a lion scan returns TIDs in heap order (as btree does since its
+heap-TID tiebreaker), so how the matching rows are spread over the heap is what the column's
+correlation describes - a column stored in key order reads its rows sequentially, a scattered one
+pays a random page per row. The index side is unchanged. The effect on the planner's choices is
+btree's: one row goes to the plain scan (no bitmap to build, no bitmap heap overhead), a few
+thousand scattered rows go to the bitmap at a normal `work_mem` (sorted page visits), and at a
+`work_mem` so low that the bitmap is priced lossy - every tuple of every lossy page rechecked,
+compute_bitmap_pages() - the plain scan wins again. The count pushdown competes at the upper rel
+with its own cost (§10) and is unaffected; the regression suite pins its choices.
+
+### 29.12 Tests
+
+`test/sql/indexscan.sql`, written before the code and failing on HEAD (no plan can show an Index
+Scan using a lion index there): every answer compared with a sequential scan's as a multiset;
+plans with nothing disabled for a one-row lookup and for low `work_mem`, and every predicate kind
+forced through a plain Index Scan - equality, IN and `= ANY` with NULL elements, ranges, `IS NULL`
+and `IS NOT NULL`, multicolumn ANDs, arrays and tsvector with recheck, cross-type keys, citext, a
+collation mismatch declined; nested-loop inner scans with rescans; cursors (FETCH forward, SCROLL
+over a Material, NO SCROLL refusing backward); a dirty heap after updates and deletes, then VACUUM;
+a posting set far larger than one batch with its memory flat; an exclusion constraint; the count
+pushdown still chosen for its shapes. Isolation: `gettuple_pause.spec` (cursors, every major) parks
+a scan between two `amgettuple` calls while the directory leaf under a walk splits, the posting
+leaves under a cursor split, an INLINE set spills, and VACUUM deletes the next entry of the walk,
+each with the exact answer after, and shows that VACUUM does not wait for the paused MVCC scan;
+`gettuple_dirty_pin.spec` (injection point `lion-gettuple-batch`, 17+) parks an exclusion-
+constraint check with a batch loaded and shows VACUUM waiting for its pin, a plain MVCC scan parked
+at the same point not holding one, and a scan parked on a posting set that VACUUM then deletes and
+whose pages an insert reuses, ending that set at the owner check with the exact answer.
