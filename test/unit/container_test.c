@@ -637,6 +637,7 @@ test_run_overflow(void)
 	(void) ref_remove_range(&ref_a, 2, 2);
 	CHECK(buf_a.c.type == LION_CT_BITSET, "remove_range split overflow -> BITSET");
 	verify_full(&buf_a.c, &ref_a);
+
 }
 
 static void
@@ -1982,6 +1983,399 @@ test_check_rejects(void)
 }
 
 /* ----------------------------------------------------------------
+ *				exact-size buffers (damaged containers)
+ *
+ * A heap buffer of exactly the size under test, so that a build with
+ * -fsanitize=address reports any access past it.  Without the sanitizer a
+ * guard of LION_CONTAINER_MAX_SIZE bytes follows it - no function here writes
+ * further than that past any buffer - and guard_ok() checks it is untouched.
+ * ----------------------------------------------------------------
+ */
+
+#if defined(__SANITIZE_ADDRESS__)
+#define UNIT_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define UNIT_ASAN 1
+#endif
+#endif
+
+/* a variable, not a macro: 0 would make the loops below "always false" */
+#ifdef UNIT_ASAN
+static Size guard_bytes = 0;
+#else
+static Size guard_bytes = LION_CONTAINER_MAX_SIZE;
+#endif
+#define GUARD_FILL	0xA5
+
+static void *
+exact_alloc(Size size)
+{
+	unsigned char *p = malloc(size + guard_bytes);
+	Size		i;
+
+	if (p == NULL)
+	{
+		printf("out of memory\n");
+		exit(2);
+	}
+	for (i = 0; i < guard_bytes; i++)
+		p[size + i] = GUARD_FILL;
+	return p;
+}
+
+static bool
+guard_ok(const void *p, Size size)
+{
+	const unsigned char *g = (const unsigned char *) p + size;
+	Size		i;
+
+	for (i = 0; i < guard_bytes; i++)
+		if (g[i] != GUARD_FILL)
+			return false;
+	return true;
+}
+
+/* ----------------------------------------------------------------
+ *				damaged containers (DESIGN.md §3)
+ *
+ * A container read from disk has passed a check of its header and size and
+ * nothing else when the library works on it.  These hand the library
+ * containers whose payload is anything at all, each in an exact
+ * LION_CONTAINER_MAX_SIZE buffer, with every output array of exactly its
+ * documented size.  What is checked is what the library promises for ANY
+ * payload: no access outside a buffer, every lo it hands out below
+ * LION_CONTAINER_RANGE and never more than LION_CONTAINER_RANGE of them, and
+ * a container a mutator leaves behind no larger than LION_CONTAINER_MAX_SIZE.
+ * Which members come out is unspecified.
+ * ----------------------------------------------------------------
+ */
+
+typedef struct DamageIter
+{
+	uint32		n;
+	uint32		bad;			/* lo values out of range */
+} DamageIter;
+
+static bool
+damage_iter_cb(uint16 lo, void *arg)
+{
+	DamageIter *st = (DamageIter *) arg;
+
+	st->n++;
+	if ((uint32) lo > LION_CONTAINER_RANGE - 1)
+		st->bad++;
+	return true;
+}
+
+static uint64 damage_pred_seed;
+static uint32 damage_pred_calls;
+
+static bool
+damage_pred(uint16 lo, void *arg)
+{
+	damage_pred_calls++;
+	if ((uint32) lo > LION_CONTAINER_RANGE - 1)
+		damage_pred_calls += 1000000;	/* flagged by the caller */
+	return ((((uint32) lo * 2654435761U) ^ (uint32) damage_pred_seed) >> 29) == 0;
+}
+
+static LionContainer *dmg_a;
+static LionContainer *dmg_b;
+static LionContainer *dmg_dst;
+static LionContainer *dmg_work;
+static uint16 *dmg_out;
+
+/*
+ * Run every reader over c (and c against other), and every mutator over a
+ * copy of c, checking the promises above.  c and other are left unchanged.
+ */
+static void
+damage_exercise(const LionContainer *c, const LionContainer *other)
+{
+	DamageIter	st;
+	uint32		n;
+	uint32		i;
+	uint32		bad = 0;
+	uint32		lo = rng_below(LION_CONTAINER_RANGE);
+	uint32		s = rng_below(LION_CONTAINER_RANGE);
+	uint32		e = s + rng_below(LION_CONTAINER_RANGE - s);
+
+	/* readers */
+	(void) lion_container_contains(c, (uint16) lo);
+	(void) lion_container_range_cardinality(c, (uint16) s, (uint16) e);
+
+	st.n = 0;
+	st.bad = 0;
+	lion_container_iterate(c, damage_iter_cb, &st);
+	CHECK(st.n <= LION_CONTAINER_RANGE, "damaged: iterate() visits at most 32768 values");
+	CHECK(st.bad == 0, "damaged: iterate() hands out only lo values in range");
+
+	n = lion_container_to_array(c, dmg_out);
+	CHECK(n <= LION_CONTAINER_RANGE, "damaged: to_array() returns at most 32768 values");
+	CHECK(n == st.n, "damaged: to_array() and iterate() agree on the count");
+	for (i = 0; i < n && i < LION_CONTAINER_RANGE; i++)
+		if ((uint32) dmg_out[i] > LION_CONTAINER_RANGE - 1)
+			bad++;
+	CHECK(bad == 0, "damaged: to_array() writes only lo values in range");
+	CHECK(guard_ok(dmg_out, LION_CONTAINER_RANGE * sizeof(uint16)),
+		  "damaged: to_array() stays inside its 32768-entry output");
+
+	(void) lion_container_and_cardinality(c, other);
+	(void) lion_container_and_cardinality(other, c);
+	(void) lion_container_and(c, other, dmg_dst);
+	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: and() result size");
+	(void) lion_container_and(other, c, dmg_dst);
+	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: and() result size");
+	(void) lion_container_or(c, other, dmg_dst);
+	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: or() result size");
+	(void) lion_container_or(other, c, dmg_dst);
+	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: or() result size");
+	(void) lion_container_andnot(c, other, dmg_dst);
+	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: andnot() result size");
+	(void) lion_container_andnot(other, c, dmg_dst);
+	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: andnot() result size");
+	CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "damaged: set algebra stays inside dest");
+
+	/* mutators, each on a fresh copy */
+#define DAMAGE_MUTATE(what, stmt) \
+	do { \
+		memcpy(dmg_work, c, LION_CONTAINER_MAX_SIZE); \
+		stmt; \
+		CHECK(lion_container_size(dmg_work) <= LION_CONTAINER_MAX_SIZE, \
+			  "damaged: " what " leaves a container of at most 4104 bytes"); \
+		CHECK(guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE), \
+			  "damaged: " what " stays inside its buffer"); \
+		st.n = 0; \
+		st.bad = 0; \
+		lion_container_iterate(dmg_work, damage_iter_cb, &st); \
+		CHECK(st.n <= LION_CONTAINER_RANGE && st.bad == 0, \
+			  "damaged: " what " leaves a container that iterates in range"); \
+	} while (0)
+
+	DAMAGE_MUTATE("add()", (void) lion_container_add(dmg_work, (uint16) lo));
+	DAMAGE_MUTATE("remove()", (void) lion_container_remove(dmg_work, (uint16) lo));
+	DAMAGE_MUTATE("remove_range()",
+				  (void) lion_container_remove_range(dmg_work, (uint16) s, (uint16) e));
+	DAMAGE_MUTATE("optimize()", lion_container_optimize(dmg_work));
+	DAMAGE_MUTATE("to_bitset()", lion_container_to_bitset(dmg_work));
+	damage_pred_seed = rng_next();
+	damage_pred_calls = 0;
+	DAMAGE_MUTATE("remove_if()",
+				  (void) lion_container_remove_if(dmg_work, damage_pred, NULL));
+	CHECK(damage_pred_calls <= LION_CONTAINER_RANGE,
+		  "damaged: remove_if() asks about at most 32768 lo values, all in range");
+	DAMAGE_MUTATE("remove_if() then optimize()",
+				  ((void) lion_container_remove_if(dmg_work, damage_pred, NULL),
+				   lion_container_optimize(dmg_work)));
+#undef DAMAGE_MUTATE
+}
+
+static void
+test_damaged_reported(void)
+{
+	Ref		   *r = &ref_b;
+	uint32		i;
+	uint32		n;
+	DamageIter	st;
+
+	/*
+	 * The three shapes a 2026-09 review found overflowing a buffer, with
+	 * AddressSanitizer, in a standalone harness.
+	 */
+	phase("damaged: ARRAY member past 32767 against a BITSET");
+	gen_typed(r, &buf_b, LION_CT_BITSET);
+	memcpy(dmg_b, &buf_b, LION_CONTAINER_MAX_SIZE);
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->cardinality = 1;
+	LION_ARRAY_DATA(dmg_a)[0] = 32768;	/* bits_set() indexed word 512 */
+	(void) lion_container_or(dmg_a, dmg_b, dmg_dst);
+	CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "or() stays inside dest");
+	damage_exercise(dmg_a, dmg_b);
+	LION_ARRAY_DATA(dmg_a)[0] = 65535;	/* ... and word 1023, 4 KB past it */
+	(void) lion_container_or(dmg_a, dmg_b, dmg_dst);
+	CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "or() stays inside dest");
+	damage_exercise(dmg_a, dmg_b);
+
+	phase("damaged: RUN reaching past 32767, materialised");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->cardinality = 1;
+	LION_RUN_NRUNS(dmg_a) = 1;
+	LION_RUN_DATA(dmg_a)[0].start = 30000;
+	LION_RUN_DATA(dmg_a)[0].len_minus_1 = 60000;
+	n = lion_container_to_array(dmg_a, dmg_out);
+	CHECK(n == LION_CONTAINER_RANGE - 30000, "a run clamped at 32767 yields 30000 .. 32767");
+	CHECK(guard_ok(dmg_out, LION_CONTAINER_RANGE * sizeof(uint16)),
+		  "to_array() stays inside its 32768-entry output");
+	damage_exercise(dmg_a, dmg_b);
+
+	phase("damaged: BITSET whose header understates its members, filtered");
+	gen_random(r, 5000);
+	build_by_append(&buf_a, r);
+	lion_container_to_bitset(&buf_a.c);
+	memcpy(dmg_a, &buf_a, LION_CONTAINER_MAX_SIZE);
+	dmg_a->cardinality = 100;	/* container_shrink_bitset() trusted this */
+	damage_pred_seed = 0;
+	(void) lion_container_remove_if(dmg_a, damage_pred, NULL);
+	CHECK(dmg_a->type == LION_CT_BITSET,
+		  "a BITSET holding more than an ARRAY can is not made one");
+	CHECK(guard_ok(dmg_a, LION_CONTAINER_MAX_SIZE), "remove_if() stays inside the container");
+	memcpy(dmg_a, &buf_a, LION_CONTAINER_MAX_SIZE);
+	dmg_a->cardinality = 100;
+	lion_container_optimize(dmg_a);
+	CHECK(dmg_a->type == LION_CT_BITSET, "nor does optimize() make it one");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* overlapping runs: every value once, and never more than 32768 */
+	phase("damaged: 1023 runs each covering the whole range");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->cardinality = 7;
+	LION_RUN_NRUNS(dmg_a) = LION_RUN_MAX_NRUNS;
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+	{
+		LION_RUN_DATA(dmg_a)[i].start = 0;
+		LION_RUN_DATA(dmg_a)[i].len_minus_1 = LION_CONTAINER_RANGE - 1;
+	}
+	n = lion_container_to_array(dmg_a, dmg_out);
+	CHECK(n == LION_CONTAINER_RANGE, "overlapping runs yield each value once");
+	st.n = 0;
+	st.bad = 0;
+	lion_container_iterate(dmg_a, damage_iter_cb, &st);
+	CHECK(st.n == LION_CONTAINER_RANGE, "and iterate() visits each value once");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* a run that starts past the range is empty */
+	phase("damaged: a run starting past 32767");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->cardinality = 3;
+	LION_RUN_NRUNS(dmg_a) = 2;
+	LION_RUN_DATA(dmg_a)[0].start = 10;
+	LION_RUN_DATA(dmg_a)[0].len_minus_1 = 2;
+	LION_RUN_DATA(dmg_a)[1].start = 40000;
+	LION_RUN_DATA(dmg_a)[1].len_minus_1 = 5;
+	CHECK(lion_container_to_array(dmg_a, dmg_out) == 3, "the run past the range is empty");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* counts past the largest legal container, in an exact 4104-byte buffer */
+	phase("damaged: ARRAY claiming 3000 members");
+	for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+		((char *) dmg_a)[i] = (char) rng_next();
+	dmg_a->ckey = TEST_CKEY;
+	dmg_a->type = LION_CT_ARRAY;
+	dmg_a->flags = 0;
+	dmg_a->cardinality = 3000;
+	damage_exercise(dmg_a, dmg_b);
+	damage_exercise(dmg_a, dmg_a);
+
+	phase("damaged: RUN claiming 60000 runs");
+	dmg_a->type = LION_CT_RUN;
+	LION_RUN_NRUNS(dmg_a) = 60000;
+	damage_exercise(dmg_a, dmg_b);
+	damage_exercise(dmg_a, dmg_a);
+
+	/* runs out of order, which remove_range()'s run arithmetic assumes */
+	phase("damaged: RUN with runs out of order");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->cardinality = 100;
+	LION_RUN_NRUNS(dmg_a) = LION_RUN_MAX_NRUNS;
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+	{
+		LION_RUN_DATA(dmg_a)[i].start = (uint16) (32000 - 31 * i);
+		LION_RUN_DATA(dmg_a)[i].len_minus_1 = 3;
+	}
+	memcpy(dmg_work, dmg_a, LION_CONTAINER_MAX_SIZE);
+	(void) lion_container_remove_range(dmg_work, 5000, 20000);
+	CHECK(lion_container_size(dmg_work) <= LION_CONTAINER_MAX_SIZE &&
+		  guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE),
+		  "remove_range() over unordered runs stays inside its buffer");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* an ARRAY out of order, which remove_range()'s binary searches assume */
+	phase("damaged: ARRAY with members out of order");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->cardinality = LION_ARRAY_MAX_CARD;
+	for (i = 0; i < LION_ARRAY_MAX_CARD; i++)
+		LION_ARRAY_DATA(dmg_a)[i] = (uint16) (65535 - 16 * i);
+	memcpy(dmg_work, dmg_a, LION_CONTAINER_MAX_SIZE);
+	(void) lion_container_remove_range(dmg_work, 100, 30000);
+	CHECK(guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE),
+		  "remove_range() over an unordered array stays inside its buffer");
+	damage_exercise(dmg_a, dmg_b);
+}
+
+/*
+ * Random payloads.  A third of them get a count field that is plausible, so
+ * that the payload's contents rather than the clamps are what the functions
+ * meet; the rest get anything.
+ */
+static void
+damage_randomize(LionContainer *c)
+{
+	uint32		i;
+	uint32		k = rng_below(3);
+
+	for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+		((char *) c)[i] = (char) rng_next();
+	c->ckey = TEST_CKEY;
+	c->type = (uint8) (LION_CT_ARRAY + rng_below(3));
+	c->flags = (uint8) rng_below(2);
+	c->cardinality = (uint16) (k == 0 ? rng_below(LION_ARRAY_MAX_CARD + 1) : rng_next());
+	if (c->type == LION_CT_RUN)
+	{
+		LionRun    *runs = LION_RUN_DATA(c);
+		uint32		nruns = (k == 0) ? rng_below(LION_RUN_MAX_NRUNS + 1) : (rng_next() & 0xFFFF);
+
+		LION_RUN_NRUNS(c) = (uint16) nruns;
+		if (k == 1)
+		{
+			/* plausible runs: mostly short, mostly in range */
+			for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+			{
+				runs[i].start = (uint16) rng_below(LION_CONTAINER_RANGE + 2000);
+				runs[i].len_minus_1 = (uint16) rng_below(64);
+			}
+		}
+	}
+	else if (c->type == LION_CT_ARRAY && k == 1)
+	{
+		/* ascending, with the odd member past the range */
+		uint16	   *arr = LION_ARRAY_DATA(c);
+		uint32		v = 0;
+
+		for (i = 0; i < LION_ARRAY_MAX_CARD; i++)
+		{
+			v += 1 + rng_below(40);
+			arr[i] = (uint16) v;
+		}
+	}
+}
+
+static void
+test_damaged_random(uint32 iters, uint64 seed)
+{
+	uint32		it;
+
+	phase("damaged: random payloads");
+	rng_seed(seed);
+	for (it = 0; it < iters; it++)
+	{
+		damage_randomize(dmg_a);
+		if (rng_below(2) == 0)
+		{
+			gen_typed(&ref_b, &buf_b, (LionContainerType) (LION_CT_ARRAY + rng_below(3)));
+			memcpy(dmg_b, &buf_b, LION_CONTAINER_MAX_SIZE);
+		}
+		else
+			damage_randomize(dmg_b);
+		damage_exercise(dmg_a, dmg_b);
+	}
+}
+
+/* ----------------------------------------------------------------
  *					representative sizes (informational)
  * ----------------------------------------------------------------
  */
@@ -2103,6 +2497,15 @@ main(void)
 	test_run_intersection_overflow();
 	test_remove_if_rebuild();
 	test_check_rejects();
+
+	dmg_a = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	dmg_b = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	dmg_dst = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	dmg_work = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	dmg_out = exact_alloc(LION_CONTAINER_RANGE * sizeof(uint16));
+	rng_seed(UINT64CONST(0x5EED3000));
+	test_damaged_reported();
+	test_damaged_random(3000, UINT64CONST(0x5EED3002));
 
 	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001));
 	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002));

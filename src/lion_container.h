@@ -5,7 +5,20 @@
  *	  This module depends only on c.h and port/pg_bitutils.h so that it can be
  *	  unit-tested outside the server (test/unit/container_test.c, built with
  *	  -DFRONTEND).  No palloc, no elog: every function is total over valid
- *	  inputs and reports impossible states through Assert().
+ *	  inputs, and Assert()s its caller's side of the contract.
+ *
+ *	  DAMAGED INPUT.  A container read from disk is data.  Every function is
+ *	  memory-safe for any payload behind a header of a valid type: nothing
+ *	  here reads more than LION_CONTAINER_MAX_SIZE bytes from the start of a
+ *	  container or writes past a buffer of the documented size, every lo value
+ *	  handed to a caller is below LION_CONTAINER_RANGE, and a mutator never
+ *	  leaves a container larger than LION_CONTAINER_MAX_SIZE, whatever the
+ *	  header claimed.  What a damaged container yields is unspecified (but
+ *	  deterministic); lion_container_check() is what finds it.  A reader that
+ *	  hands in a container straight from a page must still know that
+ *	  lion_container_size() of it lies inside the item, as lion_inline_fetch()
+ *	  checks - reading LION_CONTAINER_MAX_SIZE bytes from the start of a short
+ *	  item could leave the page.  lion_container.c, "untrusted containers".
  *
  *	  Mutators operate IN PLACE on a caller-supplied buffer that must have at
  *	  least LION_CONTAINER_MAX_SIZE bytes of capacity, because a mutation may
@@ -96,7 +109,11 @@ extern void lion_container_to_bitset(LionContainer *c);
 /* Iteration in ascending lo order; callback returns false to stop early. */
 typedef bool (*lion_lo_callback) (uint16 lo, void *arg);
 extern void lion_container_iterate(const LionContainer *c, lion_lo_callback cb, void *arg);
-/* Materialise all members (out must hold LION_CONTAINER_RANGE uint16s); returns count. */
+/*
+ * Materialise all members, in iterate() order - ascending for a well-formed
+ * container.  out must hold LION_CONTAINER_RANGE uint16s, which is as many as
+ * any container yields, damaged or not.  Returns the count.
+ */
 extern uint32 lion_container_to_array(const LionContainer *c, uint16 *out);
 
 /*
