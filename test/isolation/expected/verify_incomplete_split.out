@@ -1,0 +1,108 @@
+Parsed test spec with 1 sessions
+
+starting permutation: s1_shape s1_split_posting s1_detach_posting s1_split_dir s1_detach_dir s1_verify_posting s1_verify_dir s1_answers
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_shape: 
+	SELECT max_posting_height > 0 AS posting_is_a_tree FROM lion_index_stats('vis_p_k');
+	SELECT directory_height > 0 AS directory_has_a_root FROM lion_index_stats('vis_d_k');
+
+posting_is_a_tree
+-----------------
+t                
+(1 row)
+
+directory_has_a_root
+--------------------
+t                   
+(1 row)
+
+step s1_split_posting: 
+	SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
+	INSERT INTO vis_p SELECT 100000 + i, i % 2 FROM generate_series(1, 30000) i;
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+ERROR:  error triggered for injection point lion-posting-split-incomplete
+step s1_detach_posting: SELECT injection_points_detach('lion-posting-split-incomplete');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_split_dir: 
+	SELECT injection_points_attach('lion-dir-split-incomplete', 'error');
+	INSERT INTO vis_d SELECT 'key-' || lpad((2 * i + 1)::text, 90, '0')
+	  FROM generate_series(1, 20) i;
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+ERROR:  error triggered for injection point lion-dir-split-incomplete
+step s1_detach_dir: SELECT injection_points_detach('lion-dir-split-incomplete');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+s1: WARNING:  lion index "vis_p_k": posting page 12 has an unfinished split
+DETAIL:  Its right sibling has no downlink in the parent yet.
+HINT:  The next INSERT into that key repairs it.
+step s1_verify_posting: 
+	SELECT lion_index_verify('vis_p_k');
+	SELECT lion_index_verify('vis_p_k', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+s1: WARNING:  lion index "vis_p_k": posting page 12 has an unfinished split
+DETAIL:  Its right sibling has no downlink in the parent yet.
+HINT:  The next INSERT into that key repairs it.
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+s1: WARNING:  lion index "vis_d_k": directory page 1 has an unfinished split
+DETAIL:  Its right sibling has no downlink in the parent yet.
+HINT:  The next INSERT that descends to this page repairs it.
+step s1_verify_dir: 
+	SELECT lion_index_verify('vis_d_k');
+	SELECT lion_index_verify('vis_d_k', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+s1: WARNING:  lion index "vis_d_k": directory page 1 has an unfinished split
+DETAIL:  Its right sibling has no downlink in the parent yet.
+HINT:  The next INSERT that descends to this page repairs it.
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s1_answers: 
+	SET enable_seqscan = off;
+	SELECT (SELECT count(*) FROM vis_p WHERE k = 0) = 30000 AS k0_exact,
+		   (SELECT count(*) FROM vis_p WHERE k = 1) = 30000 AS k1_exact,
+		   (SELECT bool_and((SELECT count(*) FROM vis_d d2 WHERE d2.k = d1.k) = 1)
+			  FROM vis_d d1) AS every_key_is_found;
+	RESET enable_seqscan;
+
+k0_exact|k1_exact|every_key_is_found
+--------+--------+------------------
+t       |t       |t                 
+(1 row)
+
