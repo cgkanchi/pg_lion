@@ -649,6 +649,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
         -- the identity every page of the set is stamped with (§18).
+        -- A multi-key column (§17) is refused, with the count functions' message: its entries are
+        -- extracted keys, not column values, and a whole tsvector used to be hashed as if it were
+        -- one lexeme and look up no entry at all.
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
         -- never below the column of the entry before it, §24), at most one reserved NULL and one
@@ -658,6 +661,76 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- fresh snapshot and checks that every visible tuple's TID is present under its key in
         -- EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
         -- snapshot may not use the index.
+        -- The heap scan evaluates the index's expressions and predicate, which are the table
+        -- owner's functions and can be replaced after CREATE INDEX with anything at all. They run
+        -- AS THE TABLE OWNER, inside a SECURITY_RESTRICTED_OPERATION, under a GUC nest level that
+        -- is rolled back when the check ends, and on 17+ with search_path restricted to
+        -- pg_catalog, pg_temp - amcheck's rule since CVE-2022-1552, and what the server's own
+        -- REINDEX does. Run as the caller, a superuser verifying somebody else's table ran the
+        -- owner's code with superuser rights. The table is locked BEFORE the index (and the
+        -- index's table looked up again once both are held), the order DROP INDEX takes them in;
+        -- the other order deadlocked with `LOCK TABLE t; DROP INDEX t_k` in another session. Key
+        -- values appear in a "not indexed" report only when the CALLER is a superuser, which is
+        -- decided before the switch: asked afterwards, superuser() answers for the owner.
+        -- LOCKING: ShareLock on the table, then on the index - bt_index_parent_check()'s locks, for
+        -- bt_index_parent_check()'s reason. verify() is a parent check: it compares each level of
+        -- the directory and of every posting tree with the WHOLE level below it, and proves every
+        -- block reachable exactly once, and none of that holds between pages read at different
+        -- moments while writers split them. It ran under AccessShareLock and one page lock at a
+        -- time until the 2026-09-25 review, and a loop of inserts that split the directory made
+        -- 11 of 20 calls report "the directory points at block 733, but the index has only 732
+        -- blocks" about a sound index (the block count was taken before a split extended it; a
+        -- level walked before a split and its parent walked after it, or a page allocated after
+        -- the walk passed it, would have been next). Making each comparison tolerate growth was
+        -- the alternative, and it stops at reachability: an unreferenced live page is a leak or a
+        -- page a writer took from the FSM a moment ago, and without an LSN on unlogged pages
+        -- nothing tells the two apart. So verify() waits for the writers in flight, keeps INSERT,
+        -- UPDATE, DELETE, VACUUM and CREATE INDEX CONCURRENTLY out while it runs, and releases both
+        -- locks when it returns rather than at commit, as amcheck does. lion_index_stats() is
+        -- unaffected: it stays under AccessShareLock and concurrent.
+        -- DURING RECOVERY no lock above RowExclusiveLock can be taken, and replay takes no relation
+        -- locks anyway, so on a hot standby verify() takes AccessShareLock and reads an index that
+        -- replay may be changing. It re-reads the block count before calling a link out of range,
+        -- which covers the commonest case (a split replay has just extended the index with), but a
+        -- level comparison or the reachability pass can still report a change replay made while it
+        -- walked. Such a report is confirmed with replay paused (pg_wal_replay_pause(), then
+        -- pg_wal_replay_resume()); run on a quiet standby, as test/recovery/run.sh does, the check
+        -- is exact.
+        -- test/isolation/verify_concurrent.spec parks verify() after it has read the meta page
+        -- (injection point 'lion-verify-meta-read') and shows a directory-splitting INSERT waiting
+        -- for it, a writer in flight being waited for, and `LOCK TABLE; DROP INDEX` in another
+        -- transaction going through while verify() waits for the table.
+        -- AN UNFINISHED SPLIT IS NOT DAMAGE (§21, §22). A split writes the new right sibling in one
+        -- record and its downlink in the next, with the left page flagged
+        -- LION_PAGE_INCOMPLETE_SPLIT in between, and a crash or an error there leaves the sibling
+        -- reachable by its left neighbour's right link and from nothing above until the next
+        -- writer that descends to the left page finishes the split. verify() warns about the
+        -- flag, and when it matches a level's downlinks with the pages of the level below it
+        -- accepts a page without one if its left neighbour carries the flag - a three-way posting
+        -- split flags two pages in a row, and each missing downlink is covered by the page to its
+        -- own left. Such a page is bounded above by the next downlink's separator like any other.
+        -- The flag with the downlink already in place (the directory clears the flag in a record
+        -- of its own) needs nothing. verify() used to warn and then report the missing downlink
+        -- as "level 1 has 4 downlinks but level 0 has 5 pages";
+        -- test/isolation/verify_incomplete_split.spec makes a posting split and a directory
+        -- split fail at their injection points and verifies both.
+        -- A DAMAGED PAGE IS AN ERROR, never a crash, a read past the page or a write: every block
+        -- number verify() follows - the meta page's root, downlinks, right links, an entry's head,
+        -- a posting pivot's child - is checked against the index's length before ReadBuffer(),
+        -- which on 16-18 takes InvalidBlockNumber for P_NEW and EXTENDS the relation; every page
+        -- header's bounds are checked, then every line pointer (normal, non-empty, inside
+        -- [pd_upper, pd_special), MAXALIGNed: amcheck's PageGetItemIdCareful()), then every
+        -- directory item's header, key column and key extent and length, before anything
+        -- compares, copies or hashes it - the order checks used to hand an entry's column to
+        -- lion_column() and compare its key before the entry check had looked at either; and the
+        -- meta page's height is bounded by the index's length before the walk sizes arrays by it.
+        -- lion_index_stats(), granted to pg_stat_scan_tables, reports damage to nobody, so it
+        -- skips the pages and items it cannot read safely instead: a header out of bounds, a line
+        -- pointer outside the item space, an entry shorter than its key (whose payload length
+        -- used to underflow), an item of no known type. The regression suite writes each kind of
+        -- damage into a temporary index's file (verify.sql) and gets an ERROR from verify() and
+        -- a count without the damaged item from lion_index_stats(), where the code before
+        -- asserted, read past the page, or extended the index.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
