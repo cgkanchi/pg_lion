@@ -1,0 +1,269 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s2_pages s1_k1 s3_pins s2_grow s2_pages s1_rest s1_check_k1 s3_verify
+step s2_pages: 
+	SELECT container_pages, max_posting_height FROM lion_index_stats('gp_k');
+
+container_pages|max_posting_height
+---------------+------------------
+              5|                 1
+(1 row)
+
+step s1_k1: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE c CURSOR FOR SELECT id FROM gp WHERE k = 1;
+	SELECT gp_take('c', 5) AS first;
+
+first
+-----
+    5
+(1 row)
+
+step s3_pins: 
+	SELECT count(*) AS index_pages_pinned FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode = pg_relation_filenode('gp_k') AND pinning_backends > 0;
+
+index_pages_pinned
+------------------
+                 0
+(1 row)
+
+step s2_grow: 
+	BEGIN;
+	UPDATE gp SET k = 1 WHERE k = 2 AND id <= 30000;
+	ROLLBACK;
+
+step s2_pages: 
+	SELECT container_pages, max_posting_height FROM lion_index_stats('gp_k');
+
+container_pages|max_posting_height
+---------------+------------------
+             15|                 1
+(1 row)
+
+step s1_rest: SELECT gp_take('c', NULL) AS rest;
+rest
+----
+1995
+(1 row)
+
+step s1_check_k1: 
+	SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+	SELECT (SELECT count(*) FROM gp_got) AS got,
+		   (SELECT count(DISTINCT id) FROM gp_got) AS distinct_ids,
+		   (SELECT count(*) FROM gp WHERE k = 1) AS expected,
+		   (SELECT count(*) FROM gp_got g WHERE NOT EXISTS
+			 (SELECT 1 FROM gp WHERE gp.id = g.id AND gp.k = 1)) AS wrong;
+	COMMIT;
+
+ got|distinct_ids|expected|wrong
+----+------------+--------+-----
+2000|        2000|    2000|    0
+(1 row)
+
+step s3_verify: 
+	SELECT lion_index_verify('gp_k', true);
+	SELECT lion_index_verify('gpt_k', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_k5 s2_spill s1_rest s1_check_k5 s3_verify
+step s1_k5: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE c CURSOR FOR SELECT id FROM gp WHERE k = 5;
+	SELECT gp_take('c', 5) AS first;
+
+first
+-----
+    5
+(1 row)
+
+step s2_spill: 
+	INSERT INTO gp SELECT 50000 + i, 5, 'more' FROM generate_series(1, 3000) i;
+	SELECT lion_index_posting_root('gp_k', 5) IS NOT NULL AS spilled;
+
+spilled
+-------
+t      
+(1 row)
+
+step s1_rest: SELECT gp_take('c', NULL) AS rest;
+rest
+----
+  35
+(1 row)
+
+step s1_check_k5: 
+	SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+	SELECT (SELECT count(*) FROM gp_got) AS got,
+		   (SELECT count(DISTINCT id) FROM gp_got) AS distinct_ids,
+		   (SELECT count(*) FROM gp WHERE k = 5) AS expected,
+		   (SELECT count(*) FROM gp_got g WHERE NOT EXISTS
+			 (SELECT 1 FROM gp WHERE gp.id = g.id AND gp.k = 5)) AS wrong;
+	COMMIT;
+
+got|distinct_ids|expected|wrong
+---+------------+--------+-----
+ 40|          40|      40|    0
+(1 row)
+
+step s3_verify: 
+	SELECT lion_index_verify('gp_k', true);
+	SELECT lion_index_verify('gpt_k', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_t s2_split s1_rest s1_check_t s3_verify
+step s1_t: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE c CURSOR FOR SELECT id FROM gpt
+	 WHERE k BETWEEN 'key-' || lpad('10', 90, '0') AND 'key-' || lpad('50', 90, '0');
+	SELECT gp_take('c', 5) AS first;
+
+first
+-----
+    5
+(1 row)
+
+step s2_split: 
+	BEGIN;
+	INSERT INTO gpt
+	SELECT 10000 + i, 'key-' || lpad((2 * (i % 60) + 1)::text, 90, '0')
+	  FROM generate_series(1, 60) i;
+	ROLLBACK;
+	SELECT leaf_pages > 1 AS leaf_split FROM lion_index_stats('gpt_k');
+
+leaf_split
+----------
+t         
+(1 row)
+
+step s1_rest: SELECT gp_take('c', NULL) AS rest;
+rest
+----
+2095
+(1 row)
+
+step s1_check_t: 
+	SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+	SELECT (SELECT count(*) FROM gp_got) AS got,
+		   (SELECT count(DISTINCT id) FROM gp_got) AS distinct_ids,
+		   (SELECT count(*) FROM gpt WHERE k BETWEEN 'key-' || lpad('10', 90, '0')
+								  AND 'key-' || lpad('50', 90, '0')) AS expected;
+	COMMIT;
+
+ got|distinct_ids|expected
+----+------------+--------
+2100|        2100|    2100
+(1 row)
+
+step s3_verify: 
+	SELECT lion_index_verify('gp_k', true);
+	SELECT lion_index_verify('gpt_k', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_del4 s1_k34 s3_pins s3_vacuum s3_gone s2_reuse s2_free s1_rest s1_check_k34 s3_verify
+step s2_del4: DELETE FROM gp WHERE k = 4;
+step s1_k34: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE c CURSOR FOR SELECT id FROM gp WHERE k BETWEEN 3 AND 4;
+	SELECT gp_take('c', 5) AS first;
+
+first
+-----
+    5
+(1 row)
+
+step s3_pins: 
+	SELECT count(*) AS index_pages_pinned FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode = pg_relation_filenode('gp_k') AND pinning_backends > 0;
+
+index_pages_pinned
+------------------
+                 0
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) gp;
+step s3_gone: 
+	SELECT lion_index_posting_root('gp_k', 4) IS NULL AS entry_4_deleted,
+		   deleted_pages > 0 AS pages_freed
+	  FROM lion_index_stats('gp_k');
+
+entry_4_deleted|pages_freed
+---------------+-----------
+t              |t          
+(1 row)
+
+step s2_reuse: 
+	INSERT INTO gp SELECT 60000 + i, 9, 'nine' FROM generate_series(1, 20000) i;
+
+step s2_free: SELECT deleted_pages AS pages_left_free FROM lion_index_stats('gp_k');
+pages_left_free
+---------------
+              1
+(1 row)
+
+step s1_rest: SELECT gp_take('c', NULL) AS rest;
+rest
+----
+1995
+(1 row)
+
+step s1_check_k34: 
+	SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+	SELECT (SELECT count(*) FROM gp_got) AS got,
+		   (SELECT count(DISTINCT id) FROM gp_got) AS distinct_ids,
+		   (SELECT count(*) FROM gp WHERE k BETWEEN 3 AND 4) AS expected,
+		   (SELECT count(*) FROM gp_got g WHERE NOT EXISTS
+			 (SELECT 1 FROM gp WHERE gp.id = g.id AND gp.k BETWEEN 3 AND 4)) AS wrong;
+	COMMIT;
+
+ got|distinct_ids|expected|wrong
+----+------------+--------+-----
+2000|        2000|    2000|    0
+(1 row)
+
+step s3_verify: 
+	SELECT lion_index_verify('gp_k', true);
+	SELECT lion_index_verify('gpt_k', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

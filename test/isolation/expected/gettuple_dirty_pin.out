@@ -1,0 +1,101 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s2_delete s1_insert s3_vacuum s2_wakeup s1_after s3_check s2_detach
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete: DELETE FROM dpin WHERE k > 1500;
+step s1_insert: INSERT INTO dpin VALUES (3000, 'new'); <waiting ...>
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) dpin; <waiting ...>
+step s2_wakeup: 
+	SELECT dpin_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_wakeup('lion-gettuple-batch');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_insert: <... completed>
+step s3_vacuum: <... completed>
+step s1_after: SELECT 'released' AS s1;
+s1      
+--------
+released
+(1 row)
+
+step s3_check: 
+	SELECT count(*) AS rows, count(DISTINCT k) AS keys FROM dpin;
+	SELECT lion_index_verify('dpin_k_excl', true);
+
+rows|keys
+----+----
+1501|1501
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-gettuple-batch');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: s2_delete s1_select s3_vacuum s2_release s1_after s3_check s2_detach
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete: DELETE FROM dpin WHERE k > 1500;
+step s1_select: SELECT count(*) AS rows_with_k_5 FROM dpin WHERE k = 5; <waiting ...>
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) dpin;
+step s2_release: SELECT injection_points_wakeup('lion-gettuple-batch');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_select: <... completed>
+rows_with_k_5
+-------------
+            1
+(1 row)
+
+step s1_after: SELECT 'released' AS s1;
+s1      
+--------
+released
+(1 row)
+
+step s3_check: 
+	SELECT count(*) AS rows, count(DISTINCT k) AS keys FROM dpin;
+	SELECT lion_index_verify('dpin_k_excl', true);
+
+rows|keys
+----+----
+1500|1500
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-gettuple-batch');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

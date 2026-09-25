@@ -1,0 +1,1 @@
+../gettuple_pause.spec
