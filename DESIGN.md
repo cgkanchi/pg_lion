@@ -123,6 +123,46 @@ Representation policy
 - Mutators operate on a caller-supplied buffer of LION_CONTAINER_MAX_SIZE bytes. Page code copies a
   container out of the page into such a buffer, mutates, and writes it back (in place when it fits).
 
+**Damaged containers** (2026-09-25 review). A container read from disk is data, and a reader checks
+its header and its size (`lion_inline_fetch()`) - not its payload: `lion_container_check()` costs as
+much as using the container (0.8 us for a BITSET, a popcount of all 512 words, which is what an
+and-cardinality of two bitsets costs), and the count engine reads millions per query. The library
+used to trust the payload as far as its own buffers went, and a review found, with AddressSanitizer,
+three ways a container that passes the size check wrote outside one: an ARRAY member of 32768 or
+more indexed a bitset word past the 512th (65535 wrote 4 KB past a 4104-byte stack buffer), a run
+reaching past 32767 made `lion_container_to_array()` write past its 32768-entry output, and a BITSET
+whose header understated its members overflowed the 2048-entry array VACUUM's shrink-to-ARRAY
+extracts into. Every function is now memory-safe for ANY payload behind a header of a valid type,
+at the cost of a mask or a comparison where the payload meets an index:
+
+- bitset positions are masked into range (`lo & LION_LO_MASK`); a run's last value is clamped to
+  32767 and a run that starts past it is empty; a RUN is walked strictly ascending, skipping what an
+  earlier (overlapping) run covered, so no container ever yields more than 32768 values;
+- member and run counts are clamped to 2048 and 1023 wherever they size a loop, so nothing reads
+  more than LION_CONTAINER_MAX_SIZE bytes of a container whatever its header claims - which is what
+  makes VACUUM's work buffer, filled by the line pointer's length rather than the header's, safe -
+  and a mutator rewrites such a claim to what it uses before it starts, so what it leaves behind is
+  never larger than LION_CONTAINER_MAX_SIZE;
+- the header's cardinality is a claim, not a bound: an extraction into a fixed array is bounded by
+  the array, and a representation change the claim allows but the payload contradicts (to ARRAY,
+  from a BITSET that holds more than 2048 members) is not made, which leaves the container as damaged
+  as it was for verify() to report rather than silently shorter;
+- every lo value handed to a caller is below 32768, which the callers' per-block arrays rely on.
+
+For a well-formed container all of this is a no-op and every result is byte for byte what it was;
+for a damaged one the results are unspecified but deterministic, which WAL replay needs. Assert()
+states only the caller's side of a contract, never what a container's bytes say, so an
+assert-enabled build does not stop in the library on a damaged page either. Cost, in instructions
+(callgrind, -O2): and-cardinality and membership tests of every type pair within 0 - 8% of what
+they were (a RUN against a bitset pays six per run; against an ARRAY or a RUN nothing, because
+those merge loops only compare run ends and may take them unclamped), iteration one per ARRAY
+member, and materialising a 1000-member ARRAY 1800 against the 260 of the memcpy() it was. The
+unit tests feed every function hand-made and random damaged containers in exact-size heap buffers
+(test/unit, "damaged"), which a `-fsanitize=address` build checks to the byte. What remains the
+READER's job is the size check itself: a container used straight from a page must lie inside its
+item, as `lion_inline_fetch()` checks, because reading up to 4104 bytes from the start of a short
+item can leave the page.
+
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
 run merging/splitting, and set algebra against a brute-force 32768-bit reference.
@@ -1531,6 +1571,15 @@ Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contai
   container"); segment helpers live in `src/lion_sparse.[ch]` with their own standalone unit test
   (test/unit/sparse_test.c, `make unit`). Segments never grow while being filtered, so VACUUM's
   regrow path stays container-only.
+- Damaged segments are handled as §3 handles damaged containers (2026-09-25 review): every function
+  looks at `lion_sparse_npairs()` pairs - the header's count clamped to 682 - and finds `los[]` where
+  that many ckeys end, so a header claiming more never walks it past 4100 bytes, and a mutator
+  rewrites the claim first. The review's case was `lion_sparse_remove_if()`, whose `keep[682]` was
+  indexed by the header's count: VACUUM copies a page item into its work buffer by the line
+  pointer's length, not by the header, so a header claiming 1000 pairs wrote 318 bytes past the
+  array. `lion_sparse_extract()` builds its container with `lion_container_add()` rather than the
+  bulk builder, which is promised ascending, unique members that a damaged segment need not have
+  (the same bytes for a well-formed one, and at most three members).
 
 Expected effect: c20k 475 MB → ~125 MB, c1m 337 MB → ~170 MB (GIN: 157 / 199 MB).
 
