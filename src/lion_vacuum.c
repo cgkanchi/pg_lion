@@ -35,12 +35,14 @@
  *	  reader is still consulting the visibility map with its stale copy.  (If
  *	  VACUUM had already passed P when the reader took C, then C had already
  *	  been cleaned of this cycle's dead TIDs.)  Two properties make this
- *	  sufficient: pages are never recycled, so a new page is always right of
- *	  its split origin and is visited after it, and the set of dead TIDs is
- *	  fixed before index cleanup starts.  The same reason is why the
- *	  re-placement of a container that grew (lion_vacuum_regrow) walks right
- *	  from the page the container was filtered on, cleanup-locking each page
- *	  on the way, instead of jumping straight to the page that owns its ckey.
+ *	  sufficient: a page is only ever linked in immediately right of the page
+ *	  whose split or spill allocated it - whether its block is brand new or
+ *	  recycled from the free space map (DESIGN.md §18) - so it is visited
+ *	  after that page, and the set of dead TIDs is fixed before index cleanup
+ *	  starts.  The same reason is why the re-placement of a container that
+ *	  grew (lion_vacuum_regrow) walks right from the page the container was
+ *	  filtered on, cleanup-locking each page on the way, instead of jumping
+ *	  straight to the page that owns its ckey.
  *
  * 2. Never wait for a cleanup lock while holding another LWLock.
  *
