@@ -1173,6 +1173,85 @@ DROP FUNCTION lion_pd_probes(text);
 DROP TABLE lion_pd2;
 DROP TABLE lion_pdq;
 
+-- ---- two IN lists, one of them on the group column ----------------------
+/*
+ * An IN list on the grouping column drives the groups (DESIGN.md §15): the
+ * node walks the list's located posting sets instead of every entry of the
+ * index, and emits the groups in the order those were located in.  That is key
+ * order for every opfamily this extension ships, and hash order for this one,
+ * whose cross-type `= (int4, int8)` has no ordering an int8 list can be sorted
+ * with.  The planner decided whether the list drives by a rule of its own -
+ * it gave up at the second list anywhere in the WHERE - so with a list on `h`
+ * as well it priced a walk of all 200 entries of `k` and promised the
+ * ORDER BY a sorted output, while the executor drove the groups from the list
+ * on `k` all the same and emitted 99, 150, 42, 1, ... under `ORDER BY k` (the
+ * 2026-09-25 review).  Both now take the FIRST list on the driving column as
+ * the driver, whatever else the WHERE holds, and a list-driven grouping claims
+ * no order, so a Sort goes on top.  The other plans are disabled so that the
+ * node is the plan the old estimate would have lost with.
+ */
+CREATE OPERATOR FAMILY lion_pdk_fam USING lion;
+CREATE OPERATOR CLASS lion_pdk_ops FOR TYPE int4 USING lion
+	FAMILY lion_pdk_fam AS
+	OPERATOR	1	= (int4, int4),
+	FUNCTION	1	hashint4(int4),
+	FUNCTION	4	btint4cmp(int4, int4);
+ALTER OPERATOR FAMILY lion_pdk_fam USING lion ADD
+	OPERATOR	1	= (int4, int8),
+	FUNCTION	1	(int8, int8) hashint8(int8);
+CREATE TABLE lion_pdk (k int NOT NULL, h int NOT NULL);
+INSERT INTO lion_pdk SELECT i % 200, i % 7 FROM generate_series(1, 100000) i;
+CREATE INDEX lion_pdk_k ON lion_pdk USING lion (k lion_pdk_ops);
+CREATE INDEX lion_pdk_h ON lion_pdk USING lion (h);
+VACUUM ANALYZE lion_pdk;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+EXPLAIN (COSTS OFF)
+SELECT k, count(*) FROM lion_pdk
+ WHERE k = ANY ('{5,17,3,150,42,99,1,120}'::int8[]) AND h IN (1, 2)
+ GROUP BY k ORDER BY k;
+SELECT k, count(*) FROM lion_pdk
+ WHERE k = ANY ('{5,17,3,150,42,99,1,120}'::int8[]) AND h IN (1, 2)
+ GROUP BY k ORDER BY k;
+-- the list on `h` first: it is the first list on `k` that drives, not the first list
+SELECT k, count(*) FROM lion_pdk
+ WHERE h IN (1, 2) AND k = ANY ('{5,17,3,150,42,99,1,120}'::int8[])
+ GROUP BY k ORDER BY k;
+-- one list, as before: the list drives, and no order is claimed either
+SELECT k, count(*) FROM lion_pdk
+ WHERE k = ANY ('{5,17,3,150,42,99,1,120}'::int8[]) GROUP BY k ORDER BY k;
+SELECT lion_pd($$SELECT k, count(*) FROM lion_pdk
+				WHERE k = ANY ('{5,17,3,150,42,99,1,120}'::int8[]) AND h IN (1, 2)
+				GROUP BY k$$);
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+DROP TABLE lion_pdk;
+DROP OPERATOR FAMILY lion_pdk_fam USING lion;
+/*
+ * ... and the estimate is the executor's too, with nothing disabled: the
+ * eight listed entries rather than a walk of all 20000 entries of `k`.
+ * Priced as that walk (332 against the bitmap plan's 155) the node lost this
+ * query; priced as what it does (95) it is chosen.  The index's own opclass
+ * locates the list in key order, but the path claims no order for it either
+ * (DESIGN.md §21), so the ORDER BY sorts the eight groups.
+ */
+CREATE TABLE lion_pdk (k int NOT NULL, h int NOT NULL);
+INSERT INTO lion_pdk SELECT i % 20000, i % 7 FROM generate_series(1, 100000) i;
+CREATE INDEX lion_pdk_k ON lion_pdk USING lion (k);
+CREATE INDEX lion_pdk_h ON lion_pdk USING lion (h);
+VACUUM ANALYZE lion_pdk;
+SELECT lion_pd('SELECT k, count(*) FROM lion_pdk WHERE k IN (5, 17, 3, 150, 42, 99, 1, 120) AND h IN (1, 2) GROUP BY k');
+EXPLAIN (COSTS OFF)
+SELECT k, count(*) FROM lion_pdk
+ WHERE k IN (5, 17, 3, 150, 42, 99, 1, 120) AND h IN (1, 2)
+ GROUP BY k ORDER BY k;
+SELECT k, count(*) FROM lion_pdk
+ WHERE k IN (5, 17, 3, 150, 42, 99, 1, 120) AND h IN (1, 2)
+ GROUP BY k ORDER BY k;
+DROP TABLE lion_pdk;
+
 DROP TABLE lion_pdpo;
 DROP TABLE lion_pdmo;
 DROP TABLE lion_pdo;

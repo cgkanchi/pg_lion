@@ -27,10 +27,10 @@ SELECT count(*) FROM hk WHERE k = 3;
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM hk WHERE k IN (1, 2) GROUP BY g;
-                    QUERY PLAN                    
---------------------------------------------------
+                          QUERY PLAN                           
+---------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: hk_g (g), hk_k (k = ANY ({1,2}))
+   Lion Indexes: hk_g (g), hk_k (k = ANY ('{1,2}'::integer[]))
    Group Key: g
 (3 rows)
 
