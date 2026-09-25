@@ -230,8 +230,29 @@ SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3, 'lion_kt_v_v', 'v3'::varcha
 -- a cast FUNCTION is not taken (§21): bpchar to text is rtrim1()
 SELECT lion_index_count('lion_kt_v_t', 'v3'::bpchar);
 SELECT lion_index_count('lion_kt_v_k', 'v3'::varchar);
+-- and a binary coercion only where `col = key` makes it.  text is binary-
+-- coercible to bpchar, but `c = 'x '::text` resolves to `text = text` with
+-- the COLUMN cast by rtrim1(), and matches none of the rows bpchar's own
+-- equality, which ignores trailing blanks, would count; `k = 3::oid` is
+-- `oid = oid` on the column.  varchar does reach bpchar's `=`, and regproc
+-- oid's.
+SELECT lion_index_count('lion_kt_v_k', 3::oid);
+CREATE TABLE lion_kt_c (c char(4), o oid);
+INSERT INTO lion_kt_c
+SELECT CASE WHEN g % 2 = 0 THEN 'x' ELSE 'y' END, (g % 5)::oid FROM generate_series(1, 100) g;
+CREATE INDEX lion_kt_c_c ON lion_kt_c USING lion (c);
+CREATE INDEX lion_kt_c_o ON lion_kt_c USING lion (o);
+VACUUM ANALYZE lion_kt_c;
+SELECT count(*) FROM lion_kt_c WHERE c = 'x '::text;
+SELECT lion_index_count('lion_kt_c_c', 'x '::text);
+SELECT lion_ktc($$lion_index_count('lion_kt_c_c', 'x '::varchar)$$,
+				$$FROM lion_kt_c WHERE c = 'x '::varchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_c_c', 'x'::bpchar)$$,
+				$$FROM lion_kt_c WHERE c = 'x'::bpchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_c_o', 3::oid::regproc)$$,
+				$$FROM lion_kt_c WHERE o = 3::oid::regproc$$);
 
-DROP TABLE lion_kt_e, lion_kt_v;
+DROP TABLE lion_kt_e, lion_kt_v, lion_kt_c;
 DROP DOMAIN lion_kt_moodd, lion_kt_posint, lion_kt_big8;
 DROP TYPE lion_kt_mood, lion_kt_big, lion_kt_other;
 DROP FUNCTION lion_kt(text, text);

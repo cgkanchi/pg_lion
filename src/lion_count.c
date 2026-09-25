@@ -72,6 +72,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_oper.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
@@ -5712,11 +5713,12 @@ lion_count_no_relation(Oid relid)
  *	  member for with it (int8 on an int4 column: int48eq, exactly as in the
  *	  query), which lion_probe_init() resolves further;
  *	- or, lacking such a member, a BINARY coercion to the class's type -
- *	  varchar to text - which is what the parser does with `col = key` too:
+ *	  varchar to text - where the parser makes it with `col = key` too:
  *	  there is no `text = varchar`, so it relabels the key and calls the
  *	  class's own `text = text`.  The bytes are the same, so the key is then
  *	  simply one of the column's own values.  A cast FUNCTION is not taken,
- *	  for §21's reason (implicit does not mean lossless).
+ *	  for §21's reason (implicit does not mean lossless), and neither is a
+ *	  coercion the parser would not make (bpchar and text, below).
  *
  * This is the whole of the key type check: until 2026-09-25 it compared the
  * key with rd_opcintype exactly, so enum_ops, a DEFAULT class, could never be
@@ -5738,11 +5740,33 @@ lion_count_key_type(Relation index, AttrNumber col, Oid keytype)
 	}
 	else
 	{
+		Oid			eqopr;
+		Oid			lefttype;
+		Oid			righttype;
+
 		if (basetype == opcintype ||
 			OidIsValid(get_opfamily_member(opfamily, opcintype, basetype, 1)))
 			return basetype;
-		if (IsBinaryCoercible(basetype, opcintype))
-			return opcintype;
+
+		/*
+		 * The binary coercion only where `col = key` makes it: the operator
+		 * the parser picks for (the column's type, the key's type) has to be
+		 * the class's own (opcintype, opcintype), reached without a cast
+		 * function (compatible_oper()).  That a coercion EXISTS is not
+		 * enough.  text is binary-coercible to bpchar, but `bpcharcol =
+		 * 'x '::text` resolves to `text = text` - text is the preferred type
+		 * of its category - and casts the COLUMN with rtrim1(), so it matches
+		 * no row that bpchar's own equality, which ignores trailing blanks,
+		 * would count.
+		 */
+		eqopr = compatible_oper_opid(list_make1(makeString(pstrdup("="))),
+									 state->typid, basetype, true);
+		if (OidIsValid(eqopr))
+		{
+			op_input_types(eqopr, &lefttype, &righttype);
+			if (lefttype == opcintype && righttype == opcintype)
+				return opcintype;
+		}
 	}
 
 	ereport(ERROR,
