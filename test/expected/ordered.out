@@ -1109,6 +1109,64 @@ SELECT lion_ord('SELECT o.v, x.id FROM (VALUES (1), (190)) o(v),
 (1 row)
 
 DROP TABLE lcor;
+-- 16. A range over many distinct values (DESIGN.md §30.4, "The set is
+--     built"): a WALK source hands out a container key once per ENTRY, and
+--     the pieces are merged as they come.  Merged only at the end, 15,000
+--     one-TID pieces degraded a set of 2 containers at a 64 kB hash_mem, and
+--     their directory, one entry per piece, outlived the build: 197 kB of the
+--     set's memory context while the cursor below was paused (2026-09-25
+--     second review).
+CREATE TABLE lwalk (id int PRIMARY KEY, u int, k int) WITH (autovacuum_enabled = off);
+INSERT INTO lwalk SELECT i, i, (i * 7919) % 20011 FROM generate_series(1, 20000) i;
+CREATE INDEX lwalk_k ON lwalk (k, id);
+CREATE INDEX lwalk_u ON lwalk USING lion (u);
+VACUUM ANALYZE lwalk;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT * FROM lion_ord_run('SELECT id FROM lwalk WHERE u BETWEEN 1 AND 15000 ORDER BY k, id LIMIT 5');
+              lion_ord_run              
+----------------------------------------
+ ->  Custom Scan (LionOrdered) on lwalk
+ Index Entries Walked: 5
+ Lion Set Hits: 5
+ Heap Fetches: 5
+ Lion Set: 2 containers, exact
+(5 rows)
+
+SELECT lion_ord('SELECT id, k FROM lwalk WHERE u BETWEEN 1 AND 15000 ORDER BY k, id LIMIT 5');
+      lion_ord       
+---------------------
+ LionOrdered, 5 rows
+(1 row)
+
+SELECT lion_ord('SELECT id, k FROM lwalk WHERE u BETWEEN 1 AND 20000 AND u % 3 = 0 ORDER BY k DESC, id DESC');
+        lion_ord        
+------------------------
+ LionOrdered, 6666 rows
+(1 row)
+
+BEGIN;
+SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+DECLARE lwalk_cur CURSOR FOR SELECT id FROM lwalk WHERE u BETWEEN 1 AND 20000 ORDER BY k, id;
+FETCH 2 FROM lwalk_cur;
+  id  
+------
+ 1031
+ 2062
+(2 rows)
+
+SELECT used_bytes <= 65536 AS within_hash_mem
+  FROM pg_backend_memory_contexts WHERE name = 'LionOrdered set';
+ within_hash_mem 
+-----------------
+ t
+(1 row)
+
+COMMIT;
+RESET hash_mem_multiplier;
+RESET work_mem;
+DROP TABLE lwalk;
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;
 REVOKE SELECT ON lo FROM lion_ord_user;

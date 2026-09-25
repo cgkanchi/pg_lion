@@ -150,6 +150,7 @@ typedef struct LionTidSet
 {
 	int			n;
 	int			cap;
+	int			nmerged;		/* entries the last lo_set_finish() left */
 	uint32	   *keys;
 	LionContainer **conts;
 	bool		sorted;			/* keys strictly ascending */
@@ -157,6 +158,12 @@ typedef struct LionTidSet
 
 /* Bytes of directory charged per container key, on top of the container. */
 #define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4))
+
+/*
+ * A directory of pieces (lo_set_push()) is merged when it is full only from
+ * this size on: below it the pieces cost less than the merges would.
+ */
+#define LO_MERGE_MIN		1024
 
 /* ---------------------------------------------------------------------
  * Executor state
@@ -983,27 +990,54 @@ lo_degrade(LionOrderedState *st)
 	st->exact = false;
 }
 
-/* Append (ckey, a copy of c, or nothing when degraded). */
+static void lo_set_finish(LionOrderedState *st, LionTidSet *set);
+
+/*
+ * Append (ckey, a copy of c, or nothing when degraded).
+ *
+ * A WALK or a LIST source hands out a container key once per ENTRY or per
+ * batch, not once (§29.3): a range over 400,000 distinct values brings
+ * 400,000 one-TID pieces for 34 container keys.  The first version merged the
+ * pieces only when the source was done, so every piece held a directory entry
+ * and a container copy until then - the set degraded although its merged
+ * form was a hundredth of hash_mem, and once degraded its directory went on
+ * growing one entry per piece, past any bound (52 MB at a 1 MB hash_mem for a
+ * range over 4M values; 2026-09-25 second review).  The pieces are merged
+ * whenever the directory is full - it doubles only if it is still more than
+ * half full after that - and before their bytes would degrade the set, once
+ * there are at least as many pieces as merged entries (each merge then pays
+ * for itself); only a set whose merged form does not fit degrades (§30.4).
+ */
 static void
 lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
 			const LionContainer *c)
 {
-	if (set->n > 0 && ckey <= set->keys[set->n - 1])
-		set->sorted = false;
+	Size		size = (c != NULL && !st->degraded) ? lion_container_size(c) : 0;
+
 	if (set->n == set->cap)
 	{
-		set->cap *= 2;
-		set->keys = (uint32 *) repalloc(set->keys, sizeof(uint32) * set->cap);
-		set->conts = (LionContainer **)
-			repalloc(set->conts, sizeof(LionContainer *) * set->cap);
+		if (!set->sorted && set->cap >= LO_MERGE_MIN)
+			lo_set_finish(st, set);
+		if (set->n > set->cap / 2)
+		{
+			set->cap *= 2;
+			set->keys = (uint32 *) repalloc(set->keys, sizeof(uint32) * set->cap);
+			set->conts = (LionContainer **)
+				repalloc(set->conts, sizeof(LionContainer *) * set->cap);
+		}
 	}
+	if (size > 0 && !set->sorted &&
+		st->bytes + LO_ENTRY_BYTES + size > st->limit &&
+		set->n - set->nmerged >= set->nmerged)
+		lo_set_finish(st, set);
+
+	if (set->n > 0 && ckey <= set->keys[set->n - 1])
+		set->sorted = false;
 	st->bytes += LO_ENTRY_BYTES;
 	set->keys[set->n] = ckey;
 	set->conts[set->n] = NULL;
 	if (c != NULL && !st->degraded)
 	{
-		Size		size = lion_container_size(c);
-
 		if (st->bytes + size > st->limit)
 			lo_degrade(st);
 		else
@@ -1033,7 +1067,12 @@ lo_cmp_slot(const void *a, const void *b, void *arg)
 
 /*
  * A WALK or LIST source's containers came entry by entry (§29.3): sort them
- * by key and OR the containers of equal keys into one.
+ * by key and OR the containers of equal keys into one - when the source is
+ * done, and whenever lo_set_push() finds the pieces piling up.  The pieces of
+ * one key are ORed into a bitset image and turned into a container once:
+ * ORing them pairwise cost a pass over the growing container per piece, 4.2 s
+ * for a range over 250,000 distinct values against 0.2 s for the lion bitmap
+ * scan of the same range (2026-09-25 second review).
  */
 static void
 lo_set_finish(LionOrderedState *st, LionTidSet *set)
@@ -1041,14 +1080,15 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	int		   *order;
 	uint32	   *keys;
 	LionContainer **conts;
-	LionContainer *acc;
-	LionContainer *tmp;
+	uint64	   *img;
+	LionContainer *out;
 	int			n = 0;
 	int			i;
 
 	if (set->sorted || set->n < 2)
 	{
 		set->sorted = true;
+		set->nmerged = set->n;
 		return;
 	}
 
@@ -1060,9 +1100,8 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	keys = (uint32 *) MemoryContextAlloc(st->setcxt, sizeof(uint32) * set->cap);
 	conts = (LionContainer **)
 		MemoryContextAlloc(st->setcxt, sizeof(LionContainer *) * set->cap);
-	acc = (LionContainer *) MemoryContextAlloc(st->buildcxt,
-											   LION_CONTAINER_MAX_SIZE);
-	tmp = (LionContainer *) MemoryContextAlloc(st->buildcxt,
+	img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
+	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 											   LION_CONTAINER_MAX_SIZE);
 
 	for (i = 0; i < set->n;)
@@ -1084,20 +1123,13 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 			int			m;
 			Size		size;
 
-			memcpy(acc, set->conts[order[i]],
-				   lion_container_size(set->conts[order[i]]));
-			for (m = i + 1; m < j; m++)
-			{
-				LionContainer *swap;
-
-				lion_container_or(acc, set->conts[order[m]], tmp);
-				swap = acc;
-				acc = tmp;
-				tmp = swap;
-			}
-			size = lion_container_size(acc);
+			memset(img, 0, LION_BITSET_BYTES);
+			for (m = i; m < j; m++)
+				lion_bits_or_container(img, set->conts[order[m]]);
+			lion_bits_to_container(img, key, out);
+			size = lion_container_size(out);
 			conts[n] = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
-			memcpy(conts[n], acc, size);
+			memcpy(conts[n], out, size);
 			st->bytes += size;
 		}
 		keys[n] = key;
@@ -1118,11 +1150,12 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	pfree(set->keys);
 	pfree(set->conts);
 	pfree(order);
-	pfree(acc);
-	pfree(tmp);
+	pfree(img);
+	pfree(out);
 	set->keys = keys;
 	set->conts = conts;
 	set->n = n;
+	set->nmerged = n;
 	set->sorted = true;
 
 	if (!st->degraded && st->bytes > st->limit)
