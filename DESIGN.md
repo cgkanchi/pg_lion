@@ -5985,3 +5985,29 @@ pg_buffercache shows the paused scan pinning no index page, so the VACUUM comple
 `gettuple_dirty_pin.spec` (injection point `lion-gettuple-batch`, 17+) parks an exclusion-
 constraint check with its batch loaded and shows VACUUM waiting for its pin, and a plain MVCC scan
 parked at the same point holding none while the same VACUUM completes.
+
+### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
+
+One million rows of the benchmark's scalar table (`bench/comprehensive/workloads.py`,
+`scalar_data`), twice: one copy with lion indexes on `c200`, `c20k` and `c1m`, one with btree
+indexes on the same columns, both vacuumed and warm. The queries are the benchmark's heap fetches
+(`sum(id), sum(length(payload))`, so neither index can skip the heap), count pushdown off; median
+of 21 runs (9 for `fetch_medium`) of `EXPLAIN (ANALYZE, TIMING OFF)`'s execution time, in ms.
+"default" is the plan with nothing disabled; the other columns force one path each.
+
+| query | work_mem | lion default | lion Index Scan | lion bitmap | btree Index Scan | btree default |
+|---|---|---|---|---|---|---|
+| `fetch_c1m` (`c1m = 12345`, 1 row) | 64MB | Index Scan | 0.023 | 0.025 | 0.021 | Index Scan 0.021 |
+| `fetch_rare` (`c20k = 123`, ~50 rows) | 64MB | bitmap 0.058 | 0.053 | 0.057 | 0.046 | bitmap 0.058 |
+| `fetch_medium` (`c200 = 17`, 5000 rows) | 64MB | bitmap 5.18 | 3.45 | 5.04 | 3.55 | bitmap 5.08 |
+| `fetch_c1m` | 64kB | Index Scan 0.023 | 0.023 | 0.025 | 0.021 | Index Scan 0.020 |
+| `fetch_rare` | 64kB | bitmap 0.058 | 0.052 | 0.058 | 0.046 | bitmap 0.059 |
+| `fetch_medium` | 64kB | Index Scan 3.62 | 3.44 | **19.3 (lossy)** | 3.40 | Index Scan 3.40 |
+
+The plain lion scan is within 10-15% of btree's on one and fifty rows and level with it on five
+thousand, and the planner makes the same choices for both indexes in every cell: the plain scan for
+one row, the bitmap at a normal `work_mem` (which for these warm, in-memory runs is the slower of
+the two for both AMs, so the choice is btree's cost model's, not lion's), and the plain scan at 64 kB,
+where the lion bitmap goes lossy and costs 5.6x. The count pushdown keeps every shape of the
+benchmark's scalar cases at 200k rows (checked by comparing each case's plan with plain index scans
+enabled and disabled: only the two heap-fetch cases above that a plain scan now serves changed).
