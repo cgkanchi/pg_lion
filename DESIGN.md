@@ -475,8 +475,10 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    Empty pages stay in the chain. Every page record also carries the updated entry (ncontainers/ntids),
    so a crash cannot desynchronise the counters. An entry whose ntids reaches 0 is DELETED, and its
    chain freed, in a final step for its bucket page (§18).
-3. Report stats: num_pages, num_index_tuples = Σ ntids, tuples_removed, and the pages this cycle
-   freed (pages_newly_deleted/pages_deleted/pages_free, §18).
+3. Report stats: num_pages, num_index_tuples = Σ ntids, tuples_removed, and the free pages (§18,
+   "Page counts"): pages_newly_deleted, the pages this VACUUM freed, ADDED UP over its
+   ambulkdelete calls; pages_deleted, the free pages the index holds at the end of the call; and
+   pages_free, those of them the next allocation could take already.
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
    counting pages; otherwise pass it through.
 
@@ -2521,16 +2523,32 @@ the loop from spinning on a block the map keeps offering).  heaprel comes from `
 and `info->heaprel` in VACUUM; a NULL heaprel means "never recycle", which is what ambuildempty
 wants.  ambuild never reuses.  amvacuumcleanup calls IndexFreeSpaceMapVacuum().  Leak recovery:
 ambulkdelete keeps a bitmap of the blocks it accounted for - the meta page, every bucket page it
-walked, every container page it reached from a live entry, minus the ones it freed - and sweeps the
+walked, every container page it reached from a live entry, and every page it freed - and sweeps the
 rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into the FSM, and an
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
-below).  In a healthy index nothing is unaccounted for, so the sweep reads no pages at all.  A
-page of a LIVE set is never mistaken for a leak, because pass 2 visits every page of every chain
-it found, and a chain created after pass 1 read its bucket page has no empty page in it (a spill
-and a split both fill every page they allocate inside the record that allocates it, under the
-lock they hold throughout) and names a root that is live.
-stats report deleted_pages; pages_newly_deleted/pages_deleted/pages_free are reported to VACUUM.
+below).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
+those and nothing else.  A page of a LIVE set is never mistaken for a leak, because pass 2 visits
+every page of every chain it found, and a chain created after pass 1 read its bucket page has no
+empty page in it (a spill and a split both fill every page they allocate inside the record that
+allocates it, under the lock they hold throughout) and names a root that is live.
+lion_index_stats() reports deleted_pages; VACUUM is told the counts below.
+
+**Page counts** (2026-09-25 review).  IndexBulkDeleteResult has three: `pages_newly_deleted`,
+the pages this VACUUM freed; `pages_deleted`, the free pages the index holds; and `pages_free`,
+those the next allocation could take already.  All three were wrong.  A page a whole-set free
+marked DELETED was counted there and then un-marked in the bitmap, so the sweep met it again as
+an unaccounted DELETED page and counted it a second time; `pages_free` was a copy of
+`pages_deleted`; and `pages_newly_deleted` was assigned, so a VACUUM that calls ambulkdelete more
+than once (dead TIDs past maintenance_work_mem) reported the last call's pages alone.  `VACUUM
+VERBOSE` said "30 newly deleted, 60 currently deleted, 60 reusable" of an index whose
+lion_index_stats() said 30.  Now a page is counted where it is marked, `pages_newly_deleted` is
+ADDED UP over the calls as nbtree does it, and the other two describe the index as the call leaves
+it - the sweep counts them afresh every time, the earlier calls' pages among them - with a page
+reusable when it is all-zero, or DELETED with its safexid behind every snapshot, which is exactly
+lion_alloc_page()'s test.  A page freed a moment ago is free and not yet reusable: "30 newly
+deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all still
+reports none of them, §5 step 4: counting them would mean reading every page of the index.)
 
 **The spill** (2026-09-25 review).  An INLINE posting set that outgrows its entry moves onto
 container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry by an order of

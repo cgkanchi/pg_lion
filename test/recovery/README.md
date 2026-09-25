@@ -146,6 +146,13 @@ the server there and checks what comes back. Two more (DESIGN.md §18, §25):
   no such server can replay - and a crash right after it must recover. The
   primary is restarted in its `--mode` afterwards.
 
+1b and 1e also read the page counts `VACUUM (VERBOSE)` reports for the index
+(DESIGN.md §18, "Page counts"), which no SQL function can see: the pages
+newly deleted must be exactly the ones the phase freed, and - since neither
+index holds a page an earlier VACUUM freed - the free pages that are not newly
+deleted must be exactly the reusable ones, all-zero pages: a page counted
+twice, or one freed a moment ago called reusable, breaks the equation.
+
 **Phase 2, hot standby.** `pg_basebackup -R -X stream` into a standby, then:
 
 * the full phase-1 check battery again, in recovery.
