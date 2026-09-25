@@ -803,6 +803,22 @@ lion_scankey_is_range(LionState *col, ScanKey skey)
 }
 
 /*
+ * ... and is it `col < ANY (array)` or a sibling: an array key with a range
+ * strategy on a scalar column, one walk to the widest element (below).  It
+ * ranks as a list in lion_scan_choose(), but it is a walk and not a set tree,
+ * so every caller that sorts columns into trees and walks asks this first.
+ * A NULL array (SK_ISNULL) is still one: it selects nothing.
+ */
+static bool
+lion_scankey_is_array_range(LionState *col, ScanKey skey)
+{
+	return !col->multikey &&
+		(skey->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
+						   SK_SEARCHARRAY)) == SK_SEARCHARRAY &&
+		LION_STRAT_IS_RANGE(skey->sk_strategy);
+}
+
+/*
  * Every `<`, `<=`, `>=` and `>` of the scan on one key column, as ONE bounded
  * walk of that column's entries (DESIGN.md §28): `BETWEEN a AND b` descends
  * to `a` once and stops past `b`, and needs no recheck of its own.
@@ -1473,10 +1489,18 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
  * sharing with its other arms.  Each private bitmap has work_mem of its own,
  * as each input of a BitmapAnd does, and goes lossy rather than growing past
  * it; tbm_intersect() and tbm_union() carry the recheck flags across.
+ *
+ * rangekeys[] names each range column by its chosen key: a plain range key,
+ * whose column's range keys are then walked together, or `col < ANY (array)`,
+ * one walk to the widest element.  The array form used to be handed to
+ * lion_emit_columns() with the set trees, which cannot express it, so it was
+ * dropped and left to the heap recheck while the cost model and the plain
+ * scan both took it as answered (2026-09-25 review: `a < ANY ('{-40,-45}')
+ * AND b = 3` rechecked away 212 rows the index could have excluded).
  */
 static int64
 lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
-				   int nkeys, LionState **rangecol, int nrange,
+				   int nkeys, ScanKey *rangekeys, int nrange,
 				   TIDBitmap *tbm)
 {
 	TIDBitmap  *acc = NULL;
@@ -1499,6 +1523,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	for (i = 0; i < nrange; i++)
 	{
 		TIDBitmap  *one;
+		LionState  *col;
 		int64		n;
 
 		/* One input selects nothing, so the intersection does not either. */
@@ -1506,7 +1531,13 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 			break;
 
 		one = tbm_create((Size) work_mem * 1024, NULL);
-		n = lion_emit_range(so, rangecol[i], one);
+		col = lion_column(so->ix, rangekeys[i]->sk_attno);
+		if ((rangekeys[i]->sk_flags & SK_SEARCHARRAY) == 0)
+			n = lion_emit_range(so, col, one);
+		else if ((rangekeys[i]->sk_flags & SK_ISNULL) == 0)
+			n = lion_emit_array_range(so, col, rangekeys[i], one);
+		else
+			n = 0;				/* `k < ANY (NULL)` is never true */
 		ntids = (ntids < 0) ? n : Min(ntids, n);
 		if (acc == NULL)
 			acc = one;
@@ -1649,13 +1680,14 @@ lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
 	 * can be expressed the answer falls through to the single-column path
 	 * below, which knows how to walk a whole column.  A RANGE column is not a
 	 * set tree at all - its answer is a union of however many entries the
-	 * range holds (DESIGN.md §28) - so it is answered into a bitmap of its
-	 * own and intersected with the others' (lion_emit_intersect()).
+	 * range holds (DESIGN.md §28), `col < ANY (array)` included - so it is
+	 * answered into a bitmap of its own and intersected with the others'
+	 * (lion_emit_intersect()).
 	 */
 	if (ch.nchosen > 1)
 	{
 		ScanKey		chosen[INDEX_MAX_KEYS];
-		LionState  *rangecol[INDEX_MAX_KEYS];
+		ScanKey		rangekeys[INDEX_MAX_KEYS];
 		int			n = 0;
 		int			nrange = 0;
 		int64		ntids;
@@ -1664,14 +1696,16 @@ lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
 		{
 			if (ch.best[i] == NULL)
 				continue;
-			if (ch.bestrank[i] == 2)
-				rangecol[nrange++] = lion_column(so->ix, (AttrNumber) (i + 1));
+			if (ch.bestrank[i] == 2 ||
+				lion_scankey_is_array_range(lion_column(so->ix, (AttrNumber) (i + 1)),
+											ch.best[i]))
+				rangekeys[nrange++] = ch.best[i];
 			else
 				chosen[n++] = ch.best[i];
 		}
 
 		if (nrange > 0)
-			return lion_emit_intersect(so, chosen, n, rangecol, nrange, tbm);
+			return lion_emit_intersect(so, chosen, n, rangekeys, nrange, tbm);
 
 		ntids = lion_emit_columns(so, chosen, n, tbm);
 		if (ntids >= 0)
