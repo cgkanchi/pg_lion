@@ -11,6 +11,7 @@ CREATE TABLE hk (k int, g int, v int);
 INSERT INTO hk SELECT i % 20, i % 4, i FROM generate_series(1, 20000) i;
 CREATE INDEX hk_k ON hk USING lion (k);
 CREATE INDEX hk_g ON hk USING lion (g);
+CREATE INDEX hk_v ON hk (v);
 CREATE TABLE hk_p (k int, v int) PARTITION BY RANGE (v);
 CREATE TABLE hk_p1 PARTITION OF hk_p FOR VALUES FROM (0) TO (10000);
 CREATE TABLE hk_p2 PARTITION OF hk_p FOR VALUES FROM (10000) TO (20000);

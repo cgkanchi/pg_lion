@@ -1,0 +1,61 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_plan s1_begin s2_begin s1_read s2_read s1_insert s2_insert s1_commit s2_commit
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id FROM os WHERE c = 1 ORDER BY k, id LIMIT 3;
+QUERY PLAN                           
+-------------------------------------
+Limit                                
+  ->  Custom Scan (LionOrdered) on os
+        Ordered By: os_k             
+        Lion Cond: (c = 1)           
+        Lion Indexes: os_c           
+(5 rows)
+
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT id, k FROM os WHERE c = 1 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+191|4
+491|5
+791|6
+(3 rows)
+
+step s2_read: SELECT id, k FROM os WHERE c = 2 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+ 82|7
+382|8
+682|9
+(3 rows)
+
+step s1_insert: INSERT INTO os VALUES (2001, -1, 2);
+step s2_insert: INSERT INTO os VALUES (2002, -2, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_read s2_read s1_insert s1_commit s2_insert s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT id, k FROM os WHERE c = 1 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+191|4
+491|5
+791|6
+(3 rows)
+
+step s2_read: SELECT id, k FROM os WHERE c = 2 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+ 82|7
+382|8
+682|9
+(3 rows)
+
+step s1_insert: INSERT INTO os VALUES (2001, -1, 2);
+step s1_commit: COMMIT;
+step s2_insert: INSERT INTO os VALUES (2002, -2, 1);
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s2_commit: COMMIT;

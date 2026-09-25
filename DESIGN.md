@@ -620,6 +620,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
     src/lion_vacuum.c         ambulkdelete/amvacuumcleanup                              (wave 2)
     src/lion_funcs.c          stats/verify (+ count in phase 2)                         (wave 2)
     src/lion_multikey.c       GIN-style extraction and query trees (§17)                (wave 3)
+    src/lion_ordered.c        LionOrdered: lion-filtered, btree-ordered scans (§30)
     pg_lion.control, pg_lion--0.1.sql, Makefile, test/                    (am-core, then wave 2)
 
 Coding conventions: PostgreSQL C style (tabs, K&R braces on their own line for functions, /* */
@@ -3951,8 +3952,8 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
   under an MVCC snapshot and keeps the batch's page pinned under any other (exclusion constraints
   become possible). Its follow-ups, in the order the user set on 2026-09-24:
   - a CustomScan that walks a BTREE on the ORDER BY column and tests each TID against lion's exact
-    WHERE set, stopping at LIMIT n (PG16+, DESC and multi-column order from the btree) - the next
-    piece; §29.8 says what of the scan's source it can use;
+    WHERE set, stopping at LIMIT n (PG16+, DESC and multi-column order from the btree): designed
+    in §30 (`LionOrdered`), which builds its set from the scan's source of §29.8;
   - ordered lion scans (`amcanorder`, 18+): deferred, §29.8 records what they would take;
   - index-only scans (`amcanreturn`, §29.9) and backward scans (§29.10).
 - **Range predicates on the scalar classes: see §28.** `<`, `<=`, `>=`, `>` and `BETWEEN` as a
@@ -3981,11 +3982,12 @@ shows the shortcut answering 100 where the family and the seqscan answer 0.
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 
 What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, lion_wal.c):
-`create_upper_paths_hook` and nothing else among the hooks - no `set_rel_pathlist_hook`, no
-planner, executor, ProcessUtility or object-access hook -; a custom WAL resource manager, only
+`create_upper_paths_hook` and, since §30, `set_rel_pathlist_hook`, chained the same way (the
+previous hook first), and nothing else among the hooks - no planner, executor, ProcessUtility or
+object-access hook -; a custom WAL resource manager, only
 while `shared_preload_libraries` is processed; its GUCs, with the `pg_lion` prefix reserved by
-`MarkGUCPrefixReserved()`. The hook saves the previous value and calls it FIRST, then adds its own
-path (`lion_create_upper_paths()`), so whichever extension was loaded before pg_lion has already
+`MarkGUCPrefixReserved()`. Each hook saves the previous value and calls it FIRST, then adds its own
+path (`lion_create_upper_paths()`, `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
 added its paths when pg_lion adds its own, and an extension loaded after pg_lion reaches pg_lion
 through its own chaining. Nothing is ever uninstalled: core has not unloaded a library since
 PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
@@ -4006,7 +4008,10 @@ Against the dev cluster, restarted with the options on pg_ctl's command line:
 - in each of those four, the other hook runs on every query, sees pg_lion's path exactly when it
   was installed after pg_lion (6 times per test file, or 0), LionCount is in the plan for a plain
   count, a GROUP BY and a partitioned GROUP BY, the answers equal those with the pushdown off,
-  and `SET pg_lion.<anything else>` and `SET lion_hooktest.<anything else>` are errors;
+  and `SET pg_lion.<anything else>` and `SET lion_hooktest.<anything else>` are errors; since
+  §30 the module chains `set_rel_pathlist_hook` as well, and its hook finds the LionOrdered path
+  in the base rel exactly when pg_lion's was installed first (twice per test file, or 0), with the
+  ordered answer equal to the one with `pg_lion.enable_ordered_scan` off;
 - both preloaded on id 128: the postmaster refuses to start with core's `failed to register
   custom resource manager "lion_hooktest" with ID 128` / `Custom resource manager "pg_lion"
   already registered with the same ID` - the collision the `pg_lion.rmgr_id` GUC exists to move
@@ -5670,7 +5675,7 @@ answer is delivered: into a TIDBitmap, or as a stream the executor pulls one TID
 ### 29.3 The TID source (`LionSource`, lion_scan.c)
 
 A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgettuple` call after
-`amrescan`. It has one of four shapes:
+`amrescan`. It has one of five shapes:
 
 - **NONE**: a chosen qual selects nothing (`col = NULL`, an empty or all-NULL list, a key absent
   from the index, a multi-key query in mode NONE). `amgettuple` returns false at once.
@@ -5695,13 +5700,41 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   the column orders the elements; an UNORDERED column walks ONCE, testing each entry against every
   element's range (the bitmap path walks once per element and lets the bitmap absorb the overlap,
   which a stream cannot).
-- **BITMAP**: a MULTI-KEY column would have to be walked - `IS NOT NULL`, a query in mode ALL
+- **LIST**: an IN list on a scalar column longer than a batch (§29.4) is located and streamed a
+  batch at a time, each batch the SETS shape with the other columns' trees ANDed in. It outranks a
+  walk, which is then left to the recheck, and a second long list is left to the recheck too.
+- **UNION**: a MULTI-KEY column would have to be read whole - `IS NOT NULL`, a query in mode ALL
   (§17) with nothing else expressible, or a no-key scan whose first column is multi-key. A row is
   under several entries of such a column, so walking them would return it several times. The
-  scan then runs `liongetbitmap()` into a private TIDBitmap (`work_mem`, lossy past it, like any
-  bitmap) and iterates it; a lossy page returns every offset up to `MaxHeapTuplesPerPage` with
-  recheck set, and the heap fetch finds nothing at the ones that hold no tuple. Always rechecked.
-  Correct and expensive, which is what the cost model already says about these quals.
+  scan streams the exact UNION of the column's entries instead, a WINDOW of container keys at a
+  time: every entry is sought to the window's first key and read to its end, and ORed into one
+  bitset image per container key of the window; the next window starts at the smallest key any
+  entry had past this one. Each window walks the column's entries once, so the work is windows x
+  entries, and the window is therefore WIDE whatever `work_mem` says: `lion_union_window()` =
+  `max(1024, work_mem / 4 kB)` container keys (1024 are 65536 heap blocks, 512 MB of heap), up to
+  65536, and a key's 4 kB image is made only when an entry has a container there, so a window
+  costs what it holds - at most 4 MB at the floor, which is the one place this scan may exceed a
+  tiny `work_mem`. Always rechecked (the quals of mode ALL need it). Correct and expensive, which
+  is what the cost model already says about these quals; `lioncostestimate()` also charges each
+  window past the first another read of the index (the IndexPath is shared with the bitmap scan,
+  which is overcharged by that, only on a heap past 512 MB).
+  *(Deviation from the version before it, whose window was `max(16, work_mem / 4 kB)` keys: at
+  64 kB that is 1024 heap blocks, and a 2M-row table with 200k distinct keys took 17 windows and
+  1.40 s for an index-only count(*) against 0.48 s at 64 MB - and the planner picked that scan at
+  64 kB; 100M rows would have meant some 1600 walks of every entry (re-review, 2026-09-24).
+  Keeping every entry's cursor across windows instead would have made the memory grow with the
+  number of distinct keys, and identifying an entry across windows, while inserts and VACUUM change
+  the directory between two calls, needs its key - both worse than a wider window.
+  `test/sql/indexscan.sql` §10 counts the index blocks one count reads at 64 kB and at 64 MB: the
+  same, where they were five times as many at 64 kB.)*
+  *(Deviation from this section's first version, which ran `liongetbitmap()` into a private
+  TIDBitmap and, on a LOSSY page, returned every offset up to `MaxHeapTuplesPerPage` "with recheck
+  set". That is right for a bitmap heap scan, which re-applies the index PREDICATE to a lossy
+  page (bitmapqualorig), and wrong for a plain Index Scan, whose recheck quals are the index quals
+  minus what the predicate implies, and for an index-only scan, which rechecks nothing: on a
+  partial `(tags) WHERE flag` index at 64 kB of work_mem, `count(*) WHERE flag` answered 175,076
+  for 100,000 and a plain scan returned 140,216 rows with `flag` false - the 2026-09-24 review.
+  The rule that fixes it is §29.6's first one: no shape returns a TID the index does not hold.)*
 
 Scalar entries of one column are disjoint (one entry per equality class, §21), so a WALK never
 returns a TID twice either, and neither does SETS, whose OR node merges by container key.
@@ -5719,14 +5752,36 @@ points into the walk's private copy of the leaf, a CHAIN entry's `head` is its p
 
 ### 29.4 Batches and memory
 
+**Every located set costs its cursor, and an IN list is located whole** - which the first version
+of this section missed: a located set with the cursor that reads it takes ~20 kB (the cursor's
+4 kB staging container, its share of the OR node, the set), so a 20,000-value list held 220 MB and
+`c1m = any(array(select ... 300000 ...)) LIMIT 10`, planned as a plain Index Scan, peaked at
+1.37 GB to return ten rows (2026-09-24 review). The bitmap path never had it: `lion_emit_array()`
+looks its values up one at a time. So a list longer than a BATCH - `max(32, work_mem / 32 kB)`
+values, which keeps a batch's cursors inside `work_mem` - is the LIST shape: its values are sorted
+once into lookup order (`lion_probe_sort()`: the probe's comparison, then the hash), and located
+and streamed a batch at a time, the previous batch's sets and pins gone before the next is located
+(the §11 order). A batch is cut only where the HASH changes, and every value of one equality class
+compares equal and hashes alike, so the class's values sit next to each other and never straddle
+two batches: no entry is located twice, and since distinct entries of a scalar column are
+disjoint, no TID is returned twice - citext's `'Alice'` and `'alice'` included. What stays is the
+list itself, sorted: 12 bytes per value next to the executor's own array. The heap is visited in
+physical order within a batch and restarts per batch, which is what a btree scan of the same list
+does per value. No new cost term: with batches the plain scan's work is linear in the list, like
+the bitmap's, and a list that is a Param - the reviewed case - has no length the planner could
+price anyway. Not covered: a multi-key column's `op ANY (array of queries)` still extracts every
+query up front (per query, not per row; arrays of queries are rare), and the BITMAP path's
+multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as it always has.
+
 `amgettuple` returns TIDs out of a BATCH: the members of the container the stream is standing on,
-expanded into an array of at most `LION_CONTAINER_RANGE` TIDs (`lion_container_to_tids()`, the
-same per-heap-block order `lion_container_to_tbm()` emits). The next container is pulled only when
-the batch is used up. What the scan holds between two calls is therefore bounded by the query and
-never by the data: one container's TIDs; one 8 KB image per posting-set cursor of the tree (the
-page its current container came from - an IN list of k CHAIN keys holds k of them, exactly as the
-bitmap path's merge does); the INLINE payload copies of the located sets (at most an entry each,
-`LION_MAX_ENTRY_SIZE`); and for a WALK one directory leaf image. A posting set of any size is
+expanded into an array of at most `LION_CONTAINER_RANGE` lo values (`lion_container_to_array()`,
+turned into a TID one at a time, in the per-heap-block order `lion_container_to_tbm()` emits). The
+next container is pulled only when the batch is used up. What the scan holds between two calls is
+therefore bounded by `work_mem` (save a UNION window's floor) and the query, never by the data: one container's members; one
+8 KB image per posting-set cursor of the tree (the page its current container came from), for at
+most a batch of an IN list's sets (above); the INLINE payload copies of those sets (at most an
+entry each, `LION_MAX_ENTRY_SIZE`); for a WALK one directory leaf image; for a UNION the bitset images
+of its window (made on first use; up to 4 MB at the floor, §29.3); and a long list's values, sorted. A posting set of any size is
 STREAMED container by container - a 5M-row entry is never materialized - and a walk of any width
 holds one entry's stream at a time. Memory lives in a per-scan context reset by `amrescan`, and a
 walk's per-entry cursors in a per-entry context reset before the next entry, so a nested-loop inner
@@ -5818,8 +5873,8 @@ key keeps its own - the same rules §9 states for the count (`lion_source_pinned
   that has one sets `xs_recheck`, which filters a recycled slot whose new tuple does not match;
   the one residual effect - the same matching row twice through two stale entries - needs a
   thousand-leaf IN list under a dirty snapshot, which no caller in core builds (below).
-- The BITMAP shape (§29.3) holds no pins in either mode and is always rechecked; a TIDBitmap is a
-  set, so it cannot return a TID twice. A multi-key query's sets are located unpinned in either
+- The UNION shape (§29.3) holds no pins in either mode (its windows copy containers out of many
+  pages) and is always rechecked; a union cannot return a TID twice. A multi-key query's sets are located unpinned in either
   mode too (the tree builder the bitmap path shares drops their pins), and a multi-key scan is
   always rechecked (§29.6); `EXCLUDE USING lion (tags WITH &&)` is such a scan, and a conflict it
   reports through a recycled slot is a row that really overlaps.
@@ -5854,7 +5909,18 @@ Who scans a lion index with a non-MVCC snapshot, and the decision for each:
 
 ### 29.6 `xs_recheck`
 
-Set, for every TID of the scan, when any of these holds; otherwise the TIDs are exact:
+**First, the rule every shape keeps: no TID the index does not hold is ever returned** - only TIDs
+that some entry's posting set held when the scan read it, each at most once. `xs_recheck` is a
+statement about the QUALS the index was asked to answer, and it is not a license to return a
+superset of the index: a plain Index Scan of a partial index has the quals its predicate implies
+removed from its recheck, and an index-only scan evaluates no recheck qual at all (the planner only
+builds one for a query that references no column, so there is none to evaluate). A row that the
+index does not hold therefore comes back as a row. A TIDBitmap's lossy page is the one superset
+source lion ever had, and the UNION shape (§29.3) replaced it; every other source is a stream of
+posting-set containers.
+
+Then `xs_recheck` is set, for every TID of the scan, when any of these holds; otherwise the TIDs
+are exact:
 
 - a qual was not answered: a second qual on a column (§29.2's ranking), a second WALK column, a
   multi-key column in mode ALL next to another column that does answer (dropped, as in the bitmap
@@ -5863,7 +5929,7 @@ Set, for every TID of the scan, when any of these holds; otherwise the TIDs are 
   mode KEYS through unrechecked because `lion_extract_query()` classifies it as exact; the plain
   path is chosen for selective lookups, where one operator call per fetched row costs nothing next
   to the fetch, and it does not have to rest on that classification;
-- the BITMAP shape (§29.3), always;
+- the UNION shape (§29.3), always;
 - a non-MVCC scan with a NOPIN set (§29.5).
 
 A range is exact (the walk applies every bound of the column), an IN list is exact (a union of
@@ -5918,7 +5984,9 @@ WALK source (a range) streams entry by entry, so its union has to be accumulated
 container keys ORed as §15 does) before it can be probed. `lion_source_exact()` says whether the
 set is exact (§29.6). The entry points are `lion_source_open()`, `lion_source_next()` and
 `lion_source_close()` in lion_scan.c, declared in lion_count.h; they take an index, scan keys and
-the `keeppins` switch of §29.5, and no IndexScanDesc.
+the `keeppins` switch of §29.5, and no IndexScanDesc. §30 is that node (`LionOrdered`): it copies
+the containers of one source per lion leaf of core's bitmap qual tree into a sorted array, sorts
+and merges a WALK's or a LIST's once they are complete, and ANDs and ORs the leaves' sets.
 
 ### 29.9 Index-only scans (step 3), for later - and the one kind that exists already
 
@@ -5937,11 +6005,12 @@ none; `amoptionalkey` lets the planner scan a lion index with no key at all, and
   the posting leaf of each container pinned until the next batch - the §9 interlock, which is
   what makes the executor's visibility-map test of each returned TID safe, exactly as for the
   count;
-- the BITMAP shape (a multi-key first column) was built without pins and names every offset of a
-  lossy page, so each of its TIDs is looked up in the heap under the scan's snapshot first
-  (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays visible to that
-  snapshot, so nothing can take it away before the executor's own test. Slow and exact; the
-  count pushdown answers the common shapes instead anyway.
+- the UNION shape (a multi-key first column) returns only TIDs the index holds (§29.6) but pins
+  none of the pages they came from, so each of them is looked up in the heap under the scan's
+  snapshot first (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays
+  visible to that snapshot, so nothing can take it away before the executor's own test. A visible
+  tuple at a TID the index holds is a row of the index: a HOT chain cannot change a column the
+  predicate reads. Slow and exact; the count pushdown answers the common shapes instead anyway.
 
 What a real `amcanreturn` would need from this scan:
 
@@ -5985,7 +6054,19 @@ btree's: one row goes to the plain scan (no bitmap to build, no bitmap heap over
 thousand scattered rows go to the bitmap at a normal `work_mem` (sorted page visits), and at a
 `work_mem` so low that the bitmap is priced lossy - every tuple of every lossy page rechecked,
 compute_bitmap_pages() - the plain scan wins again. The count pushdown competes at the upper rel
-with its own cost (§10) and is unaffected; the regression suite pins its choices.
+with its own cost (§10); the regression suite pins its choices.
+
+**The count's recheck is priced the same way** (2026-09-24 review). With a correlation, a plain
+scan of a clustered value is cheap: 5000 rows of one value on 32 heap pages. The count pushdown
+charged its heap recheck one page per candidate TID up to the dirty part of the heap, so when the
+visibility map pg_class remembers had gone stale - `relallvisible` is only refreshed by VACUUM,
+while updates, and on 19+ on-access pruning, change the map - it priced the same count at 5036
+against the scan's 3252 and lost, running 2.4-2.8x slower (0.6 ms against 0.24). The recheck
+visits each page holding a candidate once, in block order, so for a count whose WHERE is one
+plain equality the pages are now what cost_index() would say they are: one per row when the values
+are scattered, the rows' share of the heap when they are stored in order, interpolated by the
+correlation's square (`lion_cost_count_rel()`, `lion_single_eq_var()`). Only ever lower, and only
+for that shape; a range already had the rule (§28), and other WHERE shapes keep the old bound.
 
 ### 29.12 Tests
 
@@ -5997,7 +6078,11 @@ and `IS NOT NULL`, multicolumn ANDs, arrays and tsvector with recheck, cross-typ
 collation mismatch declined; nested-loop inner scans with rescans; cursors (FETCH forward, SCROLL
 over a Material, NO SCROLL refusing backward); a dirty heap after updates and deletes, then VACUUM;
 a posting set far larger than one batch with its memory flat; an exclusion constraint; the count
-pushdown still chosen for its shapes; index-only scans of no-column queries (a column's walk, a
+pushdown still chosen for its shapes, a clustered value under a stale visibility map included; a
+partial multi-key index read whole at 64 kB of work_mem, by a plain scan and by index-only scans
+with nothing disabled, clean and dirty (the review's repros: rows the index does not hold came
+back); a 20,000-value Param list read through a cursor within work_mem, and long lists with
+duplicates, NULLs, citext spellings, a range and another column beside them, at 32 values a batch; index-only scans of no-column queries (a column's walk, a
 partial index, a multi-key column's bitmap), clean and dirty. Existing tests whose helpers exist to
 exercise the BITMAP path, or to force the count pushdown by disabling every other scan, now disable
 plain index scans as well; the plan pins that changed are one-row multi-key lookups, which are now
@@ -6036,3 +6121,345 @@ the two for both AMs, so the choice is btree's cost model's, not lion's), and th
 where the lion bitmap goes lossy and costs 5.6x. The count pushdown keeps every shape of the
 benchmark's scalar cases at 200k rows (checked by comparing each case's plan with plain index scans
 enabled and disabled: only the two heap-fetch cases above that a plain scan now serves changed).
+
+## 30. Lion-filtered, btree-ordered scans (`LionOrdered`, lion_ordered.c)
+
+The shape is
+
+    SELECT ... FROM t WHERE <clauses a lion index answers> [AND <anything else>]
+    ORDER BY <columns an ordered index on t provides> [LIMIT n [OFFSET m]]
+
+and the two plans core can make for it, when the WHERE is selective and the ORDER BY is not on the
+lion-indexed columns, are each wrong in their own way:
+
+1. walk the ordered index (a btree on the ORDER BY column), fetch EVERY heap row it names and
+   filter it - with a 0.25% filter, 400 heap fetches per row returned;
+2. a lion bitmap heap scan and a top-N Sort - which fetches every matching row, 2,500 of them per
+   million, to return ten.
+
+Core cannot filter with one index and order with another. `LionOrdered` does: it builds lion's
+EXACT answer to the WHERE clauses lion can answer, once, as a set of TIDs in memory; walks the
+btree in order reading only index tuples; tests each TID for membership BEFORE it touches the
+heap; and fetches, rechecks and returns only the members, until the LIMIT above stops pulling. Its
+cost is the lion lookups, the btree entries walked (index pages only) and one heap fetch per row
+returned (plus the members the rest of the WHERE rejects). Because the order comes from the btree,
+the node works on every supported major (16 .. 20), and DESC, multi-column ORDER BY, NULLS
+FIRST/LAST, expression indexes and the btree's own index quals come with it for free. This
+replaces native ordered lion scans (§29.8, `amcanorder` on 18+), which stay deferred.
+
+### 30.1 What qualifies
+
+- **The relation.** A plain base relation (`RELOPT_BASEREL`, `RTE_RELATION`, relkind table or
+  materialized view, not an inheritance parent, no TABLESAMPLE) of the heap table AM
+  (`lion_table_am_supported()`, §2), with at least one lion index and one ordered index. Declined:
+  a relation with security quals - RLS policies or a security-barrier view, i.e. an RTE with
+  `securityQuals` or any restriction clause with `security_level > 0` - exactly as LionCount
+  declines them (§9, "Row-level security"): the ordinary plan applies them with core's
+  leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so are
+  partitioned tables and their partitions, in v1 (§30.8).
+- **The WHERE.** The relation's restriction clauses, an implicit AND. Some of them are answered by
+  lion indexes and the rest stay a heap-side filter. WHICH of them lion answers, and how, is not
+  decided here but by core's own index matching: every shape the bitmap path supports - `=`, IN /
+  `= ANY`, the ranges of §28, `IS [NOT] NULL`, multicolumn indexes (§24), arrays and tsvector
+  (§17), a partial index whose predicate the query implies, an OR across lion-indexed columns (a
+  BitmapOr), several indexes ANDed (a BitmapAnd), Params wherever a Const may stand - is accepted,
+  because the node's lion side IS a bitmap path's `bitmapqual` tree (§30.2).
+- **The ORDER BY.** Any pathkeys an ordered index scan of the relation provides: core's own
+  ordered `IndexPath`s, taken from the relation's path list, so that btree ordering (direction,
+  NULLS placement, multi-column prefixes, expression indexes, opclass orderings, the btree's own
+  index quals) is never re-implemented. An index scanned with ORDER BY operators (KNN) is not an
+  ordered path in this sense and is skipped, and a lion index has no order (§29.1). In core this
+  means a btree.
+- **LIMIT** is optional: the node is priced like any path, with a start-up and a total cost
+  (§30.3), and core's LIMIT and sort planning choose. Without a LIMIT it can still beat a Sort for a
+  selective result, and loses for a large one; the cost decides.
+
+### 30.2 Planner integration
+
+`set_rel_pathlist_hook`, chained to any previous hook and calling it FIRST, as the upper-paths
+hook does (§23, "hook coexistence"). GUC `pg_lion.enable_ordered_scan` (bool, default on). For a
+qualifying relation the hook runs after core has built the relation's paths, and:
+
+1. **The ordered side.** Every unparameterized `IndexPath` in `rel->pathlist` - an Index Scan or
+   an Index Only Scan path: the node visits the heap anyway, so the same index serves - with
+   non-NIL pathkeys, no ORDER BY operators, an index AM with `amgettuple` that is not lion, and no
+   `RowCompareExpr` among its index clauses (v1). Core builds these exactly when the pathkeys are
+   useful to the query (its ORDER BY, or a merge join), and keeps each unless a cheaper path with
+   the same order exists.
+2. **The lion side, found by core.** `create_index_paths()` is run once more, on a SCRATCH copy of
+   the RelOptInfo whose `indexlist` holds only the lion indexes, whose path lists start empty, and
+   with its join clauses, eclass joins and parallelism switched off - so that only
+   unparameterized, non-partial paths are built and the real rel is left untouched. What it
+   builds - bitmap heap paths, whose `bitmapqual` is a lion IndexPath or a BitmapAnd/BitmapOr tree
+   over lion IndexPaths, and plain lion index paths, each a one-leaf `bitmapqual` - are the
+   candidate lion accesses. Only core's matching decides what a lion index can answer (operator
+   families, collations, partial-index predicates, OR arms), so the node accepts exactly what a
+   lion bitmap scan would.
+3. **One CustomPath per (ordered path, lion access)** pair, each offered to `add_path()`, which
+   keeps whichever of them is not dominated in start-up or total cost at those pathkeys. The path
+   carries the ordered path's `pathkeys`, `rows = rel->rows`, `param_info = NULL`,
+   `pathtarget = rel->reltarget`, `parallel_safe = false` and
+   `flags = CUSTOMPATH_SUPPORT_PROJECTION`: no backward scan (a SCROLL cursor gets a Material),
+   no mark/restore (a merge join restores through a Material).
+4. **Which clauses the node still evaluates** is decided the way `create_bitmap_scan_plan()`
+   decides it. The lion side's ORIGINAL qual, `lionqual`: the clauses of the leaves' index
+   clauses, plus each partial index's predicate where they do not imply it, ANDed across a
+   BitmapAnd and ORed across a BitmapOr - `create_bitmap_subplan()`'s `qual`. A restriction clause
+   leaves the heap filter when it is (by pointer) one of the ordered path's non-lossy index
+   clauses or one of the lion leaves' index clauses, or when `predicate_implied_by()` the
+   `lionqual`; the rest is the plan's `qual`, the filter core's `ExecScan()` applies. Pseudo-
+   constant clauses are core's gating Result's.
+
+The plan carries in `custom_exprs` - where setrefs.c fixes their Vars and Params, and where
+`SS_finalize_plan()` finds the Param ids that make the executor rescan the node - the lion leaves'
+index quals (key on the left, as `IndexClause.indexquals` gives them), the ordered index's index
+quals, the `lionqual` and the ordered index's original clauses; and in a positional
+`custom_private` behind a shape marker (§10) the ordered index, its scan direction, the lion tree
+(AND / OR / leaf, preorder) with each leaf's index and index columns, and whether a lion index
+clause was lossy. The executor substitutes an `INDEX_VAR` Var for each index qual's key operand,
+as `fix_indexqual_references()` would, and builds the scan keys with core's
+`ExecIndexBuildScanKeys()`, so a Param becomes a run-time key exactly as in an Index Scan.
+
+No overlap with LionCount (§10) or the FK join (§27): those replace an aggregate at the upper rel;
+this is a scan path of the base rel.
+
+### 30.3 Cost
+
+With `T = rel->tuples`, the lion access's selectivity `s` and index cost `C_lion` (core's
+`cost_bitmap_tree_node()`: the leaves' `indextotalcost`s and the BitmapAnd/Or overhead), and the
+ordered path's selectivity `s_o` (the fraction of the index its own quals leave) and index cost
+`C_ord` (its `indextotalcost`: the whole walk, index pages and index tuples):
+
+- **start-up** = `C_lion` + copying the answer into the set, `containers x cpu_operator_cost`,
+  with `containers = min(heap pages / LION_BLOCKS_PER_CONTAINER, s T)`;
+- **the walk** = `C_ord` + `s_o T` membership tests at `cpu_operator_cost` each;
+- **the heap** = `F = s_o T s` members fetched, priced as `cost_index()` prices heap fetches:
+  `index_pages_fetched()` at `random_page_cost` for an uncorrelated order, the members' share of
+  the heap for a correlated one, interpolated by the square of the ordered index's correlation
+  (asked of its own `amcostestimate`); plus `cpu_tuple_cost` and the filter's per-tuple cost for
+  each of the `F`, and the target's cost per output row;
+- **total** = start-up + walk + heap; rows = `rel->rows`.
+
+Core's LIMIT planning scales a path's run cost by the fraction of its rows the LIMIT takes
+(`adjust_limit_rows_costs()`), which is exactly how the node behaves: the walk and the fetches stop
+when the LIMIT stops pulling, and the set is built in full before the first row. So `LIMIT 10` of a
+0.25% filter pays the lion lookups, 4,000 btree entries and 10 heap fetches, where core's ordered
+walk pays 4,000 heap fetches and bitmap + Sort all 2,500 matches of a million rows. For an
+UNSELECTIVE filter (`c2 = 1`, half the rows) the ordered walk needs 20 entries for 10 rows and no
+start-up at all, while the node first reads half a million TIDs out of lion: core wins, and the
+model says so. Without a LIMIT and with a large result the node walks the whole btree and fetches
+the rows in index order, i.e. randomly, while the bitmap scan fetches them in heap order and a
+Sort is cheaper: the model says that too.
+
+**Memory ceiling.** The set is the answer's containers (§3): at most 4 kB per 64 heap blocks and
+about 2 bytes per member for a sparse answer, plus 16 bytes of directory per container - some
+12 MB for half of 100M rows. It has to fit in `hash_mem` (`get_hash_memory_limit()`, `work_mem x
+hash_mem_multiplier`, what core allows one node's in-memory hash table), and the planner does not
+offer a path whose estimate exceeds it. The estimate can be wrong, so the executor DEGRADES rather
+than overruns (§30.4).
+
+### 30.4 Execution
+
+- **BeginCustomScan** opens the ordered index and every lion index (AccessShareLock; the heap and
+  the plan's filter are core's `ExecInitCustomScan()`'s), checks the table AM again, builds the
+  scan keys (`ExecIndexBuildScanKeys()`; run-time keys get an ExprContext of their own, as an Index
+  Scan's do), and initialises two recheck quals with `ExecInitQual()`: the `lionqual` and the
+  ordered index's original clauses. The scan slot is a buffer heap tuple slot. A non-MVCC snapshot
+  is an internal error: every snapshot a SELECT's executor runs under is MVCC, and §30.5's
+  argument needs one. Under SERIALIZABLE it takes `PredicateLockRelation()` on every lion index
+  before any lookup (§9, "SERIALIZABLE": the AM has no `ampredlocks`, and the node reads it
+  without `index_beginscan()`).
+- **The set is built at the first fetch after a start or a rescan**, not in BeginCustomScan: an
+  exec Param is set by a nested loop after the node is initialised. Each lion leaf evaluates its
+  run-time keys, opens `lion_source_open(index, keys, nkeys, keeppins = false, cxt)` (§29.3,
+  §29.8; an MVCC reader holds no pin, §29.5), and copies every container it produces into a
+  `LionTidSet`: a sorted array of (container key, container copy), searched by binary search and
+  tested with `lion_container_contains()`. A SETS or UNION source arrives in ascending container
+  key (`lion_source_sorted()`); a WALK (a range) or a LIST (a long IN list) arrives entry by entry
+  or batch by batch and is sorted, with equal keys ORed, once it is complete. A BitmapAnd is the
+  container-wise AND of its children's sets, a BitmapOr their OR; a leaf that selects nothing is an
+  empty set. No lossy page exists anywhere in this: every member is a TID some entry held (§29.6).
+- **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
+  lion index clause was lossy and the set did not degrade. Then every member satisfies the
+  `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
+  `lionqual` (the multi-key strategies of §17, a second qual on one column, §29.6), and one that
+  fails counts as removed by the lion recheck.
+- **Degrading.** The set counts its bytes; when they would exceed `get_hash_memory_limit()` it
+  frees every container and keeps only their KEYS - "every TID of these 64 heap blocks may be a
+  member" -, marks itself inexact, and carries on that way. Memory is then 16 bytes per container
+  key, at most one per 64 heap blocks; the answer stays exact because every fetched member is now
+  rechecked; the node walks on as a slower filter.
+- **The walk.** `index_beginscan()` on the ordered index under the executor snapshot and
+  `index_rescan()` with its keys, in the path's direction. On 16 .. 19 each TID comes from
+  `index_getnext_tid()`, which reads only the index, and a member is fetched with
+  `index_fetch_heap()`, which follows the HOT chain under the snapshot and lets the btree mark
+  entries whose chains are dead to all, as an ordinary index scan does. PostgreSQL 20 moved the
+  heap side of index scans into the table AM (`table_index_getnext_slot()`; there is no
+  `index_getnext_tid()` or `index_fetch_heap()`), so there the node takes the TID from the index
+  AM through `tableam_index_getnext_tid()` and fetches a member with `table_fetch_tid()` (the HOT
+  chain under the snapshot, the TID moved to the version it sees) and
+  `table_tuple_fetch_row_version()`. A member with no visible version is skipped; a visible one is
+  rechecked when the set is inexact (above) or the index set `xs_recheck` (against the ordered
+  index's original clauses), then handed to `ExecScan()`, which applies the filter and projects.
+  A set with nothing in it ends the scan before the walk starts, and once as many members have
+  been found as the set holds (its cardinality, known unless it degraded) the walk stops early:
+  a btree returns each heap TID once, so nothing past that point can be a member. Without a LIMIT
+  that saves the rest of the index.
+- **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
+  substituted row against the `lionqual` and the ordered index's original clauses, as an Index
+  Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.
+- **Rescans.** `ReScanCustomScan` restarts the walk (its keys are evaluated again at the next
+  fetch) and rebuilds the set only when a Param of the lion quals changed (`chgParam` against
+  `pull_paramids()` of the lion quals, taken at BeginCustomScan). A LATERAL `ORDER BY ... LIMIT`
+  subquery whose lion filter takes the outer row's value rebuilds per outer row; one whose Param
+  is only in the btree's quals keeps its set. A rescan with no changed Param (a cursor rewound)
+  keeps it too: the snapshot is the same.
+- **EndCustomScan** ends the index scan, closes the indexes and frees the node's memory.
+
+### 30.5 Correctness and concurrency
+
+Let S be the executor snapshot (MVCC), taken before the node starts; the set M is built from the
+lion indexes at a time t1 after S was taken; the btree is walked afterwards. A row is returned iff
+its TID comes out of the btree walk, is in M, has a version visible to S at the fetch, and that
+version passes the rechecks and the filter. The claim is that these are exactly the rows the
+ordinary plan returns, in the same order.
+
+- **A row visible to S that satisfies the lion quals is in M.** Its inserting transaction committed
+  before S was taken (or is ours, at an earlier command id); an index entry is written before its
+  transaction commits, so lion held its TID before S and therefore at t1. Only VACUUM removes it,
+  and only once the row is dead to every snapshot, S included.
+- **HOT chains.** A HOT update changes no column of any index that is not summarizing
+  (`HeapDetermineColumnsInfo()` against the relation's HOT-blocking columns; lion sets
+  `amsummarizing = false`), so every version of a chain has the same lion-indexed values and the
+  same btree-indexed values. Both indexes hold only the ROOT TID of a chain: the btree returns the
+  root, M holds the root, and `index_fetch_heap()` / `table_fetch_tid()` find the version S sees
+  from it. An update of a lion-indexed column or of the btree column is never HOT - it inserts new
+  entries into both indexes under the new version's TID - so "the root is in M" means "the version
+  S sees satisfies the lion quals" (up to the recheck of an inexact set).
+- **A TID in M whose row S cannot see** - dead, deleted by a transaction committed before S, or
+  inserted by one S does not see, before or after t1 - is filtered by the heap visibility check,
+  the check every Index Scan relies on. Rows inserted after t1 are not in M, and they cannot be
+  visible to S (their transaction was running or not started when S was taken), so missing them is
+  right. Rows deleted after S was taken are still visible to S and still in the lion index (VACUUM
+  cannot remove them while S holds the horizon back), so they are in M and returned, as the
+  ordinary plan returns them.
+- **A recycled TID.** M is private memory and nothing pins the lion pages it came from (§29.5's
+  MVCC rule). If VACUUM removes a member's tuple after t1 and its slot is reused, the new tuple was
+  written after t1 by a transaction S cannot see: the fetch finds nothing visible. The btree side is
+  an ordinary index scan under core's own interlock (nbtree's MVCC `dropPin` rule).
+- **Order.** Rows come out in the order the btree walk returns them, which is what the pathkeys
+  claim; a non-member is only ever skipped, never reordered.
+- **Non-MVCC snapshots** are refused (§30.4). **Hot standby**: nothing here reads the visibility
+  map or relies on a pin, so a standby needs nothing an Index Scan does not.
+- **SERIALIZABLE.** The btree walk takes its own page predicate locks; each heap fetch takes a
+  tuple lock (`heap_hot_search_buffer()`); and the node takes a relation predicate lock on every
+  lion index it builds M from. A concurrent write that would change the answer inserts into a lion
+  index (a new matching row, or a non-HOT update that makes a skipped row match: a conflict with
+  the relation lock), or writes a row the node returned (its tuple lock), or inserts into a btree
+  page the walk read. A skipped non-member that is deleted, or updated and still does not match,
+  does not change the answer; the ordinary plan's tuple lock on it is a false positive the node
+  does not reproduce. test/isolation/ordered_serializable.spec is the write-skew case.
+
+### 30.6 Security
+
+- **Privileges** are the range table's: the node scans the relation (scanrelid > 0), and
+  `ExecCheckPermissions()` checks it like any scan.
+- **EXECUTE** (§9, "EXECUTE on what a count replaces"): the node evaluates the plan's filter
+  (initialised by core), the `lionqual` and the ordered index's original clauses, all through
+  `ExecInitQual()`, which checks EXECUTE on every function and operator for the current user at
+  executor start - the checks the ordinary plans make (an Index Scan initialises its
+  `indexqualorig` and its filter, a bitmap heap scan its `bitmapqualorig`). The `lionqual` is
+  initialised even when the set is exact, as `indexqualorig` is. Neither ordinary plan checks the
+  btree's ordering comparison, and neither does the node. test/sql/ordered.sql revokes an equality
+  function from PUBLIC and gets core's error from both plans.
+- **RLS and security-barrier views** are declined (§30.1). **Leakproofness** does not arise beyond
+  that: the membership test is not user code, and the user's quals run on a row only after the
+  heap visibility check, as in every core scan.
+
+### 30.7 EXPLAIN
+
+    Limit
+      ->  Custom Scan (LionOrdered) on fact
+            Filter: (length(payload) > 60)           -- core's, printed first by core
+            Ordered By: fact_c1m_idx (backward)      -- "(backward)" for a backward walk
+            Index Cond: (c1m > 100)                  -- the ordered index's own quals, if any
+            Lion Cond: ((c200 = 17) AND (c2 = 1))    -- the lionqual
+            Lion Indexes: fact_c200_idx, fact_c2_idx
+
+and with ANALYZE `Index Entries Walked`, `Lion Set Hits` (walked entries that were members),
+`Heap Fetches` (members with a visible version), `Rows Removed by Lion Recheck` (printed when
+the set is not exact or something was removed), and `Lion Set: N containers, exact | rechecked |
+degraded[, B builds]`, the builds counted when rescans rebuilt it (a LATERAL subquery whose lion
+filter takes the outer row's value: one per outer row).
+
+### 30.8 Declined in v1, and why
+
+- **Partitioned tables.** A partitioned parent's ordered plan is a MergeAppend over per-partition
+  ordered paths, and the hook also runs for each partition (`RELOPT_OTHER_MEMBER_REL`), so
+  offering the path there might just work; but run-time pruning, a partition's translated security
+  quals and the pathkeys of child rels are a surface of their own to test. The natural v2.
+- **The target relation of an UPDATE, DELETE or MERGE**, which a merge join's ordered input could
+  otherwise make the node scan: its row identity and EvalPlanQual rechecks would work as they do
+  for `SELECT ... FOR UPDATE` (tested), but nothing needs it and nothing tests it.
+- **Parameterized paths** (the node as the inner side of a nested loop with `t.x = outer.y` pushed
+  into it): an inner side needs no order, so an ordered filter scan has nothing to offer there.
+  Params inside a subquery (LATERAL, correlated) are ordinary Params and ARE supported (§30.4).
+- **Parallel scans** (`parallel_safe = false`), **backward scans**, **mark/restore**: the shape
+  needs none of them; core adds a Material where a caller does.
+- **RowCompareExpr index quals** on the ordered index (`(a, b) > (1, 2)`): the executor's key
+  substitution handles one key column per clause, and such a path is skipped.
+- **Lion accesses core did not build** (for example ANDing in a lion index that core's
+  `choose_bitmap_and()` judged not worth its heap savings): the node only considers the accesses
+  core's own lion index paths contain. A sharper set would save btree steps but no heap fetch.
+- **Non-MVCC snapshots, RLS, other table AMs**: above.
+
+### 30.9 Tests
+
+`test/sql/ordered.sql`, written before the node and failing without it (no plan contains
+`LionOrdered`): every query compared with the ordinary plan (`pg_lion.enable_ordered_scan = off`)
+row by row IN ORDER - ORDER BY ends in a unique key, so that the order is determined - with its plan
+checked to contain the node: `ORDER BY k [DESC] [NULLS FIRST] LIMIT n` under filters of each kind
+(=, IN, a long IN list, a range, `IS NULL`, a multicolumn lion index, an OR across two lion indexes,
+arrays and tsvector with their recheck, a partial lion index), a multi-column ORDER BY, an
+expression index, OFFSET and LIMIT, no LIMIT, a LIMIT beyond the match count, an empty answer, a
+filter on the btree column itself, a residual filter, Params under a generic plan, a LATERAL
+subquery rescanned with exec Params per outer row, cursors (FETCH forward; a SCROLL cursor over a
+Material fetching backward), a dirty heap (updates, deletes, HOT updates) and the same after
+VACUUM, a degraded set at a tiny `work_mem`; the declines (RLS, the GUC off, no lion-answerable
+clause); EXECUTE revoked (the node and the ordinary plan give the same error, security_exec.sql's
+pattern); and the plan choice with nothing disabled - the node for a selective lion filter with
+`ORDER BY` a btree column `LIMIT 10`, core's ordered btree scan for an unselective filter, and no
+node for a large result without a LIMIT. Isolation: `ordered_cursor.spec` (a cursor paused after
+its set was built while another session inserts matching rows, deletes and updates matching rows
+and commits: the rest of the cursor returns exactly its snapshot's rows, and rows inserted between
+DECLARE and the first FETCH do not appear either; VACUUM runs while it is paused and completes)
+and `ordered_serializable.spec` (the write-skew pair, both through the node: one of them fails).
+`make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
+orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
+
+### 30.10 Measured (2026-09-24, the vacuum slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
+
+One million rows of the benchmark's scalar table (`bench/comprehensive/workloads.py`,
+`scalar_data`, the columns the queries touch), lion indexes on `c2`, `c20`, `c200`, `c20k` and
+`c1m` and a btree on `c1m` beside them - the `roaring_btree` portfolio of the benchmark -,
+vacuumed and warm. The queries are the benchmark's `ordered_*` cases (`SELECT id, payload FROM
+fact WHERE ... ORDER BY c1m, id LIMIT 10`; the btree orders by `c1m` and an Incremental Sort above
+the scan breaks the ties by `id`). Median of 15 runs of `EXPLAIN (ANALYZE, TIMING OFF)`'s execution
+time, in ms; "default" is the plan with nothing disabled, the other columns force one path each
+(total cost of the plan in parentheses).
+
+| query | default | LionOrdered | core's ordered btree walk | lion bitmap + Sort |
+|---|---|---|---|---|
+| `ordered_filter` (`c200 = 17 AND c2 = 1`, 0.25%) | LionOrdered 0.47 | **0.51** (207) | 2.60 (430) | 4.87 (10,944) |
+| `ordered_filter_desc` (the same, `DESC`) | LionOrdered 0.55 | **0.61** (207) | 2.54 (430) | 4.41 (10,944) |
+| `ordered_broad` (`c2 = 1`, 50%) | btree walk 0.033 | 0.56 (4,442) | **0.032** (2.9) | 191 (38,531) |
+
+The node is 5x faster than the ordered walk and 8-9x faster than the bitmap and Sort for the
+selective filter, and the planner picks it; for the unselective one the ordered walk needs 21
+entries for 10 rows while the node first copies half a million TIDs (265 containers) out of lion,
+17x slower, and the planner keeps the walk. What the node did for `ordered_filter`: 4,636 btree
+entries walked, 23 members fetched for 10 rows - core's bitmap qual answers only `c200 = 17` (its
+`choose_bitmap_and()` judges `c2 = 1`'s set not worth its heap savings), so `c2 = 1` is the filter
+and half the members fail it (§30.8's "lion accesses core did not build"; ANDing `c2`'s set in
+would halve the fetches). Without a LIMIT the same query walks 999,767 entries to find all 5,165
+members, and the planner keeps the bitmap heap scan and Sort (5.5 ms).

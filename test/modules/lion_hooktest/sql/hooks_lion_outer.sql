@@ -27,6 +27,21 @@ SELECT g, count(*) FROM hk WHERE k IN (1, 2) GROUP BY g ORDER BY g;
 SELECT k, count(*) FROM hk_p WHERE k IN (0, 7, 19) GROUP BY k ORDER BY k;
 RESET pg_lion.enable_count_pushdown;
 
+-- the LionOrdered scan (DESIGN.md §30), which set_rel_pathlist_hook adds,
+-- chained the same way: the lion filter k = 3 over a walk of the btree on v
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET enable_indexscan = off; SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF) SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
+SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET enable_indexscan; RESET enable_indexonlyscan;
+SET pg_lion.enable_ordered_scan = off;
+SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
+RESET pg_lion.enable_ordered_scan;
+-- the other rel hook ran first, before pg_lion added its path
+SELECT lion_hooktest_rel_calls() > 0 AS rel_hook_ran,
+	   lion_hooktest_rel_saw_ordered() AS rel_hook_saw_ordered_path;
+
 -- both prefixes are reserved
 SET pg_lion.no_such_setting = 1;
 SET lion_hooktest.no_such_setting = 1;

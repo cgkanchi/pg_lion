@@ -369,6 +369,19 @@ SELECT count(*), sum(id) FROM lis_f WHERE k = 17;
 SELECT lion_top('SELECT count(*) FROM lis_f WHERE k = 17');
 SELECT lion_top('SELECT count(*) FROM lis_f WHERE u = 123456');
 SELECT lion_top('SELECT k, count(*) FROM lis_f GROUP BY k');
+-- ... including a count over a clustered value after scattered updates, when
+-- the visibility map pg_class remembers is stale: the rows of one value lie on
+-- a few pages, which is what the node's recheck is priced by now as well as
+-- the plain scan's heap side (DESIGN.md §29.11)
+CREATE TABLE lis_cl (id int, c int, x int);
+INSERT INTO lis_cl SELECT i, i / 2000, 0 FROM generate_series(1, 300000) i;
+CREATE INDEX lis_cl_c ON lis_cl USING lion (c);
+VACUUM ANALYZE lis_cl;
+UPDATE lis_cl SET x = 1 WHERE id % 20 = 7;
+ANALYZE lis_cl;
+SELECT lion_top('SELECT count(*) FROM lis_cl WHERE c = 17');
+SELECT count(*) FROM lis_cl WHERE c = 17;
+DROP TABLE lis_cl;
 
 -- ---------- 7. exclusion constraints: a non-MVCC (dirty snapshot) scan ----------
 CREATE TABLE lis_ex (a int, b text, EXCLUDE USING lion (a WITH =));
@@ -398,6 +411,119 @@ INSERT INTO lis_ex4 VALUES (1, '{1,2}'), (2, '{3}'), (3, '{}'), (4, NULL);
 INSERT INTO lis_ex4 VALUES (5, '{2,5}');
 INSERT INTO lis_ex4 VALUES (6, '{4,5}'), (7, '{}');
 SELECT id, tags FROM lis_ex4 ORDER BY id;
+
+-- ---------- 8. a partial multi-key index scanned whole, at a tiny work_mem ----------
+-- A multi-key column that has to be read whole is streamed as the exact
+-- union of its entries (DESIGN.md §29.3).  It used to be a private bitmap,
+-- whose lossy pages named every offset - rows the partial index does not
+-- hold, which neither a plain scan (the predicate is not rechecked) nor an
+-- index-only scan (nothing is) could tell apart: 140216 rows with flag false
+-- came back below, and a count of 175076 for 100000.
+CREATE TABLE lis_pr (id int, tags int[], flag bool);
+INSERT INTO lis_pr SELECT g, ARRAY[g % 10], g % 2 = 0 FROM generate_series(1, 400000) g;
+CREATE INDEX lis_pr_tags ON lis_pr USING lion (tags) WHERE flag;
+VACUUM ANALYZE lis_pr;
+SET work_mem = '64kB';
+SET pg_lion.enable_count_pushdown = off;
+SET enable_bitmapscan = off;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT flag, count(*) FROM (SELECT id, flag FROM lis_pr
+	WHERE flag AND tags <@ '{0,1,2,3,4,5,6,7,8,9}') s GROUP BY flag;
+SELECT flag, count(*) FROM (SELECT id, flag FROM lis_pr
+	WHERE flag AND tags <@ '{0,1,2,3,4,5,6,7,8,9}') s GROUP BY flag ORDER BY flag;
+SELECT flag, count(*) FROM (SELECT id, flag FROM lis_pr
+	WHERE flag AND tags IS NOT NULL) s GROUP BY flag ORDER BY flag;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+CREATE TABLE lis_pt (id int, tags int[], flag bool, pad text);
+INSERT INTO lis_pt SELECT g, ARRAY[g % 10], g % 2 = 0, repeat('x', 200)
+  FROM generate_series(1, 200000) g;
+CREATE INDEX lis_pt_tags ON lis_pt USING lion (tags) WHERE flag;
+VACUUM ANALYZE lis_pt;
+-- with nothing disabled: an index-only scan of the partial multi-key index
+SELECT lion_top('SELECT count(*) FROM lis_pt WHERE flag');
+SELECT count(*) FROM lis_pt WHERE flag;
+SELECT lion_ios('SELECT count(*) FROM lis_pt WHERE flag');
+SELECT lion_ios('SELECT count(*) FROM lis_pr WHERE flag');
+-- ... and after the heap is dirtied, so the index-only scan visits the heap
+UPDATE lis_pt SET pad = 'y' WHERE id % 50 = 0;
+DELETE FROM lis_pt WHERE id % 70 = 0;
+SELECT lion_ios('SELECT count(*) FROM lis_pt WHERE flag');
+RESET work_mem;
+DROP TABLE lis_pr, lis_pt;
+
+-- ---------- 9. a long IN list, located a batch at a time ----------
+-- Every value of an IN list used to be located up front with a cursor of its
+-- own, eleven kilobytes each: 20000 values held 220 MB.  Past a batch
+-- (work_mem / 32 kB values, at least 32) the plain scan locates and streams
+-- the list a batch at a time (DESIGN.md §29.4).
+BEGIN;
+SET LOCAL pg_lion.enable_count_pushdown = off;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SELECT lion_top('SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g))');
+DECLARE lst CURSOR FOR
+	SELECT id FROM lis_f WHERE u = ANY (array(SELECT g * 7 FROM generate_series(1, 20000) g));
+FETCH 5 FROM lst;
+SELECT count(*) > 0 AS scan_contexts,
+	   sum(total_bytes) < pg_size_bytes(current_setting('work_mem')) AS within_work_mem
+  FROM pg_backend_memory_contexts WHERE name LIKE 'lion index scan%';
+MOVE FORWARD ALL IN lst;
+COMMIT;
+-- the answers: duplicates, NULLs, a spelling per batch boundary, other columns
+SET work_mem = '64kB';
+SELECT lion_iq('SELECT id FROM lis WHERE u = ANY (array(SELECT (g % 250) * 3 FROM generate_series(1, 600) g))');
+SELECT lion_iq('SELECT id FROM lis WHERE u = ANY (array(SELECT CASE WHEN g % 9 = 0 THEN NULL ELSE g * 11 END FROM generate_series(1, 600) g)) AND u > 2000');
+SELECT lion_iq('SELECT id FROM lis WHERE ci = ANY (array(SELECT CASE g % 4 WHEN 0 THEN ''alice'' WHEN 1 THEN ''ALICE'' WHEN 2 THEN ''Bob'' || (g % 5) ELSE ''bOB'' || (g % 5) END::citext FROM generate_series(1, 500) g))');
+SELECT lion_iq('SELECT id FROM lis WHERE g = 3 AND kk = ANY (array(SELECT g % 200 FROM generate_series(1, 400) g))');
+SELECT lion_iq('SELECT id FROM lis WHERE k = ANY (array(SELECT g % 250 FROM generate_series(1, 700) g)) AND n IS NULL');
+RESET work_mem;
+
+-- ---------- 10. the union of a multi-key column: one walk of its entries ----------
+-- A multi-key column read whole is the union of its entries, gathered a
+-- window of container keys at a time, and every window walks every entry
+-- (DESIGN.md §29.3).  At 64 kB of work_mem a window used to be 16 container
+-- keys, a thousand heap blocks, and the walk was repeated for each of them;
+-- the window is at least 1024 container keys now, whatever work_mem says.
+-- The index blocks one index-only count reads are the same at 64 kB and at
+-- 64 MB of work_mem (pg_statio_user_indexes, flushed on demand).
+CREATE TABLE lis_pw (id int, tags int[], flag bool);
+INSERT INTO lis_pw SELECT g, ARRAY[g % 300], g % 2 = 0 FROM generate_series(1, 600000) g;
+CREATE INDEX lis_pw_tags ON lis_pw USING lion (tags) WITH (inline_limit = 64) WHERE flag;
+VACUUM ANALYZE lis_pw;
+CREATE TABLE lis_pw_blks (wm text, blks bigint);
+CREATE FUNCTION lis_pw_blks() RETURNS bigint LANGUAGE sql AS
+$$ SELECT idx_blks_hit + idx_blks_read FROM pg_statio_user_indexes
+	WHERE indexrelname = 'lis_pw_tags' $$;
+SET pg_lion.enable_count_pushdown = off;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT lion_top('SELECT count(*) FROM lis_pw WHERE flag');
+SELECT count(*) FROM lis_pw WHERE flag;		-- the relcache entry is built here
+SET work_mem = '64kB';
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+INSERT INTO lis_pw_blks SELECT 'before', lis_pw_blks();
+SELECT count(*) FROM lis_pw WHERE flag;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+INSERT INTO lis_pw_blks SELECT '64kB', lis_pw_blks();
+SET work_mem = '64MB';
+SELECT count(*) FROM lis_pw WHERE flag;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+INSERT INTO lis_pw_blks SELECT '64MB', lis_pw_blks();
+RESET work_mem;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_count_pushdown;
+SELECT (SELECT blks FROM lis_pw_blks WHERE wm = '64kB') - (SELECT blks FROM lis_pw_blks WHERE wm = 'before')
+	 = (SELECT blks FROM lis_pw_blks WHERE wm = '64MB') - (SELECT blks FROM lis_pw_blks WHERE wm = '64kB')
+	   AS same_index_reads_at_64kB_and_64MB;
+DROP TABLE lis_pw, lis_pw_blks;
+DROP FUNCTION lis_pw_blks();
 
 DROP TABLE lis, lis_outer, lis_big, lis_f, lis_ex, lis_ex2, lis_ex3, lis_ex4;
 DROP FUNCTION lion_iq(text);

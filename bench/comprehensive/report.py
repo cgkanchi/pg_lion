@@ -84,6 +84,8 @@ def generate(directory):
         ratio=base['median']/st['median'] if base and st['median'] else None
         if any(s['custom_count'] for s in ss):
             access='LionCount'
+        elif any(s.get('custom_ordered') for s in ss):
+            access='LionOrdered'
         else:
             access=', '.join(sorted({v for s in ss for v in s['scans']})) or 'no scan'
         if any(s['fallback'] for s in ss):
@@ -119,9 +121,9 @@ This is a synthetic, single-machine comparison, inspired by the presentation of 
 
 ## Interpretation and fairness
 
-Each selected scalar family attempts the same single-column portfolio on a freshly generated heap: seven indexes in the focused profile, eight in the full profile. The focused profile omits `clustered`; its document portfolio omits `grp`. Exact definitions are saved in `queries.json`. If selected, `btree_tuned` additionally receives a composite `(c200,c20,c2)` index and a covering `(c200) INCLUDE (id,payload)` index; its larger portfolio is charged in build time, bytes, and maintenance. Scalar GIN and GiST use `btree_gin` and `btree_gist`. GIN fastupdate is on; BRIN uses 32-page ranges. Roaring uses extension defaults. `roaring_bitmap` reuses the roaring portfolio with count pushdown disabled.
+Each selected scalar family attempts the same single-column portfolio on a freshly generated heap: seven indexes in the focused profile, eight in the full profile. The focused profile omits `clustered`; its document portfolio omits `grp`. Exact definitions are saved in `queries.json`. If selected, `btree_tuned` additionally receives a composite `(c200,c20,c2)` index and a covering `(c200) INCLUDE (id,payload)` index; its larger portfolio is charged in build time, bytes, and maintenance. Scalar GIN and GiST use `btree_gin` and `btree_gist`. GIN fastupdate is on; BRIN uses 32-page ranges. Roaring uses extension defaults. `roaring_bitmap` reuses the roaring portfolio with count pushdown disabled. `roaring_btree` is the roaring portfolio plus a B-tree on `c1m`, the ORDER BY column of the `ordered_*` cases, and measures only those cases: with the B-tree beside the lion indexes the planner may choose the LionOrdered scan (the lion filter's TID set tested against a walk of the B-tree), core's ordered B-tree walk, or a lion bitmap and a Sort.
 
-Focused document comparisons use GIN and roaring for text arrays and full-text search. The full profile also includes GiST text search; GiST has no text[] containment opclass here, so its array queries are fallbacks. The range and ordered-LIMIT cases measure distinct access patterns: consult the recorded plans for LionCount, bitmap scans, or sequential fallbacks. Lion does not provide ordered row retrieval. Sequential execution is always the correctness reference, but is timed as a separate portfolio only when `seq` is selected. This suite does not claim coverage of geometric, vector, JSON, wildcard, or arbitrary extension indexes.
+Focused document comparisons use GIN and roaring for text arrays and full-text search. The full profile also includes GiST text search; GiST has no text[] containment opclass here, so its array queries are fallbacks. The range and ordered-LIMIT cases measure distinct access patterns: consult the recorded plans for LionCount, bitmap scans, or sequential fallbacks. Lion indexes do not return rows in order themselves; with a B-tree on the ORDER BY column (`roaring_btree`) the LionOrdered scan walks that B-tree and filters it with lion's answer. Sequential execution is always the correctness reference, but is timed as a separate portfolio only when `seq` is selected. This suite does not claim coverage of geometric, vector, JSON, wildcard, or arbitrary extension indexes.
 
 `default` uses normal planner preferences. `prefer_index` disables sequential scans as a diagnostic; it is not a production tuning recommendation and does not guarantee use of an index. The access column and raw plans identify the actual route. A fallback is a query execution result, not a successful measurement of the named index algorithm.
 
@@ -187,7 +189,8 @@ Storage columns labeled Heap MiB use `pg_table_size`, including auxiliary forks 
         name=f'size-{n}.svg'
         (directory/name).write_text(svg)
         charts.append((title,name,svg))
-        for case in ['eq_c2_0','eq_c200_17','and3','group_c200','range_random','fetch_medium','fetch_c1m','fetch_and3']:
+        for case in ['eq_c2_0','eq_c200_17','and3','group_c200','range_random','fetch_medium','fetch_c1m','fetch_and3',
+                     'ordered_filter','ordered_broad']:
             values=[(key[-1]+(' (partial)' if (key[0],key[1],key[-1]) in partial else ''),st['median']) for key,st in stats.items()
                     if key[:6]==('scalar',n,'clean','default','64MB',case)]
             if not values:

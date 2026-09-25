@@ -2157,6 +2157,50 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 	return arrayci;
 }
 
+/*
+ * The Var of the WHERE clause when it is exactly one positive clause and that
+ * clause is a plain equality `col = value` on a column of rel; NULL otherwise
+ * (a partition's clauses name the parent, and are left alone).
+ */
+static Var *
+lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
+{
+	Node	   *eq = NULL;
+	int			npos = 0;
+	ListCell   *lc1;
+	ListCell   *lc2;
+	Node	   *arg;
+
+	forboth(lc1, whereclauses, lc2, wherekinds)
+	{
+		if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(lc2)))
+			continue;
+		npos++;
+		if (lfirst_int(lc2) == LION_CLAUSE_EQ)
+			eq = (Node *) lfirst(lc1);
+	}
+	if (npos != 1 || eq == NULL)
+		return NULL;
+	if (IsA(eq, RestrictInfo))
+		eq = (Node *) ((RestrictInfo *) eq)->clause;
+	if (!IsA(eq, OpExpr) || list_length(((OpExpr *) eq)->args) != 2)
+		return NULL;
+
+	arg = (Node *) linitial(((OpExpr *) eq)->args);
+	while (arg != NULL && IsA(arg, RelabelType))
+		arg = (Node *) ((RelabelType *) arg)->arg;
+	if (arg == NULL || !IsA(arg, Var) || (Index) ((Var *) arg)->varno != rel->relid)
+	{
+		arg = (Node *) lsecond(((OpExpr *) eq)->args);
+		while (arg != NULL && IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+	}
+	if (arg == NULL || !IsA(arg, Var) || (Index) ((Var *) arg)->varno != rel->relid ||
+		((Var *) arg)->varattno <= 0)
+		return NULL;
+	return (Var *) arg;
+}
+
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -2761,6 +2805,35 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		recheck_pages = Min(Min(recheck_tids, entries * perentry * dirtyfrac),
 							2.0 * recheck_pages);
+	}
+
+	/*
+	 * ... and the rows of ONE value (a plain equality, the commonest count of
+	 * all) lie on as many heap pages as the column's order says, which is
+	 * what cost_index() prices a plain index scan's heap side with (§29.11):
+	 * one per row when the values are scattered, the rows' share of the heap
+	 * when they are stored in order, interpolated by the correlation's
+	 * square.  The recheck visits each of those pages once, in block order,
+	 * so charging one page per candidate TID made a count over a clustered
+	 * value whose visibility map had gone stale (relallvisible is only
+	 * refreshed by VACUUM, while updates and on-access pruning change the
+	 * map) cost more than a plain index scan that fetches every row: 5036
+	 * against 3252 units for 5000 rows on 32 pages at a million rows, and the
+	 * node ran 2.5x faster than the scan that was chosen.
+	 */
+	if (rangevar == NULL && ors == NIL && recheck_tids > 0.0)
+	{
+		Var		   *eqvar = lion_single_eq_var(rel, whereclauses, wherekinds);
+
+		if (eqvar != NULL)
+		{
+			double		corr = lion_var_correlation(root, rel, eqvar);
+			double		scattered = Min(matching, heap_pages);
+			double		inorder = Max(1.0, matching * heap_pages / tuples);
+			double		spanned = scattered + (inorder - scattered) * corr * corr;
+
+			recheck_pages = Min(recheck_pages, Max(1.0, spanned * dirtyfrac));
+		}
 	}
 
 	run = random_pages * random_page_cost;

@@ -478,7 +478,22 @@ typedef struct LionSetStream LionSetStream;
 
 extern LionSetStream *lion_stream_begin(int nsets, LionPostingSet *sets,
 										LionKeyNode *tree, bool keeppins);
+extern void lion_stream_seek(LionSetStream *st, uint32 target);
 extern const LionContainer *lion_stream_next(LionSetStream *st);
+
+/*
+ * A bitset image of one container key's whole range (LION_BITSET_WORDS
+ * words): OR a container into it, and turn it back into a container in the
+ * smallest representation (dest has LION_CONTAINER_MAX_SIZE bytes).
+ */
+extern void lion_bits_or_container(uint64 *w, const LionContainer *c);
+extern void lion_bits_to_container(const uint64 *w, uint32 ckey,
+								   LionContainer *dest);
+
+/* A list's non-NULL values in lookup order, with their hashes (§29.4). */
+extern int	lion_probe_sort(Relation index, AttrNumber attno, Oid keytype,
+							int nvalues, const Datum *values,
+							const bool *isnull, Datum *sorted, uint32 *hashes);
 extern void lion_stream_end(LionSetStream *st);
 
 /*
@@ -486,9 +501,10 @@ extern void lion_stream_end(LionSetStream *st);
  * lion_scan.c: what a plain index scan returns, independent of any
  * IndexScanDesc, so that a caller that wants lion's answer to a WHERE clause
  * as a stream - or as a set to probe - can open one.  lion_source_next()
- * hands out one container at a time; in the SETS shape (lion_source_sorted())
- * the whole answer is one strictly ascending run of container keys, each TID
- * exactly once; a WALK streams entry by entry, ascending within each.
+ * hands out one container at a time, and never a TID the index does not
+ * hold; when lion_source_sorted() the whole answer is one strictly ascending
+ * run of container keys, each TID exactly once (SETS, UNION); a WALK streams
+ * entry by entry and a long IN list batch by batch, ascending within each.
  * lion_source_exact() is false when the TIDs are a superset that the caller
  * must recheck (§29.6).  keys must stay valid while the source is open.
  */
@@ -666,5 +682,14 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *input_rel,
 								   RelOptInfo *output_rel,
 								   void *extra);
+
+/* ---------------------------------------------------------------------
+ * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan
+ * --------------------------------------------------------------------- */
+
+extern PGDLLIMPORT bool lion_enable_ordered_scan;
+
+/* GUC, scan methods and set_rel_pathlist_hook; called from _PG_init. */
+extern void lion_ordered_init(void);
 
 #endif							/* LION_COUNT_H */

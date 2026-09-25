@@ -1,0 +1,103 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_plan s1_begin s1_declare s1_take5 s2_change s2_vacuum s1_rest s1_commit s1_check s1_now
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id, k FROM oc WHERE c = 3 ORDER BY k, id;
+QUERY PLAN                     
+-------------------------------
+Custom Scan (LionOrdered) on oc
+  Ordered By: oc_k             
+  Lion Cond: (c = 3)           
+  Lion Indexes: oc_c           
+(4 rows)
+
+step s1_begin: BEGIN;
+step s1_declare: DECLARE oc_cur NO SCROLL CURSOR FOR SELECT id, k FROM oc WHERE c = 3 ORDER BY k, id;
+step s1_take5: SELECT oc_take(5);
+oc_take
+-------
+      5
+(1 row)
+
+step s2_change: 
+	INSERT INTO oc SELECT 30000 + i, -500 - i, 3, 'late' FROM generate_series(1, 20) i;
+	INSERT INTO oc SELECT 31000 + i, 20000 + i, 3, 'late' FROM generate_series(1, 20) i;
+	DELETE FROM oc WHERE c = 3 AND id % 5 = 0 AND id < 10000;
+	UPDATE oc SET c = 4 WHERE c = 3 AND id % 5 = 1 AND id < 10000;
+	UPDATE oc SET c = 3 WHERE c = 5 AND id % 2 = 0;
+	UPDATE oc SET pad = 'hot' WHERE c = 3 AND id % 5 = 2;
+	UPDATE oc SET k = k + 5000 WHERE c = 3 AND id % 5 = 3 AND id < 10000;
+
+step s2_vacuum: VACUUM oc;
+step s1_rest: SELECT oc_take(NULL);
+oc_take
+-------
+    395
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_check: 
+	SELECT (SELECT count(*) FROM oc_got) AS got,
+		   (SELECT count(*) FROM oc_expect) AS expected,
+		   (SELECT count(*) FROM oc_got g FULL JOIN oc_expect e USING (n)
+			 WHERE g.id IS DISTINCT FROM e.id OR g.k IS DISTINCT FROM e.k) AS differ;
+
+got|expected|differ
+---+--------+------
+400|     400|     0
+(1 row)
+
+step s1_now: SELECT count(*) FROM oc WHERE c = 3;
+count
+-----
+  640
+(1 row)
+
+
+starting permutation: s1_begin s1_declare s2_early s1_take5 s2_change s2_vacuum s1_rest s1_commit s1_check s1_now
+step s1_begin: BEGIN;
+step s1_declare: DECLARE oc_cur NO SCROLL CURSOR FOR SELECT id, k FROM oc WHERE c = 3 ORDER BY k, id;
+step s2_early: 
+	INSERT INTO oc SELECT 20000 + i, -i, 3, 'early' FROM generate_series(1, 20) i;
+	UPDATE oc SET c = 3 WHERE c = 4 AND id % 3 = 0;
+	UPDATE oc SET k = -k - 100 WHERE c = 3 AND id % 7 = 1 AND id < 10000;
+
+step s1_take5: SELECT oc_take(5);
+oc_take
+-------
+      5
+(1 row)
+
+step s2_change: 
+	INSERT INTO oc SELECT 30000 + i, -500 - i, 3, 'late' FROM generate_series(1, 20) i;
+	INSERT INTO oc SELECT 31000 + i, 20000 + i, 3, 'late' FROM generate_series(1, 20) i;
+	DELETE FROM oc WHERE c = 3 AND id % 5 = 0 AND id < 10000;
+	UPDATE oc SET c = 4 WHERE c = 3 AND id % 5 = 1 AND id < 10000;
+	UPDATE oc SET c = 3 WHERE c = 5 AND id % 2 = 0;
+	UPDATE oc SET pad = 'hot' WHERE c = 3 AND id % 5 = 2;
+	UPDATE oc SET k = k + 5000 WHERE c = 3 AND id % 5 = 3 AND id < 10000;
+
+step s2_vacuum: VACUUM oc;
+step s1_rest: SELECT oc_take(NULL);
+oc_take
+-------
+    395
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_check: 
+	SELECT (SELECT count(*) FROM oc_got) AS got,
+		   (SELECT count(*) FROM oc_expect) AS expected,
+		   (SELECT count(*) FROM oc_got g FULL JOIN oc_expect e USING (n)
+			 WHERE g.id IS DISTINCT FROM e.id OR g.k IS DISTINCT FROM e.k) AS differ;
+
+got|expected|differ
+---+--------+------
+400|     400|     0
+(1 row)
+
+step s1_now: SELECT count(*) FROM oc WHERE c = 3;
+count
+-----
+  793
+(1 row)
+
