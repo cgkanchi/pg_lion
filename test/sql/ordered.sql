@@ -487,6 +487,26 @@ RESET hash_mem_multiplier;
 RESET work_mem;
 DROP TABLE lwalk;
 
+-- 17. A clause the btree and a lion index both answer is priced once
+--     (DESIGN.md §30.3): the walk of (g, k) under g = 5 meets only g = 5
+--     entries, every one a member, so the node is a plain index scan plus
+--     the lion lookups, and must not beat bitmap + Sort on a price that
+--     counted g = 5 twice (2026-09-25 second review: it did, at a hundredth
+--     of the fetches).  With a lion clause the btree does not answer, it
+--     still wins.
+CREATE TABLE ldbl (id int PRIMARY KEY, g int, h int, k int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO ldbl SELECT i, i % 100, i % 7, (i * 7919) % 100003, repeat('x', 60)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX ldbl_gk ON ldbl (g, k);
+CREATE INDEX ldbl_g ON ldbl USING lion (g);
+CREATE INDEX ldbl_h ON ldbl USING lion (h);
+VACUUM ANALYZE ldbl;
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 ORDER BY k');
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
+SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 ORDER BY k');
+SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
+DROP TABLE ldbl;
+
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;
 REVOKE SELECT ON lo FROM lion_ord_user;
