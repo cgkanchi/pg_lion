@@ -21,7 +21,7 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 2 3").  For development; `make recovery-check`
+#              "1 1b 1c 1d 1e 1f 2 3").  For development; `make recovery-check`
 #              always runs everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
@@ -97,7 +97,7 @@ TMPROOT=${RECOVERY_TMPDIR:-${TMPDIR:-/tmp}}
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 2 3"
+PHASES="1 1b 1c 1d 1e 1f 2 3"
 EXTRA_CONF=()
 
 # Set by make_private_dirs(), which the main section calls once the arguments
@@ -437,6 +437,30 @@ run_check() {
 	NCHECKS=$(printf '%s\n' "$out" | wc -l)
 }
 
+# vacuum_page_counts <label> <table> <index>
+#
+# VACUUM (VERBOSE) the table and read what it reports about the index's free
+# pages (DESIGN.md §18, "Page counts") into NEWLY, CURRENT and REUSABLE: the
+# pages this VACUUM freed, the free pages the index holds, and those of them
+# the next allocation could take already.  Only a shell can read them - no SQL
+# function sees an IndexBulkDeleteResult - which is why this lives here and
+# not in the regression suite.  Never call it in a command substitution.
+NEWLY=0
+CURRENT=0
+REUSABLE=0
+vacuum_page_counts() {
+	local label=$1 table=$2 index=$3 line
+	line=$(psql_p -c "VACUUM (VERBOSE, INDEX_CLEANUP ON) $table" 2>&1 |
+		tee -a "$RUNLOG" | grep "index \"$index\": pages:" || true)
+	[ -n "$line" ] || die "$label: VACUUM VERBOSE printed no page counts for $index"
+	NEWLY=$(printf '%s' "$line" | sed -n 's/.* \([0-9]*\) newly deleted.*/\1/p')
+	CURRENT=$(printf '%s' "$line" | sed -n 's/.* \([0-9]*\) currently deleted.*/\1/p')
+	REUSABLE=$(printf '%s' "$line" | sed -n 's/.* \([0-9]*\) reusable.*/\1/p')
+	[ -n "$NEWLY" ] && [ -n "$CURRENT" ] && [ -n "$REUSABLE" ] ||
+		die "$label: could not read the page counts in: $line"
+	log "$label: $line"
+}
+
 # ---------------------------------------------------------------- phase 1
 
 crash_immediate() {
@@ -468,7 +492,10 @@ recovery_evidence() {
 	local off=$1 txt redo_start redo_end generic segs startseg endseg
 	txt=$(tail -c "+$((off + 1))" "$PRIMARY_LOG")
 	printf '%s\n' "$txt" >>"$RUNLOG"
-	printf '%s' "$txt" | grep -q "database system was not properly shut down" ||
+	# Not `printf | grep -q`: grep -q exits at the first match, the writer can
+	# then die of SIGPIPE, and under pipefail that failed the check about once
+	# in a thousand runs although the line was there.
+	grep -q "database system was not properly shut down" <<<"$txt" ||
 		die "the restart did not report an unclean shutdown: the crash did not take effect"
 	redo_start=$(printf '%s' "$txt" |
 		sed -n 's/.*redo starts at \([0-9A-F]*\/[0-9A-F]*\).*/\1/p' | head -1)
@@ -668,8 +695,8 @@ phase1b() {
 	# redo almost nothing to do; what this round proves is the leak and the
 	# sweep, and phase 1 is what proves replay.
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1b: the restart did not report an unclean shutdown"
 
 	# The entries really are gone, the pages really are leaked (verify()
@@ -703,10 +730,21 @@ phase1b() {
 	# warn about, which is the assertion that the leak is gone.
 	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_leak WHERE k = 4" \
 		>>"$RUNLOG" 2>&1
-	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_leak" >>"$RUNLOG" 2>&1
+	vacuum_page_counts "phase 1b" lion_leak lion_leak_k
 	freed=$(psql_p -tAc "select deleted_pages from lion_index_stats('lion_leak_k')")
 	[ "$freed" -gt 0 ] ||
 		die "phase 1b: the leak sweep recovered no pages (deleted_pages = $freed)"
+
+	# What VACUUM reported about it (DESIGN.md §18, "Page counts").  The index
+	# held no DELETED page before, so every one it holds now is one this
+	# VACUUM freed - the leaked pages its sweep found and k = 4's chain - and
+	# none of them is reusable yet; the other free pages, if a split left any,
+	# are all-zero and reusable.  A page freed with its chain used to be
+	# counted a second time by the sweep, and every free page as reusable.
+	[ "$NEWLY" = "$freed" ] ||
+		die "phase 1b: VACUUM reported $NEWLY pages newly deleted, the index holds $freed DELETED pages"
+	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
+		die "phase 1b: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
 	warn=$(psql_p -c "SELECT lion_index_verify('lion_leak_k', true)" 2>&1 >>"$RUNLOG" |
 		grep -c 'unused and unreachable' || true)
 	[ "$warn" = 0 ] ||
@@ -789,8 +827,8 @@ phase1c() {
 	verify_node psql_p "$PRIMARY_DATA"
 
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1c: the restart did not report an unclean shutdown"
 
 	# The page really came back flagged: verify() says so, as a WARNING and
@@ -909,8 +947,8 @@ phase1d() {
 	verify_node psql_p "$PRIMARY_DATA"
 
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1d: the restart did not report an unclean shutdown"
 
 	# The page really came back flagged: verify() says so, as a WARNING and
@@ -996,6 +1034,247 @@ phase1d() {
 
 	log "phase 1d: the unfinished posting split survived the crash and the next append repaired it ($before -> $after leaves)"
 	SUMMARY+=("phase1d            crash between posting split and downlink; repaired by the next append")
+}
+
+# ------------------------------------------------------------- phase 1e
+
+# A crash in the middle of a MULTI-LEAF INLINE spill (DESIGN.md §18, "The
+# spill").  VACUUM's filtering turns one key's INLINE payload - eleven RUN
+# containers over 150,000 clustered rows - into ten BITSETs, which need a leaf
+# each; the spill writes a record per leaf and dies before its last record,
+# the root together with the rewritten entry.  Then:
+#
+#  * replay brings the leaves back and the entry stays INLINE with every TID
+#    it had, the dead ones included: nothing is lost and nothing is half-CHAIN;
+#  * lion_index_verify() calls the leaves a leak (a WARNING), not corruption;
+#  * the next VACUUM spills the set properly, and its sweep frees the orphan
+#    leaves, which are FULL - the sweep used to free only empty unreferenced
+#    leaves, so these stayed leaked for good.  Its VERBOSE page counts
+#    (DESIGN.md §18, "Page counts") are checked here, where a shell can read
+#    them: the ten orphans newly deleted, and never counted twice;
+#  * and a second crash replays that VACUUM, the whole multi-leaf spill
+#    included (under wal_consistency_checking when --conf asks for it).
+#
+# The crash point is deterministic: an injection point parks the VACUUM after
+# its last leaf record and the server is pulled out from under it.
+phase1e() {
+	local off parked warn ev
+	log ""
+	log "=== phase 1e: a crash between a spill's leaves and its root ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ log "phase 1e skipped: this server has no injection_points extension"
+		  SUMMARY+=("phase1e            skipped (no injection points)"); return 0; }
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1e: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_mspill;
+		CREATE TABLE lion_mspill (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_mspill SELECT i, 0 FROM generate_series(1, 150000) i;
+		CREATE INDEX lion_mspill_k ON lion_mspill USING lion (k);
+		DELETE FROM lion_mspill WHERE id % 10 = 3;
+	SQL
+	[ "$(psql_p -tAc "select inline_entries from lion_index_stats('lion_mspill_k')")" = 1 ] ||
+		die "phase 1e: the fixture's posting set is not INLINE"
+
+	psql_p -c "SELECT injection_points_attach('lion-spill-leaves-written', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1e: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "VACUUM (INDEX_CLEANUP ON) lion_mspill" >>"$RUNLOG" 2>&1 &
+	parked=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-spill-leaves-written'" \
+		60 "the VACUUM to park between the spill's leaves and its root"
+
+	# The leaf records are inserted and not flushed: ambulkdelete's records
+	# belong to no transaction.  A COMMIT from another session flushes the
+	# stream past them.  Not a CHECKPOINT: the parked backend holds the
+	# directory leaf's cleanup lock and the checkpointer could block on it.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE IF NOT EXISTS lion_mspill_flush (i int);
+		INSERT INTO lion_mspill_flush VALUES (1);
+	SQL
+
+	crash_immediate
+	wait "$parked" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+
+	# The leaves were replayed and nothing references them; the entry is the
+	# INLINE entry it was, dead TIDs and all.
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unused and unreachable' || true)
+	[ "$warn" -ge 10 ] ||
+		die "phase 1e: $warn unreachable page(s) after the crash, expected the ten orphan leaves and their root"
+	run_check "phase 1e post-crash" psql_p \
+		"select inline_entries = 1 and ntids = 150000,
+				format('the entry is still INLINE with every TID (%s entries INLINE, ntids %s)',
+					   inline_entries, ntids)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select container_pages = 10,
+				format('the ten leaves came back unreferenced (%s container pages)', container_pages)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select lion_index_count('lion_mspill_k', 0) = 135000,
+				'the index still counts all 135000 rows of k = 0'"
+
+	psql_p -c "SELECT injection_points_detach('lion-spill-leaves-written')" \
+		>>"$RUNLOG" 2>&1 || true
+
+	# The next VACUUM spills the set and sweeps the orphans away, and says so:
+	# the ten orphans are what it newly deleted, and they are not reusable
+	# yet.  Every other free page is all-zero - the root the crash left
+	# unwritten - and reusable, so the two differences agree exactly unless a
+	# page is counted twice or a fresh one is called reusable.
+	vacuum_page_counts "phase 1e" lion_mspill lion_mspill_k
+	[ "$NEWLY" = 10 ] ||
+		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the ten orphan leaves"
+	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
+		die "phase 1e: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
+
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unused and unreachable' || true)
+	[ "$warn" -le 1 ] ||
+		die "phase 1e: $warn page(s) are still leaked after the sweep (only the never-written root may be left, all-zero)"
+	run_check "phase 1e swept" psql_p \
+		"select inline_entries = 0 and posting_internal_pages = 1 and container_pages = 10,
+				format('spilled: %s INLINE, %s internal, %s leaves',
+					   inline_entries, posting_internal_pages, container_pages)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select deleted_pages = 10, format('%s DELETED pages, the ten orphans', deleted_pages)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select ntids = (select count(*) from lion_mspill), 'ntids agrees with the heap'
+		   from lion_index_stats('lion_mspill_k')"
+
+	# Replay that VACUUM too: the leaves, the root with the entry, the sweep.
+	off=$(stat -c %s "$PRIMARY_LOG")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		INSERT INTO lion_mspill_flush VALUES (2);
+	SQL
+	crash_immediate
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+	run_check "phase 1e replayed" psql_p \
+		"select lion_index_verify('lion_mspill_k', true) is not null, 'verify'
+		 union all
+		 select inline_entries = 0 and ntids = (select count(*) from lion_mspill),
+				'the spilled set replayed with every TID'
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select lion_index_count('lion_mspill_k', 0) = 135000,
+				'the index counts all 135000 rows of k = 0'"
+
+	psql_p -c "DROP TABLE lion_mspill, lion_mspill_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1e: the crash left the entry INLINE and ten orphan leaves; the next VACUUM spilled it and freed them"
+	SUMMARY+=("phase1e            crash inside a 10-leaf spill; nothing lost, orphans swept")
+}
+
+# ------------------------------------------------------------- phase 1f
+
+# VACUUM of an rmgr-mode index on a server WITHOUT the resource manager
+# (DESIGN.md §25, "VACUUM is the one path that could write without
+# lion_wal_begin()").  The index is built while the library is preloaded,
+# and the server is then restarted without it.  A VACUUM that removes nothing
+# from the index - a partial index none of whose rows died - walks it all the
+# same, and used to hand every page it visited to the standby barrier, which
+# past pg_lion.vacuum_barrier_ranges it wrote out on its own under rmid 128: a
+# manager this server does not have, so crash recovery stopped with a FATAL
+# at the first of those records.  Now nothing of the kind may be in the WAL,
+# and the crash after it must recover.
+#
+# Both modes run it: generic mode preloads the library for the build, rmgr
+# mode drops the preload (and wal_consistency_checking, which names the
+# manager) for the VACUUM.
+phase1f() {
+	local before after custom off
+	log ""
+	log "=== phase 1f: VACUUM of an rmgr-mode index on a server without the manager ==="
+
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: could not stop the primary"
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries=pg_lion" \
+		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary with the preload"
+	verify_node psql_p "$PRIMARY_DATA"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_norm;
+		CREATE TABLE lion_norm (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_norm SELECT i, i % 500 FROM generate_series(1, 100000) i;
+		CREATE INDEX lion_norm_k ON lion_norm USING lion (k)
+			WITH (wal_mode = rmgr, inline_limit = 64) WHERE id % 2 = 0;
+	SQL
+	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_k'::regclass)")" = rmgr ] ||
+		die "phase 1f: the partial index was not built in rmgr mode"
+
+	# A fast stop checkpoints, so nothing of the build is left to replay.
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: could not stop the primary"
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries='' -c wal_consistency_checking=''" \
+		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary without the preload"
+	verify_node psql_p "$PRIMARY_DATA"
+	[ "$(psql_p -tAc "select count(*) from pg_get_wal_resource_managers() where rm_name = 'pg_lion'")" = 0 ] ||
+		die "phase 1f: the resource manager is still registered"
+
+	# The deleted rows are not in the partial index, so the VACUUM removes
+	# nothing from it and only visits its pages; one visited range per
+	# stand-alone record is the most records it could write.
+	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_norm WHERE id % 2 = 1" \
+		>>"$RUNLOG" 2>&1 || die "phase 1f: delete failed"
+	before=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: the VACUUM failed"
+		SET pg_lion.vacuum_barrier_ranges = 1;
+		VACUUM (INDEX_CLEANUP ON) lion_norm;
+	SQL
+	off=$(stat -c %s "$PRIMARY_LOG")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE lion_norm_flush (i int);
+	SQL
+	after=$(psql_p -tAc "select pg_current_wal_flush_lsn()")
+	custom=$("$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" -s "$before" -e "$after" 2>>"$RUNLOG" |
+		grep -c 'rmgr: custom' || true)
+	[ "$custom" = 0 ] ||
+		die "phase 1f: the VACUUM wrote $custom record(s) of a resource manager this server does not have"
+
+	# And recovery goes through that range.
+	crash_immediate
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
+		die "phase 1f: the restart did not report an unclean shutdown"
+	run_check "phase 1f recovered" psql_p \
+		"select lion_index_verify('lion_norm_k', true) is not null, 'verify'
+		 union all
+		 select lion_index_count('lion_norm_k', 4) = 200, 'the index counts the 200 rows of k = 4'"
+
+	# The primary goes back to what --mode says for the phases after this one.
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: could not stop the primary"
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	psql_p -c "DROP TABLE lion_norm, lion_norm_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
+	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
 }
 
 # ---------------------------------------------------------------- phase 2
@@ -1579,6 +1858,8 @@ want_phase 1 && phase1
 want_phase 1b && phase1b
 want_phase 1c && phase1c
 want_phase 1d && phase1d
+want_phase 1e && phase1e
+want_phase 1f && phase1f
 want_phase 2 && phase2
 want_phase 3 && phase3
 

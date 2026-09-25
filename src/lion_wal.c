@@ -53,7 +53,18 @@
 #include "lion.h"
 #include "lion_wal.h"
 
-/* The rmid this server registered us under; -1 when we are not registered. */
+/*
+ * The rmid of pg_lion.rmgr_id, which is what this server registered us under
+ * when lion_rmgr_is_registered is true - and only then.  Without the preload
+ * the GUC is never defined and this keeps its initial value, 128, which is
+ * NOT an id this server knows: a record inserted under it cannot be replayed
+ * ("resource manager with ID 128 not registered" stops crash recovery and
+ * every standby).  So nothing may call XLogInsert() with it unless
+ * lion_rmgr_is_registered says so: lion_wal_begin() refuses to open an
+ * rmgr-mode record without it, and the standby barrier never collects one
+ * (lion_wal_visit()).  The initial value stays the GUC's boot value because
+ * that is what the GUC machinery expects the variable to hold.
+ */
 int			lion_rmgr_id = RM_EXPERIMENTAL_ID;
 static bool lion_rmgr_is_registered = false;
 
@@ -254,6 +265,20 @@ lion_wal_visit_flush(void)
 	Assert(!lion_wal_open);
 	Assert(lion_wal_visit_have && lion_wal_nvisits > 0);
 
+	/*
+	 * Never a record this server could not replay (see lion_rmgr_id).
+	 * lion_wal_visit() collects nothing without the resource manager, so this
+	 * is not reached; if it were, dropping the list would be the right thing,
+	 * because a barrier only matters to an rmgr-mode removal record written
+	 * after it, and lion_wal_begin() refuses to write one.
+	 */
+	if (!lion_rmgr_is_registered)
+	{
+		Assert(false);
+		lion_wal_nvisits = 0;
+		return;
+	}
+
 	hdr.initmask = 0;
 	hdr.cleanupmask = 0;
 	hdr.nvisit = (uint16) lion_wal_nvisits;
@@ -280,8 +305,22 @@ lion_wal_visit(Relation index, BlockNumber blk)
 	 * generic record takes no cleanup lock anywhere - and the count on a
 	 * standby rechecks every TID for it (DESIGN.md §9), so there is nothing
 	 * to carry.  Neither is there for an index whose changes are not logged.
+	 *
+	 * Nor for an rmgr-mode index on a server that did not register the
+	 * resource manager (2026-09-25 review).  The list used to be collected
+	 * all the same, and once it outgrew pg_lion.vacuum_barrier_ranges it
+	 * went out in a VACUUM_VISIT record under an id this server does not
+	 * know: pg_waldump showed custom128 records of an UNKNOWN type after a
+	 * VACUUM of a partial index that removed nothing, and crash recovery or
+	 * a standby stops with a FATAL at such a record.  Visiting a page changes
+	 * nothing, so it is not refused the way a write is (lion_wal_begin());
+	 * the list is simply not kept.  That loses nothing: the only records it
+	 * could ride on are rmgr-mode removals, and this server writes none - a
+	 * VACUUM that does have something to remove from such an index still
+	 * stops at its first write, with the preload hint.
 	 */
-	if (lion_wal_mode(index) != LION_WAL_MODE_RMGR || !RelationNeedsWAL(index))
+	if (lion_wal_mode(index) != LION_WAL_MODE_RMGR || !RelationNeedsWAL(index) ||
+		!lion_rmgr_is_registered)
 		return;
 
 	lion_wal_setup_buffers();
