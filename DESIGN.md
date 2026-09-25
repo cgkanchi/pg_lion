@@ -596,6 +596,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
         -- the identity every page of the set is stamped with (§18).
+        -- A multi-key column (§17) is refused, with the count functions' message: its entries are
+        -- extracted keys, not column values, and a whole tsvector used to be hashed as if it were
+        -- one lexeme and look up no entry at all.
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
         -- never below the column of the entry before it, §24), at most one reserved NULL and one
