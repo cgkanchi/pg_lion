@@ -455,6 +455,10 @@ CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
  * column), or a binary coercion to the column's type (varchar on text); a
  * domain as its base type; and for enum_ops the column's own enum and no
  * other (DESIGN.md section 9, "SQL surface").
+ *
+ * They are STRICT: a NULL index or key answers NULL - no count is made -
+ * where `count(*) WHERE col = NULL` answers 0 (section 9 says why).  A NULL
+ * element of lion_index_count_any()'s array selects nothing and counts 0.
  * --------------------------------------------------------------------- */
 
 CREATE FUNCTION lion_index_count(idx regclass, key anyelement)
