@@ -1816,7 +1816,7 @@ struct LionSource
 	AttrNumber	unionattno;
 	bool		withnull;
 	int			uwidth;			/* container keys per window */
-	uint64	   *ubits;			/* [uwidth][LION_BITSET_WORDS] */
+	uint64	  **uimg;			/* [uwidth] bitset images, made on first use */
 	bool	   *utouched;		/* [uwidth] */
 	uint64		ustart;			/* the window's first container key */
 	uint64		unext;			/* the smallest key seen past the window */
@@ -1825,6 +1825,21 @@ struct LionSource
 	bool		udone;
 	LionContainer *cbuf;		/* the container handed out */
 };
+
+/*
+ * How many container keys one UNION window gathers (§29.3): at least
+ * LION_UNION_MIN_WINDOW whatever work_mem says, because every window walks
+ * every entry of the column again, and more when work_mem allows, up to
+ * 65536.  A container key's bitset image is 4 kB and made only when an entry
+ * has a container there, so a window costs what it holds, at most 4 MB at the
+ * floor.  lioncostestimate() prices the windows with the same number.
+ */
+int
+lion_union_window(void)
+{
+	return (int) Max((double) LION_UNION_MIN_WINDOW,
+					 Min((double) work_mem * 1024.0 / LION_BITSET_BYTES, 65536.0));
+}
 
 /* How many sets of one IN list a plain scan holds cursors for at once (§29.4). */
 static int
@@ -2183,9 +2198,8 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		src->recheck = true;
 		src->unionattno = (AttrNumber) (unioncol + 1);
 		src->withnull = withnull;
-		src->uwidth = (int) Max(16.0, Min((double) work_mem * 1024.0 / LION_BITSET_BYTES,
-										  65536.0));
-		src->ubits = (uint64 *) palloc0((Size) src->uwidth * LION_BITSET_BYTES);
+		src->uwidth = lion_union_window();
+		src->uimg = (uint64 **) palloc0(sizeof(uint64 *) * src->uwidth);
 		src->utouched = (bool *) palloc0(sizeof(bool) * src->uwidth);
 		src->uemit = src->uwidth;
 		src->ufirst = true;
@@ -2423,8 +2437,10 @@ lion_source_union_window(LionSource *src)
 			}
 			if (k < src->ustart)
 				continue;		/* a sparse segment's keys below the seek */
-			lion_bits_or_container(src->ubits + (k - src->ustart) * LION_BITSET_WORDS,
-								   c);
+			if (src->uimg[k - src->ustart] == NULL)
+				src->uimg[k - src->ustart] = (uint64 *)
+					MemoryContextAllocZero(src->cxt, LION_BITSET_BYTES);
+			lion_bits_or_container(src->uimg[k - src->ustart], c);
 			src->utouched[k - src->ustart] = true;
 		}
 		lion_stream_end(st);
@@ -2448,7 +2464,7 @@ lion_source_union_next(LionSource *src)
 		while (src->uemit < src->uwidth)
 		{
 			int			k = src->uemit++;
-			uint64	   *w = src->ubits + (Size) k * LION_BITSET_WORDS;
+			uint64	   *w = src->uimg[k];
 
 			if (!src->utouched[k])
 				continue;

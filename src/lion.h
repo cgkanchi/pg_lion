@@ -1152,6 +1152,13 @@ extern void lionrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys, ScanK
 extern void lionendscan(IndexScanDesc scan);
 extern int64 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool liongettuple(IndexScanDesc scan, ScanDirection dir);	/* DESIGN.md §29 */
+
+/*
+ * Container keys per window of a plain scan that reads a multi-key column
+ * whole (DESIGN.md §29.3): 1024 container keys, 65536 heap blocks, at least.
+ */
+#define LION_UNION_MIN_WINDOW	1024
+extern int	lion_union_window(void);
 extern bytea *lionoptions(Datum reloptions, bool validate);
 extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,

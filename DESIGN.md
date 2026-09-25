@@ -5678,10 +5678,25 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   under several entries of such a column, so walking them would return it several times. The
   scan streams the exact UNION of the column's entries instead, a WINDOW of container keys at a
   time: every entry is sought to the window's first key and read to its end, and ORed into one
-  bitset image per container key of the window (`max(16, work_mem / 4 kB)` of them); the next
-  window starts at the smallest key any entry had past this one. Each window walks the column's
-  entries once. Always rechecked (the quals of mode ALL need it). Correct and expensive, which is
-  what the cost model already says about these quals.
+  bitset image per container key of the window; the next window starts at the smallest key any
+  entry had past this one. Each window walks the column's entries once, so the work is windows x
+  entries, and the window is therefore WIDE whatever `work_mem` says: `lion_union_window()` =
+  `max(1024, work_mem / 4 kB)` container keys (1024 are 65536 heap blocks, 512 MB of heap), up to
+  65536, and a key's 4 kB image is made only when an entry has a container there, so a window
+  costs what it holds - at most 4 MB at the floor, which is the one place this scan may exceed a
+  tiny `work_mem`. Always rechecked (the quals of mode ALL need it). Correct and expensive, which
+  is what the cost model already says about these quals; `lioncostestimate()` also charges each
+  window past the first another read of the index (the IndexPath is shared with the bitmap scan,
+  which is overcharged by that, only on a heap past 512 MB).
+  *(Deviation from the version before it, whose window was `max(16, work_mem / 4 kB)` keys: at
+  64 kB that is 1024 heap blocks, and a 2M-row table with 200k distinct keys took 17 windows and
+  1.40 s for an index-only count(*) against 0.48 s at 64 MB - and the planner picked that scan at
+  64 kB; 100M rows would have meant some 1600 walks of every entry (re-review, 2026-09-24).
+  Keeping every entry's cursor across windows instead would have made the memory grow with the
+  number of distinct keys, and identifying an entry across windows, while inserts and VACUUM change
+  the directory between two calls, needs its key - both worse than a wider window.
+  `test/sql/indexscan.sql` §10 counts the index blocks one count reads at 64 kB and at 64 MB: the
+  same, where they were five times as many at 64 kB.)*
   *(Deviation from this section's first version, which ran `liongetbitmap()` into a private
   TIDBitmap and, on a LOSSY page, returned every offset up to `MaxHeapTuplesPerPage` "with recheck
   set". That is right for a bitmap heap scan, which re-applies the index PREDICATE to a lossy
@@ -5732,11 +5747,11 @@ multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as 
 expanded into an array of at most `LION_CONTAINER_RANGE` lo values (`lion_container_to_array()`,
 turned into a TID one at a time, in the per-heap-block order `lion_container_to_tbm()` emits). The
 next container is pulled only when the batch is used up. What the scan holds between two calls is
-therefore bounded by `work_mem` and the query, never by the data: one container's members; one
+therefore bounded by `work_mem` (save a UNION window's floor) and the query, never by the data: one container's members; one
 8 KB image per posting-set cursor of the tree (the page its current container came from), for at
 most a batch of an IN list's sets (above); the INLINE payload copies of those sets (at most an
-entry each, `LION_MAX_ENTRY_SIZE`); for a WALK one directory leaf image; for a UNION its window of
-bitset images; and a long list's values, sorted. A posting set of any size is
+entry each, `LION_MAX_ENTRY_SIZE`); for a WALK one directory leaf image; for a UNION the bitset images
+of its window (made on first use; up to 4 MB at the floor, §29.3); and a long list's values, sorted. A posting set of any size is
 STREAMED container by container - a 5M-row entry is never materialized - and a walk of any width
 holds one entry's stream at a time. Memory lives in a per-scan context reset by `amrescan`, and a
 walk's per-entry cursors in a per-entry context reset before the next entry, so a nested-loop inner

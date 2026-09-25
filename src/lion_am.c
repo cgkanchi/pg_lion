@@ -8,6 +8,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/amapi.h"
 #include "access/amvalidate.h"
 #include "access/generic_xlog.h"
@@ -867,6 +869,40 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	}
 
 	costs.indexTotalCost += lion_range_entry_cost(root, path);
+
+	/*
+	 * A plain scan that reads a multi-key column whole streams the union of
+	 * its entries a window of container keys at a time, and walks every entry
+	 * again for each window (DESIGN.md §29.3, lion_union_window()): charge
+	 * each window past the first another read of the index.  The IndexPath is
+	 * shared with the bitmap scan, which reads the index once, so that side
+	 * is overcharged - which only matters on a heap of more than 65536 blocks
+	 * per window and a qual that reads the whole column anyway.
+	 */
+	if (fullscan)
+	{
+		IndexOptInfo *index = path->indexinfo;
+		int			col = 0;
+		ListCell   *lc;
+
+		foreach(lc, path->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+
+			if (lc == list_head(path->indexclauses) || iclause->indexcol < col)
+				col = iclause->indexcol;
+		}
+		if (lion_index_is_multikey(index, col))
+		{
+			double		containers = ceil((double) index->rel->pages /
+										  LION_BLOCKS_PER_CONTAINER);
+			double		windows = ceil(containers / lion_union_window());
+
+			if (windows > 1.0)
+				costs.indexTotalCost += (windows - 1.0) *
+					Max((double) index->pages, 1.0) * seq_page_cost;
+		}
+	}
 
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;

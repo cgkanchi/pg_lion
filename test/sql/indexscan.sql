@@ -481,6 +481,50 @@ SELECT lion_iq('SELECT id FROM lis WHERE g = 3 AND kk = ANY (array(SELECT g % 20
 SELECT lion_iq('SELECT id FROM lis WHERE k = ANY (array(SELECT g % 250 FROM generate_series(1, 700) g)) AND n IS NULL');
 RESET work_mem;
 
+-- ---------- 10. the union of a multi-key column: one walk of its entries ----------
+-- A multi-key column read whole is the union of its entries, gathered a
+-- window of container keys at a time, and every window walks every entry
+-- (DESIGN.md §29.3).  At 64 kB of work_mem a window used to be 16 container
+-- keys, a thousand heap blocks, and the walk was repeated for each of them;
+-- the window is at least 1024 container keys now, whatever work_mem says.
+-- The index blocks one index-only count reads are the same at 64 kB and at
+-- 64 MB of work_mem (pg_statio_user_indexes, flushed on demand).
+CREATE TABLE lis_pw (id int, tags int[], flag bool);
+INSERT INTO lis_pw SELECT g, ARRAY[g % 300], g % 2 = 0 FROM generate_series(1, 600000) g;
+CREATE INDEX lis_pw_tags ON lis_pw USING lion (tags) WITH (inline_limit = 64) WHERE flag;
+VACUUM ANALYZE lis_pw;
+CREATE TABLE lis_pw_blks (wm text, blks bigint);
+CREATE FUNCTION lis_pw_blks() RETURNS bigint LANGUAGE sql AS
+$$ SELECT idx_blks_hit + idx_blks_read FROM pg_statio_user_indexes
+	WHERE indexrelname = 'lis_pw_tags' $$;
+SET pg_lion.enable_count_pushdown = off;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT lion_top('SELECT count(*) FROM lis_pw WHERE flag');
+SELECT count(*) FROM lis_pw WHERE flag;		-- the relcache entry is built here
+SET work_mem = '64kB';
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+INSERT INTO lis_pw_blks SELECT 'before', lis_pw_blks();
+SELECT count(*) FROM lis_pw WHERE flag;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+INSERT INTO lis_pw_blks SELECT '64kB', lis_pw_blks();
+SET work_mem = '64MB';
+SELECT count(*) FROM lis_pw WHERE flag;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+INSERT INTO lis_pw_blks SELECT '64MB', lis_pw_blks();
+RESET work_mem;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_count_pushdown;
+SELECT (SELECT blks FROM lis_pw_blks WHERE wm = '64kB') - (SELECT blks FROM lis_pw_blks WHERE wm = 'before')
+	 = (SELECT blks FROM lis_pw_blks WHERE wm = '64MB') - (SELECT blks FROM lis_pw_blks WHERE wm = '64kB')
+	   AS same_index_reads_at_64kB_and_64MB;
+DROP TABLE lis_pw, lis_pw_blks;
+DROP FUNCTION lis_pw_blks();
+
 DROP TABLE lis, lis_outer, lis_big, lis_f, lis_ex, lis_ex2, lis_ex3, lis_ex4;
 DROP FUNCTION lion_iq(text);
 DROP FUNCTION lion_ir(text);
