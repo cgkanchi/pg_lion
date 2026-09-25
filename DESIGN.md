@@ -973,13 +973,37 @@ Planner integration
   - Every baserestrictinfo clause is `Var opeq Const` or `Const opeq Var` where Var is a plain column
     of the rel with a *valid* lion index whose opfamily contains that operator as strategy 1 (use
     the index's opfamily and the operator OID; cross-type integer equality is fine because the
-    integer opfamily contains it), the compared value is not a literal NULL, and there is at most
-    one clause per column (two different values on one column ⇒ bail; the same value twice ⇒
-    dedupe, by `equal()`, so two different Params on one column bail). §15 adds
-    `Var = ANY (array)` and §14 the two null tests to the shapes accepted here; an `IS NOT NULL`
-    clause is exempt from the one-clause-per-column rule, because it constrains no value. §19 adds a
-    top-level `OR` of such clauses, whose leaves are exempt from the rule as well and enter none of
-    the per-column bookkeeping, because they constrain no column of the result.
+    integer opfamily contains it), and the compared value is not a literal NULL. §15 adds
+    `Var = ANY (array)` and §14 the two null tests to the shapes accepted here. §19 adds a
+    top-level `OR` of such clauses, whose leaves enter none of the per-column bookkeeping below,
+    because they constrain no column of the result.
+  - **Several clauses may constrain one column, and each is a source of its own** (2026-09-25
+    review). A second positive clause on a column is ANDed with the first exactly as a clause on
+    another column is: it is matched to an index for ITS operator under ITS input collation, and the
+    query is declined when there is none - the AND of exact sources is exact. Only the very same
+    clause again is dropped as a duplicate: the same kind, the same operator, the same input
+    collation and an `equal()` value (so `v === 'A' AND 'A' === v` is one clause, and `v === $1 AND
+    v === $2` is two), because the first one's lookup is then its answer. The rule used to be "at
+    most one clause per column", with a duplicate recognised by its kind and value alone, and that
+    dropped clauses no index had answered: over an index whose case-insensitive opclass has `===` as
+    strategy 1, `v === 'A' AND v = 'A'` counted the entry of `===` - both spellings, 10000 rows
+    where the query selects 5000 - and never asked anything about `=`. A nondeterministic collation
+    does the same with one operator, `s COLLATE ci = 'a' AND s = 'a'`. The generic plan (`v === $1
+    AND v = $1`), the IN-list forms, a GROUP BY and the FK-side join's fact filters (§27) all went
+    through that one test. Nothing downstream needs one clause per column: the key a target list
+    prints for a pinned column is its FIRST pinning clause's, and every equality on that column must
+    then pass the value-representation rule below; an IN list that drives the groups (§15) is the
+    FIRST list on the driving index's key column, by one rule in the planner and the executor (see
+    the executor's GROUP BY paragraph). Two clauses that differ only in value used to be declined as
+    well - they select little or nothing - and are answered now: under a coarse equality they need
+    not even disagree (`v === 'a' AND v === 'A'` is one entry, looked up twice).
+    `test/sql/samecolumn.sql` covers every form against a sequential scan, with the other plans
+    disabled so that a node that is built at all is the plan. `IS NOT NULL`, a multi-key clause
+    (§17) and an OR leaf never took part in the old rule and are unchanged. Not done: a clause is
+    matched against the FIRST lion index on its column only (`lion_find_roaring_index()`), so two
+    clauses that two different indexes of one column would answer - `===` from a case-insensitive
+    one and `=` from a plain one - are declined, not answered; that is a plan left on the table and
+    not a wrong answer.
   - **An index is an (index, KEY COLUMN) pair since §24.** A multicolumn lion index holds each of
     its columns' keys as an independent set of entries, so `lion_find_roaring_index()` accepts a
     match on ANY key column and returns its number `i` beside the index; every opclass question in
@@ -1189,6 +1213,20 @@ Executor
   the planner must not assume sortedness (pathkeys = NIL). This is one function,
   `lion_next_group()`, and it is the whole of the GROUP BY executor: a partitioned scan runs it once
   per partition (§16).
+
+  (Since written: §21 ordered the entries and gave an entry walk pathkeys, and §15 let an IN list on
+  the group column drive the groups instead - `lion_next_group_inlist()`, which emits them in the
+  order the list's sets were located in and so claims no order at all. WHICH clause drives is one
+  rule, applied by the planner (`lion_inlist_shape()`, for the cost and for the pathkeys) and by the
+  executor (`lion_locate_where()`) alike: the FIRST list, in clause order and outside any OR, on the
+  driving index's own key column - whatever other lists the WHERE holds. The planner used to give
+  up at the second list anywhere in the WHERE, so `g IN (...) AND h IN (...) GROUP BY g` was priced
+  as a walk of every entry of `g` and claimed `ORDER BY g`, while the executor drove the groups
+  from the list on `g` all the same; for an opfamily whose cross-type equality has no ordering to
+  sort the list with, the list is located in hash order, and the query returned its groups unsorted
+  under `ORDER BY g` (the 2026-09-25 review). `test/sql/pushdown.sql` pins both halves: that
+  opfamily's ordered output with a Sort above the node, and the plan choice the corrected estimate
+  makes on the shipped one - eight listed entries against a walk of twenty thousand.)
 - ReScanCustomScan: reset iteration state. EndCustomScan: close indexes, free.
 - ExplainCustomScan: print "Indexes: idx1 (col = const), ..." - with the index's KEY COLUMN
   appended as `idx1.col` when, and only when, the index is a MULTICOLUMN one (§24), so that two
@@ -1196,10 +1234,15 @@ Executor
   and "Group Key: col" and, with ANALYZE,
   the number of TIDs rechecked in the heap, the heap blocks skipped via the visibility map, the
   containers visited, and the block visits the visibility cache answered or had to let past its
-  budget ("Heap Blocks From Cache" / "Heap Blocks Past Cache Budget", §9). A clause whose value is
-  not a literal is printed as the expression the plan carries, which for a prepared statement's
-  parameter is `$1` - the text core's EXPLAIN gives a qual on one - via `deparse_expression()`
-  against the plan's own deparse context.
+  budget ("Heap Blocks From Cache" / "Heap Blocks Past Cache Budget", §9). Every clause is printed
+  with its OWN operator's name and with its value as core's EXPLAIN prints a qual's - through
+  `deparse_expression()` against the plan's own deparse context, whatever the value is: a literal
+  with its quotes and its type (`idx (v === 'A'::text)`, `idx (k = ANY ('{1,2}'::integer[]))`,
+  `idx (tags @> '{a}'::text[])`), a prepared statement's parameter as `$1`, and the FK-side join's
+  key as the other table's column (§27). Until the 2026-09-25 review an equality or a list was
+  always printed with `=`, and a literal through its type's output function alone - `(v = A)`,
+  `ANY ({90,5,50,1})`, as §15 still quotes it - which made the `===` clause of that review's wrong
+  answer look exactly like the `=` the planner had dropped beside it.
 
 Tests (pg_regress): the pushdown produces identical results to the plain plan for: no rows; all rows;
 WHERE constants that match no key; cross-type constants; GROUP BY with and without WHERE; after

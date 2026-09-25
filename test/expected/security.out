@@ -127,10 +127,10 @@ SELECT count(*) FROM lion_coll WHERE name = 'B';
 
 -- matching collation: pushed down
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_coll WHERE name = 'B' COLLATE "C";
-                 QUERY PLAN                  
----------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_coll_name_c (name = B)
+   Lion Indexes: lion_coll_name_c (name = 'B'::text COLLATE "C")
 (2 rows)
 
 SELECT count(*) FROM lion_coll WHERE name = 'B' COLLATE "C";
