@@ -644,6 +644,20 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- (injection point 'lion-verify-meta-read') and shows a directory-splitting INSERT waiting
         -- for it, a writer in flight being waited for, and `LOCK TABLE; DROP INDEX` in another
         -- transaction going through while verify() waits for the table.
+        -- AN UNFINISHED SPLIT IS NOT DAMAGE (§21, §22). A split writes the new right sibling in one
+        -- record and its downlink in the next, with the left page flagged
+        -- LION_PAGE_INCOMPLETE_SPLIT in between, and a crash or an error there leaves the sibling
+        -- reachable by its left neighbour's right link and from nothing above until the next
+        -- writer that descends to the left page finishes the split. verify() warns about the
+        -- flag, and when it matches a level's downlinks with the pages of the level below it
+        -- accepts a page without one if its left neighbour carries the flag - a three-way posting
+        -- split flags two pages in a row, and each missing downlink is covered by the page to its
+        -- own left. Such a page is bounded above by the next downlink's separator like any other.
+        -- The flag with the downlink already in place (the directory clears the flag in a record
+        -- of its own) needs nothing. verify() used to warn and then report the missing downlink
+        -- as "level 1 has 4 downlinks but level 0 has 5 pages";
+        -- test/isolation/verify_incomplete_split.spec makes a posting split and a directory
+        -- split fail at their injection points and verifies both.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership

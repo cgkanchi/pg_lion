@@ -916,12 +916,13 @@ typedef struct LionVerifyPLevel
 	uint32	   *lastkey;		/* last container key of a leaf */
 	uint32	   *highkey;		/* internal pages only */
 	bool	   *hashigh;
+	bool	   *incomplete;	/* flagged LION_PAGE_INCOMPLETE_SPLIT */
 } LionVerifyPLevel;
 
 static void
 lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
 					   bool hasfirst, uint32 lastkey, uint32 highkey,
-					   bool hashigh)
+					   bool hashigh, bool incomplete)
 {
 	if (lvl->npages >= lvl->maxpages)
 	{
@@ -936,6 +937,7 @@ lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
 			lvl->lastkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
 			lvl->highkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
 			lvl->hashigh = (bool *) palloc(sizeof(bool) * lvl->maxpages);
+			lvl->incomplete = (bool *) palloc(sizeof(bool) * lvl->maxpages);
 		}
 		else
 		{
@@ -945,6 +947,7 @@ lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
 			lvl->lastkey = (uint32 *) repalloc(lvl->lastkey, sizeof(uint32) * lvl->maxpages);
 			lvl->highkey = (uint32 *) repalloc(lvl->highkey, sizeof(uint32) * lvl->maxpages);
 			lvl->hashigh = (bool *) repalloc(lvl->hashigh, sizeof(bool) * lvl->maxpages);
+			lvl->incomplete = (bool *) repalloc(lvl->incomplete, sizeof(bool) * lvl->maxpages);
 		}
 	}
 	lvl->blocks[lvl->npages] = blk;
@@ -953,6 +956,7 @@ lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
 	lvl->lastkey[lvl->npages] = lastkey;
 	lvl->highkey[lvl->npages] = highkey;
 	lvl->hashigh[lvl->npages] = hashigh;
+	lvl->incomplete[lvl->npages] = incomplete;
 	lvl->npages++;
 }
 
@@ -1078,7 +1082,7 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 
 		lion_verify_plevel_add(out, blk, minckey,
 							   firstused != InvalidOffsetNumber, maxckey, 0,
-							   false);
+							   false, LionPageIncompleteSplit(page));
 
 		last = blk;
 		blk = opaque->rightlink;
@@ -1177,13 +1181,13 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 
 			if (children != NULL)
 				lion_verify_plevel_add(children, piv->child, piv->ckey, true,
-									   piv->ckey, 0, false);
+									   piv->ckey, 0, false, false);
 
 			CHECK_FOR_INTERRUPTS();
 		}
 
 		lion_verify_plevel_add(out, blk, firstkey, hasfirst, prevkey, highkey,
-							   hashigh);
+							   hashigh, LionPageIncompleteSplit(page));
 
 		blk = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
@@ -1290,55 +1294,86 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	for (i = 1; i <= height; i++)
 	{
 		LionVerifyPLevel children;
+		const LionVerifyPLevel *below = &lvl[i - 1];
+		int			p;
 
 		memset(&children, 0, sizeof(children));
 		lion_verify_posting_level(vs, eblk, eoff, entry, leftmost[i],
 								  (uint16) i, &lvl[i], &children);
 
-		if (children.npages != lvl[i - 1].npages)
-			lion_corrupt("lion index \"%s\": posting level %u of chain entry %u on block %u has %d downlinks but level %u has %d pages",
-						RelationGetRelationName(vs->index), i, eoff, eblk,
-						children.npages, i - 1, lvl[i - 1].npages);
-
-		for (j = 0; j < children.npages; j++)
+		/*
+		 * Match the downlinks, in the order the walk of this level found
+		 * them, with the pages of the level below, in the order ITS walk
+		 * found them.  j is the next downlink to match.
+		 *
+		 * One page may lack a downlink without being damage: the right
+		 * sibling a split made, while the split is unfinished.  The split
+		 * writes the sibling in one record and its downlink in the next, and
+		 * leaves the LEFT page flagged LION_PAGE_INCOMPLETE_SPLIT in between;
+		 * a crash - or an error - there leaves it so until the next writer
+		 * that descends to the left page finishes it (DESIGN.md §22).  The
+		 * sibling is then reachable through its left neighbour's right link
+		 * and from nothing above, and the walk has already warned about the
+		 * flag.  A three-way split flags both of its first two pages, so each
+		 * missing downlink is covered by the page to its own left.  Such a
+		 * page lies in its left neighbour's key range until the split
+		 * finishes, and is bounded above by the next downlink's separator
+		 * like any other page.
+		 */
+		j = 0;
+		for (p = 0; p < below->npages; p++)
 		{
-			uint32		sep = children.firstkey[j];
-
-			if (children.blocks[j] != lvl[i - 1].blocks[j])
-				lion_corrupt("lion index \"%s\": downlink %d of posting level %u points at block %u, but the %dth page of level %u is block %u",
-							RelationGetRelationName(vs->index), j, i,
-							children.blocks[j], j, i - 1,
-							lvl[i - 1].blocks[j]);
-
-			if (j == 0 && sep != 0)
-				lion_corrupt("lion index \"%s\": the first downlink of posting level %u has separator %u, expected minus infinity",
-							RelationGetRelationName(vs->index), i, sep);
-
-			/* the separator is at or below its child's own first key */
-			if (lvl[i - 1].hasfirst[j] && sep > lvl[i - 1].firstkey[j])
-				lion_corrupt("lion index \"%s\": the separator %u of posting block %u sorts after its own first container key %u",
-							RelationGetRelationName(vs->index), sep,
-							children.blocks[j], lvl[i - 1].firstkey[j]);
-
-			/* ... and the child's own upper bound is below the next one */
-			if (j + 1 < children.npages)
+			if (j < children.npages && children.blocks[j] == below->blocks[p])
 			{
-				uint32		next = children.firstkey[j + 1];
+				uint32		sep = children.firstkey[j];
+
+				if (j == 0 && sep != 0)
+					lion_corrupt("lion index \"%s\": the first downlink of posting level %u has separator %u, expected minus infinity",
+								RelationGetRelationName(vs->index), i, sep);
+
+				/* the separator is at or below its child's own first key */
+				if (below->hasfirst[p] && sep > below->firstkey[p])
+					lion_corrupt("lion index \"%s\": the separator %u of posting block %u sorts after its own first container key %u",
+								RelationGetRelationName(vs->index), sep,
+								below->blocks[p], below->firstkey[p]);
+				j++;
+			}
+			else if (p > 0 && below->incomplete[p - 1])
+			{
+				/* the right half of an unfinished split: no downlink yet */
+			}
+			else if (j < children.npages)
+				lion_corrupt("lion index \"%s\": downlink %d of posting level %u points at block %u, but the next page of level %u is block %u",
+							RelationGetRelationName(vs->index), j, i,
+							children.blocks[j], i - 1, below->blocks[p]);
+			else
+				lion_corrupt("lion index \"%s\": posting level %u of chain entry %u on block %u has %d downlinks but level %u has %d pages",
+							RelationGetRelationName(vs->index), i, eoff, eblk,
+							children.npages, i - 1, below->npages);
+
+			/* ... and the page's own upper bound is below the next one */
+			if (j < children.npages)
+			{
+				uint32		next = children.firstkey[j];
 
 				if (i == 1)
 				{
-					if (lvl[0].hasfirst[j] && lvl[0].lastkey[j] >= next)
+					if (below->hasfirst[p] && below->lastkey[p] >= next)
 						lion_corrupt("lion index \"%s\": leaf %u holds container key %u, at or above the separator %u of its right sibling",
 									RelationGetRelationName(vs->index),
-									lvl[0].blocks[j], lvl[0].lastkey[j], next);
+									below->blocks[p], below->lastkey[p], next);
 				}
-				else if (lvl[i - 1].hashigh[j] && lvl[i - 1].highkey[j] > next)
+				else if (below->hashigh[p] && below->highkey[p] > next)
 					lion_corrupt("lion index \"%s\": the high key %u of posting block %u sorts after the separator %u of its right sibling",
 								RelationGetRelationName(vs->index),
-								lvl[i - 1].highkey[j], lvl[i - 1].blocks[j],
-								next);
+								below->highkey[p], below->blocks[p], next);
 			}
 		}
+
+		if (j < children.npages)
+			lion_corrupt("lion index \"%s\": posting level %u of chain entry %u on block %u has %d downlinks but level %u has %d pages",
+						RelationGetRelationName(vs->index), i, eoff, eblk,
+						children.npages, i - 1, below->npages);
 	}
 
 	if (height > vs->max_posting_height)
@@ -1548,11 +1583,13 @@ typedef struct LionVerifyLevel
 	BlockNumber *blocks;
 	LionEntryTuple **firstkey;	/* first data item of each page, or NULL */
 	LionEntryTuple **highkey;	/* its high key, or NULL when rightmost */
+	bool	   *incomplete;		/* flagged LION_PAGE_INCOMPLETE_SPLIT */
 } LionVerifyLevel;
 
 static void
 lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
-					 LionEntryTuple *firstkey, LionEntryTuple *highkey)
+					 LionEntryTuple *firstkey, LionEntryTuple *highkey,
+					 bool incomplete)
 {
 	if (lvl->npages >= lvl->maxpages)
 	{
@@ -1564,6 +1601,7 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 			lvl->blocks = (BlockNumber *) palloc(sizeof(BlockNumber) * lvl->maxpages);
 			lvl->firstkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
 			lvl->highkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
+			lvl->incomplete = (bool *) palloc(sizeof(bool) * lvl->maxpages);
 		}
 		else
 		{
@@ -1573,11 +1611,14 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 														 sizeof(LionEntryTuple *) * lvl->maxpages);
 			lvl->highkey = (LionEntryTuple **) repalloc(lvl->highkey,
 														sizeof(LionEntryTuple *) * lvl->maxpages);
+			lvl->incomplete = (bool *) repalloc(lvl->incomplete,
+												sizeof(bool) * lvl->maxpages);
 		}
 	}
 	lvl->blocks[lvl->npages] = blk;
 	lvl->firstkey[lvl->npages] = firstkey;
 	lvl->highkey[lvl->npages] = highkey;
+	lvl->incomplete[lvl->npages] = incomplete;
 	lvl->npages++;
 }
 
@@ -1793,7 +1834,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 				if (children != NULL)
 					lion_verify_level_add(children, item->head,
 										  lion_verify_copy_item(page, off),
-										  NULL);
+										  NULL, false);
 			}
 
 			CHECK_FOR_INTERRUPTS();
@@ -1806,7 +1847,8 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		if (prevkey != NULL)
 			pfree(prevkey);
 
-		lion_verify_level_add(out, blk, firstkey, highkey);
+		lion_verify_level_add(out, blk, firstkey, highkey,
+							  LionPageIncompleteSplit(page));
 
 		prev = blk;
 		prevhigh = highkey;		/* owned by *out; not freed here */
@@ -1876,49 +1918,75 @@ lion_verify_directory(LionVerifyState *vs)
 
 		if (i > 0)
 		{
-			if (children.npages != lvl[i - 1].npages)
-				lion_corrupt("lion index \"%s\": level %u has %d downlinks but level %u has %d pages",
-							RelationGetRelationName(vs->index), i,
-							children.npages, i - 1, lvl[i - 1].npages);
+			const LionVerifyLevel *below = &lvl[i - 1];
+			int			p;
 
-			for (j = 0; j < children.npages; j++)
+			/*
+			 * Match the downlinks with the pages of the level below, each in
+			 * the order its own walk found them; j is the next downlink to
+			 * match.  A page may lack a downlink when its left neighbour is
+			 * flagged LION_PAGE_INCOMPLETE_SPLIT: the right half of a split
+			 * whose downlink record a crash or an error cut off, which the
+			 * next writer that descends to the left page finishes (DESIGN.md
+			 * §21) and which the walk has already warned about.  The flag
+			 * with the downlink already in place is normal too - the flag is
+			 * cleared by a record of its own - and needs nothing here.  The
+			 * rules are the posting tree's, in lion_verify_chain().
+			 */
+			j = 0;
+			for (p = 0; p < below->npages; p++)
 			{
-				LionEntryTuple *sep = children.firstkey[j];
-
-				if (children.blocks[j] != lvl[i - 1].blocks[j])
-					lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, but the %dth page of level %u is block %u",
-								RelationGetRelationName(vs->index), j, i,
-								children.blocks[j], j, i - 1,
-								lvl[i - 1].blocks[j]);
-
-				if (j == 0)
+				if (j < children.npages && children.blocks[j] == below->blocks[p])
 				{
-					if (!LionEntryIsMinusInf(sep))
-						lion_corrupt("lion index \"%s\": the first downlink of level %u is not minus infinity",
-									RelationGetRelationName(vs->index), i);
+					LionEntryTuple *sep = children.firstkey[j];
+
+					if (j == 0)
+					{
+						if (!LionEntryIsMinusInf(sep))
+							lion_corrupt("lion index \"%s\": the first downlink of level %u is not minus infinity",
+										RelationGetRelationName(vs->index), i);
+					}
+					else if (LionEntryIsMinusInf(sep))
+						lion_corrupt("lion index \"%s\": downlink %d of level %u is minus infinity",
+									RelationGetRelationName(vs->index), j, i);
+					else if (below->firstkey[p] != NULL &&
+							 lion_cmp_entries(vs->ix, sep,
+											  below->firstkey[p]) > 0)
+						lion_corrupt("lion index \"%s\": the separator of block %u sorts after its own first key",
+									RelationGetRelationName(vs->index),
+									below->blocks[p]);
+					j++;
 				}
-				else if (LionEntryIsMinusInf(sep))
-					lion_corrupt("lion index \"%s\": downlink %d of level %u is minus infinity",
-								RelationGetRelationName(vs->index), j, i);
-				else if (lvl[i - 1].firstkey[j] != NULL &&
-						 lion_cmp_entries(vs->ix, sep,
-										  lvl[i - 1].firstkey[j]) > 0)
-					lion_corrupt("lion index \"%s\": the separator of block %u sorts after its own first key",
-								RelationGetRelationName(vs->index),
-								children.blocks[j]);
+				else if (p > 0 && below->incomplete[p - 1])
+				{
+					/* the right half of an unfinished split: no downlink yet */
+				}
+				else if (j < children.npages)
+					lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, but the next page of level %u is block %u",
+								RelationGetRelationName(vs->index), j, i,
+								children.blocks[j], i - 1, below->blocks[p]);
+				else
+					lion_corrupt("lion index \"%s\": level %u has %d downlinks but level %u has %d pages",
+								RelationGetRelationName(vs->index), i,
+								children.npages, i - 1, below->npages);
 
 				/*
 				 * A child's high key was the next separator when the split
 				 * made them; later splits of the child only lower it.
 				 */
-				if (j + 1 < children.npages &&
-					lvl[i - 1].highkey[j] != NULL &&
-					lion_cmp_entries(vs->ix, lvl[i - 1].highkey[j],
-									 children.firstkey[j + 1]) > 0)
+				if (j < children.npages &&
+					below->highkey[p] != NULL &&
+					lion_cmp_entries(vs->ix, below->highkey[p],
+									 children.firstkey[j]) > 0)
 					lion_corrupt("lion index \"%s\": the high key of block %u sorts after the separator of its right sibling",
 								RelationGetRelationName(vs->index),
-								lvl[i - 1].blocks[j]);
+								below->blocks[p]);
 			}
+
+			if (j < children.npages)
+				lion_corrupt("lion index \"%s\": level %u has %d downlinks but level %u has %d pages",
+							RelationGetRelationName(vs->index), i,
+							children.npages, i - 1, below->npages);
 		}
 	}
 
