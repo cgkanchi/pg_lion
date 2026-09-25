@@ -1349,6 +1349,15 @@ extern void lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 							OffsetNumber entryoff, LionEntryTuple *entry,
 							const char *payload, Size paylen);
 
+/*
+ * Does `head` name the live root of a posting set whose key hashes to `hash`?
+ * What tells a leaf that an interrupted multi-leaf spill left behind - its
+ * root was never written - from a leaf of a set that exists (DESIGN.md §18).
+ * wait = false never blocks and answers true when the root is busy.
+ */
+extern bool lion_posting_root_live(Relation index, uint32 hash,
+								   BlockNumber head, bool wait);
+
 
 /* ---------- additive helpers (wave 3, write path) ---------- */
 

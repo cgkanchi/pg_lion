@@ -2286,11 +2286,13 @@ lion_verify_meta(LionVerifyState *vs)
  * Every block has to belong to the meta page, the directory or exactly one
  * key's container chain.
  *
- * Two kinds of unreferenced block are tolerated (with a warning), because a
- * crash or an error can leave them behind and neither one makes the index
+ * Some unreferenced blocks are tolerated (with a warning), because a
+ * crash or an error can leave them behind and none of them makes the index
  * wrong: a block that was never initialised (the relation was extended and
- * the transaction did not get as far as its WAL record) and an empty
- * container page (a multi-page spill that did not reach its entry update).
+ * the transaction did not get as far as its WAL record), an empty container
+ * page (a crash between the two steps of a whole-set free), and a full leaf
+ * whose root was never written (a multi-leaf spill that did not reach its
+ * last record) - the kinds the leak sweep of the next VACUUM frees.
  */
 static void
 lion_verify_reachable(LionVerifyState *vs)
@@ -2339,7 +2341,26 @@ lion_verify_reachable(LionVerifyState *vs)
 			 (PageGetMaxOffsetNumber(page) == 0 ||
 			  LionPageIsPostingInternal(page)));
 
-		UnlockReleaseBuffer(buf);
+		/*
+		 * A FULL leaf is leaked when its root is not a live root of its key:
+		 * a multi-leaf spill that an ERROR or a crash stopped before its last
+		 * record writes the leaves and never the root (lion_entry_spill(),
+		 * DESIGN.md §18).  The root is looked at with nothing held.
+		 */
+		if (!leaked && !PageIsNew(page) &&
+			PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+			LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
+			LionPageIsPostingLeaf(page) && !LionPageIsDeleted(page) &&
+			LionPageGetOpaque(page)->owner_head != blk)
+		{
+			uint32		ohash = LionPageGetOpaque(page)->owner_hash;
+			BlockNumber ohead = LionPageGetOpaque(page)->owner_head;
+
+			UnlockReleaseBuffer(buf);
+			leaked = !lion_posting_root_live(vs->index, ohash, ohead, true);
+		}
+		else
+			UnlockReleaseBuffer(buf);
 
 		if (!leaked)
 			lion_corrupt("lion index \"%s\": block %u is not reachable from the meta page",
