@@ -51,6 +51,22 @@ endif
 # libdir only.
 UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libdir) -lpgcommon -lpgport -lm
 
+# `make unit SANITIZE=1` builds the unit tests with AddressSanitizer and
+# UndefinedBehaviorSanitizer and makes every report fatal, which CI does on
+# every major.  The unit tests are frontend programs that link nothing but
+# libpgcommon and libpgport, so the sanitizers need no help from the server,
+# and they are what feeds the container and sparse code malformed input.  The
+# binaries are always rebuilt under SANITIZE=1: a plain `make unit` leaves
+# binaries that are up to date by their sources, and running those would
+# silently test nothing extra.  (The reverse is harmless: a plain `make unit`
+# after a sanitized one runs the sanitized binaries until a source changes.)
+ifeq ($(SANITIZE),1)
+UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+UNIT_LDFLAGS += -fsanitize=address,undefined
+test/unit/container_test test/unit/sparse_test: .lion-force-unit
+.PHONY: .lion-force-unit
+endif
+
 test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
 
@@ -74,12 +90,14 @@ src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o: src/lio
 #
 #   make recovery-check PG_CONFIG=<prefix>/bin/pg_config RECOVERY_PREFIX=<prefix>
 #
-# With RECOVERY_PREFIX unset, run.sh uses the worktree install
-# (../pg_roaring_index-partial/.local/pg) - deliberately NOT the prefix
-# PG_CONFIG points at, so a bare "make recovery-check" cannot install into the
-# dev cluster's tree.  Nothing here touches the dev cluster either way: run.sh
-# creates its own clusters on a private socket directory and port and removes
-# them on exit.
+# RECOVERY_PREFIX is REQUIRED: run.sh refuses to start without it rather than
+# guess, and it is deliberately not derived from PG_CONFIG, so a bare "make
+# recovery-check" can never install into whatever installation the dev cluster
+# happens to use.  As root (a container, a CI image) also set
+# RECOVERY_RUN_AS=<unprivileged user>, because initdb and postgres refuse to
+# run as root.  Nothing here touches the dev cluster: run.sh creates its own
+# clusters in a private mktemp -d directory, with the socket directory inside
+# it, and removes that directory on exit.
 RECOVERY_PREFIX ?=
 EXTRA_CLEAN += test/recovery/log
 

@@ -314,13 +314,14 @@ VACUUM's sweep turns them into free pages) and anything else as an ERROR.
 
 ## 5. Locking protocol (deliberately coarse in v0)
 
-**Where this section says "bucket head page", read "the directory LEAF that holds the entry" (§21).**
-The directory is a B-tree now, so step 1 of INSERT is a descent rather than a modulo, step 2's walk
-of a bucket chain is a binary search plus a scan of the prefix run, the bucket-directory guard of
-step 2 is gone entirely (the tree grows by splitting), and ambuild sizes nothing. Everything else -
-the lock ordering, the one-record-per-atomic-step rule, the measured concurrency ceiling and why
-shortening the hold would not move it - is unchanged, and the leaf serialises the writers of a key
-exactly as the bucket head page did.
+Two B-trees are involved, and this section is the protocol across them: the entry DIRECTORY, keyed
+by the index key, whose leaves hold the entry tuples (§21), and for every CHAIN entry a POSTING TREE
+keyed by container key, whose leaves are the container pages and whose root is the entry's `head`
+(§22). What v0 decided and every format since has kept: one lock order, one WAL record per atomic
+step with an entry's counters in the same record as the containers they count, and **every writer
+of a key - aminsert and VACUUM - serialised on one page, the directory leaf that holds the key's
+entry**. That leaf is what the bucket head page of formats 1-3 was; the historical note at the end
+of this section says what went away with it.
 
 **A MULTICOLUMN index changes none of it (§24).** One relation holds every key column's entries in
 one directory, so one aminsert is n independent single-key inserts - one per column, each taking and
@@ -328,69 +329,91 @@ releasing the leaf that holds ITS entry - and two columns of one index contend e
 single-column indexes would, except that they may land on the same leaf. The lock ordering below is
 unchanged because a directory leaf is a directory leaf whatever column's entry is on it.
 
-Lock ordering: directory pages (root to leaf) → container pages (left to right) → new page.
-Never lock a page to the left of one you hold. The meta page is read once at relation open and
-cached (and re-read when a root split invalidates the cached root, §21).
+Lock ordering:
 
-INSERT (`lion_insert.c`)
-1. Hash the key; lock the bucket head page EXCLUSIVE and hold it until the insert is complete.
-2. Walk the bucket chain (lock each further bucket page EXCLUSIVE while inspecting/modifying it;
-   pages other than the head may be released when done) to find the entry. If absent, add an INLINE
-   entry with one 1-member array container (splitting the bucket chain by appending a new bucket page
-   if no bucket page has room).
-   **Bucket directory guard** (v1 write wave): the walk counts the pages it visits, and a chain
-   longer than `LION_BUCKET_PAGES_WARN` = 4 pages means the bucket holds about six times the entry
-   bytes ambuild sizes a bucket for (three quarters of a page), i.e. the index has outgrown the
-   directory it was built with. The threshold is not the "two pages per bucket on average" this
-   policy is stated as, because what an insert can observe cheaply is one bucket's chain - a
-   maximum, not an average - and hash skew plus ambuild's byte estimate (~30% low for keys whose
-   TIDs spread thinly, §13) leave a correctly sized index with three-page buckets; measured on the
-   20000-key column of bench/write_micro.sh's portfolio, which warned at a threshold of 2 right
-   after a clean build. An index that has really outgrown its directory is far past four pages:
-   100k keys in an index created empty give 64 buckets of twelve pages each.
-   The backend then says so once per index (`lion_warn_bucket_chain()`), suggesting a REINDEX. It is
-   advisory in exactly the way the §17 cardinality guard is - the index keeps working and keeps
-   taking rows - and the estimate is one bucket's chain rather than an average over the directory,
-   because hashes spread entries evenly enough and walking the whole directory on every insert would
-   cost more than the warning is worth. An index whose `buckets` reloption was set explicitly is
-   never warned about: that count is what its owner asked for. lion_index_stats() reports the
-   same quantity exactly, as `max_bucket_pages` (the longest chain in the index).
-   This is a warning and not online growth on purpose. Growing the directory in place would mean
-   splitting buckets (a new bucket count changes `lion_bucket_of()` for every key, so either the
-   whole directory is rehashed under a lock that stops every reader, or the index keeps a split
-   point and two hash functions, as dynamic hashing does - and then every reader, the count
-   pushdown and VACUUM have to consult it, and a crash in the middle has to leave the two halves
-   consistent). Measured: 100k keys inserted into an index created empty keep 64 buckets and 773
-   bucket pages, and the 100-key IN median goes from 0.104 ms (bulk-built, 847 buckets) to 0.321 ms
-   (bench/results/2026-09-21-stress). A REINDEX costs one build and puts it back; online growth is
-   out of scope for v1.
-3. INLINE: rebuild the inline payload in a work buffer with the member added; if ≤ inline_limit and it
-   fits on the bucket page (after PageRepairFragmentation if needed), overwrite the entry tuple;
-   else spill to a chain (allocate one page, add all containers) and fall through to CHAIN.
-4. CHAIN: find the page for ckey; lock it EXCLUSIVE; copy container out, add member (or create a new
-   1-member container), write back / split as in §4; update entry (ncontainers, ntids, tail).
+- **Directory pages before posting pages, never the reverse.** Nothing waits for a directory lock
+  while it holds a posting page; a READER also never asks for one while it holds a PIN on a posting
+  page (§11's deadlock rule for readers: VACUUM holds the leaf and waits for cleanup locks on that
+  entry's posting pages, and buffer locks have no deadlock detector). VACUUM's pass 2 is the one
+  path that holds a posting page and wants the leaf, and it only ever tries
+  (`ConditionalLockBuffer`), letting go of the posting page before it waits (§11).
+- **Within one tree, nbtree's rules** (§21 "Locking summary", §22): a descent takes SHARE locks and
+  releases the parent BEFORE locking the child, and takes the target leaf directly in the mode the
+  caller needs, so no lock is ever upgraded; a searcher whose key a concurrent split has moved off
+  the page it lands on moves right, which is where the split put it; on one level pages are only
+  ever taken left to right; an ascent - a split inserting its downlink, a repair finishing an
+  INCOMPLETE_SPLIT - holds the child while it locks the parent, which is exactly why a descent must
+  not couple downwards.
+- **A new page last.** It is taken (from the free space map or by extending the relation, §18)
+  before the record that initialises it opens, and it is always linked immediately right of the page
+  whose split or spill allocated it - the property §9/§11 build on.
+- **The meta page** is read at relation open and cached; the directory root is cached in
+  `LionState` and validated by the LION_PAGE_ROOT flag, so a lookup reads the meta page only when
+  the root has really moved (§21). A directory split writes it (it counts `dirpages`) and a root
+  split rewrites it, both taking it as the LAST buffer of their record; nothing else writes it.
+
+INSERT (`lion_insert.c`: `lioninsert()` calls `lion_insert_one()` once per key column and, for a
+multi-key opclass, once per extracted key)
+1. Hash the key and build the search key - kind VALUE, or the reserved NULL or EMPTY entry (§14,
+   §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
+   lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
+   held until the insert is complete: it is the page every writer of this key serialises on.
+2. Look the key up on the leaf: binary search to its prefix run, then the opclass equality over the
+   run (§21 "The order"). If it is absent, add an INLINE entry holding a one-pair sparse segment
+   (§13) at its exact position (`lion_dir_add_entry()`); find-or-create is one serialised operation,
+   because the leaf is held from the unsuccessful lookup to the insert - and for the rare prefix run
+   that spans pages, the leaf it is entered from is held as a GUARD while the scan couples rightwards
+   (§21 Operations). A leaf with no room splits: left, right, old right sibling and meta page in one
+   record, the downlink into the parent in a second, the INCOMPLETE_SPLIT flag cleared in a third; a
+   root split is one atomic record (§21). This is also the one path that makes the index grow a key,
+   so the §17 cardinality guard is checked here: the entries on this leaf times the number of
+   leaves, against `max_entries`.
+3. INLINE: rebuild the payload with the member added. If it is at most `lion_inline_max()` -
+   `inline_limit`, capped so that the entry never exceeds LION_MAX_ENTRY_SIZE (§21) - overwrite the
+   entry: at its allotted length when the INLINE growth slack left by the last insert holds the new
+   payload (only this entry's bytes change, no other entry on the leaf moves), else at the new length
+   plus fresh slack (§4). A grown entry that no longer fits its leaf splits the leaf
+   (`lion_dir_place()`) instead of spilling, which the hash directory had to do. Otherwise SPILL:
+   allocate one container page, move the containers there, make the entry CHAIN with head = tail =
+   that page - the root of a one-page posting tree, keeping every LION_ENTRY_RESERVED bit - and fall
+   through to CHAIN. The leaf is still held.
+4. CHAIN: find the posting LEAF that owns the ckey and lock it EXCLUSIVE. The tail is tried first
+   (`lion_insert_lock_chain_page()`), with the exclusive lock the insert needs anyway, and kept when
+   it is still the rightmost leaf, not incompletely split, and its minckey is at or below the ckey -
+   which is where every insert into a growing posting set lands. Anything else releases it and
+   descends the posting tree from `head` (`lion_posting_search()`); because the directory leaf held
+   in step 1 serialises every writer of the key, no posting split can be in flight, the separators
+   say exactly which leaf owns the ckey, and a write descent needs no move-right (§22). Then copy
+   the item out, add the member - or let the pair join or start a sparse segment, promoting a ckey
+   that reaches LION_SPARSE_THRESHOLD members to a container of its own (§13) - and write it back,
+   splitting the leaf if it no longer fits: P → M → N in one record (P, M, N, entry leaf), a
+   record per downlink, then the flags cleared; a split of the ROOT is a push-down that keeps the
+   root at its block, so `head` never changes (§4, §22). The entry's counters (ncontainers, ntids,
+   tail) are written in the same record as the items.
    Fast path: when the item already on the page can take the member without changing the number of
-   bytes the page has allotted it, the member is added directly in the GenericXLog page image
+   bytes the page has allotted it, the member is added directly in the page the WAL shim hands back
    (same locks, same single record carrying the entry tuple) instead of being copied out, mutated
    and written back with PageIndexTupleOverwrite. Nothing else on the page changes: same allotted
    length, same offset, same ckey, so min/max stay put (a sparse segment may extend its range, and
    then only min/max move). A BITSET always qualifies - it is 4104 bytes whatever its cardinality -
    and an ARRAY, a RUN or a segment qualifies when the item has growth slack (§4), which the general
    path leaves behind whenever an insert writes an item.
-   The page is located with the exclusive lock the insert needs anyway: the tail page is tried
-   first (`lion_insert_lock_chain_page()`), because that is where every insert into a growing posting
-   set lands, and only a ckey the tail does not own falls back to `lion_chain_find_page()`, which
-   walks from the head. That saves the SHARE acquisition lion_chain_find_page() would take on the
-   very same tail page just to read its minckey: two lock acquisitions per appending insert instead
-   of three, all of them inside the bucket-lock window. It did NOT move the concurrent-insert
-   ceiling of step 6 (643 tps either way, measured by swapping the two builds in one session), which
-   is what step 6 explains; it is kept because it strictly removes work from inside that window, and
-   an insert whose ckey is not on the tail pays the same number of acquisitions as before (an
-   exclusive lock on the tail where it used to be a shared one).
-5. All page modifications go through GenericXLog: one GenericXLogStart per atomic step, registering
-   at most 4 buffers (a split touches P, N, possibly M, and the bucket page).
-6. Release everything. Inserts to different buckets do not block each other; inserts to the same
-   bucket serialize. Documented and accepted for v0, and measured for v1 (bench/write_micro.sh,
+   Trying the tail first saves the SHARE acquisition a lookup-then-lock would take on the very same
+   tail page just to read its minckey: two lock acquisitions per appending insert instead of three,
+   all of them inside the leaf-lock window. It did NOT move the concurrent-insert ceiling of step 6
+   (643 tps either way, measured with the hash directory and generic WAL by swapping the two builds
+   in one session), which is what step 6 explains; it is kept because it strictly removes work from
+   inside that window, and an insert whose ckey is not on the tail pays the same number of
+   acquisitions as before (an exclusive lock on the tail where a shared one would have done).
+5. Every page modification goes through the WAL shim of §25 (`lion_wal_begin()`,
+   `lion_wal_register_buffer()`, `lion_wal_op()`, `lion_wal_finish()`): one record per atomic step,
+   registering at most 4 buffers - GenericXLog's limit, which the resource manager's records keep so
+   that both modes share every call site; a split touches P, N, possibly M, and the entry leaf. In
+   rmgr mode the record is written inside a critical section, so everything fallible - taking a new
+   page above all - happens before it opens.
+6. Release everything. Inserts whose keys live on different directory leaves do not block each
+   other; inserts of one key serialise, and so do inserts of keys that share a leaf. Documented and
+   accepted for v0, and measured for v1 with the hash directory and generic WAL (bench/write_micro.sh,
    8 clients × 100 rows per transaction, fsync on, synchronous_commit on, 1 index):
 
        transactions/s, 100 rows each      1 client   4 clients   8 clients
@@ -400,136 +423,159 @@ INSERT (`lion_insert.c`)
        no index, 2 key values                511       1170        2296
 
    With a thousand key values the index side all but disappears (5.1× scaling, 82% of the no-index
-   ceiling); with two it flatlines at 1.7×. The wait-event profile of the two-value case is 57%
+   ceiling); with two it flatlines at 1.7×. The wait-event profile of the two-value case was 57%
    `Buffer/BufferExclusive` against btree's 31%, so the buffer content locks of the two keys' pages
-   are indeed where the time goes - but shortening the hold is NOT what would fix it, and the
-   numbers say why. A single-client roaring insert costs ~7.7 µs of which the serialized part is the
-   GenericXLog record: registering a buffer copies the whole 8 KB page, GenericXLogFinish() diffs
-   it against the copy and applies the image, so a record covering the container page and the
-   bucket page moves ~48 KB of memory per single-TID insert, all of it inside both locks because
-   §5 requires the entry's counters to travel with the container change. Repeating the burst on an
-   UNLOGGED table - no delta, no XLogInsert - lifts it only from 643 to 868 tps (btree 1466 → 2150,
-   no index 2296 → 19538), so the cost is the page-sized copying rather than the logging.
-   The protocol that would shorten the bucket hold (release the bucket page, walk and lock the
-   chain page, then ConditionalLockBuffer() the bucket page and re-read the entry, retrying from
-   the top on failure, as ambulkdelete does in §11) was therefore NOT implemented: it does not
-   remove the record write from the window where both pages are held, and it adds an acquisition
-   and a retry path. It is worth doing for the case it really helps - an insert whose ckey is in
-   the MIDDLE of a long chain, where `lion_chain_find_page()` walks many pages under the bucket
-   lock - and that is the shape to revisit it in. The structural fix for hot-key inserts is a
-   custom WAL resource manager (RegisterCustomRmgr, PG 15+) with physical records ("set member m of
-   the item at offset o", "add n to the entry's ntids") instead of GenericXLog's page diffs, which
-   would cut the critical section by an order of magnitude.
+   were indeed where the time went - but shortening the hold is NOT what would fix it, and the
+   numbers said why. A single-client insert cost ~7.7 µs of which the serialised part was the
+   GenericXLog record: registering a buffer copies the whole 8 KB page and GenericXLogFinish() diffs
+   it against the copy and applies the image, so a record covering the container page and the entry
+   page moved ~48 KB of memory per single-TID insert, all of it inside both locks because the
+   entry's counters travel with the container change. Repeating the burst on an UNLOGGED table - no
+   delta, no XLogInsert - lifted it only from 643 to 868 tps (btree 1466 → 2150, no index 2296 →
+   19538), so the cost was the page-sized copying rather than the logging.
+   So the protocol that would shorten the leaf hold (release the leaf, walk and lock the posting
+   page, then ConditionalLockBuffer() the leaf and re-read the entry, retrying from the top on
+   failure, as ambulkdelete does in §11) was NOT implemented: it does not remove the record write
+   from the window where both pages are held, and it adds an acquisition and a retry path. The
+   structural fix was the custom WAL resource manager of §25, which logs the bytes that changed with
+   no image and no diff: the same 8-client, 2-key burst went from 765 tps generic to 1275 rmgr
+   (btree 1632, release build), past the unlogged ceiling above.
 
-SCAN (`lion_scan.c`, amgetbitmap)
-1. Lock bucket head SHARED, walk the bucket chain (lock coupling not required for bucket pages:
-   hold one page at a time; entries are only ever appended to bucket pages or overwritten in place).
-2. On finding the entry: INLINE → copy the payload out, release, emit. CHAIN → copy head, release the
-   bucket page, then descend to the leftmost LEAF (§22: head is the posting tree's root) and walk the
-   leaves holding one SHARED page lock at a time: read all items and the rightlink under the lock,
-   release, lock the rightlink. Splits only move items to a new page immediately to the right and
-   require an EXCLUSIVE lock on the source, so a reader sees every container exactly once (it read
-   the items and the rightlink atomically). The descent hands the first leaf back LOCKED, which is
-   what keeps a root push-down from slipping in between.
+SCAN (`lion_scan.c`, amgetbitmap; §29 says what the plain index scan does differently)
+1. Descend the directory with SHARE locks to the leaf that holds the search key's entry - the probe
+   resolved once per scan key type, which is also how a cross-type key is handled (§21
+   `lion_probe_init()`/`lion_probe_find()`) - holding one page at a time and moving right past a
+   concurrent split. `IS NULL` descends to the column's reserved NULL entry; `IS NOT NULL` and the
+   multi-key fallback walk the column's whole run of leaves instead, and a range the part of it
+   between its bounds (§28), copying each leaf into backend-local memory and releasing it before its
+   entries are emitted.
+2. On finding the entry: INLINE → copy the payload out, release the leaf, emit. CHAIN → copy the
+   entry out and release the leaf BEFORE any posting page is pinned (the reader half of §11's
+   deadlock rule), then descend the posting tree from `head` to its leftmost leaf and walk the leaves
+   holding one SHARE lock at a time: copy the page - items and rightlink - under the lock, release,
+   lock the rightlink. Splits only move items to a new page immediately to the right and require an
+   EXCLUSIVE lock on the source, so a reader sees every container exactly once (it read the items
+   and the rightlink atomically). The descent hands the first leaf back LOCKED, which is what keeps
+   a root push-down from slipping in between. Between releasing the leaf and reading the posting
+   pages the scan holds nothing of the set but its `head`, so VACUUM may free the set and an insert
+   may take its pages back; the owner stamp on every page (§18) is what makes the walk stop there,
+   and VACUUM frees a set only once it holds nothing any snapshot could see, so stopping loses
+   nothing.
 3. Emit each container into the TIDBitmap: for each of the ≤ 64 heap blocks the container covers,
    collect its offsets into an ItemPointerData array and call tbm_add_tuples once per heap block
    (never one call per TID). Return the number of TIDs.
-4. amgetbitmap with a NULL scan key (`col = NULL`) or a key of the wrong type returns 0 TIDs.
-   SK_SEARCHNULL emits the NULL entry and SK_SEARCHNOTNULL every other entry (§14); SK_SEARCHARRAY
-   emits one entry per non-NULL element of the array (§15).
-5. The index has one key column, but the planner may hand the scan more than one qual on it
-   (`b = ANY (x) AND b = ANY (y)`, an equality next to a null test). The scan answers the most
-   selective-looking one - a plain equality, else a list, else a null test - and passes recheck =
-   true to tbm_add_tuples() for every TID, so the bitmap heap scan re-applies the original quals.
-   Emitting a superset with recheck set is correct; silently dropping the other quals would not be.
+4. A NULL scan key (`col = NULL`, a NULL array) returns 0 TIDs, and so does a NULL element of an
+   array. SK_SEARCHNULL emits the NULL entry and SK_SEARCHNOTNULL every other entry of the column
+   (§14); SK_SEARCHARRAY emits one entry per non-NULL element (§15). A multi-key opclass answers its
+   own strategies through its extracted key tree (§17).
+5. The planner may hand one key column more than one qual (`b = ANY (x) AND b = ANY (y)`, an
+   equality next to a null test). Per column the scan answers the most selective-looking one - a
+   plain equality, else a list, else a range (every range key of the column at once, §28), else a
+   null test (`lion_scan_choose()`) - and passes recheck = true to tbm_add_tuples() for every TID
+   whenever a qual was left out, so the bitmap heap scan re-applies the original quals. Emitting a
+   superset with recheck set is correct; silently dropping the other quals would not be. Several
+   key columns (§24) are answered per column and intersected.
 
 VACUUM (`lion_vacuum.c`, ambulkdelete)
-1. For each bucket: two passes as described in §11 (the head is cleanup-locked only while its own
-   INLINE entries are modified; chain pages are processed without holding the head across waits).
-2. For each entry: INLINE → filter the payload through the callback and repack. Note that removal can
-   GROW a container (every-other-member deletion turns a RUN into a 4104-byte BITSET), so a filtered
-   INLINE payload may exceed inline_limit or the page: then the entry spills to a chain during VACUUM.
-   The bound is lion_inline_max(), as for INSERT and ambuild: next to a ~2000-byte key a payload
-   inside inline_limit can still overflow LION_MAX_ENTRY_SIZE (an ARRAY that a 2030-member deletion
-   made out of a RUN, say), and VACUUM tested inline_limit alone and failed on it every run until
-   the 2026-09-23 review.
-   CHAIN → walk the posting tree's leaves, left to right from the leftmost one; each leaf is locked
-   with LockBufferForCleanup (this is the
-   interlock that phase 2 relies on: a heap-skipping reader keeps the page pinned while it consults
-   the visibility map). Filter every container with lion_container_remove_if, run
-   lion_container_optimize, write back in place or, if it grew and no longer fits, re-place it through
-   the chain machinery (which may split the page); delete empty containers with one
-   PageIndexMultiDelete per page (it compacts; no PageRepairFragmentation needed); update min/max.
-   Empty pages stay in the chain. Every page record also carries the updated entry (ncontainers/ntids),
-   so a crash cannot desynchronise the counters. An entry whose ntids reaches 0 is DELETED, and its
-   chain freed, in a final step for its bucket page (§18).
+1. Walk the directory leaves left to right from the leftmost one, each in the two passes §11 sets
+   out. Pass 1 cleanup-locks the leaf with nothing else held, filters its INLINE entries and writes
+   every changed one back in ONE record for the leaf, and notes the offset, head and KEY of every
+   CHAIN entry; it then drops the content lock and keeps the pin. Pass 2 takes each CHAIN entry's
+   posting tree in turn and never waits for a lock while it holds another (§11's waiting rule): it
+   waits for a posting page's cleanup lock with nothing else held and then only TRIES the leaf, and
+   when the leaf is busy it lets go of the page, waits for the leaf with nothing else held and then
+   only tries the page, starting over if that fails. The noted offset is only a hint - a sorted
+   leaf shifts entries when an insert lands in the middle and moves them when it splits - so every
+   use re-validates the entry by kind and stored key, and one that moved is found again by a descent
+   made with NOTHING held (§21 "Offsets are not names any more").
+2. For each entry: INLINE → filter the payload through the callback and repack. Removal can GROW a
+   container (every-other-member deletion turns a RUN into a 4104-byte BITSET), so a filtered
+   INLINE payload may exceed lion_inline_max(); then the entry spills during VACUUM, exactly as an
+   insert would.
+   CHAIN → descend from `head` to the leftmost leaf with a cleanup lock on every page of the way,
+   the root first (`lion_vacuum_descend()`, §11, §22: a one-page set's root is a leaf a reader may
+   have copied containers from), then walk the leaves left to right, each under
+   LockBufferForCleanup whether or not the page has anything to remove, because this is the
+   interlock the count path relies on (§9: a heap-skipping reader keeps the page pinned while it
+   consults the visibility map). Filter every container with lion_container_remove_if, run
+   lion_container_optimize, write back in place or, if it grew and no longer fits, re-place it
+   through the posting-tree placement code in a window of its own (the regrow of §11 and §18, which
+   may split the leaf or push the root down); delete empty containers with one PageIndexMultiDelete
+   per page; update min/max. A root that an insert pushed down under the walk - VACUUM finds an
+   internal page where it expected a leaf - makes it descend again. Every page record also carries
+   the updated entry (ncontainers/ntids), applied as deltas to the entry as it stands, so a crash
+   cannot desynchronise the counters. Empty leaves and internal pages stay in the tree; an entry
+   whose ntids reaches 0 is DELETED, and its whole posting tree freed bottom up, in a final step for
+   its leaf (§18). A page VACUUM cleanup-locked without writing to it joins the standby barrier of
+   §25.
 3. Report stats: num_pages, num_index_tuples = Σ ntids, tuples_removed, and the pages this cycle
-   freed (pages_newly_deleted/pages_deleted/pages_free, §18).
+   freed (pages_newly_deleted/pages_deleted/pages_free, §18) - including what the leak sweep at the
+   end recovered from blocks the walk never reached.
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
    counting pages; otherwise pass it through.
 
 BUILD (`lion_build.c`)
-1. table_index_build_scan callback pushes (hash int4, key datum, code int8) into a tuplesort created
-   with tuplesort_begin_heap over a 3-attribute TupleDesc, sort keys (hash ASC via int4 btree,
-   code ASC via int8 btree), TUPLESORT_RANDOMACCESS, maintenance_work_mem. A NULL key goes in with
-   hash 0 and the key column NULL (§14); the two passes below group by the isnull flag first.
-2. Pass 1 over the sorted data counts distinct keys (equal hash ⇒ compare with the equality proc,
-   remembering the small set of distinct keys seen for the current hash value) and adds up the BYTES
-   their entry tuples will need: for each key, MAXALIGN(MAXALIGN(LION_ENTRY_HDRSZ + keylen) +
-   min(payload, inline_limit)) + sizeof(ItemIdData), where the payload of a key with n members is
-   estimated as 6n bytes below LION_SPARSE_THRESHOLD members (one sparse pair each, §13) and
-   LION_CONTAINER_HDRSZ + 2n from there on (an ARRAY container). Both halves are rough - pass 1 does
-   not group the codes by container key - but they have the right order of magnitude at both
-   extremes. nbuckets = reloption if set, else ceil(total bytes / (BLCKSZ * 3/4)), clamped to
-   [LION_DEFAULT_BUCKETS = 64, 65536]. Bytes rather than key counts, because every bucket owns a head
-   page whether it needs one or not: sizing by distinct keys spent 32768 pages (256 MB) on a
-   1M-key index whose entries were 84 MB. The floor matters because indexes are usually built on
-   empty tables and filled later.
-   The byte total is scaled up by `pg_class.reltuples / indexed rows` when the heap is known to hold
-   more rows than this build put in the index, because the directory is sized once and nothing ever
-   resizes it (INSERT step 2 warns when it has been outgrown). Only ever up, and only for an index
-   over the whole table: a partial index holds the rows its predicate selects, and sizing that for
-   the whole heap would spend pages on buckets that stay empty. reltuples is -1 until something
-   analyses the heap, so an index built on an EMPTY table still gets the floor - for that case the
-   only way to say how large the index is going to be is the `buckets` reloption, which means an
-   exact count (§4).
-3. tuplesort_rescan; pass 2 groups by key. Because codes are sorted within a hash, and keys sharing a
-   hash are rare, keep one open builder per distinct key of the current hash (a builder = ordered
-   list of containers under construction; use lion_container_append_sorted with a per-key "last ckey"
-   and finish each container with lion_container_optimize when the ckey changes). When the hash
-   changes, flush all builders: small payload → INLINE entry; else allocate container pages and fill
-   them sequentially (fill each page until the next container does not fit; set rightlink,
-   min/max), then add the CHAIN entry.
+1. table_index_build_scan's callback puts one tuple per (key column, extracted key, heap row) into a
+   tuplesort per key column (§24), sorted into the directory order - `(key ASC NULLS FIRST, [kind],
+   code)` for an ordered opclass, `(hash, kind, code)` for an unordered one - so the codes of each key
+   arrive together and ascending (§21 "Bulk build", which also says why `kind` never leads).
+   maintenance_work_mem is split between the sorts. A NULL key goes in with a NULL key column and
+   the reserved kind (§14).
+2. ONE pass over the sorted data groups the codes of each key into containers. There is no sizing
+   pass any more: the old pass 1 counted distinct keys only to size the bucket directory, and a
+   B-tree directory is not sized, it is built to fit, so the tuplesort needs no
+   TUPLESORT_RANDOMACCESS either.
+3. Keep one open builder per distinct key in progress - one, unless the hash function of an
+   unordered opclass collides - using lion_container_append_sorted with a per-key "last ckey" and
+   finishing each container with lion_container_optimize when the ckey changes; a ckey with fewer
+   than LION_SPARSE_THRESHOLD members goes into a sparse segment instead (§13). When the key
+   changes, flush: the builders are
+   put in directory order first (§21, a hash collision), then a payload within lion_inline_max()
+   becomes an INLINE entry, and anything larger a posting tree - its leaves written left to right,
+   each filled until the next container does not fit (rightlink, min/max), with the ROOT's block
+   reserved the moment a second leaf is needed and the internal levels built bottom-up in the same
+   pass (§22). The entry then goes to the directory's leaf level, which is built the same way,
+   nbtree's `_bt_buildadd` shape: one open page per level, leaves filled to `fillfactor`, internal
+   pages to 70% with at least two downlinks, each page written when the item that does not fit
+   arrives - that item's key is the page's high key - and the level whose last page is also its
+   first is the root (§21). An empty table gets a single leaf that is also the root.
 4. Pages are written through the bulk-write API (storage/bulk_write.h), which is what the nbtree
    and GiST builds use: `smgr_bulk_start_rel()` once for MAIN_FORKNUM, `smgr_bulk_get_buf()` for
-   each page image, `smgr_bulk_write()` when that page is final, `smgr_bulk_finish()` at the end.
-   Pages go straight to the file without passing through shared buffers, are WAL-logged in batches
-   of up to 32 as full-page images (or not logged at all for an unlogged relation or under
-   wal_level = minimal, in which case the relation is registered for the next sync), and each page
-   is written EXACTLY ONCE. Nothing may touch these blocks through the buffer manager until
-   smgr_bulk_finish() has returned.
+   each page image, `smgr_bulk_write()` when that page is final, `smgr_bulk_finish()` at the end
+   (PostgreSQL 16 gets a reduced copy of 17's API in lion_build.c). Pages go straight to the file
+   without passing through shared buffers, are WAL-logged in batches of up to 32 as full-page images
+   (or not logged at all for an unlogged relation or under wal_level = minimal, in which case the
+   relation is registered for the next sync), and each page is written EXACTLY ONCE. Nothing may
+   touch these blocks through the buffer manager until smgr_bulk_finish() has returned. The build
+   therefore never goes through the WAL shim, and `wal_mode` changes nothing about it (§25).
    Writing each page once is the point: the old route through the buffer manager logged one
    GenericXLog record per entry tuple, so a build of 632k keys paid 632k page diffs and 632k WAL
    records to fill 15k pages (measured, 1M rows, one column: 4.7 s and 76 MiB of WAL against 1.9 s
-   and 39 MiB now; the eight-index portfolio of bench/COMPARISON.md went 13.0 s / 95 MiB to
-   11.3 s / 57 MiB, which is below btree's 59 MiB).
-   It also means a page has to be FINAL before it is written, and a bucket page is only final when
-   the last entry that hashes to it has been added. Bucket pages therefore live in backend-local
-   memory - one 8 KB image per bucket page that holds entries, allocated lazily - until pass 2 is
-   over, and are written afterwards: head pages in bucket order, then the overflow pages in block
-   order. That is the cost of this route: the directory is sized at three quarters of a page per
-   bucket, so the images come to ~1.3× the bytes the entries need, bounded by LION_MAX_BUCKETS pages
-   (512 MB) and by nothing else. Container pages are final as soon as the next container does not
-   fit, so only one per open key exists at a time.
-   Block numbers come from a counter rather than from extending the relation, in the same order the
-   buffer-manager route extended it (meta = 0, bucket directory = 1 .. nbuckets, then container
-   pages and further bucket pages on demand), so an index built by either route has the same page at
-   the same block - which is what keeps every regression output identical. The directory is a hole
-   in the file while pass 2 runs; the bulk writer fills a hole with zero pages when a later block is
-   written past it, and the real pages overwrite them afterwards, which costs one extra 8 KB
-   buffered write per bucket page and no WAL.
-5. ambuildempty: init meta + bucket pages (nbuckets = reloption or 64) in INIT_FORKNUM with
-   log_newpage, as contrib/bloom does.
+   and 39 MiB with the bulk writer; the eight-index portfolio of bench/COMPARISON.md went 13.0 s /
+   95 MiB to 11.3 s / 57 MiB, which is below btree's 59 MiB).
+   It also means a page has to be FINAL before it is written. A directory page is final as soon as
+   the item that does not fit on it arrives, so at most one page per level is open at a time, and a
+   container page as soon as the next container does not fit, so only one of those exists per open
+   key. Block numbers come from a counter: the meta page is block 0, and its image is kept and
+   written last, once the root is known; everything else takes the next block as it is needed.
+5. ambuildempty (`lion_am.c`): the meta page, recording the directory order as a build does, and a
+   single empty leaf that is also the root, in INIT_FORKNUM with log_newpage, as contrib/bloom does.
+
+**Historical: the bucket directory (formats 1-3).** Before §21 the directory was `nbuckets` hash
+buckets, each a rightlink chain of bucket pages starting at a fixed head page, and before §22 a
+CHAIN entry's containers were a plain linked chain of pages walked from `head`. INSERT and VACUUM
+serialised on the bucket HEAD page, SCAN walked the bucket chain, and ambuild spent a first pass
+over the sorted data estimating entry bytes to size the directory once and for all (at least 64
+buckets, 3/4 of a page each, scaled by `reltuples`), because nothing could grow it: an insert that
+found its bucket chain longer than four pages warned once per index that the directory had been
+outgrown and suggested a REINDEX (`max_bucket_pages` in lion_index_stats() measured the same thing).
+Measured then: 100k keys inserted into an index created empty kept 64 buckets and 773 bucket pages,
+and the 100-key IN median went from 0.104 ms (bulk-built, 847 buckets) to 0.321 ms. Online growth
+by dynamic hashing was rejected as out of scope for v1; the sorted directory replaced the whole
+arrangement instead, and grows by splitting. `nbuckets`, the bucket-chain warning and its
+threshold, and the sizing pass are gone; the `buckets` reloption is accepted and ignored with a
+NOTICE (§21 "What goes away"). The bucket-era build kept every bucket page image in memory until
+the last key had been hashed; the sorted build keeps one open page per level.
 
 ## 6. Handler settings (`lion_am.c`)
 
