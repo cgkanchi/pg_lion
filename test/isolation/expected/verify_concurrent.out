@@ -1,0 +1,102 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_attach s1_verify s2_insert s3_wakeup s3_after
+step s1_attach: 
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('lion-verify-meta-read', 'wait');
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_insert: 
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	  FROM generate_series(1, 600) g;
+ <waiting ...>
+step s3_wakeup: 
+	SELECT injection_points_detach('lion-verify-meta-read');
+	SELECT injection_points_wakeup('lion-verify-meta-read');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_insert: <... completed>
+step s3_after: 
+	SELECT s.leaf_pages > b.leaf_pages AS the_insert_split_the_directory,
+		   (SELECT count(*) FROM vc WHERE k LIKE 'new%') AS new_rows
+	  FROM lion_index_stats('vc_k') s, vc_before b;
+	SELECT lion_index_verify('vc_k', true);
+
+the_insert_split_the_directory|new_rows
+------------------------------+--------
+t                             |     600
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_begin s2_insert s1_verify s2_commit s3_after
+step s2_begin: BEGIN;
+step s2_insert: 
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	  FROM generate_series(1, 600) g;
+
+step s1_verify: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_commit: COMMIT;
+step s1_verify: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_after: 
+	SELECT s.leaf_pages > b.leaf_pages AS the_insert_split_the_directory,
+		   (SELECT count(*) FROM vc WHERE k LIKE 'new%') AS new_rows
+	  FROM lion_index_stats('vc_k') s, vc_before b;
+	SELECT lion_index_verify('vc_k', true);
+
+the_insert_split_the_directory|new_rows
+------------------------------+--------
+t                             |     600
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_lock s1_verify s2_drop s2_rollback
+step s2_lock: BEGIN; LOCK TABLE vc IN ACCESS EXCLUSIVE MODE;
+step s1_verify: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_drop: DROP INDEX vc_k;
+step s2_rollback: ROLLBACK;
+step s1_verify: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+

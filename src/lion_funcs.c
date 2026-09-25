@@ -5,11 +5,25 @@
  *		lion_index_stats(), lion_index_verify(), lion_index_posting_root()
  *		and lion_index_wal_mode().
  *
- * Both open the index with AccessShareLock and read one page at a time under
- * a SHARE lock, so they run concurrently with inserts; lion_index_verify()
- * additionally holds the SHARE lock of a bucket head page for as long as it
- * is checking that bucket, which pins down the whole bucket (every reader and
- * writer of a key enters through its bucket head) and gives it a stable view.
+ * lion_index_stats() opens the index with AccessShareLock and reads one page
+ * at a time under a SHARE lock, so it runs concurrently with INSERT and
+ * VACUUM.  Its counters are sums over pages read at different moments, which
+ * is all a statistic promises, and it checks no more of a page than it needs
+ * to read the page safely: telling damage apart is lion_index_verify()'s job.
+ *
+ * lion_index_verify() is a PARENT check in amcheck's sense
+ * (bt_index_parent_check()): it compares every level of the directory and of
+ * each posting tree with the whole level below it, and proves that every
+ * block is reachable exactly once.  None of that holds between pages read at
+ * different moments while writers split them - a level walked before a split
+ * and its parent walked after it disagree, a block number taken at the start
+ * is exceeded by the first page a split allocates, and a page allocated after
+ * the walk passed is reachable from nothing it saw - so it takes ShareLock on
+ * the table and then on the index, which keeps every INSERT, UPDATE, DELETE
+ * and VACUUM out for as long as it runs and makes it check one index rather
+ * than a moving one.  During recovery no lock above RowExclusiveLock can be
+ * taken, and no lock stops replay anyway: there it takes AccessShareLock and
+ * is exact only while replay leaves the index alone (DESIGN.md section 7).
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table
@@ -615,13 +629,43 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
  * --------------------------------------------------------------------- */
 
 /*
+ * Is blk a block of the index?
+ *
+ * vs->nblocks is the count taken when the check began, and nothing can extend
+ * the index under the ShareLock the check holds - except replay, during
+ * recovery, where the lock keeps nothing out.  There the count is read again
+ * before a block is called out of range, so that a leaf replay has just split
+ * onto a new block is not reported as a link past the end.
+ */
+static bool
+lion_verify_block_exists(LionVerifyState *vs, BlockNumber blk)
+{
+	if (blk < vs->nblocks)
+		return true;
+
+	if (RecoveryInProgress())
+	{
+		BlockNumber n = RelationGetNumberOfBlocks(vs->index);
+
+		if (n > vs->nblocks)
+		{
+			vs->refs = (uint8 *) repalloc0(vs->refs, Max(vs->nblocks, 1),
+										   sizeof(uint8) * n);
+			vs->nblocks = n;
+		}
+	}
+
+	return blk < vs->nblocks;
+}
+
+/*
  * Record that blk is referenced by something, and refuse to look at it twice
  * (which also stops a corrupt rightlink cycle from looping forever).
  */
 static void
 lion_verify_visit(LionVerifyState *vs, BlockNumber blk, const char *what)
 {
-	if (blk >= vs->nblocks)
+	if (!lion_verify_block_exists(vs, blk))
 		lion_corrupt("lion index \"%s\": %s points at block %u, but the index has only %u blocks",
 					RelationGetRelationName(vs->index), what, blk, vs->nblocks);
 
@@ -2284,13 +2328,23 @@ lion_verify_heapallindexed(LionVerifyState *vs)
  *
  * The one decision that has to be the CALLER's is whether the error messages
  * may carry key values, so it is taken before the switch (showvalues).
+ *
+ * BOTH LOCKS ARE SHARELOCKS, which is what bt_index_parent_check() takes for
+ * the same kind of check (see the file header): no writer and no VACUUM can
+ * change the index while it is walked level by level, and none of the
+ * whole-index comparisons can mistake a concurrent split for damage.  They
+ * wait for the writers already in flight, block new ones until the check is
+ * over, and are released when this function returns rather than at commit,
+ * as amcheck does - nothing here sends an invalidation that could make that
+ * unsafe.  During recovery only AccessShareLock is possible (and replay takes
+ * no relation locks to be kept out by); DESIGN.md §7 says what that means.
  */
 Datum
 lion_index_verify(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	bool		heapallindexed = PG_GETARG_BOOL(1);
-	LOCKMODE	lockmode = AccessShareLock;
+	LOCKMODE	lockmode = RecoveryInProgress() ? AccessShareLock : ShareLock;
 	LionVerifyState vs;
 	Oid			heapoid;
 	Oid			save_userid;
@@ -2328,6 +2382,14 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	vs.refs = (uint8 *) palloc0(sizeof(uint8) * Max(vs.nblocks, 1));
 
 	lion_verify_meta(&vs);
+
+	/*
+	 * Test hook: the block count and the root are taken, nothing has been
+	 * walked.  test/isolation/verify_concurrent.spec parks here and has a
+	 * writer try to split the directory underneath.
+	 */
+	LION_INJECTION_POINT("lion-verify-meta-read");
+
 	lion_verify_directory(&vs);
 	lion_verify_reachable(&vs);
 
