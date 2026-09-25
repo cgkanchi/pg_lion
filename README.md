@@ -177,6 +177,9 @@ attempted for an old-style inheritance parent without `ONLY`, whose children nee
 its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
 are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
 `pg_stat_scan_tables`.
+`lion_index_verify()` takes ShareLock on the table and the index, like amcheck's
+`bt_index_parent_check()`: writes to the table wait while it runs (reads and other checks do not),
+and with `heapallindexed` it evaluates the index's expressions as the table's owner (DESIGN.md §7).
 
 ## Source layout
 
