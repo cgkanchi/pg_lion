@@ -411,6 +411,19 @@ lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
  * set's last leaf changes and `tail` travels in the same record; an internal
  * root's push-down touches no entry field at all and passes InvalidBuffer.
  *
+ * What the record writes is the entry AS IT IS ON THE PAGE with `tail`
+ * changed, and not the caller's copy: that copy already counts the items the
+ * caller is about to place (an insert adds its member to ntids before it
+ * places it, VACUUM's regrow subtracts the TIDs it filtered out), and they go
+ * onto the child in a LATER record - the child's own split, which allocates
+ * pages and can fail, or be cut short by a crash.  Logging the caller's
+ * counters here would leave them claiming items that no page holds (the
+ * 2026-09-25 review measured "claims 9241 TIDs, but its containers hold 9240"
+ * after an ERROR at lion-posting-pushdown-child).  The push-down moves items
+ * without changing them, so the counters on the page are exactly right for
+ * the tree it leaves behind; the caller's copy gets the new `tail` too, and
+ * its counters travel with the record that really places the items.
+ *
  * The child is returned still EXCLUSIVE-locked.  Both callers go on to write
  * to it with the root unlocked, and the one that matters is VACUUM's regrow
  * (DESIGN.md §18): there the root was a leaf VACUUM holds a CLEANUP lock on,
@@ -442,6 +455,8 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	BlockNumber cblk;
 	LionPostingPivot pivot;
 	int			nmoved;
+	LionEntryTuple *logged = NULL;
+	Size		loggedsz = 0;
 
 	Assert(LionPageIsContainer(page));
 	Assert(!LionPageIncompleteSplit(page));
@@ -457,6 +472,30 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	/* The child is allocated before the record opens (DESIGN.md §25). */
 	cbuf = lion_alloc_page(index, heaprel, true);
 	cblk = BufferGetBlockNumber(cbuf);
+
+	/*
+	 * The entry this record writes: the one on the page, which the caller
+	 * holds EXCLUSIVE, with only `tail` changed (see the header comment).  It
+	 * is copied here because an rmgr-mode record is a critical section, where
+	 * nothing may be palloc'd.
+	 */
+	if (level == 0)
+	{
+		Page		epage;
+		ItemId		eiid;
+
+		Assert(entry != NULL && BufferIsValid(entrybuf));
+		epage = BufferGetPage(entrybuf);
+		eiid = PageGetItemId(epage, entryoff);
+		loggedsz = ItemIdGetLength(eiid);
+		logged = (LionEntryTuple *) palloc(loggedsz);
+		memcpy(logged, PageGetItem(epage, eiid), loggedsz);
+		if ((logged->flags & LION_ENTRY_CHAIN) == 0 || logged->head != head)
+			elog(ERROR, "lion index \"%s\": entry %u on block %u does not own the posting set at %u",
+				 RelationGetRelationName(index), entryoff,
+				 BufferGetBlockNumber(entrybuf), head);
+		logged->tail = cblk;
+	}
 
 	xstate = lion_wal_begin(index);
 
@@ -517,16 +556,17 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 
 	if (level == 0)
 	{
-		Assert(entry != NULL && BufferIsValid(entrybuf));
-		entry->tail = cblk;
-		if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry,
-								LionEntryPayloadOffset(entry)))
+		if (!lion_replace_entry(index, xstate, entrybuf, entryoff, logged,
+								loggedsz))
 			elog(ERROR, "lion index: could not update entry tuple at %u/%u",
 				 BufferGetBlockNumber(entrybuf), entryoff);
+		entry->tail = cblk;
 	}
 
 	lion_wal_finish(xstate, LION_XLOG_SPLIT);
 	pfree(copy);
+	if (logged != NULL)
+		pfree(logged);
 
 	return cbuf;
 }

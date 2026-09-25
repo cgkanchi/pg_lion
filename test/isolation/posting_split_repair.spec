@@ -1,5 +1,6 @@
 # Posting-tree splits that never finished, met by the writers that do NOT
-# descend (DESIGN.md §22, addendum of 2026-09-25).
+# descend, and a root push-down cut short (DESIGN.md §22, the two addenda of
+# 2026-09-25).
 #
 # A leaf split is two records: the first splits the page, flags its left half
 # LION_PAGE_INCOMPLETE_SPLIT and - when the page was the set's last - makes the
@@ -25,11 +26,25 @@
 #     half was waiting for, orphaning that half - and the containers on it,
 #     for every reader that seeks by container key.
 #
+# And a root push-down cut short:
+#
+#  D. an insert that overflows a one-page set's root pushes the root down in a
+#     record of its own, and places its member on the new child in the next -
+#     which is the child's own split, and can fail.  The push-down logged the
+#     entry with the counters the insert had already bumped, so an ERROR in
+#     between (injection point lion-posting-pushdown-child) left ntids one
+#     above what the containers hold: "claims 9241 TIDs, but its containers
+#     hold 9240".
+#  E. the same in VACUUM's regrow, with counters LOWERED by TIDs filtered out
+#     of a container that had not been written yet: 966 too few, and every
+#     later VACUUM subtracted them again.
+#
 # The splits are cut short with lion-posting-split-incomplete set to 'error'
 # inside a subtransaction, which leaves on disk exactly what a crash between
 # the two records leaves (test/recovery/run.sh phase 1d does it with a real
 # crash).  After every scenario verify() must be clean - no split left
-# unfinished - and the index must answer what the heap answers.
+# unfinished, counters equal to the containers - and the index must answer
+# what the heap answers.
 #
 # The fixture of B and C: key 1 holds a RUN of five rows in every thirty, so each
 # container key (64 heap blocks of 226 rows) is a ~1980-byte RUN and a
@@ -62,6 +77,20 @@ setup
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 2 END
 	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_left_k ON psr_left USING lion (k);
+
+	-- D: created empty; the first root that overflows is pushed down.
+	CREATE TABLE psr_push (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	CREATE INDEX psr_push_k ON psr_push USING lion (k);
+
+	-- E: test/isolation/vacuum_regrow_pushdown.spec's fixture.  k = 1 is ONE
+	-- posting page: a RUN in heap blocks 0..63 and two ~2.9 KB arrays.
+	CREATE TABLE psr_vpush (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	CREATE INDEX psr_vpush_k ON psr_vpush USING lion (k) WITH (inline_limit = 64);
+	INSERT INTO psr_vpush SELECT i, CASE
+		WHEN i <= 14464 AND i % 30 < 5 THEN 1
+		WHEN i > 14464 AND i % 10 = 0 THEN 1
+		ELSE 2 END
+	  FROM generate_series(1, 43392) i;
 
 	/*
 	 * Insert key-1 rows one at a time, each in a subtransaction, until one of
@@ -120,12 +149,14 @@ setup
 
 teardown
 {
-	DROP TABLE psr_app, psr_right, psr_left;
+	DROP TABLE psr_app, psr_right, psr_left, psr_push, psr_vpush;
 	DROP FUNCTION psr_insert_until_error(text);
 	DROP FUNCTION psr_landed(text);
 	DROP FUNCTION psr_counts(text, int);
 	/* Never leave an injection point attached, whatever the permutation did. */
 	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-split-incomplete');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-pushdown-child');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
@@ -138,6 +169,8 @@ setup
 
 step split_breaks	{ SELECT injection_points_attach('lion-posting-split-incomplete', 'error'); }
 step split_works	{ SELECT injection_points_detach('lion-posting-split-incomplete'); }
+step push_breaks	{ SELECT injection_points_attach('lion-posting-pushdown-child', 'error'); }
+step push_works		{ SELECT injection_points_detach('lion-posting-pushdown-child'); }
 
 # A. Appends after an unfinished split.
 step a_fill		{ INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 60000) i; }
@@ -196,9 +229,43 @@ step c_check	{
 	SELECT * FROM psr_counts('psr_left', 2);
 }
 
+# D. An insert's root push-down cut short.  Right after it the root is an
+# internal page over one child that holds what the root held, and the entry
+# must count exactly that.
+step d_cut		{ INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i; }
+step d_after_cut {
+	SELECT posting_internal_pages FROM lion_index_stats('psr_push_k');
+	SELECT lion_index_verify('psr_push_k');
+}
+step d_more		{ INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i; }
+step d_check	{
+	SELECT lion_index_verify('psr_push_k', true);
+	SELECT * FROM psr_counts('psr_push', 0);
+	SELECT * FROM psr_counts('psr_push', 1);
+}
+
+# E. VACUUM's regrow push-down cut short: the child still holds the RUN with
+# its dead TIDs, and the entry must still count them.  The next VACUUM
+# removes them, and ntids then equals the heap's rows.
+step e_delete	{ DELETE FROM psr_vpush WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3); }
+step e_cut		{ VACUUM (INDEX_CLEANUP ON) psr_vpush; }
+step e_after_cut {
+	SELECT posting_internal_pages FROM lion_index_stats('psr_vpush_k');
+	SELECT lion_index_verify('psr_vpush_k');
+}
+step e_vacuum	{ VACUUM (INDEX_CLEANUP ON) psr_vpush; }
+step e_check	{
+	SELECT lion_index_verify('psr_vpush_k', true);
+	SELECT ntids = (SELECT count(*) FROM psr_vpush) AS ntids_agrees
+	  FROM lion_index_stats('psr_vpush_k');
+	SELECT * FROM psr_counts('psr_vpush', 1);
+}
+
 permutation
 	a_fill split_breaks a_cut split_works a_append a_check
 	b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut
 	b_delete b_vacuum b_check
 	c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut
 	c_delete c_vacuum c_check
+	push_breaks d_cut push_works d_after_cut d_more d_check
+	e_delete push_breaks e_cut push_works e_after_cut e_vacuum e_check
