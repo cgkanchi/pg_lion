@@ -1,0 +1,259 @@
+-- The type a search value is looked up as (DESIGN.md §21, "Key types").
+--
+-- lion_probe_init() is the one place that decides how a value is compared
+-- with a key column: as one of the column's own values, through the family's
+-- cross-type members, or relabelled by a binary coercion.  Every scan path
+-- and every SQL count function reaches it, each handing it the type it has
+-- for the value - a scan key's sk_subtype, an array's element type, the SQL
+-- argument's type - and they have to come to the same answer.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+/*
+ * lion_kt() runs a query as a plain INDEX scan or a BITMAP scan - the other
+ * scans and the count pushdown switched off - and again as a sequential scan,
+ * compares the two as multisets, and names the lion index the plan used.
+ */
+CREATE FUNCTION lion_kt(how text, q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used text := NULL;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_indexscan', (how = 'index')::text, true);
+	PERFORM set_config('enable_bitmapscan', (how = 'bitmap')::text, true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ '(Index Scan using|Bitmap Index Scan on) lion_kt' AND used IS NULL THEN
+			used := substring(ln from '((Index Scan using|Bitmap Index Scan on) \S+)');
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_kt_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_kt_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_kt_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_kt_on EXCEPT ALL SELECT * FROM lion_kt_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_kt_off EXCEPT ALL SELECT * FROM lion_kt_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_kt_on, lion_kt_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', coalesce(used, 'no lion scan'), nrows);
+END $$;
+
+/*
+ * An enum column (2026-09-25 review).  enum_ops is declared FOR TYPE anyenum,
+ * so a scan key names its member by anyenum (sk_subtype), while the elements
+ * of `m IN (...)` are of the column's own enum: the operator is polymorphic
+ * and the parser leaves the array as it is.  The single-column bitmap scan
+ * probed with sk_subtype and worked; a plain index scan and a multicolumn
+ * bitmap scan probed with the array's element type, which lion_probe_init()
+ * took for a cross-type search and refused - "type lion_kt_mood cannot be
+ * compared with index ... The index is on type anyenum".  The big enum has
+ * enough labels for a list longer than one batch of a plain scan's LIST
+ * source (§29.4), which sorts and locates the list through the same probe.
+ */
+CREATE TYPE lion_kt_mood AS ENUM ('sad', 'meh', 'ok', 'ecstatic');
+DO $$
+BEGIN
+	EXECUTE format('CREATE TYPE lion_kt_big AS ENUM (%s)',
+				   (SELECT string_agg(quote_literal('l' || lpad(g::text, 3, '0')), ', ' ORDER BY g)
+					  FROM generate_series(0, 99) g));
+END $$;
+CREATE TABLE lion_kt_e (
+	id	int NOT NULL,
+	m	lion_kt_mood,
+	b	bool NOT NULL,
+	big	lion_kt_big NOT NULL
+);
+INSERT INTO lion_kt_e
+SELECT g,
+	   CASE WHEN g % 50 = 0 THEN NULL ELSE (enum_range(NULL::lion_kt_mood))[1 + g % 4] END,
+	   g % 3 = 0,
+	   (enum_range(NULL::lion_kt_big))[1 + g % 100]
+  FROM generate_series(1, 10000) g;
+CREATE INDEX lion_kt_m ON lion_kt_e USING lion (m);
+CREATE INDEX lion_kt_mb ON lion_kt_e USING lion (m, b);
+CREATE INDEX lion_kt_big ON lion_kt_e USING lion (big);
+VACUUM ANALYZE lion_kt_e;
+
+-- plain index scans: a short list (a set tree) and the single value
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE m IN ('meh', 'ecstatic')$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE m = ANY ('{meh, meh, sad}')$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE m = ANY (ARRAY['ok', NULL]::lion_kt_mood[])$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE m = 'ok'$$);
+-- the first key column of the two-column index
+DROP INDEX lion_kt_m;
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE m IN ('meh', 'ecstatic') AND b$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE m IN ('sad', 'ok')$$);
+-- multicolumn bitmap scans: each column's set tree, intersected
+SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_e WHERE m IN ('meh', 'ecstatic') AND b$$);
+SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_e WHERE m IN ('meh', 'ecstatic') AND NOT b$$);
+SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_e WHERE m = ANY ('{}'::lion_kt_mood[]) AND b$$);
+CREATE INDEX lion_kt_m ON lion_kt_e USING lion (m);
+-- lists longer than a batch (32 values at 64kB): 60 distinct labels, as a
+-- literal and as a parameter, and 30 labels twice over
+SET work_mem = 64;
+SELECT lion_kt('index', format('SELECT id FROM lion_kt_e WHERE big = ANY (%L::lion_kt_big[])',
+	(SELECT array_agg(l ORDER BY l DESC) FROM unnest(enum_range(NULL::lion_kt_big)) l
+	  WHERE l::text < 'l060')));
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_e WHERE big = ANY (ARRAY(
+	SELECT l FROM unnest(enum_range(NULL::lion_kt_big)) l WHERE l::text < 'l060'))$$);
+SELECT lion_kt('index', format('SELECT id FROM lion_kt_e WHERE big = ANY (%L::lion_kt_big[])',
+	(SELECT array_agg(l) FROM unnest(enum_range(NULL::lion_kt_big)) l,
+		   generate_series(1, 2) WHERE l::text >= 'l070')));
+RESET work_mem;
+-- and the single-column bitmap scan, which always worked
+SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_e WHERE m IN ('meh', 'ecstatic')$$);
+
+/*
+ * Arrays whose element type is not the column's own but reaches it anyway:
+ * varchar[] on a text_ops column, and an array of a domain over int4.  The
+ * parser coerces the array to the operator's type - the elements arrive as
+ * text and int4 - so these always worked; they are here so that the next
+ * change to the resolution sees them.
+ */
+CREATE DOMAIN lion_kt_posint AS int4 CHECK (VALUE > 0);
+CREATE TABLE lion_kt_v (id int NOT NULL, v varchar(8), t text, k int4, dk lion_kt_posint);
+INSERT INTO lion_kt_v
+SELECT g, 'v' || (g % 10), 'v' || (g % 10), g % 10, 1 + g % 10
+  FROM generate_series(1, 2000) g;
+CREATE INDEX lion_kt_v_v ON lion_kt_v USING lion (v);
+CREATE INDEX lion_kt_v_t ON lion_kt_v USING lion (t);
+CREATE INDEX lion_kt_v_k ON lion_kt_v USING lion (k);
+CREATE INDEX lion_kt_v_dk ON lion_kt_v USING lion (dk);
+VACUUM ANALYZE lion_kt_v;
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE v IN ('v3', 'v4')$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE v = ANY (ARRAY['v3', 'v4']::varchar[])$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE t = ANY (ARRAY['v3', 'v4']::varchar[])$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE k = ANY (ARRAY[3, 4]::lion_kt_posint[])$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE dk = ANY (ARRAY[3, 4]::lion_kt_posint[])$$);
+SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE dk IN (3, 4)$$);
+SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_v WHERE v = ANY (ARRAY['v3', 'v4']::varchar[])$$);
+SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_v WHERE k = ANY (ARRAY[3, 4]::lion_kt_posint[])$$);
+
+/*
+ * The SQL count functions (DESIGN.md §9, "SQL surface").  Their key argument
+ * is polymorphic, so its type is whatever the caller wrote, and it is
+ * resolved as `col = key` would resolve it (lion_count_key_type()).  Until
+ * 2026-09-25 the key had to be rd_opcintype exactly or have a cross-type
+ * member: enum_ops, a DEFAULT class, could not be counted at all ("the index
+ * is on type anyenum"), nor could a varchar key on the varchar column it
+ * indexes.  lion_ktc() compares a count with the SELECT it stands for.
+ */
+CREATE FUNCTION lion_ktc(cnt text, sel text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	a bigint;
+	b bigint;
+BEGIN
+	EXECUTE 'SELECT ' || cnt INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'SELECT count(*) ' || sel INTO b;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH roaring=%s select=%s', a, b);
+	END IF;
+	RETURN format('ok %s', a);
+END $$;
+CREATE DOMAIN lion_kt_moodd AS lion_kt_mood;
+CREATE TYPE lion_kt_other AS ENUM ('sad', 'meh', 'ok', 'ecstatic');
+CREATE DOMAIN lion_kt_big8 AS int8;
+CREATE INDEX lion_kt_b ON lion_kt_e USING lion (b);
+VACUUM ANALYZE lion_kt_e;
+
+-- enum_ops: the column's own enum, and a domain over it
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'meh'::lion_kt_mood)$$,
+				$$FROM lion_kt_e WHERE m = 'meh'$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'ok'::lion_kt_moodd)$$,
+				$$FROM lion_kt_e WHERE m = 'ok'$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_m', '{meh, ecstatic, meh}'::lion_kt_mood[])$$,
+				$$FROM lion_kt_e WHERE m IN ('meh', 'ecstatic', 'meh')$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_big', ARRAY(SELECT l FROM unnest(enum_range(NULL::lion_kt_big)) l WHERE l::text < 'l060'))$$,
+				$$FROM lion_kt_e WHERE big::text < 'l060'$$);
+SELECT lion_ktc($$(lion_index_count_stats('lion_kt_m', 'sad'::lion_kt_mood)).count$$,
+				$$FROM lion_kt_e WHERE m = 'sad'$$);
+-- two keys of two unrelated types (key2 is anycompatible, not key1's anyelement)
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'meh'::lion_kt_mood, 'lion_kt_b', true)$$,
+				$$FROM lion_kt_e WHERE m = 'meh' AND b$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_b', false, 'lion_kt_big', 'l042'::lion_kt_big)$$,
+				$$FROM lion_kt_e WHERE NOT b AND big = 'l042'$$);
+-- another enum with the same labels is not this column's: its OIDs are not
+-- the column's, and `m = 'meh'::lion_kt_other` finds no operator either
+SELECT lion_index_count('lion_kt_m', 'meh'::lion_kt_other);
+SELECT lion_index_count_any('lion_kt_m', '{meh}'::lion_kt_other[]);
+SELECT lion_index_count('lion_kt_m', 'meh'::text);
+\set VERBOSITY default
+SELECT lion_index_count('lion_kt_m', 'meh'::lion_kt_other);
+\set VERBOSITY terse
+
+-- a binary coercion to the class's type: varchar on text_ops, as the parser
+-- relabels it; and a domain is its base type, cross-type members included
+SELECT lion_ktc($$lion_index_count('lion_kt_v_v', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE v = 'v3'::varchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_t', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE t = 'v3'::varchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_v', 'v3'::text)$$,
+				$$FROM lion_kt_v WHERE v = 'v3'::text$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_v', '{v3, v4, nope}'::varchar[])$$,
+				$$FROM lion_kt_v WHERE v = ANY ('{v3, v4, nope}'::varchar[])$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3::lion_kt_posint)$$,
+				$$FROM lion_kt_v WHERE k = 3::lion_kt_posint$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_dk', 3)$$,
+				$$FROM lion_kt_v WHERE dk = 3$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3::lion_kt_big8)$$,
+				$$FROM lion_kt_v WHERE k = 3::lion_kt_big8$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_posint[])$$,
+				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_posint[])$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_big8[])$$,
+				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_big8[])$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3, 'lion_kt_v_v', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE k = 3 AND v = 'v3'$$);
+-- a cast FUNCTION is not taken (§21): bpchar to text is rtrim1()
+SELECT lion_index_count('lion_kt_v_t', 'v3'::bpchar);
+SELECT lion_index_count('lion_kt_v_k', 'v3'::varchar);
+-- and a binary coercion only where `col = key` makes it.  text is binary-
+-- coercible to bpchar, but `c = 'x '::text` resolves to `text = text` with
+-- the COLUMN cast by rtrim1(), and matches none of the rows bpchar's own
+-- equality, which ignores trailing blanks, would count; `k = 3::oid` is
+-- `oid = oid` on the column.  varchar does reach bpchar's `=`, and regproc
+-- oid's.
+SELECT lion_index_count('lion_kt_v_k', 3::oid);
+CREATE TABLE lion_kt_c (c char(4), o oid);
+INSERT INTO lion_kt_c
+SELECT CASE WHEN g % 2 = 0 THEN 'x' ELSE 'y' END, (g % 5)::oid FROM generate_series(1, 100) g;
+CREATE INDEX lion_kt_c_c ON lion_kt_c USING lion (c);
+CREATE INDEX lion_kt_c_o ON lion_kt_c USING lion (o);
+VACUUM ANALYZE lion_kt_c;
+SELECT count(*) FROM lion_kt_c WHERE c = 'x '::text;
+SELECT lion_index_count('lion_kt_c_c', 'x '::text);
+SELECT lion_ktc($$lion_index_count('lion_kt_c_c', 'x '::varchar)$$,
+				$$FROM lion_kt_c WHERE c = 'x '::varchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_c_c', 'x'::bpchar)$$,
+				$$FROM lion_kt_c WHERE c = 'x'::bpchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_c_o', 3::oid::regproc)$$,
+				$$FROM lion_kt_c WHERE o = 3::oid::regproc$$);
+
+DROP TABLE lion_kt_e, lion_kt_v, lion_kt_c;
+DROP DOMAIN lion_kt_moodd, lion_kt_posint, lion_kt_big8;
+DROP TYPE lion_kt_mood, lion_kt_big, lion_kt_other;
+DROP FUNCTION lion_kt(text, text);
+DROP FUNCTION lion_ktc(text, text);
