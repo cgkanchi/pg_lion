@@ -98,9 +98,11 @@ SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_a
 SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_agg(k) FROM (SELECT k FROM lion_pin ORDER BY k LIMIT 100) s)::text[]) OR x = 1');
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+SET enable_indexscan = off;
 SELECT lion_pinsrc($q$SELECT count(*) FROM lion_pin WHERE k = repeat(md5('7'), 59) || '7' AND y = 7$q$);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
+RESET enable_indexscan;
 DROP FUNCTION lion_pinsrc(text);
 -- the multicolumn bitmap scan
 SET pg_lion.enable_count_pushdown = off;

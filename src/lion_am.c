@@ -38,6 +38,7 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 #include "lion.h"
 #include "lion_count.h"
@@ -243,7 +244,7 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amadjustmembers = NULL,
 		.ambeginscan = lionbeginscan,
 		.amrescan = lionrescan,
-		.amgettuple = NULL,
+		.amgettuple = liongettuple,	/* DESIGN.md §29 */
 		.amgetbitmap = liongetbitmap,
 		.amendscan = lionendscan,
 		.ammarkpos = NULL,
@@ -744,11 +745,79 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path)
 }
 
 /*
- * Cost estimate: the generic estimate, with three corrections.  A lion index
- * has no correlation with the heap order (contrib/bloom does the same), a
- * scan that has to walk the whole index is priced as one rather than as the
- * selective lookup its predicate's output selectivity suggests, and a range
- * pays for the entries it walks (lion_range_entry_cost()).
+ * The correlation a PLAIN index scan's heap fetches have with the heap order
+ * (DESIGN.md §29.11), which only cost_index() reads - a bitmap heap scan
+ * sorts its pages whatever the index says.  It is btcostestimate()'s answer:
+ * the ANALYZE correlation of the first index column the path has a clause on
+ * (of column 1 when it has none), for the type's default `<`, which is what
+ * ANALYZE computed it with, times 0.75 for a multicolumn index.  Within one
+ * key a lion scan returns TIDs in heap order, as btree does since its heap-TID
+ * tiebreaker, so how that key's rows are spread over the heap is what the
+ * column's correlation describes.  0 for a multi-key column (a row is under
+ * several of its entries and the column's statistics are the ARRAY's), for
+ * an expression column, and whenever there is no statistic.
+ */
+static double
+lion_index_correlation(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	VariableStatData vardata;
+	RangeTblEntry *rte;
+	TypeCacheEntry *tce;
+	Oid			atttype;
+	double		corr = 0.0;
+	int			col = -1;
+	ListCell   *lc;
+	Var		   *var;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+
+		if (col < 0 || iclause->indexcol < col)
+			col = iclause->indexcol;
+	}
+	if (col < 0)
+		col = 0;
+	if (col >= index->nkeycolumns || index->indexkeys[col] <= 0 ||
+		lion_index_is_multikey(index, col))
+		return 0.0;
+
+	rte = planner_rt_fetch(index->rel->relid, root);
+	atttype = get_atttype(rte->relid, index->indexkeys[col]);
+	var = makeVar(index->rel->relid, index->indexkeys[col], atttype, -1,
+				  index->indexcollations[col], 0);
+
+	examine_variable(root, (Node *) var, index->rel->relid, &vardata);
+	tce = lookup_type_cache(atttype, TYPECACHE_LT_OPR);
+	if (HeapTupleIsValid(vardata.statsTuple) && OidIsValid(tce->lt_opr))
+	{
+		AttStatsSlot sslot;
+
+		if (get_attstatsslot(&sslot, vardata.statsTuple,
+							 STATISTIC_KIND_CORRELATION, tce->lt_opr,
+							 ATTSTATSSLOT_NUMBERS))
+		{
+			if (sslot.nnumbers > 0)
+				corr = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+	}
+	ReleaseVariableStats(vardata);
+
+	if (index->nkeycolumns > 1)
+		corr *= 0.75;
+	return corr;
+}
+
+/*
+ * Cost estimate: the generic estimate, with three corrections and the heap
+ * correlation.  A scan that has to walk the whole index is priced as one
+ * rather than as the selective lookup its predicate's output selectivity
+ * suggests, a range pays for the entries it walks (lion_range_entry_cost()),
+ * and a plain index scan's heap side is priced with the column's correlation
+ * as btree's is (lion_index_correlation(), DESIGN.md §29.11); a bitmap path,
+ * which shares this estimate, does not read that last number.
  */
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -802,7 +871,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;
-	*indexCorrelation = 0.0;
+	*indexCorrelation = lion_index_correlation(root, path);
 	*indexPages = costs.numIndexPages;
 }
 

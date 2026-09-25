@@ -29,6 +29,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushed down';
@@ -64,10 +65,12 @@ DECLARE
 	ln text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
 END $$;
 -- ---- the table ---------------------------------------------------------
 --
@@ -823,8 +826,9 @@ DROP TABLE lion_arr_odd;
  * lookup.
  *
  * sum(id) keeps the count pushdown out of the comparison, so what is being
- * chosen between is the bitmap plan and the sequential scan.  An exact `@>`
- * or `&&` must keep the bitmap scan; an ALL-mode query must lose it.  A
+ * chosen between is the index and the sequential scan.  An exact `@>` or `&&`
+ * must keep the index - a plain Index Scan for these one-row answers since
+ * DESIGN.md §29 - and an ALL-mode query must lose it.  A
  * multi-key clause whose value is not a plan-time Const has to be priced as
  * the expensive shape too, because the query's SHAPE is what decides its
  * mode.
@@ -837,36 +841,30 @@ CREATE INDEX lion_arrc_tags ON lion_arrc USING lion (tags);
 VACUUM ANALYZE lion_arrc;
 -- exact: containment and overlap over real elements
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc WHERE tags @> ARRAY['u500'];
-                      QUERY PLAN                      
-------------------------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_arrc
-         Recheck Cond: (tags @> '{u500}'::text[])
-         ->  Bitmap Index Scan on lion_arrc_tags
-               Index Cond: (tags @> '{u500}'::text[])
-(5 rows)
+   ->  Index Scan using lion_arrc_tags on lion_arrc
+         Index Cond: (tags @> '{u500}'::text[])
+(3 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags @> ARRAY['u500', 't0'];
-                       QUERY PLAN                        
----------------------------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_arrc
-         Recheck Cond: (tags @> '{u500,t0}'::text[])
-         ->  Bitmap Index Scan on lion_arrc_tags
-               Index Cond: (tags @> '{u500,t0}'::text[])
-(5 rows)
+   ->  Index Scan using lion_arrc_tags on lion_arrc
+         Index Cond: (tags @> '{u500,t0}'::text[])
+(3 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags && ARRAY['u500', 'u501'];
-                        QUERY PLAN                         
------------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_arrc
-         Recheck Cond: (tags && '{u500,u501}'::text[])
-         ->  Bitmap Index Scan on lion_arrc_tags
-               Index Cond: (tags && '{u500,u501}'::text[])
-(5 rows)
+   ->  Index Scan using lion_arrc_tags on lion_arrc
+         Index Cond: (tags && '{u500,u501}'::text[])
+(3 rows)
 
 -- ALL mode: `<@`, the empty array, a NULL element
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc

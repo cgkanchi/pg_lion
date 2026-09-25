@@ -33,6 +33,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushed down';
@@ -69,10 +70,12 @@ DECLARE
 	ln text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
 END $$;
 
 -- ---- the table ---------------------------------------------------------
@@ -374,8 +377,9 @@ DROP TABLE lion_arr_odd;
  * lookup.
  *
  * sum(id) keeps the count pushdown out of the comparison, so what is being
- * chosen between is the bitmap plan and the sequential scan.  An exact `@>`
- * or `&&` must keep the bitmap scan; an ALL-mode query must lose it.  A
+ * chosen between is the index and the sequential scan.  An exact `@>` or `&&`
+ * must keep the index - a plain Index Scan for these one-row answers since
+ * DESIGN.md §29 - and an ALL-mode query must lose it.  A
  * multi-key clause whose value is not a plan-time Const has to be priced as
  * the expensive shape too, because the query's SHAPE is what decides its
  * mode.

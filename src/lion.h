@@ -1151,6 +1151,7 @@ extern IndexScanDesc lionbeginscan(Relation r, int nkeys, int norderbys);
 extern void lionrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys, ScanKey orderbys, int norderbys);
 extern void lionendscan(IndexScanDesc scan);
 extern int64 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
+extern bool liongettuple(IndexScanDesc scan, ScanDirection dir);	/* DESIGN.md §29 */
 extern bytea *lionoptions(Datum reloptions, bool validate);
 extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,

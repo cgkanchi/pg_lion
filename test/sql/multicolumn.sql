@@ -35,7 +35,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Bitmap Index Scan%' THEN
 			node := 'index scan';
@@ -150,8 +150,11 @@ SELECT lion_mccmp($$SELECT id FROM lion_mc
 SELECT lion_mccmp($$SELECT id FROM lion_mc WHERE k = 12345 AND t = 't42'$$);
 
 -- the query plan really is one Bitmap Index Scan with a multi-column condition
+-- (with plain index scans off: one row goes to one since DESIGN.md §29)
+SET enable_indexscan = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM lion_mc WHERE k = 7 AND t = 't47' AND a @> ARRAY[3];
+RESET enable_indexscan;
 
 -- ---- 4. IN lists, per column and across columns ---------------------------
 

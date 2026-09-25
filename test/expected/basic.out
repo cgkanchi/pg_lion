@@ -54,6 +54,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', false);
 	PERFORM set_config('enable_bitmapscan', 'on', false);
+	PERFORM set_config('enable_indexscan', 'off', false);	-- the bitmap path (§29: a plain scan could be chosen)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Bitmap Index Scan%' THEN
 			used := true;
@@ -65,6 +66,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', false);
 	EXECUTE q INTO b;
 	PERFORM set_config('enable_bitmapscan', 'on', false);
+	PERFORM set_config('enable_indexscan', 'on', false);
 
 	IF a IS DISTINCT FROM b THEN
 		RETURN format('MISMATCH index=%s seqscan=%s', a::text, b::text);

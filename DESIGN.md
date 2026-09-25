@@ -5628,6 +5628,8 @@ index-only scans (step 3) would need from it, so that neither has to redesign th
   reading. VACUUM removes them. Known cost: a plain scan over a hot key with many dead versions
   keeps visiting their heap slots until the next VACUUM, as a bitmap scan does today.
 - **No parallel scan.** `amcanparallel` stays false; the parallel callbacks stay NULL.
+- **No returnable column** (`amcanreturn` NULL, step 3) - but an index-only scan of a query that
+  needs no column at all is possible the moment `amgettuple` exists, and it is served (§29.9).
 
 ### 29.2 The scan plan, shared with the bitmap path
 
@@ -5792,7 +5794,10 @@ key keeps its own - the same rules §9 states for the count (`lion_source_pinned
   the one residual effect - the same matching row twice through two stale entries - needs a
   thousand-leaf IN list under a dirty snapshot, which no caller in core builds (below).
 - The BITMAP shape (§29.3) holds no pins in either mode and is always rechecked; a TIDBitmap is a
-  set, so it cannot return a TID twice.
+  set, so it cannot return a TID twice. A multi-key query's sets are located unpinned in either
+  mode too (the tree builder the bitmap path shares drops their pins), and a multi-key scan is
+  always rechecked (§29.6); `EXCLUDE USING lion (tags WITH &&)` is such a scan, and a conflict it
+  reports through a recycled slot is a row that really overlaps.
 - The §11 deadlock rule for readers holds in both modes: every set is located - every directory
   lock taken - before the first container page is pinned, and a WALK takes the next directory leaf
   only after the previous entry's stream has been closed and its container pins dropped. Holding
@@ -5890,9 +5895,30 @@ set is exact (§29.6). The entry points are `lion_source_open()`, `lion_source_n
 `lion_source_close()` in lion_scan.c, declared in lion_count.h; they take an index, scan keys and
 the `keeppins` switch of §29.5, and no IndexScanDesc.
 
-### 29.9 Index-only scans (step 3), for later
+### 29.9 Index-only scans (step 3), for later - and the one kind that exists already
 
-What `amcanreturn` would need from this scan:
+**An index-only scan of a query that needs no column exists already** (found while implementing
+step 1: `count.sql` failed with core's `no data returned for index-only scan`). check_index_only()
+allows an index-only scan when every column the query needs can be returned, and a query that
+needs none - `SELECT count(*) FROM t`, `count(*) WHERE <a partial index's predicate>` - needs
+none; `amoptionalkey` lets the planner scan a lion index with no key at all, and once
+`amgettuple` exists it builds that path and sometimes picks it. It is served, not refused:
+
+- the executor reads the tuple from `xs_itup` (and its shape from `xs_itupdesc`, which
+  `ambeginscan` now sets), so the scan hands it a tuple of NULLs of the index's own shape, formed
+  once; nothing reads it, because there is no column in the target list or the quals to read
+  (the recheck qual is empty too: a key would put its column among the needed ones);
+- `xs_want_itup` turns `dropPin` off, so a WALK keeps the directory leaf of each INLINE entry and
+  the posting leaf of each container pinned until the next batch - the §9 interlock, which is
+  what makes the executor's visibility-map test of each returned TID safe, exactly as for the
+  count;
+- the BITMAP shape (a multi-key first column) was built without pins and names every offset of a
+  lossy page, so each of its TIDs is looked up in the heap under the scan's snapshot first
+  (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays visible to that
+  snapshot, so nothing can take it away before the executor's own test. Slow and exact; the
+  count pushdown answers the common shapes instead anyway.
+
+What a real `amcanreturn` would need from this scan:
 
 - **A value to return.** A lion column's stored key is the value only under the §10
   value-representation contract (`BTEQUALIMAGE_PROC`, the bpchar allowlist): citext's two
@@ -5946,11 +5972,16 @@ and `IS NOT NULL`, multicolumn ANDs, arrays and tsvector with recheck, cross-typ
 collation mismatch declined; nested-loop inner scans with rescans; cursors (FETCH forward, SCROLL
 over a Material, NO SCROLL refusing backward); a dirty heap after updates and deletes, then VACUUM;
 a posting set far larger than one batch with its memory flat; an exclusion constraint; the count
-pushdown still chosen for its shapes. Isolation: `gettuple_pause.spec` (cursors, every major) parks
-a scan between two `amgettuple` calls while the directory leaf under a walk splits, the posting
-leaves under a cursor split, an INLINE set spills, and VACUUM deletes the next entry of the walk,
-each with the exact answer after, and shows that VACUUM does not wait for the paused MVCC scan;
+pushdown still chosen for its shapes; index-only scans of no-column queries (a column's walk, a
+partial index, a multi-key column's bitmap), clean and dirty. Existing tests whose helpers exist to
+exercise the BITMAP path, or to force the count pushdown by disabling every other scan, now disable
+plain index scans as well; the plan pins that changed are one-row multi-key lookups, which are now
+plain Index Scans. Isolation: `gettuple_pause.spec` (cursors - the pause the executor really makes,
+between two `amgettuple` calls - so it runs on every major) parks a scan after five rows while the
+posting leaves under it split, the INLINE set it copied spills, the directory leaf under a range
+walk splits, and VACUUM deletes the NEXT entry of the walk and frees its posting tree, whose pages
+an insert then takes back; each drains to exactly the rows its snapshot sees, none twice, and
+pg_buffercache shows the paused scan pinning no index page, so the VACUUM completes under it.
 `gettuple_dirty_pin.spec` (injection point `lion-gettuple-batch`, 17+) parks an exclusion-
-constraint check with a batch loaded and shows VACUUM waiting for its pin, a plain MVCC scan parked
-at the same point not holding one, and a scan parked on a posting set that VACUUM then deletes and
-whose pages an insert reuses, ending that set at the owner check with the exact answer.
+constraint check with its batch loaded and shows VACUUM waiting for its pin, and a plain MVCC scan
+parked at the same point holding none while the same VACUUM completes.

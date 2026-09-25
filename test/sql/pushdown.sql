@@ -585,6 +585,7 @@ SELECT lion_pd('SELECT v, count(*) FROM lion_pdn WHERE v = 1.000 GROUP BY v');
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+SET enable_indexscan = off;
 -- (and no Sort, so that core's own plan for the refused grouping is the same
 -- whether disabled paths are counted, as in 18, or priced, as in 16 and 17)
 SET enable_sort = off;
@@ -594,6 +595,7 @@ SELECT lion_plans('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 SELECT lion_pd('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
+RESET enable_indexscan;
 SELECT v, count(*) FROM lion_pdn GROUP BY v ORDER BY v;
 
 -- ---- bpchar: an equalimage function that is not enough -----------------
@@ -615,6 +617,7 @@ INSERT INTO lion_pdb VALUES ('a', 1);
 ANALYZE lion_pdb;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+SET enable_indexscan = off;
 SELECT lion_pd('SELECT c, count(*) FROM lion_pdb GROUP BY c');
 SELECT lion_pd('SELECT c, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY c');
 SELECT lion_pd('SELECT k, c, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY k, c');
@@ -645,6 +648,7 @@ SELECT f, i FROM (SELECT f, count(*) FROM lion_pdf GROUP BY f) a,
 	(SELECT i, count(*) FROM lion_pdf GROUP BY i) b;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
+RESET enable_indexscan;
 
 -- ---- an unpopulated materialized view --------------------------------
 /*
@@ -660,6 +664,7 @@ CREATE INDEX lion_pdm_k ON lion_pdm USING lion (k);
 CREATE INDEX lion_pdm_j ON lion_pdm USING lion (j);
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_pdm GROUP BY k;
 SELECT k, count(*) FROM lion_pdm GROUP BY k;
 SELECT count(*) FROM lion_pdm WHERE k = 1;
@@ -677,6 +682,7 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdm WHERE k = 1');
 SELECT lion_pd('SELECT j, count(DISTINCT k) FROM lion_pdm GROUP BY j');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
+RESET enable_indexscan;
 DROP MATERIALIZED VIEW lion_pdm;
 DROP TABLE lion_pdf;
 DROP TABLE lion_pdb;

@@ -28,6 +28,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushed down';
@@ -63,10 +64,12 @@ DECLARE
 	ln text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
 END $$;
 
 -- ---- the table ---------------------------------------------------------
@@ -297,7 +300,8 @@ DROP TABLE lion_ts_empty;
  * The queries here aggregate sum(id) rather than count(*) so that the count
  * pushdown is out of the picture and the comparison is between the bitmap
  * plan and the sequential scan, which is where the misestimate lived.  An
- * exact query must keep the bitmap scan; an ALL-mode one must lose it.
+ * exact query must keep the index - a plain Index Scan for these few rows
+ * since DESIGN.md §29 - and an ALL-mode one must lose it.
  */
 CREATE TABLE lion_tsc (id int NOT NULL, tsv tsvector NOT NULL);
 INSERT INTO lion_tsc

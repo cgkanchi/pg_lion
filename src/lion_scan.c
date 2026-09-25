@@ -35,6 +35,7 @@
  */
 #include "postgres.h"
 
+#include "access/itup.h"
 #include "access/relscan.h"
 #if PG_VERSION_NUM >= 190000
 #include "executor/instrument_node.h"
@@ -70,9 +71,32 @@ typedef struct LionScanOpaqueData
 	LionIndexState *ix;			/* cached relation state */
 	LionScanCol *cols;			/* [ix->ncolumns] */
 	bool		recheck;		/* the emitted TIDs are a superset */
+
+	/* The keys being answered: the scan's own, or a lion_source_open()'s. */
+	Relation	index;
+	ScanKey		keys;
+	int			nkeys;
+
+	/*
+	 * The plain scan (liongettuple(), DESIGN.md §29).  The source is opened
+	 * by the first call after a rescan and lives in gtcxt, which amrescan
+	 * resets; the batch is the members of the container it last handed out,
+	 * as lo values of that container (lion_container_to_array()), turned into
+	 * a TID one at a time.
+	 */
+	MemoryContext gtcxt;
+	struct LionSource *src;
+	bool		srcdone;		/* the source is exhausted */
+	uint16	   *lo;				/* [LION_CONTAINER_RANGE], allocated once */
+	int			nlo;
+	int			pos;
+	BlockNumber firstblk;		/* first heap block of the batch's container */
+	IndexTuple	nullitup;		/* what an index-only scan is handed (§29.9) */
 } LionScanOpaqueData;
 
 typedef LionScanOpaqueData *LionScanOpaque;
+
+static void lion_source_release(struct LionSource *src);
 
 /* State threaded through lion_container_iterate() by lion_container_to_tbm() */
 typedef struct LionTbmState
@@ -188,16 +212,39 @@ lionbeginscan(Relation r, int nkeys, int norderbys)
 	so = (LionScanOpaque) palloc0(sizeof(LionScanOpaqueData));
 	so->ix = lion_get_index_state(r);
 	so->cols = (LionScanCol *) palloc0(sizeof(LionScanCol) * so->ix->ncolumns);
+	so->index = r;
 
 	scan->opaque = so;
+	scan->xs_itupdesc = RelationGetDescr(r);
 
 	return scan;
+}
+
+/*
+ * Close the plain scan's source, if one is open: every pin it holds goes
+ * (DESIGN.md §29.7), then the memory.  The probe cache stays.
+ */
+static void
+lion_scan_reset(LionScanOpaque so)
+{
+	if (so->src != NULL)
+		lion_source_release(so->src);
+	so->src = NULL;
+	so->srcdone = false;
+	so->nlo = 0;
+	so->pos = 0;
+	if (so->gtcxt != NULL)
+		MemoryContextReset(so->gtcxt);
 }
 
 void
 lionrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		  ScanKey orderbys, int norderbys)
 {
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+
+	lion_scan_reset(so);
+
 	if (scankey && scan->numberOfKeys > 0)
 		memcpy(scan->keyData, scankey,
 			   scan->numberOfKeys * sizeof(ScanKeyData));
@@ -210,6 +257,11 @@ lionendscan(IndexScanDesc scan)
 
 	if (so != NULL)
 	{
+		lion_scan_reset(so);
+		if (so->gtcxt != NULL)
+			MemoryContextDelete(so->gtcxt);
+		if (so->lo != NULL)
+			pfree(so->lo);
 		if (so->cols != NULL)
 			pfree(so->cols);
 		pfree(so);
@@ -367,10 +419,10 @@ lion_emit_entry(Relation index, Buffer entrybuf,
  * Emit the posting set of one search value on one key column.
  */
 static int64
-lion_emit_value(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+lion_emit_value(LionScanOpaque so, LionState *col,
 			   ScanKey skey, Datum value, TIDBitmap *tbm)
 {
-	Relation	index = scan->indexRelation;
+	Relation	index = so->index;
 	LionScanCol *sc = &so->cols[col->attno - 1];
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
@@ -403,7 +455,7 @@ lion_emit_value(IndexScanDesc scan, LionScanOpaque so, LionState *col,
  * nothing, and repeated elements are harmless because a TIDBitmap is a set.
  */
 static int64
-lion_emit_array(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+lion_emit_array(LionScanOpaque so, LionState *col,
 			   ScanKey skey, TIDBitmap *tbm)
 {
 	ArrayType  *arr = DatumGetArrayTypeP(skey->sk_argument);
@@ -425,7 +477,7 @@ lion_emit_array(IndexScanDesc scan, LionScanOpaque so, LionState *col,
 	{
 		if (nulls[i])
 			continue;			/* `x = NULL` is never true */
-		ntids += lion_emit_value(scan, so, col, skey, elems[i], tbm);
+		ntids += lion_emit_value(so, col, skey, elems[i], tbm);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -489,100 +541,234 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
  * split moves entries only to a page further right, which this walk has not
  * passed yet, so nothing is seen twice either.
  */
-static int64
-lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
-					  bool recheck, bool withnull, LionRange *range)
+/*
+ * The leaf walk itself, as an iterator, shared by the bitmap scan (below) and
+ * the plain scan's WALK (DESIGN.md §29.3): each directory leaf is copied into
+ * backend-local memory and released - or, for a plain scan under a non-MVCC
+ * snapshot, released but kept PINNED until the walk moves on (§29.5) - and
+ * lion_walk_next() hands out the entries of the copy the walk selects, one at
+ * a time.  An entry is valid until the next call: the next call may read the
+ * next leaf into the same buffer.
+ *
+ * The entries selected are the column's (DESIGN.md §24), without its NULL
+ * entry unless withnull, and - when ranges are given - those at least one of
+ * the ranges selects (DESIGN.md §28).  Several ranges are the union a plain
+ * scan needs for `op ANY (array)` on a column that cannot compare the
+ * elements, walked ONCE rather than once per element, so that no entry comes
+ * out twice; the walk ends when every range has ended.
+ */
+typedef struct LionLeafWalk
 {
-	PGAlignedBlock *copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
-	Page		cpage = (Page) copy->data;
-	BlockNumber blkno;
-	int64		ntids = 0;
-	bool		done = false;
+	Relation	index;
+	LionState  *col;
+	bool		withnull;
+	LionRange  *ranges;			/* nranges of them, ORed; NULL: every entry */
+	int			nranges;
+	bool	   *ended;			/* [nranges]: no later entry is in range r */
+	bool		keeppin;		/* keep the leaf the image came from pinned */
+	Buffer		pinbuf;
+	PGAlignedBlock *copy;
+	bool		haspage;
+	BlockNumber nextblk;
+	OffsetNumber off;
+	OffsetNumber maxoff;
+	bool		done;
+} LionLeafWalk;
+
+static void
+lion_walk_begin(LionLeafWalk *w, Relation index, LionState *col,
+				bool withnull, LionRange *ranges, int nranges, bool keeppin)
+{
+	int			nlive = 0;
+	int			i;
+
+	memset(w, 0, sizeof(LionLeafWalk));
+	w->index = index;
+	w->col = col;
+	w->withnull = withnull;
+	w->ranges = ranges;
+	w->nranges = (ranges != NULL) ? nranges : 0;
+	w->keeppin = keeppin;
+	w->pinbuf = InvalidBuffer;
+	w->copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+	w->nextblk = InvalidBlockNumber;
+
+	if (w->nranges > 0)
+	{
+		w->ended = (bool *) palloc(sizeof(bool) * w->nranges);
+		for (i = 0; i < w->nranges; i++)
+		{
+			w->ended[i] = ranges[i].empty;
+			if (!ranges[i].empty)
+				nlive++;
+		}
+		if (nlive == 0)
+		{
+			w->done = true;
+			return;
+		}
+	}
 
 	/*
 	 * A range starts at the leaf its lower bound lives on (DESIGN.md §28);
 	 * the entries of an earlier column and those below the bound that share
 	 * the leaf are passed over below, like everything else the walk skips.
 	 */
-	if (range != NULL && range->empty)
-	{
-		pfree(copy);
-		return 0;
-	}
-	blkno = (range != NULL) ? lion_range_first_leaf(index, range) :
+	w->nextblk = (w->nranges == 1) ? lion_range_first_leaf(index, &ranges[0]) :
 		lion_dir_column_first(index, col, NULL);
+}
 
-	while (!done && BlockNumberIsValid(blkno))
+static LionEntryTuple *
+lion_walk_next(LionLeafWalk *w, Size *itemlen)
+{
+	Page		cpage = (Page) w->copy->data;
+
+	for (;;)
 	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber maxoff;
-		OffsetNumber off;
+		if (w->done)
+			return NULL;
 
-		buf = ReadBuffer(index, blkno);
-		lion_dir_pages_read++;
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		if (!LionPageIsLeaf(page))
+		if (!w->haspage)
 		{
-			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index: block %u is not a directory leaf", blkno);
+			Buffer		buf;
+			Page		page;
+
+			if (!BlockNumberIsValid(w->nextblk))
+			{
+				w->done = true;
+				return NULL;
+			}
+
+			/* The entries of the leaf before this one have all been used. */
+			if (BufferIsValid(w->pinbuf))
+			{
+				ReleaseBuffer(w->pinbuf);
+				w->pinbuf = InvalidBuffer;
+			}
+
+			buf = ReadBuffer(w->index, w->nextblk);
+			lion_dir_pages_read++;
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (!LionPageIsLeaf(page))
+			{
+				UnlockReleaseBuffer(buf);
+				elog(ERROR, "lion index: block %u is not a directory leaf",
+					 w->nextblk);
+			}
+			memcpy(cpage, page, BLCKSZ);
+			if (w->keeppin)
+			{
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				w->pinbuf = buf;
+			}
+			else
+				UnlockReleaseBuffer(buf);
+
+			w->nextblk = LionPageGetOpaque(cpage)->rightlink;
+			w->off = lion_page_first_data(cpage);
+			w->maxoff = PageGetMaxOffsetNumber(cpage);
+			w->haspage = true;
 		}
-		memcpy(cpage, page, BLCKSZ);
-		UnlockReleaseBuffer(buf);
 
-		blkno = LionPageGetOpaque(cpage)->rightlink;
-		maxoff = PageGetMaxOffsetNumber(cpage);
-
-		for (off = lion_page_first_data(cpage); off <= maxoff; off++)
+		while (w->off <= w->maxoff)
 		{
-			ItemId		iid = PageGetItemId(cpage, off);
+			ItemId		iid = PageGetItemId(cpage, w->off);
 			LionEntryTuple *entry;
 
+			w->off = OffsetNumberNext(w->off);
 			if (!ItemIdIsUsed(iid))
 				continue;
 			entry = (LionEntryTuple *) PageGetItem(cpage, iid);
 
 			/* Bounded to one key column (DESIGN.md §24). */
-			if (entry->attno < col->attno)
+			if (entry->attno < w->col->attno)
 				continue;
-			if (entry->attno > col->attno)
+			if (entry->attno > w->col->attno)
 			{
-				done = true;
-				break;
+				w->done = true;
+				return NULL;
 			}
 
-			if (LionEntryIsNullKey(entry) && !withnull)
+			if (LionEntryIsNullKey(entry) && !w->withnull)
 				continue;
 
-			/* Only the entries the range selects, up to its end (§28). */
-			if (range != NULL)
+			/* Only the entries a range selects, up to its end (§28). */
+			if (w->nranges > 0)
 			{
-				int			r = lion_range_test(range, entry);
+				bool		match = false;
+				bool		allended = true;
+				int			r;
 
-				if (r == LION_RANGE_END)
+				for (r = 0; r < w->nranges; r++)
 				{
-					done = true;
-					break;
+					int			t;
+
+					if (w->ended[r])
+						continue;
+					t = lion_range_test(&w->ranges[r], entry);
+					if (t == LION_RANGE_MATCH)
+						match = true;
+					else if (t == LION_RANGE_END)
+						w->ended[r] = true;
+					if (!w->ended[r])
+						allended = false;
 				}
-				if (r == LION_RANGE_SKIP)
+				if (!match)
+				{
+					if (allended)
+					{
+						w->done = true;
+						return NULL;
+					}
 					continue;
+				}
 			}
 
-			if ((entry->flags & LION_ENTRY_INLINE) != 0)
-				ntids += lion_emit_inline(LionEntryGetPayload(entry),
-										 LION_ENTRY_PAYLOAD_LEN(entry,
-															   ItemIdGetLength(iid)),
-										 tbm, recheck);
-			else
-				ntids += lion_emit_chain(index, entry->hash, entry->head,
-										tbm, recheck);
-
-			CHECK_FOR_INTERRUPTS();
+			*itemlen = ItemIdGetLength(iid);
+			return entry;
 		}
+
+		w->haspage = false;
+	}
+}
+
+static void
+lion_walk_end(LionLeafWalk *w)
+{
+	if (BufferIsValid(w->pinbuf))
+		ReleaseBuffer(w->pinbuf);
+	w->pinbuf = InvalidBuffer;
+	w->done = true;
+	w->haspage = false;
+}
+
+static int64
+lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
+					  bool recheck, bool withnull, LionRange *range)
+{
+	LionLeafWalk w;
+	LionEntryTuple *entry;
+	Size		itemlen;
+	int64		ntids = 0;
+
+	lion_walk_begin(&w, index, col, withnull, range, 1, false);
+
+	while ((entry = lion_walk_next(&w, &itemlen)) != NULL)
+	{
+		if ((entry->flags & LION_ENTRY_INLINE) != 0)
+			ntids += lion_emit_inline(LionEntryGetPayload(entry),
+									 LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
+									 tbm, recheck);
+		else
+			ntids += lion_emit_chain(index, entry->hash, entry->head,
+									tbm, recheck);
+
+		CHECK_FOR_INTERRUPTS();
 	}
 
-	pfree(copy);
+	lion_walk_end(&w);
+	pfree(w.copy);
 	return ntids;
 }
 
@@ -621,18 +807,18 @@ lion_scankey_is_range(LionState *col, ScanKey skey)
  * rather than growing.
  */
 static int64
-lion_emit_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+lion_emit_range(LionScanOpaque so, LionState *col,
 			   TIDBitmap *tbm)
 {
-	Relation	index = scan->indexRelation;
+	Relation	index = so->index;
 	LionRange	range;
 	int64		ntids;
 	int			i;
 
 	lion_range_init(&range, index, (AttrNumber) col->attno);
-	for (i = 0; i < scan->numberOfKeys; i++)
+	for (i = 0; i < so->nkeys; i++)
 	{
-		ScanKey		k = &scan->keyData[i];
+		ScanKey		k = &so->keys[i];
 
 		if (k->sk_attno != col->attno || !lion_scankey_is_range(col, k))
 			continue;
@@ -670,10 +856,10 @@ lion_emit_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
  * empty one, selects nothing.
  */
 static int64
-lion_emit_array_range(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+lion_emit_array_range(LionScanOpaque so, LionState *col,
 					 ScanKey skey, TIDBitmap *tbm)
 {
-	Relation	index = scan->indexRelation;
+	Relation	index = so->index;
 	LionScanCol *sc = &so->cols[col->attno - 1];
 	ArrayType  *arr = DatumGetArrayTypeP(skey->sk_argument);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
@@ -877,10 +1063,10 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
  * cost nothing but the second lookup.
  */
 static int64
-lion_emit_multikey(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+lion_emit_multikey(LionScanOpaque so, LionState *col,
 				  ScanKey skey, TIDBitmap *tbm)
 {
-	Relation	index = scan->indexRelation;
+	Relation	index = so->index;
 
 	/*
 	 * A strategy this file does not know is an ERROR and not an empty result:
@@ -1018,10 +1204,10 @@ lion_scan_shift(LionKeyNode *node, int base)
  * the qual selects nothing whatsoever, which settles the entire scan.
  */
 static LionKeyNode *
-lion_scan_col_tree(IndexScanDesc scan, LionScanOpaque so, LionState *col,
+lion_scan_col_tree(LionScanOpaque so, LionState *col,
 				  ScanKey skey, LionScanSets *acc, bool *ok, bool *nomatch)
 {
-	Relation	index = scan->indexRelation;
+	Relation	index = so->index;
 	AttrNumber	attno = (AttrNumber) col->attno;
 
 	*ok = true;
@@ -1193,7 +1379,7 @@ lion_scan_col_tree(IndexScanDesc scan, LionScanOpaque so, LionState *col,
  * so the caller falls back to a single-column answer.
  */
 static int64
-lion_emit_columns(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
+lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 				 int nkeys, TIDBitmap *tbm)
 {
 	LionScanSets acc;
@@ -1223,7 +1409,7 @@ lion_emit_columns(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
 		bool		ok;
 		bool		nomatch;
 
-		node = lion_scan_col_tree(scan, so, col, keys[i], &acc, &ok, &nomatch);
+		node = lion_scan_col_tree(so, col, keys[i], &acc, &ok, &nomatch);
 
 		if (nomatch)
 		{
@@ -1280,7 +1466,7 @@ lion_emit_columns(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
  * it; tbm_intersect() and tbm_union() carry the recheck flags across.
  */
 static int64
-lion_emit_intersect(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
+lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 				   int nkeys, LionState **rangecol, int nrange,
 				   TIDBitmap *tbm)
 {
@@ -1291,7 +1477,7 @@ lion_emit_intersect(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
 	if (nkeys > 0)
 	{
 		acc = tbm_create((Size) work_mem * 1024, NULL);
-		ntids = lion_emit_columns(scan, so, keys, nkeys, acc);
+		ntids = lion_emit_columns(so, keys, nkeys, acc);
 		if (ntids < 0)
 		{
 			/* Nothing expressible there: the ranges alone, rechecked. */
@@ -1311,7 +1497,7 @@ lion_emit_intersect(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
 			break;
 
 		one = tbm_create((Size) work_mem * 1024, NULL);
-		n = lion_emit_range(scan, so, rangecol[i], one);
+		n = lion_emit_range(so, rangecol[i], one);
 		ntids = (ntids < 0) ? n : Min(ntids, n);
 		if (acc == NULL)
 			acc = one;
@@ -1331,73 +1517,48 @@ lion_emit_intersect(IndexScanDesc scan, LionScanOpaque so, ScanKey *keys,
 	return Max(ntids, 0);
 }
 
-int64
-liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+/*
+ * The per-column choice both kinds of scan make (DESIGN.md §5 SCAN step 5,
+ * §24, §28, §29.2).  ONE qual per key column is answered: the planner may
+ * hand a column more than one (`b = ANY (x) AND b = ANY (y)`, or an equality
+ * next to a null test), and the most selective-looking one is answered while
+ * the rest are left to the heap recheck, which is correct because the others
+ * only shrink the result.  The ranking is a plain equality first, then a
+ * list, then a range, then a null test - and it is mirrored in
+ * lion_scan_walks_whole_index() so that the path is priced as the path it
+ * takes.  A range is every `<`, `<=`, `>=` and `>` of the column at once
+ * (DESIGN.md §28): the walk answers all of them, so when the range is the
+ * chosen qual none of them is dropped.
+ */
+typedef struct LionScanChoice
 {
-	Relation	index = scan->indexRelation;
-	LionScanOpaque so = (LionScanOpaque) scan->opaque;
 	ScanKey		best[INDEX_MAX_KEYS];
 	int			bestrank[INDEX_MAX_KEYS];
+	int			nchosen;		/* columns with a chosen qual */
+	int			ndropped;		/* quals left to the recheck */
+} LionScanChoice;
+
+static void
+lion_scan_choose(LionScanOpaque so, LionScanChoice *ch)
+{
 	int			nkeys[INDEX_MAX_KEYS];
 	int			nrangekeys[INDEX_MAX_KEYS];
-	int			ncols;
-	int			nchosen = 0;
-	int			ndropped = 0;
+	int			ncols = so->ix->ncolumns;
 	int			i;
-	LionState  *col;
-	ScanKey		skey;
 
-	/*
-	 * Re-fetch the cached state: a relcache invalidation since ambeginscan
-	 * would have thrown the copy in rd_amcache away.
-	 */
-	so->ix = lion_get_index_state(index);
-	ncols = so->ix->ncolumns;
-
-	pgstat_count_index_scan(index);
-#if PG_VERSION_NUM >= 180000
-	if (scan->instrument)
-		scan->instrument->nsearches++;
-#endif
-
-	/*
-	 * No scan key at all: a PARTIAL index whose predicate the query implies
-	 * (amoptionalkey, DESIGN.md §24).  The answer is every row the index
-	 * holds, which is the union of every entry of ANY ONE key column - the
-	 * NULL entry included this time, because a row whose value is NULL is
-	 * still an indexed row.  No recheck: these TIDs are exactly the rows the
-	 * scan selects.
-	 */
-	if (scan->numberOfKeys < 1)
-	{
-		so->recheck = false;
-		return lion_emit_all_keys_ext(index, lion_column(so->ix, 1), tbm,
-									 false, true, NULL);
-	}
-
-	/*
-	 * ONE qual per key column is answered (DESIGN.md §24).  The planner may
-	 * hand a column more than one (`b = ANY (x) AND b = ANY (y)`, or an
-	 * equality next to a null test); the most selective-looking one is
-	 * answered and the rest are left to the heap recheck, which is correct
-	 * because the others only shrink the result.  The ranking is a plain
-	 * equality first, then a list, then a range, then a null test - and it
-	 * is mirrored in lion_scan_walks_whole_index() so that the path is priced
-	 * as the path it takes.  A range is every `<`, `<=`, `>=` and `>` of the
-	 * column at once (DESIGN.md §28): the walk answers all of them, so when
-	 * the range is the chosen qual none of them is dropped.
-	 */
+	ch->nchosen = 0;
+	ch->ndropped = 0;
 	for (i = 0; i < ncols; i++)
 	{
-		best[i] = NULL;
-		bestrank[i] = 4;
+		ch->best[i] = NULL;
+		ch->bestrank[i] = 4;
 		nkeys[i] = 0;
 		nrangekeys[i] = 0;
 	}
 
-	for (i = 0; i < scan->numberOfKeys; i++)
+	for (i = 0; i < so->nkeys; i++)
 	{
-		ScanKey		k = &scan->keyData[i];
+		ScanKey		k = &so->keys[i];
 		int			ci = k->sk_attno - 1;
 		int			rank;
 
@@ -1416,26 +1577,62 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		else
 			rank = 0;
 
-		if (best[ci] == NULL)
-			nchosen++;
+		if (ch->best[ci] == NULL)
+			ch->nchosen++;
 		nkeys[ci]++;
 
-		if (rank < bestrank[ci])
+		if (rank < ch->bestrank[ci])
 		{
-			bestrank[ci] = rank;
-			best[ci] = k;
+			ch->bestrank[ci] = rank;
+			ch->best[ci] = k;
 		}
 	}
 
-	if (nchosen == 0)
-		return 0;
-
 	for (i = 0; i < ncols; i++)
 	{
-		if (best[i] != NULL)
-			ndropped += nkeys[i] - (bestrank[i] == 2 ? nrangekeys[i] : 1);
+		if (ch->best[i] != NULL)
+			ch->ndropped += nkeys[i] - (ch->bestrank[i] == 2 ? nrangekeys[i] : 1);
 	}
-	so->recheck = (ndropped > 0);
+}
+
+/*
+ * The bitmap scan proper, on the keys so->keys[0 .. so->nkeys - 1].  The
+ * plain scan runs it as well, into a private bitmap, for the one shape it
+ * cannot stream (DESIGN.md §29.3, BITMAP).
+ */
+static int64
+lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
+{
+	Relation	index = so->index;
+	LionScanChoice ch;
+	int			ncols;
+	int			i;
+	LionState  *col;
+	ScanKey		skey;
+
+	ncols = so->ix->ncolumns;
+
+	/*
+	 * No scan key at all: a PARTIAL index whose predicate the query implies
+	 * (amoptionalkey, DESIGN.md §24).  The answer is every row the index
+	 * holds, which is the union of every entry of ANY ONE key column - the
+	 * NULL entry included this time, because a row whose value is NULL is
+	 * still an indexed row.  No recheck: these TIDs are exactly the rows the
+	 * scan selects.
+	 */
+	if (so->nkeys < 1)
+	{
+		so->recheck = false;
+		return lion_emit_all_keys_ext(index, lion_column(so->ix, 1), tbm,
+									 false, true, NULL);
+	}
+
+	lion_scan_choose(so, &ch);
+
+	if (ch.nchosen == 0)
+		return 0;
+
+	so->recheck = (ch.ndropped > 0);
 
 	/*
 	 * Several columns: intersect their set trees.  A column whose qual the
@@ -1446,7 +1643,7 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 * range holds (DESIGN.md §28) - so it is answered into a bitmap of its
 	 * own and intersected with the others' (lion_emit_intersect()).
 	 */
-	if (nchosen > 1)
+	if (ch.nchosen > 1)
 	{
 		ScanKey		chosen[INDEX_MAX_KEYS];
 		LionState  *rangecol[INDEX_MAX_KEYS];
@@ -1456,19 +1653,18 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 		for (i = 0; i < ncols; i++)
 		{
-			if (best[i] == NULL)
+			if (ch.best[i] == NULL)
 				continue;
-			if (bestrank[i] == 2)
+			if (ch.bestrank[i] == 2)
 				rangecol[nrange++] = lion_column(so->ix, (AttrNumber) (i + 1));
 			else
-				chosen[n++] = best[i];
+				chosen[n++] = ch.best[i];
 		}
 
 		if (nrange > 0)
-			return lion_emit_intersect(scan, so, chosen, n, rangecol, nrange,
-									   tbm);
+			return lion_emit_intersect(so, chosen, n, rangecol, nrange, tbm);
 
-		ntids = lion_emit_columns(scan, so, chosen, n, tbm);
+		ntids = lion_emit_columns(so, chosen, n, tbm);
 		if (ntids >= 0)
 			return ntids;
 
@@ -1478,11 +1674,11 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	for (i = 0; i < ncols; i++)
 	{
-		if (best[i] != NULL)
+		if (ch.best[i] != NULL)
 			break;
 	}
 	Assert(i < ncols);
-	skey = best[i];
+	skey = ch.best[i];
 	col = lion_column(so->ix, skey->sk_attno);
 
 	/* The null tests carry no strategy number and must be tested first. */
@@ -1497,16 +1693,16 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	/* A multi-key opclass answers the strategies of DESIGN.md §17. */
 	if (col->multikey)
-		return lion_emit_multikey(scan, so, col, skey, tbm);
+		return lion_emit_multikey(so, col, skey, tbm);
 
 	/* Every range key of the column, as one walk (DESIGN.md §28). */
 	if (lion_scankey_is_range(col, skey))
-		return lion_emit_range(scan, so, col, tbm);
+		return lion_emit_range(so, col, tbm);
 
 	/* ... and `col < ANY (array)`, one walk per element. */
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0 &&
 		LION_STRAT_IS_RANGE(skey->sk_strategy))
-		return lion_emit_array_range(scan, so, col, skey, tbm);
+		return lion_emit_array_range(so, col, skey, tbm);
 
 	/*
 	 * A strategy this file does not know is an ERROR and not an empty result:
@@ -1518,7 +1714,796 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 			 RelationGetRelationName(index), (int) skey->sk_strategy);
 
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
-		return lion_emit_array(scan, so, col, skey, tbm);
+		return lion_emit_array(so, col, skey, tbm);
 
-	return lion_emit_value(scan, so, col, skey, skey->sk_argument, tbm);
+	return lion_emit_value(so, col, skey, skey->sk_argument, tbm);
+}
+
+int64
+liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
+{
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+
+	/*
+	 * Re-fetch the cached state: a relcache invalidation since ambeginscan
+	 * would have thrown the copy in rd_amcache away.
+	 */
+	so->ix = lion_get_index_state(scan->indexRelation);
+	so->index = scan->indexRelation;
+	so->keys = scan->keyData;
+	so->nkeys = scan->numberOfKeys;
+
+	pgstat_count_index_scan(scan->indexRelation);
+#if PG_VERSION_NUM >= 180000
+	if (scan->instrument)
+		scan->instrument->nsearches++;
+#endif
+
+	return lion_getbitmap_so(so, tbm);
+}
+
+
+/* ---------------------------------------------------------------------
+ * Plain index scans (DESIGN.md §29): the TID source and amgettuple
+ * --------------------------------------------------------------------- */
+
+/*
+ * The shapes of §29.3.  NONE selects nothing; SETS is one stream over the
+ * columns' set trees; WALK streams the entries of one column's walk, each
+ * ANDed with the other columns' trees; BITMAP runs the bitmap scan into a
+ * private TIDBitmap and hands its pages out as containers.
+ */
+typedef enum LionSourceShape
+{
+	LION_SRC_NONE,
+	LION_SRC_SETS,
+	LION_SRC_WALK,
+	LION_SRC_BITMAP
+} LionSourceShape;
+
+struct LionSource
+{
+	LionScanOpaque so;			/* the keys and the probe cache */
+	Relation	index;
+	MemoryContext cxt;			/* everything below, but the entry's streams */
+	MemoryContext entrycxt;		/* WALK: one entry's stream and cursors */
+	bool		keeppins;		/* §29.5: a non-MVCC scan keeps its pins */
+	bool		recheck;		/* §29.6 */
+	LionSourceShape shape;
+
+	/* the located sets of the SETS tree, or of a WALK's other columns */
+	LionPostingSet *sets;		/* nsets of them, + 1 slot for a WALK entry */
+	int			nsets;
+	LionKeyNode *tree;			/* over sets[]; a WALK's names sets[nsets] */
+	LionSetStream *stream;		/* the current one */
+
+	/* WALK */
+	LionLeafWalk walk;
+	LionRange  *ranges;
+	int			nranges;
+
+	/* BITMAP */
+	TIDBitmap  *tbm;
+#if PG_VERSION_NUM >= 180000
+	TBMPrivateIterator *tbmit;
+#else
+	TBMIterator *tbmit;
+#endif
+	bool		tbmdone;
+	bool		tbmpending;		/* a page is waiting to start the next container */
+	BlockNumber pendblk;
+	int			npend;			/* -1: lossy */
+	OffsetNumber pendoffs[MaxHeapTuplesPerPage];
+	LionContainer *cbuf;		/* the container handed out */
+};
+
+/* The probe of a scan key's type on one column, cached per column. */
+static LionProbe *
+lion_scan_probe(LionScanOpaque so, LionState *col, Oid subtype)
+{
+	LionScanCol *sc = &so->cols[col->attno - 1];
+
+	if (!sc->probevalid || sc->subtype != subtype)
+	{
+		/* the probe's FmgrInfos live as long as the scan */
+		MemoryContext oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+
+		lion_probe_init(so->index, col, subtype, &sc->probe);
+		MemoryContextSwitchTo(oldcxt);
+		sc->subtype = subtype;
+		sc->probevalid = true;
+	}
+	return &sc->probe;
+}
+
+/*
+ * The ranges a WALK of a scalar column tests its entries with (§29.3): every
+ * range key of the column as ONE range, or, for `op ANY (array)`, the range of
+ * the widest element when the column orders the elements (§28) and one range
+ * per element otherwise.  Returns false when nothing can be in range: an
+ * empty array, or one of NULLs only.
+ */
+static bool
+lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
+{
+	LionScanOpaque so = src->so;
+	Relation	index = src->index;
+	int			i;
+
+	if ((best->sk_flags & SK_SEARCHARRAY) == 0)
+	{
+		src->ranges = (LionRange *) palloc(sizeof(LionRange));
+		src->nranges = 1;
+		lion_range_init(&src->ranges[0], index, (AttrNumber) col->attno);
+		for (i = 0; i < so->nkeys; i++)
+		{
+			ScanKey		k = &so->keys[i];
+
+			if (k->sk_attno != col->attno || !lion_scankey_is_range(col, k))
+				continue;
+			lion_range_add(&src->ranges[0], index, k->sk_strategy,
+						   k->sk_func.fn_oid, k->sk_subtype, k->sk_argument,
+						   (k->sk_flags & SK_ISNULL) != 0, k->sk_collation);
+		}
+		return true;
+	}
+
+	if ((best->sk_flags & SK_ISNULL) != 0)
+		return false;			/* `k < ANY (NULL)` */
+
+	{
+		ArrayType  *arr = DatumGetArrayTypeP(best->sk_argument);
+		Oid			elemtype = ARR_ELEMTYPE(arr);
+		LionProbe  *probe = lion_scan_probe(so, col, best->sk_subtype);
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		int			widest = -1;
+
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+						  &elems, &nulls, &nelems);
+
+		src->ranges = (LionRange *) palloc(sizeof(LionRange) * Max(nelems, 1));
+		src->nranges = 0;
+
+		for (i = 0; i < nelems; i++)
+		{
+			if (nulls[i])
+				continue;		/* a strict comparison with NULL is not true */
+
+			if (probe->hassort)
+			{
+				int32		c;
+
+				if (widest < 0)
+				{
+					widest = i;
+					continue;
+				}
+				c = DatumGetInt32(FunctionCall2Coll(&probe->sortproc,
+													col->collation,
+													elems[i], elems[widest]));
+				if (LION_STRAT_IS_LOWER(best->sk_strategy) ? (c < 0) : (c > 0))
+					widest = i;
+				continue;
+			}
+
+			/* No order among the elements: one range each, in ONE walk. */
+			lion_range_init(&src->ranges[src->nranges], index,
+							(AttrNumber) col->attno);
+			lion_range_add(&src->ranges[src->nranges], index,
+						   best->sk_strategy, best->sk_func.fn_oid,
+						   best->sk_subtype, elems[i], false,
+						   best->sk_collation);
+			src->nranges++;
+		}
+
+		if (widest >= 0)
+		{
+			lion_range_init(&src->ranges[0], index, (AttrNumber) col->attno);
+			lion_range_add(&src->ranges[0], index, best->sk_strategy,
+						   best->sk_func.fn_oid, best->sk_subtype,
+						   elems[widest], false, best->sk_collation);
+			src->nranges = 1;
+		}
+
+		/* The element values stay in src->cxt with the ranges that use them. */
+		return src->nranges > 0;
+	}
+}
+
+/*
+ * Build the source for so->keys (DESIGN.md §29.3).  Every set is located -
+ * every directory lock taken - before any posting page is pinned, which is
+ * the reader side of the §11 deadlock rule.
+ */
+static LionSource *
+lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
+{
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionSource *src;
+	LionScanChoice ch;
+	LionScanSets acc;
+	LionKeyNode **args;
+	int			nargs = 0;
+	int			walkcol = -1;
+	bool		withnull = false;
+	bool		nomatch = false;
+	bool		mkfallback = false;
+	int			ncols = so->ix->ncolumns;
+	int			i;
+
+	cxt = AllocSetContextCreate(parent, "lion index scan",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	src = (LionSource *) palloc0(sizeof(LionSource));
+	src->so = so;
+	src->index = so->index;
+	src->cxt = cxt;
+	src->keeppins = keeppins;
+	src->shape = LION_SRC_NONE;
+
+	memset(&ch, 0, sizeof(ch));
+	acc.maxsets = 8;
+	acc.nsets = 0;
+	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (INDEX_MAX_KEYS + 1));
+
+	if (so->nkeys < 1)
+	{
+		/*
+		 * No key at all: a partial index whose predicate the query implies
+		 * (§24).  Every row the index holds is under column 1, NULL entry
+		 * included - streamed by a walk, unless that column is multi-key.
+		 */
+		if (lion_column(so->ix, 1)->multikey)
+			mkfallback = true;
+		else
+		{
+			walkcol = 0;
+			withnull = true;
+		}
+	}
+	else
+	{
+		lion_scan_choose(so, &ch);
+		if (ch.nchosen == 0)
+			nomatch = true;
+		src->recheck = (ch.ndropped > 0);
+
+		for (i = 0; i < ncols && !nomatch; i++)
+		{
+			ScanKey		skey = ch.best[i];
+			LionState  *col;
+			LionKeyNode *node;
+			bool		ok;
+			bool		none;
+
+			if (skey == NULL)
+				continue;
+			col = lion_column(so->ix, (AttrNumber) (i + 1));
+
+			if (col->multikey)
+			{
+				/* Answered, and rechecked all the same (§29.6). */
+				src->recheck = true;
+				if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
+				{
+					mkfallback = true;	/* a walk would repeat rows */
+					continue;
+				}
+				node = lion_scan_col_tree(so, col, skey, &acc, &ok, &none);
+				if (none)
+					nomatch = true;
+				else if (!ok)
+					mkfallback = true;	/* mode ALL: every row */
+				else
+					args[nargs++] = node;
+				continue;
+			}
+
+			/* A scalar column: a walk, or a set tree. */
+			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0 ||
+				ch.bestrank[i] == 2 ||
+				((skey->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL)) == SK_SEARCHARRAY &&
+				 LION_STRAT_IS_RANGE(skey->sk_strategy)))
+			{
+				if (walkcol < 0)
+					walkcol = i;
+				else
+					src->recheck = true;	/* a second walk is not answered */
+				continue;
+			}
+
+			if ((skey->sk_flags & (SK_SEARCHNULL | SK_ISNULL)) == 0 &&
+				skey->sk_strategy != LION_STRAT_EQUAL)
+				elog(ERROR, "lion index \"%s\": unsupported strategy %d",
+					 RelationGetRelationName(so->index),
+					 (int) skey->sk_strategy);
+
+			node = lion_scan_col_tree(so, col, skey, &acc, &ok, &none);
+			if (none)
+				nomatch = true;
+			else
+			{
+				Assert(ok && node != NULL);
+				args[nargs++] = node;
+			}
+		}
+
+		/*
+		 * A multi-key column that needs every row, next to a column that
+		 * does answer: dropped and rechecked, as the bitmap path does.  Only
+		 * when nothing else answers does the scan need its bitmap.
+		 */
+		if (mkfallback && (nargs > 0 || walkcol >= 0))
+			mkfallback = false;
+	}
+
+	if (!nomatch && walkcol >= 0 && !withnull)
+	{
+		LionState  *col = lion_column(so->ix, (AttrNumber) (walkcol + 1));
+		ScanKey		best = ch.best[walkcol];
+
+		if ((best->sk_flags & SK_SEARCHNOTNULL) == 0 &&
+			!lion_source_ranges(src, col, best))
+			nomatch = true;
+	}
+
+	if (nomatch || mkfallback)
+	{
+		for (i = 0; i < acc.nsets; i++)
+			lion_posting_set_release(&acc.sets[i]);
+	}
+
+	if (nomatch)
+	{
+		src->shape = LION_SRC_NONE;
+		MemoryContextSwitchTo(oldcxt);
+		return src;
+	}
+
+	if (mkfallback)
+	{
+		src->shape = LION_SRC_BITMAP;
+		src->recheck = true;
+		src->tbm = tbm_create((Size) work_mem * 1024, NULL);
+		(void) lion_getbitmap_so(so, src->tbm);
+#if PG_VERSION_NUM >= 180000
+		src->tbmit = tbm_begin_private_iterate(src->tbm);
+#else
+		src->tbmit = tbm_begin_iterate(src->tbm);
+#endif
+		src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		MemoryContextSwitchTo(oldcxt);
+		return src;
+	}
+
+	/*
+	 * The located sets: one more slot for a WALK's entry.  Under an MVCC
+	 * snapshot no pin is kept at all (§29.5); otherwise a set located past
+	 * the list pin budget carries no interlock, and the TIDs are rechecked.
+	 */
+	src->nsets = acc.nsets;
+	src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * (acc.nsets + 1));
+	for (i = 0; i < acc.nsets; i++)
+	{
+		src->sets[i] = acc.sets[i];
+		if (!keeppins)
+			lion_posting_set_unpin(&src->sets[i]);
+		else if (src->sets[i].found && src->sets[i].is_inline &&
+				 !BufferIsValid(src->sets[i].pinbuf))
+			src->recheck = true;
+	}
+
+	if (walkcol < 0)
+	{
+		src->shape = LION_SRC_SETS;
+		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
+		src->stream = lion_stream_begin(src->nsets, src->sets, src->tree,
+										keeppins);
+	}
+	else
+	{
+		LionState  *col = lion_column(so->ix, (AttrNumber) (walkcol + 1));
+
+		src->shape = LION_SRC_WALK;
+		args[nargs++] = lion_scan_leaf(src->nsets);
+		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
+		src->entrycxt = AllocSetContextCreate(cxt, "lion index scan entry",
+											  ALLOCSET_DEFAULT_SIZES);
+		lion_walk_begin(&src->walk, so->index, col, withnull, src->ranges,
+						src->nranges, keeppins);
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	return src;
+}
+
+/*
+ * The BITMAP shape's next container: the private TIDBitmap's pages, grouped
+ * by the container key their blocks fall under.  A lossy page stands for
+ * every offset a heap page can have; the fetch finds nothing where there is
+ * no tuple, and the scan is rechecked anyway.
+ */
+static bool
+lion_source_tbm_page(LionSource *src)
+{
+#if PG_VERSION_NUM >= 180000
+	TBMIterateResult res;
+
+	if (!tbm_private_iterate(src->tbmit, &res))
+		return false;
+	src->pendblk = res.blockno;
+	if (res.lossy)
+		src->npend = -1;
+	else
+		src->npend = tbm_extract_page_tuple(&res, src->pendoffs,
+											MaxHeapTuplesPerPage);
+#else
+	TBMIterateResult *res = tbm_iterate(src->tbmit);
+
+	if (res == NULL)
+		return false;
+	src->pendblk = res->blockno;
+	src->npend = res->ntuples;
+	if (res->ntuples > 0)
+		memcpy(src->pendoffs, res->offsets, sizeof(OffsetNumber) * res->ntuples);
+#endif
+	return true;
+}
+
+static const LionContainer *
+lion_source_tbm_next(LionSource *src)
+{
+	uint32		ckey = 0;
+	bool		started = false;
+
+	for (;;)
+	{
+		uint64		code;
+		int			j;
+
+		if (!src->tbmpending)
+		{
+			if (src->tbmdone || !lion_source_tbm_page(src))
+			{
+				src->tbmdone = true;
+				return started ? src->cbuf : NULL;
+			}
+			src->tbmpending = true;
+		}
+
+		code = ((uint64) src->pendblk) << LION_OFFSET_BITS;
+		if (started && lion_code_ckey(code) != ckey)
+			return src->cbuf;	/* the pending page starts the next one */
+
+		if (!started)
+		{
+			ckey = lion_code_ckey(code);
+			lion_container_init(src->cbuf, ckey);
+			started = true;
+		}
+
+		if (src->npend < 0)
+		{
+			for (j = FirstOffsetNumber; j <= MaxHeapTuplesPerPage; j++)
+				lion_container_append_sorted(src->cbuf,
+											 lion_code_lo(code | (uint64) j));
+		}
+		else
+		{
+			for (j = 0; j < src->npend; j++)
+				lion_container_append_sorted(src->cbuf,
+											 lion_code_lo(code | (uint64) src->pendoffs[j]));
+		}
+		src->tbmpending = false;
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * The next container of the source, or NULL at the end.  Valid until the
+ * next call, which is where the pins it was read under - if any - go.
+ */
+const LionContainer *
+lion_source_next(LionSource *src)
+{
+	switch (src->shape)
+	{
+		case LION_SRC_NONE:
+			return NULL;
+
+		case LION_SRC_SETS:
+			return lion_stream_next(src->stream);
+
+		case LION_SRC_BITMAP:
+			return lion_source_tbm_next(src);
+
+		case LION_SRC_WALK:
+			for (;;)
+			{
+				LionEntryTuple *entry;
+				LionPostingSet *ps;
+				Size		itemlen;
+				MemoryContext oldcxt;
+
+				if (src->stream != NULL)
+				{
+					const LionContainer *c = lion_stream_next(src->stream);
+
+					if (c != NULL)
+						return c;
+
+					/*
+					 * This entry is done: its cursors' pins go, and only then
+					 * is the next directory leaf locked (the §11 rule).
+					 */
+					lion_stream_end(src->stream);
+					src->stream = NULL;
+					MemoryContextReset(src->entrycxt);
+				}
+
+				entry = lion_walk_next(&src->walk, &itemlen);
+				if (entry == NULL)
+					return NULL;
+
+				/*
+				 * The entry as a located set, without a lookup: an INLINE
+				 * payload read straight out of the walk's copy of the leaf
+				 * (which stays put until this entry's stream is over), a
+				 * posting tree through its root.  Under a non-MVCC snapshot
+				 * the walk keeps that leaf pinned (§29.5).
+				 */
+				ps = &src->sets[src->nsets];
+				memset(ps, 0, sizeof(LionPostingSet));
+				ps->index = src->index;
+				ps->attno = entry->attno;
+				ps->found = true;
+				ps->pinbuf = InvalidBuffer;
+				ps->ntids = entry->ntids;
+				ps->ncontainers = entry->ncontainers;
+				ps->entryblk = InvalidBlockNumber;
+				ps->entryoff = InvalidOffsetNumber;
+				ps->keyisnull = LionEntryIsNullKey(entry);
+				ps->cxt = src->entrycxt;
+				if ((entry->flags & LION_ENTRY_INLINE) != 0)
+				{
+					ps->is_inline = true;
+					ps->head = InvalidBlockNumber;
+					ps->payload = LionEntryGetPayload(entry);
+					ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
+				}
+				else
+					ps->head = entry->head;
+
+				oldcxt = MemoryContextSwitchTo(src->entrycxt);
+				src->stream = lion_stream_begin(src->nsets + 1, src->sets,
+												src->tree, src->keeppins);
+				MemoryContextSwitchTo(oldcxt);
+
+				CHECK_FOR_INTERRUPTS();
+			}
+	}
+	return NULL;				/* keep compiler quiet */
+}
+
+/* Drop every pin the source holds; its memory goes with its context. */
+static void
+lion_source_release(LionSource *src)
+{
+	int			i;
+
+	if (src->stream != NULL)
+		lion_stream_end(src->stream);
+	src->stream = NULL;
+	if (src->shape == LION_SRC_WALK)
+		lion_walk_end(&src->walk);
+	for (i = 0; i < src->nsets; i++)
+		lion_posting_set_release(&src->sets[i]);
+	src->nsets = 0;
+	if (src->tbmit != NULL)
+	{
+#if PG_VERSION_NUM >= 180000
+		tbm_end_private_iterate(src->tbmit);
+#else
+		tbm_end_iterate(src->tbmit);
+#endif
+		src->tbmit = NULL;
+	}
+	if (src->tbm != NULL)
+	{
+		tbm_free(src->tbm);
+		src->tbm = NULL;
+	}
+	src->shape = LION_SRC_NONE;
+}
+
+LionSource *
+lion_source_open(Relation index, ScanKey keys, int nkeys, bool keeppins,
+				 MemoryContext cxt)
+{
+	LionScanOpaque so;
+	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+
+	so = (LionScanOpaque) palloc0(sizeof(LionScanOpaqueData));
+	so->ix = lion_get_index_state(index);
+	so->cols = (LionScanCol *) palloc0(sizeof(LionScanCol) * so->ix->ncolumns);
+	so->index = index;
+	so->keys = keys;
+	so->nkeys = nkeys;
+	MemoryContextSwitchTo(oldcxt);
+
+	return lion_source_build(so, keeppins, cxt);
+}
+
+bool
+lion_source_sorted(LionSource *src)
+{
+	return src->shape != LION_SRC_WALK;
+}
+
+bool
+lion_source_exact(LionSource *src)
+{
+	return !src->recheck;
+}
+
+void
+lion_source_close(LionSource *src)
+{
+	LionScanOpaque so = src->so;
+
+	lion_source_release(src);
+	MemoryContextDelete(src->cxt);
+	pfree(so->cols);
+	pfree(so);
+}
+
+/*
+ * amgettuple (DESIGN.md §29): the next TID of the source, one container's
+ * members at a time.
+ */
+bool
+liongettuple(IndexScanDesc scan, ScanDirection dir)
+{
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+
+	/* §29.1: lion is not ordered, so nothing asks for another direction. */
+	if (!ScanDirectionIsForward(dir))
+		elog(ERROR, "lion index \"%s\" cannot be scanned backward",
+			 RelationGetRelationName(scan->indexRelation));
+
+	if (so->src == NULL)
+	{
+		bool		droppin;
+
+		if (so->srcdone)
+			return false;
+
+		/* A relcache invalidation may have replaced the cached state. */
+		so->ix = lion_get_index_state(scan->indexRelation);
+		so->index = scan->indexRelation;
+		so->keys = scan->keyData;
+		so->nkeys = scan->numberOfKeys;
+
+		pgstat_count_index_scan(scan->indexRelation);
+#if PG_VERSION_NUM >= 180000
+		if (scan->instrument)
+			scan->instrument->nsearches++;
+#endif
+
+		if (so->gtcxt == NULL)
+			so->gtcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+											  "lion index scan state",
+											  ALLOCSET_SMALL_SIZES);
+		if (so->lo == NULL)
+			so->lo = (uint16 *) MemoryContextAlloc(GetMemoryChunkContext(so),
+												   sizeof(uint16) * LION_CONTAINER_RANGE);
+
+		/*
+		 * An index-only scan (DESIGN.md §29.9).  lion returns no column
+		 * (amcanreturn is NULL), so the planner builds one only for a query
+		 * that needs no column at all - `SELECT count(*) FROM t`, which
+		 * amoptionalkey lets it answer from a lion index with no key - and
+		 * nothing ever reads what the tuple holds.  It still has to BE one:
+		 * a tuple of NULLs of the index's own shape.
+		 */
+		if (scan->xs_want_itup && so->nullitup == NULL)
+		{
+			TupleDesc	desc = RelationGetDescr(scan->indexRelation);
+			Datum		values[INDEX_MAX_KEYS];
+			bool		isnull[INDEX_MAX_KEYS];
+			MemoryContext oldcxt;
+			int			i;
+
+			for (i = 0; i < desc->natts; i++)
+			{
+				values[i] = (Datum) 0;
+				isnull[i] = true;
+			}
+			oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+			so->nullitup = index_form_tuple(desc, values, isnull);
+			MemoryContextSwitchTo(oldcxt);
+		}
+
+		/*
+		 * nbtree's dropPin rule (nbtree.c, btrescan): an MVCC snapshot needs
+		 * no pin, anything else keeps the page each batch came from pinned
+		 * until the next batch (DESIGN.md §29.5).
+		 */
+		droppin = LION_IS_MVCC_LIKE(scan->xs_snapshot) &&
+			!scan->xs_want_itup && scan->heapRelation != NULL;
+
+		so->src = lion_source_build(so, !droppin, so->gtcxt);
+		so->nlo = 0;
+		so->pos = 0;
+	}
+
+	for (;;)
+	{
+		const LionContainer *c;
+
+		if (so->pos < so->nlo)
+		{
+			uint16		blkinc;
+			OffsetNumber off;
+
+			lion_lo_split(so->lo[so->pos++], &blkinc, &off);
+			ItemPointerSet(&scan->xs_heaptid, so->firstblk + blkinc, off);
+			scan->xs_recheck = so->src->recheck;
+
+			if (scan->xs_want_itup)
+			{
+				/*
+				 * An index-only scan trusts the visibility map for every TID
+				 * it is handed.  The SETS and WALK shapes keep the page each
+				 * batch came from pinned until the next one (xs_want_itup
+				 * turned dropPin off), which is the §9 interlock the count
+				 * relies on.  The BITMAP shape was built without pins, and a
+				 * lossy page names offsets that hold nothing: its TIDs are
+				 * checked in the heap here, and only a tuple visible to the
+				 * snapshot is handed on - which stays visible to it, so no
+				 * VACUUM can take it away before the executor looks.
+				 */
+				if (so->src->shape == LION_SRC_BITMAP)
+				{
+					ItemPointerData tid = scan->xs_heaptid;
+
+					if (!lion_table_fetch_tid(scan->heapRelation, &tid,
+											  scan->xs_snapshot, NULL))
+						continue;
+				}
+				scan->xs_itup = so->nullitup;
+			}
+			return true;
+		}
+
+		c = lion_source_next(so->src);
+		if (c == NULL)
+		{
+			lion_source_release(so->src);
+			so->src = NULL;
+			so->srcdone = true;
+			return false;
+		}
+
+		so->firstblk = lion_ckey_first_block(c->ckey);
+		so->nlo = (int) lion_container_to_array(c, so->lo);
+		so->pos = 0;
+
+		/*
+		 * Test hook: a batch has just been loaded and none of it returned.
+		 * Under a non-MVCC snapshot the page it came from is pinned here;
+		 * under an MVCC one nothing is.  test/isolation/gettuple_dirty_pin.spec
+		 * parks scans of both kinds at this point.
+		 */
+		LION_INJECTION_POINT("lion-gettuple-batch");
+	}
 }

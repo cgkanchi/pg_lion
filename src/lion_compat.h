@@ -45,6 +45,19 @@
 #define LION_INJECTION_POINT(name)	((void) 0)
 #endif
 
+/*
+ * The snapshots a plain index scan may drop its pins under (DESIGN.md §29.5),
+ * as nbtree decides it: 19 narrowed IsMVCCSnapshot() to regular MVCC
+ * snapshots and named the old meaning, historic ones included,
+ * IsMVCCLikeSnapshot().
+ */
+#include "utils/snapmgr.h"
+#ifdef IsMVCCLikeSnapshot
+#define LION_IS_MVCC_LIKE(snapshot)	IsMVCCLikeSnapshot(snapshot)
+#else
+#define LION_IS_MVCC_LIKE(snapshot)	IsMVCCSnapshot(snapshot)
+#endif
+
 /* vacuum_delay_point() took is_analyze in 18. */
 #if PG_VERSION_NUM >= 180000
 #define lion_vacuum_delay_point()	vacuum_delay_point(false)
