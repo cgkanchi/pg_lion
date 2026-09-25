@@ -12,6 +12,7 @@
 #ifndef LION_COUNT_H
 #define LION_COUNT_H
 
+#include "access/skey.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/planner.h"
 #include "storage/buf.h"
@@ -461,6 +462,44 @@ typedef bool (*lion_container_callback) (const LionContainer *c, void *arg);
 extern int64 lion_sets_iterate(int nsets, LionPostingSet *sets,
 							  LionKeyNode *tree,
 							  lion_container_callback cb, void *arg);
+
+/*
+ * The same walk as a PULL: lion_stream_next() hands out one container per
+ * call, in strictly ascending container key, each valid until the next call,
+ * and NULL at the end (DESIGN.md §29.3).  keeppins keeps the §9 pin on the
+ * page each current container came from until the stream moves past it; with
+ * it off the cursors copy each posting leaf and let go of it at once, which
+ * is what a plain index scan under an MVCC snapshot wants (§29.5).  An INLINE
+ * set's own leaf pin is the caller's: lion_posting_set_unpin() it for no pin
+ * at all.  The stream and its cursors are allocated in the current memory
+ * context; lion_stream_end() drops every pin they hold.
+ */
+typedef struct LionSetStream LionSetStream;
+
+extern LionSetStream *lion_stream_begin(int nsets, LionPostingSet *sets,
+										LionKeyNode *tree, bool keeppins);
+extern const LionContainer *lion_stream_next(LionSetStream *st);
+extern void lion_stream_end(LionSetStream *st);
+
+/*
+ * A source of the TIDs one set of scan keys selects (DESIGN.md §29.3), in
+ * lion_scan.c: what a plain index scan returns, independent of any
+ * IndexScanDesc, so that a caller that wants lion's answer to a WHERE clause
+ * as a stream - or as a set to probe - can open one.  lion_source_next()
+ * hands out one container at a time; in the SETS shape (lion_source_sorted())
+ * the whole answer is one strictly ascending run of container keys, each TID
+ * exactly once; a WALK streams entry by entry, ascending within each.
+ * lion_source_exact() is false when the TIDs are a superset that the caller
+ * must recheck (§29.6).  keys must stay valid while the source is open.
+ */
+typedef struct LionSource LionSource;
+
+extern LionSource *lion_source_open(Relation index, ScanKey keys, int nkeys,
+									bool keeppins, MemoryContext cxt);
+extern const LionContainer *lion_source_next(LionSource *src);
+extern bool lion_source_sorted(LionSource *src);
+extern bool lion_source_exact(LionSource *src);
+extern void lion_source_close(LionSource *src);
 
 /*
  * Can (tree over sets) select anything at all?  False when a key the tree

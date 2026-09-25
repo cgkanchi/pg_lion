@@ -167,6 +167,10 @@ typedef struct LionCountCtx
 								 * sets, DESIGN.md §15): recheck everything */
 	bool		rel_read_only;	/* the statement does not modify heap: on-access
 								 * pruning may set the VM (DESIGN.md §11) */
+	bool		droppins;		/* the caller needs no interlock at all: every
+								 * cursor lets go of a posting leaf as soon as
+								 * it has copied it (a plain index scan under
+								 * an MVCC snapshot, DESIGN.md §29.5) */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
 	int64		count;			/* members counted straight from the VM */
 	LionCountStats stats;
@@ -244,6 +248,9 @@ typedef struct LionSetCursor
 	OffsetNumber maxoff;
 	PGAlignedBlock *imgbuf;		/* private copy of the current container page */
 	Page		img;
+	bool		haspage;		/* img holds a leaf whose items are being
+								 * consumed; pinbuf pins it unless the cursor
+								 * was told to drop its pins (cx->droppins) */
 
 	/*
 	 * SEEKING (DESIGN.md §22).  `descend` says the next leaf must come from a
@@ -1408,6 +1415,7 @@ lion_cursor_unpin(LionSetCursor *cur)
 		ReleaseBuffer(cur->pinbuf);
 	cur->pinbuf = InvalidBuffer;
 	cur->ownpin = false;
+	cur->haspage = false;
 }
 
 static void
@@ -1471,9 +1479,28 @@ static void
 lion_cursor_take_page(LionSetCursor *cur, Buffer buf)
 {
 	memcpy(cur->img, BufferGetPage(buf), BLCKSZ);
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	cur->pinbuf = buf;
-	cur->ownpin = true;
+	cur->haspage = true;
+
+	/*
+	 * A caller that needs no interlock (DESIGN.md §29.5: a plain index scan
+	 * under an MVCC snapshot, which visits the heap for every TID) keeps the
+	 * image and nothing else.  Everything the cursor does next - the items,
+	 * the right link, maxckey for a seek - is read from the image, so the pin
+	 * was only ever the §9 interlock, and a pin held across a paused scan
+	 * would make every VACUUM of the table wait for it.
+	 */
+	if (cur->cx->droppins)
+	{
+		UnlockReleaseBuffer(buf);
+		cur->pinbuf = InvalidBuffer;
+		cur->ownpin = false;
+	}
+	else
+	{
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		cur->pinbuf = buf;
+		cur->ownpin = true;
+	}
 
 	cur->nextblk = LionPageGetOpaque(cur->img)->rightlink;
 	cur->off = FirstOffsetNumber;
@@ -1516,7 +1543,7 @@ lion_cursor_next_item(LionSetCursor *cur)
 		Page		page;
 
 		/* Finish the page we already have in hand. */
-		while (BufferIsValid(cur->pinbuf) && cur->off <= cur->maxoff)
+		while (cur->haspage && cur->off <= cur->maxoff)
 		{
 			ItemId		iid = PageGetItemId(cur->img, cur->off);
 
@@ -1747,7 +1774,7 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 		Page		page;
 		bool		found;
 
-		if (!BufferIsValid(cur->pinbuf))
+		if (!cur->haspage)
 		{
 			/* nothing in hand: let the next page come from a descent */
 			cur->descend = true;
@@ -4756,6 +4783,85 @@ lion_sets_satisfiable(int nsets, LionPostingSet *sets, LionKeyNode *tree)
 }
 
 /*
+ * A pull interface over the evaluator: the containers of one expression over
+ * located posting sets, in ascending container key, one per call (DESIGN.md
+ * §29.3).  This is what a plain index scan streams its TIDs from, and what
+ * lion_sets_iterate() below - the bitmap scan's push form - loops over.
+ *
+ * keeppins says whether the cursors keep the §9 pin on the page each current
+ * container came from until the stream moves past it (the count's rule, and
+ * what a scan under a non-MVCC snapshot needs, §29.5), or let go of every
+ * posting leaf as soon as they have copied it (a plain scan under an MVCC
+ * snapshot).  An INLINE set's own pin is the caller's business either way:
+ * lion_posting_set_unpin() it first when no pin is wanted.
+ */
+struct LionSetStream
+{
+	LionCountCtx cx;			/* the cursors' statistics and pin mode */
+	LionExprCursor cursor;
+	bool		empty;			/* no sets at all: nothing to stream */
+	bool		first;			/* the cursor stands on the first container,
+								 * which has not been handed out yet */
+};
+
+LionSetStream *
+lion_stream_begin(int nsets, LionPostingSet *sets, LionKeyNode *tree,
+				  bool keeppins)
+{
+	LionSetStream *st = (LionSetStream *) palloc0(sizeof(LionSetStream));
+	LionCountSource src;
+	LionKeyNode *node;
+
+	memset(&src, 0, sizeof(src));
+	src.nsets = nsets;
+	src.sets = sets;
+	src.tree = tree;
+
+	st->cx.vmbuf = InvalidBuffer;
+	st->cx.droppins = !keeppins;
+
+	node = lion_source_tree(&src);
+	if (node == NULL)
+	{
+		st->empty = true;
+		return st;
+	}
+
+	lion_ecursor_init(&st->cursor, node, sets, nsets, &st->cx);
+	st->first = true;
+	return st;
+}
+
+/*
+ * The next container, or NULL at the end.  It is valid until the next call:
+ * moving past it is what lets go of the pins it was read under.
+ */
+const LionContainer *
+lion_stream_next(LionSetStream *st)
+{
+	if (st->empty)
+		return NULL;
+
+	if (st->first)
+		st->first = false;
+	else
+	{
+		lion_ecursor_next(&st->cursor);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	return st->cursor.valid ? st->cursor.cur : NULL;
+}
+
+void
+lion_stream_end(LionSetStream *st)
+{
+	if (!st->empty)
+		lion_ecursor_close(&st->cursor);
+	st->empty = true;
+}
+
+/*
  * Walk the containers of one expression over located posting sets, without
  * any visibility-map interlock: what a bitmap scan of a multi-key opclass
  * needs (DESIGN.md §17).  Every TID goes to the executor, which visits the
@@ -4767,36 +4873,19 @@ int64
 lion_sets_iterate(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 				 lion_container_callback cb, void *arg)
 {
-	LionCountSource src;
-	LionExprCursor cursor;
-	LionCountCtx cx;
-	LionKeyNode *node;
+	LionSetStream *st = lion_stream_begin(nsets, sets, tree, true);
+	const LionContainer *c;
 	int64		total = 0;
 
-	memset(&src, 0, sizeof(src));
-	src.nsets = nsets;
-	src.sets = sets;
-	src.tree = tree;
-
-	node = lion_source_tree(&src);
-	if (node == NULL)
-		return 0;
-
-	memset(&cx, 0, sizeof(cx));
-	cx.vmbuf = InvalidBuffer;
-
-	lion_ecursor_init(&cursor, node, sets, nsets, &cx);
-
-	while (cursor.valid)
+	while ((c = lion_stream_next(st)) != NULL)
 	{
-		total += (int64) lion_container_cardinality(cursor.cur);
-		if (!cb(cursor.cur, arg))
+		total += (int64) lion_container_cardinality(c);
+		if (!cb(c, arg))
 			break;
-		lion_ecursor_next(&cursor);
-		CHECK_FOR_INTERRUPTS();
 	}
 
-	lion_ecursor_close(&cursor);
+	lion_stream_end(st);
+	pfree(st);
 
 	return total;
 }
