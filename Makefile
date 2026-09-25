@@ -51,6 +51,22 @@ endif
 # libdir only.
 UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libdir) -lpgcommon -lpgport -lm
 
+# `make unit SANITIZE=1` builds the unit tests with AddressSanitizer and
+# UndefinedBehaviorSanitizer and makes every report fatal, which CI does on
+# every major.  The unit tests are frontend programs that link nothing but
+# libpgcommon and libpgport, so the sanitizers need no help from the server,
+# and they are what feeds the container and sparse code malformed input.  The
+# binaries are always rebuilt under SANITIZE=1: a plain `make unit` leaves
+# binaries that are up to date by their sources, and running those would
+# silently test nothing extra.  (The reverse is harmless: a plain `make unit`
+# after a sanitized one runs the sanitized binaries until a source changes.)
+ifeq ($(SANITIZE),1)
+UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+UNIT_LDFLAGS += -fsanitize=address,undefined
+test/unit/container_test test/unit/sparse_test: .lion-force-unit
+.PHONY: .lion-force-unit
+endif
+
 test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
 
