@@ -4443,41 +4443,74 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)
 		{
 			/*
-			 * At most one positive clause per column: the same clause twice
-			 * is just a duplicate, two different ones mean the query selects
-			 * little or nothing and we would rather leave that to the normal
-			 * plan.  `IS NOT NULL` is not subject to this - it constrains
+			 * A second positive clause on a column is a source of its own,
+			 * ANDed with the first exactly as a clause on another column is:
+			 * it is matched to an index that answers ITS operator under ITS
+			 * collation (lion_match_index(), per relation), and the AND of
+			 * two exact sources is exact.  Only the very same clause again -
+			 * the same kind, the same operator, the same input collation and
+			 * an equal() value - is dropped, because the lookup the first one
+			 * makes is then its answer too.
+			 *
+			 * Anything less than all four is not "the same clause", and a
+			 * clause dropped here is one no index is ever asked about (the
+			 * 2026-09-25 review).  Comparing the kind and the value alone
+			 * called `v === 'A' AND v = 'A'` a duplicate over an index whose
+			 * case-insensitive opclass answers `===` - and nothing at all
+			 * answered `=` - so both spellings were counted, 10000 rows
+			 * where the query selects 5000.  A nondeterministic collation
+			 * does it with one operator: `s COLLATE ci = 'a' AND s = 'a'`
+			 * differ in nothing but their input collation.  Now the second
+			 * clause needs an index of its own and the query is declined
+			 * when there is none.
+			 *
+			 * Two clauses that differ only in value used to be declined too,
+			 * on the grounds that they select little or nothing.  They are
+			 * answered now, because nothing in the AND is specific to one
+			 * clause per column: the entry a GROUP BY or an IN list drives
+			 * is the FIRST suitable clause on its index (lion_inlist_shape()
+			 * and lion_locate_where() agree on that), the key a target list
+			 * prints is the first pinning clause's, and every clause on the
+			 * column must then be one whose index may print it.  Under a
+			 * coarse equality they need not even disagree: `v === 'a' AND
+			 * v === 'A'` is one entry, looked up twice.
+			 *
+			 * `IS NOT NULL` is not subject to any of this - it constrains
 			 * nothing by itself and is simply subtracted - and neither is a
 			 * multi-key clause, whose sources intersect exactly as two
 			 * clauses on different columns do (`tags @> '{a}' AND
 			 * tags && '{b,c}'` is one AND of three key sets).  Nor is a leaf
 			 * of an OR, which says nothing about the rows the OTHER arms
-			 * select and so cannot be compared with a clause that does.
+			 * select and so cannot stand in for a clause that does.
 			 */
 			if (list_member_int(posattnos, (int) leaf.var->varattno))
 			{
 				ListCell   *l1;
 				ListCell   *l2;
 				ListCell   *l3;
-				ListCell   *l4;
 				bool		same = false;
 
-				forfour(l1, whereattnos, l2, whereconsts, l3, wherekinds,
-						l4, whereinor)
+				forthree(l1, clauseinfos, l2, whereconsts, l3, whereinor)
 				{
-					if (lfirst_int(l4) != 0 ||
-						lfirst_int(l1) != (int) leaf.var->varattno ||
-						lfirst_int(l3) == LION_CLAUSE_NOTNULL)
+					LionClauseInfo *prev = (LionClauseInfo *) lfirst(l1);
+
+					if (lfirst_int(l3) != 0 ||
+						prev->attno != leaf.var->varattno)
 						continue;
-					same = (lfirst_int(l3) == leaf.kind &&
-							equal(lfirst(l2), leaf.val));
-					break;
+					if (prev->kind == leaf.kind &&
+						prev->opno == leaf.opno &&
+						prev->collation == leaf.collation &&
+						equal(lfirst(l2), leaf.val))
+					{
+						same = true;
+						break;
+					}
 				}
-				if (!same)
-					return;
-				continue;
+				if (same)
+					continue;
 			}
-			posattnos = lappend_int(posattnos, (int) leaf.var->varattno);
+			else
+				posattnos = lappend_int(posattnos, (int) leaf.var->varattno);
 		}
 
 		switch (leaf.kind)

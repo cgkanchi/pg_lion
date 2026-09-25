@@ -895,13 +895,37 @@ Planner integration
   - Every baserestrictinfo clause is `Var opeq Const` or `Const opeq Var` where Var is a plain column
     of the rel with a *valid* lion index whose opfamily contains that operator as strategy 1 (use
     the index's opfamily and the operator OID; cross-type integer equality is fine because the
-    integer opfamily contains it), the compared value is not a literal NULL, and there is at most
-    one clause per column (two different values on one column ⇒ bail; the same value twice ⇒
-    dedupe, by `equal()`, so two different Params on one column bail). §15 adds
-    `Var = ANY (array)` and §14 the two null tests to the shapes accepted here; an `IS NOT NULL`
-    clause is exempt from the one-clause-per-column rule, because it constrains no value. §19 adds a
-    top-level `OR` of such clauses, whose leaves are exempt from the rule as well and enter none of
-    the per-column bookkeeping, because they constrain no column of the result.
+    integer opfamily contains it), and the compared value is not a literal NULL. §15 adds
+    `Var = ANY (array)` and §14 the two null tests to the shapes accepted here. §19 adds a
+    top-level `OR` of such clauses, whose leaves enter none of the per-column bookkeeping below,
+    because they constrain no column of the result.
+  - **Several clauses may constrain one column, and each is a source of its own** (2026-09-25
+    review). A second positive clause on a column is ANDed with the first exactly as a clause on
+    another column is: it is matched to an index for ITS operator under ITS input collation, and the
+    query is declined when there is none - the AND of exact sources is exact. Only the very same
+    clause again is dropped as a duplicate: the same kind, the same operator, the same input
+    collation and an `equal()` value (so `v === 'A' AND 'A' === v` is one clause, and `v === $1 AND
+    v === $2` is two), because the first one's lookup is then its answer. The rule used to be "at
+    most one clause per column", with a duplicate recognised by its kind and value alone, and that
+    dropped clauses no index had answered: over an index whose case-insensitive opclass has `===` as
+    strategy 1, `v === 'A' AND v = 'A'` counted the entry of `===` - both spellings, 10000 rows
+    where the query selects 5000 - and never asked anything about `=`. A nondeterministic collation
+    does the same with one operator, `s COLLATE ci = 'a' AND s = 'a'`. The generic plan (`v === $1
+    AND v = $1`), the IN-list forms, a GROUP BY and the FK-side join's fact filters (§27) all went
+    through that one test. Nothing downstream needs one clause per column: the key a target list
+    prints for a pinned column is its FIRST pinning clause's, and every equality on that column must
+    then pass the value-representation rule below; an IN list that drives the groups (§15) is the
+    FIRST list on the driving index's key column, by one rule in the planner and the executor (see
+    the executor's GROUP BY paragraph). Two clauses that differ only in value used to be declined as
+    well - they select little or nothing - and are answered now: under a coarse equality they need
+    not even disagree (`v === 'a' AND v === 'A'` is one entry, looked up twice).
+    `test/sql/samecolumn.sql` covers every form against a sequential scan, with the other plans
+    disabled so that a node that is built at all is the plan. `IS NOT NULL`, a multi-key clause
+    (§17) and an OR leaf never took part in the old rule and are unchanged. Not done: a clause is
+    matched against the FIRST lion index on its column only (`lion_find_roaring_index()`), so two
+    clauses that two different indexes of one column would answer - `===` from a case-insensitive
+    one and `=` from a plain one - are declined, not answered; that is a plan left on the table and
+    not a wrong answer.
   - **An index is an (index, KEY COLUMN) pair since §24.** A multicolumn lion index holds each of
     its columns' keys as an independent set of entries, so `lion_find_roaring_index()` accepts a
     match on ANY key column and returns its number `i` beside the index; every opclass question in

@@ -1,0 +1,417 @@
+-- Two clauses on ONE column in the count pushdown (DESIGN.md section 10).
+--
+-- A second positive clause on a column used to be dropped as a duplicate
+-- when its kind and value matched the first one's, without a look at its
+-- operator or its collation - and a dropped clause is one no index is ever
+-- asked about (the 2026-09-25 review).  Now only the very same clause is
+-- dropped; any other is a source of its own, ANDed with the first, and needs
+-- an index that answers it.  Every query below is answered through the
+-- pushdown - with every other plan disabled, so that the node is the plan
+-- whenever it is built at all - and through a sequential scan, and the two
+-- results must be equal as multisets.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+/* VACUUM can only set all-visible for commits that reached disk (citext.sql). */
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+/*
+ * lion_sc() plans and runs one query with the pushdown on and every other
+ * scan disabled, then runs it again as a sequential scan with the pushdown
+ * off, and reports whether the node was used and how many rows came out -
+ * after proving the two results match as multisets.
+ */
+CREATE FUNCTION lion_sc(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_sc_on AS %s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_sc_off AS %s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_sc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_sc_on EXCEPT ALL SELECT * FROM lion_sc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_sc_off EXCEPT ALL SELECT * FROM lion_sc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_sc_on, lion_sc_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+/* Whether one statement's plan is the node; the plan itself may differ by release. */
+CREATE FUNCTION lion_sc_pushed(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+/*
+ * A case-insensitive equality and an opclass built on it: two strings are
+ * equal when they differ only in case, and the index keeps one entry for
+ * 'A' and 'a'.  The functions are plpgsql so that the planner cannot inline
+ * them - an inlined `lower(v) = lower('A')` is no longer a clause on v at all,
+ * and the query would never reach the pushdown.  It is the custom-opclass form
+ * of the realistic trigger, a nondeterministic collation (`s COLLATE ci = 'a'
+ * AND s = 'a'`), which needs ICU.
+ */
+CREATE FUNCTION lion_sc_eq(text, text) RETURNS boolean
+	LANGUAGE plpgsql IMMUTABLE STRICT
+	AS $$ BEGIN RETURN lower($1) = lower($2); END $$;
+CREATE FUNCTION lion_sc_hash(text) RETURNS integer
+	LANGUAGE plpgsql IMMUTABLE STRICT
+	AS $$ BEGIN RETURN hashtext(lower($1)); END $$;
+CREATE OPERATOR === (LEFTARG = text, RIGHTARG = text, FUNCTION = lion_sc_eq,
+					 COMMUTATOR = ===);
+CREATE OPERATOR CLASS lion_sc_ops FOR TYPE text USING lion AS
+	OPERATOR	1	=== (text, text),
+	FUNCTION	1	lion_sc_hash(text);
+/*
+ * v is indexed case-insensitively only; w holds the same values under the
+ * default text opclass; g is a grouping column and the fk of the join below.
+ */
+CREATE TABLE lion_sc_t (v text NOT NULL, w text NOT NULL, g int NOT NULL);
+INSERT INTO lion_sc_t SELECT 'A', 'A', i % 4 FROM generate_series(1, 5000) i;
+INSERT INTO lion_sc_t SELECT 'a', 'a', i % 4 FROM generate_series(1, 5000) i;
+INSERT INTO lion_sc_t SELECT 'b', 'b', i % 4 FROM generate_series(1, 2000) i;
+CREATE INDEX lion_sc_v ON lion_sc_t USING lion (v lion_sc_ops);
+CREATE INDEX lion_sc_w ON lion_sc_t USING lion (w);
+CREATE INDEX lion_sc_g ON lion_sc_t USING lion (g);
+VACUUM ANALYZE lion_sc_t;
+-- one entry for the two spellings, which is what the opclass says
+SELECT entries FROM lion_index_stats('lion_sc_v');
+ entries 
+---------
+       2
+(1 row)
+
+-- ---- a second clause no index answers: declined ------------------------
+/*
+ * `v = 'A'` is the type's equality, which lion_sc_ops does not have, so
+ * nothing can answer it and the query is the ordinary plan's: 5000 rows.  The
+ * pushdown used to count the entry of `===` alone - 10000.
+ */
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A'$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v = 'A' AND v === 'A'$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = ANY ('{A}')$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === ANY ('{A}') AND v = ANY ('{A}')$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT g, count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' GROUP BY g$$);
+         lion_sc         
+-------------------------
+ not pushed down, 4 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' AND g = 1$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- the counts themselves, through the same forced plans
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A';
+ count 
+-------
+  5000
+(1 row)
+
+SELECT g, count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' GROUP BY g ORDER BY g;
+ g | count 
+---+-------
+ 0 |  1250
+ 1 |  1250
+ 2 |  1250
+ 3 |  1250
+(4 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+/*
+ * The same operator and the same value under two collations, which only the
+ * clauses' input collations tell apart - the shape a nondeterministic
+ * collation makes a wrong answer of.  Both collations here are deterministic,
+ * so the answer is the same either way; what is checked is that the clause
+ * under "C" is not taken for the other one's duplicate, since w's index was
+ * built under the column's own collation and cannot answer it.
+ */
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w = 'A' AND w COLLATE "C" = 'A'$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w COLLATE "C" = 'A' AND w = 'A'$$);
+         lion_sc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ---- the FK-side join's fact filters are the same clauses (§27) ----------
+CREATE TABLE lion_sc_d (id int PRIMARY KEY, x text NOT NULL);
+INSERT INTO lion_sc_d SELECT i, 'x' || (i % 2) FROM generate_series(0, 3) i;
+ANALYZE lion_sc_d;
+SELECT lion_sc($$SELECT d.x, count(*) FROM lion_sc_t f JOIN lion_sc_d d ON f.g = d.id
+				 WHERE f.v === 'A' AND f.v = 'A' GROUP BY d.x$$);
+         lion_sc         
+-------------------------
+ not pushed down, 2 rows
+(1 row)
+
+-- ... while a filter the posting sets do answer still joins
+SELECT lion_sc($$SELECT d.x, count(*) FROM lion_sc_t f JOIN lion_sc_d d ON f.g = d.id
+				 WHERE f.v === 'A' GROUP BY d.x$$);
+       lion_sc       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ---- a generic plan: the clauses are Params, and just as different ------
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+PREPARE lion_sc_p(text) AS SELECT count(*) FROM lion_sc_t WHERE v === $1 AND v = $1;
+SELECT lion_sc_pushed($$EXECUTE lion_sc_p('A')$$);
+ lion_sc_pushed 
+----------------
+ f
+(1 row)
+
+EXECUTE lion_sc_p('A');
+ count 
+-------
+  5000
+(1 row)
+
+DEALLOCATE lion_sc_p;
+-- two parameters under the one operator are two sources, and both are answered
+PREPARE lion_sc_p(text, text) AS SELECT count(*) FROM lion_sc_t WHERE v === $1 AND v === $2;
+EXPLAIN (COSTS OFF) EXECUTE lion_sc_p('A', 'a');
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_sc_v (v = $1), lion_sc_v (v = $2)
+(2 rows)
+
+EXECUTE lion_sc_p('A', 'a');
+ count 
+-------
+ 10000
+(1 row)
+
+EXECUTE lion_sc_p('A', 'b');
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE lion_sc_p('A', NULL);
+ count 
+-------
+     0
+(1 row)
+
+DEALLOCATE lion_sc_p;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET plan_cache_mode;
+-- ---- two clauses the index does answer: both are sources ----------------
+/*
+ * Two clauses that differ only in value used to be declined as well, on the
+ * grounds that they select little or nothing.  Each is exact, and so is their
+ * AND: under the case-insensitive equality `v === 'A' AND v === 'a'` is one
+ * entry looked up twice, and under any equality two lists are the entries
+ * they share.
+ */
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a'$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'b'$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === ANY ('{A,b}') AND v === 'a'$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w IN ('A', 'a') AND w IN ('a', 'b')$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w = 'a' AND w IN ('a', 'b')$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT g, count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a' GROUP BY g$$);
+       lion_sc       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+/*
+ * Two lists on the GROUP BY column: the first drives the groups (§15) and the
+ * second is intersected with each of them, so 'A' - which the second list
+ * does not name - is no group.
+ */
+SELECT lion_sc($$SELECT w, count(*) FROM lion_sc_t WHERE w IN ('A', 'a', 'b') AND w IN ('a', 'b') GROUP BY w$$);
+       lion_sc       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_sc($$SELECT w, count(*) FROM lion_sc_t WHERE w IN ('a', 'b') AND w IN ('A', 'a', 'b') GROUP BY w$$);
+       lion_sc       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ... and the printed key of a pinned column is its first equality's entry
+SELECT lion_sc($$SELECT w, count(*) FROM lion_sc_t WHERE w = 'a' AND w IN ('a', 'b') GROUP BY w$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_sc_v (v = A), lion_sc_v (v = a)
+(2 rows)
+
+SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
+ count 
+-------
+ 10000
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT w, count(*) FROM lion_sc_t WHERE w IN ('A', 'a', 'b') AND w IN ('a', 'b') GROUP BY w;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_sc_w (w), lion_sc_w (w = ANY ({A,a,b})), lion_sc_w (w = ANY ({a,b}))
+   Group Key: w
+(3 rows)
+
+SELECT w, count(*) FROM lion_sc_t WHERE w IN ('A', 'a', 'b') AND w IN ('a', 'b') GROUP BY w ORDER BY w;
+ w | count 
+---+-------
+ a |  5000
+ b |  2000
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+-- ---- the very same clause twice is still one source ----------------------
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'A'$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND 'A' === v$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w IN ('A', 'a') AND w IN ('A', 'a')$$);
+       lion_sc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND 'A' === v;
+            QUERY PLAN             
+-----------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_sc_v (v = A)
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+DROP TABLE lion_sc_d;
+DROP TABLE lion_sc_t;
+DROP OPERATOR FAMILY lion_sc_ops USING lion;
+DROP OPERATOR === (text, text);
+DROP FUNCTION lion_sc_eq(text, text);
+DROP FUNCTION lion_sc_hash(text);
+DROP FUNCTION lion_sc(text);
+DROP FUNCTION lion_sc_pushed(text);
