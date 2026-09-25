@@ -605,6 +605,17 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- fresh snapshot and checks that every visible tuple's TID is present under its key in
         -- EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
         -- snapshot may not use the index.
+        -- The heap scan evaluates the index's expressions and predicate, which are the table
+        -- owner's functions and can be replaced after CREATE INDEX with anything at all. They run
+        -- AS THE TABLE OWNER, inside a SECURITY_RESTRICTED_OPERATION, under a GUC nest level that
+        -- is rolled back when the check ends, and on 17+ with search_path restricted to
+        -- pg_catalog, pg_temp - amcheck's rule since CVE-2022-1552, and what the server's own
+        -- REINDEX does. Run as the caller, a superuser verifying somebody else's table ran the
+        -- owner's code with superuser rights. The table is locked BEFORE the index (and the
+        -- index's table looked up again once both are held), the order DROP INDEX takes them in;
+        -- the other order deadlocked with `LOCK TABLE t; DROP INDEX t_k` in another session. Key
+        -- values appear in a "not indexed" report only when the CALLER is a superuser, which is
+        -- decided before the switch: asked afterwards, superuser() answers for the owner.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
