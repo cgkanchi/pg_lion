@@ -6489,7 +6489,8 @@ and with ANALYZE `Index Entries Walked`, `Lion Set Hits` (walked entries that we
 `Heap Fetches` (members with a visible version), `Rows Removed by Lion Recheck` (printed when
 the set is not exact or something was removed), and `Lion Set: N containers, exact | rechecked |
 degraded[, B builds]`, the builds counted when rescans rebuilt it (a LATERAL subquery whose lion
-filter takes the outer row's value: one per outer row).
+filter takes the outer row's value: one per outer row). A node that never ran (`LIMIT 0`, an
+untaken branch) built no set and prints neither of the last two.
 
 ### 30.8 Declined in v1, and why
 
