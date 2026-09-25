@@ -117,10 +117,11 @@ SELECT lion_ccmp('lion_cnt_c10', 'lion_cnt', 'c10', '7::int8');
 SELECT lion_ccmp('lion_cnt_c10', 'lion_cnt', 'c10', '7::int2');
 
 /*
- * Two keys at once: the merge of two posting sets.  Both keys share a single
- * anyelement in the function's signature, so they have to resolve to the same
- * SQL type; the index each one is looked up in may of course be on a
- * different (cross-type compatible) type, as the c100k case below shows.
+ * Two keys at once: the merge of two posting sets.  Each key is resolved
+ * against its own index (key2 is anycompatible, not key1's anyelement, so the
+ * two need not share a type - test/sql/keytypes.sql counts an enum with a
+ * bool); the index each one is looked up in may of course be on a different
+ * (cross-type compatible) type, as the c100k case below shows.
  */
 SELECT lion_ccmp2('lion_cnt_c10', '3', 'lion_cnt_m7', '2',
 				 'lion_cnt', 'c10', 'm7');

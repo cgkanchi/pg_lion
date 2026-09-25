@@ -697,7 +697,8 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   The SQL functions stand for `SELECT count(*) FROM t WHERE col = key` (or `= ANY (keys)`, or
   `GROUP BY col`), so they require EXECUTE on count() - checked as an aggregate, as above - and on
   the equality function they look up with: strategy 1 of the key column's opfamily for (opcintype,
-  the key's type), which is `int48eq` for an int8 key on an int4 column exactly as in the query,
+  the key's type as "SQL surface" below resolves it), which is `int48eq` for an int8 key on an int4
+  column exactly as in the query,
   and (opcintype, opcintype) for the grouped form. These checks follow the exact SELECT check,
   under the lock (test/sql/security_exec.sql). One case follows core rather than the rule:
   a clause implied by a PARTIAL index's predicate is dropped by the planner, so a keyless plain
@@ -832,9 +833,21 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
      for tests: same entry scan, one count per group, one cache.
 
 SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
-`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
-Both verify the key type matches the index's opcintype, open the heap via IndexGetRelation with
-AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
+`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anycompatible) RETURNS bigint`,
+whose keys are of two unrelated polymorphic types because each is compared with its own index's
+column and the two columns need not share a type. Both open the heap via IndexGetRelation with AccessShareLock, use
+GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
+**The key's type is resolved as `col = key` would resolve it** (`lion_count_key_type()`, 2026-09-25
+review; before it the key had to BE the index's opcintype or have a cross-type member, so enum_ops, a
+DEFAULT class, could not be counted at all and neither could a varchar key on the varchar column it
+indexes): a domain is its base type; then the class's own type, or a type the family has a
+strategy-1 member for with it (int8 on int4: `int48eq`, which §21's probe resolves further); lacking
+one, a BINARY coercion to the class's type (varchar on text_ops - the parser relabels it and calls
+`texteq`), never a cast function (§21); and for a class on a POLYMORPHIC type (enum_ops) the
+column's actual type and nothing else, since a different enum would pass for "an enum" and its OIDs
+mean nothing to this column (DETAIL names the column's type, not anyenum). The resolved type is what
+the lookup is made as and what the EXECUTE check names the equality by (enum_eq, texteq;
+test/sql/security_exec.sql). `lion_index_count_any()` resolves its array's element type the same way.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
 entry's meaning and used to be hashed and compared as if it did.
