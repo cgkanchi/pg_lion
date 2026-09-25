@@ -35,7 +35,12 @@
       },
       "test": {
          "requires": {
-            "citext": "0"
+            "citext": "0",
+            "pg_buffercache": "0",
+            "pg_walinspect": "0"
+         },
+         "recommends": {
+            "injection_points": "0"
          }
       }
    },

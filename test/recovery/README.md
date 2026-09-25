@@ -16,26 +16,42 @@ existed. This directory is that test.
 make recovery-check PG_CONFIG=<prefix>/bin/pg_config RECOVERY_PREFIX=<prefix>
 
 # or directly:
-test/recovery/run.sh [--prefix <prefix>] [--iters N] [--keep]
+test/recovery/run.sh --prefix <prefix> [--iters N] [--keep]
+
+# as root (a container, a CI image): initdb and postgres refuse to run as
+# root, so name an unprivileged user to run the clusters as
+RECOVERY_RUN_AS=postgres make recovery-check RECOVERY_PREFIX=<prefix>
 ```
 
 `<prefix>` is a PostgreSQL *installation* (it needs `bin/initdb`,
 `bin/pg_basebackup`, `bin/pgbench`, `bin/pg_waldump`, and `citext` in
-`share/postgresql/extension`). It defaults to the worktree install,
-`../pg_roaring_index-partial/.local/pg`. The extension is rebuilt from a
-clean copy of this tree — `src/`, the Makefile, the control and SQL files,
-with `src/*.o` removed — and installed into that prefix, exactly as
-`bench/lib.sh`'s `bench_build_extension` does; `make install` is never run in
-the source tree.
+`share/postgresql/extension`), and it is REQUIRED - `--prefix` or
+`RECOVERY_PREFIX`; the run refuses to start without one. There is no default
+on purpose: the extension is rebuilt from a clean copy of this tree — `src/`,
+the Makefile, the control and SQL files, with `src/*.o` removed — and
+*installed* into that prefix, exactly as `bench/lib.sh`'s
+`bench_build_extension` does, so a guessed prefix would be somebody else's
+server. `make install` is never run in the source tree, and the prefix is
+deliberately not derived from `PG_CONFIG`.
 
-The run creates two clusters of its own under
-`/tmp/claude-1000/lion_recovery`, on the private socket directory
-`/tmp/claude-1000/pgsk_rec` and ports 54340 (primary) and 54341 (standby),
-with `listen_addresses = ''`. It refuses to start if anything already listens
-there, checks `SHOW data_directory` against the directory it asked for before
-trusting a connection, and removes both clusters through an exit trap
-(`--keep` suppresses only the removal). It never touches the dev cluster or
-the benchmark clusters.
+`RECOVERY_RUN_AS=<user>` runs `initdb`, `pg_ctl` and `pg_basebackup` through
+`runuser -u <user>`; everything else (psql, pgbench, pg_waldump, the build)
+runs as the caller. Run as root without it, the script stops before doing
+anything and says so. That user must be able to read the prefix; it is given
+ownership of the run's private directory.
+
+The run creates everything it needs in ONE private directory that
+`mktemp -d` makes for it under `$RECOVERY_TMPDIR` (default `$TMPDIR`, else
+`/tmp`): the two clusters, their server logs, the socket directory and the
+build copy. The clusters listen on ports 54340 (primary) and 54341 (standby)
+of that private socket directory only, with `listen_addresses = ''`, so two
+runs - two users, two worktrees - cannot meet at an endpoint. (A Unix socket
+path has a length limit, so when the private directory is too deep for one
+the socket directory is a second `mktemp -d` under `/tmp`.) The run checks
+`SHOW data_directory` against the directory it asked for before trusting a
+connection, and removes the directory it created, and nothing else, through
+an exit trap (`--keep` suppresses only the removal and prints the path). It
+never touches the dev cluster or the benchmark clusters.
 
 One caveat about that prefix: it is shared. The run installs
 `pg_lion.so` into it and then starts a cluster that loads it, so another
