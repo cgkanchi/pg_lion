@@ -325,6 +325,36 @@ lion_get_am_oid(void)
 }
 
 /*
+ * Is a value of type `typid` one of this key column's own values?  Asked of a
+ * class declared on a POLYMORPHIC type (enum_ops is FOR TYPE anyenum), whose
+ * input type says nothing about which enum the column holds: the key type,
+ * state->typid, does - the column's type as the index's tuple descriptor has
+ * it (DESIGN.md §17's key type resolution).  Domains are looked through on
+ * both sides, as the parser does: a domain over the enum has the enum's
+ * representation, and the index's column may itself be of the domain.
+ */
+static bool
+lion_type_is_column(LionState *state, Oid typid)
+{
+	return OidIsValid(typid) &&
+		getBaseType(typid) == getBaseType(state->typid);
+}
+
+/*
+ * The type to name when a value cannot be compared with a key column: the
+ * class's input type, or the column's actual type where that is polymorphic
+ * ("the index is on type anyenum" says nothing about which one).  A multi-key
+ * column's key type is the ELEMENT type (array_ops on text[] stores text), not
+ * what the column holds, so there the class's type is named as before.
+ */
+static Oid
+lion_column_type(LionState *state, Oid opcintype)
+{
+	return (IsPolymorphicType(opcintype) && !state->multikey) ?
+		state->typid : opcintype;
+}
+
+/*
  * LionProbe, the one cross-type resolution of DESIGN.md §21, is declared in
  * lion_count.h: the bitmap scan (lion_scan.c) resolves its scan keys through
  * lion_probe_init() and lion_probe_find() as well, so the two paths cannot
@@ -344,7 +374,23 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 
 	memset(probe, 0, sizeof(LionProbe));
 
-	if (!OidIsValid(keytype) || keytype == opcintype)
+	/*
+	 * The column's OWN type: nothing to resolve.  That is the opclass's input
+	 * type, or - for a class declared on a polymorphic type, enum_ops being
+	 * FOR TYPE anyenum - the type the column actually has, whatever it is
+	 * called.  A scan key names the class's member by its declared type
+	 * (sk_subtype is anyenum), but the elements of `col = ANY (array)` are
+	 * of the array's element type, which is the column's own enum: the
+	 * operator is polymorphic, so the parser left the array as it was
+	 * (make_scalar_array_op()).  Both are the class's own values, and looking
+	 * up a cross-type (anyenum, mood) member for the second answered a plain
+	 * index scan of `mood IN (...)` with "type mood cannot be compared with
+	 * index" (2026-09-25 review).  lion_type_is_column() compares BASE types,
+	 * because a domain over the enum is the enum's representation, and never
+	 * accepts a different enum: its OIDs mean nothing to this column.
+	 */
+	if (!OidIsValid(keytype) || keytype == opcintype ||
+		(IsPolymorphicType(opcintype) && lion_type_is_column(state, keytype)))
 	{
 		probe->typlen = state->typlen;
 		probe->typbyval = state->typbyval;
@@ -368,7 +414,7 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 						format_type_be(keytype),
 						RelationGetRelationName(index)),
 				 errdetail("The index is on type %s.",
-						   format_type_be(opcintype))));
+						   format_type_be(lion_column_type(state, opcintype)))));
 
 	hashproc = get_opfamily_proc(opfamily, keytype, keytype, 1);
 	if (!OidIsValid(hashproc))
