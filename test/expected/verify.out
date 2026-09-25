@@ -311,7 +311,8 @@ SELECT sparse_members = ntids AS still_all_segments,
  t                  | t
 (1 row)
 
--- a partial index only has to contain the rows its predicate selects
+-- a partial index only has to contain the rows its predicate selects: the
+-- first row below is one it selects (a new key, 'vpart'), the second is not
 CREATE INDEX lion_vfy_part ON lion_vfy USING lion (t) WHERE k < 100;
 SELECT lion_index_verify('lion_vfy_part', true);
  lion_index_verify 
@@ -325,20 +326,18 @@ SELECT entries, ntids FROM lion_index_stats('lion_vfy_part');
       13 | 10355
 (1 row)
 
-INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL, NULL);
-ERROR:  INSERT has more expressions than target columns at character 61
-INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL, NULL);
-ERROR:  INSERT has more expressions than target columns at character 63
+INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL);
+INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL);
 SELECT lion_index_verify('lion_vfy_part', true);
  lion_index_verify 
 -------------------
  
 (1 row)
 
-SELECT ntids FROM lion_index_stats('lion_vfy_part');
- ntids 
--------
- 10355
+SELECT entries, ntids FROM lion_index_stats('lion_vfy_part');
+ entries | ntids 
+---------+-------
+      14 | 10356
 (1 row)
 
 -- an expression index is verified through the same path
@@ -355,9 +354,15 @@ SELECT entries FROM lion_index_stats('lion_vfy_expr');
       10
 (1 row)
 
--- NULL keys are not indexed and must not be reported as missing
-INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL, NULL);
-ERROR:  INSERT has more expressions than target columns at character 62
+/*
+ * NULL keys ARE indexed, in the column's reserved NULL entry (DESIGN.md §14),
+ * and heapallindexed looks for such a row there.  The first row is NULL in
+ * every column; the second is NULL only in t and satisfies the partial
+ * index's predicate, so the partial index gets a NULL entry too, and the
+ * expression index gets one for the NULL k of the first.
+ */
+INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL);
+INSERT INTO lion_vfy VALUES (200004, 7, NULL, 2.0, NULL);
 SELECT lion_index_verify('lion_vfy_k', true);
  lion_index_verify 
 -------------------
@@ -368,6 +373,48 @@ SELECT lion_index_verify('lion_vfy_t', true);
  lion_index_verify 
 -------------------
  
+(1 row)
+
+SELECT lion_index_verify('lion_vfy_n', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_vfy_part', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_vfy_expr', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_k');
+ null_tids 
+-----------
+         1
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_t');
+ null_tids 
+-----------
+         2
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_part');
+ null_tids 
+-----------
+         1
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_expr');
+ null_tids 
+-----------
+         1
 (1 row)
 
 -- unlogged relations work the same way
