@@ -2197,7 +2197,7 @@ rebuild of it measures 3.8-4.0. Every comparison above is between two runs of th
 
 A GROUP BY over the same column restricts the groups to the listed values (a group outside the list
 counts 0 and is not emitted). `col = ANY (...)` with useOr = false (`= ALL`) is not pushed down.
-EXPLAIN prints the list as `idx (col = ANY ({1,2,3}))`.
+EXPLAIN prints the list as `idx (col = ANY ('{1,2,3}'::integer[]))` (the clause's own operator and a deparsed value, §10).
 
 ### Bounded cursors (2026-09-25 review)
 
