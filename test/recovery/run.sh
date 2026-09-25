@@ -465,7 +465,7 @@ crash_kill9() {
 # iteration that replayed nothing cannot pass silently.  Prints
 # "<redo start LSN> <generic WAL records replayed>".
 recovery_evidence() {
-	local off=$1 txt redo_start redo_end generic
+	local off=$1 txt redo_start redo_end generic segs startseg endseg
 	txt=$(tail -c "+$((off + 1))" "$PRIMARY_LOG")
 	printf '%s\n' "$txt" >>"$RUNLOG"
 	printf '%s' "$txt" | grep -q "database system was not properly shut down" ||
@@ -491,12 +491,26 @@ recovery_evidence() {
 	# treated as a failure.  wal_consistency_checking makes every record carry
 	# a full-page image and is what makes a range that long, so
 	# recovery-check-rmgr raises wal_keep_size to match.
+	#
+	# The segments the range starts and ends in are named explicitly.  Given
+	# only a directory, pg_waldump learns the segment size from the header of
+	# the first WAL file readdir() happens to return, and a segment the
+	# server has preallocated but not yet written has an all-zero header:
+	# "invalid WAL segment size ... (0 bytes)", intermittently, and the
+	# round's evidence was lost.  (Naming the start alone is not enough:
+	# pg_waldump then requires the end to lie in that same segment.)  The
+	# primary is up and not in recovery here, so pg_walfile_name() can name
+	# both, on the timeline crash recovery kept.
+	segs=$(psql_p -tAc "select pg_walfile_name('$redo_start') || ' ' || pg_walfile_name('$redo_end')") ||
+		die "could not name the WAL segments of $redo_start..$redo_end"
+	startseg=${segs% *}
+	endseg=${segs#* }
 	generic=$("$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" \
-		-s "$redo_start" -e "$redo_end" 2>/dev/null |
+		-s "$redo_start" -e "$redo_end" "$startseg" "$endseg" 2>/dev/null |
 		grep -cE 'rmgr: (Generic|custom[0-9]+)' || true)
 	if [ "$generic" -eq 0 ]; then
 		if "$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" -s "$redo_start" \
-			-e "$redo_end" >/dev/null 2>>"$RUNLOG"; then
+			-e "$redo_end" "$startseg" "$endseg" >/dev/null 2>>"$RUNLOG"; then
 			die "the range $redo_start..$redo_end was replayed but holds no index WAL record: this round tested no index change"
 		fi
 		# To stderr: stdout is the one line the caller parses.
