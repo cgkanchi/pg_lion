@@ -20,7 +20,7 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 2 3").  For development; `make recovery-check`
+#              "1 1b 1c 1d 1e 1f 2 3").  For development; `make recovery-check`
 #              always runs everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
@@ -76,7 +76,7 @@ fi
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 1e 2 3"
+PHASES="1 1b 1c 1d 1e 1f 2 3"
 EXTRA_CONF=()
 
 BASE=/tmp/claude-1000/lion_recovery
@@ -1005,6 +1005,100 @@ phase1e() {
 	SUMMARY+=("phase1e            crash inside a 10-leaf spill; nothing lost, orphans swept")
 }
 
+# ------------------------------------------------------------- phase 1f
+
+# VACUUM of an rmgr-mode index on a server WITHOUT the resource manager
+# (DESIGN.md §25, "VACUUM is the one path that could write without
+# lion_wal_begin()").  The index is built while the library is preloaded,
+# and the server is then restarted without it.  A VACUUM that removes nothing
+# from the index - a partial index none of whose rows died - walks it all the
+# same, and used to hand every page it visited to the standby barrier, which
+# past pg_lion.vacuum_barrier_ranges it wrote out on its own under rmid 128: a
+# manager this server does not have, so crash recovery stopped with a FATAL
+# at the first of those records.  Now nothing of the kind may be in the WAL,
+# and the crash after it must recover.
+#
+# Both modes run it: generic mode preloads the library for the build, rmgr
+# mode drops the preload (and wal_consistency_checking, which names the
+# manager) for the VACUUM.
+phase1f() {
+	local before after custom off
+	log ""
+	log "=== phase 1f: VACUUM of an rmgr-mode index on a server without the manager ==="
+
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: could not stop the primary"
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries=pg_lion" \
+		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary with the preload"
+	verify_node psql_p "$PRIMARY_DATA"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_norm;
+		CREATE TABLE lion_norm (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_norm SELECT i, i % 500 FROM generate_series(1, 100000) i;
+		CREATE INDEX lion_norm_k ON lion_norm USING lion (k)
+			WITH (wal_mode = rmgr, inline_limit = 64) WHERE id % 2 = 0;
+	SQL
+	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_k'::regclass)")" = rmgr ] ||
+		die "phase 1f: the partial index was not built in rmgr mode"
+
+	# A fast stop checkpoints, so nothing of the build is left to replay.
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: could not stop the primary"
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries='' -c wal_consistency_checking=''" \
+		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary without the preload"
+	verify_node psql_p "$PRIMARY_DATA"
+	[ "$(psql_p -tAc "select count(*) from pg_get_wal_resource_managers() where rm_name = 'pg_lion'")" = 0 ] ||
+		die "phase 1f: the resource manager is still registered"
+
+	# The deleted rows are not in the partial index, so the VACUUM removes
+	# nothing from it and only visits its pages; one visited range per
+	# stand-alone record is the most records it could write.
+	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_norm WHERE id % 2 = 1" \
+		>>"$RUNLOG" 2>&1 || die "phase 1f: delete failed"
+	before=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: the VACUUM failed"
+		SET pg_lion.vacuum_barrier_ranges = 1;
+		VACUUM (INDEX_CLEANUP ON) lion_norm;
+	SQL
+	off=$(stat -c %s "$PRIMARY_LOG")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE lion_norm_flush (i int);
+	SQL
+	after=$(psql_p -tAc "select pg_current_wal_flush_lsn()")
+	custom=$("$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" -s "$before" -e "$after" 2>>"$RUNLOG" |
+		grep -c 'rmgr: custom' || true)
+	[ "$custom" = 0 ] ||
+		die "phase 1f: the VACUUM wrote $custom record(s) of a resource manager this server does not have"
+
+	# And recovery goes through that range.
+	crash_immediate
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
+		grep -q "database system was not properly shut down" ||
+		die "phase 1f: the restart did not report an unclean shutdown"
+	run_check "phase 1f recovered" psql_p \
+		"select lion_index_verify('lion_norm_k', true) is not null, 'verify'
+		 union all
+		 select lion_index_count('lion_norm_k', 4) = 200, 'the index counts the 200 rows of k = 4'"
+
+	# The primary goes back to what --mode says for the phases after this one.
+	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: could not stop the primary"
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	psql_p -c "DROP TABLE lion_norm, lion_norm_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
+	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -1587,6 +1681,7 @@ want_phase 1b && phase1b
 want_phase 1c && phase1c
 want_phase 1d && phase1d
 want_phase 1e && phase1e
+want_phase 1f && phase1f
 want_phase 2 && phase2
 want_phase 3 && phase3
 

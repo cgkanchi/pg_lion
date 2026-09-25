@@ -124,11 +124,11 @@ finish a half-applied two-pass bulkdelete. After every restart:
   `null_tids` and `empty_tids` are checked separately, because a reserved
   entry that lost its flag would hide inside the `ntids` total.
 
-**Phases 1b-1e, a crash at a chosen point.** Each builds a
+**Phases 1b-1f, a crash or a restart at a chosen point.** Each builds a
 table of its own. 1b parks a VACUUM between the two steps of a whole-chain
 free (injection point `lion-vacuum-entries-deleted`), 1c and 1d an insert
 between a directory or posting-tree split and its downlink, and each crashes
-the server there and checks what comes back. One more (DESIGN.md §18):
+the server there and checks what comes back. Two more (DESIGN.md §18, §25):
 
 * **1e**, a crash inside a MULTI-LEAF spill. VACUUM's filtering turns one
   key's INLINE payload into ten BITSETs, a leaf each; the spill parks at
@@ -137,6 +137,14 @@ the server there and checks what comes back. One more (DESIGN.md §18):
   every TID, `lion_index_verify()` must call the ten leaves a leak and not
   corruption, and the next VACUUM must spill the set and free the orphans in
   its sweep. A second crash replays that VACUUM.
+* **1f**, VACUUM of an rmgr-mode index on a server WITHOUT the resource
+  manager. The partial index is built with the library preloaded, the server
+  is restarted without it (and without `wal_consistency_checking`, which
+  names the manager), and a VACUUM that removes nothing from the index runs
+  with `pg_lion.vacuum_barrier_ranges = 1`. `pg_waldump` over its range must
+  find no record of a custom manager - it used to find `custom128` ones, which
+  no such server can replay - and a crash right after it must recover. The
+  primary is restarted in its `--mode` afterwards.
 
 **Phase 2, hot standby.** `pg_basebackup -R -X stream` into a standby, then:
 

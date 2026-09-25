@@ -4651,6 +4651,27 @@ the one place every write path passes through, with the preload hint and the
 REINDEX alternative. REINDEX is what changes an index's mode.
 `lion_index_wal_mode(idx)` reports it.
 
+**VACUUM is the one path that could write without `lion_wal_begin()`**
+(2026-09-25 review): the standby barrier's stand-alone VACUUM_VISIT record is
+inserted by `lion_wal_visit_flush()` directly, and `lion_wal_visit()` looked at
+the index's wal_mode and RelationNeedsWAL() and nothing else. So a VACUUM of an
+rmgr-mode index on a server without the preload that removed nothing - a
+partial index none of whose rows died - collected its visited pages all the
+same and, past `pg_lion.vacuum_barrier_ranges`, wrote them out under
+`lion_rmgr_id`, which without the preload is the GUC's boot value 128 and not
+a manager this server has: pg_waldump showed them as custom128 records of an
+unknown type, and crash recovery or a standby stops with a FATAL ("resource
+manager with ID 128 not registered") at the first of them. Now
+`lion_wal_visit()` collects nothing unless the manager is registered, and the
+flush refuses to insert without it. Visiting changes no page, so it is not
+refused the way a write is; the barrier is not needed either, because the only
+records it could ride on are rmgr-mode removals, which this server cannot
+write - a VACUUM that has something to remove from such an index still stops
+at its first write, with the hint. `test/recovery/run.sh` phase 1f vacuums an
+rmgr-mode partial index on a server restarted without the preload, then
+crashes it: no custom-manager record may be in the range, and recovery must
+succeed.
+
 ### Testing (implemented)
 
 - `make installcheck` runs the whole suite in generic mode, which is what a
