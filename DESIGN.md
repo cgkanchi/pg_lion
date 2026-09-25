@@ -6314,9 +6314,22 @@ than overruns (§30.4).
   `LionTidSet`: a sorted array of (container key, container copy), searched by binary search and
   tested with `lion_container_contains()`. A SETS or UNION source arrives in ascending container
   key (`lion_source_sorted()`); a WALK (a range) or a LIST (a long IN list) arrives entry by entry
-  or batch by batch and is sorted, with equal keys ORed, once it is complete. A BitmapAnd is the
-  container-wise AND of its children's sets, a BitmapOr their OR; a leaf that selects nothing is an
-  empty set. No lossy page exists anywhere in this: every member is a TID some entry held (§29.6).
+  or batch by batch - one PIECE per container key each entry or batch touches, so a range over
+  400,000 distinct values brings 400,000 one-TID pieces for 34 keys - and its pieces are sorted and
+  those of equal keys ORed, through one bitset image per key, whenever the directory is full (from
+  1,024 entries on; it doubles only if it is still more than half full afterwards), before their
+  bytes would degrade the set (once there are at least as many pieces as merged entries), and when
+  the source is complete. A BitmapAnd is the container-wise AND of its children's sets, a BitmapOr
+  their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
+  every member is a TID some entry held (§29.6).
+  *(Fixed 2026-09-25, second review: the pieces were merged only once the source was complete, and
+  pairwise. Every piece kept a directory entry and a container copy until then, so a set whose
+  merged form was a few hundred bytes degraded at a 64 kB hash_mem, and after degrading the
+  directory went on growing one entry per piece - 52 MB at a 1 MB hash_mem for a range over 4M
+  values, 197 kB of a 64 kB one still held after the build of a 15,000-value range, and "invalid
+  memory alloc request size" past 2^27 pieces; ORing the pieces pairwise cost a pass over the
+  growing container per piece, 4.2 s to build the set of a 250,000-value range that the lion bitmap
+  scan reads in 0.2 s, now 0.33 s.)*
 - **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
   lion index clause was lossy and the set did not degrade. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
@@ -6325,8 +6338,9 @@ than overruns (§30.4).
 - **Degrading.** The set counts its bytes; when they would exceed `get_hash_memory_limit()` it
   frees every container and keeps only their KEYS - "every TID of these 64 heap blocks may be a
   member" -, marks itself inexact, and carries on that way. Memory is then 16 bytes per container
-  key, at most one per 64 heap blocks; the answer stays exact because every fetched member is now
-  rechecked; the node walks on as a slower filter.
+  key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, its unmerged
+  pieces: fewer than three per key, or 1,024, above); the answer stays exact because every
+  fetched member is now rechecked; the node walks on as a slower filter.
 - **The walk.** `index_beginscan()` on the ordered index under the executor snapshot and
   `index_rescan()` with its keys, in the path's direction. On 16 .. 19 each TID comes from
   `index_getnext_tid()`, which reads only the index, and a member is fetched with
@@ -6522,6 +6536,9 @@ correlated AND, three members early and a thousand late (the switch after rows w
 including through a paused cursor), NULLs first under DESC with members among the NULLs met
 before the switch, a btree qual beside it, and a LATERAL rescan - each compared in order with the
 ordinary plan, with the switch shown by EXPLAIN ANALYZE.
+Added with the second review's fixes, each failing before its fix: a range over 15,000 distinct
+values at a 64 kB hash_mem, whose set must stay exact, and whose `LionOrdered set` memory context,
+read while a cursor is paused after the build, must hold no more than hash_mem.
 `make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
 orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
 
