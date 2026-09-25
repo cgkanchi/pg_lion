@@ -72,6 +72,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_oper.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
@@ -325,6 +326,36 @@ lion_get_am_oid(void)
 }
 
 /*
+ * Is a value of type `typid` one of this key column's own values?  Asked of a
+ * class declared on a POLYMORPHIC type (enum_ops is FOR TYPE anyenum), whose
+ * input type says nothing about which enum the column holds: the key type,
+ * state->typid, does - the column's type as the index's tuple descriptor has
+ * it (DESIGN.md §17's key type resolution).  Domains are looked through on
+ * both sides, as the parser does: a domain over the enum has the enum's
+ * representation, and the index's column may itself be of the domain.
+ */
+static bool
+lion_type_is_column(LionState *state, Oid typid)
+{
+	return OidIsValid(typid) &&
+		getBaseType(typid) == getBaseType(state->typid);
+}
+
+/*
+ * The type to name when a value cannot be compared with a key column: the
+ * class's input type, or the column's actual type where that is polymorphic
+ * ("the index is on type anyenum" says nothing about which one).  A multi-key
+ * column's key type is the ELEMENT type (array_ops on text[] stores text), not
+ * what the column holds, so there the class's type is named as before.
+ */
+static Oid
+lion_column_type(LionState *state, Oid opcintype)
+{
+	return (IsPolymorphicType(opcintype) && !state->multikey) ?
+		state->typid : opcintype;
+}
+
+/*
  * LionProbe, the one cross-type resolution of DESIGN.md §21, is declared in
  * lion_count.h: the bitmap scan (lion_scan.c) resolves its scan keys through
  * lion_probe_init() and lion_probe_find() as well, so the two paths cannot
@@ -344,7 +375,23 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 
 	memset(probe, 0, sizeof(LionProbe));
 
-	if (!OidIsValid(keytype) || keytype == opcintype)
+	/*
+	 * The column's OWN type: nothing to resolve.  That is the opclass's input
+	 * type, or - for a class declared on a polymorphic type, enum_ops being
+	 * FOR TYPE anyenum - the type the column actually has, whatever it is
+	 * called.  A scan key names the class's member by its declared type
+	 * (sk_subtype is anyenum), but the elements of `col = ANY (array)` are
+	 * of the array's element type, which is the column's own enum: the
+	 * operator is polymorphic, so the parser left the array as it was
+	 * (make_scalar_array_op()).  Both are the class's own values, and looking
+	 * up a cross-type (anyenum, mood) member for the second answered a plain
+	 * index scan of `mood IN (...)` with "type mood cannot be compared with
+	 * index" (2026-09-25 review).  lion_type_is_column() compares BASE types,
+	 * because a domain over the enum is the enum's representation, and never
+	 * accepts a different enum: its OIDs mean nothing to this column.
+	 */
+	if (!OidIsValid(keytype) || keytype == opcintype ||
+		(IsPolymorphicType(opcintype) && lion_type_is_column(state, keytype)))
 	{
 		probe->typlen = state->typlen;
 		probe->typbyval = state->typbyval;
@@ -368,7 +415,7 @@ lion_probe_init(Relation index, LionState *state, Oid keytype, LionProbe *probe)
 						format_type_be(keytype),
 						RelationGetRelationName(index)),
 				 errdetail("The index is on type %s.",
-						   format_type_be(opcintype))));
+						   format_type_be(lion_column_type(state, opcintype)))));
 
 	hashproc = get_opfamily_proc(opfamily, keytype, keytype, 1);
 	if (!OidIsValid(hashproc))
@@ -5649,6 +5696,90 @@ lion_count_no_relation(Oid relid)
 }
 
 /*
+ * The type a SQL count's key is looked up as: what `col = key` in the query
+ * the count stands for would compare it as, or an ERROR where that query
+ * would find no operator.  The function's argument is polymorphic, so its
+ * type is whatever the caller wrote, and it has to be brought to one of the
+ * column's opclass members by the rules the parser would apply:
+ *
+ *	- a domain is its base type, as it is to operator resolution;
+ *	- a class declared on a POLYMORPHIC type (enum_ops, FOR TYPE anyenum)
+ *	  takes values of the column's own type and nothing else: its members
+ *	  are (anyenum, anyenum), which the parser only lets two values of ONE
+ *	  enum meet at.  A different enum would pass for "an enum", and its OIDs
+ *	  would be looked up in this column's directory as if they meant
+ *	  something there.  The resolved type is the class's own, opcintype.
+ *	- otherwise the class's own type, or a type the family has a strategy-1
+ *	  member for with it (int8 on an int4 column: int48eq, exactly as in the
+ *	  query), which lion_probe_init() resolves further;
+ *	- or, lacking such a member, a BINARY coercion to the class's type -
+ *	  varchar to text - where the parser makes it with `col = key` too:
+ *	  there is no `text = varchar`, so it relabels the key and calls the
+ *	  class's own `text = text`.  The bytes are the same, so the key is then
+ *	  simply one of the column's own values.  A cast FUNCTION is not taken,
+ *	  for §21's reason (implicit does not mean lossless), and neither is a
+ *	  coercion the parser would not make (bpchar and text, below).
+ *
+ * This is the whole of the key type check: until 2026-09-25 it compared the
+ * key with rd_opcintype exactly, so enum_ops, a DEFAULT class, could never be
+ * counted at all ("the index is on type anyenum" for the column's own enum),
+ * and neither could a varchar key on the varchar column it indexes.
+ */
+static Oid
+lion_count_key_type(Relation index, AttrNumber col, Oid keytype)
+{
+	LionState  *state = lion_index_column_state(index, col);
+	Oid			opfamily = index->rd_opfamily[col - 1];
+	Oid			opcintype = index->rd_opcintype[col - 1];
+	Oid			basetype = getBaseType(keytype);
+
+	if (IsPolymorphicType(opcintype))
+	{
+		if (lion_type_is_column(state, basetype))
+			return opcintype;
+	}
+	else
+	{
+		Oid			eqopr;
+		Oid			lefttype;
+		Oid			righttype;
+
+		if (basetype == opcintype ||
+			OidIsValid(get_opfamily_member(opfamily, opcintype, basetype, 1)))
+			return basetype;
+
+		/*
+		 * The binary coercion only where `col = key` makes it: the operator
+		 * the parser picks for (the column's type, the key's type) has to be
+		 * the class's own (opcintype, opcintype), reached without a cast
+		 * function (compatible_oper()).  That a coercion EXISTS is not
+		 * enough.  text is binary-coercible to bpchar, but `bpcharcol =
+		 * 'x '::text` resolves to `text = text` - text is the preferred type
+		 * of its category - and casts the COLUMN with rtrim1(), so it matches
+		 * no row that bpchar's own equality, which ignores trailing blanks,
+		 * would count.
+		 */
+		eqopr = compatible_oper_opid(list_make1(makeString(pstrdup("="))),
+									 state->typid, basetype, true);
+		if (OidIsValid(eqopr))
+		{
+			op_input_types(eqopr, &lefttype, &righttype);
+			if (lefttype == opcintype && righttype == opcintype)
+				return opcintype;
+		}
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_DATATYPE_MISMATCH),
+			 errmsg("type %s cannot be compared with index \"%s\"",
+					format_type_be(keytype),
+					RelationGetRelationName(index)),
+			 errdetail("The index is on type %s.",
+					   format_type_be(lion_column_type(state, opcintype)))));
+	return InvalidOid;			/* keep the compiler quiet */
+}
+
+/*
  * Open and vet the indexes of one SQL count: relkind, access method, key
  * type, privileges, row-level security and snapshot eligibility.  keytype may
  * be NULL, which means the caller has no search key at all (the grouped form
@@ -5769,23 +5900,15 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 							RelationGetRelationName(index), wantcol)));
 
 		/*
-		 * The key must be the index's own type, or a type the opfamily can
-		 * compare it with (integer cross-type equality, for instance).
-		 * lion_probe_init() would raise the same errors later; raising them
-		 * here keeps them out of the middle of the count.
+		 * The key's type, resolved the way `col = key` would resolve it
+		 * (lion_count_key_type()); what lion_probe_init() is handed from here
+		 * on, and what the EXECUTE check below names the equality by.
+		 * Raising the errors here keeps them out of the middle of the count.
 		 */
-		if (OidIsValid(call->keytype[i]) &&
-			call->keytype[i] != index->rd_opcintype[0] &&
-			!OidIsValid(get_opfamily_member(index->rd_opfamily[0],
-											index->rd_opcintype[0],
-											call->keytype[i], 1)))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("type %s cannot be compared with index \"%s\"",
-							format_type_be(call->keytype[i]),
-							RelationGetRelationName(index)),
-					 errdetail("The index is on type %s.",
-							   format_type_be(index->rd_opcintype[0]))));
+		if (OidIsValid(call->keytype[i]))
+			call->keytype[i] = lion_count_key_type(index,
+												   (wantcol == 0) ? 1 : wantcol,
+												   call->keytype[i]);
 
 		/*
 		 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted
@@ -5889,12 +6012,33 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	}
 
 	/*
+	 * A materialized view created WITH NO DATA has an empty heap and empty
+	 * indexes, so every count through them was 0 - where the query the count
+	 * stands for refuses to run at all (2026-09-25 review).  Refuse as
+	 * ExecOpenScanRelation() does, and where the executor does: after the
+	 * range table's privileges, before the scan's quals and the aggregate are
+	 * initialised and their functions checked.  The pushdown node makes the
+	 * same check (lion_begin_custom_scan()).
+	 */
+	if (!RelationIsScannable(call->heap))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("materialized view \"%s\" has not been populated",
+						RelationGetRelationName(call->heap)),
+				 errhint("Use the REFRESH MATERIALIZED VIEW command.")));
+
+	/*
 	 * The query also CALLS count() and the equality the key is looked up
 	 * with, so the count asks for EXECUTE on both, as the executor would of
 	 * that query (2026-09-23 review).  `col = key` is strategy 1 of the key
-	 * column's opfamily for (opcintype, the key's type) - int48eq for an int8
-	 * key on an int4 column, exactly as in the query - and `col = ANY (keys)`
-	 * calls the same function per element.  The grouped form stands for
+	 * column's opfamily for (opcintype, the key's type as
+	 * lion_count_key_type() resolved it) - int48eq for an int8 key on an int4
+	 * column, texteq for a varchar key on a text_ops column (the parser
+	 * relabels it), enum_eq for the column's own enum, exactly as in the
+	 * query - and `col = ANY (keys)` calls the same function per element.
+	 * The resolved type is also what the lookup is made as, so the function
+	 * checked here is the one whose meaning the count reproduces.  The
+	 * grouped form stands for
 	 * `SELECT col, count(*) ... GROUP BY col`, whose Agg compares groups with
 	 * the type's equality; the pushdown only groups by an index whose
 	 * strategy 1 IS that equality (DESIGN.md §10), so strategy 1 for
@@ -6111,8 +6255,13 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
+	/*
+	 * The elements are deconstructed as what the array holds, and looked up
+	 * as the type lion_count_open_indexes() resolved that to: a varchar[] is
+	 * looked up as text on a text_ops column, the same bytes.
+	 */
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
-	nsets = lion_posting_set_lookup_many_col(call.index[0], 1, elemtype,
+	nsets = lion_posting_set_lookup_many_col(call.index[0], 1, call.keytype[0],
 											nelems, elems, nulls, sets,
 											&nfound);
 

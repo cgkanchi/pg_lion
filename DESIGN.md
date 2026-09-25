@@ -697,7 +697,8 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   The SQL functions stand for `SELECT count(*) FROM t WHERE col = key` (or `= ANY (keys)`, or
   `GROUP BY col`), so they require EXECUTE on count() - checked as an aggregate, as above - and on
   the equality function they look up with: strategy 1 of the key column's opfamily for (opcintype,
-  the key's type), which is `int48eq` for an int8 key on an int4 column exactly as in the query,
+  the key's type as "SQL surface" below resolves it), which is `int48eq` for an int8 key on an int4
+  column exactly as in the query,
   and (opcintype, opcintype) for the grouped form. These checks follow the exact SELECT check,
   under the lock (test/sql/security_exec.sql). One case follows core rather than the rule:
   a clause implied by a PARTIAL index's predicate is dropped by the planner, so a keyless plain
@@ -832,12 +833,43 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
      for tests: same entry scan, one count per group, one cache.
 
 SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
-`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anyelement) RETURNS bigint`.
-Both verify the key type matches the index's opcintype, open the heap via IndexGetRelation with
-AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent SELECT.
+`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anycompatible) RETURNS bigint`,
+whose keys are of two unrelated polymorphic types because each is compared with its own index's
+column and the two columns need not share a type. Both open the heap via IndexGetRelation with
+AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
+SELECT.
+**The key's type is resolved as `col = key` would resolve it** (`lion_count_key_type()`, 2026-09-25
+review; before it the key had to BE the index's opcintype or have a cross-type member, so enum_ops, a
+DEFAULT class, could not be counted at all and neither could a varchar key on the varchar column it
+indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
+the column's actual type and nothing else: a different enum would pass for "an enum", and its OIDs
+mean nothing to this column (the DETAIL names the column's type, not anyenum). Otherwise the key is
+of the class's own type, or of a type the family has a strategy-1 member for with it (int8 on int4:
+`int48eq`, which §21's probe resolves further), or - lacking one - BINARY-coercible to the class's
+type where the parser makes that coercion itself: its `=` for (column type, key type) must be the
+class's own (opcintype, opcintype) operator reached without a cast function (`compatible_oper()`),
+as for varchar on text_ops, which the parser relabels to call `texteq`. A cast function is never
+taken (§21), and a coercion merely existing is not enough: text is binary-coercible to bpchar, but
+`bpcharcol = 'x '::text` is `text = text` on the column cast by rtrim1(), and matches none of the
+rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
+the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
+`lion_index_count_any()` resolves its array's element type the same way.
+**A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
+STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
+argument - a NULL constant folds the call away when the query is planned - so no count is made,
+nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding
+what a keyless count checks, and the query it would stand for does not settle it: the planner folds
+`col = NULL` to a constant-false filter, so that query reads no index, calls no equality and never
+asks whether a materialized view is populated.
+A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY (...)`, and counts
+0; a NULL array is a NULL argument.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
-entry's meaning and used to be hashed and compared as if it did.
+entry's meaning and used to be hashed and compared as if it did. All of them refuse a materialized
+view created WITH NO DATA with core's error ("has not been populated"), as ExecOpenScanRelation()
+refuses the query, between the privilege checks and the EXECUTE checks where the executor raises it;
+its heap and indexes are empty, so the count used to answer 0 (2026-09-25 review; the pushdown node
+already refused it).
 Nobody vetted the index they were handed, so they also make the decision the planner makes in
 get_relation_info() before looking anything up: `lion_index_usable(index, snapshot, &why)` (lion.h,
 implemented in lion_pages.c, shared with lion_index_verify's heapallindexed pass) requires
@@ -3818,6 +3850,21 @@ implemented by the same function as the key type's own strategy-1 operator; othe
 stated a different equality (e.g. `bpchar =~~= text` with text semantics on a bpchar index, where
 'x' and 'x ' differ) and the probe walks the leaves with that equality. test/sql/directory.sql §18
 shows the shortcut answering 100 where the family and the seqscan answer 0.
+
+**Before any of the outcomes above, a value of the column's OWN type needs no resolution** - and
+for a class declared on a POLYMORPHIC type the class's input type does not say what that is
+(2026-09-25 review). `enum_ops` is FOR TYPE anyenum: a scan key names its member by that type
+(`sk_subtype` = anyenum), but the elements of `m IN ('a', 'b')` are of the column's enum, because
+the operator is polymorphic and the parser leaves the array as it is (`make_scalar_array_op()`).
+`lion_probe_init()` took `keytype == opcintype` for the only way to say "own type", so every path
+that probes with the ARRAY's element type - a plain index scan's set tree and its LIST batches
+(§29.3, §29.4), a multicolumn bitmap scan (§24) - looked up an (anyenum, mood) member, found none
+and raised "type mood cannot be compared with index"; only the single-column bitmap scan, which
+probes with `sk_subtype`, worked. For a polymorphic class the own type is now also the column's
+actual type, read from the key column (`LionState.typid`), with domains looked through on both
+sides; a different enum is still not one (its OIDs mean nothing to this column) and still refused.
+`lion_range_add()` had made the same step for range bounds since §28. test/sql/keytypes.sql runs
+every scan shape against a sequential scan on an enum column, a list longer than a batch included.
 
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
