@@ -2087,6 +2087,21 @@ static int *lion_or_group_map(List *ors, int nclause);
  * grouping column an equality pins).
  *
  * Returns the clause index of the list, or -1 when neither applies.
+ *
+ * *groupdrive has to be the executor's answer and not an approximation of
+ * it, because it is also what decides whether the path may claim pathkeys:
+ * the entry walk emits its groups in directory order, the list's sets in
+ * whatever order they were located in.  lion_locate_where() takes as the
+ * driver the FIRST clause - in clause order, OR leaves skipped - that is a
+ * list (or, with eqdrives, an equality) on the driving index's own key
+ * column, whatever else the WHERE holds, and so does this function.  It used
+ * to give up at the second list anywhere in the WHERE ("neither is THE one"),
+ * which with `g IN (...) AND h IN (...) GROUP BY g` priced a walk of every
+ * entry of g and promised `ORDER BY g` a sorted output the executor never
+ * built: it drove the groups from g's list all the same (the 2026-09-25
+ * review).  The listed sets come out in key order for every opfamily this
+ * extension ships, which is why no test caught it; a family whose lookup
+ * falls back to an unsorted probe emits them in hash order.
  */
 static int
 lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -2097,9 +2112,9 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 {
 	int			nclause = list_length(whereclauses);
 	bool	   *inor = lion_or_leaf_map(ors, nclause);
-	IndexOptInfo *arrayidx = NULL;
-	AttrNumber	arraycol = 1;
-	int			arrayci = -1;
+	int			firstlist = -1; /* the first list anywhere */
+	int			nlist = 0;
+	int			groupci = -1;	/* the first one on the driving column */
 	int			npos = 0;
 	int			ci = 0;
 	ListCell   *lc1;
@@ -2112,49 +2127,51 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 
 	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
 	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
+		bool		ondriver = (groupidx != NULL &&
+								idx->indexoid == groupidx->indexoid &&
+								(AttrNumber) lfirst_int(lc4) == groupcol);
+
 		if (!inor[ci] && LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
 		{
 			npos++;
 			if (IsA((Node *) lfirst(lc2), ScalarArrayOpExpr) ||
-				(eqdrives && lfirst_int(lc3) == LION_CLAUSE_EQ &&
-				 groupidx != NULL &&
-				 ((IndexOptInfo *) lfirst(lc1))->indexoid == groupidx->indexoid &&
-				 (AttrNumber) lfirst_int(lc4) == groupcol))
+				(eqdrives && lfirst_int(lc3) == LION_CLAUSE_EQ && ondriver))
 			{
-				if (arrayci >= 0)
-					arrayci = -2;	/* two lists: neither is "the" one */
-				else if (arrayci == -1)
-				{
-					arrayci = ci;
-					arrayidx = (IndexOptInfo *) lfirst(lc1);
-					arraycol = (AttrNumber) lfirst_int(lc4);
-				}
+				nlist++;
+				if (firstlist < 0)
+					firstlist = ci;
+				if (groupci < 0 && ondriver)
+					groupci = ci;
 			}
 		}
 		ci++;
 	}
 	pfree(inor);
 
-	if (arrayci < 0)
-		return -1;
-
 	/*
 	 * The list drives the groups only when its entries ARE the groups: the
 	 * same index AND the same key column (DESIGN.md §24).  Two columns of one
 	 * multicolumn index are two independent sets of entries, so a list on `b`
 	 * says nothing about the groups of `a` - which is also how the executor
-	 * decides it (lion_locate_where(), by index and by heap attno).
+	 * decides it (lion_locate_where(), by index and by heap attno).  Any other
+	 * list, or a second one on the same column, is an ordinary source.
+	 *
+	 * The sum of a list's entries stands for its union only when nothing else
+	 * is in the AND, so that needs the list to be the one positive clause.
 	 */
-	if (groupidx == NULL && groupidx2 == NULL && ors == NIL && npos == 1)
+	if (groupidx == NULL && groupidx2 == NULL && ors == NIL && npos == 1 &&
+		nlist == 1)
+	{
 		*sumshort = true;
-	else if (groupidx != NULL && groupidx2 == NULL && arrayidx != NULL &&
-			 arrayidx->indexoid == groupidx->indexoid &&
-			 arraycol == groupcol)
+		return firstlist;
+	}
+	if (groupidx != NULL && groupidx2 == NULL && groupci >= 0)
+	{
 		*groupdrive = true;
-	else
-		return -1;
-
-	return arrayci;
+		return groupci;
+	}
+	return -1;
 }
 
 /*

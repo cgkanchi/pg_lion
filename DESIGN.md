@@ -1111,6 +1111,20 @@ Executor
   the planner must not assume sortedness (pathkeys = NIL). This is one function,
   `lion_next_group()`, and it is the whole of the GROUP BY executor: a partitioned scan runs it once
   per partition (§16).
+
+  (Since written: §21 ordered the entries and gave an entry walk pathkeys, and §15 let an IN list on
+  the group column drive the groups instead - `lion_next_group_inlist()`, which emits them in the
+  order the list's sets were located in and so claims no order at all. WHICH clause drives is one
+  rule, applied by the planner (`lion_inlist_shape()`, for the cost and for the pathkeys) and by the
+  executor (`lion_locate_where()`) alike: the FIRST list, in clause order and outside any OR, on the
+  driving index's own key column - whatever other lists the WHERE holds. The planner used to give
+  up at the second list anywhere in the WHERE, so `g IN (...) AND h IN (...) GROUP BY g` was priced
+  as a walk of every entry of `g` and claimed `ORDER BY g`, while the executor drove the groups
+  from the list on `g` all the same; for an opfamily whose cross-type equality has no ordering to
+  sort the list with, the list is located in hash order, and the query returned its groups unsorted
+  under `ORDER BY g` (the 2026-09-25 review). `test/sql/pushdown.sql` pins both halves: that
+  opfamily's ordered output with a Sort above the node, and the plan choice the corrected estimate
+  makes on the shipped one - eight listed entries against a walk of twenty thousand.)
 - ReScanCustomScan: reset iteration state. EndCustomScan: close indexes, free.
 - ExplainCustomScan: print "Indexes: idx1 (col = const), ..." - with the index's KEY COLUMN
   appended as `idx1.col` when, and only when, the index is a MULTICOLUMN one (§24), so that two
