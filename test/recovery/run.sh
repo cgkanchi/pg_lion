@@ -357,6 +357,30 @@ run_check() {
 	NCHECKS=$(printf '%s\n' "$out" | wc -l)
 }
 
+# vacuum_page_counts <label> <table> <index>
+#
+# VACUUM (VERBOSE) the table and read what it reports about the index's free
+# pages (DESIGN.md §18, "Page counts") into NEWLY, CURRENT and REUSABLE: the
+# pages this VACUUM freed, the free pages the index holds, and those of them
+# the next allocation could take already.  Only a shell can read them - no SQL
+# function sees an IndexBulkDeleteResult - which is why this lives here and
+# not in the regression suite.  Never call it in a command substitution.
+NEWLY=0
+CURRENT=0
+REUSABLE=0
+vacuum_page_counts() {
+	local label=$1 table=$2 index=$3 line
+	line=$(psql_p -c "VACUUM (VERBOSE, INDEX_CLEANUP ON) $table" 2>&1 |
+		tee -a "$RUNLOG" | grep "index \"$index\": pages:" || true)
+	[ -n "$line" ] || die "$label: VACUUM VERBOSE printed no page counts for $index"
+	NEWLY=$(printf '%s' "$line" | sed -n 's/.* \([0-9]*\) newly deleted.*/\1/p')
+	CURRENT=$(printf '%s' "$line" | sed -n 's/.* \([0-9]*\) currently deleted.*/\1/p')
+	REUSABLE=$(printf '%s' "$line" | sed -n 's/.* \([0-9]*\) reusable.*/\1/p')
+	[ -n "$NEWLY" ] && [ -n "$CURRENT" ] && [ -n "$REUSABLE" ] ||
+		die "$label: could not read the page counts in: $line"
+	log "$label: $line"
+}
+
 # ---------------------------------------------------------------- phase 1
 
 crash_immediate() {
@@ -601,10 +625,21 @@ phase1b() {
 	# warn about, which is the assertion that the leak is gone.
 	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_leak WHERE k = 4" \
 		>>"$RUNLOG" 2>&1
-	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_leak" >>"$RUNLOG" 2>&1
+	vacuum_page_counts "phase 1b" lion_leak lion_leak_k
 	freed=$(psql_p -tAc "select deleted_pages from lion_index_stats('lion_leak_k')")
 	[ "$freed" -gt 0 ] ||
 		die "phase 1b: the leak sweep recovered no pages (deleted_pages = $freed)"
+
+	# What VACUUM reported about it (DESIGN.md §18, "Page counts").  The index
+	# held no DELETED page before, so every one it holds now is one this
+	# VACUUM freed - the leaked pages its sweep found and k = 4's chain - and
+	# none of them is reusable yet; the other free pages, if a split left any,
+	# are all-zero and reusable.  A page freed with its chain used to be
+	# counted a second time by the sweep, and every free page as reusable.
+	[ "$NEWLY" = "$freed" ] ||
+		die "phase 1b: VACUUM reported $NEWLY pages newly deleted, the index holds $freed DELETED pages"
+	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
+		die "phase 1b: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
 	warn=$(psql_p -c "SELECT lion_index_verify('lion_leak_k', true)" 2>&1 >>"$RUNLOG" |
 		grep -c 'unused and unreachable' || true)
 	[ "$warn" = 0 ] ||
@@ -880,7 +915,9 @@ phase1d() {
 #  * lion_index_verify() calls the leaves a leak (a WARNING), not corruption;
 #  * the next VACUUM spills the set properly, and its sweep frees the orphan
 #    leaves, which are FULL - the sweep used to free only empty unreferenced
-#    leaves, so these stayed leaked for good;
+#    leaves, so these stayed leaked for good.  Its VERBOSE page counts
+#    (DESIGN.md §18, "Page counts") are checked here, where a shell can read
+#    them: the ten orphans newly deleted, and never counted twice;
 #  * and a second crash replays that VACUUM, the whole multi-leaf spill
 #    included (under wal_consistency_checking when --conf asks for it).
 #
@@ -958,9 +995,16 @@ phase1e() {
 	psql_p -c "SELECT injection_points_detach('lion-spill-leaves-written')" \
 		>>"$RUNLOG" 2>&1 || true
 
-	# The next VACUUM spills the set and sweeps the orphans away.
-	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_mspill" >>"$RUNLOG" 2>&1 ||
-		die "phase 1e: the VACUUM after the crash failed"
+	# The next VACUUM spills the set and sweeps the orphans away, and says so:
+	# the ten orphans are what it newly deleted, and they are not reusable
+	# yet.  Every other free page is all-zero - the root the crash left
+	# unwritten - and reusable, so the two differences agree exactly unless a
+	# page is counted twice or a fresh one is called reusable.
+	vacuum_page_counts "phase 1e" lion_mspill lion_mspill_k
+	[ "$NEWLY" = 10 ] ||
+		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the ten orphan leaves"
+	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
+		die "phase 1e: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
 
 	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
 		grep -c 'unused and unreachable' || true)
