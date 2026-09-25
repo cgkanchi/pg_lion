@@ -387,6 +387,13 @@ INSERT (`lion_insert.c`)
    is what step 6 explains; it is kept because it strictly removes work from inside that window, and
    an insert whose ckey is not on the tail pays the same number of acquisitions as before (an
    exclusive lock on the tail where it used to be a shared one).
+   **The tail is good only for the in-place fast path** (2026-09-25). An insert that needs the
+   general path - which rewrites the item and may split the page - lets the tail go and DESCENDS,
+   even when the tail owns its ckey, because the tail may be the right half of a split that never
+   finished, and only a descent finishes one (§22 addendum, "an unfinished split and the writers
+   that do not descend"). The descent lands on the tail again; what it costs is its own locks, one
+   per level, on the general path only - never for a BITSET, about once per 30 members of a
+   growing ARRAY.
 5. All page modifications go through GenericXLog: one GenericXLogStart per atomic step, registering
    at most 4 buffers (a split touches P, N, possibly M, and the bucket page).
 6. Release everything. Inserts to different buckets do not block each other; inserts to the same
@@ -3488,6 +3495,8 @@ Operations.
   upgraded. `lion_chain_find_page()` is that descent (`lion_posting_search()` in the new
   `lion_posting.c`); the tail hint stays for appends and is now decided with the EXCLUSIVE lock the
   insert needs anyway, without descending at all, when the tail is still the rightmost leaf.
+  *(Narrowed 2026-09-25: the hint serves only the in-place fast path; anything that may split the
+  page descends - see the addendum "an unfinished split and the writers that do not descend".)*
 - **Leaf split**: as today (items at and after the insert position move to a brand new page N linked
   right; when the new items still do not fit on P they get a second new page M linked between them),
   plus a downlink insert into the parent. Each new page's LEFT neighbour is flagged
@@ -3496,7 +3505,8 @@ Operations.
   cannot reach M before M has one. Records: (P, M, N, entry leaf) = 4 buffers for the split, one for
   each downlink, one tiny one for each flag. Injection point `lion-posting-split-incomplete` fires
   between the first record and the downlink; `test/recovery/run.sh` phase 1d crashes the server there
-  and proves the next writer's descent repairs it.
+  and proves the next writer repairs it - an append as much as a descent since the 2026-09-25
+  addendum below, which covers the two writers that reach a leaf WITHOUT descending.
 - **Root split is a PUSH-DOWN**, and this is the deviation that matters most from the first draft,
   which had it allocate a new root and rewrite the entry's `head`. The root block never moves: its
   items go to a brand new child and the root block itself becomes the level above, holding one
@@ -3809,6 +3819,59 @@ build, dead TIDs left behind on a release build). Injection points `lion-vacuum-
 parks VACUUM on either side of it while an insert pushes the root down, and asserts that every dead
 TID is gone afterwards (ntids = rows) and verify() is clean. Before the re-check the spec crashed the
 backend.
+
+### §22 addendum: an unfinished split and the writers that do not descend (2026-09-25)
+
+The repair rule of this section is that a WRITE DESCENT finishes every unfinished split it meets.
+That was the only repair, and two writers reach a leaf without descending at all:
+
+- **An append**, through the entry's `tail` (§5 INSERT step 4). A split of the set's last leaf
+  makes the new right half the tail in its FIRST record, so after a crash between the two records -
+  or an ERROR there, such as running out of disk while the downlink insertion splits the parent -
+  every append went straight to the right half and no descent ever came near the flagged page.
+  When the right half filled, its own split looked for its downlink in the parent, found none and
+  failed with "no downlink for block N at level 1", and so did every later split of the tail, since
+  each left the next tail without a downlink too: an append-only key never took another row. The
+  2026-09-25 review reproduced it in five statements with the injection point set to 'error'.
+- **VACUUM's regrow** (§18), which reaches the page a grown container lives on by walking right
+  links under cleanup locks - it may not jump there (§11; rule 1 of lion_vacuum.c). On the RIGHT
+  half, which has no downlink, its split's parent lookup failed as above, and VACUUM could not
+  complete.
+
+Two rules close it, both after nbtree:
+
+1. **The append hint serves only changes that stay on the page.** `lion_insert_chain()` uses the
+   tail for the in-place member inserts of §4 and nothing else; a member that needs the general
+   path, which rewrites the item and may split the page, lets the tail go and descends with
+   `forwrite`. The right half has no downlink, so its keys route to the flagged left half, and the
+   descent finishes that split on its way down. nbtree's rightmost-leaf fastpath has the same
+   limit: `_bt_search_insert()` uses its cached block only when the tuple fits without a split.
+2. **A page with no downlink finds out why.** `lion_posting_find_parent()`, on a miss, walks the
+   child's level rightwards from the page the separators route the child's key to, finishes every
+   flagged page it passes, and looks again (`lion_posting_adopt()`); failing that it scans the
+   parent level from its leftmost page, because a route key can lead past a downlink whose
+   separator an emptied neighbour shares. nbtree's `_bt_getstackbuf()` finishes the incomplete
+   splits it meets in the same spirit, though only ever one level up, since nbtree reaches every
+   page it splits by a descent. The walk locks pages to the LEFT of the child the caller holds,
+   which §5's lock order otherwise forbids. It is safe for the reason the whole posting tree rests
+   on: every writer of the key holds the entry's directory leaf, so nothing else can hold a page of
+   this tree while it waits for one to its right - readers hold one page at a time, and VACUUM,
+   when it holds a posting page without the directory leaf, asks for the leaf only conditionally.
+   When the flagged page's right sibling is the child itself, the separator is read off the page
+   the caller already holds instead of locking it a second time.
+
+Rule 1 makes the repair early - the first general-path insert after the crash does it - and rule 2
+makes it certain for a writer that did not descend, which today means VACUUM's regrow on the right
+half. What rule 1 costs is the descent's locks, one per level, on the general path only: never for
+a BITSET, and about once per 30 members of a growing ARRAY, whose slack is 64 bytes.
+
+Tests: `test/isolation/posting_split_repair.spec` cuts a split short with
+`lion-posting-split-incomplete` set to 'error' inside a subtransaction - which leaves on disk exactly
+what a crash between the two records leaves - and then (A) appends, and (B) makes VACUUM regrow on
+the right half, which has no downlink. Both end with verify() clean and the index agreeing with the
+heap; before the fix both failed with "no downlink". `test/recovery/run.sh` phase 1d now appends
+after its real crash, which is the case it used to route around by inserting only into the middle
+of the heap.
 
 ### §21 addendum: binary coercion requires the same equality function
 

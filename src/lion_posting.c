@@ -45,10 +45,23 @@
  *	  takes four buffers and a leaf split already needs (left, new right, a
  *	  second new page, the entry leaf), so the flag cannot ride along with the
  *	  parent insertion the way nbtree does it.  A crash anywhere in between
- *	  leaves the flag set; the next WRITE descent that meets it finishes the
- *	  split before touching the page, and the repair looks for the downlink
- *	  before adding one, so doing it twice is harmless.  Readers never notice:
- *	  the right link takes them to the items.
+ *	  leaves the flag set, and so does an ERROR there - the parent insertion
+ *	  may have to split the parent, which allocates a page, which can fail;
+ *	  the next WRITE descent that meets it finishes the split before touching
+ *	  the page, and the repair looks for the downlink before adding one, so
+ *	  doing it twice is harmless.  Readers never notice: the right link takes
+ *	  them to the items.
+ *
+ *	  Two writers reach a leaf WITHOUT descending - an insert through the
+ *	  append hint (the entry's `tail`) and VACUUM, which walks the right links
+ *	  - and a descent is the only thing that repairs as it goes, so more rules
+ *	  close the gap.  The append hint is used only for changes that stay
+ *	  inside the page; anything that may split the page descends
+ *	  (lion_insert.c).  And a page that has NO downlink - the right half of an
+ *	  unfinished split, reached through the hint or a right link - finds, when
+ *	  its own split needs its parent, the flagged page to its left and
+ *	  finishes that first (lion_posting_find_parent(), nbtree's
+ *	  _bt_getstackbuf() doing _bt_finish_split()).
  *
  * Every page modification here goes through the WAL shim of DESIGN.md §25,
  * which writes either a GenericXLog record or one of our own, and every buffer is
@@ -68,13 +81,17 @@
 
 static Buffer lion_posting_find_parent(Relation index, Relation heaprel,
 									   uint32 hash, BlockNumber head,
-									   BlockNumber childblk, uint16 childlevel,
+									   Buffer childbuf,
 									   uint32 routeckey, bool haveroute,
 									   OffsetNumber *offp);
 static void lion_posting_place_pivot(Relation index, Relation heaprel,
 									 uint32 hash, BlockNumber head, Buffer buf,
 									 OffsetNumber off,
 									 const LionPostingPivot *pivot);
+static void lion_posting_finish_split_ext(Relation index, Relation heaprel,
+										  uint32 hash, BlockNumber head,
+										  Buffer pbuf, const uint32 *knownsep,
+										  Buffer heldright);
 
 /* ---------------------------------------------------------------------
  * Page helpers
@@ -228,8 +245,12 @@ restart:
 		 * not only one it ends up standing on: the page to the right of a
 		 * flagged one is the page with no downlink, and a writer that stepped
 		 * over the flag and then split THAT page would have no parent item to
-		 * insert next to.  The repair moves items' ownership around, so the
-		 * descent starts again rather than guessing where it now stands.
+		 * insert next to.  (lion_posting_find_parent() copes with that too,
+		 * by walking the level from where the route leads up to the page and
+		 * finishing the splits it passes - but that is a second pass over the
+		 * level, and only a writer that reached its leaf without a descent
+		 * should ever need it.)  The repair moves items' ownership around, so
+		 * the descent starts again rather than guessing where it now stands.
 		 */
 		if (forwrite && LionPageIncompleteSplit(page))
 		{
@@ -782,13 +803,31 @@ void
 lion_posting_finish_split(Relation index, Relation heaprel, uint32 hash,
 						  BlockNumber head, Buffer pbuf)
 {
-	lion_posting_finish_split_sep(index, heaprel, hash, head, pbuf, NULL);
+	lion_posting_finish_split_ext(index, heaprel, hash, head, pbuf, NULL,
+								  InvalidBuffer);
 }
 
 void
 lion_posting_finish_split_sep(Relation index, Relation heaprel, uint32 hash,
 							  BlockNumber head, Buffer pbuf,
 							  const uint32 *knownsep)
+{
+	lion_posting_finish_split_ext(index, heaprel, hash, head, pbuf, knownsep,
+								  InvalidBuffer);
+}
+
+/*
+ * The one implementation of both.  heldright, when valid, is a page this
+ * backend already holds EXCLUSIVE, and is the reason this exists: when it is
+ * pbuf's right sibling - lion_posting_adopt() finishing the split that left
+ * heldright without a downlink - the separator is read off it directly
+ * instead of by locking it, which would be a lock this backend already holds
+ * and would wait for itself forever.
+ */
+static void
+lion_posting_finish_split_ext(Relation index, Relation heaprel, uint32 hash,
+							  BlockNumber head, Buffer pbuf,
+							  const uint32 *knownsep, Buffer heldright)
 {
 	Page		ppage = BufferGetPage(pbuf);
 	BlockNumber pblk = BufferGetBlockNumber(pbuf);
@@ -857,16 +896,29 @@ lion_posting_finish_split_sep(Relation index, Relation heaprel, uint32 hash,
 	 */
 	if (!havesep)
 	{
-		Buffer		rbuf = lion_posting_getbuf(index, rblk, head,
-											   BUFFER_LOCK_SHARE, true);
-		Page		rp = BufferGetPage(rbuf);
-
-		if (PageGetMaxOffsetNumber(rp) >= FirstOffsetNumber)
+		if (BufferIsValid(heldright) && BufferGetBlockNumber(heldright) == rblk)
 		{
-			sep = LionPageGetOpaque(rp)->minckey;
-			havesep = true;
+			Page		rp = BufferGetPage(heldright);
+
+			if (PageGetMaxOffsetNumber(rp) >= FirstOffsetNumber)
+			{
+				sep = LionPageGetOpaque(rp)->minckey;
+				havesep = true;
+			}
 		}
-		UnlockReleaseBuffer(rbuf);
+		else
+		{
+			Buffer		rbuf = lion_posting_getbuf(index, rblk, head,
+												   BUFFER_LOCK_SHARE, true);
+			Page		rp = BufferGetPage(rbuf);
+
+			if (PageGetMaxOffsetNumber(rp) >= FirstOffsetNumber)
+			{
+				sep = LionPageGetOpaque(rp)->minckey;
+				havesep = true;
+			}
+			UnlockReleaseBuffer(rbuf);
+		}
 	}
 	if (!havesep && maxoff >= FirstOffsetNumber)
 	{
@@ -879,7 +931,7 @@ lion_posting_finish_split_sep(Relation index, Relation heaprel, uint32 hash,
 		}
 	}
 
-	parent = lion_posting_find_parent(index, heaprel, hash, head, pblk, level,
+	parent = lion_posting_find_parent(index, heaprel, hash, head, pbuf,
 									  routeckey, haveroute, &off);
 	leftsep = lion_posting_pivot(BufferGetPage(parent), off)->ckey;
 	if (!havesep || sep < leftsep)
@@ -906,35 +958,34 @@ lion_posting_finish_split_sep(Relation index, Relation heaprel, uint32 hash,
 }
 
 /*
- * The page at childlevel + 1 that holds the downlink of childblk, locked
- * EXCLUSIVE, with *offp its offset.  Without a route key the scan starts at
- * the leftmost page of that level.
+ * The block of `level` that the separators route routeckey to - or, without a
+ * route key, the leftmost block of that level: where a scan of that level
+ * for something belonging to routeckey starts.  Reads only, SHARE one page at
+ * a time, and holds nothing on return.  The root must be at `level` or above
+ * it.
  */
-static Buffer
-lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,
-						 BlockNumber head, BlockNumber childblk,
-						 uint16 childlevel, uint32 routeckey, bool haveroute,
-						 OffsetNumber *offp)
+static BlockNumber
+lion_posting_level_start(Relation index, BlockNumber head, uint16 level,
+						 uint32 routeckey, bool haveroute)
 {
 	Buffer		buf;
 	BlockNumber blk;
 
 	buf = lion_posting_getbuf(index, head, head, BUFFER_LOCK_SHARE, true);
-	if (LionPageGetOpaque(BufferGetPage(buf))->level <= childlevel)
+	if (LionPageGetOpaque(BufferGetPage(buf))->level < level)
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index \"%s\": posting set at %u has no level above %u for block %u",
-			 RelationGetRelationName(index), head, childlevel, childblk);
+		elog(ERROR, "lion index \"%s\": posting set at %u has no level %u",
+			 RelationGetRelationName(index), head, level);
 	}
 
-	/* Down to the level above the child, reading only. */
 	for (;;)
 	{
 		Page		page = BufferGetPage(buf);
 		OffsetNumber off;
 		BlockNumber child;
 
-		if (LionPageGetOpaque(page)->level == childlevel + 1)
+		if (LionPageGetOpaque(page)->level == level)
 			break;
 
 		if (haveroute)
@@ -963,16 +1014,27 @@ lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	/*
-	 * At the right level.  Take the page EXCLUSIVE (the descent had it SHARE)
-	 * and scan right until the downlink turns up.  The scan holds one page at
-	 * a time and only ever moves rightwards, so two repairers cannot deadlock.
-	 */
 	blk = BufferGetBlockNumber(buf);
 	UnlockReleaseBuffer(buf);
 
+	return blk;
+}
+
+/*
+ * Scan a level rightwards from blk for the downlink of childblk, EXCLUSIVE
+ * one page at a time, and return the page that holds it still locked, with
+ * *offp its offset - or InvalidBuffer when the level ends first.  The scan
+ * holds one page at a time and only ever moves rightwards, so two repairers
+ * cannot deadlock.
+ */
+static Buffer
+lion_posting_scan_for_downlink(Relation index, Relation heaprel, uint32 hash,
+							   BlockNumber head, BlockNumber blk,
+							   BlockNumber childblk, OffsetNumber *offp)
+{
 	for (;;)
 	{
+		Buffer		buf;
 		Page		page;
 		OffsetNumber off;
 		OffsetNumber maxoff;
@@ -984,8 +1046,9 @@ lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,
 		 * This page's own split may never have finished.  Finish it first: the
 		 * downlink we want may be on the page its sibling became, and nothing
 		 * may add an item to a page whose flag a later split of it would
-		 * overwrite.  The recursion is bounded by the height, because every
-		 * step of it goes one level up.
+		 * overwrite.  The recursion goes one level up at every step, and
+		 * sideways only through lion_posting_adopt(), which clears a flag each
+		 * time, so it ends.
 		 */
 		if (LionPageIncompleteSplit(page))
 		{
@@ -1006,8 +1069,168 @@ lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,
 		blk = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
 		if (!BlockNumberIsValid(blk))
-			elog(ERROR, "lion index \"%s\": no downlink for block %u at level %u of the posting set at %u",
-				 RelationGetRelationName(index), childblk, childlevel + 1, head);
+			return InvalidBuffer;
 		CHECK_FOR_INTERRUPTS();
 	}
+}
+
+/*
+ * childbuf, which the caller holds EXCLUSIVE, has no downlink anywhere in the
+ * level above.  Only one thing leaves a page like that: a split to its LEFT
+ * that wrote its first record and never got to the second (a crash, or an
+ * ERROR in the parent insertion), whose flagged left half is somewhere
+ * between the page the separators route childbuf's keys to and childbuf
+ * itself.  A descent would have met that flag and finished it; childbuf was
+ * reached WITHOUT one - through the append hint, or by VACUUM walking the
+ * right links - so the finishing is done here: walk the level rightwards from
+ * where the route key leads, finish every unfinished split on the way, stop
+ * at childbuf.  nbtree's _bt_getstackbuf() finishes the incomplete splits it
+ * meets in the same spirit; it only ever meets them one level up because
+ * nbtree reaches every page it splits by a descent.
+ *
+ * The walk locks pages to the LEFT of one this backend holds, which the lock
+ * order (DESIGN.md §5) otherwise forbids, and it is safe here for the reason
+ * the whole posting tree rests on: every writer of this key holds the entry's
+ * directory leaf, which this backend does, so nobody else can be holding a
+ * page of this tree and waiting for one to its right.  Readers hold one page
+ * at a time and wait for nothing while they do, and VACUUM, when it holds a
+ * page of the tree without the directory leaf, only ever asks for the leaf
+ * conditionally (lion_vacuum.c, rule 2).
+ *
+ * The pages it passes are taken SHARE and only a flagged one is taken again
+ * EXCLUSIVE.  Returns whether it finished anything; false means the level
+ * holds no reason for the missing downlink, which is corruption.
+ */
+static bool
+lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
+				   BlockNumber head, Buffer childbuf, uint32 routeckey,
+				   bool haveroute)
+{
+	BlockNumber childblk = BufferGetBlockNumber(childbuf);
+	uint16		level = LionPageGetOpaque(BufferGetPage(childbuf))->level;
+	bool		finished = false;
+	bool		route = haveroute;
+
+	for (;;)
+	{
+		BlockNumber blk = lion_posting_level_start(index, head, level,
+												   routeckey, route);
+
+		while (BlockNumberIsValid(blk) && blk != childblk)
+		{
+			Buffer		buf;
+			Page		page;
+
+			buf = lion_posting_getbuf(index, blk, head, BUFFER_LOCK_SHARE, true);
+			page = BufferGetPage(buf);
+			if (LionPageGetOpaque(page)->level != level)
+			{
+				UnlockReleaseBuffer(buf);
+				elog(ERROR, "lion index \"%s\": block %u of the posting set at %u is not on level %u with its left neighbour",
+					 RelationGetRelationName(index), blk, head, level);
+			}
+
+			if (LionPageIncompleteSplit(page))
+			{
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+				page = BufferGetPage(buf);
+				if (LionPageIncompleteSplit(page))
+				{
+					lion_posting_finish_split_ext(index, heaprel, hash, head,
+												  buf, NULL, childbuf);
+					finished = true;
+					page = BufferGetPage(buf);
+				}
+			}
+
+			blk = LionPageGetOpaque(page)->rightlink;
+			UnlockReleaseBuffer(buf);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		if (blk == childblk)
+			return finished;
+
+		/*
+		 * The route led PAST childbuf.  Separators are only non-decreasing - a
+		 * page both of whose halves were empty when its split was repaired
+		 * shares its left neighbour's (lion_posting_finish_split_ext()) - so
+		 * a route key can land right of a page that holds it; start again
+		 * from the leftmost page of the level, which cannot.
+		 */
+		if (!route)
+			return false;
+		route = false;
+	}
+}
+
+/*
+ * The page one level above childbuf that holds its downlink, locked
+ * EXCLUSIVE, with *offp its offset.  routeckey is a key childbuf holds;
+ * without one the scan starts at the leftmost page of that level.  childbuf is
+ * held EXCLUSIVE by the caller throughout.
+ *
+ * A child with no downlink at all is repaired rather than reported: see
+ * lion_posting_adopt().  Before that repair existed, an append that took the
+ * right half of an unfinished split through the append hint and then filled
+ * it hit an ERROR here, and so did every later split of the tail, for good
+ * (2026-09-25 review).
+ */
+static Buffer
+lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,
+						 BlockNumber head, Buffer childbuf,
+						 uint32 routeckey, bool haveroute,
+						 OffsetNumber *offp)
+{
+	BlockNumber childblk = BufferGetBlockNumber(childbuf);
+	uint16		childlevel = LionPageGetOpaque(BufferGetPage(childbuf))->level;
+	Buffer		buf;
+
+	if (childblk == head)
+		elog(ERROR, "lion index \"%s\": posting set at %u has no level above %u for block %u",
+			 RelationGetRelationName(index), head, childlevel, childblk);
+
+	buf = lion_posting_scan_for_downlink(index, heaprel, hash, head,
+										 lion_posting_level_start(index, head,
+																  childlevel + 1,
+																  routeckey,
+																  haveroute),
+										 childblk, offp);
+	if (BufferIsValid(buf))
+		return buf;
+
+	/*
+	 * Not there.  Finish whatever left it out, then look again: from where
+	 * the route leads, which is where the downlink now is, and failing that
+	 * from the leftmost page of the level, because a route key can lead past
+	 * a downlink whose separator an emptied neighbour shares (see
+	 * lion_posting_adopt()).
+	 */
+	if (lion_posting_adopt(index, heaprel, hash, head, childbuf, routeckey,
+						   haveroute))
+	{
+		buf = lion_posting_scan_for_downlink(index, heaprel, hash, head,
+											 lion_posting_level_start(index, head,
+																	  childlevel + 1,
+																	  routeckey,
+																	  haveroute),
+											 childblk, offp);
+		if (BufferIsValid(buf))
+			return buf;
+	}
+	if (haveroute)
+	{
+		buf = lion_posting_scan_for_downlink(index, heaprel, hash, head,
+											 lion_posting_level_start(index, head,
+																	  childlevel + 1,
+																	  0, false),
+											 childblk, offp);
+		if (BufferIsValid(buf))
+			return buf;
+	}
+
+	elog(ERROR, "lion index \"%s\": no downlink for block %u at level %u of the posting set at %u",
+		 RelationGetRelationName(index), childblk, childlevel + 1, head);
+	return InvalidBuffer;		/* keep the compiler quiet */
 }
