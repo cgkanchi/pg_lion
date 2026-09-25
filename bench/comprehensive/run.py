@@ -16,7 +16,7 @@ import time
 
 from db import DB, DatabaseError, digest, nodes
 from workloads import (FAMILIES, FOCUSED_FAMILIES, AFTER_MAINTENANCE, scalar_data,
-                       doc_data, profile_cases, profile_indexes, measurement_matrix)
+                       doc_data, family_cases, profile_cases, profile_indexes, measurement_matrix)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -248,12 +248,20 @@ class Suite:
             tree = list(nodes(plan['Plan']))
             used = sorted({x['Index Name'] for x in tree if 'Index Name' in x})
             custom = any(x.get('Custom Plan Provider') == 'LionCount' for x in tree)
+            # LionOrdered (DESIGN.md §30) names the index it walks and the lion indexes it
+            # filters with in properties of its own.
+            ordered = [x for x in tree if x.get('Custom Plan Provider') == 'LionOrdered']
+            used = sorted(set(used) | {name.strip() for x in ordered
+                                       for name in [x.get('Ordered By', '').split(' (')[0],
+                                                    *x.get('Lion Indexes', '').split(',')]
+                                       if name.strip()})
             scans = sorted({x['Node Type'] for x in tree if 'Scan' in x['Node Type']})
             # Custom scan embeds its own index access; EXPLAIN need not emit Index Name.
             fallback = context['variant'] != 'seq' and not used and not custom
             sample = dict(**context, repeat=rep, sequence=self.sequence, status='ok',
                           execution_ms=plan['Execution Time'], planning_ms=plan['Planning Time'],
-                          indexes=used, custom_count=custom, scans=scans, fallback=fallback,
+                          indexes=used, custom_count=custom, custom_ordered=bool(ordered),
+                          scans=scans, fallback=fallback,
                           shared_hit_blocks=plan['Plan'].get('Shared Hit Blocks',0),
                           shared_read_blocks=plan['Plan'].get('Shared Read Blocks',0),
                           temp_written_blocks=plan['Plan'].get('Temp Written Blocks',0),
@@ -335,9 +343,11 @@ class Suite:
             phases = list(dict.fromkeys(config['phase'] for config in matrix
                                        if config['phase'] not in ['low_work_mem', 'after_maintenance']))
             for phase in phases:
-                configs = [c for c in matrix if c['phase'] == phase or
-                           (phase == 'clean' and c['phase'] == 'low_work_mem')]
+                configs = [dict(c, cases=family_cases(family, c['cases'])) for c in matrix
+                           if c['phase'] == phase or (phase == 'clean' and c['phase'] == 'low_work_mem')]
                 selected = [by_id[name] for name in dict.fromkeys(name for c in configs for name in c['cases'])]
+                if not selected:
+                    continue    # a family measuring only some cases (workloads.FAMILY_CASES)
                 if phase == 'dirty_clustered_5pct':
                     self.db.query(f"UPDATE {table} SET payload=reverse(payload) WHERE id <= {max(1,n//20)}")
                     self.db.query(f'ANALYZE {table}')
@@ -349,15 +359,18 @@ class Suite:
                 self.log(f'{suite} rows={n} family={family}: {phase}, {len(selected)} cases')
                 for variant in variants:
                     for config in configs:
+                        if not config['cases']:
+                            continue
                         self.measure(suite,n,variant,config['phase'],
                                      [by_id[name] for name in config['cases']], expected,
                                      modes=[config['mode']], memory=config['memory'])
                     if phase == 'clean' and suite == 'scalar':
-                        if self.args.cold_repeats:
-                            self.cold(suite,n,variant,[c for c in cases if c.id in ['eq_c200_17','fetch_medium']])
-                        if self.args.duration:
+                        cold_cases = family_cases(family, ['eq_c200_17','fetch_medium'])
+                        if self.args.cold_repeats and cold_cases:
+                            self.cold(suite,n,variant,[c for c in cases if c.id in cold_cases])
+                        if self.args.duration and family_cases(family, ['and2']):
                             self.concurrent(suite,n,variant,next(c for c in cases if c.id=='and2'))
-            if suite == 'scalar' and self.args.maintenance:
+            if suite == 'scalar' and self.args.maintenance and family_cases(family, AFTER_MAINTENANCE):
                 self.log(f'{suite} rows={n} family={family}: maintenance')
                 self.settings(family)
                 operations = [('insert',f'INSERT INTO fact {scalar_data(max(1,n//100),start=n+1)}'),
@@ -376,7 +389,7 @@ class Suite:
                         failed_operation = label
                         self.log(f'{suite} rows={n} family={family}: {label} failed; dependent maintenance checks skipped')
                         break
-                check = [by_id[name] for name in AFTER_MAINTENANCE]
+                check = [by_id[name] for name in family_cases(family, AFTER_MAINTENANCE)]
                 if failed_operation:
                     for variant in variants:
                         for case in check:
@@ -456,7 +469,7 @@ def parse_args(argv=None):
                    help='focused (default): relevant competitors and representative cases; full: legacy exhaustive matrix')
     p.add_argument('--rows',type=int,nargs='+',default=[1000000,5000000])
     p.add_argument('--documents',type=int,default=200000)
-    p.add_argument('--families',nargs='+',choices=FAMILIES,help='Default: btree gin roaring; full profile: all families. roaring also measures roaring_bitmap')
+    p.add_argument('--families',nargs='+',choices=FAMILIES,help='Default: btree gin roaring roaring_btree; full profile: all families. roaring also measures roaring_bitmap; roaring_btree (the roaring portfolio plus a B-tree on c1m) measures only the ordered_* cases')
     p.add_argument('--repeats',type=int,help='Timing rounds: focused 3, full 10')
     p.add_argument('--warmups',type=int,help='Warmups: focused 1, full 2')
     p.add_argument('--build-repeats',type=int,help='Build trials: focused 1, full 3')

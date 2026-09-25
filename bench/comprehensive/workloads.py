@@ -2,18 +2,19 @@
 
 def am_name(family):
     """Access method name for a benchmark family label (the roaring family's AM is 'lion')."""
-    return 'lion' if family == 'roaring' else family
+    return 'lion' if family in ('roaring', 'roaring_btree') else family
 from dataclasses import dataclass, asdict
 
 SCALAR_COLUMNS = ['c2', 'c20', 'c200', 'c20k', 'c1m', 'clustered', 'skew', 'nullable']
-FAMILIES = ['seq', 'btree', 'btree_tuned', 'hash', 'gin', 'gist', 'brin', 'roaring']
-FOCUSED_FAMILIES = ['btree', 'gin', 'roaring']
+FAMILIES = ['seq', 'btree', 'btree_tuned', 'hash', 'gin', 'gist', 'brin', 'roaring', 'roaring_btree']
+FOCUSED_FAMILIES = ['btree', 'gin', 'roaring', 'roaring_btree']
 FOCUSED_SCALAR = [
     'eq_c2_0', 'eq_c200_17', 'eq_c20k_123', 'eq_c1m_12345', 'eq_skew_0', 'eq_skew_17',
     'in_c20k_10', 'in_c20k_1000', 'and2', 'and3_selective', 'in_and', 'or_columns',
     'is_null', 'fetch_medium', 'range_random', 'ordered_limit',
     'fetch_c1m', 'fetch_rare', 'fetch_broad', 'fetch_and2', 'fetch_and3', 'fetch_in_and',
     'group_c2', 'group_c200', 'group_filtered',
+    'ordered_filter', 'ordered_filter_desc', 'ordered_broad',
 ]
 FOCUSED_DOCS = [
     'array_common', 'array_and', 'array_or', 'ts_common', 'ts_rare', 'ts_and',
@@ -25,6 +26,19 @@ LOW_MEMORY = ['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium']
 # thousands, and multi-predicate ANDs.  Low memory is where a plain index scan
 # (btree) and a lossy bitmap (lion, which has no amgettuple) part ways.
 LOW_MEMORY_FETCH = ['fetch_c1m', 'fetch_rare', 'fetch_and3']
+# A lion filter under ORDER BY a B-tree column with LIMIT (DESIGN.md §30, LionOrdered):
+# selective (c200 and c2, 0.25% of the rows), the same descending, and unselective
+# (c2 alone, half the rows), where the planner should keep core's ordered B-tree walk.
+ORDERED_CASES = ['ordered_filter', 'ordered_filter_desc', 'ordered_broad']
+# Families that measure only some cases: roaring_btree is the roaring portfolio plus a
+# B-tree on the sort column, there for the ordered cases alone (scalar suite only).
+FAMILY_CASES = {'roaring_btree': ORDERED_CASES}
+
+
+def family_cases(family, names):
+    """The case ids of names that family measures, in order."""
+    keep = FAMILY_CASES.get(family)
+    return [name for name in names if keep is None or name in keep]
 
 
 def profile_cases(suite, profile):
@@ -128,6 +142,9 @@ def scalar_cases():
               Case('range_clustered','range','SELECT count(*) FROM fact WHERE clustered BETWEEN 17 AND 26'),
               Case('range_broad','range','SELECT count(*) FROM fact WHERE c20k BETWEEN 100 AND 10000'),
               Case('ordered_limit','ordered_limit','SELECT c20k FROM fact WHERE c20k>=100 ORDER BY c20k LIMIT 100'),
+              Case('ordered_filter','ordered_filter','SELECT id,payload FROM fact WHERE c200=17 AND c2=1 ORDER BY c1m,id LIMIT 10'),
+              Case('ordered_filter_desc','ordered_filter','SELECT id,payload FROM fact WHERE c200=17 AND c2=1 ORDER BY c1m DESC,id DESC LIMIT 10'),
+              Case('ordered_broad','ordered_filter','SELECT id,payload FROM fact WHERE c2=1 ORDER BY c1m,id LIMIT 10'),
               Case('residual_filter','residual','SELECT count(*) FROM fact WHERE c200=17 AND length(payload)>60'),
               Case('count_distinct','distinct','SELECT count(DISTINCT c20k) FROM fact WHERE c200=17')]
     for col in ['c2','c20','c200','c20k','nullable']:
@@ -180,6 +197,9 @@ def index_specs(suite, family):
     if family=='seq':
         return []
     if suite=='scalar':
+        if family=='roaring_btree':
+            return index_specs(suite, 'roaring') + [
+                ('ix_c1m_btree', 'CREATE INDEX ix_c1m_btree ON fact USING btree (c1m)')]
         method='btree' if family=='btree_tuned' else family
         suffix=' WITH (fastupdate=on)' if family=='gin' else ' WITH (pages_per_range=32)' if family=='brin' else ''
         specs=[(f'ix_{c}',f'CREATE INDEX ix_{c} ON fact USING {am_name(method)} ({c}){suffix}') for c in SCALAR_COLUMNS]

@@ -6411,3 +6411,30 @@ DECLARE and the first FETCH do not appear either; VACUUM runs while it is paused
 and `ordered_serializable.spec` (the write-skew pair, both through the node: one of them fails).
 `make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
 orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
+
+### 30.10 Measured (2026-09-24, the vacuum slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
+
+One million rows of the benchmark's scalar table (`bench/comprehensive/workloads.py`,
+`scalar_data`, the columns the queries touch), lion indexes on `c2`, `c20`, `c200`, `c20k` and
+`c1m` and a btree on `c1m` beside them - the `roaring_btree` portfolio of the benchmark -,
+vacuumed and warm. The queries are the benchmark's `ordered_*` cases (`SELECT id, payload FROM
+fact WHERE ... ORDER BY c1m, id LIMIT 10`; the btree orders by `c1m` and an Incremental Sort above
+the scan breaks the ties by `id`). Median of 15 runs of `EXPLAIN (ANALYZE, TIMING OFF)`'s execution
+time, in ms; "default" is the plan with nothing disabled, the other columns force one path each
+(total cost of the plan in parentheses).
+
+| query | default | LionOrdered | core's ordered btree walk | lion bitmap + Sort |
+|---|---|---|---|---|
+| `ordered_filter` (`c200 = 17 AND c2 = 1`, 0.25%) | LionOrdered 0.47 | **0.51** (207) | 2.60 (430) | 4.87 (10,944) |
+| `ordered_filter_desc` (the same, `DESC`) | LionOrdered 0.55 | **0.61** (207) | 2.54 (430) | 4.41 (10,944) |
+| `ordered_broad` (`c2 = 1`, 50%) | btree walk 0.033 | 0.56 (4,442) | **0.032** (2.9) | 191 (38,531) |
+
+The node is 5x faster than the ordered walk and 8-9x faster than the bitmap and Sort for the
+selective filter, and the planner picks it; for the unselective one the ordered walk needs 21
+entries for 10 rows while the node first copies half a million TIDs (265 containers) out of lion,
+17x slower, and the planner keeps the walk. What the node did for `ordered_filter`: 4,636 btree
+entries walked, 23 members fetched for 10 rows - core's bitmap qual answers only `c200 = 17` (its
+`choose_bitmap_and()` judges `c2 = 1`'s set not worth its heap savings), so `c2 = 1` is the filter
+and half the members fail it (§30.8's "lion accesses core did not build"; ANDing `c2`'s set in
+would halve the fetches). Without a LIMIT the same query walks 999,767 entries to find all 5,165
+members, and the planner keeps the bitmap heap scan and Sort (5.5 ms).

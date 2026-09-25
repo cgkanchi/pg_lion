@@ -7,6 +7,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from workloads import family_cases
+
 
 def expected_configurations(meta, queries):
     """Derive coverage from the saved workload, not only from existing samples."""
@@ -20,29 +22,33 @@ def expected_configurations(meta, queries):
             if suite == 'documents' and family not in ['seq', 'gin', 'gist', 'roaring']:
                 continue
             variants = ['roaring', 'roaring_bitmap'] if family == 'roaring' else [family]
+            # A family may measure only some cases (workloads.FAMILY_CASES).
+            only = lambda names: family_cases(family, names)
             for variant in variants:
                 if 'matrix' in queries:
                     for config in queries['matrix'][suite]:
-                        for case in config['cases']:
+                        for case in only(config['cases']):
                             warm.add((suite, n, variant, config['phase'], config['mode'], config['memory'], case))
                     if suite == 'scalar' and args['cold_repeats']:
-                        for case in ['eq_c200_17', 'fetch_medium']:
+                        for case in only(['eq_c200_17', 'fetch_medium']):
                             cold.add((suite, n, variant, 'shared_buffers_cold', 'default', '64MB', case))
                     continue
                 for case in queries[suite]:
+                    if not only([case['id']]):
+                        continue
                     for mode in ['default', 'prefer_index']:
                         warm.add((suite, n, variant, 'clean', mode, '64MB', case['id']))
                         if suite == 'scalar' and case['stress']:
                             for phase in ['dirty_clustered_5pct', 'dirty_scattered']:
                                 warm.add((suite, n, variant, phase, mode, '64MB', case['id']))
                 if suite == 'scalar':
-                    for case in ['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium']:
+                    for case in only(['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium']):
                         warm.add((suite, n, variant, 'low_work_mem', 'prefer_index', '64kB', case))
                     if args['maintenance']:
-                        for case in ['eq_c200_17', 'and2', 'is_null', 'group_c200']:
+                        for case in only(['eq_c200_17', 'and2', 'is_null', 'group_c200']):
                             warm.add((suite, n, variant, 'after_maintenance', 'default', '64MB', case))
                     if args['cold_repeats']:
-                        for case in ['eq_c200_17', 'fetch_medium']:
+                        for case in only(['eq_c200_17', 'fetch_medium']):
                             cold.add((suite, n, variant, 'shared_buffers_cold', 'default', '64MB', case))
     return warm, cold
 

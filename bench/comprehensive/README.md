@@ -27,7 +27,7 @@ python3 bench/comprehensive/audit.py bench/results/my-comparison
 
 The runner needs only Python's standard library and the supplied PostgreSQL installation's libpq. Report charts require Matplotlib (`python3 -m pip install matplotlib` if it is not already available). The generated HTML is standalone and works locally without a web server or external scripts; the SVG figures are separate exportable artifacts as well.
 
-The focused default uses two scalar sizes (1,000,000 and 5,000,000 rows), 200,000 documents, **three timing rounds, one warmup, and one build per index**. It schedules **1,074 timings and 46 index builds**, versus **38,388 timings and 372 builds** in the current full profile: about **97% fewer timings and 88% fewer builds**. These are workload counts, not a measured wall-clock speedup; loads, correctness queries, and writes still cost time. Runtime at the default scales has not yet been measured for this profile.
+The focused default uses two scalar sizes (1,000,000 and 5,000,000 rows), 200,000 documents, **three timing rounds, one warmup, and one build per index**. It schedules **1,164 timings and 62 index builds**, versus **39,588 timings and 426 builds** in the current full profile: about **97% fewer timings and 85% fewer builds**. These are workload counts, not a measured wall-clock speedup; loads, correctness queries, and writes still cost time. Runtime at the default scales has not yet been measured for this profile.
 
 To reproduce the broader matrix deliberately:
 
