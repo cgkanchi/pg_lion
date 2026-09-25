@@ -1071,7 +1071,10 @@ extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,
  * pinned and still EXCLUSIVE-locked - it has never been unlocked since it was
  * allocated, so no reader can have copied the items it now holds before the
  * caller has finished with them (DESIGN.md §11, §22) - and the entry's `tail`
- * is updated in the same record.
+ * is updated in the same record.  Only `tail`: the record logs the entry as
+ * it is on entrybuf, because the counters in the caller's copy describe items
+ * that a LATER record places, and that record may never be written.  The
+ * caller's copy gets the new `tail` as well.
  *
  * nbtree and GIN both keep the root in place on a root split, and §22 needs
  * it for a second reason: `head` is the set's identity, so an entry never has

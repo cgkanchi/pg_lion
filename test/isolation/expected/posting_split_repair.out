@@ -1,6 +1,6 @@
 Parsed test spec with 1 sessions
 
-starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut c_delete c_vacuum c_check
+starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut c_delete c_vacuum c_check push_breaks d_cut push_works d_after_cut d_more d_check e_delete push_breaks e_cut push_works e_after_cut e_vacuum e_check
 injection_points_set_local
 --------------------------
                           
@@ -182,5 +182,105 @@ via_index|via_heap
 via_index|via_heap
 ---------+--------
     92568|   92568
+(1 row)
+
+step push_breaks: SELECT injection_points_attach('lion-posting-pushdown-child', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step d_cut: INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i;
+ERROR:  error triggered for injection point lion-posting-pushdown-child
+step push_works: SELECT injection_points_detach('lion-posting-pushdown-child');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step d_after_cut: 
+	SELECT posting_internal_pages FROM lion_index_stats('psr_push_k');
+	SELECT lion_index_verify('psr_push_k');
+
+posting_internal_pages
+----------------------
+                     1
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step d_more: INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i;
+step d_check: 
+	SELECT lion_index_verify('psr_push_k', true);
+	SELECT * FROM psr_counts('psr_push', 0);
+	SELECT * FROM psr_counts('psr_push', 1);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+via_index|via_heap
+---------+--------
+    10000|   10000
+(1 row)
+
+via_index|via_heap
+---------+--------
+    10000|   10000
+(1 row)
+
+step e_delete: DELETE FROM psr_vpush WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3);
+step push_breaks: SELECT injection_points_attach('lion-posting-pushdown-child', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step e_cut: VACUUM (INDEX_CLEANUP ON) psr_vpush;
+ERROR:  error triggered for injection point lion-posting-pushdown-child
+step push_works: SELECT injection_points_detach('lion-posting-pushdown-child');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step e_after_cut: 
+	SELECT posting_internal_pages FROM lion_index_stats('psr_vpush_k');
+	SELECT lion_index_verify('psr_vpush_k');
+
+posting_internal_pages
+----------------------
+                     2
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step e_vacuum: VACUUM (INDEX_CLEANUP ON) psr_vpush;
+step e_check: 
+	SELECT lion_index_verify('psr_vpush_k', true);
+	SELECT ntids = (SELECT count(*) FROM psr_vpush) AS ntids_agrees
+	  FROM lion_index_stats('psr_vpush_k');
+	SELECT * FROM psr_counts('psr_vpush', 1);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+ntids_agrees
+------------
+t           
+(1 row)
+
+via_index|via_heap
+---------+--------
+     4341|    4341
 (1 row)
 

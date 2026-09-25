@@ -3519,6 +3519,9 @@ Operations.
   that overflowed simply runs again at the same offset on the child - the root lock is dropped for
   that window, because the child's own split has to take the root to insert ITS downlink and buffer
   locks are not reentrant, which is safe precisely because writers of one key serialise.
+  The push-down's record carries the entry AS IT IS ON THE PAGE with only `tail` moved - not the
+  caller's copy, whose counters already count the items being placed, because those go onto the
+  child in the NEXT record, which can fail (2026-09-25 addendum below).
 - **VACUUM**: the leaves are visited in ckey order via right links exactly as before, with a cleanup
   lock on every one of them (§11); pass 2 starts by DESCENDING from `head` to the leftmost leaf,
   and the descent takes a cleanup lock on every page it passes, the root first
@@ -3880,6 +3883,20 @@ right half, which has no downlink, and (C) on the flagged left half. Each ends w
 and the index agreeing with the heap; before the fix A and B failed with "no downlink" and C
 crashed an assert build. `test/recovery/run.sh` phase 1d now appends after its real crash, which is
 the case it used to route around by inserting only into the middle of the heap.
+
+### §22 addendum: a root push-down logs the counters its page holds (2026-09-25)
+
+An insert adds its member to `ntids` in its private copy of the entry before placing it, and
+VACUUM's regrow subtracts the TIDs it filtered out of a container it has not written back yet. When
+the placement pushed a leaf root down, the push-down's record wrote that copy - the new `tail` and
+the new counters - while the items were placed by the NEXT record, the child's split, which
+allocates pages and can fail or be cut short by a crash. An ERROR at `lion-posting-pushdown-child`
+in between left verify() reporting "claims 9241 TIDs, but its containers hold 9240" after an
+insert, and "claims 4341 TIDs, but its containers hold 5307" after a VACUUM - and every later VACUUM
+subtracted the regrown container's dead TIDs once more, so the drift never healed. The push-down now
+logs the entry as it stands on the page with only `tail` moved; the counters travel with the record
+that places the items, as §5 has always said they must. `test/isolation/posting_split_repair.spec`
+cuts a push-down short (D) in an insert and (E) in VACUUM's regrow; both used to fail verify().
 
 ### §21 addendum: binary coercion requires the same equality function
 
