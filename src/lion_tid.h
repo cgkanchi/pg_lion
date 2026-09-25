@@ -19,8 +19,15 @@
  * expression, which is not a constant expression for the preprocessor.  Switch
  * on BLCKSZ instead (9 at 8K, 10 at 16K, 11 at 32K) and verify the real bound
  * with a static assertion.
+ *
+ * Below 8K the encoding would work, but a 4104-byte BITSET container is not
+ * an item any page of that size can hold (DESIGN.md §2; lion.h asserts the
+ * page capacity itself), so such a build is refused here, where every file
+ * sees it first.
  */
-#if BLCKSZ <= 8192
+#if BLCKSZ < 8192
+#error "pg_lion: BLCKSZ below 8192 is not supported (a BITSET container does not fit on a page)"
+#elif BLCKSZ == 8192
 #define LION_OFFSET_BITS 9
 #elif BLCKSZ <= 16384
 #define LION_OFFSET_BITS 10

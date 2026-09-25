@@ -32,6 +32,7 @@ Every heap TID is mapped to a 64-bit code and split into a container key and a 1
 
     LION_OFFSET_BITS      = 9 at BLCKSZ 8192 (MaxHeapTuplesPerPage = 291 < 512)
                            10 at 16K (585), 11 at 32K (1169)   -- computed at compile time, see lion_tid.h
+                           (BLCKSZ below 8192 does not compile: see the end of this section)
     code(tid)            = ((uint64) block << LION_OFFSET_BITS) | offset        -- 41 bits at 8K
     LION_CONTAINER_BITS   = 15
     ckey(code)           = code >> 15                                          -- uint32, block >> 6 at 8K
@@ -84,8 +85,14 @@ callbacks - may have changed anything.
 
 Why not GIN's 11 offset bits: bitset containers would be 86% empty. Why 15 container bits and not 16:
 a 16-bit bitset is 8192 bytes and cannot be a page item; 15 bits gives a 4096-byte bitset, so every
-container fits on any page, and VACUUM can always fall back to a bitset when a run split would
-otherwise grow a container past its slot.
+container fits on a page of PostgreSQL's default BLCKSZ or larger - a BITSET item is 4104 bytes plus
+its line pointer, against 8136 bytes of item space at 8K - and VACUUM can always fall back to a
+bitset when a run split would otherwise grow a container past its slot.
+*(The first version said "on any page". It does not hold below 8K: a 4K page has 4040 bytes of item
+space, and a build or an insert failed on the first BITSET. A BLCKSZ below 8192 is now refused at
+compile time, by an `#error` in lion_tid.h - the first header every file includes - and, as the
+property that refusal stands for, a static assertion in lion.h that
+`MAXALIGN(LION_CONTAINER_MAX_SIZE) + sizeof(ItemIdData) <= LION_PAGE_CAPACITY`. 2026-09-25 review.)*
 
 ## 3. Containers (module `lion_container.[ch]`, no backend dependencies beyond `c.h` + pg_bitutils)
 
@@ -107,14 +114,69 @@ Payloads (all little values are host-endian uint16/uint64, like every other PG o
 
 Representation policy
 - Insert into ARRAY beyond 2048 members ⇒ convert to BITSET. Insert into RUN that would exceed
-  1023 runs ⇒ convert to BITSET.
+  1023 runs ⇒ convert to ARRAY if the members, the new one included, fit one (≤ 2048), else BITSET.
 - Remove from BITSET leaving ≤ 2048 members ⇒ convert to ARRAY. Remove from RUN that would exceed
-  1023 runs (split) ⇒ convert to BITSET. Cardinality may reach 0; the caller deletes empty containers.
+  1023 runs (split) ⇒ the same: ARRAY if the members fit one, else BITSET, which the removal shrinks
+  to ARRAY if it can. Cardinality may reach 0; the caller deletes empty containers.
+  *(The RUN insert used to go straight to BITSET, 2026-09-25 review: 20 runs of 10 (a 90-byte RUN)
+  plus 1003 scattered inserts are 1023 runs of 1203 members, and the next isolated insert made a
+  4104-byte BITSET where a 2416-byte ARRAY holds the same - an ARRAY that fits is never larger than a
+  bitset - and the insert path does not optimize afterwards, so the bitset stayed, and a 4104-byte
+  item cannot share an 8K page with another. The split already ended as an ARRAY, through a bitset;
+  it now converts the same way the insert does.)*
 - `lion_container_optimize()` picks the smallest of the three representations. It is called at bulk
   build time for every container and by VACUUM after modifying a container. It is *not* called on
   every insert (inserts only enforce the size invariant), matching CRoaring's runOptimize semantics.
 - Mutators operate on a caller-supplied buffer of LION_CONTAINER_MAX_SIZE bytes. Page code copies a
   container out of the page into such a buffer, mutates, and writes it back (in place when it fits).
+  The one exception is **growth in place**: the hot-key insert (`lion_insert_container_inplace()`)
+  and its redo (`LION_OP_CONTAINER_ADD`, §25) call `lion_container_add()` on the page item itself,
+  whose allotted length is only its size plus slack. What they rely on, and all they rely on, is
+  that add() writes at most 2 bytes past the size of an ARRAY below 2048 members, 4 past a RUN below
+  1023 runs, and nothing past a BITSET, and never changes the representation of any of them; the
+  conversions above happen only at those limits, which the in-place path checks and refuses. The
+  sparse insert has the same shape: 6 bytes past a segment below 682 pairs (§13). Stated in
+  lion_container.h and lion_sparse.h, and tested on exact-size heap allocations (test/unit).
+
+**Damaged containers** (2026-09-25 review). A container read from disk is data, and a reader checks
+its header and its size (`lion_inline_fetch()`) - not its payload: `lion_container_check()` costs as
+much as using the container (0.8 us for a BITSET, a popcount of all 512 words, which is what an
+and-cardinality of two bitsets costs), and the count engine reads millions per query. The library
+used to trust the payload as far as its own buffers went, and a review found, with AddressSanitizer,
+three ways a container that passes the size check wrote outside one: an ARRAY member of 32768 or
+more indexed a bitset word past the 512th (65535 wrote 4 KB past a 4104-byte stack buffer), a run
+reaching past 32767 made `lion_container_to_array()` write past its 32768-entry output, and a BITSET
+whose header understated its members overflowed the 2048-entry array VACUUM's shrink-to-ARRAY
+extracts into. Every function is now memory-safe for ANY payload behind a header of a valid type,
+at the cost of a mask or a comparison where the payload meets an index:
+
+- bitset positions are masked into range (`lo & LION_LO_MASK`); a run's last value is clamped to
+  32767 and a run that starts past it is empty; a RUN is walked strictly ascending, skipping what an
+  earlier (overlapping) run covered, so no container ever yields more than 32768 values;
+- member and run counts are clamped to 2048 and 1023 wherever they size a loop, so nothing reads
+  more than LION_CONTAINER_MAX_SIZE bytes of a container whatever its header claims - which is what
+  makes VACUUM's work buffer, filled by the line pointer's length rather than the header's, safe -
+  and a mutator rewrites such a claim to what it uses before it starts, so what it leaves behind is
+  never larger than LION_CONTAINER_MAX_SIZE;
+- the header's cardinality is a claim, not a bound: an extraction into a fixed array is bounded by
+  the array, and a representation change the claim allows but the payload contradicts (to ARRAY,
+  from a BITSET that holds more than 2048 members) is not made, which leaves the container as damaged
+  as it was for verify() to report rather than silently shorter;
+- every lo value handed to a caller is below 32768, which the callers' per-block arrays rely on.
+
+For a well-formed container all of this is a no-op and every result is byte for byte what it was;
+for a damaged one the results are unspecified but deterministic, which WAL replay needs. Assert()
+states only the caller's side of a contract, never what a container's bytes say, so an
+assert-enabled build does not stop in the library on a damaged page either. Cost, in instructions
+(callgrind, -O2): and-cardinality and membership tests of every type pair within 0 - 8% of what
+they were (a RUN against a bitset pays six per run; against an ARRAY or a RUN nothing, because
+those merge loops only compare run ends and may take them unclamped), iteration one per ARRAY
+member, and materialising a 1000-member ARRAY 1800 against the 260 of the memcpy() it was. The
+unit tests feed every function hand-made and random damaged containers in exact-size heap buffers
+(test/unit, "damaged"), which a `-fsanitize=address` build checks to the byte. What remains the
+READER's job is the size check itself: a container used straight from a page must lie inside its
+item, as `lion_inline_fetch()` checks, because reading up to 4104 bytes from the start of a short
+item can leave the page.
 
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
@@ -1739,6 +1801,15 @@ Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contai
   container"); segment helpers live in `src/lion_sparse.[ch]` with their own standalone unit test
   (test/unit/sparse_test.c, `make unit`). Segments never grow while being filtered, so VACUUM's
   regrow path stays container-only.
+- Damaged segments are handled as §3 handles damaged containers (2026-09-25 review): every function
+  looks at `lion_sparse_npairs()` pairs - the header's count clamped to 682 - and finds `los[]` where
+  that many ckeys end, so a header claiming more never walks it past 4100 bytes, and a mutator
+  rewrites the claim first. The review's case was `lion_sparse_remove_if()`, whose `keep[682]` was
+  indexed by the header's count: VACUUM copies a page item into its work buffer by the line
+  pointer's length, not by the header, so a header claiming 1000 pairs wrote 318 bytes past the
+  array. `lion_sparse_extract()` builds its container with `lion_container_add()` rather than the
+  bulk builder, which is promised ascending, unique members that a damaged segment need not have
+  (the same bytes for a well-formed one, and at most three members).
 
 Expected effect: c20k 475 MB → ~125 MB, c1m 337 MB → ~170 MB (GIN: 157 / 199 MB).
 
@@ -3791,6 +3862,43 @@ output is in key order for an ordered opclass.
 EXPLAIN ANALYZE reports **Directory Pages Read**, the leaves and internal pages the node read, which
 is what `test/sql/directory.sql` uses to prove that a thousand-value IN list costs one pass over the
 leaves its values live on rather than a descent each.
+
+**A link read from a directory page is data, and a damaged one is an ERROR (INDEX_CORRUPTED), not a
+walk** (2026-09-25 review). verify() checks all of the above offline; a reader checks, per page it
+reads and at the cost of a comparison each, only what it would otherwise follow blindly:
+
+- a block number it is about to read is valid (`lion_dir_readbuf()`). InvalidBlockNumber is P_NEW,
+  and `ReadBuffer()` on PostgreSQL 16 to 18 EXTENDS the relation when asked for it: a root downlink
+  set to 0xFFFFFFFF made every SELECT and INSERT that descended through it grow the index by a block
+  before the page check refused the new, empty page. A block past the end needs no test of its own
+  (`ReadBuffer()` fails on it), and asking for the relation's size at every step of every descent
+  would cost a system call each;
+- an internal page has a downlink where the binary search points (`lion_dir_downlink_block()`): a
+  page with no data items made `lion_page_downlink()` answer one past maxoff, and the descent read a
+  line pointer past pd_lower;
+- a page reached through a downlink is exactly one level below the page holding it, and a right
+  sibling is at the page's own level (`lion_dir_check_level()`). A directory page never changes level
+  and is never freed, so this is exact rather than a heuristic, and it is what makes a descent
+  terminate: a downlink to the page itself, or to one above it, used to send it round for ever;
+- a non-rightmost page has the high key every reader takes as its first item without looking;
+- the parent's right sibling that `lion_dir_downlink_present()` reads during a split repair is a
+  directory page at the parent's level, like every other page this file reads; and
+- an entry's `attno` names a key column the index has before `lion_search_key_exact()` takes that
+  column's state, which `lion_column()` only Asserts: past the end of `ix->cols` the comparison would
+  have called whatever function pointers it found there.
+
+A block number past the end, a right-link cycle and a damaged key datum are not caught here: the
+first fails in `ReadBuffer()`, the second walks until it is cancelled, and the third is the same
+risk every index AM takes with its own keys. "Until it is cancelled" is new as well: every step of
+a descent and of an uncoupled walk right now checks for interrupts BETWEEN the pages, with no content
+lock held. It used to check just after locking the next page, where the lock holds interrupts off,
+so a descent round a cycle of downlinks (the third case of the test below, before the level check
+refused it) ignored statement_timeout and pg_terminate_backend() alike and only SIGKILL stopped it. (The lock-coupled steps through a prefix run that spans pages
+still hold a lock at every point; they are bounded by that run.) `test/sql/corrupt.sql` damages a
+freshly built index's root on disk in the first three ways and checks that queries and inserts fail
+with INDEX_CORRUPTED and leave the relation's size alone; against the code before this review the
+first grew the index by a block per statement, the second answered from a line pointer past
+pd_lower, and the third never returned.
 
 ### Planner
 
