@@ -1,0 +1,174 @@
+In file included from src/lion_wal.c:43:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/itup.h:18:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+In file included from src/lion_wal.c:53:
+In file included from src/lion.h:29:
+In file included from src/lion_wal.h:46:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: warning: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: note: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+src/lion_wal.c:503:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  503 |         memcpy(&hdr, b->ops.data + b->lastop, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:503:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  503 |         memcpy(&hdr, b->ops.data + b->lastop, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:507:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  507 |         memcpy(b->ops.data + b->lastop, &hdr, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:507:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  507 |         memcpy(b->ops.data + b->lastop, &hdr, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:526:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  526 |         memcpy(&hdr, b->ops.data + b->lastop, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:526:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  526 |         memcpy(&hdr, b->ops.data + b->lastop, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:528:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  528 |         memcpy(b->ops.data + b->lastop, &hdr, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:528:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  528 |         memcpy(b->ops.data + b->lastop, &hdr, SizeOfLionOp);
+      |         ^~~~~~
+src/lion_wal.c:565:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  565 |         memcpy(state->savebuf, PageGetItem(page, iid), len);
+      |         ^~~~~~
+src/lion_wal.c:565:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  565 |         memcpy(state->savebuf, PageGetItem(page, iid), len);
+      |         ^~~~~~
+src/lion_wal.c:607:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  607 |                 memset(state->savebuf + oldlen, 0, len - oldlen);
+      |                 ^~~~~~
+src/lion_wal.c:607:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  607 |                 memset(state->savebuf + oldlen, 0, len - oldlen);
+      |                 ^~~~~~
+src/lion_wal.c:876:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  876 |                 memcpy(&op, data + pos, SizeOfLionOp);
+      |                 ^~~~~~
+src/lion_wal.c:876:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  876 |                 memcpy(&op, data + pos, SizeOfLionOp);
+      |                 ^~~~~~
+src/lion_wal.c:896:6: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  896 |                                         memcpy(LionPageGetOpaque(page), payload,
+      |                                         ^~~~~~
+src/lion_wal.c:896:6: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  896 |                                         memcpy(LionPageGetOpaque(page), payload,
+      |                                         ^~~~~~
+src/lion_wal.c:905:5: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  905 |                                 memcpy(LionPageGetOpaque(page), payload,
+      |                                 ^~~~~~
+src/lion_wal.c:905:5: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  905 |                                 memcpy(LionPageGetOpaque(page), payload,
+      |                                 ^~~~~~
+src/lion_wal.c:928:7: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  928 |                                                 memcpy(&isz, payload + p, sizeof(uint16));
+      |                                                 ^~~~~~
+src/lion_wal.c:928:7: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  928 |                                                 memcpy(&isz, payload + p, sizeof(uint16));
+      |                                                 ^~~~~~
+src/lion_wal.c:986:7: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  986 |                                                 memcpy(target, PageGetItem(page, iid),
+      |                                                 ^~~~~~
+src/lion_wal.c:986:7: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  986 |                                                 memcpy(target, PageGetItem(page, iid),
+      |                                                 ^~~~~~
+src/lion_wal.c:989:8: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  989 |                                                         memset(target + oldlen, 0, newlen - oldlen);
+      |                                                         ^~~~~~
+src/lion_wal.c:989:8: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  989 |                                                         memset(target + oldlen, 0, newlen - oldlen);
+      |                                                         ^~~~~~
+src/lion_wal.c:999:7: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  999 |                                                 memcpy(&r, payload + p, SizeOfLionRange);
+      |                                                 ^~~~~~
+src/lion_wal.c:999:7: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  999 |                                                 memcpy(&r, payload + p, SizeOfLionRange);
+      |                                                 ^~~~~~
+src/lion_wal.c:1005:7: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1005 |                                                 memcpy(target + r.at, payload + p, r.len);
+      |                                                 ^~~~~~
+src/lion_wal.c:1005:7: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1005 |                                                 memcpy(target + r.at, payload + p, r.len);
+      |                                                 ^~~~~~
+src/lion_wal.c:1024:6: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1024 |                                         memcpy((char *) PageGetItem(page, iid) + op.aux, payload,
+      |                                         ^~~~~~
+src/lion_wal.c:1024:6: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1024 |                                         memcpy((char *) PageGetItem(page, iid) + op.aux, payload,
+      |                                         ^~~~~~
+src/lion_wal.c:1040:6: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1040 |                                         memcpy(offs, payload, op.len);
+      |                                         ^~~~~~
+src/lion_wal.c:1040:6: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1040 |                                         memcpy(offs, payload, op.len);
+      |                                         ^~~~~~
+src/lion_wal.c:1074:5: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1074 |                                 memcpy(LionPageGetMeta(page), payload, sizeof(LionMetaPageData));
+      |                                 ^~~~~~
+src/lion_wal.c:1074:5: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1074 |                                 memcpy(LionPageGetMeta(page), payload, sizeof(LionMetaPageData));
+      |                                 ^~~~~~
+src/lion_wal.c:1086:6: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1086 |                                         memcpy(&safexid, payload, sizeof(FullTransactionId));
+      |                                         ^~~~~~
+src/lion_wal.c:1086:6: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1086 |                                         memcpy(&safexid, payload, sizeof(FullTransactionId));
+      |                                         ^~~~~~
+src/lion_wal.c:1112:6: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1112 |                                         memcpy(&ckey, payload, sizeof(uint32));
+      |                                         ^~~~~~
+src/lion_wal.c:1112:6: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1112 |                                         memcpy(&ckey, payload, sizeof(uint32));
+      |                                         ^~~~~~
+src/lion_wal.c:1167:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1167 |                 memcpy(&v, data + i * SizeOfLionVisit, SizeOfLionVisit);
+      |                 ^~~~~~
+src/lion_wal.c:1167:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1167 |                 memcpy(&v, data + i * SizeOfLionVisit, SizeOfLionVisit);
+      |                 ^~~~~~
+src/lion_wal.c:1197:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1197 |         memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
+      |         ^~~~~~
+src/lion_wal.c:1197:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1197 |         memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
+      |         ^~~~~~
+src/lion_wal.c:1216:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1216 |                         memcpy(&rloc, p, sizeof(RelFileLocator));
+      |                         ^~~~~~
+src/lion_wal.c:1216:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1216 |                         memcpy(&rloc, p, sizeof(RelFileLocator));
+      |                         ^~~~~~
+src/lion_wal.c:1338:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1338 |         memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
+      |         ^~~~~~
+src/lion_wal.c:1338:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1338 |         memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
+      |         ^~~~~~
+src/lion_wal.c:1356:5: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1356 |                                 memcpy(&v, p + k * SizeOfLionVisit, SizeOfLionVisit);
+      |                                 ^~~~~~
+src/lion_wal.c:1356:5: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1356 |                                 memcpy(&v, p + k * SizeOfLionVisit, SizeOfLionVisit);
+      |                                 ^~~~~~
+src/lion_wal.c:1385:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1385 |                         memcpy(&op, data + pos, SizeOfLionOp);
+      |                         ^~~~~~
+src/lion_wal.c:1385:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1385 |                         memcpy(&op, data + pos, SizeOfLionOp);
+      |                         ^~~~~~
+src/lion_wal.c:1498:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1498 |                 memset((char *) page + start + len, MASK_MARKER, alen - len);
+      |                 ^~~~~~
+src/lion_wal.c:1498:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 1498 |                 memset((char *) page + start + len, MASK_MARKER, alen - len);
+      |                 ^~~~~~
+28 warnings generated.

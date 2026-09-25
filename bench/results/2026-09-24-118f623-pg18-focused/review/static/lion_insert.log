@@ -1,0 +1,174 @@
+In file included from src/lion_insert.c:69:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/generic_xlog.h:19:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xloginsert.h:18:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:271:10: warning: Out of bound access to memory preceding the field 'pd_linp' [alpha.security.ArrayBoundV2]
+  271 |         return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+      |                 ^
+src/lion_insert.c:1147:14: note: Assuming 'c' is < field 'ncolumns'
+ 1147 |         for (c = 0; c < ix->ncolumns; c++)
+      |                     ^~~~~~~~~~~~~~~~
+src/lion_insert.c:1147:2: note: Loop condition is true.  Entering loop body
+ 1147 |         for (c = 0; c < ix->ncolumns; c++)
+      |         ^
+src/lion_insert.c:1159:7: note: Assuming the condition is true
+ 1159 |                 if (isnull[c])
+      |                     ^~~~~~~~~
+src/lion_insert.c:1159:3: note: Taking true branch
+ 1159 |                 if (isnull[c])
+      |                 ^
+src/lion_insert.c:1160:4: note: Calling 'lion_insert_one'
+ 1160 |                         lion_insert_one(index, heapRel, state, (Datum) 0,
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1161 |                                                    LION_ENTRY_NULLKEY, ckey, lo);
+      |                                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_insert.c:1061:10: note: 'reservedflag' is not equal to 0
+ 1061 |         hash = (reservedflag != 0) ? LION_NULLKEY_HASH : lion_hash_key(state, key);
+      |                 ^~~~~~~~~~~~
+src/lion_insert.c:1061:9: note: '?' condition is true
+ 1061 |         hash = (reservedflag != 0) ? LION_NULLKEY_HASH : lion_hash_key(state, key);
+      |                ^
+src/lion_insert.c:1063:6: note: 'reservedflag' is equal to LION_ENTRY_NULLKEY
+ 1063 |         if (reservedflag == LION_ENTRY_NULLKEY)
+      |             ^~~~~~~~~~~~
+src/lion_insert.c:1063:2: note: Taking true branch
+ 1063 |         if (reservedflag == LION_ENTRY_NULLKEY)
+      |         ^
+src/lion_insert.c:1079:6: note: Assuming 'found' is true
+ 1079 |         if (!found)
+      |             ^~~~~~
+src/lion_insert.c:1079:2: note: Taking false branch
+ 1079 |         if (!found)
+      |         ^
+src/lion_insert.c:1090:7: note: Assuming the condition is false
+ 1090 |                 if ((entry->flags & LION_ENTRY_INLINE) != 0)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_insert.c:1090:3: note: Taking false branch
+ 1090 |                 if ((entry->flags & LION_ENTRY_INLINE) != 0)
+      |                 ^
+src/lion_insert.c:1094:4: note: Calling 'lion_insert_chain'
+ 1094 |                         lion_insert_chain(index, heaprel, leafbuf, entryoff, ckey, lo);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_insert.c:922:9: note: Assuming 'esize' is equal to field 'lp_len'
+  922 |         Assert(esize == ItemIdGetLength(iid));
+      |         ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_insert.c:922:2: note: Taking false branch
+  922 |         Assert(esize == ItemIdGetLength(iid));
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_insert.c:922:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_insert.c:923:9: note: Assuming the condition is true
+  923 |         Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
+      |         ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_insert.c:923:2: note: Taking false branch
+  923 |         Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_insert.c:923:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_insert.c:935:6: note: Assuming 'found' is false
+  935 |         if (found &&
+      |             ^~~~~
+src/lion_insert.c:935:12: note: Left side of '&&' is false
+  935 |         if (found &&
+      |                   ^
+src/lion_insert.c:951:7: note: 'found' is false
+  951 |         if (!found)
+      |              ^~~~~
+src/lion_insert.c:951:2: note: Taking true branch
+  951 |         if (!found)
+      |         ^
+src/lion_insert.c:961:7: note: Assuming 'off' is <= FirstOffsetNumber
+  961 |                 if (off > FirstOffsetNumber &&
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~
+src/lion_insert.c:961:31: note: Left side of '&&' is false
+  961 |                 if (off > FirstOffsetNumber &&
+      |                                             ^
+src/lion_insert.c:966:12: note: Assuming 'off' is <= 'maxoff'
+  966 |                 else if (off <= maxoff &&
+      |                          ^~~~~~~~~~~~~
+src/lion_insert.c:966:12: note: Left side of '&&' is true
+src/lion_insert.c:968:31: note: Calling 'PageGetItemId'
+  968 |                                                                           PageGetItem(cpage, PageGetItemId(cpage, off))))
+      |                                                                                              ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:271:10: note: Access of the field 'pd_linp' at negative byte offset -4
+  271 |         return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from src/lion_insert.c:77:
+In file included from src/lion.h:13:
+In file included from src/lion_compat.h:22:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tableam.h:20:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/relscan.h:17:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/htup_details.h:20:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+In file included from src/lion_insert.c:77:
+In file included from src/lion.h:29:
+In file included from src/lion_wal.h:46:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: warning: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: note: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+src/lion_insert.c:280:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  280 |                 memcpy(lion_segwork_buf(&w.seg), PageGetItem(page, iid), isize);
+      |                 ^~~~~~
+src/lion_insert.c:280:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  280 |                 memcpy(lion_segwork_buf(&w.seg), PageGetItem(page, iid), isize);
+      |                 ^~~~~~
+src/lion_insert.c:326:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  326 |         memcpy(dst, &buf.c, csize);
+      |         ^~~~~~
+src/lion_insert.c:326:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  326 |         memcpy(dst, &buf.c, csize);
+      |         ^~~~~~
+src/lion_insert.c:415:5: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  415 |                                 memcpy(lion_segwork_buf(&w.seg), cbuf, csize);
+      |                                 ^~~~~~
+src/lion_insert.c:415:5: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  415 |                                 memcpy(lion_segwork_buf(&w.seg), cbuf, csize);
+      |                                 ^~~~~~
+src/lion_insert.c:426:6: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  426 |                                         memcpy(out + used, w.items[i], isz);
+      |                                         ^~~~~~
+src/lion_insert.c:426:6: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  426 |                                         memcpy(out + used, w.items[i], isz);
+      |                                         ^~~~~~
+src/lion_insert.c:444:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  444 |                 memcpy(out + used, cbuf, csize);
+      |                 ^~~~~~
+src/lion_insert.c:444:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  444 |                 memcpy(out + used, cbuf, csize);
+      |                 ^~~~~~
+src/lion_insert.c:548:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  548 |         memcpy(oldpay, LionEntryGetPayload(entry), paylen);
+      |         ^~~~~~
+src/lion_insert.c:548:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  548 |         memcpy(oldpay, LionEntryGetPayload(entry), paylen);
+      |         ^~~~~~
+src/lion_insert.c:1020:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1020 |                 memcpy(cbuf, PageGetItem(cpage, ciid), ItemIdGetLength(ciid));
+      |                 ^~~~~~
+src/lion_insert.c:1020:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1020 |                 memcpy(cbuf, PageGetItem(cpage, ciid), ItemIdGetLength(ciid));
+      |                 ^~~~~~
+10 warnings generated.

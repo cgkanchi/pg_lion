@@ -1,0 +1,1816 @@
+In file included from src/lion_container.c:43:
+In file included from src/lion_container.h:20:
+In file included from src/lion_tid.h:12:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/htup_details.h:20:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+src/lion_container.c:96:18: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+   96 |         return (uint32) *(const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
+      |                         ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking true branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1802:9: note: Calling 'container_emit_result'
+ 1802 |         return container_emit_result(o, dest);
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1666:2: note: Calling 'lion_container_optimize'
+ 1666 |         lion_container_optimize(o);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:802:18: note: Calling 'container_count_runs'
+  802 |         uint32          nruns = container_count_runs(c);
+      |                                 ^~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:568:2: note: Control jumps to 'case LION_CT_RUN:'  at line 584
+  568 |         switch (c->type)
+      |         ^
+src/lion_container.c:585:11: note: Calling 'run_nruns'
+  585 |                         return run_nruns(c);
+      |                                ^~~~~~~~~~~~
+src/lion_container.c:96:18: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+   96 |         return (uint32) *(const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:103:2: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  103 |         *(uint16 *) ((char *) c + LION_CONTAINER_HDRSZ) = (uint16) nruns;
+      |         ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:11: note: Left side of '||' is false
+src/lion_container.c:1686:39: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                              ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:7: note: Taking false branch
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1703:11: note: Assuming field 'type' is equal to LION_CT_RUN
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                  ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1703:11: note: Left side of '&&' is true
+src/lion_container.c:1703:37: note: Assuming field 'type' is equal to LION_CT_RUN
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                                            ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1703:11: note: Left side of '&&' is true
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                  ^
+src/lion_container.c:1704:5: note: Calling 'run_and_run'
+ 1704 |                          run_and_run(a, b, o))
+      |                          ^~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1606:9: note: Assuming 'i' is >= 'na'
+ 1606 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1606:16: note: Left side of '&&' is false
+ 1606 |         while (i < na && j < nb)
+      |                       ^
+src/lion_container.c:1628:2: note: Calling 'run_set_nruns'
+ 1628 |         run_set_nruns(o, n);
+      |         ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:102:2: note: Taking false branch
+  102 |         Assert(nruns <= LION_RUN_MAX_NRUNS);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:102:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:103:2: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+  103 |         *(uint16 *) ((char *) c + LION_CONTAINER_HDRSZ) = (uint16) nruns;
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:176:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  176 |                 memset(&w[wlo + 1], 0xFF, (size_t) (whi - wlo - 1) * sizeof(uint64));
+      |                 ^~~~~~
+src/lion_container.c:176:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  176 |                 memset(&w[wlo + 1], 0xFF, (size_t) (whi - wlo - 1) * sizeof(uint64));
+      |                 ^~~~~~
+src/lion_container.c:194:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  194 |                 memset(&w[wlo + 1], 0x00, (size_t) (whi - wlo - 1) * sizeof(uint64));
+      |                 ^~~~~~
+src/lion_container.c:194:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  194 |                 memset(&w[wlo + 1], 0x00, (size_t) (whi - wlo - 1) * sizeof(uint64));
+      |                 ^~~~~~
+src/lion_container.c:241:17: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  241 |                 uint64          cur = w[i];
+      |                                       ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking true branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1802:9: note: Calling 'container_emit_result'
+ 1802 |         return container_emit_result(o, dest);
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1666:2: note: Calling 'lion_container_optimize'
+ 1666 |         lion_container_optimize(o);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:802:18: note: Calling 'container_count_runs'
+  802 |         uint32          nruns = container_count_runs(c);
+      |                                 ^~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:568:2: note: Control jumps to 'case LION_CT_BITSET:'  at line 582
+  568 |         switch (c->type)
+      |         ^
+src/lion_container.c:583:11: note: Calling 'bits_count_runs'
+  583 |                         return bits_count_runs(bitset_cdata(c));
+      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:239:2: note: Loop condition is true.  Entering loop body
+  239 |         for (i = 0; i < LION_BITSET_WORDS; i++)
+      |         ^
+src/lion_container.c:241:17: note: Access of 'buf.hdr' at index 1, while it holds only a single 'unsigned long' element
+  241 |                 uint64          cur = w[i];
+      |                                       ^~~~
+src/lion_container.c:285:17: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  285 |                 uint64          cur = w[i];
+      |                                       ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking true branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1802:9: note: Calling 'container_emit_result'
+ 1802 |         return container_emit_result(o, dest);
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1666:2: note: Calling 'lion_container_optimize'
+ 1666 |         lion_container_optimize(o);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:807:9: note: Assuming the condition is false
+  807 |         asz = (card <= LION_ARRAY_MAX_CARD)
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:807:8: note: '?' condition is false
+  807 |         asz = (card <= LION_ARRAY_MAX_CARD)
+      |               ^
+src/lion_container.c:810:8: note: '?' condition is true
+  810 |         rsz = (nruns <= LION_RUN_MAX_NRUNS)
+      |               ^
+src/lion_container.c:815:6: note: 'asz' is > 'rsz'
+  815 |         if (asz <= rsz && asz <= bsz)
+      |             ^~~
+src/lion_container.c:815:17: note: Left side of '&&' is false
+  815 |         if (asz <= rsz && asz <= bsz)
+      |                        ^
+src/lion_container.c:817:11: note: 'rsz' is <= 'bsz'
+  817 |         else if (rsz <= bsz)
+      |                  ^~~
+src/lion_container.c:817:7: note: Taking true branch
+  817 |         else if (rsz <= bsz)
+      |              ^
+src/lion_container.c:818:3: note: Calling 'container_make_run'
+  818 |                 container_make_run(c);
+      |                 ^~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:631:6: note: Assuming field 'type' is not equal to LION_CT_RUN
+  631 |         if (c->type == LION_CT_RUN)
+      |             ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:631:2: note: Taking false branch
+  631 |         if (c->type == LION_CT_RUN)
+      |         ^
+src/lion_container.c:633:6: note: Assuming field 'type' is equal to LION_CT_BITSET
+  633 |         if (c->type == LION_CT_BITSET)
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:633:2: note: Taking true branch
+  633 |         if (c->type == LION_CT_BITSET)
+      |         ^
+src/lion_container.c:634:7: note: Calling 'bits_extract_runs'
+  634 |                 n = bits_extract_runs(bitset_cdata(c), tmp, LION_RUN_MAX_NRUNS);
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:283:2: note: Loop condition is true.  Entering loop body
+  283 |         for (i = 0; i < LION_BITSET_WORDS; i++)
+      |         ^
+src/lion_container.c:285:17: note: Access of 'buf.hdr' at index 1, while it holds only a single 'unsigned long' element
+  285 |                 uint64          cur = w[i];
+      |                                       ^~~~
+src/lion_container.c:491:6: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  491 |                                         w[i] &= ~src[i];
+      |                                         ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is not equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking false branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1778:11: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1778:7: note: Taking false branch
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1798:3: note: Calling 'container_andnot_bitset'
+ 1798 |                 container_andnot_bitset(b, w);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:476:2: note: Control jumps to 'case LION_CT_BITSET:'  at line 486
+  476 |         switch (c->type)
+      |         ^
+src/lion_container.c:490:5: note: Loop condition is true.  Entering loop body
+  490 |                                 for (i = 0; i < LION_BITSET_WORDS; i++)
+      |                                 ^
+src/lion_container.c:491:6: note: Access of 'buf.hdr' at index 1, while it holds only a single 'unsigned long' element
+  491 |                                         w[i] &= ~src[i];
+      |                                         ^~~~
+src/lion_container.c:525:6: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  525 |                                         w[i] &= src[i];
+      |                                         ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:11: note: Left side of '||' is false
+src/lion_container.c:1686:39: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                              ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:7: note: Taking false branch
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1703:11: note: Assuming field 'type' is not equal to LION_CT_RUN
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                  ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1703:34: note: Left side of '&&' is false
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                                         ^
+src/lion_container.c:1713:3: note: Calling 'container_and_bitset'
+ 1713 |                 container_and_bitset(b, w);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:518:2: note: Control jumps to 'case LION_CT_BITSET:'  at line 520
+  518 |         switch (c->type)
+      |         ^
+src/lion_container.c:524:5: note: Loop condition is true.  Entering loop body
+  524 |                                 for (i = 0; i < LION_BITSET_WORDS; i++)
+      |                                 ^
+src/lion_container.c:525:6: note: Access of 'buf.hdr' at index 1, while it holds only a single 'unsigned long' element
+  525 |                                         w[i] &= src[i];
+      |                                         ^~~~
+src/lion_container.c:556:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  556 |                 memcpy(w, bitset_cdata(c), LION_BITSET_BYTES);
+      |                 ^~~~~~
+src/lion_container.c:556:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  556 |                 memcpy(w, bitset_cdata(c), LION_BITSET_BYTES);
+      |                 ^~~~~~
+src/lion_container.c:559:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  559 |                 memset(w, 0, LION_BITSET_BYTES);
+      |                 ^~~~~~
+src/lion_container.c:559:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  559 |                 memset(w, 0, LION_BITSET_BYTES);
+      |                 ^~~~~~
+src/lion_container.c:578:29: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  578 |                                         if (i == 0 || (uint32) arr[i] != (uint32) arr[i - 1] + 1)
+      |                                                                ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking true branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1802:9: note: Calling 'container_emit_result'
+ 1802 |         return container_emit_result(o, dest);
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1666:2: note: Calling 'lion_container_optimize'
+ 1666 |         lion_container_optimize(o);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:802:18: note: Calling 'container_count_runs'
+  802 |         uint32          nruns = container_count_runs(c);
+      |                                 ^~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:568:2: note: Control jumps to 'case LION_CT_ARRAY:'  at line 570
+  568 |         switch (c->type)
+      |         ^
+src/lion_container.c:577:17: note: Assuming 'i' is < 'n'
+  577 |                                 for (i = 0; i < n; i++)
+      |                                             ^~~~~
+src/lion_container.c:577:5: note: Loop condition is true.  Entering loop body
+  577 |                                 for (i = 0; i < n; i++)
+      |                                 ^
+src/lion_container.c:578:10: note: 'i' is equal to 0
+  578 |                                         if (i == 0 || (uint32) arr[i] != (uint32) arr[i - 1] + 1)
+      |                                             ^
+src/lion_container.c:578:17: note: Left side of '||' is true
+  578 |                                         if (i == 0 || (uint32) arr[i] != (uint32) arr[i - 1] + 1)
+      |                                                    ^
+src/lion_container.c:577:17: note: Assuming 'i' is < 'n'
+  577 |                                 for (i = 0; i < n; i++)
+      |                                             ^~~~~
+src/lion_container.c:577:5: note: Loop condition is true.  Entering loop body
+  577 |                                 for (i = 0; i < n; i++)
+      |                                 ^
+src/lion_container.c:578:10: note: 'i' is not equal to 0
+  578 |                                         if (i == 0 || (uint32) arr[i] != (uint32) arr[i - 1] + 1)
+      |                                             ^
+src/lion_container.c:578:10: note: Left side of '||' is false
+src/lion_container.c:578:29: note: Access of 'buf.hdr' at index 5, while it holds only 4 'unsigned short' elements
+  578 |                                         if (i == 0 || (uint32) arr[i] != (uint32) arr[i - 1] + 1)
+      |                                                                ^~~~~~
+src/lion_container.c:607:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  607 |         memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
+      |         ^~~~~~
+src/lion_container.c:607:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  607 |         memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
+      |         ^~~~~~
+src/lion_container.c:622:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  622 |         memcpy(array_mdata(c), tmp, (size_t) n * sizeof(uint16));
+      |         ^~~~~~
+src/lion_container.c:622:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  622 |         memcpy(array_mdata(c), tmp, (size_t) n * sizeof(uint16));
+      |         ^~~~~~
+src/lion_container.c:652:20: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+  652 |                                 tmp[n].start = arr[i];
+      |                                                ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking true branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1802:9: note: Calling 'container_emit_result'
+ 1802 |         return container_emit_result(o, dest);
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1666:2: note: Calling 'lion_container_optimize'
+ 1666 |         lion_container_optimize(o);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:807:9: note: Assuming the condition is false
+  807 |         asz = (card <= LION_ARRAY_MAX_CARD)
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:807:8: note: '?' condition is false
+  807 |         asz = (card <= LION_ARRAY_MAX_CARD)
+      |               ^
+src/lion_container.c:810:8: note: '?' condition is true
+  810 |         rsz = (nruns <= LION_RUN_MAX_NRUNS)
+      |               ^
+src/lion_container.c:815:6: note: 'asz' is > 'rsz'
+  815 |         if (asz <= rsz && asz <= bsz)
+      |             ^~~
+src/lion_container.c:815:17: note: Left side of '&&' is false
+  815 |         if (asz <= rsz && asz <= bsz)
+      |                        ^
+src/lion_container.c:817:11: note: 'rsz' is <= 'bsz'
+  817 |         else if (rsz <= bsz)
+      |                  ^~~
+src/lion_container.c:817:7: note: Taking true branch
+  817 |         else if (rsz <= bsz)
+      |              ^
+src/lion_container.c:818:3: note: Calling 'container_make_run'
+  818 |                 container_make_run(c);
+      |                 ^~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:631:6: note: Assuming field 'type' is not equal to LION_CT_RUN
+  631 |         if (c->type == LION_CT_RUN)
+      |             ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:631:2: note: Taking false branch
+  631 |         if (c->type == LION_CT_RUN)
+      |         ^
+src/lion_container.c:633:6: note: Assuming field 'type' is not equal to LION_CT_BITSET
+  633 |         if (c->type == LION_CT_BITSET)
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:633:2: note: Taking false branch
+  633 |         if (c->type == LION_CT_BITSET)
+      |         ^
+src/lion_container.c:642:15: note: Assuming 'i' is < 'card'
+  642 |                 for (i = 0; i < card; i++)
+      |                             ^~~~~~~~
+src/lion_container.c:642:3: note: Loop condition is true.  Entering loop body
+  642 |                 for (i = 0; i < card; i++)
+      |                 ^
+src/lion_container.c:644:8: note: 'i' is <= 0
+  644 |                         if (i > 0 && (uint32) arr[i] == (uint32) arr[i - 1] + 1)
+      |                             ^
+src/lion_container.c:644:14: note: Left side of '&&' is false
+  644 |                         if (i > 0 && (uint32) arr[i] == (uint32) arr[i - 1] + 1)
+      |                                   ^
+src/lion_container.c:650:4: note: Taking true branch
+  650 |                         if (n < LION_RUN_MAX_NRUNS)
+      |                         ^
+src/lion_container.c:652:20: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+  652 |                                 tmp[n].start = arr[i];
+      |                                                ^~~~~~
+src/lion_container.c:661:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  661 |         memcpy(run_mdata(c), tmp, (size_t) n * sizeof(LionRun));
+      |         ^~~~~~
+src/lion_container.c:661:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  661 |         memcpy(run_mdata(c), tmp, (size_t) n * sizeof(LionRun));
+      |         ^~~~~~
+src/lion_container.c:688:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  688 |                 memcpy(run_mdata(c), runs, (size_t) n * sizeof(LionRun));
+      |                 ^~~~~~
+src/lion_container.c:688:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  688 |                 memcpy(run_mdata(c), runs, (size_t) n * sizeof(LionRun));
+      |                 ^~~~~~
+src/lion_container.c:698:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  698 |                 memcpy(array_mdata(c), vals, (size_t) n * sizeof(uint16));
+      |                 ^~~~~~
+src/lion_container.c:698:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  698 |                 memcpy(array_mdata(c), vals, (size_t) n * sizeof(uint16));
+      |                 ^~~~~~
+src/lion_container.c:702:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  702 |         memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
+      |         ^~~~~~
+src/lion_container.c:702:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  702 |         memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
+      |         ^~~~~~
+src/lion_container.c:854:5: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  854 |                                 memmove(&runs[idx + 1], &runs[idx + 2],
+      |                                 ^~~~~~~
+src/lion_container.c:854:5: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  854 |                                 memmove(&runs[idx + 1], &runs[idx + 2],
+      |                                 ^~~~~~~
+src/lion_container.c:880:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  880 |         memmove(&runs[idx + 2], &runs[idx + 1],
+      |         ^~~~~~~
+src/lion_container.c:880:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  880 |         memmove(&runs[idx + 2], &runs[idx + 1],
+      |         ^~~~~~~
+src/lion_container.c:909:3: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  909 |                 memmove(&runs[idx], &runs[idx + 1],
+      |                 ^~~~~~~
+src/lion_container.c:909:3: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  909 |                 memmove(&runs[idx], &runs[idx + 1],
+      |                 ^~~~~~~
+src/lion_container.c:933:3: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  933 |                 memmove(&runs[idx + 2], &runs[idx + 1],
+      |                 ^~~~~~~
+src/lion_container.c:933:3: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  933 |                 memmove(&runs[idx + 2], &runs[idx + 1],
+      |                 ^~~~~~~
+src/lion_container.c:966:5: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  966 |                                 memmove(&arr[pos + 1], &arr[pos],
+      |                                 ^~~~~~~
+src/lion_container.c:966:5: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  966 |                                 memmove(&arr[pos + 1], &arr[pos],
+      |                                 ^~~~~~~
+src/lion_container.c:1005:5: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1005 |                                 memmove(&arr[pos], &arr[pos + 1],
+      |                                 ^~~~~~~
+src/lion_container.c:1005:5: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+ 1005 |                                 memmove(&arr[pos], &arr[pos + 1],
+      |                                 ^~~~~~~
+src/lion_container.c:1139:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1139 |                         memcpy(out, array_cdata(c), (size_t) n * sizeof(uint16));
+      |                         ^~~~~~
+src/lion_container.c:1139:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1139 |                         memcpy(out, array_cdata(c), (size_t) n * sizeof(uint16));
+      |                         ^~~~~~
+src/lion_container.c:1232:5: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1232 |                                 memset(w, 0, LION_BITSET_BYTES);
+      |                                 ^~~~~~
+src/lion_container.c:1232:5: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 1232 |                                 memset(w, 0, LION_BITSET_BYTES);
+      |                                 ^~~~~~
+src/lion_container.c:1323:6: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1323 |                                         memmove(&arr[from], &arr[to],
+      |                                         ^~~~~~~
+src/lion_container.c:1323:6: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+ 1323 |                                         memmove(&arr[from], &arr[to],
+      |                                         ^~~~~~~
+src/lion_container.c:1397:5: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1397 |                                 memmove(&runs[i + nrepl], &runs[j + 1],
+      |                                 ^~~~~~~
+src/lion_container.c:1397:5: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+ 1397 |                                 memmove(&runs[i + nrepl], &runs[j + 1],
+      |                                 ^~~~~~~
+src/lion_container.c:1444:5: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1444 |                                 out[n++] = small[i];
+      |                                 ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:36: note: Left side of '||' is true
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                           ^
+src/lion_container.c:1688:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                                ^
+src/lion_container.c:1688:30: note: '?' condition is true
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                            ^
+src/lion_container.c:1689:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                                ^
+src/lion_container.c:1689:30: note: '?' condition is true
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                            ^
+src/lion_container.c:1693:7: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1693:3: note: Taking true branch
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1694:8: note: Calling 'array_intersect'
+ 1694 |                         n = array_intersect(array_cdata(a), a->cardinality,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1695 |                                                                 array_cdata(b), b->cardinality, out);
+      |                                                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1430:6: note: Assuming the condition is true
+ 1430 |         if (na > nb * 8 || nb > na * 8)
+      |             ^~~~~~~~~~~
+src/lion_container.c:1430:18: note: Left side of '||' is true
+ 1430 |         if (na > nb * 8 || nb > na * 8)
+      |                         ^
+src/lion_container.c:1432:26: note: Assuming 'na' is > 'nb'
+ 1432 |                 const uint16 *small = (na <= nb) ? a : b;
+      |                                        ^~~~~~~~
+src/lion_container.c:1432:25: note: '?' condition is false
+ 1432 |                 const uint16 *small = (na <= nb) ? a : b;
+      |                                       ^
+src/lion_container.c:1433:26: note: 'na' is > 'nb'
+ 1433 |                 const uint16 *large = (na <= nb) ? b : a;
+      |                                        ^~
+src/lion_container.c:1433:25: note: '?' condition is false
+ 1433 |                 const uint16 *large = (na <= nb) ? b : a;
+      |                                       ^
+src/lion_container.c:1434:21: note: 'na' is > 'nb'
+ 1434 |                 uint32          nsmall = (na <= nb) ? na : nb;
+      |                                           ^~
+src/lion_container.c:1434:20: note: '?' condition is false
+ 1434 |                 uint32          nsmall = (na <= nb) ? na : nb;
+      |                                          ^
+src/lion_container.c:1435:21: note: 'na' is > 'nb'
+ 1435 |                 uint32          nlarge = (na <= nb) ? nb : na;
+      |                                           ^~
+src/lion_container.c:1435:20: note: '?' condition is false
+ 1435 |                 uint32          nlarge = (na <= nb) ? nb : na;
+      |                                          ^
+src/lion_container.c:1438:15: note: 'i' is < 'nsmall'
+ 1438 |                 for (i = 0; i < nsmall; i++)
+      |                             ^
+src/lion_container.c:1438:3: note: Loop condition is true.  Entering loop body
+ 1438 |                 for (i = 0; i < nsmall; i++)
+      |                 ^
+src/lion_container.c:1441:8: note: Assuming 'li' is < 'nlarge'
+ 1441 |                         if (li >= nlarge)
+      |                             ^~~~~~~~~~~~
+src/lion_container.c:1441:4: note: Taking false branch
+ 1441 |                         if (li >= nlarge)
+      |                         ^
+src/lion_container.c:1443:8: note: Assuming the condition is true
+ 1443 |                         if (large[li] == small[i])
+      |                             ^~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1443:4: note: Taking true branch
+ 1443 |                         if (large[li] == small[i])
+      |                         ^
+src/lion_container.c:1444:5: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1444 |                                 out[n++] = small[i];
+      |                                 ^~~~~~~~
+src/lion_container.c:1457:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1457 |                         out[n++] = a[i];
+      |                         ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:36: note: Left side of '||' is true
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                           ^
+src/lion_container.c:1688:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                                ^
+src/lion_container.c:1688:30: note: '?' condition is true
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                            ^
+src/lion_container.c:1689:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                                ^
+src/lion_container.c:1689:30: note: '?' condition is true
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                            ^
+src/lion_container.c:1693:7: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1693:3: note: Taking true branch
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1694:8: note: Calling 'array_intersect'
+ 1694 |                         n = array_intersect(array_cdata(a), a->cardinality,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1695 |                                                                 array_cdata(b), b->cardinality, out);
+      |                                                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1430:6: note: Assuming the condition is false
+ 1430 |         if (na > nb * 8 || nb > na * 8)
+      |             ^~~~~~~~~~~
+src/lion_container.c:1430:6: note: Left side of '||' is false
+src/lion_container.c:1430:21: note: Assuming the condition is false
+ 1430 |         if (na > nb * 8 || nb > na * 8)
+      |                            ^~~~~~~~~~~
+src/lion_container.c:1430:2: note: Taking false branch
+ 1430 |         if (na > nb * 8 || nb > na * 8)
+      |         ^
+src/lion_container.c:1449:9: note: 'i' is < 'na'
+ 1449 |         while (i < na && j < nb)
+      |                ^
+src/lion_container.c:1449:9: note: Left side of '&&' is true
+src/lion_container.c:1449:19: note: 'j' is < 'nb'
+ 1449 |         while (i < na && j < nb)
+      |                          ^
+src/lion_container.c:1449:2: note: Loop condition is true.  Entering loop body
+ 1449 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1451:7: note: Assuming the condition is false
+ 1451 |                 if (a[i] < b[j])
+      |                     ^~~~~~~~~~~
+src/lion_container.c:1451:3: note: Taking false branch
+ 1451 |                 if (a[i] < b[j])
+      |                 ^
+src/lion_container.c:1453:12: note: Assuming the condition is false
+ 1453 |                 else if (a[i] > b[j])
+      |                          ^~~~~~~~~~~
+src/lion_container.c:1453:8: note: Taking false branch
+ 1453 |                 else if (a[i] > b[j])
+      |                      ^
+src/lion_container.c:1457:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1457 |                         out[n++] = a[i];
+      |                         ^~~~~~~~
+src/lion_container.c:1476:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1476 |                         out[n++] = a[i++];
+      |                         ^
+src/lion_container.c:1727:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1727 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1727:2: note: Taking false branch
+ 1727 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1727:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1730:6: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+src/lion_container.c:1730:34: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^
+src/lion_container.c:1731:3: note: Assuming the condition is true
+ 1731 |                 (uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:2: note: Taking true branch
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |         ^
+src/lion_container.c:1733:15: note: Calling 'array_union'
+ 1733 |                 uint32          n = array_union(array_cdata(a), a->cardinality,
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1734 |                                                                         array_cdata(b), b->cardinality,
+      |                                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1735 |                                                                         array_mdata(o));
+      |                                                                         ~~~~~~~~~~~~~~~
+src/lion_container.c:1473:9: note: Assuming 'i' is < 'na'
+ 1473 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1473:9: note: Left side of '&&' is true
+src/lion_container.c:1473:19: note: Assuming 'j' is < 'nb'
+ 1473 |         while (i < na && j < nb)
+      |                          ^~~~~~
+src/lion_container.c:1473:2: note: Loop condition is true.  Entering loop body
+ 1473 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1475:7: note: Assuming the condition is true
+ 1475 |                 if (a[i] < b[j])
+      |                     ^~~~~~~~~~~
+src/lion_container.c:1475:3: note: Taking true branch
+ 1475 |                 if (a[i] < b[j])
+      |                 ^
+src/lion_container.c:1476:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1476 |                         out[n++] = a[i++];
+      |                         ^~~~~~~~
+src/lion_container.c:1478:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1478 |                         out[n++] = b[j++];
+      |                         ^
+src/lion_container.c:1727:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1727 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1727:2: note: Taking false branch
+ 1727 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1727:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1730:6: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+src/lion_container.c:1730:34: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^
+src/lion_container.c:1731:3: note: Assuming the condition is true
+ 1731 |                 (uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:2: note: Taking true branch
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |         ^
+src/lion_container.c:1733:15: note: Calling 'array_union'
+ 1733 |                 uint32          n = array_union(array_cdata(a), a->cardinality,
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1734 |                                                                         array_cdata(b), b->cardinality,
+      |                                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1735 |                                                                         array_mdata(o));
+      |                                                                         ~~~~~~~~~~~~~~~
+src/lion_container.c:1473:9: note: Assuming 'i' is < 'na'
+ 1473 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1473:9: note: Left side of '&&' is true
+src/lion_container.c:1473:19: note: Assuming 'j' is < 'nb'
+ 1473 |         while (i < na && j < nb)
+      |                          ^~~~~~
+src/lion_container.c:1473:2: note: Loop condition is true.  Entering loop body
+ 1473 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1475:7: note: Assuming the condition is false
+ 1475 |                 if (a[i] < b[j])
+      |                     ^~~~~~~~~~~
+src/lion_container.c:1475:3: note: Taking false branch
+ 1475 |                 if (a[i] < b[j])
+      |                 ^
+src/lion_container.c:1477:12: note: Assuming the condition is true
+ 1477 |                 else if (a[i] > b[j])
+      |                          ^~~~~~~~~~~
+src/lion_container.c:1477:8: note: Taking true branch
+ 1477 |                 else if (a[i] > b[j])
+      |                      ^
+src/lion_container.c:1478:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1478 |                         out[n++] = b[j++];
+      |                         ^~~~~~~~
+src/lion_container.c:1481:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1481 |                         out[n++] = a[i++];
+      |                         ^
+src/lion_container.c:1727:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1727 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1727:2: note: Taking false branch
+ 1727 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1727:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1730:6: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+src/lion_container.c:1730:34: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^
+src/lion_container.c:1731:3: note: Assuming the condition is true
+ 1731 |                 (uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:2: note: Taking true branch
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |         ^
+src/lion_container.c:1733:15: note: Calling 'array_union'
+ 1733 |                 uint32          n = array_union(array_cdata(a), a->cardinality,
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1734 |                                                                         array_cdata(b), b->cardinality,
+      |                                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1735 |                                                                         array_mdata(o));
+      |                                                                         ~~~~~~~~~~~~~~~
+src/lion_container.c:1473:9: note: Assuming 'i' is < 'na'
+ 1473 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1473:9: note: Left side of '&&' is true
+src/lion_container.c:1473:19: note: Assuming 'j' is < 'nb'
+ 1473 |         while (i < na && j < nb)
+      |                          ^~~~~~
+src/lion_container.c:1473:2: note: Loop condition is true.  Entering loop body
+ 1473 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1475:7: note: Assuming the condition is false
+ 1475 |                 if (a[i] < b[j])
+      |                     ^~~~~~~~~~~
+src/lion_container.c:1475:3: note: Taking false branch
+ 1475 |                 if (a[i] < b[j])
+      |                 ^
+src/lion_container.c:1477:12: note: Assuming the condition is false
+ 1477 |                 else if (a[i] > b[j])
+      |                          ^~~~~~~~~~~
+src/lion_container.c:1477:8: note: Taking false branch
+ 1477 |                 else if (a[i] > b[j])
+      |                      ^
+src/lion_container.c:1481:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1481 |                         out[n++] = a[i++];
+      |                         ^~~~~~~~
+src/lion_container.c:1486:3: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1486 |                 out[n++] = a[i++];
+      |                 ^
+src/lion_container.c:1727:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1727 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1727:2: note: Taking false branch
+ 1727 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1727:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1730:6: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+src/lion_container.c:1730:34: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^
+src/lion_container.c:1731:3: note: Assuming the condition is true
+ 1731 |                 (uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:2: note: Taking true branch
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |         ^
+src/lion_container.c:1733:15: note: Calling 'array_union'
+ 1733 |                 uint32          n = array_union(array_cdata(a), a->cardinality,
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1734 |                                                                         array_cdata(b), b->cardinality,
+      |                                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1735 |                                                                         array_mdata(o));
+      |                                                                         ~~~~~~~~~~~~~~~
+src/lion_container.c:1473:9: note: Assuming 'i' is < 'na'
+ 1473 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1473:9: note: Left side of '&&' is true
+src/lion_container.c:1473:19: note: Assuming 'j' is >= 'nb'
+ 1473 |         while (i < na && j < nb)
+      |                          ^~~~~~
+src/lion_container.c:1473:2: note: Loop condition is false. Execution continues on line 1485
+ 1473 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1485:9: note: 'i' is < 'na'
+ 1485 |         while (i < na)
+      |                ^
+src/lion_container.c:1485:2: note: Loop condition is true.  Entering loop body
+ 1485 |         while (i < na)
+      |         ^
+src/lion_container.c:1486:3: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1486 |                 out[n++] = a[i++];
+      |                 ^~~~~~~~
+src/lion_container.c:1488:3: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1488 |                 out[n++] = b[j++];
+      |                 ^
+src/lion_container.c:1727:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1727 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1727:2: note: Taking false branch
+ 1727 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1727:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1730:6: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+src/lion_container.c:1730:34: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:6: note: Left side of '&&' is true
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |             ^
+src/lion_container.c:1731:3: note: Assuming the condition is true
+ 1731 |                 (uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1730:2: note: Taking true branch
+ 1730 |         if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+      |         ^
+src/lion_container.c:1733:15: note: Calling 'array_union'
+ 1733 |                 uint32          n = array_union(array_cdata(a), a->cardinality,
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1734 |                                                                         array_cdata(b), b->cardinality,
+      |                                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1735 |                                                                         array_mdata(o));
+      |                                                                         ~~~~~~~~~~~~~~~
+src/lion_container.c:1473:9: note: Assuming 'i' is >= 'na'
+ 1473 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1473:16: note: Left side of '&&' is false
+ 1473 |         while (i < na && j < nb)
+      |                       ^
+src/lion_container.c:1485:2: note: Loop condition is false. Execution continues on line 1487
+ 1485 |         while (i < na)
+      |         ^
+src/lion_container.c:1487:9: note: Assuming 'j' is < 'nb'
+ 1487 |         while (j < nb)
+      |                ^~~~~~
+src/lion_container.c:1487:2: note: Loop condition is true.  Entering loop body
+ 1487 |         while (j < nb)
+      |         ^
+src/lion_container.c:1488:3: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1488 |                 out[n++] = b[j++];
+      |                 ^~~~~~~~
+src/lion_container.c:1504:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1504 |                         out[n++] = a[i++];
+      |                         ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is not equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking false branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1778:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1778:7: note: Taking true branch
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1783:7: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1783:3: note: Taking true branch
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1784:8: note: Calling 'array_difference'
+ 1784 |                         n = array_difference(array_cdata(a), a->cardinality,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1785 |                                                                  array_cdata(b), b->cardinality, out);
+      |                                                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1501:9: note: 'i' is < 'na'
+ 1501 |         while (i < na && j < nb)
+      |                ^
+src/lion_container.c:1501:9: note: Left side of '&&' is true
+src/lion_container.c:1501:19: note: 'j' is < 'nb'
+ 1501 |         while (i < na && j < nb)
+      |                          ^
+src/lion_container.c:1501:2: note: Loop condition is true.  Entering loop body
+ 1501 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1503:7: note: Assuming the condition is true
+ 1503 |                 if (a[i] < b[j])
+      |                     ^~~~~~~~~~~
+src/lion_container.c:1503:3: note: Taking true branch
+ 1503 |                 if (a[i] < b[j])
+      |                 ^
+src/lion_container.c:1504:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1504 |                         out[n++] = a[i++];
+      |                         ^~~~~~~~
+src/lion_container.c:1514:3: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1514 |                 out[n++] = a[i++];
+      |                 ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is not equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking false branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1778:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1778:7: note: Taking true branch
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1783:7: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1783:3: note: Taking true branch
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1784:8: note: Calling 'array_difference'
+ 1784 |                         n = array_difference(array_cdata(a), a->cardinality,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1785 |                                                                  array_cdata(b), b->cardinality, out);
+      |                                                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1501:9: note: 'i' is < 'na'
+ 1501 |         while (i < na && j < nb)
+      |                ^
+src/lion_container.c:1501:9: note: Left side of '&&' is true
+src/lion_container.c:1501:19: note: 'j' is < 'nb'
+ 1501 |         while (i < na && j < nb)
+      |                          ^
+src/lion_container.c:1501:2: note: Loop condition is true.  Entering loop body
+ 1501 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1503:7: note: Assuming the condition is false
+ 1503 |                 if (a[i] < b[j])
+      |                     ^~~~~~~~~~~
+src/lion_container.c:1503:3: note: Taking false branch
+ 1503 |                 if (a[i] < b[j])
+      |                 ^
+src/lion_container.c:1505:12: note: Assuming the condition is true
+ 1505 |                 else if (a[i] > b[j])
+      |                          ^~~~~~~~~~~
+src/lion_container.c:1505:8: note: Taking true branch
+ 1505 |                 else if (a[i] > b[j])
+      |                      ^
+src/lion_container.c:1501:9: note: 'i' is < 'na'
+ 1501 |         while (i < na && j < nb)
+      |                ^
+src/lion_container.c:1501:9: note: Left side of '&&' is true
+src/lion_container.c:1501:19: note: Assuming 'j' is >= 'nb'
+ 1501 |         while (i < na && j < nb)
+      |                          ^~~~~~
+src/lion_container.c:1501:2: note: Loop condition is false. Execution continues on line 1513
+ 1501 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1513:9: note: 'i' is < 'na'
+ 1513 |         while (i < na)
+      |                ^
+src/lion_container.c:1513:2: note: Loop condition is true.  Entering loop body
+ 1513 |         while (i < na)
+      |         ^
+src/lion_container.c:1514:3: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1514 |                 out[n++] = a[i++];
+      |                 ^~~~~~~~
+src/lion_container.c:1535:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1535 |                         out[n++] = arr[i++];
+      |                         ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:36: note: Left side of '||' is true
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                           ^
+src/lion_container.c:1688:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                                ^
+src/lion_container.c:1688:30: note: '?' condition is true
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                            ^
+src/lion_container.c:1689:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                                ^
+src/lion_container.c:1689:30: note: '?' condition is true
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                            ^
+src/lion_container.c:1693:7: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1693:3: note: Taking false branch
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1696:12: note: Assuming field 'type' is not equal to LION_CT_BITSET
+ 1696 |                 else if (oth->type == LION_CT_BITSET)
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1696:8: note: Taking false branch
+ 1696 |                 else if (oth->type == LION_CT_BITSET)
+      |                      ^
+src/lion_container.c:1700:8: note: Calling 'array_and_run'
+ 1700 |                         n = array_and_run(array_cdata(arr), arr->cardinality, oth, out);
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1528:9: note: 'i' is < 'na'
+ 1528 |         while (i < na && j < nruns)
+      |                ^
+src/lion_container.c:1528:9: note: Left side of '&&' is true
+src/lion_container.c:1528:19: note: Assuming 'j' is < 'nruns'
+ 1528 |         while (i < na && j < nruns)
+      |                          ^~~~~~~~~
+src/lion_container.c:1528:2: note: Loop condition is true.  Entering loop body
+ 1528 |         while (i < na && j < nruns)
+      |         ^
+src/lion_container.c:1530:7: note: Assuming the condition is false
+ 1530 |                 if ((int32) arr[i] < (int32) runs[j].start)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1530:3: note: Taking false branch
+ 1530 |                 if ((int32) arr[i] < (int32) runs[j].start)
+      |                 ^
+src/lion_container.c:1532:12: note: Assuming the condition is false
+ 1532 |                 else if ((int32) arr[i] > run_last(&runs[j]))
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1532:8: note: Taking false branch
+ 1532 |                 else if ((int32) arr[i] > run_last(&runs[j]))
+      |                      ^
+src/lion_container.c:1535:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1535 |                         out[n++] = arr[i++];
+      |                         ^~~~~~~~
+src/lion_container.c:1553:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1553 |                         out[n++] = arr[i++];
+      |                         ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is not equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking false branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1778:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1778:7: note: Taking true branch
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1783:7: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1783:3: note: Taking false branch
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1786:12: note: Assuming field 'type' is not equal to LION_CT_BITSET
+ 1786 |                 else if (b->type == LION_CT_BITSET)
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1786:8: note: Taking false branch
+ 1786 |                 else if (b->type == LION_CT_BITSET)
+      |                      ^
+src/lion_container.c:1790:8: note: Calling 'array_andnot_run'
+ 1790 |                         n = array_andnot_run(array_cdata(a), a->cardinality, b, out);
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1550:9: note: 'i' is < 'na'
+ 1550 |         while (i < na && j < nruns)
+      |                ^
+src/lion_container.c:1550:9: note: Left side of '&&' is true
+src/lion_container.c:1550:19: note: Assuming 'j' is < 'nruns'
+ 1550 |         while (i < na && j < nruns)
+      |                          ^~~~~~~~~
+src/lion_container.c:1550:2: note: Loop condition is true.  Entering loop body
+ 1550 |         while (i < na && j < nruns)
+      |         ^
+src/lion_container.c:1552:7: note: Assuming the condition is true
+ 1552 |                 if ((int32) arr[i] < (int32) runs[j].start)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1552:3: note: Taking true branch
+ 1552 |                 if ((int32) arr[i] < (int32) runs[j].start)
+      |                 ^
+src/lion_container.c:1553:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1553 |                         out[n++] = arr[i++];
+      |                         ^~~~~~~~
+src/lion_container.c:1560:3: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1560 |                 out[n++] = arr[i++];
+      |                 ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is not equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking false branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1778:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1778:7: note: Taking true branch
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1783:7: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1783:3: note: Taking false branch
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1786:12: note: Assuming field 'type' is not equal to LION_CT_BITSET
+ 1786 |                 else if (b->type == LION_CT_BITSET)
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1786:8: note: Taking false branch
+ 1786 |                 else if (b->type == LION_CT_BITSET)
+      |                      ^
+src/lion_container.c:1790:8: note: Calling 'array_andnot_run'
+ 1790 |                         n = array_andnot_run(array_cdata(a), a->cardinality, b, out);
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1550:9: note: 'i' is < 'na'
+ 1550 |         while (i < na && j < nruns)
+      |                ^
+src/lion_container.c:1550:9: note: Left side of '&&' is true
+src/lion_container.c:1550:19: note: Assuming 'j' is >= 'nruns'
+ 1550 |         while (i < na && j < nruns)
+      |                          ^~~~~~~~~
+src/lion_container.c:1550:2: note: Loop condition is false. Execution continues on line 1559
+ 1550 |         while (i < na && j < nruns)
+      |         ^
+src/lion_container.c:1559:9: note: 'i' is < 'na'
+ 1559 |         while (i < na)
+      |                ^
+src/lion_container.c:1559:2: note: Loop condition is true.  Entering loop body
+ 1559 |         while (i < na)
+      |         ^
+src/lion_container.c:1560:3: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1560 |                 out[n++] = arr[i++];
+      |                 ^~~~~~~~
+src/lion_container.c:1572:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1572 |                         out[n++] = arr[i];
+      |                         ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:36: note: Left side of '||' is true
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                           ^
+src/lion_container.c:1688:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                                ^
+src/lion_container.c:1688:30: note: '?' condition is true
+ 1688 |                 const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+      |                                            ^
+src/lion_container.c:1689:34: note: Field 'type' is equal to LION_CT_ARRAY
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                                ^
+src/lion_container.c:1689:30: note: '?' condition is true
+ 1689 |                 const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+      |                                            ^
+src/lion_container.c:1693:7: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1693:3: note: Taking false branch
+ 1693 |                 if (oth->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1696:12: note: Assuming field 'type' is equal to LION_CT_BITSET
+ 1696 |                 else if (oth->type == LION_CT_BITSET)
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1696:8: note: Taking true branch
+ 1696 |                 else if (oth->type == LION_CT_BITSET)
+      |                      ^
+src/lion_container.c:1697:8: note: Calling 'array_and_bitset'
+ 1697 |                         n = array_and_bitset(array_cdata(arr), arr->cardinality,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1698 |                                                                  bitset_cdata(oth), out);
+      |                                                                  ~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1570:14: note: 'i' is < 'na'
+ 1570 |         for (i = 0; i < na; i++)
+      |                     ^
+src/lion_container.c:1570:2: note: Loop condition is true.  Entering loop body
+ 1570 |         for (i = 0; i < na; i++)
+      |         ^
+src/lion_container.c:1571:7: note: Assuming the condition is true
+ 1571 |                 if (bits_test(w, arr[i]))
+      |                     ^~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1571:3: note: Taking true branch
+ 1571 |                 if (bits_test(w, arr[i]))
+      |                 ^
+src/lion_container.c:1572:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1572 |                         out[n++] = arr[i];
+      |                         ^~~~~~~~
+src/lion_container.c:1584:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1584 |                         out[n++] = arr[i];
+      |                         ^
+src/lion_container.c:1766:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1766 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1766:2: note: Taking false branch
+ 1766 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1766:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1769:6: note: Assuming field 'cardinality' is not equal to 0
+ 1769 |         if (a->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1769:2: note: Taking false branch
+ 1769 |         if (a->cardinality == 0)
+      |         ^
+src/lion_container.c:1773:11: note: Assuming field 'cardinality' is not equal to 0
+ 1773 |         else if (b->cardinality == 0)
+      |                  ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1773:7: note: Taking false branch
+ 1773 |         else if (b->cardinality == 0)
+      |              ^
+src/lion_container.c:1778:11: note: Assuming field 'type' is equal to LION_CT_ARRAY
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1778:7: note: Taking true branch
+ 1778 |         else if (a->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1783:7: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1783:3: note: Taking false branch
+ 1783 |                 if (b->type == LION_CT_ARRAY)
+      |                 ^
+src/lion_container.c:1786:12: note: Assuming field 'type' is equal to LION_CT_BITSET
+ 1786 |                 else if (b->type == LION_CT_BITSET)
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1786:8: note: Taking true branch
+ 1786 |                 else if (b->type == LION_CT_BITSET)
+      |                      ^
+src/lion_container.c:1787:8: note: Calling 'array_andnot_bitset'
+ 1787 |                         n = array_andnot_bitset(array_cdata(a), a->cardinality,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1788 |                                                                         bitset_cdata(b), out);
+      |                                                                         ~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1582:14: note: 'i' is < 'na'
+ 1582 |         for (i = 0; i < na; i++)
+      |                     ^
+src/lion_container.c:1582:2: note: Loop condition is true.  Entering loop body
+ 1582 |         for (i = 0; i < na; i++)
+      |         ^
+src/lion_container.c:1583:7: note: Assuming the condition is true
+ 1583 |                 if (!bits_test(w, arr[i]))
+      |                     ^~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1583:3: note: Taking true branch
+ 1583 |                 if (!bits_test(w, arr[i]))
+      |                 ^
+src/lion_container.c:1584:4: note: Access of 'buf.hdr' at index 4, while it holds only 4 'unsigned short' elements
+ 1584 |                         out[n++] = arr[i];
+      |                         ^~~~~~~~
+src/lion_container.c:1617:4: warning: Out of bound access to memory after the end of 'buf.hdr' [alpha.security.ArrayBoundV2]
+ 1617 |                         out[n].start = (uint16) s;
+      |                         ^
+src/lion_container.c:1679:9: note: Assuming 'a->ckey' is equal to 'b->ckey'
+ 1679 |         Assert(a->ckey == b->ckey);
+      |                ^~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_container.c:1679:2: note: Taking false branch
+ 1679 |         Assert(a->ckey == b->ckey);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_container.c:1679:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_container.c:1682:6: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:6: note: Left side of '||' is false
+src/lion_container.c:1682:29: note: Assuming field 'cardinality' is not equal to 0
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |                                    ^~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1682:2: note: Taking false branch
+ 1682 |         if (a->cardinality == 0 || b->cardinality == 0)
+      |         ^
+src/lion_container.c:1686:11: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:11: note: Left side of '||' is false
+src/lion_container.c:1686:39: note: Assuming field 'type' is not equal to LION_CT_ARRAY
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |                                              ^~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1686:7: note: Taking false branch
+ 1686 |         else if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+      |              ^
+src/lion_container.c:1703:11: note: Assuming field 'type' is equal to LION_CT_RUN
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                  ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1703:11: note: Left side of '&&' is true
+src/lion_container.c:1703:37: note: Assuming field 'type' is equal to LION_CT_RUN
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                                            ^~~~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1703:11: note: Left side of '&&' is true
+ 1703 |         else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+      |                  ^
+src/lion_container.c:1704:5: note: Calling 'run_and_run'
+ 1704 |                          run_and_run(a, b, o))
+      |                          ^~~~~~~~~~~~~~~~~~~~
+src/lion_container.c:1606:9: note: Assuming 'i' is < 'na'
+ 1606 |         while (i < na && j < nb)
+      |                ^~~~~~
+src/lion_container.c:1606:9: note: Left side of '&&' is true
+src/lion_container.c:1606:19: note: Assuming 'j' is < 'nb'
+ 1606 |         while (i < na && j < nb)
+      |                          ^~~~~~
+src/lion_container.c:1606:2: note: Loop condition is true.  Entering loop body
+ 1606 |         while (i < na && j < nb)
+      |         ^
+src/lion_container.c:1610:14: note: Assuming 'ra[i].start' is <= 'rb[j].start'
+ 1610 |                 int32           s = Max((int32) ra[i].start, (int32) rb[j].start);
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1125:21: note: expanded from macro 'Max'
+ 1125 | #define Max(x, y)               ((x) > (y) ? (x) : (y))
+      |                                  ^~~~~~~~~
+src/lion_container.c:1610:14: note: '?' condition is false
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1125:21: note: expanded from macro 'Max'
+ 1125 | #define Max(x, y)               ((x) > (y) ? (x) : (y))
+      |                                  ^
+src/lion_container.c:1611:14: note: Assuming 'ea' is >= 'eb'
+ 1611 |                 int32           e = Min(ea, eb);
+      |                                     ^~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1131:21: note: expanded from macro 'Min'
+ 1131 | #define Min(x, y)               ((x) < (y) ? (x) : (y))
+      |                                  ^~~~~~~~~
+src/lion_container.c:1611:14: note: '?' condition is false
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1131:21: note: expanded from macro 'Min'
+ 1131 | #define Min(x, y)               ((x) < (y) ? (x) : (y))
+      |                                  ^
+src/lion_container.c:1613:7: note: Assuming 's' is <= 'e'
+ 1613 |                 if (s <= e)
+      |                     ^~~~~~
+src/lion_container.c:1613:3: note: Taking true branch
+ 1613 |                 if (s <= e)
+      |                 ^
+src/lion_container.c:1615:4: note: Taking false branch
+ 1615 |                         if (n >= LION_RUN_MAX_NRUNS)
+      |                         ^
+src/lion_container.c:1617:4: note: Access of 'buf.hdr' at byte offset 10, while it holds only 8 bytes
+ 1617 |                         out[n].start = (uint16) s;
+      |                         ^~~~~~
+src/lion_container.c:1668:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1668 |         memcpy(dest, o, lion_container_size(o));
+      |         ^~~~~~
+src/lion_container.c:1668:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1668 |         memcpy(dest, o, lion_container_size(o));
+      |         ^~~~~~
+src/lion_container.c:1743:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1743 |                 memcpy(o, src, lion_container_size(src));
+      |                 ^~~~~~
+src/lion_container.c:1743:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1743 |                 memcpy(o, src, lion_container_size(src));
+      |                 ^~~~~~
+src/lion_container.c:1775:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1775 |                 memcpy(o, a, lion_container_size(a));
+      |                 ^~~~~~
+src/lion_container.c:1775:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1775 |                 memcpy(o, a, lion_container_size(a));
+      |                 ^~~~~~
+47 warnings generated.

@@ -1,0 +1,2506 @@
+{
+  "arguments": {
+    "prefix": "/tmp/lion-range-review-fkvc3cle/pg18",
+    "output": "/tmp/lion-range-review-fkvc3cle/pg18-focused",
+    "profile": "focused",
+    "rows": [
+      1000000,
+      5000000
+    ],
+    "documents": 200000,
+    "families": [
+      "btree",
+      "gin",
+      "roaring"
+    ],
+    "repeats": 3,
+    "warmups": 1,
+    "build_repeats": 1,
+    "cold_repeats": 0,
+    "clients": [
+      1,
+      4,
+      8
+    ],
+    "duration": 0,
+    "maintenance": true,
+    "keep_cluster": false,
+    "resume": false,
+    "seed": 20260920,
+    "preload": true
+  },
+  "started_utc": "2026-09-24T22:25:46Z",
+  "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpu_count": 16,
+  "cpuinfo": "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 25\nmodel\t\t: 33\nmodel name\t: AMD Ryzen 7 5700X3D 8-Core Processor\nstepping\t: 2\nmicrocode\t: 0xffffffff\ncpu MHz\t\t: 3200.041\ncache size\t: 512 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 0\ncpu cores\t: 8\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 13\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl tsc_reliable nonstop_tsc cpuid extd_apicid pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves clzero xsaveerptr arat npt nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload umip vaes vpclmulqdq rdpid fsrm\nbugs\t\t: sysret_ss_attrs null_seg spectre_v1 spectre_v2 spec_store_bypass srso\nbogomips\t: 6400.08\nTLB size\t: 2560 4K pages\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 48 bits physical, 48 bits virtual\npower management:",
+  "meminfo": "MemTotal:       24613196 kB\nMemFree:        18366284 kB\nMemAvailable:   19833156 kB\nBuffers:           12732 kB\nCached:          2109456 kB\nSwapCached:          344 kB\nActive:           695832 kB\nInactive:        4000128 kB\nActive(anon):     154980 kB\nInactive(anon):  3632868 kB\nActive(file):     540852 kB\nInactive(file):   367260 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:       6291456 kB\nSwapFree:        6246380 kB\nDirty:               672 kB\nWriteback:             0 kB\nAnonPages:       2467112 kB\nMapped:           930648 kB\nShmem:           1214072 kB\nKReclaimable:    1044792 kB\nSlab:            1227308 kB\nSReclaimable:    1044792 kB\nSUnreclaim:       182516 kB\nKernelStack:       12736 kB\nPageTables:        19676 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    18598052 kB\nCommitted_AS:   10817448 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       36604 kB\nVmallocChunk:          0 kB\nPercpu:             9216 kB\nAnonHugePages:   1294336 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      474112 kB\nDirectMap2M:    22593536 kB\nDirectMap1G:    11534336 kB\n",
+  "commit": "118f6239266973a8a3bda9e404702988871cd815",
+  "git_diff": " README.md                     | 290 +++++++++++++++++++++++-------------------\n bench/comprehensive/README.md |  10 +-\n 2 files changed, 165 insertions(+), 135 deletions(-)\n",
+  "pg_config": "'--prefix=/tmp/claude-1000/-home-cgkanchi-code-pg-lion/56cf0453-5bfa-41cc-b276-b2a6db91507c/scratchpad/pgv/rel-18' '--without-icu' '--without-zlib' '--without-readline' 'CFLAGS=-O2'",
+  "schema": "Synthetic integer equality/cardinality and text-array/full-text workloads",
+  "cache": "Warm process/OS cache; optional shared-buffer-cold retains OS cache",
+  "clock": "EXPLAIN ANALYZE TIMING OFF Execution Time; planning recorded separately",
+  "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "settings": [
+    {
+      "name": "DateStyle",
+      "setting": "ISO, MDY",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "IntervalStyle",
+      "setting": "postgres",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "TimeZone",
+      "setting": "America/Los_Angeles",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "allow_alter_system",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "allow_in_place_tablespaces",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "allow_system_table_mods",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "application_name",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "archive_cleanup_command",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "archive_command",
+      "setting": "(disabled)",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "archive_library",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "archive_mode",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "archive_timeout",
+      "setting": "0",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "array_nulls",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "authentication_timeout",
+      "setting": "60",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "autovacuum",
+      "setting": "off",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "autovacuum_analyze_scale_factor",
+      "setting": "0.1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_analyze_threshold",
+      "setting": "50",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_freeze_max_age",
+      "setting": "200000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_max_workers",
+      "setting": "3",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_multixact_freeze_max_age",
+      "setting": "400000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_naptime",
+      "setting": "60",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_cost_delay",
+      "setting": "2",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_cost_limit",
+      "setting": "-1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_insert_scale_factor",
+      "setting": "0.2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_insert_threshold",
+      "setting": "1000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_max_threshold",
+      "setting": "100000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_scale_factor",
+      "setting": "0.2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_vacuum_threshold",
+      "setting": "50",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_work_mem",
+      "setting": "-1",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "autovacuum_worker_slots",
+      "setting": "16",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "backend_flush_after",
+      "setting": "0",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "backslash_quote",
+      "setting": "safe_encoding",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "backtrace_functions",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "bgwriter_delay",
+      "setting": "200",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "bgwriter_flush_after",
+      "setting": "64",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "bgwriter_lru_maxpages",
+      "setting": "100",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "bgwriter_lru_multiplier",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "block_size",
+      "setting": "8192",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "bonjour",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "bonjour_name",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "bytea_output",
+      "setting": "hex",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "check_function_bodies",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "checkpoint_completion_target",
+      "setting": "0.9",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "checkpoint_flush_after",
+      "setting": "32",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "checkpoint_timeout",
+      "setting": "3600",
+      "unit": "s",
+      "source": "configuration file"
+    },
+    {
+      "name": "checkpoint_warning",
+      "setting": "30",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "client_connection_check_interval",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "client_encoding",
+      "setting": "SQL_ASCII",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "client_min_messages",
+      "setting": "notice",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "cluster_name",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "commit_delay",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "commit_siblings",
+      "setting": "5",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "commit_timestamp_buffers",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "compute_query_id",
+      "setting": "auto",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "config_file",
+      "setting": "/tmp/lion-comparison-imhuc2v3/data/postgresql.conf",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "constraint_exclusion",
+      "setting": "partition",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "cpu_index_tuple_cost",
+      "setting": "0.005",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "cpu_operator_cost",
+      "setting": "0.0025",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "cpu_tuple_cost",
+      "setting": "0.01",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "createrole_self_grant",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "cursor_tuple_fraction",
+      "setting": "0.1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "data_checksums",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "data_directory",
+      "setting": "/tmp/lion-comparison-imhuc2v3/data",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "data_directory_mode",
+      "setting": "0700",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "data_sync_retry",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "deadlock_timeout",
+      "setting": "1000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "debug_assertions",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_discard_caches",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_io_direct",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_logical_replication_streaming",
+      "setting": "buffered",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_parallel_query",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_pretty_print",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_print_parse",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_print_plan",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "debug_print_rewritten",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_statistics_target",
+      "setting": "100",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_table_access_method",
+      "setting": "heap",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_tablespace",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_text_search_config",
+      "setting": "pg_catalog.english",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "default_toast_compression",
+      "setting": "pglz",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_transaction_deferrable",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_transaction_isolation",
+      "setting": "read committed",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "default_transaction_read_only",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "dynamic_library_path",
+      "setting": "$libdir",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "dynamic_shared_memory_type",
+      "setting": "posix",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "effective_cache_size",
+      "setting": "524288",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "effective_io_concurrency",
+      "setting": "16",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_async_append",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_bitmapscan",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_distinct_reordering",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_gathermerge",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_group_by_reordering",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_hashagg",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_hashjoin",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_incremental_sort",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_indexonlyscan",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_indexscan",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_material",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_memoize",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_mergejoin",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_nestloop",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_parallel_append",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_parallel_hash",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_partition_pruning",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_partitionwise_aggregate",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_partitionwise_join",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_presorted_aggregate",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_self_join_elimination",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_seqscan",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_sort",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_tidscan",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "escape_string_warning",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "event_source",
+      "setting": "PostgreSQL",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "event_triggers",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "exit_on_error",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "extension_control_path",
+      "setting": "$system",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "external_pid_file",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "extra_float_digits",
+      "setting": "1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "file_copy_method",
+      "setting": "copy",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "file_extend_method",
+      "setting": "posix_fallocate",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "from_collapse_limit",
+      "setting": "8",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "fsync",
+      "setting": "on",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "full_page_writes",
+      "setting": "on",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "geqo",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "geqo_effort",
+      "setting": "5",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "geqo_generations",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "geqo_pool_size",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "geqo_seed",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "geqo_selection_bias",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "geqo_threshold",
+      "setting": "12",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "gin_fuzzy_search_limit",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "gin_pending_list_limit",
+      "setting": "4096",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "gss_accept_delegation",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "hash_mem_multiplier",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "hba_file",
+      "setting": "/tmp/lion-comparison-imhuc2v3/data/pg_hba.conf",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "hot_standby",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "hot_standby_feedback",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "huge_page_size",
+      "setting": "0",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "huge_pages",
+      "setting": "try",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "huge_pages_status",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "icu_validation_level",
+      "setting": "warning",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ident_file",
+      "setting": "/tmp/lion-comparison-imhuc2v3/data/pg_ident.conf",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "idle_in_transaction_session_timeout",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "idle_replication_slot_timeout",
+      "setting": "0",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "idle_session_timeout",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "ignore_checksum_failure",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ignore_invalid_pages",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ignore_system_indexes",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "in_hot_standby",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "integer_datetimes",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "io_combine_limit",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "io_max_combine_limit",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "io_max_concurrency",
+      "setting": "64",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "io_method",
+      "setting": "worker",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "io_workers",
+      "setting": "3",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit",
+      "setting": "off",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "jit_above_cost",
+      "setting": "100000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_debugging_support",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_dump_bitcode",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_expressions",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_inline_above_cost",
+      "setting": "500000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_optimize_above_cost",
+      "setting": "500000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_profiling_support",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_provider",
+      "setting": "llvmjit",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "jit_tuple_deforming",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "join_collapse_limit",
+      "setting": "8",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "krb_caseins_users",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "krb_server_keyfile",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "lc_messages",
+      "setting": "C",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "lc_monetary",
+      "setting": "C",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "lc_numeric",
+      "setting": "C",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "lc_time",
+      "setting": "C",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "listen_addresses",
+      "setting": "",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "lo_compat_privileges",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "local_preload_libraries",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "lock_timeout",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "log_autovacuum_min_duration",
+      "setting": "600000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "log_checkpoints",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_connections",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_destination",
+      "setting": "stderr",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_directory",
+      "setting": "log",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_disconnections",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_duration",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_error_verbosity",
+      "setting": "default",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_executor_stats",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_file_mode",
+      "setting": "0600",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_filename",
+      "setting": "postgresql-%Y-%m-%d_%H%M%S.log",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_hostname",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_line_prefix",
+      "setting": "%m [%p] ",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_lock_failures",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_lock_waits",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_min_duration_sample",
+      "setting": "-1",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "log_min_duration_statement",
+      "setting": "-1",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "log_min_error_statement",
+      "setting": "error",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_min_messages",
+      "setting": "warning",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_parameter_max_length",
+      "setting": "-1",
+      "unit": "B",
+      "source": "default"
+    },
+    {
+      "name": "log_parameter_max_length_on_error",
+      "setting": "0",
+      "unit": "B",
+      "source": "default"
+    },
+    {
+      "name": "log_parser_stats",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_planner_stats",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_recovery_conflict_waits",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_replication_commands",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_rotation_age",
+      "setting": "1440",
+      "unit": "min",
+      "source": "default"
+    },
+    {
+      "name": "log_rotation_size",
+      "setting": "10240",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "log_startup_progress_interval",
+      "setting": "10000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "log_statement",
+      "setting": "none",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_statement_sample_rate",
+      "setting": "1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_statement_stats",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_temp_files",
+      "setting": "-1",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "log_timezone",
+      "setting": "America/Los_Angeles",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "log_transaction_sample_rate",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_truncate_on_rotation",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "logging_collector",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "logical_decoding_work_mem",
+      "setting": "65536",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "maintenance_io_concurrency",
+      "setting": "16",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "maintenance_work_mem",
+      "setting": "524288",
+      "unit": "kB",
+      "source": "configuration file"
+    },
+    {
+      "name": "max_active_replication_origins",
+      "setting": "10",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_connections",
+      "setting": "100",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "max_files_per_process",
+      "setting": "1000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_function_args",
+      "setting": "100",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_identifier_length",
+      "setting": "63",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_index_keys",
+      "setting": "32",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_locks_per_transaction",
+      "setting": "64",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_logical_replication_workers",
+      "setting": "4",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_notify_queue_pages",
+      "setting": "1048576",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_parallel_apply_workers_per_subscription",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_parallel_maintenance_workers",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_parallel_workers",
+      "setting": "8",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_parallel_workers_per_gather",
+      "setting": "0",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "max_pred_locks_per_page",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_pred_locks_per_relation",
+      "setting": "-2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_pred_locks_per_transaction",
+      "setting": "64",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_prepared_transactions",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_replication_slots",
+      "setting": "10",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_slot_wal_keep_size",
+      "setting": "-1",
+      "unit": "MB",
+      "source": "default"
+    },
+    {
+      "name": "max_stack_depth",
+      "setting": "2048",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "max_standby_archive_delay",
+      "setting": "30000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "max_standby_streaming_delay",
+      "setting": "30000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "max_sync_workers_per_subscription",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_wal_senders",
+      "setting": "10",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_wal_size",
+      "setting": "8192",
+      "unit": "MB",
+      "source": "configuration file"
+    },
+    {
+      "name": "max_worker_processes",
+      "setting": "8",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "md5_password_warnings",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "min_dynamic_shared_memory",
+      "setting": "0",
+      "unit": "MB",
+      "source": "default"
+    },
+    {
+      "name": "min_parallel_index_scan_size",
+      "setting": "64",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "min_parallel_table_scan_size",
+      "setting": "1024",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "min_wal_size",
+      "setting": "80",
+      "unit": "MB",
+      "source": "configuration file"
+    },
+    {
+      "name": "multixact_member_buffers",
+      "setting": "32",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "multixact_offset_buffers",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "notify_buffers",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "num_os_semaphores",
+      "setting": "174",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "oauth_validator_libraries",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "output_plugin_libraries",
+      "setting": "pgoutput, test_decoding",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "parallel_leader_participation",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "parallel_setup_cost",
+      "setting": "1000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "parallel_tuple_cost",
+      "setting": "0.1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "password_encryption",
+      "setting": "scram-sha-256",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "pg_lion.enable_count_pushdown",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "pg_lion.rmgr_id",
+      "setting": "128",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "pg_lion.vacuum_barrier_ranges",
+      "setting": "1024",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "plan_cache_mode",
+      "setting": "auto",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "plpgsql.check_asserts",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "plpgsql.extra_errors",
+      "setting": "none",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "plpgsql.extra_warnings",
+      "setting": "none",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "plpgsql.print_strict_params",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "plpgsql.variable_conflict",
+      "setting": "error",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "port",
+      "setting": "55449",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "post_auth_delay",
+      "setting": "0",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "pre_auth_delay",
+      "setting": "0",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "primary_conninfo",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "primary_slot_name",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "quote_all_identifiers",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "random_page_cost",
+      "setting": "4",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_end_command",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_init_sync_method",
+      "setting": "fsync",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_min_apply_delay",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "recovery_prefetch",
+      "setting": "try",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_action",
+      "setting": "pause",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_inclusive",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_lsn",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_name",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_time",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_timeline",
+      "setting": "latest",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recovery_target_xid",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "recursive_worktable_factor",
+      "setting": "10",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "remove_temp_files_after_crash",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "reserved_connections",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "restart_after_crash",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "restore_command",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "restrict_nonsystem_relation_kind",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "row_security",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "scram_iterations",
+      "setting": "4096",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "search_path",
+      "setting": "\"$user\", public",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "segment_size",
+      "setting": "131072",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "send_abort_for_crash",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "send_abort_for_kill",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "seq_page_cost",
+      "setting": "1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "serializable_buffers",
+      "setting": "32",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "server_encoding",
+      "setting": "SQL_ASCII",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "server_version",
+      "setting": "18.6",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "server_version_num",
+      "setting": "180006",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "session_preload_libraries",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "session_replication_role",
+      "setting": "origin",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "shared_buffers",
+      "setting": "65536",
+      "unit": "8kB",
+      "source": "configuration file"
+    },
+    {
+      "name": "shared_memory_size",
+      "setting": "558",
+      "unit": "MB",
+      "source": "default"
+    },
+    {
+      "name": "shared_memory_size_in_huge_pages",
+      "setting": "279",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "shared_memory_type",
+      "setting": "mmap",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "shared_preload_libraries",
+      "setting": "pg_lion",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "ssl",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_ca_file",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_cert_file",
+      "setting": "server.crt",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_ciphers",
+      "setting": "none",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_crl_dir",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_crl_file",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_dh_params_file",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_groups",
+      "setting": "none",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_key_file",
+      "setting": "server.key",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_library",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_max_protocol_version",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_min_protocol_version",
+      "setting": "TLSv1.2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_passphrase_command",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_passphrase_command_supports_reload",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_prefer_server_ciphers",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "ssl_tls13_ciphers",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "standard_conforming_strings",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "statement_timeout",
+      "setting": "60000",
+      "unit": "ms",
+      "source": "session"
+    },
+    {
+      "name": "stats_fetch_consistency",
+      "setting": "cache",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "subtransaction_buffers",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "summarize_wal",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "superuser_reserved_connections",
+      "setting": "3",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "sync_replication_slots",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "synchronize_seqscans",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "synchronized_standby_slots",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "synchronous_commit",
+      "setting": "on",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "synchronous_standby_names",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "syslog_facility",
+      "setting": "local0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "syslog_ident",
+      "setting": "postgres",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "syslog_sequence_numbers",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "syslog_split_messages",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "tcp_keepalives_count",
+      "setting": "0",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "tcp_keepalives_idle",
+      "setting": "0",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "tcp_keepalives_interval",
+      "setting": "0",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "tcp_user_timeout",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "temp_buffers",
+      "setting": "1024",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "temp_file_limit",
+      "setting": "-1",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "temp_tablespaces",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "timezone_abbreviations",
+      "setting": "Default",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "trace_connection_negotiation",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "trace_notify",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "trace_sort",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_activities",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_activity_query_size",
+      "setting": "1024",
+      "unit": "B",
+      "source": "default"
+    },
+    {
+      "name": "track_commit_timestamp",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_cost_delay_timing",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_counts",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_functions",
+      "setting": "none",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_io_timing",
+      "setting": "on",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "track_wal_io_timing",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "transaction_buffers",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "transaction_deferrable",
+      "setting": "off",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "transaction_isolation",
+      "setting": "read committed",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "transaction_read_only",
+      "setting": "off",
+      "unit": null,
+      "source": "override"
+    },
+    {
+      "name": "transaction_timeout",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "transform_null_equals",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "unix_socket_directories",
+      "setting": "/tmp/lion-comparison-imhuc2v3/socket",
+      "unit": null,
+      "source": "configuration file"
+    },
+    {
+      "name": "unix_socket_group",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "unix_socket_permissions",
+      "setting": "0777",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "update_process_title",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_buffer_usage_limit",
+      "setting": "2048",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "vacuum_cost_delay",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "vacuum_cost_limit",
+      "setting": "200",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_cost_page_dirty",
+      "setting": "20",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_cost_page_hit",
+      "setting": "1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_cost_page_miss",
+      "setting": "2",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_failsafe_age",
+      "setting": "1600000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_freeze_min_age",
+      "setting": "50000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_freeze_table_age",
+      "setting": "150000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_max_eager_freeze_failure_rate",
+      "setting": "0.03",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_multixact_failsafe_age",
+      "setting": "1600000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_multixact_freeze_min_age",
+      "setting": "5000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_multixact_freeze_table_age",
+      "setting": "150000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_truncate",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_block_size",
+      "setting": "8192",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_buffers",
+      "setting": "2048",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "wal_compression",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_consistency_checking",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_decode_buffer_size",
+      "setting": "524288",
+      "unit": "B",
+      "source": "default"
+    },
+    {
+      "name": "wal_init_zero",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_keep_size",
+      "setting": "0",
+      "unit": "MB",
+      "source": "default"
+    },
+    {
+      "name": "wal_level",
+      "setting": "replica",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_log_hints",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_receiver_create_temp_slot",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_receiver_status_interval",
+      "setting": "10",
+      "unit": "s",
+      "source": "default"
+    },
+    {
+      "name": "wal_receiver_timeout",
+      "setting": "60000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "wal_recycle",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_retrieve_retry_interval",
+      "setting": "5000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "wal_segment_size",
+      "setting": "16777216",
+      "unit": "B",
+      "source": "default"
+    },
+    {
+      "name": "wal_sender_timeout",
+      "setting": "60000",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "wal_skip_threshold",
+      "setting": "2048",
+      "unit": "kB",
+      "source": "default"
+    },
+    {
+      "name": "wal_summary_keep_time",
+      "setting": "14400",
+      "unit": "min",
+      "source": "default"
+    },
+    {
+      "name": "wal_sync_method",
+      "setting": "fdatasync",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "wal_writer_delay",
+      "setting": "200",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "wal_writer_flush_after",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "work_mem",
+      "setting": "65536",
+      "unit": "kB",
+      "source": "configuration file"
+    },
+    {
+      "name": "xmlbinary",
+      "setting": "base64",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "xmloption",
+      "setting": "content",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "zero_damaged_pages",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    }
+  ],
+  "completed_utc": "2026-09-24T22:32:45Z",
+  "errors": 0,
+  "status": "complete",
+  "elapsed_seconds": 393.99108875496313,
+  "build_provenance": {
+    "src": "/tmp/lion-range-review-fkvc3cle/src18",
+    "prefix": "/tmp/lion-range-review-fkvc3cle/pg18",
+    "server": "PostgreSQL 18.6",
+    "configure": "'--prefix=/tmp/claude-1000/-home-cgkanchi-code-pg-lion/56cf0453-5bfa-41cc-b276-b2a6db91507c/scratchpad/pgv/rel-18' '--without-icu' '--without-zlib' '--without-readline' 'CFLAGS=-O2'",
+    "extension_sha256": "f8facdad662e33f44d4b170484a6c1eefd3de8a4aee383acab28d5ca875a1dd5",
+    "extension_commit": "118f6239266973a8a3bda9e404702988871cd815",
+    "source_archive_sha256": "ae8a988e6014ee120693d02e1ac52decc8a4493fca1467c5890f29d81b41d6d5",
+    "wal_mode": "rmgr",
+    "elapsed_seconds": 393.99108875496313,
+    "note": "Build from archived commit, isolated release PostgreSQL installation. Source files were not modified by this review.",
+    "source_archive": "source.tar.gz",
+    "source_uncompressed_sha256": "0254cf07d41ca3a7be1f1ea7eec16b6e7252003524baf93891b8fda263cb5d1b"
+  }
+}

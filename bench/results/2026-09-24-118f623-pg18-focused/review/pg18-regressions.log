@@ -1,0 +1,49 @@
+pg_lion: no injection_points module in this installation; skipping isolation specs: count_distinct_vacuum_race count_prune_race count_range_vacuum_race count_root_pushdown_race count_split_race count_vacuum_race dir_insert_race dir_split_scan mc_entry_scan vacuum_chain_reuse vacuum_entry_delete vacuum_parallel vacuum_regrow_pushdown vacuum_retry_pushdown
+echo "# +++ regress install-check in  +++" && /tmp/lion-range-review-fkvc3cle/pg18/lib/postgresql/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/tmp/lion-range-review-fkvc3cle/pg18/bin'    --inputdir=test --outputdir=test --dbname=contrib_regression array array_collide basic citext count directory distinct fkjoin hardening inlist insert large multicolumn noextension null options ordering partition pinbudget posting_tree prune pushdown range security security_exec sparse tableam tsvector unlogged vacuum verify walrecords
+# +++ regress install-check in  +++
+# using postmaster on /tmp/lion-comparison-txao9vq0/socket, port 55449
+ok 1         - array                                    1500 ms
+ok 2         - array_collide                             461 ms
+ok 3         - basic                                    2210 ms
+ok 4         - citext                                    163 ms
+ok 5         - count                                    1474 ms
+ok 6         - directory                                6435 ms
+ok 7         - distinct                                 1730 ms
+ok 8         - fkjoin                                   1006 ms
+ok 9         - hardening                                  72 ms
+ok 10        - inlist                                   6063 ms
+ok 11        - insert                                   5764 ms
+ok 12        - large                                   10097 ms
+ok 13        - multicolumn                              3651 ms
+ok 14        - noextension                               809 ms
+ok 15        - null                                     1081 ms
+ok 16        - options                                   247 ms
+ok 17        - ordering                                 2452 ms
+ok 18        - partition                                2874 ms
+ok 19        - pinbudget                                 610 ms
+ok 20        - posting_tree                             1732 ms
+ok 21        - prune                                      65 ms
+ok 22        - pushdown                                17273 ms
+ok 23        - range                                    3625 ms
+ok 24        - security                                  165 ms
+ok 25        - security_exec                             160 ms
+ok 26        - sparse                                   1861 ms
+ok 27        - tableam                                   249 ms
+ok 28        - tsvector                                  477 ms
+ok 29        - unlogged                                  337 ms
+ok 30        - vacuum                                   4837 ms
+ok 31        - verify                                   3128 ms
+ok 32        - walrecords                               1276 ms
+1..32
+# All 32 tests passed.
+echo "# +++ isolation install-check in  +++" && /tmp/lion-range-review-fkvc3cle/pg18/lib/postgresql/pgxs/src/makefiles/../../src/test/isolation/pg_isolation_regress --inputdir=./ --outputdir=output_iso --bindir='/tmp/lion-range-review-fkvc3cle/pg18/bin'    --inputdir=test/isolation --outputdir=test/isolation --dbname=isolation_regression count_checkxmin count_lock_privilege count_serializable count_snapshot insert_concurrent vacuum_scan
+# +++ isolation install-check in  +++
+# using postmaster on /tmp/lion-comparison-txao9vq0/socket, port 55449
+ok 1         - count_checkxmin                            42 ms
+ok 2         - count_lock_privilege                       18 ms
+ok 3         - count_serializable                         30 ms
+ok 4         - count_snapshot                             59 ms
+ok 5         - insert_concurrent                         121 ms
+ok 6         - vacuum_scan                               196 ms
+1..6
+# All 6 tests passed.

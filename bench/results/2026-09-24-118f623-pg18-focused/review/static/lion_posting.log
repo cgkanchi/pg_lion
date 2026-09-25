@@ -1,0 +1,213 @@
+In file included from src/lion_posting.c:61:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/generic_xlog.h:19:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xloginsert.h:18:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:271:10: warning: Out of bound access to memory preceding the field 'pd_linp' [alpha.security.ArrayBoundV2]
+  271 |         return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+      |                 ^
+src/lion_posting.c:361:9: note: Left side of '&&' is true
+  361 |         Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
+      |                ^
+src/lion_posting.c:361:2: note: Taking false branch
+  361 |         Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_posting.c:361:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_posting.c:363:8: note: Calling 'lion_posting_search'
+  363 |         buf = lion_posting_search(index, NULL, hash, head, ckey, BUFFER_LOCK_SHARE,
+      |               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  364 |                                                           false);
+      |                                                           ~~~~~~
+src/lion_posting.c:183:10: note: 'forwrite' is false
+  183 |         Assert(!forwrite || lockmode == BUFFER_LOCK_EXCLUSIVE);
+      |                 ^~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_posting.c:183:19: note: Left side of '||' is true
+  183 |         Assert(!forwrite || lockmode == BUFFER_LOCK_EXCLUSIVE);
+      |                          ^
+src/lion_posting.c:183:2: note: Taking false branch
+  183 |         Assert(!forwrite || lockmode == BUFFER_LOCK_EXCLUSIVE);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_posting.c:183:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_posting.c:187:2: note: Taking false branch
+  187 |         if (!BufferIsValid(buf))
+      |         ^
+src/lion_posting.c:190:48: note: Left side of '&&' is false
+  190 |         if (LionPageIsPostingLeaf(BufferGetPage(buf)) &&
+      |                                                       ^
+src/lion_posting.c:216:2: note: Loop condition is true.  Entering loop body
+  216 |         for (;;)
+      |         ^
+src/lion_posting.c:234:7: note: 'forwrite' is false
+  234 |                 if (forwrite && LionPageIncompleteSplit(page))
+      |                     ^~~~~~~~
+src/lion_posting.c:234:16: note: Left side of '&&' is false
+  234 |                 if (forwrite && LionPageIncompleteSplit(page))
+      |                              ^
+src/lion_posting.c:252:7: note: Assuming 'level' is <= 0
+  252 |                 if (level > 0 && !LionPageIsRightmost(page) &&
+      |                     ^~~~~~~~~
+src/lion_posting.c:252:17: note: Left side of '&&' is false
+  252 |                 if (level > 0 && !LionPageIsRightmost(page) &&
+      |                               ^
+src/lion_posting.c:267:7: note: 'level' is equal to 0
+  267 |                 if (level == 0)
+      |                     ^~~~~
+src/lion_posting.c:267:3: note: Taking true branch
+  267 |                 if (level == 0)
+      |                 ^
+src/lion_posting.c:282:9: note: 'forwrite' is false
+  282 |                         if (!forwrite)
+      |                              ^~~~~~~~
+src/lion_posting.c:282:4: note: Taking true branch
+  282 |                         if (!forwrite)
+      |                         ^
+src/lion_posting.c:284:12: note: Assuming 'ckey' is > field 'maxckey'
+  284 |                                 while (LionPageGetOpaque(page)->maxckey < ckey &&
+      |                                        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion.h:101:33: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                 ^
+src/lion_posting.c:284:12: note: Left side of '&&' is true
+src/lion.h:101:33: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                 ^
+src/lion_posting.c:284:5: note: Loop condition is true.  Entering loop body
+  284 |                                 while (LionPageGetOpaque(page)->maxckey < ckey &&
+      |                                 ^
+src/lion_posting.c:289:6: note: Taking false branch
+  289 |                                         if (!BufferIsValid(buf))
+      |                                         ^
+src/lion_posting.c:292:10: note: Assuming the condition is false
+  292 |                                         if (!LionPageIsPostingLeaf(page))
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_posting.c:292:6: note: Taking false branch
+  292 |                                         if (!LionPageIsPostingLeaf(page))
+      |                                         ^
+src/lion_posting.c:284:12: note: Assuming 'ckey' is > field 'maxckey'
+  284 |                                 while (LionPageGetOpaque(page)->maxckey < ckey &&
+      |                                        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion.h:101:33: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                 ^
+src/lion_posting.c:284:12: note: Left side of '&&' is true
+src/lion.h:101:33: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                 ^
+src/lion_posting.c:284:5: note: Loop condition is true.  Entering loop body
+  284 |                                 while (LionPageGetOpaque(page)->maxckey < ckey &&
+      |                                 ^
+src/lion_posting.c:289:6: note: Taking false branch
+  289 |                                         if (!BufferIsValid(buf))
+      |                                         ^
+src/lion_posting.c:292:10: note: Assuming the condition is false
+  292 |                                         if (!LionPageIsPostingLeaf(page))
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_posting.c:292:6: note: Taking false branch
+  292 |                                         if (!LionPageIsPostingLeaf(page))
+      |                                         ^
+src/lion_posting.c:284:12: note: Assuming 'ckey' is > field 'maxckey'
+  284 |                                 while (LionPageGetOpaque(page)->maxckey < ckey &&
+      |                                        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion.h:101:33: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                 ^
+src/lion_posting.c:284:12: note: Left side of '&&' is true
+src/lion.h:101:33: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                 ^
+src/lion_posting.c:284:5: note: Loop condition is true.  Entering loop body
+  284 |                                 while (LionPageGetOpaque(page)->maxckey < ckey &&
+      |                                 ^
+src/lion_posting.c:289:6: note: Taking false branch
+  289 |                                         if (!BufferIsValid(buf))
+      |                                         ^
+src/lion_posting.c:292:6: note: Taking true branch
+  292 |                                         if (!LionPageIsPostingLeaf(page))
+      |                                         ^
+src/lion_posting.c:295:7: note: Control jumps to line 186
+  295 |                                                 goto restart;
+      |                                                 ^
+src/lion_posting.c:187:2: note: Taking false branch
+  187 |         if (!BufferIsValid(buf))
+      |         ^
+src/lion_posting.c:190:48: note: Left side of '&&' is false
+  190 |         if (LionPageIsPostingLeaf(BufferGetPage(buf)) &&
+      |                                                       ^
+src/lion_posting.c:216:2: note: Loop condition is true.  Entering loop body
+  216 |         for (;;)
+      |         ^
+src/lion_posting.c:234:7: note: 'forwrite' is false
+  234 |                 if (forwrite && LionPageIncompleteSplit(page))
+      |                     ^~~~~~~~
+src/lion_posting.c:234:16: note: Left side of '&&' is false
+  234 |                 if (forwrite && LionPageIncompleteSplit(page))
+      |                              ^
+src/lion_posting.c:252:7: note: Assuming 'level' is > 0
+  252 |                 if (level > 0 && !LionPageIsRightmost(page) &&
+      |                     ^~~~~~~~~
+src/lion_posting.c:252:7: note: Left side of '&&' is true
+src/lion_posting.c:252:47: note: Left side of '&&' is false
+  252 |                 if (level > 0 && !LionPageIsRightmost(page) &&
+      |                                                             ^
+src/lion_posting.c:267:7: note: 'level' is not equal to 0
+  267 |                 if (level == 0)
+      |                     ^~~~~
+src/lion_posting.c:267:3: note: Taking false branch
+  267 |                 if (level == 0)
+      |                 ^
+src/lion_posting.c:303:7: note: Assuming the condition is false
+  303 |                 if (off > PageGetMaxOffsetNumber(page))
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_posting.c:303:3: note: Taking false branch
+  303 |                 if (off > PageGetMaxOffsetNumber(page))
+      |                 ^
+src/lion_posting.c:307:11: note: Calling 'lion_posting_pivot'
+  307 |                 child = lion_posting_pivot(page, off)->child;
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion.h:220:48: note: Calling 'PageGetItemId'
+  220 |         return (LionPostingPivot *) PageGetItem(page, PageGetItemId(page, off));
+      |                                                       ^~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:271:10: note: Access of the field 'pd_linp' at negative byte offset -4
+  271 |         return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from src/lion_posting.c:67:
+In file included from src/lion.h:13:
+In file included from src/lion_compat.h:22:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tableam.h:20:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/relscan.h:17:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/htup_details.h:20:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+In file included from src/lion_posting.c:67:
+In file included from src/lion.h:29:
+In file included from src/lion_wal.h:46:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: warning: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: note: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+src/lion_posting.c:429:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  429 |         memcpy(cpage, page, BLCKSZ);
+      |         ^~~~~~
+src/lion_posting.c:429:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  429 |         memcpy(cpage, page, BLCKSZ);
+      |         ^~~~~~
+4 warnings generated.

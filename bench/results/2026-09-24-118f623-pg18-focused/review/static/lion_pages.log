@@ -1,0 +1,606 @@
+In file included from src/lion_pages.c:20:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/htup_details.h:20:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+In file included from src/lion_pages.c:45:
+In file included from src/lion.h:29:
+In file included from src/lion_wal.h:46:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: warning: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: note: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+src/lion_pages.c:298:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  298 |         memset(meta, 0, sizeof(LionMetaPageData));
+      |         ^~~~~~
+src/lion_pages.c:298:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  298 |         memset(meta, 0, sizeof(LionMetaPageData));
+      |         ^~~~~~
+src/lion_pages.c:853:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  853 |         memset(ix, 0, sizeof(LionIndexState));
+      |         ^~~~~~
+src/lion_pages.c:853:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  853 |         memset(ix, 0, sizeof(LionIndexState));
+      |         ^~~~~~
+src/lion_pages.c:996:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  996 |                 memcpy(dest, &key, sizeof(Datum));
+      |                 ^~~~~~
+src/lion_pages.c:996:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  996 |                 memcpy(dest, &key, sizeof(Datum));
+      |                 ^~~~~~
+src/lion_pages.c:998:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  998 |                 memcpy(dest, DatumGetPointer(key), (Size) state->typlen);
+      |                 ^~~~~~
+src/lion_pages.c:998:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  998 |                 memcpy(dest, DatumGetPointer(key), (Size) state->typlen);
+      |                 ^~~~~~
+src/lion_pages.c:1003:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1003 |                 memcpy(dest, v, VARSIZE(v));
+      |                 ^~~~~~
+src/lion_pages.c:1003:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1003 |                 memcpy(dest, v, VARSIZE(v));
+      |                 ^~~~~~
+src/lion_pages.c:1011:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1011 |                 memcpy(dest, s, strlen(s) + 1);
+      |                 ^~~~~~
+src/lion_pages.c:1011:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1011 |                 memcpy(dest, s, strlen(s) + 1);
+      |                 ^~~~~~
+src/lion_pages.c:1027:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1027 |                 memcpy(&d, src, sizeof(Datum));
+      |                 ^~~~~~
+src/lion_pages.c:1027:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1027 |                 memcpy(&d, src, sizeof(Datum));
+      |                 ^~~~~~
+src/lion_pages.c:1078:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1078 |         memcpy(buf, payload + *off, peek);
+      |         ^~~~~~
+src/lion_pages.c:1078:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1078 |         memcpy(buf, payload + *off, peek);
+      |         ^~~~~~
+src/lion_pages.c:1090:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1090 |         memcpy(buf, payload + *off, csize);
+      |         ^~~~~~
+src/lion_pages.c:1090:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1090 |         memcpy(buf, payload + *off, csize);
+      |         ^~~~~~
+src/lion_pages.c:1135:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1135 |                 memcpy(((char *) entry) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1135:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1135 |                 memcpy(((char *) entry) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1183:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1183 |                 memcpy(((char *) entry) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1183:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1183 |                 memcpy(((char *) entry) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1214:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1214 |         memcpy(copy, entry, payoff);
+      |         ^~~~~~
+src/lion_pages.c:1214:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1214 |         memcpy(copy, entry, payoff);
+      |         ^~~~~~
+src/lion_pages.c:1218:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1218 |                 memcpy(((char *) copy) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1218:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1218 |                 memcpy(((char *) copy) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1252:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1252 |         memcpy(copy, entry, payoff);
+      |         ^~~~~~
+src/lion_pages.c:1252:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1252 |         memcpy(copy, entry, payoff);
+      |         ^~~~~~
+src/lion_pages.c:1256:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1256 |                 memcpy(((char *) copy) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1256:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1256 |                 memcpy(((char *) copy) + payoff, payload, payloadlen);
+      |                 ^~~~~~
+src/lion_pages.c:1592:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1592 |                 memset((char *) item + size, 0, alloc - size);
+      |                 ^~~~~~
+src/lion_pages.c:1592:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 1592 |                 memset((char *) item + size, 0, alloc - size);
+      |                 ^~~~~~
+src/lion_pages.c:2197:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 2197 |                         memcpy(movebuf + used, PageGetItem(page, iid), sz);
+      |                         ^~~~~~
+src/lion_pages.c:2197:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 2197 |                         memcpy(movebuf + used, PageGetItem(page, iid), sz);
+      |                         ^~~~~~
+src/lion_pages.c:2229:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 2229 |         memcpy(trial->data, page, BLCKSZ);
+      |         ^~~~~~
+src/lion_pages.c:2229:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 2229 |         memcpy(trial->data, page, BLCKSZ);
+      |         ^~~~~~
+src/lion_pages.c:2324:4: warning: Access to field 'pd_special' results in a dereference of a null pointer (loaded from variable 'pM') [core.NullDereference]
+ 2324 |                         LionPageGetOpaque(pM)->rightlink = after_m;
+      |                         ^                 ~~
+src/lion.h:101:51: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                                   ^                     ~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:367:12: note: expanded from macro 'PageGetSpecialPointer'
+  367 |         ((page) + ((const PageHeaderData *) (page))->pd_special) \
+      |                   ^                          ~~~~
+src/lion_pages.c:2095:28: note: Assuming 'replace' is false
+ 2095 |         OffsetNumber firstright = replace ? OffsetNumberNext(off) : off;
+      |                                   ^~~~~~~
+src/lion_pages.c:2095:28: note: '?' condition is false
+src/lion_pages.c:2108:2: note: 'pM' initialized to a null pointer value
+ 2108 |         Page            pM = NULL;
+      |         ^~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2119:9: note: Assuming 'ndel' is >= 0
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |                ^~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2119:9: note: Left side of '&&' is true
+src/lion_pages.c:2119:22: note: 'nmove' is >= 0
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |                             ^~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2119:9: note: Left side of '&&' is true
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |                ^
+src/lion_pages.c:2119:2: note: Taking false branch
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2119:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2120:9: note: Assuming 'nitems' is >= 1
+ 2120 |         Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+      |                ^~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2120:9: note: Left side of '&&' is true
+src/lion_pages.c:2120:24: note: Assuming 'nitems' is <= 3
+ 2120 |         Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+      |         ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2120:2: note: Taking false branch
+ 2120 |         Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2120:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2121:2: note: Assuming the condition is false
+ 2121 |         Assert(LionPageIsPostingLeaf(page));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:7: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                     ^~~~~~~~~~~~
+src/lion_pages.c:2121:2: note: Taking false branch
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2121:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2122:2: note: Assuming the condition is false
+ 2122 |         Assert(!LionPageIncompleteSplit(page));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:7: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                     ^~~~~~~~~~~~
+src/lion_pages.c:2122:2: note: Taking false branch
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2122:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2124:6: note: Assuming 'blk' is not equal to field 'head'
+ 2124 |         if (blk == entry->head)
+      |             ^~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2124:2: note: Taking false branch
+ 2124 |         if (blk == entry->head)
+      |         ^
+src/lion_pages.c:2176:14: note: 'i' is < 'nitems'
+ 2176 |         for (i = 0; i < nitems; i++)
+      |                     ^
+src/lion_pages.c:2176:2: note: Loop condition is true.  Entering loop body
+ 2176 |         for (i = 0; i < nitems; i++)
+      |         ^
+src/lion_pages.c:2176:14: note: Assuming 'i' is >= 'nitems'
+ 2176 |         for (i = 0; i < nitems; i++)
+      |                     ^~~~~~~~~~
+src/lion_pages.c:2176:2: note: Loop condition is false. Execution continues on line 2183
+ 2176 |         for (i = 0; i < nitems; i++)
+      |         ^
+src/lion_pages.c:2183:6: note: Assuming 'nmove' is <= 0
+ 2183 |         if (nmove > 0)
+      |             ^~~~~~~~~
+src/lion_pages.c:2183:2: note: Taking false branch
+ 2183 |         if (nmove > 0)
+      |         ^
+src/lion_pages.c:2207:6: note: 'ndel' is <= 0
+ 2207 |         if (ndel > 0)
+      |             ^~~~
+src/lion_pages.c:2207:2: note: Taking false branch
+ 2207 |         if (ndel > 0)
+      |         ^
+src/lion_pages.c:2230:6: note: 'ndel' is <= 0
+ 2230 |         if (ndel > 0)
+      |             ^~~~
+src/lion_pages.c:2230:2: note: Taking false branch
+ 2230 |         if (ndel > 0)
+      |         ^
+src/lion_pages.c:2232:10: note: Assuming the condition is true
+ 2232 |         needm = PageGetExactFreeSpace((Page) trial->data) < need;
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2235:6: note: 'nmove' is <= 0
+ 2235 |         if (nmove > 0)
+      |             ^~~~~
+src/lion_pages.c:2235:2: note: Taking false branch
+ 2235 |         if (nmove > 0)
+      |         ^
+src/lion_pages.c:2240:6: note: 'needm' is true
+ 2240 |         if (needm)
+      |             ^~~~~
+src/lion_pages.c:2240:2: note: Taking true branch
+ 2240 |         if (needm)
+      |         ^
+src/lion_pages.c:2249:2: note: Taking false branch
+ 2249 |         if (BufferIsValid(nbuf))
+      |         ^
+src/lion_pages.c:2254:2: note: Taking false branch
+ 2254 |         if (BufferIsValid(mbuf))
+      |         ^
+src/lion_pages.c:2260:6: note: 'ndel' is <= 0
+ 2260 |         if (ndel > 0)
+      |             ^~~~
+src/lion_pages.c:2260:2: note: Taking false branch
+ 2260 |         if (ndel > 0)
+      |         ^
+src/lion_pages.c:2267:7: note: 'needm' is true
+ 2267 |         if (!needm)
+      |              ^~~~~
+src/lion_pages.c:2267:2: note: Taking false branch
+ 2267 |         if (!needm)
+      |         ^
+src/lion_pages.c:2283:3: note: Loop condition is true.  Entering loop body
+ 2283 |                 for (i = 0; i < nitems; i++)
+      |                 ^
+src/lion_pages.c:2288:8: note: Assuming 'noff' is not equal to InvalidOffsetNumber
+ 2288 |                         if (noff == InvalidOffsetNumber)
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2288:4: note: Taking false branch
+ 2288 |                         if (noff == InvalidOffsetNumber)
+      |                         ^
+src/lion_pages.c:2283:3: note: Loop condition is false. Execution continues on line 2294
+ 2283 |                 for (i = 0; i < nitems; i++)
+      |                 ^
+src/lion_pages.c:2294:6: note: 'nmove' is <= 0
+ 2294 |         if (nmove > 0)
+      |             ^~~~~
+src/lion_pages.c:2294:2: note: Taking false branch
+ 2294 |         if (nmove > 0)
+      |         ^
+src/lion_pages.c:2309:6: note: 'pN' is equal to NULL
+ 2309 |         if (pN != NULL)
+      |             ^~
+src/lion_pages.c:2309:2: note: Taking false branch
+ 2309 |         if (pN != NULL)
+      |         ^
+src/lion_pages.c:2311:6: note: 'pM' is equal to NULL
+ 2311 |         if (pM != NULL)
+      |             ^~
+src/lion_pages.c:2311:2: note: Taking false branch
+ 2311 |         if (pM != NULL)
+      |         ^
+src/lion_pages.c:2320:25: note: '?' condition is false
+ 2320 |                 BlockNumber after_m = BlockNumberIsValid(nblk) ? nblk : oldright;
+      |                                       ^
+src/lion_pages.c:2322:3: note: Taking true branch
+ 2322 |                 if (BlockNumberIsValid(mblk))
+      |                 ^
+src/lion_pages.c:2324:4: note: Access to field 'pd_special' results in a dereference of a null pointer (loaded from variable 'pM')
+ 2324 |                         LionPageGetOpaque(pM)->rightlink = after_m;
+      |                         ^                 ~~
+src/lion.h:101:51: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                                   ^                     ~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:367:12: note: expanded from macro 'PageGetSpecialPointer'
+  367 |         ((page) + ((const PageHeaderData *) (page))->pd_special) \
+      |                   ^                          ~~~~
+src/lion_pages.c:2338:4: warning: Access to field 'pd_special' results in a dereference of a null pointer (loaded from variable 'pN') [core.NullDereference]
+ 2338 |                         LionPageGetOpaque(pN)->rightlink = oldright;
+      |                         ^                 ~~
+src/lion.h:101:51: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                                   ^                     ~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:367:12: note: expanded from macro 'PageGetSpecialPointer'
+  367 |         ((page) + ((const PageHeaderData *) (page))->pd_special) \
+      |                   ^                          ~~~~
+src/lion_pages.c:2095:28: note: Assuming 'replace' is false
+ 2095 |         OffsetNumber firstright = replace ? OffsetNumberNext(off) : off;
+      |                                   ^~~~~~~
+src/lion_pages.c:2095:28: note: '?' condition is false
+src/lion_pages.c:2107:2: note: 'pN' initialized to a null pointer value
+ 2107 |         Page            pN = NULL;
+      |         ^~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2119:9: note: Assuming 'ndel' is >= 0
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |                ^~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2119:9: note: Left side of '&&' is true
+src/lion_pages.c:2119:22: note: 'nmove' is >= 0
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |                             ^~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2119:9: note: Left side of '&&' is true
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |                ^
+src/lion_pages.c:2119:2: note: Taking false branch
+ 2119 |         Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2119:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2120:9: note: Assuming 'nitems' is >= 1
+ 2120 |         Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+      |                ^~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2120:9: note: Left side of '&&' is true
+src/lion_pages.c:2120:24: note: Assuming 'nitems' is <= 3
+ 2120 |         Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+      |         ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2120:2: note: Taking false branch
+ 2120 |         Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
+      |         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2120:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2121:2: note: Assuming the condition is false
+ 2121 |         Assert(LionPageIsPostingLeaf(page));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:7: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                     ^~~~~~~~~~~~
+src/lion_pages.c:2121:2: note: Taking false branch
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2121:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2122:2: note: Assuming the condition is false
+ 2122 |         Assert(!LionPageIncompleteSplit(page));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:7: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                     ^~~~~~~~~~~~
+src/lion_pages.c:2122:2: note: Taking false branch
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2122:2: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2124:6: note: Assuming 'blk' is not equal to field 'head'
+ 2124 |         if (blk == entry->head)
+      |             ^~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2124:2: note: Taking false branch
+ 2124 |         if (blk == entry->head)
+      |         ^
+src/lion_pages.c:2176:14: note: 'i' is < 'nitems'
+ 2176 |         for (i = 0; i < nitems; i++)
+      |                     ^
+src/lion_pages.c:2176:2: note: Loop condition is true.  Entering loop body
+ 2176 |         for (i = 0; i < nitems; i++)
+      |         ^
+src/lion_pages.c:2176:14: note: Assuming 'i' is >= 'nitems'
+ 2176 |         for (i = 0; i < nitems; i++)
+      |                     ^~~~~~~~~~
+src/lion_pages.c:2176:2: note: Loop condition is false. Execution continues on line 2183
+ 2176 |         for (i = 0; i < nitems; i++)
+      |         ^
+src/lion_pages.c:2183:6: note: Assuming 'nmove' is > 0
+ 2183 |         if (nmove > 0)
+      |             ^~~~~~~~~
+src/lion_pages.c:2183:2: note: Taking true branch
+ 2183 |         if (nmove > 0)
+      |         ^
+src/lion_pages.c:2191:15: note: 'i' is < 'nmove'
+ 2191 |                 for (i = 0; i < nmove; i++)
+      |                             ^
+src/lion_pages.c:2191:3: note: Loop condition is true.  Entering loop body
+ 2191 |                 for (i = 0; i < nmove; i++)
+      |                 ^
+src/lion_pages.c:2196:11: note: Assuming the condition is true
+ 2196 |                         Assert(used + MAXALIGN(sz) <= BLCKSZ);
+      |                         ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2196:4: note: Taking false branch
+ 2196 |                         Assert(used + MAXALIGN(sz) <= BLCKSZ);
+      |                         ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2196:4: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2191:15: note: Assuming 'i' is >= 'nmove'
+ 2191 |                 for (i = 0; i < nmove; i++)
+      |                             ^~~~~~~~~
+src/lion_pages.c:2191:3: note: Loop condition is false. Execution continues on line 2204
+ 2191 |                 for (i = 0; i < nmove; i++)
+      |                 ^
+src/lion_pages.c:2207:6: note: 'ndel' is > 0
+ 2207 |         if (ndel > 0)
+      |             ^~~~
+src/lion_pages.c:2207:2: note: Taking true branch
+ 2207 |         if (ndel > 0)
+      |         ^
+src/lion_pages.c:2210:3: note: Loop condition is true.  Entering loop body
+ 2210 |                 for (i = 0; i < ndel; i++)
+      |                 ^
+src/lion_pages.c:2210:3: note: Loop condition is false. Execution continues on line 2228
+src/lion_pages.c:2230:6: note: 'ndel' is > 0
+ 2230 |         if (ndel > 0)
+      |             ^~~~
+src/lion_pages.c:2230:2: note: Taking true branch
+ 2230 |         if (ndel > 0)
+      |         ^
+src/lion_pages.c:2232:10: note: Assuming the condition is false
+ 2232 |         needm = PageGetExactFreeSpace((Page) trial->data) < need;
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2235:6: note: 'nmove' is > 0
+ 2235 |         if (nmove > 0)
+      |             ^~~~~
+src/lion_pages.c:2235:2: note: Taking true branch
+ 2235 |         if (nmove > 0)
+      |         ^
+src/lion_pages.c:2240:6: note: 'needm' is false
+ 2240 |         if (needm)
+      |             ^~~~~
+src/lion_pages.c:2240:2: note: Taking false branch
+ 2240 |         if (needm)
+      |         ^
+src/lion_pages.c:2249:2: note: Taking false branch
+ 2249 |         if (BufferIsValid(nbuf))
+      |         ^
+src/lion_pages.c:2254:2: note: Taking false branch
+ 2254 |         if (BufferIsValid(mbuf))
+      |         ^
+src/lion_pages.c:2260:6: note: 'ndel' is > 0
+ 2260 |         if (ndel > 0)
+      |             ^~~~
+src/lion_pages.c:2260:2: note: Taking true branch
+ 2260 |         if (ndel > 0)
+      |         ^
+src/lion_pages.c:2267:7: note: 'needm' is false
+ 2267 |         if (!needm)
+      |              ^~~~~
+src/lion_pages.c:2267:2: note: Taking true branch
+ 2267 |         if (!needm)
+      |         ^
+src/lion_pages.c:2269:10: note: Assuming the condition is true
+ 2269 |                 Assert(PageGetExactFreeSpace(pP) >= need);
+      |                        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:9: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                       ^~~~~~~~~
+src/lion_pages.c:2269:3: note: Taking false branch
+ 2269 |                 Assert(PageGetExactFreeSpace(pP) >= need);
+      |                 ^
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1018:3: note: expanded from macro 'Assert'
+ 1018 |                 if (!(condition)) \
+      |                 ^
+src/lion_pages.c:2269:3: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:1017:2: note: expanded from macro 'Assert'
+ 1017 |         do { \
+      |         ^
+src/lion_pages.c:2270:3: note: Loop condition is true.  Entering loop body
+ 2270 |                 for (i = 0; i < nitems; i++)
+      |                 ^
+src/lion_pages.c:2275:8: note: Assuming 'noff' is not equal to InvalidOffsetNumber
+ 2275 |                         if (noff == InvalidOffsetNumber)
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2275:4: note: Taking false branch
+ 2275 |                         if (noff == InvalidOffsetNumber)
+      |                         ^
+src/lion_pages.c:2270:3: note: Loop condition is false. Execution continues on line 2294
+ 2270 |                 for (i = 0; i < nitems; i++)
+      |                 ^
+src/lion_pages.c:2294:6: note: 'nmove' is > 0
+ 2294 |         if (nmove > 0)
+      |             ^~~~~
+src/lion_pages.c:2294:2: note: Taking true branch
+ 2294 |         if (nmove > 0)
+      |         ^
+src/lion_pages.c:2296:3: note: Loop condition is true.  Entering loop body
+ 2296 |                 for (i = 0; i < nmove; i++)
+      |                 ^
+src/lion_pages.c:2301:8: note: Assuming 'noff' is not equal to InvalidOffsetNumber
+ 2301 |                         if (noff == InvalidOffsetNumber)
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_pages.c:2301:4: note: Taking false branch
+ 2301 |                         if (noff == InvalidOffsetNumber)
+      |                         ^
+src/lion_pages.c:2296:3: note: Loop condition is false. Execution continues on line 2308
+ 2296 |                 for (i = 0; i < nmove; i++)
+      |                 ^
+src/lion_pages.c:2309:6: note: 'pN' is equal to NULL
+ 2309 |         if (pN != NULL)
+      |             ^~
+src/lion_pages.c:2309:2: note: Taking false branch
+ 2309 |         if (pN != NULL)
+      |         ^
+src/lion_pages.c:2311:6: note: 'pM' is equal to NULL
+ 2311 |         if (pM != NULL)
+      |             ^~
+src/lion_pages.c:2311:2: note: Taking false branch
+ 2311 |         if (pM != NULL)
+      |         ^
+src/lion_pages.c:2320:25: note: '?' condition is true
+ 2320 |                 BlockNumber after_m = BlockNumberIsValid(nblk) ? nblk : oldright;
+      |                                       ^
+src/lion_pages.c:2322:3: note: Taking false branch
+ 2322 |                 if (BlockNumberIsValid(mblk))
+      |                 ^
+src/lion_pages.c:2333:4: note: Taking true branch
+ 2333 |                         if (BlockNumberIsValid(nblk))
+      |                         ^
+src/lion_pages.c:2337:3: note: Taking true branch
+ 2337 |                 if (BlockNumberIsValid(nblk))
+      |                 ^
+src/lion_pages.c:2338:4: note: Access to field 'pd_special' results in a dereference of a null pointer (loaded from variable 'pN')
+ 2338 |                         LionPageGetOpaque(pN)->rightlink = oldright;
+      |                         ^                 ~~
+src/lion.h:101:51: note: expanded from macro 'LionPageGetOpaque'
+  101 | #define LionPageGetOpaque(page) ((LionPageOpaque) PageGetSpecialPointer(page))
+      |                                                   ^                     ~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:367:12: note: expanded from macro 'PageGetSpecialPointer'
+  367 |         ((page) + ((const PageHeaderData *) (page))->pd_special) \
+      |                   ^                          ~~~~
+22 warnings generated.

@@ -1,0 +1,47 @@
+echo "# +++ regress install-check in  +++" && /tmp/lion-range-review-fkvc3cle/pg20/lib/postgresql/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/tmp/lion-range-review-fkvc3cle/pg20/bin'    --inputdir=test --outputdir=test --dbname=contrib_regression array array_collide basic citext count directory distinct fkjoin hardening inlist insert large multicolumn noextension null options ordering partition pinbudget posting_tree prune pushdown range security security_exec sparse tableam tsvector unlogged vacuum verify walrecords
+# +++ regress install-check in  +++
+# using postmaster on /tmp/lion-comparison-2tq6fiu0/socket, port 55449
+ok 1         - array                                    2209 ms
+ok 2         - array_collide                             517 ms
+ok 3         - basic                                    3730 ms
+ok 4         - citext                                    185 ms
+ok 5         - count                                    2464 ms
+ok 6         - directory                                9091 ms
+ok 7         - distinct                                 2432 ms
+ok 8         - fkjoin                                   1302 ms
+ok 9         - hardening                                  87 ms
+ok 10        - inlist                                   9752 ms
+ok 11        - insert                                   8449 ms
+ok 12        - large                                   17389 ms
+ok 13        - multicolumn                              6111 ms
+ok 14        - noextension                               838 ms
+ok 15        - null                                     1544 ms
+ok 16        - options                                   365 ms
+ok 17        - ordering                                 3655 ms
+ok 18        - partition                                3788 ms
+ok 19        - pinbudget                                 690 ms
+ok 20        - posting_tree                             2613 ms
+ok 21        - prune                                      77 ms
+ok 22        - pushdown                                22516 ms
+ok 23        - range                                    5105 ms
+ok 24        - security                                  207 ms
+ok 25        - security_exec                             195 ms
+ok 26        - sparse                                   2342 ms
+ok 27        - tableam                                   346 ms
+ok 28        - tsvector                                  811 ms
+ok 29        - unlogged                                  815 ms
+ok 30        - vacuum                                   7811 ms
+ok 31        - verify                                   4959 ms
+ok 32        - walrecords                               1684 ms
+1..32
+# All 32 tests passed.
+echo "# +++ isolation install-check in  +++" && /tmp/lion-range-review-fkvc3cle/pg20/lib/postgresql/pgxs/src/makefiles/../../src/test/isolation/pg_isolation_regress --inputdir=./ --outputdir=output_iso --bindir='/tmp/lion-range-review-fkvc3cle/pg20/bin'    --inputdir=test/isolation --outputdir=test/isolation --dbname=isolation_regression count_range_vacuum_race count_lock_privilege count_serializable count_snapshot count_checkxmin
+# +++ isolation install-check in  +++
+# using postmaster on /tmp/lion-comparison-2tq6fiu0/socket, port 55449
+ok 1         - count_range_vacuum_race                   177 ms
+ok 2         - count_lock_privilege                       24 ms
+ok 3         - count_serializable                         38 ms
+ok 4         - count_snapshot                             83 ms
+ok 5         - count_checkxmin                            33 ms
+1..5
+# All 5 tests passed.

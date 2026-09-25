@@ -1,0 +1,14 @@
+{
+  "src": "/tmp/lion-range-review-fkvc3cle/src18",
+  "prefix": "/tmp/lion-range-review-fkvc3cle/pg18",
+  "server": "PostgreSQL 18.6",
+  "configure": "'--prefix=/tmp/claude-1000/-home-cgkanchi-code-pg-lion/56cf0453-5bfa-41cc-b276-b2a6db91507c/scratchpad/pgv/rel-18' '--without-icu' '--without-zlib' '--without-readline' 'CFLAGS=-O2'",
+  "extension_sha256": "f8facdad662e33f44d4b170484a6c1eefd3de8a4aee383acab28d5ca875a1dd5",
+  "extension_commit": "118f6239266973a8a3bda9e404702988871cd815",
+  "source_archive_sha256": "ae8a988e6014ee120693d02e1ac52decc8a4493fca1467c5890f29d81b41d6d5",
+  "wal_mode": "rmgr",
+  "elapsed_seconds": 393.99108875496313,
+  "note": "Build from archived commit, isolated release PostgreSQL installation. Source files were not modified by this review.",
+  "source_archive": "source.tar.gz",
+  "source_uncompressed_sha256": "0254cf07d41ca3a7be1f1ea7eec16b6e7252003524baf93891b8fda263cb5d1b"
+}

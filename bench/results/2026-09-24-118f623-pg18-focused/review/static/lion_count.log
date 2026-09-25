@@ -1,0 +1,343 @@
+In file included from src/lion_count.c:51:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/heapam.h:17:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/heapam_xlog.h:21:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:271:10: warning: Out of bound access to memory preceding the field 'pd_linp' [alpha.security.ArrayBoundV2]
+  271 |         return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+      |                 ^
+src/lion_count.c:1496:6: note: Assuming field 'mat' is equal to NULL
+ 1496 |         if (cur->set->mat != NULL)
+      |             ^~~~~~~~~~~~~~~~~~~~~
+src/lion_count.c:1496:2: note: Taking false branch
+ 1496 |         if (cur->set->mat != NULL)
+      |         ^
+src/lion_count.c:1505:6: note: Assuming field 'is_inline' is false
+ 1505 |         if (cur->set->is_inline)
+      |             ^~~~~~~~~~~~~~~~~~~
+src/lion_count.c:1505:2: note: Taking false branch
+ 1505 |         if (cur->set->is_inline)
+      |         ^
+src/lion_count.c:1513:2: note: Loop condition is true.  Entering loop body
+ 1513 |         for (;;)
+      |         ^
+src/lion_count.c:1519:37: note: Left side of '&&' is false
+ 1519 |                 while (BufferIsValid(cur->pinbuf) && cur->off <= cur->maxoff)
+      |                                                   ^
+src/lion_count.c:1532:7: note: Assuming field 'descend' is true
+ 1532 |                 if (cur->descend)
+      |                     ^~~~~~~~~~~~
+src/lion_count.c:1532:3: note: Taking true branch
+ 1532 |                 if (cur->descend)
+      |                 ^
+src/lion_count.c:1544:4: note: Taking false branch
+ 1544 |                         if (!BufferIsValid(buf))
+      |                         ^
+src/lion_count.c:1551:4: note: Assuming 'InterruptPending' is equal to 0
+ 1551 |                         CHECK_FOR_INTERRUPTS();
+      |                         ^~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/miscadmin.h:127:6: note: expanded from macro 'CHECK_FOR_INTERRUPTS'
+  127 |         if (INTERRUPTS_PENDING_CONDITION()) \
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/miscadmin.h:116:3: note: expanded from macro 'INTERRUPTS_PENDING_CONDITION'
+  116 |         (unlikely(InterruptPending))
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/c.h:494:38: note: expanded from macro 'unlikely'
+  494 | #define unlikely(x) __builtin_expect((x) != 0, 0)
+      |                                      ^~~~~~~~
+src/lion_count.c:1551:4: note: Taking false branch
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/miscadmin.h:127:2: note: expanded from macro 'CHECK_FOR_INTERRUPTS'
+  127 |         if (INTERRUPTS_PENDING_CONDITION()) \
+      |         ^
+src/lion_count.c:1551:4: note: Loop condition is false.  Exiting loop
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/miscadmin.h:125:32: note: expanded from macro 'CHECK_FOR_INTERRUPTS'
+  125 | #define CHECK_FOR_INTERRUPTS() \
+      |                                ^
+src/lion_count.c:1552:4: note:  Execution continues on line 1513
+ 1552 |                         continue;
+      |                         ^
+src/lion_count.c:1513:2: note: Loop condition is true.  Entering loop body
+ 1513 |         for (;;)
+      |         ^
+src/lion_count.c:1519:10: note: Left side of '&&' is true
+ 1519 |                 while (BufferIsValid(cur->pinbuf) && cur->off <= cur->maxoff)
+      |                        ^
+src/lion_count.c:1519:40: note: Assuming field 'off' is <= field 'maxoff'
+ 1519 |                 while (BufferIsValid(cur->pinbuf) && cur->off <= cur->maxoff)
+      |                                                      ^~~~~~~~~~~~~~~~~~~~~~~
+src/lion_count.c:1519:3: note: Loop condition is true.  Entering loop body
+ 1519 |                 while (BufferIsValid(cur->pinbuf) && cur->off <= cur->maxoff)
+      |                 ^
+src/lion_count.c:1521:18: note: Calling 'PageGetItemId'
+ 1521 |                         ItemId          iid = PageGetItemId(cur->img, cur->off);
+      |                                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/storage/bufpage.h:271:10: note: Access of the field 'pd_linp' at negative byte offset -4
+  271 |         return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from src/lion_count.c:51:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/heapam.h:19:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/relscan.h:17:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/htup_details.h:20:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+In file included from src/lion_count.c:90:
+In file included from src/lion.h:29:
+In file included from src/lion_wal.h:46:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: warning: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/xlog_internal.h:204:2: note: Call to function 'sscanf' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'sscanf_s' in case of C11
+  204 |         sscanf(fname, "%08X%08X%08X", tli, &log, &seg);
+      |         ^~~~~~
+src/lion_count.c:338:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  338 |         memset(probe, 0, sizeof(LionProbe));
+      |         ^~~~~~
+src/lion_count.c:338:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  338 |         memset(probe, 0, sizeof(LionProbe));
+      |         ^~~~~~
+src/lion_count.c:545:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  545 |         memset(ps, 0, sizeof(LionPostingSet));
+      |         ^~~~~~
+src/lion_count.c:545:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  545 |         memset(ps, 0, sizeof(LionPostingSet));
+      |         ^~~~~~
+src/lion_count.c:584:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  584 |                         memcpy(ps->payload, LionEntryGetPayload(entry), ps->paylen);
+      |                         ^~~~~~
+src/lion_count.c:584:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  584 |                         memcpy(ps->payload, LionEntryGetPayload(entry), ps->paylen);
+      |                         ^~~~~~
+src/lion_count.c:675:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  675 |         memset(ps, 0, sizeof(LionPostingSet));
+      |         ^~~~~~
+src/lion_count.c:675:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  675 |         memset(ps, 0, sizeof(LionPostingSet));
+      |         ^~~~~~
+src/lion_count.c:928:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  928 |                 memset(&sets[nsets], 0, sizeof(LionPostingSet));
+      |                 ^~~~~~
+src/lion_count.c:928:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  928 |                 memset(&sets[nsets], 0, sizeof(LionPostingSet));
+      |                 ^~~~~~
+src/lion_count.c:1094:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1094 |         memset(ps, 0, sizeof(LionPostingSet));
+      |         ^~~~~~
+src/lion_count.c:1094:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 1094 |         memset(ps, 0, sizeof(LionPostingSet));
+      |         ^~~~~~
+src/lion_count.c:1149:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1149 |                 memset(fresh, 0, sizeof(LionPostingSet));
+      |                 ^~~~~~
+src/lion_count.c:1149:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 1149 |                 memset(fresh, 0, sizeof(LionPostingSet));
+      |                 ^~~~~~
+src/lion_count.c:1275:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1275 |                         memcpy(img, BufferGetPage(firstbuf), BLCKSZ);
+      |                         ^~~~~~
+src/lion_count.c:1275:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1275 |                         memcpy(img, BufferGetPage(firstbuf), BLCKSZ);
+      |                         ^~~~~~
+src/lion_count.c:1324:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1324 |                         memcpy(buf + used, c, sz);
+      |                         ^~~~~~
+src/lion_count.c:1324:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1324 |                         memcpy(buf + used, c, sz);
+      |                         ^~~~~~
+src/lion_count.c:1347:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1347 |                         memcpy(img, page, BLCKSZ);
+      |                         ^~~~~~
+src/lion_count.c:1347:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1347 |                         memcpy(img, page, BLCKSZ);
+      |                         ^~~~~~
+src/lion_count.c:1416:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1416 |         memset(cur, 0, sizeof(LionSetCursor));
+      |         ^~~~~~
+src/lion_count.c:1416:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 1416 |         memset(cur, 0, sizeof(LionSetCursor));
+      |         ^~~~~~
+src/lion_count.c:1473:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 1473 |         memcpy(cur->img, BufferGetPage(buf), BLCKSZ);
+      |         ^~~~~~
+src/lion_count.c:1473:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 1473 |         memcpy(cur->img, BufferGetPage(buf), BLCKSZ);
+      |         ^~~~~~
+src/lion_count.c:2125:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 2125 |         memcpy(LION_BITSET_DATA(dest), w, LION_BITSET_BYTES);
+      |         ^~~~~~
+src/lion_count.c:2125:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 2125 |         memcpy(LION_BITSET_DATA(dest), w, LION_BITSET_BYTES);
+      |         ^~~~~~
+src/lion_count.c:2146:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 2146 |         memset(c, 0, sizeof(LionExprCursor));
+      |         ^~~~~~
+src/lion_count.c:2146:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 2146 |         memset(c, 0, sizeof(LionExprCursor));
+      |         ^~~~~~
+src/lion_count.c:2260:4: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 2260 |                         memset(c->bits, 0, LION_BITSET_BYTES);
+      |                         ^~~~~~
+src/lion_count.c:2260:4: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 2260 |                         memset(c->bits, 0, LION_BITSET_BYTES);
+      |                         ^~~~~~
+In file included from src/lion_count.c:2953:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:487:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  487 |         memset(tb->data, 0, sizeof(SH_ELEMENT_TYPE) * tb->size);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:487:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+  487 |         memset(tb->data, 0, sizeof(SH_ELEMENT_TYPE) * tb->size);
+      |         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:595:4: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  595 |                         memcpy(newentry, oldentry, sizeof(SH_ELEMENT_TYPE));
+      |                         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:595:4: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  595 |                         memcpy(newentry, oldentry, sizeof(SH_ELEMENT_TYPE));
+      |                         ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:741:5: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  741 |                                 memcpy(lastentry, moveentry, sizeof(SH_ELEMENT_TYPE));
+      |                                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:741:5: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  741 |                                 memcpy(lastentry, moveentry, sizeof(SH_ELEMENT_TYPE));
+      |                                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:915:5: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  915 |                                 memcpy(lastentry, curentry, sizeof(SH_ELEMENT_TYPE));
+      |                                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:915:5: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  915 |                                 memcpy(lastentry, curentry, sizeof(SH_ELEMENT_TYPE));
+      |                                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:978:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  978 |                 memcpy(lastentry, curentry, sizeof(SH_ELEMENT_TYPE));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/lib/simplehash.h:978:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  978 |                 memcpy(lastentry, curentry, sizeof(SH_ELEMENT_TYPE));
+      |                 ^~~~~~
+src/lion_count.c:3210:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 3210 |         memset(e->vis, 0, sizeof(e->vis));
+      |         ^~~~~~
+src/lion_count.c:3210:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 3210 |         memset(e->vis, 0, sizeof(e->vis));
+      |         ^~~~~~
+src/lion_count.c:3437:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 3437 |                 memset(needrecheck, 0, sizeof(needrecheck));
+      |                 ^~~~~~
+src/lion_count.c:3437:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 3437 |                 memset(needrecheck, 0, sizeof(needrecheck));
+      |                 ^~~~~~
+src/lion_count.c:4576:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 4576 |         memset(&cx, 0, sizeof(cx));
+      |         ^~~~~~
+src/lion_count.c:4576:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 4576 |         memset(&cx, 0, sizeof(cx));
+      |         ^~~~~~
+src/lion_count.c:4750:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 4750 |         memset(&src, 0, sizeof(src));
+      |         ^~~~~~
+src/lion_count.c:4750:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 4750 |         memset(&src, 0, sizeof(src));
+      |         ^~~~~~
+src/lion_count.c:4776:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 4776 |         memset(&src, 0, sizeof(src));
+      |         ^~~~~~
+src/lion_count.c:4776:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 4776 |         memset(&src, 0, sizeof(src));
+      |         ^~~~~~
+src/lion_count.c:4785:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 4785 |         memset(&cx, 0, sizeof(cx));
+      |         ^~~~~~
+src/lion_count.c:4785:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 4785 |         memset(&cx, 0, sizeof(cx));
+      |         ^~~~~~
+src/lion_count.c:4865:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 4865 |         memset(range, 0, sizeof(LionRange));
+      |         ^~~~~~
+src/lion_count.c:4865:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 4865 |         memset(range, 0, sizeof(LionRange));
+      |         ^~~~~~
+src/lion_count.c:4914:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 4914 |         memset(b, 0, sizeof(LionRangeBound));
+      |         ^~~~~~
+src/lion_count.c:4914:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 4914 |         memset(b, 0, sizeof(LionRangeBound));
+      |         ^~~~~~
+src/lion_count.c:5129:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 5129 |                 memcpy(es->lastkey, LionEntryGetKey(entry), entry->keylen);
+      |                 ^~~~~~
+src/lion_count.c:5129:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+ 5129 |                 memcpy(es->lastkey, LionEntryGetKey(entry), entry->keylen);
+      |                 ^~~~~~
+src/lion_count.c:5832:7: warning: Out of bound access to memory after the end of 'call.index' [alpha.security.ArrayBoundV2]
+ 5832 |                 if (call->index[i] != NULL)
+      |                     ^
+src/lion_count.c:5879:18: note: Calling 'lion_count_sql'
+ 5879 |         PG_RETURN_INT64(lion_count_sql(fcinfo, 2, NULL));
+      |         ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/fmgr.h:370:50: note: expanded from macro 'PG_RETURN_INT64'
+  370 | #define PG_RETURN_INT64(x)       return Int64GetDatum(x)
+      |                                                       ^
+src/lion_count.c:5848:6: note: Assuming 'snapshot' is not equal to NULL
+ 5848 |         if (snapshot == NULL)
+      |             ^~~~~~~~~~~~~~~~
+src/lion_count.c:5848:2: note: Taking false branch
+ 5848 |         if (snapshot == NULL)
+      |         ^
+src/lion_count.c:5860:2: note: Loop condition is true.  Entering loop body
+ 5860 |         for (i = 0; i < nkeys; i++)
+      |         ^
+src/lion_count.c:5860:2: note: Loop condition is true.  Entering loop body
+src/lion_count.c:5860:2: note: Loop condition is false. Execution continues on line 5863
+src/lion_count.c:5866:2: note: Calling 'lion_count_sql_close'
+ 5866 |         lion_count_sql_close(&call);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/lion_count.c:5830:14: note: Assuming 'i' is < field 'nkeys'
+ 5830 |         for (i = 0; i < call->nkeys; i++)
+      |                     ^~~~~~~~~~~~~~~
+src/lion_count.c:5830:2: note: Loop condition is true.  Entering loop body
+ 5830 |         for (i = 0; i < call->nkeys; i++)
+      |         ^
+src/lion_count.c:5832:3: note: Taking true branch
+ 5832 |                 if (call->index[i] != NULL)
+      |                 ^
+src/lion_count.c:5830:14: note: Assuming 'i' is < field 'nkeys'
+ 5830 |         for (i = 0; i < call->nkeys; i++)
+      |                     ^~~~~~~~~~~~~~~
+src/lion_count.c:5830:2: note: Loop condition is true.  Entering loop body
+ 5830 |         for (i = 0; i < call->nkeys; i++)
+      |         ^
+src/lion_count.c:5832:3: note: Taking true branch
+ 5832 |                 if (call->index[i] != NULL)
+      |                 ^
+src/lion_count.c:5830:14: note: Assuming 'i' is < field 'nkeys'
+ 5830 |         for (i = 0; i < call->nkeys; i++)
+      |                     ^~~~~~~~~~~~~~~
+src/lion_count.c:5830:2: note: Loop condition is true.  Entering loop body
+ 5830 |         for (i = 0; i < call->nkeys; i++)
+      |         ^
+src/lion_count.c:5832:7: note: Access of 'call.index' at index 2, while it holds only 2 'struct RelationData *' elements
+ 5832 |                 if (call->index[i] != NULL)
+      |                     ^~~~~~~~~~~~~~
+src/lion_count.c:5895:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 5895 |         memset(&stats, 0, sizeof(stats));
+      |         ^~~~~~
+src/lion_count.c:5895:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 5895 |         memset(&stats, 0, sizeof(stats));
+      |         ^~~~~~
+src/lion_count.c:5960:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 5960 |                 memset(&src, 0, sizeof(src));
+      |                 ^~~~~~
+src/lion_count.c:5960:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 5960 |                 memset(&src, 0, sizeof(src));
+      |                 ^~~~~~
+src/lion_count.c:6045:2: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 6045 |         memset(&stats, 0, sizeof(stats));
+      |         ^~~~~~
+src/lion_count.c:6045:2: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 6045 |         memset(&stats, 0, sizeof(stats));
+      |         ^~~~~~
+src/lion_count.c:6072:3: warning: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+ 6072 |                 memset(&src, 0, sizeof(src));
+      |                 ^~~~~~
+src/lion_count.c:6072:3: note: Call to function 'memset' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memset_s' in case of C11
+ 6072 |                 memset(&src, 0, sizeof(src));
+      |                 ^~~~~~
+37 warnings generated.

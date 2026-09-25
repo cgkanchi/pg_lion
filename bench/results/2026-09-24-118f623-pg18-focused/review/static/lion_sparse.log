@@ -1,0 +1,84 @@
+In file included from src/lion_sparse.c:26:
+In file included from src/lion_sparse.h:53:
+In file included from src/lion_container.h:20:
+In file included from src/lion_tid.h:12:
+In file included from /tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/htup_details.h:20:
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+/tmp/lion-range-review-fkvc3cle/pg20/include/postgresql/server/access/tupmacs.h:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(isnull, &isnull_8, sizeof(uint64));
+      |                 ^~~~~~
+src/lion_sparse.c:83:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   83 |                 memcpy(LION_SPARSE_CKEYS(dest), LION_SPARSE_CKEYS_CONST(src) + from,
+      |                 ^~~~~~
+src/lion_sparse.c:83:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   83 |                 memcpy(LION_SPARSE_CKEYS(dest), LION_SPARSE_CKEYS_CONST(src) + from,
+      |                 ^~~~~~
+src/lion_sparse.c:85:3: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+   85 |                 memcpy(LION_SPARSE_LOS(dest), LION_SPARSE_LOS_CONST(src) + from,
+      |                 ^~~~~~
+src/lion_sparse.c:85:3: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+   85 |                 memcpy(LION_SPARSE_LOS(dest), LION_SPARSE_LOS_CONST(src) + from,
+      |                 ^~~~~~
+src/lion_sparse.c:110:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  110 |         memmove(ckeys + from, ckeys + from + count,
+      |         ^~~~~~~
+src/lion_sparse.c:110:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  110 |         memmove(ckeys + from, ckeys + from + count,
+      |         ^~~~~~~
+src/lion_sparse.c:118:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  118 |         memmove(newlos, los, (Size) from * sizeof(uint16));
+      |         ^~~~~~~
+src/lion_sparse.c:118:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  118 |         memmove(newlos, los, (Size) from * sizeof(uint16));
+      |         ^~~~~~~
+src/lion_sparse.c:119:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  119 |         memmove(newlos + from, los + from + count,
+      |         ^~~~~~~
+src/lion_sparse.c:119:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  119 |         memmove(newlos + from, los + from + count,
+      |         ^~~~~~~
+src/lion_sparse.c:217:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  217 |         memmove(newlos + pos + 1, los + pos, (Size) (n - pos) * sizeof(uint16));
+      |         ^~~~~~~
+src/lion_sparse.c:217:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  217 |         memmove(newlos + pos + 1, los + pos, (Size) (n - pos) * sizeof(uint16));
+      |         ^~~~~~~
+src/lion_sparse.c:218:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  218 |         memmove(newlos, los, (Size) pos * sizeof(uint16));
+      |         ^~~~~~~
+src/lion_sparse.c:218:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  218 |         memmove(newlos, los, (Size) pos * sizeof(uint16));
+      |         ^~~~~~~
+src/lion_sparse.c:219:2: warning: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  219 |         memmove(ckeys + pos + 1, ckeys + pos, (Size) (n - pos) * sizeof(uint32));
+      |         ^~~~~~~
+src/lion_sparse.c:219:2: note: Call to function 'memmove' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memmove_s' in case of C11
+  219 |         memmove(ckeys + pos + 1, ckeys + pos, (Size) (n - pos) * sizeof(uint32));
+      |         ^~~~~~~
+src/lion_sparse.c:395:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  395 |         memcpy(LION_SPARSE_CKEYS(out), LION_SPARSE_CKEYS_CONST(a),
+      |         ^~~~~~
+src/lion_sparse.c:395:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  395 |         memcpy(LION_SPARSE_CKEYS(out), LION_SPARSE_CKEYS_CONST(a),
+      |         ^~~~~~
+src/lion_sparse.c:397:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  397 |         memcpy(LION_SPARSE_CKEYS(out) + na, LION_SPARSE_CKEYS_CONST(b),
+      |         ^~~~~~
+src/lion_sparse.c:397:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  397 |         memcpy(LION_SPARSE_CKEYS(out) + na, LION_SPARSE_CKEYS_CONST(b),
+      |         ^~~~~~
+src/lion_sparse.c:399:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  399 |         memcpy(LION_SPARSE_LOS(out), LION_SPARSE_LOS_CONST(a),
+      |         ^~~~~~
+src/lion_sparse.c:399:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  399 |         memcpy(LION_SPARSE_LOS(out), LION_SPARSE_LOS_CONST(a),
+      |         ^~~~~~
+src/lion_sparse.c:401:2: warning: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11 [security.insecureAPI.DeprecatedOrUnsafeBufferHandling]
+  401 |         memcpy(LION_SPARSE_LOS(out) + na, LION_SPARSE_LOS_CONST(b),
+      |         ^~~~~~
+src/lion_sparse.c:401:2: note: Call to function 'memcpy' is insecure as it does not provide security checks introduced in the C11 standard. Replace with analogous functions that support length arguments or provides boundary checks such as 'memcpy_s' in case of C11
+  401 |         memcpy(LION_SPARSE_LOS(out) + na, LION_SPARSE_LOS_CONST(b),
+      |         ^~~~~~
+13 warnings generated.

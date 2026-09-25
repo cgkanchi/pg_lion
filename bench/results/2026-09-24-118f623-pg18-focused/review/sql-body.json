@@ -1,0 +1,60 @@
+[
+  {
+    "sql": "SELECT prosrc, prosqlbody IS NOT NULL FROM pg_proc WHERE oid='lion_ocmp(int,int)'::regprocedure",
+    "result": [
+      [
+        "",
+        "t"
+      ]
+    ]
+  },
+  {
+    "sql": "SELECT ordered FROM lion_index_stats('identity_idx')",
+    "result": [
+      [
+        "t"
+      ]
+    ]
+  },
+  {
+    "sql": "SELECT lion_index_count('identity_idx',7)",
+    "result": [
+      [
+        "10"
+      ]
+    ]
+  },
+  {
+    "sql": "SELECT prosrc, prosqlbody IS NOT NULL FROM pg_proc WHERE oid='lion_ocmp(int,int)'::regprocedure",
+    "result": [
+      [
+        "",
+        "t"
+      ]
+    ]
+  },
+  {
+    "sql": "SELECT ordered FROM lion_index_stats('identity_idx')",
+    "result": [
+      [
+        "t"
+      ]
+    ]
+  },
+  {
+    "sql": "SELECT lion_index_count('identity_idx',7)",
+    "result": [
+      [
+        "0"
+      ]
+    ]
+  },
+  {
+    "sql": "SET pg_lion.enable_count_pushdown=off;SET enable_bitmapscan=off;SELECT count(*) FROM identity_probe WHERE k=7",
+    "result": [
+      [
+        "10"
+      ]
+    ]
+  }
+]
