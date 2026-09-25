@@ -658,6 +658,23 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- as "level 1 has 4 downlinks but level 0 has 5 pages";
         -- test/isolation/verify_incomplete_split.spec makes a posting split and a directory
         -- split fail at their injection points and verifies both.
+        -- A DAMAGED PAGE IS AN ERROR, never a crash, a read past the page or a write: every block
+        -- number verify() follows - the meta page's root, downlinks, right links, an entry's head,
+        -- a posting pivot's child - is checked against the index's length before ReadBuffer(),
+        -- which on 16-18 takes InvalidBlockNumber for P_NEW and EXTENDS the relation; every page
+        -- header's bounds are checked, then every line pointer (normal, non-empty, inside
+        -- [pd_upper, pd_special), MAXALIGNed: amcheck's PageGetItemIdCareful()), then every
+        -- directory item's header, key column and key extent and length, before anything
+        -- compares, copies or hashes it - the order checks used to hand an entry's column to
+        -- lion_column() and compare its key before the entry check had looked at either; and the
+        -- meta page's height is bounded by the index's length before the walk sizes arrays by it.
+        -- lion_index_stats(), granted to pg_stat_scan_tables, reports damage to nobody, so it
+        -- skips the pages and items it cannot read safely instead: a header out of bounds, a line
+        -- pointer outside the item space, an entry shorter than its key (whose payload length
+        -- used to underflow), an item of no known type. The regression suite writes each kind of
+        -- damage into a temporary index's file (verify.sql) and gets an ERROR from verify() and
+        -- a count without the damaged item from lion_index_stats(), where the code before
+        -- asserted, read past the page, or extended the index.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
