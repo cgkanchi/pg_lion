@@ -743,8 +743,9 @@ phase1c() {
 # LION_PAGE_INCOMPLETE_SPLIT, its right sibling exists and is linked in, but
 # the parent has no downlink for it yet, and the server dies.  Readers never
 # noticed (the right link gets them there, and a sequential walk of the leaves
-# is all they do), and the first writer that descends to that page finishes the
-# split before touching it.
+# is all they do), and the next writer finishes the split: an APPEND - the
+# split was of the set's last leaf, so its right half is the entry's tail -
+# and, after it, inserts that descend into every leaf's range.
 #
 # The crash point is deterministic: an injection point parks the inserting
 # backend in that window and the server is pulled out from under it.
@@ -827,14 +828,42 @@ phase1d() {
 				(select count(*) from lion_psplit where id % 2 = 1),
 				'k = 1 still answers exactly'"
 
-	# A WRITER's descent is what repairs it - the descent that lands on the
-	# flagged page finishes its split before touching the page - but only a
-	# descent that ROUTES there does, and an append does not descend at all
-	# (it takes the set's last leaf directly, which is the point of the append
-	# hint).  So the rows below are made to land all over the heap instead:
-	# a third of them is deleted, VACUUM frees those line pointers on every
-	# page, and the inserts that refill them have container keys in every
-	# leaf's range, including the flagged one's.
+	# An APPEND, which is what an append-only table does next, and until
+	# 2026-09-25 the one writer that could not repair this: it took the set's
+	# last leaf through the append hint - the right half of the unfinished
+	# split, which has no downlink - and the first split of THAT page failed
+	# with "no downlink for block N", as did every later split of the tail
+	# (DESIGN.md §22 addendum, "an unfinished split and the writers that do not
+	# descend").  An insert that may split the page descends now, the descent
+	# routes to the flagged left half and finishes it on the way, and this
+	# phase used to route around the bug by inserting only into the middle of
+	# the heap (below).
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: appending after the crash failed"
+		SET synchronous_commit = on;
+		INSERT INTO lion_psplit SELECT 200000 + i, i % 2
+		  FROM generate_series(1, 20000) i;
+	SQL
+
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_psplit_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unfinished split' || true)
+	[ "$warn" = 0 ] ||
+		die "phase 1d: $warn posting page(s) still have an unfinished split after the append"
+	run_check "phase 1d appended" psql_p \
+		"select (select count(*) from lion_psplit where k = 0) =
+				(select count(*) from lion_psplit where id % 2 = 0),
+				'k = 0 answers exactly after the append'
+		 union all
+		 select (select count(*) from lion_psplit where k = 1) =
+				(select count(*) from lion_psplit where id % 2 = 1),
+				'k = 1 answers exactly after the append'
+		 union all
+		 select true, 'verify() is clean after the append'
+		   from (select lion_index_verify('lion_psplit_k', true)) v"
+
+	# Then writers that DESCEND into every leaf's range, the repair path this
+	# phase was first written for: a third of the rows is deleted, VACUUM frees
+	# those line pointers on every page, and the inserts that refill them have
+	# container keys in every leaf's range.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: the repairing insert failed"
 		SET synchronous_commit = on;
 		DELETE FROM lion_psplit WHERE id % 3 = 0;
@@ -863,8 +892,8 @@ phase1d() {
 	psql_p -c "DROP TABLE lion_psplit" >>"$RUNLOG" 2>&1
 	psql_p -c "DROP TABLE IF EXISTS lion_psplit_flush" >>"$RUNLOG" 2>&1
 
-	log "phase 1d: the unfinished posting split survived the crash and a writer's descent repaired it ($before -> $after leaves)"
-	SUMMARY+=("phase1d            crash between posting split and downlink; repaired on the next descent")
+	log "phase 1d: the unfinished posting split survived the crash and the next append repaired it ($before -> $after leaves)"
+	SUMMARY+=("phase1d            crash between posting split and downlink; repaired by the next append")
 }
 
 # ---------------------------------------------------------------- phase 2

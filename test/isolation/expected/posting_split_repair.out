@@ -1,0 +1,118 @@
+Parsed test spec with 1 sessions
+
+starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step a_fill: INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 60000) i;
+step split_breaks: SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step a_cut: INSERT INTO psr_app SELECT 100000 + i, i % 2 FROM generate_series(1, 30000) i;
+ERROR:  error triggered for injection point lion-posting-split-incomplete
+step split_works: SELECT injection_points_detach('lion-posting-split-incomplete');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step a_append: 
+	INSERT INTO psr_app SELECT 200000 + i, i % 2 FROM generate_series(1, 20000) i;
+	INSERT INTO psr_app SELECT 300000 + i, i % 2 FROM generate_series(1, 20000) i;
+
+step a_check: 
+	SELECT lion_index_verify('psr_app_k', true);
+	SELECT * FROM psr_counts('psr_app', 0);
+	SELECT * FROM psr_counts('psr_app', 1);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+via_index|via_heap
+---------+--------
+    50000|   50000
+(1 row)
+
+via_index|via_heap
+---------+--------
+    50000|   50000
+(1 row)
+
+step b_holes: DELETE FROM psr_right WHERE k = 3 AND id <= 14464;
+step b_vacuum_holes: VACUUM (INDEX_CLEANUP ON) psr_right;
+step b_before: SELECT container_pages FROM lion_index_stats('psr_right_k');
+container_pages
+---------------
+              7
+(1 row)
+
+step split_breaks: SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step b_cut: SELECT psr_insert_until_error('psr_right');
+psr_insert_until_error                                           
+-----------------------------------------------------------------
+error triggered for injection point lion-posting-split-incomplete
+(1 row)
+
+step split_works: SELECT injection_points_detach('lion-posting-split-incomplete');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step b_after_cut: 
+	SELECT * FROM psr_landed('psr_right');
+	SELECT container_pages FROM lion_index_stats('psr_right_k');
+
+lo|hi
+--+--
+ 0| 0
+(1 row)
+
+container_pages
+---------------
+              8
+(1 row)
+
+step b_delete: 
+	DELETE FROM psr_right WHERE k = 1 AND id % 30 IN (1, 3)
+	   AND id BETWEEN 14464 + 1 AND 14464 * 4;
+
+step b_vacuum: VACUUM (INDEX_CLEANUP ON) psr_right;
+step b_check: 
+	SELECT container_pages FROM lion_index_stats('psr_right_k');
+	SELECT lion_index_verify('psr_right_k', true);
+	SELECT * FROM psr_counts('psr_right', 1);
+	SELECT * FROM psr_counts('psr_right', 2);
+
+container_pages
+---------------
+              9
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+via_index|via_heap
+---------+--------
+    16448|   16448
+(1 row)
+
+via_index|via_heap
+---------+--------
+    92568|   92568
+(1 row)
+
