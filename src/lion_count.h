@@ -683,4 +683,13 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *output_rel,
 								   void *extra);
 
+/* ---------------------------------------------------------------------
+ * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan
+ * --------------------------------------------------------------------- */
+
+extern PGDLLIMPORT bool lion_enable_ordered_scan;
+
+/* GUC, scan methods and set_rel_pathlist_hook; called from _PG_init. */
+extern void lion_ordered_init(void);
+
 #endif							/* LION_COUNT_H */

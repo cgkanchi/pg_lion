@@ -96,6 +96,52 @@ SELECT k, count(*) FROM hk_p WHERE k IN (0, 7, 19) GROUP BY k ORDER BY k;
 (3 rows)
 
 RESET pg_lion.enable_count_pushdown;
+-- the LionOrdered scan (DESIGN.md §30), which set_rel_pathlist_hook adds,
+-- chained the same way: the lion filter k = 3 over a walk of the btree on v
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET enable_indexscan = off; SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF) SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
+              QUERY PLAN               
+---------------------------------------
+ Limit
+   ->  Custom Scan (LionOrdered) on hk
+         Ordered By: hk_v
+         Lion Cond: (k = 3)
+         Lion Indexes: hk_k
+(5 rows)
+
+SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
+ v  
+----
+  3
+ 23
+ 43
+ 63
+ 83
+(5 rows)
+
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET enable_indexscan; RESET enable_indexonlyscan;
+SET pg_lion.enable_ordered_scan = off;
+SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
+ v  
+----
+  3
+ 23
+ 43
+ 63
+ 83
+(5 rows)
+
+RESET pg_lion.enable_ordered_scan;
+-- the other rel hook found pg_lion's path there both times
+SELECT lion_hooktest_rel_calls() > 0 AS rel_hook_ran,
+	   lion_hooktest_rel_saw_ordered() AS rel_hook_saw_ordered_path;
+ rel_hook_ran | rel_hook_saw_ordered_path 
+--------------+---------------------------
+ t            |                         2
+(1 row)
+
 SET pg_lion.no_such_setting = 1;
 ERROR:  invalid configuration parameter name "pg_lion.no_such_setting"
 SET lion_hooktest.no_such_setting = 1;

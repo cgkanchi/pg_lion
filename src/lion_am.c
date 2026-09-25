@@ -158,6 +158,12 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * The LionOrdered CustomScan (DESIGN.md §30): its GUC, its scan methods
+	 * and the set_rel_pathlist_hook that offers it, chained like the other.
+	 */
+	lion_ordered_init();
+
 	MarkGUCPrefixReserved("pg_lion");
 
 	lion_prev_create_upper_paths_hook = create_upper_paths_hook;

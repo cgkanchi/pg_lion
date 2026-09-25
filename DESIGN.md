@@ -620,6 +620,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
     src/lion_vacuum.c         ambulkdelete/amvacuumcleanup                              (wave 2)
     src/lion_funcs.c          stats/verify (+ count in phase 2)                         (wave 2)
     src/lion_multikey.c       GIN-style extraction and query trees (§17)                (wave 3)
+    src/lion_ordered.c        LionOrdered: lion-filtered, btree-ordered scans (§30)
     pg_lion.control, pg_lion--0.1.sql, Makefile, test/                    (am-core, then wave 2)
 
 Coding conventions: PostgreSQL C style (tabs, K&R braces on their own line for functions, /* */
@@ -3960,8 +3961,8 @@ What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, l
 previous hook first), and nothing else among the hooks - no planner, executor, ProcessUtility or
 object-access hook -; a custom WAL resource manager, only
 while `shared_preload_libraries` is processed; its GUCs, with the `pg_lion` prefix reserved by
-`MarkGUCPrefixReserved()`. The hook saves the previous value and calls it FIRST, then adds its own
-path (`lion_create_upper_paths()`), so whichever extension was loaded before pg_lion has already
+`MarkGUCPrefixReserved()`. Each hook saves the previous value and calls it FIRST, then adds its own
+path (`lion_create_upper_paths()`, `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
 added its paths when pg_lion adds its own, and an extension loaded after pg_lion reaches pg_lion
 through its own chaining. Nothing is ever uninstalled: core has not unloaded a library since
 PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
@@ -3982,7 +3983,10 @@ Against the dev cluster, restarted with the options on pg_ctl's command line:
 - in each of those four, the other hook runs on every query, sees pg_lion's path exactly when it
   was installed after pg_lion (6 times per test file, or 0), LionCount is in the plan for a plain
   count, a GROUP BY and a partitioned GROUP BY, the answers equal those with the pushdown off,
-  and `SET pg_lion.<anything else>` and `SET lion_hooktest.<anything else>` are errors;
+  and `SET pg_lion.<anything else>` and `SET lion_hooktest.<anything else>` are errors; since
+  §30 the module chains `set_rel_pathlist_hook` as well, and its hook finds the LionOrdered path
+  in the base rel exactly when pg_lion's was installed first (twice per test file, or 0), with the
+  ordered answer equal to the one with `pg_lion.enable_ordered_scan` off;
 - both preloaded on id 128: the postmaster refuses to start with core's `failed to register
   custom resource manager "lion_hooktest" with ID 128` / `Custom resource manager "pg_lion"
   already registered with the same ID` - the collision the `pg_lion.rmgr_id` GUC exists to move
@@ -6126,7 +6130,8 @@ replaces native ordered lion scans (§29.8, `amcanorder` on 18+), which stay def
   a relation with security quals - RLS policies or a security-barrier view, i.e. an RTE with
   `securityQuals` or any restriction clause with `security_level > 0` - exactly as LionCount
   declines them (§9, "Row-level security"): the ordinary plan applies them with core's
-  leakproofness rules. Partitioned tables and their partitions are declined in v1 (§30.8).
+  leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so are
+  partitioned tables and their partitions, in v1 (§30.8).
 - **The WHERE.** The relation's restriction clauses, an implicit AND. Some of them are answered by
   lion indexes and the rest stay a heap-side filter. WHICH of them lion answers, and how, is not
   decided here but by core's own index matching: every shape the bitmap path supports - `=`, IN /
@@ -6271,6 +6276,10 @@ than overruns (§30.4).
   `table_tuple_fetch_row_version()`. A member with no visible version is skipped; a visible one is
   rechecked when the set is inexact (above) or the index set `xs_recheck` (against the ordered
   index's original clauses), then handed to `ExecScan()`, which applies the filter and projects.
+  A set with nothing in it ends the scan before the walk starts, and once as many members have
+  been found as the set holds (its cardinality, known unless it degraded) the walk stops early:
+  a btree returns each heap TID once, so nothing past that point can be a member. Without a LIMIT
+  that saves the rest of the index.
 - **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
   substituted row against the `lionqual` and the ordered index's original clauses, as an Index
   Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.
@@ -6346,16 +6355,17 @@ ordinary plan returns, in the same order.
 
     Limit
       ->  Custom Scan (LionOrdered) on fact
-            Order By: fact_c1m_idx [Backward]
+            Filter: (length(payload) > 60)           -- core's, printed first by core
+            Ordered By: fact_c1m_idx (backward)      -- "(backward)" for a backward walk
             Index Cond: (c1m > 100)                  -- the ordered index's own quals, if any
             Lion Cond: ((c200 = 17) AND (c2 = 1))    -- the lionqual
             Lion Indexes: fact_c200_idx, fact_c2_idx
-            Filter: (length(payload) > 60)           -- core's, with Rows Removed by Filter
 
 and with ANALYZE `Index Entries Walked`, `Lion Set Hits` (walked entries that were members),
-`Heap Fetches` (members with a visible version), `Rows Removed by Lion Recheck`, and
-`Lion Set: N containers, exact | rechecked | degraded` with the number of builds when rescans
-rebuilt it.
+`Heap Fetches` (members with a visible version), `Rows Removed by Lion Recheck` (printed when
+the set is not exact or something was removed), and `Lion Set: N containers, exact | rechecked |
+degraded[, B builds]`, the builds counted when rescans rebuilt it (a LATERAL subquery whose lion
+filter takes the outer row's value: one per outer row).
 
 ### 30.8 Declined in v1, and why
 
@@ -6363,6 +6373,9 @@ rebuilt it.
   ordered paths, and the hook also runs for each partition (`RELOPT_OTHER_MEMBER_REL`), so
   offering the path there might just work; but run-time pruning, a partition's translated security
   quals and the pathkeys of child rels are a surface of their own to test. The natural v2.
+- **The target relation of an UPDATE, DELETE or MERGE**, which a merge join's ordered input could
+  otherwise make the node scan: its row identity and EvalPlanQual rechecks would work as they do
+  for `SELECT ... FOR UPDATE` (tested), but nothing needs it and nothing tests it.
 - **Parameterized paths** (the node as the inner side of a nested loop with `t.x = outer.y` pushed
   into it): an inner side needs no order, so an ordered filter scan has nothing to offer there.
   Params inside a subquery (LATERAL, correlated) are ordinary Params and ARE supported (§30.4).
@@ -6394,5 +6407,7 @@ pattern); and the plan choice with nothing disabled - the node for a selective l
 node for a large result without a LIMIT. Isolation: `ordered_cursor.spec` (a cursor paused after
 its set was built while another session inserts matching rows, deletes and updates matching rows
 and commits: the rest of the cursor returns exactly its snapshot's rows, and rows inserted between
-DECLARE and the first FETCH do not appear either) and `ordered_serializable.spec` (the write-skew
-pair, both through the node: one of them fails).
+DECLARE and the first FETCH do not appear either; VACUUM runs while it is paused and completes)
+and `ordered_serializable.spec` (the write-skew pair, both through the node: one of them fails).
+`make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
+orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).

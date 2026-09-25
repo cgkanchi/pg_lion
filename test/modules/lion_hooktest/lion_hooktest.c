@@ -12,6 +12,8 @@
  *	  counting its calls and noting whether a LionCount path was already in
  *	  the grouped rel when the previous hook returned - which tells in which
  *	  order the two hooks were installed;
+ *	- set_rel_pathlist_hook, the same way for the LionOrdered path pg_lion
+ *	  adds to a base rel (DESIGN.md §30);
  *	- when preloaded, a custom WAL resource manager under the id in
  *	  lion_hooktest.rmgr_id, RM_EXPERIMENTAL_ID by default - pg_lion's own
  *	  default, so that the collision is the default case;
@@ -32,6 +34,7 @@
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "utils/guc.h"
 
@@ -40,11 +43,16 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(lion_hooktest_calls);
 PG_FUNCTION_INFO_V1(lion_hooktest_saw_lion);
 PG_FUNCTION_INFO_V1(lion_hooktest_reset);
+PG_FUNCTION_INFO_V1(lion_hooktest_rel_calls);
+PG_FUNCTION_INFO_V1(lion_hooktest_rel_saw_ordered);
 PG_FUNCTION_INFO_V1(lion_hooktest_heapcopy_handler);
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
 static int64 hook_calls = 0;
 static int64 hook_saw_lion = 0;
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+static int64 rel_hook_calls = 0;
+static int64 rel_hook_saw_ordered = 0;
 static int	hooktest_rmgr_id = RM_EXPERIMENTAL_ID;
 static TableAmRoutine heapcopy_routine;
 
@@ -95,6 +103,35 @@ hooktest_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	}
 }
 
+/*
+ * The same for set_rel_pathlist_hook: pg_lion's LionOrdered path is in the
+ * base rel's path list when the previous hook returns only if pg_lion's hook
+ * was installed before this one.
+ */
+static void
+hooktest_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
+						  RangeTblEntry *rte)
+{
+	ListCell   *lc;
+
+	rel_hook_calls++;
+
+	if (prev_set_rel_pathlist_hook != NULL)
+		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (IsA(path, CustomPath) &&
+			strcmp(((CustomPath *) path)->methods->CustomName, "LionOrdered") == 0)
+		{
+			rel_hook_saw_ordered++;
+			break;
+		}
+	}
+}
+
 void
 _PG_init(void)
 {
@@ -115,6 +152,8 @@ _PG_init(void)
 
 	prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = hooktest_create_upper_paths;
+	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = hooktest_set_rel_pathlist;
 }
 
 Datum
@@ -134,7 +173,21 @@ lion_hooktest_reset(PG_FUNCTION_ARGS)
 {
 	hook_calls = 0;
 	hook_saw_lion = 0;
+	rel_hook_calls = 0;
+	rel_hook_saw_ordered = 0;
 	PG_RETURN_VOID();
+}
+
+Datum
+lion_hooktest_rel_calls(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(rel_hook_calls);
+}
+
+Datum
+lion_hooktest_rel_saw_ordered(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(rel_hook_saw_ordered);
 }
 
 Datum
