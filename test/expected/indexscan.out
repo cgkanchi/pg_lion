@@ -864,6 +864,29 @@ SELECT lion_top('SELECT k, count(*) FROM lis_f GROUP BY k');
  Custom Scan (LionCount)
 (1 row)
 
+-- ... including a count over a clustered value after scattered updates, when
+-- the visibility map pg_class remembers is stale: the rows of one value lie on
+-- a few pages, which is what the node's recheck is priced by now as well as
+-- the plain scan's heap side (DESIGN.md §29.11)
+CREATE TABLE lis_cl (id int, c int, x int);
+INSERT INTO lis_cl SELECT i, i / 2000, 0 FROM generate_series(1, 300000) i;
+CREATE INDEX lis_cl_c ON lis_cl USING lion (c);
+VACUUM ANALYZE lis_cl;
+UPDATE lis_cl SET x = 1 WHERE id % 20 = 7;
+ANALYZE lis_cl;
+SELECT lion_top('SELECT count(*) FROM lis_cl WHERE c = 17');
+        lion_top         
+-------------------------
+ Custom Scan (LionCount)
+(1 row)
+
+SELECT count(*) FROM lis_cl WHERE c = 17;
+ count 
+-------
+  2000
+(1 row)
+
+DROP TABLE lis_cl;
 -- ---------- 7. exclusion constraints: a non-MVCC (dirty snapshot) scan ----------
 CREATE TABLE lis_ex (a int, b text, EXCLUDE USING lion (a WITH =));
 INSERT INTO lis_ex VALUES (1, 'one'), (2, 'two'), (3, 'three');

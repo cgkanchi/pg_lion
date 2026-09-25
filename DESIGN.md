@@ -6009,6 +6009,18 @@ thousand scattered rows go to the bitmap at a normal `work_mem` (sorted page vis
 compute_bitmap_pages() - the plain scan wins again. The count pushdown competes at the upper rel
 with its own cost (§10); the regression suite pins its choices.
 
+**The count's recheck is priced the same way** (2026-09-24 review). With a correlation, a plain
+scan of a clustered value is cheap: 5000 rows of one value on 32 heap pages. The count pushdown
+charged its heap recheck one page per candidate TID up to the dirty part of the heap, so when the
+visibility map pg_class remembers had gone stale - `relallvisible` is only refreshed by VACUUM,
+while updates, and on 19+ on-access pruning, change the map - it priced the same count at 5036
+against the scan's 3252 and lost, running 2.4-2.8x slower (0.6 ms against 0.24). The recheck
+visits each page holding a candidate once, in block order, so for a count whose WHERE is one
+plain equality the pages are now what cost_index() would say they are: one per row when the values
+are scattered, the rows' share of the heap when they are stored in order, interpolated by the
+correlation's square (`lion_cost_count_rel()`, `lion_single_eq_var()`). Only ever lower, and only
+for that shape; a range already had the rule (§28), and other WHERE shapes keep the old bound.
+
 ### 29.12 Tests
 
 `test/sql/indexscan.sql`, written before the code and failing on HEAD (no plan can show an Index
@@ -6019,7 +6031,7 @@ and `IS NOT NULL`, multicolumn ANDs, arrays and tsvector with recheck, cross-typ
 collation mismatch declined; nested-loop inner scans with rescans; cursors (FETCH forward, SCROLL
 over a Material, NO SCROLL refusing backward); a dirty heap after updates and deletes, then VACUUM;
 a posting set far larger than one batch with its memory flat; an exclusion constraint; the count
-pushdown still chosen for its shapes; a
+pushdown still chosen for its shapes, a clustered value under a stale visibility map included; a
 partial multi-key index read whole at 64 kB of work_mem, by a plain scan and by index-only scans
 with nothing disabled, clean and dirty (the review's repros: rows the index does not hold came
 back); a 20,000-value Param list read through a cursor within work_mem, and long lists with
