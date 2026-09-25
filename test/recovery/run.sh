@@ -412,7 +412,10 @@ recovery_evidence() {
 	local off=$1 txt redo_start redo_end generic
 	txt=$(tail -c "+$((off + 1))" "$PRIMARY_LOG")
 	printf '%s\n' "$txt" >>"$RUNLOG"
-	printf '%s' "$txt" | grep -q "database system was not properly shut down" ||
+	# Not `printf | grep -q`: grep -q exits at the first match, the writer can
+	# then die of SIGPIPE, and under pipefail that failed the check about once
+	# in a thousand runs although the line was there.
+	grep -q "database system was not properly shut down" <<<"$txt" ||
 		die "the restart did not report an unclean shutdown: the crash did not take effect"
 	redo_start=$(printf '%s' "$txt" |
 		sed -n 's/.*redo starts at \([0-9A-F]*\/[0-9A-F]*\).*/\1/p' | head -1)
@@ -590,8 +593,8 @@ phase1b() {
 	# redo almost nothing to do; what this round proves is the leak and the
 	# sweep, and phase 1 is what proves replay.
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1b: the restart did not report an unclean shutdown"
 
 	# The entries really are gone, the pages really are leaked (verify()
@@ -722,8 +725,8 @@ phase1c() {
 	verify_node psql_p "$PRIMARY_DATA"
 
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1c: the restart did not report an unclean shutdown"
 
 	# The page really came back flagged: verify() says so, as a WARNING and
@@ -841,8 +844,8 @@ phase1d() {
 	verify_node psql_p "$PRIMARY_DATA"
 
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1d: the restart did not report an unclean shutdown"
 
 	# The page really came back flagged: verify() says so, as a WARNING and
@@ -1124,8 +1127,8 @@ phase1f() {
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
 	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
-	tail -c "+$((off + 1))" "$PRIMARY_LOG" |
-		grep -q "database system was not properly shut down" ||
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
 		die "phase 1f: the restart did not report an unclean shutdown"
 	run_check "phase 1f recovered" psql_p \
 		"select lion_index_verify('lion_norm_k', true) is not null, 'verify'
