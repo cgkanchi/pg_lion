@@ -32,6 +32,7 @@ Every heap TID is mapped to a 64-bit code and split into a container key and a 1
 
     LION_OFFSET_BITS      = 9 at BLCKSZ 8192 (MaxHeapTuplesPerPage = 291 < 512)
                            10 at 16K (585), 11 at 32K (1169)   -- computed at compile time, see lion_tid.h
+                           (BLCKSZ below 8192 does not compile: see the end of this section)
     code(tid)            = ((uint64) block << LION_OFFSET_BITS) | offset        -- 41 bits at 8K
     LION_CONTAINER_BITS   = 15
     ckey(code)           = code >> 15                                          -- uint32, block >> 6 at 8K
@@ -84,8 +85,14 @@ callbacks - may have changed anything.
 
 Why not GIN's 11 offset bits: bitset containers would be 86% empty. Why 15 container bits and not 16:
 a 16-bit bitset is 8192 bytes and cannot be a page item; 15 bits gives a 4096-byte bitset, so every
-container fits on any page, and VACUUM can always fall back to a bitset when a run split would
-otherwise grow a container past its slot.
+container fits on a page of PostgreSQL's default BLCKSZ or larger - a BITSET item is 4104 bytes plus
+its line pointer, against 8136 bytes of item space at 8K - and VACUUM can always fall back to a
+bitset when a run split would otherwise grow a container past its slot.
+*(The first version said "on any page". It does not hold below 8K: a 4K page has 4040 bytes of item
+space, and a build or an insert failed on the first BITSET. A BLCKSZ below 8192 is now refused at
+compile time, by an `#error` in lion_tid.h - the first header every file includes - and, as the
+property that refusal stands for, a static assertion in lion.h that
+`MAXALIGN(LION_CONTAINER_MAX_SIZE) + sizeof(ItemIdData) <= LION_PAGE_CAPACITY`. 2026-09-25 review.)*
 
 ## 3. Containers (module `lion_container.[ch]`, no backend dependencies beyond `c.h` + pg_bitutils)
 
