@@ -5124,6 +5124,17 @@ lion_range_first_leaf(Relation index, LionRange *range)
 	OffsetNumber off;
 	BlockNumber blk;
 
+	/*
+	 * The column state is the index's relcache entry's, and a relcache
+	 * invalidation since the range was built - any catalog read may process
+	 * one - frees the LionIndexState it points back to, which the descent
+	 * reads the cached root from.  The column states themselves live on in
+	 * rd_indexcxt, so the stale one still says which column it is; look the
+	 * current one up by that and re-point the range (the bounds' comparison
+	 * functions are copies and need nothing).
+	 */
+	range->state = lion_index_column_state(index, range->state->attno);
+
 	if (!range->ordered || range->lower < 0)
 		return lion_dir_column_first(index, range->state, NULL);
 
@@ -5189,7 +5200,8 @@ lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
 	if (range == NULL)
 		return;
 
-	Assert(range->state == es->state);
+	/* The scan's state is the current one (see lion_range_first_leaf()). */
+	range->state = es->state;
 	es->range = range;
 	if (range->empty)
 		es->done = true;

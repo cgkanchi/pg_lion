@@ -203,15 +203,15 @@ lion_wal_setup_buffers(void)
 }
 
 /*
- * The wal_mode of an index.  The meta page is cached in rd_amcache, so this
- * is a pointer chase on every path that has already looked a key up.
+ * The wal_mode of an index.  It is asked for when a record begins, with
+ * pages - the meta page among them, in a split - already locked, so it must
+ * not rebuild the relcache state, which reads the meta page: it comes from
+ * the per-relfilenode memory of lion_index_meta_wal_mode().
  */
 int
 lion_wal_mode(Relation index)
 {
-	LionIndexState *ix = lion_get_index_state(index);
-
-	return (ix->meta.wal_mode == LION_WAL_MODE_RMGR) ?
+	return (lion_index_meta_wal_mode(index) == LION_WAL_MODE_RMGR) ?
 		LION_WAL_MODE_RMGR : LION_WAL_MODE_GENERIC;
 }
 

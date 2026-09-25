@@ -521,6 +521,94 @@ lion_proc_has_sqlbody(Oid procoid)
 }
 
 /*
+ * What rd_amcache points to: a HANDLE on the index's state, not the state.
+ *
+ * A relcache flush of an index entry - RelationReloadIndexInfo(), which any
+ * catalog read may trigger under debug_discard_caches and ordinary
+ * invalidation traffic can trigger at any lock acquisition - pfree()s
+ * rd_amcache and nothing else of what it points into.  With the state itself
+ * there, every caller that had taken a LionIndexState and read the catalog
+ * before it was done with it - a scan resolving a cross-type probe, verify()
+ * comparing text keys under a collation, the order check below - held a
+ * pointer into freed memory: under debug_discard_caches the order check read
+ * a garbage identity and refused every index, and verify() crashed.  With a
+ * handle, the flush frees only the handle.  The state stays where it is, in
+ * rd_indexcxt, for as long as the relcache entry lives, so a pointer taken
+ * earlier stays valid - it is simply no longer the entry's current state,
+ * and the next lion_get_index_state() builds a new one, as it always did
+ * after a flush.  (The column states and FmgrInfos of a replaced state were
+ * already left in rd_indexcxt before; now the 40-odd bytes of its header are
+ * too.)
+ */
+typedef struct LionAmCache
+{
+	LionIndexState *ix;
+} LionAmCache;
+
+/*
+ * The WAL mode of every index this backend has read a meta page of, keyed by
+ * its relfilenode (DESIGN.md §25).
+ *
+ * lion_wal_mode() is asked for when a record is begun, which is in the middle
+ * of a page change - a directory split holds the meta page itself EXCLUSIVE -
+ * and the mode used to come out of lion_get_index_state().  After a relcache
+ * flush that means building the state again, which reads the meta page: a
+ * second lock on a buffer this backend already holds, which a cassert build
+ * traps on and a production build would wait on for ever (found under
+ * debug_discard_caches, where every catalog read flushes; ordinary
+ * invalidation traffic can do the same between an insert's start and its
+ * split).  The mode never changes for a relfilenode - REINDEX and TRUNCATE
+ * give the index a new one - so it is remembered here the first time a meta
+ * page is read, and the write path never has to read one.
+ */
+typedef struct LionWalModeEnt
+{
+	RelFileLocator locator;
+	uint32		wal_mode;
+} LionWalModeEnt;
+
+static HTAB *lion_wal_modes = NULL;
+
+static void
+lion_remember_wal_mode(Relation index, uint32 wal_mode)
+{
+	LionWalModeEnt *ent;
+	bool		found;
+
+	if (lion_wal_modes == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(LionWalModeEnt);
+		ctl.hcxt = TopMemoryContext;
+		lion_wal_modes = hash_create("lion index WAL modes", 64, &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	ent = (LionWalModeEnt *) hash_search(lion_wal_modes, &index->rd_locator,
+										 HASH_ENTER, &found);
+	ent->wal_mode = wal_mode;
+}
+
+/*
+ * The meta page's wal_mode of index, without reading anything in the common
+ * case: remembered per relfilenode by whoever read its meta page first.
+ */
+uint32
+lion_index_meta_wal_mode(Relation index)
+{
+	if (lion_wal_modes != NULL)
+	{
+		LionWalModeEnt *ent = (LionWalModeEnt *)
+			hash_search(lion_wal_modes, &index->rd_locator, HASH_FIND, NULL);
+
+		if (ent != NULL)
+			return ent->wal_mode;
+	}
+	return lion_get_index_state(index)->meta.wal_mode;
+}
+
+/*
  * How many pg_proc invalidations this backend has seen (DESIGN.md §21).  A
  * cached index state is kept in the index's relcache entry, and replacing
  * the comparison it was built with invalidates pg_proc and NOT the index, so
@@ -828,9 +916,14 @@ lion_proc_ident(Oid procoid)
 	bool		isnull;
 	uint32		h = 0;
 
+	/*
+	 * A function that no longer exists at all (a loose family member dropped,
+	 * and then the function) is simply a comparison that is not the recorded
+	 * one: the caller's REINDEX error, not an internal one.
+	 */
 	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(procoid));
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for function %u", procoid);
+		return hash_bytes_uint32(procoid) ^ 0x6c696f6e;
 
 	d = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc, &isnull);
 	if (!isnull)
@@ -974,43 +1067,91 @@ lion_get_index_state(Relation index)
 	 * A cached state is good until a function has changed since it was last
 	 * checked (lion_proc_generation).  Then the recorded order's comparisons
 	 * are resolved and compared again - in a throw-away state, which is all
-	 * lion_fill_index_state() needs to raise its ERROR, so that the cached one
-	 * keeps its memory and every pointer into it stays valid - and a state
-	 * that passes is good until the next change.  The count is read BEFORE
-	 * the check, whose own catalog reads may process more invalidations: one
-	 * that arrives meanwhile makes the next call check again.
+	 * lion_fill_index_state() needs to raise its ERROR - and a state that
+	 * passes is good until the next change.  The count is read BEFORE the
+	 * check, whose own catalog reads may process more invalidations: one that
+	 * arrives meanwhile makes the next call check again.
+	 *
+	 * THOSE SAME CATALOG READS MAY FLUSH THIS INDEX'S RELCACHE ENTRY, which
+	 * pfree()s rd_amcache (see LionAmCache): the handle may be gone by the
+	 * time the check returns.  The state it pointed to is not, but it is no
+	 * longer the entry's, so the handle is looked up again afterwards and a
+	 * state built afresh when the flush left none.  The check reads a COPY of
+	 * the meta page image for the same reason.
 	 */
-	if (index->rd_amcache != NULL)
+	while (index->rd_amcache != NULL)
 	{
-		ix = (LionIndexState *) index->rd_amcache;
-		gen = lion_proc_generation;
-		if (ix->procgen != gen)
-		{
-			if ((ix->meta.order_flags & LION_META_ORDER_RECORDED) != 0 &&
-				ix->meta.ordered_cols != 0)
-			{
-				MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
-														  "lion order recheck",
-														  ALLOCSET_SMALL_SIZES);
-				LionIndexState check;
+		LionAmCache *cache = (LionAmCache *) index->rd_amcache;
 
-				lion_fill_index_state(index, &check, &ix->meta, cxt);
-				MemoryContextDelete(cxt);
-			}
-			ix->procgen = gen;
+		ix = cache->ix;
+		gen = lion_proc_generation;
+		if (ix->procgen == gen)
+			return ix;
+
+		/*
+		 * Not with a buffer lock held, or inside a critical section: the
+		 * check reads the catalog, which is no business of a caller that is
+		 * half-way through a page change (lion_wal_mode() is asked for inside
+		 * a split, with the meta page locked).  Every LWLock holds off
+		 * interrupts, so a positive InterruptHoldoffCount is exactly "some
+		 * lock is held"; the state is returned unchecked, and the next call
+		 * made with nothing held checks it.
+		 */
+		if (InterruptHoldoffCount > 0 || CritSectionCount > 0)
+			return ix;
+
+		/*
+		 * What the cached state CALLS is its own FmgrInfos, the functions it
+		 * was filled with - not whatever the catalog would resolve today - so
+		 * the question is only whether one of those has changed what it runs
+		 * since the index was built: lion_order_ident() over the state's own
+		 * comparisons, one syscache lookup per ordered column.  A comparison
+		 * the catalog would resolve differently now but this state does not
+		 * call cannot hurt it; the next state built answers for that, through
+		 * lion_fill_index_state().  (A full fill here cost a hundred syscache
+		 * lookups per call under debug_discard_caches, where every call finds
+		 * the count moved.)
+		 */
+		if ((ix->meta.order_flags & LION_META_ORDER_RECORDED) != 0 &&
+			ix->meta.ordered_cols != 0)
+		{
+			uint32		recorded = ix->meta.order_ident;
+
+			if (lion_order_ident(ix) != recorded)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("index \"%s\" was built in the order of a comparison function its operator class no longer uses",
+								RelationGetRelationName(index)),
+						 errhint("REINDEX the index.")));
+
+			/* The handle may have been freed by now: look again. */
+			if ((LionAmCache *) index->rd_amcache != cache)
+				continue;
 		}
+		ix->procgen = gen;
 		return ix;
 	}
 
 	gen = lion_proc_generation;
 	lion_read_meta(index, &meta);
+	lion_remember_wal_mode(index, meta.wal_mode);
 
 	ix = (LionIndexState *) MemoryContextAlloc(index->rd_indexcxt,
 											   sizeof(LionIndexState));
 	lion_fill_index_state(index, ix, &meta, index->rd_indexcxt);
 	ix->procgen = gen;
 
-	index->rd_amcache = (void *) ix;
+	/*
+	 * Installed only now, so that a flush during the fill above - which reads
+	 * the catalog - has no handle to free and leaves this state alone.
+	 */
+	{
+		LionAmCache *cache = (LionAmCache *)
+			MemoryContextAlloc(index->rd_indexcxt, sizeof(LionAmCache));
+
+		cache->ix = ix;
+		index->rd_amcache = (void *) cache;
+	}
 	return ix;
 }
 
