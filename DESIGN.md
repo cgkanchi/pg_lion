@@ -3443,6 +3443,43 @@ EXPLAIN ANALYZE reports **Directory Pages Read**, the leaves and internal pages 
 is what `test/sql/directory.sql` uses to prove that a thousand-value IN list costs one pass over the
 leaves its values live on rather than a descent each.
 
+**A link read from a directory page is data, and a damaged one is an ERROR (INDEX_CORRUPTED), not a
+walk** (2026-09-25 review). verify() checks all of the above offline; a reader checks, per page it
+reads and at the cost of a comparison each, only what it would otherwise follow blindly:
+
+- a block number it is about to read is valid (`lion_dir_readbuf()`). InvalidBlockNumber is P_NEW,
+  and `ReadBuffer()` on PostgreSQL 16 to 18 EXTENDS the relation when asked for it: a root downlink
+  set to 0xFFFFFFFF made every SELECT and INSERT that descended through it grow the index by a block
+  before the page check refused the new, empty page. A block past the end needs no test of its own
+  (`ReadBuffer()` fails on it), and asking for the relation's size at every step of every descent
+  would cost a system call each;
+- an internal page has a downlink where the binary search points (`lion_dir_downlink_block()`): a
+  page with no data items made `lion_page_downlink()` answer one past maxoff, and the descent read a
+  line pointer past pd_lower;
+- a page reached through a downlink is exactly one level below the page holding it, and a right
+  sibling is at the page's own level (`lion_dir_check_level()`). A directory page never changes level
+  and is never freed, so this is exact rather than a heuristic, and it is what makes a descent
+  terminate: a downlink to the page itself, or to one above it, used to send it round for ever;
+- a non-rightmost page has the high key every reader takes as its first item without looking;
+- the parent's right sibling that `lion_dir_downlink_present()` reads during a split repair is a
+  directory page at the parent's level, like every other page this file reads; and
+- an entry's `attno` names a key column the index has before `lion_search_key_exact()` takes that
+  column's state, which `lion_column()` only Asserts: past the end of `ix->cols` the comparison would
+  have called whatever function pointers it found there.
+
+A block number past the end, a right-link cycle and a damaged key datum are not caught here: the
+first fails in `ReadBuffer()`, the second walks until it is cancelled, and the third is the same
+risk every index AM takes with its own keys. "Until it is cancelled" is new as well: every step of
+a descent and of an uncoupled walk right now checks for interrupts BETWEEN the pages, with no content
+lock held. It used to check just after locking the next page, where the lock holds interrupts off,
+so a descent round a cycle of downlinks (the third case of the test below, before the level check
+refused it) ignored statement_timeout and pg_terminate_backend() alike and only SIGKILL stopped it. (The lock-coupled steps through a prefix run that spans pages
+still hold a lock at every point; they are bounded by that run.) `test/sql/corrupt.sql` damages a
+freshly built index's root on disk in the first three ways and checks that queries and inserts fail
+with INDEX_CORRUPTED and leave the relation's size alone; against the code before this review the
+first grew the index by a block per statement, the second answered from a line pointer past
+pd_lower, and the third never returned.
+
 ### Planner
 
 When the grouped column's index is `ordered`, the GROUP BY is a single column driven from that index
