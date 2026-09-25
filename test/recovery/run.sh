@@ -4,13 +4,14 @@
 #
 # USAGE
 #
-#   test/recovery/run.sh [--prefix <pg install prefix>] [--iters N] [--keep]
+#   test/recovery/run.sh --prefix <pg install prefix> [--iters N] [--keep]
 #   make recovery-check PG_CONFIG=<prefix>/bin/pg_config RECOVERY_PREFIX=<prefix>
 #
-#   --prefix   PostgreSQL installation to use (bin/, lib/, share/).  Defaults
-#              to the worktree install, ../pg_roaring_index-partial/.local/pg.
-#              The extension is rebuilt from a clean copy of this tree and
-#              installed into that prefix; the tree itself is never written to
+#   --prefix   PostgreSQL installation to use (bin/, lib/, share/).  REQUIRED,
+#              here or as RECOVERY_PREFIX in the environment: there is no
+#              default, because the extension is rebuilt from a clean copy of
+#              this tree and INSTALLED into that prefix, and a guessed prefix
+#              is someone else's server.  The tree itself is never written to
 #              and "make install" is never run in it.
 #   --iters    crash/recover iterations in phase 1 (default 8).
 #   --keep     leave the clusters and their logs in place on exit.
@@ -29,6 +30,20 @@
 #              which makes the standby (and every crash recovery in phase 1)
 #              compare the page replay produced against the page the primary
 #              had, for every page of every lion record.
+#
+# ENVIRONMENT
+#
+#   RECOVERY_PREFIX   the same as --prefix (the option wins).
+#   RECOVERY_RUN_AS   an unprivileged OS user to run initdb, pg_ctl and
+#                     pg_basebackup as (through runuser).  initdb and the
+#                     server refuse to run as root, so a root shell - a
+#                     container, a CI image - needs this; the run refuses to
+#                     start as root without it.  That user must be able to read
+#                     the prefix, and it gets ownership of the run's private
+#                     directory below.  psql, pgbench, pg_waldump and the
+#                     extension build still run as the caller.
+#   RECOVERY_TMPDIR   where the run's private directory is made (default
+#                     $TMPDIR, else /tmp).
 #
 # Exit status is 0 only if every check passed.  A summary is printed at the
 # end; the full log is written to test/recovery/log/run.log, and on failure the
@@ -63,6 +78,13 @@
 # SHOW data_directory before the first statement, and remove everything on exit
 # through a trap.  These clusters are created here and are never shared with
 # the dev cluster or the benchmark clusters.
+#
+# "Private" is literal: everything the run creates - both data directories,
+# their logs, the socket directory, the build copy - lives in ONE directory
+# that mktemp -d makes for this run (mode 0700, a name nobody else has), and
+# the exit trap removes that directory and nothing else.  There is no fixed
+# path in a shared /tmp that a second run, another user or a stale directory
+# could already occupy, and nothing the run did not create is ever removed.
 
 set -euo pipefail
 
@@ -70,33 +92,35 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT=$(cd "$HERE/../.." && pwd)
 
 PREFIX=${RECOVERY_PREFIX:-}
-if [ -z "$PREFIX" ]; then
-	PREFIX=$(cd "$PROJECT/../pg_roaring_index-partial/.local/pg" 2>/dev/null && pwd || true)
-fi
+RUN_AS=${RECOVERY_RUN_AS:-}
+TMPROOT=${RECOVERY_TMPDIR:-${TMPDIR:-/tmp}}
 ITERS=8
 KEEP=0
 MODE=generic
 PHASES="1 1b 1c 1d 2 3"
 EXTRA_CONF=()
 
-BASE=/tmp/claude-1000/lion_recovery
-SOCKDIR=/tmp/claude-1000/pgsk_rec
+# Set by make_private_dirs(), which the main section calls once the arguments
+# have been checked; empty until then, which cleanup() relies on.
+BASE=""
+SOCKDIR=""
+SOCKDIR_OWN=""		# a socket directory of its own, when BASE is too long for one
 PRIMARY_PORT=54340
 STANDBY_PORT=54341
 DBNAME=postgres
 
-# Endpoints that belong to other runs (the dev cluster, the benchmark
-# clusters).  Hard-refuse rather than trust the variables above.
-FORBIDDEN_PORTS="54329 54330 54331 54332"
-FORBIDDEN_SOCKDIRS="/tmp/claude-1000/pgsk /tmp/claude-1000/pgsk_bench /tmp/claude-1000/pgsk_wt"
+# The dev cluster's default port (dev.sh).  The socket directory is private, so
+# no other cluster can be listening in it; this only stops an edit of the two
+# ports above from pointing the run at the endpoint a developer's psql uses.
+FORBIDDEN_PORTS="54329"
 
 LOGDIR=$HERE/log
 RUNLOG=$LOGDIR/run.log
 
-PRIMARY_DATA=$BASE/primary
-STANDBY_DATA=$BASE/standby
-PRIMARY_LOG=$BASE/primary.log
-STANDBY_LOG=$BASE/standby.log
+PRIMARY_DATA=""
+STANDBY_DATA=""
+PRIMARY_LOG=""
+STANDBY_LOG=""
 BUILDDIR=""
 VACLOOP=""
 VACPID=""
@@ -120,7 +144,8 @@ while [ $# -gt 0 ]; do
 		--mode)   MODE=${2:-}; shift 2 ;;
 		--conf)   EXTRA_CONF+=("${2:-}"); shift 2 ;;
 		--phases) PHASES=${2:-}; shift 2 ;;
-		-h|--help) sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^#\{0,1\} \{0,1\}//'; exit 0 ;;
+		-h|--help) sed -n '/^# USAGE/,/^# Exit status/p' "${BASH_SOURCE[0]}" |
+			sed '$d; s/^#\{0,1\} \{0,1\}//'; exit 0 ;;
 		*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -136,8 +161,9 @@ case $MODE in
 	*) die "--mode wants generic or rmgr" ;;
 esac
 
-[ -n "$PREFIX" ] || die "no --prefix given and the worktree install was not found"
-PREFIX=$(cd "$PREFIX" 2>/dev/null && pwd) || die "prefix does not exist"
+[ -n "$PREFIX" ] ||
+	die "no PostgreSQL installation given: pass --prefix <prefix> or set RECOVERY_PREFIX (make recovery-check RECOVERY_PREFIX=<prefix>).  The extension is built and INSTALLED into it, so there is no default."
+PREFIX=$(cd "$PREFIX" 2>/dev/null && pwd) || die "prefix $PREFIX does not exist"
 PGBIN=$PREFIX/bin
 for prog in initdb pg_ctl psql pgbench pg_basebackup pg_waldump pg_config; do
 	[ -x "$PGBIN/$prog" ] || die "$PGBIN/$prog is missing; is $PREFIX a PostgreSQL install?"
@@ -145,29 +171,79 @@ done
 case $ITERS in ''|*[!0-9]*) die "--iters wants a number" ;; esac
 [ "$ITERS" -ge 1 ] || die "--iters must be at least 1"
 
+if [ -n "$RUN_AS" ]; then
+	id -u "$RUN_AS" >/dev/null 2>&1 || die "RECOVERY_RUN_AS: no such user '$RUN_AS'"
+	[ "$(id -u "$RUN_AS")" != 0 ] || die "RECOVERY_RUN_AS must be an unprivileged user, not root"
+	[ "$(id -u)" = 0 ] || die "RECOVERY_RUN_AS needs root (runuser) to switch to '$RUN_AS'"
+	command -v runuser >/dev/null 2>&1 || die "RECOVERY_RUN_AS needs runuser(1), which is missing"
+elif [ "$(id -u)" = 0 ]; then
+	die "initdb and postgres refuse to run as root: set RECOVERY_RUN_AS=<unprivileged user> to run the clusters as that user"
+fi
+
 # ---------------------------------------------------------------- safety
 
 for p in $FORBIDDEN_PORTS; do
 	[ "$PRIMARY_PORT" = "$p" ] && die "port $p belongs to another cluster"
 	[ "$STANDBY_PORT" = "$p" ] && die "port $p belongs to another cluster"
 done
-for d in $FORBIDDEN_SOCKDIRS; do
-	[ "$SOCKDIR" = "$d" ] && die "socket directory $d belongs to another cluster"
-done
-case $BASE in
-	/tmp/claude-1000/lion_recovery) ;;
-	*) die "refusing to manage data directories outside /tmp/claude-1000/lion_recovery" ;;
-esac
-if [ -S "$SOCKDIR/.s.PGSQL.$PRIMARY_PORT" ] || [ -S "$SOCKDIR/.s.PGSQL.$STANDBY_PORT" ]; then
-	die "something already listens on $SOCKDIR:$PRIMARY_PORT/$STANDBY_PORT; refusing to share the endpoint"
-fi
+
+# as_server <program> [args]: run a program that must not run as root - initdb,
+# pg_ctl, and pg_basebackup, whose output is a data directory the server will
+# own - as RECOVERY_RUN_AS when that is set, else as the caller.  From / so that
+# a working directory the other user cannot read is never an issue.
+as_server() {
+	if [ -n "$RUN_AS" ]; then
+		(cd / && runuser -u "$RUN_AS" -- "$@")
+	else
+		"$@"
+	fi
+}
+
+# Make the run's private directory, and give it to RECOVERY_RUN_AS if set: the
+# clusters, their logs and the socket directory are all created inside it by
+# that user.  A Unix-domain socket path is limited to ~107 bytes, so when the
+# private directory's path is too long for "<dir>/.s.PGSQL.<port>" (a deep
+# TMPDIR) the socket directory is a second mktemp -d under /tmp; it is removed
+# with the first.
+make_private_dirs() {
+	mkdir -p "$TMPROOT" || die "cannot create $TMPROOT"
+	BASE=$(mktemp -d "$TMPROOT/lion_recovery.XXXXXX") ||
+		die "mktemp -d in $TMPROOT failed"
+	BASE=$(cd "$BASE" && pwd)
+	SOCKDIR=$BASE/sock
+	if [ "${#SOCKDIR}" -gt 80 ]; then
+		SOCKDIR=$(mktemp -d /tmp/lion_recovery_sock.XXXXXX) ||
+			die "mktemp -d for the socket directory failed"
+		SOCKDIR_OWN=$SOCKDIR
+	else
+		mkdir "$SOCKDIR"
+	fi
+	PRIMARY_DATA=$BASE/primary
+	STANDBY_DATA=$BASE/standby
+	PRIMARY_LOG=$BASE/primary.log
+	STANDBY_LOG=$BASE/standby.log
+	if [ -n "$RUN_AS" ]; then
+		chown "$RUN_AS" "$BASE" "$SOCKDIR" || die "cannot give $BASE to $RUN_AS"
+	fi
+}
+
+# rm -rf only a directory this run made: the path mktemp returned, still of
+# the shape it was made with.
+remove_private_dir() {
+	local d=$1 pattern=$2
+	[ -n "$d" ] && [ -d "$d" ] || return 0
+	case $d in
+		$pattern) rm -rf "$d" ;;
+		*) echo "not removing $d: not a directory this run created" >&2 ;;
+	esac
+}
 
 # ---------------------------------------------------------------- shutdown
 
 stop_hard() {
 	local d=$1
-	[ -d "$d" ] || return 0
-	"$PGBIN/pg_ctl" -D "$d" stop -m immediate -w -t 30 >/dev/null 2>&1
+	[ -n "$d" ] && [ -d "$d" ] || return 0
+	as_server "$PGBIN/pg_ctl" -D "$d" stop -m immediate -w -t 30 >/dev/null 2>&1
 	return 0
 }
 
@@ -200,9 +276,9 @@ cleanup() {
 	if [ "$KEEP" = 1 ]; then
 		echo "--keep: clusters left in $BASE (prefix $PREFIX)"
 	else
-		[ -n "$BUILDDIR" ] && rm -rf "$BUILDDIR"
-		rm -rf "$BASE"
-		rmdir "$SOCKDIR" >/dev/null 2>&1
+		# BUILDDIR is inside BASE; the socket directory may not be.
+		remove_private_dir "$BASE" '*/lion_recovery.??????'
+		remove_private_dir "$SOCKDIR_OWN" '/tmp/lion_recovery_sock.??????'
 	fi
 	exit $rc
 }
@@ -234,7 +310,8 @@ wait_true() {
 
 build_extension() {
 	log "-- building the extension into $PREFIX"
-	BUILDDIR=$(mktemp -d /tmp/claude-1000/lion_rec_build.XXXXXX)
+	BUILDDIR=$BASE/build
+	mkdir "$BUILDDIR"
 	cp -r "$PROJECT/src" "$PROJECT/Makefile" "$PROJECT"/pg_lion*.control \
 		"$PROJECT"/pg_lion*--*.sql "$BUILDDIR/"
 	# Never reuse objects built against another server.
@@ -295,12 +372,16 @@ write_standby_conf() {
 		# The default 10s would make the feedback-on case depend on luck.
 		wal_receiver_status_interval = 1s
 	EOF
+	# Written by the caller, read by a server that may run as someone else.
+	if [ -n "$RUN_AS" ]; then
+		chown "$RUN_AS" "$STANDBY_DATA/standby_extra.conf"
+	fi
 }
 
 start_node() {
 	local d=$1 port=$2 logf=$3 tries=0
 	while :; do
-		if "$PGBIN/pg_ctl" -D "$d" -l "$logf" \
+		if as_server "$PGBIN/pg_ctl" -D "$d" -l "$logf" \
 			-o "-p $port -k $SOCKDIR -c listen_addresses=''" -w -t 120 start \
 			>>"$RUNLOG" 2>&1; then
 			break
@@ -322,8 +403,7 @@ verify_node() {
 
 init_primary() {
 	log "-- initdb $PRIMARY_DATA"
-	mkdir -p "$BASE" "$SOCKDIR"
-	"$PGBIN/initdb" -D "$PRIMARY_DATA" -U postgres --auth=trust --no-sync \
+	as_server "$PGBIN/initdb" -D "$PRIMARY_DATA" -U postgres --auth=trust --no-sync \
 		--data-checksums -E UTF8 --locale=C >>"$RUNLOG" 2>&1 ||
 		die "initdb failed (see $RUNLOG)"
 	write_primary_conf
@@ -360,7 +440,7 @@ run_check() {
 # ---------------------------------------------------------------- phase 1
 
 crash_immediate() {
-	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m immediate -w -t 60 >>"$RUNLOG" 2>&1 ||
+	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m immediate -w -t 60 >>"$RUNLOG" 2>&1 ||
 		die "pg_ctl stop -m immediate failed"
 }
 
@@ -416,10 +496,11 @@ recovery_evidence() {
 		grep -cE 'rmgr: (Generic|custom[0-9]+)' || true)
 	if [ "$generic" -eq 0 ]; then
 		if "$PGBIN/pg_waldump" -p "$PRIMARY_DATA/pg_wal" -s "$redo_start" \
-			-e "$redo_end" >/dev/null 2>&1; then
+			-e "$redo_end" >/dev/null 2>>"$RUNLOG"; then
 			die "the range $redo_start..$redo_end was replayed but holds no index WAL record: this round tested no index change"
 		fi
-		log "note: $redo_start..$redo_end is no longer on disk (wal_keep_size); the replay happened, the count did not"
+		# To stderr: stdout is the one line the caller parses.
+		log "note: pg_waldump could not read $redo_start..$redo_end (its error is in $RUNLOG); the replay happened, the count did not" >&2
 	fi
 	echo "$redo_start $generic"
 }
@@ -477,7 +558,14 @@ phase1() {
 		verify_node psql_p "$PRIMARY_DATA"
 		[ "$(psql_p -tAc 'select pg_is_in_recovery()')" = "f" ] ||
 			die "iteration $it: the primary is still in recovery after pg_ctl -w start"
-		ev=$(recovery_evidence "$off")
+		ev=$(recovery_evidence "$off") || exit 1
+		# Anything but "<lsn> <count>" here would make the arithmetic below
+		# an expansion error, and bash abandons the whole top-level command
+		# on one - this phase - and carries on with the next as if it had
+		# passed.  So check the shape first and fail loudly.
+		case ${ev#* } in
+			''|*[!0-9]*) die "iteration $it: unreadable recovery evidence: '$ev'" ;;
+		esac
 		GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
 
 		# Before VACUUM the index may still hold TIDs of dead tuples, so ntids
@@ -871,7 +959,7 @@ phase1d() {
 
 basebackup_standby() {
 	log "-- pg_basebackup -R into $STANDBY_DATA"
-	"$PGBIN/pg_basebackup" -D "$STANDBY_DATA" -R -X stream -c fast --no-sync \
+	as_server "$PGBIN/pg_basebackup" -D "$STANDBY_DATA" -R -X stream -c fast --no-sync \
 		-h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres >>"$RUNLOG" 2>&1 ||
 		die "pg_basebackup failed (see $RUNLOG)"
 	[ -f "$STANDBY_DATA/standby.signal" ] ||
@@ -885,7 +973,7 @@ basebackup_standby() {
 }
 
 restart_standby() {
-	"$PGBIN/pg_ctl" -D "$STANDBY_DATA" stop -m fast -w -t 60 >>"$RUNLOG" 2>&1 ||
+	as_server "$PGBIN/pg_ctl" -D "$STANDBY_DATA" stop -m fast -w -t 60 >>"$RUNLOG" 2>&1 ||
 		die "could not stop the standby"
 	start_node "$STANDBY_DATA" "$STANDBY_PORT" "$STANDBY_LOG"
 	verify_node psql_s "$STANDBY_DATA"
@@ -1161,7 +1249,7 @@ phase2() {
 
 	log ""
 	log "-- promoting the standby"
-	"$PGBIN/pg_ctl" -D "$STANDBY_DATA" promote -w -t 120 >>"$RUNLOG" 2>&1 ||
+	as_server "$PGBIN/pg_ctl" -D "$STANDBY_DATA" promote -w -t 120 >>"$RUNLOG" 2>&1 ||
 		die "pg_ctl promote failed"
 	wait_true psql_s "select not pg_is_in_recovery()" 120 "the standby to finish promotion"
 	run_check "promoted standby" psql_s "select * from lion_rec_check(true, false)"
@@ -1414,10 +1502,9 @@ phase3() {
 
 mkdir -p "$LOGDIR"
 : >"$RUNLOG"
-rm -rf "$BASE"
-mkdir -p "$BASE"
-: >"$BASE/warnings.txt"
 trap cleanup EXIT
+make_private_dirs
+: >"$BASE/warnings.txt"
 
 START=$(now_ms)
 log "pg_lion recovery tests"
@@ -1425,6 +1512,7 @@ log "prefix     $PREFIX"
 log "server     $("$PGBIN/pg_config" --version)"
 log "clusters   $PRIMARY_DATA (port $PRIMARY_PORT), $STANDBY_DATA (port $STANDBY_PORT)"
 log "socket dir $SOCKDIR"
+[ -z "$RUN_AS" ] || log "run as     $RUN_AS (initdb, pg_ctl, pg_basebackup)"
 log ""
 
 build_extension

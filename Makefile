@@ -74,12 +74,14 @@ src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o: src/lio
 #
 #   make recovery-check PG_CONFIG=<prefix>/bin/pg_config RECOVERY_PREFIX=<prefix>
 #
-# With RECOVERY_PREFIX unset, run.sh uses the worktree install
-# (../pg_roaring_index-partial/.local/pg) - deliberately NOT the prefix
-# PG_CONFIG points at, so a bare "make recovery-check" cannot install into the
-# dev cluster's tree.  Nothing here touches the dev cluster either way: run.sh
-# creates its own clusters on a private socket directory and port and removes
-# them on exit.
+# RECOVERY_PREFIX is REQUIRED: run.sh refuses to start without it rather than
+# guess, and it is deliberately not derived from PG_CONFIG, so a bare "make
+# recovery-check" can never install into whatever installation the dev cluster
+# happens to use.  As root (a container, a CI image) also set
+# RECOVERY_RUN_AS=<unprivileged user>, because initdb and postgres refuse to
+# run as root.  Nothing here touches the dev cluster: run.sh creates its own
+# clusters in a private mktemp -d directory, with the socket directory inside
+# it, and removes that directory on exit.
 RECOVERY_PREFIX ?=
 EXTRA_CLEAN += test/recovery/log
 
