@@ -250,7 +250,178 @@ SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_v WHERE k = ANY (ARRAY[3, 4]::
  Bitmap Index Scan on lion_kt_v_k, 400 rows
 (1 row)
 
+/*
+ * The SQL count functions (DESIGN.md §9, "SQL surface").  Their key argument
+ * is polymorphic, so its type is whatever the caller wrote, and it is
+ * resolved as `col = key` would resolve it (lion_count_key_type()).  Until
+ * 2026-09-25 the key had to be rd_opcintype exactly or have a cross-type
+ * member: enum_ops, a DEFAULT class, could not be counted at all ("the index
+ * is on type anyenum"), nor could a varchar key on the varchar column it
+ * indexes.  lion_ktc() compares a count with the SELECT it stands for.
+ */
+CREATE FUNCTION lion_ktc(cnt text, sel text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	a bigint;
+	b bigint;
+BEGIN
+	EXECUTE 'SELECT ' || cnt INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'SELECT count(*) ' || sel INTO b;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH roaring=%s select=%s', a, b);
+	END IF;
+	RETURN format('ok %s', a);
+END $$;
+CREATE DOMAIN lion_kt_moodd AS lion_kt_mood;
+CREATE TYPE lion_kt_other AS ENUM ('sad', 'meh', 'ok', 'ecstatic');
+CREATE DOMAIN lion_kt_big8 AS int8;
+CREATE INDEX lion_kt_b ON lion_kt_e USING lion (b);
+VACUUM ANALYZE lion_kt_e;
+-- enum_ops: the column's own enum, and a domain over it
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'meh'::lion_kt_mood)$$,
+				$$FROM lion_kt_e WHERE m = 'meh'$$);
+ lion_ktc 
+----------
+ ok 2500
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'ok'::lion_kt_moodd)$$,
+				$$FROM lion_kt_e WHERE m = 'ok'$$);
+ lion_ktc 
+----------
+ ok 2400
+(1 row)
+
+SELECT lion_ktc($$lion_index_count_any('lion_kt_m', '{meh, ecstatic, meh}'::lion_kt_mood[])$$,
+				$$FROM lion_kt_e WHERE m IN ('meh', 'ecstatic', 'meh')$$);
+ lion_ktc 
+----------
+ ok 5000
+(1 row)
+
+SELECT lion_ktc($$lion_index_count_any('lion_kt_big', ARRAY(SELECT l FROM unnest(enum_range(NULL::lion_kt_big)) l WHERE l::text < 'l060'))$$,
+				$$FROM lion_kt_e WHERE big::text < 'l060'$$);
+ lion_ktc 
+----------
+ ok 6000
+(1 row)
+
+SELECT lion_ktc($$(lion_index_count_stats('lion_kt_m', 'sad'::lion_kt_mood)).count$$,
+				$$FROM lion_kt_e WHERE m = 'sad'$$);
+ lion_ktc 
+----------
+ ok 2400
+(1 row)
+
+-- two keys of two unrelated types (key2 is anycompatible, not key1's anyelement)
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'meh'::lion_kt_mood, 'lion_kt_b', true)$$,
+				$$FROM lion_kt_e WHERE m = 'meh' AND b$$);
+ lion_ktc 
+----------
+ ok 833
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_b', false, 'lion_kt_big', 'l042'::lion_kt_big)$$,
+				$$FROM lion_kt_e WHERE NOT b AND big = 'l042'$$);
+ lion_ktc 
+----------
+ ok 66
+(1 row)
+
+-- another enum with the same labels is not this column's: its OIDs are not
+-- the column's, and `m = 'meh'::lion_kt_other` finds no operator either
+SELECT lion_index_count('lion_kt_m', 'meh'::lion_kt_other);
+ERROR:  type lion_kt_other cannot be compared with index "lion_kt_m"
+SELECT lion_index_count_any('lion_kt_m', '{meh}'::lion_kt_other[]);
+ERROR:  type lion_kt_other cannot be compared with index "lion_kt_m"
+SELECT lion_index_count('lion_kt_m', 'meh'::text);
+ERROR:  type text cannot be compared with index "lion_kt_m"
+\set VERBOSITY default
+SELECT lion_index_count('lion_kt_m', 'meh'::lion_kt_other);
+ERROR:  type lion_kt_other cannot be compared with index "lion_kt_m"
+DETAIL:  The index is on type lion_kt_mood.
+\set VERBOSITY terse
+-- a binary coercion to the class's type: varchar on text_ops, as the parser
+-- relabels it; and a domain is its base type, cross-type members included
+SELECT lion_ktc($$lion_index_count('lion_kt_v_v', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE v = 'v3'::varchar$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_v_t', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE t = 'v3'::varchar$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_v_v', 'v3'::text)$$,
+				$$FROM lion_kt_v WHERE v = 'v3'::text$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_v', '{v3, v4, nope}'::varchar[])$$,
+				$$FROM lion_kt_v WHERE v = ANY ('{v3, v4, nope}'::varchar[])$$);
+ lion_ktc 
+----------
+ ok 400
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3::lion_kt_posint)$$,
+				$$FROM lion_kt_v WHERE k = 3::lion_kt_posint$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_v_dk', 3)$$,
+				$$FROM lion_kt_v WHERE dk = 3$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3::lion_kt_big8)$$,
+				$$FROM lion_kt_v WHERE k = 3::lion_kt_big8$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_posint[])$$,
+				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_posint[])$$);
+ lion_ktc 
+----------
+ ok 400
+(1 row)
+
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_big8[])$$,
+				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_big8[])$$);
+ lion_ktc 
+----------
+ ok 400
+(1 row)
+
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3, 'lion_kt_v_v', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE k = 3 AND v = 'v3'$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
+-- a cast FUNCTION is not taken (§21): bpchar to text is rtrim1()
+SELECT lion_index_count('lion_kt_v_t', 'v3'::bpchar);
+ERROR:  type character cannot be compared with index "lion_kt_v_t"
+SELECT lion_index_count('lion_kt_v_k', 'v3'::varchar);
+ERROR:  type character varying cannot be compared with index "lion_kt_v_k"
 DROP TABLE lion_kt_e, lion_kt_v;
-DROP TYPE lion_kt_mood, lion_kt_big;
-DROP DOMAIN lion_kt_posint;
+DROP DOMAIN lion_kt_moodd, lion_kt_posint, lion_kt_big8;
+DROP TYPE lion_kt_mood, lion_kt_big, lion_kt_other;
 DROP FUNCTION lion_kt(text, text);
+DROP FUNCTION lion_ktc(text, text);

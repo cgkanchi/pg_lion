@@ -150,7 +150,89 @@ SELECT lion_kt('index', $$SELECT id FROM lion_kt_v WHERE dk IN (3, 4)$$);
 SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_v WHERE v = ANY (ARRAY['v3', 'v4']::varchar[])$$);
 SELECT lion_kt('bitmap', $$SELECT id FROM lion_kt_v WHERE k = ANY (ARRAY[3, 4]::lion_kt_posint[])$$);
 
+/*
+ * The SQL count functions (DESIGN.md §9, "SQL surface").  Their key argument
+ * is polymorphic, so its type is whatever the caller wrote, and it is
+ * resolved as `col = key` would resolve it (lion_count_key_type()).  Until
+ * 2026-09-25 the key had to be rd_opcintype exactly or have a cross-type
+ * member: enum_ops, a DEFAULT class, could not be counted at all ("the index
+ * is on type anyenum"), nor could a varchar key on the varchar column it
+ * indexes.  lion_ktc() compares a count with the SELECT it stands for.
+ */
+CREATE FUNCTION lion_ktc(cnt text, sel text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	a bigint;
+	b bigint;
+BEGIN
+	EXECUTE 'SELECT ' || cnt INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'SELECT count(*) ' || sel INTO b;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH roaring=%s select=%s', a, b);
+	END IF;
+	RETURN format('ok %s', a);
+END $$;
+CREATE DOMAIN lion_kt_moodd AS lion_kt_mood;
+CREATE TYPE lion_kt_other AS ENUM ('sad', 'meh', 'ok', 'ecstatic');
+CREATE DOMAIN lion_kt_big8 AS int8;
+CREATE INDEX lion_kt_b ON lion_kt_e USING lion (b);
+VACUUM ANALYZE lion_kt_e;
+
+-- enum_ops: the column's own enum, and a domain over it
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'meh'::lion_kt_mood)$$,
+				$$FROM lion_kt_e WHERE m = 'meh'$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'ok'::lion_kt_moodd)$$,
+				$$FROM lion_kt_e WHERE m = 'ok'$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_m', '{meh, ecstatic, meh}'::lion_kt_mood[])$$,
+				$$FROM lion_kt_e WHERE m IN ('meh', 'ecstatic', 'meh')$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_big', ARRAY(SELECT l FROM unnest(enum_range(NULL::lion_kt_big)) l WHERE l::text < 'l060'))$$,
+				$$FROM lion_kt_e WHERE big::text < 'l060'$$);
+SELECT lion_ktc($$(lion_index_count_stats('lion_kt_m', 'sad'::lion_kt_mood)).count$$,
+				$$FROM lion_kt_e WHERE m = 'sad'$$);
+-- two keys of two unrelated types (key2 is anycompatible, not key1's anyelement)
+SELECT lion_ktc($$lion_index_count('lion_kt_m', 'meh'::lion_kt_mood, 'lion_kt_b', true)$$,
+				$$FROM lion_kt_e WHERE m = 'meh' AND b$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_b', false, 'lion_kt_big', 'l042'::lion_kt_big)$$,
+				$$FROM lion_kt_e WHERE NOT b AND big = 'l042'$$);
+-- another enum with the same labels is not this column's: its OIDs are not
+-- the column's, and `m = 'meh'::lion_kt_other` finds no operator either
+SELECT lion_index_count('lion_kt_m', 'meh'::lion_kt_other);
+SELECT lion_index_count_any('lion_kt_m', '{meh}'::lion_kt_other[]);
+SELECT lion_index_count('lion_kt_m', 'meh'::text);
+\set VERBOSITY default
+SELECT lion_index_count('lion_kt_m', 'meh'::lion_kt_other);
+\set VERBOSITY terse
+
+-- a binary coercion to the class's type: varchar on text_ops, as the parser
+-- relabels it; and a domain is its base type, cross-type members included
+SELECT lion_ktc($$lion_index_count('lion_kt_v_v', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE v = 'v3'::varchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_t', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE t = 'v3'::varchar$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_v', 'v3'::text)$$,
+				$$FROM lion_kt_v WHERE v = 'v3'::text$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_v', '{v3, v4, nope}'::varchar[])$$,
+				$$FROM lion_kt_v WHERE v = ANY ('{v3, v4, nope}'::varchar[])$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3::lion_kt_posint)$$,
+				$$FROM lion_kt_v WHERE k = 3::lion_kt_posint$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_dk', 3)$$,
+				$$FROM lion_kt_v WHERE dk = 3$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3::lion_kt_big8)$$,
+				$$FROM lion_kt_v WHERE k = 3::lion_kt_big8$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_posint[])$$,
+				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_posint[])$$);
+SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_big8[])$$,
+				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_big8[])$$);
+SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3, 'lion_kt_v_v', 'v3'::varchar)$$,
+				$$FROM lion_kt_v WHERE k = 3 AND v = 'v3'$$);
+-- a cast FUNCTION is not taken (§21): bpchar to text is rtrim1()
+SELECT lion_index_count('lion_kt_v_t', 'v3'::bpchar);
+SELECT lion_index_count('lion_kt_v_k', 'v3'::varchar);
+
 DROP TABLE lion_kt_e, lion_kt_v;
-DROP TYPE lion_kt_mood, lion_kt_big;
-DROP DOMAIN lion_kt_posint;
+DROP DOMAIN lion_kt_moodd, lion_kt_posint, lion_kt_big8;
+DROP TYPE lion_kt_mood, lion_kt_big, lion_kt_other;
 DROP FUNCTION lion_kt(text, text);
+DROP FUNCTION lion_ktc(text, text);

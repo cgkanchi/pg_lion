@@ -449,6 +449,12 @@ CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
  * indexes, interlocked with the visibility map (DESIGN.md section 9).  The
  * result is always exactly count(*) of the equivalent SELECT under the same
  * snapshot, so these are VOLATILE.
+ *
+ * A key is taken as `col = key` would take it: the column's own type, a type
+ * the column's operator family compares it with (an int8 key on an int4
+ * column), or a binary coercion to the column's type (varchar on text); a
+ * domain as its base type; and for enum_ops the column's own enum and no
+ * other (DESIGN.md section 9, "SQL surface").
  * --------------------------------------------------------------------- */
 
 CREATE FUNCTION lion_index_count(idx regclass, key anyelement)
@@ -459,13 +465,19 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 COMMENT ON FUNCTION lion_index_count(regclass, anyelement) IS
 	'count rows with key from a lion index, skipping all-visible heap pages';
 
+/*
+ * The two keys are of two unrelated polymorphic types: each is compared with
+ * its own index's column, and nothing says the two columns share a type.
+ * With one anyelement for both, `lion_index_count('i', 1, 't', 'x'::text)`
+ * could not be called at all.
+ */
 CREATE FUNCTION lion_index_count(idx1 regclass, key1 anyelement,
-									idx2 regclass, key2 anyelement)
+									idx2 regclass, key2 anycompatible)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'lion_index_count2'
 LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION lion_index_count(regclass, anyelement, regclass, anyelement) IS
+COMMENT ON FUNCTION lion_index_count(regclass, anyelement, regclass, anycompatible) IS
 	'count rows matching both keys from two lion indexes on the same table';
 
 /*
