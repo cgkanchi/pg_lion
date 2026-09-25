@@ -230,6 +230,44 @@ lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno)
 }
 
 /*
+ * Can this page be read at all?  lion_index_stats() reports damage to nobody -
+ * telling it apart is lion_index_verify()'s job - but it must not read past a
+ * page because of it.  A page read from disk had its header checked by
+ * PageIsVerified(); one damaged in shared buffers did not, and pd_lower bounds
+ * the line pointer array that every loop below walks.  A page that fails is
+ * skipped, as a new one is.
+ */
+static bool
+lion_stats_page_readable(Page page)
+{
+	PageHeader	phdr = (PageHeader) page;
+
+	return !PageIsNew(page) &&
+		phdr->pd_lower >= SizeOfPageHeaderData &&
+		phdr->pd_lower <= phdr->pd_upper &&
+		phdr->pd_upper <= phdr->pd_special &&
+		phdr->pd_special <= BLCKSZ &&
+		PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+		LionPageGetOpaque(page)->page_id == LION_PAGE_ID;
+}
+
+/*
+ * ... and this item, of which the reader looks at the first minlen bytes?  It
+ * must lie wholly inside the page's item space; one that does not is left
+ * out of the counts.
+ */
+static bool
+lion_stats_item_readable(Page page, ItemId iid, Size minlen)
+{
+	PageHeader	phdr = (PageHeader) page;
+
+	return ItemIdIsNormal(iid) &&
+		ItemIdGetLength(iid) >= minlen &&
+		ItemIdGetOffset(iid) >= phdr->pd_upper &&
+		ItemIdGetOffset(iid) + ItemIdGetLength(iid) <= phdr->pd_special;
+}
+
+/*
  * Account for one item of a posting set.  The container counters count real
  * containers only; a sparse segment (DESIGN.md §13) is reported by
  * sparse_segments/sparse_members instead.  container_bytes is the bytes of
@@ -327,7 +365,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 
-			if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+			if (!lion_stats_page_readable(page))
 			{
 				UnlockReleaseBuffer(buf);
 				continue;
@@ -351,12 +389,18 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					LionEntryTuple *entry;
 					LionColStats *cs;
 
-					if (!ItemIdIsUsed(iid))
+					if (!lion_stats_item_readable(page, iid, LION_ENTRY_HDRSZ))
 						continue;
 
+					/*
+					 * Corrupt entries are left out; verify() is what reports
+					 * them.  The payload length is the item's length less
+					 * the key, which must not underflow.
+					 */
 					entry = (LionEntryTuple *) PageGetItem(page, iid);
-					if (entry->attno < 1 || entry->attno > st->ncolumns)
-						continue;	/* corrupt; verify() is what reports it */
+					if (entry->attno < 1 || entry->attno > st->ncolumns ||
+						ItemIdGetLength(iid) < LionEntryPayloadOffset(entry))
+						continue;
 					cs = &st->cols[entry->attno - 1];
 
 					cs->entries++;
@@ -435,13 +479,21 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				for (off = FirstOffsetNumber; off <= maxoff; off++)
 				{
 					ItemId		iid = PageGetItemId(page, off);
+					LionContainer *c;
 
-					if (!ItemIdIsUsed(iid))
+					/*
+					 * lion_item_size() reads the header, and a RUN's count
+					 * of runs after it, and has no size for a type it does
+					 * not know; no real item is shorter than that.
+					 */
+					if (!lion_stats_item_readable(page, iid,
+												  LION_CONTAINER_HDRSZ + sizeof(uint16)))
+						continue;
+					c = (LionContainer *) PageGetItem(page, iid);
+					if (c->type < LION_CT_ARRAY || c->type > LION_CT_SPARSE)
 						continue;
 
-					lion_stats_item(cs,
-								   (LionContainer *) PageGetItem(page, iid),
-								   ItemIdGetLength(iid));
+					lion_stats_item(cs, c, ItemIdGetLength(iid));
 				}
 			}
 
@@ -685,8 +737,19 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 {
 	Buffer		buf;
 	Page		page;
+	PageHeader	phdr;
 	LionPageOpaque opaque;
 	uint16		flags;
+
+	/*
+	 * Every block number that reaches this function was read off a page, and
+	 * ReadBuffer() must not see one past the end: on 16 to 18 it treats
+	 * InvalidBlockNumber as P_NEW and EXTENDS the relation, and a check that
+	 * writes to what it checks is worse than one that crashes.
+	 */
+	if (!lion_verify_block_exists(vs, blk))
+		lion_corrupt("lion index \"%s\": a link points at block %u, but the index has only %u blocks",
+					RelationGetRelationName(vs->index), blk, vs->nblocks);
 
 	buf = ReadBuffer(vs->index, blk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -696,6 +759,21 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 	if (PageIsNew(page))
 		lion_corrupt("lion index \"%s\": block %u has never been initialised",
 					RelationGetRelationName(vs->index), blk);
+
+	/*
+	 * The header bounds everything else on the page: the line pointer array
+	 * ends at pd_lower, the items live in [pd_upper, pd_special).  A page read
+	 * from disk had this checked by PageIsVerified(); one that was damaged in
+	 * shared buffers did not.
+	 */
+	phdr = (PageHeader) page;
+	if (phdr->pd_lower < SizeOfPageHeaderData ||
+		phdr->pd_lower > phdr->pd_upper ||
+		phdr->pd_upper > phdr->pd_special ||
+		phdr->pd_special > BLCKSZ)
+		lion_corrupt("lion index \"%s\": block %u has a page header with lower %u, upper %u and special %u",
+					RelationGetRelationName(vs->index), blk,
+					phdr->pd_lower, phdr->pd_upper, phdr->pd_special);
 
 	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
 		lion_corrupt("lion index \"%s\": block %u has a special area of %u bytes, expected %zu",
@@ -734,6 +812,46 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 					kind == LION_PAGE_DIR ? "directory" : "container");
 
 	return page;
+}
+
+/*
+ * The line pointer of item off, checked before anything reads the item it
+ * points at, which a corrupt one could otherwise place anywhere on the page
+ * or past its end (amcheck's PageGetItemIdCareful()).
+ *
+ * An UNUSED line pointer is handed back as it is, for the caller to skip or
+ * refuse: VACUUM leaves them on directory leaves, whose entry offsets never
+ * move (DESIGN.md §18).  lion never marks an item dead or redirects one, and
+ * a used item has to lie wholly inside the item space [pd_upper, pd_special)
+ * at a MAXALIGNed offset - the same test bufpage.c applies before it moves
+ * one.  The header bounds were checked by lion_verify_read_page().
+ */
+static ItemId
+lion_verify_itemid(LionVerifyState *vs, BlockNumber blk, Page page,
+				   OffsetNumber off)
+{
+	PageHeader	phdr = (PageHeader) page;
+	ItemId		iid = PageGetItemId(page, off);
+	unsigned	lpoff;
+	unsigned	lplen;
+
+	if (!ItemIdIsUsed(iid))
+		return iid;
+
+	if (!ItemIdIsNormal(iid))
+		lion_corrupt("lion index \"%s\": line pointer %u on block %u is %s, which lion never makes",
+					RelationGetRelationName(vs->index), off, blk,
+					ItemIdIsDead(iid) ? "dead" : "a redirect");
+
+	lpoff = ItemIdGetOffset(iid);
+	lplen = ItemIdGetLength(iid);
+	if (lplen == 0 || lpoff < phdr->pd_upper ||
+		lpoff + lplen > phdr->pd_special || lpoff != MAXALIGN(lpoff))
+		lion_corrupt("lion index \"%s\": line pointer %u on block %u points at %u bytes at offset %u, outside the item space %u .. %u",
+					RelationGetRelationName(vs->index), off, blk, lplen, lpoff,
+					phdr->pd_upper, phdr->pd_special);
+
+	return iid;
 }
 
 /*
@@ -779,6 +897,75 @@ lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
 			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed cstring key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
+}
+
+/*
+ * The parts of a directory item - an entry, a high key or a downlink - that
+ * the rest of the check READS before it could check them: a line pointer that
+ * stays on the page, a whole header, a key column the index has, and key
+ * bytes that lie inside the item and have the length the column's key type
+ * calls for.  The order checks compare keys through the opclass, the
+ * duplicate check calls its equality, the entry check hashes the key, and
+ * lion_column() of a column the index does not have indexes past its array:
+ * each of those would read wherever a lying header sent it.  So every item of
+ * a directory page goes through this before any of them looks at it.
+ *
+ * Returns NULL for an unused line pointer, which the caller skips.
+ */
+static LionEntryTuple *
+lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
+					 OffsetNumber off)
+{
+	ItemId		iid = lion_verify_itemid(vs, blk, page, off);
+	LionEntryTuple *item;
+	Size		itemsz;
+	int			kind;
+
+	if (!ItemIdIsUsed(iid))
+		return NULL;
+
+	itemsz = ItemIdGetLength(iid);
+	if (itemsz < LION_ENTRY_HDRSZ)
+		lion_corrupt("lion index \"%s\": item %u on block %u is only %zu bytes, less than an entry header",
+					RelationGetRelationName(vs->index), off, blk, itemsz);
+
+	item = (LionEntryTuple *) PageGetItem(page, iid);
+	if (itemsz < LionEntryPayloadOffset(item))
+		lion_corrupt("lion index \"%s\": item %u on block %u is %zu bytes, too small for its %u byte key",
+					RelationGetRelationName(vs->index), off, blk, itemsz,
+					item->keylen);
+
+	kind = lion_entry_kind(item);
+
+	/* The minus-infinity downlink has no column and no key (§21, §24). */
+	if (kind == LION_KIND_MINF)
+	{
+		if (item->attno != 0 || item->keylen != 0)
+			lion_corrupt("lion index \"%s\": the minus-infinity item %u on block %u has key column %u and a key of %u bytes",
+						RelationGetRelationName(vs->index), off, blk,
+						item->attno, item->keylen);
+		return item;
+	}
+
+	if (item->attno < 1 || item->attno > vs->ix->ncolumns)
+		lion_corrupt("lion index \"%s\": entry %u on block %u belongs to key column %u, but the index has %d",
+					RelationGetRelationName(vs->index), off, blk, item->attno,
+					vs->ix->ncolumns);
+
+	if (kind != LION_KIND_VALUE)
+	{
+		/* the NULL and EMPTY entries, or pivots made from them (§14, §17) */
+		if (item->keylen != 0)
+			lion_corrupt("lion index \"%s\": %s item %u on block %u has a key of %u bytes",
+						RelationGetRelationName(vs->index),
+						kind == LION_KIND_NULL ? "null" : "empty", off, blk,
+						item->keylen);
+		return item;
+	}
+
+	lion_verify_keylen(vs, lion_column(vs->ix, (AttrNumber) item->attno),
+					   blk, off, item);
+	return item;
 }
 
 /*
@@ -876,6 +1063,11 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 					 uint32 *prevckey)
 {
 	const char *detail = NULL;
+
+	/* the header has to be there before its type can say what follows */
+	if (avail < LION_CONTAINER_HDRSZ)
+		lion_corrupt("lion index \"%s\": item %u on block %u is only %zu bytes, less than an item header",
+					RelationGetRelationName(vs->index), off, blk, avail);
 
 	if (c->type == LION_CT_SPARSE)
 	{
@@ -1039,7 +1231,7 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 		{
-			ItemId		iid = PageGetItemId(page, off);
+			ItemId		iid = lion_verify_itemid(vs, blk, page, off);
 			LionContainer *c;
 
 			if (!ItemIdIsUsed(iid))
@@ -1123,6 +1315,19 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 		maxoff = PageGetMaxOffsetNumber(page);
 		firstdata = lion_posting_first_data(page);
 
+		/* Every item is one whole pivot before any of them is read. */
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		iid = lion_verify_itemid(vs, blk, page, off);
+
+			if (!ItemIdIsUsed(iid) ||
+				ItemIdGetLength(iid) != LION_POSTING_PIVOT_SIZE)
+				lion_corrupt("lion index \"%s\": item %u of internal posting page %u is %zu bytes, expected %zu",
+							RelationGetRelationName(vs->index), off, blk,
+							(Size) ItemIdGetLength(iid),
+							LION_POSTING_PIVOT_SIZE);
+		}
+
 		if (!LionPageIsRightmost(page))
 		{
 			if (maxoff < FirstOffsetNumber)
@@ -1147,12 +1352,6 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 		{
 			LionPostingPivot *piv = lion_posting_pivot(page, off);
 
-			if (ItemIdGetLength(PageGetItemId(page, off)) !=
-				LION_POSTING_PIVOT_SIZE)
-				lion_corrupt("lion index \"%s\": item %u of internal posting page %u is %zu bytes, expected %zu",
-							RelationGetRelationName(vs->index), off, blk,
-							(Size) ItemIdGetLength(PageGetItemId(page, off)),
-							LION_POSTING_PIVOT_SIZE);
 			if (!BlockNumberIsValid(piv->child))
 				lion_corrupt("lion index \"%s\": item %u of internal posting page %u is a second high key",
 							RelationGetRelationName(vs->index), off, blk);
@@ -1223,10 +1422,16 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 					RelationGetRelationName(vs->index), eoff, eblk,
 					entry->head, entry->tail);
 
-	/* The leftmost page of every level, from the root down. */
+	/*
+	 * The leftmost page of every level, from the root down.  The pages are
+	 * read, not visited: the level walks below visit them.  An ERROR raised
+	 * with a buffer locked releases it on the way out, as everywhere else in
+	 * this file.
+	 */
 	{
 		BlockNumber blk = entry->head;
 		int			steps = 0;
+		uint16		expect = 0;
 
 		for (i = 0; i <= LION_POSTING_MAX_HEIGHT; i++)
 			leftmost[i] = InvalidBlockNumber;
@@ -1236,52 +1441,52 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			Buffer		buf;
 			Page		page;
 			uint16		level;
+			OffsetNumber firstdata;
+			ItemId		iid;
 
 			if (steps++ > LION_POSTING_MAX_HEIGHT)
 				lion_corrupt("lion index \"%s\": the posting tree of chain entry %u on block %u is deeper than %d levels",
 							RelationGetRelationName(vs->index), eoff, eblk,
 							LION_POSTING_MAX_HEIGHT);
 
-			buf = ReadBuffer(vs->index, blk);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
-				LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
-				!LionPageIsContainer(page))
-			{
-				UnlockReleaseBuffer(buf);
-				lion_corrupt("lion index \"%s\": block %u is not a container page of chain entry %u on block %u",
-							RelationGetRelationName(vs->index), blk, eoff, eblk);
-			}
+			/* the block's range, the header and the page kind */
+			page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
+
 			level = LionPageGetOpaque(page)->level;
 			if (level > LION_POSTING_MAX_HEIGHT)
-			{
-				UnlockReleaseBuffer(buf);
 				lion_corrupt("lion index \"%s\": posting page %u claims level %u",
 							RelationGetRelationName(vs->index), blk, level);
-			}
 			if (blk == entry->head)
 				height = level;
+			else if (level != expect)
+				lion_corrupt("lion index \"%s\": posting page %u is at level %u, but its parent is at level %u",
+							RelationGetRelationName(vs->index), blk, level,
+							expect + 1);
 			if (!LionPageIsRightmost(page) && blk == entry->head)
-			{
-				UnlockReleaseBuffer(buf);
 				lion_corrupt("lion index \"%s\": the root %u of chain entry %u on block %u has a right sibling",
 							RelationGetRelationName(vs->index), blk, eoff, eblk);
-			}
 			leftmost[level] = blk;
 			if (level == 0)
 			{
 				UnlockReleaseBuffer(buf);
 				break;
 			}
-			if (lion_posting_first_data(page) > PageGetMaxOffsetNumber(page))
-			{
-				UnlockReleaseBuffer(buf);
+
+			firstdata = lion_posting_first_data(page);
+			if (firstdata > PageGetMaxOffsetNumber(page))
 				lion_corrupt("lion index \"%s\": internal posting page %u has no downlink",
 							RelationGetRelationName(vs->index), blk);
-			}
-			blk = lion_posting_pivot(page,
-									 lion_posting_first_data(page))->child;
+			iid = lion_verify_itemid(vs, blk, page, firstdata);
+			if (!ItemIdIsUsed(iid) ||
+				ItemIdGetLength(iid) != LION_POSTING_PIVOT_SIZE)
+				lion_corrupt("lion index \"%s\": item %u of internal posting page %u is %zu bytes, expected %zu",
+							RelationGetRelationName(vs->index), firstdata, blk,
+							(Size) ItemIdGetLength(iid),
+							LION_POSTING_PIVOT_SIZE);
+
+			/* checked against the index's length when it is read */
+			blk = lion_posting_pivot(page, firstdata)->child;
+			expect = level - 1;
 			UnlockReleaseBuffer(buf);
 		}
 	}
@@ -1392,6 +1597,11 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 
 /*
  * Check one entry tuple.
+ *
+ * The walk has put every item of the page through lion_verify_dir_item()
+ * already, but this does not lean on it for the order of its own reads: the
+ * size is checked before any header field is read, and the key's extent and
+ * length before the key is hashed.
  */
 static void
 lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
@@ -1399,8 +1609,19 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 {
 	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 	Size		itemsz = ItemIdGetLength(iid);
-	uint16		kind = entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN);
+	uint16		kind;
 	LionState  *state;
+
+	if (itemsz < LION_ENTRY_HDRSZ)
+		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
+					RelationGetRelationName(vs->index), off, blk, itemsz);
+
+	if (itemsz < LionEntryPayloadOffset(entry))
+		lion_corrupt("lion index \"%s\": entry %u on block %u is %zu bytes, too small for its %u byte key",
+					RelationGetRelationName(vs->index), off, blk, itemsz,
+					entry->keylen);
+
+	kind = entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN);
 
 	/*
 	 * The KEY COLUMN (DESIGN.md §24).  Everything below - the key length, the
@@ -1423,10 +1644,6 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	if (entry->unused != 0)
 		lion_corrupt("lion index \"%s\": entry %u on block %u has a non-zero reserved header field",
 					RelationGetRelationName(vs->index), off, blk);
-
-	if (itemsz < LION_ENTRY_HDRSZ)
-		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
-					RelationGetRelationName(vs->index), off, blk, itemsz);
 
 	if (kind != LION_ENTRY_INLINE && kind != LION_ENTRY_CHAIN)
 		lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, expected exactly one of INLINE and CHAIN",
@@ -1488,11 +1705,6 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						RelationGetRelationName(vs->index), off, blk,
 						entry->hash, hash);
 	}
-
-	if (itemsz < LionEntryPayloadOffset(entry))
-		lion_corrupt("lion index \"%s\": entry %u on block %u is %zu bytes, too small for its %u byte key",
-					RelationGetRelationName(vs->index), off, blk, itemsz,
-					entry->keylen);
 
 	if (kind == LION_ENTRY_INLINE)
 	{
@@ -1774,17 +1986,23 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		maxoff = PageGetMaxOffsetNumber(page);
 		firstdata = lion_page_first_data(page);
 
+		/* Nothing below reads an item this has not vouched for. */
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+			(void) lion_verify_dir_item(vs, blk, page, off);
+
 		if (!LionPageIsRightmost(page))
 		{
 			if (maxoff < FirstOffsetNumber)
 				lion_corrupt("lion index \"%s\": directory page %u is not rightmost but has no high key",
 							RelationGetRelationName(vs->index), blk);
-			if (!LionEntryIsHighKey(lion_page_entry(page, FirstOffsetNumber)))
+			if (!ItemIdIsUsed(PageGetItemId(page, FirstOffsetNumber)) ||
+				!LionEntryIsHighKey(lion_page_entry(page, FirstOffsetNumber)))
 				lion_corrupt("lion index \"%s\": the first item of directory page %u is not a high key",
 							RelationGetRelationName(vs->index), blk);
 			highkey = lion_verify_copy_item(page, FirstOffsetNumber);
 		}
 		else if (maxoff >= FirstOffsetNumber &&
+				 ItemIdIsUsed(PageGetItemId(page, FirstOffsetNumber)) &&
 				 LionEntryIsHighKey(lion_page_entry(page, FirstOffsetNumber)))
 			lion_corrupt("lion index \"%s\": rightmost directory page %u carries a high key",
 						RelationGetRelationName(vs->index), blk);
@@ -1893,14 +2111,19 @@ lion_verify_directory(LionVerifyState *vs)
 			leftmost[level] = blk;
 			if (level > 0)
 			{
-				if (PageGetMaxOffsetNumber(page) < lion_page_first_data(page))
+				LionEntryTuple *down = NULL;
+
+				if (PageGetMaxOffsetNumber(page) >= lion_page_first_data(page))
+					down = lion_verify_dir_item(vs, blk, page,
+												lion_page_first_data(page));
+				if (down == NULL)
 					lion_corrupt("lion index \"%s\": internal page %u has no downlink",
 								RelationGetRelationName(vs->index), blk);
-				if (!LionEntryIsMinusInf(lion_page_entry(page,
-														 lion_page_first_data(page))))
+				if (!LionEntryIsMinusInf(down))
 					lion_corrupt("lion index \"%s\": the leftmost downlink of page %u is not minus infinity",
 								RelationGetRelationName(vs->index), blk);
-				blk = lion_page_entry(page, lion_page_first_data(page))->head;
+				/* checked against the index's length when it is read */
+				blk = down->head;
 			}
 			UnlockReleaseBuffer(buf);
 		}
@@ -2027,6 +2250,15 @@ lion_verify_meta(LionVerifyState *vs)
 	if (!BlockNumberIsValid(meta->root) || meta->root >= vs->nblocks)
 		lion_corrupt("lion index \"%s\": meta page names root block %u, but the index has %u blocks",
 					RelationGetRelationName(vs->index), meta->root, vs->nblocks);
+
+	/*
+	 * A directory of height h has at least h + 1 pages besides this one, and
+	 * the walk sizes its arrays by the height: bound it before it is used.
+	 */
+	if ((uint64) meta->height + 2 > (uint64) vs->nblocks)
+		lion_corrupt("lion index \"%s\": meta page has directory height %u, but the index has only %u blocks",
+					RelationGetRelationName(vs->index), meta->height,
+					vs->nblocks);
 
 	if (LionPageGetOpaque(page)->rightlink != InvalidBlockNumber)
 		lion_corrupt("lion index \"%s\": the meta page has a right link to block %u",
