@@ -160,17 +160,17 @@ SELECT lion_arrplan($$SELECT id FROM lion_arr WHERE tags @> '{t5}'$$);
 (4 rows)
 
 SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5,t7}'$$);
-                  lion_arrplan                   
--------------------------------------------------
+                       lion_arrplan                        
+-----------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_arr_tags (tags @> {t5,t7})
+   Lion Indexes: lion_arr_tags (tags @> '{t5,t7}'::text[])
 (2 rows)
 
 SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags && '{t5,t7}'$$);
-                  lion_arrplan                   
--------------------------------------------------
+                       lion_arrplan                        
+-----------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_arr_tags (tags && {t5,t7})
+   Lion Indexes: lion_arr_tags (tags && '{t5,t7}'::text[])
 (2 rows)
 
 -- `<@` needs every row rechecked, so it is never pushed down
@@ -197,19 +197,19 @@ SELECT lion_arrplan($$SELECT count(*) FROM lion_arr WHERE tags @> '{}'$$);
 
 SELECT lion_arrplan($$SELECT grp, count(*) FROM lion_arr
 					 WHERE tags @> '{t5}' GROUP BY grp$$);
-                           lion_arrplan                           
-------------------------------------------------------------------
+                                lion_arrplan                                
+----------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_arr_grp (grp), lion_arr_tags (tags @> {t5})
+   Lion Indexes: lion_arr_grp (grp), lion_arr_tags (tags @> '{t5}'::text[])
    Group Key: grp
 (3 rows)
 
 SELECT lion_arrplan($$SELECT count(*) FROM lion_arr
 					 WHERE tags @> '{t5}' AND nums && '{3}'$$);
-                               lion_arrplan                                
----------------------------------------------------------------------------
+                                           lion_arrplan                                           
+--------------------------------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_arr_tags (tags @> {t5}), lion_arr_nums (nums && {3})
+   Lion Indexes: lion_arr_tags (tags @> '{t5}'::text[]), lion_arr_nums (nums && '{3}'::integer[])
 (2 rows)
 
 -- ---- @> with one, two and three elements -------------------------------
@@ -747,11 +747,11 @@ CREATE INDEX ON lion_arr_p1 USING lion (grp);
 CREATE INDEX ON lion_arr_p2 USING lion (grp);
 VACUUM ANALYZE lion_arr_part;
 SELECT lion_arrplan($$SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}'$$);
-              lion_arrplan              
-----------------------------------------
+                lion_arrplan                 
+---------------------------------------------
  Custom Scan (LionCount)
    Partitions: lion_arr_p1, lion_arr_p2
-   Lion Indexes: (tags @> {t5,t2})
+   Lion Indexes: (tags @> '{t5,t2}'::text[])
 (3 rows)
 
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}'$$);
@@ -937,10 +937,10 @@ EXECUTE lion_arrc_c(ARRAY[]::text[]);
 
 SET plan_cache_mode = force_custom_plan;
 EXPLAIN (COSTS OFF) EXECUTE lion_arrc_c(ARRAY['u500']);
-                   QUERY PLAN                    
--------------------------------------------------
+                        QUERY PLAN                         
+-----------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_arrc_tags (tags @> {u500})
+   Lion Indexes: lion_arrc_tags (tags @> '{u500}'::text[])
 (2 rows)
 
 EXECUTE lion_arrc_c(ARRAY['u500']);

@@ -244,10 +244,10 @@ DEALLOCATE lion_sc_p;
 -- two parameters under the one operator are two sources, and both are answered
 PREPARE lion_sc_p(text, text) AS SELECT count(*) FROM lion_sc_t WHERE v === $1 AND v === $2;
 EXPLAIN (COSTS OFF) EXECUTE lion_sc_p('A', 'a');
-                       QUERY PLAN                       
---------------------------------------------------------
+                         QUERY PLAN                         
+------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_sc_v (v = $1), lion_sc_v (v = $2)
+   Lion Indexes: lion_sc_v (v === $1), lion_sc_v (v === $2)
 (2 rows)
 
 EXECUTE lion_sc_p('A', 'a');
@@ -345,10 +345,10 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
-                      QUERY PLAN                      
-------------------------------------------------------
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_sc_v (v = A), lion_sc_v (v = a)
+   Lion Indexes: lion_sc_v (v === 'A'::text), lion_sc_v (v === 'a'::text)
 (2 rows)
 
 SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
@@ -358,10 +358,10 @@ SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT w, count(*) FROM lion_sc_t WHERE w IN ('A', 'a', 'b') AND w IN ('a', 'b') GROUP BY w;
-                                        QUERY PLAN                                         
--------------------------------------------------------------------------------------------
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_sc_w (w), lion_sc_w (w = ANY ({A,a,b})), lion_sc_w (w = ANY ({a,b}))
+   Lion Indexes: lion_sc_w (w), lion_sc_w (w = ANY ('{A,a,b}'::text[])), lion_sc_w (w = ANY ('{a,b}'::text[]))
    Group Key: w
 (3 rows)
 
@@ -398,10 +398,10 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND 'A' === v;
-            QUERY PLAN             
------------------------------------
+                 QUERY PLAN                  
+---------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_sc_v (v = A)
+   Lion Indexes: lion_sc_v (v === 'A'::text)
 (2 rows)
 
 RESET enable_seqscan;

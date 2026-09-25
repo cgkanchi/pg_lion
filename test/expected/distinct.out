@@ -580,18 +580,18 @@ SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_dt WHERE a =
 (3 rows)
 
 SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_dt WHERE k IN (1, 2) AND a = 3') AS p("QUERY PLAN");
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_dt_k (k), lion_dt_k (k = ANY ({1,2})), lion_dt_a (a = 3)
+   Lion Indexes: lion_dt_k (k), lion_dt_k (k = ANY ('{1,2}'::integer[])), lion_dt_a (a = 3)
    Distinct Key: k
 (3 rows)
 
 SELECT * FROM lion_explain_norm('SELECT g, count(*), count(DISTINCT k) FROM lion_dt WHERE t = ''t1'' GROUP BY g') AS p("QUERY PLAN");
-                            QUERY PLAN                            
-------------------------------------------------------------------
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_dt_g (g), lion_dt_k (k), lion_dt_t (t = t1)
+   Lion Indexes: lion_dt_g (g), lion_dt_k (k), lion_dt_t (t = 't1'::text)
    Group Key: g
    Distinct Key: k
 (4 rows)
