@@ -128,7 +128,13 @@ RESET ROLE;
 GRANT SELECT ON lion_sec_c TO lion_sec_reader;              -- the whole table, but no EXECUTE
 SET ROLE lion_sec_reader;
 SELECT lion_index_count('lion_sec_c_fn', 3);                  -- denied: the expression calls lion_sec_fn
-SELECT count(*) FROM lion_sec_c WHERE lion_sec_fn(id) = 3;    -- as the query does
+-- As the query does, whatever plan answers it.  The value is 4 rather than 3:
+-- lion_sec_c_pred is a partial index WHERE lion_sec_fn(id) = 3, and when the
+-- relcache entry was built by a role without EXECUTE its predicate is not
+-- inlined, so `lion_sec_fn(id) = 3` is implied by it, dropped, and answered
+-- by a keyless scan of that index without calling lion_sec_fn - core's rule
+-- for partial indexes, the same for a B-tree (DESIGN.md §9).
+SELECT count(*) FROM lion_sec_c WHERE lion_sec_fn(id) = 4;
 SELECT lion_index_count('lion_sec_c_pred', 3);                -- and through a predicate
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION lion_sec_fn(int) TO lion_sec_reader;

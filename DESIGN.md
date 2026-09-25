@@ -699,7 +699,13 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   the equality function they look up with: strategy 1 of the key column's opfamily for (opcintype,
   the key's type), which is `int48eq` for an int8 key on an int4 column exactly as in the query,
   and (opcintype, opcintype) for the grouped form. These checks follow the exact SELECT check,
-  under the lock (test/sql/security_exec.sql). The
+  under the lock (test/sql/security_exec.sql). One case follows core rather than the rule:
+  a clause implied by a PARTIAL index's predicate is dropped by the planner, so a keyless plain
+  or index-only scan of that index answers without calling the clause's functions, and without
+  checking EXECUTE on them. Whether the clause is implied can depend on who built the index's
+  relcache entry (a role without EXECUTE sees an inlinable SQL function un-inlined, which then
+  matches the query's clause exactly). A B-tree behaves identically; the predicate was evaluated
+  by whoever built the index, as core intends. The
   diagnostic functions check neither privileges nor RLS - `lion_index_posting_root()` answers key
   membership, `lion_index_stats()` gives counts, `lion_index_verify()` reads the heap,
   `lion_index_wal_mode()` locks whatever it is handed - so they are revoked from PUBLIC like
