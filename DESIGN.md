@@ -392,8 +392,8 @@ INSERT (`lion_insert.c`)
    even when the tail owns its ckey, because the tail may be the right half of a split that never
    finished, and only a descent finishes one (§22 addendum, "an unfinished split and the writers
    that do not descend"). The descent lands on the tail again; what it costs is its own locks, one
-   per level, on the general path only - never for a BITSET, about once per 30 members of a
-   growing ARRAY.
+   per level, on the general path only - never for a BITSET, and otherwise once each time an
+   item's growth slack (§4) runs out.
 5. All page modifications go through GenericXLog: one GenericXLogStart per atomic step, registering
    at most 4 buffers (a split touches P, N, possibly M, and the bucket page).
 6. Release everything. Inserts to different buckets do not block each other; inserts to the same
@@ -3873,14 +3873,18 @@ Three rules close it, all three after nbtree:
 
 Rule 1 makes the repair early - the first general-path insert after the crash does it - and rules 2
 and 3 make it certain for a writer that did not descend, which today means VACUUM's regrow, on
-either half. What rule 1 costs is the descent's locks, one per level, on the general path only: never for
-a BITSET, and about once per 30 members of a growing ARRAY, whose slack is 64 bytes.
+either half. What rule 1 costs is the descent's locks, one per level, and only on the general
+path: never for a BITSET, and for an ARRAY, a RUN or a sparse segment once each time the item's
+growth slack (§4: an eighth of it, 8 to 64 bytes) runs out - every 32 members of an ARRAY past
+512 bytes. Measured on the assert-enabled development build, 300,000 single-row inserts into a
+dense key (bitsets), 500 keys of sparse segments and 20 keys of arrays showed no difference beyond
+the run-to-run noise of that shared machine (±30%).
 
 Tests: `test/isolation/posting_split_repair.spec` cuts a split short with
-`lion-posting-split-incomplete` set to 'error' inside a subtransaction - which leaves on disk exactly
-what a crash between the two records leaves - and then (A) appends, (B) makes VACUUM regrow on the
-right half, which has no downlink, and (C) on the flagged left half. Each ends with verify() clean
-and the index agreeing with the heap; before the fix A and B failed with "no downlink" and C
+`lion-posting-split-incomplete` set to 'error' inside a subtransaction - which leaves on disk
+exactly what a crash between the two records leaves - and then (A) appends, (B) makes VACUUM regrow
+on the right half, which has no downlink, and (C) on the flagged left half. Each ends with verify()
+clean and the index agreeing with the heap; before the fix A and B failed with "no downlink" and C
 crashed an assert build. `test/recovery/run.sh` phase 1d now appends after its real crash, which is
 the case it used to route around by inserting only into the middle of the heap.
 
