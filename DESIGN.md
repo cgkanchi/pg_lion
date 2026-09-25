@@ -6157,8 +6157,9 @@ qualifying relation the hook runs after core has built the relation's paths, and
 
 1. **The ordered side.** Every unparameterized `IndexPath` in `rel->pathlist` - an Index Scan or
    an Index Only Scan path: the node visits the heap anyway, so the same index serves - with
-   non-NIL pathkeys, no ORDER BY operators, an index AM with `amgettuple` that is not lion, and no
-   `RowCompareExpr` among its index clauses (v1). Core builds these exactly when the pathkeys are
+   non-NIL pathkeys, no ORDER BY operators, a BTREE (§30.4's early stop and switch rest on a btree
+   returning each heap TID once per scan, in its pathkeys' order; any other ordered AM is declined,
+   2026-09-25 review), and no `RowCompareExpr` among its index clauses (v1). Core builds these exactly when the pathkeys are
    useful to the query (its ORDER BY, or a merge join), and keeps each unless a cheaper path with
    the same order exists.
 2. **The lion side, found by core.** `create_index_paths()` is run once more, on a SCRATCH copy of
@@ -6181,9 +6182,18 @@ qualifying relation the hook runs after core has built the relation's paths, and
    clauses, plus each partial index's predicate where they do not imply it, ANDed across a
    BitmapAnd and ORed across a BitmapOr - `create_bitmap_subplan()`'s `qual`. A restriction clause
    leaves the heap filter when it is (by pointer) one of the ordered path's non-lossy index
-   clauses or one of the lion leaves' index clauses, or when `predicate_implied_by()` the
-   `lionqual`; the rest is the plan's `qual`, the filter core's `ExecScan()` applies. Pseudo-
-   constant clauses are core's gating Result's.
+   clauses, or one of the index clauses of a lion leaf reached from the root through ANDS ONLY,
+   or when `predicate_implied_by()` the `lionqual`; the rest is the plan's `qual`, the filter
+   core's `ExecScan()` applies. Pseudo-constant clauses are core's gating Result's.
+   *(Fixed 2026-09-25: the first version dropped every leaf's clauses, OR arms' included. Core
+   builds each arm of a BitmapOr with the other top-level clauses at hand, so for `a = 3 AND
+   (b = 5 OR c = 7)` over a lion index on `(a, b)` the arm `a = 3 AND b = 5` reuses the top-level
+   RestrictInfo of `a = 3`; the lion qual `((a = 3 AND b = 5) OR c = 7)` does not imply it, yet it
+   left the filter, and at default settings 38 of 50 rows had `a <> 3`. An arm's clauses are now
+   never treated as implied; only what `predicate_implied_by()` proves of the whole lion qual, or
+   an AND-path leaf's own clause, leaves the filter - which is what `create_bitmap_scan_plan()`
+   does. Nothing else in the node assumes a leaf's clause is implied: an exact set is exact for
+   the `lionqual` as a whole, and the recheck of an inexact one is the whole `lionqual`.)*
 
 The plan carries in `custom_exprs` - where setrefs.c fixes their Vars and Params, and where
 `SS_finalize_plan()` finds the Param ids that make the executor rescan the node - the lion leaves'
@@ -6225,6 +6235,20 @@ start-up at all, while the node first reads half a million TIDs out of lion: cor
 model says so. Without a LIMIT and with a large result the node walks the whole btree and fetches
 the rows in index order, i.e. randomly, while the bitmap scan fetches them in heap order and a
 Sort is cheaper: the model says that too.
+
+**The hazard: a filter correlated with the order** (2026-09-25 review). LIMIT scaling assumes the
+members are spread evenly along the btree, so that `LIMIT 10` of a 0.25% filter meets its rows
+after 4,000 entries. When the filter is correlated with the order - `c = 398 ORDER BY k` where
+`c` is `k / 2500`, or a zero-row AND of two correlated columns - the members lie at the far end
+(or nowhere), and the walk reads almost the whole index: 997,510 entries and 41.5 ms on 1M rows,
+against 0.6 ms for bitmap + Sort. Core's own ordered walk has the same hazard (it paid 113 ms
+there), but the node competes with bitmap + Sort as well, and the planner cannot see the
+correlation (no cross-column or filter-to-order statistics). The model is left as it is; the
+EXECUTOR bounds the damage instead (§30.4, "When the walk is not paying"): the set's exact size
+is known before the walk starts, and once the walk has cost what fetching the remaining members
+would, it fetches and sorts those. The same query now takes 2.8 ms: 80,000 entries walked, then
+2,500 members fetched and sorted (§30.10). Still 3.5x the bitmap plan's time - the cost of not
+knowing - but no longer 50x.
 
 **Memory ceiling.** The set is the answer's containers (§3): at most 4 kB per 64 heap blocks and
 about 2 bytes per member for a sparse answer, plus 16 bytes of directory per container - some
@@ -6276,10 +6300,47 @@ than overruns (§30.4).
   `table_tuple_fetch_row_version()`. A member with no visible version is skipped; a visible one is
   rechecked when the set is inexact (above) or the index set `xs_recheck` (against the ordered
   index's original clauses), then handed to `ExecScan()`, which applies the filter and projects.
-  A set with nothing in it ends the scan before the walk starts, and once as many members have
-  been found as the set holds (its cardinality, known unless it degraded) the walk stops early:
-  a btree returns each heap TID once, so nothing past that point can be a member. Without a LIMIT
-  that saves the rest of the index.
+  A set with nothing in it ends the scan before the walk starts.
+- **Stopping early.** Once the walk has met as many DISTINCT members as the set holds (its
+  cardinality, known unless it degraded) it stops: nothing further along can be one. The walk
+  remembers which members it has met - one 4 kB bitmap per container key it touches, in a per-scan
+  context, within `hash_mem` (past that it stops tracking and simply walks on, neither stopping
+  early nor switching) - and a member counts once however often the walk meets its TID.
+  *(Fixed 2026-09-25: the first version counted every meeting, on the premise that a btree
+  returns each TID once. Within one scan it returns each INDEX TUPLE once, but under an MVCC
+  snapshot the paused walk holds no pin (nbtree's `dropPin`, and lion's §29.5), so while a
+  cursor waits VACUUM can remove a dead member X the walk has already passed and an insert can
+  take X's slot with a key further along; the walk then meets X's TID again, as a tuple the
+  snapshot cannot see. Counted twice, it made the count reach the cardinality one visible member
+  early, and `FETCH ALL` stopped before B: test/isolation/ordered_recycle.spec. The choice between
+  the two fixes the review offered: remembering the members met, or counting only members fetched
+  VISIBLE (a recycled slot is never visible to the snapshot, so that count cannot overshoot).
+  The second needs no memory but, on a table with dead members, rarely stops early at all; the
+  first stops exactly when the last member has been met, dead or alive, and the switch below
+  needs the same record anyway. A second meeting of a TID is skipped without a fetch, which is
+  right: the tuple it now names was written after the snapshot. The premise that the ordered
+  index hands out each index tuple once is why the node is limited to btree.)*
+- **When the walk is not paying: fetch and sort.** The set's exact size is known before the walk
+  starts, so the walk is a bet on reaching `LIMIT` rows early, and the executor can cap the bet.
+  Once this scan has walked at least `LO_SWITCH_MIN_WALK` (10,000) entries and at least
+  `LO_SWITCH_RATIO` (32) entries per member it has not met yet, it stops walking, fetches every
+  member it has not met in TID order (the HOT chain under the snapshot, then the version it
+  sees), keeps the visible ones that pass the lion recheck (an inexact set) and the ordered
+  index's own original clauses (these rows did not come through the index), sorts them by the
+  path's pathkeys (SortSupport on the pathkeys' own sort operators, collations and NULLS
+  placement) and returns them. This is the ski-rental rule: the ratio is what a member's heap
+  fetch costs in index entries (0.04 us an entry against 1-2 us a random fetch, §30.10), so by
+  the time the node switches it has spent on the walk about what the fetches cost, and in the
+  worst case pays about twice what fetching and sorting from the start would have; the 10,000
+  floor keeps a small set's walk, which costs well under a millisecond, from switching at all.
+  Correctness: every row the walk has not returned yet is among the members it has not met (a
+  visible member's index entry lies where the walk has not been, and the walk only skips
+  non-members), and none it has returned is (those were met); rows with equal sort keys may come
+  in any order, which is all the pathkeys promise. The switch needs the pathkeys to be plain
+  columns of the relation - an expression index's order would evaluate its functions where the
+  ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6) - and gives up,
+  letting the walk go on, if the rows do not fit in `work_mem`. EXPLAIN ANALYZE says
+  `Switched to Fetch and Sort: S of N scans, M members fetched`. A rescan starts afresh.
 - **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
   substituted row against the `lionqual` and the ordered index's original clauses, as an Index
   Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.
@@ -6323,7 +6384,9 @@ ordinary plan returns, in the same order.
   written after t1 by a transaction S cannot see: the fetch finds nothing visible. The btree side is
   an ordinary index scan under core's own interlock (nbtree's MVCC `dropPin` rule).
 - **Order.** Rows come out in the order the btree walk returns them, which is what the pathkeys
-  claim; a non-member is only ever skipped, never reordered.
+  claim; a non-member is only ever skipped, never reordered. After a fetch-and-sort switch the
+  rest come out sorted by the pathkeys, all of them at or after the last row the walk returned
+  (§30.4).
 - **Non-MVCC snapshots** are refused (§30.4). **Hot standby**: nothing here reads the visibility
   map or relies on a pin, so a standby needs nothing an Index Scan does not.
 - **SERIALIZABLE.** The btree walk takes its own page predicate locks; each heap fetch takes a
@@ -6383,6 +6446,9 @@ filter takes the outer row's value: one per outer row).
   needs none of them; core adds a Material where a caller does.
 - **RowCompareExpr index quals** on the ordered index (`(a, b) > (1, 2)`): the executor's key
   substitution handles one key column per clause, and such a path is skipped.
+- **Ordered indexes other than btree**: §30.4's early stop and switch rest on btree's behaviour.
+- **The fetch-and-sort switch for an expression order** (`ORDER BY k % 1000` over an expression
+  index): the walk never switches there (§30.4).
 - **Lion accesses core did not build** (for example ANDing in a lion index that core's
   `choose_bitmap_and()` judged not worth its heap savings): the node only considers the accesses
   core's own lion index paths contain. A sharper set would save btree steps but no heap fetch.
@@ -6407,8 +6473,16 @@ pattern); and the plan choice with nothing disabled - the node for a selective l
 node for a large result without a LIMIT. Isolation: `ordered_cursor.spec` (a cursor paused after
 its set was built while another session inserts matching rows, deletes and updates matching rows
 and commits: the rest of the cursor returns exactly its snapshot's rows, and rows inserted between
-DECLARE and the first FETCH do not appear either; VACUUM runs while it is paused and completes)
-and `ordered_serializable.spec` (the write-skew pair, both through the node: one of them fails).
+DECLARE and the first FETCH do not appear either; VACUUM runs while it is paused and completes),
+`ordered_recycle.spec` (the review's repro of §30.4's recycled TID: `FETCH ALL` returns B) and
+`ordered_serializable.spec` (the write-skew pair, both through the node: one of them fails).
+Added with the 2026-09-25 fixes, each failing before its fix: `a = 3 AND (b = 5 OR c = 7)` at
+default settings and forced (the OR-arm residual; 38 wrong rows of 50), the same shape on the
+main fixture, and a filter correlated with the order - members at the far end, a zero-row
+correlated AND, three members early and a thousand late (the switch after rows were returned,
+including through a paused cursor), NULLs first under DESC with members among the NULLs met
+before the switch, a btree qual beside it, and a LATERAL rescan - each compared in order with the
+ordinary plan, with the switch shown by EXPLAIN ANALYZE.
 `make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
 orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
 
@@ -6438,3 +6512,19 @@ entries walked, 23 members fetched for 10 rows - core's bitmap qual answers only
 and half the members fail it (§30.8's "lion accesses core did not build"; ANDing `c2`'s set in
 would halve the fetches). Without a LIMIT the same query walks 999,767 entries to find all 5,165
 members, and the planner keeps the bitmap heap scan and Sort (5.5 ms).
+
+**After the 2026-09-25 fixes** (same slot and build; median of 15). The three benchmark queries
+are unchanged within noise - `ordered_filter` 0.72 ms through the node (default plan 0.55),
+`ordered_filter_desc` 0.52, `ordered_broad` kept on core's walk (0.032) - because their walks stay
+under the switch's 10,000-entry floor. The correlated hazard of §30.3, on a second 1M-row table
+with `k = i` (btree) and `c = (i - 1) / 2500`, `g = c % 2` (lion), 0.25% per `c` value:
+
+| query | default | LionOrdered | btree/lion Index Scan + Sort | lion bitmap + Sort |
+|---|---|---|---|---|
+| `c = 398 ORDER BY k LIMIT 10` (members at the far end) | LionOrdered 2.83 | 2.87 (was ~41) | 0.90 | **0.80** |
+| `c = 150 AND g = 1 ORDER BY k LIMIT 10` (no row) | Index Scan + Sort 0.25 | 4.90 | 0.25 | **0.21** |
+
+The first is still chosen by the planner (it cannot see the correlation) and now switches after
+80,000 entries, fetching and sorting the 2,500 members: 3.5x the best plan instead of 50x. The
+second is not chosen here; forced, it switches after 80,000 entries and fetches 2,500 members that
+all fail `g = 1`.

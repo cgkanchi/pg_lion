@@ -142,7 +142,7 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
-		IF ln ~ '(LionOrdered|Index Entries Walked|Lion Set|Heap Fetches|Rows Removed by)' THEN
+		IF ln ~ '(LionOrdered|Index Entries Walked|Lion Set|Heap Fetches|Rows Removed by|Switched)' THEN
 			RETURN NEXT btrim(regexp_replace(ln, '\s*\(actual.*\)', ''));
 		END IF;
 	END LOOP;
@@ -392,6 +392,71 @@ RESET ROLE;
 SELECT p.proname FROM pg_proc p
  WHERE p.proname IN ('int4eq', 'int4gt')
    AND NOT has_function_privilege('lion_ord_user', p.oid, 'EXECUTE');
+
+-- 14. A restriction clause that one ARM of a BitmapOr reuses is still a
+--     filter: the lion condition ((a = 3 AND b = 5) OR c = 7) does not imply
+--     a = 3 (2026-09-25 review; wrong at default settings).
+CREATE TABLE orb (id int, k int, a int, b int, c int);
+INSERT INTO orb SELECT i, i, i % 7, i % 11, i % 13 FROM generate_series(1, 20000) i;
+CREATE INDEX orb_k ON orb (k);
+CREATE INDEX orb_ab ON orb USING lion (a, b);
+CREATE INDEX orb_c ON orb USING lion (c);
+VACUUM ANALYZE orb;
+SELECT * FROM lion_ord_plan('SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50');
+SELECT count(*) FILTER (WHERE a <> 3) AS wrong, count(*)
+  FROM (SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50) s;
+SELECT lion_ord('SELECT id, k FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50');
+SELECT lion_ord('SELECT id, k FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k DESC');
+DROP TABLE orb;
+DROP INDEX lo_k2;
+SELECT lion_ord('SELECT id, k FROM lo WHERE k2 = 3 AND (nl = 5 OR c1k = 7) ORDER BY k, id');
+
+-- 15. A filter correlated with the order (DESIGN.md §30.3): the members lie
+--     at the far end of the btree.  The walk switches to fetching the
+--     members it has not met and sorting them once it has walked as much as
+--     that would cost, rows it already returned included exactly once.
+CREATE TABLE lcor (id int PRIMARY KEY, k int, k3 int, c int, h int, h2 int, g int);
+INSERT INTO lcor
+SELECT i, i, CASE WHEN i % 50 = 0 THEN NULL ELSE i END, (i - 1) / 1000,
+	   CASE WHEN i IN (5, 10, 15) OR i BETWEEN 190001 AND 191000 THEN 1 ELSE 0 END,
+	   CASE WHEN i IN (199990, 199995) OR i BETWEEN 1001 AND 2000 THEN 1 ELSE 0 END,
+	   ((i - 1) / 1000) % 2
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lcor_k ON lcor (k);
+CREATE INDEX lcor_k3 ON lcor (k3, id);
+CREATE INDEX lcor_c ON lcor USING lion (c);
+CREATE INDEX lcor_h ON lcor USING lion (h);
+CREATE INDEX lcor_h2 ON lcor USING lion (h2);
+VACUUM ANALYZE lcor;
+-- whatever the planner picks (it cannot see the correlation), forced here
+SELECT * FROM lion_ord_plan('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+-- no row at all: every c = 190 row has g = 0
+SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
+SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
+-- three members early, the rest late: the switch comes after rows were returned
+SELECT lion_ord('SELECT id, k FROM lcor WHERE h = 1 ORDER BY k LIMIT 20');
+SELECT lion_ord('SELECT id, k FROM lcor WHERE h = 1 ORDER BY k');
+SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE h = 1 ORDER BY k LIMIT 20');
+SELECT lion_ord('SELECT id, k FROM lcor WHERE h = 1 AND k > 12 ORDER BY k LIMIT 20');
+-- NULLs first (DESC), nulls among the members met before the switch
+SELECT lion_ord('SELECT id, k3 FROM lcor WHERE h2 = 1 ORDER BY k3 DESC, id DESC LIMIT 40');
+SELECT lion_ord('SELECT id, k3 FROM lcor WHERE h2 = 1 ORDER BY k3 DESC NULLS FIRST, id DESC');
+SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE h2 = 1 ORDER BY k3 DESC, id DESC LIMIT 40');
+-- a paused cursor that switches, and a rescan
+BEGIN;
+SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+DECLARE lcor_cur CURSOR FOR SELECT id FROM lcor WHERE h = 1 ORDER BY k;
+FETCH 4 FROM lcor_cur;
+FETCH 2 FROM lcor_cur;
+MOVE FORWARD 990 IN lcor_cur;
+FETCH ALL FROM lcor_cur;
+COMMIT;
+SELECT lion_ord('SELECT o.v, x.id FROM (VALUES (1), (190)) o(v),
+				 LATERAL (SELECT id FROM lcor WHERE c = o.v ORDER BY k LIMIT 3) x');
+DROP TABLE lcor;
 
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;

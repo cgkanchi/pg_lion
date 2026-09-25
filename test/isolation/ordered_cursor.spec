@@ -4,8 +4,10 @@
 # The cursor's snapshot is taken at DECLARE; the node builds its lion TID set
 # at the FIRST FETCH and walks the btree afterwards.  Rows committed between
 # DECLARE and the first FETCH are in the set but invisible to the snapshot;
-# rows committed while the cursor is paused are not in the set at all (and
-# invisible too); rows deleted, or updated out of the filter, while the
+# rows committed while the cursor is paused are not in the set - unless one
+# takes the heap slot of a dead member VACUUM removed, whose TID the set still
+# holds (ordered_recycle.spec) - and are invisible either way; rows deleted,
+# or updated out of the filter, while the
 # cursor is paused are still visible to it and must still come back, at their
 # old place in the order.  Every permutation drains the cursor into oc_got and
 # compares it, row by row in order, with the answer the snapshot saw
