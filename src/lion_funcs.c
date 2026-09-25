@@ -648,15 +648,26 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
 	index = lion_open_index(relid, AccessShareLock);
 	state = lion_get_state(index);
 
+	/*
+	 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted key,
+	 * so its entries are not column values: the key this takes is of the
+	 * column's own type - a whole tsvector - which no entry holds, and hashing
+	 * and comparing it as if it were one lexeme answered for no key at all.
+	 * Refused as the count functions refuse it (lion_count.c).  The errors
+	 * leave the index to the abort to close: its name is still needed.
+	 */
+	if (state->multikey)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
+						1, RelationGetRelationName(index))));
+
 	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0])
-	{
-		index_close(index, AccessShareLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("type %s cannot be compared with index \"%s\"",
 						format_type_be(keytype),
 						RelationGetRelationName(index))));
-	}
 
 	if (lion_find_entry(index, state, BUFFER_LOCK_SHARE, key,
 						lion_hash_key(state, key), &buf, &off))

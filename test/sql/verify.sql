@@ -295,4 +295,19 @@ DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
 DROP FUNCTION lion_vfy_poke(regclass, int8, int8, bytea);
 DROP FUNCTION lion_vfy_item(regclass, int8, int);
 
+/*
+ * lion_index_posting_root() takes a column VALUE, and a multi-key column's
+ * entries are keys extracted from values (DESIGN.md §17): a whole tsvector
+ * hashed as if it were one lexeme named no entry at all.  It refuses such a
+ * column, as the count functions do.
+ */
+CREATE TABLE lion_vfy_mk (tags text[], doc tsvector);
+INSERT INTO lion_vfy_mk VALUES ('{a,b}', 'a b');
+CREATE INDEX lion_vfy_mk_tags ON lion_vfy_mk USING lion (tags);
+CREATE INDEX lion_vfy_mk_doc ON lion_vfy_mk USING lion (doc);
+SELECT lion_index_posting_root('lion_vfy_mk_doc', 'a b'::tsvector);
+SELECT lion_index_posting_root('lion_vfy_mk_tags', '{a,b}'::text[]);
+SELECT lion_index_count('lion_vfy_mk_doc', 'a b'::tsvector);
+DROP TABLE lion_vfy_mk;
+
 DROP TABLE lion_vfy, lion_vfy_empty, lion_vfy_unl, lion_vfy_hot;
