@@ -20,7 +20,7 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 2 3").  For development; `make recovery-check`
+#              "1 1b 1c 1d 1e 2 3").  For development; `make recovery-check`
 #              always runs everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
@@ -76,7 +76,7 @@ fi
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 2 3"
+PHASES="1 1b 1c 1d 1e 2 3"
 EXTRA_CONF=()
 
 BASE=/tmp/claude-1000/lion_recovery
@@ -867,6 +867,144 @@ phase1d() {
 	SUMMARY+=("phase1d            crash between posting split and downlink; repaired on the next descent")
 }
 
+# ------------------------------------------------------------- phase 1e
+
+# A crash in the middle of a MULTI-LEAF INLINE spill (DESIGN.md §18, "The
+# spill").  VACUUM's filtering turns one key's INLINE payload - eleven RUN
+# containers over 150,000 clustered rows - into ten BITSETs, which need a leaf
+# each; the spill writes a record per leaf and dies before its last record,
+# the root together with the rewritten entry.  Then:
+#
+#  * replay brings the leaves back and the entry stays INLINE with every TID
+#    it had, the dead ones included: nothing is lost and nothing is half-CHAIN;
+#  * lion_index_verify() calls the leaves a leak (a WARNING), not corruption;
+#  * the next VACUUM spills the set properly, and its sweep frees the orphan
+#    leaves, which are FULL - the sweep used to free only empty unreferenced
+#    leaves, so these stayed leaked for good;
+#  * and a second crash replays that VACUUM, the whole multi-leaf spill
+#    included (under wal_consistency_checking when --conf asks for it).
+#
+# The crash point is deterministic: an injection point parks the VACUUM after
+# its last leaf record and the server is pulled out from under it.
+phase1e() {
+	local off parked warn ev
+	log ""
+	log "=== phase 1e: a crash between a spill's leaves and its root ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ log "phase 1e skipped: this server has no injection_points extension"
+		  SUMMARY+=("phase1e            skipped (no injection points)"); return 0; }
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1e: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_mspill;
+		CREATE TABLE lion_mspill (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_mspill SELECT i, 0 FROM generate_series(1, 150000) i;
+		CREATE INDEX lion_mspill_k ON lion_mspill USING lion (k);
+		DELETE FROM lion_mspill WHERE id % 10 = 3;
+	SQL
+	[ "$(psql_p -tAc "select inline_entries from lion_index_stats('lion_mspill_k')")" = 1 ] ||
+		die "phase 1e: the fixture's posting set is not INLINE"
+
+	psql_p -c "SELECT injection_points_attach('lion-spill-leaves-written', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1e: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "VACUUM (INDEX_CLEANUP ON) lion_mspill" >>"$RUNLOG" 2>&1 &
+	parked=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-spill-leaves-written'" \
+		60 "the VACUUM to park between the spill's leaves and its root"
+
+	# The leaf records are inserted and not flushed: ambulkdelete's records
+	# belong to no transaction.  A COMMIT from another session flushes the
+	# stream past them.  Not a CHECKPOINT: the parked backend holds the
+	# directory leaf's cleanup lock and the checkpointer could block on it.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE IF NOT EXISTS lion_mspill_flush (i int);
+		INSERT INTO lion_mspill_flush VALUES (1);
+	SQL
+
+	crash_immediate
+	wait "$parked" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+
+	# The leaves were replayed and nothing references them; the entry is the
+	# INLINE entry it was, dead TIDs and all.
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unused and unreachable' || true)
+	[ "$warn" -ge 10 ] ||
+		die "phase 1e: $warn unreachable page(s) after the crash, expected the ten orphan leaves and their root"
+	run_check "phase 1e post-crash" psql_p \
+		"select inline_entries = 1 and ntids = 150000,
+				format('the entry is still INLINE with every TID (%s entries INLINE, ntids %s)',
+					   inline_entries, ntids)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select container_pages = 10,
+				format('the ten leaves came back unreferenced (%s container pages)', container_pages)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select lion_index_count('lion_mspill_k', 0) = 135000,
+				'the index still counts all 135000 rows of k = 0'"
+
+	psql_p -c "SELECT injection_points_detach('lion-spill-leaves-written')" \
+		>>"$RUNLOG" 2>&1 || true
+
+	# The next VACUUM spills the set and sweeps the orphans away.
+	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_mspill" >>"$RUNLOG" 2>&1 ||
+		die "phase 1e: the VACUUM after the crash failed"
+
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unused and unreachable' || true)
+	[ "$warn" -le 1 ] ||
+		die "phase 1e: $warn page(s) are still leaked after the sweep (only the never-written root may be left, all-zero)"
+	run_check "phase 1e swept" psql_p \
+		"select inline_entries = 0 and posting_internal_pages = 1 and container_pages = 10,
+				format('spilled: %s INLINE, %s internal, %s leaves',
+					   inline_entries, posting_internal_pages, container_pages)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select deleted_pages = 10, format('%s DELETED pages, the ten orphans', deleted_pages)
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select ntids = (select count(*) from lion_mspill), 'ntids agrees with the heap'
+		   from lion_index_stats('lion_mspill_k')"
+
+	# Replay that VACUUM too: the leaves, the root with the entry, the sweep.
+	off=$(stat -c %s "$PRIMARY_LOG")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		INSERT INTO lion_mspill_flush VALUES (2);
+	SQL
+	crash_immediate
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+	run_check "phase 1e replayed" psql_p \
+		"select lion_index_verify('lion_mspill_k', true) is not null, 'verify'
+		 union all
+		 select inline_entries = 0 and ntids = (select count(*) from lion_mspill),
+				'the spilled set replayed with every TID'
+		   from lion_index_stats('lion_mspill_k')
+		 union all
+		 select lion_index_count('lion_mspill_k', 0) = 135000,
+				'the index counts all 135000 rows of k = 0'"
+
+	psql_p -c "DROP TABLE lion_mspill, lion_mspill_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1e: the crash left the entry INLINE and ten orphan leaves; the next VACUUM spilled it and freed them"
+	SUMMARY+=("phase1e            crash inside a 10-leaf spill; nothing lost, orphans swept")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -1448,6 +1586,7 @@ want_phase 1 && phase1
 want_phase 1b && phase1b
 want_phase 1c && phase1c
 want_phase 1d && phase1d
+want_phase 1e && phase1e
 want_phase 2 && phase2
 want_phase 3 && phase3
 

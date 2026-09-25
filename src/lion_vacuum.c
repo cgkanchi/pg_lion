@@ -712,8 +712,10 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	 * becomes a BITSET - so the entry may no longer fit the page, or may have
 	 * outgrown inline_limit - or, next to a long key, LION_MAX_ENTRY_SIZE,
 	 * which lion_inline_max() also bounds - and then its posting set spills
-	 * onto container pages exactly as an insert would.  Try the plain
-	 * overwrite first; the spill is decided when that fails.
+	 * onto container pages as an insert's would, except that it may need
+	 * many of them: the payload is not bounded by inline_limit any more,
+	 * only by the number of items it had (lion_entry_spill()).  Try the
+	 * plain overwrite first; the spill is decided when that fails.
 	 */
 	if (res->paylen <= inlinemax)
 	{
@@ -1022,10 +1024,15 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		}
 
 		/*
-		 * A payload that outgrew its entry moves onto container pages, one
-		 * record of its own each.  This is rare (it needs a RUN container to
+		 * A payload that outgrew its entry moves onto container pages, in
+		 * records of its own.  This is rare (it needs a RUN container to
 		 * turn into a BITSET while losing members), so it is not worth
-		 * batching, and lion_entry_spill() rewrites the entry itself.
+		 * batching, and lion_entry_spill() rewrites the entry itself.  It is
+		 * NOT small when it happens: a few kilobytes of RUN containers that
+		 * all turn into BITSETs need a leaf each, and the spill writes as
+		 * many as it takes - a record per leaf, then the root and the entry
+		 * together - where it used to refuse more than four and so failed
+		 * this VACUUM, and every VACUUM after it (2026-09-25 review).
 		 *
 		 * The payload it spills is the FILTERED one, so the rewrite of the
 		 * entry on this leaf is where this entry's dead TIDs leave the
@@ -1486,22 +1493,30 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
  *
  * Every block the walk accounted for is marked in vs->visited, so what is
  * left is either a page a concurrent insert created - which this VACUUM knows
- * nothing about and must not touch - or a leak.  Two kinds of leak are
- * recoverable and this is where they come back:
+ * nothing about and must not touch - or a leak.  These are the leaks that are
+ * recoverable, and this is where they come back:
  *
  *	- a page that is already DELETED, from a VACUUM that crashed between
  *	  recording it and vacuuming the free space map, or one this VACUUM did
  *	  not free itself.  It goes back into the map.
  *	- an EMPTY container page nothing references, which is what a crash
- *	  between the two steps of a whole-chain free leaves, and what an
- *	  interrupted multi-page spill leaves after its first page.  It becomes a
+ *	  between the two steps of a whole-chain free leaves.  It becomes a
  *	  DELETED page and goes into the map.
+ *	- a container LEAF nothing references whose root is not a live root of
+ *	  its key (lion_posting_root_live()): what a multi-leaf spill that an
+ *	  ERROR or a crash stopped before its last record leaves behind, full
+ *	  leaves under a root that was never written (lion_entry_spill()).  It
+ *	  becomes a DELETED page like the empty ones.
+ *	- an INTERNAL posting page whose children are all DELETED pages (the
+ *	  rounds of lion_vacuum_sweep()).
  *
- * An empty container page of a LIVE chain is never mistaken for one of these,
- * because pass 2 walks every page of every chain it found and marks it
- * visited; a chain created after pass 1 read its bucket page has no empty
- * page in it (a spill and a split both fill every page they allocate inside
- * the record that allocates it, under the lock they hold throughout).
+ * A page of a LIVE set is never mistaken for any of these.  Pass 2 walks
+ * every leaf of every set it found and marks it visited, and a set created
+ * after pass 1 read its leaf, or a leaf a split added since, has no empty
+ * page (a spill and a split fill every page they allocate inside the record
+ * that allocates it, under the lock they hold throughout) and names a root
+ * that is live - or, while its spill is still writing, a root that spill
+ * holds EXCLUSIVE, which lion_posting_root_live() reads as live.
  *
  * Nothing here ever waits: an unreferenced page nobody can reach should not
  * be locked by anyone, and if it somehow is, the next VACUUM will find it.
@@ -1647,6 +1662,26 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 
 			if (PageGetMaxOffsetNumber(page) == 0)
+			{
+				lion_vac_free_page(vs, buf, blk);
+				progress = true;
+				continue;
+			}
+
+			/*
+			 * A full leaf that nothing references: a leaf of a set this walk
+			 * did not know about, or one an interrupted spill left behind,
+			 * and its ROOT tells them apart.  The root is only locked
+			 * conditionally, with the leaf held; a busy root is taken for a
+			 * live one.  A leaf that is its own root is a one-page set, which
+			 * a spill writes in the same record as its entry, so it is never
+			 * an orphan.
+			 */
+			if (LionPageGetOpaque(page)->owner_head != blk &&
+				!lion_posting_root_live(vs->index,
+										LionPageGetOpaque(page)->owner_hash,
+										LionPageGetOpaque(page)->owner_head,
+										false))
 			{
 				lion_vac_free_page(vs, buf, blk);
 				progress = true;
