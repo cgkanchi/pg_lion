@@ -848,6 +848,14 @@ column's actual type and nothing else, since a different enum would pass for "an
 mean nothing to this column (DETAIL names the column's type, not anyenum). The resolved type is what
 the lookup is made as and what the EXECUTE check names the equality by (enum_eq, texteq;
 test/sql/security_exec.sql). `lion_index_count_any()` resolves its array's element type the same way.
+**A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
+STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
+argument - a NULL constant folds the call away when the query is planned - so no count is made,
+nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding what a keyless count checks, and the query it would
+stand for does not settle it: the planner folds `col = NULL` to a constant-false filter, so that
+query reads no index, calls no equality and never asks whether a materialized view is populated.
+A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY (...)`, and counts
+0; a NULL array is a NULL argument.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
 entry's meaning and used to be hashed and compared as if it did. All of them refuse a materialized

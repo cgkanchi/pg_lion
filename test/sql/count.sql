@@ -597,9 +597,13 @@ SELECT lion_index_count('lion_cnt_elig_k', 1);
 SELECT lion_index_verify('lion_cnt_elig_k', true);
 DROP TABLE lion_cnt_elig;
 
--- NULL arguments: STRICT
+-- NULL arguments: STRICT, so NULL - no count is made - where the SELECT
+-- `WHERE c10 = NULL` answers 0; kept deliberately (DESIGN.md section 9, "SQL
+-- surface")
 SELECT lion_index_count('lion_cnt_c10', NULL::int4) IS NULL AS null_key;
 SELECT lion_index_count(NULL, 0) IS NULL AS null_index;
+SELECT lion_index_count('lion_cnt_c10', 1, 'lion_cnt_m7', NULL::int4) IS NULL AS null_key2;
+SELECT count IS NULL AS null_stats FROM lion_index_count_stats('lion_cnt_c10', NULL::int4);
 
 DROP TABLE lion_cnt_other;
 DROP TABLE lion_cnt_hot;
