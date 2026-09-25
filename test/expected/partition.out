@@ -277,7 +277,7 @@ SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE a IN (1, 4, 7)');
 -------------------------------------------------------------------------
  Custom Scan (LionCount)
    Partitions: lion_part_p1, lion_part_p2x, lion_part_p2d, lion_part_def
-   Lion Indexes: (a = ANY ({1,4,7}))
+   Lion Indexes: (a = ANY ('{1,4,7}'::integer[]))
 (3 rows)
 
 SELECT lion_pplan('SELECT n, count(*) AS c1, count(n) AS c2 FROM lion_part GROUP BY n');
@@ -722,13 +722,13 @@ SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE k = 15 AND a = 3');
 (3 rows)
 
 SELECT lion_pplan('SELECT a, count(*) FROM lion_part WHERE k IN (2, 25) GROUP BY a');
-                   lion_pplan                    
--------------------------------------------------
+                         lion_pplan                         
+------------------------------------------------------------
  Finalize HashAggregate
    Group Key: lion_part.a
    ->  Custom Scan (LionCount)
          Partitions: lion_part_p1, lion_part_def
-         Lion Indexes: (a), (k = ANY ({2,25}))
+         Lion Indexes: (a), (k = ANY ('{2,25}'::integer[]))
          Group Key: a
 (6 rows)
 

@@ -188,11 +188,11 @@ SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
 (10 rows)
 
 SELECT lion_plans($$SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2 AND c = 'c1'$$);
-                                 lion_plans                                  
------------------------------------------------------------------------------
+                                     lion_plans                                      
+-------------------------------------------------------------------------------------
  -- on:
  Custom Scan (LionCount)
-   Lion Indexes: lion_pdt_a (a = 3), lion_pdt_b (b = 2), lion_pdt_c (c = c1)
+   Lion Indexes: lion_pdt_a (a = 3), lion_pdt_b (b = 2), lion_pdt_c (c = 'c1'::text)
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdt
@@ -1891,11 +1891,11 @@ SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 AND b = 3) OR (c = 
 (1 row)
 
 SELECT lion_plans($$SELECT count(*) FROM lion_pdo WHERE (a = 17 AND b = 3) OR (c = 'c1' AND n = 2)$$);
-                                                    lion_plans                                                     
--------------------------------------------------------------------------------------------------------------------
+                                                        lion_plans                                                         
+---------------------------------------------------------------------------------------------------------------------------
  -- on:
  Custom Scan (LionCount)
-   Lion Indexes: lion_pdo_a, lion_pdo_b, lion_pdo_c, lion_pdo_n (((a = 17) AND (b = 3)) OR ((c = c1) AND (n = 2)))
+   Lion Indexes: lion_pdo_a, lion_pdo_b, lion_pdo_c, lion_pdo_n (((a = 17) AND (b = 3)) OR ((c = 'c1'::text) AND (n = 2)))
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdo
@@ -1921,11 +1921,11 @@ SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND c = '
 (1 row)
 
 SELECT lion_plans($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND c = 'c1'$$);
-                                    lion_plans                                     
------------------------------------------------------------------------------------
+                                        lion_plans                                         
+-------------------------------------------------------------------------------------------
  -- on:
  Custom Scan (LionCount)
-   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3)), lion_pdo_c (c = c1)
+   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3)), lion_pdo_c (c = 'c1'::text)
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdo
@@ -1971,11 +1971,11 @@ SELECT lion_pd($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND (c = 
 (1 row)
 
 SELECT lion_plans($$SELECT count(*) FROM lion_pdo WHERE (a = 17 OR b = 3) AND (c = 'c1' OR n = 2)$$);
-                                                 lion_plans                                                 
-------------------------------------------------------------------------------------------------------------
+                                                     lion_plans                                                     
+--------------------------------------------------------------------------------------------------------------------
  -- on:
  Custom Scan (LionCount)
-   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3)), lion_pdo_c, lion_pdo_n ((c = c1) OR (n = 2))
+   Lion Indexes: lion_pdo_a, lion_pdo_b ((a = 17) OR (b = 3)), lion_pdo_c, lion_pdo_n ((c = 'c1'::text) OR (n = 2))
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdo
@@ -2002,11 +2002,11 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b IN (3, 4) OR n I
 (1 row)
 
 SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a IN (17, 18) OR n IS NULL');
-                                 lion_plans                                  
------------------------------------------------------------------------------
+                                        lion_plans                                        
+------------------------------------------------------------------------------------------
  -- on:
  Custom Scan (LionCount)
-   Lion Indexes: lion_pdo_a, lion_pdo_n ((a = ANY ({17,18})) OR (n IS NULL))
+   Lion Indexes: lion_pdo_a, lion_pdo_n ((a = ANY ('{17,18}'::integer[])) OR (n IS NULL))
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdo
@@ -2295,11 +2295,11 @@ CREATE INDEX lion_pdmo_k ON lion_pdmo USING lion (k);
 CREATE INDEX lion_pdmo_tags ON lion_pdmo USING lion (tags);
 VACUUM ANALYZE lion_pdmo;
 SELECT lion_plans($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5}' OR k = 7$$);
-                               lion_plans                                
--------------------------------------------------------------------------
+                                    lion_plans                                     
+-----------------------------------------------------------------------------------
  -- on:
  Custom Scan (LionCount)
-   Lion Indexes: lion_pdmo_tags, lion_pdmo_k ((tags @> {t5}) OR (k = 7))
+   Lion Indexes: lion_pdmo_tags, lion_pdmo_k ((tags @> '{t5}'::text[]) OR (k = 7))
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdmo
@@ -2927,12 +2927,12 @@ EXPLAIN (COSTS OFF)
 SELECT k, count(*) FROM lion_pdk
  WHERE k = ANY ('{5,17,3,150,42,99,1,120}'::int8[]) AND h IN (1, 2)
  GROUP BY k ORDER BY k;
-                                                     QUERY PLAN                                                      
----------------------------------------------------------------------------------------------------------------------
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
  Sort
    Sort Key: k
    ->  Custom Scan (LionCount)
-         Lion Indexes: lion_pdk_k (k), lion_pdk_k (k = ANY ({5,17,3,150,42,99,1,120})), lion_pdk_h (h = ANY ({1,2}))
+         Lion Indexes: lion_pdk_k (k), lion_pdk_k (k = ANY ('{5,17,3,150,42,99,1,120}'::bigint[])), lion_pdk_h (h = ANY ('{1,2}'::integer[]))
          Group Key: k
 (5 rows)
 
@@ -3018,12 +3018,12 @@ EXPLAIN (COSTS OFF)
 SELECT k, count(*) FROM lion_pdk
  WHERE k IN (5, 17, 3, 150, 42, 99, 1, 120) AND h IN (1, 2)
  GROUP BY k ORDER BY k;
-                                                     QUERY PLAN                                                      
----------------------------------------------------------------------------------------------------------------------
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
  Sort
    Sort Key: k
    ->  Custom Scan (LionCount)
-         Lion Indexes: lion_pdk_k (k), lion_pdk_k (k = ANY ({5,17,3,150,42,99,1,120})), lion_pdk_h (h = ANY ({1,2}))
+         Lion Indexes: lion_pdk_k (k), lion_pdk_k (k = ANY ('{5,17,3,150,42,99,1,120}'::integer[])), lion_pdk_h (h = ANY ('{1,2}'::integer[]))
          Group Key: k
 (5 rows)
 

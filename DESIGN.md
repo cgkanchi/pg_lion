@@ -1156,10 +1156,15 @@ Executor
   and "Group Key: col" and, with ANALYZE,
   the number of TIDs rechecked in the heap, the heap blocks skipped via the visibility map, the
   containers visited, and the block visits the visibility cache answered or had to let past its
-  budget ("Heap Blocks From Cache" / "Heap Blocks Past Cache Budget", §9). A clause whose value is
-  not a literal is printed as the expression the plan carries, which for a prepared statement's
-  parameter is `$1` - the text core's EXPLAIN gives a qual on one - via `deparse_expression()`
-  against the plan's own deparse context.
+  budget ("Heap Blocks From Cache" / "Heap Blocks Past Cache Budget", §9). Every clause is printed
+  with its OWN operator's name and with its value as core's EXPLAIN prints a qual's - through
+  `deparse_expression()` against the plan's own deparse context, whatever the value is: a literal
+  with its quotes and its type (`idx (v === 'A'::text)`, `idx (k = ANY ('{1,2}'::integer[]))`,
+  `idx (tags @> '{a}'::text[])`), a prepared statement's parameter as `$1`, and the FK-side join's
+  key as the other table's column (§27). Until the 2026-09-25 review an equality or a list was
+  always printed with `=`, and a literal through its type's output function alone - `(v = A)`,
+  `ANY ({90,5,50,1})`, as §15 still quotes it - which made the `===` clause of that review's wrong
+  answer look exactly like the `=` the planner had dropped beside it.
 
 Tests (pg_regress): the pushdown produces identical results to the plain plan for: no rows; all rows;
 WHERE constants that match no key; cross-type constants; GROUP BY with and without WHERE; after

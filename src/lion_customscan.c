@@ -8395,13 +8395,22 @@ lion_end_custom_scan(CustomScanState *node)
 }
 
 /*
- * "col = 3", "col = ANY ('{1,2,3}')", "col IS NULL", "col IS NOT NULL",
- * "tags @> {a,b}", "tsv @@ 'a' & 'b'", "col >= 10" (a range, DESIGN.md §28,
- * with the column on the left whichever side the query had it on).
+ * "col = 3", "col = ANY ('{1,2,3}'::integer[])", "col IS NULL",
+ * "col IS NOT NULL", "tags @> '{a,b}'::text[]", "col >= 10" (a range,
+ * DESIGN.md §28, with the column on the left whichever side the query had it
+ * on) - each with the clause's OWN operator and its value as core's EXPLAIN
+ * would print it in a qual.
  *
- * A clause whose value is not a literal is printed as the expression the plan
- * carries, which for a prepared statement's parameter is `$1` - the same text
- * core's EXPLAIN gives a qual on one (DESIGN.md §10).
+ * Both used to be approximated, and the approximation hid a wrong answer (the
+ * 2026-09-25 review): every equality was printed with `=`, so a clause on a
+ * case-insensitive opclass's `===` read exactly like the `=` beside it that
+ * the planner had dropped as its duplicate, and a literal was printed through
+ * its type's output function alone, so `v = 'A'` came out as `(v = A)` and a
+ * list as `ANY ({90,5,50,1})`.  Now the operator is named - `===` prints as
+ * `===`, as the multi-key and range clauses always did - and the value is
+ * deparsed like any other expression the plan carries: a literal with its
+ * quotes and its type, and a parameter as `$1`, the same text core gives a
+ * qual on one (DESIGN.md §10).
  */
 static void
 lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors,
@@ -8419,44 +8428,33 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 			break;
 		default:
 			{
-				Oid			outfunc;
-				bool		isvarlena;
+				List	   *context;
+				char	   *opname = get_opname(cl->opno);
 				char	   *val;
 
-				if (cl->con == NULL)
-				{
-					List	   *context =
-						set_deparse_context_plan(es->deparse_cxt,
-												 st->css.ss.ps.plan,
-												 ancestors);
+				if (opname == NULL)
+					elog(ERROR, "LionCount: cache lookup failed for operator %u",
+						 cl->opno);
 
-					/*
-					 * The FK-side join's key is a column of the OTHER table
-					 * (DESIGN.md §27), so it is printed qualified: `fk =
-					 * d.pk`, as core prints a join clause.
-					 */
-					val = deparse_expression((Node *) cl->valexpr, context,
-											 st->joinclause >= 0 &&
-											 cl == &st->clause[st->joinclause],
-											 false);
-				}
-				else
-				{
-					getTypeOutputInfo(cl->con->consttype, &outfunc, &isvarlena);
-					val = OidOutputFunctionCall(outfunc, cl->con->constvalue);
-				}
+				context = set_deparse_context_plan(es->deparse_cxt,
+												   st->css.ss.ps.plan,
+												   ancestors);
+
+				/*
+				 * The FK-side join's key is a column of the OTHER table
+				 * (DESIGN.md §27), so it is printed qualified: `fk = d.pk`,
+				 * as core prints a join clause.
+				 */
+				val = deparse_expression((Node *) cl->valexpr, context,
+										 st->joinclause >= 0 &&
+										 cl == &st->clause[st->joinclause],
+										 false);
 				if (cl->kind == LION_CLAUSE_ARRAY)
-					appendStringInfo(buf, "%s = ANY (%s)", attname, val);
-				else if (cl->kind == LION_CLAUSE_MULTI ||
-						 cl->kind == LION_CLAUSE_RANGE)
-				{
-					char	   *opname = get_opname(cl->opno);
-
-					appendStringInfo(buf, "%s %s %s", attname, opname, val);
-					pfree(opname);
-				}
+					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
+									 val);
 				else
-					appendStringInfo(buf, "%s = %s", attname, val);
+					appendStringInfo(buf, "%s %s %s", attname, opname, val);
+				pfree(opname);
 				pfree(val);
 				break;
 			}

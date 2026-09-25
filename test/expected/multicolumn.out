@@ -777,18 +777,18 @@ SELECT lion_index_verify('lion_mcp_i', true);
 -- single-column index prints what it always printed.
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM lion_mcp WHERE a = 3 AND c = 'c1';
-                         QUERY PLAN                          
--------------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_mcp_i.a (a = 3), lion_mcp_i.c (c = c1)
+   Lion Indexes: lion_mcp_i.a (a = 3), lion_mcp_i.c (c = 'c1'::text)
 (2 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM lion_mcs WHERE a = 3 AND c = 'c1';
-                       QUERY PLAN                        
----------------------------------------------------------
+                           QUERY PLAN                            
+-----------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_mcs_a (a = 3), lion_mcs_c (c = c1)
+   Lion Indexes: lion_mcs_a (a = 3), lion_mcs_c (c = 'c1'::text)
 (2 rows)
 
 EXPLAIN (COSTS OFF)

@@ -113,24 +113,24 @@ SELECT lion_inplan('SELECT id FROM lion_in WHERE a IN (1, 2, 3)');
 (4 rows)
 
 SELECT lion_inplan('SELECT count(*) FROM lion_in WHERE a IN (1, 2, 3)');
-                  lion_inplan                  
------------------------------------------------
- Custom Scan (LionCount)
-   Lion Indexes: lion_in_a (a = ANY ({1,2,3}))
-(2 rows)
-
-SELECT lion_inplan($$SELECT count(*) FROM lion_in WHERE a IN (1, 2) AND c = 'c1'$$);
-                           lion_inplan                           
------------------------------------------------------------------
- Custom Scan (LionCount)
-   Lion Indexes: lion_in_a (a = ANY ({1,2})), lion_in_c (c = c1)
-(2 rows)
-
-SELECT lion_inplan('SELECT b, count(*) FROM lion_in WHERE b IN (1, 2) GROUP BY b');
                         lion_inplan                         
 ------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_in_b (b), lion_in_b (b = ANY ({1,2}))
+   Lion Indexes: lion_in_a (a = ANY ('{1,2,3}'::integer[]))
+(2 rows)
+
+SELECT lion_inplan($$SELECT count(*) FROM lion_in WHERE a IN (1, 2) AND c = 'c1'$$);
+                                     lion_inplan                                      
+--------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_in_a (a = ANY ('{1,2}'::integer[])), lion_in_c (c = 'c1'::text)
+(2 rows)
+
+SELECT lion_inplan('SELECT b, count(*) FROM lion_in WHERE b IN (1, 2) GROUP BY b');
+                               lion_inplan                               
+-------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_in_b (b), lion_in_b (b = ANY ('{1,2}'::integer[]))
    Group Key: b
 (3 rows)
 
