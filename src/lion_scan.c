@@ -1448,6 +1448,15 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 
 	tree = lion_scan_op(LION_KN_AND, args, nargs);
 
+	/*
+	 * Every set is located; the leaves the INLINE ones pinned protect
+	 * nothing here (the bitmap heap scan visits every TID), and a list's could
+	 * be up to the whole list pin budget (DESIGN.md §15).  The walk below
+	 * keeps no pin either.
+	 */
+	for (i = 0; i < acc.nsets; i++)
+		lion_posting_set_unpin(&acc.sets[i]);
+
 	es.tbm = tbm;
 	es.recheck = so->recheck;
 	es.ntids = 0;
