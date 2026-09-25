@@ -2668,8 +2668,12 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	heapoid = IndexGetRelation(relid, true);
 	if (!OidIsValid(heapoid))
 	{
-		/* Not an index: opening it as one raises the error that says so. */
-		index_close(lion_open_index(relid, lockmode), lockmode);
+		/*
+		 * Not an index: opening it as one raises the error that says so.
+		 * With AccessShareLock, because this is only to say that, and a
+		 * ShareLock on a table would first wait for its writers.
+		 */
+		index_close(lion_open_index(relid, AccessShareLock), AccessShareLock);
 		elog(ERROR, "could not find the table of index %u", relid);
 	}
 	vs.heap = table_open(heapoid, lockmode);
