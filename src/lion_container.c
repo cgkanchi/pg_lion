@@ -11,9 +11,10 @@
  *
  *	  Representation policy (DESIGN.md §3), enforced by the mutators:
  *		- adding to a full ARRAY (2048 members)			=> BITSET
- *		- adding to a RUN that would need a 1024th run	=> BITSET
+ *		- adding to a RUN that would need a 1024th run	=> ARRAY when the
+ *				members, the new one included, fit one (<= 2048), else BITSET
  *		- removing from a RUN so that a split would need a 1024th run
- *														=> BITSET
+ *														=> the same
  *		- removing from a BITSET leaving <= 2048 members	=> ARRAY
  *
  *	  lion_container_optimize() is the only function that searches for the
@@ -21,8 +22,10 @@
  *
  *	  This file depends only on c.h, port/pg_bitutils.h and the project
  *	  headers, so that it also builds standalone with -DFRONTEND for
- *	  test/unit/container_test.c.  No palloc, no elog: invariants are
- *	  Assert()ed and structural damage is reported by lion_container_check().
+ *	  test/unit/container_test.c.  No palloc, no elog: the caller's side of
+ *	  every contract is Assert()ed, structural damage is reported by
+ *	  lion_container_check(), and a damaged container is never trusted with a
+ *	  buffer (see "untrusted containers" below).
  *-------------------------------------------------------------------------
  */
 /*
@@ -62,6 +65,65 @@ typedef union LionContainerBuf
 
 
 /* ----------------------------------------------------------------
+ *						untrusted containers
+ *
+ * A container read from disk is DATA, and a damaged one must cost a wrong
+ * answer or an error somewhere else, never a write outside a buffer.
+ * lion_index_verify() runs lion_container_check() over every item, but the
+ * readers do not, on purpose: the count engine reads millions of containers
+ * per query, and checking each one again would cost about as much as using it
+ * (a BITSET's check is a popcount of all 512 words, 0.8 us, which is what an
+ * and_cardinality() of two bitsets costs too).  What a reader does check is
+ * the header and the size: lion_inline_fetch() refuses an item whose type is
+ * not one of the four or whose lion_item_size() is past the payload or past
+ * LION_CONTAINER_MAX_SIZE.  So everything in this file is written to be
+ * memory-safe for ANY payload behind a header of a valid type, which costs a
+ * mask or a comparison where the payload meets an index:
+ *
+ *	- A count is never trusted to size a loop past the largest legal
+ *	  container.  array_card() and run_nruns() clamp the member and run counts
+ *	  to LION_ARRAY_MAX_CARD and LION_RUN_MAX_NRUNS, so nothing here reads more
+ *	  than LION_CONTAINER_MAX_SIZE bytes from the start of a container
+ *	  whatever its header claims - which is what makes a work buffer of that
+ *	  size, filled by ItemIdGetLength() rather than by the header, safe to
+ *	  hand in - and a mutator first rewrites such a claim to what it is going
+ *	  to use (container_clamp()), so that what it leaves behind is never
+ *	  larger than LION_CONTAINER_MAX_SIZE either.
+ *	- A member never indexes a bitset unmasked: bits_test() and friends take
+ *	  lo & LION_LO_MASK.  A run's bounds are clamped to LION_LO_MAX by
+ *	  run_last(), and a run that starts past it comes out empty.
+ *	- The header's CARDINALITY is a claim, not a bound.  Every extraction
+ *	  into a fixed-size array is bounded by the array, and a representation
+ *	  change the claim allows but the payload contradicts (a BITSET that says
+ *	  it has 2000 members but holds 5000) is not made.
+ *	- Every lo value handed to a caller is below LION_CONTAINER_RANGE, and a
+ *	  RUN is walked strictly ascending, skipping what an earlier run already
+ *	  covered, so that a caller never sees more than LION_CONTAINER_RANGE
+ *	  members of one container - which is the size lion_container_to_array()
+ *	  promises its output array needs.
+ *
+ * For a well-formed container every one of these is a no-op, and every
+ * result is byte for byte what it was without them.  For a damaged one the
+ * results are unspecified - lion_container_check() is what says why - but
+ * deterministic, which WAL replay relies on: redo runs this same code on the
+ * same bytes (DESIGN.md §25).  Assert() states the caller's side of each
+ * contract - the arguments, and the ordering the bulk builder is promised -
+ * and never what a container's bytes say, so that an assert-enabled build
+ * does not stop in here on a damaged page any more than a production one.
+ *
+ * Measured in instructions (callgrind, -O2, 2026-09-25): and_cardinality()
+ * and contains() of every type pair within 0 - 8% of what they were (six more
+ * per run where a RUN meets a bitset; none where it meets an ARRAY or a RUN,
+ * whose merge loops compare run ends unclamped, run_end()), iterate() one
+ * more per ARRAY member, and to_array() of a 1000-member ARRAY 1800 against
+ * the 260 of the memcpy() it was.  The lion_container_check() a reader would
+ * otherwise need per container is 4700 instructions (0.8 us) for a BITSET
+ * and 11800 (1.2 us) for a 1000-member ARRAY: as much as the and_cardinality()
+ * it would guard.
+ * ----------------------------------------------------------------
+ */
+
+/* ----------------------------------------------------------------
  *						payload accessors
  * ----------------------------------------------------------------
  */
@@ -78,6 +140,16 @@ array_cdata(const LionContainer *c)
 	return (const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
 }
 
+/*
+ * Members of an ARRAY container: the header's count, clamped so that a
+ * damaged header can never walk past LION_CONTAINER_MAX_SIZE.
+ */
+static inline uint32
+array_card(const LionContainer *c)
+{
+	return Min((uint32) c->cardinality, (uint32) LION_ARRAY_MAX_CARD);
+}
+
 static inline uint64 *
 bitset_mdata(LionContainer *c)
 {
@@ -90,10 +162,18 @@ bitset_cdata(const LionContainer *c)
 	return (const uint64 *) ((const char *) c + LION_CONTAINER_HDRSZ);
 }
 
+/* nruns as stored: for lion_container_check(), the size, and the clamps */
+static inline uint32
+run_nruns_raw(const LionContainer *c)
+{
+	return (uint32) *(const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
+}
+
+/* Runs of a RUN container, clamped like array_card(). */
 static inline uint32
 run_nruns(const LionContainer *c)
 {
-	return (uint32) *(const uint16 *) ((const char *) c + LION_CONTAINER_HDRSZ);
+	return Min(run_nruns_raw(c), (uint32) LION_RUN_MAX_NRUNS);
 }
 
 static inline void
@@ -115,11 +195,48 @@ run_cdata(const LionContainer *c)
 	return (const LionRun *) ((const char *) c + LION_CONTAINER_HDRSZ + sizeof(uint16));
 }
 
-/* Last lo value covered by a run. */
+/*
+ * Last lo value covered by a run, clamped to LION_LO_MAX: a damaged run may
+ * claim to reach up to 131070.  A run whose START is past LION_LO_MAX then
+ * ends before it starts, and every loop over a run's values (v = start; v <=
+ * last) visits nothing; the loops that hand a run to the bitset range
+ * primitives skip it explicitly.
+ */
 static inline int32
 run_last(const LionRun *r)
 {
+	int32		last = (int32) r->start + (int32) r->len_minus_1;
+
+	return Min(last, (int32) LION_LO_MAX);
+}
+
+/*
+ * The same, NOT clamped: for code that only compares a run's end or adds it
+ * up, where a damaged one costs a wrong answer and nothing else.  That is the
+ * merge loops of the count engine's hot paths (an ARRAY or RUN against a
+ * RUN), which the clamp slowed by up to a fifth.  Anything that indexes,
+ * iterates or writes with the value uses run_last().
+ */
+static inline int32
+run_end(const LionRun *r)
+{
 	return (int32) r->start + (int32) r->len_minus_1;
+}
+
+/*
+ * Rewrite a count the header claims past its representation's limit to the
+ * limit, which is what every function here reads it as anyway.  Mutators
+ * call this first, so that the container they leave behind is never larger
+ * than LION_CONTAINER_MAX_SIZE, whatever it came in as.  A no-op, and no
+ * store at all, for a well-formed container.
+ */
+static inline void
+container_clamp(LionContainer *c)
+{
+	if (c->type == LION_CT_ARRAY && c->cardinality > LION_ARRAY_MAX_CARD)
+		c->cardinality = LION_ARRAY_MAX_CARD;
+	else if (c->type == LION_CT_RUN && run_nruns_raw(c) > LION_RUN_MAX_NRUNS)
+		run_set_nruns(c, LION_RUN_MAX_NRUNS);
 }
 
 
@@ -138,24 +255,30 @@ word_mask(uint32 lo, uint32 hi)
 	return (LION_ALL_ONES >> (63 - (hi - lo))) << lo;
 }
 
+/*
+ * Single-bit primitives.  lo is often an ARRAY member, which is data: a
+ * uint16 up to 65535 where only 0 .. 32767 are legal.  Unmasked, a member of
+ * 65535 would address word 1023 of a 512-word bitset, 4 KB past its end, so
+ * the index is masked instead of asserted.  A legal lo is unchanged by it.
+ */
 static inline bool
 bits_test(const uint64 *w, uint32 lo)
 {
-	Assert(lo <= LION_LO_MAX);
+	lo &= LION_LO_MASK;
 	return (w[lo >> 6] & (UINT64CONST(1) << (lo & 63))) != 0;
 }
 
 static inline void
 bits_set(uint64 *w, uint32 lo)
 {
-	Assert(lo <= LION_LO_MAX);
+	lo &= LION_LO_MASK;
 	w[lo >> 6] |= UINT64CONST(1) << (lo & 63);
 }
 
 static inline void
 bits_clear(uint64 *w, uint32 lo)
 {
-	Assert(lo <= LION_LO_MAX);
+	lo &= LION_LO_MASK;
 	w[lo >> 6] &= ~(UINT64CONST(1) << (lo & 63));
 }
 
@@ -195,15 +318,17 @@ bits_clear_range(uint64 *w, uint32 lo, uint32 hi)
 	w[whi] &= ~word_mask(0, hi & 63);
 }
 
-static uint32
+/*
+ * One pg_popcount() over the whole bitset rather than a pg_popcount64() per
+ * word: on x86-64 before PostgreSQL 19 pg_popcount64 is a function pointer,
+ * so the per-word loop made 512 indirect calls, where pg_popcount() makes
+ * one and runs the hardware instruction (or AVX-512) inside it.  Measured on
+ * PostgreSQL 18, x86-64 with POPCNT (2026-09-25): 768 ns -> 612 ns.
+ */
+static inline uint32
 bits_cardinality(const uint64 *w)
 {
-	uint32		n = 0;
-	uint32		i;
-
-	for (i = 0; i < LION_BITSET_WORDS; i++)
-		n += (uint32) pg_popcount64(w[i]);
-	return n;
+	return (uint32) pg_popcount((const char *) w, LION_BITSET_BYTES);
 }
 
 static uint32
@@ -236,6 +361,11 @@ bits_count_runs(const uint64 *w)
 	uint64		prev = 0;
 	uint32		i;
 
+	/*
+	 * Word by word, not an image of the run starts counted by one
+	 * pg_popcount() as bits_cardinality() does: writing the 4 KB image cost
+	 * more than the calls it saved (1.22 us against 0.92, 2026-09-25).
+	 */
 	for (i = 0; i < LION_BITSET_WORDS; i++)
 	{
 		uint64		cur = w[i];
@@ -246,9 +376,14 @@ bits_count_runs(const uint64 *w)
 	return nruns;
 }
 
-/* Materialise the set bits in ascending order.  Returns the count. */
+/*
+ * Materialise the set bits in ascending order into out, which has room for
+ * cap values.  Returns the count, or cap + 1 as soon as there are more set
+ * bits than that: the callers size out by a cardinality that a damaged header
+ * may understate (DESIGN.md §3, "untrusted containers" above).
+ */
 static uint32
-bits_extract_array(const uint64 *w, uint16 *out)
+bits_extract_array(const uint64 *w, uint16 *out, uint32 cap)
 {
 	uint32		n = 0;
 	uint32		i;
@@ -258,6 +393,10 @@ bits_extract_array(const uint64 *w, uint16 *out)
 		uint64		cur = w[i];
 		uint32		base = i << 6;
 
+		/* a word adds at most 64: test per word, and count only near cap */
+		if (unlikely(n + 64 > cap) && cur != 0 &&
+			n + (uint32) pg_popcount64(cur) > cap)
+			return cap + 1;
 		while (cur != 0)
 		{
 			out[n++] = (uint16) (base + (uint32) pg_rightmost_one_pos64(cur));
@@ -439,8 +578,9 @@ container_or_bitset(const LionContainer *c, uint64 *w)
 		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
+				uint32		n = array_card(c);
 
-				for (i = 0; i < c->cardinality; i++)
+				for (i = 0; i < n; i++)
 					bits_set(w, arr[i]);
 				break;
 			}
@@ -458,7 +598,12 @@ container_or_bitset(const LionContainer *c, uint64 *w)
 				uint32		nruns = run_nruns(c);
 
 				for (i = 0; i < nruns; i++)
-					bits_set_range(w, runs[i].start, (uint32) run_last(&runs[i]));
+				{
+					int32		last = run_last(&runs[i]);
+
+					if ((int32) runs[i].start <= last)
+						bits_set_range(w, runs[i].start, (uint32) last);
+				}
 				break;
 			}
 		default:
@@ -478,8 +623,9 @@ container_andnot_bitset(const LionContainer *c, uint64 *w)
 		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
+				uint32		n = array_card(c);
 
-				for (i = 0; i < c->cardinality; i++)
+				for (i = 0; i < n; i++)
 					bits_clear(w, arr[i]);
 				break;
 			}
@@ -497,7 +643,12 @@ container_andnot_bitset(const LionContainer *c, uint64 *w)
 				uint32		nruns = run_nruns(c);
 
 				for (i = 0; i < nruns; i++)
-					bits_clear_range(w, runs[i].start, (uint32) run_last(&runs[i]));
+				{
+					int32		last = run_last(&runs[i]);
+
+					if ((int32) runs[i].start <= last)
+						bits_clear_range(w, runs[i].start, (uint32) last);
+				}
 				break;
 			}
 		default:
@@ -531,12 +682,20 @@ container_and_bitset(const LionContainer *c, uint64 *w)
 				uint32		nruns = run_nruns(c);
 				uint32		prev = 0;
 
-				/* clear the gaps between (and around) the runs */
+				/*
+				 * Clear the gaps between (and around) the runs.  A run that
+				 * starts past LION_LO_MAX is empty (run_last()) and leaves
+				 * its gap to the final clear.
+				 */
 				for (i = 0; i < nruns; i++)
 				{
+					int32		last = run_last(&runs[i]);
+
+					if ((int32) runs[i].start > last)
+						continue;
 					if ((uint32) runs[i].start > prev)
 						bits_clear_range(w, prev, (uint32) runs[i].start - 1);
-					prev = (uint32) run_last(&runs[i]) + 1;
+					prev = (uint32) last + 1;
 				}
 				if (prev <= LION_LO_MAX)
 					bits_clear_range(w, prev, LION_LO_MAX);
@@ -570,7 +729,7 @@ container_count_runs(const LionContainer *c)
 		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
-				uint32		n = c->cardinality;
+				uint32		n = array_card(c);
 				uint32		nruns = 0;
 				uint32		i;
 
@@ -607,6 +766,93 @@ container_make_bitset(LionContainer *c)
 	memcpy(bitset_mdata(c), w, LION_BITSET_BYTES);
 }
 
+/*
+ * Materialise the members of c in ascending order into out, which has room
+ * for cap of them.  Returns the count, or cap + 1 when there are more than
+ * that, which only a damaged container can have (a header claiming fewer
+ * members than its payload holds, or overlapping runs):
+ * lion_container_to_array() passes LION_CONTAINER_RANGE, which no walk below
+ * can exceed, and container_make_array() the LION_ARRAY_MAX_CARD its header's
+ * cardinality promised.  What comes out is what lion_container_iterate()
+ * visits: members masked into range, and each run's values only from past the
+ * last value already emitted.
+ */
+static uint32
+container_extract(const LionContainer *c, uint16 *out, uint32 cap)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(c);
+
+				n = array_card(c);
+				if (n > cap)
+					return cap + 1;
+
+				/*
+				 * Copied, then masked four members at a time: a plain loop
+				 * of per-member masks is not vectorized at -O2 and made a
+				 * 1000-member to_array() 13 times slower than the memcpy()
+				 * it replaces (0.4 us against 0.03), four at a time half
+				 * that - next to the heap fetch each member then costs.
+				 */
+				memcpy(out, arr, (size_t) n * sizeof(uint16));
+				for (i = 0; i + 4 <= n; i += 4)
+				{
+					uint64		quad;
+
+					memcpy(&quad, &out[i], sizeof(quad));
+					quad &= LION_LO_MASK * UINT64CONST(0x0001000100010001);
+					memcpy(&out[i], &quad, sizeof(quad));
+				}
+				for (; i < n; i++)
+					out[i] &= (uint16) LION_LO_MASK;
+				break;
+			}
+		case LION_CT_BITSET:
+			n = bits_extract_array(bitset_cdata(c), out, cap);
+			break;
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(c);
+				uint32		nruns = run_nruns(c);
+				int32		next = 0;	/* first value not emitted yet */
+
+				for (i = 0; i < nruns; i++)
+				{
+					int32		v = Max((int32) runs[i].start, next);
+					int32		last = run_last(&runs[i]);
+
+					if (v > last)
+						continue;
+					if (n + (uint32) (last - v + 1) > cap)
+						return cap + 1;
+					for (; v <= last; v++)
+						out[n++] = (uint16) v;
+					next = last + 1;
+				}
+				break;
+			}
+		default:
+			Assert(false);
+			break;
+	}
+	return n;
+}
+
+/*
+ * The ARRAY form of c, whose header says it has at most LION_ARRAY_MAX_CARD
+ * members.  A damaged container whose payload holds MORE than that keeps its
+ * representation instead: tmp[] is sized by the header's word, and the caller
+ * is left with a container that is still what it was, for
+ * lion_container_check() to report, rather than a smaller one that has
+ * silently lost members.  The cardinality is set to what was extracted, which
+ * for a well-formed container is what it already was.
+ */
 static void
 container_make_array(LionContainer *c)
 {
@@ -616,9 +862,11 @@ container_make_array(LionContainer *c)
 	if (c->type == LION_CT_ARRAY)
 		return;
 	Assert(c->cardinality <= LION_ARRAY_MAX_CARD);
-	n = lion_container_to_array(c, tmp);
-	Assert(n == c->cardinality);
+	n = container_extract(c, tmp, LION_ARRAY_MAX_CARD);
+	if (n > LION_ARRAY_MAX_CARD)
+		return;
 	c->type = LION_CT_ARRAY;
+	c->cardinality = (uint16) n;
 	memcpy(array_mdata(c), tmp, (size_t) n * sizeof(uint16));
 }
 
@@ -635,7 +883,7 @@ container_make_run(LionContainer *c)
 	else
 	{
 		const uint16 *arr = array_cdata(c);
-		uint32		card = c->cardinality;
+		uint32		card = array_card(c);
 		uint32		i;
 
 		n = 0;
@@ -662,11 +910,13 @@ container_make_run(LionContainer *c)
 }
 
 /*
- * Rewrite a RUN container's payload from a bitset image holding "card"
- * members; "w" must not overlap c.  The RUN encoding is kept when the runs
- * still fit, otherwise the smaller of ARRAY (when it is legal) and BITSET is
- * used.  This is the tail of the RUN removal paths, which per DESIGN.md §3
- * must never leave a BITSET holding <= LION_ARRAY_MAX_CARD members.
+ * Rewrite a RUN container's payload from a bitset image holding exactly
+ * "card" members (the caller counted them as it set them, so a damaged
+ * header has no say here); "w" must not overlap c.  The RUN encoding is kept
+ * when the runs still fit, otherwise the smaller of ARRAY (when it is legal)
+ * and BITSET is used.  This is the tail of lion_container_remove_if() on a
+ * RUN, which per DESIGN.md §3 must never leave a BITSET holding <=
+ * LION_ARRAY_MAX_CARD members.
  */
 static void
 container_rebuild(LionContainer *c, const uint64 *w, uint32 card)
@@ -691,7 +941,7 @@ container_rebuild(LionContainer *c, const uint64 *w, uint32 card)
 	if (card <= LION_ARRAY_MAX_CARD)
 	{
 		uint16		vals[LION_ARRAY_MAX_CARD];
-		uint32		n = bits_extract_array(w, vals);
+		uint32		n = bits_extract_array(w, vals, LION_ARRAY_MAX_CARD);
 
 		Assert(n == card);
 		c->type = LION_CT_ARRAY;
@@ -740,7 +990,8 @@ Size
 lion_container_size(const LionContainer *c)
 {
 	if (c->type == LION_CT_RUN)
-		return lion_container_size_for(LION_CT_RUN, c->cardinality, run_nruns(c));
+		return lion_container_size_for(LION_CT_RUN, c->cardinality,
+									   run_nruns_raw(c));
 	return lion_container_size_for((LionContainerType) c->type, c->cardinality, 0);
 }
 
@@ -769,7 +1020,7 @@ lion_container_contains(const LionContainer *c, uint16 lo)
 		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
-				uint32		n = c->cardinality;
+				uint32		n = array_card(c);
 				uint32		pos = array_lower_bound(arr, n, lo);
 
 				return pos < n && arr[pos] == lo;
@@ -781,7 +1032,7 @@ lion_container_contains(const LionContainer *c, uint16 lo)
 				const LionRun *runs = run_cdata(c);
 				int32		idx = run_locate(runs, run_nruns(c), lo);
 
-				return idx >= 0 && (int32) lo <= run_last(&runs[idx]);
+				return idx >= 0 && (int32) lo <= run_end(&runs[idx]);
 			}
 		default:
 			Assert(false);
@@ -792,17 +1043,23 @@ lion_container_contains(const LionContainer *c, uint16 lo)
 void
 lion_container_to_bitset(LionContainer *c)
 {
+	container_clamp(c);
 	container_make_bitset(c);
 }
 
 void
 lion_container_optimize(LionContainer *c)
 {
-	uint32		card = c->cardinality;
-	uint32		nruns = container_count_runs(c);
+	uint32		card;
+	uint32		nruns;
 	Size		asz;
 	Size		rsz;
-	Size		bsz = lion_container_size_for(LION_CT_BITSET, card, 0);
+	Size		bsz;
+
+	container_clamp(c);
+	card = c->cardinality;
+	nruns = container_count_runs(c);
+	bsz = lion_container_size_for(LION_CT_BITSET, card, 0);
 
 	asz = (card <= LION_ARRAY_MAX_CARD)
 		? lion_container_size_for(LION_CT_ARRAY, card, 0)
@@ -869,13 +1126,30 @@ run_add(LionContainer *c, uint32 lo)
 		return true;
 	}
 
-	/* a brand new one-element run is needed */
+	/*
+	 * A brand new one-element run is needed.  When there is no room for a
+	 * 1024th run, DESIGN.md §3: the container becomes an ARRAY if the members
+	 * fit one with the new member in, which is always smaller than a BITSET
+	 * (8 + 2 * 2048 = 4104 at worst), and a BITSET otherwise.  Converting
+	 * straight to a BITSET, as this did before, turned 20 runs of 10 plus
+	 * 1003 scattered inserts - a 4102-byte RUN of 1203 members - into a
+	 * 4104-byte BITSET on the 1004th, where a 2416-byte ARRAY would do, and
+	 * the insert path does not optimize afterwards.
+	 *
+	 * Neither conversion is ever made on a page item in place: the in-place
+	 * insert (lion_insert_container_inplace()) and its redo
+	 * (LION_OP_CONTAINER_ADD) only take a RUN below LION_RUN_MAX_NRUNS runs,
+	 * which never gets here (lion_container.h, "growth in place").  The
+	 * general path works in a LION_CONTAINER_MAX_SIZE buffer and writes back
+	 * whatever size results.
+	 */
 	if (nruns >= (int32) LION_RUN_MAX_NRUNS)
 	{
-		container_make_bitset(c);
-		bits_set(bitset_mdata(c), lo);
-		c->cardinality++;
-		return true;
+		if (c->cardinality < LION_ARRAY_MAX_CARD)
+			container_make_array(c);
+		if (c->type == LION_CT_RUN)		/* too many members, or damaged */
+			container_make_bitset(c);
+		return lion_container_add(c, (uint16) lo);
 	}
 	memmove(&runs[idx + 2], &runs[idx + 1],
 			(size_t) (nruns - idx - 1) * sizeof(LionRun));
@@ -921,14 +1195,21 @@ run_remove(LionContainer *c, uint32 lo)
 	}
 	else
 	{
-		/* the run splits in two */
+		/*
+		 * The run splits in two.  With no room for a 1024th run the container
+		 * changes representation exactly as run_add() does: an ARRAY if the
+		 * members fit one before the removal, and otherwise a BITSET, which
+		 * the removal then shrinks to an ARRAY if it can
+		 * (container_shrink_bitset()).  Either way a RUN of 1023 runs never
+		 * becomes a BITSET of <= 2048 members.
+		 */
 		if (nruns >= (int32) LION_RUN_MAX_NRUNS)
 		{
-			container_make_bitset(c);
-			bits_clear(bitset_mdata(c), lo);
-			c->cardinality--;
-			container_shrink_bitset(c);
-			return true;
+			if (c->cardinality <= LION_ARRAY_MAX_CARD)
+				container_make_array(c);
+			if (c->type == LION_CT_RUN)
+				container_make_bitset(c);
+			return lion_container_remove(c, (uint16) lo);
 		}
 		memmove(&runs[idx + 2], &runs[idx + 1],
 				(size_t) (nruns - idx - 1) * sizeof(LionRun));
@@ -946,6 +1227,7 @@ lion_container_add(LionContainer *c, uint16 lo)
 {
 	Assert((uint32) lo <= LION_LO_MAX);
 
+	container_clamp(c);
 	switch (c->type)
 	{
 		case LION_CT_ARRAY:
@@ -992,6 +1274,7 @@ lion_container_remove(LionContainer *c, uint16 lo)
 {
 	Assert((uint32) lo <= LION_LO_MAX);
 
+	container_clamp(c);
 	switch (c->type)
 	{
 		case LION_CT_ARRAY:
@@ -1077,10 +1360,11 @@ lion_container_iterate(const LionContainer *c, lion_lo_callback cb, void *arg)
 		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
-				uint32		n = c->cardinality;
+				uint32		n = array_card(c);
 
+				/* masked: a caller's per-block arrays are indexed by lo */
 				for (i = 0; i < n; i++)
-					if (!cb(arr[i], arg))
+					if (!cb((uint16) (arr[i] & LION_LO_MASK), arg))
 						return;
 				break;
 			}
@@ -1108,15 +1392,24 @@ lion_container_iterate(const LionContainer *c, lion_lo_callback cb, void *arg)
 			{
 				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
+				int32		next = 0;	/* first value not visited yet */
 
+				/*
+				 * Strictly ascending even if the runs overlap, so that no
+				 * container yields more than LION_CONTAINER_RANGE values
+				 * (container_extract() walks the same way).
+				 */
 				for (i = 0; i < nruns; i++)
 				{
-					int32		v = (int32) runs[i].start;
+					int32		v = Max((int32) runs[i].start, next);
 					int32		last = run_last(&runs[i]);
 
+					if (v > last)
+						continue;
 					for (; v <= last; v++)
 						if (!cb((uint16) v, arg))
 							return;
+					next = last + 1;
 				}
 				break;
 			}
@@ -1126,41 +1419,17 @@ lion_container_iterate(const LionContainer *c, lion_lo_callback cb, void *arg)
 	}
 }
 
+/*
+ * No container yields more than LION_CONTAINER_RANGE values, damaged or not
+ * (container_extract()), so out never overflows; a well-formed one yields
+ * exactly its cardinality.
+ */
 uint32
 lion_container_to_array(const LionContainer *c, uint16 *out)
 {
-	uint32		n = 0;
-	uint32		i;
+	uint32		n = container_extract(c, out, LION_CONTAINER_RANGE);
 
-	switch (c->type)
-	{
-		case LION_CT_ARRAY:
-			n = c->cardinality;
-			memcpy(out, array_cdata(c), (size_t) n * sizeof(uint16));
-			break;
-		case LION_CT_BITSET:
-			n = bits_extract_array(bitset_cdata(c), out);
-			break;
-		case LION_CT_RUN:
-			{
-				const LionRun *runs = run_cdata(c);
-				uint32		nruns = run_nruns(c);
-
-				for (i = 0; i < nruns; i++)
-				{
-					int32		v = (int32) runs[i].start;
-					int32		last = run_last(&runs[i]);
-
-					for (; v <= last; v++)
-						out[n++] = (uint16) v;
-				}
-				break;
-			}
-		default:
-			Assert(false);
-			break;
-	}
-	Assert(n == c->cardinality);
+	Assert(n <= LION_CONTAINER_RANGE);
 	return n;
 }
 
@@ -1176,6 +1445,7 @@ lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 	uint32		removed = 0;
 	uint32		i;
 
+	container_clamp(c);
 	switch (c->type)
 	{
 		case LION_CT_ARRAY:
@@ -1186,7 +1456,7 @@ lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 
 				for (i = 0; i < n; i++)
 				{
-					if (pred(arr[i], arg))
+					if (pred((uint16) (arr[i] & LION_LO_MASK), arg))
 						removed++;
 					else
 						arr[keep++] = arr[i];
@@ -1217,7 +1487,7 @@ lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 					}
 					w[i] = keep;
 				}
-				Assert(removed <= c->cardinality);
+				/* a damaged header can understate; it wraps, verify says so */
 				c->cardinality -= (uint16) removed;
 				container_shrink_bitset(c);
 				break;
@@ -1227,24 +1497,39 @@ lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 				uint64		w[LION_BITSET_WORDS];
 				const LionRun *runs = run_cdata(c);
 				uint32		nruns = run_nruns(c);
-				uint32		card = c->cardinality;
+				uint32		kept = 0;
+				int32		next = 0;
 
 				memset(w, 0, LION_BITSET_BYTES);
 				for (i = 0; i < nruns; i++)
 				{
-					int32		v = (int32) runs[i].start;
+					int32		v = Max((int32) runs[i].start, next);
 					int32		last = run_last(&runs[i]);
 
+					if (v > last)
+						continue;
 					for (; v <= last; v++)
 					{
 						if (pred((uint16) v, arg))
 							removed++;
 						else
+						{
 							bits_set(w, (uint32) v);
+							kept++;
+						}
 					}
+					next = last + 1;
 				}
-				Assert(removed <= card);
-				container_rebuild(c, w, card - removed);
+
+				/*
+				 * Nothing removed, which is VACUUM's common case: the runs
+				 * are what they were, and rebuilding them from the image
+				 * would only write the same bytes back (two passes over the
+				 * 4 KB image and a copy).
+				 */
+				if (removed == 0)
+					return 0;
+				container_rebuild(c, w, kept);
 				break;
 			}
 		default:
@@ -1267,10 +1552,12 @@ lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16
 		case LION_CT_ARRAY:
 			{
 				const uint16 *arr = array_cdata(c);
-				uint32		n = c->cardinality;
+				uint32		n = array_card(c);
+				uint32		from = array_lower_bound(arr, n, lo_start);
+				uint32		to = array_upper_bound(arr, n, lo_end);
 
-				return array_upper_bound(arr, n, lo_end) -
-					array_lower_bound(arr, n, lo_start);
+				/* only an unsorted (damaged) array can have to < from */
+				return (to > from) ? to - from : 0;
 			}
 		case LION_CT_BITSET:
 			return bits_range_cardinality(bitset_cdata(c), lo_start, lo_end);
@@ -1281,12 +1568,12 @@ lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16
 				int32		i = run_locate(runs, (uint32) nruns, lo_start);
 				uint32		n = 0;
 
-				if (i < 0 || run_last(&runs[i]) < (int32) lo_start)
+				if (i < 0 || run_end(&runs[i]) < (int32) lo_start)
 					i++;
 				for (; i < nruns && (int32) runs[i].start <= (int32) lo_end; i++)
 				{
 					int32		s = Max((int32) runs[i].start, (int32) lo_start);
-					int32		e = Min(run_last(&runs[i]), (int32) lo_end);
+					int32		e = Min(run_end(&runs[i]), (int32) lo_end);
 
 					if (s <= e)
 						n += (uint32) (e - s + 1);
@@ -1299,6 +1586,25 @@ lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16
 	}
 }
 
+/*
+ * remove_range() the representation-independent way: through a BITSET, which
+ * the removal then shrinks to an ARRAY if it can.  For a RUN whose split
+ * would need a 1024th run, and for one whose runs are not in order, which
+ * only a damaged container has and the run arithmetic below assumes.
+ */
+static uint32
+container_remove_range_bitset(LionContainer *c, uint16 lo_start, uint16 lo_end)
+{
+	uint32		removed;
+
+	container_make_bitset(c);
+	removed = bits_range_cardinality(bitset_mdata(c), lo_start, lo_end);
+	bits_clear_range(bitset_mdata(c), lo_start, lo_end);
+	c->cardinality -= (uint16) removed;
+	container_shrink_bitset(c);
+	return removed;
+}
+
 uint32
 lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 {
@@ -1308,6 +1614,7 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 	if (lo_start > lo_end || c->cardinality == 0)
 		return 0;
 
+	container_clamp(c);
 	switch (c->type)
 	{
 		case LION_CT_ARRAY:
@@ -1317,7 +1624,11 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 				uint32		from = array_lower_bound(arr, n, lo_start);
 				uint32		to = array_upper_bound(arr, n, lo_end);
 
-				removed = to - from;
+				/*
+				 * Only an unsorted (damaged) array can have to < from, and
+				 * the memmove below would then write past the array.
+				 */
+				removed = (to > from) ? to - from : 0;
 				if (removed > 0)
 				{
 					memmove(&arr[from], &arr[to],
@@ -1360,7 +1671,12 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 					return 0;
 				/* last run starting at or before the end of the range */
 				j = run_locate(runs, (uint32) nruns, lo_end);
-				Assert(j >= i);
+				if (unlikely(j < i))
+				{
+					/* runs out of order: nothing below holds */
+					removed = container_remove_range_bitset(c, lo_start, lo_end);
+					break;
+				}
 
 				removed = 0;
 				for (k = i; k <= j; k++)
@@ -1388,10 +1704,7 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 				newn = nruns - (j - i + 1) + nrepl;
 				if (newn > (int32) LION_RUN_MAX_NRUNS)
 				{
-					container_make_bitset(c);
-					bits_clear_range(bitset_mdata(c), lo_start, lo_end);
-					c->cardinality -= (uint16) removed;
-					container_shrink_bitset(c);
+					removed = container_remove_range_bitset(c, lo_start, lo_end);
 					break;
 				}
 				memmove(&runs[i + nrepl], &runs[j + 1],
@@ -1529,7 +1842,7 @@ array_and_run(const uint16 *arr, uint32 na, const LionContainer *rc, uint16 *out
 	{
 		if ((int32) arr[i] < (int32) runs[j].start)
 			i++;
-		else if ((int32) arr[i] > run_last(&runs[j]))
+		else if ((int32) arr[i] > run_end(&runs[j]))
 			j++;
 		else
 			out[n++] = arr[i++];
@@ -1551,7 +1864,7 @@ array_andnot_run(const uint16 *arr, uint32 na, const LionContainer *rc,
 	{
 		if ((int32) arr[i] < (int32) runs[j].start)
 			out[n++] = arr[i++];
-		else if ((int32) arr[i] > run_last(&runs[j]))
+		else if ((int32) arr[i] > run_end(&runs[j]))
 			j++;
 		else
 			i++;
@@ -1605,10 +1918,12 @@ run_and_run(const LionContainer *a, const LionContainer *b, LionContainer *o)
 
 	while (i < na && j < nb)
 	{
-		int32		ea = run_last(&ra[i]);
-		int32		eb = run_last(&rb[j]);
+		int32		ea = run_end(&ra[i]);
+		int32		eb = run_end(&rb[j]);
 		int32		s = Max((int32) ra[i].start, (int32) rb[j].start);
-		int32		e = Min(ea, eb);
+
+		/* clamped where it is written, as run_last() would have it */
+		int32		e = Min(Min(ea, eb), (int32) LION_LO_MAX);
 
 		if (s <= e)
 		{
@@ -1644,8 +1959,8 @@ run_and_run_cardinality(const LionContainer *a, const LionContainer *b)
 
 	while (i < na && j < nb)
 	{
-		int32		ea = run_last(&ra[i]);
-		int32		eb = run_last(&rb[j]);
+		int32		ea = run_end(&ra[i]);
+		int32		eb = run_end(&rb[j]);
 		int32		s = Max((int32) ra[i].start, (int32) rb[j].start);
 		int32		e = Min(ea, eb);
 
@@ -1657,6 +1972,34 @@ run_and_run_cardinality(const LionContainer *a, const LionContainer *b)
 			j++;
 	}
 	return card;
+}
+
+/*
+ * o = c, for the set algebra's shortcuts, in what c's readers here look at:
+ * a well-formed c is copied byte for byte, and a header claiming more than
+ * LION_ARRAY_MAX_CARD members or LION_RUN_MAX_NRUNS runs is copied as its
+ * clamped self, so that the copy fits the LION_CONTAINER_MAX_SIZE work buffer
+ * whatever the header says.
+ */
+static void
+container_copy(const LionContainer *c, LionContainer *o)
+{
+	Size		size;
+
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			size = lion_container_size_for(LION_CT_ARRAY, array_card(c), 0);
+			break;
+		case LION_CT_RUN:
+			size = lion_container_size_for(LION_CT_RUN, 0, run_nruns(c));
+			break;
+		default:
+			size = lion_container_size_for((LionContainerType) c->type, 0, 0);
+			break;
+	}
+	memcpy(o, c, size);
+	container_clamp(o);
 }
 
 /* Finish a freshly computed result: optimize and copy into dest. */
@@ -1691,13 +2034,13 @@ lion_container_and(const LionContainer *a, const LionContainer *b,
 		uint32		n;
 
 		if (oth->type == LION_CT_ARRAY)
-			n = array_intersect(array_cdata(a), a->cardinality,
-								array_cdata(b), b->cardinality, out);
+			n = array_intersect(array_cdata(a), array_card(a),
+								array_cdata(b), array_card(b), out);
 		else if (oth->type == LION_CT_BITSET)
-			n = array_and_bitset(array_cdata(arr), arr->cardinality,
+			n = array_and_bitset(array_cdata(arr), array_card(arr),
 								 bitset_cdata(oth), out);
 		else
-			n = array_and_run(array_cdata(arr), arr->cardinality, oth, out);
+			n = array_and_run(array_cdata(arr), array_card(arr), oth, out);
 		o->cardinality = (uint16) n;
 	}
 	else if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
@@ -1728,10 +2071,10 @@ lion_container_or(const LionContainer *a, const LionContainer *b,
 	lion_container_init(o, a->ckey);
 
 	if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
-		(uint32) a->cardinality + (uint32) b->cardinality <= LION_ARRAY_MAX_CARD)
+		array_card(a) + array_card(b) <= LION_ARRAY_MAX_CARD)
 	{
-		uint32		n = array_union(array_cdata(a), a->cardinality,
-									array_cdata(b), b->cardinality,
+		uint32		n = array_union(array_cdata(a), array_card(a),
+									array_cdata(b), array_card(b),
 									array_mdata(o));
 
 		o->cardinality = (uint16) n;
@@ -1740,7 +2083,7 @@ lion_container_or(const LionContainer *a, const LionContainer *b,
 	{
 		const LionContainer *src = (a->cardinality == 0) ? b : a;
 
-		memcpy(o, src, lion_container_size(src));
+		container_copy(src, o);
 		o->ckey = a->ckey;
 		o->flags = 0;
 	}
@@ -1772,7 +2115,7 @@ lion_container_andnot(const LionContainer *a, const LionContainer *b,
 	}
 	else if (b->cardinality == 0)
 	{
-		memcpy(o, a, lion_container_size(a));
+		container_copy(a, o);
 		o->flags = 0;
 	}
 	else if (a->type == LION_CT_ARRAY)
@@ -1781,13 +2124,13 @@ lion_container_andnot(const LionContainer *a, const LionContainer *b,
 		uint32		n;
 
 		if (b->type == LION_CT_ARRAY)
-			n = array_difference(array_cdata(a), a->cardinality,
-								 array_cdata(b), b->cardinality, out);
+			n = array_difference(array_cdata(a), array_card(a),
+								 array_cdata(b), array_card(b), out);
 		else if (b->type == LION_CT_BITSET)
-			n = array_andnot_bitset(array_cdata(a), a->cardinality,
+			n = array_andnot_bitset(array_cdata(a), array_card(a),
 									bitset_cdata(b), out);
 		else
-			n = array_andnot_run(array_cdata(a), a->cardinality, b, out);
+			n = array_andnot_run(array_cdata(a), array_card(a), b, out);
 		o->cardinality = (uint16) n;
 	}
 	else
@@ -1810,17 +2153,24 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 	if (a->cardinality == 0 || b->cardinality == 0)
 		return 0;
 
-	/* BITSET x BITSET: popcount of the ANDed words, nothing materialised */
+	/*
+	 * BITSET x BITSET: AND into a local image, then one popcount of it
+	 * (bits_cardinality()).  Popcounting the ANDed words one at a time
+	 * materialised nothing but made 512 indirect calls on x86-64 before
+	 * PostgreSQL 19; the AND loop vectorizes and the image is 4 KB of stack.
+	 * 920 ns -> 837 ns on the machine bits_cardinality() was measured on; a
+	 * review measured 2.3 - 3.8 us -> 1.2 us on another.
+	 */
 	if (a->type == LION_CT_BITSET && b->type == LION_CT_BITSET)
 	{
 		const uint64 *wa = bitset_cdata(a);
 		const uint64 *wb = bitset_cdata(b);
-		uint32		card = 0;
+		uint64		w[LION_BITSET_WORDS];
 		uint32		i;
 
 		for (i = 0; i < LION_BITSET_WORDS; i++)
-			card += (uint32) pg_popcount64(wa[i] & wb[i]);
-		return card;
+			w[i] = wa[i] & wb[i];
+		return bits_cardinality(w);
 	}
 
 	if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
@@ -1828,7 +2178,7 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 		const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
 		const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
 		const uint16 *data = array_cdata(arr);
-		uint32		n = arr->cardinality;
+		uint32		n = array_card(arr);
 		uint32		card = 0;
 		uint32		i;
 
@@ -1836,8 +2186,8 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 		{
 			const uint16 *ba = array_cdata(a);
 			const uint16 *bb = array_cdata(b);
-			uint32		na = a->cardinality;
-			uint32		nb = b->cardinality;
+			uint32		na = array_card(a);
+			uint32		nb = array_card(b);
 			uint32		x = 0;
 			uint32		y = 0;
 
@@ -1876,7 +2226,7 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 			{
 				if ((int32) data[i] < (int32) runs[j].start)
 					i++;
-				else if ((int32) data[i] > run_last(&runs[j]))
+				else if ((int32) data[i] > run_end(&runs[j]))
 					j++;
 				else
 				{
@@ -1902,8 +2252,12 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 		uint32		i;
 
 		for (i = 0; i < nruns; i++)
-			card += bits_range_cardinality(w, runs[i].start,
-										   (uint32) run_last(&runs[i]));
+		{
+			int32		last = run_last(&runs[i]);
+
+			if ((int32) runs[i].start <= last)
+				card += bits_range_cardinality(w, runs[i].start, (uint32) last);
+		}
 		return card;
 	}
 }
@@ -1985,7 +2339,7 @@ lion_container_check(const LionContainer *c, Size avail_bytes, const char **errm
 
 				if (avail_bytes < LION_CONTAINER_HDRSZ + sizeof(uint16))
 					LION_CHECK_FAIL("run container header does not fit in the available space");
-				nruns = run_nruns(c);
+				nruns = run_nruns_raw(c);
 				if (nruns > LION_RUN_MAX_NRUNS)
 					LION_CHECK_FAIL("run container has more than LION_RUN_MAX_NRUNS runs");
 				if (lion_container_size_for(LION_CT_RUN, card, nruns) > avail_bytes)
@@ -1996,7 +2350,7 @@ lion_container_check(const LionContainer *c, Size avail_bytes, const char **errm
 				for (i = 0; i < nruns; i++)
 				{
 					int32		start = (int32) runs[i].start;
-					int32		last = run_last(&runs[i]);
+					int32		last = run_end(&runs[i]); /* not clamped */
 
 					if (last > (int32) LION_LO_MAX)
 						LION_CHECK_FAIL("run container run extends past the container range");

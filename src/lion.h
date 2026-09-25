@@ -117,6 +117,18 @@ typedef LionPageOpaqueData *LionPageOpaque;
 	((Size) (BLCKSZ - SizeOfPageHeaderData - LION_SPECIAL_SIZE))
 
 /*
+ * DESIGN.md §2: every container fits on a page - a BITSET is the largest,
+ * and it must be an item on an otherwise empty container page, line pointer
+ * and all.  That holds from BLCKSZ 8192 up (8136 bytes of capacity for a
+ * 4108-byte item) and not below it: at 4096 the capacity is 4040 bytes, and a
+ * build or an insert would fail on the first BITSET.  lion_tid.h refuses
+ * such a BLCKSZ outright, with a clearer message; this is the property that
+ * refusal stands for.
+ */
+StaticAssertDecl(MAXALIGN(LION_CONTAINER_MAX_SIZE) + sizeof(ItemIdData) <= LION_PAGE_CAPACITY,
+				 "pg_lion: a BITSET container does not fit on a page of this BLCKSZ");
+
+/*
  * The body of a DELETED page: the transaction id from which on no scan can
  * still hold a link to it, exactly as nbtree's BTDeletedPageData (see
  * BTPageIsRecyclable() in access/nbtree.h).  Nothing else is left on the page.

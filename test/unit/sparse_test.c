@@ -983,6 +983,278 @@ test_check_rejects(void)
 	}
 }
 
+/* ----------------------------------------------------------------
+ *		damaged segments, and growth in place (DESIGN.md §13)
+ *
+ * As in container_test.c: every buffer is a heap allocation of exactly the
+ * size under test, so that -fsanitize=address reports any access past it,
+ * and otherwise a guard of LION_CONTAINER_MAX_SIZE bytes follows it that
+ * guard_ok() checks.
+ * ----------------------------------------------------------------
+ */
+
+#if defined(__SANITIZE_ADDRESS__)
+#define UNIT_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define UNIT_ASAN 1
+#endif
+#endif
+
+/* a variable, not a macro: 0 would make the loops below "always false" */
+#ifdef UNIT_ASAN
+static Size guard_bytes = 0;
+#else
+static Size guard_bytes = LION_CONTAINER_MAX_SIZE;
+#endif
+#define GUARD_FILL	0xA5
+
+static void *
+exact_alloc(Size size)
+{
+	unsigned char *p = malloc(size + guard_bytes);
+	Size		i;
+
+	if (p == NULL)
+	{
+		printf("out of memory\n");
+		exit(2);
+	}
+	for (i = 0; i < guard_bytes; i++)
+		p[size + i] = GUARD_FILL;
+	return p;
+}
+
+static bool
+guard_ok(const void *p, Size size)
+{
+	const unsigned char *g = (const unsigned char *) p + size;
+	Size		i;
+
+	for (i = 0; i < guard_bytes; i++)
+		if (g[i] != GUARD_FILL)
+			return false;
+	return true;
+}
+
+static uint32 damage_pairs;
+
+static bool
+damage_count_cb(uint32 ckey, uint16 lo, void *arg)
+{
+	damage_pairs++;
+	return true;
+}
+
+static uint32 damage_seed;
+
+static bool
+damage_pair_pred(uint32 ckey, uint16 lo, void *arg)
+{
+	damage_pairs++;
+	return (((ckey ^ lo) * 2654435761U ^ damage_seed) >> 30) == 0;
+}
+
+static bool
+damage_lo_cb(uint16 lo, void *arg)
+{
+	if ((uint32) lo >= LION_CONTAINER_RANGE)
+		(*(uint32 *) arg)++;
+	return true;
+}
+
+/*
+ * Every function of the segment library over s, in exact
+ * LION_CONTAINER_MAX_SIZE buffers, checking what is promised for any bytes:
+ * no access outside a buffer, at most LION_SPARSE_MAX_PAIRS pairs looked at,
+ * and a segment a mutator leaves behind no larger than
+ * LION_CONTAINER_MAX_SIZE.  s is left unchanged.
+ */
+static void
+damage_exercise_segment(const LionContainer *s, LionContainer *work,
+						LionContainer *left, LionContainer *right,
+						LionContainer *cont)
+{
+	uint32		ckey = LION_SPARSE_CKEYS_CONST(s)[rng_below(LION_SPARSE_MAX_PAIRS)];
+	uint16		lo = (uint16) rng_below(LION_CONTAINER_RANGE);
+	uint32		first;
+	uint32		count;
+	uint32		bad = 0;
+
+	(void) lion_sparse_contains(s, ckey, lo);
+	lion_sparse_find(s, ckey, &first, &count);
+	CHECK(first + count <= LION_SPARSE_MAX_PAIRS, "damaged: find() stays within the pairs");
+	(void) lion_sparse_count(s, ckey + 1);
+	damage_pairs = 0;
+	lion_sparse_iterate(s, damage_count_cb, NULL);
+	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS, "damaged: iterate() visits at most 682 pairs");
+	if (s->cardinality > 0)
+		(void) lion_item_last_ckey(s);
+
+	if (lion_sparse_split_half(s, left, right))
+		CHECK(lion_sparse_size(left) <= LION_CONTAINER_MAX_SIZE &&
+			  lion_sparse_size(right) <= LION_CONTAINER_MAX_SIZE,
+			  "damaged: split_half() halves fit a work buffer");
+	CHECK(guard_ok(left, LION_CONTAINER_MAX_SIZE) && guard_ok(right, LION_CONTAINER_MAX_SIZE),
+		  "damaged: split_half() stays inside its buffers");
+	lion_sparse_split_at(s, ckey, left, right);
+	CHECK(lion_sparse_size(left) <= LION_CONTAINER_MAX_SIZE &&
+		  lion_sparse_size(right) <= LION_CONTAINER_MAX_SIZE,
+		  "damaged: split_at() parts fit a work buffer");
+	CHECK(guard_ok(left, LION_CONTAINER_MAX_SIZE) && guard_ok(right, LION_CONTAINER_MAX_SIZE),
+		  "damaged: split_at() stays inside its buffers");
+	(void) lion_sparse_merge(s, s, work);
+	CHECK(guard_ok(work, LION_CONTAINER_MAX_SIZE), "damaged: merge() stays inside its buffer");
+
+#define DAMAGE_MUTATE(what, stmt) \
+	do { \
+		memcpy(work, s, LION_CONTAINER_MAX_SIZE); \
+		stmt; \
+		CHECK(lion_sparse_size(work) <= LION_CONTAINER_MAX_SIZE, \
+			  "damaged: " what " leaves a segment of at most 4104 bytes"); \
+		CHECK(guard_ok(work, LION_CONTAINER_MAX_SIZE), \
+			  "damaged: " what " stays inside its buffer"); \
+	} while (0)
+
+	DAMAGE_MUTATE("insert()", (void) lion_sparse_insert(work, ckey, lo, NULL));
+	DAMAGE_MUTATE("remove()", (void) lion_sparse_remove(work, ckey, lo));
+	damage_seed = rng_next();
+	damage_pairs = 0;
+	DAMAGE_MUTATE("remove_if()", (void) lion_sparse_remove_if(work, damage_pair_pred, NULL));
+	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS,
+		  "damaged: remove_if() asks about at most 682 pairs");
+	DAMAGE_MUTATE("extract()", (void) lion_sparse_extract(work, ckey, cont));
+	CHECK(lion_container_size(cont) <= LION_CONTAINER_MAX_SIZE &&
+		  guard_ok(cont, LION_CONTAINER_MAX_SIZE),
+		  "damaged: extract() builds a container inside its buffer");
+	lion_container_iterate(cont, damage_lo_cb, &bad);
+	CHECK(bad == 0, "damaged: extract() builds a container of lo values in range");
+#undef DAMAGE_MUTATE
+}
+
+static void
+test_damaged(uint32 iters, uint64 seed)
+{
+	LionContainer *s = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	LionContainer *work = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	LionContainer *left = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	LionContainer *right = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	LionContainer *cont = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	uint32		it;
+	uint32		i;
+
+	/*
+	 * The case a 2026-09 review found: VACUUM copies a page item into a
+	 * LION_CONTAINER_MAX_SIZE buffer by its line pointer's length, and
+	 * lion_sparse_remove_if() indexed its keep[682] by the header's count.
+	 */
+	phase("damaged: a segment claiming 1000 pairs, filtered");
+	rng_seed(seed);
+	lion_sparse_init(s, 0);
+	for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
+		(void) lion_sparse_insert(s, i / 2, (uint16) (i * 7), NULL);
+	s->cardinality = 1000;
+	memcpy(work, s, LION_CONTAINER_MAX_SIZE);
+	damage_seed = 0;
+	(void) lion_sparse_remove_if(work, damage_pair_pred, NULL);
+	CHECK(work->cardinality <= LION_SPARSE_MAX_PAIRS, "remove_if() leaves at most 682 pairs");
+	CHECK(guard_ok(work, LION_CONTAINER_MAX_SIZE), "remove_if() stays inside its buffer");
+	damage_exercise_segment(s, work, left, right, cont);
+	s->cardinality = 65535;
+	damage_exercise_segment(s, work, left, right, cont);
+
+	/* pairs out of order, duplicated, and lo values past the range */
+	phase("damaged: a segment of unordered pairs");
+	lion_sparse_init(s, 0);
+	s->cardinality = LION_SPARSE_MAX_PAIRS;
+	for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
+	{
+		LION_SPARSE_CKEYS(s)[i] = (i % 3 == 0) ? 5 : 1000 - i;
+		LION_SPARSE_LOS(s)[i] = (uint16) (65535 - 13 * i);
+	}
+	s->ckey = LION_SPARSE_CKEYS(s)[0];
+	damage_exercise_segment(s, work, left, right, cont);
+
+	phase("damaged: random segments");
+	for (it = 0; it < iters; it++)
+	{
+		for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+			((char *) s)[i] = (char) rng_next();
+		s->type = LION_CT_SPARSE;
+		s->flags = 0;
+		s->cardinality = (uint16) ((it % 3 == 0) ? rng_below(LION_SPARSE_MAX_PAIRS + 1) : rng_next());
+		if (it % 3 == 1)
+		{
+			/* plausible: ascending ckeys over a few values */
+			for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
+				LION_SPARSE_CKEYS(s)[i] = 100 + i / (1 + rng_below(4));
+		}
+		damage_exercise_segment(s, work, left, right, cont);
+	}
+
+	free(s);
+	free(work);
+	free(left);
+	free(right);
+	free(cont);
+}
+
+/*
+ * lion_sparse.h's contract for the in-place insert and its WAL redo
+ * (lion_insert_segment_inplace(), LION_OP_SPARSE_INS): insert() into a segment
+ * below LION_SPARSE_MAX_PAIRS pairs needs LION_SPARSE_PAIR_SIZE bytes past
+ * its size.  Each insert runs on an allocation of exactly that, and must
+ * leave the bytes an insert into a full-size buffer does.
+ */
+static void
+test_inplace_growth(void)
+{
+	SBuf		full;
+	SBuf		ref;
+	uint32		k;
+	uint32		i;
+
+	phase("insert() within the in-place growth contract");
+	rng_seed(UINT64CONST(0x5EED2100));
+	for (k = 0; k < 200; k++)
+	{
+		uint32		n = (k < 4) ? LION_SPARSE_MAX_PAIRS - 1 - k : rng_below(LION_SPARSE_MAX_PAIRS);
+		Size		alloc;
+		LionContainer *p;
+		uint32		ckey;
+		uint16		lo;
+		bool		dup1 = false;
+		bool		dup2 = false;
+		bool		r1;
+		bool		r2;
+
+		lion_sparse_init(&ref.c, 0);
+		while (ref.c.cardinality < n)
+			(void) lion_sparse_insert(&ref.c, 1000 + rng_below(2 * n + 1),
+									  (uint16) rng_below(LION_CONTAINER_RANGE), NULL);
+		alloc = lion_sparse_size(&ref.c) + LION_SPARSE_PAIR_SIZE;
+
+		for (i = 0; i < 4; i++)
+		{
+			/* before, among and after the ckeys there are */
+			ckey = (i == 0) ? 999 : ((i == 3) ? 1000 + 2 * n + 1 : 1000 + rng_below(2 * n + 1));
+			lo = (uint16) rng_below(LION_CONTAINER_RANGE);
+
+			p = exact_alloc(alloc);
+			memcpy(p, &ref.c, lion_sparse_size(&ref.c));
+			memcpy(&full, &ref, sizeof(full));
+			r1 = lion_sparse_insert(p, ckey, lo, &dup1);
+			r2 = lion_sparse_insert(&full.c, ckey, lo, &dup2);
+			CHECK(r1 && r2 && dup1 == dup2, "insert() in place succeeds as it does in a full buffer");
+			CHECK(lion_sparse_size(p) <= alloc, "insert() in place stays inside the item");
+			CHECK(guard_ok(p, alloc), "insert() in place writes nothing past the item");
+			CHECK(memcmp(p, &full, lion_sparse_size(p)) == 0,
+				  "insert() in place leaves the bytes it leaves in a full buffer");
+			free(p);
+		}
+	}
+}
+
 /*
  * Randomized insert/remove/extract/split/merge sequences against the
  * reference.
@@ -1186,6 +1458,8 @@ main(void)
 	test_merge();
 	test_iterate_early_stop();
 	test_check_rejects();
+	test_damaged(3000, UINT64CONST(0x5EED2200));
+	test_inplace_growth();
 
 	test_random_ops("random ops, 8 ckeys (dense)", 8, 20000,
 					UINT64CONST(0x5EED2001));

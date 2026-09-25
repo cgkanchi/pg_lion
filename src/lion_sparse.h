@@ -43,6 +43,19 @@
  *	  uint32 ckeys[] is aligned); a segment inside an INLINE payload is
  *	  unaligned and must be copied out with lion_inline_fetch() first, exactly
  *	  like a container.
+ *
+ *	  GROWTH IN PLACE: lion_sparse_insert() into a segment of fewer than
+ *	  LION_SPARSE_MAX_PAIRS pairs writes at most lion_sparse_size() +
+ *	  LION_SPARSE_PAIR_SIZE bytes, which is what the in-place insert
+ *	  (lion_insert_segment_inplace()) and its WAL redo (LION_OP_SPARSE_INS)
+ *	  check for before calling it on a page item.  Nothing else may be called
+ *	  on an item in place.
+ *
+ *	  DAMAGED INPUT, as for containers (lion_container.h): every function is
+ *	  memory-safe for any pairs behind a LION_CT_SPARSE header, never looks
+ *	  at more than lion_sparse_npairs() pairs - 4100 bytes - and never leaves
+ *	  a segment larger than LION_CONTAINER_MAX_SIZE; what a damaged segment
+ *	  yields is unspecified, and lion_sparse_check() is what finds it.
  *-------------------------------------------------------------------------
  */
 #ifndef LION_SPARSE_H
@@ -103,6 +116,21 @@ lion_item_is_sparse(const LionContainer *item)
 }
 
 /*
+ * The number of pairs a reader may look at: the header's count, clamped to
+ * LION_SPARSE_MAX_PAIRS.  A segment read from disk is data, and a damaged
+ * header must not walk a reader - or a mutator working in a
+ * LION_CONTAINER_MAX_SIZE buffer that ItemIdGetLength() filled - past the
+ * largest legal segment (lion_container.c, "untrusted containers").  For a
+ * well-formed segment it is the cardinality; lion_sparse_size() and
+ * lion_sparse_check() still see what the header claims.
+ */
+static inline uint32
+lion_sparse_npairs(const LionContainer *s)
+{
+	return Min((uint32) s->cardinality, LION_SPARSE_MAX_PAIRS);
+}
+
+/*
  * Size of any item of a posting set, container or segment.  Everything that
  * derives an item's length from its header goes through this.
  */
@@ -128,7 +156,7 @@ lion_item_last_ckey(const LionContainer *item)
 	if (item->type == LION_CT_SPARSE)
 	{
 		Assert(item->cardinality > 0);
-		return LION_SPARSE_CKEYS_CONST(item)[item->cardinality - 1];
+		return LION_SPARSE_CKEYS_CONST(item)[lion_sparse_npairs(item) - 1];
 	}
 	return item->ckey;
 }
