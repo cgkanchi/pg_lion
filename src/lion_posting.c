@@ -57,11 +57,15 @@
  *	  - and a descent is the only thing that repairs as it goes, so more rules
  *	  close the gap.  The append hint is used only for changes that stay
  *	  inside the page; anything that may split the page descends
- *	  (lion_insert.c).  And a page that has NO downlink - the right half of an
+ *	  (lion_insert.c).  A page that has NO downlink - the right half of an
  *	  unfinished split, reached through the hint or a right link - finds, when
  *	  its own split needs its parent, the flagged page to its left and
  *	  finishes that first (lion_posting_find_parent(), nbtree's
- *	  _bt_getstackbuf() doing _bt_finish_split()).
+ *	  _bt_getstackbuf() doing _bt_finish_split()).  And a page that is itself
+ *	  flagged finishes that split before it is split again
+ *	  (lion_split_and_place()): a second split would put its new page between
+ *	  the two halves of the first, and the first one's right half would never
+ *	  get a downlink.
  *
  * Every page modification here goes through the WAL shim of DESIGN.md §25,
  * which writes either a GenericXLog record or one of our own, and every buffer is

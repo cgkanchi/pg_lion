@@ -3836,9 +3836,13 @@ That was the only repair, and two writers reach a leaf without descending at all
 - **VACUUM's regrow** (§18), which reaches the page a grown container lives on by walking right
   links under cleanup locks - it may not jump there (§11; rule 1 of lion_vacuum.c). On the RIGHT
   half, which has no downlink, its split's parent lookup failed as above, and VACUUM could not
-  complete.
+  complete. On the flagged LEFT half, the split it caused was guarded by an Assert and nothing
+  else: a release build linked the new page between the two halves of the old split, gave the NEW
+  page a downlink and cleared the one flag that remembered the old right half, which then had no
+  downlink for good. The leaf chain stays intact, so sequential readers were right, but a descent -
+  which is how a seek probes a set - never reached that page again.
 
-Two rules close it, both after nbtree:
+Three rules close it, all three after nbtree:
 
 1. **The append hint serves only changes that stay on the page.** `lion_insert_chain()` uses the
    tail for the in-place member inserts of §4 and nothing else; a member that needs the general
@@ -3859,19 +3863,23 @@ Two rules close it, both after nbtree:
    when it holds a posting page without the directory leaf, asks for the leaf only conditionally.
    When the flagged page's right sibling is the child itself, the separator is read off the page
    the caller already holds instead of locking it a second time.
+3. **A split first finishes the page's own unfinished split** (`lion_split_and_place()`), as
+   `lion_dir_place()` does for the directory; nbtree's `_bt_insertonpg()` refuses to touch such a
+   page at all. Finishing touches the parent and the page's flag, not its items or its right
+   link, so the split that follows proceeds exactly as it would have.
 
-Rule 1 makes the repair early - the first general-path insert after the crash does it - and rule 2
-makes it certain for a writer that did not descend, which today means VACUUM's regrow on the right
-half. What rule 1 costs is the descent's locks, one per level, on the general path only: never for
+Rule 1 makes the repair early - the first general-path insert after the crash does it - and rules 2
+and 3 make it certain for a writer that did not descend, which today means VACUUM's regrow, on
+either half. What rule 1 costs is the descent's locks, one per level, on the general path only: never for
 a BITSET, and about once per 30 members of a growing ARRAY, whose slack is 64 bytes.
 
 Tests: `test/isolation/posting_split_repair.spec` cuts a split short with
 `lion-posting-split-incomplete` set to 'error' inside a subtransaction - which leaves on disk exactly
-what a crash between the two records leaves - and then (A) appends, and (B) makes VACUUM regrow on
-the right half, which has no downlink. Both end with verify() clean and the index agreeing with the
-heap; before the fix both failed with "no downlink". `test/recovery/run.sh` phase 1d now appends
-after its real crash, which is the case it used to route around by inserting only into the middle
-of the heap.
+what a crash between the two records leaves - and then (A) appends, (B) makes VACUUM regrow on the
+right half, which has no downlink, and (C) on the flagged left half. Each ends with verify() clean
+and the index agreeing with the heap; before the fix A and B failed with "no downlink" and C
+crashed an assert build. `test/recovery/run.sh` phase 1d now appends after its real crash, which is
+the case it used to route around by inserting only into the middle of the heap.
 
 ### §21 addendum: binary coercion requires the same equality function
 

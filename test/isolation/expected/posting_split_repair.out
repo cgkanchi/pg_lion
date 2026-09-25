@@ -1,6 +1,6 @@
 Parsed test spec with 1 sessions
 
-starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check
+starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut c_delete c_vacuum c_check
 injection_points_set_local
 --------------------------
                           
@@ -109,6 +109,74 @@ lion_index_verify
 via_index|via_heap
 ---------+--------
     16448|   16448
+(1 row)
+
+via_index|via_heap
+---------+--------
+    92568|   92568
+(1 row)
+
+step c_holes: DELETE FROM psr_left WHERE k = 3 AND id BETWEEN 14464 * 3 + 1 AND 14464 * 4;
+step c_vacuum_holes: VACUUM (INDEX_CLEANUP ON) psr_left;
+step c_before: SELECT container_pages FROM lion_index_stats('psr_left_k');
+container_pages
+---------------
+              7
+(1 row)
+
+step split_breaks: SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step c_cut: SELECT psr_insert_until_error('psr_left');
+psr_insert_until_error                                           
+-----------------------------------------------------------------
+error triggered for injection point lion-posting-split-incomplete
+(1 row)
+
+step split_works: SELECT injection_points_detach('lion-posting-split-incomplete');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step c_after_cut: 
+	SELECT * FROM psr_landed('psr_left');
+	SELECT container_pages FROM lion_index_stats('psr_left_k');
+
+lo|hi
+--+--
+ 3| 3
+(1 row)
+
+container_pages
+---------------
+              8
+(1 row)
+
+step c_delete: DELETE FROM psr_left WHERE k = 1 AND id % 30 IN (1, 3) AND id <= 14464 * 3;
+step c_vacuum: VACUUM (INDEX_CLEANUP ON) psr_left;
+step c_check: 
+	SELECT container_pages FROM lion_index_stats('psr_left_k');
+	SELECT lion_index_verify('psr_left_k', true);
+	SELECT * FROM psr_counts('psr_left', 1);
+	SELECT * FROM psr_counts('psr_left', 2);
+
+container_pages
+---------------
+              9
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+via_index|via_heap
+---------+--------
+    16445|   16445
 (1 row)
 
 via_index|via_heap

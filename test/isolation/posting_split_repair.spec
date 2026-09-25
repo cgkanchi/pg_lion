@@ -19,6 +19,11 @@
 #  B. VACUUM's REGROW, which walks the right links to the page a container
 #     that grew on filtering lives on.  On the right half, which has no
 #     downlink, its split failed the same way, and VACUUM never completed.
+#  C. the same on the flagged LEFT half, which it split again: an assertion
+#     failure in an assert build, and in a release build a new page between
+#     the two halves of the old split that took the downlink the old right
+#     half was waiting for, orphaning that half - and the containers on it,
+#     for every reader that seeks by container key.
 #
 # The splits are cut short with lion-posting-split-incomplete set to 'error'
 # inside a subtransaction, which leaves on disk exactly what a crash between
@@ -26,7 +31,7 @@
 # crash).  After every scenario verify() must be clean - no split left
 # unfinished - and the index must answer what the heap answers.
 #
-# The fixture of B: key 1 holds a RUN of five rows in every thirty, so each
+# The fixture of B and C: key 1 holds a RUN of five rows in every thirty, so each
 # container key (64 heap blocks of 226 rows) is a ~1980-byte RUN and a
 # bulk-built leaf holds four of them with 208 bytes to spare; key 3 is the row
 # in the middle of each gap.  Deleting key 3's rows in ONE container key's heap
@@ -46,12 +51,17 @@ setup
 	CREATE TABLE psr_app (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	CREATE INDEX psr_app_k ON psr_app USING lion (k);
 
-	-- B: eight container keys, two leaves of four RUNs for key 1.
+	-- B and C: eight container keys, two leaves of four RUNs for key 1.
 	CREATE TABLE psr_right (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO psr_right SELECT i,
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 2 END
 	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_right_k ON psr_right USING lion (k);
+	CREATE TABLE psr_left (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	INSERT INTO psr_left SELECT i,
+		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 2 END
+	  FROM generate_series(1, 14464 * 8) i;
+	CREATE INDEX psr_left_k ON psr_left USING lion (k);
 
 	/*
 	 * Insert key-1 rows one at a time, each in a subtransaction, until one of
@@ -110,7 +120,7 @@ setup
 
 teardown
 {
-	DROP TABLE psr_app, psr_right;
+	DROP TABLE psr_app, psr_right, psr_left;
 	DROP FUNCTION psr_insert_until_error(text);
 	DROP FUNCTION psr_landed(text);
 	DROP FUNCTION psr_counts(text, int);
@@ -165,7 +175,30 @@ step b_check	{
 	SELECT * FROM psr_counts('psr_right', 2);
 }
 
+# C. VACUUM's regrow on the flagged LEFT half.  The rows go to container key
+# 3, the LAST RUN of the first leaf, so the split moves nothing right: the
+# grown RUN gets a page of its own and the leaf keeps the RUNs of keys 0-2,
+# whose growth on filtering then overflows it.
+step c_holes	{ DELETE FROM psr_left WHERE k = 3 AND id BETWEEN 14464 * 3 + 1 AND 14464 * 4; }
+step c_vacuum_holes	{ VACUUM (INDEX_CLEANUP ON) psr_left; }
+step c_before	{ SELECT container_pages FROM lion_index_stats('psr_left_k'); }
+step c_cut		{ SELECT psr_insert_until_error('psr_left'); }
+step c_after_cut {
+	SELECT * FROM psr_landed('psr_left');
+	SELECT container_pages FROM lion_index_stats('psr_left_k');
+}
+step c_delete	{ DELETE FROM psr_left WHERE k = 1 AND id % 30 IN (1, 3) AND id <= 14464 * 3; }
+step c_vacuum	{ VACUUM (INDEX_CLEANUP ON) psr_left; }
+step c_check	{
+	SELECT container_pages FROM lion_index_stats('psr_left_k');
+	SELECT lion_index_verify('psr_left_k', true);
+	SELECT * FROM psr_counts('psr_left', 1);
+	SELECT * FROM psr_counts('psr_left', 2);
+}
+
 permutation
 	a_fill split_breaks a_cut split_works a_append a_check
 	b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut
 	b_delete b_vacuum b_check
+	c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut
+	c_delete c_vacuum c_check
