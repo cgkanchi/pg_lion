@@ -616,6 +616,34 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- the other order deadlocked with `LOCK TABLE t; DROP INDEX t_k` in another session. Key
         -- values appear in a "not indexed" report only when the CALLER is a superuser, which is
         -- decided before the switch: asked afterwards, superuser() answers for the owner.
+        -- LOCKING: ShareLock on the table, then on the index - bt_index_parent_check()'s locks, for
+        -- bt_index_parent_check()'s reason. verify() is a parent check: it compares each level of
+        -- the directory and of every posting tree with the WHOLE level below it, and proves every
+        -- block reachable exactly once, and none of that holds between pages read at different
+        -- moments while writers split them. It ran under AccessShareLock and one page lock at a
+        -- time until the 2026-09-25 review, and a loop of inserts that split the directory made
+        -- 11 of 20 calls report "the directory points at block 733, but the index has only 732
+        -- blocks" about a sound index (the block count was taken before a split extended it; a
+        -- level walked before a split and its parent walked after it, or a page allocated after
+        -- the walk passed it, would have been next). Making each comparison tolerate growth was
+        -- the alternative, and it stops at reachability: an unreferenced live page is a leak or a
+        -- page a writer took from the FSM a moment ago, and without an LSN on unlogged pages
+        -- nothing tells the two apart. So verify() waits for the writers in flight, keeps INSERT,
+        -- UPDATE, DELETE, VACUUM and CREATE INDEX CONCURRENTLY out while it runs, and releases both
+        -- locks when it returns rather than at commit, as amcheck does. lion_index_stats() is
+        -- unaffected: it stays under AccessShareLock and concurrent.
+        -- DURING RECOVERY no lock above RowExclusiveLock can be taken, and replay takes no relation
+        -- locks anyway, so on a hot standby verify() takes AccessShareLock and reads an index that
+        -- replay may be changing. It re-reads the block count before calling a link out of range,
+        -- which covers the commonest case (a split replay has just extended the index with), but a
+        -- level comparison or the reachability pass can still report a change replay made while it
+        -- walked. Such a report is confirmed with replay paused (pg_wal_replay_pause(), then
+        -- pg_wal_replay_resume()); run on a quiet standby, as test/recovery/run.sh does, the check
+        -- is exact.
+        -- test/isolation/verify_concurrent.spec parks verify() after it has read the meta page
+        -- (injection point 'lion-verify-meta-read') and shows a directory-splitting INSERT waiting
+        -- for it, a writer in flight being waited for, and `LOCK TABLE; DROP INDEX` in another
+        -- transaction going through while verify() waits for the table.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
 
 ## 8. Module ownership
