@@ -555,6 +555,22 @@ SELECT lion_index_count('lion_cnt', 0);
 CREATE TABLE lion_cnt_other (k int4);
 CREATE INDEX lion_cnt_other_k ON lion_cnt_other USING lion (k);
 SELECT lion_index_count('lion_cnt_c10', 0, 'lion_cnt_other_k', 0);
+-- a materialized view created WITH NO DATA: its heap and indexes are empty,
+-- and the query refuses to run; so does every count through it, rather than
+-- answering 0 (2026-09-25 review)
+CREATE MATERIALIZED VIEW lion_cnt_mv AS
+SELECT i % 10 AS k FROM generate_series(1, 1000) i WITH NO DATA;
+CREATE INDEX lion_cnt_mv_k ON lion_cnt_mv USING lion (k);
+SELECT count(*) FROM lion_cnt_mv WHERE k = 1;
+SELECT lion_index_count('lion_cnt_mv_k', 1);
+SELECT lion_index_count('lion_cnt_mv_k', 1, 'lion_cnt_mv_k', 2);
+SELECT count FROM lion_index_count_stats('lion_cnt_mv_k', 1);
+SELECT lion_index_count_any('lion_cnt_mv_k', ARRAY[1, 2]);
+SELECT groups FROM lion_index_count_group_stats('lion_cnt_mv_k');
+REFRESH MATERIALIZED VIEW lion_cnt_mv;
+SELECT lion_ccmp('lion_cnt_mv_k', 'lion_cnt_mv', 'k', '1');
+SELECT lion_index_count_any('lion_cnt_mv_k', ARRAY[1, 2]) AS count_any;
+DROP MATERIALIZED VIEW lion_cnt_mv;
 /*
  * Indexes that exist but that this transaction may not use (2026-09-20
  * review, finding 2).  A direct SQL count was handed an index nobody vetted,

@@ -850,7 +850,11 @@ the lookup is made as and what the EXECUTE check names the equality by (enum_eq,
 test/sql/security_exec.sql). `lion_index_count_any()` resolves its array's element type the same way.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
-entry's meaning and used to be hashed and compared as if it did.
+entry's meaning and used to be hashed and compared as if it did. All of them refuse a materialized
+view created WITH NO DATA with core's error ("has not been populated"), as ExecOpenScanRelation()
+refuses the query, between the privilege checks and the EXECUTE checks where the executor raises it;
+its heap and indexes are empty, so the count used to answer 0 (2026-09-25 review; the pushdown node
+already refused it).
 Nobody vetted the index they were handed, so they also make the decision the planner makes in
 get_relation_info() before looking anything up: `lion_index_usable(index, snapshot, &why)` (lion.h,
 implemented in lion_pages.c, shared with lion_index_verify's heapallindexed pass) requires

@@ -5988,6 +5988,22 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	}
 
 	/*
+	 * A materialized view created WITH NO DATA has an empty heap and empty
+	 * indexes, so every count through them was 0 - where the query the count
+	 * stands for refuses to run at all (2026-09-25 review).  Refuse as
+	 * ExecOpenScanRelation() does, and where the executor does: after the
+	 * range table's privileges, before the scan's quals and the aggregate are
+	 * initialised and their functions checked.  The pushdown node makes the
+	 * same check (lion_begin_custom_scan()).
+	 */
+	if (!RelationIsScannable(call->heap))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("materialized view \"%s\" has not been populated",
+						RelationGetRelationName(call->heap)),
+				 errhint("Use the REFRESH MATERIALIZED VIEW command.")));
+
+	/*
 	 * The query also CALLS count() and the equality the key is looked up
 	 * with, so the count asks for EXECUTE on both, as the executor would of
 	 * that query (2026-09-23 review).  `col = key` is strategy 1 of the key
