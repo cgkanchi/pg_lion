@@ -2098,239 +2098,379 @@ lion_chain_put_container(Relation index, Relation heaprel, Buffer entrybuf,
 }
 
 /*
- * Move an INLINE entry's payload onto a chain of container pages and turn it
- * into a CHAIN entry.
+ * The INLINE -> CHAIN spill (DESIGN.md §4, §5 INSERT step 3 and VACUUM step
+ * 2, §18, §22).
  *
- * entry is a private copy of the entry tuple in its CHAIN shape (no payload,
- * with ncontainers and ntids already set by the caller); payload holds the
- * containers to write out, packed as in an INLINE payload.  The entry page is
- * held EXCLUSIVE by the caller and is rewritten here, in the same WAL record
- * as the last container page.
- */
-/*
- * How many LEAVES an INLINE payload needs once it is on container pages.
+ * An INLINE posting set moves onto container pages when it outgrows its
+ * entry, and two callers do that with payloads of very different sizes:
  *
- * This has to agree exactly with the packing loop below, because the answer
- * decides whether the page the entry's `head` names is the single leaf or the
- * ROOT above several of them - and a root has to be allocated BEFORE the
- * leaves, since every page of a posting set is stamped with the root's block
- * (DESIGN.md §18, §22).  An inline payload is at most `inline_limit` bytes and
- * the smallest item is ten, so this is at most two in practice; the loop is
- * written for any number anyway.
+ *	- an INSERT spills the payload it FOUND, which is at most inline_limit
+ *	  bytes and therefore always fits one leaf;
+ *	- VACUUM spills the payload it has just FILTERED, and removing members
+ *	  can make a payload grow by an order of magnitude.  A clustered key's
+ *	  RUN container is a few hundred bytes for 64 heap pages of rows; the
+ *	  same container with a tenth of them gone at random is a 4104-byte
+ *	  BITSET, and two of those do not fit one page.  A 4 KB payload of such
+ *	  containers needs a leaf per container: seven for a 300,000-row table of
+ *	  three keys, eleven for 150,000 rows of one key with every other row
+ *	  deleted.
+ *
+ * This code used to allocate every leaf before its first record and refused
+ * anything past four as "unreachable" - which it is for an INSERT - so every
+ * VACUUM of such a table failed, and failed again the next time, autovacuum
+ * and the anti-wraparound VACUUM included, until the failsafe gave up on
+ * index vacuuming (2026-09-25 review).  The number of leaves is bounded by
+ * the root now and by nothing else:
+ *
+ *	1. The ROOT is allocated first, because every page of a posting set is
+ *	   stamped with the root's block (§18) - and never from the free space
+ *	   map, which is what keeps owner_head an identity.  It stays pinned and
+ *	   EXCLUSIVE until the end.
+ *	2. Each LEAF is filled, linked to the next one and logged in a record of
+ *	   its own, which registers that one buffer.  The next leaf is allocated
+ *	   just before the record of the one in front of it - that record has to
+ *	   carry the rightlink, and an rmgr-mode record cannot allocate (§25) - so
+ *	   no more than two leaves are ever pinned.
+ *	3. The root's downlinks, ONE internal level (LION_SPILL_MAX_LEAVES says
+ *	   why one is always enough), go in with the rewritten entry in the LAST
+ *	   record, which registers two buffers.
+ *
+ * The entry changes in that last record and in no other, so it is INLINE
+ * until the whole posting set is on disk and CHAIN from the moment it is,
+ * never half of each.  A crash or an ERROR before the last record leaves
+ * behind leaves that nothing references, stamped with a root that was never
+ * written, and loses nothing: the entry still holds the payload it always
+ * held (for VACUUM, dead TIDs included, which the next VACUUM removes).
+ * Those leaves are NOT empty, which is how every other leak looks, so the
+ * leak sweep recognises them by their root instead: it is not a live root of
+ * their key (lion_posting_root_live(), lion_vacuum_sweep()).  An INSERT's
+ * spill is one record and cannot leave anything behind.
  */
-static int
-lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
-{
-	Size		off = 0;
-	Size		csize;
-	Size		used = 0;
-	int			n = 1;
 
+/*
+ * The most leaves a spill may write: as many downlinks as one page of pivots,
+ * the root, holds.  It is never the limit that binds.  A leaf takes at least
+ * one item, a spilled payload has no more items than the INLINE payload it
+ * came from (filtering drops items and never splits one), and that payload is
+ * at most LION_MAX_INLINE_LIMIT bytes of items that are each at least a
+ * header long: 512 items against 678 downlinks on an 8 KB page, and the
+ * assertion keeps it so for every block size the index supports.  The run-time
+ * check in lion_entry_spill() is for a payload that is corrupt.
+ */
+#define LION_SPILL_MAX_LEAVES \
+	((int) (LION_PAGE_CAPACITY / \
+			(MAXALIGN(LION_POSTING_PIVOT_SIZE) + sizeof(ItemIdData))))
+
+StaticAssertDecl(Min(LION_MAX_INLINE_LIMIT, LION_MAX_ENTRY_SIZE) / LION_CONTAINER_HDRSZ <=
+				 LION_PAGE_CAPACITY / (MAXALIGN(LION_POSTING_PIVOT_SIZE) + sizeof(ItemIdData)),
+				 "pg_lion: the downlinks of a spilled INLINE payload must fit one root page");
+
+/*
+ * Where the leaf that starts at byte `off` of an INLINE payload ends: the
+ * offset just past the last item an empty leaf takes, counted exactly as
+ * PageAddItemExtended() packs them (MAXALIGNed, one line pointer each).
+ * *more says whether an item follows, i.e. whether another leaf is needed.
+ *
+ * A leaf always takes its first item - none is larger than
+ * LION_CONTAINER_MAX_SIZE, which an empty page holds - so every call makes
+ * progress.
+ */
+static Size
+lion_spill_leaf_end(const char *payload, Size paylen, Size off,
+					LionContainer *cbuf, bool *more)
+{
+	Size		used = 0;
+	Size		end = off;
+	Size		csize;
+
+	*more = false;
 	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
 	{
 		Size		need = MAXALIGN(csize) + sizeof(ItemIdData);
 
 		if (used > 0 && used + need > (Size) LION_PAGE_CAPACITY)
 		{
-			n++;
-			used = 0;
+			*more = true;
+			break;
 		}
 		used += need;
+		end = off;
+	}
+
+	return end;
+}
+
+/*
+ * How many LEAVES an INLINE payload needs once it is on container pages.
+ *
+ * It decides whether the page the entry's `head` names is the single leaf or
+ * the ROOT above several of them, and a root has to be allocated before the
+ * first leaf is written, since every page of a posting set carries the root's
+ * block (DESIGN.md §18, §22).  It is lion_spill_leaf_end() run to the end of
+ * the payload, which is also what the fill loop in lion_entry_spill() runs,
+ * so the two agree by construction.
+ */
+static int
+lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
+{
+	Size		off = 0;
+	bool		more = true;
+	int			n = 0;
+
+	while (more)
+	{
+		off = lion_spill_leaf_end(payload, paylen, off, cbuf, &more);
+		n++;
 	}
 
 	return n;
 }
 
 /*
- * The most leaves a spill can need.  An INLINE payload is at most
- * LION_MAX_ENTRY_SIZE bytes and a leaf holds LION_PAGE_CAPACITY, so two is
- * already unreachable; the limit exists because DESIGN.md §25 requires every
- * page to be ALLOCATED before the first record opens (an rmgr-mode record runs
- * in a critical section), and an unbounded number of pinned buffers is not
- * something to discover at run time.
+ * Put the items of payload[off, end) on a leaf the open record has just
+ * initialised, log them, and set the leaf's minckey/maxckey.
+ * lion_spill_leaf_end() chose `end` so that they fit, so a failure here is a
+ * bug - a PANIC in rmgr mode, where the record is a critical section.
  */
-#define LION_SPILL_MAX_LEAVES	4
+static void
+lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
+					 Size off, Size end, LionContainer *cbuf)
+{
+	Size		csize;
 
+	while ((csize = lion_inline_fetch(payload, end, &off, cbuf)) > 0)
+	{
+		OffsetNumber noff = PageAddItemExtended(page, cbuf, csize,
+												InvalidOffsetNumber, 0);
+
+		if (noff == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to spill a container onto a new leaf");
+		lion_wal_op(xstate, page, LION_OP_ADD, noff, 0, cbuf, csize);
+	}
+	lion_page_update_minmax(page);
+}
+
+/*
+ * Turn the caller's private copy of the entry into its CHAIN shape, for the
+ * record that writes it.
+ *
+ * Only the INLINE/CHAIN half of the flags changes: a reserved entry (NULL-key,
+ * §14, or empty-key, §17) stays the reserved entry it was once its payload
+ * moves to a chain.  Losing a reserved bit here would leave a key-less entry
+ * that lion_find_reserved_entry() no longer finds and that every other reader
+ * takes for an ordinary entry with a zero-length key, so the next row of that
+ * kind would start a second entry.
+ */
+static void
+lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
+{
+	entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
+	entry->head = root;
+	entry->tail = tail;
+}
+
+/*
+ * Move an INLINE entry's payload onto container pages and turn it into a
+ * CHAIN entry (see the comment above LION_SPILL_MAX_LEAVES).
+ *
+ * entry is a private copy of the entry tuple in its CHAIN shape (no payload,
+ * with ncontainers and ntids already set by the caller); payload holds the
+ * containers to write out, packed as in an INLINE payload.  The entry page is
+ * held EXCLUSIVE by the caller (a cleanup lock, when VACUUM calls) and is
+ * rewritten here, in the last record.
+ */
 void
 lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 				OffsetNumber entryoff, LionEntryTuple *entry,
 				const char *payload, Size paylen)
 {
 	LionWalState *xstate;
-	Buffer		headbuf;
-	Page		headpage;
-	Buffer		leafbuf[LION_SPILL_MAX_LEAVES];
-	BlockNumber leafblk[LION_SPILL_MAX_LEAVES];
+	Buffer		rootbuf;
+	Page		rootpage;
+	BlockNumber root;
 	LionContainer *cbuf;
-	LionPostingPivot pivots[LION_SPILL_MAX_LEAVES];
-	BlockNumber head;
+	LionPostingPivot *pivots;
+	Buffer		leafbuf;
+	BlockNumber tail = InvalidBlockNumber;
 	Size		off = 0;
-	Size		csize;
 	int			nleaves;
-	int			cur;
-	bool		multi;
 	int			i;
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	nleaves = lion_spill_count_leaves(payload, paylen, cbuf);
-	multi = (nleaves > 1);
 
 	if (nleaves > LION_SPILL_MAX_LEAVES)
-		elog(ERROR, "lion index \"%s\": an inline payload of %zu bytes needs %d container pages",
+		elog(ERROR, "lion index \"%s\": an inline payload of %zu bytes needs %d container pages, more than one root can link",
 			 RelationGetRelationName(index), paylen, nleaves);
 
 	/*
-	 * Every page this spill needs is taken HERE, before any record opens
-	 * (DESIGN.md §25).  The ROOT of a posting set is the one page this index
-	 * never recycles, so that root blocks come only from extending the
-	 * relation and no two sets can ever share one - which is what makes
-	 * owner_head an identity a reader can trust with nothing else in hand,
-	 * exactly the situation the count cursor is in (DESIGN.md §18).
+	 * The ROOT of a posting set is the one page this index never recycles, so
+	 * that root blocks come only from extending the relation and no two sets
+	 * can ever share one - which is what makes owner_head an identity a
+	 * reader can trust with nothing else in hand, exactly the situation the
+	 * count cursor is in (DESIGN.md §18).  It is taken before any record
+	 * opens (§25) and held EXCLUSIVE to the end, which is also what tells the
+	 * leak sweep that the leaves written below are not orphans while this
+	 * runs: it cannot lock their root.
 	 */
-	headbuf = lion_alloc_page(index, heaprel, false);
-	head = BufferGetBlockNumber(headbuf);
+	rootbuf = lion_alloc_page(index, heaprel, false);
+	root = BufferGetBlockNumber(rootbuf);
 
-	for (i = 0; i < (multi ? nleaves : 0); i++)
-	{
-		leafbuf[i] = lion_alloc_page(index, heaprel, true);
-		leafblk[i] = BufferGetBlockNumber(leafbuf[i]);
-	}
-
-	if (!multi)
+	if (nleaves == 1)
 	{
 		/*
-		 * One leaf, which IS the head: the whole spill is one record holding
-		 * the new page and the entry that starts pointing at it.
+		 * One leaf, which IS the root: the whole spill is one record holding
+		 * the new page and the entry that starts pointing at it.  Every spill
+		 * an INSERT makes is this one.
 		 */
 		xstate = lion_wal_begin(index);
-		headpage = lion_wal_init_buffer(xstate, headbuf, LION_PAGE_CONTAINER);
-		lion_page_set_owner(headpage, entry->hash, head);
+		rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
+		lion_page_set_owner(rootpage, entry->hash, root);
+		lion_spill_fill_leaf(xstate, rootpage, payload, 0, paylen, cbuf);
+		lion_wal_log_special(xstate, rootpage);
 
-		while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
-		{
-			OffsetNumber noff = PageAddItemExtended(headpage, cbuf, csize,
-													InvalidOffsetNumber, 0);
-
-			if (noff == InvalidOffsetNumber)
-				elog(ERROR, "lion index: failed to spill container to page %u",
-					 head);
-			lion_wal_op(xstate, headpage, LION_OP_ADD, noff, 0, cbuf, csize);
-		}
-		lion_page_update_minmax(headpage);
-		lion_wal_log_special(xstate, headpage);
-
-		entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
-		entry->head = head;
-		entry->tail = head;
+		lion_spill_set_chain(entry, root, root);
 		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 
-		UnlockReleaseBuffer(headbuf);
+		UnlockReleaseBuffer(rootbuf);
 		pfree(cbuf);
 		return;
 	}
 
 	/*
-	 * Several leaves.  Each one is filled and linked to its successor in a
-	 * record of its own - the block numbers are all known, because the pages
-	 * were allocated above - and the ROOT that names them goes in with the
-	 * entry, last.  A crash before that last record leaks the leaves, which
-	 * is what §18 already says about a crash in the middle of a whole-chain
-	 * free: they are unreferenced, the entry still describes the INLINE
-	 * payload it always did, and the next VACUUM's sweep collects them.
+	 * Several leaves, left to right, one record each.  Where each one ends is
+	 * decided before its record opens, and so is its right sibling, which is
+	 * allocated then: nothing fallible happens inside a record (§25), and a
+	 * leaf is linked to a page that exists the moment it is written.
 	 */
-	cur = 0;
-	xstate = lion_wal_begin(index);
-	{
-		Page		curpage = lion_wal_init_buffer(xstate, leafbuf[0],
-												   LION_PAGE_CONTAINER);
+	pivots = (LionPostingPivot *) palloc(sizeof(LionPostingPivot) * nleaves);
+	leafbuf = lion_alloc_page(index, heaprel, true);
 
-		lion_page_set_owner(curpage, entry->hash, head);
-
-		while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
-		{
-			OffsetNumber noff;
-
-			if (PageGetFreeSpace(curpage) < MAXALIGN(csize))
-			{
-				Assert(cur + 1 < nleaves);
-				lion_page_update_minmax(curpage);
-				LionPageGetOpaque(curpage)->rightlink = leafblk[cur + 1];
-				pivots[cur].ckey = LionPageGetOpaque(curpage)->minckey;
-				pivots[cur].child = leafblk[cur];
-				lion_wal_log_special(xstate, curpage);
-				lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
-				UnlockReleaseBuffer(leafbuf[cur]);
-
-				cur++;
-				xstate = lion_wal_begin(index);
-				curpage = lion_wal_init_buffer(xstate, leafbuf[cur],
-											   LION_PAGE_CONTAINER);
-				lion_page_set_owner(curpage, entry->hash, head);
-			}
-
-			noff = PageAddItemExtended(curpage, cbuf, csize,
-									   InvalidOffsetNumber, 0);
-			if (noff == InvalidOffsetNumber)
-				elog(ERROR, "lion index: failed to spill container to page %u",
-					 leafblk[cur]);
-			lion_wal_op(xstate, curpage, LION_OP_ADD, noff, 0, cbuf, csize);
-		}
-
-		lion_page_update_minmax(curpage);
-		pivots[cur].ckey = LionPageGetOpaque(curpage)->minckey;
-		pivots[cur].child = leafblk[cur];
-		lion_wal_log_special(xstate, curpage);
-		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
-		UnlockReleaseBuffer(leafbuf[cur]);
-	}
-
-	/*
-	 * A leaf the packing did not need after all goes straight back: nothing
-	 * was written to it, so there is nothing to log and nothing to undo.
-	 * lion_spill_count_leaves() agrees with the loop above by construction,
-	 * so this is the belt to its braces - and it is the shape DESIGN.md §25
-	 * requires, since a page cannot be allocated inside the record any more.
-	 */
-	for (i = cur + 1; i < nleaves; i++)
-		lion_release_unused_page(index, leafbuf[i]);
-	nleaves = cur + 1;
-
-	/*
-	 * Only the INLINE/CHAIN half of the flags changes: a reserved entry
-	 * (NULL-key, §14, or empty-key, §17) stays the reserved entry it was once
-	 * its payload moves to a chain.  Losing a reserved bit here would leave a
-	 * key-less entry that lion_find_reserved_entry() no longer finds and that
-	 * every other reader takes for an ordinary entry with a zero-length key,
-	 * so the next row of that kind would start a second entry.
-	 */
-	entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
-	entry->head = head;
-	entry->tail = leafblk[nleaves - 1];
-
-	/* The root's downlinks and the entry, in one last record. */
-	xstate = lion_wal_begin(index);
-	headpage = lion_wal_init_buffer(xstate, headbuf, LION_PAGE_CONTAINER);
-	LionPageGetOpaque(headpage)->level = 1;
-	lion_page_set_owner(headpage, entry->hash, head);
-	pivots[0].ckey = 0;			/* the leftmost downlink is minus infinity */
 	for (i = 0; i < nleaves; i++)
 	{
-		OffsetNumber noff = PageAddItemExtended(headpage, (char *) &pivots[i],
+		Buffer		nextbuf = InvalidBuffer;
+		BlockNumber leafblk = BufferGetBlockNumber(leafbuf);
+		Page		leafpage;
+		Size		end;
+		bool		more;
+
+		end = lion_spill_leaf_end(payload, paylen, off, cbuf, &more);
+		if (more != (i + 1 < nleaves))
+			elog(ERROR, "lion index \"%s\": a spilled payload of %zu bytes does not pack the way it was counted",
+				 RelationGetRelationName(index), paylen);
+		if (more)
+			nextbuf = lion_alloc_page(index, heaprel, true);
+
+		xstate = lion_wal_begin(index);
+		leafpage = lion_wal_init_buffer(xstate, leafbuf, LION_PAGE_CONTAINER);
+		lion_page_set_owner(leafpage, entry->hash, root);
+		lion_spill_fill_leaf(xstate, leafpage, payload, off, end, cbuf);
+		if (more)
+			LionPageGetOpaque(leafpage)->rightlink = BufferGetBlockNumber(nextbuf);
+		lion_wal_log_special(xstate, leafpage);
+
+		/* The leftmost downlink is minus infinity (DESIGN.md §22). */
+		pivots[i].ckey = (i == 0) ? 0 : LionPageGetOpaque(leafpage)->minckey;
+		pivots[i].child = leafblk;
+		tail = leafblk;
+
+		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+
+		UnlockReleaseBuffer(leafbuf);
+		leafbuf = nextbuf;
+		off = end;
+	}
+	Assert(!BufferIsValid(leafbuf));
+
+	/*
+	 * Test hook: every leaf is written and logged, nothing references any of
+	 * them, and the entry is still the INLINE entry it was.  An ERROR or a
+	 * crash here is the leak the sweep recovers
+	 * (test/isolation/vacuum_spill_interrupted.spec).  Compiles to nothing
+	 * without --enable-injection-points.
+	 */
+	LION_INJECTION_POINT("lion-spill-leaves-written");
+
+	/* The root's downlinks and the entry, in one last record. */
+	lion_spill_set_chain(entry, root, tail);
+	xstate = lion_wal_begin(index);
+	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
+	LionPageGetOpaque(rootpage)->level = 1;
+	lion_page_set_owner(rootpage, entry->hash, root);
+	for (i = 0; i < nleaves; i++)
+	{
+		OffsetNumber noff = PageAddItemExtended(rootpage, &pivots[i],
 												LION_POSTING_PIVOT_SIZE,
 												InvalidOffsetNumber, 0);
 
 		if (noff == InvalidOffsetNumber)
 			elog(ERROR, "lion index: failed to build the root of a spilled posting set");
-		lion_wal_op(xstate, headpage, LION_OP_ADD, noff, 0, &pivots[i],
+		lion_wal_op(xstate, rootpage, LION_OP_ADD, noff, 0, &pivots[i],
 					LION_POSTING_PIVOT_SIZE);
 	}
-	lion_wal_log_special(xstate, headpage);
+	lion_wal_log_special(xstate, rootpage);
 	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
-	UnlockReleaseBuffer(headbuf);
+	UnlockReleaseBuffer(rootbuf);
 
+	pfree(pivots);
 	pfree(cbuf);
+}
+
+/*
+ * Does `head` name the LIVE root of a posting set whose key hashes to `hash`?
+ *
+ * The leak sweep asks this about the owner stamp of a non-empty leaf that no
+ * entry references (DESIGN.md §18) and frees the leaf when the answer is no,
+ * so "no" must never be said of a page of a set that exists - while it is the
+ * right answer for the leaves an interrupted spill leaves behind, whose root
+ * was never written.
+ *
+ * Live means what the readers' owner check means: the page at `head` is a
+ * container page, not DELETED, and stamped with (hash, head) itself.  Only a
+ * ROOT carries its own block as owner_head, and a block is a root at most
+ * once in the life of the index (lion_entry_spill() takes roots with reuse =
+ * false), so:
+ *
+ *	- every page of a set that exists names a root that passes: its own set's,
+ *	  which stays live until the entry is gone and the set is freed;
+ *	- a spill that is still writing holds its root EXCLUSIVE from before it
+ *	  stamps its first leaf until the root is written, so the lock below
+ *	  waits for it (wait = true) or fails and answers "live" (wait = false);
+ *	- a root seen under that lock unwritten, DELETED, or stamped for another
+ *	  set (its block recycled) stays that way for every leaf stamped with it:
+ *	  the spill that stamped the leaf ended without writing the root, and
+ *	  nothing will make that block a root again.
+ *
+ * With wait = false the only lock taken is a conditional one, so the caller
+ * may hold other buffer locks (the sweep holds the leaf's cleanup lock); with
+ * wait = true it must hold none.  A block past the end of the relation - a
+ * root whose extension a crash undid - is not live.
+ */
+bool
+lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
+{
+	Buffer		buf;
+	bool		live;
+
+	if (!BlockNumberIsValid(head) || head == LION_METAPAGE_BLKNO ||
+		head >= RelationGetNumberOfBlocks(index))
+		return false;
+
+	buf = ReadBuffer(index, head);
+	if (wait)
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+	else if (!ConditionalLockBuffer(buf))
+	{
+		ReleaseBuffer(buf);
+		return true;			/* busy: somebody is writing it, keep it */
+	}
+
+	live = lion_page_owns_entry(BufferGetPage(buf), hash, head);
+	UnlockReleaseBuffer(buf);
+
+	return live;
 }
 
 /*

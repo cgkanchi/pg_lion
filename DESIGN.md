@@ -453,6 +453,18 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    inside inline_limit can still overflow LION_MAX_ENTRY_SIZE (an ARRAY that a 2030-member deletion
    made out of a RUN, say), and VACUUM tested inline_limit alone and failed on it every run until
    the 2026-09-23 review.
+   The growth is not bounded by inline_limit either, only by the number of items the payload had:
+   a clustered key's RUN container is a few hundred bytes for 64 heap pages of rows, and with a
+   tenth of those rows deleted at random it is a 4104-byte BITSET, two of which never share a page.
+   So VACUUM's spill may need a LEAF PER CONTAINER - seven for a key of a 300,000-row table of three,
+   eleven for 150,000 rows of one key with every other row gone - and `lion_entry_spill()` writes
+   as many as it takes: a record per leaf, each leaf allocated just before the record of the one in
+   front of it (which has to carry its rightlink), then the posting tree's root and the entry
+   together in a last record (§18, "The spill"). It used to allocate every leaf up front and
+   refused more than four as unreachable, which it is for an INSERT, whose payload is within
+   inline_limit and always fits one leaf; for VACUUM it meant that the table's every VACUUM failed,
+   autovacuum's and the anti-wraparound one's included, until the failsafe stopped vacuuming
+   indexes at all (2026-09-25 review).
    CHAIN → walk the posting tree's leaves, left to right from the leftmost one; each leaf is locked
    with LockBufferForCleanup (this is the
    interlock that phase 2 relies on: a heap-skipping reader keeps the page pinned while it consults
@@ -2451,8 +2463,8 @@ the padding is self-describing; verify() bounds it and checks that every byte of
 **One record per bucket page.** Pass 1 collects every INLINE entry of a bucket page that changed and
 writes them all in a single GenericXLog record.  Entry offsets survive PageIndexTupleOverwrite(), so
 the writes do not disturb each other.  A payload that outgrew its entry still spills onto container
-pages in a record of its own (rare: it needs a RUN container to become a BITSET while losing
-members).
+pages in records of its own (rare: it needs a RUN container to become a BITSET while losing
+members; "The spill" below says how many records).
 
 **Entry deletion.** An entry with ntids = 0 and ncontainers = 0 is deleted by VACUUM:
 - The deletion happens in a final step for that bucket page, after every chain of that page's
@@ -2511,12 +2523,50 @@ wants.  ambuild never reuses.  amvacuumcleanup calls IndexFreeSpaceMapVacuum(). 
 ambulkdelete keeps a bitmap of the blocks it accounted for - the meta page, every bucket page it
 walked, every container page it reached from a live entry, minus the ones it freed - and sweeps the
 rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into the FSM, and an
-unreferenced EMPTY container page becomes a DELETED one first.  In a healthy index nothing is
-unaccounted for, so the sweep reads no pages at all.  An empty container page of a LIVE chain is
-never mistaken for a leak, because pass 2 visits every page of every chain it found and a chain
-created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
-every page they allocate inside the record that allocates it, under the lock they hold throughout).
+unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
+leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
+below).  In a healthy index nothing is unaccounted for, so the sweep reads no pages at all.  A
+page of a LIVE set is never mistaken for a leak, because pass 2 visits every page of every chain
+it found, and a chain created after pass 1 read its bucket page has no empty page in it (a spill
+and a split both fill every page they allocate inside the record that allocates it, under the
+lock they hold throughout) and names a root that is live.
 stats report deleted_pages; pages_newly_deleted/pages_deleted/pages_free are reported to VACUUM.
+
+**The spill** (2026-09-25 review).  An INLINE posting set that outgrows its entry moves onto
+container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry by an order of
+magnitude (§5, VACUUM step 2), so `lion_entry_spill()` writes as many leaves as the payload needs:
+
+1. the ROOT first, with reuse = false and held EXCLUSIVE to the end - every page of a set is
+   stamped with its root's block, and a root block is never handed out twice (above);
+2. then each LEAF, filled, linked to the next one and logged in a record of its own that
+   registers that one buffer.  The next leaf is allocated just before the record of the one in
+   front of it, because that record carries the rightlink and a record may not allocate (§25), so
+   at most two leaves are pinned at any time;
+3. then the root's downlinks - ONE internal level: a leaf takes at least one item, a spilled
+   payload has no more items than the INLINE payload it came from, which is at most
+   LION_MAX_INLINE_LIMIT bytes of items of at least a header each, 512 against the 678 downlinks
+   an 8 KB root holds (a static assertion keeps it so) - and the rewritten entry, together, in the
+   LAST record.  A set that fits one leaf is that leaf and its entry in one record, which is every
+   spill an INSERT makes.
+
+The entry changes in the last record and in no other, so it is INLINE until the whole set is on
+disk and CHAIN from the moment it is, never half of each.  An ERROR or a crash before the last
+record loses nothing - the entry still holds the payload it held, dead TIDs included, which the
+next VACUUM removes - and leaves FULL leaves that nothing references, stamped with a root that was
+never written.  The spill's own comment promised that the next VACUUM's sweep collects those; it
+did not, because the sweep only ever freed EMPTY unreferenced leaves, so they stayed leaked for
+good.  The sweep now asks the leaf's ROOT (`lion_posting_root_live()`): a leaf is an orphan when
+the page at its owner_head is not a live container page stamped with that same (owner_hash,
+owner_head).  Every page of a set that exists passes - its root is live until the entry is gone
+and the set freed, and the whole-set free only frees EMPTY sets, whose leaves the sweep frees for
+being empty - and a spill that is still writing holds its root EXCLUSIVE, which the sweep's
+conditional lock reads as live.  A root seen unwritten, DELETED or stamped for another set under
+its lock stays that way for every leaf stamped with it, because the spill that stamped the leaf
+has ended and no block is a root twice.  lion_index_verify() reports such a leaf as the leak it
+is, with a WARNING, like an empty one (which extends what §4 says verify() tolerates).
+`test/isolation/vacuum_spill_interrupted.spec` stops a VACUUM's spill between the leaves and the
+root with an ERROR (injection point `lion-spill-leaves-written`), and `test/recovery/run.sh`
+phase 1e with a crash.
 
 **Hot standby.** Generic WAL cannot raise recovery conflicts - nbtree's XLOG_BTREE_REUSE_PAGE has no
 equivalent - so on a standby a reader holding a stale chain link could land on a page that replay has
@@ -4450,6 +4500,16 @@ VACUUM. Every record VACUUM writes is now one of: VACUUM_PAGE/ITEM_DELETE/
 PAGE_DELETED/ENTRY with its cleanup mark set by VACUUM itself, or a record of
 the shared placement code written inside a removal window (regrow, spill); the
 re-descent that finds a moved entry writes nothing.
+
+Since the 2026-09-25 review a spill VACUUM causes may write MANY records (§18,
+"The spill"): one per leaf, whose only block is the new leaf, and the root with
+the entry last. All of them are inside the window. A leaf record's first block
+is the leaf it initialises, so it is marked too and replays with
+RBM_ZERO_AND_CLEANUP_LOCK - a lock on a page nobody can have pinned, which
+costs nothing - and the first of them carries whatever barrier VACUUM has
+collected. That is before the removal, which is in the last record, and
+replay applies them in that order, so the barrier still comes first. Each
+record registers one or two buffers, whatever the number of leaves.
 
 **The standby BARRIER, and why the cleanup mask alone is not enough**
 (2026-09-22 review). ambulkdelete cleanup-locks every page that can hold a TID
