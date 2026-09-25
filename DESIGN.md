@@ -3072,7 +3072,15 @@ keys under a collation - held a pointer into freed memory; the order check read 
 and refused every index, and verify crashed. `rd_amcache` is now a HANDLE (`LionAmCache`) on a
 state allocated beside it in `rd_indexcxt`, so a flush frees only the handle and a pointer taken
 earlier stays valid - no longer the entry's current state, and the next `lion_get_index_state()`
-builds a new one, as it always did after a flush. And `lion_wal_mode()`, asked for when a record
+builds a new one, as it always did after a flush. That holds because a flush of an OPEN index entry
+with its support info loaded is, on every release from 16 to 20, the in-place reload
+(`RelationReloadIndexInfo()`: the index branch of 16's and 17's `RelationClearRelation()`, 18-20's
+`RelationRebuildRelation()`), which frees `rd_amcache` and keeps `rd_indexcxt`; the context goes
+only with the entry, in `RelationDestroyRelation()`, which asserts a reference count of zero. So the rule is that a state is valid
+while the caller holds the index open - every caller does, and none keeps one across
+`index_close()` - and a stale state is a correct one: its content is what was built, only no
+longer the entry's. A flush therefore leaves one state behind in `rd_indexcxt` per flush of an open
+index until the entry is destroyed, as it already did for the column states. And `lion_wal_mode()`, asked for when a record
 begins - in a split, with the meta page held EXCLUSIVE - rebuilt the state after a flush, which
 reads the meta page: a second lock on a buffer the backend already holds, an assertion failure on
 a cassert build and a wait for ever on a production one. The mode never changes for a

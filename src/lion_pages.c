@@ -533,12 +533,29 @@ lion_proc_has_sqlbody(Oid procoid)
  * pointer into freed memory: under debug_discard_caches the order check read
  * a garbage identity and refused every index, and verify() crashed.  With a
  * handle, the flush frees only the handle.  The state stays where it is, in
- * rd_indexcxt, for as long as the relcache entry lives, so a pointer taken
- * earlier stays valid - it is simply no longer the entry's current state,
- * and the next lion_get_index_state() builds a new one, as it always did
- * after a flush.  (The column states and FmgrInfos of a replaced state were
- * already left in rd_indexcxt before; now the 40-odd bytes of its header are
- * too.)
+ * rd_indexcxt, so a pointer taken earlier stays valid - it is simply no
+ * longer the entry's current state, and the next lion_get_index_state()
+ * builds a new one, as it always did after a flush.
+ *
+ * WHY rd_indexcxt OUTLIVES THE FLUSH, on every supported release: a flush of
+ * an index entry that is OPEN (rd_refcnt > 0) and has its index support
+ * loaded (rd_indexcxt != NULL) is always the in-place reload - 16's and
+ * 17's RelationClearRelation() take the index branch and return before the
+ * destroy/full-rebuild code, and 18-20's RelationRebuildRelation() calls
+ * RelationReloadIndexInfo() for exactly that case - and the reload frees
+ * rd_amcache and keeps rd_indexcxt.  The context is deleted only when the
+ * entry itself is destroyed (RelationDestroyRelation(), which asserts a
+ * reference count of zero on every one of those releases).  So
+ * the rule is: a state, or a column state, is valid for as long as the
+ * caller holds the index open, and every caller in this extension does - a
+ * scan through its IndexScanDesc, VACUUM and insert through the executor's
+ * open relation, the count node until lion_close_relation(), the SQL
+ * functions until they close it.  Nothing keeps one across an index_close().
+ *
+ * The cost: each flush of an open index leaves one state behind in
+ * rd_indexcxt until the relcache entry is destroyed.  That was already true
+ * of the column states and their FmgrInfos, which were never freed with the
+ * rd_amcache they hung off; the handle adds the header's few dozen bytes.
  */
 typedef struct LionAmCache
 {
