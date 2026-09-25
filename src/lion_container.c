@@ -318,15 +318,17 @@ bits_clear_range(uint64 *w, uint32 lo, uint32 hi)
 	w[whi] &= ~word_mask(0, hi & 63);
 }
 
-static uint32
+/*
+ * One pg_popcount() over the whole bitset rather than a pg_popcount64() per
+ * word: on x86-64 before PostgreSQL 19 pg_popcount64 is a function pointer,
+ * so the per-word loop made 512 indirect calls, where pg_popcount() makes
+ * one and runs the hardware instruction (or AVX-512) inside it.  Measured on
+ * PostgreSQL 18, x86-64 with POPCNT (2026-09-25): 768 ns -> 612 ns.
+ */
+static inline uint32
 bits_cardinality(const uint64 *w)
 {
-	uint32		n = 0;
-	uint32		i;
-
-	for (i = 0; i < LION_BITSET_WORDS; i++)
-		n += (uint32) pg_popcount64(w[i]);
-	return n;
+	return (uint32) pg_popcount((const char *) w, LION_BITSET_BYTES);
 }
 
 static uint32
@@ -359,6 +361,11 @@ bits_count_runs(const uint64 *w)
 	uint64		prev = 0;
 	uint32		i;
 
+	/*
+	 * Word by word, not an image of the run starts counted by one
+	 * pg_popcount() as bits_cardinality() does: writing the 4 KB image cost
+	 * more than the calls it saved (1.22 us against 0.92, 2026-09-25).
+	 */
 	for (i = 0; i < LION_BITSET_WORDS; i++)
 	{
 		uint64		cur = w[i];
@@ -1513,6 +1520,15 @@ lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 					}
 					next = last + 1;
 				}
+
+				/*
+				 * Nothing removed, which is VACUUM's common case: the runs
+				 * are what they were, and rebuilding them from the image
+				 * would only write the same bytes back (two passes over the
+				 * 4 KB image and a copy).
+				 */
+				if (removed == 0)
+					return 0;
 				container_rebuild(c, w, kept);
 				break;
 			}
@@ -2137,17 +2153,24 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 	if (a->cardinality == 0 || b->cardinality == 0)
 		return 0;
 
-	/* BITSET x BITSET: popcount of the ANDed words, nothing materialised */
+	/*
+	 * BITSET x BITSET: AND into a local image, then one popcount of it
+	 * (bits_cardinality()).  Popcounting the ANDed words one at a time
+	 * materialised nothing but made 512 indirect calls on x86-64 before
+	 * PostgreSQL 19; the AND loop vectorizes and the image is 4 KB of stack.
+	 * 920 ns -> 837 ns on the machine bits_cardinality() was measured on; a
+	 * review measured 2.3 - 3.8 us -> 1.2 us on another.
+	 */
 	if (a->type == LION_CT_BITSET && b->type == LION_CT_BITSET)
 	{
 		const uint64 *wa = bitset_cdata(a);
 		const uint64 *wb = bitset_cdata(b);
-		uint32		card = 0;
+		uint64		w[LION_BITSET_WORDS];
 		uint32		i;
 
 		for (i = 0; i < LION_BITSET_WORDS; i++)
-			card += (uint32) pg_popcount64(wa[i] & wb[i]);
-		return card;
+			w[i] = wa[i] & wb[i];
+		return bits_cardinality(w);
 	}
 
 	if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
