@@ -1167,6 +1167,55 @@ COMMIT;
 RESET hash_mem_multiplier;
 RESET work_mem;
 DROP TABLE lwalk;
+-- 17. A clause the btree and a lion index both answer is priced once
+--     (DESIGN.md §30.3): the walk of (g, k) under g = 5 meets only g = 5
+--     entries, every one a member, so the node is a plain index scan plus
+--     the lion lookups, and must not beat bitmap + Sort on a price that
+--     counted g = 5 twice (2026-09-25 second review: it did, at a hundredth
+--     of the fetches).  With a lion clause the btree does not answer, it
+--     still wins.
+CREATE TABLE ldbl (id int PRIMARY KEY, g int, h int, k int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO ldbl SELECT i, i % 100, i % 7, (i * 7919) % 100003, repeat('x', 60)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX ldbl_gk ON ldbl (g, k);
+CREATE INDEX ldbl_g ON ldbl USING lion (g);
+CREATE INDEX ldbl_h ON ldbl USING lion (h);
+VACUUM ANALYZE ldbl;
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 ORDER BY k');
+              lion_ord_plan              
+-----------------------------------------
+ Sort
+   Sort Key: k
+   ->  Bitmap Heap Scan on ldbl
+         Recheck Cond: (g = 5)
+         ->  Bitmap Index Scan on ldbl_g
+               Index Cond: (g = 5)
+(6 rows)
+
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
+              lion_ord_plan               
+------------------------------------------
+ Limit
+   ->  Custom Scan (LionOrdered) on ldbl
+         Ordered By: ldbl_gk
+         Index Cond: (g = 5)
+         Lion Cond: ((g = 5) AND (h = 3))
+         Lion Indexes: ldbl_g, ldbl_h
+(6 rows)
+
+SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 ORDER BY k');
+        lion_ord        
+------------------------
+ LionOrdered, 1000 rows
+(1 row)
+
+SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
+       lion_ord       
+----------------------
+ LionOrdered, 10 rows
+(1 row)
+
+DROP TABLE ldbl;
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;
 REVOKE SELECT ON lo FROM lion_ord_user;

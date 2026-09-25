@@ -555,10 +555,14 @@ lo_residual(List *rinfos, IndexPath *ord, List *lionrinfos, List *lionqual)
  */
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-		List *residual, Cost *startup_p, Cost *total_p, double *setbytes)
+		List *lionrinfos, List *residual, Cost *startup_p, Cost *total_p,
+		double *setbytes)
 {
 	Cost		lioncost;
 	Selectivity sel;
+	Selectivity selwalk;
+	List	   *shared = NIL;
+	ListCell   *lc;
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
 	double		members;
@@ -588,8 +592,34 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	walked = clamp_row_est(ord->indexselectivity * tuples);
 	run = ord->indextotalcost + walked * cpu_operator_cost;
 
-	/* the members' heap fetches, priced as cost_index() prices them */
-	fetched = clamp_row_est(walked * sel);
+	/*
+	 * The members' heap fetches, priced as cost_index() prices them: of the
+	 * entries walked, the share the lion access selects BEYOND what the
+	 * ordered index's own quals already did.  A clause both of them answer -
+	 * `g = 5` over a btree on (g, k) and a lion index on g - was counted
+	 * twice: the walk meets only g = 5 entries, every one a member, yet the
+	 * fetches were priced at 1% of them, and the node (a plain index scan
+	 * plus the lion lookups) beat a bitmap scan and Sort that the planner's
+	 * own price for that index scan had rejected, 721 against 13,909 on 1M
+	 * rows (2026-09-25 second review).
+	 */
+	foreach(lc, ord->indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+
+		if (list_member_ptr(lionrinfos, iclause->rinfo))
+			shared = lappend(shared, iclause->rinfo);
+	}
+	selwalk = sel;
+	if (shared != NIL)
+	{
+		Selectivity both = clauselist_selectivity(root, shared, rel->relid,
+												  JOIN_INNER, NULL);
+
+		if (both > 0)
+			selwalk = Min(sel / both, 1.0);
+	}
+	fetched = clamp_row_est(walked * selwalk);
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	{
 		Cost		s;
@@ -774,8 +804,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			Cost		total;
 			double		setbytes;
 
-			lo_cost(root, rel, ord, lion, residual, &startup, &total,
-					&setbytes);
+			lo_cost(root, rel, ord, lion, lionrinfos, residual, &startup,
+					&total, &setbytes);
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
 

@@ -6261,8 +6261,16 @@ ordered path's selectivity `s_o` (the fraction of the index its own quals leave)
   `index_pages_fetched()` at `random_page_cost` for an uncorrelated order, the members' share of
   the heap for a correlated one, interpolated by the square of the ordered index's correlation
   (asked of its own `amcostestimate`); plus `cpu_tuple_cost` and the filter's per-tuple cost for
-  each of the `F`, and the target's cost per output row;
+  each of the `F`, and the target's cost per output row. A clause that is both one of the ordered
+  index's index clauses and a lion AND-path leaf's (`g = 5` over a btree on `(g, k)` and a lion
+  index on `g`) is counted once: `s` is divided by its selectivity, since the walk already met
+  only entries that satisfy it;
 - **total** = start-up + walk + heap; rows = `rel->rows`.
+
+*(Fixed 2026-09-25, second review: `F` was `s_o T s` whatever the two sides shared, so for
+`WHERE g = 5 ORDER BY k` over those two indexes the walk's 10,100 members were priced as 102
+fetches, and the node - a plain index scan of `(g, k)` plus the lion lookups - cost 721 against
+13,909 for the bitmap scan and Sort that the planner had preferred to that same index scan.)*
 
 Core's LIMIT planning scales a path's run cost by the fraction of its rows the LIMIT takes
 (`adjust_limit_rows_costs()`), which is exactly how the node behaves: the walk and the fetches stop
@@ -6538,7 +6546,9 @@ before the switch, a btree qual beside it, and a LATERAL rescan - each compared 
 ordinary plan, with the switch shown by EXPLAIN ANALYZE.
 Added with the second review's fixes, each failing before its fix: a range over 15,000 distinct
 values at a 64 kB hash_mem, whose set must stay exact, and whose `LionOrdered set` memory context,
-read while a cursor is paused after the build, must hold no more than hash_mem.
+read while a cursor is paused after the build, must hold no more than hash_mem; and `g = 5 ORDER BY
+k` over a btree on `(g, k)` and a lion index on `g`, where the plan must not be the node (§30.3),
+beside `g = 5 AND h = 3 ... LIMIT 10`, where it still is.
 `make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
 orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
 
