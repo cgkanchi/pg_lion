@@ -2353,6 +2353,23 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
  *
  * The ROOT is split by pushing it down instead, so that the root block - the
  * entry's `head`, and the owner stamp of every page of the set - never moves.
+ *
+ * P itself may be the left half of a split that never finished - a crash or
+ * an ERROR between that split's two records (DESIGN.md §22) - when the caller
+ * reached it without a descent, which is what VACUUM's regrow does: it walks
+ * the right links.  That split is finished FIRST.  Splitting P again as it
+ * stands would link the new page between P and the right half R of the old
+ * split, and finishing THIS split would then give the new page its downlink
+ * and clear the one flag that remembered R: R would have no downlink for
+ * good, and every reader that seeks by container key - a descent, which is
+ * how an intersection probes a set - would miss what is on it.  nbtree's
+ * _bt_insertonpg() refuses to touch such a page at all, and lion_dir_place()
+ * finishes the split first for the directory, as this does.
+ *
+ * Finishing it here, inside VACUUM's removal window (lion_wal_removal_begin()),
+ * makes replay take a cleanup lock on the parent and on P for those records as
+ * well, which is more than they need and harmless: the downlinks of a split
+ * this function goes on to make are written in that window already.
  */
 static void
 lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
@@ -2360,13 +2377,13 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 					Buffer entrybuf, OffsetNumber entryoff,
 					LionEntryTuple *entry, LionContainer **items, int nitems)
 {
-	Page		page = BufferGetPage(buf);
+	Page		page;
 	BlockNumber blk = BufferGetBlockNumber(buf);
-	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber maxoff;
 	OffsetNumber firstright = replace ? OffsetNumberNext(off) : off;
 	OffsetNumber delfirst = off;
-	int			ndel = (int) (maxoff + 1 - delfirst);
-	int			nmove = (int) (maxoff + 1 - firstright);
+	int			ndel;
+	int			nmove;
 	Size		sizes[LION_MAX_PUT_ITEMS];
 	Size		need = 0;
 	char	   *movebuf = NULL;
@@ -2379,13 +2396,30 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	Page		pM = NULL;
 	Buffer		nbuf = InvalidBuffer;
 	Buffer		mbuf = InvalidBuffer;
-	BlockNumber oldright = LionPageGetOpaque(page)->rightlink;
+	BlockNumber oldright;
 	BlockNumber nblk = InvalidBlockNumber;
 	BlockNumber mblk = InvalidBlockNumber;
 	uint32		firstmoved = 0;	/* first ckey of the items that move right */
 	PGAlignedBlock *trial = NULL;
 	bool		needm;
 	int			i;
+
+	/*
+	 * An unfinished split of P comes first (see above).  Finishing it touches
+	 * the parent and P's flag and nothing else: P's items and right link stay
+	 * as they are, so off and everything below still describe the page.  The
+	 * root is never flagged - its split is a push-down - so this cannot meet
+	 * the push-down path below.
+	 */
+	if (LionPageIncompleteSplit(BufferGetPage(buf)))
+		lion_posting_finish_split(index, heaprel, entry->hash, entry->head,
+								  buf);
+
+	page = BufferGetPage(buf);
+	maxoff = PageGetMaxOffsetNumber(page);
+	ndel = (int) (maxoff + 1 - delfirst);
+	nmove = (int) (maxoff + 1 - firstright);
+	oldright = LionPageGetOpaque(page)->rightlink;
 
 	Assert(ndel >= 0 && nmove >= 0 && nmove <= ndel);
 	Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
