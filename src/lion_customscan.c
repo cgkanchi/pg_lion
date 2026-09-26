@@ -4349,7 +4349,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		{
 			BoolExpr   *orexpr = (BoolExpr *) clause;
 			List	   *armlens = NIL;
-			int			first = list_length(whereattnos);
+			int			orfirst = list_length(whereattnos);
 			ListCell   *la;
 
 			if (list_length(orexpr->args) < 2)
@@ -4395,7 +4395,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			}
 
 			ors = lappend(ors,
-						  list_concat(list_make2_int(first,
+						  list_concat(list_make2_int(orfirst,
 													 list_length(armlens)),
 									  armlens));
 			havepositive = true;
