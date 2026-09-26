@@ -1,26 +1,143 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_attach s1_verify s2_insert s3_wakeup s3_after
-step s1_attach: 
-	SELECT injection_points_set_local();
-	SELECT injection_points_attach('lion-verify-meta-read', 'wait');
-
+starting permutation: s1_park_level s1_verify_c s2_split_right s3_wake_level_again s2_split_right2 s3_wake_level s3_dir
 injection_points_set_local
 --------------------------
                           
 (1 row)
 
+step s1_park_level: SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait');
 injection_points_attach
 -----------------------
                        
 (1 row)
 
-step s1_verify: SELECT lion_index_verify('vc_k', true); <waiting ...>
-step s2_insert: 
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_split_right: 
 	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
-	  FROM generate_series(1, 600) g;
- <waiting ...>
-step s3_wakeup: 
+	  FROM generate_series(1, 1000) g;
+
+step s3_wake_level_again: SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_split_right2: 
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	  FROM generate_series(1001, 2000) g;
+
+step s3_wake_level: 
+	SELECT injection_points_detach('lion-verify-dir-level-walked');
+	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_dir: 
+	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
+		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
+		   (SELECT count(*) FROM vc) AS rows
+	  FROM lion_index_stats('vc_k') s, v_before b;
+	SELECT lion_index_verify('vc_k', true);
+
+the_leaves_split|the_internal_pages_split|rows
+----------------+------------------------+----
+t               |t                       |5000
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_park_page s1_verify_c s2_split_left s3_wake_page s3_dir
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_page: SELECT injection_points_attach('lion-verify-dir-page-read', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_split_left: 
+	INSERT INTO vc SELECT 'key0-' || g || repeat('z', 100)
+	  FROM generate_series(1, 100) g;
+
+step s3_wake_page: 
+	SELECT injection_points_detach('lion-verify-dir-page-read');
+	SELECT injection_points_wakeup('lion-verify-dir-page-read');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_dir: 
+	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
+		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
+		   (SELECT count(*) FROM vc) AS rows
+	  FROM lion_index_stats('vc_k') s, v_before b;
+	SELECT lion_index_verify('vc_k', true);
+
+the_leaves_split|the_internal_pages_split|rows
+----------------+------------------------+----
+t               |f                       |3100
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_park_meta s1_verify_r s2_split_root s3_wake_meta s3_root
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_meta: SELECT injection_points_attach('lion-verify-meta-read', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_r: SELECT lion_index_verify('vr_k', true); <waiting ...>
+step s2_split_root: 
+	INSERT INTO vr SELECT 'root' || g || repeat('r', 200)
+	  FROM generate_series(1, 300) g;
+
+step s3_wake_meta: 
 	SELECT injection_points_detach('lion-verify-meta-read');
 	SELECT injection_points_wakeup('lion-verify-meta-read');
 
@@ -34,22 +151,180 @@ injection_points_wakeup
                        
 (1 row)
 
-step s1_verify: <... completed>
+step s1_verify_r: <... completed>
 lion_index_verify
 -----------------
                  
 (1 row)
 
-step s2_insert: <... completed>
-step s3_after: 
-	SELECT s.leaf_pages > b.leaf_pages AS the_insert_split_the_directory,
-		   (SELECT count(*) FROM vc WHERE k LIKE 'new%') AS new_rows
-	  FROM lion_index_stats('vc_k') s, vc_before b;
+step s3_root: 
+	SELECT s.directory_height > b.vr_height AS the_root_split
+	  FROM lion_index_stats('vr_k') s, v_before b;
+	SELECT lion_index_verify('vr_k', true);
+
+the_root_split
+--------------
+t             
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_park_set s1_verify_p s2_grow_p s3_wake_set s3_posting
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_set: SELECT injection_points_attach('lion-verify-set-leaves-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 30000) i;
+step s3_wake_set: 
+	SELECT injection_points_detach('lion-verify-set-leaves-walked');
+	SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_posting: 
+	SELECT s.container_pages > b.vp_leaves AS the_leaves_split,
+		   (SELECT count(*) FROM vp WHERE k = 0) AS k0_rows
+	  FROM lion_index_stats('vp_k') s, v_before b;
+	SELECT lion_index_verify('vp_k', true);
+
+the_leaves_split|k0_rows
+----------------+-------
+t               |  60000
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_park_set s1_verify_q s2_push_q s3_wake_set s3_pushdown
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_set: SELECT injection_points_attach('lion-verify-set-leaves-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_q: SELECT lion_index_verify('vq_k', true); <waiting ...>
+step s2_push_q: 
+	INSERT INTO vq SELECT 4000 + i, CASE WHEN i % 2 = 0 THEN 0 ELSE 5 END
+	  FROM generate_series(1, 40000) i;
+
+step s3_wake_set: 
+	SELECT injection_points_detach('lion-verify-set-leaves-walked');
+	SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_q: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_pushdown: 
+	SELECT s.max_posting_height > b.vq_height AS the_root_was_pushed_down,
+		   lion_index_posting_root('vq_k', 0) = b.vq_root AS the_root_kept_its_block,
+		   lion_index_posting_root('vq_k', 5) IS NOT NULL AS the_new_key_spilled
+	  FROM lion_index_stats('vq_k') s, v_before b;
+	SELECT lion_index_verify('vq_k', true);
+
+the_root_was_pushed_down|the_root_kept_its_block|the_new_key_spilled
+------------------------+-----------------------+-------------------
+t                       |t                      |t                  
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_park_level s1_verify_c s2_spill s3_wake_level s3_spilled
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_level: SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_spill: 
+	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 200);
+
+step s3_wake_level: 
+	SELECT injection_points_detach('lion-verify-dir-level-walked');
+	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_spilled: 
+	SELECT s.inline_entries = b.vc_inline - 1 AS the_entry_spilled,
+		   lion_index_posting_root('vc_k', 'key1' || repeat('x', 100)) IS NOT NULL
+		   AS it_has_a_posting_tree
+	  FROM lion_index_stats('vc_k') s, v_before b;
 	SELECT lion_index_verify('vc_k', true);
 
-the_insert_split_the_directory|new_rows
-------------------------------+--------
-t                             |     600
+the_entry_spilled|it_has_a_posting_tree
+-----------------+---------------------
+t                |t                    
 (1 row)
 
 lion_index_verify
@@ -58,29 +333,334 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_begin s2_insert s1_verify s2_commit s3_after
-step s2_begin: BEGIN;
-step s2_insert: 
+starting permutation: s1_park_set s1_note_held s1_verify_p s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set s3_touched
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_set: SELECT injection_points_attach('lion-verify-set-leaves-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_note_held: SELECT injection_points_attach('lion-verify-set-held', 'notice');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s2_touch_p: INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i;
+step s3_wake_set_again: SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_touch_p: INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i;
+step s3_wake_set_again: SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_touch_p: INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i;
+step s3_wake_set: 
+	SELECT injection_points_detach('lion-verify-set-leaves-walked');
+	SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+s1: NOTICE:  notice triggered for injection point lion-verify-set-held
+step s1_verify_p: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_touched: 
+	SELECT (SELECT count(*) FROM vp WHERE k = 0) AS k0_rows;
+	SELECT lion_index_verify('vp_k', true);
+
+k0_rows
+-------
+  30300
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_p s3_wake_level s3_reused
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s2_free_p: DELETE FROM vp WHERE k = 1;
+step s2_vacuum_p: VACUUM vp;
+step s2_xid: SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid;
+took_an_xid
+-----------
+t          
+(1 row)
+
+step s3_note_free: 
+	CREATE TABLE v_free AS
+	SELECT deleted_pages, pg_relation_size('vp_k') AS size
+	  FROM lion_index_stats('vp_k');
+	SELECT deleted_pages > 0 AS vacuum_freed_pages FROM v_free;
+
+vacuum_freed_pages
+------------------
+t                 
+(1 row)
+
+step s1_park_level: SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 30000) i;
+step s3_wake_level: 
+	SELECT injection_points_detach('lion-verify-dir-level-walked');
+	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_reused: 
+	SELECT s.deleted_pages < f.deleted_pages AS freed_pages_were_taken,
+		   pg_relation_size('vp_k') = f.size AS the_index_did_not_grow
+	  FROM lion_index_stats('vp_k') s, v_free f;
+	SELECT lion_index_verify('vp_k', true);
+
+freed_pages_were_taken|the_index_did_not_grow
+----------------------+----------------------
+t                     |t                     
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_new s3_wake_level s3_new_set
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s2_free_p: DELETE FROM vp WHERE k = 1;
+step s2_vacuum_p: VACUUM vp;
+step s2_xid: SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid;
+took_an_xid
+-----------
+t          
+(1 row)
+
+step s3_note_free: 
+	CREATE TABLE v_free AS
+	SELECT deleted_pages, pg_relation_size('vp_k') AS size
+	  FROM lion_index_stats('vp_k');
+	SELECT deleted_pages > 0 AS vacuum_freed_pages FROM v_free;
+
+vacuum_freed_pages
+------------------
+t                 
+(1 row)
+
+step s1_park_level: SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s2_grow_new: INSERT INTO vp SELECT 100000 + i, 2 FROM generate_series(1, 30000) i;
+step s3_wake_level: 
+	SELECT injection_points_detach('lion-verify-dir-level-walked');
+	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_p: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_new_set: 
+	SELECT s.deleted_pages < f.deleted_pages AS freed_pages_were_taken,
+		   lion_index_posting_root('vp_k', 2) IS NOT NULL AS the_new_key_has_a_tree
+	  FROM lion_index_stats('vp_k') s, v_free f;
+	SELECT lion_index_verify('vp_k', true);
+
+freed_pages_were_taken|the_new_key_has_a_tree
+----------------------+----------------------
+t                     |t                     
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s1_park_meta s1_verify_c s2_vacuum_c s3_wake_meta s3_dir
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_meta: SELECT injection_points_attach('lion-verify-meta-read', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_vacuum_c: VACUUM vc; <waiting ...>
+step s3_wake_meta: 
+	SELECT injection_points_detach('lion-verify-meta-read');
+	SELECT injection_points_wakeup('lion-verify-meta-read');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_vacuum_c: <... completed>
+step s3_dir: 
+	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
+		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
+		   (SELECT count(*) FROM vc) AS rows
+	  FROM lion_index_stats('vc_k') s, v_before b;
+	SELECT lion_index_verify('vc_k', true);
+
+the_leaves_split|the_internal_pages_split|rows
+----------------+------------------------+----
+f               |f                       |3000
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_hold s1_park_level s1_verify_c s2_split_right s2_late s3_wake_level s3_release s3_dir
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s3_hold: SELECT pg_advisory_lock(4711);
+pg_advisory_lock
+----------------
+                
+(1 row)
+
+step s1_park_level: SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_split_right: 
 	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
-	  FROM generate_series(1, 600) g;
+	  FROM generate_series(1, 1000) g;
 
-step s1_verify: SELECT lion_index_verify('vc_k', true); <waiting ...>
-step s2_commit: COMMIT;
-step s1_verify: <... completed>
+step s2_late: 
+	INSERT INTO vc SELECT 'late' || g ||
+		   CASE WHEN g > 1 THEN pg_advisory_xact_lock_shared(4711)::text ELSE '' END
+	  FROM generate_series(1, 3) g;
+ <waiting ...>
+step s3_wake_level: 
+	SELECT injection_points_detach('lion-verify-dir-level-walked');
+	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_release: SELECT pg_advisory_unlock(4711);
+pg_advisory_unlock
+------------------
+t                 
+(1 row)
+
+step s2_late: <... completed>
+step s1_verify_c: <... completed>
 lion_index_verify
 -----------------
                  
 (1 row)
 
-step s3_after: 
-	SELECT s.leaf_pages > b.leaf_pages AS the_insert_split_the_directory,
-		   (SELECT count(*) FROM vc WHERE k LIKE 'new%') AS new_rows
-	  FROM lion_index_stats('vc_k') s, vc_before b;
+step s3_dir: 
+	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
+		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
+		   (SELECT count(*) FROM vc) AS rows
+	  FROM lion_index_stats('vc_k') s, v_before b;
 	SELECT lion_index_verify('vc_k', true);
 
-the_insert_split_the_directory|new_rows
-------------------------------+--------
-t                             |     600
+the_leaves_split|the_internal_pages_split|rows
+----------------+------------------------+----
+t               |t                       |4003
 (1 row)
 
 lion_index_verify
@@ -89,12 +669,74 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_lock s1_verify s2_drop s2_rollback
+starting permutation: s2_begin s1_park_level s1_verify_c s2_split_right s3_wake_level s2_commit s3_dir
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s2_begin: BEGIN;
+step s1_park_level: SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s2_split_right: 
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	  FROM generate_series(1, 1000) g;
+
+step s3_wake_level: 
+	SELECT injection_points_detach('lion-verify-dir-level-walked');
+	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify_c: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_commit: COMMIT;
+step s3_dir: 
+	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
+		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
+		   (SELECT count(*) FROM vc) AS rows
+	  FROM lion_index_stats('vc_k') s, v_before b;
+	SELECT lion_index_verify('vc_k', true);
+
+the_leaves_split|the_internal_pages_split|rows
+----------------+------------------------+----
+t               |t                       |4000
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_lock s1_verify_c s2_drop s2_rollback
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
 step s2_lock: BEGIN; LOCK TABLE vc IN ACCESS EXCLUSIVE MODE;
-step s1_verify: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
 step s2_drop: DROP INDEX vc_k;
 step s2_rollback: ROLLBACK;
-step s1_verify: <... completed>
+step s1_verify_c: <... completed>
 lion_index_verify
 -----------------
                  

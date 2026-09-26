@@ -943,6 +943,15 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
 							 int lockmode, bool forwrite, OffsetNumber *offp);
 
 /*
+ * The same read-only descent stopped at `level`: the page of that level whose
+ * key range holds sk, locked SHARE, or InvalidBuffer when the directory is not
+ * that tall.  For lion_index_verify(), which proves with it that a page a
+ * concurrent split made is where a search for its keys lands (DESIGN.md §7).
+ */
+extern Buffer lion_dir_search_level(Relation index, LionIndexState *ix,
+									const LionSearchKey *sk, uint16 level);
+
+/*
  * Locate the entry for sk.  On true *buf is a leaf locked in lockmode and
  * *offnum its offset.  On false *buf is still a locked leaf and *offnum is
  * the offset the entry would be inserted at, EXCEPT when *movedright says the
@@ -1065,6 +1074,14 @@ extern bool lion_replace_entry(Relation index, LionWalState *state, Buffer buf,
 extern Buffer lion_posting_search(Relation index, Relation heaprel,
 								  uint32 hash, BlockNumber head, uint32 ckey,
 								  int lockmode, bool forwrite);
+
+/*
+ * A reader's descent of the set rooted at head, stopped at `level`: the page
+ * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
+ * For lion_index_verify() (DESIGN.md §7), as lion_dir_search_level() is.
+ */
+extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
+										uint32 ckey, uint16 level);
 
 /* The leftmost leaf, where every sequential walk of a posting set starts. */
 extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,

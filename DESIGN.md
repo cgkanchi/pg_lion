@@ -372,7 +372,9 @@ calls since §25: taking the page is the fallible half and has to happen before 
 because an rmgr-mode record is written inside a critical section. The recycling rule, what `heaprel` is for and
 why a chain's head page never comes from the map are in §18. verify() reports DELETED pages as the
 ordinary free pages they are, unreferenced never-initialised or empty pages as WARNINGs (the next
-VACUUM's sweep turns them into free pages) and anything else as an ERROR.
+VACUUM's sweep turns them into free pages) and anything else as an ERROR - on a primary only once the
+writers that were in flight are done and the page is still not where a search for it lands, since a
+live page nothing reached may be one an INSERT made behind the walk (§7, "verify() beside writers").
 
 ## 5. Locking protocol (deliberately coarse in v0)
 
@@ -748,34 +750,31 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- the other order deadlocked with `LOCK TABLE t; DROP INDEX t_k` in another session. Key
         -- values appear in a "not indexed" report only when the CALLER is a superuser, which is
         -- decided before the switch: asked afterwards, superuser() answers for the owner.
-        -- LOCKING: ShareLock on the table, then on the index - bt_index_parent_check()'s locks, for
-        -- bt_index_parent_check()'s reason. verify() is a parent check: it compares each level of
-        -- the directory and of every posting tree with the WHOLE level below it, and proves every
-        -- block reachable exactly once, and none of that holds between pages read at different
-        -- moments while writers split them. It ran under AccessShareLock and one page lock at a
-        -- time until the 2026-09-25 review, and a loop of inserts that split the directory made
-        -- 11 of 20 calls report "the directory points at block 733, but the index has only 732
-        -- blocks" about a sound index (the block count was taken before a split extended it; a
-        -- level walked before a split and its parent walked after it, or a page allocated after
-        -- the walk passed it, would have been next). Making each comparison tolerate growth was
-        -- the alternative, and it stops at reachability: an unreferenced live page is a leak or a
-        -- page a writer took from the FSM a moment ago, and without an LSN on unlogged pages
-        -- nothing tells the two apart. So verify() waits for the writers in flight, keeps INSERT,
-        -- UPDATE, DELETE, VACUUM and CREATE INDEX CONCURRENTLY out while it runs, and releases both
-        -- locks when it returns rather than at commit, as amcheck does. lion_index_stats() is
-        -- unaffected: it stays under AccessShareLock and concurrent.
+        -- LOCKING: ShareUpdateExclusiveLock on the table, then on the index - the lock CREATE
+        -- INDEX CONCURRENTLY builds under, and verify() checks the way CIC builds, beside the
+        -- writers. INSERT, UPDATE and DELETE go on while it runs; VACUUM, ANALYZE, DDL, CIC and a
+        -- second verify() wait for it (and it for them). Both locks are released when it returns
+        -- rather than at commit, as amcheck does. With VACUUM locked out nothing leaves the index
+        -- while it is walked, so the only changes it meets are an INSERT's, and each of them is
+        -- settled rather than reported - "verify() beside writers" below says how, and what it
+        -- costs: it may wait for the statements that are writing the index, for as long as
+        -- lock_timeout and statement_timeout allow. lion_index_stats() is unaffected: it stays
+        -- under AccessShareLock and concurrent. verify() took AccessShareLock and nothing else
+        -- until the 2026-09-25 review - a loop of inserts that split the directory made 11 of 20
+        -- calls report "the directory points at block 733, but the index has only 732 blocks"
+        -- about a sound index - and then ShareLock, bt_index_parent_check()'s, which kept every
+        -- writer out for as long as it ran.
         -- DURING RECOVERY no lock above RowExclusiveLock can be taken, and replay takes no relation
-        -- locks anyway, so on a hot standby verify() takes AccessShareLock and reads an index that
-        -- replay may be changing. It re-reads the block count before calling a link out of range,
-        -- which covers the commonest case (a split replay has just extended the index with), but a
-        -- level comparison or the reachability pass can still report a change replay made while it
-        -- walked. Such a report is confirmed with replay paused (pg_wal_replay_pause(), then
+        -- locks anyway, so on a hot standby verify() takes AccessShareLock, reads an index that
+        -- replay may be changing, and reports what it finds at once, as it always has: none of
+        -- the settling below applies there, because it rests on how WRITERS lock pages across
+        -- their records, and replay locks each record's pages for that record alone. It re-reads
+        -- the block count before calling a link out of range, which covers the commonest case (a
+        -- split replay has just extended the index with), but a level comparison, a left link or
+        -- the reachability pass can still report a change replay made while it walked. Such a
+        -- report is confirmed with replay paused (pg_wal_replay_pause(), then
         -- pg_wal_replay_resume()); run on a quiet standby, as test/recovery/run.sh does, the check
-        -- is exact.
-        -- test/isolation/verify_concurrent.spec parks verify() after it has read the meta page
-        -- (injection point 'lion-verify-meta-read') and shows a directory-splitting INSERT waiting
-        -- for it, a writer in flight being waited for, and `LOCK TABLE; DROP INDEX` in another
-        -- transaction going through while verify() waits for the table.
+        -- is exact. A standby is the one place verify() can report damage that is not there.
         -- AN UNFINISHED SPLIT IS NOT DAMAGE (§21, §22). A split writes the new right sibling in one
         -- record and its downlink in the next, with the left page flagged
         -- LION_PAGE_INCOMPLETE_SPLIT in between, and a crash or an error there leaves the sibling
@@ -789,7 +788,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- of its own) needs nothing. verify() used to warn and then report the missing downlink
         -- as "level 1 has 4 downlinks but level 0 has 5 pages";
         -- test/isolation/verify_incomplete_split.spec makes a posting split and a directory
-        -- split fail at their injection points and verifies both.
+        -- split fail at their injection points and verifies both. On a primary the WARNING is
+        -- exact even with writers running: a split holds the page it flags EXCLUSIVE from the
+        -- record that sets the flag to the one that clears it, so a flag a SHARE lock lets
+        -- verify() read is one a crash or an error left behind.
         -- A DAMAGED PAGE IS AN ERROR, never a crash, a read past the page or a write: every block
         -- number verify() follows - the meta page's root, downlinks, right links, an entry's head,
         -- a posting pivot's child - is checked against the index's length before ReadBuffer(),
@@ -806,8 +808,166 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- used to underflow), an item of no known type. The regression suite writes each kind of
         -- damage into a temporary index's file (verify.sql) and gets an ERROR from verify() and
         -- a count without the damaged item from lion_index_stats(), where the code before
-        -- asserted, read past the page, or extended the index.
+        -- asserted, read past the page, or extended the index. Its sixth case is damage only the
+        -- recheck below can tell from a concurrent split: a right link, and the left link that
+        -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone.
     (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
+
+### verify() beside writers: suspect, wait, recheck (2026-09-26)
+
+verify() is a parent check: it compares each level of the directory and of every posting tree with
+the WHOLE level below it, and proves every block reachable exactly once. Pages read at different
+moments while writers split them disagree, which is why it ran under ShareLock and kept every
+writer out for as long as it ran. It takes ShareUpdateExclusiveLock now, the lock CREATE INDEX
+CONCURRENTLY builds under, and checks the way CIC builds: beside the writers, settling afterwards
+what they may have changed under it.
+
+**What it can meet.** VACUUM is the only thing that removes anything from a lion index - a TID, an
+entry, a page - and ShareUpdateExclusiveLock keeps it out, with ANALYZE, DDL, CIC and a second
+verify(). So nothing leaves the index while it is walked, no page is freed, and no page that is
+live when the walk reads it is anything else later. What is left is what an INSERT does, and each
+of those is handled:
+
+    new TIDs in a container, an INLINE entry,    a page is read under its SHARE lock and copied: every
+      new entries on a leaf                      check of one page is exact, since writers change a
+                                                 page only in whole records; an INLINE entry's
+                                                 counters are on the page with its payload
+    a directory leaf, internal or root split    see "the walk" and "candidates" below
+    an unfinished split (INCOMPLETE_SPLIT)       exact: a split holds the page it flags EXCLUSIVE from
+                                                 the record that sets the flag to the one that clears
+                                                 it, so a flag seen under SHARE is an abandoned one
+    an INLINE -> CHAIN spill                     the entry was checked INLINE from the leaf's copy; its
+                                                 new root is found through the entry (candidates)
+    a posting leaf or internal split, a root     the set is walked again (below)
+      push-down, entry counters changing
+    relation extension                           a link past the block count taken at the start is
+                                                 checked against the relation's length NOW, and only
+                                                 one past the end now is reported: a split links its
+                                                 new page in the record that initialises it
+    a page taken from the free space map         it is a live page nothing reached (candidates); one
+                                                 the reachability pass saw DELETED is a free page, as
+                                                 it always was
+
+**The walk** reads every level of a tree from the LEAVES UP, as it always did, and that order is what
+makes a split between two walks harmless. A split puts its new page into its level's right-link
+chain in its first record and the downlink into the parent in a later one, holding the flagged left
+page EXCLUSIVE in between; the walk of the lower level therefore reads that page either before the
+split or after it has finished. A split made after the lower walk passed its place shows up in the
+comparison of the two levels as one thing only - a downlink to a page the lower walk never reached -
+and in the reachability pass as a live page nothing reached. Everything else the comparison checks is
+exact: a page's lower bound is the high key its left neighbour had when the walk read it and never
+changes, a split never takes a page's first item away, and items move only onto a page the split
+links immediately right of the page they left. Two things a split changes are settled on the spot,
+because one more read proves them: the LEFT LINK of the page the walk reaches next names the split's
+new page rather than the one the walk came from - the level is walked again from that page, each page
+held until its right sibling is locked (left to right, the directory's own order), where one's left
+link naming the other is exact - and a page at the height the meta page gave has lost its ROOT flag,
+which a root split does in the same record that makes the meta page name a taller directory.
+
+**Posting sets** are walked with nothing held: holding the entry's directory leaf for every walk would
+keep the writers of every key on that leaf waiting. The entry is read again afterwards - found by its
+exact key from the leaf it was on, moving right, since an entry leaves its leaf only with the upper
+half of a split - and the walk is kept when the entry reads the same (flags, head, tail, ntids,
+ncontainers) both times. That is exact: every writer of a key holds the entry's leaf EXCLUSIVE from its
+first record to its last (§5), and both reads were made under SHARE, so a writer that touched the set
+between them did all of it between them; and every change an INSERT makes to a set moves the entry -
+an item added, grown or split off adds its TID to `ntids` in the record that places it, a push-down
+moves `tail`. The one kind of writer that adds no TID - one that finishes an abandoned split on its
+way down and then finds its TID already there, or fails - adds a downlink and clears a flag, which
+the walk accepts either way, and any internal split that makes is a downlink the lower walk never
+saw, which throws the walk away too; so does a root at another level than the descent found it at.
+A set that keeps changing - a hot key - is walked at most three times like that, and then once more
+with the leaf held SHARE throughout. That is the lock order every writer uses (directory page before
+posting page) and keeps waiting only the writers of the keys on that one leaf, for one walk of one
+set; the 50-call stress run below needed it for 6 of its 70 set walks.
+
+**Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
+reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
+reported. When the walk and the reachability pass are over and there are candidates, verify() waits
+for the statements that are writing the index: `WaitForLockers()` on the INDEX's lock tag in
+ShareLock, the mode CIC waits in. An INSERT, UPDATE or COPY takes RowExclusiveLock on each index of
+its table when it puts its first row into it and lets it go when the statement ends
+(`ExecOpenIndices()`, `ExecCloseIndices()`), and a statement that has ended has finished every split
+it began, or left it flagged for good. CIC waits on the TABLE's lock tag because it must outwait
+every transaction that could still insert without knowing the new index; verify() need not, so a
+transaction that wrote the table and sits idle, or prepared, holds no lock on the index and is not
+waited for. `WaitForLockers()` waits for each holder's whole transaction, which is more than needed and
+the only unit it offers. The wait is a lock wait on each writer's virtual transaction id, so
+lock_timeout ends it (with "canceling statement due to lock timeout") as well as statement_timeout;
+without either, a statement that keeps the index open for writing keeps verify() waiting. An index
+nobody wrote to during the walk has no candidates and nothing is waited for.
+
+Then each candidate is checked again by itself. A downlink's page has to be in the lower level's
+chain between the reached page whose downlink precedes it and the one whose downlink follows it,
+which a coupled walk between the two proves or disproves. A page nothing reached has to be where a
+search for its own first key lands: from the directory's root, stopped at the page's level
+(`lion_dir_search_level()`), or from its posting set's root (`lion_posting_search_level()`) - a root
+that was reached, or that an entry names. The roots are found through the entries in one walk of the
+leaves; that is needed for more than a spill's root, because a posting set's root always comes from
+the end of the relation (§18) while the pages it grows by may come out of the free space map, so a
+set created during the walk can leave unreached pages under a root nothing reached either (a first
+version reported "block 7 is not reachable from the meta page" about exactly that). A candidate the
+recheck cannot settle is reported as the walk would have reported it: as a leak, with a WARNING, when
+it is a kind an interrupted writer leaves and the next VACUUM's sweep frees - an internal posting page
+among them - and as corruption otherwise.
+
+**What it no longer sees.** A block the relation grew by after the check began holds nothing that was
+in the index then; the reachability pass stops at the count it started with (a link the walk followed
+into such a block was checked like any other). An entry inserted behind the walk is not checked, and
+neither is a set created behind it beyond the pages it took. **heapallindexed** is as sound as it was:
+its snapshot is taken after the structural check, is registered, and every row it sees was inserted
+by a transaction that committed before it - whose index inserts had therefore finished - while VACUUM,
+the one thing that could have taken a visible row's TID out of the index, is locked out. The lookups
+are readers' descents; a posting-tree lookup holds the entry's leaf for that one descent, as it always
+did. The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
+
+**What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
+nothing and reports what it finds at once, as before - the arguments above rest on how writers hold
+pages across their records, and replay holds each record's pages for that record alone.
+
+**Measured** (the assert-enabled PostgreSQL 18.6 of the development slot, 4 CPUs; ratios, not
+absolute numbers). The stress is a loop inserting 200 new ~140-byte text keys at a time (directory
+leaf, internal and root splits) and a loop adding 300 rows at a time to one hot key (posting leaf
+splits), 20 ms apart, against a loop of `lion_index_verify(idx, true)`. The ShareLock code with its
+lock taken back down to AccessShareLock - which is what it was before the 2026-09-25 review - failed 9
+of 20 calls ("the directory points at block 1048, but the index has only 1048 blocks", "the high key
+of block 585 sorts after the separator of its right sibling"); this code passed 20 of 20, 50 of 50
+and 40 of 40, settling 1,833 candidates after 41 waits in the 50-call run, and throwing away 20
+posting-set walks and holding the leaf for 6. With the writers 2 ms apart instead it passed all 36
+calls it finished before the table reached 22 million rows, settling 5,728 candidates after 36 waits
+and throwing away 35 of 72 posting-set walks, holding the leaf for 9.
+
+    1M rows; m_k: 20 keys, 280 posting leaves; m_t: 50,000 keys, 1,250 directory leaves
+    verify() alone, ms     m_k: structural 3-5,   heapallindexed 970-1,050
+                           m_t: structural 15-31, heapallindexed 1,520-1,590
+
+    INSERTs, 2 pgbench clients,   alone           beside a verify() loop           beside a
+    20 s each                                     structural      heapallindexed   heap scan loop
+    this code  avg / p99 ms       0.127 / 0.312   0.139 / 0.408   0.129 / 0.343    0.136 / 0.366
+               inserts            312,187         284,563         307,149          291,373
+    ShareLock  avg / p99 ms       0.123 / 0.286   1.118 / 79.6    34.7 / 1,384     0.132 / 0.329
+               inserts            320,758         35,852          1,265            299,710
+
+Beside the inserts a structural verify() of m_t took 111 ms on average (15-31 alone: the index grew
+by thousands of keys during the phase, and the candidates are waited for and searched), and one with
+heapallindexed 2.8-3.7 s (the heap grew by 600,000 rows). The inserts beside it lose what they lose
+to a plain heap scan loop taking the same CPU, and nothing else; under ShareLock they queued behind
+every verify().
+
+`test/isolation/verify_concurrent.spec` parks verify() at injection points with nothing held - after
+the meta page (`lion-verify-meta-read`), after a directory level (`lion-verify-dir-level-walked`),
+on a directory page (`lion-verify-dir-page-read`), after a posting set's leaves
+(`lion-verify-set-leaves-walked`) - and has INSERTs split leaves and internal pages of the directory
+behind it, split the page it stands on, split its root, split a posting leaf, push a posting root
+down, spill an INLINE entry, keep changing a set until it is walked with its leaf held
+(`lion-verify-set-held` with 'notice'), and take pages VACUUM freed for an existing set and for a new
+one; every time the check passes and the observer shows the change was made. It also shows VACUUM
+waiting for the check, the check waiting for a statement that holds the index open for writing and
+not for a transaction whose statement is over, and `LOCK TABLE; DROP INDEX` in another transaction
+going through while the check waits for the table. Each change is one the old AccessShareLock code
+reported as damage or would have; `verify.sql`'s sixth damage case is real damage that only the
+recheck can tell from one of them. verify() says at DEBUG1 what writers cost it: candidates, waits,
+left links and root flags settled on the spot, and posting-set walks made, thrown away and held.
 
 ## 8. Module ownership
 
