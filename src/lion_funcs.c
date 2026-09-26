@@ -2131,6 +2131,17 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		LionEntryTuple before = *cur;
 		bool		ok;
 
+		/*
+		 * Test hook: the last walk was thrown away, the entry is read again,
+		 * and nothing is held.  test/isolation/verify_concurrent.spec parks
+		 * here and at lion-verify-set-leaves-walked in turn: the
+		 * isolationtester cannot tell a session that parks at a point again
+		 * from one still to wake from the point, but it can tell two points
+		 * apart.
+		 */
+		if (attempt > 0)
+			LION_INJECTION_POINT("lion-verify-set-rewalk");
+
 		memset(&res, 0, sizeof(res));
 		lion_verify_track_begin(vs);
 		vs->nsetwalks++;
