@@ -602,11 +602,67 @@ SELECT containers FROM lion_index_stats('lion_vfy_bad_type');
 (1 row)
 
 SET client_min_messages = warning;
+-- (6) a right link that skips a leaf, and the left link that goes with it,
+-- so that the leaf is reached by its downlink and by nothing else.  The walk
+-- of the leaves cannot tell that from a leaf a concurrent split made after
+-- the walk had passed its place - verify() lets INSERTs run beside it
+-- (DESIGN.md §7) - so it is a candidate, and it is the walk of the level
+-- again, after the wait for the writers in flight, that finds the downlink
+-- pointing out of the level.  The special area is the last 32 bytes of a
+-- block: the right link first, then the left link, the flags at 26.
+CREATE FUNCTION lion_vfy_u32(idx regclass, blk int8, pos int8)
+RETURNS int8 LANGUAGE sql AS $$
+	SELECT get_byte(b, 0)::int8 + get_byte(b, 1)::int8 * 256 +
+		   get_byte(b, 2)::int8 * 65536 + get_byte(b, 3)::int8 * 16777216
+	  FROM lion_vfy_peek(idx, blk, pos, 4) b
+$$;
+CREATE FUNCTION lion_vfy_le32(x int8)
+RETURNS bytea LANGUAGE sql AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		   0, (x & 255)::int), 1, ((x >> 8) & 255)::int),
+		   2, ((x >> 16) & 255)::int), 3, ((x >> 24) & 255)::int)
+$$;
+CREATE TEMP TABLE lion_vfy_badd (k text);
+INSERT INTO lion_vfy_badd
+SELECT 'key' || lpad(i::text, 5, '0') || repeat('x', 100) FROM generate_series(1, 300) i;
+CREATE INDEX lion_vfy_bad_link ON lion_vfy_badd USING lion (k);
+SELECT current_setting('block_size')::int8 - 32 AS special \gset
+SELECT b AS leaf1
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_link') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_link', b, :special + 24) >> 16) & 2 = 2
+   AND lion_vfy_u32('lion_vfy_bad_link', b, :special + 4) = 4294967295 \gset
+SELECT lion_vfy_u32('lion_vfy_bad_link', :leaf1, :special) AS leaf2 \gset
+SELECT lion_vfy_u32('lion_vfy_bad_link', :leaf2, :special) AS leaf3 \gset
+SELECT :leaf1 AS leaf1, :leaf2 AS leaf2, :leaf3 AS leaf3;
+ leaf1 | leaf2 | leaf3 
+-------+-------+-------
+     1 |     2 |     4
+(1 row)
+
+SELECT lion_vfy_poke('lion_vfy_bad_link', :leaf1, :special, lion_vfy_le32(:leaf3));
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SELECT lion_vfy_poke('lion_vfy_bad_link', :leaf3, :special + 4, lion_vfy_le32(:leaf1));
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_link');
+ERROR:  lion index "lion_vfy_bad_link": downlink 1 of level 1 points at block 2, which is not a page of level 0 between blocks 1 and 4
+SET client_min_messages = warning;
 RESET ignore_checksum_failure;
-DROP TABLE lion_vfy_bad, lion_vfy_badp;
+DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd;
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
 DROP FUNCTION lion_vfy_poke(regclass, int8, int8, bytea);
 DROP FUNCTION lion_vfy_item(regclass, int8, int);
+DROP FUNCTION lion_vfy_u32(regclass, int8, int8);
+DROP FUNCTION lion_vfy_le32(int8);
 /*
  * lion_index_posting_root() takes a column VALUE, and a multi-key column's
  * entries are keys extracted from values (DESIGN.md §17): a whole tsvector

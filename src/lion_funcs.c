@@ -14,16 +14,44 @@
  * lion_index_verify() is a PARENT check in amcheck's sense
  * (bt_index_parent_check()): it compares every level of the directory and of
  * each posting tree with the whole level below it, and proves that every
- * block is reachable exactly once.  None of that holds between pages read at
- * different moments while writers split them - a level walked before a split
- * and its parent walked after it disagree, a block number taken at the start
- * is exceeded by the first page a split allocates, and a page allocated after
- * the walk passed is reachable from nothing it saw - so it takes ShareLock on
- * the table and then on the index, which keeps every INSERT, UPDATE, DELETE
- * and VACUUM out for as long as it runs and makes it check one index rather
- * than a moving one.  During recovery no lock above RowExclusiveLock can be
- * taken, and no lock stops replay anyway: there it takes AccessShareLock and
- * is exact only while replay leaves the index alone (DESIGN.md section 7).
+ * block is reachable exactly once.  It does that WITHOUT BLOCKING WRITERS,
+ * the way CREATE INDEX CONCURRENTLY builds an index beside them (DESIGN.md
+ * section 7):
+ *
+ *	- It takes ShareUpdateExclusiveLock on the table and then on the index.
+ *	  INSERT, UPDATE and DELETE go on; VACUUM, ANALYZE, DDL and a second
+ *	  verify() wait.  With VACUUM out nothing leaves the index while it is
+ *	  walked - no TID, no entry, no page - so the only changes it can meet
+ *	  are the ones an INSERT makes, and each of them is either invisible to a
+ *	  check or accounted for below.
+ *	- Every check that a concurrent INSERT can make fail on a sound index is
+ *	  settled on the spot where one more read proves it (a right sibling's
+ *	  left link after a split, a root flag after a root split, a link past
+ *	  the block count taken at the start), retried where a whole posting set
+ *	  has to be read again, and otherwise recorded as a CANDIDATE: a downlink
+ *	  to a page the walk of its level did not reach, a live page no walk
+ *	  reached.  After the walk, and only when there are candidates, it waits
+ *	  for the statements that are writing the index - WaitForLockers() on the
+ *	  index, in the mode CIC waits in, which conflicts with the
+ *	  RowExclusiveLock a writing statement holds on it - and checks the
+ *	  candidates again, one targeted lookup each.  What is still wrong then is
+ *	  reported.  The wait lasts as long as those statements do, unless
+ *	  lock_timeout or statement_timeout ends it first; an index nobody wrote
+ *	  to while it was walked is not waited for at all.
+ *	- A posting set is walked without its entry's directory leaf held, and
+ *	  the entry is read again afterwards: every change a writer makes to a
+ *	  set moves its counters or its tail, and every writer of a key holds
+ *	  that leaf from its first record to its last, so an entry that reads the
+ *	  same before and after was walked while nobody wrote to it.  A set that
+ *	  keeps changing is walked a last time with the leaf held SHARE, which
+ *	  keeps the writers of that one leaf's keys waiting for that one walk.
+ *
+ * During recovery no lock above RowExclusiveLock can be taken and replay
+ * takes no relation locks at all: there it takes AccessShareLock, reports
+ * what it finds at once, as it always has, and is exact only while replay
+ * leaves the index alone.  None of the settling above holds against replay,
+ * which locks each record's pages for that record alone, so a standby is the
+ * one place verify() can report damage that is not there.
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table
@@ -64,12 +92,49 @@ PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 
 #define LION_STATS_NCOLS		24
 
+/*
+ * A check a concurrent INSERT can make fail on a sound index, recorded instead
+ * of reported and settled once the writers that were in flight are done
+ * (DESIGN.md §7, "suspect, wait, recheck").
+ */
+typedef enum LionVerifyCandKind
+{
+	/*
+	 * A downlink of the directory to a page the walk of the level below did
+	 * not reach: a split made that page after the walk had passed its left
+	 * neighbour.  Settled by walking the level from that neighbour to the
+	 * next page the walk did reach, which is where a split puts it.
+	 */
+	LION_VCAND_DOWNLINK,
+
+	/*
+	 * A live page no walk reached: one a split, a root push-down or a spill
+	 * made - from the end of the relation or out of the free space map -
+	 * after the walk had passed the place it went.  Settled by a search for
+	 * the page's own first key from its tree's root, or, for the root of a
+	 * posting set, by finding the entry that names it.
+	 */
+	LION_VCAND_UNREACHED
+} LionVerifyCandKind;
+
+typedef struct LionVerifyCand
+{
+	LionVerifyCandKind kind;
+	BlockNumber blk;
+	uint16		level;			/* DOWNLINK: the level blk has to be on */
+	BlockNumber left;			/* DOWNLINK: the reached page before it */
+	BlockNumber right;			/* DOWNLINK: the reached page after it, or
+								 * InvalidBlockNumber when there is none */
+	int			downlink;		/* DOWNLINK: its position on its level */
+} LionVerifyCand;
+
 typedef struct LionVerifyState
 {
 	Relation	index;
 	Relation	heap;
 	LionIndexState *ix;
-	BlockNumber nblocks;
+	BlockNumber nblocks;		/* the block count, re-read when a link passes it */
+	BlockNumber startblocks;	/* ... and what it was when the check began */
 	uint8	   *refs;			/* how often each block is referenced */
 	LionContainer *cbuf;			/* aligned container work buffer */
 	BlockNumber root;			/* the directory root, from the meta page */
@@ -84,7 +149,57 @@ typedef struct LionVerifyState
 	int64		nheaptuples;
 	bool		showvalues;		/* the CALLER is a superuser; decided before
 								 * the switch to the table owner */
+
+	/*
+	 * Writers may run beside the check: true on a primary, where the check
+	 * holds ShareUpdateExclusiveLock.  On a standby it is false, and every
+	 * suspicion is reported the moment it arises, as it always was there.
+	 */
+	bool		concurrent;
+	bool		rootsplit;		/* the meta page showed a taller directory */
+	LionVerifyCand *cands;		/* what the walk could not settle */
+	int			ncands;
+	int			maxcands;
+
+	/*
+	 * The blocks the posting-set walk in progress has marked in refs, so that
+	 * a walk that has to be repeated (lion_verify_set()) can unmark them: a
+	 * page reached twice is otherwise a page with two owners.
+	 */
+	MemoryContext setcxt;		/* for one set's walks, emptied after it */
+	bool		settrack;
+	BlockNumber *setvisits;		/* allocated outside setcxt */
+	int			nsetvisits;
+	int			maxsetvisits;
+
+	/* What the concurrency cost, for the DEBUG1 line at the end. */
+	int64		nleftlinks;		/* left links settled by a coupled walk */
+	int64		nrootsplits;	/* root flags settled by the meta page */
+	int64		nsetwalks;		/* posting-set walks */
+	int64		nsetretries;	/* ... thrown away because a writer got in */
+	int64		nsetholds;		/* ... made with the entry's leaf held */
+	int			nwaits;			/* WaitForLockers() calls */
 } LionVerifyState;
+
+/*
+ * How many times a posting set is walked with nothing held before the walk is
+ * made with its entry's directory leaf held SHARE (lion_verify_set()).  Each
+ * extra walk costs this backend a read of the set; the last one costs the
+ * writers of that leaf's keys a wait for one read of it.
+ */
+#define LION_VERIFY_SET_ATTEMPTS	3
+
+/* What one walk of a posting set found (lion_verify_chain()). */
+typedef struct LionVerifySetResult
+{
+	uint64		card;			/* TIDs its leaves hold */
+	uint32		ncontainers;	/* items its leaves hold */
+	BlockNumber last;			/* the last leaf of the right-link chain */
+	uint32		height;			/* its root's level */
+	int			nincomplete;	/* pages flagged LION_PAGE_INCOMPLETE_SPLIT */
+	int			maxincomplete;
+	BlockNumber *incomplete;
+} LionVerifySetResult;
 
 /*
  * Report structural damage.  Every message names the block (and item) the
@@ -691,33 +806,43 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
  * lion_index_verify()
  * --------------------------------------------------------------------- */
 
+/* Take the index's length again, and grow the per-block array with it. */
+static void
+lion_verify_refresh_nblocks(LionVerifyState *vs)
+{
+	BlockNumber n = RelationGetNumberOfBlocks(vs->index);
+
+	if (n > vs->nblocks)
+	{
+		vs->refs = (uint8 *) repalloc0(vs->refs, Max(vs->nblocks, 1),
+									   sizeof(uint8) * n);
+		vs->nblocks = n;
+	}
+}
+
 /*
  * Is blk a block of the index?
  *
- * vs->nblocks is the count taken when the check began, and nothing can extend
- * the index under the ShareLock the check holds - except replay, during
- * recovery, where the lock keeps nothing out.  There the count is read again
- * before a block is called out of range, so that a leaf replay has just split
- * onto a new block is not reported as a link past the end.
+ * vs->nblocks starts as the count taken when the check began, and the index
+ * grows while it runs: INSERTs go on beside it on a primary, and replay does
+ * on a standby.  A split takes its new page from the end of the relation and
+ * links it in the record that initialises it, so a link to a block past the
+ * count the check started with is the commonest thing a concurrent writer
+ * shows it.  The count is therefore read again before a block is called out of
+ * range, and only a block that is past the end NOW is: that needs no waiting,
+ * since a page is linked in the same record that makes it exist.
+ * InvalidBlockNumber is never a block (and must never reach ReadBuffer(),
+ * which takes it for P_NEW and extends the relation on 16 to 18).
  */
 static bool
 lion_verify_block_exists(LionVerifyState *vs, BlockNumber blk)
 {
 	if (blk < vs->nblocks)
 		return true;
+	if (!BlockNumberIsValid(blk))
+		return false;
 
-	if (RecoveryInProgress())
-	{
-		BlockNumber n = RelationGetNumberOfBlocks(vs->index);
-
-		if (n > vs->nblocks)
-		{
-			vs->refs = (uint8 *) repalloc0(vs->refs, Max(vs->nblocks, 1),
-										   sizeof(uint8) * n);
-			vs->nblocks = n;
-		}
-	}
-
+	lion_verify_refresh_nblocks(vs);
 	return blk < vs->nblocks;
 }
 
@@ -737,6 +862,94 @@ lion_verify_visit(LionVerifyState *vs, BlockNumber blk, const char *what)
 					RelationGetRelationName(vs->index), blk, what);
 
 	vs->refs[blk]++;
+
+	if (vs->settrack)
+	{
+		if (vs->nsetvisits >= vs->maxsetvisits)
+		{
+			/* repalloc() keeps the array in the context it was made in */
+			vs->maxsetvisits *= 2;
+			vs->setvisits = (BlockNumber *) repalloc(vs->setvisits,
+													 sizeof(BlockNumber) * vs->maxsetvisits);
+		}
+		vs->setvisits[vs->nsetvisits++] = blk;
+	}
+}
+
+/*
+ * A walk of a posting set that may have to be repeated keeps a list of the
+ * blocks it marks (lion_verify_set()); a walk that is kept leaves them marked,
+ * one that is thrown away unmarks them for the next.
+ */
+static void
+lion_verify_track_begin(LionVerifyState *vs)
+{
+	vs->settrack = true;
+	vs->nsetvisits = 0;
+}
+
+static void
+lion_verify_track_end(LionVerifyState *vs, bool keep)
+{
+	int			i;
+
+	if (!keep)
+	{
+		for (i = 0; i < vs->nsetvisits; i++)
+		{
+			Assert(vs->refs[vs->setvisits[i]] > 0);
+			vs->refs[vs->setvisits[i]]--;
+		}
+	}
+	vs->settrack = false;
+	vs->nsetvisits = 0;
+}
+
+/* Record a candidate for lion_verify_recheck(); only on a primary. */
+static void
+lion_verify_add_cand(LionVerifyState *vs, const LionVerifyCand *cand)
+{
+	Assert(vs->concurrent);
+
+	if (vs->ncands >= vs->maxcands)
+	{
+		vs->maxcands = Max(vs->maxcands * 2, 16);
+		vs->cands = (vs->cands == NULL) ?
+			(LionVerifyCand *) palloc(sizeof(LionVerifyCand) * vs->maxcands) :
+			(LionVerifyCand *) repalloc(vs->cands,
+										sizeof(LionVerifyCand) * vs->maxcands);
+	}
+	vs->cands[vs->ncands++] = *cand;
+}
+
+static int
+lion_verify_blkcmp(const void *a, const void *b)
+{
+	BlockNumber x = *(const BlockNumber *) a;
+	BlockNumber y = *(const BlockNumber *) b;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/* A sorted copy of n block numbers, for lion_verify_has_block(). */
+static BlockNumber *
+lion_verify_sorted_blocks(const BlockNumber *blocks, int n)
+{
+	BlockNumber *s = (BlockNumber *) palloc(sizeof(BlockNumber) * Max(n, 1));
+
+	if (n > 0)
+	{
+		memcpy(s, blocks, sizeof(BlockNumber) * n);
+		qsort(s, n, sizeof(BlockNumber), lion_verify_blkcmp);
+	}
+	return s;
+}
+
+static bool
+lion_verify_has_block(const BlockNumber *sorted, int n, BlockNumber blk)
+{
+	return n > 0 &&
+		bsearch(&blk, sorted, n, sizeof(BlockNumber), lion_verify_blkcmp) != NULL;
 }
 
 /*
@@ -1163,11 +1376,36 @@ lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
 	lvl->npages++;
 }
 
-/* The page kind and owner checks every page of a posting set goes through. */
+/* The unfinished-split WARNING, which a set walk may defer (see below). */
+static void
+lion_verify_warn_posting_incomplete(LionVerifyState *vs, BlockNumber blk)
+{
+	ereport(WARNING,
+			(errmsg("lion index \"%s\": posting page %u has an unfinished split",
+					RelationGetRelationName(vs->index), blk),
+			 errdetail("Its right sibling has no downlink in the parent yet."),
+			 errhint("The next INSERT into that key repairs it.")));
+}
+
+/*
+ * The page kind and owner checks every page of a posting set goes through.
+ *
+ * With `exact` false the walk is one lion_verify_set() may throw away and
+ * repeat, because writers of the key can be changing the set under it; then
+ * one check here is not an error but a reason to walk again - the ROOT at
+ * another level than the descent found it at, which is what a push-down of
+ * the root does (DESIGN.md §22: the root keeps its block and becomes the
+ * level above) - and NULL comes back with the buffer released.  Every other
+ * check here is exact whatever writers do: VACUUM, the only thing that frees
+ * a page, is locked out, so a page reached through a link of the set belongs
+ * to the set for as long as the check runs, and no page but the root ever
+ * changes level.
+ */
 static Page
 lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
 						 BlockNumber eblk, OffsetNumber eoff,
 						 const LionEntryTuple *entry, uint16 level,
+						 bool exact, LionVerifySetResult *res,
 						 Buffer *bufp)
 {
 	Page		page;
@@ -1195,29 +1433,67 @@ lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
 					entry->hash, entry->head);
 
 	if (opaque->level != level)
+	{
+		if (!exact && blk == entry->head)
+		{
+			UnlockReleaseBuffer(*bufp);
+			*bufp = InvalidBuffer;
+			return NULL;
+		}
 		lion_corrupt("lion index \"%s\": posting page %u of chain entry %u on block %u is at level %u, expected %u",
 					RelationGetRelationName(vs->index), blk, eoff, eblk,
 					opaque->level, level);
+	}
 
+	/*
+	 * A flag seen under a SHARE lock is a split that was abandoned, never one
+	 * in progress: a writer holds the flagged page EXCLUSIVE from the record
+	 * that sets the flag to the one that clears it (DESIGN.md §22), so this
+	 * is exact on a primary.  A walk that may be repeated warns only once it
+	 * is kept, which lion_verify_chain_totals() does.
+	 */
 	if (LionPageIncompleteSplit(page))
-		ereport(WARNING,
-				(errmsg("lion index \"%s\": posting page %u has an unfinished split",
-						RelationGetRelationName(vs->index), blk),
-				 errdetail("Its right sibling has no downlink in the parent yet."),
-				 errhint("The next INSERT into that key repairs it.")));
+	{
+		if (exact)
+			lion_verify_warn_posting_incomplete(vs, blk);
+		else
+		{
+			if (res->nincomplete >= res->maxincomplete)
+			{
+				res->maxincomplete = Max(res->maxincomplete * 2, 4);
+				res->incomplete = (res->incomplete == NULL) ?
+					(BlockNumber *) palloc(sizeof(BlockNumber) * res->maxincomplete) :
+					(BlockNumber *) repalloc(res->incomplete,
+											 sizeof(BlockNumber) * res->maxincomplete);
+			}
+			res->incomplete[res->nincomplete++] = blk;
+		}
+	}
 
 	return page;
 }
 
 /*
  * Walk the LEAF chain of a posting set, left to right: the items of each page
- * and the ascending ckey order within and across pages.
+ * and the ascending ckey order within and across pages.  Returns false when
+ * the walk has to be repeated (see lion_verify_posting_page()).
+ *
+ * The order across pages is exact even with the key's writers running: a
+ * split moves items only onto a page it links immediately right of the page
+ * they came from, so everything the walk read on one page is below everything
+ * on the page it read that page's right link from.  So is the set of items
+ * the walk sees: an item that moves right in a split the walk has not reached
+ * yet is met on its new page, one that moves after the walk read its page was
+ * seen there.  What is NOT exact while writers run is how many items there
+ * are and which leaf is the last, so those are only collected here and
+ * compared by lion_verify_chain_totals() - except in an exact walk, which
+ * checks the tail at once, as it always did.
  */
-static void
+static bool
 lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 						   OffsetNumber eoff, const LionEntryTuple *entry,
 						   BlockNumber first, LionVerifyPLevel *out,
-						   uint64 *cardp, uint32 *ncontainersp)
+						   bool exact, LionVerifySetResult *res)
 {
 	BlockNumber blk = first;
 	BlockNumber last = InvalidBlockNumber;
@@ -1236,7 +1512,10 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 		uint32		minckey = 0;
 		uint32		maxckey = 0;
 
-		page = lion_verify_posting_page(vs, blk, eblk, eoff, entry, 0, &buf);
+		page = lion_verify_posting_page(vs, blk, eblk, eoff, entry, 0, exact,
+										res, &buf);
+		if (page == NULL)
+			return false;
 		opaque = LionPageGetOpaque(page);
 		maxoff = PageGetMaxOffsetNumber(page);
 
@@ -1252,8 +1531,8 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 			lion_verify_container(vs, blk, off, c, ItemIdGetLength(iid),
 								 &haveprev, &prevckey);
 
-			*cardp += c->cardinality;
-			(*ncontainersp)++;
+			res->card += c->cardinality;
+			res->ncontainers++;
 
 			if (firstused == InvalidOffsetNumber)
 				firstused = off;
@@ -1294,18 +1573,24 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	if (last != entry->tail)
+	res->last = last;
+	if (exact && last != entry->tail)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, last,
 					entry->tail);
+	return true;
 }
 
-/* Walk one INTERNAL level of a posting set, collecting its downlinks. */
-static void
+/*
+ * Walk one INTERNAL level of a posting set, collecting its downlinks.
+ * Returns false when the walk has to be repeated (lion_verify_posting_page()).
+ */
+static bool
 lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 						  OffsetNumber eoff, const LionEntryTuple *entry,
 						  BlockNumber first, uint16 level,
-						  LionVerifyPLevel *out, LionVerifyPLevel *children)
+						  LionVerifyPLevel *out, LionVerifyPLevel *children,
+						  bool exact, LionVerifySetResult *res)
 {
 	BlockNumber blk = first;
 
@@ -1322,7 +1607,10 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 		bool		hasfirst = false;
 		uint32		prevkey = 0;
 
-		page = lion_verify_posting_page(vs, blk, eblk, eoff, entry, level, &buf);
+		page = lion_verify_posting_page(vs, blk, eblk, eoff, entry, level,
+										exact, res, &buf);
+		if (page == NULL)
+			return false;
 		maxoff = PageGetMaxOffsetNumber(page);
 		firstdata = lion_posting_first_data(page);
 
@@ -1404,6 +1692,8 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	return true;
 }
 
 /*
@@ -1415,15 +1705,36 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
  * above is then checked against what that walk collected, which proves that
  * its downlinks name exactly those pages in that order - which is the same
  * statement as "the leaf right-link chain equals the in-order leaf sequence".
+ *
+ * `entry` is the caller's copy.  With `exact` the set cannot change while it
+ * is walked - its entry's directory leaf is held, or this is a standby, where
+ * nothing can be held against replay and the answer is what it always was -
+ * and everything is checked and reported here but the totals, which
+ * lion_verify_chain_totals() compares with the entry.
+ *
+ * Without it, writers of the key may be changing the set, and this is one
+ * attempt of lion_verify_set(), which reads the entry again afterwards and
+ * throws the attempt away when anything changed.  Walking the LOWER level
+ * FIRST is what makes a concurrent split harmless to the comparison of two
+ * levels: a split puts its new page into the level's right-link chain in its
+ * first record and the downlink into the parent in a later one, and holds the
+ * page to the left of the new one EXCLUSIVE - and flagged - in between, where
+ * no walk can read it.  So a page the child walk found either has a downlink
+ * by the time the parent level is walked, or its left neighbour was read with
+ * the flag of a split that was ABANDONED (an error, a crash), which the
+ * comparison has always accepted.  The one thing a split between the two
+ * walks can show is a downlink to a page the child walk never saw, and that
+ * is a reason to walk again, not a finding - the insert that made it moved
+ * the entry's counters anyway - as is a root pushed down under the walk.
+ * Everything else the comparison checks is exact.
  */
-static void
+static bool
 lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
-				 const LionEntryTuple *entry)
+				  const LionEntryTuple *entry, bool exact,
+				  LionVerifySetResult *res)
 {
 	BlockNumber leftmost[LION_POSTING_MAX_HEIGHT + 1];
 	LionVerifyPLevel *lvl;
-	uint64		card = 0;
-	uint32		ncontainers = 0;
 	uint32		height = 0;
 	uint32		i;
 	int			j;
@@ -1502,10 +1813,22 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		}
 	}
 
+	res->height = height;
 	lvl = (LionVerifyPLevel *) palloc0(sizeof(LionVerifyPLevel) * (height + 1));
 
-	lion_verify_posting_leaves(vs, eblk, eoff, entry, leftmost[0], &lvl[0],
-							   &card, &ncontainers);
+	if (!lion_verify_posting_leaves(vs, eblk, eoff, entry, leftmost[0], &lvl[0],
+									exact, res))
+		return false;
+
+	/*
+	 * Test hook: the leaves are walked, the levels above are not, and nothing
+	 * is held.  test/isolation/verify_concurrent.spec parks here and has an
+	 * INSERT split a leaf of this set or push its root down.  Never in an
+	 * exact walk, which may hold a directory leaf that a writer would then
+	 * wait for without isolationtester seeing it wait.
+	 */
+	if (!exact)
+		LION_INJECTION_POINT("lion-verify-set-leaves-walked");
 
 	for (i = 1; i <= height; i++)
 	{
@@ -1514,8 +1837,33 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		int			p;
 
 		memset(&children, 0, sizeof(children));
-		lion_verify_posting_level(vs, eblk, eoff, entry, leftmost[i],
-								  (uint16) i, &lvl[i], &children);
+		if (!lion_verify_posting_level(vs, eblk, eoff, entry, leftmost[i],
+									   (uint16) i, &lvl[i], &children, exact,
+									   res))
+			return false;
+
+		/*
+		 * A downlink to a page the walk of the level below did not see is a
+		 * split made after that walk passed: walk the set again (see the
+		 * header).  In an exact walk nothing can have split, and the
+		 * comparison below reports such a downlink as the mismatch it is.
+		 */
+		if (!exact)
+		{
+			BlockNumber *seen = lion_verify_sorted_blocks(below->blocks,
+														  below->npages);
+
+			for (j = 0; j < children.npages; j++)
+			{
+				if (!lion_verify_has_block(seen, below->npages,
+										   children.blocks[j]))
+				{
+					pfree(seen);
+					return false;
+				}
+			}
+			pfree(seen);
+		}
 
 		/*
 		 * Match the downlinks, in the order the walk of this level found
@@ -1592,18 +1940,255 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 						children.npages, i - 1, below->npages);
 	}
 
-	if (height > vs->max_posting_height)
-		vs->max_posting_height = height;
+	return true;
+}
 
-	if (card != entry->ntids)
+/*
+ * What a walk of a posting set is compared with its entry by: the last leaf
+ * against `tail`, the TIDs and items against `ntids` and `ncontainers`.  Only
+ * for a walk that is kept: an exact one, or one lion_verify_set() found the
+ * entry unchanged around.  Also where a kept walk's unfinished-split warnings
+ * are given, so that a walk that is thrown away and repeated gives them once.
+ */
+static void
+lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
+						 OffsetNumber eoff, const LionEntryTuple *entry,
+						 const LionVerifySetResult *res)
+{
+	int			i;
+
+	for (i = 0; i < res->nincomplete; i++)
+		lion_verify_warn_posting_incomplete(vs, res->incomplete[i]);
+
+	if (res->last != entry->tail)
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
+					RelationGetRelationName(vs->index), eoff, eblk, res->last,
+					entry->tail);
+
+	if (res->height > vs->max_posting_height)
+		vs->max_posting_height = res->height;
+
+	if (res->card != entry->ntids)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims " UINT64_FORMAT " TIDs, but its containers hold " UINT64_FORMAT,
 					RelationGetRelationName(vs->index), eoff, eblk,
-					entry->ntids, card);
+					entry->ntids, res->card);
 
-	if (ncontainers != entry->ncontainers)
+	if (res->ncontainers != entry->ncontainers)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims %u containers, but its posting tree holds %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
-					entry->ncontainers, ncontainers);
+					entry->ncontainers, res->ncontainers);
+}
+
+/* Does the entry header read now say what the one read before said? */
+static bool
+lion_verify_same_entry(const LionEntryTuple *a, const LionEntryTuple *b)
+{
+	return a->flags == b->flags && a->head == b->head && a->tail == b->tail &&
+		a->ntids == b->ntids && a->ncontainers == b->ncontainers;
+}
+
+/*
+ * Find the entry `cur` names again, by its exact stored key, and copy its
+ * header - flags, head, tail, counters - over cur's; the key, the hash and the
+ * column cannot change.  *blkp is the leaf it was last seen on and the search
+ * starts there and goes right: an entry only ever leaves its leaf in a split,
+ * for the page the split links immediately to the right (DESIGN.md §21), and
+ * nothing deletes an entry while VACUUM is locked out.  So the leaf whose high
+ * key is above the key is where the entry is, and its absence there is
+ * corruption.  With keep the leaf comes back locked SHARE (the last resort of
+ * lion_verify_set()), else it is released.
+ */
+static Buffer
+lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
+				   OffsetNumber *offp, bool keep)
+{
+	LionSearchKey sk;
+	BlockNumber blk = *blkp;
+	BlockNumber steps = 0;
+
+	lion_search_key_exact(vs->ix, &sk, cur);
+
+	for (;;)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+		ItemId		iid;
+		LionEntryTuple *item;
+
+		page = lion_verify_read_page(vs, blk, LION_PAGE_BUCKET, &buf);
+		if (LionPageGetOpaque(page)->level != 0)
+			lion_corrupt("lion index \"%s\": directory leaf %u is at level %u",
+						RelationGetRelationName(vs->index), blk,
+						LionPageGetOpaque(page)->level);
+
+		/* a page split onto since the walk read it has not been checked */
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+			(void) lion_verify_dir_item(vs, blk, page, off);
+		if (!LionPageIsRightmost(page) &&
+			(maxoff < FirstOffsetNumber ||
+			 !ItemIdIsUsed(PageGetItemId(page, FirstOffsetNumber)) ||
+			 !LionEntryIsHighKey(lion_page_entry(page, FirstOffsetNumber))))
+			lion_corrupt("lion index \"%s\": the first item of directory page %u is not a high key",
+						RelationGetRelationName(vs->index), blk);
+
+		if (!LionPageIsRightmost(page) &&
+			lion_cmp_entry(lion_page_entry(page, FirstOffsetNumber), &sk) <= 0)
+		{
+			/* the entry went right with the upper half of a split */
+			BlockNumber next = LionPageGetOpaque(page)->rightlink;
+
+			UnlockReleaseBuffer(buf);
+			if (++steps > vs->nblocks)
+				lion_corrupt("lion index \"%s\": the right links of the directory leaves from block %u go round in a cycle",
+							RelationGetRelationName(vs->index), *blkp);
+			blk = next;
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		off = lion_dir_binsrch(page, &sk);
+		iid = (off <= maxoff) ? PageGetItemId(page, off) : NULL;
+		item = (iid != NULL && ItemIdIsUsed(iid)) ?
+			(LionEntryTuple *) PageGetItem(page, iid) : NULL;
+		if (item == NULL || lion_cmp_entry(item, &sk) != 0)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is not on block %u, where its key sorts",
+						RelationGetRelationName(vs->index), *offp, *blkp, blk);
+		if ((item->flags & LION_ENTRY_CHAIN) != 0 &&
+			ItemIdGetLength(iid) != LionEntryPayloadOffset(item))
+			lion_corrupt("lion index \"%s\": chain entry %u on block %u is %zu bytes, expected %zu",
+						RelationGetRelationName(vs->index), off, blk,
+						(Size) ItemIdGetLength(iid),
+						LionEntryPayloadOffset(item));
+
+		cur->flags = item->flags;
+		cur->head = item->head;
+		cur->tail = item->tail;
+		cur->ntids = item->ntids;
+		cur->ncontainers = item->ncontainers;
+
+		*blkp = blk;
+		*offp = off;
+		if (keep)
+			return buf;
+		UnlockReleaseBuffer(buf);
+		return InvalidBuffer;
+	}
+}
+
+/*
+ * Walk and check the posting set of the CHAIN entry `entry`, which the walk
+ * of the directory found at (eblk, eoff) - on its copy of the leaf, with the
+ * leaf itself no longer locked (DESIGN.md §7).
+ *
+ * The counters of a set that writers are adding to cannot be compared with
+ * its containers by a walk that holds nothing, and holding the entry's leaf
+ * for every walk would keep the writers of every key on that leaf waiting
+ * for it.  So the set is walked with nothing held, and the entry read again
+ * afterwards, and the walk is kept when the entry reads the same both times.
+ * That is exact, for two reasons.  Every writer of a key holds the directory
+ * leaf of its entry EXCLUSIVE from its first record to its last (§5, §21),
+ * and the entry was read under a SHARE lock both times, so a writer that
+ * changed the set in between did all of it in between.  And every change an
+ * INSERT makes to a set moves the entry: an item added, grown or split off
+ * adds a TID to `ntids` in the record that places it, a push-down of the root
+ * moves `tail`; the one kind of writer that adds no TID - one that finishes an
+ * abandoned split on its way down and then finds its TID already there, or
+ * fails - only adds a downlink and clears a flag, which the walk accepts
+ * either way, and whatever internal split that makes shows up as a downlink
+ * the walk of the level below never saw, which throws the walk away too.
+ * VACUUM, the one writer that changes containers without adding TIDs, is
+ * locked out.
+ *
+ * A set that keeps changing - a hot key - is walked at most
+ * LION_VERIFY_SET_ATTEMPTS times that way, and then once more with the leaf
+ * held SHARE throughout.  That is the lock order every writer uses (directory
+ * page before posting page, §5), and it keeps waiting only the writers of the
+ * keys on that one leaf, for one walk of one set.  On a standby that walk is
+ * the only one: replay does not lock the entry's leaf across its records, so
+ * the entry reading the same proves nothing there, and verify() reports what
+ * it finds, as it always did.
+ */
+static void
+lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
+					  const LionEntryTuple *entry)
+{
+	Size		sz = LionEntryPayloadOffset(entry);
+	LionEntryTuple *cur = (LionEntryTuple *) palloc(sz);
+	BlockNumber blk = eblk;
+	OffsetNumber off = eoff;
+	LionVerifySetResult res;
+	Buffer		leaf;
+	int			attempt;
+
+	memcpy(cur, entry, sz);
+
+	for (attempt = 0; vs->concurrent && attempt < LION_VERIFY_SET_ATTEMPTS;
+		 attempt++)
+	{
+		LionEntryTuple before = *cur;
+		bool		ok;
+
+		memset(&res, 0, sizeof(res));
+		lion_verify_track_begin(vs);
+		vs->nsetwalks++;
+		ok = lion_verify_chain(vs, blk, off, cur, false, &res);
+		(void) lion_verify_refind(vs, cur, &blk, &off, false);
+
+		if (ok && lion_verify_same_entry(&before, cur))
+		{
+			lion_verify_track_end(vs, true);
+			lion_verify_chain_totals(vs, blk, off, cur, &res);
+			pfree(cur);
+			return;
+		}
+
+		/* A writer got in; forget what this walk marked, and walk again. */
+		lion_verify_track_end(vs, false);
+		vs->nsetretries++;
+		if ((cur->flags & LION_ENTRY_CHAIN) == 0)
+			break;				/* the exact walk below reports it */
+	}
+
+	vs->nsetwalks++;
+	if (vs->concurrent)
+		vs->nsetholds++;
+	leaf = lion_verify_refind(vs, cur, &blk, &off, true);
+
+	/*
+	 * Test hook: the leaf is held and the exact walk is about to begin.
+	 * test/isolation/verify_concurrent.spec attaches 'notice' here to show
+	 * that a set a writer kept changing got this walk.
+	 */
+	LION_INJECTION_POINT("lion-verify-set-held");
+
+	if ((cur->flags & LION_ENTRY_CHAIN) == 0)
+		lion_corrupt("lion index \"%s\": chain entry %u on block %u is an inline entry now",
+					RelationGetRelationName(vs->index), off, blk);
+	memset(&res, 0, sizeof(res));
+	(void) lion_verify_chain(vs, blk, off, cur, true, &res);
+	lion_verify_chain_totals(vs, blk, off, cur, &res);
+	UnlockReleaseBuffer(leaf);
+	pfree(cur);
+}
+
+/*
+ * lion_verify_set_walks() in a memory context of its own, emptied after every
+ * set: the level arrays of a walk - and of every walk thrown away - are
+ * garbage the moment the set is settled, and an index has as many sets as it
+ * has keys with more than an entry's worth of rows.
+ */
+static void
+lion_verify_set(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
+				const LionEntryTuple *entry)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(vs->setcxt);
+
+	lion_verify_set_walks(vs, eblk, eoff, entry);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(vs->setcxt);
 }
 
 /*
@@ -1783,7 +2368,12 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						RelationGetRelationName(vs->index), off, blk, itemsz,
 						LionEntryPayloadOffset(entry));
 
-		lion_verify_chain(vs, blk, off, entry);
+		if (!BlockNumberIsValid(entry->head) || !BlockNumberIsValid(entry->tail))
+			lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
+						RelationGetRelationName(vs->index), off, blk,
+						entry->head, entry->tail);
+
+		lion_verify_set(vs, blk, off, entry);
 	}
 }
 
@@ -1941,8 +2531,138 @@ lion_verify_run_add(LionVerifyState *vs, LionVerifyRun *run,
 }
 
 /*
+ * A directory page's left link is not the page the walk came from.
+ *
+ * On a sound index that is a split of the page the walk came from, made after
+ * the walk read it: the split links its new page between the two in the same
+ * record that changes this page's left link (DESIGN.md §21), and a walk that
+ * follows the right link it read never visits the new page.  So the level is
+ * walked again from `prev` to blk with each page held until its right sibling
+ * is locked - left to right, the order every directory writer locks one level
+ * in, so it cannot deadlock - and with both of two neighbours locked, the
+ * right one's left link naming the left one is exact.  The pages found in
+ * between are not visited here: nothing reached them, and the reachability
+ * pass settles them as it settles every page a split made behind the walk.
+ */
+static void
+lion_verify_leftlink(LionVerifyState *vs, BlockNumber blk, uint16 level,
+					 uint16 kind, BlockNumber prev, BlockNumber leftlink)
+{
+	Buffer		buf;
+	Page		page;
+	BlockNumber cur = prev;
+	BlockNumber steps = 0;
+
+	if (!vs->concurrent || !BlockNumberIsValid(prev))
+		lion_corrupt("lion index \"%s\": directory page %u has left link %u, expected %u",
+					RelationGetRelationName(vs->index), blk, leftlink, prev);
+
+	vs->nleftlinks++;
+	page = lion_verify_read_page(vs, cur, kind, &buf);
+	for (;;)
+	{
+		BlockNumber next = LionPageGetOpaque(page)->rightlink;
+		Buffer		nbuf;
+		Page		npage;
+
+		if (!BlockNumberIsValid(next) || ++steps > vs->nblocks)
+			lion_corrupt("lion index \"%s\": directory page %u has left link %u, expected %u, and the right links from block %u do not lead to it",
+						RelationGetRelationName(vs->index), blk, leftlink, prev,
+						prev);
+
+		npage = lion_verify_read_page(vs, next, kind, &nbuf);
+		if (LionPageGetOpaque(npage)->level != level)
+			lion_corrupt("lion index \"%s\": directory page %u is at level %u, expected %u",
+						RelationGetRelationName(vs->index), next,
+						LionPageGetOpaque(npage)->level, level);
+		if (LionPageGetOpaque(npage)->leftlink != cur)
+			lion_corrupt("lion index \"%s\": directory page %u has left link %u, expected %u",
+						RelationGetRelationName(vs->index), next,
+						LionPageGetOpaque(npage)->leftlink, cur);
+		UnlockReleaseBuffer(buf);
+		buf = nbuf;
+		page = npage;
+		cur = next;
+		if (cur == blk)
+			break;
+		CHECK_FOR_INTERRUPTS();
+	}
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * A page at the height the meta page gave has no root flag.
+ *
+ * On a sound index that is a root split made since the meta page was read:
+ * it takes the flag off the old root, which stays at its block and level as
+ * the left half, and names a new root one level up in the meta page, in one
+ * record (DESIGN.md §21).  So a meta page that now says the directory is
+ * taller settles it at once.  The new root and the old root's new sibling are
+ * pages the walk may not reach; the reachability pass settles them.
+ */
+static void
+lion_verify_root_flag(LionVerifyState *vs, BlockNumber blk, uint16 level,
+					  bool isroot)
+{
+	if (isroot == (level == vs->height))
+		return;
+
+	if (!isroot && vs->concurrent)
+	{
+		Buffer		buf;
+		Page		page;
+
+		/* once the meta page has said so, it says so for every such page */
+		if (!vs->rootsplit)
+		{
+			page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META,
+										 &buf);
+			vs->rootsplit = LionPageGetMeta(page)->height > vs->height;
+			UnlockReleaseBuffer(buf);
+			if (vs->rootsplit)
+				vs->nrootsplits++;
+		}
+		if (vs->rootsplit)
+			return;
+	}
+
+	lion_corrupt("lion index \"%s\": directory page %u at level %u %s the root flag",
+				RelationGetRelationName(vs->index), blk, level,
+				isroot ? "should not have" : "should have");
+}
+
+/*
+ * Read blk under a SHARE lock, check its header and kind, and copy it into
+ * dest, for a caller that goes on to check the copy with nothing locked.
+ */
+static void
+lion_verify_copy_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
+					  Page dest)
+{
+	Buffer		buf;
+	Page		page;
+
+	page = lion_verify_read_page(vs, blk, kind, &buf);
+	memcpy(dest, page, BLCKSZ);
+	UnlockReleaseBuffer(buf);
+}
+
+/*
  * Walk one level of the directory along its right links.  For an internal
  * level the downlinks and their separators are collected into *children.
+ *
+ * Each page is COPIED under its SHARE lock and checked from the copy, so no
+ * lock is held while the opclass's functions order and hash the keys, nor -
+ * on a leaf - while the posting sets of its CHAIN entries are walked
+ * (lion_verify_set()).  A page is consistent in itself at every moment a
+ * reader can lock it, whatever writers do, so every check of one page is
+ * exact.  So are the checks across two neighbours that read the left one's
+ * high key and the right one's first key: a page's lower bound is the high
+ * key its left neighbour had when the walk read it, a split of the left page
+ * after that only lowers the left page's own high key, and a split never
+ * leaves a page without its first item.  What a concurrent split can change
+ * is the right page's left link (lion_verify_leftlink()) and which page is
+ * the root (lion_verify_root_flag()).
  */
 static void
 lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
@@ -1953,13 +2673,13 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 	BlockNumber prev = InvalidBlockNumber;
 	LionEntryTuple *prevhigh = NULL;
 	LionVerifyRun run;
+	uint16		kind = isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR;
+	Page		page = (Page) palloc(BLCKSZ);
 
 	memset(&run, 0, sizeof(run));
 
 	while (BlockNumberIsValid(blk))
 	{
-		Buffer		buf;
-		Page		page;
 		LionPageOpaque opaque;
 		OffsetNumber maxoff;
 		OffsetNumber off;
@@ -1969,24 +2689,30 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		LionEntryTuple *highkey = NULL;
 
 		lion_verify_visit(vs, blk, "the directory");
-		page = lion_verify_read_page(vs, blk,
-									 isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR,
-									 &buf);
+		lion_verify_copy_page(vs, blk, kind, page);
 		opaque = LionPageGetOpaque(page);
+
+		/*
+		 * Test hook: this page is copied and its right link read, and nothing
+		 * is held.  test/isolation/verify_concurrent.spec parks on the first
+		 * leaf and splits it, so that the next page's left link names the
+		 * split's new page instead of this one.
+		 */
+		LION_INJECTION_POINT("lion-verify-dir-page-read");
 
 		if (opaque->level != level)
 			lion_corrupt("lion index \"%s\": directory page %u is at level %u, expected %u",
 						RelationGetRelationName(vs->index), blk, opaque->level,
 						level);
 		if (opaque->leftlink != prev)
-			lion_corrupt("lion index \"%s\": directory page %u has left link %u, expected %u",
-						RelationGetRelationName(vs->index), blk, opaque->leftlink,
-						prev);
-		if (LionPageIsRoot(page) != (level == vs->height))
-			lion_corrupt("lion index \"%s\": directory page %u at level %u %s the root flag",
-						RelationGetRelationName(vs->index), blk, level,
-						LionPageIsRoot(page) ? "should not have" : "should have");
+			lion_verify_leftlink(vs, blk, level, kind, prev, opaque->leftlink);
+		lion_verify_root_flag(vs, blk, level, LionPageIsRoot(page));
 
+		/*
+		 * Exact: a split holds the page it flags EXCLUSIVE until it clears the
+		 * flag (DESIGN.md §21), so a flag a SHARE lock lets the walk see is one
+		 * a crash or an error left behind.
+		 */
 		if (LionPageIncompleteSplit(page))
 			ereport(WARNING,
 					(errmsg("lion index \"%s\": directory page %u has an unfinished split",
@@ -2082,15 +2808,114 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		prev = blk;
 		prevhigh = highkey;		/* owned by *out; not freed here */
 		blk = opaque->rightlink;
-		UnlockReleaseBuffer(buf);
 
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	pfree(page);
+}
+
+/*
+ * Split the downlinks the walk of level `level` collected into the ones that
+ * name pages the walk of the level below reached - copied into *seen, in
+ * order, for the comparison - and the ones that do not.
+ *
+ * The level below is walked FIRST, so a split made between the two walks
+ * shows up here and nowhere else: its new page went into the level's right
+ * links behind the child walk, and its downlink into this level before this
+ * walk got there.  (A split made before the child walk reached the place is
+ * simply walked: the child walk reads the flagged page only after the split
+ * has finished, because the split holds it EXCLUSIVE until then.)  Such a
+ * downlink is a candidate - the page has to be in the level below, between
+ * the reached page whose downlink precedes it and the one whose downlink
+ * follows it - and lion_verify_recheck_downlink() walks there once the
+ * writers in flight are done.
+ *
+ * Three kinds of downlink to an unreached page are corruption whatever
+ * writers do, and are reported at once: the level's FIRST downlink, which
+ * names the level's leftmost page, and no split ever moves that; one to a
+ * page something else reached - a posting page, or a directory page of
+ * another level - since no page is freed or changes level while the check
+ * runs; and a second downlink to the same page.
+ */
+static void
+lion_verify_filter_downlinks(LionVerifyState *vs, uint32 level,
+							 const LionVerifyLevel *below,
+							 const LionVerifyLevel *children,
+							 LionVerifyLevel *seen)
+{
+	BlockNumber *sorted = lion_verify_sorted_blocks(below->blocks,
+													below->npages);
+	BlockNumber lastseen = InvalidBlockNumber;
+	int			firstcand = vs->ncands;
+	int			pending = vs->ncands;
+	int			j;
+
+	for (j = 0; j < children->npages; j++)
+	{
+		BlockNumber b = children->blocks[j];
+		LionVerifyCand cand;
+
+		if (lion_verify_has_block(sorted, below->npages, b))
+		{
+			lion_verify_level_add(seen, b, children->firstkey[j], NULL, false);
+			/* the candidates since the last reached page lie before this one */
+			for (; pending < vs->ncands; pending++)
+				vs->cands[pending].right = b;
+			lastseen = b;
+			continue;
+		}
+
+		if (j == 0)
+			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, but the next page of level %u is block %u",
+						RelationGetRelationName(vs->index), j, level, b,
+						level - 1, below->blocks[0]);
+		if (b < vs->nblocks && vs->refs[b] != 0)
+			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, which is not a page of level %u",
+						RelationGetRelationName(vs->index), j, level, b,
+						level - 1);
+		if (!vs->concurrent)
+			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, which the walk of level %u did not reach",
+						RelationGetRelationName(vs->index), j, level, b,
+						level - 1);
+
+		memset(&cand, 0, sizeof(cand));
+		cand.kind = LION_VCAND_DOWNLINK;
+		cand.blk = b;
+		cand.level = (uint16) (level - 1);
+		cand.left = lastseen;
+		cand.right = InvalidBlockNumber;
+		cand.downlink = j;
+		lion_verify_add_cand(vs, &cand);
+	}
+
+	/* two downlinks to one unreached page */
+	if (vs->ncands - firstcand > 1)
+	{
+		int			n = vs->ncands - firstcand;
+		BlockNumber *dl = (BlockNumber *) palloc(sizeof(BlockNumber) * n);
+		int			k;
+
+		for (k = 0; k < n; k++)
+			dl[k] = vs->cands[firstcand + k].blk;
+		qsort(dl, n, sizeof(BlockNumber), lion_verify_blkcmp);
+		for (k = 1; k < n; k++)
+		{
+			if (dl[k] == dl[k - 1])
+				lion_corrupt("lion index \"%s\": block %u is referenced more than once (reached again as a downlink of level %u)",
+							RelationGetRelationName(vs->index), dl[k], level);
+		}
+		pfree(dl);
+	}
+
+	pfree(sorted);
 }
 
 /*
  * Check the whole directory: every level, and every level against the one
- * below it.
+ * below it.  The levels are walked from the leaves up, which is what lets a
+ * split made between two walks show up as nothing worse than a downlink to a
+ * page the lower walk did not reach (lion_verify_filter_downlinks()).
  */
 static void
 lion_verify_directory(LionVerifyState *vs)
@@ -2144,16 +2969,20 @@ lion_verify_directory(LionVerifyState *vs)
 
 	for (i = 0; i <= h; i++)
 	{
+		LionVerifyLevel walked;
 		LionVerifyLevel children;
 
+		memset(&walked, 0, sizeof(walked));
 		memset(&children, 0, sizeof(children));
 		lion_verify_walk_level(vs, leftmost[i], (uint16) i, i == 0, &lvl[i],
-							   i == 0 ? NULL : &children);
+							   i == 0 ? NULL : &walked);
 
 		if (i > 0)
 		{
 			const LionVerifyLevel *below = &lvl[i - 1];
 			int			p;
+
+			lion_verify_filter_downlinks(vs, i, below, &walked, &children);
 
 			/*
 			 * Match the downlinks with the pages of the level below, each in
@@ -2222,6 +3051,14 @@ lion_verify_directory(LionVerifyState *vs)
 							RelationGetRelationName(vs->index), i,
 							children.npages, i - 1, below->npages);
 		}
+
+		/*
+		 * Test hook: level i is walked (and compared with level i - 1), the
+		 * levels above it are not, and nothing is held.
+		 * test/isolation/verify_concurrent.spec parks here after the leaves
+		 * and has INSERTs split them, spill an entry and reuse a free page.
+		 */
+		LION_INJECTION_POINT("lion-verify-dir-level-walked");
 	}
 
 	pfree(leftmost);
@@ -2258,7 +3095,12 @@ lion_verify_meta(LionVerifyState *vs)
 					RelationGetRelationName(vs->index), meta->inline_limit,
 					LION_MIN_INLINE_LIMIT, LION_MAX_INLINE_LIMIT);
 
-	if (!BlockNumberIsValid(meta->root) || meta->root >= vs->nblocks)
+	/*
+	 * A root split since the block count was taken can name a root past it
+	 * (lion_verify_block_exists() reads the count again), and makes the
+	 * directory taller, which the bound below reads the count again for.
+	 */
+	if (!lion_verify_block_exists(vs, meta->root))
 		lion_corrupt("lion index \"%s\": meta page names root block %u, but the index has %u blocks",
 					RelationGetRelationName(vs->index), meta->root, vs->nblocks);
 
@@ -2266,6 +3108,8 @@ lion_verify_meta(LionVerifyState *vs)
 	 * A directory of height h has at least h + 1 pages besides this one, and
 	 * the walk sizes its arrays by the height: bound it before it is used.
 	 */
+	if ((uint64) meta->height + 2 > (uint64) vs->nblocks)
+		lion_verify_refresh_nblocks(vs);
 	if ((uint64) meta->height + 2 > (uint64) vs->nblocks)
 		lion_corrupt("lion index \"%s\": meta page has directory height %u, but the index has only %u blocks",
 					RelationGetRelationName(vs->index), meta->height,
@@ -2283,94 +3127,579 @@ lion_verify_meta(LionVerifyState *vs)
 }
 
 /*
- * Every block has to belong to the meta page, the directory or exactly one
- * key's container chain.
+ * What an unreferenced block is, as far as the reachability pass cares.
+ */
+typedef enum LionVerifyUnref
+{
+	LION_UNREF_FREE,			/* a DELETED page: free, and in the map */
+	LION_UNREF_LEAK,			/* what an interrupted allocation leaves */
+	LION_UNREF_INTERNAL,		/* an internal posting page */
+	LION_UNREF_LIVE,			/* a live page, which has to be reachable */
+	LION_UNREF_FOREIGN			/* not a page of this index at all */
+} LionVerifyUnref;
+
+/*
+ * Classify blk, which no walk reached.
  *
- * Some unreferenced blocks are tolerated (with a warning), because a
- * crash or an error can leave them behind and none of them makes the index
- * wrong: a block that was never initialised (the relation was extended and
- * the transaction did not get as far as its WAL record), an empty container
- * page (a crash between the two steps of a whole-set free), and a full leaf
- * whose root was never written (a multi-leaf spill that did not reach its
- * last record) - the kinds the leak sweep of the next VACUUM frees.
+ * Some unreferenced blocks are tolerated (with a warning), because a crash or
+ * an error can leave them behind and none of them makes the index wrong: a
+ * block that was never initialised (the relation was extended and the
+ * transaction did not get as far as its WAL record), an empty container page
+ * (a crash between the two steps of a whole-set free), a full leaf whose root
+ * was never written (a multi-leaf spill that did not reach its last record) -
+ * the kinds the leak sweep of the next VACUUM frees - and an INTERNAL posting
+ * page, which a posting set freed leaves-first leaves behind with its
+ * downlinks still on it (DESIGN.md §22).
+ *
+ * None of that is changed by writers running beside the check: a page a
+ * writer is still initialising is one it holds EXCLUSIVE from the moment it
+ * takes it - out of the free space map, or from ExtendBufferedRel(), which
+ * locks the new block before anyone can read it - to the record that
+ * initialises and links it, so the SHARE lock below waits for that record,
+ * and a page seen all-zero or DELETED under it is one no record came for.  A
+ * new page is never empty, and every page a split or a push-down makes is
+ * stamped with a root that is live.  Only the internal and the live kinds can
+ * be pages a writer made behind the walk, and those are the candidates.
+ */
+static LionVerifyUnref
+lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
+{
+	Buffer		buf;
+	Page		page;
+	BlockNumber ohead;
+	uint32		ohash;
+
+	buf = ReadBuffer(vs->index, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	if (PageIsNew(page))
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_LEAK;
+	}
+	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_FOREIGN;
+	}
+
+	/*
+	 * A DELETED page is the normal state of a freed one (DESIGN.md §18): it
+	 * is unreferenced on purpose, it is in the free space map, and the next
+	 * allocation whose safexid test it passes takes it.  Nothing to report.
+	 */
+	if (LionPageIsDeleted(page))
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_FREE;
+	}
+
+	if (!LionPageIsContainer(page))
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_LIVE;
+	}
+	if (PageGetMaxOffsetNumber(page) == 0)
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_LEAK;
+	}
+	if (LionPageIsPostingInternal(page))
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_INTERNAL;
+	}
+
+	/*
+	 * A FULL leaf is leaked when its root is not a live root of its key: a
+	 * multi-leaf spill that an ERROR or a crash stopped before its last record
+	 * writes the leaves and never the root (lion_entry_spill(), DESIGN.md
+	 * §18).  The root is looked at with nothing held.  A leaf that is its own
+	 * root is a one-page set, which a spill writes in the same record as its
+	 * entry.
+	 */
+	ohead = LionPageGetOpaque(page)->owner_head;
+	ohash = LionPageGetOpaque(page)->owner_hash;
+	UnlockReleaseBuffer(buf);
+
+	if (ohead != blk && !lion_posting_root_live(vs->index, ohash, ohead, true))
+		return LION_UNREF_LEAK;
+	return LION_UNREF_LIVE;
+}
+
+static void
+lion_verify_warn_leak(LionVerifyState *vs, BlockNumber blk)
+{
+	ereport(WARNING,
+			(errmsg("lion index \"%s\": block %u is unused and unreachable",
+					RelationGetRelationName(vs->index), blk),
+			 errdetail("An interrupted page allocation leaks blocks; the next VACUUM turns them into free pages.")));
+}
+
+/* A macro, so that the compiler sees the ERROR does not return. */
+#define lion_verify_unreachable(vs, blk) \
+	lion_corrupt("lion index \"%s\": block %u is not reachable from the meta page", \
+				RelationGetRelationName((vs)->index), (blk))
+
+/*
+ * Every block has to belong to the meta page, the directory or exactly one
+ * key's posting set (lion_verify_classify() says which unreferenced ones are
+ * tolerated).
+ *
+ * The pass covers the blocks the index had when the check began: a block the
+ * relation grew by since then holds nothing that was in the index when it
+ * began, and a link into one that the walk followed has been checked.  A
+ * live page no walk reached may be a page a writer made - a split's new
+ * sibling, a push-down's child, a spilled set's root, from the end of the
+ * relation or out of the free space map - after the walk had passed the place
+ * it went.  On a primary that is a candidate for lion_verify_recheck(); on a
+ * standby it is reported, as it always was.
  */
 static void
 lion_verify_reachable(LionVerifyState *vs)
 {
 	BlockNumber blk;
 
-	for (blk = 0; blk < vs->nblocks; blk++)
+	for (blk = 0; blk < vs->startblocks; blk++)
 	{
-		Buffer		buf;
-		Page		page;
-		bool		leaked;
+		LionVerifyCand cand;
 
 		if (vs->refs[blk] != 0)
 			continue;
 
-		buf = ReadBuffer(vs->index, blk);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-
-		/*
-		 * A DELETED page is the normal state of a freed one (DESIGN.md §18):
-		 * it is unreferenced on purpose, it is in the free space map, and the
-		 * next allocation whose safexid test it passes takes it.  Nothing to
-		 * report.
-		 */
-		if (!PageIsNew(page) &&
-			PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
-			LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
-			LionPageIsDeleted(page))
+		switch (lion_verify_classify(vs, blk))
 		{
-			UnlockReleaseBuffer(buf);
-			continue;
+			case LION_UNREF_FREE:
+				continue;
+			case LION_UNREF_LEAK:
+				lion_verify_warn_leak(vs, blk);
+				continue;
+			case LION_UNREF_FOREIGN:
+				lion_verify_unreachable(vs, blk);
+				break;
+			case LION_UNREF_INTERNAL:
+				if (!vs->concurrent)
+				{
+					lion_verify_warn_leak(vs, blk);
+					continue;
+				}
+				break;
+			case LION_UNREF_LIVE:
+				if (!vs->concurrent)
+					lion_verify_unreachable(vs, blk);
+				break;
 		}
 
-		/*
-		 * An INTERNAL posting page is leaked as a whole page rather than as an
-		 * empty one (DESIGN.md §22): a posting set is freed leaves-first, so a
-		 * crash between deleting the entry and marking its pages free can
-		 * leave the root of the set behind with its downlinks still on it.
-		 * The next VACUUM's sweep recovers it once its children are gone.
-		 */
-		leaked = PageIsNew(page) ||
-			(PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
-			 LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
-			 LionPageIsContainer(page) &&
-			 (PageGetMaxOffsetNumber(page) == 0 ||
-			  LionPageIsPostingInternal(page)));
+		memset(&cand, 0, sizeof(cand));
+		cand.kind = LION_VCAND_UNREACHED;
+		cand.blk = blk;
+		cand.left = cand.right = InvalidBlockNumber;
+		lion_verify_add_cand(vs, &cand);
 
-		/*
-		 * A FULL leaf is leaked when its root is not a live root of its key:
-		 * a multi-leaf spill that an ERROR or a crash stopped before its last
-		 * record writes the leaves and never the root (lion_entry_spill(),
-		 * DESIGN.md §18).  The root is looked at with nothing held.
-		 */
-		if (!leaked && !PageIsNew(page) &&
-			PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
-			LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
-			LionPageIsPostingLeaf(page) && !LionPageIsDeleted(page) &&
-			LionPageGetOpaque(page)->owner_head != blk)
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/* ---------------------------------------------------------------------
+ * The recheck (DESIGN.md §7: suspect, wait, recheck)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Wait for the statements that are writing the index.
+ *
+ * An INSERT, an UPDATE or a COPY takes RowExclusiveLock on each index of its
+ * table when it puts its first row into it (ExecOpenIndices()) and lets it go
+ * when the statement ends (ExecCloseIndices()) - unlike its lock on the
+ * table, which lasts until the transaction ends.  Every change a writer makes
+ * to this index is made under that lock, and a statement that has ended has
+ * finished every split it began, or left it flagged for good, and linked
+ * every page it took.  So waiting - in ShareLock, the weakest mode that
+ * conflicts with RowExclusiveLock, and CREATE INDEX CONCURRENTLY's own - for
+ * everyone who holds a conflicting lock on the INDEX is waiting for exactly
+ * the writes that may have been in flight while the walk ran.  WaitForLockers()
+ * waits for each holder's whole transaction, which is more than needed and the
+ * only unit it offers.  It leaves this backend out, and nobody else can hold a
+ * stronger lock: the ShareUpdateExclusiveLock held here conflicts with all of
+ * them.
+ *
+ * CIC waits on the TABLE's lock instead, because it has to outwait every
+ * transaction that might still insert without knowing the new index.  This
+ * check need not: a transaction that wrote the table and sits idle, or
+ * prepared, holds no lock on the index any more and is not waited for.
+ *
+ * The wait is a lock wait on each writer's virtual transaction id, so
+ * lock_timeout ends it as well as statement_timeout.
+ */
+static void
+lion_verify_wait_for_writers(LionVerifyState *vs)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION(tag, vs->index->rd_lockInfo.lockRelId.dbId,
+						 vs->index->rd_lockInfo.lockRelId.relId);
+	WaitForLockers(tag, ShareLock, false);
+}
+
+/*
+ * A downlink of level cand->level + 1 names a page the walk of cand->level did
+ * not reach (lion_verify_filter_downlinks()).  On a sound index that page is
+ * a split's new sibling, and a split links its new page immediately right of
+ * the page it splits: so it lies in the level's right-link chain between the
+ * reached page whose downlink came before it and the reached page whose
+ * downlink came after it.  Walk there, each page held until its right sibling
+ * is locked, which also proves every left link on the way (see
+ * lion_verify_leftlink()).  Pages only ever enter the chain, and the walk
+ * starts at a page the level walk reached, so anything a writer does now
+ * cannot hide the page from it.
+ */
+static void
+lion_verify_recheck_downlink(LionVerifyState *vs, const LionVerifyCand *cand)
+{
+	uint16		kind = (cand->level == 0) ? LION_PAGE_BUCKET : LION_PAGE_DIR;
+	BlockNumber cur = cand->left;
+	BlockNumber steps = 0;
+	Buffer		buf;
+	Page		page;
+
+	Assert(BlockNumberIsValid(cand->left));
+
+	page = lion_verify_read_page(vs, cur, kind, &buf);
+	for (;;)
+	{
+		BlockNumber next = LionPageGetOpaque(page)->rightlink;
+		Buffer		nbuf;
+		Page		npage;
+
+		if (!BlockNumberIsValid(next) || next == cand->right ||
+			++steps > vs->nblocks)
 		{
-			uint32		ohash = LionPageGetOpaque(page)->owner_hash;
-			BlockNumber ohead = LionPageGetOpaque(page)->owner_head;
+			if (BlockNumberIsValid(cand->right))
+				lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, which is not a page of level %u between blocks %u and %u",
+							RelationGetRelationName(vs->index), cand->downlink,
+							cand->level + 1, cand->blk, cand->level, cand->left,
+							cand->right);
+			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, which is not a page of level %u after block %u",
+						RelationGetRelationName(vs->index), cand->downlink,
+						cand->level + 1, cand->blk, cand->level, cand->left);
+		}
 
-			UnlockReleaseBuffer(buf);
-			leaked = !lion_posting_root_live(vs->index, ohash, ohead, true);
+		npage = lion_verify_read_page(vs, next, kind, &nbuf);
+		if (LionPageGetOpaque(npage)->level != cand->level)
+			lion_corrupt("lion index \"%s\": directory page %u is at level %u, expected %u",
+						RelationGetRelationName(vs->index), next,
+						LionPageGetOpaque(npage)->level, cand->level);
+		if (LionPageGetOpaque(npage)->leftlink != cur)
+			lion_corrupt("lion index \"%s\": directory page %u has left link %u, expected %u",
+						RelationGetRelationName(vs->index), next,
+						LionPageGetOpaque(npage)->leftlink, cur);
+		UnlockReleaseBuffer(buf);
+		buf = nbuf;
+		page = npage;
+		cur = next;
+		if (cur == cand->blk)
+			break;
+		CHECK_FOR_INTERRUPTS();
+	}
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Mark in found[] which of the n blocks in roots[] (sorted) an entry of the
+ * directory names as its posting set's root.  One walk of the leaves, with
+ * nothing but the entries' headers read: an entry the walk has not reached
+ * yet may move right in a split, but only onto a page the walk still comes
+ * to, so it is seen.
+ */
+static void
+lion_verify_find_heads(LionVerifyState *vs, const BlockNumber *roots, int n,
+					   bool *found)
+{
+	BlockNumber blk = lion_dir_leftmost_leaf(vs->index, vs->ix);
+	BlockNumber steps = 0;
+
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+		BlockNumber next;
+
+		page = lion_verify_read_page(vs, blk, LION_PAGE_BUCKET, &buf);
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (off = lion_page_first_data(page); off <= maxoff; off++)
+		{
+			ItemId		iid = lion_verify_itemid(vs, blk, page, off);
+			LionEntryTuple *e;
+			BlockNumber *hit;
+
+			if (!ItemIdIsUsed(iid) || ItemIdGetLength(iid) < LION_ENTRY_HDRSZ)
+				continue;
+			e = (LionEntryTuple *) PageGetItem(page, iid);
+			if ((e->flags & LION_ENTRY_CHAIN) == 0)
+				continue;
+			hit = (BlockNumber *) bsearch(&e->head, roots, n, sizeof(BlockNumber),
+										  lion_verify_blkcmp);
+			if (hit != NULL)
+				found[hit - roots] = true;
+		}
+		next = LionPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+
+		if (++steps > vs->nblocks)
+			lion_corrupt("lion index \"%s\": the right links of the directory leaves go round in a cycle",
+						RelationGetRelationName(vs->index));
+		blk = next;
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * What a page no walk reached is, read again after the wait: its kind, its
+ * level, and the first key a search for it would use.  False when it has no
+ * first key to search for.
+ */
+typedef struct LionVerifyUnreached
+{
+	bool		isdir;
+	uint16		level;
+	BlockNumber ohead;			/* a posting page's root */
+	uint32		ckey;			/* ... and its first container key */
+	LionEntryTuple *first;		/* a directory page's first item (a copy) */
+} LionVerifyUnreached;
+
+static bool
+lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
+						   LionVerifyUnreached *u)
+{
+	Buffer		buf;
+	Page		page;
+	bool		ok = false;
+
+	memset(u, 0, sizeof(*u));
+	buf = ReadBuffer(vs->index, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	if (!PageIsNew(page) && PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+		LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
+		!LionPageIsDeleted(page))
+	{
+		LionPageOpaque opaque = LionPageGetOpaque(page);
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+		u->level = opaque->level;
+		if (LionPageIsBucket(page) || LionPageIsDir(page))
+		{
+			OffsetNumber first = lion_page_first_data(page);
+
+			u->isdir = true;
+			if (first <= maxoff)
+			{
+				int			i;
+
+				/* a page nothing has checked yet: vouch for its items first */
+				for (i = FirstOffsetNumber; i <= maxoff; i++)
+					(void) lion_verify_dir_item(vs, blk, page, (OffsetNumber) i);
+				if (ItemIdIsUsed(PageGetItemId(page, first)))
+				{
+					u->first = lion_verify_copy_item(page, first);
+					ok = true;
+				}
+			}
+		}
+		else if (LionPageIsContainer(page) && maxoff >= FirstOffsetNumber)
+		{
+			u->ohead = opaque->owner_head;
+			if (opaque->level == 0)
+			{
+				u->ckey = opaque->minckey;
+				ok = true;
+			}
+			else if (lion_posting_first_data(page) <= maxoff &&
+					 ItemIdGetLength(PageGetItemId(page, lion_posting_first_data(page))) ==
+					 LION_POSTING_PIVOT_SIZE)
+			{
+				u->ckey = lion_posting_pivot(page, lion_posting_first_data(page))->ckey;
+				ok = true;
+			}
+		}
+	}
+
+	UnlockReleaseBuffer(buf);
+	return ok;
+}
+
+/*
+ * Is blk, a page no walk reached, part of its tree now that the writers that
+ * were in flight are done?  A search for the page's own first key has to land
+ * on it: from the directory's root for a directory page, from its posting
+ * set's root for a posting page - a root that is itself reached, or named by
+ * an entry (rootfound).  A root of a posting set is part of the index when an
+ * entry names it.  A search races with the writers that started since the
+ * wait, and the page's first key can move right in a split of the page, so a
+ * miss is tried again, with the key read again, a few times.
+ */
+static bool
+lion_verify_confirm(LionVerifyState *vs, BlockNumber blk,
+					const BlockNumber *roots, int nroots, const bool *rootfound)
+{
+	int			attempt;
+
+	for (attempt = 0; attempt < LION_VERIFY_SET_ATTEMPTS; attempt++)
+	{
+		LionVerifyUnreached u;
+		Buffer		buf;
+		bool		hit;
+
+		if (!lion_verify_read_unreached(vs, blk, &u))
+			return false;
+
+		if (u.isdir)
+		{
+			LionSearchKey sk;
+
+			lion_search_key_exact(vs->ix, &sk, u.first);
+			buf = lion_dir_search_level(vs->index, vs->ix, &sk, u.level);
+			pfree(u.first);
 		}
 		else
-			UnlockReleaseBuffer(buf);
+		{
+			BlockNumber *r;
 
-		if (!leaked)
-			lion_corrupt("lion index \"%s\": block %u is not reachable from the meta page",
-						RelationGetRelationName(vs->index), blk);
+			if (u.ohead == blk)
+			{
+				r = (BlockNumber *) bsearch(&blk, roots, nroots, sizeof(BlockNumber),
+											lion_verify_blkcmp);
+				return r != NULL && rootfound[r - roots];
+			}
 
-		ereport(WARNING,
-				(errmsg("lion index \"%s\": block %u is unused and unreachable",
-						RelationGetRelationName(vs->index), blk),
-				 errdetail("An interrupted page allocation leaks blocks; the next VACUUM turns them into free pages.")));
+			/* its root has to be part of the index first */
+			if (!(u.ohead < vs->nblocks && vs->refs[u.ohead] != 0))
+			{
+				r = (BlockNumber *) bsearch(&u.ohead, roots, nroots,
+											sizeof(BlockNumber),
+											lion_verify_blkcmp);
+				if (r == NULL || !rootfound[r - roots])
+					return false;
+			}
+			buf = lion_posting_search_level(vs->index, u.ohead, u.ckey, u.level);
+		}
+
+		if (!BufferIsValid(buf))
+			continue;
+		hit = (BufferGetBlockNumber(buf) == blk);
+		UnlockReleaseBuffer(buf);
+		if (hit)
+			return true;
+		CHECK_FOR_INTERRUPTS();
 	}
+
+	return false;
+}
+
+/*
+ * Settle the candidates the walk recorded, and report what is still wrong.
+ *
+ * Only when there are candidates does the check wait for the writers that
+ * were in flight (lion_verify_wait_for_writers()); an index nobody wrote to
+ * while it was walked has none.  After the wait every change a writer made
+ * behind the walk is complete - its pages linked, its splits finished or
+ * flagged - and each candidate is checked again by itself.  A page that is
+ * still unreachable is reported as the walk would have reported it: a leak
+ * with a WARNING when it is a kind VACUUM's sweep frees, and corruption
+ * otherwise.
+ */
+static void
+lion_verify_recheck(LionVerifyState *vs)
+{
+	BlockNumber *roots;
+	bool	   *rootfound;
+	int			nroots = 0;
+	int			i;
+
+	if (vs->ncands == 0)
+		return;
+
+	vs->nwaits++;
+	lion_verify_wait_for_writers(vs);
+
+	for (i = 0; i < vs->ncands; i++)
+	{
+		if (vs->cands[i].kind == LION_VCAND_DOWNLINK)
+			lion_verify_recheck_downlink(vs, &vs->cands[i]);
+	}
+
+	/*
+	 * The roots no walk reached are found through the entries that name them,
+	 * all in one walk of the leaves: an unreached page that is a root itself,
+	 * and the root an unreached posting page is stamped with.  The second is
+	 * not a candidate in its own right when a writer made it: a posting set's
+	 * root always comes from the end of the relation (§18), past the blocks
+	 * the reachability pass looks at, while the pages the set grows by later
+	 * may come out of the free space map, well inside them.  A new key, or an
+	 * entry the walk read INLINE and a writer spilled, is exactly that.
+	 */
+	roots = (BlockNumber *) palloc(sizeof(BlockNumber) * vs->ncands);
+	for (i = 0; i < vs->ncands; i++)
+	{
+		LionVerifyUnreached u;
+
+		if (vs->cands[i].kind != LION_VCAND_UNREACHED)
+			continue;
+		if (lion_verify_read_unreached(vs, vs->cands[i].blk, &u))
+		{
+			if (u.isdir)
+				pfree(u.first);
+			else if (u.ohead == vs->cands[i].blk ||
+					 !(u.ohead < vs->nblocks && vs->refs[u.ohead] != 0))
+				roots[nroots++] = u.ohead;
+		}
+	}
+	if (nroots > 0)
+	{
+		int			k = 0;
+
+		qsort(roots, nroots, sizeof(BlockNumber), lion_verify_blkcmp);
+		for (i = 0; i < nroots; i++)
+		{
+			if (k == 0 || roots[i] != roots[k - 1])
+				roots[k++] = roots[i];
+		}
+		nroots = k;
+	}
+	rootfound = (bool *) palloc0(sizeof(bool) * Max(nroots, 1));
+	if (nroots > 0)
+		lion_verify_find_heads(vs, roots, nroots, rootfound);
+
+	for (i = 0; i < vs->ncands; i++)
+	{
+		BlockNumber blk = vs->cands[i].blk;
+
+		if (vs->cands[i].kind != LION_VCAND_UNREACHED)
+			continue;
+		if (lion_verify_confirm(vs, blk, roots, nroots, rootfound))
+			continue;
+
+		switch (lion_verify_classify(vs, blk))
+		{
+			case LION_UNREF_FREE:
+				break;
+			case LION_UNREF_LEAK:
+			case LION_UNREF_INTERNAL:
+				lion_verify_warn_leak(vs, blk);
+				break;
+			case LION_UNREF_LIVE:
+			case LION_UNREF_FOREIGN:
+				lion_verify_unreachable(vs, blk);
+				break;
+		}
+	}
+
+	pfree(rootfound);
+	pfree(roots);
 }
 
 /* ---------------------------------------------------------------------
@@ -2661,12 +3990,12 @@ lion_verify_heapallindexed(LionVerifyState *vs)
  * The one decision that has to be the CALLER's is whether the error messages
  * may carry key values, so it is taken before the switch (showvalues).
  *
- * BOTH LOCKS ARE SHARELOCKS, which is what bt_index_parent_check() takes for
- * the same kind of check (see the file header): no writer and no VACUUM can
- * change the index while it is walked level by level, and none of the
- * whole-index comparisons can mistake a concurrent split for damage.  They
- * wait for the writers already in flight, block new ones until the check is
- * over, and are released when this function returns rather than at commit,
+ * BOTH LOCKS ARE SHAREUPDATEEXCLUSIVELOCKS, the lock CREATE INDEX
+ * CONCURRENTLY holds while it builds (see the file header): INSERT, UPDATE
+ * and DELETE go on, while VACUUM - the one thing that removes anything from
+ * the index - ANALYZE, DDL and a second verify() wait for the check, which
+ * sees only the changes an INSERT makes and settles each of them (DESIGN.md
+ * §7).  They are released when this function returns rather than at commit,
  * as amcheck does - nothing here sends an invalidation that could make that
  * unsafe.  During recovery only AccessShareLock is possible (and replay takes
  * no relation locks to be kept out by); DESIGN.md §7 says what that means.
@@ -2676,7 +4005,8 @@ lion_index_verify(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	bool		heapallindexed = PG_GETARG_BOOL(1);
-	LOCKMODE	lockmode = RecoveryInProgress() ? AccessShareLock : ShareLock;
+	bool		inrecovery = RecoveryInProgress();
+	LOCKMODE	lockmode = inrecovery ? AccessShareLock : ShareUpdateExclusiveLock;
 	LionVerifyState vs;
 	Oid			heapoid;
 	Oid			save_userid;
@@ -2685,14 +4015,15 @@ lion_index_verify(PG_FUNCTION_ARGS)
 
 	memset(&vs, 0, sizeof(vs));
 	vs.showvalues = superuser();
+	vs.concurrent = !inrecovery;
 
 	heapoid = IndexGetRelation(relid, true);
 	if (!OidIsValid(heapoid))
 	{
 		/*
 		 * Not an index: opening it as one raises the error that says so.
-		 * With AccessShareLock, because this is only to say that, and a
-		 * ShareLock on a table would first wait for its writers.
+		 * With AccessShareLock, because this is only to say that, and it
+		 * should not wait behind a VACUUM of the table to say it.
 		 */
 		index_close(lion_open_index(relid, AccessShareLock), AccessShareLock);
 		elog(ERROR, "could not find the table of index %u", relid);
@@ -2713,25 +4044,43 @@ lion_index_verify(PG_FUNCTION_ARGS)
 						RelationGetRelationName(vs.index))));
 
 	vs.ix = lion_get_index_state(vs.index);
-	vs.nblocks = RelationGetNumberOfBlocks(vs.index);
+	vs.nblocks = vs.startblocks = RelationGetNumberOfBlocks(vs.index);
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.refs = (uint8 *) palloc0(sizeof(uint8) * Max(vs.nblocks, 1));
+	vs.maxsetvisits = 64;
+	vs.setvisits = (BlockNumber *) palloc(sizeof(BlockNumber) * vs.maxsetvisits);
+	vs.setcxt = AllocSetContextCreate(CurrentMemoryContext,
+									  "lion index verify posting set",
+									  ALLOCSET_DEFAULT_SIZES);
 
 	lion_verify_meta(&vs);
 
 	/*
 	 * Test hook: the block count and the root are taken, nothing has been
-	 * walked.  test/isolation/verify_concurrent.spec parks here and has a
-	 * writer try to split the directory underneath.
+	 * walked.  test/isolation/verify_concurrent.spec parks here and has
+	 * writers split the directory's root underneath, and VACUUM wait.
 	 */
 	LION_INJECTION_POINT("lion-verify-meta-read");
 
 	lion_verify_directory(&vs);
 	lion_verify_reachable(&vs);
+	lion_verify_recheck(&vs);
+
+	/*
+	 * What writers running beside the check cost it (DESIGN.md §7), in the
+	 * spirit of ambulkdelete's DEBUG1 breakdown.
+	 */
+	elog(DEBUG1, "lion index \"%s\": %u blocks at the start and %u at the end; %d candidates settled after %d waits; %lld left links and %lld root flags settled on the spot; %lld posting-set walks, %lld thrown away, %lld with the leaf held",
+		 RelationGetRelationName(vs.index), vs.startblocks, vs.nblocks,
+		 vs.ncands, vs.nwaits, (long long) vs.nleftlinks,
+		 (long long) vs.nrootsplits, (long long) vs.nsetwalks,
+		 (long long) vs.nsetretries, (long long) vs.nsetholds);
 
 	if (heapallindexed)
 		lion_verify_heapallindexed(&vs);
 
+	MemoryContextDelete(vs.setcxt);
+	pfree(vs.setvisits);
 	pfree(vs.refs);
 	pfree(vs.cbuf);
 
