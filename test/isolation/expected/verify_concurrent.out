@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_park_level s1_verify_c s2_split_right s3_wake_level_again s2_split_right2 s3_wake_level s1_done s3_dir
+starting permutation: s1_park_level s1_verify_c s2_split_right s3_park_page s3_wake_level_again s3_at_page s3_wake_page s3_at_level s2_split_right2 s3_wake_level s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -17,10 +17,42 @@ step s2_split_right:
 	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
 	  FROM generate_series(1, 1000) g;
 
+step s3_park_page: SELECT injection_points_attach('lion-verify-dir-page-read', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
 step s3_wake_level_again: SELECT injection_points_wakeup('lion-verify-dir-level-walked');
 injection_points_wakeup
 -----------------------
                        
+(1 row)
+
+step s3_at_page: SELECT v_parked('lion-verify-dir-page-read');
+v_parked
+--------
+        
+(1 row)
+
+step s3_wake_page: 
+	SELECT injection_points_detach('lion-verify-dir-page-read');
+	SELECT injection_points_wakeup('lion-verify-dir-page-read');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_level: SELECT v_parked('lion-verify-dir-level-walked');
+v_parked
+--------
+        
 (1 row)
 
 step s2_split_right2: 
@@ -369,13 +401,19 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_note_held s1_verify_p s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set s1_done s3_touched
+starting permutation: s1_park_set s1_park_rewalk s1_note_held s1_verify_p s2_touch_p s3_wake_set_again s3_at_rewalk s3_wake_rewalk s3_at_set s2_touch_p s3_wake_set_again s3_at_rewalk s3_wake_rewalk s3_at_set s2_touch_p s3_wake_set s1_done s3_touched
 injection_points_set_local
 --------------------------
                           
 (1 row)
 
 step s1_park_set: SELECT injection_points_attach('lion-verify-set-leaves-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_park_rewalk: SELECT injection_points_attach('lion-verify-set-rewalk', 'wait');
 injection_points_attach
 -----------------------
                        
@@ -395,11 +433,47 @@ injection_points_wakeup
                        
 (1 row)
 
+step s3_at_rewalk: SELECT v_parked('lion-verify-set-rewalk');
+v_parked
+--------
+        
+(1 row)
+
+step s3_wake_rewalk: SELECT injection_points_wakeup('lion-verify-set-rewalk');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_set: SELECT v_parked('lion-verify-set-leaves-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_touch_p: INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i;
 step s3_wake_set_again: SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
 injection_points_wakeup
 -----------------------
                        
+(1 row)
+
+step s3_at_rewalk: SELECT v_parked('lion-verify-set-rewalk');
+v_parked
+--------
+        
+(1 row)
+
+step s3_wake_rewalk: SELECT injection_points_wakeup('lion-verify-set-rewalk');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_set: SELECT v_parked('lion-verify-set-leaves-walked');
+v_parked
+--------
+        
 (1 row)
 
 step s2_touch_p: INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i;

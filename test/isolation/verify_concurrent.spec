@@ -20,7 +20,8 @@
 #
 # The directory (vc: 3000 keys of about 110 bytes, three levels):
 #  * split_right: parked after the leaves are walked, and again after level
-#    1, new keys split the last leaves and then the last page of level 1.
+#    1 (on its first page in between, see v_parked), new keys split the last
+#    leaves and then the last page of level 1.
 #    The level above then holds downlinks to pages the walk of the level
 #    below never reached, and nothing reached the new pages: candidates,
 #    settled after the wait.
@@ -45,7 +46,9 @@
 #  * held: a set a writer changes under every walk is walked
 #    LION_VERIFY_SET_ATTEMPTS times with nothing held and then once with its
 #    entry's directory leaf held SHARE; the 'notice' on
-#    'lion-verify-set-held' shows that walk happening.
+#    'lion-verify-set-held' shows that walk happening.  The check parks after
+#    each walk's leaves, and before each new walk at 'lion-verify-set-rewalk'
+#    (see v_parked).
 #  * fsm_reuse: a key's rows are deleted and VACUUM frees its posting tree.
 #    Parked after the leaves, an insert splits the other key's leaves into
 #    those freed pages (the relation does not grow, deleted_pages falls): live
@@ -103,12 +106,39 @@ setup
 		   (SELECT container_pages FROM lion_index_stats('vp_k')) AS vp_leaves,
 		   (SELECT max_posting_height FROM lion_index_stats('vq_k')) AS vq_height,
 		   lion_index_posting_root('vq_k', 0) AS vq_root;
+
+	/*
+	 * Returns once the check is parked at `point`.  The isolationtester sees a
+	 * session parked at an injection point only when it launches a step, and
+	 * after a wakeup it goes on as soon as pg_stat_activity shows the session
+	 * at an injection point - which, until the woken session has actually run,
+	 * is still the point it was woken from.  A writer launched then could
+	 * change the index before the check moved on, not after.  So a permutation
+	 * that parks the check more than once parks it at two points in turn, and
+	 * waits for the next one by name.
+	 */
+	CREATE FUNCTION v_parked(point text) RETURNS void LANGUAGE plpgsql AS $f$
+	DECLARE
+		t0 timestamptz := clock_timestamp();
+	BEGIN
+		LOOP
+			PERFORM pg_stat_clear_snapshot();
+			EXIT WHEN EXISTS (SELECT 1 FROM pg_stat_activity
+							   WHERE wait_event_type = 'InjectionPoint'
+								 AND wait_event = point);
+			IF clock_timestamp() - t0 > interval '120 s' THEN
+				RAISE EXCEPTION 'the check did not park at %', point;
+			END IF;
+			PERFORM pg_sleep(0.001);
+		END LOOP;
+	END $f$;
 }
 
 teardown
 {
 	DROP TABLE vc, vr, vp, vq, v_before;
 	DROP TABLE IF EXISTS v_free;
+	DROP FUNCTION v_parked(text);
 	/* Injection points are cluster-wide: never leave one attached, and
 	 * never fail the teardown because the permutation already did. */
 	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-meta-read');
@@ -118,6 +148,8 @@ teardown
 	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-dir-page-read');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-set-leaves-walked');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-set-rewalk');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-set-held');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
@@ -130,6 +162,7 @@ step s1_park_meta	{ SELECT injection_points_attach('lion-verify-meta-read', 'wai
 step s1_park_level	{ SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait'); }
 step s1_park_page	{ SELECT injection_points_attach('lion-verify-dir-page-read', 'wait'); }
 step s1_park_set	{ SELECT injection_points_attach('lion-verify-set-leaves-walked', 'wait'); }
+step s1_park_rewalk	{ SELECT injection_points_attach('lion-verify-set-rewalk', 'wait'); }
 step s1_note_held	{ SELECT injection_points_attach('lion-verify-set-held', 'notice'); }
 step s1_verify_c	{ SELECT lion_index_verify('vc_k', true); }
 step s1_verify_r	{ SELECT lion_index_verify('vr_k', true); }
@@ -205,12 +238,20 @@ step s3_wake_page	{
 }
 # ... and let it park again, after the next level.
 step s3_wake_level_again	{ SELECT injection_points_wakeup('lion-verify-dir-level-walked'); }
+# Attached here, not in s1, so for every session: s1 is busy with the check.
+# Only verify() reads directory pages there.
+step s3_park_page	{ SELECT injection_points_attach('lion-verify-dir-page-read', 'wait'); }
+step s3_at_level	{ SELECT v_parked('lion-verify-dir-level-walked'); }
+step s3_at_page		{ SELECT v_parked('lion-verify-dir-page-read'); }
 step s3_wake_set	{
 	SELECT injection_points_detach('lion-verify-set-leaves-walked');
 	SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
 }
 # ... and let it park at the same point again, in the next walk of the set.
 step s3_wake_set_again	{ SELECT injection_points_wakeup('lion-verify-set-leaves-walked'); }
+step s3_wake_rewalk	{ SELECT injection_points_wakeup('lion-verify-set-rewalk'); }
+step s3_at_set		{ SELECT v_parked('lion-verify-set-leaves-walked'); }
+step s3_at_rewalk	{ SELECT v_parked('lion-verify-set-rewalk'); }
 step s3_note_free	{
 	CREATE TABLE v_free AS
 	SELECT deleted_pages, pg_relation_size('vp_k') AS size
@@ -270,7 +311,11 @@ permutation
 	s1_park_level
 	s1_verify_c(s3_wake_level)	# parks with the leaves walked
 	s2_split_right				# goes through: nothing waits for the check
-	s3_wake_level_again			# parks again with level 1 walked
+	s3_park_page
+	s3_wake_level_again			# parks on the first page of level 1
+	s3_at_page
+	s3_wake_page				# parks again with level 1 walked
+	s3_at_level
 	s2_split_right2				# splits leaves, and a page of level 1
 	s3_wake_level				# the check settles what the splits left
 	s1_done						# the check has ended
@@ -318,12 +363,19 @@ permutation
 
 permutation
 	s1_park_set
+	s1_park_rewalk
 	s1_note_held
-	s1_verify_p(s3_wake_set)	# attempt 1 parks
+	s1_verify_p(s3_wake_set)	# walk 1 parks after the set's leaves
 	s2_touch_p
-	s3_wake_set_again			# attempt 1 is thrown away; attempt 2 parks
+	s3_wake_set_again			# walk 1 is thrown away
+	s3_at_rewalk				# walk 2 is about to start
+	s3_wake_rewalk
+	s3_at_set					# walk 2 parks after the leaves
 	s2_touch_p
-	s3_wake_set_again			# attempt 3 parks
+	s3_wake_set_again			# walk 2 is thrown away
+	s3_at_rewalk
+	s3_wake_rewalk
+	s3_at_set					# walk 3 parks after the leaves
 	s2_touch_p
 	s3_wake_set					# thrown away too: the leaf is held (NOTICE)
 	s1_done						# the check has ended

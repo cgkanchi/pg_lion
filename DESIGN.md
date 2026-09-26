@@ -960,7 +960,8 @@ on a directory page (`lion-verify-dir-page-read`), after a posting set's leaves
 (`lion-verify-set-leaves-walked`) - and has INSERTs split leaves and internal pages of the directory
 behind it, split the page it stands on, split its root, split a posting leaf, push a posting root
 down, spill an INLINE entry, keep changing a set until it is walked with its leaf held
-(`lion-verify-set-held` with 'notice'), and take pages VACUUM freed for an existing set and for a new
+(`lion-verify-set-held` with 'notice'; the check parks before each new walk of the set too, at
+`lion-verify-set-rewalk`), and take pages VACUUM freed for an existing set and for a new
 one; every time the check passes and the observer shows the change was made. It also shows VACUUM
 waiting for the check, the check waiting for a statement that holds the index open for writing and
 not for a transaction whose statement is over, and `LOCK TABLE; DROP INDEX` in another transaction
