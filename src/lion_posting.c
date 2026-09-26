@@ -347,6 +347,108 @@ restart:
 	}
 }
 
+/*
+ * The page at `level` of the posting set rooted at head that the separators
+ * route ckey to, locked SHARE: a READER's descent - SHARE locks, the parent
+ * released before the child is locked, a move right past a concurrent split
+ * at every level, and at the leaves the reader's walk right while a leaf's
+ * maxckey is below ckey - that stops at `level` instead of at the leaves.
+ * InvalidBuffer when a page does not belong to the set (it was freed, which
+ * only VACUUM does) or the set has no such level.
+ *
+ * lion_index_verify() is the caller (DESIGN.md §7).  A posting page its walk
+ * did not reach may be one a writer of that key made after the walk of the
+ * set was over, and a search for the page's own first container key landing
+ * on it is the proof that it belongs to the tree.  A root push-down met on the
+ * way starts the descent again, a bounded number of times: the root is the
+ * one page whose level changes.
+ */
+Buffer
+lion_posting_search_level(Relation index, BlockNumber head, uint32 ckey,
+						  uint16 level)
+{
+	int			restarts = 0;
+	Buffer		buf;
+	Page		page;
+
+restart:
+	if (restarts++ > LION_POSTING_MAX_HEIGHT)
+		return InvalidBuffer;
+
+	buf = lion_posting_getbuf(index, head, head, BUFFER_LOCK_SHARE, false);
+	if (!BufferIsValid(buf))
+		return InvalidBuffer;
+	if (LionPageGetOpaque(BufferGetPage(buf))->level < level)
+	{
+		UnlockReleaseBuffer(buf);
+		return InvalidBuffer;
+	}
+
+	for (;;)
+	{
+		uint16		plevel;
+		OffsetNumber off;
+		BlockNumber child;
+
+		page = BufferGetPage(buf);
+		plevel = LionPageGetOpaque(page)->level;
+
+		if (plevel > 0 && !LionPageIsRightmost(page) &&
+			lion_posting_highkey(page)->ckey <= ckey)
+		{
+			buf = lion_posting_step_right(index, buf, head, BUFFER_LOCK_SHARE,
+										  false);
+			if (!BufferIsValid(buf))
+				return InvalidBuffer;
+			if (LionPageGetOpaque(BufferGetPage(buf))->level != plevel)
+			{
+				UnlockReleaseBuffer(buf);
+				goto restart;
+			}
+			continue;
+		}
+
+		if (plevel == level)
+		{
+			while (plevel == 0 && LionPageGetOpaque(page)->maxckey < ckey &&
+				   !LionPageIsRightmost(page))
+			{
+				buf = lion_posting_step_right(index, buf, head,
+											  BUFFER_LOCK_SHARE, false);
+				if (!BufferIsValid(buf))
+					return InvalidBuffer;
+				page = BufferGetPage(buf);
+				if (!LionPageIsPostingLeaf(page))
+				{
+					UnlockReleaseBuffer(buf);
+					goto restart;
+				}
+			}
+			return buf;
+		}
+
+		off = lion_posting_downlink_off(page, ckey);
+		if (off > PageGetMaxOffsetNumber(page))
+		{
+			UnlockReleaseBuffer(buf);
+			return InvalidBuffer;
+		}
+		child = lion_posting_pivot(page, off)->child;
+
+		/* Release the parent BEFORE locking the child; see the file header. */
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+		buf = lion_posting_getbuf(index, child, head, BUFFER_LOCK_SHARE, false);
+		if (!BufferIsValid(buf))
+			return InvalidBuffer;
+		if (LionPageGetOpaque(BufferGetPage(buf))->level != plevel - 1)
+		{
+			UnlockReleaseBuffer(buf);
+			goto restart;
+		}
+	}
+}
+
 BlockNumber
 lion_posting_leftmost_leaf(Relation index, uint32 hash, BlockNumber head)
 {

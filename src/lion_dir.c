@@ -633,6 +633,63 @@ restart:
 }
 
 /*
+ * The page at `level` whose key range holds sk, locked SHARE: a read-only
+ * descent, moving right past concurrent splits exactly as lion_dir_search()
+ * does, that stops at `level` instead of at the leaves.  InvalidBuffer when
+ * the directory has no such level.
+ *
+ * lion_index_verify() is the caller.  It runs beside INSERTs (DESIGN.md §7),
+ * so a directory page its walk of a level did not reach may simply be one a
+ * split made after the walk had passed; this is how it proves such a page is
+ * part of the tree - a search for the page's own first key lands on it - and
+ * not a page nothing leads to.  It never repairs an unfinished split: that
+ * is a writer's job, and verify() writes nothing.
+ */
+Buffer
+lion_dir_search_level(Relation index, LionIndexState *ix,
+					  const LionSearchKey *sk, uint16 level)
+{
+	Buffer		buf = lion_dir_get_root(index, ix);
+
+	if (LionPageGetOpaque(BufferGetPage(buf))->level < level)
+	{
+		UnlockReleaseBuffer(buf);
+		return InvalidBuffer;
+	}
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		OffsetNumber off;
+		BlockNumber child;
+		int			plevel;
+
+		while (!LionPageIsRightmost(page) &&
+			   lion_cmp_entry(lion_page_highkey(page), sk) <= 0)
+		{
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+		}
+
+		plevel = LionPageGetOpaque(page)->level;
+		if (plevel == level)
+			return buf;
+
+		off = lion_page_downlink(page, sk);
+		child = lion_dir_downlink_block(index, page, BufferGetBlockNumber(buf),
+										off);
+
+		/* Release the parent BEFORE locking the child; see the file header. */
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+		buf = lion_dir_readbuf(index, child);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		lion_dir_check_page(index, BufferGetPage(buf), child);
+		lion_dir_check_level(index, BufferGetPage(buf), child, plevel - 1);
+	}
+}
+
+/*
  * The cross-type fallback of DESIGN.md §21: an opfamily that offers
  * cross-type equality but no cross-type ordering cannot be descended for such
  * a value, so every leaf is walked instead.  Correct, and linear in the
