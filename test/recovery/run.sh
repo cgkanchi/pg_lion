@@ -161,6 +161,20 @@ case $MODE in
 	*) die "--mode wants generic or rmgr" ;;
 esac
 
+# wal_consistency_checking puts a full-page image in every record it names,
+# and one crash round of phase 1 then replays 600-800 MB of WAL, more than
+# the 512 MB kept otherwise: recovery_evidence() would find the round's first
+# segment recycled and count nothing.  So when a --conf line turns it on,
+# the primary keeps (and lets checkpoints grow to) 2 GB; a --conf line
+# setting either of these still wins.
+WAL_KEEP_SIZE=512MB
+MAX_WAL_SIZE=1GB
+for line in "${EXTRA_CONF[@]}"; do
+	case $line in
+		*wal_consistency_checking*) WAL_KEEP_SIZE=2GB; MAX_WAL_SIZE=2GB ;;
+	esac
+done
+
 [ -n "$PREFIX" ] ||
 	die "no PostgreSQL installation given: pass --prefix <prefix> or set RECOVERY_PREFIX (make recovery-check RECOVERY_PREFIX=<prefix>).  The extension is built and INSTALLED into it, so there is no default."
 PREFIX=$(cd "$PREFIX" 2>/dev/null && pwd) || die "prefix $PREFIX does not exist"
@@ -339,10 +353,10 @@ write_primary_conf() {
 		synchronous_commit = on
 		wal_level = replica
 		max_wal_senders = 5
-		max_wal_size = 1GB
+		max_wal_size = $MAX_WAL_SIZE
 		# Enough that the range each restart replays is still on disk when
 		# recovery_evidence() runs pg_waldump over it.
-		wal_keep_size = 512MB
+		wal_keep_size = $WAL_KEEP_SIZE
 		hot_standby = on
 		# Explicit VACUUMs only, so the crash points and the recovery-conflict
 		# test are the ones this script chose.
@@ -516,8 +530,8 @@ recovery_evidence() {
 	# wal_keep_size is no longer there to be counted; that is a limit of the
 	# EVIDENCE, not of the test, so it is reported and skipped rather than
 	# treated as a failure.  wal_consistency_checking makes every record carry
-	# a full-page image and is what makes a range that long, so
-	# recovery-check-rmgr raises wal_keep_size to match.
+	# a full-page image and is what makes a range that long, so the primary
+	# keeps more when it is on (WAL_KEEP_SIZE).
 	#
 	# The segments the range starts and ends in are named explicitly.  Given
 	# only a directory, pg_waldump learns the segment size from the header of
