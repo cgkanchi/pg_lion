@@ -177,9 +177,14 @@ attempted for an old-style inheritance parent without `ONLY`, whose children nee
 its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
 are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
 `pg_stat_scan_tables`.
-`lion_index_verify()` takes ShareLock on the table and the index, like amcheck's
-`bt_index_parent_check()`: writes to the table wait while it runs (reads and other checks do not),
-and with `heapallindexed` it evaluates the index's expressions as the table's owner (DESIGN.md §7).
+`lion_index_verify()` checks the index while it is being written to, the way `CREATE INDEX
+CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the index, so INSERT,
+UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it.
+What a concurrent insert could make look wrong it checks again once the statements that were writing
+the index have ended, so it may wait for them - for as long as statement_timeout and lock_timeout
+allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock and
+is exact only while replay leaves the index alone.  With `heapallindexed` it evaluates the index's
+expressions as the table's owner (DESIGN.md §7).
 
 ## Source layout
 
