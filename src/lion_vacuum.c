@@ -35,12 +35,14 @@
  *	  reader is still consulting the visibility map with its stale copy.  (If
  *	  VACUUM had already passed P when the reader took C, then C had already
  *	  been cleaned of this cycle's dead TIDs.)  Two properties make this
- *	  sufficient: pages are never recycled, so a new page is always right of
- *	  its split origin and is visited after it, and the set of dead TIDs is
- *	  fixed before index cleanup starts.  The same reason is why the
- *	  re-placement of a container that grew (lion_vacuum_regrow) walks right
- *	  from the page the container was filtered on, cleanup-locking each page
- *	  on the way, instead of jumping straight to the page that owns its ckey.
+ *	  sufficient: a page is only ever linked in immediately right of the page
+ *	  whose split or spill allocated it - whether its block is brand new or
+ *	  recycled from the free space map (DESIGN.md §18) - so it is visited
+ *	  after that page, and the set of dead TIDs is fixed before index cleanup
+ *	  starts.  The same reason is why the re-placement of a container that
+ *	  grew (lion_vacuum_regrow) walks right from the page the container was
+ *	  filtered on, cleanup-locking each page on the way, instead of jumping
+ *	  straight to the page that owns its ckey.
  *
  * 2. Never wait for a cleanup lock while holding another LWLock.
  *
@@ -147,6 +149,7 @@
 #include "storage/indexfsm.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "lion.h"
 
@@ -205,12 +208,15 @@ typedef struct LionVacState
 
 	/*
 	 * The blocks this ambulkdelete accounted for: the meta page, every bucket
-	 * page it walked and every container page it reached from a live entry.
-	 * A page it FREED is cleared again.  What is left unset when the walk is
+	 * page it walked, every container page it reached from a live entry, and
+	 * every page it freed or found free.  What is left unset when the walk is
 	 * over is either a block a concurrent insert created (which this VACUUM
-	 * must not touch) or a leak - a page an interrupted allocation or a crash
-	 * between the two steps of a whole-chain free left unreferenced - and the
-	 * sweep at the end of ambulkdelete is what recovers those (DESIGN.md §18).
+	 * must not touch), a DELETED page an earlier VACUUM freed, or a leak - a
+	 * page an interrupted allocation, an interrupted spill or a crash between
+	 * the two steps of a whole-chain free left unreferenced - and the sweep at
+	 * the end of ambulkdelete is what counts the free pages and recovers the
+	 * leaks (DESIGN.md §18).  A page is counted where it is marked, so no page
+	 * is counted twice.
 	 *
 	 * Blocks at or above nblocks did not exist when this VACUUM started and
 	 * are never looked at.
@@ -218,8 +224,18 @@ typedef struct LionVacState
 	uint8	   *visited;
 	BlockNumber nblocks;
 
-	int64		pages_newly_deleted;	/* pages this VACUUM freed */
-	int64		pages_deleted;	/* DELETED pages the index holds now */
+	/*
+	 * What IndexBulkDeleteResult reports (DESIGN.md §18): the pages this call
+	 * freed, and - about the whole index as this call leaves it, which is why
+	 * lionbulkdelete() assigns them rather than adding them up over the calls
+	 * of one VACUUM - the free pages it holds and how many of them the next
+	 * allocation may take already, i.e. an all-zero page or a DELETED one
+	 * whose safexid is behind every snapshot.  A page freed a moment ago is
+	 * free and not yet reusable, as in nbtree.
+	 */
+	int64		pages_newly_deleted;	/* pages this call freed */
+	int64		pages_deleted;	/* free pages the index holds now */
+	int64		pages_free;		/* ... of which reusable now */
 	LionVacProfile prof;
 } LionVacState;
 
@@ -228,13 +244,6 @@ lion_vac_visit(LionVacState *vs, BlockNumber blk)
 {
 	if (blk < vs->nblocks)
 		vs->visited[blk / 8] |= (uint8) (1 << (blk % 8));
-}
-
-static inline void
-lion_vac_unvisit(LionVacState *vs, BlockNumber blk)
-{
-	if (blk < vs->nblocks)
-		vs->visited[blk / 8] &= (uint8) ~(1 << (blk % 8));
 }
 
 static inline bool
@@ -506,9 +515,17 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	stats->num_pages = RelationGetNumberOfBlocks(index);
 	stats->num_index_tuples = vs.numtids;
 	stats->estimated_count = false;
-	stats->pages_newly_deleted = (BlockNumber) vs.pages_newly_deleted;
+
+	/*
+	 * A VACUUM whose dead TIDs do not fit maintenance_work_mem calls this
+	 * more than once: what THIS call freed adds to what the earlier ones did,
+	 * as nbtree's pages_newly_deleted does, while the other two describe the
+	 * whole index and the sweep has just counted them afresh - the pages the
+	 * earlier calls freed among them.
+	 */
+	stats->pages_newly_deleted += (BlockNumber) vs.pages_newly_deleted;
 	stats->pages_deleted = (BlockNumber) vs.pages_deleted;
-	stats->pages_free = (BlockNumber) vs.pages_deleted;
+	stats->pages_free = (BlockNumber) vs.pages_free;
 
 	lion_vac_tick(&vs.prof.total, started);
 	elog(DEBUG1, "lion vacuum \"%s\": total %.1f ms (cleanup-lock wait %.1f, filter %.1f, apply %.1f, inline %.1f); "
@@ -712,8 +729,10 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	 * becomes a BITSET - so the entry may no longer fit the page, or may have
 	 * outgrown inline_limit - or, next to a long key, LION_MAX_ENTRY_SIZE,
 	 * which lion_inline_max() also bounds - and then its posting set spills
-	 * onto container pages exactly as an insert would.  Try the plain
-	 * overwrite first; the spill is decided when that fails.
+	 * onto container pages as an insert's would, except that it may need
+	 * many of them: the payload is not bounded by inline_limit any more,
+	 * only by the number of items it had (lion_entry_spill()).  Try the
+	 * plain overwrite first; the spill is decided when that fails.
 	 */
 	if (res->paylen <= inlinemax)
 	{
@@ -1022,10 +1041,15 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		}
 
 		/*
-		 * A payload that outgrew its entry moves onto container pages, one
-		 * record of its own each.  This is rare (it needs a RUN container to
+		 * A payload that outgrew its entry moves onto container pages, in
+		 * records of its own.  This is rare (it needs a RUN container to
 		 * turn into a BITSET while losing members), so it is not worth
-		 * batching, and lion_entry_spill() rewrites the entry itself.
+		 * batching, and lion_entry_spill() rewrites the entry itself.  It is
+		 * NOT small when it happens: a few kilobytes of RUN containers that
+		 * all turn into BITSETs need a leaf each, and the spill writes as
+		 * many as it takes - a record per leaf, then the root and the entry
+		 * together - where it used to refuse more than four and so failed
+		 * this VACUUM, and every VACUUM after it (2026-09-25 review).
 		 *
 		 * The payload it spills is the FILTERED one, so the rewrite of the
 		 * entry on this leaf is where this entry's dead TIDs leave the
@@ -1420,8 +1444,13 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 		lion_wal_finish(xstate, LION_XLOG_PAGE_DELETED);
 		UnlockReleaseBuffer(buf);
 
+		/*
+		 * Counted here and marked, so that the sweep does not come across it
+		 * as an unvisited DELETED page and count it a second time - which it
+		 * did, reporting twice the pages freed as "currently deleted".
+		 */
 		RecordFreeIndexPage(vs->index, blk);
-		lion_vac_unvisit(vs, blk);
+		lion_vac_visit(vs, blk);
 		vs->pages_newly_deleted++;
 		vs->pages_deleted++;
 		vs->prof.records++;
@@ -1482,26 +1511,36 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
 }
 
 /*
- * Leak recovery (DESIGN.md §18).
+ * Leak recovery, and the count of the free pages (DESIGN.md §18).
  *
  * Every block the walk accounted for is marked in vs->visited, so what is
- * left is either a page a concurrent insert created - which this VACUUM knows
- * nothing about and must not touch - or a leak.  Two kinds of leak are
- * recoverable and this is where they come back:
+ * left is a page a concurrent insert created - which this VACUUM knows
+ * nothing about and must not touch - a page an earlier VACUUM freed, or a
+ * leak.  This is where the free pages are counted and the leaks come back:
  *
- *	- a page that is already DELETED, from a VACUUM that crashed between
- *	  recording it and vacuuming the free space map, or one this VACUUM did
- *	  not free itself.  It goes back into the map.
+ *	- an all-zero page, from an extension whose record never happened, and a
+ *	  DELETED page, freed by an earlier VACUUM or by one that crashed between
+ *	  recording it and vacuuming the free space map.  It goes (back) into the
+ *	  map, and counts as reusable when it is all-zero, or DELETED with a
+ *	  safexid behind every snapshot (lion_vac_page_reusable()).
  *	- an EMPTY container page nothing references, which is what a crash
- *	  between the two steps of a whole-chain free leaves, and what an
- *	  interrupted multi-page spill leaves after its first page.  It becomes a
+ *	  between the two steps of a whole-chain free leaves.  It becomes a
  *	  DELETED page and goes into the map.
+ *	- a container LEAF nothing references whose root is not a live root of
+ *	  its key (lion_posting_root_live()): what a multi-leaf spill that an
+ *	  ERROR or a crash stopped before its last record leaves behind, full
+ *	  leaves under a root that was never written (lion_entry_spill()).  It
+ *	  becomes a DELETED page like the empty ones.
+ *	- an INTERNAL posting page whose children are all DELETED pages (the
+ *	  rounds of lion_vacuum_sweep()).
  *
- * An empty container page of a LIVE chain is never mistaken for one of these,
- * because pass 2 walks every page of every chain it found and marks it
- * visited; a chain created after pass 1 read its bucket page has no empty
- * page in it (a spill and a split both fill every page they allocate inside
- * the record that allocates it, under the lock they hold throughout).
+ * A page of a LIVE set is never mistaken for any of these.  Pass 2 walks
+ * every leaf of every set it found and marks it visited, and a set created
+ * after pass 1 read its leaf, or a leaf a split added since, has no empty
+ * page (a spill and a split fill every page they allocate inside the record
+ * that allocates it, under the lock they hold throughout) and names a root
+ * that is live - or, while its spill is still writing, a root that spill
+ * holds EXCLUSIVE, which lion_posting_root_live() reads as live.
  *
  * Nothing here ever waits: an unreferenced page nobody can reach should not
  * be locked by anyone, and if it somehow is, the next VACUUM will find it.
@@ -1548,6 +1587,22 @@ lion_vac_children_deleted(LionVacState *vs, Page page)
 	}
 
 	return true;
+}
+
+/*
+ * May the next allocation take this DELETED page already?  The rule
+ * lion_alloc_page() applies, nbtree's: its safexid is behind every snapshot.
+ * Without the heap relation there is no horizon to test against, and the page
+ * is counted as free but not as reusable.
+ */
+static bool
+lion_vac_page_reusable(LionVacState *vs, Page page)
+{
+	if (vs->heaprel == NULL)
+		return false;
+
+	return GlobalVisCheckRemovableFullXid(vs->heaprel,
+										  lion_page_get_safexid(page));
 }
 
 /* Mark blk DELETED and hand it to the free space map.  buf is cleanup-locked. */
@@ -1612,6 +1667,7 @@ lion_vacuum_sweep(LionVacState *vs)
 				RecordFreeIndexPage(vs->index, blk);
 				lion_vac_visit(vs, blk);
 				vs->pages_deleted++;
+				vs->pages_free++;
 				progress = true;
 				continue;
 			}
@@ -1626,10 +1682,14 @@ lion_vacuum_sweep(LionVacState *vs)
 
 			if (LionPageIsDeleted(page))
 			{
+				bool		reusable = lion_vac_page_reusable(vs, page);
+
 				UnlockReleaseBuffer(buf);
 				RecordFreeIndexPage(vs->index, blk);
 				lion_vac_visit(vs, blk);
 				vs->pages_deleted++;
+				if (reusable)
+					vs->pages_free++;
 				progress = true;
 				continue;
 			}
@@ -1647,6 +1707,26 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 
 			if (PageGetMaxOffsetNumber(page) == 0)
+			{
+				lion_vac_free_page(vs, buf, blk);
+				progress = true;
+				continue;
+			}
+
+			/*
+			 * A full leaf that nothing references: a leaf of a set this walk
+			 * did not know about, or one an interrupted spill left behind,
+			 * and its ROOT tells them apart.  The root is only locked
+			 * conditionally, with the leaf held; a busy root is taken for a
+			 * live one.  A leaf that is its own root is a one-page set, which
+			 * a spill writes in the same record as its entry, so it is never
+			 * an orphan.
+			 */
+			if (LionPageGetOpaque(page)->owner_head != blk &&
+				!lion_posting_root_live(vs->index,
+										LionPageGetOpaque(page)->owner_hash,
+										LionPageGetOpaque(page)->owner_head,
+										false))
 			{
 				lion_vac_free_page(vs, buf, blk);
 				progress = true;

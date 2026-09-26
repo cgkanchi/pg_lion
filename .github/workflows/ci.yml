@@ -7,9 +7,19 @@
 #   source  REL_19_STABLE and master built from source with --enable-cassert
 #           and --enable-injection-points, the injection_points module and the
 #           isolation tester installed, so every isolation spec runs.  The
-#           build is cached per upstream commit.
+#           build is cached per upstream commit.  These are also the only jobs
+#           with an assert build, so the debug_discard_caches run is here.
 #   dist    make dist, META.json validated against the PGXN Meta Spec, and the
 #           archive built and tested on its own, outside the checkout.
+#
+# The injection-point specs - the race tests of the VACUUM/count/split
+# interlocks - therefore run on 19 and master only.  16 has no injection
+# points at all, and 17 and 18 would need a source build of their own
+# (PGDG ships no injection_points module); README.md says so.
+#
+# The pgdg and source jobs run the unit tests twice: as built, and with
+# AddressSanitizer and UndefinedBehaviorSanitizer (make unit SANITIZE=1),
+# which is where the container and sparse code meets malformed input.
 #
 # Every server job runs the suite twice, as DESIGN.md section 25 requires:
 # installcheck in generic-WAL mode and installcheck-rmgr with the custom
@@ -70,6 +80,9 @@ jobs:
 
       - name: Unit tests
         run: make unit
+
+      - name: Unit tests with ASan and UBSan
+        run: make unit SANITIZE=1 WERROR=1
 
       - name: Start a private cluster
         run: ./dev.sh reset
@@ -161,6 +174,9 @@ jobs:
       - name: Unit tests
         run: make unit
 
+      - name: Unit tests with ASan and UBSan
+        run: make unit SANITIZE=1 WERROR=1
+
       - name: Start a private cluster
         run: ./dev.sh reset
 
@@ -172,6 +188,24 @@ jobs:
           if grep -q 'skipping isolation specs' installcheck.log; then
             echo "injection-point specs were skipped"; exit 1
           fi
+
+      # debug_discard_caches = 1 flushes every cache entry at every catalog
+      # read, which is how the relcache-flush bugs of DESIGN.md §21 ("A
+      # relcache flush must not free the state") were found.  The setting
+      # exists only in assert builds, so only these jobs can run it.  The
+      # whole suite under it takes hours; test/sql/discard_caches.sql, which
+      # the step above already ran with the setting switched on around its
+      # own queries, is run again here with it on for EVERY statement - the
+      # builds, inserts, VACUUMs and verify() between those queries too.
+      # PGOPTIONS reaches every session pg_regress opens, which it extends
+      # rather than replaces.  Measured on an assert 18.6 on a busy 4-CPU box:
+      # 17 minutes, against about 3 for the same file in the step above; if
+      # that is too much for two jobs, `if: matrix.branch == 'master'` halves
+      # it.
+      - name: discard_caches.sql with debug_discard_caches = 1 throughout
+        run: |
+          eval "$(./dev.sh env)"
+          PGOPTIONS="-c debug_discard_caches=1" make installcheck REGRESS=discard_caches ISOLATION=
 
       - name: installcheck-rmgr with wal_consistency_checking
         run: |

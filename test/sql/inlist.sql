@@ -167,7 +167,8 @@ SELECT lion_incmp($$SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND c = 'c3'$
 SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE n IN (1, 2)');
 -- an IN list and a null test on the same column
 SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE n IN (1, 2) AND n IS NOT NULL');
--- the same list twice is a duplicate clause, two different ones are not
+-- the same list twice is a duplicate clause; two different ones are two
+-- sources, ANDed like lists on two columns (samecolumn.sql)
 SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND b IN (1, 2)');
 SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND b IN (2, 3)');
 -- = ALL is answered by the ordinary plan

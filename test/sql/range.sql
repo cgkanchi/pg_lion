@@ -547,6 +547,26 @@ SELECT lion_rq('SELECT id FROM lion_rm WHERE (a < 5 AND b = 1) OR (a > 45 AND c 
 SELECT lion_rq('SELECT id FROM lion_rm WHERE a < 0 AND b = 1');
 SELECT lion_rq('SELECT id FROM lion_rm WHERE a < ANY (''{3, 7}'') AND b = 2');
 SELECT lion_rq('SELECT id FROM lion_rm WHERE a > ANY (''{40, 45}'') AND b IS NOT NULL');
+SELECT lion_rq('SELECT id FROM lion_rm WHERE a < ANY (''{-40, -45}'') AND b = 3');
+SELECT lion_rq('SELECT id FROM lion_rm WHERE a >= ANY (''{48, NULL}'') AND b = 3 AND c > ''m''');
+-- ... and `< ANY` there is answered by its walk, intersected with the other
+-- columns' bitmap, not dropped for the recheck: it used to be, and the heap
+-- threw away every row of b = 3 (685, 586 and 329 rows below), while the cost
+-- model and the plain scan took it as answered.  Nothing is removed now.
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_indexscan = off;
+SET LOCAL pg_lion.enable_count_pushdown = off;
+SELECT l FROM lion_explain_norm('SELECT id FROM lion_rm WHERE a < ANY (''{-40, -45}'') AND b = 3',
+								'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l
+ WHERE l ~ '(Bitmap Heap Scan|Rows Removed by Index Recheck)';
+SELECT l FROM lion_explain_norm('SELECT id FROM lion_rm WHERE a < ANY (''{3, 7}'') AND b = 2',
+								'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l
+ WHERE l ~ '(Bitmap Heap Scan|Rows Removed by Index Recheck)';
+SELECT l FROM lion_explain_norm('SELECT id FROM lion_rm WHERE a >= ANY (''{48, NULL}'') AND b = 3 AND c > ''m''',
+								'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l
+ WHERE l ~ '(Bitmap Heap Scan|Rows Removed by Index Recheck)';
+ROLLBACK;
 SELECT lion_rc('SELECT count(*) FROM lion_rm WHERE a < 20');
 SELECT lion_rc('SELECT count(*) FROM lion_rm WHERE a < 20 AND b = 2');
 SELECT lion_rc('SELECT count(*) FROM lion_rm WHERE c BETWEEN ''d'' AND ''k'' AND a = 7');

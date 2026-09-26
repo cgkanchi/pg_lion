@@ -58,6 +58,20 @@
 #define LION_IS_MVCC_LIKE(snapshot)	IsMVCCSnapshot(snapshot)
 #endif
 
+/*
+ * RestrictSearchPath() (17) sets search_path to "pg_catalog, pg_temp" for the
+ * current GUC nest level; 17's maintenance commands - CREATE INDEX, REINDEX,
+ * VACUUM, amcheck - evaluate the table owner's index expressions under it.
+ * 16's evaluate them under the session's search_path, and so does
+ * lion_index_verify() there, which is what makes it evaluate an expression
+ * exactly as that server's own CREATE INDEX did.
+ */
+#include "utils/guc.h"
+
+#if PG_VERSION_NUM < 170000
+#define RestrictSearchPath()	((void) 0)
+#endif
+
 /* vacuum_delay_point() took is_analyze in 18. */
 #if PG_VERSION_NUM >= 180000
 #define lion_vacuum_delay_point()	vacuum_delay_point(false)
@@ -158,6 +172,15 @@ typedef int LionSysCacheId;
 /* 19 requires TupleDescFinalize() on a hand-built descriptor; before, nothing. */
 #if PG_VERSION_NUM < 190000
 #define TupleDescFinalize(tupdesc)	((void) (tupdesc))
+#endif
+
+/*
+ * pg_always_inline is the newer spelling of pg_attribute_always_inline (which
+ * every supported major has); released 16.x and 17.x minors do not define it,
+ * so lion_count.c did not compile against them.
+ */
+#ifndef pg_always_inline
+#define pg_always_inline pg_attribute_always_inline
 #endif
 
 /* get_opfamily_name() moved into lsyscache.c in 18. */

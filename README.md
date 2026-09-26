@@ -14,12 +14,18 @@ on-disk format, locking protocol, the VACUUM/visibility-map interlock argument (
 planner integration (§10).
 
 Status: prototype.  Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version
-differences live in `src/lion_compat.h`.  Validated on 16.15, 17.11, 18.6, 19beta4 and master: 21 SQL
-regression files and 15 isolation specs (including injection-point checks of the VACUUM/container-page
-interlock) in both WAL modes, 660k container and 290k sparse unit checks, and the crash-recovery/
-hot-standby harness in both modes.  PostgreSQL 16 has no injection points, so there the 10 specs that
-need them are skipped (the Makefile says so) and the interlock is covered by the code, not by a test.
-See the [latest review](FOLLOWUP_REVIEW.md) for evidence and remaining limitations.
+differences live in `src/lion_compat.h`, and the first validation across all of them (16.15, 17.11,
+18.6, 19beta4 and master) was at `eb1579e`.  CI (`.github/workflows/ci.yml`) builds and tests every
+one of those majors on each push: the container and sparse unit tests, every SQL regression file in
+`test/sql` and every isolation spec in `test/isolation` in both WAL modes, and, on the 19 and master
+source builds, the crash-recovery/hot-standby harness in both modes.  One gap is deliberate and worth
+knowing: the isolation specs that park a backend on an injection point (`grep -l injection_points
+test/isolation/*.spec`), which are the race tests of the VACUUM/count/split interlocks, need a server
+configured with `--enable-injection-points` and the `injection_points` test module.  PostgreSQL 16
+has no injection points, and the PGDG packages of 17 and 18 ship without the module, so CI runs those
+specs only on its 19 and master source builds; on 16-18 the interlocks are covered by the same code
+and by those specs on the newer majors, not by a test on that major.  See the
+[latest review](FOLLOWUP_REVIEW.md) for evidence and remaining limitations.
 
 ## When to use Lion
 
@@ -35,7 +41,7 @@ estimate that benefit; dirty pages require visibility checks in the heap.
 | Count many matches, combine equality filters, or count groups | Consider Lion on the columns used by these queries. The largest measured gains come from `LionCount` pushdown. |
 | Fetch a handful of rows, or count a very selective key | B-tree is a strong default. The latest run shows practical parity for tiny equality counts and no consistent heap-fetch advantage from Lion. |
 | Count matches within a scalar range | Consider Lion count pushdown: the measured clean range count beats B-tree at both scales. Fetching matching rows has different costs. |
-| Ordered retrieval or uniqueness | Keep B-tree. Lion supplies bitmap scans and count pushdown, not ordered row retrieval or unique indexes. |
+| Ordered retrieval or uniqueness | Keep B-tree. Lion supplies bitmap and plain index scans and count pushdown, not ordered row retrieval or unique indexes. |
 | Array membership or exact-lexeme counts | Consider Lion when counts dominate; compare against GIN on your predicates and result sizes. |
 | Full-text phrase/prefix search, or searches returning documents | Prefer GIN for the measured phrase/prefix cases; ordinary document fetching shows no clear Lion advantage. |
 | Frequent inserts or indexed updates | B-tree/GIN build more cheaply. Write results are mixed: Lion's inserts are slower and emit more WAL, but its indexed UPDATE is faster than B-tree in this run. GIN defers work, so include VACUUM costs. |
@@ -63,16 +69,37 @@ CREATE INDEX, so the suite has to pass in both:
     make PG_CONFIG=.local/pg/bin/pg_config recovery-check-rmgr  RECOVERY_PREFIX=<prefix>
 
 `installcheck-rmgr` restarts the dev cluster with `shared_preload_libraries = 'pg_lion'` on
-pg_ctl's command line, runs the same suite, and restarts it back; nothing is written into
-postgresql.conf, so an interrupted run leaves no trace.  `recovery-check-rmgr` is the recovery
+pg_ctl's command line, proves the restart took - the server lists pg_lion as a WAL resource manager
+and a freshly built index reports `rmgr` - and only then runs the same suite (`walrecords` has an
+expected file for each mode, so the suite alone would pass in either), and afterwards puts the
+cluster back as it found it: restarted in generic mode, or stopped.  Nothing is written into
+postgresql.conf, so an interrupted run leaves no trace; `make hookcheck` works the same way.
+`recovery-check-rmgr` is the recovery
 harness with the resource manager registered AND `wal_consistency_checking = 'pg_lion'`, which is
 where "replay reproduces every page" is actually proved - the comparison only happens during
 replay, so turning it on for a primary that never replays proves nothing.
 
-`.local/pg` can be any PostgreSQL 16 or later install.  The isolation specs need
-`pg_isolation_regress` installed from `src/test/isolation`; the ones that park a backend on an
-injection point also need `--enable-injection-points` (17 or later) and the `injection_points` test
-module installed, and are skipped when the module is missing (`INJECTION_POINTS=1` forces them).
+`.local/pg` can be any PostgreSQL 16 or later install.  What the suites need from it:
+
+- **contrib: `citext`, `pg_buffercache` and `pg_walinspect`.**  The regression suite creates all
+  three.  Without `pg_buffercache` the `pinbudget` and `range` files and the `gettuple_pause` spec
+  fail, without `pg_walinspect` `walrecords` fails, and most files use `citext`.  The PGDG packages
+  (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
+- **`pg_isolation_regress`** for the isolation specs: a source build installs it with
+  `make -C src/test/isolation install`, and the packages ship it in `postgresql-server-dev-N`.
+- **`injection_points`** for the specs that park a backend on an injection point: a server
+  configured with `--enable-injection-points` (17 or later) and the test module installed with
+  `make -C src/test/modules/injection_points install`.  Where the module is missing those specs are
+  skipped and the run says which (`INJECTION_POINTS=1` forces them, and makes a missing module an
+  error instead).
+- **The recovery harness** (`make recovery-check`) needs a whole installation to initdb clusters
+  in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into; as root it also
+  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).
+
+`dev.sh` puts its cluster's socket in `$XDG_RUNTIME_DIR/pg_lion-<user>` (or `/tmp/pg_lion-<user>`)
+on port 54329, and `LION_SOCK` / `LION_PORT` move it; the cluster runs with `wal_level = replica`, so
+that index builds and the write paths of indexes created in the same transaction are WAL-logged in
+the suite as they are in production.
 
 ## How to use it
 
@@ -123,23 +150,64 @@ SELECT count(*) FROM docs WHERE tags @> ARRAY['t1', 't17'];
 CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
 ```
 
+## SQL functions
+
+Ordinary SQL is the interface - the planner uses the index and the `LionCount` pushdown on its own -
+and these functions are for testing, diagnostics and the occasional direct count:
+
+    lion_index_count(idx, key)                      count(*) WHERE col = key, through one index
+    lion_index_count(idx1, key1, idx2, key2)        ... AND col2 = key2, two indexes on one table
+    lion_index_count_any(idx, keys)                 count(*) WHERE col = ANY (keys)
+    lion_index_count_stats(idx, key)                lion_index_count() plus the heap it visited
+    lion_index_count_group_stats(idx [, use_cache, attno])   every group's count, as GROUP BY does
+    lion_index_stats(idx)                           the index's shape, one row per key column
+    lion_index_verify(idx [, heapallindexed])       structural check, optionally against the heap
+    lion_index_wal_mode(idx)                        'generic' or 'rmgr' (DESIGN.md §25)
+    lion_index_posting_root(idx, key)               a key's posting-tree root block, for tests
+
+The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
+and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
+force for the caller.  They take one INDEX, and an index belongs to one table, so they count that
+table's own rows and nothing else.  On an inheritance parent that is the parent's rows alone - the
+count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, even though a plain
+`FROM parent` includes them.  A partitioned table's index has no storage and is refused
+(`"..." is not an index`); pass a partition's own index, or write the `SELECT count(*)` against the
+partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
+attempted for an old-style inheritance parent without `ONLY`, whose children need not even share
+its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
+are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
+`pg_stat_scan_tables`.
+`lion_index_verify()` checks the index while it is being written to, the way `CREATE INDEX
+CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the index, so INSERT,
+UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it.
+What a concurrent insert could make look wrong it checks again once the statements that were writing
+the index have ended, so it may wait for them - for as long as statement_timeout and lock_timeout
+allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock and
+is exact only while replay leaves the index alone.  With `heapallindexed` it evaluates the index's
+expressions as the table's owner (DESIGN.md §7).
+
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
     src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
-    src/lion.h, lion_pages.c on-disk structs; meta/entry/leaf primitives, page splits, generic WAL
+    src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
+    src/lion.h, lion_pages.c on-disk structs; meta/entry/leaf primitives, page splits
+    src/lion_compat.h       the differences between PostgreSQL 16, 17, 18, 19 and master
+    src/lion_wal.[ch]       the WAL shim every write path calls, and the custom resource manager
     src/lion_dir.c          the sorted entry directory: a Lehman & Yao B-tree keyed by the index key
     src/lion_posting.c      the per-key posting tree: a B-tree over container keys, GIN's shape
     src/lion_am.c           handler, reloptions, amvalidate, cost estimate, buildempty, _PG_init hook/GUC
     src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key posting trees
-    src/lion_scan.c         amgetbitmap
+    src/lion_scan.c         amgetbitmap, and amgettuple for plain index scans
     src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
-    src/lion_funcs.c        lion_index_stats(), lion_index_verify()
+    src/lion_funcs.c        lion_index_stats(), lion_index_verify() and the other diagnostics
     src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
     src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
+    src/lion_fkjoin.[ch]    the FK-side join a LionCount answers (GROUP BY dim.attr over a fact table)
+    src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered, btree-ordered scans
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
-    test/sql, test/isolation, test/unit
+    test/sql, test/isolation, test/unit, test/recovery, test/modules
 
 ## Key types
 
@@ -167,13 +235,15 @@ extraction functions, and answer
 combined with a `GROUP BY` on a scalar roaring column. Everything a plain AND/OR of key sets cannot
 express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*` or weights - falls
 back to scanning every indexed row and rechecking it if the Lion index is used. The planner may
-choose a sequential scan instead; GIN wins the measured phrase/prefix cases below. The reloption `max_entries` (default 0 = unlimited) makes the index warn once per backend when it grows
-past that many distinct keys; it never rejects a row.
+choose a sequential scan instead; GIN wins the measured phrase/prefix cases below.
 
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
-`max_entries` (0 = unlimited; the advisory cardinality guard above) and
+`max_entries` (default 0 = unlimited): an advisory cardinality guard.  The index warns once per
+backend when it has grown past that many distinct keys - counted exactly by a build, estimated by an
+insert that adds a key as the entries on its directory leaf times the number of leaves - and never
+rejects a row.  For a multi-key column the keys are the extracted elements or lexemes.
 `inline_limit` (64 .. 4096 bytes, default 4096): how large a key's posting set may be before it
 moves out of its entry tuple onto container pages of its own.
 `buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
@@ -212,8 +282,10 @@ every row.
 
 ## Known limitations
 
-Equality, `IN` lists, scalar ranges and the multi-key operators above are supported. There are no
-`amgettuple`/index-only scans, no INCLUDE columns, no
+Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
+scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered index scans (an
+`ORDER BY` needs a B-tree, which `LionOrdered` combines with a lion filter, §30), no index-only scans
+that return a column (only those that need none, like `count(*)`), no INCLUDE columns, no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured

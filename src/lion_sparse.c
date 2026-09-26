@@ -31,8 +31,34 @@
 
 /* ----------------------------------------------------------------
  *							internal helpers
+ *
+ * A segment read from disk is data, exactly as a container is
+ * (lion_container.c, "untrusted containers").  Every function here works
+ * with lion_sparse_npairs() pairs and finds los[] where that many ckeys end,
+ * so that a header claiming more than LION_SPARSE_MAX_PAIRS never walks it
+ * past the largest legal segment, 4100 bytes; and a mutator first rewrites
+ * such a claim to that count (sparse_clamp()), so that what it leaves behind
+ * fits a LION_CONTAINER_MAX_SIZE buffer.  The pairs' values are only ever
+ * compared, never used as an index, and a lo handed to the container library
+ * is masked into range.  For a well-formed segment all of this is a no-op.
  * ----------------------------------------------------------------
  */
+
+/* los[] of a segment, for reading, where npairs ckeys end. */
+static inline const uint16 *
+sparse_los_const(const LionContainer *s, uint32 npairs)
+{
+	return (const uint16 *) ((const char *) s + LION_CONTAINER_HDRSZ +
+							 (Size) npairs * sizeof(uint32));
+}
+
+/* See lion_container.c's container_clamp(). */
+static inline void
+sparse_clamp(LionContainer *s)
+{
+	if (s->cardinality > LION_SPARSE_MAX_PAIRS)
+		s->cardinality = LION_SPARSE_MAX_PAIRS;
+}
 
 /*
  * Index of the first pair whose (ckey, lo) is not below (ckey, lo) -- the
@@ -41,10 +67,11 @@
 static uint32
 sparse_lower_bound(const LionContainer *s, uint32 ckey, uint32 lo)
 {
+	uint32		n = lion_sparse_npairs(s);
 	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(s);
-	const uint16 *los = LION_SPARSE_LOS_CONST(s);
+	const uint16 *los = sparse_los_const(s, n);
 	uint32		low = 0;
-	uint32		high = s->cardinality;
+	uint32		high = n;
 
 	while (low < high)
 	{
@@ -70,7 +97,7 @@ sparse_copy_range(const LionContainer *src, uint32 from, uint32 to,
 {
 	uint32		n = to - from;
 
-	Assert(from <= to && to <= src->cardinality);
+	Assert(from <= to && to <= lion_sparse_npairs(src));
 	Assert(n <= LION_SPARSE_MAX_PAIRS);
 
 	dest->type = LION_CT_SPARSE;
@@ -82,7 +109,8 @@ sparse_copy_range(const LionContainer *src, uint32 from, uint32 to,
 	{
 		memcpy(LION_SPARSE_CKEYS(dest), LION_SPARSE_CKEYS_CONST(src) + from,
 			   (Size) n * sizeof(uint32));
-		memcpy(LION_SPARSE_LOS(dest), LION_SPARSE_LOS_CONST(src) + from,
+		memcpy(LION_SPARSE_LOS(dest),
+			   sparse_los_const(src, lion_sparse_npairs(src)) + from,
 			   (Size) n * sizeof(uint16));
 	}
 }
@@ -143,7 +171,7 @@ lion_sparse_find(const LionContainer *s, uint32 ckey, uint32 *first,
 				uint32 *count)
 {
 	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(s);
-	uint32		n = s->cardinality;
+	uint32		n = lion_sparse_npairs(s);
 	uint32		pos = sparse_lower_bound(s, ckey, 0);
 	uint32		end = pos;
 
@@ -169,19 +197,20 @@ lion_sparse_count(const LionContainer *s, uint32 ckey)
 bool
 lion_sparse_contains(const LionContainer *s, uint32 ckey, uint16 lo)
 {
+	uint32		n = lion_sparse_npairs(s);
 	uint32		pos = sparse_lower_bound(s, ckey, lo);
 
 	Assert(s->type == LION_CT_SPARSE);
 
-	return pos < s->cardinality &&
+	return pos < n &&
 		LION_SPARSE_CKEYS_CONST(s)[pos] == ckey &&
-		LION_SPARSE_LOS_CONST(s)[pos] == lo;
+		sparse_los_const(s, n)[pos] == lo;
 }
 
 bool
 lion_sparse_insert(LionContainer *s, uint32 ckey, uint16 lo, bool *dup)
 {
-	uint32		n = s->cardinality;
+	uint32		n;
 	uint32		pos;
 	uint32	   *ckeys;
 	uint16	   *los;
@@ -189,6 +218,9 @@ lion_sparse_insert(LionContainer *s, uint32 ckey, uint16 lo, bool *dup)
 
 	Assert(s->type == LION_CT_SPARSE);
 	Assert((uint32) lo < LION_CONTAINER_RANGE);
+
+	sparse_clamp(s);
+	n = s->cardinality;
 
 	if (dup != NULL)
 		*dup = false;
@@ -230,9 +262,12 @@ lion_sparse_insert(LionContainer *s, uint32 ckey, uint16 lo, bool *dup)
 bool
 lion_sparse_remove(LionContainer *s, uint32 ckey, uint16 lo)
 {
-	uint32		pos = sparse_lower_bound(s, ckey, lo);
+	uint32		pos;
 
 	Assert(s->type == LION_CT_SPARSE);
+
+	sparse_clamp(s);
+	pos = sparse_lower_bound(s, ckey, lo);
 
 	if (pos >= s->cardinality || LION_SPARSE_CKEYS_CONST(s)[pos] != ckey ||
 		LION_SPARSE_LOS_CONST(s)[pos] != lo)
@@ -247,14 +282,22 @@ lion_sparse_remove_if(LionContainer *s, lion_pair_predicate pred, void *arg)
 {
 	bool		keep[LION_SPARSE_MAX_PAIRS];
 	uint32	   *ckeys = LION_SPARSE_CKEYS(s);
-	const uint16 *los = LION_SPARSE_LOS_CONST(s);
-	uint32		n = s->cardinality;
+	const uint16 *los;
+	uint32		n;
 	uint32		nkept = 0;
 	uint32		i;
 	uint16	   *newlos;
 
 	Assert(s->type == LION_CT_SPARSE);
-	Assert(n <= LION_SPARSE_MAX_PAIRS);
+
+	/*
+	 * keep[] is sized by the largest legal segment, and VACUUM hands in a
+	 * page item copied by its line pointer's length, not by its header: a
+	 * header claiming 1000 pairs would index keep[] 318 entries past its end.
+	 */
+	sparse_clamp(s);
+	n = s->cardinality;
+	los = LION_SPARSE_LOS_CONST(s);
 
 	for (i = 0; i < n; i++)
 	{
@@ -306,18 +349,27 @@ lion_sparse_remove_if(LionContainer *s, lion_pair_predicate pred, void *arg)
 uint32
 lion_sparse_extract(LionContainer *s, uint32 ckey, LionContainer *out)
 {
-	const uint16 *los = LION_SPARSE_LOS_CONST(s);
+	const uint16 *los;
 	uint32		first;
 	uint32		count;
 	uint32		i;
 
 	Assert(s->type == LION_CT_SPARSE);
 
+	sparse_clamp(s);
+	los = LION_SPARSE_LOS_CONST(s);
 	lion_sparse_find(s, ckey, &first, &count);
 
+	/*
+	 * add(), not the bulk builder's append_sorted(): the los of one ckey are
+	 * ascending and unique in a well-formed segment, and then the two build
+	 * the same bytes (at most LION_SPARSE_THRESHOLD - 1 of them, so the
+	 * builder's saving is nothing), but a damaged segment's are whatever
+	 * they are, and append_sorted() is promised order and uniqueness.
+	 */
 	lion_container_init(out, ckey);
 	for (i = 0; i < count; i++)
-		lion_container_append_sorted(out, los[first + i]);
+		(void) lion_container_add(out, (uint16) (los[first + i] & LION_LO_MASK));
 
 	if (count > 0)
 		sparse_delete_range(s, first, count);
@@ -330,7 +382,7 @@ lion_sparse_split_half(const LionContainer *s, LionContainer *left,
 					  LionContainer *right)
 {
 	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(s);
-	uint32		n = s->cardinality;
+	uint32		n = lion_sparse_npairs(s);
 	uint32		m;
 
 	Assert(s->type == LION_CT_SPARSE);
@@ -365,19 +417,23 @@ lion_sparse_split_at(const LionContainer *s, uint32 ckey, LionContainer *left,
 
 	Assert(s->type == LION_CT_SPARSE);
 
+	/*
+	 * The caller extracted ckey already, so count is 0 - unless the segment
+	 * is damaged and held ckey's pairs out of order, in which case the ones
+	 * extract() did not find simply go right.
+	 */
 	lion_sparse_find(s, ckey, &first, &count);
-	Assert(count == 0);			/* the caller extracted ckey already */
 
 	sparse_copy_range(s, 0, first, left);
-	sparse_copy_range(s, first, s->cardinality, right);
+	sparse_copy_range(s, first, lion_sparse_npairs(s), right);
 }
 
 bool
 lion_sparse_merge(const LionContainer *a, const LionContainer *b,
 				 LionContainer *out)
 {
-	uint32		na = a->cardinality;
-	uint32		nb = b->cardinality;
+	uint32		na = lion_sparse_npairs(a);
+	uint32		nb = lion_sparse_npairs(b);
 
 	Assert(a->type == LION_CT_SPARSE && b->type == LION_CT_SPARSE);
 
@@ -396,9 +452,9 @@ lion_sparse_merge(const LionContainer *a, const LionContainer *b,
 		   (Size) na * sizeof(uint32));
 	memcpy(LION_SPARSE_CKEYS(out) + na, LION_SPARSE_CKEYS_CONST(b),
 		   (Size) nb * sizeof(uint32));
-	memcpy(LION_SPARSE_LOS(out), LION_SPARSE_LOS_CONST(a),
+	memcpy(LION_SPARSE_LOS(out), sparse_los_const(a, na),
 		   (Size) na * sizeof(uint16));
-	memcpy(LION_SPARSE_LOS(out) + na, LION_SPARSE_LOS_CONST(b),
+	memcpy(LION_SPARSE_LOS(out) + na, sparse_los_const(b, nb),
 		   (Size) nb * sizeof(uint16));
 
 	return true;
@@ -407,9 +463,9 @@ lion_sparse_merge(const LionContainer *a, const LionContainer *b,
 void
 lion_sparse_iterate(const LionContainer *s, lion_pair_callback cb, void *arg)
 {
+	uint32		n = lion_sparse_npairs(s);
 	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(s);
-	const uint16 *los = LION_SPARSE_LOS_CONST(s);
-	uint32		n = s->cardinality;
+	const uint16 *los = sparse_los_const(s, n);
 	uint32		i;
 
 	Assert(s->type == LION_CT_SPARSE);

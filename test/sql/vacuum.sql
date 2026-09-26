@@ -518,5 +518,51 @@ VACUUM lion_vacbig;
 SELECT inline_entries, ntids FROM lion_index_stats('lion_vacbig_k');
 SELECT lion_index_verify('lion_vacbig_k', true);
 
+/*
+ * A filtered INLINE payload that needs MANY leaves (DESIGN.md §5 VACUUM, §18;
+ * lion_entry_spill()).  One key over 150,000 clustered rows is eleven RUN
+ * containers of a few hundred bytes, INLINE; deleting every tenth row turns
+ * ten of them into 4104-byte BITSETs, two of which never fit one page, so the
+ * posting set VACUUM spills needs ten leaves and a root above them.  The
+ * spill refused more than four ("needs 10 container pages"), and since
+ * nothing changes between two VACUUMs, every VACUUM of the table failed from
+ * then on - autovacuum's and the anti-wraparound one's included.  The NULL
+ * entry (§14) goes the same way and must stay the reserved entry it is.
+ */
+CREATE TABLE lion_vacwide (i int4 NOT NULL, k int4, n int4);
+INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(1, 150000) i;
+CREATE INDEX lion_vacwide_k ON lion_vacwide USING lion (k);
+CREATE INDEX lion_vacwide_n ON lion_vacwide USING lion (n);
+SELECT entries, inline_entries, run_containers, ntids
+  FROM lion_index_stats('lion_vacwide_k');
+SELECT entries, inline_entries, null_tids FROM lion_index_stats('lion_vacwide_n');
+DELETE FROM lion_vacwide WHERE i % 10 = 3;
+VACUUM lion_vacwide;
+SELECT entries, inline_entries, container_pages, posting_internal_pages,
+	   bitset_containers, ntids
+  FROM lion_index_stats('lion_vacwide_k');
+SELECT entries, inline_entries, container_pages, posting_internal_pages,
+	   null_tids
+  FROM lion_index_stats('lion_vacwide_n');
+SELECT lion_index_verify('lion_vacwide_k', true);
+SELECT lion_index_verify('lion_vacwide_n', true);
+SELECT lion_cmp('lion_vacwide', 'k = 0');
+SELECT lion_cmp('lion_vacwide', 'n IS NULL');
+SELECT lion_index_count('lion_vacwide_k', 0) AS n;
+
+-- ... and the tree it built takes new rows and VACUUMs like any other
+INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(150001, 152000) i;
+DELETE FROM lion_vacwide WHERE i % 10 = 7;
+VACUUM lion_vacwide;
+SELECT entries, inline_entries, ntids = (SELECT count(*) FROM lion_vacwide)
+	   AS ntids_matches_heap
+  FROM lion_index_stats('lion_vacwide_k');
+SELECT null_tids = (SELECT count(*) FROM lion_vacwide) AS null_tids_match_heap
+  FROM lion_index_stats('lion_vacwide_n');
+SELECT lion_index_verify('lion_vacwide_k', true);
+SELECT lion_index_verify('lion_vacwide_n', true);
+SELECT lion_cmp('lion_vacwide', 'k = 0');
+SELECT lion_cmp('lion_vacwide', 'n IS NULL');
+
 DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv,
-	lion_slacki, lion_vacpre, lion_vacbig;
+	lion_slacki, lion_vacpre, lion_vacbig, lion_vacwide;

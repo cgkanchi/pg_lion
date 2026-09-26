@@ -17,7 +17,16 @@
 # generic mode.
 #
 # Nothing here touches the cluster's data directory beyond starting and
-# stopping it, and it never runs initdb.
+# stopping it, and it never runs initdb.  It leaves the cluster as it found
+# it: running (in generic mode, with no pg_ctl -o options, which is how
+# dev.sh starts it) if it was running, stopped if it was stopped.
+#
+# Before the suite runs, it proves that the restart took: the server must list
+# pg_lion among its WAL resource managers, and an index built there must
+# report wal_mode 'rmgr'.  Without that check a restart that silently came up
+# without the preload would still pass - walrecords has an expected file for
+# each mode, and pg_regress accepts either - and "passed in rmgr mode" would
+# be a statement about generic mode.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -34,17 +43,29 @@ if [ "${WAL_CONSISTENCY:-0}" != "0" ]; then
 	MODE="rmgr + wal_consistency_checking"
 fi
 
+# Whether the cluster was running when this began: that, and only that, is
+# the state it is put back in.  pg_ctl status exits 0 for a running server.
+if "$BINDIR/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+	WAS_RUNNING=1
+else
+	WAS_RUNNING=0
+fi
+
 # STOP and START rather than restart, in both directions.  `pg_ctl restart`
 # reuses the options in postmaster.opts, so a restart after an "-o" start
 # keeps the preload - which would leave the dev cluster in rmgr mode and make
 # the next plain `make installcheck` silently test the wrong thing.
 restore()
 {
-	echo "== restoring the cluster to generic mode"
 	"$BINDIR/pg_ctl" -D "$PGDATA" stop -m fast >/dev/null 2>&1
-	"$BINDIR/pg_ctl" -D "$PGDATA" -l "$LOG" start >/dev/null 2>&1
-	"$BINDIR/psql" -X -q -tAc \
-		"select 'resource managers registered: ' || count(*) from pg_get_wal_resource_managers() where rm_name = 'pg_lion'"
+	if [ "$WAS_RUNNING" = 1 ]; then
+		echo "== restoring the cluster to generic mode"
+		"$BINDIR/pg_ctl" -D "$PGDATA" -l "$LOG" start >/dev/null 2>&1
+		"$BINDIR/psql" -X -q -tAc \
+			"select 'resource managers registered: ' || count(*) from pg_get_wal_resource_managers() where rm_name = 'pg_lion'"
+	else
+		echo "== the cluster was stopped when this began; leaving it stopped"
+	fi
 }
 trap restore EXIT
 
@@ -54,9 +75,30 @@ echo "== restarting the dev cluster with: $OPTS"
 
 eval "$("$ROOT/dev.sh" env)"
 
-"$BINDIR/psql" -X -q -c \
-	"SELECT rm_id, rm_name FROM pg_get_wal_resource_managers() WHERE rm_name = 'pg_lion'" \
-	|| exit 1
+# The proof that this is rmgr mode, before anything is run in it.  The index
+# is built in a transaction that is rolled back, so the database is left as
+# it was, the extension included.
+registered=$("$BINDIR/psql" -X -q -tAc \
+	"SELECT count(*) FROM pg_get_wal_resource_managers() WHERE rm_name = 'pg_lion'") || exit 1
+if [ "$registered" != 1 ]; then
+	echo "== FAILED: the restarted server does not list pg_lion among its WAL resource managers" >&2
+	exit 1
+fi
+walmode=$("$BINDIR/psql" -X -q -tA -v ON_ERROR_STOP=1 <<-'SQL'
+	SET client_min_messages = warning;
+	BEGIN;
+	CREATE EXTENSION IF NOT EXISTS pg_lion;
+	CREATE TABLE lion_rmgr_check (k int);
+	CREATE INDEX lion_rmgr_check_k ON lion_rmgr_check USING lion (k);
+	SELECT lion_index_wal_mode('lion_rmgr_check_k');
+	ROLLBACK;
+SQL
+) || exit 1
+if [ "$walmode" != "rmgr" ]; then
+	echo "== FAILED: an index built on the restarted server is in '$walmode' mode, not rmgr" >&2
+	exit 1
+fi
+echo "== pg_lion is a registered resource manager, and a new index is built in rmgr mode"
 
 echo "== make installcheck ($MODE)"
 make -C "$ROOT" PG_CONFIG="$PG_CONFIG" installcheck

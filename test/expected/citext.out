@@ -31,10 +31,10 @@ SELECT count(*) FROM lion_ci WHERE name = 'nobody';
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_ci WHERE name = 'CAROL';
-                 QUERY PLAN                  
----------------------------------------------
+                      QUERY PLAN                       
+-------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_ci_name (name = CAROL)
+   Lion Indexes: lion_ci_name (name = 'CAROL'::citext)
 (2 rows)
 
 SET pg_lion.enable_count_pushdown = off;
@@ -235,10 +235,10 @@ $$;
 -- counting needs no representative: still the custom node
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';
-                         QUERY PLAN                         
-------------------------------------------------------------
+                              QUERY PLAN                              
+----------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_cirep_name (name = SECRETOLDSPELLING)
+   Lion Indexes: lion_cirep_name (name = 'SECRETOLDSPELLING'::citext)
 (2 rows)
 
 SELECT count(*) FROM lion_cirep WHERE name = 'SECRETOLDSPELLING';

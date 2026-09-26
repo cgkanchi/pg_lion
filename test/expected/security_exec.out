@@ -252,6 +252,72 @@ SELECT groups, count FROM lion_index_count_group_stats('lion_ex_t');   -- allowe
 
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION int4eq(int4, int4) TO PUBLIC;
+-- ---------- the equality of a key the count resolves: enum_eq, texteq ----------
+-- An enum key on enum_ops is looked up with the class's (anyenum, anyenum)
+-- member, and a varchar key on a text_ops column with (text, text), which the
+-- parser reaches by relabelling the key: the functions `col = key` calls, so
+-- the ones the count asks EXECUTE on (test/sql/keytypes.sql, 2026-09-25).
+CREATE TYPE lion_ex_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE lion_exe (e lion_ex_mood, v varchar);
+INSERT INTO lion_exe
+SELECT (enum_range(NULL::lion_ex_mood))[1 + i % 3], 'v' || (i % 4) FROM generate_series(1, 300) i;
+CREATE INDEX lion_exe_e ON lion_exe USING lion (e);
+CREATE INDEX lion_exe_v ON lion_exe USING lion (v);
+VACUUM ANALYZE lion_exe;
+GRANT SELECT ON lion_exe TO lion_exec_user;
+REVOKE EXECUTE ON FUNCTION enum_eq(anyenum, anyenum) FROM PUBLIC;
+SELECT lion_ex('SELECT count(*) FROM lion_exe WHERE e = ''ok''');
+                                     lion_ex                                      
+----------------------------------------------------------------------------------
+ NOT PUSHED: ERROR: permission denied for function enum_eq (as the ordinary plan)
+(1 row)
+
+SET ROLE lion_exec_user;
+SELECT lion_index_count('lion_exe_e', 'ok'::lion_ex_mood);
+ERROR:  permission denied for function enum_eq
+SELECT lion_index_count_any('lion_exe_e', '{ok, sad}'::lion_ex_mood[]);
+ERROR:  permission denied for function enum_eq
+SELECT lion_index_count('lion_exe_v', 'v1'::varchar);                  -- texteq: allowed
+ lion_index_count 
+------------------
+               75
+(1 row)
+
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION enum_eq(anyenum, anyenum) TO PUBLIC;
+-- lion_ex() itself compares text, so these run by hand
+REVOKE EXECUTE ON FUNCTION texteq(text, text) FROM PUBLIC;
+SET ROLE lion_exec_user;
+SELECT count(*) FROM lion_exe WHERE v = 'v1'::varchar;
+ERROR:  permission denied for function texteq
+SELECT lion_index_count('lion_exe_v', 'v1'::varchar);
+ERROR:  permission denied for function texteq
+SELECT lion_index_count_any('lion_exe_v', '{v1, v2}'::varchar[]);
+ERROR:  permission denied for function texteq
+SELECT lion_index_count('lion_exe_e', 'ok'::lion_ex_mood);             -- enum_eq: allowed
+ lion_index_count 
+------------------
+              100
+(1 row)
+
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION texteq(text, text) TO PUBLIC;
+SET ROLE lion_exec_user;
+SELECT lion_index_count('lion_exe_v', 'v1'::varchar) = (SELECT count(*) FROM lion_exe WHERE v = 'v1') AS ok;
+ ok 
+----
+ t
+(1 row)
+
+SELECT lion_index_count('lion_exe_e', 'ok'::lion_ex_mood) = (SELECT count(*) FROM lion_exe WHERE e = 'ok') AS ok;
+ ok 
+----
+ t
+(1 row)
+
+RESET ROLE;
+DROP TABLE lion_exe;
+DROP TYPE lion_ex_mood;
 -- ---------- a range's operators (DESIGN.md §28): int4lt ----------
 REVOKE EXECUTE ON FUNCTION int4lt(int4, int4) FROM PUBLIC;
 SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k < 5');
@@ -613,6 +679,7 @@ SELECT p.oid::regprocedure
   FROM pg_proc p
  WHERE p.oid IN ('int4eq(int4,int4)'::regprocedure, 'int4lt(int4,int4)'::regprocedure,
                  'hashint4(int4)'::regprocedure,
+                 'enum_eq(anyenum,anyenum)'::regprocedure, 'texteq(text,text)'::regprocedure,
                  'count()'::regprocedure, 'count("any")'::regprocedure)
    AND NOT has_function_privilege('public', p.oid, 'EXECUTE');
  oid 
