@@ -55,6 +55,38 @@ BEGIN
 END $$;
 
 /*
+ * lion_cbplan() prints a plan's nodes and index conditions only, with the
+ * InitPlan that computes an array named the same on every major: 16 prints
+ * `InitPlan 1 (returns $0)` and `$0`, 17 and 18 `(InitPlan 1).col1`, 19
+ * `(InitPlan array_1).col1`.  What the tests below show is which scan answers
+ * the query and which conditions its index takes, not how core names a
+ * subplan's output.
+ */
+CREATE FUNCTION lion_cbplan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	skip int := -1;		/* indentation of the InitPlan being skipped */
+	ind int;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		ind := length(ln) - length(ltrim(ln));
+		IF skip >= 0 AND ind > skip THEN
+			CONTINUE;			/* inside the InitPlan's subtree */
+		END IF;
+		skip := -1;
+		IF ln ~ '^\s*InitPlan' THEN
+			skip := ind;
+			CONTINUE;
+		END IF;
+		CONTINUE WHEN ln ~ 'Recheck Cond:|Disabled: true';
+		ln := regexp_replace(ln, '\(InitPlan [a-z_]*[0-9]+\)\.col[0-9]+|\$[0-9]+',
+							 '(InitPlan)', 'g');
+		RETURN NEXT regexp_replace(ln, '^\s*(->\s+)?', '');
+	END LOOP;
+END $$;
+
+/*
  * The table: a posting set of 30 rows per key, spread over 4300 heap pages
  * (67 container keys, so that a union window of 31 images - work_mem 64kB -
  * takes three windows).  k's index is CHAIN (inline_limit = 64): each entry is
@@ -129,8 +161,7 @@ SELECT lion_cbcmp(format('SELECT count(*) FROM lion_cb WHERE tags @> %L::int[]',
 SET pg_lion.enable_count_pushdown = off;
 SET enable_seqscan = off;
 SET enable_indexscan = off;
-EXPLAIN (COSTS OFF)
-SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(1, 2000) g)) AND x = 1;
+SELECT lion_cbplan('SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(1, 2000) g)) AND x = 1');
 SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(1, 2000) g)) AND x = 1;
 RESET enable_indexscan;
 SET enable_bitmapscan = off;
@@ -219,8 +250,7 @@ SET work_mem = '4MB';
 SET pg_lion.enable_count_pushdown = off;
 SET enable_seqscan = off;
 SET enable_indexscan = off;
-EXPLAIN (COSTS OFF)
-SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 5000))) AND x = 1;
+SELECT lion_cbplan('SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 5000))) AND x = 1');
 SELECT bool_and(entries > 0) AS warm FROM lion_index_stats('lion_cbm_kx');
 RESET enable_seqscan;
 SELECT count(*) FROM lion_cbm;
@@ -264,4 +294,5 @@ SELECT lion_cbcmp('SELECT count(*) FROM lion_cbw WHERE k = ANY ((SELECT array_ag
 DROP TABLE lion_cbt, lion_cbw;
 DROP TABLE lion_cb, lion_cbm;
 DROP FUNCTION lion_cbcmp(text);
+DROP FUNCTION lion_cbplan(text);
 DROP FUNCTION lion_cb_hwm();
