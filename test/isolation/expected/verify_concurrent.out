@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_park_level s1_verify_c s2_split_right s3_wake_level_again s2_split_right2 s3_wake_level s3_dir
+starting permutation: s1_park_level s1_verify_c s2_split_right s3_wake_level_again s2_split_right2 s3_wake_level s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -47,6 +47,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_dir: 
 	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
 		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
@@ -65,7 +71,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_page s1_verify_c s2_split_left s3_wake_page s3_dir
+starting permutation: s1_park_page s1_verify_c s2_split_left s3_wake_page s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -102,6 +108,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_dir: 
 	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
 		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
@@ -120,7 +132,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_meta s1_verify_r s2_split_root s3_wake_meta s3_root
+starting permutation: s1_park_meta s1_verify_r s2_split_root s3_wake_meta s1_done s3_root
 injection_points_set_local
 --------------------------
                           
@@ -157,6 +169,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_root: 
 	SELECT s.directory_height > b.vr_height AS the_root_split
 	  FROM lion_index_stats('vr_k') s, v_before b;
@@ -173,7 +191,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_verify_p s2_grow_p s3_wake_set s3_posting
+starting permutation: s1_park_set s1_verify_p s2_grow_p s3_wake_set s1_done s3_posting
 injection_points_set_local
 --------------------------
                           
@@ -207,6 +225,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_posting: 
 	SELECT s.container_pages > b.vp_leaves AS the_leaves_split,
 		   (SELECT count(*) FROM vp WHERE k = 0) AS k0_rows
@@ -224,7 +248,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_verify_q s2_push_q s3_wake_set s3_pushdown
+starting permutation: s1_park_set s1_verify_q s2_push_q s3_wake_set s1_done s3_pushdown
 injection_points_set_local
 --------------------------
                           
@@ -261,6 +285,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_pushdown: 
 	SELECT s.max_posting_height > b.vq_height AS the_root_was_pushed_down,
 		   lion_index_posting_root('vq_k', 0) = b.vq_root AS the_root_kept_its_block,
@@ -279,7 +309,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_level s1_verify_c s2_spill s3_wake_level s3_spilled
+starting permutation: s1_park_level s1_verify_c s2_spill s3_wake_level s1_done s3_spilled
 injection_points_set_local
 --------------------------
                           
@@ -315,6 +345,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_spilled: 
 	SELECT s.inline_entries = b.vc_inline - 1 AS the_entry_spilled,
 		   lion_index_posting_root('vc_k', 'key1' || repeat('x', 100)) IS NOT NULL
@@ -333,7 +369,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_note_held s1_verify_p s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set s3_touched
+starting permutation: s1_park_set s1_note_held s1_verify_p s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set_again s2_touch_p s3_wake_set s1_done s3_touched
 injection_points_set_local
 --------------------------
                           
@@ -388,6 +424,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_touched: 
 	SELECT (SELECT count(*) FROM vp WHERE k = 0) AS k0_rows;
 	SELECT lion_index_verify('vp_k', true);
@@ -403,7 +445,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_p s3_wake_level s3_reused
+starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_p s3_wake_level s1_done s3_reused
 injection_points_set_local
 --------------------------
                           
@@ -456,6 +498,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_reused: 
 	SELECT s.deleted_pages < f.deleted_pages AS freed_pages_were_taken,
 		   pg_relation_size('vp_k') = f.size AS the_index_did_not_grow
@@ -473,7 +521,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_new s3_wake_level s3_new_set
+starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_new s3_wake_level s1_done s3_new_set
 injection_points_set_local
 --------------------------
                           
@@ -526,6 +574,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_new_set: 
 	SELECT s.deleted_pages < f.deleted_pages AS freed_pages_were_taken,
 		   lion_index_posting_root('vp_k', 2) IS NOT NULL AS the_new_key_has_a_tree
@@ -543,7 +597,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_meta s1_verify_c s2_vacuum_c s3_wake_meta s3_dir
+starting permutation: s1_park_meta s1_verify_c s2_vacuum_c s3_wake_meta s1_done s2_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -578,6 +632,18 @@ lion_index_verify
 (1 row)
 
 step s2_vacuum_c: <... completed>
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
+step s2_done: SELECT 'vacuumed' AS s2;
+s2      
+--------
+vacuumed
+(1 row)
+
 step s3_dir: 
 	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
 		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
@@ -596,7 +662,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s3_hold s1_park_level s1_verify_c s2_split_right s2_late s3_wake_level s3_release s3_dir
+starting permutation: s3_hold s1_park_level s1_verify_c s2_split_right s2_late s3_wake_level s3_release s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -651,6 +717,12 @@ lion_index_verify
                  
 (1 row)
 
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
 step s3_dir: 
 	SELECT s.leaf_pages > b.vc_leaves AS the_leaves_split,
 		   s.internal_pages > b.vc_internal AS the_internal_pages_split,
@@ -669,7 +741,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_begin s1_park_level s1_verify_c s2_split_right s3_wake_level s2_commit s3_dir
+starting permutation: s2_begin s1_park_level s1_verify_c s2_split_right s3_wake_level s1_done s2_commit s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -705,6 +777,12 @@ step s1_verify_c: <... completed>
 lion_index_verify
 -----------------
                  
+(1 row)
+
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
 (1 row)
 
 step s2_commit: COMMIT;
