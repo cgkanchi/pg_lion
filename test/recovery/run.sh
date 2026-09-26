@@ -1204,9 +1204,9 @@ phase1f() {
 	log ""
 	log "=== phase 1f: VACUUM of an rmgr-mode index on a server without the manager ==="
 
-	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
 		die "phase 1f: could not stop the primary"
-	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
 		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries=pg_lion" \
 		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary with the preload"
 	verify_node psql_p "$PRIMARY_DATA"
@@ -1223,9 +1223,9 @@ phase1f() {
 		die "phase 1f: the partial index was not built in rmgr mode"
 
 	# A fast stop checkpoints, so nothing of the build is left to replay.
-	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
 		die "phase 1f: could not stop the primary"
-	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
 		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries='' -c wal_consistency_checking=''" \
 		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary without the preload"
 	verify_node psql_p "$PRIMARY_DATA"
@@ -1267,7 +1267,7 @@ phase1f() {
 		 select lion_index_count('lion_norm_k', 4) = 200, 'the index counts the 200 rows of k = 4'"
 
 	# The primary goes back to what --mode says for the phases after this one.
-	"$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
+	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
 		die "phase 1f: could not stop the primary"
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
