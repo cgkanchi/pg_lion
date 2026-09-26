@@ -142,7 +142,7 @@ hookcheck:
 recovery-check:
 	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
 		$(if $(RECOVERY_MODE),--mode $(RECOVERY_MODE)) \
-		$(if $(WAL_CONSISTENCY),--conf "wal_consistency_checking = 'pg_lion'")
+		$(if $(WAL_CONSISTENCY),--conf "wal_consistency_checking = '$(if $(filter rmgr,$(RECOVERY_MODE)),pg_lion,generic)'")
 
 # The same harness with the custom WAL resource manager registered and every
 # page of every lion record replayed and compared (DESIGN.md §25).  This is
@@ -152,8 +152,7 @@ recovery-check:
 .PHONY: recovery-check-rmgr
 recovery-check-rmgr:
 	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
-		--mode rmgr --conf "wal_consistency_checking = 'pg_lion'" \
-		--conf "wal_keep_size = 2GB" --conf "max_wal_size = 2GB"
+		--mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
 
 # The PGXN release archive: pg_lion-<version>.zip, made by git archive from
 # the committed HEAD, so it holds exactly the tracked files named here - what
