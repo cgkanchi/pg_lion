@@ -135,6 +135,10 @@ step s1_verify_c	{ SELECT lion_index_verify('vc_k', true); }
 step s1_verify_r	{ SELECT lion_index_verify('vr_k', true); }
 step s1_verify_p	{ SELECT lion_index_verify('vp_k', true); }
 step s1_verify_q	{ SELECT lion_index_verify('vq_k', true); }
+# A step of this session cannot start until the check it parked has ended,
+# which is what makes the next step's output order the same on every server
+# (src/test/isolation/README, "an empty step in session A").
+step s1_done		{ SELECT 'checked' AS s1; }
 
 # The writer.
 session s2
@@ -181,6 +185,9 @@ step s2_drop		{ DROP INDEX vc_k; }
 step s2_rollback	{ ROLLBACK; }
 
 # The observer.
+# As s1_done, for this session's VACUUM.
+step s2_done		{ SELECT 'vacuumed' AS s2; }
+
 session s3
 step s3_hold		{ SELECT pg_advisory_lock(4711); }
 step s3_release		{ SELECT pg_advisory_unlock(4711); }
@@ -266,6 +273,7 @@ permutation
 	s3_wake_level_again			# parks again with level 1 walked
 	s2_split_right2				# splits leaves, and a page of level 1
 	s3_wake_level				# the check settles what the splits left
+	s1_done						# the check has ended
 	s3_dir
 
 permutation
@@ -273,6 +281,7 @@ permutation
 	s1_verify_c(s3_wake_page)	# parks on the first leaf
 	s2_split_left				# splits it
 	s3_wake_page				# the next leaf's left link is the new page
+	s1_done						# the check has ended
 	s3_dir
 
 permutation
@@ -280,6 +289,7 @@ permutation
 	s1_verify_r(s3_wake_meta)	# parks with the root and height read
 	s2_split_root				# splits the root
 	s3_wake_meta
+	s1_done						# the check has ended
 	s3_root
 
 permutation
@@ -287,6 +297,7 @@ permutation
 	s1_verify_p(s3_wake_set)	# parks with the first set's leaves walked
 	s2_grow_p					# splits its last leaf
 	s3_wake_set					# the walk sees a downlink it did not expect
+	s1_done						# the check has ended
 	s3_posting
 
 permutation
@@ -294,6 +305,7 @@ permutation
 	s1_verify_q(s3_wake_set)	# parks with a one-page set walked
 	s2_push_q					# pushes its root down; a new key spills
 	s3_wake_set
+	s1_done						# the check has ended
 	s3_pushdown
 
 permutation
@@ -301,6 +313,7 @@ permutation
 	s1_verify_c(s3_wake_level)
 	s2_spill					# an INLINE entry the walk checked spills
 	s3_wake_level
+	s1_done						# the check has ended
 	s3_spilled
 
 permutation
@@ -313,6 +326,7 @@ permutation
 	s3_wake_set_again			# attempt 3 parks
 	s2_touch_p
 	s3_wake_set					# thrown away too: the leaf is held (NOTICE)
+	s1_done						# the check has ended
 	s3_touched
 
 permutation
@@ -324,6 +338,7 @@ permutation
 	s1_verify_p(s3_wake_level)	# parks with the leaves walked
 	s2_grow_p					# splits k = 0's leaves into the freed pages
 	s3_wake_level
+	s1_done						# the check has ended
 	s3_reused
 
 permutation
@@ -336,6 +351,7 @@ permutation
 	s2_grow_new					# a new key: its root from the end of the
 								# relation, its leaves from the freed pages
 	s3_wake_level
+	s1_done						# the check has ended
 	s3_new_set
 
 permutation
@@ -343,6 +359,8 @@ permutation
 	s1_verify_c(s3_wake_meta)
 	s2_vacuum_c(s1_verify_c)	# waits for the check's lock
 	s3_wake_meta
+	s1_done						# the check ends first
+	s2_done						# ... and the VACUUM after it
 	s3_dir
 
 permutation
@@ -353,6 +371,7 @@ permutation
 	s2_late						# one row in, then stopped: holds the index
 	s3_wake_level				# the check has candidates, and waits for it
 	s3_release					# the insert ends, and then the check
+	s1_done						# the check has ended
 	s3_dir
 
 permutation
@@ -361,6 +380,7 @@ permutation
 	s1_verify_c					# parks with the leaves walked
 	s2_split_right				# in a transaction that stays open
 	s3_wake_level				# candidates, but no statement to wait for
+	s1_done						# the check ends without the COMMIT
 	s2_commit
 	s3_dir
 
