@@ -200,7 +200,13 @@ CREATE TEMP TABLE lion_mid_before AS
 SELECT bitset_containers > 0 AS key2_has_bitsets
   FROM lion_index_stats('lion_mid_k');
 DELETE FROM lion_mid WHERE k = 1;
-VACUUM lion_mid;
+/*
+ * FREEZE, here and below where a count depends on every dead row going: a
+ * plain VACUUM skips pruning a heap page it cannot get a cleanup lock on -
+ * one the checkpointer happens to be writing, say - and that page's dead
+ * TIDs stay in the index.  An aggressive VACUUM waits for the lock instead.
+ */
+VACUUM (FREEZE) lion_mid;
 INSERT INTO lion_mid SELECT i, 2 + (i % 2) FROM generate_series(300001, 400000) i;
 /*
  * Key 1's posting set is empty after the VACUUM, so its entry is deleted and
@@ -240,7 +246,7 @@ SELECT i, CASE WHEN i % 20000 = 0 THEN 1 ELSE 2 END
   FROM generate_series(1, 300000) i;
 SELECT entries, inline_entries FROM lion_index_stats('lion_inlmid_k');
 DELETE FROM lion_inlmid WHERE i <= 100000;
-VACUUM lion_inlmid;
+VACUUM (FREEZE) lion_inlmid;
 INSERT INTO lion_inlmid VALUES (300001, 1);
 SELECT inline_entries, ntids FROM lion_index_stats('lion_inlmid_k');
 SELECT lion_index_verify('lion_inlmid_k', true);
@@ -436,7 +442,7 @@ INSERT INTO lion_runmerge SELECT i, 1 FROM generate_series(1, 20000) i;
 CREATE INDEX lion_runmerge_k ON lion_runmerge USING lion (k)
 	WITH (inline_limit = 64);
 DELETE FROM lion_runmerge WHERE id % 16 = 0;
-VACUUM (INDEX_CLEANUP ON) lion_runmerge;
+VACUUM (FREEZE, INDEX_CLEANUP ON) lion_runmerge;
 DO $$ BEGIN
 	FOR i IN 1 .. 400 LOOP
 		INSERT INTO lion_runmerge VALUES (100000 + i, 1);
