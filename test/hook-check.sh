@@ -13,8 +13,9 @@
 #
 # Against the dev cluster, like test/rmgr-check.sh, and for the same reason
 # restarted with the options on pg_ctl's command line rather than in
-# postgresql.conf: an interrupted run leaves no trace, and the cluster is put
-# back in generic mode on exit.
+# postgresql.conf: an interrupted run leaves no trace.  On exit the cluster is
+# put back the way it was found: restarted in generic mode if it was running,
+# left stopped if it was stopped.
 #
 #   1. nothing preloaded: the table-AM test, then LOAD-on-first-use in both
 #      orders - lion_hooktest LOADed before pg_lion's first use, and after;
@@ -42,11 +43,22 @@ LOG=$ROOT/.local/pg.log
 MOD=$ROOT/test/modules/lion_hooktest
 FAILED=""
 
+# Only the state that was found is restored: see test/rmgr-check.sh.
+if "$BINDIR/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+	WAS_RUNNING=1
+else
+	WAS_RUNNING=0
+fi
+
 restore()
 {
-	echo "== restoring the cluster to generic mode"
 	"$BINDIR/pg_ctl" -D "$PGDATA" stop -m fast >/dev/null 2>&1
-	"$BINDIR/pg_ctl" -D "$PGDATA" -l "$LOG" start >/dev/null 2>&1
+	if [ "$WAS_RUNNING" = 1 ]; then
+		echo "== restoring the cluster to generic mode"
+		"$BINDIR/pg_ctl" -D "$PGDATA" -l "$LOG" start >/dev/null 2>&1
+	else
+		echo "== the cluster was stopped when this began; leaving it stopped"
+	fi
 }
 trap restore EXIT
 

@@ -77,9 +77,26 @@ static void lion_dir_finish_split(Relation index, Relation heaprel,
  * Small page helpers
  * --------------------------------------------------------------------- */
 
+/*
+ * DIRECTORY LINKS ARE DATA.  Every block number a descent or a walk follows
+ * was read from a page - a downlink's `head`, a right link, the meta page's
+ * root - and a damaged page can hold anything there.  In particular it can
+ * hold InvalidBlockNumber, which is P_NEW, and ReadBuffer() on PostgreSQL 16
+ * to 18 answers P_NEW by EXTENDING the relation: a root downlink set to
+ * 0xFFFFFFFF grew the index by a block on every SELECT and INSERT that
+ * descended through it (2026-09-25 review).  So every directory read refuses
+ * one, as corruption.  A block past the end of the relation needs no test of
+ * its own - ReadBuffer() fails on it - and asking for the relation's size on
+ * every step of every descent would cost a system call each.
+ */
 static inline Buffer
 lion_dir_readbuf(Relation index, BlockNumber blk)
 {
+	if (unlikely(!BlockNumberIsValid(blk)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\" links to an invalid block number",
+						RelationGetRelationName(index))));
 	lion_dir_pages_read++;
 	return ReadBuffer(index, blk);
 }
@@ -114,6 +131,66 @@ lion_dir_check_page(Relation index, Page page, BlockNumber blk)
 		(LionPageGetOpaque(page)->flags & (LION_PAGE_BUCKET | LION_PAGE_DIR)) == 0)
 		elog(ERROR, "lion index \"%s\": block %u is not a directory page",
 			 RelationGetRelationName(index), blk);
+
+	/*
+	 * Every reader of a non-rightmost page takes its first item as the high
+	 * key without looking at maxoff, and no page ever loses its high key.
+	 */
+	if (unlikely(!LionPageIsRightmost(page) &&
+				 PageGetMaxOffsetNumber(page) < FirstOffsetNumber))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": directory block %u has a right sibling but no high key",
+						RelationGetRelationName(index), blk)));
+}
+
+/*
+ * A page reached through a link is at the level the link promises: a
+ * downlink's child one below the page that holds it, a right sibling at the
+ * page's own.  A directory page never changes level (DESIGN.md §21: a root
+ * split keeps the old root as the left half, at its level) and is never
+ * freed, so anything else is a link to the wrong page - and a downlink to the
+ * page itself or to one above it would send a descent round for ever.
+ * `expected` is an int because a leaf's children would be at level -1.
+ */
+static inline void
+lion_dir_check_level(Relation index, Page page, BlockNumber blk, int expected)
+{
+	if (unlikely((int) LionPageGetOpaque(page)->level != expected))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": directory block %u is at level %u, but the link to it expects level %d",
+						RelationGetRelationName(index), blk,
+						LionPageGetOpaque(page)->level, expected)));
+}
+
+/*
+ * The child block of the downlink at off, on internal page blk.  off comes
+ * from a binary search, which answers one past the last item on a page that
+ * has none - and an internal page is never left without a downlink, so such
+ * a page is damaged, and taking its "item" would read a line pointer past
+ * pd_lower.  (lion_dir_readbuf() refuses the child if it is not a valid block
+ * number; this says which page the bad link is on.)
+ */
+static BlockNumber
+lion_dir_downlink_block(Relation index, Page page, BlockNumber blk,
+						OffsetNumber off)
+{
+	BlockNumber child;
+
+	if (unlikely(off < lion_page_first_data(page) ||
+				 off > PageGetMaxOffsetNumber(page)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": internal page %u has no downlink",
+						RelationGetRelationName(index), blk)));
+	child = lion_page_item(page, off)->head;
+	if (unlikely(!BlockNumberIsValid(child)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": internal page %u has a downlink to an invalid block number",
+						RelationGetRelationName(index), blk)));
+	return child;
 }
 
 /*
@@ -125,15 +202,23 @@ Buffer
 lion_dir_step_right(Relation index, Buffer buf, int lockmode)
 {
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+	int			level = LionPageGetOpaque(BufferGetPage(buf))->level;
 	Buffer		nbuf;
 
 	Assert(BlockNumberIsValid(next));
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * Between the pages, where no content lock is held: after LockBuffer()
+	 * the lock holds interrupts off, and a walk round a cycle of damaged
+	 * links would then not even answer a cancel (see lion_dir_search()).
+	 */
+	CHECK_FOR_INTERRUPTS();
 	nbuf = lion_dir_readbuf(index, next);
 	LockBuffer(nbuf, lockmode);
 	lion_dir_check_page(index, BufferGetPage(nbuf), next);
+	lion_dir_check_level(index, BufferGetPage(nbuf), next, level);
 
-	CHECK_FOR_INTERRUPTS();
 	return nbuf;
 }
 
@@ -255,7 +340,20 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 	}
 	else
 	{
-		LionState  *col = lion_column(ix, (AttrNumber) entry->attno);
+		LionState  *col;
+
+		/*
+		 * The entry comes from a page, and lion_column() only Asserts its
+		 * argument: a damaged attno would pick a LionState past the end of
+		 * ix->cols, and the comparison below would call whatever function
+		 * pointers it found there.
+		 */
+		if (unlikely(entry->attno > ix->ncolumns))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index entry belongs to key column %u, but the index has %d",
+							entry->attno, ix->ncolumns)));
+		col = lion_column(ix, (AttrNumber) entry->attno);
 
 		lion_search_key_init(col, sk, kind,
 							 kind == LION_KIND_VALUE ?
@@ -404,6 +502,7 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
 		Page		page = BufferGetPage(buf);
 		BlockNumber blk = BufferGetBlockNumber(buf);
 		BlockNumber child;
+		int			level = LionPageGetOpaque(page)->level;
 
 		if (LionPageIsLeaf(page))
 		{
@@ -411,20 +510,14 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
 			return blk;
 		}
 
-		if (PageGetMaxOffsetNumber(page) < lion_page_first_data(page))
-		{
-			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index \"%s\": internal page %u has no downlink",
-				 RelationGetRelationName(index), blk);
-		}
-
-		child = lion_page_item(page, lion_page_first_data(page))->head;
+		child = lion_dir_downlink_block(index, page, blk, lion_page_first_data(page));
 		UnlockReleaseBuffer(buf);
 
+		CHECK_FOR_INTERRUPTS();
 		buf = lion_dir_readbuf(index, child);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
-		CHECK_FOR_INTERRUPTS();
+		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 	}
 }
 
@@ -468,6 +561,7 @@ restart:
 			BUFFER_LOCK_SHARE;
 		OffsetNumber off;
 		BlockNumber child;
+		int			level;
 		int			childlock;
 
 		/*
@@ -517,17 +611,81 @@ restart:
 		}
 
 		off = lion_page_downlink(page, sk);
-		child = lion_page_item(page, off)->head;
-		childlock = (LionPageGetOpaque(page)->level == 1) ? lockmode :
-			BUFFER_LOCK_SHARE;
+		child = lion_dir_downlink_block(index, page, BufferGetBlockNumber(buf), off);
+		level = LionPageGetOpaque(page)->level;
+		childlock = (level == 1) ? lockmode : BUFFER_LOCK_SHARE;
 
 		/* Release the parent BEFORE locking the child; see the file header. */
 		UnlockReleaseBuffer(buf);
+
+		/*
+		 * Here, with nothing locked, and not after locking the child: a
+		 * content lock holds interrupts off, and a descent that went round a
+		 * cycle of damaged downlinks - which lion_dir_check_level() now
+		 * refuses - did not answer even statement_timeout, only SIGKILL.
+		 */
+		CHECK_FOR_INTERRUPTS();
 		buf = lion_dir_readbuf(index, child);
 		LockBuffer(buf, childlock);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
+		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
+	}
+}
 
+/*
+ * The page at `level` whose key range holds sk, locked SHARE: a read-only
+ * descent, moving right past concurrent splits exactly as lion_dir_search()
+ * does, that stops at `level` instead of at the leaves.  InvalidBuffer when
+ * the directory has no such level.
+ *
+ * lion_index_verify() is the caller.  It runs beside INSERTs (DESIGN.md §7),
+ * so a directory page its walk of a level did not reach may simply be one a
+ * split made after the walk had passed; this is how it proves such a page is
+ * part of the tree - a search for the page's own first key lands on it - and
+ * not a page nothing leads to.  It never repairs an unfinished split: that
+ * is a writer's job, and verify() writes nothing.
+ */
+Buffer
+lion_dir_search_level(Relation index, LionIndexState *ix,
+					  const LionSearchKey *sk, uint16 level)
+{
+	Buffer		buf = lion_dir_get_root(index, ix);
+
+	if (LionPageGetOpaque(BufferGetPage(buf))->level < level)
+	{
+		UnlockReleaseBuffer(buf);
+		return InvalidBuffer;
+	}
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		OffsetNumber off;
+		BlockNumber child;
+		int			plevel;
+
+		while (!LionPageIsRightmost(page) &&
+			   lion_cmp_entry(lion_page_highkey(page), sk) <= 0)
+		{
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+		}
+
+		plevel = LionPageGetOpaque(page)->level;
+		if (plevel == level)
+			return buf;
+
+		off = lion_page_downlink(page, sk);
+		child = lion_dir_downlink_block(index, page, BufferGetBlockNumber(buf),
+										off);
+
+		/* Release the parent BEFORE locking the child; see the file header. */
+		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
+		buf = lion_dir_readbuf(index, child);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		lion_dir_check_page(index, BufferGetPage(buf), child);
+		lion_dir_check_level(index, BufferGetPage(buf), child, plevel - 1);
 	}
 }
 
@@ -554,6 +712,7 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 		LockBuffer(buf, lockmode);
 		page = BufferGetPage(buf);
 		lion_dir_check_page(index, page, blk);
+		lion_dir_check_level(index, page, blk, 0);
 		maxoff = PageGetMaxOffsetNumber(page);
 
 		for (off = lion_page_first_data(page); off <= maxoff; off++)
@@ -605,6 +764,8 @@ lion_dir_step_right_coupled(Relation index, Buffer buf, int lockmode, bool keep)
 	nbuf = lion_dir_readbuf(index, next);
 	LockBuffer(nbuf, lockmode);
 	lion_dir_check_page(index, BufferGetPage(nbuf), next);
+	lion_dir_check_level(index, BufferGetPage(nbuf), next,
+						 LionPageGetOpaque(BufferGetPage(buf))->level);
 	if (!keep)
 		UnlockReleaseBuffer(buf);
 
@@ -1388,6 +1549,8 @@ lion_dir_place_again(Relation index, Relation heaprel, LionIndexState *ix,
 
 		LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
 		lion_dir_check_page(index, BufferGetPage(rbuf), next);
+		lion_dir_check_level(index, BufferGetPage(rbuf), next,
+							 LionPageGetOpaque(page)->level);
 		roff = lion_dir_binsrch(BufferGetPage(rbuf), &sk);
 		lion_dir_place(index, heaprel, ix, rbuf, roff, replace, item, size);
 		UnlockReleaseBuffer(rbuf);
@@ -1424,6 +1587,9 @@ lion_dir_downlink_present(Relation index, Buffer pbuf, OffsetNumber off,
 
 	nbuf = ReadBuffer(index, next);
 	LockBuffer(nbuf, BUFFER_LOCK_SHARE);
+	lion_dir_check_page(index, BufferGetPage(nbuf), next);
+	lion_dir_check_level(index, BufferGetPage(nbuf), next,
+						 LionPageGetOpaque(page)->level);
 	{
 		Page		np = BufferGetPage(nbuf);
 		OffsetNumber nfirst = lion_page_first_data(np);
@@ -1527,6 +1693,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		Page		page = BufferGetPage(buf);
 		OffsetNumber off;
 		BlockNumber child;
+		int			level;
 
 		if (LionPageGetOpaque(page)->level == childlevel + 1)
 			break;
@@ -1544,12 +1711,14 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		else
 			off = lion_page_first_data(page);
 
-		child = lion_page_item(page, off)->head;
+		child = lion_dir_downlink_block(index, page, BufferGetBlockNumber(buf), off);
+		level = LionPageGetOpaque(page)->level;
 		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
 		buf = lion_dir_readbuf(index, child);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
-		CHECK_FOR_INTERRUPTS();
+		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 	}
 
 	/*
@@ -1570,6 +1739,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
 		lion_dir_check_page(index, page, blk);
+		lion_dir_check_level(index, page, blk, childlevel + 1);
 
 		/*
 		 * This page's own split may never have finished.  Finish it first: the

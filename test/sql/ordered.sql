@@ -240,6 +240,9 @@ SELECT * FROM lion_ord_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND c2 = 1 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND length(note) = 5 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_run($$SELECT id FROM lo WHERE tags @> ARRAY['t3', 'u5'] ORDER BY k, id LIMIT 10$$);
+-- a node that never ran built no set, and rechecked nothing (it used to
+-- print "Rows Removed by Lion Recheck: 0", as if its set were inexact)
+SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 0');
 
 -- 8. Cursors: forward, a SCROLL cursor (a Material under it), NO SCROLL.
 SET enable_seqscan = off; SET enable_bitmapscan = off;
@@ -457,6 +460,55 @@ COMMIT;
 SELECT lion_ord('SELECT o.v, x.id FROM (VALUES (1), (190)) o(v),
 				 LATERAL (SELECT id FROM lcor WHERE c = o.v ORDER BY k LIMIT 3) x');
 DROP TABLE lcor;
+
+-- 16. A range over many distinct values (DESIGN.md §30.4, "The set is
+--     built"): a WALK source hands out a container key once per ENTRY, and
+--     the pieces are merged as they come.  Merged only at the end, 15,000
+--     one-TID pieces degraded a set of 2 containers at a 64 kB hash_mem, and
+--     their directory, one entry per piece, outlived the build: 197 kB of the
+--     set's memory context while the cursor below was paused (2026-09-25
+--     second review).
+CREATE TABLE lwalk (id int PRIMARY KEY, u int, k int) WITH (autovacuum_enabled = off);
+INSERT INTO lwalk SELECT i, i, (i * 7919) % 20011 FROM generate_series(1, 20000) i;
+CREATE INDEX lwalk_k ON lwalk (k, id);
+CREATE INDEX lwalk_u ON lwalk USING lion (u);
+VACUUM ANALYZE lwalk;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT * FROM lion_ord_run('SELECT id FROM lwalk WHERE u BETWEEN 1 AND 15000 ORDER BY k, id LIMIT 5');
+SELECT lion_ord('SELECT id, k FROM lwalk WHERE u BETWEEN 1 AND 15000 ORDER BY k, id LIMIT 5');
+SELECT lion_ord('SELECT id, k FROM lwalk WHERE u BETWEEN 1 AND 20000 AND u % 3 = 0 ORDER BY k DESC, id DESC');
+BEGIN;
+SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+DECLARE lwalk_cur CURSOR FOR SELECT id FROM lwalk WHERE u BETWEEN 1 AND 20000 ORDER BY k, id;
+FETCH 2 FROM lwalk_cur;
+SELECT used_bytes <= 65536 AS within_hash_mem
+  FROM pg_backend_memory_contexts WHERE name = 'LionOrdered set';
+COMMIT;
+RESET hash_mem_multiplier;
+RESET work_mem;
+DROP TABLE lwalk;
+
+-- 17. A clause the btree and a lion index both answer is priced once
+--     (DESIGN.md §30.3): the walk of (g, k) under g = 5 meets only g = 5
+--     entries, every one a member, so the node is a plain index scan plus
+--     the lion lookups, and must not beat bitmap + Sort on a price that
+--     counted g = 5 twice (2026-09-25 second review: it did, at a hundredth
+--     of the fetches).  With a lion clause the btree does not answer, it
+--     still wins.
+CREATE TABLE ldbl (id int PRIMARY KEY, g int, h int, k int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO ldbl SELECT i, i % 100, i % 7, (i * 7919) % 100003, repeat('x', 60)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX ldbl_gk ON ldbl (g, k);
+CREATE INDEX ldbl_g ON ldbl USING lion (g);
+CREATE INDEX ldbl_h ON ldbl USING lion (h);
+VACUUM ANALYZE ldbl;
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 ORDER BY k');
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
+SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 ORDER BY k');
+SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
+DROP TABLE ldbl;
 
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;

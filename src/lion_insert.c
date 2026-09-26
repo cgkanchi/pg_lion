@@ -92,7 +92,13 @@ static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumb
 										 uint16 lo, bool *done);
 static Buffer lion_insert_lock_chain_page(Relation index, Relation heaprel,
 										  uint32 hash, BlockNumber head,
-										  BlockNumber tail, uint32 ckey);
+										  BlockNumber tail, uint32 ckey,
+										  bool *ontail);
+static bool lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
+								   Buffer entrybuf, OffsetNumber entryoff,
+								   LionEntryTuple *ecopy, Size esize,
+								   LionContainer *cbuf, uint32 ckey, uint16 lo,
+								   bool mayput);
 static bool lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 									   Buffer entrybuf, OffsetNumber entryoff,
 									   LionEntryTuple *entry, Size entrysize,
@@ -837,7 +843,7 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 
 /*
  * Lock the posting-tree leaf that owns ckey EXCLUSIVE, for the CHAIN insert
- * path.
+ * path, and say in *ontail whether it was the append hint that found it.
  *
  * The append case - the ckey belongs on the set's LAST leaf, which is where
  * every insert into a growing posting set lands - is decided with the
@@ -854,12 +860,21 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
  * own bounds go (minckey is 0, which would swallow every ckey), so it falls
  * through to the descent, which routes by the parent's separators instead.
  *
+ * What the hint skips is not only the descent's locks but its REPAIRS: a
+ * write descent finishes every unfinished split it meets (DESIGN.md §22), and
+ * the tail may be the right half of one - the split that made it the tail
+ * wrote its first record and then crashed, or failed to put the downlink in
+ * - so that it has no downlink of its own.  A leaf taken through the hint is
+ * therefore good only for a change that STAYS on it; lion_insert_chain()
+ * descends for anything that may split it.
+ *
  * Nothing is held while descending: the tail lock is dropped first, so no page
  * is ever locked before a page to its left (DESIGN.md §22 rule 3).
  */
 static Buffer
 lion_insert_lock_chain_page(Relation index, Relation heaprel, uint32 hash,
-						   BlockNumber head, BlockNumber tail, uint32 ckey)
+						   BlockNumber head, BlockNumber tail, uint32 ckey,
+						   bool *ontail)
 {
 	Buffer		buf;
 	Page		page;
@@ -888,46 +903,41 @@ lion_insert_lock_chain_page(Relation index, Relation heaprel, uint32 hash,
 		!LionPageIncompleteSplit(page) &&
 		PageGetMaxOffsetNumber(page) >= FirstOffsetNumber &&
 		ckey >= LionPageGetOpaque(page)->minckey)
+	{
+		*ontail = true;
 		return buf;
+	}
 
 	UnlockReleaseBuffer(buf);
 
+	*ontail = false;
 	return lion_posting_search(index, heaprel, hash, head, ckey,
 							   BUFFER_LOCK_EXCLUSIVE, true);
 }
 
 /*
- * Add (ckey, lo) to the CHAIN entry at (entrybuf, entryoff), which is held
- * EXCLUSIVE.
+ * Add (ckey, lo) on the leaf buf, which owns ckey and is held EXCLUSIVE, for
+ * the CHAIN entry at (entrybuf, entryoff), also held EXCLUSIVE.  ecopy is the
+ * caller's private copy of that entry (esize bytes) and cbuf a work buffer of
+ * LION_CONTAINER_MAX_SIZE bytes.
+ *
+ * With mayput false only the in-place paths may run - the ones that change a
+ * member inside an item and nothing else on the page.  When the member needs
+ * the general path instead, which rewrites the item and may split the page,
+ * nothing at all is done (ecopy included) and the answer is false.  Otherwise
+ * the member is in (or was already) and the answer is true.
  */
-static void
-lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
-				 OffsetNumber entryoff,
-				 uint32 ckey, uint16 lo)
+static bool
+lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
+					   Buffer entrybuf, OffsetNumber entryoff,
+					   LionEntryTuple *ecopy, Size esize, LionContainer *cbuf,
+					   uint32 ckey, uint16 lo, bool mayput)
 {
-	Page		page = BufferGetPage(entrybuf);
-	ItemId		iid = PageGetItemId(page, entryoff);
-	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
-	LionEntryTuple *ecopy;
-	LionContainer *cbuf;
-	Size		esize;
-	BlockNumber blk;
-	Buffer		buf;
-	Page		cpage;
+	Page		cpage = BufferGetPage(buf);
+	BlockNumber blk = BufferGetBlockNumber(buf);
 	OffsetNumber off;
 	bool		found;
 	int			delta;
-
-	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
-	Assert(esize == ItemIdGetLength(iid));
-	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
-
-	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-
-	buf = lion_insert_lock_chain_page(index, heaprel, ecopy->hash, ecopy->head,
-									 ecopy->tail, ckey);
-	blk = BufferGetBlockNumber(buf);
-	cpage = BufferGetPage(buf);
 
 	/* Which item owns this ckey: a container, a segment, or nothing yet? */
 	off = lion_page_find_item(cpage, ckey, &found);
@@ -938,14 +948,14 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 	{
 		bool		done = false;
 
-		if (!lion_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
+		if (lion_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
 										ecopy, esize, ckey, lo, &done))
-			lion_insert_segment(index, heaprel, buf, off, true, entrybuf,
-							   entryoff, ecopy, ckey, lo);
-		UnlockReleaseBuffer(buf);
-		pfree(cbuf);
-		pfree(ecopy);
-		return;
+			return true;
+		if (!mayput)
+			return false;
+		lion_insert_segment(index, heaprel, buf, off, true, entrybuf,
+						   entryoff, ecopy, ckey, lo);
+		return true;
 	}
 
 	if (!found)
@@ -972,24 +982,23 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 		{
 			bool		done = false;
 
-			if (!lion_insert_segment_inplace(index, buf, target, entrybuf,
+			if (lion_insert_segment_inplace(index, buf, target, entrybuf,
 											entryoff, ecopy, esize, ckey, lo,
 											&done))
-				lion_insert_segment(index, heaprel, buf, target, true, entrybuf,
-								   entryoff, ecopy, ckey, lo);
-			UnlockReleaseBuffer(buf);
-			pfree(cbuf);
-			pfree(ecopy);
-			return;
+				return true;
+			if (!mayput)
+				return false;
+			lion_insert_segment(index, heaprel, buf, target, true, entrybuf,
+							   entryoff, ecopy, ckey, lo);
+			return true;
 		}
 
 		/* No segment to join: the pair becomes a new one-pair segment. */
+		if (!mayput)
+			return false;
 		lion_insert_segment(index, heaprel, buf, off, false, entrybuf, entryoff,
 						   ecopy, ckey, lo);
-		UnlockReleaseBuffer(buf);
-		pfree(cbuf);
-		pfree(ecopy);
-		return;
+		return true;
 	}
 
 	/* A container with this ckey. */
@@ -1003,11 +1012,10 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 										 ecopy, esize, lo, &done))
 		{
 			Assert(done);
-			UnlockReleaseBuffer(buf);
-			pfree(cbuf);
-			pfree(ecopy);
-			return;
+			return true;
 		}
+		if (!mayput)
+			return false;
 
 		/*
 		 * The item may be longer than the container needs (growth slack,
@@ -1019,24 +1027,83 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 				 (Size) ItemIdGetLength(ciid), blk, off);
 		memcpy(cbuf, PageGetItem(cpage, ciid), ItemIdGetLength(ciid));
 		if (!lion_container_add(cbuf, lo))
-		{
-			/* already indexed */
-			UnlockReleaseBuffer(buf);
-			pfree(cbuf);
-			pfree(ecopy);
-			return;
-		}
+			return true;		/* already indexed */
 	}
 
 	ecopy->ntids += 1;
 
 	lion_chain_put_container_locked_ext(index, heaprel, buf, entrybuf, entryoff,
 									   ecopy, cbuf, &delta, true);
-	UnlockReleaseBuffer(buf);
 
 	Assert(delta == 0);
 	(void) delta;
 
+	return true;
+}
+
+/*
+ * Add (ckey, lo) to the CHAIN entry at (entrybuf, entryoff), which is held
+ * EXCLUSIVE.
+ *
+ * The leaf comes from the append hint when the hint qualifies, and then it is
+ * used only for the in-place paths, which are what an appending key takes
+ * nearly every time (a BITSET always, anything else while its item has growth
+ * slack).  A member that needs the general path lets the tail go and DESCENDS
+ * to it, forwrite: the general path can split the page, and a page that is the
+ * right half of an unfinished split must not be split before the split that
+ * made it is finished (DESIGN.md §22), which is what the descent does on its
+ * way down - it routes to the flagged left half, because the right half has
+ * no downlink.  Before this, every append went to the tail, the flagged page
+ * was never descended to, and the first split of the tail failed with "no
+ * downlink" - and so did every later one, so an append-only table never took
+ * another row into that key (2026-09-25 review).  lion_posting_find_parent()
+ * repairs that case as well now; the descent is what makes it rare, and puts
+ * the repair on the first general-path insert instead of on the tail's next
+ * split.
+ *
+ * The descent after a declined hint almost always lands on the tail again,
+ * so the cost is the descent's own locks - one per level - on the general
+ * path only.
+ */
+static void
+lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
+				 OffsetNumber entryoff,
+				 uint32 ckey, uint16 lo)
+{
+	Page		page = BufferGetPage(entrybuf);
+	ItemId		iid = PageGetItemId(page, entryoff);
+	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *ecopy;
+	LionContainer *cbuf;
+	Size		esize;
+	Buffer		buf;
+	bool		ontail;
+
+	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
+	Assert(esize == ItemIdGetLength(iid));
+	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
+
+	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+
+	buf = lion_insert_lock_chain_page(index, heaprel, ecopy->hash, ecopy->head,
+									 ecopy->tail, ckey, &ontail);
+
+	if (!lion_insert_chain_leaf(index, heaprel, buf, entrybuf, entryoff, ecopy,
+								esize, cbuf, ckey, lo, !ontail))
+	{
+		bool		done;
+
+		Assert(ontail);
+		UnlockReleaseBuffer(buf);
+		buf = lion_posting_search(index, heaprel, ecopy->hash, ecopy->head,
+								  ckey, BUFFER_LOCK_EXCLUSIVE, true);
+		done = lion_insert_chain_leaf(index, heaprel, buf, entrybuf, entryoff,
+									  ecopy, esize, cbuf, ckey, lo, true);
+		Assert(done);
+		(void) done;
+	}
+
+	UnlockReleaseBuffer(buf);
 	pfree(cbuf);
 	pfree(ecopy);
 }

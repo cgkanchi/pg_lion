@@ -117,6 +117,18 @@ typedef LionPageOpaqueData *LionPageOpaque;
 	((Size) (BLCKSZ - SizeOfPageHeaderData - LION_SPECIAL_SIZE))
 
 /*
+ * DESIGN.md §2: every container fits on a page - a BITSET is the largest,
+ * and it must be an item on an otherwise empty container page, line pointer
+ * and all.  That holds from BLCKSZ 8192 up (8136 bytes of capacity for a
+ * 4108-byte item) and not below it: at 4096 the capacity is 4040 bytes, and a
+ * build or an insert would fail on the first BITSET.  lion_tid.h refuses
+ * such a BLCKSZ outright, with a clearer message; this is the property that
+ * refusal stands for.
+ */
+StaticAssertDecl(MAXALIGN(LION_CONTAINER_MAX_SIZE) + sizeof(ItemIdData) <= LION_PAGE_CAPACITY,
+				 "pg_lion: a BITSET container does not fit on a page of this BLCKSZ");
+
+/*
  * The body of a DELETED page: the transaction id from which on no scan can
  * still hold a link to it, exactly as nbtree's BTDeletedPageData (see
  * BTPageIsRecyclable() in access/nbtree.h).  Nothing else is left on the page.
@@ -931,6 +943,15 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
 							 int lockmode, bool forwrite, OffsetNumber *offp);
 
 /*
+ * The same read-only descent stopped at `level`: the page of that level whose
+ * key range holds sk, locked SHARE, or InvalidBuffer when the directory is not
+ * that tall.  For lion_index_verify(), which proves with it that a page a
+ * concurrent split made is where a search for its keys lands (DESIGN.md §7).
+ */
+extern Buffer lion_dir_search_level(Relation index, LionIndexState *ix,
+									const LionSearchKey *sk, uint16 level);
+
+/*
  * Locate the entry for sk.  On true *buf is a leaf locked in lockmode and
  * *offnum its offset.  On false *buf is still a locked leaf and *offnum is
  * the offset the entry would be inserted at, EXCEPT when *movedright says the
@@ -1054,6 +1075,14 @@ extern Buffer lion_posting_search(Relation index, Relation heaprel,
 								  uint32 hash, BlockNumber head, uint32 ckey,
 								  int lockmode, bool forwrite);
 
+/*
+ * A reader's descent of the set rooted at head, stopped at `level`: the page
+ * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
+ * For lion_index_verify() (DESIGN.md §7), as lion_dir_search_level() is.
+ */
+extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
+										uint32 ckey, uint16 level);
+
 /* The leftmost leaf, where every sequential walk of a posting set starts. */
 extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,
 											  BlockNumber head);
@@ -1071,7 +1100,10 @@ extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,
  * pinned and still EXCLUSIVE-locked - it has never been unlocked since it was
  * allocated, so no reader can have copied the items it now holds before the
  * caller has finished with them (DESIGN.md §11, §22) - and the entry's `tail`
- * is updated in the same record.
+ * is updated in the same record.  Only `tail`: the record logs the entry as
+ * it is on entrybuf, because the counters in the caller's copy describe items
+ * that a LATER record places, and that record may never be written.  The
+ * caller's copy gets the new `tail` as well.
  *
  * nbtree and GIN both keep the root in place on a root split, and §22 needs
  * it for a second reason: `head` is the set's identity, so an entry never has
@@ -1154,11 +1186,16 @@ extern int64 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool liongettuple(IndexScanDesc scan, ScanDirection dir);	/* DESIGN.md §29 */
 
 /*
- * Container keys per window of a plain scan that reads a multi-key column
- * whole (DESIGN.md §29.3): 1024 container keys, 65536 heap blocks, at least.
+ * The windows of a plain scan (DESIGN.md §29.3): container keys per window of
+ * one that reads a multi-key column whole, and the other columns' containers
+ * per window of a long range beside them.  Each is sized by work_mem, and by
+ * pg_lion.scan_window_floor at least - 4 MB by default: 1024 container keys,
+ * 65536 heap blocks, for the first, 512 containers for the second.
  */
-#define LION_UNION_MIN_WINDOW	1024
+#define LION_SCAN_WINDOW_FLOOR	4096	/* kB */
+extern PGDLLIMPORT int lion_scan_window_floor;
 extern int	lion_union_window(void);
+extern int	lion_walk_window(void);
 extern bytea *lionoptions(Datum reloptions, bool validate);
 extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
@@ -1345,6 +1382,15 @@ extern void lion_chain_put_items_locked(Relation index, Relation heaprel,
 extern void lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 							OffsetNumber entryoff, LionEntryTuple *entry,
 							const char *payload, Size paylen);
+
+/*
+ * Does `head` name the live root of a posting set whose key hashes to `hash`?
+ * What tells a leaf that an interrupted multi-leaf spill left behind - its
+ * root was never written - from a leaf of a set that exists (DESIGN.md §18).
+ * wait = false never blocks and answers true when the root is busy.
+ */
+extern bool lion_posting_root_live(Relation index, uint32 hash,
+								   BlockNumber head, bool wait);
 
 
 /* ---------- additive helpers (wave 3, write path) ---------- */

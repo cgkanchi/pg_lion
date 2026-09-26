@@ -311,7 +311,8 @@ SELECT sparse_members = ntids AS still_all_segments,
  t                  | t
 (1 row)
 
--- a partial index only has to contain the rows its predicate selects
+-- a partial index only has to contain the rows its predicate selects: the
+-- first row below is one it selects (a new key, 'vpart'), the second is not
 CREATE INDEX lion_vfy_part ON lion_vfy USING lion (t) WHERE k < 100;
 SELECT lion_index_verify('lion_vfy_part', true);
  lion_index_verify 
@@ -325,20 +326,18 @@ SELECT entries, ntids FROM lion_index_stats('lion_vfy_part');
       13 | 10355
 (1 row)
 
-INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL, NULL);
-ERROR:  INSERT has more expressions than target columns at character 61
-INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL, NULL);
-ERROR:  INSERT has more expressions than target columns at character 63
+INSERT INTO lion_vfy VALUES (200001, 5, 'vpart', 1.0, NULL);
+INSERT INTO lion_vfy VALUES (200002, 500, 'vpart', 1.0, NULL);
 SELECT lion_index_verify('lion_vfy_part', true);
  lion_index_verify 
 -------------------
  
 (1 row)
 
-SELECT ntids FROM lion_index_stats('lion_vfy_part');
- ntids 
--------
- 10355
+SELECT entries, ntids FROM lion_index_stats('lion_vfy_part');
+ entries | ntids 
+---------+-------
+      14 | 10356
 (1 row)
 
 -- an expression index is verified through the same path
@@ -355,9 +354,15 @@ SELECT entries FROM lion_index_stats('lion_vfy_expr');
       10
 (1 row)
 
--- NULL keys are not indexed and must not be reported as missing
-INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL, NULL);
-ERROR:  INSERT has more expressions than target columns at character 62
+/*
+ * NULL keys ARE indexed, in the column's reserved NULL entry (DESIGN.md §14),
+ * and heapallindexed looks for such a row there.  The first row is NULL in
+ * every column; the second is NULL only in t and satisfies the partial
+ * index's predicate, so the partial index gets a NULL entry too, and the
+ * expression index gets one for the NULL k of the first.
+ */
+INSERT INTO lion_vfy VALUES (200003, NULL, NULL, NULL, NULL);
+INSERT INTO lion_vfy VALUES (200004, 7, NULL, 2.0, NULL);
 SELECT lion_index_verify('lion_vfy_k', true);
  lion_index_verify 
 -------------------
@@ -368,6 +373,48 @@ SELECT lion_index_verify('lion_vfy_t', true);
  lion_index_verify 
 -------------------
  
+(1 row)
+
+SELECT lion_index_verify('lion_vfy_n', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_vfy_part', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_vfy_expr', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_k');
+ null_tids 
+-----------
+         1
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_t');
+ null_tids 
+-----------
+         2
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_part');
+ null_tids 
+-----------
+         1
+(1 row)
+
+SELECT null_tids FROM lion_index_stats('lion_vfy_expr');
+ null_tids 
+-----------
+         1
 (1 row)
 
 -- unlogged relations work the same way
@@ -398,4 +445,239 @@ SELECT lion_index_stats('lion_vfy_unl');
 ERROR:  "lion_vfy_unl" is not an index
 SELECT lion_index_verify('no_such_relation');
 ERROR:  relation "no_such_relation" does not exist at character 26
+/*
+ * Damaged pages (2026-09-25 review).  verify() must ERROR on each of these -
+ * never crash, read past a page or write to the index it checks - and
+ * lion_index_stats(), which is granted to pg_stat_scan_tables and reports
+ * damage to nobody, must not read past a page either: it leaves out what it
+ * cannot read.
+ *
+ * The damage is written into the relation file with dd, through COPY TO
+ * PROGRAM, and has to be read back from the file rather than from a buffer.
+ * A TEMPORARY index arranges that: its build writes the pages straight to the
+ * file and nothing logs them afterwards, so nothing reads them back - under
+ * wal_level = minimal a small permanent index is logged at commit, through
+ * shared buffers - and its buffers are this backend's own.  So every case
+ * builds an index of its own and damages it before anything has read it; the
+ * layout comes from the line pointers in the file, or from a twin built the
+ * same way and read instead.  The page checksum is then wrong too, and
+ * ignore_checksum_failure lets the read through; the WARNING that gives, and
+ * whether it gives one at all, depends on the cluster, so client_min_messages
+ * hides it.  Line pointers are written for a little-endian machine.
+ */
+CREATE FUNCTION lion_vfy_peek(idx regclass, blk int8, pos int8, len int8)
+RETURNS bytea LANGUAGE sql AS $$
+	SELECT pg_read_binary_file(pg_relation_filepath(idx),
+							   blk * current_setting('block_size')::int8 + pos, len)
+$$;
+CREATE FUNCTION lion_vfy_poke(idx regclass, blk int8, pos int8, bytes bytea)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	oct text := '';
+	b int;
+BEGIN
+	FOR i IN 0 .. length(bytes) - 1 LOOP
+		b := get_byte(bytes, i);
+		oct := oct || '\' || (b >> 6)::text || ((b >> 3) & 7)::text || (b & 7)::text;
+	END LOOP;
+	EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+				   format('cat >/dev/null; printf ''%s'' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null',
+						  oct, pg_relation_filepath(idx),
+						  blk * current_setting('block_size')::int8 + pos));
+END $$;
+-- where item off of block blk begins (lp_off, the low 15 bits)
+CREATE FUNCTION lion_vfy_item(idx regclass, blk int8, off int)
+RETURNS int8 LANGUAGE sql AS $$
+	SELECT (get_byte(lp, 0) + (get_byte(lp, 1) & 127) * 256)::int8
+	  FROM lion_vfy_peek(idx, blk, 24 + 4 * (off - 1), 4) lp
+$$;
+CREATE TEMP TABLE lion_vfy_bad (k int4);
+INSERT INTO lion_vfy_bad SELECT i % 50 FROM generate_series(1, 20000) i;
+CREATE TEMP TABLE lion_vfy_badp (id int4, k int4);
+INSERT INTO lion_vfy_badp SELECT i, i % 2 FROM generate_series(1, 60000) i;
+SET ignore_checksum_failure = on;
+-- (1) a line pointer that points past the page
+CREATE INDEX lion_vfy_bad_lp ON lion_vfy_bad USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_lp', 1, 24 + 4 * 2, '\xf8fffeff');
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_lp');
+ERROR:  lion index "lion_vfy_bad_lp": line pointer 3 on block 1 points at 32767 bytes at offset 32760, outside the item space 1272 .. 8160
+SELECT entries FROM lion_index_stats('lion_vfy_bad_lp');
+ entries 
+---------
+      49
+(1 row)
+
+SET client_min_messages = warning;
+-- (2) an entry of a key column the index does not have, which the order
+-- check used to hand to lion_column() before anything had checked it
+CREATE INDEX lion_vfy_bad_attno ON lion_vfy_bad USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_attno', 1,
+					 lion_vfy_item('lion_vfy_bad_attno', 1, 3) + 20, '\xffff');
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_attno');
+ERROR:  lion index "lion_vfy_bad_attno": entry 3 on block 1 belongs to key column 65535, but the index has 1
+SELECT entries FROM lion_index_stats('lion_vfy_bad_attno');
+ entries 
+---------
+      49
+(1 row)
+
+SET client_min_messages = warning;
+-- (3) a key longer than its entry: the payload length computed from it used
+-- to underflow, and lion_index_stats() walked the "payload" off the page
+CREATE INDEX lion_vfy_bad_keylen ON lion_vfy_bad USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_keylen', 1,
+					 lion_vfy_item('lion_vfy_bad_keylen', 1, 3) + 6, '\xffff');
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_keylen');
+ERROR:  lion index "lion_vfy_bad_keylen": item 3 on block 1 is 856 bytes, too small for its 65535 byte key
+SELECT entries FROM lion_index_stats('lion_vfy_bad_keylen');
+ entries 
+---------
+      49
+(1 row)
+
+SET client_min_messages = warning;
+-- (4) a posting-tree downlink to InvalidBlockNumber, which ReadBuffer() takes
+-- for P_NEW on 16 to 18: the check used to EXTEND the index it was checking
+CREATE INDEX lion_vfy_badp_twin ON lion_vfy_badp USING lion (k);
+SELECT lion_index_posting_root('lion_vfy_badp_twin', 0) AS root \gset
+SELECT max_posting_height FROM lion_index_stats('lion_vfy_badp_twin');
+ max_posting_height 
+--------------------
+                  1
+(1 row)
+
+CREATE INDEX lion_vfy_bad_child ON lion_vfy_badp USING lion (k);
+SELECT pg_relation_size('lion_vfy_bad_child') AS size_before \gset
+SELECT lion_vfy_poke('lion_vfy_bad_child', :root,
+					 lion_vfy_item('lion_vfy_bad_child', :root, 1) + 4, '\xffffffff');
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_child');
+ERROR:  lion index "lion_vfy_bad_child": a link points at block 4294967295, but the index has only 12 blocks
+SET client_min_messages = warning;
+SELECT pg_relation_size('lion_vfy_bad_child') = :size_before AS not_extended;
+ not_extended 
+--------------
+ t
+(1 row)
+
+-- (5) a container of no known type on a posting leaf
+CREATE INDEX lion_vfy_bad_type ON lion_vfy_badp USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_type', :root + 1,
+					 lion_vfy_item('lion_vfy_bad_type', :root + 1, 1) + 6, '\x7f');
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_type');
+ERROR:  lion index "lion_vfy_bad_type": container 1 on block 3 is corrupt: invalid container type
+SELECT containers FROM lion_index_stats('lion_vfy_bad_type');
+ containers 
+------------
+          9
+(1 row)
+
+SET client_min_messages = warning;
+-- (6) a right link that skips a leaf, and the left link that goes with it,
+-- so that the leaf is reached by its downlink and by nothing else.  The walk
+-- of the leaves cannot tell that from a leaf a concurrent split made after
+-- the walk had passed its place - verify() lets INSERTs run beside it
+-- (DESIGN.md §7) - so it is a candidate, and it is the walk of the level
+-- again, after the wait for the writers in flight, that finds the downlink
+-- pointing out of the level.  The special area is the last 32 bytes of a
+-- block: the right link first, then the left link, the flags at 26.
+CREATE FUNCTION lion_vfy_u32(idx regclass, blk int8, pos int8)
+RETURNS int8 LANGUAGE sql AS $$
+	SELECT get_byte(b, 0)::int8 + get_byte(b, 1)::int8 * 256 +
+		   get_byte(b, 2)::int8 * 65536 + get_byte(b, 3)::int8 * 16777216
+	  FROM lion_vfy_peek(idx, blk, pos, 4) b
+$$;
+CREATE FUNCTION lion_vfy_le32(x int8)
+RETURNS bytea LANGUAGE sql AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		   0, (x & 255)::int), 1, ((x >> 8) & 255)::int),
+		   2, ((x >> 16) & 255)::int), 3, ((x >> 24) & 255)::int)
+$$;
+CREATE TEMP TABLE lion_vfy_badd (k text);
+INSERT INTO lion_vfy_badd
+SELECT 'key' || lpad(i::text, 5, '0') || repeat('x', 100) FROM generate_series(1, 300) i;
+CREATE INDEX lion_vfy_bad_link ON lion_vfy_badd USING lion (k);
+SELECT current_setting('block_size')::int8 - 32 AS special \gset
+SELECT b AS leaf1
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_link') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_link', b, :special + 24) >> 16) & 2 = 2
+   AND lion_vfy_u32('lion_vfy_bad_link', b, :special + 4) = 4294967295 \gset
+SELECT lion_vfy_u32('lion_vfy_bad_link', :leaf1, :special) AS leaf2 \gset
+SELECT lion_vfy_u32('lion_vfy_bad_link', :leaf2, :special) AS leaf3 \gset
+SELECT :leaf1 AS leaf1, :leaf2 AS leaf2, :leaf3 AS leaf3;
+ leaf1 | leaf2 | leaf3 
+-------+-------+-------
+     1 |     2 |     4
+(1 row)
+
+SELECT lion_vfy_poke('lion_vfy_bad_link', :leaf1, :special, lion_vfy_le32(:leaf3));
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SELECT lion_vfy_poke('lion_vfy_bad_link', :leaf3, :special + 4, lion_vfy_le32(:leaf1));
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_link');
+ERROR:  lion index "lion_vfy_bad_link": downlink 1 of level 1 points at block 2, which is not a page of level 0 between blocks 1 and 4
+SET client_min_messages = warning;
+RESET ignore_checksum_failure;
+DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd;
+DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
+DROP FUNCTION lion_vfy_poke(regclass, int8, int8, bytea);
+DROP FUNCTION lion_vfy_item(regclass, int8, int);
+DROP FUNCTION lion_vfy_u32(regclass, int8, int8);
+DROP FUNCTION lion_vfy_le32(int8);
+/*
+ * lion_index_posting_root() takes a column VALUE, and a multi-key column's
+ * entries are keys extracted from values (DESIGN.md §17): a whole tsvector
+ * hashed as if it were one lexeme named no entry at all.  It refuses such a
+ * column, as the count functions do.
+ */
+CREATE TABLE lion_vfy_mk (tags text[], doc tsvector);
+INSERT INTO lion_vfy_mk VALUES ('{a,b}', 'a b');
+CREATE INDEX lion_vfy_mk_tags ON lion_vfy_mk USING lion (tags);
+CREATE INDEX lion_vfy_mk_doc ON lion_vfy_mk USING lion (doc);
+SELECT lion_index_posting_root('lion_vfy_mk_doc', 'a b'::tsvector);
+ERROR:  key column 1 of index "lion_vfy_mk_doc" has a multi-key operator class, whose entries are not column values
+SELECT lion_index_posting_root('lion_vfy_mk_tags', '{a,b}'::text[]);
+ERROR:  key column 1 of index "lion_vfy_mk_tags" has a multi-key operator class, whose entries are not column values
+SELECT lion_index_count('lion_vfy_mk_doc', 'a b'::tsvector);
+ERROR:  key column 1 of index "lion_vfy_mk_doc" has a multi-key operator class, whose entries are not column values
+DROP TABLE lion_vfy_mk;
 DROP TABLE lion_vfy, lion_vfy_empty, lion_vfy_unl, lion_vfy_hot;

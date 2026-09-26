@@ -113,24 +113,24 @@ SELECT lion_inplan('SELECT id FROM lion_in WHERE a IN (1, 2, 3)');
 (4 rows)
 
 SELECT lion_inplan('SELECT count(*) FROM lion_in WHERE a IN (1, 2, 3)');
-                  lion_inplan                  
------------------------------------------------
- Custom Scan (LionCount)
-   Lion Indexes: lion_in_a (a = ANY ({1,2,3}))
-(2 rows)
-
-SELECT lion_inplan($$SELECT count(*) FROM lion_in WHERE a IN (1, 2) AND c = 'c1'$$);
-                           lion_inplan                           
------------------------------------------------------------------
- Custom Scan (LionCount)
-   Lion Indexes: lion_in_a (a = ANY ({1,2})), lion_in_c (c = c1)
-(2 rows)
-
-SELECT lion_inplan('SELECT b, count(*) FROM lion_in WHERE b IN (1, 2) GROUP BY b');
                         lion_inplan                         
 ------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_in_b (b), lion_in_b (b = ANY ({1,2}))
+   Lion Indexes: lion_in_a (a = ANY ('{1,2,3}'::integer[]))
+(2 rows)
+
+SELECT lion_inplan($$SELECT count(*) FROM lion_in WHERE a IN (1, 2) AND c = 'c1'$$);
+                                     lion_inplan                                      
+--------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_in_a (a = ANY ('{1,2}'::integer[])), lion_in_c (c = 'c1'::text)
+(2 rows)
+
+SELECT lion_inplan('SELECT b, count(*) FROM lion_in WHERE b IN (1, 2) GROUP BY b');
+                               lion_inplan                               
+-------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_in_b (b), lion_in_b (b = ANY ('{1,2}'::integer[]))
    Group Key: b
 (3 rows)
 
@@ -385,7 +385,8 @@ SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE n IN (1, 2) AND n IS NOT N
  pushed down, 1 rows
 (1 row)
 
--- the same list twice is a duplicate clause, two different ones are not
+-- the same list twice is a duplicate clause; two different ones are two
+-- sources, ANDed like lists on two columns (samecolumn.sql)
 SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND b IN (1, 2)');
      lion_incmp      
 ---------------------
@@ -393,9 +394,9 @@ SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND b IN (1, 2
 (1 row)
 
 SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND b IN (2, 3)');
-     lion_incmp     
---------------------
- index scan, 1 rows
+     lion_incmp      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- = ALL is answered by the ordinary plan

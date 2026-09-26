@@ -125,18 +125,18 @@ SELECT lion_tsplan($$SELECT id FROM lion_ts
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 & w2')$$);
-                   lion_tsplan                    
---------------------------------------------------
+                           lion_tsplan                           
+-----------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_ts_tsv (tsv @@ 'w1' & 'w2')
+   Lion Indexes: lion_ts_tsv (tsv @@ '''w1'' & ''w2'''::tsquery)
 (2 rows)
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 | w2')$$);
-                   lion_tsplan                    
---------------------------------------------------
+                           lion_tsplan                           
+-----------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_ts_tsv (tsv @@ 'w1' | 'w2')
+   Lion Indexes: lion_ts_tsv (tsv @@ '''w1'' | ''w2'''::tsquery)
 (2 rows)
 
 -- NOT, prefix, phrase and weights are never pushed down
@@ -186,10 +186,10 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 
 SELECT lion_tsplan($$SELECT grp, count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 & w2') GROUP BY grp$$);
-                             lion_tsplan                             
----------------------------------------------------------------------
+                                    lion_tsplan                                     
+------------------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_ts_grp (grp), lion_ts_tsv (tsv @@ 'w1' & 'w2')
+   Lion Indexes: lion_ts_grp (grp), lion_ts_tsv (tsv @@ '''w1'' & ''w2'''::tsquery)
    Group Key: grp
 (3 rows)
 

@@ -1,0 +1,79 @@
+Parsed test spec with 1 sessions
+
+starting permutation: s1_stats s1_vacuum s1_stats s1_verify s1_count s1_detach s1_vacuum s1_stats s1_verify s1_count
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_stats: 
+	SELECT entries, inline_entries, container_pages, posting_internal_pages,
+		   deleted_pages, ntids
+	  FROM lion_index_stats('vsi_k');
+
+entries|inline_entries|container_pages|posting_internal_pages|deleted_pages| ntids
+-------+--------------+---------------+----------------------+-------------+------
+      1|             1|              0|                     0|            0|150000
+(1 row)
+
+step s1_vacuum: VACUUM vsi;
+ERROR:  error triggered for injection point lion-spill-leaves-written
+step s1_stats: 
+	SELECT entries, inline_entries, container_pages, posting_internal_pages,
+		   deleted_pages, ntids
+	  FROM lion_index_stats('vsi_k');
+
+entries|inline_entries|container_pages|posting_internal_pages|deleted_pages| ntids
+-------+--------------+---------------+----------------------+-------------+------
+      1|             1|             10|                     0|            0|150000
+(1 row)
+
+step s1_verify: SELECT lion_index_verify('vsi_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s1_count: 
+	SET enable_seqscan = off; SET enable_indexscan = off;
+	SELECT count(*) AS through_the_index FROM vsi WHERE k = 0;
+	RESET enable_seqscan; RESET enable_indexscan;
+
+through_the_index
+-----------------
+           135000
+(1 row)
+
+step s1_detach: SELECT injection_points_detach('lion-spill-leaves-written');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: VACUUM vsi;
+step s1_stats: 
+	SELECT entries, inline_entries, container_pages, posting_internal_pages,
+		   deleted_pages, ntids
+	  FROM lion_index_stats('vsi_k');
+
+entries|inline_entries|container_pages|posting_internal_pages|deleted_pages| ntids
+-------+--------------+---------------+----------------------+-------------+------
+      1|             0|             10|                     1|           10|135000
+(1 row)
+
+step s1_verify: SELECT lion_index_verify('vsi_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s1_count: 
+	SET enable_seqscan = off; SET enable_indexscan = off;
+	SELECT count(*) AS through_the_index FROM vsi WHERE k = 0;
+	RESET enable_seqscan; RESET enable_indexscan;
+
+through_the_index
+-----------------
+           135000
+(1 row)
+

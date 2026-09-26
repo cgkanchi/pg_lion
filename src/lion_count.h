@@ -174,11 +174,16 @@ typedef struct LionPostingSet
 	 * Bookkeeping for materialization.  cxt is the memory context the set was
 	 * located in, which is where the copies go; nuses counts the calls of
 	 * lion_count_posting_sets() this set has taken part in, and is what tells
-	 * a one-shot count apart from a set the GROUP BY path reuses.
+	 * a one-shot count apart from a set the GROUP BY path reuses.  matfailed
+	 * says a copy was tried and given up on - the set is too big, or the
+	 * copies its count's sources already hold have spent their budget
+	 * (DESIGN.md §15, "Bounded cursors") - so it is not walked again for a
+	 * copy that would fail the same way at every group.
 	 */
 	MemoryContext cxt;
 	int			nuses;
 	struct LionMatSet *mat;		/* materialized containers, or NULL */
+	bool		matfailed;
 
 	/*
 	 * A private copy of the key exactly as the index stored it.  Callers that
@@ -503,8 +508,9 @@ extern void lion_stream_end(LionSetStream *st);
  * as a stream - or as a set to probe - can open one.  lion_source_next()
  * hands out one container at a time, and never a TID the index does not
  * hold; when lion_source_sorted() the whole answer is one strictly ascending
- * run of container keys, each TID exactly once (SETS, UNION); a WALK streams
- * entry by entry and a long IN list batch by batch, ascending within each.
+ * run of container keys, each TID exactly once (SETS, UNION, WINDOW); a WALK
+ * streams entry by entry and a long IN list batch by batch, ascending within
+ * each.
  * lion_source_exact() is false when the TIDs are a superset that the caller
  * must recheck (§29.6).  keys must stay valid while the source is open.
  */

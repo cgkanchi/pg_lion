@@ -2087,6 +2087,21 @@ static int *lion_or_group_map(List *ors, int nclause);
  * grouping column an equality pins).
  *
  * Returns the clause index of the list, or -1 when neither applies.
+ *
+ * *groupdrive has to be the executor's answer and not an approximation of
+ * it, because it is also what decides whether the path may claim pathkeys:
+ * the entry walk emits its groups in directory order, the list's sets in
+ * whatever order they were located in.  lion_locate_where() takes as the
+ * driver the FIRST clause - in clause order, OR leaves skipped - that is a
+ * list (or, with eqdrives, an equality) on the driving index's own key
+ * column, whatever else the WHERE holds, and so does this function.  It used
+ * to give up at the second list anywhere in the WHERE ("neither is THE one"),
+ * which with `g IN (...) AND h IN (...) GROUP BY g` priced a walk of every
+ * entry of g and promised `ORDER BY g` a sorted output the executor never
+ * built: it drove the groups from g's list all the same (the 2026-09-25
+ * review).  The listed sets come out in key order for every opfamily this
+ * extension ships, which is why no test caught it; a family whose lookup
+ * falls back to an unsorted probe emits them in hash order.
  */
 static int
 lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -2097,9 +2112,9 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 {
 	int			nclause = list_length(whereclauses);
 	bool	   *inor = lion_or_leaf_map(ors, nclause);
-	IndexOptInfo *arrayidx = NULL;
-	AttrNumber	arraycol = 1;
-	int			arrayci = -1;
+	int			firstlist = -1; /* the first list anywhere */
+	int			nlist = 0;
+	int			groupci = -1;	/* the first one on the driving column */
 	int			npos = 0;
 	int			ci = 0;
 	ListCell   *lc1;
@@ -2112,49 +2127,51 @@ lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 
 	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
 	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
+		bool		ondriver = (groupidx != NULL &&
+								idx->indexoid == groupidx->indexoid &&
+								(AttrNumber) lfirst_int(lc4) == groupcol);
+
 		if (!inor[ci] && LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
 		{
 			npos++;
 			if (IsA((Node *) lfirst(lc2), ScalarArrayOpExpr) ||
-				(eqdrives && lfirst_int(lc3) == LION_CLAUSE_EQ &&
-				 groupidx != NULL &&
-				 ((IndexOptInfo *) lfirst(lc1))->indexoid == groupidx->indexoid &&
-				 (AttrNumber) lfirst_int(lc4) == groupcol))
+				(eqdrives && lfirst_int(lc3) == LION_CLAUSE_EQ && ondriver))
 			{
-				if (arrayci >= 0)
-					arrayci = -2;	/* two lists: neither is "the" one */
-				else if (arrayci == -1)
-				{
-					arrayci = ci;
-					arrayidx = (IndexOptInfo *) lfirst(lc1);
-					arraycol = (AttrNumber) lfirst_int(lc4);
-				}
+				nlist++;
+				if (firstlist < 0)
+					firstlist = ci;
+				if (groupci < 0 && ondriver)
+					groupci = ci;
 			}
 		}
 		ci++;
 	}
 	pfree(inor);
 
-	if (arrayci < 0)
-		return -1;
-
 	/*
 	 * The list drives the groups only when its entries ARE the groups: the
 	 * same index AND the same key column (DESIGN.md §24).  Two columns of one
 	 * multicolumn index are two independent sets of entries, so a list on `b`
 	 * says nothing about the groups of `a` - which is also how the executor
-	 * decides it (lion_locate_where(), by index and by heap attno).
+	 * decides it (lion_locate_where(), by index and by heap attno).  Any other
+	 * list, or a second one on the same column, is an ordinary source.
+	 *
+	 * The sum of a list's entries stands for its union only when nothing else
+	 * is in the AND, so that needs the list to be the one positive clause.
 	 */
-	if (groupidx == NULL && groupidx2 == NULL && ors == NIL && npos == 1)
+	if (groupidx == NULL && groupidx2 == NULL && ors == NIL && npos == 1 &&
+		nlist == 1)
+	{
 		*sumshort = true;
-	else if (groupidx != NULL && groupidx2 == NULL && arrayidx != NULL &&
-			 arrayidx->indexoid == groupidx->indexoid &&
-			 arraycol == groupcol)
+		return firstlist;
+	}
+	if (groupidx != NULL && groupidx2 == NULL && groupci >= 0)
+	{
 		*groupdrive = true;
-	else
-		return -1;
-
-	return arrayci;
+		return groupci;
+	}
+	return -1;
 }
 
 /*
@@ -4332,7 +4349,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		{
 			BoolExpr   *orexpr = (BoolExpr *) clause;
 			List	   *armlens = NIL;
-			int			first = list_length(whereattnos);
+			int			orfirst = list_length(whereattnos);
 			ListCell   *la;
 
 			if (list_length(orexpr->args) < 2)
@@ -4378,7 +4395,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			}
 
 			ors = lappend(ors,
-						  list_concat(list_make2_int(first,
+						  list_concat(list_make2_int(orfirst,
 													 list_length(armlens)),
 									  armlens));
 			havepositive = true;
@@ -4426,41 +4443,74 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)
 		{
 			/*
-			 * At most one positive clause per column: the same clause twice
-			 * is just a duplicate, two different ones mean the query selects
-			 * little or nothing and we would rather leave that to the normal
-			 * plan.  `IS NOT NULL` is not subject to this - it constrains
+			 * A second positive clause on a column is a source of its own,
+			 * ANDed with the first exactly as a clause on another column is:
+			 * it is matched to an index that answers ITS operator under ITS
+			 * collation (lion_match_index(), per relation), and the AND of
+			 * two exact sources is exact.  Only the very same clause again -
+			 * the same kind, the same operator, the same input collation and
+			 * an equal() value - is dropped, because the lookup the first one
+			 * makes is then its answer too.
+			 *
+			 * Anything less than all four is not "the same clause", and a
+			 * clause dropped here is one no index is ever asked about (the
+			 * 2026-09-25 review).  Comparing the kind and the value alone
+			 * called `v === 'A' AND v = 'A'` a duplicate over an index whose
+			 * case-insensitive opclass answers `===` - and nothing at all
+			 * answered `=` - so both spellings were counted, 10000 rows
+			 * where the query selects 5000.  A nondeterministic collation
+			 * does it with one operator: `s COLLATE ci = 'a' AND s = 'a'`
+			 * differ in nothing but their input collation.  Now the second
+			 * clause needs an index of its own and the query is declined
+			 * when there is none.
+			 *
+			 * Two clauses that differ only in value used to be declined too,
+			 * on the grounds that they select little or nothing.  They are
+			 * answered now, because nothing in the AND is specific to one
+			 * clause per column: the entry a GROUP BY or an IN list drives
+			 * is the FIRST suitable clause on its index (lion_inlist_shape()
+			 * and lion_locate_where() agree on that), the key a target list
+			 * prints is the first pinning clause's, and every clause on the
+			 * column must then be one whose index may print it.  Under a
+			 * coarse equality they need not even disagree: `v === 'a' AND
+			 * v === 'A'` is one entry, looked up twice.
+			 *
+			 * `IS NOT NULL` is not subject to any of this - it constrains
 			 * nothing by itself and is simply subtracted - and neither is a
 			 * multi-key clause, whose sources intersect exactly as two
 			 * clauses on different columns do (`tags @> '{a}' AND
 			 * tags && '{b,c}'` is one AND of three key sets).  Nor is a leaf
 			 * of an OR, which says nothing about the rows the OTHER arms
-			 * select and so cannot be compared with a clause that does.
+			 * select and so cannot stand in for a clause that does.
 			 */
 			if (list_member_int(posattnos, (int) leaf.var->varattno))
 			{
 				ListCell   *l1;
 				ListCell   *l2;
 				ListCell   *l3;
-				ListCell   *l4;
 				bool		same = false;
 
-				forfour(l1, whereattnos, l2, whereconsts, l3, wherekinds,
-						l4, whereinor)
+				forthree(l1, clauseinfos, l2, whereconsts, l3, whereinor)
 				{
-					if (lfirst_int(l4) != 0 ||
-						lfirst_int(l1) != (int) leaf.var->varattno ||
-						lfirst_int(l3) == LION_CLAUSE_NOTNULL)
+					LionClauseInfo *prev = (LionClauseInfo *) lfirst(l1);
+
+					if (lfirst_int(l3) != 0 ||
+						prev->attno != leaf.var->varattno)
 						continue;
-					same = (lfirst_int(l3) == leaf.kind &&
-							equal(lfirst(l2), leaf.val));
-					break;
+					if (prev->kind == leaf.kind &&
+						prev->opno == leaf.opno &&
+						prev->collation == leaf.collation &&
+						equal(lfirst(l2), leaf.val))
+					{
+						same = true;
+						break;
+					}
 				}
-				if (!same)
-					return;
-				continue;
+				if (same)
+					continue;
 			}
-			posattnos = lappend_int(posattnos, (int) leaf.var->varattno);
+			else
+				posattnos = lappend_int(posattnos, (int) leaf.var->varattno);
 		}
 
 		switch (leaf.kind)
@@ -8345,13 +8395,22 @@ lion_end_custom_scan(CustomScanState *node)
 }
 
 /*
- * "col = 3", "col = ANY ('{1,2,3}')", "col IS NULL", "col IS NOT NULL",
- * "tags @> {a,b}", "tsv @@ 'a' & 'b'", "col >= 10" (a range, DESIGN.md §28,
- * with the column on the left whichever side the query had it on).
+ * "col = 3", "col = ANY ('{1,2,3}'::integer[])", "col IS NULL",
+ * "col IS NOT NULL", "tags @> '{a,b}'::text[]", "col >= 10" (a range,
+ * DESIGN.md §28, with the column on the left whichever side the query had it
+ * on) - each with the clause's OWN operator and its value as core's EXPLAIN
+ * would print it in a qual.
  *
- * A clause whose value is not a literal is printed as the expression the plan
- * carries, which for a prepared statement's parameter is `$1` - the same text
- * core's EXPLAIN gives a qual on one (DESIGN.md §10).
+ * Both used to be approximated, and the approximation hid a wrong answer (the
+ * 2026-09-25 review): every equality was printed with `=`, so a clause on a
+ * case-insensitive opclass's `===` read exactly like the `=` beside it that
+ * the planner had dropped as its duplicate, and a literal was printed through
+ * its type's output function alone, so `v = 'A'` came out as `(v = A)` and a
+ * list as `ANY ({90,5,50,1})`.  Now the operator is named - `===` prints as
+ * `===`, as the multi-key and range clauses always did - and the value is
+ * deparsed like any other expression the plan carries: a literal with its
+ * quotes and its type, and a parameter as `$1`, the same text core gives a
+ * qual on one (DESIGN.md §10).
  */
 static void
 lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors,
@@ -8369,44 +8428,33 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 			break;
 		default:
 			{
-				Oid			outfunc;
-				bool		isvarlena;
+				List	   *context;
+				char	   *opname = get_opname(cl->opno);
 				char	   *val;
 
-				if (cl->con == NULL)
-				{
-					List	   *context =
-						set_deparse_context_plan(es->deparse_cxt,
-												 st->css.ss.ps.plan,
-												 ancestors);
+				if (opname == NULL)
+					elog(ERROR, "LionCount: cache lookup failed for operator %u",
+						 cl->opno);
 
-					/*
-					 * The FK-side join's key is a column of the OTHER table
-					 * (DESIGN.md §27), so it is printed qualified: `fk =
-					 * d.pk`, as core prints a join clause.
-					 */
-					val = deparse_expression((Node *) cl->valexpr, context,
-											 st->joinclause >= 0 &&
-											 cl == &st->clause[st->joinclause],
-											 false);
-				}
-				else
-				{
-					getTypeOutputInfo(cl->con->consttype, &outfunc, &isvarlena);
-					val = OidOutputFunctionCall(outfunc, cl->con->constvalue);
-				}
+				context = set_deparse_context_plan(es->deparse_cxt,
+												   st->css.ss.ps.plan,
+												   ancestors);
+
+				/*
+				 * The FK-side join's key is a column of the OTHER table
+				 * (DESIGN.md §27), so it is printed qualified: `fk = d.pk`,
+				 * as core prints a join clause.
+				 */
+				val = deparse_expression((Node *) cl->valexpr, context,
+										 st->joinclause >= 0 &&
+										 cl == &st->clause[st->joinclause],
+										 false);
 				if (cl->kind == LION_CLAUSE_ARRAY)
-					appendStringInfo(buf, "%s = ANY (%s)", attname, val);
-				else if (cl->kind == LION_CLAUSE_MULTI ||
-						 cl->kind == LION_CLAUSE_RANGE)
-				{
-					char	   *opname = get_opname(cl->opno);
-
-					appendStringInfo(buf, "%s %s %s", attname, opname, val);
-					pfree(opname);
-				}
+					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
+									 val);
 				else
-					appendStringInfo(buf, "%s = %s", attname, val);
+					appendStringInfo(buf, "%s %s %s", attname, opname, val);
+				pfree(opname);
 				pfree(val);
 				break;
 			}

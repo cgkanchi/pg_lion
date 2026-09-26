@@ -16,26 +16,42 @@ existed. This directory is that test.
 make recovery-check PG_CONFIG=<prefix>/bin/pg_config RECOVERY_PREFIX=<prefix>
 
 # or directly:
-test/recovery/run.sh [--prefix <prefix>] [--iters N] [--keep]
+test/recovery/run.sh --prefix <prefix> [--iters N] [--keep]
+
+# as root (a container, a CI image): initdb and postgres refuse to run as
+# root, so name an unprivileged user to run the clusters as
+RECOVERY_RUN_AS=postgres make recovery-check RECOVERY_PREFIX=<prefix>
 ```
 
 `<prefix>` is a PostgreSQL *installation* (it needs `bin/initdb`,
 `bin/pg_basebackup`, `bin/pgbench`, `bin/pg_waldump`, and `citext` in
-`share/postgresql/extension`). It defaults to the worktree install,
-`../pg_roaring_index-partial/.local/pg`. The extension is rebuilt from a
-clean copy of this tree — `src/`, the Makefile, the control and SQL files,
-with `src/*.o` removed — and installed into that prefix, exactly as
-`bench/lib.sh`'s `bench_build_extension` does; `make install` is never run in
-the source tree.
+`share/postgresql/extension`), and it is REQUIRED - `--prefix` or
+`RECOVERY_PREFIX`; the run refuses to start without one. There is no default
+on purpose: the extension is rebuilt from a clean copy of this tree — `src/`,
+the Makefile, the control and SQL files, with `src/*.o` removed — and
+*installed* into that prefix, exactly as `bench/lib.sh`'s
+`bench_build_extension` does, so a guessed prefix would be somebody else's
+server. `make install` is never run in the source tree, and the prefix is
+deliberately not derived from `PG_CONFIG`.
 
-The run creates two clusters of its own under
-`/tmp/claude-1000/lion_recovery`, on the private socket directory
-`/tmp/claude-1000/pgsk_rec` and ports 54340 (primary) and 54341 (standby),
-with `listen_addresses = ''`. It refuses to start if anything already listens
-there, checks `SHOW data_directory` against the directory it asked for before
-trusting a connection, and removes both clusters through an exit trap
-(`--keep` suppresses only the removal). It never touches the dev cluster or
-the benchmark clusters.
+`RECOVERY_RUN_AS=<user>` runs `initdb`, `pg_ctl` and `pg_basebackup` through
+`runuser -u <user>`; everything else (psql, pgbench, pg_waldump, the build)
+runs as the caller. Run as root without it, the script stops before doing
+anything and says so. That user must be able to read the prefix; it is given
+ownership of the run's private directory.
+
+The run creates everything it needs in ONE private directory that
+`mktemp -d` makes for it under `$RECOVERY_TMPDIR` (default `$TMPDIR`, else
+`/tmp`): the two clusters, their server logs, the socket directory and the
+build copy. The clusters listen on ports 54340 (primary) and 54341 (standby)
+of that private socket directory only, with `listen_addresses = ''`, so two
+runs - two users, two worktrees - cannot meet at an endpoint. (A Unix socket
+path has a length limit, so when the private directory is too deep for one
+the socket directory is a second `mktemp -d` under `/tmp`.) The run checks
+`SHOW data_directory` against the directory it asked for before trusting a
+connection, and removes the directory it created, and nothing else, through
+an exit trap (`--keep` suppresses only the removal and prints the path). It
+never touches the dev cluster or the benchmark clusters.
 
 One caveat about that prefix: it is shared. The run installs
 `pg_lion.so` into it and then starts a cluster that loads it, so another
@@ -124,6 +140,35 @@ finish a half-applied two-pass bulkdelete. After every restart:
   `null_tids` and `empty_tids` are checked separately, because a reserved
   entry that lost its flag would hide inside the `ntids` total.
 
+**Phases 1b-1f, a crash or a restart at a chosen point.** Each builds a
+table of its own. 1b parks a VACUUM between the two steps of a whole-chain
+free (injection point `lion-vacuum-entries-deleted`), 1c and 1d an insert
+between a directory or posting-tree split and its downlink, and each crashes
+the server there and checks what comes back. Two more (DESIGN.md §18, §25):
+
+* **1e**, a crash inside a MULTI-LEAF spill. VACUUM's filtering turns one
+  key's INLINE payload into ten BITSETs, a leaf each; the spill parks at
+  `lion-spill-leaves-written`, after its last leaf record and before the root
+  and the entry, and the server dies. The entry must come back INLINE with
+  every TID, `lion_index_verify()` must call the ten leaves a leak and not
+  corruption, and the next VACUUM must spill the set and free the orphans in
+  its sweep. A second crash replays that VACUUM.
+* **1f**, VACUUM of an rmgr-mode index on a server WITHOUT the resource
+  manager. The partial index is built with the library preloaded, the server
+  is restarted without it (and without `wal_consistency_checking`, which
+  names the manager), and a VACUUM that removes nothing from the index runs
+  with `pg_lion.vacuum_barrier_ranges = 1`. `pg_waldump` over its range must
+  find no record of a custom manager - it used to find `custom128` ones, which
+  no such server can replay - and a crash right after it must recover. The
+  primary is restarted in its `--mode` afterwards.
+
+1b and 1e also read the page counts `VACUUM (VERBOSE)` reports for the index
+(DESIGN.md §18, "Page counts"), which no SQL function can see: the pages
+newly deleted must be exactly the ones the phase freed, and - since neither
+index holds a page an earlier VACUUM freed - the free pages that are not newly
+deleted must be exactly the reusable ones, all-zero pages: a page counted
+twice, or one freed a moment ago called reusable, breaks the equation.
+
 **Phase 2, hot standby.** `pg_basebackup -R -X stream` into a standby, then:
 
 * the full phase-1 check battery again, in recovery.
@@ -193,11 +238,11 @@ a subset, and `--phases 3` skips phases 1 and 2.
 * **No long soak.** Eight rounds of two seconds is about 20000 transactions;
   it is a smoke test for the WAL records the write paths emit, not a
   statement about hours of churn. `--iters N` raises it.
-* **No crash injection at a chosen point in the AM.** The worktree server has
-  injection points built in, and a future version of this test could stop the
-  backend between the two records of a spill or a segment promotion. As it
-  stands the crash lands wherever the workload happens to be, which reaches
-  the frequent paths and not the rare ones.
+* **Crash injection at a few chosen points only.** Phases 1b-1e stop a
+  backend at an injection point and crash the server there; every other
+  multi-record operation (a segment promotion, say) is crashed wherever the
+  phase 1 workload happens to be, which reaches the frequent paths and not
+  the rare ones.
 * **No replica that is behind.** The standby is always caught up before it is
   read, except in the conflict test where being behind is the point. Nothing
   tests a cascading standby, a restart from an archive, `pg_rewind`, or a

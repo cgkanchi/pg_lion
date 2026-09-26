@@ -79,6 +79,55 @@ RESET lion_hard.salt;
 REVOKE EXECUTE ON FUNCTION lion_index_verify(regclass, bool) FROM lion_hard_mallory;
 DROP TABLE lion_hard_v;
 DROP FUNCTION lion_hard_pred(int4);
+\set VERBOSITY terse
+-- ---------- lion_index_verify() runs the table owner's code as the table owner ----------
+-- The owner's index expression was IMMUTABLE when the index was built, and is
+-- replaced afterwards by a body that makes its owner able to create roles
+-- whenever a superuser runs it (the class of CVE-2022-1552).  heapallindexed
+-- evaluates it for every row; a superuser checking the index must run it as
+-- the table owner, who gains nothing, in a security-restricted operation whose
+-- setting changes do not outlive the call.
+CREATE SCHEMA lion_hard_m AUTHORIZATION lion_hard_mallory;
+SET ROLE lion_hard_mallory;
+CREATE TABLE lion_hard_m.t (k int4);
+INSERT INTO lion_hard_m.t VALUES (1), (2);
+CREATE FUNCTION lion_hard_m.f(int4) RETURNS int4 LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+CREATE INDEX t_k ON lion_hard_m.t USING lion (lion_hard_m.f(k));
+CREATE OR REPLACE FUNCTION lion_hard_m.f(int4) RETURNS int4 LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+	RAISE NOTICE 'the index expression runs as %', current_user;
+	IF (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user) THEN
+		EXECUTE 'ALTER ROLE lion_hard_mallory CREATEROLE';
+	END IF;
+	PERFORM pg_catalog.set_config('lion_hard.who', current_user, false);
+	IF pg_catalog.current_setting('lion_hard.fail', true) = 'on' THEN
+		RAISE EXCEPTION 'the owner''s code failed';
+	END IF;
+	RETURN $1;
+END $$;
+RESET ROLE;
+SET lion_hard.who = 'the caller';
+SELECT lion_index_verify('lion_hard_m.t_k', true);
+SELECT rolcreaterole AS mallory_can_create_roles FROM pg_roles WHERE rolname = 'lion_hard_mallory';
+-- the caller is itself again, and the setting the owner's code made is gone
+SELECT current_user = session_user AS the_caller_again,
+	   current_setting('lion_hard.who') AS who;
+CREATE TEMP TABLE lion_hard_not_restricted (i int);   -- not a security-restricted operation any more
+DROP TABLE lion_hard_not_restricted;
+-- ... and the same when the owner's code fails and the error is caught
+SET lion_hard.fail = on;
+DO $$
+BEGIN
+	PERFORM lion_index_verify('lion_hard_m.t_k', true);
+EXCEPTION WHEN OTHERS THEN
+	RAISE NOTICE 'caught: %', SQLERRM;
+END $$;
+RESET lion_hard.fail;
+SELECT current_user = session_user AS the_caller_again,
+	   current_setting('lion_hard.who') AS who;
+RESET lion_hard.who;
+DROP SCHEMA lion_hard_m CASCADE;
+\set VERBOSITY default
 DROP TABLE lion_hard_t;
 -- leave citext's opclass installed for whatever follows, as the tests before did
 SET client_min_messages = warning;
