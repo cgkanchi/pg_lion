@@ -181,11 +181,13 @@ SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
  -- off:
  Aggregate
    ->  Bitmap Heap Scan on lion_pdt
-         Recheck Cond: (a = 3)
-         Filter: (b = 2)
-         ->  Bitmap Index Scan on lion_pdt_a
-               Index Cond: (a = 3)
-(10 rows)
+         Recheck Cond: ((a = 3) AND (b = 2))
+         ->  BitmapAnd
+               ->  Bitmap Index Scan on lion_pdt_a
+                     Index Cond: (a = 3)
+               ->  Bitmap Index Scan on lion_pdt_b
+                     Index Cond: (b = 2)
+(12 rows)
 
 SELECT lion_plans($$SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2 AND c = 'c1'$$);
                                      lion_plans                                      
@@ -289,18 +291,16 @@ SELECT lion_plans('SELECT n, count(*) FROM lion_pdt GROUP BY n');
 (8 rows)
 
 SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE n IS NULL');
-                 lion_plans                  
----------------------------------------------
+                  lion_plans                   
+-----------------------------------------------
  -- on:
  Custom Scan (LionCount)
    Lion Indexes: lion_pdt_n (n IS NULL)
  -- off:
  Aggregate
-   ->  Bitmap Heap Scan on lion_pdt
-         Recheck Cond: (n IS NULL)
-         ->  Bitmap Index Scan on lion_pdt_n
-               Index Cond: (n IS NULL)
-(9 rows)
+   ->  Index Scan using lion_pdt_n on lion_pdt
+         Index Cond: (n IS NULL)
+(7 rows)
 
 -- ---- shapes that must push down ----------------------------------------
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3');
@@ -581,7 +581,7 @@ SELECT * FROM lion_explain_norm('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GR
    Heap Blocks From Cache: 0
    Heap Blocks Past Cache Budget: 0
    Posting Sets Summed: 0
-   Directory Pages Read: 13
+   Directory Pages Read: 3
 (14 rows)
 
 -- a parameter in the HAVING, under a generic plan
@@ -1033,12 +1033,12 @@ SELECT lion_pd_counters('SELECT count(*) FROM lion_pdt WHERE a = 3');
  * snapshot - but each dirty BLOCK is fetched only once per query, because the
  * per-query visibility cache answers every later group from memory
  * (DESIGN.md §9), so the node makes one pass over the heap and not one per
- * group.  It is therefore pushed down here, and measurably should be: on a
- * 100k-row table in this state the node ran in 17.9 ms against the
- * sequential aggregate's 26.8 ms, and once the pages had become all-visible
- * again 8.0 ms against 18.4 ms (2026-09-21).  Before the cache, and before
- * the estimate stopped charging numgroups random reads per dirty page, this
- * was the case that had to lose.
+ * group.  Before the cache, and before the estimate stopped charging
+ * numgroups random reads per dirty page, this was the case that had to lose
+ * by far.  On the release build it is a tie - the node 14.8 ms of CPU, the
+ * sequential scan and hash aggregate 15.6 - which the model gives to the hash
+ * aggregate, priced below what hashing a row costs (DESIGN.md §10, "The
+ * units"); once the pages are all-visible again the node wins, and is chosen.
  */
 CREATE TABLE lion_pdd (g int NOT NULL, pad text NOT NULL);
 INSERT INTO lion_pdd
@@ -1046,9 +1046,9 @@ SELECT i % 1000, repeat('x', 200) FROM generate_series(1, 100000) i;
 CREATE INDEX lion_pdd_g ON lion_pdd USING lion (g);
 ANALYZE lion_pdd;			-- no VACUUM: relallvisible stays 0
 SELECT lion_pd('SELECT g, count(*) FROM lion_pdd GROUP BY g');
-        lion_pd         
-------------------------
- pushed down, 1000 rows
+          lion_pd           
+----------------------------
+ not pushed down, 1000 rows
 (1 row)
 
 -- and once it is all-visible there is nothing left to recheck at all
@@ -1435,16 +1435,18 @@ SELECT lion_plans('SELECT v, count(*) FROM lion_pdn GROUP BY v');
 
 RESET enable_sort;
 SELECT lion_plans('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
-                  lion_plans                   
------------------------------------------------
+                 lion_plans                  
+---------------------------------------------
  -- on:
  Custom Scan (LionCount)
    Lion Indexes: lion_pdn_v (v = 1.000)
  -- off:
  Aggregate
-   ->  Index Scan using lion_pdn_v on lion_pdn
-         Index Cond: (v = 1.000)
-(7 rows)
+   ->  Bitmap Heap Scan on lion_pdn
+         Recheck Cond: (v = 1.000)
+         ->  Bitmap Index Scan on lion_pdn_v
+               Index Cond: (v = 1.000)
+(9 rows)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
        lion_pd       
@@ -2390,12 +2392,23 @@ SELECT lion_plans('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP
                           lion_plans                           
 ---------------------------------------------------------------
  -- on:
- Finalize HashAggregate
+ HashAggregate
    Group Key: lion_pdpo.a
-   ->  Custom Scan (LionCount)
-         Partitions: lion_pdpo1, lion_pdpo2
-         Lion Indexes: (a), ((a = 17) OR (b = 3))
-         Group Key: a
+   ->  Append
+         ->  Bitmap Heap Scan on lion_pdpo1 lion_pdpo_1
+               Recheck Cond: ((a = 17) OR (b = 3))
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on lion_pdpo1_a_idx
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdpo1_b_idx
+                           Index Cond: (b = 3)
+         ->  Bitmap Heap Scan on lion_pdpo2 lion_pdpo_2
+               Recheck Cond: ((a = 17) OR (b = 3))
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on lion_pdpo2_a_idx
+                           Index Cond: (a = 17)
+                     ->  Bitmap Index Scan on lion_pdpo2_b_idx
+                           Index Cond: (b = 3)
  -- off:
  HashAggregate
    Group Key: lion_pdpo.a
@@ -2414,12 +2427,12 @@ SELECT lion_plans('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP
                            Index Cond: (a = 17)
                      ->  Bitmap Index Scan on lion_pdpo2_b_idx
                            Index Cond: (b = 3)
-(25 rows)
+(36 rows)
 
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP BY a');
-       lion_pd        
-----------------------
- pushed down, 11 rows
+         lion_pd          
+--------------------------
+ not pushed down, 11 rows
 (1 row)
 
 SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3;
@@ -2515,9 +2528,9 @@ SELECT lion_pd('SELECT a, n, count(a) FROM lion_pdt GROUP BY a, n');
 
 -- an OR restriction under a two-column grouping
 SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' OR n = 2 GROUP BY a, b$$);
-       lion_pd        
-----------------------
- pushed down, 35 rows
+         lion_pd          
+--------------------------
+ not pushed down, 35 rows
 (1 row)
 
 -- the results themselves

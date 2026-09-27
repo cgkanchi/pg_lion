@@ -614,7 +614,10 @@ SELECT count(*) AS keys_not_found FROM generate_series(0, 499) g
               0
 (1 row)
 
--- the groups come out in the OPCLASS's order, which is descending
+-- the groups come out in the OPCLASS's order, which is descending (the node
+-- is forced: 500 groups of 10 rows each are a sequential scan's to win, and
+-- this opclass's SQL comparison makes every entry of the walk dearer still)
+SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_rev GROUP BY k;
            QUERY PLAN           
 --------------------------------
@@ -649,6 +652,7 @@ EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_rev GROUP BY k ORDER BY k;
          Group Key: k
 (5 rows)
 
+RESET enable_seqscan;
 DROP TABLE lion_rev;
 -- A comparison that belongs to no btree family at all cannot drive a
 -- tuplesort, and an ordering the build cannot reproduce is no ordering: the
@@ -1139,6 +1143,7 @@ SELECT ordered FROM lion_index_stats('lion_oddx_k');
 
 SET pg_lion.enable_count_pushdown = off;
 SET enable_seqscan = off;
+SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_oddx WHERE k = 7::int8;
                   QUERY PLAN                  
 ----------------------------------------------
@@ -1164,7 +1169,6 @@ SELECT count(*) AS bitmap_many FROM lion_oddx
 
 RESET enable_seqscan;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
 SELECT count(*) AS expected_many FROM lion_oddx
 	WHERE k = ANY (ARRAY(SELECT ((i * 37) % 5000)::int8 FROM generate_series(1, 300) i));
  expected_many 

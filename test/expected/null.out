@@ -624,9 +624,9 @@ SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NULL');
 (1 row)
 
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NOT NULL');
-    lion_nullcmp     
----------------------
- pushed down, 1 rows
+    lion_nullcmp    
+--------------------
+ index scan, 1 rows
 (1 row)
 
 SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null_all GROUP BY k');

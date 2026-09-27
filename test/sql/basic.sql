@@ -78,10 +78,13 @@ BEGIN
 	RETURN format('ok %s rows', a.c);
 END $$;
 
--- The plan really is a bitmap index scan on the lion index.
+-- The plan really is a bitmap index scan on the lion index (plain index
+-- scans off: for a key of a few hundred rows one could be chosen, §29).
 SET enable_seqscan = off;
+SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c1000 = 42;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE t1000 = 'key 7';
+RESET enable_indexscan;
 RESET enable_seqscan;
 
 -- 2 distinct values: one bitset container per 64 heap blocks.

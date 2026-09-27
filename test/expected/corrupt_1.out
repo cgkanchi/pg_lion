@@ -133,6 +133,60 @@ SELECT lion_dc_poke('lion_dc_i', r.root,
 SELECT lion_dc_try('SELECT count(*) FROM lion_dc WHERE k = 5');
 SELECT lion_dc_try('INSERT INTO lion_dc VALUES (11)');
 DROP INDEX lion_dc_i;
+-- ---------- 4. a summary whose key is not its bucket's (DESIGN.md §32) ----------
+-- Buckets of 16 keys: the second summary is keyed 32 and holds the rows of
+-- keys 17 to 32.  Its key is rewritten to 24, which still sorts between its
+-- neighbours (a summary's hash is a constant, so nothing else changes), so
+-- the directory is in order and every entry is sound on its own - but the
+-- rows of keys 25 to 32 are now in the summary of a bucket that ends at 24,
+-- and missing from the next one.
+CREATE TABLE lion_dc_s (k int NOT NULL);
+INSERT INTO lion_dc_s SELECT i FROM generate_series(1, 400) i;
+CREATE INDEX lion_dc_s_i ON lion_dc_s USING lion (k)
+	WITH (summaries = on, summary_tids = 16);
+SELECT lion_index_verify('lion_dc_s_i', true);
+SELECT lion_dc_evict('lion_dc_s_i');
+-- A little-endian uint32 as four bytes.
+CREATE FUNCTION lion_dc_le32(v bigint) RETURNS bytea
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		0, (v & 255)::int), 1, ((v >> 8) & 255)::int),
+		2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
+$$;
+-- The block and byte offset of the summary of an int4 column keyed k: an
+-- item whose header (hash, flags, keylen at +0, +4, +6) is a SUMMARY entry's
+-- (flag 0x0080, hash 0) with an 8-byte key equal to k at +32.
+CREATE FUNCTION lion_dc_summary(idx regclass, k int, OUT blk bigint, OUT pos int)
+LANGUAGE plpgsql AS $$
+DECLARE
+	nblocks bigint := pg_relation_size(idx) / current_setting('block_size')::int;
+	page bytea;
+	off int;
+	p int;
+BEGIN
+	FOR b IN 1 .. nblocks - 1 LOOP
+		page := lion_dc_block(idx, b);
+		FOR off IN 1 .. ((lion_dc_u32(page, 12) & 65535) - 24) / 4 LOOP
+			p := lion_dc_item(page, off);
+			CONTINUE WHEN p < 24 OR p + 40 > length(page);
+			IF lion_dc_u32(page, p) = 0
+			   AND (lion_dc_u32(page, p + 4) & 128) <> 0
+			   AND (lion_dc_u32(page, p + 4) >> 16) = 8
+			   AND lion_dc_u32(page, p + 32) = k THEN
+				blk := b;
+				pos := p;
+				RETURN;
+			END IF;
+		END LOOP;
+	END LOOP;
+END $$;
+SELECT blk IS NOT NULL AS found FROM lion_dc_summary('lion_dc_s_i', 32);
+SELECT lion_dc_poke('lion_dc_s_i', s.blk, s.pos + 32, lion_dc_le32(24))
+  FROM lion_dc_summary('lion_dc_s_i', 32) s;
+SELECT lion_dc_try($$SELECT lion_index_verify('lion_dc_s_i', false)$$);
+DROP TABLE lion_dc_s;
+DROP FUNCTION lion_dc_summary(regclass, int);
+DROP FUNCTION lion_dc_le32(bigint);
 -- ---------- an undamaged index still works, and the rows are all there ----------
 CREATE INDEX lion_dc_i ON lion_dc USING lion (k);
 SELECT count(*) FROM lion_dc WHERE k = 5;

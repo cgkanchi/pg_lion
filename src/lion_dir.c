@@ -244,8 +244,14 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 	ikind = lion_entry_kind(item);
 	if (ikind != sk->kind)
 		return ikind < sk->kind ? -1 : 1;
-	if (ikind != LION_KIND_VALUE)
-		return 0;					/* one NULL and one EMPTY entry per column */
+
+	/*
+	 * One NULL, one EMPTY and one last SUMMARY entry per column: their kind is
+	 * their whole position.  VALUE and SUMMARY entries are ordered by their
+	 * keys (DESIGN.md §32: a summary's key is its bucket's upper bound).
+	 */
+	if (!LION_KIND_HAS_KEY(ikind))
+		return 0;
 
 	if (sk->cmpproc != NULL)
 	{
@@ -281,6 +287,15 @@ lion_cmp_entry(const LionEntryTuple *item, const LionSearchKey *sk)
 	 */
 	if (sk->raw == NULL)
 		return 1;
+
+	/*
+	 * The last summary of a column (DESIGN.md §32) keeps the largest key its
+	 * bucket holds, which an insert raises; that key is not a position, so two
+	 * of them are the same entry whatever their bytes - which is also what
+	 * lets a walk resume past it after its key has changed.
+	 */
+	if (sk->kind == LION_KIND_SUMLAST)
+		return 0;
 
 	n = Min((Size) item->keylen, sk->rawlen);
 	if (n > 0)
@@ -356,7 +371,7 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 		col = lion_column(ix, (AttrNumber) entry->attno);
 
 		lion_search_key_init(col, sk, kind,
-							 kind == LION_KIND_VALUE ?
+							 LION_KIND_HAS_KEY(kind) ?
 							 lion_fetch_key(col, LionEntryGetKey(entry)) :
 							 (Datum) 0,
 							 entry->hash);
@@ -630,6 +645,44 @@ restart:
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 	}
+}
+
+/*
+ * lion_dir_search() for a caller that wants the first ITEM at or after sk
+ * rather than the leaf that owns sk.  When the landing offset is past the
+ * leaf's last item, that item is on a leaf further right, and the walk steps
+ * there - finishing, as a writer, any split it steps over, because the page to
+ * the right of a flagged one has no downlink yet (DESIGN.md §21).  *offp is the
+ * item's offset, or past the last item of the rightmost leaf.  The summary
+ * insert of DESIGN.md §32 looks its bucket up this way: the first summary of
+ * the column whose key is at or above the row's.
+ */
+Buffer
+lion_dir_search_first(Relation index, Relation heaprel, LionIndexState *ix,
+					  const LionSearchKey *sk, int lockmode, bool forwrite,
+					  OffsetNumber *offp)
+{
+	OffsetNumber off;
+	Buffer		buf = lion_dir_search(index, heaprel, ix, sk, lockmode,
+									  forwrite, &off);
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+
+		if (off <= PageGetMaxOffsetNumber(page) || LionPageIsRightmost(page))
+			break;
+		if (forwrite && LionPageIncompleteSplit(page))
+		{
+			lion_dir_finish_split(index, heaprel, ix, buf);
+			continue;
+		}
+		buf = lion_dir_step_right(index, buf, lockmode);
+		off = lion_page_first_data(BufferGetPage(buf));
+	}
+
+	*offp = off;
+	return buf;
 }
 
 /*
@@ -976,6 +1029,103 @@ lion_dir_column_first(Relation index, LionState *col, OffsetNumber *offp)
 	return blk;
 }
 
+/*
+ * The leaf where one key column's run of VALUE entries BEGINS, share-locked,
+ * for the planner's endpoint probe (DESIGN.md §28, lion_selfuncs.c), with
+ * *offp the column's first VALUE entry on it, or the leaf's maxoff + 1.
+ *
+ * The search key is (attno, VALUE) with no key, no comparison and no stored
+ * form: the column's reserved entries sort below it on the kind, and every
+ * VALUE entry above it - each ties with it up to the hash or the stored form,
+ * which a search key without one loses (lion_cmp_entry()).
+ */
+Buffer
+lion_dir_value_start(Relation index, LionState *col, OffsetNumber *offp)
+{
+	LionSearchKey sk;
+
+	lion_search_key_init(col, &sk, LION_KIND_VALUE, (Datum) 0, 0);
+	sk.cmpproc = NULL;
+
+	return lion_dir_search(index, NULL, col->ix, &sk, BUFFER_LOCK_SHARE, false,
+						   offp);
+}
+
+/*
+ * The leaf where one key column's run of VALUE entries ENDS, share-locked,
+ * for the planner's endpoint probe (DESIGN.md §28, lion_selfuncs.c).
+ *
+ * The search key is the column's (attno, first kind after VALUE), with no
+ * comparison and no stored form: every VALUE entry of the column sorts below
+ * it on the kind alone, and every entry of a later kind of the column, or of
+ * a later column, above it - a later kind with a key ties on the prefix and
+ * then sorts above a search key without a stored form, as any run does
+ * (lion_cmp_entry()).  So *offp is the first item past the VALUE run on the
+ * leaf, or the leaf's maxoff + 1; the column's last VALUE entry is the item
+ * before it, or on a leaf to the left when it is the leaf's first data item
+ * (lion_dir_step_left()).
+ */
+Buffer
+lion_dir_value_end(Relation index, LionState *col, OffsetNumber *offp)
+{
+	LionSearchKey sk;
+
+	lion_search_key_init(col, &sk, LION_KIND_VALUE + 1, (Datum) 0, 0);
+	sk.cmpproc = NULL;
+
+	return lion_dir_search(index, NULL, col->ix, &sk, BUFFER_LOCK_SHARE, false,
+						   offp);
+}
+
+/*
+ * Move from a directory page to its LEFT sibling, share-locked, releasing the
+ * page we came from first; InvalidBuffer at the leftmost page of the level,
+ * or when the sibling could not be found in `maxsteps` pages.
+ *
+ * The left link names the page that was left of this one when it was last
+ * set, and that page may have split since: a split only moves entries right,
+ * onto a new page linked immediately right of the one it splits, and no
+ * directory page is ever unlinked (DESIGN.md §21), so the page now left of
+ * this one is reached by walking right from the one the link names until a
+ * page's right link is this page - nbtree's _bt_walk_left() without page
+ * deletion.  The walk is bounded because its caller only estimates and can
+ * give up; nothing is held between the two pages, as in lion_dir_step_right().
+ */
+Buffer
+lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
+{
+	Page		page = BufferGetPage(buf);
+	BlockNumber cur = BufferGetBlockNumber(buf);
+	BlockNumber left = LionPageGetOpaque(page)->leftlink;
+	int			level = LionPageGetOpaque(page)->level;
+	Buffer		lbuf;
+	int			steps;
+
+	UnlockReleaseBuffer(buf);
+	if (!BlockNumberIsValid(left) || left == cur)
+		return InvalidBuffer;
+
+	CHECK_FOR_INTERRUPTS();
+	lbuf = lion_dir_readbuf(index, left);
+	LockBuffer(lbuf, BUFFER_LOCK_SHARE);
+	lion_dir_check_page(index, BufferGetPage(lbuf), left);
+	lion_dir_check_level(index, BufferGetPage(lbuf), left, level);
+
+	for (steps = 0;; steps++)
+	{
+		Page		lpage = BufferGetPage(lbuf);
+
+		if (LionPageGetOpaque(lpage)->rightlink == cur)
+			return lbuf;
+		if (LionPageIsRightmost(lpage) || steps >= maxsteps)
+			break;
+		lbuf = lion_dir_step_right(index, lbuf, BUFFER_LOCK_SHARE);
+	}
+
+	UnlockReleaseBuffer(lbuf);
+	return InvalidBuffer;
+}
+
 /* ---------------------------------------------------------------------
  * Placing items
  * --------------------------------------------------------------------- */
@@ -996,7 +1146,7 @@ lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 	p->hash = (src != NULL) ? src->hash : 0;
 	p->flags = pivotflag |
 		(uint16) ((src != NULL) ?
-				  (src->flags & (LION_ENTRY_RESERVED | LION_ENTRY_MINUSINF)) :
+				  (src->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF)) :
 				  LION_ENTRY_MINUSINF);
 	p->keylen = (uint16) keylen;
 	p->head = child;

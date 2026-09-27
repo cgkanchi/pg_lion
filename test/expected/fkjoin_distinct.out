@@ -1,0 +1,663 @@
+-- FK-side join pushdown, part three (DESIGN.md §27, "count(DISTINCT)"):
+-- count(DISTINCT x) over the join, where x is the fact's join column or a
+-- column of the dimension.
+--
+-- A DISTINCT count has no partial form, so the node emits the dimension rows
+-- that join - one each, however many fact rows each joins, or for an anti
+-- join the ones that join none - and core's own Agg, over a Sort by the
+-- query's group pathkeys, computes the aggregates.  Every answer is checked
+-- against the same query with the pushdown off, as a multiset in both
+-- directions.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+/*
+ * lion_dj() runs a query through the pushdown - with every join method
+ * disabled when force is set, so that a shape the cost model would not pick
+ * is still EXERCISED - and again with the pushdown off and the planner left
+ * alone, and compares the two.  It reports whether the node was used.
+ */
+CREATE FUNCTION lion_dj(q text, force boolean DEFAULT true) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	IF force THEN
+		PERFORM set_config('enable_hashjoin', 'off', true);
+		PERFORM set_config('enable_mergejoin', 'off', true);
+		PERFORM set_config('enable_nestloop', 'off', true);
+	END IF;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_dj_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	/* the reference: the ordinary plan, with the pushdown off */
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_dj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_dj_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_dj_on EXCEPT ALL SELECT * FROM lion_dj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_dj_off EXCEPT ALL SELECT * FROM lion_dj_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_dj_on, lion_dj_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+/* The answer itself, through the pushdown, joins disabled. */
+CREATE FUNCTION lion_dj_val(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	RETURN QUERY EXECUTE format('SELECT s::text FROM (%s) s', q);
+END $$;
+/* Which plan the cost model picks, with nothing disabled. */
+CREATE FUNCTION lion_dj_pick(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN 'pushed down';
+		END IF;
+	END LOOP;
+	RETURN 'not pushed down';
+END $$;
+/* A generic prepared plan, which keeps $n a Param, against the same with the pushdown off. */
+CREATE FUNCTION lion_dj_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_djp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_djp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_dj_on AS EXECUTE lion_djp_on(%s)', args);
+
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE lion_djp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_dj_off AS EXECUTE lion_djp_off(%s)', args);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_djp_on';
+	EXECUTE 'DEALLOCATE lion_djp_off';
+
+	EXECUTE 'SELECT count(*) FROM lion_dj_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_dj_on EXCEPT ALL SELECT * FROM lion_dj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_dj_off EXCEPT ALL SELECT * FROM lion_dj_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_dj_on, lion_dj_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_dj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+/*
+ * The dimension: 300 rows, int8 primary key 1..300, attr 0..6 with NULL on
+ * every 13th, a region and a group, and a lion index on (region, grp).  The
+ * fact: 30000 rows in random key order; fk over 1..360, so keys 301..360
+ * join no dimension row, NULL on every 40th row, and no row at all for the
+ * keys that are multiples of 17, so those dimension rows join no fact row.
+ * fk4 is fk as int4; x has 10 values, y 5 and NULLs, t 20.
+ */
+CREATE TABLE lion_dd (
+	pk		int8	PRIMARY KEY,
+	attr	int,
+	region	text	NOT NULL,
+	grp		text	NOT NULL
+);
+INSERT INTO lion_dd
+SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
+	   CASE i % 3 WHEN 0 THEN 'eu' WHEN 1 THEN 'us' ELSE 'ap' END,
+	   'g' || (i % 5)
+FROM generate_series(1, 300) i;
+CREATE INDEX lion_dd_rg ON lion_dd USING lion (region, grp);
+CREATE TABLE lion_df (
+	id		int		NOT NULL,
+	fk		int8,
+	fk4		int4,
+	x		int		NOT NULL,
+	y		int,
+	t		text	NOT NULL
+);
+INSERT INTO lion_df
+SELECT i, k, k, h2 % 10, CASE WHEN h2 % 9 = 0 THEN NULL ELSE h2 / 10 % 5 END,
+	   't' || (h3 % 20)
+FROM (SELECT i,
+			 CASE WHEN i % 40 = 0 THEN NULL
+				  WHEN (abs(hashint4(i)) % 360 + 1) % 17 = 0 THEN NULL
+				  ELSE abs(hashint4(i)) % 360 + 1 END AS k,
+			 abs(hashint4(i + 1000000)) AS h2,
+			 abs(hashint4(i + 2000000)) AS h3
+	  FROM generate_series(1, 30000) i) s;
+CREATE INDEX lion_df_fk ON lion_df USING lion (fk);
+CREATE INDEX lion_df_fk4 ON lion_df USING lion (fk4);
+CREATE INDEX lion_df_x ON lion_df USING lion (x);
+CREATE INDEX lion_df_yt ON lion_df USING lion (y, t);
+-- a dimension whose key is NOT unique: every key twice, and NULLs
+CREATE TABLE lion_ddn (k int8, attr int NOT NULL);
+INSERT INTO lion_ddn SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE i % 150 + 1 END, i % 4
+FROM generate_series(1, 300) i;
+CREATE INDEX lion_ddn_k ON lion_ddn (k);
+-- a text key: 200 codes, and facts over 240 of them
+CREATE TABLE lion_dt (code text PRIMARY KEY, grp text NOT NULL);
+INSERT INTO lion_dt SELECT 'c' || i, 'g' || (i % 4) FROM generate_series(1, 200) i;
+CREATE TABLE lion_dtf (code text, x int NOT NULL);
+INSERT INTO lion_dtf
+SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE 'c' || (abs(hashint4(i)) % 240 + 1) END,
+	   abs(hashint4(i + 1000000)) % 10
+FROM generate_series(1, 10000) i;
+CREATE INDEX lion_dtf_code ON lion_dtf USING lion (code);
+CREATE INDEX lion_dtf_x ON lion_dtf USING lion (x);
+VACUUM ANALYZE lion_df;
+VACUUM ANALYZE lion_dd;
+VACUUM ANALYZE lion_ddn;
+VACUUM ANALYZE lion_dt;
+VACUUM ANALYZE lion_dtf;
+-- ---- 1. count(DISTINCT fact.fk) over the inner join ----------------------------
+-- the fact rows' keys that have a qualifying dimension row: the dimension rows
+-- that join, one each
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND d.region = ''eu''');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t IN (''t1'', ''t2'') AND f.y IS NOT NULL');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE (f.x = 1 OR f.t = ''t4'') AND d.grp <> ''g2''');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj_val('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk');
+ lion_dj_val 
+-------------
+ (283)
+(1 row)
+
+-- the EXISTS and IN forms over the unique key are the same inner join
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_dd d WHERE d.pk = f.fk AND d.region = ''eu'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f WHERE f.x = 3 AND f.fk IN (SELECT d.pk FROM lion_dd d WHERE d.region = ''us'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- grouped by dimension columns, HAVING, ORDER BY, LIMIT
+SELECT lion_dj('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.region, d.grp, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.y = 1 GROUP BY d.region, d.grp');
+       lion_dj        
+----------------------
+ pushed down, 15 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.attr, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t3'' GROUP BY d.attr HAVING count(DISTINCT f.fk) > 5');
+       lion_dj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_dj('SELECT upper(d.grp), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 2 GROUP BY upper(d.grp) ORDER BY 2 DESC, 1 LIMIT 3');
+       lion_dj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- a GROUP BY the planner folds to a constant: an empty join has no group
+SELECT lion_dj('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND d.region = ''eu'' GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND d.region = ''mars'' GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 0 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 77 AND d.region = ''eu'' GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 0 rows
+(1 row)
+
+-- ungrouped over nothing: one row, zero
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 77');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj_val('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 77');
+ lion_dj_val 
+-------------
+ (0)
+(1 row)
+
+-- a text key under the join's collation
+SELECT lion_dj('SELECT count(DISTINCT f.code) FROM lion_dtf f JOIN lion_dt d ON d.code = f.code WHERE f.x = 3');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.grp, count(DISTINCT f.code) FROM lion_dtf f JOIN lion_dt d ON d.code = f.code WHERE f.x IN (1, 2) GROUP BY d.grp');
+       lion_dj       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+-- ---- 2. count(DISTINCT) of a dimension column ---------------------------------
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND f.t = ''t5''');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.pk), count(DISTINCT d.grp) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND f.y = 2');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.region, count(DISTINCT d.attr), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t9'' GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- the reverse semi join: dimension rows with a matching fact row
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t5'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.grp, count(DISTINCT d.attr) FROM lion_dd d WHERE d.pk IN (SELECT f.fk FROM lion_df f WHERE f.y = 4) GROUP BY d.grp');
+       lion_dj       
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.region) FROM lion_dd d WHERE d.grp = ''g1'' AND EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t19'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- ... and the anti join: dimension rows with none
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t5'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.region, count(DISTINCT d.grp) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk) GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.pk) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 77)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- duplicated and NULL dimension keys: each dimension row is tested on its own,
+-- a NULL key has no match and is a row of the anti join
+CREATE INDEX lion_ddn_kl ON lion_ddn USING lion (k);
+ANALYZE lion_ddn;
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_ddn d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.k AND f.x = 2 AND f.t = ''t1'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.k), count(DISTINCT d.attr) FROM lion_ddn d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.k AND f.x = 2 AND f.t = ''t1'')');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.attr, count(DISTINCT d.k) FROM lion_ddn d WHERE d.k IN (SELECT f.fk FROM lion_df f WHERE f.t = ''t11'') GROUP BY d.attr');
+       lion_dj       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+-- ---- 3. declined ---------------------------------------------------------------
+-- the key is not unique: the inner join counts a fact row once per duplicate
+-- and is declined, while the forward EXISTS stays a semi join whose inner side
+-- is the dimension, counted over its distinct keys (fkjoin_nonunique.sql)
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_ddn d ON d.k = f.fk WHERE f.x = 3');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ddn d WHERE d.k = f.fk AND d.attr = 1)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+DROP INDEX lion_ddn_kl;
+-- a count of rows beside a count of distinct values: the rows stand for
+-- dimension rows, not for pairs
+SELECT lion_dj('SELECT count(*), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(*), count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a fact column that is not the join key
+SELECT lion_dj('SELECT count(DISTINCT f.x) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t3''');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT f.fk4) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t3''');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- the join column in another type from the key (int4 against int8): the key
+-- cannot stand where the fact's column does
+SELECT lion_dj('SELECT count(DISTINCT f.fk4) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk4 WHERE f.t = ''t3''');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ... though a dimension column over that join can
+SELECT lion_dj('SELECT count(DISTINCT d.grp) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk4 WHERE f.t = ''t3''');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- a DISTINCT under a collation other than the join's
+SELECT lion_dj('SELECT count(DISTINCT f.code COLLATE "C") FROM lion_dtf f JOIN lion_dt d ON d.code = f.code WHERE f.x = 3');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- an expression over a column, not the column
+SELECT lion_dj('SELECT count(DISTINCT d.pk + 0) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- FILTER, ORDER BY inside the aggregate, another aggregate
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FILTER (WHERE d.grp = ''g1'') FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT string_agg(DISTINCT d.grp, '','' ORDER BY d.grp) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT sum(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+         lion_dj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ---- 4. the plan ----------------------------------------------------------------
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+-- the rows are sorted by the DISTINCT argument, which core then presorts
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND d.region = 'eu';
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate
+   ->  Sort
+         Sort Key: fk
+         ->  Custom Scan (LionCount)
+               Lion Indexes: lion_df_fk (fk = d.pk), lion_df_x (x = 3)
+               Join Rows: the dimension rows with a match
+               ->  Seq Scan on lion_dd d
+                     Filter: (region = 'eu'::text)
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT d.grp, count(DISTINCT d.attr) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3) GROUP BY d.grp;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ GroupAggregate
+   Group Key: d.grp
+   ->  Sort
+         Sort Key: d.grp, d.attr
+         ->  Custom Scan (LionCount)
+               Lion Indexes: lion_df_fk (fk = d.pk), lion_df_x (x = 3)
+               Join Type: Anti
+               Join Rows: the dimension rows without a match
+               ->  Seq Scan on lion_dd d
+(9 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+-- an inner join's rows need a visible fact row, not a count of them: the
+-- existence test stops early, as the semi join's does
+SELECT lion_dj_counter('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk', 'Containers Visited')
+	< lion_dj_counter('SELECT count(*) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk', 'Containers Visited') AS rows_test_existence;
+ rows_test_existence 
+---------------------
+ t
+(1 row)
+
+SELECT lion_dj_counter('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3', 'Join Keys Looked Up');
+ lion_dj_counter 
+-----------------
+             300
+(1 row)
+
+-- the cost model's choice
+SELECT lion_dj_pick('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+  lion_dj_pick   
+-----------------
+ not pushed down
+(1 row)
+
+SELECT lion_dj_pick('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND f.t = ''t4'' GROUP BY d.region');
+  lion_dj_pick   
+-----------------
+ not pushed down
+(1 row)
+
+-- ---- 5. parameters and rescans ----------------------------------------------
+SELECT lion_dj_prep('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE d.region = $2 AND EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = $1)', '3, ''eu''');
+    lion_dj_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj_prep('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = $1', '''t8''');
+    lion_dj_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj_prep('SELECT count(DISTINCT d.grp) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = $1)', 'NULL');
+    lion_dj_prep     
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT g, (SELECT count(DISTINCT d.grp) FROM lion_dd d WHERE d.attr = g.g AND EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 2)) FROM generate_series(0, 7) g');
+       lion_dj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_dj('SELECT g, (SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = g.g AND f.t = ''t1'') FROM generate_series(0, 10) g');
+       lion_dj        
+----------------------
+ pushed down, 11 rows
+(1 row)
+
+-- ---- 6. a dirty heap: deletes and updates on both sides, not yet vacuumed -----
+DELETE FROM lion_df WHERE fk = 7;
+DELETE FROM lion_df WHERE fk = 8 AND x < 5;
+UPDATE lion_df SET fk = 9, fk4 = 9 WHERE fk = 10 AND x = 1;
+UPDATE lion_df SET x = 3 WHERE id % 97 = 0;
+UPDATE lion_df SET fk = NULL, fk4 = NULL WHERE fk = 11;
+INSERT INTO lion_df SELECT 30000 + i, 34, 34, 3, 1, 't5' FROM generate_series(1, 5) i;
+DELETE FROM lion_dd WHERE pk = 12;
+UPDATE lion_dd SET region = 'eu', attr = 6 WHERE pk IN (1, 2, 4);
+UPDATE lion_dd SET attr = NULL WHERE pk = 5;
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.region');
+       lion_dj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.pk) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj_counter('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3', 'Heap TIDs Rechecked') > 0 AS dirty_heap_rechecks;
+ dirty_heap_rechecks 
+---------------------
+ t
+(1 row)
+
+VACUUM lion_df;
+VACUUM lion_dd;
+SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(DISTINCT d.pk) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+DROP TABLE lion_df, lion_dd, lion_ddn, lion_dt, lion_dtf;
+DROP FUNCTION lion_dj(text, boolean);
+DROP FUNCTION lion_dj_val(text);
+DROP FUNCTION lion_dj_pick(text);
+DROP FUNCTION lion_dj_prep(text, text);
+DROP FUNCTION lion_dj_counter(text, text);

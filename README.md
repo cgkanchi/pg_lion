@@ -40,7 +40,8 @@ estimate that benefit; dirty pages require visibility checks in the heap.
 | --- | --- |
 | Count many matches, combine equality filters, or count groups | Consider Lion on the columns used by these queries. The largest measured gains come from `LionCount` pushdown. |
 | Fetch a handful of rows, or count a very selective key | B-tree is a strong default. The latest run shows practical parity for tiny equality counts and no consistent heap-fetch advantage from Lion. |
-| Count matches within a scalar range | Consider Lion count pushdown: the measured clean range count beats B-tree at both scales. Fetching matching rows has different costs. |
+| Count matches within a scalar range | Consider Lion count pushdown when the column has few distinct values (days, statuses, small integers): the measured clean range count beats B-tree at both scales. Fetching matching rows has different costs. |
+| Range filters on high-cardinality columns (timestamps, ids, prices) | Build the index `WITH (summaries = auto)` (or `on`). Without it a range is answered one distinct key at a time, so its cost grows with the number of distinct values in the range (or outside it, whichever is smaller), and a time window over a timestamp column is slow. With it the column keeps one summary posting set per bucket of about 4096 rows, and a range counts whole buckets at once: a million-key range went from 346 ms to 3.9 ms on an assert build (DESIGN.md §32). Summaries cost inserts CPU - 31% more for single-row INSERTs and 73% for a bulk INSERT in that measurement, with two of the index's three columns summarized - and a few percent of index size. |
 | Ordered retrieval or uniqueness | Keep B-tree. Lion supplies bitmap and plain index scans and count pushdown, not ordered row retrieval or unique indexes. |
 | Array membership or exact-lexeme counts | Consider Lion when counts dominate; compare against GIN on your predicates and result sizes. |
 | Full-text phrase/prefix search, or searches returning documents | Prefer GIN for the measured phrase/prefix cases; ordinary document fetching shows no clear Lion advantage. |
@@ -138,6 +139,43 @@ fetches heap tuples and does not have the same count shortcut. Normal SQL is suf
 `lion_index_count()` calls are optional. Use `lion_index_stats('events_country_lion')` to inspect
 storage and `lion_index_verify('events_country_lion', heapallindexed => true)` for verification.
 
+A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
+fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
+side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for
+each dimension row the node looks the key up in the fact's FK index and counts, or for `EXISTS` tests,
+that key's rows ANDed with the fact filters, which it collects once for the whole scan:
+
+```sql
+CREATE INDEX orders_customer_lion ON orders USING lion (customer_id);
+CREATE INDEX orders_status_lion ON orders USING lion (status);
+
+-- orders of the matching customers (also as a JOIN, or with customer_id IN (...))
+SELECT count(*) FROM orders o
+WHERE o.status = 'open'
+  AND EXISTS (SELECT 1 FROM customers cu WHERE cu.id = o.customer_id AND cu.country = 'NZ');
+
+-- customers with at least one matching order (NOT EXISTS: with none)
+SELECT count(*) FROM customers cu
+WHERE cu.country = 'NZ'
+  AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = cu.id AND o.status = 'open');
+```
+
+Written as a JOIN, the first form needs `customers.id` unique (a primary key). As `EXISTS` or `IN`
+it does not: over a key that repeats - `o.customer_id IN (SELECT customer_id FROM visits WHERE
+...)` - the node sorts the subquery's keys and counts each distinct key's orders once (DESIGN.md
+§27; five million fact rows against 9,776 rows over 8,848 distinct keys took 117 ms, against 585
+for the hash semi join, on an assert build). The JOIN and the second form may group by the
+dimension's columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of
+`count(*)` is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate
+counts their distinct values. The node pays a lookup per dimension row (per distinct key), so the
+cost model leaves a large dimension set to the hash join. With parallel query enabled
+(`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
+dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
+once per process into memory bounded like a hash join's (`work_mem` × `hash_mem_multiplier`); past
+that the node reads them per dimension row instead. Their values may be parameters and stable
+expressions as for a single table, an `IN` list whose array is a parameter (`o.status = ANY ($1)`)
+included: every process evaluates them once per scan.
+
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
 ```sql
@@ -204,7 +242,7 @@ expressions as the table's owner (DESIGN.md §7).
     src/lion_funcs.c        lion_index_stats(), lion_index_verify() and the other diagnostics
     src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
     src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
-    src/lion_fkjoin.[ch]    the FK-side join a LionCount answers (GROUP BY dim.attr over a fact table)
+    src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS)
     src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered, btree-ordered scans
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit, test/recovery, test/modules
@@ -237,6 +275,18 @@ express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*
 back to scanning every indexed row and rechecking it if the Lion index is used. The planner may
 choose a sequential scan instead; GIN wins the measured phrase/prefix cases below.
 
+A literal query is only pushed down when it is exact. A query the count only sees at run time - a
+prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a stable expression
+(`tsv @@ to_tsquery(current_setting('app.q'))`) - is pushed down whatever it turns out to be
+(DESIGN.md §17): exactly when the key sets answer it; from a superset of its rows, each rechecked in
+the heap, when they do not (`@>` with a NULL element counts the other elements' rows, a phrase the
+rows with all of its lexemes, `a & !b` the rows with `a`); and when no key narrows it at all (`@>
+'{}'`, `!a`, `foo:*`), by rechecking the rows the other clauses select, or every row by a
+sequential scan when there is no other clause. `EXPLAIN ANALYZE` reports the rows the recheck
+turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is priced as the case
+that rechecks the most, so a lone `tags @> $1` in a generic plan usually goes to the ordinary plan
+and a custom plan of the literal to the pushdown. Such a query is not taken under an `OR`.
+
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
@@ -248,6 +298,16 @@ rejects a row.  For a multi-key column the keys are the extracted elements or le
 moves out of its entry tuple onto container pages of its own.
 `buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
 index key, and it grows by splitting instead of being sized once.
+`summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §32).
+With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
+consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their
+keys; `auto` gives them only to the columns whose keys are small next to a bucket (many distinct
+values), which is where ranges are slow.  Every insert into a summarized column also updates its
+bucket's set.  `summary_tids` (16 .. 16777216, default 4096) is the rows a bucket closes at.  Both
+are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at the next REINDEX.
+An index with summaries is format 7, which an older build refuses; one without is format 6, as
+before.  A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
+g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
@@ -289,8 +349,13 @@ that return a column (only those that need none, like `count(*)`), no INCLUDE co
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
-[write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants and parameters,
-a `GROUP BY` of one or two indexed columns, and a `HAVING` over the counts it computes (a `HAVING`
+[write costs](#writes-and-maintenance-5m-rows) below. Count pushdown supports constants, parameters
+and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
+per execution; a volatile one like `random()` goes to the ordinary plan) on any indexed column, enum
+columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
+NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
+(`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
+clauses in all), a `GROUP BY` of one or two indexed columns, and a `HAVING` over the counts it computes (a `HAVING`
 with a correlated subquery, or a `GROUP BY` of three or more columns, goes to the ordinary plan). `IN` lists of more than 1000
 values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a
 sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the

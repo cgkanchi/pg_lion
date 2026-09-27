@@ -12,7 +12,9 @@
 #ifndef LION_COUNT_H
 #define LION_COUNT_H
 
+#include "access/htup.h"
 #include "access/skey.h"
+#include "fmgr.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/planner.h"
 #include "storage/buf.h"
@@ -87,6 +89,14 @@ typedef struct LionCountStats
 	 * clause and an IN list ANDed with something else still do.
 	 */
 	int64		sets_summed;
+
+	/*
+	 * Candidate rows the snapshot sees that a row filter (LionRowFilter
+	 * below) turned away: rows of a superset the posting sets answered for a
+	 * multi-key query they could not answer exactly (DESIGN.md §17).  Zero
+	 * whenever no count had a filter.
+	 */
+	int64		rows_removed;
 } LionCountStats;
 
 /*
@@ -112,6 +122,66 @@ typedef struct LionVisCache LionVisCache;
 extern LionVisCache *lion_vis_cache_create(MemoryContext parent);
 extern void lion_vis_cache_reset(LionVisCache *cache);
 extern void lion_vis_cache_destroy(LionVisCache *cache);
+
+/*
+ * A test every row a count counts has to pass as well, made on the heap tuple
+ * the snapshot sees (DESIGN.md §17, "A query known only at run time").  The
+ * count pushdown sets one while a multi-key clause whose query it only had at
+ * run time - a generic plan's parameter, a stable expression - came out as one
+ * the posting sets cannot answer exactly: its sources are then a SUPERSET of
+ * the rows (or, for a query no key narrows at all, the other clauses' rows
+ * alone), and each clause is tested here instead.
+ *
+ * Each clause is `column op value`, the column on the left, of a strict
+ * operator: a NULL column fails it, and so does a NULL result.  notnull makes
+ * a clause the test `column IS NOT NULL` alone, which is all the heap-scan
+ * fallback (lion_count_heap_filtered()) needs besides.  attno is the heap
+ * column in the numbering of `heap`, the relation being counted - a
+ * partition's own (DESIGN.md §16).
+ */
+typedef struct LionRowFilterClause
+{
+	AttrNumber	attno;
+	bool		notnull;
+	FmgrInfo	flinfo;			/* the operator's function */
+	Oid			collation;
+	Datum		value;
+} LionRowFilterClause;
+
+typedef struct LionRowFilter
+{
+	Relation	heap;
+	int			nclauses;
+	LionRowFilterClause *clauses;
+	MemoryContext tmpcxt;		/* one row's evaluation, reset after it */
+} LionRowFilter;
+
+/*
+ * Every count that is handed `cache` afterwards (lion_count_sources_cached(),
+ * lion_exists_sources_cached()) sends each candidate TID to the heap - the
+ * visibility map vouches for visibility, not for the filter - and counts the
+ * row the snapshot sees only when it passes `filter`.  NULL removes it.  The
+ * cache is the handle the count node already gives every count of one
+ * execution; lion_vis_cache_reset() leaves the filter where it is, and a
+ * count of another relation than filter->heap is an error.  A collection
+ * (lion_sources_collect()) is never filtered: the superset it copies is
+ * filtered when it is counted.
+ */
+extern void lion_vis_cache_set_filter(LionVisCache *cache,
+									  LionRowFilter *filter);
+
+/* Does the row pass?  tuple is a heap tuple of filter->heap. */
+extern bool lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple);
+
+/*
+ * The rows of `heap` visible to snapshot that pass filter, by a sequential
+ * scan: what the count pushdown falls back to when a filtered clause was its
+ * only source and there is no candidate set to recheck (DESIGN.md §17).  The
+ * rows scanned are counted as rechecked in stats.
+ */
+extern int64 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
+									  LionRowFilter *filter,
+									  LionCountStats *stats);
 
 /*
  * A located posting set: everything the counting code needs in order to
@@ -255,6 +325,18 @@ typedef struct LionCountSource
 	 * not multi-key) before acting on it.
 	 */
 	bool		disjoint;
+
+	/*
+	 * A RANGE on a column that does not drive the count, taken as a source
+	 * (DESIGN.md §32, "A range as a source") that was too large to collect
+	 * into memory: the rows whose key lies in the range, which the caller
+	 * counts as the SUM over the sets a walk of the range hands out - disjoint
+	 * entries and summaries of one scalar column - each ANDed with the other
+	 * sources in its place.  The count functions below never take one; the
+	 * count pushdown, which defines the structure, expands it before it calls
+	 * them (lion_node_count()).
+	 */
+	struct LionRangeSource *rangewalk;
 } LionCountSource;
 
 /*
@@ -329,6 +411,13 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 	return lion_posting_set_lookup_many_col(index, 1, keytype, nvalues, values,
 										   isnull, sets, nfound);
 }
+
+/*
+ * The posting set of the entry at (buf, off) of a leaf the caller holds
+ * locked; an INLINE set takes a pin of its own on the leaf.
+ */
+extern void lion_posting_set_at(Relation index, LionState *state, Buffer buf,
+								OffsetNumber off, LionPostingSet *ps);
 
 /* Drop whatever pin/memory the posting set holds.  Idempotent. */
 extern void lion_posting_set_release(LionPostingSet *ps);
@@ -439,6 +528,34 @@ extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
 									   LionCountStats *stats,
 									   LionVisCache *cache,
 									   bool rel_read_only);
+
+/*
+ * The members of the same intersection, copied into a private, pinless
+ * posting set instead of counted (DESIGN.md §27): what a caller that
+ * intersects one fixed set of sources with many located sets in turn builds
+ * once.  Nothing is checked against the visibility map or the heap, so the
+ * copy may only ever be counted beside a located set that carries the §9
+ * interlock.  False when it would take more than maxbytes.
+ */
+extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
+								 int nsources, LionCountSource *sources,
+								 Size maxbytes, LionPostingSet *out,
+								 LionCountStats *stats);
+
+/*
+ * The rows of one range over key column `attno` of index - every set a walk of
+ * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
+ * private, pinless posting set: their union, copied into memory.  Like a
+ * collected intersection it may only ever be counted beside a located set that
+ * carries the §9 interlock.  False, with nothing allocated, when the copy
+ * would take more than maxbytes.  *held is what the copy takes, and *nsets
+ * and *nsummaries say what the walk read.
+ */
+struct LionRange;
+extern bool lion_range_collect(Relation index, AttrNumber attno,
+							   struct LionRange *range, Size maxbytes,
+							   LionPostingSet *out, Size *held, int64 *nsets,
+							   int64 *nsummaries);
 
 /*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and
@@ -566,6 +683,8 @@ typedef struct LionRangeBound
  *			every entry of the column, which is correct and linear.
  *	lower	the lower bound the walk descends to, or -1 for none: the walk
  *			then starts where the column does.
+ *	upper	the upper bound a walk of what lies ABOVE the range descends to
+ *			when it is the only one (nupper == 1), or -1.
  *	empty	a bound is NULL, so nothing can satisfy the range.
  *
  * The bound values are the caller's and must outlive the range.
@@ -578,6 +697,8 @@ typedef struct LionRange
 	LionRangeBound *bounds;
 	bool		ordered;
 	int			lower;
+	int			upper;
+	int			nupper;
 	bool		empty;
 } LionRange;
 
@@ -592,6 +713,8 @@ extern void lion_range_add(LionRange *range, Relation index,
 						   StrategyNumber strategy, Oid opfuncid, Oid valtype,
 						   Datum value, bool isnull, Oid collation);
 extern int	lion_range_test(LionRange *range, const LionEntryTuple *entry);
+extern bool lion_range_fails_upper(LionRange *range,
+								   const LionEntryTuple *entry);
 extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
 
 /* ---------------------------------------------------------------------
@@ -603,11 +726,20 @@ extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
  * links (DESIGN.md §21).  For an ordered opclass the entries therefore come
  * out in key order, which is what lets the count pushdown claim pathkeys.
  *
- * The scan gives up its lock between two entries, and the position it comes
- * back to is a KEY and not an offset: a sorted directory inserts in the
- * middle of a leaf and splits it, so offsets are not stable the way they were
- * on a bucket page.  Resuming at "the first key above the last one returned"
- * is stable under both, and under the entry deletion of §18.
+ * The scan reads each leaf ONCE: it copies the entries it selects from the
+ * leaf into a private batch under one share lock, gives the lock up, and
+ * hands the copies out one by one (DESIGN.md §28, "One read per leaf").  The
+ * position it comes back to for the next leaf is a KEY and not an offset: a
+ * sorted directory inserts in the middle of a leaf and splits it, so offsets
+ * are not stable the way they were on a bucket page.  Resuming at "the first
+ * key above the last one examined" is stable under both, and under the entry
+ * deletion of §18.
+ *
+ * An INLINE copy is counted against the visibility map, so the leaf it came
+ * from stays PINNED from the copy until that set is handed out, which then
+ * takes the pin over (DESIGN.md §9).  batchbuf is that pin; it is dropped as
+ * soon as the batch holds no INLINE copy still to come, so a batch of CHAIN
+ * entries pins nothing.
  */
 typedef struct LionEntryScan
 {
@@ -617,16 +749,85 @@ typedef struct LionEntryScan
 								 * first entry of the next column */
 	BlockNumber blkno;			/* directory leaf to read next */
 	bool		haslast;		/* the key below is valid */
-	int			lastkind;		/* LION_KIND_* of the last entry returned */
+	int			lastkind;		/* LION_KIND_* of the last entry examined */
 	uint32		lasthash;
 	char	   *lastkey;		/* its stored bytes, in cxt */
 	Size		lastkeylen;
-	int			onpage;			/* entries returned from the current leaf */
 	LionRange  *range;			/* the entries returned are bounded by this
 								 * (DESIGN.md §28), or NULL */
+	int			part;			/* LION_WALK_*: which of them */
 	MemoryContext cxt;
 	bool		done;
+
+	/*
+	 * SUMMARY POSTING SETS (DESIGN.md §32).  A walk whose caller only adds up
+	 * what it hands out may read a column's summaries instead of its keys: it
+	 * then walks in up to three PHASES - the VALUE entries of its part up to
+	 * the first bucket it covers whole (LOWER), the SUMMARY entries of the
+	 * buckets it covers whole (SUMS), and the VALUE entries after the last of
+	 * them (UPPER).  The three are disjoint and together are exactly the rows
+	 * of the part.  clipmax and clipmin are the bucket boundaries a VALUE phase
+	 * is cut at - keys at or below clipmax, keys above clipmin, compared with
+	 * the column's own comparison - and sumprev is the key of the last bucket
+	 * the SUMS phase has taken or started after.
+	 */
+	bool		usesum;			/* the caller allows summaries */
+	int			phase;			/* LION_PHASE_* being walked */
+	int			nextphase;		/* ... and the one to set up at the next read */
+	int			resumekind;		/* resume after every entry of the column up
+								 * to this kind, instead of after lastkey */
+	bool		hasclipmax;
+	bool		hasclipmin;
+	bool		hassumprev;
+	char	   *clipmax;		/* in phasecxt */
+	Size		clipmaxlen;
+	char	   *clipmin;
+	Size		clipminlen;
+	char	   *sumprev;
+	Size		sumprevlen;
+	uint32		sumprevhash;
+	MemoryContext phasecxt;
+	int64		nsummaries;		/* summary entries handed out */
+
+	/* The batch: what the last leaf read selected, copied out of it. */
+	MemoryContext batchcxt;
+	LionEntryTuple **bentry;	/* the copies */
+	Size	   *bsize;			/* their item sizes */
+	OffsetNumber *boff;			/* where they were on the leaf */
+	char	   *bpage;			/* BLCKSZ bytes the copies are packed into */
+	int			nbatch;
+	int			maxbatch;
+	int			nextbatch;		/* the next one to hand out */
+	int			lastinline;		/* the last INLINE one, or -1 */
+	BlockNumber batchblk;		/* the leaf they came from */
+	Buffer		batchbuf;		/* its pin, while an INLINE copy is to come */
+	int64		nleaves;		/* leaves this walk has read */
 } LionEntryScan;
+
+/*
+ * Which entries of a range's column a walk returns (DESIGN.md §28).  An
+ * ordered range selects one contiguous run of the column's VALUE entries, and
+ * its complement is the run before it and the run after it:
+ *
+ *	INSIDE	the entries the range selects (lion_entry_scan_begin_range())
+ *	BELOW	the VALUE entries that fail a LOWER bound and no upper one: the
+ *			column's first entries, up to where the range begins
+ *	ABOVE	the VALUE entries that fail an UPPER bound: the column's last ones
+ *
+ * BELOW and ABOVE are disjoint, and with INSIDE they are every VALUE entry of
+ * the column.  Both need an ordered range (LionRange.ordered).
+ */
+#define LION_WALK_ALL		0	/* no range: every entry */
+#define LION_WALK_INSIDE	1
+#define LION_WALK_BELOW		2
+#define LION_WALK_ABOVE		3
+
+/* The phases of a walk that uses summaries (DESIGN.md §32). */
+#define LION_PHASE_VALUES	0	/* no summaries: the part's VALUE entries */
+#define LION_PHASE_LOWER	1	/* VALUE entries at or below clipmax */
+#define LION_PHASE_SUMS		2	/* the summaries of whole buckets */
+#define LION_PHASE_UPPER	3	/* VALUE entries above clipmin */
+#define LION_PHASE_DONE		4
 
 extern void lion_entry_scan_begin_col(LionEntryScan *es, Relation index,
 									 AttrNumber attno);
@@ -647,6 +848,29 @@ extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
 									   AttrNumber attno, LionRange *range);
 
 /*
+ * The walk of one part of an ordered range's column (LION_WALK_*, above):
+ * INSIDE is lion_entry_scan_begin_range(), BELOW starts where the column
+ * starts and ends where the range begins, ABOVE starts at the leaf an upper
+ * bound lives on and ends with the column.
+ */
+extern void lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
+									  AttrNumber attno, LionRange *range,
+									  int part);
+
+/*
+ * The same walk for a caller that only ADDS UP what it hands out - a sum, or
+ * a union - which may therefore be handed a column's SUMMARY entries in place
+ * of the keys they cover (DESIGN.md §32): the entries are still pairwise
+ * disjoint and still cover exactly the rows of the part.  On a column without
+ * summaries, and for an unordered range, it is lion_entry_scan_begin_part().
+ * The NULL entry never comes out of a walk that uses summaries; LION_WALK_ALL
+ * is then every VALUE entry, which is what the sum over a column needs.
+ */
+extern void lion_entry_scan_begin_sum(LionEntryScan *es, Relation index,
+									 AttrNumber attno, LionRange *range,
+									 int part);
+
+/*
  * Fetch the next entry.  On true, *key is a private copy of the entry's key
  * (palloc'd in the current context) and *ps is its located posting set, which
  * the caller must hand to lion_posting_set_release().  Entries whose posting
@@ -655,6 +879,33 @@ extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
  */
 extern bool lion_entry_scan_next(LionEntryScan *es, Datum *key,
 								LionPostingSet *ps);
+
+/*
+ * Read ONE more leaf of the walk and say how many entries on it the walk
+ * would return, without copying or locating any of them: the cheap half of
+ * deciding how to evaluate a range (DESIGN.md §28).  A walk is either counted
+ * this way or fetched with lion_entry_scan_next(), never both.
+ */
+extern int64 lion_entry_scan_skip_leaf(LionEntryScan *es);
+
+/*
+ * How many entries of the leaf the walk read last are still to be handed out
+ * by lion_entry_scan_next() before it reads another.
+ */
+static inline int
+lion_entry_scan_batch_left(const LionEntryScan *es)
+{
+	return es->nbatch - es->nextbatch;
+}
+
+/*
+ * The caller is about to hand a row to the executor and may not come back
+ * for as long as a cursor stays open.  A walk must not keep a directory leaf
+ * pinned across that (VACUUM would wait for it), so the INLINE copies still
+ * to come are dropped with their pin and the leaf is read again on the next
+ * call, from the last entry handed out.  A batch of CHAIN copies is kept.
+ */
+extern void lion_entry_scan_pause(LionEntryScan *es);
 extern void lion_entry_scan_end(LionEntryScan *es);
 
 /* ---------------------------------------------------------------------
@@ -684,10 +935,28 @@ extern void lion_check_aggregate_execute(Oid aggfnoid);
 extern PGDLLIMPORT bool lion_enable_count_pushdown;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
+extern void lion_count_scan_register(void);
 extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *input_rel,
 								   RelOptInfo *output_rel,
 								   void *extra);
+
+/*
+ * The cost model's shared terms (DESIGN.md section 10, "The units"): what a
+ * merge of posting sets costs in CPU, used by the count pushdown and by
+ * lioncostestimate() for the AND of sets an index scan makes; and a column's
+ * correlation with the heap order less ANALYZE's tie-break (lion_am.c).
+ */
+extern double lion_merge_cpu_cost(int nsrc, const double *members,
+								  const double *containers, const bool *inmem,
+								  double tuples, double *probes);
+extern double lion_containers_for(double heap_pages, double members);
+extern double lion_index_column_posting_share(PlannerInfo *root,
+											  RelOptInfo *rel,
+											  IndexOptInfo *idx,
+											  AttrNumber col);
+extern double lion_var_heap_correlation(PlannerInfo *root, Index relid,
+										Var *var);
 
 /* ---------------------------------------------------------------------
  * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan
@@ -697,5 +966,37 @@ extern PGDLLIMPORT bool lion_enable_ordered_scan;
 
 /* GUC, scan methods and set_rel_pathlist_hook; called from _PG_init. */
 extern void lion_ordered_init(void);
+
+/* ---------------------------------------------------------------------
+ * lion_selfuncs.c (DESIGN.md §28, "The endpoint probe")
+ * --------------------------------------------------------------------- */
+
+/* get_relation_stats_hook; called from _PG_init. */
+extern void lion_selfuncs_init(void);
+
+/*
+ * While lion prices one of its own accesses to rel, a range among `clauses`
+ * that bounds a column past its histogram's ends is estimated with the ends
+ * a lion index on the column holds.  lion_probe_begin() says whether a scope
+ * began; lion_probe_end() must then close it, on error too.  Inside it,
+ * lion_probe_rel_rows() is rel's rows as that estimate sees them (rel->rows
+ * outside).  lion_amcostestimate() is lioncostestimate() in such a scope.
+ */
+extern bool lion_probe_begin(PlannerInfo *root, RelOptInfo *rel,
+							 List *clauses);
+extern void lion_probe_end(void);
+extern double lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel);
+extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
+								double loop_count, Cost *indexStartupCost,
+								Cost *indexTotalCost,
+								Selectivity *indexSelectivity,
+								double *indexCorrelation, double *indexPages);
+
+/*
+ * The part of a plain scan's price above cost_index()'s uncorrelated end,
+ * which lion charges the path once rel's paths are built (DESIGN.md §29.11).
+ */
+extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
+									  Cost remainder);
 
 #endif							/* LION_COUNT_H */

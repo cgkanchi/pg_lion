@@ -1,0 +1,342 @@
+-- FK-side join pushdown, part four (DESIGN.md §27, "Parallel"): the node
+-- over a partial path of the dimension, below a Gather.
+--
+-- Each participant counts the dimension rows its share of the child returns,
+-- with its own copy of the fact filters; the leader's Finalize Agg adds the
+-- partial counts up, or core's Agg aggregates the rows of a count(DISTINCT).
+-- Every answer is checked against the same query run serially through the
+-- pushdown, and with the pushdown off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+
+-- parallel plans at any size, and the workers doing the counting whenever
+-- they start (without them the leader counts alone: the same answers)
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+
+/*
+ * lion_pj() runs a query through the pushdown with every join method
+ * disabled, so that the node is EXERCISED: once as planned here - in
+ * parallel, when the plan says so - once with max_parallel_workers_per_gather
+ * at 0, and once with the pushdown off and the planner left alone.  It
+ * compares both of the first two with the third and says which plan the
+ * first one had.
+ */
+CREATE FUNCTION lion_pj(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+	sdiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'parallel' THEN
+			how := 'serial';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_pj_par AS SELECT s::text AS r FROM (%s) s', q);
+
+	/* the same, serially */
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE format('CREATE TEMP TABLE lion_pj_ser AS SELECT s::text AS r FROM (%s) s', q);
+
+	/* the reference: the ordinary plan, with the pushdown off */
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_pj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_pj_par' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_pj_par EXCEPT ALL SELECT * FROM lion_pj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_pj_off EXCEPT ALL SELECT * FROM lion_pj_par) b)'
+		INTO ndiff;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_pj_ser EXCEPT ALL SELECT * FROM lion_pj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_pj_off EXCEPT ALL SELECT * FROM lion_pj_ser) b)'
+		INTO sdiff;
+	EXECUTE 'DROP TABLE lion_pj_par, lion_pj_ser, lion_pj_off';
+
+	IF ndiff <> 0 OR sdiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ in parallel, %s serially', ndiff, sdiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_pj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+
+/* The node's EXPLAIN ANALYZE output. */
+CREATE FUNCTION lion_pj_analyze(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+
+/*
+ * The dimension: 3000 rows over some twenty pages, so that two workers both
+ * have a share, int8 primary key 1..3000, attr 0..6 with NULL on every 13th,
+ * a region and a group.  The fact: 60000 rows in random key order; fk over
+ * 1..3600, so keys 3001..3600 join no dimension row, NULL on every 40th row,
+ * and no row at all for the keys that are multiples of 17.  x has 10 values,
+ * y 5 and NULLs, t 20.
+ */
+CREATE TABLE lion_pd (
+	pk		int8	PRIMARY KEY,
+	attr	int,
+	region	text	NOT NULL,
+	grp		text	NOT NULL
+) WITH (parallel_workers = 2);
+INSERT INTO lion_pd
+SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
+	   CASE i % 3 WHEN 0 THEN 'eu' WHEN 1 THEN 'us' ELSE 'ap' END,
+	   'g' || (i % 5)
+FROM generate_series(1, 3000) i;
+CREATE INDEX lion_pd_rg ON lion_pd USING lion (region, grp);
+
+CREATE TABLE lion_pf (
+	id		int		NOT NULL,
+	fk		int8,
+	x		int		NOT NULL,
+	y		int,
+	t		text	NOT NULL
+);
+INSERT INTO lion_pf
+SELECT i, k, h2 % 10, CASE WHEN h2 % 9 = 0 THEN NULL ELSE h2 / 10 % 5 END,
+	   't' || (h3 % 20)
+FROM (SELECT i,
+			 CASE WHEN i % 40 = 0 THEN NULL
+				  WHEN (abs(hashint4(i)) % 3600 + 1) % 17 = 0 THEN NULL
+				  ELSE abs(hashint4(i)) % 3600 + 1 END AS k,
+			 abs(hashint4(i + 1000000)) AS h2,
+			 abs(hashint4(i + 2000000)) AS h3
+	  FROM generate_series(1, 60000) i) s;
+CREATE INDEX lion_pf_fk ON lion_pf USING lion (fk);
+CREATE INDEX lion_pf_x ON lion_pf USING lion (x);
+CREATE INDEX lion_pf_yt ON lion_pf USING lion (y, t);
+
+-- a dimension whose key is NOT unique: every key twice, and NULLs
+CREATE TABLE lion_pdn (k int8, attr int NOT NULL) WITH (parallel_workers = 2);
+INSERT INTO lion_pdn SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE i % 1500 + 1 END, i % 4
+FROM generate_series(1, 3000) i;
+CREATE INDEX lion_pdn_k ON lion_pdn USING lion (k);
+VACUUM ANALYZE lion_pf;
+VACUUM ANALYZE lion_pd;
+VACUUM ANALYZE lion_pdn;
+
+-- ---- 1. the plans ------------------------------------------------------------
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+-- partial counts, added up above the Gather
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
+EXPLAIN (COSTS OFF) SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.t = 't3' GROUP BY d.grp;
+-- the rows of a count(DISTINCT), gathered, sorted and aggregated by core
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT f.fk) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3 AND d.attr = 2;
+-- as many workers as max_parallel_workers_per_gather allows (one worker and
+-- a leader that does not take part would count every row one participant
+-- counts serially, which is no cheaper) ...
+SET max_parallel_workers_per_gather = 1;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
+SET parallel_leader_participation = on;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
+SET parallel_leader_participation = off;
+-- ... none at all
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
+SET max_parallel_workers_per_gather = 2;
+-- ... and as many as the dimension's parallel_workers allows
+ALTER TABLE lion_pd SET (parallel_workers = 0);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
+-- the serial node is parallel-safe: with debug_parallel_query a worker runs it
+SET debug_parallel_query = on;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
+RESET debug_parallel_query;
+ALTER TABLE lion_pd SET (parallel_workers = 2);
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+
+-- ---- 2. the answers ------------------------------------------------------------
+-- reverse: dimension rows with (and without) a matching fact row
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t5'')');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND (f.x = 9 OR f.y IS NULL) AND f.t = ''t0'')');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk)');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk)');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.y IS NOT NULL AND f.t IN (''t1'', ''t2''))');
+SELECT lion_pj('SELECT d.attr, count(*) FROM lion_pd d WHERE d.pk IN (SELECT f.fk FROM lion_pf f WHERE f.x = 3 AND f.t = ''t5'') GROUP BY d.attr');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 77)');
+-- forward and inner: fact rows whose dimension row qualifies
+SELECT lion_pj('SELECT count(*) FROM lion_pf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_pd d WHERE d.pk = f.fk AND d.attr = 2)');
+SELECT lion_pj('SELECT count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.y = 1 AND d.grp <> ''g4''');
+SELECT lion_pj('SELECT d.region, d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.t IN (''t1'', ''t2'') GROUP BY d.region, d.grp');
+SELECT lion_pj('SELECT d.attr, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.attr HAVING count(*) > 250');
+SELECT lion_pj('SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 2 GROUP BY d.grp ORDER BY count(*) DESC, d.grp LIMIT 2');
+-- a GROUP BY folded to a constant, over something and over nothing
+SELECT lion_pj('SELECT d.region, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3 AND d.region = ''eu'' GROUP BY d.region');
+SELECT lion_pj('SELECT d.region, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 77 AND d.region = ''eu'' GROUP BY d.region');
+SELECT lion_pj('SELECT count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 77');
+-- count(DISTINCT)
+SELECT lion_pj('SELECT count(DISTINCT f.fk) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3');
+SELECT lion_pj('SELECT d.region, count(DISTINCT f.fk) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.t = ''t3'' GROUP BY d.region');
+SELECT lion_pj('SELECT count(DISTINCT d.attr) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3 AND f.y = 2)');
+SELECT lion_pj('SELECT d.grp, count(DISTINCT d.attr) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3) GROUP BY d.grp');
+-- duplicated and NULL dimension keys
+SELECT lion_pj('SELECT count(*) FROM lion_pdn d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.k AND f.x = 2)');
+SELECT lion_pj('SELECT d.attr, count(*) FROM lion_pdn d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.k AND f.x = 2 AND f.t = ''t1'') GROUP BY d.attr');
+SELECT lion_pj('SELECT count(DISTINCT d.k) FROM lion_pdn d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.k AND f.x = 2)');
+-- every participant's counters are added up: each dimension row is looked up
+-- once, whichever participant it went to
+SELECT lion_pj_counter('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Looked Up');
+SELECT lion_pj_counter('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Without Entry');
+
+-- ---- 3. the serial node in a worker (debug_parallel_query) ----------------------
+ALTER TABLE lion_pd SET (parallel_workers = 0);
+SET debug_parallel_query = on;
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)');
+SELECT lion_pj('SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.t = ''t3'' GROUP BY d.grp');
+SELECT lion_pj('SELECT count(DISTINCT d.attr) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)');
+RESET debug_parallel_query;
+ALTER TABLE lion_pd SET (parallel_workers = 2);
+
+-- ---- 4. rescans: the Gather started again for every outer row ------------------
+-- (index scans off: a nested loop semi join over lion_pf_fk is cheaper than the
+-- node here, and it is the node's rescans this is about)
+SET enable_material = off;
+SET enable_memoize = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT lion_pj('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g');
+SELECT lion_pj('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(DISTINCT d.attr) AS c FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.t = ''t4'')) s ON s.c > g');
+SELECT lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g', 'Join Keys Looked Up');
+RESET enable_material;
+RESET enable_memoize;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+RESET enable_bitmapscan;
+
+-- ---- 5. a generic plan's parameters, evaluated in every participant ------------
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE lion_pj_p(int, text) AS SELECT d.grp, count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = $1 AND f.t = $2) GROUP BY d.grp ORDER BY d.grp;
+EXPLAIN (COSTS OFF) EXECUTE lion_pj_p(3, 't5');
+EXECUTE lion_pj_p(3, 't5');
+EXECUTE lion_pj_p(NULL, 't5');
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET pg_lion.enable_count_pushdown = off;
+SET max_parallel_workers_per_gather = 0;
+PREPARE lion_pj_q(int, text) AS SELECT d.grp, count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = $1 AND f.t = $2) GROUP BY d.grp ORDER BY d.grp;
+EXECUTE lion_pj_q(3, 't5');
+RESET max_parallel_workers_per_gather;
+SET max_parallel_workers_per_gather = 2;
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_pj_p;
+DEALLOCATE lion_pj_q;
+RESET plan_cache_mode;
+
+-- ---- 6. each participant's copy of the fact filters, and its budget -----------
+-- Half of 250000 narrow rows is a bitset in each of 22 containers, some 90 kB:
+-- more than a hash join's memory at 64 kB, so every participant that tries
+-- gives up and reads the filters per count - with the same answer.
+CREATE TABLE lion_pfw (fk int8, x int NOT NULL);
+INSERT INTO lion_pfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10
+FROM generate_series(1, 250000) i;
+CREATE INDEX lion_pfw_fk ON lion_pfw USING lion (fk);
+CREATE INDEX lion_pfw_x ON lion_pfw USING lion (x);
+VACUUM ANALYZE lion_pfw;
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE lion_pj_big AS SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pfw f WHERE f.fk = d.pk AND f.x IN (0, 2, 4, 6, 8));
+EXPLAIN (COSTS OFF) EXECUTE lion_pj_big;
+EXECUTE lion_pj_big;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT count(*) FILTER (WHERE p ~ 'Fact Filters: collected once') AS planned_to_collect,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Rows Collected: -1') AS could_not
+FROM (SELECT * FROM lion_pj_analyze('EXECUTE lion_pj_big')) AS e(p);
+EXECUTE lion_pj_big;
+RESET work_mem;
+RESET hash_mem_multiplier;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pfw f WHERE f.fk = d.pk AND f.x IN (0, 2, 4, 6, 8));
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_pj_big;
+RESET plan_cache_mode;
+DROP TABLE lion_pfw;
+
+-- ---- 7. a dirty heap: deletes and updates on both sides, not yet vacuumed -----
+DELETE FROM lion_pf WHERE fk = 7;
+DELETE FROM lion_pf WHERE fk = 8 AND x < 5;
+UPDATE lion_pf SET fk = 9 WHERE fk = 10 AND x = 1;
+UPDATE lion_pf SET x = 3 WHERE id % 97 = 0;
+UPDATE lion_pf SET fk = NULL WHERE fk = 11;
+INSERT INTO lion_pf SELECT 60000 + i, 34, 3, 1, 't5' FROM generate_series(1, 5) i;
+DELETE FROM lion_pd WHERE pk IN (12, 1200, 2400);
+UPDATE lion_pd SET region = 'eu', attr = 6 WHERE pk IN (1, 2, 4, 1500);
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)');
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk)');
+SELECT lion_pj('SELECT d.region, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.region');
+SELECT lion_pj('SELECT count(DISTINCT f.fk) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3');
+SELECT lion_pj_counter('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)', 'Heap TIDs Rechecked') > 0 AS dirty_heap_rechecks;
+VACUUM lion_pf;
+VACUUM lion_pd;
+SELECT lion_pj('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)');
+SELECT lion_pj('SELECT d.region, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.region');
+
+DROP TABLE lion_pf, lion_pd, lion_pdn;
+DROP FUNCTION lion_pj(text);
+DROP FUNCTION lion_pj_counter(text, text);
+DROP FUNCTION lion_pj_analyze(text);

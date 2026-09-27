@@ -63,6 +63,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -74,6 +75,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -84,13 +86,14 @@
 #include "varatt.h"
 
 #include "lion.h"
+#include "lion_count.h"
 
 PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_verify);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
 PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 
-#define LION_STATS_NCOLS		24
+#define LION_STATS_NCOLS		28
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
@@ -142,6 +145,7 @@ typedef struct LionVerifyState
 	/* per key column (DESIGN.md §24): at most one of each, per column */
 	int64		nnullentries[INDEX_MAX_KEYS];
 	int64		nemptyentries[INDEX_MAX_KEYS];
+	int64		nlastsummaries[INDEX_MAX_KEYS];	/* §32: at most one */
 	uint16		lastattno;		/* attno of the last leaf entry seen */
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */
 	Oid			keyoutfunc;		/* output function of the column being checked */
@@ -278,6 +282,18 @@ typedef struct LionColStats
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
 	int64		inline_slack_bytes; /* ... and inside INLINE payloads (§4) */
+
+	/*
+	 * SUMMARY entries (DESIGN.md §32), which none of the counters above
+	 * include: those describe the column's keys, and a summary is a second
+	 * copy of some of their rows.  These say what that copy costs - its
+	 * entries, the rows it holds, the bytes of its items and the posting pages
+	 * of the summaries too large to stay INLINE.
+	 */
+	int64		summary_entries;
+	int64		summary_tids;
+	int64		summary_bytes;
+	int64		summary_pages;
 } LionColStats;
 
 /* What one posting set contributed, before its column is known. */
@@ -285,6 +301,7 @@ typedef struct LionSetStats
 {
 	BlockNumber head;			/* hash key: the set's root block */
 	uint16		attno;			/* 0 until the owning entry is seen */
+	bool		summary;		/* ... and it is a summary's (§32) */
 	LionColStats st;
 } LionSetStats;
 
@@ -320,6 +337,7 @@ lion_stats_bucket(LionStats *st, BlockNumber head)
 	if (!found)
 	{
 		ent->attno = 0;
+		ent->summary = false;
 		memset(&ent->st, 0, sizeof(LionColStats));
 	}
 	return &ent->st;
@@ -327,7 +345,7 @@ lion_stats_bucket(LionStats *st, BlockNumber head)
 
 /* ... and the same for an entry, whose column is known right away. */
 static void
-lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno)
+lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno, bool summary)
 {
 	LionSetStats *ent;
 	bool		found;
@@ -342,6 +360,7 @@ lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno)
 		memset(&ent->st, 0, sizeof(LionColStats));
 	}
 	ent->attno = attno;
+	ent->summary = summary;
 }
 
 /*
@@ -455,7 +474,13 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		for (i = 0; i < st->ncolumns; i++)
 			st->ordered[i] = ix->cols[i].ordered;
 		st->sets = NULL;
-		if (st->ncolumns > 1)
+
+		/*
+		 * A column's posting pages are its own for a single-column index -
+		 * unless it has summaries (DESIGN.md §32), whose pages are counted
+		 * apart and are known only through the entries that own them.
+		 */
+		if (st->ncolumns > 1 || ix->meta.summary_cols != 0)
 		{
 			HASHCTL		ctl;
 
@@ -518,6 +543,31 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						continue;
 					cs = &st->cols[entry->attno - 1];
 
+					/* A summary (DESIGN.md §32) is counted apart. */
+					if (LionEntryIsSummary(entry))
+					{
+						cs->summary_entries++;
+						cs->summary_tids += (int64) entry->ntids;
+						if ((entry->flags & LION_ENTRY_INLINE) != 0)
+						{
+							LionColStats tmp;
+							Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry,
+																	   ItemIdGetLength(iid));
+							Size		cur = 0;
+							Size		csize;
+
+							memset(&tmp, 0, sizeof(tmp));
+							while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
+															 paylen, &cur, cbuf)) > 0)
+								lion_stats_item(&tmp, cbuf, csize);
+							cs->summary_bytes += tmp.container_bytes;
+						}
+						else
+							lion_stats_claim(st, entry->head, entry->attno,
+											 true);
+						continue;
+					}
+
 					cs->entries++;
 					cs->ntids += (int64) entry->ntids;
 					if (LionEntryIsNullKey(entry))
@@ -549,7 +599,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						cs->inline_slack_bytes += (int64) (paylen - cur);
 					}
 					else
-						lion_stats_claim(st, entry->head, entry->attno);
+						lion_stats_claim(st, entry->head, entry->attno,
+										 false);
 				}
 			}
 			else if (LionPageIsContainer(page))
@@ -639,6 +690,14 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					continue;
 				cs = &st->cols[ent->attno - 1];
 
+				if (ent->summary)
+				{
+					cs->summary_bytes += ent->st.container_bytes;
+					cs->summary_pages += ent->st.container_pages +
+						ent->st.posting_internal_pages;
+					continue;
+				}
+
 				cs->containers += ent->st.containers;
 				for (k = 0; k < 4; k++)
 					cs->by_type[k] += ent->st.by_type[k];
@@ -700,6 +759,10 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		values[21] = Int64GetDatum(cs->posting_internal_pages);
 		values[22] = Int32GetDatum(st->max_posting_height);
 		values[23] = Int64GetDatum(cs->inline_slack_bytes);
+		values[24] = Int64GetDatum(cs->summary_entries);
+		values[25] = Int64GetDatum(cs->summary_tids);
+		values[26] = Int64GetDatum(cs->summary_bytes);
+		values[27] = Int64GetDatum(cs->summary_pages);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
@@ -777,7 +840,16 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
 				 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
 						1, RelationGetRelationName(index))));
 
-	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0])
+	/*
+	 * The key is looked up as one of the column's own values.  For a class
+	 * declared on a polymorphic type (enum_ops is FOR TYPE anyenum) that is a
+	 * value of the column's actual type, which the class's input type does
+	 * not name: a domain over the enum is its enum, a different enum is not
+	 * (lion_type_is_column() in lion_count.c makes the same test).
+	 */
+	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0] &&
+		!(IsPolymorphicType(index->rd_opcintype[0]) &&
+		  getBaseType(keytype) == getBaseType(state->typid)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("type %s cannot be compared with index \"%s\"",
@@ -1176,7 +1248,7 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 					RelationGetRelationName(vs->index), off, blk, item->attno,
 					vs->ix->ncolumns);
 
-	if (kind != LION_KIND_VALUE)
+	if (kind == LION_KIND_NULL || kind == LION_KIND_EMPTY)
 	{
 		/* the NULL and EMPTY entries, or pivots made from them (§14, §17) */
 		if (item->keylen != 0)
@@ -2257,9 +2329,34 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
 
 	if ((entry->flags & ~(uint16) (LION_ENTRY_INLINE | LION_ENTRY_CHAIN |
-								   LION_ENTRY_RESERVED)) != 0)
+								   LION_ENTRY_RESERVED |
+								   LION_ENTRY_SUMKINDS)) != 0)
 		lion_corrupt("lion index \"%s\": entry %u on block %u has unknown flag bits in 0x%04X",
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
+
+	/*
+	 * A SUMMARY entry (DESIGN.md §32): only in a column the meta page says has
+	 * summaries, never a reserved one, the open bucket's flag only with the
+	 * summary flag, and one open bucket per column.  What it holds is checked
+	 * by lion_verify_summaries() once the structure is known to be sound.
+	 */
+	if (LionEntryIsSummary(entry))
+	{
+		if (!state->summarized)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is a summary of key column %u, which has none",
+						RelationGetRelationName(vs->index), off, blk,
+						entry->attno);
+		if (LionEntryIsReserved(entry) ||
+			(entry->flags & LION_ENTRY_SUMMARY) == 0)
+			lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, which no summary has",
+						RelationGetRelationName(vs->index), off, blk,
+						entry->flags);
+		if (LionEntryIsSumLast(entry) &&
+			++vs->nlastsummaries[entry->attno - 1] > 1)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is a second open summary for key column %u",
+						RelationGetRelationName(vs->index), off, blk,
+						entry->attno);
+	}
 
 	if ((entry->flags & LION_ENTRY_RESERVED) == LION_ENTRY_RESERVED)
 		lion_corrupt("lion index \"%s\": entry %u on block %u is both the null and the empty entry",
@@ -2305,8 +2402,10 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 
 		lion_verify_keylen(vs, state, blk, off, entry);
 
-		hash = lion_hash_key(state,
-							lion_fetch_key(state, LionEntryGetKey(entry)));
+		/* A summary's hash is a constant, not its key's (DESIGN.md §32). */
+		hash = LionEntryIsSummary(entry) ? LION_SUMMARY_HASH :
+			lion_hash_key(state,
+						  lion_fetch_key(state, LionEntryGetKey(entry)));
 		if (hash != entry->hash)
 			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
 						RelationGetRelationName(vs->index), off, blk,
@@ -3089,10 +3188,30 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION)
-		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
+	if (meta->magic != LION_MAGIC ||
+		(meta->version != LION_VERSION &&
+		 meta->version != LION_VERSION_SUMMARIES))
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u or %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION);
+					meta->version, LION_MAGIC, LION_VERSION,
+					LION_VERSION_SUMMARIES);
+
+	/* DESIGN.md §32: version 7 is version 6 with summaries, and only that. */
+	if ((meta->version == LION_VERSION) != (meta->summary_cols == 0))
+		lion_corrupt("lion index \"%s\": meta page version %u names summarized key columns %08X",
+					RelationGetRelationName(vs->index), meta->version,
+					meta->summary_cols);
+	if (meta->summary_cols != 0 &&
+		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
+		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))
+		lion_corrupt("lion index \"%s\": meta page has summary buckets of %u TIDs, expected %d .. %d",
+					RelationGetRelationName(vs->index), meta->summary_tids,
+					LION_MIN_SUMMARY_TIDS, LION_MAX_SUMMARY_TIDS);
+	if ((meta->summary_cols >> vs->ix->ncolumns) != 0 &&
+		vs->ix->ncolumns < 32)
+		lion_corrupt("lion index \"%s\": meta page names summarized key columns %08X of %d",
+					RelationGetRelationName(vs->index), meta->summary_cols,
+					vs->ix->ncolumns);
 
 	if (meta->offset_bits != LION_OFFSET_BITS ||
 		meta->container_bits != LION_CONTAINER_BITS)
@@ -3968,6 +4087,670 @@ lion_verify_heapallindexed(LionVerifyState *vs)
 	vs->heapcxt = NULL;
 }
 
+/* ---------------------------------------------------------------------
+ * Summary posting sets (DESIGN.md §32)
+ *
+ * Every summary must hold exactly the rows of its bucket - the union of the
+ * posting sets of the column's keys above the previous summary's key and at or
+ * below its own - and the open bucket's key must be at or above every key it
+ * holds.  Checked a bucket at a time: the keys of the bucket are walked, their
+ * codes collected and sorted, and the result compared with the summary's own
+ * codes.
+ *
+ * Beside writers (DESIGN.md §7) the two cannot be read at one instant: an
+ * insert puts a row under its key's entry and then into its summary, with
+ * nothing held in between, and the walk may read the key after the first step
+ * and the summary before the second.  So every difference is a CANDIDATE, as
+ * for the structure: once the walk is over, the statements writing the index
+ * are waited for (lion_verify_wait_for_writers()) and each candidate is looked
+ * at again - the row a summary lacks is looked for in the summary its key's
+ * bucket has now, and the row a summary holds and its bucket's keys lacked is
+ * looked for among the bucket's keys again.  What is still missing is damage,
+ * unless the row is DEAD: an insert that failed or crashed between its two
+ * steps leaves its row in one of the two sets and not the other, and that row
+ * is one no snapshot can see, and the next VACUUM removes it from both.
+ * --------------------------------------------------------------------- */
+
+/* One difference the walk found, to be looked at again. */
+typedef struct LionVerifySumCand
+{
+	uint64		code;			/* the row */
+	bool		insummary;		/* the summary has it and the keys do not */
+	int64		bucket;			/* index into the buckets below */
+	char	   *keyraw;			/* a key an open bucket holds above its own */
+	Size		keylen;
+} LionVerifySumCand;
+
+/* A bucket as the walk saw it: its bounds, for the recheck. */
+typedef struct LionVerifyBucket
+{
+	char	   *lo;				/* the previous summary's key, or NULL */
+	Size		lolen;
+	char	   *hi;				/* its own key; NULL: open above */
+	Size		hilen;
+} LionVerifyBucket;
+
+typedef struct LionVerifySumState
+{
+	LionVerifyState *vs;
+	LionState  *col;
+	MemoryContext cxt;
+	/* the codes of the bucket's keys */
+	uint64	   *codes;
+	int64		ncodes;
+	int64		capcodes;
+	/* the codes of its summary */
+	uint64	   *scodes;
+	int64		nscodes;
+	int64		capscodes;
+	LionVerifySumCand *cands;
+	int			ncands;
+	int			maxcands;
+	LionVerifyBucket *buckets;
+	int64		nbuckets;
+	int64		maxbuckets;
+	int64		nsummaries;
+	int64		nkeys;
+} LionVerifySumState;
+
+/* Too many differences to be anything but damage, or a summary of garbage. */
+#define LION_VERIFY_MAX_SUM_CANDS	10000
+
+typedef struct LionVerifyCodeSink
+{
+	uint64	  **codes;
+	int64	   *n;
+	int64	   *cap;
+	uint32		ckey;
+} LionVerifyCodeSink;
+
+static bool
+lion_verify_code_cb(uint16 lo, void *arg)
+{
+	LionVerifyCodeSink *sink = (LionVerifyCodeSink *) arg;
+
+	if (*sink->n >= *sink->cap)
+	{
+		*sink->cap *= 2;
+		*sink->codes = (uint64 *) repalloc_huge(*sink->codes,
+												sizeof(uint64) * *sink->cap);
+	}
+	(*sink->codes)[(*sink->n)++] = lion_make_code(sink->ckey, lo);
+	return true;
+}
+
+static bool
+lion_verify_container_cb(const LionContainer *c, void *arg)
+{
+	LionVerifyCodeSink *sink = (LionVerifyCodeSink *) arg;
+
+	sink->ckey = c->ckey;
+	lion_container_iterate(c, lion_verify_code_cb, sink);
+	return true;
+}
+
+/* Every code of a located posting set, appended to (*codes, *n). */
+static void
+lion_verify_set_codes(LionPostingSet *ps, uint64 **codes, int64 *n, int64 *cap)
+{
+	LionVerifyCodeSink sink;
+
+	if (!ps->found)
+		return;
+	sink.codes = codes;
+	sink.n = n;
+	sink.cap = cap;
+	sink.ckey = 0;
+	(void) lion_sets_iterate(1, ps, NULL, lion_verify_container_cb, &sink);
+}
+
+static int
+lion_verify_code_cmp(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+static void
+lion_verify_sum_cand(LionVerifySumState *ss, uint64 code, bool insummary,
+					 const char *keyraw, Size keylen)
+{
+	LionVerifySumCand *c;
+
+	if (ss->ncands >= LION_VERIFY_MAX_SUM_CANDS)
+		lion_corrupt("lion index \"%s\": key column %d has more than %d rows that its summaries and its keys disagree about",
+					RelationGetRelationName(ss->vs->index), ss->col->attno,
+					LION_VERIFY_MAX_SUM_CANDS);
+	if (ss->ncands >= ss->maxcands)
+	{
+		ss->maxcands = Max(ss->maxcands * 2, 64);
+		ss->cands = (LionVerifySumCand *)
+			repalloc(ss->cands, sizeof(LionVerifySumCand) * ss->maxcands);
+	}
+	c = &ss->cands[ss->ncands++];
+	c->code = code;
+	c->insummary = insummary;
+	c->bucket = ss->nbuckets - 1;
+	c->keyraw = NULL;
+	c->keylen = 0;
+	if (keyraw != NULL)
+	{
+		c->keyraw = (char *) MemoryContextAlloc(ss->cxt, Max(keylen, 1));
+		memcpy(c->keyraw, keyraw, keylen);
+		c->keylen = keylen;
+	}
+}
+
+static char *
+lion_verify_keydup(LionVerifySumState *ss, const LionEntryTuple *e, Size *lenp)
+{
+	char	   *k = (char *) MemoryContextAlloc(ss->cxt, Max(e->keylen, 1));
+
+	memcpy(k, LionEntryGetKey(e), e->keylen);
+	*lenp = e->keylen;
+	return k;
+}
+
+/* Compare the codes of a bucket's keys with its summary's; note differences. */
+static void
+lion_verify_bucket_compare(LionVerifySumState *ss)
+{
+	int64		i = 0;
+	int64		j = 0;
+
+	qsort(ss->codes, (size_t) ss->ncodes, sizeof(uint64), lion_verify_code_cmp);
+
+	while (i < ss->ncodes || j < ss->nscodes)
+	{
+		if (j >= ss->nscodes ||
+			(i < ss->ncodes && ss->codes[i] < ss->scodes[j]))
+			lion_verify_sum_cand(ss, ss->codes[i++], false, NULL, 0);
+		else if (i >= ss->ncodes || ss->scodes[j] < ss->codes[i])
+			lion_verify_sum_cand(ss, ss->scodes[j++], true, NULL, 0);
+		else
+		{
+			/* two keys of one scalar column never share a row */
+			if (i + 1 < ss->ncodes && ss->codes[i + 1] == ss->codes[i])
+				lion_corrupt("lion index \"%s\": row (%u,%u) is under two keys of key column %d",
+							RelationGetRelationName(ss->vs->index),
+							(unsigned) (ss->codes[i] >> LION_OFFSET_BITS),
+							(unsigned) (ss->codes[i] & ((1 << LION_OFFSET_BITS) - 1)),
+							ss->col->attno);
+			i++;
+			j++;
+		}
+	}
+	ss->ncodes = 0;
+	ss->nscodes = 0;
+}
+
+/* Is (the heap row at) code dead to every transaction there is? */
+static bool
+lion_verify_tid_dead(LionVerifyState *vs, uint64 code)
+{
+	ItemPointerData tid;
+	BlockNumber blk;
+	OffsetNumber off;
+	Buffer		buf;
+	Page		page;
+	ItemId		lp;
+	bool		dead;
+
+	lion_code_to_tid(code, &tid);
+	blk = ItemPointerGetBlockNumber(&tid);
+	off = ItemPointerGetOffsetNumber(&tid);
+	if (blk >= RelationGetNumberOfBlocks(vs->heap))
+		return true;
+
+	buf = ReadBuffer(vs->heap, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	if (PageIsNew(page) || off < FirstOffsetNumber ||
+		off > PageGetMaxOffsetNumber(page))
+		dead = true;
+	else
+	{
+		lp = PageGetItemId(page, off);
+		if (!ItemIdIsUsed(lp) || ItemIdIsDead(lp))
+			dead = true;
+		else if (ItemIdIsRedirected(lp))
+			dead = false;		/* a HOT chain with a live member */
+		else
+		{
+			HeapTupleData tup;
+
+			tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			tup.t_len = ItemIdGetLength(lp);
+			tup.t_tableOid = RelationGetRelid(vs->heap);
+			ItemPointerSet(&tup.t_self, blk, off);
+			dead = HeapTupleSatisfiesVacuum(&tup,
+											GetOldestNonRemovableTransactionId(vs->heap),
+											buf) == HEAPTUPLE_DEAD;
+		}
+	}
+	UnlockReleaseBuffer(buf);
+	return dead;
+}
+
+/* Does the located set hold code? */
+static bool
+lion_verify_set_has(LionPostingSet *ps, uint64 code)
+{
+	uint64	   *codes;
+	int64		n = 0;
+	int64		cap = 256;
+	int64		i;
+	bool		has = false;
+
+	codes = (uint64 *) palloc(sizeof(uint64) * cap);
+	lion_verify_set_codes(ps, &codes, &n, &cap);
+	for (i = 0; i < n && !has; i++)
+		has = (codes[i] == code);
+	pfree(codes);
+	return has;
+}
+
+/*
+ * Is code in the summary of the bucket a key belongs to NOW?  The descent an
+ * insert makes (lion_summary_insert()): the first summary of the column at or
+ * above the key, which the open bucket's is when every other summary's key is
+ * below it - and then the open bucket's key has to be at or above it too.
+ */
+static bool
+lion_verify_in_bucket_of(LionVerifySumState *ss, const char *keyraw,
+						 uint64 code)
+{
+	LionVerifyState *vs = ss->vs;
+	LionState  *col = lion_column(vs->ix, ss->col->attno);
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
+	Page		page;
+	LionEntryTuple *e = NULL;
+	LionPostingSet ps;
+	Datum		key = lion_fetch_key(col, keyraw);
+	bool		has;
+
+	lion_search_key_init(col, &sk, LION_KIND_SUMMARY, key, 0);
+	buf = lion_dir_search_first(vs->index, NULL, vs->ix, &sk,
+								BUFFER_LOCK_SHARE, false, &off);
+	page = BufferGetPage(buf);
+	if (off <= PageGetMaxOffsetNumber(page))
+		e = lion_page_entry(page, off);
+	if (e == NULL || e->attno != col->attno || !LionEntryIsSummary(e) ||
+		LionEntryIsPivot(e))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+	if (LionEntryIsSumLast(e) &&
+		DatumGetInt32(FunctionCall2Coll(&col->cmpproc, col->collation, key,
+										lion_fetch_key(col,
+													   LionEntryGetKey(e)))) > 0)
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	/* The same located set a count would read, pinned as a count's is. */
+	lion_posting_set_at(vs->index, col, buf, off, &ps);
+	UnlockReleaseBuffer(buf);
+	has = lion_verify_set_has(&ps, code);
+	lion_posting_set_release(&ps);
+	return has;
+}
+
+/*
+ * Is code among the keys of bucket b, as the walk saw the bucket: above its
+ * lower bound and, unless it is open above, at or below its upper one?
+ */
+static bool
+lion_verify_in_keys_of(LionVerifySumState *ss, const LionVerifyBucket *b,
+					   uint64 code)
+{
+	LionVerifyState *vs = ss->vs;
+	LionEntryScan es;
+	LionPostingSet ps;
+	Datum		k;
+	bool		has = false;
+
+	lion_entry_scan_begin_col(&es, vs->index, ss->col->attno);
+	while (!has && lion_entry_scan_next(&es, &k, &ps))
+	{
+		LionState  *col = es.state;
+
+		if (ps.keyisnull || !ps.hasstoredkey)
+		{
+			lion_posting_set_release(&ps);
+			continue;
+		}
+		if (b->lo != NULL &&
+			DatumGetInt32(FunctionCall2Coll(&col->cmpproc, col->collation,
+											ps.storedkey,
+											lion_fetch_key(col, b->lo))) <= 0)
+		{
+			lion_posting_set_release(&ps);
+			continue;
+		}
+		if (b->hi != NULL &&
+			DatumGetInt32(FunctionCall2Coll(&col->cmpproc, col->collation,
+											ps.storedkey,
+											lion_fetch_key(col, b->hi))) > 0)
+		{
+			lion_posting_set_release(&ps);
+			break;
+		}
+		has = lion_verify_set_has(&ps, code);
+		lion_posting_set_release(&ps);
+	}
+	lion_entry_scan_end(&es);
+	return has;
+}
+
+/*
+ * One summarized key column: its buckets, walked beside its keys, and every
+ * difference looked at again once the writers that could explain it are done.
+ */
+static void
+lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
+{
+	LionVerifySumState ss;
+	LionEntryScan sums;
+	LionEntryScan vals;
+	LionPostingSet sps;
+	LionPostingSet vps;
+	bool		havevps = false;
+	bool		valsdone = false;
+	bool		haveprev = false;
+	bool		sawlast = false;
+	char	   *prevkey = NULL;
+	Size		prevlen = 0;
+	Datum		dummy;
+	int			i;
+
+	memset(&ss, 0, sizeof(ss));
+	ss.vs = vs;
+	ss.col = col;
+	ss.cxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "lion index verify summaries",
+								   ALLOCSET_DEFAULT_SIZES);
+	ss.capcodes = ss.capscodes = 1024;
+	ss.codes = (uint64 *) MemoryContextAlloc(ss.cxt, sizeof(uint64) * ss.capcodes);
+	ss.scodes = (uint64 *) MemoryContextAlloc(ss.cxt, sizeof(uint64) * ss.capscodes);
+	ss.maxcands = 64;
+	ss.cands = (LionVerifySumCand *)
+		MemoryContextAlloc(ss.cxt, sizeof(LionVerifySumCand) * ss.maxcands);
+	ss.maxbuckets = 64;
+	ss.buckets = (LionVerifyBucket *)
+		MemoryContextAlloc(ss.cxt, sizeof(LionVerifyBucket) * ss.maxbuckets);
+
+	lion_entry_scan_begin_sum(&sums, vs->index, col->attno, NULL,
+							  LION_WALK_ALL);
+	lion_entry_scan_begin_col(&vals, vs->index, col->attno);
+
+	while (lion_entry_scan_next(&sums, &dummy, &sps))
+	{
+		LionVerifyBucket *b;
+		bool		islast;
+		Size		keylen;
+		char	   *key;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * The walk hands out every summary of the column but the empty ones,
+		 * which have no rows to compare: a bucket VACUUM emptied, whose keys
+		 * then hold only dead rows, and the key comparison below skips none
+		 * of its keys' rows either way, since they are dead.
+		 */
+		if (sawlast)
+			lion_corrupt("lion index \"%s\": key column %d has a summary after its open one",
+						RelationGetRelationName(vs->index), col->attno);
+		islast = (sums.bentry[sums.nextbatch - 1]->flags &
+				  LION_ENTRY_SUMLAST) != 0;
+		sawlast = islast;
+		key = lion_verify_keydup(&ss, sums.bentry[sums.nextbatch - 1], &keylen);
+		ss.nsummaries++;
+
+		if (haveprev &&
+			DatumGetInt32(FunctionCall2Coll(&col->cmpproc, col->collation,
+											lion_fetch_key(col, key),
+											lion_fetch_key(col, prevkey))) <= 0)
+			lion_corrupt("lion index \"%s\": a summary of key column %d is out of order",
+						RelationGetRelationName(vs->index), col->attno);
+
+		if (ss.nbuckets >= ss.maxbuckets)
+		{
+			ss.maxbuckets *= 2;
+			ss.buckets = (LionVerifyBucket *)
+				repalloc_huge(ss.buckets, sizeof(LionVerifyBucket) * ss.maxbuckets);
+		}
+		b = &ss.buckets[ss.nbuckets++];
+		b->lo = haveprev ? prevkey : NULL;
+		b->lolen = haveprev ? prevlen : 0;
+		b->hi = islast ? NULL : key;
+		b->hilen = islast ? 0 : keylen;
+
+		/* The keys of the bucket: every value up to its key, or all of them. */
+		for (;;)
+		{
+			if (!havevps)
+			{
+				if (valsdone || !lion_entry_scan_next(&vals, &dummy, &vps))
+				{
+					valsdone = true;
+					break;
+				}
+				havevps = true;
+			}
+			if (vps.keyisnull || !vps.hasstoredkey)
+			{
+				lion_posting_set_release(&vps);
+				havevps = false;
+				continue;
+			}
+			if (DatumGetInt32(FunctionCall2Coll(&col->cmpproc, col->collation,
+												vps.storedkey,
+												lion_fetch_key(col, key))) > 0)
+			{
+				if (!islast)
+					break;		/* the next bucket's */
+
+				/*
+				 * The open bucket holds a key above its own: a concurrent
+				 * insert raises it right after putting the row under the key,
+				 * so it is a candidate.
+				 */
+				{
+					LionState  *vcol = vals.state;
+					Size		vlen = lion_key_datum_size(vcol, vps.storedkey);
+					char	   *vraw = (char *) palloc(vlen);
+
+					lion_store_key(vcol, vps.storedkey, vraw);
+					lion_verify_sum_cand(&ss, 0, false, vraw, vlen);
+					pfree(vraw);
+				}
+			}
+			lion_verify_set_codes(&vps, &ss.codes, &ss.ncodes, &ss.capcodes);
+			ss.nkeys++;
+			lion_posting_set_release(&vps);
+			havevps = false;
+		}
+
+		lion_verify_set_codes(&sps, &ss.scodes, &ss.nscodes, &ss.capscodes);
+		lion_posting_set_release(&sps);
+		lion_verify_bucket_compare(&ss);
+
+		prevkey = key;
+		prevlen = keylen;
+		haveprev = true;
+	}
+
+	/*
+	 * Keys past the last bucket: a column whose open bucket a crash closed
+	 * before the next one was opened (lion_summary_close_last()), or that has
+	 * no summary left at all.  Their rows are in no summary, which is right
+	 * only for rows no one can see.
+	 */
+	if (ss.nbuckets >= ss.maxbuckets)
+	{
+		ss.maxbuckets *= 2;
+		ss.buckets = (LionVerifyBucket *)
+			repalloc_huge(ss.buckets, sizeof(LionVerifyBucket) * ss.maxbuckets);
+	}
+	ss.buckets[ss.nbuckets].lo = haveprev ? prevkey : NULL;
+	ss.buckets[ss.nbuckets].lolen = haveprev ? prevlen : 0;
+	ss.buckets[ss.nbuckets].hi = NULL;
+	ss.buckets[ss.nbuckets].hilen = 0;
+	ss.nbuckets++;
+	for (;;)
+	{
+		if (!havevps)
+		{
+			if (valsdone || !lion_entry_scan_next(&vals, &dummy, &vps))
+				break;
+			havevps = true;
+		}
+		if (!vps.keyisnull && vps.hasstoredkey)
+		{
+			lion_verify_set_codes(&vps, &ss.codes, &ss.ncodes, &ss.capcodes);
+			ss.nkeys++;
+		}
+		lion_posting_set_release(&vps);
+		havevps = false;
+	}
+	lion_verify_bucket_compare(&ss);
+
+	lion_entry_scan_end(&sums);
+	lion_entry_scan_end(&vals);
+
+	/* Settle the differences: wait for the writers, then look again. */
+	if (ss.ncands > 0)
+	{
+		if (vs->concurrent)
+		{
+			lion_verify_wait_for_writers(vs);
+			vs->nwaits++;
+		}
+
+		for (i = 0; i < ss.ncands; i++)
+		{
+			LionVerifySumCand *c = &ss.cands[i];
+			LionVerifyBucket *b = &ss.buckets[c->bucket];
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (c->keyraw != NULL)
+			{
+				/* a key above the open bucket's: is it in a bucket now? */
+				LionEntryScan es;
+				LionPostingSet ps;
+				Datum		k;
+				bool		ok = true;
+
+				lion_entry_scan_begin_col(&es, vs->index, col->attno);
+				while (ok && lion_entry_scan_next(&es, &k, &ps))
+				{
+					if (!ps.keyisnull && ps.hasstoredkey &&
+						DatumGetInt32(FunctionCall2Coll(&col->cmpproc,
+														col->collation,
+														ps.storedkey,
+														lion_fetch_key(col, c->keyraw))) == 0)
+					{
+						uint64	   *codes;
+						int64		n = 0;
+						int64		cap = 256;
+						int64		j;
+
+						codes = (uint64 *) palloc(sizeof(uint64) * cap);
+						lion_verify_set_codes(&ps, &codes, &n, &cap);
+						for (j = 0; j < n && ok; j++)
+							ok = lion_verify_in_bucket_of(&ss, c->keyraw,
+														  codes[j]) ||
+								lion_verify_tid_dead(vs, codes[j]);
+						pfree(codes);
+					}
+					lion_posting_set_release(&ps);
+				}
+				lion_entry_scan_end(&es);
+				if (!ok)
+					lion_corrupt("lion index \"%s\": a row of a key of key column %d is not in the summary of that key's bucket, whose key is below it",
+								RelationGetRelationName(vs->index),
+								col->attno);
+				continue;
+			}
+
+			if (c->insummary)
+			{
+				if (lion_verify_in_keys_of(&ss, b, c->code) ||
+					lion_verify_tid_dead(vs, c->code))
+					continue;
+				lion_corrupt("lion index \"%s\": a summary of key column %d holds row (%u,%u), which no key of its bucket holds",
+							RelationGetRelationName(vs->index), col->attno,
+							(unsigned) (c->code >> LION_OFFSET_BITS),
+							(unsigned) (c->code & ((1 << LION_OFFSET_BITS) - 1)));
+			}
+			else
+			{
+				/* find the key that holds it, and its bucket's summary */
+				LionEntryScan es;
+				LionPostingSet ps;
+				Datum		k;
+				bool		ok = false;
+				bool		seen = false;
+
+				lion_entry_scan_begin_col(&es, vs->index, col->attno);
+				while (!seen && lion_entry_scan_next(&es, &k, &ps))
+				{
+					if (!ps.keyisnull && ps.hasstoredkey &&
+						lion_verify_set_has(&ps, c->code))
+					{
+						Size		len = lion_key_datum_size(es.state,
+															  ps.storedkey);
+						char	   *raw = (char *) palloc(len);
+
+						lion_store_key(es.state, ps.storedkey, raw);
+						seen = true;
+						ok = lion_verify_in_bucket_of(&ss, raw, c->code);
+						pfree(raw);
+					}
+					lion_posting_set_release(&ps);
+				}
+				lion_entry_scan_end(&es);
+				if (ok || !seen || lion_verify_tid_dead(vs, c->code))
+					continue;
+				lion_corrupt("lion index \"%s\": row (%u,%u) of key column %d is not in the summary of its key's bucket",
+							RelationGetRelationName(vs->index),
+							(unsigned) (c->code >> LION_OFFSET_BITS),
+							(unsigned) (c->code & ((1 << LION_OFFSET_BITS) - 1)),
+							col->attno);
+			}
+		}
+	}
+
+	elog(DEBUG1, "lion index \"%s\": key column %d has " INT64_FORMAT " summaries over " INT64_FORMAT " keys; %d differences settled",
+		 RelationGetRelationName(vs->index), col->attno, ss.nsummaries,
+		 ss.nkeys, ss.ncands);
+
+	MemoryContextDelete(ss.cxt);
+}
+
+/* Every summarized key column's summaries (DESIGN.md §32). */
+static void
+lion_verify_summaries(LionVerifyState *vs)
+{
+	int			c;
+
+	for (c = 0; c < vs->ix->ncolumns; c++)
+	{
+		if (vs->ix->cols[c].summarized)
+			lion_verify_column_summaries(vs, &vs->ix->cols[c]);
+	}
+}
+
 /*
  * lion_index_verify(regclass, heapallindexed bool)
  *
@@ -4076,6 +4859,12 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	lion_verify_directory(&vs);
 	lion_verify_reachable(&vs);
 	lion_verify_recheck(&vs);
+
+	/*
+	 * The structure is sound: now what the summaries hold (DESIGN.md §32),
+	 * which reads the index the way the counts do.
+	 */
+	lion_verify_summaries(&vs);
 
 	/*
 	 * What writers running beside the check cost it (DESIGN.md §7), in the
