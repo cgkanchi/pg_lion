@@ -267,9 +267,9 @@ VACUUM ANALYZE lion_exe;
 GRANT SELECT ON lion_exe TO lion_exec_user;
 REVOKE EXECUTE ON FUNCTION enum_eq(anyenum, anyenum) FROM PUBLIC;
 SELECT lion_ex('SELECT count(*) FROM lion_exe WHERE e = ''ok''');
-                                     lion_ex                                      
-----------------------------------------------------------------------------------
- NOT PUSHED: ERROR: permission denied for function enum_eq (as the ordinary plan)
+                                   lion_ex                                    
+------------------------------------------------------------------------------
+ pushed: ERROR: permission denied for function enum_eq (as the ordinary plan)
 (1 row)
 
 SET ROLE lion_exec_user;
