@@ -157,12 +157,17 @@ SELECT lion_cbcmp(format('SELECT count(*) FROM lion_cb WHERE tags && %L::int[] A
 						 (SELECT array_agg(g) FROM generate_series(1, 600) g)));
 SELECT lion_cbcmp(format('SELECT count(*) FROM lion_cb WHERE tags @> %L::int[]',
 						 (SELECT array_agg(g) FROM generate_series(1, 40) g)));
--- the bitmap scan of a two-column index walks the same evaluator
+-- the bitmap scan of a two-column index walks the same evaluator (its
+-- one-column indexes are dropped for it: their BitmapAnd is chosen otherwise,
+-- and takes 10 ms of CPU where the two-column index takes 26)
 SET pg_lion.enable_count_pushdown = off;
 SET enable_seqscan = off;
 SET enable_indexscan = off;
+BEGIN;
+DROP INDEX lion_cb_k, lion_cb_x;
 SELECT lion_cbplan('SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(1, 2000) g)) AND x = 1');
 SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(1, 2000) g)) AND x = 1;
+ROLLBACK;
 RESET enable_indexscan;
 SET enable_bitmapscan = off;
 RESET enable_seqscan;
