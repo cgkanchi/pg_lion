@@ -640,14 +640,37 @@ lion_probe_find(Relation index, LionState *state, LionProbe *probe,
  * *keeppin is set: the caller must keep a pin on buf and store it in
  * ps->pinbuf (DESIGN.md section 9).
  */
+static void lion_fill_posting_set_entry(Relation index, LionState *state,
+										const LionEntryTuple *entry,
+										Size itemsz, BlockNumber blkno,
+										OffsetNumber offnum,
+										LionPostingSet *ps, bool *keeppin);
+
 static void
 lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 					 OffsetNumber offnum, LionPostingSet *ps, bool *keeppin)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, offnum);
-	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
 
+	lion_fill_posting_set_entry(index, state,
+								(LionEntryTuple *) PageGetItem(page, iid),
+								ItemIdGetLength(iid), BufferGetBlockNumber(buf),
+								offnum, ps, keeppin);
+}
+
+/*
+ * The same from an entry tuple of itemsz bytes that was at (blkno, offnum): a
+ * leaf the caller holds locked, or a private copy of one taken under that lock
+ * while the caller still holds the leaf's pin (lion_entry_scan_next()), which
+ * is the pin *keeppin asks it to hand over.
+ */
+static void
+lion_fill_posting_set_entry(Relation index, LionState *state,
+							const LionEntryTuple *entry, Size itemsz,
+							BlockNumber blkno, OffsetNumber offnum,
+							LionPostingSet *ps, bool *keeppin)
+{
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
 	ps->attno = entry->attno;
@@ -655,7 +678,7 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 	ps->found = true;
 	ps->ntids = entry->ntids;
 	ps->ncontainers = entry->ncontainers;
-	ps->entryblk = BufferGetBlockNumber(buf);
+	ps->entryblk = blkno;
 	ps->entryoff = offnum;
 	ps->cxt = CurrentMemoryContext;
 	ps->nuses = 0;
@@ -684,7 +707,7 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 	{
 		ps->is_inline = true;
 		ps->head = InvalidBlockNumber;
-		ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
+		ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
 		if (ps->paylen > 0)
 		{
 			ps->payload = (char *) palloc(ps->paylen);
@@ -6200,6 +6223,9 @@ lion_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
  * Range restrictions (DESIGN.md §28)
  * --------------------------------------------------------------------- */
 
+static BlockNumber lion_range_bound_leaf(Relation index, LionRange *range,
+										 int bound);
+
 void
 lion_range_init(LionRange *range, Relation index, AttrNumber attno)
 {
@@ -6207,6 +6233,8 @@ lion_range_init(LionRange *range, Relation index, AttrNumber attno)
 	range->state = lion_index_column_state(index, attno);
 	range->ordered = range->state->ordered;
 	range->lower = -1;
+	range->upper = -1;
+	range->nupper = 0;
 	range->empty = false;
 }
 
@@ -6278,9 +6306,42 @@ lion_range_add(LionRange *range, Relation index, StrategyNumber strategy,
 		range->ordered = false;
 	}
 
-	if (LION_STRAT_IS_LOWER(strategy) && range->lower < 0)
-		range->lower = range->nbounds;
+	if (LION_STRAT_IS_LOWER(strategy))
+	{
+		if (range->lower < 0)
+			range->lower = range->nbounds;
+	}
+	else
+	{
+		range->upper = (range->nupper == 0) ? range->nbounds : -1;
+		range->nupper++;
+	}
 	range->nbounds++;
+}
+
+/* Does the stored key satisfy one bound? */
+static bool
+lion_range_bound_ok(LionRange *range, LionRangeBound *b, Datum key)
+{
+	int32		c;
+
+	if (!b->hascmp)
+		return DatumGetBool(FunctionCall2Coll(&b->opproc, b->collation,
+											  key, b->value));
+
+	c = DatumGetInt32(FunctionCall2Coll(&b->cmpproc, range->state->collation,
+										key, b->value));
+	switch (b->strategy)
+	{
+		case LION_STRAT_LT:
+			return c < 0;
+		case LION_STRAT_LE:
+			return c <= 0;
+		case LION_STRAT_GE:
+			return c >= 0;
+		default:
+			return c > 0;
+	}
 }
 
 /*
@@ -6315,35 +6376,8 @@ lion_range_test(LionRange *range, const LionEntryTuple *entry)
 	for (i = 0; i < range->nbounds; i++)
 	{
 		LionRangeBound *b = &range->bounds[i];
-		bool		ok;
 
-		if (b->hascmp)
-		{
-			int32		c = DatumGetInt32(FunctionCall2Coll(&b->cmpproc,
-															state->collation,
-															key, b->value));
-
-			switch (b->strategy)
-			{
-				case LION_STRAT_LT:
-					ok = (c < 0);
-					break;
-				case LION_STRAT_LE:
-					ok = (c <= 0);
-					break;
-				case LION_STRAT_GE:
-					ok = (c >= 0);
-					break;
-				default:
-					ok = (c > 0);
-					break;
-			}
-		}
-		else
-			ok = DatumGetBool(FunctionCall2Coll(&b->opproc,
-												b->collation, key, b->value));
-
-		if (ok)
+		if (lion_range_bound_ok(range, b, key))
 			continue;
 		if (range->ordered && !LION_STRAT_IS_LOWER(b->strategy))
 			return LION_RANGE_END;
@@ -6351,6 +6385,31 @@ lion_range_test(LionRange *range, const LionEntryTuple *entry)
 	}
 
 	return skip ? LION_RANGE_SKIP : LION_RANGE_MATCH;
+}
+
+/*
+ * Does a VALUE entry of the range's column fail an UPPER bound?  In an ordered
+ * range those entries are the column's last ones (the walk ABOVE the range,
+ * DESIGN.md §28), and every entry after the first of them fails one too.
+ */
+bool
+lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
+{
+	Datum		key;
+	int			i;
+
+	Assert(lion_entry_kind(entry) == LION_KIND_VALUE);
+	key = lion_fetch_key(range->state, LionEntryGetKey(entry));
+
+	for (i = 0; i < range->nbounds; i++)
+	{
+		LionRangeBound *b = &range->bounds[i];
+
+		if (!LION_STRAT_IS_LOWER(b->strategy) &&
+			!lion_range_bound_ok(range, b, key))
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -6370,6 +6429,19 @@ lion_range_test(LionRange *range, const LionEntryTuple *entry)
 BlockNumber
 lion_range_first_leaf(Relation index, LionRange *range)
 {
+	return lion_range_bound_leaf(index, range,
+								 range->ordered ? range->lower : -1);
+}
+
+/*
+ * The directory leaf the first entry at or above bound number `bound` lives
+ * on, as lion_range_first_leaf() finds its lower bound's; -1 is where the
+ * column's entries begin.  A walk ABOVE the range starts at its one upper
+ * bound's (DESIGN.md §28).
+ */
+static BlockNumber
+lion_range_bound_leaf(Relation index, LionRange *range, int bound)
+{
 	LionRangeBound *b;
 	LionSearchKey sk;
 	Buffer		buf;
@@ -6387,10 +6459,11 @@ lion_range_first_leaf(Relation index, LionRange *range)
 	 */
 	range->state = lion_index_column_state(index, range->state->attno);
 
-	if (!range->ordered || range->lower < 0)
+	if (bound < 0)
 		return lion_dir_column_first(index, range->state, NULL);
 
-	b = &range->bounds[range->lower];
+	b = &range->bounds[bound];
+	Assert(b->hascmp);
 	lion_search_key_init(range->state, &sk, LION_KIND_VALUE, b->value, 0);
 	sk.cmpproc = &b->cmpproc;
 
@@ -6407,8 +6480,16 @@ lion_range_first_leaf(Relation index, LionRange *range)
  * Iterating every entry of an index
  * --------------------------------------------------------------------- */
 
-void
-lion_entry_scan_begin_col(LionEntryScan *es, Relation index, AttrNumber attno)
+/*
+ * The most entries one leaf can hold: every item at least an entry header and
+ * a line pointer.  A batch is at most one leaf's worth (DESIGN.md §28).
+ */
+#define LION_LEAF_MAX_ENTRIES \
+	((int) (BLCKSZ / (MAXALIGN(LION_ENTRY_HDRSZ) + sizeof(ItemIdData))) + 1)
+
+/* Everything but where the walk starts. */
+static void
+lion_entry_scan_init(LionEntryScan *es, Relation index, AttrNumber attno)
 {
 	es->index = index;
 	es->state = lion_index_column_state(index, attno);
@@ -6421,19 +6502,49 @@ lion_entry_scan_begin_col(LionEntryScan *es, Relation index, AttrNumber attno)
 	 * The walk starts at (attno, MINF), a position below every entry of this
 	 * column and above every entry of the columns before it, and ends at the
 	 * first entry whose attno is not this one (DESIGN.md §24).  MINF is not a
-	 * kind any stored entry has, so "resume after the last key returned" -
-	 * which is what every later call does - starts at the column's first
-	 * entry without a special case.
+	 * kind any stored entry has, so "resume after the last key examined" -
+	 * which is what every leaf read does - starts at the column's first entry
+	 * without a special case.
 	 */
 	es->lastkind = LION_KIND_MINF;
 	es->lasthash = 0;
 	es->lastkeylen = 0;
 	es->lastkey = (char *) MemoryContextAllocZero(es->cxt, 1);
 	es->haslast = true;
-	es->blkno = lion_dir_column_first(index, es->state, NULL);
-	es->onpage = 0;
+	es->blkno = InvalidBlockNumber;
 	es->range = NULL;
+	es->part = LION_WALK_ALL;
 	es->done = false;
+
+	/*
+	 * The batch lives beside the position and is allocated once: one leaf's
+	 * entries fit in a block's worth of bytes, because that is where they
+	 * were copied from.
+	 */
+	es->batchcxt = AllocSetContextCreate(CurrentMemoryContext,
+										 "lion entry scan batch",
+										 ALLOCSET_DEFAULT_SIZES);
+	es->maxbatch = LION_LEAF_MAX_ENTRIES;
+	es->bentry = (LionEntryTuple **)
+		MemoryContextAlloc(es->batchcxt, sizeof(LionEntryTuple *) * es->maxbatch);
+	es->bsize = (Size *)
+		MemoryContextAlloc(es->batchcxt, sizeof(Size) * es->maxbatch);
+	es->boff = (OffsetNumber *)
+		MemoryContextAlloc(es->batchcxt, sizeof(OffsetNumber) * es->maxbatch);
+	es->bpage = (char *) MemoryContextAlloc(es->batchcxt, BLCKSZ);
+	es->nbatch = 0;
+	es->nextbatch = 0;
+	es->lastinline = -1;
+	es->batchblk = InvalidBlockNumber;
+	es->batchbuf = InvalidBuffer;
+	es->nleaves = 0;
+}
+
+void
+lion_entry_scan_begin_col(LionEntryScan *es, Relation index, AttrNumber attno)
+{
+	lion_entry_scan_init(es, index, attno);
+	es->blkno = lion_dir_column_first(index, es->state, NULL);
 }
 
 /*
@@ -6448,17 +6559,63 @@ void
 lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
 							AttrNumber attno, LionRange *range)
 {
-	lion_entry_scan_begin_col(es, index, attno);
 	if (range == NULL)
-		return;
+		lion_entry_scan_begin_col(es, index, attno);
+	else
+		lion_entry_scan_begin_part(es, index, attno, range, LION_WALK_INSIDE);
+}
 
-	/* The scan's state is the current one (see lion_range_first_leaf()). */
+/*
+ * ... and of the parts of it the range does NOT select (DESIGN.md §28, "The
+ * complement").  BELOW starts where the column does and stops at the first
+ * entry the range selects or that fails an upper bound.  ABOVE starts at the
+ * leaf its one upper bound lives on, as INSIDE starts at its lower bound's, and
+ * returns every entry that fails an upper bound until the column ends.  With
+ * more than one upper bound it is not known which is the tightest, so it
+ * starts where INSIDE does and passes over what the range selects: correct,
+ * and as slow as the walk it was meant to avoid, which the caller's choice of
+ * walk (lion_range_choose() in lion_customscan.c) sees and avoids.
+ */
+void
+lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
+						   AttrNumber attno, LionRange *range, int part)
+{
+	int			bound = -1;
+
+	lion_entry_scan_init(es, index, attno);
+
+	/* The scan's state is the current one (see lion_range_bound_leaf()). */
 	range->state = es->state;
 	es->range = range;
+	es->part = part;
 	if (range->empty)
+	{
 		es->done = true;
-	else
-		es->blkno = lion_range_first_leaf(index, range);
+		return;
+	}
+
+	switch (part)
+	{
+		case LION_WALK_INSIDE:
+			bound = range->ordered ? range->lower : -1;
+			break;
+		case LION_WALK_BELOW:
+			Assert(range->ordered);
+			bound = -1;
+			break;
+		case LION_WALK_ABOVE:
+			Assert(range->ordered);
+			if (range->nupper == 0)
+			{
+				es->done = true;
+				return;
+			}
+			bound = (range->nupper == 1) ? range->upper : range->lower;
+			break;
+		default:
+			elog(ERROR, "lion index: unknown part %d of a range walk", part);
+	}
+	es->blkno = lion_range_bound_leaf(index, range, bound);
 }
 
 /* Remember where to resume, as a KEY (see the comment on LionEntryScan). */
@@ -6484,196 +6641,378 @@ lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
 }
 
 /*
- * Fetch the next entry of the index, in directory order.
+ * Does the walk return this entry of its column?  *stop is set when no later
+ * entry can be returned either: the first entry past an upper bound ends a
+ * walk of what a range selects (DESIGN.md §28), and the first entry the range
+ * selects - or that fails an upper bound - ends the walk below it.
+ */
+static bool
+lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
+						bool *stop)
+{
+	int			r;
+
+	switch (es->part)
+	{
+		case LION_WALK_ALL:
+			return true;
+		case LION_WALK_INSIDE:
+			r = lion_range_test(es->range, entry);
+			if (r == LION_RANGE_END)
+				*stop = true;
+			return r == LION_RANGE_MATCH;
+		case LION_WALK_BELOW:
+			if (lion_entry_kind(entry) != LION_KIND_VALUE)
+				return false;
+			r = lion_range_test(es->range, entry);
+			if (r != LION_RANGE_SKIP)
+				*stop = true;
+			return r == LION_RANGE_SKIP;
+		case LION_WALK_ABOVE:
+			if (lion_entry_kind(entry) != LION_KIND_VALUE)
+				return false;
+			return lion_range_fails_upper(es->range, entry);
+	}
+	return false;
+}
+
+/*
+ * Read the leaf the walk stands at, ONCE, and take what the walk selects from
+ * it: copies of the entries into the batch (copy), or only how many there are.
+ * Returns how many were taken.
  *
- * The scan gives up its lock on a leaf between calls and comes back to the
- * first key ABOVE the last one it returned, which is what makes it safe
- * against everything a sorted directory does to offsets: an insert in the
- * middle of a leaf shifts them, a split moves the upper half to a page
- * further right, and VACUUM deletes entries outright (DESIGN.md §18, §21).
+ * Everything is decided under one share lock: where to resume on this leaf
+ * (the first key above the last one examined, however the leaf has changed
+ * since the walk left it), which entries the walk returns, where the next
+ * read resumes (after the last entry examined here, which may be one the walk
+ * passed over) and which leaf it reads next - the right link as it stands,
+ * unless the walk ended here.  The lock is then given up; the pin is kept
+ * while the batch holds an INLINE copy (see lion_entry_scan_next()).
+ */
+static int64
+lion_entry_scan_fill(LionEntryScan *es, bool copy)
+{
+	LionState  *state = es->state;
+	Buffer		buf;
+	Page		page;
+	OffsetNumber off;
+	OffsetNumber maxoff;
+	LionEntryTuple *last = NULL;
+	char	   *dst = es->bpage;
+	int64		ntaken = 0;
+	bool		stop = false;
+
+	Assert(es->nextbatch >= es->nbatch);
+	Assert(!BufferIsValid(es->batchbuf));
+	es->nbatch = 0;
+	es->nextbatch = 0;
+	es->lastinline = -1;
+
+	/*
+	 * Test hook: the walk is between two leaves and holds nothing of the
+	 * directory at all - no lock, and no pin of its own - so a concurrent
+	 * insert may split the leaf it has just left and the one it is about to
+	 * read.  It fires before every leaf but the first, in a counting walk
+	 * (lion_entry_scan_skip_leaf()) as in a fetching one;
+	 * test/isolation/count_range_split_race.spec parks the race of
+	 * lion_range_choose() here.  Compiles to nothing without
+	 * --enable-injection-points.
+	 */
+	if (es->nleaves > 0)
+		LION_INJECTION_POINT("lion-entry-scan-leaf");
+
+	buf = ReadBuffer(es->index, es->blkno);
+	lion_dir_pages_read++;
+	es->nleaves++;
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (!LionPageIsLeaf(page))
+	{
+		UnlockReleaseBuffer(buf);
+		elog(ERROR, "lion index: block %u is not a directory leaf",
+			 es->blkno);
+	}
+
+	if (es->haslast)
+	{
+		LionSearchKey sk;
+
+		sk.attno = es->attno;
+		sk.col = state;
+		sk.kind = es->lastkind;
+		sk.key = (es->lastkind == LION_KIND_VALUE) ?
+			lion_fetch_key(state, es->lastkey) : (Datum) 0;
+		sk.hash = es->lasthash;
+		sk.cmpproc = state->ordered ? &state->cmpproc : NULL;
+		sk.eqproc = &state->eqproc;
+		sk.collation = state->collation;
+		sk.raw = es->lastkey;
+		sk.rawlen = es->lastkeylen;
+
+		/*
+		 * Everything on this page may already be behind us, which is what a
+		 * split of the page we were on looks like from here.
+		 */
+		if (!LionPageIsRightmost(page) &&
+			lion_cmp_entry(lion_dir_highkey(page), &sk) <= 0)
+		{
+			es->blkno = LionPageGetOpaque(page)->rightlink;
+			UnlockReleaseBuffer(buf);
+			return 0;
+		}
+
+		off = lion_dir_binsrch(page, &sk);
+		while (off <= PageGetMaxOffsetNumber(page) &&
+			   lion_cmp_entry(lion_page_entry(page, off), &sk) <= 0)
+			off = OffsetNumberNext(off);
+	}
+	else
+		off = lion_page_first_data(page);
+
+	maxoff = PageGetMaxOffsetNumber(page);
+
+	for (; off <= maxoff; off++)
+	{
+		ItemId		iid = PageGetItemId(page, off);
+		LionEntryTuple *entry;
+
+		if (!ItemIdIsUsed(iid))
+			continue;
+		entry = (LionEntryTuple *) PageGetItem(page, iid);
+
+		/*
+		 * The walk is bounded to one key column (DESIGN.md §24): the entries
+		 * are sorted by attno, so the first entry of the next column ends it.
+		 */
+		if (entry->attno != es->attno)
+		{
+			stop = true;
+			break;
+		}
+
+		/*
+		 * A bounded walk (DESIGN.md §28) returns only the entries of its part
+		 * of the range, and may end here.
+		 */
+		if (!lion_entry_scan_selects(es, entry, &stop))
+		{
+			if (stop)
+				break;
+			last = entry;
+			continue;
+		}
+		last = entry;
+
+		/*
+		 * An entry whose posting set is empty can never produce a group.
+		 * VACUUM deletes those (DESIGN.md §18), but one can be seen here
+		 * between the moment its last TID was filtered out and the moment the
+		 * leaf's final step removes it.
+		 */
+		if (entry->ntids == 0)
+			continue;
+
+		ntaken++;
+		if (copy)
+		{
+			Size		sz = ItemIdGetLength(iid);
+			int			n = es->nbatch;
+
+			if (unlikely(n >= es->maxbatch ||
+						 dst + sz > es->bpage + BLCKSZ))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": directory leaf %u holds more entries than fit on a page",
+								RelationGetRelationName(es->index),
+								BufferGetBlockNumber(buf))));
+			memcpy(dst, entry, sz);
+			es->bentry[n] = (LionEntryTuple *) dst;
+			es->bsize[n] = sz;
+			es->boff[n] = off;
+			if ((entry->flags & LION_ENTRY_INLINE) != 0)
+				es->lastinline = n;
+			es->nbatch = n + 1;
+			dst += MAXALIGN(sz);
+		}
+	}
+
+	/* The next read of any leaf resumes after the last entry examined here. */
+	if (last != NULL)
+		lion_entry_scan_remember(es, last);
+
+	es->batchblk = BufferGetBlockNumber(buf);
+	if (stop)
+		es->done = true;
+	else
+	{
+		/*
+		 * Everything this leaf holds after the resume position has been
+		 * examined, so the walk goes on at the right sibling this leaf had
+		 * when it was read, without reading this leaf again.  What a split of
+		 * it moves to a new page in between after that are entries the batch
+		 * has already, or entries inserted since, which hold no row this
+		 * walk's snapshot can see (DESIGN.md §28, "One read per leaf").
+		 */
+		es->blkno = LionPageGetOpaque(page)->rightlink;
+		if (!BlockNumberIsValid(es->blkno))
+			es->done = true;
+	}
+
+	/*
+	 * DESIGN.md section 9: an INLINE copy is counted against the visibility
+	 * map, so the leaf it was copied from stays pinned until that set has been
+	 * handed out.  A batch without one needs no pin at all.
+	 */
+	if (es->lastinline >= 0)
+	{
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		es->batchbuf = buf;
+	}
+	else
+		UnlockReleaseBuffer(buf);
+
+	return ntaken;
+}
+
+/*
+ * Fetch the next entry of the walk, in directory order.
  *
- * Nothing is therefore skipped or returned twice.  A split moves entries only
- * rightwards onto a page this walk has not passed, and their keys are still
- * above the last one returned, so they come out exactly once.  A deleted
- * entry is simply gone, and only an EMPTY posting set is ever deleted, so its
- * group had nothing this scan's snapshot could have counted.  An entry
- * INSERTED behind the walk is missed, which is the same freedom the bucket
- * walk had: it can only hold TIDs no older snapshot can see.
+ * The entries come out of the batch the last leaf read copied (DESIGN.md §28,
+ * "One read per leaf"), so a leaf is read once however many of its entries
+ * the walk returns - it used to be read again for every entry, to find "the
+ * first key above the last one returned" on it, which made a range over n
+ * keys read n leaves and more.  Handing out a copy after the lock is gone is
+ * safe for the reasons a resumed scan always was:
+ *
+ *	- a split moves entries only rightwards, onto a page the walk has not
+ *	  passed; the ones that were on this leaf when it was read are in the
+ *	  batch, and the walk reads next the right sibling the leaf had then, so
+ *	  nothing is skipped or returned twice;
+ *	- a deleted entry had an empty posting set, which nothing this walk's
+ *	  snapshot can see was in (§18), and a CHAIN copy whose set was freed
+ *	  meanwhile reads as empty (the owner check of §18);
+ *	- an entry inserted after the leaf was read holds only rows no older
+ *	  snapshot can see (§29.5 case 3), so missing it is right - the same
+ *	  freedom the walk has always had behind its position;
+ *	- and an INLINE payload is counted under the pin of the leaf it was copied
+ *	  from, which the scan holds from the copy until the set is handed out and
+ *	  the set holds after that: §9's rule, only with the pin taken once for the
+ *	  leaf instead of once per entry.
  */
 bool
 lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 {
-	LionState  *state = es->state;
+	int			i;
+	bool		keeppin;
 
-	while (!es->done && BlockNumberIsValid(es->blkno))
+	while (es->nextbatch >= es->nbatch)
 	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber maxoff;
-		OffsetNumber off;
-		BlockNumber next;
-		bool		got = false;
-		LionSearchKey sk;
-
-		/*
-		 * Test hook: the scan is between two entries of one leaf and holds no
-		 * lock on it at all, so a concurrent VACUUM is free to delete entries
-		 * and a concurrent insert to split the page.  It fires once per leaf,
-		 * which is what lets an isolation test park a GROUP BY here exactly
-		 * once; test/isolation/vacuum_entry_delete.spec and
-		 * test/isolation/dir_split_scan.spec are those two cases.  Compiles to
-		 * nothing without --enable-injection-points.
-		 */
-		if (es->onpage == 1)
-			LION_INJECTION_POINT("lion-entry-scan-resumed");
-
-		buf = ReadBuffer(es->index, es->blkno);
-		lion_dir_pages_read++;
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		if (!LionPageIsLeaf(page))
+		if (es->done || !BlockNumberIsValid(es->blkno))
 		{
-			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index: block %u is not a directory leaf",
-				 es->blkno);
+			es->done = true;
+			return false;
 		}
-
-		if (es->haslast)
-		{
-			sk.attno = es->attno;
-			sk.col = state;
-			sk.kind = es->lastkind;
-			sk.key = (es->lastkind == LION_KIND_VALUE) ?
-				lion_fetch_key(state, es->lastkey) : (Datum) 0;
-			sk.hash = es->lasthash;
-			sk.cmpproc = state->ordered ? &state->cmpproc : NULL;
-			sk.eqproc = &state->eqproc;
-			sk.collation = state->collation;
-			sk.raw = es->lastkey;
-			sk.rawlen = es->lastkeylen;
-
-			/*
-			 * Everything on this page may already be behind us, which is what
-			 * a split of the page we were on looks like from here.
-			 */
-			if (!LionPageIsRightmost(page) &&
-				lion_cmp_entry(lion_dir_highkey(page), &sk) <= 0)
-			{
-				next = LionPageGetOpaque(page)->rightlink;
-				UnlockReleaseBuffer(buf);
-				es->blkno = next;
-				es->onpage = 0;
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-
-			off = lion_dir_binsrch(page, &sk);
-			while (off <= PageGetMaxOffsetNumber(page) &&
-				   lion_cmp_entry(lion_page_entry(page, off), &sk) <= 0)
-				off = OffsetNumberNext(off);
-		}
-		else
-			off = lion_page_first_data(page);
-
-		maxoff = PageGetMaxOffsetNumber(page);
-
-		for (; off <= maxoff; off++)
-		{
-			ItemId		iid = PageGetItemId(page, off);
-			LionEntryTuple *entry;
-			bool		keeppin;
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			entry = (LionEntryTuple *) PageGetItem(page, iid);
-
-			/*
-			 * The walk is bounded to one key column (DESIGN.md §24): the
-			 * entries are sorted by attno, so the first entry of the next
-			 * column ends the scan.
-			 */
-			if (entry->attno != es->attno)
-			{
-				UnlockReleaseBuffer(buf);
-				es->done = true;
-				return false;
-			}
-
-			/*
-			 * A bounded walk (DESIGN.md §28) returns only the entries its range
-			 * selects, and ends at the first one past an upper bound.
-			 */
-			if (es->range != NULL)
-			{
-				int			r = lion_range_test(es->range, entry);
-
-				if (r == LION_RANGE_END)
-				{
-					UnlockReleaseBuffer(buf);
-					es->done = true;
-					return false;
-				}
-				if (r == LION_RANGE_SKIP)
-				{
-					lion_entry_scan_remember(es, entry);
-					continue;
-				}
-			}
-
-			/*
-			 * An entry whose posting set is empty can never produce a group.
-			 * VACUUM deletes those (DESIGN.md §18), but one can be seen here
-			 * between the moment its last TID was filtered out and the moment
-			 * the leaf's final step removes it.
-			 */
-			if (entry->ntids == 0)
-			{
-				lion_entry_scan_remember(es, entry);
-				continue;
-			}
-
-			lion_fill_posting_set(es->index, state, buf, off, ps, &keeppin);
-			*key = ps->storedkey;
-			if (keeppin)
-			{
-				/*
-				 * DESIGN.md section 9: the INLINE payload we just copied out
-				 * needs a pin of its own on this leaf, independent of the
-				 * scan's position.
-				 */
-				IncrBufferRefCount(buf);
-				ps->pinbuf = buf;
-			}
-
-			lion_entry_scan_remember(es, entry);
-			es->onpage++;
-			got = true;
-			break;
-		}
-
-		next = LionPageGetOpaque(page)->rightlink;
-		UnlockReleaseBuffer(buf);
-
-		if (got)
-			return true;
-
-		es->blkno = next;
-		es->onpage = 0;
 		CHECK_FOR_INTERRUPTS();
+		(void) lion_entry_scan_fill(es, true);
 	}
 
-	es->done = true;
-	return false;
+	i = es->nextbatch++;
+
+	/*
+	 * Test hook: the walk is between two entries of one leaf and holds no lock
+	 * on it at all (a pin only while an INLINE copy is still to come), so a
+	 * concurrent VACUUM is free to delete entries and a concurrent insert to
+	 * split the page.  It fires once per leaf, which is what lets an isolation
+	 * test park a walk here exactly once; test/isolation/vacuum_entry_delete,
+	 * dir_split_scan and count_range_split_race are such cases.  Compiles to
+	 * nothing without --enable-injection-points.
+	 */
+	if (i == 1)
+		LION_INJECTION_POINT("lion-entry-scan-resumed");
+
+	lion_fill_posting_set_entry(es->index, es->state, es->bentry[i],
+								es->bsize[i], es->batchblk, es->boff[i], ps,
+								&keeppin);
+	*key = ps->storedkey;
+	if (keeppin)
+	{
+		/*
+		 * DESIGN.md section 9: the INLINE payload needs a pin of its own on the
+		 * leaf it was copied from.  The last INLINE copy of the batch takes the
+		 * scan's pin over.
+		 */
+		Assert(BufferIsValid(es->batchbuf));
+		if (i == es->lastinline)
+		{
+			ps->pinbuf = es->batchbuf;
+			es->batchbuf = InvalidBuffer;
+		}
+		else
+		{
+			IncrBufferRefCount(es->batchbuf);
+			ps->pinbuf = es->batchbuf;
+		}
+	}
+
+	return true;
+}
+
+int64
+lion_entry_scan_skip_leaf(LionEntryScan *es)
+{
+	Assert(es->nextbatch >= es->nbatch);
+
+	if (es->done || !BlockNumberIsValid(es->blkno))
+	{
+		es->done = true;
+		return 0;
+	}
+	return lion_entry_scan_fill(es, false);
+}
+
+/*
+ * No pin across a row (see lion_count.h).  Called with at least one entry of
+ * the batch handed out, which is where the leaf is read again from: the walk
+ * resumes after it, so the INLINE copies dropped here come back in the next
+ * batch - or, if VACUUM or a split has moved them meanwhile, from wherever
+ * the key-based resume finds them.  A batch with nothing handed out yet (no
+ * caller pauses there) keeps its pin rather than lose its position.
+ */
+void
+lion_entry_scan_pause(LionEntryScan *es)
+{
+	if (!BufferIsValid(es->batchbuf) || es->nextbatch == 0)
+		return;
+
+	ReleaseBuffer(es->batchbuf);
+	es->batchbuf = InvalidBuffer;
+	lion_entry_scan_remember(es, es->bentry[es->nextbatch - 1]);
+	es->nbatch = es->nextbatch;
+	es->lastinline = -1;
+	es->blkno = es->batchblk;
+	es->done = false;
 }
 
 void
 lion_entry_scan_end(LionEntryScan *es)
 {
 	es->done = true;
+	if (BufferIsValid(es->batchbuf))
+	{
+		ReleaseBuffer(es->batchbuf);
+		es->batchbuf = InvalidBuffer;
+	}
+	es->nbatch = 0;
+	es->nextbatch = 0;
 	if (es->cxt != NULL)
 	{
 		MemoryContextDelete(es->cxt);
 		es->cxt = NULL;
+	}
+	if (es->batchcxt != NULL)
+	{
+		MemoryContextDelete(es->batchcxt);
+		es->batchcxt = NULL;
 	}
 }
 
