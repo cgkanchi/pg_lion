@@ -169,6 +169,10 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 
 /* Flag bits of the join member of custom_private (LION_PRIV_JOIN). */
 #define LION_JOINFLAG_COLLECT	0x01	/* the fact filters are collected once */
+#define LION_JOINFLAG_ROWS		0x02	/* one row per dimension row that joins
+										 * (or, for an anti join, that does
+										 * not), for a core Agg above to
+										 * aggregate: count(DISTINCT) */
 
 /*
  * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
@@ -832,6 +836,7 @@ typedef struct LionCountScanState
 	 */
 	int			jointype;
 	bool		joincollect;
+	bool		joinrows;
 	bool		joincollected;
 	bool		joinfiltered;
 	LionPostingSet joinfilter;
@@ -4510,6 +4515,233 @@ lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
 }
 
 /*
+ * Is the aggregate a count(DISTINCT x) the FK-side join can hand to a core Agg
+ * above rows of its own (DESIGN.md §27, "count(DISTINCT)")?  Those rows are
+ * the dimension rows that join - one each, however many fact rows each joins
+ * - and a DISTINCT count does not see multiplicity, so over them it is the
+ * join's own for any x the rows carry:
+ *
+ *	- a column of the dimension: its values come out of the dimension's
+ *	  tuples, as they would out of the join's;
+ *	- the fact's join column, in an inner join, which the rows carry as the
+ *	  dimension's key.  Every fact value a dimension row joins is equal to
+ *	  that row's key under the join's operator; if that is the equality the
+ *	  DISTINCT compares with - the same operator or one of its btree or hash
+ *	  family (equality_ops_are_compatible()) - under the same collation, then
+ *	  the fact values of one dimension row are one distinct value, and the
+ *	  key is it.  Two dimension rows with equal keys are one value too, which
+ *	  the Agg's own DISTINCT sees: uniqueness is not what makes this exact.
+ *	  The key is emitted where the fact's column stands, so the two have to be
+ *	  of one type.
+ *
+ * No FILTER, no ORDER BY, one argument; the Agg evaluates the rest.
+ */
+static bool
+lion_fkjoin_agg_is_distinct(Aggref *agg, const LionFkJoin *fj)
+{
+	TargetEntry *tle;
+	SortGroupClause *sgc;
+	Node	   *arg;
+	Var		   *v;
+
+	if (agg->aggfnoid != F_COUNT_ANY)
+		return false;
+	if (list_length(agg->aggdistinct) != 1 || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->aggvariadic)
+		return false;
+	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->aggkind != AGGKIND_NORMAL)
+		return false;
+	if (list_length(agg->args) != 1)
+		return false;
+	tle = (TargetEntry *) linitial(agg->args);
+	if (!IsA(tle, TargetEntry))
+		return false;
+	arg = lion_strip((Node *) tle->expr);
+	if (arg == NULL || !IsA(arg, Var))
+		return false;
+	v = (Var *) arg;
+	if (v->varlevelsup != 0 || v->varattno <= 0)
+		return false;
+
+	if (v->varno == fj->pkvar->varno)
+		return true;			/* a dimension column */
+
+	if (v->varno != fj->fkvar->varno || v->varattno != fj->fkvar->varattno)
+		return false;
+	if (fj->jointype != JOIN_INNER)
+		return false;
+	if (fj->fkvar->vartype != fj->pkvar->vartype)
+		return false;
+	sgc = (SortGroupClause *) linitial(agg->aggdistinct);
+	if (!IsA(sgc, SortGroupClause) || !OidIsValid(sgc->eqop))
+		return false;
+	if (!equality_ops_are_compatible(sgc->eqop, fj->opno))
+		return false;
+	if (agg->inputcollid != fj->collation)
+		return false;
+	return true;
+}
+
+/*
+ * The custom_private of an FK-side join path (DESIGN.md §27): the members
+ * lion_try_fkjoin_path() built, with the join member of this path - the
+ * clause, the kind of join and the flags - in LION_PRIV_JOIN.
+ */
+static List *
+lion_fkjoin_private(List *base, int joinclause, int jointype, int flags)
+{
+	List	   *priv = list_copy(base);
+
+	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
+		list_make3_int(joinclause, jointype, flags);
+	return priv;
+}
+
+/*
+ * The FK-side join path (DESIGN.md §27) over `child`, the dimension's
+ * cheapest path, and what goes above it into the grouped rel.
+ *
+ * The node streams one row per dimension row that joins (a partial count, or
+ * the row itself for count(DISTINCT)), so it starts when its child does, and
+ * it costs the child plus what it does per dimension row.
+ *
+ * Above it goes core's Finalize Agg over the partial counts - or, for emitted
+ * rows, a Sort by the query's group pathkeys (the GROUP BY columns and the
+ * DISTINCT arguments core may have chosen to presort) and core's plain Agg.
+ */
+static void
+lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
+					  RelOptInfo *output_rel, const LionFkJoin *fj,
+					  List *having, LionCountTarget *first, Path *child,
+					  PathTarget *nodetarget, List *base,
+					  int joinclause, int jointype, bool emitrows,
+					  List *whereclauses, List *wherekinds, List *ors,
+					  double dimrows)
+{
+	Query	   *parse = root->parse;
+	CustomPath *cpath;
+	Path	   *input;
+	double		childrows = clamp_row_est(child->rows);
+	double		rows;
+	double		numgroups;
+	bool		collect;
+	Cost		run;
+	int			flags;
+	AggStrategy aggstrategy;
+	AggClauseCosts agg_costs;
+
+	run = lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
+							   whereclauses, wherekinds, ors, childrows,
+							   jointype != LION_JOIN_INNER || emitrows,
+							   &collect);
+	flags = (collect ? LION_JOINFLAG_COLLECT : 0) |
+		(emitrows ? LION_JOINFLAG_ROWS : 0);
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = nodetarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	cpath->path.pathkeys = NIL;
+	cpath->flags = 0;
+	cpath->custom_paths = list_make1(child);
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	cpath->custom_private = lion_fkjoin_private(base, joinclause, jointype,
+												flags);
+	cpath->methods = &lion_count_path_methods;
+
+	/*
+	 * At most one row per dimension row comes out.  A semi or anti join's
+	 * rows are exactly the join's, whose estimate the planner has made
+	 * already.
+	 */
+	rows = (jointype == LION_JOIN_INNER) ? childrows :
+		clamp_row_est(Min(fj->joinrel->rows, childrows));
+	cpath->path.rows = rows;
+	cpath->path.startup_cost = child->startup_cost;
+	cpath->path.total_cost = child->total_cost + run;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = child->disabled_nodes;
+#endif
+
+	input = &cpath->path;
+
+	if (!emitrows)
+	{
+		/* ---- the Finalize Agg that groups the partial counts ---- */
+		if (root->processed_groupClause != NIL)
+		{
+			aggstrategy = AGG_HASHED;
+			numgroups = estimate_num_groups(root,
+											get_sortgrouplist_exprs(root->processed_groupClause,
+																	root->processed_tlist),
+											rows, NULL, NULL);
+		}
+		else
+		{
+			aggstrategy = (parse->groupClause != NIL) ? AGG_SORTED : AGG_PLAIN;
+			numgroups = 1.0;
+		}
+
+		MemSet(&agg_costs, 0, sizeof(agg_costs));
+		get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_costs);
+
+		add_path(output_rel, (Path *)
+				 create_agg_path(root, output_rel, input,
+								 output_rel->reltarget,
+								 aggstrategy, AGGSPLIT_FINAL_DESERIAL,
+								 root->processed_groupClause,
+								 having,
+								 &agg_costs,
+								 numgroups));
+		return;
+	}
+
+	/*
+	 * ---- core's own Agg over the dimension rows that join ----
+	 *
+	 * Sorted by root->group_pathkeys, which is the GROUP BY followed by the
+	 * DISTINCT arguments core decided to presort (the aggregates it marked
+	 * aggpresorted, whose DISTINCT then only compares neighbours): the order
+	 * core's own sorted Agg would be given.
+	 */
+	if (root->group_pathkeys != NIL)
+		input = (Path *) create_sort_path(root, output_rel, input,
+										  root->group_pathkeys, -1.0);
+	if (root->processed_groupClause != NIL)
+	{
+		aggstrategy = AGG_SORTED;
+		numgroups = estimate_num_groups(root,
+										get_sortgrouplist_exprs(root->processed_groupClause,
+																root->processed_tlist),
+										rows, NULL, NULL);
+	}
+	else
+	{
+		aggstrategy = (parse->groupClause != NIL) ? AGG_SORTED : AGG_PLAIN;
+		numgroups = 1.0;
+	}
+
+	MemSet(&agg_costs, 0, sizeof(agg_costs));
+	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &agg_costs);
+
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, input,
+							 output_rel->reltarget,
+							 aggstrategy, AGGSPLIT_SIMPLE,
+							 root->processed_groupClause,
+							 having,
+							 &agg_costs,
+							 numgroups));
+}
+
+/*
  * The rest of lion_try_count_path() for the FK-side join (DESIGN.md §27).
  *
  * The caller has analysed the FACT rel's WHERE clauses exactly as it does for
@@ -4522,16 +4754,22 @@ lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
  *	  opfamily for the join operator, a cross-type equality and hash for the
  *	  dimension key's type, the clause's collation - which is everything a
  *	  lookup needs to answer `f.fk = <that row's key>` exactly (§10);
- *	- the target list: the dimension's columns (in any non-volatile
- *	  expression) and count aggregates, nothing of the fact rel's.  The groups
- *	  are the dimension's and are formed by core's Finalize Agg, so neither
- *	  the grouping-equality rule nor the value-representation rule of §10 has
- *	  anything to check: no index drives the groups and no index key is
- *	  printed;
- *	- the path: a CustomPath whose child is the dimension's cheapest path and
- *	  whose target is the partially-grouped one, under a Finalize Agg - hashed
- *	  for a GROUP BY, sorted over no columns for a GROUP BY the planner folded
- *	  to constants (an empty join has no group then), plain without one.
+ *	- the target list, which decides what the node emits.  Counts - count(*),
+ *	  count(1), count of the key - are PARTIAL counts per dimension row, and
+ *	  core's Finalize Agg above groups and adds them: hashed for a GROUP BY,
+ *	  sorted over no columns for a GROUP BY the planner folded to constants
+ *	  (an empty join has no group then), plain without one.  count(DISTINCT)
+ *	  of the key or of a dimension column has no partial form; then the node
+ *	  emits the dimension ROWS that join, one each, and core's own Agg - over
+ *	  a Sort by the query's group pathkeys, which is what its DISTINCT and a
+ *	  GROUP BY of it expect - computes the aggregates as it would over the
+ *	  join (lion_fkjoin_agg_is_distinct()).  The two do not mix: a count of
+ *	  pairs cannot come out of rows that stand for dimension rows.  Either
+ *	  way the groups are the dimension's and core forms them, so neither the
+ *	  grouping-equality rule nor the value-representation rule of §10 has
+ *	  anything to check;
+ *	- the path: the node over the dimension's cheapest path
+ *	  (lion_add_fkjoin_paths()).
  */
 static void
 lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
@@ -4541,7 +4779,6 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 					 List *whereconsts, List *wherekinds, List *whereopnos,
 					 List *whereinor, List *ors)
 {
-	Query	   *parse = root->parse;
 	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
 	List	   *exprs;
 	List	   *items;
@@ -4550,37 +4787,22 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	int			joinclause;
 	List	   *targets = NIL;
 	LionCountTarget *first;
-	PathTarget *partialtarget;
-	CustomPath *cpath;
+	PathTarget *nodetarget;
 	List	   *oids;
 	List	   *ints;
 	List	   *consts = NIL;
 	List	   *ckinds = NIL;
+	List	   *base;
 	double		dimrows;
-	double		numgroups;
 	int			jointype;
-	bool		collect;
-	Cost		run;
-	AggStrategy aggstrategy;
-	AggClauseCosts agg_final_costs;
-	bool		haveagg = false;
+	bool		emitrows;
+	int			ncount = 0;
+	int			ndistinct = 0;
 	ListCell   *lc;
 	ListCell   *l1;
 	ListCell   *l2;
 	ListCell   *l3;
 	int			i;
-
-	/*
-	 * The grouping is done above the node, from partial counts, so the
-	 * planner has to consider the aggregates splittable and a GROUP BY has to
-	 * be hashable (a sorted Finalize Agg would need a Sort over the node,
-	 * which v1 does not build).
-	 */
-	if (extra == NULL || (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0)
-		return;
-	if (root->processed_groupClause != NIL &&
-		!grouping_is_hashable(root->processed_groupClause))
-		return;
 
 	/* ---- the target and the HAVING: dimension columns and counts ---- */
 	exprs = list_copy(output_rel->reltarget->exprs);
@@ -4620,15 +4842,72 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		}
 		else if (IsA(node, Aggref))
 		{
-			if (!lion_fkjoin_agg_is_count((Aggref *) node, fj))
+			if (lion_fkjoin_agg_is_count((Aggref *) node, fj))
+				ncount++;
+			else if (lion_fkjoin_agg_is_distinct((Aggref *) node, fj))
+				ndistinct++;
+			else
 				return;
-			haveagg = true;
 		}
 		else
 			return;
 	}
-	if (!haveagg)
+	if (ncount + ndistinct == 0 || (ncount > 0 && ndistinct > 0))
 		return;
+	emitrows = (ndistinct > 0);
+
+	if (!emitrows)
+	{
+		/*
+		 * The grouping is done above the node, from partial counts, so the
+		 * planner has to consider the aggregates splittable and a GROUP BY
+		 * has to be hashable (a sorted Finalize Agg would need a Sort over
+		 * the node, which is not built for partial counts).
+		 */
+		if (extra == NULL || (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0)
+			return;
+		if (root->processed_groupClause != NIL &&
+			!grouping_is_hashable(root->processed_groupClause))
+			return;
+		nodetarget = lion_make_partial_target(root, output_rel->reltarget,
+											  having);
+	}
+	else
+	{
+		/*
+		 * The node's rows are the grouping input - the target core would
+		 * have computed over the join, which the scan/join rel carries by
+		 * now: the grouping expressions and the columns the aggregates read.
+		 * Every column in it has to be one the rows carry: the dimension's,
+		 * or the fact's join column that a DISTINCT count reads, which the
+		 * node emits as the key.  A DISTINCT aggregate groups by sorting, so
+		 * a GROUP BY must be sortable.
+		 */
+		if (root->processed_groupClause != NIL &&
+			!grouping_is_sortable(root->processed_groupClause))
+			return;
+		nodetarget = fj->joinrel->reltarget;
+		if (contain_volatile_functions((Node *) nodetarget->exprs))
+			return;
+		items = pull_var_clause((Node *) nodetarget->exprs,
+								PVC_RECURSE_AGGREGATES |
+								PVC_RECURSE_WINDOWFUNCS |
+								PVC_INCLUDE_PLACEHOLDERS);
+		foreach(lc, items)
+		{
+			Var		   *v = (Var *) lfirst(lc);
+
+			if (!IsA(v, Var) || v->varlevelsup != 0 || v->varattno <= 0)
+				return;
+			if (v->varno == (int) fj->dimrel->relid)
+				continue;
+			if (v->varno == fj->fkvar->varno &&
+				v->varattno == fj->fkvar->varattno &&
+				fj->jointype == JOIN_INNER)
+				continue;
+			return;
+		}
+	}
 
 	/*
 	 * An IN list whose array is a parameter - or any other expression that
@@ -4678,15 +4957,10 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		return;
 	first = (LionCountTarget *) linitial(targets);
 
-	/* ---- the path ---- */
+	/* ---- what every path of it carries ---- */
 	dimrows = clamp_row_est(fj->dimpath->rows);
-	partialtarget = lion_make_partial_target(root, output_rel->reltarget,
-											 having);
 	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI :
 		(fj->jointype == JOIN_ANTI) ? LION_JOIN_ANTI : LION_JOIN_INNER;
-	run = lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
-							   whereclauses, wherekinds, ors, dimrows,
-							   jointype != LION_JOIN_INNER, &collect);
 
 	oids = list_make3_oid(rte->relid, InvalidOid, InvalidOid);
 	ints = list_make4_int((int) rel->relid, 0, 0, 0);
@@ -4702,84 +4976,25 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		i++;
 	}
 
-	cpath = makeNode(CustomPath);
-	cpath->path.pathtype = T_CustomScan;
-	cpath->path.parent = output_rel;
-	cpath->path.pathtarget = partialtarget;
-	cpath->path.param_info = NULL;
-	cpath->path.parallel_aware = false;
-	cpath->path.parallel_safe = false;
-	cpath->path.parallel_workers = 0;
-	cpath->path.pathkeys = NIL;
-	cpath->flags = 0;
-	cpath->custom_paths = list_make1(fj->dimpath);
-#if PG_VERSION_NUM >= 170000
-	cpath->custom_restrictinfo = NIL;
-#endif
-	cpath->custom_private = list_make1(list_make2_int(LION_PRIV_MAGIC,
-													  LION_PRIV_NMEMBERS));
-	cpath->custom_private = lappend(cpath->custom_private, oids);
-	cpath->custom_private = lappend(cpath->custom_private, ints);
-	cpath->custom_private = lappend(cpath->custom_private, consts);
-	cpath->custom_private = lappend(cpath->custom_private, ckinds);
-	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* parts */
-	cpath->custom_private = lappend(cpath->custom_private, whereopnos);
-	cpath->custom_private = lappend(cpath->custom_private, ors);
-	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* having */
-	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* distinct */
-	cpath->custom_private = lappend(cpath->custom_private,
-									list_make3_int(joinclause, jointype,
-												   collect ?
-												   LION_JOINFLAG_COLLECT : 0));
-	/* the dimension's GROUP BY is the Finalize Agg's, which checks it */
-	cpath->custom_private = lappend(cpath->custom_private,
-									lion_replaced_functions(rel,
-															output_rel->reltarget->exprs,
-															having, NIL, fj));
-	cpath->methods = &lion_count_path_methods;
+	base = list_make1(list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS));
+	base = lappend(base, oids);
+	base = lappend(base, ints);
+	base = lappend(base, consts);
+	base = lappend(base, ckinds);
+	base = lappend(base, NIL);	/* parts */
+	base = lappend(base, whereopnos);
+	base = lappend(base, ors);
+	base = lappend(base, NIL);	/* having */
+	base = lappend(base, NIL);	/* distinct */
+	base = lappend(base, NIL);	/* join: lion_fkjoin_private() */
+	/* the dimension's GROUP BY is the Agg's, which checks it */
+	base = lappend(base, lion_replaced_functions(rel,
+												 output_rel->reltarget->exprs,
+												 having, NIL, fj));
 
-	/*
-	 * The node streams one partial row per dimension row that has fact rows,
-	 * so it starts when its child does, and it costs the child plus what it
-	 * does per dimension row.  At most one row per dimension row comes out;
-	 * the dimension key is unique, so that is also at most one per fk value.
-	 * A semi or anti join's rows are exactly the join's, whose estimate the
-	 * planner has made already.
-	 */
-	cpath->path.rows = (jointype == LION_JOIN_INNER) ? dimrows :
-		clamp_row_est(Min(fj->joinrel->rows, dimrows));
-	cpath->path.startup_cost = fj->dimpath->startup_cost;
-	cpath->path.total_cost = fj->dimpath->total_cost + run;
-#if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = fj->dimpath->disabled_nodes;
-#endif
-
-	/* ---- the Finalize Agg that groups the partial counts ---- */
-	if (root->processed_groupClause != NIL)
-	{
-		aggstrategy = AGG_HASHED;
-		numgroups = estimate_num_groups(root,
-										get_sortgrouplist_exprs(root->processed_groupClause,
-																root->processed_tlist),
-										dimrows, NULL, NULL);
-	}
-	else
-	{
-		aggstrategy = (parse->groupClause != NIL) ? AGG_SORTED : AGG_PLAIN;
-		numgroups = 1.0;
-	}
-
-	MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
-	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
-
-	add_path(output_rel, (Path *)
-			 create_agg_path(root, output_rel, &cpath->path,
-							 output_rel->reltarget,
-							 aggstrategy, AGGSPLIT_FINAL_DESERIAL,
-							 root->processed_groupClause,
-							 having,
-							 &agg_final_costs,
-							 numgroups));
+	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+						  fj->dimpath, nodetarget, base, joinclause, jointype,
+						  emitrows, whereclauses, wherekinds, ors, dimrows);
 }
 
 /*
@@ -6010,7 +6225,9 @@ lion_child_resno(Plan *child, Var *var)
  * may compute expressions over those columns (`upper(d.name)`); setrefs.c
  * rewrites it, and the key's value expression in custom_exprs, into INDEX_VAR
  * references against custom_scan_tlist, and the node's projection evaluates
- * it per row.  HAVING is the Finalize Agg's, so there is no qual here.
+ * it per row.  HAVING is the Agg's, so there is no qual here.  The rows of a
+ * count(DISTINCT) carry no counts, and may carry the fact's join column,
+ * which is read from the key's column of the child.
  */
 static Plan *
 lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
@@ -6024,9 +6241,13 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	List	   *kinds = NIL;
 	List	   *priv;
 	List	   *join;
+	List	   *ints;
 	int			joinclause;
 	Node	   *keyexpr;
 	Var		   *keyvar;
+	Index		factrelid;
+	AttrNumber	fkattno;
+	AttrNumber	keyresno;
 	ListCell   *lc;
 
 	if (list_length(custom_plans) != 1)
@@ -6039,6 +6260,16 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	keyexpr = (Node *) list_nth(consts, joinclause);
 	keyvar = (Var *) lion_strip(keyexpr);
 	Assert(keyvar != NULL && IsA(keyvar, Var));
+	keyresno = lion_child_resno(child, keyvar);
+
+	/*
+	 * The fact's join column, which the rows of a count(DISTINCT) carry as
+	 * the key (lion_fkjoin_agg_is_distinct()): the fact rel and the column
+	 * are the join clause's.
+	 */
+	ints = (List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
+	factrelid = (Index) linitial_int(ints);
+	fkattno = (AttrNumber) list_nth_int(ints, 4 + joinclause);
 
 	want = pull_var_clause((Node *) tlist,
 						   PVC_INCLUDE_AGGREGATES |
@@ -6053,7 +6284,12 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		ListCell   *l2;
 		bool		dup = false;
 
-		if (IsA(expr, Var))
+		if (IsA(expr, Var) && ((Var *) expr)->varno == (int) factrelid &&
+			((Var *) expr)->varattno == fkattno &&
+			(lsecond_int(join) == LION_JOIN_INNER) &&
+			(lthird_int(join) & LION_JOINFLAG_ROWS) != 0)
+			kind = LION_TL_CHILDCOL(keyresno);
+		else if (IsA(expr, Var))
 			kind = LION_TL_CHILDCOL(lion_child_resno(child, (Var *) expr));
 		else if (IsA(expr, Aggref))
 			kind = LION_TL_COUNT;	/* every count the planner accepted */
@@ -6093,7 +6329,7 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
 	lfirst(list_nth_cell(priv, LION_PRIV_HAVING)) = NIL;
 	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
-		lappend_int(list_copy(join), (int) lion_child_resno(child, keyvar));
+		lappend_int(list_copy(join), (int) keyresno);
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
@@ -6810,6 +7046,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinkeyresno = 0;
 	st->jointype = LION_JOIN_INNER;
 	st->joincollect = false;
+	st->joinrows = false;
 	if (join != NIL)
 	{
 		if (list_length(join) != 4 ||
@@ -6818,6 +7055,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->joinclause = linitial_int(join);
 		st->jointype = lsecond_int(join);
 		st->joincollect = (lthird_int(join) & LION_JOINFLAG_COLLECT) != 0;
+		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
 		st->joinkeyresno = (AttrNumber) lfourth_int(join);
 		if (st->joinclause < 0 || st->joinclause >= st->nclause ||
 			st->joinkeyresno <= 0 ||
@@ -9000,11 +9238,14 @@ lion_join_collect(LionCountScanState *st)
  * stopped at the first visible row) and the partial count is 1.  An ANTI
  * join's row is the dimension row that joins none: a NULL key, a key with no
  * entry, a key whose test finds nothing, and every row when a fact filter
- * selects nothing at all.
+ * selects nothing at all.  The rows of a count(DISTINCT) (joinrows) are the
+ * same existence tests over an inner join: the dimension rows that join,
+ * once each, with no count at all.
  *
  * The row is PARTIAL: core's Finalize Agg above groups them by the dimension
  * columns and adds the counts, which is the join's count for each group
- * because that count is a sum over the group's dimension rows.
+ * because that count is a sum over the group's dimension rows - or, for
+ * joinrows, it is a row core's plain Agg aggregates as it would the join's.
  */
 static TupleTableSlot *
 lion_next_join_row(LionCountScanState *st)
@@ -9074,7 +9315,7 @@ lion_next_join_row(LionCountScanState *st)
 			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 1);
 		}
 
-		if (st->jointype == LION_JOIN_INNER)
+		if (st->jointype == LION_JOIN_INNER && !st->joinrows)
 			count = st->joinfiltered ?
 				lion_count_sources_cached(st->heap, estate->es_snapshot,
 										  2, st->joinsources, &st->stats,
@@ -9815,6 +10056,11 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			ExplainPropertyText("Join Type", "Semi", es);
 		else if (st->jointype == LION_JOIN_ANTI)
 			ExplainPropertyText("Join Type", "Anti", es);
+		if (st->joinrows)
+			ExplainPropertyText("Join Rows",
+								st->jointype == LION_JOIN_ANTI ?
+								"the dimension rows without a match" :
+								"the dimension rows with a match", es);
 		if (st->joincollect)
 			ExplainPropertyText("Fact Filters", "collected once", es);
 	}
