@@ -412,8 +412,9 @@ SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FR
 -- semi join reads fewer containers than the inner join's counts of the same keys
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk)', 'Containers Visited')
 	< lion_sj_counter('SELECT count(*) FROM lion_sd d JOIN lion_sf f ON f.fk = d.pk', 'Containers Visited') AS exists_stops_early;
--- a copy that outgrows work_mem: the plan was made to collect, the run cannot,
--- and every count reads the filters instead - with the same answer.  Half of
+-- a copy that outgrows a hash join's memory (work_mem times
+-- hash_mem_multiplier): the plan was made to collect, the run cannot, and
+-- every count reads the filters instead - with the same answer.  Half of
 -- 250000 narrow rows is a bitset in each of 22 containers: some 90 kB.
 CREATE TABLE lion_sfw (fk int8, x int NOT NULL);
 INSERT INTO lion_sfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10
@@ -428,11 +429,13 @@ SET enable_nestloop = off;
 PREPARE lion_sj_big AS SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sfw f WHERE f.fk = d.pk AND f.x IN (0, 2, 4, 6, 8));
 EXECUTE lion_sj_big;
 SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
 SELECT count(*) FILTER (WHERE p ~ 'Fact Filters: collected once') AS planned_to_collect,
 	   count(*) FILTER (WHERE p ~ 'Fact Filter Rows Collected: -1') AS could_not
 FROM (SELECT * FROM lion_explain_norm('EXECUTE lion_sj_big', 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF')) AS e(p);
 EXECUTE lion_sj_big;
 RESET work_mem;
+RESET hash_mem_multiplier;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_nestloop;
