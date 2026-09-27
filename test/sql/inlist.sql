@@ -401,11 +401,18 @@ SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s
 SELECT lion_insum(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY k',
 						lion_inlist(0, 999, 100000)));
 -- ... including with a second clause, which the groups are intersected with
+-- ... and a GROUP BY on a DIFFERENT column, which the entry scan still drives.
+-- (Both forced: the node takes 9.4 and 9.2 ms of CPU, the bitmap heap scan and
+-- hash aggregate 15.6 and 20, but core prices hashing a row at a fraction of
+-- what it costs and the model chooses the aggregate - DESIGN.md §10.)
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
 SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1 GROUP BY k',
 						lion_inlist(0, 999, 100000)));
--- ... and a GROUP BY on a DIFFERENT column, which the entry scan still drives
 SELECT lion_incmp(format('SELECT lo, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY lo',
 						lion_inlist(0, 999, 100000)));
+RESET enable_bitmapscan;
+RESET enable_indexscan;
 
 -- ANDed with another clause: the merge, not the sum
 SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1',

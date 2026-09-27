@@ -857,6 +857,23 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *output_rel,
 								   void *extra);
 
+/*
+ * The cost model's shared terms (DESIGN.md section 10, "The units"): what a
+ * merge of posting sets costs in CPU, used by the count pushdown and by
+ * lioncostestimate() for the AND of sets an index scan makes; and a column's
+ * correlation with the heap order less ANALYZE's tie-break (lion_am.c).
+ */
+extern double lion_merge_cpu_cost(int nsrc, const double *members,
+								  const double *containers, const bool *inmem,
+								  double tuples, double *probes);
+extern double lion_containers_for(double heap_pages, double members);
+extern double lion_index_column_posting_share(PlannerInfo *root,
+											  RelOptInfo *rel,
+											  IndexOptInfo *idx,
+											  AttrNumber col);
+extern double lion_var_heap_correlation(PlannerInfo *root, Index relid,
+										Var *var);
+
 /* ---------------------------------------------------------------------
  * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan
  * --------------------------------------------------------------------- */

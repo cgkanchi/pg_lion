@@ -384,12 +384,12 @@ SELECT lion_pd_counters('SELECT count(*) FROM lion_pdt WHERE a = 3');
  * snapshot - but each dirty BLOCK is fetched only once per query, because the
  * per-query visibility cache answers every later group from memory
  * (DESIGN.md §9), so the node makes one pass over the heap and not one per
- * group.  It is therefore pushed down here, and measurably should be: on a
- * 100k-row table in this state the node ran in 17.9 ms against the
- * sequential aggregate's 26.8 ms, and once the pages had become all-visible
- * again 8.0 ms against 18.4 ms (2026-09-21).  Before the cache, and before
- * the estimate stopped charging numgroups random reads per dirty page, this
- * was the case that had to lose.
+ * group.  Before the cache, and before the estimate stopped charging
+ * numgroups random reads per dirty page, this was the case that had to lose
+ * by far.  On the release build it is a tie - the node 14.8 ms of CPU, the
+ * sequential scan and hash aggregate 15.6 - which the model gives to the hash
+ * aggregate, priced below what hashing a row costs (DESIGN.md §10, "The
+ * units"); once the pages are all-visible again the node wins, and is chosen.
  */
 CREATE TABLE lion_pdd (g int NOT NULL, pad text NOT NULL);
 INSERT INTO lion_pdd
