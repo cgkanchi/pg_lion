@@ -8132,6 +8132,20 @@ lion_exec_custom_scan(CustomScanState *node)
 			break;
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	/*
+	 * A row goes up to the executor, which may not ask for the next one for as
+	 * long as a cursor stays open: the walks let go of the directory leaf they
+	 * stand on (lion_entry_scan_pause()), so that an idle cursor over a GROUP BY
+	 * does not hold VACUUM up on it.
+	 */
+	if (slot != NULL)
+	{
+		if (st->scanning)
+			lion_entry_scan_pause(&st->escan);
+		if (st->scanning2)
+			lion_entry_scan_pause(&st->escan2);
+	}
 	st->dirpages += lion_dir_pages_read - dirbefore;
 
 	return slot;

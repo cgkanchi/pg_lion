@@ -566,6 +566,8 @@ typedef struct LionRangeBound
  *			every entry of the column, which is correct and linear.
  *	lower	the lower bound the walk descends to, or -1 for none: the walk
  *			then starts where the column does.
+ *	upper	the upper bound a walk of what lies ABOVE the range descends to
+ *			when it is the only one (nupper == 1), or -1.
  *	empty	a bound is NULL, so nothing can satisfy the range.
  *
  * The bound values are the caller's and must outlive the range.
@@ -578,6 +580,8 @@ typedef struct LionRange
 	LionRangeBound *bounds;
 	bool		ordered;
 	int			lower;
+	int			upper;
+	int			nupper;
 	bool		empty;
 } LionRange;
 
@@ -592,6 +596,8 @@ extern void lion_range_add(LionRange *range, Relation index,
 						   StrategyNumber strategy, Oid opfuncid, Oid valtype,
 						   Datum value, bool isnull, Oid collation);
 extern int	lion_range_test(LionRange *range, const LionEntryTuple *entry);
+extern bool lion_range_fails_upper(LionRange *range,
+								   const LionEntryTuple *entry);
 extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
 
 /* ---------------------------------------------------------------------
@@ -603,11 +609,20 @@ extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
  * links (DESIGN.md §21).  For an ordered opclass the entries therefore come
  * out in key order, which is what lets the count pushdown claim pathkeys.
  *
- * The scan gives up its lock between two entries, and the position it comes
- * back to is a KEY and not an offset: a sorted directory inserts in the
- * middle of a leaf and splits it, so offsets are not stable the way they were
- * on a bucket page.  Resuming at "the first key above the last one returned"
- * is stable under both, and under the entry deletion of §18.
+ * The scan reads each leaf ONCE: it copies the entries it selects from the
+ * leaf into a private batch under one share lock, gives the lock up, and
+ * hands the copies out one by one (DESIGN.md §28, "One read per leaf").  The
+ * position it comes back to for the next leaf is a KEY and not an offset: a
+ * sorted directory inserts in the middle of a leaf and splits it, so offsets
+ * are not stable the way they were on a bucket page.  Resuming at "the first
+ * key above the last one examined" is stable under both, and under the entry
+ * deletion of §18.
+ *
+ * An INLINE copy is counted against the visibility map, so the leaf it came
+ * from stays PINNED from the copy until that set is handed out, which then
+ * takes the pin over (DESIGN.md §9).  batchbuf is that pin; it is dropped as
+ * soon as the batch holds no INLINE copy still to come, so a batch of CHAIN
+ * entries pins nothing.
  */
 typedef struct LionEntryScan
 {
@@ -617,16 +632,48 @@ typedef struct LionEntryScan
 								 * first entry of the next column */
 	BlockNumber blkno;			/* directory leaf to read next */
 	bool		haslast;		/* the key below is valid */
-	int			lastkind;		/* LION_KIND_* of the last entry returned */
+	int			lastkind;		/* LION_KIND_* of the last entry examined */
 	uint32		lasthash;
 	char	   *lastkey;		/* its stored bytes, in cxt */
 	Size		lastkeylen;
-	int			onpage;			/* entries returned from the current leaf */
 	LionRange  *range;			/* the entries returned are bounded by this
 								 * (DESIGN.md §28), or NULL */
+	int			part;			/* LION_WALK_*: which of them */
 	MemoryContext cxt;
 	bool		done;
+
+	/* The batch: what the last leaf read selected, copied out of it. */
+	MemoryContext batchcxt;
+	LionEntryTuple **bentry;	/* the copies */
+	Size	   *bsize;			/* their item sizes */
+	OffsetNumber *boff;			/* where they were on the leaf */
+	char	   *bpage;			/* BLCKSZ bytes the copies are packed into */
+	int			nbatch;
+	int			maxbatch;
+	int			nextbatch;		/* the next one to hand out */
+	int			lastinline;		/* the last INLINE one, or -1 */
+	BlockNumber batchblk;		/* the leaf they came from */
+	Buffer		batchbuf;		/* its pin, while an INLINE copy is to come */
+	int64		nleaves;		/* leaves this walk has read */
 } LionEntryScan;
+
+/*
+ * Which entries of a range's column a walk returns (DESIGN.md §28).  An
+ * ordered range selects one contiguous run of the column's VALUE entries, and
+ * its complement is the run before it and the run after it:
+ *
+ *	INSIDE	the entries the range selects (lion_entry_scan_begin_range())
+ *	BELOW	the VALUE entries that fail a LOWER bound and no upper one: the
+ *			column's first entries, up to where the range begins
+ *	ABOVE	the VALUE entries that fail an UPPER bound: the column's last ones
+ *
+ * BELOW and ABOVE are disjoint, and with INSIDE they are every VALUE entry of
+ * the column.  Both need an ordered range (LionRange.ordered).
+ */
+#define LION_WALK_ALL		0	/* no range: every entry */
+#define LION_WALK_INSIDE	1
+#define LION_WALK_BELOW		2
+#define LION_WALK_ABOVE		3
 
 extern void lion_entry_scan_begin_col(LionEntryScan *es, Relation index,
 									 AttrNumber attno);
@@ -647,6 +694,16 @@ extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
 									   AttrNumber attno, LionRange *range);
 
 /*
+ * The walk of one part of an ordered range's column (LION_WALK_*, above):
+ * INSIDE is lion_entry_scan_begin_range(), BELOW starts where the column
+ * starts and ends where the range begins, ABOVE starts at the leaf an upper
+ * bound lives on and ends with the column.
+ */
+extern void lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
+									  AttrNumber attno, LionRange *range,
+									  int part);
+
+/*
  * Fetch the next entry.  On true, *key is a private copy of the entry's key
  * (palloc'd in the current context) and *ps is its located posting set, which
  * the caller must hand to lion_posting_set_release().  Entries whose posting
@@ -655,6 +712,33 @@ extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
  */
 extern bool lion_entry_scan_next(LionEntryScan *es, Datum *key,
 								LionPostingSet *ps);
+
+/*
+ * Read ONE more leaf of the walk and say how many entries on it the walk
+ * would return, without copying or locating any of them: the cheap half of
+ * deciding how to evaluate a range (DESIGN.md §28).  A walk is either counted
+ * this way or fetched with lion_entry_scan_next(), never both.
+ */
+extern int64 lion_entry_scan_skip_leaf(LionEntryScan *es);
+
+/*
+ * How many entries of the leaf the walk read last are still to be handed out
+ * by lion_entry_scan_next() before it reads another.
+ */
+static inline int
+lion_entry_scan_batch_left(const LionEntryScan *es)
+{
+	return es->nbatch - es->nextbatch;
+}
+
+/*
+ * The caller is about to hand a row to the executor and may not come back
+ * for as long as a cursor stays open.  A walk must not keep a directory leaf
+ * pinned across that (VACUUM would wait for it), so the INLINE copies still
+ * to come are dropped with their pin and the leaf is read again on the next
+ * call, from the last entry handed out.  A batch of CHAIN copies is kept.
+ */
+extern void lion_entry_scan_pause(LionEntryScan *es);
 extern void lion_entry_scan_end(LionEntryScan *es);
 
 /* ---------------------------------------------------------------------
