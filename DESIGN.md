@@ -1348,6 +1348,21 @@ Planner integration
     At plan time the value is unknown, so `clause_selectivity()` gives the estimate it gives any
     non-Const comparison; at run time a NULL value selects no rows, which every operator involved
     agrees with by being strict.
+  - **Enum keys: the class's own type, for every clause kind** (2026-09-27).
+    `enum_ops` is FOR TYPE anyenum, so its members are (anyenum, anyenum) and so is its hash proc,
+    while the constant of `k = 'x'` and the elements of `k IN (...)` are of the column's own enum.
+    `lion_match_index()` resolved the value's type to the class's for a range bound (§28) and for
+    nothing else: for an equality or an IN list it looked up an (anyenum, mood) member, found none
+    and declined the index, so an enum column was never counted by the node at all - with every
+    other scan disabled the plan was a disabled sequential scan, on the very low-cardinality columns
+    the node is best at. The resolution is now made before any member is looked up, for every clause
+    kind, by the rule `lion_probe_init()` applies at run time (§22's addendum on key types): the
+    same BASE type as the key column's own, so that a domain over the enum - which the parser only
+    takes cast to its enum, `dstatus::mood = 'x'` - is its enum, and another enum, whose OIDs mean
+    nothing to this column, is not. GROUP BY an enum, the value-representation rule, the FK-side
+    join (§27) on an enum key and EXPLAIN needed nothing more. `lion_index_posting_root()` made the
+    same mistake (`keytype != opcintype`) and refused every enum key; it takes the column's enum,
+    or a domain over it, now.
   - Collations follow the planner's IndexCollMatchesExprColl() rule: a collation-sensitive clause
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
     indexcollations[i] - of the KEY COLUMN that indexes the clause's column (§24) - equals that
@@ -1569,7 +1584,11 @@ treatment under `plan_cache_mode = force_generic_plan`, which is what keeps a `$
 count, a count that matches nothing, a NULL parameter, `= ANY ($1)`, `IN ($1, $2)`, a GROUP BY with
 a parameterised WHERE clause, a parameterised clause whose column the target list prints, and a
 LATERAL nested loop whose inner side is rescanned with a new exec Param for every outer row - each
-compared against the same query with the pushdown switched off, as a multiset both ways round. `test/sql/null.sql` and
+compared against the same query with the pushdown switched off, as a multiset both ways round.
+`test/sql/countclauses.sql` does the same for the enum keys above - `=`, an IN list, a GROUP BY, a
+domain over the enum and the FK-side join on an enum key - over one single-column index per column
+and again over one multicolumn index, with every other scan disabled so that a LionCount path that
+is built at all is the plan. `test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too. Section 11 of `test/sql/multicolumn.sql` runs the whole of this section

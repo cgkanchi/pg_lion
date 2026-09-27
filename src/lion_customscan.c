@@ -1061,6 +1061,31 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	}
 
 	/*
+	 * A class declared on a polymorphic type (enum_ops is FOR TYPE anyenum)
+	 * names its members on that type - (anyenum, anyenum), and the hash proc
+	 * for it - while the value a clause compares the column with is of the
+	 * column's own enum: the constant of `k = 'x'`, the elements of `k IN
+	 * (...)`, a range bound.  That is one of the class's own values and not a
+	 * cross-type search, so it is resolved to the class's type before any
+	 * member is looked up, for EVERY kind of clause.  Only the range
+	 * comparison of DESIGN.md §28 used to do this, and `k = 'x'` and `k IN
+	 * (...)` on an enum column asked for an (anyenum, mood) member that no
+	 * family has: the index was declined and the node never reached, on the
+	 * very columns it is best at.  The test is the one lion_probe_init()
+	 * makes at run time (lion_type_is_column(), lion_count.c): the same BASE
+	 * type as the key column's own - a domain over the enum is its enum, and
+	 * a different enum, whose OIDs mean nothing to this column, is not.
+	 */
+	if (OidIsValid(cmptype) && IsPolymorphicType(idx->opcintype[i]))
+	{
+		Oid			coltype = get_atttype(idx->indexoid, col);
+
+		if (OidIsValid(coltype) &&
+			getBaseType(cmptype) == getBaseType(coltype))
+			cmptype = idx->opcintype[i];
+	}
+
+	/*
 	 * A range comparison (DESIGN.md §28) has to be one of the index's range
 	 * strategies, with the ordering its walk needs - proc 4 for the pair - in
 	 * the same family; lionvalidate() insists on both together, and this is
@@ -1071,14 +1096,6 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	 */
 	if (kind == LION_CLAUSE_RANGE)
 	{
-		/*
-		 * A class declared on a polymorphic type (enum_ops is FOR TYPE
-		 * anyenum) names its members on that type, and the bound is of the
-		 * column's own enum: that is the class's own type, not another one.
-		 */
-		if (IsPolymorphicType(idx->opcintype[i]) &&
-			IsBinaryCoercible(cmptype, idx->opcintype[i]))
-			cmptype = idx->opcintype[i];
 		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
 														  idx->opfamily[i])))
 			return NULL;
