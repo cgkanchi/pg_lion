@@ -8039,7 +8039,7 @@ column of many values. This applies to every plain lion scan, and is the number 
 those that are not in heap order.
 
 **A scan in heap order is priced as the bitmap heap scan of the same rows, and a little more.**
-The SETS, UNION and WINDOW shapes (§29.3, `lion_source_sorted()`; `lion_plain_scan_is_sorted()`
+The SETS, UNION and WINDOW shapes (§29.3, `lion_source_sorted()`; `lion_plain_scan_shape()`
 mirrors the choice at plan time) hand out their TIDs in heap order whatever the column's
 correlation: they read every page that holds a match once, in block order - exactly the bitmap
 heap scan's pages, in its order. cost_index() interpolates its I/O by the correlation squared
@@ -8060,6 +8060,52 @@ heap in shared buffers (2M narrow rows, 185 to a page, and 1M rows of 42), the p
 to 50 ns a row more than the bitmap heap scan, against 55 ns for a row of a sequential scan - the
 row cpu_tuple_cost stands for - and 0.4 us a page LESS, which is not credited: with about one row
 to a page the two scans cost the same, and the plain scan wins the tie on its startup cost.
+
+**A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
+in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
+heap order does: btree's price, Mackert and Lohman's pages each a random read, whatever its entries
+held. What it does is a pass over the heap per entry, each reading the entry's pages in block order: a
+bitmap heap scan of one entry's rows, done once per entry. So it is priced as compute_bitmap_pages()
+prices a bitmap heap scan repeated that often, `lion_plain_walk_entries()` passes of `rows / passes`
+rows each: Mackert and Lohman's pages for all the rows together (a page a later pass reads again is
+in the cache while the cache holds the heap), each at the price of ONE pass's pages - random_page_cost
+for a pass of a few pages, falling to seq_page_cost for one over most of the heap - interpolated
+towards the packed end by the column's correlation as before; the fetches past the first on a page
+counted per pass; and `LION_WALK_PASS_COST`, 5 cpu_tuple_cost, for each entry past the first, which
+the plain scan streams through a stream of its own where the bitmap scan adds it to its bitmap
+(0.30 to 0.35 us an entry more than the bitmap scan over 4,000 to 390,000 one-row entries). One entry
+is a scan in heap order, priced as `k = v` is; one-row entries are btree's uncorrelated end and a
+stream each. The price a WALK gets against the bitmap scan's, and the time it takes against the
+bitmap scan's, before and after (assert build, median of five; 1M rows of the benchmark shape in
+shared buffers, 8M from the OS cache):
+
+| query | entries | plain / bitmap price, before | now | plain / bitmap time |
+|---|---|---|---|---|
+| 1M `pc BETWEEN 1 AND 1` | 1 | 1.12 | 1.00 (plain chosen) | 0.61-0.70 |
+| 1M `pc BETWEEN 1 AND 2` | 2 | 1.17 | 1.05 | 0.58-0.79 |
+| 1M `pc BETWEEN 1 AND 20` | 20 | 1.74 | 1.56 | 0.81-0.98 |
+| 1M `pc BETWEEN 1 AND 100` | 100 | 3.77 | 3.38 | 1.21-2.07 |
+| 1M `status >= 'parked'`, 40% of the rows on every page | 2 | 2.93 | 1.05 | 1.19-1.46 |
+| 1M `flag >= true`, 80% on every page | 1 | 2.40 | 1.08 (a sequential scan chosen) | 1.14-1.41 |
+| 8M `pc BETWEEN 1 AND 20` | 20 | 1.79 | 1.60 | 0.56-0.74 warm, 2.83 cold |
+| 8M `pc BETWEEN 1 AND 400` | 400 | 3.24 | 2.95 | 5.2-7.2 |
+
+**The benchmark handoff's `pc BETWEEN 1 AND 20`** (the plain scan 349 ms against the bitmap scan's
+600, and the bitmap scan chosen) is the 8M row: 20 passes read 79,000 page visits where the bitmap
+scan reads its 65,734 pages once. The plain scan's lead is not the WALK's: with the heap in the OS
+cache and PostgreSQL 18's default io_method=worker, the bitmap heap scan hands each read to an I/O
+worker through its read stream, which for a page already in the OS cache costs more than the plain
+scan's synchronous read (the plain scan 371-451 ms against 536-700). With io_method=sync the two
+tie (392 against 388), and cold the bitmap scan's read-ahead makes it 2.8 times faster (4,454 against
+1,573). The bitmap scan is still the choice, now at 1.6 times the plain scan's price for what it does
+rather than 1.8 for a btree's.
+
+What the model still cannot see: a range over a column stored in heap order, `ts` BETWEEN two days of
+a timestamp, is priced at the packed end - rightly, it reads a few hundred pages in order - while
+cost_bitmap_heap_scan() prices the bitmap scan's pages by Cardenas's formula with no correlation at
+all, as scattered over the heap; the plain scan is chosen at about the bitmap scan's price and takes
+2.3 times as long (30,000 one-row entries: 17 ms against 7.2), the difference being its stream per
+entry. The bitmap scan's price is core's.
 
 What this cannot do: cost_index() charges no more than its uncorrelated end, Mackert and Lohman's
 pages at random_page_cost. At a random_page_cost near seq_page_cost (1.1, as on the benchmark's
@@ -8187,7 +8233,9 @@ parked at the same point holding none while the same VACUUM completes.
 the benchmark's shape, sampled whole so the statistics are exact: counts of 13% (a multi-key
 column, rechecked) and 43% of the rows, on every page, go to the bitmap scan, and 0.5%, 0.1% and
 0.01%, about a row to a page, to the plain scan, at the default random_page_cost and at 1.1 (the
-43% one only at the default, above); a column stored in value order keeps its correlation; and a
+43% one only at the default, above); a range alone is a heap pass per key - one
+key goes to the plain scan as `pc = 5` does, twenty keys and one key over every page to the bitmap
+scan, with the sequential scan's answers; a column stored in value order keeps its correlation; and a
 range beside dense sets - `pc < 20`, the always-true `pc >= 0` - is a WINDOW whose plain scan
 reads within twice the bitmap scan's buffers, with the sequential scan's answers. Tests whose plans
 changed: those meant to show the bitmap path (`basic.sql`'s first plans, `directory.sql`'s
