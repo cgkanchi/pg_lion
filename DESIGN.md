@@ -6587,7 +6587,7 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   keys, 36 s against 1.7 for 400, and the always-true `pc >= 0` (2000 keys) past two minutes
   against 2 s. As WINDOWs: 0.14, 0.44, 0.97 and 2.2 s. A plain Index Scan of this shape on a
   much larger table did not finish in 60 s (2026-09-27): an always-true range over about two
-  thousand keys beside four sets. `test/sql/plaincost.sql` §1.)*
+  thousand keys beside four sets. `test/sql/plaincost.sql` §3.)*
 - **LIST**: an IN list on a scalar column longer than a batch (§29.4) is located and streamed a
   batch at a time, each batch the SETS shape with the other columns' trees ANDed in. It outranks a
   walk, which is then left to the recheck, and a second long list is left to the recheck too.
@@ -6967,19 +6967,93 @@ leaves have none, so a descending container order needs the tree's pivots or a r
 Plain and bitmap index paths are the same IndexPath and share `amcostestimate`; the planner prices
 the heap side of each (cost_index() for a plain scan, cost_bitmap_heap_scan() for a bitmap one).
 The only input that differs is `indexCorrelation`, which only cost_index() reads, and lion used to
-return 0 for it. It now returns what btcostestimate() returns: the ANALYZE correlation of the
+return 0 for it. It then returned what btcostestimate() returns: the ANALYZE correlation of the
 column whose qual the scan answers (`STATISTIC_KIND_CORRELATION` for the type's default `<`, the
 operator ANALYZE computes it with), times 0.75 for a multicolumn index as btree does; 0 for a
-multi-key column and whenever no statistic exists. That is the right number for the same reason it
-is for btree: within one key a lion scan returns TIDs in heap order (as btree does since its
-heap-TID tiebreaker), so how the matching rows are spread over the heap is what the column's
-correlation describes - a column stored in key order reads its rows sequentially, a scattered one
-pays a random page per row. The index side is unchanged. The effect on the planner's choices is
-btree's: one row goes to the plain scan (no bitmap to build, no bitmap heap overhead), a few
-thousand scattered rows go to the bitmap at a normal `work_mem` (sorted page visits), and at a
-`work_mem` so low that the bitmap is priced lossy - every tuple of every lossy page rechecked,
-compute_bitmap_pages() - the plain scan wins again. The count pushdown competes at the upper rel
-with its own cost (§10); the regression suite pins its choices.
+multi-key column and whenever no statistic exists - on the argument that within one key a lion
+scan returns TIDs in heap order (as btree does since its heap-TID tiebreaker), so how the matching
+rows are spread over the heap is what the column's correlation describes. The index side is
+unchanged. The count pushdown competes at the upper rel with its own cost (§10); the regression
+suite pins its choices. A benchmark (2026-09-27) showed that number to be wrong
+twice over, and it is now two things (`lion_plain_heap_correlation()`):
+
+**The correlation, less ANALYZE's tie-break** (`lion_index_correlation()`). ANALYZE sorts its
+sample by value and equal values by their place in the heap, and correlates the sorted order with
+the heap order. For a column of few values placed at random that comes out at exactly the sum of
+its values' squared frequencies S, not 0 - 1/k for k equally common values, 0.82 for a 90/10
+boolean; on 8M rows placed at random: 0.4406 for three values at 60/20/20% (S = 0.44), 0.8171 for
+90/10 (S = 0.82), 0.6852 for 80/20 (S = 0.68). cost_index() read that as the rows of one value
+packed on fewer pages than they touch, and lion is made for exactly such columns. The correlation
+is now taken beyond that baseline, `(corr - S) / (1 - S)` clamped to [-1, 1], S from the MCV list
+and an even share of the rest: 0 for values placed at random, still 1 for a column stored in value
+order (-1 for one stored in reverse, whose values are packed as well), and the raw number for a
+column of many values. This applies to every plain lion scan, and is the number handed on for
+those that are not in heap order.
+
+**A scan in heap order is priced as the bitmap heap scan of the same rows, and a little more.**
+The SETS, UNION and WINDOW shapes (§29.3, `lion_source_sorted()`; `lion_plain_scan_is_sorted()`
+mirrors the choice at plan time) hand out their TIDs in heap order whatever the column's
+correlation: they read every page that holds a match once, in block order - exactly the bitmap
+heap scan's pages, in its order. cost_index() interpolates its I/O by the correlation squared
+between rows packed on `sel x heap` pages read in order and rows scattered over Mackert and
+Lohman's count of pages, each a random read; a scan in heap order has the first end but not the
+second, where it reads what compute_bitmap_pages() counts (Cardenas's formula) at
+cost_bitmap_heap_scan()'s price a page (random_page_cost falling to seq_page_cost as the pages
+approach the whole heap). So the I/O is that, interpolated towards the packed end by the
+correlation above, and the correlation returned is the one that makes cost_index() arrive at it.
+Per row cost_index() charges cpu_tuple_cost and the quals left to the heap; the plain scan is
+charged what cost_bitmap_heap_scan() charges a row besides - every index qual (the recheck, which
+the plain scan does whenever it drops a qual or reads a multi-key column, §29.6, and which
+cost_index() never charges) and the bitmap entry (a tenth of a cpu_operator_cost,
+`LION_BITMAP_ROW_COST`) - and `LION_PLAIN_FETCH_ROW_COST`, half a cpu_tuple_cost, for every row
+past the first on its page: the bitmap heap scan locks a page and walks its matches once, the plain
+scan makes an amgettuple call and takes a buffer lock and a HOT search per row. Measured with the
+heap in shared buffers (2M narrow rows, 185 to a page, and 1M rows of 42), the plain scan spent 20
+to 50 ns a row more than the bitmap heap scan, against 55 ns for a row of a sequential scan - the
+row cpu_tuple_cost stands for - and 0.4 us a page LESS, which is not credited: with about one row
+to a page the two scans cost the same, and the plain scan wins the tie on its startup cost.
+
+What this cannot do: cost_index() charges no more than its uncorrelated end, Mackert and Lohman's
+pages at random_page_cost. At a random_page_cost near seq_page_cost (1.1, as on the benchmark's
+server) the heap side of a result on nearly every page is clamped there, within 10% of the bitmap
+heap scan's, and a plain scan of an exact result of many rows to a page can still tie with the
+bitmap scan - `test/sql/plaincost.sql` leaves that case out of its pins at 1.1. There is no
+parallel plain lion scan (`amcanparallel` is false, §29.1): the planner compares the serial plain
+scan with a parallel bitmap heap scan, and it credits the parallel one with its CPU divided among
+the workers and nothing for its I/O, as it does for every AM. Index-only scans keep the column's
+correlation: lion's are of queries that need no column, and the one kind in heap order, a multi-key
+UNION, fetches every TID it hands out whatever the visibility map says, which cost_index()'s
+all-visible fraction would not describe.
+
+On the benchmark shape (8M rows, 190k heap pages, a five-column index; assert build, warm OS cache
+and 256 MB of shared buffers, the paths interleaved in one backend, median of three; count pushdown
+off, parallel plans off unless marked; `L13` is `status = 0 AND supp = 0 AND
+flag AND tags && '{ga}'`, 13% of the rows on every page, `L13r` the same `AND pc >= 0` (2000
+keys), `M4` `country IN ('c1', 'c2')`, 4% on 82% of the pages, `M2` `country = 'c7'`, 2% on 57%,
+`M05` 0.5% on 13%; cold is after evicting the relation from shared buffers and the OS cache):
+
+| query | plain before | plain after | bitmap | parallel bitmap (3) | chosen before, rpc 4 / 1.1 | chosen after |
+|---|---|---|---|---|---|---|
+| L13 | 1569 ms | 1569 ms | 1040 ms | 653 ms | bitmap / **plain** | bitmap / bitmap |
+| L13r | > 138 s (WALK) | 2162 ms (WINDOW) | 1661 ms | 1234 ms | bitmap / **plain** | bitmap / bitmap |
+| M4 | 768 ms | 768 ms | 913 ms | 486 ms | **bitmap** / **bitmap** | plain / plain |
+| M2 | 516 ms (733 cold) | same | 983 ms (1834 cold) | - | **bitmap** / **bitmap** | plain / plain |
+| M05 | 52 ms (611 cold) | same | 59 ms (1453 cold) | - | **bitmap** / plain | plain / plain |
+
+With parallel plans the large ones go to the parallel bitmap or sequential scan, before and after,
+at the default random_page_cost; at 1.1 `L13` did too, by 2%. The prices behind the columns: `L13`
+at 1.1 was 219k for the plain scan against 228k for the bitmap scan and is now 235k; `M2` at 4 was
+458k against 196k and is now level with it. At the default random_page_cost the old number
+overcharged every scattered result (the uncorrelated end is a random read a page, which a scan in
+heap order never pays), so results of a few percent went to a bitmap scan up to 1.9 times slower
+warm and 2.5 cold; at 1.1 the tie-break correlation gave large results the packed end's discount,
+which is how a benchmark's large count (costed just below the parallel bitmap scan's)
+went to the plain scan: reconstructed from its plan, a correlation of about 0.38 took a large share off
+its heap I/O, and the WALK above did the rest. For comparison, a btree on `(status, supp, flag, pc,
+country)` reads `L13`'s rows in key order, the heap at random: 17 s against its own bitmap scan's
+2.5, priced 795k against 316k (2.5 times for 6.8). The column-correlation model is btree's; applied
+to a lion plain scan, whose heap is read in order, it erred the other way - 3 times the bitmap
+scan's price at the default random_page_cost for 1.5 times its time.
 
 **The count's recheck is priced the same way** (2026-09-24 review). With a correlation, a plain
 scan of a clustered value is cheap: 5000 rows of one value on 32 heap pages. The count pushdown
@@ -7060,6 +7134,23 @@ no index page, so the VACUUM completes under it.
 `gettuple_dirty_pin.spec` (injection point `lion-gettuple-batch`, 17+) parks an exclusion-
 constraint check with its batch loaded and shows VACUUM waiting for its pin, and a plain MVCC scan
 parked at the same point holding none while the same VACUUM completes.
+
+`test/sql/plaincost.sql` (2026-09-27, §29.11) pins the plain-against-bitmap choice on 200k rows of
+the benchmark's shape, sampled whole so the statistics are exact: counts of 13% (a multi-key
+column, rechecked) and 43% of the rows, on every page, go to the bitmap scan, and 0.5%, 0.1% and
+0.01%, about a row to a page, to the plain scan, at the default random_page_cost and at 1.1 (the
+43% one only at the default, above); a column stored in value order keeps its correlation; and a
+range beside dense sets - `pc < 20`, the always-true `pc >= 0` - is a WINDOW whose plain scan
+reads within twice the bitmap scan's buffers, with the sequential scan's answers. Tests whose plans
+changed: those meant to show the bitmap path (`basic.sql`'s first plans, `directory.sql`'s
+`bitmap_one`) now disable plain scans; the others print a plain Index Scan for a key of about a
+row to a page, which the plain scan reads as the bitmap scan does without building a bitmap -
+measured on the tests' own tables, 2.2 ms against 2.75 (`lis_f`, `k = 17`), 1.5 against 1.7
+(`lis_w`, `a IS NOT NULL AND b = 5`), 0.97 against 1.24 (`ldbl`, `g = 5`), a tie on `lion_in`'s
+`a IN (1, 2, 3)`. `pushdown.sql`'s `lion_pdn` count, 40000 of 60000 narrow rows stored in value
+order, went from a plain scan to a sequential scan: the plain scan now pays per row what the
+bitmap scan does and more (5.2 ms against its 3.55), and both come out above the sequential scan,
+which takes 10 ms - the price of a numeric `=`, one cpu_operator_cost like any other, is core's.
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 

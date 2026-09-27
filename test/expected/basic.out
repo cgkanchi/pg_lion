@@ -285,14 +285,12 @@ SELECT lion_cmp('lion_basic', 'c10 = 3 AND c1000 = 419');
 -- BitmapOr: the planner uses one index scan per array element
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c1000 IN (11, 22, 33);
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_basic
-         Recheck Cond: (c1000 = ANY ('{11,22,33}'::integer[]))
-         ->  Bitmap Index Scan on lion_c1000
-               Index Cond: (c1000 = ANY ('{11,22,33}'::integer[]))
-(5 rows)
+   ->  Index Scan using lion_c1000 on lion_basic
+         Index Cond: (c1000 = ANY ('{11,22,33}'::integer[]))
+(3 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c1000 = 11 OR t1000 = 'key 500';
                             QUERY PLAN                             
@@ -323,14 +321,12 @@ SELECT lion_cmp('lion_basic', 'c1000 = 11 OR t1000 = ''key 500''');
 -- Cross-type equality inside the shared integer operator family
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c50k = 29::int4;
-                 QUERY PLAN                 
---------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_basic
-         Recheck Cond: (c50k = 29)
-         ->  Bitmap Index Scan on lion_c50k
-               Index Cond: (c50k = 29)
-(5 rows)
+   ->  Index Scan using lion_c50k on lion_basic
+         Index Cond: (c50k = 29)
+(3 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE c10 = 3::int8;
                   QUERY PLAN                   
@@ -373,14 +369,12 @@ INSERT INTO lion_varchar SELECT 'v' || (i % 100) FROM generate_series(1, 10000) 
 CREATE INDEX lion_varchar_idx ON lion_varchar USING lion (v);
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_varchar WHERE v = 'v42';
-                     QUERY PLAN                      
------------------------------------------------------
+                       QUERY PLAN                        
+---------------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_varchar
-         Recheck Cond: ((v)::text = 'v42'::text)
-         ->  Bitmap Index Scan on lion_varchar_idx
-               Index Cond: ((v)::text = 'v42'::text)
-(5 rows)
+   ->  Index Scan using lion_varchar_idx on lion_varchar
+         Index Cond: ((v)::text = 'v42'::text)
+(3 rows)
 
 SELECT count(*) FROM lion_varchar WHERE v = 'v42';
  count 
@@ -397,14 +391,12 @@ SELECT (ARRAY['red', 'green', 'blue']::lion_color[])[1 + (i % 3)] AS c
 CREATE INDEX lion_enum_idx ON lion_enum USING lion (c);
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_enum WHERE c = 'green';
-                     QUERY PLAN                      
------------------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Aggregate
-   ->  Bitmap Heap Scan on lion_enum
-         Recheck Cond: (c = 'green'::lion_color)
-         ->  Bitmap Index Scan on lion_enum_idx
-               Index Cond: (c = 'green'::lion_color)
-(5 rows)
+   ->  Index Scan using lion_enum_idx on lion_enum
+         Index Cond: (c = 'green'::lion_color)
+(3 rows)
 
 SELECT count(*) FROM lion_enum WHERE c = 'green';
  count 

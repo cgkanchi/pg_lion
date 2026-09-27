@@ -1946,8 +1946,11 @@ lion_walk_window(void)
  */
 #define LION_SCAN_ENTRY_BLOCK	(64 * 1024)
 
-/* How many sets of one IN list a plain scan holds cursors for at once (§29.4). */
-static int
+/*
+ * How many sets of one IN list a plain scan holds cursors for at once (§29.4).
+ * lioncostestimate() tells a LIST from a set tree with the same number.
+ */
+int
 lion_scan_list_batch(void)
 {
 	/*
