@@ -75,6 +75,7 @@
 #include "varatt.h"
 
 #include "lion.h"
+#include "lion_compat.h"
 
 static void lion_insert_new_entry(Relation index, Relation heaprel,
 								 LionState *state, Buffer *leafbuf,
@@ -1530,10 +1531,16 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			/*
 			 * ... and in its bucket's summary (DESIGN.md §31), which is a
 			 * second step with nothing held in between: see
-			 * lion_summary_insert() for why that is safe.
+			 * lion_summary_insert() for why that is safe.  Test hook: the row
+			 * is under its key and in no summary yet;
+			 * test/isolation/summary_race.spec runs lion_index_verify() in
+			 * this window.
 			 */
 			if (state->summarized)
+			{
+				LION_INJECTION_POINT("lion-insert-before-summary");
 				lion_summary_insert(index, heapRel, state, key, ckey, lo);
+			}
 		}
 
 		CHECK_FOR_INTERRUPTS();
