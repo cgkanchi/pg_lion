@@ -1293,7 +1293,8 @@ Planner integration
     integer opfamily contains it), and the compared value is not a literal NULL. §15 adds
     `Var = ANY (array)` and §14 the two null tests to the shapes accepted here. §19 adds a
     top-level `OR` of such clauses, whose leaves enter none of the per-column bookkeeping below,
-    because they constrain no column of the result.
+    because they constrain no column of the result. A boolean column tested by itself is the
+    equality it stands for (below).
   - **Several clauses may constrain one column, and each is a source of its own** (2026-09-25
     review). A second positive clause on a column is ANDed with the first exactly as a clause on
     another column is: it is matched to an index for ITS operator under ITS input collation, and the
@@ -1348,6 +1349,23 @@ Planner integration
     At plan time the value is unknown, so `clause_selectivity()` gives the estimate it gives any
     non-Const comparison; at run time a NULL value selects no rows, which every operator involved
     agrees with by being strict.
+  - **A boolean column tested by itself is the equality it stands for** (2026-09-27).
+    `eval_const_expressions()` folds `flag = true` into the bare Var `flag`, and `flag =
+    false` and `flag <> true` into `NOT flag`, before any path is built, so no boolean equality ever
+    reaches the pushdown as an OpExpr - and `flag IS TRUE` never was one. Core's index matching takes
+    all of these through `match_boolean_index_clause()`, which is why a lion index scan printed
+    `Index Cond: (flag = false)` for `NOT flag` while a count of the same rows could not be pushed
+    down. The clause analysis now does the same (`lion_boolean_eq_test()`): `flag` and `flag IS TRUE`
+    are `flag = true`, `NOT flag` and `flag IS FALSE` are `flag = false`, with `BooleanEqualOperator`
+    (bool_ops' strategy 1) and a boolean Const as the clause's value, so that the executor looks it
+    up like any literal and EXPLAIN prints `flag = true` as core prints the index condition; the cost
+    model is handed that OpExpr in place of the bare column. All four are false for NULL, as `=` is.
+    `flag IS NOT TRUE` and `flag IS NOT FALSE` are true for NULL as well and so are no equality: they
+    are the OR of the other value and the column's NULL entry, `flag = false OR flag IS NULL`, which
+    §19 takes apart like any other OR - as a whole restriction, or flattened into the arms of one;
+    inside an AND arm it is declined (`lion_boolean_not_test()`). `flag IS UNKNOWN` and `flag IS NOT
+    UNKNOWN` are §14's two null tests. A domain over boolean is relabelled to boolean by the WHERE
+    clause and answered by bool_ops unchanged.
   - **Enum keys: the class's own type, for every clause kind** (2026-09-27).
     `enum_ops` is FOR TYPE anyenum, so its members are (anyenum, anyenum) and so is its hash proc,
     while the constant of `k = 'x'` and the elements of `k IN (...)` are of the column's own enum.
@@ -1585,10 +1603,10 @@ count, a count that matches nothing, a NULL parameter, `= ANY ($1)`, `IN ($1, $2
 a parameterised WHERE clause, a parameterised clause whose column the target list prints, and a
 LATERAL nested loop whose inner side is rescanned with a new exec Param for every outer row - each
 compared against the same query with the pushdown switched off, as a multiset both ways round.
-`test/sql/countclauses.sql` does the same for the enum keys above - `=`, an IN list, a GROUP BY, a
-domain over the enum and the FK-side join on an enum key - over one single-column index per column
-and again over one multicolumn index, with every other scan disabled so that a LionCount path that
-is built at all is the plan. `test/sql/null.sql` and
+`test/sql/countclauses.sql` does the same for the enum and boolean shapes above - an enum `=`, IN
+list, GROUP BY, domain and FK-side join, and every boolean form beside other columns and under an
+OR - over one single-column index per column and again over one multicolumn index, with every
+other scan disabled so that a LionCount path that is built at all is the plan. `test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too. Section 11 of `test/sql/multicolumn.sql` runs the whole of this section

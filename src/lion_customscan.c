@@ -15,7 +15,9 @@
  * or `k IS NOT NULL` (§14), each on a column with a usable lion index.
  * The first three select rows and are intersected; `IS NOT NULL` subtracts
  * the index's NULL entry from the result, and when it is the only clause the
- * node sums the counts of every entry of that index instead.
+ * node sums the counts of every entry of that index instead.  A boolean
+ * column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`) is the
+ * equality `flag = true` or `flag = false` it stands for.
  *
  * A top-level `OR` of such clauses (DESIGN.md §19) is one source as well: its
  * arms are positive clauses, or ANDs of them, on columns of the same relation
@@ -73,6 +75,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
@@ -3216,6 +3219,92 @@ lion_array_const_nelems(Const *con)
 }
 
 /*
+ * Is this clause a test of a boolean column by itself, which core's
+ * match_boolean_index_clause() hands an index scan as `col = true` or `col =
+ * false`?  `col`, `NOT col`, `col IS TRUE` and `col IS FALSE` are, and set
+ * *var and *value; eval_const_expressions() has already folded `col = true`
+ * into the first and `col = false` and `col <> true` into the second, so no
+ * boolean equality ever reaches the pushdown as an OpExpr.  All four are
+ * false for NULL, as `=` is.  A domain over boolean is its base type here as
+ * everywhere: the WHERE clause relabels it to boolean, and bool_ops answers.
+ */
+static bool
+lion_boolean_eq_test(Node *clause, Var **var, bool *value)
+{
+	Node	   *arg = clause;
+	bool		val = true;
+
+	if (IsA(clause, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) clause;
+
+		if (b->boolop != NOT_EXPR || list_length(b->args) != 1)
+			return false;
+		arg = (Node *) linitial(b->args);
+		val = false;
+	}
+	else if (IsA(clause, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) clause;
+
+		if (bt->booltesttype == IS_TRUE)
+			val = true;
+		else if (bt->booltesttype == IS_FALSE)
+			val = false;
+		else
+			return false;
+		arg = (Node *) bt->arg;
+	}
+
+	arg = lion_strip(arg);
+	if (arg == NULL || !IsA(arg, Var) ||
+		getBaseType(((Var *) arg)->vartype) != BOOLOID)
+		return false;
+
+	*var = (Var *) arg;
+	*value = val;
+	return true;
+}
+
+/*
+ * `col IS NOT TRUE` and `col IS NOT FALSE` of a boolean column hold for the
+ * NULL rows as well, so they are no equality: they are the OR of two clauses
+ * the posting sets answer, `col = false OR col IS NULL` and `col = true OR
+ * col IS NULL`, and that OR is returned for the machinery of DESIGN.md §19 to
+ * take apart like any other.  NULL for every other clause.
+ */
+static BoolExpr *
+lion_boolean_not_test(Node *clause)
+{
+	BooleanTest *bt;
+	Node	   *arg;
+	NullTest   *nt;
+	Expr	   *eq;
+
+	if (clause == NULL || !IsA(clause, BooleanTest))
+		return NULL;
+	bt = (BooleanTest *) clause;
+	if (bt->booltesttype != IS_NOT_TRUE && bt->booltesttype != IS_NOT_FALSE)
+		return NULL;
+	arg = lion_strip((Node *) bt->arg);
+	if (arg == NULL || !IsA(arg, Var) ||
+		getBaseType(((Var *) arg)->vartype) != BOOLOID)
+		return NULL;
+
+	eq = make_opclause(BooleanEqualOperator, BOOLOID, false, (Expr *) arg,
+					   (Expr *) makeBoolConst(bt->booltesttype == IS_NOT_FALSE,
+											  false),
+					   InvalidOid, InvalidOid);
+	nt = makeNode(NullTest);
+	nt->arg = (Expr *) arg;
+	nt->nulltesttype = IS_NULL;
+	nt->argisrow = false;
+	nt->location = -1;
+
+	return (BoolExpr *) makeBoolExpr(OR_EXPR, list_make2(eq, nt), -1);
+}
+
+/*
  * One WHERE clause as the analysis below understands it: which column it
  * constrains, with what, and everything lion_match_index() will need in order
  * to find an index for it on each relation.
@@ -3224,6 +3313,9 @@ typedef struct LionLeafInfo
 {
 	Var		   *var;
 	Node	   *val;			/* the value expression, or a NULL placeholder */
+	Node	   *costclause;		/* the clause as the cost model is to see it,
+								 * or NULL for the query's own: `col = true`
+								 * for a bare boolean column */
 	Oid			opno;			/* 0 for a null test */
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
@@ -3252,6 +3344,9 @@ static bool
 lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 				 bool allow_range, LionLeafInfo *out)
 {
+	Var		   *boolvar;
+	bool		boolval;
+
 	memset(out, 0, sizeof(LionLeafInfo));
 	out->opno = InvalidOid;
 	out->cmptype = InvalidOid;
@@ -3261,7 +3356,29 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 	if (clause == NULL)
 		return false;
 
-	if (IsA(clause, OpExpr))
+	if (lion_boolean_eq_test(clause, &boolvar, &boolval))
+	{
+		/*
+		 * A boolean column by itself (lion_boolean_eq_test()): the equality
+		 * `col = true` or `col = false` it stands for, with bool_ops' own
+		 * strategy 1.  The Const is the clause's value like any literal's, so
+		 * EXPLAIN prints `flag = true` as core prints the index condition,
+		 * and the cost model is handed that OpExpr rather than the bare
+		 * column, so that everything it asks of an equality is asked of
+		 * this one.
+		 */
+		out->var = boolvar;
+		out->val = (Node *) makeBoolConst(boolval, false);
+		out->opno = BooleanEqualOperator;
+		out->cmptype = BOOLOID;
+		out->strategy = LION_STRAT_EQUAL;
+		out->kind = LION_CLAUSE_EQ;
+		out->costclause = (Node *) make_opclause(BooleanEqualOperator, BOOLOID,
+												 false, (Expr *) boolvar,
+												 (Expr *) out->val,
+												 InvalidOid, InvalidOid);
+	}
+	else if (IsA(clause, OpExpr))
 	{
 		OpExpr	   *op = (OpExpr *) clause;
 		Node	   *left;
@@ -3458,22 +3575,37 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 		out->kind = LION_CLAUSE_ARRAY;
 		out->collation = saop->inputcollid;
 	}
-	else if (IsA(clause, NullTest))
+	else if (IsA(clause, NullTest) ||
+			 (IsA(clause, BooleanTest) &&
+			  (((BooleanTest *) clause)->booltesttype == IS_UNKNOWN ||
+			   ((BooleanTest *) clause)->booltesttype == IS_NOT_UNKNOWN)))
 	{
-		NullTest   *nt = (NullTest *) clause;
+		bool		isnull;
 		Node	   *arg;
 
-		if (nt->argisrow)
+		/* `flag IS UNKNOWN` is `flag IS NULL`, and its negation likewise. */
+		if (IsA(clause, NullTest))
+		{
+			NullTest   *nt = (NullTest *) clause;
+
+			if (nt->argisrow)
+				return false;
+			isnull = (nt->nulltesttype == IS_NULL);
+			arg = (Node *) nt->arg;
+		}
+		else
+		{
+			isnull = (((BooleanTest *) clause)->booltesttype == IS_UNKNOWN);
+			arg = (Node *) ((BooleanTest *) clause)->arg;
+		}
+		if (!isnull && !allow_negated)
 			return false;
-		if (nt->nulltesttype != IS_NULL && !allow_negated)
-			return false;
-		arg = lion_strip((Node *) nt->arg);
+		arg = lion_strip(arg);
 		if (arg == NULL || !IsA(arg, Var))
 			return false;
 		out->var = (Var *) arg;
 
-		out->kind = (nt->nulltesttype == IS_NULL) ?
-			LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
+		out->kind = isnull ? LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
 		/* The executor needs no value; keep the lists in step. */
 		out->val = (Node *) makeNullConst(out->var->vartype,
 										  out->var->vartypmod,
@@ -3494,7 +3626,9 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
  * flattened clause array holds the leaves of an OR restriction alongside the
  * plain clauses (DESIGN.md §19), so everything that follows - matching an
  * index per relation, pricing the lookup, moving a Param into custom_exprs -
- * treats them alike; inor says which are which.
+ * treats them alike; inor says which are which.  The clause the cost model
+ * is given is the leaf's own costclause when the analysis made one (a bare
+ * boolean column's `col = true`), the query's otherwise.
  */
 static void
 lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
@@ -3514,7 +3648,8 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 
 	*whereattnos = lappend_int(*whereattnos, (int) leaf->var->varattno);
 	*clauseinfos = lappend(*clauseinfos, ci);
-	*whereclauses = lappend(*whereclauses, clause);
+	*whereclauses = lappend(*whereclauses,
+							leaf->costclause != NULL ? leaf->costclause : clause);
 	*whereconsts = lappend(*whereconsts, leaf->val);
 	*wherekinds = lappend_int(*wherekinds, leaf->kind);
 	*whereopnos = lappend_oid(*whereopnos, leaf->opno);
@@ -3754,7 +3889,10 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
  * evaluated over the finished counts, and a non-literal clause value, which
  * are initialised with ExecInitExpr() and so checked by core as they stand.
  * (A clause value is a literal or a parameter, possibly in an ARRAY[], and
- * calls nothing anyway.)
+ * calls nothing anyway.)  A boolean column tested by itself (`WHERE flag`)
+ * calls nothing in core's plan either: the node's `flag = true` is looked up
+ * through the index, as core's index scan looks it up, without asking
+ * EXECUTE on booleq.
  */
 static List *
 lion_replaced_functions(RelOptInfo *rel, List *tlexprs, List *having,
@@ -4343,15 +4481,29 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		clause = (Node *) rinfo->clause;
 
 		/*
+		 * `flag IS NOT TRUE` of a boolean column is `flag = false OR flag IS
+		 * NULL`, and is an OR like any other from here on
+		 * (lion_boolean_not_test()).
+		 */
+		{
+			BoolExpr   *orform = lion_boolean_not_test(clause);
+
+			if (orform != NULL)
+				clause = (Node *) orform;
+		}
+
+		/*
 		 * ---- an OR across columns (DESIGN.md §19) ----
 		 *
 		 * Every arm has to be a positive clause the posting sets can answer,
 		 * or an AND of such clauses, each on a column of this relation.  The
 		 * whole restriction then becomes ONE source - the union of the arms -
 		 * which is ANDed with the other sources and with the GROUP BY driver
-		 * like any other.  A negated arm (`IS NOT NULL`, NOT) is declined:
-		 * the complement of a posting set is not a posting set, and under a
-		 * union there is nothing to subtract it from.
+		 * like any other.  A negated arm (`IS NOT NULL`, a NOT of anything
+		 * but a boolean column) is declined: the complement of a posting set
+		 * is not a posting set, and under a union there is nothing to
+		 * subtract it from.  An arm `flag IS NOT TRUE` is two arms of the
+		 * same union, `flag = false` and `flag IS NULL`.
 		 *
 		 * The leaves are appended to the clause array like plain clauses, so
 		 * that an index is matched for each of them per partition and a Param
@@ -4365,6 +4517,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 		{
 			BoolExpr   *orexpr = (BoolExpr *) clause;
+			List	   *arms = NIL;
 			List	   *armlens = NIL;
 			int			orfirst = list_length(whereattnos);
 			ListCell   *la;
@@ -4373,6 +4526,16 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				return;
 
 			foreach(la, orexpr->args)
+			{
+				BoolExpr   *orform = lion_boolean_not_test((Node *) lfirst(la));
+
+				if (orform != NULL)
+					arms = list_concat(arms, orform->args);
+				else
+					arms = lappend(arms, lfirst(la));
+			}
+
+			foreach(la, arms)
 			{
 				Node	   *arm = (Node *) lfirst(la);
 				int			nleaf = 0;
