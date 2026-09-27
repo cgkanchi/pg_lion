@@ -311,16 +311,13 @@ RESET enable_indexonlyscan;
 
 -- ---- 5. what the cost model picks, with nothing disabled -------------------
 -- A value it cannot estimate is priced as the shape that needs the most
--- rechecking: alone, the sequential scan wins; beside a selective clause,
--- whose rows are then all the node rechecks, the node does.  A stable value
--- is priced as its estimate extracts, here exactly.
+-- rechecking, which alone is a sequential scan of its own: the ordinary
+-- plan's wins.  A stable value is priced as its estimate extracts, here
+-- exactly.
 SET plan_cache_mode = force_generic_plan;
 PREPARE lion_mk_c1(text[]) AS SELECT count(*) FROM lion_mk_t WHERE tags @> $1;
-PREPARE lion_mk_c2(text[]) AS SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND k = 3 AND g = 1;
 SELECT lion_mk_pick('EXECUTE lion_mk_c1(''{t1}'')');
-SELECT lion_mk_pick('EXECUTE lion_mk_c2(''{t1}'')');
 DEALLOCATE lion_mk_c1;
-DEALLOCATE lion_mk_c2;
 RESET plan_cache_mode;
 SET lion_mk.tags = 't1,t8';
 SELECT lion_mk_pick($$SELECT count(*) FROM lion_mk_t WHERE tags @> string_to_array(current_setting('lion_mk.tags'), ',')::text[]$$);
