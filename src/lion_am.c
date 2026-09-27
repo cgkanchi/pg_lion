@@ -242,7 +242,8 @@ lion_handler(PG_FUNCTION_ARGS)
 		.ampredlocks = false,
 		.amcanparallel = false,
 #if PG_VERSION_NUM >= 170000
-		.amcanbuildparallel = false,
+		/* DESIGN.md §24, "Build"; 16 builds only btree indexes in parallel */
+		.amcanbuildparallel = true,
 #endif
 		.amcaninclude = false,
 		.amusemaintenanceworkmem = true,
