@@ -1,0 +1,238 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s1_plan s2_predel s1_begin s1_plain s2_delete s1_semi s3_vacuum s2_wakeup s1_commit s3_count s3_pushed s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM fj_f;
+step s1_plan: 
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+
+QUERY PLAN                                                                                           
+-----------------------------------------------------------------------------------------------------
+Finalize Aggregate                                                                                   
+  ->  Custom Scan (LionCount)                                                                        
+        Lion Indexes: fj_f_fk (fk = d.pk), fj_f_x (x = ANY ('{1,3,5,7,9,11,13,15,17,19}'::integer[]))
+        Join Type: Semi                                                                              
+        Fact Filters: collected once                                                                 
+        ->  Seq Scan on fj_d d                                                                       
+(6 rows)
+
+QUERY PLAN                                                                                           
+-----------------------------------------------------------------------------------------------------
+Finalize Aggregate                                                                                   
+  ->  Custom Scan (LionCount)                                                                        
+        Lion Indexes: fj_f_fk (fk = d.pk), fj_f_x (x = ANY ('{1,3,5,7,9,11,13,15,17,19}'::integer[]))
+        Fact Filters: collected once                                                                 
+        ->  Seq Scan on fj_d d                                                                       
+(5 rows)
+
+step s2_predel: DELETE FROM fj_f WHERE fk = 0;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+count
+-----
+    3
+(1 row)
+
+count
+-----
+ 1500
+(1 row)
+
+step s2_delete: DELETE FROM fj_f WHERE fk = 2;
+step s1_semi: SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19)); <waiting ...>
+step s3_vacuum: VACUUM fj_f; <waiting ...>
+step s2_wakeup: 
+	SELECT fj_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_semi: <... completed>
+count
+-----
+    3
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+
+count
+-----
+    2
+(1 row)
+
+count
+-----
+ 1000
+(1 row)
+
+step s3_pushed: 
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_hashjoin = off;
+	SET enable_mergejoin = off;
+	SET enable_nestloop = off;
+	SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+	RESET enable_hashjoin;
+	RESET enable_mergejoin;
+	RESET enable_nestloop;
+	RESET pg_lion.enable_count_pushdown;
+
+count
+-----
+    2
+(1 row)
+
+count
+-----
+ 1000
+(1 row)
+
+step s3_verify: 
+	SELECT lion_index_verify('fj_f_fk', true);
+	SELECT lion_index_verify('fj_f_x', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s2_predel s1_begin s1_plain s2_delete s1_join s3_vacuum s2_wakeup s1_commit s3_count s3_pushed s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM fj_f;
+step s2_predel: DELETE FROM fj_f WHERE fk = 0;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+count
+-----
+    3
+(1 row)
+
+count
+-----
+ 1500
+(1 row)
+
+step s2_delete: DELETE FROM fj_f WHERE fk = 2;
+step s1_join: SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19); <waiting ...>
+step s3_vacuum: VACUUM fj_f; <waiting ...>
+step s2_wakeup: 
+	SELECT fj_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_detach('lion-count-containers-pinned');
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_join: <... completed>
+count
+-----
+ 1500
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_count: 
+	SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+
+count
+-----
+    2
+(1 row)
+
+count
+-----
+ 1000
+(1 row)
+
+step s3_pushed: 
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_hashjoin = off;
+	SET enable_mergejoin = off;
+	SET enable_nestloop = off;
+	SELECT count(*) FROM fj_d d WHERE EXISTS (SELECT 1 FROM fj_f f WHERE f.fk = d.pk AND f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19));
+	SELECT count(*) FROM fj_f f JOIN fj_d d ON f.fk = d.pk WHERE f.x IN (1, 3, 5, 7, 9, 11, 13, 15, 17, 19);
+	RESET enable_hashjoin;
+	RESET enable_mergejoin;
+	RESET enable_nestloop;
+	RESET pg_lion.enable_count_pushdown;
+
+count
+-----
+    2
+(1 row)
+
+count
+-----
+ 1000
+(1 row)
+
+step s3_verify: 
+	SELECT lion_index_verify('fj_f_fk', true);
+	SELECT lion_index_verify('fj_f_x', true);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

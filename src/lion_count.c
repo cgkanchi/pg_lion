@@ -190,7 +190,35 @@ typedef struct LionCountCtx
 	 * row known to be visible.  lion_exists_settled() is the only reader.
 	 */
 	bool		exists;
+
+	/*
+	 * Neither: the containers of the intersection are COPIED instead of
+	 * counted, and nothing is asked of the visibility map or the heap
+	 * (lion_sources_collect(), DESIGN.md §27).  NULL for a count.
+	 */
+	struct LionCollect *collect;
 } LionCountCtx;
+
+/*
+ * The containers an intersection yields, copied out as the merge produces
+ * them: in ascending container key order, each MAXALIGNed in buf so that a
+ * BITSET keeps its uint64 alignment - the layout of a LionMatSet, which is
+ * what lion_sources_collect() turns this into.  failed says the copy has
+ * outgrown maxbytes; the merge stops at the next container boundary.
+ */
+typedef struct LionCollect
+{
+	MemoryContext cxt;			/* where the copy lives: the caller's */
+	Size		maxbytes;
+	char	   *buf;
+	Size		used;
+	Size		cap;
+	Size	   *offs;
+	int			noffs;
+	int			offcap;
+	uint64		members;
+	bool		failed;
+} LionCollect;
 
 /*
  * What the cursors of ONE expression node may hold open at once (DESIGN.md
@@ -4323,6 +4351,49 @@ lion_recheck_cb(uint16 lo, void *arg)
 }
 
 /*
+ * Copy one container of a collected intersection (DESIGN.md §27).  The merge
+ * hands them over in ascending container key order, one per key, which is the
+ * order a LionMatSet keeps.  A copy that would outgrow its budget is given up
+ * on: failed is set, the merge stops at the next container boundary
+ * (lion_exists_settled()), and the caller counts the ordinary way instead.
+ */
+static void
+lion_collect_container(LionCollect *col, const LionContainer *c)
+{
+	Size		sz = lion_item_size(c);
+	MemoryContext oldcxt;
+
+	if (col->failed)
+		return;
+	if (lion_container_cardinality(c) == 0)
+		return;
+	if (sizeof(LionMatSet) + MAXALIGN(col->used + sz) +
+		sizeof(LionContainer *) * (col->noffs + 1) > col->maxbytes)
+	{
+		col->failed = true;
+		return;
+	}
+
+	oldcxt = MemoryContextSwitchTo(col->cxt);
+	while (col->used + sz > col->cap)
+	{
+		col->cap *= 2;
+		col->buf = (char *) repalloc(col->buf, col->cap);
+	}
+	if (col->noffs >= col->offcap)
+	{
+		col->offcap *= 2;
+		col->offs = (Size *) repalloc(col->offs, sizeof(Size) * col->offcap);
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	memcpy(col->buf + col->used, c, sz);
+	col->offs[col->noffs++] = col->used;
+	col->used += MAXALIGN(sz);
+	col->members += lion_container_cardinality(c);
+}
+
+/*
  * Step 1 of counting a container: ask the visibility map about every heap
  * block that has members, and either count the members outright (plus a
  * predicate lock, as an index-only scan would take) or queue the block's TIDs
@@ -4348,6 +4419,13 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	uint64		members;		/* blocks of this container that have members */
 	uint64		allvis;			/* blocks marked all-visible in the VM */
 	uint64		dirty;			/* blocks with members that need a heap recheck */
+
+	/* A collection copies the container and asks nothing (DESIGN.md §27). */
+	if (cx->collect != NULL)
+	{
+		lion_collect_container(cx->collect, c);
+		return;
+	}
 
 	/*
 	 * Test hook: the containers have been copied out, the source pages are
@@ -4519,6 +4597,14 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 	else if (ps->mat != NULL)
 	{
 		Assert(ps->found && !ps->is_inline);
+
+		/*
+		 * A COLLECTED intersection (lion_sources_collect()) has no chain to
+		 * fall back on, and is only ever counted beside a located set that
+		 * carries the interlock (DESIGN.md §27).
+		 */
+		if (!BlockNumberIsValid(ps->head))
+			elog(ERROR, "lion index: a collected posting set counted on its own");
 		fresh = *ps;
 		fresh.mat = NULL;		/* the chain itself, not the copy */
 		fresh.budgeted = false;	/* nothing of it is the list's to return */
@@ -4565,6 +4651,10 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 static bool
 lion_exists_settled(LionCountCtx *cx)
 {
+	/* A collection that outgrew its budget stops the same way (§27). */
+	if (cx->collect != NULL)
+		return cx->collect->failed;
+
 	if (!cx->exists)
 		return false;
 
@@ -5593,7 +5683,7 @@ static int64 lion_count_sources_run(Relation heap, Snapshot snapshot,
 									int nsources, LionCountSource *sources,
 									LionCountStats *stats,
 									LionVisCache *cache, bool rel_read_only,
-									bool exists);
+									bool exists, LionCollect *collect);
 
 int64
 lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
@@ -5601,7 +5691,7 @@ lion_count_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 						 LionVisCache *cache, bool rel_read_only)
 {
 	return lion_count_sources_run(heap, snapshot, nsources, sources, stats,
-								  cache, rel_read_only, false);
+								  cache, rel_read_only, false, NULL);
 }
 
 bool
@@ -5610,13 +5700,124 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
 						  LionVisCache *cache, bool rel_read_only)
 {
 	return lion_count_sources_run(heap, snapshot, nsources, sources, stats,
-								  cache, rel_read_only, true) > 0;
+								  cache, rel_read_only, true, NULL) > 0;
+}
+
+/*
+ * The intersection of the positive sources minus the negated ones, as a
+ * private posting set (DESIGN.md §27): the containers the merge of a count
+ * would have put through the visibility map, copied into memory instead, and
+ * nothing asked of the map or the heap.  *out comes back a found, pinless,
+ * materialized set of no index entry of its own - head is invalid - and holds
+ * every row of the intersection, visible to the caller's snapshot or not.  It
+ * is what the FK-side join intersects with each dimension row's fk set, where
+ * the merge of the fact filters would otherwise be built again at every one
+ * of that set's container keys, per dimension row.
+ *
+ * A copy made this way is a stale copy by the time it is counted, exactly as
+ * a materialized set is, and it is safe on exactly the same terms (the
+ * argument is on lion_posting_set_materialize()): it may only ever be counted
+ * beside a located set that carries the DESIGN.md §9 interlock - a dead TID
+ * it still lists is then either gone from that set's container, or on a heap
+ * block whose all-visible bit VACUUM cannot have set yet - and it cannot be
+ * missing a row the snapshot sees, because it is read after the snapshot was
+ * taken and a visible row was in every index before its transaction
+ * committed.  lion_count_one_set() refuses to count one on its own.
+ *
+ * Returns false, with *out not found and nothing allocated, when the copy
+ * would take more than maxbytes, or when a source is a list too long to open
+ * at once (it is read in batches, each yielding every container key of its
+ * own).  The caller then counts the ordinary way.  The copy is allocated in
+ * the current memory context.
+ */
+bool
+lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
+					 LionCountSource *sources, Size maxbytes,
+					 LionPostingSet *out, LionCountStats *stats)
+{
+	LionCollect col;
+	LionMatSet *mat;
+	Relation	index = NULL;
+	int			i;
+	int			j;
+
+	memset(out, 0, sizeof(LionPostingSet));
+	out->pinbuf = InvalidBuffer;
+	out->head = InvalidBlockNumber;
+
+	for (i = 0; i < nsources && index == NULL; i++)
+	{
+		for (j = 0; j < sources[i].nsets; j++)
+		{
+			if (sources[i].sets[j].found)
+			{
+				index = sources[i].sets[j].index;
+				break;
+			}
+		}
+	}
+	if (index == NULL)
+		return false;
+
+	memset(&col, 0, sizeof(col));
+	col.cxt = CurrentMemoryContext;
+	col.maxbytes = maxbytes;
+	col.cap = 8192;
+	col.buf = (char *) palloc(col.cap);
+	col.offcap = 256;
+	col.offs = (Size *) palloc(sizeof(Size) * col.offcap);
+
+	(void) lion_count_sources_run(heap, snapshot, nsources, sources, stats,
+								  NULL, false, false, &col);
+
+	if (col.failed)
+	{
+		pfree(col.buf);
+		pfree(col.offs);
+		return false;
+	}
+
+	/*
+	 * An empty intersection is a set that selects nothing, which is how a key
+	 * with no entry reads: not found.
+	 */
+	out->index = index;
+	out->attno = 1;
+	out->cxt = CurrentMemoryContext;
+	out->entryblk = InvalidBlockNumber;
+	out->entryoff = InvalidOffsetNumber;
+	if (col.noffs == 0)
+	{
+		pfree(col.buf);
+		pfree(col.offs);
+		return true;
+	}
+
+	mat = (LionMatSet *) palloc(sizeof(LionMatSet));
+	mat->ncontainers = col.noffs;
+	mat->bytes = col.used;
+	mat->held = sizeof(LionMatSet) + MAXALIGN(Max(col.used, (Size) 1)) +
+		sizeof(LionContainer *) * Max(col.noffs, 1);
+	mat->buf = col.buf;
+	mat->containers = (LionContainer **)
+		palloc(sizeof(LionContainer *) * Max(col.noffs, 1));
+	for (i = 0; i < col.noffs; i++)
+		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
+	pfree(col.offs);
+
+	out->found = true;
+	out->mat = mat;
+	out->ntids = col.members;
+	out->ncontainers = (uint32) col.noffs;
+
+	return true;
 }
 
 static int64
 lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 					   LionCountSource *sources, LionCountStats *stats,
-					   LionVisCache *cache, bool rel_read_only, bool exists)
+					   LionVisCache *cache, bool rel_read_only, bool exists,
+					   LionCollect *collect)
 {
 	MemoryContext cxt;
 	MemoryContext oldcxt;
@@ -5679,6 +5880,14 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	summed = (lion_sources_disjoint_sum(nsources, sources) &&
 			  (lion_source_has_nopin(&sources[0]) ||
 			   lion_sum_is_cheaper(heap, &sources[0])));
+
+	/*
+	 * A collection (DESIGN.md §27) wants the union itself, not the sum of its
+	 * counts, and needs no interlock to build it: a NOPIN set is read from
+	 * its own copy like any other.
+	 */
+	if (collect != NULL)
+		summed = false;
 	oneset = !summed && lion_sources_one_set(nsources, sources);
 
 	/*
@@ -5693,6 +5902,17 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	lion_open_budget_init(&budget, heap);
 	batchsrc = (summed || oneset) ? -1 :
 		lion_batch_source(nsources, sources, trees, &budget);
+
+	/*
+	 * The passes of a batched list each yield every container key of their
+	 * own, so a collection of one would come out of order.  It is refused;
+	 * the caller counts the ordinary way, as it does past its byte budget.
+	 */
+	if (collect != NULL && batchsrc >= 0)
+	{
+		collect->failed = true;
+		return 0;
+	}
 
 	/*
 	 * Decide which sets to serve from a private copy this time (DESIGN.md
@@ -5756,9 +5976,10 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	/*
 	 * A summed source counts every set exactly once, so there is nothing a
 	 * private copy could save; skipping the decision also keeps the one
-	 * positive source of each pass on the pinned path by construction.
+	 * positive source of each pass on the pinned path by construction.  A
+	 * collection reads each set once too.
 	 */
-	for (i = 0; !summed && i < nsources; i++)
+	for (i = 0; !summed && collect == NULL && i < nsources; i++)
 	{
 		/*
 		 * Rule 3 (DESIGN.md §19): a source may forbid it outright.  An OR
@@ -5897,6 +6118,18 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
 	cx.exists = exists;
+
+	/*
+	 * A collection counts nothing, so nothing it reads needs a pin once it
+	 * has been copied: the cursors let go of every leaf as they go, as a
+	 * bitmap walk's do (DESIGN.md §27).
+	 */
+	cx.collect = collect;
+	if (collect != NULL)
+	{
+		cx.droppins = true;
+		cache = NULL;
+	}
 
 	/*
 	 * The visibility cache, if the caller keeps one for this node execution.
