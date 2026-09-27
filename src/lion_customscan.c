@@ -546,6 +546,15 @@ typedef struct LionClauseState
 	bool		valisnull;
 
 	StrategyNumber strategy;	/* LION_CLAUSE_MULTI: 2, 3 or 5 */
+
+	/*
+	 * LION_CLAUSE_MULTI: how this scan's query was answered.  A literal is
+	 * KEYS, always (the planner only takes an exact one); a value the node
+	 * evaluates is extracted as a superset (lion_locate_multikey(), DESIGN.md
+	 * §17, "A query known only at run time"), and LOSSY and ALL then need
+	 * every candidate rechecked in the heap - ALL with no posting set at all.
+	 */
+	LionQueryMode qmode;
 	Relation	idx;
 	Datum		storedkey;
 	bool		hasstoredkey;
@@ -790,6 +799,16 @@ typedef struct LionCountScanState
 	 */
 	LionVisCache *viscache;
 	LionCountStats stats;
+
+	/*
+	 * The heap recheck of the multi-key clauses whose run-time query the
+	 * posting sets could not answer exactly (DESIGN.md §17, "A query known
+	 * only at run time"), or NULL.  Built by lion_locate_where() for the
+	 * relation being counted, in wherecxt, and set on viscache, which is how
+	 * every count of this execution finds it; lion_release_where() takes it
+	 * away again.
+	 */
+	LionRowFilter *filter;
 
 	/*
 	 * Whether the statement leaves the relation being counted alone
@@ -1347,31 +1366,24 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 }
 
 /*
- * Extract a multi-key query at plan time and say whether the posting sets can
- * answer it exactly (DESIGN.md §17).  Only then is the clause pushed down:
- * an ALL-mode query would need every row rechecked against the heap, which is
- * what the ordinary bitmap plan already does and does better.
- *
- * *extractquery receives the support function used, which lion_match_index()
- * then insists on finding on every index that will answer the clause, so that
- * the run-time extraction cannot come out differently from this one.
+ * How extractquery answers the query in con, as the executor would ask it:
+ * lion_extract_query()'s mode for a literal, and with superset
+ * lion_extract_query_superset()'s, which is what it asks of a query it only
+ * has at run time (DESIGN.md §17, "A query known only at run time").
  */
-static bool
-lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
-							StrategyNumber strategy, Const *con,
-							Oid *extractquery)
+static LionQueryMode
+lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
+						 Const *con, bool superset)
 {
 	FmgrInfo	flinfo;
 	LionQuery	q;
 	LionState	state;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
-	bool		exact;
+	LionQueryMode mode;
 
-	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
-									  LION_EXTRACTQUERY_PROC);
-	if (!OidIsValid(*extractquery))
-		return false;
+	if (con->constisnull)
+		return LION_QMODE_NONE; /* every operator involved is strict */
 
 	/*
 	 * lion_extract_query() wants an LionState, but only for the extractQuery
@@ -1389,16 +1401,43 @@ lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
 	memset(&state, 0, sizeof(state));
 	state.multikey = true;
 	state.collation = con->constcollid;
-	fmgr_info(*extractquery, &flinfo);
+	fmgr_info(extractquery, &flinfo);
 	state.extractquery = flinfo;
 
-	lion_extract_query(&state, con->constvalue, strategy, &q);
-	exact = (q.mode == LION_QMODE_KEYS);
+	if (superset)
+		lion_extract_query_superset(&state, con->constvalue, strategy, &q);
+	else
+		lion_extract_query(&state, con->constvalue, strategy, &q);
+	mode = q.mode;
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 
-	return exact;
+	return mode;
+}
+
+/*
+ * Extract a multi-key query at plan time and say whether the posting sets can
+ * answer it exactly (DESIGN.md §17).  Only then is a LITERAL query pushed
+ * down: an ALL-mode query would need every row rechecked against the heap,
+ * which is what the ordinary bitmap plan already does and does better.
+ *
+ * *extractquery receives the support function used, which lion_match_index()
+ * then insists on finding on every index that will answer the clause, so that
+ * the run-time extraction cannot come out differently from this one.
+ */
+static bool
+lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
+							StrategyNumber strategy, Const *con,
+							Oid *extractquery)
+{
+	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
+									  LION_EXTRACTQUERY_PROC);
+	if (!OidIsValid(*extractquery))
+		return false;
+
+	return lion_multikey_query_mode(*extractquery, strategy, con,
+									false) == LION_QMODE_KEYS;
 }
 
 /*
@@ -2270,6 +2309,10 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 
 static bool *lion_or_leaf_map(List *ors, int nclause);
 static int *lion_or_group_map(List *ors, int nclause);
+static Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
+							  List *whereidx, List *wherecol,
+							  List *whereclauses, List *wherekinds, List *ors,
+							  double matched, double counts, double ceiling);
 
 /*
  * Does an IN list's source take the disjoint-sum short-circuit of DESIGN.md
@@ -3287,6 +3330,15 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->driveidx[0] != NULL);
 
 		/*
+		 * A multi-key query the node only has at run time may need its
+		 * candidates rechecked in the heap, one count - one group, one test -
+		 * at a time (DESIGN.md §17, "A query known only at run time").
+		 */
+		run += lion_cost_recheck(root, t->rel, t->whereidx, t->wherecol,
+								 whereclauses, wherekinds, ors,
+								 t->rel->rows, numgroups, t->rel->tuples);
+
+		/*
 		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
 		 * entry it visits, in each relation it walks - a partition's entries
 		 * are its own.  A count(DISTINCT) walk already pays its per-test cost
@@ -3316,18 +3368,28 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 }
 
 /*
- * How many posting sets a multi-key clause's query is made of (DESIGN.md
- * §17): the keys its extraction yields, which is what a count merges at every
- * container key it asks the clause about.  The clause's value is always a
- * literal - only an exact extraction of one is pushed down
- * (lion_multikey_query_is_exact()) - so it is extracted again here the same
- * way; anything unexpected answers 1, the old price.
+ * How a multi-key clause will be answered (DESIGN.md §17), and how many
+ * posting sets its query is made of: the keys its extraction yields, which is
+ * what a count merges at every container key it asks the clause about.
+ *
+ * A literal is extracted again the way the executor extracts it, exactly -
+ * only an exact extraction of a literal is pushed down
+ * (lion_multikey_query_is_exact()).  A value the executor only has at run
+ * time comes here as its plan-time estimate when there is one (the clause
+ * lion_analyze_leaf() gave the cost model carries it), extracted as the
+ * executor will extract the run-time value: exactly, as a superset to be
+ * rechecked, or as every row.  With no estimate at all - a generic plan's
+ * parameter - the query's shape is unknown, and it is taken to be the
+ * expensive one, every row, as lioncostestimate() takes it for a bitmap scan.
+ * Anything unexpected answers one set, the old price.
  */
-static double
-lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
+static LionQueryMode
+lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col, Node *clause,
+						double *nkeys)
 {
 	OpExpr	   *op;
-	Const	   *con = NULL;
+	Node	   *arg;
+	Const	   *con;
 	Oid			opfamily;
 	Oid			lefttype;
 	Oid			proc;
@@ -3337,22 +3399,20 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	LionState	state;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
-	double		nkeys;
-	ListCell   *lc;
 
+	*nkeys = 1.0;
 	if (clause == NULL || !IsA(clause, OpExpr) || col < 1 ||
-		col > idx->nkeycolumns)
-		return 1.0;
+		col > idx->nkeycolumns || list_length(((OpExpr *) clause)->args) != 2)
+		return LION_QMODE_KEYS;
 	op = (OpExpr *) clause;
-	foreach(lc, op->args)
-	{
-		Node	   *arg = lion_strip((Node *) lfirst(lc));
 
-		if (arg != NULL && IsA(arg, Const))
-			con = (Const *) arg;
-	}
-	if (con == NULL || con->constisnull)
-		return 1.0;
+	/* the column is the left operand of a multi-key clause, the query the right */
+	arg = lion_strip((Node *) lsecond(op->args));
+	if (arg == NULL || !IsA(arg, Const))
+		return LION_QMODE_ALL;
+	con = (Const *) arg;
+	if (con->constisnull)
+		return LION_QMODE_NONE;
 
 	opfamily = idx->opfamily[col - 1];
 	lefttype = idx->opcintype[col - 1];
@@ -3360,7 +3420,7 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	proc = get_opfamily_proc(opfamily, lefttype, lefttype,
 							 LION_EXTRACTQUERY_PROC);
 	if (strategy == 0 || !OidIsValid(proc))
-		return 1.0;
+		return LION_QMODE_KEYS;
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"roaring count query keys",
@@ -3372,13 +3432,100 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	state.collation = con->constcollid;
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
-	lion_extract_query(&state, con->constvalue, (StrategyNumber) strategy, &q);
-	nkeys = (q.mode == LION_QMODE_KEYS) ? Max((double) q.nkeys, 1.0) : 1.0;
+
+	/* a query the exact extraction answers comes out the same either way */
+	lion_extract_query_superset(&state, con->constvalue,
+								(StrategyNumber) strategy, &q);
+	if (q.mode == LION_QMODE_KEYS || q.mode == LION_QMODE_LOSSY)
+		*nkeys = Max((double) q.nkeys, 1.0);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 
+	return q.mode;
+}
+
+static double
+lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
+{
+	double		nkeys;
+
+	(void) lion_multikey_cost_mode(idx, col, clause, &nkeys);
 	return nkeys;
+}
+
+/*
+ * The heap recheck of the multi-key clauses whose query the node only has at
+ * run time (DESIGN.md §17, "A query known only at run time"), over `matched`
+ * rows of `rel` - the rows every clause selects - counted `counts` times over
+ * (once per group, per test of a count(DISTINCT) walk, or per dimension row
+ * of the FK-side join), and never more than `ceiling` candidates.
+ *
+ * How each clause will be answered is asked of its plan-time estimate
+ * (lion_multikey_cost_mode()): exactly, which needs no recheck and costs
+ * nothing here; as a superset, whose candidates are taken to be the rows the
+ * clause selects - a floor, since the estimate says the superset is wider but
+ * not by how much; or as every row, whose candidates are then every row the
+ * OTHER clauses select - with no other clause, every row of the relation,
+ * read by a sequential scan (lion_count_heap_filtered()).  A value with no
+ * estimate at all is that last case.
+ *
+ * Each candidate is fetched, whatever the visibility map says - the map
+ * vouches for visibility and not for the filter - on the pages each count
+ * reads for itself (a filtered recheck keeps no visibility cache), and tested
+ * at the clauses' own evaluation cost.  §10's recheck of the dirty pages is
+ * still charged beside it by the caller; it is the smaller of the two.
+ */
+static Cost
+lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
+				  List *wherecol, List *whereclauses, List *wherekinds,
+				  List *ors, double matched, double counts, double ceiling)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		cand = Max(matched, 1.0);
+	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
+	Cost		perrow = cpu_tuple_cost;
+	bool		any = false;
+	double		pages;
+	int			ci = 0;
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+	ListCell   *lc4;
+
+	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
+	{
+		Node	   *clause = (Node *) lfirst(lc2);
+		bool		inor = (orgrp[ci++] >= 0);
+		LionQueryMode mode;
+		double		nkeys;
+		QualCost	qual_cost;
+
+		/* an OR leaf's query is always a literal (lion_analyze_leaf()) */
+		if (lfirst_int(lc3) != LION_CLAUSE_MULTI || inor)
+			continue;
+		mode = lion_multikey_cost_mode((IndexOptInfo *) lfirst(lc1),
+									   (AttrNumber) lfirst_int(lc4), clause,
+									   &nkeys);
+		if (mode != LION_QMODE_LOSSY && mode != LION_QMODE_ALL)
+			continue;
+
+		any = true;
+		cost_qual_eval_node(&qual_cost, clause, root);
+		perrow += qual_cost.per_tuple;
+		if (mode == LION_QMODE_ALL)
+			cand /= Max(clause_selectivity(root, clause, 0, JOIN_INNER, NULL),
+						1e-10);
+	}
+	pfree(orgrp);
+	if (!any)
+		return 0.0;
+
+	cand = Min(cand, Max(ceiling, 1.0));
+	pages = Min(cand, heap_pages * Max(counts, 1.0));
+
+	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
+		cand * perrow;
 }
 
 /*
@@ -4035,10 +4182,20 @@ typedef struct LionLeafInfo
  * bounds the entry walk that drives the count and is not a source at all: an
  * OR's arms are sources of one union, and a range would have to be the union
  * of its entries there.
+ *
+ * allow_recheck says the same of a multi-key clause whose query the node only
+ * has at run time (DESIGN.md §17, "A query known only at run time"), which may
+ * turn out to need every candidate rechecked in the heap.  The recheck tests
+ * the clause alone, which is right for a clause the other sources are ANDed
+ * with; a leaf of an OR is not tested alone - the row passes when ANY arm
+ * holds, and the other arms' leaves are answered from posting sets and never
+ * evaluated - so under an OR the query has to be a literal the posting sets
+ * answer exactly, as before.
  */
 static bool
 lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
-				 bool allow_negated, bool allow_range, LionLeafInfo *out)
+				 bool allow_negated, bool allow_range, bool allow_recheck,
+				 LionLeafInfo *out)
 {
 	Var		   *boolvar;
 	bool		boolval;
@@ -4171,32 +4328,76 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			 * not commute - `'{a}' @> tags` is a containment the other way
 			 * round, which is strategy 4 and not pushed down - so the column
 			 * has to be the left operand.
-			 *
-			 * The QUERY, not just its value, decides whether the posting sets
-			 * can answer this clause at all, so it has to be available now: a
-			 * Param is refused here even though one is accepted for equality
-			 * (DESIGN.md §17).  `tags @> $1` with `$1 = '{}'` extracts to ALL
-			 * mode, which this node cannot answer - it has no way to recheck
-			 * the operator against the heap - and by then there would be no
-			 * plan left to fall back to.
 			 */
-			if (!IsA(left, Var) || !IsA(right, Const))
+			if (!IsA(left, Var))
 				return false;
 			out->var = (Var *) left;
 			out->val = right;
-			if (((Const *) out->val)->constisnull)
-				return false;
 
-			/*
-			 * Only an EXACT query is pushed down.  `tags @> '{}'`, `<@`, a
-			 * tsquery with NOT/phrase/prefix/weights and anything with a NULL
-			 * element all want every row rechecked in the heap, which is what
-			 * the ordinary plan does anyway.
-			 */
-			if (!lion_multikey_query_is_exact(opfamily, lefttype, out->strategy,
-											 (Const *) out->val,
-											 &out->extractquery))
-				return false;
+			if (IsA(right, Const))
+			{
+				if (((Const *) out->val)->constisnull)
+					return false;
+
+				/*
+				 * A literal query's SHAPE is known now, so only an EXACT one
+				 * is pushed down.  `tags @> '{}'`, a tsquery with
+				 * NOT/phrase/prefix/weights and anything with a NULL element
+				 * want rows rechecked in the heap, which is what the ordinary
+				 * plan does anyway.
+				 */
+				if (!lion_multikey_query_is_exact(opfamily, lefttype,
+												 out->strategy,
+												 (Const *) out->val,
+												 &out->extractquery))
+					return false;
+			}
+			else
+			{
+				Node	   *est;
+
+				/*
+				 * A query the node only has at run time: a generic plan's
+				 * `tags @> $1`, `tsv @@ to_tsquery(current_setting(...))`
+				 * (DESIGN.md §17, "A query known only at run time").  Its
+				 * shape decides whether the posting sets answer it exactly,
+				 * and the shape is not known until the executor has the value
+				 * - `$1 = '{}'` is every row, a phrase is its lexemes' rows
+				 * and more - so the node cannot decline the ones they do not
+				 * answer.  It answers them from a SUPERSET instead and
+				 * rechecks every candidate in the heap
+				 * (lion_extract_query_superset(), LionRowFilter), which is
+				 * exact for every value the clause can take.  A value the
+				 * executor evaluates once per scan qualifies, by the rule
+				 * equality follows (lion_is_value_expr()), and so does the
+				 * `ARRAY[$1, $2]` a generic plan keeps for an array written
+				 * out of parameters.
+				 */
+				if (!allow_recheck || !lion_is_value_expr(right, true))
+					return false;
+				out->extractquery = get_opfamily_proc(opfamily, lefttype,
+													  lefttype,
+													  LION_EXTRACTQUERY_PROC);
+				if (!OidIsValid(out->extractquery))
+					return false;
+
+				/*
+				 * The cost model extracts the plan-time estimate of the value
+				 * the way the executor will extract the value itself
+				 * (lion_multikey_cost_mode()), so it is handed the clause
+				 * over that estimate; a value without one - a Param - is
+				 * priced as the expensive shape.  The executor evaluates the
+				 * expression, never the estimate.
+				 */
+				est = estimate_expression_value(root, right);
+				if (IsA(est, Const))
+					out->costclause = (Node *)
+						make_opclause(op->opno, op->opresulttype,
+									  op->opretset,
+									  (Expr *) linitial(op->args),
+									  (Expr *) est,
+									  op->opcollid, op->inputcollid);
+			}
 
 			out->opno = op->opno;
 			out->cmptype = InvalidOid;	/* the query is not a key */
@@ -4827,6 +5028,24 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 							   &collect);
 	flags = (collect ? LION_JOINFLAG_COLLECT : 0) |
 		(emitrows ? LION_JOINFLAG_ROWS : 0);
+
+	/*
+	 * A fact filter that is a multi-key query the node only has at run time
+	 * may need the candidates of every count rechecked in the heap (DESIGN.md
+	 * §17, "A query known only at run time"): the fact rows the dimension rows
+	 * reach, each count reading its own.
+	 */
+	{
+		double		tuples = Max(rel->tuples, 1.0);
+		double		reach = Min(childrows * tuples /
+								lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar),
+								tuples);
+
+		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
+								 whereclauses, wherekinds, ors,
+								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
+								 childrows, reach);
+	}
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -5561,7 +5780,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				foreach(lb, arm)
 				{
 					if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
-										  false, false, &leaf))
+										  false, false, false, &leaf))
 						return;
 					lion_append_clause(&leaf, (Node *) lfirst(lb), true,
 									  &whereattnos, &clauseinfos,
@@ -5579,7 +5798,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			continue;
 		}
 
-		if (!lion_analyze_leaf(root, clause, rti, true, true, &leaf))
+		if (!lion_analyze_leaf(root, clause, rti, true, true, true, &leaf))
 			return;
 
 		/*
@@ -7573,6 +7792,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 									   "LionCount clause values",
 									   ALLOCSET_SMALL_SIZES);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
+	st->filter = NULL;
 	st->writtenrels = lion_statement_written_rels(estate);
 	st->rel_read_only = false;
 
@@ -7835,29 +8055,54 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
  * costed with.  The tree becomes the source's combining expression; the
  * merge in lion_count.c evaluates it over the sets with the same cursors it
  * uses for an IN list, so the DESIGN.md §9 pin discipline is unchanged.
+ *
+ * A query the node only has at run time - a Param, a stable expression - is
+ * extracted as a SUPERSET instead (DESIGN.md §17, "A query known only at run
+ * time"), and cl->qmode says how it came out: KEYS is what a literal gives;
+ * LOSSY locates the keys of a wider tree; NONE and ALL locate nothing, NONE
+ * because no row can match and ALL because every row may.  The caller makes
+ * the last two no source at all and a source that selects nothing, and
+ * rechecks LOSSY and ALL in the heap (lion_build_filter()).
  */
 static int
 lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 					LionKeyNode **tree)
 {
 	LionState   *istate = lion_index_column_state(cl->idx, cl->idxcol);
+	StrategyNumber strategy;
 	LionQuery	q;
 	int			i;
 
-	lion_extract_query(istate, cl->val,
-					  (StrategyNumber) get_op_opfamily_strategy(cl->opno,
-																cl->idx->rd_opfamily[cl->idxcol - 1]),
-					  &q);
+	strategy = (StrategyNumber)
+		get_op_opfamily_strategy(cl->opno,
+								 cl->idx->rd_opfamily[cl->idxcol - 1]);
 
-	/*
-	 * The plan was only made because this extraction came out exact
-	 * (lion_multikey_query_is_exact()), against this very function and this
-	 * very constant.  A different answer now would mean the count could
-	 * silently miss rows, so say so instead.
-	 */
-	if (q.mode != LION_QMODE_KEYS)
-		elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
-			 RelationGetRelationName(cl->idx));
+	if (cl->con == NULL)
+	{
+		lion_extract_query_superset(istate, cl->val, strategy, &q);
+		cl->qmode = q.mode;
+		if (q.mode != LION_QMODE_KEYS && q.mode != LION_QMODE_LOSSY)
+		{
+			*sets = NULL;
+			*tree = NULL;
+			return 0;
+		}
+	}
+	else
+	{
+		lion_extract_query(istate, cl->val, strategy, &q);
+
+		/*
+		 * The plan was only made because this extraction came out exact
+		 * (lion_multikey_query_is_exact()), against this very function and
+		 * this very constant.  A different answer now would mean the count
+		 * could silently miss rows, so say so instead.
+		 */
+		if (q.mode != LION_QMODE_KEYS)
+			elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+				 RelationGetRelationName(cl->idx));
+		cl->qmode = LION_QMODE_KEYS;
+	}
 
 	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(q.nkeys, 1));
 	*tree = q.tree;
@@ -7891,6 +8136,7 @@ lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
 
 	*sets = NULL;
 	*nsets = 0;
+	cl->qmode = LION_QMODE_NONE;	/* until a multi-key query says otherwise */
 
 	/*
 	 * A parameter that came out NULL selects no rows at all, whatever the
@@ -8088,6 +8334,74 @@ lion_save_clause_key(LionCountScanState *st, LionClauseState *cl,
 }
 
 /*
+ * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
+ * query known only at run time"), as a row filter over the relation being
+ * counted, set on the visibility cache every count of this execution is
+ * handed (lion_vis_cache_set_filter()) - or none, which is what every scan
+ * whose queries all came out exact gets.
+ *
+ * Each clause is `col op value`: the clause's own operator and its value as
+ * this scan evaluated it, and the column as THIS relation numbers it, which
+ * the index says (a partition may number it differently from the parent,
+ * DESIGN.md §16).  The collation is the index column's, which
+ * lion_match_index() found equal to the clause's input collation whenever
+ * the clause has one; a clause over a type that has none ignores it.
+ */
+static void
+lion_build_filter(LionCountScanState *st)
+{
+	MemoryContext oldcxt;
+	LionRowFilter *filter;
+	int			n = 0;
+	int			i;
+
+	st->filter = NULL;
+	lion_vis_cache_set_filter(st->viscache, NULL);
+
+	for (i = 0; i < st->nclause; i++)
+	{
+		LionClauseState *cl = &st->clause[i];
+
+		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
+			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
+			n++;
+	}
+	if (n == 0)
+		return;
+
+	oldcxt = MemoryContextSwitchTo(st->wherecxt);
+	filter = (LionRowFilter *) palloc0(sizeof(LionRowFilter));
+	filter->heap = st->heap;
+	filter->clauses = (LionRowFilterClause *)
+		palloc0(sizeof(LionRowFilterClause) * n);
+	filter->tmpcxt = AllocSetContextCreate(st->wherecxt,
+										   "LionCount row filter",
+										   ALLOCSET_SMALL_SIZES);
+	for (i = 0; i < st->nclause; i++)
+	{
+		LionClauseState *cl = &st->clause[i];
+		LionRowFilterClause *c;
+
+		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
+			  (cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL)))
+			continue;
+
+		c = &filter->clauses[filter->nclauses++];
+		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
+		if (c->attno <= 0)
+			elog(ERROR, "LionCount: a multi-key clause on an index expression");
+		c->notnull = false;
+		fmgr_info_cxt(get_opcode(cl->opno), &c->flinfo, st->wherecxt);
+		c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
+		c->value = cl->val;
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	st->filter = filter;
+	lion_vis_cache_set_filter(st->viscache, filter);
+}
+
+/*
  * Locate the posting sets of every WHERE clause of the relation the node is
  * counting.  They keep their pins (for INLINE entries) until
  * lion_release_where(), which is exactly the DESIGN.md section 9 discipline
@@ -8123,6 +8437,20 @@ lion_locate_where(LionCountScanState *st)
 
 		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
 		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
+
+		/*
+		 * A multi-key query no key narrows (DESIGN.md §17, "A query known
+		 * only at run time"): as far as this clause goes every row is a
+		 * candidate, so it is no source of the intersection - a negated
+		 * source with nothing to subtract, which is exactly how `IS NOT NULL`
+		 * over a column without NULLs reads - and the row filter below tests
+		 * it on each candidate the other sources leave.
+		 */
+		if (cl->kind == LION_CLAUSE_MULTI && cl->qmode == LION_QMODE_ALL)
+		{
+			src->negated = true;
+			continue;
+		}
 
 		/*
 		 * An IN list is one scalar index's entries, one per distinct listed
@@ -8276,6 +8604,7 @@ lion_locate_where(LionCountScanState *st)
 		st->ndsource = n;
 	}
 
+	lion_build_filter(st);
 	st->located = true;
 }
 
@@ -8300,6 +8629,11 @@ lion_release_where(LionCountScanState *st)
 		src->nomaterialize = false;
 		src->disjoint = false;
 	}
+
+	/* the row filter lives in wherecxt too, and names this relation */
+	st->filter = NULL;
+	lion_vis_cache_set_filter(st->viscache, NULL);
+
 	if (st->wherecxt != NULL)
 		MemoryContextReset(st->wherecxt);
 	st->located = false;
@@ -8441,6 +8775,61 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
  * --------------------------------------------------------------------- */
 
 /*
+ * Is any WHERE item of the relation being counted a source that SELECTS
+ * rows?  Always, except when a multi-key query no key narrows was the only
+ * one (DESIGN.md §17, "A query known only at run time"): it is no source then
+ * (lion_locate_where()), and `IS NOT NULL` only subtracts.
+ */
+static bool
+lion_where_has_positive(LionCountScanState *st)
+{
+	int			k;
+
+	for (k = 0; k < st->nitem; k++)
+	{
+		if (!st->sources[k + 1].negated)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A count with nothing to take its candidates from: every WHERE clause that
+ * selects rows was a multi-key query no key narrows, so the candidates are
+ * every row of the relation, and the heap is read once, sequentially, with
+ * the row filter - those queries - and the `IS NOT NULL` clauses tested on
+ * each row the snapshot sees.  It is the ordinary plan's work, which the
+ * cost model charged for a value it could not estimate (lion_cost_recheck()).
+ */
+static int64
+lion_count_scan_filtered(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionRowFilter scan;
+	int			k;
+
+	scan = *st->filter;
+	scan.clauses = (LionRowFilterClause *)
+		palloc0(sizeof(LionRowFilterClause) * (st->filter->nclauses + st->nitem));
+	memcpy(scan.clauses, st->filter->clauses,
+		   sizeof(LionRowFilterClause) * st->filter->nclauses);
+	for (k = 0; k < st->nitem; k++)
+	{
+		LionClauseState *cl = &st->clause[st->item[k].clauseno];
+		LionRowFilterClause *c;
+
+		if (st->item[k].orno >= 0 || cl->kind != LION_CLAUSE_NOTNULL)
+			continue;
+		c = &scan.clauses[scan.nclauses++];
+		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
+		c->notnull = true;
+	}
+
+	return lion_count_heap_filtered(st->heap, estate->es_snapshot, &scan,
+									&st->stats);
+}
+
+/*
  * The intersection of the WHERE clauses, with no index driving the count.
  */
 static int64
@@ -8456,10 +8845,13 @@ lion_count_relation(LionCountScanState *st)
 
 	MemoryContextReset(st->pergroup);
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
-	count = lion_count_sources_cached(st->heap, estate->es_snapshot,
-									 st->nitem, &st->sources[1],
-									 &st->stats, st->viscache,
-									 st->rel_read_only);
+	if (st->filter != NULL && !lion_where_has_positive(st))
+		count = lion_count_scan_filtered(st);
+	else
+		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
+										 st->nitem, &st->sources[1],
+										 &st->stats, st->viscache,
+										 st->rel_read_only);
 	MemoryContextSwitchTo(oldcxt);
 
 	return count;
@@ -10048,6 +10440,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->stats.cache_hits += st->stats.cache_hits;
 		shared->stats.cache_full += st->stats.cache_full;
 		shared->stats.sets_summed += st->stats.sets_summed;
+		shared->stats.rows_removed += st->stats.rows_removed;
 		shared->lookups += st->joinlookups;
 		shared->missing += st->joinmissing;
 		shared->dirpages += st->dirpages;
@@ -10446,6 +10839,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		tot.cache_hits += st->joinworkerstats.cache_hits;
 		tot.cache_full += st->joinworkerstats.cache_full;
 		tot.sets_summed += st->joinworkerstats.sets_summed;
+		tot.rows_removed += st->joinworkerstats.rows_removed;
 
 		ExplainPropertyInteger("Heap Blocks Skipped via VM", NULL,
 							   tot.blocks_skipped_via_vm, es);
@@ -10453,6 +10847,17 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 							   tot.tids_rechecked, es);
 		ExplainPropertyInteger("Heap Blocks Rechecked", NULL,
 							   tot.blocks_rechecked, es);
+
+		/*
+		 * Rows the heap recheck of a multi-key query turned away (DESIGN.md
+		 * §17, "A query known only at run time"): candidates of a superset
+		 * that the query, tested on the row, does not select.  Printed only
+		 * when there were some, as core prints "Rows Removed by Index
+		 * Recheck".
+		 */
+		if (tot.rows_removed > 0)
+			ExplainPropertyInteger("Rows Removed by Recheck", NULL,
+								   tot.rows_removed, es);
 		ExplainPropertyInteger("Containers Visited", NULL,
 							   tot.containers_visited, es);
 		/*
