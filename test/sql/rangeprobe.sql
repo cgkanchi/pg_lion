@@ -129,7 +129,10 @@ RESET pg_lion.enable_count_pushdown;
 -- run their leaves stay, empty and linked (DESIGN.md §18).  Either way the
 -- probe steps over them to the live end, 2026-01-21 03:20, which is where
 -- core finds it with a btree: lion's estimate from the directory alone and
--- core's from the btree are the same number, before VACUUM and after.
+-- core's from the btree are the same number, before VACUUM and after.  Each
+-- lion estimate is taken right after the btree's, with the btree dropped in
+-- between: building it rewrites the table's reltuples on 16, and both numbers
+-- have to be scaled by the same one.
 CREATE TABLE lpr_est (step text, est bigint);
 CREATE FUNCTION lpr_note(step text, ix text) RETURNS void
 LANGUAGE sql AS $$
@@ -138,15 +141,15 @@ LANGUAGE sql AS $$
 $$;
 SELECT lpr_note('histogram', NULL);
 DELETE FROM lpr WHERE id > 29000;
-SELECT lpr_note('deleted, lion', 'lpr_lion');
 CREATE INDEX lpr_bt ON lpr (ts);
 SELECT lpr_note('deleted, btree', NULL);
 DROP INDEX lpr_bt;
+SELECT lpr_note('deleted, lion', 'lpr_lion');
 VACUUM lpr;
-SELECT lpr_note('vacuumed, lion', 'lpr_lion');
 CREATE INDEX lpr_bt ON lpr (ts);
 SELECT lpr_note('vacuumed, btree', NULL);
 DROP INDEX lpr_bt;
+SELECT lpr_note('vacuumed, lion', 'lpr_lion');
 -- 9,000 more, and their leaves - some 300 of this column's, an index that
 -- grew by inserts holding about 34 of its keys to a leaf - are more than the
 -- probe reads (LION_PROBE_LEAVES): it gives up, and the histogram's own end
