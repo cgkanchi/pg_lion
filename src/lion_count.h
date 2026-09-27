@@ -330,6 +330,13 @@ lion_posting_set_lookup_many(Relation index, Oid keytype, int nvalues,
 										   isnull, sets, nfound);
 }
 
+/*
+ * The posting set of the entry at (buf, off) of a leaf the caller holds
+ * locked; an INLINE set takes a pin of its own on the leaf.
+ */
+extern void lion_posting_set_at(Relation index, LionState *state, Buffer buf,
+								OffsetNumber off, LionPostingSet *ps);
+
 /* Drop whatever pin/memory the posting set holds.  Idempotent. */
 extern void lion_posting_set_release(LionPostingSet *ps);
 
@@ -655,6 +662,36 @@ typedef struct LionEntryScan
 	MemoryContext cxt;
 	bool		done;
 
+	/*
+	 * SUMMARY POSTING SETS (DESIGN.md §31).  A walk whose caller only adds up
+	 * what it hands out may read a column's summaries instead of its keys: it
+	 * then walks in up to three PHASES - the VALUE entries of its part up to
+	 * the first bucket it covers whole (LOWER), the SUMMARY entries of the
+	 * buckets it covers whole (SUMS), and the VALUE entries after the last of
+	 * them (UPPER).  The three are disjoint and together are exactly the rows
+	 * of the part.  clipmax and clipmin are the bucket boundaries a VALUE phase
+	 * is cut at - keys at or below clipmax, keys above clipmin, compared with
+	 * the column's own comparison - and sumprev is the key of the last bucket
+	 * the SUMS phase has taken or started after.
+	 */
+	bool		usesum;			/* the caller allows summaries */
+	int			phase;			/* LION_PHASE_* being walked */
+	int			nextphase;		/* ... and the one to set up at the next read */
+	int			resumekind;		/* resume after every entry of the column up
+								 * to this kind, instead of after lastkey */
+	bool		hasclipmax;
+	bool		hasclipmin;
+	bool		hassumprev;
+	char	   *clipmax;		/* in phasecxt */
+	Size		clipmaxlen;
+	char	   *clipmin;
+	Size		clipminlen;
+	char	   *sumprev;
+	Size		sumprevlen;
+	uint32		sumprevhash;
+	MemoryContext phasecxt;
+	int64		nsummaries;		/* summary entries handed out */
+
 	/* The batch: what the last leaf read selected, copied out of it. */
 	MemoryContext batchcxt;
 	LionEntryTuple **bentry;	/* the copies */
@@ -688,6 +725,13 @@ typedef struct LionEntryScan
 #define LION_WALK_BELOW		2
 #define LION_WALK_ABOVE		3
 
+/* The phases of a walk that uses summaries (DESIGN.md §31). */
+#define LION_PHASE_VALUES	0	/* no summaries: the part's VALUE entries */
+#define LION_PHASE_LOWER	1	/* VALUE entries at or below clipmax */
+#define LION_PHASE_SUMS		2	/* the summaries of whole buckets */
+#define LION_PHASE_UPPER	3	/* VALUE entries above clipmin */
+#define LION_PHASE_DONE		4
+
 extern void lion_entry_scan_begin_col(LionEntryScan *es, Relation index,
 									 AttrNumber attno);
 
@@ -715,6 +759,19 @@ extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
 extern void lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
 									  AttrNumber attno, LionRange *range,
 									  int part);
+
+/*
+ * The same walk for a caller that only ADDS UP what it hands out - a sum, or
+ * a union - which may therefore be handed a column's SUMMARY entries in place
+ * of the keys they cover (DESIGN.md §31): the entries are still pairwise
+ * disjoint and still cover exactly the rows of the part.  On a column without
+ * summaries, and for an unordered range, it is lion_entry_scan_begin_part().
+ * The NULL entry never comes out of a walk that uses summaries; LION_WALK_ALL
+ * is then every VALUE entry, which is what the sum over a column needs.
+ */
+extern void lion_entry_scan_begin_sum(LionEntryScan *es, Relation index,
+									 AttrNumber attno, LionRange *range,
+									 int part);
 
 /*
  * Fetch the next entry.  On true, *key is a private copy of the entry's key

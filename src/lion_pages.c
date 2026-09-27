@@ -394,14 +394,41 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	*meta = *ondisk;
 	UnlockReleaseBuffer(buf);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION)
+	/*
+	 * Version 6 is the base format and version 7 the same with summary posting
+	 * sets (DESIGN.md §31): both are read, and a version 6 index is one whose
+	 * columns have no summaries.  Anything older predates a format change that
+	 * moved or reinterpreted items, and anything newer is a format this build
+	 * does not know.
+	 */
+	if (meta->magic != LION_MAGIC ||
+		(meta->version != LION_VERSION &&
+		 meta->version != LION_VERSION_SUMMARIES))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
-						   meta->magic, meta->version, LION_MAGIC, LION_VERSION),
+				 errdetail("Meta page magic %08X version %u, expected %08X version %u or %u.",
+						   meta->magic, meta->version, LION_MAGIC, LION_VERSION,
+						   LION_VERSION_SUMMARIES),
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.")));
+
+	/*
+	 * The summary words (§31) must agree with the version: a version 6 meta
+	 * page has zeros there, and a version 7 one names at least one column and
+	 * a bucket size a build could have chosen.
+	 */
+	if ((meta->version == LION_VERSION) != (meta->summary_cols == 0) ||
+		(meta->summary_cols != 0 &&
+		 (meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
+		  meta->summary_tids > LION_MAX_SUMMARY_TIDS)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Meta page version %u names summarized columns %08X with buckets of %u TIDs.",
+						   meta->version, meta->summary_cols,
+						   meta->summary_tids)));
 
 	if (meta->offset_bits != LION_OFFSET_BITS ||
 		meta->container_bits != LION_CONTAINER_BITS)
@@ -1042,6 +1069,22 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 	{
 		ix->cols[i].ix = ix;
 		lion_fill_column_state(index, &ix->cols[i], (AttrNumber) (i + 1), cxt);
+
+		/*
+		 * Summaries (DESIGN.md §31) are recorded per column by the build, which
+		 * gives them only to an ordered scalar column; a meta page that names
+		 * another is not one a build wrote.
+		 */
+		if ((meta->summary_cols & (((uint32) 1) << i)) != 0)
+		{
+			if (!ix->cols[i].ordered || ix->cols[i].multikey)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("index \"%s\" records summaries for key column %d, which is not an ordered scalar column",
+								RelationGetRelationName(index), i + 1),
+						 errhint("REINDEX the index.")));
+			ix->cols[i].summarized = true;
+		}
 	}
 
 	/*
@@ -1061,6 +1104,24 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 				 errmsg("index \"%s\" was built in the order of a comparison function its operator class no longer uses",
 						RelationGetRelationName(index)),
 				 errhint("REINDEX the index.")));
+}
+
+void
+lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
+						   uint32 bucket_tids)
+{
+	if (cols == 0)
+	{
+		meta->version = LION_VERSION;
+		meta->summary_cols = 0;
+		meta->summary_tids = 0;
+	}
+	else
+	{
+		meta->version = LION_VERSION_SUMMARIES;
+		meta->summary_cols = cols;
+		meta->summary_tids = bucket_tids;
+	}
 }
 
 /*
@@ -2264,7 +2325,7 @@ lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
 static void
 lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
 {
-	entry->flags = (entry->flags & LION_ENTRY_RESERVED) | LION_ENTRY_CHAIN;
+	entry->flags = (entry->flags & LION_ENTRY_KINDFLAGS) | LION_ENTRY_CHAIN;
 	entry->head = root;
 	entry->tail = tail;
 }
