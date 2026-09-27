@@ -1348,11 +1348,13 @@ Planner integration
     IN list; `k IN ($1, $2)` keeps an `ArrayExpr` over them in a generic plan, and that is accepted
     too, as long as its elements are themselves literals or parameters (the node evaluates the array
     ONCE per scan, and an element that could be volatile does not mean the same thing evaluated once
-    as it does evaluated per row). A multi-key clause (§17) still requires a Const, because there
-    the query's SHAPE and not just its value decides whether the posting sets can answer it at all.
-    At plan time the value is unknown, so `clause_selectivity()` gives the estimate it gives any
-    non-Const comparison; at run time a NULL value selects no rows, which every operator involved
-    agrees with by being strict.
+    as it does evaluated per row). A multi-key clause (§17) required a Const until 2026-09-27,
+    because there the query's SHAPE and not just its value decides whether the posting sets can
+    answer it at all; it takes a Param now, and answers the values its posting sets cannot answer
+    exactly from a superset rechecked in the heap (§17, "A query known only at run time"). At plan
+    time the value is unknown, so `clause_selectivity()` gives the estimate it gives any non-Const
+    comparison; at run time a NULL value selects no rows, which every operator involved agrees with
+    by being strict.
   - **So does any expression an index scan would take as a run-time key** (2026-09-27, a
     real-workload benchmark). A time window is written `ts >= now() - interval '90 days'` or `d >=
     current_date - 30`, and neither is a Const or a Param: `eval_const_expressions()` folds only
@@ -1377,8 +1379,8 @@ Planner integration
     estimate and the cost model prices the list's real length rather than `estimate_array_length()`'s
     default for an expression. An `ARRAY[]` over such expressions is taken element by element, as a
     generic plan's `ARRAY[$1, $2]` is. EXPLAIN deparses the expression like any clause value, `ts >=
-    (now() - '30 days'::interval)`. A multi-key clause (§17) still takes a Const only, for the
-    reason above.
+    (now() - '30 days'::interval)`. A multi-key clause (§17) takes one as its query too - `tsv @@
+    to_tsquery(current_setting(...))` - under the same rule as a Param.
   - **A boolean column tested by itself is the equality it stands for** (2026-09-27).
     `eval_const_expressions()` folds `flag = true` into the bare Var `flag`, and `flag =
     false` and `flag <> true` into `NOT flag`, before any path is built, so no boolean equality ever
@@ -1392,8 +1394,9 @@ Planner integration
     model is handed that OpExpr in place of the bare column. All four are false for NULL, as `=` is.
     `flag IS NOT TRUE` and `flag IS NOT FALSE` are true for NULL as well and so are no equality: they
     are the OR of the other value and the column's NULL entry, `flag = false OR flag IS NULL`, which
-    §19 takes apart like any other OR - as a whole restriction, or flattened into the arms of one;
-    inside an AND arm it is declined (`lion_boolean_not_test()`). `flag IS UNKNOWN` and `flag IS NOT
+    §19 takes apart like any other OR - as a whole restriction, flattened into the arms of one, or
+    inside an AND arm distributed into two arms (`lion_boolean_not_test()`, and §19's "Nested ORs,
+    distributed"; until that was written it was declined there). `flag IS UNKNOWN` and `flag IS NOT
     UNKNOWN` are §14's two null tests. A domain over boolean is relabelled to boolean by the WHERE
     clause and answered by bool_ops unchanged.
   - **Enum keys: the class's own type, for every clause kind** (2026-09-27).
@@ -1658,7 +1661,10 @@ enum `=`, IN list, GROUP BY, domain and FK-side join, every boolean form beside 
 under an OR, `now()` and `current_date` windows, a STABLE function, generic plans over `$1::date +
 1`, an exec Param inside an expression, and the volatile values that must be declined - over one
 single-column index per column and again over one multicolumn index, with every other scan
-disabled so that a LionCount path that is built at all is the plan. `test/sql/null.sql` and
+disabled so that a LionCount path that is built at all is the plan; and the ORs nested inside AND
+arms of §19, `flag IS NOT TRUE` among them, up to the distribution that is too large and declined.
+`test/sql/countmultikey.sql` does it for the multi-key queries only the executor sees (§17).
+`test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too. Section 11 of `test/sql/multicolumn.sql` runs the whole of this section
@@ -3109,25 +3115,28 @@ decision.
 
 A new clause kind, `LION_CLAUSE_MULTI`: an OpExpr whose operator is strategy 2, 3 or 5 of some roaring
 opfamily, with the column on the LEFT (these operators do not commute: `'{a}' @> tags` is strategy 4)
-and a non-NULL Const on the right.  Strategy 4 and everything that is not a roaring operator bail.
+and a non-NULL Const on the right - or, since 2026-09-27, a value the node evaluates at run time
+("A query known only at run time" below).  Strategy 4 and everything that is not a roaring operator
+bail.
 
 - The strategy is read from the OPERATOR (`lion_op_roaring_strategy()`, a pg_amop lookup restricted to
   the roaring AM), not from an index, because the parent of a partitioned table has no index list
   (§16) and the clause kind has to be known before any index is matched.  `lion_match_index()` then
   re-checks the strategy against the index that will really answer the clause, per partition.
-- The query is extracted AT PLAN TIME and the clause is only pushed down when the mode is KEYS.  An
-  ALL-mode query would have every row rechecked in the heap, which is what the ordinary bitmap plan
-  already does, better.  `lion_match_index()` additionally insists that each relation's index carries
-  the very extractQuery function the plan-time extraction used, so the run-time extraction cannot
-  come out differently.
-- **A multi-key clause therefore requires a Const**, even though §10 accepts a Param for equality
-  and for an IN list.  What decides whether this node can answer the clause at all is the query's
-  SHAPE - `tags @> $1` with `$1 = '{}'` extracts to ALL mode, as does a phrase or a prefix tsquery -
-  and a Param has no shape until the executor has it, at which point the plan is fixed and there is
-  nothing to fall back to: the node cannot recheck the operator against the heap, so it would have
-  to error on a query it was handed legitimately.  A generic plan over `tags @> $1` therefore uses
-  the ordinary plan (costed as ALL, above); a custom plan folds the parameter to a literal and is
-  pushed down as usual.  `test/sql/array.sql` pins both.
+- A LITERAL query is extracted AT PLAN TIME and the clause is only pushed down when the mode is
+  KEYS.  An ALL-mode query would have every row rechecked in the heap, which is what the ordinary
+  bitmap plan already does, better.  `lion_match_index()` additionally insists that each relation's
+  index carries the very extractQuery function the plan-time extraction used, so the run-time
+  extraction cannot come out differently.
+- **A multi-key clause used to require a Const**, even though §10 accepts a Param for equality and
+  for an IN list.  What decides whether this node can answer the clause at all is the query's SHAPE
+  - `tags @> $1` with `$1 = '{}'` extracts to ALL mode, as does a phrase or a prefix tsquery - and a
+  Param has no shape until the executor has it, at which point the plan is fixed and there is
+  nothing to fall back to: the node could not recheck the operator against the heap, so it would
+  have had to error on a query it was handed legitimately.  It can now, and so a generic plan's
+  `tags @> $1` and a stable expression's query are taken ("A query known only at run time" below).
+  A custom plan folds the parameter to a literal and is pushed down as before; `test/sql/array.sql`
+  pins both.
 - At run time the clause's source is the tree over its keys' posting sets, ANDed with the other
   clauses by the merge, exactly like an IN list's union.  Several multi-key clauses on ONE column are
   allowed (the one-positive-clause-per-column rule of §10 is for clauses that pin a value;
@@ -3142,6 +3151,141 @@ and a non-NULL Const on the right.  Strategy 4 and everything that is not a roar
   column next to a multi-key WHERE clause is the supported and tested combination.
 - EXPLAIN prints the clause with its operator: `Lion Indexes: idx (tags @> {t5,t7})`,
   `idx (tsv @@ 'w1' & 'w2')`.
+
+### A query known only at run time (2026-09-27)
+
+A multi-key clause whose query is not a literal - a prepared statement's GENERIC plan
+(`tags @> $1`, `tsv @@ to_tsquery($1)`), a stable expression (`tsv @@
+to_tsquery(current_setting('app.q'))`), an exec Param under a LATERAL nested loop - was declined,
+for the reason above: its shape decides whether the posting sets can answer it, and the node
+could not answer the shapes they cannot.  It is accepted now, under §10's rule for a value
+(`lion_is_value_expr()`, an `ARRAY[$1, $2]` of values included), and the node answers EVERY value
+the clause can take: exactly when the key sets answer it, and otherwise from a SUPERSET of its rows
+whose every candidate is tested in the heap.
+
+**The superset** (`lion_extract_query_superset()`, lion_multikey.c).  The run-time value is extracted
+with the index's own extractQuery, as a literal is, and the tree over its keys is widened wherever
+lion_extract_query() would have given up - which only a caller that rechecks may do:
+
+- `@>` with a NULL element is the AND of the other elements (a NULL is under no key, and an AND of
+  fewer keys selects more rows); every row when there is no other;
+- `&&` with a NULL or partial key is every row: an OR cannot leave a key out and stay a superset;
+- in a tsquery a lexeme with a weight mask is the lexeme at any weight; a prefix lexeme is every row
+  (the keys are hashed, and a range of them cannot be walked); `!a` is every row; a phrase `a <N> b`
+  is `a & b`, each side widened the same way, because a phrase matches only where both of its
+  operands match - at positions the index does not store - and an operand that is itself every row
+  (`!a <-> b`) constrains nothing; an AND drops the operands that are every row, and an OR is every
+  row when either operand is;
+- INCLUDE_EMPTY and ALL search modes (`@> '{}'`), more keys than LION_MAX_QUERY_KEYS and any other
+  strategy are every row.
+
+A query lion_extract_query() answers exactly comes back KEYS with the same keys; one that selects
+nothing (`&& '{}'`, an empty tsquery) NONE; a widened one LOSSY, with only the keys its tree names;
+and one no key narrows ALL.  `<@` is still declined whatever its value: ginqueryarrayextract() answers
+it with INCLUDE_EMPTY, so it would never be exact and always be the recheck the ordinary bitmap plan
+makes anyway.  (`=` on arrays is no operator of array_ops.)
+
+**Execution** (`lion_locate_multikey()`, lion_customscan.c).  The value is evaluated once per scan
+and after every ReScan with the other clause values (`lion_eval_clause_values()`, in every
+participant of a parallel plan), and extracted per relation counted:
+
+- KEYS is the literal case: the tree over the keys' sets is the clause's source;
+- NONE selects nothing, like a NULL value;
+- LOSSY makes the superset's tree the source, and the clause is added to the ROW FILTER below;
+- ALL locates nothing and is no source of the intersection at all - a negated source with nothing to
+  subtract, which is exactly how `IS NOT NULL` over a column without NULLs reads - and the clause
+  is added to the row filter, which then tests the rows the OTHER sources select;
+- and when there is no other source that selects rows - a plain count whose only positive clause
+  was an ALL query - the relation is read by a sequential scan under the count's snapshot, and the
+  filter and the `IS NOT NULL` clauses are tested on each row (`lion_count_heap_filtered()`): the
+  ordinary plan's work, which is what the cost model charges a value it cannot estimate.
+
+**The row filter** (`LionRowFilter`, lion_count.c).  The node builds one per relation it counts - each
+clause `col op value` with the clause's operator and this scan's value, the column numbered as the
+index that answers it says, which for a partition is the partition's own numbering (§16) - and hangs
+it on the visibility cache every count of the execution is handed (`lion_vis_cache_set_filter()`),
+so that no caller of the count changes.  A count that finds one:
+
+- asks nothing of the visibility map: it vouches for visibility, not for the query.  Every candidate
+  TID goes to the heap recheck, as on a standby or with no pinned source (§9's `novm`);
+- resolves each candidate's HOT chain under the page's share lock exactly as an unfiltered recheck
+  does (`heap_hot_search_buffer()`, with its serializable checks and tuple predicate locks), notes the
+  visible member, and tests it after the lock is released, under the pin alone - which is what core's
+  page-at-a-time heap scans do: nothing moves a tuple while another backend pins its page, pruning
+  and defragmentation need the cleanup lock, and the operator may detoast or run for a while, which
+  must not happen under a content lock.  A row counts when the snapshot sees it and it passes;
+- keeps no visibility cache: the cache knows which offsets are visible, not what their tuples hold.
+
+Why the answer is exact: the candidates are a superset of the rows the WHERE selects - the sources
+are exact for their own clauses and a superset for the filtered one - and each candidate is then
+decided by the snapshot and by the very operator and value the query applies, on the very version the
+snapshot sees.  §9's interlock has nothing to protect: nothing is counted from the map.
+
+Every shape of the node counts through the same functions, so every shape takes the filter: a GROUP
+BY per group, a count(DISTINCT) per test (an existence test stops at its first row that passes), a
+range walk per entry, a partition per partition, and the FK-side join (§27) per dimension row - where
+the collected copy of the fact filters is made WITHOUT the filter (it copies the superset; a
+collection is handed no cache) and each count of it applies the filter.  A disjoint sum or a one-set
+count is not taken beside an ALL query's empty source, which takes the ordinary merge instead.
+
+Under an OR (§19) the query still has to be a literal: the filter tests the clause alone, which is
+right for a clause the rest are ANDed with, while a row satisfies an OR when ANY arm holds, and the
+other arms' leaves are answered from posting sets and never evaluated.
+
+**Cost** (`lion_multikey_cost_mode()`, `lion_cost_recheck()`).  The clause analysis hands the cost model
+the clause over the value's plan-time estimate when `estimate_expression_value()` gives one (a stable
+expression; a custom plan's parameter is a literal already), and the model extracts it as the
+executor will extract the value itself: KEYS costs what a literal costs; LOSSY rechecks at least the
+rows the clause selects (the superset is wider, by how much the estimate does not say); ALL rechecks
+every row the other clauses select, or every row of the relation.  A value with no estimate - a
+generic plan's parameter - is priced as ALL: its shape is unknown, and is assumed to be the
+expensive one, as lioncostestimate() assumes it for a bitmap scan.  Each candidate is fetched on
+the pages each count reads for itself (`lion_heap_page_cost()`, a filtered recheck having no cache)
+and tested at the clause's own evaluation cost; §10's recheck of the dirty pages is still charged
+beside it.  So a lone `tags @> $1` in a generic plan loses to the ordinary plan, whose own index
+path is priced as ALL too; beside a selective clause the rows the node would recheck are the ones
+the ordinary plan fetches anyway, and the two come out close, the node ahead by what the posting
+sets save (18% in the table below, 4% on the smaller table of the tests, which is why those pin
+only the lone clause); and under `plan_cache_mode = auto` the generic plan's price keeps the plan
+cache choosing custom plans, whose literals are pushed down exactly.
+
+**EXPLAIN** prints the clause with its value as core does (`tags @> $1`, `tsv @@
+to_tsquery('simple'::regconfig, current_setting('app.q'::text))`); with ANALYZE, `Heap TIDs
+Rechecked` counts the candidates tested, or the rows scanned, and `Rows Removed by Recheck` - printed
+only when there were some, as core prints its own - the ones the filter turned away.
+
+**Measured** (2026-09-27, PostgreSQL 18.6 assert build, so ratios and not absolute numbers; 400,000
+rows over 9,757 heap pages, all-visible; `k` 50 values, `tags` three elements out of 20, 7 and
+5,000, `tsv` four lexemes; generic plans, medians of five, warm):
+
+| query and value | node | ordinary plan |
+|---|---|---|
+| `tsv @@ $1 AND k = $2`, `'w1 & x2'` (exact) | **0.4 ms** (8,116) | 8.6 (9,929) |
+| ... `'w1 <-> x1'` (the AND of the lexemes, rechecked) | **2.9** | 7.1 |
+| ... `'!w1'` (every row of `k = 1` rechecked) | **7.2** | 6.6 |
+| `tags @> $1` alone, `'{t1}'` (exact) | 0.2 (14,784) | **126** (14,762) |
+| ... `'{t1,NULL}'` (the rows of `t1`, rechecked) | 33.5 | **122** |
+| ... `'{}'` (a sequential scan) | 79.5 | **105** |
+
+Bold is the plan the model picks, which does not know the value: beside a selective clause the
+node, whose worst case - `!w1` - is the ordinary plan's work to a tenth; alone the sequential scan,
+by 22 units in 14,762, because priced as every row the node IS a sequential scan - and one that
+runs faster than the ordinary plan's, since the query is extracted once where the ordinary plan
+evaluates it per row, so the worst case the model assumes is not worse than what it replaces.
+What the lone clause gives up is the exact case, 0.2 ms against 126; under `plan_cache_mode =
+auto` the plan cache keeps choosing custom plans for it, whose literal is exact.
+
+`test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
+counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
+that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b`, a
+prefix beside a lexeme) and are every row (`{}`, `!a`, `a:*`, `a | !b`), queries built by
+`to_tsquery($1)` and `websearch_to_tsquery($1)`, `ARRAY[$1, $2]`; beside other clauses, two such
+clauses and an `IS NOT NULL` read by the sequential scan, `count(col)`, GROUP BY (one column and two),
+HAVING, a folded GROUP BY and count(DISTINCT); the OR that is declined; custom plans; stable
+expressions, and one cached generic plan executed as its setting moves through exact, every row and
+widened; an exec Param under LATERAL; the cost model's choices; a partitioned table whose partitions
+number the column differently; the FK-side join's inner, semi, anti and count(DISTINCT) forms, and
+in parallel plans; and a dirty heap before and after VACUUM.
 
 ### Cardinality guard
 
@@ -3158,8 +3302,9 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 ### Not supported
 
 `<@` from the posting sets (a row matches when it has no key OUTSIDE the query array, which the index
-cannot tell); prefix, phrase and weighted tsqueries from the posting sets; `col op ANY (...)` in the
-count pushdown (only in the bitmap scan); a Param as a multi-key query in the count pushdown (above);
+cannot tell); prefix, phrase and weighted tsqueries from the posting sets, except as the superset a
+query known only at run time is counted from (above); `col op ANY (...)` in the count pushdown (only
+in the bitmap scan); a query known only at run time under an OR (above);
 a multi-key index as the GROUP BY or sum-over-all driver;
 `lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
 
@@ -3602,6 +3747,30 @@ End, and at the end of each partition's turn.
 `Lion Indexes: ix_c200, ix_c20 ((c200 = 17) OR (c20 = 3))`, an AND arm as
 `((a = 1) AND (b = 2))`, and - on a partitioned scan, where there is one index per partition - the
 expression alone. A Param is deparsed as `$1` like any other clause value.
+
+**Nested ORs, distributed (2026-09-27).** The structure above is an OR of ANDs of leaves, one level
+deep, because that is what a source's tree is built from. An AND arm with an OR inside it used to
+decline the whole query - and `flag IS NOT TRUE` is one (`flag = false OR flag IS NULL`, §10), so
+`(status = 'val1' AND flag IS NOT TRUE) OR country = 'c1'` was never counted while the same test at
+the top level was. `lion_or_arms()` now puts the restriction into disjunctive normal form before the
+leaves are analysed: an OR's arms are its operands' arms, an AND's are every combination of one arm
+of each operand, and `flag IS NOT TRUE` / `IS NOT FALSE` are the ORs they stand for wherever they
+appear, so that one is `((status = 'val1') AND (flag = false)) OR ((status = 'val1') AND (flag IS
+NULL)) OR (country = 'c1')` - which is what EXPLAIN prints. The union of the arms is the same set of
+rows, and nothing downstream changes: the arms are ordinary arms, flattened and carried as before.
+Distributing repeats a term in every arm it is distributed into, and each repetition is a leaf of its
+own - its own lookup, priced as such, and its own set of the union - and it multiplies arms: an AND of
+k two-way ORs is 2^k arms of k leaves. So the leaves of one OR are bounded by what an IN list's sets
+are bounded by, LION_MAX_ARRAY_ELEMS (§15), for the same reason: every set of the union may hold a
+buffer pin for as long as the node runs, and a union's leaves are never materialized (above). Past
+it the query is declined; the bound applies to an OR as written as well, which no ordinary query
+comes near. The other option, an OR node inside an arm, would have kept a term to one lookup, at the
+price of a second level in `LION_PRIV_ORS`, `lion_locate_or()` and the model's union terms; the
+distributed form is the one the rest of the machinery already knows, and the repeats cost what the
+model says they cost. `test/sql/countclauses.sql` covers both boolean tests in an arm, both in one
+arm (four arms, three of which select nothing), each in an arm of its own on both sides of the OR,
+an OR of other columns nested in an arm, a GROUP BY and a clause ANDed beside the OR, three nested
+ORs in one arm, and ten, which would be 1,024 arms of 11 leaves and is declined.
 
 **Measured** (2026-09-21, 1M rows of `(c200, c20)`, 18,182 heap pages all-visible, assert build):
 `count(*) WHERE c200 = 17 OR c20 = 3` returns 55,000 rows in **0.55-0.62 ms** against the BitmapOr +
@@ -6249,8 +6418,9 @@ ANALYZE shows the early exit reading fewer containers than the same walk with `c
 ## 27. FK-side join pushdown: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK (v1, implemented)
 
 Formerly the §23 backlog item of the same name; the semi and anti joins (`EXISTS`, `IN`, `NOT
-EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`
-and parallel plans after them. The shape is the star-schema aggregate
+EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`,
+parallel plans and the forward semi join over a non-unique key after them. The shape is the
+star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -6331,6 +6501,10 @@ The proof is therefore a COSTING AND SCOPE GUARD ONLY, and nothing about correct
 (2026-09-23 review): because the per-dimension-row sum is exact with duplicates, a unique index that
 is later dropped, becomes invalid, or is deferrable and violated inside the current transaction can
 make the node do more lookups than it was priced for, never give a wrong answer.
+
+It guards the inner join only. A semi join's count is not a sum over join pairs, and the forward
+one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
+("Forward semi joins over a non-unique key", below), which makes the question moot there.
 
 ### The join semantics the lookup must reproduce
 
@@ -6445,11 +6619,21 @@ loop's 2 ms, and forced with `d.pk < 2000` estimated 7,500 against 10,000 and ra
 per-count union is worst (`x IN (1, 2)` over 1000 dimension rows: 957 ms, refused, against 108).
 The rows of the table below are unchanged by it.
 
-An IN list whose array is a PARAMETER (`= ANY ($1)`) is refused outright: its length is not known
-until the executor has it (§15), and the node's work per dimension row is proportional to it - a
-43,000-value array over 20,000 dimension rows ran for minutes in the review. A single table
-answers such a list once and keeps accepting it; `IN ($1, $2)` keeps its length at plan time and
-is priced like a literal list.
+An IN list whose array is a PARAMETER (`= ANY ($1)`) used to be refused outright: its length is not
+known until the executor has it (§15), and a count that reads the filters does work per dimension
+row proportional to it - a 43,000-value array over 20,000 dimension rows ran for minutes in the
+review. Since the fact filters are collected once ("The fact filters, collected once" below) that
+work is done once per scan instead, whatever the list's length, and the list is taken as a single
+table takes it (2026-09-27): evaluated once per scan and rescan, in every participant of a parallel
+plan, and so is any other array a stable expression computes (`x = ANY
+(string_to_array(current_setting(...), ',')::int[])`). The cost model prices it two ways
+(`lion_cost_fkjoin_rel()`): collected, once per scan, at `estimate_array_length()`'s guess - an
+expression's array at its plan-time estimate, which the clause analysis puts in the clause (§10) -
+and probed, per dimension row, as the longest list a literal may be (LION_MAX_ARRAY_ELEMS). A
+wrong guess about a scan's one-off work costs little; a wrong guess about a dimension row's costs
+that many times over, which is what the review measured. So the copy is what is chosen whenever it
+is expected to fit, and a copy that does not fit at run time falls back to the probes, as a literal
+list's does. `IN ($1, $2)` keeps its length at plan time and is priced like a literal list.
 
 **Measured** (2026-09-23, prune slot's PostgreSQL 20devel install - assert-enabled, so ratios and
 not absolute numbers; two million fact rows over 22,728 heap pages with a 40-byte pad, `fk` = a
@@ -6513,12 +6697,12 @@ differently.
   made of it.)
 - **A non-unique key keeps its semi join**, and has to: counting pairs would count a fact row once
   per duplicate. The node never treats it as an inner join. Its inner side is the DIMENSION, so the
-  one shape it can take is the reverse one below with the roles exchanged - each fact row tested
-  against the dimension's posting sets - which needs a lion index on the dimension's key, dimension
-  filters that posting sets answer, and a lookup per fact row, which the cost model refuses whenever
-  the fact table is the large one (tested). Core's other way of running it, the dimension's distinct
-  keys joined as an inner join (`JOIN_UNIQUE_INNER`), would let the node count the forward form over
-  a non-unique key too, as a sum over distinct keys; it is not built.
+  one shape it could take at first is the reverse one below with the roles exchanged - each fact
+  row tested against the dimension's posting sets - which needs a lion index on the dimension's key,
+  dimension filters that posting sets answer, and a lookup per fact row, which the cost model
+  refuses whenever the fact table is the large one (tested). Core's other way of running it, the
+  dimension's distinct keys joined as an inner join (`JOIN_UNIQUE_INNER`), is the one the node takes
+  now, as a sum over distinct keys ("Forward semi joins over a non-unique key", below).
 - **The reverse form is new.** Its rows are the OUTER side's, each once, when it has a match. That is
   the lookup the node already makes per dimension row, with §26's existence test in place of the
   count: the fk set merged with the fact filters and stopped at the first container that shows a
@@ -6534,16 +6718,16 @@ differently.
 
 Recognition (`lion_fkjoin_recognize()`): exactly one SpecialJoinInfo, JOIN_SEMI or JOIN_ANTI, with
 no `ojrelid`, whose minimal sides are one base relation each and equal to its syntactic sides; the
-fact is its inner (right) side and the dimension its outer side, one way round only; the one join
-clause is found as for an inner join, from the equivalence class or joininfo. A qual of a NOT
-EXISTS that names only the outer side (`NOT EXISTS (... AND d.attr = 2)`) stays a join clause of
-the anti join and is a second one, which declines; inside an EXISTS the planner moves it to the
-outer relation, where it is a dimension filter like any other. No uniqueness is asked: the count is
-per dimension row, so a duplicated key is two rows tested twice and counted twice, as the semi join
-counts them, and a NULL key is looked up by nobody. The aggregates are the inner join's counts:
-`count(*)`, `count(1)`, and in a semi join `count(d.pk)` (a matched row's key is not NULL); an anti
-join's rows include the NULL keys, so there `count(d.pk)` declines. The partial path's row estimate
-is the join rel's own.
+fact is its inner (right) side and the dimension its outer side (a semi join is also taken the other
+way round, as "Forward semi joins over a non-unique key" below); the one join clause is found as for
+an inner join, from the equivalence class or joininfo. A qual of a NOT EXISTS that names only the
+outer side (`NOT EXISTS (... AND d.attr = 2)`) stays a join clause of the anti join and is a second
+one, which declines; inside an EXISTS the planner moves it to the outer relation, where it is a
+dimension filter like any other. No uniqueness is asked: the count is per dimension row, so a
+duplicated key is two rows tested twice and counted twice, as the semi join counts them, and a NULL
+key is looked up by nobody. The aggregates are the inner join's counts: `count(*)`, `count(1)`, and
+in a semi join `count(d.pk)` (a matched row's key is not NULL); an anti join's rows include the NULL
+keys, so there `count(d.pk)` declines. The partial path's row estimate is the join rel's own.
 
 Visibility is §26's argument, unchanged: an existence test is a count compared with zero, computed
 from the same containers read the same way, and the per-dimension-row structure is this section's.
@@ -6587,8 +6771,14 @@ count seeks by a binary search in memory. The same forward count takes 135 ms (t
   does (the merge stops there: `lion_exists_settled()` reads the collection's `failed`), and that
   run reads the filters per count as before; EXPLAIN ANALYZE then prints `Fact Filter Rows
   Collected: -1`. The same on a hot standby, where whether the map may be trusted depends on the
-  WAL mode of every index read, and for an IN list too long to open at once, whose batches (§15)
-  each yield every container key of their own and would reach a copy out of order.
+  WAL mode of every index read.
+- An IN list too long to open at once used to be refused a copy as well: a count takes such a list
+  in batches (§15, "Bounded cursors"), each yielding every container key of its own, which would
+  reach a copy out of order. A collection is never batched now (2026-09-27): the batches exist to
+  keep a count's pins, which a collection drops anyway, so the list is read as the windowed union
+  any other union too wide for the open budget is (`lion_plan_node()`, `lion_wide_fill()`), a window
+  of container keys at a time and every key in order. That is what makes a list whose length the
+  planner could not see safe to collect, however long it turns out.
 - Nothing is asked of the visibility map or the heap while the copy is made, and nothing is pinned:
   its cursors drop each leaf once copied (`cx->droppins`), the visibility cache is not consulted,
   and the disjoint sum and the one-set shortcut of §15 are not taken - a copy wants the union
@@ -6827,7 +7017,9 @@ it is offered, besides the serial path, over the dimension's cheapest partial pa
   nothing else is divided, so every partial count or row comes from one participant and the
   answers are the serial node's. Above the Gather, core's Finalize Agg adds the partial counts
   (hashed for a GROUP BY, sorted over no columns for a folded one, plain without one); the rows of
-  a `count(DISTINCT)` are sorted and aggregated above it by core's Agg.
+  a `count(DISTINCT)` are sorted and aggregated above it by core's Agg. (The forward semi join over
+  a non-unique key divides its distinct keys instead, over the dimension's whole plan, and shares a
+  counter to do it: "Forward semi joins over a non-unique key".)
 - **Nothing is shared but EXPLAIN's counters.** Each participant locates the fact filters and makes
   its own copy of them (`lion_sources_collect()`) under its own `get_hash_memory_limit()`, and
   falls back to probing on its own when its copy does not fit. The copy is not built once in
@@ -6896,9 +7088,174 @@ dimension rows) the first row took 94 ms and the third 650; the fk index's pages
 three. The serial `count(DISTINCT)` over the 2,000,000-key fk is the one serial choice the model
 gets wrong here (the hash join at 121,557 against the node's 123,222, 706 ms against 507).
 
+### Forward semi joins over a non-unique key (2026-09-27)
+
+    SELECT count(*) FROM fact f WHERE <f filters>
+      AND EXISTS (SELECT 1 FROM dim d WHERE d.k = f.fk AND <d filters>)
+
+and `f.fk IN (SELECT d.k FROM dim d WHERE ...)`, where nothing proves `d.k` unique. With no proof
+`reduce_unique_semijoins()` leaves the semi join a semi join, its inner side the dimension, and its
+answer is the fact rows whose key is in the SET of keys of the dimension rows that pass the filters:
+counting join pairs, as the inner join does, would count a fact row once per duplicate. Core runs it
+as a (hash) semi join, or as `JOIN_UNIQUE_INNER` - the dimension made unique on the key by a
+HashAggregate or a Sort and a Unique, then an inner join. The node does the second:
+
+- it runs the dimension's plan as its child, as for every FK-side join, and sorts the keys of its
+  rows, which puts equal keys next to each other; each is kept once;
+- it counts each DISTINCT key as the inner join counts a dimension row - the key's fk set ANDed
+  with the fact filters or their collected copy, a partial count - and the Finalize Agg adds the
+  counts up.
+
+Why that is the semi join's count:
+
+- **Distinct keys have disjoint posting sets.** A fact row has one fk value, and two keys that are
+  distinct under the join's equality cannot both equal it: the sort's btree family has the join
+  operator as its equality, and equality in a family is transitive across its types (an `int4` fk
+  against `int8` keys included). So every fact row with a match is counted once, under the one key
+  it equals, and no other fact row is counted at all.
+- **Which keys are distinct is the join's own question.** The sort is by the `<` of a btree family
+  that has the join operator as its equality, for the dimension key's type
+  (`get_ordering_op_for_equality_op()`, the order core's own sorted unique-ification of a semi
+  join's inner side takes), under the join clause's input collation, and neighbours are compared
+  with that family's `=`. Two keys the join cannot tell apart are neighbours and one of them is
+  looked up - which finds the other's entry too, since the fk index answers the join operator
+  (`lion_match_index()`). An operator no btree family knows has no such order, and the shape is left
+  to the ordinary plan.
+- **NULL keys** are never sorted (a strict operator matches nothing to them), and a NULL fk lives in
+  the fk index's NULL entry, which no key reaches.
+- **Visibility is the inner join's**: the child runs under the query's snapshot, each distinct key's
+  count is §9's, and the sort holds keys, never a posting set or a pin. The fact filters are located
+  (and collected) before the child runs and keep their pins while it runs to its end, which is the
+  exposure "Visibility and the §9 interlock" names for a child that runs between counts.
+
+Recognition (`lion_fkjoin_recognize()`): the one semi join of "Semi and anti joins", taken the other
+way round - the fact its outer side, the dimension its inner one - as `JOIN_UNIQUE_INNER`, core's
+name for the plan. Where the dimension has lion indexes of its own, the reverse orientation with the
+roles exchanged is offered beside it and the cost model chooses (the tests' model takes the distinct
+keys). `lion_try_fkjoin_path()` treats it as an inner join over the distinct keys, `LION_JOIN_INNER`
+with `LION_JOINFLAG_UNIQUE`. What the query above the EXISTS can name is the fact's: `count(*)`,
+`count(1)`, `count(f.fk)` (a matched row's key is not NULL) and `count(DISTINCT f.fk)`, whose rows
+("count(DISTINCT)") are then one per distinct key with a match, carrying the key. A GROUP BY can only
+be of fact columns, which no FK-side join puts in its output ("Declined"), and declines; so does the
+anti join the other way round, `NOT EXISTS` over the fact's rows, which would count the fact rows
+WITHOUT a match.
+
+**A sort in the node, not core's unique-ification as the child.** Core's path for it is
+`create_unique_path()` up to 18 and `create_unique_paths()` from 19, which builds other shapes (a
+presorted or incrementally sorted input, a two-phase unique-ification over a Gather) and different
+ones per major; a hashed one gives its keys in no order, and the parallel plan below needs every
+participant to produce the same sequence of distinct keys, which a sort by a total order gives. A
+datum sort of the key alone (`tuplesort_begin_datum()`) is what a Sort node over one column does and
+takes as long: 199,000 random `int4` keys sorted in 21.5 ms, and in 20 ms by a Sort node over the
+same Seq Scan, against about 30 ms for the HashAggregate core would make of them. It sorts within
+`work_mem` and spills past it as a Sort node's does.
+
+**Parallel.** Unique-ification per participant is not global: with the dimension's partial path as
+the child, as the other joins take it, a key whose rows went to two participants would be kept and
+counted by both, its fact rows twice. Three plans were measured (the table below):
+
+- **serial**;
+- **unique-ified in the leader**: the serial node over a Gather of the dimension's partial path,
+  which is what the node gets without anything built whenever a parallel scan is the dimension's
+  cheapest path. It divides only the dimension scan, which is the small part: 118.6 ms against the
+  serial node's 118.5 for the first row of the table, 98.4 against 94.7, 142.0 against 141.7, 435.9
+  against 441.5 and 460.2 against 434.9 for the 139,929 and 199,000 rows - no gain anywhere;
+- **the keys partitioned** (taken): every participant runs the dimension's WHOLE plan - its cheapest
+  path that may run in a worker, which is not its cheapest path when that is a Gather - and sorts all
+  of the keys, so that all of them have the same sorted sequence of distinct keys, and they divide it
+  by position in runs of `LION_FKJOIN_UNIQUE_CHUNK` (64), each claimed from an atomic counter in the
+  Gather's dynamic shared memory. A participant claims the run after its last one only once it has
+  finished that one, so the counter never gives out a run behind the participant's position, and
+  every run is counted by exactly one participant, however many start and whether the leader takes
+  part; a plan run without its workers counts every key in the leader, and a rescan's
+  `ReInitializeDSMCustomScan` sets the counter back to the first run. The child, the sort and the
+  copy of the fact filters are every participant's, as a hash join's table below a Gather is, and
+  are charged so; the counts are divided. 1.2 to 2.3 times faster than serial on four shared cores.
+
+Every participant has to see the same rows, so the parallel path is not offered when a dimension
+qual has a volatile function in it (which could keep a row in one participant and drop it in
+another; an EXISTS with one is not pulled up to a semi join at all, an IN is). `Join Keys Looked Up`
+summed over the participants is then the distinct keys exactly, which the tests check, and over
+rescans of the Gather each run's.
+
+**Cost.** The child's total cost and the sort's are the node's startup: `LION_FKJOIN_SORT_COMPARE_COST`
+(a quarter of a `cpu_operator_cost`) a comparison, N log2 N of them, and `LION_FKJOIN_SORT_KEY_COST`
+(6) a key for putting it in, taking it out and comparing it with the previous distinct key, plus one
+merge pass past `work_mem`. Measured: 0.108 us a key to put in and sort 40,000 or 199,000 keys, and
+0.023 us to take them out and compare them - about 13 `cpu_operator_cost` a key at the 250 units a
+millisecond the node's other terms run at. `cost_sort()` charges 36 a key at 200,000, three times
+the time the sort takes (while `cost_agg()` charges core's hashed unique-ification one a row), and it
+answers `enable_sort`, which this sort, no Sort node, does not. Then "Cost, revisited"'s per-key
+terms, over the distinct keys (`estimate_num_groups()` of the key over the child's rows) - but not
+all of them. The keys of `IN (SELECT k FROM ...)` are any set's, and only those that are fk values
+find an entry; the rest cost a descent and nothing more. How many find one is what core's own
+estimate of the semi join says: the fact rows it leaves over the rows the fact filters leave of one
+fk value (the fact rel's rows over the fk's n_distinct). Before that term, `fkjoin_nonunique.sql`'s
+`x = 3` against a 60,000-row dimension filtered to 600 rows - 300 distinct keys, 3 of them fk values
+- was refused at 1,069 against the hash semi join's 872, running in 1.0 ms against 2.9; it is chosen
+at 462 now, and the same dimension unfiltered (30,000 distinct keys) is refused at 6,516 against
+2,238 (32.5 ms against 17.6). The other FK-side joins take every dimension row to find an entry, as
+an fk into a dimension key is expected to, and are priced as before.
+
+**EXPLAIN**:
+
+    Finalize Aggregate
+      ->  Custom Scan (LionCount)
+            Lion Indexes: bf_dim (dim_id = d.k), bf_doc (doc @@ '...'::tsquery)
+            Join Type: Semi
+            Join Keys: distinct, sorted
+            Fact Filters: collected once
+            ->  Bitmap Heap Scan on bd d
+                  ...
+
+and in a parallel plan `Parallel Custom Scan (LionCount)` below a Gather, over the dimension's whole
+plan. With ANALYZE, `Join Keys Sorted` (the child's rows with a key; in a parallel plan what one
+participant sorted, summed over the runs), `Join Key Sort Method`, `Join Key Sort Space Used` and
+`Join Key Sort Space Type` (the sort as it went in the leader, when it ran one), and `Join Keys
+Looked Up` - the DISTINCT keys. The join member of `custom_private` carries the sort operator and
+collation (shape 13).
+
+**Measured** (2026-09-27, the fact of "Cost, revisited" - 5,000,000 rows over 86,207 heap pages,
+`dim_id` over 200,000 keys in random heap order, 1% NULL - against dimensions whose keys repeat:
+`bd`, 200,000 rows over 50,000 keys (every fourth fact key, four rows each, 0.5% NULL) with `status`
+70% `'val1'`, `country` 20 values and `size` 10 under a lion index, and a btree on the key; `bdh`, the
+same rows over 1,000 keys; and `bdu`, `bd`'s keys once each under no unique index. PostgreSQL 18.6
+assert build, four cores shared with other work, medians of five after a warm-up: the backend's CPU
+time for the serial plans, wall time for the parallel ones. "Ordinary" is the pushdown off, which
+before this change was the plan for every one of these; costs in parentheses, bold the plan the
+model picks, `wN` the workers planned. `f` is `status = 'val1' AND country IN ('c1', 'c2') AND size
+< 7`.)
+
+| shape | dimension rows / distinct keys | node, serial | ordinary, serial | node, parallel | ordinary, parallel |
+|---|---|---|---|---|---|
+| `doc @@ '(sen0 \| sen1) & (jfd0 \| jfd1)'` (5.5%), `bd` under `f`; EXISTS and IN alike | 9,776 / 8,848 | **117** (29,777) | 585 (97,834) | **82** w2 (20,842) | 275 w3 (94,818) |
+| `kind = 'k3' AND sen IN ('sen0', 'sen1')` (1.7%), `bd` under `f` | 9,776 / 8,848 | **95** (29,211) | 309 (95,353) | **66** w2 (20,276) | 316 (95,353) |
+| no fact filter, `bd` under `f` | 9,776 / 8,848 | **44** (16,748) | 845 (156,354) | **35** w2 (12,361) | 305 w3 (112,384) |
+| the tsquery, `bd` under `status = 'val1' AND country IN ('c1', 'c2')` | 14,016 / 12,160 | **139** (34,837) | 595 (97,460) | **92** w2 (24,304) | 255 w3 (94,159) |
+| the tsquery, `bd` under `status = 'val1'` | 139,929 / 46,957 | **442** (91,231) | 701 (100,334) | **190** w3 (47,861) | 310 w3 (96,444) |
+| the tsquery, all of `bd` | 200,000 / 49,110 | **430** (92,233) | 665 (99,878) | **192** w3 (48,844) | 338 w3 (95,602) |
+| the tsquery, `bdh` under `f` | 9,776 / 1,000 | **51** (11,697) | 45 (94,802) | not parallel | |
+| the tsquery, all of `bdh` | 200,000 / 1,000 | **77** (17,515) | 75 (96,119) | not parallel | |
+| the tsquery, `bdu` under `f` | 2,316 / 2,316 | **57** (12,660) | 563 (94,396) | | |
+| `count(DISTINCT f.dim_id)`, the tsquery, `bd` under `f` | 9,776 / 8,848 | **96** (28,654) | 571 (98,660) | **78** w2 (20,724) | 272 w3 (96,458) |
+
+The ordinary plans are a hash semi join over the fact filter's bitmap or index scan, or - with no
+fact filter, or a large dimension set - a hash join over a HashAggregate of the dimension's keys,
+`JOIN_UNIQUE_INNER`; over `bdh`'s thousand keys a nested loop over that HashAggregate with a lion
+index scan of `dim_id` inside. That nested loop is the one plan the node does not beat: 1,000 keys
+are cheap to look up either way, and what the node adds is the fact filter's copy (5.5% of the fact,
+about 35 ms) and, unfiltered, the sort of 199,000 keys. The model picks the node there, priced as
+its other plans are, against a nested loop core prices at 94,802 for 45 ms: 1.13 and 1.03 times
+slower. Over `bd` the node is 1.5 to 19 times faster serially and 1.6 to 8.7 in parallel, and
+with 139,929 dimension rows, which the inner join's node loses to the hash join ("Parallel"), it wins
+here because it looks up the 46,957 distinct keys and not the rows. The workers are the fk index
+pages' (as for the other joins), so `bdh`'s thousand keys get none.
+
 ### Declined in v1, and why
 
-- **A non-unique dimension key** (above: a scope and costing decision, not a correctness one).
+- **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
+  correctness one). The forward semi join over one is counted over its distinct keys ("Forward semi
+  joins over a non-unique key").
 - **A partitioned fact table.** §16 opens one partition at a time, so the join would have to re-run
   the dimension child per partition or look every key up in every partition's index; both are
   straightforward but double the tested surface. A partitioned, inheritance or subquery DIMENSION
@@ -6907,10 +7264,12 @@ gets wrong here (the hash join at 121,557 against the node's 123,222, 706 ms aga
 - **More than two relations**, composite keys, snowflake chains: the dimension would be a join
   itself.
 - **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
-  over `f.x`, which composes, but is not in v1.
+  over `f.x`, which composes, but is not in v1. It is also every GROUP BY of a forward semi join,
+  whose dimension the query above the EXISTS cannot name.
 - **`count(f.col)` of a nullable column, and every non-count aggregate**, as for a single table.
-- **A forward semi join over a non-unique key** ("Semi and anti joins" above): the dimension's
-  distinct keys would have to be the child's rows.
+- **The anti join the other way round**, `NOT EXISTS (SELECT 1 FROM dim d WHERE d.k = f.fk ...)`
+  over the fact's rows: the fact rows WITHOUT a qualifying key, a complement of the forward semi
+  join's union that no count per key gives.
 - **A count of rows beside a `count(DISTINCT)`**, a DISTINCT over an expression or over a fact
   column other than the key, an fk of another type than the key, a DISTINCT under another
   collation than the join's ("count(DISTINCT)" above).
@@ -6924,7 +7283,9 @@ before VACUUM) - GROUP BY one and two dimension columns and an expression, the u
 a dimension filter, fact filters (`=`, IN, `IS NULL` on another column, OR), NULL fks, NULL
 dimension keys and a NULL group, HAVING, ORDER BY and LIMIT on top, cross-type keys (`int4` fk
 against `int8` pk and `int8` against `int4`), text keys, `count(1)` and `count` of either join
-column, generic plans with Param fact and dimension filters (a NULL one included), and a correlated
+column, generic plans with Param fact and dimension filters (a NULL one included) and, since
+2026-09-27, IN lists of unknown length (`= ANY ($1)` with two values, none, NULL and 1,500 of them,
+`ANY (ARRAY[$1, $2 + 1])`, and a stable expression's array), and a correlated
 subquery whose dimension filter is an exec Param, so that the node and its child are rescanned per
 outer row; the declines - a non-unique dimension key, a key unique only under another collation
 than the join's (and accepted once a unique index under the join's own exists), a second join
@@ -6939,32 +7300,32 @@ entries VACUUM deleted); EXPLAIN through `lion_explain_norm()`. No new concurren
 introduced - the fact side is §9 per dimension row and the dimension side is a core scan under the
 same snapshot - so no isolation spec is added.
 
-`test/sql/fkjoin_semi.sql` (2026-09-27), the same way against the pushdown off: the forward
-EXISTS, IN and JOIN spellings over a unique key with fact filters of every kind (`=`, IN, a
-tsquery, an OR, `IS NULL`, `IS NOT NULL`), none, and ones that select nothing, a dimension filter
-that passes nothing, cross-type keys and a grouped join; a non-unique key, whose forward semi join is
-not pushed down until the dimension has lion indexes, and then only as the reverse shape with the
-roles exchanged, which the model refuses; the reverse EXISTS and IN forms, grouped, with HAVING,
-ORDER BY and LIMIT, `count(1)` and `count` of the key, duplicated and NULL dimension keys, keys with
-no fact rows (`lion_sj_val()` pins the answers themselves) and fact rows whose key has no dimension
-row; the anti joins, NULL keys among them, `count` of the key declined there, and the LEFT JOIN and
-`NOT IN` forms left alone; the declines (a second correlation, an outer-side qual inside NOT
-EXISTS, a fact filter the posting sets cannot answer, another aggregate, `count` of a nullable
-dimension column, three relations, a subquery that cannot be pulled up); generic plans with Param
-filters on both sides, NULL ones included; correlated subqueries that rescan the node with a new
-dimension filter and with a new FACT filter, whose copy is made again; EXPLAIN of the collected and
-the probed plans and of a dimension filtered through its own lion index; the `Fact Filter Rows
-Collected`, `Join Keys` and `Containers Visited` counters (an existence test reads fewer containers
-than the counts); a copy that outgrows the memory limit at run time (`work_mem` and
-`hash_mem_multiplier` both set) and falls back with the same answer;
-the model's choice, including a 60,000-row dimension it refuses forward and reverse unless its own
-filter leaves few rows; and a dirty heap before and after VACUUM. Its two EXPLAINs of a dimension
-filtered by its own index and of two dimension rows use plans of the child that PostgreSQL 16 to
-19 all make (two equalities in the Index Cond; a sequential scan with index scans off): 16 keeps a
-second column's IN list out of the bitmap's Index Cond and costs `pk IN (5, 6)` as a sequential
-scan where 18 takes the primary key. In `test/sql/fkjoin.sql` a
-60-value IN list, one union for the scan instead of one per count, is now collected and chosen. `test/isolation/fkjoin_vacuum_race.spec`
-is the race of the copy against VACUUM, above.
+`test/sql/fkjoin_semi.sql` (2026-09-27), the same way against the pushdown off: the forward EXISTS,
+IN and JOIN spellings over a unique key with fact filters of every kind (`=`, IN, a tsquery, an OR,
+`IS NULL`, `IS NOT NULL`), none, and ones that select nothing, a dimension filter that passes
+nothing, cross-type keys and a grouped join; a non-unique key, whose forward semi join is counted
+over its distinct keys, and - once the dimension has lion indexes - also offered as the reverse
+shape with the roles exchanged, which the model does not take; the reverse EXISTS and IN forms,
+grouped, with HAVING, ORDER BY and LIMIT, `count(1)` and `count` of the key, duplicated and NULL
+dimension keys, keys with no fact rows (`lion_sj_val()` pins the answers themselves) and fact rows
+whose key has no dimension row; the anti joins, NULL keys among them, `count` of the key declined
+there, and the LEFT JOIN and `NOT IN` forms left alone; the declines (a second correlation, an
+outer-side qual inside NOT EXISTS, a fact filter the posting sets cannot answer, another aggregate,
+`count` of a nullable dimension column, three relations, a subquery that cannot be pulled up);
+generic plans with Param filters on both sides, NULL ones included; correlated subqueries that
+rescan the node with a new dimension filter and with a new FACT filter, whose copy is made again;
+EXPLAIN of the collected and the probed plans and of a dimension filtered through its own lion
+index; the `Fact Filter Rows Collected`, `Join Keys` and `Containers Visited` counters (an existence
+test reads fewer containers than the counts); a copy that outgrows the memory limit at run time
+(`work_mem` and `hash_mem_multiplier` both set) and falls back with the same answer; the model's
+choice, including a 60,000-row dimension it refuses forward and reverse unless its own filter leaves
+few rows; and a dirty heap before and after VACUUM. Its two EXPLAINs of a dimension filtered by its
+own index and of two dimension rows use plans of the child that PostgreSQL 16 to 19 all make (two
+equalities in the Index Cond; a sequential scan with index scans off): 16 keeps a second column's IN
+list out of the bitmap's Index Cond and costs `pk IN (5, 6)` as a sequential scan where 18 takes the
+primary key. In `test/sql/fkjoin.sql` a 60-value IN list, one union for the scan instead of one per
+count, is now collected and chosen. `test/isolation/fkjoin_vacuum_race.spec` is the race of the copy
+against VACUUM, above.
 
 `test/sql/fkjoin_distinct.sql` (2026-09-27), against the pushdown off: `count(DISTINCT f.fk)` over
 the inner join and its EXISTS and IN spellings, with fact filters of every kind, none, and one that
@@ -6998,7 +7359,35 @@ inner side of a nested loop; a generic plan's Params evaluated in every particip
 included; each participant's copy abandoned at run time over a 64 kB memory limit with the answer
 unchanged; and a dirty heap before and after VACUUM. Its plans are ones every supported release
 makes alike (a parallel sequential scan of the dimension, the worker count from its
-`parallel_workers`); the expected output was checked on PostgreSQL 16 and 18.
+`parallel_workers`); the expected output was checked on PostgreSQL 16 and 18. Section 9 of
+`test/sql/countmultikey.sql` (2026-09-27) does the same for the values every participant evaluates
+for itself: multi-key fact filters known only at run time (§17), exact, widened and every row, and
+IN lists of unknown length - a parameter, a NULL one, 1,500 values, `IN ($1, $2)` and a stable
+expression's array - and checks serially that the 1,500-value list, too wide for the open budget at
+a `work_mem` of 64 kB, is collected once.
+
+`test/sql/fkjoin_nonunique.sql` (2026-09-27), the forward semi join over a non-unique key, against
+the pushdown off: EXISTS and IN over a 900-row dimension of 400 keys, most of them two or three
+times, with fact filters of every kind (`=`, IN, a tsquery, an OR, `IS NULL`, `IS NOT NULL`) and
+none, dimension filters and none, a fact filter with no entry, a dimension filtered to nothing and
+one that leaves only NULL keys (`lion_nj_val()` pins 0); heavy duplication (3,000 rows over six
+keys, one without fact rows) and every row the same key (the answer pinned against that key's own
+count); cross-type keys both ways and a text key; `count(1)`, `count` of the fact's key, and
+`count(DISTINCT)` of it, over nothing too; HAVING, ORDER BY and LIMIT; the counters (`Join Keys
+Sorted` without the NULL keys, `Join Keys Looked Up` the distinct keys, `Join Keys Without Entry`);
+the declines (a fact column in the GROUP BY, another aggregate, a count of rows beside a
+`count(DISTINCT)`, a second correlation, the anti join the other way round, a fact filter the
+posting sets cannot answer); generic plans with Params on both sides, NULL ones included;
+correlated subqueries that rescan the node, its child and its sort with a new dimension filter and
+with a new fact filter; the model's choice, including a 60,000-row dimension it refuses unless its
+filter leaves few keys that are fk values; and a dirty heap before and after VACUUM. Its parallel
+section runs every query as planned, serially and with the pushdown off (`lion_nj_par()`, as
+`lion_pj()` does): EXPLAIN of the Gather over the parallel node, the leader taking part and not,
+`Join Keys Looked Up` summed over the participants equal to the distinct keys and `Join Keys
+Sorted` to one participant's, both over four rescans of the Gather as well, a generic plan, a
+volatile dimension filter that keeps the node serial, `parallel_workers = 0` and
+`debug_parallel_query`. EXPLAIN prints the node and what is above it, and the dimension's own plan
+as one line (`lion_nj_explain()`), because that plan is whatever each major makes of a small scan.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
@@ -7201,6 +7590,8 @@ mid-cardinality column that term is small and the index is a fraction of a btree
 bitmap scan wins; on a near-unique column every row is an entry, the index is larger than the btree
 (an entry header per row) and the entry term adds to the per-row charge, so btree - which also has a
 correlation to exploit, and a lion scan never has one - wins. `test/sql/range.sql` pins both choices.
+A bound past the histogram's end is estimated with the column's actual end, read from the directory
+(The endpoint probe, below).
 
 On a MULTICOLUMN path `genericcostestimate()` prorates by every column's selectivity together,
 while the range column is walked whole whatever the others select; the postings of the range that
@@ -7469,9 +7860,90 @@ a few hundred nanoseconds each.
 and a stale histogram or an `n_distinct` that ANALYZE's sample got wrong makes a range of millions of
 keys look like a range of thousands. That is what happened on a very large table: tens of millions of keys
 priced as a few hundred thousand. Execution is robust to it now: the race picks the smaller side whatever the
-plan thought. The plan choice is not, and a directory probe at plan time would make it so: InnoDB's
-`records_in_range` descends to both bounds and estimates the leaves between from the internal levels.
-It is the obvious next step, and it is not done here.
+plan thought. The plan choice is not. A bound past the histogram's end is now read from the
+directory, as core reads it from a btree (The endpoint probe, below); a histogram that is stale
+inside, or an `n_distinct` that is wrong, is not. InnoDB's `records_in_range`, which descends to
+both bounds and estimates the leaves between from the internal levels, would correct both, and is
+still not done.
+
+### The endpoint probe (2026-09-27)
+
+ANALYZE's histogram ends at the largest value its sample saw, and a column that grows at one end - a
+timestamp, a serial id - puts every row added since past that end. Core estimates an inequality past
+it at a hundredth of one bin (`ineq_histogram_selectivity()` clamps to that when it has no actual
+end), so `ts >= now() - interval '30 days'` on a table grown by a tenth since its last ANALYZE came
+out at 330 rows for 148,760. Core corrects this with `get_actual_variable_range()`: whenever the
+histogram's binary search is about to compare the constant with the first or last entry, it reads the
+column's actual minimum or maximum from an index and puts it in place of that entry, and the bound
+then falls inside the last bin and is interpolated there. It reads only ordered indexes that can
+return their first column - a btree - so a column indexed by lion alone never got the correction, in
+lion's own estimates or anyone's.
+
+Lion's cost model now makes the same correction itself, from lion's directory (`lion_selfuncs.c`):
+
+- **Where.** Exactly where core would read an end: lion runs core's binary search over the
+  histogram with the clause's own operator and constant (`lion_probe_ends_wanted()`), under core's
+  own conditions for using the histogram (its collation, `comparison_ops_are_compatible()`). The
+  constant is what `get_restriction_variable()` makes of the other side, so `now() - interval` is
+  one. A Param is not, and is not probed.
+- **What is read.** The column's first or last VALUE entry whose posting set has a live row. The
+  directory is in the key's order within each key column (§21), so a descent to (attno, VALUE) with
+  no key lands on the first VALUE entry (`lion_dir_value_start()`), and one to (attno, the first kind
+  after VALUE) just past the last (`lion_dir_value_end()`), whichever key column of the index it is.
+  The walk goes on from there, a leaf at a time, to the right or through the left links
+  (`lion_dir_step_left()`, nbtree's `_bt_walk_left()` without page deletion), copying each leaf's
+  entries under its share lock and testing them with none held. A row is live when the visibility
+  map vouches for its page or `SnapshotNonVacuumable` accepts it, core's test: a key whose rows are
+  all deleted is not an end, and one whose rows are recently dead or uncommitted is. Only an ordered
+  scalar column is probed, and only when its order is the histogram's (the key type's default btree
+  comparison, the index's collation the statistics').
+- **Bounded, as core's is.** `LION_PROBE_HEAP_PAGES` (100, core's `VISITED_PAGES_LIMIT`) heap pages
+  without a live row, or `LION_PROBE_LEAVES` (100) directory leaves, and the probe gives up and the
+  histogram's own end stands. The leaves bound matters where core's does not: a directory leaf is
+  never unlinked (§18), so deleting a column's newest keys and vacuuming leaves their leaves empty
+  and linked, where a btree would have deleted its pages. An index that grew by inserts holds about
+  34 one-row keys of a column to a leaf, so the 10,000 newest keys deleted are past the bound and
+  1,000 are not (`test/sql/rangeprobe.sql` §3 shows both).
+- **Once per planner run.** The ends are cached for the PlannerGlobal of the query, in its memory,
+  and forgotten when that memory is reset. Neither a hypothetical nor a partial index is read, nor the
+  parent of an inheritance tree. A column core reads itself - it has a btree on it - is left to core.
+- **Lion's estimates only.** The probed ends go into a copy of the column's `pg_statistic` row, which
+  `get_relation_stats_hook` hands to core's own `clauselist_selectivity()` while lion prices one of
+  its accesses (`lion_probe_begin()` .. `lion_probe_end()`): `lioncostestimate()` for every lion
+  index path - the selectivity `genericcostestimate()` prorates the index by, the entries
+  `lion_range_entry_cost()` prices, the heap side priced from them, and so LionOrdered's lion side -
+  and the count pushdown's paths (`lion_try_count_path()`: the range's share of its entries, and the
+  rows `lion_cost_count_rel()` and `lion_cost_range_sum()` recheck, `lion_probe_rel_rows()`). The
+  relation's row count and every other path's estimates stay core's. Core caches a clause's
+  selectivity in its RestrictInfo the first time it is asked (`clause_selectivity_ext()`), so the
+  scope clears that cache on each clause it corrects and puts it back when it ends.
+
+The correction is core's, and so is its reach: the bound lands in the last bin, which holds a
+hundredth of the rows ANALYZE saw at the default statistics target, so an estimate past the end rises
+to at most that share however many rows were added. On a very large table it would lift a wide
+range's estimate many times over and still leave it several times
+short - and whether that alone moves the plan depends on the range's price per key.
+
+Measured on the assert build (PostgreSQL 18.6), best of three warm runs; "before" is the build without
+the probe:
+
+| table, query | actual rows | lion's estimate before / now | lion's price before / now | chosen, ms |
+|---|---|---|---|---|
+| 3.3M rows, the newest 300k past the histogram and in heap order: `sum(id) WHERE ts >= now() - interval '30 days'` | 148,760 | 330 / 14,769 | plain 605 / 24,249, bitmap 1,261 / 32,181 | plain scan 83-87 (bitmap 38-48, seq 663) |
+| the same, `count(*)` | 148,760 | 330 / 14,780 | LionCount 75 / 3,344 | LionCount 63 |
+| the 300k newest rows in the space a DELETE and VACUUM of a tenth freed, on 42,773 of 42,858 pages: `sum(id)`, 30 days | 148,760 | 300 / 13,363 | plain 552 / 22,027, bitmap 1,148 / 29,246 | plain scan 100 (bitmap 84) |
+| `rangeprobe.sql`'s table, 1,500 rows analyzed and 28,500 added: `count(*) WHERE ts >= '2026-01-02 02:00'` | 28,441 | 60 / 5,926 | LionCount 69 / 1,274 | LionCount 12.6-16 before, seq scan 4.1 now |
+
+The first three plans are the same before and after: a 30-day range of a large table is a small share
+of it, which lion reads quickly whatever it was priced at, far ahead of the sequential scan. Two of
+them are the fastest plan. The first is not - the plain scan streams its 148,760 one-row entries a
+stream each (§29.11) and takes twice the bitmap scan's time - and is still chosen because the
+estimate it is priced by, 14,769 entries, is a tenth of them: the probe's reach, above. The last row
+is a range over most of a table whose statistics saw a twentieth of it, with a histogram of five bins
+so that its last one holds a fifth of the rows: there the count pushdown walked 28,441 entries it had
+priced as 60, and a sequential scan does the count in a third of the time. The probe costs 7
+shared-buffer reads and about 0.05 ms of planning per planner run (0.12 ms against 0.07 for the
+30-day count), and none when no bound is past an end.
 
 ### Dropping the range for a heap recheck (considered, not done)
 
@@ -7592,7 +8064,17 @@ Summed`. The cases:
 - a partitioned table whose partitions each take a different way.
 
 It also checks that a sum over 20,000 one-row entries reads each leaf once, and that a full-domain
-range reads a few descents' worth of pages. `test/isolation/count_range_split_race.spec` parks a
+range reads a few descents' worth of pages.
+
+`test/sql/rangeprobe.sql` (2026-09-27) covers the endpoint probe on a table analyzed at 1,500 rows,
+sampled whole, and grown to 30,000 past both ends of two of its columns, the first and the third of
+the index. Written before the code, it fails on the build before it: lion's estimate of a range past
+either end is core's, the count and the sum over it go to the count pushdown and to the plain scan,
+where a sequential scan is three times faster. It checks lion's estimate against core's; the plans,
+and the answers against a sequential scan's; a bound inside the histogram, which is not probed; the
+newest 1,000 rows deleted, before VACUUM and after, where lion's estimate is the number core makes
+with a btree on the column; 9,000 more, past `LION_PROBE_LEAVES`, where the probe gives up and the
+histogram's end stands; a partial index, and a Param. `test/isolation/count_range_split_race.spec` parks a
 range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
 both counts against the heap.
@@ -8117,7 +8599,7 @@ column of many values. This applies to every plain lion scan, and is the number 
 those that are not in heap order.
 
 **A scan in heap order is priced as the bitmap heap scan of the same rows, and a little more.**
-The SETS, UNION and WINDOW shapes (§29.3, `lion_source_sorted()`; `lion_plain_scan_is_sorted()`
+The SETS, UNION and WINDOW shapes (§29.3, `lion_source_sorted()`; `lion_plain_scan_shape()`
 mirrors the choice at plan time) hand out their TIDs in heap order whatever the column's
 correlation: they read every page that holds a match once, in block order - exactly the bitmap
 heap scan's pages, in its order. cost_index() interpolates its I/O by the correlation squared
@@ -8131,7 +8613,7 @@ Per row cost_index() charges cpu_tuple_cost and the quals left to the heap; the 
 charged what cost_bitmap_heap_scan() charges a row besides - the bitmap entry (a tenth of a
 cpu_operator_cost, `LION_BITMAP_ROW_COST`, core's own number), and every index qual only when the
 scan RECHECKS them (§29.6: it dropped a qual, it reads a multi-key column, or it is a UNION;
-`lion_plain_scan_is_sorted()` answers that too) - and `LION_PLAIN_FETCH_ROW_COST`, one
+`lion_plain_scan_shape()` answers that too) - and `LION_PLAIN_FETCH_ROW_COST`, one
 cpu_tuple_cost, for every row past the first on its page: the bitmap heap scan locks a page and
 walks its matches once, the plain scan makes an amgettuple call and takes a buffer lock and a HOT
 search per row. Measured on the release build (backend CPU time, heap in shared buffers, the scans
@@ -8172,17 +8654,87 @@ sets ANDed to 48,000 rows, raised the lion plain scan from 80,300 to 83,900, and
 takes the btree's bitmap heap scan (79,800; 52 ms of CPU) over it (82 ms). Plain and bitmap paths
 share the estimate, and both make the same AND (§29.2).
 
-What this cannot do: cost_index() charges no more than its uncorrelated end, Mackert and Lohman's
-pages at random_page_cost. At a random_page_cost near seq_page_cost (1.1, as on the benchmark's
-server) the heap side of a result on nearly every page is clamped there, within 10% of the bitmap
-heap scan's, and a plain scan of an exact result of many rows to a page can still tie with the
-bitmap scan - `test/sql/plaincost.sql` leaves that case out of its pins at 1.1. There is no
-parallel plain lion scan (`amcanparallel` is false, §29.1): the planner compares the serial plain
-scan with a parallel bitmap heap scan, and it credits the parallel one with its CPU divided among
-the workers and nothing for its I/O, as it does for every AM. Index-only scans keep the column's
-correlation: lion's are of queries that need no column, and the one kind in heap order, a multi-key
-UNION, fetches every TID it hands out whatever the visibility map says, which cost_index()'s
-all-visible fraction would not describe.
+**A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
+in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
+heap order does: btree's price, Mackert and Lohman's pages each a random read, whatever its entries
+held. What it does is a pass over the heap per entry, each reading the entry's pages in block order: a
+bitmap heap scan of one entry's rows, done once per entry. So it is priced as compute_bitmap_pages()
+prices a bitmap heap scan repeated that often, `lion_plain_walk_entries()` passes of `rows / passes`
+rows each: Mackert and Lohman's pages for all the rows together (a page a later pass reads again is
+in the cache while the cache holds the heap), each at the price of ONE pass's pages - random_page_cost
+for a pass of a few pages, falling to seq_page_cost for one over most of the heap - interpolated
+towards the packed end by the column's correlation as before; the fetches past the first on a page
+counted per pass; and `LION_WALK_PASS_COST`, 5 cpu_tuple_cost, for each entry past the first, which
+the plain scan streams through a stream of its own where the bitmap scan adds it to its bitmap
+(0.30 to 0.35 us an entry more than the bitmap scan over 4,000 to 390,000 one-row entries). One entry
+is a scan in heap order, priced as `k = v` is; one-row entries are btree's uncorrelated end and a
+stream each. The price a WALK gets against the bitmap scan's, and the time it takes against the
+bitmap scan's, before and after (assert build, median of five; 1M rows of the benchmark shape in
+shared buffers, 8M from the OS cache):
+
+| query | entries | plain / bitmap price, before | now | plain / bitmap time |
+|---|---|---|---|---|
+| 1M `pc BETWEEN 1 AND 1` | 1 | 1.12 | 1.00 (plain chosen) | 0.61-0.70 |
+| 1M `pc BETWEEN 1 AND 2` | 2 | 1.17 | 1.05 | 0.58-0.79 |
+| 1M `pc BETWEEN 1 AND 20` | 20 | 1.74 | 1.56 | 0.81-0.98 |
+| 1M `pc BETWEEN 1 AND 100` | 100 | 3.77 | 3.38 | 1.21-2.07 |
+| 1M `status >= 'val2'`, 40% of the rows on every page | 2 | 2.93 | 1.05 | 1.19-1.46 |
+| 1M `flag >= true`, 80% on every page | 1 | 2.40 | 1.08 (a sequential scan chosen) | 1.14-1.41 |
+| 8M `pc BETWEEN 1 AND 20` | 20 | 1.79 | 1.60 | 0.56-0.74 warm, 2.83 cold |
+| 8M `pc BETWEEN 1 AND 400` | 400 | 3.24 | 2.95 | 5.2-7.2 |
+
+**A benchmark's `pc BETWEEN 1 AND 20`** (the plain scan 349 ms against the bitmap scan's
+600, and the bitmap scan chosen) is the 8M row: 20 passes read 79,000 page visits where the bitmap
+scan reads its 65,734 pages once. The plain scan's lead is not the WALK's: with the heap in the OS
+cache and PostgreSQL 18's default io_method=worker, the bitmap heap scan hands each read to an I/O
+worker through its read stream, which for a page already in the OS cache costs more than the plain
+scan's synchronous read (the plain scan 371-451 ms against 536-700). With io_method=sync the two
+tie (392 against 388), and cold the bitmap scan's read-ahead makes it 2.8 times faster (4,454 against
+1,573). The bitmap scan is still the choice, now at 1.6 times the plain scan's price for what it does
+rather than 1.8 for a btree's.
+
+What the model still cannot see: a range over a column stored in heap order, `ts` BETWEEN two days of
+a timestamp, is priced at the packed end - rightly, it reads a few hundred pages in order - while
+cost_bitmap_heap_scan() prices the bitmap scan's pages by Cardenas's formula with no correlation at
+all, as scattered over the heap; the plain scan is chosen at about the bitmap scan's price and takes
+2.3 times as long (30,000 one-row entries: 17 ms against 7.2), the difference being its stream per
+entry. The bitmap scan's price is core's.
+
+**What cost_index() cannot charge is charged to the path** (2026-09-27). cost_index() charges no
+more than its uncorrelated end, Mackert and Lohman's pages at random_page_cost. At a random_page_cost
+near seq_page_cost (1.1, as on the benchmark's server) a result of many rows on nearly every page
+costs the plain scan more than that end - by its fetches past the first on a page, which the bitmap
+scan does not pay - and the correlation cannot carry it: the two scans came out within 1% of each
+other, add_path() took that for a tie, the plain scan won it on its lower startup cost, and the bitmap
+path was discarded. Nothing amcostestimate returns tells the two apart: cost_index() stores the same
+index cost for the bitmap path the moment amcostestimate returns, and reads nothing else lion gives
+it. So `lion_plain_heap_correlation()` notes what is left over for an unparameterized plain path
+(`lion_plain_note_remainder()`), and lion's set_rel_pathlist_hook adds it to the path once the
+relation's paths are built and offers the bitmap heap scan of the same index path again beside it
+(`lion_plain_set_rel_pathlist()`, in `lion_selfuncs.c`, before LionOrdered's hook sees the paths);
+set_rel_pathlist() allows a hook to modify the core paths, and the two are then compared as any
+others. The plain path keeps its startup cost, which is what a LIMIT asks of it. At 1.1, 43% of the
+rows, 18 to a page, on every page (`plaincost.sql`'s shape, `status = 0 AND supp = 0
+AND flag`):
+
+| table | plain / bitmap price before | now | plain | bitmap |
+|---|---|---|---|---|
+| 8M rows, heap from the OS cache | 304,596 / 303,920 (plain chosen) | 329,081 / 303,920 | 1,540-1,712 ms (1,558 under load) | 1,240-1,430 ms (1,680-1,750 under load) |
+| the same, cold | | | 3.0-6.7 s | 1.36 s |
+| 1M rows, heap in shared buffers | 37,985 / 37,898 (plain chosen) | 41,038 / 37,898 | 135-163 ms | 114-131 ms |
+| `plaincost.sql`'s 200k rows | 7,294 / 7,273 (plain chosen) | 7,896 / 7,273 | 26 ms | 22 ms |
+
+A result of 2.5 rows to a page on 93% of the pages (`status = 0 AND supp = 1`) fits
+under the end and is unchanged; it is the plain scan's in shared buffers (34 ms against 39-49) and
+the bitmap scan's from the OS cache (815-1,087 against 975-1,105), which is a tie. With parallel plans
+the large ones go to the parallel sequential or bitmap scan, before and after.
+
+There is no parallel plain lion scan (`amcanparallel` is false, §29.1): the planner compares the
+serial plain scan with a parallel bitmap heap scan, and it credits the parallel one with its CPU
+divided among the workers and nothing for its I/O, as it does for every AM. Index-only scans keep the
+column's correlation: lion's are of queries that need no column, and the one kind in heap order, a
+multi-key UNION, fetches every TID it hands out whatever the visibility map says, which
+cost_index()'s all-visible fraction would not describe.
 
 On the benchmark shape (8M rows, 190k heap pages, a five-column index; assert build, warm OS cache
 and 256 MB of shared buffers, the paths interleaved in one backend, median of three; count pushdown
@@ -8213,6 +8765,12 @@ country)` reads `L13`'s rows in key order, the heap at random: 17 s against its 
 2.5, priced 795k against 316k (2.5 times for 6.8). The column-correlation model is btree's; applied
 to a lion plain scan, whose heap is read in order, it erred the other way - 3 times the bitmap
 scan's price at the default random_page_cost for 1.5 times its time.
+
+Measured again with the endpoint probe (§28), the WALK priced as passes and the remainder charged to
+the path (above) (2026-09-27, the same table and build, a loaded machine): every choice of the "chosen
+after" column holds at both random_page_costs. The plain and the bitmap scan took 1,631 and 1,215 ms
+for `L13`, 2,398 and 1,943 for `L13r`, 839 and 837 for `M4`, 546 and 927 for `M2`, and 53 and 60 for
+`M05`; the chosen plans 1,064, 2,294, 835, 592 and 50.
 
 **The count's recheck is priced the same way** (2026-09-24 review). With a correlation, a plain
 scan of a clustered value is cheap: 5000 rows of one value on 32 heap pages. The count pushdown
@@ -8303,7 +8861,9 @@ parked at the same point holding none while the same VACUUM completes.
 the benchmark's shape, sampled whole so the statistics are exact: counts of 13% (a multi-key
 column, rechecked) and 43% of the rows, on every page, go to the bitmap scan, and 0.5%, 0.1% and
 0.01%, about a row to a page, to the plain scan, at the default random_page_cost and at 1.1 (the
-43% one only at the default, above); a column stored in value order keeps its correlation; and a
+43% one at 1.1 since the remainder is charged, above); a range alone is a heap pass per key - one
+key goes to the plain scan as `pc = 5` does, twenty keys and one key over every page to the bitmap
+scan, with the sequential scan's answers; a column stored in value order keeps its correlation; and a
 range beside dense sets - `pc < 20`, the always-true `pc >= 0` - is a WINDOW whose plain scan
 reads within twice the bitmap scan's buffers, with the sequential scan's answers. Tests whose plans
 changed: those meant to show the bitmap path (`basic.sql`'s first plans, `directory.sql`'s
@@ -8853,6 +9413,12 @@ pages, entries, TIDs), in microseconds, converted at §10's 500 units a millisec
 | `LION_PLAIN_FETCH_ROW_COST` | 0.5 `cpu_tuple_cost` | 1.0 | 3 plain against bitmap shapes (§29.11) | 11.5, 21 and 20 ns a row |
 | a range entry's containers (§28) | 2 `cpu_operator_cost` | §10's merge units | 35 range shapes | **provisional**: 47 to 2,294 units a millisecond (median 500), were 14 to 8,049 |
 | unchanged, and confirmed | `LION_DISTINCT_TEST_COST` 50 and `LION_RANGE_UNION_ENTRY_COST` 12 `cpu_tuple_cost`, `LION_FKJOIN_COPY_*`, `LION_BITMAP_ROW_COST` | | | 1.0 us; 290 to 300 ns; 374 to 595 units a millisecond; core's own number |
+
+Not refitted: the terms that arrived with work merged beside this pass - `LION_WALK_PASS_COST`
+(§29.11's WALK, 5 `cpu_tuple_cost` an entry) and `LION_FKJOIN_SORT_COMPARE_COST` /
+`LION_FKJOIN_SORT_KEY_COST` (§27's non-unique dimension keys, scaled at 250 units a millisecond) -
+carry their assert-build measurements, and the endpoint probe's plain-scan remainder
+(`lion_plain_note_remainder()`) adds the same per-row terms as the correlation it completes.
 
 The model's shape changed with them, each in its section: the early exit of an AND is priced (§10,
 §25); a GROUP BY is charged per entry of its column, with the entry's set a source (§10, §26); how
