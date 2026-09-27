@@ -1196,6 +1196,7 @@ extern bool liongettuple(IndexScanDesc scan, ScanDirection dir);	/* DESIGN.md §
 extern PGDLLIMPORT int lion_scan_window_floor;
 extern int	lion_union_window(void);
 extern int	lion_walk_window(void);
+extern int	lion_scan_list_batch(void);
 extern bytea *lionoptions(Datum reloptions, bool validate);
 extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,

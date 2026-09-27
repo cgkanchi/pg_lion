@@ -16,7 +16,7 @@ teardown
 }
 
 session s1
-setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; }
+setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
 step s1_begin   { BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_func    { SELECT lion_index_count('ser_k', 99); }
 step s1_plan    { EXPLAIN (COSTS OFF) SELECT count(*) FROM ser WHERE k = 99; }
@@ -25,7 +25,7 @@ step s1_insert  { INSERT INTO ser VALUES (99); }
 step s1_commit  { COMMIT; }
 
 session s2
-setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; }
+setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
 step s2_begin   { BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_func    { SELECT lion_index_count('ser_k', 99); }
 step s2_push    { SELECT count(*) FROM ser WHERE k = 99; }
