@@ -950,4 +950,36 @@ extern PGDLLIMPORT bool lion_enable_ordered_scan;
 /* GUC, scan methods and set_rel_pathlist_hook; called from _PG_init. */
 extern void lion_ordered_init(void);
 
+/* ---------------------------------------------------------------------
+ * lion_selfuncs.c (DESIGN.md §28, "The endpoint probe")
+ * --------------------------------------------------------------------- */
+
+/* get_relation_stats_hook; called from _PG_init. */
+extern void lion_selfuncs_init(void);
+
+/*
+ * While lion prices one of its own accesses to rel, a range among `clauses`
+ * that bounds a column past its histogram's ends is estimated with the ends
+ * a lion index on the column holds.  lion_probe_begin() says whether a scope
+ * began; lion_probe_end() must then close it, on error too.  Inside it,
+ * lion_probe_rel_rows() is rel's rows as that estimate sees them (rel->rows
+ * outside).  lion_amcostestimate() is lioncostestimate() in such a scope.
+ */
+extern bool lion_probe_begin(PlannerInfo *root, RelOptInfo *rel,
+							 List *clauses);
+extern void lion_probe_end(void);
+extern double lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel);
+extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
+								double loop_count, Cost *indexStartupCost,
+								Cost *indexTotalCost,
+								Selectivity *indexSelectivity,
+								double *indexCorrelation, double *indexPages);
+
+/*
+ * The part of a plain scan's price above cost_index()'s uncorrelated end,
+ * which lion charges the path once rel's paths are built (DESIGN.md §29.11).
+ */
+extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
+									  Cost remainder);
+
 #endif							/* LION_COUNT_H */

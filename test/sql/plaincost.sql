@@ -14,7 +14,8 @@
 -- with an always-true range beside the other columns, the benchmark handoff's
 -- query, to one that walked the range entry by entry and restarted the other
 -- columns' sets for each entry (2026-09-27, item 6: it did not finish in 60 s
--- on 80.6M rows).
+-- on 80.6M rows).  A range alone - one column's keys walked in key order - is
+-- a heap pass per key, priced as such.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -106,12 +107,14 @@ INSERT INTO lpc_q VALUES
 	(5, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1$$),
 	(6, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1 AND supp = 1$$);
 SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
--- 43% of the rows is left out at 1.1: with a random read priced near a
--- sequential one, cost_index() cannot charge a result on every page more than
--- its I/O at random_page_cost, and the two scans come out alike
--- (DESIGN.md §29.11)
+-- 43% of the rows at 1.1: with a random read priced near a sequential one,
+-- cost_index() charges a result on every page no more than its I/O at
+-- random_page_cost, less than the plain scan's fetches of 19 rows to a page
+-- cost beyond the bitmap scan's; lion charges the rest to the path once it is
+-- built, and the bitmap scan it had displaced is chosen (DESIGN.md §29.11:
+-- 22 ms against the plain scan's 26 on this table).
 SET random_page_cost = 1.1;
-SELECT n, lpc_plan(q) FROM lpc_q WHERE n <> 3 ORDER BY n;
+SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
 RESET random_page_cost;
 
 -- ---------- 2. a column stored in value order keeps its correlation ----------
@@ -142,6 +145,34 @@ SET enable_seqscan = on;
 SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20;
 SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}';
 SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5;
+RESET enable_indexscan;
+RESET enable_seqscan;
+
+-- ---------- 4. a range alone: a walk in key order, a heap pass per key ----------
+-- The plain scan hands out one key's rows in heap order, then the next key's
+-- (DESIGN.md §29.3, WALK): a pass over the heap per key.  One key is exactly
+-- `pc = 5`, a scan in heap order, and goes to the plain scan as that does
+-- (0.54 ms against the bitmap scan's 0.73).  Twenty keys read their pages in
+-- twenty passes where the bitmap scan reads them once, and one key with nine
+-- rows on every page is fetched a row at a time where the bitmap scan takes a
+-- page at a time: both go to the bitmap scan (10 ms against 14, and 12
+-- against 18).  The one key used to be priced as a btree scan's random reads,
+-- and went to the bitmap scan too.
+SELECT lpc_plan('SELECT sum(id) FROM lpc WHERE pc BETWEEN 5 AND 5');
+SELECT lpc_plan('SELECT sum(id) FROM lpc WHERE pc BETWEEN 1 AND 20');
+SELECT lpc_plan('SELECT sum(id) FROM lpc WHERE status >= 2');
+-- and the answers are the sequential scan's
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*), sum(id) FROM lpc WHERE pc BETWEEN 5 AND 5;
+SELECT count(*), sum(id) FROM lpc WHERE pc BETWEEN 1 AND 20;
+SELECT count(*), sum(id) FROM lpc WHERE status >= 2;
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT count(*), sum(id) FROM lpc WHERE pc BETWEEN 5 AND 5;
+SELECT count(*), sum(id) FROM lpc WHERE pc BETWEEN 1 AND 20;
+SELECT count(*), sum(id) FROM lpc WHERE status >= 2;
 RESET enable_indexscan;
 RESET enable_seqscan;
 
