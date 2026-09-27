@@ -400,21 +400,21 @@ SELECT lion_src_prep('SELECT count(*) FROM lion_src_t WHERE u >= $1 AND r < $2',
 -- beside a multi-key clause whose value is known only at run time, and one
 -- that the posting sets answer only as a superset (a NULL element)
 SELECT lion_src_prep('SELECT g, count(*) FROM lion_src_t WHERE tags @> $1 AND u < $2 GROUP BY g', '''{2}'', 12000');
-                              lion_src_prep                               
---------------------------------------------------------------------------
- not pushed down: (0,343) (1,343) (2,343) (3,343) (4,342) (5,343) (6,343)
+                            lion_src_prep                             
+----------------------------------------------------------------------
+ pushed down: (0,343) (1,343) (2,343) (3,343) (4,342) (5,343) (6,343)
 (1 row)
 
 SELECT lion_src_prep('SELECT g, count(*) FROM lion_src_t WHERE tags @> $1 AND u < $2 GROUP BY g', '''{2,NULL}'', 12000');
-      lion_src_prep      
--------------------------
- not pushed down: (none)
+    lion_src_prep    
+---------------------
+ pushed down: (none)
 (1 row)
 
 SELECT lion_src_prep('SELECT count(*) FROM lion_src_t WHERE tags && $1 AND u < $2 AND r > 100', '''{1,11}'', 15000');
-      lion_src_prep      
--------------------------
- not pushed down: (5969)
+    lion_src_prep    
+---------------------
+ pushed down: (5969)
 (1 row)
 
 -- ---------- 6. a dirty heap, and VACUUM ----------

@@ -175,6 +175,14 @@ typedef struct LionCountCtx
 								 * it has copied it (a plain index scan under
 								 * an MVCC snapshot, DESIGN.md §29.5) */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
+
+	/*
+	 * A test every counted row must pass as well (DESIGN.md §17, "A query
+	 * known only at run time"), or NULL.  With one, the visibility map is not
+	 * asked at all: every candidate goes to the heap, where the row the
+	 * snapshot sees is tested (lion_recheck_heap_filtered()).
+	 */
+	LionRowFilter *filter;
 	int64		count;			/* members counted straight from the VM */
 	LionCountStats stats;
 
@@ -3978,6 +3986,13 @@ struct LionVisCache
 	int			ncounts;		/* counts served since the last reset */
 	int			maxentries;		/* work_mem budget, in entries */
 	bool		full;			/* budget reached: stop inserting */
+
+	/*
+	 * The row filter every count of this node execution applies, or NULL
+	 * (lion_vis_cache_set_filter()).  It is the caller's and outlives no
+	 * relation it names; a reset leaves it alone.
+	 */
+	LionRowFilter *filter;
 };
 
 /*
@@ -4033,9 +4048,22 @@ lion_vis_cache_destroy(LionVisCache *cache)
 	if (cache == NULL)
 		return;
 	cache->ht = NULL;
+	cache->filter = NULL;
 	if (cache->cxt != NULL)
 		MemoryContextDelete(cache->cxt);
 	cache->cxt = NULL;
+}
+
+void
+lion_vis_cache_set_filter(LionVisCache *cache, LionRowFilter *filter)
+{
+	if (cache == NULL)
+	{
+		if (filter != NULL)
+			elog(ERROR, "lion index count: a row filter needs a visibility cache");
+		return;
+	}
+	cache->filter = filter;
 }
 
 /*
@@ -4468,6 +4496,9 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	members = lion_container_block_mask(c);
 	if (cx->in_recovery || cx->novm)
 		allvis = 0;				/* see lion_count_sources(): no interlock */
+	else if (cx->filter != NULL)
+		allvis = 0;				/* the map vouches for visibility, and every
+								 * row has to be tested as well */
 	else
 	{
 		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, members,
@@ -4874,6 +4905,166 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 	return visible;
 }
 
+bool
+lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
+{
+	TupleDesc	desc = RelationGetDescr(filter->heap);
+	MemoryContext oldcxt = MemoryContextSwitchTo(filter->tmpcxt);
+	bool		pass = true;
+	int			i;
+
+	for (i = 0; i < filter->nclauses && pass; i++)
+	{
+		LionRowFilterClause *c = &filter->clauses[i];
+		Datum		d;
+		bool		isnull;
+
+		d = heap_getattr(tuple, c->attno, desc, &isnull);
+		if (isnull)
+			pass = false;		/* a strict operator, or IS NOT NULL */
+		else if (!c->notnull)
+		{
+			LOCAL_FCINFO(fcinfo, 2);
+			Datum		result;
+
+			InitFunctionCallInfoData(*fcinfo, &c->flinfo, 2, c->collation,
+									 NULL, NULL);
+			fcinfo->args[0].value = d;
+			fcinfo->args[0].isnull = false;
+			fcinfo->args[1].value = c->value;
+			fcinfo->args[1].isnull = false;
+			result = FunctionCallInvoke(fcinfo);
+			pass = (!fcinfo->isnull && DatumGetBool(result));
+		}
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(filter->tmpcxt);
+	return pass;
+}
+
+/*
+ * lion_recheck_heap_heap() for a count with a row filter (DESIGN.md §17, "A
+ * query known only at run time"): the row the snapshot sees is not only
+ * found, it is tested, and counted when it passes.
+ *
+ * The chain of each candidate is resolved under the share lock exactly as
+ * there - heap_hot_search_buffer(), its serializable conflict checks and
+ * tuple predicate locks included - and the offsets of the visible members
+ * are noted.  The filter runs after the lock is released, on the tuples the
+ * pin alone keeps in place, which is what core's page-at-a-time heap scans do
+ * (heap_prepare_pagescan()): nothing moves a tuple while another backend holds
+ * a pin, since pruning and defragmentation need the cleanup lock, and the
+ * operator it calls may read TOAST or run for a while, neither of which may
+ * happen under a buffer content lock.
+ *
+ * The visibility cache is neither read nor filled: it knows which offsets
+ * are visible, but the filter needs their tuples.
+ */
+static int64
+lion_recheck_heap_filtered(LionCountCtx *cx)
+{
+	LionRowFilter *filter = cx->filter;
+	OffsetNumber vis[MaxHeapTuplesPerPage];
+	int64		passed = 0;
+	int			i = 0;
+
+	while (i < cx->ntids)
+	{
+		BlockNumber blk = ItemPointerGetBlockNumber(&cx->tids[i]);
+		Buffer		buf;
+		Page		page;
+		int			nvis = 0;
+		int			j;
+
+		buf = ReadBuffer(cx->heap, blk);
+		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		cx->stats.blocks_rechecked++;
+
+		do
+		{
+			ItemPointerData tid = cx->tids[i];	/* callee updates it */
+			HeapTupleData heapTuple;
+
+			if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
+									   &heapTuple, NULL, true))
+			{
+				/* one visible member per chain, one chain per candidate */
+				if (nvis >= MaxHeapTuplesPerPage)
+					elog(ERROR, "lion index count: more visible tuples than a heap page holds");
+				vis[nvis++] = ItemPointerGetOffsetNumber(&tid);
+			}
+			i++;
+		} while (i < cx->ntids &&
+				 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+		page = BufferGetPage(buf);
+		for (j = 0; j < nvis; j++)
+		{
+			ItemId		lp = PageGetItemId(page, vis[j]);
+			HeapTupleData tuple;
+
+			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			tuple.t_len = ItemIdGetLength(lp);
+			tuple.t_tableOid = RelationGetRelid(cx->heap);
+			ItemPointerSet(&tuple.t_self, blk, vis[j]);
+
+			if (lion_row_filter_test(filter, &tuple))
+				passed++;
+			else
+				cx->stats.rows_removed++;
+		}
+
+		ReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	return passed;
+}
+
+int64
+lion_count_heap_filtered(Relation heap, Snapshot snapshot,
+						 LionRowFilter *filter, LionCountStats *stats)
+{
+	TableScanDesc scan;
+	HeapTuple	tuple;
+	BlockNumber lastblk = InvalidBlockNumber;
+	int64		count = 0;
+
+	if (filter == NULL || filter->heap != heap)
+		elog(ERROR, "lion index count: a heap scan without its row filter");
+
+	/*
+	 * An ordinary sequential scan under the count's snapshot: it takes the
+	 * relation's predicate lock under SERIALIZABLE and prunes on access as
+	 * any scan does.  table_beginscan_strat() rather than table_beginscan(),
+	 * whose arguments changed in PostgreSQL 19; these are its defaults.
+	 */
+	scan = table_beginscan_strat(heap, snapshot, 0, NULL, true, true);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		BlockNumber blk = ItemPointerGetBlockNumber(&tuple->t_self);
+
+		if (blk != lastblk)
+		{
+			stats->blocks_rechecked++;
+			lastblk = blk;
+		}
+		stats->tids_rechecked++;
+		if (lion_row_filter_test(filter, tuple))
+			count++;
+		else
+			stats->rows_removed++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	table_endscan(scan);
+
+	return count;
+}
+
 /*
  * Visit the heap for the TIDs of blocks that were not all-visible.
  */
@@ -4892,7 +5083,18 @@ lion_recheck_heap(LionCountCtx *cx)
 	if (!cx->tids_sorted)
 		qsort(cx->tids, cx->ntids, sizeof(ItemPointerData), lion_tid_cmp);
 
-	if (cx->heap->rd_tableam == GetHeapamTableAmRoutine())
+	/*
+	 * A filtered count reads the tuples themselves, which only the heap AM
+	 * gives it that way; the count pushdown refuses every other table AM
+	 * before it gets here (DESIGN.md §10).
+	 */
+	if (cx->filter != NULL)
+	{
+		if (cx->heap->rd_tableam != GetHeapamTableAmRoutine())
+			elog(ERROR, "lion index count: a row filter over a table that is not a heap");
+		visible = lion_recheck_heap_filtered(cx);
+	}
+	else if (cx->heap->rd_tableam == GetHeapamTableAmRoutine())
 		visible = lion_recheck_heap_heap(cx);
 	else
 		visible = lion_recheck_heap_am(cx);
@@ -5745,10 +5947,10 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * committed.  lion_count_one_set() refuses to count one on its own.
  *
  * Returns false, with *out not found and nothing allocated, when the copy
- * would take more than maxbytes, or when a source is a list too long to open
- * at once (it is read in batches, each yielding every container key of its
- * own).  The caller then counts the ordinary way.  The copy is allocated in
- * the current memory context.
+ * would take more than maxbytes.  The caller then counts the ordinary way.  A
+ * list too long to open at once is read as a windowed union, not in the
+ * batches a count takes it in (lion_count_sources_run()).  The copy is
+ * allocated in the current memory context.
  */
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
@@ -6135,19 +6337,23 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 * always was.
 	 */
 	lion_open_budget_init(&budget, heap);
-	batchsrc = (summed || oneset) ? -1 :
-		lion_batch_source(nsources, sources, trees, &budget);
 
 	/*
-	 * The passes of a batched list each yield every container key of their
-	 * own, so a collection of one would come out of order.  It is refused;
-	 * the caller counts the ordinary way, as it does past its byte budget.
+	 * A collection is never batched.  The passes of a batched list each
+	 * yield every container key of their own, so a copy of them would come
+	 * out of order; and the reason a COUNT batches a disjoint list rather than
+	 * read it as a windowed union - that a batch keeps its pins, and so the
+	 * DESIGN.md §9 interlock - is nothing to a collection, whose cursors drop
+	 * every pin anyway (DESIGN.md §27).  A list too wide to open at once is
+	 * therefore read the way any other too-wide union is (lion_plan_node()):
+	 * a window of container keys at a time, its sets opened one after the
+	 * other, every key in order.  That is what lets an IN list whose length
+	 * the planner could not see - a parameter, an expression (§27) - be
+	 * collected once however long it turns out, instead of being merged
+	 * again by every count; such a list used to be refused a copy here.
 	 */
-	if (collect != NULL && batchsrc >= 0)
-	{
-		collect->failed = true;
-		return 0;
-	}
+	batchsrc = (summed || oneset || collect != NULL) ? -1 :
+		lion_batch_source(nsources, sources, trees, &budget);
 
 	/*
 	 * Decide which sets to serve from a private copy this time (DESIGN.md
@@ -6375,6 +6581,16 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	lion_vis_cache_begin(cache, heap, snapshot);
 	cx.cache = cache;
 
+	/*
+	 * ... and the row filter the node asks of every count of this execution
+	 * (DESIGN.md §17, "A query known only at run time").  A collection has no
+	 * cache and is not filtered: it copies the superset, and the counts of
+	 * that copy are.
+	 */
+	cx.filter = (cache != NULL) ? cache->filter : NULL;
+	if (cx.filter != NULL && cx.filter->heap != heap)
+		elog(ERROR, "lion index count: a row filter for another relation");
+
 	if (summed)
 	{
 		/*
@@ -6464,6 +6680,7 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 		stats->cache_hits += cx.stats.cache_hits;
 		stats->cache_full += cx.stats.cache_full;
 		stats->sets_summed += cx.stats.sets_summed;
+		stats->rows_removed += cx.stats.rows_removed;
 	}
 
 	return result;

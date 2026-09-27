@@ -287,7 +287,20 @@ INSERT INTO lion_cc_q VALUES
 (224, $$SELECT status, count(*) FROM lion_cc_t WHERE NOT flag GROUP BY status$$),
 (225, $$SELECT count(DISTINCT status) FROM lion_cc_t WHERE flag$$),
 -- a fact filter of the FK-side join
-(226, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.flag AND f.country = 'c1' GROUP BY d.status$$);
+(226, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.flag AND f.country = 'c1' GROUP BY d.status$$),
+-- IS NOT TRUE / IS NOT FALSE inside an AND arm of an OR: distributed into
+-- the arms it stands for, and so is any other OR nested there
+(227, $$SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND flag IS NOT TRUE) OR country = 'c1'$$),
+(228, $$SELECT count(*) FROM lion_cc_t WHERE (flag IS NOT FALSE AND country = 'c2') OR status IS NULL$$),
+(229, $$SELECT count(*) FROM lion_cc_t WHERE (status = 'dead' AND flag IS NOT TRUE AND flag IS NOT FALSE) OR pc = 3$$),
+(230, $$SELECT count(*) FROM lion_cc_t WHERE (flag IS NOT TRUE AND country = 'c3') OR (flag IS NOT FALSE AND status = 'parked')$$),
+(231, $$SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND (country = 'c1' OR pc = 2)) OR flag IS NOT TRUE$$),
+(232, $$SELECT status, count(*) FROM lion_cc_t WHERE (country = 'c1' AND flag IS NOT TRUE) OR pc = 2 GROUP BY status$$),
+(233, $$SELECT count(*) FROM lion_cc_t WHERE (pc = 1 AND (country = 'c1' OR status = 'live') AND (country = 'c2' OR flag) AND (flag IS NOT FALSE OR status IS NULL)) OR pc = 2$$),
+(234, $$SELECT count(*) FROM lion_cc_t WHERE country = 'c4' AND ((status = 'dead' AND flag IS NOT TRUE) OR pc = 5)$$),
+-- ... but no further than an IN list's sets: 2^10 arms of 11 leaves each is
+-- declined
+(235, $$SELECT count(*) FROM lion_cc_t WHERE (pc = 1 AND (country = 'c0' OR pc = 10) AND (country = 'c1' OR pc = 11) AND (country = 'c2' OR pc = 12) AND (country = 'c3' OR pc = 13) AND (country = 'c4' OR pc = 14) AND (country = 'c5' OR pc = 15) AND (status = 'live' OR pc = 16) AND (status = 'dead' OR pc = 17) AND (flag OR pc = 18) AND (flag IS NOT TRUE OR pc = 19)) OR pc = 2$$);
 
 -- ---- 3. stable expressions as clause values ----
 INSERT INTO lion_cc_q VALUES
@@ -335,6 +348,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag = true;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE NOT flag;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS TRUE AND status = 'parked';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS NOT TRUE;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND flag IS NOT TRUE) OR country = 'c1';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND (country = 'c1' OR pc = 2)) OR flag;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE ts >= now() - interval '30 days';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE d >= current_date - 30;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE pc IN (lion_cc_pick(), 3);
@@ -441,7 +456,7 @@ SELECT lion_cc_prep('SELECT count(*) FROM lion_cc_t WHERE d >= $1::date + 1 AND 
 
 -- ... and a dirty heap, whose candidates the node rechecks
 UPDATE lion_cc_t SET flag = NOT flag, status = 'dead' WHERE id % 11 = 0;
-SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 203, 208, 213, 301, 305, 310) ORDER BY n;
+SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 203, 208, 213, 227, 229, 232, 301, 305, 310) ORDER BY n;
 
 DROP TABLE lion_cc_q, lion_cc_t, lion_cc_dim;
 DROP DOMAIN lion_cc_wsd;

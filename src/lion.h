@@ -804,6 +804,10 @@ lion_column(LionIndexState *ix, AttrNumber attno)
  *
  *	LION_QMODE_NONE	nothing at all (`tags && '{}'`)
  *	LION_QMODE_KEYS	exactly the rows the key tree selects; no recheck
+ *	LION_QMODE_LOSSY	at least the rows the query selects, and perhaps
+ *					more: the key tree selects a SUPERSET, which the caller
+ *					rechecks (lion_extract_query_superset() only: a phrase
+ *					as the AND of its lexemes, `a & !b` as `a`)
  *	LION_QMODE_ALL	every indexed row, with recheck (`tags @> '{}'`, `<@`,
  *					a tsquery with NOT/phrase/prefix/weights, a NULL key)
  */
@@ -811,6 +815,7 @@ typedef enum LionQueryMode
 {
 	LION_QMODE_NONE = 0,
 	LION_QMODE_KEYS,
+	LION_QMODE_LOSSY,
 	LION_QMODE_ALL
 } LionQueryMode;
 
@@ -840,7 +845,7 @@ typedef struct LionQuery
 	LionQueryMode mode;
 	int			nkeys;			/* keys the extraction produced */
 	Datum	   *keys;
-	LionKeyNode *tree;			/* LION_QMODE_KEYS only; over keys[] */
+	LionKeyNode *tree;			/* LION_QMODE_KEYS and LOSSY; over keys[] */
 } LionQuery;
 
 /*
@@ -857,6 +862,18 @@ extern int lion_extract_value(LionState *state, Datum value, Datum **keys);
  */
 extern void lion_extract_query(LionState *state, Datum query,
 							  StrategyNumber strategy, LionQuery *q);
+
+/*
+ * The same, for a caller that rechecks what it is handed (the count pushdown's
+ * heap recheck of a query it only sees at run time, DESIGN.md §17): a query
+ * the key sets cannot answer exactly comes back LION_QMODE_LOSSY with a tree
+ * that selects a superset of its rows, where one narrower than every row
+ * exists, and LION_QMODE_ALL where none does.  keys[] then holds only the
+ * keys the tree names.  A query lion_extract_query() answers exactly comes
+ * back the same here.
+ */
+extern void lion_extract_query_superset(LionState *state, Datum query,
+									   StrategyNumber strategy, LionQuery *q);
 
 
 /* ---------- lion_pages.c: primitives shared by build/insert/scan/vacuum ---------- */

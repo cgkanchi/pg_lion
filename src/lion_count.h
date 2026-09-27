@@ -12,7 +12,9 @@
 #ifndef LION_COUNT_H
 #define LION_COUNT_H
 
+#include "access/htup.h"
 #include "access/skey.h"
+#include "fmgr.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/planner.h"
 #include "storage/buf.h"
@@ -87,6 +89,14 @@ typedef struct LionCountStats
 	 * clause and an IN list ANDed with something else still do.
 	 */
 	int64		sets_summed;
+
+	/*
+	 * Candidate rows the snapshot sees that a row filter (LionRowFilter
+	 * below) turned away: rows of a superset the posting sets answered for a
+	 * multi-key query they could not answer exactly (DESIGN.md §17).  Zero
+	 * whenever no count had a filter.
+	 */
+	int64		rows_removed;
 } LionCountStats;
 
 /*
@@ -112,6 +122,66 @@ typedef struct LionVisCache LionVisCache;
 extern LionVisCache *lion_vis_cache_create(MemoryContext parent);
 extern void lion_vis_cache_reset(LionVisCache *cache);
 extern void lion_vis_cache_destroy(LionVisCache *cache);
+
+/*
+ * A test every row a count counts has to pass as well, made on the heap tuple
+ * the snapshot sees (DESIGN.md §17, "A query known only at run time").  The
+ * count pushdown sets one while a multi-key clause whose query it only had at
+ * run time - a generic plan's parameter, a stable expression - came out as one
+ * the posting sets cannot answer exactly: its sources are then a SUPERSET of
+ * the rows (or, for a query no key narrows at all, the other clauses' rows
+ * alone), and each clause is tested here instead.
+ *
+ * Each clause is `column op value`, the column on the left, of a strict
+ * operator: a NULL column fails it, and so does a NULL result.  notnull makes
+ * a clause the test `column IS NOT NULL` alone, which is all the heap-scan
+ * fallback (lion_count_heap_filtered()) needs besides.  attno is the heap
+ * column in the numbering of `heap`, the relation being counted - a
+ * partition's own (DESIGN.md §16).
+ */
+typedef struct LionRowFilterClause
+{
+	AttrNumber	attno;
+	bool		notnull;
+	FmgrInfo	flinfo;			/* the operator's function */
+	Oid			collation;
+	Datum		value;
+} LionRowFilterClause;
+
+typedef struct LionRowFilter
+{
+	Relation	heap;
+	int			nclauses;
+	LionRowFilterClause *clauses;
+	MemoryContext tmpcxt;		/* one row's evaluation, reset after it */
+} LionRowFilter;
+
+/*
+ * Every count that is handed `cache` afterwards (lion_count_sources_cached(),
+ * lion_exists_sources_cached()) sends each candidate TID to the heap - the
+ * visibility map vouches for visibility, not for the filter - and counts the
+ * row the snapshot sees only when it passes `filter`.  NULL removes it.  The
+ * cache is the handle the count node already gives every count of one
+ * execution; lion_vis_cache_reset() leaves the filter where it is, and a
+ * count of another relation than filter->heap is an error.  A collection
+ * (lion_sources_collect()) is never filtered: the superset it copies is
+ * filtered when it is counted.
+ */
+extern void lion_vis_cache_set_filter(LionVisCache *cache,
+									  LionRowFilter *filter);
+
+/* Does the row pass?  tuple is a heap tuple of filter->heap. */
+extern bool lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple);
+
+/*
+ * The rows of `heap` visible to snapshot that pass filter, by a sequential
+ * scan: what the count pushdown falls back to when a filtered clause was its
+ * only source and there is no candidate set to recheck (DESIGN.md §17).  The
+ * rows scanned are counted as rechecked in stats.
+ */
+extern int64 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
+									  LionRowFilter *filter,
+									  LionCountStats *stats);
 
 /*
  * A located posting set: everything the counting code needs in order to
