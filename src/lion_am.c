@@ -20,12 +20,14 @@
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
@@ -860,17 +862,81 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 }
 
 /*
+ * The sum of the squared frequencies of a column's values among its non-NULL
+ * rows, from its MCV list and, for the values not in it, an even share of
+ * the rest: what ANALYZE's correlation comes out at when the values are
+ * placed at random (lion_index_correlation()).  1 when nothing is known,
+ * which leaves no correlation at all.
+ */
+static double
+lion_stats_sum_sq_freq(VariableStatData *vardata)
+{
+	Form_pg_statistic stats;
+	AttStatsSlot sslot;
+	double		nonnull;
+	double		summcv = 0.0;
+	double		sumsq = 0.0;
+	double		rest;
+	double		ndistinct;
+	bool		isdefault;
+	int			nmcv = 0;
+	int			i;
+
+	if (!HeapTupleIsValid(vardata->statsTuple))
+		return 1.0;
+	stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
+	nonnull = 1.0 - stats->stanullfrac;
+	if (nonnull <= 0.0)
+		return 1.0;
+
+	if (get_attstatsslot(&sslot, vardata->statsTuple, STATISTIC_KIND_MCV,
+						 InvalidOid, ATTSTATSSLOT_NUMBERS))
+	{
+		for (i = 0; i < sslot.nnumbers; i++)
+		{
+			double		f = sslot.numbers[i] / nonnull;
+
+			summcv += sslot.numbers[i];
+			sumsq += f * f;
+		}
+		nmcv = sslot.nnumbers;
+		free_attstatsslot(&sslot);
+	}
+
+	rest = Max(nonnull - summcv, 0.0) / nonnull;
+	if (rest > 0.0)
+	{
+		ndistinct = get_variable_numdistinct(vardata, &isdefault);
+		sumsq += rest * rest / Max(ndistinct - nmcv, 1.0);
+	}
+	return Min(sumsq, 1.0);
+}
+
+/*
  * The correlation a PLAIN index scan's heap fetches have with the heap order
  * (DESIGN.md §29.11), which only cost_index() reads - a bitmap heap scan
- * sorts its pages whatever the index says.  It is btcostestimate()'s answer:
- * the ANALYZE correlation of the first index column the path has a clause on
- * (of column 1 when it has none), for the type's default `<`, which is what
- * ANALYZE computed it with, times 0.75 for a multicolumn index.  Within one
- * key a lion scan returns TIDs in heap order, as btree does since its heap-TID
- * tiebreaker, so how that key's rows are spread over the heap is what the
- * column's correlation describes.  0 for a multi-key column (a row is under
- * several of its entries and the column's statistics are the ARRAY's), for
- * an expression column, and whenever there is no statistic.
+ * sorts its pages whatever the index says.  It starts from btcostestimate()'s
+ * answer: the ANALYZE correlation of the first index column the path has a
+ * clause on (of column 1 when it has none), for the type's default `<`, which
+ * is what ANALYZE computed it with, times 0.75 for a multicolumn index.
+ * Within one key a lion scan returns TIDs in heap order, as btree does since
+ * its heap-TID tiebreaker, so how that key's rows are spread over the heap is
+ * what the column's correlation describes.  0 for a multi-key column (a row
+ * is under several of its entries and the column's statistics are the
+ * ARRAY's), for an expression column, and whenever there is no statistic.
+ *
+ * Less the part that says nothing about the heap.  ANALYZE sorts its sample
+ * by value and equal values by their place in the heap, so a column of few
+ * values placed at random correlates by exactly the sum of its values'
+ * squared frequencies: 1/k for k equally common values, 0.82 for a 90/10
+ * boolean.  cost_index() read that as the rows of one value packed on fewer
+ * pages than they touch - and lion is made for such columns.  So the
+ * correlation is taken beyond that baseline: (corr - S) / (1 - S), S the sum
+ * of the squares, clamped to [-1, 1], which is 0 for values placed at random
+ * and still 1 for a column stored in value order (and -1 for one stored in
+ * reverse, whose values are packed as well).  Measured on 8M rows with the
+ * values placed at random: 0.4406 for a column of three values at 60/20/20%
+ * (S = 0.44), 0.8171 for 90/10 (S = 0.82), 0.6852 for 80/20 (S = 0.68).
  */
 static double
 lion_index_correlation(PlannerInfo *root, IndexPath *path)
@@ -914,7 +980,13 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 							 ATTSTATSSLOT_NUMBERS))
 		{
 			if (sslot.nnumbers > 0)
-				corr = sslot.numbers[0];
+			{
+				double		sumsq = lion_stats_sum_sq_freq(&vardata);
+
+				corr = (sumsq < 1.0) ?
+					(sslot.numbers[0] - sumsq) / (1.0 - sumsq) : 0.0;
+				corr = Max(-1.0, Min(corr, 1.0));
+			}
 			free_attstatsslot(&sslot);
 		}
 	}
@@ -926,13 +998,271 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 }
 
 /*
+ * Does a plain scan of this path hand out its TIDs in heap order - the SETS,
+ * UNION and WINDOW sources of DESIGN.md §29.3, lion_source_sorted()?
+ * Mirrors lion_source_build(): per key column the qual lion_scan_choose()
+ * ranks first is answered; an IN list longer than a batch is a LIST, which
+ * restarts the heap per batch; a range, or an `IS NOT NULL` that nothing
+ * else answers, is a WALK in key order when no other column's sets are
+ * beside it.  Beside them a range is taken for a WINDOW, as
+ * lion_range_entry_cost() takes it: a walk too short for one restarts the
+ * other columns' stream a few times at most (lion_source_walk_is_long()),
+ * each restart in heap order.
+ */
+static bool
+lion_plain_scan_is_sorted(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	int			ncols = index->nkeycolumns;
+	int			bestrank[INDEX_MAX_KEYS];
+	Node	   *chosen[INDEX_MAX_KEYS];
+	int			nsets = 0;
+	int			nwalks = 0;
+	int			nlists = 0;
+	bool		anychosen = false;
+	ListCell   *lc;
+	int			c;
+
+	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
+		return false;
+
+	for (c = 0; c < ncols; c++)
+	{
+		bestrank[c] = 4;
+		chosen[c] = NULL;
+	}
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lc2;
+
+		c = iclause->indexcol;
+		if (c < 0 || c >= ncols)
+			continue;
+		foreach(lc2, iclause->indexquals)
+		{
+			Node	   *clause = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+			int			rank;
+
+			if (IsA(clause, NullTest))
+				rank = 3;
+			else if (IsA(clause, ScalarArrayOpExpr))
+				rank = 1;
+			else if (IsA(clause, OpExpr) &&
+					 lion_cost_is_range(index, c, (OpExpr *) clause))
+				rank = 2;
+			else
+				rank = 0;
+			if (rank < bestrank[c])
+			{
+				bestrank[c] = rank;
+				chosen[c] = clause;
+			}
+		}
+	}
+
+	for (c = 0; c < ncols; c++)
+	{
+		Node	   *cl = chosen[c];
+
+		if (cl == NULL)
+			continue;
+		anychosen = true;
+
+		/* a multi-key column is a set tree or a UNION, both in heap order */
+		if (lion_index_is_multikey(index, c))
+			nsets++;
+		else if (IsA(cl, NullTest) &&
+				 ((NullTest *) cl)->nulltesttype == IS_NOT_NULL)
+			nwalks++;
+		else if (bestrank[c] == 2 ||
+				 (IsA(cl, ScalarArrayOpExpr) &&
+				  lion_cost_is_range_op(index, c,
+										((ScalarArrayOpExpr *) cl)->opno)))
+			nwalks++;
+		else if (IsA(cl, ScalarArrayOpExpr) &&
+				 get_op_opfamily_strategy(((ScalarArrayOpExpr *) cl)->opno,
+										  index->opfamily[c]) == LION_STRAT_EQUAL &&
+#if PG_VERSION_NUM >= 170000
+				 estimate_array_length(root,
+									   (Node *) lsecond(((ScalarArrayOpExpr *) cl)->args))
+#else
+				 estimate_array_length((Node *) lsecond(((ScalarArrayOpExpr *) cl)->args))
+#endif
+				 > lion_scan_list_batch())
+			nlists++;
+		else
+			nsets++;
+	}
+
+	/*
+	 * No key: a partial index read whole, by a walk of column 1 or, when that
+	 * column is multi-key, by a union.
+	 */
+	if (!anychosen)
+		return lion_index_is_multikey(index, 0);
+	if (nlists > 0)
+		return false;
+	if (nwalks > 0)
+		return nsets > 0;
+	return true;
+}
+
+/*
+ * What a plain scan pays to fetch a row past the first on its heap page, in
+ * cpu_tuple_cost, beyond what a bitmap heap scan pays for the same row: an
+ * amgettuple call, a buffer lock and a HOT search per row, where the bitmap
+ * heap scan takes the lock and walks the page's matches once.  Measured on
+ * an assert-enabled build with the heap in shared buffers: 20 to 50 ns a row
+ * more than the bitmap heap scan, against 55 ns for a row of a sequential
+ * scan - the row cpu_tuple_cost stands for.
+ */
+#define LION_PLAIN_FETCH_ROW_COST	0.5
+
+/*
+ * cost_bitmap_tree_node()'s charge for a row's bitmap entry, in
+ * cpu_operator_cost: part of the bitmap heap scan's per-row price, which the
+ * plain scan is charged as well (lion_plain_heap_correlation()).
+ */
+#define LION_BITMAP_ROW_COST		0.1
+
+/*
+ * The correlation handed to cost_index() for a plain scan (DESIGN.md
+ * §29.11).  A scan whose TIDs are not in heap order - a WALK in key order, a
+ * LIST restarted per batch - gets the column's, as btree's does
+ * (lion_index_correlation()).
+ *
+ * For a scan in heap order it is not a statistic but the value that makes
+ * cost_index()'s heap side come out at what the scan reads and does, which
+ * is what a bitmap heap scan of the same rows reads and does, and a little
+ * more.  cost_index() interpolates its I/O by the correlation squared between
+ * rows packed on sel x heap pages and read in order, and rows scattered at
+ * random over Mackert and Lohman's count of pages, each a random read.  A
+ * scan in heap order has the packed end but not the scattered one: scattered
+ * rows are read as a bitmap heap scan reads them, each page once and in block
+ * order, which cost_bitmap_heap_scan() prices (compute_bitmap_pages():
+ * Cardenas's count of the pages the rows touch, at random_page_cost falling
+ * to seq_page_cost as those approach the whole heap).  So the I/O is that,
+ * interpolated towards the packed end by the column's correlation.  Priced
+ * as a random read a page, a count of 2% of 8M rows scattered over 108k of
+ * the heap's 190k pages came to 2.3 times the bitmap scan's price and ran 1.6
+ * to 2.5 times faster than it (2026-09-27).
+ *
+ * Per row, cost_index() charges cpu_tuple_cost and the quals it leaves to the
+ * heap, and cost_bitmap_heap_scan() that, every index qual as well (the
+ * recheck) and a bitmap entry.  The plain scan is charged the bitmap heap
+ * scan's price - it rechecks its index quals whenever it drops one or reads
+ * a multi-key column, which cost_index() never charges - and, for every row
+ * past the first on its page, LION_PLAIN_FETCH_ROW_COST more.  In the
+ * measurement behind that constant the plain scan spent 0.4 us a page LESS
+ * than the bitmap heap scan, which is not credited: with one row to a page
+ * the two cost about the same.
+ *
+ * cost_index() charges no more than its uncorrelated end, so at a
+ * random_page_cost near seq_page_cost the heap side of a result on nearly
+ * every page is clamped there, about the bitmap heap scan's, and the choice
+ * between the two falls to their CPU and to the parallel bitmap scan, which
+ * the plain scan has no counterpart to (DESIGN.md §29.1).
+ */
+static double
+lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
+							double loop_count, Selectivity sel)
+{
+	IndexOptInfo *index = path->indexinfo;
+	RelOptInfo *baserel = index->rel;
+	double		corr = lion_index_correlation(root, path);
+	double		T;
+	double		tuples;
+	double		pages;
+	double		max_pages;
+	double		min_pages;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+	QualCost	qcost;
+	Cost		target;
+	Cost		max_io;
+	Cost		min_io;
+	double		csquared;
+
+	/*
+	 * An index-only scan is left as it was: lion's are of queries that need no
+	 * column, so they have no qual and read a whole column, and a multi-key
+	 * one - the only kind in heap order - fetches every TID it hands out
+	 * (liongettuple()), which the all-visible fraction cost_index() applies
+	 * would not describe.
+	 */
+	if (path->path.pathtype == T_IndexOnlyScan ||
+		!lion_plain_scan_is_sorted(root, path))
+		return corr;
+
+	T = (baserel->pages > 1) ? (double) baserel->pages : 1.0;
+	tuples = clamp_row_est(sel * baserel->tuples);
+	get_tablespace_page_costs(baserel->reltablespace, &spc_random_page_cost,
+							  &spc_seq_page_cost);
+
+	/* compute_bitmap_pages() and cost_bitmap_heap_scan() */
+	if (loop_count > 1)
+		pages = index_pages_fetched(tuples * loop_count, baserel->pages,
+									(double) index->pages, root) / loop_count;
+	else
+		pages = (2.0 * T * tuples) / (2.0 * T + tuples);
+	pages = (pages >= T) ? T : ceil(pages);
+	target = pages * ((pages >= 2.0) ?
+					  spc_random_page_cost -
+					  (spc_random_page_cost - spc_seq_page_cost) * sqrt(pages / T) :
+					  spc_random_page_cost);
+
+	/* cost_index()'s ends: uncorrelated (max_io) and packed (min_io) */
+	if (loop_count > 1)
+	{
+		max_pages = index_pages_fetched(tuples * loop_count, baserel->pages,
+										(double) index->pages, root);
+		min_pages = index_pages_fetched(ceil(sel * (double) baserel->pages) *
+										loop_count, baserel->pages,
+										(double) index->pages, root);
+		max_io = max_pages * spc_random_page_cost / loop_count;
+		min_io = min_pages * spc_random_page_cost / loop_count;
+	}
+	else
+	{
+		max_pages = index_pages_fetched(tuples, baserel->pages,
+										(double) index->pages, root);
+		min_pages = ceil(sel * (double) baserel->pages);
+		max_io = max_pages * spc_random_page_cost;
+		min_io = (min_pages > 0) ? spc_random_page_cost +
+			Max(min_pages - 1.0, 0.0) * spc_seq_page_cost : 0.0;
+	}
+
+	/* from scattered as the bitmap reads them to packed */
+	target += corr * corr * (min_io - target);
+
+	/* the rows: the bitmap heap scan's recheck and bitmap, and the fetches */
+	cost_qual_eval(&qcost, get_quals_from_indexclauses(path->indexclauses),
+				   root);
+	target += tuples * (qcost.per_tuple +
+						LION_BITMAP_ROW_COST * cpu_operator_cost);
+	target += LION_PLAIN_FETCH_ROW_COST * cpu_tuple_cost *
+		Max(tuples - pages, 0.0);
+
+	if (max_io <= min_io)
+		return 0.0;
+	csquared = (max_io - target) / (max_io - min_io);
+	csquared = Max(0.0, Min(csquared, 1.0));
+	return sqrt(csquared);
+}
+
+/*
  * Cost estimate: the generic estimate, with three corrections and the heap
  * correlation.  A scan that has to walk the whole index is priced as one
  * rather than as the selective lookup its predicate's output selectivity
  * suggests, a range pays for the entries it walks (lion_range_entry_cost()),
- * and a plain index scan's heap side is priced with the column's correlation
- * as btree's is (lion_index_correlation(), DESIGN.md §29.11); a bitmap path,
- * which shares this estimate, does not read that last number.
+ * and a plain index scan's heap side is priced by the correlation: for a scan
+ * in heap order, the bitmap heap scan's price for the same pages and the
+ * plain scan's per-row work (lion_plain_heap_correlation()), otherwise the
+ * column's correlation as btree's is (lion_index_correlation(), DESIGN.md
+ * §29.11); a bitmap path, which shares this estimate, does not read that
+ * last number.
  */
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -1052,7 +1382,8 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;
-	*indexCorrelation = lion_index_correlation(root, path);
+	*indexCorrelation = lion_plain_heap_correlation(root, path, loop_count,
+													costs.indexSelectivity);
 	*indexPages = costs.numIndexPages;
 }
 

@@ -1,14 +1,20 @@
--- Plain index scans (amgettuple) against the bitmap scan of the same index.
+-- What a plain index scan (amgettuple) is priced at, against the bitmap scan
+-- of the same index (DESIGN.md §29.11).
 --
--- A range on one column of a multicolumn index beside other columns' sets is
--- walked in WINDOWs of those sets (DESIGN.md §29.3) when restarting their
--- stream for each entry of the range would read more than the sets: which
--- every key of a low-cardinality column does, its rows being at nearly every
--- container key.  It used to be counted in entries against the sets' posting
--- pages, so a range of a few hundred such keys was walked entry by entry and
--- read the other columns' sets once per key: the benchmark handoff's query,
--- an always-true range of 1889 keys beside four sets on 80.6M rows, did not
--- finish in 60 s (2026-09-27, item 6).
+-- A plain lion scan hands out its TIDs in heap order - the bitmap heap scan's
+-- pages in the bitmap heap scan's order - so its heap side is priced as the
+-- bitmap heap scan's, with its per-row fetches on top: a result of about a
+-- row to a page goes to the plain scan, which builds no bitmap, and one of
+-- many rows on every page to the bitmap scan, which fetches a page's rows at
+-- once.  It used to be priced with the first column's ANALYZE correlation,
+-- which for a column of few values placed at random is the sum of their
+-- squared frequencies, not 0: a scattered result of a few percent was priced
+-- as random reads and went to a bitmap scan up to 2.5 times slower, and at a
+-- random_page_cost of 1.1 a count of 13% of the rows went to the plain scan -
+-- with an always-true range beside the other columns, the benchmark handoff's
+-- query, to one that walked the range entry by entry and restarted the other
+-- columns' sets for each entry (2026-09-27, item 6: it did not finish in 60 s
+-- on 80.6M rows).
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -41,6 +47,22 @@ CREATE INDEX lpc_lion ON lpc USING lion (status, supp, flag, pc, tags);
 CREATE INDEX lpc_cl ON lpc USING lion (cl);
 VACUUM (FREEZE, ANALYZE) lpc;
 
+/* The scan nodes of a plan with nothing disabled, on one line. */
+CREATE FUNCTION lpc_plan(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	res text := '';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Scan' THEN
+			res := res || CASE WHEN res = '' THEN '' ELSE ' / ' END ||
+				   btrim(regexp_replace(ln, '->', ''));
+		END IF;
+	END LOOP;
+	RETURN res;
+END $$;
+
 /*
  * lpc_bufs() runs a query as a plain index scan, or as a bitmap scan, under
  * EXPLAIN (ANALYZE, BUFFERS) and returns the shared buffers its top node
@@ -70,7 +92,36 @@ END $$;
 -- the count pushdown would answer the counts below from the index alone
 SET pg_lion.enable_count_pushdown = off;
 
--- ---------- 1. a range beside the other columns' sets, key by key ----------
+-- ---------- 1. a large result goes to the bitmap scan, a small one to the plain scan ----------
+-- At the default random_page_cost and at 1.1, as on the benchmark's server.
+-- 13% of the rows, on every page; the same with an always-true range beside
+-- it, the benchmark's query; 43% of the rows, on every page; and 1000, 200
+-- and 20 rows, about one to a page.
+CREATE TABLE lpc_q (n int, q text);
+INSERT INTO lpc_q VALUES
+	(1, $$SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND tags && '{ga}'$$),
+	(2, $$SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}'$$),
+	(3, $$SELECT sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag$$),
+	(4, $$SELECT sum(id) FROM lpc WHERE pc = 5$$),
+	(5, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1$$),
+	(6, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1 AND supp = 1$$);
+SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
+-- 43% of the rows is left out at 1.1: with a random read priced near a
+-- sequential one, cost_index() cannot charge a result on every page more than
+-- its I/O at random_page_cost, and the two scans come out alike
+-- (DESIGN.md §29.11)
+SET random_page_cost = 1.1;
+SELECT n, lpc_plan(q) FROM lpc_q WHERE n <> 3 ORDER BY n;
+RESET random_page_cost;
+
+-- ---------- 2. a column stored in value order keeps its correlation ----------
+-- cl's four values each fill a quarter of the heap: its correlation is 1
+-- after the baseline its frequencies give is taken off, as before, and a
+-- quarter of the rows is read as the pages that hold them.
+SELECT lpc_plan('SELECT sum(id) FROM lpc WHERE cl = 1');
+SELECT lpc_plan('SELECT sum(id) FROM lpc WHERE cl IN (1, 2)');
+
+-- ---------- 3. a range beside the other columns' sets, key by key ----------
 -- Each pc key has rows at nearly every container key, so restarting the
 -- other columns' stream for each key walked read their sets once per key:
 -- the plain scan is a WINDOW now (DESIGN.md §29.3) and reads about what the
@@ -95,5 +146,6 @@ RESET enable_indexscan;
 RESET enable_seqscan;
 
 RESET pg_lion.enable_count_pushdown;
-DROP TABLE lpc;
+DROP TABLE lpc, lpc_q;
+DROP FUNCTION lpc_plan(text);
 DROP FUNCTION lpc_bufs(text, boolean);
