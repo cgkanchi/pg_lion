@@ -124,9 +124,11 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "port/atomics.h"
 #include "storage/predicate.h"
 #include "storage/shm_toc.h"
 #include "storage/spin.h"
+#include "utils/tuplesort.h"
 
 #include "lion.h"
 #include "lion_count.h"
@@ -176,6 +178,22 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 										 * (or, for an anti join, that does
 										 * not), for a core Agg above to
 										 * aggregate: count(DISTINCT) */
+#define LION_JOINFLAG_UNIQUE	0x04	/* the child's keys are made distinct
+										 * before any is looked up, by sorting
+										 * them: the forward semi join over a
+										 * non-unique key, an inner join over
+										 * the distinct keys */
+
+/*
+ * How many distinct keys of a forward semi join over a non-unique key
+ * (DESIGN.md §27, "Forward semi joins over a non-unique key") a participant of
+ * a parallel plan claims at a time.  Every participant sorts all of the keys,
+ * and they divide the sorted, distinct sequence between them in runs of this
+ * many, each run counted by the one participant that claimed it: a count is 3
+ * to 10 us, so a run is a fraction of a millisecond, and a participant that
+ * finishes early is never more than one run behind the others.
+ */
+#define LION_FKJOIN_UNIQUE_CHUNK	64
 
 /*
  * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
@@ -238,6 +256,32 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_FKJOIN_COPY_PROBE_COST	(15.0 * cpu_operator_cost)
 #define LION_FKJOIN_COPY_MEMBER_COST	(3.0 * cpu_operator_cost)
 #define LION_FKJOIN_COPY_CONTAINER_COST	(20.0 * cpu_operator_cost)
+
+/*
+ * Making the dimension's keys distinct for a forward semi join over a
+ * non-unique key (DESIGN.md §27, "Forward semi joins over a non-unique key"),
+ * which the node does itself with a datum sort of the child's keys:
+ *
+ *	SORT_COMPARE	one comparison of two keys in the sort, N log2 N of them
+ *					for N keys;
+ *	SORT_KEY		per key, the key read from the child's row and put into
+ *					the sort, taken out of it again and compared with the
+ *					previous distinct key.
+ *
+ * Measured on the assert build with int4 keys in random order: 0.108 us a key
+ * to put 40,000 or 199,000 of them in and sort them, and 0.023 us to take
+ * them out and compare them - as fast as core's Sort node over the same
+ * column, and about 13 cpu_operator_cost a key at the 250 units a millisecond
+ * the node's other terms run at (§27, "Cost, revisited").  cost_sort() is not
+ * used: it charges two cpu_operator_cost a comparison, 36 a key at 200,000,
+ * three times what the sort takes here (while cost_agg() charges core's own
+ * hashed unique-ification one a row), and it answers enable_sort, which this
+ * sort, no Sort node, does not.  A text key compares more slowly than these.
+ * A sort larger than work_mem also writes its keys out and reads them back,
+ * once each, as core's cost_tuplesort() charges one merge pass.
+ */
+#define LION_FKJOIN_SORT_COMPARE_COST	(0.25 * cpu_operator_cost)
+#define LION_FKJOIN_SORT_KEY_COST	(6.0 * cpu_operator_cost)
 
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
@@ -522,10 +566,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	10	IntList: the FK-side join (DESIGN.md §27), or empty: the number of
  *		the clause that is the join key - an equality on the fact's fk whose
  *		value expression is the dimension's column - then the LION_JOIN_*
- *		kind of join and the LION_JOINFLAG_* bits, and, added at plan time
- *		once the child plan exists, the position of that column in the
- *		child's target list.  The join key clause is not a source: the node
- *		looks it up once per child row, in source slot 0
+ *		kind of join and the LION_JOINFLAG_* bits, the sort operator and
+ *		collation the keys are made distinct by (LION_JOINFLAG_UNIQUE; 0
+ *		otherwise), and, added at plan time once the child plan exists, the
+ *		position of that column in the child's target list.  The join key
+ *		clause is not a source: the node looks it up once per child row (per
+ *		distinct key), in source slot 0
  *	11	List of three OidLists: the functions whose evaluation the node
  *		replaces, for the EXECUTE checks the executor would have made on the
  *		plan it stands for (DESIGN.md §9, "Privileges"; checked at executor
@@ -578,7 +624,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *
  * Shape 12 gave the JOIN member (10) the kind of join and its flags between
  * the clause number and the child's column (DESIGN.md §27's semi and anti
- * joins, and the fact filters collected once).
+ * joins, and the fact filters collected once), and shape 13 the sort operator
+ * and collation after them (the forward semi join over a non-unique key).
  *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
@@ -589,7 +636,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x5242490c
+#define LION_PRIV_MAGIC		0x5242490d
 #define LION_PRIV_NMEMBERS	13
 
 /*
@@ -632,6 +679,15 @@ typedef struct LionClauseState
 	bool		valisnull;
 
 	StrategyNumber strategy;	/* LION_CLAUSE_MULTI: 2, 3 or 5 */
+
+	/*
+	 * LION_CLAUSE_MULTI: how this scan's query was answered.  A literal is
+	 * KEYS, always (the planner only takes an exact one); a value the node
+	 * evaluates is extracted as a superset (lion_locate_multikey(), DESIGN.md
+	 * §17, "A query known only at run time"), and LOSSY and ALL then need
+	 * every candidate rechecked in the heap - ALL with no posting set at all.
+	 */
+	LionQueryMode qmode;
 	Relation	idx;
 	Datum		storedkey;
 	bool		hasstoredkey;
@@ -878,6 +934,16 @@ typedef struct LionCountScanState
 	LionCountStats stats;
 
 	/*
+	 * The heap recheck of the multi-key clauses whose run-time query the
+	 * posting sets could not answer exactly (DESIGN.md §17, "A query known
+	 * only at run time"), or NULL.  Built by lion_locate_where() for the
+	 * relation being counted, in wherecxt, and set on viscache, which is how
+	 * every count of this execution finds it; lion_release_where() takes it
+	 * away again.
+	 */
+	LionRowFilter *filter;
+
+	/*
 	 * Whether the statement leaves the relation being counted alone
 	 * (DESIGN.md §11, "On-access pruning sets the visibility map too").  On
 	 * PostgreSQL 19 and later that is what lets the heap recheck's on-access
@@ -933,6 +999,38 @@ typedef struct LionCountScanState
 	int64		joinfilterrows;
 
 	/*
+	 * The forward semi join over a non-unique key (DESIGN.md §27, "Forward
+	 * semi joins over a non-unique key"): joinunique says each key is counted
+	 * once however many child rows carry it.  The keys of the child's rows go
+	 * into joinsort first, a datum sort by joinsortop under joinsortcoll, and
+	 * a key joineqfn finds equal to the previous distinct one, joinprevkey
+	 * (in joinkeycxt), is skipped; each distinct key is handed on as the key
+	 * column of joinsortslot, a row of the child's shape whose other columns
+	 * nothing reads.  joinkeypos numbers the distinct keys, and in a parallel
+	 * plan joinchunk is the run of them this participant claimed last, -1
+	 * before the first.  joinsorted is the keys sorted, and joinsortstats
+	 * what the sort did, for EXPLAIN ANALYZE.
+	 */
+	bool		joinunique;
+	Oid			joinsortop;
+	Oid			joinsortcoll;
+	FmgrInfo	joineqfn;
+	Oid			joinkeytype;
+	bool		joinkeybyval;
+	int16		joinkeylen;
+	Tuplesortstate *joinsort;
+	bool		joinsortdone;
+	TupleTableSlot *joinsortslot;
+	MemoryContext joinkeycxt;
+	Datum		joinprevkey;
+	bool		joinhaveprev;
+	int64		joinkeypos;
+	int64		joinchunk;
+	int64		joinsorted;
+	bool		joinhavesortstats;
+	TuplesortInstrumentation joinsortstats;
+
+	/*
 	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
 	 * counts the dimension rows its share of the child returns and adds what
 	 * EXPLAIN ANALYZE reports into joinshared, in the dynamic shared memory
@@ -947,13 +1045,20 @@ typedef struct LionCountScanState
 	int64		joinworkermissing;
 	int64		joinworkerdirpages;
 	int64		joinworkerfilterrows;
+	int64		joinworkersorted;
 } LionCountScanState;
 
 /*
  * What the participants of a parallel FK-side join add up for EXPLAIN
  * ANALYZE, in the Gather's dynamic shared memory (lion_shutdown_custom_scan()).
  * filterrows is the largest copy any participant made of the fact filters,
- * -1 when none did.
+ * -1 when none did.  sorted is the keys a participant of this run sorted -
+ * every participant sorts all of them - and sortedruns the same summed over
+ * the runs before it (lion_reinitialize_dsm()).
+ *
+ * nextchunk is the one thing the participants share while they run: the next
+ * run of LION_FKJOIN_UNIQUE_CHUNK distinct keys of a forward semi join over a
+ * non-unique key that nobody has claimed yet.
  */
 typedef struct LionJoinShared
 {
@@ -963,6 +1068,9 @@ typedef struct LionJoinShared
 	int64		missing;
 	int64		dirpages;
 	int64		filterrows;
+	int64		sorted;
+	int64		sortedruns;
+	pg_atomic_uint32 nextchunk;
 } LionJoinShared;
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
@@ -1433,31 +1541,24 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 }
 
 /*
- * Extract a multi-key query at plan time and say whether the posting sets can
- * answer it exactly (DESIGN.md §17).  Only then is the clause pushed down:
- * an ALL-mode query would need every row rechecked against the heap, which is
- * what the ordinary bitmap plan already does and does better.
- *
- * *extractquery receives the support function used, which lion_match_index()
- * then insists on finding on every index that will answer the clause, so that
- * the run-time extraction cannot come out differently from this one.
+ * How extractquery answers the query in con, as the executor would ask it:
+ * lion_extract_query()'s mode for a literal, and with superset
+ * lion_extract_query_superset()'s, which is what it asks of a query it only
+ * has at run time (DESIGN.md §17, "A query known only at run time").
  */
-static bool
-lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
-							StrategyNumber strategy, Const *con,
-							Oid *extractquery)
+static LionQueryMode
+lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
+						 Const *con, bool superset)
 {
 	FmgrInfo	flinfo;
 	LionQuery	q;
 	LionState	state;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
-	bool		exact;
+	LionQueryMode mode;
 
-	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
-									  LION_EXTRACTQUERY_PROC);
-	if (!OidIsValid(*extractquery))
-		return false;
+	if (con->constisnull)
+		return LION_QMODE_NONE; /* every operator involved is strict */
 
 	/*
 	 * lion_extract_query() wants an LionState, but only for the extractQuery
@@ -1475,16 +1576,43 @@ lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
 	memset(&state, 0, sizeof(state));
 	state.multikey = true;
 	state.collation = con->constcollid;
-	fmgr_info(*extractquery, &flinfo);
+	fmgr_info(extractquery, &flinfo);
 	state.extractquery = flinfo;
 
-	lion_extract_query(&state, con->constvalue, strategy, &q);
-	exact = (q.mode == LION_QMODE_KEYS);
+	if (superset)
+		lion_extract_query_superset(&state, con->constvalue, strategy, &q);
+	else
+		lion_extract_query(&state, con->constvalue, strategy, &q);
+	mode = q.mode;
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 
-	return exact;
+	return mode;
+}
+
+/*
+ * Extract a multi-key query at plan time and say whether the posting sets can
+ * answer it exactly (DESIGN.md §17).  Only then is a LITERAL query pushed
+ * down: an ALL-mode query would need every row rechecked against the heap,
+ * which is what the ordinary bitmap plan already does and does better.
+ *
+ * *extractquery receives the support function used, which lion_match_index()
+ * then insists on finding on every index that will answer the clause, so that
+ * the run-time extraction cannot come out differently from this one.
+ */
+static bool
+lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
+							StrategyNumber strategy, Const *con,
+							Oid *extractquery)
+{
+	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
+									  LION_EXTRACTQUERY_PROC);
+	if (!OidIsValid(*extractquery))
+		return false;
+
+	return lion_multikey_query_mode(*extractquery, strategy, con,
+									false) == LION_QMODE_KEYS;
 }
 
 /*
@@ -2540,6 +2668,10 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 
 static bool *lion_or_leaf_map(List *ors, int nclause);
 static int *lion_or_group_map(List *ors, int nclause);
+static Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
+							  List *whereidx, List *wherecol,
+							  List *whereclauses, List *wherekinds, List *ors,
+							  double matched, double counts, double ceiling);
 
 /*
  * Does an IN list's source take the disjoint-sum short-circuit of DESIGN.md
@@ -2735,7 +2867,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
-	double		matching = Max(rel->rows, 1.0);
+	double		matching = Max(lion_probe_rel_rows(root, rel), 1.0);
 	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		sel = Min(Max(rangesel, 1e-10), 1.0);
@@ -2873,7 +3005,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		dirty_pages;
-	double		matching = Max(rel->rows, 1.0);
+	double		matching = Max(lion_probe_rel_rows(root, rel), 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
 	double		random_pages = 0;	/* directory leaves, one per lookup */
 	Cost		descent_cost = 0;	/* comparisons on the way down (§21) */
@@ -3710,6 +3842,16 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->driveidx[0] != NULL);
 
 		/*
+		 * A multi-key query the node only has at run time may need its
+		 * candidates rechecked in the heap, one count - one group, one test -
+		 * at a time (DESIGN.md §17, "A query known only at run time").
+		 */
+		run += lion_cost_recheck(root, t->rel, t->whereidx, t->wherecol,
+								 whereclauses, wherekinds, ors,
+								 lion_probe_rel_rows(root, t->rel), numgroups,
+								 t->rel->tuples);
+
+		/*
 		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
 		 * entry it visits, in each relation it walks - a partition's entries
 		 * are its own.  A count(DISTINCT) walk already pays its per-test cost
@@ -3739,18 +3881,28 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 }
 
 /*
- * How many posting sets a multi-key clause's query is made of (DESIGN.md
- * §17): the keys its extraction yields, which is what a count merges at every
- * container key it asks the clause about.  The clause's value is always a
- * literal - only an exact extraction of one is pushed down
- * (lion_multikey_query_is_exact()) - so it is extracted again here the same
- * way; anything unexpected answers 1, the old price.
+ * How a multi-key clause will be answered (DESIGN.md §17), and how many
+ * posting sets its query is made of: the keys its extraction yields, which is
+ * what a count merges at every container key it asks the clause about.
+ *
+ * A literal is extracted again the way the executor extracts it, exactly -
+ * only an exact extraction of a literal is pushed down
+ * (lion_multikey_query_is_exact()).  A value the executor only has at run
+ * time comes here as its plan-time estimate when there is one (the clause
+ * lion_analyze_leaf() gave the cost model carries it), extracted as the
+ * executor will extract the run-time value: exactly, as a superset to be
+ * rechecked, or as every row.  With no estimate at all - a generic plan's
+ * parameter - the query's shape is unknown, and it is taken to be the
+ * expensive one, every row, as lioncostestimate() takes it for a bitmap scan.
+ * Anything unexpected answers one set, the old price.
  */
-static double
-lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
+static LionQueryMode
+lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col, Node *clause,
+						double *nkeys)
 {
 	OpExpr	   *op;
-	Const	   *con = NULL;
+	Node	   *arg;
+	Const	   *con;
 	Oid			opfamily;
 	Oid			lefttype;
 	Oid			proc;
@@ -3760,22 +3912,20 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	LionState	state;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
-	double		nkeys;
-	ListCell   *lc;
 
+	*nkeys = 1.0;
 	if (clause == NULL || !IsA(clause, OpExpr) || col < 1 ||
-		col > idx->nkeycolumns)
-		return 1.0;
+		col > idx->nkeycolumns || list_length(((OpExpr *) clause)->args) != 2)
+		return LION_QMODE_KEYS;
 	op = (OpExpr *) clause;
-	foreach(lc, op->args)
-	{
-		Node	   *arg = lion_strip((Node *) lfirst(lc));
 
-		if (arg != NULL && IsA(arg, Const))
-			con = (Const *) arg;
-	}
-	if (con == NULL || con->constisnull)
-		return 1.0;
+	/* the column is the left operand of a multi-key clause, the query the right */
+	arg = lion_strip((Node *) lsecond(op->args));
+	if (arg == NULL || !IsA(arg, Const))
+		return LION_QMODE_ALL;
+	con = (Const *) arg;
+	if (con->constisnull)
+		return LION_QMODE_NONE;
 
 	opfamily = idx->opfamily[col - 1];
 	lefttype = idx->opcintype[col - 1];
@@ -3783,7 +3933,7 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	proc = get_opfamily_proc(opfamily, lefttype, lefttype,
 							 LION_EXTRACTQUERY_PROC);
 	if (strategy == 0 || !OidIsValid(proc))
-		return 1.0;
+		return LION_QMODE_KEYS;
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"roaring count query keys",
@@ -3795,13 +3945,100 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	state.collation = con->constcollid;
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
-	lion_extract_query(&state, con->constvalue, (StrategyNumber) strategy, &q);
-	nkeys = (q.mode == LION_QMODE_KEYS) ? Max((double) q.nkeys, 1.0) : 1.0;
+
+	/* a query the exact extraction answers comes out the same either way */
+	lion_extract_query_superset(&state, con->constvalue,
+								(StrategyNumber) strategy, &q);
+	if (q.mode == LION_QMODE_KEYS || q.mode == LION_QMODE_LOSSY)
+		*nkeys = Max((double) q.nkeys, 1.0);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 
+	return q.mode;
+}
+
+static double
+lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
+{
+	double		nkeys;
+
+	(void) lion_multikey_cost_mode(idx, col, clause, &nkeys);
 	return nkeys;
+}
+
+/*
+ * The heap recheck of the multi-key clauses whose query the node only has at
+ * run time (DESIGN.md §17, "A query known only at run time"), over `matched`
+ * rows of `rel` - the rows every clause selects - counted `counts` times over
+ * (once per group, per test of a count(DISTINCT) walk, or per dimension row
+ * of the FK-side join), and never more than `ceiling` candidates.
+ *
+ * How each clause will be answered is asked of its plan-time estimate
+ * (lion_multikey_cost_mode()): exactly, which needs no recheck and costs
+ * nothing here; as a superset, whose candidates are taken to be the rows the
+ * clause selects - a floor, since the estimate says the superset is wider but
+ * not by how much; or as every row, whose candidates are then every row the
+ * OTHER clauses select - with no other clause, every row of the relation,
+ * read by a sequential scan (lion_count_heap_filtered()).  A value with no
+ * estimate at all is that last case.
+ *
+ * Each candidate is fetched, whatever the visibility map says - the map
+ * vouches for visibility and not for the filter - on the pages each count
+ * reads for itself (a filtered recheck keeps no visibility cache), and tested
+ * at the clauses' own evaluation cost.  §10's recheck of the dirty pages is
+ * still charged beside it by the caller; it is the smaller of the two.
+ */
+static Cost
+lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
+				  List *wherecol, List *whereclauses, List *wherekinds,
+				  List *ors, double matched, double counts, double ceiling)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		cand = Max(matched, 1.0);
+	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
+	Cost		perrow = cpu_tuple_cost;
+	bool		any = false;
+	double		pages;
+	int			ci = 0;
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+	ListCell   *lc4;
+
+	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
+	{
+		Node	   *clause = (Node *) lfirst(lc2);
+		bool		inor = (orgrp[ci++] >= 0);
+		LionQueryMode mode;
+		double		nkeys;
+		QualCost	qual_cost;
+
+		/* an OR leaf's query is always a literal (lion_analyze_leaf()) */
+		if (lfirst_int(lc3) != LION_CLAUSE_MULTI || inor)
+			continue;
+		mode = lion_multikey_cost_mode((IndexOptInfo *) lfirst(lc1),
+									   (AttrNumber) lfirst_int(lc4), clause,
+									   &nkeys);
+		if (mode != LION_QMODE_LOSSY && mode != LION_QMODE_ALL)
+			continue;
+
+		any = true;
+		cost_qual_eval_node(&qual_cost, clause, root);
+		perrow += qual_cost.per_tuple;
+		if (mode == LION_QMODE_ALL)
+			cand /= Max(clause_selectivity(root, clause, 0, JOIN_INNER, NULL),
+						1e-10);
+	}
+	pfree(orgrp);
+	if (!any)
+		return 0.0;
+
+	cand = Min(cand, Max(ceiling, 1.0));
+	pages = Min(cand, heap_pages * Max(counts, 1.0));
+
+	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
+		cand * perrow;
 }
 
 /*
@@ -3848,7 +4085,11 @@ lion_parallel_divisor(int workers)
 
 /*
  * Cost the FK-side join (DESIGN.md §27) over the fact relation `rel`, for
- * `dimrows` dimension rows; the child plan's own cost is the caller's to add.
+ * `dimrows` dimension rows, `found` of which have an entry in the fk index;
+ * the child plan's own cost is the caller's to add.  A key without an entry
+ * costs its descent and nothing more.  Every caller but the forward semi join
+ * over a non-unique key takes every row to find one (found = dimrows), which
+ * is what an fk into a dimension key is expected to do.
  *
  * What the node does per dimension row: one lookup of the key in the fk
  * index - a directory descent, whose leaf is charged at lion_heap_page_cost()'s
@@ -3897,7 +4138,7 @@ static Cost
 lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 					 Var *fkvar, int joinclause, List *whereclauses,
 					 List *wherekinds, List *ors, double dimrows,
-					 bool exists, bool *collect)
+					 double found, bool exists, bool *collect)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -3909,7 +4150,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	int		   *orgrp = lion_or_group_map(ors, nclause);
 	int			nsrc = list_length(ors);
 	double	   *srcsets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	double	   *srcprobesets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
 	double	   *srcmembers = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	double		probesets;
 	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		nd;
 	double		perkey;
@@ -3940,6 +4183,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	ListCell   *lc4;
 
 	dimrows = Max(dimrows, 1.0);
+	found = Min(Max(found, 1.0), dimrows);
 	*collect = false;
 
 	/* How many rows one key of the fk column has, and in how many containers. */
@@ -3967,7 +4211,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	run += lookups * lion_heap_page_cost(root, rel, lookups,
 										 Max((double) fkidx->pages, 1.0));
 	run += dimrows * (height + 1.0) * LION_DESCENT_COST;
-	run += Min(dimrows * container_pages / nd, container_pages) * seq_page_cost;
+	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
 	forfour(lc1, t->whereidx, lc2, whereclauses, lc3, wherekinds,
@@ -3990,9 +4234,11 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		}
 
 		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		probesets = 0.0;
 		if (IsA(clause, ScalarArrayOpExpr))
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+			Node	   *array = lion_strip((Node *) lsecond(saop->args));
 
 #if PG_VERSION_NUM >= 170000
 			nkeys = Max(estimate_array_length(root,
@@ -4002,10 +4248,28 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 			nkeys = Max(estimate_array_length((Node *) lsecond(saop->args)),
 						1.0);
 #endif
+
+			/*
+			 * An array whose length the planner cannot see - a parameter; an
+			 * expression comes here as its plan-time estimate
+			 * (lion_analyze_leaf()) - is located and collected once for
+			 * whatever it turns out to hold, and priced once at
+			 * estimate_array_length()'s guess.  But a count that PROBES the
+			 * filters builds its union again per dimension row, so there it
+			 * is priced as the longest list a literal may be: underpricing a
+			 * scan's one-off work costs a little, underpricing a dimension
+			 * row's costs that many times over (the 2026-09-23 review's
+			 * 43,000 values over 20,000 dimension rows ran for minutes).
+			 */
+			if (array == NULL ||
+				(!IsA(array, Const) && !IsA(array, ArrayExpr)))
+				probesets = Max(nkeys, (double) LION_MAX_ARRAY_ELEMS);
 		}
 		else if (kind == LION_CLAUSE_MULTI)
 			nkeys = lion_multikey_nkeys(idx, (AttrNumber) lfirst_int(lc4),
 										clause);
+		if (probesets <= 0.0)
+			probesets = nkeys;
 
 		/*
 		 * Which source of the AND the clause's sets belong to: its OR's, or
@@ -4017,6 +4281,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		 */
 		sno = (orgrp[ci] >= 0) ? orgrp[ci] : nsrc + ci;
 		srcsets[sno] += nkeys;
+		srcprobesets[sno] += probesets;
 		srcmembers[sno] += tuples * ((kind == LION_CLAUSE_MULTI) ?
 									 Min(sel * nkeys, 1.0) : sel);
 		ci++;
@@ -4055,24 +4320,24 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		call = lion_containers_for(heap_pages, srcmembers[sno]);
 		cs = Min(cfk, call);
 		probes += cs;
-		if (srcsets[sno] > 1.0)
-		{
-			probed += dimrows *
-				(srcsets[sno] * LION_FKJOIN_SET_COST +
-				 lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
+		if (srcprobesets[sno] > 1.0)
+			probed += found *
+				(srcprobesets[sno] * LION_FKJOIN_SET_COST +
+				 lion_merge_ops(heap_pages, srcmembers[sno], srcprobesets[sno]) *
 				 Min(cs / ckeys, 1.0) * readshare * cpu_operator_cost);
+		if (srcsets[sno] > 1.0)
 			collected += srcsets[sno] * LION_FKJOIN_SET_COST +
 				lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
 				cpu_operator_cost;
-		}
 		if (drive < 0.0 || call < drive)
 			drive = call;
 	}
 	pfree(orgrp);
 	pfree(srcsets);
+	pfree(srcprobesets);
 	pfree(srcmembers);
 
-	probed += dimrows * probes * readshare * LION_FKJOIN_PROBE_COST;
+	probed += found * probes * readshare * LION_FKJOIN_PROBE_COST;
 
 	/*
 	 * What the collected copy holds and how large it is: the filters' rows, in
@@ -4083,16 +4348,16 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	copybytes = copyckeys * (LION_CONTAINER_HDRSZ + sizeof(LionContainer *) +
 							 Min(2.0 * filtered / copyckeys,
 								 (double) LION_BITSET_BYTES));
-	probed += dimrows * LION_FKJOIN_COUNT_COST;
+	probed += found * LION_FKJOIN_COUNT_COST;
 	if (npositive > 0)
 	{
 		collected += drive * 2.0 * cpu_operator_cost +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
 			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
-		collected += dimrows * (LION_FKJOIN_COPY_COUNT_COST +
-								Min(cfk, copyckeys) * readshare *
-								(LION_FKJOIN_COPY_PROBE_COST +
-								 perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
+		collected += found * (LION_FKJOIN_COPY_COUNT_COST +
+							  Min(cfk, copyckeys) * readshare *
+							  (LION_FKJOIN_COPY_PROBE_COST +
+							   perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
 
 		if (copybytes <= (double) get_hash_memory_limit() &&
 			collected < probed)
@@ -4105,20 +4370,20 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	 * are (lion_merge_cpu_cost(): LION_CONTAINER_COST, and LION_MEMBER_COST a
 	 * member of them).
 	 */
-	run += dimrows * cfk * readshare *
+	run += found * cfk * readshare *
 		(LION_CONTAINER_COST + LION_MEMBER_COST * Min(perkey / cfk,
 													   LION_MEMBER_CAP));
 
 	/* ---- the heap the visibility map cannot vouch for ---- */
-	matched = Min(dimrows * perkey, tuples) * wheresel * readshare;
+	matched = Min(found * perkey, tuples) * wheresel * readshare;
 	recheck_tids = matched * dirtyfrac;
 	recheck_pages = Min(recheck_tids, heap_pages * dirtyfrac);
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											   heap_pages);
 	run += recheck_tids * LION_RECHECK_TID_COST;
 
-	/* ---- a partial row per dimension row ---- */
-	run += dimrows * cpu_tuple_cost;
+	/* ---- a partial row per dimension row that finds one ---- */
+	run += found * cpu_tuple_cost;
 
 	return run;
 }
@@ -4327,6 +4592,110 @@ lion_boolean_not_test(Node *clause)
 }
 
 /*
+ * The walker of lion_or_arms(): node in disjunctive normal form, as a list of
+ * arms that are each the list of their leaves, with the number of leaves of
+ * them all in *nleaves; NIL once that number would pass LION_MAX_ARRAY_ELEMS.
+ */
+static List *
+lion_or_dnf(Node *node, int *nleaves)
+{
+	BoolExpr   *orform = lion_boolean_not_test(node);
+	List	   *result;
+	double		total;
+	ListCell   *lc;
+
+	check_stack_depth();
+
+	if (orform != NULL)
+		node = (Node *) orform;
+
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == OR_EXPR)
+	{
+		result = NIL;
+		total = 0;
+		foreach(lc, ((BoolExpr *) node)->args)
+		{
+			int			n;
+			List	   *sub = lion_or_dnf((Node *) lfirst(lc), &n);
+
+			if (sub == NIL)
+				return NIL;
+			total += n;
+			if (total > LION_MAX_ARRAY_ELEMS)
+				return NIL;
+			result = list_concat(result, sub);
+		}
+		*nleaves = (int) total;
+		return result;
+	}
+
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		/* one empty arm, which the first term's arms extend */
+		result = list_make1(NIL);
+		total = 0;
+		foreach(lc, ((BoolExpr *) node)->args)
+		{
+			int			n;
+			List	   *sub = lion_or_dnf((Node *) lfirst(lc), &n);
+			List	   *product = NIL;
+			ListCell   *la;
+			ListCell   *lb;
+
+			if (sub == NIL)
+				return NIL;
+
+			/* every arm so far ANDed with every arm of this term */
+			total = total * list_length(sub) + (double) n * list_length(result);
+			if (total > LION_MAX_ARRAY_ELEMS)
+				return NIL;
+			foreach(la, result)
+			{
+				foreach(lb, sub)
+					product = lappend(product,
+									  list_concat_copy((List *) lfirst(la),
+													   (List *) lfirst(lb)));
+			}
+			result = product;
+		}
+		*nleaves = (int) total;
+		return result;
+	}
+
+	/* a leaf, for lion_analyze_leaf() to accept or decline */
+	*nleaves = 1;
+	return list_make1(list_make1(node));
+}
+
+/*
+ * An OR restriction as the arms of one union (DESIGN.md §19): a list of arms,
+ * each the list of the clauses it ANDs, or NIL when it is too big to count.
+ *
+ * The OR machinery takes an OR of ANDs of leaves, one level deep, because
+ * that is what a source's tree is built from (lion_locate_or()).  Anything
+ * nested deeper is DISTRIBUTED into that shape: `(a AND (b OR c)) OR d` is
+ * `(a AND b) OR (a AND c) OR d`, and `(a AND flag IS NOT TRUE) OR d` - whose
+ * `flag IS NOT TRUE` is `flag = false OR flag IS NULL` (lion_boolean_not_test())
+ * and used to decline the whole query - is `(a AND flag = false) OR (a AND
+ * flag IS NULL) OR d`.  The union of the arms is the same set of rows.
+ *
+ * Distributing repeats a term in every arm it is distributed into, and each
+ * repetition is a leaf of its own: its own lookup, priced as such, and its own
+ * posting set in the union.  An AND of k two-way ORs is 2^k arms of k leaves.
+ * So the leaves of the result are bounded by the number an IN list's sets are
+ * (LION_MAX_ARRAY_ELEMS, DESIGN.md §15), for the same reason: every set of the
+ * union may hold a buffer pin for as long as the node runs (§9), and an OR's
+ * leaves are never materialized (§19).  Past it the query is declined.
+ */
+static List *
+lion_or_arms(Node *clause)
+{
+	int			nleaves;
+
+	return lion_or_dnf(clause, &nleaves);
+}
+
+/*
  * One WHERE clause as the analysis below understands it: which column it
  * constrains, with what, and everything lion_match_index() will need in order
  * to find an index for it on each relation.
@@ -4362,10 +4731,20 @@ typedef struct LionLeafInfo
  * bounds the entry walk that drives the count and is not a source at all: an
  * OR's arms are sources of one union, and a range would have to be the union
  * of its entries there.
+ *
+ * allow_recheck says the same of a multi-key clause whose query the node only
+ * has at run time (DESIGN.md §17, "A query known only at run time"), which may
+ * turn out to need every candidate rechecked in the heap.  The recheck tests
+ * the clause alone, which is right for a clause the other sources are ANDed
+ * with; a leaf of an OR is not tested alone - the row passes when ANY arm
+ * holds, and the other arms' leaves are answered from posting sets and never
+ * evaluated - so under an OR the query has to be a literal the posting sets
+ * answer exactly, as before.
  */
 static bool
 lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
-				 bool allow_negated, bool allow_range, LionLeafInfo *out)
+				 bool allow_negated, bool allow_range, bool allow_recheck,
+				 LionLeafInfo *out)
 {
 	Var		   *boolvar;
 	bool		boolval;
@@ -4498,32 +4877,76 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			 * not commute - `'{a}' @> tags` is a containment the other way
 			 * round, which is strategy 4 and not pushed down - so the column
 			 * has to be the left operand.
-			 *
-			 * The QUERY, not just its value, decides whether the posting sets
-			 * can answer this clause at all, so it has to be available now: a
-			 * Param is refused here even though one is accepted for equality
-			 * (DESIGN.md §17).  `tags @> $1` with `$1 = '{}'` extracts to ALL
-			 * mode, which this node cannot answer - it has no way to recheck
-			 * the operator against the heap - and by then there would be no
-			 * plan left to fall back to.
 			 */
-			if (!IsA(left, Var) || !IsA(right, Const))
+			if (!IsA(left, Var))
 				return false;
 			out->var = (Var *) left;
 			out->val = right;
-			if (((Const *) out->val)->constisnull)
-				return false;
 
-			/*
-			 * Only an EXACT query is pushed down.  `tags @> '{}'`, `<@`, a
-			 * tsquery with NOT/phrase/prefix/weights and anything with a NULL
-			 * element all want every row rechecked in the heap, which is what
-			 * the ordinary plan does anyway.
-			 */
-			if (!lion_multikey_query_is_exact(opfamily, lefttype, out->strategy,
-											 (Const *) out->val,
-											 &out->extractquery))
-				return false;
+			if (IsA(right, Const))
+			{
+				if (((Const *) out->val)->constisnull)
+					return false;
+
+				/*
+				 * A literal query's SHAPE is known now, so only an EXACT one
+				 * is pushed down.  `tags @> '{}'`, a tsquery with
+				 * NOT/phrase/prefix/weights and anything with a NULL element
+				 * want rows rechecked in the heap, which is what the ordinary
+				 * plan does anyway.
+				 */
+				if (!lion_multikey_query_is_exact(opfamily, lefttype,
+												 out->strategy,
+												 (Const *) out->val,
+												 &out->extractquery))
+					return false;
+			}
+			else
+			{
+				Node	   *est;
+
+				/*
+				 * A query the node only has at run time: a generic plan's
+				 * `tags @> $1`, `tsv @@ to_tsquery(current_setting(...))`
+				 * (DESIGN.md §17, "A query known only at run time").  Its
+				 * shape decides whether the posting sets answer it exactly,
+				 * and the shape is not known until the executor has the value
+				 * - `$1 = '{}'` is every row, a phrase is its lexemes' rows
+				 * and more - so the node cannot decline the ones they do not
+				 * answer.  It answers them from a SUPERSET instead and
+				 * rechecks every candidate in the heap
+				 * (lion_extract_query_superset(), LionRowFilter), which is
+				 * exact for every value the clause can take.  A value the
+				 * executor evaluates once per scan qualifies, by the rule
+				 * equality follows (lion_is_value_expr()), and so does the
+				 * `ARRAY[$1, $2]` a generic plan keeps for an array written
+				 * out of parameters.
+				 */
+				if (!allow_recheck || !lion_is_value_expr(right, true))
+					return false;
+				out->extractquery = get_opfamily_proc(opfamily, lefttype,
+													  lefttype,
+													  LION_EXTRACTQUERY_PROC);
+				if (!OidIsValid(out->extractquery))
+					return false;
+
+				/*
+				 * The cost model extracts the plan-time estimate of the value
+				 * the way the executor will extract the value itself
+				 * (lion_multikey_cost_mode()), so it is handed the clause
+				 * over that estimate; a value without one - a Param - is
+				 * priced as the expensive shape.  The executor evaluates the
+				 * expression, never the estimate.
+				 */
+				est = estimate_expression_value(root, right);
+				if (IsA(est, Const))
+					out->costclause = (Node *)
+						make_opclause(op->opno, op->opresulttype,
+									  op->opretset,
+									  (Expr *) linitial(op->args),
+									  (Expr *) est,
+									  op->opcollid, op->inputcollid);
+			}
 
 			out->opno = op->opno;
 			out->cmptype = InvalidOid;	/* the query is not a key */
@@ -5027,16 +5450,17 @@ lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
  *
  *	- a column of the dimension: its values come out of the dimension's
  *	  tuples, as they would out of the join's;
- *	- the fact's join column, in an inner join, which the rows carry as the
- *	  dimension's key.  Every fact value a dimension row joins is equal to
- *	  that row's key under the join's operator; if that is the equality the
- *	  DISTINCT compares with - the same operator or one of its btree or hash
- *	  family (equality_ops_are_compatible()) - under the same collation, then
- *	  the fact values of one dimension row are one distinct value, and the
- *	  key is it.  Two dimension rows with equal keys are one value too, which
- *	  the Agg's own DISTINCT sees: uniqueness is not what makes this exact.
- *	  The key is emitted where the fact's column stands, so the two have to be
- *	  of one type.
+ *	- the fact's join column, in an inner join (and in the forward semi join
+ *	  over a non-unique key, an inner join over the distinct keys), which the
+ *	  rows carry as the dimension's key.  Every fact value a dimension row
+ *	  joins is equal to that row's key under the join's operator; if that is
+ *	  the equality the DISTINCT compares with - the same operator or one of
+ *	  its btree or hash family (equality_ops_are_compatible()) - under the
+ *	  same collation, then the fact values of one dimension row are one
+ *	  distinct value, and the key is it.  Two dimension rows with equal keys
+ *	  are one value too, which the Agg's own DISTINCT sees: uniqueness is not
+ *	  what makes this exact.  The key is emitted where the fact's column
+ *	  stands, so the two have to be of one type.
  *
  * No FILTER, no ORDER BY, one argument; the Agg evaluates the rest.
  */
@@ -5073,7 +5497,7 @@ lion_fkjoin_agg_is_distinct(Aggref *agg, const LionFkJoin *fj)
 
 	if (v->varno != fj->fkvar->varno || v->varattno != fj->fkvar->varattno)
 		return false;
-	if (fj->jointype != JOIN_INNER)
+	if (fj->jointype != JOIN_INNER && fj->jointype != JOIN_UNIQUE_INNER)
 		return false;
 	if (fj->fkvar->vartype != fj->pkvar->vartype)
 		return false;
@@ -5090,22 +5514,65 @@ lion_fkjoin_agg_is_distinct(Aggref *agg, const LionFkJoin *fj)
 /*
  * The custom_private of an FK-side join path (DESIGN.md §27): the members
  * lion_try_fkjoin_path() built, with the join member of this path - the
- * clause, the kind of join and the flags - in LION_PRIV_JOIN.
+ * clause, the kind of join, the flags, and the sort operator and collation of
+ * a forward semi join's distinct keys - in LION_PRIV_JOIN.  The operator and
+ * the collation are OIDs in an IntList, which casting to int and back keeps.
  */
 static List *
-lion_fkjoin_private(List *base, int joinclause, int jointype, int flags)
+lion_fkjoin_private(List *base, int joinclause, int jointype, int flags,
+					Oid sortop, Oid sortcoll)
 {
 	List	   *priv = list_copy(base);
 
 	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
-		list_make3_int(joinclause, jointype, flags);
+		list_make5_int(joinclause, jointype, flags, (int) sortop,
+					   (int) sortcoll);
 	return priv;
+}
+
+/*
+ * What making the keys of a forward semi join over a non-unique key distinct
+ * costs (DESIGN.md §27, "Forward semi joins over a non-unique key"): the keys
+ * of `rows` child rows, `width` bytes each, sorted, and each taken out of the
+ * sort again and compared with the previous distinct key.  All of it comes
+ * before the first key is looked up.  A datum sort holds three words a key,
+ * and the key itself when it is passed by reference; past work_mem it writes
+ * its keys out and reads them back once, three quarters of the pages in
+ * sequence, as core's cost_tuplesort() charges one merge pass.
+ */
+static Cost
+lion_fkjoin_sort_cost(double rows, int width)
+{
+	double		n = Max(rows, 2.0);
+	double		bytes = n * (MAXALIGN(width) + 3 * sizeof(Datum));
+	Cost		cost;
+
+	cost = LION_FKJOIN_SORT_COMPARE_COST * n * (log(n) / log(2.0)) +
+		LION_FKJOIN_SORT_KEY_COST * n;
+	if (bytes > work_mem * 1024.0)
+		cost += 2.0 * ceil(bytes / BLCKSZ) *
+			(0.75 * seq_page_cost + 0.25 * random_page_cost);
+	return cost;
 }
 
 /*
  * One FK-side join path (DESIGN.md §27) over `child` - the dimension's
  * cheapest path, or, with `workers` above zero, its cheapest partial path run
  * by that many workers - and what goes above it into the grouped rel.
+ *
+ * A forward semi join over a non-unique key (fj->jointype JOIN_UNIQUE_INNER)
+ * is different on both counts.  `dimrows` is its DISTINCT keys, which are what
+ * the node looks up, `found` those of them expected to have fact rows at all,
+ * and the child is always a whole path of the dimension, whose rows the node
+ * sorts to make the keys distinct before it looks any up.  In a parallel plan
+ * every participant runs that whole child and sorts all of it - a partial
+ * child would give each participant keys the others may have too, and a key
+ * counted by two participants counts its fact rows twice - and the
+ * participants divide the sorted, distinct keys among themselves instead, in
+ * runs of LION_FKJOIN_UNIQUE_CHUNK (lion_join_next_key()).  So the child and
+ * the sort are charged to every participant in full, as the fact filters'
+ * copy is, and the lookups and counts are one participant's share of the
+ * keys.
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
@@ -5129,31 +5596,66 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 					  int workers, PathTarget *nodetarget, List *base,
 					  int joinclause, int jointype, bool emitrows,
 					  List *whereclauses, List *wherekinds, List *ors,
-					  double dimrows, bool parallel_safe)
+					  double dimrows, double found, bool parallel_safe)
 {
 	Query	   *parse = root->parse;
 	CustomPath *cpath;
 	Path	   *input;
 	bool		partial = (workers > 0);
+	bool		unique = (fj->jointype == JOIN_UNIQUE_INNER);
 	double		divisor = partial ? lion_parallel_divisor(workers) : 1.0;
-	double		childrows = partial ?
+	double		childrows = (partial || unique) ?
 		clamp_row_est(dimrows / divisor) : clamp_row_est(child->rows);
 	double		share = Min(childrows / Max(dimrows, 1.0), 1.0);
+	double		childfound = Min(clamp_row_est(found * share), childrows);
 	double		rows;
 	double		inrows;
 	double		numgroups;
 	bool		collect;
 	Cost		run;
+	Cost		startup;
 	int			flags;
 	AggStrategy aggstrategy;
 	AggClauseCosts agg_costs;
 
 	run = lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
 							   whereclauses, wherekinds, ors, childrows,
+							   childfound,
 							   jointype != LION_JOIN_INNER || emitrows,
 							   &collect);
 	flags = (collect ? LION_JOINFLAG_COLLECT : 0) |
-		(emitrows ? LION_JOINFLAG_ROWS : 0);
+		(emitrows ? LION_JOINFLAG_ROWS : 0) |
+		(unique ? LION_JOINFLAG_UNIQUE : 0);
+
+	/*
+	 * The node starts when its child does - or, when it sorts the child's
+	 * keys first, once the whole child has run and the keys are sorted.
+	 */
+	startup = child->startup_cost;
+	if (unique)
+	{
+		startup = child->total_cost +
+			lion_fkjoin_sort_cost(child->rows, child->pathtarget->width);
+		run += startup - child->total_cost;
+	}
+
+	/*
+	 * A fact filter that is a multi-key query the node only has at run time
+	 * may need the candidates of every count rechecked in the heap (DESIGN.md
+	 * §17, "A query known only at run time"): the fact rows the keys it looks
+	 * up reach, each count reading its own.
+	 */
+	{
+		double		tuples = Max(rel->tuples, 1.0);
+		double		reach = Min(childfound * tuples /
+								lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar),
+								tuples);
+
+		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
+								 whereclauses, wherekinds, ors,
+								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
+								 childfound, reach);
+	}
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -5170,18 +5672,22 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	cpath->custom_restrictinfo = NIL;
 #endif
 	cpath->custom_private = lion_fkjoin_private(base, joinclause, jointype,
-												flags);
+												flags, fj->uniqsortop,
+												unique ? fj->collation :
+												InvalidOid);
 	cpath->methods = &lion_count_path_methods;
 
 	/*
-	 * At most one row per dimension row comes out.  A semi or anti join's
-	 * rows are exactly the join's, whose estimate the planner has made
-	 * already, as is the share of them a participant sees.
+	 * At most one row per dimension row comes out (per distinct key that has
+	 * fact rows, for a forward semi join over a non-unique key).  A semi or
+	 * anti join's rows are exactly the join's, whose estimate the planner has
+	 * made already, as is the share of them a participant sees.
 	 */
-	rows = (jointype == LION_JOIN_INNER) ? childrows :
+	rows = unique ? childfound :
+		(jointype == LION_JOIN_INNER) ? childrows :
 		clamp_row_est(Min(fj->joinrel->rows * share, childrows));
 	cpath->path.rows = rows;
-	cpath->path.startup_cost = child->startup_cost;
+	cpath->path.startup_cost = startup;
 	cpath->path.total_cost = child->total_cost + run;
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = child->disabled_nodes;
@@ -5321,6 +5827,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	List	   *ckinds = NIL;
 	List	   *base;
 	double		dimrows;
+	double		found;
 	int			jointype;
 	bool		emitrows;
 	bool		parallel;
@@ -5431,30 +5938,29 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 				continue;
 			if (v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno &&
-				fj->jointype == JOIN_INNER)
+				(fj->jointype == JOIN_INNER ||
+				 fj->jointype == JOIN_UNIQUE_INNER))
 				continue;
 			return;
 		}
 	}
 
 	/*
-	 * An IN list whose array is a parameter - or any other expression that
-	 * is not a literal list - has no length until the executor has it (§15),
-	 * and every count of this node rebuilds the list's union - so its work
-	 * per dimension row is proportional to a length the cost model cannot
-	 * see.  A single table answers such a list once; here a 43,000-value `=
+	 * An IN list whose array is a parameter, or any other expression that is
+	 * not a literal list, has no length until the executor has it (§15).  It
+	 * used to be refused here, because a count that reads the fact filters
+	 * rebuilds the list's union per dimension row, and a 43,000-value `=
 	 * ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
-	 * review), so the shape is refused.  Literal lists and `IN ($1, $2)` have
-	 * their length at plan time and are priced per set.
+	 * review).  It is taken now as a single table takes it, evaluated once
+	 * per scan and rescan (lion_eval_clause_values(), in every participant of
+	 * a parallel plan): the fact filters are collected once into a copy that
+	 * every count reads (DESIGN.md §27) whatever the list's length - a list
+	 * too long to open at once is read as a windowed union for it
+	 * (lion_count_sources_run()) - and the cost model prices the per-count
+	 * reading of an array it cannot see as the longest list a literal may be
+	 * (lion_cost_fkjoin_rel()), so that the copy is what it chooses.  An
+	 * expression's array is priced by its plan-time estimate.
 	 */
-	forboth(l1, wherekinds, l2, whereconsts)
-	{
-		Node	   *val = (Node *) lfirst(l2);
-
-		if (lfirst_int(l1) == LION_CLAUSE_ARRAY &&
-			!IsA(val, Const) && !IsA(val, ArrayExpr))
-			return;
-	}
 
 	/* ---- the join key: one more equality clause on the fact rel ---- */
 	memset(&leaf, 0, sizeof(leaf));
@@ -5485,8 +5991,38 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		return;
 	first = (LionCountTarget *) linitial(targets);
 
-	/* ---- what every path of it carries ---- */
-	dimrows = clamp_row_est(fj->dimpath->rows);
+	/*
+	 * ---- what every path of it carries ----
+	 *
+	 * The dimension rows the node looks up: the child's, or - for a forward
+	 * semi join over a non-unique key - their distinct keys, which is the
+	 * inner join the node counts (JOIN_UNIQUE_INNER is LION_JOIN_INNER with
+	 * LION_JOINFLAG_UNIQUE).  NULL is one of the groups estimate_num_groups()
+	 * counts, and one the node never looks up.
+	 */
+	if (fj->jointype == JOIN_UNIQUE_INNER)
+		dimrows = clamp_row_est(estimate_num_groups(root,
+													list_make1(fj->pkvar),
+													fj->dimpath->rows,
+													NULL, NULL));
+	else
+		dimrows = clamp_row_est(fj->dimpath->rows);
+
+	/*
+	 * Which of them find an entry of the fk index: every dimension row, as an
+	 * fk into a dimension key is expected to - except that the distinct keys
+	 * of a forward semi join are those of any set of rows, which may share
+	 * few values with the fact (`fk IN (SELECT k FROM ...)`).  Their number
+	 * is what core's own estimate of the semi join says: the fact rows it
+	 * leaves (the join rel's rows) over the rows the fact filters leave of one
+	 * key's (the fact rel's rows over the fk's distinct values).
+	 */
+	found = dimrows;
+	if (fj->jointype == JOIN_UNIQUE_INNER)
+		found = Min(dimrows,
+					clamp_row_est(fj->joinrel->rows *
+								  lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar) /
+								  Max(rel->rows, 1.0)));
 	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI :
 		(fj->jointype == JOIN_ANTI) ? LION_JOIN_ANTI : LION_JOIN_INNER;
 
@@ -5541,8 +6077,50 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
 						  fj->dimpath, 0, nodetarget, base, joinclause,
 						  jointype, emitrows, whereclauses, wherekinds, ors,
-						  dimrows, parallel && fj->dimpath->parallel_safe);
-	if (parallel && fj->dimrel->partial_pathlist != NIL)
+						  dimrows, found,
+						  parallel && fj->dimpath->parallel_safe);
+	if (parallel && fj->jointype == JOIN_UNIQUE_INNER)
+	{
+		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
+														joinclause);
+		Path	   *whole = NULL;
+		double		fkpages;
+		int			workers;
+
+		/*
+		 * A forward semi join over a non-unique key is parallel over its
+		 * whole child, which every participant runs and sorts: the sorted,
+		 * distinct keys are what they divide (lion_add_fkjoin_paths()).  So
+		 * the child has to give every participant the same rows - it may run
+		 * in a worker, and nothing in the dimension's quals is volatile,
+		 * which could keep a row in one participant and drop it in another.
+		 * It is the dimension's cheapest path that may run in a worker, which
+		 * is not its cheapest path when that is a Gather.  The workers are
+		 * what a parallel scan of the fk index pages the distinct keys read
+		 * would get, as for the other joins; there is no partial child whose
+		 * own count could be more.
+		 */
+		foreach(lc, fj->dimrel->pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (p->parallel_safe && p->param_info == NULL &&
+				(whole == NULL || compare_path_costs(p, whole, TOTAL_COST) < 0))
+				whole = p;
+		}
+		fkpages = (double) fkidx->pages *
+			Min(dimrows / lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar), 1.0);
+		workers = compute_parallel_worker(fj->dimrel, -1, fkpages,
+										  max_parallel_workers_per_gather);
+
+		if (whole != NULL && workers > 0 &&
+			!contain_volatile_functions((Node *) fj->dimrel->baserestrictinfo))
+			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+								  whole, workers, nodetarget, base,
+								  joinclause, jointype, emitrows, whereclauses,
+								  wherekinds, ors, dimrows, found, true);
+	}
+	else if (parallel && fj->dimrel->partial_pathlist != NIL)
 	{
 		Path	   *partial = (Path *) linitial(fj->dimrel->partial_pathlist);
 		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
@@ -5573,7 +6151,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
 								  partial, workers, nodetarget, base,
 								  joinclause, jointype, emitrows, whereclauses,
-								  wherekinds, ors, dimrows, true);
+								  wherekinds, ors, dimrows, dimrows, true);
 	}
 }
 
@@ -5853,7 +6431,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * but a boolean column) is declined: the complement of a posting set
 		 * is not a posting set, and under a union there is nothing to
 		 * subtract it from.  An arm `flag IS NOT TRUE` is two arms of the
-		 * same union, `flag = false` and `flag IS NULL`.
+		 * same union, `flag = false` and `flag IS NULL`, and an AND arm with
+		 * an OR inside - `flag IS NOT TRUE` among its terms, or any other -
+		 * is distributed into the arms it stands for (lion_or_arms()).
 		 *
 		 * The leaves are appended to the clause array like plain clauses, so
 		 * that an index is matched for each of them per partition and a Param
@@ -5866,63 +6446,34 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 		{
-			BoolExpr   *orexpr = (BoolExpr *) clause;
-			List	   *arms = NIL;
+			List	   *arms;
 			List	   *armlens = NIL;
 			int			orfirst = list_length(whereattnos);
 			ListCell   *la;
 
-			if (list_length(orexpr->args) < 2)
+			if (list_length(((BoolExpr *) clause)->args) < 2)
 				return;
 
-			foreach(la, orexpr->args)
-			{
-				BoolExpr   *orform = lion_boolean_not_test((Node *) lfirst(la));
-
-				if (orform != NULL)
-					arms = list_concat(arms, orform->args);
-				else
-					arms = lappend(arms, lfirst(la));
-			}
+			arms = lion_or_arms(clause);
+			if (arms == NIL)
+				return;
 
 			foreach(la, arms)
 			{
-				Node	   *arm = (Node *) lfirst(la);
-				int			nleaf = 0;
+				List	   *arm = (List *) lfirst(la);
+				ListCell   *lb;
 
-				if (IsA(arm, BoolExpr) &&
-					((BoolExpr *) arm)->boolop == AND_EXPR)
+				foreach(lb, arm)
 				{
-					ListCell   *lb;
-
-					foreach(lb, ((BoolExpr *) arm)->args)
-					{
-						if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
-											  false, false, &leaf))
-							return;
-						lion_append_clause(&leaf, (Node *) lfirst(lb), true,
-										  &whereattnos, &clauseinfos,
-										  &whereclauses, &whereconsts,
-										  &wherekinds, &whereopnos,
-										  &whereinor);
-						nleaf++;
-					}
-					if (nleaf == 0)
+					if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
+										  false, false, false, &leaf))
 						return;
-				}
-				else
-				{
-					if (!lion_analyze_leaf(root, arm, rti, false, false,
-										  &leaf))
-						return;
-					lion_append_clause(&leaf, arm, true,
+					lion_append_clause(&leaf, (Node *) lfirst(lb), true,
 									  &whereattnos, &clauseinfos,
 									  &whereclauses, &whereconsts,
 									  &wherekinds, &whereopnos, &whereinor);
-					nleaf = 1;
 				}
-
-				armlens = lappend_int(armlens, nleaf);
+				armlens = lappend_int(armlens, list_length(arm));
 			}
 
 			ors = lappend(ors,
@@ -5933,7 +6484,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			continue;
 		}
 
-		if (!lion_analyze_leaf(root, clause, rti, true, true, &leaf))
+		if (!lion_analyze_leaf(root, clause, rti, true, true, true, &leaf))
 			return;
 
 		/*
@@ -6764,8 +7315,26 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	}
 
-	lion_try_count_path(root, input_rel, output_rel,
-					   (GroupPathExtraData *) extra, NULL);
+	/*
+	 * A range past the histogram's ends is priced with the ends the
+	 * directory holds (DESIGN.md §28, "The endpoint probe").
+	 */
+	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
+	{
+		lion_try_count_path(root, input_rel, output_rel,
+						   (GroupPathExtraData *) extra, NULL);
+		return;
+	}
+	PG_TRY();
+	{
+		lion_try_count_path(root, input_rel, output_rel,
+						   (GroupPathExtraData *) extra, NULL);
+	}
+	PG_FINALLY();
+	{
+		lion_probe_end();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -7645,21 +8214,30 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->jointype = LION_JOIN_INNER;
 	st->joincollect = false;
 	st->joinrows = false;
+	st->joinunique = false;
+	st->joinsortop = InvalidOid;
+	st->joinsortcoll = InvalidOid;
 	if (join != NIL)
 	{
-		if (list_length(join) != 4 ||
+		if (list_length(join) != 6 ||
 			list_length(cscan->custom_plans) != 1)
 			elog(ERROR, "LionCount: malformed join");
 		st->joinclause = linitial_int(join);
 		st->jointype = lsecond_int(join);
 		st->joincollect = (lthird_int(join) & LION_JOINFLAG_COLLECT) != 0;
 		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
-		st->joinkeyresno = (AttrNumber) lfourth_int(join);
+		st->joinunique = (lthird_int(join) & LION_JOINFLAG_UNIQUE) != 0;
+		st->joinsortop = (Oid) list_nth_int(join, 3);
+		st->joinsortcoll = (Oid) list_nth_int(join, 4);
+		st->joinkeyresno = (AttrNumber) list_nth_int(join, 5);
 		if (st->joinclause < 0 || st->joinclause >= st->nclause ||
 			st->joinkeyresno <= 0 ||
 			(st->jointype != LION_JOIN_INNER &&
 			 st->jointype != LION_JOIN_SEMI &&
-			 st->jointype != LION_JOIN_ANTI))
+			 st->jointype != LION_JOIN_ANTI) ||
+			(st->joinunique &&
+			 (st->jointype != LION_JOIN_INNER ||
+			  !OidIsValid(st->joinsortop))))
 			elog(ERROR, "LionCount: malformed join");
 	}
 
@@ -7927,6 +8505,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 									   "LionCount clause values",
 									   ALLOCSET_SMALL_SIZES);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
+	st->filter = NULL;
 	st->writtenrels = lion_statement_written_rels(estate);
 	st->rel_read_only = false;
 
@@ -7951,11 +8530,65 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinworkerfilterrows = -1;
 	memset(&st->joinfilter, 0, sizeof(st->joinfilter));
 	st->joinfilter.pinbuf = InvalidBuffer;
+	st->joinsort = NULL;
+	st->joinsortdone = false;
+	st->joinsortslot = NULL;
+	st->joinkeycxt = NULL;
+	st->joinhaveprev = false;
+	st->joinkeypos = 0;
+	st->joinchunk = -1;
+	st->joinsorted = 0;
+	st->joinhavesortstats = false;
+	st->joinworkersorted = 0;
 	if (st->joinclause >= 0)
 	{
 		st->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
 								 estate, eflags);
 		node->custom_ps = list_make1(st->child);
+	}
+
+	/*
+	 * A forward semi join over a non-unique key (DESIGN.md §27) sorts the
+	 * child's rows by their key and compares neighbours with the equality of
+	 * the sort operator's btree family, which is the join operator's family
+	 * (lion_fkjoin_recognize()) for the key's own type.
+	 */
+	if (st->joinunique)
+	{
+		TupleDesc	childdesc = ExecGetResultType(st->child);
+		Form_pg_attribute keyatt;
+		Oid			eqop;
+
+		if (st->joinkeyresno > childdesc->natts)
+			elog(ERROR, "LionCount: malformed join");
+
+		/*
+		 * Only the key comes out of the sort, so the key is the only column
+		 * of the child the target list may read: the dimension of a forward
+		 * semi join is not visible to the query above it, and what the join
+		 * rows of a count(DISTINCT) carry is the key (lion_plan_fkjoin_path()).
+		 */
+		for (i = 0; i < st->ntlist; i++)
+		{
+			if (LION_TL_IS_CHILDCOL(st->tlkind[i]) &&
+				LION_TL_CHILDRESNO(st->tlkind[i]) != st->joinkeyresno)
+				elog(ERROR, "LionCount: a distinct-key join reads a column other than its key");
+		}
+
+		keyatt = TupleDescAttr(childdesc, st->joinkeyresno - 1);
+		st->joinkeytype = keyatt->atttypid;
+		st->joinkeybyval = keyatt->attbyval;
+		st->joinkeylen = keyatt->attlen;
+		eqop = get_equality_op_for_ordering_op(st->joinsortop, NULL);
+		if (!OidIsValid(eqop))
+			elog(ERROR, "could not find equality operator for ordering operator %u",
+				 st->joinsortop);
+		fmgr_info_cxt(get_opcode(eqop), &st->joineqfn, estate->es_query_cxt);
+		st->joinsortslot = ExecInitExtraTupleSlot(estate, childdesc,
+												  &TTSOpsVirtual);
+		st->joinkeycxt = AllocSetContextCreate(estate->es_query_cxt,
+											   "LionCount join key",
+											   ALLOCSET_SMALL_SIZES);
 	}
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
@@ -8189,29 +8822,54 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
  * costed with.  The tree becomes the source's combining expression; the
  * merge in lion_count.c evaluates it over the sets with the same cursors it
  * uses for an IN list, so the DESIGN.md §9 pin discipline is unchanged.
+ *
+ * A query the node only has at run time - a Param, a stable expression - is
+ * extracted as a SUPERSET instead (DESIGN.md §17, "A query known only at run
+ * time"), and cl->qmode says how it came out: KEYS is what a literal gives;
+ * LOSSY locates the keys of a wider tree; NONE and ALL locate nothing, NONE
+ * because no row can match and ALL because every row may.  The caller makes
+ * the last two no source at all and a source that selects nothing, and
+ * rechecks LOSSY and ALL in the heap (lion_build_filter()).
  */
 static int
 lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 					LionKeyNode **tree)
 {
 	LionState   *istate = lion_index_column_state(cl->idx, cl->idxcol);
+	StrategyNumber strategy;
 	LionQuery	q;
 	int			i;
 
-	lion_extract_query(istate, cl->val,
-					  (StrategyNumber) get_op_opfamily_strategy(cl->opno,
-																cl->idx->rd_opfamily[cl->idxcol - 1]),
-					  &q);
+	strategy = (StrategyNumber)
+		get_op_opfamily_strategy(cl->opno,
+								 cl->idx->rd_opfamily[cl->idxcol - 1]);
 
-	/*
-	 * The plan was only made because this extraction came out exact
-	 * (lion_multikey_query_is_exact()), against this very function and this
-	 * very constant.  A different answer now would mean the count could
-	 * silently miss rows, so say so instead.
-	 */
-	if (q.mode != LION_QMODE_KEYS)
-		elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
-			 RelationGetRelationName(cl->idx));
+	if (cl->con == NULL)
+	{
+		lion_extract_query_superset(istate, cl->val, strategy, &q);
+		cl->qmode = q.mode;
+		if (q.mode != LION_QMODE_KEYS && q.mode != LION_QMODE_LOSSY)
+		{
+			*sets = NULL;
+			*tree = NULL;
+			return 0;
+		}
+	}
+	else
+	{
+		lion_extract_query(istate, cl->val, strategy, &q);
+
+		/*
+		 * The plan was only made because this extraction came out exact
+		 * (lion_multikey_query_is_exact()), against this very function and
+		 * this very constant.  A different answer now would mean the count
+		 * could silently miss rows, so say so instead.
+		 */
+		if (q.mode != LION_QMODE_KEYS)
+			elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+				 RelationGetRelationName(cl->idx));
+		cl->qmode = LION_QMODE_KEYS;
+	}
 
 	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(q.nkeys, 1));
 	*tree = q.tree;
@@ -8245,6 +8903,7 @@ lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
 
 	*sets = NULL;
 	*nsets = 0;
+	cl->qmode = LION_QMODE_NONE;	/* until a multi-key query says otherwise */
 
 	/*
 	 * A parameter that came out NULL selects no rows at all, whatever the
@@ -8442,6 +9101,98 @@ lion_save_clause_key(LionCountScanState *st, LionClauseState *cl,
 }
 
 /*
+ * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
+ * query known only at run time"), as a row filter over the relation being
+ * counted, set on the visibility cache every count of this execution is
+ * handed (lion_vis_cache_set_filter()) - or none, which is what every scan
+ * whose queries all came out exact gets.
+ *
+ * Each clause is `col op value`: the clause's own operator and its value as
+ * this scan evaluated it, and the column as THIS relation numbers it, which
+ * the index says (a partition may number it differently from the parent,
+ * DESIGN.md §16).  The collation is the index column's, which
+ * lion_match_index() found equal to the clause's input collation whenever
+ * the clause has one; a clause over a type that has none ignores it.
+ */
+static void
+lion_build_filter(LionCountScanState *st)
+{
+	MemoryContext oldcxt;
+	LionRowFilter *filter;
+	int			n = 0;
+	int			i;
+
+	st->filter = NULL;
+	lion_vis_cache_set_filter(st->viscache, NULL);
+
+	for (i = 0; i < st->nclause; i++)
+	{
+		LionClauseState *cl = &st->clause[i];
+
+		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
+			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
+			n++;
+	}
+	if (n == 0)
+		return;
+
+	oldcxt = MemoryContextSwitchTo(st->wherecxt);
+	filter = (LionRowFilter *) palloc0(sizeof(LionRowFilter));
+	filter->heap = st->heap;
+	filter->clauses = (LionRowFilterClause *)
+		palloc0(sizeof(LionRowFilterClause) * n);
+	filter->tmpcxt = AllocSetContextCreate(st->wherecxt,
+										   "LionCount row filter",
+										   ALLOCSET_SMALL_SIZES);
+	for (i = 0; i < st->nclause; i++)
+	{
+		LionClauseState *cl = &st->clause[i];
+		LionRowFilterClause *c;
+		Form_pg_attribute att;
+		int16		typlen;
+		bool		typbyval;
+
+		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
+			  (cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL)))
+			continue;
+
+		c = &filter->clauses[filter->nclauses++];
+		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
+		if (c->attno <= 0 || c->attno > RelationGetDescr(st->heap)->natts)
+			elog(ERROR, "LionCount: a multi-key clause on an index expression");
+		c->notnull = false;
+		c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
+		c->value = cl->val;
+		fmgr_info_cxt(get_opcode(cl->opno), &c->flinfo, st->wherecxt);
+
+		/*
+		 * The call the executor would have made for the clause, expression
+		 * included, which is what a polymorphic operator's function asks
+		 * its argument types of (get_fn_expr_argtype()).
+		 */
+		att = TupleDescAttr(RelationGetDescr(st->heap), c->attno - 1);
+		get_typlenbyval(cl->valtype, &typlen, &typbyval);
+		fmgr_info_set_expr((Node *)
+						   make_opclause(cl->opno, BOOLOID, false,
+										 (Expr *) makeVar(1, c->attno,
+														  att->atttypid,
+														  att->atttypmod,
+														  att->attcollation,
+														  0),
+										 (Expr *) makeConst(cl->valtype, -1,
+															InvalidOid,
+															typlen, cl->val,
+															false, typbyval),
+										 InvalidOid, c->collation),
+						   &c->flinfo);
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	st->filter = filter;
+	lion_vis_cache_set_filter(st->viscache, filter);
+}
+
+/*
  * Locate the posting sets of every WHERE clause of the relation the node is
  * counting.  They keep their pins (for INLINE entries) until
  * lion_release_where(), which is exactly the DESIGN.md section 9 discipline
@@ -8477,6 +9228,20 @@ lion_locate_where(LionCountScanState *st)
 
 		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
 		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
+
+		/*
+		 * A multi-key query no key narrows (DESIGN.md §17, "A query known
+		 * only at run time"): as far as this clause goes every row is a
+		 * candidate, so it is no source of the intersection - a negated
+		 * source with nothing to subtract, which is exactly how `IS NOT NULL`
+		 * over a column without NULLs reads - and the row filter below tests
+		 * it on each candidate the other sources leave.
+		 */
+		if (cl->kind == LION_CLAUSE_MULTI && cl->qmode == LION_QMODE_ALL)
+		{
+			src->negated = true;
+			continue;
+		}
 
 		/*
 		 * An IN list is one scalar index's entries, one per distinct listed
@@ -8630,6 +9395,7 @@ lion_locate_where(LionCountScanState *st)
 		st->ndsource = n;
 	}
 
+	lion_build_filter(st);
 	st->located = true;
 }
 
@@ -8654,6 +9420,11 @@ lion_release_where(LionCountScanState *st)
 		src->nomaterialize = false;
 		src->disjoint = false;
 	}
+
+	/* the row filter lives in wherecxt too, and names this relation */
+	st->filter = NULL;
+	lion_vis_cache_set_filter(st->viscache, NULL);
+
 	if (st->wherecxt != NULL)
 		MemoryContextReset(st->wherecxt);
 	st->located = false;
@@ -8795,6 +9566,61 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
  * --------------------------------------------------------------------- */
 
 /*
+ * Is any WHERE item of the relation being counted a source that SELECTS
+ * rows?  Always, except when a multi-key query no key narrows was the only
+ * one (DESIGN.md §17, "A query known only at run time"): it is no source then
+ * (lion_locate_where()), and `IS NOT NULL` only subtracts.
+ */
+static bool
+lion_where_has_positive(LionCountScanState *st)
+{
+	int			k;
+
+	for (k = 0; k < st->nitem; k++)
+	{
+		if (!st->sources[k + 1].negated)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A count with nothing to take its candidates from: every WHERE clause that
+ * selects rows was a multi-key query no key narrows, so the candidates are
+ * every row of the relation, and the heap is read once, sequentially, with
+ * the row filter - those queries - and the `IS NOT NULL` clauses tested on
+ * each row the snapshot sees.  It is the ordinary plan's work, which the
+ * cost model charged for a value it could not estimate (lion_cost_recheck()).
+ */
+static int64
+lion_count_scan_filtered(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionRowFilter scan;
+	int			k;
+
+	scan = *st->filter;
+	scan.clauses = (LionRowFilterClause *)
+		palloc0(sizeof(LionRowFilterClause) * (st->filter->nclauses + st->nitem));
+	memcpy(scan.clauses, st->filter->clauses,
+		   sizeof(LionRowFilterClause) * st->filter->nclauses);
+	for (k = 0; k < st->nitem; k++)
+	{
+		LionClauseState *cl = &st->clause[st->item[k].clauseno];
+		LionRowFilterClause *c;
+
+		if (st->item[k].orno >= 0 || cl->kind != LION_CLAUSE_NOTNULL)
+			continue;
+		c = &scan.clauses[scan.nclauses++];
+		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
+		c->notnull = true;
+	}
+
+	return lion_count_heap_filtered(st->heap, estate->es_snapshot, &scan,
+									&st->stats);
+}
+
+/*
  * The intersection of the WHERE clauses, with no index driving the count.
  */
 static int64
@@ -8810,10 +9636,13 @@ lion_count_relation(LionCountScanState *st)
 
 	MemoryContextReset(st->pergroup);
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
-	count = lion_count_sources_cached(st->heap, estate->es_snapshot,
-									 st->nitem, &st->sources[1],
-									 &st->stats, st->viscache,
-									 st->rel_read_only);
+	if (st->filter != NULL && !lion_where_has_positive(st))
+		count = lion_count_scan_filtered(st);
+	else
+		count = lion_count_sources_cached(st->heap, estate->es_snapshot,
+										 st->nitem, &st->sources[1],
+										 &st->stats, st->viscache,
+										 st->rel_read_only);
 	MemoryContextSwitchTo(oldcxt);
 
 	return count;
@@ -9822,6 +10651,115 @@ lion_join_collect(LionCountScanState *st)
 }
 
 /*
+ * The forward semi join over a non-unique key (DESIGN.md §27, "Forward semi
+ * joins over a non-unique key"): run the whole child and sort the keys of its
+ * rows, so that they come out in order and equal ones next to each other.  A
+ * NULL key joins nothing and is left out.  The sort is a datum sort of the key
+ * alone - what a Sort node over one column does - within work_mem, spilling
+ * past it as a Sort node's does, in the per-query memory, where it lives until
+ * the run is reset (lion_reset_run()).
+ */
+static void
+lion_join_sort_keys(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+	st->joinsort = tuplesort_begin_datum(st->joinkeytype, st->joinsortop,
+										 st->joinsortcoll, false, work_mem,
+										 NULL, TUPLESORT_NONE);
+	MemoryContextSwitchTo(oldcxt);
+
+	for (;;)
+	{
+		TupleTableSlot *slot;
+		Datum		key;
+		bool		isnull;
+
+		CHECK_FOR_INTERRUPTS();
+		slot = ExecProcNode(st->child);
+		if (TupIsNull(slot))
+			break;
+		key = slot_getattr(slot, st->joinkeyresno, &isnull);
+		if (isnull)
+			continue;
+		tuplesort_putdatum(st->joinsort, key, false);
+		st->joinsorted++;
+	}
+	tuplesort_performsort(st->joinsort);
+	tuplesort_get_stats(st->joinsort, &st->joinsortstats);
+	st->joinhavesortstats = true;
+	st->joinsortdone = true;
+}
+
+/*
+ * The next distinct key of the sorted child rows, as the row that carries it,
+ * or NULL when there are no more.  A row whose key the sort operator's
+ * equality - the join operator's, for the key's type - finds equal to the
+ * previous distinct key's is skipped: its fact rows are that key's, and have
+ * been counted.
+ *
+ * In a parallel plan every participant has sorted every row, so the distinct
+ * keys come out in the same sequence in each, and they are divided by their
+ * position in it: a participant counts the keys of the runs of
+ * LION_FKJOIN_UNIQUE_CHUNK it claims from the shared counter, and passes over
+ * the others, which another participant claimed.  A participant claims the
+ * run after its last one only once it has finished that one, so the counter
+ * never gives out a run behind the participant's position, and every run is
+ * counted by exactly one of them - however many start, and whether the leader
+ * takes part or not.  A plan run without its workers, or a node that is not
+ * parallel-aware, has no shared counter and counts every key.
+ */
+static TupleTableSlot *
+lion_join_next_key(LionCountScanState *st)
+{
+	TupleTableSlot *slot = st->joinsortslot;
+
+	for (;;)
+	{
+		Datum		key;
+		bool		isnull;
+		int64		chunk;
+		MemoryContext oldcxt;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!tuplesort_getdatum(st->joinsort, true, false, &key, &isnull,
+								NULL))
+			return NULL;
+		Assert(!isnull);
+		if (st->joinhaveprev &&
+			DatumGetBool(FunctionCall2Coll(&st->joineqfn, st->joinsortcoll,
+										   st->joinprevkey, key)))
+			continue;
+
+		/* the sort's copy lasts until the next key: keep one of our own */
+		ExecClearTuple(slot);
+		MemoryContextReset(st->joinkeycxt);
+		oldcxt = MemoryContextSwitchTo(st->joinkeycxt);
+		st->joinprevkey = datumCopy(key, st->joinkeybyval, st->joinkeylen);
+		MemoryContextSwitchTo(oldcxt);
+		st->joinhaveprev = true;
+
+		chunk = st->joinkeypos++ / LION_FKJOIN_UNIQUE_CHUNK;
+		if (st->joinshared != NULL)
+		{
+			if (st->joinchunk < chunk)
+				st->joinchunk = (int64)
+					pg_atomic_fetch_add_u32(&st->joinshared->nextchunk, 1);
+			if (st->joinchunk != chunk)
+				continue;
+		}
+
+		memset(slot->tts_isnull, true,
+			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
+		slot->tts_values[st->joinkeyresno - 1] = st->joinprevkey;
+		slot->tts_isnull[st->joinkeyresno - 1] = false;
+		return ExecStoreVirtualTuple(slot);
+	}
+}
+
+/*
  * The FK-side join (DESIGN.md §27): the next dimension row with fact rows, as
  * one partial row - its dimension columns and its count.
  *
@@ -9852,6 +10790,13 @@ lion_join_collect(LionCountScanState *st)
  * columns and adds the counts, which is the join's count for each group
  * because that count is a sum over the group's dimension rows - or, for
  * joinrows, it is a row core's plain Agg aggregates as it would the join's.
+ *
+ * A forward semi join over a non-unique key (joinunique) reads its rows from
+ * the sorted child instead, one per DISTINCT key (lion_join_next_key()), and
+ * counts each as an inner join counts a dimension row.  The posting sets of
+ * distinct keys are disjoint - a fact row has one fk value, and two distinct
+ * keys cannot both equal it - so the counts add up to the fact rows with at
+ * least one matching dimension row, each once: the semi join's count.
  */
 static TupleTableSlot *
 lion_next_join_row(LionCountScanState *st)
@@ -9875,6 +10820,9 @@ lion_next_join_row(LionCountScanState *st)
 		return NULL;
 	}
 
+	if (st->joinunique && !st->joinsortdone)
+		lion_join_sort_keys(st);
+
 	for (;;)
 	{
 		TupleTableSlot *childslot;
@@ -9886,7 +10834,8 @@ lion_next_join_row(LionCountScanState *st)
 		CHECK_FOR_INTERRUPTS();
 
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
-		childslot = ExecProcNode(st->child);
+		childslot = st->joinunique ? lion_join_next_key(st) :
+			ExecProcNode(st->child);
 		if (TupIsNull(childslot))
 		{
 			st->childslot = NULL;
@@ -10258,6 +11207,21 @@ lion_reset_run(LionCountScanState *st)
 	st->joincollected = false;
 	st->joinfiltered = false;
 
+	/* ... and a forward semi join's sorted keys, sorted again next run. */
+	if (st->joinsort != NULL)
+	{
+		tuplesort_end(st->joinsort);
+		st->joinsort = NULL;
+	}
+	if (st->joinsortslot != NULL)
+		ExecClearTuple(st->joinsortslot);
+	if (st->joinkeycxt != NULL)
+		MemoryContextReset(st->joinkeycxt);
+	st->joinsortdone = false;
+	st->joinhaveprev = false;
+	st->joinkeypos = 0;
+	st->joinchunk = -1;
+
 	if (st->npart > 0)
 		lion_close_relation(st);
 
@@ -10349,17 +11313,29 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	memset(shared, 0, sizeof(LionJoinShared));
 	SpinLockInit(&shared->mutex);
 	shared->filterrows = -1;
+	pg_atomic_init_u32(&shared->nextchunk, 0);
 	st->joinshared = shared;
 }
 
 /*
  * Before the workers are launched again for a rescan.  The sums are kept:
- * they are the whole execution's, as the leader's own counters are.
+ * they are the whole execution's, as the leader's own counters are.  The runs
+ * of distinct keys a forward semi join's participants claim start again from
+ * the first, since the rescan's keys are sorted again (and may be others).
+ * No participant is running: the Gather has shut the workers down, and the
+ * leader's own node claims nothing before the Gather launches them again.
  */
 static void
 lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 					  void *coordinate)
 {
+	LionJoinShared *shared = (LionJoinShared *) coordinate;
+
+	pg_atomic_write_u32(&shared->nextchunk, 0);
+	SpinLockAcquire(&shared->mutex);
+	shared->sortedruns += shared->sorted;
+	shared->sorted = 0;
+	SpinLockRelease(&shared->mutex);
 }
 
 static void
@@ -10402,10 +11378,12 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->stats.cache_hits += st->stats.cache_hits;
 		shared->stats.cache_full += st->stats.cache_full;
 		shared->stats.sets_summed += st->stats.sets_summed;
+		shared->stats.rows_removed += st->stats.rows_removed;
 		shared->lookups += st->joinlookups;
 		shared->missing += st->joinmissing;
 		shared->dirpages += st->dirpages;
 		shared->filterrows = Max(shared->filterrows, st->joinfilterrows);
+		shared->sorted = Max(shared->sorted, st->joinsorted);
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -10417,6 +11395,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkermissing = shared->missing;
 	st->joinworkerdirpages = shared->dirpages;
 	st->joinworkerfilterrows = shared->filterrows;
+	st->joinworkersorted = shared->sortedruns + shared->sorted;
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -10470,6 +11449,11 @@ lion_end_custom_scan(CustomScanState *node)
 	{
 		MemoryContextDelete(st->valcxt);
 		st->valcxt = NULL;
+	}
+	if (st->joinkeycxt != NULL)
+	{
+		MemoryContextDelete(st->joinkeycxt);
+		st->joinkeycxt = NULL;
 	}
 	if (st->viscache != NULL)
 	{
@@ -10753,14 +11737,22 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	 */
 	if (st->joinclause >= 0)
 	{
-		if (st->jointype == LION_JOIN_SEMI)
+		/*
+		 * A forward semi join over a non-unique key counts the fact rows of
+		 * each DISTINCT key of the dimension, which it sorts to find them.
+		 */
+		if (st->jointype == LION_JOIN_SEMI || st->joinunique)
 			ExplainPropertyText("Join Type", "Semi", es);
 		else if (st->jointype == LION_JOIN_ANTI)
 			ExplainPropertyText("Join Type", "Anti", es);
+		if (st->joinunique)
+			ExplainPropertyText("Join Keys", "distinct, sorted", es);
 		if (st->joinrows)
 			ExplainPropertyText("Join Rows",
 								st->jointype == LION_JOIN_ANTI ?
 								"the dimension rows without a match" :
+								st->joinunique ?
+								"the distinct keys with a match" :
 								"the dimension rows with a match", es);
 		if (st->joincollect)
 			ExplainPropertyText("Fact Filters", "collected once", es);
@@ -10800,6 +11792,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		tot.cache_hits += st->joinworkerstats.cache_hits;
 		tot.cache_full += st->joinworkerstats.cache_full;
 		tot.sets_summed += st->joinworkerstats.sets_summed;
+		tot.rows_removed += st->joinworkerstats.rows_removed;
 
 		ExplainPropertyInteger("Heap Blocks Skipped via VM", NULL,
 							   tot.blocks_skipped_via_vm, es);
@@ -10807,6 +11800,17 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 							   tot.tids_rechecked, es);
 		ExplainPropertyInteger("Heap Blocks Rechecked", NULL,
 							   tot.blocks_rechecked, es);
+
+		/*
+		 * Rows the heap recheck of a multi-key query turned away (DESIGN.md
+		 * §17, "A query known only at run time"): candidates of a superset
+		 * that the query, tested on the row, does not select.  Printed only
+		 * when there were some, as core prints "Rows Removed by Index
+		 * Recheck".
+		 */
+		if (tot.rows_removed > 0)
+			ExplainPropertyInteger("Rows Removed by Recheck", NULL,
+								   tot.rows_removed, es);
 		ExplainPropertyInteger("Containers Visited", NULL,
 							   tot.containers_visited, es);
 		/*
@@ -10887,6 +11891,30 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		if (st->joinclause >= 0)
 		{
+			/*
+			 * A forward semi join's keys: the child rows with one, sorted - by
+			 * every participant of a parallel plan, so what one of them sorted
+			 * in each run, summed over the runs - and how the sort went here,
+			 * if it ran here.  "Looked Up" below is then the DISTINCT keys,
+			 * each by one participant.
+			 */
+			if (st->joinunique)
+			{
+				ExplainPropertyInteger("Join Keys Sorted", NULL,
+									   Max(st->joinsorted,
+										   st->joinworkersorted), es);
+				if (st->joinhavesortstats)
+				{
+					ExplainPropertyText("Join Key Sort Method",
+										tuplesort_method_name(st->joinsortstats.sortMethod),
+										es);
+					ExplainPropertyInteger("Join Key Sort Space Used", "kB",
+										   st->joinsortstats.spaceUsed, es);
+					ExplainPropertyText("Join Key Sort Space Type",
+										tuplesort_space_type_name(st->joinsortstats.spaceType),
+										es);
+				}
+			}
 			ExplainPropertyInteger("Join Keys Looked Up", NULL,
 								   st->joinlookups + st->joinworkerlookups, es);
 			ExplainPropertyInteger("Join Keys Without Entry", NULL,
