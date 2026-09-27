@@ -135,6 +135,19 @@ lion_ordering_op_is_lt(Oid ltopr, Oid *opfamily, Oid *opcintype)
 #endif
 
 /*
+ * A parallel index build joins its heap scan through
+ * table_beginscan_parallel() (DESIGN.md §24, "Build"), which took scan
+ * options in 19; nbtree passes none, and so does lion.
+ */
+#if PG_VERSION_NUM >= 190000
+#define lion_table_beginscan_parallel(rel, pscan) \
+	table_beginscan_parallel(rel, pscan, SO_NONE)
+#else
+#define lion_table_beginscan_parallel(rel, pscan) \
+	table_beginscan_parallel(rel, pscan)
+#endif
+
+/*
  * The range table indexes a statement modifies or row-locks - what
  * ScanRelIsReadOnly() (19) tests a scan's relation against.  19 keeps them as
  * PlannedStmt.resultRelationRelids and .rowMarkRelids; before, they are the
