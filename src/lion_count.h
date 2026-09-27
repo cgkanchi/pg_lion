@@ -441,6 +441,19 @@ extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
 									   bool rel_read_only);
 
 /*
+ * The members of the same intersection, copied into a private, pinless
+ * posting set instead of counted (DESIGN.md §27): what a caller that
+ * intersects one fixed set of sources with many located sets in turn builds
+ * once.  Nothing is checked against the visibility map or the heap, so the
+ * copy may only ever be counted beside a located set that carries the §9
+ * interlock.  False when it would take more than maxbytes.
+ */
+extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
+								 int nsources, LionCountSource *sources,
+								 Size maxbytes, LionPostingSet *out,
+								 LionCountStats *stats);
+
+/*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and
  * count the intersection of their posting sets.  keytypes may be NULL, which
  * means every key already has its index's opcintype.

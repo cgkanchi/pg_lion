@@ -24,6 +24,12 @@
  *		core's relation_has_unique_index_for(), which before PostgreSQL 19
  *		does not compare collations.
  *
+ *		The semi and anti joins of `EXISTS`, `IN` and `NOT EXISTS` are
+ *		recognised here too, one way round: the dimension is the outer side,
+ *		whose rows the join returns, and the fact the inner side, whose posting
+ *		sets say whether a dimension row has a match - DESIGN.md §27, "Semi
+ *		and anti joins".  They need no uniqueness at all.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -136,12 +142,14 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 	OpExpr	   *op;
 	Node	   *argexpr[2];
 	Var		   *argvar[2];
+	JoinType	jointype = JOIN_INNER;
+	int			semifact = 0;
 	int			n = 0;
 	int			i;
 	int			k;
 	ListCell   *lc;
 
-	/* ---- two plain tables, inner-joined, nothing else in the query ---- */
+	/* ---- two plain tables, joined, nothing else in the query ---- */
 	if (joinrel->reloptkind != RELOPT_JOINREL)
 		return 0;
 	if (bms_num_members(joinrel->relids) != 2)
@@ -150,17 +158,55 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 		return 0;
 
 	/*
-	 * An outer, semi or anti join anywhere makes a SpecialJoinInfo, and a
-	 * count over it is not the inner join's (a LEFT JOIN keeps the fact rows
-	 * with no dimension row).  A PlaceHolderVar is an expression evaluated at
-	 * some join level, which the node has no level to evaluate at.  A
-	 * pseudoconstant qual is gated at the join the node replaces, where it
-	 * would be lost.
+	 * A PlaceHolderVar is an expression evaluated at some join level, which
+	 * the node has no level to evaluate at.  A pseudoconstant qual is gated at
+	 * the join the node replaces, where it would be lost.
 	 */
-	if (root->join_info_list != NIL || root->placeholder_list != NIL)
+	if (root->placeholder_list != NIL)
 		return 0;
 	if (root->hasPseudoConstantQuals || root->hasLateralRTEs)
 		return 0;
+
+	/*
+	 * An outer join makes a SpecialJoinInfo, and a count over it is not the
+	 * inner join's (a LEFT JOIN keeps the fact rows with no dimension row).
+	 * So does a semi or an anti join - EXISTS, IN, NOT EXISTS pulled up into
+	 * the join tree - and that one IS a shape the node answers: its rows are
+	 * the outer side's, each once, that have (or have not) a match on the
+	 * inner side, so with the outer side as the dimension and the inner one
+	 * as the fact it is the same lookup per dimension row with an existence
+	 * test in place of the count.  An EXISTS whose inner side is provably
+	 * unique on the join key never gets here as one: the planner has made it
+	 * an inner join already (reduce_unique_semijoins()), which is the
+	 * equivalence the forward direction - fact rows whose dimension row
+	 * qualifies - rests on, and the one a non-unique key must not get.
+	 *
+	 * Only the join between these two tables, then, and one whose relation
+	 * set is exactly them: an anti join made from `LEFT JOIN ... WHERE
+	 * f.fk IS NULL` has a range table entry of its own (ojrelid), which the
+	 * NOT EXISTS form does not, and is left alone.
+	 */
+	if (root->join_info_list != NIL)
+	{
+		SpecialJoinInfo *sjinfo;
+
+		if (list_length(root->join_info_list) != 1)
+			return 0;
+		sjinfo = (SpecialJoinInfo *) linitial(root->join_info_list);
+		if (sjinfo->jointype != JOIN_SEMI && sjinfo->jointype != JOIN_ANTI)
+			return 0;
+		if (sjinfo->ojrelid != 0)
+			return 0;
+		if (bms_membership(sjinfo->min_lefthand) != BMS_SINGLETON ||
+			!bms_get_singleton_member(sjinfo->min_righthand, &semifact) ||
+			!bms_equal(sjinfo->syn_lefthand, sjinfo->min_lefthand) ||
+			!bms_equal(sjinfo->syn_righthand, sjinfo->min_righthand) ||
+			bms_overlap(sjinfo->min_lefthand, sjinfo->min_righthand) ||
+			!bms_is_subset(sjinfo->min_lefthand, joinrel->relids) ||
+			!bms_is_member(semifact, joinrel->relids))
+			return 0;
+		jointype = sjinfo->jointype;
+	}
 
 	i = -1;
 	k = 0;
@@ -229,7 +275,9 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 	 * Equality commutes, so either operand may be either table's.  Which of
 	 * the two has a lion index that answers the operator is the caller's
 	 * question (lion_collect_targets(), per clause); which one's column is
-	 * unique is this file's.
+	 * unique is this file's.  A semi or anti join goes one way only, the
+	 * fact its inner side, and asks nothing about uniqueness: its count is
+	 * one per dimension row, however many dimension rows share a key.
 	 */
 	for (k = 0; k < 2; k++)
 	{
@@ -243,8 +291,13 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 			argvar[di]->varno != (int) dim->relid)
 			return 0;
 
-		if (!lion_fkjoin_dim_unique(dim, argvar[di], op->opno,
-									op->inputcollid))
+		if (jointype != JOIN_INNER)
+		{
+			if ((int) fact->relid != semifact)
+				continue;
+		}
+		else if (!lion_fkjoin_dim_unique(dim, argvar[di], op->opno,
+										 op->inputcollid))
 			continue;
 		if (dim->cheapest_total_path == NULL ||
 			dim->cheapest_total_path->param_info != NULL)
@@ -259,6 +312,8 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 		fj->collation = op->inputcollid;
 		fj->clause = (Node *) op;
 		fj->dimpath = dim->cheapest_total_path;
+		fj->jointype = jointype;
+		fj->joinrel = joinrel;
 		n++;
 	}
 

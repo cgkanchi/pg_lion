@@ -245,10 +245,12 @@ SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON
 SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k WHERE d.k < 60 GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k WHERE d.k < 60 GROUP BY d.attr', false);
 DROP TABLE lion_fdbig;
--- a long IN list among the fact filters: every count rebuilds the list's
--- union, so the node is refused with nothing disabled (the 2026-09-23 review:
+-- a long IN list among the fact filters.  Read per count, every count
+-- rebuilds the list's union, which is priced per set (the 2026-09-23 review:
 -- priced as one set, 1000 values over 300 dimension rows were chosen at 1.2 s
--- against 2 ms); forced, it still answers exactly
+-- against 2 ms); collected once, the union is built once for the whole scan,
+-- and the node is chosen - 4.0 ms against the hash join's 4.4 on an assert
+-- build.  Forced, it answers exactly
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
 	(SELECT string_agg(quote_literal('k' || i), ', ') FROM generate_series(1, 60) i) || ')') AS p("QUERY PLAN");
 SELECT lion_fj('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
