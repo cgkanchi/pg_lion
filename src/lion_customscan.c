@@ -8402,6 +8402,9 @@ lion_build_filter(LionCountScanState *st)
 	{
 		LionClauseState *cl = &st->clause[i];
 		LionRowFilterClause *c;
+		Form_pg_attribute att;
+		int16		typlen;
+		bool		typbyval;
 
 		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
 			  (cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL)))
@@ -8409,12 +8412,33 @@ lion_build_filter(LionCountScanState *st)
 
 		c = &filter->clauses[filter->nclauses++];
 		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
-		if (c->attno <= 0)
+		if (c->attno <= 0 || c->attno > RelationGetDescr(st->heap)->natts)
 			elog(ERROR, "LionCount: a multi-key clause on an index expression");
 		c->notnull = false;
-		fmgr_info_cxt(get_opcode(cl->opno), &c->flinfo, st->wherecxt);
 		c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
 		c->value = cl->val;
+		fmgr_info_cxt(get_opcode(cl->opno), &c->flinfo, st->wherecxt);
+
+		/*
+		 * The call the executor would have made for the clause, expression
+		 * included, which is what a polymorphic operator's function asks
+		 * its argument types of (get_fn_expr_argtype()).
+		 */
+		att = TupleDescAttr(RelationGetDescr(st->heap), c->attno - 1);
+		get_typlenbyval(cl->valtype, &typlen, &typbyval);
+		fmgr_info_set_expr((Node *)
+						   make_opclause(cl->opno, BOOLOID, false,
+										 (Expr *) makeVar(1, c->attno,
+														  att->atttypid,
+														  att->atttypmod,
+														  att->attcollation,
+														  0),
+										 (Expr *) makeConst(cl->valtype, -1,
+															InvalidOid,
+															typlen, cl->val,
+															false, typbyval),
+										 InvalidOid, c->collation),
+						   &c->flinfo);
 	}
 	MemoryContextSwitchTo(oldcxt);
 
