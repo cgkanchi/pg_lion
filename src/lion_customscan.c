@@ -208,18 +208,22 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	COPY_PROBE		per fk container, the copy sought by a binary search in
  *					memory and the two containers ANDed, in place of a probe
  *					into each filter's posting tree;
+ *	COPY_MEMBER		... and per member of that fk container, which the AND
+ *					walks and the visibility map is asked about;
  *	COPY_CONTAINER	once per scan, one container of the copy made.
  *
- * Measured on the assert build over the 2026-09-27 benchmark's five-million-
- * row fact (DESIGN.md §27): a count against the copy costs about 3 us plus
- * 0.2 us per fk container, from 10,601 dimension rows of 25 rows a key and
- * 105,268 of 2.75; a copy of 1,500 containers takes 0.8 ms when the filter is
- * one set.  With these the collected paths came out at 150 to 360 cost units
- * per millisecond across fourteen shapes, against 145 to 240 for the hash and
- * nested-loop joins of the same queries.
+ * Measured on the assert build (DESIGN.md §27, "Cost, revisited"): a count
+ * against the copy costs about 3 us plus 0.2 us per fk container when the fk
+ * sets hold a member or two per container (the 2026-09-27 benchmark's five
+ * million rows, 25 and 2.75 rows a key), and 0.47 us per container when they
+ * hold six (§27's two million rows, 2,000 a key over 322 containers) - where,
+ * without the member term, `x = 3 GROUP BY d.attr` over a thousand dimension
+ * rows was chosen at 152 ms against the hash join's 125.  A copy of 1,500
+ * containers takes 0.8 ms when the filter is one set.
  */
 #define LION_FKJOIN_COPY_COUNT_COST	(25.0 * cpu_tuple_cost)
 #define LION_FKJOIN_COPY_PROBE_COST	(15.0 * cpu_operator_cost)
+#define LION_FKJOIN_COPY_MEMBER_COST	(3.0 * cpu_operator_cost)
 #define LION_FKJOIN_COPY_CONTAINER_COST	(20.0 * cpu_operator_cost)
 
 /*
@@ -3320,7 +3324,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
 		collected += dimrows * (LION_FKJOIN_COPY_COUNT_COST +
 								Min(cfk, copyckeys) * readshare *
-								LION_FKJOIN_COPY_PROBE_COST);
+								(LION_FKJOIN_COPY_PROBE_COST +
+								 perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
 
 		if (copybytes <= (double) work_mem * 1024.0 && collected < probed)
 			*collect = true;

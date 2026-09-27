@@ -428,10 +428,9 @@ SELECT * FROM lion_explain_norm('SELECT d.attr, count(*) FROM lion_ff f JOIN lio
    Group Key: d.attr
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_ff_fk (fk = d.pk), lion_ff_x (x = 3)
-         Fact Filters: collected once
          ->  Seq Scan on lion_fd d
                Filter: (region = 'eu'::text)
-(7 rows)
+(6 rows)
 
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.attr = 2') AS p("QUERY PLAN");
                   QUERY PLAN                  
