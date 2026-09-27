@@ -319,9 +319,9 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k >= 3 AND g = 2');
 (1 row)
 
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k >= 3 AND k < 790 AND u > 1000');
-         lion_sm          
---------------------------
- not pushed down: (16992)
+            lion_sm             
+--------------------------------
+ inside, summaries 854: (16992)
 (1 row)
 
 -- ---------- 3. two bounds on one side (DESIGN.md §31: the tightest one) ----------

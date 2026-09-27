@@ -826,8 +826,15 @@ SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
  not pushed down, 1 rows
 (1 row)
 
--- a WHERE clause the posting sets cannot answer
+-- a range on a column the walk does not drive is a source (DESIGN.md §31)
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
+       lion_dc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- a WHERE clause the posting sets cannot answer
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
          lion_dc         
 -------------------------
  not pushed down, 1 rows
