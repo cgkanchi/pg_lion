@@ -3,6 +3,8 @@
 -- saw some of the commonest filter shapes:
 --
 --	- an enum key, `status = 'val1'` or `status IN ('val1', 'val3')`;
+--	- a boolean column tested by itself: `flag`, which is what `flag = true` is
+--	  folded into, `NOT flag`, `flag IS TRUE` and the rest;
 --
 -- Every query here runs with the other scans disabled, so that a LionCount
 -- path that is built at all is the plan whatever the cost model says, and its
@@ -188,6 +190,40 @@ INSERT INTO lion_cc_q VALUES
 (121, $$SELECT d.label, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status GROUP BY d.label$$),
 (122, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.country = 'c1' AND f.pc = 3 GROUP BY d.status$$);
 
+-- ---- 2. a boolean column tested by itself ----
+-- `flag = true` is folded into `flag`, and `flag = false` into NOT flag
+INSERT INTO lion_cc_q VALUES
+(201, $$SELECT count(*) FROM lion_cc_t WHERE flag$$),
+(202, $$SELECT count(*) FROM lion_cc_t WHERE flag = true$$),
+(203, $$SELECT count(*) FROM lion_cc_t WHERE NOT flag$$),
+(204, $$SELECT count(*) FROM lion_cc_t WHERE flag = false$$),
+(205, $$SELECT count(*) FROM lion_cc_t WHERE flag <> true$$),
+(206, $$SELECT count(*) FROM lion_cc_t WHERE flag IS TRUE$$),
+(207, $$SELECT count(*) FROM lion_cc_t WHERE flag IS FALSE$$),
+-- the two that hold for NULL too: an OR of the other value and the NULL entry
+(208, $$SELECT count(*) FROM lion_cc_t WHERE flag IS NOT TRUE$$),
+(209, $$SELECT count(*) FROM lion_cc_t WHERE flag IS NOT FALSE$$),
+(210, $$SELECT count(*) FROM lion_cc_t WHERE NOT (flag IS TRUE) AND country = 'c2'$$),
+(211, $$SELECT count(*) FROM lion_cc_t WHERE flag IS UNKNOWN$$),
+(212, $$SELECT count(*) FROM lion_cc_t WHERE flag IS NOT UNKNOWN$$),
+-- beside other columns, under an OR, and in its arms
+(213, $$SELECT count(*) FROM lion_cc_t WHERE flag AND status = 'val1'$$),
+(214, $$SELECT count(*) FROM lion_cc_t WHERE NOT flag AND country = 'c1'$$),
+(215, $$SELECT count(*) FROM lion_cc_t WHERE flag OR country = 'c1'$$),
+(216, $$SELECT count(*) FROM lion_cc_t WHERE status = 'val3' OR flag IS NOT TRUE$$),
+(217, $$SELECT count(*) FROM lion_cc_t WHERE (flag AND status = 'val1') OR (NOT flag AND country = 'c2')$$),
+(218, $$SELECT count(*) FROM lion_cc_t WHERE flag AND NOT flag$$),
+(219, $$SELECT count(*) FROM lion_cc_t WHERE flag AND flag IS TRUE$$),
+(220, $$SELECT count(flag) FROM lion_cc_t WHERE flag IS FALSE$$),
+-- GROUP BY the boolean, and a boolean clause beside another GROUP BY
+(221, $$SELECT flag, count(*) FROM lion_cc_t GROUP BY flag$$),
+(222, $$SELECT flag, count(*) FROM lion_cc_t WHERE flag GROUP BY flag$$),
+(223, $$SELECT flag, count(*) FROM lion_cc_t WHERE flag IS NOT FALSE GROUP BY flag$$),
+(224, $$SELECT status, count(*) FROM lion_cc_t WHERE NOT flag GROUP BY status$$),
+(225, $$SELECT count(DISTINCT status) FROM lion_cc_t WHERE flag$$),
+-- a fact filter of the FK-side join
+(226, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.flag AND f.country = 'c1' GROUP BY d.status$$);
+
 -- ---------- over one single-column index per column ----------
 CREATE INDEX lion_cc_status ON lion_cc_t USING lion (status);
 CREATE INDEX lion_cc_dstatus ON lion_cc_t USING lion (dstatus);
@@ -208,6 +244,10 @@ SET enable_indexonlyscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'val1';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status IN ('val1', 'val3');
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE dstatus::lion_cc_ws = 'val1';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag = true;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE NOT flag;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS TRUE AND status = 'val2';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS NOT TRUE;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -216,6 +256,9 @@ RESET enable_indexonlyscan;
 -- The same clauses through the access method's own scans.
 SELECT lion_cc_scan('index', $$SELECT id FROM lion_cc_t WHERE status = 'val2'$$);
 SELECT lion_cc_scan('bitmap', $$SELECT id FROM lion_cc_t WHERE dstatus::lion_cc_ws IN ('val1', 'val3')$$);
+SELECT lion_cc_scan('index', $$SELECT id FROM lion_cc_t WHERE flag$$);
+SELECT lion_cc_scan('bitmap', $$SELECT id FROM lion_cc_t WHERE NOT flag$$);
+SELECT lion_cc_scan('bitmap', $$SELECT id FROM lion_cc_t WHERE flag IS TRUE$$);
 
 /*
  * lion_index_posting_root() takes a key of the column's own type, which for
@@ -238,7 +281,7 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'val1' AND country = 'c1';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'val1' AND flag;
 EXPLAIN (COSTS OFF) SELECT flag, count(*) FROM lion_cc_t WHERE status IN ('val1', 'val3') GROUP BY flag;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -247,7 +290,7 @@ RESET enable_indexonlyscan;
 
 -- ... and a dirty heap, whose candidates the node rechecks
 UPDATE lion_cc_t SET flag = NOT flag, status = 'val3' WHERE id % 11 = 0;
-SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121) ORDER BY n;
+SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 203, 208, 213) ORDER BY n;
 
 DROP TABLE lion_cc_q, lion_cc_t, lion_cc_dim;
 DROP DOMAIN lion_cc_wsd;
