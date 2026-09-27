@@ -2067,32 +2067,18 @@ lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
 }
 
 /*
- * The correlation between `var`'s values and the heap's physical order, from
- * its statistics, as btcostestimate() reads it; 0 when there is none.
+ * The correlation between `var`'s values and the heap's physical order, as
+ * lioncostestimate() reads it for a plain scan (lion_var_heap_correlation(),
+ * DESIGN.md §29.11): ANALYZE's number less the sum of the values' squared
+ * frequencies, which is what it comes out at for values placed at random;
+ * 0 when there is none.  Read raw, a column of a few values placed at random
+ * looked as though each value's rows were packed on a share of the heap, and
+ * the recheck of a count over one was priced on too few pages.
  */
 static double
 lion_var_correlation(PlannerInfo *root, RelOptInfo *rel, Var *var)
 {
-	VariableStatData vardata;
-	double		corr = 0.0;
-
-	examine_variable(root, (Node *) var, rel->relid, &vardata);
-	if (HeapTupleIsValid(vardata.statsTuple))
-	{
-		AttStatsSlot sslot;
-
-		if (get_attstatsslot(&sslot, vardata.statsTuple,
-							 STATISTIC_KIND_CORRELATION, InvalidOid,
-							 ATTSTATSSLOT_NUMBERS))
-		{
-			if (sslot.nnumbers > 0)
-				corr = sslot.numbers[0];
-			free_attstatsslot(&sslot);
-		}
-	}
-	ReleaseVariableStats(vardata);
-
-	return corr;
+	return lion_var_heap_correlation(root, rel->relid, var);
 }
 
 /*

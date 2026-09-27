@@ -873,7 +873,7 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
  * The sum of the squared frequencies of a column's values among its non-NULL
  * rows, from its MCV list and, for the values not in it, an even share of
  * the rest: what ANALYZE's correlation comes out at when the values are
- * placed at random (lion_index_correlation()).  1 when nothing is known,
+ * placed at random (lion_var_heap_correlation()).  1 when nothing is known,
  * which leaves no correlation at all.
  */
 static double
@@ -921,64 +921,37 @@ lion_stats_sum_sq_freq(VariableStatData *vardata)
 }
 
 /*
- * The correlation a PLAIN index scan's heap fetches have with the heap order
- * (DESIGN.md §29.11), which only cost_index() reads - a bitmap heap scan
- * sorts its pages whatever the index says.  It starts from btcostestimate()'s
- * answer: the ANALYZE correlation of the first index column the path has a
- * clause on (of column 1 when it has none), for the type's default `<`, which
- * is what ANALYZE computed it with, times 0.75 for a multicolumn index.
- * Within one key a lion scan returns TIDs in heap order, as btree does since
- * its heap-TID tiebreaker, so how that key's rows are spread over the heap is
- * what the column's correlation describes.  0 for a multi-key column (a row
- * is under several of its entries and the column's statistics are the
- * ARRAY's), for an expression column, and whenever there is no statistic.
+ * The correlation of a heap column's values with the heap order, as the cost
+ * model reads it (DESIGN.md §29.11): the ANALYZE correlation for the type's
+ * default `<`, which is what ANALYZE computed it with, less the part that
+ * says nothing about the heap.  0 whenever there is no statistic.
  *
- * Less the part that says nothing about the heap.  ANALYZE sorts its sample
- * by value and equal values by their place in the heap, so a column of few
- * values placed at random correlates by exactly the sum of its values'
- * squared frequencies: 1/k for k equally common values, 0.82 for a 90/10
- * boolean.  cost_index() read that as the rows of one value packed on fewer
- * pages than they touch - and lion is made for such columns.  So the
- * correlation is taken beyond that baseline: (corr - S) / (1 - S), S the sum
- * of the squares, clamped to [-1, 1], which is 0 for values placed at random
- * and still 1 for a column stored in value order (and -1 for one stored in
- * reverse, whose values are packed as well).  Measured on 8M rows with the
- * values placed at random: 0.4406 for a column of three values at 60/20/20%
- * (S = 0.44), 0.8171 for 90/10 (S = 0.82), 0.6852 for 80/20 (S = 0.68).
+ * ANALYZE sorts its sample by value and equal values by their place in the
+ * heap, so a column of few values placed at random correlates by exactly the
+ * sum of its values' squared frequencies: 1/k for k equally common values,
+ * 0.82 for a 90/10 boolean.  cost_index() reads that as the rows of one value
+ * packed on fewer pages than they touch - and lion is made for such columns.
+ * So the correlation is taken beyond that baseline: (corr - S) / (1 - S), S
+ * the sum of the squares, clamped to [-1, 1], which is 0 for values placed at
+ * random and still 1 for a column stored in value order (and -1 for one
+ * stored in reverse, whose values are packed as well).  Measured on 8M rows
+ * with the values placed at random: 0.4406 for a column of three values at
+ * 60/20/20% (S = 0.44), 0.8171 for 90/10 (S = 0.82), 0.6852 for 80/20
+ * (S = 0.68).
+ *
+ * Shared with the count pushdown, which prices the heap pages its recheck
+ * visits by the same number (lion_customscan.c, lion_var_correlation()): read
+ * raw, a low-cardinality column placed at random looked packed there too.
  */
-static double
-lion_index_correlation(PlannerInfo *root, IndexPath *path)
+double
+lion_var_heap_correlation(PlannerInfo *root, Index relid, Var *var)
 {
-	IndexOptInfo *index = path->indexinfo;
 	VariableStatData vardata;
-	RangeTblEntry *rte;
 	TypeCacheEntry *tce;
-	Oid			atttype;
 	double		corr = 0.0;
-	int			col = -1;
-	ListCell   *lc;
-	Var		   *var;
 
-	foreach(lc, path->indexclauses)
-	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-
-		if (col < 0 || iclause->indexcol < col)
-			col = iclause->indexcol;
-	}
-	if (col < 0)
-		col = 0;
-	if (col >= index->nkeycolumns || index->indexkeys[col] <= 0 ||
-		lion_index_is_multikey(index, col))
-		return 0.0;
-
-	rte = planner_rt_fetch(index->rel->relid, root);
-	atttype = get_atttype(rte->relid, index->indexkeys[col]);
-	var = makeVar(index->rel->relid, index->indexkeys[col], atttype, -1,
-				  index->indexcollations[col], 0);
-
-	examine_variable(root, (Node *) var, index->rel->relid, &vardata);
-	tce = lookup_type_cache(atttype, TYPECACHE_LT_OPR);
+	examine_variable(root, (Node *) var, relid, &vardata);
+	tce = lookup_type_cache(var->vartype, TYPECACHE_LT_OPR);
 	if (HeapTupleIsValid(vardata.statsTuple) && OidIsValid(tce->lt_opr))
 	{
 		AttStatsSlot sslot;
@@ -999,6 +972,51 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 		}
 	}
 	ReleaseVariableStats(vardata);
+
+	return corr;
+}
+
+/*
+ * The correlation a PLAIN index scan's heap fetches have with the heap order
+ * (DESIGN.md §29.11), which only cost_index() reads - a bitmap heap scan
+ * sorts its pages whatever the index says.  It starts from btcostestimate()'s
+ * answer: the correlation of the first index column the path has a clause on
+ * (of column 1 when it has none), times 0.75 for a multicolumn index, taken
+ * as lion_var_heap_correlation() takes it.  Within one key a lion scan
+ * returns TIDs in heap order, as btree does since its heap-TID tiebreaker, so
+ * how that key's rows are spread over the heap is what the column's
+ * correlation describes.  0 for a multi-key column (a row is under several of
+ * its entries and the column's statistics are the ARRAY's) and for an
+ * expression column.
+ */
+static double
+lion_index_correlation(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	RangeTblEntry *rte;
+	double		corr;
+	int			col = -1;
+	ListCell   *lc;
+	Var		   *var;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+
+		if (col < 0 || iclause->indexcol < col)
+			col = iclause->indexcol;
+	}
+	if (col < 0)
+		col = 0;
+	if (col >= index->nkeycolumns || index->indexkeys[col] <= 0 ||
+		lion_index_is_multikey(index, col))
+		return 0.0;
+
+	rte = planner_rt_fetch(index->rel->relid, root);
+	var = makeVar(index->rel->relid, index->indexkeys[col],
+				  get_atttype(rte->relid, index->indexkeys[col]), -1,
+				  index->indexcollations[col], 0);
+	corr = lion_var_heap_correlation(root, index->rel->relid, var);
 
 	if (index->nkeycolumns > 1)
 		corr *= 0.75;
