@@ -3125,10 +3125,11 @@ expensive one, as lioncostestimate() assumes it for a bitmap scan.  Each candida
 the pages each count reads for itself (`lion_heap_page_cost()`, a filtered recheck having no cache)
 and tested at the clause's own evaluation cost; §10's recheck of the dirty pages is still charged
 beside it.  So a lone `tags @> $1` in a generic plan loses to the ordinary plan, whose own index
-path is priced as ALL too, and `tags @> $1 AND k = 3 AND g = 1` is chosen, because the rows it
-would recheck are the ones the ordinary plan fetches anyway; under `plan_cache_mode = auto` the
-generic plan's price keeps the plan cache choosing custom plans, whose literals are pushed down
-exactly.
+path is priced as ALL too; beside a selective clause the rows the node would recheck are the ones
+the ordinary plan fetches anyway, and the two come out close, the node ahead by what the posting
+sets save (18% in the table below, 4% on the smaller table of the tests, which is why those pin
+only the lone clause); and under `plan_cache_mode = auto` the generic plan's price keeps the plan
+cache choosing custom plans, whose literals are pushed down exactly.
 
 **EXPLAIN** prints the clause with its value as core does (`tags @> $1`, `tsv @@
 to_tsquery('simple'::regconfig, current_setting('app.q'::text))`); with ANALYZE, `Heap TIDs
