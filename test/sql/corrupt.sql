@@ -148,10 +148,11 @@ DROP INDEX lion_dc_i;
 
 -- ---------- 4. a summary whose key is not its bucket's (DESIGN.md §31) ----------
 -- Buckets of 16 keys: the second summary is keyed 32 and holds the rows of
--- keys 17 to 32.  Its key (and the hash stored beside it) is rewritten to 24,
--- which still sorts between its neighbours, so the directory is in order and
--- every entry is sound on its own - but the rows of keys 25 to 32 are now in
--- the summary of a bucket that ends at 24, and missing from the next one.
+-- keys 17 to 32.  Its key is rewritten to 24, which still sorts between its
+-- neighbours (a summary's hash is a constant, so nothing else changes), so
+-- the directory is in order and every entry is sound on its own - but the
+-- rows of keys 25 to 32 are now in the summary of a bucket that ends at 24,
+-- and missing from the next one.
 CREATE TABLE lion_dc_s (k int NOT NULL);
 INSERT INTO lion_dc_s SELECT i FROM generate_series(1, 400) i;
 CREATE INDEX lion_dc_s_i ON lion_dc_s USING lion (k)
@@ -169,7 +170,7 @@ $$;
 
 -- The block and byte offset of the summary of an int4 column keyed k: an
 -- item whose header (hash, flags, keylen at +0, +4, +6) is a SUMMARY entry's
--- (flag 0x0080) with k's hash and an 8-byte key equal to k at +32.
+-- (flag 0x0080, hash 0) with an 8-byte key equal to k at +32.
 CREATE FUNCTION lion_dc_summary(idx regclass, k int, OUT blk bigint, OUT pos int)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -183,7 +184,7 @@ BEGIN
 		FOR off IN 1 .. ((lion_dc_u32(page, 12) & 65535) - 24) / 4 LOOP
 			p := lion_dc_item(page, off);
 			CONTINUE WHEN p < 24 OR p + 40 > length(page);
-			IF lion_dc_u32(page, p) = (hashint4(k)::bigint & 4294967295)
+			IF lion_dc_u32(page, p) = 0
 			   AND (lion_dc_u32(page, p + 4) & 128) <> 0
 			   AND (lion_dc_u32(page, p + 4) >> 16) = 8
 			   AND lion_dc_u32(page, p + 32) = k THEN
@@ -196,9 +197,7 @@ BEGIN
 END $$;
 
 SELECT blk IS NOT NULL AS found FROM lion_dc_summary('lion_dc_s_i', 32);
-SELECT lion_dc_poke('lion_dc_s_i', s.blk, s.pos,
-					lion_dc_le32(hashint4(24)::bigint & 4294967295)),
-	   lion_dc_poke('lion_dc_s_i', s.blk, s.pos + 32, lion_dc_le32(24))
+SELECT lion_dc_poke('lion_dc_s_i', s.blk, s.pos + 32, lion_dc_le32(24))
   FROM lion_dc_summary('lion_dc_s_i', 32) s;
 SELECT lion_dc_try($$SELECT lion_index_verify('lion_dc_s_i', false)$$);
 DROP TABLE lion_dc_s;
