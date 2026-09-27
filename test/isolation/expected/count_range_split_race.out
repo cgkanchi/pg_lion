@@ -1,0 +1,213 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s3_prep s3_how s1_inside s2_split s2_wakeup_resumed s3_plain s3_shape s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) rsr;
+step s3_how: 
+	CREATE FUNCTION rsr_how(q text) RETURNS text LANGUAGE plpgsql AS $fn$
+	DECLARE j jsonb;
+	BEGIN
+		EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' || q INTO j;
+		RETURN jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")') ->> 'Range Evaluation';
+	END $fn$;
+	SELECT rsr_how('SELECT count(*) FROM rsr WHERE k BETWEEN 1000 AND 1800 AND g = 1') AS inside,
+		   rsr_how('SELECT count(*) FROM rsr WHERE k >= 800 AND g = 1') AS complement,
+		   leaf_pages < 30 AS one_leaf_per_hundred_keys
+	  FROM lion_index_stats('rsr_k');
+	DROP FUNCTION rsr_how(text);
+
+inside|complement|one_leaf_per_hundred_keys
+------+----------+-------------------------
+inside|complement|t                        
+(1 row)
+
+step s1_inside: SELECT count(*) FROM rsr WHERE k BETWEEN 1000 AND 1800 AND g = 1; <waiting ...>
+step s2_split: 
+	BEGIN;
+	INSERT INTO rsr SELECT 100000 + i, 2 * i + 1, 1 FROM generate_series(0, 1999) i;
+	ROLLBACK;
+
+step s2_wakeup_resumed: 
+	/*
+	 * Detach first, so that nothing can park at the point again, then
+	 * release whoever is parked now: the walk reaches it once per leaf.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-resumed');
+	DO $$
+	DECLARE n int; zero int := 0;
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			SELECT count(*) INTO n FROM pg_stat_activity
+			 WHERE wait_event = 'lion-entry-scan-resumed';
+			IF n = 0 THEN
+				zero := zero + 1;
+				EXIT WHEN zero >= 10;
+			ELSE
+				zero := 0;
+				BEGIN
+					PERFORM injection_points_wakeup('lion-entry-scan-resumed');
+				EXCEPTION WHEN OTHERS THEN NULL;
+				END;
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_inside: <... completed>
+count
+-----
+  401
+(1 row)
+
+step s3_plain: 
+	SET pg_lion.enable_count_pushdown = off;
+	RESET enable_seqscan;
+	SELECT count(*) AS inside FROM rsr WHERE k BETWEEN 1000 AND 1800 AND g = 1;
+	SELECT count(*) AS complement FROM rsr WHERE k >= 800 AND g = 1;
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_seqscan = off;
+
+inside
+------
+   401
+(1 row)
+
+complement
+----------
+      1600
+(1 row)
+
+step s3_shape: 
+	SELECT leaf_pages > 30 AS the_leaves_really_split,
+		   entries = 4000 AS aborted_entries_are_still_there
+	  FROM lion_index_stats('rsr_k');
+
+the_leaves_really_split|aborted_entries_are_still_there
+-----------------------+-------------------------------
+t                      |t                              
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('rsr_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s3_how s4_complement s2_split s2_wakeup_leaf s3_plain s3_shape s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) rsr;
+step s3_how: 
+	CREATE FUNCTION rsr_how(q text) RETURNS text LANGUAGE plpgsql AS $fn$
+	DECLARE j jsonb;
+	BEGIN
+		EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' || q INTO j;
+		RETURN jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")') ->> 'Range Evaluation';
+	END $fn$;
+	SELECT rsr_how('SELECT count(*) FROM rsr WHERE k BETWEEN 1000 AND 1800 AND g = 1') AS inside,
+		   rsr_how('SELECT count(*) FROM rsr WHERE k >= 800 AND g = 1') AS complement,
+		   leaf_pages < 30 AS one_leaf_per_hundred_keys
+	  FROM lion_index_stats('rsr_k');
+	DROP FUNCTION rsr_how(text);
+
+inside|complement|one_leaf_per_hundred_keys
+------+----------+-------------------------
+inside|complement|t                        
+(1 row)
+
+step s4_complement: SELECT count(*) FROM rsr WHERE k >= 800 AND g = 1; <waiting ...>
+step s2_split: 
+	BEGIN;
+	INSERT INTO rsr SELECT 100000 + i, 2 * i + 1, 1 FROM generate_series(0, 1999) i;
+	ROLLBACK;
+
+step s2_wakeup_leaf: 
+	SELECT injection_points_detach('lion-entry-scan-leaf');
+	DO $$
+	DECLARE n int; zero int := 0;
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			SELECT count(*) INTO n FROM pg_stat_activity
+			 WHERE wait_event = 'lion-entry-scan-leaf';
+			IF n = 0 THEN
+				zero := zero + 1;
+				EXIT WHEN zero >= 10;
+			ELSE
+				zero := 0;
+				BEGIN
+					PERFORM injection_points_wakeup('lion-entry-scan-leaf');
+				EXCEPTION WHEN OTHERS THEN NULL;
+				END;
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s4_complement: <... completed>
+count
+-----
+ 1600
+(1 row)
+
+step s3_plain: 
+	SET pg_lion.enable_count_pushdown = off;
+	RESET enable_seqscan;
+	SELECT count(*) AS inside FROM rsr WHERE k BETWEEN 1000 AND 1800 AND g = 1;
+	SELECT count(*) AS complement FROM rsr WHERE k >= 800 AND g = 1;
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_seqscan = off;
+
+inside
+------
+   401
+(1 row)
+
+complement
+----------
+      1600
+(1 row)
+
+step s3_shape: 
+	SELECT leaf_pages > 30 AS the_leaves_really_split,
+		   entries = 4000 AS aborted_entries_are_still_there
+	  FROM lion_index_stats('rsr_k');
+
+the_leaves_really_split|aborted_entries_are_still_there
+-----------------------+-------------------------------
+t                      |t                              
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('rsr_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
