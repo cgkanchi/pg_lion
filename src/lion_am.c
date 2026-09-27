@@ -745,6 +745,90 @@ lion_cost_sets_beside(IndexPath *path, int col)
 }
 
 /*
+ * The range quals of key column c that one walk answers, ranked as
+ * liongetbitmap() ranks them (DESIGN.md §28): an equality or a list outranks
+ * a range and leaves no walk at all (NIL), then an `op ANY (array)` - which
+ * for a range operator is ONE walk to the widest element
+ * (lion_emit_array_range()) - then the column's plain range comparisons, all
+ * of them one walk.
+ */
+static List *
+lion_cost_col_ranges(IndexPath *path, int c)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *ranges = NIL;
+	RestrictInfo *arrayrange = NULL;
+	bool		outranked = false;
+	ListCell   *lc;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (iclause->indexcol != c)
+			continue;
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Node	   *clause = (Node *) rinfo->clause;
+
+			if (IsA(clause, OpExpr) &&
+				lion_cost_is_range(index, c, (OpExpr *) clause))
+				ranges = lappend(ranges, rinfo);
+			else if (IsA(clause, ScalarArrayOpExpr) &&
+					 lion_cost_is_range_op(index, c,
+										   ((ScalarArrayOpExpr *) clause)->opno))
+			{
+				if (arrayrange == NULL)
+					arrayrange = rinfo;
+			}
+			else if (!IsA(clause, NullTest))
+				outranked = true;	/* an equality or a list: no walk */
+		}
+	}
+
+	/* An array range outranks the plain ones and is one walk alone. */
+	if (outranked)
+	{
+		list_free(ranges);
+		ranges = NIL;
+	}
+	else if (arrayrange != NULL)
+	{
+		list_free(ranges);
+		ranges = list_make1(arrayrange);
+	}
+	return ranges;
+}
+
+/*
+ * n_distinct of the heap column key column c indexes, which is how many
+ * entries a scalar column has; DEFAULT_NUM_DISTINCT for an expression.
+ */
+static double
+lion_cost_col_ndistinct(PlannerInfo *root, IndexOptInfo *index, int c)
+{
+	RangeTblEntry *rte;
+	VariableStatData vardata;
+	bool		isdefault;
+	double		ndistinct;
+	Var		   *var;
+
+	if (index->indexkeys[c] <= 0)
+		return DEFAULT_NUM_DISTINCT;
+
+	rte = planner_rt_fetch(index->rel->relid, root);
+	var = makeVar(index->rel->relid, index->indexkeys[c],
+				  get_atttype(rte->relid, index->indexkeys[c]),
+				  -1, index->indexcollations[c], 0);
+	examine_variable(root, (Node *) var, index->rel->relid, &vardata);
+	ndistinct = get_variable_numdistinct(&vardata, &isdefault);
+	ReleaseVariableStats(vardata);
+	return ndistinct;
+}
+
+/*
  * What the ENTRIES of the range walks of this path cost (DESIGN.md §28), on
  * top of the pages and the postings genericcostestimate() prorates by the
  * selectivity.
@@ -755,11 +839,7 @@ lion_cost_sets_beside(IndexPath *path, int col)
  * few hundred entries, which is nothing; on a near-unique one every row is
  * an entry, and this is the term - with the index's own size, an entry header
  * per row against btree's tuple - that leaves such a column to btree.  Only
- * a column whose chosen qual IS its range pays it, ranked as liongetbitmap()
- * ranks them: an equality outranks everything, then an `op ANY (array)` -
- * which for a range operator is ONE walk to the widest element
- * (lion_emit_array_range()) and pays for the entries that walk visits - then
- * the column's plain range comparisons, all of them one walk.
+ * a column whose chosen qual IS its range pays it (lion_cost_col_ranges()).
  *
  * Beside another column's sets, a plain scan walks a long range once per
  * WINDOW of those sets' containers (DESIGN.md §29.3, lion_walk_window()), so
@@ -789,74 +869,15 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 
 	for (c = 0; c < index->nkeycolumns; c++)
 	{
-		List	   *ranges = NIL;
-		RestrictInfo *arrayrange = NULL;
-		bool		outranked = false;
-		ListCell   *lc;
-
-		foreach(lc, path->indexclauses)
-		{
-			IndexClause *iclause = (IndexClause *) lfirst(lc);
-			ListCell   *lc2;
-
-			if (iclause->indexcol != c)
-				continue;
-			foreach(lc2, iclause->indexquals)
-			{
-				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
-				Node	   *clause = (Node *) rinfo->clause;
-
-				if (IsA(clause, OpExpr) &&
-					lion_cost_is_range(index, c, (OpExpr *) clause))
-					ranges = lappend(ranges, rinfo);
-				else if (IsA(clause, ScalarArrayOpExpr) &&
-						 lion_cost_is_range_op(index, c,
-											   ((ScalarArrayOpExpr *) clause)->opno))
-				{
-					if (arrayrange == NULL)
-						arrayrange = rinfo;
-				}
-				else if (!IsA(clause, NullTest))
-					outranked = true;	/* an equality or a list: no walk */
-			}
-		}
-
-		/* An array range outranks the plain ones and is one walk alone. */
-		if (outranked)
-		{
-			list_free(ranges);
-			ranges = NIL;
-		}
-		else if (arrayrange != NULL)
-		{
-			list_free(ranges);
-			ranges = list_make1(arrayrange);
-		}
+		List	   *ranges = lion_cost_col_ranges(path, c);
 
 		if (ranges != NIL)
 		{
 			Selectivity sel = clauselist_selectivity(root, ranges,
 													 index->rel->relid,
 													 JOIN_INNER, NULL);
-			double		ndistinct = DEFAULT_NUM_DISTINCT;
+			double		ndistinct = lion_cost_col_ndistinct(root, index, c);
 			double		entries;
-
-			if (index->indexkeys[c] > 0)
-			{
-				RangeTblEntry *rte = planner_rt_fetch(index->rel->relid, root);
-				VariableStatData vardata;
-				bool		isdefault;
-				Var		   *var = makeVar(index->rel->relid,
-										  index->indexkeys[c],
-										  get_atttype(rte->relid,
-													  index->indexkeys[c]),
-										  -1, index->indexcollations[c], 0);
-
-				examine_variable(root, (Node *) var, index->rel->relid,
-								 &vardata);
-				ndistinct = get_variable_numdistinct(&vardata, &isdefault);
-				ReleaseVariableStats(vardata);
-			}
 
 			entries = Max(1.0, ndistinct * sel);
 			if (lion_cost_sets_beside(path, c))
@@ -1014,33 +1035,48 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 }
 
 /*
- * Does a plain scan of this path hand out its TIDs in heap order - the SETS,
- * UNION and WINDOW sources of DESIGN.md §29.3, lion_source_sorted()?
+ * The order a plain scan of this path hands out its TIDs in (DESIGN.md §29.3,
+ * lion_source_build()):
+ *
+ *	LION_PLAIN_SORTED	heap order: the SETS, UNION and WINDOW sources
+ *						(lion_source_sorted());
+ *	LION_PLAIN_WALK		one column's entries in key order, each entry's TIDs
+ *						in heap order: *walkcol is that column;
+ *	LION_PLAIN_LIST		an IN list longer than a batch, located and streamed a
+ *						batch at a time, each batch in heap order.
+ *
  * Mirrors lion_source_build(): per key column the qual lion_scan_choose()
- * ranks first is answered; an IN list longer than a batch is a LIST, which
- * restarts the heap per batch; a range, or an `IS NOT NULL` that nothing
- * else answers, is a WALK in key order when no other column's sets are
- * beside it.  Beside them a range is taken for a WINDOW, as
- * lion_range_entry_cost() takes it: a walk too short for one restarts the
- * other columns' stream a few times at most (lion_source_walk_is_long()),
- * each restart in heap order.
+ * ranks first is answered; a long list outranks a walk; the first column
+ * whose chosen qual is a range walks, and a second one is rechecked; an
+ * `IS NOT NULL` walks only when nothing else answers.  Beside another column's
+ * sets a range is taken for a WINDOW, as lion_range_entry_cost() takes it: a
+ * walk too short for one restarts the other columns' stream a few times at
+ * most (lion_source_walk_is_long()), each restart in heap order.  No key at
+ * all is a partial index read whole, by a walk of column 1 or, when that
+ * column is multi-key, by a union.
  */
-static bool
-lion_plain_scan_is_sorted(PlannerInfo *root, IndexPath *path)
+#define LION_PLAIN_SORTED	0
+#define LION_PLAIN_WALK		1
+#define LION_PLAIN_LIST		2
+
+static int
+lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol)
 {
 	IndexOptInfo *index = path->indexinfo;
 	int			ncols = index->nkeycolumns;
 	int			bestrank[INDEX_MAX_KEYS];
 	Node	   *chosen[INDEX_MAX_KEYS];
 	int			nsets = 0;
-	int			nwalks = 0;
 	int			nlists = 0;
+	int			rangecol = -1;
+	int			notnullcol = -1;
 	bool		anychosen = false;
 	ListCell   *lc;
 	int			c;
 
+	*walkcol = 0;
 	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
-		return false;
+		return LION_PLAIN_LIST;
 
 	for (c = 0; c < ncols; c++)
 	{
@@ -1091,12 +1127,18 @@ lion_plain_scan_is_sorted(PlannerInfo *root, IndexPath *path)
 			nsets++;
 		else if (IsA(cl, NullTest) &&
 				 ((NullTest *) cl)->nulltesttype == IS_NOT_NULL)
-			nwalks++;
+		{
+			if (notnullcol < 0)
+				notnullcol = c;
+		}
 		else if (bestrank[c] == 2 ||
 				 (IsA(cl, ScalarArrayOpExpr) &&
 				  lion_cost_is_range_op(index, c,
 										((ScalarArrayOpExpr *) cl)->opno)))
-			nwalks++;
+		{
+			if (rangecol < 0)
+				rangecol = c;
+		}
 		else if (IsA(cl, ScalarArrayOpExpr) &&
 				 get_op_opfamily_strategy(((ScalarArrayOpExpr *) cl)->opno,
 										  index->opfamily[c]) == LION_STRAT_EQUAL &&
@@ -1112,17 +1154,42 @@ lion_plain_scan_is_sorted(PlannerInfo *root, IndexPath *path)
 			nsets++;
 	}
 
-	/*
-	 * No key: a partial index read whole, by a walk of column 1 or, when that
-	 * column is multi-key, by a union.
-	 */
 	if (!anychosen)
-		return lion_index_is_multikey(index, 0);
+		return lion_index_is_multikey(index, 0) ? LION_PLAIN_SORTED :
+			LION_PLAIN_WALK;
 	if (nlists > 0)
-		return false;
-	if (nwalks > 0)
-		return nsets > 0;
-	return true;
+		return LION_PLAIN_LIST;
+	if (nsets > 0)
+		return LION_PLAIN_SORTED;
+	if (rangecol >= 0 || notnullcol >= 0)
+	{
+		*walkcol = (rangecol >= 0) ? rangecol : notnullcol;
+		return LION_PLAIN_WALK;
+	}
+	return LION_PLAIN_SORTED;
+}
+
+/*
+ * How many entries a WALK of key column c reads (LION_PLAIN_WALK): the
+ * column's n_distinct, times its range's selectivity when a range bounds the
+ * walk - the same count lion_range_entry_cost() prices the entries by, and
+ * the same caveat: it is the share of the column's values for a column whose
+ * rows spread evenly over them.
+ */
+static double
+lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *ranges = lion_cost_col_ranges(path, c);
+	double		entries = lion_cost_col_ndistinct(root, index, c);
+
+	if (ranges != NIL)
+	{
+		entries *= clauselist_selectivity(root, ranges, index->rel->relid,
+										  JOIN_INNER, NULL);
+		list_free(ranges);
+	}
+	return Max(1.0, entries);
 }
 
 /*
@@ -1144,10 +1211,21 @@ lion_plain_scan_is_sorted(PlannerInfo *root, IndexPath *path)
 #define LION_BITMAP_ROW_COST		0.1
 
 /*
+ * What a WALK pays for an entry past the first, in cpu_tuple_cost, beyond what
+ * the bitmap scan's walk of the same entry pays: the plain scan streams each
+ * entry through a stream of its own, the other columns' sets beside it
+ * (lion_source_next()), where the bitmap scan adds the entry's members to its
+ * bitmap.  Measured on an assert-enabled build over 4,000 to 390,000 one-row
+ * entries of a timestamp stored in heap order, the heap in memory: 0.30 to
+ * 0.35 us an entry more than the bitmap scan, against 55 ns for a row of a
+ * sequential scan.
+ */
+#define LION_WALK_PASS_COST		5.0
+
+/*
  * The correlation handed to cost_index() for a plain scan (DESIGN.md
- * §29.11).  A scan whose TIDs are not in heap order - a WALK in key order, a
- * LIST restarted per batch - gets the column's, as btree's does
- * (lion_index_correlation()).
+ * §29.11).  A LIST, which restarts the heap for every batch, gets the
+ * column's, as btree's does (lion_index_correlation()).
  *
  * For a scan in heap order it is not a statistic but the value that makes
  * cost_index()'s heap side come out at what the scan reads and does, which
@@ -1175,6 +1253,22 @@ lion_plain_scan_is_sorted(PlannerInfo *root, IndexPath *path)
  * than the bitmap heap scan, which is not credited: with one row to a page
  * the two cost about the same.
  *
+ * A WALK hands out one entry's TIDs in heap order, then the next entry's:
+ * it is a pass over the heap per entry, each reading its entry's pages in
+ * block order - a bitmap heap scan of one entry's rows, done once per entry
+ * (lion_plain_walk_entries()).  So its pages are what compute_bitmap_pages()
+ * counts for scans repeated that often, Mackert and Lohman's for all the rows
+ * together (a page a later pass reads again comes from the cache while the
+ * cache holds the heap), each at the price of a pass's own pages - a pass of
+ * a few pages pays random_page_cost for each, and one over most of the heap
+ * seq_page_cost - and its fetches are counted per pass, and each pass past
+ * the first costs its stream (LION_WALK_PASS_COST).  One entry is a sorted
+ * scan; entries of a row each are btree's uncorrelated end, one random read a
+ * row, and a stream each.  It used to be priced as btree's whatever its
+ * entries held: `flag >= true`, one entry over 80% of 1M rows on every page,
+ * came to 2.4 times the bitmap scan's price for 1.14 to 1.41 times its time,
+ * and two entries of 40% to 2.9 times for 1.2 to 1.5 (2026-09-27).
+ *
  * cost_index() charges no more than its uncorrelated end, so at a
  * random_page_cost near seq_page_cost the heap side of a result on nearly
  * every page is clamped there, about the bitmap heap scan's, and the choice
@@ -1200,6 +1294,11 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	Cost		max_io;
 	Cost		min_io;
 	double		csquared;
+	double		passes = 1.0;	/* heap passes: the entries of a WALK */
+	double		passpages;		/* the pages one pass reads */
+	double		visits;			/* the page visits of all the passes */
+	int			walkcol;
+	int			shape;
 
 	/*
 	 * An index-only scan is left as it was: lion's are of queries that need no
@@ -1208,25 +1307,41 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	 * (liongettuple()), which the all-visible fraction cost_index() applies
 	 * would not describe.
 	 */
-	if (path->path.pathtype == T_IndexOnlyScan ||
-		!lion_plain_scan_is_sorted(root, path))
+	if (path->path.pathtype == T_IndexOnlyScan)
+		return corr;
+	shape = lion_plain_scan_shape(root, path, &walkcol);
+	if (shape == LION_PLAIN_LIST)
 		return corr;
 
 	T = (baserel->pages > 1) ? (double) baserel->pages : 1.0;
 	tuples = clamp_row_est(sel * baserel->tuples);
 	get_tablespace_page_costs(baserel->reltablespace, &spc_random_page_cost,
 							  &spc_seq_page_cost);
+	if (shape == LION_PLAIN_WALK)
+		passes = Min(lion_plain_walk_entries(root, path, walkcol), tuples);
 
-	/* compute_bitmap_pages() and cost_bitmap_heap_scan() */
-	if (loop_count > 1)
+	/*
+	 * compute_bitmap_pages() and cost_bitmap_heap_scan(), for `passes` scans
+	 * of tuples / passes rows each
+	 */
+	if (loop_count > 1 || passes > 1.0)
 		pages = index_pages_fetched(tuples * loop_count, baserel->pages,
 									(double) index->pages, root) / loop_count;
 	else
 		pages = (2.0 * T * tuples) / (2.0 * T + tuples);
 	pages = (pages >= T) ? T : ceil(pages);
-	target = pages * ((pages >= 2.0) ?
+	if (passes > 1.0)
+	{
+		double		perpass = tuples / passes;
+
+		passpages = Min((2.0 * T * perpass) / (2.0 * T + perpass), T);
+	}
+	else
+		passpages = pages;
+	visits = Min(passes * passpages, tuples);
+	target = pages * ((passpages >= 2.0) ?
 					  spc_random_page_cost -
-					  (spc_random_page_cost - spc_seq_page_cost) * sqrt(pages / T) :
+					  (spc_random_page_cost - spc_seq_page_cost) * sqrt(passpages / T) :
 					  spc_random_page_cost);
 
 	/* cost_index()'s ends: uncorrelated (max_io) and packed (min_io) */
@@ -1259,7 +1374,8 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	target += tuples * (qcost.per_tuple +
 						LION_BITMAP_ROW_COST * cpu_operator_cost);
 	target += LION_PLAIN_FETCH_ROW_COST * cpu_tuple_cost *
-		Max(tuples - pages, 0.0);
+		Max(tuples - visits, 0.0);
+	target += LION_WALK_PASS_COST * cpu_tuple_cost * Max(passes - 1.0, 0.0);
 
 	if (max_io <= min_io)
 		return 0.0;
