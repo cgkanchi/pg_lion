@@ -41,7 +41,7 @@ estimate that benefit; dirty pages require visibility checks in the heap.
 | Count many matches, combine equality filters, or count groups | Consider Lion on the columns used by these queries. The largest measured gains come from `LionCount` pushdown. |
 | Fetch a handful of rows, or count a very selective key | B-tree is a strong default. The latest run shows practical parity for tiny equality counts and no consistent heap-fetch advantage from Lion. |
 | Count matches within a scalar range | Consider Lion count pushdown when the column has few distinct values (days, statuses, small integers): the measured clean range count beats B-tree at both scales. Fetching matching rows has different costs. |
-| Range filters on high-cardinality columns (timestamps, ids, prices) | A poor fit for now. A range is answered one distinct key at a time, so its cost grows with the number of distinct values in the range (or outside it, whichever is smaller), not with the rows counted. A range covering nearly all of the column's values is cheap, but a time window over a timestamp column is not. Keep a B-tree on such columns, and don't rely on Lion to answer the range. |
+| Range filters on high-cardinality columns (timestamps, ids, prices) | Build the index `WITH (summaries = auto)` (or `on`). Without it a range is answered one distinct key at a time, so its cost grows with the number of distinct values in the range (or outside it, whichever is smaller), and a time window over a timestamp column is slow. With it the column keeps one summary posting set per bucket of about 4096 rows, and a range counts whole buckets at once: a million-key range went from 346 ms to 3.9 ms on an assert build (DESIGN.md §31). Summaries cost inserts CPU - 31% more for single-row INSERTs and 73% for a bulk INSERT in that measurement, with two of the index's three columns summarized - and a few percent of index size. |
 | Ordered retrieval or uniqueness | Keep B-tree. Lion supplies bitmap and plain index scans and count pushdown, not ordered row retrieval or unique indexes. |
 | Array membership or exact-lexeme counts | Consider Lion when counts dominate; compare against GIN on your predicates and result sizes. |
 | Full-text phrase/prefix search, or searches returning documents | Prefer GIN for the measured phrase/prefix cases; ordinary document fetching shows no clear Lion advantage. |
@@ -298,6 +298,16 @@ rejects a row.  For a multi-key column the keys are the extracted elements or le
 moves out of its entry tuple onto container pages of its own.
 `buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
 index key, and it grows by splitting instead of being sized once.
+`summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §31).
+With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
+consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their
+keys; `auto` gives them only to the columns whose keys are small next to a bucket (many distinct
+values), which is where ranges are slow.  Every insert into a summarized column also updates its
+bucket's set.  `summary_tids` (16 .. 16777216, default 4096) is the rows a bucket closes at.  Both
+are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at the next REINDEX.
+An index with summaries is format 7, which an older build refuses; one without is format 6, as
+before.  A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
+g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the

@@ -4635,9 +4635,10 @@ typedef struct LionLeafInfo
  * not a posting set (DESIGN.md §19).
  *
  * allow_range says the same of a range comparison (DESIGN.md §28), which
- * bounds the entry walk that drives the count and is not a source at all: an
- * OR's arms are sources of one union, and a range would have to be the union
- * of its entries there.
+ * bounds the entry walk that drives the count or, on another column, is a
+ * range taken as a source (§31).  Every caller allows it now - an OR's arm
+ * takes a range as a source, the rows the union of its sets holds - and it is
+ * the caller that decides which of the two a range is.
  *
  * allow_recheck says the same of a multi-key clause whose query the node only
  * has at run time (DESIGN.md §17, "A query known only at run time"), which may
