@@ -8370,6 +8370,12 @@ country)` reads `L13`'s rows in key order, the heap at random: 17 s against its 
 to a lion plain scan, whose heap is read in order, it erred the other way - 3 times the bitmap
 scan's price at the default random_page_cost for 1.5 times its time.
 
+Measured again with the endpoint probe (§28), the WALK priced as passes and the remainder charged to
+the path (above) (2026-09-27, the same table and build, a loaded machine): every choice of the "chosen
+after" column holds at both random_page_costs. The plain and the bitmap scan took 1,631 and 1,215 ms
+for `L13`, 2,398 and 1,943 for `L13r`, 839 and 837 for `M4`, 546 and 927 for `M2`, and 53 and 60 for
+`M05`; the chosen plans 1,064, 2,294, 835, 592 and 50.
+
 **The count's recheck is priced the same way** (2026-09-24 review). With a correlation, a plain
 scan of a clustered value is cheap: 5000 rows of one value on 32 heap pages. The count pushdown
 charged its heap recheck one page per candidate TID up to the dirty part of the heap, so when the
