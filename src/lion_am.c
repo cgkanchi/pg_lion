@@ -1271,9 +1271,9 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
  *
  * cost_index() charges no more than its uncorrelated end, so at a
  * random_page_cost near seq_page_cost the heap side of a result on nearly
- * every page is clamped there, about the bitmap heap scan's, and the choice
- * between the two falls to their CPU and to the parallel bitmap scan, which
- * the plain scan has no counterpart to (DESIGN.md §29.1).
+ * every page is clamped there, about the bitmap heap scan's, and the fetches
+ * that make the plain scan dearer are lost; what the correlation cannot carry
+ * is charged to the path once it is built (lion_plain_note_remainder()).
  */
 static double
 lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
@@ -1376,6 +1376,10 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	target += LION_PLAIN_FETCH_ROW_COST * cpu_tuple_cost *
 		Max(tuples - visits, 0.0);
 	target += LION_WALK_PASS_COST * cpu_tuple_cost * Max(passes - 1.0, 0.0);
+
+	/* what the uncorrelated end cannot carry is charged to the path later */
+	if (target > max_io && loop_count <= 1.0 && path->path.param_info == NULL)
+		lion_plain_note_remainder(root, path, target - max_io);
 
 	if (max_io <= min_io)
 		return 0.0;
