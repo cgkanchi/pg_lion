@@ -712,13 +712,13 @@ VACUUM (ANALYZE) lion_oddx;
 SELECT ordered FROM lion_index_stats('lion_oddx_k');
 SET pg_lion.enable_count_pushdown = off;
 SET enable_seqscan = off;
+SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_oddx WHERE k = 7::int8;
 SELECT count(*) AS bitmap_one FROM lion_oddx WHERE k = 7::int8;
 SELECT count(*) AS bitmap_many FROM lion_oddx
 	WHERE k = ANY (ARRAY(SELECT ((i * 37) % 5000)::int8 FROM generate_series(1, 300) i));
 RESET enable_seqscan;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
 SELECT count(*) AS expected_many FROM lion_oddx
 	WHERE k = ANY (ARRAY(SELECT ((i * 37) % 5000)::int8 FROM generate_series(1, 300) i));
 RESET enable_bitmapscan;
