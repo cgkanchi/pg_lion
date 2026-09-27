@@ -3360,9 +3360,10 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
  *	  over all of their containers, as a single count of them would make, and
  *	  a private copy of what survives, which every count then seeks with a
  *	  binary search (LION_FKJOIN_COPY_PROBE_COST a probe).  Only when the copy
- *	  is expected to fit in work_mem - a container's members at two bytes
- *	  each, a bitset's 4 kB at most - because past it the executor gives up
- *	  and probes.
+ *	  is expected to fit in a hash join's memory (get_hash_memory_limit(),
+ *	  which is also what the executor gives it) - a container's members at two
+ *	  bytes each, a bitset's 4 kB at most - because past it the executor gives
+ *	  up and probes.
  *
  * Either way the filters are located once for the whole scan, each one lookup
  * and one walk of its chain, as a single count prices them.
@@ -3587,7 +3588,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 								(LION_FKJOIN_COPY_PROBE_COST +
 								 perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
 
-		if (copybytes <= (double) work_mem * 1024.0 && collected < probed)
+		if (copybytes <= (double) get_hash_memory_limit() &&
+			collected < probed)
 			*collect = true;
 	}
 	run += *collect ? collected : probed;
@@ -8915,8 +8917,8 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
  * a source that does.  The WHERE sets themselves stay located, as they always
  * are for the length of a run.  Not on a standby, where the interlock depends
  * on the WAL mode of every index read (lion_count_sources_cached()) and the
- * ordinary counts are left to decide it; and not past work_mem, where the copy
- * gives up and the counts read the filters as they always did.
+ * ordinary counts are left to decide it; and not past a hash join's memory,
+ * where the copy gives up and the counts read the filters as they always did.
  */
 static void
 lion_join_collect(LionCountScanState *st)
@@ -8945,9 +8947,14 @@ lion_join_collect(LionCountScanState *st)
 	if (k == st->nitem)
 		return;
 
+	/*
+	 * The budget is a hash join's (get_hash_memory_limit(): work_mem times
+	 * hash_mem_multiplier): the copy stands where the ordinary plan's hash
+	 * table would.
+	 */
 	oldcxt = MemoryContextSwitchTo(st->outercxt);
 	ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
-							  &st->sources[1], (Size) work_mem * 1024,
+							  &st->sources[1], get_hash_memory_limit(),
 							  &st->joinfilter, &st->stats);
 	MemoryContextSwitchTo(oldcxt);
 	if (!ok)
@@ -9923,8 +9930,8 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 			/*
 			 * The rows of the collected fact filters, or -1 when the plan
-			 * collected them and the run could not (a copy over work_mem, a
-			 * standby) and every count read the filters instead.
+			 * collected them and the run could not (a copy over the memory
+			 * limit, a standby) and every count read the filters instead.
 			 */
 			if (st->joincollect)
 				ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
