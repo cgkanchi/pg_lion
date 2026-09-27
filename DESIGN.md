@@ -7047,6 +7047,8 @@ mid-cardinality column that term is small and the index is a fraction of a btree
 bitmap scan wins; on a near-unique column every row is an entry, the index is larger than the btree
 (an entry header per row) and the entry term adds to the per-row charge, so btree - which also has a
 correlation to exploit, and a lion scan never has one - wins. `test/sql/range.sql` pins both choices.
+A bound past the histogram's end is estimated with the column's actual end, read from the directory
+(The endpoint probe, below).
 
 On a MULTICOLUMN path `genericcostestimate()` prorates by every column's selectivity together,
 while the range column is walked whole whatever the others select; the postings of the range that
@@ -7298,9 +7300,90 @@ keys is costed at 97,424 and goes to a plain index scan, 72 ms against 280.
 and a stale histogram or an `n_distinct` that ANALYZE's sample got wrong makes a range of millions of
 keys look like a range of thousands. That is what happened on the 550M-row table: 46.8 million keys
 at an estimated 312k. Execution is robust to it now: the race picks the smaller side whatever the
-plan thought. The plan choice is not, and a directory probe at plan time would make it so: InnoDB's
-`records_in_range` descends to both bounds and estimates the leaves between from the internal levels.
-It is the obvious next step, and it is not done here.
+plan thought. The plan choice is not. A bound past the histogram's end is now read from the
+directory, as core reads it from a btree (The endpoint probe, below); a histogram that is stale
+inside, or an `n_distinct` that is wrong, is not. InnoDB's `records_in_range`, which descends to
+both bounds and estimates the leaves between from the internal levels, would correct both, and is
+still not done.
+
+### The endpoint probe (2026-09-27)
+
+ANALYZE's histogram ends at the largest value its sample saw, and a column that grows at one end - a
+timestamp, a serial id - puts every row added since past that end. Core estimates an inequality past
+it at a hundredth of one bin (`ineq_histogram_selectivity()` clamps to that when it has no actual
+end), so `ts >= now() - interval '30 days'` on a table grown by a tenth since its last ANALYZE came
+out at 330 rows for 148,760. Core corrects this with `get_actual_variable_range()`: whenever the
+histogram's binary search is about to compare the constant with the first or last entry, it reads the
+column's actual minimum or maximum from an index and puts it in place of that entry, and the bound
+then falls inside the last bin and is interpolated there. It reads only ordered indexes that can
+return their first column - a btree - so a column indexed by lion alone never got the correction, in
+lion's own estimates or anyone's.
+
+Lion's cost model now makes the same correction itself, from lion's directory (`lion_selfuncs.c`):
+
+- **Where.** Exactly where core would read an end: lion runs core's binary search over the
+  histogram with the clause's own operator and constant (`lion_probe_ends_wanted()`), under core's
+  own conditions for using the histogram (its collation, `comparison_ops_are_compatible()`). The
+  constant is what `get_restriction_variable()` makes of the other side, so `now() - interval` is
+  one. A Param is not, and is not probed.
+- **What is read.** The column's first or last VALUE entry whose posting set has a live row. The
+  directory is in the key's order within each key column (§21), so a descent to (attno, VALUE) with
+  no key lands on the first VALUE entry (`lion_dir_value_start()`), and one to (attno, the first kind
+  after VALUE) just past the last (`lion_dir_value_end()`), whichever key column of the index it is.
+  The walk goes on from there, a leaf at a time, to the right or through the left links
+  (`lion_dir_step_left()`, nbtree's `_bt_walk_left()` without page deletion), copying each leaf's
+  entries under its share lock and testing them with none held. A row is live when the visibility
+  map vouches for its page or `SnapshotNonVacuumable` accepts it, core's test: a key whose rows are
+  all deleted is not an end, and one whose rows are recently dead or uncommitted is. Only an ordered
+  scalar column is probed, and only when its order is the histogram's (the key type's default btree
+  comparison, the index's collation the statistics').
+- **Bounded, as core's is.** `LION_PROBE_HEAP_PAGES` (100, core's `VISITED_PAGES_LIMIT`) heap pages
+  without a live row, or `LION_PROBE_LEAVES` (100) directory leaves, and the probe gives up and the
+  histogram's own end stands. The leaves bound matters where core's does not: a directory leaf is
+  never unlinked (§18), so deleting a column's newest keys and vacuuming leaves their leaves empty
+  and linked, where a btree would have deleted its pages. An index that grew by inserts holds about
+  34 one-row keys of a column to a leaf, so the 10,000 newest keys deleted are past the bound and
+  1,000 are not (`test/sql/rangeprobe.sql` §3 shows both).
+- **Once per planner run.** The ends are cached for the PlannerGlobal of the query, in its memory,
+  and forgotten when that memory is reset. Neither a hypothetical nor a partial index is read, nor the
+  parent of an inheritance tree. A column core reads itself - it has a btree on it - is left to core.
+- **Lion's estimates only.** The probed ends go into a copy of the column's `pg_statistic` row, which
+  `get_relation_stats_hook` hands to core's own `clauselist_selectivity()` while lion prices one of
+  its accesses (`lion_probe_begin()` .. `lion_probe_end()`): `lioncostestimate()` for every lion
+  index path - the selectivity `genericcostestimate()` prorates the index by, the entries
+  `lion_range_entry_cost()` prices, the heap side priced from them, and so LionOrdered's lion side -
+  and the count pushdown's paths (`lion_try_count_path()`: the range's share of its entries, and the
+  rows `lion_cost_count_rel()` and `lion_cost_range_sum()` recheck, `lion_probe_rel_rows()`). The
+  relation's row count and every other path's estimates stay core's. Core caches a clause's
+  selectivity in its RestrictInfo the first time it is asked (`clause_selectivity_ext()`), so the
+  scope clears that cache on each clause it corrects and puts it back when it ends.
+
+The correction is core's, and so is its reach: the bound lands in the last bin, which holds a
+hundredth of the rows ANALYZE saw at the default statistics target, so an estimate past the end rises
+to at most that share however many rows were added. On the 550M-row table it would lift the 90-day
+range to at most 5.5 million keys against 46.8 million - 35 times what the plan saw and still 8 times
+short - and whether that alone moves the plan depends on the range's price per key.
+
+Measured on the assert build (PostgreSQL 18.6), best of three warm runs; "before" is the build without
+the probe:
+
+| table, query | actual rows | lion's estimate before / now | lion's price before / now | chosen, ms |
+|---|---|---|---|---|
+| 3.3M rows, the newest 300k past the histogram and in heap order: `sum(id) WHERE ts >= now() - interval '30 days'` | 148,760 | 330 / 14,769 | plain 605 / 24,249, bitmap 1,261 / 32,181 | plain scan 83-87 (bitmap 38-48, seq 663) |
+| the same, `count(*)` | 148,760 | 330 / 14,780 | LionCount 75 / 3,344 | LionCount 63 |
+| the 300k newest rows in the space a DELETE and VACUUM of a tenth freed, on 42,773 of 42,858 pages: `sum(id)`, 30 days | 148,760 | 300 / 13,363 | plain 552 / 22,027, bitmap 1,148 / 29,246 | plain scan 100 (bitmap 84) |
+| `rangeprobe.sql`'s table, 1,500 rows analyzed and 28,500 added: `count(*) WHERE ts >= '2026-01-02 02:00'` | 28,441 | 60 / 5,926 | LionCount 69 / 1,274 | LionCount 12.6-16 before, seq scan 4.1 now |
+
+The first three plans are the same before and after: a 30-day range of a large table is a small share
+of it, which lion reads quickly whatever it was priced at, far ahead of the sequential scan. Two of
+them are the fastest plan. The first is not - the plain scan streams its 148,760 one-row entries a
+stream each (§29.11) and takes twice the bitmap scan's time - and is still chosen because the
+estimate it is priced by, 14,769 entries, is a tenth of them: the probe's reach, above. The last row
+is a range over most of a table whose statistics saw a twentieth of it, with a histogram of five bins
+so that its last one holds a fifth of the rows: there the count pushdown walked 28,441 entries it had
+priced as 60, and a sequential scan does the count in a third of the time. The probe costs 7
+shared-buffer reads and about 0.05 ms of planning per planner run (0.12 ms against 0.07 for the
+30-day count), and none when no bound is past an end.
 
 ### Dropping the range for a heap recheck (considered, not done)
 
@@ -7421,7 +7504,17 @@ Summed`. The cases:
 - a partitioned table whose partitions each take a different way.
 
 It also checks that a sum over 20,000 one-row entries reads each leaf once, and that a full-domain
-range reads a few descents' worth of pages. `test/isolation/count_range_split_race.spec` parks a
+range reads a few descents' worth of pages.
+
+`test/sql/rangeprobe.sql` (2026-09-27) covers the endpoint probe on a table analyzed at 1,500 rows,
+sampled whole, and grown to 30,000 past both ends of two of its columns, the first and the third of
+the index. Written before the code, it fails on the build before it: lion's estimate of a range past
+either end is core's, the count and the sum over it go to the count pushdown and to the plain scan,
+where a sequential scan is three times faster. It checks lion's estimate against core's; the plans,
+and the answers against a sequential scan's; a bound inside the histogram, which is not probed; the
+newest 1,000 rows deleted, before VACUUM and after, where lion's estimate is the number core makes
+with a btree on the column; 9,000 more, past `LION_PROBE_LEAVES`, where the probe gives up and the
+histogram's end stands; a partial index, and a Param. `test/isolation/count_range_split_race.spec` parks a
 range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
 both counts against the heap.
