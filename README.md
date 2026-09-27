@@ -40,7 +40,8 @@ estimate that benefit; dirty pages require visibility checks in the heap.
 | --- | --- |
 | Count many matches, combine equality filters, or count groups | Consider Lion on the columns used by these queries. The largest measured gains come from `LionCount` pushdown. |
 | Fetch a handful of rows, or count a very selective key | B-tree is a strong default. The latest run shows practical parity for tiny equality counts and no consistent heap-fetch advantage from Lion. |
-| Count matches within a scalar range | Consider Lion count pushdown: the measured clean range count beats B-tree at both scales. Fetching matching rows has different costs. |
+| Count matches within a scalar range | Consider Lion count pushdown when the column has few distinct values (days, statuses, small integers): the measured clean range count beats B-tree at both scales. Fetching matching rows has different costs. |
+| Range filters on high-cardinality columns (timestamps, ids, prices) | A poor fit for now. A range is answered one distinct key at a time, so its cost grows with the number of distinct values in the range (or outside it, whichever is smaller), not with the rows counted. A range covering nearly all of the column's values is cheap, but a time window over a timestamp column is not. Keep a B-tree on such columns, and don't rely on Lion to answer the range. |
 | Ordered retrieval or uniqueness | Keep B-tree. Lion supplies bitmap and plain index scans and count pushdown, not ordered row retrieval or unique indexes. |
 | Array membership or exact-lexeme counts | Consider Lion when counts dominate; compare against GIN on your predicates and result sizes. |
 | Full-text phrase/prefix search, or searches returning documents | Prefer GIN for the measured phrase/prefix cases; ordinary document fetching shows no clear Lion advantage. |

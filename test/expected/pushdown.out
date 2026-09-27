@@ -581,7 +581,7 @@ SELECT * FROM lion_explain_norm('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GR
    Heap Blocks From Cache: 0
    Heap Blocks Past Cache Budget: 0
    Posting Sets Summed: 0
-   Directory Pages Read: 13
+   Directory Pages Read: 3
 (14 rows)
 
 -- a parameter in the HAVING, under a generic plan

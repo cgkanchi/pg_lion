@@ -270,6 +270,45 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  */
 #define LION_RANGE_ENTRY_COST	(40.0 * cpu_tuple_cost)
 
+/*
+ * ... and of one SMALL entry of a summed range, counted with the rest of its
+ * leaf as one union (DESIGN.md §28, "Counting a walk"): the leaf is read once
+ * for all of them, and what is left per entry is its copy, its cursor and its
+ * share of the union.  Measured on the assert build over the 2M-row repro
+ * table: 0.3 to 0.5 us an entry of one row, against 1.5 before.
+ */
+#define LION_RANGE_UNION_ENTRY_COST	(12.0 * cpu_tuple_cost)
+
+/* Which walk a range bounds, for the cost model (DESIGN.md §28). */
+#define LION_RANGED_NONE	0
+#define LION_RANGED_WALK	1	/* a GROUP BY or count(DISTINCT) walk */
+#define LION_RANGED_SUM		2	/* the sum over the range's entries */
+
+/*
+ * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
+ * "Counting a walk"): the entries the walk copied out of one directory leaf
+ * are counted together, as the union of disjoint sets, when they are small -
+ * at most LION_SUM_UNION_MAX_ITEMS containers each on average - and one by
+ * one otherwise.  The union saves the set-up of a count per entry, which is
+ * the whole cost of an entry of a row or two; for entries of many containers
+ * that set-up is noise, and the pairwise container unions below the merge's
+ * bitset image (LION_OR_BITSET_MIN) cost more than it saves.  Measured on the
+ * repro table of DESIGN.md §28 (assert build), beside a selective equality:
+ * 86,399 one-row entries 148 ms one by one and 40 ms a leaf at a time; 1,000
+ * entries of 230 containers each 39 ms one by one and 165 ms as unions of
+ * eight leaves' worth.
+ */
+#define LION_SUM_UNION_MAX_ITEMS	4
+
+/*
+ * How a range bounding a sum is evaluated (DESIGN.md §28, "The complement"):
+ * the entries it selects, or the rows with a value minus the entries it does
+ * not select, or - when it selects every entry - the rows with a value alone.
+ */
+#define LION_RANGE_EVAL_INSIDE		0
+#define LION_RANGE_EVAL_COMPLEMENT	1
+#define LION_RANGE_EVAL_FULL		2
+
 /* Flag bits of the third integer of LION_PRIV_INTS. */
 #define LION_FLAG_SINGLEGROUP	0x01
 #define LION_FLAG_SUMALL			0x02
@@ -548,6 +587,13 @@ typedef struct LionCountScanState
 	 */
 	bool		hasrange;
 	LionRange	range;
+
+	/*
+	 * How each relation's range-bounded sum was evaluated (DESIGN.md §28, "The
+	 * complement"), indexed by LION_RANGE_EVAL_*: what EXPLAIN ANALYZE prints
+	 * as "Range Evaluation".
+	 */
+	int64		rangeeval[3];
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -1861,16 +1907,14 @@ lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col)
 }
 
 /*
- * How many entries of `var`'s index a range walk visits (DESIGN.md §28): the
- * column's n_distinct over the WHOLE table - a walk visits an entry whatever
- * the other clauses leave of it - times the range's own selectivity, at least
- * one.  n_distinct is taken as examine_variable() gives it rather than
- * through estimate_num_groups(), which would scale it down by every clause of
- * the relation, the range included, and count the range twice.
+ * `var`'s n_distinct over the WHOLE table - a walk visits an entry whatever
+ * the other clauses leave of it - which is how many entries a scalar column's
+ * index has.  It is taken as examine_variable() gives it rather than through
+ * estimate_num_groups(), which would scale it down by every clause of the
+ * relation, a range included, and count the range twice.
  */
 static double
-lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
-				  Selectivity sel)
+lion_var_ndistinct(PlannerInfo *root, RelOptInfo *rel, Var *var)
 {
 	VariableStatData vardata;
 	double		ndistinct;
@@ -1880,7 +1924,18 @@ lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
 	ndistinct = get_variable_numdistinct(&vardata, &isdefault);
 	ReleaseVariableStats(vardata);
 
-	return Max(1.0, ndistinct * sel);
+	return Max(1.0, ndistinct);
+}
+
+/*
+ * How many entries of `var`'s index a range walk visits (DESIGN.md §28): its
+ * n_distinct times the range's own selectivity, at least one.
+ */
+static double
+lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
+				  Selectivity sel)
+{
+	return Max(1.0, lion_var_ndistinct(root, rel, var) * sel);
 }
 
 /*
@@ -2242,6 +2297,160 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
 	return (Var *) arg;
 }
 
+/*
+ * THE SUM OVER A RANGE (DESIGN.md §28, "The cost of a summed range"):
+ * `count(*) WHERE <range on k> [AND F]`, priced as lion_sumall_relation()
+ * runs it.
+ *
+ *	- ONE side of the range is walked: the entries it selects, or - when F
+ *	  has a positive source and k's directory is ordered - the entries below
+ *	  and above it, plus one count of F minus k's NULL entry (the complement).
+ *	  The executor takes the side with fewer leaves, and so does this.
+ *	- Each entry walked costs a fixed amount (LION_RANGE_ENTRY_COST for one
+ *	  counted on its own, LION_RANGE_UNION_ENTRY_COST for a small one counted
+ *	  with the rest of its leaf) plus its OWN containers - the rows of one key
+ *	  of k, not the rows that survive F: the entry drives its count when it is
+ *	  the smaller, and F is then probed at each of its container keys, so the
+ *	  key steps are the smaller of the two containers' worth, once for every
+ *	  source.  How many containers one key's rows lie in follows the column's
+ *	  correlation with the heap, as cost_index() interpolates pages.
+ *	- The leaves under the entries walked are read once each; with a
+ *	  complement to choose, both sides are first stepped a leaf at a time up
+ *	  to the smaller one's end, counting only (lion_range_choose()).
+ *	- The heap the visibility map cannot vouch for: F's candidates and the
+ *	  entries' for the complement, the entries' for the range, each page
+ *	  fetched at most twice (the per-entry revisits of DESIGN.md §28).
+ *
+ * Before this the walk was charged the range's entries at LION_RANGE_ENTRY_COST
+ * and ONE container each - the rows of the whole count spread over them - so a
+ * range over 2,000 keys of a thousand rows each beside a selective equality
+ * was priced at 1,344 for 920,000 containers, and a range over 1.9 million keys
+ * at 813,000 whether or not the keys outside it were a handful.
+ */
+static Cost lion_range_recheck(PlannerInfo *root, RelOptInfo *rel,
+								double tids, double entries, double corr);
+
+static Cost
+lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
+					AttrNumber groupcol, Var *rangevar, Selectivity rangesel,
+					List *whereclauses, List *wherekinds, List *ors)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		matching = Max(rel->rows, 1.0);
+	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		sel = Min(Max(rangesel, 1e-10), 1.0);
+	double		nd = lion_var_ndistinct(root, rel, rangevar);
+	double		nin = Max(1.0, nd * sel);
+	double		nout = Max(0.0, nd - nin);
+	double		rowsper = Max(tuples * sel / nin, 1.0);
+	double		corr = lion_var_correlation(root, rel, rangevar);
+	double		scattered = lion_containers_for(heap_pages, rowsper);
+	double		inorder = Max(1.0, rowsper * ckeys / tuples);
+	double		percont = scattered + (inorder - scattered) * corr * corr;
+	double		pageper;
+	double		frows = Min(tuples, matching / sel);
+	double		fcont = lion_containers_for(heap_pages, frows);
+	double		steps;
+	double		perentry;
+	int			nsrc = list_length(ors);
+	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
+	int			ci = 0;
+	bool		ordered;
+	Relation	indexrel;
+	ListCell   *lc;
+	Cost		inside;
+	Cost		outside;
+
+	/* The sources of F: one per OR restriction, one per positive clause. */
+	foreach(lc, wherekinds)
+	{
+		if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc)) && orgrp[ci] < 0)
+			nsrc++;
+		ci++;
+	}
+	pfree(orgrp);
+
+	indexrel = index_open(groupidx->indexoid, AccessShareLock);
+	ordered = lion_index_column_state(indexrel, groupcol)->ordered;
+	index_close(indexrel, AccessShareLock);
+
+	/*
+	 * One entry: its fixed cost, and its containers' key steps against every
+	 * source of F.  Small ones are counted a leaf at a time.
+	 */
+	steps = (nsrc > 0) ? Min(percont, fcont) * (1.0 + nsrc) : percont;
+	perentry = ((percont <= (double) LION_SUM_UNION_MAX_ITEMS) ?
+				LION_RANGE_UNION_ENTRY_COST : LION_RANGE_ENTRY_COST) +
+		steps * cpu_operator_cost * 2.0;
+
+	/* The leaves under one entry: its share of the column's pages. */
+	pageper = Max(1.0, (double) groupidx->pages *
+				  lion_index_column_share(root, rel, groupidx, groupcol)) / nd;
+
+	inside = nin * (perentry + pageper * seq_page_cost) +
+		lion_range_recheck(root, rel, matching * dirtyfrac, nin, corr);
+	if (nsrc == 0 || !ordered)
+		return inside;
+
+	/*
+	 * The complement: the entries outside, the count of F minus the NULL
+	 * entry (F's containers once more, and a descent), and F's candidates on
+	 * top of the outside entries' for the recheck.
+	 */
+	outside = nout * (perentry + pageper * seq_page_cost) +
+		fcont * (1.0 + nsrc) * cpu_operator_cost * 2.0 + random_page_cost +
+		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
+						   Max(nout, 1.0), corr);
+
+	/* ... and the leaf-by-leaf race that picks the side, counting only. */
+	return Min(inside, outside) +
+		2.0 * Min(nin, nout) * pageper * seq_page_cost;
+}
+
+/*
+ * The heap recheck of a range walk (DESIGN.md §28): `tids` candidates on the
+ * pages the visibility map cannot vouch for, counted `entries` at a time.  The
+ * visibility cache fetches a dirty page once per query - but it answers a page
+ * only from its second visit on, and each count flushes its own recheck batch,
+ * so a page that holds candidates of several entries is fetched for each of
+ * them until the cache has it: never more than twice, and never more often
+ * than the entries' candidates lie on pages.  How many pages one entry's
+ * candidates lie on follows the column's order, as cost_index() interpolates
+ * it with the correlation's square: one per row scattered, their share of the
+ * heap in order.
+ */
+static Cost
+lion_range_recheck(PlannerInfo *root, RelOptInfo *rel, double tids,
+				   double entries, double corr)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		dirty_pages = Min(heap_pages * dirtyfrac, heap_pages);
+	double		rowsper;
+	double		scattered;
+	double		inorder;
+	double		perentry;
+	double		pages;
+
+	if (tids <= 0.0 || dirtyfrac <= 0.0)
+		return 0.0;
+
+	/* the candidates of one entry, dirty pages or not */
+	rowsper = tids / dirtyfrac / Max(entries, 1.0);
+	scattered = Min(rowsper, heap_pages);
+	inorder = Max(1.0, rowsper * heap_pages / tuples);
+	perentry = scattered + (inorder - scattered) * corr * corr;
+
+	pages = Min(tids, dirty_pages);
+	pages = Min(Min(tids, entries * perentry * dirtyfrac), 2.0 * pages);
+
+	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
+		tids * cpu_tuple_cost;
+}
+
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -2250,7 +2459,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *wherekinds,
 				   List *ors, double numgroups,
 				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar)
+				   double drivefrac, Var *rangevar, bool rangesum)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -2291,10 +2500,25 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	int			inlistci;
 	double		ingroups = numgroups;	/* groups the node really emits */
 	double		recheckshare = 1.0; /* §26: what the existence tests recheck */
+	Cost		rangecost = 0;	/* §28: the walk of a summed range */
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
 	ListCell   *lc4;
+
+	/*
+	 * A sum over a range (DESIGN.md §28) prices its walk, its entries and its
+	 * heap recheck itself (lion_cost_range_sum()); what is left here is the
+	 * WHERE sources, located once and read once - materialized after their
+	 * first use - and the one row.
+	 */
+	if (rangesum)
+	{
+		rangecost = lion_cost_range_sum(root, rel, groupidx, groupcol,
+										rangevar, drivefrac, whereclauses,
+										wherekinds, ors);
+		ingroups = 1.0;
+	}
 
 	/*
 	 * A count(DISTINCT k) without a GROUP BY walks k's entries, and a WHERE
@@ -2645,8 +2869,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		if (pages <= 0.0)
 			continue;			/* a negated clause, or nothing to read */
 
-		if (clausesrc[i] < 0 || clausesrc[i] == driver)
-			seq_pages += pages; /* walked: the driver, and a group's own list */
+		if (clausesrc[i] < 0 || clausesrc[i] == driver || rangesum)
+			seq_pages += pages; /* walked: the driver, a group's own list,
+								 * and what a range's entries are ANDed with */
 		else
 		{
 			pages = Min(pages,
@@ -2670,9 +2895,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * The entry scan of the driving index - unless an IN list on that very
 	 * column drives the groups instead (DESIGN.md §15), in which case its
 	 * elements' lookups and containers, charged above, ARE the per-group work
-	 * and the index's entries are never walked.
+	 * and the index's entries are never walked.  A summed range has priced its
+	 * walk already.
 	 */
-	if (groupidx != NULL && !groupdrive)
+	if (groupidx != NULL && !groupdrive && !rangesum)
 	{
 		/*
 		 * The entry scan walks ONE key column's entries and stops at the first
@@ -2814,6 +3040,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	recheck_tids = matching * dirtyfrac * recheckshare;
 	recheck_pages = Min(recheck_tids, dirty_pages);
 
+	/* A summed range has priced its own (lion_cost_range_sum()). */
+	if (rangesum)
+		recheck_tids = recheck_pages = 0.0;
+
 	/*
 	 * ... except that a RANGE-bounded walk (DESIGN.md §28) does not visit a
 	 * dirty page once per query: it counts entry by entry, each count flushes
@@ -2889,6 +3119,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += recheck_tids * cpu_tuple_cost;
 	run += ingroups * cpu_tuple_cost;
 	run += pair_cost;
+	run += rangecost;
 
 	return run;
 }
@@ -2906,7 +3137,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, List *ors,
 					double numgroups, double outer_entries,
 					double inner_entries, double outrows, int distinct,
-					bool ranged, double drivefrac)
+					int ranged, double drivefrac)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -2914,6 +3145,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	foreach(lc, targets)
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		Var		   *rangevar = (ranged != LION_RANGED_NONE) ?
+			t->drivevar[0] : NULL;
 
 		run += lion_cost_count_rel(root, t->rel,
 								  t->driveidx[0], t->drivecol[0],
@@ -2921,17 +3154,20 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
 								  outer_entries, inner_entries, distinct,
-								  drivefrac, ranged ? t->drivevar[0] : NULL);
+								  drivefrac, rangevar,
+								  ranged == LION_RANGED_SUM && rangevar != NULL &&
+								  t->driveidx[0] != NULL);
 
 		/*
-		 * A range-bounded walk (DESIGN.md §28) pays a fixed cost per entry it
-		 * visits, in each relation it walks - a partition's entries are its
-		 * own.  A count(DISTINCT) walk already pays its per-test cost for
-		 * each of them (§26), which is the same work.
+		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
+		 * entry it visits, in each relation it walks - a partition's entries
+		 * are its own.  A count(DISTINCT) walk already pays its per-test cost
+		 * for each of them (§26), which is the same work, and a summed range
+		 * has priced its entries in lion_cost_range_sum().
 		 */
-		if (ranged && distinct == LION_DISTINCT_NONE &&
-			t->drivevar[0] != NULL)
-			run += lion_range_entries(root, t->rel, t->drivevar[0],
+		if (ranged == LION_RANGED_WALK && distinct == LION_DISTINCT_NONE &&
+			rangevar != NULL)
+			run += lion_range_entries(root, t->rel, rangevar,
 									  drivefrac) * LION_RANGE_ENTRY_COST;
 	}
 
@@ -5403,7 +5639,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						(distvar == NULL) ? LION_DISTINCT_NONE :
 						distcounts ? LION_DISTINCT_COUNT :
 						LION_DISTINCT_EXISTS,
-						rangevar != NULL, rangesel);
+						(rangevar == NULL) ? LION_RANGED_NONE :
+						sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
+						rangesel);
 
 	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
@@ -6578,6 +6816,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->curpart = 0;
 	st->partopen = false;
 	memset(&st->stats, 0, sizeof(st->stats));
+	memset(st->rangeeval, 0, sizeof(st->rangeeval));
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
@@ -7479,6 +7718,269 @@ lion_count_relation(LionCountScanState *st)
 }
 
 /*
+ * Sum the counts of the entries one walk of the driving column returns - all
+ * of them (LION_WALK_ALL), or one part of a range's (LION_WALK_*) - each ANDed
+ * with sources[1 .. nsource - 1]; sources[0] is the driver's slot, which is
+ * borrowed for the walk's entries and handed back as it was.
+ *
+ * The entries of one directory leaf are taken together (DESIGN.md §28,
+ * "Counting a walk").  When they are small they are counted as ONE source
+ * whose sets are DISJOINT - distinct entries of one scalar column - so the
+ * count of the batch is the count of their union ANDed with the rest, and the
+ * sum over the leaves is the sum over the entries: §15's argument, the one the
+ * sum-over-all has always rested on, taken a leaf at a time instead of an
+ * entry at a time.  lion_count_sources_cached() then counts the batch as §15
+ * counts an IN list - summed set by set when it is the only positive source
+ * and summing is cheaper, merged as a union otherwise.  Large entries are
+ * counted one by one, as they always were (LION_SUM_UNION_MAX_ITEMS).
+ *
+ * Pins (DESIGN.md §9): every INLINE set of the batch holds the pin of the one
+ * leaf it was copied from until it has been counted, so a walk of any width
+ * holds one directory leaf pinned.  The WHERE sources are the relation's,
+ * located once, and are materialized on their second use as for any GROUP BY;
+ * the batch is then the positive source that carries the interlock.
+ */
+static int64
+lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
+			  int part)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource saved = sources[0];
+	LionPostingSet *sets;
+	int64		total = 0;
+	int			i;
+
+	if (part == LION_WALK_ALL || part == LION_WALK_INSIDE)
+		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
+									st->hasrange ? &st->range : NULL);
+	else
+		lion_entry_scan_begin_part(&st->escan, st->groupidx, st->groupidxcol,
+								   &st->range, part);
+	st->scanning = true;
+
+	/* One leaf's entries, which is at most what lion_count.c copies of one. */
+	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) *
+									 st->escan.maxbatch);
+
+	for (;;)
+	{
+		MemoryContext oldcxt;
+		int			nsets = 0;
+		int			per;
+		double		items = 0;
+		Datum		key;
+		bool		more = true;
+
+		CHECK_FOR_INTERRUPTS();
+
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		/*
+		 * The first entry may read a new leaf; the rest are what that leaf
+		 * holds of the walk.
+		 */
+		do
+		{
+			if (!lion_entry_scan_next(&st->escan, &key, &sets[nsets]))
+			{
+				more = false;
+				break;
+			}
+
+			/* The NULL entry's rows are the ones `IS NOT NULL` excludes. */
+			if (st->sumallitem >= 0 && sets[nsets].keyisnull)
+			{
+				lion_posting_set_release(&sets[nsets]);
+				continue;
+			}
+			items += sets[nsets].ncontainers;
+			nsets++;
+		} while (lion_entry_scan_batch_left(&st->escan) > 0);
+
+		/* Small entries are one count, large ones one count each. */
+		per = (items <= (double) nsets * LION_SUM_UNION_MAX_ITEMS) ?
+			Max(nsets, 1) : 1;
+
+		for (i = 0; i < nsets; i += per)
+		{
+			int64		summed = st->stats.sets_summed;
+			int			n = Min(per, nsets - i);
+
+			sources[0].nsets = n;
+			sources[0].sets = &sets[i];
+			sources[0].tree = NULL;
+			sources[0].negated = false;
+			sources[0].nomaterialize = false;
+			sources[0].disjoint = (n > 1);
+
+			total += lion_count_sources_cached(st->heap, estate->es_snapshot,
+											  nsource, sources,
+											  &st->stats, st->viscache,
+											  st->rel_read_only);
+
+			/*
+			 * "Posting Sets Summed" is the entries whose counts the walk added
+			 * up, however they were counted.
+			 */
+			st->stats.sets_summed = summed + n;
+		}
+
+		for (i = 0; i < nsets; i++)
+			lion_posting_set_release(&sets[i]);
+		MemoryContextSwitchTo(oldcxt);
+
+		if (!more)
+			break;
+	}
+
+	sources[0] = saved;
+	pfree(sets);
+	lion_entry_scan_end(&st->escan);
+	st->scanning = false;
+	return total;
+}
+
+/*
+ * count(*) WHERE k IS NOT NULL AND <sources[1 .. nsource - 1]>, k being the
+ * driving column: the WHERE sources minus k's reserved NULL entry, which is
+ * what `k IS NOT NULL` is as a source (DESIGN.md §14) - one merge, however
+ * many entries k has.  The caller has checked that a positive source is among
+ * them (lion_range_choose()).
+ */
+static int64
+lion_count_nonnull(LionCountScanState *st, LionCountSource *sources,
+				   int nsource)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *srcs;
+	LionPostingSet nullset;
+	MemoryContext oldcxt;
+	int64		count;
+	int			n = 0;
+	int			i;
+
+	MemoryContextReset(st->pergroup);
+	oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+	srcs = (LionCountSource *) palloc0(sizeof(LionCountSource) * nsource);
+	for (i = 1; i < nsource; i++)
+		srcs[n++] = sources[i];
+
+	if (lion_posting_set_lookup_null_col(st->groupidx, st->groupidxcol,
+										 &nullset))
+	{
+		srcs[n].nsets = 1;
+		srcs[n].sets = &nullset;
+		srcs[n].tree = NULL;
+		srcs[n].negated = true;
+		n++;
+	}
+
+	count = lion_count_sources_cached(st->heap, estate->es_snapshot, n, srcs,
+									  &st->stats, st->viscache,
+									  st->rel_read_only);
+	lion_posting_set_release(&nullset);
+	MemoryContextSwitchTo(oldcxt);
+
+	return count;
+}
+
+/*
+ * How to evaluate the range that bounds a sum (DESIGN.md §28, "The
+ * complement").  The VALUE entries of the range's column are three runs in
+ * directory order - BELOW the range, INSIDE it, ABOVE it - and the rows the
+ * sum wants are those of INSIDE ANDed with the WHERE sources F.  The entries
+ * being disjoint and every row with a value being under exactly one of them,
+ *
+ *		|INSIDE ∩ F| = |F − NULL(k)| − |BELOW ∩ F| − |ABOVE ∩ F|
+ *
+ * and |F − NULL(k)| is one merge.  So the sum can walk whichever side has
+ * fewer entries, and when BELOW and ABOVE are both empty - the range covers
+ * every key the column has - it walks nothing at all.
+ *
+ * Which side is smaller is decided here exactly, not from statistics: the
+ * INSIDE walk and the BELOW-then-ABOVE walk are stepped a leaf at a time in
+ * turn, counting what each would return without locating anything
+ * (lion_entry_scan_skip_leaf()), until one of them runs out.  That costs at
+ * most twice the leaves of the side that is then walked, which is small next
+ * to counting it, and it is what makes "every key is inside" an exact answer:
+ * the walks of BELOW and ABOVE ran to their ends and found no entry.  (An
+ * entry with a visible row exists from before the snapshot until the count is
+ * over - VACUUM deletes only empty ones - so a walk that saw none saw that
+ * there is none.  The same holds for the walks that count BELOW and ABOVE
+ * afterwards, which are ordinary walks.)
+ *
+ * The complement is not taken when
+ *
+ *	- the range is unordered, or empty: there is no run to take apart, or no
+ *	  row to count;
+ *	- no WHERE source is positive: |F − NULL(k)| has nothing to drive it, and
+ *	  a count of every row of the table is not something an index can give;
+ *	- the driving index is PARTIAL: its entries hold only the rows its
+ *	  predicate admits, and F − NULL(k) counts the others too.
+ */
+static int
+lion_range_choose(LionCountScanState *st, LionCountSource *sources,
+				  int nsource)
+{
+	LionEntryScan in;
+	LionEntryScan below;
+	LionEntryScan above;
+	int64		nin = 0;
+	int64		nout = 0;
+	bool		positive = false;
+	int			eval;
+	int			i;
+
+	if (!st->range.ordered || st->range.empty)
+		return LION_RANGE_EVAL_INSIDE;
+	for (i = 1; i < nsource; i++)
+		if (!sources[i].negated)
+			positive = true;
+	if (!positive)
+		return LION_RANGE_EVAL_INSIDE;
+	if (RelationGetIndexPredicate(st->groupidx) != NIL)
+		return LION_RANGE_EVAL_INSIDE;	/* the planner never picks one */
+
+	lion_entry_scan_begin_part(&in, st->groupidx, st->groupidxcol,
+							   &st->range, LION_WALK_INSIDE);
+	lion_entry_scan_begin_part(&below, st->groupidx, st->groupidxcol,
+							   &st->range, LION_WALK_BELOW);
+	lion_entry_scan_begin_part(&above, st->groupidx, st->groupidxcol,
+							   &st->range, LION_WALK_ABOVE);
+
+	for (;;)
+	{
+		if (!in.done)
+			nin += lion_entry_scan_skip_leaf(&in);
+		if (!below.done)
+			nout += lion_entry_scan_skip_leaf(&below);
+		else if (!above.done)
+			nout += lion_entry_scan_skip_leaf(&above);
+
+		if (in.done || (below.done && above.done))
+			break;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (!below.done || !above.done)
+		eval = LION_RANGE_EVAL_INSIDE;
+	else if (nout == 0)
+		eval = LION_RANGE_EVAL_FULL;
+	else if (!in.done || nout < nin)
+		eval = LION_RANGE_EVAL_COMPLEMENT;
+	else
+		eval = LION_RANGE_EVAL_INSIDE;
+
+	lion_entry_scan_end(&in);
+	lion_entry_scan_end(&below);
+	lion_entry_scan_end(&above);
+
+	return eval;
+}
+
+/*
  * The sum over every entry of the driving index (DESIGN.md §14,
  * `col IS NOT NULL` with nothing else to drive the merge).
  *
@@ -7501,19 +8003,17 @@ lion_count_relation(LionCountScanState *st)
  * container keys, for every entry of the index.  A `IS NOT NULL` on another
  * column is a different index's set and keeps its source.
  *
- * The caller owns the entry scan (this walks it to the end) and every posting
- * set it takes is released before the next one is located, so the §9 pin
- * budget is one entry's.
+ * The entries are counted a leaf at a time (lion_sum_walk()), and a range on
+ * the driving column may be answered from the entries it does NOT select
+ * (lion_range_choose()); DESIGN.md §28 has both.
  */
 static int64
 lion_sumall_relation(LionCountScanState *st)
 {
-	EState	   *estate = st->css.ss.ps.state;
 	LionCountSource *sources;
-	MemoryContext oldcxt;
-	int64		total = 0;
+	int64		total;
 	int			nsource;
-	Datum		key;
+	int			eval = LION_RANGE_EVAL_INSIDE;
 
 	if (st->wheremissing)
 		return 0;
@@ -7529,42 +8029,29 @@ lion_sumall_relation(LionCountScanState *st)
 		nsource = st->nsource;
 	}
 
-	lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
-								st->hasrange ? &st->range : NULL);
-	st->scanning = true;
+	if (st->hasrange)
+		eval = lion_range_choose(st, sources, nsource);
 
-	for (;;)
+	switch (eval)
 	{
-		CHECK_FOR_INTERRUPTS();
-
-		MemoryContextReset(st->pergroup);
-		oldcxt = MemoryContextSwitchTo(st->pergroup);
-
-		if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
-		{
-			MemoryContextSwitchTo(oldcxt);
+		case LION_RANGE_EVAL_FULL:
+			total = lion_count_nonnull(st, sources, nsource);
 			break;
-		}
-
-		/* The NULL entry's rows are the ones `IS NOT NULL` excludes. */
-		if (st->sumallitem >= 0 && st->groupset.keyisnull)
-		{
-			lion_posting_set_release(&st->groupset);
-			MemoryContextSwitchTo(oldcxt);
-			continue;
-		}
-
-		total += lion_count_sources_cached(st->heap, estate->es_snapshot,
-										  nsource, sources,
-										  &st->stats, st->viscache,
-										  st->rel_read_only);
-		st->stats.sets_summed++;
-		lion_posting_set_release(&st->groupset);
-		MemoryContextSwitchTo(oldcxt);
+		case LION_RANGE_EVAL_COMPLEMENT:
+			total = lion_count_nonnull(st, sources, nsource);
+			total -= lion_sum_walk(st, sources, nsource, LION_WALK_BELOW);
+			total -= lion_sum_walk(st, sources, nsource, LION_WALK_ABOVE);
+			Assert(total >= 0);
+			break;
+		default:
+			total = lion_sum_walk(st, sources, nsource,
+								  st->hasrange ? LION_WALK_INSIDE :
+								  LION_WALK_ALL);
+			break;
 	}
 
-	lion_entry_scan_end(&st->escan);
-	st->scanning = false;
+	if (st->hasrange)
+		st->rangeeval[eval]++;
 	return total;
 }
 
@@ -8387,6 +8874,20 @@ lion_exec_custom_scan(CustomScanState *node)
 			break;
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	/*
+	 * A row goes up to the executor, which may not ask for the next one for as
+	 * long as a cursor stays open: the walks let go of the directory leaf they
+	 * stand on (lion_entry_scan_pause()), so that an idle cursor over a GROUP BY
+	 * does not hold VACUUM up on it.
+	 */
+	if (slot != NULL)
+	{
+		if (st->scanning)
+			lion_entry_scan_pause(&st->escan);
+		if (st->scanning2)
+			lion_entry_scan_pause(&st->escan2);
+	}
 	st->dirpages += lion_dir_pages_read - dirbefore;
 
 	return slot;
@@ -8969,6 +9470,40 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 * values live on plus one descent, not a descent per value.
 		 */
 		ExplainPropertyInteger("Directory Pages Read", NULL, st->dirpages, es);
+
+		/*
+		 * How the range bounding a sum was evaluated (DESIGN.md §28, "The
+		 * complement"): from the entries it selects ("inside"), from the ones
+		 * it does not ("complement"), or from none because it selects them all
+		 * ("full domain").  A partitioned table, or a rescan, may take more
+		 * than one way; each is then printed with how often it was taken.
+		 */
+		if (st->hasrange && st->sumall)
+		{
+			static const char *const evalname[] = {"inside", "complement",
+			"full domain"};
+			int			kinds = 0;
+			int			k;
+
+			initStringInfo(&buf);
+			for (k = 0; k < (int) lengthof(evalname); k++)
+				if (st->rangeeval[k] > 0)
+					kinds++;
+			for (k = 0; k < (int) lengthof(evalname); k++)
+			{
+				if (st->rangeeval[k] == 0)
+					continue;
+				if (buf.len > 0)
+					appendStringInfoString(&buf, ", ");
+				appendStringInfoString(&buf, evalname[k]);
+				if (kinds > 1)
+					appendStringInfo(&buf, " %lld",
+									 (long long) st->rangeeval[k]);
+			}
+			if (buf.len > 0)
+				ExplainPropertyText("Range Evaluation", buf.data, es);
+			pfree(buf.data);
+		}
 
 		/*
 		 * The existence (or count) tests a count(DISTINCT k) made: one per
