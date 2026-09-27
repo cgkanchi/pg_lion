@@ -15,7 +15,9 @@
  * or `k IS NOT NULL` (§14), each on a column with a usable lion index.
  * The first three select rows and are intersected; `IS NOT NULL` subtracts
  * the index's NULL entry from the result, and when it is the only clause the
- * node sums the counts of every entry of that index instead.  A boolean
+ * node sums the counts of every entry of that index instead.  The "const" is
+ * anything the node can evaluate once per scan - a literal, a parameter, a
+ * stable expression such as `now() - interval '1 day'` - and a boolean
  * column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`) is the
  * equality `flag = true` or `flag = false` it stands for.
  *
@@ -303,7 +305,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	3	List of Expr, one per WHERE clause: the compared value, the array of
  *		an IN list, or a NULL Const placeholder for a null test.  It is a
  *		Const for a literal query and a Param - or an ArrayExpr over Consts
- *		and Params - for a prepared one (DESIGN.md §10).  The PATH carries
+ *		and Params - for a prepared one, or any other stable expression over
+ *		those (DESIGN.md §10).  The PATH carries
  *		them here; lion_plan_custom_path() moves them into the CustomScan's
  *		custom_exprs and leaves this member empty, because that is the field
  *		setrefs.c fixes up and SS_finalize_plan() collects Param ids from -
@@ -426,10 +429,11 @@ typedef struct LionClauseState
 	 * The compared value: its expression (from custom_exprs), the expression
 	 * itself when it is a plain Const, an initialised ExprState when it is
 	 * not, and the value once it has been evaluated.  A literal query has its
-	 * value ready at plan time; a prepared one evaluates its Param through
-	 * the node's ExprContext at the start of every scan and after every
-	 * ReScan, because a nested loop changes an exec Param between them
-	 * (DESIGN.md §10).
+	 * value ready at plan time; a prepared one evaluates its Param - and any
+	 * query its stable expression, `now() - interval '1 day'` - through the
+	 * node's ExprContext at the start of every scan and after every ReScan,
+	 * because a nested loop changes an exec Param between them (DESIGN.md
+	 * §10).
 	 */
 	Expr	   *valexpr;
 	Const	   *con;			/* valexpr, when it is a Const; else NULL */
@@ -3143,8 +3147,40 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 }
 
 /*
+ * The walker of lion_is_value_expr(): true at anything that makes an
+ * expression something other than one value per scan - a column of this
+ * query level or of any other, a subquery, an aggregate or a window function
+ * - or that the node's ExprContext has nothing to evaluate with (a Param
+ * other than a statement's own or an exec one).
+ */
+static bool
+lion_not_value_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) || IsA(node, PlaceHolderVar))
+		return true;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		return (p->paramkind != PARAM_EXTERN && p->paramkind != PARAM_EXEC);
+	}
+	if (IsA(node, SubLink) || IsA(node, SubPlan) ||
+		IsA(node, AlternativeSubPlan))
+		return true;
+	if (IsA(node, Aggref) || IsA(node, WindowFunc) ||
+		IsA(node, GroupingFunc))
+		return true;
+	if (IsA(node, CurrentOfExpr))
+		return true;
+	return expression_tree_walker(node, lion_not_value_walker, context);
+}
+
+/*
  * Is this expression a value the node can compare a column with - a literal,
- * or a parameter it evaluates at the start of the scan (DESIGN.md §10)?
+ * or an expression it evaluates once at the start of the scan (DESIGN.md
+ * §10)?
  *
  * A Param is accepted wherever a Const is, which is what lets a prepared
  * statement's GENERIC plan reach the pushdown: the planner leaves `k = $1` as
@@ -3154,11 +3190,24 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
  * PARAM_EXEC for the ones a nested loop or a LATERAL reference supplies,
  * which change between rescans.
  *
+ * So is any other expression that the executor would take as an index scan's
+ * RUN-TIME key (ExecIndexBuildScanKeys()): no Var of any level, no volatile
+ * function, no subquery, no aggregate or window function.  That is what a
+ * time window is written as - `ts >= now() - interval '90 days'`, `d >=
+ * current_date - 30`, `d = $1::date + 1` in a generic plan - and none of it
+ * is a Const or a Param: eval_const_expressions() folds only immutable
+ * functions, and now(), current_date and timestamptz arithmetic (which
+ * depends on the time zone) are stable.  A stable expression has one value
+ * throughout a statement, so evaluating it once per scan, beside the Params
+ * (lion_eval_clause_values()), means what evaluating it per row means; a
+ * volatile one does not (`k = random()`), and is declined.  At plan time its
+ * value is only estimated, which clause_selectivity() does itself through
+ * estimate_expression_value(); a cached generic plan evaluates it anew at
+ * every execution.
+ *
  * An ArrayExpr is accepted for the array of an IN list, because that is the
- * shape `k IN ($1, $2)` keeps in a generic plan, but only over literals and
- * parameters: the node evaluates the array ONCE per scan, and an element that
- * could be volatile does not mean the same thing evaluated once as it does
- * evaluated per row.
+ * shape `k IN ($1, $2)` keeps in a generic plan, when each of its elements is
+ * a value by the same rule: the node evaluates the array ONCE per scan.
  */
 static bool
 lion_is_value_expr(Node *node, bool allow_array_expr)
@@ -3167,18 +3216,12 @@ lion_is_value_expr(Node *node, bool allow_array_expr)
 		return false;
 	if (IsA(node, Const))
 		return true;
-	if (IsA(node, Param))
-	{
-		Param	   *p = (Param *) node;
-
-		return (p->paramkind == PARAM_EXTERN || p->paramkind == PARAM_EXEC);
-	}
-	if (allow_array_expr && IsA(node, ArrayExpr))
+	if (IsA(node, ArrayExpr))
 	{
 		ArrayExpr  *a = (ArrayExpr *) node;
 		ListCell   *lc;
 
-		if (a->multidims || a->elements == NIL)
+		if (!allow_array_expr || a->multidims || a->elements == NIL)
 			return false;
 		foreach(lc, a->elements)
 		{
@@ -3187,7 +3230,9 @@ lion_is_value_expr(Node *node, bool allow_array_expr)
 		}
 		return true;
 	}
-	return false;
+	if (expression_returns_set(node) || lion_not_value_walker(node, NULL))
+		return false;
+	return !contain_volatile_functions(node);
 }
 
 /*
@@ -3315,7 +3360,8 @@ typedef struct LionLeafInfo
 	Node	   *val;			/* the value expression, or a NULL placeholder */
 	Node	   *costclause;		/* the clause as the cost model is to see it,
 								 * or NULL for the query's own: `col = true`
-								 * for a bare boolean column */
+								 * for a bare boolean column, an IN list with
+								 * its array estimated */
 	Oid			opno;			/* 0 for a null test */
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
@@ -3341,8 +3387,8 @@ typedef struct LionLeafInfo
  * of its entries there.
  */
 static bool
-lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
-				 bool allow_range, LionLeafInfo *out)
+lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
+				 bool allow_negated, bool allow_range, LionLeafInfo *out)
 {
 	Var		   *boolvar;
 	bool		boolval;
@@ -3543,6 +3589,15 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 		 * for `k IN ($1, $2)`.  A parameter that IS an array has no length
 		 * until the executor has it, and by then there is no plan to decline
 		 * in favour of, so it is answered whatever its length.
+		 *
+		 * Any other array expression - a stable function's, `k = ANY
+		 * (string_to_array(current_setting(...), ','))` - is estimated as
+		 * core's selectivity functions estimate it, and when that gives a
+		 * literal the cap is applied to it and the cost model is handed the
+		 * clause over it, so that it prices the list's real length rather
+		 * than estimate_array_length()'s guess for an expression.  The
+		 * executor still evaluates the expression itself (the estimate is
+		 * the plan-time value, which a stable function need not keep).
 		 */
 		if (IsA(out->val, Const))
 		{
@@ -3557,6 +3612,23 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 			nelems = list_length(((ArrayExpr *) out->val)->elements);
 			if (nelems > LION_MAX_ARRAY_ELEMS)
 				return false;
+		}
+		else if (!IsA(out->val, Param))
+		{
+			Node	   *est = estimate_expression_value(root, out->val);
+
+			if (IsA(est, Const) && !((Const *) est)->constisnull)
+			{
+				ScalarArrayOpExpr *costsaop;
+
+				nelems = lion_array_const_nelems((Const *) est);
+				if (nelems > LION_MAX_ARRAY_ELEMS)
+					return false;
+
+				costsaop = (ScalarArrayOpExpr *) copyObject(saop);
+				costsaop->args = list_make2(linitial(costsaop->args), est);
+				out->costclause = (Node *) costsaop;
+			}
 		}
 
 		/*
@@ -3888,11 +3960,11 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
  * function revoked and so does the node; and the projection and the HAVING
  * evaluated over the finished counts, and a non-literal clause value, which
  * are initialised with ExecInitExpr() and so checked by core as they stand.
- * (A clause value is a literal or a parameter, possibly in an ARRAY[], and
- * calls nothing anyway.)  A boolean column tested by itself (`WHERE flag`)
- * calls nothing in core's plan either: the node's `flag = true` is looked up
- * through the index, as core's index scan looks it up, without asking
- * EXECUTE on booleq.
+ * (A clause value that calls functions - `now() - interval '1 day'` - has
+ * them in baserestrictinfo as well, so they are in the list too.)  A boolean
+ * column tested by itself (`WHERE flag`) calls nothing in core's plan either:
+ * the node's `flag = true` is looked up through the index, as core's index
+ * scan looks it up, without asking EXECUTE on booleq.
  */
 static List *
 lion_replaced_functions(RelOptInfo *rel, List *tlexprs, List *having,
@@ -4085,11 +4157,12 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		return;
 
 	/*
-	 * An IN list whose array is a parameter has no length until the executor
-	 * has it (§15), and every count of this node rebuilds the list's union -
-	 * so its work per dimension row is proportional to a length the cost model
-	 * cannot see.  A single table answers such a list once; here a 43,000-value
-	 * `= ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
+	 * An IN list whose array is a parameter - or any other expression that
+	 * is not a literal list - has no length until the executor has it (§15),
+	 * and every count of this node rebuilds the list's union - so its work
+	 * per dimension row is proportional to a length the cost model cannot
+	 * see.  A single table answers such a list once; here a 43,000-value `=
+	 * ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
 	 * review), so the shape is refused.  Literal lists and `IN ($1, $2)` have
 	 * their length at plan time and are priced per set.
 	 */
@@ -4547,8 +4620,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 					foreach(lb, ((BoolExpr *) arm)->args)
 					{
-						if (!lion_analyze_leaf((Node *) lfirst(lb), rti, false,
-											  false, &leaf))
+						if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
+											  false, false, &leaf))
 							return;
 						lion_append_clause(&leaf, (Node *) lfirst(lb), true,
 										  &whereattnos, &clauseinfos,
@@ -4562,7 +4635,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				}
 				else
 				{
-					if (!lion_analyze_leaf(arm, rti, false, false, &leaf))
+					if (!lion_analyze_leaf(root, arm, rti, false, false,
+										  &leaf))
 						return;
 					lion_append_clause(&leaf, arm, true,
 									  &whereattnos, &clauseinfos,
@@ -4582,7 +4656,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			continue;
 		}
 
-		if (!lion_analyze_leaf(clause, rti, true, true, &leaf))
+		if (!lion_analyze_leaf(root, clause, rti, true, true, &leaf))
 			return;
 
 		/*
@@ -6313,9 +6387,9 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 		/*
 		 * A literal's value is ready now and never changes, so it is taken
-		 * straight from the Const; anything else - a Param, or the ARRAY[]
-		 * of a generic IN list - gets an ExprState and is evaluated at the
-		 * start of each scan (lion_eval_clause_values()).
+		 * straight from the Const; anything else - a Param, the ARRAY[] of a
+		 * generic IN list, a stable expression - gets an ExprState and is
+		 * evaluated at the start of each scan (lion_eval_clause_values()).
 		 */
 		cl->valexpr = (Expr *) list_nth(exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
@@ -6616,7 +6690,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
  * ReScan: a nested loop or a LATERAL reference sets a new exec Param between
  * the two, and the node has to see the new value.  A generic prepared plan's
  * PARAM_EXTERN is constant for the statement but is still only available
- * here.
+ * here, and so is a stable expression's value: a cached plan carries the
+ * expression, never the value it had when it was planned.
  *
  * ExecEvalExprSwitchContext() leaves its result in the per-tuple memory of
  * the node's ExprContext, which nothing here owns, so the value is copied

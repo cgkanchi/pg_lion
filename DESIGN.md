@@ -1293,8 +1293,9 @@ Planner integration
     integer opfamily contains it), and the compared value is not a literal NULL. §15 adds
     `Var = ANY (array)` and §14 the two null tests to the shapes accepted here. §19 adds a
     top-level `OR` of such clauses, whose leaves enter none of the per-column bookkeeping below,
-    because they constrain no column of the result. A boolean column tested by itself is the
-    equality it stands for (below).
+    because they constrain no column of the result. The "Const" is anything the node can evaluate
+    once per scan - a literal, a Param, a stable expression over them - and a boolean column tested
+    by itself is the equality it stands for (both below).
   - **Several clauses may constrain one column, and each is a source of its own** (2026-09-25
     review). A second positive clause on a column is ANDed with the first exactly as a clause on
     another column is: it is matched to an index for ITS operator under ITS input collation, and the
@@ -1349,6 +1350,32 @@ Planner integration
     At plan time the value is unknown, so `clause_selectivity()` gives the estimate it gives any
     non-Const comparison; at run time a NULL value selects no rows, which every operator involved
     agrees with by being strict.
+  - **So does any expression an index scan would take as a run-time key** (2026-09-27, a
+    real-workload benchmark). A time window is written `ts >= now() - interval '90 days'` or `d >=
+    current_date - 30`, and neither is a Const or a Param: `eval_const_expressions()` folds only
+    immutable functions, and `now()`, `current_date` and `timestamptz` arithmetic (which depends on
+    the time zone) are stable. Such a clause was declined before any cost was asked, on the filter
+    nearly every time-windowed count carries. `lion_is_value_expr()` now takes core's rule for an
+    index scan's run-time keys (`ExecIndexBuildScanKeys()`): no Var of any level, no volatile
+    function, no SubLink or SubPlan, no aggregate or window function, no set-returning function, and
+    a Param only of the two kinds above. A stable expression has one value for the whole statement,
+    so evaluating it once per scan - through the same ExprState, at the same moment and again after
+    every ReScan as a Param (`lion_eval_clause_values()`) - means what evaluating it per row means;
+    `k = random()` does not, and is declined. It travels in `custom_exprs` like a Param, so setrefs.c
+    records its functions as plan dependencies, an exec Param inside it (`pc = v.k + 1` under a
+    LATERAL nested loop) rescans the node, and a cached generic plan evaluates it anew at every
+    execution: `d = $1::date + 1` under `force_generic_plan`, and a STABLE function whose answer
+    changes between two EXECUTEs of one cached plan. At plan time it is only ESTIMATED. Core's
+    selectivity functions already reduce each side of a comparison with
+    `estimate_expression_value()`, so the clause is priced as its plan-time value would be - the same
+    cost to the unit as the literal, in the benchmark's reproduction - and an IN list whose array is
+    an expression other than a literal or an `ARRAY[]` (`k = ANY (string_to_array(current_setting(
+    ...), ','))`) is estimated by the clause analysis itself, so that §15's length cap applies to the
+    estimate and the cost model prices the list's real length rather than `estimate_array_length()`'s
+    default for an expression. An `ARRAY[]` over such expressions is taken element by element, as a
+    generic plan's `ARRAY[$1, $2]` is. EXPLAIN deparses the expression like any clause value, `ts >=
+    (now() - '30 days'::interval)`. A multi-key clause (§17) still takes a Const only, for the
+    reason above.
   - **A boolean column tested by itself is the equality it stands for** (2026-09-27).
     `eval_const_expressions()` folds `flag = true` into the bare Var `flag`, and `flag =
     false` and `flag <> true` into `NOT flag`, before any path is built, so no boolean equality ever
@@ -1603,10 +1630,12 @@ count, a count that matches nothing, a NULL parameter, `= ANY ($1)`, `IN ($1, $2
 a parameterised WHERE clause, a parameterised clause whose column the target list prints, and a
 LATERAL nested loop whose inner side is rescanned with a new exec Param for every outer row - each
 compared against the same query with the pushdown switched off, as a multiset both ways round.
-`test/sql/countclauses.sql` does the same for the enum and boolean shapes above - an enum `=`, IN
-list, GROUP BY, domain and FK-side join, and every boolean form beside other columns and under an
-OR - over one single-column index per column and again over one multicolumn index, with every
-other scan disabled so that a LionCount path that is built at all is the plan. `test/sql/null.sql` and
+`test/sql/countclauses.sql` does the same for the enum, boolean and stable-value shapes above - an
+enum `=`, IN list, GROUP BY, domain and FK-side join, every boolean form beside other columns and
+under an OR, `now()` and `current_date` windows, a STABLE function, generic plans over `$1::date +
+1`, an exec Param inside an expression, and the volatile values that must be declined - over one
+single-column index per column and again over one multicolumn index, with every other scan
+disabled so that a LionCount path that is built at all is the plan. `test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too. Section 11 of `test/sql/multicolumn.sql` runs the whole of this section
@@ -2211,10 +2240,13 @@ rows, `nullable` (200 values plus 10% NULL): 36.9 ms before, 13.0 ms now, agains
 aggregate's 69.1.
 
 The array may also be a Param, or an `ArrayExpr` over literals and Params, which is what `k IN
-($1, $2)` and `k = ANY ($1)` keep in a generic plan (§10). The length cap then applies only when the
-length is known at plan time - a literal array's and an ArrayExpr's. A Param that IS an array has no
-length until the executor has it, and by then there is no plan left to decline in favour of, so it
-is answered whatever its length, and the pins are bounded by the lookup instead (below).
+($1, $2)` and `k = ANY ($1)` keep in a generic plan (§10) - or, since 2026-09-27, any stable
+expression, or an `ArrayExpr` over stable expressions (`k IN (current_date, current_date - 1)`).
+The length cap then applies only when the length is known at plan time - a literal array's, an
+ArrayExpr's, and a stable expression's that `estimate_expression_value()` reduces to a literal. A
+Param that IS an array has no length until the executor has it, and by then there is no plan left
+to decline in favour of, so it is answered whatever its length, and the pins are bounded by the
+lookup instead (below).
 
 ### The pin budget (2026-09-23 review)
 
@@ -4812,12 +4844,10 @@ every scan shape against a sequential scan on an enum column, a list longer than
     across a list's sets: the entries' counts are only added up, so their dirty TIDs may be
     rechecked together, one visit per page per batch, instead of per entry (§28's measured 68,384
     visits for 37,133 pages, and a model that has to charge them);
-  - a STABLE bound expression in the count pushdown (`ts > now() - interval '1 day'`, the commonest
-    range of all): the node takes a Const or a Param, as for equality (§10), and this is neither.
-    Evaluated once per scan like a Param it would mean the same thing - a stable function returns
-    one answer per statement - so this is only a matter of widening `lion_is_value_expr()` to
-    pseudo-constant expressions for RANGE clauses and EXPLAINing them. The bitmap scan already
-    takes them: the executor evaluates a pseudo-constant index qual as a run-time key.
+  - DONE (2026-09-27, §10): a STABLE bound expression in the count pushdown (`ts > now() -
+    interval '1 day'`, the commonest range of all). The node takes any expression an index scan
+    would take as a run-time key, for every clause kind and not only a range bound, and evaluates
+    it once per scan beside the Params.
 
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 
