@@ -318,9 +318,16 @@ SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM 
 SELECT lion_sj('SELECT count(d.k), count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 SELECT lion_sj('SELECT count(1) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 DROP INDEX lion_sdn_kl;
--- the anti join made from a LEFT JOIN is left alone; NOT IN is no anti join
+-- the anti join made from a LEFT JOIN is left alone
 SELECT lion_sj('SELECT count(*) FROM lion_sd d LEFT JOIN lion_sf f ON f.fk = d.pk AND f.x = 3 WHERE f.fk IS NULL');
-SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE d.pk NOT IN (SELECT f.fk FROM lion_sf f WHERE f.x = 3 AND f.fk IS NOT NULL)');
+-- NOT IN is no anti join while the subquery's column may be NULL (one NULL
+-- there makes every row's NOT IN unknown), on every major
+SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE d.pk NOT IN (SELECT f.fk FROM lion_sf f WHERE f.x = 3)');
+-- With both sides provably not NULL, 19 plans NOT IN as the anti join it then
+-- is, and the node counts it; earlier majors keep the hashed subplan.  Only
+-- the answer is compared here: it is the same either way.
+SELECT regexp_replace(lion_sj('SELECT count(*) FROM lion_sd d WHERE d.pk NOT IN (SELECT f.fk FROM lion_sf f WHERE f.x = 3 AND f.fk IS NOT NULL)'),
+					  '^(not )?pushed down, ', '') AS not_in_not_null;
 
 -- ---- 4. declined ---------------------------------------------------------------
 -- a second correlation: two join clauses
