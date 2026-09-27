@@ -385,11 +385,19 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE EXISTS (SE
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.doc @@ ''a1 & b1''::tsquery)') AS p("QUERY PLAN");
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sd d WHERE d.pk = f.fk AND d.region = ''eu'')') AS p("QUERY PLAN");
 -- the dimension's own filters answered by its lion index, as a bitmap scan
+-- (two equalities: every supported release puts both in the Index Cond)
 SET enable_seqscan = off;
-SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.region = ''us'' AND d.grp IN (''g1'', ''g2'') AND EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.t = ''t3'')') AS p("QUERY PLAN");
+SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.region = ''us'' AND d.grp = ''g1'' AND EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.t = ''t3'')') AS p("QUERY PLAN");
 RESET enable_seqscan;
--- two dimension rows: two counts, each probing the filter itself
+-- two dimension rows: two counts, each probing the filter itself.  The child
+-- is a plain scan here, which every supported release chooses alike.
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_bitmapscan = off;
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.pk IN (5, 6) AND EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)') AS p("QUERY PLAN");
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+RESET enable_bitmapscan;
 -- no fact filter, nothing to collect
 SELECT * FROM lion_explain_norm('SELECT d.grp, count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk) GROUP BY d.grp', 'COSTS OFF, VERBOSE') AS p("QUERY PLAN");
 RESET enable_hashjoin;
