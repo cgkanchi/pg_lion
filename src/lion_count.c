@@ -5927,10 +5927,10 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * committed.  lion_count_one_set() refuses to count one on its own.
  *
  * Returns false, with *out not found and nothing allocated, when the copy
- * would take more than maxbytes, or when a source is a list too long to open
- * at once (it is read in batches, each yielding every container key of its
- * own).  The caller then counts the ordinary way.  The copy is allocated in
- * the current memory context.
+ * would take more than maxbytes.  The caller then counts the ordinary way.  A
+ * list too long to open at once is read as a windowed union, not in the
+ * batches a count takes it in (lion_count_sources_run()).  The copy is
+ * allocated in the current memory context.
  */
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
@@ -6102,19 +6102,23 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 * always was.
 	 */
 	lion_open_budget_init(&budget, heap);
-	batchsrc = (summed || oneset) ? -1 :
-		lion_batch_source(nsources, sources, trees, &budget);
 
 	/*
-	 * The passes of a batched list each yield every container key of their
-	 * own, so a collection of one would come out of order.  It is refused;
-	 * the caller counts the ordinary way, as it does past its byte budget.
+	 * A collection is never batched.  The passes of a batched list each
+	 * yield every container key of their own, so a copy of them would come
+	 * out of order; and the reason a COUNT batches a disjoint list rather than
+	 * read it as a windowed union - that a batch keeps its pins, and so the
+	 * DESIGN.md §9 interlock - is nothing to a collection, whose cursors drop
+	 * every pin anyway (DESIGN.md §27).  A list too wide to open at once is
+	 * therefore read the way any other too-wide union is (lion_plan_node()):
+	 * a window of container keys at a time, its sets opened one after the
+	 * other, every key in order.  That is what lets an IN list whose length
+	 * the planner could not see - a parameter, an expression (§27) - be
+	 * collected once however long it turns out, instead of being merged
+	 * again by every count; such a list used to be refused a copy here.
 	 */
-	if (collect != NULL && batchsrc >= 0)
-	{
-		collect->failed = true;
-		return 0;
-	}
+	batchsrc = (summed || oneset || collect != NULL) ? -1 :
+		lion_batch_source(nsources, sources, trees, &budget);
 
 	/*
 	 * Decide which sets to serve from a private copy this time (DESIGN.md
