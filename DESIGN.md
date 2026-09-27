@@ -6553,10 +6553,14 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   entry of its column ANDed with the other columns' stream - `a IS NOT NULL AND b = 5` over a
   million unique `a` took 4.37M buffer hits and 1.8 s against the bitmap scan's 19 ms, while the
   cost model priced it by `b` alone, 2026-09-25 review.)*
-- **WINDOW**: a WALK beside the other columns' set trees that is LONG - more entries than those
-  sets have posting pages, and at least 16 (`lion_source_walk_is_long()`, which counts them from the
-  directory leaves alone and stops there). Restarting `AND(entry, rest)` for every entry
-  re-descends each of the rest's posting trees per entry; a WINDOW reads them once. The rest is
+- **WINDOW**: a WALK beside the other columns' set trees that is LONG - whose restarts would read
+  more than those sets have posting pages, and more than 16 (`lion_source_walk_is_long()`, which
+  counts them from the directory leaves alone and stops there). Restarting `AND(entry, rest)` for
+  an entry re-descends each of the rest's posting trees and then reads, of each, the posting
+  pages at the entry's container keys: at most one per TID of the entry (its header's `ntids`),
+  at most the set's own pages (`lion_source_restart_pages()`). An entry of a few rows costs a
+  descent; an entry spread over the heap - every entry of a low-cardinality column - costs reading
+  the rest whole. A WINDOW reads the rest once. The rest is
   ONE stream, and a window is its next `lion_walk_window()` containers, each ORed into a bitset
   image; the range is then walked once for the window, each entry sought to the window's first
   container key and read up to its last - an INLINE entry straight from the walk's copy of the
@@ -6574,6 +6578,16 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   for the 200000-row range, 409 ms against 38 (2026-09-25 review). As a WINDOW it reads 5485
   buffers in 36 ms, and the 200000-row range 2751 in 17 ms; an INLINE entry read through a stream
   of its own, as the first cut of the WINDOW did, took 113 ms for those 200000 entries.)*
+  *(Deviation from the WINDOW's first version, which counted ENTRIES against the rest's posting
+  pages, a restart being taken for a descent. That holds for a column of a few rows per key, the
+  unique `a` above, and not for a low-cardinality one: each of `pc < 100`'s 100 keys (4000 rows
+  each, 8M rows, 190k heap pages) has rows at nearly every container key, so with four dense sets
+  beside it - 4700 posting pages, more than 100 entries - the scan stayed a WALK that streamed
+  those sets once per key: 10.8 s against the bitmap scan's 0.77, 2.5 s against 0.27 for 20
+  keys, 36 s against 1.7 for 400, and the always-true `pc >= 0` (2000 keys) past two minutes
+  against 2 s. As WINDOWs: 0.14, 0.44, 0.97 and 2.2 s. The benchmark handoff's plain Index Scan
+  that did not finish in 60 s (2026-09-27, item 6) had this shape: `product_count >= 0`, 1889
+  keys, beside four sets over 80.6M rows. `test/sql/plaincost.sql` §1.)*
 - **LIST**: an IN list on a scalar column longer than a batch (§29.4) is located and streamed a
   batch at a time, each batch the SETS shape with the other columns' trees ANDed in. It outranks a
   walk, which is then left to the recheck, and a second long list is left to the recheck too.

@@ -1,0 +1,131 @@
+-- Plain index scans (amgettuple) against the bitmap scan of the same index.
+--
+-- A range on one column of a multicolumn index beside other columns' sets is
+-- walked in WINDOWs of those sets (DESIGN.md §29.3) when restarting their
+-- stream for each entry of the range would read more than the sets: which
+-- every key of a low-cardinality column does, its rows being at nearly every
+-- container key.  It used to be counted in entries against the sets' posting
+-- pages, so a range of a few hundred such keys was walked entry by entry and
+-- read the other columns' sets once per key: the benchmark handoff's query,
+-- an always-true range of 1889 keys beside four sets on 80.6M rows, did not
+-- finish in 60 s (2026-09-27, item 6).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+-- a sample of every row: the statistics, and the plans, do not depend on it
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+-- 200000 rows, 44 to a page; every column a hash of the row number.  status
+-- has three values (60/20/20%), supp two (90/10%), flag is 80% true, pc has
+-- 200 values and tags holds 'ga' 30% of the time; all placed at random.  cl
+-- has four values stored in value order.
+CREATE TABLE lpc (id int, status int, supp int, flag bool, pc int, cl int,
+				  tags text[], pad text);
+INSERT INTO lpc
+SELECT g,
+	   (ARRAY[0, 0, 0, 1, 2])[1 + ((hashint8extended(g, 1) & 2147483647) % 5)],
+	   CASE WHEN (hashint8extended(g, 2) & 2147483647) % 10 = 0 THEN 1 ELSE 0 END,
+	   (hashint8extended(g, 3) & 2147483647) % 5 <> 0,
+	   ((hashint8extended(g, 4) & 2147483647) % 200)::int,
+	   (g - 1) / 50000,
+	   CASE WHEN (hashint8extended(g, 6) & 2147483647) % 10 < 3
+			THEN ARRAY['ga', 'p' || ((hashint8extended(g, 7) & 2147483647) % 11)]
+			ELSE ARRAY['p' || ((hashint8extended(g, 7) & 2147483647) % 11)] END,
+	   repeat('x', 100)
+  FROM generate_series(1, 200000) g;
+CREATE INDEX lpc_lion ON lpc USING lion (status, supp, flag, pc, tags);
+CREATE INDEX lpc_cl ON lpc USING lion (cl);
+VACUUM (FREEZE, ANALYZE) lpc;
+/*
+ * lpc_bufs() runs a query as a plain index scan, or as a bitmap scan, under
+ * EXPLAIN (ANALYZE, BUFFERS) and returns the shared buffers its top node
+ * touched, hits and reads together.
+ */
+CREATE FUNCTION lpc_bufs(q text, plain boolean) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	res bigint := NULL;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', CASE WHEN plain THEN 'off' ELSE 'on' END, true);
+	PERFORM set_config('enable_indexscan', CASE WHEN plain THEN 'on' ELSE 'off' END, true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF res IS NULL AND ln ~ 'Buffers: shared' THEN
+			res := coalesce(substring(ln from 'hit=(\d+)')::bigint, 0) +
+				   coalesce(substring(ln from 'read=(\d+)')::bigint, 0);
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	RETURN res;
+END $$;
+-- the count pushdown would answer the counts below from the index alone
+SET pg_lion.enable_count_pushdown = off;
+-- ---------- 1. a range beside the other columns' sets, key by key ----------
+-- Each pc key has rows at nearly every container key, so restarting the
+-- other columns' stream for each key walked read their sets once per key:
+-- the plain scan is a WINDOW now (DESIGN.md §29.3) and reads about what the
+-- bitmap scan reads.
+SELECT lpc_bufs(q, true) <= 2 * lpc_bufs(q, false) AS plain_reads_about_the_bitmaps
+  FROM (VALUES ('SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20'),
+			   ('SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && ''{ga}'''),
+			   ('SELECT count(*) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5')) v(q);
+ plain_reads_about_the_bitmaps 
+-------------------------------
+ t
+ t
+ t
+(3 rows)
+
+-- and the answers are the sequential scan's
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20;
+ count |    sum    
+-------+-----------
+  8558 | 857067353
+(1 row)
+
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}';
+ count |    sum     
+-------+------------
+ 25902 | 2586404767
+(1 row)
+
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5;
+ count |    sum    
+-------+-----------
+  1784 | 178466633
+(1 row)
+
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20;
+ count |    sum    
+-------+-----------
+  8558 | 857067353
+(1 row)
+
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}';
+ count |    sum     
+-------+------------
+ 25902 | 2586404767
+(1 row)
+
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5;
+ count |    sum    
+-------+-----------
+  1784 | 178466633
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE lpc;
+DROP FUNCTION lpc_bufs(text, boolean);
