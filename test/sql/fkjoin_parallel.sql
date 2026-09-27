@@ -238,10 +238,15 @@ RESET debug_parallel_query;
 ALTER TABLE lion_pd SET (parallel_workers = 2);
 
 -- ---- 4. rescans: the Gather started again for every outer row ------------------
+-- (index scans off: a nested loop semi join over lion_pf_fk is cheaper than the
+-- node here, and it is the node's rescans this is about)
 SET enable_material = off;
 SET enable_memoize = off;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
@@ -250,6 +255,9 @@ SELECT lion_pj('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT cou
 SELECT lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g', 'Join Keys Looked Up');
 RESET enable_material;
 RESET enable_memoize;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+RESET enable_bitmapscan;
 
 -- ---- 5. a generic plan's parameters, evaluated in every participant ------------
 SET plan_cache_mode = force_generic_plan;
