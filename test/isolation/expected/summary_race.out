@@ -1,0 +1,402 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s3_prep s3_how s1_attach_pinned s2_predel s1_begin s1_plain s2_delete s1_upto s3_vacuum s2_wakeup_pinned s1_commit s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) sr;
+step s3_how: 
+	CREATE FUNCTION sr_how(q text) RETURNS text LANGUAGE plpgsql AS $fn$
+	DECLARE j jsonb;
+	BEGIN
+		EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' || q INTO j;
+		RETURN (jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")') ->> 'Summaries Summed');
+	END $fn$;
+	SELECT sr_how('SELECT count(*) FROM sr WHERE k <= 3500') AS upto_3500_summaries,
+		   sr_how('SELECT count(*) FROM sr WHERE k >= 500') AS from_500_summaries,
+		   sr_how('SELECT count(*) FROM sr WHERE k BETWEEN 500 AND 3500') AS between_summaries;
+	DROP FUNCTION sr_how(text);
+
+upto_3500_summaries|from_500_summaries|between_summaries
+-------------------+------------------+-----------------
+                  3|                 3|                2
+(1 row)
+
+step s1_attach_pinned: SELECT injection_points_attach('lion-count-containers-pinned', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_predel: DELETE FROM sr WHERE k <= 1000;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+upto_3500
+---------
+     2500
+(1 row)
+
+from_500
+--------
+    3000
+(1 row)
+
+between_500_3500
+----------------
+            2500
+(1 row)
+
+step s2_delete: DELETE FROM sr WHERE k BETWEEN 1001 AND 1100;
+step s1_upto: SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500; <waiting ...>
+step s3_vacuum: VACUUM sr; <waiting ...>
+step s2_wakeup_pinned: 
+	SELECT sr_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT sr_release('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+sr_release
+----------
+          
+(1 row)
+
+step s1_upto: <... completed>
+upto_3500
+---------
+     2500
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_counts: 
+	SET pg_lion.enable_count_pushdown = off;
+	RESET enable_seqscan;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_seqscan = off;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+
+upto_3500
+---------
+     2400
+(1 row)
+
+from_500
+--------
+    2900
+(1 row)
+
+between_500_3500
+----------------
+            2400
+(1 row)
+
+upto_3500
+---------
+     2400
+(1 row)
+
+from_500
+--------
+    2900
+(1 row)
+
+between_500_3500
+----------------
+            2400
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('sr_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s1_attach_phase s1_begin s1_plain s1_from s2_append s2_wakeup_phase s1_commit s3_shape s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) sr;
+step s1_attach_phase: SELECT injection_points_attach('lion-entry-scan-phase', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+upto_3500
+---------
+     3500
+(1 row)
+
+from_500
+--------
+    3501
+(1 row)
+
+between_500_3500
+----------------
+            3001
+(1 row)
+
+step s1_from: SELECT count(*) AS from_500 FROM sr WHERE k >= 500; <waiting ...>
+step s2_append: 
+	INSERT INTO sr SELECT 10000 + i, 4000 + i, i % 3 FROM generate_series(1, 3000) i;
+	INSERT INTO sr SELECT 20000 + i, 1000 + i, i % 3 FROM generate_series(1, 2500) i;
+
+step s2_wakeup_phase: SELECT sr_release('lion-entry-scan-phase');
+sr_release
+----------
+          
+(1 row)
+
+step s1_from: <... completed>
+from_500
+--------
+    3501
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_shape: 
+	SELECT summary_entries, summary_tids = ntids AS every_row_in_a_summary
+	  FROM lion_index_stats('sr_k');
+
+summary_entries|every_row_in_a_summary
+---------------+----------------------
+              7|t                     
+(1 row)
+
+step s3_counts: 
+	SET pg_lion.enable_count_pushdown = off;
+	RESET enable_seqscan;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_seqscan = off;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+
+upto_3500
+---------
+     6000
+(1 row)
+
+from_500
+--------
+    9001
+(1 row)
+
+between_500_3500
+----------------
+            5501
+(1 row)
+
+upto_3500
+---------
+     6000
+(1 row)
+
+from_500
+--------
+    9001
+(1 row)
+
+between_500_3500
+----------------
+            5501
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('sr_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s1_attach_phase s1_begin s1_plain s1_between s2_append s2_wakeup_phase s1_commit s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) sr;
+step s1_attach_phase: SELECT injection_points_attach('lion-entry-scan-phase', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plain: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL pg_lion.enable_count_pushdown = on;
+
+upto_3500
+---------
+     3500
+(1 row)
+
+from_500
+--------
+    3501
+(1 row)
+
+between_500_3500
+----------------
+            3001
+(1 row)
+
+step s1_between: SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500; <waiting ...>
+step s2_append: 
+	INSERT INTO sr SELECT 10000 + i, 4000 + i, i % 3 FROM generate_series(1, 3000) i;
+	INSERT INTO sr SELECT 20000 + i, 1000 + i, i % 3 FROM generate_series(1, 2500) i;
+
+step s2_wakeup_phase: SELECT sr_release('lion-entry-scan-phase');
+sr_release
+----------
+          
+(1 row)
+
+step s1_between: <... completed>
+between_500_3500
+----------------
+            3001
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_counts: 
+	SET pg_lion.enable_count_pushdown = off;
+	RESET enable_seqscan;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET pg_lion.enable_count_pushdown = on;
+	SET enable_seqscan = off;
+	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
+	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
+	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+
+upto_3500
+---------
+     6000
+(1 row)
+
+from_500
+--------
+    9001
+(1 row)
+
+between_500_3500
+----------------
+            5501
+(1 row)
+
+upto_3500
+---------
+     6000
+(1 row)
+
+from_500
+--------
+    9001
+(1 row)
+
+between_500_3500
+----------------
+            5501
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('sr_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s4_attach s4_insert s3_verify s2_wakeup_insert s3_shape
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) sr;
+step s4_attach: SELECT injection_points_attach('lion-insert-before-summary', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s4_insert: INSERT INTO sr VALUES (99999, 2500, 1); <waiting ...>
+step s3_verify: SELECT lion_index_verify('sr_k', true); <waiting ...>
+step s2_wakeup_insert: SELECT sr_release('lion-insert-before-summary');
+sr_release
+----------
+          
+(1 row)
+
+step s4_insert: <... completed>
+step s3_verify: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s3_shape: 
+	SELECT summary_entries, summary_tids = ntids AS every_row_in_a_summary
+	  FROM lion_index_stats('sr_k');
+
+summary_entries|every_row_in_a_summary
+---------------+----------------------
+              4|t                     
+(1 row)
+

@@ -346,8 +346,10 @@ SELECT lion_dc('SELECT count(DISTINCT (k, a)) FROM lion_dt');
 SELECT lion_dc('SELECT count(DISTINCT k) FILTER (WHERE a = 1) FROM lion_dt');
 SELECT lion_dc('SELECT sum(DISTINCT k) FROM lion_dt');
 SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
--- a WHERE clause the posting sets cannot answer
+-- a range on a column the walk does not drive is a source (DESIGN.md §32)
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
+-- a WHERE clause the posting sets cannot answer
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
 -- a collation other than the index's: DISTINCT would compare differently
 SELECT lion_dc('SELECT count(DISTINCT t COLLATE "C") FROM lion_dt WHERE a = 3');
 CREATE INDEX lion_dt_tc ON lion_dt USING lion (t COLLATE "C");

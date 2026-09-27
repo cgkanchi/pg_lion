@@ -244,8 +244,14 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 	ikind = lion_entry_kind(item);
 	if (ikind != sk->kind)
 		return ikind < sk->kind ? -1 : 1;
-	if (ikind != LION_KIND_VALUE)
-		return 0;					/* one NULL and one EMPTY entry per column */
+
+	/*
+	 * One NULL, one EMPTY and one last SUMMARY entry per column: their kind is
+	 * their whole position.  VALUE and SUMMARY entries are ordered by their
+	 * keys (DESIGN.md §32: a summary's key is its bucket's upper bound).
+	 */
+	if (!LION_KIND_HAS_KEY(ikind))
+		return 0;
 
 	if (sk->cmpproc != NULL)
 	{
@@ -281,6 +287,15 @@ lion_cmp_entry(const LionEntryTuple *item, const LionSearchKey *sk)
 	 */
 	if (sk->raw == NULL)
 		return 1;
+
+	/*
+	 * The last summary of a column (DESIGN.md §32) keeps the largest key its
+	 * bucket holds, which an insert raises; that key is not a position, so two
+	 * of them are the same entry whatever their bytes - which is also what
+	 * lets a walk resume past it after its key has changed.
+	 */
+	if (sk->kind == LION_KIND_SUMLAST)
+		return 0;
 
 	n = Min((Size) item->keylen, sk->rawlen);
 	if (n > 0)
@@ -356,7 +371,7 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 		col = lion_column(ix, (AttrNumber) entry->attno);
 
 		lion_search_key_init(col, sk, kind,
-							 kind == LION_KIND_VALUE ?
+							 LION_KIND_HAS_KEY(kind) ?
 							 lion_fetch_key(col, LionEntryGetKey(entry)) :
 							 (Datum) 0,
 							 entry->hash);
@@ -630,6 +645,44 @@ restart:
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 	}
+}
+
+/*
+ * lion_dir_search() for a caller that wants the first ITEM at or after sk
+ * rather than the leaf that owns sk.  When the landing offset is past the
+ * leaf's last item, that item is on a leaf further right, and the walk steps
+ * there - finishing, as a writer, any split it steps over, because the page to
+ * the right of a flagged one has no downlink yet (DESIGN.md §21).  *offp is the
+ * item's offset, or past the last item of the rightmost leaf.  The summary
+ * insert of DESIGN.md §32 looks its bucket up this way: the first summary of
+ * the column whose key is at or above the row's.
+ */
+Buffer
+lion_dir_search_first(Relation index, Relation heaprel, LionIndexState *ix,
+					  const LionSearchKey *sk, int lockmode, bool forwrite,
+					  OffsetNumber *offp)
+{
+	OffsetNumber off;
+	Buffer		buf = lion_dir_search(index, heaprel, ix, sk, lockmode,
+									  forwrite, &off);
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+
+		if (off <= PageGetMaxOffsetNumber(page) || LionPageIsRightmost(page))
+			break;
+		if (forwrite && LionPageIncompleteSplit(page))
+		{
+			lion_dir_finish_split(index, heaprel, ix, buf);
+			continue;
+		}
+		buf = lion_dir_step_right(index, buf, lockmode);
+		off = lion_page_first_data(BufferGetPage(buf));
+	}
+
+	*offp = off;
+	return buf;
 }
 
 /*
@@ -1093,7 +1146,7 @@ lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 	p->hash = (src != NULL) ? src->hash : 0;
 	p->flags = pivotflag |
 		(uint16) ((src != NULL) ?
-				  (src->flags & (LION_ENTRY_RESERVED | LION_ENTRY_MINUSINF)) :
+				  (src->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF)) :
 				  LION_ENTRY_MINUSINF);
 	p->keylen = (uint16) keylen;
 	p->head = child;

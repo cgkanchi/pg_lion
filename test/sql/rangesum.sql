@@ -128,8 +128,9 @@ SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE u > 10 AND g = 3');
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE u < 19990 AND g = 3');
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE t > ''v0003'' AND g = 3');
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE t < ''v0496'' AND g = 3');
--- two lower bounds and two upper bounds: the walk above the range starts where
--- the range does (DESIGN.md §28), and the answer is the same
+-- two lower bounds and two upper bounds: each walk starts at the tightest bound
+-- of its side (DESIGN.md §28), so the walk above the range is as short as the
+-- one below, and the complement is taken
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k > 2 AND k >= 4 AND k < 996 AND k <= 993 AND g = 3');
 
 -- ---------- 3. the inside is smaller: its entries are summed ----------

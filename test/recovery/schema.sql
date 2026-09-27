@@ -102,6 +102,19 @@ CREATE INDEX lion_rec_mc ON lion_rec USING lion (k4, t, nn, arr)
 	WITH (inline_limit = 64);
 
 /*
+ * An index with SUMMARY posting sets (DESIGN.md §32).  id is the table's key
+ * and the writer's inserts append above it, so every crash round closes,
+ * opens and rekeys the open bucket under WAL, its updates add rows to the
+ * buckets in the middle and its deletes and the VACUUM loop empty summaries
+ * and delete them; k4 beside it is a column whose every key is a bucket of
+ * its own.  summary_tids = 64 makes the buckets small, so a round goes
+ * through many of them, and inline_limit = 64 makes summaries spill to
+ * posting trees as keys do.
+ */
+CREATE INDEX lion_rec_sum ON lion_rec USING lion (id, k4)
+	WITH (summaries = on, summary_tids = 64, inline_limit = 64);
+
+/*
  * The writer's id stream.  Each pgbench client c only ever touches rows with
  * id % 8 = c, so four clients never contend for a row and the run cannot
  * produce a deadlock or a serialization failure that would abort a client.
@@ -184,7 +197,12 @@ LANGUAGE sql IMMUTABLE AS $$
 		   ('select count(*) from lion_rec where k4 = 5 and nn = 7'),
 		   ('select count(*) from lion_rec where t = ''v13'' and arr @> array[3]'),
 		   ('select count(*) from lion_rec where k4 = 5 and t = ''v13'' and nn is null'),
-		   ('select count(*) from lion_rec where k4 in (1,2,3) and nn in (4,5)')
+		   ('select count(*) from lion_rec where k4 in (1,2,3) and nn in (4,5)'),
+		   /* DESIGN.md §32: sums over summaries, and ranges as sources. */
+		   ('select count(*) from lion_rec where id >= 20000'),
+		   ('select count(*) from lion_rec where id between 1000 and 30000 and k4 = 5'),
+		   ('select k4, count(*) from lion_rec where id < 25000 group by k4'),
+		   ('select count(*) from lion_rec where id > 100 and k4 < 50')
 $$;
 
 /* Every lion index on the table, with what its ntids must add up to. */
@@ -198,6 +216,8 @@ LANGUAGE sql IMMUTABLE AS $$
 	  ('lion_rec_ct', 'select count(*) from lion_rec'),
 	  ('lion_rec_b',  'select count(*) from lion_rec'),
 	  ('lion_rec_nn', 'select count(*) from lion_rec'),
+	  /* ... two columns of it; the summaries' rows are counted apart. */
+	  ('lion_rec_sum', 'select 2 * (select count(*) from lion_rec)'),
 	  /* The multicolumn index (DESIGN.md §24): ntids over ALL its columns.
 	   * The per-column totals are checked by lion_rec_mc_columns() below. */
 	  ('lion_rec_mc',
@@ -414,6 +434,23 @@ BEGIN
 		END IF;
 		RETURN NEXT;
 	END LOOP;
+
+	/*
+	 * 2b. the summaries (DESIGN.md §32) hold every row of their columns,
+	 * which are NOT NULL: as many as the heap after a VACUUM, at least as
+	 * many before one.  lion_index_verify() above has compared each of them
+	 * with its bucket's keys.
+	 */
+	SELECT sum(summary_tids) INTO got FROM lion_index_stats('lion_rec_sum'::regclass);
+	want := 2 * nrows;
+	IF exact_ntids THEN
+		ok := (got = want);
+	ELSE
+		ok := (got >= want);
+	END IF;
+	detail := format('summary_tids(lion_rec_sum) = %s, heap wants %s%s', got, want,
+					 CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+	RETURN NEXT;
 
 	/*
 	 * 3. the reserved NULL and EMPTY entries (sections 14 and 17).  Both are
