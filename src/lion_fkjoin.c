@@ -25,10 +25,20 @@
  *		does not compare collations.
  *
  *		The semi and anti joins of `EXISTS`, `IN` and `NOT EXISTS` are
- *		recognised here too, one way round: the dimension is the outer side,
- *		whose rows the join returns, and the fact the inner side, whose posting
- *		sets say whether a dimension row has a match - DESIGN.md §27, "Semi
- *		and anti joins".  They need no uniqueness at all.
+ *		recognised here too: the dimension is the outer side, whose rows the
+ *		join returns, and the fact the inner side, whose posting sets say
+ *		whether a dimension row has a match - DESIGN.md §27, "Semi and anti
+ *		joins".  They need no uniqueness at all.
+ *
+ *		A semi join is recognised the other way round as well: the forward
+ *		`SELECT count(*) FROM fact f WHERE EXISTS (SELECT 1 FROM dim d WHERE
+ *		d.k = f.fk ...)`, whose rows are the fact's, over a dimension key
+ *		nothing proves unique (a unique one has made it an inner join by now).
+ *		It is JOIN_UNIQUE_INNER, as core calls the same plan: the dimension's
+ *		keys are made distinct, and each is counted as an inner join counts a
+ *		dimension row - DESIGN.md §27, "Forward semi joins over a non-unique
+ *		key".  What this file asks of it is an order to make the keys distinct
+ *		by: a btree family that has the join operator as its equality.
  *
  *-------------------------------------------------------------------------
  */
@@ -179,7 +189,10 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 	 * unique on the join key never gets here as one: the planner has made it
 	 * an inner join already (reduce_unique_semijoins()), which is the
 	 * equivalence the forward direction - fact rows whose dimension row
-	 * qualifies - rests on, and the one a non-unique key must not get.
+	 * qualifies - rests on, and the one a non-unique key must not get.  Over
+	 * a non-unique key the forward direction does get here, as a semi join
+	 * whose inner side is the dimension, and is counted over the dimension's
+	 * DISTINCT keys (JOIN_UNIQUE_INNER, below).
 	 *
 	 * Only the join between these two tables, then, and one whose relation
 	 * set is exactly them: an anti join made from `LEFT JOIN ... WHERE
@@ -275,9 +288,12 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 	 * Equality commutes, so either operand may be either table's.  Which of
 	 * the two has a lion index that answers the operator is the caller's
 	 * question (lion_collect_targets(), per clause); which one's column is
-	 * unique is this file's.  A semi or anti join goes one way only, the
-	 * fact its inner side, and asks nothing about uniqueness: its count is
-	 * one per dimension row, however many dimension rows share a key.
+	 * unique is this file's.  An anti join goes one way only, the fact its
+	 * inner side, and asks nothing about uniqueness: its count is one per
+	 * dimension row, however many dimension rows share a key.  A semi join
+	 * goes that way too, and the other way as JOIN_UNIQUE_INNER, the forward
+	 * semi join, whose dimension's keys are made distinct instead of proved
+	 * so.
 	 */
 	for (k = 0; k < 2; k++)
 	{
@@ -286,12 +302,32 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 		int			fi = (argvar[0]->varno == (int) fact->relid) ? 0 : 1;
 		int			di = 1 - fi;
 		LionFkJoin *fj = &out[n];
+		JoinType	thisjoin = jointype;
+		Oid			sortop = InvalidOid;
 
 		if (argvar[fi]->varno != (int) fact->relid ||
 			argvar[di]->varno != (int) dim->relid)
 			return 0;
 
-		if (jointype != JOIN_INNER)
+		if (jointype == JOIN_SEMI && (int) fact->relid != semifact)
+		{
+			/*
+			 * The forward semi join: the fact is the outer side and the
+			 * dimension the inner one, whose keys the node sorts and keeps
+			 * once each.  The sort is by the `<` of a btree family whose
+			 * equality is the join operator, for the dimension key's type -
+			 * the order core's own unique-ification of a semi join's inner
+			 * side sorts by (create_unique_path()) - so that keys equal
+			 * under the join's operator, and only those, come out next to
+			 * each other.  An operator no btree family knows has no such
+			 * order, and the shape is left to the ordinary plan.
+			 */
+			sortop = get_ordering_op_for_equality_op(op->opno, di == 0);
+			if (!OidIsValid(sortop))
+				continue;
+			thisjoin = JOIN_UNIQUE_INNER;
+		}
+		else if (jointype != JOIN_INNER)
 		{
 			if ((int) fact->relid != semifact)
 				continue;
@@ -312,8 +348,9 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 		fj->collation = op->inputcollid;
 		fj->clause = (Node *) op;
 		fj->dimpath = dim->cheapest_total_path;
-		fj->jointype = jointype;
+		fj->jointype = thisjoin;
 		fj->joinrel = joinrel;
+		fj->uniqsortop = sortop;
 		n++;
 	}
 

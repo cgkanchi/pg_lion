@@ -255,8 +255,9 @@ SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.t = ''t7'' AND EXISTS (SE
 -- grouped: only the join form can name a dimension column
 SELECT lion_sj('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d ON d.pk = f.fk WHERE f.x IN (1, 2) AND d.grp <> ''g4'' GROUP BY d.region');
 -- the key is not unique: EXISTS stays a semi join whose inner side is the
--- dimension, and with no lion index on it nothing is pushed down - the
--- inner-join equivalence would count a fact row once per duplicate
+-- dimension, which the node counts over the dimension's DISTINCT keys
+-- (fkjoin_nonunique.sql) - the inner-join equivalence would count a fact row
+-- once per duplicate
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND f.fk IN (SELECT d.k FROM lion_sdn d WHERE d.attr = 1)');
 
@@ -295,8 +296,9 @@ ANALYZE lion_sdn;
 SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 SELECT lion_sj('SELECT d.attr, count(*) FROM lion_sdn d WHERE d.k IN (SELECT f.fk FROM lion_sf f WHERE f.t = ''t11'') GROUP BY d.attr');
 -- ... and the forward semi join over the non-unique key, now that it has lion
--- indexes: the dimension is the inner side, so it is the one TESTED, once per
--- fact row - never the inner-join count, which would count each duplicate
+-- indexes: counted over the dimension's distinct keys, or with the roles
+-- exchanged, the dimension TESTED once per fact row - never the inner-join
+-- count, which would count each duplicate.  The model takes the distinct keys.
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
 SELECT lion_sj_pick('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
 DROP INDEX lion_sdn_kl, lion_sdn_al;
@@ -318,9 +320,16 @@ SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM 
 SELECT lion_sj('SELECT count(d.k), count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 SELECT lion_sj('SELECT count(1) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 DROP INDEX lion_sdn_kl;
--- the anti join made from a LEFT JOIN is left alone; NOT IN is no anti join
+-- the anti join made from a LEFT JOIN is left alone
 SELECT lion_sj('SELECT count(*) FROM lion_sd d LEFT JOIN lion_sf f ON f.fk = d.pk AND f.x = 3 WHERE f.fk IS NULL');
-SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE d.pk NOT IN (SELECT f.fk FROM lion_sf f WHERE f.x = 3 AND f.fk IS NOT NULL)');
+-- NOT IN is no anti join while the subquery's column may be NULL (one NULL
+-- there makes every row's NOT IN unknown), on every major
+SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE d.pk NOT IN (SELECT f.fk FROM lion_sf f WHERE f.x = 3)');
+-- With both sides provably not NULL, 19 plans NOT IN as the anti join it then
+-- is, and the node counts it; earlier majors keep the hashed subplan.  Only
+-- the answer is compared here: it is the same either way.
+SELECT regexp_replace(lion_sj('SELECT count(*) FROM lion_sd d WHERE d.pk NOT IN (SELECT f.fk FROM lion_sf f WHERE f.x = 3 AND f.fk IS NOT NULL)'),
+					  '^(not )?pushed down, ', '') AS not_in_not_null;
 
 -- ---- 4. declined ---------------------------------------------------------------
 -- a second correlation: two join clauses

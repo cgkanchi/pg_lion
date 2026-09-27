@@ -160,14 +160,21 @@ WHERE cu.country = 'NZ'
   AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = cu.id AND o.status = 'open');
 ```
 
-The first form needs `customers.id` unique (a primary key); both may group by the dimension's
-columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of `count(*)`
-is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate counts
-their distinct values. The node pays a lookup per dimension row, so the cost model leaves a large
-dimension set to the hash join. With parallel query enabled (`max_parallel_workers_per_gather`) it
-can run in parallel, each worker taking its share of the dimension rows. The fact filters are
-collected once per process into memory bounded like a hash join's (`work_mem` ×
-`hash_mem_multiplier`); past that the node reads them per dimension row instead.
+Written as a JOIN, the first form needs `customers.id` unique (a primary key). As `EXISTS` or `IN`
+it does not: over a key that repeats - `o.customer_id IN (SELECT customer_id FROM visits WHERE
+...)` - the node sorts the subquery's keys and counts each distinct key's orders once (DESIGN.md
+§27; five million fact rows against 9,776 rows over 8,848 distinct keys took 117 ms, against 585
+for the hash semi join, on an assert build). The JOIN and the second form may group by the
+dimension's columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of
+`count(*)` is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate
+counts their distinct values. The node pays a lookup per dimension row (per distinct key), so the
+cost model leaves a large dimension set to the hash join. With parallel query enabled
+(`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
+dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
+once per process into memory bounded like a hash join's (`work_mem` × `hash_mem_multiplier`); past
+that the node reads them per dimension row instead. Their values may be parameters and stable
+expressions as for a single table, an `IN` list whose array is a parameter (`o.status = ANY ($1)`)
+included: every process evaluates them once per scan.
 
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
@@ -268,6 +275,18 @@ express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*
 back to scanning every indexed row and rechecking it if the Lion index is used. The planner may
 choose a sequential scan instead; GIN wins the measured phrase/prefix cases below.
 
+A literal query is only pushed down when it is exact. A query the count only sees at run time - a
+prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a stable expression
+(`tsv @@ to_tsquery(current_setting('app.q'))`) - is pushed down whatever it turns out to be
+(DESIGN.md §17): exactly when the key sets answer it; from a superset of its rows, each rechecked in
+the heap, when they do not (`@>` with a NULL element counts the other elements' rows, a phrase the
+rows with all of its lexemes, `a & !b` the rows with `a`); and when no key narrows it at all (`@>
+'{}'`, `!a`, `foo:*`), by rechecking the rows the other clauses select, or every row by a
+sequential scan when there is no other clause. `EXPLAIN ANALYZE` reports the rows the recheck
+turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is priced as the case
+that rechecks the most, so a lone `tags @> $1` in a generic plan usually goes to the ordinary plan
+and a custom plan of the literal to the pushdown. Such a query is not taken under an `OR`.
+
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
@@ -324,7 +343,9 @@ leaf that holds the key; see the measured
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
 per execution; a volatile one like `random()` goes to the ordinary plan) on any indexed column, enum
 columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
-NOT FALSE`), a `GROUP BY` of one or two indexed columns, and a `HAVING` over the counts it computes (a `HAVING`
+NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
+(`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
+clauses in all), a `GROUP BY` of one or two indexed columns, and a `HAVING` over the counts it computes (a `HAVING`
 with a correlated subquery, or a `GROUP BY` of three or more columns, goes to the ordinary plan). `IN` lists of more than 1000
 values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a
 sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
