@@ -161,9 +161,13 @@ WHERE cu.country = 'NZ'
 ```
 
 The first form needs `customers.id` unique (a primary key); both may group by the dimension's
-columns. The node pays a lookup per dimension row, so the cost model leaves a large dimension set to
-the hash join. `count(DISTINCT o.customer_id)` over the join is not pushed down: with a unique key it
-is the second query.
+columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of `count(*)`
+is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate counts
+their distinct values. The node pays a lookup per dimension row, so the cost model leaves a large
+dimension set to the hash join. With parallel query enabled (`max_parallel_workers_per_gather`) it
+can run in parallel, each worker taking its share of the dimension rows. The fact filters are
+collected once per process into memory bounded like a hash join's (`work_mem` ×
+`hash_mem_multiplier`); past that the node reads them per dimension row instead.
 
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
