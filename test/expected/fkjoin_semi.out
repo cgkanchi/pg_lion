@@ -315,18 +315,19 @@ SELECT lion_sj('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d ON d.pk 
 (1 row)
 
 -- the key is not unique: EXISTS stays a semi join whose inner side is the
--- dimension, and with no lion index on it nothing is pushed down - the
--- inner-join equivalence would count a fact row once per duplicate
+-- dimension, which the node counts over the dimension's DISTINCT keys
+-- (fkjoin_nonunique.sql) - the inner-join equivalence would count a fact row
+-- once per duplicate
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
-         lion_sj         
--------------------------
- not pushed down, 1 rows
+       lion_sj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND f.fk IN (SELECT d.k FROM lion_sdn d WHERE d.attr = 1)');
-         lion_sj         
--------------------------
- not pushed down, 1 rows
+       lion_sj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ---- 2. reverse: dimension rows with at least one matching fact row -----------
@@ -469,8 +470,9 @@ SELECT lion_sj('SELECT d.attr, count(*) FROM lion_sdn d WHERE d.k IN (SELECT f.f
 (1 row)
 
 -- ... and the forward semi join over the non-unique key, now that it has lion
--- indexes: the dimension is the inner side, so it is the one TESTED, once per
--- fact row - never the inner-join count, which would count each duplicate
+-- indexes: counted over the dimension's distinct keys, or with the roles
+-- exchanged, the dimension TESTED once per fact row - never the inner-join
+-- count, which would count each duplicate.  The model takes the distinct keys.
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
        lion_sj       
 ---------------------
@@ -478,9 +480,9 @@ SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 
 (1 row)
 
 SELECT lion_sj_pick('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
-  lion_sj_pick   
------------------
- not pushed down
+ lion_sj_pick 
+--------------
+ pushed down
 (1 row)
 
 DROP INDEX lion_sdn_kl, lion_sdn_al;

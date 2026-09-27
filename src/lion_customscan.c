@@ -124,9 +124,11 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "port/atomics.h"
 #include "storage/predicate.h"
 #include "storage/shm_toc.h"
 #include "storage/spin.h"
+#include "utils/tuplesort.h"
 
 #include "lion.h"
 #include "lion_count.h"
@@ -176,6 +178,22 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 										 * (or, for an anti join, that does
 										 * not), for a core Agg above to
 										 * aggregate: count(DISTINCT) */
+#define LION_JOINFLAG_UNIQUE	0x04	/* the child's keys are made distinct
+										 * before any is looked up, by sorting
+										 * them: the forward semi join over a
+										 * non-unique key, an inner join over
+										 * the distinct keys */
+
+/*
+ * How many distinct keys of a forward semi join over a non-unique key
+ * (DESIGN.md §27, "Forward semi joins over a non-unique key") a participant of
+ * a parallel plan claims at a time.  Every participant sorts all of the keys,
+ * and they divide the sorted, distinct sequence between them in runs of this
+ * many, each run counted by the one participant that claimed it: a count is 3
+ * to 10 us, so a run is a fraction of a millisecond, and a participant that
+ * finishes early is never more than one run behind the others.
+ */
+#define LION_FKJOIN_UNIQUE_CHUNK	64
 
 /*
  * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
@@ -245,6 +263,32 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * pages that stay cached, and measured at half that.
  */
 #define LION_FKJOIN_DESCENT_COST	(25.0 * cpu_operator_cost)
+
+/*
+ * Making the dimension's keys distinct for a forward semi join over a
+ * non-unique key (DESIGN.md §27, "Forward semi joins over a non-unique key"),
+ * which the node does itself with a datum sort of the child's keys:
+ *
+ *	SORT_COMPARE	one comparison of two keys in the sort, N log2 N of them
+ *					for N keys;
+ *	SORT_KEY		per key, the key read from the child's row and put into
+ *					the sort, taken out of it again and compared with the
+ *					previous distinct key.
+ *
+ * Measured on the assert build with int4 keys in random order: 0.108 us a key
+ * to put 40,000 or 199,000 of them in and sort them, and 0.023 us to take
+ * them out and compare them - as fast as core's Sort node over the same
+ * column, and about 13 cpu_operator_cost a key at the 250 units a millisecond
+ * the node's other terms run at (§27, "Cost, revisited").  cost_sort() is not
+ * used: it charges two cpu_operator_cost a comparison, 36 a key at 200,000,
+ * three times what the sort takes here (while cost_agg() charges core's own
+ * hashed unique-ification one a row), and it answers enable_sort, which this
+ * sort, no Sort node, does not.  A text key compares more slowly than these.
+ * A sort larger than work_mem also writes its keys out and reads them back,
+ * once each, as core's cost_tuplesort() charges one merge pass.
+ */
+#define LION_FKJOIN_SORT_COMPARE_COST	(0.25 * cpu_operator_cost)
+#define LION_FKJOIN_SORT_KEY_COST	(6.0 * cpu_operator_cost)
 
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
@@ -436,10 +480,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	10	IntList: the FK-side join (DESIGN.md §27), or empty: the number of
  *		the clause that is the join key - an equality on the fact's fk whose
  *		value expression is the dimension's column - then the LION_JOIN_*
- *		kind of join and the LION_JOINFLAG_* bits, and, added at plan time
- *		once the child plan exists, the position of that column in the
- *		child's target list.  The join key clause is not a source: the node
- *		looks it up once per child row, in source slot 0
+ *		kind of join and the LION_JOINFLAG_* bits, the sort operator and
+ *		collation the keys are made distinct by (LION_JOINFLAG_UNIQUE; 0
+ *		otherwise), and, added at plan time once the child plan exists, the
+ *		position of that column in the child's target list.  The join key
+ *		clause is not a source: the node looks it up once per child row (per
+ *		distinct key), in source slot 0
  *	11	List of three OidLists: the functions whose evaluation the node
  *		replaces, for the EXECUTE checks the executor would have made on the
  *		plan it stands for (DESIGN.md §9, "Privileges"; checked at executor
@@ -492,7 +538,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *
  * Shape 12 gave the JOIN member (10) the kind of join and its flags between
  * the clause number and the child's column (DESIGN.md §27's semi and anti
- * joins, and the fact filters collected once).
+ * joins, and the fact filters collected once), and shape 13 the sort operator
+ * and collation after them (the forward semi join over a non-unique key).
  *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
@@ -503,7 +550,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * have been made by a planner that never chose a multicolumn index, so it
  * would still decode correctly; saying so is cheaper than having to know that.
  */
-#define LION_PRIV_MAGIC		0x5242490c
+#define LION_PRIV_MAGIC		0x5242490d
 #define LION_PRIV_NMEMBERS	13
 
 /*
@@ -853,6 +900,38 @@ typedef struct LionCountScanState
 	int64		joinfilterrows;
 
 	/*
+	 * The forward semi join over a non-unique key (DESIGN.md §27, "Forward
+	 * semi joins over a non-unique key"): joinunique says each key is counted
+	 * once however many child rows carry it.  The keys of the child's rows go
+	 * into joinsort first, a datum sort by joinsortop under joinsortcoll, and
+	 * a key joineqfn finds equal to the previous distinct one, joinprevkey
+	 * (in joinkeycxt), is skipped; each distinct key is handed on as the key
+	 * column of joinsortslot, a row of the child's shape whose other columns
+	 * nothing reads.  joinkeypos numbers the distinct keys, and in a parallel
+	 * plan joinchunk is the run of them this participant claimed last, -1
+	 * before the first.  joinsorted is the keys sorted, and joinsortstats
+	 * what the sort did, for EXPLAIN ANALYZE.
+	 */
+	bool		joinunique;
+	Oid			joinsortop;
+	Oid			joinsortcoll;
+	FmgrInfo	joineqfn;
+	Oid			joinkeytype;
+	bool		joinkeybyval;
+	int16		joinkeylen;
+	Tuplesortstate *joinsort;
+	bool		joinsortdone;
+	TupleTableSlot *joinsortslot;
+	MemoryContext joinkeycxt;
+	Datum		joinprevkey;
+	bool		joinhaveprev;
+	int64		joinkeypos;
+	int64		joinchunk;
+	int64		joinsorted;
+	bool		joinhavesortstats;
+	TuplesortInstrumentation joinsortstats;
+
+	/*
 	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
 	 * counts the dimension rows its share of the child returns and adds what
 	 * EXPLAIN ANALYZE reports into joinshared, in the dynamic shared memory
@@ -867,13 +946,20 @@ typedef struct LionCountScanState
 	int64		joinworkermissing;
 	int64		joinworkerdirpages;
 	int64		joinworkerfilterrows;
+	int64		joinworkersorted;
 } LionCountScanState;
 
 /*
  * What the participants of a parallel FK-side join add up for EXPLAIN
  * ANALYZE, in the Gather's dynamic shared memory (lion_shutdown_custom_scan()).
  * filterrows is the largest copy any participant made of the fact filters,
- * -1 when none did.
+ * -1 when none did.  sorted is the keys a participant of this run sorted -
+ * every participant sorts all of them - and sortedruns the same summed over
+ * the runs before it (lion_reinitialize_dsm()).
+ *
+ * nextchunk is the one thing the participants share while they run: the next
+ * run of LION_FKJOIN_UNIQUE_CHUNK distinct keys of a forward semi join over a
+ * non-unique key that nobody has claimed yet.
  */
 typedef struct LionJoinShared
 {
@@ -883,6 +969,9 @@ typedef struct LionJoinShared
 	int64		missing;
 	int64		dirpages;
 	int64		filterrows;
+	int64		sorted;
+	int64		sortedruns;
+	pg_atomic_uint32 nextchunk;
 } LionJoinShared;
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
@@ -3431,7 +3520,11 @@ lion_parallel_divisor(int workers)
 
 /*
  * Cost the FK-side join (DESIGN.md §27) over the fact relation `rel`, for
- * `dimrows` dimension rows; the child plan's own cost is the caller's to add.
+ * `dimrows` dimension rows, `found` of which have an entry in the fk index;
+ * the child plan's own cost is the caller's to add.  A key without an entry
+ * costs its descent and nothing more.  Every caller but the forward semi join
+ * over a non-unique key takes every row to find one (found = dimrows), which
+ * is what an fk into a dimension key is expected to do.
  *
  * What the node does per dimension row: one lookup of the key in the fk
  * index - a directory descent, whose leaf is charged at lion_heap_page_cost()'s
@@ -3480,7 +3573,7 @@ static Cost
 lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 					 Var *fkvar, int joinclause, List *whereclauses,
 					 List *wherekinds, List *ors, double dimrows,
-					 bool exists, bool *collect)
+					 double found, bool exists, bool *collect)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -3523,6 +3616,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	ListCell   *lc4;
 
 	dimrows = Max(dimrows, 1.0);
+	found = Min(Max(found, 1.0), dimrows);
 	*collect = false;
 
 	/* How many rows one key of the fk column has, and in how many containers. */
@@ -3548,7 +3642,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	run += lookups * lion_heap_page_cost(root, rel, lookups,
 										 Max((double) fkidx->pages, 1.0));
 	run += dimrows * (height + 1.0) * LION_FKJOIN_DESCENT_COST;
-	run += Min(dimrows * container_pages / nd, container_pages) * seq_page_cost;
+	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
 	forfour(lc1, t->whereidx, lc2, whereclauses, lc3, wherekinds,
@@ -3635,7 +3729,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		probes += cs;
 		if (srcsets[sno] > 1.0)
 		{
-			probed += dimrows *
+			probed += found *
 				(srcsets[sno] * LION_FKJOIN_SET_COST +
 				 lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
 				 Min(cs / ckeys, 1.0) * readshare * cpu_operator_cost);
@@ -3650,7 +3744,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	pfree(srcsets);
 	pfree(srcmembers);
 
-	probed += dimrows * probes * readshare * LION_FKJOIN_PROBE_COST;
+	probed += found * probes * readshare * LION_FKJOIN_PROBE_COST;
 
 	/*
 	 * What the collected copy holds and how large it is: the filters' rows, in
@@ -3661,16 +3755,16 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	copybytes = copyckeys * (LION_CONTAINER_HDRSZ + sizeof(LionContainer *) +
 							 Min(2.0 * filtered / copyckeys,
 								 (double) LION_BITSET_BYTES));
-	probed += dimrows * LION_FKJOIN_COUNT_COST;
+	probed += found * LION_FKJOIN_COUNT_COST;
 	if (npositive > 0)
 	{
 		collected += drive * 2.0 * cpu_operator_cost +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
 			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
-		collected += dimrows * (LION_FKJOIN_COPY_COUNT_COST +
-								Min(cfk, copyckeys) * readshare *
-								(LION_FKJOIN_COPY_PROBE_COST +
-								 perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
+		collected += found * (LION_FKJOIN_COPY_COUNT_COST +
+							  Min(cfk, copyckeys) * readshare *
+							  (LION_FKJOIN_COPY_PROBE_COST +
+							   perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
 
 		if (copybytes <= (double) get_hash_memory_limit() &&
 			collected < probed)
@@ -3682,18 +3776,18 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	 * The fk set's containers at every count, as §10 charges a container (a
 	 * block mask and a visibility-map mask).
 	 */
-	run += dimrows * cfk * readshare * cpu_operator_cost * 2.0;
+	run += found * cfk * readshare * cpu_operator_cost * 2.0;
 
 	/* ---- the heap the visibility map cannot vouch for ---- */
-	matched = Min(dimrows * perkey, tuples) * wheresel * readshare;
+	matched = Min(found * perkey, tuples) * wheresel * readshare;
 	recheck_tids = matched * dirtyfrac;
 	recheck_pages = Min(recheck_tids, heap_pages * dirtyfrac);
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											   heap_pages);
 	run += recheck_tids * cpu_tuple_cost;
 
-	/* ---- a partial row per dimension row ---- */
-	run += dimrows * cpu_tuple_cost;
+	/* ---- a partial row per dimension row that finds one ---- */
+	run += found * cpu_tuple_cost;
 
 	return run;
 }
@@ -4602,16 +4696,17 @@ lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
  *
  *	- a column of the dimension: its values come out of the dimension's
  *	  tuples, as they would out of the join's;
- *	- the fact's join column, in an inner join, which the rows carry as the
- *	  dimension's key.  Every fact value a dimension row joins is equal to
- *	  that row's key under the join's operator; if that is the equality the
- *	  DISTINCT compares with - the same operator or one of its btree or hash
- *	  family (equality_ops_are_compatible()) - under the same collation, then
- *	  the fact values of one dimension row are one distinct value, and the
- *	  key is it.  Two dimension rows with equal keys are one value too, which
- *	  the Agg's own DISTINCT sees: uniqueness is not what makes this exact.
- *	  The key is emitted where the fact's column stands, so the two have to be
- *	  of one type.
+ *	- the fact's join column, in an inner join (and in the forward semi join
+ *	  over a non-unique key, an inner join over the distinct keys), which the
+ *	  rows carry as the dimension's key.  Every fact value a dimension row
+ *	  joins is equal to that row's key under the join's operator; if that is
+ *	  the equality the DISTINCT compares with - the same operator or one of
+ *	  its btree or hash family (equality_ops_are_compatible()) - under the
+ *	  same collation, then the fact values of one dimension row are one
+ *	  distinct value, and the key is it.  Two dimension rows with equal keys
+ *	  are one value too, which the Agg's own DISTINCT sees: uniqueness is not
+ *	  what makes this exact.  The key is emitted where the fact's column
+ *	  stands, so the two have to be of one type.
  *
  * No FILTER, no ORDER BY, one argument; the Agg evaluates the rest.
  */
@@ -4648,7 +4743,7 @@ lion_fkjoin_agg_is_distinct(Aggref *agg, const LionFkJoin *fj)
 
 	if (v->varno != fj->fkvar->varno || v->varattno != fj->fkvar->varattno)
 		return false;
-	if (fj->jointype != JOIN_INNER)
+	if (fj->jointype != JOIN_INNER && fj->jointype != JOIN_UNIQUE_INNER)
 		return false;
 	if (fj->fkvar->vartype != fj->pkvar->vartype)
 		return false;
@@ -4665,22 +4760,65 @@ lion_fkjoin_agg_is_distinct(Aggref *agg, const LionFkJoin *fj)
 /*
  * The custom_private of an FK-side join path (DESIGN.md §27): the members
  * lion_try_fkjoin_path() built, with the join member of this path - the
- * clause, the kind of join and the flags - in LION_PRIV_JOIN.
+ * clause, the kind of join, the flags, and the sort operator and collation of
+ * a forward semi join's distinct keys - in LION_PRIV_JOIN.  The operator and
+ * the collation are OIDs in an IntList, which casting to int and back keeps.
  */
 static List *
-lion_fkjoin_private(List *base, int joinclause, int jointype, int flags)
+lion_fkjoin_private(List *base, int joinclause, int jointype, int flags,
+					Oid sortop, Oid sortcoll)
 {
 	List	   *priv = list_copy(base);
 
 	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
-		list_make3_int(joinclause, jointype, flags);
+		list_make5_int(joinclause, jointype, flags, (int) sortop,
+					   (int) sortcoll);
 	return priv;
+}
+
+/*
+ * What making the keys of a forward semi join over a non-unique key distinct
+ * costs (DESIGN.md §27, "Forward semi joins over a non-unique key"): the keys
+ * of `rows` child rows, `width` bytes each, sorted, and each taken out of the
+ * sort again and compared with the previous distinct key.  All of it comes
+ * before the first key is looked up.  A datum sort holds three words a key,
+ * and the key itself when it is passed by reference; past work_mem it writes
+ * its keys out and reads them back once, three quarters of the pages in
+ * sequence, as core's cost_tuplesort() charges one merge pass.
+ */
+static Cost
+lion_fkjoin_sort_cost(double rows, int width)
+{
+	double		n = Max(rows, 2.0);
+	double		bytes = n * (MAXALIGN(width) + 3 * sizeof(Datum));
+	Cost		cost;
+
+	cost = LION_FKJOIN_SORT_COMPARE_COST * n * (log(n) / log(2.0)) +
+		LION_FKJOIN_SORT_KEY_COST * n;
+	if (bytes > work_mem * 1024.0)
+		cost += 2.0 * ceil(bytes / BLCKSZ) *
+			(0.75 * seq_page_cost + 0.25 * random_page_cost);
+	return cost;
 }
 
 /*
  * One FK-side join path (DESIGN.md §27) over `child` - the dimension's
  * cheapest path, or, with `workers` above zero, its cheapest partial path run
  * by that many workers - and what goes above it into the grouped rel.
+ *
+ * A forward semi join over a non-unique key (fj->jointype JOIN_UNIQUE_INNER)
+ * is different on both counts.  `dimrows` is its DISTINCT keys, which are what
+ * the node looks up, `found` those of them expected to have fact rows at all,
+ * and the child is always a whole path of the dimension, whose rows the node
+ * sorts to make the keys distinct before it looks any up.  In a parallel plan
+ * every participant runs that whole child and sorts all of it - a partial
+ * child would give each participant keys the others may have too, and a key
+ * counted by two participants counts its fact rows twice - and the
+ * participants divide the sorted, distinct keys among themselves instead, in
+ * runs of LION_FKJOIN_UNIQUE_CHUNK (lion_join_next_key()).  So the child and
+ * the sort are charged to every participant in full, as the fact filters'
+ * copy is, and the lookups and counts are one participant's share of the
+ * keys.
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
@@ -4704,31 +4842,48 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 					  int workers, PathTarget *nodetarget, List *base,
 					  int joinclause, int jointype, bool emitrows,
 					  List *whereclauses, List *wherekinds, List *ors,
-					  double dimrows, bool parallel_safe)
+					  double dimrows, double found, bool parallel_safe)
 {
 	Query	   *parse = root->parse;
 	CustomPath *cpath;
 	Path	   *input;
 	bool		partial = (workers > 0);
+	bool		unique = (fj->jointype == JOIN_UNIQUE_INNER);
 	double		divisor = partial ? lion_parallel_divisor(workers) : 1.0;
-	double		childrows = partial ?
+	double		childrows = (partial || unique) ?
 		clamp_row_est(dimrows / divisor) : clamp_row_est(child->rows);
 	double		share = Min(childrows / Max(dimrows, 1.0), 1.0);
+	double		childfound = Min(clamp_row_est(found * share), childrows);
 	double		rows;
 	double		inrows;
 	double		numgroups;
 	bool		collect;
 	Cost		run;
+	Cost		startup;
 	int			flags;
 	AggStrategy aggstrategy;
 	AggClauseCosts agg_costs;
 
 	run = lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
 							   whereclauses, wherekinds, ors, childrows,
+							   childfound,
 							   jointype != LION_JOIN_INNER || emitrows,
 							   &collect);
 	flags = (collect ? LION_JOINFLAG_COLLECT : 0) |
-		(emitrows ? LION_JOINFLAG_ROWS : 0);
+		(emitrows ? LION_JOINFLAG_ROWS : 0) |
+		(unique ? LION_JOINFLAG_UNIQUE : 0);
+
+	/*
+	 * The node starts when its child does - or, when it sorts the child's
+	 * keys first, once the whole child has run and the keys are sorted.
+	 */
+	startup = child->startup_cost;
+	if (unique)
+	{
+		startup = child->total_cost +
+			lion_fkjoin_sort_cost(child->rows, child->pathtarget->width);
+		run += startup - child->total_cost;
+	}
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -4745,18 +4900,22 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	cpath->custom_restrictinfo = NIL;
 #endif
 	cpath->custom_private = lion_fkjoin_private(base, joinclause, jointype,
-												flags);
+												flags, fj->uniqsortop,
+												unique ? fj->collation :
+												InvalidOid);
 	cpath->methods = &lion_count_path_methods;
 
 	/*
-	 * At most one row per dimension row comes out.  A semi or anti join's
-	 * rows are exactly the join's, whose estimate the planner has made
-	 * already, as is the share of them a participant sees.
+	 * At most one row per dimension row comes out (per distinct key that has
+	 * fact rows, for a forward semi join over a non-unique key).  A semi or
+	 * anti join's rows are exactly the join's, whose estimate the planner has
+	 * made already, as is the share of them a participant sees.
 	 */
-	rows = (jointype == LION_JOIN_INNER) ? childrows :
+	rows = unique ? childfound :
+		(jointype == LION_JOIN_INNER) ? childrows :
 		clamp_row_est(Min(fj->joinrel->rows * share, childrows));
 	cpath->path.rows = rows;
-	cpath->path.startup_cost = child->startup_cost;
+	cpath->path.startup_cost = startup;
 	cpath->path.total_cost = child->total_cost + run;
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = child->disabled_nodes;
@@ -4896,6 +5055,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	List	   *ckinds = NIL;
 	List	   *base;
 	double		dimrows;
+	double		found;
 	int			jointype;
 	bool		emitrows;
 	bool		parallel;
@@ -5006,7 +5166,8 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 				continue;
 			if (v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno &&
-				fj->jointype == JOIN_INNER)
+				(fj->jointype == JOIN_INNER ||
+				 fj->jointype == JOIN_UNIQUE_INNER))
 				continue;
 			return;
 		}
@@ -5060,8 +5221,38 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		return;
 	first = (LionCountTarget *) linitial(targets);
 
-	/* ---- what every path of it carries ---- */
-	dimrows = clamp_row_est(fj->dimpath->rows);
+	/*
+	 * ---- what every path of it carries ----
+	 *
+	 * The dimension rows the node looks up: the child's, or - for a forward
+	 * semi join over a non-unique key - their distinct keys, which is the
+	 * inner join the node counts (JOIN_UNIQUE_INNER is LION_JOIN_INNER with
+	 * LION_JOINFLAG_UNIQUE).  NULL is one of the groups estimate_num_groups()
+	 * counts, and one the node never looks up.
+	 */
+	if (fj->jointype == JOIN_UNIQUE_INNER)
+		dimrows = clamp_row_est(estimate_num_groups(root,
+													list_make1(fj->pkvar),
+													fj->dimpath->rows,
+													NULL, NULL));
+	else
+		dimrows = clamp_row_est(fj->dimpath->rows);
+
+	/*
+	 * Which of them find an entry of the fk index: every dimension row, as an
+	 * fk into a dimension key is expected to - except that the distinct keys
+	 * of a forward semi join are those of any set of rows, which may share
+	 * few values with the fact (`fk IN (SELECT k FROM ...)`).  Their number
+	 * is what core's own estimate of the semi join says: the fact rows it
+	 * leaves (the join rel's rows) over the rows the fact filters leave of one
+	 * key's (the fact rel's rows over the fk's distinct values).
+	 */
+	found = dimrows;
+	if (fj->jointype == JOIN_UNIQUE_INNER)
+		found = Min(dimrows,
+					clamp_row_est(fj->joinrel->rows *
+								  lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar) /
+								  Max(rel->rows, 1.0)));
 	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI :
 		(fj->jointype == JOIN_ANTI) ? LION_JOIN_ANTI : LION_JOIN_INNER;
 
@@ -5116,8 +5307,50 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
 						  fj->dimpath, 0, nodetarget, base, joinclause,
 						  jointype, emitrows, whereclauses, wherekinds, ors,
-						  dimrows, parallel && fj->dimpath->parallel_safe);
-	if (parallel && fj->dimrel->partial_pathlist != NIL)
+						  dimrows, found,
+						  parallel && fj->dimpath->parallel_safe);
+	if (parallel && fj->jointype == JOIN_UNIQUE_INNER)
+	{
+		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
+														joinclause);
+		Path	   *whole = NULL;
+		double		fkpages;
+		int			workers;
+
+		/*
+		 * A forward semi join over a non-unique key is parallel over its
+		 * whole child, which every participant runs and sorts: the sorted,
+		 * distinct keys are what they divide (lion_add_fkjoin_paths()).  So
+		 * the child has to give every participant the same rows - it may run
+		 * in a worker, and nothing in the dimension's quals is volatile,
+		 * which could keep a row in one participant and drop it in another.
+		 * It is the dimension's cheapest path that may run in a worker, which
+		 * is not its cheapest path when that is a Gather.  The workers are
+		 * what a parallel scan of the fk index pages the distinct keys read
+		 * would get, as for the other joins; there is no partial child whose
+		 * own count could be more.
+		 */
+		foreach(lc, fj->dimrel->pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (p->parallel_safe && p->param_info == NULL &&
+				(whole == NULL || compare_path_costs(p, whole, TOTAL_COST) < 0))
+				whole = p;
+		}
+		fkpages = (double) fkidx->pages *
+			Min(dimrows / lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar), 1.0);
+		workers = compute_parallel_worker(fj->dimrel, -1, fkpages,
+										  max_parallel_workers_per_gather);
+
+		if (whole != NULL && workers > 0 &&
+			!contain_volatile_functions((Node *) fj->dimrel->baserestrictinfo))
+			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+								  whole, workers, nodetarget, base,
+								  joinclause, jointype, emitrows, whereclauses,
+								  wherekinds, ors, dimrows, found, true);
+	}
+	else if (parallel && fj->dimrel->partial_pathlist != NIL)
 	{
 		Path	   *partial = (Path *) linitial(fj->dimrel->partial_pathlist);
 		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
@@ -5148,7 +5381,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
 								  partial, workers, nodetarget, base,
 								  joinclause, jointype, emitrows, whereclauses,
-								  wherekinds, ors, dimrows, true);
+								  wherekinds, ors, dimrows, dimrows, true);
 	}
 }
 
@@ -7220,21 +7453,30 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->jointype = LION_JOIN_INNER;
 	st->joincollect = false;
 	st->joinrows = false;
+	st->joinunique = false;
+	st->joinsortop = InvalidOid;
+	st->joinsortcoll = InvalidOid;
 	if (join != NIL)
 	{
-		if (list_length(join) != 4 ||
+		if (list_length(join) != 6 ||
 			list_length(cscan->custom_plans) != 1)
 			elog(ERROR, "LionCount: malformed join");
 		st->joinclause = linitial_int(join);
 		st->jointype = lsecond_int(join);
 		st->joincollect = (lthird_int(join) & LION_JOINFLAG_COLLECT) != 0;
 		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
-		st->joinkeyresno = (AttrNumber) lfourth_int(join);
+		st->joinunique = (lthird_int(join) & LION_JOINFLAG_UNIQUE) != 0;
+		st->joinsortop = (Oid) list_nth_int(join, 3);
+		st->joinsortcoll = (Oid) list_nth_int(join, 4);
+		st->joinkeyresno = (AttrNumber) list_nth_int(join, 5);
 		if (st->joinclause < 0 || st->joinclause >= st->nclause ||
 			st->joinkeyresno <= 0 ||
 			(st->jointype != LION_JOIN_INNER &&
 			 st->jointype != LION_JOIN_SEMI &&
-			 st->jointype != LION_JOIN_ANTI))
+			 st->jointype != LION_JOIN_ANTI) ||
+			(st->joinunique &&
+			 (st->jointype != LION_JOIN_INNER ||
+			  !OidIsValid(st->joinsortop))))
 			elog(ERROR, "LionCount: malformed join");
 	}
 
@@ -7527,11 +7769,65 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinworkerfilterrows = -1;
 	memset(&st->joinfilter, 0, sizeof(st->joinfilter));
 	st->joinfilter.pinbuf = InvalidBuffer;
+	st->joinsort = NULL;
+	st->joinsortdone = false;
+	st->joinsortslot = NULL;
+	st->joinkeycxt = NULL;
+	st->joinhaveprev = false;
+	st->joinkeypos = 0;
+	st->joinchunk = -1;
+	st->joinsorted = 0;
+	st->joinhavesortstats = false;
+	st->joinworkersorted = 0;
 	if (st->joinclause >= 0)
 	{
 		st->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
 								 estate, eflags);
 		node->custom_ps = list_make1(st->child);
+	}
+
+	/*
+	 * A forward semi join over a non-unique key (DESIGN.md §27) sorts the
+	 * child's rows by their key and compares neighbours with the equality of
+	 * the sort operator's btree family, which is the join operator's family
+	 * (lion_fkjoin_recognize()) for the key's own type.
+	 */
+	if (st->joinunique)
+	{
+		TupleDesc	childdesc = ExecGetResultType(st->child);
+		Form_pg_attribute keyatt;
+		Oid			eqop;
+
+		if (st->joinkeyresno > childdesc->natts)
+			elog(ERROR, "LionCount: malformed join");
+
+		/*
+		 * Only the key comes out of the sort, so the key is the only column
+		 * of the child the target list may read: the dimension of a forward
+		 * semi join is not visible to the query above it, and what the join
+		 * rows of a count(DISTINCT) carry is the key (lion_plan_fkjoin_path()).
+		 */
+		for (i = 0; i < st->ntlist; i++)
+		{
+			if (LION_TL_IS_CHILDCOL(st->tlkind[i]) &&
+				LION_TL_CHILDRESNO(st->tlkind[i]) != st->joinkeyresno)
+				elog(ERROR, "LionCount: a distinct-key join reads a column other than its key");
+		}
+
+		keyatt = TupleDescAttr(childdesc, st->joinkeyresno - 1);
+		st->joinkeytype = keyatt->atttypid;
+		st->joinkeybyval = keyatt->attbyval;
+		st->joinkeylen = keyatt->attlen;
+		eqop = get_equality_op_for_ordering_op(st->joinsortop, NULL);
+		if (!OidIsValid(eqop))
+			elog(ERROR, "could not find equality operator for ordering operator %u",
+				 st->joinsortop);
+		fmgr_info_cxt(get_opcode(eqop), &st->joineqfn, estate->es_query_cxt);
+		st->joinsortslot = ExecInitExtraTupleSlot(estate, childdesc,
+												  &TTSOpsVirtual);
+		st->joinkeycxt = AllocSetContextCreate(estate->es_query_cxt,
+											   "LionCount join key",
+											   ALLOCSET_SMALL_SIZES);
 	}
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
@@ -9404,6 +9700,115 @@ lion_join_collect(LionCountScanState *st)
 }
 
 /*
+ * The forward semi join over a non-unique key (DESIGN.md §27, "Forward semi
+ * joins over a non-unique key"): run the whole child and sort the keys of its
+ * rows, so that they come out in order and equal ones next to each other.  A
+ * NULL key joins nothing and is left out.  The sort is a datum sort of the key
+ * alone - what a Sort node over one column does - within work_mem, spilling
+ * past it as a Sort node's does, in the per-query memory, where it lives until
+ * the run is reset (lion_reset_run()).
+ */
+static void
+lion_join_sort_keys(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+	st->joinsort = tuplesort_begin_datum(st->joinkeytype, st->joinsortop,
+										 st->joinsortcoll, false, work_mem,
+										 NULL, TUPLESORT_NONE);
+	MemoryContextSwitchTo(oldcxt);
+
+	for (;;)
+	{
+		TupleTableSlot *slot;
+		Datum		key;
+		bool		isnull;
+
+		CHECK_FOR_INTERRUPTS();
+		slot = ExecProcNode(st->child);
+		if (TupIsNull(slot))
+			break;
+		key = slot_getattr(slot, st->joinkeyresno, &isnull);
+		if (isnull)
+			continue;
+		tuplesort_putdatum(st->joinsort, key, false);
+		st->joinsorted++;
+	}
+	tuplesort_performsort(st->joinsort);
+	tuplesort_get_stats(st->joinsort, &st->joinsortstats);
+	st->joinhavesortstats = true;
+	st->joinsortdone = true;
+}
+
+/*
+ * The next distinct key of the sorted child rows, as the row that carries it,
+ * or NULL when there are no more.  A row whose key the sort operator's
+ * equality - the join operator's, for the key's type - finds equal to the
+ * previous distinct key's is skipped: its fact rows are that key's, and have
+ * been counted.
+ *
+ * In a parallel plan every participant has sorted every row, so the distinct
+ * keys come out in the same sequence in each, and they are divided by their
+ * position in it: a participant counts the keys of the runs of
+ * LION_FKJOIN_UNIQUE_CHUNK it claims from the shared counter, and passes over
+ * the others, which another participant claimed.  A participant claims the
+ * run after its last one only once it has finished that one, so the counter
+ * never gives out a run behind the participant's position, and every run is
+ * counted by exactly one of them - however many start, and whether the leader
+ * takes part or not.  A plan run without its workers, or a node that is not
+ * parallel-aware, has no shared counter and counts every key.
+ */
+static TupleTableSlot *
+lion_join_next_key(LionCountScanState *st)
+{
+	TupleTableSlot *slot = st->joinsortslot;
+
+	for (;;)
+	{
+		Datum		key;
+		bool		isnull;
+		int64		chunk;
+		MemoryContext oldcxt;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!tuplesort_getdatum(st->joinsort, true, false, &key, &isnull,
+								NULL))
+			return NULL;
+		Assert(!isnull);
+		if (st->joinhaveprev &&
+			DatumGetBool(FunctionCall2Coll(&st->joineqfn, st->joinsortcoll,
+										   st->joinprevkey, key)))
+			continue;
+
+		/* the sort's copy lasts until the next key: keep one of our own */
+		ExecClearTuple(slot);
+		MemoryContextReset(st->joinkeycxt);
+		oldcxt = MemoryContextSwitchTo(st->joinkeycxt);
+		st->joinprevkey = datumCopy(key, st->joinkeybyval, st->joinkeylen);
+		MemoryContextSwitchTo(oldcxt);
+		st->joinhaveprev = true;
+
+		chunk = st->joinkeypos++ / LION_FKJOIN_UNIQUE_CHUNK;
+		if (st->joinshared != NULL)
+		{
+			if (st->joinchunk < chunk)
+				st->joinchunk = (int64)
+					pg_atomic_fetch_add_u32(&st->joinshared->nextchunk, 1);
+			if (st->joinchunk != chunk)
+				continue;
+		}
+
+		memset(slot->tts_isnull, true,
+			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
+		slot->tts_values[st->joinkeyresno - 1] = st->joinprevkey;
+		slot->tts_isnull[st->joinkeyresno - 1] = false;
+		return ExecStoreVirtualTuple(slot);
+	}
+}
+
+/*
  * The FK-side join (DESIGN.md §27): the next dimension row with fact rows, as
  * one partial row - its dimension columns and its count.
  *
@@ -9434,6 +9839,13 @@ lion_join_collect(LionCountScanState *st)
  * columns and adds the counts, which is the join's count for each group
  * because that count is a sum over the group's dimension rows - or, for
  * joinrows, it is a row core's plain Agg aggregates as it would the join's.
+ *
+ * A forward semi join over a non-unique key (joinunique) reads its rows from
+ * the sorted child instead, one per DISTINCT key (lion_join_next_key()), and
+ * counts each as an inner join counts a dimension row.  The posting sets of
+ * distinct keys are disjoint - a fact row has one fk value, and two distinct
+ * keys cannot both equal it - so the counts add up to the fact rows with at
+ * least one matching dimension row, each once: the semi join's count.
  */
 static TupleTableSlot *
 lion_next_join_row(LionCountScanState *st)
@@ -9457,6 +9869,9 @@ lion_next_join_row(LionCountScanState *st)
 		return NULL;
 	}
 
+	if (st->joinunique && !st->joinsortdone)
+		lion_join_sort_keys(st);
+
 	for (;;)
 	{
 		TupleTableSlot *childslot;
@@ -9468,7 +9883,8 @@ lion_next_join_row(LionCountScanState *st)
 		CHECK_FOR_INTERRUPTS();
 
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
-		childslot = ExecProcNode(st->child);
+		childslot = st->joinunique ? lion_join_next_key(st) :
+			ExecProcNode(st->child);
 		if (TupIsNull(childslot))
 		{
 			st->childslot = NULL;
@@ -9840,6 +10256,21 @@ lion_reset_run(LionCountScanState *st)
 	st->joincollected = false;
 	st->joinfiltered = false;
 
+	/* ... and a forward semi join's sorted keys, sorted again next run. */
+	if (st->joinsort != NULL)
+	{
+		tuplesort_end(st->joinsort);
+		st->joinsort = NULL;
+	}
+	if (st->joinsortslot != NULL)
+		ExecClearTuple(st->joinsortslot);
+	if (st->joinkeycxt != NULL)
+		MemoryContextReset(st->joinkeycxt);
+	st->joinsortdone = false;
+	st->joinhaveprev = false;
+	st->joinkeypos = 0;
+	st->joinchunk = -1;
+
 	if (st->npart > 0)
 		lion_close_relation(st);
 
@@ -9931,17 +10362,29 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	memset(shared, 0, sizeof(LionJoinShared));
 	SpinLockInit(&shared->mutex);
 	shared->filterrows = -1;
+	pg_atomic_init_u32(&shared->nextchunk, 0);
 	st->joinshared = shared;
 }
 
 /*
  * Before the workers are launched again for a rescan.  The sums are kept:
- * they are the whole execution's, as the leader's own counters are.
+ * they are the whole execution's, as the leader's own counters are.  The runs
+ * of distinct keys a forward semi join's participants claim start again from
+ * the first, since the rescan's keys are sorted again (and may be others).
+ * No participant is running: the Gather has shut the workers down, and the
+ * leader's own node claims nothing before the Gather launches them again.
  */
 static void
 lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 					  void *coordinate)
 {
+	LionJoinShared *shared = (LionJoinShared *) coordinate;
+
+	pg_atomic_write_u32(&shared->nextchunk, 0);
+	SpinLockAcquire(&shared->mutex);
+	shared->sortedruns += shared->sorted;
+	shared->sorted = 0;
+	SpinLockRelease(&shared->mutex);
 }
 
 static void
@@ -9988,6 +10431,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->missing += st->joinmissing;
 		shared->dirpages += st->dirpages;
 		shared->filterrows = Max(shared->filterrows, st->joinfilterrows);
+		shared->sorted = Max(shared->sorted, st->joinsorted);
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -9999,6 +10443,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkermissing = shared->missing;
 	st->joinworkerdirpages = shared->dirpages;
 	st->joinworkerfilterrows = shared->filterrows;
+	st->joinworkersorted = shared->sortedruns + shared->sorted;
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -10052,6 +10497,11 @@ lion_end_custom_scan(CustomScanState *node)
 	{
 		MemoryContextDelete(st->valcxt);
 		st->valcxt = NULL;
+	}
+	if (st->joinkeycxt != NULL)
+	{
+		MemoryContextDelete(st->joinkeycxt);
+		st->joinkeycxt = NULL;
 	}
 	if (st->viscache != NULL)
 	{
@@ -10335,14 +10785,22 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	 */
 	if (st->joinclause >= 0)
 	{
-		if (st->jointype == LION_JOIN_SEMI)
+		/*
+		 * A forward semi join over a non-unique key counts the fact rows of
+		 * each DISTINCT key of the dimension, which it sorts to find them.
+		 */
+		if (st->jointype == LION_JOIN_SEMI || st->joinunique)
 			ExplainPropertyText("Join Type", "Semi", es);
 		else if (st->jointype == LION_JOIN_ANTI)
 			ExplainPropertyText("Join Type", "Anti", es);
+		if (st->joinunique)
+			ExplainPropertyText("Join Keys", "distinct, sorted", es);
 		if (st->joinrows)
 			ExplainPropertyText("Join Rows",
 								st->jointype == LION_JOIN_ANTI ?
 								"the dimension rows without a match" :
+								st->joinunique ?
+								"the distinct keys with a match" :
 								"the dimension rows with a match", es);
 		if (st->joincollect)
 			ExplainPropertyText("Fact Filters", "collected once", es);
@@ -10477,6 +10935,30 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		if (st->joinclause >= 0)
 		{
+			/*
+			 * A forward semi join's keys: the child rows with one, sorted - by
+			 * every participant of a parallel plan, so what one of them sorted
+			 * in each run, summed over the runs - and how the sort went here,
+			 * if it ran here.  "Looked Up" below is then the DISTINCT keys,
+			 * each by one participant.
+			 */
+			if (st->joinunique)
+			{
+				ExplainPropertyInteger("Join Keys Sorted", NULL,
+									   Max(st->joinsorted,
+										   st->joinworkersorted), es);
+				if (st->joinhavesortstats)
+				{
+					ExplainPropertyText("Join Key Sort Method",
+										tuplesort_method_name(st->joinsortstats.sortMethod),
+										es);
+					ExplainPropertyInteger("Join Key Sort Space Used", "kB",
+										   st->joinsortstats.spaceUsed, es);
+					ExplainPropertyText("Join Key Sort Space Type",
+										tuplesort_space_type_name(st->joinsortstats.spaceType),
+										es);
+				}
+			}
 			ExplainPropertyInteger("Join Keys Looked Up", NULL,
 								   st->joinlookups + st->joinworkerlookups, es);
 			ExplainPropertyInteger("Join Keys Without Entry", NULL,
