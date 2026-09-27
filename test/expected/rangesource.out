@@ -1,0 +1,539 @@
+-- A range on a column that does not drive the count, taken as a source
+-- (DESIGN.md §32, "A range as a source").
+--
+-- `g, count(*) ... WHERE <range on k> GROUP BY g`, a range beside a sum over
+-- another range, a range as an OR's arm and a range among the fact filters of
+-- an FK-side join: the rows whose key lies in the range are one source of the
+-- count, collected into memory once - summaries and all - or, when they do
+-- not fit in a hash table's memory, summed over the walk of the range at
+-- every count.  Every answer is checked against the same query with the
+-- pushdown off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+/*
+ * lion_src() runs q with the pushdown forced (every other scan and join
+ * disabled) and again with the pushdown off and the planner left alone, and
+ * compares the answers as multisets.  It reports how the node took its ranges.
+ */
+CREATE FUNCTION lion_src(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	node jsonb;
+	how text;
+	got text;
+	want text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) '
+		|| q INTO j;
+	node := jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")');
+	IF node IS NULL THEN
+		how := 'not pushed down';
+	ELSE
+		how := 'collected ' || coalesce(node ->> 'Range Sources Collected', '0') ||
+			', walked ' || coalesce(node ->> 'Range Sources Walked', '0');
+		IF node ->> 'Range Evaluation' IS NOT NULL THEN
+			how := how || ', ' || (node ->> 'Range Evaluation');
+		END IF;
+	END IF;
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO got;
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO want;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	IF got IS DISTINCT FROM want THEN
+		RETURN format('MISMATCH: %s, pushed %s, seqscan %s', how, got, want);
+	END IF;
+	RETURN how || ': ' || left(got, 160);
+END $$;
+/* The same through a generic prepared plan, $1 and $2 kept Params. */
+CREATE FUNCTION lion_src_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	got text;
+	want text;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_srcp AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_srcp(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM lion_srcp_run(%L) s', args)
+		INTO got;
+	EXECUTE 'DEALLOCATE lion_srcp';
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE 'PREPARE lion_srcp AS ' || q;
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM lion_srcp_run(%L) s', args)
+		INTO want;
+	EXECUTE 'DEALLOCATE lion_srcp';
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('plan_cache_mode', 'auto', true);
+
+	IF got IS DISTINCT FROM want THEN
+		RETURN format('MISMATCH: pushed %s, seqscan %s', got, want);
+	END IF;
+	RETURN CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END ||
+		': ' || left(got, 160);
+END $$;
+/* The rows of EXECUTE lion_srcp(args), as text. */
+CREATE FUNCTION lion_srcp_run(args text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+BEGIN
+	FOR r IN EXECUTE 'EXECUTE lion_srcp(' || args || ')' LOOP
+		RETURN NEXT r::text;
+	END LOOP;
+END $$;
+-- ---------- the table ----------
+-- u unique and in heap order, r unique in no order, g 7 values, k 800
+-- values with NULLs, a 30 values, tags a small array
+CREATE TABLE lion_src_t (id int NOT NULL, u int NOT NULL, r int NOT NULL,
+						 g int NOT NULL, k int, a int NOT NULL, tags int[]);
+INSERT INTO lion_src_t
+SELECT i, i, (i * 7919) % 20011, i % 7,
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE (i * 17) % 800 END,
+	   i % 30, ARRAY[i % 5, 10 + i % 4]
+  FROM generate_series(1, 20000) i;
+CREATE INDEX lion_src_ur ON lion_src_t USING lion (u, r)
+	WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_src_g ON lion_src_t USING lion (g);
+CREATE INDEX lion_src_k ON lion_src_t USING lion (k);
+CREATE INDEX lion_src_a ON lion_src_t USING lion (a);
+CREATE INDEX lion_src_tags ON lion_src_t USING lion (tags);
+VACUUM (FREEZE, ANALYZE) lion_src_t;
+-- ---------- 1. a range on a column that does not drive a GROUP BY ----------
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u >= 5000 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 1, walked 0: (0,2143) (1,2143) (2,2143) (3,2143) (4,2143) (5,2143) (6,2143)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u BETWEEN 3000 AND 11000 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 1, walked 0: (0,1143) (1,1143) (2,1143) (3,1143) (4,1143) (5,1143) (6,1143)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE r < 900 GROUP BY g');
+                                    lion_src                                    
+--------------------------------------------------------------------------------
+ collected 1, walked 0: (0,129) (1,129) (2,128) (3,128) (4,127) (5,128) (6,128)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE k > 700 GROUP BY g');
+                                    lion_src                                    
+--------------------------------------------------------------------------------
+ collected 1, walked 0: (0,327) (1,329) (2,325) (3,325) (4,326) (5,328) (6,325)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE k > 700 AND k <= 790 AND a = 3 GROUP BY g');
+                               lion_src                                
+-----------------------------------------------------------------------
+ collected 1, walked 0: (0,9) (1,12) (2,11) (3,10) (4,10) (5,10) (6,8)
+(1 row)
+
+SELECT lion_src('SELECT g, count(k) FROM lion_src_t WHERE k < 20 GROUP BY g');
+                                lion_src                                 
+-------------------------------------------------------------------------
+ collected 1, walked 0: (0,64) (1,66) (2,66) (3,67) (4,68) (5,66) (6,65)
+(1 row)
+
+-- two ranges beside a GROUP BY, and two bounds on one side of one
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u > 100 AND r < 15000 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 2, walked 0: (0,2132) (1,2131) (2,2131) (3,2130) (4,2131) (5,2130) (6,2131)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u < 9000 AND u <= 8000::int8 AND r > 50 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 2, walked 0: (0,1138) (1,1140) (2,1140) (3,1140) (4,1140) (5,1139) (6,1140)
+(1 row)
+
+-- an empty range, a range outside the keys
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u BETWEEN 900 AND 300 GROUP BY g');
+           lion_src            
+-------------------------------
+ collected 1, walked 0: (none)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u > 5000000000::int8 GROUP BY g');
+           lion_src            
+-------------------------------
+ collected 1, walked 0: (none)
+(1 row)
+
+-- a range and an equality on one column: two sources
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE k > 100 AND k = 257 GROUP BY g');
+                             lion_src                             
+------------------------------------------------------------------
+ collected 1, walked 0: (0,3) (1,3) (2,3) (3,3) (4,4) (5,3) (6,4)
+(1 row)
+
+-- a two-column GROUP BY, and count(DISTINCT) beside a range on another column
+SELECT lion_src('SELECT g, a, count(*) FROM lion_src_t WHERE u < 700 GROUP BY g, a');
+                                                                                        lion_src                                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ collected 1, walked 0: (0,0,3) (0,1,3) (0,10,3) (0,11,3) (0,12,4) (0,13,3) (0,14,4) (0,15,3) (0,16,3) (0,17,3) (0,18,3) (0,19,4) (0,2,3) (0,20,3) (0,21,4) (0,22,3) (0,23,3) (0,24,3) (
+(1 row)
+
+SELECT lion_src('SELECT count(DISTINCT a) FROM lion_src_t WHERE u BETWEEN 100 AND 130');
+          lion_src           
+-----------------------------
+ collected 1, walked 0: (30)
+(1 row)
+
+SELECT lion_src('SELECT g, count(DISTINCT a) FROM lion_src_t WHERE r < 300 GROUP BY g');
+                                lion_src                                 
+-------------------------------------------------------------------------
+ collected 1, walked 0: (0,30) (1,30) (2,28) (3,30) (4,27) (5,30) (6,29)
+(1 row)
+
+-- ---------- 2. two ranges and no GROUP BY: the wider drives, the other is a source ----------
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u >= 100 AND r < 5000');
+               lion_src                
+---------------------------------------
+ collected 1, walked 0, inside: (4970)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u BETWEEN 100 AND 300 AND r > 50');
+               lion_src               
+--------------------------------------
+ collected 1, walked 0, inside: (200)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE k >= 3 AND k < 790 AND u > 1000');
+                lion_src                
+----------------------------------------
+ collected 1, walked 0, inside: (17253)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE k >= 3 AND u > 1000 AND r < 19000 AND g = 2');
+                 lion_src                  
+-------------------------------------------
+ collected 2, walked 0, complement: (2374)
+(1 row)
+
+-- ---------- 3. a range as an OR's arm ----------
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE (u < 100 OR a = 3) GROUP BY g');
+                                    lion_src                                    
+--------------------------------------------------------------------------------
+ collected 1, walked 0: (0,108) (1,110) (2,108) (3,109) (4,109) (5,109) (6,109)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE (u < 100 OR u > 19900) GROUP BY g');
+                                lion_src                                 
+-------------------------------------------------------------------------
+ collected 2, walked 0: (0,29) (1,30) (2,28) (3,28) (4,28) (5,28) (6,28)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE ((k >= 5 AND k < 9 AND a = 1) OR a = 2) AND g = 1');
+          lion_src           
+-----------------------------
+ collected 1, walked 0: (96)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE ((r BETWEEN 10 AND 900) OR a = 7) AND g = 4');
+           lion_src           
+------------------------------
+ collected 1, walked 0: (215)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE (r < 100 OR k > 790) AND u > 17000');
+              lion_src               
+-------------------------------------
+ collected 2, walked 0, inside: (44)
+(1 row)
+
+-- with nothing to carry the §9 interlock beside the collected range, left to
+-- the ordinary plan
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u < 100 OR a = 3');
+        lion_src        
+------------------------
+ not pushed down: (762)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE (k >= 5 AND k < 9 AND a = 1) OR a = 2');
+        lion_src        
+------------------------
+ not pushed down: (674)
+(1 row)
+
+-- ---------- 4. too large for a hash table's memory: walked at every count ----------
+-- A range over half of the rows of a column in no order is a container of
+-- some four kilobytes at each container key of the heap, and 200,000 narrow
+-- rows are some twenty of them: more than the 64 kB of work_mem's floor.
+CREATE TABLE lion_src_w (u int NOT NULL, r int NOT NULL, g int NOT NULL,
+						 a int NOT NULL);
+INSERT INTO lion_src_w
+SELECT i, hashint4(i) & 1048575, i % 7, i % 30
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lion_src_w_ur ON lion_src_w USING lion (u, r)
+	WITH (summaries = on, summary_tids = 1024);
+CREATE INDEX lion_src_w_g ON lion_src_w USING lion (g);
+CREATE INDEX lion_src_w_a ON lion_src_w USING lion (a);
+VACUUM (FREEZE, ANALYZE) lion_src_w;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r < 524288 GROUP BY g');
+                                           lion_src                                           
+----------------------------------------------------------------------------------------------
+ collected 0, walked 1: (0,14200) (1,14316) (2,14256) (3,14202) (4,14356) (5,14411) (6,14342)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r >= 300000 AND r < 800000 AND a < 20 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 1, walked 1: (0,9047) (1,9009) (2,9092) (3,9001) (4,9174) (5,9094) (6,9110)
+(1 row)
+
+-- the complement of a walked range, and its inside
+SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u >= 100 AND r BETWEEN 1000 AND 1040000');
+                  lion_src                   
+---------------------------------------------
+ collected 0, walked 1, complement: (198122)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u BETWEEN 100 AND 180000 AND r > 524288 AND g = 3');
+                  lion_src                  
+--------------------------------------------
+ collected 0, walked 1, complement: (12989)
+(1 row)
+
+-- existence tests over a walked range
+SELECT lion_src('SELECT count(DISTINCT a) FROM lion_src_w WHERE r < 524288');
+          lion_src           
+-----------------------------
+ collected 0, walked 1: (30)
+(1 row)
+
+SELECT lion_src('SELECT g, count(DISTINCT a) FROM lion_src_w WHERE r > 500000 GROUP BY g');
+                                lion_src                                 
+-------------------------------------------------------------------------
+ collected 0, walked 1: (0,30) (1,30) (2,30) (3,30) (4,30) (5,30) (6,30)
+(1 row)
+
+-- dirty
+UPDATE lion_src_w SET a = a + 1 WHERE u % 50 = 0;
+DELETE FROM lion_src_w WHERE u % 70 = 0;
+SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r < 524288 GROUP BY g');
+                                           lion_src                                           
+----------------------------------------------------------------------------------------------
+ collected 0, walked 1: (0,12753) (1,14316) (2,14256) (3,14202) (4,14356) (5,14411) (6,14342)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u >= 100 AND r BETWEEN 1000 AND 1040000');
+                  lion_src                   
+---------------------------------------------
+ collected 0, walked 1, complement: (195295)
+(1 row)
+
+RESET work_mem;
+RESET hash_mem_multiplier;
+-- and the same with the memory to collect it
+SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r < 524288 GROUP BY g');
+                                           lion_src                                           
+----------------------------------------------------------------------------------------------
+ collected 1, walked 0: (0,12753) (1,14316) (2,14256) (3,14202) (4,14356) (5,14411) (6,14342)
+(1 row)
+
+DROP TABLE lion_src_w;
+-- ---------- 5. generic plans: bounds as Params, a NULL one, a multi-key Param ----------
+SELECT lion_src_prep('SELECT g, count(*) FROM lion_src_t WHERE u >= $1 AND u < $2 GROUP BY g', '1000, 9000');
+                                lion_src_prep                                
+-----------------------------------------------------------------------------
+ pushed down: (0,1143) (1,1143) (2,1143) (3,1143) (4,1143) (5,1142) (6,1143)
+(1 row)
+
+SELECT lion_src_prep('SELECT g, count(*) FROM lion_src_t WHERE u >= $1 AND u < $2 GROUP BY g', 'NULL, 9000');
+    lion_src_prep    
+---------------------
+ pushed down: (none)
+(1 row)
+
+SELECT lion_src_prep('SELECT count(*) FROM lion_src_t WHERE u >= $1 AND r < $2', '10, 7000');
+    lion_src_prep    
+---------------------
+ pushed down: (6993)
+(1 row)
+
+-- beside a multi-key clause whose value is known only at run time, and one
+-- that the posting sets answer only as a superset (a NULL element)
+SELECT lion_src_prep('SELECT g, count(*) FROM lion_src_t WHERE tags @> $1 AND u < $2 GROUP BY g', '''{2}'', 12000');
+                            lion_src_prep                             
+----------------------------------------------------------------------
+ pushed down: (0,343) (1,343) (2,343) (3,343) (4,342) (5,343) (6,343)
+(1 row)
+
+SELECT lion_src_prep('SELECT g, count(*) FROM lion_src_t WHERE tags @> $1 AND u < $2 GROUP BY g', '''{2,NULL}'', 12000');
+    lion_src_prep    
+---------------------
+ pushed down: (none)
+(1 row)
+
+SELECT lion_src_prep('SELECT count(*) FROM lion_src_t WHERE tags && $1 AND u < $2 AND r > 100', '''{1,11}'', 15000');
+    lion_src_prep    
+---------------------
+ pushed down: (5969)
+(1 row)
+
+-- ---------- 6. a dirty heap, and VACUUM ----------
+UPDATE lion_src_t SET a = a + 1 WHERE id % 9 = 0;
+DELETE FROM lion_src_t WHERE id % 11 = 0;
+INSERT INTO lion_src_t SELECT 30000 + i, 30000 + i, 20011 + i, i % 7, i % 800, i % 30, ARRAY[i % 5]
+  FROM generate_series(1, 500) i;
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u >= 5000 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 1, walked 0: (0,2019) (1,2020) (2,2020) (3,2021) (4,2019) (5,2019) (6,2019)
+(1 row)
+
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE r < 900 OR a = 3 GROUP BY g');
+                                    lion_src                                    
+--------------------------------------------------------------------------------
+ collected 1, walked 0: (0,175) (1,173) (2,173) (3,175) (4,172) (5,175) (6,173)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u >= 100 AND r < 5000');
+               lion_src                
+---------------------------------------
+ collected 1, walked 0, inside: (4516)
+(1 row)
+
+VACUUM lion_src_t;
+SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u >= 5000 GROUP BY g');
+                                       lion_src                                        
+---------------------------------------------------------------------------------------
+ collected 1, walked 0: (0,2019) (1,2020) (2,2020) (3,2021) (4,2019) (5,2019) (6,2019)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u >= 100 AND r < 5000');
+               lion_src                
+---------------------------------------
+ collected 1, walked 0, inside: (4516)
+(1 row)
+
+SELECT lion_index_verify('lion_src_ur', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+-- ---------- 7. a partitioned table ----------
+CREATE TABLE lion_src_p (u int NOT NULL, g int NOT NULL, ts timestamptz NOT NULL)
+	PARTITION BY RANGE (u);
+CREATE TABLE lion_src_p1 PARTITION OF lion_src_p FOR VALUES FROM (0) TO (6000);
+CREATE TABLE lion_src_p2 PARTITION OF lion_src_p FOR VALUES FROM (6000) TO (20000);
+INSERT INTO lion_src_p SELECT i, i % 5, '2025-01-01'::timestamptz + (i * 37 % 20000) * interval '1 minute'
+  FROM generate_series(0, 19999) i;
+CREATE INDEX lion_src_p1_i ON lion_src_p1 USING lion (u, g, ts) WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_src_p2_i ON lion_src_p2 USING lion (u, g, ts);
+VACUUM (FREEZE, ANALYZE) lion_src_p;
+SELECT lion_src('SELECT g, count(*) FROM lion_src_p WHERE ts >= ''2025-01-05'' GROUP BY g');
+                              lion_src                               
+---------------------------------------------------------------------
+ collected 2, walked 0: (0,2848) (1,2848) (2,2848) (3,2848) (4,2848)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_p WHERE u > 300 AND ts < ''2025-01-09''');
+                lion_src                
+----------------------------------------
+ collected 2, walked 0, inside: (11219)
+(1 row)
+
+-- ---------- 8. the fact filters of an FK-side join ----------
+CREATE TABLE lion_src_dim (pk int PRIMARY KEY, attr text NOT NULL);
+INSERT INTO lion_src_dim SELECT i, 'attr' || (i % 4) FROM generate_series(0, 29) i;
+CREATE TABLE lion_src_fact (fk int NOT NULL, ts int NOT NULL, v int NOT NULL);
+INSERT INTO lion_src_fact SELECT i % 30, i, i % 11 FROM generate_series(1, 30000) i;
+CREATE INDEX lion_src_fact_fk ON lion_src_fact USING lion (fk);
+CREATE INDEX lion_src_fact_tsv ON lion_src_fact USING lion (ts, v)
+	WITH (summaries = on, summary_tids = 128);
+VACUUM (FREEZE, ANALYZE) lion_src_fact;
+ANALYZE lion_src_dim;
+SELECT lion_src('SELECT d.attr, count(*) FROM lion_src_fact f JOIN lion_src_dim d ON f.fk = d.pk WHERE f.ts >= 12000 GROUP BY d.attr');
+                                  lion_src                                  
+----------------------------------------------------------------------------
+ collected 1, walked 0: (attr0,4801) (attr1,4800) (attr2,4200) (attr3,4200)
+(1 row)
+
+SELECT lion_src('SELECT d.attr, count(*) FROM lion_src_fact f JOIN lion_src_dim d ON f.fk = d.pk WHERE f.ts BETWEEN 100 AND 25000 AND f.v = 3 GROUP BY d.attr');
+                                lion_src                                
+------------------------------------------------------------------------
+ collected 1, walked 0: (attr0,603) (attr1,604) (attr2,529) (attr3,528)
+(1 row)
+
+SELECT lion_src('SELECT count(*) FROM lion_src_fact f JOIN lion_src_dim d ON f.fk = d.pk WHERE f.ts < 9000 AND d.attr = ''attr1''');
+           lion_src            
+-------------------------------
+ collected 1, walked 0: (2400)
+(1 row)
+
+-- EXPLAIN names the range with every bound
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lion_src_t WHERE u > 100 AND u <= 900 AND r < 15000 GROUP BY g;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_src_g (g), lion_src_ur.u (u > 100 AND u <= 900), lion_src_ur.r (r < 15000)
+   Group Key: g
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_src_t WHERE (u < 100 OR a = 3) AND g = 2;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_src_ur.u, lion_src_a ((u < 100) OR (a = 3)), lion_src_g (g = 2)
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+DROP TABLE lion_src_t, lion_src_p, lion_src_fact, lion_src_dim;
+DROP FUNCTION lion_src(text);
+DROP FUNCTION lion_src_prep(text, text);
+DROP FUNCTION lion_srcp_run(text);

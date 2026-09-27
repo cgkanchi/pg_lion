@@ -69,12 +69,15 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/pg_operator_d.h"
+#include "catalog/pg_type_d.h"
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/buffile.h"
 #include "storage/condition_variable.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
@@ -83,6 +86,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplesort.h"
 #include "utils/wait_event.h"
 #include "varatt.h"
 
@@ -343,7 +347,60 @@ typedef struct LionBuilder
 
 	uint32		nitems;			/* containers and segments (entry.ncontainers) */
 	uint64		ntids;
+
+	/*
+	 * Summary posting sets (DESIGN.md §32).  sumflags are the kind flags the
+	 * entry is written with (LION_ENTRY_SUMMARY, plus LION_ENTRY_SUMLAST for a
+	 * column's last bucket).  tofile makes a COLLECTING builder: it groups
+	 * codes into items exactly as every builder does, and writes each item to
+	 * the file instead of to an entry or a page - the items of a summary wait
+	 * there until the column's VALUE entries are all written, which is where
+	 * the summaries go in the directory order.
+	 */
+	uint16		sumflags;
+	BufFile    *tofile;
 } LionBuilder;
+
+/*
+ * The summaries of the key column being written (DESIGN.md §32).  The build
+ * sees a column's keys in directory order with each key's codes, so it cuts
+ * them into BUCKETS as they pass: the codes of consecutive keys are collected
+ * until they reach summary_tids, and the bucket is then closed at the key
+ * boundary - sorted, grouped into items and put aside in `file`.  The last
+ * bucket of the column, whatever its size, becomes the column's SUMLAST
+ * entry.  Once the column's last key has been written the buckets are written
+ * after it, as entries, which is where the directory order puts them.
+ *
+ * AUTO decides only then, from the column's exact counts, whether to keep
+ * them; until then nothing has been written to the index, so dropping them
+ * costs nothing but the file.
+ */
+typedef struct LionSumBuild
+{
+	int			mode;			/* LION_SUMOPT_ON or LION_SUMOPT_AUTO */
+	uint32		bucket_tids;	/* the summary_tids reloption */
+	MemoryContext cxt;			/* lives for the column */
+	MemoryContext bucketcxt;	/* reset after each bucket */
+
+	/* the bucket being collected */
+	uint64	   *codes;
+	int64		ncodes;
+	int64		capcodes;
+	int64		maxcodes;		/* past this the codes go to `sort` */
+	Tuplesortstate *sort;
+	bool		sorted;			/* codes[] is ascending as it stands */
+	uint64		lastcode;
+	char	   *lastraw;		/* stored bytes of its largest key so far */
+	Size		lastrawlen;
+	Size		lastrawcap;
+	int64		bucketkeys;
+
+	/* the column so far */
+	int64		nkeys;
+	double		ntids;
+	int64		nbuckets;
+	BufFile    *file;
+} LionSumBuild;
 
 /*
  * One level of the directory under construction (DESIGN.md §21).  Items are
@@ -410,6 +467,13 @@ typedef struct LionBuildState
 	int			maxbuilders;
 
 	double		indtuples;		/* TIDs pushed into the index */
+
+	/* Summary posting sets (DESIGN.md §32). */
+	int			sumopt;			/* the `summaries` reloption, LION_SUMOPT_* */
+	uint32		sumtids;		/* the `summary_tids` reloption */
+	LionSumBuild *sum;			/* the column being written's, or NULL */
+	uint32		summary_cols;	/* the columns that got them */
+	int64		nsummaries;		/* summary entries written */
 } LionBuildState;
 
 static void lion_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -498,7 +562,7 @@ lion_build_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 	p->hash = (src != NULL) ? src->hash : 0;
 	p->flags = pivotflag |
 		(uint16) ((src != NULL) ?
-				  (src->flags & (LION_ENTRY_RESERVED | LION_ENTRY_MINUSINF)) :
+				  (src->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF)) :
 				  LION_ENTRY_MINUSINF);
 	p->keylen = (uint16) keylen;
 	p->head = child;
@@ -710,7 +774,9 @@ static void
 lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 {
 	lion_build_level_add(bs, bs->leaf, entry, size);
-	bs->ndistinct++;
+	/* the keys, for the §17 guard; a summary (§32) is not one */
+	if (!LionEntryIsSummary(entry))
+		bs->ndistinct++;
 }
 
 /*
@@ -1042,6 +1108,16 @@ lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 {
 	Size		csize = lion_item_size(c);
 
+	/* A collecting summary builder puts its items aside (DESIGN.md §32). */
+	if (b->tofile != NULL)
+	{
+		uint32		len = (uint32) csize;
+
+		BufFileWrite(b->tofile, &len, sizeof(len));
+		BufFileWrite(b->tofile, c, csize);
+		return;
+	}
+
 	if (!b->spilled)
 	{
 		if (b->inlineused + csize <= b->inlinemax)
@@ -1215,6 +1291,7 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 
 	entry->ncontainers = b->nitems;
 	entry->ntids = b->ntids;
+	entry->flags |= b->sumflags;
 
 	lion_build_add_entry(bs, entry, size);
 
@@ -1291,6 +1368,329 @@ lion_flush_builders(LionBuildState *bs)
 }
 
 /* ---------------------------------------------------------------------
+ * Summary posting sets (DESIGN.md §32)
+ * --------------------------------------------------------------------- */
+
+/*
+ * The mark that ends a bucket's items in the file, where an item's length
+ * would be; no item is empty.
+ */
+#define LION_SUM_END_OF_ITEMS	0
+
+/* The header of a bucket in the file: its key and what its entry needs. */
+typedef struct LionSumBucketHdr
+{
+	uint16		sumflags;
+	uint32		rawlen;
+	uint64		ntids;
+} LionSumBucketHdr;
+
+/*
+ * Does the key column being written get summaries?  Only an ordered scalar
+ * column can: a summary is the union of a RUN of keys, which needs an order,
+ * and a multi-key column's entries are extracted keys, not column values.
+ */
+static LionSumBuild *
+lion_sum_begin(LionBuildState *bs, LionState *col)
+{
+	LionSumBuild *sum;
+
+	if (bs->sumopt == LION_SUMOPT_OFF || !col->ordered || col->multikey)
+		return NULL;
+
+	sum = (LionSumBuild *) MemoryContextAllocZero(bs->buildctx,
+												  sizeof(LionSumBuild));
+	sum->mode = bs->sumopt;
+	sum->bucket_tids = bs->sumtids;
+	sum->cxt = AllocSetContextCreate(bs->buildctx, "lion summary build",
+									 ALLOCSET_DEFAULT_SIZES);
+	sum->bucketcxt = AllocSetContextCreate(sum->cxt, "lion summary bucket",
+										   ALLOCSET_DEFAULT_SIZES);
+	sum->capcodes = 1024;
+	sum->codes = (uint64 *) MemoryContextAlloc(sum->cxt,
+											   sizeof(uint64) * sum->capcodes);
+
+	/*
+	 * A bucket is normally summary_tids codes and a key's worth more, which
+	 * is a few hundred kilobytes.  One key can be far larger than that - a
+	 * column of few keys with summaries = on - and past a quarter of
+	 * maintenance_work_mem the rest of such a bucket is sorted by a tuplesort,
+	 * which spills.
+	 */
+	sum->maxcodes = Max((int64) maintenance_work_mem * 1024L / 4 /
+						(int64) sizeof(uint64), (int64) 8192);
+	sum->sorted = true;
+	sum->lastrawcap = 64;
+	sum->lastraw = (char *) MemoryContextAlloc(sum->cxt, sum->lastrawcap);
+	sum->file = BufFileCreateTemp(false);
+
+	return sum;
+}
+
+/* One code of the bucket being collected. */
+static void
+lion_sum_add(LionSumBuild *sum, uint64 code)
+{
+	if (sum->sort != NULL)
+	{
+		tuplesort_putdatum(sum->sort, Int64GetDatum((int64) code), false);
+		sum->ncodes++;
+		return;
+	}
+
+	if (sum->ncodes > 0 && code <= sum->lastcode)
+		sum->sorted = false;
+	sum->lastcode = code;
+
+	if (sum->ncodes >= sum->capcodes)
+	{
+		if (sum->ncodes >= sum->maxcodes)
+		{
+			MemoryContext old = MemoryContextSwitchTo(sum->bucketcxt);
+			int64		i;
+
+			sum->sort = tuplesort_begin_datum(INT8OID, Int8LessOperator,
+											  InvalidOid, false,
+											  maintenance_work_mem / 4, NULL,
+											  TUPLESORT_NONE);
+			MemoryContextSwitchTo(old);
+			for (i = 0; i < sum->ncodes; i++)
+				tuplesort_putdatum(sum->sort,
+								   Int64GetDatum((int64) sum->codes[i]), false);
+			tuplesort_putdatum(sum->sort, Int64GetDatum((int64) code), false);
+			sum->ncodes++;
+			return;
+		}
+		sum->capcodes = Min(sum->capcodes * 2, sum->maxcodes);
+		sum->codes = (uint64 *) repalloc_huge(sum->codes,
+											  sizeof(uint64) * sum->capcodes);
+	}
+	sum->codes[sum->ncodes++] = code;
+}
+
+static int
+lion_sum_code_cmp(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/*
+ * Close the bucket being collected: its codes in ascending order, grouped into
+ * items by the very builder every posting set is written with, and put aside
+ * in the file after a header naming the bucket's key.  The codes of one bucket
+ * are the disjoint codes of distinct keys of one scalar column, so none of
+ * them repeats; a repeat is skipped all the same, as the builder takes each
+ * member once.
+ */
+static void
+lion_sum_close_bucket(LionBuildState *bs, LionSumBuild *sum, bool last)
+{
+	MemoryContext old;
+	LionBuilder *b;
+	LionSumBucketHdr hdr;
+	uint32		end = LION_SUM_END_OF_ITEMS;
+	uint64		prev = 0;
+	bool		any = false;
+
+	if (sum->ncodes == 0)
+		return;
+
+	old = MemoryContextSwitchTo(sum->bucketcxt);
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.sumflags = LION_ENTRY_SUMMARY | (last ? LION_ENTRY_SUMLAST : 0);
+	hdr.rawlen = (uint32) sum->lastrawlen;
+	hdr.ntids = (uint64) sum->ncodes;
+	BufFileWrite(sum->file, &hdr, sizeof(hdr));
+	BufFileWrite(sum->file, sum->lastraw, sum->lastrawlen);
+
+	/* A collecting builder: no key, no entry, its items go to the file. */
+	b = (LionBuilder *) palloc0(sizeof(LionBuilder));
+	b->keykind = LION_KEY_REAL;
+	b->cur = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	b->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	b->seg = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	lion_sparse_init(b->seg, 0);
+	b->tofile = sum->file;
+
+	if (sum->sort != NULL)
+	{
+		Datum		val;
+		bool		isnull;
+
+		tuplesort_performsort(sum->sort);
+		while (tuplesort_getdatum(sum->sort, true, false, &val, &isnull, NULL))
+		{
+			uint64		code = (uint64) DatumGetInt64(val);
+
+			if (any && code == prev)
+				continue;
+			lion_builder_add(bs, b, code);
+			prev = code;
+			any = true;
+		}
+		tuplesort_end(sum->sort);
+		sum->sort = NULL;
+	}
+	else
+	{
+		int64		i;
+
+		/*
+		 * A column stored in the order of its keys - a timestamp that rows
+		 * arrive in - hands its buckets over already sorted.
+		 */
+		if (!sum->sorted)
+			qsort(sum->codes, (size_t) sum->ncodes, sizeof(uint64),
+				  lion_sum_code_cmp);
+		for (i = 0; i < sum->ncodes; i++)
+		{
+			if (any && sum->codes[i] == prev)
+				continue;
+			lion_builder_add(bs, b, sum->codes[i]);
+			prev = sum->codes[i];
+			any = true;
+		}
+	}
+	lion_builder_finish_group(bs, b);
+	lion_builder_close_segment(bs, b);
+	BufFileWrite(sum->file, &end, sizeof(end));
+
+	sum->nbuckets++;
+	sum->ncodes = 0;
+	sum->sorted = true;
+	sum->bucketkeys = 0;
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(sum->bucketcxt);
+}
+
+/*
+ * The key whose codes lion_sum_add() was just handed has been written: it is
+ * now the largest key of the bucket, and the bucket closes once it holds
+ * summary_tids codes - at a key boundary, since a key's rows are never split
+ * between two buckets.
+ */
+static void
+lion_sum_key_done(LionBuildState *bs, LionSumBuild *sum, const char *raw,
+				  Size rawlen)
+{
+	if (rawlen > sum->lastrawcap)
+	{
+		sum->lastrawcap = Max(rawlen, sum->lastrawcap * 2);
+		sum->lastraw = (char *) repalloc(sum->lastraw, sum->lastrawcap);
+	}
+	memcpy(sum->lastraw, raw, rawlen);
+	sum->lastrawlen = rawlen;
+	sum->bucketkeys++;
+	sum->nkeys++;
+
+	if (sum->ncodes >= (int64) sum->bucket_tids)
+		lion_sum_close_bucket(bs, sum, false);
+}
+
+/*
+ * The column's VALUE entries are all written.  The last bucket becomes the
+ * column's SUMLAST entry, AUTO decides from the column's exact counts whether
+ * to keep any of it, and the buckets are written after the column's values as
+ * entries - INLINE or a posting tree of their own, by the same builders and
+ * the same rules as every entry.
+ */
+static void
+lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
+{
+	LionState  *cs = bs->cur;
+	bool		keep;
+
+	lion_sum_close_bucket(bs, sum, true);
+
+	/*
+	 * ON summarizes the column even with no rows yet: its first insert opens
+	 * the first bucket.  AUTO needs rows to decide from, and a column it
+	 * leaves without summaries has none until the next REINDEX.
+	 */
+	if (sum->mode == LION_SUMOPT_ON)
+		keep = true;
+	else
+		keep = sum->ntids >= (double) LION_SUMMARY_AUTO_MIN_BUCKETS *
+			sum->bucket_tids &&
+			sum->ntids <= (double) sum->nkeys *
+			((double) sum->bucket_tids / LION_SUMMARY_AUTO_MIN_KEYS);
+
+	if (keep)
+	{
+		LionSumBucketHdr hdr;
+		LionContainer *item = (LionContainer *)
+			MemoryContextAlloc(sum->cxt, LION_CONTAINER_MAX_SIZE);
+		char	   *raw = NULL;
+		Size		rawcap = 0;
+		int64		i;
+
+		if (BufFileSeek(sum->file, 0, 0, SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not rewind lion summary temporary file")));
+
+		for (i = 0; i < sum->nbuckets; i++)
+		{
+			MemoryContext old;
+			LionBuilder *b;
+			Datum		key;
+			uint32		len;
+
+			BufFileReadExact(sum->file, &hdr, sizeof(hdr));
+			if (hdr.rawlen > rawcap)
+			{
+				rawcap = Max((Size) hdr.rawlen, (Size) 64);
+				raw = (char *) MemoryContextAlloc(sum->cxt, rawcap);
+			}
+			BufFileReadExact(sum->file, raw, hdr.rawlen);
+
+			old = MemoryContextSwitchTo(bs->tmpctx);
+			key = lion_fetch_key(cs, raw);
+
+			Assert(bs->nbuilders == 0);
+			b = lion_builder_create(bs, key, LION_KEY_REAL,
+									LION_SUMMARY_HASH);
+			bs->nbuilders = 0;	/* written here, not by lion_flush_builders() */
+			b->sumflags = hdr.sumflags;
+
+			for (;;)
+			{
+				BufFileReadExact(sum->file, &len, sizeof(len));
+				if (len == LION_SUM_END_OF_ITEMS)
+					break;
+				if (len < LION_CONTAINER_HDRSZ || len > LION_CONTAINER_MAX_SIZE)
+					elog(ERROR, "lion index build: a summary item of %u bytes",
+						 len);
+				BufFileReadExact(sum->file, item, len);
+				lion_builder_emit(bs, b, item);
+				b->nitems++;
+			}
+			b->ntids = hdr.ntids;
+			lion_builder_flush(bs, b);
+			bs->nsummaries++;
+
+			MemoryContextSwitchTo(old);
+			MemoryContextReset(bs->tmpctx);
+		}
+
+		bs->summary_cols |= ((uint32) 1) << (cs->attno - 1);
+	}
+
+	elog(DEBUG1, "lion index \"%s\": key column %d, " INT64_FORMAT " keys, %.0f TIDs, " INT64_FORMAT " summary buckets of %u TIDs, %s",
+		 RelationGetRelationName(bs->index), cs->attno, sum->nkeys, sum->ntids,
+		 sum->nbuckets, sum->bucket_tids, keep ? "kept" : "dropped");
+
+	BufFileClose(sum->file);
+	MemoryContextDelete(sum->cxt);
+	pfree(sum);
+}
+
+/* ---------------------------------------------------------------------
  * The build itself
  * --------------------------------------------------------------------- */
 
@@ -1324,6 +1724,7 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 	uint64		code;
 	int			which;
 	int			i;
+	bool		sumkey;
 
 	Assert(bs->nbuilders == 0);
 	for (i = 0; i < n; i++)
@@ -1333,14 +1734,38 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 		b[i] = lion_builder_create(bs, e->key, e->kind, e->hash);
 	}
 
+	/*
+	 * A summarized column's values go into its current summary bucket as well
+	 * (DESIGN.md §32); its reserved entries are in no bucket.
+	 */
+	sumkey = (bs->sum != NULL &&
+			  lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE);
+
 	while (lion_spool_group_next(group, &which, &code))
 	{
 		lion_builder_add(bs, b[which], code);
+		if (sumkey)
+		{
+			lion_sum_add(bs->sum, code);
+			bs->sum->ntids++;
+		}
 		if ((++ncodes & 0xFFFF) == 0)
 			CHECK_FOR_INTERRUPTS();
 	}
 
 	lion_flush_builders(bs);
+
+	if (sumkey)
+	{
+		/*
+		 * The largest key of the group, which the directory order puts last;
+		 * a group of an ordered column is one key unless its comparison ties
+		 * keys its equality does not, and then they all sort as one.
+		 */
+		const LionSpoolEntry *e = lion_spool_group_entry(group, n - 1);
+
+		lion_sum_key_done(bs, bs->sum, e->raw, e->rawlen);
+	}
 	MemoryContextSwitchTo(oldctx);
 	MemoryContextReset(bs->tmpctx);
 }
@@ -1754,6 +2179,11 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.max_entries = lion_max_entries(index);
 	bs.root = InvalidBlockNumber;
 	bs.height = 0;
+	bs.sumopt = opts ? opts->summaries : LION_SUMOPT_OFF;
+	bs.sumtids = opts ? (uint32) opts->summary_tids : LION_DEFAULT_SUMMARY_TIDS;
+	bs.sum = NULL;
+	bs.summary_cols = 0;
+	bs.nsummaries = 0;
 
 	/*
 	 * How full a directory page is packed (DESIGN.md §21).  A LEAF needs no
@@ -1844,10 +2274,21 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	for (c = 0; c < ncols; c++)
 	{
 		bs.cur = &bs.ix.cols[c];
+
+		/*
+		 * A column's summaries (DESIGN.md §32) are collected while its values
+		 * are written and written after them, which is where they sort.
+		 */
+		bs.sum = lion_sum_begin(&bs, bs.cur);
 		if (bs.reader != NULL)
 			lion_spool_reader_emit_column(bs.reader, c, lion_build_emit, &bs);
 		else
 			lion_spool_emit_column(bs.spool, c, lion_build_emit, &bs);
+		if (bs.sum != NULL)
+		{
+			lion_sum_finish(&bs, bs.sum);
+			bs.sum = NULL;
+		}
 	}
 	bs.cur = NULL;
 
@@ -1860,6 +2301,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					  lion_wal_mode_for_build(index));
 	/* ... and the order the directory was just laid out in (§21). */
 	lion_meta_record_order(LionPageGetMeta((Page) metabuf->data), &bs.ix);
+	/* ... and which columns got summaries, which makes it version 7 (§32). */
+	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
+							   bs.summary_cols, bs.sumtids);
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);

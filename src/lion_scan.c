@@ -692,10 +692,13 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 				continue;
 			entry = (LionEntryTuple *) PageGetItem(cpage, iid);
 
-			/* Bounded to one key column (DESIGN.md §24). */
+			/*
+			 * Bounded to one key column (DESIGN.md §24), and to its values:
+			 * the column's summary entries (§32) come after its last value.
+			 */
 			if (entry->attno < w->col->attno)
 				continue;
-			if (entry->attno > w->col->attno)
+			if (entry->attno > w->col->attno || LionEntryIsSummary(entry))
 			{
 				w->done = true;
 				return NULL;

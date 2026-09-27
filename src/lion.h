@@ -280,8 +280,21 @@ lion_posting_highkey(Page page)
  * rejected in §24, because the two formats would then be told apart by a field
  * that means "column one" in one of them and "no column at all" in the other.
  * Opening a version 5 index is the same ERROR with the same REINDEX hint.
+ *
+ * Version 7 (DESIGN.md §32) is version 6 plus SUMMARY POSTING SETS: entries of
+ * two new kinds, after a column's VALUE entries, each holding the union of the
+ * posting sets of a run of that column's keys.  It is an ADDITION: every page
+ * and every item of a version 6 index reads exactly as it did, and a version 6
+ * index is simply one without summaries, which this code reads and writes as it
+ * always has.  The number moves only so that a build of pg_lion that predates
+ * summaries refuses an index that has them - it would take a summary entry for
+ * a VALUE entry, whose kind is what an unknown flag reads as, and count its
+ * rows twice.  A build writes version 7 only when at least one key column has
+ * summaries (summary_cols below), so an index built with `summaries = off`
+ * stays readable by the builds before this one.
  */
-#define LION_VERSION			6
+#define LION_VERSION			6	/* the base format every index has */
+#define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 
 typedef struct LionMetaPageData
 {
@@ -331,7 +344,23 @@ typedef struct LionMetaPageData
 	uint32		order_flags;
 	uint32		ordered_cols;
 	uint32		order_ident;
-	uint32		reserved[2];	/* room for the next field to need none */
+
+	/*
+	 * SUMMARY POSTING SETS (DESIGN.md §32), in the last two reserved words -
+	 * zero on every index written before them, which is exactly "no column
+	 * has summaries".
+	 *
+	 *	summary_cols	bit i - 1: key column i has summaries, decided when the
+	 *					index was built and fixed for its life.  Nonzero only
+	 *					on a version 7 meta page.
+	 *	summary_tids	how many TIDs a summary bucket takes before the next
+	 *					key above every key it holds starts a new one: the
+	 *					`summary_tids` reloption at build time.  Inserts read
+	 *					it from here, so ALTER INDEX changes nothing until a
+	 *					REINDEX, as for wal_mode.
+	 */
+	uint32		summary_cols;
+	uint32		summary_tids;
 } LionMetaPageData;
 
 #define LION_META_ORDER_RECORDED	0x0001
@@ -341,10 +370,11 @@ StaticAssertDecl(INDEX_MAX_KEYS <= 32,
 				 "lion's meta page records the order of at most 32 key columns");
 
 /*
- * §25 and §21's order record spent four of the reserved words, so the struct
- * is exactly the size it has been since version 4 and a meta page written by
- * either version reads as the other - which is what lets the format version
- * stay at 6.
+ * §25 and §21's order record spent four of the reserved words and §32's
+ * summaries the last two, so the struct is exactly the size it has been since
+ * version 4 and a meta page written by any of them reads as the others - which
+ * is what let the format version stay at 6 until §32 needed it to move for a
+ * reason of its own.
  */
 StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 				 "the lion meta page payload must not change size");
@@ -374,11 +404,28 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 #define LION_ENTRY_DOWNLINK	0x0020
 #define LION_ENTRY_MINUSINF	0x0040
 
+/*
+ * SUMMARY entries (DESIGN.md §32, format version 7).  A summary entry's posting
+ * set is the union of the posting sets of a run of its column's VALUE entries
+ * - a BUCKET of keys - and its key is the largest key the bucket may hold: the
+ * buckets of a column are (previous summary's key, this summary's key], in key
+ * order, and sort after every VALUE entry of the column.  The last bucket of a
+ * column is open above; its entry carries LION_ENTRY_SUMLAST as well, sorts
+ * after every other summary of the column WHATEVER ITS KEY, and its key is the
+ * largest key it holds so far, which an insert of a larger key raises.  So its
+ * key is data, not position, and the order compares no key of it at all.
+ */
+#define LION_ENTRY_SUMMARY	0x0080
+#define LION_ENTRY_SUMLAST	0x0100
+
 #define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)
+#define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
+/* The flags that make an entry's KIND, which a pivot copied from it keeps. */
+#define LION_ENTRY_KINDFLAGS	(LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS)
 #define LION_ENTRY_PIVOT		(LION_ENTRY_HIGHKEY | LION_ENTRY_DOWNLINK)
 #define LION_ENTRY_ALLFLAGS \
 	(LION_ENTRY_INLINE | LION_ENTRY_CHAIN | LION_ENTRY_RESERVED | \
-	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF)
+	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS)
 
 #define LionEntryIsPivot(e)		(((e)->flags & LION_ENTRY_PIVOT) != 0)
 #define LionEntryIsHighKey(e)	(((e)->flags & LION_ENTRY_HIGHKEY) != 0)
@@ -403,7 +450,20 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 #define LionEntryIsNullKey(e)	(((e)->flags & LION_ENTRY_NULLKEY) != 0)
 #define LionEntryIsEmptyKey(e)	(((e)->flags & LION_ENTRY_EMPTYKEY) != 0)
 #define LionEntryIsReserved(e)	(((e)->flags & LION_ENTRY_RESERVED) != 0)
+#define LionEntryIsSummary(e)	(((e)->flags & LION_ENTRY_SUMKINDS) != 0)
+#define LionEntryIsSumLast(e)	(((e)->flags & LION_ENTRY_SUMLAST) != 0)
 #define LION_NULLKEY_HASH		0
+
+/*
+ * The hash every SUMMARY entry carries (DESIGN.md §32), whatever its key.
+ * A summary is ordered by its key alone - the keys of a column's summaries
+ * are distinct under proc 4, and the open one sorts by its kind - so the hash
+ * has nothing to order; and it is what the owner stamp of every page of a
+ * CHAINED summary's posting tree says (§18), which must not change when the
+ * open bucket's key is raised.  With the key's hash there, raising the key of
+ * a chained open bucket left its pages claiming another entry.
+ */
+#define LION_SUMMARY_HASH		0
 
 /*
  * THE DIRECTORY ORDER (DESIGN.md §21, §24).
@@ -420,7 +480,14 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
  * no key to compare - and gives the leftmost downlink of an internal page a
  * value below every real one:
  *
- *		MINF < NULL < EMPTY < VALUE
+ *		MINF < NULL < EMPTY < VALUE < SUMMARY < SUMLAST
+ *
+ * The two summary kinds of DESIGN.md §32 come after every VALUE entry, so a
+ * column's values are one run and its summaries the run right after it: a walk
+ * of a column's values ends at its first summary exactly as it ends at the
+ * next column's first entry.  SUMMARY entries are ordered by their keys like
+ * values; the one SUMLAST entry a column may have is ordered by its kind
+ * alone.
  *
  * Within VALUE the order is the opclass's ordering support function (proc 4)
  * under the index collation, then the hash, then a bytewise comparison of the
@@ -434,6 +501,11 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 #define LION_KIND_NULL		1
 #define LION_KIND_EMPTY		2
 #define LION_KIND_VALUE		3
+#define LION_KIND_SUMMARY	4	/* DESIGN.md §32 */
+#define LION_KIND_SUMLAST	5
+
+/* Kinds whose order compares keys (the others are one entry per column). */
+#define LION_KIND_HAS_KEY(k)	((k) == LION_KIND_VALUE || (k) == LION_KIND_SUMMARY)
 
 typedef struct LionEntryTuple
 {
@@ -484,6 +556,10 @@ lion_entry_kind(const LionEntryTuple *e)
 		return LION_KIND_NULL;
 	if ((e->flags & LION_ENTRY_EMPTYKEY) != 0)
 		return LION_KIND_EMPTY;
+	if ((e->flags & LION_ENTRY_SUMLAST) != 0)
+		return LION_KIND_SUMLAST;
+	if ((e->flags & LION_ENTRY_SUMMARY) != 0)
+		return LION_KIND_SUMMARY;
 	return LION_KIND_VALUE;
 }
 
@@ -534,7 +610,45 @@ typedef struct LionOptions
 	int			max_entries;	/* 0 = unlimited (DESIGN.md §17) */
 	int			fillfactor;		/* directory leaf fill at build time (§21) */
 	int			wal_mode;		/* LION_WALOPT_*, DESIGN.md §25 */
+	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
+	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
 } LionOptions;
+
+/*
+ * The `summaries` reloption (DESIGN.md §32): which ORDERED SCALAR key columns
+ * a build gives summary posting sets.  OFF is the default and builds none, so
+ * an index is written as format 6 exactly as before; ON gives every such
+ * column summaries; AUTO decides per column from the data the build sees - a
+ * column with many keys and few rows per key, where a range walks many small
+ * entries - and gives an index built on an empty table none.  Read at build
+ * time only: the answer is recorded on the meta page (summary_cols).
+ */
+#define LION_SUMOPT_OFF			0
+#define LION_SUMOPT_ON			1
+#define LION_SUMOPT_AUTO		2
+
+/*
+ * The `summary_tids` reloption: how many TIDs a summary bucket holds before the
+ * next insert of a key above every key it holds starts a new one, and how many
+ * a build puts in one before it starts the next.  It trades the two costs of a
+ * summed range (DESIGN.md §32, "Bucket size"): the summaries a range covers,
+ * about its rows over this, against the keys of the two buckets at its edges,
+ * which are walked one by one.
+ */
+#define LION_DEFAULT_SUMMARY_TIDS	4096
+#define LION_MIN_SUMMARY_TIDS		16
+#define LION_MAX_SUMMARY_TIDS		(1 << 24)
+
+/*
+ * AUTO's rule (DESIGN.md §32): a column gets summaries when it has at least
+ * LION_SUMMARY_AUTO_MIN_BUCKETS buckets' worth of TIDs and its keys hold at
+ * most summary_tids / LION_SUMMARY_AUTO_MIN_KEYS TIDs each on average, so that
+ * a bucket stands for at least that many keys.  Below either there is little
+ * per-key work for a summary to save: a range over a few keys, or over keys
+ * each so large that a summary is barely larger than one of them.
+ */
+#define LION_SUMMARY_AUTO_MIN_BUCKETS	4
+#define LION_SUMMARY_AUTO_MIN_KEYS		16
 
 /*
  * The `wal_mode` reloption (DESIGN.md §25).  AUTO is the default and means
@@ -632,6 +746,14 @@ typedef struct LionState
 	bool		multikey;
 	FmgrInfo	extractvalue;	/* support proc 2 */
 	FmgrInfo	extractquery;	/* support proc 3 */
+
+	/*
+	 * The column has SUMMARY POSTING SETS (DESIGN.md §32): its bit in the meta
+	 * page's summary_cols.  Only ever set on an ordered scalar column, and only
+	 * on a version 7 index; inserts keep the summaries current and ranges read
+	 * them.
+	 */
+	bool		summarized;
 } LionState;
 
 struct LionIndexState
@@ -973,6 +1095,16 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
 							 int lockmode, bool forwrite, OffsetNumber *offp);
 
 /*
+ * The same, handing back the first ITEM at or after sk instead: the leaf is
+ * the one that item is on, stepping right from the landing leaf when sk sorts
+ * after everything on it.
+ */
+extern Buffer lion_dir_search_first(Relation index, Relation heaprel,
+									LionIndexState *ix, const LionSearchKey *sk,
+									int lockmode, bool forwrite,
+									OffsetNumber *offp);
+
+/*
  * The same read-only descent stopped at `level`: the page of that level whose
  * key range holds sk, locked SHARE, or InvalidBuffer when the directory is not
  * that tall.  For lion_index_verify(), which proves with it that a page a
@@ -1280,6 +1412,13 @@ extern uint32 lion_index_meta_wal_mode(Relation index);
 
 /* Record on a meta page image the order a build laid the directory out in (§21). */
 extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
+
+/*
+ * ... and which key columns got summary posting sets, with their bucket size
+ * (DESIGN.md §32).  None leaves the meta page at version 6; any makes it 7.
+ */
+extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
+									   uint32 bucket_tids);
 
 /*
  * Like lion_find_entry(), but with the comparison functions the caller wants:
