@@ -328,7 +328,7 @@ typedef struct LionCountSource
 
 	/*
 	 * A RANGE on a column that does not drive the count, taken as a source
-	 * (DESIGN.md §31, "A range as a source") that was too large to collect
+	 * (DESIGN.md §32, "A range as a source") that was too large to collect
 	 * into memory: the rows whose key lies in the range, which the caller
 	 * counts as the SUM over the sets a walk of the range hands out - disjoint
 	 * entries and summaries of one scalar column - each ANDed with the other
@@ -544,7 +544,7 @@ extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 
 /*
  * The rows of one range over key column `attno` of index - every set a walk of
- * the range's INSIDE hands out, summaries included (DESIGN.md §31) - as ONE
+ * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
  * private, pinless posting set: their union, copied into memory.  Like a
  * collected intersection it may only ever be counted beside a located set that
  * carries the §9 interlock.  False, with nothing allocated, when the copy
@@ -760,7 +760,7 @@ typedef struct LionEntryScan
 	bool		done;
 
 	/*
-	 * SUMMARY POSTING SETS (DESIGN.md §31).  A walk whose caller only adds up
+	 * SUMMARY POSTING SETS (DESIGN.md §32).  A walk whose caller only adds up
 	 * what it hands out may read a column's summaries instead of its keys: it
 	 * then walks in up to three PHASES - the VALUE entries of its part up to
 	 * the first bucket it covers whole (LOWER), the SUMMARY entries of the
@@ -822,7 +822,7 @@ typedef struct LionEntryScan
 #define LION_WALK_BELOW		2
 #define LION_WALK_ABOVE		3
 
-/* The phases of a walk that uses summaries (DESIGN.md §31). */
+/* The phases of a walk that uses summaries (DESIGN.md §32). */
 #define LION_PHASE_VALUES	0	/* no summaries: the part's VALUE entries */
 #define LION_PHASE_LOWER	1	/* VALUE entries at or below clipmax */
 #define LION_PHASE_SUMS		2	/* the summaries of whole buckets */
@@ -860,7 +860,7 @@ extern void lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
 /*
  * The same walk for a caller that only ADDS UP what it hands out - a sum, or
  * a union - which may therefore be handed a column's SUMMARY entries in place
- * of the keys they cover (DESIGN.md §31): the entries are still pairwise
+ * of the keys they cover (DESIGN.md §32): the entries are still pairwise
  * disjoint and still cover exactly the rows of the part.  On a column without
  * summaries, and for an unordered range, it is lion_entry_scan_begin_part().
  * The NULL entry never comes out of a walk that uses summaries; LION_WALK_ALL
@@ -940,6 +940,23 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *input_rel,
 								   RelOptInfo *output_rel,
 								   void *extra);
+
+/*
+ * The cost model's shared terms (DESIGN.md section 10, "The units"): what a
+ * merge of posting sets costs in CPU, used by the count pushdown and by
+ * lioncostestimate() for the AND of sets an index scan makes; and a column's
+ * correlation with the heap order less ANALYZE's tie-break (lion_am.c).
+ */
+extern double lion_merge_cpu_cost(int nsrc, const double *members,
+								  const double *containers, const bool *inmem,
+								  double tuples, double *probes);
+extern double lion_containers_for(double heap_pages, double members);
+extern double lion_index_column_posting_share(PlannerInfo *root,
+											  RelOptInfo *rel,
+											  IndexOptInfo *idx,
+											  AttrNumber col);
+extern double lion_var_heap_correlation(PlannerInfo *root, Index relid,
+										Var *var);
 
 /* ---------------------------------------------------------------------
  * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan

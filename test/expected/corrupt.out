@@ -218,7 +218,7 @@ SELECT lion_dc_try('INSERT INTO lion_dc VALUES (11)');
 (1 row)
 
 DROP INDEX lion_dc_i;
--- ---------- 4. a summary whose key is not its bucket's (DESIGN.md §31) ----------
+-- ---------- 4. a summary whose key is not its bucket's (DESIGN.md §32) ----------
 -- Buckets of 16 keys: the second summary is keyed 32 and holds the rows of
 -- keys 17 to 32.  Its key is rewritten to 24, which still sorts between its
 -- neighbours (a summary's hash is a constant, so nothing else changes), so

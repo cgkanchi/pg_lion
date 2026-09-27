@@ -6115,7 +6115,7 @@ lion_range_union_cmp(const void *a, const void *b)
 }
 
 /*
- * The rows of one range, collected (DESIGN.md §31, "A range as a source").
+ * The rows of one range, collected (DESIGN.md §32, "A range as a source").
  *
  * The walk is the one a summed range makes (lion_entry_scan_begin_sum()):
  * the entries of the range's partial buckets and the summaries of its whole
@@ -6131,7 +6131,7 @@ lion_range_union_cmp(const void *a, const void *b)
  * before its transaction committed.  The same goes for the summaries: an
  * insert puts its row under its key and then under its bucket's summary, both
  * before it commits, and the walk reads the keys of a bucket or its summary,
- * never both (DESIGN.md §31, "Readers").
+ * never both (DESIGN.md §32, "Readers").
  */
 bool
 lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
@@ -7097,7 +7097,7 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
 
 /*
  * Where a descent for bound number `bound` lands among the column's entries of
- * `kind` - VALUE, or SUMMARY for the summaries of DESIGN.md §31 - and a copy of
+ * `kind` - VALUE, or SUMMARY for the summaries of DESIGN.md §32 - and a copy of
  * the first item at or after that position, moving right past a leaf whose
  * last item is below it; *posp is NULL at the very end of the directory.  The
  * leaf returned is the one that item is on.
@@ -7167,7 +7167,7 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
  * bound of the side this is that bound's descent, as it always was; with two
  * (`k < 10 AND k <= $1`) it used to be the first one's, or - for the walk
  * above - where the range itself started, which made the complement no
- * cheaper than the range (DESIGN.md §28, fixed in §31).
+ * cheaper than the range (DESIGN.md §28, fixed in §32).
  *
  * Returns InvalidBlockNumber when the side has no bound.  *posp is the copy
  * of the item the landing marks, NULL at the end of the directory.
@@ -7252,7 +7252,7 @@ lion_range_first_leaf(Relation index, LionRange *range)
 }
 
 /*
- * Where a column's summaries begin (DESIGN.md §31): the leaf a descent to
+ * Where a column's summaries begin (DESIGN.md §32): the leaf a descent to
  * (attno, SUMMARY) with no key lands on.  A search key of kind SUMMARY and no
  * comparison compares only on its hash, 0, and without a stored form it is the
  * smallest member of its run, so it sorts below every summary of the column
@@ -7337,7 +7337,7 @@ lion_entry_scan_init(LionEntryScan *es, Relation index, AttrNumber attno)
 	es->part = LION_WALK_ALL;
 	es->done = false;
 
-	/* No summaries unless lion_entry_scan_begin_sum() plans them (§31). */
+	/* No summaries unless lion_entry_scan_begin_sum() plans them (§32). */
 	es->usesum = false;
 	es->phase = LION_PHASE_VALUES;
 	es->nextphase = LION_PHASE_VALUES;
@@ -7473,7 +7473,7 @@ lion_scan_keycopy(LionEntryScan *es, const LionEntryTuple *entry, char **bufp,
 /*
  * Compare a stored key of the walk's column with another stored one, under the
  * column's own comparison: how a key is put on one side or the other of a
- * bucket boundary (DESIGN.md §31).
+ * bucket boundary (DESIGN.md §32).
  */
 static int
 lion_scan_keycmp(LionEntryScan *es, const char *a, const char *b)
@@ -7530,7 +7530,7 @@ lion_scan_bucket_inside(LionEntryScan *es, const LionEntryTuple *entry)
 }
 
 /*
- * Plan a walk that uses the column's summaries (DESIGN.md §31): find the first
+ * Plan a walk that uses the column's summaries (DESIGN.md §32): find the first
  * bucket the part covers whole, and set the walk up for the phase it starts
  * in.  The buckets of a column are (previous summary's key, this summary's
  * key], in key order, and a bucket is wholly in the part when both of its
@@ -7687,7 +7687,7 @@ lion_entry_scan_setup_phase(LionEntryScan *es)
 {
 	/*
 	 * Test hook: one phase of a summed walk is over and the next is about to
-	 * descend to where it begins (DESIGN.md §31), holding nothing of the
+	 * descend to where it begins (DESIGN.md §32), holding nothing of the
 	 * directory.  test/isolation/summary_race.spec parks here while inserts
 	 * close and open buckets and split the leaves the next phase reads.
 	 * Compiles to nothing without --enable-injection-points.
@@ -7813,7 +7813,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 
 	*partended = false;
 
-	/* The summaries of whole buckets (DESIGN.md §31). */
+	/* The summaries of whole buckets (DESIGN.md §32). */
 	if (es->phase == LION_PHASE_SUMS)
 	{
 		if (kind < LION_KIND_SUMMARY)
@@ -7831,7 +7831,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 
 	/*
 	 * A walk of values ends where the column's summaries begin: they sort
-	 * after its last value (§31).
+	 * after its last value (§32).
 	 */
 	if (kind >= LION_KIND_SUMMARY)
 	{
@@ -7893,7 +7893,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
  * unless the walk ended here.  The lock is then given up; the pin is kept
  * while the batch holds an INLINE copy (see lion_entry_scan_next()).
  *
- * A walk that uses summaries (DESIGN.md §31) moves from one phase to the next
+ * A walk that uses summaries (DESIGN.md §32) moves from one phase to the next
  * here, and sets the next phase up at the start of the following read.
  */
 static int64
@@ -7948,7 +7948,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 	if (es->resumekind >= 0)
 	{
 		/*
-		 * After every entry of the column up to a kind (§31: where a column's
+		 * After every entry of the column up to a kind (§32: where a column's
 		 * summaries begin), which a key cannot say.  The landing leaf holds at
 		 * most the tail of the run before it, passed over here.
 		 */
@@ -8149,7 +8149,7 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 
 	while (es->nextbatch >= es->nbatch)
 	{
-		/* a phase that has ended hands over at the next read (§31) */
+		/* a phase that has ended hands over at the next read (§32) */
 		if (es->done ||
 			(!BlockNumberIsValid(es->blkno) && es->nextphase == es->phase))
 		{

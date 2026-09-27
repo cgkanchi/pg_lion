@@ -346,7 +346,7 @@ SELECT lion_dc('SELECT count(DISTINCT (k, a)) FROM lion_dt');
 SELECT lion_dc('SELECT count(DISTINCT k) FILTER (WHERE a = 1) FROM lion_dt');
 SELECT lion_dc('SELECT sum(DISTINCT k) FROM lion_dt');
 SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
--- a range on a column the walk does not drive is a source (DESIGN.md §31)
+-- a range on a column the walk does not drive is a source (DESIGN.md §32)
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
 -- a WHERE clause the posting sets cannot answer
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');

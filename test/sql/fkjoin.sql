@@ -330,7 +330,7 @@ SELECT lion_fj('SELECT d.attr, f.x, count(*) FROM lion_ff f JOIN lion_fd d ON f.
 SELECT lion_fj('SELECT d.attr + (random() * 0)::int AS a, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY 1');
 SELECT lion_fj('SELECT d.attr, sum(f.x) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(f.y) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
--- a range among the fact filters is a source (DESIGN.md §31)
+-- a range among the fact filters is a source (DESIGN.md §32)
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x > 3 GROUP BY d.attr');
 -- a fact filter the posting sets cannot answer
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x % 2 = 1 GROUP BY d.attr');

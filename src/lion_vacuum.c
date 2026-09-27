@@ -769,7 +769,7 @@ lion_vac_entry_matches(Page page, OffsetNumber off, const LionVacEntry *ent)
 		return false;			/* another key column (DESIGN.md §24) */
 
 	/*
-	 * A SUMMARY entry (DESIGN.md §31) of a posting tree is its tree: the open
+	 * A SUMMARY entry (DESIGN.md §32) of a posting tree is its tree: the open
 	 * bucket's key is raised by inserts and the bucket is closed - its kind
 	 * changes - when the next one opens, but the root block a set is stamped
 	 * with never changes and is never reused (§18).

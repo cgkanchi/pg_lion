@@ -1110,7 +1110,7 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 }
 
 /* ---------------------------------------------------------------------
- * Summary posting sets (DESIGN.md §31)
+ * Summary posting sets (DESIGN.md §32)
  * --------------------------------------------------------------------- */
 
 /* A new SUMLAST entry: the open bucket of a column, holding one row. */
@@ -1236,7 +1236,7 @@ lion_summary_close_last(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
- * SUMMARY POSTING SETS (DESIGN.md §31): add (ckey, lo), a row whose key in a
+ * SUMMARY POSTING SETS (DESIGN.md §32): add (ckey, lo), a row whose key in a
  * summarized column is `key`, to the summary of the bucket the key belongs
  * to.  The caller has put the row under the key's own entry first and holds
  * nothing.
@@ -1529,7 +1529,7 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			lion_insert_one(index, heapRel, state, key, 0, ckey, lo);
 
 			/*
-			 * ... and in its bucket's summary (DESIGN.md §31), which is a
+			 * ... and in its bucket's summary (DESIGN.md §32), which is a
 			 * second step with nothing held in between: see
 			 * lion_summary_insert() for why that is safe.  Test hook: the row
 			 * is under its key and in no summary yet;

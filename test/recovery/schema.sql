@@ -102,7 +102,7 @@ CREATE INDEX lion_rec_mc ON lion_rec USING lion (k4, t, nn, arr)
 	WITH (inline_limit = 64);
 
 /*
- * An index with SUMMARY posting sets (DESIGN.md §31).  id is the table's key
+ * An index with SUMMARY posting sets (DESIGN.md §32).  id is the table's key
  * and the writer's inserts append above it, so every crash round closes,
  * opens and rekeys the open bucket under WAL, its updates add rows to the
  * buckets in the middle and its deletes and the VACUUM loop empty summaries
@@ -198,7 +198,7 @@ LANGUAGE sql IMMUTABLE AS $$
 		   ('select count(*) from lion_rec where t = ''v13'' and arr @> array[3]'),
 		   ('select count(*) from lion_rec where k4 = 5 and t = ''v13'' and nn is null'),
 		   ('select count(*) from lion_rec where k4 in (1,2,3) and nn in (4,5)'),
-		   /* DESIGN.md §31: sums over summaries, and ranges as sources. */
+		   /* DESIGN.md §32: sums over summaries, and ranges as sources. */
 		   ('select count(*) from lion_rec where id >= 20000'),
 		   ('select count(*) from lion_rec where id between 1000 and 30000 and k4 = 5'),
 		   ('select k4, count(*) from lion_rec where id < 25000 group by k4'),
@@ -436,7 +436,7 @@ BEGIN
 	END LOOP;
 
 	/*
-	 * 2b. the summaries (DESIGN.md §31) hold every row of their columns,
+	 * 2b. the summaries (DESIGN.md §32) hold every row of their columns,
 	 * which are NOT NULL: as many as the heap after a VACUUM, at least as
 	 * many before one.  lion_index_verify() above has compared each of them
 	 * with its bucket's keys.

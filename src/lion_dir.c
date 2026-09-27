@@ -248,7 +248,7 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 	/*
 	 * One NULL, one EMPTY and one last SUMMARY entry per column: their kind is
 	 * their whole position.  VALUE and SUMMARY entries are ordered by their
-	 * keys (DESIGN.md §31: a summary's key is its bucket's upper bound).
+	 * keys (DESIGN.md §32: a summary's key is its bucket's upper bound).
 	 */
 	if (!LION_KIND_HAS_KEY(ikind))
 		return 0;
@@ -289,7 +289,7 @@ lion_cmp_entry(const LionEntryTuple *item, const LionSearchKey *sk)
 		return 1;
 
 	/*
-	 * The last summary of a column (DESIGN.md §31) keeps the largest key its
+	 * The last summary of a column (DESIGN.md §32) keeps the largest key its
 	 * bucket holds, which an insert raises; that key is not a position, so two
 	 * of them are the same entry whatever their bytes - which is also what
 	 * lets a walk resume past it after its key has changed.
@@ -654,7 +654,7 @@ restart:
  * there - finishing, as a writer, any split it steps over, because the page to
  * the right of a flagged one has no downlink yet (DESIGN.md §21).  *offp is the
  * item's offset, or past the last item of the rightmost leaf.  The summary
- * insert of DESIGN.md §31 looks its bucket up this way: the first summary of
+ * insert of DESIGN.md §32 looks its bucket up this way: the first summary of
  * the column whose key is at or above the row's.
  */
 Buffer

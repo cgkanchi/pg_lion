@@ -1292,7 +1292,7 @@ SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_r WHERE k < 
    Distinct Key: k
 (3 rows)
 
--- ---------- 8. ranges that do not drive: sources since DESIGN.md §31 ----------
+-- ---------- 8. ranges that do not drive: sources since DESIGN.md §32 ----------
 SELECT lion_rc('SELECT x, count(*) FROM lion_r WHERE k < 20 GROUP BY x');     -- range not the driver
        lion_rc        
 ----------------------
@@ -1330,7 +1330,7 @@ SELECT lion_rc('SELECT x, y, count(*) FROM lion_r WHERE x < 5 GROUP BY x, y');
 (1 row)
 
 -- declined shapes (the ordinary plan answers them): an OR with nothing that
--- holds the §9 pin beside it (§31), and the rest
+-- holds the §9 pin beside it (§32), and the rest
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 OR x = 3');          -- under an OR
          lion_rc         
 -------------------------
@@ -1361,7 +1361,7 @@ SELECT lion_rc('SELECT count(*) FROM lion_r WHERE n > 1');                     -
  pushed down, 1 rows
 (1 row)
 
--- an FK-side join's fact filter is a source (DESIGN.md §27), a range too (§31)
+-- an FK-side join's fact filter is a source (DESIGN.md §27), a range too (§32)
 CREATE TABLE lion_rd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO lion_rd SELECT i, 'n' || (i % 3) FROM generate_series(0, 9) i;
 ANALYZE lion_rd;

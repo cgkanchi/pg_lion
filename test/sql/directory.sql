@@ -384,13 +384,17 @@ SELECT ordered, entries FROM lion_index_stats('lion_rev_k');
 SELECT lion_index_verify('lion_rev_k', true);
 SELECT count(*) AS keys_not_found FROM generate_series(0, 499) g
 	WHERE lion_index_count('lion_rev_k', g) <> 10;
--- the groups come out in the OPCLASS's order, which is descending
+-- the groups come out in the OPCLASS's order, which is descending (the node
+-- is forced: 500 groups of 10 rows each are a sequential scan's to win, and
+-- this opclass's SQL comparison makes every entry of the walk dearer still)
+SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_rev GROUP BY k;
 SELECT k, count(*) FROM lion_rev GROUP BY k LIMIT 3;
 SELECT lion_groups_monotonic('SELECT k, count(*) FROM lion_rev GROUP BY k',
 							 false) AS groups_in_opclass_order;
 -- ... and that is not int4's own order, so an ORDER BY keeps its Sort
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_rev GROUP BY k ORDER BY k;
+RESET enable_seqscan;
 DROP TABLE lion_rev;
 
 -- A comparison that belongs to no btree family at all cannot drive a

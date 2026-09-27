@@ -655,7 +655,7 @@ SELECT lion_fj('SELECT d.attr, count(f.y) FROM lion_ff f JOIN lion_fd d ON f.fk 
  not pushed down, 8 rows
 (1 row)
 
--- a range among the fact filters is a source (DESIGN.md §31)
+-- a range among the fact filters is a source (DESIGN.md §32)
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x > 3 GROUP BY d.attr');
        lion_fj       
 ---------------------
