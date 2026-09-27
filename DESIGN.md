@@ -6282,8 +6282,9 @@ ANALYZE shows the early exit reading fewer containers than the same walk with `c
 ## 27. FK-side join pushdown: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK (v1, implemented)
 
 Formerly the §23 backlog item of the same name; the semi and anti joins (`EXISTS`, `IN`, `NOT
-EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`
-and parallel plans after them. The shape is the star-schema aggregate
+EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`,
+parallel plans and the forward semi join over a non-unique key after them. The shape is the
+star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -6364,6 +6365,10 @@ The proof is therefore a COSTING AND SCOPE GUARD ONLY, and nothing about correct
 (2026-09-23 review): because the per-dimension-row sum is exact with duplicates, a unique index that
 is later dropped, becomes invalid, or is deferrable and violated inside the current transaction can
 make the node do more lookups than it was priced for, never give a wrong answer.
+
+It guards the inner join only. A semi join's count is not a sum over join pairs, and the forward
+one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
+("Forward semi joins over a non-unique key", below), which makes the question moot there.
 
 ### The join semantics the lookup must reproduce
 
@@ -6556,12 +6561,12 @@ differently.
   made of it.)
 - **A non-unique key keeps its semi join**, and has to: counting pairs would count a fact row once
   per duplicate. The node never treats it as an inner join. Its inner side is the DIMENSION, so the
-  one shape it can take is the reverse one below with the roles exchanged - each fact row tested
-  against the dimension's posting sets - which needs a lion index on the dimension's key, dimension
-  filters that posting sets answer, and a lookup per fact row, which the cost model refuses whenever
-  the fact table is the large one (tested). Core's other way of running it, the dimension's distinct
-  keys joined as an inner join (`JOIN_UNIQUE_INNER`), would let the node count the forward form over
-  a non-unique key too, as a sum over distinct keys; it is not built.
+  one shape it could take at first is the reverse one below with the roles exchanged - each fact
+  row tested against the dimension's posting sets - which needs a lion index on the dimension's key,
+  dimension filters that posting sets answer, and a lookup per fact row, which the cost model
+  refuses whenever the fact table is the large one (tested). Core's other way of running it, the
+  dimension's distinct keys joined as an inner join (`JOIN_UNIQUE_INNER`), is the one the node takes
+  now, as a sum over distinct keys ("Forward semi joins over a non-unique key", below).
 - **The reverse form is new.** Its rows are the OUTER side's, each once, when it has a match. That is
   the lookup the node already makes per dimension row, with §26's existence test in place of the
   count: the fk set merged with the fact filters and stopped at the first container that shows a
@@ -6577,16 +6582,16 @@ differently.
 
 Recognition (`lion_fkjoin_recognize()`): exactly one SpecialJoinInfo, JOIN_SEMI or JOIN_ANTI, with
 no `ojrelid`, whose minimal sides are one base relation each and equal to its syntactic sides; the
-fact is its inner (right) side and the dimension its outer side, one way round only; the one join
-clause is found as for an inner join, from the equivalence class or joininfo. A qual of a NOT
-EXISTS that names only the outer side (`NOT EXISTS (... AND d.attr = 2)`) stays a join clause of
-the anti join and is a second one, which declines; inside an EXISTS the planner moves it to the
-outer relation, where it is a dimension filter like any other. No uniqueness is asked: the count is
-per dimension row, so a duplicated key is two rows tested twice and counted twice, as the semi join
-counts them, and a NULL key is looked up by nobody. The aggregates are the inner join's counts:
-`count(*)`, `count(1)`, and in a semi join `count(d.pk)` (a matched row's key is not NULL); an anti
-join's rows include the NULL keys, so there `count(d.pk)` declines. The partial path's row estimate
-is the join rel's own.
+fact is its inner (right) side and the dimension its outer side (a semi join is also taken the other
+way round, as "Forward semi joins over a non-unique key" below); the one join clause is found as for
+an inner join, from the equivalence class or joininfo. A qual of a NOT EXISTS that names only the
+outer side (`NOT EXISTS (... AND d.attr = 2)`) stays a join clause of the anti join and is a second
+one, which declines; inside an EXISTS the planner moves it to the outer relation, where it is a
+dimension filter like any other. No uniqueness is asked: the count is per dimension row, so a
+duplicated key is two rows tested twice and counted twice, as the semi join counts them, and a NULL
+key is looked up by nobody. The aggregates are the inner join's counts: `count(*)`, `count(1)`, and
+in a semi join `count(d.pk)` (a matched row's key is not NULL); an anti join's rows include the NULL
+keys, so there `count(d.pk)` declines. The partial path's row estimate is the join rel's own.
 
 Visibility is §26's argument, unchanged: an existence test is a count compared with zero, computed
 from the same containers read the same way, and the per-dimension-row structure is this section's.
@@ -6858,7 +6863,9 @@ it is offered, besides the serial path, over the dimension's cheapest partial pa
   nothing else is divided, so every partial count or row comes from one participant and the
   answers are the serial node's. Above the Gather, core's Finalize Agg adds the partial counts
   (hashed for a GROUP BY, sorted over no columns for a folded one, plain without one); the rows of
-  a `count(DISTINCT)` are sorted and aggregated above it by core's Agg.
+  a `count(DISTINCT)` are sorted and aggregated above it by core's Agg. (The forward semi join over
+  a non-unique key divides its distinct keys instead, over the dimension's whole plan, and shares a
+  counter to do it: "Forward semi joins over a non-unique key".)
 - **Nothing is shared but EXPLAIN's counters.** Each participant locates the fact filters and makes
   its own copy of them (`lion_sources_collect()`) under its own `get_hash_memory_limit()`, and
   falls back to probing on its own when its copy does not fit. The copy is not built once in
@@ -6927,9 +6934,174 @@ dimension rows) the first row took 94 ms and the third 650; the fk index's pages
 three. The serial `count(DISTINCT)` over the 2,000,000-key fk is the one serial choice the model
 gets wrong here (the hash join at 121,557 against the node's 123,222, 706 ms against 507).
 
+### Forward semi joins over a non-unique key (2026-09-27)
+
+    SELECT count(*) FROM fact f WHERE <f filters>
+      AND EXISTS (SELECT 1 FROM dim d WHERE d.k = f.fk AND <d filters>)
+
+and `f.fk IN (SELECT d.k FROM dim d WHERE ...)`, where nothing proves `d.k` unique. With no proof
+`reduce_unique_semijoins()` leaves the semi join a semi join, its inner side the dimension, and its
+answer is the fact rows whose key is in the SET of keys of the dimension rows that pass the filters:
+counting join pairs, as the inner join does, would count a fact row once per duplicate. Core runs it
+as a (hash) semi join, or as `JOIN_UNIQUE_INNER` - the dimension made unique on the key by a
+HashAggregate or a Sort and a Unique, then an inner join. The node does the second:
+
+- it runs the dimension's plan as its child, as for every FK-side join, and sorts the keys of its
+  rows, which puts equal keys next to each other; each is kept once;
+- it counts each DISTINCT key as the inner join counts a dimension row - the key's fk set ANDed
+  with the fact filters or their collected copy, a partial count - and the Finalize Agg adds the
+  counts up.
+
+Why that is the semi join's count:
+
+- **Distinct keys have disjoint posting sets.** A fact row has one fk value, and two keys that are
+  distinct under the join's equality cannot both equal it: the sort's btree family has the join
+  operator as its equality, and equality in a family is transitive across its types (an `int4` fk
+  against `int8` keys included). So every fact row with a match is counted once, under the one key
+  it equals, and no other fact row is counted at all.
+- **Which keys are distinct is the join's own question.** The sort is by the `<` of a btree family
+  that has the join operator as its equality, for the dimension key's type
+  (`get_ordering_op_for_equality_op()`, the order core's own sorted unique-ification of a semi
+  join's inner side takes), under the join clause's input collation, and neighbours are compared
+  with that family's `=`. Two keys the join cannot tell apart are neighbours and one of them is
+  looked up - which finds the other's entry too, since the fk index answers the join operator
+  (`lion_match_index()`). An operator no btree family knows has no such order, and the shape is left
+  to the ordinary plan.
+- **NULL keys** are never sorted (a strict operator matches nothing to them), and a NULL fk lives in
+  the fk index's NULL entry, which no key reaches.
+- **Visibility is the inner join's**: the child runs under the query's snapshot, each distinct key's
+  count is §9's, and the sort holds keys, never a posting set or a pin. The fact filters are located
+  (and collected) before the child runs and keep their pins while it runs to its end, which is the
+  exposure "Visibility and the §9 interlock" names for a child that runs between counts.
+
+Recognition (`lion_fkjoin_recognize()`): the one semi join of "Semi and anti joins", taken the other
+way round - the fact its outer side, the dimension its inner one - as `JOIN_UNIQUE_INNER`, core's
+name for the plan. Where the dimension has lion indexes of its own, the reverse orientation with the
+roles exchanged is offered beside it and the cost model chooses (the tests' model takes the distinct
+keys). `lion_try_fkjoin_path()` treats it as an inner join over the distinct keys, `LION_JOIN_INNER`
+with `LION_JOINFLAG_UNIQUE`. What the query above the EXISTS can name is the fact's: `count(*)`,
+`count(1)`, `count(f.fk)` (a matched row's key is not NULL) and `count(DISTINCT f.fk)`, whose rows
+("count(DISTINCT)") are then one per distinct key with a match, carrying the key. A GROUP BY can only
+be of fact columns, which no FK-side join puts in its output ("Declined"), and declines; so does the
+anti join the other way round, `NOT EXISTS` over the fact's rows, which would count the fact rows
+WITHOUT a match.
+
+**A sort in the node, not core's unique-ification as the child.** Core's path for it is
+`create_unique_path()` up to 18 and `create_unique_paths()` from 19, which builds other shapes (a
+presorted or incrementally sorted input, a two-phase unique-ification over a Gather) and different
+ones per major; a hashed one gives its keys in no order, and the parallel plan below needs every
+participant to produce the same sequence of distinct keys, which a sort by a total order gives. A
+datum sort of the key alone (`tuplesort_begin_datum()`) is what a Sort node over one column does and
+takes as long: 199,000 random `int4` keys sorted in 21.5 ms, and in 20 ms by a Sort node over the
+same Seq Scan, against about 30 ms for the HashAggregate core would make of them. It sorts within
+`work_mem` and spills past it as a Sort node's does.
+
+**Parallel.** Unique-ification per participant is not global: with the dimension's partial path as
+the child, as the other joins take it, a key whose rows went to two participants would be kept and
+counted by both, its fact rows twice. Three plans were measured (the table below):
+
+- **serial**;
+- **unique-ified in the leader**: the serial node over a Gather of the dimension's partial path,
+  which is what the node gets without anything built whenever a parallel scan is the dimension's
+  cheapest path. It divides only the dimension scan, which is the small part: 118.6 ms against the
+  serial node's 118.5 for the first row of the table, 98.4 against 94.7, 142.0 against 141.7, 435.9
+  against 441.5 and 460.2 against 434.9 for the 139,929 and 199,000 rows - no gain anywhere;
+- **the keys partitioned** (taken): every participant runs the dimension's WHOLE plan - its cheapest
+  path that may run in a worker, which is not its cheapest path when that is a Gather - and sorts all
+  of the keys, so that all of them have the same sorted sequence of distinct keys, and they divide it
+  by position in runs of `LION_FKJOIN_UNIQUE_CHUNK` (64), each claimed from an atomic counter in the
+  Gather's dynamic shared memory. A participant claims the run after its last one only once it has
+  finished that one, so the counter never gives out a run behind the participant's position, and
+  every run is counted by exactly one participant, however many start and whether the leader takes
+  part; a plan run without its workers counts every key in the leader, and a rescan's
+  `ReInitializeDSMCustomScan` sets the counter back to the first run. The child, the sort and the
+  copy of the fact filters are every participant's, as a hash join's table below a Gather is, and
+  are charged so; the counts are divided. 1.2 to 2.3 times faster than serial on four shared cores.
+
+Every participant has to see the same rows, so the parallel path is not offered when a dimension
+qual has a volatile function in it (which could keep a row in one participant and drop it in
+another; an EXISTS with one is not pulled up to a semi join at all, an IN is). `Join Keys Looked Up`
+summed over the participants is then the distinct keys exactly, which the tests check, and over
+rescans of the Gather each run's.
+
+**Cost.** The child's total cost and the sort's are the node's startup: `LION_FKJOIN_SORT_COMPARE_COST`
+(a quarter of a `cpu_operator_cost`) a comparison, N log2 N of them, and `LION_FKJOIN_SORT_KEY_COST`
+(6) a key for putting it in, taking it out and comparing it with the previous distinct key, plus one
+merge pass past `work_mem`. Measured: 0.108 us a key to put in and sort 40,000 or 199,000 keys, and
+0.023 us to take them out and compare them - about 13 `cpu_operator_cost` a key at the 250 units a
+millisecond the node's other terms run at. `cost_sort()` charges 36 a key at 200,000, three times
+the time the sort takes (while `cost_agg()` charges core's hashed unique-ification one a row), and it
+answers `enable_sort`, which this sort, no Sort node, does not. Then "Cost, revisited"'s per-key
+terms, over the distinct keys (`estimate_num_groups()` of the key over the child's rows) - but not
+all of them. The keys of `IN (SELECT k FROM ...)` are any set's, and only those that are fk values
+find an entry; the rest cost a descent and nothing more. How many find one is what core's own
+estimate of the semi join says: the fact rows it leaves over the rows the fact filters leave of one
+fk value (the fact rel's rows over the fk's n_distinct). Before that term, `fkjoin_nonunique.sql`'s
+`x = 3` against a 60,000-row dimension filtered to 600 rows - 300 distinct keys, 3 of them fk values
+- was refused at 1,069 against the hash semi join's 872, running in 1.0 ms against 2.9; it is chosen
+at 462 now, and the same dimension unfiltered (30,000 distinct keys) is refused at 6,516 against
+2,238 (32.5 ms against 17.6). The other FK-side joins take every dimension row to find an entry, as
+an fk into a dimension key is expected to, and are priced as before.
+
+**EXPLAIN**:
+
+    Finalize Aggregate
+      ->  Custom Scan (LionCount)
+            Lion Indexes: bf_dim (dim_id = d.k), bf_doc (doc @@ '...'::tsquery)
+            Join Type: Semi
+            Join Keys: distinct, sorted
+            Fact Filters: collected once
+            ->  Bitmap Heap Scan on bd d
+                  ...
+
+and in a parallel plan `Parallel Custom Scan (LionCount)` below a Gather, over the dimension's whole
+plan. With ANALYZE, `Join Keys Sorted` (the child's rows with a key; in a parallel plan what one
+participant sorted, summed over the runs), `Join Key Sort Method`, `Join Key Sort Space Used` and
+`Join Key Sort Space Type` (the sort as it went in the leader, when it ran one), and `Join Keys
+Looked Up` - the DISTINCT keys. The join member of `custom_private` carries the sort operator and
+collation (shape 13).
+
+**Measured** (2026-09-27, the fact of "Cost, revisited" - 5,000,000 rows over 86,207 heap pages,
+`dim_id` over 200,000 keys in random heap order, 1% NULL - against dimensions whose keys repeat:
+`bd`, 200,000 rows over 50,000 keys (every fourth fact key, four rows each, 0.5% NULL) with `status`
+70% `'val1'`, `country` 20 values and `size` 10 under a lion index, and a btree on the key; `bdh`, the
+same rows over 1,000 keys; and `bdu`, `bd`'s keys once each under no unique index. PostgreSQL 18.6
+assert build, four cores shared with other work, medians of five after a warm-up: the backend's CPU
+time for the serial plans, wall time for the parallel ones. "Ordinary" is the pushdown off, which
+before this change was the plan for every one of these; costs in parentheses, bold the plan the
+model picks, `wN` the workers planned. `f` is `status = 'val1' AND country IN ('c1', 'c2') AND size
+< 7`.)
+
+| shape | dimension rows / distinct keys | node, serial | ordinary, serial | node, parallel | ordinary, parallel |
+|---|---|---|---|---|---|
+| `doc @@ '(sen0 \| sen1) & (jfd0 \| jfd1)'` (5.5%), `bd` under `f`; EXISTS and IN alike | 9,776 / 8,848 | **117** (29,777) | 585 (97,834) | **82** w2 (20,842) | 275 w3 (94,818) |
+| `kind = 'k3' AND sen IN ('sen0', 'sen1')` (1.7%), `bd` under `f` | 9,776 / 8,848 | **95** (29,211) | 309 (95,353) | **66** w2 (20,276) | 316 (95,353) |
+| no fact filter, `bd` under `f` | 9,776 / 8,848 | **44** (16,748) | 845 (156,354) | **35** w2 (12,361) | 305 w3 (112,384) |
+| the tsquery, `bd` under `status = 'val1' AND country IN ('c1', 'c2')` | 14,016 / 12,160 | **139** (34,837) | 595 (97,460) | **92** w2 (24,304) | 255 w3 (94,159) |
+| the tsquery, `bd` under `status = 'val1'` | 139,929 / 46,957 | **442** (91,231) | 701 (100,334) | **190** w3 (47,861) | 310 w3 (96,444) |
+| the tsquery, all of `bd` | 200,000 / 49,110 | **430** (92,233) | 665 (99,878) | **192** w3 (48,844) | 338 w3 (95,602) |
+| the tsquery, `bdh` under `f` | 9,776 / 1,000 | **51** (11,697) | 45 (94,802) | not parallel | |
+| the tsquery, all of `bdh` | 200,000 / 1,000 | **77** (17,515) | 75 (96,119) | not parallel | |
+| the tsquery, `bdu` under `f` | 2,316 / 2,316 | **57** (12,660) | 563 (94,396) | | |
+| `count(DISTINCT f.dim_id)`, the tsquery, `bd` under `f` | 9,776 / 8,848 | **96** (28,654) | 571 (98,660) | **78** w2 (20,724) | 272 w3 (96,458) |
+
+The ordinary plans are a hash semi join over the fact filter's bitmap or index scan, or - with no
+fact filter, or a large dimension set - a hash join over a HashAggregate of the dimension's keys,
+`JOIN_UNIQUE_INNER`; over `bdh`'s thousand keys a nested loop over that HashAggregate with a lion
+index scan of `dim_id` inside. That nested loop is the one plan the node does not beat: 1,000 keys
+are cheap to look up either way, and what the node adds is the fact filter's copy (5.5% of the fact,
+about 35 ms) and, unfiltered, the sort of 199,000 keys. The model picks the node there, priced as
+its other plans are, against a nested loop core prices at 94,802 for 45 ms: 1.13 and 1.03 times
+slower. Over `bd` the node is 1.5 to 19 times faster serially and 1.6 to 8.7 in parallel, and
+with 139,929 dimension rows, which the inner join's node loses to the hash join ("Parallel"), it wins
+here because it looks up the 46,957 distinct keys and not the rows. The workers are the fk index
+pages' (as for the other joins), so `bdh`'s thousand keys get none.
+
 ### Declined in v1, and why
 
-- **A non-unique dimension key** (above: a scope and costing decision, not a correctness one).
+- **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
+  correctness one). The forward semi join over one is counted over its distinct keys ("Forward semi
+  joins over a non-unique key").
 - **A partitioned fact table.** §16 opens one partition at a time, so the join would have to re-run
   the dimension child per partition or look every key up in every partition's index; both are
   straightforward but double the tested surface. A partitioned, inheritance or subquery DIMENSION
@@ -6938,10 +7110,12 @@ gets wrong here (the hash join at 121,557 against the node's 123,222, 706 ms aga
 - **More than two relations**, composite keys, snowflake chains: the dimension would be a join
   itself.
 - **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
-  over `f.x`, which composes, but is not in v1.
+  over `f.x`, which composes, but is not in v1. It is also every GROUP BY of a forward semi join,
+  whose dimension the query above the EXISTS cannot name.
 - **`count(f.col)` of a nullable column, and every non-count aggregate**, as for a single table.
-- **A forward semi join over a non-unique key** ("Semi and anti joins" above): the dimension's
-  distinct keys would have to be the child's rows.
+- **The anti join the other way round**, `NOT EXISTS (SELECT 1 FROM dim d WHERE d.k = f.fk ...)`
+  over the fact's rows: the fact rows WITHOUT a qualifying key, a complement of the forward semi
+  join's union that no count per key gives.
 - **A count of rows beside a `count(DISTINCT)`**, a DISTINCT over an expression or over a fact
   column other than the key, an fk of another type than the key, a DISTINCT under another
   collation than the join's ("count(DISTINCT)" above).
@@ -6972,32 +7146,32 @@ entries VACUUM deleted); EXPLAIN through `lion_explain_norm()`. No new concurren
 introduced - the fact side is §9 per dimension row and the dimension side is a core scan under the
 same snapshot - so no isolation spec is added.
 
-`test/sql/fkjoin_semi.sql` (2026-09-27), the same way against the pushdown off: the forward
-EXISTS, IN and JOIN spellings over a unique key with fact filters of every kind (`=`, IN, a
-tsquery, an OR, `IS NULL`, `IS NOT NULL`), none, and ones that select nothing, a dimension filter
-that passes nothing, cross-type keys and a grouped join; a non-unique key, whose forward semi join is
-not pushed down until the dimension has lion indexes, and then only as the reverse shape with the
-roles exchanged, which the model refuses; the reverse EXISTS and IN forms, grouped, with HAVING,
-ORDER BY and LIMIT, `count(1)` and `count` of the key, duplicated and NULL dimension keys, keys with
-no fact rows (`lion_sj_val()` pins the answers themselves) and fact rows whose key has no dimension
-row; the anti joins, NULL keys among them, `count` of the key declined there, and the LEFT JOIN and
-`NOT IN` forms left alone; the declines (a second correlation, an outer-side qual inside NOT
-EXISTS, a fact filter the posting sets cannot answer, another aggregate, `count` of a nullable
-dimension column, three relations, a subquery that cannot be pulled up); generic plans with Param
-filters on both sides, NULL ones included; correlated subqueries that rescan the node with a new
-dimension filter and with a new FACT filter, whose copy is made again; EXPLAIN of the collected and
-the probed plans and of a dimension filtered through its own lion index; the `Fact Filter Rows
-Collected`, `Join Keys` and `Containers Visited` counters (an existence test reads fewer containers
-than the counts); a copy that outgrows the memory limit at run time (`work_mem` and
-`hash_mem_multiplier` both set) and falls back with the same answer;
-the model's choice, including a 60,000-row dimension it refuses forward and reverse unless its own
-filter leaves few rows; and a dirty heap before and after VACUUM. Its two EXPLAINs of a dimension
-filtered by its own index and of two dimension rows use plans of the child that PostgreSQL 16 to
-19 all make (two equalities in the Index Cond; a sequential scan with index scans off): 16 keeps a
-second column's IN list out of the bitmap's Index Cond and costs `pk IN (5, 6)` as a sequential
-scan where 18 takes the primary key. In `test/sql/fkjoin.sql` a
-60-value IN list, one union for the scan instead of one per count, is now collected and chosen. `test/isolation/fkjoin_vacuum_race.spec`
-is the race of the copy against VACUUM, above.
+`test/sql/fkjoin_semi.sql` (2026-09-27), the same way against the pushdown off: the forward EXISTS,
+IN and JOIN spellings over a unique key with fact filters of every kind (`=`, IN, a tsquery, an OR,
+`IS NULL`, `IS NOT NULL`), none, and ones that select nothing, a dimension filter that passes
+nothing, cross-type keys and a grouped join; a non-unique key, whose forward semi join is counted
+over its distinct keys, and - once the dimension has lion indexes - also offered as the reverse
+shape with the roles exchanged, which the model does not take; the reverse EXISTS and IN forms,
+grouped, with HAVING, ORDER BY and LIMIT, `count(1)` and `count` of the key, duplicated and NULL
+dimension keys, keys with no fact rows (`lion_sj_val()` pins the answers themselves) and fact rows
+whose key has no dimension row; the anti joins, NULL keys among them, `count` of the key declined
+there, and the LEFT JOIN and `NOT IN` forms left alone; the declines (a second correlation, an
+outer-side qual inside NOT EXISTS, a fact filter the posting sets cannot answer, another aggregate,
+`count` of a nullable dimension column, three relations, a subquery that cannot be pulled up);
+generic plans with Param filters on both sides, NULL ones included; correlated subqueries that
+rescan the node with a new dimension filter and with a new FACT filter, whose copy is made again;
+EXPLAIN of the collected and the probed plans and of a dimension filtered through its own lion
+index; the `Fact Filter Rows Collected`, `Join Keys` and `Containers Visited` counters (an existence
+test reads fewer containers than the counts); a copy that outgrows the memory limit at run time
+(`work_mem` and `hash_mem_multiplier` both set) and falls back with the same answer; the model's
+choice, including a 60,000-row dimension it refuses forward and reverse unless its own filter leaves
+few rows; and a dirty heap before and after VACUUM. Its two EXPLAINs of a dimension filtered by its
+own index and of two dimension rows use plans of the child that PostgreSQL 16 to 19 all make (two
+equalities in the Index Cond; a sequential scan with index scans off): 16 keeps a second column's IN
+list out of the bitmap's Index Cond and costs `pk IN (5, 6)` as a sequential scan where 18 takes the
+primary key. In `test/sql/fkjoin.sql` a 60-value IN list, one union for the scan instead of one per
+count, is now collected and chosen. `test/isolation/fkjoin_vacuum_race.spec` is the race of the copy
+against VACUUM, above.
 
 `test/sql/fkjoin_distinct.sql` (2026-09-27), against the pushdown off: `count(DISTINCT f.fk)` over
 the inner join and its EXISTS and IN spellings, with fact filters of every kind, none, and one that
@@ -7037,6 +7211,29 @@ for itself: multi-key fact filters known only at run time (§17), exact, widened
 IN lists of unknown length - a parameter, a NULL one, 1,500 values, `IN ($1, $2)` and a stable
 expression's array - and checks serially that the 1,500-value list, too wide for the open budget at
 a `work_mem` of 64 kB, is collected once.
+
+`test/sql/fkjoin_nonunique.sql` (2026-09-27), the forward semi join over a non-unique key, against
+the pushdown off: EXISTS and IN over a 900-row dimension of 400 keys, most of them two or three
+times, with fact filters of every kind (`=`, IN, a tsquery, an OR, `IS NULL`, `IS NOT NULL`) and
+none, dimension filters and none, a fact filter with no entry, a dimension filtered to nothing and
+one that leaves only NULL keys (`lion_nj_val()` pins 0); heavy duplication (3,000 rows over six
+keys, one without fact rows) and every row the same key (the answer pinned against that key's own
+count); cross-type keys both ways and a text key; `count(1)`, `count` of the fact's key, and
+`count(DISTINCT)` of it, over nothing too; HAVING, ORDER BY and LIMIT; the counters (`Join Keys
+Sorted` without the NULL keys, `Join Keys Looked Up` the distinct keys, `Join Keys Without Entry`);
+the declines (a fact column in the GROUP BY, another aggregate, a count of rows beside a
+`count(DISTINCT)`, a second correlation, the anti join the other way round, a fact filter the
+posting sets cannot answer); generic plans with Params on both sides, NULL ones included;
+correlated subqueries that rescan the node, its child and its sort with a new dimension filter and
+with a new fact filter; the model's choice, including a 60,000-row dimension it refuses unless its
+filter leaves few keys that are fk values; and a dirty heap before and after VACUUM. Its parallel
+section runs every query as planned, serially and with the pushdown off (`lion_nj_par()`, as
+`lion_pj()` does): EXPLAIN of the Gather over the parallel node, the leader taking part and not,
+`Join Keys Looked Up` summed over the participants equal to the distinct keys and `Join Keys
+Sorted` to one participant's, both over four rescans of the Gather as well, a generic plan, a
+volatile dimension filter that keeps the node serial, `parallel_workers = 0` and
+`debug_parallel_query`. EXPLAIN prints the node and what is above it, and the dimension's own plan
+as one line (`lion_nj_explain()`), because that plan is whatever each major makes of a small scan.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
