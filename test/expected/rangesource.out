@@ -1,5 +1,5 @@
 -- A range on a column that does not drive the count, taken as a source
--- (DESIGN.md §31, "A range as a source").
+-- (DESIGN.md §32, "A range as a source").
 --
 -- `g, count(*) ... WHERE <range on k> GROUP BY g`, a range beside a sum over
 -- another range, a range as an OR's arm and a range among the fact filters of

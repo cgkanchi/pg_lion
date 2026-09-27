@@ -1,5 +1,5 @@
 # Range counts that sum SUMMARY posting sets, and lion_index_verify()'s check
-# of them, beside the writers that change them (DESIGN.md §31).
+# of them, beside the writers that change them (DESIGN.md §32).
 #
 # The table: 4000 rows, k = 1 .. 4000 in heap order, and a lion index on k
 # with buckets of 1000 rows - summaries keyed 1000, 2000, 3000 and the open

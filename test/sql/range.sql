@@ -477,7 +477,7 @@ SELECT lion_rc('SELECT x, count(DISTINCT k) FROM lion_r WHERE x < 3 GROUP BY x')
 SELECT lion_rc('SELECT count(DISTINCT k) FROM lion_r WHERE x = 3 AND k > 190 GROUP BY x');
 SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_r WHERE k < 20') AS p("QUERY PLAN");
 
--- ---------- 8. ranges that do not drive: sources since DESIGN.md §31 ----------
+-- ---------- 8. ranges that do not drive: sources since DESIGN.md §32 ----------
 SELECT lion_rc('SELECT x, count(*) FROM lion_r WHERE k < 20 GROUP BY x');     -- range not the driver
 SELECT lion_rc('SELECT count(DISTINCT x) FROM lion_r WHERE k < 20');
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND i4 < 20');       -- two range columns
@@ -485,13 +485,13 @@ SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND k = 5');         --
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND k IN (5, 6)');
 SELECT lion_rc('SELECT x, y, count(*) FROM lion_r WHERE x < 5 GROUP BY x, y');
 -- declined shapes (the ordinary plan answers them): an OR with nothing that
--- holds the §9 pin beside it (§31), and the rest
+-- holds the §9 pin beside it (§32), and the rest
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 OR x = 3');          -- under an OR
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE t < ''k'' COLLATE "C"');   -- collation mismatch
 SELECT lion_rc('SELECT t, count(*) FROM lion_r WHERE t < ''k'' COLLATE "C" GROUP BY t');
 SELECT lion_rc('SELECT n, count(*) FROM lion_r WHERE n > 1 GROUP BY n');      -- numeric is not printable
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE n > 1');                     -- ... but countable
--- an FK-side join's fact filter is a source (DESIGN.md §27), a range too (§31)
+-- an FK-side join's fact filter is a source (DESIGN.md §27), a range too (§32)
 CREATE TABLE lion_rd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO lion_rd SELECT i, 'n' || (i % 3) FROM generate_series(0, 9) i;
 ANALYZE lion_rd;

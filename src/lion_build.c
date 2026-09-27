@@ -349,7 +349,7 @@ typedef struct LionBuilder
 	uint64		ntids;
 
 	/*
-	 * Summary posting sets (DESIGN.md §31).  sumflags are the kind flags the
+	 * Summary posting sets (DESIGN.md §32).  sumflags are the kind flags the
 	 * entry is written with (LION_ENTRY_SUMMARY, plus LION_ENTRY_SUMLAST for a
 	 * column's last bucket).  tofile makes a COLLECTING builder: it groups
 	 * codes into items exactly as every builder does, and writes each item to
@@ -362,7 +362,7 @@ typedef struct LionBuilder
 } LionBuilder;
 
 /*
- * The summaries of the key column being written (DESIGN.md §31).  The build
+ * The summaries of the key column being written (DESIGN.md §32).  The build
  * sees a column's keys in directory order with each key's codes, so it cuts
  * them into BUCKETS as they pass: the codes of consecutive keys are collected
  * until they reach summary_tids, and the bucket is then closed at the key
@@ -468,7 +468,7 @@ typedef struct LionBuildState
 
 	double		indtuples;		/* TIDs pushed into the index */
 
-	/* Summary posting sets (DESIGN.md §31). */
+	/* Summary posting sets (DESIGN.md §32). */
 	int			sumopt;			/* the `summaries` reloption, LION_SUMOPT_* */
 	uint32		sumtids;		/* the `summary_tids` reloption */
 	LionSumBuild *sum;			/* the column being written's, or NULL */
@@ -774,7 +774,7 @@ static void
 lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 {
 	lion_build_level_add(bs, bs->leaf, entry, size);
-	/* the keys, for the §17 guard; a summary (§31) is not one */
+	/* the keys, for the §17 guard; a summary (§32) is not one */
 	if (!LionEntryIsSummary(entry))
 		bs->ndistinct++;
 }
@@ -1108,7 +1108,7 @@ lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 {
 	Size		csize = lion_item_size(c);
 
-	/* A collecting summary builder puts its items aside (DESIGN.md §31). */
+	/* A collecting summary builder puts its items aside (DESIGN.md §32). */
 	if (b->tofile != NULL)
 	{
 		uint32		len = (uint32) csize;
@@ -1368,7 +1368,7 @@ lion_flush_builders(LionBuildState *bs)
 }
 
 /* ---------------------------------------------------------------------
- * Summary posting sets (DESIGN.md §31)
+ * Summary posting sets (DESIGN.md §32)
  * --------------------------------------------------------------------- */
 
 /*
@@ -1736,7 +1736,7 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 
 	/*
 	 * A summarized column's values go into its current summary bucket as well
-	 * (DESIGN.md §31); its reserved entries are in no bucket.
+	 * (DESIGN.md §32); its reserved entries are in no bucket.
 	 */
 	sumkey = (bs->sum != NULL &&
 			  lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE);
@@ -2276,7 +2276,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		bs.cur = &bs.ix.cols[c];
 
 		/*
-		 * A column's summaries (DESIGN.md §31) are collected while its values
+		 * A column's summaries (DESIGN.md §32) are collected while its values
 		 * are written and written after them, which is where they sort.
 		 */
 		bs.sum = lion_sum_begin(&bs, bs.cur);
@@ -2301,7 +2301,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					  lion_wal_mode_for_build(index));
 	/* ... and the order the directory was just laid out in (§21). */
 	lion_meta_record_order(LionPageGetMeta((Page) metabuf->data), &bs.ix);
-	/* ... and which columns got summaries, which makes it version 7 (§31). */
+	/* ... and which columns got summaries, which makes it version 7 (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
