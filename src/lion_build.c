@@ -1654,7 +1654,7 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
 
 			Assert(bs->nbuilders == 0);
 			b = lion_builder_create(bs, key, LION_KEY_REAL,
-									lion_hash_key(cs, key));
+									LION_SUMMARY_HASH);
 			bs->nbuilders = 0;	/* written here, not by lion_flush_builders() */
 			b->sumflags = hdr.sumflags;
 
