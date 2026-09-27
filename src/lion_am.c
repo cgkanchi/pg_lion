@@ -186,6 +186,13 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("pg_lion");
 
+	/*
+	 * The LionCount scan methods, known before any plan names them: a
+	 * parallel worker reads the leader's plan - a parallel FK-side join,
+	 * DESIGN.md §27 - before it has planned anything of its own.
+	 */
+	lion_count_scan_register();
+
 	lion_prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = lion_create_upper_paths;
 }
