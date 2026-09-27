@@ -479,12 +479,52 @@ lion_tsquery_plan(Datum query, int nkeys)
 }
 
 /*
+ * One call of the opclass's extractQuery (support proc 3), with GIN's
+ * conventions applied: searchMode starts at GIN_SEARCH_MODE_DEFAULT, and an
+ * out-of-range answer is treated as GIN_SEARCH_MODE_ALL (ginNewScanKey() does
+ * the same).  pmatch and nulls stay NULL unless the function set them.
+ */
+typedef struct LionRawQuery
+{
+	int32		nkeys;
+	Datum	   *keys;
+	bool	   *pmatch;
+	bool	   *nulls;
+	int32		searchMode;
+} LionRawQuery;
+
+static void
+lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
+					  LionRawQuery *raw)
+{
+	Pointer    *extra_data = NULL;
+
+	raw->nkeys = 0;
+	raw->pmatch = NULL;
+	raw->nulls = NULL;
+	raw->searchMode = GIN_SEARCH_MODE_DEFAULT;
+
+	raw->keys = (Datum *)
+		DatumGetPointer(FunctionCall7Coll(&state->extractquery,
+										  state->collation,
+										  query,
+										  PointerGetDatum(&raw->nkeys),
+										  UInt16GetDatum(lion_gin_strategy(strategy)),
+										  PointerGetDatum(&raw->pmatch),
+										  PointerGetDatum(&extra_data),
+										  PointerGetDatum(&raw->nulls),
+										  PointerGetDatum(&raw->searchMode)));
+
+	if (raw->searchMode < GIN_SEARCH_MODE_DEFAULT ||
+		raw->searchMode > GIN_SEARCH_MODE_ALL)
+		raw->searchMode = GIN_SEARCH_MODE_ALL;
+}
+
+/*
  * Extract a query and decide how its keys combine (DESIGN.md §17).
  *
- * The GIN contract is followed to the letter: searchMode starts at
- * GIN_SEARCH_MODE_DEFAULT, an out-of-range answer is treated as
- * GIN_SEARCH_MODE_ALL (ginNewScanKey() does the same), and pmatch/nullFlags
- * are only read when extractQuery set them.
+ * The GIN contract is followed to the letter (lion_call_extractquery()), and
+ * pmatch/nullFlags are only read when extractQuery set them.
  *
  * Anything that is not "the rows are exactly the ones an AND/OR of whole key
  * sets selects" becomes LION_QMODE_ALL: a partial (prefix) match, because the
@@ -496,11 +536,10 @@ void
 lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 				  LionQuery *q)
 {
-	int32		nkeys = 0;
-	bool	   *pmatch = NULL;
-	Pointer    *extra_data = NULL;
-	bool	   *nulls = NULL;
-	int32		searchMode = GIN_SEARCH_MODE_DEFAULT;
+	LionRawQuery raw;
+	int32		nkeys;
+	bool	   *pmatch;
+	bool	   *nulls;
 	Datum	   *keys;
 	int			i;
 
@@ -508,21 +547,13 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 
 	memset(q, 0, sizeof(LionQuery));
 
-	keys = (Datum *) DatumGetPointer(FunctionCall7Coll(&state->extractquery,
-													   state->collation,
-													   query,
-													   PointerGetDatum(&nkeys),
-													   UInt16GetDatum(lion_gin_strategy(strategy)),
-													   PointerGetDatum(&pmatch),
-													   PointerGetDatum(&extra_data),
-													   PointerGetDatum(&nulls),
-													   PointerGetDatum(&searchMode)));
+	lion_call_extractquery(state, query, strategy, &raw);
+	nkeys = raw.nkeys;
+	keys = raw.keys;
+	pmatch = raw.pmatch;
+	nulls = raw.nulls;
 
-	if (searchMode < GIN_SEARCH_MODE_DEFAULT ||
-		searchMode > GIN_SEARCH_MODE_ALL)
-		searchMode = GIN_SEARCH_MODE_ALL;
-
-	if (searchMode != GIN_SEARCH_MODE_DEFAULT)
+	if (raw.searchMode != GIN_SEARCH_MODE_DEFAULT)
 	{
 		/* INCLUDE_EMPTY and ALL both mean "every indexed row, then recheck". */
 		q->mode = LION_QMODE_ALL;
@@ -598,4 +629,290 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 	}
 
 	q->mode = LION_QMODE_KEYS;
+}
+
+/* ---------------------------------------------------------------------
+ * Supersets, for a caller that rechecks (DESIGN.md §17, "A query known only
+ * at run time")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Is key k of an extraction one that no posting set holds - a partial match,
+ * or a NULL?  A superset has to do without it.
+ */
+static bool
+lion_raw_key_unusable(const LionRawQuery *raw, int k)
+{
+	return (raw->pmatch != NULL && raw->pmatch[k]) ||
+		(raw->nulls != NULL && raw->nulls[k]);
+}
+
+/*
+ * The superset form of lion_tsquery_tree(): a tree that selects AT LEAST the
+ * rows the tsquery rooted at item i matches, or NULL for "every row".  *lossy
+ * is set whenever a rule below widened the answer; *ok is cleared for an item
+ * the walk does not understand, which makes the whole query every row.
+ *
+ *	- a lexeme with a weight mask is the lexeme at any weight;
+ *	- a prefix lexeme, or one extractQuery flagged partial or NULL, is every
+ *	  row: the keys are hashed and a range of them cannot be walked;
+ *	- `!a` is every row: no posting set is the complement of another;
+ *	- `a <N> b` is `a & b`: a phrase matches only where both of its operands
+ *	  match, at positions the index does not store, and an operand that is
+ *	  itself every row (`!a <-> b`) constrains nothing;
+ *	- an AND drops the operands that are every row, and is every row when all
+ *	  of them are; an OR is every row when either operand is.
+ */
+static LionKeyNode *
+lion_tsquery_superset(QueryItem *items, int32 size, int32 i, const int *map,
+					 const LionRawQuery *raw, bool *lossy, bool *ok)
+{
+	QueryItem  *item;
+
+	check_stack_depth();
+
+	if (!*ok)
+		return NULL;
+	if (i < 0 || i >= size)
+	{
+		*ok = false;
+		return NULL;
+	}
+
+	item = &items[i];
+
+	if (item->type == QI_VAL)
+	{
+		if (item->qoperand.prefix || lion_raw_key_unusable(raw, map[i]))
+		{
+			*lossy = true;
+			return NULL;
+		}
+		if (item->qoperand.weight != 0)
+			*lossy = true;
+		return lion_keynode_leaf(map[i]);
+	}
+
+	if (item->type != QI_OPR)
+	{
+		*ok = false;
+		return NULL;
+	}
+
+	switch (item->qoperator.oper)
+	{
+		case OP_NOT:
+			*lossy = true;
+			return NULL;
+
+		case OP_AND:
+		case OP_OR:
+		case OP_PHRASE:
+			{
+				uint32		left = item->qoperator.left;
+				LionKeyNode *lt;
+				LionKeyNode *rt;
+				LionKeyNode **args;
+				int			nargs = 0;
+
+				/* the bounds lion_tsquery_tree() checks, for the same reason */
+				if (left < 2 || left >= (uint32) (size - i))
+				{
+					*ok = false;
+					return NULL;
+				}
+
+				rt = lion_tsquery_superset(items, size, i + 1, map, raw,
+										   lossy, ok);
+				lt = lion_tsquery_superset(items, size, i + (int32) left, map,
+										   raw, lossy, ok);
+				if (!*ok)
+					return NULL;
+
+				if (item->qoperator.oper == OP_OR)
+				{
+					if (lt == NULL || rt == NULL)
+						return NULL;
+					args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+					args[0] = lt;
+					args[1] = rt;
+					return lion_keynode_op(LION_KN_OR, args, 2);
+				}
+
+				if (item->qoperator.oper == OP_PHRASE)
+					*lossy = true;
+				args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+				if (lt != NULL)
+					args[nargs++] = lt;
+				if (rt != NULL)
+					args[nargs++] = rt;
+				if (nargs == 0)
+					return NULL;
+				return lion_keynode_op(LION_KN_AND, args, nargs);
+			}
+
+		default:
+			*ok = false;
+			return NULL;
+	}
+}
+
+/*
+ * Renumber a tree's leaves onto the keys it names, in the order it first
+ * names them, and keep only those: a superset may leave keys out - a partial
+ * one, a NULL one - that must never be looked up.
+ */
+static void
+lion_superset_renumber(LionKeyNode *node, int *newno, const Datum *from,
+					   Datum *to, int *nto)
+{
+	int			i;
+
+	if (node->kind == LION_KN_KEY)
+	{
+		if (newno[node->keyno] < 0)
+		{
+			newno[node->keyno] = *nto;
+			to[(*nto)++] = from[node->keyno];
+		}
+		node->keyno = newno[node->keyno];
+		return;
+	}
+	for (i = 0; i < node->nargs; i++)
+		lion_superset_renumber(node->args[i], newno, from, to, nto);
+}
+
+/*
+ * lion_extract_query() for a caller that rechecks every row it is handed: the
+ * count pushdown, for a clause whose query it only has at run time - a
+ * parameter of a generic plan, `to_tsquery(current_setting(...))` - and which
+ * therefore cannot have declined the query when it turned out to be one the
+ * key sets do not answer exactly.  It counts a SUPERSET instead and rechecks
+ * each candidate in the heap, and the narrower the superset the fewer the
+ * candidates:
+ *
+ *	- `@>` with a NULL element is the AND of the other elements (a NULL is
+ *	  under no key, and an AND of fewer keys selects more); every row when
+ *	  there are none;
+ *	- `&&` with a NULL or partial key is every row: an OR cannot leave a key
+ *	  out and stay a superset;
+ *	- a tsquery is widened as lion_tsquery_superset() says;
+ *	- INCLUDE_EMPTY and ALL, more keys than LION_MAX_QUERY_KEYS, `<@` and
+ *	  anything else are every row, as they are for lion_extract_query().
+ *
+ * NONE and KEYS mean what they mean there: a query lion_extract_query()
+ * answers exactly comes back KEYS with the same keys, and needs no recheck.
+ */
+void
+lion_extract_query_superset(LionState *state, Datum query,
+						   StrategyNumber strategy, LionQuery *q)
+{
+	LionRawQuery raw;
+	LionKeyNode *tree = NULL;
+	bool		lossy = false;
+	bool		ok = true;
+	int		   *newno;
+	Datum	   *keys;
+	int			nkeys = 0;
+	int			i;
+
+	Assert(state->multikey);
+
+	memset(q, 0, sizeof(LionQuery));
+
+	lion_call_extractquery(state, query, strategy, &raw);
+
+	if (raw.searchMode != GIN_SEARCH_MODE_DEFAULT)
+	{
+		/* the rows no key was extracted from may qualify too */
+		q->mode = LION_QMODE_ALL;
+		return;
+	}
+	if (raw.nkeys <= 0 || raw.keys == NULL)
+	{
+		q->mode = LION_QMODE_NONE;
+		return;
+	}
+	if (raw.nkeys > LION_MAX_QUERY_KEYS)
+	{
+		q->mode = LION_QMODE_ALL;
+		return;
+	}
+
+	switch (strategy)
+	{
+		case LION_STRAT_CONTAINS:
+			{
+				LionKeyNode **args = (LionKeyNode **)
+					palloc(sizeof(LionKeyNode *) * raw.nkeys);
+				int			nargs = 0;
+
+				for (i = 0; i < raw.nkeys; i++)
+				{
+					if (lion_raw_key_unusable(&raw, i))
+						lossy = true;
+					else
+						args[nargs++] = lion_keynode_leaf(i);
+				}
+				if (nargs > 0)
+					tree = lion_keynode_op(LION_KN_AND, args, nargs);
+				break;
+			}
+
+		case LION_STRAT_OVERLAP:
+			for (i = 0; i < raw.nkeys; i++)
+			{
+				if (lion_raw_key_unusable(&raw, i))
+					break;
+			}
+			if (i == raw.nkeys)
+				tree = lion_keynode_flat(LION_KN_OR, raw.nkeys);
+			break;
+
+		case LION_STRAT_MATCH:
+			{
+				TSQuery		tsq = DatumGetTSQuery(query);
+				QueryItem  *items;
+				int		   *map;
+				int32		j = 0;
+
+				if (tsq->size <= 0)
+					break;
+				items = GETQUERY(tsq);
+				map = (int *) palloc0(sizeof(int) * tsq->size);
+				for (i = 0; i < tsq->size; i++)
+				{
+					if (items[i].type == QI_VAL)
+						map[i] = j++;
+				}
+				/* the numbering lion_tsquery_plan() relies on, checked alike */
+				if (j == raw.nkeys)
+					tree = lion_tsquery_superset(items, tsq->size, 0, map,
+												 &raw, &lossy, &ok);
+				pfree(map);
+				break;
+			}
+
+		default:
+			break;
+	}
+
+	if (!ok || tree == NULL)
+	{
+		q->mode = LION_QMODE_ALL;
+		return;
+	}
+
+	/* Only the keys the tree names are looked up. */
+	newno = (int *) palloc(sizeof(int) * raw.nkeys);
+	for (i = 0; i < raw.nkeys; i++)
+		newno[i] = -1;
+	keys = (Datum *) palloc(sizeof(Datum) * raw.nkeys);
+	lion_superset_renumber(tree, newno, raw.keys, keys, &nkeys);
+	pfree(newno);
+
+	q->nkeys = nkeys;
+	q->keys = keys;
+	q->tree = tree;
+	q->mode = lossy ? LION_QMODE_LOSSY : LION_QMODE_KEYS;
 }
