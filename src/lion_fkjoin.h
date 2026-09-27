@@ -3,7 +3,8 @@
  * lion_fkjoin.h
  *		Recognising the FK-side join the count pushdown answers (DESIGN.md
  *		§27): a fact table joined to a dimension table on one equality, the
- *		dimension's column provably unique.
+ *		dimension's column provably unique - or made unique, for a forward
+ *		semi join.
  *
  *		lion_fkjoin.c finds the join clause and proves the dimension key
  *		unique; everything about the FACT side - its WHERE clauses, the lion
@@ -24,10 +25,19 @@
  * of these and tries both, letting the cost model choose.
  *
  * A semi or anti join (`WHERE [NOT] EXISTS (SELECT 1 FROM fact ...)`, `pk IN
- * (SELECT fk FROM fact ...)`) qualifies one way only: its outer side is the
- * dimension, whose rows the join returns, and its inner side the fact, whose
- * posting sets say whether a dimension row has a match.  Its dimension key
- * need not be unique: each dimension row is tested on its own.
+ * (SELECT fk FROM fact ...)`) qualifies with its outer side the dimension,
+ * whose rows the join returns, and its inner side the fact, whose posting
+ * sets say whether a dimension row has a match.  Its dimension key need not be
+ * unique: each dimension row is tested on its own.
+ *
+ * A semi join qualifies the other way round too, as JOIN_UNIQUE_INNER: the
+ * FORWARD semi join `SELECT count(*) FROM fact f WHERE EXISTS (SELECT 1 FROM
+ * dim d WHERE d.k = f.fk ...)` over a key that nothing proves unique, whose
+ * rows are the fact's.  Its dimension - the inner side - is made unique first,
+ * the keys sorted by uniqsortop and each kept once, and each distinct key is
+ * then counted as an inner join counts a dimension row: distinct keys have
+ * disjoint posting sets, so the counts add up to the fact rows that have a
+ * match, each once.
  */
 typedef struct LionFkJoin
 {
@@ -44,8 +54,13 @@ typedef struct LionFkJoin
 	Path	   *dimpath;		/* the dimension's cheapest total path */
 	JoinType	jointype;		/* JOIN_INNER; or JOIN_SEMI or JOIN_ANTI, the
 								 * dimension the outer side and the fact the
-								 * inner one */
+								 * inner one; or JOIN_UNIQUE_INNER, a semi
+								 * join the other way round */
 	RelOptInfo *joinrel;		/* the join rel: a semi or anti join's rows */
+	Oid			uniqsortop;		/* JOIN_UNIQUE_INNER: the `<` of the join
+								 * operator's btree family for the dimension
+								 * key's type, which the keys are sorted by
+								 * to make them distinct; else InvalidOid */
 } LionFkJoin;
 
 /*
