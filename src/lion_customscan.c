@@ -15,7 +15,11 @@
  * or `k IS NOT NULL` (§14), each on a column with a usable lion index.
  * The first three select rows and are intersected; `IS NOT NULL` subtracts
  * the index's NULL entry from the result, and when it is the only clause the
- * node sums the counts of every entry of that index instead.
+ * node sums the counts of every entry of that index instead.  The "const" is
+ * anything the node can evaluate once per scan - a literal, a parameter, a
+ * stable expression such as `now() - interval '1 day'` - and a boolean
+ * column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`) is the
+ * equality `flag = true` or `flag = false` it stands for.
  *
  * A top-level `OR` of such clauses (DESIGN.md §19) is one source as well: its
  * arms are positive clauses, or ANDs of them, on columns of the same relation
@@ -73,6 +77,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
@@ -300,7 +305,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	3	List of Expr, one per WHERE clause: the compared value, the array of
  *		an IN list, or a NULL Const placeholder for a null test.  It is a
  *		Const for a literal query and a Param - or an ArrayExpr over Consts
- *		and Params - for a prepared one (DESIGN.md §10).  The PATH carries
+ *		and Params - for a prepared one, or any other stable expression over
+ *		those (DESIGN.md §10).  The PATH carries
  *		them here; lion_plan_custom_path() moves them into the CustomScan's
  *		custom_exprs and leaves this member empty, because that is the field
  *		setrefs.c fixes up and SS_finalize_plan() collects Param ids from -
@@ -423,10 +429,11 @@ typedef struct LionClauseState
 	 * The compared value: its expression (from custom_exprs), the expression
 	 * itself when it is a plain Const, an initialised ExprState when it is
 	 * not, and the value once it has been evaluated.  A literal query has its
-	 * value ready at plan time; a prepared one evaluates its Param through
-	 * the node's ExprContext at the start of every scan and after every
-	 * ReScan, because a nested loop changes an exec Param between them
-	 * (DESIGN.md §10).
+	 * value ready at plan time; a prepared one evaluates its Param - and any
+	 * query its stable expression, `now() - interval '1 day'` - through the
+	 * node's ExprContext at the start of every scan and after every ReScan,
+	 * because a nested loop changes an exec Param between them (DESIGN.md
+	 * §10).
 	 */
 	Expr	   *valexpr;
 	Const	   *con;			/* valexpr, when it is a Const; else NULL */
@@ -1061,6 +1068,31 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	}
 
 	/*
+	 * A class declared on a polymorphic type (enum_ops is FOR TYPE anyenum)
+	 * names its members on that type - (anyenum, anyenum), and the hash proc
+	 * for it - while the value a clause compares the column with is of the
+	 * column's own enum: the constant of `k = 'x'`, the elements of `k IN
+	 * (...)`, a range bound.  That is one of the class's own values and not a
+	 * cross-type search, so it is resolved to the class's type before any
+	 * member is looked up, for EVERY kind of clause.  Only the range
+	 * comparison of DESIGN.md §28 used to do this, and `k = 'x'` and `k IN
+	 * (...)` on an enum column asked for an (anyenum, mood) member that no
+	 * family has: the index was declined and the node never reached, on the
+	 * very columns it is best at.  The test is the one lion_probe_init()
+	 * makes at run time (lion_type_is_column(), lion_count.c): the same BASE
+	 * type as the key column's own - a domain over the enum is its enum, and
+	 * a different enum, whose OIDs mean nothing to this column, is not.
+	 */
+	if (OidIsValid(cmptype) && IsPolymorphicType(idx->opcintype[i]))
+	{
+		Oid			coltype = get_atttype(idx->indexoid, col);
+
+		if (OidIsValid(coltype) &&
+			getBaseType(cmptype) == getBaseType(coltype))
+			cmptype = idx->opcintype[i];
+	}
+
+	/*
 	 * A range comparison (DESIGN.md §28) has to be one of the index's range
 	 * strategies, with the ordering its walk needs - proc 4 for the pair - in
 	 * the same family; lionvalidate() insists on both together, and this is
@@ -1071,14 +1103,6 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	 */
 	if (kind == LION_CLAUSE_RANGE)
 	{
-		/*
-		 * A class declared on a polymorphic type (enum_ops is FOR TYPE
-		 * anyenum) names its members on that type, and the bound is of the
-		 * column's own enum: that is the class's own type, not another one.
-		 */
-		if (IsPolymorphicType(idx->opcintype[i]) &&
-			IsBinaryCoercible(cmptype, idx->opcintype[i]))
-			cmptype = idx->opcintype[i];
 		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
 														  idx->opfamily[i])))
 			return NULL;
@@ -3123,8 +3147,40 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 }
 
 /*
+ * The walker of lion_is_value_expr(): true at anything that makes an
+ * expression something other than one value per scan - a column of this
+ * query level or of any other, a subquery, an aggregate or a window function
+ * - or that the node's ExprContext has nothing to evaluate with (a Param
+ * other than a statement's own or an exec one).
+ */
+static bool
+lion_not_value_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) || IsA(node, PlaceHolderVar))
+		return true;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		return (p->paramkind != PARAM_EXTERN && p->paramkind != PARAM_EXEC);
+	}
+	if (IsA(node, SubLink) || IsA(node, SubPlan) ||
+		IsA(node, AlternativeSubPlan))
+		return true;
+	if (IsA(node, Aggref) || IsA(node, WindowFunc) ||
+		IsA(node, GroupingFunc))
+		return true;
+	if (IsA(node, CurrentOfExpr))
+		return true;
+	return expression_tree_walker(node, lion_not_value_walker, context);
+}
+
+/*
  * Is this expression a value the node can compare a column with - a literal,
- * or a parameter it evaluates at the start of the scan (DESIGN.md §10)?
+ * or an expression it evaluates once at the start of the scan (DESIGN.md
+ * §10)?
  *
  * A Param is accepted wherever a Const is, which is what lets a prepared
  * statement's GENERIC plan reach the pushdown: the planner leaves `k = $1` as
@@ -3134,11 +3190,24 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
  * PARAM_EXEC for the ones a nested loop or a LATERAL reference supplies,
  * which change between rescans.
  *
+ * So is any other expression that the executor would take as an index scan's
+ * RUN-TIME key (ExecIndexBuildScanKeys()): no Var of any level, no volatile
+ * function, no subquery, no aggregate or window function.  That is what a
+ * time window is written as - `ts >= now() - interval '90 days'`, `d >=
+ * current_date - 30`, `d = $1::date + 1` in a generic plan - and none of it
+ * is a Const or a Param: eval_const_expressions() folds only immutable
+ * functions, and now(), current_date and timestamptz arithmetic (which
+ * depends on the time zone) are stable.  A stable expression has one value
+ * throughout a statement, so evaluating it once per scan, beside the Params
+ * (lion_eval_clause_values()), means what evaluating it per row means; a
+ * volatile one does not (`k = random()`), and is declined.  At plan time its
+ * value is only estimated, which clause_selectivity() does itself through
+ * estimate_expression_value(); a cached generic plan evaluates it anew at
+ * every execution.
+ *
  * An ArrayExpr is accepted for the array of an IN list, because that is the
- * shape `k IN ($1, $2)` keeps in a generic plan, but only over literals and
- * parameters: the node evaluates the array ONCE per scan, and an element that
- * could be volatile does not mean the same thing evaluated once as it does
- * evaluated per row.
+ * shape `k IN ($1, $2)` keeps in a generic plan, when each of its elements is
+ * a value by the same rule: the node evaluates the array ONCE per scan.
  */
 static bool
 lion_is_value_expr(Node *node, bool allow_array_expr)
@@ -3147,18 +3216,12 @@ lion_is_value_expr(Node *node, bool allow_array_expr)
 		return false;
 	if (IsA(node, Const))
 		return true;
-	if (IsA(node, Param))
-	{
-		Param	   *p = (Param *) node;
-
-		return (p->paramkind == PARAM_EXTERN || p->paramkind == PARAM_EXEC);
-	}
-	if (allow_array_expr && IsA(node, ArrayExpr))
+	if (IsA(node, ArrayExpr))
 	{
 		ArrayExpr  *a = (ArrayExpr *) node;
 		ListCell   *lc;
 
-		if (a->multidims || a->elements == NIL)
+		if (!allow_array_expr || a->multidims || a->elements == NIL)
 			return false;
 		foreach(lc, a->elements)
 		{
@@ -3167,7 +3230,9 @@ lion_is_value_expr(Node *node, bool allow_array_expr)
 		}
 		return true;
 	}
-	return false;
+	if (expression_returns_set(node) || lion_not_value_walker(node, NULL))
+		return false;
+	return !contain_volatile_functions(node);
 }
 
 /*
@@ -3199,6 +3264,92 @@ lion_array_const_nelems(Const *con)
 }
 
 /*
+ * Is this clause a test of a boolean column by itself, which core's
+ * match_boolean_index_clause() hands an index scan as `col = true` or `col =
+ * false`?  `col`, `NOT col`, `col IS TRUE` and `col IS FALSE` are, and set
+ * *var and *value; eval_const_expressions() has already folded `col = true`
+ * into the first and `col = false` and `col <> true` into the second, so no
+ * boolean equality ever reaches the pushdown as an OpExpr.  All four are
+ * false for NULL, as `=` is.  A domain over boolean is its base type here as
+ * everywhere: the WHERE clause relabels it to boolean, and bool_ops answers.
+ */
+static bool
+lion_boolean_eq_test(Node *clause, Var **var, bool *value)
+{
+	Node	   *arg = clause;
+	bool		val = true;
+
+	if (IsA(clause, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) clause;
+
+		if (b->boolop != NOT_EXPR || list_length(b->args) != 1)
+			return false;
+		arg = (Node *) linitial(b->args);
+		val = false;
+	}
+	else if (IsA(clause, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) clause;
+
+		if (bt->booltesttype == IS_TRUE)
+			val = true;
+		else if (bt->booltesttype == IS_FALSE)
+			val = false;
+		else
+			return false;
+		arg = (Node *) bt->arg;
+	}
+
+	arg = lion_strip(arg);
+	if (arg == NULL || !IsA(arg, Var) ||
+		getBaseType(((Var *) arg)->vartype) != BOOLOID)
+		return false;
+
+	*var = (Var *) arg;
+	*value = val;
+	return true;
+}
+
+/*
+ * `col IS NOT TRUE` and `col IS NOT FALSE` of a boolean column hold for the
+ * NULL rows as well, so they are no equality: they are the OR of two clauses
+ * the posting sets answer, `col = false OR col IS NULL` and `col = true OR
+ * col IS NULL`, and that OR is returned for the machinery of DESIGN.md §19 to
+ * take apart like any other.  NULL for every other clause.
+ */
+static BoolExpr *
+lion_boolean_not_test(Node *clause)
+{
+	BooleanTest *bt;
+	Node	   *arg;
+	NullTest   *nt;
+	Expr	   *eq;
+
+	if (clause == NULL || !IsA(clause, BooleanTest))
+		return NULL;
+	bt = (BooleanTest *) clause;
+	if (bt->booltesttype != IS_NOT_TRUE && bt->booltesttype != IS_NOT_FALSE)
+		return NULL;
+	arg = lion_strip((Node *) bt->arg);
+	if (arg == NULL || !IsA(arg, Var) ||
+		getBaseType(((Var *) arg)->vartype) != BOOLOID)
+		return NULL;
+
+	eq = make_opclause(BooleanEqualOperator, BOOLOID, false, (Expr *) arg,
+					   (Expr *) makeBoolConst(bt->booltesttype == IS_NOT_FALSE,
+											  false),
+					   InvalidOid, InvalidOid);
+	nt = makeNode(NullTest);
+	nt->arg = (Expr *) arg;
+	nt->nulltesttype = IS_NULL;
+	nt->argisrow = false;
+	nt->location = -1;
+
+	return (BoolExpr *) makeBoolExpr(OR_EXPR, list_make2(eq, nt), -1);
+}
+
+/*
  * One WHERE clause as the analysis below understands it: which column it
  * constrains, with what, and everything lion_match_index() will need in order
  * to find an index for it on each relation.
@@ -3207,6 +3358,10 @@ typedef struct LionLeafInfo
 {
 	Var		   *var;
 	Node	   *val;			/* the value expression, or a NULL placeholder */
+	Node	   *costclause;		/* the clause as the cost model is to see it,
+								 * or NULL for the query's own: `col = true`
+								 * for a bare boolean column, an IN list with
+								 * its array estimated */
 	Oid			opno;			/* 0 for a null test */
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
@@ -3232,9 +3387,12 @@ typedef struct LionLeafInfo
  * of its entries there.
  */
 static bool
-lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
-				 bool allow_range, LionLeafInfo *out)
+lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
+				 bool allow_negated, bool allow_range, LionLeafInfo *out)
 {
+	Var		   *boolvar;
+	bool		boolval;
+
 	memset(out, 0, sizeof(LionLeafInfo));
 	out->opno = InvalidOid;
 	out->cmptype = InvalidOid;
@@ -3244,7 +3402,29 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 	if (clause == NULL)
 		return false;
 
-	if (IsA(clause, OpExpr))
+	if (lion_boolean_eq_test(clause, &boolvar, &boolval))
+	{
+		/*
+		 * A boolean column by itself (lion_boolean_eq_test()): the equality
+		 * `col = true` or `col = false` it stands for, with bool_ops' own
+		 * strategy 1.  The Const is the clause's value like any literal's, so
+		 * EXPLAIN prints `flag = true` as core prints the index condition,
+		 * and the cost model is handed that OpExpr rather than the bare
+		 * column, so that everything it asks of an equality is asked of
+		 * this one.
+		 */
+		out->var = boolvar;
+		out->val = (Node *) makeBoolConst(boolval, false);
+		out->opno = BooleanEqualOperator;
+		out->cmptype = BOOLOID;
+		out->strategy = LION_STRAT_EQUAL;
+		out->kind = LION_CLAUSE_EQ;
+		out->costclause = (Node *) make_opclause(BooleanEqualOperator, BOOLOID,
+												 false, (Expr *) boolvar,
+												 (Expr *) out->val,
+												 InvalidOid, InvalidOid);
+	}
+	else if (IsA(clause, OpExpr))
 	{
 		OpExpr	   *op = (OpExpr *) clause;
 		Node	   *left;
@@ -3409,6 +3589,15 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 		 * for `k IN ($1, $2)`.  A parameter that IS an array has no length
 		 * until the executor has it, and by then there is no plan to decline
 		 * in favour of, so it is answered whatever its length.
+		 *
+		 * Any other array expression - a stable function's, `k = ANY
+		 * (string_to_array(current_setting(...), ','))` - is estimated as
+		 * core's selectivity functions estimate it, and when that gives a
+		 * literal the cap is applied to it and the cost model is handed the
+		 * clause over it, so that it prices the list's real length rather
+		 * than estimate_array_length()'s guess for an expression.  The
+		 * executor still evaluates the expression itself (the estimate is
+		 * the plan-time value, which a stable function need not keep).
 		 */
 		if (IsA(out->val, Const))
 		{
@@ -3423,6 +3612,23 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 			nelems = list_length(((ArrayExpr *) out->val)->elements);
 			if (nelems > LION_MAX_ARRAY_ELEMS)
 				return false;
+		}
+		else if (!IsA(out->val, Param))
+		{
+			Node	   *est = estimate_expression_value(root, out->val);
+
+			if (IsA(est, Const) && !((Const *) est)->constisnull)
+			{
+				ScalarArrayOpExpr *costsaop;
+
+				nelems = lion_array_const_nelems((Const *) est);
+				if (nelems > LION_MAX_ARRAY_ELEMS)
+					return false;
+
+				costsaop = (ScalarArrayOpExpr *) copyObject(saop);
+				costsaop->args = list_make2(linitial(costsaop->args), est);
+				out->costclause = (Node *) costsaop;
+			}
 		}
 
 		/*
@@ -3441,22 +3647,37 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
 		out->kind = LION_CLAUSE_ARRAY;
 		out->collation = saop->inputcollid;
 	}
-	else if (IsA(clause, NullTest))
+	else if (IsA(clause, NullTest) ||
+			 (IsA(clause, BooleanTest) &&
+			  (((BooleanTest *) clause)->booltesttype == IS_UNKNOWN ||
+			   ((BooleanTest *) clause)->booltesttype == IS_NOT_UNKNOWN)))
 	{
-		NullTest   *nt = (NullTest *) clause;
+		bool		isnull;
 		Node	   *arg;
 
-		if (nt->argisrow)
+		/* `flag IS UNKNOWN` is `flag IS NULL`, and its negation likewise. */
+		if (IsA(clause, NullTest))
+		{
+			NullTest   *nt = (NullTest *) clause;
+
+			if (nt->argisrow)
+				return false;
+			isnull = (nt->nulltesttype == IS_NULL);
+			arg = (Node *) nt->arg;
+		}
+		else
+		{
+			isnull = (((BooleanTest *) clause)->booltesttype == IS_UNKNOWN);
+			arg = (Node *) ((BooleanTest *) clause)->arg;
+		}
+		if (!isnull && !allow_negated)
 			return false;
-		if (nt->nulltesttype != IS_NULL && !allow_negated)
-			return false;
-		arg = lion_strip((Node *) nt->arg);
+		arg = lion_strip(arg);
 		if (arg == NULL || !IsA(arg, Var))
 			return false;
 		out->var = (Var *) arg;
 
-		out->kind = (nt->nulltesttype == IS_NULL) ?
-			LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
+		out->kind = isnull ? LION_CLAUSE_NULL : LION_CLAUSE_NOTNULL;
 		/* The executor needs no value; keep the lists in step. */
 		out->val = (Node *) makeNullConst(out->var->vartype,
 										  out->var->vartypmod,
@@ -3477,7 +3698,9 @@ lion_analyze_leaf(Node *clause, Index rti, bool allow_negated,
  * flattened clause array holds the leaves of an OR restriction alongside the
  * plain clauses (DESIGN.md §19), so everything that follows - matching an
  * index per relation, pricing the lookup, moving a Param into custom_exprs -
- * treats them alike; inor says which are which.
+ * treats them alike; inor says which are which.  The clause the cost model
+ * is given is the leaf's own costclause when the analysis made one (a bare
+ * boolean column's `col = true`), the query's otherwise.
  */
 static void
 lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
@@ -3497,7 +3720,8 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 
 	*whereattnos = lappend_int(*whereattnos, (int) leaf->var->varattno);
 	*clauseinfos = lappend(*clauseinfos, ci);
-	*whereclauses = lappend(*whereclauses, clause);
+	*whereclauses = lappend(*whereclauses,
+							leaf->costclause != NULL ? leaf->costclause : clause);
 	*whereconsts = lappend(*whereconsts, leaf->val);
 	*wherekinds = lappend_int(*wherekinds, leaf->kind);
 	*whereopnos = lappend_oid(*whereopnos, leaf->opno);
@@ -3736,8 +3960,11 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
  * function revoked and so does the node; and the projection and the HAVING
  * evaluated over the finished counts, and a non-literal clause value, which
  * are initialised with ExecInitExpr() and so checked by core as they stand.
- * (A clause value is a literal or a parameter, possibly in an ARRAY[], and
- * calls nothing anyway.)
+ * (A clause value that calls functions - `now() - interval '1 day'` - has
+ * them in baserestrictinfo as well, so they are in the list too.)  A boolean
+ * column tested by itself (`WHERE flag`) calls nothing in core's plan either:
+ * the node's `flag = true` is looked up through the index, as core's index
+ * scan looks it up, without asking EXECUTE on booleq.
  */
 static List *
 lion_replaced_functions(RelOptInfo *rel, List *tlexprs, List *having,
@@ -3930,11 +4157,12 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		return;
 
 	/*
-	 * An IN list whose array is a parameter has no length until the executor
-	 * has it (§15), and every count of this node rebuilds the list's union -
-	 * so its work per dimension row is proportional to a length the cost model
-	 * cannot see.  A single table answers such a list once; here a 43,000-value
-	 * `= ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
+	 * An IN list whose array is a parameter - or any other expression that
+	 * is not a literal list - has no length until the executor has it (§15),
+	 * and every count of this node rebuilds the list's union - so its work
+	 * per dimension row is proportional to a length the cost model cannot
+	 * see.  A single table answers such a list once; here a 43,000-value `=
+	 * ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
 	 * review), so the shape is refused.  Literal lists and `IN ($1, $2)` have
 	 * their length at plan time and are priced per set.
 	 */
@@ -4326,15 +4554,29 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		clause = (Node *) rinfo->clause;
 
 		/*
+		 * `flag IS NOT TRUE` of a boolean column is `flag = false OR flag IS
+		 * NULL`, and is an OR like any other from here on
+		 * (lion_boolean_not_test()).
+		 */
+		{
+			BoolExpr   *orform = lion_boolean_not_test(clause);
+
+			if (orform != NULL)
+				clause = (Node *) orform;
+		}
+
+		/*
 		 * ---- an OR across columns (DESIGN.md §19) ----
 		 *
 		 * Every arm has to be a positive clause the posting sets can answer,
 		 * or an AND of such clauses, each on a column of this relation.  The
 		 * whole restriction then becomes ONE source - the union of the arms -
 		 * which is ANDed with the other sources and with the GROUP BY driver
-		 * like any other.  A negated arm (`IS NOT NULL`, NOT) is declined:
-		 * the complement of a posting set is not a posting set, and under a
-		 * union there is nothing to subtract it from.
+		 * like any other.  A negated arm (`IS NOT NULL`, a NOT of anything
+		 * but a boolean column) is declined: the complement of a posting set
+		 * is not a posting set, and under a union there is nothing to
+		 * subtract it from.  An arm `flag IS NOT TRUE` is two arms of the
+		 * same union, `flag = false` and `flag IS NULL`.
 		 *
 		 * The leaves are appended to the clause array like plain clauses, so
 		 * that an index is matched for each of them per partition and a Param
@@ -4348,6 +4590,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 		{
 			BoolExpr   *orexpr = (BoolExpr *) clause;
+			List	   *arms = NIL;
 			List	   *armlens = NIL;
 			int			orfirst = list_length(whereattnos);
 			ListCell   *la;
@@ -4356,6 +4599,16 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				return;
 
 			foreach(la, orexpr->args)
+			{
+				BoolExpr   *orform = lion_boolean_not_test((Node *) lfirst(la));
+
+				if (orform != NULL)
+					arms = list_concat(arms, orform->args);
+				else
+					arms = lappend(arms, lfirst(la));
+			}
+
+			foreach(la, arms)
 			{
 				Node	   *arm = (Node *) lfirst(la);
 				int			nleaf = 0;
@@ -4367,8 +4620,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 					foreach(lb, ((BoolExpr *) arm)->args)
 					{
-						if (!lion_analyze_leaf((Node *) lfirst(lb), rti, false,
-											  false, &leaf))
+						if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
+											  false, false, &leaf))
 							return;
 						lion_append_clause(&leaf, (Node *) lfirst(lb), true,
 										  &whereattnos, &clauseinfos,
@@ -4382,7 +4635,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				}
 				else
 				{
-					if (!lion_analyze_leaf(arm, rti, false, false, &leaf))
+					if (!lion_analyze_leaf(root, arm, rti, false, false,
+										  &leaf))
 						return;
 					lion_append_clause(&leaf, arm, true,
 									  &whereattnos, &clauseinfos,
@@ -4402,7 +4656,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			continue;
 		}
 
-		if (!lion_analyze_leaf(clause, rti, true, true, &leaf))
+		if (!lion_analyze_leaf(root, clause, rti, true, true, &leaf))
 			return;
 
 		/*
@@ -6133,9 +6387,9 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 		/*
 		 * A literal's value is ready now and never changes, so it is taken
-		 * straight from the Const; anything else - a Param, or the ARRAY[]
-		 * of a generic IN list - gets an ExprState and is evaluated at the
-		 * start of each scan (lion_eval_clause_values()).
+		 * straight from the Const; anything else - a Param, the ARRAY[] of a
+		 * generic IN list, a stable expression - gets an ExprState and is
+		 * evaluated at the start of each scan (lion_eval_clause_values()).
 		 */
 		cl->valexpr = (Expr *) list_nth(exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
@@ -6436,7 +6690,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
  * ReScan: a nested loop or a LATERAL reference sets a new exec Param between
  * the two, and the node has to see the new value.  A generic prepared plan's
  * PARAM_EXTERN is constant for the statement but is still only available
- * here.
+ * here, and so is a stable expression's value: a cached plan carries the
+ * expression, never the value it had when it was planned.
  *
  * ExecEvalExprSwitchContext() leaves its result in the per-tuple memory of
  * the node's ExprContext, which nothing here owns, so the value is copied
