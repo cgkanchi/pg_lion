@@ -1292,47 +1292,49 @@ SELECT * FROM lion_explain_norm('SELECT count(DISTINCT k) FROM lion_r WHERE k < 
    Distinct Key: k
 (3 rows)
 
--- ---------- 8. declined shapes (the ordinary plan answers them) ----------
+-- ---------- 8. ranges that do not drive: sources since DESIGN.md §32 ----------
 SELECT lion_rc('SELECT x, count(*) FROM lion_r WHERE k < 20 GROUP BY x');     -- range not the driver
-         lion_rc          
---------------------------
- not pushed down, 10 rows
+       lion_rc        
+----------------------
+ pushed down, 10 rows
 (1 row)
 
 SELECT lion_rc('SELECT count(DISTINCT x) FROM lion_r WHERE k < 20');
-         lion_rc         
--------------------------
- not pushed down, 1 rows
+       lion_rc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND i4 < 20');       -- two range columns
-         lion_rc         
--------------------------
- not pushed down, 1 rows
+       lion_rc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
+SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND k = 5');         -- beside = on k
+       lion_rc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND k IN (5, 6)');
+       lion_rc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_rc('SELECT x, y, count(*) FROM lion_r WHERE x < 5 GROUP BY x, y');
+       lion_rc        
+----------------------
+ pushed down, 40 rows
+(1 row)
+
+-- declined shapes (the ordinary plan answers them): an OR with nothing that
+-- holds the §9 pin beside it (§32), and the rest
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 OR x = 3');          -- under an OR
          lion_rc         
 -------------------------
  not pushed down, 1 rows
-(1 row)
-
-SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND k = 5');         -- beside = on k
-         lion_rc         
--------------------------
- not pushed down, 1 rows
-(1 row)
-
-SELECT lion_rc('SELECT count(*) FROM lion_r WHERE k < 20 AND k IN (5, 6)');
-         lion_rc         
--------------------------
- not pushed down, 1 rows
-(1 row)
-
-SELECT lion_rc('SELECT x, y, count(*) FROM lion_r WHERE x < 5 GROUP BY x, y');
-         lion_rc          
---------------------------
- not pushed down, 40 rows
 (1 row)
 
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE t < ''k'' COLLATE "C"');   -- collation mismatch
@@ -1359,7 +1361,7 @@ SELECT lion_rc('SELECT count(*) FROM lion_r WHERE n > 1');                     -
  pushed down, 1 rows
 (1 row)
 
--- an FK-side join's fact filter must be a source (DESIGN.md §27)
+-- an FK-side join's fact filter is a source (DESIGN.md §27), a range too (§32)
 CREATE TABLE lion_rd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO lion_rd SELECT i, 'n' || (i % 3) FROM generate_series(0, 9) i;
 ANALYZE lion_rd;
@@ -1367,9 +1369,9 @@ SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
 SELECT lion_rc('SELECT d.name, count(*) FROM lion_r f JOIN lion_rd d ON f.x = d.pk WHERE f.k < 20 GROUP BY d.name');
-         lion_rc         
--------------------------
- not pushed down, 3 rows
+       lion_rc       
+---------------------
+ pushed down, 3 rows
 (1 row)
 
 SELECT lion_rc('SELECT d.name, count(*) FROM lion_r f JOIN lion_rd d ON f.x = d.pk WHERE f.y = 2 GROUP BY d.name');

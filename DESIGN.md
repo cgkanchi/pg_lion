@@ -206,7 +206,9 @@ the header and every item on every page stay exactly where they were. A `attno` 
 minus-infinity downlink alone.
 
 Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 6, offset_bits,
-container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. Version 2 was the first that
+container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. *(Version 7, §32: an index
+with summary posting sets, which records them in `summary_cols` and `summary_tids`, two words that
+were reserved; an index without them is still version 6, byte for byte.)* Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
 structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
@@ -682,9 +684,10 @@ the last key had been hashed; the sorted build keeps one open page per level.
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
     amoptions: reloptions `fillfactor` (int, 10..100, default 90, §21), `inline_limit` (int bytes,
-    64..4096, default 4096), `max_entries` (int, 0 = unlimited, §17) and `buckets`, which is
-    accepted and ignored with a NOTICE since format 4 (§21), via add_reloption_kind /
-    add_int_reloption / build_reloptions.
+    64..4096, default 4096), `max_entries` (int, 0 = unlimited, §17), `buckets`, which is
+    accepted and ignored with a NOTICE since format 4 (§21), `summaries` (enum off | on | auto,
+    default off, §32) and `summary_tids` (int, 16..2^24, default 4096, §32), via
+    add_reloption_kind / add_int_reloption / add_enum_reloption / build_reloptions.
     ambuild: refuses a table whose table AM is not the heap, by routine (§2).
     amvalidate: a scalar opclass must have support proc 1 with signature (T) → int4 and operator
     strategy 1; a multi-key one (§17) procs 2 and 3 and strategies within {2,3,4,5}; proc 4 is
@@ -710,7 +713,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT sparse_segments bigint, OUT sparse_members bigint, OUT null_tids bigint,
         OUT empty_tids bigint, OUT slack_bytes bigint,
         OUT deleted_pages bigint,
-        OUT posting_internal_pages bigint, OUT max_posting_height int) RETURNS SETOF record
+        OUT posting_internal_pages bigint, OUT max_posting_height int,
+        OUT inline_slack_bytes bigint, OUT summary_entries bigint, OUT summary_tids bigint,
+        OUT summary_bytes bigint, OUT summary_pages bigint) RETURNS SETOF record
         -- ONE ROW PER KEY COLUMN (§24), in attno order.  Counters that describe an entry or a
         -- posting set - entries, inline_entries, ntids, null_tids, empty_tids, the container and
         -- sparse counts, container_bytes, slack_bytes, container_pages, posting_internal_pages -
@@ -725,7 +730,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- null_tids is the member count of the reserved NULL entry (§14) and empty_tids that of
         -- the reserved no-key entry (§17); container_pages counts posting-tree LEAVES and
         -- posting_internal_pages the pages above them, with max_posting_height the tallest
-        -- posting tree in the index (§22; 0 means every set fits one page)
+        -- posting tree in the index (§22; 0 means every set fits one page);
+        -- the SUMMARY entries of §32 are counted apart, in summary_entries, summary_tids (the rows
+        -- they hold), summary_bytes (their items) and summary_pages (their posting-tree pages),
+        -- and in none of the counters above
     lion_index_posting_root(regclass, key anyelement) RETURNS bigint
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
@@ -5145,11 +5153,12 @@ every scan shape against a sequential scan on an enum column, a list longer than
 - **Range predicates on the scalar classes: see §28.** `<`, `<=`, `>=`, `>` and `BETWEEN` as a
   bounded walk of the sorted directory, in the bitmap scan and - bounding the driving entry walk -
   in the count pushdown. Its follow-ups, in order of value:
-  - a range on a column that does NOT drive the count (`g, count(*) ... WHERE <range on k> GROUP BY
-    g`, the commonest shape of all; a range under an OR; a range as an FK-join fact filter): either
-    the range as a union SOURCE, built per container key into §15's bitset image so that no entry
-    has to stay located, or §20's (g, k) pair loop with the pair counts summed per group; each with
-    its own cost terms (entries in range per count, or |G| x entries in range pairs);
+  - DONE (2026-09-27, §32 "A range as a source"): a range on a column that does NOT drive the
+    count (`g, count(*) ... WHERE <range on k> GROUP BY g`, the commonest shape of all; a range
+    under an OR; a range as an FK-join fact filter) is a union SOURCE, collected per container key
+    into one private set - or walked at every count when it is too large to collect. Left: a
+    walked OR arm (inclusion-exclusion over the range's pieces), and the bitmap scan of a range
+    reading summaries;
   - `min(k)` / `max(k)`: walk from either end of the column to the first entry with a visible row
     (§26's existence test), printing its key under the value-representation contract; max needs the
     backward walk §21's leftlink was kept for;
@@ -5162,10 +5171,11 @@ every scan shape against a sequential scan on an enum column, a list longer than
   - a plan-time estimate of a range's entries that does not rest on `n_distinct` and the histogram
     alone (§28, "The cost of a summed range"): descend to both bounds and estimate the leaves
     between from the internal levels, as InnoDB's `records_in_range` does;
-  - summary posting sets per key bucket (a leaf, or a fixed key interval, perhaps hierarchical), so
-    that a range is the union of O(log n + buckets) summaries plus exact work at its two edges: the
-    structural fix for ranges over high-cardinality keys, which changes the on-disk format and
-    needs its maintenance on insert and VACUUM designed;
+  - DONE (2026-09-27, §32): summary posting sets per key bucket, so that a range is the union of
+    the summaries of the buckets it covers whole plus exact work at its two edges (format 7, opt-in
+    with the `summaries` reloption). Left: splitting a middle bucket that inserts grow (REINDEX
+    rebalances today), per-column control of which columns are summarized, and `auto` as the
+    default once its insert overhead is judged acceptable;
   - DONE (2026-09-27, §10): a STABLE bound expression in the count pushdown (`ts > now() -
     interval '1 day'`, the commonest range of all). The node takes any expression an index scan
     would take as a run-time key, for every clause kind and not only a range bound, and evaluates
@@ -7455,10 +7465,12 @@ A column's range clauses become one `LionRange`, resolved once per scan (per par
   descent, these calls run with a leaf share-locked; §21 says why a SQL-language operator that
   reads the same index can hang its own backend there, and why that is a superuser's concern.
 - **Positioning.** When every bound has a comparison and the column is ordered, the walk descends to
-  the first entry of the column that does not sort below the first LOWER bound: a search key of kind
-  VALUE with that bound as its key, hash 0 and no stored form, which compares as the smallest member
-  of its run (§21), so the descent lands on the first entry whose proc 4 is at or above the bound.
-  Without a lower bound it starts where the column starts. Either way the scan's resume position is
+  the first entry of the column that does not sort below the TIGHTEST lower bound: a search key of
+  kind VALUE with that bound as its key, hash 0 and no stored form, which compares as the smallest
+  member of its run (§21), so the descent lands on the first entry whose proc 4 is at or above the
+  bound. With more than one lower bound it descends once per bound and keeps the landing furthest
+  right (`lion_range_side_leaf()`, since §32; it used to descend to the first one and skip the
+  entries below the others). Without a lower bound it starts where the column starts. Either way the scan's resume position is
   the column's (attno, MINF), so the entries of an earlier column on the landing leaf are passed by
   the ordinary resume comparison and the bound needs no special case there.
 - **The test per entry.** A reserved entry is skipped. An entry failing a LOWER bound is skipped - the
@@ -7641,19 +7653,17 @@ Accepted (`lion_try_count_path()`), every other rule of §10, §14 and §16 unch
 6. Any number of range clauses on the SAME column, combined into one walk. They are exempt from the
    one-positive-clause-per-column rule among themselves, and from nothing else.
 
-Declined, and why:
+Declined at first, and since §32 answered: **a range on a column that does not drive** (`g,
+count(*) ... WHERE <range on k> GROUP BY g`, `count(DISTINCT g) WHERE <range on k>`, a range beside a
+two-column GROUP BY, two range columns), **a range under an OR** (§19), **a range beside `=`, `IN`
+or `IS NULL` on the same column**, and **a range as an FK-join fact filter** (§27). Each needs the
+range as an intersected SOURCE; §32 ("A range as a source") collects it into one private set once
+per relation - cheap with summaries - or, when it does not fit in a hash table's memory, sums over
+its walk at every count. Without a GROUP BY the widest range drives the sum and the others are
+sources; a range on a column with a positive clause of its own is always a source.
 
-- **A range on a column that does not drive**: `g, count(*) ... WHERE <range on k> GROUP BY g`,
-  `count(DISTINCT g) WHERE <range on k>`, a range beside a two-column GROUP BY, two range columns.
-  Each needs the range as an intersected SOURCE - the union above, or a §20-style (g, k) pair loop
-  summed per group - which are both real designs with their own costs (pairs = |G| x entries in
-  range) and are §23 follow-ups rather than something to ship half-priced. The ordinary plan answers
-  them, now with a lion bitmap scan for the range.
-- **A range under an OR** (§19): the same union, inside another union.
-- **A range beside `=`, `IN` or `IS NULL` on the same column**: two positive clauses on one column,
-  which §10 already leaves to the ordinary plan.
-- **A range as an FK-join fact filter** (§27): the fact filters are sources ANDed with every fk set,
-  so this is the union again.
+Still declined:
+
 - **min(k)/max(k)** (§23). Core's own min/max optimisation (planagg.c) needs an ORDERED index scan -
   `amcanorder` and `amgettuple` - which lion does not have. Doing it here means a new node shape that
   PRINTS a value (the value-representation contract), walks from either end to the first entry with a
@@ -7782,10 +7792,11 @@ column, check both.
 
 Where the walks START: BELOW starts at the column's first entry, (attno, MINF), exactly as an
 unbounded walk does. ABOVE descends to its upper bound's leaf, as INSIDE descends to its lower
-bound's. With more than one upper bound (`k < 10 AND k <= $1`) it is not known which is the
-tightest, so ABOVE starts where INSIDE does and passes over what the range selects. That is correct,
-and the race sees that this side is as long as the inside, so it takes the inside. On a multicolumn
-index (§24) each walk stops at the first entry of another column, as every walk does.
+bound's. With more than one upper bound (`k < 10 AND k <= $1`) each is descended to and the
+leftmost landing - the tightest bound - is where ABOVE starts (§32, "Two bounds on one side"; it
+used to start where INSIDE does, which was correct but made that side as long as the inside, so the
+race never took the complement). On a multicolumn index (§24) each walk stops at the first entry of
+another column, as every walk does.
 
 Not taken, and the inside walked as before:
 
@@ -9498,3 +9509,448 @@ model and win on the machine: `inlist.sql`'s two GROUP BY counts over IN lists, 
 **Provisional**: the range sums (§28) and the plain scan's heap side (§29.11), whose costing other
 work is reworking; the matrix's `range` and `fetch` rows are theirs to rerun. Parallel plans were
 not in the CPU-time matrix.
+
+## 32. Summary posting sets for ranges (format version 7)
+
+§28 made a range a contiguous run of VALUE entries, and a count over it a walk of that run: one
+count per entry, 0.3 to 0.5 us for a small one counted with the rest of its leaf and 1.4 to 1.9 us
+for one counted on its own. That is linear in the KEYS the range covers, and a range over a unique
+timestamp covers as many keys as rows: a million keys was 350 ms on the assert build, where the
+rows' posting sets would have been a few thousand containers. §23 listed the structural fix -
+coarse posting sets per key bucket, so that a range is the union of whole buckets plus exact work
+at its two edges - as a format change whose maintenance on insert and VACUUM had to be designed
+first. This is that design, and it is implemented.
+
+### What a summary is
+
+A summarized key column keeps, after its VALUE entries, one SUMMARY entry per BUCKET of
+consecutive keys. Bucket i holds the keys in `(K_{i-1}, K_i]` and its summary is keyed `K_i`, its
+inclusive upper bound: an entry `(attno, kind SUMMARY, K_i, LION_SUMMARY_HASH)` whose posting set is the
+union of the posting sets of every key in the bucket. The last bucket is OPEN: its entry carries
+both `LION_ENTRY_SUMMARY` and `LION_ENTRY_SUMLAST`, has kind `LION_KIND_SUMLAST` (5, above SUMMARY's
+4), sorts after every other summary of the column by its kind alone, and is keyed by the largest
+key it holds, which inserts raise. A bucket is a set of rows, never a range of heap blocks: a key's
+rows are all in one bucket, and buckets close at key boundaries.
+
+A summary is an ORDINARY directory entry in everything but its kind and its hash: INLINE while its payload fits
+(§13's items, sparse segments and all) and a posting tree of its own (§22) past that, written by
+the same builders, the same `lion_dir_place()` / `lion_dir_add_entry()` and the same posting-tree
+code as a key's set, and split, moved right, vacuumed and deleted (§18) like one. Its hash is
+`LION_SUMMARY_HASH` (0) whatever its key: summaries are ordered by key alone (a column's bucket
+bounds are distinct under proc 4, and the open one sorts by its kind), and the hash is what the
+owner stamp of every page of a chained summary says (§18), which must not change when the open
+bucket's key is raised - with the key's hash there, the first raise of a chained open bucket left
+its pages claiming another entry (found by the insert benchmark below, before this was released).
+
+That is the design's main choice: **no TID ever moves between summaries, and summaries use no WAL
+record of their own**, so §25's records, their redo, `wal_consistency_checking`'s masking and the recovery
+harness cover them as they stand. `lion_cmp_entry()` treats the SUMLAST kind as keyless for
+ordering (it compares equal to any search key of its kind), `lion_cmp_prefix()` compares keys for
+VALUE and SUMMARY kinds (`LION_KIND_HAS_KEY`), and every walk that returns keys - the bitmap
+scan's `LionLeafWalk`, the entry scans of GROUP BY and count(DISTINCT) - stops at the first summary
+exactly as it stops at the next column's first entry, so nothing that reads keys ever sees one.
+
+**Buckets are decoupled from directory leaves.** A leaf split moves entries, summaries among them,
+as for any entry; it never touches a bucket's boundaries, because the boundaries are keys. The
+alternative - a summary per leaf, rebuilt at each split - would have made every leaf split rewrite
+two posting sets, WAL-log them, and pull the summaries into §21's split protocol; with buckets keyed
+by value, a leaf split is exactly what it was.
+
+### Which columns, and the options
+
+Only an ORDERED scalar key column can have summaries: a bucket is a run of keys, which needs the
+column's directory in its order (§21, "The order is the index's"), and a multi-key column's entries
+are extracted keys whose sets overlap. Two reloptions, per index:
+
+- `summaries` = `off` (the default), `on`, or `auto`. `on` gives every ordered scalar key column
+  summaries, even with no rows yet (its first insert opens its first bucket). `auto` decides per
+  column at build time from the column's exact counts: it keeps them when the column has at least
+  `LION_SUMMARY_AUTO_MIN_BUCKETS` (4) buckets' worth of rows and its buckets average at least
+  `LION_SUMMARY_AUTO_MIN_KEYS` (16) keys - a column of few large keys gains nothing, since its
+  range walk is already short.
+- `summary_tids` = the rows a bucket closes at (4096; 16 to 2^24). A bucket closes at the first key
+  boundary at or past it, so one key larger than that is a bucket of its own.
+
+**Chosen conservatively, flagged for the owner:** `off` by default, so nothing changes for an
+existing schema and no insert pays for summaries it did not ask for; `auto` is the documented
+alternative a user opts into, and a later release could make it the default once the insert
+overhead below is judged acceptable. The option is per INDEX, not per column (a multicolumn index
+with `on` summarizes every ordered column, low-cardinality ones included - `auto` is the way to be
+selective); per-column control would need a column-level reloption the AM interface does not have,
+or an opclass parameter. `auto` on an EMPTY table decides no summaries (there is nothing to decide
+from); such an index gets them at its next REINDEX, or is built with `on`.
+
+The meta page records which columns have summaries - `summary_cols`, a bitmap of key columns, and
+`summary_tids` - in the two words that were `reserved[2]`, so the page keeps its 56 bytes. An index
+with at least one summarized column is **format 7**; one with none is **format 6, byte for byte what
+it was**, and `lion_read_meta()` reads both (and refuses a 6 with summary words set, a 7 without,
+or a bucket size out of range). The option is read at BUILD time only: `ALTER INDEX ... SET
+(summaries = on)` changes what the next REINDEX builds, never an index's existing entries, and an
+insert gives summaries only to the columns the meta page names - a column the build left without
+them stays without them.
+
+**Upgrade.** Existing indexes are format 6 and keep working unchanged, walking keys as §28 does;
+`REINDEX` with the option adds summaries. **Downgrade:** a build before this one refuses a format 7
+index (its version check), so an index with summaries has to be rebuilt with `summaries = off`
+before going back.
+
+### Build (lion_build.c)
+
+The build writes each key column's entries in key order in one pass over the spool's merged output
+(§21), serially or after a parallel build's workers have sorted their runs - the pass is the
+leader's either way, so parallel builds get summaries too. For a summarized column
+(`lion_sum_begin()`), every code the pass hands a VALUE entry's builder is also added to the current
+bucket, and once a key is written the bucket closes if it holds `summary_tids` codes or more
+(`lion_sum_key_done()`). A bucket's codes are collected in an array, which switches to an INT8
+tuplesort past a quarter of `maintenance_work_mem` (one key of a column with few keys can be most of
+the table); a closed bucket is sorted, run through a collecting builder into the same items a
+posting set is made of, and put aside in a temporary BufFile after a header naming its key. When
+the column's values are done (`lion_sum_finish()`), the last bucket is closed as the SUMLAST, `auto`
+decides, and the file is replayed through ordinary builders into entries written after the
+column's values - which is where they sort. The build's DEBUG1 line reports the buckets per column
+and whether they were kept.
+
+### Insert (lion_insert.c)
+
+`lioninsert()` inserts the key as it always did (`lion_insert_one()`), and then, for a summarized
+column and a non-NULL key, puts the row into its bucket's summary (`lion_summary_insert()`), with
+nothing held in between:
+
+1. Descend to `(SUMMARY, key, hash 0)` for write (`lion_dir_search_first()`, which finishes an
+   INCOMPLETE_SPLIT on the way and steps right past a leaf's end): the landing is the first summary
+   whose key is at or above the row's.
+2. A regular SUMMARY there is the row's bucket: the TID goes into its set, INLINE or chain, exactly
+   as into a key's (`lion_insert_inline()` / `lion_insert_chain()`).
+3. The SUMLAST with a key at or above the row's: the same.
+4. The SUMLAST with a key BELOW the row's - the row is above every key the column's summaries
+   cover. If the open bucket holds fewer than `summary_tids` rows it is REKEYED to the row's key
+   (`lion_summary_rekey()`: the same entry with the new key, spilled to a chain if the longer key
+   pushes its INLINE payload past the limit) and step 1 is retried; if it is full it is CLOSED
+   (`lion_summary_close_last()`: the SUMLAST flag dropped in place, which leaves a regular summary
+   keyed by the largest key it holds) and a new SUMLAST holding just the row is added right after
+   it.
+5. No summary at all (an empty column, or VACUUM deleted the last one): a new SUMLAST holding the
+   row, added where the column's summaries sort.
+
+So middle buckets never split: inserts into the middle of the key space make their buckets grow,
+and only the open bucket at the top is closed and succeeded. A column whose keys arrive in order
+(a timestamp, a sequence) gets buckets of `summary_tids` rows forever; one whose keys arrive in no
+order keeps the buckets its build made and grows them - `REINDEX` rebalances. **Flagged:** a split
+of a middle bucket would move rows between two summaries, which the reader's disjointness argument
+below forbids without a protocol of its own (a two-entry atomic replace under one WAL record); it
+was left out, and the backlog has it.
+
+The key goes in FIRST. A crash or an error between the two leaves the row under its key and in no
+summary; its transaction did not commit, so the row is dead, and a dead row missing from a summary
+is no difference to a count or to `lion_index_verify()` (below). The reverse order would have left
+a live-looking key missing a row a summary has, for the same dead row - equally harmless - but the
+key-first order is what the reader's argument below uses for the open bucket.
+
+**Cost.** One more descent and one more posting-set update per summarized column per inserted row,
+into a set that is larger and hotter than a key's: the summary of the open bucket takes every
+appended row of a timestamp column. Measured below.
+
+### VACUUM (lion_vacuum.c)
+
+Summaries are entries, so the bulk-delete pass removes dead TIDs from them as from a key's set, in
+the same chain order and under the same cleanup locks (§11), and an emptied summary is deleted as
+an emptied entry is (§18) - the open one included; the next insert above the column's summaries
+then opens a new one (step 5). A CHAIN summary is identified across a concurrent split by its root
+block (`lion_vac_entry_matches()`), and found again after one by descending to `(SUMMARY, key)` and
+walking right through the column's summaries (`lion_vac_ref_relocate()`), as a key's entry is found
+by its key.
+
+### Readers: the phased walk (lion_count.c)
+
+A summed walk over a summarized column (`lion_entry_scan_begin_sum()`: the sum of §28, its
+complement's BELOW and ABOVE, the sum over all of §14, and the collection of a range source below)
+walks one part of the column in up to three PHASES:
+
+1. **LOWER** - the VALUE entries from the part's start up to and including `K_j`, the key of the
+   first summary at or above the part's lower bound (found by the same descent the part starts with,
+   with the search key's kind SUMMARY). That summary's bucket may straddle the bound, so its keys are
+   walked one by one.
+2. **SUMS** - the summaries after it, as long as each one's bucket lies wholly inside the part: its
+   key passes every upper bound (`lion_scan_bucket_inside()`). The last one taken, `K_m`, is
+   remembered.
+3. **UPPER** - the VALUE entries above `K_m` (a descent to it), up to the part's end.
+
+A part with no lower bound (BELOW, the sum over all, `k < v`) starts with SUMS, its first bucket
+being whole. When the first summary at or above the part's start lies past the part's end - the
+range is inside one bucket - the walk is the plain walk of §28 (`lion_entry_scan_plan_sum()`
+decides before it starts); when no summary after it is whole, SUMS takes none and UPPER goes on
+from `K_j`. Each phase after the first starts with a
+descent of its own, resumed by key as every walk is (§28, "One read per leaf"), so a split or an
+entry deletion between phases is what it is between leaves.
+
+**Why the counts stay exact.** The three phases partition the rows of the part: a key `k <= K_j`
+is walked in LOWER, a key in `(K_j, K_m]` is in exactly one whole bucket and counted through its
+summary, a key above `K_m` is walked in UPPER - disjoint sets of one column, so the sum, the
+complement and the collection take them as they take entries (§15's argument). Under concurrent
+writers, with an MVCC snapshot deciding every row:
+
+- A row's bucket never changes once the row is in it. Middle buckets' bounds never move; the open
+  bucket's upper bound only rises; a closed bucket keeps its key. So a row counted through a
+  summary is in no other summary, and its key is outside LOWER and UPPER's key intervals.
+- The open bucket's key is raised by an insert AFTER the row is under its own key (key first). A
+  reader that took the open bucket as whole with its old key `K_s` walks UPPER from `K_s`, and finds
+  the new key's entry there - and the summary it read did not have the row yet. A reader that saw
+  the raised key counts the row through the summary, and UPPER starts above it. Either way once.
+- A summary VACUUM empties and deletes had only dead rows. After it is gone the next summary's
+  bucket reaches down to the previous one's key; rows inserted into that span afterwards go into
+  it, and the dead rows that were in the deleted one are counted by no one, which is right.
+- A row inserted after the snapshot may be anywhere; it is invisible, and the visibility map and
+  the heap recheck decide it as they decide every candidate (§9).
+
+The §9 interlock is the ordinary one: a summary's containers are read under a pin on the page they
+came from, like a key's.
+
+**Where summaries are not used.** Anything that needs keys: a GROUP BY k walk (its groups ARE the
+keys), count(DISTINCT k), the bitmap and plain index scans of §28 and §29 and the ordered scans of
+§30 (they return TIDs per key or in key order), `k IS NULL`. The bitmap scan of a range could use
+them - a summary's containers are TIDs like any - and is left for later.
+
+### Two bounds on one side (2026-09-27)
+
+§28's walks descended to the FIRST lower bound (INSIDE) and, with more than one upper bound, started
+ABOVE where INSIDE starts: `k < 10 AND k <= $1` did not know which bound is tighter. Now each side
+takes its TIGHTEST bound (`lion_range_side_leaf()`): it descends once per bound of the side and
+keeps the landing that is further in - the rightmost of the lower bounds' landings for INSIDE, the
+leftmost of the upper bounds' for ABOVE - comparing the landed items by the directory's own order
+(`lion_cmp_entries()`). The descents are one per bound (two, in practice), and the walk then starts
+where it should: `test/sql/rangesum.sql`'s `k > 2 AND k >= 4 AND k < 996 AND k <= 993` is now
+taken as its complement, 10 entries against 990 walked before.
+
+### A range as a source (lion_customscan.c)
+
+§28 bounded the DRIVING walk with a range and declined a range anywhere else. With summaries a
+range on any column is cheap to turn into the set of its rows, so the count pushdown now takes a
+range on a column that does not drive the count as an ordinary positive SOURCE
+(`LION_CLAUSE_RANGESRC`):
+
+- `g, count(*) ... WHERE <range on k> GROUP BY g`, beside a two-column GROUP BY, and beside a
+  count(DISTINCT) walk of another column;
+- two range columns without a GROUP BY: the WIDEST range drives the sum (the complement and the
+  summaries make a wide walk short) and the others are sources;
+- a range and an equality on one column (`k > 100 AND k = 257`): two sources;
+- a range as an OR's arm, or part of one (`(k < 10 OR a = 3)`, `(k BETWEEN 5 AND 9 AND a = 1) OR
+  ...`): one leaf of the union per arm, whatever bounds the arm has on the column;
+- a range among the fact filters of an FK-side join (§27).
+
+**How it is evaluated.** Per relation (and per rescan, Params being values then), the bounds of each
+range on its column - in its conjunction: the top level, or one OR arm - are made one `LionRange`,
+and the rows of the range are COLLECTED (`lion_range_collect()`): the phased walk above hands out
+entries and summaries, and each set's containers are ORed into a union kept by container key, then
+put in key order into one private, pinless set. It is read like any other set from then on - by
+every group, pair or dimension row the node counts - and it is exact: the same argument as the
+collected fact filters of §27 (it is only ever counted beside a located set that holds the §9 pin,
+which settles any TID VACUUM has since removed; it cannot miss a row visible to the snapshot,
+because it is read after the snapshot was taken).
+
+**Too large to collect.** The collections of one relation share one hash table's memory
+(`get_hash_memory_limit()`): a union is at most a container per container key of the heap, about
+two bytes a row until those fill up. A range that would not fit is not collected but WALKED at
+every count it is part of (`LionCountSource.rangewalk`, `lion_node_count()`): the rows of the
+range are the disjoint union of the sets its walk hands out, so the count is the SUM over them of
+the count of each - a leaf's worth of small entries at a time, as §28 counts - ANDed with the other
+sources, or, when the leaf-by-leaf race says the outside is shorter, the count of the other sources
+minus the column's NULL entry less the sums below and above (§28's complement). An existence test
+walks the inside and stops at the first piece with a row. Every count and existence test the node
+makes goes through `lion_node_count()`, which expands a walked range and hands everything else to
+the counting core unchanged - so a multi-key clause answered only as a superset (a phrase, a NULL
+element) is rechecked there as it always is.
+
+**What it needs beside it.** A collected range holds no pin, so a count with nothing else that
+carries the §9 interlock would recheck every row in the heap. The planner therefore takes a range
+as a source only beside something that does: the walk that drives the count (a GROUP BY, the sum
+over another range, a count(DISTINCT) walk), the fk set of a join, or a clause - or an OR of
+clauses - outside the ranges. `count(*) WHERE k < 10 OR a = 3` alone is left to the ordinary plan.
+An OR's leaf cannot be walked (the union's other arms would have to be subtracted from each piece),
+so it is collected whatever it takes, and the planner prices one it expects not to fit out of the
+plan (`lion_cost_range_source()`). **Flagged:** a walked OR arm by inclusion-exclusion -
+`|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B ∩ Z − Y|` over R's pieces B - is the way to lift that.
+
+EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <= 900)`), and
+EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any.
+
+### Costs (lion_customscan.c)
+
+`lion_cost_range_sum()` prices each side of a summed range with `lion_cost_range_side()`. On a
+summarized column a bucket holds `max(summary_tids, rows per key)` rows and so `bucket rows / rows
+per key` keys; a side of `n` keys covers `n / keys per bucket - 1` buckets whole (half a bucket is
+left at each end on average), walks the keys of the partial buckets as before, and counts each
+whole bucket's summary at `LION_RANGE_ENTRY_COST` plus its containers - bucket rows spread over the
+heap as the column's correlation says - read and counted, and each of the other sources probed at
+them in memory, at §31's per-container, per-member and per-probe costs as an entry is; it reads
+about the pages of the keys it stands for, scaled by the containers the union saves. `LION_SUMMARY_PHASE_DESCENTS` (2) charges
+the phases' own descents. Without a whole bucket, or without summaries, the model is §28's. The
+recheck is spread over the side's counts rather than its keys. The sum over every entry of a
+summarized column (`k IS NOT NULL` alone, §14) is priced as a range over all of it
+(`LION_RANGED_SUMALL`).
+
+A range taken as a source costs its collection once per relation - the same walk, with nothing to
+AND and nothing to recheck, plus a step per container of the union - and is then a source read from
+memory: no page reads for the probes, its rows `tuples x selectivity of its bounds`. One whose
+estimated union exceeds a hash table's memory is priced as walked by every count (the walk times
+the counts), and one in an OR is priced out.
+
+The range's selectivity is the planner's (`clauselist_selectivity()` of its bounds), which the
+plan-time endpoint probe of another change may sharpen; nothing here depends on how it is obtained.
+
+### Verification (lion_funcs.c)
+
+`lion_index_verify()` checks every summarized column after its other checks
+(`lion_verify_column_summaries()`): it walks the summaries beside the column's VALUE entries,
+collects the codes of each bucket's keys and of its summary, sorts both, and compares them. It also
+checks that summaries are in order, that there is at most one SUMLAST and it is the last, that a
+summary is of a summarized column and carries `LION_SUMMARY_HASH`, and that no row is under two
+keys. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside inserts (VACUUM
+waits for it), so a difference is a CANDIDATE, not an error: an insert may be between its key and
+its summary, or have raised the open bucket's key. After waiting for every writer that could
+explain them (`lion_verify_wait_for_writers()`), each candidate is looked at again: a row a summary
+holds must be in one of its bucket's keys now, a row a key holds must be in its bucket's summary
+now, a key above the open bucket's must be in a bucket - and a DEAD row (`HeapTupleSatisfiesVacuum()`
+against the oldest non-removable xid, or an unused or dead line pointer) is never a difference,
+which is what a crash or an error between an insert's two steps leaves. A row that is still one
+is reported. `test/sql/corrupt.sql`
+rewrites a summary's key on disk to one that still sorts between its neighbours, so that every
+entry is sound on its own and only the comparison can tell; verify reports the row the summary
+holds and no key of its bucket does.
+
+`lion_index_stats()` reports per column the summaries' entries, rows, bytes and posting pages
+(`summary_entries`, `summary_tids`, `summary_bytes`, `summary_pages`), which the other counters
+leave out.
+
+### Tests
+
+- `test/sql/summary.sql`: range shapes (both sides open, closed, within one bucket, empty,
+  inverted, outside the keys, cross-type bounds past the int4 domain) on a column in heap order, one
+  in no order, a nullable one and a text one, each against a sequential scan with the pushdown off
+  and printed with its evaluation and the summaries it summed; the inside, the complement and the
+  full domain beside other clauses; two bounds on one side; walks that must not use summaries (a
+  GROUP BY, count(DISTINCT), `k IS NOT NULL`) and the bitmap scan; appends that open buckets,
+  inserts between and below every key; a dirty heap, VACUUM, a run of whole buckets deleted and a
+  column emptied and refilled; a format-6 index (the default), `ALTER INDEX ... SET (summaries)`
+  having no effect until REINDEX, REINDEX adding and removing them; `auto` on a multicolumn index,
+  on a multi-key column and on an empty table; `on` on an empty table with keys arriving out of
+  order; a partitioned table with summaries in some partitions; a unique timestamp under `auto`.
+  `lion_index_verify()` after every kind of change.
+- `test/sql/rangesource.sql`: a range as a source beside a GROUP BY (one and two columns), a
+  count(DISTINCT), another range, an equality on its own column, in OR arms, among an FK-side join's
+  fact filters, on a partitioned table; collected and - at work_mem's floor, over 200,000 rows -
+  walked, inside and as its complement, and in existence tests; generic plans with Param bounds, a
+  NULL one, and multi-key Params beside it; a dirty heap and VACUUM.
+- `test/sql/corrupt.sql` section 4, and `test/sql/rangesum.sql`'s two-bounds case; `range.sql`,
+  `distinct.sql` and `fkjoin.sql` keep their formerly declined shapes, now answered, beside a clause
+  no posting set answers.
+- `test/isolation/summary_race.spec`: a count summing summaries parks with the first summary's
+  container pinned (`lion-count-containers-pinned`) and a VACUUM that would remove that bucket's
+  dead rows waits for the pin (asserted), the count exact with the next bucket's rows deleted after
+  its snapshot rechecked in the heap; counts park between the phases of their walk
+  (`lion-entry-scan-phase`, new) while appends close, open and rekey buckets and middle inserts
+  split the leaves the next phase descends into, exact against their own snapshot's count; and
+  `lion_index_verify()` runs while an insert is parked between its key and its summary
+  (`lion-insert-before-summary`, new), waits for it, and comes back clean.
+- The recovery harness (`test/recovery/`): the table gains `lion_rec_sum` on `(id, k4)` with
+  `summaries = on, summary_tids = 64, inline_limit = 64` - id is what the writer appends above, so
+  every crash round closes, opens and rekeys buckets (chained ones among them) under WAL while its
+  updates grow the middle buckets and its deletes and the VACUUM loop empty and delete summaries -
+  and range queries that sum summaries and take ranges as sources join the probes compared with a
+  sequential scan on the primary, the standby and the promoted standby. Every check runs
+  `lion_index_verify()` on it, which compares every summary with its bucket, and a new check
+  requires the summaries to hold every row (exactly, after a VACUUM). No new WAL record type, so no
+  new phase: the summaries ride on the records every phase already replays. Both modes pass with
+  `wal_consistency_checking` on (`'generic'`, and `'pg_lion'` with `--mode rmgr`): eight crash
+  rounds each, 333,389 and 224,543 index records replayed, 158 checks per round (2026-09-27).
+
+### Open for the owner
+
+The choices made conservatively here, each with the alternative:
+
+- **`summaries = off` by default.** Nothing changes for an existing schema and no insert pays for
+  what it did not ask for. The alternative is `auto` as the default, which would summarize exactly
+  the columns the range walks hurt on (many small keys) at the insert cost measured below.
+- **Per index, not per column.** `on` summarizes every ordered scalar key column, a low-cardinality
+  one included; `auto` is the selective form. A per-column choice needs a column-level option the
+  index AM interface does not offer (an opclass parameter could carry it).
+- **Middle buckets never split.** Inserts into the middle of the key space grow their buckets, which
+  only REINDEX rebalances; a split would move rows between two summaries and needs its own atomic
+  protocol (both entries in one record) against the readers' disjointness.
+- **`auto` on an empty table decides nothing**, and the index gets summaries at its next REINDEX.
+- **A range in an OR's arm is always collected**, whatever memory it takes; the planner prices one it
+  expects to exceed a hash table's memory out of the plan. Walking it would need inclusion-exclusion
+  against the other arms.
+- **Downgrade**: an index with summaries is format 7, which an older build refuses; REINDEX with
+  `summaries = off` first.
+- **Not used by**: the bitmap and plain index scans, GROUP BY k walks, count(DISTINCT k), ordered
+  scans - they want keys, or could take summaries (the bitmap scan of a range) in a later change.
+- **The insert fast path** an appending column could have - remembering where the open bucket is,
+  as btree remembers its rightmost leaf - is not there: every summarized row descends from the root.
+
+### Measured (2026-09-27, PostgreSQL 18.6 assert build, generic WAL, CPU time of the backend)
+
+Two copies of one 2M-row table - `id`, `ts` (a unique timestamp one second apart, in heap order),
+`g` (50 values), `r` (a permutation of 0 .. 2M-1 in no heap order), a short pad - each with one lion
+index on `(ts, g, r)`: the BEFORE copy's built with `summaries = off` (format 6: what every index
+was), the AFTER copy's with `summaries = auto` (format 7: `ts` and `r` get 489 summaries of 4096
+rows each, `g` none, as `auto` decides). One build, one server, every page all-visible, the
+pushdown forced for the range timings, the copies interleaved, CPU time of the backend
+(`/proc/<pid>/schedstat`) per run, over repeated runs of at least 250 ms, the best of three passes.
+
+**Range counts, by keys in the range** (ms per count; the "before" walks a key at a time, the
+"after" walks the edge buckets' keys and sums the summaries between):
+
+| keys in range | `ts` range | | `ts` range `AND g = 7` | | `r` range (no order) | | `ts >= X` alone | |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| | before | after | before | after | before | after | before | after |
+| 1,000 | 0.43 | 0.46 | 0.69 | 0.72 | 0.43 | 0.43 | 0.43 | 0.42 |
+| 10,000 | 3.49 | 0.75 | 4.56 | 1.15 | 3.43 | 0.86 | 3.42 | 0.32 |
+| 100,000 | 34.9 | 0.72 | 46.5 | 1.29 | 34.7 | 2.11 | 34.2 | 0.29 |
+| 1,000,000 | 346 | 3.92 | 459 | 4.42 | 341 | 16.3 | 344 | 3.11 |
+| 1,990,000 | 437 | 2.89 | 355 | 3.40 | - | - | 678 | 5.26 |
+
+A range within one bucket is what it was (no bucket is whole, so the walk is §28's). Past a few
+buckets the time stops growing with the range: it is the keys of the two partial buckets - up to
+4096 one-row keys each, 0.3 to 0.5 us apiece - plus a count per summary. The `ts` summaries are a
+RUN container or two each (the column is in heap order), so 244 of them cost less than the edges;
+the `r` summaries are a container at every one of the heap's 230 container keys, which is why its
+million-key range is 16 ms and not 4. `ts >= X` alone (no other clause, so no complement) is the
+shape §28 could only walk: 678 ms for 1.99M keys, 5.3 ms now. With a clause beside it the
+complement already made the near-full range short (355 ms for 1.99M keys was the complement's
+walk of the 10,000 keys outside); summaries make both sides short.
+
+**Plans** (default settings, and the cost units before §31 refitted them on a release build - the
+ratios are the point): the million-key `ts` range is priced 132,572 before (a sequential
+scan at 47,189 is chosen, ~190 ms) and 898 after (the node, 3.9 ms); `ts >= X` over 1.99M keys
+266,885 before (sequential scan chosen) and 1,241 after (the node). A 1,000-key range is priced
+134 and 125.
+
+**Ranges as sources** (after only; "off" is the plan the planner picks with the pushdown off):
+
+| query | pushdown off | pushdown on |
+|---|---:|---:|
+| `g, count(*) WHERE <ts range of 100k keys> GROUP BY g` | 33.5 (bitmap heap scan) | 12.5 |
+| `g, count(*) WHERE <ts range of 1M keys> GROUP BY g` | 338 (seq scan) | 39.4 |
+| `g, count(*) WHERE r < 1000000 GROUP BY g` (half the rows, no order) | 376 (seq scan) | 310 |
+| `count(*) WHERE ts >= X AND r < 100000` (two ranges) | 253 (seq scan) | 26.7 |
+
+**Insert** (CPU of the statement, best of three): 5,000 single-row INSERTs 320 -> 419 ms (+31%,
+about 20 us a row for the two summarized columns: a descent and a posting-set insert each);
+INSERT ... SELECT of 100,000 rows 3,086 -> 5,342 ms (+73%, 23 us a row). The index work per row is
+five posting-set updates instead of three, and that is the price: about 10 us per summarized column
+per row on this assert build. The open bucket of an appending column takes every row, INLINE and
+small (a RUN container); the `r` column's buckets are posting trees of scattered rows.
+
+**Size**: 265 MB -> 277 MB (+4.5%). The `ts` summaries are 67 kB of items (RUN containers), the `r`
+summaries 4.9 MB of items on 1,465 posting pages; nothing else changes.
+
+**VACUUM** after deleting a tenth of the rows spread over the table (1.5M rows left; the heap
+pass is the same work in both): 1,376 -> 1,594 ms, best of two rounds each in alternating order
+(+16%; the rounds differed by 10 to 20% among themselves). The bulk-delete pass reads every
+summary as it reads every key, and the summarized columns hold each dead TID twice.
+
+**Build** (REINDEX, serial, 1.27M rows): 3,335 -> 3,598 ms (+8%), best of two in alternating
+order; the index is 159 MB -> 169 MB (+6%) at that size.
+
+**Not measured here**: the rmgr WAL mode's timings (the records are the same ones, so its ratios
+should follow), and a production build - these are assert-build CPU times, for ratios only.

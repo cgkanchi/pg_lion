@@ -561,13 +561,17 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT deleted_pages int8,
 									OUT posting_internal_pages int8,
 									OUT max_posting_height int4,
-									OUT inline_slack_bytes int8)
+									OUT inline_slack_bytes int8,
+									OUT summary_entries int8,
+									OUT summary_tids int8,
+									OUT summary_bytes int8,
+									OUT summary_pages int8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index, one row per key column: directory shape, entries, containers by kind, sparse segments, posting trees, NULL keys and key-less rows';
+	'shape of a lion index, one row per key column: directory shape, entries, containers by kind, sparse segments, posting trees, NULL keys and key-less rows, and summary posting sets';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key

@@ -655,8 +655,15 @@ SELECT lion_fj('SELECT d.attr, count(f.y) FROM lion_ff f JOIN lion_fd d ON f.fk 
  not pushed down, 8 rows
 (1 row)
 
--- a fact filter the posting sets cannot answer
+-- a range among the fact filters is a source (DESIGN.md §32)
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x > 3 GROUP BY d.attr');
+       lion_fj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+-- a fact filter the posting sets cannot answer
+SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x % 2 = 1 GROUP BY d.attr');
          lion_fj         
 -------------------------
  not pushed down, 8 rows
