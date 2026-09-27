@@ -266,6 +266,20 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_RANGE_ENTRY_COST	(40.0 * cpu_tuple_cost)
 
 /*
+ * ... and of one SMALL entry of a summed range, counted with the rest of its
+ * leaf as one union (DESIGN.md §28, "Counting a walk"): the leaf is read once
+ * for all of them, and what is left per entry is its copy, its cursor and its
+ * share of the union.  Measured on the assert build over the 2M-row repro
+ * table: 0.3 to 0.5 us an entry of one row, against 1.5 before.
+ */
+#define LION_RANGE_UNION_ENTRY_COST	(12.0 * cpu_tuple_cost)
+
+/* Which walk a range bounds, for the cost model (DESIGN.md §28). */
+#define LION_RANGED_NONE	0
+#define LION_RANGED_WALK	1	/* a GROUP BY or count(DISTINCT) walk */
+#define LION_RANGED_SUM		2	/* the sum over the range's entries */
+
+/*
  * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
  * "Counting a walk"): the entries the walk copied out of one directory leaf
  * are counted together, as the union of disjoint sets, when they are small -
@@ -1869,16 +1883,14 @@ lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col)
 }
 
 /*
- * How many entries of `var`'s index a range walk visits (DESIGN.md §28): the
- * column's n_distinct over the WHOLE table - a walk visits an entry whatever
- * the other clauses leave of it - times the range's own selectivity, at least
- * one.  n_distinct is taken as examine_variable() gives it rather than
- * through estimate_num_groups(), which would scale it down by every clause of
- * the relation, the range included, and count the range twice.
+ * `var`'s n_distinct over the WHOLE table - a walk visits an entry whatever
+ * the other clauses leave of it - which is how many entries a scalar column's
+ * index has.  It is taken as examine_variable() gives it rather than through
+ * estimate_num_groups(), which would scale it down by every clause of the
+ * relation, a range included, and count the range twice.
  */
 static double
-lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
-				  Selectivity sel)
+lion_var_ndistinct(PlannerInfo *root, RelOptInfo *rel, Var *var)
 {
 	VariableStatData vardata;
 	double		ndistinct;
@@ -1888,7 +1900,18 @@ lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
 	ndistinct = get_variable_numdistinct(&vardata, &isdefault);
 	ReleaseVariableStats(vardata);
 
-	return Max(1.0, ndistinct * sel);
+	return Max(1.0, ndistinct);
+}
+
+/*
+ * How many entries of `var`'s index a range walk visits (DESIGN.md §28): its
+ * n_distinct times the range's own selectivity, at least one.
+ */
+static double
+lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
+				  Selectivity sel)
+{
+	return Max(1.0, lion_var_ndistinct(root, rel, var) * sel);
 }
 
 /*
@@ -2250,6 +2273,160 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
 	return (Var *) arg;
 }
 
+/*
+ * THE SUM OVER A RANGE (DESIGN.md §28, "The cost of a summed range"):
+ * `count(*) WHERE <range on k> [AND F]`, priced as lion_sumall_relation()
+ * runs it.
+ *
+ *	- ONE side of the range is walked: the entries it selects, or - when F
+ *	  has a positive source and k's directory is ordered - the entries below
+ *	  and above it, plus one count of F minus k's NULL entry (the complement).
+ *	  The executor takes the side with fewer leaves, and so does this.
+ *	- Each entry walked costs a fixed amount (LION_RANGE_ENTRY_COST for one
+ *	  counted on its own, LION_RANGE_UNION_ENTRY_COST for a small one counted
+ *	  with the rest of its leaf) plus its OWN containers - the rows of one key
+ *	  of k, not the rows that survive F: the entry drives its count when it is
+ *	  the smaller, and F is then probed at each of its container keys, so the
+ *	  key steps are the smaller of the two containers' worth, once for every
+ *	  source.  How many containers one key's rows lie in follows the column's
+ *	  correlation with the heap, as cost_index() interpolates pages.
+ *	- The leaves under the entries walked are read once each; with a
+ *	  complement to choose, both sides are first stepped a leaf at a time up
+ *	  to the smaller one's end, counting only (lion_range_choose()).
+ *	- The heap the visibility map cannot vouch for: F's candidates and the
+ *	  entries' for the complement, the entries' for the range, each page
+ *	  fetched at most twice (the per-entry revisits of DESIGN.md §28).
+ *
+ * Before this the walk was charged the range's entries at LION_RANGE_ENTRY_COST
+ * and ONE container each - the rows of the whole count spread over them - so a
+ * range over 2,000 keys of a thousand rows each beside a selective equality
+ * was priced at 1,344 for 920,000 containers, and a range over 1.9 million keys
+ * at 813,000 whether or not the keys outside it were a handful.
+ */
+static Cost lion_range_recheck(PlannerInfo *root, RelOptInfo *rel,
+								double tids, double entries, double corr);
+
+static Cost
+lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
+					AttrNumber groupcol, Var *rangevar, Selectivity rangesel,
+					List *whereclauses, List *wherekinds, List *ors)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		matching = Max(rel->rows, 1.0);
+	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		sel = Min(Max(rangesel, 1e-10), 1.0);
+	double		nd = lion_var_ndistinct(root, rel, rangevar);
+	double		nin = Max(1.0, nd * sel);
+	double		nout = Max(0.0, nd - nin);
+	double		rowsper = Max(tuples * sel / nin, 1.0);
+	double		corr = lion_var_correlation(root, rel, rangevar);
+	double		scattered = lion_containers_for(heap_pages, rowsper);
+	double		inorder = Max(1.0, rowsper * ckeys / tuples);
+	double		percont = scattered + (inorder - scattered) * corr * corr;
+	double		pageper;
+	double		frows = Min(tuples, matching / sel);
+	double		fcont = lion_containers_for(heap_pages, frows);
+	double		steps;
+	double		perentry;
+	int			nsrc = list_length(ors);
+	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
+	int			ci = 0;
+	bool		ordered;
+	Relation	indexrel;
+	ListCell   *lc;
+	Cost		inside;
+	Cost		outside;
+
+	/* The sources of F: one per OR restriction, one per positive clause. */
+	foreach(lc, wherekinds)
+	{
+		if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc)) && orgrp[ci] < 0)
+			nsrc++;
+		ci++;
+	}
+	pfree(orgrp);
+
+	indexrel = index_open(groupidx->indexoid, AccessShareLock);
+	ordered = lion_index_column_state(indexrel, groupcol)->ordered;
+	index_close(indexrel, AccessShareLock);
+
+	/*
+	 * One entry: its fixed cost, and its containers' key steps against every
+	 * source of F.  Small ones are counted a leaf at a time.
+	 */
+	steps = (nsrc > 0) ? Min(percont, fcont) * (1.0 + nsrc) : percont;
+	perentry = ((percont <= (double) LION_SUM_UNION_MAX_ITEMS) ?
+				LION_RANGE_UNION_ENTRY_COST : LION_RANGE_ENTRY_COST) +
+		steps * cpu_operator_cost * 2.0;
+
+	/* The leaves under one entry: its share of the column's pages. */
+	pageper = Max(1.0, (double) groupidx->pages *
+				  lion_index_column_share(root, rel, groupidx, groupcol)) / nd;
+
+	inside = nin * (perentry + pageper * seq_page_cost) +
+		lion_range_recheck(root, rel, matching * dirtyfrac, nin, corr);
+	if (nsrc == 0 || !ordered)
+		return inside;
+
+	/*
+	 * The complement: the entries outside, the count of F minus the NULL
+	 * entry (F's containers once more, and a descent), and F's candidates on
+	 * top of the outside entries' for the recheck.
+	 */
+	outside = nout * (perentry + pageper * seq_page_cost) +
+		fcont * (1.0 + nsrc) * cpu_operator_cost * 2.0 + random_page_cost +
+		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
+						   Max(nout, 1.0), corr);
+
+	/* ... and the leaf-by-leaf race that picks the side, counting only. */
+	return Min(inside, outside) +
+		2.0 * Min(nin, nout) * pageper * seq_page_cost;
+}
+
+/*
+ * The heap recheck of a range walk (DESIGN.md §28): `tids` candidates on the
+ * pages the visibility map cannot vouch for, counted `entries` at a time.  The
+ * visibility cache fetches a dirty page once per query - but it answers a page
+ * only from its second visit on, and each count flushes its own recheck batch,
+ * so a page that holds candidates of several entries is fetched for each of
+ * them until the cache has it: never more than twice, and never more often
+ * than the entries' candidates lie on pages.  How many pages one entry's
+ * candidates lie on follows the column's order, as cost_index() interpolates
+ * it with the correlation's square: one per row scattered, their share of the
+ * heap in order.
+ */
+static Cost
+lion_range_recheck(PlannerInfo *root, RelOptInfo *rel, double tids,
+				   double entries, double corr)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		dirtyfrac = 1.0 - rel->allvisfrac;
+	double		dirty_pages = Min(heap_pages * dirtyfrac, heap_pages);
+	double		rowsper;
+	double		scattered;
+	double		inorder;
+	double		perentry;
+	double		pages;
+
+	if (tids <= 0.0 || dirtyfrac <= 0.0)
+		return 0.0;
+
+	/* the candidates of one entry, dirty pages or not */
+	rowsper = tids / dirtyfrac / Max(entries, 1.0);
+	scattered = Min(rowsper, heap_pages);
+	inorder = Max(1.0, rowsper * heap_pages / tuples);
+	perentry = scattered + (inorder - scattered) * corr * corr;
+
+	pages = Min(tids, dirty_pages);
+	pages = Min(Min(tids, entries * perentry * dirtyfrac), 2.0 * pages);
+
+	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
+		tids * cpu_tuple_cost;
+}
+
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -2258,7 +2435,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *wherekinds,
 				   List *ors, double numgroups,
 				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar)
+				   double drivefrac, Var *rangevar, bool rangesum)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -2299,10 +2476,25 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	int			inlistci;
 	double		ingroups = numgroups;	/* groups the node really emits */
 	double		recheckshare = 1.0; /* §26: what the existence tests recheck */
+	Cost		rangecost = 0;	/* §28: the walk of a summed range */
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
 	ListCell   *lc4;
+
+	/*
+	 * A sum over a range (DESIGN.md §28) prices its walk, its entries and its
+	 * heap recheck itself (lion_cost_range_sum()); what is left here is the
+	 * WHERE sources, located once and read once - materialized after their
+	 * first use - and the one row.
+	 */
+	if (rangesum)
+	{
+		rangecost = lion_cost_range_sum(root, rel, groupidx, groupcol,
+										rangevar, drivefrac, whereclauses,
+										wherekinds, ors);
+		ingroups = 1.0;
+	}
 
 	/*
 	 * A count(DISTINCT k) without a GROUP BY walks k's entries, and a WHERE
@@ -2653,8 +2845,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		if (pages <= 0.0)
 			continue;			/* a negated clause, or nothing to read */
 
-		if (clausesrc[i] < 0 || clausesrc[i] == driver)
-			seq_pages += pages; /* walked: the driver, and a group's own list */
+		if (clausesrc[i] < 0 || clausesrc[i] == driver || rangesum)
+			seq_pages += pages; /* walked: the driver, a group's own list,
+								 * and what a range's entries are ANDed with */
 		else
 		{
 			pages = Min(pages,
@@ -2678,9 +2871,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * The entry scan of the driving index - unless an IN list on that very
 	 * column drives the groups instead (DESIGN.md §15), in which case its
 	 * elements' lookups and containers, charged above, ARE the per-group work
-	 * and the index's entries are never walked.
+	 * and the index's entries are never walked.  A summed range has priced its
+	 * walk already.
 	 */
-	if (groupidx != NULL && !groupdrive)
+	if (groupidx != NULL && !groupdrive && !rangesum)
 	{
 		/*
 		 * The entry scan walks ONE key column's entries and stops at the first
@@ -2822,6 +3016,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	recheck_tids = matching * dirtyfrac * recheckshare;
 	recheck_pages = Min(recheck_tids, dirty_pages);
 
+	/* A summed range has priced its own (lion_cost_range_sum()). */
+	if (rangesum)
+		recheck_tids = recheck_pages = 0.0;
+
 	/*
 	 * ... except that a RANGE-bounded walk (DESIGN.md §28) does not visit a
 	 * dirty page once per query: it counts entry by entry, each count flushes
@@ -2897,6 +3095,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += recheck_tids * cpu_tuple_cost;
 	run += ingroups * cpu_tuple_cost;
 	run += pair_cost;
+	run += rangecost;
 
 	return run;
 }
@@ -2914,7 +3113,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, List *ors,
 					double numgroups, double outer_entries,
 					double inner_entries, double outrows, int distinct,
-					bool ranged, double drivefrac)
+					int ranged, double drivefrac)
 {
 	Cost		run = 0;
 	ListCell   *lc;
@@ -2922,6 +3121,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	foreach(lc, targets)
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		Var		   *rangevar = (ranged != LION_RANGED_NONE) ?
+			t->drivevar[0] : NULL;
 
 		run += lion_cost_count_rel(root, t->rel,
 								  t->driveidx[0], t->drivecol[0],
@@ -2929,17 +3130,20 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
 								  outer_entries, inner_entries, distinct,
-								  drivefrac, ranged ? t->drivevar[0] : NULL);
+								  drivefrac, rangevar,
+								  ranged == LION_RANGED_SUM && rangevar != NULL &&
+								  t->driveidx[0] != NULL);
 
 		/*
-		 * A range-bounded walk (DESIGN.md §28) pays a fixed cost per entry it
-		 * visits, in each relation it walks - a partition's entries are its
-		 * own.  A count(DISTINCT) walk already pays its per-test cost for
-		 * each of them (§26), which is the same work.
+		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
+		 * entry it visits, in each relation it walks - a partition's entries
+		 * are its own.  A count(DISTINCT) walk already pays its per-test cost
+		 * for each of them (§26), which is the same work, and a summed range
+		 * has priced its entries in lion_cost_range_sum().
 		 */
-		if (ranged && distinct == LION_DISTINCT_NONE &&
-			t->drivevar[0] != NULL)
-			run += lion_range_entries(root, t->rel, t->drivevar[0],
+		if (ranged == LION_RANGED_WALK && distinct == LION_DISTINCT_NONE &&
+			rangevar != NULL)
+			run += lion_range_entries(root, t->rel, rangevar,
 									  drivefrac) * LION_RANGE_ENTRY_COST;
 	}
 
@@ -5181,7 +5385,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						(distvar == NULL) ? LION_DISTINCT_NONE :
 						distcounts ? LION_DISTINCT_COUNT :
 						LION_DISTINCT_EXISTS,
-						rangevar != NULL, rangesel);
+						(rangevar == NULL) ? LION_RANGED_NONE :
+						sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
+						rangesel);
 
 	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
