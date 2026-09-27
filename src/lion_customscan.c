@@ -382,10 +382,22 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  */
 #define LION_RANGE_UNION_ENTRY_COST	(12.0 * cpu_tuple_cost)
 
+/*
+ * The descents a summed walk over a summarized column makes on top of the
+ * first (DESIGN.md §31): the walk of a side is up to three phases - the keys
+ * below its first whole bucket, the whole buckets' summaries, the keys above
+ * its last - and each phase after the first starts with a descent of its own
+ * to where it begins, a root-to-leaf read each.
+ */
+#define LION_SUMMARY_PHASE_DESCENTS	2.0
+
 /* Which walk a range bounds, for the cost model (DESIGN.md §28). */
 #define LION_RANGED_NONE	0
 #define LION_RANGED_WALK	1	/* a GROUP BY or count(DISTINCT) walk */
 #define LION_RANGED_SUM		2	/* the sum over the range's entries */
+#define LION_RANGED_SUMALL	3	/* the sum over every entry, `k IS NOT NULL`
+								 * alone (§14): priced as a range over all of
+								 * k when k has summaries (§31) */
 
 /*
  * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
@@ -2201,6 +2213,23 @@ lion_containers_for(double heap_pages, double members)
 }
 
 /*
+ * Does key column col of idx have summary posting sets (DESIGN.md §31)?  What
+ * the index's meta page says, read through its cached state as a count reads
+ * it; a column built without them has none until the next REINDEX.
+ */
+static bool
+lion_index_col_summarized(IndexOptInfo *idx, AttrNumber col)
+{
+	Relation	indexrel;
+	bool		summarized;
+
+	indexrel = index_open(idx->indexoid, AccessShareLock);
+	summarized = lion_index_column_state(indexrel, col)->summarized;
+	index_close(indexrel, AccessShareLock);
+	return summarized;
+}
+
+/*
  * The share of an intersection's work an EXISTENCE test does (DESIGN.md §26).
  *
  * The test stops at the first container that shows a visible row.  An
@@ -2537,6 +2566,10 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
  *	  key steps are the smaller of the two containers' worth, once for every
  *	  source.  How many containers one key's rows lie in follows the column's
  *	  correlation with the heap, as cost_index() interpolates pages.
+ *	- When k has SUMMARIES (DESIGN.md §31), a side that covers whole buckets
+ *	  walks only the keys of the buckets at its ends, entry by entry, and
+ *	  counts each whole bucket's summary once instead of its keys
+ *	  (lion_cost_range_side()).
  *	- The leaves under the entries walked are read once each; with a
  *	  complement to choose, both sides are first stepped a leaf at a time up
  *	  to the smaller one's end, counting only (lion_range_choose()).
@@ -2551,7 +2584,61 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
  * at 813,000 whether or not the keys outside it were a handful.
  */
 static Cost lion_range_recheck(PlannerInfo *root, RelOptInfo *rel,
-								double tids, double entries, double corr);
+							   double tids, double entries, double corr);
+
+/*
+ * A summarized column (DESIGN.md §31), as the cost of a walk over it sees it:
+ * how many keys one bucket holds, and what one bucket's summary costs to
+ * count and to read.
+ */
+typedef struct LionSumModel
+{
+	double		keysper;		/* keys of k in one bucket */
+	double		persum;			/* one summary's count: fixed + containers */
+	double		sumpages;		/* ... and the pages it reads */
+} LionSumModel;
+
+/*
+ * What one side of a summed range walk costs (DESIGN.md §28, §31): nkeys
+ * entries of k in one run, each `perentry` and `pageper` pages - or, when k is
+ * summarized (sum != NULL), the keys of the partial buckets at the run's
+ * `nedges` ends one by one and each bucket it covers whole as ONE count of
+ * its summary.  A run of n keys over buckets of `keysper` keys covers about
+ * n / keysper - 1 of them whole when both its ends fall inside a bucket: half
+ * a bucket is left over at each end on average.  With no whole bucket the
+ * executor walks the keys as it always did (lion_entry_scan_plan_sum()), and
+ * so does this.
+ *
+ * *counts is how many counts the side makes - entries and summaries - which
+ * is what the heap recheck is spread over; *pages is what it reads.
+ */
+static Cost
+lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
+					 double perentry, double pageper, double *counts,
+					 double *pages)
+{
+	double		whole = 0.0;
+	double		edgekeys;
+	Cost		cost;
+
+	if (sum != NULL)
+		whole = Max(0.0, nkeys / sum->keysper - 0.5 * nedges);
+	if (whole < 1.0)
+	{
+		*counts = nkeys;
+		*pages = nkeys * pageper;
+		return nkeys * (perentry + pageper * seq_page_cost);
+	}
+
+	edgekeys = Max(0.0, nkeys - whole * sum->keysper);
+	*counts = edgekeys + whole;
+	*pages = edgekeys * pageper + whole * sum->sumpages;
+	cost = edgekeys * (perentry + pageper * seq_page_cost) +
+		whole * (sum->persum + sum->sumpages * seq_page_cost);
+
+	/* the phases after the first each start with a descent of their own */
+	return cost + LION_SUMMARY_PHASE_DESCENTS * random_page_cost;
+}
 
 static Cost
 lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
@@ -2580,9 +2667,18 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	int			nsrc = list_length(ors);
 	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
 	int			ci = 0;
+	LionState  *colstate;
 	bool		ordered;
+	bool		summarized;
+	uint32		bucket_tids;
 	Relation	indexrel;
 	ListCell   *lc;
+	LionSumModel summodel;
+	LionSumModel *sum = NULL;
+	double		incounts;
+	double		inpages;
+	double		outcounts;
+	double		outpages;
 	Cost		inside;
 	Cost		outside;
 
@@ -2596,7 +2692,10 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	pfree(orgrp);
 
 	indexrel = index_open(groupidx->indexoid, AccessShareLock);
-	ordered = lion_index_column_state(indexrel, groupcol)->ordered;
+	colstate = lion_index_column_state(indexrel, groupcol);
+	ordered = colstate->ordered;
+	summarized = colstate->summarized;
+	bucket_tids = lion_get_index_state(indexrel)->meta.summary_tids;
 	index_close(indexrel, AccessShareLock);
 
 	/*
@@ -2612,24 +2711,53 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	pageper = Max(1.0, (double) groupidx->pages *
 				  lion_index_column_share(root, rel, groupidx, groupcol)) / nd;
 
-	inside = nin * (perentry + pageper * seq_page_cost) +
-		lion_range_recheck(root, rel, matching * dirtyfrac, nin, corr);
+	/*
+	 * The summaries (DESIGN.md §31).  A bucket closes at the first key that
+	 * brings it to summary_tids rows, so it holds that many rows - or one
+	 * key's, when a key alone has more - and bucketrows / rowsper keys.  Its
+	 * summary is ONE set of those rows, which lies in as many containers as
+	 * that many rows spread over the heap as the column's order says, and
+	 * takes about the bytes of its keys' sets with the containers they share
+	 * merged: their pages, scaled by the containers the union saves.  It is
+	 * counted on its own (LION_RANGE_ENTRY_COST), as a large entry is.
+	 */
+	if (summarized && ordered && bucket_tids > 0)
+	{
+		double		bucketrows = Max((double) bucket_tids, rowsper);
+		double		sscattered = lion_containers_for(heap_pages, bucketrows);
+		double		sinorder = Max(1.0, bucketrows * ckeys / tuples);
+		double		sc = sscattered + (sinorder - sscattered) * corr * corr;
+		double		ssteps = (nsrc > 0) ? Min(sc, fcont) * (1.0 + nsrc) : sc;
+
+		summodel.keysper = Max(1.0, bucketrows / rowsper);
+		summodel.persum = LION_RANGE_ENTRY_COST +
+			ssteps * cpu_operator_cost * 2.0;
+		summodel.sumpages = Max(1.0, summodel.keysper * pageper *
+								Min(1.0, sc / (summodel.keysper * percont)));
+		sum = &summodel;
+	}
+
+	inside = lion_cost_range_side(nin, 2.0, sum, perentry, pageper,
+								  &incounts, &inpages) +
+		lion_range_recheck(root, rel, matching * dirtyfrac, incounts, corr);
 	if (nsrc == 0 || !ordered)
 		return inside;
 
 	/*
-	 * The complement: the entries outside, the count of F minus the NULL
-	 * entry (F's containers once more, and a descent), and F's candidates on
-	 * top of the outside entries' for the recheck.
+	 * The complement: the entries outside - a run at each end of the column,
+	 * with a partial bucket at the range's side of each - the count of F minus
+	 * the NULL entry (F's containers once more, and a descent), and F's
+	 * candidates on top of the outside entries' for the recheck.
 	 */
-	outside = nout * (perentry + pageper * seq_page_cost) +
+	outside = lion_cost_range_side(nout, 2.0, sum, perentry, pageper,
+								   &outcounts, &outpages) +
 		fcont * (1.0 + nsrc) * cpu_operator_cost * 2.0 + random_page_cost +
 		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
-						   Max(nout, 1.0), corr);
+						   Max(outcounts, 1.0), corr);
 
 	/* ... and the leaf-by-leaf race that picks the side, counting only. */
 	return Min(inside, outside) +
-		2.0 * Min(nin, nout) * pageper * seq_page_cost;
+		2.0 * Min(inpages, outpages) * seq_page_cost;
 }
 
 /*
@@ -3368,8 +3496,28 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	foreach(lc, targets)
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
-		Var		   *rangevar = (ranged != LION_RANGED_NONE) ?
-			t->drivevar[0] : NULL;
+		int			tranged = ranged;
+		double		tfrac = drivefrac;
+		Var		   *rangevar;
+
+		/*
+		 * The sum over every entry of a summarized column (DESIGN.md §31) is
+		 * the sum over its summaries: a range over all of it, and priced as
+		 * one.  Without summaries - in this relation: partitions differ - it
+		 * is the walk over every entry it always was.
+		 */
+		if (tranged == LION_RANGED_SUMALL)
+		{
+			if (t->driveidx[0] != NULL &&
+				lion_index_col_summarized(t->driveidx[0], t->drivecol[0]))
+			{
+				tranged = LION_RANGED_SUM;
+				tfrac = 1.0;
+			}
+			else
+				tranged = LION_RANGED_NONE;
+		}
+		rangevar = (tranged != LION_RANGED_NONE) ? t->drivevar[0] : NULL;
 
 		run += lion_cost_count_rel(root, t->rel,
 								  t->driveidx[0], t->drivecol[0],
@@ -3377,8 +3525,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  t->whereidx, t->wherecol,
 								  whereclauses, wherekinds, ors, numgroups,
 								  outer_entries, inner_entries, distinct,
-								  drivefrac, rangevar,
-								  ranged == LION_RANGED_SUM && rangevar != NULL &&
+								  tfrac, rangevar,
+								  tranged == LION_RANGED_SUM && rangevar != NULL &&
 								  t->driveidx[0] != NULL);
 
 		/*
@@ -3388,10 +3536,10 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		 * for each of them (§26), which is the same work, and a summed range
 		 * has priced its entries in lion_cost_range_sum().
 		 */
-		if (ranged == LION_RANGED_WALK && distinct == LION_DISTINCT_NONE &&
+		if (tranged == LION_RANGED_WALK && distinct == LION_DISTINCT_NONE &&
 			rangevar != NULL)
 			run += lion_range_entries(root, t->rel, rangevar,
-									  drivefrac) * LION_RANGE_ENTRY_COST;
+									  tfrac) * LION_RANGE_ENTRY_COST;
 	}
 
 	cpath->path.rows = outrows;
@@ -6488,7 +6636,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						(distvar == NULL) ? LION_DISTINCT_NONE :
 						distcounts ? LION_DISTINCT_COUNT :
 						LION_DISTINCT_EXISTS,
-						(rangevar == NULL) ? LION_RANGED_NONE :
+						(rangevar == NULL) ?
+						((sumall && distvar == NULL) ? LION_RANGED_SUMALL :
+						 LION_RANGED_NONE) :
 						sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
 						rangesel);
 
