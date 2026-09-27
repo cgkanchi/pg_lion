@@ -289,18 +289,16 @@ SELECT lion_plans('SELECT n, count(*) FROM lion_pdt GROUP BY n');
 (8 rows)
 
 SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE n IS NULL');
-                 lion_plans                  
----------------------------------------------
+                  lion_plans                   
+-----------------------------------------------
  -- on:
  Custom Scan (LionCount)
    Lion Indexes: lion_pdt_n (n IS NULL)
  -- off:
  Aggregate
-   ->  Bitmap Heap Scan on lion_pdt
-         Recheck Cond: (n IS NULL)
-         ->  Bitmap Index Scan on lion_pdt_n
-               Index Cond: (n IS NULL)
-(9 rows)
+   ->  Index Scan using lion_pdt_n on lion_pdt
+         Index Cond: (n IS NULL)
+(7 rows)
 
 -- ---- shapes that must push down ----------------------------------------
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3');
@@ -1435,15 +1433,15 @@ SELECT lion_plans('SELECT v, count(*) FROM lion_pdn GROUP BY v');
 
 RESET enable_sort;
 SELECT lion_plans('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
-                  lion_plans                   
------------------------------------------------
+               lion_plans               
+----------------------------------------
  -- on:
  Custom Scan (LionCount)
    Lion Indexes: lion_pdn_v (v = 1.000)
  -- off:
  Aggregate
-   ->  Index Scan using lion_pdn_v on lion_pdn
-         Index Cond: (v = 1.000)
+   ->  Seq Scan on lion_pdn
+         Filter: (v = 1.000)
 (7 rows)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdn WHERE v = 1.000');

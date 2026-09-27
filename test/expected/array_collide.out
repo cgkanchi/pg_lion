@@ -134,13 +134,11 @@ SET enable_seqscan = off;
 SET pg_lion.enable_count_pushdown = off;
 EXPLAIN (COSTS OFF) SELECT id FROM lion_coll8
 	WHERE a @> ARRAY[lion_samehash(1), lion_samehash(2)];
-                           QUERY PLAN                           
-----------------------------------------------------------------
- Bitmap Heap Scan on lion_coll8
-   Recheck Cond: (a @> '{4294967297,8589934594}'::bigint[])
-   ->  Bitmap Index Scan on lion_coll8_a
-         Index Cond: (a @> '{4294967297,8589934594}'::bigint[])
-(4 rows)
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Index Scan using lion_coll8_a on lion_coll8
+   Index Cond: (a @> '{4294967297,8589934594}'::bigint[])
+(2 rows)
 
 RESET enable_seqscan;
 RESET pg_lion.enable_count_pushdown;
