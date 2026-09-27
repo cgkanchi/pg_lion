@@ -3425,7 +3425,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		 */
 		run += lion_cost_recheck(root, t->rel, t->whereidx, t->wherecol,
 								 whereclauses, wherekinds, ors,
-								 t->rel->rows, numgroups, t->rel->tuples);
+								 lion_probe_rel_rows(root, t->rel), numgroups,
+								 t->rel->tuples);
 
 		/*
 		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
