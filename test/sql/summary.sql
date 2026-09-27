@@ -12,6 +12,7 @@
 SET client_min_messages = warning;
 LOAD 'pg_lion';
 CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
 RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
@@ -237,11 +238,21 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k >= 0');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k > 41');
 
 -- ---------- 7. old format: an index without summaries, and REINDEX ----------
+-- The format version, read off the meta page (block 0: LionMetaPageData
+-- follows the 24-byte page header, with its version at +4), and how many key
+-- columns have summaries.
+CREATE FUNCTION lion_sm_meta(idx regclass, OUT version int, OUT summary_cols int)
+LANGUAGE sql AS $$
+	SELECT get_byte(p, 28) | (get_byte(p, 29) << 8),
+		   (SELECT count(*)::int FROM lion_index_stats(idx) s WHERE s.summary_entries > 0)
+	  FROM get_raw_page(idx::text, 0) p
+$$;
 CREATE TABLE lion_sm_old (u int NOT NULL, g int NOT NULL);
 INSERT INTO lion_sm_old SELECT i, i % 5 FROM generate_series(1, 5000) i;
 -- summaries = off is the default, and writes format 6, as every index before
 CREATE INDEX lion_sm_old_u ON lion_sm_old USING lion (u, g);
 VACUUM (FREEZE, ANALYZE) lion_sm_old;
+SELECT * FROM lion_sm_meta('lion_sm_old_u');
 SELECT attno, summary_entries FROM lion_index_stats('lion_sm_old_u');
 SELECT lion_sm('SELECT count(*) FROM lion_sm_old WHERE u >= 100 AND g = 2');
 SELECT lion_sm('SELECT count(*) FROM lion_sm_old WHERE u BETWEEN 100 AND 4000');
@@ -252,6 +263,7 @@ INSERT INTO lion_sm_old SELECT i, i % 5 FROM generate_series(5001, 5100) i;
 SELECT attno, summary_entries FROM lion_index_stats('lion_sm_old_u');
 SELECT lion_sm('SELECT count(*) FROM lion_sm_old WHERE u >= 100 AND g = 2');
 REINDEX INDEX lion_sm_old_u;
+SELECT * FROM lion_sm_meta('lion_sm_old_u');
 SELECT attno, summary_entries > 0 AS has FROM lion_index_stats('lion_sm_old_u');
 SELECT lion_index_verify('lion_sm_old_u', true);
 SELECT lion_sm('SELECT count(*) FROM lion_sm_old WHERE u >= 100 AND g = 2');
@@ -259,7 +271,9 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm_old WHERE u BETWEEN 100 AND 4000');
 -- ... and off again
 ALTER INDEX lion_sm_old_u SET (summaries = off);
 REINDEX INDEX lion_sm_old_u;
+SELECT * FROM lion_sm_meta('lion_sm_old_u');
 SELECT attno, summary_entries FROM lion_index_stats('lion_sm_old_u');
+DROP FUNCTION lion_sm_meta(regclass);
 
 -- ---------- 8. auto: the build decides per column from the data ----------
 CREATE TABLE lion_sm_auto (u int NOT NULL, g int NOT NULL, b bool, e int[]);
