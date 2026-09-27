@@ -2101,11 +2101,27 @@ lion_scankey_list_length(LionState *col, ScanKey skey)
 }
 
 /*
- * About how many posting pages the located sets fill - what one stream over
- * them reads at most (an AND leapfrogs past some of it).  Each set's ntids
- * and ncontainers are its entry's own hints; a container's members take two
+ * About how many posting pages one located set fills.  Its ntids and
+ * ncontainers are its entry's own hints; a container's members take two
  * bytes each up to LION_BITSET_BYTES.  An INLINE set is inside its entry and
  * reads no page of its own.
+ */
+static double
+lion_source_set_pages(LionPostingSet *ps)
+{
+	double		bytes;
+
+	if (!ps->found || ps->is_inline)
+		return 0.0;
+	bytes = Min(2.0 * (double) ps->ntids,
+				(double) LION_BITSET_BYTES * ps->ncontainers) +
+		(double) LION_CONTAINER_HDRSZ * ps->ncontainers;
+	return Max(1.0, ceil(bytes / BLCKSZ));
+}
+
+/*
+ * About how many posting pages the located sets fill - what one stream over
+ * them reads at most (an AND leapfrogs past some of it).
  */
 static double
 lion_source_rest_pages(LionSource *src)
@@ -2114,28 +2130,54 @@ lion_source_rest_pages(LionSource *src)
 	int			i;
 
 	for (i = 0; i < src->nsets; i++)
-	{
-		LionPostingSet *ps = &src->sets[i];
-		double		bytes;
-
-		if (!ps->found || ps->is_inline)
-			continue;
-		bytes = Min(2.0 * (double) ps->ntids,
-					(double) LION_BITSET_BYTES * ps->ncontainers) +
-			(double) LION_CONTAINER_HDRSZ * ps->ncontainers;
-		pages += Max(1.0, ceil(bytes / BLCKSZ));
-	}
+		pages += lion_source_set_pages(&src->sets[i]);
 	return pages;
 }
 
 /*
+ * What restarting the located sets' stream for one walked entry of ntids
+ * TIDs reads: of each set, a descent, and then the posting pages that hold
+ * its containers at the entry's container keys - at most one page per TID of
+ * the entry, and at most the set's own pages.  An entry of a few rows costs a
+ * descent of each posting tree; an entry spread over the heap, which is
+ * every entry of a low-cardinality column, costs reading the sets whole.  At
+ * least 1, so that a walk beside INLINE sets alone is counted in entries.
+ */
+static double
+lion_source_restart_pages(LionSource *src, double ntids)
+{
+	double		pages = 0.0;
+	int			i;
+
+	for (i = 0; i < src->nsets; i++)
+	{
+		double		setpages = lion_source_set_pages(&src->sets[i]);
+
+		if (setpages > 0.0)
+			pages += Max(1.0, Min(setpages, ntids));
+	}
+	return Max(1.0, pages);
+}
+
+/*
  * Is the walk of col, beside the other columns' sets, too long to restart
- * their stream for every entry (§29.3)?  A restart costs a descent of each of
- * their posting trees; the WINDOW shape instead reads their posting pages
- * once and walks the range once per window.  So a walk is long when it has
- * more entries than those sets have posting pages, and at least
- * LION_WALK_SHORT: counted here, from the directory leaves alone, and never
- * further than that.
+ * their stream for every entry (§29.3)?  The WINDOW shape reads their posting
+ * pages once and walks the range once per window; the entry-by-entry WALK
+ * restarts their stream for every entry, which reads what
+ * lion_source_restart_pages() says.  So a walk is long when its restarts
+ * would read more than those sets' posting pages, and than LION_WALK_SHORT:
+ * counted here, from the directory leaves alone - each entry's ntids is in
+ * its header - and never further than that.
+ *
+ * The first version counted ENTRIES against the posting pages, a restart
+ * being a descent of each posting tree.  That holds for a column of a few
+ * rows per key; each key of a low-cardinality column has rows at nearly every
+ * container key, so each restart streamed the other columns' sets over the
+ * whole heap.  `pc < 100` (100 keys of 4000 rows each) beside four such sets
+ * over 8M rows was walked entry by entry and took 10.8 s where the bitmap
+ * scan took 0.77 s; as a WINDOW it takes 0.39 s (2026-09-27; on a much
+ * larger table an always-true range of a few thousand keys beside four such
+ * sets did not finish in 60 s).
  */
 #define LION_WALK_SHORT		16
 
@@ -2144,19 +2186,20 @@ lion_source_walk_is_long(LionSource *src, LionState *col)
 {
 	LionLeafWalk w;
 	Size		itemlen;
+	LionEntryTuple *entry;
 	double		limit = Max((double) LION_WALK_SHORT, lion_source_rest_pages(src));
-	double		n = 0.0;
+	double		restarts = 0.0;
 	MemoryContext oldcxt = MemoryContextSwitchTo(src->entrycxt);
 
 	lion_walk_begin(&w, src->index, col, false, src->ranges, src->nranges,
 					false);
-	while (n <= limit && lion_walk_next(&w, &itemlen) != NULL)
-		n += 1.0;
+	while (restarts <= limit && (entry = lion_walk_next(&w, &itemlen)) != NULL)
+		restarts += lion_source_restart_pages(src, (double) entry->ntids);
 	lion_walk_end(&w);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(src->entrycxt);
 
-	return n > limit;
+	return restarts > limit;
 }
 
 /*
