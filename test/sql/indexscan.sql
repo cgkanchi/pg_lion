@@ -344,9 +344,11 @@ DROP TABLE lis_mem;
 SELECT lion_iq('SELECT count(*), sum(id) FROM lis_big WHERE b = 1');
 
 -- ---------- 6. plan choice with nothing disabled ----------
--- Narrow rows, many to a page: a one-row lookup goes to the plain scan; a
--- key of a few hundred scattered rows goes to the bitmap at the default
--- work_mem and to the plain scan when the bitmap would be lossy.
+-- Narrow rows, many to a page: a one-row lookup goes to the plain scan, and
+-- so does a key of two thousand scattered rows, about one to a page, whose
+-- pages the plain scan reads in heap order as the bitmap scan does and
+-- without building the bitmap (DESIGN.md §29.11: 2.2 ms against 2.75); at a
+-- work_mem that makes the bitmap lossy all the more.
 CREATE TABLE lis_f (id int, k int, u int);
 INSERT INTO lis_f SELECT i, (i::int8 * 7919 % 300)::int, i FROM generate_series(1, 600000) i;
 CREATE INDEX lis_f_k ON lis_f USING lion (k);
@@ -650,7 +652,8 @@ COMMIT;
 -- every a pays for its own walk (DESIGN.md §29.11) where it was prorated by
 -- b's selectivity too, and goes to the sequential scan rather than to a
 -- bitmap scan half as slow again; `a IS NOT NULL AND b = 5` is priced by b
--- alone and goes to the bitmap scan
+-- alone, and its plain scan, b's rows in heap order with a rechecked, goes
+-- ahead of the bitmap scan that reads the same pages (1.5 ms against 1.7)
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 5000 AND b = 5');
 SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 190000 AND b = 5');
