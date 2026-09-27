@@ -448,6 +448,56 @@ SELECT lion_mk_par('SELECT d.attr, count(*) FROM lion_mk_pd d WHERE EXISTS (SELE
 SELECT lion_mk_par('SELECT count(*) FROM lion_mk_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.tsv @@ $1)', '''w1 <-> x1''');
 SELECT lion_mk_par('SELECT d.attr, count(*) FROM lion_mk_pf f JOIN lion_mk_pd d ON f.fk = d.pk WHERE f.tsv @@ to_tsquery(''simple'', $1) GROUP BY d.attr', '''w2 & !x2''');
 SELECT lion_mk_par('SELECT count(DISTINCT d.attr) FROM lion_mk_pd d WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.tags && $1)', '''{t5,NULL}''');
+-- an IN list whose length the plan does not know, evaluated by every
+-- participant (DESIGN.md §27): a parameter, one longer than a batch of the
+-- list pin budget, and the ARRAY[] a generic plan keeps for IN ($1, $2)
+SELECT lion_mk_par('SELECT d.attr, count(*) FROM lion_mk_pd d WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.x = ANY ($1)) GROUP BY d.attr', '''{1,3,5}''');
+SELECT lion_mk_par('SELECT d.attr, count(*) FROM lion_mk_pd d WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.x = ANY ($1)) GROUP BY d.attr', 'NULL');
+SELECT lion_mk_par('SELECT d.attr, count(*) FROM lion_mk_pd d WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.fk = ANY ($1)) GROUP BY d.attr', (SELECT quote_literal(array_agg(i)::text) FROM generate_series(1, 3000, 2) i));
+SELECT lion_mk_par('SELECT count(*) FROM lion_mk_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.x IN ($1, $2))', '4, 7');
+SET lion_mk.xs = '2,4,6';
+SELECT lion_mk_par($$SELECT d.attr, count(*) FROM lion_mk_pd d WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.x = ANY (string_to_array(current_setting('lion_mk.xs'), ',')::int[])) GROUP BY d.attr$$, '');
+RESET lion_mk.xs;
+
+/*
+ * The 1500 values of the long list have an entry each, and at a work_mem of
+ * 64 kB their cursors do not fit the open budget together: a count takes
+ * such a list in batches, and the copy of the fact filters reads it as a
+ * windowed union instead - once, before the first dimension row - where it
+ * used to give up on the copy and read the list again at every count
+ * (DESIGN.md §27).
+ */
+CREATE FUNCTION lion_mk_analyze(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+SET max_parallel_workers_per_gather = 0;
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET work_mem = '64kB';
+PREPARE lion_mk_long(int[]) AS SELECT d.attr, count(*) FROM lion_mk_pd d
+	WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.fk = ANY ($1))
+	GROUP BY d.attr;
+SELECT count(*) FILTER (WHERE p ~ 'Fact Filters: collected once') AS planned_to_collect,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Rows Collected: [0-9]') AS collected
+FROM lion_mk_analyze(format('EXECUTE lion_mk_long(%L)',
+							(SELECT array_agg(i)::text
+							   FROM generate_series(1, 3000, 2) i))) AS e(p);
+SELECT lion_mk_par('SELECT d.attr, count(*) FROM lion_mk_pd d WHERE EXISTS (SELECT 1 FROM lion_mk_pf f WHERE f.fk = d.pk AND f.fk = ANY ($1)) GROUP BY d.attr', (SELECT quote_literal(array_agg(i)::text) FROM generate_series(1, 3000, 2) i));
+DEALLOCATE lion_mk_long;
+RESET work_mem;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+RESET plan_cache_mode;
+DROP FUNCTION lion_mk_analyze(text);
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;

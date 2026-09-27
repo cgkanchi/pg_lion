@@ -3633,7 +3633,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	int		   *orgrp = lion_or_group_map(ors, nclause);
 	int			nsrc = list_length(ors);
 	double	   *srcsets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	double	   *srcprobesets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
 	double	   *srcmembers = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	double		probesets;
 	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		nd;
 	double		perkey;
@@ -3712,9 +3714,11 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		}
 
 		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		probesets = 0.0;
 		if (IsA(clause, ScalarArrayOpExpr))
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+			Node	   *array = lion_strip((Node *) lsecond(saop->args));
 
 #if PG_VERSION_NUM >= 170000
 			nkeys = Max(estimate_array_length(root,
@@ -3724,10 +3728,28 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 			nkeys = Max(estimate_array_length((Node *) lsecond(saop->args)),
 						1.0);
 #endif
+
+			/*
+			 * An array whose length the planner cannot see - a parameter; an
+			 * expression comes here as its plan-time estimate
+			 * (lion_analyze_leaf()) - is located and collected once for
+			 * whatever it turns out to hold, and priced once at
+			 * estimate_array_length()'s guess.  But a count that PROBES the
+			 * filters builds its union again per dimension row, so there it
+			 * is priced as the longest list a literal may be: underpricing a
+			 * scan's one-off work costs a little, underpricing a dimension
+			 * row's costs that many times over (the 2026-09-23 review's
+			 * 43,000 values over 20,000 dimension rows ran for minutes).
+			 */
+			if (array == NULL ||
+				(!IsA(array, Const) && !IsA(array, ArrayExpr)))
+				probesets = Max(nkeys, (double) LION_MAX_ARRAY_ELEMS);
 		}
 		else if (kind == LION_CLAUSE_MULTI)
 			nkeys = lion_multikey_nkeys(idx, (AttrNumber) lfirst_int(lc4),
 										clause);
+		if (probesets <= 0.0)
+			probesets = nkeys;
 
 		/*
 		 * Which source of the AND the clause's sets belong to: its OR's, or
@@ -3739,6 +3761,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		 */
 		sno = (orgrp[ci] >= 0) ? orgrp[ci] : nsrc + ci;
 		srcsets[sno] += nkeys;
+		srcprobesets[sno] += probesets;
 		srcmembers[sno] += tuples * ((kind == LION_CLAUSE_MULTI) ?
 									 Min(sel * nkeys, 1.0) : sel);
 		ci++;
@@ -3774,21 +3797,21 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		call = lion_containers_for(heap_pages, srcmembers[sno]);
 		cs = Min(cfk, call);
 		probes += cs;
-		if (srcsets[sno] > 1.0)
-		{
+		if (srcprobesets[sno] > 1.0)
 			probed += dimrows *
-				(srcsets[sno] * LION_FKJOIN_SET_COST +
-				 lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
+				(srcprobesets[sno] * LION_FKJOIN_SET_COST +
+				 lion_merge_ops(heap_pages, srcmembers[sno], srcprobesets[sno]) *
 				 Min(cs / ckeys, 1.0) * readshare * cpu_operator_cost);
+		if (srcsets[sno] > 1.0)
 			collected += srcsets[sno] * LION_FKJOIN_SET_COST +
 				lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
 				cpu_operator_cost;
-		}
 		if (drive < 0.0 || call < drive)
 			drive = call;
 	}
 	pfree(orgrp);
 	pfree(srcsets);
+	pfree(srcprobesets);
 	pfree(srcmembers);
 
 	probed += dimrows * probes * readshare * LION_FKJOIN_PROBE_COST;
@@ -5330,23 +5353,21 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * An IN list whose array is a parameter - or any other expression that
-	 * is not a literal list - has no length until the executor has it (§15),
-	 * and every count of this node rebuilds the list's union - so its work
-	 * per dimension row is proportional to a length the cost model cannot
-	 * see.  A single table answers such a list once; here a 43,000-value `=
+	 * An IN list whose array is a parameter, or any other expression that is
+	 * not a literal list, has no length until the executor has it (§15).  It
+	 * used to be refused here, because a count that reads the fact filters
+	 * rebuilds the list's union per dimension row, and a 43,000-value `=
 	 * ANY ($1)` over 20,000 dimension rows ran for minutes (the 2026-09-23
-	 * review), so the shape is refused.  Literal lists and `IN ($1, $2)` have
-	 * their length at plan time and are priced per set.
+	 * review).  It is taken now as a single table takes it, evaluated once
+	 * per scan and rescan (lion_eval_clause_values(), in every participant of
+	 * a parallel plan): the fact filters are collected once into a copy that
+	 * every count reads (DESIGN.md §27) whatever the list's length - a list
+	 * too long to open at once is read as a windowed union for it
+	 * (lion_count_sources_run()) - and the cost model prices the per-count
+	 * reading of an array it cannot see as the longest list a literal may be
+	 * (lion_cost_fkjoin_rel()), so that the copy is what it chooses.  An
+	 * expression's array is priced by its plan-time estimate.
 	 */
-	forboth(l1, wherekinds, l2, whereconsts)
-	{
-		Node	   *val = (Node *) lfirst(l2);
-
-		if (lfirst_int(l1) == LION_CLAUSE_ARRAY &&
-			!IsA(val, Const) && !IsA(val, ArrayExpr))
-			return;
-	}
 
 	/* ---- the join key: one more equality clause on the fact rel ---- */
 	memset(&leaf, 0, sizeof(leaf));
