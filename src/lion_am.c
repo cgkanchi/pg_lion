@@ -186,6 +186,13 @@ _PG_init(void)
 	 */
 	lion_ordered_init();
 
+	/*
+	 * The endpoint probe (DESIGN.md §28): the statistics hook through which
+	 * lion's own cost estimates see a range past the histogram as the
+	 * directory has it.
+	 */
+	lion_selfuncs_init();
+
 	MarkGUCPrefixReserved("pg_lion");
 
 	/*
@@ -277,7 +284,8 @@ lion_handler(PG_FUNCTION_ARGS)
 		.ambulkdelete = lionbulkdelete,
 		.amvacuumcleanup = lionvacuumcleanup,
 		.amcanreturn = NULL,
-		.amcostestimate = lioncostestimate,
+		/* lioncostestimate() with the endpoint probe, DESIGN.md §28 */
+		.amcostestimate = lion_amcostestimate,
 #if PG_VERSION_NUM >= 180000
 		.amgettreeheight = NULL,
 #endif
