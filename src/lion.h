@@ -455,6 +455,17 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 #define LION_NULLKEY_HASH		0
 
 /*
+ * The hash every SUMMARY entry carries (DESIGN.md §31), whatever its key.
+ * A summary is ordered by its key alone - the keys of a column's summaries
+ * are distinct under proc 4, and the open one sorts by its kind - so the hash
+ * has nothing to order; and it is what the owner stamp of every page of a
+ * CHAINED summary's posting tree says (§18), which must not change when the
+ * open bucket's key is raised.  With the key's hash there, raising the key of
+ * a chained open bucket left its pages claiming another entry.
+ */
+#define LION_SUMMARY_HASH		0
+
+/*
  * THE DIRECTORY ORDER (DESIGN.md §21, §24).
  *
  * Entries sort by (attno, kind, key, hash, stored bytes).  The KEY COLUMN

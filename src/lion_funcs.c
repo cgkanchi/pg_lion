@@ -2402,8 +2402,10 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 
 		lion_verify_keylen(vs, state, blk, off, entry);
 
-		hash = lion_hash_key(state,
-							lion_fetch_key(state, LionEntryGetKey(entry)));
+		/* A summary's hash is a constant, not its key's (DESIGN.md §31). */
+		hash = LionEntryIsSummary(entry) ? LION_SUMMARY_HASH :
+			lion_hash_key(state,
+						  lion_fetch_key(state, LionEntryGetKey(entry)));
 		if (hash != entry->hash)
 			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
 						RelationGetRelationName(vs->index), off, blk,

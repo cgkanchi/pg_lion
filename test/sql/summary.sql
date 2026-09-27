@@ -202,6 +202,28 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k < 5');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE t < ''kc''');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE t > ''kz1''');
 
+-- ---------- 5b. an open bucket that is a posting tree, its key raised ----------
+-- inline_limit = 64 spills a summary to a chain of its own after a few rows,
+-- and the appends after a VACUUM land in the free space it left all over the
+-- heap: the open bucket is a chain whose key every append raises.  Its pages
+-- are stamped with its entry's hash (§18), which is why a summary's hash is a
+-- constant and not its key's: the key changes, the stamp may not.
+CREATE TABLE lion_sm_chain (k int NOT NULL, pad text);
+INSERT INTO lion_sm_chain SELECT i, repeat('p', 200) FROM generate_series(1, 4000) i;
+CREATE INDEX lion_sm_chain_k ON lion_sm_chain USING lion (k)
+	WITH (summaries = on, summary_tids = 64, inline_limit = 64);
+DELETE FROM lion_sm_chain WHERE k % 3 <> 0;
+VACUUM lion_sm_chain;
+INSERT INTO lion_sm_chain SELECT 4000 + i, repeat('p', 200) FROM generate_series(1, 3000) i;
+SELECT summary_entries > 60 AS many, summary_tids = ntids AS covers,
+	   summary_pages > 0 AS chained
+  FROM lion_index_stats('lion_sm_chain_k');
+SELECT lion_index_verify('lion_sm_chain_k', true);
+VACUUM (ANALYZE) lion_sm_chain;
+SELECT lion_sm('SELECT count(*) FROM lion_sm_chain WHERE k > 3000');
+SELECT lion_sm('SELECT count(*) FROM lion_sm_chain WHERE k BETWEEN 2000 AND 6500');
+DROP TABLE lion_sm_chain;
+
 -- ---------- 6. a dirty heap, and VACUUM ----------
 UPDATE lion_sm SET pad = 'dirty' WHERE id % 5 = 0;
 UPDATE lion_sm SET u = u + 100000 WHERE id % 97 = 0;

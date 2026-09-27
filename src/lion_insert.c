@@ -1277,7 +1277,7 @@ static void
 lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 					Datum key, uint32 ckey, uint16 lo)
 {
-	uint32		hash = lion_hash_key(state, key);
+	uint32		hash = LION_SUMMARY_HASH;	/* whatever the key: see lion.h */
 	uint32		bucket_tids = state->ix->meta.summary_tids;
 
 	/*
