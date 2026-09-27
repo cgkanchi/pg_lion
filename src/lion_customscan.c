@@ -88,6 +88,7 @@
 #if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
 #endif
+#include "access/parallel.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -124,6 +125,8 @@
 #include "utils/typcache.h"
 
 #include "storage/predicate.h"
+#include "storage/shm_toc.h"
+#include "storage/spin.h"
 
 #include "lion.h"
 #include "lion_count.h"
@@ -842,7 +845,39 @@ typedef struct LionCountScanState
 	LionPostingSet joinfilter;
 	LionCountSource joinsources[2];
 	int64		joinfilterrows;
+
+	/*
+	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
+	 * counts the dimension rows its share of the child returns and adds what
+	 * EXPLAIN ANALYZE reports into joinshared, in the dynamic shared memory
+	 * of the Gather above it, when it shuts down; the leader copies the sums
+	 * into the joinworker fields before that memory goes.  They are NULL,
+	 * zero and -1 outside a parallel plan.
+	 */
+	struct LionJoinShared *joinshared;
+	bool		joinreported;
+	LionCountStats joinworkerstats;
+	int64		joinworkerlookups;
+	int64		joinworkermissing;
+	int64		joinworkerdirpages;
+	int64		joinworkerfilterrows;
 } LionCountScanState;
+
+/*
+ * What the participants of a parallel FK-side join add up for EXPLAIN
+ * ANALYZE, in the Gather's dynamic shared memory (lion_shutdown_custom_scan()).
+ * filterrows is the largest copy any participant made of the fact filters,
+ * -1 when none did.
+ */
+typedef struct LionJoinShared
+{
+	slock_t		mutex;
+	LionCountStats stats;
+	int64		lookups;
+	int64		missing;
+	int64		dirpages;
+	int64		filterrows;
+} LionJoinShared;
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								  CustomPath *best_path, List *tlist,
@@ -856,6 +891,14 @@ static void lion_end_custom_scan(CustomScanState *node);
 static void lion_rescan_custom_scan(CustomScanState *node);
 static void lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 									ExplainState *es);
+static Size lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+								void *coordinate);
+static void lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+								  void *coordinate);
+static void lion_initialize_worker(CustomScanState *node, shm_toc *toc,
+								   void *coordinate);
+static void lion_shutdown_custom_scan(CustomScanState *node);
 
 static const CustomPathMethods lion_count_path_methods = {
 	.CustomName = "LionCount",
@@ -874,6 +917,11 @@ static const CustomExecMethods lion_count_exec_methods = {
 	.ExecCustomScan = lion_exec_custom_scan,
 	.EndCustomScan = lion_end_custom_scan,
 	.ReScanCustomScan = lion_rescan_custom_scan,
+	.EstimateDSMCustomScan = lion_estimate_dsm,
+	.InitializeDSMCustomScan = lion_initialize_dsm,
+	.ReInitializeDSMCustomScan = lion_reinitialize_dsm,
+	.InitializeWorkerCustomScan = lion_initialize_worker,
+	.ShutdownCustomScan = lion_shutdown_custom_scan,
 	.ExplainCustomScan = lion_explain_custom_scan,
 };
 
@@ -3334,6 +3382,48 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 }
 
 /*
+ * The fk column's distinct keys (DESIGN.md §27).  A key's posting set holds
+ * every row of the table with that key, not the ones the fact filters leave,
+ * so this is the column's n_distinct over the whole table, taken as
+ * lion_range_entries() takes it.  estimate_num_groups() scales it down to the
+ * rows the relation's own clauses leave, which for an fk of a few rows per key
+ * under a filter of a few percent made every key eight times as large as it
+ * is (the 2026-09-27 benchmark: 21.9 rows a key where there are 2.75).
+ */
+static double
+lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel, Var *fkvar)
+{
+	VariableStatData vardata;
+	bool		isdefault;
+	double		nd;
+
+	examine_variable(root, (Node *) fkvar, rel->relid, &vardata);
+	nd = get_variable_numdistinct(&vardata, &isdefault);
+	ReleaseVariableStats(vardata);
+	return Max(Min(nd, Max(rel->tuples, 1.0)), 1.0);
+}
+
+/*
+ * How many participants a parallel plan's rows are divided among: core's
+ * get_parallel_divisor() (costsize.c), which is static there.  The leader
+ * takes part less the more workers it has to serve.
+ */
+static double
+lion_parallel_divisor(int workers)
+{
+	double		divisor = workers;
+
+	if (parallel_leader_participation)
+	{
+		double		leader = 1.0 - (0.3 * workers);
+
+		if (leader > 0)
+			divisor += leader;
+	}
+	return divisor;
+}
+
+/*
  * Cost the FK-side join (DESIGN.md §27) over the fact relation `rel`, for
  * `dimrows` dimension rows; the child plan's own cost is the caller's to add.
  *
@@ -3429,25 +3519,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	dimrows = Max(dimrows, 1.0);
 	*collect = false;
 
-	/*
-	 * How many rows one key of the fk column has, and in how many containers.
-	 * A key's posting set holds every row of the table with that key, not the
-	 * ones the fact filters leave, so this is the column's n_distinct over the
-	 * whole table, taken as lion_range_entries() takes it.
-	 * estimate_num_groups() scales it down to the rows the relation's own
-	 * clauses leave, which for an fk of a few rows per key under a filter of
-	 * a few percent made every key eight times as large as it is (the
-	 * 2026-09-27 benchmark: 21.9 rows a key where there are 2.75).
-	 */
-	{
-		VariableStatData vardata;
-		bool		isdefault;
-
-		examine_variable(root, (Node *) fkvar, rel->relid, &vardata);
-		nd = get_variable_numdistinct(&vardata, &isdefault);
-		ReleaseVariableStats(vardata);
-	}
-	nd = Max(Min(nd, tuples), 1.0);
+	/* How many rows one key of the fk column has, and in how many containers. */
+	nd = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
 	perkey = tuples / nd;
 	cfk = lion_containers_for(heap_pages, perkey);
 
@@ -4599,31 +4672,44 @@ lion_fkjoin_private(List *base, int joinclause, int jointype, int flags)
 }
 
 /*
- * The FK-side join path (DESIGN.md §27) over `child`, the dimension's
- * cheapest path, and what goes above it into the grouped rel.
+ * One FK-side join path (DESIGN.md §27) over `child` - the dimension's
+ * cheapest path, or, with `workers` above zero, its cheapest partial path run
+ * by that many workers - and what goes above it into the grouped rel.
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
- * it costs the child plus what it does per dimension row.
+ * it costs the child plus what it does per dimension row.  In a parallel plan
+ * the child hands each participant its share of the dimension rows, the
+ * dimension rows divided as core divides a partial path's (the Gather may
+ * start more workers than the child planned, "Parallel"); every participant
+ * locates the fact filters and makes its own copy of them, so the cost of
+ * those is charged in full to each, as a hash join below a Gather charges its
+ * hash table - the elapsed cost of the parallel plan is one participant's.
  *
- * Above it goes core's Finalize Agg over the partial counts - or, for emitted
- * rows, a Sort by the query's group pathkeys (the GROUP BY columns and the
- * DISTINCT arguments core may have chosen to presort) and core's plain Agg.
+ * Above a partial path goes a Gather; above that, or above the node itself,
+ * core's Finalize Agg over the partial counts - or, for emitted rows, a Sort
+ * by the query's group pathkeys (the GROUP BY columns and the DISTINCT
+ * arguments core may have chosen to presort) and core's plain Agg.
  */
 static void
 lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 					  RelOptInfo *output_rel, const LionFkJoin *fj,
 					  List *having, LionCountTarget *first, Path *child,
-					  PathTarget *nodetarget, List *base,
+					  int workers, PathTarget *nodetarget, List *base,
 					  int joinclause, int jointype, bool emitrows,
 					  List *whereclauses, List *wherekinds, List *ors,
-					  double dimrows)
+					  double dimrows, bool parallel_safe)
 {
 	Query	   *parse = root->parse;
 	CustomPath *cpath;
 	Path	   *input;
-	double		childrows = clamp_row_est(child->rows);
+	bool		partial = (workers > 0);
+	double		divisor = partial ? lion_parallel_divisor(workers) : 1.0;
+	double		childrows = partial ?
+		clamp_row_est(dimrows / divisor) : clamp_row_est(child->rows);
+	double		share = Min(childrows / Max(dimrows, 1.0), 1.0);
 	double		rows;
+	double		inrows;
 	double		numgroups;
 	bool		collect;
 	Cost		run;
@@ -4643,9 +4729,9 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.parent = output_rel;
 	cpath->path.pathtarget = nodetarget;
 	cpath->path.param_info = NULL;
-	cpath->path.parallel_aware = false;
-	cpath->path.parallel_safe = false;
-	cpath->path.parallel_workers = 0;
+	cpath->path.parallel_aware = partial;
+	cpath->path.parallel_safe = parallel_safe;
+	cpath->path.parallel_workers = workers;
 	cpath->path.pathkeys = NIL;
 	cpath->flags = 0;
 	cpath->custom_paths = list_make1(child);
@@ -4659,10 +4745,10 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	/*
 	 * At most one row per dimension row comes out.  A semi or anti join's
 	 * rows are exactly the join's, whose estimate the planner has made
-	 * already.
+	 * already, as is the share of them a participant sees.
 	 */
 	rows = (jointype == LION_JOIN_INNER) ? childrows :
-		clamp_row_est(Min(fj->joinrel->rows, childrows));
+		clamp_row_est(Min(fj->joinrel->rows * share, childrows));
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = child->startup_cost;
 	cpath->path.total_cost = child->total_cost + run;
@@ -4671,6 +4757,14 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 #endif
 
 	input = &cpath->path;
+	inrows = rows;
+	if (partial)
+	{
+		/* the rows of every participant */
+		inrows = clamp_row_est(rows * divisor);
+		input = (Path *) create_gather_path(root, output_rel, input,
+											nodetarget, NULL, &inrows);
+	}
 
 	if (!emitrows)
 	{
@@ -4681,7 +4775,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 			numgroups = estimate_num_groups(root,
 											get_sortgrouplist_exprs(root->processed_groupClause,
 																	root->processed_tlist),
-											rows, NULL, NULL);
+											inrows, NULL, NULL);
 		}
 		else
 		{
@@ -4720,7 +4814,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 		numgroups = estimate_num_groups(root,
 										get_sortgrouplist_exprs(root->processed_groupClause,
 																root->processed_tlist),
-										rows, NULL, NULL);
+										inrows, NULL, NULL);
 	}
 	else
 	{
@@ -4768,8 +4862,10 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
  *	  way the groups are the dimension's and core forms them, so neither the
  *	  grouping-equality rule nor the value-representation rule of §10 has
  *	  anything to check;
- *	- the path: the node over the dimension's cheapest path
- *	  (lion_add_fkjoin_paths()).
+ *	- the paths: the node over the dimension's cheapest path, and - when the
+ *	  query may run in parallel and the dimension has a partial path - the
+ *	  node over that partial path under a Gather, each participant counting
+ *	  the dimension rows its share of the child returns ("Parallel").
  */
 static void
 lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
@@ -4796,6 +4892,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	double		dimrows;
 	int			jointype;
 	bool		emitrows;
+	bool		parallel;
 	int			ncount = 0;
 	int			ndistinct = 0;
 	ListCell   *lc;
@@ -4992,9 +5089,61 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 												 output_rel->reltarget->exprs,
 												 having, NIL, fj));
 
+	/*
+	 * ---- may it run in a worker ----
+	 *
+	 * Every participant opens the fact table and its indexes, so the fact
+	 * rel has to be one a worker may read (not a temporary table, say); the
+	 * clause values are evaluated in every one of them; and the grouped rel
+	 * says whether the target and the HAVING may be computed above a Gather.
+	 * The serial node is then as parallel-safe as its child - a worker may
+	 * run the whole of it, under debug_parallel_query or below a Gather that
+	 * core puts over the plan - and with a partial path of the dimension it
+	 * is also offered parallel, each participant counting its share.
+	 */
+	parallel = (output_rel->consider_parallel &&
+				fj->joinrel->consider_parallel &&
+				rel->consider_parallel &&
+				fj->dimrel->consider_parallel &&
+				is_parallel_safe(root, (Node *) consts));
+
 	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
-						  fj->dimpath, nodetarget, base, joinclause, jointype,
-						  emitrows, whereclauses, wherekinds, ors, dimrows);
+						  fj->dimpath, 0, nodetarget, base, joinclause,
+						  jointype, emitrows, whereclauses, wherekinds, ors,
+						  dimrows, parallel && fj->dimpath->parallel_safe);
+	if (parallel && fj->dimrel->partial_pathlist != NIL)
+	{
+		Path	   *partial = (Path *) linitial(fj->dimrel->partial_pathlist);
+		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
+														joinclause);
+		double		fkpages;
+		int			workers;
+
+		/*
+		 * How many workers.  The node's work is the dimension rows' lookups
+		 * and counts, not the dimension scan the child's own count was made
+		 * for - a few thousand dimension rows are a small scan and a large
+		 * join - so it gets the workers core would give a parallel scan of
+		 * the fk index pages those lookups read (the dimension rows' share of
+		 * the fk keys), or the child's, whichever is more.  A parallel_workers
+		 * setting on the dimension decides alone, and
+		 * max_parallel_workers_per_gather caps it, as they do core's.  The
+		 * child's parallel scan hands out its rows to however many
+		 * participants come.
+		 */
+		fkpages = (double) fkidx->pages *
+			Min(dimrows / lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar), 1.0);
+		workers = compute_parallel_worker(fj->dimrel, -1, fkpages,
+										  max_parallel_workers_per_gather);
+		if (fj->dimrel->rel_parallel_workers == -1)
+			workers = Max(workers, partial->parallel_workers);
+
+		if (partial->param_info == NULL && workers > 0)
+			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+								  partial, workers, nodetarget, base,
+								  joinclause, jointype, emitrows, whereclauses,
+								  wherekinds, ors, dimrows, true);
+	}
 }
 
 /*
@@ -6340,6 +6489,18 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * Make the name "LionCount" resolvable when a plan is read back - by a
+ * parallel worker, above all, which reads the leader's plan before it has
+ * planned anything itself (DESIGN.md §27, "Parallel").  From _PG_init.
+ */
+void
+lion_count_scan_register(void)
+{
+	if (GetCustomScanMethods("LionCount", true) == NULL)
+		RegisterCustomScanMethods(&lion_count_scan_methods);
+}
+
+/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -6367,11 +6528,11 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 	/*
 	 * The name has to be resolvable before any CustomScan node of ours is
-	 * written out or read back; plan time is the first moment that can
-	 * happen, and registering twice is harmless.
+	 * written out or read back.  _PG_init registers it
+	 * (lion_count_scan_register()); this is for a library loaded some other
+	 * way, and registering twice is harmless.
 	 */
-	if (GetCustomScanMethods("LionCount", true) == NULL)
-		RegisterCustomScanMethods(&lion_count_scan_methods);
+	lion_count_scan_register();
 
 	if ((List *) list_nth(best_path->custom_private, LION_PRIV_JOIN) != NIL)
 		return lion_plan_fkjoin_path(root, rel, best_path, tlist, custom_plans);
@@ -6822,7 +6983,13 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 
 	Assert(st->heap == NULL);
 
-	st->heap = table_open(heapoid, NoLock);
+	/*
+	 * A parallel worker (DESIGN.md §27, "Parallel") holds no lock of the
+	 * leader's and takes its own, as ExecGetRangeTableRelation() does for the
+	 * scans of a worker.
+	 */
+	st->heap = table_open(heapoid, IsParallelWorker() ? AccessShareLock :
+						  NoLock);
 	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
 	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
@@ -7344,6 +7511,13 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joincollected = false;
 	st->joinfiltered = false;
 	st->joinfilterrows = -1;
+	st->joinshared = NULL;
+	st->joinreported = false;
+	memset(&st->joinworkerstats, 0, sizeof(st->joinworkerstats));
+	st->joinworkerlookups = 0;
+	st->joinworkermissing = 0;
+	st->joinworkerdirpages = 0;
+	st->joinworkerfilterrows = -1;
 	memset(&st->joinfilter, 0, sizeof(st->joinfilter));
 	st->joinfilter.pinbuf = InvalidBuffer;
 	if (st->joinclause >= 0)
@@ -9188,7 +9362,8 @@ lion_join_collect(LionCountScanState *st)
 	/*
 	 * The budget is a hash join's (get_hash_memory_limit(): work_mem times
 	 * hash_mem_multiplier): the copy stands where the ordinary plan's hash
-	 * table would.
+	 * table would, and a participant of a parallel plan makes one of its own,
+	 * as each participant of a hash join below a Gather builds its own table.
 	 */
 	oldcxt = MemoryContextSwitchTo(st->outercxt);
 	ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
@@ -9719,6 +9894,101 @@ lion_rescan_custom_scan(CustomScanState *node)
 	st->childslot = NULL;
 }
 
+/*
+ * A parallel FK-side join (DESIGN.md §27, "Parallel") keeps one small struct
+ * in the Gather's dynamic shared memory: what the participants add up for
+ * EXPLAIN ANALYZE.  Nothing else is shared - each participant reads its share
+ * of the dimension rows from the parallel-aware child, locates the fact
+ * filters and makes its own copy of them - so a node that is not a join, or
+ * a join run without a Gather, never gets here.
+ */
+static Size
+lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	return MAXALIGN(sizeof(LionJoinShared));
+}
+
+static void
+lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+					void *coordinate)
+{
+	LionCountScanState *st = (LionCountScanState *) node;
+	LionJoinShared *shared = (LionJoinShared *) coordinate;
+
+	memset(shared, 0, sizeof(LionJoinShared));
+	SpinLockInit(&shared->mutex);
+	shared->filterrows = -1;
+	st->joinshared = shared;
+}
+
+/*
+ * Before the workers are launched again for a rescan.  The sums are kept:
+ * they are the whole execution's, as the leader's own counters are.
+ */
+static void
+lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+					  void *coordinate)
+{
+}
+
+static void
+lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
+{
+	LionCountScanState *st = (LionCountScanState *) node;
+
+	st->joinshared = (LionJoinShared *) coordinate;
+}
+
+/*
+ * The end of a participant's execution.  A worker adds its counters to the
+ * shared sums, once.  The leader takes a copy of them for EXPLAIN: its
+ * ExecShutdownNode() reaches this node before the Gather above it, so before
+ * the dynamic shared memory is detached, and after the Gather has read every
+ * worker's last row - which it does only once they have all finished
+ * (gather_readnext() shuts them down), and every shape above this node reads
+ * all of it.  A Gather stopped early would leave some worker's counters out
+ * of EXPLAIN, and nothing else.
+ */
+static void
+lion_shutdown_custom_scan(CustomScanState *node)
+{
+	LionCountScanState *st = (LionCountScanState *) node;
+	LionJoinShared *shared = st->joinshared;
+
+	if (shared == NULL)
+		return;
+
+	if (IsParallelWorker())
+	{
+		if (st->joinreported)
+			return;
+		SpinLockAcquire(&shared->mutex);
+		shared->stats.blocks_skipped_via_vm += st->stats.blocks_skipped_via_vm;
+		shared->stats.tids_rechecked += st->stats.tids_rechecked;
+		shared->stats.blocks_rechecked += st->stats.blocks_rechecked;
+		shared->stats.containers_visited += st->stats.containers_visited;
+		shared->stats.probes_avoided += st->stats.probes_avoided;
+		shared->stats.cache_hits += st->stats.cache_hits;
+		shared->stats.cache_full += st->stats.cache_full;
+		shared->stats.sets_summed += st->stats.sets_summed;
+		shared->lookups += st->joinlookups;
+		shared->missing += st->joinmissing;
+		shared->dirpages += st->dirpages;
+		shared->filterrows = Max(shared->filterrows, st->joinfilterrows);
+		SpinLockRelease(&shared->mutex);
+		st->joinreported = true;
+		return;
+	}
+
+	SpinLockAcquire(&shared->mutex);
+	st->joinworkerstats = shared->stats;
+	st->joinworkerlookups = shared->lookups;
+	st->joinworkermissing = shared->missing;
+	st->joinworkerdirpages = shared->dirpages;
+	st->joinworkerfilterrows = shared->filterrows;
+	SpinLockRelease(&shared->mutex);
+}
+
 static void
 lion_end_custom_scan(CustomScanState *node)
 {
@@ -10084,14 +10354,30 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 	if (es->analyze)
 	{
+		/*
+		 * The leader's own counters, plus - for a parallel FK-side join
+		 * (DESIGN.md §27, "Parallel") - what its workers added up
+		 * (lion_shutdown_custom_scan()).
+		 */
+		LionCountStats tot = st->stats;
+
+		tot.blocks_skipped_via_vm += st->joinworkerstats.blocks_skipped_via_vm;
+		tot.tids_rechecked += st->joinworkerstats.tids_rechecked;
+		tot.blocks_rechecked += st->joinworkerstats.blocks_rechecked;
+		tot.containers_visited += st->joinworkerstats.containers_visited;
+		tot.probes_avoided += st->joinworkerstats.probes_avoided;
+		tot.cache_hits += st->joinworkerstats.cache_hits;
+		tot.cache_full += st->joinworkerstats.cache_full;
+		tot.sets_summed += st->joinworkerstats.sets_summed;
+
 		ExplainPropertyInteger("Heap Blocks Skipped via VM", NULL,
-							   st->stats.blocks_skipped_via_vm, es);
+							   tot.blocks_skipped_via_vm, es);
 		ExplainPropertyInteger("Heap TIDs Rechecked", NULL,
-							   st->stats.tids_rechecked, es);
+							   tot.tids_rechecked, es);
 		ExplainPropertyInteger("Heap Blocks Rechecked", NULL,
-							   st->stats.blocks_rechecked, es);
+							   tot.blocks_rechecked, es);
 		ExplainPropertyInteger("Containers Visited", NULL,
-							   st->stats.containers_visited, es);
+							   tot.containers_visited, es);
 		/*
 		 * Probes the AND merge did not make because the container key was
 		 * already ruled out (DESIGN.md §25).  Each one is a seek into another
@@ -10099,11 +10385,11 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 * make before it knew whether anything survived at that key.
 		 */
 		ExplainPropertyInteger("Probes Avoided", NULL,
-							   st->stats.probes_avoided, es);
+							   tot.probes_avoided, es);
 		ExplainPropertyInteger("Heap Blocks From Cache", NULL,
-							   st->stats.cache_hits, es);
+							   tot.cache_hits, es);
 		ExplainPropertyInteger("Heap Blocks Past Cache Budget", NULL,
-							   st->stats.cache_full, es);
+							   tot.cache_full, es);
 		/*
 		 * Posting sets counted on their own and added up instead of merged:
 		 * the disjoint-sum short-circuit of DESIGN.md §15.  Zero means every
@@ -10111,13 +10397,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 * ANDed with another clause, and every multi-key clause, still do.
 		 */
 		ExplainPropertyInteger("Posting Sets Summed", NULL,
-							   st->stats.sets_summed, es);
+							   tot.sets_summed, es);
 		/*
 		 * Directory pages - leaves and internal pages both - this node read
 		 * (DESIGN.md §21).  A sorted IN list should cost about the leaves its
 		 * values live on plus one descent, not a descent per value.
 		 */
-		ExplainPropertyInteger("Directory Pages Read", NULL, st->dirpages, es);
+		ExplainPropertyInteger("Directory Pages Read", NULL,
+							   st->dirpages + st->joinworkerdirpages, es);
 
 		/*
 		 * How the range bounding a sum was evaluated (DESIGN.md §28, "The
@@ -10170,18 +10457,20 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->joinclause >= 0)
 		{
 			ExplainPropertyInteger("Join Keys Looked Up", NULL,
-								   st->joinlookups, es);
+								   st->joinlookups + st->joinworkerlookups, es);
 			ExplainPropertyInteger("Join Keys Without Entry", NULL,
-								   st->joinmissing, es);
+								   st->joinmissing + st->joinworkermissing, es);
 
 			/*
 			 * The rows of the collected fact filters, or -1 when the plan
 			 * collected them and the run could not (a copy over the memory
-			 * limit, a standby) and every count read the filters instead.
+			 * limit, a standby) and every count read the filters instead - in
+			 * a parallel plan, the largest copy any participant made.
 			 */
 			if (st->joincollect)
 				ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
-									   st->joinfilterrows, es);
+									   Max(st->joinfilterrows,
+										   st->joinworkerfilterrows), es);
 		}
 	}
 }
