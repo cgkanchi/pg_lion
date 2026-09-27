@@ -497,6 +497,32 @@ crash_kill9() {
 		[ "$i" -gt 300 ] && die "postmaster $pm survived SIGKILL"
 		nap 0.1
 	done
+	shm_detach_all
+}
+
+# A child the postmaster forked after `kids` was listed - or one busy enough
+# not to notice its death for a while - is still attached to the cluster's
+# System V shared memory interlock segment, and while anything is, the next
+# start refuses to run ("pre-existing shared memory block ... is still in
+# use"): on master's CI runner one outlived start_node()'s retries.  Find
+# every process with the segment mapped, by the key postmaster.pid records
+# on its seventh line, and SIGKILL it too, until none is left.
+shm_detach_all() {
+	local key pat pids k i=0
+	key=$(sed -n 7p "$PRIMARY_DATA/postmaster.pid" 2>/dev/null | awk '{print $1}')
+	case $key in '' | 0 | *[!0-9]*) return 0 ;; esac
+	pat=$(printf 'SYSV%08x' "$key")
+	while :; do
+		# grep finds nothing (status 1) when all is well, and cannot read
+		# some processes' maps (status 2): neither may end the run under -e.
+		pids=$({ grep -l "$pat" /proc/[0-9]*/maps 2>/dev/null || true; } |
+			cut -d/ -f3 | tr '\n' ' ')
+		[ -n "${pids// /}" ] || break
+		for k in $pids; do kill -9 "$k" 2>/dev/null || true; done
+		i=$((i + 1))
+		[ "$i" -gt 300 ] && die "still attached to the shared memory of $PRIMARY_DATA: $pids"
+		nap 0.1
+	done
 }
 
 # Everything the log says about the recovery that just happened, so an
