@@ -23,7 +23,8 @@ Goals
 
 Non-goals for v0 (documented limitations; NULL keys and IN lists arrived in v1, §14 and §15;
 entry deletion and page recycling in §18)
-- Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple` (arrived in §29), parallel build/scan,
+- Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple` (arrived in §29), parallel build
+  (arrived in §24, "Build") and scan,
   fine-grained write concurrency (inserts serialize on the directory leaf that holds the key, §21),
   key sizes above 2000 bytes.
 
@@ -606,9 +607,10 @@ BUILD (`lion_build.c`, `lion_spool.c`)
    deltas, since the scan delivers TIDs in ascending order. A NULL goes to the column's reserved
    NULL entry (§14), a row a multi-key opclass extracts nothing from to its EMPTY entry (§17). The
    columns share maintenance_work_mem; when it is full, the largest are spilled to a logical tape as
-   sorted runs.
-2. The spool gives the entries back in directory order - the distinct keys sorted, the runs merged
-   by key and each key's codes by code - and ONE pass groups the codes of each
+   sorted runs. On PostgreSQL 17 and later the scan can be parallel: every participant fills an
+   accumulator of its own and hands the leader one tape.
+2. The spool gives the entries back in directory order - the distinct keys sorted, the runs and
+   participants merged by key and each key's codes by code - and ONE pass groups the codes of each
    key into containers. There is no sizing pass any more: the old pass 1 counted distinct keys only
    to size the bucket directory, and a B-tree directory is not sized, it is built to fit.
 3. Keep one open builder per distinct key in progress - one, unless the hash function of an
@@ -673,7 +675,7 @@ the last key had been hashed; the sorted build keeps one open page per level.
     amcanbackward = false            amcanunique = false       amcanmulticol = false
     amoptionalkey = false            amsearcharray = true      amsearchnulls = true
     amstorage = true (§17)           amclusterable = false     ampredlocks = false
-    amcanparallel = false            amcanbuildparallel = false    amcaninclude = false
+    amcanparallel = false            amcanbuildparallel = true (17+, §24)   amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
     amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL (§11, §18; cleanup stays with the leader)
     amgettuple = liongettuple (§29)  amgetbitmap = liongetbitmap    amcanreturn = NULL
@@ -4137,8 +4139,9 @@ the ordering checks alone only catch byte-identical twins (`directory.sql` §13)
 Leaf deletion and page reclaim for an empty leaf (nbtree's half-dead protocol); a backward scan
 (`leftlink` exists on DIRECTORY pages and verify() checks it, but nothing reads it yet - a future
 `amgettuple` will; §22 turned out not to need it, and posting pages therefore keep no left link at
-all); parallel build; and online deduplication of a prefix run that spans pages, which an opclass
-with a comparison coarser than its equality could in principle produce.
+all); parallel build (done since, §24 "Build"); and online deduplication of a prefix run that
+spans pages, which an opclass with a comparison coarser than its equality could in principle
+produce.
 
 ## 22. Per-key posting tree (format version 5, implemented)
 
@@ -5055,9 +5058,11 @@ measured below, whose timestamps are all distinct keys.)
   arrive out of order - within that page only. Such a code goes in as a zero delta (no real delta is
   zero) followed by the code, the entry is marked unsorted, and it is read back one heap page at a
   time, each page's codes sorted (at most `1 << LION_OFFSET_BITS`). A synchronized scan could start
-  mid-table and wrap around: the scan asks for none (`allow_sync = false`, as GIN's serial build
-  does); should the block number go down anyway, every column is spilled at that point, so no run
-  straddles the jump, and the merge below orders codes across runs whatever their order.
+  mid-table and wrap around: the serial scan asks for none (`allow_sync = false`, as GIN's serial
+  build does) and the parallel one is told none (`phs_syncscan = false`, set before any participant
+  starts, which is when the heap AM reads it); should the block number go down anyway, every column
+  is spilled at that point, so no run straddles the jump, and the merge below orders codes across
+  runs whatever their order.
 - **The key an entry is written with is the one its smallest code came with.** It matters for an
   opclass whose equality is coarser than its bytes (`'Alice'`/`'alice'` under citext, `1.0`/`1.00`
   as numeric, the SQL-function classes of `test/sql/directory.sql` §9), and it is what the sort
@@ -5066,9 +5071,9 @@ measured below, whose timestamps are all distinct keys.)
 
 **Memory is one budget for all the key columns**, not an even share each: a boolean column costs a
 few bytes a row and a column of unique keys the most, and each takes what it needs. The budget is
-maintenance_work_mem, and it counts what the columns' entries take, not the empty table and first
-block every column has whatever the budget - counting those made a 64kB budget on a wide index
-spill every column at every heap page. It is
+maintenance_work_mem (divided between the participants of a parallel build), and it counts what the
+columns' entries take, not the empty table and first block every column has whatever the budget -
+counting those made a 64kB budget on a wide index spill every column at every heap page. It is
 checked when the scan moves to the next heap page, and when it is exceeded the LARGEST columns are
 spilled until half of it is free: sorted into directory order and written to a logical tape as one
 RUN, and their memory reset. Runs therefore begin and end at page boundaries. Block sizes (the
@@ -5087,7 +5092,8 @@ the hash for an unordered one - and pops every input that ties with the smallest
 - one key, held in one record by each input (the normal case): its codes are streamed from the inputs
   in ascending order. The rule is to take the input with the smallest code and stay on it while its
   codes stay below the runner-up's, which makes the runs of a serial scan, whose codes follow one
-  another, a concatenation;
+  another, a concatenation, and a parallel build's participants, whose codes interleave one block
+  chunk at a time, one comparison per chunk rather than per code;
 - several keys (a collision, within a run or across runs): every record of the group is read into
   memory, the records are gathered into distinct keys by the opclass equality, and the keys are
   handed over together in the directory's full order, their codes interleaved in code order - which
@@ -5100,35 +5106,57 @@ SortSupport, abbreviated where the type offers it (text under C or ICU, numeric,
 tuplesort gives it up, when the converter's own estimate says it does not pay. That sort is where
 leading with the key still pays: a C or ICU collation gets abbreviated keys there.
 
+**Parallel build** (PostgreSQL 17 and later, `amcanbuildparallel`; 16's `index_build()` asks for
+workers only for btree). nbtree's and GIN's shape: the leader sets up a parallel heap scan, a shared
+fileset and one TapeShare per participant, launches the workers and takes part itself. Each
+participant scans its block chunks into an accumulator of its own, with maintenance_work_mem divided
+between them, spills as a serial build does, and at the end merges its runs into ONE tape holding a
+section per key column (`lion_spool_export()`). The leader waits for all of them, imports the tapes
+and merges them a column at a time exactly as a serial build merges its runs, then does the same
+single write pass with one bulk writer - the write pass stays serial, as nbtree's does. Workers get
+their own IndexInfo, so expression and partial indexes work, and report reltuples, index tuples and
+a broken HOT chain through shared memory; how many there are is plan_create_index_workers()'s
+decision (max_parallel_maintenance_workers, the table's `parallel_workers`, 32MB of
+maintenance_work_mem per participant, parallel-safe index expressions and predicate).
+*(Considered and not done: aligning the scan's block chunks to container boundaries, 64 heap blocks
+at 8kB, so that each container's codes come from one participant. The chunk size is the heap AM's
+(`table_block_parallelscan_startblock_init()`), not something an index AM can set, and the merge's
+"stay on the smallest input" already costs one comparison per chunk; alignment would buy nothing
+measurable.)*
+
 **The index is the one the sorted build wrote, page for page.** The same keys come out in the same
 order with the same codes and the same stored bytes, and the builders and the directory are
 unchanged, so every block is allocated in the same order. Checked against the tuplesort build by
 comparing relation files block by block (LSN and checksum masked) over a corpus of every opclass
 shape - scalar and multi-key, NULLs and empty arrays, an unordered class whose hash collides into
 posting trees, a coarse-equality class, HOT chains, partial and expression indexes, dead rows, empty
-and all-NULL tables - built in memory, at 64kB (up to a few thousand runs, merged in passes), and
-by REINDEX CONCURRENTLY. `test/sql/build.sql` keeps the in-memory and spilled builds of such a corpus
-byte-identical to each other (unlogged tables, whose pages carry no LSN) and checks each column's
-keys, TIDs, NULL and key-less rows against the heap.
+and all-NULL tables - built in memory, at 64kB (up to a few thousand runs, merged in passes), in
+parallel, in parallel at 64kB, and by REINDEX CONCURRENTLY serially and in parallel.
+`test/sql/build.sql` keeps the in-memory, spilled and parallel builds of such a corpus byte-identical
+to each other (unlogged tables, whose pages carry no LSN) and checks each column's keys, TIDs, NULL
+and key-less rows against the heap.
 
 ### Measured (2026-09-27, 2M rows each, assert-enabled PostgreSQL 18.6: ratios, not absolute numbers)
 
-CPU seconds (utime + stime from /proc) of the backend running `CREATE INDEX`; maintenance_work_mem
-512MB.
+CPU seconds (utime + stime from /proc) of the backend running `CREATE INDEX`, and for a parallel
+build of its workers too (the postmaster's reaped children); maintenance_work_mem 512MB.
 
-| index | before | after |
-| --- | --- | --- |
-| 5 columns: enum, bool, int (2,000 keys), unique timestamptz, text (50 keys, C) | 18.80 s | 3.34 s |
-| 11 columns, en_US libc text of 3 to 50,000 keys and one unique, bool, int, two text[] | 87.28 s | 22.67 s |
+| index | before | after, serial | after, 2 workers | after, 3 workers |
+| --- | --- | --- | --- | --- |
+| 5 columns: enum, bool, int (2,000 keys), unique timestamptz, text (50 keys, C) | 18.80 s | 3.34 s | 3.54 s (2.04 + 1.50) | 3.79 s (1.94 + 1.85) |
+| 11 columns, en_US libc text of 3 to 50,000 keys and one unique, bool, int, two text[] | 87.28 s | 22.67 s | 24.42 s (11.66 + 12.76) | 22.77 s (8.39 + 14.38) |
 
-At maintenance_work_mem
+Parallel figures are the leader's CPU plus the workers'. Wall clock went 19.2 s → 3.4 s → 2.1 s (2
+workers) for the first index and 90.9 s → 23.2 s → 13.7 s (2 workers) → 10.9 s (3 workers) for the
+second, on a machine whose other load kept all four cores busy. What the workers cannot take is the
+leader's share: the merge of every participant's tape and the one write pass. At maintenance_work_mem
 64MB the two indexes spill 3 and 43 runs and take 3.15 s and 23.74 s serially: a spill costs about
 what writing and reading the codes once costs, which is little next to a sort.
 
 The unique text column is most of what is left of the second index: alone it takes 16.9 s under
 en_US against 6.5 s under C and 2.7 s for a unique int column, the difference being the `strcoll()`
 calls of sorting two million distinct keys, which a libc collation cannot abbreviate. Both indexes
-came out byte-identical to the tuplesort build's.
+came out byte-identical to the tuplesort build's, serially and in parallel.
 
 ## 25. Custom WAL resource manager (replacing generic WAL)
 

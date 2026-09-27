@@ -1,11 +1,16 @@
 -- The build (DESIGN.md §24, "Build"): every row's code appended to its key's
 -- entry in memory, spilled in sorted runs when maintenance_work_mem runs out,
--- and merged back in directory order.  Whatever the route, the index is the
--- same one, page for page, so this builds each index every way and compares
--- the relation files byte for byte.
+-- merged back in directory order, and on PostgreSQL 17 and later scanned by
+-- parallel workers too.  Whatever the route, the index is the same one, page
+-- for page, so this builds each index every way and compares the relation
+-- files byte for byte.
 --
 -- The tables are UNLOGGED because a logged build's pages carry the LSN of the
 -- WAL record that logged them; an unlogged one's are written as they are.
+--
+-- There are two expected files: build.out for 17 and later, build_1.out for
+-- 16, where only btree indexes are built in parallel and the DEBUG lines say
+-- so.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 
@@ -17,11 +22,12 @@ SELECT setseed(0.31);
 CREATE FUNCTION lion_build_digest(idx regclass) RETURNS text
 	LANGUAGE sql AS $$ SELECT md5(pg_read_binary_file(pg_relation_filepath(idx))) $$;
 
--- REINDEX under the given maintenance_work_mem, and digest the result
-CREATE FUNCTION lion_build_as(idx regclass, mem text)
+-- REINDEX under the given memory and worker settings, and digest the result
+CREATE FUNCTION lion_build_as(idx regclass, mem text, workers int)
 	RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
 	PERFORM set_config('maintenance_work_mem', mem, true);
+	PERFORM set_config('max_parallel_maintenance_workers', workers::text, true);
 	EXECUTE format('REINDEX INDEX %s', idx);
 	RETURN lion_build_digest(idx);
 END $$;
@@ -29,13 +35,15 @@ END $$;
 -- ---------------------------------------------------------------------
 -- 1. Every kind of key: enum, bool, int, text, timestamptz, NULLs, arrays
 --    with empty arrays and NULL elements, tsvectors with no lexemes.
+--    parallel_workers fixes the worker count whatever the table's size or
+--    maintenance_work_mem (plan_create_index_workers()).
 -- ---------------------------------------------------------------------
 
 CREATE TYPE lion_build_mood AS ENUM ('sad', 'ok', 'happy', 'ecstatic');
 CREATE UNLOGGED TABLE lion_build (
 	id int, mood lion_build_mood, flag bool, n int, t text, ts timestamptz,
 	ia int[], ta text[], tv tsvector, u int8, pad text)
-	WITH (fillfactor = 60);
+	WITH (fillfactor = 60, parallel_workers = 2);
 INSERT INTO lion_build
 SELECT g,
 	   CASE WHEN g % 13 = 0 THEN NULL
@@ -99,7 +107,7 @@ CREATE OPERATOR CLASS lion_build_lower_ops FOR TYPE text USING lion AS
 	FUNCTION 1 lion_build_lower_hash(text);
 
 CREATE UNLOGGED TABLE lion_build_coll (x xid, s text, pad text)
-	WITH (fillfactor = 60);
+	WITH (fillfactor = 60, parallel_workers = 2);
 INSERT INTO lion_build_coll
 SELECT CASE WHEN g % 29 = 0 THEN NULL ELSE ((g * 7) % 12 + 1)::text::xid END,
 	   CASE (g * 31) % 4 WHEN 0 THEN 'Key' WHEN 1 THEN 'kEY' WHEN 2 THEN 'KEY'
@@ -113,39 +121,51 @@ CREATE INDEX lion_build_coll_x ON lion_build_coll
 CREATE INDEX lion_build_coll_s ON lion_build_coll USING lion (s lion_build_lower_ops);
 
 -- ---------------------------------------------------------------------
--- 4. The same index every way: in memory and spilled (64kB is the least
---    maintenance_work_mem there is).
+-- 4. The same index every way: in memory, spilled (64kB is the least
+--    maintenance_work_mem there is), in parallel, and in parallel with every
+--    participant spilling.
 -- ---------------------------------------------------------------------
 
 CREATE TEMP TABLE lion_build_ways AS
 SELECT idx::text AS idx,
-	   lion_build_as(idx, '64MB') AS in_memory,
-	   lion_build_as(idx, '64kB') AS spilled
+	   lion_build_as(idx, '64MB', 0) AS in_memory,
+	   lion_build_as(idx, '64kB', 0) AS spilled,
+	   lion_build_as(idx, '64MB', 2) AS parallel,
+	   lion_build_as(idx, '64kB', 2) AS parallel_spilled
   FROM unnest(ARRAY['lion_build_all', 'lion_build_tv', 'lion_build_part',
 					'lion_build_expr', 'lion_build_coll_x',
 					'lion_build_coll_s']::regclass[]) idx;
-SELECT idx, spilled = in_memory AS spilled_same
+SELECT idx, spilled = in_memory AS spilled_same,
+	   parallel = in_memory AS parallel_same,
+	   parallel_spilled = in_memory AS parallel_spilled_same
   FROM lion_build_ways ORDER BY idx;
 
--- REINDEX CONCURRENTLY builds from an MVCC snapshot, into a new index that
--- then takes the old one's name
+-- REINDEX CONCURRENTLY builds from an MVCC snapshot, serially and in parallel,
+-- into a new index that then takes the old one's name
 RESET maintenance_work_mem;
+SET max_parallel_maintenance_workers = 0;
 REINDEX INDEX CONCURRENTLY lion_build_all;
 SELECT lion_build_digest('lion_build_all') = in_memory AS concurrently_same
   FROM lion_build_ways WHERE idx = 'lion_build_all';
+SET max_parallel_maintenance_workers = 2;
 SET maintenance_work_mem = '64kB';
 REINDEX INDEX CONCURRENTLY lion_build_all;
-SELECT lion_build_digest('lion_build_all') = in_memory AS concurrently_spilled_same
+SELECT lion_build_digest('lion_build_all') = in_memory AS concurrently_parallel_same
   FROM lion_build_ways WHERE idx = 'lion_build_all';
 RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
 
 -- Which way each build went.
+SET max_parallel_maintenance_workers = 2;
 SET client_min_messages = debug1;
+REINDEX INDEX lion_build_tv;
+SET max_parallel_maintenance_workers = 0;
 REINDEX INDEX lion_build_tv;
 SET maintenance_work_mem = '64kB';
 REINDEX INDEX lion_build_tv;
 SET client_min_messages = warning;
 RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
 
 -- ---------------------------------------------------------------------
 -- 5. And it is the right index: verify() finds every heap row under every
@@ -194,11 +214,29 @@ SELECT lion_index_count_any('lion_build_coll_s', ARRAY['KEY7', 'key7']::text[]) 
 	   (SELECT count(*) FROM lion_build_coll WHERE lower(s) = 'key7') AS class_count;
 SELECT entries FROM lion_index_stats('lion_build_coll_s');
 
+-- ---------------------------------------------------------------------
+-- 6. Parallel only where the index expressions can run in a worker: a
+--    parallel-unsafe expression makes it a serial build.  (PL/pgSQL, because
+--    a SQL function this simple would be inlined, and the inlined expression
+--    is safe.)
+-- ---------------------------------------------------------------------
+
+CREATE FUNCTION lion_build_unsafe(int) RETURNS int
+	LANGUAGE plpgsql IMMUTABLE PARALLEL UNSAFE AS $$ BEGIN RETURN $1 % 10; END $$;
+CREATE INDEX lion_build_unsafe_i ON lion_build USING lion (lion_build_unsafe(n));
+SET max_parallel_maintenance_workers = 2;
+SET client_min_messages = debug1;
+REINDEX INDEX lion_build_unsafe_i;
+SET client_min_messages = warning;
+RESET max_parallel_maintenance_workers;
+SELECT lion_index_verify('lion_build_unsafe_i', true);
+
 DROP TABLE lion_build, lion_build_coll;
 DROP TYPE lion_build_mood;
 DROP OPERATOR CLASS lion_build_xid_ops USING lion;
 DROP OPERATOR CLASS lion_build_lower_ops USING lion;
 DROP OPERATOR ==== (text, text);
 DROP FUNCTION lion_build_xid_hash(xid), lion_build_lower_eq(text, text),
-	lion_build_lower_hash(text), lion_build_shape(text),
-	lion_build_digest(regclass), lion_build_as(regclass, text);
+	lion_build_lower_hash(text), lion_build_unsafe(int),
+	lion_build_shape(text),
+	lion_build_digest(regclass), lion_build_as(regclass, text, int);
