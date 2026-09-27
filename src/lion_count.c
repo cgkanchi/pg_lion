@@ -81,6 +81,7 @@
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/memutils.h"
@@ -5832,6 +5833,217 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	return true;
 }
 
+/*
+ * The union lion_range_collect() builds: one container per container key,
+ * each the OR of what every set of the range has at that key.  The sets come
+ * in key order, which for a column stored in the heap's order is container
+ * key order too, but in general is not - so the containers are kept by key
+ * in a hash table and put in order once at the end.
+ */
+typedef struct LionRangeUnionEnt
+{
+	uint32		ckey;			/* hash key */
+	uint32		size;
+	LionContainer *c;
+} LionRangeUnionEnt;
+
+typedef struct LionRangeUnion
+{
+	HTAB	   *byckey;
+	MemoryContext cxt;
+	Size		held;			/* what the containers take, with overhead */
+	Size		maxbytes;
+	bool		failed;
+	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes */
+} LionRangeUnion;
+
+/* What one kept container costs beyond its bytes: its entry and its chunk. */
+#define LION_RANGE_UNION_OVERHEAD	(sizeof(LionRangeUnionEnt) + 16)
+
+static bool
+lion_range_union_cb(const LionContainer *c, void *arg)
+{
+	LionRangeUnion *u = (LionRangeUnion *) arg;
+	LionRangeUnionEnt *e;
+	uint32		ckey = c->ckey;
+	bool		found;
+	Size		size;
+
+	if (lion_container_cardinality(c) == 0)
+		return true;
+
+	e = (LionRangeUnionEnt *) hash_search(u->byckey, &ckey, HASH_ENTER, &found);
+	if (!found)
+	{
+		size = lion_container_size(c);
+		e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
+		memcpy(e->c, c, size);
+		e->size = (uint32) size;
+		u->held += size + LION_RANGE_UNION_OVERHEAD;
+	}
+	else
+	{
+		(void) lion_container_or(e->c, c, u->tmp);
+		size = lion_container_size(u->tmp);
+		if (size != e->size)
+		{
+			pfree(e->c);
+			e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
+			u->held = u->held - e->size + size;
+			e->size = (uint32) size;
+		}
+		memcpy(e->c, u->tmp, size);
+	}
+
+	if (u->held > u->maxbytes)
+	{
+		u->failed = true;
+		return false;
+	}
+	return true;
+}
+
+static int
+lion_range_union_cmp(const void *a, const void *b)
+{
+	uint32		x = (*(LionRangeUnionEnt *const *) a)->ckey;
+	uint32		y = (*(LionRangeUnionEnt *const *) b)->ckey;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/*
+ * The rows of one range, collected (DESIGN.md §31, "A range as a source").
+ *
+ * The walk is the one a summed range makes (lion_entry_scan_begin_sum()):
+ * the entries of the range's partial buckets and the summaries of its whole
+ * ones, disjoint sets of one scalar column whose union is exactly the rows
+ * whose key lies in the range.  Each set's containers are ORed into the union
+ * as they come; its pin, if it has one, is dropped once it has been read.
+ *
+ * What comes out is safe on lion_sources_collect()'s terms, for the same
+ * reasons: a stale copy - a TID VACUUM has since removed - is only ever
+ * counted beside a located set that holds the §9 pin, which settles it, and
+ * no row visible to the caller's snapshot can be missing, because the copy is
+ * read after the snapshot was taken and every such row was in the index
+ * before its transaction committed.  The same goes for the summaries: an
+ * insert puts its row under its key and then under its bucket's summary, both
+ * before it commits, and the walk reads the keys of a bucket or its summary,
+ * never both (DESIGN.md §31, "Readers").
+ */
+bool
+lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
+				   Size maxbytes, LionPostingSet *out, Size *held,
+				   int64 *nsets, int64 *nsummaries)
+{
+	LionRangeUnion u;
+	LionEntryScan es;
+	LionPostingSet ps;
+	HASHCTL		ctl;
+	HASH_SEQ_STATUS seq;
+	LionRangeUnionEnt *e;
+	LionRangeUnionEnt **ents;
+	LionCollect col;
+	LionMatSet *mat;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	Datum		key;
+	long		n;
+	long		i;
+
+	memset(out, 0, sizeof(LionPostingSet));
+	out->pinbuf = InvalidBuffer;
+	out->head = InvalidBlockNumber;
+	*held = 0;
+	*nsets = 0;
+	*nsummaries = 0;
+
+	/* The union is built in a context of its own and copied out at the end. */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion range collect",
+								ALLOCSET_DEFAULT_SIZES);
+	memset(&u, 0, sizeof(u));
+	u.cxt = cxt;
+	u.maxbytes = maxbytes;
+	u.tmp = (LionContainer *) MemoryContextAlloc(cxt, LION_CONTAINER_MAX_SIZE);
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(uint32);
+	ctl.entrysize = sizeof(LionRangeUnionEnt);
+	ctl.hcxt = cxt;
+	u.byckey = hash_create("lion range union", 256, &ctl,
+						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	lion_entry_scan_begin_sum(&es, index, attno, range, LION_WALK_INSIDE);
+	while (!u.failed && lion_entry_scan_next(&es, &key, &ps))
+	{
+		if (ps.found)
+			(void) lion_sets_iterate(1, &ps, NULL, lion_range_union_cb, &u);
+		lion_posting_set_release(&ps);
+		(*nsets)++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	*nsummaries = es.nsummaries;
+	lion_entry_scan_end(&es);
+
+	if (u.failed)
+	{
+		MemoryContextDelete(cxt);
+		return false;
+	}
+
+	/* The containers in key order, into one buffer as a collection has them. */
+	n = hash_get_num_entries(u.byckey);
+	out->index = index;
+	out->attno = attno;
+	out->cxt = CurrentMemoryContext;
+	out->entryblk = InvalidBlockNumber;
+	out->entryoff = InvalidOffsetNumber;
+	if (n == 0)
+	{
+		MemoryContextDelete(cxt);
+		return true;			/* the range selects nothing: not found */
+	}
+
+	oldcxt = MemoryContextSwitchTo(cxt);
+	ents = (LionRangeUnionEnt **) palloc(sizeof(LionRangeUnionEnt *) * n);
+	i = 0;
+	hash_seq_init(&seq, u.byckey);
+	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
+		ents[i++] = e;
+	Assert(i == n);
+	qsort(ents, n, sizeof(LionRangeUnionEnt *), lion_range_union_cmp);
+	MemoryContextSwitchTo(oldcxt);
+
+	memset(&col, 0, sizeof(col));
+	col.cxt = CurrentMemoryContext;
+	col.maxbytes = SIZE_MAX;
+	col.cap = 8192;
+	col.buf = (char *) palloc(col.cap);
+	col.offcap = 256;
+	col.offs = (Size *) palloc(sizeof(Size) * col.offcap);
+	for (i = 0; i < n; i++)
+		lion_collect_container(&col, ents[i]->c);
+	MemoryContextDelete(cxt);
+
+	mat = (LionMatSet *) palloc(sizeof(LionMatSet));
+	mat->ncontainers = col.noffs;
+	mat->bytes = col.used;
+	mat->held = sizeof(LionMatSet) + MAXALIGN(Max(col.used, (Size) 1)) +
+		sizeof(LionContainer *) * Max(col.noffs, 1);
+	mat->buf = col.buf;
+	mat->containers = (LionContainer **)
+		palloc(sizeof(LionContainer *) * Max(col.noffs, 1));
+	for (i = 0; i < col.noffs; i++)
+		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
+	pfree(col.offs);
+
+	out->found = true;
+	out->mat = mat;
+	out->ntids = col.members;
+	out->ncontainers = (uint32) col.noffs;
+	*held = mat->held;
+	return true;
+}
+
 static int64
 lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 					   LionCountSource *sources, LionCountStats *stats,
@@ -5860,11 +6072,15 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	/*
 	 * The shape of each source, and whether it can select anything at all: a
 	 * positive source that cannot makes the whole intersection empty, and a
-	 * negated one that cannot simply subtracts nothing.
+	 * negated one that cannot simply subtracts nothing.  A range source still
+	 * to be walked is no set at all, and is the caller's to expand
+	 * (LionCountSource.rangewalk).
 	 */
 	trees = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * nsources);
 	for (i = 0; i < nsources; i++)
 	{
+		if (sources[i].rangewalk != NULL)
+			elog(ERROR, "lion index: a range source to be walked handed to a count");
 		trees[i] = lion_source_tree(&sources[i]);
 
 		if (sources[i].negated)
@@ -7252,6 +7468,15 @@ lion_entry_scan_end_phase(LionEntryScan *es, bool partended)
 static void
 lion_entry_scan_setup_phase(LionEntryScan *es)
 {
+	/*
+	 * Test hook: one phase of a summed walk is over and the next is about to
+	 * descend to where it begins (DESIGN.md §31), holding nothing of the
+	 * directory.  test/isolation/summary_race.spec parks here while inserts
+	 * close and open buckets and split the leaves the next phase reads.
+	 * Compiles to nothing without --enable-injection-points.
+	 */
+	LION_INJECTION_POINT("lion-entry-scan-phase");
+
 	switch (es->nextphase)
 	{
 		case LION_PHASE_SUMS:
