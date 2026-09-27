@@ -514,10 +514,9 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON
          ->  Custom Scan (LionCount)
                Lion Indexes: lion_df_fk (fk = d.pk), lion_df_x (x = 3)
                Join Rows: the dimension rows with a match
-               Fact Filters: collected once
                ->  Seq Scan on lion_dd d
                      Filter: (region = 'eu'::text)
-(9 rows)
+(8 rows)
 
 EXPLAIN (COSTS OFF) SELECT d.grp, count(DISTINCT d.attr) FROM lion_dd d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3) GROUP BY d.grp;
                               QUERY PLAN                               
@@ -530,9 +529,8 @@ EXPLAIN (COSTS OFF) SELECT d.grp, count(DISTINCT d.attr) FROM lion_dd d WHERE NO
                Lion Indexes: lion_df_fk (fk = d.pk), lion_df_x (x = 3)
                Join Type: Anti
                Join Rows: the dimension rows without a match
-               Fact Filters: collected once
                ->  Seq Scan on lion_dd d
-(10 rows)
+(9 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;
@@ -554,9 +552,9 @@ SELECT lion_dj_counter('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd 
 
 -- the cost model's choice
 SELECT lion_dj_pick('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
- lion_dj_pick 
---------------
- pushed down
+  lion_dj_pick   
+-----------------
+ not pushed down
 (1 row)
 
 SELECT lion_dj_pick('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND f.t = ''t4'' GROUP BY d.region');
