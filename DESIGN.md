@@ -3905,7 +3905,9 @@ splits it, which moves the upper half away. Both readers therefore changed:
   only an EMPTY posting set is ever deleted, so its group had nothing the scan's snapshot could have
   counted. An entry INSERTED behind the walk is missed, which is the same freedom the bucket walk
   had. `test/isolation/dir_split_scan.spec` parks a GROUP BY between two entries and splits the leaf
-  under it.
+  under it. *(Since §28's "One read per leaf" the scan resumes at a key once per LEAF rather than
+  once per entry: it copies what it wants out of a leaf under one lock and hands the copies out.
+  The key rule is unchanged; only how often it is applied.)*
 - **VACUUM carries the entry's KIND and KEY** next to the offset, and re-validates before every use:
   one entry per key, so equal stored bytes mean the same entry. A hit at the remembered offset is the
   common case, a scan of the page catches an insert that shifted it, and anything else means the
@@ -4774,7 +4776,15 @@ every scan shape against a sequential scan on an enum column, a list longer than
   - carry the recheck batch across the entries of a range SUM, as §15's disjoint sum carries it
     across a list's sets: the entries' counts are only added up, so their dirty TIDs may be
     rechecked together, one visit per page per batch, instead of per entry (§28's measured 68,384
-    visits for 37,133 pages, and a model that has to charge them);
+    visits for 37,133 pages, and a model that has to charge them). *(Done a LEAF at a time for
+    small entries since §28's "Counting a walk"; entries counted one by one still flush their own);*
+  - a plan-time estimate of a range's entries that does not rest on `n_distinct` and the histogram
+    alone (§28, "The cost of a summed range"): descend to both bounds and estimate the leaves
+    between from the internal levels, as InnoDB's `records_in_range` does;
+  - summary posting sets per key bucket (a leaf, or a fixed key interval, perhaps hierarchical), so
+    that a range is the union of O(log n + buckets) summaries plus exact work at its two edges: the
+    structural fix for ranges over high-cardinality keys, which changes the on-disk format and
+    needs its maintenance on insert and VACUUM designed;
   - a STABLE bound expression in the count pushdown (`ts > now() - interval '1 day'`, the commonest
     range of all): the node takes a Const or a Param, as for equality (§10), and this is neither.
     Evaluated once per scan like a Param it would mean the same thing - a stable function returns
@@ -6255,6 +6265,65 @@ stop. So there is **no new concurrency argument**. An isolation spec is added al
 (`count_range_vacuum_race.spec`, below), because the per-entry §9 argument of the count is the thing
 a reviewer will want to see exercised under a range.
 
+### One read per leaf (2026-09-27)
+
+A benchmark on real data (the findings of 2026-09-26) showed a range reading the directory once or
+twice PER KEY: 4,012 directory pages for 2,000 keys, 1.93 million for 1.91 million, and 47.2 million
+for 46.8 million on a 550-million-row table. There was no second descent; the entry scan re-read
+the leaf. `lion_entry_scan_next()` gave its lock up after every entry it returned and came back
+for the next one by reading the same leaf again and binary-searching it for "the first key above
+the last one returned" (§21). Once the leaf ran out it read it one more time, found nothing after
+the last key, and only then followed the right link. A walk over n entries on m leaves therefore
+read n + m leaves. That is two reads per key when an entry fills a leaf (2,000 keys of a
+thousand-row column whose INLINE entries are 3.8 kB each) and one when a leaf holds a hundred and
+fifty of them (a unique timestamp).
+
+The walk now reads a leaf ONCE (`lion_entry_scan_fill()`). Under one share lock it:
+
+- finds where to resume on the leaf, which is still the first key above the last one examined;
+- copies every entry the walk selects into a private batch, which is at most a block's bytes, since
+  that is where they came from;
+- remembers the last entry it examined as the next resume key;
+- and remembers the leaf's right link as the next leaf to read, unless the walk ended on this leaf.
+
+It then gives the lock up and hands the copies out one by one. The next leaf read goes to that right
+link without reading this leaf again. A walk over n entries on m leaves reads m leaves: 1,000 reads
+for 1,000 such entries (the thousand-row column, one per leaf) and 15,820 for 1,913,601 (the unique
+timestamp).
+
+Why the copies may outlive the lock is §21's argument, applied per leaf instead of per entry:
+
+- **A split** moves entries only rightwards, onto a new page linked immediately right of the one it
+  splits. The entries the leaf held after the resume key when it was read are in the batch. A split
+  after that moves them, and entries inserted since, to a page between this leaf and the right
+  sibling the batch recorded, and the walk never reads that page. The inserted entries hold only rows
+  no older snapshot can see (§29.5 case 3), which is the freedom the walk has always had behind its
+  position. If the recorded right sibling splits before the walk reads it, the high key and the
+  resume key route the walk right as before.
+- **VACUUM** deletes an entry only once its set is empty. A CHAIN copy whose set has been freed reads
+  as empty through the owner check of §18.
+- **An INLINE copy** is counted against the visibility map, so §9 wants the leaf it came from pinned
+  from the copy until the count. The scan keeps that pin (`batchbuf`) while the batch holds an INLINE
+  copy still to be handed out. Every INLINE set handed out takes a pin of its own, and the last one
+  takes the scan's. VACUUM's cleanup lock on that leaf therefore waits as it waited for the one set's
+  pin before, only for a batch's length. A batch of CHAIN copies pins nothing, which
+  `vacuum_entry_delete.spec` relies on: it parks a walk and needs VACUUM to get through.
+
+**A walk that returns rows pauses.** A GROUP BY hands a row to the executor per group, and a cursor
+can hold that row for ever, so the node calls `lion_entry_scan_pause()` whenever it returns a row. A
+batch that still holds INLINE copies drops them with their pin, and the next call reads the leaf
+again from the last entry handed out. A GROUP BY over INLINE entries therefore still reads a leaf per
+group, as it always did; it emits a row per group anyway. A batch of CHAIN copies survives the pause.
+The sums never pause: the sum over a range, the sum-over-all of §14, the count(DISTINCT) walk of §26
+and `lion_index_count_group_stats()` each walk to the end within one call. §28's pinned-GROUP-BY
+test (`range.sql` §14, at most one leaf pinned) holds as before.
+
+Two injection points park a walk with no lock held: `lion-entry-scan-resumed` between the first and
+second entry handed out of a leaf, as before, and `lion-entry-scan-leaf` before every leaf read but
+the first, in a counting walk as in a fetching one. `test/isolation/count_range_split_race.spec`
+parks a range sum at each point, splits every leaf of the column under it with 2,000 inserted keys
+that it then rolls back, and gets the exact count.
+
 ### Bitmap scans (`liongetbitmap()`)
 
 A scan key with strategy 6..9 on a scalar column is a RANGE key. The per-column ranking of §24
@@ -6370,7 +6439,9 @@ Declined, and why:
   visible row (an existence test per entry, §26), and for max walks backwards, which §21's leftlink
   allows on paper and nothing reads yet. It fits, but not cleanly enough to ride along with this.
 
-**Cost** (`lion_cost_count_rel()`). The range clauses are not sources: no lookup, no chain and no
+**Cost** (`lion_cost_count_rel()`). *(What follows is the model of the GROUP BY and count(DISTINCT)
+walks over a range. The SUM over a range is priced as it now runs, by `lion_cost_range_sum()`: see
+"The cost of a summed range" below.)* The range clauses are not sources: no lookup, no chain and no
 container term of their own. They scale the DRIVER: the entry scan's pages by the fraction of the
 column's entries in range - the combined selectivity of the range clauses alone
 (`clauselist_selectivity()`), which is the right fraction for a column whose rows are spread evenly
@@ -6415,6 +6486,160 @@ functions, so `lion_replaced_functions()` already lists them in `LION_PRIV_EXECU
 checks EXECUTE on them at startup as the ordinary plan's scan does. `test/sql/range.sql` revokes
 `int4lt` from PUBLIC and gets core's error from both plans.
 
+### Counting a walk (2026-09-27)
+
+The sum over a range counted each entry on its own, with one `lion_count_sources_cached()` per entry.
+Each of those builds a memory context, the source trees, a plan and a cursor per set, and the
+visibility-map state, and tears them down again. On the assert build that was about 1.5 us per
+entry whatever the entry held, which is the whole cost of an entry of one or two rows: 1.91 million
+one-row timestamps took 2.9 s beside `country = 'c7'`, and 2.1 s alone.
+
+`lion_sum_walk()` now counts the entries of one directory LEAF together. They go into the driver's
+slot as ONE source whose sets are DISJOINT: they are distinct entries of one scalar column, the
+argument §15 makes for an IN list and §14's sum-over-all has always rested on. So the count of the
+batch is the count of their union ANDed with the WHERE sources, and the sum over the leaves is the sum
+over the entries. `lion_count_sources_cached()` then treats the batch as it treats an IN list: summed
+set by set in one shared context when it is the only positive source and summing is cheaper
+(`lion_sum_is_cheaper()`), and merged as a k-way union beside the WHERE sources otherwise. A dirty
+page with rows of several entries of the leaf is then rechecked once for the leaf instead of once per
+entry, which is the §23 item ("carry the recheck batch across a sum's entries") done a leaf at a
+time. §9 needs no new argument. Each INLINE set of the batch holds the pin of its leaf until the
+batch has been counted, so the batch is a positive source that holds a pin at every container key.
+That lets the WHERE sources be materialized on their second use, exactly as a GROUP BY's are. A walk
+of any width holds one directory leaf pinned.
+
+The union pays only for SMALL entries. `LION_SUM_UNION_MAX_ITEMS` (4) containers per entry on
+average is the cut. Above it each entry is counted on its own, as before, because the merge folds
+fewer than `LION_OR_BITSET_MIN` containers at a key pairwise (a `lion_container_or()` and an
+optimize per pair). For entries of 230 containers each, that fold cost more than the per-count
+set-up it saved. Measured with 1,000 such entries ANDed with `country = 'c7'`: 39 ms one by one
+against 165 ms as unions of eight leaves' worth. For one-row entries the union is what wins: 86,399
+of them took 40 ms a leaf at a time, against 148 ms one by one on the base build.
+
+### The complement (2026-09-27)
+
+An ordered range selects one contiguous run of its column's VALUE entries. The entries it does not
+select are the run BELOW it, whose entries fail a lower bound and no upper one, and the run ABOVE it,
+whose entries fail an upper bound. Every row with a value of k is under exactly one entry of k, and
+the WHERE sources F pick rows, so
+
+    |INSIDE ∩ F|  =  |F − NULL(k)|  −  |BELOW ∩ F|  −  |ABOVE ∩ F|
+
+`|F − NULL(k)|` is one merge: F with k's reserved NULL entry subtracted, which is the negated source
+`k IS NOT NULL` has always been (§14). So a range can be answered from either side, and
+`lion_sumall_relation()` takes the smaller:
+
+- **full domain**: BELOW and ABOVE are empty. The range covers every key the column has, it is
+  exactly `k IS NOT NULL`, and nothing is walked at all. `country = 'c7' AND pc >= 0` over a column
+  whose 2,000 values are all at least 0 took 69 ms and now takes 0.5 ms.
+- **complement**: BELOW and ABOVE together have fewer entries than INSIDE. Their entries are summed,
+  as INSIDE's would have been (`lion_sum_walk()` with `LION_WALK_BELOW` and `LION_WALK_ABOVE`), and
+  subtracted.
+- **inside**: otherwise, as before.
+
+**Which side is smaller is decided exactly, at execution time** (`lion_range_choose()`). The INSIDE
+walk and the BELOW-then-ABOVE walk are stepped a leaf at a time in turn. They only COUNT what they
+would return (`lion_entry_scan_skip_leaf()`) and locate nothing. The race stops as soon as one side
+runs out, so it costs at most twice the leaves of the side that is then walked, which is small next
+to counting that side. Deciding by leaves weighs a side by its bytes: many small entries or few large
+ones.
+
+The decision needs no statistics, which is the point: the planner's `n_distinct` times histogram
+fraction can be off by orders of magnitude (the benchmark's 550M-row case was), and the first and
+last entries of the column are what says exactly whether a range covers everything. The walks
+BELOW and ABOVE ran to their ends, so "no entry outside" is exact:
+
+- an entry with a row visible to the count's snapshot exists from before that snapshot until the
+  count ends, because VACUUM deletes only empty entries (§18);
+- a key-resumed walk sees every entry that exists for the whole of the walk (One read per leaf,
+  above).
+
+The same holds for the walks that then count BELOW and ABOVE. Each of the three counts is exact under
+the one snapshot (§9), so their difference is exact too. `lion_index_verify()` after the tests and
+`count_range_split_race.spec`, which parks the race between two leaves and splits every leaf of the
+column, check both.
+
+Where the walks START: BELOW starts at the column's first entry, (attno, MINF), exactly as an
+unbounded walk does. ABOVE descends to its upper bound's leaf, as INSIDE descends to its lower
+bound's. With more than one upper bound (`k < 10 AND k <= $1`) it is not known which is the
+tightest, so ABOVE starts where INSIDE does and passes over what the range selects. That is correct,
+and the race sees that this side is as long as the inside, so it takes the inside. On a multicolumn
+index (§24) each walk stops at the first entry of another column, as every walk does.
+
+Not taken, and the inside walked as before:
+
+- **an unordered range**, where there is no run to take apart;
+- **no positive WHERE source.** `|F − NULL(k)|` needs one to drive the merge (§14), and the count of
+  every row of the table is not something an index can give. `count(*) WHERE k >= 0` alone is the
+  sum over every entry, as it always was. Summing another column's entries, NULL included, and
+  subtracting k's NULL entry from each would give it, but that is a walk of another column, and only
+  worth it when that column has far fewer entries. Not done.
+- **a partial driving index.** Its entries hold only the rows its predicate admits, and
+  `F − NULL(k)` would count the others too. The planner never picks one (`lion_find_roaring_index()`), and
+  the executor checks anyway.
+- **the GROUP BY and count(DISTINCT) walks**, where every entry is a group or a test of its own.
+
+EXPLAIN ANALYZE prints `Range Evaluation: inside | complement | full domain`. A partitioned table
+takes its way per partition, and a rescan takes it per scan, so with more than one way taken it
+prints how often each was taken: `complement 1, full domain 2`. Under time partitioning every
+partition the range covers whole is a full-domain one. `Posting Sets Summed` counts the entries
+summed on whichever side was walked, and `Directory Pages Read` includes the race's leaves.
+
+### The cost of a summed range (2026-09-27)
+
+`lion_cost_range_sum()` prices `count(*) WHERE <range on k> [AND F]` as `lion_sumall_relation()`
+runs it, and `lion_cost_count_rel()` adds F's own terms (located once, and a walk of each of its sets)
+and nothing per entry. The earlier model charged the walk `LION_RANGE_ENTRY_COST` per entry and ONE
+container per entry: the rows of the whole count, spread over the entries. That priced 2,000 keys of
+a thousand rows each beside a selective equality at 1,344 for 920,000 containers (69 ms), and it
+could not see that the keys outside a range might be a handful. Now:
+
+- **One side is walked.** INSIDE has `nin = n_distinct(k) × sel` entries. When F has a positive source
+  and k's directory is ordered, the complement has `n_distinct(k) − nin` entries plus one count of
+  F minus the NULL entry: F's containers again, and a descent. The cheaper side is charged, plus the
+  race: two leaf reads for every leaf of that side.
+- **Each entry walked** costs a fixed amount, `LION_RANGE_UNION_ENTRY_COST` (12 `cpu_tuple_cost`)
+  for a small entry counted with its leaf and `LION_RANGE_ENTRY_COST` (40) for one counted on its
+  own. On top of that come its OWN containers: the rows of one key of k (`tuples × sel / nin`), not
+  the rows that survive F. They lie in as many containers as the column's correlation says, between
+  one per row and their share of the heap, as `cost_index()` interpolates pages. The key steps are
+  the smaller of the entry's and F's containers, once for every source, since the smaller one drives
+  the merge and the other is probed at its keys.
+- **The leaves**: the column's share of the index pages, divided among its `n_distinct` entries,
+  once per entry walked.
+- **The heap the map cannot vouch for**, entry by entry as before (below). For the complement that
+  is F's candidates in the count of F and the outside entries' in theirs.
+
+With this, on the repro table below, each summed range costs 350 to 400 units per millisecond on
+the assert build, against about 140 for the sequential scan. The one exception is the thousand-row
+keys, whose containers are charged the two `cpu_operator_cost` every lion count charges per
+container, like any lion count's containers. The planner now takes the node where it is the faster
+plan: the 1.9-million-key range beside `country = 'c7'` is chosen at 14,675 and runs in 41 ms,
+against the sequential scan's 316 ms. It leaves the node where it is slower: a 7-day window of 605k
+keys is costed at 97,424 and goes to a plain index scan, 72 ms against 280.
+
+**What this cannot fix is the estimate itself.** `n_distinct × sel` is what the planner believes,
+and a stale histogram or an `n_distinct` that ANALYZE's sample got wrong makes a range of millions of
+keys look like a range of thousands. That is what happened on the 550M-row table: 46.8 million keys
+at an estimated 312k. Execution is robust to it now: the race picks the smaller side whatever the
+plan thought. The plan choice is not, and a directory probe at plan time would make it so: InnoDB's
+`records_in_range` descends to both bounds and estimates the leaves between from the internal levels.
+It is the obvious next step, and it is not done here.
+
+### Dropping the range for a heap recheck (considered, not done)
+
+When the range is wide and F is selective, the node could count F and test the range on each
+candidate's heap tuple instead of walking the range's entries. That is a Bitmap Heap Scan of F with
+the range as its filter, which the planner already builds when F's column has an index of its own,
+at the price of a heap visit per candidate and never the visibility map. The node's recheck asks
+only visibility. Teaching it to evaluate a qual would give LionCount a second, bitmap-shaped
+execution with a cost model of its own, for a case where a plan the planner already has is at best
+equal. With the walk priced as it runs, the planner already declines the pushdown for it: the 7-day
+window below goes to the index scan. When F and the range are columns of ONE multicolumn index,
+core has no F-only index path, and the lion bitmap scan answers the range by a walk into a bitmap of
+its own (above). Leaving that range to the heap recheck is a question for `lioncostestimate()` and
+the bitmap scan, not for this node.
+
 ### Measured (2026-09-24, the distinct slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
 Five million rows over 37,133 heap pages, all-visible after VACUUM: `d` - about 2000 days stored in
@@ -6453,6 +6678,36 @@ against the btree's 11.5; `dr` 30 days, the node 157 ms against the bitmap heap 
 `dr` 30 days `AND status = 3`, the node 18 ms (chosen) against 30; `count(DISTINCT dr)` over 365
 days, the node 22 ms (chosen) against 263.
 
+### Measured again (2026-09-27, PostgreSQL 18.6 assert build, pg_lion preloaded, rmgr WAL mode)
+
+These are section 4 of the benchmark's repro script. The table is 2M rows over 14,720 heap pages,
+all-visible, with one lion index on `(status, flag, pc, ts, country)`:
+
+- `pc` has 2,000 values, all at least 0, a thousand rows each, one 3.8 kB INLINE entry per leaf;
+- `ts` is a timestamp unique per row, in heap order, about 150 entries per leaf;
+- `country` has 50 values.
+
+The base build is ad9c155 and "now" is this section's three changes. Times are medians of five
+warm `EXPLAIN ANALYZE` runs (TIMING OFF) in ms. The cost is the node's own estimate, forced when it
+is not the chosen plan, and "pages" is Directory Pages Read:
+
+| query | base: cost / ms / pages / summed | now: cost / ms / pages / summed, evaluation | chosen now |
+|---|---|---|---|
+| `country = 'c7'` | 166 / 1.0 / 4 / 0 | 166 / 1.0 / 4 / 0 | node |
+| `... AND pc >= 0` (all 2,000 keys) | 1,344 / 69.5 / 4,012 / 2,000 | 173 / 0.49 / 18 / 0, full domain | node |
+| `... AND ts >= '2025-01-02'` (1.91M keys in, 86k out) | 812,380 / 3,713 / 1,929,429 / 1,913,601 | 14,675 / 39 / 2,165 / 86,399, complement | node 41 (base: seq scan 365) |
+| `... AND ts < '2025-01-02'` (86k keys) | 38,091 / 148 / 87,126 / 86,399 | 14,370 / 40 / 2,165 / 86,399, inside | index scan |
+| `... AND ts` 7-day window (605k keys) | 258,312 / 1,128 / 609,813 / 604,801 | 97,424 / 280 / 15,020 / 604,801, inside | index scan 72 |
+| `ts >= '2025-01-02'` alone | 812,572 / 2,069 / 1,929,425 / 1,913,601 | 258,544 / 648 / 15,820 / 1,913,601, inside | seq scan |
+| `country = 'c7' AND pc >= 1000` (1,000 keys) | 705 / 36 / 2,013 / 1,000 | 2,903 / 40 / 3,019 / 1,000, inside | node |
+| sequential scan of the 1.9M-key count | 44,807 / 316 | the same | |
+
+Directory reads went from about one per key to about one per leaf. A range whose outside is small
+costs what its outside does, and one covering every key costs one count of F. The one row that got
+no faster is the thousand-row keys: they are counted one by one as before, plus the leaves of the
+race (3,019 pages against 2,013). Their estimate rose from a fifth of the time's worth to about half
+of it, measured against the other ranges' 350 to 400 units per ms.
+
 ### Tests
 
 `test/sql/range.sql`, written before the code and shown failing first: every strategy and
@@ -6470,6 +6725,30 @@ on a low-cardinality column, and btree or a sequential scan over lion on a near-
 goes through `lion_explain_norm()`. `test/isolation/count_range_vacuum_race.spec` parks a range count
 with an entry's container pinned while the VACUUM of that entry's dead rows waits, as
 count_vacuum_race.spec does for an equality.
+
+`test/sql/rangesum.sql` (2026-09-27) covers the sum over a range. Each answer is checked against a
+sequential scan with the pushdown off and printed with its `Range Evaluation` and `Posting Sets
+Summed`. The cases:
+
+- full-domain ranges on int and text keys, including cross-type bounds outside the int4 domain, with
+  NULLs in the column;
+- near-full ranges taken as their complement, on either side and on both;
+- ranges whose inside is smaller;
+- empty and inverted ranges;
+- two upper bounds;
+- ranges beside an IN list, an OR, `IS NULL` and `IS NOT NULL` on other columns, and `k IS NOT NULL`
+  on their own;
+- the GROUP BY and count(DISTINCT) walks;
+- Params under a generic plan (a NULL one included) and a rescan per outer row;
+- a dirty heap with a key inserted above every other one and one below, before and after VACUUM;
+- a range on each column of a multicolumn index;
+- a partitioned table whose partitions each take a different way.
+
+It also checks that a sum over 20,000 one-row entries reads each leaf once, and that a full-domain
+range reads a few descents' worth of pages. `test/isolation/count_range_split_race.spec` parks a
+range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
+between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
+both counts against the heap.
 
 ## 29. Index scans: amgettuple, ordered scans, index-only scans
 
