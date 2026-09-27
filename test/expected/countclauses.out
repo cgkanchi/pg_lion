@@ -3,6 +3,8 @@
 -- saw the commonest filters of a real workload:
 --
 --	- an enum key, `status = 'live'` or `status IN ('live', 'dead')`;
+--	- a boolean column tested by itself: `flag`, which is what `flag = true` is
+--	  folded into, `NOT flag`, `flag IS TRUE` and the rest;
 --
 -- Every query here runs with the other scans disabled, so that a LionCount
 -- path that is built at all is the plan whatever the cost model says, and its
@@ -182,6 +184,39 @@ INSERT INTO lion_cc_q VALUES
 -- the FK-side join (DESIGN.md §27) on an enum key
 (121, $$SELECT d.label, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status GROUP BY d.label$$),
 (122, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.country = 'c1' AND f.pc = 3 GROUP BY d.status$$);
+-- ---- 2. a boolean column tested by itself ----
+-- `flag = true` is folded into `flag`, and `flag = false` into NOT flag
+INSERT INTO lion_cc_q VALUES
+(201, $$SELECT count(*) FROM lion_cc_t WHERE flag$$),
+(202, $$SELECT count(*) FROM lion_cc_t WHERE flag = true$$),
+(203, $$SELECT count(*) FROM lion_cc_t WHERE NOT flag$$),
+(204, $$SELECT count(*) FROM lion_cc_t WHERE flag = false$$),
+(205, $$SELECT count(*) FROM lion_cc_t WHERE flag <> true$$),
+(206, $$SELECT count(*) FROM lion_cc_t WHERE flag IS TRUE$$),
+(207, $$SELECT count(*) FROM lion_cc_t WHERE flag IS FALSE$$),
+-- the two that hold for NULL too: an OR of the other value and the NULL entry
+(208, $$SELECT count(*) FROM lion_cc_t WHERE flag IS NOT TRUE$$),
+(209, $$SELECT count(*) FROM lion_cc_t WHERE flag IS NOT FALSE$$),
+(210, $$SELECT count(*) FROM lion_cc_t WHERE NOT (flag IS TRUE) AND country = 'c2'$$),
+(211, $$SELECT count(*) FROM lion_cc_t WHERE flag IS UNKNOWN$$),
+(212, $$SELECT count(*) FROM lion_cc_t WHERE flag IS NOT UNKNOWN$$),
+-- beside other columns, under an OR, and in its arms
+(213, $$SELECT count(*) FROM lion_cc_t WHERE flag AND status = 'live'$$),
+(214, $$SELECT count(*) FROM lion_cc_t WHERE NOT flag AND country = 'c1'$$),
+(215, $$SELECT count(*) FROM lion_cc_t WHERE flag OR country = 'c1'$$),
+(216, $$SELECT count(*) FROM lion_cc_t WHERE status = 'dead' OR flag IS NOT TRUE$$),
+(217, $$SELECT count(*) FROM lion_cc_t WHERE (flag AND status = 'live') OR (NOT flag AND country = 'c2')$$),
+(218, $$SELECT count(*) FROM lion_cc_t WHERE flag AND NOT flag$$),
+(219, $$SELECT count(*) FROM lion_cc_t WHERE flag AND flag IS TRUE$$),
+(220, $$SELECT count(flag) FROM lion_cc_t WHERE flag IS FALSE$$),
+-- GROUP BY the boolean, and a boolean clause beside another GROUP BY
+(221, $$SELECT flag, count(*) FROM lion_cc_t GROUP BY flag$$),
+(222, $$SELECT flag, count(*) FROM lion_cc_t WHERE flag GROUP BY flag$$),
+(223, $$SELECT flag, count(*) FROM lion_cc_t WHERE flag IS NOT FALSE GROUP BY flag$$),
+(224, $$SELECT status, count(*) FROM lion_cc_t WHERE NOT flag GROUP BY status$$),
+(225, $$SELECT count(DISTINCT status) FROM lion_cc_t WHERE flag$$),
+-- a fact filter of the FK-side join
+(226, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.flag AND f.country = 'c1' GROUP BY d.status$$);
 -- ---------- over one single-column index per column ----------
 CREATE INDEX lion_cc_status ON lion_cc_t USING lion (status);
 CREATE INDEX lion_cc_dstatus ON lion_cc_t USING lion (dstatus);
@@ -216,7 +251,33 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  120 | not pushed, 1 rows
  121 | LionCount, 3 rows
  122 | LionCount, 3 rows
-(22 rows)
+ 201 | LionCount, 1 rows
+ 202 | LionCount, 1 rows
+ 203 | LionCount, 1 rows
+ 204 | LionCount, 1 rows
+ 205 | LionCount, 1 rows
+ 206 | LionCount, 1 rows
+ 207 | LionCount, 1 rows
+ 208 | LionCount, 1 rows
+ 209 | LionCount, 1 rows
+ 210 | LionCount, 1 rows
+ 211 | LionCount, 1 rows
+ 212 | LionCount, 1 rows
+ 213 | LionCount, 1 rows
+ 214 | LionCount, 1 rows
+ 215 | LionCount, 1 rows
+ 216 | LionCount, 1 rows
+ 217 | LionCount, 1 rows
+ 218 | LionCount, 1 rows
+ 219 | LionCount, 1 rows
+ 220 | LionCount, 1 rows
+ 221 | LionCount, 3 rows
+ 222 | LionCount, 1 rows
+ 223 | LionCount, 2 rows
+ 224 | LionCount, 4 rows
+ 225 | LionCount, 1 rows
+ 226 | LionCount, 3 rows
+(48 rows)
 
 -- What EXPLAIN prints: each clause as core prints its index condition.
 SET enable_seqscan = off;
@@ -244,6 +305,34 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE dstatus::lion_cc_ws = '
    Lion Indexes: lion_cc_dstatus (dstatus = 'live'::lion_cc_ws)
 (2 rows)
 
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag = true;
+                 QUERY PLAN                 
+--------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cc_flag (flag = true)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE NOT flag;
+                 QUERY PLAN                  
+---------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cc_flag (flag = false)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS TRUE AND status = 'parked';
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cc_flag (flag = true), lion_cc_status (status = 'parked'::lion_cc_ws)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS NOT TRUE;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cc_flag, lion_cc_flag ((flag = false) OR (flag IS NULL))
+(2 rows)
+
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -259,6 +348,24 @@ SELECT lion_cc_scan('bitmap', $$SELECT id FROM lion_cc_t WHERE dstatus::lion_cc_
                   lion_cc_scan                   
 -------------------------------------------------
  Bitmap Index Scan on lion_cc_dstatus, 8400 rows
+(1 row)
+
+SELECT lion_cc_scan('index', $$SELECT id FROM lion_cc_t WHERE flag$$);
+               lion_cc_scan               
+------------------------------------------
+ Index Scan using lion_cc_flag, 9183 rows
+(1 row)
+
+SELECT lion_cc_scan('bitmap', $$SELECT id FROM lion_cc_t WHERE NOT flag$$);
+                 lion_cc_scan                 
+----------------------------------------------
+ Bitmap Index Scan on lion_cc_flag, 2296 rows
+(1 row)
+
+SELECT lion_cc_scan('bitmap', $$SELECT id FROM lion_cc_t WHERE flag IS TRUE$$);
+                 lion_cc_scan                 
+----------------------------------------------
+ Bitmap Index Scan on lion_cc_flag, 9183 rows
 (1 row)
 
 /*
@@ -310,17 +417,43 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  120 | not pushed, 1 rows
  121 | LionCount, 3 rows
  122 | LionCount, 3 rows
-(22 rows)
+ 201 | LionCount, 1 rows
+ 202 | LionCount, 1 rows
+ 203 | LionCount, 1 rows
+ 204 | LionCount, 1 rows
+ 205 | LionCount, 1 rows
+ 206 | LionCount, 1 rows
+ 207 | LionCount, 1 rows
+ 208 | LionCount, 1 rows
+ 209 | LionCount, 1 rows
+ 210 | LionCount, 1 rows
+ 211 | LionCount, 1 rows
+ 212 | LionCount, 1 rows
+ 213 | LionCount, 1 rows
+ 214 | LionCount, 1 rows
+ 215 | LionCount, 1 rows
+ 216 | LionCount, 1 rows
+ 217 | LionCount, 1 rows
+ 218 | LionCount, 1 rows
+ 219 | LionCount, 1 rows
+ 220 | LionCount, 1 rows
+ 221 | LionCount, 3 rows
+ 222 | LionCount, 1 rows
+ 223 | LionCount, 2 rows
+ 224 | LionCount, 4 rows
+ 225 | LionCount, 1 rows
+ 226 | LionCount, 3 rows
+(48 rows)
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'live' AND country = 'c1';
-                                                QUERY PLAN                                                
-----------------------------------------------------------------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'live' AND flag;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_cc_m.status (status = 'live'::lion_cc_ws), lion_cc_m.country (country = 'c1'::text)
+   Lion Indexes: lion_cc_m.flag (flag = true), lion_cc_m.status (status = 'live'::lion_cc_ws)
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT flag, count(*) FROM lion_cc_t WHERE status IN ('live', 'dead') GROUP BY flag;
@@ -337,7 +470,7 @@ RESET enable_indexscan;
 RESET enable_indexonlyscan;
 -- ... and a dirty heap, whose candidates the node rechecks
 UPDATE lion_cc_t SET flag = NOT flag, status = 'dead' WHERE id % 11 = 0;
-SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121) ORDER BY n;
+SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 203, 208, 213) ORDER BY n;
   n  |      lion_cc      
 -----+-------------------
  101 | LionCount, 1 rows
@@ -345,7 +478,11 @@ SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121) ORDER B
  111 | LionCount, 4 rows
  113 | LionCount, 1 rows
  121 | LionCount, 3 rows
-(5 rows)
+ 201 | LionCount, 1 rows
+ 203 | LionCount, 1 rows
+ 208 | LionCount, 1 rows
+ 213 | LionCount, 1 rows
+(9 rows)
 
 DROP TABLE lion_cc_q, lion_cc_t, lion_cc_dim;
 DROP DOMAIN lion_cc_wsd;
