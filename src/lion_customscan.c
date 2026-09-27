@@ -201,7 +201,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * locates its set: a merge set up and torn down.  It is the same work §26's
  * per-test cost measures, and the same number.
  */
-#define LION_FKJOIN_COUNT_COST	(50.0 * cpu_tuple_cost)
+#define LION_FKJOIN_COUNT_COST	(25.0 * cpu_tuple_cost)
 
 /*
  * ... and one PROBE of such a count into a fact filter's set: a seek of the
@@ -216,18 +216,19 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * keeps the same query over a quarter of the dimension, 39 ms against 67,
  * chosen (about 8,000).
  */
-#define LION_FKJOIN_PROBE_COST	(30.0 * cpu_operator_cost)
+#define LION_FKJOIN_PROBE_COST	(80.0 * cpu_operator_cost)
 
 /*
  * ... and, per count, each SET of a fact filter that is a union (an IN list,
  * an OR across columns): the count builds its k-way union again (§15), and
  * each sub-cursor is set up and positioned whether or not the fk set's keys
- * find anything in it.  Measured as above, 1.5M fact rows and 300 dimension
- * rows: `t IN (n values)` took 57 ms at n = 30, 199 at 100, 599 at 300 and
- * 1195 at 1000 - 4 to 6 us per set per count, about 0.8 of the units the
- * ordinary plan's estimate spends per millisecond of the same run.
+ * find anything in it.  Measured on the assert build, 1.5M fact rows and 300
+ * dimension rows: `t IN (n values)` took 57 ms at n = 30, 199 at 100, 599 at
+ * 300 and 1195 at 1000 - 4 to 6 us per set per count.  It is the rebuild a
+ * GROUP BY's counts make of a union source too, measured on the release build
+ * at 2.7 to 6 us a set (LION_UNION_SET_COST), and priced as that.
  */
-#define LION_FKJOIN_SET_COST	(80.0 * cpu_tuple_cost)
+#define LION_FKJOIN_SET_COST	LION_UNION_SET_COST
 
 /*
  * ... and, when the fact filters are COLLECTED once into a private copy
@@ -255,14 +256,6 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_FKJOIN_COPY_PROBE_COST	(15.0 * cpu_operator_cost)
 #define LION_FKJOIN_COPY_MEMBER_COST	(3.0 * cpu_operator_cost)
 #define LION_FKJOIN_COPY_CONTAINER_COST	(20.0 * cpu_operator_cost)
-
-/*
- * One level of the fk index's directory descended, per dimension row: a page
- * already in shared buffers and a binary search.  §21's single lookup charges
- * 50 cpu_operator_cost; the descents of a join come thousands at a time over
- * pages that stay cached, and measured at half that.
- */
-#define LION_FKJOIN_DESCENT_COST	(25.0 * cpu_operator_cost)
 
 /*
  * Making the dimension's keys distinct for a forward semi join over a
@@ -310,14 +303,14 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_CLAUSE_MULTI	4	/* col @> / && / @@ const, DESIGN.md §17 */
 #define LION_CLAUSE_RANGE	5	/* col < / <= / >= / > const, DESIGN.md §28 */
 #define LION_CLAUSE_RANGESRC	6	/* the same on a column that does not drive
-									 * the count: a source, DESIGN.md §31 */
+									 * the count: a source, DESIGN.md §32 */
 
 /*
  * A RANGE clause is neither: it is not a source of the count at all, but a
  * bound on the entry walk that drives it (DESIGN.md §28), so it is never
  * located, never merged and never priced as a lookup.  A RANGESRC clause is a
  * bound of a range on ANOTHER column, and the range is a positive source: the
- * rows whose key lies in it (DESIGN.md §31, "A range as a source").
+ * rows whose key lies in it (DESIGN.md §32, "A range as a source").
  */
 #define LION_CLAUSE_IS_POSITIVE(k) \
 	((k) != LION_CLAUSE_NOTNULL && (k) != LION_CLAUSE_RANGE)
@@ -363,6 +356,30 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_DISTINCT_TEST_COST	(50.0 * cpu_tuple_cost)
 
 /*
+ * ... and of each count a GROUP BY makes, one per entry of its column or pair
+ * of two (DESIGN.md §10, §20): the same set-up and tear-down, and the entry
+ * decoded, over and above its merge (lion_merge_cpu_cost()).  Measured on the
+ * release build over a 5M-row table: 1.0 us a test of a count(DISTINCT) walk
+ * of 20,000 one-container entries, 1.3 us a group of 200 whose sets are six
+ * RUN containers each.  A group of an IN list that drives the groups (§15)
+ * was located with the list and decodes nothing: 0.35 us a group, measured
+ * over 1,000 of them.
+ */
+#define LION_ENTRY_COUNT_COST	(50.0 * cpu_tuple_cost)
+#define LION_LIST_GROUP_COST	(18.0 * cpu_tuple_cost)
+
+/*
+ * ... and each set of a WHERE source that is a union (an IN list, an OR
+ * across columns), which every count of a GROUP BY builds again: its cursor
+ * set up and positioned over the set's copy, and its merge (DESIGN.md §15,
+ * §19).  Measured on the release build: 2 us a set for 4 groups ANDed with a
+ * list of 1,000 values of 100 rows each, and 2.7 and 6 us a set, a few us of
+ * which are the union's own set-up, for 200 groups of 250 rows ANDed with
+ * `a = 17 OR b = 3` and with `b IN (3, 4)`.
+ */
+#define LION_UNION_SET_COST		(100.0 * cpu_tuple_cost)
+
+/*
  * The fixed cost of one ENTRY of a range-bounded walk (DESIGN.md §28) - the
  * sum over a range, and a GROUP BY over one - over and above the containers
  * it reads: the walk resumes at a key (a leaf read and a binary search), the
@@ -388,12 +405,81 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 
 /*
  * The descents a summed walk over a summarized column makes on top of the
- * first (DESIGN.md §31): the walk of a side is up to three phases - the keys
+ * first (DESIGN.md §32): the walk of a side is up to three phases - the keys
  * below its first whole bucket, the whole buckets' summaries, the keys above
  * its last - and each phase after the first starts with a descent of its own
  * to where it begins, a root-to-leaf read each.
  */
 #define LION_SUMMARY_PHASE_DESCENTS	2.0
+
+/*
+ * THE MERGE'S CPU (DESIGN.md §10, "The units"), which lion_merge_cpu_cost()
+ * charges wherever posting sets are counted or intersected - the count
+ * pushdown's AND, each group of a GROUP BY and each pair of two, and the AND a
+ * lion index scan makes of several columns' sets (lioncostestimate()).
+ * Fitted on the release build (-O2, no assertions; 4-core VM, warm shared
+ * buffers) to the backend CPU time of 35 counts over a 5M-row table whose sets
+ * hold 1 to 4,500 rows a container - eleven sets alone, and pairs, triples
+ * and a quadruple of them ANDed - at 500 cost units a millisecond, the rate
+ * core's own scans of the same tables run at there (sequential scans 400 to
+ * 700, index-only scans 415 to 535):
+ *
+ *	CONTAINER	each container the driver reads and counts: 32 to 39 ns;
+ *	MEMBER		... and each of its members, which the visibility-map mask is
+ *				built from: 0.74 ns, up to MEMBER_CAP of them - a bitset costs
+ *				what an array of about a thousand members does;
+ *	PROBE		each seek of another source's posting tree to a container key
+ *				of the driver's, and the container it finds: 210 ns - with the
+ *				leaves the seeks move to fitted at 0.7 us a page, which the
+ *				model charges as I/O instead (lion_probed_pages());
+ *	AND_MEMBER	each member of the running intersection ANDed with what a
+ *				probe finds: 4 to 5 ns.
+ *
+ * Median residual 27%.  The model it replaces - two cpu_operator_cost a
+ * container, members and probes free - priced these counts at 87 to 46,000
+ * units a millisecond.
+ *
+ * MEMORY_PROBE is a probe of a set the count has copied into memory - the
+ * WHERE sets a GROUP BY intersects with every group, after their first use
+ * (DESIGN.md §9), and the outer entry's set of a two-column GROUP BY (§20): a
+ * binary search of the copy's containers, 100 to 200 ns, measured over
+ * 20,000 groups of 219 containers each and 1,000 of 38.
+ */
+#define LION_CONTAINER_COST		(8.0 * cpu_operator_cost)
+#define LION_MEMBER_COST		(0.15 * cpu_operator_cost)
+#define LION_MEMBER_CAP			1024.0
+#define LION_PROBE_COST			(40.0 * cpu_operator_cost)
+#define LION_MEMORY_PROBE_COST	(30.0 * cpu_operator_cost)
+#define LION_AND_MEMBER_COST	(0.8 * cpu_operator_cost)
+
+/*
+ * One level of an entry directory descended - a page pinned and locked, a
+ * binary search, the entry decoded - for a count's lookup of a key, an IN
+ * list's of each of its values, and the FK-side join's of each dimension row's
+ * key (DESIGN.md §21, §27).  Fitted on the release build to the FK-side join's
+ * 23 shapes (DESIGN.md §27, "Cost, revisited"): 0.6 us a directory page read,
+ * median residual 9%.  The page itself is charged separately, as I/O.
+ */
+#define LION_DESCENT_COST		(120.0 * cpu_operator_cost)
+
+/*
+ * One candidate TID of a heap recheck (DESIGN.md §9): the visibility check of
+ * its tuple, on a page the recheck has pinned (the page itself is charged as
+ * I/O).  Fitted on the release build to counts of 99 to 1M candidates on a
+ * 2M-row table whose every page had been made dirty, and to 2,100 on a
+ * clustered value whose map had gone stale: 24 to 29 ns a TID where a page
+ * holds 68 to 150 of them, up to 70 ns where it holds 34 scattered ones - one
+ * and a half of the rows cpu_tuple_cost stands for in a sequential scan
+ * (DESIGN.md §10, "The units").
+ *
+ * A GROUP BY rechecks each group's candidates on its own, and answers a page
+ * it has fetched out of the visibility cache from its second visit on: 130 ns
+ * a candidate over 200 groups of a whole dirty table (2M candidates, 1.6M
+ * answered from the cache), which one cpu_tuple_cost priced at 53,000 for
+ * 267 ms.
+ */
+#define LION_RECHECK_TID_COST	(1.5 * cpu_tuple_cost)
+#define LION_RECHECK_GROUP_TID_COST	(6.0 * cpu_tuple_cost)
 
 /* Which walk a range bounds, for the cost model (DESIGN.md §28). */
 #define LION_RANGED_NONE	0
@@ -401,7 +487,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_RANGED_SUM		2	/* the sum over the range's entries */
 #define LION_RANGED_SUMALL	3	/* the sum over every entry, `k IS NOT NULL`
 								 * alone (§14): priced as a range over all of
-								 * k when k has summaries (§31) */
+								 * k when k has summaries (§32) */
 
 /*
  * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
@@ -646,14 +732,14 @@ typedef struct LionSourceItem
 {
 	int			clauseno;		/* the clause, or the OR's first leaf */
 	int			orno;			/* -1, or the OR this item stands for */
-	bool		rangesrc;		/* a range as a source (DESIGN.md §31): the
+	bool		rangesrc;		/* a range as a source (DESIGN.md §32): the
 								 * first of its bounds, standing for all of
 								 * them */
 } LionSourceItem;
 
 /*
  * A range taken as a source that was too large to collect into memory
- * (DESIGN.md §31, "A range as a source"): what LionCountSource.rangewalk
+ * (DESIGN.md §32, "A range as a source"): what LionCountSource.rangewalk
  * points at, and what lion_node_count() expands into the sets a walk of the
  * range hands out.
  */
@@ -749,12 +835,12 @@ typedef struct LionCountScanState
 
 	/*
 	 * Summary entries the sums added up in place of the keys they cover
-	 * (DESIGN.md §31): what EXPLAIN ANALYZE prints as "Summaries Summed".
+	 * (DESIGN.md §32): what EXPLAIN ANALYZE prints as "Summaries Summed".
 	 */
 	int64		summaries;
 
 	/*
-	 * The ranges taken as sources (DESIGN.md §31, "A range as a source"): how
+	 * The ranges taken as sources (DESIGN.md §32, "A range as a source"): how
 	 * many were collected into memory, how many were too large and were
 	 * summed over their walk at every count instead, and what the collected
 	 * ones hold - all of them within one hash table's memory.
@@ -2092,6 +2178,46 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 	return Max(dirpages, 1.0);
 }
 
+/* A key column's n_distinct, or -1 for an expression column. */
+static double
+lion_index_column_nd(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					 int i)
+{
+	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
+	AttrNumber	attno = idx->indexkeys[i];
+	VariableStatData vardata;
+	Var		   *var;
+	double		nd;
+	bool		isdefault;
+
+	/* An expression column has no heap attribute to ask about. */
+	if (attno <= 0)
+		return -1.0;
+
+	var = makeVar(rel->relid, attno, get_atttype(rte->relid, attno), -1,
+				  get_typcollation(get_atttype(rte->relid, attno)), 0);
+	examine_variable(root, (Node *) var, 0, &vardata);
+	nd = get_variable_numdistinct(&vardata, &isdefault);
+	ReleaseVariableStats(vardata);
+	pfree(var);
+
+	return Max(nd, 1.0);
+}
+
+/* Is the relation one whose statistics the shares below can ask about? */
+static bool
+lion_index_shares_known(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
+{
+	RangeTblEntry *rte;
+
+	if (idx->nkeycolumns <= 1)
+		return false;
+	if (rel->relid == 0 || rel->relid >= (Index) root->simple_rel_array_size)
+		return false;
+	rte = root->simple_rte_array[rel->relid];
+	return rte != NULL && rte->rtekind == RTE_RELATION;
+}
+
 /*
  * ONE KEY COLUMN's share of a multicolumn lion index (DESIGN.md §24).
  *
@@ -2131,42 +2257,80 @@ static double
 lion_index_column_share(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					   AttrNumber col)
 {
-	RangeTblEntry *rte;
 	double		total = 0;
 	double		mine = 0;
 	int			i;
 
-	if (idx->nkeycolumns <= 1)
-		return 1.0;
-	if (rel->relid == 0 || rel->relid >= (Index) root->simple_rel_array_size)
-		return 1.0;
-	rte = root->simple_rte_array[rel->relid];
-	if (rte == NULL || rte->rtekind != RTE_RELATION)
+	if (!lion_index_shares_known(root, rel, idx))
 		return 1.0;
 
 	for (i = 0; i < idx->nkeycolumns; i++)
 	{
-		AttrNumber	attno = idx->indexkeys[i];
-		VariableStatData vardata;
-		Var		   *var;
-		double		nd;
-		bool		isdefault;
+		double		nd = lion_index_column_nd(root, rel, idx, i);
 
-		/* An expression column has no heap attribute to ask about. */
-		if (attno <= 0)
+		if (nd < 0.0)
 			return 1.0 / (double) idx->nkeycolumns;
-
-		var = makeVar(rel->relid, attno, get_atttype(rte->relid, attno), -1,
-					  get_typcollation(get_atttype(rte->relid, attno)), 0);
-		examine_variable(root, (Node *) var, 0, &vardata);
-		nd = get_variable_numdistinct(&vardata, &isdefault);
-		ReleaseVariableStats(vardata);
-		pfree(var);
-
-		nd = Max(nd, 1.0);
 		total += nd;
 		if (i == col - 1)
 			mine = nd;
+	}
+
+	if (total <= 0.0 || mine <= 0.0)
+		return 1.0 / (double) idx->nkeycolumns;
+
+	return Min(mine / total, 1.0);
+}
+
+/*
+ * ONE KEY COLUMN's share of a multicolumn lion index's CONTAINER pages
+ * (DESIGN.md §24).  lion_index_column_share() splits the relation by entries,
+ * which is right for the directory - a column has an entry per distinct
+ * value - and wrong for the posting sets: every row is under one entry of
+ * each scalar column, so a column's container pages follow its ROWS and what
+ * they cost to store, not its entries.  Split by n_distinct, the three values
+ * of a status column beside a column of 2,000 got 0.14% of a 110 MB index's
+ * pages where they hold a tenth of it, and `status = 'parked'` - a million
+ * rows over every container key - was priced at 16 for a 1 ms count.
+ *
+ * So each column is weighed by the bytes its sets take: nd entries of N / nd
+ * rows each, which lie in Min(container keys, N / nd) containers of a header
+ * each (16 bytes with its line pointer) and two bytes a member up to a
+ * bitset's 4 kB, or about six bytes a row where the rows are too few a
+ * container for one (a sparse segment, §13).  On that 110 MB index the
+ * estimate comes to 114 MB, the 2,000-value column 44% of it.
+ */
+double
+lion_index_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
+								IndexOptInfo *idx, AttrNumber col)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		ckeys = Max((double) rel->pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	double		total = 0;
+	double		mine = 0;
+	int			i;
+
+	if (!lion_index_shares_known(root, rel, idx))
+		return 1.0;
+
+	for (i = 0; i < idx->nkeycolumns; i++)
+	{
+		double		nd = lion_index_column_nd(root, rel, idx, i);
+		double		rows;
+		double		conts;
+		double		bytes;
+
+		if (nd < 0.0)
+			return 1.0 / (double) idx->nkeycolumns;
+		rows = tuples / nd;
+		conts = Min(ckeys, rows);
+		if (rows / conts <= 2.0)
+			bytes = nd * rows * 6.0;
+		else
+			bytes = nd * (conts * 16.0 +
+						  Min(2.0 * rows, conts * (double) LION_BITSET_BYTES));
+		total += bytes;
+		if (i == col - 1)
+			mine = bytes;
 	}
 
 	if (total <= 0.0 || mine <= 0.0)
@@ -2243,46 +2407,32 @@ lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
 }
 
 /*
- * The correlation between `var`'s values and the heap's physical order, from
- * its statistics, as btcostestimate() reads it; 0 when there is none.
+ * The correlation between `var`'s values and the heap's physical order, as
+ * lioncostestimate() reads it for a plain scan (lion_var_heap_correlation(),
+ * DESIGN.md §29.11): ANALYZE's number less the sum of the values' squared
+ * frequencies, which is what it comes out at for values placed at random;
+ * 0 when there is none.  Read raw, a column of a few values placed at random
+ * looked as though each value's rows were packed on a share of the heap, and
+ * the recheck of a count over one was priced on too few pages.
  */
 static double
 lion_var_correlation(PlannerInfo *root, RelOptInfo *rel, Var *var)
 {
-	VariableStatData vardata;
-	double		corr = 0.0;
-
-	examine_variable(root, (Node *) var, rel->relid, &vardata);
-	if (HeapTupleIsValid(vardata.statsTuple))
-	{
-		AttStatsSlot sslot;
-
-		if (get_attstatsslot(&sslot, vardata.statsTuple,
-							 STATISTIC_KIND_CORRELATION, InvalidOid,
-							 ATTSTATSSLOT_NUMBERS))
-		{
-			if (sslot.nnumbers > 0)
-				corr = sslot.numbers[0];
-			free_attstatsslot(&sslot);
-		}
-	}
-	ReleaseVariableStats(vardata);
-
-	return corr;
+	return lion_var_heap_correlation(root, rel->relid, var);
 }
 
 /*
  * How many containers a posting set of `members` members can span: one per
  * LION_BLOCKS_PER_CONTAINER heap pages, and never more than one per member.
  */
-static double
+double
 lion_containers_for(double heap_pages, double members)
 {
 	return Max(1.0, Min(heap_pages / LION_BLOCKS_PER_CONTAINER, members));
 }
 
 /*
- * Does key column col of idx have summary posting sets (DESIGN.md §31)?  What
+ * Does key column col of idx have summary posting sets (DESIGN.md §32)?  What
  * the index's meta page says, read through its cached state as a count reads
  * it; a column built without them has none until the next REINDEX.
  */
@@ -2296,6 +2446,51 @@ lion_index_col_summarized(IndexOptInfo *idx, AttrNumber col)
 	summarized = lion_index_column_state(indexrel, col)->summarized;
 	index_close(indexrel, AccessShareLock);
 	return summarized;
+}
+
+/*
+ * ... and how many the rows of ONE KEY of index column `col` do lie in: as
+ * many as they can when the column's values are placed at random, their
+ * share of the heap's container keys when it is stored in value order, and
+ * between the two by the correlation's square, as cost_index() interpolates
+ * pages (lion_var_heap_correlation(); lion_cost_range_sum() does the same for
+ * a range's entries).  A day of a table loaded in time order is one or two
+ * containers, not one at every container key: priced as scattered, a GROUP
+ * BY over 365 such days cost 4,650 for 0.6 ms.  An expression or a multi-key
+ * column has no correlation to go by and is taken as scattered.
+ */
+static double
+lion_key_containers(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					AttrNumber col, double members)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		scattered = lion_containers_for(heap_pages, members);
+	double		inorder;
+	double		corr;
+	AttrNumber	attno;
+	RangeTblEntry *rte;
+	Var		   *var;
+
+	if (col < 1 || col > idx->nkeycolumns || scattered <= 1.0)
+		return scattered;
+	attno = idx->indexkeys[col - 1];
+	if (attno <= 0 || rel->relid == 0 ||
+		rel->relid >= (Index) root->simple_rel_array_size)
+		return scattered;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_RELATION ||
+		lion_opfamily_is_multikey(idx->opfamily[col - 1],
+								  idx->opcintype[col - 1]))
+		return scattered;
+
+	var = makeVar(rel->relid, attno, get_atttype(rte->relid, attno), -1,
+				  idx->indexcollations[col - 1], 0);
+	corr = lion_var_correlation(root, rel, var);
+	pfree(var);
+
+	inorder = Max(1.0, members * (heap_pages / LION_BLOCKS_PER_CONTAINER) /
+				  Max(rel->tuples, 1.0));
+	return Max(1.0, scattered + (inorder - scattered) * corr * corr);
 }
 
 /*
@@ -2404,6 +2599,81 @@ lion_merge_ops(double heap_pages, double members, double nkeys)
 			LION_BITSET_WORDS + members;
 
 	return sifts + members * log2(nkeys);
+}
+
+/*
+ * What a merge that counts the AND of `nsrc` sources costs in CPU (DESIGN.md
+ * §10, "The units"; §22, §25): members[i] rows lying in containers[i]
+ * containers (a union's are its sets' together), of a table of `tuples` rows.
+ *
+ * The source with the fewest members drives: each of its containers is read
+ * and counted (LION_CONTAINER_COST, and LION_MEMBER_COST a member, up to a
+ * bitset's worth).  At each of its container keys the others are sought in
+ * ascending order of members, a probe each (LION_PROBE_COST, or
+ * LION_MEMORY_PROBE_COST for a source inmem[] says is a copy in memory) that
+ * ANDs the running intersection's members with what it finds
+ * (LION_AND_MEMBER_COST).
+ * A key is abandoned as soon as the intersection empties (§25), so the k'th
+ * source is sought only at the keys where the ones before it left a row: at
+ * 1 - exp(-lambda) of them, lambda the rows the intersection is expected to
+ * hold at a key when the columns are independent.  Without that the third
+ * source of `c20k = 77 AND c200 = 17 AND c2 = 1` was charged a probe at each
+ * of 219 keys, when c200 empties all but two of them, and the node was refused
+ * at 777 against a BitmapAnd's 237 for 0.03 ms against 2.8.
+ *
+ * probes[i], when probes is not NULL, is set to how often source i is sought
+ * (0 for the driver), for the pages those probes read.
+ */
+double
+lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
+					const bool *inmem, double tuples, double *probes)
+{
+	int		   *order;
+	int			i;
+	int			k;
+	double		keys;
+	double		lambda;
+	double		alive = 1.0;
+	double		cost;
+
+	if (nsrc <= 0)
+		return 0.0;
+
+	order = (int *) palloc(sizeof(int) * nsrc);
+	for (i = 0; i < nsrc; i++)
+	{
+		double		m = members[i];
+
+		/* insertion sort by members, ascending: the order the merge seeks in */
+		for (k = i; k > 0 && members[order[k - 1]] > m; k--)
+			order[k] = order[k - 1];
+		order[k] = i;
+	}
+
+	keys = Max(containers[order[0]], 1.0);
+	lambda = Max(members[order[0]], 0.0) / keys;
+	cost = keys * (LION_CONTAINER_COST +
+				   LION_MEMBER_COST * Min(lambda, LION_MEMBER_CAP));
+	if (probes != NULL)
+		probes[order[0]] = 0.0;
+
+	for (k = 1; k < nsrc; k++)
+	{
+		int			j = order[k];
+		double		sought = keys * alive;
+
+		cost += sought * ((inmem != NULL && inmem[j]) ?
+						  LION_MEMORY_PROBE_COST : LION_PROBE_COST);
+		cost += sought * LION_AND_MEMBER_COST * Min(lambda, LION_MEMBER_CAP);
+		if (probes != NULL)
+			probes[j] = sought;
+
+		lambda *= Min(Max(members[j], 0.0) / Max(tuples, 1.0), 1.0);
+		alive = 1.0 - exp(-lambda);
+	}
+
+	pfree(order);
+	return cost;
 }
 
 /*
@@ -2639,7 +2909,7 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
  *	  key steps are the smaller of the two containers' worth, once for every
  *	  source.  How many containers one key's rows lie in follows the column's
  *	  correlation with the heap, as cost_index() interpolates pages.
- *	- When k has SUMMARIES (DESIGN.md §31), a side that covers whole buckets
+ *	- When k has SUMMARIES (DESIGN.md §32), a side that covers whole buckets
  *	  walks only the keys of the buckets at its ends, entry by entry, and
  *	  counts each whole bucket's summary once instead of its keys
  *	  (lion_cost_range_side()).
@@ -2662,7 +2932,7 @@ static int *lion_rangesrc_leaders(List *whereidx, List *wherecol,
 								  List *wherekinds, List *ors, int nclause);
 
 /*
- * A summarized column (DESIGN.md §31), as the cost of a walk over it sees it:
+ * A summarized column (DESIGN.md §32), as the cost of a walk over it sees it:
  * how many keys one bucket holds, and what one bucket's summary costs to
  * count and to read.
  */
@@ -2674,7 +2944,7 @@ typedef struct LionSumModel
 } LionSumModel;
 
 /*
- * What one side of a summed range walk costs (DESIGN.md §28, §31): nkeys
+ * What one side of a summed range walk costs (DESIGN.md §28, §32): nkeys
  * entries of k in one run, each `perentry` and `pageper` pages - or, when k is
  * summarized (sum != NULL), the keys of the partial buckets at the run's
  * `nedges` ends one by one and each bucket it covers whole as ONE count of
@@ -2778,17 +3048,26 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * One entry: its fixed cost, and its containers' key steps against every
 	 * source of F.  Small ones are counted a leaf at a time.
 	 */
-	steps = (nsrc > 0) ? Min(percont, fcont) * (1.0 + nsrc) : percont;
+	{
+		double		m = Min(rowsper / Max(percont, 1.0), LION_MEMBER_CAP);
+		double		keys = (nsrc > 0) ? Min(percont, fcont) : percont;
+
+		/*
+		 * the driver's containers, and each of F's sources probed at them -
+		 * in memory, where a walk copies them on their second use (§9)
+		 */
+		steps = keys * (LION_CONTAINER_COST + LION_MEMBER_COST * m) +
+			keys * nsrc * (LION_MEMORY_PROBE_COST + LION_AND_MEMBER_COST * m);
+	}
 	perentry = ((percont <= (double) LION_SUM_UNION_MAX_ITEMS) ?
-				LION_RANGE_UNION_ENTRY_COST : LION_RANGE_ENTRY_COST) +
-		steps * cpu_operator_cost * 2.0;
+				LION_RANGE_UNION_ENTRY_COST : LION_RANGE_ENTRY_COST) + steps;
 
 	/* The leaves under one entry: its share of the column's pages. */
 	pageper = Max(1.0, (double) groupidx->pages *
 				  lion_index_column_share(root, rel, groupidx, groupcol)) / nd;
 
 	/*
-	 * The summaries (DESIGN.md §31).  A bucket closes at the first key that
+	 * The summaries (DESIGN.md §32).  A bucket closes at the first key that
 	 * brings it to summary_tids rows, so it holds that many rows - or one
 	 * key's, when a key alone has more - and bucketrows / rowsper keys.  Its
 	 * summary is ONE set of those rows, which lies in as many containers as
@@ -2803,11 +3082,15 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		double		sscattered = lion_containers_for(heap_pages, bucketrows);
 		double		sinorder = Max(1.0, bucketrows * ckeys / tuples);
 		double		sc = sscattered + (sinorder - sscattered) * corr * corr;
-		double		ssteps = (nsrc > 0) ? Min(sc, fcont) * (1.0 + nsrc) : sc;
+		double		sm = Min(bucketrows / Max(sc, 1.0), LION_MEMBER_CAP);
+		double		skeys = (nsrc > 0) ? Min(sc, fcont) : sc;
 
 		summodel.keysper = Max(1.0, bucketrows / rowsper);
+
+		/* the summary's containers, and F's sources probed at them, as above */
 		summodel.persum = LION_RANGE_ENTRY_COST +
-			ssteps * cpu_operator_cost * 2.0;
+			skeys * (LION_CONTAINER_COST + LION_MEMBER_COST * sm) +
+			skeys * nsrc * (LION_MEMORY_PROBE_COST + LION_AND_MEMBER_COST * sm);
 		summodel.sumpages = Max(1.0, summodel.keysper * pageper *
 								Min(1.0, sc / (summodel.keysper * percont)));
 		sum = &summodel;
@@ -2817,7 +3100,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 								  &incounts, &inpages);
 
 	/*
-	 * A range collected as a source (DESIGN.md §31) reads the same walk and
+	 * A range collected as a source (DESIGN.md §32) reads the same walk and
 	 * counts nothing, so it rechecks nothing either.
 	 */
 	if (collect)
@@ -2835,7 +3118,9 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 */
 	outside = lion_cost_range_side(nout, 2.0, sum, perentry, pageper,
 								   &outcounts, &outpages) +
-		fcont * (1.0 + nsrc) * cpu_operator_cost * 2.0 + random_page_cost +
+		fcont * (LION_CONTAINER_COST +
+				 LION_MEMBER_COST * Min(frows / fcont, LION_MEMBER_CAP) +
+				 nsrc * LION_PROBE_COST) + random_page_cost +
 		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
 						   Max(outcounts, 1.0), corr);
 
@@ -2867,7 +3152,7 @@ lion_index_col_var(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 }
 
 /*
- * A RANGE TAKEN AS A SOURCE (DESIGN.md §31, "A range as a source"): the rows
+ * A RANGE TAKEN AS A SOURCE (DESIGN.md §32, "A range as a source"): the rows
  * whose key lies in it, which the executor collects into memory once per
  * relation - the walk of the range, summaries and all, priced as the walk of
  * a summed range with nothing to AND and nothing to recheck - and then reads
@@ -2942,7 +3227,7 @@ lion_range_recheck(PlannerInfo *root, RelOptInfo *rel, double tids,
 	pages = Min(Min(tids, entries * perentry * dirtyfrac), 2.0 * pages);
 
 	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
-		tids * cpu_tuple_cost;
+		tids * LION_RECHECK_TID_COST;
 }
 
 static Cost
@@ -2965,9 +3250,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		seq_pages = 0;	/* container chains, read in order */
 	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
 	Cost		probe_cost = 0; /* what the SOUGHT sources read (§22) */
-	double		ncontainers = 0;
-	double	   *andc;			/* containers of each top-level AND source */
-	int			nand = 0;
+	Cost		read_cpu = 0;	/* containers read whole: unions, lists */
+	Cost		merge_cpu = 0;	/* the AND's driver and probes (§10) */
 	int		   *orgrp;			/* each clause's OR restriction, or -1 */
 	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
@@ -2981,9 +3265,11 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	int		   *clausesrc;		/* the AND source it is part of, or -1 */
 	double	   *srcmembers;		/* members of each AND source */
 	double	   *srccontainers;	/* and the containers they lie in */
+	bool	   *srcunion;		/* is it a union of several sets? */
+	double	   *srcsets;		/* ... of how many */
+	double	   *srcprobes;		/* how often each is sought */
 	int			nsrc;
 	int			driver = -1;	/* the source that drives the leapfrog */
-	double		probes = 0;		/* how often the others are sought */
 	int			nclause = list_length(whereclauses);
 	int			ci = 0;
 	int			i;
@@ -2995,9 +3281,11 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		ingroups = numgroups;	/* groups the node really emits */
 	double		recheckshare = 1.0; /* §26: what the existence tests recheck */
 	Cost		rangecost = 0;	/* §28: the walk of a summed range */
-	Cost		rangesrc_cost = 0;	/* §31: collecting the ranges taken as
+	Cost		rangesrc_cost = 0;	/* §32: collecting the ranges taken as
 									 * sources */
 	int		   *rangelead;		/* each clause's range source, or -1 */
+	double		listrows = 0;	/* rows of one entry of a group-driving list */
+	double		walked = 1.0;	/* counts the merge runs: groups, pairs */
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
@@ -3037,7 +3325,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	clausesrc = (int *) palloc0(sizeof(int) * Max(nclause, 1));
 	srcmembers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 	srccontainers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	andc = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	srcunion = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	srcsets = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	srcprobes = (double *) palloc0(sizeof(double) * (Max(nclause, 1) + 2));
 	orgrp = lion_or_group_map(ors, nclause);
 
 	/*
@@ -3075,7 +3365,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		}
 
 		/*
-		 * A range taken as a source (DESIGN.md §31): one source for all the
+		 * A range taken as a source (DESIGN.md §32): one source for all the
 		 * bounds of its conjunction, priced once, by the first of them.  It
 		 * is read from memory, so it is sought at no page cost; what it costs
 		 * is collecting it (lion_cost_range_source()).
@@ -3106,14 +3396,22 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			clauseleaves[ci - 1] = 1.0;
 			clauseidx[ci - 1] = Max((double) idx->pages, 1.0);
 
-			clc = lion_containers_for(heap_pages, tuples * sel);
+			/*
+			 * As one set of the AND, it drives the merge or is probed at the
+			 * driver's keys (lion_merge_cpu_cost()); as an OR's leaf, its
+			 * containers are all read into the union.
+			 */
+			clc = lion_key_containers(root, rel, idx,
+									  (AttrNumber) lfirst_int(lc4), tuples * sel);
 			if (orgrp[ci - 1] >= 0)
-				ncontainers += clc;
-			else
-				andc[nand++] = clc;
+				read_cpu += clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
+								   Min(tuples * sel / clc, LION_MEMBER_CAP));
 			clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
 			srcmembers[clausesrc[ci - 1]] += tuples * sel;
 			srccontainers[clausesrc[ci - 1]] += clc;
+			srcsets[clausesrc[ci - 1]] += 1.0;
+			if (orgrp[ci - 1] >= 0)
+				srcunion[clausesrc[ci - 1]] = true;
 			continue;
 		}
 
@@ -3133,7 +3431,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 										(AttrNumber) lfirst_int(lc4));
 		dirpages = lion_index_dir_pages(idx, &height);
 
-		container_pages = ((double) idx->pages - 1.0 - dirpages) * share;
+		container_pages = ((double) idx->pages - 1.0 - dirpages) *
+			lion_index_column_posting_share(root, rel, idx,
+											(AttrNumber) lfirst_int(lc4));
 		container_pages = Max(container_pages, 0.0);
 		dirpages = Max(dirpages * share, 1.0);
 
@@ -3202,6 +3502,17 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 			lookup_cost += lookups *
 				lion_heap_page_cost(root, rel, lookups, idx_pages);
+
+			/*
+			 * ... and each value's search: a binary search of its leaf, and
+			 * the levels above it too where the values are too sparse for the
+			 * walk to step from one to the next (a descent each, §21).  Free
+			 * before 2026-09-27, which chose a thousand-value list over a
+			 * near-unique column at 7.6 ms against the btree index-only scan's
+			 * 1.8.
+			 */
+			descent_cost += nkeys * LION_DESCENT_COST *
+				(1.0 + height * Min(1.0, dirpages / nkeys));
 			clausepages[ci - 1] = Min(Max(nkeys, container_pages * sel),
 									  container_pages);
 		}
@@ -3216,7 +3527,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 * page's worth per level.
 			 */
 			random_pages += 1.0;
-			descent_cost += (height + 1.0) * 50.0 * cpu_operator_cost;
+			descent_cost += (height + 1.0) * LION_DESCENT_COST;
 			clausepages[ci - 1] = Max(1.0, container_pages * sel);
 		}
 
@@ -3234,22 +3545,22 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		clauseidx[ci - 1] = Max((double) idx->pages, 1.0);
 
 		{
-			double		clc = nkeys * lion_containers_for(heap_pages,
+			double		clc = nkeys * lion_key_containers(root, rel, idx,
+														  (AttrNumber) lfirst_int(lc4),
 														  tuples * sel / nkeys);
 
 			/*
-			 * A source that is ANDed with the others is PROBED at their
-			 * container keys since DESIGN.md §22, so the intersection costs
-			 * the most selective source's containers once per source rather
-			 * than the sum of all of them.  An OR leaf is not an AND source -
-			 * it is part of one union, which is driven by whichever of its
-			 * arms has a container at a key - and neither is a list that
-			 * drives the groups, so both keep their own term.
+			 * A single set ANDed with the others is read only where it drives
+			 * the merge, and PROBED at the driver's container keys elsewhere
+			 * (DESIGN.md §22), which lion_merge_cpu_cost() prices below.  The
+			 * containers of an OR leaf and of an IN list's sets are all READ:
+			 * a union is built of them (§15, §19) or they are summed.  A list
+			 * that drives the groups is read one entry a group, below.
 			 */
-			if (orgrp[ci - 1] >= 0 || (groupdrive && ci - 1 == inlistci))
-				ncontainers += clc;
-			else
-				andc[nand++] = clc;
+			if (!(groupdrive && ci - 1 == inlistci) &&
+				(orgrp[ci - 1] >= 0 || nkeys > 1.0))
+				read_cpu += clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
+								   Min(tuples * sel / clc, LION_MEMBER_CAP));
 
 			/*
 			 * Which source of the AND this clause belongs to: the union of its
@@ -3264,6 +3575,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
 				srcmembers[clausesrc[ci - 1]] += tuples * sel;
 				srccontainers[clausesrc[ci - 1]] += clc;
+				srcsets[clausesrc[ci - 1]] += nkeys;
+				if (orgrp[ci - 1] >= 0 || nkeys > 1.0)
+					srcunion[clausesrc[ci - 1]] = true;
 			}
 		}
 
@@ -3298,7 +3612,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * every entry of the index.
 		 */
 		if (groupdrive && ci - 1 == inlistci)
+		{
 			ingroups = Min(nkeys, ingroups);
+			listrows = tuples * sel / nkeys;
+		}
 	}
 
 	/*
@@ -3329,28 +3646,6 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	pfree(orgrp);
 	pfree(rangelead);
 
-	/*
-	 * The AND of the clauses (DESIGN.md §22).  With the posting tree the merge
-	 * is a leapfrog join: whichever source keeps producing the largest
-	 * container key advances sequentially and the others SEEK to it, so the
-	 * work is the most selective source's containers times the number of
-	 * sources - one probe each - and not the sum over all of them, which is
-	 * what a walk of every chain cost.  Measured at one million rows,
-	 * `c20k = 77 AND c200 = 17 AND c2 = 1` visits 424 containers as a walk and
-	 * 140 as probes.  One source is its own minimum, so a single clause is
-	 * priced exactly as before.
-	 */
-	if (nand > 0)
-	{
-		double		andmin = andc[0];
-		int			k;
-
-		for (k = 1; k < nand; k++)
-			andmin = Min(andmin, andc[k]);
-
-		ncontainers += andmin * nand;
-	}
-	pfree(andc);
 
 	/*
 	 * WHAT THE SOURCES READ (DESIGN.md §22).  The same leapfrog decides it: the
@@ -3380,29 +3675,178 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * (DESIGN.md §9 - the sets a GROUP BY intersects with every group are
 	 * copied out on their second use and are probed in memory after that).
 	 */
+	/*
+	 * Which one drives is decided from the MEMBERS, as lion_run_merge() decides
+	 * it from the entries' `ntids` - not from the containers, which for a union
+	 * of k sets are counted k times over and would hand the merge to whichever
+	 * source happens to lie in the fewest of them.  What the driver then costs
+	 * the others is its CONTAINER KEYS, of which there are no more than the
+	 * heap has.
+	 */
 	if (nsrc > 0)
 	{
+		double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+		int			s;
+
+		for (s = 0; s < nsrc; s++)
+		{
+			if (driver < 0 || srcmembers[s] < srcmembers[driver])
+				driver = s;
+			srccontainers[s] = Min(srccontainers[s], ckeys);
+		}
+	}
+
+	/*
+	 * THE MERGE (DESIGN.md §10, "The units"; §22).  An ungrouped count is one
+	 * merge of the AND's sources, driven by the smallest and the others sought
+	 * at its keys (lion_merge_cpu_cost()) - unless its one source is a union,
+	 * whose containers are all read above and are the whole of the work.  A
+	 * grouped count runs one merge per GROUP, in which the group's own set is a
+	 * source like any other - it drives whenever it is smaller than the WHERE's
+	 * sets - and one per (outer, inner) PAIR of two group columns (§20).  Every
+	 * entry of the grouping column is counted, whatever the WHERE leaves of it
+	 * (lion_next_group() skips the empty ones only after counting them): so the
+	 * merges are its n_distinct, not the groups the planner expects out.  The
+	 * model before 2026-09-27 charged each group the containers of its share of
+	 * the WHERE's rows, which for `c20k, count(*) ... WHERE c20 = 3 GROUP BY
+	 * c20k` is 12 of the 219 each entry's own set lies in: 6,550 units for
+	 * 1,091 ms, where the sequential aggregate is 142,000 for 905.
+	 * A summed range prices its entries' merges itself (lion_cost_range_sum()).
+	 */
+	if (groupidx == NULL && !rangesum && nsrc > 0 &&
+		(nsrc > 1 || !srcunion[0]))
+		merge_cpu = lion_merge_cpu_cost(nsrc, srcmembers, srccontainers,
+										NULL, tuples, srcprobes);
+	else if (groupidx != NULL && !rangesum)
+	{
+		double	   *mem = (double *) palloc(sizeof(double) * (nsrc + 2));
+		double	   *keys = (double *) palloc(sizeof(double) * (nsrc + 2));
+		bool	   *inmem = (bool *) palloc0(sizeof(bool) * (nsrc + 2));
+		double		unionsets = 0;
+		double		gnd = -1.0;
+		double		gm;
+		double		per;
+		double		share = 1.0;
 		int			s;
 
 		/*
-		 * Which one drives is decided from the MEMBERS, as lion_run_merge()
-		 * decides it from the entries' `ntids` - not from the containers, which
-		 * for a union of k sets are counted k times over and would hand the
-		 * merge to whichever source happens to lie in the fewest of them.  What
-		 * the driver then costs the others is its CONTAINER KEYS, of which
-		 * there are no more than the heap has.
+		 * The WHERE's sets are copied into memory on their second use and
+		 * probed there by every group after that (DESIGN.md §9); a group's
+		 * own set is located from the index for its one count.
 		 */
 		for (s = 0; s < nsrc; s++)
-			if (driver < 0 || srcmembers[s] < srcmembers[driver])
-				driver = s;
-		probes = Min(srccontainers[driver],
-					 Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0));
+		{
+			mem[s] = srcmembers[s];
+			keys[s] = srccontainers[s];
+			inmem[s] = true;
+		}
 
-		if (groupidx != NULL)
-			probes = Max(ingroups, 1.0) *
-				Min(lion_containers_for(heap_pages,
-										matching / Max(numgroups, 1.0)),
-					probes);
+		/* the rows of one group's own set, and how many groups are counted */
+		if (groupdrive)
+		{
+			gm = Max(listrows, 1.0);
+			walked = Max(ingroups, 1.0);
+		}
+		else
+		{
+			if (groupcol >= 1 && groupcol <= groupidx->nkeycolumns &&
+				rel->relid > 0 && rel->relid < (Index) root->simple_rel_array_size &&
+				root->simple_rte_array[rel->relid] != NULL &&
+				root->simple_rte_array[rel->relid]->rtekind == RTE_RELATION)
+				gnd = lion_index_column_nd(root, rel, groupidx, groupcol - 1);
+			if (gnd > 0.0)
+			{
+				gm = tuples / gnd;
+				walked = Max(gnd * drivefrac, 1.0);
+			}
+			else
+			{
+				gm = tuples / Max(numgroups, 1.0);
+				walked = Max(ingroups, 1.0);
+			}
+		}
+		mem[nsrc] = gm;
+		keys[nsrc] = lion_key_containers(root, rel, groupidx, groupcol, gm);
+
+		/*
+		 * A WHERE source that is a union - an IN list, an OR - is built again
+		 * by every count, each of its sets' cursors set up and positioned
+		 * over the copy in memory (LION_UNION_SET_COST a set).
+		 */
+		for (s = 0; s < nsrc; s++)
+			if (srcunion[s])
+				unionsets += srcsets[s];
+
+		if (groupidx2 == NULL)
+		{
+			/*
+			 * The count(DISTINCT k) walk over k's entries (DESIGN.md §26)
+			 * tests each entry for ONE visible row and stops there, so it
+			 * reads the share of each entry's intersection
+			 * lion_exists_fraction() expects - one container or two when the
+			 * entries are dense, all of it when the WHERE leaves most of them
+			 * empty - and rechecks that share of the candidates.
+			 */
+			if (distinct == LION_DISTINCT_EXISTS)
+			{
+				double		drvkeys = keys[nsrc];
+
+				/* the test walks the merge's driver: the smallest source */
+				for (s = 0; s < nsrc; s++)
+					if (mem[s] < mem[nsrc])
+						drvkeys = Min(drvkeys, keys[s]);
+				share = lion_exists_fraction(drvkeys, matching / walked);
+				recheckshare = share;
+			}
+			per = lion_merge_cpu_cost(nsrc + 1, mem, keys, inmem, tuples,
+									  srcprobes) + unionsets * LION_UNION_SET_COST;
+			merge_cpu = walked * per * share;
+
+			/*
+			 * ... and each count's own set-up and tear-down (a memory context,
+			 * the sources' cursors, the visibility-map state): a distinct
+			 * walk's test prices it (LION_DISTINCT_TEST_COST, below), a range's
+			 * walk its entry (LION_RANGE_ENTRY_COST).
+			 */
+			if (distinct == LION_DISTINCT_NONE && rangevar == NULL)
+				merge_cpu += walked * (groupdrive ? LION_LIST_GROUP_COST :
+									   LION_ENTRY_COUNT_COST);
+		}
+		else
+		{
+			/*
+			 * A second GROUP BY column (DESIGN.md §20): every (outer, inner)
+			 * PAIR of the two indexes' entries is a count of its own, the
+			 * two groups' sets and the WHERE's merged, whether or not the
+			 * intersection comes out empty.  Two groups whose rows are
+			 * scattered over the whole heap have a container at nearly every
+			 * container key, which is what makes a pair expensive even when
+			 * their intersection is empty.
+			 */
+			double		oe = Max(outer_entries, 1.0);
+			double		ie = Max(inner_entries, 1.0);
+
+			mem[nsrc] = tuples / oe;
+			keys[nsrc] = lion_key_containers(root, rel, groupidx, groupcol,
+											 tuples / oe);
+			mem[nsrc + 1] = tuples / ie;
+			keys[nsrc + 1] = lion_key_containers(root, rel, groupidx2,
+												 groupcol2, tuples / ie);
+			/*
+			 * The early exit of a count(DISTINCT k)'s pair test is NOT
+			 * discounted: a pair's time is its lookup and its merge's set-up
+			 * far more than its members.  Discounted, 200 x 50 pairs over 100k
+			 * rows were chosen at 10,566 for 45 ms against the sorting
+			 * aggregate's 10,694 for 27.
+			 */
+			per = lion_merge_cpu_cost(nsrc + 2, mem, keys, inmem, tuples,
+									  srcprobes) + unionsets * LION_UNION_SET_COST;
+			walked = oe * ie;
+			merge_cpu = walked * per;
+		}
+		pfree(mem);
+		pfree(keys);
+		pfree(inmem);
 	}
 
 	for (i = 0; i < nclause; i++)
@@ -3419,7 +3863,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		{
 			pages = Min(pages,
 						clausekeys[i] * lion_probed_pages(clauseleaves[i],
-														  probes,
+														  srcprobes[clausesrc[i]] * walked,
 														  clauseheight[i]));
 			probe_cost += pages *
 				lion_heap_page_cost(root, rel, pages, clauseidx[i]);
@@ -3433,6 +3877,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	pfree(clausesrc);
 	pfree(srcmembers);
 	pfree(srccontainers);
+	pfree(srcunion);
+	pfree(srcsets);
+	pfree(srcprobes);
 
 	/*
 	 * The entry scan of the driving index - unless an IN list on that very
@@ -3450,31 +3897,20 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * a range bounds the walk to drivefrac of those (§28), the share of
 		 * the column's entries it selects.
 		 */
-		double		pergroup = lion_containers_for(heap_pages,
-												   matching / Max(numgroups, 1.0));
-		double		share = 1.0;
-
 		seq_pages += Max(1.0, (double) groupidx->pages *
 						 lion_index_column_share(root, rel, groupidx,
 												 groupcol) * drivefrac);
 
 		/*
-		 * The count(DISTINCT k) walk over k's entries (DESIGN.md §26) tests
-		 * each entry for ONE visible row and stops there, so it reads the
-		 * share of each entry's intersection lion_exists_fraction() expects
-		 * - one container or two when the entries are dense, all of it when
-		 * the WHERE leaves most of them empty - and rechecks that share of
-		 * the candidates.  Beside a GROUP BY this is the group's own test,
-		 * which the pairs below come on top of.
+		 * Beside a second GROUP BY column a count(DISTINCT k) tests each
+		 * group of the first for a row as well, which the pairs' tests come
+		 * on top of (DESIGN.md §26).
 		 */
-		if (distinct != LION_DISTINCT_NONE &&
-			(distinct == LION_DISTINCT_EXISTS || groupidx2 != NULL))
-		{
-			share = lion_exists_fraction(pergroup,
-										 matching / Max(numgroups, 1.0));
-			recheckshare = share;
-		}
-		ncontainers += numgroups * pergroup * share;
+		if (distinct != LION_DISTINCT_NONE && groupidx2 != NULL)
+			recheckshare = lion_exists_fraction(
+												lion_containers_for(heap_pages,
+																	matching / Max(numgroups, 1.0)),
+												matching / Max(numgroups, 1.0));
 	}
 
 	/*
@@ -3518,9 +3954,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		seq_pages += Max(1.0, (double) groupidx2->pages *
 						 lion_index_column_share(root, rel, groupidx2,
 												 groupcol2));
-		pair_cost = Max(oe * ie, numgroups) * cpu_tuple_cost;
-		merge_ops += Min(oe, ie) * tuples;
-		ncontainers += oe * ie * (co + cinner);
+		pair_cost = Max(oe * ie, numgroups) *
+			((distinct == LION_DISTINCT_NONE) ? LION_ENTRY_COUNT_COST :
+			 cpu_tuple_cost);
 
 		/*
 		 * The (g, k) pairs of a count(DISTINCT k) per group (DESIGN.md §26)
@@ -3542,8 +3978,6 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				1.0;
 		}
 	}
-	ncontainers = Max(ncontainers, 1.0);
-
 	/*
 	 * ... and the fixed cost of the tests of a count(DISTINCT k) that are not
 	 * pairs (DESIGN.md §26): one per entry of k the walk visits - or per
@@ -3655,11 +4089,12 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += lookup_cost;
 	run += seq_pages * seq_page_cost;
 	run += probe_cost;
-	run += ncontainers * cpu_operator_cost * 2.0;	/* block mask + VM mask */
+	run += read_cpu + merge_cpu;	/* containers, members, probes (§10) */
 	run += merge_ops * cpu_operator_cost;
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											  heap_pages);
-	run += recheck_tids * cpu_tuple_cost;
+	run += recheck_tids * ((groupidx != NULL && !rangesum) ?
+						   LION_RECHECK_GROUP_TID_COST : LION_RECHECK_TID_COST);
 	run += ingroups * cpu_tuple_cost;
 	run += pair_cost;
 	run += rangecost;
@@ -3694,7 +4129,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		Var		   *rangevar;
 
 		/*
-		 * The sum over every entry of a summarized column (DESIGN.md §31) is
+		 * The sum over every entry of a summarized column (DESIGN.md §32) is
 		 * the sum over its summaries: a range over all of it, and priced as
 		 * one.  Without summaries - in this relation: partitions differ - it
 		 * is the walk over every entry it always was.
@@ -3729,7 +4164,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		 */
 		run += lion_cost_recheck(root, t->rel, t->whereidx, t->wherecol,
 								 whereclauses, wherekinds, ors,
-								 t->rel->rows, numgroups, t->rel->tuples);
+								 lion_probe_rel_rows(root, t->rel), numgroups,
+								 t->rel->tuples);
 
 		/*
 		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
@@ -4083,13 +4519,15 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	/* ---- one lookup and one count per dimension row ---- */
 	share = lion_index_column_share(root, rel, fkidx, fkcol);
 	dirpages = lion_index_dir_pages(fkidx, &height);
-	container_pages = Max(((double) fkidx->pages - 1.0 - dirpages) * share, 0.0);
+	container_pages = Max(((double) fkidx->pages - 1.0 - dirpages) *
+						  lion_index_column_posting_share(root, rel, fkidx,
+														  fkcol), 0.0);
 	dirpages = Max(dirpages * share, 1.0);
 
 	lookups = Min(dimrows, dirpages);
 	run += lookups * lion_heap_page_cost(root, rel, lookups,
 										 Max((double) fkidx->pages, 1.0));
-	run += dimrows * (height + 1.0) * LION_FKJOIN_DESCENT_COST;
+	run += dimrows * (height + 1.0) * LION_DESCENT_COST;
 	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
@@ -4115,7 +4553,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		}
 
 		/*
-		 * A range taken as a source (DESIGN.md §31): collected once, by the
+		 * A range taken as a source (DESIGN.md §32): collected once, by the
 		 * first of its bounds, and read from memory by every count - or walked
 		 * by each, when it is too large to collect (lion_cost_range_source()).
 		 */
@@ -4202,10 +4640,13 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		cshare = lion_index_column_share(root, rel, idx,
 										 (AttrNumber) lfirst_int(lc4));
 		cdir = lion_index_dir_pages(idx, &cheight);
-		cpages = Max(((double) idx->pages - 1.0 - cdir) * cshare, 0.0);
+		cpages = Max(((double) idx->pages - 1.0 - cdir) *
+					 lion_index_column_posting_share(root, rel, idx,
+													 (AttrNumber) lfirst_int(lc4)),
+					 0.0);
 
 		run += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
-			nkeys * (cheight + 1.0) * 50.0 * cpu_operator_cost;
+			nkeys * (cheight + 1.0) * LION_DESCENT_COST;
 		run += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
 	}
 
@@ -4276,10 +4717,13 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	run += *collect ? collected : probed;
 
 	/*
-	 * The fk set's containers at every count, as §10 charges a container (a
-	 * block mask and a visibility-map mask).
+	 * The fk set's containers at every count, read and counted as any count's
+	 * are (lion_merge_cpu_cost(): LION_CONTAINER_COST, and LION_MEMBER_COST a
+	 * member of them).
 	 */
-	run += found * cfk * readshare * cpu_operator_cost * 2.0;
+	run += found * cfk * readshare *
+		(LION_CONTAINER_COST + LION_MEMBER_COST * Min(perkey / cfk,
+													   LION_MEMBER_CAP));
 
 	/* ---- the heap the visibility map cannot vouch for ---- */
 	matched = Min(found * perkey, tuples) * wheresel * readshare;
@@ -4287,7 +4731,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	recheck_pages = Min(recheck_tids, heap_pages * dirtyfrac);
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											   heap_pages);
-	run += recheck_tids * cpu_tuple_cost;
+	run += recheck_tids * LION_RECHECK_TID_COST;
 
 	/* ---- a partial row per dimension row that finds one ---- */
 	run += found * cpu_tuple_cost;
@@ -4636,7 +5080,7 @@ typedef struct LionLeafInfo
  *
  * allow_range says the same of a range comparison (DESIGN.md §28), which
  * bounds the entry walk that drives the count or, on another column, is a
- * range taken as a source (§31).  Every caller allows it now - an OR's arm
+ * range taken as a source (§32).  Every caller allows it now - an OR's arm
  * takes a range as a source, the rows the union of its sets holds - and it is
  * the caller that decides which of the two a range is.
  *
@@ -5101,7 +5545,7 @@ lion_or_group_map(List *ors, int nclause)
 /*
  * The ARM each clause is a leaf of, numbered across every OR restriction (-1
  * for a clause that is not an OR's leaf): the bounds of one range in one arm
- * are one source (DESIGN.md §31), and the same column's bounds in two arms
+ * are one source (DESIGN.md §32), and the same column's bounds in two arms
  * are two.
  */
 static int *
@@ -5137,7 +5581,7 @@ lion_or_arm_map(List *ors, int nclause)
 
 /*
  * For each clause, the clause that stands for its range when it is a bound of
- * a range taken as a source (DESIGN.md §31): the first RANGESRC clause on the
+ * a range taken as a source (DESIGN.md §32): the first RANGESRC clause on the
  * same key column of the same index in the same conjunction - the top level,
  * or one OR arm.  -1 for every other clause.  The executor groups them the
  * same way (lion_begin_custom_scan(), lion_locate_or()).
@@ -6150,7 +6594,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 /*
  * Turn the RANGE clauses of every range column but `keep` (an index into
  * rangepos, or -1 for none) into bounds of ranges taken as sources
- * (DESIGN.md §31): LION_CLAUSE_RANGESRC in the clause lists, which is all the
+ * (DESIGN.md §32): LION_CLAUSE_RANGESRC in the clause lists, which is all the
  * executor goes by.
  */
 static void
@@ -6218,12 +6662,12 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	Var		   *notnullvar = NULL;	/* the first `IS NOT NULL` column */
 	Var		   *rangevar = NULL;	/* the column the RANGE clauses bound (§28) */
 	List	   *rangeclauses = NIL; /* ... and those clauses' RestrictInfos */
-	List	   *rangevars = NIL;	/* every column a range bounds (§28, §31) */
+	List	   *rangevars = NIL;	/* every column a range bounds (§28, §32) */
 	List	   *rangecls = NIL;		/* ... its clauses' RestrictInfos, a List
 									 * per column */
 	List	   *rangepos = NIL;		/* ... and their positions in the clause
 									 * lists, an IntList per column */
-	bool		hasrangesrc = false;	/* a range is a source (§31) */
+	bool		hasrangesrc = false;	/* a range is a source (§32) */
 	bool		pinnedsrc = false;	/* a source outside ranges that holds the
 									 * §9 pin: a clause, or an OR of them */
 	Selectivity rangesel = 1.0; /* the share of its entries they select */
@@ -6492,7 +6936,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 					/*
 					 * A range in an arm is a leaf of the union like any other:
-					 * the rows whose key lies in it, collected (DESIGN.md §31).
+					 * the rows whose key lies in it, collected (DESIGN.md §32).
 					 */
 					if (leaf.kind == LION_CLAUSE_RANGE)
 					{
@@ -6516,7 +6960,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			/*
 			 * A union holds the §9 pin at every container key only when every
 			 * leaf does, which a range collected into memory does not
-			 * (DESIGN.md §31).
+			 * (DESIGN.md §32).
 			 */
 			if (thisrange)
 				hasrangesrc = true;
@@ -6531,7 +6975,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		/*
 		 * A range comparison (DESIGN.md §28) bounds the entry walk that DRIVES
 		 * the count - or, on a column that does not drive it, is a bound of a
-		 * range taken as a source (§31) - which is decided once everything
+		 * range taken as a source (§32) - which is decided once everything
 		 * else is known.  Any number of them may name one column: they are
 		 * ANDed into one range, and they are gathered per column here.  A
 		 * strict comparison is never true of NULL, so the column is non-NULL
@@ -6691,7 +7135,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	/*
 	 * The FK-side join's fact filters are all sources, ANDed with every fk
 	 * set, so every range among them is a range taken as a source (DESIGN.md
-	 * §31); the fk set of each dimension row is what carries the §9 pin.
+	 * §32); the fk set of each dimension row is what carries the §9 pin.
 	 */
 	if (fj != NULL && rangevars != NIL)
 	{
@@ -6882,11 +7326,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Which range bounds the walk that DRIVES the count (DESIGN.md §28): the
 	 * one on the column the GROUP BY or the count(DISTINCT) walks, or - with
 	 * neither - the WIDEST range, whose sum is then the count: it walks the
-	 * fewer sets of the two sides (the complement, and the summaries of §31,
+	 * fewer sets of the two sides (the complement, and the summaries of §32,
 	 * make a wide walk short) where a range taken as a source is collected
 	 * row by row.  A column with an equality, a list or a null test of its
 	 * own does not drive: those are positive clauses on it, which §10 leaves
-	 * to the ordinary merge.  Every other range is a source (§31).
+	 * to the ordinary merge.  Every other range is a source (§32).
 	 */
 	if (rangevars != NIL)
 	{
@@ -6971,7 +7415,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 
 	/*
-	 * A range taken as a source (DESIGN.md §31) is collected into memory and
+	 * A range taken as a source (DESIGN.md §32) is collected into memory and
 	 * holds no pin, so every count it takes part in needs another source that
 	 * carries the §9 interlock, or it would recheck every row in the heap: the
 	 * walk that drives the count, or a clause - or an OR of clauses - outside
@@ -6985,7 +7429,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * The range left bounding a walk has to bound the one that DRIVES the
 	 * count (DESIGN.md §28): k's entries under a GROUP BY k, a count(DISTINCT
 	 * k) or the sum above, or g's under `g, count(DISTINCT k) ... GROUP BY g`.
-	 * Every other range was made a source above (§31), so this only guards
+	 * Every other range was made a source above (§32), so this only guards
 	 * against the two halves of this function drifting apart.
 	 */
 	if (rangevar != NULL &&
@@ -8578,7 +9022,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			continue;
 
 		/*
-		 * A range taken as a source (DESIGN.md §31) is ONE source however many
+		 * A range taken as a source (DESIGN.md §32) is ONE source however many
 		 * bounds it has: the first bound on its column opens it, for all of
 		 * them.  Under an OR the same goes per arm (lion_locate_or()).
 		 */
@@ -9179,7 +9623,7 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 }
 
 /*
- * Locate a range taken as a source (DESIGN.md §31, "A range as a source"):
+ * Locate a range taken as a source (DESIGN.md §32, "A range as a source"):
  * the rows whose key lies in it, which is the union of the disjoint sets a
  * walk of it hands out - entries, and the summaries of the buckets it covers
  * whole.  They are COLLECTED into one private set when that fits what is
@@ -9284,7 +9728,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 			armfirst += orst->armlen[arm++];
 
 		/*
-		 * A range in an arm (DESIGN.md §31) is one leaf however many bounds
+		 * A range in an arm (DESIGN.md §32) is one leaf however many bounds
 		 * it has there: the first bound on its column stands for all of them
 		 * and the others are absorbed into it.
 		 */
@@ -9533,7 +9977,7 @@ lion_locate_where(LionCountScanState *st)
 			continue;
 		}
 
-		/* A range as a source (DESIGN.md §31): collected, or walked. */
+		/* A range as a source (DESIGN.md §32): collected, or walked. */
 		if (st->item[k].rangesrc)
 		{
 			LionRangeSource *rs = lion_rangesrc_range(st, 0, st->nclause, true,
@@ -9951,7 +10395,7 @@ lion_count_scan_filtered(LionCountScanState *st)
 /*
  * Is src a positive source that can drive a count of F minus a NULL entry
  * (the complement of DESIGN.md §28)?  A COLLECTED set - a range taken as a
- * source (§31) - cannot: it holds no pin, and a count it drove alone would
+ * source (§32) - cannot: it holds no pin, and a count it drove alone would
  * have nothing to carry the §9 interlock and would recheck every row in the
  * heap.  A range still to be walked can: its pieces are located sets.
  */
@@ -9975,7 +10419,7 @@ static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
  * Every count the node makes, and every existence test (`exists`: 1 or 0),
  * goes through here: the AND of sources, as lion_count_sources_cached()
  * counts it - once any range taken as a source that was too large to collect
- * (LionCountSource.rangewalk; DESIGN.md §31) has been expanded.  Such a range
+ * (LionCountSource.rangewalk; DESIGN.md §32) has been expanded.  Such a range
  * is the union of the disjoint sets a walk of it hands out, so the count is
  * the SUM of the counts of those sets, each ANDed with the other sources in
  * its place (lion_walk_count()); the counts of the pieces come back through
@@ -10060,7 +10504,7 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 	/*
 	 * A sum only adds up what the walk hands out, so it may be handed the
 	 * column's SUMMARY entries in place of the keys they cover (DESIGN.md
-	 * §31): still disjoint sets, still exactly the rows of the part.
+	 * §32): still disjoint sets, still exactly the rows of the part.
 	 */
 	lion_entry_scan_begin_sum(&st->escan, st->groupidx, st->groupidxcol,
 							  st->hasrange ? &st->range : NULL, part);
@@ -10241,7 +10685,7 @@ lion_range_choose_on(Relation index, AttrNumber col, LionRange *range,
 
 	/*
 	 * |F − NULL(k)| needs a source of F that can drive it, which a range
-	 * collected as a source (DESIGN.md §31) cannot (lion_source_drives()).
+	 * collected as a source (DESIGN.md §32) cannot (lion_source_drives()).
 	 */
 	for (i = 0; i < nsource; i++)
 		if (i != skip && lion_source_drives(&sources[i]))
@@ -10252,7 +10696,7 @@ lion_range_choose_on(Relation index, AttrNumber col, LionRange *range,
 		return LION_RANGE_EVAL_INSIDE;	/* the planner never picks one */
 
 	/*
-	 * The walks that will be counted, summaries and all (DESIGN.md §31): a
+	 * The walks that will be counted, summaries and all (DESIGN.md §32): a
 	 * side is as long as the sets it would count, whatever they stand for.
 	 */
 	lion_entry_scan_begin_sum(&in, index, col, range, LION_WALK_INSIDE);
@@ -10302,7 +10746,7 @@ lion_range_choose(LionCountScanState *st, LionCountSource *sources,
  * The SUM over the sets one part (LION_WALK_*) of a walk of rs's range hands
  * out, each ANDed with the other sources in slot's place: the counting half of
  * lion_sum_walk(), for a range taken as a source that was too large to
- * collect (DESIGN.md §31).  It has an entry scan and a memory context of its
+ * collect (DESIGN.md §32).  It has an entry scan and a memory context of its
  * own, because it runs inside the counts of another walk - the driver's - and
  * must leave that walk's batch alone.  The entries of one leaf are one count
  * when they are small and one each when they are not, as lion_sum_walk()
@@ -10390,7 +10834,7 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 
 /*
  * The AND of sources with a range taken as a source in slot w that was too
- * large to collect (DESIGN.md §31, "A range as a source"): the range's column
+ * large to collect (DESIGN.md §32, "A range as a source"): the range's column
  * drives the count as it drives a summed range (§28) - the sum over the sets
  * of its inside, or the count of the other sources minus the column's NULL
  * entry less the sums over the entries below and above it, whichever side
@@ -11148,7 +11592,7 @@ lion_join_collect(LionCountScanState *st)
 
 	/*
 	 * A range taken as a source that was too large to collect on its own
-	 * (DESIGN.md §31) is not a set to collect either; the counts walk it.
+	 * (DESIGN.md §32) is not a set to collect either; the counts walk it.
 	 */
 	for (k = 0; k < st->nitem; k++)
 	{
@@ -12190,7 +12634,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (orno < 0 && st->item[i].rangesrc)
 		{
 			/*
-			 * A range taken as a source (DESIGN.md §31): its index and all
+			 * A range taken as a source (DESIGN.md §32): its index and all
 			 * of its bounds, `ix (k >= 10 AND k < 20)`.
 			 */
 			LionClauseState *first = &st->clause[st->item[i].clauseno];
@@ -12427,7 +12871,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		}
 
 		/*
-		 * The summaries (DESIGN.md §31) a sum added up in place of the keys
+		 * The summaries (DESIGN.md §32) a sum added up in place of the keys
 		 * they cover, among the Posting Sets Summed.  Only when there were
 		 * any, so that an index without summaries prints what it always did.
 		 */
@@ -12435,7 +12879,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			ExplainPropertyInteger("Summaries Summed", NULL, st->summaries, es);
 
 		/*
-		 * The ranges taken as sources (DESIGN.md §31): collected into memory,
+		 * The ranges taken as sources (DESIGN.md §32): collected into memory,
 		 * or - too large for it - summed over their walk at every count they
 		 * are part of.  Again only when there were any.
 		 */

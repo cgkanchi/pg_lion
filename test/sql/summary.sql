@@ -1,4 +1,4 @@
--- Summary posting sets (DESIGN.md §31).
+-- Summary posting sets (DESIGN.md §32).
 --
 -- A summarized key column keeps, after its values, one SUMMARY entry per
 -- bucket of consecutive keys holding the union of their posting sets; a range
@@ -160,7 +160,7 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE r < 8900 AND (g = 1 OR k = 7)
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k >= 3 AND g = 2');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k >= 3 AND k < 790 AND u > 1000');
 
--- ---------- 3. two bounds on one side (DESIGN.md §31: the tightest one) ----------
+-- ---------- 3. two bounds on one side (DESIGN.md §32: the tightest one) ----------
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u < 19900 AND u <= 19950 AND g = 3');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u <= 19950 AND u < 19900 AND g = 3');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u > 50 AND u >= 20 AND g = 3');

@@ -396,7 +396,7 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 
 	/*
 	 * Version 6 is the base format and version 7 the same with summary posting
-	 * sets (DESIGN.md §31): both are read, and a version 6 index is one whose
+	 * sets (DESIGN.md §32): both are read, and a version 6 index is one whose
 	 * columns have no summaries.  Anything older predates a format change that
 	 * moved or reinterpreted items, and anything newer is a format this build
 	 * does not know.
@@ -414,7 +414,7 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.")));
 
 	/*
-	 * The summary words (§31) must agree with the version: a version 6 meta
+	 * The summary words (§32) must agree with the version: a version 6 meta
 	 * page has zeros there, and a version 7 one names at least one column and
 	 * a bucket size a build could have chosen.
 	 */
@@ -1071,7 +1071,7 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 		lion_fill_column_state(index, &ix->cols[i], (AttrNumber) (i + 1), cxt);
 
 		/*
-		 * Summaries (DESIGN.md §31) are recorded per column by the build, which
+		 * Summaries (DESIGN.md §32) are recorded per column by the build, which
 		 * gives them only to an ordered scalar column; a meta page that names
 		 * another is not one a build wrote.
 		 */

@@ -145,7 +145,7 @@ typedef struct LionVerifyState
 	/* per key column (DESIGN.md §24): at most one of each, per column */
 	int64		nnullentries[INDEX_MAX_KEYS];
 	int64		nemptyentries[INDEX_MAX_KEYS];
-	int64		nlastsummaries[INDEX_MAX_KEYS];	/* §31: at most one */
+	int64		nlastsummaries[INDEX_MAX_KEYS];	/* §32: at most one */
 	uint16		lastattno;		/* attno of the last leaf entry seen */
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */
 	Oid			keyoutfunc;		/* output function of the column being checked */
@@ -284,7 +284,7 @@ typedef struct LionColStats
 	int64		inline_slack_bytes; /* ... and inside INLINE payloads (§4) */
 
 	/*
-	 * SUMMARY entries (DESIGN.md §31), which none of the counters above
+	 * SUMMARY entries (DESIGN.md §32), which none of the counters above
 	 * include: those describe the column's keys, and a summary is a second
 	 * copy of some of their rows.  These say what that copy costs - its
 	 * entries, the rows it holds, the bytes of its items and the posting pages
@@ -301,7 +301,7 @@ typedef struct LionSetStats
 {
 	BlockNumber head;			/* hash key: the set's root block */
 	uint16		attno;			/* 0 until the owning entry is seen */
-	bool		summary;		/* ... and it is a summary's (§31) */
+	bool		summary;		/* ... and it is a summary's (§32) */
 	LionColStats st;
 } LionSetStats;
 
@@ -477,7 +477,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 		/*
 		 * A column's posting pages are its own for a single-column index -
-		 * unless it has summaries (DESIGN.md §31), whose pages are counted
+		 * unless it has summaries (DESIGN.md §32), whose pages are counted
 		 * apart and are known only through the entries that own them.
 		 */
 		if (st->ncolumns > 1 || ix->meta.summary_cols != 0)
@@ -543,7 +543,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						continue;
 					cs = &st->cols[entry->attno - 1];
 
-					/* A summary (DESIGN.md §31) is counted apart. */
+					/* A summary (DESIGN.md §32) is counted apart. */
 					if (LionEntryIsSummary(entry))
 					{
 						cs->summary_entries++;
@@ -2335,7 +2335,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
 
 	/*
-	 * A SUMMARY entry (DESIGN.md §31): only in a column the meta page says has
+	 * A SUMMARY entry (DESIGN.md §32): only in a column the meta page says has
 	 * summaries, never a reserved one, the open bucket's flag only with the
 	 * summary flag, and one open bucket per column.  What it holds is checked
 	 * by lion_verify_summaries() once the structure is known to be sound.
@@ -2402,7 +2402,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 
 		lion_verify_keylen(vs, state, blk, off, entry);
 
-		/* A summary's hash is a constant, not its key's (DESIGN.md §31). */
+		/* A summary's hash is a constant, not its key's (DESIGN.md §32). */
 		hash = LionEntryIsSummary(entry) ? LION_SUMMARY_HASH :
 			lion_hash_key(state,
 						  lion_fetch_key(state, LionEntryGetKey(entry)));
@@ -3196,7 +3196,7 @@ lion_verify_meta(LionVerifyState *vs)
 					meta->version, LION_MAGIC, LION_VERSION,
 					LION_VERSION_SUMMARIES);
 
-	/* DESIGN.md §31: version 7 is version 6 with summaries, and only that. */
+	/* DESIGN.md §32: version 7 is version 6 with summaries, and only that. */
 	if ((meta->version == LION_VERSION) != (meta->summary_cols == 0))
 		lion_corrupt("lion index \"%s\": meta page version %u names summarized key columns %08X",
 					RelationGetRelationName(vs->index), meta->version,
@@ -4088,7 +4088,7 @@ lion_verify_heapallindexed(LionVerifyState *vs)
 }
 
 /* ---------------------------------------------------------------------
- * Summary posting sets (DESIGN.md §31)
+ * Summary posting sets (DESIGN.md §32)
  *
  * Every summary must hold exactly the rows of its bucket - the union of the
  * posting sets of the column's keys above the previous summary's key and at or
@@ -4738,7 +4738,7 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 	MemoryContextDelete(ss.cxt);
 }
 
-/* Every summarized key column's summaries (DESIGN.md §31). */
+/* Every summarized key column's summaries (DESIGN.md §32). */
 static void
 lion_verify_summaries(LionVerifyState *vs)
 {
@@ -4861,7 +4861,7 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	lion_verify_recheck(&vs);
 
 	/*
-	 * The structure is sound: now what the summaries hold (DESIGN.md §31),
+	 * The structure is sound: now what the summaries hold (DESIGN.md §32),
 	 * which reads the index the way the counts do.
 	 */
 	lion_verify_summaries(&vs);

@@ -479,9 +479,16 @@ RESET enable_memoize;
 CREATE FUNCTION lion_nj_vol(int) RETURNS int LANGUAGE plpgsql VOLATILE PARALLEL SAFE
 	AS 'BEGIN RETURN $1; END';
 SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND f.fk IN (SELECT d.k FROM lion_nd d WHERE d.attr = lion_nj_vol(2))');
--- none, and none on a dimension set to 0
+-- none, and none on a dimension set to 0 (the joins off: serially the hash
+-- join is the faster plan here, 1.2 ms of CPU against the node's 2.3)
 SET max_parallel_workers_per_gather = 0;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
 SELECT lion_nj_pick('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)');
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
 SET max_parallel_workers_per_gather = 2;
 ALTER TABLE lion_nd SET (parallel_workers = 0);
 SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)');
