@@ -1505,15 +1505,35 @@ Planner integration
     factor is the column count, always, and always against the node. `test/sql/multicolumn.sql`
     pins it by asking the same question of one multicolumn index and of n single-column ones and
     requiring the same plan choice; the five-clause case there is refused over the multicolumn
-    index with the correction disabled and accepted with it (2026-09-22);
-  - **one O(1) step per container per participating source**, twice cpu_operator_cost (a block mask
-    and a visibility-map mask), where a source's containers are `Min(heap_pages /
-    LION_BLOCKS_PER_CONTAINER, its members)`, so a GROUP BY pays numgroups of them;
+    index with the correction disabled and accepted with it (2026-09-22). *(Since 2026-09-27 that
+    split applies to the DIRECTORY only. A column's CONTAINER pages follow its rows - every row is
+    under one entry of each scalar column - so they are split by what each column's sets take to
+    store: n_distinct entries of N / n_distinct rows, a header a container and two bytes a member
+    up to a bitset's 4 kB, six bytes a row where the rows are too few a container for one
+    (`lion_index_column_posting_share()`). Split by entries, the three values of a status column
+    beside a 2,000-value column got 0.14% of a 110 MB index's pages where they hold a tenth of it,
+    and `status = 'parked'` - a million rows at every container key - was priced at 16 for 1 ms.)*
+  - **the merge's CPU** (`lion_merge_cpu_cost()`, "The units" below, since 2026-09-27): each
+    container the driving source reads and counts, `LION_CONTAINER_COST` and `LION_MEMBER_COST` a
+    member up to a bitset's worth; each probe of another source at the driver's container keys,
+    `LION_PROBE_COST` (`LION_MEMORY_PROBE_COST` into a copy in memory) and `LION_AND_MEMBER_COST` a
+    member of the running intersection; the k'th source sought only at the keys the first k - 1
+    left a row at. A source's containers are `Min(heap_pages / LION_BLOCKS_PER_CONTAINER, its
+    members)` when its column's values are scattered, and its rows' share of the container keys
+    when it is stored in value order, interpolated by the correlation's square
+    (`lion_key_containers()`). A GROUP BY runs one merge per ENTRY of its column - every entry is
+    counted, whatever the WHERE leaves of it - with the entry's own set as a source, and one per
+    pair of two columns (§20), plus each count's set-up, `LION_ENTRY_COUNT_COST`
+    (`LION_LIST_GROUP_COST` for a group of an IN list that drives them), and each set of a union
+    source rebuilt at every count, `LION_UNION_SET_COST`. Before, every container was two
+    cpu_operator_cost whatever it held, members and probes were free, and a group was charged the
+    containers of its share of the WHERE's rows rather than of its own set;
   - **the union of an IN list**, cpu_operator_cost × members × log2(nelems): a merge of k sets costs
     that per member however it is organised (§15 builds the k-way one), and a single-key clause with
     k = 1 pays nothing for a merge it does not make;
   - **the heap the visibility map cannot vouch for**: `recheck_tids = rows × dirtyfrac` from
-    `pg_class.relallvisible/relpages`, one cpu_tuple_cost each - that is a visibility-bit lookup in
+    `pg_class.relallvisible/relpages`, `LION_RECHECK_TID_COST` (1.5 cpu_tuple_cost; 6 for a GROUP
+    BY's, `LION_RECHECK_GROUP_TID_COST`, "The units") each - that is a visibility-bit lookup in
     the per-query cache of §9 - on `Min(recheck_tids, heap_pages × dirtyfrac)` DISTINCT pages,
     fetched ONCE per query whatever brings the count back to them.
 
@@ -1649,6 +1669,104 @@ columns, parameters, a partitioned table whose partitions order their index colu
 and number their heap columns differently again, a dirty heap and a clean one - each against the
 same query with the pushdown off, as a multiset both ways round - and it pins the plan CHOICE
 against a twin table carrying one single-column index per column.
+
+### The units (2026-09-27, release build)
+
+Every lion constant used to be fitted on the assert-enabled development build (-O1, cassert),
+whose assertions inflate lion's own code far more than core's - so each of them was off, against
+core's units, by a factor nobody knew. This pass fitted them again on a RELEASE build: PostgreSQL
+18.6 at -O2 without assertions, on a 4-core, 15 GB VM, `shared_buffers` 5 GB with every relation
+of the test database resident (the production target is warm), `work_mem` 64 MB, and every core
+cost GUC at its default (`random_page_cost` 4, `seq_page_cost` 1, the `cpu_*` and parallel costs as
+shipped). Numbers in this section and in the cost sections that cite it are from that build and
+machine; §31 has the data sets and the decision matrix. The first measurements are medians of five
+`EXPLAIN (ANALYZE, TIMING OFF)` runs on a quiet machine; once other work shared it, the backend's
+own CPU time (`/proc/<pid>/schedstat`) over a DO loop that plans a query once and runs it many
+times, alternatives interleaved - serial plans only, which is what it can measure.
+
+**Core's units on this machine.** Cost units per millisecond of core's own plans over 5M-row
+tables (`s`: 66,667 narrow pages; `w`: 102,639 wide ones; §31):
+
+| core plan | cost | ms | units/ms |
+|---|---|---|---|
+| seq scan, `count(*)`, narrow rows | 129,189 | 210 | 617 |
+| ... one int qual / two ANDed / three ORed | 129,252 / 141,693 / 154,860 | 263 / 265 / 341 | 491 / 534 / 454 |
+| ... `sum()` | 129,189 | 313 | 412 |
+| seq scan, `count(*)`, wide rows / one text qual / four quals | 165,157 / 165,400 / 190,262 | 238 / 394 / 474 | 695 / 419 / 401 |
+| btree index-only scan, 25k / 250k / 2.5M rows | 614 / 6,609 / 77,410 | 1.28 / 12.3 / 187 | 480 / 536 / 415 |
+| btree bitmap heap scan, 500 / 25k / 250k rows scattered | 1,834 / 49,218 / 74,525 | 0.41 / 28.9 / 137 | 4,419 / 1,702 / 544 |
+| hash aggregate over a seq scan, 200 / 20,000 groups | 141,692 / 141,888 | 680 / 905 | 208 / 157 |
+| sort and group aggregate, 200 groups | 778,903 | 1,115 | 699 |
+| hash join 2M x 1,000 / 5M x 200k (4.4k and 140k rows hashed) / 5M x 2M (1.4M) | 45,201 / 110,063 / 122,632 / 178,551 | 161 / 390 / 664 / 3,148 | 280 / 283 / 185 / 57 |
+| nested loop into a btree, 4.4k outer rows | 14,154 | 13.4 | 1,057 |
+| parallel (2 workers) seq scan `count(*)` / one qual / wide, four quals | 93,730 / 93,756 / 140,159 | 102 / 118 / 210 | 915 / 797 / 667 |
+| parallel hash join / hash aggregate | 80,029 / 104,341 | 365 / 337 | 219 / 309 |
+
+Core is not consistent with itself, and three things account for most of it. A page is charged
+as I/O whether or not it is in memory: a warm sequential page costs 0.6 us against the 2 us a
+`seq_page_cost` stands for at 500 units a millisecond, and a warm random one about 1 us against 8,
+which is why plans that read scattered pages run at 1,700 to 6,300 units a millisecond. Operators
+are charged by count, not by type: an int `=` costs 10.6 ns a row, a text one 31 ns, both one
+`cpu_operator_cost` (5 ns at 500). And hashing is charged far below what it costs: 94 ns a row into
+a hash aggregate against one or two `cpu_operator_cost`, which puts every plan with a hash
+aggregate or a large hash join at 57 to 310 units a millisecond.
+
+**The reference.** Lion's CPU constants are fitted at **500 units a millisecond** - the middle of
+core's CPU-bound scans (sequential scans 400 to 700, index-only scans 415 to 535) - so a
+microsecond is 0.5 units, a `cpu_tuple_cost` 20 ns and a `cpu_operator_cost` 5 ns. Lion's I/O
+terms keep core's convention: a page read in order at `seq_page_cost`, a random one at
+`random_page_cost`, interpolated by `lion_heap_page_cost()` where core would interpolate, so that
+lion and core overcharge a warm page alike and `random_page_cost` moves both the same way. Against
+core's hash aggregates and hash joins that rate makes lion honest and them cheap: where a grouped
+count competes with a hash aggregate on close to equal terms, the aggregate wins in the model and
+loses on the machine (§31 lists the cases). Pricing lion at the hash aggregate's rate instead would
+make it beat sequential and index-only scans it is up to twice as slow as.
+
+**The merge** (`lion_merge_cpu_cost()`; every count, every group and pair of a GROUP BY, the AND
+of a lion index scan's sets in `lioncostestimate()`). Fitted to the backend CPU time of 35 counts
+over the 5M-row `s` - eleven single sets holding 1 to 4,500 rows a container (sparse arrays,
+dense arrays, bitsets, RUN containers), eighteen pairs, five triples and a quadruple of them ANDed
+- by non-negative least squares on the features the planner can compute (the driver's containers
+and members, the probes after the early exit, the running intersection's members, the probed
+pages):
+
+| constant | value | fitted | what |
+|---|---|---|---|
+| `LION_CONTAINER_COST` | 8 `cpu_operator_cost` | 32 to 39 ns | a container the driver reads and counts |
+| `LION_MEMBER_COST` | 0.15 `cpu_operator_cost`, up to `LION_MEMBER_CAP` (1,024) a container | 0.74 ns | a member of it: the visibility-map mask is built from them; a bitset costs what an array of a thousand does (800 ns) |
+| `LION_PROBE_COST` | 40 `cpu_operator_cost` | 210 ns | a seek of another source's posting tree to a driver key, and the container found; the leaves the seeks cross fit at 0.7 us a page and are charged as I/O (`lion_probed_pages()`) |
+| `LION_MEMORY_PROBE_COST` | 30 `cpu_operator_cost` | 100 to 200 ns | the same into a set copied into memory (a GROUP BY's WHERE sets after their first use, §9; a two-column GROUP BY's outer set); 20,000 groups of 219 containers and 1,000 of 38 |
+| `LION_AND_MEMBER_COST` | 0.8 `cpu_operator_cost` | 4 to 5 ns | a member of the running intersection ANDed with what a probe found |
+
+The k'th source is sought only at the keys the first k - 1 left a row at, `1 - exp(-lambda)` of
+them (§25's early exit, which was never priced). Median residual 27%. Re-costing the 35 counts
+with the model moved them from 87 to 46,239 units a millisecond (a ratio of 530 between the
+cheapest and the dearest) to 283 to 3,724 (13); the high end is counts of a few containers, whose
+time is a directory lookup priced as a random read, as btree's leaf is. The per-container charge
+it replaces - two `cpu_operator_cost` whatever the container held, members and probes free - was
+calibrated in §10's first version, before the posting tree, and never again.
+
+**The counts around the merge.**
+
+| constant | before | now | fitted on the release build |
+|---|---|---|---|
+| `LION_DESCENT_COST` (a directory level of a lookup: a count's, an IN list value's, an FK join's) | 50 `cpu_operator_cost` (25 in the FK join) | 120 | 0.6 us a directory page read, from the FK join's 23 shapes (§27), median residual 9% |
+| an IN list value's search | nothing but its leaf's page | a descent (§21: a leaf's binary search, the levels above it too when the values are sparser than the leaves) | 1,000 values over 1M keys: 7.6 ms, chosen over a 1.8 ms btree index-only scan at 1,032 |
+| `LION_ENTRY_COUNT_COST` (each count of a GROUP BY: one per entry of its column, per pair of two) | `cpu_tuple_cost` | 50 `cpu_tuple_cost` | 1.0 us a test of a walk of 20,000 entries; 1.3 us a group of 200 of six RUN containers |
+| `LION_LIST_GROUP_COST` (the same, a group of an IN list that drives them) | `cpu_tuple_cost` | 18 `cpu_tuple_cost` | 0.35 us a group over 1,000 of them |
+| `LION_UNION_SET_COST` (a set of a union source, rebuilt by every count of a GROUP BY; `LION_FKJOIN_SET_COST` is it) | 0 (80 `cpu_tuple_cost` in the FK join) | 100 `cpu_tuple_cost` | 2 us a set for 4 groups ANDed with a 1,000-value list; 2.7 and 6 us for 200 groups ANDed with a two-arm OR and a two-value list |
+| `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` (a candidate TID of the heap recheck) | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | 24 to 29 ns a TID on pages holding 68 to 150 candidates, up to 70 ns at 34; 130 ns in a 200-group count of a wholly dirty table, 1.6M of 2M pages answered from the visibility cache |
+| `LION_DISTINCT_TEST_COST` | 50 `cpu_tuple_cost` | unchanged | 1.0 us (§26) |
+
+A GROUP BY is charged one merge per ENTRY of its column - the executor counts every entry and
+skips the empty ones after - with the entry's own set a source. Before, each group was charged
+the containers of its share of the WHERE's rows: `c20k, count(*) FROM s WHERE c20 = 3 GROUP BY
+c20k` cost 6,550 for 1,091 ms (6 units a millisecond, against the hash aggregate's 142,000 for
+905); it now costs 502,000. How many containers one key's rows lie in follows its column's
+correlation (`lion_key_containers()`: one a row when scattered, their share of the heap when
+stored in value order, interpolated by the correlation's square): a GROUP BY over 365 days of a
+table loaded in date order cost 4,650 for 0.6 ms when every day was taken to be scattered, and
+costs 317.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
@@ -4427,6 +4545,17 @@ every one of them the driver is either the only source or has a container at nea
 key. The quick benchmark at one and five million rows confirms it from the other side: no case
 changes plan and every case is at its baseline within run-to-run noise.
 
+**Since 2026-09-27 the CPU of the leapfrog is `lion_merge_cpu_cost()`** (§10, "The units"; the
+fit is in §31): the driver's containers and members, a probe and the running intersection's members
+per other source at each of its keys - and the k'th source is sought only at the keys where the
+ones before it left a row, `1 - exp(-lambda)` of them, lambda the rows the intersection is expected
+to hold at a key. That is §25's early exit, which the model had never priced: the third source of
+`c20k = 77 AND c200 = 17 AND c2 = 1` over 5M rows was charged a probe - and a descent of its posting
+tree - at each of the 219 container keys of `c20k = 77`, where the executor abandons all but two of
+them once `c200 = 17` is empty (217 "Probes Avoided"). It cost 777 against a BitmapAnd's 237 and
+took 0.03 ms against 2.8; it now costs 59. The probed pages of `lion_probed_pages()` are counted
+over the probes that happen, too.
+
 ### The open item: the node is charged for pages, its competitor for tuples
 
 `c20k = 77 AND c200 = 17 AND c2 = 1` is still NOT the node's, and it should be: 117.6 against the
@@ -6055,11 +6184,17 @@ distinct count - the decline the backlog item asked for, with the cost model as 
 
 - **A fixed cost per test**, `LION_DISTINCT_TEST_COST` (50 x `cpu_tuple_cost`), for every entry
   test, group test and pair test: a merge set up and torn down, and for a pair the inner set's
-  lookup. Measured on the assert build at 100k rows, a test costs about 2 us with nothing to
-  intersect and 3.4 us with a WHERE set to seek, against about 0.2 us per row for the sort-based
-  aggregate, whose model charges about 0.1 per row: a test is worth some ten of its rows. Without
-  it, a walk of 1000 entries of `k` under a WHERE that leaves 500 rows was chosen, and took 3.4 ms
-  against the bitmap scan and sort's 0.56.
+  lookup. On the release build a test of the walk over 20,000 one-container entries of a 5M-row
+  table costs 1.0 us, which is 50 `cpu_tuple_cost` at the 500 units a millisecond of §10's "The
+  units"; the assert build measured 2 us with nothing to intersect and 3.4 us with a WHERE set to
+  seek. Without it, a walk of 1000 entries of `k` under a WHERE that leaves 500 rows was chosen,
+  and took 3.4 ms against the bitmap scan and sort's 0.56.
+- **The merges are §10's** (`lion_merge_cpu_cost()`, 2026-09-27): each entry's own set is a source
+  of its test, which drives whenever it is the smaller, so a test over a selective WHERE costs its
+  entry's containers and not the WHERE's share. With the old per-container charge `count(DISTINCT
+  c20k) WHERE c200 = 17` over 5M rows cost 12,427 and took 341 ms; it now costs 404,500 - which
+  overprices it (341 ms is 170,500 at 500 units a millisecond: the existence test finds its row
+  sooner than `lion_exists_fraction()` expects) and refuses it, as its time says it should be.
 - **The early exit is discounted only where it is real.** In shape 1 each entry test reads the
   share of its intersection `lion_exists_fraction()` expects: a test whose intersection is expected
   to hold `s >= 1` rows over `D` containers stops after about `D/s + 1` of them, and one expected to
@@ -6068,7 +6203,8 @@ distinct count - the decline the backlog item asked for, with the cost model as 
   The pair terms of shape 2 are NOT discounted: a pair's time is its lookup and its merge setup
   far more than its members - measured per pair, an existence test took 6.5 us against 7.7 for
   §20's count of the same 200 x 50 pairs - and discounting them chose 200 x 50 pairs at 64.6 ms
-  against the sort's 43.
+  against the sort's 43 (and, on the release build with §10's merge units, at 10,566 against the
+  sort's 10,694, for 45 ms of CPU against 27).
 - Tests that must COUNT (the mixed target lists above) are charged in full.
 
 Measured with the final model (100k rows, uncorrelated columns, warm cache, assert build - ratios,
@@ -6495,22 +6631,40 @@ the join member of `custom_private` became `{clause, kind of join, flags [, chil
   the same `get_hash_memory_limit()` the executor gives it: a container's members at two bytes
   each, a bitset's 4 kB at most.
 
-A directory descent costs `LION_FKJOIN_DESCENT_COST` (25 `cpu_operator_cost`) a level, half §21's
-single lookup: a join's descents come thousands at a time over cached pages. A semi or anti join's
-existence test reads the share of the fk set `lion_exists_fraction()` expects - `rows per key x
-filter selectivity` visible rows spread over the set's containers - of its containers, probes and
-recheck candidates, as §26's walk does.
+A directory descent costs `LION_DESCENT_COST` (120 `cpu_operator_cost`) a level, as every lookup
+of the count does (§10, "The units"). A semi or anti join's existence test reads the share of the
+fk set `lion_exists_fraction()` expects - `rows per key x filter selectivity` visible rows spread
+over the set's containers - of its containers, probes and recheck candidates, as §26's walk does.
+The fk set's containers are read and counted at §10's `LION_CONTAINER_COST` and
+`LION_MEMBER_COST` a member, and a union filter's sets are rebuilt at every count at
+`LION_FKJOIN_SET_COST`, which is §10's `LION_UNION_SET_COST`.
 
-Calibrated on the benchmark below by timing the node minus its child, forced to each strategy in
-turn: the collected paths came out at 150 to 390 cost units per millisecond across fourteen shapes
-(a count against the copy: about 3 us plus 0.2 us per fk container of a member or two, 0.47 us per
-container of six), against 145 to 240 for the hash and nested-loop joins of the same queries - the
-model is honest within a factor of two, in both directions. The probed paths came out at 106 to
-177: a probe measured about 1 us on this machine where the 2026-09-23 calibration found 0.3 us, so
-`LION_FKJOIN_PROBE_COST` underprices it by up to half. It is left alone: with a copy available the
-probes are chosen only for a handful of dimension rows, where every plan is cheap, and past the
-memory limit underpricing them can only choose the node where the ordinary plan was up to twice as
-fast.
+**Refitted on the release build** (2026-09-27; 4-core VM, warm; §31). The node's own CPU time -
+the node minus its dimension child, both timed by backend CPU time over DO loops, serial - on the
+23 shapes of the table below (the fact filters collected in 20 of them) against its counters,
+fitted by non-negative least squares: 0.60 us a directory page read (the descents, 3 to 4 a
+dimension row), 0.14 us a container visited (the fk set's and the probes into the filters), 84 ns a
+row of the fact filters collected, and nothing left per dimension row; median residual 9%, worst
+89% (the thousand-row dimension, whose 2,000-row fk sets the fit prices by containers alone). At
+500 units a millisecond that moved:
+
+| constant | assert build | release build |
+|---|---|---|
+| `LION_FKJOIN_DESCENT_COST` / `LION_DESCENT_COST` | 25 `cpu_operator_cost` | 120 (0.6 us a level) |
+| `LION_FKJOIN_PROBE_COST` | 30 `cpu_operator_cost` | 80 (0.4 us; 0.46 measured over the 2,000-row sets of the thousand-row dimension) |
+| `LION_FKJOIN_COUNT_COST` | 50 `cpu_tuple_cost` | 25 (the per-row constant the fit leaves at zero) |
+| `LION_FKJOIN_SET_COST` | 80 `cpu_tuple_cost` | 100, as `LION_UNION_SET_COST` (2 to 6 us a set a count) |
+| the fk set's containers | 2 `cpu_operator_cost` each | `LION_CONTAINER_COST` + `LION_MEMBER_COST` a member |
+| `LION_FKJOIN_COPY_*` | 25 `cpu_tuple_cost`, 15, 3 and 20 `cpu_operator_cost` | unchanged: the collected shapes come out at 374 to 595 units a millisecond with them |
+
+The model then prices the node at 230 to 717 units a millisecond of its own CPU (median 467),
+against 185 to 488 (median 294) before; the three shapes at 230 to 250 are the thousand-row
+dimension's, whose collected plan the refitted model now prefers over the probed one they were
+timed in. The ordinary plans of the same queries run at 214 to 820 (hash joins 185 to 283, nested
+loops over a btree higher, since core charges their inner index pages as random reads). *(The
+assert-build calibration found the collected paths at 150 to 390 units a millisecond and the probed
+ones at 106 to 177 there, a probe about 1 us; that build inflates lion's own code more than core's,
+which is why its constants were refitted.)*
 
 **Measured** (2026-09-27, PostgreSQL 18.6, assert build, so ratios and not absolute numbers; four
 cores shared with other work, medians of five, warm, all-visible, `max_parallel_workers_per_gather
@@ -7288,11 +7442,28 @@ could not see that the keys outside a range might be a handful. Now:
 
 With this, on the repro table below, each summed range costs 350 to 400 units per millisecond on
 the assert build, against about 140 for the sequential scan. The one exception is the thousand-row
-keys, whose containers are charged the two `cpu_operator_cost` every lion count charges per
-container, like any lion count's containers. The planner now takes the node where it is the faster
-plan: the 1.9-million-key range beside `country = 'c7'` is chosen at 14,675 and runs in 41 ms,
-against the sequential scan's 316 ms. It leaves the node where it is slower: a 7-day window of 605k
-keys is costed at 97,424 and goes to a plain index scan, 72 ms against 280.
+keys, whose containers are charged the two `cpu_operator_cost` every lion count charged per
+container then. The planner now takes the node where it is the faster plan: the 1.9-million-key
+range beside `country = 'c7'` is chosen at 14,675 and runs in 41 ms, against the sequential scan's
+316 ms. It leaves the node where it is slower: a 7-day window of 605k keys is costed at 97,424 and
+goes to a plain index scan, 72 ms against 280.
+
+**On the release build (2026-09-27; §31) - PROVISIONAL**, because the range work under way will
+rework these terms. The entry constants hold: an entry of one row counted with its leaf takes 290
+to 300 ns there (86,400 to 2.6M one-row timestamps, 450 to 550 units a millisecond as priced), which
+is `LION_RANGE_UNION_ENTRY_COST`'s 12 `cpu_tuple_cost` at §10's 500 units a millisecond. The
+per-container charge was not: an entry's containers, and each of F's sources probed at them, are
+now §10's merge units (`LION_CONTAINER_COST` and `LION_MEMBER_COST` a member for the entry's,
+`LION_MEMORY_PROBE_COST` and `LION_AND_MEMBER_COST` for each probe into F's sets, which a walk
+copies into memory on their second use), and the complement's count of F the same. Over the
+35 range shapes of §31's micro-benchmark that moved the node from 14 to 8,049 units a millisecond
+(median 225) to 47 to 2,294 (median 500): scattered days of 2,500 rows went from 150 to
+about 400, and the same beside a 20-value status from 80 to about 450. What is left is the executor
+more than the model: days stored in value order (2,500 rows each in one or two containers, fifty
+entries to a leaf) run at 62 to 66 units a millisecond, because §15's density test sends a leaf of
+them to the k-way union, which builds a bitset image and optimizes it back into a run container at
+every container key (6 us a key, measured with a stack sampler), where summing them would have been
+a few hundred nanoseconds each.
 
 **What this cannot fix is the estimate itself.** `n_distinct × sel` is what the planner believes,
 and a stale histogram or an `n_distinct` that ANALYZE's sample got wrong makes a range of millions of
@@ -7957,16 +8128,49 @@ cost_bitmap_heap_scan()'s price a page (random_page_cost falling to seq_page_cos
 approach the whole heap). So the I/O is that, interpolated towards the packed end by the
 correlation above, and the correlation returned is the one that makes cost_index() arrive at it.
 Per row cost_index() charges cpu_tuple_cost and the quals left to the heap; the plain scan is
-charged what cost_bitmap_heap_scan() charges a row besides - every index qual (the recheck, which
-the plain scan does whenever it drops a qual or reads a multi-key column, §29.6, and which
-cost_index() never charges) and the bitmap entry (a tenth of a cpu_operator_cost,
-`LION_BITMAP_ROW_COST`) - and `LION_PLAIN_FETCH_ROW_COST`, half a cpu_tuple_cost, for every row
-past the first on its page: the bitmap heap scan locks a page and walks its matches once, the plain
-scan makes an amgettuple call and takes a buffer lock and a HOT search per row. Measured with the
-heap in shared buffers (2M narrow rows, 185 to a page, and 1M rows of 42), the plain scan spent 20
-to 50 ns a row more than the bitmap heap scan, against 55 ns for a row of a sequential scan - the
-row cpu_tuple_cost stands for - and 0.4 us a page LESS, which is not credited: with about one row
-to a page the two scans cost the same, and the plain scan wins the tie on its startup cost.
+charged what cost_bitmap_heap_scan() charges a row besides - the bitmap entry (a tenth of a
+cpu_operator_cost, `LION_BITMAP_ROW_COST`, core's own number), and every index qual only when the
+scan RECHECKS them (§29.6: it dropped a qual, it reads a multi-key column, or it is a UNION;
+`lion_plain_scan_is_sorted()` answers that too) - and `LION_PLAIN_FETCH_ROW_COST`, one
+cpu_tuple_cost, for every row past the first on its page: the bitmap heap scan locks a page and
+walks its matches once, the plain scan makes an amgettuple call and takes a buffer lock and a HOT
+search per row. Measured on the release build (backend CPU time, heap in shared buffers, the scans
+interleaved; §31): 11.5 ns a row more than the bitmap heap scan for 40,000 of 60,000 numeric rows
+stored in value order, 21 ns for 75,000 rows of 30 days stored in order, 20 ns for 43% of the
+200,000-row table of `plaincost.sql` on every page - about the 20 ns a cpu_tuple_cost stands for at
+the 500 units a millisecond of §10's "The units" (it was half that, from 20 to 50 ns on an assert
+build against 55 ns for a sequential scan's row). Where the rows are scattered the plain scan
+spends 0.5 us a page LESS than the bitmap heap scan - 23 ms against 33 for 25,000 rows at 0.4 a
+page, 71 against 104 for 100,000 at 1.5 - which is not credited: the plain-scan costing under way
+may. *(Until 2026-09-27 every index qual was charged per row, as cost_bitmap_heap_scan() charges
+it. An exact scan evaluates none - and neither does a bitmap heap scan on an exact page, though
+core charges it - and the charge lost `pushdown.sql`'s `lion_pdn` count, 40,000 of 60,000 numeric
+rows stored in value order, to a sequential scan that takes twice as long: its one numeric `=` a
+row is priced as an int's.)*
+
+**No operator per index tuple** (2026-09-27). `genericcostestimate()` charges every index tuple it
+expects to visit `cpu_index_tuple_cost` and a `cpu_operator_cost` per index qual, as a btree
+evaluates its quals on its tuples. A lion scan evaluates none: its index tuples are the members of
+the posting sets its quals located, turned into TIDs a container at a time. `lioncostestimate()`
+takes the operator back out and leaves `cpu_index_tuple_cost` a TID, which is about what a TID
+costs there (5 to 15 ns into a bitmap, against the 10 ns `cpu_index_tuple_cost` stands for at 500
+units a millisecond). With it, `lion_pdn`'s bitmap scan (2.5 ms of CPU) is chosen at 1,085 over
+the plain scan (3.0 ms, 1,099) and the sequential scan (5.3 ms, 1,116); the test's plan with every
+scan disabled prints it.
+
+**The AND of sets** (2026-09-27, `lion_set_merge_cost()`). `genericcostestimate()` prorates the
+index by the selectivity of all the quals together, which prices an AND by what it RETURNS. What
+the scan reads is the sets: per key column the qual it answers is a posting set (an equality, `IS
+NULL`, a multi-key query) or an IN list's union, and it ANDs them as a count does - the smallest
+drives, the others are sought at its container keys - so `lioncostestimate()` now charges §10's
+merge CPU for them (`lion_merge_cpu_cost()`, the count pushdown's own price) and the pages the
+driver walks and the probes touch, beyond the prorated share, at `seq_page_cost`. One set alone,
+and a range or `IS NOT NULL` (a walk, priced by `lion_range_entry_cost()`), add nothing. Four dense
+sets whose AND was 1,730 rows of 8M ran 52 ms on lion against 1.2 ms on a btree over the four
+columns at about the same cost (6.5k against 6.2k). On §31's 5M-row `w` the same shape, four
+sets ANDed to 48,000 rows, raised the lion plain scan from 80,300 to 83,900, and the planner now
+takes the btree's bitmap heap scan (79,800; 52 ms of CPU) over it (82 ms). Plain and bitmap paths
+share the estimate, and both make the same AND (§29.2).
 
 What this cannot do: cost_index() charges no more than its uncorrelated end, Mackert and Lohman's
 pages at random_page_cost. At a random_page_cost near seq_page_cost (1.1, as on the benchmark's
@@ -8021,6 +8225,11 @@ plain equality the pages are now what cost_index() would say they are: one per r
 are scattered, the rows' share of the heap when they are stored in order, interpolated by the
 correlation's square (`lion_cost_count_rel()`, `lion_single_eq_var()`). Only ever lower, and only
 for that shape; a range already had the rule (§28), and other WHERE shapes keep the old bound.
+*(Since 2026-09-27 that correlation, the range's, and the containers a key's rows lie in
+(`lion_key_containers()`, §10) are all read through `lion_var_heap_correlation()`, the plain
+scan's own number less ANALYZE's tie-break, where they read the raw statistic before: a column of
+a few values placed at random looked packed to the count as it had to the plain scan - 0.44 for
+three values at 60/20/20% - and its recheck was priced on a fifth fewer pages than it visits.)*
 
 **A range beside other columns' sets is priced as walked** (2026-09-25 review). Because the two
 paths share the IndexPath, the index side has to be what both of them read, and a plain scan that
@@ -8103,9 +8312,12 @@ row to a page, which the plain scan reads as the bitmap scan does without buildi
 measured on the tests' own tables, 2.2 ms against 2.75 (`lis_f`, `k = 17`), 1.5 against 1.7
 (`lis_w`, `a IS NOT NULL AND b = 5`), 0.97 against 1.24 (`ldbl`, `g = 5`), a tie on `lion_in`'s
 `a IN (1, 2, 3)`. `pushdown.sql`'s `lion_pdn` count, 40000 of 60000 narrow rows stored in value
-order, went from a plain scan to a sequential scan: the plain scan now pays per row what the
-bitmap scan does and more (5.2 ms against its 3.55), and both come out above the sequential scan,
-which takes 10 ms - the price of a numeric `=`, one cpu_operator_cost like any other, is core's.
+order, went from a plain scan to a sequential scan: the plain scan paid per row what the bitmap
+scan does and more (5.2 ms against its 3.55), and both came out above the sequential scan, which
+takes 10 ms - the price of a numeric `=`, one cpu_operator_cost like any other, is core's. Since
+2026-09-27 (above: no index qual charged where it is not evaluated, no operator per index tuple)
+it prints the bitmap scan, the fastest of the three: 2.5 ms of CPU on the release build against
+the plain scan's 3.0 and the sequential scan's 5.3.
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
@@ -8592,3 +8804,131 @@ The first is still chosen by the planner (it cannot see the correlation) and now
 80,000 entries, fetching and sorting the 2,500 members: 3.5x the best plan instead of 50x. The
 second is not chosen here; forced, it switches after 80,000 entries and fetches 2,500 members that
 all fail `g = 1`.
+
+## 31. Cost calibration on the release build (2026-09-27)
+
+Every number in this section is from a RELEASE build - PostgreSQL 18.6 at -O2, no assertions -
+on a 4-core, 15 GB VM shared with other work, `shared_buffers` 5 GB with every relation below
+resident, `work_mem` 64 MB, and every core cost GUC at its default. §10's "The units" says why
+(the constants had all been fitted on an assert build) and what core's own plans cost there; this
+section holds the data sets, the constants that moved, and the decision matrix that checks them.
+The scripts, the data generators and the raw results are outside the tree, in the project's
+`.local/calib/` directory, with a README on rerunning them.
+
+### Data sets
+
+| table | rows | shape |
+|---|---|---|
+| `s` | 5M, 66,667 pages | ints of 2, 20, 200, 20,000 and 1M values at random; 200 values stored in order (`clustered`); a skewed one (90% one value); one 10% NULL; a lion index on each, btrees beside three |
+| `w` | 5M, 102,639 pages | the wide shape of a real workload: an enum of three values (60/20/20%), a two-value text, a boolean, 2,000 ints, 50 countries, 8 sizes, a text[] of one or two tags, a timestamp in order; one lion index over seven columns, btrees over four columns and over one and one |
+| `r` | 5M | a date in heap order (2,500 rows a day), a date at random, a 20-value status, a unique timestamp in order; lion and btree on each |
+| `fact` / `dim` / `dim2` | 5M / 200k / 2M | §27's shape: two fks (25 and 2.75 rows a key, 1% NULL), a 20-value kind, a 6-value `sen`, a tsvector; dimensions with a primary key and a lion index on `(status, country, size)`; and `fact2` (2M) over `dim1k` (1,000) |
+| `t` | 2M | §28's range table: an enum, a boolean, 2,000 ints, a unique timestamp and 50 countries under one lion index |
+| `sd` | 2M | a copy of `s` whose heap updates leave dirty, for the recheck terms |
+
+### Measurement
+
+Medians of five `EXPLAIN (ANALYZE, TIMING OFF)` runs while the machine was quiet (core's units,
+the FK join shapes); after that, because other work shared the machine, the backend's own CPU time
+from `/proc/<pid>/schedstat` over a DO loop that plans a query once and runs it many times, the
+alternatives interleaved round by round. That measures serial plans only: a parallel worker's CPU
+is not the leader's, and the parallel plans keep their wall-clock measurements (§27's "Parallel").
+Fits are non-negative least squares on what the planner can compute (containers, members, probes,
+pages, entries, TIDs), in microseconds, converted at §10's 500 units a millisecond.
+
+### What moved
+
+| constant | before (assert build) | now | fitted on | fit |
+|---|---|---|---|---|
+| `LION_CONTAINER_COST` | 2 `cpu_operator_cost` a container, nothing else | 8 | 35 counts of 1 to 4 sets (§10) | median residual 27%; the 35 re-costed span 283 to 3,724 units a millisecond (were 87 to 46,239) |
+| `LION_MEMBER_COST` (up to `LION_MEMBER_CAP`, 1,024) | - | 0.15 `cpu_operator_cost` | same | 0.74 ns a member |
+| `LION_PROBE_COST` / `LION_MEMORY_PROBE_COST` | - | 40 / 30 `cpu_operator_cost` | same | 210 ns; 100 to 200 ns in memory |
+| `LION_AND_MEMBER_COST` | - | 0.8 `cpu_operator_cost` | same | 4 to 5 ns |
+| `LION_DESCENT_COST` (a count's, an IN list value's, an FK join's) | 50 (25 in the FK join) `cpu_operator_cost` | 120 | 23 FK join shapes (§27) | 0.6 us a directory page; median residual 9% |
+| `LION_ENTRY_COUNT_COST` / `LION_LIST_GROUP_COST` | `cpu_tuple_cost` | 50 / 18 `cpu_tuple_cost` | GROUP BY walks of 200 to 20,000 entries | 1.0 to 1.3 us / 0.35 us a group |
+| `LION_UNION_SET_COST` (= `LION_FKJOIN_SET_COST`) | 0 (80 `cpu_tuple_cost` in the FK join) | 100 `cpu_tuple_cost` | grouped counts over OR and IN sources | 2 to 6 us a set |
+| `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | `sd`, clean against dirty | 24 to 70 ns a TID; 130 ns in a grouped count |
+| `LION_FKJOIN_PROBE_COST` | 30 `cpu_operator_cost` | 80 | 23 FK join shapes | 0.4 us (0.46 over 2,000-row sets) |
+| `LION_FKJOIN_COUNT_COST` | 50 `cpu_tuple_cost` | 25 | same | the fit leaves the per-row term at zero |
+| `LION_PLAIN_FETCH_ROW_COST` | 0.5 `cpu_tuple_cost` | 1.0 | 3 plain against bitmap shapes (§29.11) | 11.5, 21 and 20 ns a row |
+| a range entry's containers (§28) | 2 `cpu_operator_cost` | §10's merge units | 35 range shapes | **provisional**: 47 to 2,294 units a millisecond (median 500), were 14 to 8,049 |
+| unchanged, and confirmed | `LION_DISTINCT_TEST_COST` 50 and `LION_RANGE_UNION_ENTRY_COST` 12 `cpu_tuple_cost`, `LION_FKJOIN_COPY_*`, `LION_BITMAP_ROW_COST` | | | 1.0 us; 290 to 300 ns; 374 to 595 units a millisecond; core's own number |
+
+The model's shape changed with them, each in its section: the early exit of an AND is priced (§10,
+§25); a GROUP BY is charged per entry of its column, with the entry's set a source (§10, §26); how
+many containers a key's rows lie in follows its column's correlation (§10); an IN list value pays
+a descent (§21); `lioncostestimate()` charges the AND of its sets and no operator per index tuple,
+and the plain scan charges its quals only when it rechecks them (§29.11 - the four-set AND and
+`pushdown.sql`'s `lion_pdn`); LionCount's recheck reads the corrected correlation that
+`lion_var_heap_correlation()` now shares with the plain scan (§10).
+
+### The decision matrix
+
+128 queries where lion competes with core - equality, IN, enum and boolean counts (`eq`); ranges
+inside, outside and over the whole domain on timestamps, dates and dense ints (`range`); GROUP BY
+and `count(DISTINCT)` (`group`); FK join counts forward, reverse, anti and distinct (`fk`); and
+fetches that go to a plain, bitmap or sequential scan at many selectivities and over the
+multicolumn index (`fetch`) - each with every alternative forced (the count node, seq, bitmap,
+plain and index-only scans, the join methods, the btrees alone by dropping the lion indexes in a
+transaction). Every distinct plan was timed once in backend CPU time; each build's choice is what
+the planner picked with that build's library loaded, at `random_page_cost` 4 and 1.1. A mispick is
+a choice more than 15% (and 0.05 ms) slower than the fastest plan; one query in each column sits
+between 10 and 15%, which is noise here, and is not counted.
+
+| mispicks, time lost | before, rpc 4 | now, rpc 4 | before, rpc 1.1 | now, rpc 1.1 |
+|---|---|---|---|---|
+| `eq` (34) | 3, 10.8 ms | 1, 3.8 ms | 3, 10.8 ms | 2, 4.3 ms |
+| `range` (26) | 2, 20.6 ms | 2, 20.6 ms | 2, 20.6 ms | 2, 20.6 ms |
+| `group` (19) | 4, 1,889 ms | 1, 31.2 ms | 4, 1,889 ms | 2, 203 ms |
+| `fk` (24) | 2, 62.4 ms | 3, 37.4 ms | 1, 37.2 ms | 2, 12.2 ms |
+| `fetch` (25) | 7, 104 ms | 8, 94.3 ms | 8, 199 ms | 8, 199 ms |
+| **all (128)** | **18, 2,087 ms** | **15, 187 ms** | **18, 2,157 ms** | **16, 440 ms** |
+| the chosen plans' total (the fastest: 6,434 ms) | 8,590 ms | 6,723 ms | 8,664 ms | 6,962 ms |
+
+What went: the grouped counts - `GROUP BY c20k` under a 20-value WHERE ran 1,069 ms in the node
+against 148 in a hash aggregate, priced at 6,600 against 73,000, and `count(DISTINCT c20k)` under a
+200-value one 342 ms against 28 - which the per-entry charge prices; the four-set AND counted by
+the node (7.6 ms, costed 90) against a btree index-only scan (2.1 ms); a three-set AND the node
+answers in 0.03 ms that went to a BitmapAnd (1.6 ms); the four-set fetch that took the lion plain
+scan (82 ms) and now takes the btree's bitmap (52 ms). Two FK join choices between the node over a
+plain and over a bitmap scan of its dimension (`fk fwd ks dim10k`, `fk fwd nofilter dim10k`, 18
+and 22% slower) are new, and small.
+
+What is left, the worst first:
+
+- **The smallest dimension set over the 2M-key fk** (`fk fwd tsq dim2 1.2k`): the node 36.9 ms
+  (costed 13,700) against a nested loop's 11.8 (23,800). Core prices its nested loop over warm
+  indexes at 2,000 units a millisecond; it was §27's one wrong choice too, and at rpc 1.1 the
+  nested loop is chosen.
+- **Plain against bitmap lion scans of 20 to 50% of a table** (`fetch w.country2`, `w.parked
+  supp`, `s.c20`): the lion plain scan is 17 to 31% faster than the bitmap heap scan both builds
+  pick, by the 0.5 us a page §29.11 measured and does not credit; at rpc 1.1 both builds take the
+  btree's plain scan instead, 49 to 87% slower than lion's (`w.country` too). Not a regression;
+  the plain-scan costing's to take.
+- **A 1,000-value IN list over 1M keys** (`eq s.c1m in 1000`): the node 5.6 ms (costed 2,019)
+  against a btree index-only scan's 1.8 (4,294; chosen at rpc 1.1). The executor walks at most
+  `LION_LOOKUP_WALK_MAX` (8) entries before it searches again, and over 1,000 sparse keys it
+  searches for nearly every one; the model charges a descent a value and still comes out under the
+  btree. Modelling the walk limit broke the contiguous lists that do walk, and was taken out.
+- **A one-day range of dates at random beside a 20-value status** (`fetch r.dr 1d st`): a BitmapAnd
+  of both lion sets (5.2 ms, costed 2,019) against the plain scan of the day (1.1 ms, 7,794), whose
+  2,500 scattered heap pages core's convention prices as random reads though they are warm, while
+  the BitmapAnd's 250,000-TID status set is cheap. Lion keeps that convention (§10).
+- **`range t.c7 pc >= 1000`**: the node 30.5 ms against a plain lion scan's 20.2, now costed 24,600
+  (was 2,700): one of the provisional range sums (§28).
+- **At rpc 1.1 only**: `GROUP BY c20k` over the whole table goes to a group aggregate over the
+  btree's index-only scan (328 ms, costed 105,000) over the node (156 ms, 117,100), and 100- and
+  1,000-value IN lists over `c20k` to the index-only scan (1.2 and 11.5 ms) over the node (0.74 and
+  7.7), priced within 8% of each other: core's index-only scans fall with `random_page_cost`,
+  lion's CPU does not.
+- **`group s.c20k w c20`**: a hash aggregate over a bitmap scan (179 ms) against one over a plain
+  scan (148) - the same plain-against-bitmap credit, under core's aggregate.
+
+The hash aggregate stays priced below every lion path (157 to 309 units a millisecond, §10's "The
+reference"), so a grouped count that competes with one on close to equal terms can lose in the
+model and win on the machine: `inlist.sql`'s two GROUP BY counts over IN lists, which the node runs
+1.7 to 2.2 times faster, force the node rather than pin the aggregate.
+
+**Provisional**: the range sums (§28) and the plain scan's heap side (§29.11), whose costing other
+work is reworking; the matrix's `range` and `fetch` rows are theirs to rerun. Parallel plans were
+not in the CPU-time matrix.
