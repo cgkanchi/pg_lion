@@ -1057,6 +1057,19 @@ extern BlockNumber lion_dir_leftmost_leaf(Relation index, LionIndexState *ix);
 extern BlockNumber lion_dir_column_first(Relation index, LionState *col,
 										 OffsetNumber *offp);
 
+/*
+ * For the planner's endpoint probe (DESIGN.md §28): the leaf where the
+ * column's VALUE entries begin, share-locked, with *offp the first of them,
+ * and the leaf where they end, with *offp the first item past them; and the
+ * left sibling of a directory page, found within maxsteps pages or given up
+ * on (InvalidBuffer), releasing the page it comes from.
+ */
+extern Buffer lion_dir_value_start(Relation index, LionState *col,
+								   OffsetNumber *offp);
+extern Buffer lion_dir_value_end(Relation index, LionState *col,
+								 OffsetNumber *offp);
+extern Buffer lion_dir_step_left(Relation index, Buffer buf, int maxsteps);
+
 /* The first data item of a directory page (offset 1, or 2 under a high key). */
 static inline OffsetNumber
 lion_page_first_data(Page page)

@@ -2723,7 +2723,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
-	double		matching = Max(rel->rows, 1.0);
+	double		matching = Max(lion_probe_rel_rows(root, rel), 1.0);
 	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		sel = Min(Max(rangesel, 1e-10), 1.0);
@@ -2958,7 +2958,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		dirty_pages;
-	double		matching = Max(rel->rows, 1.0);
+	double		matching = Max(lion_probe_rel_rows(root, rel), 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
 	double		random_pages = 0;	/* directory leaves, one per lookup */
 	Cost		descent_cost = 0;	/* comparisons on the way down (§21) */
@@ -7455,8 +7455,26 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	}
 
-	lion_try_count_path(root, input_rel, output_rel,
-					   (GroupPathExtraData *) extra, NULL);
+	/*
+	 * A range past the histogram's ends is priced with the ends the
+	 * directory holds (DESIGN.md §28, "The endpoint probe").
+	 */
+	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
+	{
+		lion_try_count_path(root, input_rel, output_rel,
+						   (GroupPathExtraData *) extra, NULL);
+		return;
+	}
+	PG_TRY();
+	{
+		lion_try_count_path(root, input_rel, output_rel,
+						   (GroupPathExtraData *) extra, NULL);
+	}
+	PG_FINALLY();
+	{
+		lion_probe_end();
+	}
+	PG_END_TRY();
 }
 
 /*
