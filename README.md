@@ -138,6 +138,32 @@ fetches heap tuples and does not have the same count shortcut. Normal SQL is suf
 `lion_index_count()` calls are optional. Use `lion_index_stats('events_country_lion')` to inspect
 storage and `lion_index_verify('events_country_lion', heapallindexed => true)` for verification.
 
+A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
+fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
+side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for
+each dimension row the node looks the key up in the fact's FK index and counts, or for `EXISTS` tests,
+that key's rows ANDed with the fact filters, which it collects once for the whole scan:
+
+```sql
+CREATE INDEX orders_customer_lion ON orders USING lion (customer_id);
+CREATE INDEX orders_status_lion ON orders USING lion (status);
+
+-- orders of the matching customers (also as a JOIN, or with customer_id IN (...))
+SELECT count(*) FROM orders o
+WHERE o.status = 'open'
+  AND EXISTS (SELECT 1 FROM customers cu WHERE cu.id = o.customer_id AND cu.country = 'NZ');
+
+-- customers with at least one matching order (NOT EXISTS: with none)
+SELECT count(*) FROM customers cu
+WHERE cu.country = 'NZ'
+  AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = cu.id AND o.status = 'open');
+```
+
+The first form needs `customers.id` unique (a primary key); both may group by the dimension's
+columns. The node pays a lookup per dimension row, so the cost model leaves a large dimension set to
+the hash join. `count(DISTINCT o.customer_id)` over the join is not pushed down: with a unique key it
+is the second query.
+
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
 ```sql
@@ -204,7 +230,7 @@ expressions as the table's owner (DESIGN.md §7).
     src/lion_funcs.c        lion_index_stats(), lion_index_verify() and the other diagnostics
     src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
     src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
-    src/lion_fkjoin.[ch]    the FK-side join a LionCount answers (GROUP BY dim.attr over a fact table)
+    src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS)
     src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered, btree-ordered scans
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit, test/recovery, test/modules
