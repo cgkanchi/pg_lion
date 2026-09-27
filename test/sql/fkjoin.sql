@@ -296,10 +296,21 @@ SELECT lion_fj_counter('SELECT count(*) FROM lion_ff8 f JOIN lion_fd4 d ON f.fk8
 SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = $1 GROUP BY d.attr', '3');
 SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = $1 AND d.region = $2 GROUP BY d.attr', '4, ''eu''');
 SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = $1', 'NULL');
--- `IN ($1, $2)` has its length at plan time; `= ANY ($1)` does not, and every
--- count would rebuild a union of however many values it brings: refused
+-- `IN ($1, $2)` has its length at plan time; `= ANY ($1)` does not, and is
+-- evaluated once per scan and collected once, whatever it turns out to hold:
+-- two values, none, NULL, and 1500 of them
 SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x IN ($1, $2)', '1, 2');
 SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY ($1)', '''{1,2}''');
+SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY ($1) GROUP BY d.attr', '''{}''');
+SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY ($1) GROUP BY d.attr', 'NULL');
+SELECT lion_fj_prep('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.fk = ANY ($1) AND f.x = 2 GROUP BY d.attr', (SELECT quote_literal(array_agg(i)::text) FROM generate_series(1, 3000, 2) i));
+SELECT lion_fj_prep('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY (ARRAY[$1, $2 + 1])', '1, 2');
+-- ... and so is an array a stable expression computes, which the planner
+-- prices by its estimate
+SET lion_fj.xs = '1,3,5';
+SELECT lion_fj($$SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY (string_to_array(current_setting('lion_fj.xs'), ',')::int[]) GROUP BY d.attr$$);
+SELECT lion_fj_prep($$SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = ANY (string_to_array($1, ',')::int[])$$, '''2,4''');
+RESET lion_fj.xs;
 -- a correlated subquery: the dimension filter is an exec Param, so the node
 -- (and its child) is rescanned with a new value for every outer row
 SELECT lion_fj('SELECT g, (SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.attr = g.g AND f.x = 2) FROM generate_series(0, 7) g');

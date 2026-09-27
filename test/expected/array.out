@@ -907,11 +907,12 @@ EXPLAIN (COSTS OFF) EXECUTE lion_arrc_p(ARRAY['u500']);
 RESET plan_cache_mode;
 DEALLOCATE lion_arrc_p;
 /*
- * ... and the count pushdown refuses a multi-key clause it cannot see the
- * query of, for the same reason: `tags @> $1` with `$1 = '{}'` extracts to
- * ALL mode, which this node cannot answer at all, and at execution time
- * there would be no plan left to fall back to (DESIGN.md §17).  A CUSTOM
- * plan folds the parameter to a literal and is pushed down as usual.
+ * ... and the count pushdown prices a multi-key clause it cannot see the
+ * query of the same way: `tags @> $1` with `$1 = '{}'` extracts to ALL mode,
+ * which the node answers from a sequential scan that tests every row
+ * (DESIGN.md §17, "A query known only at run time"), so alone the clause
+ * loses to the ordinary plan.  A CUSTOM plan folds the parameter to a
+ * literal and is pushed down as usual.
  */
 PREPARE lion_arrc_c(text[]) AS SELECT count(*) FROM lion_arrc WHERE tags @> $1;
 SET plan_cache_mode = force_generic_plan;
