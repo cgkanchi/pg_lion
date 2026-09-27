@@ -22,6 +22,12 @@
  * One way round of a recognised join.  A join of two tables may qualify both
  * ways - each side's column unique and indexed - and then the caller gets two
  * of these and tries both, letting the cost model choose.
+ *
+ * A semi or anti join (`WHERE [NOT] EXISTS (SELECT 1 FROM fact ...)`, `pk IN
+ * (SELECT fk FROM fact ...)`) qualifies one way only: its outer side is the
+ * dimension, whose rows the join returns, and its inner side the fact, whose
+ * posting sets say whether a dimension row has a match.  Its dimension key
+ * need not be unique: each dimension row is tested on its own.
  */
 typedef struct LionFkJoin
 {
@@ -36,6 +42,10 @@ typedef struct LionFkJoin
 	Oid			collation;		/* and its input collation, or InvalidOid */
 	Node	   *clause;			/* the join clause, for selectivity */
 	Path	   *dimpath;		/* the dimension's cheapest total path */
+	JoinType	jointype;		/* JOIN_INNER; or JOIN_SEMI or JOIN_ANTI, the
+								 * dimension the outer side and the fact the
+								 * inner one */
+	RelOptInfo *joinrel;		/* the join rel: a semi or anti join's rows */
 } LionFkJoin;
 
 /*
