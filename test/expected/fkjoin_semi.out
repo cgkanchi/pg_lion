@@ -749,23 +749,28 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AN
 (6 rows)
 
 -- the dimension's own filters answered by its lion index, as a bitmap scan
+-- (two equalities: every supported release puts both in the Index Cond)
 SET enable_seqscan = off;
-SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.region = ''us'' AND d.grp IN (''g1'', ''g2'') AND EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.t = ''t3'')') AS p("QUERY PLAN");
-                                         QUERY PLAN                                          
----------------------------------------------------------------------------------------------
+SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.region = ''us'' AND d.grp = ''g1'' AND EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.t = ''t3'')') AS p("QUERY PLAN");
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sf_fk (fk = d.pk), lion_sf_yt.t (t = 't3'::text)
          Join Type: Semi
          Fact Filters: collected once
          ->  Bitmap Heap Scan on lion_sd d
-               Recheck Cond: ((region = 'us'::text) AND (grp = ANY ('{g1,g2}'::text[])))
+               Recheck Cond: ((region = 'us'::text) AND (grp = 'g1'::text))
                ->  Bitmap Index Scan on lion_sd_rg
-                     Index Cond: ((region = 'us'::text) AND (grp = ANY ('{g1,g2}'::text[])))
+                     Index Cond: ((region = 'us'::text) AND (grp = 'g1'::text))
 (9 rows)
 
 RESET enable_seqscan;
--- two dimension rows: two counts, each probing the filter itself
+-- two dimension rows: two counts, each probing the filter itself.  The child
+-- is a plain scan here, which every supported release chooses alike.
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_bitmapscan = off;
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.pk IN (5, 6) AND EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)') AS p("QUERY PLAN");
                            QUERY PLAN                            
 -----------------------------------------------------------------
@@ -773,10 +778,13 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.pk IN (5
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sf_fk (fk = d.pk), lion_sf_x (x = 3)
          Join Type: Semi
-         ->  Index Only Scan using lion_sd_pkey on lion_sd d
-               Index Cond: (pk = ANY ('{5,6}'::bigint[]))
+         ->  Seq Scan on lion_sd d
+               Filter: (pk = ANY ('{5,6}'::bigint[]))
 (6 rows)
 
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+RESET enable_bitmapscan;
 -- no fact filter, nothing to collect
 SELECT * FROM lion_explain_norm('SELECT d.grp, count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk) GROUP BY d.grp', 'COSTS OFF, VERBOSE') AS p("QUERY PLAN");
                   QUERY PLAN                  
