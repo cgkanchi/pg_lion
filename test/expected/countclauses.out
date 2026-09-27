@@ -279,7 +279,20 @@ INSERT INTO lion_cc_q VALUES
 (224, $$SELECT status, count(*) FROM lion_cc_t WHERE NOT flag GROUP BY status$$),
 (225, $$SELECT count(DISTINCT status) FROM lion_cc_t WHERE flag$$),
 -- a fact filter of the FK-side join
-(226, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.flag AND f.country = 'c1' GROUP BY d.status$$);
+(226, $$SELECT d.status, count(*) FROM lion_cc_t f JOIN lion_cc_dim d ON f.status = d.status WHERE f.flag AND f.country = 'c1' GROUP BY d.status$$),
+-- IS NOT TRUE / IS NOT FALSE inside an AND arm of an OR: distributed into
+-- the arms it stands for, and so is any other OR nested there
+(227, $$SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND flag IS NOT TRUE) OR country = 'c1'$$),
+(228, $$SELECT count(*) FROM lion_cc_t WHERE (flag IS NOT FALSE AND country = 'c2') OR status IS NULL$$),
+(229, $$SELECT count(*) FROM lion_cc_t WHERE (status = 'dead' AND flag IS NOT TRUE AND flag IS NOT FALSE) OR pc = 3$$),
+(230, $$SELECT count(*) FROM lion_cc_t WHERE (flag IS NOT TRUE AND country = 'c3') OR (flag IS NOT FALSE AND status = 'parked')$$),
+(231, $$SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND (country = 'c1' OR pc = 2)) OR flag IS NOT TRUE$$),
+(232, $$SELECT status, count(*) FROM lion_cc_t WHERE (country = 'c1' AND flag IS NOT TRUE) OR pc = 2 GROUP BY status$$),
+(233, $$SELECT count(*) FROM lion_cc_t WHERE (pc = 1 AND (country = 'c1' OR status = 'live') AND (country = 'c2' OR flag) AND (flag IS NOT FALSE OR status IS NULL)) OR pc = 2$$),
+(234, $$SELECT count(*) FROM lion_cc_t WHERE country = 'c4' AND ((status = 'dead' AND flag IS NOT TRUE) OR pc = 5)$$),
+-- ... but no further than an IN list's sets: 2^10 arms of 11 leaves each is
+-- declined
+(235, $$SELECT count(*) FROM lion_cc_t WHERE (pc = 1 AND (country = 'c0' OR pc = 10) AND (country = 'c1' OR pc = 11) AND (country = 'c2' OR pc = 12) AND (country = 'c3' OR pc = 13) AND (country = 'c4' OR pc = 14) AND (country = 'c5' OR pc = 15) AND (status = 'live' OR pc = 16) AND (status = 'dead' OR pc = 17) AND (flag OR pc = 18) AND (flag IS NOT TRUE OR pc = 19)) OR pc = 2$$);
 -- ---- 3. stable expressions as clause values ----
 INSERT INTO lion_cc_q VALUES
 (301, $$SELECT count(*) FROM lion_cc_t WHERE ts >= now() - interval '30 days'$$),
@@ -361,6 +374,15 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  224 | LionCount, 4 rows
  225 | LionCount, 1 rows
  226 | LionCount, 3 rows
+ 227 | LionCount, 1 rows
+ 228 | LionCount, 1 rows
+ 229 | LionCount, 1 rows
+ 230 | LionCount, 1 rows
+ 231 | LionCount, 1 rows
+ 232 | LionCount, 3 rows
+ 233 | LionCount, 1 rows
+ 234 | LionCount, 1 rows
+ 235 | not pushed, 1 rows
  301 | LionCount, 1 rows
  302 | LionCount, 1 rows
  303 | LionCount, 1 rows
@@ -379,7 +401,7 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  316 | not pushed, 1 rows
  317 | not pushed, 1 rows
  318 | not pushed, 1 rows
-(66 rows)
+(75 rows)
 
 -- What EXPLAIN prints: each clause as core prints its index condition.
 SET enable_seqscan = off;
@@ -433,6 +455,20 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE flag IS NOT TRUE;
 -------------------------------------------------------------------------------
  Custom Scan (LionCount)
    Lion Indexes: lion_cc_flag, lion_cc_flag ((flag = false) OR (flag IS NULL))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND flag IS NOT TRUE) OR country = 'c1';
+                                                                                                            QUERY PLAN                                                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cc_status, lion_cc_flag, lion_cc_status, lion_cc_flag, lion_cc_country (((status = 'live'::lion_cc_ws) AND (flag = false)) OR ((status = 'live'::lion_cc_ws) AND (flag IS NULL)) OR (country = 'c1'::text))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE (status = 'live' AND (country = 'c1' OR pc = 2)) OR flag;
+                                                                                                       QUERY PLAN                                                                                                        
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_cc_status, lion_cc_country, lion_cc_status, lion_cc_pc, lion_cc_flag (((status = 'live'::lion_cc_ws) AND (country = 'c1'::text)) OR ((status = 'live'::lion_cc_ws) AND (pc = 2)) OR (flag = true))
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE ts >= now() - interval '30 days';
@@ -740,6 +776,15 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  224 | LionCount, 4 rows
  225 | LionCount, 1 rows
  226 | LionCount, 3 rows
+ 227 | LionCount, 1 rows
+ 228 | LionCount, 1 rows
+ 229 | LionCount, 1 rows
+ 230 | LionCount, 1 rows
+ 231 | LionCount, 1 rows
+ 232 | LionCount, 3 rows
+ 233 | LionCount, 1 rows
+ 234 | LionCount, 1 rows
+ 235 | not pushed, 1 rows
  301 | LionCount, 1 rows
  302 | LionCount, 1 rows
  303 | LionCount, 1 rows
@@ -758,7 +803,7 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  316 | not pushed, 1 rows
  317 | not pushed, 1 rows
  318 | not pushed, 1 rows
-(66 rows)
+(75 rows)
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
@@ -798,7 +843,7 @@ SELECT lion_cc_prep('SELECT count(*) FROM lion_cc_t WHERE d >= $1::date + 1 AND 
 
 -- ... and a dirty heap, whose candidates the node rechecks
 UPDATE lion_cc_t SET flag = NOT flag, status = 'dead' WHERE id % 11 = 0;
-SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 203, 208, 213, 301, 305, 310) ORDER BY n;
+SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 203, 208, 213, 227, 229, 232, 301, 305, 310) ORDER BY n;
   n  |      lion_cc      
 -----+-------------------
  101 | LionCount, 1 rows
@@ -810,10 +855,13 @@ SELECT n, lion_cc(q) FROM lion_cc_q WHERE n IN (101, 104, 111, 113, 121, 201, 20
  203 | LionCount, 1 rows
  208 | LionCount, 1 rows
  213 | LionCount, 1 rows
+ 227 | LionCount, 1 rows
+ 229 | LionCount, 1 rows
+ 232 | LionCount, 3 rows
  301 | LionCount, 1 rows
  305 | LionCount, 1 rows
  310 | LionCount, 1 rows
-(12 rows)
+(15 rows)
 
 DROP TABLE lion_cc_q, lion_cc_t, lion_cc_dim;
 DROP DOMAIN lion_cc_wsd;

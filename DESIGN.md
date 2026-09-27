@@ -1348,11 +1348,13 @@ Planner integration
     IN list; `k IN ($1, $2)` keeps an `ArrayExpr` over them in a generic plan, and that is accepted
     too, as long as its elements are themselves literals or parameters (the node evaluates the array
     ONCE per scan, and an element that could be volatile does not mean the same thing evaluated once
-    as it does evaluated per row). A multi-key clause (§17) still requires a Const, because there
-    the query's SHAPE and not just its value decides whether the posting sets can answer it at all.
-    At plan time the value is unknown, so `clause_selectivity()` gives the estimate it gives any
-    non-Const comparison; at run time a NULL value selects no rows, which every operator involved
-    agrees with by being strict.
+    as it does evaluated per row). A multi-key clause (§17) required a Const until 2026-09-27,
+    because there the query's SHAPE and not just its value decides whether the posting sets can
+    answer it at all; it takes a Param now, and answers the values its posting sets cannot answer
+    exactly from a superset rechecked in the heap (§17, "A query known only at run time"). At plan
+    time the value is unknown, so `clause_selectivity()` gives the estimate it gives any non-Const
+    comparison; at run time a NULL value selects no rows, which every operator involved agrees with
+    by being strict.
   - **So does any expression an index scan would take as a run-time key** (2026-09-27, a
     real-workload benchmark). A time window is written `ts >= now() - interval '90 days'` or `d >=
     current_date - 30`, and neither is a Const or a Param: `eval_const_expressions()` folds only
@@ -1377,8 +1379,8 @@ Planner integration
     estimate and the cost model prices the list's real length rather than `estimate_array_length()`'s
     default for an expression. An `ARRAY[]` over such expressions is taken element by element, as a
     generic plan's `ARRAY[$1, $2]` is. EXPLAIN deparses the expression like any clause value, `ts >=
-    (now() - '30 days'::interval)`. A multi-key clause (§17) still takes a Const only, for the
-    reason above.
+    (now() - '30 days'::interval)`. A multi-key clause (§17) takes one as its query too - `tsv @@
+    to_tsquery(current_setting(...))` - under the same rule as a Param.
   - **A boolean column tested by itself is the equality it stands for** (2026-09-27).
     `eval_const_expressions()` folds `flag = true` into the bare Var `flag`, and `flag =
     false` and `flag <> true` into `NOT flag`, before any path is built, so no boolean equality ever
@@ -1392,8 +1394,9 @@ Planner integration
     model is handed that OpExpr in place of the bare column. All four are false for NULL, as `=` is.
     `flag IS NOT TRUE` and `flag IS NOT FALSE` are true for NULL as well and so are no equality: they
     are the OR of the other value and the column's NULL entry, `flag = false OR flag IS NULL`, which
-    §19 takes apart like any other OR - as a whole restriction, or flattened into the arms of one;
-    inside an AND arm it is declined (`lion_boolean_not_test()`). `flag IS UNKNOWN` and `flag IS NOT
+    §19 takes apart like any other OR - as a whole restriction, flattened into the arms of one, or
+    inside an AND arm distributed into two arms (`lion_boolean_not_test()`, and §19's "Nested ORs,
+    distributed"; until that was written it was declined there). `flag IS UNKNOWN` and `flag IS NOT
     UNKNOWN` are §14's two null tests. A domain over boolean is relabelled to boolean by the WHERE
     clause and answered by bool_ops unchanged.
   - **Enum keys: the class's own type, for every clause kind** (2026-09-27).
@@ -1638,7 +1641,10 @@ enum `=`, IN list, GROUP BY, domain and FK-side join, every boolean form beside 
 under an OR, `now()` and `current_date` windows, a STABLE function, generic plans over `$1::date +
 1`, an exec Param inside an expression, and the volatile values that must be declined - over one
 single-column index per column and again over one multicolumn index, with every other scan
-disabled so that a LionCount path that is built at all is the plan. `test/sql/null.sql` and
+disabled so that a LionCount path that is built at all is the plan; and the ORs nested inside AND
+arms of §19, `flag IS NOT TRUE` among them, up to the distribution that is too large and declined.
+`test/sql/countmultikey.sql` does it for the multi-key queries only the executor sees (§17).
+`test/sql/null.sql` and
 `test/sql/inlist.sql` do the same for the clause kinds of §14 and §15, comparing every query against
 a forced sequential scan rather than against the pushdown-off plan, so that the access method's own
 answers are checked too. Section 11 of `test/sql/multicolumn.sql` runs the whole of this section
@@ -2991,25 +2997,28 @@ decision.
 
 A new clause kind, `LION_CLAUSE_MULTI`: an OpExpr whose operator is strategy 2, 3 or 5 of some roaring
 opfamily, with the column on the LEFT (these operators do not commute: `'{a}' @> tags` is strategy 4)
-and a non-NULL Const on the right.  Strategy 4 and everything that is not a roaring operator bail.
+and a non-NULL Const on the right - or, since 2026-09-27, a value the node evaluates at run time
+("A query known only at run time" below).  Strategy 4 and everything that is not a roaring operator
+bail.
 
 - The strategy is read from the OPERATOR (`lion_op_roaring_strategy()`, a pg_amop lookup restricted to
   the roaring AM), not from an index, because the parent of a partitioned table has no index list
   (§16) and the clause kind has to be known before any index is matched.  `lion_match_index()` then
   re-checks the strategy against the index that will really answer the clause, per partition.
-- The query is extracted AT PLAN TIME and the clause is only pushed down when the mode is KEYS.  An
-  ALL-mode query would have every row rechecked in the heap, which is what the ordinary bitmap plan
-  already does, better.  `lion_match_index()` additionally insists that each relation's index carries
-  the very extractQuery function the plan-time extraction used, so the run-time extraction cannot
-  come out differently.
-- **A multi-key clause therefore requires a Const**, even though §10 accepts a Param for equality
-  and for an IN list.  What decides whether this node can answer the clause at all is the query's
-  SHAPE - `tags @> $1` with `$1 = '{}'` extracts to ALL mode, as does a phrase or a prefix tsquery -
-  and a Param has no shape until the executor has it, at which point the plan is fixed and there is
-  nothing to fall back to: the node cannot recheck the operator against the heap, so it would have
-  to error on a query it was handed legitimately.  A generic plan over `tags @> $1` therefore uses
-  the ordinary plan (costed as ALL, above); a custom plan folds the parameter to a literal and is
-  pushed down as usual.  `test/sql/array.sql` pins both.
+- A LITERAL query is extracted AT PLAN TIME and the clause is only pushed down when the mode is
+  KEYS.  An ALL-mode query would have every row rechecked in the heap, which is what the ordinary
+  bitmap plan already does, better.  `lion_match_index()` additionally insists that each relation's
+  index carries the very extractQuery function the plan-time extraction used, so the run-time
+  extraction cannot come out differently.
+- **A multi-key clause used to require a Const**, even though §10 accepts a Param for equality and
+  for an IN list.  What decides whether this node can answer the clause at all is the query's SHAPE
+  - `tags @> $1` with `$1 = '{}'` extracts to ALL mode, as does a phrase or a prefix tsquery - and a
+  Param has no shape until the executor has it, at which point the plan is fixed and there is
+  nothing to fall back to: the node could not recheck the operator against the heap, so it would
+  have had to error on a query it was handed legitimately.  It can now, and so a generic plan's
+  `tags @> $1` and a stable expression's query are taken ("A query known only at run time" below).
+  A custom plan folds the parameter to a literal and is pushed down as before; `test/sql/array.sql`
+  pins both.
 - At run time the clause's source is the tree over its keys' posting sets, ANDed with the other
   clauses by the merge, exactly like an IN list's union.  Several multi-key clauses on ONE column are
   allowed (the one-positive-clause-per-column rule of §10 is for clauses that pin a value;
@@ -3024,6 +3033,141 @@ and a non-NULL Const on the right.  Strategy 4 and everything that is not a roar
   column next to a multi-key WHERE clause is the supported and tested combination.
 - EXPLAIN prints the clause with its operator: `Lion Indexes: idx (tags @> {t5,t7})`,
   `idx (tsv @@ 'w1' & 'w2')`.
+
+### A query known only at run time (2026-09-27)
+
+A multi-key clause whose query is not a literal - a prepared statement's GENERIC plan
+(`tags @> $1`, `tsv @@ to_tsquery($1)`), a stable expression (`tsv @@
+to_tsquery(current_setting('app.q'))`), an exec Param under a LATERAL nested loop - was declined,
+for the reason above: its shape decides whether the posting sets can answer it, and the node
+could not answer the shapes they cannot.  It is accepted now, under §10's rule for a value
+(`lion_is_value_expr()`, an `ARRAY[$1, $2]` of values included), and the node answers EVERY value
+the clause can take: exactly when the key sets answer it, and otherwise from a SUPERSET of its rows
+whose every candidate is tested in the heap.
+
+**The superset** (`lion_extract_query_superset()`, lion_multikey.c).  The run-time value is extracted
+with the index's own extractQuery, as a literal is, and the tree over its keys is widened wherever
+lion_extract_query() would have given up - which only a caller that rechecks may do:
+
+- `@>` with a NULL element is the AND of the other elements (a NULL is under no key, and an AND of
+  fewer keys selects more rows); every row when there is no other;
+- `&&` with a NULL or partial key is every row: an OR cannot leave a key out and stay a superset;
+- in a tsquery a lexeme with a weight mask is the lexeme at any weight; a prefix lexeme is every row
+  (the keys are hashed, and a range of them cannot be walked); `!a` is every row; a phrase `a <N> b`
+  is `a & b`, each side widened the same way, because a phrase matches only where both of its
+  operands match - at positions the index does not store - and an operand that is itself every row
+  (`!a <-> b`) constrains nothing; an AND drops the operands that are every row, and an OR is every
+  row when either operand is;
+- INCLUDE_EMPTY and ALL search modes (`@> '{}'`), more keys than LION_MAX_QUERY_KEYS and any other
+  strategy are every row.
+
+A query lion_extract_query() answers exactly comes back KEYS with the same keys; one that selects
+nothing (`&& '{}'`, an empty tsquery) NONE; a widened one LOSSY, with only the keys its tree names;
+and one no key narrows ALL.  `<@` is still declined whatever its value: ginqueryarrayextract() answers
+it with INCLUDE_EMPTY, so it would never be exact and always be the recheck the ordinary bitmap plan
+makes anyway.  (`=` on arrays is no operator of array_ops.)
+
+**Execution** (`lion_locate_multikey()`, lion_customscan.c).  The value is evaluated once per scan
+and after every ReScan with the other clause values (`lion_eval_clause_values()`, in every
+participant of a parallel plan), and extracted per relation counted:
+
+- KEYS is the literal case: the tree over the keys' sets is the clause's source;
+- NONE selects nothing, like a NULL value;
+- LOSSY makes the superset's tree the source, and the clause is added to the ROW FILTER below;
+- ALL locates nothing and is no source of the intersection at all - a negated source with nothing to
+  subtract, which is exactly how `IS NOT NULL` over a column without NULLs reads - and the clause
+  is added to the row filter, which then tests the rows the OTHER sources select;
+- and when there is no other source that selects rows - a plain count whose only positive clause
+  was an ALL query - the relation is read by a sequential scan under the count's snapshot, and the
+  filter and the `IS NOT NULL` clauses are tested on each row (`lion_count_heap_filtered()`): the
+  ordinary plan's work, which is what the cost model charges a value it cannot estimate.
+
+**The row filter** (`LionRowFilter`, lion_count.c).  The node builds one per relation it counts - each
+clause `col op value` with the clause's operator and this scan's value, the column numbered as the
+index that answers it says, which for a partition is the partition's own numbering (§16) - and hangs
+it on the visibility cache every count of the execution is handed (`lion_vis_cache_set_filter()`),
+so that no caller of the count changes.  A count that finds one:
+
+- asks nothing of the visibility map: it vouches for visibility, not for the query.  Every candidate
+  TID goes to the heap recheck, as on a standby or with no pinned source (§9's `novm`);
+- resolves each candidate's HOT chain under the page's share lock exactly as an unfiltered recheck
+  does (`heap_hot_search_buffer()`, with its serializable checks and tuple predicate locks), notes the
+  visible member, and tests it after the lock is released, under the pin alone - which is what core's
+  page-at-a-time heap scans do: nothing moves a tuple while another backend pins its page, pruning
+  and defragmentation need the cleanup lock, and the operator may detoast or run for a while, which
+  must not happen under a content lock.  A row counts when the snapshot sees it and it passes;
+- keeps no visibility cache: the cache knows which offsets are visible, not what their tuples hold.
+
+Why the answer is exact: the candidates are a superset of the rows the WHERE selects - the sources
+are exact for their own clauses and a superset for the filtered one - and each candidate is then
+decided by the snapshot and by the very operator and value the query applies, on the very version the
+snapshot sees.  §9's interlock has nothing to protect: nothing is counted from the map.
+
+Every shape of the node counts through the same functions, so every shape takes the filter: a GROUP
+BY per group, a count(DISTINCT) per test (an existence test stops at its first row that passes), a
+range walk per entry, a partition per partition, and the FK-side join (§27) per dimension row - where
+the collected copy of the fact filters is made WITHOUT the filter (it copies the superset; a
+collection is handed no cache) and each count of it applies the filter.  A disjoint sum or a one-set
+count is not taken beside an ALL query's empty source, which takes the ordinary merge instead.
+
+Under an OR (§19) the query still has to be a literal: the filter tests the clause alone, which is
+right for a clause the rest are ANDed with, while a row satisfies an OR when ANY arm holds, and the
+other arms' leaves are answered from posting sets and never evaluated.
+
+**Cost** (`lion_multikey_cost_mode()`, `lion_cost_recheck()`).  The clause analysis hands the cost model
+the clause over the value's plan-time estimate when `estimate_expression_value()` gives one (a stable
+expression; a custom plan's parameter is a literal already), and the model extracts it as the
+executor will extract the value itself: KEYS costs what a literal costs; LOSSY rechecks at least the
+rows the clause selects (the superset is wider, by how much the estimate does not say); ALL rechecks
+every row the other clauses select, or every row of the relation.  A value with no estimate - a
+generic plan's parameter - is priced as ALL: its shape is unknown, and is assumed to be the
+expensive one, as lioncostestimate() assumes it for a bitmap scan.  Each candidate is fetched on
+the pages each count reads for itself (`lion_heap_page_cost()`, a filtered recheck having no cache)
+and tested at the clause's own evaluation cost; §10's recheck of the dirty pages is still charged
+beside it.  So a lone `tags @> $1` in a generic plan loses to the ordinary plan, whose own index
+path is priced as ALL too; beside a selective clause the rows the node would recheck are the ones
+the ordinary plan fetches anyway, and the two come out close, the node ahead by what the posting
+sets save (18% in the table below, 4% on the smaller table of the tests, which is why those pin
+only the lone clause); and under `plan_cache_mode = auto` the generic plan's price keeps the plan
+cache choosing custom plans, whose literals are pushed down exactly.
+
+**EXPLAIN** prints the clause with its value as core does (`tags @> $1`, `tsv @@
+to_tsquery('simple'::regconfig, current_setting('app.q'::text))`); with ANALYZE, `Heap TIDs
+Rechecked` counts the candidates tested, or the rows scanned, and `Rows Removed by Recheck` - printed
+only when there were some, as core prints its own - the ones the filter turned away.
+
+**Measured** (2026-09-27, PostgreSQL 18.6 assert build, so ratios and not absolute numbers; 400,000
+rows over 9,757 heap pages, all-visible; `k` 50 values, `tags` three elements out of 20, 7 and
+5,000, `tsv` four lexemes; generic plans, medians of five, warm):
+
+| query and value | node | ordinary plan |
+|---|---|---|
+| `tsv @@ $1 AND k = $2`, `'w1 & x2'` (exact) | **0.4 ms** (8,116) | 8.6 (9,929) |
+| ... `'w1 <-> x1'` (the AND of the lexemes, rechecked) | **2.9** | 7.1 |
+| ... `'!w1'` (every row of `k = 1` rechecked) | **7.2** | 6.6 |
+| `tags @> $1` alone, `'{t1}'` (exact) | 0.2 (14,784) | **126** (14,762) |
+| ... `'{t1,NULL}'` (the rows of `t1`, rechecked) | 33.5 | **122** |
+| ... `'{}'` (a sequential scan) | 79.5 | **105** |
+
+Bold is the plan the model picks, which does not know the value: beside a selective clause the
+node, whose worst case - `!w1` - is the ordinary plan's work to a tenth; alone the sequential scan,
+by 22 units in 14,762, because priced as every row the node IS a sequential scan - and one that
+runs faster than the ordinary plan's, since the query is extracted once where the ordinary plan
+evaluates it per row, so the worst case the model assumes is not worse than what it replaces.
+What the lone clause gives up is the exact case, 0.2 ms against 126; under `plan_cache_mode =
+auto` the plan cache keeps choosing custom plans for it, whose literal is exact.
+
+`test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
+counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
+that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b`, a
+prefix beside a lexeme) and are every row (`{}`, `!a`, `a:*`, `a | !b`), queries built by
+`to_tsquery($1)` and `websearch_to_tsquery($1)`, `ARRAY[$1, $2]`; beside other clauses, two such
+clauses and an `IS NOT NULL` read by the sequential scan, `count(col)`, GROUP BY (one column and two),
+HAVING, a folded GROUP BY and count(DISTINCT); the OR that is declined; custom plans; stable
+expressions, and one cached generic plan executed as its setting moves through exact, every row and
+widened; an exec Param under LATERAL; the cost model's choices; a partitioned table whose partitions
+number the column differently; the FK-side join's inner, semi, anti and count(DISTINCT) forms, and
+in parallel plans; and a dirty heap before and after VACUUM.
 
 ### Cardinality guard
 
@@ -3040,8 +3184,9 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 ### Not supported
 
 `<@` from the posting sets (a row matches when it has no key OUTSIDE the query array, which the index
-cannot tell); prefix, phrase and weighted tsqueries from the posting sets; `col op ANY (...)` in the
-count pushdown (only in the bitmap scan); a Param as a multi-key query in the count pushdown (above);
+cannot tell); prefix, phrase and weighted tsqueries from the posting sets, except as the superset a
+query known only at run time is counted from (above); `col op ANY (...)` in the count pushdown (only
+in the bitmap scan); a query known only at run time under an OR (above);
 a multi-key index as the GROUP BY or sum-over-all driver;
 `lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
 
@@ -3484,6 +3629,30 @@ End, and at the end of each partition's turn.
 `Lion Indexes: ix_c200, ix_c20 ((c200 = 17) OR (c20 = 3))`, an AND arm as
 `((a = 1) AND (b = 2))`, and - on a partitioned scan, where there is one index per partition - the
 expression alone. A Param is deparsed as `$1` like any other clause value.
+
+**Nested ORs, distributed (2026-09-27).** The structure above is an OR of ANDs of leaves, one level
+deep, because that is what a source's tree is built from. An AND arm with an OR inside it used to
+decline the whole query - and `flag IS NOT TRUE` is one (`flag = false OR flag IS NULL`, §10), so
+`(status = 'live' AND flag IS NOT TRUE) OR country = 'c1'` was never counted while the same test at
+the top level was. `lion_or_arms()` now puts the restriction into disjunctive normal form before the
+leaves are analysed: an OR's arms are its operands' arms, an AND's are every combination of one arm
+of each operand, and `flag IS NOT TRUE` / `IS NOT FALSE` are the ORs they stand for wherever they
+appear, so that one is `((status = 'live') AND (flag = false)) OR ((status = 'live') AND (flag IS
+NULL)) OR (country = 'c1')` - which is what EXPLAIN prints. The union of the arms is the same set of
+rows, and nothing downstream changes: the arms are ordinary arms, flattened and carried as before.
+Distributing repeats a term in every arm it is distributed into, and each repetition is a leaf of its
+own - its own lookup, priced as such, and its own set of the union - and it multiplies arms: an AND of
+k two-way ORs is 2^k arms of k leaves. So the leaves of one OR are bounded by what an IN list's sets
+are bounded by, LION_MAX_ARRAY_ELEMS (§15), for the same reason: every set of the union may hold a
+buffer pin for as long as the node runs, and a union's leaves are never materialized (above). Past
+it the query is declined; the bound applies to an OR as written as well, which no ordinary query
+comes near. The other option, an OR node inside an arm, would have kept a term to one lookup, at the
+price of a second level in `LION_PRIV_ORS`, `lion_locate_or()` and the model's union terms; the
+distributed form is the one the rest of the machinery already knows, and the repeats cost what the
+model says they cost. `test/sql/countclauses.sql` covers both boolean tests in an arm, both in one
+arm (four arms, three of which select nothing), each in an arm of its own on both sides of the OR,
+an OR of other columns nested in an arm, a GROUP BY and a clause ANDed beside the OR, three nested
+ORs in one arm, and ten, which would be 1,024 arms of 11 leaves and is declined.
 
 **Measured** (2026-09-21, 1M rows of `(c200, c20)`, 18,182 heap pages all-visible, assert build):
 `count(*) WHERE c200 = 17 OR c20 = 3` returns 55,000 rows in **0.55-0.62 ms** against the BitmapOr +
@@ -6314,11 +6483,21 @@ loop's 2 ms, and forced with `d.pk < 2000` estimated 7,500 against 10,000 and ra
 per-count union is worst (`x IN (1, 2)` over 1000 dimension rows: 957 ms, refused, against 108).
 The rows of the table below are unchanged by it.
 
-An IN list whose array is a PARAMETER (`= ANY ($1)`) is refused outright: its length is not known
-until the executor has it (§15), and the node's work per dimension row is proportional to it - a
-43,000-value array over 20,000 dimension rows ran for minutes in the review. A single table
-answers such a list once and keeps accepting it; `IN ($1, $2)` keeps its length at plan time and
-is priced like a literal list.
+An IN list whose array is a PARAMETER (`= ANY ($1)`) used to be refused outright: its length is not
+known until the executor has it (§15), and a count that reads the filters does work per dimension
+row proportional to it - a 43,000-value array over 20,000 dimension rows ran for minutes in the
+review. Since the fact filters are collected once ("The fact filters, collected once" below) that
+work is done once per scan instead, whatever the list's length, and the list is taken as a single
+table takes it (2026-09-27): evaluated once per scan and rescan, in every participant of a parallel
+plan, and so is any other array a stable expression computes (`x = ANY
+(string_to_array(current_setting(...), ',')::int[])`). The cost model prices it two ways
+(`lion_cost_fkjoin_rel()`): collected, once per scan, at `estimate_array_length()`'s guess - an
+expression's array at its plan-time estimate, which the clause analysis puts in the clause (§10) -
+and probed, per dimension row, as the longest list a literal may be (LION_MAX_ARRAY_ELEMS). A
+wrong guess about a scan's one-off work costs little; a wrong guess about a dimension row's costs
+that many times over, which is what the review measured. So the copy is what is chosen whenever it
+is expected to fit, and a copy that does not fit at run time falls back to the probes, as a literal
+list's does. `IN ($1, $2)` keeps its length at plan time and is priced like a literal list.
 
 **Measured** (2026-09-23, prune slot's PostgreSQL 20devel install - assert-enabled, so ratios and
 not absolute numbers; two million fact rows over 22,728 heap pages with a 40-byte pad, `fk` = a
@@ -6456,8 +6635,14 @@ count seeks by a binary search in memory. The same forward count takes 135 ms (t
   does (the merge stops there: `lion_exists_settled()` reads the collection's `failed`), and that
   run reads the filters per count as before; EXPLAIN ANALYZE then prints `Fact Filter Rows
   Collected: -1`. The same on a hot standby, where whether the map may be trusted depends on the
-  WAL mode of every index read, and for an IN list too long to open at once, whose batches (§15)
-  each yield every container key of their own and would reach a copy out of order.
+  WAL mode of every index read.
+- An IN list too long to open at once used to be refused a copy as well: a count takes such a list
+  in batches (§15, "Bounded cursors"), each yielding every container key of its own, which would
+  reach a copy out of order. A collection is never batched now (2026-09-27): the batches exist to
+  keep a count's pins, which a collection drops anyway, so the list is read as the windowed union
+  any other union too wide for the open budget is (`lion_plan_node()`, `lion_wide_fill()`), a window
+  of container keys at a time and every key in order. That is what makes a list whose length the
+  planner could not see safe to collect, however long it turns out.
 - Nothing is asked of the visibility map or the heap while the copy is made, and nothing is pinned:
   its cursors drop each leaf once copied (`cx->droppins`), the visibility cache is not consulted,
   and the disjoint sum and the one-set shortcut of §15 are not taken - a copy wants the union
@@ -6944,7 +7129,9 @@ before VACUUM) - GROUP BY one and two dimension columns and an expression, the u
 a dimension filter, fact filters (`=`, IN, `IS NULL` on another column, OR), NULL fks, NULL
 dimension keys and a NULL group, HAVING, ORDER BY and LIMIT on top, cross-type keys (`int4` fk
 against `int8` pk and `int8` against `int4`), text keys, `count(1)` and `count` of either join
-column, generic plans with Param fact and dimension filters (a NULL one included), and a correlated
+column, generic plans with Param fact and dimension filters (a NULL one included) and, since
+2026-09-27, IN lists of unknown length (`= ANY ($1)` with two values, none, NULL and 1,500 of them,
+`ANY (ARRAY[$1, $2 + 1])`, and a stable expression's array), and a correlated
 subquery whose dimension filter is an exec Param, so that the node and its child are rescanned per
 outer row; the declines - a non-unique dimension key, a key unique only under another collation
 than the join's (and accepted once a unique index under the join's own exists), a second join
@@ -7018,7 +7205,12 @@ inner side of a nested loop; a generic plan's Params evaluated in every particip
 included; each participant's copy abandoned at run time over a 64 kB memory limit with the answer
 unchanged; and a dirty heap before and after VACUUM. Its plans are ones every supported release
 makes alike (a parallel sequential scan of the dimension, the worker count from its
-`parallel_workers`); the expected output was checked on PostgreSQL 16 and 18.
+`parallel_workers`); the expected output was checked on PostgreSQL 16 and 18. Section 9 of
+`test/sql/countmultikey.sql` (2026-09-27) does the same for the values every participant evaluates
+for itself: multi-key fact filters known only at run time (§17), exact, widened and every row, and
+IN lists of unknown length - a parameter, a NULL one, 1,500 values, `IN ($1, $2)` and a stable
+expression's array - and checks serially that the 1,500-value list, too wide for the open budget at
+a `work_mem` of 64 kB, is collected once.
 
 `test/sql/fkjoin_nonunique.sql` (2026-09-27), the forward semi join over a non-unique key, against
 the pushdown off: EXISTS and IN over a 900-row dimension of 400 keys, most of them two or three
