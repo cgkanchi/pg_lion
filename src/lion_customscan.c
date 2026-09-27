@@ -3896,6 +3896,110 @@ lion_boolean_not_test(Node *clause)
 }
 
 /*
+ * The walker of lion_or_arms(): node in disjunctive normal form, as a list of
+ * arms that are each the list of their leaves, with the number of leaves of
+ * them all in *nleaves; NIL once that number would pass LION_MAX_ARRAY_ELEMS.
+ */
+static List *
+lion_or_dnf(Node *node, int *nleaves)
+{
+	BoolExpr   *orform = lion_boolean_not_test(node);
+	List	   *result;
+	double		total;
+	ListCell   *lc;
+
+	check_stack_depth();
+
+	if (orform != NULL)
+		node = (Node *) orform;
+
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == OR_EXPR)
+	{
+		result = NIL;
+		total = 0;
+		foreach(lc, ((BoolExpr *) node)->args)
+		{
+			int			n;
+			List	   *sub = lion_or_dnf((Node *) lfirst(lc), &n);
+
+			if (sub == NIL)
+				return NIL;
+			total += n;
+			if (total > LION_MAX_ARRAY_ELEMS)
+				return NIL;
+			result = list_concat(result, sub);
+		}
+		*nleaves = (int) total;
+		return result;
+	}
+
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		/* one empty arm, which the first term's arms extend */
+		result = list_make1(NIL);
+		total = 0;
+		foreach(lc, ((BoolExpr *) node)->args)
+		{
+			int			n;
+			List	   *sub = lion_or_dnf((Node *) lfirst(lc), &n);
+			List	   *product = NIL;
+			ListCell   *la;
+			ListCell   *lb;
+
+			if (sub == NIL)
+				return NIL;
+
+			/* every arm so far ANDed with every arm of this term */
+			total = total * list_length(sub) + (double) n * list_length(result);
+			if (total > LION_MAX_ARRAY_ELEMS)
+				return NIL;
+			foreach(la, result)
+			{
+				foreach(lb, sub)
+					product = lappend(product,
+									  list_concat_copy((List *) lfirst(la),
+													   (List *) lfirst(lb)));
+			}
+			result = product;
+		}
+		*nleaves = (int) total;
+		return result;
+	}
+
+	/* a leaf, for lion_analyze_leaf() to accept or decline */
+	*nleaves = 1;
+	return list_make1(list_make1(node));
+}
+
+/*
+ * An OR restriction as the arms of one union (DESIGN.md §19): a list of arms,
+ * each the list of the clauses it ANDs, or NIL when it is too big to count.
+ *
+ * The OR machinery takes an OR of ANDs of leaves, one level deep, because
+ * that is what a source's tree is built from (lion_locate_or()).  Anything
+ * nested deeper is DISTRIBUTED into that shape: `(a AND (b OR c)) OR d` is
+ * `(a AND b) OR (a AND c) OR d`, and `(a AND flag IS NOT TRUE) OR d` - whose
+ * `flag IS NOT TRUE` is `flag = false OR flag IS NULL` (lion_boolean_not_test())
+ * and used to decline the whole query - is `(a AND flag = false) OR (a AND
+ * flag IS NULL) OR d`.  The union of the arms is the same set of rows.
+ *
+ * Distributing repeats a term in every arm it is distributed into, and each
+ * repetition is a leaf of its own: its own lookup, priced as such, and its own
+ * posting set in the union.  An AND of k two-way ORs is 2^k arms of k leaves.
+ * So the leaves of the result are bounded by the number an IN list's sets are
+ * (LION_MAX_ARRAY_ELEMS, DESIGN.md §15), for the same reason: every set of the
+ * union may hold a buffer pin for as long as the node runs (§9), and an OR's
+ * leaves are never materialized (§19).  Past it the query is declined.
+ */
+static List *
+lion_or_arms(Node *clause)
+{
+	int			nleaves;
+
+	return lion_or_dnf(clause, &nleaves);
+}
+
+/*
  * One WHERE clause as the analysis below understands it: which column it
  * constrains, with what, and everything lion_match_index() will need in order
  * to find an index for it on each relation.
@@ -5422,7 +5526,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 * but a boolean column) is declined: the complement of a posting set
 		 * is not a posting set, and under a union there is nothing to
 		 * subtract it from.  An arm `flag IS NOT TRUE` is two arms of the
-		 * same union, `flag = false` and `flag IS NULL`.
+		 * same union, `flag = false` and `flag IS NULL`, and an AND arm with
+		 * an OR inside - `flag IS NOT TRUE` among its terms, or any other -
+		 * is distributed into the arms it stands for (lion_or_arms()).
 		 *
 		 * The leaves are appended to the clause array like plain clauses, so
 		 * that an index is matched for each of them per partition and a Param
@@ -5435,63 +5541,34 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 		{
-			BoolExpr   *orexpr = (BoolExpr *) clause;
-			List	   *arms = NIL;
+			List	   *arms;
 			List	   *armlens = NIL;
 			int			orfirst = list_length(whereattnos);
 			ListCell   *la;
 
-			if (list_length(orexpr->args) < 2)
+			if (list_length(((BoolExpr *) clause)->args) < 2)
 				return;
 
-			foreach(la, orexpr->args)
-			{
-				BoolExpr   *orform = lion_boolean_not_test((Node *) lfirst(la));
-
-				if (orform != NULL)
-					arms = list_concat(arms, orform->args);
-				else
-					arms = lappend(arms, lfirst(la));
-			}
+			arms = lion_or_arms(clause);
+			if (arms == NIL)
+				return;
 
 			foreach(la, arms)
 			{
-				Node	   *arm = (Node *) lfirst(la);
-				int			nleaf = 0;
+				List	   *arm = (List *) lfirst(la);
+				ListCell   *lb;
 
-				if (IsA(arm, BoolExpr) &&
-					((BoolExpr *) arm)->boolop == AND_EXPR)
+				foreach(lb, arm)
 				{
-					ListCell   *lb;
-
-					foreach(lb, ((BoolExpr *) arm)->args)
-					{
-						if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
-											  false, false, &leaf))
-							return;
-						lion_append_clause(&leaf, (Node *) lfirst(lb), true,
-										  &whereattnos, &clauseinfos,
-										  &whereclauses, &whereconsts,
-										  &wherekinds, &whereopnos,
-										  &whereinor);
-						nleaf++;
-					}
-					if (nleaf == 0)
+					if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
+										  false, false, &leaf))
 						return;
-				}
-				else
-				{
-					if (!lion_analyze_leaf(root, arm, rti, false, false,
-										  &leaf))
-						return;
-					lion_append_clause(&leaf, arm, true,
+					lion_append_clause(&leaf, (Node *) lfirst(lb), true,
 									  &whereattnos, &clauseinfos,
 									  &whereclauses, &whereconsts,
 									  &wherekinds, &whereopnos, &whereinor);
-					nleaf = 1;
 				}
-
-				armlens = lappend_int(armlens, nleaf);
+				armlens = lappend_int(armlens, list_length(arm));
 			}
 
 			ors = lappend(ors,
