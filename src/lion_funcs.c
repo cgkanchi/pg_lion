@@ -777,7 +777,16 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
 				 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
 						1, RelationGetRelationName(index))));
 
-	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0])
+	/*
+	 * The key is looked up as one of the column's own values.  For a class
+	 * declared on a polymorphic type (enum_ops is FOR TYPE anyenum) that is a
+	 * value of the column's actual type, which the class's input type does
+	 * not name: a domain over the enum is its enum, a different enum is not
+	 * (lion_type_is_column() in lion_count.c makes the same test).
+	 */
+	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0] &&
+		!(IsPolymorphicType(index->rd_opcintype[0]) &&
+		  getBaseType(keytype) == getBaseType(state->typid)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("type %s cannot be compared with index \"%s\"",
