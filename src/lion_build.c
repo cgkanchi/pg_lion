@@ -83,6 +83,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 #include "varatt.h"
 
 #include "lion.h"
