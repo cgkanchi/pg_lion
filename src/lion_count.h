@@ -787,6 +787,13 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *output_rel,
 								   void *extra);
 
+/*
+ * A column's correlation with the heap order less ANALYZE's tie-break, as the
+ * cost model reads it (lion_am.c).
+ */
+extern double lion_var_heap_correlation(PlannerInfo *root, Index relid,
+										Var *var);
+
 /* ---------------------------------------------------------------------
  * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan
  * --------------------------------------------------------------------- */
