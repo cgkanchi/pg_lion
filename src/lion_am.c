@@ -80,7 +80,17 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
 	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)},
 	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)},
-	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)}
+	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
+	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
+	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)}
+};
+
+/* DESIGN.md §31: which key columns a build gives summary posting sets. */
+static relopt_enum_elt_def lion_summaries_options[] = {
+	{"off", LION_SUMOPT_OFF},
+	{"on", LION_SUMOPT_ON},
+	{"auto", LION_SUMOPT_AUTO},
+	{(const char *) NULL}
 };
 
 /* DESIGN.md §25: which WAL logger a new index is built for. */
@@ -143,6 +153,27 @@ _PG_init(void)
 					   lion_wal_mode_options, LION_WALOPT_AUTO,
 					   "Valid values are \"auto\", \"generic\" and \"rmgr\".",
 					   AccessExclusiveLock);
+
+	/*
+	 * DESIGN.md §31.  Summary posting sets make a range over many keys cost
+	 * a summary per bucket of keys instead of a posting set per key, and every
+	 * insert into a summarized column one more posting-set insert.  "off" is
+	 * the default so that nothing changes for an index that does not ask:
+	 * "auto" lets the build decide per column from the data, "on" gives every
+	 * ordered scalar column summaries.  Both are read at build time only and
+	 * recorded on the meta page, so it is REINDEX that adds or removes them,
+	 * and so is the bucket size.
+	 */
+	add_enum_reloption(lion_relopt_kind, "summaries",
+					   "Which ordered key columns get summary posting sets",
+					   lion_summaries_options, LION_SUMOPT_OFF,
+					   "Valid values are \"off\", \"on\" and \"auto\".",
+					   AccessExclusiveLock);
+	add_int_reloption(lion_relopt_kind, "summary_tids",
+					  "Rows a summary posting set holds before the next one starts",
+					  LION_DEFAULT_SUMMARY_TIDS, LION_MIN_SUMMARY_TIDS,
+					  LION_MAX_SUMMARY_TIDS,
+					  AccessExclusiveLock);
 
 	/*
 	 * The resource manager itself, which only registers while
@@ -1880,6 +1911,25 @@ lionbuildempty(Relation index)
 	lion_fill_index_state(index, &ix, &meta, CurrentMemoryContext);
 	lion_meta_record_order(&meta, &ix);	/* not in the critical section */
 
+	/*
+	 * Summaries (DESIGN.md §31): "on" gives them to every ordered scalar
+	 * column of an empty index as it would to a full one.  "auto" decides
+	 * from the rows a build sees, and an empty index has none, so it gives
+	 * them to nobody - which is what a build of an empty table decides too.
+	 */
+	{
+		uint32		cols = 0;
+		int			i;
+
+		if (opts != NULL && opts->summaries == LION_SUMOPT_ON)
+			for (i = 0; i < ix.ncolumns; i++)
+				if (ix.cols[i].ordered && !ix.cols[i].multikey)
+					cols |= ((uint32) 1) << i;
+		lion_meta_record_summaries(&meta, cols,
+								   opts ? (uint32) opts->summary_tids :
+								   LION_DEFAULT_SUMMARY_TIDS);
+	}
+
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -1890,6 +1940,9 @@ lionbuildempty(Relation index)
 	LionPageGetMeta(BufferGetPage(buf))->order_flags = meta.order_flags;
 	LionPageGetMeta(BufferGetPage(buf))->ordered_cols = meta.ordered_cols;
 	LionPageGetMeta(BufferGetPage(buf))->order_ident = meta.order_ident;
+	LionPageGetMeta(BufferGetPage(buf))->version = meta.version;
+	LionPageGetMeta(BufferGetPage(buf))->summary_cols = meta.summary_cols;
+	LionPageGetMeta(BufferGetPage(buf))->summary_tids = meta.summary_tids;
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

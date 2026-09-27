@@ -767,6 +767,18 @@ lion_vac_entry_matches(Page page, OffsetNumber off, const LionVacEntry *ent)
 		return false;
 	if (e->attno != ent->attno)
 		return false;			/* another key column (DESIGN.md §24) */
+
+	/*
+	 * A SUMMARY entry (DESIGN.md §31) of a posting tree is its tree: the open
+	 * bucket's key is raised by inserts and the bucket is closed - its kind
+	 * changes - when the next one opens, but the root block a set is stamped
+	 * with never changes and is never reused (§18).
+	 */
+	if (ent->ischain && (ent->kind == LION_KIND_SUMMARY ||
+						 ent->kind == LION_KIND_SUMLAST))
+		return LionEntryIsSummary(e) && (e->flags & LION_ENTRY_CHAIN) != 0 &&
+			e->head == ent->head;
+
 	if (lion_entry_kind(e) != ent->kind || e->keylen != ent->keylen)
 		return false;
 
@@ -826,6 +838,50 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 	{
 		ReleaseBuffer(ref->buf);
 		ref->buf = InvalidBuffer;
+	}
+
+	/*
+	 * A summary's tree is found by its root (lion_vac_entry_matches()): from
+	 * the key it had when pass 1 saw it, which it can only have raised since,
+	 * rightwards through the column's summaries.
+	 */
+	if (ent->ischain && (ent->kind == LION_KIND_SUMMARY ||
+						 ent->kind == LION_KIND_SUMLAST))
+	{
+		LionState  *col = lion_column(vs->ix, (AttrNumber) ent->attno);
+
+		lion_search_key_init(col, &sk, LION_KIND_SUMMARY,
+							 lion_fetch_key(col, ent->keydata), 0);
+		buf = lion_dir_search(vs->index, vs->heaprel, vs->ix, &sk,
+							  BUFFER_LOCK_SHARE, false, &off);
+		for (;;)
+		{
+			Page		page = BufferGetPage(buf);
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+			for (; off <= maxoff; off++)
+			{
+				LionEntryTuple *e = lion_page_entry(page, off);
+
+				if (e->attno > ent->attno)
+					goto summary_gone;
+				if (lion_vac_entry_matches(page, off, ent))
+				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					ref->buf = buf;
+					ref->off = off;
+					return;
+				}
+			}
+			if (LionPageIsRightmost(page))
+				break;
+			buf = lion_dir_step_right(vs->index, buf, BUFFER_LOCK_SHARE);
+			off = lion_page_first_data(BufferGetPage(buf));
+		}
+summary_gone:
+		UnlockReleaseBuffer(buf);
+		elog(ERROR, "lion index \"%s\": a summary VACUUM is working on has disappeared",
+			 RelationGetRelationName(vs->index));
 	}
 
 	probe = (LionEntryTuple *) palloc0(probesz);

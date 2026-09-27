@@ -658,6 +658,12 @@ typedef struct LionCountScanState
 	 * as "Range Evaluation".
 	 */
 	int64		rangeeval[3];
+
+	/*
+	 * Summary entries the sums added up in place of the keys they cover
+	 * (DESIGN.md §31): what EXPLAIN ANALYZE prints as "Summaries Summed".
+	 */
+	int64		summaries;
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -7476,6 +7482,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->partopen = false;
 	memset(&st->stats, 0, sizeof(st->stats));
 	memset(st->rangeeval, 0, sizeof(st->rangeeval));
+	st->summaries = 0;
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
@@ -8421,12 +8428,13 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 	int64		total = 0;
 	int			i;
 
-	if (part == LION_WALK_ALL || part == LION_WALK_INSIDE)
-		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
-									st->hasrange ? &st->range : NULL);
-	else
-		lion_entry_scan_begin_part(&st->escan, st->groupidx, st->groupidxcol,
-								   &st->range, part);
+	/*
+	 * A sum only adds up what the walk hands out, so it may be handed the
+	 * column's SUMMARY entries in place of the keys they cover (DESIGN.md
+	 * §31): still disjoint sets, still exactly the rows of the part.
+	 */
+	lion_entry_scan_begin_sum(&st->escan, st->groupidx, st->groupidxcol,
+							  st->hasrange ? &st->range : NULL, part);
 	st->scanning = true;
 
 	/* One leaf's entries, which is at most what lion_count.c copies of one. */
@@ -8507,6 +8515,7 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 
 	sources[0] = saved;
 	pfree(sets);
+	st->summaries += st->escan.nsummaries;
 	lion_entry_scan_end(&st->escan);
 	st->scanning = false;
 	return total;
@@ -8614,12 +8623,16 @@ lion_range_choose(LionCountScanState *st, LionCountSource *sources,
 	if (RelationGetIndexPredicate(st->groupidx) != NIL)
 		return LION_RANGE_EVAL_INSIDE;	/* the planner never picks one */
 
-	lion_entry_scan_begin_part(&in, st->groupidx, st->groupidxcol,
-							   &st->range, LION_WALK_INSIDE);
-	lion_entry_scan_begin_part(&below, st->groupidx, st->groupidxcol,
-							   &st->range, LION_WALK_BELOW);
-	lion_entry_scan_begin_part(&above, st->groupidx, st->groupidxcol,
-							   &st->range, LION_WALK_ABOVE);
+	/*
+	 * The walks that will be counted, summaries and all (DESIGN.md §31): a
+	 * side is as long as the sets it would count, whatever they stand for.
+	 */
+	lion_entry_scan_begin_sum(&in, st->groupidx, st->groupidxcol,
+							  &st->range, LION_WALK_INSIDE);
+	lion_entry_scan_begin_sum(&below, st->groupidx, st->groupidxcol,
+							  &st->range, LION_WALK_BELOW);
+	lion_entry_scan_begin_sum(&above, st->groupidx, st->groupidxcol,
+							  &st->range, LION_WALK_ABOVE);
 
 	for (;;)
 	{
@@ -10439,6 +10452,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				ExplainPropertyText("Range Evaluation", buf.data, es);
 			pfree(buf.data);
 		}
+
+		/*
+		 * The summaries (DESIGN.md §31) a sum added up in place of the keys
+		 * they cover, among the Posting Sets Summed.  Only when there were
+		 * any, so that an index without summaries prints what it always did.
+		 */
+		if (st->summaries > 0)
+			ExplainPropertyInteger("Summaries Summed", NULL, st->summaries, es);
 
 		/*
 		 * The existence (or count) tests a count(DISTINCT k) made: one per
