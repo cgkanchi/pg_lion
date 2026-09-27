@@ -33,7 +33,7 @@
  *	  (lion_cursor_step()), which is all the disorder there can be.
  *
  *	- A synchronized scan may start in the middle of the table and wrap
- *	  around.  The build asks for none (lion_build.c), but should the block
+ *	  around.  The builds ask for none (lion_build.c), but should the block
  *	  number ever go DOWN, every column is spilled at that point, so that no
  *	  run holds codes from both sides of the jump; the merge below orders
  *	  codes across runs whatever their order, so nothing else changes.
@@ -50,11 +50,21 @@
  *
  * The MERGE takes a column's runs and what is still in memory, k-way by key
  * (lion_merge_column()).  The inputs holding equal keys are merged by CODE,
- * which for the runs of one serial scan means taking them one after the other.
- * The key an entry is written with is the one its smallest code came with,
- * which matters for an opclass whose equality is coarser than the bytes
- * ('Alice' and 'alice' under citext, 1.0 and 1.00 as numeric) and is what the
- * sorted build wrote: its sort put the smallest code of a key first.
+ * which for the runs of one serial scan means taking them one after the other
+ * and for the participants of a parallel build means interleaving them one
+ * block chunk at a time.  The key an entry is written with is the one its
+ * smallest code came with, which matters for an opclass whose equality is
+ * coarser than the bytes ('Alice' and 'alice' under citext, 1.0 and 1.00 as
+ * numeric) and is what the sorted build wrote: its sort put the smallest code
+ * of a key first.
+ *
+ * A PARALLEL build (lion_build.c) gives each participant a spool of its own
+ * and a shared fileset; at the end of its part of the scan a participant
+ * merges its runs into ONE tape with a section per column
+ * (lion_spool_export()), and the leader merges the participants' tapes a
+ * column at a time exactly as a serial build merges its runs
+ * (lion_spool_reader_emit_column()).  The entries and the codes that come out
+ * are the same either way, so the index is too, page for page.
  *
  *-------------------------------------------------------------------------
  */
@@ -173,11 +183,23 @@ struct LionSpool
 	Size		membytes;		/* what the accumulators may use together */
 	Size		readbuf;		/* the read buffer of one run in a merge */
 	int			maxorder;		/* the most runs one merge reads at once */
+	SharedFileSet *fileset;		/* a parallel participant's, or NULL */
+	int			filenum;
 	LogicalTapeSet *tapes;		/* created at the first spill */
 	BlockNumber curblk;			/* the heap page the scan is on */
 	bool		haveblk;
 	double		ntids;			/* (key, code) pairs added */
 	int			nspills;		/* runs spilled, all columns together */
+};
+
+struct LionSpoolReader
+{
+	LionIndexState *ix;
+	MemoryContext cxt;
+	MemoryContext mergecxt;
+	LogicalTapeSet *tapes;
+	int			nparts;
+	struct LionRunCursor **curs;
 };
 
 /* A record's header on a tape, followed by its key and its code chunks. */
@@ -1095,10 +1117,12 @@ lion_spool_group_entry(const LionSpoolGroup *group, int i)
  * belongs to.
  *
  * The codes of one entry come from several inputs when the key was spilled
- * more than once.  They are merged by taking the input with the smallest code
- * and staying on it while its codes stay below the next input's, which makes
- * the runs of a serial scan - whose codes follow one another - a
- * concatenation, and costs one comparison per switch whatever the inputs.
+ * more than once or when several participants of a parallel build saw it.
+ * They are merged by taking the input with the smallest code and staying on
+ * it while its codes stay below the next input's, which makes the runs of a
+ * serial scan - whose codes follow one another - a concatenation, and a
+ * parallel scan's participants - whose codes interleave one block chunk at a
+ * time - one comparison per chunk rather than per code.
  */
 bool
 lion_spool_group_next(LionSpoolGroup *group, int *entry, uint64 *code)
@@ -1595,7 +1619,8 @@ lion_run_emit(void *arg, LionSpoolGroup *group)
  * --------------------------------------------------------------------- */
 
 LionSpool *
-lion_spool_begin(LionIndexState *ix, Size membytes)
+lion_spool_begin(LionIndexState *ix, Size membytes, SharedFileSet *fileset,
+				 int filenum)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "lion build spool",
@@ -1622,6 +1647,8 @@ lion_spool_begin(LionIndexState *ix, Size membytes)
 	sp->readbuf = Max((Size) BLCKSZ, Min((Size) BLCKSZ * 8, sp->membytes / 16));
 	sp->maxorder = (int) Max(6, Min(512, sp->membytes / 2 / sp->readbuf));
 
+	sp->fileset = fileset;
+	sp->filenum = filenum;
 	sp->cols = palloc0(sizeof(LionAccCol) * sp->ncols);
 	for (c = 0; c < sp->ncols; c++)
 	{
@@ -1646,6 +1673,10 @@ lion_spool_begin(LionIndexState *ix, Size membytes)
 		col->runs = palloc(sizeof(LogicalTape *) * col->maxruns);
 		lion_acc_reset(col);
 	}
+
+	/* a participant's file has to exist for the leader to import it */
+	if (fileset != NULL)
+		sp->tapes = LogicalTapeSetCreate(false, fileset, filenum);
 
 	MemoryContextSwitchTo(old);
 	return sp;
@@ -1986,10 +2017,115 @@ lion_spool_emit_column(LionSpool *sp, int col, LionSpoolEmit emit, void *arg)
 	lion_spool_merge_column(sp, col, emit, arg);
 }
 
+/*
+ * A parallel participant's output: every column's entries, in directory
+ * order, one section per column in column order, on one tape frozen for the
+ * leader to import.
+ */
+void
+lion_spool_export(LionSpool *sp, TapeShare *share)
+{
+	LogicalTape *out;
+	LionRunWriter *w;
+	int			c;
+
+	MemoryContext old;
+
+	Assert(sp->fileset != NULL && sp->tapes != NULL);
+	out = lion_spool_new_tape(sp);
+	w = MemoryContextAlloc(sp->cxt, sizeof(LionRunWriter));
+	w->tape = out;
+	for (c = 0; c < sp->ncols; c++)
+	{
+		lion_spool_merge_column(sp, c, lion_run_emit, w);
+		lion_run_end_column(out);
+	}
+	old = MemoryContextSwitchTo(sp->cxt);
+	LogicalTapeFreeze(out, share);
+	MemoryContextSwitchTo(old);
+}
+
 void
 lion_spool_end(LionSpool *sp)
 {
 	if (sp->tapes != NULL)
 		LogicalTapeSetClose(sp->tapes);
 	MemoryContextDelete(sp->cxt);
+}
+
+/* ---------------------------------------------------------------------
+ * The leader of a parallel build
+ * --------------------------------------------------------------------- */
+
+LionSpoolReader *
+lion_spool_reader_begin(LionIndexState *ix, SharedFileSet *fileset,
+						int nparticipants, const int *filenums,
+						TapeShare *shares, Size membytes)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "lion build spool reader",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	LionSpoolReader *rd = palloc0(sizeof(LionSpoolReader));
+	Size		readbuf;
+	int			i;
+
+	rd->ix = ix;
+	rd->cxt = cxt;
+	rd->mergecxt = AllocSetContextCreate(cxt, "lion build spool merge",
+										 ALLOCSET_DEFAULT_SIZES);
+	rd->nparts = nparticipants;
+	rd->tapes = LogicalTapeSetCreate(false, fileset, -1);
+	readbuf = Max((Size) BLCKSZ,
+				  Min((Size) BLCKSZ * 32, membytes / 2 / Max(nparticipants, 1)));
+	rd->curs = palloc(sizeof(LionRunCursor *) * nparticipants);
+	for (i = 0; i < nparticipants; i++)
+	{
+		LogicalTape *tape = LogicalTapeImport(rd->tapes, filenums[i],
+											  &shares[i]);
+
+		LogicalTapeRewindForRead(tape, readbuf);
+		/* the read buffer, now, in the reader's context (see above) */
+		LogicalTapeRead(tape, NULL, 0);
+		rd->curs[i] = palloc(sizeof(LionRunCursor));
+		lion_cursor_init_tape(rd->curs[i], &ix->cols[0], i, tape);
+	}
+	LogicalTapeSetForgetFreeSpace(rd->tapes);
+
+	MemoryContextSwitchTo(old);
+	return rd;
+}
+
+/*
+ * One column's entries from every participant.  Each participant's tape holds
+ * the columns in order, so the cursors carry on from where the column before
+ * left them.
+ */
+void
+lion_spool_reader_emit_column(LionSpoolReader *rd, int col,
+							  LionSpoolEmit emit, void *arg)
+{
+	MemoryContext old = MemoryContextSwitchTo(rd->mergecxt);
+	LionMerge	m;
+	int			i;
+
+	for (i = 0; i < rd->nparts; i++)
+	{
+		rd->curs[i]->state = &rd->ix->cols[col];
+		lion_cursor_next_record(rd->curs[i]);
+	}
+	lion_merge_init(&m, &rd->ix->cols[col],
+					AllocSetContextCreate(rd->mergecxt, "lion build spool group",
+										  ALLOCSET_DEFAULT_SIZES));
+	lion_merge_column(&m, rd->curs, rd->nparts, emit, arg);
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(rd->mergecxt);
+}
+
+void
+lion_spool_reader_end(LionSpoolReader *rd)
+{
+	LogicalTapeSetClose(rd->tapes);
+	MemoryContextDelete(rd->cxt);
 }

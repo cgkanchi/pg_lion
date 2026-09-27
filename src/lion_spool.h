@@ -12,11 +12,16 @@
 #define LION_SPOOL_H
 
 #include "storage/itemptr.h"
+#include "storage/sharedfileset.h"
+#include "utils/logtape.h"
 
 #include "lion.h"
 
 /* One process's accumulator for every key column of one index. */
 typedef struct LionSpool LionSpool;
+
+/* The leader's view of the participants' output in a parallel build. */
+typedef struct LionSpoolReader LionSpoolReader;
 
 /*
  * What the merge hands the writer: the entries of one directory position, and
@@ -45,17 +50,40 @@ extern const LionSpoolEntry *lion_spool_group_entry(const LionSpoolGroup *group,
 extern bool lion_spool_group_next(LionSpoolGroup *group, int *entry,
 								  uint64 *code);
 
-/* membytes is what the accumulators of all the columns may use together. */
-extern LionSpool *lion_spool_begin(LionIndexState *ix, Size membytes);
+/*
+ * membytes is what the accumulators of all the columns may use together.  A
+ * parallel participant passes the build's shared fileset and a file number no
+ * other participant uses; a serial build passes NULL and spills to a private
+ * temporary file.
+ */
+extern LionSpool *lion_spool_begin(LionIndexState *ix, Size membytes,
+								   SharedFileSet *fileset, int filenum);
 extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 						   bool *isnull);
 extern double lion_spool_ntids(const LionSpool *spool);
 extern int	lion_spool_nruns(const LionSpool *spool);
 
-/* One column's entries, in directory order, to emit. */
+/* Serial build: one column's entries, in directory order, to emit. */
 extern void lion_spool_emit_column(LionSpool *spool, int col,
 								   LionSpoolEmit emit, void *arg);
 
+/* Parallel participant: every column's entries, to one tape for the leader. */
+extern void lion_spool_export(LionSpool *spool, TapeShare *share);
+
 extern void lion_spool_end(LionSpool *spool);
+
+/*
+ * Parallel leader: the participants' tapes, which filenums[] and shares[]
+ * name, merged one column at a time.
+ */
+extern LionSpoolReader *lion_spool_reader_begin(LionIndexState *ix,
+												SharedFileSet *fileset,
+												int nparticipants,
+												const int *filenums,
+												TapeShare *shares,
+												Size membytes);
+extern void lion_spool_reader_emit_column(LionSpoolReader *reader, int col,
+										  LionSpoolEmit emit, void *arg);
+extern void lion_spool_reader_end(LionSpoolReader *reader);
 
 #endif							/* LION_SPOOL_H */
