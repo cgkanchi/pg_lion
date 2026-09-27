@@ -15,7 +15,8 @@ Goals
 - Single-column equality index whose posting lists are roaring-style containers (array / bitset / run).
 - Bitmap scans (`amgetbitmap`) so the planner can use it in Bitmap Index Scan / BitmapAnd / BitmapOr.
 - Correct under concurrent INSERT and VACUUM. Crash-safe via generic WAL.
-- Bulk build via tuplesort. Inserts, VACUUM (ambulkdelete) that removes TIDs and shrinks containers.
+- Bulk build via tuplesort (replaced by appends per key, §24 "Build"). Inserts, VACUUM (ambulkdelete)
+  that removes TIDs and shrinks containers.
 - SQL-callable `lion_index_stats()` and `lion_index_verify()` for tests and debugging.
 - Layered so that phase 2 can add: a visibility-map-interlocked `lion_index_count()` and a
   CustomScan that answers `count(*) ... GROUP BY key` from containers without visiting the heap.
@@ -599,17 +600,17 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
    counting pages; otherwise pass it through.
 
-BUILD (`lion_build.c`)
-1. table_index_build_scan's callback puts one tuple per (key column, extracted key, heap row) into a
-   tuplesort per key column (§24), sorted into the directory order - `(key ASC NULLS FIRST, [kind],
-   code)` for an ordered opclass, `(hash, kind, code)` for an unordered one - so the codes of each key
-   arrive together and ascending (§21 "Bulk build", which also says why `kind` never leads).
-   maintenance_work_mem is split between the sorts. A NULL key goes in with a NULL key column and
-   the reserved kind (§14).
-2. ONE pass over the sorted data groups the codes of each key into containers. There is no sizing
-   pass any more: the old pass 1 counted distinct keys only to size the bucket directory, and a
-   B-tree directory is not sized, it is built to fit, so the tuplesort needs no
-   TUPLESORT_RANDOMACCESS either.
+BUILD (`lion_build.c`, `lion_spool.c`)
+1. table_index_build_scan's callback APPENDS each row's code to its key's entry in a per-key-column
+   accumulator (§24 "Build"): a hash table of the column's keys, each with its codes as varbyte
+   deltas, since the scan delivers TIDs in ascending order. A NULL goes to the column's reserved
+   NULL entry (§14), a row a multi-key opclass extracts nothing from to its EMPTY entry (§17). The
+   columns share maintenance_work_mem; when it is full, the largest are spilled to a logical tape as
+   sorted runs.
+2. The spool gives the entries back in directory order - the distinct keys sorted, the runs merged
+   by key and each key's codes by code - and ONE pass groups the codes of each
+   key into containers. There is no sizing pass any more: the old pass 1 counted distinct keys only
+   to size the bucket directory, and a B-tree directory is not sized, it is built to fit.
 3. Keep one open builder per distinct key in progress - one, unless the hash function of an
    unordered opclass collides - using lion_container_append_sorted with a per-key "last ckey" and
    finishing each container with lion_container_optimize when the ckey changes; a ckey with fewer
@@ -2028,7 +2029,8 @@ lion_entry_rebuild, build) preserves all of LION_ENTRY_RESERVED, and verify() re
 without one as corruption (keylen 0 is not a legal key length).
 
 Build: the tuplesort's key column may be NULL (hash 0 for NULLs; both passes group by the isnull
-flag first, then by key). Insert: NULL → the null entry (created on first use). Scan:
+flag first, then by key). *(Since §24 "Build" there is no sort: a NULL row's code is appended to the
+column's reserved NULL entry directly.)* Insert: NULL → the null entry (created on first use). Scan:
 `amsearchnulls = true`; SK_SEARCHNULL returns the null entry's set; SK_SEARCHNOTNULL returns every
 other entry (a full walk of the index, correct but expensive; the cost model prices it as the whole
 index). Stats gain `null_tids`. verify checks there is at most one null entry, that it is in bucket
@@ -2770,7 +2772,9 @@ wave - so no existing index answers anything wrongly, which is the test §14 set
 Build (`lion_build.c`): the tuplesort tuple grows a fourth column, `kind int2`
 (REAL / NULL / EMPTY), still sorted by (hash, code).  A multi-key row is pushed once per distinct
 extracted key, all with the same code; both passes group by (kind, key) instead of (isnull, key).
-Nothing else changes, because the codes of each key still arrive ascending.
+Nothing else changes, because the codes of each key still arrive ascending.  *(Since §24 "Build" the
+row's code is appended to each extracted key's entry, and to the reserved EMPTY entry when there is
+none; the sort, and `kind` with it, is gone.)*
 
 Insert (`lion_insert.c`): `lioninsert()` extracts and then performs one ordinary single-key insert per
 key, each taking and releasing its own bucket lock.  They are not atomic with respect to a reader,
@@ -3608,11 +3612,12 @@ entry per equality class.
    `bttextcmp` separates them, and a lookup for the spelling the entry was NOT created with
    descended past it and found nothing. An unordered directory ties wherever the hash ties, which is
    exactly where the run scan applies the opclass equality, so the same class works.)*
-3. Either way the ordering needs a `<` OPERATOR THAT SORTS WITH THE SAME FUNCTION, because ambuild's
-   tuplesort is driven by an operator. The key type's default `<` qualifies only when the comparison
-   is the key type's default one; a comparison of the opclass's own is looked for in the btree
-   opfamily that uses it as its `BTORDER_PROC` (a `pg_amproc` scan, once per relcache build, and
-   only for an opclass that names a comparison no built-in one does). The candidate is verified with
+3. Either way the ordering needs a `<` OPERATOR THAT SORTS WITH THE SAME FUNCTION, because ambuild
+   sorts through the SortSupport an operator names (its tuplesort did, before §24 "Build"). The key
+   type's default `<` qualifies only when the comparison is the key type's default one; a
+   comparison of the opclass's own is looked for in the btree opfamily that uses it as its
+   `BTORDER_PROC` (a `pg_amproc` scan, once per relcache build, and only for an opclass that names
+   a comparison no built-in one does). The candidate is verified with
    `get_ordering_op_properties()`, which is the same catalogue path
    `PrepareSortSupportFromOrderingOp()` takes, so "the sort will use this function" is not a guess.
    An ordering the build cannot reproduce is NO ordering: the index is unordered instead, which is
@@ -3702,7 +3707,7 @@ rule too. The guard catches the common, direct changes; it does not certify the 
 `lion_fill_column_state()` still resolves the comparison from the catalog, but the
 RECORDED bit decides whether the column is ordered: a directory built in hash order stays in hash
 order whatever btree opclass appears later, and one built in value order is read in value order
-without the sort operator, which only the build's tuplesort ever needed. If an ordered column's
+without the sort operator, which only the build's sort of the keys ever needs. If an ordered column's
 comparison no longer resolves at all, or resolves to a function with a different source than the
 recorded one, opening the index is an ERROR with a REINDEX hint rather than a quietly different
 order (within the limits of the guard, above). Readers and
@@ -3915,6 +3920,12 @@ splits it, which moves the upper half away. Both readers therefore changed:
   has moved; the next VACUUM gets it.
 
 ### Bulk build
+
+*(Since 2026-09-27 the build sorts no TIDs at all - §24 "Build" appends each key's codes as the scan
+delivers them and sorts only the distinct keys - so the tuplesort this subsection describes is gone.
+It is kept for the record, and what it established still holds: the sort that is left leads with the
+key, the reserved entries come first, the hash is compared as a uint32, and a collision's keys are
+ordered at flush time.)*
 
 The tuplesort's sort keys are `(key ASC NULLS FIRST, [kind], code)` for an ordered opclass and
 `(hash, kind, code)` for an unordered one, so the entries come out in directory order. Neither
@@ -4891,13 +4902,14 @@ which is what makes the comparator a pure function of (item, search key).
 to the first entry of attno+1 - a descent to (attno, MINF), a bounded leaf walk that stops at the
 first entry of the next column, still sorted for an ordered opclass. **IN lists**: per column.
 
-**Build**: one heap scan feeding ONE TUPLESORT PER KEY COLUMN, drained into the shared directory in
-attno order. *(Deviation from the first draft, which said "one tuplesort of (attno, kind, key, hash,
+**Build**: one heap scan feeding one accumulator PER KEY COLUMN, drained into the shared directory in
+attno order ("Build: appends, not a sort" below; until 2026-09-27 it was one tuplesort per key
+column). *(Deviation from the first draft, which said "one tuplesort of (attno, kind, key, hash,
 code)". One tuplesort needs one tuple descriptor and one sort operator per sort key, and the columns
 of a multicolumn index have DIFFERENT key types, so there is no single `key` column to describe. n
 sorts from one scan is what this section's own rationale asks for, it compares nothing across
-columns, and it keeps each column's sort keys exactly what §21 chose for that column;
-maintenance_work_mem is split between them.)* The directory order leads with the column, so the
+columns, and it keeps each column's sort keys exactly what §21 chose for that column. The
+accumulators kept all three properties.)* The directory order leads with the column, so the
 columns' entry runs laid end to end are already sorted and the bottom-up level builder of §21 never
 learns that more than one column exists.
 
@@ -5010,6 +5022,113 @@ for a scalar column and an underestimate for a multi-key one (one entry per lexe
 and the directory HEIGHT is still the whole relation's. Reading a column's entry count off the meta
 page - one counter per column, maintained by build and by insert - would remove both
 approximations, and `lion_index_stats()` already computes it the expensive way.
+
+### Build: appends, not a sort (2026-09-27, `lion_spool.c`)
+
+Why. A real workload's 18-column index on 80.6M rows took 71 minutes to build, on one core with the
+disk idle, and ~70% of it was tuplesort comparisons: `comparetup_heap_tiebreak`, attribute fetches,
+and `strcoll()` under an en_US libc collation. The sort already led with the key (§21 "Bulk build"),
+but Lion is for low-cardinality keys, so nearly every comparison TIED on the key and fell through to
+fetching and comparing the codes; a libc collation other than C gets no abbreviated keys, so the key
+comparison itself was a `strcoll()` every time. *(The report proposed to stop leading with `kind`
+first; that was already the case, and what was left of the sort's cost was the codes, which the
+change below takes out of the sort altogether.)*
+
+**Nothing sorts the TIDs.** A serial heap scan delivers them in ascending order, so each row's code
+is APPENDED to its key's entry in a per-column accumulator, and only the DISTINCT keys are sorted: K
+log K comparisons for K keys, where the tuplesort made N log N over all N (key, row) pairs. That is
+GIN's shape (`ginBuildCallback()`, BuildAccumulator); a posting set is then written exactly as
+before, by the same builders, fed the same codes in the same order. (One change on that side: the
+context a key's builders are made in now has a first block that holds all four of their buffers, so
+resetting it after every key no longer hands blocks back to malloc - a fifth of the first build
+measured below, whose timestamps are all distinct keys.)
+
+- **The accumulator** of a column is a simplehash table found by the opclass hash (through
+  `murmurhash32()`, since nothing says an opclass hash spreads its low bits) and the opclass
+  equality, the same pair the directory uses. An entry holds the key's stored bytes and its codes
+  as varbyte DELTAS, the first counted from zero - one or two bytes a row for a dense key - and a
+  key with one code keeps it in the entry and allocates nothing. The reserved NULL (§14) and EMPTY
+  (§17) entries are two more entries outside the table, which is all "build them outside the sort"
+  takes once there is no sort.
+- **Two exceptions to "ascending", both handled.** A heap-only tuple is reported under its HOT chain's
+  ROOT offset while the scan walks the page in physical order, so the codes of one heap page can
+  arrive out of order - within that page only. Such a code goes in as a zero delta (no real delta is
+  zero) followed by the code, the entry is marked unsorted, and it is read back one heap page at a
+  time, each page's codes sorted (at most `1 << LION_OFFSET_BITS`). A synchronized scan could start
+  mid-table and wrap around: the scan asks for none (`allow_sync = false`, as GIN's serial build
+  does); should the block number go down anyway, every column is spilled at that point, so no run
+  straddles the jump, and the merge below orders codes across runs whatever their order.
+- **The key an entry is written with is the one its smallest code came with.** It matters for an
+  opclass whose equality is coarser than its bytes (`'Alice'`/`'alice'` under citext, `1.0`/`1.00`
+  as numeric, the SQL-function classes of `test/sql/directory.sql` §9), and it is what the sort
+  wrote, since it put a key's smallest code first. A HOT root offset can bring a smaller code late;
+  the entry then takes that row's key.
+
+**Memory is one budget for all the key columns**, not an even share each: a boolean column costs a
+few bytes a row and a column of unique keys the most, and each takes what it needs. The budget is
+maintenance_work_mem, and it counts what the columns' entries take, not the empty table and first
+block every column has whatever the budget - counting those made a 64kB budget on a wide index
+spill every column at every heap page. It is
+checked when the scan moves to the next heap page, and when it is exceeded the LARGEST columns are
+spilled until half of it is free: sorted into directory order and written to a logical tape as one
+RUN, and their memory reset. Runs therefore begin and end at page boundaries. Block sizes (the
+columns' contexts, the arena that entries and keys are carved from) scale with the budget, so a small
+one is not gone in one block.
+
+A run is a sequence of records - kind, flags, hash, key length, the key's stored bytes, then the
+codes as varbyte deltas in chunks of at most 8kB - and an end marker. A record whose successor in the
+same run has the same PREFIX (the kind, then the comparison or, for an unordered opclass, the hash) is
+flagged TIED, which happens when an unordered opclass's hash collides.
+
+**The merge** (`lion_merge_column()`) takes a column's runs and what is still in memory, k-way through
+a binary heap ordered by that prefix - the key type's SortSupport comparison for an ordered column,
+the hash for an unordered one - and pops every input that ties with the smallest as one GROUP:
+
+- one key, held in one record by each input (the normal case): its codes are streamed from the inputs
+  in ascending order. The rule is to take the input with the smallest code and stay on it while its
+  codes stay below the runner-up's, which makes the runs of a serial scan, whose codes follow one
+  another, a concatenation;
+- several keys (a collision, within a run or across runs): every record of the group is read into
+  memory, the records are gathered into distinct keys by the opclass equality, and the keys are
+  handed over together in the directory's full order, their codes interleaved in code order - which
+  is how the sorted build fed the builders of one hash, so their pages are allocated in the same
+  order too.
+
+More runs than a merge pass reads at once (`maxorder`, the buffers of one pass taking at most half the
+budget) are merged in passes first. The distinct keys of a spill are sorted through the key type's
+SortSupport, abbreviated where the type offers it (text under C or ICU, numeric, ...) and given up as
+tuplesort gives it up, when the converter's own estimate says it does not pay. That sort is where
+leading with the key still pays: a C or ICU collation gets abbreviated keys there.
+
+**The index is the one the sorted build wrote, page for page.** The same keys come out in the same
+order with the same codes and the same stored bytes, and the builders and the directory are
+unchanged, so every block is allocated in the same order. Checked against the tuplesort build by
+comparing relation files block by block (LSN and checksum masked) over a corpus of every opclass
+shape - scalar and multi-key, NULLs and empty arrays, an unordered class whose hash collides into
+posting trees, a coarse-equality class, HOT chains, partial and expression indexes, dead rows, empty
+and all-NULL tables - built in memory, at 64kB (up to a few thousand runs, merged in passes), and
+by REINDEX CONCURRENTLY. `test/sql/build.sql` keeps the in-memory and spilled builds of such a corpus
+byte-identical to each other (unlogged tables, whose pages carry no LSN) and checks each column's
+keys, TIDs, NULL and key-less rows against the heap.
+
+### Measured (2026-09-27, 2M rows each, assert-enabled PostgreSQL 18.6: ratios, not absolute numbers)
+
+CPU seconds (utime + stime from /proc) of the backend running `CREATE INDEX`; maintenance_work_mem
+512MB.
+
+| index | before | after |
+| --- | --- | --- |
+| 5 columns: enum, bool, int (2,000 keys), unique timestamptz, text (50 keys, C) | 18.80 s | 3.34 s |
+| 11 columns, en_US libc text of 3 to 50,000 keys and one unique, bool, int, two text[] | 87.28 s | 22.67 s |
+
+At maintenance_work_mem
+64MB the two indexes spill 3 and 43 runs and take 3.15 s and 23.74 s serially: a spill costs about
+what writing and reading the codes once costs, which is little next to a sort.
+
+The unique text column is most of what is left of the second index: alone it takes 16.9 s under
+en_US against 6.5 s under C and 2.7 s for a unique int column, the difference being the `strcoll()`
+calls of sorting two million distinct keys, which a libc collation cannot abbreviate. Both indexes
+came out byte-identical to the tuplesort build's.
 
 ## 25. Custom WAL resource manager (replacing generic WAL)
 
