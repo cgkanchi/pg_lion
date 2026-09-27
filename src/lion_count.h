@@ -781,6 +781,7 @@ extern void lion_check_aggregate_execute(Oid aggfnoid);
 extern PGDLLIMPORT bool lion_enable_count_pushdown;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
+extern void lion_count_scan_register(void);
 extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *input_rel,
 								   RelOptInfo *output_rel,
