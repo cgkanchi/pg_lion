@@ -614,7 +614,10 @@ SELECT count(*) AS keys_not_found FROM generate_series(0, 499) g
               0
 (1 row)
 
--- the groups come out in the OPCLASS's order, which is descending
+-- the groups come out in the OPCLASS's order, which is descending (the node
+-- is forced: 500 groups of 10 rows each are a sequential scan's to win, and
+-- this opclass's SQL comparison makes every entry of the walk dearer still)
+SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_rev GROUP BY k;
            QUERY PLAN           
 --------------------------------
@@ -649,6 +652,7 @@ EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_rev GROUP BY k ORDER BY k;
          Group Key: k
 (5 rows)
 
+RESET enable_seqscan;
 DROP TABLE lion_rev;
 -- A comparison that belongs to no btree family at all cannot drive a
 -- tuplesort, and an ordering the build cannot reproduce is no ordering: the

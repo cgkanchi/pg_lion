@@ -263,8 +263,9 @@ SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND 
          Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
          Join Type: Semi
          Join Keys: distinct, sorted
+         Fact Filters: collected once
          ->  (the dimension's plan)
-(6 rows)
+(7 rows)
 
 SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_nd d WHERE d.attr = 2)');
                lion_nj_explain               
@@ -722,8 +723,9 @@ SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND 
                Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
                Join Type: Semi
                Join Keys: distinct, sorted
+               Fact Filters: collected once
                ->  (the dimension's plan)
-(8 rows)
+(9 rows)
 
 SELECT * FROM lion_nj_explain('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_nd d WHERE d.attr < 4)');
                         lion_nj_explain                        
@@ -841,8 +843,9 @@ SELECT * FROM lion_nj_explain('SELECT g, s.c FROM generate_series(1, 4) g LEFT J
                      Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
                      Join Type: Semi
                      Join Keys: distinct, sorted
+                     Fact Filters: collected once
                      ->  (the dimension's plan)
-(11 rows)
+(12 rows)
 
 SELECT lion_nj_par('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(*) AS c FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)) s ON s.c > g');
    lion_nj_par    
@@ -872,14 +875,21 @@ SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND f.fk IN (SE
  serial, 1 rows
 (1 row)
 
--- none, and none on a dimension set to 0
+-- none, and none on a dimension set to 0 (the joins off: serially the hash
+-- join is the faster plan here, 1.2 ms of CPU against the node's 2.3)
 SET max_parallel_workers_per_gather = 0;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
 SELECT lion_nj_pick('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)');
  lion_nj_pick 
 --------------
  pushed down
 (1 row)
 
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
 SET max_parallel_workers_per_gather = 2;
 ALTER TABLE lion_nd SET (parallel_workers = 0);
 SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)');
