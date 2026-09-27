@@ -267,8 +267,9 @@ SELECT lion_dj('SELECT count(DISTINCT d.k), count(DISTINCT d.attr) FROM lion_ddn
 SELECT lion_dj('SELECT d.attr, count(DISTINCT d.k) FROM lion_ddn d WHERE d.k IN (SELECT f.fk FROM lion_df f WHERE f.t = ''t11'') GROUP BY d.attr');
 
 -- ---- 3. declined ---------------------------------------------------------------
--- the key is not unique: the inner join counts a fact row once per duplicate,
--- and the forward EXISTS stays a semi join whose inner side is the dimension
+-- the key is not unique: the inner join counts a fact row once per duplicate
+-- and is declined, while the forward EXISTS stays a semi join whose inner side
+-- is the dimension, counted over its distinct keys (fkjoin_nonunique.sql)
 SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_ddn d ON d.k = f.fk WHERE f.x = 3');
 SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ddn d WHERE d.k = f.fk AND d.attr = 1)');
 DROP INDEX lion_ddn_kl;

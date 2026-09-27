@@ -255,8 +255,9 @@ SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.t = ''t7'' AND EXISTS (SE
 -- grouped: only the join form can name a dimension column
 SELECT lion_sj('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d ON d.pk = f.fk WHERE f.x IN (1, 2) AND d.grp <> ''g4'' GROUP BY d.region');
 -- the key is not unique: EXISTS stays a semi join whose inner side is the
--- dimension, and with no lion index on it nothing is pushed down - the
--- inner-join equivalence would count a fact row once per duplicate
+-- dimension, which the node counts over the dimension's DISTINCT keys
+-- (fkjoin_nonunique.sql) - the inner-join equivalence would count a fact row
+-- once per duplicate
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND f.fk IN (SELECT d.k FROM lion_sdn d WHERE d.attr = 1)');
 
@@ -295,8 +296,9 @@ ANALYZE lion_sdn;
 SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 SELECT lion_sj('SELECT d.attr, count(*) FROM lion_sdn d WHERE d.k IN (SELECT f.fk FROM lion_sf f WHERE f.t = ''t11'') GROUP BY d.attr');
 -- ... and the forward semi join over the non-unique key, now that it has lion
--- indexes: the dimension is the inner side, so it is the one TESTED, once per
--- fact row - never the inner-join count, which would count each duplicate
+-- indexes: counted over the dimension's distinct keys, or with the roles
+-- exchanged, the dimension TESTED once per fact row - never the inner-join
+-- count, which would count each duplicate.  The model takes the distinct keys.
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
 SELECT lion_sj_pick('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdn d WHERE d.k = f.fk AND d.attr = 1)');
 DROP INDEX lion_sdn_kl, lion_sdn_al;

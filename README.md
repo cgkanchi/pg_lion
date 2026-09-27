@@ -160,16 +160,21 @@ WHERE cu.country = 'NZ'
   AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = cu.id AND o.status = 'open');
 ```
 
-The first form needs `customers.id` unique (a primary key); both may group by the dimension's
-columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of `count(*)`
-is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate counts
-their distinct values. The node pays a lookup per dimension row, so the cost model leaves a large
-dimension set to the hash join. With parallel query enabled (`max_parallel_workers_per_gather`) it
-can run in parallel, each worker taking its share of the dimension rows. The fact filters are
-collected once per process into memory bounded like a hash join's (`work_mem` ×
-`hash_mem_multiplier`); past that the node reads them per dimension row instead. Their values may
-be parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
-(`o.status = ANY ($1)`) included: every process evaluates them once per scan.
+Written as a JOIN, the first form needs `customers.id` unique (a primary key). As `EXISTS` or `IN`
+it does not: over a key that repeats - `o.customer_id IN (SELECT customer_id FROM visits WHERE
+...)` - the node sorts the subquery's keys and counts each distinct key's orders once (DESIGN.md
+§27; five million fact rows against 9,776 rows over 8,848 distinct keys took 117 ms, against 585
+for the hash semi join, on an assert build). The JOIN and the second form may group by the
+dimension's columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of
+`count(*)` is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate
+counts their distinct values. The node pays a lookup per dimension row (per distinct key), so the
+cost model leaves a large dimension set to the hash join. With parallel query enabled
+(`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
+dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
+once per process into memory bounded like a hash join's (`work_mem` × `hash_mem_multiplier`); past
+that the node reads them per dimension row instead. Their values may be parameters and stable
+expressions as for a single table, an `IN` list whose array is a parameter (`o.status = ANY ($1)`)
+included: every process evaluates them once per scan.
 
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
