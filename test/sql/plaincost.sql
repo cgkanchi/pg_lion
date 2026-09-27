@@ -107,12 +107,14 @@ INSERT INTO lpc_q VALUES
 	(5, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1$$),
 	(6, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1 AND supp = 1$$);
 SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
--- 43% of the rows is left out at 1.1: with a random read priced near a
--- sequential one, cost_index() cannot charge a result on every page more than
--- its I/O at random_page_cost, and the two scans come out alike
--- (DESIGN.md §29.11)
+-- 43% of the rows at 1.1: with a random read priced near a sequential one,
+-- cost_index() charges a result on every page no more than its I/O at
+-- random_page_cost, less than the plain scan's fetches of 19 rows to a page
+-- cost beyond the bitmap scan's; lion charges the rest to the path once it is
+-- built, and the bitmap scan it had displaced is chosen (DESIGN.md §29.11:
+-- 22 ms against the plain scan's 26 on this table).
 SET random_page_cost = 1.1;
-SELECT n, lpc_plan(q) FROM lpc_q WHERE n <> 3 ORDER BY n;
+SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
 RESET random_page_cost;
 
 -- ---------- 2. a column stored in value order keeps its correlation ----------

@@ -1,9 +1,12 @@
 /*-------------------------------------------------------------------------
  *
  * lion_selfuncs.c
- *		The planner's endpoint probe: a range bound beyond a column's
- *		histogram, estimated from the column's first or last live key in the
- *		lion directory (DESIGN.md §28, "The endpoint probe").
+ *		Two corrections to what the planner's own machinery tells lion's cost
+ *		model: the endpoint probe - a range bound beyond a column's histogram,
+ *		estimated from the column's first or last live key in the lion
+ *		directory (DESIGN.md §28, "The endpoint probe") - and the part of a
+ *		plain scan's price that cost_index() cannot charge (DESIGN.md §29.11,
+ *		lion_plain_note_remainder()).
  *
  * ANALYZE's histogram ends at the largest value its sample saw.  A column
  * that grows at one end - a timestamp, a serial id - puts every row inserted
@@ -57,6 +60,8 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
@@ -131,6 +136,7 @@ typedef struct LionProbeCache
 	PlannerGlobal *glob;
 	MemoryContext cxt;
 	List	   *ends;			/* LionEndpoint */
+	List	   *remainders;		/* LionPlainRemainder */
 } LionProbeCache;
 
 static LionProbeCache lion_probe_cache;
@@ -158,6 +164,7 @@ lion_probe_cache_for(PlannerInfo *root)
 		lion_probe_cache.glob = root->glob;
 		lion_probe_cache.cxt = cxt;
 		lion_probe_cache.ends = NIL;
+		lion_probe_cache.remainders = NIL;
 	}
 	return &lion_probe_cache;
 }
@@ -745,6 +752,9 @@ typedef struct LionProbeScope
 
 static LionProbeScope *lion_probe_scope = NULL;
 static get_relation_stats_hook_type lion_prev_relation_stats_hook = NULL;
+static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
+static void lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+										Index rti, RangeTblEntry *rte);
 
 static bool
 lion_relation_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
@@ -775,12 +785,19 @@ lion_relation_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 	return false;
 }
 
-/* _PG_init(): the hook through which the probed ends are seen. */
+/*
+ * _PG_init(): the hook through which the probed ends are seen, and the one
+ * that charges a plain scan what cost_index() could not.  Called after
+ * lion_ordered_init(), so that the plain scans are repriced before LionOrdered
+ * compares its path with them.
+ */
 void
 lion_selfuncs_init(void)
 {
 	lion_prev_relation_stats_hook = get_relation_stats_hook;
 	get_relation_stats_hook = lion_relation_stats;
+	lion_prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = lion_plain_set_rel_pathlist;
 }
 
 /*
@@ -1071,4 +1088,108 @@ lion_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		lion_probe_end();
 	}
 	PG_END_TRY();
+}
+
+/* ---------------------------------------------------------------------
+ * What cost_index() cannot charge a plain scan (DESIGN.md §29.11)
+ * --------------------------------------------------------------------- */
+
+typedef struct LionPlainRemainder
+{
+	IndexPath  *path;
+	Cost		remainder;
+} LionPlainRemainder;
+
+/*
+ * lion_plain_heap_correlation() prices a plain scan in heap order as the
+ * bitmap heap scan of the same rows and its per-row fetches, and hands
+ * cost_index() the correlation that makes its heap side come out at that.
+ * cost_index() interpolates between two ends and charges no more than the
+ * uncorrelated one, Mackert and Lohman's pages at random_page_cost: at a
+ * random_page_cost near seq_page_cost, a result of many rows on nearly every
+ * page costs more than that end, by the fetches that are not the bitmap
+ * scan's, and the correlation cannot say so.  The plain scan then came out
+ * within 1% of the bitmap scan of the same rows, which add_path() takes for a
+ * tie that the plain scan's lower startup cost wins, and the bitmap path was
+ * thrown away - 13% to 25% faster warm and 2 to 5 times cold at 43% of 8M
+ * rows, 18 to a page (2026-09-27).  What is left over is noted here, for an
+ * unparameterized path, and charged once the relation's paths are built.
+ */
+void
+lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
+{
+	LionProbeCache *cache;
+	LionPlainRemainder *r;
+	MemoryContext oldcxt;
+
+	if (root == NULL || root->glob == NULL || remainder <= 0)
+		return;
+	cache = lion_probe_cache_for(root);
+	oldcxt = MemoryContextSwitchTo(cache->cxt);
+	r = (LionPlainRemainder *) palloc(sizeof(LionPlainRemainder));
+	r->path = path;
+	r->remainder = remainder;
+	cache->remainders = lappend(cache->remainders, r);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * set_rel_pathlist_hook: each plain lion path of rel with a remainder noted
+ * pays it, and is offered again with the bitmap heap scan of the same index
+ * path beside it, which add_path() may have discarded for the plain one - the
+ * paths added here are compared as any others (set_rel_pathlist() allows a
+ * hook to modify the core paths).  The plain path keeps its startup cost, which
+ * is what a LIMIT asks of it.
+ */
+static void
+lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
+							RangeTblEntry *rte)
+{
+	if (root->glob != NULL && lion_probe_cache.glob == root->glob &&
+		lion_probe_cache.remainders != NIL)
+	{
+		List	   *repriced = NIL;
+		ListCell   *lc;
+
+		foreach(lc, rel->pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+			ListCell   *lc2;
+			bool		found = false;
+
+			if (!IsA(p, IndexPath) || p->pathtype != T_IndexScan ||
+				p->param_info != NULL)
+				continue;
+			foreach(lc2, lion_probe_cache.remainders)
+			{
+				LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
+
+				if (r->path == (IndexPath *) p && r->remainder > 0)
+				{
+					p->total_cost += r->remainder;
+					r->remainder = 0;
+					found = true;
+					break;
+				}
+			}
+			if (found)
+			{
+				repriced = lappend(repriced, p);
+				rel->pathlist = foreach_delete_current(rel->pathlist, lc);
+			}
+		}
+
+		foreach(lc, repriced)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			add_path(rel, p);
+			add_path(rel, (Path *) create_bitmap_heap_path(root, rel, p, NULL,
+														   1.0, 0));
+		}
+		list_free(repriced);
+	}
+
+	if (lion_prev_set_rel_pathlist_hook != NULL)
+		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
 }

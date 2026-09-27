@@ -112,20 +112,23 @@ SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
  6 | Index Scan using lpc_lion on lpc
 (6 rows)
 
--- 43% of the rows is left out at 1.1: with a random read priced near a
--- sequential one, cost_index() cannot charge a result on every page more than
--- its I/O at random_page_cost, and the two scans come out alike
--- (DESIGN.md §29.11)
+-- 43% of the rows at 1.1: with a random read priced near a sequential one,
+-- cost_index() charges a result on every page no more than its I/O at
+-- random_page_cost, less than the plain scan's fetches of 19 rows to a page
+-- cost beyond the bitmap scan's; lion charges the rest to the path once it is
+-- built, and the bitmap scan it had displaced is chosen (DESIGN.md §29.11:
+-- 22 ms against the plain scan's 26 on this table).
 SET random_page_cost = 1.1;
-SELECT n, lpc_plan(q) FROM lpc_q WHERE n <> 3 ORDER BY n;
+SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
  n |                        lpc_plan                         
 ---+---------------------------------------------------------
  1 | Bitmap Heap Scan on lpc / Bitmap Index Scan on lpc_lion
  2 | Bitmap Heap Scan on lpc / Bitmap Index Scan on lpc_lion
+ 3 | Bitmap Heap Scan on lpc / Bitmap Index Scan on lpc_lion
  4 | Index Scan using lpc_lion on lpc
  5 | Index Scan using lpc_lion on lpc
  6 | Index Scan using lpc_lion on lpc
-(5 rows)
+(6 rows)
 
 RESET random_page_cost;
 -- ---------- 2. a column stored in value order keeps its correlation ----------

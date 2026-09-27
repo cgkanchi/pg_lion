@@ -8107,17 +8107,41 @@ all, as scattered over the heap; the plain scan is chosen at about the bitmap sc
 2.3 times as long (30,000 one-row entries: 17 ms against 7.2), the difference being its stream per
 entry. The bitmap scan's price is core's.
 
-What this cannot do: cost_index() charges no more than its uncorrelated end, Mackert and Lohman's
-pages at random_page_cost. At a random_page_cost near seq_page_cost (1.1, as on the benchmark's
-server) the heap side of a result on nearly every page is clamped there, within 10% of the bitmap
-heap scan's, and a plain scan of an exact result of many rows to a page can still tie with the
-bitmap scan - `test/sql/plaincost.sql` leaves that case out of its pins at 1.1. There is no
-parallel plain lion scan (`amcanparallel` is false, §29.1): the planner compares the serial plain
-scan with a parallel bitmap heap scan, and it credits the parallel one with its CPU divided among
-the workers and nothing for its I/O, as it does for every AM. Index-only scans keep the column's
-correlation: lion's are of queries that need no column, and the one kind in heap order, a multi-key
-UNION, fetches every TID it hands out whatever the visibility map says, which cost_index()'s
-all-visible fraction would not describe.
+**What cost_index() cannot charge is charged to the path** (2026-09-27). cost_index() charges no
+more than its uncorrelated end, Mackert and Lohman's pages at random_page_cost. At a random_page_cost
+near seq_page_cost (1.1, as on the benchmark's server) a result of many rows on nearly every page
+costs the plain scan more than that end - by its fetches past the first on a page, which the bitmap
+scan does not pay - and the correlation cannot carry it: the two scans came out within 1% of each
+other, add_path() took that for a tie, the plain scan won it on its lower startup cost, and the bitmap
+path was discarded. Nothing amcostestimate returns tells the two apart: cost_index() stores the same
+index cost for the bitmap path the moment amcostestimate returns, and reads nothing else lion gives
+it. So `lion_plain_heap_correlation()` notes what is left over for an unparameterized plain path
+(`lion_plain_note_remainder()`), and lion's set_rel_pathlist_hook adds it to the path once the
+relation's paths are built and offers the bitmap heap scan of the same index path again beside it
+(`lion_plain_set_rel_pathlist()`, in `lion_selfuncs.c`, before LionOrdered's hook sees the paths);
+set_rel_pathlist() allows a hook to modify the core paths, and the two are then compared as any
+others. The plain path keeps its startup cost, which is what a LIMIT asks of it. At 1.1, 43% of the
+rows, 18 to a page, on every page (the benchmark shape's `status = 'live' AND supp = 'no_suppression'
+AND flag`):
+
+| table | plain / bitmap price before | now | plain | bitmap |
+|---|---|---|---|---|
+| 8M rows, heap from the OS cache | 304,596 / 303,920 (plain chosen) | 329,081 / 303,920 | 1,540-1,712 ms (1,558 under load) | 1,240-1,430 ms (1,680-1,750 under load) |
+| the same, cold | | | 3.0-6.7 s | 1.36 s |
+| 1M rows, heap in shared buffers | 37,985 / 37,898 (plain chosen) | 41,038 / 37,898 | 135-163 ms | 114-131 ms |
+| `plaincost.sql`'s 200k rows | 7,294 / 7,273 (plain chosen) | 7,896 / 7,273 | 26 ms | 22 ms |
+
+A result of 2.5 rows to a page on 93% of the pages (`status = 'live' AND supp = 'suppressed'`) fits
+under the end and is unchanged; it is the plain scan's in shared buffers (34 ms against 39-49) and
+the bitmap scan's from the OS cache (815-1,087 against 975-1,105), which is a tie. With parallel plans
+the large ones go to the parallel sequential or bitmap scan, before and after.
+
+There is no parallel plain lion scan (`amcanparallel` is false, §29.1): the planner compares the
+serial plain scan with a parallel bitmap heap scan, and it credits the parallel one with its CPU
+divided among the workers and nothing for its I/O, as it does for every AM. Index-only scans keep the
+column's correlation: lion's are of queries that need no column, and the one kind in heap order, a
+multi-key UNION, fetches every TID it hands out whatever the visibility map says, which
+cost_index()'s all-visible fraction would not describe.
 
 On the benchmark shape (8M rows, 190k heap pages, a five-column index; assert build, warm OS cache
 and 256 MB of shared buffers, the paths interleaved in one backend, median of three; count pushdown
@@ -8233,7 +8257,7 @@ parked at the same point holding none while the same VACUUM completes.
 the benchmark's shape, sampled whole so the statistics are exact: counts of 13% (a multi-key
 column, rechecked) and 43% of the rows, on every page, go to the bitmap scan, and 0.5%, 0.1% and
 0.01%, about a row to a page, to the plain scan, at the default random_page_cost and at 1.1 (the
-43% one only at the default, above); a range alone is a heap pass per key - one
+43% one at 1.1 since the remainder is charged, above); a range alone is a heap pass per key - one
 key goes to the plain scan as `pc = 5` does, twenty keys and one key over every page to the bitmap
 scan, with the sequential scan's answers; a column stored in value order keeps its correlation; and a
 range beside dense sets - `pc < 20`, the always-true `pc >= 0` - is a WINDOW whose plain scan

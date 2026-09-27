@@ -821,4 +821,11 @@ extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
 								Selectivity *indexSelectivity,
 								double *indexCorrelation, double *indexPages);
 
+/*
+ * The part of a plain scan's price above cost_index()'s uncorrelated end,
+ * which lion charges the path once rel's paths are built (DESIGN.md §29.11).
+ */
+extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
+									  Cost remainder);
+
 #endif							/* LION_COUNT_H */
