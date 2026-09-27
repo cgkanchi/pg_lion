@@ -6598,8 +6598,8 @@ Why it is the join's answer:
 
 - **A DISTINCT count does not see multiplicity.** The join's pairs `(f, d)` project onto `x`; for a
   dimension column, the values over the pairs are the values over the dimension rows that have at
-  least one pair, each as often as it has pairs, and a DISTINCT keeps each once. The node's rows
-  - each matching dimension row once - give the Agg the same values.
+  least one pair, each as often as it has pairs, and a DISTINCT keeps each once. The node's rows,
+  each matching dimension row once, give the Agg the same values.
 - **The fact's join column** is a value the rows do not carry, but every fact value a dimension row
   `d` joins is equal to `d.pk` under the join's operator. When the DISTINCT compares with that
   equality - its `SortGroupClause` equality operator and the join operator share a btree or hash
@@ -6611,12 +6611,12 @@ Why it is the join's answer:
   such a count, and in the target list or a GROUP BY, where it would be printed, it declines as
   before.
 - **Uniqueness is not needed for the answer.** Two dimension rows with one key are two rows whose
-  equal keys the DISTINCT collapses, as it collapses the join's pairs; the 2026-09-27 note that
-  this would make uniqueness a correctness premise was about counting matching dimension rows,
-  which is not what the node does here. The inner join is still recognised only when an index
-  proves the dimension key unique (`lion_fkjoin_dim_unique()`, above: core's kind of proof, never
-  statistics), so over a key without one it stays with the ordinary plan, as before; the semi and
-  anti joins never asked for one.
+  equal keys the DISTINCT collapses, as it collapses the join's pairs. (An earlier version of this
+  section held that it would make uniqueness a correctness premise; that is true of counting the
+  matching dimension rows, which is not what the node does.) The inner join is still recognised
+  only when an index proves the dimension key unique (`lion_fkjoin_dim_unique()`, above: core's
+  kind of proof, never statistics), so over a key without one it stays with the ordinary plan, as
+  before; the semi and anti joins never asked for one.
 - **NULLs, filtered and invisible rows.** A NULL fk joins nothing; a NULL dimension column is a row
   whose value the DISTINCT skips, as it skips it among the join's pairs; a NULL dimension key is a
   row of an anti join only. A dimension row the dimension filters remove, or the snapshot does not
