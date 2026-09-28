@@ -32,6 +32,8 @@
  * for every other path, and the relation's row count, stay core's.
  *
  * Core's safeguards, kept:
+ *	- the clause's operator is called on the histogram's values only when
+ *	  statistic_proc_security_check() allows it, as core's search asks;
  *	- a descent or two: the probe reads the leaf an end is on and, when the
  *	  entries there have no live row, LION_PROBE_LEAVES leaves at most;
  *	- a live row, not just an entry: a key whose rows are all deleted is not
@@ -836,11 +838,22 @@ lion_probe_clause(PlannerInfo *root, RelOptInfo *rel, Node *clause,
 		node = (Node *) ((RelabelType *) node)->arg;
 	opno = varonleft ? op->opno : get_commutator(op->opno);
 
+	/*
+	 * The search below calls the clause's operator on the histogram's values,
+	 * which are rows the user may not be allowed to read: a column without
+	 * SELECT, or a table behind a security barrier view or a row-level
+	 * policy.  Core's ineq_histogram_selectivity() asks
+	 * statistic_proc_security_check() before its own search and uses no
+	 * histogram at all when the answer is no (the operator is not leakproof);
+	 * the probe asks the same of the same row and, told no, reads nothing -
+	 * there would be no histogram for its ends to go into.
+	 */
 	if (node != NULL && IsA(node, Var) &&
 		(Index) ((Var *) node)->varno == rel->relid &&
 		((Var *) node)->varattno > 0 &&
 		IsA(other, Const) && !((Const *) other)->constisnull &&
 		OidIsValid(opno) && HeapTupleIsValid(vardata.statsTuple) &&
+		statistic_proc_security_check(&vardata, get_opcode(opno)) &&
 		(idx = lion_probe_index(rel, ((Var *) node)->varattno, &col)) != NULL &&
 		LION_STRAT_IS_RANGE(strategy =
 							get_op_opfamily_strategy(opno,

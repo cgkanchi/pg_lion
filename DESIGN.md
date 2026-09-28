@@ -7894,9 +7894,14 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
 
 - **Where.** Exactly where core would read an end: lion runs core's binary search over the
   histogram with the clause's own operator and constant (`lion_probe_ends_wanted()`), under core's
-  own conditions for using the histogram (its collation, `comparison_ops_are_compatible()`). The
-  constant is what `get_restriction_variable()` makes of the other side, so `now() - interval` is
-  one. A Param is not, and is not probed.
+  own conditions for using the histogram (its collation, `comparison_ops_are_compatible()`,
+  `statistic_proc_security_check()`). The constant is what `get_restriction_variable()` makes of the
+  other side, so `now() - interval` is one. A Param is not, and is not probed. The search calls the
+  clause's operator on the histogram's values, which the user may not be allowed to read - a column
+  without SELECT, a table behind a security barrier view or a row-level policy - so, as core's
+  search does, it runs only when the operator is leakproof or the user can read every row of the
+  column; otherwise core uses no histogram for the clause and the probe reads nothing (2026-09-28
+  review: the search ran regardless, and a leaky operator was handed the histogram).
 - **What is read.** The column's first or last VALUE entry whose posting set has a live row. The
   directory is in the key's order within each key column (§21), so a descent to (attno, VALUE) with
   no key lands on the first VALUE entry (`lion_dir_value_start()`), and one to (attno, the first kind
@@ -8085,7 +8090,11 @@ where a sequential scan is three times faster. It checks lion's estimate against
 and the answers against a sequential scan's; a bound inside the histogram, which is not probed; the
 newest 1,000 rows deleted, before VACUUM and after, where lion's estimate is the number core makes
 with a btree on the column; 9,000 more, past `LION_PROBE_LEAVES`, where the probe gives up and the
-histogram's end stands; a partial index, and a Param. `test/isolation/count_range_split_race.spec` parks a
+histogram's end stands; a partial index, and a Param. `test/sql/rangeprobe_leak.sql` (2026-09-28)
+counts the calls of a non-leakproof `>=` of a lion operator class made while a query is planned: the
+table's owner has the histogram searched with it, a role under a row-level policy does not, and the
+same role does once the operator is leakproof.
+`test/isolation/count_range_split_race.spec` parks a
 range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
 both counts against the heap.
