@@ -3628,12 +3628,23 @@ generic plan's parameter - is priced as ALL: its shape is unknown, and is assume
 expensive one, as lioncostestimate() assumes it for a bitmap scan.  Each candidate is fetched on
 the pages each count reads for itself (`lion_heap_page_cost()`, a filtered recheck having no cache)
 and tested at the clause's own evaluation cost; §10's recheck of the dirty pages is still charged
-beside it.  So a lone `tags @> $1` in a generic plan loses to the ordinary plan, whose own index
-path is priced as ALL too; beside a selective clause the rows the node would recheck are the ones
-the ordinary plan fetches anyway, and the two come out close, the node ahead by what the posting
-sets save (18% in the table below, 4% on the smaller table of the tests, which is why those pin
-only the lone clause); and under `plan_cache_mode = auto` the generic plan's price keeps the plan
-cache choosing custom plans, whose literals are pushed down exactly.
+beside it.  An ALL query is no source of the AND, in the price as in the executor: the model
+leaves it out of the sources `lion_cost_count_rel()` merges, by the same `lion_multikey_cost_mode()`
+the recheck is priced by, as a scan's price leaves it out of the scan's AND (§29.11).  That is the
+count's extraction, a superset, and not the scan's exact one (`lion_cost_qual_is_full()`), which
+would leave out a phrase or a NULL element too, whose superset the count does locate and AND.
+Until 2026-09-28 the price counted it a source all the same, at its default selectivity: a lookup,
+and a probe at each key of the driver - or, where that selectivity made it the smallest source, the
+driver of every count, which priced a grouped count's merges as though a set of a few rows cut each
+of them short.  So a lone `tags @> $1` in a generic plan, priced as ALL, is priced as the
+sequential scan the node then makes, and is chosen over the ordinary plan's sequential scan by the
+Aggregate above that one: at worst the node does the ordinary plan's work without the Aggregate,
+and any other value it answers from the posting sets (below).  Beside a selective clause the rows
+the node would recheck are the ones the ordinary plan fetches anyway, and the two come out close,
+the node ahead by what the posting sets save (18% in the table below, 4% on the smaller table of
+the tests, which is why those pin the choice of the lone clause only, and beside another clause the
+price); and under `plan_cache_mode = auto` the generic plan's price keeps the plan cache choosing
+custom plans, whose literals are pushed down exactly.
 
 **EXPLAIN** prints the clause with its value as core does (`tags @> $1`, `tsv @@
 to_tsquery('simple'::regconfig, current_setting('app.q'::text))`); with ANALYZE, `Heap TIDs
@@ -3653,13 +3664,25 @@ rows over 9,757 heap pages, all-visible; `k` 50 values, `tags` three elements ou
 | ... `'{t1,NULL}'` (the rows of `t1`, rechecked) | 33.5 | **122** |
 | ... `'{}'` (a sequential scan) | 79.5 | **105** |
 
-Bold is the plan the model picks, which does not know the value: beside a selective clause the
-node, whose worst case - `!w1` - is the ordinary plan's work to a tenth; alone the sequential scan,
-by 22 units in 14,762, because priced as every row the node IS a sequential scan - and one that
-runs faster than the ordinary plan's, since the query is extracted once where the ordinary plan
-evaluates it per row, so the worst case the model assumes is not worse than what it replaces.
-What the lone clause gives up is the exact case, 0.2 ms against 126; under `plan_cache_mode =
-auto` the plan cache keeps choosing custom plans for it, whose literal is exact.
+Bold is the plan the model picked then, which does not know the value: beside a selective clause
+the node, whose worst case - `!w1` - is the ordinary plan's work to a tenth; alone the sequential
+scan, by 22 units in 14,762, because priced as every row the node IS a sequential scan - and one
+that runs faster than the ordinary plan's, since the query is extracted once where the ordinary
+plan evaluates it per row, so the worst case the model assumes is not worse than what it replaces.
+The 22 units were the lookup and the probes of a source the node never reads; without them
+(2026-09-28, above) the lone clause goes to the node, and gives up nothing: measured again on
+PostgreSQL 16.15 (a distribution's build, no assertions; generic plans, medians of fifteen, warm,
+all-visible), on the two tables the tests pin it on and on a million rows with
+`countmultikey.sql`'s tags (20, 7 and 500 values) beside a few other columns, 16,210 heap pages:
+
+| `count(*) ... WHERE tags @> $1` | node | ordinary plan |
+|---|---|---|
+| `array.sql`'s 20,000 rows: `'{u500}'` (exact) / `'{t3,NULL}'` (rechecked) / `'{}'` | **0.003 / 0.16 / 2.1 ms** (457.01) | 3.1 / 3.0 / 3.0 (457.26) |
+| `countmultikey.sql`'s 12,000: `'{t1}'` / `'{t1,NULL}'` / `'{}'` | **0.005 / 0.39 / 1.4** (400.01) | 2.2 / 2.0 / 1.9 (400.16) |
+| 1,000,000: `'{u499}'` / `'{t3,u7}'` / `'{t1,NULL}'` / `'{}'` | **0.013 / 0.11 / 58 / 127** (28,710) | 193 / 192 / 184 / 170 (28,723) |
+
+Under `plan_cache_mode = auto` the plan cache still keeps choosing custom plans for it, whose
+literal is exact.
 
 `test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
 counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
@@ -9969,8 +9992,9 @@ the two prices differed in:
   over the same clauses now AND the same sets. What is no set is each path's own: a range, which
   the scan walks on a column without sets (`lion_range_walk_cost()`) and the count may take for a
   source (§32), and a multi-key query that needs every row, which both leave to a recheck of the
-  rows the other sources leave - and which the count's price still counts a source of its AND as
-  well (`lion_cost_count_rel()`, an overcharge of the count on that shape, left as it was).
+  rows the other sources leave, and neither price counts a source of its AND: the scan's by
+  `lion_cost_qual_is_full()`, the count's since 2026-09-28 by `lion_multikey_cost_mode()`, the
+  count's own extraction of the same query (§17, "A query known only at run time").
 
 One function prices it now. `lion_cost_set_and()` (lion_customscan.c) prices each clause as
 `lion_cost_count_rel()` prices a WHERE source - `lion_cost_set_clause()`: its lookups, what a walk

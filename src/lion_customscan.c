@@ -3473,6 +3473,8 @@ static Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
 							  List *whereidx, List *wherecol,
 							  List *whereclauses, List *wherekinds, List *ors,
 							  double matched, double counts, double ceiling);
+static LionQueryMode lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col,
+											 Node *clause, double *nkeys);
 
 /*
  * Does an IN list's source take the disjoint-sum short-circuit of DESIGN.md
@@ -4195,6 +4197,30 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 * `IS NOT NULL` selects no rows of its own; it has been left out
 			 * of this estimate since before partitions existed.
 			 */
+			ci++;
+			continue;
+		}
+
+		/*
+		 * Nor does a multi-key query the count will answer with every row
+		 * (DESIGN.md §17, "A query known only at run time"): a value no key
+		 * narrows, or one with no estimate to go by.  The executor locates no
+		 * set for it - it is a source with nothing to subtract - and tests it
+		 * on each candidate the other sources leave (lion_locate_where(),
+		 * lion_build_filter()), which lion_cost_recheck() prices; it neither
+		 * drives the AND nor is sought in it, as the scan's AND of sets leaves
+		 * the same query out (lion_scan_set_quals()).  Whether it is such a
+		 * query is lion_multikey_cost_mode()'s answer, the one the recheck is
+		 * priced by: a superset of its rows, as the count extracts a run-time
+		 * value, and not the scan's exact extraction, which would also leave
+		 * out a phrase or a NULL element that the count answers from the
+		 * other lexemes' or elements' sets.  An OR's leaf is a literal
+		 * (lion_analyze_leaf()) and is never one.
+		 */
+		if (lfirst_int(lc3) == LION_CLAUSE_MULTI && orgrp[ci] < 0 &&
+			lion_multikey_cost_mode(idx, (AttrNumber) lfirst_int(lc4), clause,
+									&nkeys) == LION_QMODE_ALL)
+		{
 			ci++;
 			continue;
 		}
