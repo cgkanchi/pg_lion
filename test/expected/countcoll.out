@@ -25,7 +25,7 @@ INSERT INTO lcc_d SELECT g, (ARRAY['abc', 'ABC', 'Abc', 'xyz'])[1 + g % 4]
 CREATE INDEX lcc_d_c ON lcc_d USING lion (t COLLATE "C");
 CREATE INDEX lcc_d_t ON lcc_d USING lion (t);
 SELECT lion_index_count('lcc_d_c', 'abc'::text) AS c_index,
-	   lion_index_count('lcc_d_t', 'abc' COLLATE "C") AS c_key,
+	   lion_index_count('lcc_d_t', 'abc'::text COLLATE "C") AS c_key,
 	   (SELECT count(*) FROM lcc_d WHERE t = 'abc') AS query;
  c_index | c_key | query 
 ---------+-------+-------
@@ -47,16 +47,25 @@ SELECT groups, count FROM lion_index_count_group_stats('lcc_d_c');
 
 DROP TABLE lcc_d;
 -- ---------- a nondeterministic collation agrees with no other ----------
-SELECT getdatabaseencoding() <> 'UTF8' OR
-	   NOT EXISTS (SELECT 1 FROM pg_collation WHERE collprovider = 'i')
+-- the collation, where the build has ICU and the database is UTF8: core
+-- lists its "unicode" ICU collation in pg_collation even in a build without
+-- ICU, so whether one can be created is the only test
+SET client_min_messages = warning;
+DO $$
+BEGIN
+	IF getdatabaseencoding() = 'UTF8' THEN
+		CREATE COLLATION lcc_ci (provider = icu, locale = 'und-u-ks-level2',
+								 deterministic = false);
+	END IF;
+EXCEPTION WHEN feature_not_supported THEN
+	NULL;						-- a build without ICU
+END $$;
+RESET client_min_messages;
+SELECT NOT EXISTS (SELECT 1 FROM pg_collation WHERE collname = 'lcc_ci')
 	   AS lcc_skip \gset
 \if :lcc_skip
 \echo 'no ICU collations, or not a UTF8 database: skipped'
 \else
-SET client_min_messages = warning;
-CREATE COLLATION lcc_ci (provider = icu, locale = 'und-u-ks-level2',
-						 deterministic = false);
-RESET client_min_messages;
 -- a column of the default collation, and an index under the
 -- case-insensitive one: 'abc', 'ABC' and 'Abc' are one key of the index
 CREATE TABLE lcc (id int, m int, t text) WITH (autovacuum_enabled = off);
@@ -82,14 +91,14 @@ ERROR:  cannot count through index "lcc_ci_i" under collation "default"
 SELECT groups, count FROM lion_index_count_group_stats('lcc_ci_i');
 ERROR:  cannot count through index "lcc_ci_i" under collation "default"
 -- under the index's own collation, the count is the query's
-SELECT lion_index_count('lcc_ci_i', 'abc' COLLATE lcc_ci) AS lion,
+SELECT lion_index_count('lcc_ci_i', 'abc'::text COLLATE lcc_ci) AS lion,
 	   (SELECT count(*) FROM lcc WHERE t COLLATE lcc_ci = 'abc') AS query;
  lion | query 
 ------+-------
   300 |   300
 (1 row)
 
-SELECT count FROM lion_index_count_stats('lcc_ci_i', 'abc' COLLATE lcc_ci);
+SELECT count FROM lion_index_count_stats('lcc_ci_i', 'abc'::text COLLATE lcc_ci);
  count 
 -------
    300
@@ -103,7 +112,7 @@ SELECT lion_index_count_any('lcc_ci_i', ARRAY['abc', 'xyz'] COLLATE lcc_ci) AS l
 (1 row)
 
 -- each key of the two-index form under its own collation
-SELECT lion_index_count('lcc_ci_i', 'abc' COLLATE lcc_ci, 'lcc_m', 0) AS lion,
+SELECT lion_index_count('lcc_ci_i', 'abc'::text COLLATE lcc_ci, 'lcc_m', 0) AS lion,
 	   (SELECT count(*) FROM lcc WHERE t COLLATE lcc_ci = 'abc' AND m = 0) AS query;
  lion | query 
 ------+-------
@@ -137,13 +146,13 @@ SELECT groups, count FROM lion_index_count_group_stats('lcc2_i');
       2 |   400
 (1 row)
 
-SELECT lion_index_count('lcc2_i', 'abc' COLLATE "C");
+SELECT lion_index_count('lcc2_i', 'abc'::text COLLATE "C");
 ERROR:  cannot count through index "lcc2_i" under collation "C"
 SELECT lion_index_count('lcc2_c', 'abc'::text);
 ERROR:  cannot count through index "lcc2_c" under collation "lcc_ci"
 SELECT groups, count FROM lion_index_count_group_stats('lcc2_c');
 ERROR:  cannot count through index "lcc2_c" under collation "lcc_ci"
-SELECT lion_index_count('lcc2_c', 'abc' COLLATE "C") AS lion,
+SELECT lion_index_count('lcc2_c', 'abc'::text COLLATE "C") AS lion,
 	   (SELECT count(*) FROM lcc2 WHERE t = 'abc' COLLATE "C") AS query;
  lion | query 
 ------+-------
