@@ -1396,6 +1396,61 @@ run_binops(void)
 	CHECK(card == ref_r.card, "reverse andnot() cardinality");
 	verify_full(&buf_d.c, &ref_r);
 
+	/*
+	 * The unoptimized forms: the same members and cardinality, in whatever
+	 * representation the operation built them in - which every reader takes.
+	 */
+	ref_binop(&ref_a, &ref_b, &ref_r, OP_AND);
+	card = lion_container_and_raw(&buf_a.c, &buf_b.c, &buf_d.c);
+	CHECK(card == ref_r.card, "and_raw() returned the wrong cardinality");
+	verify_full(&buf_d.c, &ref_r);
+	card = lion_container_and_raw(&buf_b.c, &buf_a.c, &buf_d.c);
+	CHECK(card == ref_r.card, "and_raw() is not symmetric");
+	verify_full(&buf_d.c, &ref_r);
+
+	/*
+	 * An ARRAY against an image of the other operand: the AND's count and
+	 * block mask, without the AND (the grouped walk of the count engine)
+	 */
+	if (buf_a.c.type == LION_CT_ARRAY)
+	{
+		uint64		img[LION_BITSET_WORDS];
+		uint64		blocks = ~UINT64CONST(0);
+		uint64		expect_blocks = 0;
+		uint32		i;
+
+		memset(img, 0, sizeof(img));
+		lion_container_or_into_bitset(&buf_b.c, img);
+		card = lion_container_and_image_count(&buf_a.c, img, &blocks);
+		CHECK(card == ref_r.card, "and_image_count() returned the wrong cardinality");
+		for (i = 0; i < LION_CONTAINER_RANGE; i++)
+			if (ref_r.m[i])
+				expect_blocks |= lo_block_bit(i);
+		CHECK(blocks == expect_blocks,
+			  "and_image_count() names exactly the blocks of the AND");
+	}
+
+	ref_binop(&ref_a, &ref_b, &ref_r, OP_OR);
+	card = lion_container_or_raw(&buf_a.c, &buf_b.c, &buf_d.c);
+	CHECK(card == ref_r.card, "or_raw() returned the wrong cardinality");
+	verify_full(&buf_d.c, &ref_r);
+	lion_container_bitset_init(&buf_d.c, TEST_CKEY);
+	lion_container_or_into_bitset(&buf_a.c, LION_BITSET_DATA(&buf_d.c));
+	lion_container_or_into_bitset(&buf_b.c, LION_BITSET_DATA(&buf_d.c));
+	card = lion_container_bitset_recount(&buf_d.c);
+	CHECK(card == ref_r.card && buf_d.c.type == LION_CT_BITSET,
+		  "bitset_init() and or_into_bitset() make the union, recount() its cardinality");
+	verify_full(&buf_d.c, &ref_r);
+
+	ref_binop(&ref_a, &ref_b, &ref_r, OP_ANDNOT);
+	card = lion_container_andnot_raw(&buf_a.c, &buf_b.c, &buf_d.c);
+	CHECK(card == ref_r.card, "andnot_raw() returned the wrong cardinality");
+	verify_full(&buf_d.c, &ref_r);
+	ref_binop(&ref_b, &ref_a, &ref_r, OP_ANDNOT);
+	card = lion_container_andnot_raw(&buf_b.c, &buf_a.c, &buf_d.c);
+	CHECK(card == ref_r.card, "reverse andnot_raw() cardinality");
+	verify_full(&buf_d.c, &ref_r);
+
 	/* the operands must not have been touched */
 	CHECK(lion_container_size(&buf_a.c) == asz && memcmp(&buf_e, &buf_a, asz) == 0,
 		  "a set operation modified its left operand");
@@ -1906,6 +1961,49 @@ test_gallop_intersection(void)
 	}
 	lion_container_optimize(&buf_a.c);
 	run_binops();
+}
+
+/*
+ * The ways an AND of an ARRAY meets the other side (lion_container.c, "how
+ * two sides of an AND meet"): a merge of two small sides, a gallop or a run
+ * search for a few members against many, and a bitset image of the larger
+ * side for everything else - each on either side of its threshold, against
+ * ARRAYs and against RUNs of short and long runs, few and many of them.
+ */
+static void
+test_and_shapes(void)
+{
+	static const uint32 asizes[] = {4, 5, 9, 16, 20, 30, 44, 60, 150, 600, 2000};
+	static const uint32 nrunss[] = {1, 3, 20, 44, 100, 400, 1000};
+	uint32		i;
+	uint32		j;
+	uint32		k;
+
+	phase("AND of an ARRAY: merged, galloped, searched and imaged");
+	rng_seed(UINT64CONST(0x5EED000A));
+	for (i = 0; i < lengthof(asizes); i++)
+	{
+		for (j = 0; j < lengthof(asizes); j++)
+		{
+			gen_random(&ref_a, asizes[i]);
+			build_by_append(&buf_a, &ref_a);
+			gen_random(&ref_b, asizes[j]);
+			build_by_append(&buf_b, &ref_b);
+			if (buf_a.c.type != LION_CT_ARRAY || buf_b.c.type != LION_CT_ARRAY)
+				continue;
+			run_binops();
+		}
+		for (k = 0; k < lengthof(nrunss); k++)
+		{
+			gen_random(&ref_a, asizes[i]);
+			build_by_append(&buf_a, &ref_a);
+			gen_runs(&ref_b, nrunss[k], 1 + rng_below(3), 4 + rng_below(20));
+			build_run_direct(&buf_b, &ref_b);
+			if (buf_a.c.type != LION_CT_ARRAY || buf_b.c.type != LION_CT_RUN)
+				continue;
+			run_binops();
+		}
+	}
 }
 
 static bool raw_in_range(const LionContainer *c);
@@ -2502,6 +2600,14 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 
 	(void) lion_container_and_cardinality(c, other);
 	(void) lion_container_and_cardinality(other, c);
+	if (c->type == LION_CT_ARRAY)
+	{
+		uint64		blocks;
+
+		n = lion_container_and_image_count(c, dmg_img, &blocks);
+		CHECK((blocks & ~TEST_BLOCK_BITS) == 0 && n <= LION_ARRAY_MAX_CARD,
+			  "damaged: and_image_count() counts at most the ARRAY's members, on its blocks");
+	}
 
 #define DAMAGE_SETOP(what, stmt) \
 	do { \
@@ -2518,6 +2624,12 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 	DAMAGE_SETOP("or()", (void) lion_container_or(other, c, dmg_dst));
 	DAMAGE_SETOP("andnot()", (void) lion_container_andnot(c, other, dmg_dst));
 	DAMAGE_SETOP("andnot()", (void) lion_container_andnot(other, c, dmg_dst));
+	DAMAGE_SETOP("and_raw()", (void) lion_container_and_raw(c, other, dmg_dst));
+	DAMAGE_SETOP("and_raw()", (void) lion_container_and_raw(other, c, dmg_dst));
+	DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(c, other, dmg_dst));
+	DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(other, c, dmg_dst));
+	DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(c, other, dmg_dst));
+	DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(other, c, dmg_dst));
 #undef DAMAGE_SETOP
 	CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "damaged: set algebra stays inside dest");
 
@@ -3522,6 +3634,7 @@ main(void)
 	test_run_edge_cases();
 	test_iterate_early_stop();
 	test_gallop_intersection();
+	test_and_shapes();
 	test_and_probe();
 	test_run_intersection_overflow();
 	test_remove_if_rebuild();
