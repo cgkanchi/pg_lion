@@ -1502,6 +1502,62 @@ Planner integration
     between two indexes. A grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.
+  - **`GROUP BY coalesce(col, c)`** (2026-09-28, from a benchmark). A report that labels the rows
+    with no value writes the group as `coalesce(col, c)`, and only a bare column used to be
+    accepted. Its groups are col's with ONE change, which is where an inexact answer would come
+    from: the rows where col is NULL are counted in the group of c - a group of their own, printed
+    as c, when no row has col = c, and MERGED into that key's group when one does, so that the key
+    is emitted once with the two counts added. The node does exactly that. `lion_next_group()`
+    walks col's entries as for `GROUP BY col` and takes two of them out of the stream: the reserved
+    NULL entry, and the entry whose key the grouping equality finds equal to c (the equality
+    operator's function called on each key under the grouping collation, one call per entry).
+    Their counts are added up instead of emitted, and the one group they make comes out as c after
+    the last entry, when it has a visible row. That is exact whatever order the two come in and
+    whichever of them exists: the classes of one index are disjoint, so no second entry can equal
+    c; an entry of c that VACUUM deletes before the walk reaches it held no row the snapshot sees
+    (§18), and one inserted meanwhile holds none either, so the group is the same without it; and
+    the decision is made in the walk itself, never by a lookup of c at another moment. The value
+    printed for that group is the Const - the constant as the query wrote it, which is what core
+    prints for NULL rows - and for c's own group it is the value those rows hold as well, because
+    a key the target list prints is only produced by an index whose equality implies an identical
+    representation (the value gate below). What `lion_group_coalesce()` requires, and why:
+    - exactly one GROUP BY expression, `coalesce(col, c)` as `eval_const_expressions()` leaves it:
+      a plain column of the relation and a non-NULL Const (NULL arguments and everything after
+      the first non-NULL constant are gone by then, and a constant expression is folded). A
+      Param - `coalesce(col, $1)` under a generic plan - another column or a stable function is
+      declined; so is anything wrapped around the expression;
+    - no coercion: the column, the Const and the expression all of the column's own type, so that
+      the grouping equality (`SortGroupClause.eqop`, which the next rule makes the driving index's
+      strategy 1, as for a bare column) compares c with the stored keys as it compares the rows. A
+      cast of the column - `coalesce(i4::int8, 0)` - is a function call and declines, even where
+      it would keep equality, and a relabelled one declines too; the constant is coerced to the
+      column's type by the parser, which is what a written `coalesce(col, 0)` is;
+    - the expression's collation the column's, which the driving index's collation has to match
+      per relation as for a bare column, so that c is compared under the collation the GROUP BY
+      groups under (`coalesce(t, 'x' COLLATE "C")` over a default-collation index declines).
+
+    The target list and the HAVING may use the expression itself, which the node prints as the
+    group key, and the counts; not the bare column (a HAVING that takes the expression apart) and
+    no other expression over it. `count(col)` of the coalesced column is the one count the merge
+    changes - in the merged group it is c's rows alone - so it, and a `count(DISTINCT col)` proved
+    to be it (§26), is answered only where no counted row has col NULL: col declared NOT NULL, or a
+    clause of the WHERE that says so, and then nothing is merged. `count(DISTINCT k)` of §26 beside
+    it and a second GROUP BY column decline. An IN list on col drives the groups as in §15 and
+    never meets the NULL entry, and neither does a range on col (§28) or `col IS NOT NULL`. The
+    path claims no pathkeys - the group of c comes last, wherever c sorts - so an `ORDER BY` puts
+    a Sort above the node. A partitioned table is §16's shape unchanged: each partition emits its
+    own partial group of c, and the Finalize Aggregate adds the partitions' groups of c up like
+    any other key's. EXPLAIN prints `Group Key: COALESCE(g, 0)`. The constant travels in the new
+    `LION_PRIV_COALESCE` member of `custom_private` with the equality and its collation (shape 14).
+    `test/sql/group_coalesce.sql` compares each form against a sequential scan: a constant that is
+    a key and one that is not, for int, text and boolean columns, no NULL rows (a NOT NULL column,
+    `IS NOT NULL`, an IN list, a range), only NULL rows, a key the WHERE leaves no row of beside
+    NULL rows that it does, HAVING that keeps or drops the merged group alone, parameters, a
+    LATERAL rescan, a dirty heap in which c's key has lost every row, after VACUUM has deleted that
+    entry, a partitioned table whose NULLs and whose c rows are in different partitions, and the
+    declines. Not done: another spelling of the same grouping (`CASE WHEN col IS NULL THEN c ELSE
+    col END`), and a c known only at run time, which the node could evaluate once per scan like a
+    clause value (§10) but does not.
   - **The driving index's equality is the grouping equality** (2026-09-20 review, finding 3). An
     index's entries are the classes of
     strategy 1 of ITS opfamily on its own key type, and an operator class is free to define a
@@ -6688,7 +6744,8 @@ and includes the key deleted after the snapshot.
   accepted. No value of `k` is printed, so the representation gate of finding 4 does not apply.
 - Partitioned tables decline: distinct counts are not additive across partitions, and §16's shape
   (partial aggregates added up by a Finalize Agg) would add them. A later version could emit
-  per-partition (g, k) pairs for core to deduplicate.
+  per-partition (g, k) pairs for core to deduplicate. (A column unique over the whole table is
+  not walked at all, below.)
 - Everything else - WHERE clause kinds, OR, IN lists, Params, HAVING, privileges, RLS - is §10 as it
   stands. A query with no WHERE clause at all is accepted: `k`'s entries drive it.
 
@@ -6697,6 +6754,74 @@ front of the target-list kinds - shape 8, `LION_PRIV_NMEMBERS` 11 - and the targ
 `LION_TL_COUNT_DISTINCT` and `LION_TL_COUNT_DISTCOL` (`count(k)`). `k`'s index travels in the
 existing Oid slots, the driving one in shape 1 and the inner one in shape 2; `groupattno2` stays 0,
 because `k` is not a grouping column, and the executor calls the inner column `innerattno`.
+
+### A unique column (2026-09-28)
+
+A benchmark counted `SELECT g, count(DISTINCT id) FROM t WHERE <lion filters> GROUP BY g` with
+`id` the table's primary key. Nothing above answered it: `id` had no lion index, and with one the
+(g, k) loop would have tested one entry per ROW for every group - far more than the count it is.
+For a column no two rows share a value of, `count(DISTINCT col)` over any set of rows is
+`count(col)` over the same rows, and so it is taken now (`lion_agg_distinct_unique()`): such an
+aggregate is not `k` at all but one more count of the target list, which §14's rules for
+`count(col)` then answer - `count(*)` where col is known non-NULL (declared NOT NULL, through
+`attnotnull` on 16 and core's `notnullattnums` from 17, which leaves out a NOT VALID constraint
+on 18 and later; or a clause of the WHERE that is strict on col, or `col IS NOT NULL`), the group's
+count or 0 when col is the group column, and 0 under `col IS NULL`. Where none of those holds - a
+nullable unique column nothing proves non-NULL - the aggregate is `k` as before and is walked if
+col has a lion index. For a proven one nothing is walked, priced or printed as a Distinct Key:
+the path is §10's count with that count in the target list, and costs what `count(*)` costs.
+
+**The proof** is the one §27 takes for a dimension key, `lion_column_is_unique()` (lion_fkjoin.c),
+over the relation's `indexlist` - the valid indexes a plan may rely on under this snapshot, which
+leaves out one that `CREATE INDEX CONCURRENTLY` has not finished:
+
+- a btree index that is UNIQUE and on exactly one key column, which is col itself (not an
+  expression over it, not col among others);
+- enforced immediately. A DEFERRABLE constraint is checked at commit, and inside a transaction
+  that has deferred it two rows may share a value: `test/sql/distinct_unique.sql` makes one, and
+  the count has to come out one less than the rows;
+- not partial, even under a WHERE that implies the predicate. The predicate proof would hold (the
+  rows counted are rows the index covers) but is not taken in v1, as core's join removal does not
+  take it for proofs that must hold before any join;
+- not hypothetical (an index an advisor only pretends exists);
+- whose opfamily has the DISTINCT's own equality (`SortGroupClause.eqop`) as its equality
+  strategy, and whose collation is the DISTINCT's (`exprCollation()` of the argument) when that is
+  a collation at all: a key unique under "C" is not unique under a case-insensitive one.
+  `count(DISTINCT t)` over a unique index on `t COLLATE "C"` declines, and `count(DISTINCT t
+  COLLATE "C")` is counted.
+
+Uniqueness among the table's rows is uniqueness among any snapshot's: a unique index lets no
+second live row with a key in until the first is deleted by a committed transaction, so no
+snapshot sees both - the guarantee core's own join removal and unique joins rest on.
+
+**Partitioned tables.** A partitioned parent's `indexlist` holds its PARTITIONED indexes (16 and
+later), and a unique one of those is a proof for the whole table: it has to contain every
+partitioning column, so a single-column one is on the partition key, which keeps equal values in
+one partition, whose own unique index keeps them apart - the proof core's join removal takes from
+the same list. A unique index on each partition is not one, and the test makes the values repeat
+across partitions to show it declines. Without a GROUP BY the partitions are counted and summed as
+for `count(*)` (§16). With one it still declines: core never marks an aggregate with a DISTINCT
+splittable (`hasNonPartialAggs`, so `GROUPING_CAN_PARTIAL_AGG` is unset), and §16's partial
+counts under a Finalize Agg are the only form a partitioned GROUP BY takes.
+
+**Nothing is recorded** about the proof in the plan, as for core's uses of it: dropping the index
+or the constraint, and `ALTER COLUMN ... DROP NOT NULL`, change the table's catalog rows and so
+invalidate its relcache entry, and every cached plan that reads the table - its OID is in the
+plan's relation list - is made again before it runs. The test prepares a generic plan, drops the
+unique index (then the NOT NULL) under it, inserts duplicates (then NULLs), and checks that the
+next EXECUTE is planned without the count and counts them once.
+
+**The plan** tells the two kinds of `count(DISTINCT)` apart by their column: the one
+`LION_PRIV_DISTINCT` names is walked, any other is a count, `LION_TL_COUNT` or one of §14's
+kinds (`lion_plan_custom_path()`). The member's shape is unchanged: a plan an earlier build made
+never holds a DISTINCT aggregate of another column, and the kinds are decided at plan time. So one
+column is never both: a distinct count proved unique under one collation beside a walked one of the
+same column under another declines. Beside a walked `k` of another column the proven one is simply
+one more count, and makes the tests of shape 1 counts as any other count does.
+
+Not done: a multi-column unique index whose other columns the WHERE pins to one value, the
+predicate proof of a partial one, and the FK-side join (§27), whose `count(DISTINCT)` is core's
+own aggregate over the node's rows already.
 
 ### Cost
 
@@ -6773,6 +6898,16 @@ coarser opclass, an unindexed column, two distinct columns, `k` as the group col
 BY columns. The plan choice for shape 2 is pinned at a small and a large pair count, and EXPLAIN
 ANALYZE shows the early exit reading fewer containers than the same walk with `count(k)` beside it.
 
+`test/sql/distinct_unique.sql` does the same for a unique column, and says for each query whether
+it was counted, walked or declined: a primary key with and without a GROUP BY, under every clause
+kind, HAVING, a folded and a two-column GROUP BY, a generic plan, beside a walked non-unique column;
+a nullable unique column, walked unless the WHERE rules its NULLs out, and as the group column; the
+proofs that do not hold - an expression, a two-column unique index, an expression index, another
+collation, a partial index (with duplicates outside its predicate) and a deferrable constraint
+(with a duplicate made inside a deferring transaction); a dirty heap and VACUUM; the cached plan
+replanned after its unique index and then its NOT NULL are dropped; and a partitioned table with
+per-partition unique indexes over repeating values, then a primary key.
+
 ## 27. FK-side join pushdown: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK (v1, implemented)
 
 Formerly the §23 backlog item of the same name; the semi and anti joins (`EXISTS`, `IN`, `NOT
@@ -6847,12 +6982,12 @@ this design does not need uniqueness to be RIGHT. v1 requires it anyway, as a sc
 - a non-unique key is the shape where a hash join over the fact wins in any case, because the
   lookups multiply, and it is kept out of the tested surface.
 
-The proof is `lion_fkjoin_dim_unique()`: a single-column, UNIQUE, immediately enforced, non-partial
-btree index on the dimension's join column whose opfamily contains the join operator as its
-equality strategy and whose collation equals the join clause's input collation (or the type is not
-collatable). It is written against the index list rather than through core's
-`relation_has_unique_index_for()`, because before PostgreSQL 19 that function does not compare
-collations (its own `XXX`): a unique index under `"C"` does not make a join under a
+The proof is `lion_column_is_unique()` (§26's unique column takes the same one): a single-column,
+UNIQUE, immediately enforced, non-partial btree index on the dimension's join column whose opfamily
+contains the join operator as its equality strategy and whose collation equals the join clause's
+input collation (or the type is not collatable). It is written against the index list rather than
+through core's `relation_has_unique_index_for()`, because before PostgreSQL 19 that function does
+not compare collations (its own `XXX`): a unique index under `"C"` does not make a join under a
 case-insensitive collation unique. Lifting the rule is a costing change, not a correctness one.
 
 The proof is therefore a COSTING AND SCOPE GUARD ONLY, and nothing about correctness rests on it
@@ -7051,7 +7186,7 @@ differently.
   fact row then joins at most one dimension row, so counting join pairs counts fact rows. What
   reaches UPPERREL_GROUP_AGG is the inner join this section was written for, and the EXISTS, the IN
   and the JOIN spellings get the same plan. The equivalence is core's, made from core's uniqueness
-  proof; `lion_fkjoin_dim_unique()` is asked afterwards, as ever, as a costing guard. (Before
+  proof; `lion_column_is_unique()` is asked afterwards, as ever, as a costing guard. (Before
   PostgreSQL 19 core does not compare collations in that proof - the XXX of "Uniqueness of the
   dimension key" - so an EXISTS over a key unique only under another collation is an inner join to
   core; the node then has no proof of its own, declines, and the ordinary plan is whatever core
@@ -7342,7 +7477,7 @@ Why it is the join's answer:
   equal keys the DISTINCT collapses, as it collapses the join's pairs. (An earlier version of this
   section held that it would make uniqueness a correctness premise; that is true of counting the
   matching dimension rows, which is not what the node does.) The inner join is still recognised
-  only when an index proves the dimension key unique (`lion_fkjoin_dim_unique()`, above: core's
+  only when an index proves the dimension key unique (`lion_column_is_unique()`, above: core's
   kind of proof, never statistics), so over a key without one it stays with the ordinary plan, as
   before; the semi and anti joins never asked for one.
 - **NULLs, filtered and invisible rows.** A NULL fk joins nothing; a NULL dimension column is a row

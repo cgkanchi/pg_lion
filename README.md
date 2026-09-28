@@ -371,10 +371,17 @@ per execution; a volatile one like `random()` goes to the ordinary plan) on any 
 columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
 NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
 (`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
-clauses in all), a `GROUP BY` of one or two indexed columns, and a `HAVING` over the counts it computes (a `HAVING`
-with a correlated subquery, or a `GROUP BY` of three or more columns, goes to the ordinary plan). `IN` lists of more than 1000
-values are left to the ordinary plan, a multi-key index can never drive a `GROUP BY` or a
-sum-over-all-entries count (its entries are keys, not row values), and the cost model inherits the
+clauses in all), a `GROUP BY` of one or two indexed columns - or of `coalesce(col, constant)` of
+one, whose NULL rows are counted in the constant's group, merged with that key's rows when the
+column has it - and a `HAVING` over the counts it computes (a `HAVING` with a correlated subquery,
+or a `GROUP BY` of three or more columns, goes to the ordinary plan). `count(DISTINCT col)` is
+answered for an indexed column (DESIGN.md §26), and for a column a unique index proves unique - a
+primary key - as the `count(col)` it equals: `count(*)` where the column is NOT NULL, whether or not
+it has a lion index (a single-column, immediate, non-partial btree index under the `DISTINCT`'s
+collation; on a partitioned table, one on the parent, and then only without a `GROUP BY`). `IN`
+lists of more than 1000 values are left to the ordinary plan, a multi-key index can never drive a
+`GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values), and the cost
+model inherits the
 stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
 with an error and have to be rebuilt with REINDEX.
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead

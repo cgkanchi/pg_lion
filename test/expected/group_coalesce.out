@@ -1,0 +1,620 @@
+-- GROUP BY coalesce(col, c) in the LionCount pushdown (DESIGN.md §10,
+-- "coalesce").
+--
+-- The groups are col's, with the rows where col is NULL counted in the group
+-- of c: a group of their own, printed as c, when no row has col = c, and
+-- MERGED into that key's group when one does.  The node walks col's entries
+-- as for a plain GROUP BY col and holds back two of them - the NULL entry and
+-- the entry whose key equals c under the grouping equality - which it emits as
+-- one group after the last entry.  Every answer is compared with a sequential
+-- scan with the pushdown off, as a multiset in both directions; a few are
+-- printed as well, so that the value of the relabelled group shows.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+/*
+ * lion_gc() runs a query with every other scan disabled, so that a LionCount
+ * path that is built at all is the plan, and again as a sequential scan with
+ * the pushdown off, and compares the two.
+ */
+CREATE FUNCTION lion_gc(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_gc_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_gc_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'SELECT count(*) FROM lion_gc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gc_on EXCEPT ALL SELECT * FROM lion_gc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gc_off EXCEPT ALL SELECT * FROM lion_gc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_gc_on, lion_gc_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+/* The same under a generic plan, which keeps $n a Param. */
+CREATE FUNCTION lion_gc_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_gcp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_gcp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_gc_on AS EXECUTE lion_gcp_on(%s)', args);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE lion_gcp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_gc_off AS EXECUTE lion_gcp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_gcp_on';
+	EXECUTE 'DEALLOCATE lion_gcp_off';
+	EXECUTE 'SELECT count(*) FROM lion_gc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gc_on EXCEPT ALL SELECT * FROM lion_gc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gc_off EXCEPT ALL SELECT * FROM lion_gc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_gc_on, lion_gc_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+/*
+ * 3000 rows.  g: 0 .. 7, NULL on every 9th row.  h: 1 .. 5, NULL on every 6th
+ * row - 0 never occurs.  a: 10 values.  t: 'x0' .. 'x4', NULL on every 13th
+ * row.  b: true and false, NULL on every 7th row.  n: 4 values, NOT NULL.
+ */
+CREATE TABLE lion_gc (
+	id	int		NOT NULL,
+	g	int,
+	h	int,
+	a	int		NOT NULL,
+	t	text,
+	b	boolean,
+	n	int		NOT NULL
+);
+INSERT INTO lion_gc
+SELECT i,
+	   CASE WHEN i % 9 = 0 THEN NULL ELSE (i / 2) % 8 END,
+	   CASE WHEN i % 6 = 0 THEN NULL ELSE 1 + (i / 5) % 5 END,
+	   i % 10,
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE 'x' || ((i / 7) % 5) END,
+	   CASE WHEN i % 7 = 0 THEN NULL ELSE (i / 3) % 3 = 0 END,
+	   (i / 11) % 4
+  FROM generate_series(1, 3000) i;
+CREATE INDEX lion_gc_g ON lion_gc USING lion (g);
+CREATE INDEX lion_gc_h ON lion_gc USING lion (h);
+CREATE INDEX lion_gc_a ON lion_gc USING lion (a);
+CREATE INDEX lion_gc_t ON lion_gc USING lion (t);
+CREATE INDEX lion_gc_b ON lion_gc USING lion (b);
+CREATE INDEX lion_gc_n ON lion_gc USING lion (n);
+CREATE UNIQUE INDEX lion_gc_id ON lion_gc (id);
+VACUUM (FREEZE, ANALYZE) lion_gc;
+-- ---- 1. a constant that is a key: the NULL rows join its group ------------
+SELECT coalesce(g, 0) AS k, count(*) FROM lion_gc GROUP BY 1 ORDER BY 1;
+ k | count 
+---+-------
+ 0 |   667
+ 1 |   334
+ 2 |   334
+ 3 |   335
+ 4 |   333
+ 5 |   332
+ 6 |   332
+ 7 |   333
+(8 rows)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 5), count(*) FROM lion_gc WHERE a = 3 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 7), count(*), count(a) FROM lion_gc WHERE a IN (1, 2) GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(h, 3), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a = 3 OR h = 2 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+-- ---- 2. a constant that is not: a group of its own, printed as written -----
+SELECT coalesce(g, 99) AS k, count(*) FROM lion_gc GROUP BY 1 ORDER BY 1;
+ k  | count 
+----+-------
+  0 |   334
+  1 |   334
+  2 |   334
+  3 |   335
+  4 |   333
+  5 |   332
+  6 |   332
+  7 |   333
+ 99 |   333
+(9 rows)
+
+SELECT lion_gc('SELECT coalesce(g, 99), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 9 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, -1), count(*) FROM lion_gc WHERE a = 3 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 9 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(h, 0), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 6 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(h, 0), count(*) FROM lion_gc WHERE a = 8 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 6 rows
+(1 row)
+
+-- ---- 3. text and boolean columns ----------------------------------------
+SELECT coalesce(t, 'x2') AS k, count(*) FROM lion_gc WHERE a = 4 GROUP BY 1 ORDER BY 1;
+ k  | count 
+----+-------
+ x0 |    40
+ x1 |    40
+ x2 |   103
+ x3 |    39
+ x4 |    78
+(5 rows)
+
+SELECT lion_gc('SELECT coalesce(t, ''x2''), count(*) FROM lion_gc WHERE a = 4 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT coalesce(t, 'none') AS k, count(*) FROM lion_gc GROUP BY 1 ORDER BY 1;
+  k   | count 
+------+-------
+ none |   230
+ x0   |   556
+ x1   |   555
+ x2   |   556
+ x3   |   554
+ x4   |   549
+(6 rows)
+
+SELECT lion_gc('SELECT coalesce(t, ''none''), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 6 rows
+(1 row)
+
+SELECT coalesce(b, false) AS k, count(*) FROM lion_gc WHERE a = 1 GROUP BY 1 ORDER BY 1;
+ k | count 
+---+-------
+ f |   214
+ t |    86
+(2 rows)
+
+SELECT lion_gc('SELECT coalesce(b, false), count(*) FROM lion_gc WHERE a = 1 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(b, true), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ---- 4. no NULL rows, and nothing but NULL rows -------------------------
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE g IS NOT NULL GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE g IN (0, 1, 2) GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE g >= 0 AND a = 5 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 5), count(*) FROM lion_gc WHERE g <= 3 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(n, 0), count(*) FROM lion_gc WHERE a = 2 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 5), count(*) FROM lion_gc WHERE g IS NULL GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT coalesce(g, 5) AS k, count(*) FROM lion_gc WHERE g IS NULL AND a = 3 GROUP BY 1;
+ k | count 
+---+-------
+ 5 |    33
+(1 row)
+
+-- the NULL rows of a key whose own rows the WHERE leaves none of
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE g IS NULL OR g = 3 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ---- 5. what else the target list and HAVING may say --------------------
+-- count(g) counts g's own rows, not the NULL rows merged in: only where the
+-- WHERE rules them out, or the column is NOT NULL
+SELECT lion_gc('SELECT coalesce(g, 0), count(g) FROM lion_gc GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*), count(g) FROM lion_gc WHERE g IS NOT NULL GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*), count(g) FROM lion_gc WHERE g IS NULL GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(n, 0), count(n) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*), count(n), count(a) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(t) FROM lion_gc GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 8 rows
+(1 row)
+
+-- a distinct count of a unique column is a count (distinct_unique.sql)
+SELECT lion_gc('SELECT coalesce(g, 0), count(DISTINCT id) FROM lion_gc WHERE a = 3 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+-- the group key only in GROUP BY, printed twice, and a column a clause pins
+SELECT lion_gc('SELECT count(*) FROM lion_gc GROUP BY coalesce(g, 0)');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0) AS k1, coalesce(g, 0) AS k2, count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT a, coalesce(g, 0), count(*) FROM lion_gc WHERE a = 6 GROUP BY 2, a');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+-- HAVING over the merged group: it alone passes, and it alone fails; and
+-- over the relabelled one, among others
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc GROUP BY 1 HAVING count(*) > 500');
+       lion_gc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc GROUP BY 1 HAVING count(*) < 500');
+       lion_gc       
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 99) FROM lion_gc GROUP BY 1 HAVING count(*) = 333');
+       lion_gc       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- ---- 6. parameters, and a rescan per outer row --------------------------
+SELECT lion_gc_prep('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a = $1 GROUP BY 1', '3');
+    lion_gc_prep     
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc_prep('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a = ANY ($1) GROUP BY 1', '''{2,4}''::int[]');
+    lion_gc_prep     
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT x, s.* FROM generate_series(0, 3) x, LATERAL (SELECT coalesce(g, 0) AS k, count(*) FROM lion_gc WHERE a = x GROUP BY 1) s');
+       lion_gc        
+----------------------
+ pushed down, 32 rows
+(1 row)
+
+-- ---- 7. EXPLAIN ----------------------------------------------------------
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF) SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a = 3 GROUP BY 1;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_gc_g (g), lion_gc_a (a = 3)
+   Group Key: COALESCE(g, 0)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT coalesce(t, 'none'), count(*) FROM lion_gc WHERE b GROUP BY 1;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_gc_t (t), lion_gc_b (b = true)
+   Group Key: COALESCE(t, 'none'::text)
+(3 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+-- ---- 8. declined ---------------------------------------------------------
+-- the second argument not a constant: another column, a parameter
+SELECT lion_gc('SELECT coalesce(g, a), count(*) FROM lion_gc GROUP BY 1');
+         lion_gc          
+--------------------------
+ not pushed down, 10 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, h), count(*) FROM lion_gc GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 9 rows
+(1 row)
+
+SELECT lion_gc_prep('SELECT coalesce(g, $1), count(*) FROM lion_gc GROUP BY 1', '0');
+      lion_gc_prep       
+-------------------------
+ not pushed down, 8 rows
+(1 row)
+
+-- the column cast to another type, and a collation the index was not built for
+SELECT lion_gc('SELECT coalesce(g::bigint, 0), count(*) FROM lion_gc GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(t, ''x2'' COLLATE "C"), count(*) FROM lion_gc GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 5 rows
+(1 row)
+
+-- an expression over the group key, the column itself, a second group key
+SELECT lion_gc('SELECT coalesce(g, 0) + 1, count(*) FROM lion_gc GROUP BY coalesce(g, 0)');
+         lion_gc         
+-------------------------
+ not pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc GROUP BY 1 HAVING count(*) > coalesce(g, 0) * 50');
+         lion_gc         
+-------------------------
+ not pushed down, 7 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), a, count(*) FROM lion_gc WHERE a < 2 GROUP BY 1, 2');
+         lion_gc          
+--------------------------
+ not pushed down, 16 rows
+(1 row)
+
+-- a distinct count beside it
+SELECT lion_gc('SELECT coalesce(g, 0), count(DISTINCT h) FROM lion_gc GROUP BY 1');
+         lion_gc         
+-------------------------
+ not pushed down, 8 rows
+(1 row)
+
+-- ---- 9. a dirty heap, and after VACUUM ------------------------------------
+-- key 7 loses every row (an entry with no visible row), key 0 some of its
+-- rows, and some rows move to NULL
+DELETE FROM lion_gc WHERE g = 7;
+DELETE FROM lion_gc WHERE g = 0 AND a < 5;
+UPDATE lion_gc SET g = NULL WHERE id % 31 = 0;
+SELECT coalesce(g, 7) AS k, count(*) FROM lion_gc GROUP BY 1 ORDER BY 1;
+ k | count 
+---+-------
+ 0 |   160
+ 1 |   323
+ 2 |   323
+ 3 |   325
+ 4 |   322
+ 5 |   321
+ 6 |   321
+ 7 |   405
+(8 rows)
+
+SELECT lion_gc('SELECT coalesce(g, 7), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a = 2 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+VACUUM ANALYZE lion_gc;
+SELECT lion_gc('SELECT coalesce(g, 7), count(*) FROM lion_gc GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a IN (2, 7) GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT coalesce(g, 0) AS k, count(*) FROM lion_gc GROUP BY 1 ORDER BY 1;
+ k | count 
+---+-------
+ 0 |   565
+ 1 |   323
+ 2 |   323
+ 3 |   325
+ 4 |   322
+ 5 |   321
+ 6 |   321
+(7 rows)
+
+-- ---- 10. a partitioned table ---------------------------------------------
+/*
+ * The first partition has NULLs and no 0, the second 0 and no NULLs: each
+ * partition's node emits its own partial group of c, and core's Finalize
+ * Aggregate above adds the two (DESIGN.md §16).
+ */
+CREATE TABLE lion_gcp (id int NOT NULL, g int, a int NOT NULL) PARTITION BY RANGE (id);
+CREATE TABLE lion_gcp1 PARTITION OF lion_gcp FOR VALUES FROM (0) TO (1000);
+CREATE TABLE lion_gcp2 PARTITION OF lion_gcp FOR VALUES FROM (1000) TO (2000);
+INSERT INTO lion_gcp
+SELECT i,
+	   CASE WHEN i >= 1000 THEN i % 4 WHEN i % 5 = 0 THEN NULL ELSE 1 + i % 4 END,
+	   i % 3
+  FROM generate_series(0, 1999) i;
+CREATE INDEX lion_gcp_g ON lion_gcp USING lion (g);
+CREATE INDEX lion_gcp_a ON lion_gcp USING lion (a);
+VACUUM ANALYZE lion_gcp;
+SELECT coalesce(g, 0) AS k, count(*) FROM lion_gcp GROUP BY 1 ORDER BY 1;
+ k | count 
+---+-------
+ 0 |   450
+ 1 |   450
+ 2 |   450
+ 3 |   450
+ 4 |   200
+(5 rows)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gcp GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 9), count(*) FROM lion_gcp WHERE a = 1 GROUP BY 1');
+       lion_gc       
+---------------------
+ pushed down, 6 rows
+(1 row)
+
+SELECT lion_gc('SELECT coalesce(g, 0), count(*) FROM lion_gcp GROUP BY 1 HAVING count(*) > 400');
+       lion_gc       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+DROP TABLE lion_gcp;
+DROP TABLE lion_gc;
+DROP FUNCTION lion_gc(text);
+DROP FUNCTION lion_gc_prep(text, text);
