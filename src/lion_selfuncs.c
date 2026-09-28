@@ -69,6 +69,7 @@
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
 #include "executor/instrument.h"
 #include "fmgr.h"
@@ -80,6 +81,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
@@ -1256,6 +1258,425 @@ lion_probe_end(void)
 }
 
 /* ---------------------------------------------------------------------
+ * One form for one filter (DESIGN.md §29.11, "An OR of equalities is its
+ * IN list")
+ * --------------------------------------------------------------------- */
+
+/*
+ * `k = 1 OR k = 7 OR k = 9` and `k IN (1, 7, 9)` select the same rows, and
+ * lion answers, prices and probes them as ONE clause: the IN list.  The OR
+ * restriction is what core keeps in baserestrictinfo whatever it makes of it
+ * for an index (PostgreSQL 18 matches it to an index column as the list,
+ * match_orclause_to_indexcol(); 16 and 17 do not), and lion used to take it
+ * for a union of single-key leaves (DESIGN.md §19): each leaf looked up and
+ * priced alone, the union priced by another formula than the list's, no
+ * disjoint sum, and no intersection probe at all.
+ *
+ * The list the OR spells, as core builds it for the index: every arm `expr op
+ * Const` or `Const op expr` (the operator commuted), one operator, one input
+ * collation and one constant type across the arms, the same expr in each, no
+ * NULL constant, and an array type for the constants' type.  Anything else is
+ * NULL, and stays the OR it is.  Whether the operator is an equality of the
+ * index that answers expr is the caller's to ask, as for any IN list.  Only
+ * constants: an OR over Params is left to core, as its lookups are the
+ * executor's.
+ */
+Node *
+lion_or_as_array(Node *clause)
+{
+	BoolExpr   *orclause;
+	Node	   *expr = NULL;
+	Oid			opno = InvalidOid;
+	Oid			consttype = InvalidOid;
+	Oid			inputcollid = InvalidOid;
+	Oid			arraytype;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			dims[1];
+	int			lbs[1] = {1};
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	ScalarArrayOpExpr *saop;
+	int			n = 0;
+	ListCell   *lc;
+
+	if (clause != NULL && IsA(clause, RestrictInfo))
+		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	if (clause == NULL || !IsA(clause, BoolExpr) ||
+		((BoolExpr *) clause)->boolop != OR_EXPR ||
+		list_length(((BoolExpr *) clause)->args) < 2)
+		return NULL;
+	orclause = (BoolExpr *) clause;
+
+	elems = (Datum *) palloc(sizeof(Datum) * list_length(orclause->args));
+	foreach(lc, orclause->args)
+	{
+		OpExpr	   *op = (OpExpr *) lfirst(lc);
+		Node	   *left;
+		Node	   *right;
+		Node	   *side;
+		Const	   *con;
+		Oid			armop;
+
+		if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+			break;
+		left = (Node *) linitial(op->args);
+		right = (Node *) lsecond(op->args);
+		if (IsA(right, Const) && !IsA(left, Const))
+		{
+			side = left;
+			con = (Const *) right;
+			armop = op->opno;
+		}
+		else if (IsA(left, Const) && !IsA(right, Const))
+		{
+			side = right;
+			con = (Const *) left;
+			armop = get_commutator(op->opno);
+		}
+		else
+			break;
+		if (!OidIsValid(armop) || con->constisnull ||
+			contain_volatile_functions(side))
+			break;
+		if (n == 0)
+		{
+			expr = side;
+			opno = armop;
+			consttype = con->consttype;
+			inputcollid = op->inputcollid;
+			if (consttype == RECORDOID || exprType(side) == RECORDOID)
+				break;
+		}
+		else if (armop != opno || con->consttype != consttype ||
+				 op->inputcollid != inputcollid || !equal(side, expr))
+			break;
+		elems[n++] = con->constvalue;
+	}
+	arraytype = (lc == NULL) ? get_array_type(consttype) : InvalidOid;
+	if (!OidIsValid(arraytype))
+	{
+		pfree(elems);
+		return NULL;
+	}
+
+	/* the array Const as make_SAOP_expr() builds it */
+	nulls = (bool *) palloc0(sizeof(bool) * n);
+	dims[0] = n;
+	get_typlenbyvalalign(consttype, &typlen, &typbyval, &typalign);
+	saop = makeNode(ScalarArrayOpExpr);
+	saop->opno = opno;
+	saop->opfuncid = get_opcode(opno);
+	saop->hashfuncid = InvalidOid;
+	saop->negfuncid = InvalidOid;
+	saop->useOr = true;
+	saop->inputcollid = inputcollid;
+	saop->args = list_make2(copyObject(expr),
+							makeConst(arraytype, -1, inputcollid, -1,
+									  PointerGetDatum(construct_md_array(elems, nulls,
+																		 1, dims, lbs,
+																		 consttype,
+																		 typlen,
+																		 typbyval,
+																		 typalign)),
+									  false, false));
+	saop->location = -1;
+	pfree(elems);
+	pfree(nulls);
+	return (Node *) saop;
+}
+
+/*
+ * A restriction clause in the form lion's estimates take it: an OR of
+ * equalities as its IN list (lion_or_as_array()), and a boolean column by
+ * itself - `col`, `NOT col`, `col IS TRUE`, `col IS FALSE`, which is how
+ * eval_const_expressions() leaves `col = true` and `col = false` - as the
+ * equality core's match_boolean_index_clause() hands an index scan.  Any
+ * other clause is itself, bare.
+ */
+Node *
+lion_canonical_clause(Node *clause)
+{
+	Node	   *arr;
+	Node	   *arg;
+	Node	   *bare;
+	bool		val = true;
+
+	if (clause != NULL && IsA(clause, RestrictInfo))
+		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	if (clause == NULL)
+		return NULL;
+	if ((arr = lion_or_as_array(clause)) != NULL)
+		return arr;
+
+	arg = clause;
+	if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == NOT_EXPR &&
+		list_length(((BoolExpr *) clause)->args) == 1)
+	{
+		arg = (Node *) linitial(((BoolExpr *) clause)->args);
+		val = false;
+	}
+	else if (IsA(clause, BooleanTest) &&
+			 (((BooleanTest *) clause)->booltesttype == IS_TRUE ||
+			  ((BooleanTest *) clause)->booltesttype == IS_FALSE))
+	{
+		arg = (Node *) ((BooleanTest *) clause)->arg;
+		val = (((BooleanTest *) clause)->booltesttype == IS_TRUE);
+	}
+	bare = arg;
+	while (bare != NULL && IsA(bare, RelabelType))
+		bare = (Node *) ((RelabelType *) bare)->arg;
+	if (bare != NULL && IsA(bare, Var) &&
+		getBaseType(exprType(bare)) == BOOLOID)
+		return (Node *) make_opclause(BooleanEqualOperator, BOOLOID, false,
+									  (Expr *) arg,
+									  (Expr *) makeBoolConst(val, false),
+									  InvalidOid, InvalidOid);
+	return clause;
+}
+
+#if PG_VERSION_NUM < 180000
+/* Where ptr is in list, by pointer, or -1. */
+static int
+lion_list_position(List *list, void *ptr)
+{
+	ListCell   *lc;
+
+	foreach(lc, list)
+	{
+		if (lfirst(lc) == ptr)
+			return foreach_current_index(lc);
+	}
+	return -1;
+}
+
+/*
+ * Does the list arr - lion_or_as_array()'s - name a key column of one of the
+ * lion indexes, under an operator of its family and a collation it matches:
+ * would 18's match_orclause_to_indexcol() match the OR to it?
+ */
+static bool
+lion_or_list_matches(Node *arr, List *lionidx)
+{
+	ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) arr;
+	Node	   *expr = (Node *) linitial(saop->args);
+	ListCell   *lc;
+
+	foreach(lc, lionidx)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			c;
+
+		for (c = 0; c < idx->nkeycolumns; c++)
+		{
+			if (match_index_to_operand(expr, c, idx) &&
+				op_in_opfamily(saop->opno, idx->opfamily[c]) &&
+				(!OidIsValid(idx->indexcollations[c]) ||
+				 idx->indexcollations[c] == saop->inputcollid))
+				return true;
+		}
+	}
+	return false;
+}
+
+/* Does the path's tree answer one of the lists (their RestrictInfos)? */
+static bool
+lion_or_list_uses(Path *p, List *lists)
+{
+	ListCell   *lc;
+
+	if (IsA(p, BitmapHeapPath))
+		return lion_or_list_uses(((BitmapHeapPath *) p)->bitmapqual, lists);
+	if (IsA(p, BitmapAndPath) || IsA(p, BitmapOrPath))
+	{
+		List	   *quals = IsA(p, BitmapAndPath) ?
+			((BitmapAndPath *) p)->bitmapquals :
+			((BitmapOrPath *) p)->bitmapquals;
+
+		foreach(lc, quals)
+		{
+			if (lion_or_list_uses((Path *) lfirst(lc), lists))
+				return true;
+		}
+		return false;
+	}
+	if (IsA(p, IndexPath))
+	{
+		foreach(lc, ((IndexPath *) p)->indexclauses)
+		{
+			if (list_member_ptr(lists, ((IndexClause *) lfirst(lc))->rinfo))
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Hand a path built on the scratch copy back to rel: its IndexPaths to the
+ * indexes they copied, and each IndexClause of a list to the OR restriction
+ * the list stands for, the list its index qual - 18's IndexClause.
+ */
+static void
+lion_or_list_restore(Path *p, RelOptInfo *rel, List *copies, List *indexes,
+					 List *lists, List *ors)
+{
+	ListCell   *lc;
+
+	if (IsA(p, BitmapHeapPath))
+	{
+		p->parent = rel;
+		lion_or_list_restore(((BitmapHeapPath *) p)->bitmapqual, rel, copies,
+							 indexes, lists, ors);
+	}
+	else if (IsA(p, BitmapAndPath) || IsA(p, BitmapOrPath))
+	{
+		List	   *quals = IsA(p, BitmapAndPath) ?
+			((BitmapAndPath *) p)->bitmapquals :
+			((BitmapOrPath *) p)->bitmapquals;
+
+		p->parent = rel;
+		foreach(lc, quals)
+			lion_or_list_restore((Path *) lfirst(lc), rel, copies, indexes,
+								 lists, ors);
+	}
+	else if (IsA(p, IndexPath))
+	{
+		IndexPath  *ipath = (IndexPath *) p;
+		int			i = lion_list_position(copies, ipath->indexinfo);
+
+		p->parent = rel;
+		if (i >= 0)
+			ipath->indexinfo = (IndexOptInfo *) list_nth(indexes, i);
+		foreach(lc, ipath->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			int			j = lion_list_position(lists, iclause->rinfo);
+
+			if (j >= 0)
+				iclause->rinfo = (RestrictInfo *) list_nth(ors, j);
+		}
+	}
+}
+
+/*
+ * PostgreSQL 16 and 17: the lion index paths of rel that answer an OR of
+ * equalities as the IN list it spells (lion_or_as_array(), DESIGN.md §29.11,
+ * "An OR of equalities is its IN list").  18 matches such an OR to an index
+ * column as that list (match_orclause_to_indexcol()): an IndexClause whose
+ * rinfo is the OR restriction and whose index qual is the list, not lossy.
+ * 16 and 17 match it to nothing but the arms of a BitmapOr, so that
+ * `k IN (1, 7)` was ANDed with the other clauses in one lion scan and
+ * `k = 1 OR k = 7` was left to the heap filter, or to a BitmapOr of a scan per
+ * arm.  These are the paths 18 builds, built as LionOrdered builds its lion
+ * side: create_index_paths() on a scratch copy of rel that sees the given lion
+ * indexes, with each such OR replaced by its list among their restriction
+ * clauses and no join clause - then handed back to rel, each list's
+ * IndexClause pointing to the OR as 18's does, so that the plan's index
+ * condition is the list, its recheck the OR, and neither is left to the
+ * filter.  Unparameterized, non-partial paths only, and only those that
+ * answer a list; NIL when no OR of rel spells one for a key column of the
+ * indexes.  A path of the others is one core has built already.
+ */
+List *
+lion_or_list_paths(PlannerInfo *root, RelOptInfo *rel, List *lionidx)
+{
+	List	   *ors = NIL;
+	List	   *lists = NIL;
+	List	   *canon = NIL;
+	List	   *copies = NIL;
+	List	   *result = NIL;
+	RelOptInfo *scratch;
+	ListCell   *lc;
+
+	if (lionidx == NIL || rel->reloptkind != RELOPT_BASEREL ||
+		!bms_is_empty(rel->lateral_relids))
+		return NIL;
+
+	/*
+	 * Not beside a security barrier's or a row-level policy's quals, whose
+	 * order against the lists core's matching would have to keep: those
+	 * relations keep the paths core builds.
+	 */
+	foreach(lc, rel->baserestrictinfo)
+	{
+		if (lfirst_node(RestrictInfo, lc)->security_level > 0)
+			return NIL;
+	}
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Node	   *arr = rinfo->pseudoconstant ? NULL :
+			lion_or_as_array((Node *) rinfo);
+
+		if (arr != NULL && lion_or_list_matches(arr, lionidx))
+		{
+			RestrictInfo *lrinfo = make_simple_restrictinfo(root, (Expr *) arr);
+
+			lrinfo->security_level = rinfo->security_level;
+			ors = lappend(ors, rinfo);
+			lists = lappend(lists, lrinfo);
+			canon = lappend(canon, lrinfo);
+		}
+		else
+			canon = lappend(canon, rinfo);
+	}
+	if (ors == NIL)
+	{
+		list_free(canon);
+		return NIL;
+	}
+
+	/* the indexes, their restriction clauses with the lists for the ORs */
+	foreach(lc, lionidx)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		IndexOptInfo *copy = makeNode(IndexOptInfo);
+		ListCell   *lc2;
+
+		memcpy(copy, idx, sizeof(IndexOptInfo));
+		copy->indrestrictinfo = NIL;
+		foreach(lc2, idx->indrestrictinfo)
+		{
+			int			i = lion_list_position(ors, lfirst(lc2));
+
+			copy->indrestrictinfo = lappend(copy->indrestrictinfo,
+											i >= 0 ? list_nth(lists, i) :
+											lfirst(lc2));
+		}
+		copies = lappend(copies, copy);
+	}
+
+	scratch = makeNode(RelOptInfo);
+	memcpy(scratch, rel, sizeof(RelOptInfo));
+	scratch->indexlist = copies;
+	scratch->baserestrictinfo = canon;
+	scratch->pathlist = NIL;
+	scratch->ppilist = NIL;
+	scratch->partial_pathlist = NIL;
+	scratch->cheapest_startup_path = NULL;
+	scratch->cheapest_total_path = NULL;
+	scratch->cheapest_parameterized_paths = NIL;
+	scratch->joininfo = NIL;
+	scratch->has_eclass_joins = false;
+	scratch->consider_parallel = false;
+	create_index_paths(root, scratch);
+
+	foreach(lc, scratch->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (p->param_info != NULL || !lion_or_list_uses(p, lists))
+			continue;
+		lion_or_list_restore(p, rel, copies, lionidx, lists, ors);
+		result = lappend(result, p);
+	}
+	return result;
+}
+#endif
+
+/* ---------------------------------------------------------------------
  * The intersection probe (DESIGN.md §29.11, "Correlated sets")
  * --------------------------------------------------------------------- */
 
@@ -1286,11 +1707,15 @@ lion_probe_end(void)
  *	  of no more container keys than that.  The strata still ahead widen when
  *	  the samples so far, at what they cost, would overrun the probe's
  *	  budget, and a driver that lies in a few strata only is sampled again,
- *	  in strata of its own stretch;
- *	- LION_ISECT_MAX_SETS sets located, LION_ISECT_BUFFERS buffer accesses a
- *	  probe and LION_ISECT_RUN_BUFFERS a planner run, or the probe gives up
- *	  and core's estimate stands; LION_ISECT_RUN_PROBES probes a planner run,
- *	  each conjunction measured once in it;
+ *	  in strata of its own stretch.  A set is sought there by a descent of
+ *	  its posting tree, the strata being many leaves apart;
+ *	- LION_ISECT_MAX_SETS sets located, LION_ISECT_RUN_BUFFERS buffer
+ *	  accesses a planner run, of which a probe may take what is left - the
+ *	  relation's own conjunction first - and gives up as soon as it cannot
+ *	  afford LION_ISECT_MIN_KEYS samples, core's estimate, or what the run
+ *	  measured of a part of the conjunction, standing (lion_isect_part_factor());
+ *	  LION_ISECT_RUN_PROBES probes a planner run, each conjunction measured
+ *	  once in it;
  *	- no heap page is read, and no lock or pin is held between two containers:
  *	  the sets are located and let go of before the first container is read,
  *	  and the streams copy each posting leaf and release it (DESIGN.md §29.5).
@@ -1332,19 +1757,26 @@ bool		lion_enable_intersection_probe = true;
 #define LION_ISECT_MAX_SETS		32
 
 /*
- * The buffer accesses one probe may make, locating the sets and seeking them,
- * and all of a planner run's probes together, before a probe gives up and
- * core's estimate stands.  The bound is checked before each clause is located
- * and before each sample, so a probe overruns it by one clause's lookups (an
- * IN list of LION_ISECT_MAX_SETS values) or one sample's seeks at most, and
- * the strata ahead widen to keep a sample's worth of it to spare
- * (lion_isect_pass()).  Measured (DESIGN.md §29.11): 6 to 90 accesses a probe
- * on 100k rows and 13 to 240 on 2M rows - where the first version's 64
- * containers took up to 547 - so a probe's bound is the dearest measured, and
- * the run's four of them: a millisecond or two of shared-buffer hits, or that
- * many reads on a cold cache.
+ * The sampled containers that must keep a row of the AND for the probe to
+ * raise an estimate: fewer is a sample whose error is as large as what it
+ * says (lion_isect_factor_run()).
  */
-#define LION_ISECT_BUFFERS		256
+#define LION_ISECT_MIN_HITS		3
+
+/*
+ * The buffer accesses all of a planner run's probes together may make,
+ * locating their sets and seeking them, before a probe gives up and core's
+ * estimate stands.  A probe may take whatever the run has left: the bound is
+ * checked before each clause is located and before each sample, so a probe
+ * overruns it by one clause's lookups (an IN list of LION_ISECT_MAX_SETS
+ * values) or one sample's seeks at most, and the strata ahead widen to keep a
+ * sample's worth of it to spare (lion_isect_pass()).  Measured (DESIGN.md
+ * §29.11, "Wide filters"): 6 to 90 accesses a probe on 100k rows and 13 to
+ * 240 on 2M rows; twenty sets of 6M rows 352 to 412, thirty-two 542 to 602 -
+ * which a probe's own bound of 256 used to stop short of: the probe gave up
+ * on the wide, correlated filters it exists for.  A millisecond or two of
+ * shared-buffer hits, or that many reads on a cold cache.
+ */
 #define LION_ISECT_RUN_BUFFERS	1024
 
 /* The probes one planner run makes: a conjunction is measured once in it. */
@@ -1379,6 +1811,8 @@ typedef struct LionIsect
 	AttrNumber *cols;
 	Node	  **clauses;		/* bare, in the cache's memory */
 	double		factor;			/* core's estimate is multiplied by it */
+	bool		measured;		/* by a probe of its own, or taken from a
+								 * part of it (lion_isect_part_factor()) */
 } LionIsect;
 
 static Node *
@@ -1402,7 +1836,10 @@ lion_isect_strip(Node *node)
  * look up now - an equality or a multi-key query with a constant, an IN list
  * of at most LION_ISECT_MAX_SETS constants, `IS NULL` - and what is it as the
  * scan's key?  The indexed expression may stand on either side of an
- * operator, as core matches it (match_index_to_operand()).
+ * operator, as core matches it (match_index_to_operand()).  The clause is
+ * taken in its canonical form (lion_canonical_clause()): an OR of equalities
+ * on the column is the IN list it spells, and `NOT col` of a boolean column
+ * is `col = false`, as an index scan is handed them.
  */
 static bool
 lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
@@ -1420,7 +1857,9 @@ lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
 	Oid			lefttype;
 	Oid			righttype;
 
-	clause = lion_isect_bare(clause);
+	clause = lion_canonical_clause(clause);
+	if (clause == NULL)
+		return false;
 	if (IsA(clause, NullTest))
 	{
 		NullTest   *nt = (NullTest *) clause;
@@ -1518,6 +1957,7 @@ typedef struct LionIsectSample
 	double		drvrows;		/* the driver's rows in the containers sampled */
 	double		androws;		/* ... and those the AND kept */
 	int			nsampled;		/* the containers sampled */
+	int			hits;			/* ... and those in which the AND kept a row */
 	uint32		first;			/* ... the first of them */
 	double		end;			/* the key past the last one's stratum */
 } LionIsectSample;
@@ -1591,6 +2031,8 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
 			s->tmp = swap;
 		}
 		s->androws += survive * stride;
+		if (survive > 0)
+			s->hits++;
 		s->nsampled++;
 		taken++;
 
@@ -1598,7 +2040,13 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
 		 * The next stratum's first key, past this container in any case -
 		 * unless the strata left before end would cost more than the budget
 		 * has left, at what a sample has cost so far: then those fit it,
-		 * wider, with a sample's worth to spare.
+		 * wider, with a sample's worth to spare - or, when even that would
+		 * leave the pass short of LION_ISECT_MIN_KEYS samples, the probe gives
+		 * up now, and what it has not spent is left to the run's other probes
+		 * (DESIGN.md §29.11, "Wide filters").  Before, a probe that could not
+		 * afford its samples read to the end of its budget first, and one that
+		 * could afford a few took them: four containers of a wide filter's
+		 * arm, none of which held a row of the AND, measured it empty.
 		 */
 		next = Max(lo + (floor(((double) c->ckey - lo) / stride) + 1.0) *
 				   stride, (double) c->ckey + 1.0);
@@ -1607,7 +2055,7 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
 									 (lion_isect_buffers() - s->start)) / per) - 1.0;
 		if (next < end && (end - next) / stride > affordable)
 		{
-			if (affordable < 1.0)
+			if (affordable < 1.0 || taken + affordable < LION_ISECT_MIN_KEYS)
 				return taken >= LION_ISECT_MIN_KEYS;
 			stride = Max((end - (double) c->ckey - 1.0) / affordable, 1.0);
 			next = (double) c->ckey + 1.0;
@@ -1624,12 +2072,14 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
  * sets' exact count when that is its rows (one set, or an IN list's disjoint
  * entries), core's estimate of it otherwise (a multi-key query's keys
  * overlap).  At most `budget` buffer accesses, and *used says how many it
- * made; false when a bound was reached first.
+ * made; false when a bound was reached first.  *hits is how many of the
+ * containers sampled kept a row of the AND - INT_MAX when every container of
+ * the heap was one, and the AND is counted rather than sampled.
  */
 static bool
 lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 				   LionIsectClause *cl, int64 budget, double *probesel,
-				   int64 *used)
+				   int64 *used, int *hits)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "lion intersection probe",
@@ -1647,7 +2097,7 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 	double		tuples = Max(rel->tuples, 1.0);
 	double		ckeys = Max(ceil((double) rel->pages / LION_BLOCKS_PER_CONTAINER),
 							1.0);
-	double		stride;
+	double		stride = 1.0;
 	int			keys;
 	int			totalsets = 0;
 	int			driver = 0;
@@ -1693,6 +2143,19 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 
 	if (ok && !empty)
 	{
+		/*
+		 * The heap's container keys in `keys` strata, and the driver's first
+		 * container in each: every container, when there are no more keys
+		 * than strata.  A heap grown past rel->pages makes more strata than
+		 * that, up to twice as many before the probe gives up.  Strata of
+		 * several container keys each are as many posting leaves apart, and
+		 * a set is sought there by a descent of its tree, not by stepping
+		 * right (lion_stream_far()).
+		 */
+		keys = Min(LION_ISECT_KEYS,
+				   Max(LION_ISECT_MIN_KEYS, LION_ISECT_SEEKS / Max(totalsets, 1)));
+		stride = Max(ckeys / (double) keys, 1.0);
+
 		/* the driver is the set of the fewest rows; the others by their rows */
 		for (i = 0; i < n; i++)
 		{
@@ -1702,18 +2165,11 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 				s.order[k] = s.order[k - 1];
 			s.order[k] = i;
 			s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i], false);
+			if (stride > 1.0)
+				lion_stream_far(s.st[i]);
 		}
 		driver = s.order[0];
 
-		/*
-		 * The heap's container keys in `keys` strata, and the driver's first
-		 * container in each: every container, when there are no more keys
-		 * than strata.  A heap grown past rel->pages makes more strata than
-		 * that, up to twice as many before the probe gives up.
-		 */
-		keys = Min(LION_ISECT_KEYS,
-				   Max(LION_ISECT_MIN_KEYS, LION_ISECT_SEEKS / Max(totalsets, 1)));
-		stride = Max(ckeys / (double) keys, 1.0);
 		ok = lion_isect_pass(&s, 0.0, LION_ISECT_KEY_END, ckeys, keys);
 
 		/*
@@ -1734,11 +2190,13 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 			{
 				lion_stream_end(s.st[i]);
 				s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i], false);
+				lion_stream_far(s.st[i]);
 				s.done[i] = false;
 			}
 			again.drvrows = 0;
 			again.androws = 0;
 			again.nsampled = 0;
+			again.hits = 0;
 			if (lion_isect_pass(&again, lo, hi, hi, keys))
 				s = again;
 		}
@@ -1755,6 +2213,7 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 			rows = s.androws / s.drvrows *
 				(exact[driver] ? ntids[driver] : cl[driver].sel * tuples);
 		*probesel = Min(rows / tuples, 1.0);
+		*hits = (stride <= 1.0) ? INT_MAX : s.hits;
 	}
 	*used = lion_isect_buffers() - buffers;
 
@@ -1843,6 +2302,168 @@ lion_isect_same(LionIsect *e, IndexOptInfo *idx, int n, LionIsectClause *cl)
 	return same;
 }
 
+/* Is every clause of e among the n clauses cl (on e's index)? */
+static bool
+lion_isect_holds(LionIsect *e, int n, LionIsectClause *cl)
+{
+	int			i;
+	int			j;
+
+	for (j = 0; j < e->n; j++)
+	{
+		bool		found = false;
+
+		for (i = 0; i < n && !found; i++)
+			found = (cl[i].col == e->cols[j] &&
+					 equal(lion_isect_bare(cl[i].clause), e->clauses[j]));
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/* ... and every one of the n clauses among e's? */
+static bool
+lion_isect_within(LionIsect *e, int n, LionIsectClause *cl)
+{
+	int			i;
+	int			j;
+
+	for (i = 0; i < n; i++)
+	{
+		bool		found = false;
+
+		for (j = 0; j < e->n && !found; j++)
+			found = (cl[i].col == e->cols[j] &&
+					 equal(lion_isect_bare(cl[i].clause), e->clauses[j]));
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * What a conjunction the run could not measure is taken to be, from the ones
+ * it did measure on the same index: between the largest of them that is a
+ * part of it and the smallest it is a part of, geometrically in the number of
+ * clauses - the factor that grows from the part's to the whole's as clauses
+ * are added, each clause its share of it.  With a part only, the part's: its
+ * other clauses independent of those, as core takes them and as the probe's
+ * factor takes a range or a clause it has no value for (lion_isect_factor());
+ * with a whole only, from 1 at one clause; with neither, 1.  A filter's
+ * conjunction and the ones its paths answer share most of their clauses: on
+ * the repro of DESIGN.md §29.11, "Wide filters", the five clauses beside four
+ * lists measured 3.1, all nine 186, and the five with one list 9.1, where this
+ * says 8.6.
+ */
+static double
+lion_isect_part_factor(LionProbeCache *cache, IndexOptInfo *idx, int n,
+					   LionIsectClause *cl)
+{
+	LionIsect  *part = NULL;
+	LionIsect  *whole = NULL;
+	double		lo;
+	double		lon;
+	ListCell   *lc;
+
+	foreach(lc, cache->isects)
+	{
+		LionIsect  *e = (LionIsect *) lfirst(lc);
+
+		if (!e->measured || e->indexoid != idx->indexoid)
+			continue;
+		if (e->n < n && (part == NULL || e->n > part->n) &&
+			lion_isect_holds(e, n, cl))
+			part = e;
+		else if (e->n > n && (whole == NULL || e->n < whole->n) &&
+				 lion_isect_within(e, n, cl))
+			whole = e;
+	}
+	lo = (part != NULL) ? part->factor : 1.0;
+	lon = (part != NULL) ? (double) part->n : 1.0;
+	if (whole == NULL || whole->factor <= 0.0 || lo <= 0.0)
+		return lo;
+	return lo * pow(whole->factor / lo,
+					((double) n - lon) / ((double) whole->n - lon));
+}
+
+/*
+ * The IN list that an arm of one of rel's ORs of equalities is a part of
+ * (lion_or_as_array()), or NULL: a clause that is itself one of rel's
+ * restriction clauses, or no such arm.  Core builds a path per arm of an OR
+ * for a BitmapOr, each ANDing the arm with the clauses beside the OR, and
+ * lion's estimate of each is its share of the conjunction with the whole list
+ * in its place (lion_isect_factor_run()).
+ */
+static Node *
+lion_or_arm_list(RelOptInfo *rel, Node *clause)
+{
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		if (equal(((RestrictInfo *) lfirst(lc))->clause, clause))
+			return NULL;
+	}
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		ListCell   *la;
+
+		if (!is_orclause(rinfo->clause))
+			continue;
+		foreach(la, ((BoolExpr *) rinfo->clause)->args)
+		{
+			if (equal(lfirst(la), clause))
+				return lion_or_as_array((Node *) rinfo);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The set clauses among rel's own restriction clauses that lion index idx
+ * answers - each at the first key column it is a set clause of
+ * (lion_isect_scankey()), the RestrictInfo itself in *clauses - and how many
+ * there are.  *cols and *clauses are palloc'd.
+ */
+static int
+lion_isect_rel_clauses(RelOptInfo *rel, IndexOptInfo *idx, AttrNumber **cols,
+					   Node ***clauses)
+{
+	int			n = 0;
+	ListCell   *lc;
+
+	*cols = (AttrNumber *) palloc(sizeof(AttrNumber) *
+								  Max(list_length(rel->baserestrictinfo), 1));
+	*clauses = (Node **) palloc(sizeof(Node *) *
+								Max(list_length(rel->baserestrictinfo), 1));
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		ScanKeyData skey;
+		int			c;
+
+		if (rinfo->pseudoconstant)
+			continue;
+		for (c = 0; c < idx->nkeycolumns; c++)
+		{
+			if (lion_isect_scankey(idx, c, (Node *) rinfo, &skey))
+			{
+				(*cols)[n] = (AttrNumber) (c + 1);
+				(*clauses)[n++] = (Node *) rinfo;
+				break;
+			}
+		}
+	}
+	return n;
+}
+
+static double lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel,
+									IndexOptInfo *idx, int n,
+									const AttrNumber *cols, Node **clauses,
+									bool relfirst);
+
 /*
  * What lion's estimate of the AND of the n clauses - RestrictInfos or bare
  * clauses, each on key column cols[i] (1-based) of lion index idx of rel - is
@@ -1857,6 +2478,25 @@ double
 lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				  int n, const AttrNumber *cols, Node **clauses)
 {
+	return lion_isect_factor_run(root, rel, idx, n, cols, clauses, true);
+}
+
+/*
+ * ... relfirst: before a conjunction not measured yet in this planner run is,
+ * the relation's OWN conjunction on idx - every set clause of its
+ * restriction clauses that idx answers (lion_isect_rel_clauses()) - is, when
+ * it is another one.  That is the AND the count pushdown makes and a scan of
+ * every clause makes, and it was the one left without a budget: core prices
+ * the paths of subsets first - an index path of the clauses its columns
+ * answer, each arm of a BitmapOr with the clauses beside it - and a filter
+ * written with ORs had its arms' conjunctions spend the run's budget before
+ * the relation's own was asked about (DESIGN.md §29.11, "Wide filters").
+ */
+static double
+lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					  int n, const AttrNumber *cols, Node **clauses,
+					  bool relfirst)
+{
 	LionProbeCache *cache;
 	LionIsectClause *cl;
 	LionIsect  *e = NULL;
@@ -1864,8 +2504,9 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	List	   *group = NIL;
 	Selectivity coresel;
 	Selectivity minsel = 1.0;
-	double		probesel;
+	double		probesel = 0.0;
 	double		factor = 1.0;
+	int			hits = 0;
 	int			ncl = 0;
 	int			i;
 	ListCell   *lc;
@@ -1885,19 +2526,51 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		rte->relkind == RELKIND_PARTITIONED_TABLE)
 		return 1.0;
 
-	/* the clauses it has a value to look up for */
+	/*
+	 * The clauses it has a value to look up for, each in its canonical form
+	 * (lion_canonical_clause()): an OR of equalities is estimated, measured
+	 * and remembered as the IN list it spells, so that the two spellings of
+	 * one filter are one conjunction here - core estimates the OR as though
+	 * its arms could overlap, and the list as the disjoint entries they are.
+	 *
+	 * And an arm of such an OR (lion_or_arm_list()) - what the path of one
+	 * arm of a BitmapOr answers - is the whole list here: the conjunction
+	 * measured is the one with the list in the arm's place, and its factor is
+	 * applied to core's estimate of the arm's, which is the list's times the
+	 * arm's share of it.  The arm's rows are then the list's share, as the
+	 * probe found them, and each OR of the filter costs the run one
+	 * conjunction to measure however many arms it has - the relation's own,
+	 * once the others are lists as well - where each arm used to cost one.
+	 */
 	cl = (LionIsectClause *) palloc(sizeof(LionIsectClause) * n);
 	for (i = 0; i < n; i++)
 	{
+		Node	   *canon;
+		Node	   *list;
+		bool		dup = false;
+		int			j;
+
 		if (cols[i] < 1 || cols[i] > idx->nkeycolumns ||
 			!lion_isect_scankey(idx, cols[i] - 1, clauses[i], &cl[ncl].skey))
 			continue;
+		canon = lion_canonical_clause(clauses[i]);
+		if ((list = lion_or_arm_list(rel, canon)) != NULL &&
+			lion_isect_scankey(idx, cols[i] - 1, list, &cl[ncl].skey))
+		{
+			for (j = 0; j < ncl && !dup; j++)
+				dup = (cl[j].col == cols[i] &&
+					   equal(lion_isect_bare(cl[j].clause), list));
+			if (dup)
+				continue;
+			canon = list;
+		}
 		cl[ncl].col = cols[i];
-		cl[ncl].clause = clauses[i];
-		cl[ncl].sel = clause_selectivity(root, clauses[i], 0, JOIN_INNER,
+		cl[ncl].clause = (canon == lion_isect_bare(clauses[i])) ?
+			clauses[i] : canon;
+		cl[ncl].sel = clause_selectivity(root, cl[ncl].clause, 0, JOIN_INNER,
 										 NULL);
 		minsel = Min(minsel, cl[ncl].sel);
-		group = lappend(group, clauses[i]);
+		group = lappend(group, cl[ncl].clause);
 		ncl++;
 	}
 
@@ -1925,6 +2598,32 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			break;
 		}
 	}
+
+	/* the relation's own conjunction first, when this is another one */
+	if (e == NULL && relfirst)
+	{
+		AttrNumber *relcols;
+		Node	  **relclauses;
+		int			nrel = lion_isect_rel_clauses(rel, idx, &relcols,
+												  &relclauses);
+
+		if (nrel >= 2)
+		{
+			(void) lion_isect_factor_run(root, rel, idx, nrel, relcols,
+										 relclauses, false);
+			foreach(lc, cache->isects)
+			{
+				if (lion_isect_same((LionIsect *) lfirst(lc), idx, ncl, cl))
+				{
+					e = (LionIsect *) lfirst(lc);
+					break;
+				}
+			}
+		}
+		pfree(relcols);
+		pfree(relclauses);
+	}
+
 	if (e == NULL)
 	{
 		MemoryContext oldcxt;
@@ -1934,17 +2633,33 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		if (cache->nisectprobes >= LION_ISECT_RUN_PROBES ||
 			cache->isectbuffers >= LION_ISECT_RUN_BUFFERS)
 		{
+			factor = lion_isect_part_factor(cache, idx, ncl, cl);
 			pfree(cl);
-			return 1.0;
+			return factor;
 		}
 		cache->nisectprobes++;
 
+		/* whatever the run has left (DESIGN.md §29.11, "Wide filters") */
 		measured = lion_isect_measure(rel, idx, ncl, cl,
-									  Min(LION_ISECT_BUFFERS,
-										  LION_ISECT_RUN_BUFFERS -
-										  cache->isectbuffers),
-									  &probesel, &used);
+									  LION_ISECT_RUN_BUFFERS -
+									  cache->isectbuffers,
+									  &probesel, &used, &hits);
 		cache->isectbuffers += used;
+
+		/*
+		 * A sample in which fewer than LION_ISECT_MIN_HITS containers kept a
+		 * row of the AND says little of how many rows it holds, and nothing
+		 * of more rows than core's product: on a heap whose rows lie in
+		 * stretches of their hidden group, the eight containers of a wide
+		 * filter's sample met the few stretches that hold its rows once or
+		 * not at all, and the one that did stood for its whole stratum -
+		 * twenty-two times the rows (DESIGN.md §29.11, "Wide filters").
+		 * Such a measure raises no estimate; one that lowers it stands, as
+		 * it always did.
+		 */
+		if (measured && hits < LION_ISECT_MIN_HITS &&
+			Min(probesel, minsel) >= coresel * LION_ISECT_ERROR)
+			measured = false;
 		if (measured)
 		{
 			probesel = Min(probesel, minsel);
@@ -1952,6 +2667,8 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				probesel * LION_ISECT_ERROR <= coresel)
 				factor = probesel / coresel;
 		}
+		else
+			factor = lion_isect_part_factor(cache, idx, ncl, cl);
 
 		oldcxt = MemoryContextSwitchTo(cache->cxt);
 		e = (LionIsect *) palloc(sizeof(LionIsect));
@@ -1965,6 +2682,7 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			e->clauses[i] = (Node *) copyObject(lion_isect_bare(cl[i].clause));
 		}
 		e->factor = factor;
+		e->measured = measured;
 		cache->isects = lappend(cache->isects, e);
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -1980,7 +2698,6 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 static double
 lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 {
-	int			nclauses = list_length(rel->baserestrictinfo);
 	Oid			amoid;
 	IndexOptInfo *best = NULL;
 	AttrNumber *bestcols = NULL;
@@ -1989,7 +2706,8 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 	double		factor = 1.0;
 	ListCell   *lc;
 
-	if (!lion_enable_intersection_probe || nclauses < 2 ||
+	if (!lion_enable_intersection_probe ||
+		list_length(rel->baserestrictinfo) < 2 ||
 		rel->reloptkind == RELOPT_JOINREL || rel->indexlist == NIL)
 		return 1.0;
 
@@ -1999,29 +2717,11 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
 		AttrNumber *cols;
 		Node	  **clauses;
-		int			n = 0;
-		ListCell   *lc2;
+		int			n;
 
 		if (idx->relam != amoid || idx->hypothetical || idx->indpred != NIL)
 			continue;
-		cols = (AttrNumber *) palloc(sizeof(AttrNumber) * nclauses);
-		clauses = (Node **) palloc(sizeof(Node *) * nclauses);
-		foreach(lc2, rel->baserestrictinfo)
-		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
-			ScanKeyData skey;
-			int			c;
-
-			for (c = 0; c < idx->nkeycolumns; c++)
-			{
-				if (lion_isect_scankey(idx, c, (Node *) rinfo, &skey))
-				{
-					cols[n] = (AttrNumber) (c + 1);
-					clauses[n++] = (Node *) rinfo;
-					break;
-				}
-			}
-		}
+		n = lion_isect_rel_clauses(rel, idx, &cols, &clauses);
 		if (n > bestn)
 		{
 			best = idx;
@@ -2032,9 +2732,46 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	if (best != NULL && bestn >= 2)
-		factor = lion_isect_factor(root, rel, best, bestn, bestcols,
-								   bestclauses);
+		factor = lion_isect_factor_run(root, rel, best, bestn, bestcols,
+									   bestclauses, false);
 	return factor;
+}
+
+double
+lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel)
+{
+	if (root == NULL)
+		return 1.0;
+	return lion_isect_rel_factor(root, rel);
+}
+
+/*
+ * rel's restriction clauses as lion's estimates take them: an OR of
+ * equalities as the IN list it spells (lion_or_as_array()), every other
+ * clause as it is; and whether any of them differs from core's.
+ */
+static List *
+lion_rel_canonical_clauses(RelOptInfo *rel, bool *changed)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	*changed = false;
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Node	   *arr = rinfo->pseudoconstant ? NULL :
+			lion_or_as_array((Node *) rinfo);
+
+		if (arr != NULL)
+		{
+			result = lappend(result, arr);
+			*changed = true;
+		}
+		else
+			result = lappend(result, rinfo);
+	}
+	return result;
 }
 
 /*
@@ -2043,31 +2780,48 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
  * with the probed ends, as set_baserel_size_estimates() computes rel->rows -
  * either of them times what the intersection probe found of the set clauses
  * among them (lion_isect_rel_factor()).  For a cost formula that reads the
- * rows the WHERE leaves: the count pushdown's recheck; the row count the
- * planner compares paths by stays core's.
+ * rows the WHERE leaves: the count pushdown's recheck, and LionOrdered's
+ * rows; the row count the planner compares paths by stays core's.
+ *
+ * An OR of equalities counts as the IN list it spells here too
+ * (lion_rel_canonical_clauses()): core estimates `k = 1 OR k = 7` as though
+ * the arms could overlap, 1 - (1 - s1)(1 - s2), and the list as the disjoint
+ * entries they are, s1 + s2, so the same filter came out with fewer rows
+ * written as an OR.  The rows are then computed as set_baserel_size_estimates()
+ * computes rel->rows, from the list.
  */
 double
 lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 {
 	LionProbeScope *scope;
 	double		rows = rel->rows;
+	List	   *canon = NIL;
+	bool		changed = false;
+	bool		scoped = false;
 
+	if (root == NULL)
+		return rows;
+	canon = lion_rel_canonical_clauses(rel, &changed);
 	for (scope = lion_probe_scope; scope != NULL; scope = scope->outer)
 	{
-		if (root != NULL && scope->glob == root->glob && scope->rti == rel->relid)
+		if (scope->glob == root->glob && scope->rti == rel->relid)
 		{
 			if (scope->rows < 0)
 				scope->rows = clamp_row_est(rel->tuples *
 											clauselist_selectivity(root,
-																   rel->baserestrictinfo,
+																   canon,
 																   0, JOIN_INNER,
 																   NULL));
 			rows = scope->rows;
+			scoped = true;
 			break;
 		}
 	}
-	if (root == NULL)
-		return rows;
+	if (!scoped && changed)
+		rows = clamp_row_est(rel->tuples *
+							 clauselist_selectivity(root, canon, 0,
+													JOIN_INNER, NULL));
+	list_free(canon);
 	return clamp_row_est(rows * lion_isect_rel_factor(root, rel));
 }
 
@@ -2175,6 +2929,34 @@ static void
 lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 							RangeTblEntry *rte)
 {
+#if PG_VERSION_NUM < 180000
+
+	/*
+	 * An OR of equalities as the index clause 18 matches it to: the paths
+	 * that answer it as the IN list it spells (lion_or_list_paths()), before
+	 * the plain ones among them pay their remainder below, as every plain
+	 * lion path does.
+	 */
+	if (rel->reloptkind == RELOPT_BASEREL && rte->rtekind == RTE_RELATION &&
+		rel->indexlist != NIL && !lion_old_snapshot_threshold_active())
+	{
+		Oid			amoid = lion_get_am_oid();
+		List	   *lionidx = NIL;
+		ListCell   *lc;
+
+		foreach(lc, rel->indexlist)
+		{
+			IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+			if (idx->relam == amoid && !idx->hypothetical)
+				lionidx = lappend(lionidx, idx);
+		}
+		foreach(lc, lion_or_list_paths(root, rel, lionidx))
+			add_path(rel, (Path *) lfirst(lc));
+		list_free(lionidx);
+	}
+#endif
+
 	if (root->glob != NULL && lion_probe_cache.glob == root->glob &&
 		lion_probe_cache.remainders != NIL)
 	{

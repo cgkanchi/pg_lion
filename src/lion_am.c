@@ -1937,7 +1937,8 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			}
 
 			setcost = lion_cost_set_and(root, index->rel, nsets, setidx,
-										setcols, (Node **) setquals, &setand);
+										setcols, (Node **) setquals, factor,
+										&setand);
 			if (loop_count > 1)
 				setcost = setand.cpu +
 					index_pages_fetched((setand.leafpages + setand.setpages) *
