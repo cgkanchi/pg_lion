@@ -312,6 +312,10 @@ SELECT lion_sj('SELECT d.region, d.grp, count(*) FROM lion_sd d WHERE EXISTS (SE
 SELECT lion_sj('SELECT d.grp, count(*) FROM lion_sd d WHERE d.pk IN (SELECT f.fk FROM lion_sf f WHERE f.t = ''t2'') GROUP BY d.grp ORDER BY count(*) DESC, d.grp LIMIT 2');
 -- count(1) and count of the key are count(*) here: every row has a match
 SELECT lion_sj('SELECT count(1), count(d.pk), count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 8)');
+-- a sum and a count of a nullable dimension column, over the join's rows as
+-- they stand (fkjoin_mixed.sql)
+SELECT lion_sj('SELECT sum(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
+SELECT lion_sj('SELECT count(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
 -- duplicated dimension keys are two rows, each tested on its own; a NULL key
 -- has no match
 CREATE INDEX lion_sdn_kl ON lion_sdn USING lion (k);
@@ -340,7 +344,8 @@ SELECT lion_sj('SELECT d.attr, count(*) FROM lion_sd d WHERE NOT EXISTS (SELECT 
 CREATE INDEX lion_sdn_kl ON lion_sdn USING lion (k);
 SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2 AND f.t = ''t1'')');
 SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 77)');
--- count of the key is not count(*) in an anti join: NULL keys are rows
+-- count of the key is not count(*) in an anti join: NULL keys are rows, so
+-- there it is the count of a dimension column, over the rows as they stand
 SELECT lion_sj('SELECT count(d.k), count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 SELECT lion_sj('SELECT count(1) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
 DROP INDEX lion_sdn_kl;
@@ -364,9 +369,8 @@ SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE NOT EXISTS (SELECT 1 FROM l
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3 AND d.attr = 2)');
 -- a fact filter the posting sets cannot answer
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.pad LIKE ''q%'')');
--- another aggregate, a nullable dimension column counted
-SELECT lion_sj('SELECT sum(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
-SELECT lion_sj('SELECT count(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
+-- another aggregate
+SELECT lion_sj('SELECT avg(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
 -- three relations
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3) AND EXISTS (SELECT 1 FROM lion_sdn n WHERE n.k = d.pk)');
 -- a subquery the planner cannot pull up

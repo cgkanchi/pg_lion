@@ -433,6 +433,21 @@ SELECT lion_dj('SELECT d.attr, count(DISTINCT d.k) FROM lion_ddn d WHERE d.k IN 
  pushed down, 4 rows
 (1 row)
 
+-- a count of rows beside a count of distinct values: an inner join's rows
+-- carry their counts, which the Agg adds up, and a semi join's rows are the
+-- join's own (fkjoin_mixed.sql)
+SELECT lion_dj('SELECT count(*), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_dj('SELECT count(*), count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
+       lion_dj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
 -- ---- 3. declined ---------------------------------------------------------------
 -- the key is not unique: the inner join counts a fact row once per duplicate
 -- and is declined, while the forward EXISTS stays a semi join whose inner side
@@ -450,20 +465,6 @@ SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f WHERE f.x = 3 AND EXI
 (1 row)
 
 DROP INDEX lion_ddn_kl;
--- a count of rows beside a count of distinct values: the rows stand for
--- dimension rows, not for pairs
-SELECT lion_dj('SELECT count(*), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
-         lion_dj         
--------------------------
- not pushed down, 1 rows
-(1 row)
-
-SELECT lion_dj('SELECT count(*), count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
-         lion_dj         
--------------------------
- not pushed down, 1 rows
-(1 row)
-
 -- a fact column that is not the join key
 SELECT lion_dj('SELECT count(DISTINCT f.x) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t3''');
          lion_dj         
