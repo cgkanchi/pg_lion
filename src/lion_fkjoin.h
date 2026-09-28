@@ -73,4 +73,13 @@ typedef struct LionFkJoin
 extern int	lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel,
 								  LionFkJoin *out);
 
+/*
+ * Whether rel's column attno is provably unique under the equality opno
+ * compares with, under that collation: the dimension-key proof of the join,
+ * which the count pushdown reuses for count(DISTINCT) of a unique column
+ * (DESIGN.md §26, "A unique column").
+ */
+extern bool lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
+								  Oid collation);
+
 #endif							/* LION_FKJOIN_H */

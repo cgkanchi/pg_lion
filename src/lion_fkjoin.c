@@ -100,29 +100,50 @@ lion_fkjoin_rel_ok(PlannerInfo *root, RelOptInfo *rel)
 }
 
 /*
- * Is the dimension's join column provably unique among the rows the child plan
- * can return - one dimension row per key value, under the join's equality?
+ * Is a column of rel provably unique among its rows - at most one row per
+ * value, under the equality `opno` compares with?  The FK-side join asks it of
+ * the dimension's join column, and the count pushdown of the dimension-free
+ * shapes asks it of the column of a count(DISTINCT col), which is then the
+ * count(col) of the same rows (DESIGN.md §26, "A unique column").
  *
  * A single-column btree index that is UNIQUE, enforced immediately (a
  * deferrable constraint may hold duplicates inside a transaction), not partial
- * and not hypothetical, on exactly that column, whose opfamily has the join
+ * and not hypothetical, on exactly that column, whose opfamily has the
  * operator as its equality strategy - so that "unique" is about the equality
- * the join compares with, cross-type members included - and whose collation
- * is the join clause's input collation.  The last one is the rule core's
+ * the caller compares with, cross-type members included - and whose collation
+ * is the caller's.  The last one is the rule core's
  * relation_has_unique_index_for() only acquired in PostgreSQL 19 (before that
  * it carries an XXX): a key that is unique under "C" is not unique under a
- * case-insensitive collation, where 'a' and 'A' are one value.
+ * case-insensitive collation, where 'a' and 'A' are one value.  NULLs do not
+ * count against uniqueness here (a unique index lets any number of them in
+ * unless it says NULLS NOT DISTINCT); both callers ignore NULL keys anyway.
+ *
+ * Only rel->indexlist is consulted, which get_relation_info() fills with the
+ * VALID indexes a query may rely on - one that CREATE INDEX CONCURRENTLY has
+ * not finished, or that is not yet safe to use under this transaction's
+ * snapshot, is left out of it.  For a partitioned parent it holds the
+ * PARTITIONED indexes (PostgreSQL 16 and later), and a unique one of those is
+ * a global proof: such an index must contain every partitioning column, so a
+ * single-column one is on the partition key itself, which keeps equal values
+ * in one partition, whose own unique index then holds them apart - the proof
+ * core's own join removal takes from the same list.  A unique index on a
+ * partition alone proves nothing about the parent.
+ *
+ * Nothing records that a plan relied on the index: dropping it (or the
+ * constraint behind it) sends a relcache invalidation for its table, which
+ * invalidates every cached plan that reads the table, exactly as for core's
+ * own uses of the proof.
  *
  * A multi-column unique index whose other columns the query pins to constants
  * would prove it too; v1 does not look for one.
  */
-static bool
-lion_fkjoin_dim_unique(RelOptInfo *dimrel, Var *pkvar, Oid opno,
-					   Oid collation)
+bool
+lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
+					  Oid collation)
 {
 	ListCell   *lc;
 
-	foreach(lc, dimrel->indexlist)
+	foreach(lc, rel->indexlist)
 	{
 		IndexOptInfo *ind = (IndexOptInfo *) lfirst(lc);
 
@@ -130,7 +151,7 @@ lion_fkjoin_dim_unique(RelOptInfo *dimrel, Var *pkvar, Oid opno,
 			continue;
 		if (ind->indpred != NIL || ind->relam != BTREE_AM_OID)
 			continue;
-		if (ind->nkeycolumns != 1 || ind->indexkeys[0] != pkvar->varattno)
+		if (ind->nkeycolumns != 1 || ind->indexkeys[0] != attno)
 			continue;
 		if (get_op_opfamily_strategy(opno, ind->opfamily[0]) !=
 			BTEqualStrategyNumber)
@@ -332,8 +353,8 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 			if ((int) fact->relid != semifact)
 				continue;
 		}
-		else if (!lion_fkjoin_dim_unique(dim, argvar[di], op->opno,
-										 op->inputcollid))
+		else if (!lion_column_is_unique(dim, argvar[di]->varattno, op->opno,
+										op->inputcollid))
 			continue;
 		if (dim->cheapest_total_path == NULL ||
 			dim->cheapest_total_path->param_info != NULL)

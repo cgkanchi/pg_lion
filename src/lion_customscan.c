@@ -2035,6 +2035,36 @@ lion_notnullattnums(PlannerInfo *root, RelOptInfo *rel)
 #endif
 }
 
+static bool lion_agg_distinct_var(Aggref *agg, Index rti, Var **var,
+								  Oid *eqop, Oid *collation);
+
+/*
+ * Is the aggregate a count(DISTINCT col) whose column is provably unique over
+ * rel (DESIGN.md §26, "A unique column")?  Then no two rows the node counts
+ * share a non-NULL value of col, so count(DISTINCT col) IS count(col) over the
+ * same rows - of every group, under any WHERE - and lion_agg_is_count() takes
+ * it as such: count(*), where col is also known non-NULL.
+ *
+ * The proof is the FK-side join's (lion_column_is_unique()): a single-column
+ * btree index on col that is unique, immediate, not partial and not an
+ * expression, whose opfamily has the DISTINCT's own equality as its equality
+ * strategy and whose collation is the DISTINCT's - the equality and collation
+ * nodeAgg would deduplicate the column under (lion_agg_distinct_var()).  For a
+ * partitioned parent rel is the parent, whose unique index is a global proof;
+ * a unique index on each partition is not one.
+ */
+static bool
+lion_agg_distinct_unique(Aggref *agg, Index rti, RelOptInfo *rel)
+{
+	Var		   *var;
+	Oid			eqop;
+	Oid			collation;
+
+	if (!lion_agg_distinct_var(agg, rti, &var, &eqop, &collation))
+		return false;
+	return lion_column_is_unique(rel, var->varattno, eqop, collation);
+}
+
 /*
  * Can the aggregate be answered by counting a posting set?
  *
@@ -2049,6 +2079,9 @@ lion_notnullattnums(PlannerInfo *root, RelOptInfo *rel)
  *	- col is the group column: the count of a non-NULL group is count(*), and
  *	  the NULL group's is 0;
  *	- a clause says `col IS NULL`: then it is 0 for every group.
+ *
+ * count(DISTINCT col) is count(col) when col is unique over rel
+ * (lion_agg_distinct_unique()), and then takes the same rules.
  */
 static bool
 lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti, RelOptInfo *rel,
@@ -2062,8 +2095,9 @@ lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti, RelOptInfo *rel,
 
 	if (agg->aggfnoid != F_COUNT_ && agg->aggfnoid != F_COUNT_ANY)
 		return false;
-	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
-		agg->aggfilter != NULL || agg->aggvariadic)
+	if (agg->aggorder != NIL || agg->aggfilter != NULL || agg->aggvariadic)
+		return false;
+	if (agg->aggdistinct != NIL && !lion_agg_distinct_unique(agg, rti, rel))
 		return false;
 	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE)
 		return false;
@@ -6751,6 +6785,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	Oid			distcoll = InvalidOid;
 	bool		distcounts = false; /* its walk must count, not test (§26) */
 	double		distest = 0;
+	List	   *uniqattnos = NIL;	/* columns of a count(DISTINCT) proved
+									 * unique: a count(col) each (§26) */
 	ListCell   *lc;
 
 	/* ---- the query as a whole ---- */
@@ -7263,6 +7299,25 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			continue;
 		if (!lion_agg_distinct_var(agg, rti, &dv, &deq, &dcoll))
 			return;
+
+		/*
+		 * A column the relation proves unique - a primary key, say - is not
+		 * k at all: its distinct count is the count(col) of the same rows
+		 * (lion_agg_distinct_unique()), answered wherever that count(col) is
+		 * - which is every row count when col is known non-NULL, and the
+		 * other cases of DESIGN.md §14.  Nothing is walked for it, so neither
+		 * partitions nor a second distinct column stand in its way.  One
+		 * whose count(col) the node cannot answer (a nullable unique column
+		 * nothing proves non-NULL) is left to be walked as k, as before.
+		 */
+		if (lion_column_is_unique(input_rel, dv->varattno, deq, dcoll) &&
+			lion_agg_is_count(root, agg, rti, input_rel, groupattno, ngroup,
+							  nonnullattnos, nullattnos))
+		{
+			uniqattnos = list_append_unique_int(uniqattnos,
+												(int) dv->varattno);
+			continue;
+		}
 		if (distvar == NULL)
 		{
 			distvar = dv;
@@ -7275,6 +7330,14 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 	if (distvar != NULL)
 	{
+		/*
+		 * The plan tells the two kinds apart by their column alone
+		 * (lion_plan_custom_path()), so one column is not both: a distinct
+		 * count proved unique under one collation beside a walked one under
+		 * another is left to the ordinary plan.
+		 */
+		if (list_member_int(uniqattnos, (int) distvar->varattno))
+			return;
 		if (partitioned || ngroup > 1)
 			return;
 		for (g = 0; g < ngroup; g++)
@@ -7330,8 +7393,14 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			Aggref	   *agg = (Aggref *) node;
 			AttrNumber	countcols[LION_MAX_GROUPCOLS + 1];
 			int			ncountcols = ngroup;
+			Node	   *arg = (agg->args != NIL) ?
+				lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr) :
+				NULL;
+			AttrNumber	argattno = (arg != NULL && IsA(arg, Var)) ?
+				((Var *) arg)->varattno : 0;
 
-			if (agg->aggdistinct != NIL)
+			if (agg->aggdistinct != NIL && distvar != NULL &&
+				argattno == distvar->varattno)
 			{
 				/* checked above; a distinct count needs no other test */
 				haveagg = true;
@@ -7361,11 +7430,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			 */
 			if (distvar != NULL)
 			{
-				Node	   *arg = (agg->args != NIL) ?
-					lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr) :
-					NULL;
-				bool		ofk = (arg != NULL && IsA(arg, Var) &&
-								   ((Var *) arg)->varattno == distvar->varattno);
+				bool		ofk = (argattno == distvar->varattno);
 
 				if (ngroup == 0 || ofk)
 					distcounts = true;
@@ -8243,29 +8308,36 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (IsA(expr, Aggref))
 		{
 			Aggref	   *agg = (Aggref *) expr;
+			AttrNumber	attno = 0;
+
+			if (agg->args != NIL)
+			{
+				Node	   *arg = lion_strip((Node *)
+											((TargetEntry *) linitial(agg->args))->expr);
+
+				Assert(arg != NULL && IsA(arg, Var));
+				attno = ((Var *) arg)->varattno;
+			}
 
 			/*
 			 * count(*) and every count(col) the planner accepted are the
 			 * count of the group, except two cases DESIGN.md §14 spells out:
 			 * count of the group column is 0 in the NULL group, and count of
 			 * a column a clause pins to NULL is always 0.
+			 *
+			 * A count(DISTINCT) is the walked one of DESIGN.md §26 when it
+			 * names that column, and otherwise one of a column the planner
+			 * proved unique, which is that column's count(col) and takes the
+			 * same cases (lion_agg_distinct_unique()): the planner never lets
+			 * one column be both.
 			 */
 			kind = LION_TL_COUNT;
-			if (agg->aggdistinct != NIL)
-			{
-				/* the one column the planner accepted (DESIGN.md §26) */
-				Assert(distattno != 0);
+			if (agg->aggdistinct != NIL && distattno != 0 &&
+				attno == distattno)
 				kind = LION_TL_COUNT_DISTINCT;
-			}
-			else if (agg->args != NIL)
+			else if (attno != 0)
 			{
-				Node	   *arg = lion_strip((Node *)
-											((TargetEntry *) linitial(agg->args))->expr);
-				AttrNumber	attno;
 				int			i;
-
-				Assert(arg != NULL && IsA(arg, Var));
-				attno = ((Var *) arg)->varattno;
 
 				if (distattno != 0 && attno == distattno)
 					kind = LION_TL_COUNT_DISTCOL;	/* §26: k's non-NULL rows */

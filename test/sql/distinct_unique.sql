@@ -1,0 +1,345 @@
+-- count(DISTINCT col) of a column the table proves unique, in the LionCount
+-- pushdown (DESIGN.md §26, "A unique column").
+--
+-- No two rows share a value of such a column, so its distinct count is the
+-- count(col) of the same rows - of every group, under any WHERE - and that is
+-- count(*) where the column is also known non-NULL.  The proof is a unique
+-- index on exactly that column: immediate, not partial, not an expression,
+-- under the DISTINCT's own equality and collation.  Every answer is compared
+-- with a sequential scan with the pushdown off, as a multiset in both
+-- directions, and the report says which of the two pushdowns was used: a
+-- count, or the walk over a lion index that §26 makes for any other column.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+/*
+ * lion_uq() runs a query with every other scan disabled, so that a LionCount
+ * path that is built at all is the plan, and again as a sequential scan with
+ * the pushdown off, and compares the two.  It reports "counted" for a
+ * pushdown with no Distinct Key, "distinct walk" for one with, or "not pushed
+ * down".
+ */
+CREATE FUNCTION lion_uq(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
+			how := 'counted';
+		END IF;
+		IF ln LIKE '%Distinct Key:%' THEN
+			how := 'distinct walk';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_uq_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_uq_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'SELECT count(*) FROM lion_uq_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_uq_on EXCEPT ALL SELECT * FROM lion_uq_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_uq_off EXCEPT ALL SELECT * FROM lion_uq_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_uq_on, lion_uq_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+/*
+ * The same under a generic plan, which keeps $n a Param: one statement
+ * prepared with the pushdown on and the other scans disabled, the reference
+ * prepared with the pushdown off, as a sequential scan.
+ */
+CREATE FUNCTION lion_uq_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_uqp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_uqp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
+			how := 'counted';
+		END IF;
+		IF ln LIKE '%Distinct Key:%' THEN
+			how := 'distinct walk';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_uq_on AS EXECUTE lion_uqp_on(%s)', args);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE lion_uqp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_uq_off AS EXECUTE lion_uqp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_uqp_on';
+	EXECUTE 'DEALLOCATE lion_uqp_off';
+	EXECUTE 'SELECT count(*) FROM lion_uq_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_uq_on EXCEPT ALL SELECT * FROM lion_uq_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_uq_off EXCEPT ALL SELECT * FROM lion_uq_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_uq_on, lion_uq_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+/* How the current plan of a statement - an EXECUTE, say - is made. */
+CREATE FUNCTION lion_uq_how(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
+			how := 'counted';
+		END IF;
+		IF ln LIKE '%Distinct Key:%' THEN
+			how := 'distinct walk';
+		END IF;
+	END LOOP;
+	RETURN how;
+END $$;
+/*
+ * 2000 rows.  id: the primary key.  g: 6 values and NULL on every 11th row.
+ * a: 10 values.  u: unique, NULL on every 7th row, with a lion index.  w: 250
+ * values of 8 rows each, NOT NULL, with a lion index - not unique.  d: unique
+ * under a DEFERRABLE constraint.  p: unique only where a < 5, which a partial
+ * unique index says; elsewhere every value repeats.  e: unique only as the
+ * expression e + 0.  t: unique only under the "C" collation's index.  pa:
+ * unique only together with a.
+ */
+CREATE TABLE lion_uq (
+	id	int		PRIMARY KEY,
+	g	int,
+	a	int		NOT NULL,
+	u	int		UNIQUE,
+	w	int		NOT NULL,
+	d	int		NOT NULL UNIQUE DEFERRABLE,
+	p	int		NOT NULL,
+	e	int		NOT NULL,
+	t	text	NOT NULL,
+	pa	int		NOT NULL
+);
+INSERT INTO lion_uq
+SELECT i,
+	   CASE WHEN i % 11 = 0 THEN NULL ELSE (i / 3) % 6 END,
+	   i % 10,
+	   CASE WHEN i % 7 = 0 THEN NULL ELSE i END,
+	   i % 250,
+	   i,
+	   CASE WHEN i % 10 < 5 THEN i ELSE i % 50 END,
+	   i,
+	   't' || i,
+	   i
+  FROM generate_series(1, 2000) i;
+CREATE UNIQUE INDEX lion_uq_p ON lion_uq (p) WHERE a < 5;
+CREATE UNIQUE INDEX lion_uq_e ON lion_uq ((e + 0));
+CREATE UNIQUE INDEX lion_uq_t ON lion_uq (t COLLATE "C");
+CREATE UNIQUE INDEX lion_uq_pa ON lion_uq (pa, a);
+CREATE INDEX lion_uq_g ON lion_uq USING lion (g);
+CREATE INDEX lion_uq_a ON lion_uq USING lion (a);
+CREATE INDEX lion_uq_u ON lion_uq USING lion (u);
+CREATE INDEX lion_uq_w ON lion_uq USING lion (w);
+VACUUM (FREEZE, ANALYZE) lion_uq;
+-- ---- 1. the primary key: count(DISTINCT id) is count(*) ------------------
+SELECT count(*), count(DISTINCT id) FROM lion_uq WHERE a = 3;
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 3 AND g = 2');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a IN (1, 2, 77)');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 77');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE g IS NULL');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 3 OR g = 1');
+SELECT lion_uq('SELECT count(*), count(id), count(DISTINCT id) FROM lion_uq WHERE a = 4');
+-- per group: the shape that motivated it
+SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g ORDER BY g;
+SELECT lion_uq('SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g');
+SELECT lion_uq('SELECT g, count(DISTINCT id) FROM lion_uq GROUP BY g');
+SELECT lion_uq('SELECT g, count(*), count(id), count(DISTINCT id) FROM lion_uq WHERE a IN (1, 2) GROUP BY g');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 5 GROUP BY g');
+SELECT lion_uq('SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g HAVING count(DISTINCT id) > 30');
+SELECT lion_uq('SELECT g FROM lion_uq WHERE a = 5 GROUP BY g HAVING count(DISTINCT id) < 30');
+-- a GROUP BY folded to one group, and a two-column GROUP BY
+SELECT lion_uq('SELECT a, count(DISTINCT id) FROM lion_uq WHERE a = 6 GROUP BY a');
+SELECT lion_uq('SELECT g, a, count(DISTINCT id) FROM lion_uq WHERE a IN (1, 2) GROUP BY g, a');
+-- nothing drives a count of the whole table, as for count(*)
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq');
+-- the EXPLAIN: a count, with no Distinct Key
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+-- a parameter under a generic plan
+SELECT lion_uq_prep('SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = $1 GROUP BY g', '3');
+SELECT lion_uq_prep('SELECT count(DISTINCT id) FROM lion_uq WHERE a = ANY ($1)', '''{1,5}''::int[]');
+-- ---- 2. beside a walked distinct count, and beside each other ------------
+-- w is not unique: it is walked (§26), and id beside it is a count
+SELECT lion_uq('SELECT count(DISTINCT w) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT count(DISTINCT id), count(DISTINCT w) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT g, count(DISTINCT id), count(DISTINCT w) FROM lion_uq WHERE a = 3 GROUP BY g');
+-- two unique columns
+SELECT lion_uq('SELECT count(DISTINCT id), count(DISTINCT t COLLATE "C"), count(*) FROM lion_uq WHERE a = 3');
+-- ---- 3. a nullable unique column: only where it is known non-NULL --------
+-- u is unique but NULL on every 7th row: count(DISTINCT u) is count(u),
+-- which is only count(*) where the WHERE rules the NULLs out.  Otherwise it
+-- is walked over u's own lion index, as before.
+SELECT count(*), count(u), count(DISTINCT u) FROM lion_uq WHERE a = 7;
+SELECT lion_uq('SELECT count(DISTINCT u) FROM lion_uq WHERE a = 7');
+SELECT lion_uq('SELECT count(DISTINCT u) FROM lion_uq WHERE a = 7 AND u IS NOT NULL');
+SELECT lion_uq('SELECT count(DISTINCT u) FROM lion_uq WHERE u IN (5, 6, 7, 14, 99999)');
+SELECT lion_uq('SELECT count(DISTINCT u) FROM lion_uq WHERE u = 12');
+SELECT lion_uq('SELECT count(DISTINCT u) FROM lion_uq WHERE u IS NULL');
+SELECT lion_uq('SELECT g, count(DISTINCT u) FROM lion_uq WHERE a = 7 GROUP BY g');
+SELECT lion_uq('SELECT g, count(DISTINCT u) FROM lion_uq WHERE a = 7 AND u IS NOT NULL GROUP BY g');
+-- u as the group column: 1 in a real group, 0 in the NULL group
+SELECT lion_uq('SELECT u, count(DISTINCT u) FROM lion_uq WHERE a = 3 GROUP BY u');
+SELECT lion_uq('SELECT u, count(*), count(DISTINCT u) FROM lion_uq WHERE a = 7 AND w = 7 GROUP BY u');
+SELECT u, count(*), count(DISTINCT u) FROM lion_uq WHERE a = 7 AND w = 7 GROUP BY u ORDER BY u;
+-- ---- 4. what does not prove a column unique ------------------------------
+-- an expression, not a column
+SELECT lion_uq('SELECT count(DISTINCT pa + 0) FROM lion_uq WHERE a = 3');
+-- unique only together with another column
+SELECT lion_uq('SELECT count(DISTINCT pa) FROM lion_uq WHERE a = 3');
+-- unique only as an expression
+SELECT lion_uq('SELECT count(DISTINCT e) FROM lion_uq WHERE a = 3');
+-- unique only under another collation than the DISTINCT's
+SELECT lion_uq('SELECT count(DISTINCT t) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT count(DISTINCT t COLLATE "C") FROM lion_uq WHERE a = 3');
+-- a partial unique index, even under a WHERE that implies its predicate
+SELECT count(*), count(DISTINCT p) FROM lion_uq WHERE g = 1;
+SELECT lion_uq('SELECT count(DISTINCT p) FROM lion_uq WHERE g = 1');
+SELECT lion_uq('SELECT count(DISTINCT p) FROM lion_uq WHERE a = 3');
+-- a deferrable constraint, which holds duplicates inside a transaction
+SELECT lion_uq('SELECT count(DISTINCT d) FROM lion_uq WHERE a IN (3, 4)');
+BEGIN;
+SET CONSTRAINTS lion_uq_d_key DEFERRED;
+UPDATE lion_uq SET d = d + 1 WHERE id = 3;
+SELECT count(*), count(DISTINCT d) FROM lion_uq WHERE a IN (3, 4);
+SELECT lion_uq('SELECT count(DISTINCT d) FROM lion_uq WHERE a IN (3, 4)');
+ROLLBACK;
+-- ---- 5. a dirty heap, and after VACUUM ------------------------------------
+DELETE FROM lion_uq WHERE id % 17 = 0;
+UPDATE lion_uq SET g = NULL WHERE id % 23 = 0;
+UPDATE lion_uq SET a = 3 WHERE id % 29 = 0 AND a <> 3;
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT g, count(*), count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g');
+SELECT lion_uq('SELECT g, count(DISTINCT id) FROM lion_uq GROUP BY g');
+SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g ORDER BY g;
+VACUUM ANALYZE lion_uq;
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT g, count(*), count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g');
+SELECT lion_uq('SELECT g, count(DISTINCT u) FROM lion_uq WHERE a = 3 AND u IS NOT NULL GROUP BY g');
+-- ---- 6. a cached plan that relied on the proof ----------------------------
+/*
+ * The plan relies on the unique index and on NOT NULL without recording
+ * either: dropping the index, or the NOT NULL, invalidates the table's
+ * relcache entry and with it every cached plan that reads the table.  After
+ * each change the next EXECUTE is planned again - it is no count any more -
+ * and the duplicates and NULLs inserted meanwhile are not counted twice.
+ */
+CREATE TABLE lion_uqi (id int NOT NULL, g int NOT NULL, a int NOT NULL);
+INSERT INTO lion_uqi SELECT i, i % 5, i % 4 FROM generate_series(1, 1000) i;
+CREATE UNIQUE INDEX lion_uqi_id ON lion_uqi (id);
+CREATE INDEX lion_uqi_g ON lion_uqi USING lion (g);
+CREATE INDEX lion_uqi_a ON lion_uqi USING lion (a);
+VACUUM ANALYZE lion_uqi;
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+PREPARE lion_uqi_q(int) AS
+	SELECT g, count(DISTINCT id) FROM lion_uqi WHERE a = $1 GROUP BY g ORDER BY g;
+EXECUTE lion_uqi_q(1);
+SELECT lion_uq_how('EXECUTE lion_uqi_q(1)');
+DROP INDEX lion_uqi_id;
+INSERT INTO lion_uqi SELECT id, g, a FROM lion_uqi WHERE a = 1 AND id <= 100;
+SELECT lion_uq_how('EXECUTE lion_uqi_q(1)');
+EXECUTE lion_uqi_q(1);
+DEALLOCATE lion_uqi_q;
+CREATE TABLE lion_uqn (id int NOT NULL UNIQUE, a int NOT NULL);
+INSERT INTO lion_uqn SELECT i, i % 4 FROM generate_series(1, 1000) i;
+CREATE INDEX lion_uqn_a ON lion_uqn USING lion (a);
+VACUUM ANALYZE lion_uqn;
+PREPARE lion_uqn_q(int) AS SELECT count(*), count(DISTINCT id) FROM lion_uqn WHERE a = $1;
+EXECUTE lion_uqn_q(2);
+SELECT lion_uq_how('EXECUTE lion_uqn_q(2)');
+ALTER TABLE lion_uqn ALTER COLUMN id DROP NOT NULL;
+INSERT INTO lion_uqn SELECT NULL, 2 FROM generate_series(1, 7);
+SELECT lion_uq_how('EXECUTE lion_uqn_q(2)');
+EXECUTE lion_uqn_q(2);
+DEALLOCATE lion_uqn_q;
+RESET plan_cache_mode;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+DROP TABLE lion_uqi, lion_uqn;
+-- ---- 7. partitioned tables ------------------------------------------------
+/*
+ * k is unique in each partition and repeats across them: a unique index on
+ * each partition proves nothing about the parent.  The primary key added
+ * afterwards is a partitioned index, which has to contain the partition key
+ * and so is unique over the whole table: count(DISTINCT id) is then counted
+ * one partition at a time and summed, like count(*).  Per group it is not:
+ * core does not split an aggregate with a DISTINCT into partial aggregates,
+ * which is what the node would emit for each partition (§16).
+ */
+CREATE TABLE lion_uqp (id int NOT NULL, k int NOT NULL, a int NOT NULL, g int)
+	PARTITION BY RANGE (id);
+CREATE TABLE lion_uqp1 PARTITION OF lion_uqp FOR VALUES FROM (0) TO (1000);
+CREATE TABLE lion_uqp2 PARTITION OF lion_uqp FOR VALUES FROM (1000) TO (2000);
+INSERT INTO lion_uqp SELECT i, i % 1000, i % 4, i % 3 FROM generate_series(0, 1999) i;
+CREATE UNIQUE INDEX lion_uqp1_k ON lion_uqp1 (k);
+CREATE UNIQUE INDEX lion_uqp2_k ON lion_uqp2 (k);
+CREATE INDEX lion_uqp_a ON lion_uqp USING lion (a);
+CREATE INDEX lion_uqp_g ON lion_uqp USING lion (g);
+VACUUM ANALYZE lion_uqp;
+SELECT count(*), count(DISTINCT k) FROM lion_uqp WHERE a = 1;
+SELECT lion_uq('SELECT count(DISTINCT k) FROM lion_uqp WHERE a = 1');
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uqp WHERE a = 1');
+-- one partition by itself is a plain table, with its own unique index
+SELECT lion_uq('SELECT count(DISTINCT k) FROM lion_uqp1 WHERE a = 1');
+ALTER TABLE lion_uqp ADD PRIMARY KEY (id);
+SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uqp WHERE a = 1');
+SELECT lion_uq('SELECT count(DISTINCT id), count(*) FROM lion_uqp WHERE a = 1 AND g = 2');
+SELECT lion_uq('SELECT count(DISTINCT k) FROM lion_uqp WHERE a = 1');
+SELECT lion_uq('SELECT g, count(DISTINCT id) FROM lion_uqp WHERE a = 1 GROUP BY g');
+SELECT lion_uq('SELECT g, count(*) FROM lion_uqp WHERE a = 1 GROUP BY g');
+DROP TABLE lion_uqp;
+DROP TABLE lion_uq;
+DROP FUNCTION lion_uq(text);
+DROP FUNCTION lion_uq_prep(text, text);
+DROP FUNCTION lion_uq_how(text);
