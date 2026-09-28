@@ -3021,6 +3021,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	ListCell   *lc;
 	LionSumModel summodel;
 	LionSumModel *sum = NULL;
+	LionSumShape shape;
 	double		incounts;
 	double		inpages;
 	double		outcounts;
@@ -3042,6 +3043,9 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	ordered = colstate->ordered;
 	summarized = colstate->summarized;
 	bucket_tids = lion_get_index_state(indexrel)->meta.summary_tids;
+	memset(&shape, 0, sizeof(shape));
+	if (summarized && ordered && bucket_tids > 0)
+		lion_summary_shape(indexrel, colstate, &shape);
 	index_close(indexrel, AccessShareLock);
 
 	/*
@@ -3075,15 +3079,38 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * takes about the bytes of its keys' sets with the containers they share
 	 * merged: their pages, scaled by the containers the union saves.  It is
 	 * counted on its own (LION_RANGE_ENTRY_COST), as a large entry is.
+	 *
+	 * That is a column whose keys arrive in order.  Keys that arrive in
+	 * descending order all go into the first bucket (the open one, on an
+	 * index built empty), and keys in no order into the middle buckets, which
+	 * never split: the buckets are then far larger than summary_tids, and a
+	 * range walks the keys of the ones at its ends.  The rows the column's
+	 * summaries hold per summary, read off the index (lion_summary_shape()),
+	 * say how large they really are, and once that is more than twice what
+	 * the reloption says it is what the model takes - so that one giant
+	 * bucket makes a range that covers a bucket whole the rare case it is.
+	 * The model used to count whole buckets the data did not have, and priced
+	 * such a range as a sum of summaries that the executor then walked key by
+	 * key.  A column with no summary at all - `on` over an empty table - is
+	 * walked, as the executor walks it.
 	 */
-	if (summarized && ordered && bucket_tids > 0)
+	if (summarized && ordered && bucket_tids > 0 && shape.nsummaries > 0)
 	{
 		double		bucketrows = Max((double) bucket_tids, rowsper);
-		double		sscattered = lion_containers_for(heap_pages, bucketrows);
-		double		sinorder = Max(1.0, bucketrows * ckeys / tuples);
-		double		sc = sscattered + (sinorder - sscattered) * corr * corr;
-		double		sm = Min(bucketrows / Max(sc, 1.0), LION_MEMBER_CAP);
-		double		skeys = (nsrc > 0) ? Min(sc, fcont) : sc;
+		double		realrows = shape.rows / shape.nsummaries;
+		double		sscattered;
+		double		sinorder;
+		double		sc;
+		double		sm;
+		double		skeys;
+
+		if (realrows > 2.0 * bucketrows)
+			bucketrows = realrows;
+		sscattered = lion_containers_for(heap_pages, bucketrows);
+		sinorder = Max(1.0, bucketrows * ckeys / tuples);
+		sc = sscattered + (sinorder - sscattered) * corr * corr;
+		sm = Min(bucketrows / Max(sc, 1.0), LION_MEMBER_CAP);
+		skeys = (nsrc > 0) ? Min(sc, fcont) : sc;
 
 		summodel.keysper = Max(1.0, bucketrows / rowsper);
 

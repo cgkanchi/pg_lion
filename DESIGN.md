@@ -9856,6 +9856,20 @@ recheck is spread over the side's counts rather than its keys. The sum over ever
 summarized column (`k IS NOT NULL` alone, §14) is priced as a range over all of it
 (`LION_RANGED_SUMALL`).
 
+Buckets hold `summary_tids` rows only when keys arrive in order. Keys that arrive in descending
+order all go into the first bucket (the open one, on an index built empty), and keys in no order
+grow the middle buckets, which never split; a range then walks the keys of a bucket far larger than
+the reloption says. So the model reads the rows per summary off the index at plan time
+(`lion_summary_shape()`: the entries' counters on at most `LION_SUMMARY_SHAPE_LEAVES` (4) leaves
+from where the column's summaries begin - the first buckets, where descending keys go) and takes
+that as the bucket's size once it is more than twice `max(summary_tids, rows per key)`; a single
+giant bucket makes the average large enough that a range rarely covers a bucket whole, as it rarely
+does. It used to count whole buckets the data did not have and price such a range as a sum of
+summaries that the executor walked key by key. A summarized column with no summary at all (`on`
+over an empty table) is priced as walked, as it is. (2026-09-28. The alternative - a per-bucket
+model with a giant bucket's share of the keys walked - needs the keys per bucket, which the
+summaries do not carry; the average is what the index can say cheaply.)
+
 A range taken as a source costs its collection once per relation - the same walk, with nothing to
 AND and nothing to recheck, plus a step per container of the union - and is then a source read from
 memory: no page reads for the probes, its rows `tuples x selectivity of its bounds`. One whose

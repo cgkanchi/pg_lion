@@ -7288,6 +7288,63 @@ lion_summary_first_leaf(Relation index, LionState *col)
 	return blk;
 }
 
+/*
+ * How many summaries a column has and the rows they hold, read off the
+ * entries' counters from where the column's summaries begin - at most
+ * LION_SUMMARY_SHAPE_LEAVES leaves of them, the first buckets, which is where
+ * keys that arrive in descending order go (DESIGN.md §32, "Costs").  The cost
+ * of a summed range needs it: buckets close at summary_tids rows only when
+ * keys arrive in order, and a column whose keys arrive in descending order -
+ * or in none - puts its rows into a few buckets far larger than that, whose
+ * keys a range walks one by one.  complete says every summary of the column
+ * was read.
+ */
+void
+lion_summary_shape(Relation index, LionState *col, LionSumShape *shape)
+{
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
+	int			nleaves = 1;
+
+	memset(shape, 0, sizeof(LionSumShape));
+
+	/* where the column's summaries begin, as lion_summary_first_leaf() */
+	lion_search_key_init(col, &sk, LION_KIND_SUMMARY, (Datum) 0, 0);
+	sk.cmpproc = NULL;
+	buf = lion_dir_search(index, NULL, col->ix, &sk, BUFFER_LOCK_SHARE, false,
+						  &off);
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+		for (; off <= maxoff; off++)
+		{
+			LionEntryTuple *e = lion_page_entry(page, off);
+
+			if (e->attno != col->attno || !LionEntryIsSummary(e))
+			{
+				shape->complete = true;
+				break;
+			}
+			shape->nsummaries += 1.0;
+			shape->rows += (double) e->ntids;
+		}
+		if (shape->complete || LionPageIsRightmost(page))
+		{
+			shape->complete = true;
+			break;
+		}
+		if (nleaves >= LION_SUMMARY_SHAPE_LEAVES)
+			break;
+		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+		off = lion_page_first_data(BufferGetPage(buf));
+		nleaves++;
+	}
+	UnlockReleaseBuffer(buf);
+}
+
 /* The leaf a descent to (attno, VALUE, key) lands on, key a stored one. */
 static BlockNumber
 lion_value_leaf(Relation index, LionState *col, const char *raw)

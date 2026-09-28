@@ -717,6 +717,23 @@ extern bool lion_range_fails_upper(LionRange *range,
 								   const LionEntryTuple *entry);
 extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
 
+/*
+ * The summaries of a column as the planner sees them (DESIGN.md §32,
+ * "Costs"): the first ones of them, read off at most
+ * LION_SUMMARY_SHAPE_LEAVES directory leaves.
+ */
+typedef struct LionSumShape
+{
+	double		nsummaries;
+	double		rows;			/* the rows they hold */
+	bool		complete;		/* every summary of the column was read */
+} LionSumShape;
+
+#define LION_SUMMARY_SHAPE_LEAVES	4
+
+extern void lion_summary_shape(Relation index, LionState *col,
+							   LionSumShape *shape);
+
 /* ---------------------------------------------------------------------
  * Iterating every entry of an index (the GROUP BY path of section 10)
  * --------------------------------------------------------------------- */
