@@ -5079,12 +5079,13 @@ Operations.
     writers of the key serialise. Before the bound, a downlink to the root or to the page itself
     restarted the descent for ever;
   - a page reached through a link is not one the backend already holds, checked before the lock: the
-    insert's head and tail against the directory leaf it holds, the repair's scan for a downlink and
-    `lion_posting_level_start()` against the child being repaired, `lion_posting_downlink_present()`
-    against the parent and the child, and a flagged page's right sibling against the page itself. A
-    repair that recurses up several levels holds a page per level and checks only the nearest, and a
-    link from inside the tree to the entry's directory leaf is caught only when it is the head or
-    the tail; both are double faults this does not chase;
+    insert's head and tail against the directory leaf it holds, a flagged page's right sibling
+    against the page itself, and every walk of the split repair - `lion_posting_level_start()`, the
+    scan for a downlink, `lion_posting_downlink_present()`, `lion_posting_adopt()` - against every
+    page the repair holds, however far up and sideways it has recursed (`LionPostingHeld`, the
+    2026-09-28 addendum below; until then each walk checked only the one or two pages nearest it). A
+    link from inside the tree to the entry's directory leaf is caught only when it is the head or the
+    tail, a double fault this does not chase;
   - and a walk right along a level ends (`LionRightWalk`, lion.h): a walk that only moves right
     never passes a page twice, since no page leaves a level of a live set and a split puts its new
     page to the right, so one that has taken more steps than the index has blocks is going round a
@@ -5429,6 +5430,67 @@ subtracted the regrown container's dead TIDs once more, so the drift never heale
 logs the entry as it stands on the page with only `tail` moved; the counters travel with the record
 that places the items, as §5 has always said they must. `test/isolation/posting_split_repair.spec`
 cuts a push-down short (D) in an insert and (E) in VACUUM's regrow; both used to fail verify().
+
+### §22 addendum: a repair inside a repair (2026-09-28)
+
+The 2026-09-27 review made the split repair's walks refuse, before the lock, a link to a page the
+backend already holds: a content lock is not reentrant, and a second one waits for this very backend
+for ever - uncancellably, with the key's directory leaf held. But each walk checked only the one or
+two pages its own caller held, and the repair RECURSES: up a level when the page that takes a
+downlink is flagged itself or has to split, and sideways when a page has no downlink and
+`lion_posting_adopt()` finishes the split to its left - whose right half may have no downlink
+either. Two unfinished splits on one level (two crashes between the records, or two ERRORs in the
+parent insertions) are enough: `adopt(C)` holds C, meets the flagged F on its walk and finishes it,
+and F's own missing downlink runs `adopt(F)` inside, with C still held. That walk stopped only at F,
+and a route key can land RIGHT of the page that holds it - separators are only non-decreasing: a
+split repaired with both halves empty shares its left neighbour's, and an internal split can cut a
+run of equal ones - so a walk that started past F went on to C and locked it a second time.
+
+Two changes, both in `lion_posting.c`:
+
+1. **The held pages travel with the recursion.** `LionPostingHeld` is a list with one link per frame
+   of `lion_posting_finish_split_ext()`, on that frame's stack: the page whose split it finishes.
+   Every walk of the repair looks each page up in it before the lock - the root and the moves of
+   `lion_posting_level_start()`, the scan for a downlink, `lion_posting_downlink_present()`'s look at
+   the parent's sibling, both walks of `lion_posting_adopt()` - and a held right sibling whose first
+   key a leaf repair needs as its separator is read off the held page, as the single `heldright` was.
+2. **`lion_posting_adopt()` walks twice.** First SHARE and finishing nothing, from where the route
+   leads, to learn whether its child lies ahead at all; only then again, from the first flagged page
+   that walk saw up to the child, finishing. The old single walk also finished, to no purpose, every
+   flagged page RIGHT of the child whenever the route led past it - a child's missing downlink is
+   only ever caused on its left - and that is what could nest a repair whose own child lies right of
+   a page it would walk through. Now a repair finishes splits only left of its child, so the pages
+   nested adoptions hold on one level strictly decrease, each left of the one around it, and a walk
+   that meets a held page other than its own child has passed its child exactly as a walk that
+   reaches the end of the level has: it stops there, without the lock, and the next attempt starts
+   from the leftmost page, where the child comes before all of them. Nothing either walk passes
+   changes in between: finishing a split clears a flag on the child's level and writes only above
+   it, and no other writer is in the tree.
+
+Why neither change turns a sound index into an ERROR or a wait. The recursion only climbs or stays
+on its level, so every page the repair holds is on the level being walked or below it, and never the
+root (only a flagged page goes into the list, and the root's split is a push-down, which flags
+nothing; the push-down's unlocked window is therefore never refused). `lion_posting_level_start()`
+returns a held page of its target level as the answer, unread, for the caller to judge, and refuses
+one above that level; the scan for a downlink and `downlink_present()` walk the level ABOVE the child,
+where the repair holds nothing but the parent it has found, so a held page there is damage
+(ERRCODE_INDEX_CORRUPTED, as before);
+and `adopt()` treats a held page as the end of the level. So every new ERROR is a link a sound tree
+does not have, and the one legitimate meeting - nested adoptions on a level - is a stop. The lock
+order is unchanged: the walks take the same pages in the same modes and directions as before, less
+the held ones they used to lock a second time and the flagged pages right of the child. The cost is
+the first walk of `adopt()`, a SHARE read of the pages between the route and the child, on a path
+that only runs after a crash left a split unfinished.
+
+Not covered: the leaf split's second page outside the repair - `lion_split_and_place()` still holds
+M, EXCLUSIVE, while it finishes P, and P while it finishes M, and neither is in the list, because
+`lion_pages.c` does not pass them. Neither is reached: M has no downlink and lies right of P, where
+every walk of that repair stops (P is held); and finishing M finds the downlink finishing P has just
+placed where M's first key routes - in a sound tree no later separator is at or below that key -
+without adopting. A link to the directory leaf stays the double
+fault the "link is data" bullet above does not chase. Nor does the suite reach the shape: two
+unfinished splits on one level, with a route past the page, need two injected failures in one key's
+tree, and `posting_split_repair.spec` injects one.
 
 ### §21 addendum: binary coercion requires the same equality function
 
