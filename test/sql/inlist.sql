@@ -139,8 +139,8 @@ SELECT lion_incmp('SELECT id FROM lion_in WHERE n IN (1, 2)');
 SELECT lion_incmp('SELECT id FROM lion_in WHERE n IN (1, 2) OR n IS NULL');
 /*
  * Two quals on the one key column reach the access method as two scan keys.
- * It answers the most selective-looking one and marks every TID for recheck,
- * so the bitmap heap scan applies both quals and the rows are exact.
+ * It answers both lists and ANDs them (DESIGN.md §5 SCAN step 5), and an
+ * `IS NOT NULL` beside a list or an equality is implied by it.
  */
 SELECT lion_incmp('SELECT id FROM lion_in WHERE b IN (1, 2) AND b IN (2, 3)');
 SELECT lion_incmp('SELECT id FROM lion_in WHERE b IN (1, 2) AND b = 2');

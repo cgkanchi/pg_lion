@@ -551,29 +551,207 @@ lion_cost_is_range(IndexOptInfo *index, int col, OpExpr *op)
 }
 
 /*
- * Will liongetbitmap() have to walk the WHOLE index for this path - read every
+ * What the scan answers of key column c, from the path's index quals: the
+ * classification lion_scan_choose() makes of the scan keys (lion_scan.c,
+ * DESIGN.md §5 SCAN step 5, §29.2), made here so that every function below
+ * prices the scan the executor will run.
+ *
+ *	sets	every equality, list, `IS NULL` and multi-key query: a set tree
+ *			each, ANDed with one another and with the other columns';
+ *	walk	for a column without sets: `op ANY (array)` with a range strategy
+ *			(ONE walk to its widest element), else the column's plain range
+ *			comparisons, which ranges lists and which are all one walk, else
+ *			`IS NOT NULL`;
+ *	ndropped	the quals left to the recheck: a column's range comparisons
+ *			beside its sets, and a second array range or the plain range
+ *			comparisons beside an array range;
+ *	nomatch	`IS NULL` beside a strict qual of the column or `IS NOT NULL`,
+ *			which the scan answers with no row at all.
+ *
+ * `IS NOT NULL` beside a strict qual of its column - any qual but a null test
+ * - is implied by it and is none of these, nor is a second `IS NOT NULL`.  A
+ * set tree the scan cannot build after all, a multi-key query in mode ALL
+ * (§17), is among the sets; lion_cost_qual_is_full() says which.  The lists
+ * are the caller's to free.
+ */
+typedef struct LionCostCol
+{
+	List	   *sets;			/* RestrictInfos, in the path's order */
+	List	   *ranges;			/* the plain range comparisons of the walk */
+	RestrictInfo *walk;			/* the array range, the first range
+								 * comparison, or `IS NOT NULL` */
+	int			nquals;			/* index quals on the column at all */
+	int			ndropped;
+	bool		nomatch;
+} LionCostCol;
+
+static void
+lion_cost_col_quals(IndexPath *path, int c, LionCostCol *cc)
+{
+	IndexOptInfo *index = path->indexinfo;
+	RestrictInfo *arrayrange = NULL;
+	RestrictInfo *notnull = NULL;
+	int			narray = 0;
+	int			nisnull = 0;
+	int			nstrict = 0;
+	ListCell   *lc;
+
+	memset(cc, 0, sizeof(LionCostCol));
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (iclause->indexcol != c)
+			continue;
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Node	   *clause = (Node *) rinfo->clause;
+
+			cc->nquals++;
+			if (IsA(clause, NullTest))
+			{
+				if (((NullTest *) clause)->nulltesttype == IS_NULL)
+				{
+					nisnull++;
+					cc->sets = lappend(cc->sets, rinfo);
+				}
+				else if (notnull == NULL)
+					notnull = rinfo;
+				continue;
+			}
+
+			nstrict++;
+			if (IsA(clause, OpExpr) &&
+				lion_cost_is_range(index, c, (OpExpr *) clause))
+				cc->ranges = lappend(cc->ranges, rinfo);
+			else if (IsA(clause, ScalarArrayOpExpr) &&
+					 lion_cost_is_range_op(index, c,
+										   ((ScalarArrayOpExpr *) clause)->opno))
+			{
+				if (arrayrange == NULL)
+					arrayrange = rinfo;
+				narray++;
+			}
+			else
+				cc->sets = lappend(cc->sets, rinfo);
+		}
+	}
+
+	if (nisnull > 0 && (nstrict > 0 || notnull != NULL))
+		cc->nomatch = true;
+
+	if (cc->sets != NIL)
+	{
+		/* the recheck bounds the sets */
+		cc->ndropped = list_length(cc->ranges) + narray;
+		list_free(cc->ranges);
+		cc->ranges = NIL;
+	}
+	else if (arrayrange != NULL)
+	{
+		cc->ndropped = narray - 1 + list_length(cc->ranges);
+		list_free(cc->ranges);
+		cc->ranges = NIL;
+		cc->walk = arrayrange;
+	}
+	else if (cc->ranges != NIL)
+		cc->walk = linitial_node(RestrictInfo, cc->ranges);
+	else
+		cc->walk = notnull;
+}
+
+static void
+lion_cost_col_free(LionCostCol *cc)
+{
+	list_free(cc->sets);
+	list_free(cc->ranges);
+	cc->sets = NIL;
+	cc->ranges = NIL;
+}
+
+/*
+ * Would the scan read the whole of key column c to answer this one set qual
+ * (lion_cost_col_quals())?  *all says whether it then emits every indexed
+ * row as a candidate, too, for the heap to recheck.
+ *
+ * Only a multi-key query does: one the extractor answers with
+ * LION_QMODE_ALL - a phrase, a prefix, a NOT, a weight mask, `<@`,
+ * `@> '{}'`, a NULL element, or more than LION_MAX_QUERY_KEYS keys (DESIGN.md
+ * §17) - and one whose value is not a plan-time Const (a Param), because the
+ * MODE follows the query's shape, not just its value, and an unknown value
+ * has to be priced as the expensive shape.  `op ANY (array)` is the union of
+ * its elements' answers, so one element that needs every row is enough, and
+ * an array not available at plan time has to be assumed to hold one.  A
+ * scalar column's sets - an equality, a list, `IS NULL` - look up keys, and
+ * never read the column whole.
+ */
+static bool
+lion_cost_qual_is_full(IndexOptInfo *index, int c, Node *cl, bool *all)
+{
+	*all = false;
+	if (IsA(cl, NullTest) || !lion_index_is_multikey(index, c))
+		return false;
+
+	if (IsA(cl, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) cl;
+		StrategyNumber strategy;
+		Node	   *arg;
+
+		if (list_length(op->args) == 2 &&
+			(strategy = (StrategyNumber)
+			 get_op_opfamily_strategy(op->opno, index->opfamily[c])) != 0 &&
+			(arg = lion_cost_strip((Node *) lsecond(op->args))) != NULL &&
+			IsA(arg, Const))
+		{
+			/* a strict operator with NULL is never true: nothing is scanned */
+			if (((Const *) arg)->constisnull ||
+				!lion_query_is_full_scan(index, c, strategy,
+										 ((Const *) arg)->constvalue))
+				return false;
+		}
+		*all = true;
+		return true;
+	}
+
+	if (IsA(cl, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) cl;
+		StrategyNumber strategy;
+
+		if (list_length(saop->args) == 2 &&
+			(strategy = (StrategyNumber)
+			 get_op_opfamily_strategy(saop->opno,
+									  index->opfamily[c])) != 0 &&
+			(strategy == LION_STRAT_EQUAL ||
+			 !lion_array_query_is_full_scan(index, c, strategy,
+											lion_cost_strip((Node *) lsecond(saop->args)))))
+			return false;		/* a union of single-key lookups, or of exact queries */
+		*all = true;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Will the scan have to walk the WHOLE index for this path - read every
  * bucket, every entry and every posting of every entry?
  *
- * liongetbitmap() answers ONE qual per scan and marks the rest for recheck,
- * choosing the most selective-looking one: a plain operator first, then a
- * ScalarArrayOp, then a range (DESIGN.md §28), then a null test.  The cost of
- * the scan is the cost of the qual it answers, so the choice is mirrored
- * here.  A range walks only the entries between its bounds, so it never
- * makes the scan a full one; what it costs per entry is
- * lion_range_entry_cost()'s.
- *
- * A full walk is what the AM does for:
- *
- *	- `col IS NOT NULL`, which is every entry but the reserved NULL one
- *	  (DESIGN.md §14);
- *	- a multi-key query the extractor answers with LION_QMODE_ALL: a phrase, a
- *	  prefix, a NOT, a weight mask, `<@`, `@> '{}'`, a NULL element, or more
- *	  than LION_MAX_QUERY_KEYS keys (DESIGN.md §17).  Correctness is preserved
- *	  by the recheck, but the scan reads the whole index and hands the heap
- *	  every indexed row;
- *	- and a multi-key query whose value is not a plan-time Const (a Param):
- *	  the MODE follows the query's shape, not just its value, so an unknown
- *	  value has to be priced as the expensive shape.
+ * The scan answers every set qual of a column and ANDs them with each other
+ * and with the other columns' (lion_scan_choose(), lion_cost_col_quals()),
+ * and the cost of the scan is the cost of what it answers, so the
+ * classification is mirrored here.  A column is read whole only when
+ * NOTHING it answers selects from its posting sets: every set qual of it
+ * needs the whole column (lion_cost_qual_is_full()), or it is walked for
+ * `IS NOT NULL`, which is every entry but the reserved NULL one (DESIGN.md
+ * §14).  One qual that looks keys up is enough to keep the column off the
+ * full walk - the scan drops the others and rechecks them.  A range walks
+ * only the entries between its bounds, so it never makes the scan a full
+ * one; what it costs per entry is lion_range_entry_cost()'s.
  *
  * *emits_all_rows additionally says whether the CANDIDATES the walk produces
  * are every indexed row, which is what makes the heap side a full recheck
@@ -586,19 +764,19 @@ lion_cost_is_range(IndexOptInfo *index, int col, OpExpr *op)
  * as selective lookups - a prefix query estimated at 192 cost units against
  * the sequential scan's 9156, for a scan that emitted 1.18M posting TIDs and
  * rechecked 198k rows and ran 2.6x slower than that sequential scan (the
- * 2026-09-21 follow-up review).
+ * 2026-09-21 follow-up review).  And ranking ONE qual per column, as this
+ * function did while the scan answered one, priced `tags @> '{}' AND tags &&
+ * '{t1}'` as the full walk of the first and a whole-table recheck, where the
+ * second one's sets answer it.
  */
 static bool
 lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 {
 	IndexOptInfo *index = path->indexinfo;
-	Node	   *chosen[INDEX_MAX_KEYS];
-	int			bestrank[INDEX_MAX_KEYS];
 	int			ncols = index->nkeycolumns;
 	int			nchosen = 0;
 	int			firstcol = -1;
 	bool		anyselective = false;
-	ListCell   *lc;
 	int			c;
 
 	*emits_all_rows = false;
@@ -606,129 +784,61 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
 		return false;
 
-	for (c = 0; c < ncols; c++)
-	{
-		chosen[c] = NULL;
-		bestrank[c] = 4;
-	}
-
-	foreach(lc, path->indexclauses)
-	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-		int			col = iclause->indexcol;
-		ListCell   *lc2;
-
-		if (col < 0 || col >= ncols)
-			continue;
-
-		foreach(lc2, iclause->indexquals)
-		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
-			Node	   *clause = (Node *) rinfo->clause;
-			int			rank;
-
-			if (IsA(clause, NullTest))
-				rank = 3;
-			else if (IsA(clause, ScalarArrayOpExpr))
-				rank = 1;
-			else if (IsA(clause, OpExpr))
-				rank = lion_cost_is_range(index, col, (OpExpr *) clause) ? 2 : 0;
-			else
-				continue;
-
-			if (rank < bestrank[col])
-			{
-				bestrank[col] = rank;
-				chosen[col] = clause;
-			}
-		}
-	}
-
 	/*
 	 * Per column, would that column alone make the scan walk the whole
 	 * column's entries?  The answers combine the way the scan does
 	 * (DESIGN.md §24): the columns are INTERSECTED, so one column that
 	 * selects from its posting sets keeps the scan off the full walk however
-	 * the others are answered - liongetbitmap() drops those and rechecks.
+	 * the others are answered - the scan drops those and rechecks.  When
+	 * none does, the scan walks the FIRST column, by its first qual.
 	 */
 	for (c = 0; c < ncols; c++)
 	{
-		bool		colfull;
+		LionCostCol cc;
+		bool		colfull = true;
 		bool		colall = false;
-		Node	   *cl = chosen[c];
+		ListCell   *lc;
 
-		if (cl == NULL)
+		lion_cost_col_quals(path, c, &cc);
+		if (cc.nquals == 0)
+		{
+			lion_cost_col_free(&cc);
 			continue;
+		}
 		nchosen++;
 		if (firstcol < 0)
 			firstcol = c;
 
-		if (IsA(cl, NullTest))
-			colfull = (((NullTest *) cl)->nulltesttype == IS_NOT_NULL);
-		else if (!lion_index_is_multikey(index, c))
+		if (cc.nomatch)
+			colfull = false;	/* nothing is read at all */
+		else if (cc.sets != NIL)
 		{
-			/* A scalar opclass looks ONE key up, whatever the operand. */
-			colfull = false;
-		}
-		else if (IsA(cl, OpExpr))
-		{
-			OpExpr	   *op = (OpExpr *) cl;
-			StrategyNumber strategy;
-			Node	   *arg;
-
-			colall = true;
-			colfull = true;
-			if (list_length(op->args) == 2 &&
-				(strategy = (StrategyNumber)
-				 get_op_opfamily_strategy(op->opno, index->opfamily[c])) != 0 &&
-				(arg = lion_cost_strip((Node *) lsecond(op->args))) != NULL &&
-				IsA(arg, Const))
+			foreach(lc, cc.sets)
 			{
-				if (((Const *) arg)->constisnull)
-				{
-					/* a strict operator: never true, so nothing is scanned */
-					colall = false;
+				bool		all;
+
+				if (!lion_cost_qual_is_full(index, c,
+											(Node *) lfirst_node(RestrictInfo, lc)->clause,
+											&all))
 					colfull = false;
-				}
-				else if (!lion_query_is_full_scan(index, c, strategy,
-												  ((Const *) arg)->constvalue))
-				{
-					colall = false;
-					colfull = false;
-				}
+				else if (lc == list_head(cc.sets))
+					colall = all;
 			}
 		}
 		else
-		{
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) cl;
-			StrategyNumber strategy;
-
-			colall = true;
-			colfull = true;
-			if (list_length(saop->args) == 2 &&
-				(strategy = (StrategyNumber)
-				 get_op_opfamily_strategy(saop->opno,
-										  index->opfamily[c])) != 0 &&
-				(strategy == LION_STRAT_EQUAL ||
-				 !lion_array_query_is_full_scan(index, c, strategy,
-												lion_cost_strip((Node *) lsecond(saop->args)))))
-			{
-				/* a union of single-key lookups, or of exact queries */
-				colall = false;
-				colfull = false;
-			}
-		}
+			colfull = IsA(cc.walk->clause, NullTest);	/* ranges are not */
 
 		if (!colfull)
 			anyselective = true;
 		else if (c == firstcol)
 			*emits_all_rows = colall;
+		lion_cost_col_free(&cc);
 	}
 
 	/*
 	 * No clause at all: a partial index whose predicate the query implies,
-	 * which liongetbitmap() answers by emitting every row it holds.  The rows
-	 * are exactly the ones the scan selects, so the heap side keeps the
+	 * which the scan answers by emitting every row it holds.  The rows are
+	 * exactly the ones the scan selects, so the heap side keeps the
 	 * predicate's own selectivity (*emits_all_rows stays false).
 	 */
 	if (nchosen == 0)
@@ -758,98 +868,70 @@ lion_cost_other_column(IndexPath *path, int col)
 
 /*
  * Does a column other than col have a qual the scan answers with a set tree
- * (lion_scan_col_tree()), which a range walk on col is then ANDed with?
+ * (lion_cost_col_quals(), lion_scan_col_tree()), which a range walk on col is
+ * then ANDed with?  An equality, a list, `IS NULL` or a multi-key query is a
+ * set; another range is a second walk and `IS NOT NULL` is dropped, neither of
+ * which the scan streams beside this one, and so is a multi-key query that
+ * needs every row (lion_cost_qual_is_full()).
  */
 static bool
 lion_cost_sets_beside(IndexPath *path, int col)
 {
-	ListCell   *lc;
+	IndexOptInfo *index = path->indexinfo;
+	bool		beside = false;
+	int			c;
 
-	foreach(lc, path->indexclauses)
+	for (c = 0; c < index->nkeycolumns && !beside; c++)
 	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-		ListCell   *lc2;
+		LionCostCol cc;
+		ListCell   *lc;
 
-		if (iclause->indexcol == col)
+		if (c == col)
 			continue;
-		foreach(lc2, iclause->indexquals)
+		lion_cost_col_quals(path, c, &cc);
+		foreach(lc, cc.sets)
 		{
-			Node	   *clause = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+			bool		all;
 
-			/*
-			 * An equality, a list, `IS NULL` or a multi-key query is a set;
-			 * another range is a second walk and `IS NOT NULL` is dropped,
-			 * neither of which the scan streams beside this one.
-			 */
-			if (IsA(clause, NullTest) ?
-				((NullTest *) clause)->nulltesttype == IS_NULL :
-				!((IsA(clause, OpExpr) &&
-				   lion_cost_is_range(path->indexinfo, iclause->indexcol,
-									  (OpExpr *) clause)) ||
-				  (IsA(clause, ScalarArrayOpExpr) &&
-				   lion_cost_is_range_op(path->indexinfo, iclause->indexcol,
-										 ((ScalarArrayOpExpr *) clause)->opno))))
-				return true;
+			if (!lion_cost_qual_is_full(index, c,
+										(Node *) lfirst_node(RestrictInfo, lc)->clause,
+										&all))
+			{
+				beside = true;
+				break;
+			}
 		}
+		lion_cost_col_free(&cc);
 	}
-	return false;
+	return beside;
 }
 
 /*
- * The range quals of key column c that one walk answers, ranked as
- * liongetbitmap() ranks them (DESIGN.md §28): an equality or a list outranks
- * a range and leaves no walk at all (NIL), then an `op ANY (array)` - which
- * for a range operator is ONE walk to the widest element
- * (lion_emit_array_range()) - then the column's plain range comparisons, all
- * of them one walk.
+ * The range quals of key column c that one walk answers (lion_cost_col_quals(),
+ * DESIGN.md §28): none when the column has sets - an equality, a list, `IS
+ * NULL`, a multi-key query, beside which a range is only rechecked - or
+ * selects nothing; else an `op ANY (array)`, which for a range operator is
+ * ONE walk to the widest element (lion_emit_array_range()), alone; else the
+ * column's plain range comparisons, all of them one walk.
  */
 static List *
 lion_cost_col_ranges(IndexPath *path, int c)
 {
-	IndexOptInfo *index = path->indexinfo;
+	LionCostCol cc;
 	List	   *ranges = NIL;
-	RestrictInfo *arrayrange = NULL;
-	bool		outranked = false;
-	ListCell   *lc;
 
-	foreach(lc, path->indexclauses)
+	lion_cost_col_quals(path, c, &cc);
+	if (!cc.nomatch && cc.walk != NULL && !IsA(cc.walk->clause, NullTest))
 	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-		ListCell   *lc2;
-
-		if (iclause->indexcol != c)
-			continue;
-		foreach(lc2, iclause->indexquals)
+		if (cc.ranges != NIL)
 		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
-			Node	   *clause = (Node *) rinfo->clause;
-
-			if (IsA(clause, OpExpr) &&
-				lion_cost_is_range(index, c, (OpExpr *) clause))
-				ranges = lappend(ranges, rinfo);
-			else if (IsA(clause, ScalarArrayOpExpr) &&
-					 lion_cost_is_range_op(index, c,
-										   ((ScalarArrayOpExpr *) clause)->opno))
-			{
-				if (arrayrange == NULL)
-					arrayrange = rinfo;
-			}
-			else if (!IsA(clause, NullTest))
-				outranked = true;	/* an equality or a list: no walk */
+			ranges = cc.ranges;
+			cc.ranges = NIL;
 		}
+		else
+			ranges = list_make1(cc.walk);
 	}
-
-	/* An array range outranks the plain ones and is one walk alone. */
-	if (outranked)
-	{
-		list_free(ranges);
-		ranges = NIL;
-	}
-	else if (arrayrange != NULL)
-	{
-		list_free(ranges);
-		ranges = list_make1(arrayrange);
-	}
+	lion_cost_col_free(&cc);
 	return ranges;
 }
 
@@ -948,8 +1030,8 @@ lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
  * nothing; on a near-unique one every row is an entry, and this is the term -
  * with the index's own size, an entry header per row against btree's tuple -
  * that leaves such a column to btree, unless the column has summaries (§32),
- * whose walk is a summary per bucket.  Only a column whose chosen qual IS its
- * range pays it (lion_cost_col_ranges()).
+ * whose walk is a summary per bucket.  Only a column the scan walks for its
+ * range pays it (lion_cost_col_ranges()): not one with sets of its own.
  *
  * Beside another column's sets, a plain scan walks a long range once per
  * WINDOW of those sets' containers (DESIGN.md §29.3, lion_walk_window()), so
@@ -1172,21 +1254,21 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
  *	LION_PLAIN_LIST		an IN list longer than a batch, located and streamed a
  *						batch at a time, each batch in heap order.
  *
- * Mirrors lion_source_build(): per key column the qual lion_scan_choose()
- * ranks first is answered; a long list outranks a walk; the first column
- * whose chosen qual is a range walks, and a second one is rechecked; an
- * `IS NOT NULL` walks only when nothing else answers.  Beside another column's
- * sets a range is taken for a WINDOW, as lion_range_entry_cost() takes it: a
- * walk too short for one restarts the other columns' stream a few times at
- * most (lion_source_walk_is_long()), each restart in heap order.  No key at
- * all is a partial index read whole, by a walk of column 1 or, when that
- * column is multi-key, by a union.
+ * Mirrors lion_source_build(): every set qual of every column is answered
+ * (lion_cost_col_quals()); a long list outranks a walk; the first column
+ * that walks a range walks, and a second one is rechecked; an `IS NOT NULL`
+ * walks only when nothing else answers.  Beside another column's sets a
+ * range is taken for a WINDOW, as lion_range_entry_cost() takes it: a walk
+ * too short for one restarts the other columns' stream a few times at most
+ * (lion_source_walk_is_long()), each restart in heap order.  No key at all
+ * is a partial index read whole, by a walk of column 1 or, when that column
+ * is multi-key, by a union.
  *
  * *rechecks says whether the scan sets xs_recheck (§29.6), and so evaluates
  * its index quals on every row it fetches: when it leaves a qual unanswered
- * (a second qual on a column other than a range's bounds, a second walk or
- * long list, a walk beside a list, an `IS NOT NULL` beside anything that
- * answers), when it answers a multi-key column, and for a UNION.
+ * (a range beside its column's sets, a second walk or long list, a walk
+ * beside a list, an `IS NOT NULL` beside anything that answers), when it
+ * answers a multi-key column, and for a UNION.
  */
 #define LION_PLAIN_SORTED	0
 #define LION_PLAIN_WALK		1
@@ -1198,10 +1280,6 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 {
 	IndexOptInfo *index = path->indexinfo;
 	int			ncols = index->nkeycolumns;
-	int			bestrank[INDEX_MAX_KEYS];
-	Node	   *chosen[INDEX_MAX_KEYS];
-	int			nquals[INDEX_MAX_KEYS];
-	int			nranges[INDEX_MAX_KEYS];
 	int			nsets = 0;
 	int			nlists = 0;
 	int			rangecol = -1;
@@ -1210,7 +1288,6 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 	int			nrangecols = 0;
 	int			ndropped = 0;
 	bool		anychosen = false;
-	ListCell   *lc;
 	int			c;
 
 	*walkcol = 0;
@@ -1220,90 +1297,63 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 
 	for (c = 0; c < ncols; c++)
 	{
-		bestrank[c] = 4;
-		chosen[c] = NULL;
-		nquals[c] = 0;
-		nranges[c] = 0;
-	}
+		LionCostCol cc;
+		ListCell   *lc;
 
-	foreach(lc, path->indexclauses)
-	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-		ListCell   *lc2;
-
-		c = iclause->indexcol;
-		if (c < 0 || c >= ncols)
-			continue;
-		foreach(lc2, iclause->indexquals)
+		lion_cost_col_quals(path, c, &cc);
+		if (cc.nquals == 0)
 		{
-			Node	   *clause = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
-			int			rank;
-
-			if (IsA(clause, NullTest))
-				rank = 3;
-			else if (IsA(clause, ScalarArrayOpExpr))
-				rank = 1;
-			else if (IsA(clause, OpExpr) &&
-					 lion_cost_is_range(index, c, (OpExpr *) clause))
-			{
-				rank = 2;
-				nranges[c]++;
-			}
-			else
-				rank = 0;
-			nquals[c]++;
-			if (rank < bestrank[c])
-			{
-				bestrank[c] = rank;
-				chosen[c] = clause;
-			}
-		}
-	}
-
-	for (c = 0; c < ncols; c++)
-	{
-		Node	   *cl = chosen[c];
-
-		if (cl == NULL)
+			lion_cost_col_free(&cc);
 			continue;
+		}
 		anychosen = true;
-		ndropped += nquals[c] - (bestrank[c] == 2 ? nranges[c] : 1);
+		ndropped += cc.ndropped;
 
-		/* a multi-key column is a set tree or a UNION, both in heap order */
-		if (lion_index_is_multikey(index, c))
+		/*
+		 * A column that selects nothing is the NONE source, and a multi-key
+		 * column a set tree or a UNION: all of them in heap order.
+		 */
+		if (cc.nomatch || lion_index_is_multikey(index, c))
 		{
 			nsets++;
-			*rechecks = true;
+			if (!cc.nomatch)
+				*rechecks = true;
+			lion_cost_col_free(&cc);
+			continue;
 		}
-		else if (IsA(cl, NullTest) &&
-				 ((NullTest *) cl)->nulltesttype == IS_NOT_NULL)
+
+		foreach(lc, cc.sets)
+		{
+			Node	   *cl = (Node *) lfirst_node(RestrictInfo, lc)->clause;
+
+			if (IsA(cl, ScalarArrayOpExpr) &&
+				get_op_opfamily_strategy(((ScalarArrayOpExpr *) cl)->opno,
+										 index->opfamily[c]) == LION_STRAT_EQUAL &&
+#if PG_VERSION_NUM >= 170000
+				estimate_array_length(root,
+									  (Node *) lsecond(((ScalarArrayOpExpr *) cl)->args))
+#else
+				estimate_array_length((Node *) lsecond(((ScalarArrayOpExpr *) cl)->args))
+#endif
+				> lion_scan_list_batch())
+				nlists++;
+			else
+				nsets++;
+		}
+
+		if (cc.walk != NULL && IsA(cc.walk->clause, NullTest))
 		{
 			nnotnull++;
 			if (notnullcol < 0)
 				notnullcol = c;
 		}
-		else if (bestrank[c] == 2 ||
-				 (IsA(cl, ScalarArrayOpExpr) &&
-				  lion_cost_is_range_op(index, c,
-										((ScalarArrayOpExpr *) cl)->opno)))
+		else if (cc.walk != NULL)
 		{
 			nrangecols++;
 			if (rangecol < 0)
 				rangecol = c;
 		}
-		else if (IsA(cl, ScalarArrayOpExpr) &&
-				 get_op_opfamily_strategy(((ScalarArrayOpExpr *) cl)->opno,
-										  index->opfamily[c]) == LION_STRAT_EQUAL &&
-#if PG_VERSION_NUM >= 170000
-				 estimate_array_length(root,
-									   (Node *) lsecond(((ScalarArrayOpExpr *) cl)->args))
-#else
-				 estimate_array_length((Node *) lsecond(((ScalarArrayOpExpr *) cl)->args))
-#endif
-				 > lion_scan_list_batch())
-			nlists++;
-		else
-			nsets++;
+		lion_cost_col_free(&cc);
 	}
 
 	if (ndropped > 0 || nrangecols > 1 || nlists > 1 ||
@@ -1626,18 +1676,21 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
  *
  * genericcostestimate() prorates the index by the selectivity of all the
  * quals together, which prices an AND by what it RETURNS.  What it reads is
- * the sets: per key column the qual the scan answers (ranked as
- * lion_plain_scan_shape() ranks them) is a posting set - an equality, `IS
- * NULL`, a multi-key query - or the union of an IN list's, and the scan ANDs
- * them as a count does: the smallest drives, and the others are sought at
- * each of its container keys (lion_merge_cpu_cost(), the count pushdown's own
- * price).  Four dense sets whose AND is a few hundred rows read every
- * container of the smallest and probe the other three at each, which the
- * prorating priced as a few hundred rows: `status = 'val2' AND supp =
- * 'supp' AND flag AND country = 'c7'` over 8M rows, 1,730 rows out, ran 52 ms
- * on lion against 1.2 ms on a btree over the four columns, at about the same
- * cost (6.5k against 6.2k).  A range or `IS NOT NULL` is a walk, priced by
- * lion_range_entry_cost(); one set alone is what the prorating prices.
+ * the sets: every set qual the scan answers, of every key column and as many
+ * as a column has (lion_cost_col_quals()), is a posting set - an equality,
+ * `IS NULL`, a multi-key query - or the union of an IN list's, and the scan
+ * ANDs them as a count does: the smallest drives, and the others are sought
+ * at each of its container keys (lion_merge_cpu_cost(), the count pushdown's
+ * own price).  Two `&&` on one array column are two sources as much as two
+ * columns are; a multi-key query that needs every row is none, since the
+ * scan drops it beside the others and rechecks it.  Four dense sets whose AND
+ * is a few hundred rows read every container of the smallest and probe the
+ * other three at each, which the prorating priced as a few hundred rows:
+ * `status = 'val2' AND supp = 'supp' AND flag AND country = 'c7'` over 8M
+ * rows, 1,730 rows out, ran 52 ms on lion against 1.2 ms on a btree over the
+ * four columns, at about the same cost (6.5k against 6.2k).  A range or `IS
+ * NOT NULL` is a walk, priced by lion_range_entry_cost(); one set alone is
+ * what the prorating prices.
  *
  * The pages: the driver's sets are walked, each a share of the index's
  * container pages (lion_index_column_posting_share()) by its selectivity, and
@@ -1656,98 +1709,91 @@ lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
 	IndexOptInfo *index = path->indexinfo;
 	RelOptInfo *rel = index->rel;
 	int			ncols = index->nkeycolumns;
-	int			bestrank[INDEX_MAX_KEYS];
-	RestrictInfo *chosen[INDEX_MAX_KEYS];
-	double		members[INDEX_MAX_KEYS];
-	double		containers[INDEX_MAX_KEYS];
-	double		nkeys[INDEX_MAX_KEYS];
-	double		probes[INDEX_MAX_KEYS];
-	int			cols[INDEX_MAX_KEYS];
+	double	   *members;
+	double	   *containers;
+	double	   *nkeys;
+	double	   *probes;
+	int		   *cols;
+	List	   *srcs = NIL;
+	List	   *srccols = NIL;
 	double		tuples = Max(rel->tuples, 1.0);
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	bool		nomatch = false;
 	int			nsrc = 0;
 	Cost		cost;
 	ListCell   *lc;
+	ListCell   *lc2;
 	int			c;
 	int			i;
 
 	*pages = 0.0;
-	if (ncols < 2 || ncols > INDEX_MAX_KEYS)
+	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
 		return 0.0;
 
-	for (c = 0; c < ncols; c++)
+	/*
+	 * Every set qual of every column is a source (lion_cost_col_quals()) but a
+	 * multi-key query that needs every row, which the scan drops beside the
+	 * others and rechecks instead of merging (lion_cost_qual_is_full()).
+	 */
+	for (c = 0; c < ncols && !nomatch; c++)
 	{
-		bestrank[c] = 4;
-		chosen[c] = NULL;
-	}
-	foreach(lc, path->indexclauses)
-	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-		ListCell   *lc2;
+		LionCostCol cc;
 
-		c = iclause->indexcol;
-		if (c < 0 || c >= ncols)
-			continue;
-		foreach(lc2, iclause->indexquals)
+		lion_cost_col_quals(path, c, &cc);
+		nomatch = cc.nomatch;
+		foreach(lc, cc.sets)
 		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
-			Node	   *clause = (Node *) rinfo->clause;
-			int			rank;
+			bool		all;
 
-			if (IsA(clause, NullTest))
-				rank = 3;
-			else if (IsA(clause, ScalarArrayOpExpr))
-				rank = 1;
-			else if (IsA(clause, OpExpr) &&
-					 lion_cost_is_range(index, c, (OpExpr *) clause))
-				rank = 2;
-			else
-				rank = 0;
-			if (rank < bestrank[c])
-			{
-				bestrank[c] = rank;
-				chosen[c] = rinfo;
-			}
+			if (lion_cost_qual_is_full(index, c,
+									   (Node *) lfirst_node(RestrictInfo, lc)->clause,
+									   &all))
+				continue;
+			srcs = lappend(srcs, lfirst(lc));
+			srccols = lappend_int(srccols, c);
 		}
+		lion_cost_col_free(&cc);
 	}
 
-	for (c = 0; c < ncols; c++)
+	/* nothing is read when a column selects nothing, and one set is prorated */
+	if (nomatch || list_length(srcs) < 2)
 	{
-		Node	   *clause;
+		list_free(srcs);
+		list_free(srccols);
+		return 0.0;
+	}
+
+	members = (double *) palloc(sizeof(double) * list_length(srcs));
+	containers = (double *) palloc(sizeof(double) * list_length(srcs));
+	nkeys = (double *) palloc(sizeof(double) * list_length(srcs));
+	probes = (double *) palloc(sizeof(double) * list_length(srcs));
+	cols = (int *) palloc(sizeof(int) * list_length(srcs));
+
+	forboth(lc, srcs, lc2, srccols)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Node	   *clause = (Node *) rinfo->clause;
 		double		k = 1.0;
 		Selectivity sel;
 
-		if (chosen[c] == NULL)
-			continue;
-		clause = (Node *) chosen[c]->clause;
+		c = lfirst_int(lc2);
 
-		/* A set, or a walk (a range, `IS NOT NULL`)? */
-		if (!lion_index_is_multikey(index, c))
+		/* A list of a scalar column is the union of its values' sets. */
+		if (!lion_index_is_multikey(index, c) &&
+			IsA(clause, ScalarArrayOpExpr))
 		{
-			if (IsA(clause, NullTest))
-			{
-				if (((NullTest *) clause)->nulltesttype != IS_NULL)
-					continue;
-			}
-			else if (bestrank[c] == 2)
-				continue;
-			else if (IsA(clause, ScalarArrayOpExpr))
-			{
-				ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
 
-				if (lion_cost_is_range_op(index, c, saop->opno))
-					continue;
 #if PG_VERSION_NUM >= 170000
-				k = Max(estimate_array_length(root, (Node *) lsecond(saop->args)),
-						1.0);
+			k = Max(estimate_array_length(root, (Node *) lsecond(saop->args)),
+					1.0);
 #else
-				k = Max(estimate_array_length((Node *) lsecond(saop->args)), 1.0);
+			k = Max(estimate_array_length((Node *) lsecond(saop->args)), 1.0);
 #endif
-			}
 		}
 
-		sel = clauselist_selectivity(root, list_make1(chosen[c]), rel->relid,
+		sel = clauselist_selectivity(root, list_make1(rinfo), rel->relid,
 									 JOIN_INNER, NULL);
 		members[nsrc] = Max(sel * tuples, 0.0);
 		nkeys[nsrc] = k;
@@ -1757,9 +1803,6 @@ lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
 		cols[nsrc] = c;
 		nsrc++;
 	}
-
-	if (nsrc < 2)
-		return 0.0;
 
 	cost = lion_merge_cpu_cost(nsrc, members, containers, NULL, tuples,
 							   probes);
@@ -1783,6 +1826,14 @@ lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
 						  nkeys[i] * Min(leaves, probes[i] * (height + 1.0)));
 		}
 	}
+
+	pfree(members);
+	pfree(containers);
+	pfree(nkeys);
+	pfree(probes);
+	pfree(cols);
+	list_free(srcs);
+	list_free(srccols);
 
 	return cost;
 }
