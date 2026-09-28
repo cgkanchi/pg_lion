@@ -189,6 +189,21 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 										 * index's key order and located by one
 										 * walk of its leaves ("Lookups in key
 										 * order") */
+#define LION_JOINFLAG_SUM		0x10	/* the target list is counts alone:
+										 * one partial row per run, the sum of
+										 * the dimension rows' counts ("The
+										 * per-key path, end to end") */
+
+/*
+ * Where an FK-side join's time goes (DESIGN.md §27, "Where a key's time
+ * goes"): the phases EXPLAIN ANALYZE times when its TIMING option is on, each
+ * summed over the participants of a parallel plan.
+ */
+#define LION_JT_CHILD		0	/* the child plan, producing its rows */
+#define LION_JT_LOOKUP		1	/* locating each key's fk set */
+#define LION_JT_COUNT		2	/* counting it, or testing it, and letting it go */
+#define LION_JT_COLLECT		3	/* collecting the fact filters, once a run */
+#define LION_JT_N			4
 
 /*
  * How many distinct keys of a forward semi join over a non-unique key
@@ -204,10 +219,30 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 /*
  * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
  * dimension row - over and above the containers it reads and the lookup that
- * locates its set: a merge set up and torn down.  It is the same work §26's
- * per-test cost measures, and the same number.
+ * locates its set: a merge set up and torn down.  Derived from what the count
+ * does (DESIGN.md §27, "The cost of a key, after the per-key path"): once it
+ * works in the node's scratch memory and keeps the node's map page pinned,
+ * what is left is some twenty allocations from memory already there, two
+ * cursors built and the plan's decisions, about half a microsecond - this.
+ * §10 and §26 measured 1.0 us a count or test that also made and deleted a
+ * memory context, pinned a map page and, when it merged two sources, malloc'd
+ * and freed two blocks every time: what the per-key fixes took off.
  */
 #define LION_FKJOIN_COUNT_COST	(25.0 * cpu_tuple_cost)
+
+/*
+ * ... and each row the node hands up: a partial count per dimension row that
+ * joins, or the row itself for count(DISTINCT) - the per-tuple context reset,
+ * a virtual tuple, the projection, the return through the executor, and the
+ * pause that lets go of its index pins (the leaf a walk in key order then
+ * reads again for the next key is that key's leaf visit, which
+ * lion_cost_fkjoin_walk() charges).  About 0.2 us from the operations (the
+ * same derivation), where one cpu_tuple_cost used to be charged.  A summed
+ * join (LION_JOINFLAG_SUM) hands up one row per participant and run.  What
+ * core does with the rows above the node - its Finalize Agg's transitions, a
+ * Gather's tuple queue - core charges.
+ */
+#define LION_FKJOIN_ROW_COST	(10.0 * cpu_tuple_cost)
 
 /*
  * ... and one PROBE of such a count into a fact filter's set: a seek of the
@@ -1211,6 +1246,7 @@ typedef struct LionCountScanState
 	int			jointype;
 	bool		joincollect;
 	bool		joinrows;
+	bool		joinsum;		/* LION_JOINFLAG_SUM: one row, the sum */
 	bool		joincollected;
 	bool		joinfiltered;
 	LionPostingSet joinfilter;
@@ -1299,6 +1335,23 @@ typedef struct LionCountScanState
 	int64		joinworkersorted;
 	int64		joinworkerspilled;
 	int64		joinworkerbatches;
+
+	/*
+	 * Where a key's time goes (DESIGN.md §27): the rows the child returned,
+	 * the posting-tree pages the keys' counts read (lion_posting_pages_read
+	 * over each count) and - only under EXPLAIN ANALYZE with its TIMING
+	 * option, which is what jointiming says, as core times a node only then -
+	 * the time spent in each phase (LION_JT_*).  The count's own counters are
+	 * in stats (LionCountStats: key_containers, copy_containers, ...).  The
+	 * joinworker* copies are the workers' sums, as for the counters above.
+	 */
+	int64		joinchildrows;
+	int64		joinposting;
+	bool		jointiming;
+	instr_time	jointime[LION_JT_N];
+	int64		joinworkerchildrows;
+	int64		joinworkerposting;
+	instr_time	joinworkertime[LION_JT_N];
 } LionCountScanState;
 
 /*
@@ -1314,7 +1367,9 @@ typedef struct LionCountScanState
  * non-unique key that nobody has claimed yet.  participants is how many the
  * leader started the plan for, itself included, which is how many ways each
  * of them divides the list pin budget (lion_list_pin_participants()).
- * batches is the batches of keys looked up in key order, summed.
+ * batches is the batches of keys looked up in key order, summed, and
+ * childrows, posting and time the rows, the posting pages and the phases of
+ * "Where a key's time goes" (DESIGN.md §27), summed.
  */
 typedef struct LionJoinShared
 {
@@ -1328,6 +1383,9 @@ typedef struct LionJoinShared
 	int64		sorted;
 	int64		sortedruns;
 	int64		batches;
+	int64		childrows;
+	int64		posting;
+	instr_time	time[LION_JT_N];
 	pg_atomic_uint32 nextchunk;
 	int			participants;
 } LionJoinShared;
@@ -4863,7 +4921,9 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * - then one count of that key's set ANDed with the fact filters: a merge set up
  * and torn down (LION_FKJOIN_COUNT_COST), the set's containers at §10's two
  * cpu_operator_cost each, and the set's chain pages, which are none at all
- * when the fk entries are INLINE.  Then a row out.  A semi or anti join's
+ * when the fk entries are INLINE.  The rows the node hands up are the
+ * caller's to charge (LION_FKJOIN_ROW_COST), which knows how many there are
+ * (lion_add_fkjoin_paths()).  A semi or anti join's
  * count is an existence test (`exists`), which reads the share of the set's
  * containers lion_exists_fraction() expects before it finds a visible row.
  *
@@ -5206,9 +5266,6 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											   heap_pages);
 	run += recheck_tids * LION_RECHECK_TID_COST;
-
-	/* ---- a partial row per dimension row that finds one ---- */
-	run += found * cpu_tuple_cost;
 
 	return run;
 }
@@ -6456,6 +6513,26 @@ lion_fkjoin_sort_cost(double rows, int width)
 }
 
 /*
+ * Is the FK-side join's partial target counts alone (LION_JOINFLAG_SUM)?  The
+ * target is lion_make_partial_target()'s: grouping columns, dimension Vars and
+ * partial count Aggrefs, nothing else at the top level.
+ */
+static bool
+lion_target_counts_only(PathTarget *target)
+{
+	ListCell   *lc;
+
+	if (target->exprs == NIL)
+		return false;
+	foreach(lc, target->exprs)
+	{
+		if (!IsA(lfirst(lc), Aggref))
+			return false;
+	}
+	return true;
+}
+
+/*
  * One FK-side join path (DESIGN.md §27) over `child` - the dimension's
  * cheapest path, or, with `workers` above zero, its cheapest partial path run
  * by that many workers - and what goes above it into the grouped rel.
@@ -6476,13 +6553,16 @@ lion_fkjoin_sort_cost(double rows, int width)
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
- * it costs the child plus what it does per dimension row.  In a parallel plan
- * the child hands each participant its share of the dimension rows, the
- * dimension rows divided as core divides a partial path's (the Gather may
- * start more workers than the child planned, "Parallel"); every participant
- * locates the fact filters and makes its own copy of them, so the cost of
- * those is charged in full to each, as a hash join below a Gather charges its
- * hash table - the elapsed cost of the parallel plan is one participant's.
+ * it costs the child plus what it does per dimension row.  A target of counts
+ * alone is summed instead (LION_JOINFLAG_SUM): one row per participant and
+ * run, which is what core's Gather and Finalize Agg above it then handle.
+ * In a parallel plan the child hands each participant its share of the
+ * dimension rows, the dimension rows divided as core divides a partial path's
+ * (the Gather may start more workers than the child planned, "Parallel");
+ * every participant locates the fact filters and makes its own copy of them,
+ * so the cost of those is charged in full to each, as a hash join below a
+ * Gather charges its hash table - the elapsed cost of the parallel plan is
+ * one participant's.
  *
  * Above a partial path goes a Gather; above that, or above the node itself,
  * core's Finalize Agg over the partial counts - or, for emitted rows, a Sort
@@ -6514,6 +6594,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	double		rowbytes;
 	bool		collect;
 	bool		walk;
+	bool		sum;
 	Cost		run;
 	Cost		startup;
 	int			flags;
@@ -6535,10 +6616,18 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 							   childfound,
 							   jointype != LION_JOIN_INNER || emitrows,
 							   rowbytes, &collect, &walk);
+
+	/*
+	 * Partial counts and nothing else - no dimension column to group by or
+	 * to print - are handed up as one partial row, their sum (DESIGN.md §27,
+	 * "The per-key path, end to end").
+	 */
+	sum = !emitrows && lion_target_counts_only(nodetarget);
 	flags = (collect ? LION_JOINFLAG_COLLECT : 0) |
 		(emitrows ? LION_JOINFLAG_ROWS : 0) |
 		(unique ? LION_JOINFLAG_UNIQUE : 0) |
-		(walk ? LION_JOINFLAG_WALK : 0);
+		(walk ? LION_JOINFLAG_WALK : 0) |
+		(sum ? LION_JOINFLAG_SUM : 0);
 
 	/*
 	 * The node starts when its child does - or, when it sorts the child's
@@ -6599,6 +6688,11 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	rows = unique ? childfound :
 		(jointype == LION_JOIN_INNER) ? childrows :
 		clamp_row_est(Min(fj->joinrel->rows * share, childrows));
+
+	/* ... or one, their sum, when that is all the target wants */
+	if (sum)
+		rows = 1.0;
+	run += rows * LION_FKJOIN_ROW_COST;
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = startup;
 	cpath->path.total_cost = child->total_cost + run;
@@ -9293,6 +9387,9 @@ lion_close_relation(LionCountScanState *st)
 {
 	int			i;
 
+	/* the counts' map page is this relation's */
+	lion_vis_cache_release_vm(st->viscache);
+
 	if (st->groupidx != NULL)
 	{
 		index_close(st->groupidx, AccessShareLock);
@@ -9469,6 +9566,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->jointype = LION_JOIN_INNER;
 	st->joincollect = false;
 	st->joinrows = false;
+	st->joinsum = false;
 	st->joinunique = false;
 	st->joinwalk = false;
 	st->joinsortop = InvalidOid;
@@ -9482,6 +9580,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->jointype = lsecond_int(join);
 		st->joincollect = (lthird_int(join) & LION_JOINFLAG_COLLECT) != 0;
 		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
+		st->joinsum = (lthird_int(join) & LION_JOINFLAG_SUM) != 0;
 		st->joinunique = (lthird_int(join) & LION_JOINFLAG_UNIQUE) != 0;
 		st->joinwalk = (lthird_int(join) & LION_JOINFLAG_WALK) != 0;
 		st->joinsortop = (Oid) list_nth_int(join, 3);
@@ -9494,7 +9593,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			 st->jointype != LION_JOIN_ANTI) ||
 			(st->joinunique &&
 			 (st->jointype != LION_JOIN_INNER ||
-			  !OidIsValid(st->joinsortop))))
+			  !OidIsValid(st->joinsortop))) ||
+			(st->joinsum && st->joinrows))
 			elog(ERROR, "LionCount: malformed join");
 	}
 
@@ -9505,6 +9605,32 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->tlkind[i] = list_nth_int(kinds, i);
 		if (LION_TL_IS_CHILDCOL(st->tlkind[i]) && st->joinclause < 0)
 			elog(ERROR, "LionCount: a child column without a join");
+	}
+
+	/*
+	 * A summed join's one row stands for no dimension row (LION_JOINFLAG_SUM),
+	 * so what the plan's target list reads of it must be counts alone - the
+	 * join key's column is in custom_scan_tlist for the clause's value, and is
+	 * read by nothing else.  Said, rather than trusted, like a malformed join.
+	 */
+	if (st->joinsum)
+	{
+		List	   *vars = pull_var_clause((Node *) cscan->scan.plan.targetlist,
+										   PVC_RECURSE_AGGREGATES |
+										   PVC_RECURSE_WINDOWFUNCS |
+										   PVC_RECURSE_PLACEHOLDERS);
+		ListCell   *lc;
+
+		foreach(lc, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc);
+
+			if (var->varno != INDEX_VAR || var->varattno < 1 ||
+				var->varattno > st->ntlist ||
+				st->tlkind[var->varattno - 1] != LION_TL_COUNT)
+				elog(ERROR, "LionCount: a summed join reads more than its counts");
+		}
+		list_free(vars);
 	}
 
 	/*
@@ -9826,6 +9952,22 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinsorted = 0;
 	st->joinhavesortstats = false;
 	st->joinworkersorted = 0;
+	st->joinchildrows = 0;
+	st->joinposting = 0;
+
+	/*
+	 * Timed only when core times the nodes: under EXPLAIN ANALYZE with its
+	 * TIMING option (or auto_explain's), which is what es_instrument says in
+	 * every participant, as it says so to InstrAlloc() for each node.
+	 */
+	st->jointiming = (estate->es_instrument & INSTRUMENT_TIMER) != 0;
+	st->joinworkerchildrows = 0;
+	st->joinworkerposting = 0;
+	for (i = 0; i < LION_JT_N; i++)
+	{
+		INSTR_TIME_SET_ZERO(st->jointime[i]);
+		INSTR_TIME_SET_ZERO(st->joinworkertime[i]);
+	}
 	if (st->joinclause >= 0)
 	{
 		st->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
@@ -11225,9 +11367,20 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 	{
 		int			kind = st->tlkind[i];
 
-		/* A dimension column of the FK-side join, from the child's row. */
+		/*
+		 * A dimension column of the FK-side join, from the child's row - of
+		 * which a summed join's one row has none: nothing reads its dimension
+		 * columns (LION_JOINFLAG_SUM).
+		 */
 		if (LION_TL_IS_CHILDCOL(kind))
 		{
+			if (st->childslot == NULL)
+			{
+				Assert(st->joinsum);
+				slot->tts_values[i] = (Datum) 0;
+				slot->tts_isnull[i] = true;
+				continue;
+			}
 			slot->tts_values[i] = slot_getattr(st->childslot,
 											   LION_TL_CHILDRESNO(kind),
 											   &slot->tts_isnull[i]);
@@ -13116,6 +13269,64 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 	return lion_next_group(st, exhausted);
 }
 
+static void lion_unpin_where(LionCountScanState *st);
+
+/*
+ * EXPLAIN ANALYZE's clock of the FK-side join (DESIGN.md §27, "Where a key's
+ * time goes"): charge the time since *since to `phase` (to nothing when phase
+ * is negative) and start the next phase now.  It does nothing unless the node
+ * is timed - under EXPLAIN ANALYZE with its TIMING option, as core times a
+ * node - so an untimed run pays a test and no clock read.
+ */
+static inline void
+lion_join_clock(LionCountScanState *st, int phase, instr_time *since)
+{
+	instr_time	now;
+
+	if (!st->jointiming)
+		return;
+	INSTR_TIME_SET_CURRENT(now);
+	if (phase >= 0)
+		INSTR_TIME_ACCUM_DIFF(st->jointime[phase], now, *since);
+	*since = now;
+}
+
+/* The child's next row, counted, and timed when the node is. */
+static TupleTableSlot *
+lion_join_child_next(LionCountScanState *st)
+{
+	TupleTableSlot *slot;
+	instr_time	t;
+
+	INSTR_TIME_SET_ZERO(t);
+	lion_join_clock(st, -1, &t);
+	slot = ExecProcNode(st->child);
+	lion_join_clock(st, LION_JT_CHILD, &t);
+	if (!TupIsNull(slot))
+		st->joinchildrows++;
+	return slot;
+}
+
+/*
+ * One key's count - or existence test, for a semi or anti join and for the
+ * rows of a count(DISTINCT) - of the fk set located into groupset, ANDed with
+ * the fact filters or their collected copy; the posting pages it reads are
+ * EXPLAIN ANALYZE's (DESIGN.md §27, "Where a key's time goes").
+ */
+static int64
+lion_join_count_key(LionCountScanState *st)
+{
+	int64		pages = lion_posting_pages_read;
+	int64		count;
+	bool		exists = (st->jointype != LION_JOIN_INNER || st->joinrows);
+
+	count = st->joinfiltered ?
+		lion_node_count(st, 2, st->joinsources, exists) :
+		lion_node_count(st, st->nsource, st->sources, exists);
+	st->joinposting += lion_posting_pages_read - pages;
+	return count;
+}
+
 /*
  * The fact filters of the FK-side join, collected once per run into a private
  * posting set when the plan asks for it (DESIGN.md §27): what each dimension
@@ -13151,6 +13362,8 @@ lion_join_collect(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
+	LionCountStats cstats;
+	instr_time	t;
 	bool		ok;
 	bool		spilled;
 	int			k;
@@ -13190,11 +13403,26 @@ lion_join_collect(LionCountScanState *st)
 	 * table would, and a participant of a parallel plan makes one of its own,
 	 * as each participant of a hash join below a Gather builds its own table.
 	 */
+	INSTR_TIME_SET_ZERO(t);
+	lion_join_clock(st, -1, &t);
+	memset(&cstats, 0, sizeof(cstats));
 	oldcxt = MemoryContextSwitchTo(st->outercxt);
 	ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
 							  &st->sources[1], get_hash_memory_limit(), true,
-							  &st->joinfilter, &spilled, &st->stats);
+							  &st->joinfilter, &spilled, &cstats);
 	MemoryContextSwitchTo(oldcxt);
+	lion_join_clock(st, LION_JT_COLLECT, &t);
+
+	/*
+	 * What EXPLAIN ANALYZE reports of the copy is what the counts read of it
+	 * ("Where a key's time goes"); a filter that is itself a copy (a range
+	 * collected into memory, §32) was read once to make this one, and that
+	 * is the collection's, whose containers are counted as any are.
+	 */
+	cstats.copy_containers = 0;
+	cstats.copy_seeks = 0;
+	cstats.copy_file_reads = 0;
+	lion_count_stats_add(&st->stats, &cstats);
 	if (!ok)
 		return;
 
@@ -13202,6 +13430,15 @@ lion_join_collect(LionCountScanState *st)
 	st->joinfilterrows = (int64) st->joinfilter.ntids;
 	if (spilled)
 		st->joinspilled++;
+
+	/*
+	 * No count reads the WHERE sets again this run - each reads its fk set
+	 * and the copy - so their pins go now, before the child runs, rather than
+	 * at the first row that goes up: pins of index pages held while the
+	 * child runs user code are what keep a VACUUM of the fact table waiting
+	 * ("Visibility and the §9 interlock").
+	 */
+	lion_unpin_where(st);
 
 	/* The filters select no row at all: as a clause with no entry does. */
 	if (!st->joinfilter.found)
@@ -13245,7 +13482,7 @@ lion_join_sort_keys(LionCountScanState *st)
 		bool		isnull;
 
 		CHECK_FOR_INTERRUPTS();
-		slot = ExecProcNode(st->child);
+		slot = lion_join_child_next(st);
 		if (TupIsNull(slot))
 			break;
 		key = slot_getattr(slot, st->joinkeyresno, &isnull);
@@ -13444,7 +13681,7 @@ lion_join_fill_batch(LionCountScanState *st)
 
 		CHECK_FOR_INTERRUPTS();
 		slot = st->joinunique ? lion_join_next_key(st) :
-			ExecProcNode(st->child);
+			lion_join_child_next(st);
 		if (TupIsNull(slot))
 		{
 			st->joinchilddone = true;
@@ -13515,11 +13752,11 @@ lion_join_batch_row(LionCountScanState *st, const LionJoinEnt *ent)
 }
 
 /*
- * lion_next_join_row() for a plan that looks the keys up in key order: the
+ * lion_join_next_row() for a plan that looks the keys up in key order: the
  * same rows, counted the same way, from the batches above.
  */
-static TupleTableSlot *
-lion_next_join_walk(LionCountScanState *st)
+static bool
+lion_join_next_walked(LionCountScanState *st, int64 *countp)
 {
 	bool		anti = (st->jointype == LION_JOIN_ANTI);
 	MemoryContext oldcxt;
@@ -13536,8 +13773,7 @@ lion_next_join_walk(LionCountScanState *st)
 			!lion_join_fill_batch(st))
 		{
 			lion_join_batch_reset(st);
-			st->done = true;
-			return NULL;
+			return false;
 		}
 		ent = &st->joinbatch[st->joinbatchpos++];
 
@@ -13545,8 +13781,10 @@ lion_next_join_walk(LionCountScanState *st)
 		{
 			/* joins nothing: an anti join's row, which only it batched */
 			Assert(anti);
-			lion_join_batch_row(st, ent);
-			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 1);
+			if (!st->joinsum)
+				lion_join_batch_row(st, ent);
+			*countp = 1;
+			return true;
 		}
 		st->joinlookups++;
 
@@ -13559,24 +13797,19 @@ lion_next_join_walk(LionCountScanState *st)
 		}
 		else
 		{
+			instr_time	t;
+
+			INSTR_TIME_SET_ZERO(t);
+			lion_join_clock(st, -1, &t);
 			MemoryContextReset(st->pergroup);
 			oldcxt = MemoryContextSwitchTo(st->pergroup);
 			found = lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
 										  &st->groupset);
-			count = 0;
-			if (found)
-			{
-				if (st->jointype == LION_JOIN_INNER && !st->joinrows)
-					count = st->joinfiltered ?
-						lion_node_count(st, 2, st->joinsources, false) :
-						lion_node_count(st, st->nsource, st->sources, false);
-				else
-					count = st->joinfiltered ?
-						lion_node_count(st, 2, st->joinsources, true) :
-						lion_node_count(st, st->nsource, st->sources, true);
-			}
+			lion_join_clock(st, LION_JT_LOOKUP, &t);
+			count = found ? lion_join_count_key(st) : 0;
 			lion_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
+			lion_join_clock(st, LION_JT_COUNT, &t);
 
 			st->joinlasthave = true;
 			st->joinlastkey = ent->key;
@@ -13591,14 +13824,17 @@ lion_next_join_walk(LionCountScanState *st)
 		if (count == 0)
 			continue;
 
-		lion_join_batch_row(st, ent);
-		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
+		if (!st->joinsum)
+			lion_join_batch_row(st, ent);
+		*countp = count;
+		return true;
 	}
 }
 
 /*
- * The FK-side join (DESIGN.md §27): the next dimension row with fact rows, as
- * one partial row - its dimension columns and its count.
+ * The FK-side join (DESIGN.md §27): the next dimension row with fact rows -
+ * its partial count in *countp, and the row itself in childslot, for the
+ * target list - or false when there is none left.
  *
  * Each row of the child plan - the dimension side, under the query's snapshot,
  * with its quals, RLS and privileges applied by core - carries a key.  A NULL
@@ -13623,23 +13859,125 @@ lion_next_join_walk(LionCountScanState *st)
  * same existence tests over an inner join: the dimension rows that join,
  * once each, with no count at all.
  *
- * The row is PARTIAL: core's Finalize Agg above groups them by the dimension
- * columns and adds the counts, which is the join's count for each group
- * because that count is a sum over the group's dimension rows - or, for
- * joinrows, it is a row core's plain Agg aggregates as it would the join's.
- *
  * A forward semi join over a non-unique key (joinunique) reads its rows from
  * the sorted child instead, one per DISTINCT key (lion_join_next_key()), and
  * counts each as an inner join counts a dimension row.  The posting sets of
  * distinct keys are disjoint - a fact row has one fk value, and two distinct
  * keys cannot both equal it - so the counts add up to the fact rows with at
  * least one matching dimension row, each once: the semi join's count.
+ *
+ * A summed join (joinsum, lion_next_join_row()) wants no row, only the
+ * count: the child's next row is fetched with no pin of the node's held
+ * (lion_pause_run(), which has something to let go of only the first time -
+ * the WHERE sets' pins - as a row-at-a-time join that hands its rows up lets
+ * go of them at its first row).
+ */
+static bool
+lion_join_next_row(LionCountScanState *st, int64 *countp)
+{
+	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	MemoryContext oldcxt;
+
+	for (;;)
+	{
+		TupleTableSlot *childslot;
+		Datum		key;
+		bool		isnull;
+		bool		found;
+		int64		count;
+		instr_time	t;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (st->joinsum)
+			lion_pause_run(st);
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+		childslot = st->joinunique ? lion_join_next_key(st) :
+			lion_join_child_next(st);
+		if (TupIsNull(childslot))
+		{
+			st->childslot = NULL;
+			return false;
+		}
+
+		key = slot_getattr(childslot, st->joinkeyresno, &isnull);
+		if (isnull || st->wheremissing)
+		{
+			/* joins nothing: a row only of an anti join */
+			if (!anti)
+				continue;
+			st->childslot = childslot;
+			*countp = 1;
+			return true;
+		}
+		st->joinlookups++;
+
+		INSTR_TIME_SET_ZERO(t);
+		lion_join_clock(st, -1, &t);
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		/* a descent, with the key's probe resolved once for the node */
+		found = lion_lookup_walk_descend(&st->joinwalker, key, &st->groupset);
+		lion_join_clock(st, LION_JT_LOOKUP, &t);
+		if (!found)
+		{
+			lion_posting_set_release(&st->groupset);
+			MemoryContextSwitchTo(oldcxt);
+			st->joinmissing++;
+			if (!anti)
+				continue;
+			st->childslot = childslot;
+			*countp = 1;
+			return true;
+		}
+
+		count = lion_join_count_key(st);
+		lion_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+		lion_join_clock(st, LION_JT_COUNT, &t);
+
+		if (anti)
+			count = 1 - count;
+		if (count == 0)
+			continue;
+
+		st->childslot = childslot;
+		*countp = count;
+		return true;
+	}
+}
+
+/*
+ * The FK-side join's next row (DESIGN.md §27): one PARTIAL row per dimension
+ * row with fact rows - its dimension columns and its count - which core's
+ * Finalize Agg above groups by the dimension columns and adds up, the join's
+ * count for each group being a sum over the group's dimension rows; or, for
+ * joinrows, a row core's plain Agg aggregates as it would the join's.
+ *
+ * SUMMED (joinsum, LION_JOINFLAG_SUM): when the target list is counts alone -
+ * `SELECT count(*) FROM fact JOIN dim ...` and its semi, anti and distinct-key
+ * forms, with no dimension column to group by or to print - the rows'
+ * partial counts differ in nothing the Finalize Agg looks at but the count,
+ * and it adds them up.  So the node adds them up itself and hands up ONE
+ * partial row, their sum, per run of each participant: exactly what a
+ * Partial Aggregate below a Gather hands up.  Every dimension row that used
+ * to go up alone paid for it - its projection, the return through the
+ * executor, a pause that let the walk's leaf go (read again for the next
+ * key), the Finalize Agg's transition, and in a parallel plan a trip through
+ * the Gather's tuple queue into the leader, which reads every worker's rows
+ * alone - and none of that was the key's own work.  An empty join hands up
+ * no row, as a join whose every row has count 0 did: a plain Finalize Agg
+ * answers 0 for it, and a GROUP BY folded to constants has no group, as core
+ * forms none over an empty input.
  */
 static TupleTableSlot *
 lion_next_join_row(LionCountScanState *st)
 {
 	LionClauseState *jcl = &st->clause[st->joinclause];
 	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	bool		walked = false;
+	int64		count;
 	MemoryContext oldcxt;
 
 	if (!st->joincollected)
@@ -13660,13 +13998,15 @@ lion_next_join_row(LionCountScanState *st)
 		lion_join_sort_keys(st);
 
 	/*
-	 * Lookups in key order, when the plan asks for them and there are any to
-	 * make: begun once for the node, in its query memory.  Keys the directory
-	 * cannot be sorted by - a cross-type key whose family has no ordering of
-	 * its own for that type (lion_probe_init()) - are looked up a row at a
-	 * time below, as they would be without the walk.
+	 * The walk of the fk index's directory, begun once for the node in its
+	 * query memory, which resolves the key's probe once for all the lookups
+	 * (lion_lookup_walk_begin()) - in key order when the plan asks for it and
+	 * the keys can be sorted into it, and otherwise a descent per key.  Keys
+	 * the directory cannot be sorted by - a cross-type key whose family has
+	 * no ordering of its own for that type (lion_probe_init()) - are looked
+	 * up a row at a time, as they would be without the walk.
 	 */
-	if (st->joinwalk && !st->wheremissing)
+	if (!st->wheremissing)
 	{
 		if (!st->joinwalkbegun)
 		{
@@ -13676,76 +14016,30 @@ lion_next_join_row(LionCountScanState *st)
 			MemoryContextSwitchTo(oldcxt);
 			st->joinwalkbegun = true;
 		}
-		if (lion_lookup_walk_ordered(&st->joinwalker))
-			return lion_next_join_walk(st);
+		walked = (st->joinwalk && lion_lookup_walk_ordered(&st->joinwalker));
 	}
 
-	for (;;)
+	if (st->joinsum)
 	{
-		TupleTableSlot *childslot;
-		Datum		key;
-		bool		isnull;
-		bool		found;
-		int64		count;
+		int64		total = 0;
 
-		CHECK_FOR_INTERRUPTS();
-
-		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
-		childslot = st->joinunique ? lion_join_next_key(st) :
-			ExecProcNode(st->child);
-		if (TupIsNull(childslot))
-		{
-			st->childslot = NULL;
-			st->done = true;
+		while (walked ? lion_join_next_walked(st, &count) :
+			   lion_join_next_row(st, &count))
+			total += count;
+		st->done = true;
+		st->childslot = NULL;
+		if (total == 0)
 			return NULL;
-		}
-
-		key = slot_getattr(childslot, st->joinkeyresno, &isnull);
-		if (isnull || st->wheremissing)
-		{
-			/* joins nothing: a row only of an anti join */
-			if (!anti)
-				continue;
-			st->childslot = childslot;
-			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 1);
-		}
-		st->joinlookups++;
-
-		MemoryContextReset(st->pergroup);
-		oldcxt = MemoryContextSwitchTo(st->pergroup);
-
-		found = lion_posting_set_lookup_col(jcl->idx, jcl->idxcol, key,
-										   jcl->valtype, &st->groupset);
-		if (!found)
-		{
-			lion_posting_set_release(&st->groupset);
-			MemoryContextSwitchTo(oldcxt);
-			st->joinmissing++;
-			if (!anti)
-				continue;
-			st->childslot = childslot;
-			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 1);
-		}
-
-		if (st->jointype == LION_JOIN_INNER && !st->joinrows)
-			count = st->joinfiltered ?
-				lion_node_count(st, 2, st->joinsources, false) :
-				lion_node_count(st, st->nsource, st->sources, false);
-		else
-			count = st->joinfiltered ?
-				lion_node_count(st, 2, st->joinsources, true) :
-				lion_node_count(st, st->nsource, st->sources, true);
-		lion_posting_set_release(&st->groupset);
-		MemoryContextSwitchTo(oldcxt);
-
-		if (anti)
-			count = 1 - count;
-		if (count == 0)
-			continue;
-
-		st->childslot = childslot;
-		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 	}
+
+	if (!(walked ? lion_join_next_walked(st, &count) :
+		  lion_join_next_row(st, &count)))
+	{
+		st->done = true;
+		return NULL;
+	}
+	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
 }
 
 /*
@@ -13904,31 +14198,12 @@ lion_exec_partitioned(LionCountScanState *st)
 static void
 lion_pause_run(LionCountScanState *st)
 {
-	int			i;
-	int			j;
-
 	if (st->scanning)
 		lion_entry_scan_pause(&st->escan);
 	if (st->scanning2)
 		lion_entry_scan_pause(&st->escan2);
 
-	/*
-	 * The WHERE sets gain pins only where they are located
-	 * (lion_locate_where()), so after the first pause there is nothing left
-	 * to unpin in them - and walking them all again after every row made a
-	 * list-driven GROUP BY of N values N-squared.
-	 */
-	if (st->sources != NULL && st->wherepinned)
-	{
-		for (i = 1; i <= st->nitem; i++)
-		{
-			LionCountSource *src = &st->sources[i];
-
-			for (j = 0; j < src->nsets; j++)
-				lion_posting_set_unpin(&src->sets[j]);
-		}
-		st->wherepinned = false;
-	}
+	lion_unpin_where(st);
 	if (st->outeropen)
 		lion_posting_set_unpin(&st->groupset);
 
@@ -13938,6 +14213,32 @@ lion_pause_run(LionCountScanState *st)
 	 */
 	if (st->joinwalkbegun)
 		lion_lookup_walk_pause(&st->joinwalker);
+}
+
+/*
+ * The WHERE sets let go of the pins they were located with: NOPIN copies from
+ * here on, every count of them carried by another source's pin (DESIGN.md
+ * §15, "Paused and finished counts").  They gain pins only where they are
+ * located (lion_locate_where()), so after the first time there is nothing
+ * left to unpin in them - and walking them all again after every row made a
+ * list-driven GROUP BY of N values N-squared.
+ */
+static void
+lion_unpin_where(LionCountScanState *st)
+{
+	int			i;
+	int			j;
+
+	if (st->sources == NULL || !st->wherepinned)
+		return;
+	for (i = 1; i <= st->nitem; i++)
+	{
+		LionCountSource *src = &st->sources[i];
+
+		for (j = 0; j < src->nsets; j++)
+			lion_posting_set_unpin(&src->sets[j]);
+	}
+	st->wherepinned = false;
 }
 
 /*
@@ -13967,6 +14268,13 @@ lion_finish_run(LionCountScanState *st)
 	st->outeropen = false;
 	lion_join_batch_reset(st);
 	lion_release_where(st);
+
+	/*
+	 * ... and the visibility-map page the counts kept pinned from one to the
+	 * next, which a paused node keeps as an index-only scan keeps its own:
+	 * no VACUUM waits for a map page's pin (lion_vis_cache_release_vm()).
+	 */
+	lion_vis_cache_release_vm(st->viscache);
 }
 
 static TupleTableSlot *
@@ -13995,12 +14303,13 @@ lion_exec_custom_scan(CustomScanState *node)
 	}
 
 	/*
-	 * No pin outlives the call (DESIGN.md §15, "Paused and finished counts"):
-	 * a node that is done lets go of everything, and one that returns a row
-	 * with more to come keeps its sets but none of their pins.  The row
-	 * itself points at nothing either releases: a key the WHERE pinned is in
-	 * keycxt, a group's key in pergroup or outercxt, and a listed value's in
-	 * the set, which a pause keeps.
+	 * No index pin outlives the call (DESIGN.md §15, "Paused and finished
+	 * counts"): a node that is done lets go of everything, and one that
+	 * returns a row with more to come keeps its sets but none of their pins -
+	 * only the visibility-map page its counts share, as an index-only scan
+	 * keeps its own.  The row itself points at nothing either releases: a key
+	 * the WHERE pinned is in keycxt, a group's key in pergroup or outercxt,
+	 * and a listed value's in the set, which a pause keeps.
 	 */
 	if (st->done)
 		lion_finish_run(st);
@@ -14319,6 +14628,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinShared *shared = st->joinshared;
+	int			i;
 
 	if (shared == NULL)
 		return;
@@ -14328,15 +14638,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		if (st->joinreported)
 			return;
 		SpinLockAcquire(&shared->mutex);
-		shared->stats.blocks_skipped_via_vm += st->stats.blocks_skipped_via_vm;
-		shared->stats.tids_rechecked += st->stats.tids_rechecked;
-		shared->stats.blocks_rechecked += st->stats.blocks_rechecked;
-		shared->stats.containers_visited += st->stats.containers_visited;
-		shared->stats.probes_avoided += st->stats.probes_avoided;
-		shared->stats.cache_hits += st->stats.cache_hits;
-		shared->stats.cache_full += st->stats.cache_full;
-		shared->stats.sets_summed += st->stats.sets_summed;
-		shared->stats.rows_removed += st->stats.rows_removed;
+		lion_count_stats_add(&shared->stats, &st->stats);
 		shared->lookups += st->joinlookups;
 		shared->missing += st->joinmissing;
 		shared->dirpages += st->dirpages;
@@ -14344,6 +14646,10 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->spilled += st->joinspilled;
 		shared->sorted = Max(shared->sorted, st->joinsorted);
 		shared->batches += st->joinbatches;
+		shared->childrows += st->joinchildrows;
+		shared->posting += st->joinposting;
+		for (i = 0; i < LION_JT_N; i++)
+			INSTR_TIME_ADD(shared->time[i], st->jointime[i]);
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -14358,6 +14664,10 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkerspilled = shared->spilled;
 	st->joinworkersorted = shared->sortedruns + shared->sorted;
 	st->joinworkerbatches = shared->batches;
+	st->joinworkerchildrows = shared->childrows;
+	st->joinworkerposting = shared->posting;
+	for (i = 0; i < LION_JT_N; i++)
+		st->joinworkertime[i] = shared->time[i];
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -14815,15 +15125,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		LionCountStats tot = st->stats;
 
-		tot.blocks_skipped_via_vm += st->joinworkerstats.blocks_skipped_via_vm;
-		tot.tids_rechecked += st->joinworkerstats.tids_rechecked;
-		tot.blocks_rechecked += st->joinworkerstats.blocks_rechecked;
-		tot.containers_visited += st->joinworkerstats.containers_visited;
-		tot.probes_avoided += st->joinworkerstats.probes_avoided;
-		tot.cache_hits += st->joinworkerstats.cache_hits;
-		tot.cache_full += st->joinworkerstats.cache_full;
-		tot.sets_summed += st->joinworkerstats.sets_summed;
-		tot.rows_removed += st->joinworkerstats.rows_removed;
+		lion_count_stats_add(&tot, &st->joinworkerstats);
 
 		ExplainPropertyInteger("Heap Blocks Skipped via VM", NULL,
 							   tot.blocks_skipped_via_vm, es);
@@ -15001,10 +15303,37 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 										es);
 				}
 			}
+
+			/*
+			 * Where a key's time goes (DESIGN.md §27): the rows the child
+			 * returned - the keys looked up, and the NULL keys, which join
+			 * nothing; every participant's, so for a forward semi join over a
+			 * non-unique key, whose participants each run the whole child,
+			 * that many times the dimension's rows - ...
+			 */
+			ExplainPropertyInteger("Join Child Rows", NULL,
+								   st->joinchildrows + st->joinworkerchildrows,
+								   es);
 			ExplainPropertyInteger("Join Keys Looked Up", NULL,
 								   st->joinlookups + st->joinworkerlookups, es);
 			ExplainPropertyInteger("Join Keys Without Entry", NULL,
 								   st->joinmissing + st->joinworkermissing, es);
+
+			/*
+			 * ... what their counts read of the keys' own fk sets - their
+			 * containers, and the pages of posting trees, which a set of a
+			 * few rows stored INLINE in its directory leaf has none of - and
+			 * of the visibility map: the containers it was asked about and the
+			 * map pages pinned for them.
+			 */
+			ExplainPropertyInteger("Join Key Containers Read", NULL,
+								   tot.key_containers, es);
+			ExplainPropertyInteger("Join Posting Pages Read", NULL,
+								   st->joinposting + st->joinworkerposting, es);
+			ExplainPropertyInteger("Visibility Map Checks", NULL,
+								   tot.vm_checks, es);
+			ExplainPropertyInteger("Visibility Map Pages Pinned", NULL,
+								   tot.vm_pins, es);
 
 			/*
 			 * The batches the keys were looked up in, in the fk index's order:
@@ -15035,6 +15364,48 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				ExplainPropertyInteger("Fact Filter Copies Spilled", NULL,
 									   st->joinspilled + st->joinworkerspilled,
 									   es);
+
+			/*
+			 * What the counts read of the copy: its containers, the binary
+			 * searches that found them, and of those the ones read back from
+			 * a spilled copy's temporary file - one read each, never the
+			 * copy again.
+			 */
+			if (st->joincollect)
+			{
+				ExplainPropertyInteger("Fact Filter Copy Containers Read", NULL,
+									   tot.copy_containers, es);
+				ExplainPropertyInteger("Fact Filter Copy Seeks", NULL,
+									   tot.copy_seeks, es);
+				ExplainPropertyInteger("Fact Filter Copy File Reads", NULL,
+									   tot.copy_file_reads, es);
+			}
+
+			/*
+			 * With TIMING, the time spent in each phase, summed over the
+			 * participants: the child producing its rows, the lookups, the
+			 * counts, and the collection of the fact filters.  What the node
+			 * took besides - its batches, its rows handed up - is its own
+			 * total less these.
+			 */
+			if (es->timing)
+			{
+				static const char *const phasename[LION_JT_N] = {
+					"Join Child Time", "Join Lookup Time", "Join Count Time",
+					"Fact Filter Collect Time"
+				};
+
+				for (i = 0; i < LION_JT_N; i++)
+				{
+					instr_time	t = st->jointime[i];
+
+					if (i == LION_JT_COLLECT && !st->joincollect)
+						continue;
+					INSTR_TIME_ADD(t, st->joinworkertime[i]);
+					ExplainPropertyFloat(phasename[i], "ms",
+										 INSTR_TIME_GET_MILLISEC(t), 3, es);
+				}
+			}
 		}
 	}
 }

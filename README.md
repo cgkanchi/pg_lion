@@ -198,6 +198,16 @@ that the copy spills to a temporary file, as a hash join's table would. Their va
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
 (`o.status = ANY ($1)`) included: every process evaluates them once per scan.
 
+`EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
+key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
+Entry`, the containers the counts read from each key's FK set (`Join Key Containers Read`), from the
+collected copy of the fact filters (`Fact Filter Copy Containers Read`, `Seeks`, and `File Reads`
+when the copy spilled), the posting-tree pages they read (`Join Posting Pages Read`) and the
+visibility map (`Visibility Map Checks`, `Pages Pinned`); with `TIMING` on, also `Join Child Time`,
+`Join Lookup Time`, `Join Count Time` and `Fact Filter Collect Time`, summed over parallel workers.
+A join whose result is counts alone (no `GROUP BY`, no dimension column in the output) adds the
+dimension rows' counts up inside the node and hands up one row per process.
+
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
 ```sql
