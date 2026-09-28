@@ -7488,7 +7488,11 @@ copy cannot lack a row the snapshot sees: it is made after the snapshot was take
 row was in every index before its transaction committed. An fk set located over the pin budget
 (NOPIN, §15) carries no interlock, and then nothing does: the merge finds no pinned positive source
 and rechecks every candidate (`cx->novm`), as any count does. `lion_count_one_set()` refuses to
-count a collected set on its own, which no caller does. `test/isolation/fkjoin_vacuum_race.spec`
+COUNT a collected set on its own, which no caller does; it copies one for a collection, which asks
+the map nothing. That is the copy of fact filters that are one range already collected into memory
+(§32): one source of one set, which the one-set shortcut takes, and which it used to refuse as a
+count, failing the join before its first row (2026-09-28; `fkjoin_walk.sql` pins it with the range
+source's and the copy's counters). `test/isolation/fkjoin_vacuum_race.spec`
 proves it the way `count_distinct_vacuum_race.spec` proves the existence test: the copy lists
 fk = 0's dead rows, the first count parks at `lion-count-containers-pinned` with fk = 0's set
 pinned, the VACUUM that would remove those rows waits for the pin, and the answers - semi join and

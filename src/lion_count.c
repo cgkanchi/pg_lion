@@ -5379,15 +5379,27 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 
 		/*
 		 * A COLLECTED intersection (lion_sources_collect()) has no chain to
-		 * fall back on, and is only ever counted beside a located set that
-		 * carries the interlock (DESIGN.md §27).
+		 * fall back on, and is only ever COUNTED beside a located set that
+		 * carries the interlock (DESIGN.md §27).  A collection is no count:
+		 * it asks the visibility map nothing and needs no pin
+		 * (lion_count_container_vm()), so it copies such a set as it stands.
+		 * That is what the FK-side join does when its one fact filter is a
+		 * range already collected into memory (§32): one source of one set,
+		 * the shape this function is the shortcut for.  It used to be refused
+		 * here, and the join's first row failed.
 		 */
 		if (!BlockNumberIsValid(ps->head))
-			elog(ERROR, "lion index: a collected posting set counted on its own");
-		fresh = *ps;
-		fresh.mat = NULL;		/* the chain itself, not the copy */
-		fresh.budgeted = false;	/* nothing of it is the list's to return */
-		ps = &fresh;
+		{
+			if (cx->collect == NULL)
+				elog(ERROR, "lion index: a collected posting set counted on its own");
+		}
+		else
+		{
+			fresh = *ps;
+			fresh.mat = NULL;	/* the chain itself, not the copy */
+			fresh.budgeted = false; /* nothing of it is the list's to return */
+			ps = &fresh;
+		}
 	}
 
 	lion_cursor_init(&cur, ps, cx, false);

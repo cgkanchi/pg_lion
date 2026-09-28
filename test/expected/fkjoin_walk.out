@@ -508,6 +508,17 @@ SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk 
  t
 (1 row)
 
+-- a fact filter that is one range, collected into memory on its own (§32),
+-- is what the join copies as its fact filters: one source of one set, which
+-- the collection used to refuse as a collected set counted on its own
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)', 'Range Sources Collected') AS range_collected,
+	   lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)', 'Fact Filter Rows Collected') AS rows_copied,
+	   lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)', 'Join Keys Without Entry') AS without_entry;
+ range_collected | rows_copied | without_entry 
+-----------------+-------------+---------------
+               1 |       12000 |           260
+(1 row)
+
 -- a batch is what work_mem holds: at 256 kB the keys come in more than one
 SET work_mem = '256kB';
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x < 8 GROUP BY d.attr');
