@@ -87,6 +87,20 @@ BEGIN
 		'$.** ? (@."Custom Plan Provider" == "LionCount")');
 END $$;
 
+/* The same node as the planner priced it: its EXPLAIN, joins disabled. */
+CREATE FUNCTION lion_pk_plan(q text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+	e jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO e;
+	RETURN jsonb_path_query_first(e,
+		'$.** ? (@."Custom Plan Provider" == "LionCount")');
+END $$;
+
 /*
  * The fact: 120000 rows whose int8 fk runs over 60000 keys, every key twice
  * - rows i and i + 60000, half the heap apart, so in two containers - in an
@@ -173,6 +187,12 @@ SELECT (s->>'Actual Rows')::numeric::int AS summed_rows,
 	   (g->>'Visibility Map Pages Pinned')::int AS grouped_vm_pins
 FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') s,
 	 lion_pk_node('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr') g;
+-- ... and the planner knows it: the summed node is estimated, and priced, as
+-- the one row it hands up
+SELECT (s->>'Plan Rows')::numeric::int AS summed_estimate,
+	   (g->>'Plan Rows')::numeric > 1 AS grouped_estimate_many
+FROM lion_pk_plan('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') s,
+	 lion_pk_plan('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr') g;
 -- the timings are there with TIMING, and only then
 SELECT n ? 'Join Child Time' AS child, n ? 'Join Lookup Time' AS lookup,
 	   n ? 'Join Count Time' AS count, n ? 'Fact Filter Collect Time' AS collect
@@ -244,3 +264,4 @@ SET max_parallel_workers_per_gather = 0;
 DROP TABLE lion_pkf, lion_pkd;
 DROP FUNCTION lion_pk(text);
 DROP FUNCTION lion_pk_node(text, text);
+DROP FUNCTION lion_pk_plan(text);

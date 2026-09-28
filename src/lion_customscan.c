@@ -219,10 +219,30 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 /*
  * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
  * dimension row - over and above the containers it reads and the lookup that
- * locates its set: a merge set up and torn down.  It is the same work §26's
- * per-test cost measures, and the same number.
+ * locates its set: a merge set up and torn down.  Derived from what the count
+ * does (DESIGN.md §27, "The cost of a key, after the per-key path"): once it
+ * works in the node's scratch memory and keeps the node's map page pinned,
+ * what is left is some twenty allocations from memory already there, two
+ * cursors built and the plan's decisions, about half a microsecond - this.
+ * §10 and §26 measured 1.0 us a count or test that also made and deleted a
+ * memory context, pinned a map page and, when it merged two sources, malloc'd
+ * and freed two blocks every time: what the per-key fixes took off.
  */
 #define LION_FKJOIN_COUNT_COST	(25.0 * cpu_tuple_cost)
+
+/*
+ * ... and each row the node hands up: a partial count per dimension row that
+ * joins, or the row itself for count(DISTINCT) - the per-tuple context reset,
+ * a virtual tuple, the projection, the return through the executor, and the
+ * pause that lets go of its index pins (the leaf a walk in key order then
+ * reads again for the next key is that key's leaf visit, which
+ * lion_cost_fkjoin_walk() charges).  About 0.2 us from the operations (the
+ * same derivation), where one cpu_tuple_cost used to be charged.  A summed
+ * join (LION_JOINFLAG_SUM) hands up one row per participant and run.  What
+ * core does with the rows above the node - its Finalize Agg's transitions, a
+ * Gather's tuple queue - core charges.
+ */
+#define LION_FKJOIN_ROW_COST	(10.0 * cpu_tuple_cost)
 
 /*
  * ... and one PROBE of such a count into a fact filter's set: a seek of the
@@ -4901,7 +4921,9 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * - then one count of that key's set ANDed with the fact filters: a merge set up
  * and torn down (LION_FKJOIN_COUNT_COST), the set's containers at §10's two
  * cpu_operator_cost each, and the set's chain pages, which are none at all
- * when the fk entries are INLINE.  Then a row out.  A semi or anti join's
+ * when the fk entries are INLINE.  The rows the node hands up are the
+ * caller's to charge (LION_FKJOIN_ROW_COST), which knows how many there are
+ * (lion_add_fkjoin_paths()).  A semi or anti join's
  * count is an existence test (`exists`), which reads the share of the set's
  * containers lion_exists_fraction() expects before it finds a visible row.
  *
@@ -5244,9 +5266,6 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											   heap_pages);
 	run += recheck_tids * LION_RECHECK_TID_COST;
-
-	/* ---- a partial row per dimension row that finds one ---- */
-	run += found * cpu_tuple_cost;
 
 	return run;
 }
@@ -6534,13 +6553,16 @@ lion_target_counts_only(PathTarget *target)
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
- * it costs the child plus what it does per dimension row.  In a parallel plan
- * the child hands each participant its share of the dimension rows, the
- * dimension rows divided as core divides a partial path's (the Gather may
- * start more workers than the child planned, "Parallel"); every participant
- * locates the fact filters and makes its own copy of them, so the cost of
- * those is charged in full to each, as a hash join below a Gather charges its
- * hash table - the elapsed cost of the parallel plan is one participant's.
+ * it costs the child plus what it does per dimension row.  A target of counts
+ * alone is summed instead (LION_JOINFLAG_SUM): one row per participant and
+ * run, which is what core's Gather and Finalize Agg above it then handle.
+ * In a parallel plan the child hands each participant its share of the
+ * dimension rows, the dimension rows divided as core divides a partial path's
+ * (the Gather may start more workers than the child planned, "Parallel");
+ * every participant locates the fact filters and makes its own copy of them,
+ * so the cost of those is charged in full to each, as a hash join below a
+ * Gather charges its hash table - the elapsed cost of the parallel plan is
+ * one participant's.
  *
  * Above a partial path goes a Gather; above that, or above the node itself,
  * core's Finalize Agg over the partial counts - or, for emitted rows, a Sort
@@ -6666,6 +6688,11 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	rows = unique ? childfound :
 		(jointype == LION_JOIN_INNER) ? childrows :
 		clamp_row_est(Min(fj->joinrel->rows * share, childrows));
+
+	/* ... or one, their sum, when that is all the target wants */
+	if (sum)
+		rows = 1.0;
+	run += rows * LION_FKJOIN_ROW_COST;
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = startup;
 	cpath->path.total_cost = child->total_cost + run;
