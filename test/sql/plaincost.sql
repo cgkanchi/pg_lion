@@ -11,10 +11,10 @@
 -- squared frequencies, not 0: a scattered result of a few percent was priced
 -- as random reads and went to a bitmap scan up to 2.5 times slower, and at a
 -- random_page_cost of 1.1 a count of 13% of the rows went to the plain scan -
--- with an always-true range beside the other columns, a benchmark's
--- query, to one that walked the range entry by entry and restarted the other
--- columns' sets for each entry (2026-09-27: it did not finish in 60 s
--- on a much larger table).  A range alone - one column's keys walked in key order - is
+-- with an always-true range beside the other columns, to one that walked
+-- the range entry by entry and restarted the other columns' sets for each
+-- entry (2026-09-27: on a much larger table such a query did not finish in
+-- 60 s).  A range alone - one column's keys walked in key order - is
 -- a heap pass per key, priced as such.
 \set VERBOSITY terse
 SET client_min_messages = warning;

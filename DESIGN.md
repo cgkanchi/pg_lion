@@ -6958,8 +6958,8 @@ key) and `Join Keys Without Entry`.
 
 ### Semi and anti joins (2026-09-27)
 
-Two common count shapes could not be pushed down (2026-09-26), both over a fact
-table and a dimension selected by lion-indexable filters of its own:
+Two common count shapes could not be pushed down (2026-09-26), both over a fact table and a
+dimension selected by lion-indexable filters of its own:
 
     -- forward: fact rows whose dimension row qualifies
     SELECT count(*) FROM fact f WHERE <f filters>
@@ -7775,9 +7775,9 @@ a reviewer will want to see exercised under a range.
 
 ### One read per leaf (2026-09-27)
 
-A benchmark (2026-09-26) showed a range reading the directory once or
-twice PER KEY: 4,012 directory pages for 2,000 keys, 1.93 million for 1.91 million, and the same ratio
-on a very large table. There was no second descent; the entry scan re-read
+A benchmark (2026-09-26) showed a range reading the directory once or twice PER KEY: 4,012
+directory pages for 2,000 keys and 1.93 million for 1.91 million, and the same ratio on a very large
+table. There was no second descent; the entry scan re-read
 the leaf. `lion_entry_scan_next()` gave its lock up after every entry it returned and came back
 for the next one by reading the same leaf again and binary-searching it for "the first key above
 the last one returned" (§21). Once the leaf ran out it read it one more time, found nothing after
@@ -8235,8 +8235,7 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
 The correction is core's, and so is its reach: the bound lands in the last bin, which holds a
 hundredth of the rows ANALYZE saw at the default statistics target, so an estimate past the end rises
 to at most that share however many rows were added. On a very large table it would lift a wide
-range's estimate many times over and still leave it several times
-short - and whether that alone moves the plan depends on the range's price per key.
+range's estimate many times over and still leave it several times short - and whether that alone moves the plan depends on the range's price per key.
 
 Measured on the assert build (PostgreSQL 18.6), best of three warm runs; "before" is the build without
 the probe:
