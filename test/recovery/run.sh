@@ -10,9 +10,11 @@
 #   --prefix   PostgreSQL installation to use (bin/, lib/, share/).  REQUIRED,
 #              here or as RECOVERY_PREFIX in the environment: there is no
 #              default, because the extension is rebuilt from a clean copy of
-#              this tree and INSTALLED into that prefix, and a guessed prefix
-#              is someone else's server.  The tree itself is never written to
-#              and "make install" is never run in it.
+#              this tree and INSTALLED into that prefix (unless
+#              RECOVERY_SKIP_INSTALL=1), and a guessed prefix is someone
+#              else's server.  "make install" is never run in the tree, and
+#              nothing in it is written but test/recovery/log, where the run's
+#              log goes (and, on failure, copies of the server logs).
 #   --iters    crash/recover iterations in phase 1 (default 8).
 #   --keep     leave the clusters and their logs in place on exit.
 #   --mode     generic (the default) or rmgr: rmgr preloads the library so
@@ -21,8 +23,10 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 1f 2 3").  For development; `make recovery-check`
-#              always runs everything.
+#              "1 1b 1c 1d 1e 1f 2 3").  For development, and for a server
+#              without injection points, which can run only "1 1f 2" (CI's
+#              packaged-server jobs do); `make recovery-check` always runs
+#              everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
 #              wal_consistency_checking = 'pg_lion' is turned on:
@@ -44,6 +48,21 @@
 #                     extension build still run as the caller.
 #   RECOVERY_TMPDIR   where the run's private directory is made (default
 #                     $TMPDIR, else /tmp).
+#   RECOVERY_SKIP_INSTALL=1
+#                     do not build and install the extension: use the pg_lion
+#                     already installed in the prefix, which must be there.
+#                     For an installation the caller cannot write to (CI's
+#                     packaged servers, where the job installs it with sudo
+#                     beforehand).  A pg_lion.so in the tree that differs from
+#                     the installed one is reported, since the installed one
+#                     is what gets tested.
+#   INJECTION_POINTS=1
+#                     phases 1b-1e and 3 park a backend on an injection point
+#                     and are skipped, with a line in the summary, on a server
+#                     without the injection_points extension.  With this set
+#                     (as CI's source jobs set it) that is a failure instead:
+#                     a server that should have them and does not must not
+#                     end in "ALL ... PASSED" having run none of them.
 #
 # Exit status is 0 only if every check passed.  A summary is printed at the
 # end; the full log is written to test/recovery/log/run.log, and on failure the
@@ -94,6 +113,8 @@ PROJECT=$(cd "$HERE/../.." && pwd)
 PREFIX=${RECOVERY_PREFIX:-}
 RUN_AS=${RECOVERY_RUN_AS:-}
 TMPROOT=${RECOVERY_TMPDIR:-${TMPDIR:-/tmp}}
+SKIP_INSTALL=${RECOVERY_SKIP_INSTALL:-0}
+REQUIRE_INJECTION=${INJECTION_POINTS:-0}
 ITERS=8
 KEEP=0
 MODE=generic
@@ -133,6 +154,17 @@ nap() { command sleep "$1"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
 log() { echo "$*" | tee -a "$RUNLOG"; }
 now_ms() { date +%s%3N; }
+
+# no_injection_points <phase> <summary line>: the phase needs the
+# injection_points extension, and this server does not have it.  A skip, in
+# the log and the summary - or, under INJECTION_POINTS=1, a failure.
+no_injection_points() {
+	if [ "$REQUIRE_INJECTION" = 1 ]; then
+		die "$1 needs the injection_points extension, which this server does not have (INJECTION_POINTS=1 makes that a failure rather than a skip)"
+	fi
+	log "$1 skipped: this server has no injection_points extension"
+	SUMMARY+=("$2")
+}
 
 # ---------------------------------------------------------------- arguments
 
@@ -184,6 +216,7 @@ for prog in initdb pg_ctl psql pgbench pg_basebackup pg_waldump pg_config; do
 done
 case $ITERS in ''|*[!0-9]*) die "--iters wants a number" ;; esac
 [ "$ITERS" -ge 1 ] || die "--iters must be at least 1"
+case $SKIP_INSTALL in 0|1) ;; *) die "RECOVERY_SKIP_INSTALL wants 0 or 1, not '$SKIP_INSTALL'" ;; esac
 
 if [ -n "$RUN_AS" ]; then
 	id -u "$RUN_AS" >/dev/null 2>&1 || die "RECOVERY_RUN_AS: no such user '$RUN_AS'"
@@ -336,6 +369,32 @@ build_extension() {
 		make -s PG_CONFIG="$PGBIN/pg_config" &&
 		make -s PG_CONFIG="$PGBIN/pg_config" install
 	) >>"$RUNLOG" 2>&1 || die "extension build failed (see $RUNLOG, build dir $BUILDDIR)"
+}
+
+# RECOVERY_SKIP_INSTALL=1: the extension was installed into the prefix
+# beforehand (by someone who can write to it) and is used as it is.  Both
+# control files and the library must be there; a library in the tree that is
+# not the installed one is reported, because the installed one is what the
+# clusters load.
+check_installed_extension() {
+	local libdir sharedir lib c
+	libdir=$("$PGBIN/pg_config" --pkglibdir) || die "pg_config --pkglibdir failed"
+	sharedir=$("$PGBIN/pg_config" --sharedir) || die "pg_config --sharedir failed"
+	for c in pg_lion pg_lion_citext; do
+		[ -f "$sharedir/extension/$c.control" ] ||
+			die "RECOVERY_SKIP_INSTALL=1, but $sharedir/extension/$c.control is missing: install the extension into $PREFIX first"
+	done
+	if [ -f "$libdir/pg_lion.so" ]; then
+		lib=$libdir/pg_lion.so
+	elif [ -f "$libdir/pg_lion.dylib" ]; then
+		lib=$libdir/pg_lion.dylib
+	else
+		die "RECOVERY_SKIP_INSTALL=1, but there is no pg_lion library in $libdir: install the extension into $PREFIX first"
+	fi
+	log "-- RECOVERY_SKIP_INSTALL=1: using the extension installed in $PREFIX ($lib)"
+	if [ -f "$PROJECT/$(basename "$lib")" ] && ! cmp -s "$PROJECT/$(basename "$lib")" "$lib"; then
+		log "   WARNING: $PROJECT/$(basename "$lib") differs from the installed $lib; the installed one is tested"
+	fi
 }
 
 # ---------------------------------------------------------------- clusters
@@ -684,8 +743,7 @@ phase1b() {
 	log "=== phase 1b: a crash between entry deletion and page marking ==="
 
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
-		{ log "phase 1b skipped: this server has no injection_points extension"
-		  SUMMARY+=("phase1b            skipped (no injection points)"); return 0; }
+		{ no_injection_points "phase 1b" "phase1b            skipped (no injection points)"; return 0; }
 
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1b: fixture failed"
 		SET synchronous_commit = on;
@@ -815,8 +873,7 @@ phase1c() {
 	log "=== phase 1c: a crash between a directory split and its downlink ==="
 
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
-		{ log "phase 1c skipped: this server has no injection_points extension"
-		  SUMMARY+=("phase1c            skipped (no injection points)"); return 0; }
+		{ no_injection_points "phase 1c" "phase1c            skipped (no injection points)"; return 0; }
 
 	# A table whose index is created EMPTY and grown by inserts, so that the
 	# splits really happen through aminsert and not through ambuild.
@@ -935,8 +992,7 @@ phase1d() {
 	log "=== phase 1d: a crash between a posting-tree split and its downlink ==="
 
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
-		{ log "phase 1d skipped: this server has no injection_points extension"
-		  SUMMARY+=("phase1d            skipped (no injection points)"); return 0; }
+		{ no_injection_points "phase 1d" "phase1d            skipped (no injection points)"; return 0; }
 
 	# Two keys taking alternate TIDs, so each container key is a dense bitset
 	# and fills a leaf by itself: the set is a tree after a few thousand rows.
@@ -1103,8 +1159,7 @@ phase1e() {
 	log "=== phase 1e: a crash between a spill's leaves and its root ==="
 
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
-		{ log "phase 1e skipped: this server has no injection_points extension"
-		  SUMMARY+=("phase1e            skipped (no injection points)"); return 0; }
+		{ no_injection_points "phase 1e" "phase1e            skipped (no injection points)"; return 0; }
 
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1e: fixture failed"
 		SET synchronous_commit = on;
@@ -1747,10 +1802,11 @@ phase3() {
 	local exp pages
 	log ""
 	log "=== phase 3: standby barriers for pinned readers (§9/§11/§25) ==="
-	psql_p -tAc "select count(*) from pg_available_extensions where name = 'injection_points'" |
-		grep -q '^1$' ||
-		{ log "phase 3 skipped: this server has no injection_points extension"
-		  SUMMARY+=("phase3             skipped (no injection points)"); return 0; }
+	# Not `psql | grep -q`: under pipefail a psql that grep -q has stopped
+	# reading from can fail the pipeline, which would read as "no injection
+	# points" (recovery_evidence() has the story).
+	[ "$(psql_p -tAc "select count(*) from pg_available_extensions where name = 'injection_points'" 2>>"$RUNLOG" || true)" = 1 ] ||
+		{ no_injection_points "phase 3" "phase3             skipped (no injection points)"; return 0; }
 
 	# A standby of its own: phase 2 promotes the one it made.
 	stop_hard "$STANDBY_DATA"
@@ -1877,7 +1933,11 @@ log "socket dir $SOCKDIR"
 [ -z "$RUN_AS" ] || log "run as     $RUN_AS (initdb, pg_ctl, pg_basebackup)"
 log ""
 
-build_extension
+if [ "$SKIP_INSTALL" = 1 ]; then
+	check_installed_extension
+else
+	build_extension
+fi
 init_primary
 
 log "-- loading the fixture (test/recovery/schema.sql)"
@@ -1909,6 +1969,7 @@ log ""
 log "=== summary ==="
 for s in "${SUMMARY[@]}"; do log "  $s"; done
 log ""
+log "  phases run: $PHASES"
 log "  index WAL records replayed across all crashes ($MODE mode): $GENERIC_TOTAL"
 log "  verify() warnings (unreferenced/empty pages, harmless by design): $NWARN"
 log "  total time: $(( (END - START) / 1000 ))s"

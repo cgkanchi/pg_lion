@@ -40,6 +40,21 @@ runs as the caller. Run as root without it, the script stops before doing
 anything and says so. That user must be able to read the prefix; it is given
 ownership of the run's private directory.
 
+`RECOVERY_SKIP_INSTALL=1` uses the pg_lion already installed in the prefix
+instead of building and installing one, for an installation the caller cannot
+write to: CI's packaged-server jobs install the extension with `sudo make
+install` and then run the harness as an ordinary user. The run checks that
+the control files and the library are there, and says so if the tree's
+`pg_lion.so` is not the installed one.
+
+Phases 1b-1e and 3 need the `injection_points` extension. On a server without
+it they are skipped - the log and the summary say which - and phases 1, 1f
+and 2 still run; `--phases "1 1f 2"` asks for exactly those (CI does, on the
+packaged 16-19 servers). `INJECTION_POINTS=1` in the environment turns every
+such skip into a failure, so a server that should have injection points and
+does not cannot end in "ALL RECOVERY AND HOT-STANDBY CHECKS PASSED" having run
+none of those phases; CI's source-build jobs set it.
+
 The run creates everything it needs in ONE private directory that
 `mktemp -d` makes for it under `$RECOVERY_TMPDIR` (default `$TMPDIR`, else
 `/tmp`): the two clusters, their server logs, the socket directory and the
