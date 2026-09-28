@@ -211,6 +211,13 @@ typedef struct LionCountCtx
 	 * (lion_sources_collect(), DESIGN.md §27).  NULL for a count.
 	 */
 	struct LionCollect *collect;
+
+	/*
+	 * The one set of source slot 0 - a group's, a join key's fk set - whose
+	 * containers stats.key_containers counts (DESIGN.md §27, "Where a key's
+	 * time goes"), or NULL.
+	 */
+	const LionPostingSet *keyset;
 } LionCountCtx;
 
 /*
@@ -2277,9 +2284,11 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 		CHECK_FOR_INTERRUPTS();
 
 		{
-			Buffer		pagebuf = ReadBuffer(ps->index, blkno);
+			Buffer		pagebuf;
 			Page		page;
 
+			lion_posting_pages_read++;
+			pagebuf = ReadBuffer(ps->index, blkno);
 			LockBuffer(pagebuf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(pagebuf);
 
@@ -2658,6 +2667,7 @@ lion_cursor_next_item(LionSetCursor *cur)
 				return mat->first;
 			}
 			lion_spill_read(mat, cur->matidx++, cur->cbuf);
+			cur->cx->stats.copy_file_reads++;
 			return cur->cbuf;
 		}
 		return mat->containers[cur->matidx++];
@@ -2720,6 +2730,7 @@ lion_cursor_next_item(LionSetCursor *cur)
 		if (!BlockNumberIsValid(cur->nextblk))
 			return NULL;
 
+		lion_posting_pages_read++;
 		buf = ReadBuffer(cur->set->index, cur->nextblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
@@ -2751,6 +2762,23 @@ lion_cursor_next_item(LionSetCursor *cur)
 
 		CHECK_FOR_INTERRUPTS();
 	}
+}
+
+/*
+ * The cursor stands at a container it has read: what EXPLAIN ANALYZE counts
+ * of it (LionCountStats) - every container, and whether it came from the
+ * count's own key set or from a private copy.
+ */
+static inline void
+lion_cursor_counted(LionSetCursor *cur)
+{
+	LionCountCtx *cx = cur->cx;
+
+	cx->stats.containers_visited++;
+	if (cur->set->mat != NULL)
+		cx->stats.copy_containers++;
+	if (cur->set == cx->keyset)
+		cx->stats.key_containers++;
 }
 
 /*
@@ -2831,7 +2859,7 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 
 	cur->cur = cur->segbuf;
 	cur->valid = true;
-	cur->cx->stats.containers_visited++;
+	lion_cursor_counted(cur);
 	return true;
 }
 
@@ -2850,7 +2878,7 @@ lion_cursor_advance(LionSetCursor *cur)
 		{
 			cur->cur = item;
 			cur->valid = true;
-			cur->cx->stats.containers_visited++;
+			lion_cursor_counted(cur);
 			return;
 		}
 
@@ -2975,6 +3003,7 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 		lion_cursor_unpin(cur);
 		cur->off = OffsetNumberNext(cur->maxoff);
 
+		lion_posting_pages_read++;
 		buf = ReadBuffer(cur->set->index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
@@ -3032,6 +3061,7 @@ lion_cursor_seek(LionSetCursor *cur, uint32 target)
 		 * A private copy is an array: binary search it - a spilled one by the
 		 * keys it keeps in memory, one per container.
 		 */
+		cur->cx->stats.copy_seeks++;
 		while (lo < hi)
 		{
 			int			mid = lo + (hi - lo) / 2;
@@ -4363,7 +4393,8 @@ StaticAssertDecl(LION_VM_HEAPBLOCKS_PER_PAGE % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
  * container to a single map byte.  *vmbuf is the caller's visibility map pin;
  * it is moved
  * to whatever map page is needed and left pinned for the next call, exactly as
- * visibilitymap_get_status() leaves it.
+ * visibilitymap_get_status() leaves it - and each move adds one to *pins, when
+ * pins is not NULL (EXPLAIN ANALYZE's "Visibility Map Pages Pinned").
  *
  * This is visibilitymap_get_status() for a whole container at once.  It exists
  * because asking a block at a time costs a buffer-manager lookup per heap block
@@ -4412,7 +4443,7 @@ StaticAssertDecl(LION_VM_HEAPBLOCKS_PER_PAGE % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
  */
 static pg_always_inline uint64
 lion_vm_allvisible_page(Relation heap, BlockNumber blk, uint64 seg, int b,
-					   Buffer *vmbuf)
+					   Buffer *vmbuf, int64 *pins)
 {
 	uint64		mask = 0;
 	const char *map;
@@ -4429,7 +4460,11 @@ lion_vm_allvisible_page(Relation heap, BlockNumber blk, uint64 seg, int b,
 	 * itself, which the byte read below repeats.
 	 */
 	if (!visibilitymap_pin_ok(blk, *vmbuf))
+	{
 		(void) visibilitymap_get_status(heap, blk, vmbuf);
+		if (pins != NULL)
+			(*pins)++;
+	}
 
 	/* the fork stops short of these blocks: none of them is all-visible */
 	if (!BufferIsValid(*vmbuf))
@@ -4476,7 +4511,7 @@ lion_vm_allvisible_page(Relation heap, BlockNumber blk, uint64 seg, int b,
  */
 static pg_noinline uint64
 lion_vm_allvisible_mask_split(Relation heap, BlockNumber firstblk, uint64 wanted,
-							 int n, Buffer *vmbuf)
+							 int n, Buffer *vmbuf, int64 *pins)
 {
 	uint64		mask = 0;
 	uint64		seg;
@@ -4486,19 +4521,19 @@ lion_vm_allvisible_mask_split(Relation heap, BlockNumber firstblk, uint64 wanted
 
 	seg = wanted & ((UINT64CONST(1) << n) - 1);
 	if (seg != 0)
-		mask |= lion_vm_allvisible_page(heap, firstblk, seg, 0, vmbuf);
+		mask |= lion_vm_allvisible_page(heap, firstblk, seg, 0, vmbuf, pins);
 
 	seg = wanted >> n;
 	if (seg != 0)
 		mask |= lion_vm_allvisible_page(heap, firstblk + (BlockNumber) n, seg,
-									   n, vmbuf);
+									   n, vmbuf, pins);
 
 	return mask;
 }
 
 static pg_always_inline uint64
 lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, uint64 wanted,
-					   Buffer *vmbuf)
+					   Buffer *vmbuf, int64 *pins)
 {
 	int			n;
 
@@ -4512,9 +4547,10 @@ lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, uint64 wanted,
 	n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
 			   (firstblk % LION_VM_HEAPBLOCKS_PER_PAGE));
 	if (unlikely(n < LION_BLOCKS_PER_CONTAINER))
-		return lion_vm_allvisible_mask_split(heap, firstblk, wanted, n, vmbuf);
+		return lion_vm_allvisible_mask_split(heap, firstblk, wanted, n, vmbuf,
+											pins);
 
-	return lion_vm_allvisible_page(heap, firstblk, wanted, 0, vmbuf);
+	return lion_vm_allvisible_page(heap, firstblk, wanted, 0, vmbuf, pins);
 }
 
 /*
@@ -4558,7 +4594,7 @@ lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg)
 		return;					/* the fork does not reach it: nothing set */
 
 	LockBuffer(vmbuf, BUFFER_LOCK_SHARE);
-	got = lion_vm_allvisible_page(heap, blk, seg, 0, &vmbuf);
+	got = lion_vm_allvisible_page(heap, blk, seg, 0, &vmbuf, NULL);
 	while (m != 0)
 	{
 		int			b = pg_rightmost_one_pos64(m);
@@ -5222,7 +5258,8 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	else
 	{
 		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, members,
-										&cx->vmbuf);
+										&cx->vmbuf, &cx->stats.vm_pins);
+		cx->stats.vm_checks++;
 #ifdef LION_VM_MASK_CHECK
 		lion_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
 #endif
@@ -8111,6 +8148,13 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	}
 
 	/*
+	 * The count's own key set, when source slot 0 is one (a group's set, an
+	 * FK-side join's fk set): what stats.key_containers counts the reads of.
+	 */
+	cx.keyset = (collect == NULL && !sources[0].negated &&
+				 sources[0].nsets == 1) ? &sources[0].sets[0] : NULL;
+
+	/*
 	 * The visibility cache, if the caller keeps one for this node execution.
 	 * It is emptied here if it holds answers for another relation or another
 	 * snapshot, so a partitioned count may hand the same handle to every
@@ -8209,19 +8253,29 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	MemoryContextDelete(cxt);
 
 	if (stats != NULL)
-	{
-		stats->blocks_skipped_via_vm += cx.stats.blocks_skipped_via_vm;
-		stats->tids_rechecked += cx.stats.tids_rechecked;
-		stats->blocks_rechecked += cx.stats.blocks_rechecked;
-		stats->containers_visited += cx.stats.containers_visited;
-		stats->probes_avoided += cx.stats.probes_avoided;
-		stats->cache_hits += cx.stats.cache_hits;
-		stats->cache_full += cx.stats.cache_full;
-		stats->sets_summed += cx.stats.sets_summed;
-		stats->rows_removed += cx.stats.rows_removed;
-	}
+		lion_count_stats_add(stats, &cx.stats);
 
 	return result;
+}
+
+void
+lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
+{
+	dst->blocks_skipped_via_vm += src->blocks_skipped_via_vm;
+	dst->tids_rechecked += src->tids_rechecked;
+	dst->blocks_rechecked += src->blocks_rechecked;
+	dst->containers_visited += src->containers_visited;
+	dst->probes_avoided += src->probes_avoided;
+	dst->cache_hits += src->cache_hits;
+	dst->cache_full += src->cache_full;
+	dst->sets_summed += src->sets_summed;
+	dst->rows_removed += src->rows_removed;
+	dst->key_containers += src->key_containers;
+	dst->copy_containers += src->copy_containers;
+	dst->copy_seeks += src->copy_seeks;
+	dst->copy_file_reads += src->copy_file_reads;
+	dst->vm_checks += src->vm_checks;
+	dst->vm_pins += src->vm_pins;
 }
 
 bool

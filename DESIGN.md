@@ -7347,7 +7347,8 @@ its child could be a Gather below it, which it still can.
                   Filter: (region = 'eu'::text)
 
 and with ANALYZE, besides §10's counters, `Join Keys Looked Up` (dimension rows with a non-NULL
-key) and `Join Keys Without Entry`.
+key) and `Join Keys Without Entry`, and the counters and timings of "Where a key's time goes"
+below.
 
 ### Semi and anti joins (2026-09-27)
 
@@ -8073,6 +8074,79 @@ ANALYZE `Join Key Batches`, the batches of every participant and run. `Directory
 walk's pages: about the leaves the keys cover plus a descent a batch, and a leaf again after each
 row that goes up, where a descent per key reads height + 1 pages a key.
 
+### Where a key's time goes (2026-09-28)
+
+A benchmark found the node slower than the hash join the planner had rightly preferred to it, by
+more than anything the cost model charges a key accounts for, and "Lookups in key order", which
+took most of the directory pages off each key, did not change that. What the node's time per key
+was made of - the child plan producing the dimension rows, the lookups, the counts, their reads of
+the collected copy and of the visibility map, pages read from disk - EXPLAIN could not tell apart.
+It can now. Every run keeps:
+
+- **counters**, always, each one addition where the event happens, summed over the participants of
+  a parallel plan as `Join Keys Looked Up` is (`LionJoinShared`):
+  - `Join Child Rows`: the rows the child returned - the keys looked up, and the NULL keys, which
+    join nothing; for a forward semi join over a non-unique key every participant's whole child;
+  - `Join Key Containers Read`: the containers the counts read from the keys' own fk sets
+    (`LionCountStats.key_containers`, the reads of the cursor over source slot 0's one set);
+  - `Join Posting Pages Read`: the pages of posting trees the counts read (the process-wide
+    `lion_posting_pages_read` over each count, as `Directory Pages Read` is over each call) - the
+    chains of fk sets too large to be INLINE, and the fact filters' when they are probed rather
+    than collected. Zero when every set is INLINE, the high-cardinality fk's shape; one or more a
+    key otherwise, each a random read wherever the index is not in memory;
+  - `Visibility Map Checks` and `Visibility Map Pages Pinned`: the containers whose heap blocks the
+    map was asked about, and the map pages pinned to answer them;
+  - with the fact filters collected: `Fact Filter Copy Containers Read`, `Fact Filter Copy Seeks`
+    (the binary searches) and `Fact Filter Copy File Reads` (the containers read back from a
+    spilled copy's temporary file);
+- **timings**, only under EXPLAIN ANALYZE's TIMING option, as core times a node only then (the
+  executor's `es_instrument` has `INSTRUMENT_TIMER`, in every participant):
+  `Join Child Time`, `Join Lookup Time`, `Join Count Time` and, when the filters are collected,
+  `Fact Filter Collect Time`, in milliseconds summed over the participants. Untimed, a phase costs
+  a flag test and no clock read; timed, a key costs three clock reads and a child row two, which
+  is what core's instrumentation of the child already spends on it.
+
+How to read them, for any workload:
+
+- `Join Child Time` against the node's own time is the child's share. The node's `actual time` is
+  per loop - a participant's, in a parallel plan - where these are sums, so a parallel node's are
+  compared after dividing by the participants. The child's own line prints its time too; this is
+  that figure where the node's counters are, and summed.
+- `Join Lookup Time` and `Directory Pages Read` over `Join Keys Looked Up` are a lookup: about a
+  page a key walked in key order, height + 1 descended.
+- `Join Count Time` over the keys found (`Looked Up` less `Without Entry`) is a count, and
+  `Join Key Containers Read` over them what one reads of its own set. Against the copy a count is
+  bounded by those containers, never by the copy: it reads the copy's first container when its
+  cursor is built and one more per binary search, and it searches once for each of the key's
+  containers at most - so `Fact Filter Copy Containers Read` is at most `Join Key Containers Read`
+  plus the keys, `Fact Filter Copy Seeks` at most `Join Key Containers Read`, and `Fact Filter Copy
+  File Reads`, of a spilled copy, at most the seeks. A count that is O(the copy) would show here as
+  copy containers far above those bounds.
+- `Join Posting Pages Read`, and with BUFFERS the node's shared reads less its child's, are what the
+  node itself read from disk.
+- What the node took besides these phases - its batches, and handing its rows up - is its time less
+  them.
+
+An illustration from the synthetic data of `test/sql/fkjoin_perkey.sql` - 5,000 dimension rows of
+one region, 1,250 of them without an fk entry, every fk set two rows in two containers, the fact
+filter an eight-value IN list collected once:
+
+    Custom Scan (LionCount)
+      Lion Indexes: lion_pkf_fk (fk = d.pk), lion_pkf_x (x = ANY ('{0,1,2,3,4,5,6,7}'::integer[]))
+      Fact Filters: collected once
+      ...
+      Join Child Rows: 5000
+      Join Keys Looked Up: 5000
+      Join Keys Without Entry: 1250
+      Join Key Containers Read: 7500
+      Join Posting Pages Read: 0
+      ...
+      Fact Filter Copy File Reads: 0
+
+and at a `work_mem` of 64 kB, where the same copy spills, `Fact Filter Copies Spilled: 1` with
+file reads no more than the keys' containers and temporary blocks read no more than those reads and
+one.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -8233,6 +8307,21 @@ with a new fact filter per outer row, generic plans with a Param fact filter (a 
 parallel plans of each shape (`lion_wj_par()`, as `lion_pj()` does), and a dirty heap - deletes and
 updates on both sides, and fks moved to other keys - before and after VACUUM. The walk's choices do
 not depend on `work_mem` above a few hundred kilobytes, and at the default the batches are one.
+
+`test/sql/fkjoin_perkey.sql` (2026-09-28), where a key's time goes, against the pushdown off: a fact
+of 120,000 rows whose fk runs over 60,000 keys, every key twice and half the heap apart, and a
+20,000-row dimension whose lion-indexed region selects 5,000 keys, 1,250 of them without an entry;
+inner joins grouped and not, a semi and an anti join and a grouped join under another filter, each
+answer checked. The counters are read from EXPLAIN's JSON (`lion_pk_node()`) and checked against
+the data and each other: the child's rows and the keys looked up, 5,000 each, 1,250 without entry;
+two fk containers read a key at most; a copy seek a key container at most; the copy's containers
+read at most the key containers plus the keys; the visibility map asked at most once a key
+container, and once a key for a semi join; no posting page read for INLINE sets. The timings are
+there with TIMING and not without. A copy that spills at a `work_mem` of 64 kB, from a generic plan
+made at the default: spilled once, read back, its file reads at most the keys' containers and the
+copy containers read, and the temporary blocks the node read at most those reads and one - the
+count's reads of a spilled copy are bounded by the key, not by the copy. And a parallel plan, whose
+counters are the participants' sums.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 

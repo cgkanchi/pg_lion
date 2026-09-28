@@ -1,0 +1,236 @@
+-- FK-side join pushdown, part seven (DESIGN.md §27, "Where a key's time
+-- goes"): what EXPLAIN ANALYZE says each dimension key cost - the child's
+-- rows, the keys' own fk sets, the collected copy of the fact filters, in
+-- memory and spilled to a file, the visibility map and, with TIMING, the
+-- time of each phase - and that those counters agree with each other and
+-- with the data.  Every answer is checked against the same query with the
+-- pushdown off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+
+/*
+ * lion_pk() runs a query through the pushdown with every join method
+ * disabled, so that the node is EXERCISED, and again with the pushdown off
+ * and sequential scans only, so that the reference reads no lion posting
+ * set, and compares the two as multisets.
+ */
+CREATE FUNCTION lion_pk(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'pushed down, parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
+			how := 'pushed down';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_pk_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_pk_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_pk_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_pk_on EXCEPT ALL SELECT * FROM lion_pk_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_pk_off EXCEPT ALL SELECT * FROM lion_pk_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_pk_on, lion_pk_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/*
+ * The node's EXPLAIN ANALYZE, joins disabled, as the JSON object of the
+ * LionCount node: every counter is a key of it, named as the text format
+ * names it, which no release formats differently.
+ */
+CREATE FUNCTION lion_pk_node(q text,
+							 opts text DEFAULT 'TIMING OFF, BUFFERS OFF')
+RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+	e jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON, COSTS OFF, SUMMARY OFF, ' || opts ||
+		') ' || q INTO e;
+	RETURN jsonb_path_query_first(e,
+		'$.** ? (@."Custom Plan Provider" == "LionCount")');
+END $$;
+
+/*
+ * The fact: 120000 rows whose int8 fk runs over 60000 keys, every key twice
+ * - rows i and i + 60000, half the heap apart, so in two containers - in an
+ * order unrelated to the key's; x has 10 values, the same for both rows of a
+ * key, and t 7.  The pad spreads the rows over some 1700 heap pages, 27
+ * container keys, so that a filter keeping most rows is a copy of 27 bitsets
+ * of 4 kB each.
+ */
+CREATE TABLE lion_pkf (id int NOT NULL, fk int8 NOT NULL, x int NOT NULL,
+					   t text NOT NULL, pad text);
+INSERT INTO lion_pkf
+SELECT i, (i * 7919) % 60000 + 1, i % 10, 't' || (i % 7), repeat('p', 60)
+FROM generate_series(1, 120000) i;
+CREATE INDEX lion_pkf_fk ON lion_pkf USING lion (fk);
+CREATE INDEX lion_pkf_x ON lion_pkf USING lion (x);
+CREATE INDEX lion_pkf_t ON lion_pkf USING lion (t);
+
+/*
+ * The dimension: 20000 rows, an int8 primary key over every other key of the
+ * fact's first half - and past the fact's keys for the last 5000 rows, which
+ * have no fact row - attr 0..6, a region and a group under lion indexes.
+ * region = 'r1' selects 5000 of its rows, 1250 of them without an entry.
+ */
+CREATE TABLE lion_pkd (
+	pk		int8	PRIMARY KEY,
+	attr	int		NOT NULL,
+	region	text	NOT NULL,
+	grp		text	NOT NULL
+);
+INSERT INTO lion_pkd
+SELECT CASE WHEN i <= 15000 THEN i * 2 ELSE 100000 + i END, i % 7,
+	   'r' || (i % 4), 'g' || (i % 5)
+FROM generate_series(1, 20000) i;
+CREATE INDEX lion_pkd_region ON lion_pkd USING lion (region);
+CREATE INDEX lion_pkd_grp ON lion_pkd USING lion (grp);
+VACUUM (FREEZE, ANALYZE) lion_pkf;
+VACUUM (FREEZE, ANALYZE) lion_pkd;
+
+-- ---- 1. the answers ---------------------------------------------------------
+-- the fact filter an eight-value IN list, collected once; the dimension set
+-- the 5000 rows of one region
+SELECT lion_pk('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''');
+SELECT lion_pk('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr');
+SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r1'' AND EXISTS (SELECT 1 FROM lion_pkf f WHERE f.fk = d.pk AND f.x IN (0, 1, 2, 3, 4, 5, 6, 7))');
+SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r1'' AND d.grp = ''g2'' AND NOT EXISTS (SELECT 1 FROM lion_pkf f WHERE f.fk = d.pk AND f.x IN (5, 7) AND f.t IN (''t1'', ''t2''))');
+SELECT lion_pk('SELECT d.grp, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.t IN (''t1'', ''t2'') AND d.region = ''r1'' GROUP BY d.grp');
+
+-- ---- 2. the counters ----------------------------------------------------------
+-- every dimension row the child returns has a key and is looked up; 1250 of
+-- the keys have no entry.  Each key's set is two rows in two containers, and
+-- the count reads those two; the copy is sought once for each of them, and
+-- read at most once more per key, where its first container stands; the
+-- visibility map is asked only where the two meet; and sets of two rows are
+-- INLINE in their directory leaves, so no posting-tree page is read.
+SELECT (n->>'Join Child Rows')::int AS child_rows,
+	   (n->>'Join Keys Looked Up')::int AS looked_up,
+	   (n->>'Join Keys Without Entry')::int AS without_entry,
+	   (n->>'Join Key Containers Read')::int <= 2 * ((n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int) AS two_a_key,
+	   (n->>'Fact Filter Copy Seeks')::int <= (n->>'Join Key Containers Read')::int AS a_seek_a_container,
+	   (n->>'Fact Filter Copy Containers Read')::int <= (n->>'Join Key Containers Read')::int + (n->>'Join Keys Looked Up')::int AS copy_bounded,
+	   (n->>'Visibility Map Checks')::int <= (n->>'Join Key Containers Read')::int AS vm_bounded,
+	   (n->>'Join Posting Pages Read')::int AS posting_pages,
+	   (n->>'Fact Filter Copy File Reads')::int AS file_reads
+FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') n;
+-- the same keys grouped, and tested for a semi join, which stops at the first
+-- container that shows a row
+SELECT (n->>'Join Child Rows')::int AS child_rows,
+	   (n->>'Join Keys Looked Up')::int AS looked_up,
+	   (n->>'Join Key Containers Read')::int <= 2 * ((n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int) AS two_a_key,
+	   (n->>'Fact Filter Copy Containers Read')::int <= (n->>'Join Key Containers Read')::int + (n->>'Join Keys Looked Up')::int AS copy_bounded
+FROM lion_pk_node('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr') n;
+SELECT (n->>'Join Child Rows')::int AS child_rows,
+	   (n->>'Join Keys Looked Up')::int AS looked_up,
+	   (n->>'Join Key Containers Read')::int <= 2 * ((n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int) AS two_a_key,
+	   (n->>'Visibility Map Checks')::int <= (n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int AS a_check_a_key
+FROM lion_pk_node('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r1'' AND EXISTS (SELECT 1 FROM lion_pkf f WHERE f.fk = d.pk AND f.x IN (0, 1, 2, 3, 4, 5, 6, 7))') n;
+-- the timings are there with TIMING, and only then
+SELECT n ? 'Join Child Time' AS child, n ? 'Join Lookup Time' AS lookup,
+	   n ? 'Join Count Time' AS count, n ? 'Fact Filter Collect Time' AS collect
+FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''', 'TIMING ON, BUFFERS OFF') n;
+SELECT n ? 'Join Child Time' AS child, n ? 'Join Count Time' AS count
+FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') n;
+
+-- ---- 3. a copy spilled to a temporary file ------------------------------------
+-- The plan is made at the default work_mem, where the copy of the filters -
+-- 96000 rows in 27 bitsets - fits and is chosen, and run at 64 kB, where it
+-- spills.  Each count reads back from the file only the containers its key's
+-- set is sought to, one read each, never the copy: the file reads are no more
+-- than the keys' own containers, and the temporary blocks the node read no
+-- more than those reads and the one that keeps the copy's first container in
+-- memory.
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE lion_pk_big AS SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = 'r1';
+EXECUTE lion_pk_big;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT (n->>'Fact Filter Copies Spilled')::int AS spilled,
+	   (n->>'Join Keys Looked Up')::int AS looked_up,
+	   (n->>'Fact Filter Copy File Reads')::int > 0 AS read_back,
+	   (n->>'Fact Filter Copy File Reads')::int <= (n->>'Join Key Containers Read')::int AS a_read_a_key_container,
+	   (n->>'Fact Filter Copy File Reads')::int <= (n->>'Fact Filter Copy Containers Read')::int AS reads_are_copy_containers,
+	   (n->>'Temp Read Blocks')::int <= (n->>'Fact Filter Copy File Reads')::int + 1 AS temp_blocks_bounded
+FROM lion_pk_node('EXECUTE lion_pk_big', 'TIMING OFF, BUFFERS ON') n;
+EXECUTE lion_pk_big;
+RESET work_mem;
+RESET hash_mem_multiplier;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = 'r1';
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_pk_big;
+RESET plan_cache_mode;
+
+-- ---- 4. parallel plans --------------------------------------------------------
+-- each participant counts the keys its share of the child gives it, and the
+-- counters are the sums of all of them
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+ALTER TABLE lion_pkd SET (parallel_workers = 2);
+SELECT lion_pk('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''');
+SELECT lion_pk('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr');
+SELECT (n->>'Join Child Rows')::int AS child_rows,
+	   (n->>'Join Keys Looked Up')::int AS looked_up,
+	   (n->>'Join Keys Without Entry')::int AS without_entry,
+	   (n->>'Join Key Containers Read')::int <= 2 * ((n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int) AS two_a_key,
+	   (n->>'Fact Filter Copy Containers Read')::int <= (n->>'Join Key Containers Read')::int + (n->>'Join Keys Looked Up')::int AS copy_bounded
+FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') n;
+ALTER TABLE lion_pkd RESET (parallel_workers);
+RESET parallel_leader_participation;
+RESET min_parallel_index_scan_size;
+RESET min_parallel_table_scan_size;
+RESET parallel_tuple_cost;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
+
+DROP TABLE lion_pkf, lion_pkd;
+DROP FUNCTION lion_pk(text);
+DROP FUNCTION lion_pk_node(text, text);

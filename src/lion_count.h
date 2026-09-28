@@ -97,7 +97,35 @@ typedef struct LionCountStats
 	 * whenever no count had a filter.
 	 */
 	int64		rows_removed;
+
+	/*
+	 * What a count's work is made of, container by container (DESIGN.md §27,
+	 * "Where a key's time goes"), which the FK-side join reports per key:
+	 *
+	 *	key_containers	containers read from the one set of source slot 0 -
+	 *					a group's set, a join key's fk set - so the count's
+	 *					own share of containers_visited
+	 *	copy_containers	containers read from a private copy: a collected
+	 *					intersection (the join's copy of its fact filters, a
+	 *					GROUP BY's of its WHERE items) or a materialized set
+	 *	copy_seeks		binary searches of such a copy, one a probe
+	 *	copy_file_reads	containers of a SPILLED copy read back from its
+	 *					temporary file, one read each
+	 *	vm_checks		containers whose heap blocks the visibility map was
+	 *					asked about
+	 *	vm_pins			visibility map pages pinned to answer them
+	 */
+	int64		key_containers;
+	int64		copy_containers;
+	int64		copy_seeks;
+	int64		copy_file_reads;
+	int64		vm_checks;
+	int64		vm_pins;
 } LionCountStats;
+
+/* dst += src, every field. */
+extern void lion_count_stats_add(LionCountStats *dst,
+								 const LionCountStats *src);
 
 /*
  * A per-query cache of heap visibility answers for blocks that are not
