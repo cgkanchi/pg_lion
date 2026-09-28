@@ -39,9 +39,11 @@ step s2_predel: DELETE FROM sr WHERE k <= 1000;
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s1_plain: 
 	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL enable_seqscan = on;
 	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
 	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
 	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL enable_seqscan = off;
 	SET LOCAL pg_lion.enable_count_pushdown = on;
 
 upto_3500
@@ -154,9 +156,11 @@ injection_points_attach
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s1_plain: 
 	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL enable_seqscan = on;
 	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
 	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
 	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL enable_seqscan = off;
 	SET LOCAL pg_lion.enable_count_pushdown = on;
 
 upto_3500
@@ -271,9 +275,11 @@ injection_points_attach
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s1_plain: 
 	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL enable_seqscan = on;
 	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
 	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
 	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL enable_seqscan = off;
 	SET LOCAL pg_lion.enable_count_pushdown = on;
 
 upto_3500

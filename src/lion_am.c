@@ -880,28 +880,88 @@ lion_cost_col_ndistinct(PlannerInfo *root, IndexOptInfo *index, int c)
 }
 
 /*
+ * How many entries ONE walk of key column c's range reads (DESIGN.md §28):
+ * the keys between its bounds, about n_distinct(col) x sel of them - or, on
+ * a column with SUMMARY posting sets (§32), the keys of the buckets at the
+ * range's two ends one by one and ONE summary for every bucket it covers
+ * whole, which is what lion_walk_begin() hands the bitmap and the plain scan
+ * alike.  The model is the count's (lion_cost_range_side(),
+ * lion_customscan.c): a bucket holds max(summary_tids, rows per key) rows -
+ * or what the column's first summaries hold on average, once that is more
+ * than twice as many (lion_summary_shape(): keys that arrive out of order
+ * grow the buckets past the reloption) - and so that many rows' worth of
+ * keys, and a run of n keys covers about n / keys per bucket - 1 buckets
+ * whole, half a bucket being left over at each end on average.  With no
+ * whole bucket the walk is the keys', as the executor's is.
+ */
+static double
+lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
+					   Selectivity sel)
+{
+	IndexOptInfo *index = path->indexinfo;
+	double		nkeys = Max(1.0, lion_cost_col_ndistinct(root, index, c) * sel);
+	Relation	indexrel;
+	LionState  *col;
+	LionSumShape shape;
+	uint32		bucket_tids;
+	bool		summarized;
+	double		rowsper;
+	double		bucketrows;
+	double		keysper;
+	double		whole;
+
+	if (index->hypothetical)
+		return nkeys;			/* nothing to read the options off */
+
+	indexrel = index_open(index->indexoid, AccessShareLock);
+	col = lion_index_column_state(indexrel, (AttrNumber) (c + 1));
+	summarized = col->summarized && col->ordered;
+	bucket_tids = lion_get_index_state(indexrel)->meta.summary_tids;
+	memset(&shape, 0, sizeof(shape));
+	if (summarized && bucket_tids > 0)
+		lion_summary_shape(indexrel, col, &shape);
+	index_close(indexrel, AccessShareLock);
+
+	/* `on` over an empty table: no summary yet, and a walk of the keys */
+	if (!summarized || bucket_tids == 0 || shape.nsummaries <= 0)
+		return nkeys;
+
+	rowsper = Max(Max(index->rel->tuples, 1.0) * sel / nkeys, 1.0);
+	bucketrows = Max((double) bucket_tids, rowsper);
+	if (shape.rows / shape.nsummaries > 2.0 * bucketrows)
+		bucketrows = shape.rows / shape.nsummaries;
+	keysper = Max(1.0, bucketrows / rowsper);
+	whole = Max(0.0, nkeys / keysper - 1.0);
+	if (whole < 1.0)
+		return nkeys;
+	return Max(0.0, nkeys - whole * keysper) + whole;
+}
+
+/*
  * What the ENTRIES of the range walks of this path cost (DESIGN.md §28), on
  * top of the pages and the postings genericcostestimate() prorates by the
  * selectivity.
  *
- * A range is one walk per key column, over the entries between its bounds:
- * about n_distinct(col) x the range's selectivity of them, each decoded and
- * compared with every bound.  On a low- or mid-cardinality column that is a
- * few hundred entries, which is nothing; on a near-unique one every row is
- * an entry, and this is the term - with the index's own size, an entry header
- * per row against btree's tuple - that leaves such a column to btree.  Only
- * a column whose chosen qual IS its range pays it (lion_cost_col_ranges()).
+ * A range is one walk per key column, over the entries between its bounds
+ * (lion_cost_walk_entries()), each decoded and compared with every bound.  On
+ * a low- or mid-cardinality column that is a few hundred entries, which is
+ * nothing; on a near-unique one every row is an entry, and this is the term -
+ * with the index's own size, an entry header per row against btree's tuple -
+ * that leaves such a column to btree, unless the column has summaries (§32),
+ * whose walk is a summary per bucket.  Only a column whose chosen qual IS its
+ * range pays it (lion_cost_col_ranges()).
  *
  * Beside another column's sets, a plain scan walks a long range once per
  * WINDOW of those sets' containers (DESIGN.md §29.3, lion_walk_window()), so
  * the entries are paid once per window: the heap's container keys over the
  * window, which is 1 below 32768 heap blocks at the default floor and an
  * upper bound above it (the sets may have containers at fewer keys).  The
- * bitmap scan, which shares the path, walks once and is overcharged by that
- * on a heap that large - the UNION's trade in lioncostestimate().  The plain
- * scan used to restart the other columns' stream for every entry instead, a
- * descent of each of their posting trees, and that was never charged at all
- * (2026-09-25 review).
+ * bitmap scan, which shares the path, walks once per window of the same
+ * memory too (lion_emit_intersect()), whose containers are held at their own
+ * size rather than as bitset images, so it makes at most as many walks.  The
+ * plain scan used to restart the other columns' stream for every entry
+ * instead, a descent of each of their posting trees, and that was never
+ * charged at all (2026-09-25 review).
  *
  * *walkrows is what the walks read beyond that, for lioncostestimate() to
  * charge: on a MULTICOLUMN path genericcostestimate() prorates the index by
@@ -927,10 +987,8 @@ lion_range_entry_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 			Selectivity sel = clauselist_selectivity(root, ranges,
 													 index->rel->relid,
 													 JOIN_INNER, NULL);
-			double		ndistinct = lion_cost_col_ndistinct(root, index, c);
-			double		entries;
+			double		entries = lion_cost_walk_entries(root, path, c, sel);
 
-			entries = Max(1.0, ndistinct * sel);
 			if (lion_cost_sets_beside(path, c))
 			{
 				double		containers = ceil((double) index->rel->pages /
@@ -1273,24 +1331,26 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 
 /*
  * How many entries a WALK of key column c reads (LION_PLAIN_WALK): the
- * column's n_distinct, times its range's selectivity when a range bounds the
- * walk - the same count lion_range_entry_cost() prices the entries by, and
- * the same caveat: it is the share of the column's values for a column whose
- * rows spread evenly over them.
+ * column's n_distinct, or the entries of its range's walk when a range bounds
+ * it (lion_cost_walk_entries(), summaries and all) - the same count
+ * lion_range_entry_cost() prices the entries by, and the same caveat: it is
+ * the share of the column's values for a column whose rows spread evenly over
+ * them.
  */
 static double
 lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 {
 	IndexOptInfo *index = path->indexinfo;
 	List	   *ranges = lion_cost_col_ranges(path, c);
-	double		entries = lion_cost_col_ndistinct(root, index, c);
+	double		entries;
 
-	if (ranges != NIL)
-	{
-		entries *= clauselist_selectivity(root, ranges, index->rel->relid,
-										  JOIN_INNER, NULL);
-		list_free(ranges);
-	}
+	if (ranges == NIL)
+		return Max(1.0, lion_cost_col_ndistinct(root, index, c));
+	entries = lion_cost_walk_entries(root, path, c,
+									 clauselist_selectivity(root, ranges,
+															index->rel->relid,
+															JOIN_INNER, NULL));
+	list_free(ranges);
 	return Max(1.0, entries);
 }
 

@@ -26,7 +26,11 @@
  * a and the sets of b" is an AND of set trees whatever produced them.  A qual
  * the sets cannot express (`IS NOT NULL`, a multi-key query that needs the
  * whole index) is dropped and the TIDs are marked for recheck, which is
- * always correct: the bitmap heap scan re-applies the original quals.
+ * always correct: the bitmap heap scan re-applies the original quals.  A
+ * range column is a walk and not a set; its entries are ANDed with the other
+ * columns' answer a container at a time (lion_emit_intersect()), and on a
+ * column with summaries (DESIGN.md §32) the walk reads the summaries of the
+ * buckets the range covers whole.
  *
  * A multi-key opclass (DESIGN.md §17) answers `@>`, `&&`, `<@` and `@@`
  * instead.  The query is handed to the opclass's extractQuery function, which
@@ -110,6 +114,13 @@ typedef struct LionScanOpaqueData
 typedef LionScanOpaqueData *LionScanOpaque;
 
 static void lion_source_release(struct LionSource *src);
+static void lion_source_entry_set(Relation index, LionEntryTuple *entry,
+								  Size itemlen, MemoryContext cxt,
+								  LionPostingSet *ps);
+static bool lion_scan_col_ranges(LionScanOpaque so, LionState *col,
+								 ScanKey best, LionRange **rangesp,
+								 int *nrangesp);
+static double lion_scan_window_bytes(void);
 
 /* State threaded through lion_container_iterate() by lion_container_to_tbm() */
 typedef struct LionTbmState
@@ -566,6 +577,19 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
  * scan needs for `op ANY (array)` on a column that cannot compare the
  * elements, walked ONCE rather than once per element, so that no entry comes
  * out twice; the walk ends when every range has ended.
+ *
+ * ONE range over a column with SUMMARY posting sets (DESIGN.md §32) is walked
+ * the way a sum walks it instead (lion_entry_scan_begin_summed()): the keys of
+ * the buckets at the range's ends one by one, and every bucket the range
+ * covers whole as its summary, one entry of up to summary_tids rows.  They are
+ * pairwise disjoint and together exactly the range's rows, as the keys are
+ * (§32, "Readers"), so no caller can tell them apart - every one of them
+ * takes an entry's posting set and nothing else of it - but a range over a
+ * near-unique column is a few thousand entries instead of a million.  The
+ * copies are the entry scan's batch, handed out with no pin, which is why a
+ * walk that must keep its pins (§29.5) walks the keys: the only such walk is
+ * a plain scan under a non-MVCC snapshot.  A walk with its NULL entry has no
+ * range and never gets here.
  */
 typedef struct LionLeafWalk
 {
@@ -583,6 +607,7 @@ typedef struct LionLeafWalk
 	OffsetNumber off;
 	OffsetNumber maxoff;
 	bool		done;
+	LionEntryScan *sum;			/* the summed walk above, or NULL */
 } LionLeafWalk;
 
 static void
@@ -619,6 +644,20 @@ lion_walk_begin(LionLeafWalk *w, Relation index, LionState *col,
 		}
 	}
 
+	/* One range over a summarized column: its summaries (above). */
+	if (w->nranges == 1 && col->summarized && !withnull && !keeppin)
+	{
+		LionEntryScan *es = (LionEntryScan *) palloc(sizeof(LionEntryScan));
+
+		if (lion_entry_scan_begin_summed(es, index, (AttrNumber) col->attno,
+										 &ranges[0], LION_WALK_INSIDE))
+		{
+			w->sum = es;
+			return;
+		}
+		pfree(es);
+	}
+
 	/*
 	 * A range starts at the leaf its lower bound lives on (DESIGN.md §28);
 	 * the entries of an earlier column and those below the bound that share
@@ -632,6 +671,17 @@ static LionEntryTuple *
 lion_walk_next(LionLeafWalk *w, Size *itemlen)
 {
 	Page		cpage = (Page) w->copy->data;
+
+	if (w->sum != NULL)
+	{
+		LionEntryTuple *entry = NULL;
+
+		if (!w->done)
+			entry = lion_entry_scan_next_copy(w->sum, itemlen);
+		if (entry == NULL)
+			w->done = true;
+		return entry;
+	}
 
 	for (;;)
 	{
@@ -752,6 +802,12 @@ lion_walk_end(LionLeafWalk *w)
 	if (BufferIsValid(w->pinbuf))
 		ReleaseBuffer(w->pinbuf);
 	w->pinbuf = InvalidBuffer;
+	if (w->sum != NULL)
+	{
+		lion_entry_scan_end(w->sum);
+		pfree(w->sum);
+		w->sum = NULL;
+	}
 	w->done = true;
 	w->haspage = false;
 }
@@ -833,7 +889,9 @@ lion_scankey_is_array_range(LionState *col, ScanKey skey)
  * wide the range is.  No pin budget is drawn on - a bitmap scan needs no
  * visibility-map interlock, since the executor visits every TID it emits -
  * and the memory is the TIDBitmap's own, which goes lossy under work_mem
- * rather than growing.
+ * rather than growing.  On a column with summaries (DESIGN.md §32) the walk
+ * reads the summary of every bucket the range covers whole instead of its
+ * keys (lion_walk_begin()): the same TIDs, from far fewer entries.
  */
 static int64
 lion_emit_range(LionScanOpaque so, LionState *col,
@@ -1493,81 +1551,522 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 	return es.ntids;
 }
 
+/* ---------------------------------------------------------------------
+ * A range beside other key columns (DESIGN.md §28, "Bitmap scans")
+ * --------------------------------------------------------------------- */
+
+/* One range column of an intersection: the ranges its walk tests. */
+typedef struct LionScanRangeCol
+{
+	AttrNumber	attno;
+	LionRange  *ranges;
+	int			nranges;
+} LionScanRangeCol;
+
+/*
+ * A WINDOW of the other columns' answer: its next containers, in ascending
+ * container key, copied out of their stream.
+ *
+ * The walk of the LAST range column ANDs every container of every entry it
+ * hands out with the window's container at that key, and adds what is left to
+ * the caller's bitmap at once: a bitmap is a set, so it does not matter which
+ * entry a TID came from.  A range column before the last has another range to
+ * be ANDed with afterwards, so what its walk finds is ORed into one bitset
+ * image per window container instead (hit[]), and the window's containers
+ * are cut down to it (lion_rwin_apply()) before the next column's walk.
+ */
+typedef struct LionRangeWindow
+{
+	int			n;				/* containers in the window */
+	int			max;			/* room for, in the three arrays */
+	uint32	   *keys;			/* [max] their container keys, ascending */
+	LionContainer **f;			/* [max] the containers, in cxt */
+	uint64	  **hit;			/* [max] a walk's images, NULL until used */
+	bool		last;			/* the walk is the last range column's */
+	int			p;				/* the slot the current entry has reached */
+	TIDBitmap  *tbm;
+	bool		recheck;
+	int64		ntids;			/* TIDs added from containers */
+	LionTbmState tst;			/* ... and from sparse segments' pairs */
+	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes each */
+	LionContainer *ibuf;
+	MemoryContext cxt;			/* the window's containers and images */
+	MemoryContext entrycxt;		/* one posting tree's stream */
+} LionRangeWindow;
+
+/*
+ * Move the window's position forward to the first container whose key is not
+ * below ckey, and say which slot holds ckey itself (-1 for none).  The items
+ * of one entry come in ascending container key, so the position never moves
+ * back within an entry, and a binary search from it finds the next one in a
+ * window of any size.  False once ckey is past the window's last key, which
+ * ends the entry.
+ */
+static inline bool
+lion_rwin_slot(LionRangeWindow *w, uint32 ckey, int *slot)
+{
+	*slot = -1;
+	if (ckey > w->keys[w->n - 1])
+		return false;
+	if (w->keys[w->p] < ckey)
+	{
+		int			lo = w->p + 1;
+		int			hi = w->n - 1;	/* keys[hi] >= ckey */
+
+		while (lo < hi)
+		{
+			int			mid = lo + (hi - lo) / 2;
+
+			if (w->keys[mid] < ckey)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		w->p = lo;
+	}
+	if (w->keys[w->p] == ckey)
+		*slot = w->p;
+	return true;
+}
+
+static inline uint64 *
+lion_rwin_image(LionRangeWindow *w, int slot)
+{
+	if (w->hit[slot] == NULL)
+		w->hit[slot] = (uint64 *) MemoryContextAllocZero(w->cxt,
+														 LION_BITSET_BYTES);
+	return w->hit[slot];
+}
+
+static bool
+lion_rwin_pair_cb(uint32 ckey, uint16 lo, void *arg)
+{
+	LionRangeWindow *w = (LionRangeWindow *) arg;
+	int			slot;
+
+	if (!lion_rwin_slot(w, ckey, &slot))
+		return false;
+	if (slot < 0)
+		return true;
+	if (!w->last)
+		lion_rwin_image(w, slot)[lo >> 6] |= UINT64CONST(1) << (lo & 63);
+	else if (lion_container_contains(w->f[slot], lo))
+		(void) lion_tbm_pair_callback(ckey, lo, &w->tst);
+	return true;
+}
+
+/*
+ * One item of a walked entry against the window: a container, or a sparse
+ * segment of an INLINE payload (DESIGN.md §13).  Anything at a key the window
+ * has no container at is none of its business.  Returns false once the item
+ * is past the window, which ends the entry.
+ */
+static bool
+lion_rwin_item(LionRangeWindow *w, const LionContainer *c)
+{
+	int			slot;
+
+	/* A segment's header carries its first container key (§13). */
+	if (c->ckey > w->keys[w->n - 1])
+		return false;
+	if (c->type == LION_CT_SPARSE)
+	{
+		lion_sparse_iterate(c, lion_rwin_pair_cb, w);
+		if (w->tst.ntids > 0)
+		{
+			tbm_add_tuples(w->tbm, w->tst.tids, w->tst.ntids, w->recheck);
+			w->tst.ntids = 0;
+		}
+		return true;			/* the next item says whether it is past */
+	}
+	if (!lion_rwin_slot(w, c->ckey, &slot))
+		return false;
+	if (slot < 0)
+		return true;
+	if (!w->last)
+		lion_container_or_into_bitset(c, lion_rwin_image(w, slot));
+	else if (lion_container_and(c, w->f[slot], w->tmp) > 0)
+		w->ntids += lion_container_to_tbm(w->tmp, w->tbm, w->recheck);
+	return true;
+}
+
+/*
+ * One walked entry against the window: an INLINE one straight from the walk's
+ * copy, item by item, and a posting tree sought to the window's first key and
+ * read up to its last - as the plain scan's WINDOW reads its entries
+ * (lion_source_window()).
+ */
+static void
+lion_rwin_entry(LionRangeWindow *w, Relation index, LionEntryTuple *entry,
+				Size itemlen)
+{
+	w->p = 0;
+	if ((entry->flags & LION_ENTRY_INLINE) != 0)
+	{
+		const char *payload = LionEntryGetPayload(entry);
+		Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
+		Size		off = 0;
+
+		while (lion_inline_fetch(payload, paylen, &off, w->ibuf) > 0)
+		{
+			if (!lion_rwin_item(w, w->ibuf))
+				break;
+		}
+	}
+	else
+	{
+		LionPostingSet ps;
+		LionSetStream *st;
+		const LionContainer *c;
+		MemoryContext oldcxt = MemoryContextSwitchTo(w->entrycxt);
+
+		lion_source_entry_set(index, entry, itemlen, w->entrycxt, &ps);
+		st = lion_stream_begin(1, &ps, NULL, false);
+		lion_stream_seek(st, w->keys[0]);
+		while ((c = lion_stream_next(st)) != NULL)
+		{
+			if (!lion_rwin_item(w, c))
+				break;
+		}
+		lion_stream_end(st);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextReset(w->entrycxt);
+	}
+}
+
+/*
+ * One walk of a range column for the window.  lion_walk_begin() reads the
+ * column's summaries when it has them (DESIGN.md §32), so a range that covers
+ * whole buckets is a handful of entries, however many keys it holds.
+ */
+static void
+lion_rwin_walk(LionRangeWindow *w, LionScanOpaque so, LionScanRangeCol *rc)
+{
+	LionLeafWalk lw;
+	LionEntryTuple *entry;
+	Size		itemlen;
+
+	lion_walk_begin(&lw, so->index, lion_column(so->ix, rc->attno), false,
+					rc->ranges, rc->nranges, false);
+	while ((entry = lion_walk_next(&lw, &itemlen)) != NULL)
+	{
+		lion_rwin_entry(w, so->index, entry, itemlen);
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_walk_end(&lw);
+	pfree(lw.copy);
+}
+
+/*
+ * After the walk of a range column that is not the last: each container of
+ * the window keeps only what the walk found at its key, and one left with
+ * nothing leaves the window.
+ */
+static void
+lion_rwin_apply(LionRangeWindow *w)
+{
+	int			i;
+	int			k = 0;
+
+	for (i = 0; i < w->n; i++)
+	{
+		uint64	   *img = w->hit[i];
+		LionContainer *f = w->f[i];
+		Size		size;
+
+		w->hit[i] = NULL;
+		if (img == NULL)
+		{
+			pfree(f);
+			continue;
+		}
+		lion_bits_to_container(img, w->keys[i], w->ibuf);
+		pfree(img);
+		if (lion_container_and(w->ibuf, f, w->tmp) == 0)
+		{
+			pfree(f);
+			continue;
+		}
+		pfree(f);
+		size = lion_container_size(w->tmp);
+		w->f[k] = (LionContainer *) MemoryContextAlloc(w->cxt, size);
+		memcpy(w->f[k], w->tmp, size);
+		w->keys[k] = w->keys[i];
+		k++;
+	}
+	w->n = k;
+}
+
+/*
+ * The next window: the other columns' next containers until they take the
+ * window's memory - their own size, and a bitset image's more each when a
+ * walk will fill images - and at least one.  False when the stream has none
+ * left.
+ */
+static bool
+lion_rwin_fill(LionRangeWindow *w, LionSetStream *st, bool *done, Size budget,
+			   bool images)
+{
+	Size		held = 0;
+
+	MemoryContextReset(w->cxt);
+	w->n = 0;
+	while (!*done && held < budget)
+	{
+		const LionContainer *c = lion_stream_next(st);
+		Size		size;
+
+		if (c == NULL)
+		{
+			*done = true;
+			break;
+		}
+		if (c->cardinality == 0)
+			continue;
+		if (w->n >= w->max)
+		{
+			w->max *= 2;
+			w->keys = (uint32 *) repalloc(w->keys, sizeof(uint32) * w->max);
+			w->f = (LionContainer **)
+				repalloc(w->f, sizeof(LionContainer *) * w->max);
+			w->hit = (uint64 **) repalloc(w->hit, sizeof(uint64 *) * w->max);
+		}
+		size = lion_container_size(c);
+		w->f[w->n] = (LionContainer *) MemoryContextAlloc(w->cxt, size);
+		memcpy(w->f[w->n], c, size);
+		w->keys[w->n] = c->ckey;
+		w->hit[w->n] = NULL;
+		held += GetMemoryChunkSpace(w->f[w->n]) + sizeof(uint32) +
+			sizeof(LionContainer *) + sizeof(uint64 *);
+		if (images)
+			held += LION_BITSET_BYTES;
+		w->n++;
+	}
+	return w->n > 0;
+}
+
 /*
  * Answer a scan whose keys span several key columns when at least one of them
- * is answered by a RANGE (DESIGN.md §28): the other columns' set trees into
- * one TIDBitmap, each range column's walk into one of its own, all of them
- * intersected - which is what core's BitmapAnd does, inside one index scan -
- * and the result ORed into the caller's bitmap, which a BitmapOr above may be
- * sharing with its other arms.  Each private bitmap has work_mem of its own,
- * as each input of a BitmapAnd does, and goes lossy rather than growing past
- * it; tbm_intersect() and tbm_union() carry the recheck flags across.
+ * is answered by a RANGE (DESIGN.md §28): the other columns' set trees ANDed
+ * into ONE stream of containers in ascending container key, and each range
+ * column's walk ANDed with it a container at a time - exactly - into the
+ * caller's bitmap, which a BitmapOr above may be sharing with its other arms.
+ *
+ * The stream is taken a WINDOW at a time, as much of it as the window's
+ * memory holds (lion_scan_window_bytes(): work_mem, and never less than
+ * pg_lion.scan_window_floor), and every range column is walked once per
+ * window, each entry sought to the window and read up to its end.  A
+ * selective answer of the other columns is one window, and each range one
+ * walk; a range over a summarized column (§32) walks the summaries of the
+ * buckets it covers rather than their keys, so a wide one is short.  When
+ * nothing beside the ranges could be expressed, the first range column,
+ * collected into a set of its own (lion_range_collect(), summaries and all),
+ * stands for the other columns, and a range left on its own is simply walked
+ * into the bitmap, rechecked.
  *
  * rangekeys[] names each range column by its chosen key: a plain range key,
  * whose column's range keys are then walked together, or `col < ANY (array)`,
- * one walk to the widest element.  The array form used to be handed to
- * lion_emit_columns() with the set trees, which cannot express it, so it was
- * dropped and left to the heap recheck while the cost model and the plain
- * scan both took it as answered (2026-09-25 review: `a < ANY ('{-40,-45}')
- * AND b = 3` rechecked away 212 rows the index could have excluded).
+ * one walk to the widest element.
+ *
+ * (Deviation from the version before it, which walked each range into a
+ * TIDBitmap of its own, of work_mem, and intersected the bitmaps - core's
+ * BitmapAnd inside one scan.  A range over a large heap does not fit in
+ * work_mem when its rows are spread over the heap: its bitmap went LOSSY, and
+ * tbm_intersect() keeps every exact page of the other side that falls on a
+ * lossy page of it, only marked for recheck.  A time window over rows stored
+ * in no time order has a row on nearly every page, so the range removed
+ * almost nothing and the heap recheck threw most of the rows away - with the
+ * range walked key by key into its bitmap all the same, and the scan
+ * reporting the smaller input's count as its own, which looked as if the
+ * range had not been answered at all (a benchmark, 2026-09-28).
+ * test/sql/rangebitmap.sql shows no row removed by the recheck now.)
  */
 static int64
 lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 				   int nkeys, ScanKey *rangekeys, int nrange,
 				   TIDBitmap *tbm)
 {
-	TIDBitmap  *acc = NULL;
-	int64		ntids = -1;
+	Relation	index = so->index;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionScanSets acc;
+	LionKeyNode **args;
+	LionScanRangeCol *rc;
+	LionRangeWindow w;
+	LionSetStream *st;
+	Size		budget = (Size) lion_scan_window_bytes();
+	bool		done = false;
+	bool		nomatch = false;
+	int			nargs = 0;
+	int			first = 0;
+	int64		ntids;
 	int			i;
+	int			r;
 
-	if (nkeys > 0)
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index range intersection",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	acc.maxsets = 8;
+	acc.nsets = 0;
+	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (nkeys + 1));
+
+	/*
+	 * Each range column's ranges.  One that can hold nothing - a NULL bound,
+	 * an empty array or one of NULLs - settles the whole scan.
+	 */
+	rc = (LionScanRangeCol *) palloc0(sizeof(LionScanRangeCol) * nrange);
+	for (i = 0; i < nrange && !nomatch; i++)
 	{
-		acc = tbm_create((Size) work_mem * 1024, NULL);
-		ntids = lion_emit_columns(so, keys, nkeys, acc);
-		if (ntids < 0)
+		LionState  *col = lion_column(so->ix, rangekeys[i]->sk_attno);
+		bool		any = false;
+
+		rc[i].attno = (AttrNumber) col->attno;
+		if (lion_scan_col_ranges(so, col, rangekeys[i], &rc[i].ranges,
+								 &rc[i].nranges))
 		{
-			/* Nothing expressible there: the ranges alone, rechecked. */
-			tbm_free(acc);
-			acc = NULL;
-			so->recheck = true;
+			for (r = 0; r < rc[i].nranges; r++)
+				any |= !rc[i].ranges[r].empty;
 		}
+		nomatch = !any;
 	}
 
-	for (i = 0; i < nrange; i++)
+	/* The other columns' set trees, as lion_emit_columns() builds them. */
+	for (i = 0; i < nkeys && !nomatch; i++)
 	{
-		TIDBitmap  *one;
-		LionState  *col;
-		int64		n;
+		LionKeyNode *node;
+		bool		ok;
+		bool		none;
 
-		/* One input selects nothing, so the intersection does not either. */
-		if (acc != NULL && tbm_is_empty(acc))
-			break;
+		node = lion_scan_col_tree(so, lion_column(so->ix, keys[i]->sk_attno),
+								  keys[i], &acc, &ok, &none);
+		if (none)
+			nomatch = true;
+		else if (!ok || node == NULL)
+			so->recheck = true; /* the heap scan re-applies this qual */
+		else
+			args[nargs++] = node;
+	}
 
-		one = tbm_create((Size) work_mem * 1024, NULL);
-		col = lion_column(so->ix, rangekeys[i]->sk_attno);
-		if ((rangekeys[i]->sk_flags & SK_SEARCHARRAY) == 0)
-			n = lion_emit_range(so, col, one);
-		else if ((rangekeys[i]->sk_flags & SK_ISNULL) == 0)
-			n = lion_emit_array_range(so, col, rangekeys[i], one);
-		else
-			n = 0;				/* `k < ANY (NULL)` is never true */
-		ntids = (ntids < 0) ? n : Min(ntids, n);
-		if (acc == NULL)
-			acc = one;
-		else
+	if (!nomatch && nargs == 0 && nrange == 1)
+	{
+		/* Nothing beside the range could be expressed: the range alone. */
+		ScanKey		skey = rangekeys[0];
+		LionState  *col = lion_column(so->ix, skey->sk_attno);
+
+		for (i = 0; i < acc.nsets; i++)
+			lion_posting_set_release(&acc.sets[i]);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextDelete(cxt);
+		Assert(so->recheck);
+		if ((skey->sk_flags & SK_SEARCHARRAY) == 0)
+			return lion_emit_range(so, col, tbm);
+		return lion_emit_array_range(so, col, skey, tbm);
+	}
+
+	if (!nomatch && nargs == 0)
+	{
+		/*
+		 * Nothing but ranges: the first one, collected, stands for the other
+		 * columns' sets.  Past the window's memory the collection goes on in
+		 * a temporary file, a window of container keys at a time.
+		 */
+		LionKeyNode **leaves = (LionKeyNode **)
+			palloc(sizeof(LionKeyNode *) * Max(rc[0].nranges, 1));
+		int			nleaves = 0;
+
+		for (r = 0; r < rc[0].nranges; r++)
 		{
-			tbm_intersect(acc, one);
-			tbm_free(one);
+			int			base;
+			Size		held;
+			bool		spilled;
+			int64		nsets;
+			int64		nsums;
+
+			if (rc[0].ranges[r].empty)
+				continue;
+			base = lion_sets_reserve(&acc, 1);
+			(void) lion_range_collect(index, rc[0].attno, &rc[0].ranges[r],
+									  budget, true, &acc.sets[base], &held,
+									  &spilled, &nsets, &nsums);
+			if (acc.sets[base].found)
+				leaves[nleaves++] = lion_scan_leaf(base);
+			else
+				acc.nsets--;	/* the range holds no row */
 		}
+		if (nleaves == 0)
+			nomatch = true;
+		else
+			args[nargs++] = lion_scan_op(LION_KN_OR, leaves, nleaves);
+		first = 1;
 	}
 
-	if (acc != NULL)
+	if (nomatch)
 	{
-		tbm_union(tbm, acc);
-		tbm_free(acc);
+		for (i = 0; i < acc.nsets; i++)
+			lion_posting_set_release(&acc.sets[i]);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextDelete(cxt);
+		return 0;
 	}
 
-	return Max(ntids, 0);
+	/*
+	 * Every set is located, and every directory lock taken and let go, before
+	 * the stream reads a posting page (the §11 rule).  None of their pins
+	 * protects anything here - the bitmap heap scan visits every TID - and
+	 * the stream keeps none between two containers, so the walks below lock
+	 * directory leaves with nothing pinned.
+	 */
+	for (i = 0; i < acc.nsets; i++)
+		lion_posting_set_unpin(&acc.sets[i]);
+	st = lion_stream_begin_bounded(acc.nsets, acc.sets,
+								   lion_scan_op(LION_KN_AND, args, nargs));
+
+	memset(&w, 0, sizeof(w));
+	w.max = 64;
+	w.keys = (uint32 *) palloc(sizeof(uint32) * w.max);
+	w.f = (LionContainer **) palloc(sizeof(LionContainer *) * w.max);
+	w.hit = (uint64 **) palloc(sizeof(uint64 *) * w.max);
+	w.tbm = tbm;
+	w.recheck = so->recheck;
+	w.tst.tbm = tbm;
+	w.tst.recheck = so->recheck;
+	w.tst.curblk = InvalidBlockNumber;
+	w.tmp = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	w.ibuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+
+	/*
+	 * Anything over a kilobyte - a bitset, an image - gets a block of its own
+	 * at its own size, so that what the window holds is about what it counts
+	 * (lion_range_collect() does the same).
+	 */
+	w.cxt = AllocSetContextCreate(cxt, "lion index range window",
+								  ALLOCSET_SMALL_SIZES);
+	w.entrycxt = AllocSetContextCreate(cxt, "lion index range entry",
+									   ALLOCSET_DEFAULT_SIZES);
+
+	while (lion_rwin_fill(&w, st, &done, budget, nrange - first > 1))
+	{
+		for (i = first; i < nrange && w.n > 0; i++)
+		{
+			w.last = (i == nrange - 1);
+			lion_rwin_walk(&w, so, &rc[i]);
+			if (!w.last)
+				lion_rwin_apply(&w);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	ntids = w.ntids + w.tst.total;
+
+	lion_stream_end(st);
+	for (i = 0; i < acc.nsets; i++)
+		lion_posting_set_release(&acc.sets[i]);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	return ntids;
 }
 
 /*
@@ -1693,8 +2192,8 @@ lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
 	 * can be expressed the answer falls through to the single-column path
 	 * below, which knows how to walk a whole column.  A RANGE column is not a
 	 * set tree at all - its answer is a union of however many entries the
-	 * range holds (DESIGN.md §28), `col < ANY (array)` included - so it is
-	 * answered into a bitmap of its own and intersected with the others'
+	 * range holds (DESIGN.md §28), `col < ANY (array)` included - so its
+	 * walk is ANDed with the others' stream a container at a time
 	 * (lion_emit_intersect()).
 	 */
 	if (ch.nchosen > 1)
@@ -1992,37 +2491,45 @@ lion_scan_probe(LionScanOpaque so, LionState *col, Oid subtype)
 }
 
 /*
- * The ranges a WALK of a scalar column tests its entries with (§29.3): every
- * range key of the column as ONE range, or, for `op ANY (array)`, the range of
- * the widest element when the column orders the elements (§28) and one range
- * per element otherwise.  Returns false when nothing can be in range: an
- * empty array, or one of NULLs only.
+ * The ranges a walk of a scalar column tests its entries with: every range key
+ * of the column as ONE range, or, for `op ANY (array)`, the range of the
+ * widest element when the column orders the elements (§28) and one range per
+ * element otherwise, all of them walked at once.  Returns false when nothing
+ * can be in range: an empty array, or one of NULLs only.  The plain scan's
+ * WALK (§29.3) and the bitmap scan's intersection (lion_emit_intersect())
+ * both walk these; they are allocated in the current memory context, with
+ * the element values they point at.
  */
 static bool
-lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
+lion_scan_col_ranges(LionScanOpaque so, LionState *col, ScanKey best,
+					 LionRange **rangesp, int *nrangesp)
 {
-	LionScanOpaque so = src->so;
-	Relation	index = src->index;
+	Relation	index = so->index;
+	LionRange  *ranges;
+	int			nranges;
 	int			i;
 
 	if ((best->sk_flags & SK_SEARCHARRAY) == 0)
 	{
-		src->ranges = (LionRange *) palloc(sizeof(LionRange));
-		src->nranges = 1;
-		lion_range_init(&src->ranges[0], index, (AttrNumber) col->attno);
+		ranges = (LionRange *) palloc(sizeof(LionRange));
+		lion_range_init(&ranges[0], index, (AttrNumber) col->attno);
 		for (i = 0; i < so->nkeys; i++)
 		{
 			ScanKey		k = &so->keys[i];
 
 			if (k->sk_attno != col->attno || !lion_scankey_is_range(col, k))
 				continue;
-			lion_range_add(&src->ranges[0], index, k->sk_strategy,
+			lion_range_add(&ranges[0], index, k->sk_strategy,
 						   k->sk_func.fn_oid, k->sk_subtype, k->sk_argument,
 						   (k->sk_flags & SK_ISNULL) != 0, k->sk_collation);
 		}
+		*rangesp = ranges;
+		*nrangesp = 1;
 		return true;
 	}
 
+	*rangesp = NULL;
+	*nrangesp = 0;
 	if ((best->sk_flags & SK_ISNULL) != 0)
 		return false;			/* `k < ANY (NULL)` */
 
@@ -2042,8 +2549,8 @@ lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
 		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 						  &elems, &nulls, &nelems);
 
-		src->ranges = (LionRange *) palloc(sizeof(LionRange) * Max(nelems, 1));
-		src->nranges = 0;
+		ranges = (LionRange *) palloc(sizeof(LionRange) * Max(nelems, 1));
+		nranges = 0;
 
 		for (i = 0; i < nelems; i++)
 		{
@@ -2068,27 +2575,36 @@ lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
 			}
 
 			/* No order among the elements: one range each, in ONE walk. */
-			lion_range_init(&src->ranges[src->nranges], index,
-							(AttrNumber) col->attno);
-			lion_range_add(&src->ranges[src->nranges], index,
+			lion_range_init(&ranges[nranges], index, (AttrNumber) col->attno);
+			lion_range_add(&ranges[nranges], index,
 						   best->sk_strategy, best->sk_func.fn_oid,
 						   best->sk_subtype, elems[i], false,
 						   best->sk_collation);
-			src->nranges++;
+			nranges++;
 		}
 
 		if (widest >= 0)
 		{
-			lion_range_init(&src->ranges[0], index, (AttrNumber) col->attno);
-			lion_range_add(&src->ranges[0], index, best->sk_strategy,
+			lion_range_init(&ranges[0], index, (AttrNumber) col->attno);
+			lion_range_add(&ranges[0], index, best->sk_strategy,
 						   best->sk_func.fn_oid, best->sk_subtype,
 						   elems[widest], false, best->sk_collation);
-			src->nranges = 1;
+			nranges = 1;
 		}
 
-		/* The element values stay in src->cxt with the ranges that use them. */
-		return src->nranges > 0;
+		/* The element values stay with the ranges that use them. */
+		*rangesp = ranges;
+		*nrangesp = nranges;
+		return nranges > 0;
 	}
+}
+
+/* ... as the source of a plain scan's WALK keeps them (§29.3). */
+static bool
+lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
+{
+	return lion_scan_col_ranges(src->so, col, best, &src->ranges,
+								&src->nranges);
 }
 
 /*
@@ -3051,6 +3567,8 @@ lion_source_next(LionSource *src)
 					src->walk.col = lion_column(ix, src->walkattno);
 					for (r = 0; r < src->nranges; r++)
 						src->ranges[r].state = src->walk.col;
+					if (src->walk.sum != NULL)
+						src->walk.sum->state = src->walk.col;
 					src->ix = ix;
 					src->so->ix = ix;
 				}

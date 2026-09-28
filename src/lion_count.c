@@ -7398,6 +7398,27 @@ lion_stream_end(LionSetStream *st)
 }
 
 /*
+ * The stream of lion_sets_iterate(), below, for a caller that pulls it: a
+ * bitmap scan's intersection of a range with other columns (DESIGN.md §28,
+ * "Bitmap scans").
+ */
+LionSetStream *
+lion_stream_begin_bounded(int nsets, LionPostingSet *sets, LionKeyNode *tree)
+{
+	LionOpenBudget budget;
+	Relation	rel = NULL;
+	int			i;
+
+	for (i = 0; i < nsets && rel == NULL; i++)
+	{
+		if (sets[i].found)
+			rel = sets[i].index;
+	}
+	lion_open_budget_init(&budget, rel);
+	return lion_stream_begin_budget(nsets, sets, tree, false, &budget);
+}
+
+/*
  * Walk the containers of one expression over located posting sets, without
  * any visibility-map interlock: what a bitmap scan of a multi-key opclass
  * (DESIGN.md §17) or of several key columns (§24) needs.  Every TID goes to
@@ -7413,20 +7434,11 @@ int64
 lion_sets_iterate(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 				 lion_container_callback cb, void *arg)
 {
-	LionOpenBudget budget;
 	LionSetStream *st;
 	const LionContainer *c;
-	Relation	rel = NULL;
 	int64		total = 0;
-	int			i;
 
-	for (i = 0; i < nsets && rel == NULL; i++)
-	{
-		if (sets[i].found)
-			rel = sets[i].index;
-	}
-	lion_open_budget_init(&budget, rel);
-	st = lion_stream_begin_budget(nsets, sets, tree, false, &budget);
+	st = lion_stream_begin_bounded(nsets, sets, tree);
 
 	while ((c = lion_stream_next(st)) != NULL)
 	{
@@ -8286,28 +8298,42 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 	return true;
 }
 
-void
-lion_entry_scan_begin_sum(LionEntryScan *es, Relation index, AttrNumber attno,
-						  LionRange *range, int part)
+bool
+lion_entry_scan_begin_summed(LionEntryScan *es, Relation index,
+							 AttrNumber attno, LionRange *range, int part)
 {
 	lion_entry_scan_init(es, index, attno);
 	es->range = range;
 	es->part = (range == NULL) ? LION_WALK_ALL : part;
 	if (range != NULL)
-	{
 		range->state = es->state;
-		if (range->empty)
-		{
-			es->done = true;
-			return;
-		}
+
+	if ((range == NULL || !range->empty) &&
+		lion_entry_scan_plan_sum(es, index, range, es->part))
+		return true;
+
+	lion_entry_scan_end(es);
+	return false;
+}
+
+void
+lion_entry_scan_begin_sum(LionEntryScan *es, Relation index, AttrNumber attno,
+						  LionRange *range, int part)
+{
+	if (range != NULL && range->empty)
+	{
+		lion_entry_scan_init(es, index, attno);
+		es->range = range;
+		es->part = part;
+		range->state = es->state;
+		es->done = true;
+		return;
 	}
 
-	if (lion_entry_scan_plan_sum(es, index, range, es->part))
+	if (lion_entry_scan_begin_summed(es, index, attno, range, part))
 		return;
 
 	/* No summaries to use: the plain walk. */
-	lion_entry_scan_end(es);
 	if (range == NULL)
 		lion_entry_scan_begin_col(es, index, attno);
 	else
@@ -8858,6 +8884,44 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 	}
 
 	return true;
+}
+
+/*
+ * The same walk for a caller that needs neither a located set nor a pin: a
+ * scan that hands every TID it reads to the executor, which visits each one
+ * in the heap (see lion_count.h).  The copies are the batch's own, so an
+ * entry stays valid until the next call - which may read the next leaf into
+ * the same buffer - and the pin the batch keeps for its INLINE copies, which
+ * only a count needs (DESIGN.md §9), is let go of as soon as it is taken.
+ */
+LionEntryTuple *
+lion_entry_scan_next_copy(LionEntryScan *es, Size *itemlen)
+{
+	int			i;
+
+	while (es->nextbatch >= es->nbatch)
+	{
+		/* a phase that has ended hands over at the next read (§32) */
+		if (es->done ||
+			(!BlockNumberIsValid(es->blkno) && es->nextphase == es->phase))
+		{
+			es->done = true;
+			return NULL;
+		}
+		CHECK_FOR_INTERRUPTS();
+		(void) lion_entry_scan_fill(es, true);
+	}
+
+	if (BufferIsValid(es->batchbuf))
+	{
+		ReleaseBuffer(es->batchbuf);
+		es->batchbuf = InvalidBuffer;
+	}
+	es->lastinline = -1;
+
+	i = es->nextbatch++;
+	*itemlen = es->bsize[i];
+	return es->bentry[i];
 }
 
 int64
