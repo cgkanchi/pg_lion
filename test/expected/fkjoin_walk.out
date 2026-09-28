@@ -416,6 +416,26 @@ SELECT lion_wj('SELECT d.grp, count(DISTINCT d.attr), count(*), count(d.attr) FR
  pushed down, in key order, 5 rows
 (1 row)
 
+-- grouped by either key, each row walked a group of its own - in key order
+-- a batch at a time, never twice (fkjoin_bykey.sql)
+SELECT lion_wj('SELECT f.fk, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3 GROUP BY f.fk');
+               lion_wj               
+-------------------------------------
+ pushed down, in key order, 381 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.pk, count(*), max(d.attr) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.pk');
+               lion_wj                
+--------------------------------------
+ pushed down, in key order, 3740 rows
+(1 row)
+
+SELECT lion_wj('SELECT f.fk, count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk) GROUP BY f.fk');
+               lion_wj                
+--------------------------------------
+ pushed down, in key order, 2698 rows
+(1 row)
+
 -- reverse semi and anti joins, the dimension's rows each once
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)');
               lion_wj              

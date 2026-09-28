@@ -1,0 +1,622 @@
+-- FK-side join pushdown, part eight (DESIGN.md §27, "Grouped by the join
+-- key"): the join's pairs counted per key, and those per-key counts
+-- aggregated in turn -
+--
+--   WITH a AS (SELECT d.pk FROM dim d WHERE <d filters>),
+--   n AS (SELECT f.fk, count(*) AS n FROM fact f JOIN a ON a.pk = f.fk
+--         WHERE <f filters> GROUP BY f.fk)
+--   SELECT count(*), sum(LEAST(n, 3)) FROM n;
+--
+-- The inner level's GROUP BY f.fk is the node's own count per dimension row.
+-- The node emits the dimension's key where the fact's join column stands,
+-- under the rule a count(DISTINCT f.fk) is answered by - an inner join (or
+-- the forward semi join's distinct keys), one type, a grouping equality of
+-- the join operator's family, the join's collation - and, since the column is
+-- printed, only where equality implies an identical representation.  Grouped
+-- by a key the node's rows never repeat, each row is a group of its own, and
+-- the Agg above the node is a sorted one over the rows as they come, with no
+-- Sort and no hash table.  Every answer is checked against the same query
+-- with the pushdown off, as a multiset in both directions.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+
+/*
+ * The Agg nearest above the node - past a Gather, a Sort and a LionJoinAgg -
+ * and what it does with the node's rows: hashes them, sorts them first,
+ * takes each row as a group of its own (a sorted Agg with no Sort under it),
+ * or has no groups at all.
+ */
+CREATE FUNCTION lion_bk_below(p jsonb) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	IF p IS NULL THEN
+		RETURN NULL;
+	ELSIF p->>'Custom Plan Provider' = 'LionCount' THEN
+		RETURN 'node';
+	ELSIF p->>'Node Type' = 'Gather' THEN
+		RETURN lion_bk_below(p->'Plans'->0);
+	ELSIF p->>'Node Type' IN ('Sort', 'Incremental Sort') THEN
+		RETURN CASE WHEN lion_bk_below(p->'Plans'->0) IS NULL THEN NULL ELSE 'sort' END;
+	END IF;
+	RETURN NULL;
+END $$;
+
+CREATE FUNCTION lion_bk_agg_of(p jsonb) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	c jsonb;
+	r text;
+	below text;
+BEGIN
+	IF p->>'Node Type' = 'Aggregate' THEN
+		below := lion_bk_below(p->'Plans'->0);
+		IF below IS NOT NULL THEN
+			RETURN CASE
+				WHEN p->>'Strategy' = 'Hashed' THEN 'hashed'
+				WHEN p->>'Strategy' = 'Plain' THEN 'no groups'
+				WHEN below = 'sort' THEN 'sorted'
+				WHEN p ? 'Group Key' THEN 'each row a group'
+				ELSE 'no groups' END;
+		END IF;
+	END IF;
+	FOR c IN SELECT jsonb_array_elements(COALESCE(p->'Plans', '[]'::jsonb)) LOOP
+		r := lion_bk_agg_of(c);
+		IF r IS NOT NULL THEN
+			RETURN r;
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+
+/* How the plan groups, with the settings of the moment. */
+CREATE FUNCTION lion_bk_how(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	plan jsonb;
+	how text := 'not pushed down';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionJoinAgg)%' THEN
+			how := 'counted rows';
+		ELSIF ln LIKE '%Join Rows:%' AND how <> 'counted rows' THEN
+			how := 'rows';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
+			how := 'partial counts';
+		END IF;
+	END LOOP;
+	IF how = 'not pushed down' THEN
+		RETURN how;
+	END IF;
+	EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO plan;
+	RETURN how || ', ' || COALESCE(lion_bk_agg_of(plan->0->'Plan'), 'no Agg');
+END $$;
+
+/*
+ * lion_bk() runs a query through the pushdown - with every join method
+ * disabled when force is set, so that a shape the cost model would not pick
+ * is still EXERCISED - and again with the pushdown off and sequential scans
+ * only, so that the reference reads no lion posting set, and compares the
+ * two.  It reports the plan's form and how its Agg groups the node's rows.
+ */
+CREATE FUNCTION lion_bk(q text, force boolean DEFAULT true) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	how text;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	IF force THEN
+		PERFORM set_config('enable_hashjoin', 'off', true);
+		PERFORM set_config('enable_mergejoin', 'off', true);
+		PERFORM set_config('enable_nestloop', 'off', true);
+	END IF;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	how := lion_bk_how(q);
+	EXECUTE format('CREATE TEMP TABLE lion_bk_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_bk_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_bk_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_bk_on EXCEPT ALL SELECT * FROM lion_bk_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_bk_off EXCEPT ALL SELECT * FROM lion_bk_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_bk_on, lion_bk_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/* The answer itself, through the pushdown, joins disabled. */
+CREATE FUNCTION lion_bk_val(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	RETURN QUERY EXECUTE format('SELECT s::text FROM (%s) s', q);
+END $$;
+
+/* A generic prepared plan, which keeps $n a Param, against the same with the pushdown off. */
+CREATE FUNCTION lion_bk_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	how text;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_bkp_on AS ' || q;
+	how := lion_bk_how('EXECUTE lion_bkp_on(' || args || ')');
+	EXECUTE format('CREATE TEMP TABLE lion_bk_on AS EXECUTE lion_bkp_on(%s)', args);
+
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'PREPARE lion_bkp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_bk_off AS EXECUTE lion_bkp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_bkp_on';
+	EXECUTE 'DEALLOCATE lion_bkp_off';
+
+	EXECUTE 'SELECT count(*) FROM lion_bk_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_bk_on EXCEPT ALL SELECT * FROM lion_bk_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_bk_off EXCEPT ALL SELECT * FROM lion_bk_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_bk_on, lion_bk_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/*
+ * lion_bk_par() runs a query with every join method disabled three ways: as
+ * planned - in parallel, when the plan says so - with
+ * max_parallel_workers_per_gather at 0, and with the pushdown off and
+ * sequential scans only, and compares both of the first two with the third.
+ */
+CREATE FUNCTION lion_bk_par(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+	sdiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'parallel' THEN
+			how := 'serial';
+		END IF;
+	END LOOP;
+	how := how || ', ' || lion_bk_how(q);
+	EXECUTE format('CREATE TEMP TABLE lion_bk_par AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE format('CREATE TEMP TABLE lion_bk_ser AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_bk_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_bk_par' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_bk_par EXCEPT ALL SELECT * FROM lion_bk_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_bk_off EXCEPT ALL SELECT * FROM lion_bk_par) b)'
+		INTO ndiff;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_bk_ser EXCEPT ALL SELECT * FROM lion_bk_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_bk_off EXCEPT ALL SELECT * FROM lion_bk_ser) b)'
+		INTO sdiff;
+	EXECUTE 'DROP TABLE lion_bk_par, lion_bk_ser, lion_bk_off';
+
+	IF ndiff <> 0 OR sdiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ in parallel, %s serially', ndiff, sdiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/*
+ * The plan of a query, joins disabled, as EXPLAIN (FORMAT JSON) gives it:
+ * the Agg nearest above the node (past a Gather or a LionJoinAgg) and the
+ * node, each with its estimate and costs.
+ */
+CREATE FUNCTION lion_bk_find(p jsonb, what text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+	c jsonb;
+	r jsonb;
+BEGIN
+	IF what = 'node' AND p->>'Custom Plan Provider' = 'LionCount' THEN
+		RETURN p;
+	END IF;
+	IF what = 'agg' AND p->>'Node Type' = 'Aggregate' AND lion_bk_below(p->'Plans'->0) IS NOT NULL THEN
+		RETURN p;
+	END IF;
+	FOR c IN SELECT jsonb_array_elements(COALESCE(p->'Plans', '[]'::jsonb)) LOOP
+		r := lion_bk_find(c, what);
+		IF r IS NOT NULL THEN
+			RETURN r;
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+
+/*
+ * What the Agg above the node adds to the node's cost, with work_mem at `mem`
+ * and hash_mem_multiplier at 1.
+ */
+CREATE FUNCTION lion_bk_aggcost(q text, mem text) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE
+	plan jsonb;
+	agg jsonb;
+	node jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('work_mem', mem, true);
+	PERFORM set_config('hash_mem_multiplier', '1', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+	agg := lion_bk_find(plan->0->'Plan', 'agg');
+	node := lion_bk_find(plan->0->'Plan', 'node');
+	RETURN (agg->>'Total Cost')::numeric - (node->>'Total Cost')::numeric;
+END $$;
+
+CREATE FUNCTION lion_bk_plan(q text, opts text DEFAULT '', OUT agg jsonb, OUT node jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+	plan jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE format('EXPLAIN (FORMAT JSON%s) %s', opts, q) INTO plan;
+	agg := lion_bk_find(plan->0->'Plan', 'agg');
+	node := lion_bk_find(plan->0->'Plan', 'node');
+END $$;
+
+/*
+ * The dimension: 3000 rows, int8 primary key 1..3000, and tk, a text key
+ * unique beside it; kept true on two rows in three; attr 0..6 with NULL on
+ * every 13th, small an int2 0..4 with NULL on every 7th, five groups, a name
+ * with NULL on every 11th.  The fact: 60000 rows in random key order; fk
+ * over 1..3600, so keys 3001..3600 join no dimension row, NULL on every 40th
+ * row, and no row at all for the keys that are multiples of 17, so those
+ * dimension rows join no fact row; fk4 is fk as int4 and tk as the text key.
+ * hot is true on three rows in four, x has 10 values, y 5 and NULLs.
+ */
+CREATE TABLE lion_bkd (
+	pk		int8	PRIMARY KEY,
+	tk		text	NOT NULL UNIQUE,
+	kept	bool	NOT NULL,
+	attr	int,
+	small	int2,
+	grp		text	NOT NULL,
+	name	text
+) WITH (parallel_workers = 2);
+INSERT INTO lion_bkd
+SELECT i, 'k' || lpad(i::text, 5, '0'), i % 3 <> 0,
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
+	   CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 5)::int2 END,
+	   'g' || (i % 5),
+	   CASE WHEN i % 11 = 0 THEN NULL ELSE 'n' || lpad((i % 97)::text, 2, '0') END
+FROM generate_series(1, 3000) i;
+
+CREATE TABLE lion_bkf (
+	id		int		NOT NULL,
+	fk		int8,
+	fk4		int4,
+	tk		text,
+	hot		bool	NOT NULL,
+	x		int		NOT NULL,
+	y		int
+);
+INSERT INTO lion_bkf
+SELECT i, k, k, 'k' || lpad(k::text, 5, '0'), abs(hashint4(i + 3000000)) % 4 <> 0, h2 % 10,
+	   CASE WHEN h2 % 9 = 0 THEN NULL ELSE h2 / 10 % 5 END
+FROM (SELECT i,
+			 CASE WHEN i % 40 = 0 THEN NULL
+				  WHEN (abs(hashint4(i)) % 3600 + 1) % 17 = 0 THEN NULL
+				  ELSE abs(hashint4(i)) % 3600 + 1 END AS k,
+			 abs(hashint4(i + 1000000)) AS h2
+	  FROM generate_series(1, 60000) i) s;
+CREATE INDEX lion_bkf_fk ON lion_bkf USING lion (fk);
+CREATE INDEX lion_bkf_fk4 ON lion_bkf USING lion (fk4);
+CREATE INDEX lion_bkf_tk ON lion_bkf USING lion (tk);
+CREATE INDEX lion_bkf_hot ON lion_bkf USING lion (hot);
+CREATE INDEX lion_bkf_x ON lion_bkf USING lion (x);
+CREATE INDEX lion_bkf_y ON lion_bkf USING lion (y);
+
+-- a dimension whose key is NOT unique: every key twice, and NULLs
+CREATE TABLE lion_bkdn (k int8, attr int NOT NULL, val int) WITH (parallel_workers = 2);
+INSERT INTO lion_bkdn
+SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE i % 1500 + 1 END, i % 4,
+	   CASE WHEN i % 6 = 0 THEN NULL ELSE i % 9 END
+FROM generate_series(1, 3000) i;
+CREATE INDEX lion_bkdn_k ON lion_bkdn (k);
+
+-- numeric keys, equal under the join and spelled differently on each side:
+-- 1.00 in the dimension, 1.0 in every fact row that joins it
+CREATE TABLE lion_bknd (pk numeric PRIMARY KEY, attr int NOT NULL);
+INSERT INTO lion_bknd SELECT round(i::numeric, 2), i % 3 FROM generate_series(1, 50) i;
+CREATE TABLE lion_bknf (fk numeric, x int NOT NULL);
+INSERT INTO lion_bknf SELECT round((i % 60 + 1)::numeric, 1), i % 4 FROM generate_series(1, 3000) i;
+CREATE INDEX lion_bknf_fk ON lion_bknf USING lion (fk);
+CREATE INDEX lion_bknf_x ON lion_bknf USING lion (x);
+
+VACUUM (FREEZE, ANALYZE) lion_bkf;
+VACUUM (FREEZE, ANALYZE) lion_bkd;
+VACUUM (FREEZE, ANALYZE) lion_bkdn;
+VACUUM (FREEZE, ANALYZE) lion_bknf;
+VACUUM (FREEZE, ANALYZE) lion_bknd;
+
+-- ---- 1. the join's pairs per key, aggregated in turn -------------------------
+-- as written, the fact's key grouped, and with the dimension's key instead
+SELECT lion_bk('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+SELECT lion_bk('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT a.pk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY a.pk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+SELECT lion_bk_val('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+-- other dimension and fact filters, the outer level another aggregate
+SELECT lion_bk('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.grp IN (''g1'', ''g2'') AND d.attr > 2), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.x = 3 AND f.y IS NOT NULL GROUP BY f.fk) SELECT count(*), sum(LEAST(n, 2)), max(n), count(*) FILTER (WHERE n > 1) FROM n');
+SELECT lion_bk('WITH n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x IN (1, 2) GROUP BY f.fk) SELECT n, count(*) FROM n GROUP BY n');
+-- over nothing: the fact filter selects no row, or the dimension filter none
+SELECT lion_bk_val('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.x = 77 GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+SELECT lion_bk_val('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.pk > 5000), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+
+-- ---- 2. GROUP BY the fact's key ---------------------------------------------
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot AND d.kept GROUP BY f.fk');
+SELECT lion_bk('SELECT f.fk, count(*), count(1), count(f.fk), count(d.pk) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk');
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY f.fk');
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.y IS NULL OR f.x = 5 GROUP BY f.fk');
+-- the grouping column in expressions the Agg computes above the node
+SELECT lion_bk('SELECT f.fk + 1, f.fk * count(*), count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk');
+-- ORDER BY and LIMIT on top
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk ORDER BY count(*) DESC, f.fk LIMIT 7');
+SELECT lion_bk_val('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk ORDER BY count(*) DESC, f.fk LIMIT 7');
+-- a text key, under the database's deterministic collation
+SELECT lion_bk('SELECT f.tk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.tk = f.tk WHERE f.x = 3 AND d.grp = ''g1'' GROUP BY f.tk');
+-- the fact's key beside a dimension column
+SELECT lion_bk('SELECT f.fk, d.grp, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk, d.grp');
+SELECT lion_bk('SELECT d.attr, f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.attr, f.fk');
+
+-- ---- 3. GROUP BY the dimension's key, and both keys ---------------------------
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot AND d.kept GROUP BY d.pk');
+SELECT lion_bk('SELECT d.pk, d.name, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.pk');
+-- another unique column of the dimension's: grouped, and hashed, since
+-- only the join key is asked whether it is unique
+SELECT lion_bk('SELECT d.tk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.tk');
+SELECT lion_bk('SELECT f.fk, d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk, d.pk');
+SELECT lion_bk('SELECT d.pk, f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY d.pk, f.fk');
+-- an int4 fk against the int8 key: the dimension's key is grouped as ever
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk4 WHERE f.x = 3 GROUP BY d.pk');
+
+-- ---- 4. HAVING ----------------------------------------------------------------
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk HAVING count(*) > 16');
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x < 3 GROUP BY d.pk HAVING count(*) BETWEEN 3 AND 4');
+-- a HAVING of the key alone is a WHERE of it, a range of the fk index
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk HAVING f.fk < 200');
+SELECT lion_bk('WITH n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk HAVING count(*) >= 3) SELECT count(*), sum(n) FROM n');
+
+-- ---- 5. every aggregate over the node's rows, grouped by the key ------------
+SELECT lion_bk('SELECT f.fk, count(*), max(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk');
+SELECT lion_bk('SELECT d.pk, count(*), max(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY d.pk');
+SELECT lion_bk('SELECT f.fk, count(*), count(d.name), sum(d.small), min(d.name), bool_or(d.kept), bit_and(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk');
+SELECT lion_bk('SELECT f.fk, count(DISTINCT d.attr), count(DISTINCT f.fk), count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.y = 2 GROUP BY f.fk');
+SELECT lion_bk('SELECT f.fk, max(d.name), sum(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.y = 2 GROUP BY f.fk HAVING count(*) > 2');
+SELECT lion_bk('SELECT f.fk, max(d.name) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 4 GROUP BY f.fk');
+SELECT lion_bk('WITH n AS (SELECT f.fk, count(*) AS n, max(d.attr) AS m FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot AND d.kept GROUP BY f.fk) SELECT m, count(*), sum(LEAST(n, 3)) FROM n GROUP BY m');
+-- ... and grouped by a dimension column as before: hashed, or sorted for a
+-- DISTINCT
+SELECT lion_bk('SELECT d.attr, count(*), max(d.name) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY d.attr');
+SELECT lion_bk('SELECT d.attr, count(*), count(DISTINCT f.fk) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY d.attr');
+SELECT lion_bk('SELECT d.attr, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY d.attr');
+
+-- ---- 6. semi and anti joins --------------------------------------------------
+-- the forward semi join over a non-unique key: its distinct keys, each a group
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_bkdn d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.fk');
+SELECT lion_bk('SELECT f.fk, count(*), count(DISTINCT f.fk) FROM lion_bkf f WHERE f.fk IN (SELECT d.k FROM lion_bkdn d WHERE d.attr < 2) GROUP BY f.fk HAVING count(*) > 20');
+SELECT lion_bk('WITH n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f WHERE f.hot AND EXISTS (SELECT 1 FROM lion_bkdn d WHERE d.k = f.fk) GROUP BY f.fk) SELECT count(*), sum(LEAST(n, 3)) FROM n');
+-- the reverse semi join, whose key an index proves unique, and the anti
+-- join, whose rows include NULL keys and are hashed
+SELECT lion_bk('SELECT d.pk, count(*), max(d.name) FROM lion_bkd d WHERE EXISTS (SELECT 1 FROM lion_bkf f WHERE f.fk = d.pk AND f.x = 3) GROUP BY d.pk');
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bkd d WHERE NOT EXISTS (SELECT 1 FROM lion_bkf f WHERE f.fk = d.pk AND f.x = 3) GROUP BY d.pk');
+SELECT lion_bk('SELECT d.k, count(*) FROM lion_bkdn d WHERE NOT EXISTS (SELECT 1 FROM lion_bkf f WHERE f.fk = d.k AND f.x = 3) GROUP BY d.k');
+SELECT lion_bk('SELECT d.k, count(*) FROM lion_bkdn d WHERE EXISTS (SELECT 1 FROM lion_bkf f WHERE f.fk = d.k AND f.x = 3) GROUP BY d.k');
+
+-- ---- 7. declined, or not each row a group -------------------------------------
+-- an int4 fk against the int8 key: the key the node has is not of the
+-- fact column's type
+SELECT lion_bk('SELECT f.fk4, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk4 WHERE f.x = 3 GROUP BY f.fk4');
+SELECT lion_bk('WITH n AS (SELECT f.fk4, count(*) AS n FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk4 WHERE f.hot GROUP BY f.fk4) SELECT count(*), sum(LEAST(n, 3)) FROM n');
+-- numeric: equal keys spelled differently, which the dimension's key would
+-- print in place of the fact's; the dimension's key itself is grouped
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bknf f JOIN lion_bknd d ON d.pk = f.fk WHERE f.x = 1 GROUP BY f.fk');
+SELECT lion_bk_val('SELECT f.fk, count(*) FROM lion_bknf f JOIN lion_bknd d ON d.pk = f.fk WHERE f.x = 1 AND d.pk < 3 GROUP BY f.fk');
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bknf f JOIN lion_bknd d ON d.pk = f.fk WHERE f.x = 1 GROUP BY d.pk');
+SELECT lion_bk_val('SELECT d.pk, count(*) FROM lion_bknf f JOIN lion_bknd d ON d.pk = f.fk WHERE f.x = 1 AND d.pk < 3 GROUP BY d.pk');
+-- ... but counted distinct it is still taken: a DISTINCT only compares
+SELECT lion_bk('SELECT count(DISTINCT f.fk), count(*) FROM lion_bknf f JOIN lion_bknd d ON d.pk = f.fk WHERE f.x = 1');
+-- the fact's key grouped under another collation than the join's, or as an
+-- expression: declined
+SELECT lion_bk('SELECT f.tk COLLATE "C", count(*) FROM lion_bkf f JOIN lion_bkd d ON d.tk = f.tk WHERE f.x = 3 GROUP BY f.tk COLLATE "C"');
+SELECT lion_bk('SELECT f.fk + 1, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk + 1');
+-- the dimension's key under another collation, or as an expression: taken,
+-- and hashed - its groups are not proved to be one row each
+SELECT lion_bk('SELECT d.tk COLLATE "C", count(*) FROM lion_bkf f JOIN lion_bkd d ON d.tk = f.tk WHERE f.x = 3 GROUP BY d.tk COLLATE "C"');
+SELECT lion_bk('SELECT d.pk + 0, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.pk + 0');
+-- another fact column
+SELECT lion_bk('SELECT f.x, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.x');
+SELECT lion_bk('SELECT f.fk, f.x, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk, f.x');
+
+-- ---- 8. the plans and their costs --------------------------------------------
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+-- partial counts, each finished by a sorted Agg with no Sort: each row is a
+-- group of its own
+EXPLAIN (COSTS OFF) WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n;
+EXPLAIN (VERBOSE, COSTS OFF) SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk;
+-- counted rows, below the LionJoinAgg, grouped the same way
+EXPLAIN (VERBOSE, COSTS OFF) SELECT f.fk, count(*), max(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk;
+-- the forward semi join's distinct keys
+EXPLAIN (COSTS OFF) SELECT f.fk, count(*) FROM lion_bkf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_bkdn d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.fk;
+-- a dimension column's groups are hashed, as before
+EXPLAIN (COSTS OFF) SELECT d.attr, count(*), max(d.name) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.attr;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+-- The per-row Agg streams: it starts when the node does, and costs a
+-- comparison and a group a row, whatever the memory - where a hashed Agg over
+-- as many groups is charged for its table, and for spilling it once it
+-- outgrows the memory.
+SELECT (p.agg->>'Startup Cost')::numeric = (p.node->>'Startup Cost')::numeric AS per_row_streams,
+	   (h.agg->>'Startup Cost')::numeric >= (h.node->>'Total Cost')::numeric AS hashed_waits
+FROM lion_bk_plan('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY d.pk') p,
+	 lion_bk_plan('SELECT d.pk + 0, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY d.pk + 0') h;
+SELECT lion_bk_aggcost(k, '64kB') = lion_bk_aggcost(k, '64MB') AS per_row_same_in_any_memory,
+	   lion_bk_aggcost(e, '64kB') > lion_bk_aggcost(e, '64MB') AS real_grouping_pays_memory,
+	   lion_bk_aggcost(k, '64MB') < lion_bk_aggcost(e, '64MB') AS per_row_cheaper
+FROM (VALUES ('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY d.pk',
+			  'SELECT d.pk + 0, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY d.pk + 0'),
+			 ('SELECT f.fk, count(*), max(d.name) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY f.fk',
+			  'SELECT d.pk + 0, count(*), max(d.name) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk GROUP BY d.pk + 0')) q(k, e);
+-- counted rows need no Sort either, where a dimension column's DISTINCT
+-- count sorts them
+SELECT lion_bk_below(p.agg->'Plans'->0) AS below_per_row
+FROM lion_bk_plan('SELECT f.fk, count(DISTINCT d.attr), count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk') p;
+SELECT lion_bk_below(p.agg->'Plans'->0) AS below_by_attr
+FROM lion_bk_plan('SELECT d.attr, count(DISTINCT d.name), count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.attr') p;
+-- The estimate the outer query sees: the dimension rows that join - of the
+-- dimension rows the node reads, those the join's pairs fall on: nearly all
+-- of them here, fewer under narrow fact filters.
+SELECT (p.agg->>'Plan Rows')::numeric = (p.node->>'Plan Rows')::numeric AS the_node_rows,
+	   (p.agg->>'Plan Rows')::numeric BETWEEN 0.67 * (p.agg->>'Actual Rows')::numeric
+		   AND 1.5 * (p.agg->>'Actual Rows')::numeric AS estimate_close
+FROM lion_bk_plan('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n',
+				  ', ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF') p;
+SELECT (p.agg->>'Plan Rows')::numeric < (p.node->>'Plan Rows')::numeric AS fewer_than_node_rows,
+	   (p.agg->>'Plan Rows')::numeric BETWEEN 0.67 * (p.agg->>'Actual Rows')::numeric
+		   AND 1.5 * (p.agg->>'Actual Rows')::numeric AS estimate_close
+FROM lion_bk_plan('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 AND f.y = 1 AND f.hot GROUP BY f.fk',
+				  ', ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF') p;
+-- the cost model's choice, nothing disabled: a few dimension rows are the
+-- node's, grouped by either key; all of them the hash join's
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 AND d.attr = 2 AND d.small = 1 GROUP BY f.fk', false);
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 AND d.attr = 2 AND d.small = 1 GROUP BY d.pk', false);
+SELECT lion_bk('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.attr = 2 AND d.small = 1), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.x = 3 GROUP BY f.fk) SELECT count(*), sum(LEAST(n, 3)) FROM n', false);
+SELECT lion_bk('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk', false);
+
+-- ---- 9. parameters and rescans ----------------------------------------------
+SELECT lion_bk_prep('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = $1 AND d.grp = $2 GROUP BY f.fk', '3, ''g1''');
+SELECT lion_bk_prep('SELECT f.fk, count(*), max(d.name) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = $1 GROUP BY f.fk', 'NULL');
+SELECT lion_bk_prep('WITH n AS (SELECT d.pk, count(*) AS n FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.y = $1 GROUP BY d.pk) SELECT count(*), sum(LEAST(n, 3)) FROM n', '2');
+-- a correlated subquery: the Agg and the node rescanned per outer row
+SELECT lion_bk('SELECT g, (SELECT sum(LEAST(n, 3)) FROM (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = g.g AND d.kept GROUP BY f.fk) s) FROM generate_series(0, 10) g');
+SELECT lion_bk('SELECT g, (SELECT count(*) FROM (SELECT d.pk FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE d.attr = g.g AND f.y = 2 GROUP BY d.pk HAVING count(*) > 1) s) FROM generate_series(0, 7) g');
+
+-- ---- 10. parallel -------------------------------------------------------------
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+-- each dimension row in one participant: across the Gather still one row a
+-- group
+EXPLAIN (COSTS OFF) SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk;
+EXPLAIN (COSTS OFF) SELECT f.fk, count(*) FROM lion_bkf f WHERE EXISTS (SELECT 1 FROM lion_bkdn d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.fk;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SELECT lion_bk_par('SELECT f.fk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk');
+SELECT lion_bk_par('SELECT d.pk, count(*), max(d.name), sum(d.small) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.pk');
+SELECT lion_bk_par('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+SELECT lion_bk_par('SELECT f.fk, count(*) FROM lion_bkf f WHERE EXISTS (SELECT 1 FROM lion_bkdn d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.fk');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET parallel_leader_participation;
+
+-- ---- 11. a dirty heap: deletes and updates on both sides, not yet vacuumed ----
+DELETE FROM lion_bkf WHERE fk = 7;
+DELETE FROM lion_bkf WHERE fk = 8 AND x < 5;
+UPDATE lion_bkf SET fk = 9, fk4 = 9, tk = 'k00009' WHERE fk = 10 AND x = 1;
+UPDATE lion_bkf SET x = 3 WHERE id % 97 = 0;
+UPDATE lion_bkf SET fk = NULL, fk4 = NULL, tk = NULL WHERE fk = 11;
+INSERT INTO lion_bkf SELECT 60000 + i, 34, 34, 'k00034', true, 3, 1 FROM generate_series(1, 5) i;
+DELETE FROM lion_bkd WHERE pk IN (12, 1200, 2400);
+UPDATE lion_bkd SET attr = NULL, name = 'zz' WHERE pk IN (1, 2, 4, 1500);
+UPDATE lion_bkd SET kept = false WHERE pk IN (5, 6);
+SELECT lion_bk('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+SELECT lion_bk('SELECT f.fk, count(*), max(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk');
+SELECT lion_bk('SELECT d.pk, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.pk');
+VACUUM lion_bkf;
+VACUUM lion_bkd;
+SELECT lion_bk('WITH a AS (SELECT d.pk FROM lion_bkd d WHERE d.kept), n AS (SELECT f.fk, count(*) AS n FROM lion_bkf f JOIN a ON a.pk = f.fk WHERE f.hot GROUP BY f.fk) SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n');
+SELECT lion_bk('SELECT f.fk, count(*), max(d.attr) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY f.fk');
+
+DROP TABLE lion_bkf, lion_bkd, lion_bkdn, lion_bknf, lion_bknd;
+DROP FUNCTION lion_bk(text, boolean);
+DROP FUNCTION lion_bk_how(text);
+DROP FUNCTION lion_bk_agg_of(jsonb);
+DROP FUNCTION lion_bk_val(text);
+DROP FUNCTION lion_bk_prep(text, text);
+DROP FUNCTION lion_bk_par(text);
+DROP FUNCTION lion_bk_plan(text, text);
+DROP FUNCTION lion_bk_aggcost(text, text);
+DROP FUNCTION lion_bk_find(jsonb, text);
+DROP FUNCTION lion_bk_below(jsonb);
