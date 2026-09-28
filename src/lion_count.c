@@ -1131,6 +1131,7 @@ lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
 static uint32 lion_list_pins = 0;
 static bool lion_list_pins_cb = false;
 static int	lion_list_participants = 1;
+static ResourceOwner lion_list_participants_owner = NULL;
 
 /*
  * The pins charged to one resource owner.  There are as many of these as
@@ -1191,6 +1192,16 @@ void
 lion_list_pin_participants(int participants)
 {
 	lion_list_participants = Max(participants, 1);
+
+	/*
+	 * An ERROR in a subtransaction ends the query without the node's End, so
+	 * the share is also given back when the owner the node ran under is
+	 * released (lion_list_pins_resowner()), and the callbacks that do it must
+	 * exist by then.
+	 */
+	lion_list_participants_owner =
+		(lion_list_participants > 1) ? CurrentResourceOwner : NULL;
+	(void) lion_list_pin_budget(NULL);
 }
 
 static void
@@ -1206,6 +1217,7 @@ lion_list_pins_xact(XactEvent event, void *arg)
 			lion_list_pins = 0;
 			lion_pin_ncharges = 0;
 			lion_list_participants = 1;
+			lion_list_participants_owner = NULL;
 			break;
 		default:
 			break;
@@ -1226,7 +1238,18 @@ lion_list_pins_resowner(ResourceReleasePhase phase, bool isCommit,
 {
 	int			i;
 
-	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS || lion_pin_ncharges == 0)
+	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
+		return;
+
+	/* The parallel query that divided the budget is over, one way or another. */
+	if (lion_list_participants_owner != NULL &&
+		lion_list_participants_owner == CurrentResourceOwner)
+	{
+		lion_list_participants = 1;
+		lion_list_participants_owner = NULL;
+	}
+
+	if (lion_pin_ncharges == 0)
 		return;
 	for (i = lion_pin_ncharges - 1; i >= 0; i--)
 	{

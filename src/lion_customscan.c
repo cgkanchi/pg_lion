@@ -923,6 +923,8 @@ typedef struct LionCountScanState
 	int			ninnerkey;
 	int			inneridx;		/* next inner key of the current outer group */
 	bool		outeropen;		/* groupset holds the current outer group */
+	bool		wherepinned;	/* WHERE sets may hold pins (since the last
+								 * lion_locate_where()) */
 	Datum		outerkey;
 	bool		outerisnull;
 	LionEntryScan escan2;		/* the innerkey == NULL fallback */
@@ -9613,6 +9615,30 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	st->nbatchval = lion_probe_sort(cl->idx, cl->idxcol, elemtype, nelems,
 									elems, nulls, st->batchval,
 									st->batchhash);
+
+	/*
+	 * Byte-for-byte equal values are the same key, and the sort puts them
+	 * side by side: keep one.  The lookup would skip the rest anyway, but a
+	 * batch runs on past its size while the hash stays the same, so a list of
+	 * one value repeated millions of times was one batch of that many sets.
+	 */
+	if (st->nbatchval > 1)
+	{
+		int			in;
+		int			out = 1;
+
+		for (in = 1; in < st->nbatchval; in++)
+		{
+			if (st->batchhash[in] == st->batchhash[out - 1] &&
+				datumIsEqual(st->batchval[in], st->batchval[out - 1],
+							 elmbyval, elmlen))
+				continue;
+			st->batchval[out] = st->batchval[in];
+			st->batchhash[out] = st->batchhash[in];
+			out++;
+		}
+		st->nbatchval = out;
+	}
 	st->batchtype = elemtype;
 	st->batchitem = k;
 
@@ -10253,6 +10279,9 @@ lion_locate_where(LionCountScanState *st)
 	MemoryContext oldcxt;
 	int			k;
 
+	/* what this locates may be pinned until the next pause unpins it */
+	st->wherepinned = true;
+
 	oldcxt = MemoryContextSwitchTo(st->wherecxt);
 
 	for (k = 0; k < st->nitem; k++)
@@ -10801,7 +10830,8 @@ lion_count_batched(LionCountScanState *st)
 		st->listbatches++;
 		oldcxt = MemoryContextSwitchTo(batchcxt);
 		sets = (LionPostingSet *)
-			palloc0(sizeof(LionPostingSet) * (end - start));
+			palloc_extended(sizeof(LionPostingSet) * (end - start),
+							MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 		nsets = lion_posting_set_lookup_many_col(cl->idx, cl->idxcol,
 												 st->batchtype, end - start,
 												 &st->batchval[start], NULL,
@@ -12479,7 +12509,13 @@ lion_pause_run(LionCountScanState *st)
 	if (st->scanning2)
 		lion_entry_scan_pause(&st->escan2);
 
-	if (st->sources != NULL)
+	/*
+	 * The WHERE sets gain pins only where they are located
+	 * (lion_locate_where()), so after the first pause there is nothing left
+	 * to unpin in them - and walking them all again after every row made a
+	 * list-driven GROUP BY of N values N-squared.
+	 */
+	if (st->sources != NULL && st->wherepinned)
 	{
 		for (i = 1; i <= st->nitem; i++)
 		{
@@ -12488,6 +12524,7 @@ lion_pause_run(LionCountScanState *st)
 			for (j = 0; j < src->nsets; j++)
 				lion_posting_set_unpin(&src->sets[j]);
 		}
+		st->wherepinned = false;
 	}
 	if (st->outeropen)
 		lion_posting_set_unpin(&st->groupset);
