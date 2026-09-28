@@ -18,7 +18,9 @@ SET synchronous_commit = on;
 /*
  * lion_gc() runs a query with every other scan disabled, so that a LionCount
  * path that is built at all is the plan, and again as a sequential scan with
- * the pushdown off, and compares the two.
+ * the pushdown off, and compares the two.  LionOrdered (DESIGN.md §30) is
+ * switched off with the rest: the core switches do not reach it, and over the
+ * btree on id it offers core a presorted aggregate for count(DISTINCT id).
  */
 CREATE FUNCTION lion_gc(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -32,6 +34,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
@@ -45,6 +48,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'SELECT count(*) FROM lion_gc_on' INTO nrows;
 	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gc_on EXCEPT ALL SELECT * FROM lion_gc_off) a)'
@@ -72,6 +76,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'PREPARE lion_gcp_on AS ' || q;
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_gcp_on(' || args || ')' LOOP
@@ -87,6 +92,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_gcp_on';
 	EXECUTE 'DEALLOCATE lion_gcp_off';
@@ -428,6 +434,7 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
+SET pg_lion.enable_ordered_scan = off;
 EXPLAIN (COSTS OFF) SELECT coalesce(g, 0), count(*) FROM lion_gc WHERE a = 3 GROUP BY 1;
                     QUERY PLAN                    
 --------------------------------------------------
@@ -448,6 +455,7 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 RESET enable_indexonlyscan;
+RESET pg_lion.enable_ordered_scan;
 -- ---- 8. declined ---------------------------------------------------------
 -- the second argument not a constant: another column, a parameter
 SELECT lion_gc('SELECT coalesce(g, a), count(*) FROM lion_gc GROUP BY 1');

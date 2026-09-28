@@ -21,6 +21,15 @@ SET synchronous_commit = on;
  * the pushdown off, and compares the two.  It reports "counted" for a
  * pushdown with no Distinct Key, "distinct walk" for one with, or "not pushed
  * down".
+ *
+ * "Every other scan" includes LionOrdered (DESIGN.md §30), which the core
+ * switches do not disable: it walks a btree in order and filters by a lion
+ * index, and this table has btrees on the very columns a DISTINCT or a GROUP
+ * BY sorts by.  Core then offers an aggregate over its presorted rows, and
+ * on 17 and later - where an index on any grouping or DISTINCT key counts as
+ * useful for grouping, not only one on the leading key - for more queries
+ * than on 16.  Left on, that plan wins on cost wherever it is cheaper and
+ * says nothing about whether the node was built.
  */
 CREATE FUNCTION lion_uq(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -34,6 +43,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
@@ -50,6 +60,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'SELECT count(*) FROM lion_uq_on' INTO nrows;
 	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_uq_on EXCEPT ALL SELECT * FROM lion_uq_off) a)'
@@ -63,8 +74,8 @@ BEGIN
 END $$;
 /*
  * The same under a generic plan, which keeps $n a Param: one statement
- * prepared with the pushdown on and the other scans disabled, the reference
- * prepared with the pushdown off, as a sequential scan.
+ * prepared with the pushdown on and the other scans disabled (LionOrdered
+ * too), the reference prepared with the pushdown off, as a sequential scan.
  */
 CREATE FUNCTION lion_uq_prep(q text, args text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -79,6 +90,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'PREPARE lion_uqp_on AS ' || q;
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_uqp_on(' || args || ')' LOOP
@@ -97,6 +109,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_uqp_on';
 	EXECUTE 'DEALLOCATE lion_uqp_off';
@@ -131,10 +144,11 @@ END $$;
  * 2000 rows.  id: the primary key.  g: 6 values and NULL on every 11th row.
  * a: 10 values.  u: unique, NULL on every 7th row, with a lion index.  w: 250
  * values of 8 rows each, NOT NULL, with a lion index - not unique.  d: unique
- * under a DEFERRABLE constraint.  p: unique only where a < 5, which a partial
- * unique index says; elsewhere every value repeats.  e: unique only as the
- * expression e + 0.  t: unique only under the "C" collation's index.  pa:
- * unique only together with a.
+ * under a DEFERRABLE constraint.  p: unique only where w < 125, which a
+ * partial unique index says; elsewhere every value repeats (the predicate is
+ * on w so that the UPDATEs of a below never move a row into it).  e: unique
+ * only as the expression e + 0.  t: unique only under the "C" collation's
+ * index.  pa: unique only together with a.
  */
 CREATE TABLE lion_uq (
 	id	int		PRIMARY KEY,
@@ -155,12 +169,12 @@ SELECT i,
 	   CASE WHEN i % 7 = 0 THEN NULL ELSE i END,
 	   i % 250,
 	   i,
-	   CASE WHEN i % 10 < 5 THEN i ELSE i % 50 END,
+	   CASE WHEN i % 250 < 125 THEN i ELSE i % 50 END,
 	   i,
 	   't' || i,
 	   i
   FROM generate_series(1, 2000) i;
-CREATE UNIQUE INDEX lion_uq_p ON lion_uq (p) WHERE a < 5;
+CREATE UNIQUE INDEX lion_uq_p ON lion_uq (p) WHERE w < 125;
 CREATE UNIQUE INDEX lion_uq_e ON lion_uq ((e + 0));
 CREATE UNIQUE INDEX lion_uq_t ON lion_uq (t COLLATE "C");
 CREATE UNIQUE INDEX lion_uq_pa ON lion_uq (pa, a);
@@ -196,11 +210,13 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
+SET pg_lion.enable_ordered_scan = off;
 EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 RESET enable_indexonlyscan;
+RESET pg_lion.enable_ordered_scan;
 -- a parameter under a generic plan
 SELECT lion_uq_prep('SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = $1 GROUP BY g', '3');
 SELECT lion_uq_prep('SELECT count(DISTINCT id) FROM lion_uq WHERE a = ANY ($1)', '''{1,5}''::int[]');
@@ -240,7 +256,7 @@ SELECT lion_uq('SELECT count(DISTINCT t COLLATE "C") FROM lion_uq WHERE a = 3');
 -- a partial unique index, even under a WHERE that implies its predicate
 SELECT count(*), count(DISTINCT p) FROM lion_uq WHERE g = 1;
 SELECT lion_uq('SELECT count(DISTINCT p) FROM lion_uq WHERE g = 1');
-SELECT lion_uq('SELECT count(DISTINCT p) FROM lion_uq WHERE a = 3');
+SELECT lion_uq('SELECT count(DISTINCT p) FROM lion_uq WHERE w = 3');
 -- a deferrable constraint, which holds duplicates inside a transaction
 SELECT lion_uq('SELECT count(DISTINCT d) FROM lion_uq WHERE a IN (3, 4)');
 BEGIN;
@@ -280,6 +296,7 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
+SET pg_lion.enable_ordered_scan = off;
 PREPARE lion_uqi_q(int) AS
 	SELECT g, count(DISTINCT id) FROM lion_uqi WHERE a = $1 GROUP BY g ORDER BY g;
 EXECUTE lion_uqi_q(1);
@@ -306,6 +323,7 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 RESET enable_indexonlyscan;
+RESET pg_lion.enable_ordered_scan;
 DROP TABLE lion_uqi, lion_uqn;
 -- ---- 7. partitioned tables ------------------------------------------------
 /*

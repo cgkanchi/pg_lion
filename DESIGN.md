@@ -7076,7 +7076,15 @@ proofs that do not hold - an expression, a two-column unique index, an expressio
 collation, a partial index (with duplicates outside its predicate) and a deferrable constraint
 (with a duplicate made inside a deferring transaction); a dirty heap and VACUUM; the cached plan
 replanned after its unique index and then its NOT NULL are dropped; and a partitioned table with
-per-partition unique indexes over repeating values, then a primary key.
+per-partition unique indexes over repeating values, then a primary key. Every query there runs
+with LionOrdered (§30) switched off beside core's scans, and so does `group_coalesce.sql`: a btree
+on the DISTINCT or GROUP BY column gives core an aggregate over LionOrdered's presorted rows, which
+`enable_indexscan` does not disable, and which is the cheaper plan for a walk over a column with an
+entry per row (`count(DISTINCT u)` of a nullable unique `u`, `GROUP BY u`). From 17 core counts an
+index on ANY grouping or DISTINCT key as useful for grouping, not only one on the leading key, so
+the same queries meet that competitor more often there than on 16. Left on, it decides the plan by
+cost and says nothing about whether the node was built; the first CI run of the test tripped over
+exactly that, on shapes the node answers.
 
 ## 27. FK-side join pushdown: `GROUP BY dim.attr` over a fact table joined on a lion-indexed FK (v1, implemented)
 
