@@ -3628,7 +3628,13 @@ container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry
 magnitude (§5, VACUUM step 2), so `lion_entry_spill()` writes as many leaves as the payload needs:
 
 1. the ROOT first, with reuse = false and held EXCLUSIVE to the end - every page of a set is
-   stamped with its root's block, and a root block is never handed out twice (above);
+   stamped with its root's block, and a root block is never handed out twice (above) - and
+   LOGGED first, as an internal page of the set with no downlink yet, in a record of its own
+   (2026-09-28): an extension no record touches is one an OS crash can lose, and the next
+   extension then handed the same block out again as the root of another set, whose stamp
+   the leaves the crashed spill had written could not be told from (every summary's hash and
+   every NULL entry's is 0, §32).  Replaying the record extends the relation past the root
+   whatever blocks the leaves took, so the block is never a root again;
 2. then each LEAF, filled, linked to the next one and logged in a record of its own that
    registers that one buffer.  The next leaf is allocated just before the record of the one in
    front of it, because that record carries the rightlink and a record may not allocate (§25), so
@@ -3643,18 +3649,22 @@ magnitude (§5, VACUUM step 2), so `lion_entry_spill()` writes as many leaves as
 The entry changes in the last record and in no other, so it is INLINE until the whole set is on
 disk and CHAIN from the moment it is, never half of each.  An ERROR or a crash before the last
 record loses nothing - the entry still holds the payload it held, dead TIDs included, which the
-next VACUUM removes - and leaves FULL leaves that nothing references, stamped with a root that was
-never written.  The spill's own comment promised that the next VACUUM's sweep collects those; it
-did not, because the sweep only ever freed EMPTY unreferenced leaves, so they stayed leaked for
-good.  The sweep now asks the leaf's ROOT (`lion_posting_root_live()`): a leaf is an orphan when
+next VACUUM removes - and leaves FULL leaves that nothing references, stamped with a root that
+has no downlink (before 2026-09-28: that was never written).  The spill's own comment promised
+that the next VACUUM's sweep collects those; it did not, because the sweep only ever freed EMPTY
+unreferenced leaves, so they stayed leaked for good.  The sweep now asks the leaf's ROOT (`lion_posting_root_live()`): a leaf is an orphan when
 the page at its owner_head is not a live container page stamped with that same (owner_hash,
-owner_head).  Every page of a set that exists passes - its root is live until the entry is gone
-and the set freed, and the whole-set free only frees EMPTY sets, whose leaves the sweep frees for
-being empty - and a spill that is still writing holds its root EXCLUSIVE, which the sweep's
-conditional lock reads as live.  A root seen unwritten, DELETED or stamped for another set under
-its lock stays that way for every leaf stamped with it, because the spill that stamped the leaf
-has ended and no block is a root twice.  lion_index_verify() reports such a leaf as the leak it
-is, with a WARNING, like an empty one (which extends what §4 says verify() tolerates).
+owner_head), with a downlink on it when it is an internal page.  Every page of a set that exists
+passes - its root is live until the entry is gone and the set freed, is internal only with a
+downlink (a push-down makes it one with one, in one record), and the whole-set free only frees
+EMPTY sets, whose leaves the sweep frees for being empty - and a spill that is still writing
+holds its root EXCLUSIVE, which the sweep's conditional lock reads as live.  A root seen
+unwritten, without a downlink, DELETED or stamped for another set under its lock stays that way
+for every leaf stamped with it, because the spill that stamped the leaf has ended and no block
+is a root twice.  The root itself is freed by the same sweep: an internal page all of whose
+children are DELETED - here, none - is dead (§22).  lion_index_verify() reports such a leaf as the
+leak it is, with a WARNING, like an empty one (which extends what §4 says verify() tolerates), and
+the root as an empty page.
 `test/isolation/vacuum_spill_interrupted.spec` stops a VACUUM's spill between the leaves and the
 root with an ERROR (injection point `lion-spill-leaves-written`), and `test/recovery/run.sh`
 phase 1e with a crash.
@@ -9841,7 +9851,9 @@ union of the posting sets of every key in the bucket. The last bucket is OPEN: i
 both `LION_ENTRY_SUMMARY` and `LION_ENTRY_SUMLAST`, has kind `LION_KIND_SUMLAST` (5, above SUMMARY's
 4), sorts after every other summary of the column by its kind alone, and is keyed by the largest
 key it holds, which inserts raise. A bucket is a set of rows, never a range of heap blocks: a key's
-rows are all in one bucket, and buckets close at key boundaries.
+rows are all in one bucket, and buckets close at key boundaries. No PIVOT (§21) is ever of the
+SUMLAST kind: one made from the open bucket's entry is a SUMMARY pivot with the key it has then
+(`lion_pivot_kindflags()`; "The open bucket and the directory order" below).
 
 A summary is an ORDINARY directory entry in everything but its kind and its hash: INLINE while its payload fits
 (§13's items, sparse segments and all) and a posting tree of its own (§22) past that, written by
@@ -9917,15 +9929,17 @@ The build writes each key column's entries in key order in one pass over the spo
 (§21), serially or after a parallel build's workers have sorted their runs - the pass is the
 leader's either way, so parallel builds get summaries too. For a summarized column
 (`lion_sum_begin()`), every code the pass hands a VALUE entry's builder is also added to the current
-bucket, and once a key is written the bucket closes if it holds `summary_tids` codes or more
-(`lion_sum_key_done()`). A bucket's codes are collected in an array, which switches to an INT8
-tuplesort of an eighth of `maintenance_work_mem` past an eighth (one key of a column with few keys
-can be most of the table), freeing the array; the spool leaves the summaries that quarter of its
-budget (§24 "Build"). A closed bucket is sorted, run through a collecting builder into the same
-items a
-posting set is made of, and put aside in a temporary BufFile after a header naming its key. When
-the column's values are done (`lion_sum_finish()`), the last bucket is closed as the SUMLAST, `auto`
-decides, and the file is replayed through ordinary builders into entries written after the
+bucket, and the bucket closes at the first key boundary at which it holds `summary_tids` codes or
+more. A bucket's codes are collected in an array, which switches to an INT8 tuplesort of an eighth
+of `maintenance_work_mem` past an eighth (one key of a column with few keys can be most of the
+table), freeing the array; the spool leaves the summaries that quarter of its budget (§24
+"Build"). A closed bucket is sorted, run through a collecting builder into the same items a
+posting set is made of, and put aside in a temporary BufFile after a header naming its key. A
+full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not when it fills, so that
+when the column's values are done (`lion_sum_finish()`) there is always a last bucket, and it is
+closed as the SUMLAST whatever its size - a column with rows always has its open bucket (one that
+filled exactly at the last key used to be closed as a regular summary, and the column had none);
+`auto` decides, and the file is replayed through ordinary builders into entries written after the
 column's values - which is where they sort. The build's DEBUG1 line reports the buckets per column
 and whether they were kept.
 
@@ -9936,20 +9950,27 @@ column and a non-NULL key, puts the row into its bucket's summary (`lion_summary
 nothing held in between:
 
 1. Descend to `(SUMMARY, key, hash 0)` for write (`lion_dir_search_first()`, which finishes an
-   INCOMPLETE_SPLIT on the way and steps right past a leaf's end): the landing is the first summary
-   whose key is at or above the row's.
+   INCOMPLETE_SPLIT on the way, steps right past a leaf's end, and steps over any item that sorts
+   before the search key - which a sound directory never lands on, below): the landing is the first
+   summary whose key is at or above the row's.
 2. A regular SUMMARY there is the row's bucket: the TID goes into its set, INLINE or chain, exactly
    as into a key's (`lion_insert_inline()` / `lion_insert_chain()`).
 3. The SUMLAST with a key at or above the row's: the same.
 4. The SUMLAST with a key BELOW the row's - the row is above every key the column's summaries
-   cover. If the open bucket holds fewer than `summary_tids` rows it is REKEYED to the row's key
-   (`lion_summary_rekey()`: the same entry with the new key, spilled to a chain if the longer key
-   pushes its INLINE payload past the limit) and step 1 is retried; if it is full it is CLOSED
+   cover. If the open bucket holds fewer than `summary_tids` rows its key is RAISED to the row's and
+   the row goes in, in one step under the lock the lookup took (`lion_summary_rekey_insert()`): an
+   INLINE entry is rewritten with the new key and the row in one record, a CHAIN one gets its key
+   in one record and the row through the chain insert right after (a payload the longer key and the
+   row push past the limit is spilled first). If it is full it is CLOSED
    (`lion_summary_close_last()`: the SUMLAST flag dropped in place, which leaves a regular summary
    keyed by the largest key it holds) and a new SUMLAST holding just the row is added right after
    it.
-5. No summary at all (an empty column, or VACUUM deleted the last one): a new SUMLAST holding the
-   row, added where the column's summaries sort.
+5. No summary at all: a new SUMLAST holding the row, added where the column's summaries sort. That
+   is a column that never had a row (`on` over an empty table), or one a crash left between the two
+   records of a close; VACUUM no longer deletes an emptied open bucket (below). The new entry's key
+   is above every summary of the column - the lookup found none at or above it - and the summary in
+   front of the place it goes is compared with it as well when it is on the same leaf; one that is
+   not below it sends the insert back to step 1, and a second time is reported as corruption.
 
 So middle buckets never split: inserts into the middle of the key space make their buckets grow,
 and only the open bucket at the top is closed and succeeded. A column whose keys arrive in order
@@ -9967,14 +9988,17 @@ key-first order is what the reader's argument below uses for the open bucket.
 
 **Cost.** One more descent and one more posting-set update per summarized column per inserted row,
 into a set that is larger and hotter than a key's: the summary of the open bucket takes every
-appended row of a timestamp column. Measured below.
+appended row of a timestamp column. Measured below - before step 4 was one step: an append that
+raised the open bucket's key paid a record for the key, a second descent and a second record for
+the row (2026-09-28).
 
 ### VACUUM (lion_vacuum.c)
 
 Summaries are entries, so the bulk-delete pass removes dead TIDs from them as from a key's set, in
 the same chain order and under the same cleanup locks (§11), and an emptied summary is deleted as
-an emptied entry is (§18) - the open one included; the next insert above the column's summaries
-then opens a new one (step 5). A CHAIN summary is identified across a concurrent split by its root
+an emptied entry is (§18) - but never the open one, which stays, empty, with its key: still an upper
+bound of every key it can hold, and the next row above the closed buckets goes into it (step 3). A
+CHAIN summary is identified across a concurrent split by its root
 block (`lion_vac_entry_matches()`), and found again after one by descending to `(SUMMARY, key)` and
 walking right through the column's summaries (`lion_vac_ref_relocate()`), as a key's entry is found
 by its key.
@@ -10017,17 +10041,70 @@ writers, with an MVCC snapshot deciding every row:
   the raised key counts the row through the summary, and UPPER starts above it. Either way once.
 - A summary VACUUM empties and deletes had only dead rows. After it is gone the next summary's
   bucket reaches down to the previous one's key; rows inserted into that span afterwards go into
-  it, and the dead rows that were in the deleted one are counted by no one, which is right.
+  it, and the dead rows that were in the deleted one are counted by no one, which is right. The
+  open bucket is never deleted; emptied, it is a summary of no rows, which the walk skips.
 - A row inserted after the snapshot may be anywhere; it is invisible, and the visibility map and
   the heap recheck decide it as they decide every candidate (§9).
 
 The §9 interlock is the ordinary one: a summary's containers are read under a pin on the page they
 came from, like a key's.
 
+The landing that finds E_j (`lion_range_landing()`) steps over an item that sorts before its search
+key, as the insert's lookup does: on a sound directory it never lands on one, and on an index the
+bug below damaged, taking a summary whose key is below the bound as E_j counted whole buckets below
+the range.
+
 **Where summaries are not used.** Anything that needs keys: a GROUP BY k walk (its groups ARE the
 keys), count(DISTINCT k), the bitmap and plain index scans of §28 and §29 and the ordered scans of
 §30 (they return TIDs per key or in key order), `k IS NULL`. The bitmap scan of a range could use
 them - a summary's containers are TIDs like any - and is left for later.
+
+### The open bucket and the directory order (2026-09-28)
+
+The first release of this design broke the directory order the first time an open bucket that had
+been split off on a leaf of its own was closed (the 2026-09-28 review; found by three reviewers).
+A pivot - a leaf's high key and the downlink to its right sibling (§21) - copied the kind of the
+item it was made from, SUMLAST included. When a bucket closed and the new SUMLAST did not fit on
+the rightmost leaf, the append split (`k = nitems - 1`) put it alone on the right page, so the left
+page's high key and the parent's downlink were SUMLAST pivots - which sort after every SUMMARY of
+the column by their kind. Closing that bucket later drops the flag IN PLACE, so the page's first
+item became a SUMMARY that sorted BELOW the separator routing to it: the left page's high key above
+the right page's first key. From then on a descent to `(SUMMARY, k)` for any k routed to the left
+page, stepped right, and landed on that closed summary; the insert took it without comparing keys
+and filed every later row of the column into that one closed bucket, and range counts summed it
+where it did not belong - the review traced `count(*) WHERE id <= 150000` over 200,000 appended
+rows to 200,000 (traced from the code; no server could run there). It needs the close to find the
+leaf with room for the closed entry but not for the new one, which the review put at about one
+append split in four, so any appended summarized column reaches it. A second path led to the same
+state: VACUUM deleting the emptied top buckets, the open one included, left SUMMARY pivots above
+the key of the SUMLAST the next insert then created (step 5) below them.
+
+What changed:
+
+- **A pivot is never of the SUMLAST kind** (`lion_pivot_kindflags()`, in `lion_make_pivot()` and
+  `lion_build_pivot()`; every other pivot is made from one of those or from a high key): one made
+  from the open bucket's entry is a SUMMARY pivot with its key at the time. That is a valid lower
+  bound for the entry whatever becomes of it, because its key only rises and closing keeps it, and
+  it is above every other summary of the column, whose keys are below the open one's.
+- **The open bucket is never deleted** by VACUUM, however empty, and **the build always leaves
+  one** (a bucket that fills at the column's last key is its SUMLAST): the key of a SUMLAST only
+  ever rises, so no pivot of the column is ever above it. Step 5 is then reached only by a column
+  that never had a row, or after a crash between the two records of a close - and then the new
+  SUMLAST is above every summary the lookup can find, and the summary in front of where it goes is
+  compared with it too (`lion_summary_insert()`).
+- **Nothing takes a landing on trust**: `lion_dir_search_first()` (the insert's lookup, and
+  verify's) and `lion_range_landing()` (E_j) step over an item that sorts before the search key. An
+  index the old release damaged stops getting worse - later rows go to their own buckets - and
+  stops miscounting beyond the rows already misfiled.
+- **`lion_index_verify()` reports a SUMLAST pivot** as corruption with the hint to REINDEX, before
+  anything reads past it: the index is damaged, or will be when that bucket closes. Every order
+  violation of the directory now carries the same hint.
+
+An index built by the first release needs `REINDEX` if verify says so; one it built or wrote with
+no append split at a bucket close is sound as it stands. `test/sql/summary_append.sql` appends
+rows one statement at a time across several leaves at `summary_tids = 16` and checks verify and
+range counts at and around bucket bounds, and deletes the top buckets, vacuums, inserts below the
+old top and appends again.
 
 ### Two bounds on one side (2026-09-27)
 
@@ -10107,6 +10184,20 @@ recheck is spread over the side's counts rather than its keys. The sum over ever
 summarized column (`k IS NOT NULL` alone, §14) is priced as a range over all of it
 (`LION_RANGED_SUMALL`).
 
+Buckets hold `summary_tids` rows only when keys arrive in order. Keys that arrive in descending
+order all go into the first bucket (the open one, on an index built empty), and keys in no order
+grow the middle buckets, which never split; a range then walks the keys of a bucket far larger than
+the reloption says. So the model reads the rows per summary off the index at plan time
+(`lion_summary_shape()`: the entries' counters on at most `LION_SUMMARY_SHAPE_LEAVES` (4) leaves
+from where the column's summaries begin - the first buckets, where descending keys go) and takes
+that as the bucket's size once it is more than twice `max(summary_tids, rows per key)`; a single
+giant bucket makes the average large enough that a range rarely covers a bucket whole, as it rarely
+does. It used to count whole buckets the data did not have and price such a range as a sum of
+summaries that the executor walked key by key. A summarized column with no summary at all (`on`
+over an empty table) is priced as walked, as it is. (2026-09-28. The alternative - a per-bucket
+model with a giant bucket's share of the keys walked - needs the keys per bucket, which the
+summaries do not carry; the average is what the index can say cheaply.)
+
 A range taken as a source costs its collection once per relation - the same walk, with nothing to
 AND and nothing to recheck, plus a step per container of the union - and is then a source read from
 memory: no page reads for the probes, its rows `tuples x selectivity of its bounds`. One whose
@@ -10119,19 +10210,38 @@ plan-time endpoint probe of another change may sharpen; nothing here depends on 
 ### Verification (lion_funcs.c)
 
 `lion_index_verify()` checks every summarized column after its other checks
-(`lion_verify_column_summaries()`): it walks the summaries beside the column's VALUE entries,
-collects the codes of each bucket's keys and of its summary, sorts both, and compares them. It also
-checks that summaries are in order, that there is at most one SUMLAST and it is the last, that a
-summary is of a summarized column and carries `LION_SUMMARY_HASH`, and that no row is under two
-keys. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside inserts (VACUUM
-waits for it), so a difference is a CANDIDATE, not an error: an insert may be between its key and
-its summary, or have raised the open bucket's key. After waiting for every writer that could
-explain them (`lion_verify_wait_for_writers()`), each candidate is looked at again: a row a summary
-holds must be in one of its bucket's keys now, a row a key holds must be in its bucket's summary
-now, a key above the open bucket's must be in a bucket - and a DEAD row (`HeapTupleSatisfiesVacuum()`
-against the oldest non-removable xid, or an unused or dead line pointer) is never a difference,
-which is what a crash or an error between an insert's two steps leaves. A row that is still one
-is reported. `test/sql/corrupt.sql`
+(`lion_verify_column_summaries()`): bucket by bucket in key order, it looks the bucket's summary up
+as it is at that moment (`lion_verify_summary_after()`, a descent), collects and sorts the codes of
+the bucket's keys from one walk of the column's VALUE entries, and streams the summary's codes past
+them in code order. The keys' codes are held in an array up to a quarter of `maintenance_work_mem`
+and in an INT8 tuplesort that spills past it, and the summary's are not held at all: one bucket can
+be most of the table (a column of few keys, or the one bucket descending keys go into), and both
+sides used to be collected whole, which ran a backend out of memory. It also checks that no row is
+under two keys, and (in the directory walk before it) that summaries are in order, that a SUMLAST
+is the last and no pivot is one, and that a summary is of a summarized column and carries
+`LION_SUMMARY_HASH`. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside
+inserts (VACUUM waits for it), so a difference is a CANDIDATE, not an error: an insert may be
+between its key and its summary. Once the column is walked - or earlier, when a quarter of
+`maintenance_work_mem`'s worth of them, and at least `LION_VERIFY_MAX_SUM_CANDS` (10,000), are
+waiting - the writers that could explain them are waited for (`lion_verify_wait_for_writers()`) and the
+candidates are SETTLED in one pass over the summaries of their buckets and one walk of the
+column's keys (`lion_verify_settle()`): a row a summary lacked must be in its bucket's summary now,
+a row a summary holds must be in one of its bucket's keys now - and a DEAD row
+(`HeapTupleSatisfiesVacuum()` against the oldest non-removable xid, or an unused or dead line
+pointer) is never a difference, which is what a crash or an error between an insert's two steps
+leaves. The first candidate that is still one is reported; nothing else is capped.
+
+The OPEN bucket is read when the walk gets to it - its key and its summary as they are then - and a
+key the walk finds above that key belongs to a row that arrived while the check ran: no candidate.
+Only the largest such key is kept, and it has to be inside a bucket once the writers are done
+(`lion_verify_check_above()`: the lookup an insert makes; if it is not, every row of a key above
+the column's last summary has to be dead, or an insert a second wait settles). A summary at or
+above the open bucket's key as the check began was the open bucket then and is taken as the open
+one, which bounds the walk however fast appends close buckets behind it. Before 2026-09-28 the open
+bucket's key came from a copy of its leaf made when the walk began, so every row appended during
+the check was a candidate that cost a walk of the whole column to settle, and the cap on
+candidates, meant for a summary of garbage, was applied before any was settled: a column under
+steady appends was reported corrupt. `test/sql/corrupt.sql`
 rewrites a summary's key on disk to one that still sorts between its neighbours, so that every
 entry is sound on its own and only the comparison can tell; verify reports the row the summary
 holds and no key of its bucket does.
@@ -10159,6 +10269,10 @@ leave out.
   fact filters, on a partitioned table; collected and - at work_mem's floor, over 200,000 rows -
   walked, inside and as its complement, and in existence tests; generic plans with Param bounds, a
   NULL one, and multi-key Params beside it; a dirty heap and VACUUM.
+- `test/sql/summary_append.sql` (2026-09-28): the directory order of "The open bucket and the
+  directory order" - rows appended one statement at a time over several leaves with
+  `summary_tids = 16`, verify and range counts at and around bucket bounds against a sequential
+  scan, then the top buckets deleted, VACUUM, keys below the old top and appends again.
 - `test/sql/corrupt.sql` section 4, and `test/sql/rangesum.sql`'s two-bounds case; `range.sql`,
   `distinct.sql` and `fkjoin.sql` keep their formerly declined shapes, now answered, beside a clause
   no posting set answers.
@@ -10204,7 +10318,20 @@ The choices made conservatively here, each with the alternative:
 - **Not used by**: the bitmap and plain index scans, GROUP BY k walks, count(DISTINCT k), ordered
   scans - they want keys, or could take summaries (the bitmap scan of a range) in a later change.
 - **The insert fast path** an appending column could have - remembering where the open bucket is,
-  as btree remembers its rightmost leaf - is not there: every summarized row descends from the root.
+  as btree remembers its rightmost leaf - is not there: every summarized row descends from the root
+  (once; an append that raises the open bucket's key no longer descends twice).
+- **An emptied open bucket stays**, keyed by the largest key it ever held, and the next row above
+  the closed buckets joins it however far below that key it is. Its key could be lowered to the
+  closed buckets' top by a rewrite of the entry, but not below any pivot a split made of it, which
+  the entry cannot know; keeping it is what keeps the directory order.
+- **A crash between the two records of a close** leaves a column without an open bucket; the next
+  insert above it opens one (step 5), above every summary the column has, and so above every pivot.
+  The one residue left: if VACUUM empties and deletes that closed bucket before any insert above
+  it, and a row then arrives below its key, the new open bucket is keyed below pivots the deleted
+  one may have left, and closing it would break the order as above - three unlikely events in a
+  row, which `lion_index_verify()` reports (with its hint to REINDEX). Closing it too means
+  keeping a column's last summary whatever its kind, which VACUUM can only tell by reading the next
+  leaf under the cleanup lock of this one; it was not worth that here.
 
 ### Measured (2026-09-27, PostgreSQL 18.6 assert build, generic WAL, CPU time of the backend)
 

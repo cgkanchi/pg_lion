@@ -636,14 +636,14 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1990 AND 9010 AND g
  complement, summaries 458: (3)
 (1 row)
 
--- ... and every row of a column: every summary goes, and the next insert
--- opens a bucket again
+-- ... and every row of a column: every summary goes but the open one, which
+-- stays empty (DESIGN.md §32), and the next insert goes into it again
 DELETE FROM lion_sm WHERE k IS NOT NULL;
 VACUUM (FREEZE) lion_sm;
 SELECT summary_entries, summary_tids FROM lion_index_stats('lion_sm_k');
  summary_entries | summary_tids 
 -----------------+--------------
-               0 |            0
+               1 |            0
 (1 row)
 
 INSERT INTO lion_sm VALUES (50001, 50001, 1, 1, 42, 'x', 'q'), (50002, 50002, 2, 2, 41, 'y', 'q');

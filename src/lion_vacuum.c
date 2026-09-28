@@ -1489,6 +1489,18 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 		if (entry->ntids != 0 || entry->ncontainers != 0)
 			continue;
 
+		/*
+		 * A column's OPEN summary bucket is never deleted, however empty
+		 * (DESIGN.md §32): it keeps its key, still an upper bound of every key
+		 * it can hold, and the next row above the closed ones goes into it.
+		 * Deleted, it made the next insert above the column's summaries open a
+		 * new one keyed by that row - below the keys of the summary pivots the
+		 * leaves of the deleted buckets left in the directory - and the day
+		 * that bucket closed it sorted below the separator that routes to it.
+		 */
+		if (LionEntryIsSumLast(entry))
+			continue;
+
 		delofs[ndel++] = ref.off;
 
 		if ((entry->flags & LION_ENTRY_CHAIN) != 0)

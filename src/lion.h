@@ -465,7 +465,10 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 
 #define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
-/* The flags that make an entry's KIND, which a pivot copied from it keeps. */
+/*
+ * The flags that make an entry's KIND, which a pivot copied from it keeps -
+ * all but SUMLAST (lion_pivot_kindflags()).
+ */
 #define LION_ENTRY_KINDFLAGS	(LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS)
 #define LION_ENTRY_PIVOT		(LION_ENTRY_HIGHKEY | LION_ENTRY_DOWNLINK)
 #define LION_ENTRY_ALLFLAGS \
@@ -606,6 +609,28 @@ lion_entry_kind(const LionEntryTuple *e)
 	if ((e->flags & LION_ENTRY_SUMMARY) != 0)
 		return LION_KIND_SUMMARY;
 	return LION_KIND_VALUE;
+}
+
+/*
+ * The kind flags of a PIVOT (a high key or a downlink) made from an item with
+ * `flags` (DESIGN.md §21, §32): the item's own, except that a pivot is never
+ * of the SUMLAST kind.  The open bucket's entry sorts after every summary of
+ * its column by its kind alone, and closing the bucket drops the flag IN
+ * PLACE - so a SUMLAST pivot above it would then sort after the SUMMARY it
+ * routes to, the left page's high key above the right page's first key, and
+ * every later descent to a summary would land left of it.  A SUMMARY pivot
+ * with the open bucket's key at the time is a lower bound for the entry
+ * whatever becomes of it, because its key only ever rises, and it is above
+ * every other summary of the column, whose keys are below the open one's.
+ */
+static inline uint16
+lion_pivot_kindflags(uint16 flags)
+{
+	uint16		k = flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF);
+
+	if ((k & LION_ENTRY_SUMLAST) != 0)
+		k = (uint16) ((k & ~LION_ENTRY_SUMLAST) | LION_ENTRY_SUMMARY);
+	return k;
 }
 
 /*

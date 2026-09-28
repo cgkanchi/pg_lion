@@ -7006,6 +7006,12 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
  * The item is what puts the landings of SEVERAL bounds in order
  * (lion_cmp_entries(), the directory order itself), which is how a walk finds
  * the tightest of them (lion_range_side_leaf()).
+ *
+ * An item that sorts BEFORE the search key is stepped over, as
+ * lion_dir_search_first() does: never there on a sound directory, it is what
+ * a descent to a summary lands on in an index an earlier version damaged (a
+ * SUMLAST pivot above the summary it routes to, DESIGN.md §32), and taking it
+ * as E_j made the walk count whole buckets below the range's bound.
  */
 static BlockNumber
 lion_range_landing(Relation index, LionRange *range, int bound, int kind,
@@ -7031,6 +7037,11 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 		{
 			ItemId		iid = PageGetItemId(page, off);
 
+			if (lion_cmp_entry(lion_page_entry(page, off), &sk) < 0)
+			{
+				off = OffsetNumberNext(off);
+				continue;
+			}
 			*posp = (LionEntryTuple *) palloc(ItemIdGetLength(iid));
 			memcpy(*posp, PageGetItem(page, iid), ItemIdGetLength(iid));
 			break;
@@ -7167,6 +7178,63 @@ lion_summary_first_leaf(Relation index, LionState *col)
 	UnlockReleaseBuffer(buf);
 
 	return blk;
+}
+
+/*
+ * How many summaries a column has and the rows they hold, read off the
+ * entries' counters from where the column's summaries begin - at most
+ * LION_SUMMARY_SHAPE_LEAVES leaves of them, the first buckets, which is where
+ * keys that arrive in descending order go (DESIGN.md §32, "Costs").  The cost
+ * of a summed range needs it: buckets close at summary_tids rows only when
+ * keys arrive in order, and a column whose keys arrive in descending order -
+ * or in none - puts its rows into a few buckets far larger than that, whose
+ * keys a range walks one by one.  complete says every summary of the column
+ * was read.
+ */
+void
+lion_summary_shape(Relation index, LionState *col, LionSumShape *shape)
+{
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
+	int			nleaves = 1;
+
+	memset(shape, 0, sizeof(LionSumShape));
+
+	/* where the column's summaries begin, as lion_summary_first_leaf() */
+	lion_search_key_init(col, &sk, LION_KIND_SUMMARY, (Datum) 0, 0);
+	sk.cmpproc = NULL;
+	buf = lion_dir_search(index, NULL, col->ix, &sk, BUFFER_LOCK_SHARE, false,
+						  &off);
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+		for (; off <= maxoff; off++)
+		{
+			LionEntryTuple *e = lion_page_entry(page, off);
+
+			if (e->attno != col->attno || !LionEntryIsSummary(e))
+			{
+				shape->complete = true;
+				break;
+			}
+			shape->nsummaries += 1.0;
+			shape->rows += (double) e->ntids;
+		}
+		if (shape->complete || LionPageIsRightmost(page))
+		{
+			shape->complete = true;
+			break;
+		}
+		if (nleaves >= LION_SUMMARY_SHAPE_LEAVES)
+			break;
+		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+		off = lion_page_first_data(BufferGetPage(buf));
+		nleaves++;
+	}
+	UnlockReleaseBuffer(buf);
 }
 
 /* The leaf a descent to (attno, VALUE, key) lands on, key a stored one. */

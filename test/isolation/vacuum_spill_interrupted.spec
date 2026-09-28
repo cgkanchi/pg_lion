@@ -11,15 +11,18 @@
 #
 #  * the entry INLINE and holding every TID it held, the dead ones included,
 #    which the next VACUUM removes: nothing is lost and nothing is half-CHAIN;
-#  * ten FULL leaves that nothing references, stamped with a root that was
-#    never written.  lion_index_verify() must take them for the leak they are
+#  * ten FULL leaves that nothing references, stamped with a root that is an
+#    internal page with no downlink - the spill logs its root first, so that
+#    its block is never handed out again (DESIGN.md §18) - and that root.
+#    lion_index_verify() must take them for the leak they are
 #    and not for corruption (it did not: an unreferenced page that is neither
 #    empty nor internal was "not reachable from the meta page").  Its
 #    warnings are not printed here; lion_index_stats() counts the pages;
 #  * and the next VACUUM spills the set properly while its sweep frees the
 #    ten leaves, recognising them by their root, which is not a live root of
-#    their key (lion_posting_root_live()).  The sweep used to free only EMPTY
-#    unreferenced leaves, so these stayed leaked for good.
+#    their key (lion_posting_root_live()), and the root itself.  The sweep
+#    used to free only EMPTY unreferenced leaves, so these stayed leaked for
+#    good.
 #
 # The injection point 'lion-spill-leaves-written' fires between the last leaf
 # record and the root-and-entry record.  It is attached LOCALLY, in the
@@ -65,11 +68,11 @@ step s1_count	{
 permutation
 	s1_stats		# one INLINE entry of 150,000 TIDs
 	s1_vacuum		# ERROR between the leaves and the root
-	s1_stats		# still INLINE with every TID; ten orphan leaves
+	s1_stats		# still INLINE with every TID; ten orphan leaves, their root
 	s1_verify		# the orphans are a leak, not corruption
 	s1_count		# and no TID is lost: 135,000 rows
 	s1_detach
 	s1_vacuum		# spills the set, and the sweep frees the orphans
-	s1_stats		# CHAIN: one root, ten leaves; ten DELETED pages
+	s1_stats		# CHAIN: one root, ten leaves; eleven DELETED pages
 	s1_verify
 	s1_count

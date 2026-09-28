@@ -248,8 +248,8 @@ SELECT lion_index_verify('lion_sm_urg', true);
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u >= 100');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1000 AND 10000');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1990 AND 9010 AND g = 3');
--- ... and every row of a column: every summary goes, and the next insert
--- opens a bucket again
+-- ... and every row of a column: every summary goes but the open one, which
+-- stays empty (DESIGN.md §32), and the next insert goes into it again
 DELETE FROM lion_sm WHERE k IS NOT NULL;
 VACUUM (FREEZE) lion_sm;
 SELECT summary_entries, summary_tids FROM lion_index_stats('lion_sm_k');
