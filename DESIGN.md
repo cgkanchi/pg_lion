@@ -3331,7 +3331,78 @@ range taken as a source, an OR across columns), and not at all (the NULL partiti
 null test, the default's equality, a range on the key that keeps the default partition); counts,
 GROUP BYs of one and two columns; the declines (nothing left to select rows by, a printed pinned
 column, a volatile arm, a generic plan's parameter against a custom plan's literal); and a dirty
-heap before and after VACUUM.
+heap before and after VACUUM. Since "OR arms the partition bounds refute" it also checks a filter
+per kind ORed, counted and grouped by one and two columns, with a range beside it and without,
+before and after VACUUM; an arm a sub-partition's bound refutes, whose range then no longer keeps
+the partition from carrying the pin; the two-value bound, which refutes one arm and answers the
+others from its own index; the default and the NULL partition declining the arm they do not decide;
+and, with plan-time pruning off, the partitions whose bounds refute every arm, which are not
+counted.
+
+### OR arms the partition bounds refute (2026-09-28)
+
+A filter per kind is often written as one OR, an arm per kind:
+
+    WHERE ((kind = 'a' AND tags && '{x}' AND tags && '{y}') OR (kind = 'b' AND tags && '{z}')
+           OR kind = 'c' OR kind = 'd')
+      AND ts >= now() - interval '...'
+
+over a table LIST-partitioned by kind. No partition's bounds imply the OR - `kind IN ('c', 'd')`
+does, but `kind = 'a'` does not - and the leaves `kind = ...` have no lion index, so every
+partition but that one had to decline the query, and nothing was pushed down. But in the partition
+of 'a' the arms on 'b', 'c' and 'd' are never true, and in the arm that is left `kind = 'a'` always
+is: the partition's filter is `tags && '{x}' AND tags && '{y}'`, which the posting sets answer.
+
+So after the implied restrictions, `lion_leaf_drops()` takes each OR restriction a partition's
+bounds do not imply as a whole, arm by arm:
+
+- **An arm the bounds refute is left out.** The partition constraint is TRUE for every row the
+  partition holds, so an arm it refutes in core's weak sense - `predicate_refuted_by(arm,
+  constraint, true)`: the constraint TRUE, the arm FALSE or NULL - is not TRUE for any of them, and
+  adds no row to the union. That is left out whether or not the partition has indexes for it. A
+  volatile function or a subquery keeps the arm, as it keeps a clause from being implied.
+- **In an arm it keeps, a leaf the bounds imply is left out of the arm's AND** - TRUE of every row
+  - except a range, whose bounds are one source together (§32) and are kept. An arm all of whose
+  leaves are implied is TRUE of every row, and so is the OR, which is then left out whole as an
+  implied restriction.
+- **What is left needs an index**, leaf by leaf; an arm the bounds decide neither way whose leaf
+  has none declines the query, as before: the default partition does not refute `kind = 'e'`, a
+  partition `FOR VALUES IN (NULL, 'n')` does not decide `kind IS NULL`.
+- **An OR every arm of which is refuted** is never TRUE in the partition, which then has nothing to
+  count and is not counted at all. Plan-time pruning uses the same arms, so this is met when
+  pruning is off (`enable_partition_pruning`).
+
+Nothing about the pin changes: an OR carries the §9 interlock when no leaf of it is a range
+collected into memory, and a range in an arm the partition refutes is no leaf of its union there.
+
+The plan says it as it says an implied clause: the partition's index Oid for each leaf left out is
+InvalidOid (`LION_PRIV_PARTS`). The executor tells the three cases apart by what is left of each
+arm (`lion_locate_or()`, `lion_relation_items()`): an OR with no leaf left is left out whole, an arm
+with none is refuted and out of the union, and a leaf missing from an arm that keeps others is
+implied and out of its AND - the planner never leaves an arm all of whose leaves are implied. The
+partition's cost is for the OR it keeps (`lion_target_lists()`), and the FK-side join's fact
+filters (§27) are reduced the same way, since `lion_collect_targets()` serves it too. EXPLAIN lists
+the refuted arms on a line of their own and the implied leaves with the implied clauses:
+
+    Custom Scan (LionCount)
+      Partitions: ip_a_2025, ip_a_2026, ip_b, ip_cd
+      Lion Indexes: (ts >= ...), (((kind = 'a') AND (tags && '{x1}') AND (tags && '{y2}')) OR
+                    ((kind = 'b') AND (tags && '{x3}')) OR (kind = 'c') OR (kind = 'd'))
+      Implied by Partition Bounds: ((...) OR (kind = 'c') OR (kind = 'd')) in 1 of 4 partitions,
+                    (kind = 'a') in 2 of 4 partitions, (kind = 'b') in 1 of 4 partitions
+      Refuted by Partition Bounds: ((kind = 'a') AND ...) in 1 of 4 partitions,
+                    ((kind = 'b') AND ...) in 2 of 4 partitions, (kind = 'c') in 3 of 4
+                    partitions, (kind = 'd') in 3 of 4 partitions
+
+**Not done: GROUP BY the partition key.** `SELECT kind, count(*) ... GROUP BY kind` still needs a
+lion index on kind in every partition, although in a partition whose bounds give kind one value
+every row is one group and its count the partition's count. Taking the value from the bound needs
+what §10's value gate asks of an index's stored key - the partition key's equality has to be the
+grouping's and has to preserve the representation (`numeric` 1.0 and 1.00 are one partition
+value; a nondeterministic collation groups different strings), which an opclass says for an index
+but the partition key has to be asked for - and an executor mode that counts one partition as one
+group; the FK-side join would also have to put a fact column in its output, which §27 declines.
+It is left for a change of its own.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
@@ -9224,7 +9295,10 @@ them; inner joins, ungrouped, grouped by one and two columns and an expression, 
 BY and LIMIT; `count(DISTINCT)` of dimension columns and of the key, and beside `count(*)` under a
 LionJoinAgg; the forward semi join over the non-unique key and its `count(DISTINCT)`; no fact
 filter left in any partition (the key clause implied everywhere), a filter that selects nothing in
-some partitions or all; and a partition only run-time pruning would remove. EXPLAIN of each shape
+some partitions or all; a filter per kind ORed, which each partition narrows to the arm its bounds
+leave it (§16, "OR arms the partition bounds refute") - semi, anti and grouped inner joins, the
+mixed aggregates, a range beside it, and the default partition declining the arm it does not
+decide; and a partition only run-time pruning would remove. EXPLAIN of each shape
 (the dimension's plan as one line) shows `Partitions`, `Lion Indexes` and `Implied by Partition
 Bounds` - a list one partition answers from its own index on kind, a range on `ts` one
 sub-partition's bound implies. The counters: `Join Keys Looked Up` a key per partition that has a

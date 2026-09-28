@@ -2261,6 +2261,10 @@ typedef struct LionClauseInfo
  * they are in - and each restriction's clause by its position; and whether
  * something other than the WHERE clauses drives the count, so that a
  * partition left with no clause that selects rows still has its rows counted.
+ * The OR restrictions (§19) are there as the plan has them - `ors` over the
+ * clause lists, and each leaf's own clause in `leafclauses` - so that a
+ * partition can leave out the arms its bounds refute ("OR arms the partition
+ * bounds refute").
  */
 typedef struct LionImply
 {
@@ -2270,6 +2274,8 @@ typedef struct LionImply
 	List	   *skipped;		/* String: the clauses no posting set answers
 								 * that every partition implies, which are no
 								 * clauses of the plan (LION_PRIV_IMPLIED) */
+	List	   *leafclauses;	/* Expr, one per clause of the plan */
+	List	   *ors;			/* the plan's LION_PRIV_ORS */
 } LionImply;
 
 /*
@@ -2343,6 +2349,31 @@ lion_leaf_implies(PlannerInfo *root, RelOptInfo *leaf, RelOptInfo *toprel,
 		return false;
 	leafclause = adjust_appendrel_attrs_multilevel(root, clause, leaf, toprel);
 	return predicate_implied_by(list_make1(leafclause), partqual, false);
+}
+
+/*
+ * ... and does it REFUTE `clauses`, an implicit AND over toprel's columns - an
+ * arm of an OR restriction - so that no row of the partition makes them TRUE?
+ * Every row makes the constraint TRUE, so what core's predicate_refuted_by()
+ * calls weak refutation - the clauses TRUE, the predicate FALSE or NULL - is
+ * exactly that, and an arm that is never TRUE adds no row to the OR's.  A
+ * volatile function or a subquery keeps the arm, as it keeps a clause from
+ * being implied.
+ */
+static bool
+lion_leaf_refutes(PlannerInfo *root, RelOptInfo *leaf, RelOptInfo *toprel,
+				  List *partqual, List *clauses)
+{
+	Node	   *leafclauses;
+
+	if (partqual == NIL || leaf == toprel || clauses == NIL)
+		return false;
+	if (contain_volatile_functions((Node *) clauses) ||
+		contain_subplans((Node *) clauses))
+		return false;
+	leafclauses = adjust_appendrel_attrs_multilevel(root, (Node *) clauses,
+													leaf, toprel);
+	return predicate_refuted_by((List *) leafclauses, partqual, true);
 }
 
 /*
@@ -2529,13 +2560,26 @@ lion_pinned_not_implied(PlannerInfo *root, RelOptInfo *toprel,
  * keeps.  A partition that has to leave out every such clause declines the
  * query, as it did before.
  *
+ * An OR restriction its bounds do not imply may still be one they narrow
+ * (DESIGN.md §16, "OR arms the partition bounds refute"): an arm they refute
+ * is never TRUE of a row the partition holds and adds nothing to the union,
+ * so it is left out, index or none; and in an arm they do not refute, a leaf
+ * they imply is TRUE of every row and is left out of the arm's AND - a range
+ * excepted, whose bounds make one source together (§32).  An arm all of whose
+ * leaves go that way is TRUE of every row itself, and so is the OR, which is
+ * then left out whole.  The executor tells the three apart by what is left
+ * of each arm (lion_locate_or()).  And an OR whose every arm is refuted is
+ * never TRUE in the partition at all: *emptyp says so, and the partition has
+ * nothing to count.
+ *
  * On success *droppedp is NULL when nothing is left out, and otherwise one
  * flag per clause; false declines the query.
  */
 static bool
 lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 				const LionImply *imply, List *clauseinfos,
-				IndexOptInfo **idxs, bool **droppedp, int *ndroppedp)
+				IndexOptInfo **idxs, bool **droppedp, int *ndroppedp,
+				bool *emptyp)
 {
 	int			nr = list_length(imply->clauses);
 	int			nclause = list_length(clauseinfos);
@@ -2543,8 +2587,10 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 	bool	   *present;		/* some clause came of the restriction */
 	bool	   *need;			/* ... and this partition has no index for it */
 	bool	   *keep;			/* ... and it may not be left out */
-	bool	   *orrange;		/* an OR with a range leaf: carries no pin */
+	bool	   *orrange;		/* an OR with a range leaf it keeps: carries no
+								 * pin */
 	bool	   *drop;
+	bool	   *armdrop;		/* an OR's leaf, left out with its arm or alone */
 	bool	   *dropped;
 	int			ndropped = 0;
 	int			i;
@@ -2553,6 +2599,7 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 
 	*droppedp = NULL;
 	*ndroppedp = 0;
+	*emptyp = false;
 	if (partqual == NIL || nr == 0)
 		return true;
 
@@ -2563,6 +2610,77 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 	keep = (bool *) palloc0(sizeof(bool) * nr);
 	orrange = (bool *) palloc0(sizeof(bool) * nr);
 	drop = (bool *) palloc0(sizeof(bool) * nr);
+	armdrop = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+
+#define LION_IMPLIED(r) \
+	(implied[r] < 0 ? \
+	 (implied[r] = lion_leaf_implies(root, leaf, imply->toprel, partqual, \
+									 (Node *) list_nth(imply->clauses, r)) ? 1 : 0) : \
+	 implied[r])
+
+	/* The arms of each OR the bounds do not imply as a whole. */
+	foreach(lc, imply->ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			at = first;
+		int			nkept = 0;
+		bool		whole = false;
+		int			a;
+		int			j;
+
+		r = ((LionClauseInfo *) list_nth(clauseinfos, first))->rinfono;
+		if (r < 0 || r >= nr || LION_IMPLIED(r))
+			continue;
+		for (a = 0; a < narms; a++)
+		{
+			int			len = list_nth_int(one, 2 + a);
+			List	   *arm = NIL;
+			int			nleft = 0;
+
+			for (j = at; j < at + len; j++)
+				arm = lappend(arm, list_nth(imply->leafclauses, j));
+			if (lion_leaf_refutes(root, leaf, imply->toprel, partqual, arm))
+			{
+				for (j = at; j < at + len; j++)
+					armdrop[j] = true;
+			}
+			else
+			{
+				nkept++;
+				for (j = at; j < at + len; j++)
+				{
+					LionClauseInfo *ci = (LionClauseInfo *) list_nth(clauseinfos, j);
+
+					if (ci->kind != LION_CLAUSE_RANGESRC &&
+						lion_leaf_implies(root, leaf, imply->toprel, partqual,
+										  (Node *) list_nth(imply->leafclauses, j)))
+						armdrop[j] = true;
+					else
+						nleft++;
+				}
+				if (nleft == 0)
+					whole = true;
+			}
+			list_free(arm);
+			at += len;
+		}
+
+		if (nkept == 0)
+		{
+			/* never TRUE here: the partition has no row to count */
+			*emptyp = true;
+			return true;
+		}
+		if (whole)
+		{
+			/* an arm TRUE of every row makes the OR so: it goes whole */
+			implied[r] = 1;
+			for (j = first; j < at; j++)
+				armdrop[j] = false;
+		}
+	}
 
 	i = 0;
 	foreach(lc, clauseinfos)
@@ -2573,21 +2691,15 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 		if (r >= 0 && r < nr)
 		{
 			present[r] = true;
-			if (idxs[i] == NULL)
+			if (idxs[i] == NULL && !armdrop[i])
 				need[r] = true;
 			if (ci->kind == LION_CLAUSE_RANGE || (ci->valueout && !ci->inor))
 				keep[r] = true;
-			if (ci->inor && ci->kind == LION_CLAUSE_RANGESRC)
+			if (ci->inor && ci->kind == LION_CLAUSE_RANGESRC && !armdrop[i])
 				orrange[r] = true;
 		}
 		i++;
 	}
-
-#define LION_IMPLIED(r) \
-	(implied[r] < 0 ? \
-	 (implied[r] = lion_leaf_implies(root, leaf, imply->toprel, partqual, \
-									 (Node *) list_nth(imply->clauses, r)) ? 1 : 0) : \
-	 implied[r])
 
 	/* What the partition cannot answer, it must be able to leave out. */
 	for (r = 0; r < nr; r++)
@@ -2618,7 +2730,8 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
 
-		if (ci->rinfono >= 0 && ci->rinfono < nr && drop[ci->rinfono])
+		if ((ci->rinfono >= 0 && ci->rinfono < nr && drop[ci->rinfono]) ||
+			armdrop[i])
 		{
 			dropped[i] = true;
 			ndropped++;
@@ -2823,10 +2936,16 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	 * out of its count (DESIGN.md §16, "Clauses the partition bounds
 	 * imply"); every other clause needs one, as it always did.
 	 */
-	if (imply != NULL &&
-		!lion_leaf_drops(root, rel, partqual, imply, clauseinfos, idxs,
-						 &t->dropped, &t->ndropped))
-		return false;
+	if (imply != NULL)
+	{
+		bool		empty;
+
+		if (!lion_leaf_drops(root, rel, partqual, imply, clauseinfos, idxs,
+							 &t->dropped, &t->ndropped, &empty))
+			return false;
+		if (empty)
+			return true;		/* the WHERE clauses select nothing here */
+	}
 	for (i = 0; i < nclause; i++)
 	{
 		bool		dropped = (t->dropped != NULL && t->dropped[i]);
@@ -5444,8 +5563,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 /*
  * The clause lists as one relation counts them: without the clauses its
  * partition bounds imply (DESIGN.md §16, "Clauses the partition bounds
- * imply"), which it leaves out - a whole OR restriction at a time, whose
- * position in the lists `ors` renumbers - and *joinclause, the FK-side join's
+ * imply"), which it leaves out - a whole OR restriction at a time, or the arms
+ * of one its bounds refute and the leaves of an arm they imply, which `ors`
+ * then says without them, renumbered - and *joinclause, the FK-side join's
  * key, where it lands.  A relation that leaves nothing out counts the lists as
  * they are, and gets them back unchanged.
  */
@@ -5489,12 +5609,32 @@ lion_target_lists(const LionCountTarget *t, List *whereclauses,
 	{
 		List	   *one = (List *) lfirst(lc);
 		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		List	   *armlens = NIL;
+		int			at = first;
+		int			a;
 
-		if (t->dropped[first])
-			continue;
-		one = list_copy(one);
-		linitial_int(one) = pos[first];
-		*tors = lappend(*tors, one);
+		for (a = 0; a < narms; a++)
+		{
+			int			len = list_nth_int(one, 2 + a);
+			int			kept = 0;
+			int			j;
+
+			for (j = at; j < at + len; j++)
+			{
+				if (!t->dropped[j])
+					kept++;
+			}
+			if (kept > 0)
+				armlens = lappend_int(armlens, kept);
+			at += len;
+		}
+		if (armlens == NIL)
+			continue;			/* left out whole */
+		*tors = lappend(*tors,
+						list_concat(list_make2_int(pos[first],
+												   list_length(armlens)),
+									armlens));
 	}
 	if (joinclause != NULL && *joinclause >= 0)
 		*joinclause = pos[*joinclause];
@@ -9427,6 +9567,8 @@ unanswerable:
 		imply.clauses = rinfoclauses;
 		imply.driven = true;
 		imply.skipped = impliedtexts;
+		imply.leafclauses = whereclauses;
+		imply.ors = ors;
 		lion_try_fkjoin_path(root, input_rel, output_rel, extra, fj, having,
 							 whereattnos, clauseinfos, whereclauses,
 							 whereconsts, wherekinds, whereopnos, whereinor,
@@ -9915,6 +10057,8 @@ unanswerable:
 	imply.clauses = rinfoclauses;
 	imply.driven = (ndrive > 0);
 	imply.skipped = impliedtexts;
+	imply.leafclauses = whereclauses;
+	imply.ors = ors;
 	if (!lion_collect_targets(root, input_rel, drive, ndrive, whereattnos,
 							 clauseinfos, partitioned ? &imply : NULL,
 							 &targets))
@@ -11129,11 +11273,12 @@ lion_rel_read_only(LionCountScanState *st, Relation heap)
  * The items - the sources after slot 0 - of the partition just opened: the
  * plan's, less the clauses its bounds imply (DESIGN.md §16, "Clauses the
  * partition bounds imply"), whose indexes lion_open_relation() left closed.
- * An OR is left out whole or not at all (the planner decides for the whole
- * restriction); a range taken as a source stands for all of its bounds, and
- * is left out when every one of them is, and otherwise opened by the first
- * one the partition keeps.  The inner group of a two-column GROUP BY follows
- * the items, so its slot moves with their number.
+ * An OR is left out when every leaf of it is, and otherwise located without
+ * the arms and leaves the partition leaves out (lion_locate_or()); a range
+ * taken as a source stands for all of its bounds, and is left out when every
+ * one of them is, and otherwise opened by the first one the partition keeps.
+ * The inner group of a two-column GROUP BY follows the items, so its slot
+ * moves with their number.
  */
 static void
 lion_relation_items(LionCountScanState *st)
@@ -11147,8 +11292,16 @@ lion_relation_items(LionCountScanState *st)
 
 		if (it.orno >= 0)
 		{
-			if (st->clause[st->ors[it.orno].first].idx == NULL)
-				continue;
+			LionOrState *o = &st->ors[it.orno];
+			int			j;
+
+			for (j = 0; j < o->nleaves; j++)
+			{
+				if (st->clause[o->first + j].idx != NULL)
+					break;
+			}
+			if (j == o->nleaves)
+				continue;		/* left out whole */
 		}
 		else if (it.rangesrc)
 		{
@@ -12679,6 +12832,14 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
  * selects nothing itself and is dropped; an OR with no arm left selects
  * nothing at all.
  *
+ * A partition leaves out what its bounds make of the OR (DESIGN.md §16, "OR
+ * arms the partition bounds refute"): the leaves it has no index open for.
+ * An arm left with none of its leaves is one the bounds refute, and adds
+ * nothing to the union; a leaf left out of an arm that keeps others is one
+ * they imply, TRUE of every row, and the AND goes on without it.  The planner
+ * never leaves an arm all of whose leaves are implied: that OR is left out
+ * whole (lion_leaf_drops()).
+ *
  * THE PIN RULE (DESIGN.md §9 and §19).  A source is only allowed to serve its
  * containers from pinless private copies while some OTHER positive source is
  * still read the pinned way, and `lion_source_pinned()` decides that per
@@ -12695,6 +12856,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	LionKeyNode **leaftree;
 	int		   *leafn;
 	bool	   *absorbed;
+	bool	   *left;
 	LionKeyNode **arms;
 	int			narms = 0;
 	int			total = 0;
@@ -12710,6 +12872,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	leaftree = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->nleaves);
 	leafn = (int *) palloc0(sizeof(int) * orst->nleaves);
 	absorbed = (bool *) palloc0(sizeof(bool) * orst->nleaves);
+	left = (bool *) palloc0(sizeof(bool) * orst->nleaves);
 
 	for (i = 0; i < orst->nleaves; i++)
 	{
@@ -12717,6 +12880,13 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 
 		while (i >= armfirst + orst->armlen[arm])
 			armfirst += orst->armlen[arm++];
+
+		/* left out of this partition: no index was opened for it */
+		if (cl->idx == NULL)
+		{
+			left[i] = true;
+			continue;
+		}
 
 		/*
 		 * A range in an arm (DESIGN.md §32) is one leaf however many bounds
@@ -12791,6 +12961,8 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 		{
 			if (absorbed[leaf])
 				continue;		/* a bound of a range an earlier leaf is */
+			if (left[leaf])
+				continue;		/* refuted with its arm, or implied */
 			if (leaftree[leaf] == NULL)
 				empty = true;	/* an AND with a leaf that selects nothing */
 			else
@@ -17416,35 +17588,81 @@ lion_explain_clause_col(const LionClauseState *cl)
 							cl->kind == LION_CLAUSE_MULTI);
 }
 
+/* One arm of an OR, `len` leaves from leaf `at`: `((b = 2) AND (c = 3))`. */
+static void
+lion_explain_arm(LionCountScanState *st, LionOrState *o, int at, int len,
+				 List *ancestors, ExplainState *es, StringInfo buf)
+{
+	int			j;
+
+	if (len > 1)
+		appendStringInfoChar(buf, '(');
+	for (j = 0; j < len; j++)
+	{
+		if (j > 0)
+			appendStringInfoString(buf, " AND ");
+		appendStringInfoChar(buf, '(');
+		lion_explain_clause(st, &st->clause[o->first + at + j], ancestors,
+						   es, buf);
+		appendStringInfoChar(buf, ')');
+	}
+	if (len > 1)
+		appendStringInfoChar(buf, ')');
+}
+
 /* An OR restriction (DESIGN.md §19): `((a = 1) OR ((b = 2) AND (c = 3)))`. */
 static void
 lion_explain_or(LionCountScanState *st, LionOrState *o, List *ancestors,
 				ExplainState *es, StringInfo buf)
 {
-	int			leaf = 0;
+	int			at = 0;
 	int			arm;
-	int			j;
 
 	appendStringInfoChar(buf, '(');
 	for (arm = 0; arm < o->narms; arm++)
 	{
 		if (arm > 0)
 			appendStringInfoString(buf, " OR ");
-		if (o->armlen[arm] > 1)
-			appendStringInfoChar(buf, '(');
-		for (j = 0; j < o->armlen[arm]; j++, leaf++)
-		{
-			if (j > 0)
-				appendStringInfoString(buf, " AND ");
-			appendStringInfoChar(buf, '(');
-			lion_explain_clause(st, &st->clause[o->first + leaf], ancestors,
-							   es, buf);
-			appendStringInfoChar(buf, ')');
-		}
-		if (o->armlen[arm] > 1)
-			appendStringInfoChar(buf, ')');
+		lion_explain_arm(st, o, at, o->armlen[arm], ancestors, es, buf);
+		at += o->armlen[arm];
 	}
 	appendStringInfoChar(buf, ')');
+}
+
+/*
+ * Does partition p leave out all of OR `o`'s leaves from leaf `at` on, `len`
+ * of them - all of the OR, or all of one arm of it?
+ */
+static bool
+lion_explain_left_out(LionCountScanState *st, LionOrState *o, int p, int at,
+					  int len)
+{
+	int			j;
+
+	for (j = at; j < at + len; j++)
+	{
+		if (OidIsValid(st->part[p].clauseidxoid[o->first + j]))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * What partition p makes of leaf `leaf` of OR `o`, which is in the arm of
+ * `len` leaves from `at` (DESIGN.md §16): 'o' the OR is left out whole, 'r'
+ * the arm is refuted, 'i' the leaf alone is implied, or '-' it is counted.
+ */
+static char
+lion_explain_or_leaf(LionCountScanState *st, LionOrState *o, int p, int at,
+					 int len, int leaf)
+{
+	if (lion_explain_left_out(st, o, p, 0, o->nleaves))
+		return 'o';
+	if (lion_explain_left_out(st, o, p, at, len))
+		return 'r';
+	if (!OidIsValid(st->part[p].clauseidxoid[o->first + leaf]))
+		return 'i';
+	return '-';
 }
 
 /*
@@ -17473,31 +17691,111 @@ lion_explain_dropped_all(LionCountScanState *st, int i)
 	return st->npart > 0 && lion_explain_dropped(st, i) == st->npart;
 }
 
+/* How many partitions make `what` of leaf `leaf` of OR `o`, in its arm. */
+static int
+lion_explain_or_count(LionCountScanState *st, LionOrState *o, int at, int len,
+					  int leaf, char what)
+{
+	int			n = 0;
+	int			p;
+
+	for (p = 0; p < st->npart; p++)
+	{
+		if (lion_explain_or_leaf(st, o, p, at, len, leaf) == what)
+			n++;
+	}
+	return n;
+}
+
+/* " in n of m partitions" after an entry, where not all of them are */
+static void
+lion_explain_part_count(LionCountScanState *st, int n, StringInfo buf)
+{
+	if (n < st->npart)
+		appendStringInfo(buf, " in %d of %d partitions", n, st->npart);
+}
+
 /*
- * One entry of "Implied by Partition Bounds": clause i - the OR `o` it is the
- * first leaf of, when there is one - if any partition leaves it out, with how
- * many do when not all of them.
+ * The entries of "Implied by Partition Bounds" for clause i - or for the OR
+ * `o` it is the first leaf of - with how many partitions leave each out when
+ * not all of them: the clause; the OR, where a partition leaves it out whole;
+ * and each leaf of an OR that a partition leaves out of an arm it keeps.
  */
 static void
 lion_explain_implied(LionCountScanState *st, int i, LionOrState *o,
 					 List *ancestors, ExplainState *es, StringInfo buf)
 {
-	int			n = lion_explain_dropped(st, i);
+	int			n;
+	int			at = 0;
+	int			arm;
+	int			j;
 
-	if (n == 0)
-		return;
-	if (buf->len > 0)
-		appendStringInfoString(buf, ", ");
-	if (o != NULL)
-		lion_explain_or(st, o, ancestors, es, buf);
-	else
+	if (o == NULL)
 	{
+		n = lion_explain_dropped(st, i);
+		if (n == 0)
+			return;
+		if (buf->len > 0)
+			appendStringInfoString(buf, ", ");
 		appendStringInfoChar(buf, '(');
 		lion_explain_clause(st, &st->clause[i], ancestors, es, buf);
 		appendStringInfoChar(buf, ')');
+		lion_explain_part_count(st, n, buf);
+		return;
 	}
-	if (n < st->npart)
-		appendStringInfo(buf, " in %d of %d partitions", n, st->npart);
+
+	n = lion_explain_or_count(st, o, 0, o->nleaves, 0, 'o');
+	if (n > 0)
+	{
+		if (buf->len > 0)
+			appendStringInfoString(buf, ", ");
+		lion_explain_or(st, o, ancestors, es, buf);
+		lion_explain_part_count(st, n, buf);
+	}
+	for (arm = 0; arm < o->narms; arm++)
+	{
+		for (j = at; j < at + o->armlen[arm]; j++)
+		{
+			n = lion_explain_or_count(st, o, at, o->armlen[arm], j, 'i');
+			if (n == 0)
+				continue;
+			if (buf->len > 0)
+				appendStringInfoString(buf, ", ");
+			appendStringInfoChar(buf, '(');
+			lion_explain_clause(st, &st->clause[o->first + j], ancestors, es,
+							   buf);
+			appendStringInfoChar(buf, ')');
+			lion_explain_part_count(st, n, buf);
+		}
+		at += o->armlen[arm];
+	}
+}
+
+/*
+ * The entries of "Refuted by Partition Bounds" for OR `o`: each arm some
+ * partition's bounds refute, which that partition leaves out of the union.
+ */
+static void
+lion_explain_refuted(LionCountScanState *st, LionOrState *o, List *ancestors,
+					 ExplainState *es, StringInfo buf)
+{
+	int			at = 0;
+	int			arm;
+
+	for (arm = 0; arm < o->narms; arm++)
+	{
+		int			n = lion_explain_or_count(st, o, at, o->armlen[arm], at,
+											  'r');
+
+		if (n > 0)
+		{
+			if (buf->len > 0)
+				appendStringInfoString(buf, ", ");
+			lion_explain_arm(st, o, at, o->armlen[arm], ancestors, es, buf);
+			lion_explain_part_count(st, n, buf);
+		}
+		at += o->armlen[arm];
+	}
 }
 
 static void
@@ -17642,8 +17940,10 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			continue;
 		}
 
-		if (lion_explain_dropped_all(st, orno < 0 ? it->clauseno :
-									 st->ors[orno].first))
+		if (orno < 0 ? lion_explain_dropped_all(st, it->clauseno) :
+			(st->npart > 0 &&
+			 lion_explain_or_count(st, &st->ors[orno], 0,
+								   st->ors[orno].nleaves, 0, 'o') == st->npart))
 			continue;
 		if (buf.len > 0)
 			appendStringInfoString(&buf, ", ");
@@ -17733,6 +18033,20 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		}
 		if (buf.len > 0)
 			ExplainPropertyText("Implied by Partition Bounds", buf.data, es);
+		pfree(buf.data);
+
+		/* ... and the arms of an OR a partition's bounds refute */
+		initStringInfo(&buf);
+		for (i = 0; i < st->nplanitem; i++)
+		{
+			LionSourceItem *it = &st->planitem[i];
+
+			if (it->orno >= 0)
+				lion_explain_refuted(st, &st->ors[it->orno], ancestors, es,
+									 &buf);
+		}
+		if (buf.len > 0)
+			ExplainPropertyText("Refuted by Partition Bounds", buf.data, es);
 		pfree(buf.data);
 	}
 
