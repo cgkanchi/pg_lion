@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s3_prep s2_delete s1_scan s3_vacuum s2_freed s2_insert s2_reused s2_wakeup s1_again s3_verify
+starting permutation: s3_prep s2_delete s1_scan s3_parked s3_vacuum s2_freed s2_insert s2_reused s2_wakeup s1_again s3_verify
 injection_points_attach
 -----------------------
                        
@@ -9,6 +9,12 @@ injection_points_attach
 step s3_prep: VACUUM (FREEZE, ANALYZE) vcr;
 step s2_delete: DELETE FROM vcr WHERE k = 1;
 step s1_scan: SELECT count(*) AS rows_for_key_1 FROM vcr WHERE k = 1; <waiting ...>
+step s3_parked: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-scan-chain-entered';
+parked
+------
+t     
+(1 row)
+
 step s3_vacuum: VACUUM vcr;
 step s2_freed: 
 	SELECT entries, deleted_pages > 0 AS chain_was_freed

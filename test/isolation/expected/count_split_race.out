@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s3_prep s2_delete s3_vacuum s3_leaves s3_note s1_count s2_insert s2_wakeup s1_plain s3_split s3_verify
+starting permutation: s3_prep s2_delete s3_vacuum s3_leaves s3_note s1_count s3_parked s2_insert s2_wakeup s1_plain s3_split s3_verify
 injection_points_attach
 -----------------------
                        
@@ -25,6 +25,12 @@ step s3_note:
 		SELECT container_pages AS pages FROM lion_index_stats('psr_k');
 
 step s1_count: SELECT count(*) FROM psr WHERE k = 1; <waiting ...>
+step s3_parked: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-count-containers-pinned';
+parked
+------
+t     
+(1 row)
+
 step s2_insert: 
 	INSERT INTO psr SELECT 1000000 + i, 1, '' FROM generate_series(1, 10000) i;
 

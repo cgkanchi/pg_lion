@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s3_prep s2_delete s1_group s3_vacuum s2_wakeup s1_plain s3_stats s3_vacuum2 s3_stats2 s3_verify
+starting permutation: s3_prep s2_delete s1_group s3_parked s3_vacuum s2_wakeup s1_plain s3_stats s3_vacuum2 s3_stats2 s3_verify
 injection_points_attach
 -----------------------
                        
@@ -13,6 +13,12 @@ step s1_group:
 		   sum(c) AS rows_counted, min(c) AS min_rows, max(c) AS max_rows
 	  FROM (SELECT k, count(*) AS c FROM vgd GROUP BY k) g;
  <waiting ...>
+step s3_parked: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed';
+parked
+------
+t     
+(1 row)
+
 step s3_vacuum: VACUUM vgd;
 step s2_wakeup: 
 	/*
@@ -112,7 +118,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s3_prep s2_delete s1_group2 s3_vacuum s2_wakeup s1_plain s3_stats s3_vacuum2 s3_stats2 s3_verify
+starting permutation: s3_prep s2_delete s1_group2 s3_parked s3_vacuum s2_wakeup s1_plain s3_stats s3_vacuum2 s3_stats2 s3_verify
 injection_points_attach
 -----------------------
                        
@@ -125,6 +131,12 @@ step s1_group2:
 		   sum(c) AS rows_counted
 	  FROM (SELECT k, g, count(*) AS c FROM vgd GROUP BY k, g) x;
  <waiting ...>
+step s3_parked: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed';
+parked
+------
+t     
+(1 row)
+
 step s3_vacuum: VACUUM vgd;
 step s2_wakeup: 
 	/*

@@ -156,18 +156,24 @@ step s3_vacuum2	{ VACUUM (INDEX_CLEANUP ON) vgd; }
 step s3_stats2	{ SELECT entries, ntids FROM lion_index_stats('vgd_k'); }
 step s3_verify	{ SELECT lion_index_verify('vgd_k', true);
 				  SELECT lion_index_verify('vgd_g', true); }
+# Is the parked session waiting at its injection point right now?
+step s3_parked	{ SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed'; }
 
-# The parked step carries no (*) marker: isolationtester sees a session
-# waiting on an injection point as blocked (pg_isolation_test_session_is_blocked
-# checks for it), so it moves on only once the step has really parked.  (*)
-# would move on at once, and the next step could then race the park - a slow
-# backend reached the point only after VACUUM had already run.  The marker in
-# parentheses pins the report of its completion after the step that releases
-# it.
+# The parked step carries no (*) marker, which would move on at once, and the
+# next step could then race the park - a slow backend reached the point only
+# after VACUUM had already run.  Without it isolationtester moves on once the
+# session is blocked (pg_isolation_test_session_is_blocked counts a wait on an
+# injection point) - or once the step has finished: the marker in
+# parentheses, which pins the report of its completion after the step that
+# releases it, also makes a step that never parked, and simply completed,
+# print "<waiting ...>" exactly as a parked one does.  So the output alone
+# cannot show that the race was run; s3_parked, straight after the parked
+# step, is what shows the session really is parked there.
 permutation
 	s3_prep					# make the heap all-visible
 	s2_delete				# 6000 rows, dead to everyone from here on
 	s1_group(s2_wakeup)	# parks between the first and second entry
+	s3_parked				# ... and it really is parked there
 	s3_vacuum				# deletes 20 entries and frees their chains
 	s2_wakeup				# detaches the point and releases s1
 	s1_plain				# the same numbers without the pushdown
@@ -182,6 +188,7 @@ permutation
 	s3_prep
 	s2_delete
 	s1_group2(s2_wakeup)
+	s3_parked				# ... and it really is parked there
 	s3_vacuum
 	s2_wakeup
 	s1_plain
