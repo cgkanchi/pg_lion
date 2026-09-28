@@ -99,7 +99,7 @@ def mux(build):
     """Join the rendered parts with the narration, captions and chapters.
 
     The parts are near-lossless intermediates; the one encode here is sized for the web (about
-    14 MB for the whole video: flat graphics compress well, and the narration is 24 kHz speech).
+    300 kb/s: flat graphics compress well, and the narration is 24 kHz speech).
     No -shortest: it counts the subtitle track, which ends with the last caption.
     """
     out = os.path.join(build, "pg_lion_explained.mp4")
