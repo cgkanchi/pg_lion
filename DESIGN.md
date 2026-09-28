@@ -3047,6 +3047,14 @@ complete under a GROUP BY paused after its first group and under a plain count d
 and the paused cursor's other groups come out as its snapshot saw them after VACUUM has removed TIDs
 its copy of the WHERE set still lists and an insert has taken their slots back.
 
+The counts of one node share two things (2026-09-28, §27 "The per-key path, end to end"): the
+scratch memory they work in, reset after each, and the visibility-map page the last one left
+pinned, which the node keeps between rows as core's index-only scan keeps its map page. Neither
+is an index page or part of the §9 interlock, and no VACUUM waits for a map page's pin; it goes
+when the node is done, rescanned or ended, or moves to another partition
+(`lion_vis_cache_release_vm()`). `test/sql/countpause.sql`'s check - no page of a lion index
+pinned by a paused cursor - holds as before.
+
 ## 16. Partitioned tables (v1, implemented)
 
 At UPPERREL_GROUP_AGG the input rel may be a partitioned parent: `rte->inh`, relkind `p`,
@@ -7229,7 +7237,10 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   From the first row on the WHERE sets are NOPIN copies, each count carried by its fk set's pin,
   and the node holds no pin between rows or after its last (§15, "Paused and finished counts").
   A plan that looks its keys up in key order gives them up before it reads its first batch of
-  child rows instead ("Lookups in key order"), so its child never runs with them pinned.
+  child rows instead ("Lookups in key order"), so its child never runs with them pinned; so does
+  a plan whose fact filters were collected, as soon as the copy is made, since no count reads
+  them after it; and so does a summed join ("The per-key path, end to end"), before each child
+  row, since it hands up no row until the end.
 
 ### Planner integration
 
@@ -8147,6 +8158,93 @@ and at a `work_mem` of 64 kB, where the same copy spills, `Fact Filter Copies Sp
 file reads no more than the keys' containers and temporary blocks read no more than those reads and
 one.
 
+### The per-key path, end to end (2026-09-28)
+
+With the counters above, what is left is to know what a key costs by construction. This is every
+operation between a dimension row leaving the child and its count being done, in order, with what
+it costs as the §10 units put it (a directory page visited about 0.6 us, a container read and
+counted about 0.14 us, on a warm release build) where the calibration covers it, and as estimated
+from what the code does where it does not; the fixes of 2026-09-28 are marked.
+
+1. **The child's row**: whatever the dimension's plan costs, core's plan and core's cost; now
+   `Join Child Time` and `Rows`. In a plan whose dimension set is selected by a scattered bitmap
+   heap scan over a large dimension, that is a heap page a row wherever it is not cached.
+2. **Its place in a batch** (in key order): the row copied as a MinimalTuple, its key's hash, its
+   share of the batch's sort (log2 of the batch comparisons through the opclass) - a fraction of a
+   microsecond; the batch's memory is reset once a batch.
+3. **The lookup**: a walk step or a descent (§21), a page visit each. Row at a time it also
+   RESOLVED THE KEY'S PROBE for every key (`lion_posting_set_lookup_col()` calls
+   `lion_probe_init()`): nothing for a key of the column's own type, but for a cross-type key (an
+   `int4` fk against an `int8` key) the family's cross-type equality, hash and comparisons looked
+   up in the syscache, their FmgrInfos set up and the type's length looked up - some microseconds
+   a key, for the same answer every time. *Fixed*: the node begins its walk for every plan, which
+   resolves the probe once, and a row-at-a-time lookup is a descent with it
+   (`lion_lookup_walk_descend()`).
+4. **The set located**: an INLINE payload copied, the stored key copied, in the per-key context,
+   which is reset first - O(the set).
+5. **The count's set-up** (`lion_count_sources_run()`): the sources' trees, the pin-budget and
+   batch decisions, two plans, two cursors - some twenty small allocations and decisions - and a
+   MEMORY CONTEXT made for the count and deleted after it. That context came from core's freelist,
+   but its first block is 8 kB, and a merge's two work containers and a spilled copy's staging
+   buffer are 8 kB chunks each: every count malloc'd two more blocks and freed them again, per
+   key. *Fixed*: the count works in a scratch context the node keeps (`LionVisCache.scratch`),
+   whose 64 kB first block holds an ordinary count, reset when the count is over - a few pointer
+   resets instead of a context and two blocks made and freed.
+6. **The visibility map**: every count pinned the map page its first container needed and
+   released it at the end - a buffer lookup and two atomic operations on the header of the one
+   or two map pages of the heap that every count, and every participant of a parallel plan,
+   pins. *Fixed*: the page stays pinned in the node's cache from one count to the next
+   (`LionVisCache.vmbuf`), between the node's rows as well, as an index-only scan keeps its map
+   page (`ioss_VMBuffer`), and is let go when the node is done, rescanned or ended or moves to
+   another partition (`lion_vis_cache_release_vm()`). A map page is no index page and no part of
+   the §9 interlock: VACUUM sets a bit under the page's content lock and never waits for its
+   pins, and only a truncation of the map would, under an AccessExclusiveLock this query's own
+   lock excludes. `Visibility Map Pages Pinned` counts what is left: a pin per map page a run
+   needs.
+7. **Per fk container**: the copy's binary search, log2 of its containers, and for a spilled copy
+   one read of that container from the temporary file (a system call reading a block of it) - the
+   first container stays in memory ("Lookups in key order"); the AND of the two containers; the
+   visibility map's mask of it. O(the set's containers x log(the copy)), and nothing else of the
+   copy is read.
+8. **The heap recheck** of candidates on pages the map does not vouch for, through the node's
+   visibility cache: O(the key's intersection).
+9. **The set released**: its pin, its charge to the list budget.
+10. **The row handed up**: the per-tuple context reset, a virtual tuple, the projection, the return
+    through the executor and its instrumentation, `lion_pause_run()` - which in key order lets the
+    walk's leaf go, so that the next key reads it again by its block number - and above the node
+    the Finalize Agg's transition; in a parallel plan also the Gather's tuple queue, and the
+    leader reads every participant's rows and aggregates them alone. About as much as a count's
+    set-up again, none of it the key's own work, and in a parallel plan serialized in the leader.
+    *Fixed where it can be*: when the target list is counts alone (`count(*)` and its semi, anti
+    and distinct-key forms, no dimension column to group by or print) the node adds the partial
+    counts itself and hands up ONE partial row per run and participant (`LION_JOINFLAG_SUM`,
+    chosen by the planner from the partial target) - what a Partial Aggregate below a Gather hands
+    up. The Finalize Agg adds the participants' rows as it added the dimension rows': count's
+    combine is a sum. An empty join hands up nothing, as before, which is what a plain Finalize Agg
+    answers 0 for and a GROUP BY folded to constants has no group for. A summed join fetches each
+    child row with no pin held (`lion_pause_run()` before it, which has something to let go of
+    only once), since it returns to the executor only at the end. A GROUP BY of dimension columns
+    still hands up a row a dimension row: grouping by them is core's equality, and a partial
+    aggregate of its own would be core's hashing (§10's rules; "Declined").
+
+Looked for and not found, for any shape: no count reads the copy, or positions a cursor on it,
+other than at the key's own containers; no count reads a spilled copy back from its file other
+than a container at a time, and never its first container; no per-key budget is computed from the
+copy - a count's budgets are `work_mem`'s and the pin budget's, a few instructions; no per-key
+catalog access but the cross-type probe of 3; no per-key parallel coordination - a participant
+claims a run of 64 distinct keys at a time with one atomic operation, and only in the forward semi
+join over a non-unique key; nothing per batch but its sort; and of EXPLAIN's instrumentation,
+core's clock reads around every row the node returns, which a summed join returns once, and the
+node's own phase clock, three reads a key and only under TIMING. With the fixes a key costs its
+lookup, O(its fk set x log(the copy)), and a set-up of some twenty allocations from memory already
+there.
+
+None of 2 to 10 is O(the copy), and on a warm cache their sum is the few microseconds the
+calibration of "Cost, revisited" found. A key that costs far more than that is paying for the
+child's rows (1), for pages read from disk - by the lookups, the fk sets' chains (`Join Posting
+Pages Read`) or the rechecks - or, in a parallel plan, for its row's trip through the Gather (10);
+the counters and timings of "Where a key's time goes" tell which.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -8170,6 +8268,11 @@ one.
   column other than the key, an fk of another type than the key, a DISTINCT under another
   collation than the join's ("count(DISTINCT)" above).
 - **An anti join from `LEFT JOIN ... IS NULL`, and `NOT IN`** (above).
+- **Partial aggregation of a GROUP BY's rows inside the node.** A summed join adds its counts up
+  because a count alone needs no grouping ("The per-key path, end to end"); folding the rows of a
+  `GROUP BY d.attr` before they go up would need `d.attr`'s grouping equality and hashing, which
+  are core's (§10's finding 3), in a hash table of the node's own. Core's Finalize HashAggregate
+  does it above the node.
 
 ### Tests
 
