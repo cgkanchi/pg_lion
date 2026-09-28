@@ -9868,19 +9868,38 @@ plan-time endpoint probe of another change may sharpen; nothing here depends on 
 ### Verification (lion_funcs.c)
 
 `lion_index_verify()` checks every summarized column after its other checks
-(`lion_verify_column_summaries()`): it walks the summaries beside the column's VALUE entries,
-collects the codes of each bucket's keys and of its summary, sorts both, and compares them. It also
-checks that summaries are in order, that there is at most one SUMLAST and it is the last, that a
-summary is of a summarized column and carries `LION_SUMMARY_HASH`, and that no row is under two
-keys. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside inserts (VACUUM
-waits for it), so a difference is a CANDIDATE, not an error: an insert may be between its key and
-its summary, or have raised the open bucket's key. After waiting for every writer that could
-explain them (`lion_verify_wait_for_writers()`), each candidate is looked at again: a row a summary
-holds must be in one of its bucket's keys now, a row a key holds must be in its bucket's summary
-now, a key above the open bucket's must be in a bucket - and a DEAD row (`HeapTupleSatisfiesVacuum()`
-against the oldest non-removable xid, or an unused or dead line pointer) is never a difference,
-which is what a crash or an error between an insert's two steps leaves. A row that is still one
-is reported. `test/sql/corrupt.sql`
+(`lion_verify_column_summaries()`): bucket by bucket in key order, it looks the bucket's summary up
+as it is at that moment (`lion_verify_summary_after()`, a descent), collects and sorts the codes of
+the bucket's keys from one walk of the column's VALUE entries, and streams the summary's codes past
+them in code order. The keys' codes are held in an array up to a quarter of `maintenance_work_mem`
+and in an INT8 tuplesort that spills past it, and the summary's are not held at all: one bucket can
+be most of the table (a column of few keys, or the one bucket descending keys go into), and both
+sides used to be collected whole, which ran a backend out of memory. It also checks that no row is
+under two keys, and (in the directory walk before it) that summaries are in order, that a SUMLAST
+is the last and no pivot is one, and that a summary is of a summarized column and carries
+`LION_SUMMARY_HASH`. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside
+inserts (VACUUM waits for it), so a difference is a CANDIDATE, not an error: an insert may be
+between its key and its summary. Once the column is walked - or earlier, when
+`LION_VERIFY_MAX_SUM_CANDS` (10,000) or a quarter of `maintenance_work_mem`'s worth are waiting -
+the writers that could explain them are waited for (`lion_verify_wait_for_writers()`) and the
+candidates are SETTLED in one pass over the summaries of their buckets and one walk of the
+column's keys (`lion_verify_settle()`): a row a summary lacked must be in its bucket's summary now,
+a row a summary holds must be in one of its bucket's keys now - and a DEAD row
+(`HeapTupleSatisfiesVacuum()` against the oldest non-removable xid, or an unused or dead line
+pointer) is never a difference, which is what a crash or an error between an insert's two steps
+leaves. The first candidate that is still one is reported; nothing else is capped.
+
+The OPEN bucket is read when the walk gets to it - its key and its summary as they are then - and a
+key the walk finds above that key belongs to a row that arrived while the check ran: no candidate.
+Only the largest such key is kept, and it has to be inside a bucket once the writers are done
+(`lion_verify_check_above()`: the lookup an insert makes; if it is not, every row of a key above
+the column's last summary has to be dead, or an insert a second wait settles). A summary at or
+above the open bucket's key as the check began was the open bucket then and is taken as the open
+one, which bounds the walk however fast appends close buckets behind it. Before 2026-09-28 the open
+bucket's key came from a copy of its leaf made when the walk began, so every row appended during
+the check was a candidate that cost a walk of the whole column to settle, and the cap on
+candidates, meant for a summary of garbage, was applied before any was settled: a column under
+steady appends was reported corrupt. `test/sql/corrupt.sql`
 rewrites a summary's key on disk to one that still sorts between its neighbours, so that every
 entry is sound on its own and only the comparison can tell; verify reports the row the summary
 holds and no key of its bucket does.
