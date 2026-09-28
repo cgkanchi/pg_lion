@@ -132,6 +132,7 @@
 #include "utils/tuplesort.h"
 
 #include "lion.h"
+#include "lion_costs.h"
 #include "lion_count.h"
 #include "lion_fkjoin.h"
 
@@ -217,6 +218,16 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_FKJOIN_UNIQUE_CHUNK	64
 
 /*
+ * THE PRICES.  Every LION_*_COST below is a multiple of cpu_operator_cost or
+ * cpu_tuple_cost (LION_FKJOIN_SORT_PAGE_COST, of seq_page_cost and
+ * random_page_cost), and the multiplier is a planner setting (lion_costs.c;
+ * DESIGN.md §31, "The settings"): LION_CONTAINER_COST is
+ * (lion_container_cost * cpu_operator_cost), and lion_container_cost is
+ * pg_lion.container_cost.  Each comment is the measurement or the derivation
+ * behind its setting's default.
+ */
+
+/*
  * The fixed cost of one count of the FK-side join (DESIGN.md §27) - one per
  * dimension row - over and above the containers it reads and the lookup that
  * locates its set: a merge set up and torn down.  Derived from what the count
@@ -228,7 +239,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * memory context, pinned a map page and, when it merged two sources, malloc'd
  * and freed two blocks every time: what the per-key fixes took off.
  */
-#define LION_FKJOIN_COUNT_COST	(25.0 * cpu_tuple_cost)
+#define LION_FKJOIN_COUNT_COST	(lion_fkjoin_count_cost * cpu_tuple_cost)
 
 /*
  * ... and each row the node hands up: a partial count per dimension row that
@@ -242,7 +253,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * core does with the rows above the node - its Finalize Agg's transitions, a
  * Gather's tuple queue - core charges.
  */
-#define LION_FKJOIN_ROW_COST	(10.0 * cpu_tuple_cost)
+#define LION_FKJOIN_ROW_COST	(lion_fkjoin_row_cost * cpu_tuple_cost)
 
 /*
  * ... and one PROBE of such a count into a fact filter's set: a seek of the
@@ -257,7 +268,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * keeps the same query over a quarter of the dimension, 39 ms against 67,
  * chosen (about 8,000).
  */
-#define LION_FKJOIN_PROBE_COST	(80.0 * cpu_operator_cost)
+#define LION_FKJOIN_PROBE_COST	(lion_fkjoin_probe_cost * cpu_operator_cost)
 
 /*
  * ... and, per count, each SET of a fact filter that is a union (an IN list,
@@ -266,8 +277,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * find anything in it.  Measured on the assert build, 1.5M fact rows and 300
  * dimension rows: `t IN (n values)` took 57 ms at n = 30, 199 at 100, 599 at
  * 300 and 1195 at 1000 - 4 to 6 us per set per count.  It is the rebuild a
- * GROUP BY's counts make of a union source too, measured on the release build
- * at 2.7 to 6 us a set (LION_UNION_SET_COST), and priced as that.
+ * GROUP BY's counts make of a union source too - the same count of the same
+ * sources, lion_count_sources_cached() - measured on the release build at 2.7
+ * to 6 us a set (LION_UNION_SET_COST), and priced as that, by the same setting.
  */
 #define LION_FKJOIN_SET_COST	LION_UNION_SET_COST
 
@@ -293,10 +305,22 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * rows was chosen at 152 ms against the hash join's 125.  A copy of 1,500
  * containers takes 0.8 ms when the filter is one set.
  */
-#define LION_FKJOIN_COPY_COUNT_COST	(25.0 * cpu_tuple_cost)
-#define LION_FKJOIN_COPY_PROBE_COST	(15.0 * cpu_operator_cost)
-#define LION_FKJOIN_COPY_MEMBER_COST	(3.0 * cpu_operator_cost)
-#define LION_FKJOIN_COPY_CONTAINER_COST	(20.0 * cpu_operator_cost)
+#define LION_FKJOIN_COPY_COUNT_COST	(lion_fkjoin_copy_count_cost * cpu_tuple_cost)
+#define LION_FKJOIN_COPY_PROBE_COST	(lion_fkjoin_copy_probe_cost * cpu_operator_cost)
+#define LION_FKJOIN_COPY_MEMBER_COST	(lion_fkjoin_copy_member_cost * cpu_operator_cost)
+#define LION_FKJOIN_COPY_CONTAINER_COST	(lion_fkjoin_copy_container_cost * cpu_operator_cost)
+
+/*
+ * ... and, making the copy, each container of the DRIVER of the filters'
+ * merge - the sparsest filter, read end to end while every other is probed at
+ * its container keys (LION_FKJOIN_PROBE_COST a probe) - read and ANDed.  No
+ * count is made and the visibility map is not asked, which is most of what
+ * LION_CONTAINER_COST is a price of; this is two cpu_operator_cost, §10's
+ * price of a container before the release-build fit, which "Cost, revisited"
+ * (DESIGN.md §27) left as it was: the collected shapes came out at 374 to 595
+ * units a millisecond with it.
+ */
+#define LION_FKJOIN_COLLECT_CONTAINER_COST	(lion_fkjoin_collect_container_cost * cpu_operator_cost)
 
 /*
  * Making the dimension's keys distinct for a forward semi join over a
@@ -319,10 +343,17 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * hashed unique-ification one a row), and it answers enable_sort, which this
  * sort, no Sort node, does not.  A text key compares more slowly than these.
  * A sort larger than work_mem also writes its keys out and reads them back,
- * once each, as core's cost_tuplesort() charges one merge pass.
+ * once each, as core's cost_tuplesort() charges one merge pass:
+ *
+ *	SORT_PAGE		each of those page accesses, three quarters of them in
+ *					sequence and a quarter at random - cost_tuplesort()'s own
+ *					mix, which is not measured here.
  */
-#define LION_FKJOIN_SORT_COMPARE_COST	(0.25 * cpu_operator_cost)
-#define LION_FKJOIN_SORT_KEY_COST	(6.0 * cpu_operator_cost)
+#define LION_FKJOIN_SORT_COMPARE_COST	(lion_fkjoin_sort_compare_cost * cpu_operator_cost)
+#define LION_FKJOIN_SORT_KEY_COST	(lion_fkjoin_sort_key_cost * cpu_operator_cost)
+#define LION_FKJOIN_SORT_PAGE_COST \
+	(lion_fkjoin_sort_seq_page_cost * seq_page_cost + \
+	 lion_fkjoin_sort_random_page_cost * random_page_cost)
 
 /*
  * Looking the child's rows up in the fk index's key order (DESIGN.md §27,
@@ -332,21 +363,22 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *					share of the sort (log2 of the batch comparisons through the
  *					opclass's comparison function) and the slot it is handed
  *					back to the target list in.  Priced as one directory page
- *					visit (LION_DESCENT_COST), which is on the high side:
- *					putting a key into the datum sort of the distinct keys
- *					above, sorting it and taking it out again measured at a
- *					fraction of what a page visit is fitted at, and a row's
- *					copy and its slot are of the same order.  High on purpose:
- *					the walk replaces a descent's internal levels with this, so
- *					it is taken only where it saves a page a key or more -
- *					never over a directory of height 1, whose descent is the
- *					root and the leaf.
+ *					visit - LION_DESCENT_COST's default, though a setting of
+ *					its own, since a page visit is not what it is - which is on
+ *					the high side: putting a key into the datum sort of the
+ *					distinct keys above, sorting it and taking it out again
+ *					measured at a fraction of what a page visit is fitted at,
+ *					and a row's copy and its slot are of the same order.  High
+ *					on purpose: the walk replaces a descent's internal levels
+ *					with this, so it is taken only where it saves a page a key
+ *					or more - never over a directory of height 1, whose descent
+ *					is the root and the leaf.
  *	BATCH_ENT_BYTES	per row, what a batch holds besides the row's own columns:
  *					the entry that sorts it, the MinimalTuple's header and the
  *					allocator's chunk headers of the row and of a key copied
  *					by reference.
  */
-#define LION_FKJOIN_BATCH_ROW_COST	LION_DESCENT_COST
+#define LION_FKJOIN_BATCH_ROW_COST	(lion_fkjoin_batch_row_cost * cpu_operator_cost)
 #define LION_FKJOIN_BATCH_ENT_BYTES	(sizeof(LionJoinEnt) + 48)
 
 /*
@@ -419,7 +451,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * over many entries when the WHERE leaves few rows to sort - 1000 entries of
  * k against 500 matching rows measured 3.4 ms against 0.56 (DESIGN.md §26).
  */
-#define LION_DISTINCT_TEST_COST	(50.0 * cpu_tuple_cost)
+#define LION_DISTINCT_TEST_COST	(lion_distinct_test_cost * cpu_tuple_cost)
 
 /*
  * ... and of each count a GROUP BY makes, one per entry of its column or pair
@@ -431,8 +463,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * was located with the list and decodes nothing: 0.35 us a group, measured
  * over 1,000 of them.
  */
-#define LION_ENTRY_COUNT_COST	(50.0 * cpu_tuple_cost)
-#define LION_LIST_GROUP_COST	(18.0 * cpu_tuple_cost)
+#define LION_ENTRY_COUNT_COST	(lion_entry_count_cost * cpu_tuple_cost)
+#define LION_LIST_GROUP_COST	(lion_list_group_cost * cpu_tuple_cost)
 
 /*
  * ... and each set of a WHERE source that is a union (an IN list, an OR
@@ -443,7 +475,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * which are the union's own set-up, for 200 groups of 250 rows ANDed with
  * `a = 17 OR b = 3` and with `b IN (3, 4)`.
  */
-#define LION_UNION_SET_COST		(100.0 * cpu_tuple_cost)
+#define LION_UNION_SET_COST		(lion_union_set_cost * cpu_tuple_cost)
 
 /*
  * The fixed cost of one ENTRY of a range-bounded walk (DESIGN.md §28) - the
@@ -458,7 +490,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * 200 values (21 entries, 0.18 ms against btree's 0.9) stays with the node.
  * The unbounded group walk of §10 keeps its own calibration.
  */
-#define LION_RANGE_ENTRY_COST	(40.0 * cpu_tuple_cost)
+#define LION_RANGE_ENTRY_COST	(lion_range_entry_cost * cpu_tuple_cost)
 
 /*
  * ... and of one SMALL entry of a summed range, counted with the rest of its
@@ -467,7 +499,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * share of the union.  Measured on the assert build over the 2M-row repro
  * table: 0.3 to 0.5 us an entry of one row, against 1.5 before.
  */
-#define LION_RANGE_UNION_ENTRY_COST	(12.0 * cpu_tuple_cost)
+#define LION_RANGE_UNION_ENTRY_COST	(lion_range_union_entry_cost * cpu_tuple_cost)
 
 /*
  * The descents a summed walk over a summarized column makes on top of the
@@ -489,7 +521,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * probed container marks are charged LION_AND_MEMBER_COST each, the probe's
  * as a set of LION_RANGE_UNION_ENTRY_COST.
  */
-#define LION_PROBE_STEP_COST	(2.0 * cpu_operator_cost)
+#define LION_PROBE_STEP_COST	(lion_probe_step_cost * cpu_operator_cost)
 
 /*
  * ... and when a walk turns to probing: once it has handed out this many
@@ -531,12 +563,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * binary search of the copy's containers, 100 to 200 ns, measured over
  * 20,000 groups of 219 containers each and 1,000 of 38.
  */
-#define LION_CONTAINER_COST		(8.0 * cpu_operator_cost)
-#define LION_MEMBER_COST		(0.15 * cpu_operator_cost)
+#define LION_CONTAINER_COST		(lion_container_cost * cpu_operator_cost)
+#define LION_MEMBER_COST		(lion_member_cost * cpu_operator_cost)
 #define LION_MEMBER_CAP			1024.0
-#define LION_PROBE_COST			(40.0 * cpu_operator_cost)
-#define LION_MEMORY_PROBE_COST	(30.0 * cpu_operator_cost)
-#define LION_AND_MEMBER_COST	(0.8 * cpu_operator_cost)
+#define LION_PROBE_COST			(lion_probe_cost * cpu_operator_cost)
+#define LION_MEMORY_PROBE_COST	(lion_memory_probe_cost * cpu_operator_cost)
+#define LION_AND_MEMBER_COST	(lion_and_member_cost * cpu_operator_cost)
 
 /*
  * One level of an entry directory descended - a page pinned and locked, a
@@ -546,7 +578,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * 23 shapes (DESIGN.md §27, "Cost, revisited"): 0.6 us a directory page read,
  * median residual 9%.  The page itself is charged separately, as I/O.
  */
-#define LION_DESCENT_COST		(120.0 * cpu_operator_cost)
+#define LION_DESCENT_COST		(lion_descent_cost * cpu_operator_cost)
 
 /*
  * One candidate TID of a heap recheck (DESIGN.md §9): the visibility check of
@@ -564,8 +596,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * answered from the cache), which one cpu_tuple_cost priced at 53,000 for
  * 267 ms.
  */
-#define LION_RECHECK_TID_COST	(1.5 * cpu_tuple_cost)
-#define LION_RECHECK_GROUP_TID_COST	(6.0 * cpu_tuple_cost)
+#define LION_RECHECK_TID_COST	(lion_recheck_tid_cost * cpu_tuple_cost)
+#define LION_RECHECK_GROUP_TID_COST	(lion_recheck_group_tid_cost * cpu_tuple_cost)
 
 /* Which walk a range bounds, for the cost model (DESIGN.md §28). */
 #define LION_RANGED_NONE	0
@@ -5443,7 +5475,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	probed += found * LION_FKJOIN_COUNT_COST;
 	if (npositive > 0)
 	{
-		collected += drive * 2.0 * cpu_operator_cost +
+		collected += drive * LION_FKJOIN_COLLECT_CONTAINER_COST +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
 			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
 		collected += found * (LION_FKJOIN_COPY_COUNT_COST +
@@ -6720,8 +6752,7 @@ lion_fkjoin_sort_cost(double rows, int width)
 	cost = LION_FKJOIN_SORT_COMPARE_COST * n * (log(n) / log(2.0)) +
 		LION_FKJOIN_SORT_KEY_COST * n;
 	if (bytes > work_mem * 1024.0)
-		cost += 2.0 * ceil(bytes / BLCKSZ) *
-			(0.75 * seq_page_cost + 0.25 * random_page_cost);
+		cost += 2.0 * ceil(bytes / BLCKSZ) * LION_FKJOIN_SORT_PAGE_COST;
 	return cost;
 }
 

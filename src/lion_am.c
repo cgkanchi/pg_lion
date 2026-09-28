@@ -47,6 +47,7 @@
 #include "utils/typcache.h"
 
 #include "lion.h"
+#include "lion_costs.h"
 #include "lion_count.h"
 
 #if PG_VERSION_NUM >= 180000
@@ -244,6 +245,13 @@ _PG_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * The cost model's constants (DESIGN.md §31, "The settings"): one setting
+	 * for each, the multiplier of the core cost it is priced in, for
+	 * calibrating the model without a rebuild.
+	 */
+	lion_costs_init();
 
 	/*
 	 * The LionOrdered CustomScan (DESIGN.md §30): its GUC, its scan methods
@@ -765,7 +773,7 @@ lion_cost_qual_is_full(IndexOptInfo *index, int c, Node *cl, bool *all)
  * §14).  One qual that looks keys up is enough to keep the column off the
  * full walk - the scan drops the others and rechecks them.  A range walks
  * only the entries between its bounds, so it never makes the scan a full
- * one; what it costs per entry is lion_range_entry_cost()'s.
+ * one; what it costs per entry is lion_range_walk_cost()'s.
  *
  * *emits_all_rows additionally says whether the CANDIDATES the walk produces
  * are every indexed row, which is what makes the heap side a full recheck
@@ -1068,7 +1076,7 @@ lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
  * A one-column path is prorated by that already and adds nothing.
  */
 static Cost
-lion_range_entry_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
+lion_range_walk_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 {
 	IndexOptInfo *index = path->indexinfo;
 	Cost		cost = 0;
@@ -1272,7 +1280,7 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
  * (lion_cost_col_quals()); a long list outranks a walk; the first column
  * that walks a range walks, and a second one is rechecked; an `IS NOT NULL`
  * walks only when nothing else answers.  Beside another column's sets a
- * range is taken for a WINDOW, as lion_range_entry_cost() takes it: a walk
+ * range is taken for a WINDOW, as lion_range_walk_cost() takes it: a walk
  * too short for one restarts the other columns' stream a few times at most
  * (lion_source_walk_is_long()), each restart in heap order.  No key at all
  * is a partial index read whole, by a walk of column 1 or, when that column
@@ -1397,7 +1405,7 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
  * How many entries a WALK of key column c reads (LION_PLAIN_WALK): the
  * column's n_distinct, or the entries of its range's walk when a range bounds
  * it (lion_cost_walk_entries(), summaries and all) - the same count
- * lion_range_entry_cost() prices the entries by, and the same caveat: it is
+ * lion_range_walk_cost() prices the entries by, and the same caveat: it is
  * the share of the column's values for a column whose rows spread evenly over
  * them.
  */
@@ -1419,6 +1427,13 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 }
 
 /*
+ * The plain scan's own prices below are planner settings (lion_costs.c):
+ * each macro is the multiplier a setting holds - LION_PLAIN_FETCH_ROW_COST is
+ * pg_lion.plain_fetch_row_cost - of the unit its comment names, and each
+ * comment is why the setting's default is what it is.
+ */
+
+/*
  * What a plain scan pays to fetch a row past the first on its heap page, in
  * cpu_tuple_cost, beyond what a bitmap heap scan pays for the same row: an
  * amgettuple call, a buffer lock and a HOT search per row, where the bitmap
@@ -1432,14 +1447,14 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
  * are scattered the plain scan spends 0.5 us a page LESS than the bitmap heap
  * scan (30% less over 25,000 rows at 0.4 a page), which is not credited.
  */
-#define LION_PLAIN_FETCH_ROW_COST	1.0
+#define LION_PLAIN_FETCH_ROW_COST	lion_plain_fetch_row_cost
 
 /*
  * cost_bitmap_tree_node()'s charge for a row's bitmap entry, in
  * cpu_operator_cost: part of the bitmap heap scan's per-row price, which the
  * plain scan is charged as well (lion_plain_heap_correlation()).
  */
-#define LION_BITMAP_ROW_COST		0.1
+#define LION_BITMAP_ROW_COST		lion_bitmap_row_cost
 
 /*
  * What a WALK pays for an entry past the first, in cpu_tuple_cost, beyond what
@@ -1451,7 +1466,7 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
  * 0.35 us an entry more than the bitmap scan, against 55 ns for a row of a
  * sequential scan.
  */
-#define LION_WALK_PASS_COST		5.0
+#define LION_WALK_PASS_COST		lion_walk_pass_cost
 
 /*
  * Does a plain scan whose rows lie on `pages` heap pages compete with a
@@ -1692,7 +1707,7 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
  * answers them.  Two `&&` on one array column are two sets as much as two
  * columns are.  A multi-key query that needs every row is none: the scan
  * drops it beside the others and rechecks it (lion_cost_qual_is_full()).  A
- * range or `IS NOT NULL` is a walk, priced by lion_range_entry_cost(), and
+ * range or `IS NOT NULL` is a walk, priced by lion_range_walk_cost(), and
  * every other qual of a column is left to the heap recheck.
  *
  * Returns how many there are, with their key columns (1-based) in *cols and
@@ -1770,7 +1785,7 @@ lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
  * Cost estimate: the generic estimate, with four corrections and the heap
  * correlation.  A scan that has to walk the whole index is priced as one
  * rather than as the selective lookup its predicate's output selectivity
- * suggests, a range pays for the entries it walks (lion_range_entry_cost()),
+ * suggests, a range pays for the entries it walks (lion_range_walk_cost()),
  * an AND of two sets or more is priced as the count pushdown prices the same
  * sets, from a selectivity the intersection probe may have measured
  * (lion_cost_set_and(), lion_isect_factor()), and a plain index scan's heap
@@ -1864,7 +1879,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			costs.indexSelectivity = 1.0;
 	}
 
-	costs.indexTotalCost += lion_range_entry_cost(root, path, &walkrows);
+	costs.indexTotalCost += lion_range_walk_cost(root, path, &walkrows);
 
 	/*
 	 * The AND of several sets (DESIGN.md §29.11, "One price for the AND of
@@ -1946,7 +1961,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	/*
 	 * A range walked beside other columns reads the postings of its own
 	 * range, which genericcostestimate() prorated by every column's
-	 * selectivity together (lion_range_entry_cost()): charge the rest of
+	 * selectivity together (lion_range_walk_cost()): charge the rest of
 	 * them, a share of the index's pages and a tuple cost each.  The pages
 	 * are those of a walk - directory leaves in key order through their right
 	 * links, which ambuild lays out in that order - so they are charged as
