@@ -4189,6 +4189,13 @@ End, and at the end of each partition's turn.
 `((a = 1) AND (b = 2))`, and - on a partitioned scan, where there is one index per partition - the
 expression alone. A Param is deparsed as `$1` like any other clause value.
 
+**An OR of equalities on one column is no union of leaves** (2026-09-28). `k = 1 OR k = 7`, the
+arms one operator, one collation and one constant type, is the IN list it spells
+(`lion_or_as_array()`) and takes a list's path through everything above and §15: one lookup walk,
+the disjoint sum when it is the only source, the batches past the budget, the list's price. Only
+an OR the list does not answer - another operator, a Param, a second column, a range arm - is an OR
+of leaves as described here. §29.11, "An OR of equalities is its IN list", has why.
+
 **Nested ORs, distributed (2026-09-27).** The structure above is an OR of ANDs of leaves, one level
 deep, because that is what a source's tree is built from. An AND arm with an OR inside it used to
 decline the whole query - and `flag IS NOT TRUE` is one (`flag = false OR flag IS NULL`, §10), so
@@ -10073,7 +10080,10 @@ AND for its own estimates.
   disjoint entries, core's estimate for a multi-key query of several keys, whose sets overlap.
 - **Where it can matter.** Two or more set clauses of one lion index with a value to look up at
   plan time - an equality, an IN list of at most `LION_ISECT_MAX_SETS` values, `IS NULL`, a
-  multi-key query, each with a constant (a Param has none) - on an index that is neither partial
+  multi-key query, each with a constant (a Param has none); since 2026-09-28 in their canonical
+  form (`lion_canonical_clause()`), an OR of equalities on one column as the IN list it spells and
+  a boolean column tested by itself (`NOT flag`) as its equality ("An OR of equalities is its IN
+  list", below) - on an index that is neither partial
   nor hypothetical, of a relation that is not an inheritance parent; and core's estimate of their
   AND at most a third (`LION_ISECT_ERROR`) of the smallest clause's own, which is the most the AND
   can hold. Independent clauses that are both selective pass that test as well; the probe then
@@ -10090,8 +10100,10 @@ AND for its own estimates.
   plain or bitmap path - the Bitmap Index Scan's rows, the heap side of both paths, LionOrdered's
   lion side (§30.3) - and the rows the count pushdown's recheck is priced for
   (`lion_probe_rel_rows()`, the relation's restriction clauses on the lion index that answers most
-  of them). Whatever else a conjunction holds - a range, a clause without a constant - is taken as
-  independent of them, as core takes it.
+  of them), which since 2026-09-28 are also LionOrdered's rows (§30.3), and the merge's guess of
+  how often the AND's later sources are sought ("Wide filters", below). Whatever else a
+  conjunction holds - a range, a clause without a constant - is taken as independent of them, as
+  core takes it.
 - **What it leaves.** `rel->rows`, and every other path's estimate, stay core's. Core sizes the
   relation (`set_baserel_size_estimates()`) before it builds any of its paths; a row count
   rewritten from `set_rel_pathlist_hook` would leave the paths built before it priced for another
@@ -10100,9 +10112,10 @@ AND for its own estimates.
   clauses are attached and before its first path is built, and be allowed to read an index there.
   Core's own answer to correlated columns applies to every path: `CREATE STATISTICS ...
   (dependencies, mcv)` on them corrects core's estimate, and the probe then agrees with it and
-  changes nothing. Nor does the probe correct the merge's guess of how often the later sources are
-  sought (`lion_merge_cpu_cost()`'s `1 - exp(-lambda)`, §22's open item), which still takes the
-  sets as independent; both paths share that guess.
+  changes nothing. *(Until 2026-09-28 the probe did not correct the merge's guess of how often the
+  later sources are sought either - `lion_merge_cpu_cost()`'s `1 - exp(-lambda)`, §22's open item -
+  which took the sets as independent; it does now, for an ungrouped count and a scan, "Wide
+  filters", below. A grouped count's merges still take them as independent.)*
 - **Visibility.** The TIDs are counted whatever their visibility: the probe reads no heap page and
   holds no lock or pin from one container to the next (the sets are located and their pins let go
   of before the first container is read, and the streams copy each posting leaf and release it,
@@ -10114,9 +10127,10 @@ AND for its own estimates.
 - **Bounded.** At most `LION_ISECT_KEYS` (32) driver containers, fewer when the clauses locate
   many sets - `LION_ISECT_SEEKS` (128) seeks of a set in all, each a descent of a posting tree or a
   step to the next leaf - down to `LION_ISECT_MIN_KEYS` (8); at most `LION_ISECT_MAX_SETS` (32)
-  sets located; at most `LION_ISECT_BUFFERS` (256) buffer accesses a probe and
-  `LION_ISECT_RUN_BUFFERS` (1,024) a planner run (`pgBufferUsage`), past which a probe gives up and
-  core's estimate stands, as it does when the heap has outgrown `rel->pages` twice over; at most
+  sets located; at most `LION_ISECT_RUN_BUFFERS` (1,024) buffer accesses a planner run
+  (`pgBufferUsage`), of which a probe may take what is left - until 2026-09-28 at most 256 a
+  probe, `LION_ISECT_BUFFERS`, "Wide filters" below - past which a probe gives up and core's
+  estimate stands, as it does when the heap has outgrown `rel->pages` twice over; at most
   `LION_ISECT_RUN_PROBES` (8) probes a planner run, and each conjunction measured once in it
   (cached beside the endpoint probe's ends, per `PlannerGlobal`). The budget is checked before each
   clause is located and each sample taken, so a probe overruns it by one IN list's lookups or one
@@ -10144,6 +10158,177 @@ going to `LionCount` only with the probe. Without it the lion scan that leaves t
 heap filter and ANDs the other four sets is priced for two rows, a third of the ungrouped count
 and a ninth of the grouped one; with it, at fourteen and four times theirs. The ungrouped count ran
 in 0.2 ms against that scan's 1.2 to 1.7.
+
+**An OR of equalities is its IN list** (2026-09-28, `lion_or_as_array()`, `lion_canonical_clause()`).
+A benchmark wrote one wide filter two ways, each multi-value column as `a = x OR a = y` and as `a IN
+(x, y)`, and the two planned differently, at different prices, and were estimated differently. They
+select the same rows, and where lion answered, priced or measured them they diverged in six places,
+found on a synthetic repro (6M rows, 200 hidden groups each driving nine columns of one lion index
+over seventeen, the filter of one group: four equalities, a boolean among them, four lists of two to
+four values and a three-key `&&` - twenty posting sets, 3,835 rows):
+
+1. **Core's selectivity.** Core estimates the OR as though its arms could overlap, `1 - (1 - s1)(1 -
+   s2)`, and the list as the disjoint entries they are, `s1 + s2`: 15 rows against 22 for the same
+   filter. `rel->rows` is core's and stays so; lion's own estimate of the relation's rows
+   (`lion_probe_rel_rows()`) is now computed as `set_baserel_size_estimates()` computes it, from the
+   list in the OR's place (`lion_rel_canonical_clauses()`), and so is the probe's estimate of the
+   conjunction it measures.
+2. **The probe.** `lion_isect_scankey()` took an equality, a list, `IS NULL` and a multi-key query,
+   no OR - and no boolean column by itself, which is how `flag = false` reaches the restriction
+   clauses (`NOT flag`) while the index path is handed `flag = false`. So the count's rows
+   (`lion_isect_rel_factor()`, over the restriction clauses) were measured on another conjunction
+   than the index path's - 8 clauses against 9, a second probe - and, for the OR form, on 4 of the 9,
+   the ORs left out. Every clause is taken in its canonical form now (`lion_canonical_clause()`):
+   the list for such an OR, `flag = false` for `NOT flag`; on 18 the list core derives for the index
+   and the one lion derives from the restriction are one conjunction of the run's cache (`equal()`),
+   and the filter is measured once whichever form it has.
+3. **The count's price.** An OR's leaves were priced as clauses of their own - a directory leaf at
+   `random_page_cost` and a descent each, their union `members x log2(leaves)` (§19) - and a list as
+   §15 prices it - its leaves in key order at `lion_heap_page_cost()`, a search each,
+   `lion_merge_ops()`, and no union at all where it is summed: 37,379 against 37,406 for the repro's
+   filter, and three to four times apart for a longer list alone (`k` of 200 values, 10 of them:
+   3,177 against 654; `k` of 5,000 values, 1,000 of them: 56,221 against 25,994).
+4. **The count's execution.** An OR's leaves are located one by one, a list's in one walk of the
+   directory: 40 directory pages against 22 for the repro's filter. What the merge ANDs is the same
+   union either way - 27,365 containers visited for both forms, 73 seeks avoided, the same buffers
+   but those directory pages, and the same time (110 to 135 ms warm on PostgreSQL 18, which the
+   shared machine's noise does not separate). A list that is the only source is summed (§15) where
+   the OR was merged; ANDed with anything, both merge.
+5. **The index quals of the plain and bitmap scans.** PostgreSQL 18 matches such an OR to an index
+   column as the list (`match_orclause_to_indexcol()`): an IndexClause whose rinfo is the OR and
+   whose index qual is the list. 16 and 17 match it to nothing but the arms of a BitmapOr, each an
+   index path of one arm and the clauses beside the OR, so the OR form's lion scan left the lists to
+   the heap filter where the IN form's ANDed them. `lion_or_list_paths()` builds the paths 18
+   builds, for the lion indexes only: `create_index_paths()` on a scratch copy of the relation that
+   sees them, with the list in each such OR's place among their restriction clauses and no join
+   clause, as LionOrdered builds its lion side (§30.2); then hands them back, each list's
+   IndexClause pointing to the OR, so that the plan's index condition is the list, its recheck the
+   OR, and neither is left to the filter. The count's own planner and LionOrdered's lion side take
+   the same lists. Not beside a security barrier's or a policy's quals.
+6. **The BitmapOr's arms.** Every arm is an index path of its own, and each was a conjunction to
+   measure: on 18 the OR form's planning measured five - the arms of the ORs with the other lists -
+   and spent the run's budget (1,038 buffers), and the count's own conjunction was refused its probe.
+   An arm of such an OR is its whole list in the probe now (`lion_or_arm_list()`): the conjunction
+   measured is the one with the list in the arm's place, and its factor is applied to core's
+   estimate of the arm's, which is the list's times the arm's share of it. On 18 that is the
+   relation's own conjunction - the OR form measures one conjunction, as the IN form does, 352
+   buffers - and on 16 one conjunction an OR.
+
+Which form executes: the list's, everywhere - its lookups are one walk, its batches bound a list
+past the budget (§15), and alone it is summed. Measured on PostgreSQL 18, LionCount forced, median
+of five, before (the OR's union of leaves) and after (the list's), the IN form's own time beside it:
+
+| query | IN | OR before | OR now |
+|---|---|---|---|
+| `k200 IN (2)` alone | 0.29 ms | 0.59 | 0.24 |
+| `k200 IN (10)` alone | 0.96 | 4.97 | 0.87 |
+| `k200 IN (100)` alone | 10.2 | 10.0 | 10.2 |
+| `k5000 IN (10)` alone | 0.25 | 0.72 | 0.42 |
+| `k5000 IN (300)` alone | 8.0 | 25.4 | 13.0 |
+| `k5000 IN (1000)` alone | 21.7 | 88.3 | 27.9 |
+| `k200 IN (10) AND x = 1` | 10.9 | 10.8 | 11.2 |
+| `k5000 IN (300) AND x = 1` | 30.0 | 31.0 | 24.8 |
+| `k5000 IN (1000) AND x = 1` | 101.6 | 107.9 | 110.1 |
+
+The AND rows do the same work in both forms and differ by the machine's noise (the same query's
+runs spread by 20 to 30% there); the list alone is up to five times faster than the union. On 16
+the same: `k200 IN (10)` alone 6.9 ms as the OR, 0.75 now.
+
+What stays an OR: arms of another operator or constant type, a NULL arm (which eval_const_expressions
+leaves as an OR of a NULL), a Param (core builds an `ARRAY[...]` of them for the index; lion leaves
+the restriction to §19), two columns, a range arm. `test/sql/orlist.sql` pins it: the repro's filter
+and two others in both forms, the same count plan at the same cost on every version, with the probe
+and without; LionOrdered's rows (§30.3) the probe's for both forms, within twice the 287 rows the
+filter holds, where without the probe they are core's product, a hundred times short; and every
+answer - the count, the rows, a GROUP BY, a page - the sequential scan's, for those and for five
+ORs that are no list. On 991c315 the plans and costs differ, the count is the OR's union, and
+LionOrdered is priced for core's product in both forms.
+
+**Wide filters** (2026-09-28). The probe exists for the correlated filters core's product
+underestimates, and the wider such a filter, the more it is off. On the repro the twenty sets
+estimate at 22 rows for 3,835 - and the probe, as it was, gave up on them:
+
+- **What a sample cost.** A seek past the posting leaf in hand stepped right twice before it
+  descended (`LION_POSTING_SEEK_STEPS`), which pays for a target a leaf or two away; the probe's
+  strata are a hundred leaves apart. A sample of twenty sets read 60 to 76 buffers. Sampled streams
+  now descend at once (`lion_stream_far()`): 41.
+- **What a probe could spend.** 256 buffers a probe (`LION_ISECT_BUFFERS`): the locate's 22 (82 on
+  a cold cache) and three or four samples, where `LION_ISECT_MIN_KEYS` is eight. The probe gave up
+  after 204 to 213 buffers, or, where its strata widened to fit, took four samples and applied what
+  they said. A probe may now take what the run has left of `LION_ISECT_RUN_BUFFERS` (1,024), and
+  gives up as soon as it knows it cannot take `LION_ISECT_MIN_KEYS` samples - after its first -
+  leaving what it has not spent to the run's other probes, where it used to read to its budget's end
+  first; and it no longer applies a sample of fewer (four containers of a BitmapOr arm, none of which
+  held a row of the AND, had measured it empty).
+- **Which probe goes first.** Core prices the paths of subsets before the relation's own
+  conjunction is asked about - an index path of the clauses one column answers, the arms of a
+  BitmapOr - and those spent the run's budget first. Before a conjunction is measured, the
+  relation's own - every set clause of its restriction clauses the index answers, the AND the count
+  makes and a scan of every clause makes - is, when it is another (`lion_isect_factor_run()`).
+- **What a conjunction the run could not measure is.** Core's product, as before, unless the run
+  measured others on the same index: then between the largest of them that is a part of it and the
+  smallest it is a part of, geometrically in the number of clauses (`lion_isect_part_factor()`). On
+  16 the repro's five clauses beside the four lists measured a factor of 3.1, all nine 186, and the
+  five with one of the lists 9.1, where this says 8.6.
+- **What the AND costs.** The merge's guess of how often the later sources are sought
+  (`lion_merge_cpu_cost()`, `1 - exp(-lambda)`) took the sets as independent: after five or six of
+  the twenty, the product says the intersection is empty at most keys and the later sources are
+  rarely sought. The repro's merge sought every source at every key the driver produced - 27,365
+  containers for 1,374 keys, 73 seeks avoided. What the probe measured of the AND is spread over the
+  sources after the driver, a share each (isect to the power `1 / (nsrc - 1)`), for an ungrouped
+  count and a scan (`lion_cost_set_and()`); a grouped count's merges still take the sets as
+  independent. The repro's count rises from 37,394 to 39,010.
+
+- **What a few containers can say.** A sample that meets the AND's rows in one or two of its
+  containers says little of how many there are: on the same table loaded group by group, so that
+  each group's rows lie in a stretch of seven container keys, the twenty sets' eight containers met
+  the two matching groups' stretches once, and that container stood for its stratum - 79,790 rows
+  for 3,608. The budget of old gave up before it could say so. Now fewer than
+  `LION_ISECT_MIN_HITS` (3) containers that keep a row of the AND raise no estimate - the
+  conjunction counts as not measured - while one that lowers it stands as it always did, and a
+  sample of every container of the heap is a count, not a sample. The stretched table's narrower
+  conjunctions keep the error a stratified sample of such a heap has: five of the clauses at 66,233
+  rows for 11,385, four at 82,389 for 16,279 (93,000 on 991c315).
+
+After: the twenty sets are measured in 352 buffers (412 on a cold cache), eight samples, at 4,091
+rows for 3,835; the repro's filter widened to thirty-two sets (lists of 8, 8, 6 and 4) in 542 (602
+cold), at 10,570 rows for 10,183. Planning the twenty-set count takes 1.4 ms against 0.2 without the
+probe, every page in shared buffers. The worst case is the run's budget: a probe checks it before it
+locates each clause and before each sample, so a run accesses at most 1,024 buffers and one
+sample's seeks (65 for thirty-two sets) or one list's lookups more, and its eight probes at most.
+`test/sql/orlist.sql`'s wide filter, twenty sets over 400,000 rows, needs 301 to 326 - past the old
+budget of one probe.
+
+Measured on the repro (PostgreSQL 18 and 16, release builds, shared buffers of 256 MB, the heap of
+687 MB in the OS cache, `max_parallel_workers_per_gather` 0; warm: median of 7 to 11 runs, the two
+plans alternating in one session where both can be had by a setting; cold: the cluster restarted and
+the relation's files dropped from the OS cache before each run, three runs each). Every plan that
+changed:
+
+| version, query | before | now | warm, before / now | cold, before / now |
+|---|---|---|---|---|
+| 18, count, OR form | LionCount, OR's leaves | LionCount, the lists | 124 / 124-134 ms (the same work) | |
+| 16, count, IN form | LionCount, or the plain scan of five clauses and a filter (the probe's widened sample decided which) | the plain scan | 102 or 36-44 / 45-57 ms | |
+| 16, count, OR form | BitmapOr of the m4 arms, the other lists filtered | the plain scan, as the IN form | 85 / 44-45 ms | 460-569 / 276-487 ms |
+| 16, rows, OR form | BitmapOr | the plain scan | 66 / 42-45 ms | |
+| 16, page (`ORDER BY ts LIMIT 100`), IN form | lion scan and Sort | LionOrdered | 44.3 / 50.3 ms | 591-621 / 108-136 ms |
+| 16, page, OR form | BitmapOr and Sort | LionOrdered | 79 / 41-55 ms | |
+| 18, page, both forms | lion scan and Sort | LionOrdered | 114-117 / 124-139 ms | 461-639 / 449-1000 ms (medians 471 / 495) |
+| 18, page, eight clauses (5,512 rows) | lion scan and Sort | LionOrdered | 131 / 133 ms | 534 / 201 ms |
+| 18, page, seven clauses (12,376 rows) | lion scan and Sort | LionOrdered | 142 / 128 ms | 870 / 201 ms |
+
+The one that is not better is 18's page of the nine clauses, a draw cold and 6 to 20% slower warm:
+LionOrdered ANDs the twenty sets as the lion scan does, walks the btree, and its executor switches to
+fetch and sort (§30.4) after 120,160 entries with 80 of the 100 rows met - 32 entries a member not
+yet met, 3,755 of them - so it fetches what the lion scan fetches, after the walk. The switch
+comes before the LIMIT wherever the members are fewer than about `sqrt(LIMIT x entries walked /
+32)`, 4,300 here; a filter of more members than that for its table - the eight- and seven-clause
+pages above - is walked to its LIMIT, and fetches 100 rows where the lion scan fetches thousands.
+Pricing the switch where the LIMIT's walk would pass it was tried and left out: it reads the
+members from the same estimate, and with the probe off, core's product put the five-clause page's
+11,700 rows at 3,509, predicted a switch that does not happen, and sent the page to the btree walk
+with a heap filter - 202 ms against 40 for LionOrdered. The switch bounds what a wrong bet costs,
+and the model does not second-guess it.
 
 **A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
 in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
@@ -10510,6 +10695,19 @@ are corrected by the probe, and their plans are the ones pinned already; `ordere
 LionOrdered, the one plan that moved, moved with the price (§29.11, "One price for the AND of
 sets").
 
+`test/sql/orlist.sql` (2026-09-28, §29.11 "An OR of equalities is its IN list" and "Wide
+filters"), on 400,000 rows in 100 hidden groups that take turns over the heap, nine columns
+following the group seven times in ten: a filter of twenty sets - four equalities with a boolean,
+four lists, a multi-key `&&` - a list alone and two lists beside an equality, each as lists and as
+ORs; the count's plan and cost the same for both forms with the probe and without it; LionOrdered's
+rows for both forms the probe's, within twice the filter's 287 rows, and without the probe a
+hundred times short; and every answer - the count, the rows, a GROUP BY, a page - the sequential
+scan's, for those and for five ORs that are no list. Its expected output is the same on 16 and 18,
+and on 991c315 every plan, cost and row check of it fails and every answer passes. No other
+expected output moved on 16, 17, 18 or 19, in either WAL mode: the suite's ORs are across columns
+or not of constants, its probed conjunctions fit the old budget, and the merge's correction moves
+no pinned plan.
+
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
 One million rows of the benchmark's scalar table (`bench/comprehensive/workloads.py`,
@@ -10612,7 +10810,8 @@ qualifying relation the hook runs after core has built the relation's paths, and
    lion bitmap scan would.
 3. **One CustomPath per (ordered path, lion access)** pair, each offered to `add_path()`, which
    keeps whichever of them is not dominated in start-up or total cost at those pathkeys. The path
-   carries the ordered path's `pathkeys`, `rows = rel->rows`, `param_info = NULL`,
+   carries the ordered path's `pathkeys`, `rows` = lion's estimate of the relation's rows
+   (`lion_probe_rel_rows()`, §30.3), `param_info = NULL`,
    `pathtarget = rel->reltarget`, `parallel_safe = false` and
    `flags = CUSTOMPATH_SUPPORT_PROJECTION`: no backward scan (a SCROLL cursor gets a Material),
    no mark/restore (a merge join restores through a Material).
@@ -10665,7 +10864,15 @@ ordered path's selectivity `s_o` (the fraction of the index its own quals leave)
   index's index clauses and a lion AND-path leaf's (`g = 5` over a btree on `(g, k)` and a lion
   index on `g`) is counted once: `s` is divided by its selectivity, since the walk already met
   only entries that satisfy it;
-- **total** = start-up + walk + heap; rows = `rel->rows`.
+- **total** = start-up + walk + heap; rows = lion's estimate of the relation's rows,
+  `lion_probe_rel_rows()`: `rel->rows` - computed from an OR of equalities as the IN list it
+  spells - times what the intersection probe measured of the set clauses among the relation's
+  restriction clauses (§29.11, "Correlated sets"), as the lion side's `s` already was. *(Until
+  2026-09-28 `rel->rows`: core's product of the clauses' selectivities, which for a correlated
+  filter is a few rows where it holds thousands. Core's LIMIT planning takes the share of the run
+  cost a LIMIT needs from the path's rows, so a page of such a filter was charged the node's whole
+  walk - `rows` below the LIMIT - and went to the lion scan and Sort that fetch every one of its
+  rows. §29.11, "Wide filters", has what that changes on the repro there.)*
 
 *(Fixed 2026-09-25, second review: `F` was `s_o T s` whatever the two sides shared, so for
 `WHERE g = 5 ORDER BY k` over those two indexes the walk's 10,100 members were priced as 102

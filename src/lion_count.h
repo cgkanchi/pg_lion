@@ -790,6 +790,15 @@ extern const LionContainer *lion_stream_next(LionSetStream *st);
 extern const LionContainer *lion_stream_at(LionSetStream *st, uint32 target);
 
 /*
+ * The stream's targets lie far apart - a sample's strata, each many posting
+ * leaves past the last: a seek past the leaf in hand descends the posting
+ * tree at once, rather than stepping right first (LION_POSTING_SEEK_STEPS),
+ * which only pays for a target a leaf or two away.  Before the first
+ * container is asked for.
+ */
+extern void lion_stream_far(LionSetStream *st);
+
+/*
  * A bitset image of one container key's whole range (LION_BITSET_WORDS
  * words), which lion_container_or_into_bitset() ORs containers into: turn it
  * back into a container in the smallest representation (dest has
@@ -1186,7 +1195,7 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
  */
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,
-								  double tuples, double *probes);
+								  double tuples, double isect, double *probes);
 
 /*
  * The AND of the posting sets of n clauses of one relation (DESIGN.md §29.11,
@@ -1215,7 +1224,7 @@ typedef struct LionAndCost
 
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
-							  Node **clauses, LionAndCost *out);
+							  Node **clauses, double isect, LionAndCost *out);
 extern double lion_containers_for(double heap_pages, double members);
 extern double lion_index_column_posting_share(PlannerInfo *root,
 											  RelOptInfo *rel,
@@ -1254,6 +1263,13 @@ extern void lion_probe_end(void);
 extern double lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel);
 
 /*
+ * What the intersection probe found of rel's own restriction clauses: the
+ * factor lion_probe_rel_rows() applies, 1 where it measured nothing that
+ * differs from core's estimate.
+ */
+extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
+
+/*
  * The intersection probe (DESIGN.md §29.11, "Correlated sets"): what lion's
  * estimate of a conjunction holding the n set clauses - on key columns
  * cols[] (1-based) of lion index idx of rel - is to be multiplied by, 1 when
@@ -1264,6 +1280,27 @@ extern PGDLLIMPORT bool lion_enable_intersection_probe;
 extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, int n,
 								const AttrNumber *cols, Node **clauses);
+
+/*
+ * One form for one filter (DESIGN.md §29.11, "An OR of equalities is its IN
+ * list"): an OR of equalities on one expression with constants - one
+ * operator, collation and constant type - as the `expr = ANY (array)` it
+ * spells, or NULL; and a restriction clause as lion's estimates take it,
+ * that list for such an OR and `col = true` / `col = false` for a boolean
+ * column tested by itself, bare otherwise.
+ */
+extern Node *lion_or_as_array(Node *clause);
+extern Node *lion_canonical_clause(Node *clause);
+#if PG_VERSION_NUM < 180000
+
+/*
+ * PostgreSQL 16 and 17: the unparameterized paths of rel's lion indexes
+ * lionidx that answer such an OR as that list, as 18's own index matching
+ * builds them (DESIGN.md §29.11, "An OR of equalities is its IN list").
+ */
+extern List *lion_or_list_paths(PlannerInfo *root, RelOptInfo *rel,
+								List *lionidx);
+#endif
 extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
 								double loop_count, Cost *indexStartupCost,
 								Cost *indexTotalCost,
