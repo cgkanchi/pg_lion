@@ -8171,9 +8171,10 @@ filter an eight-value IN list collected once:
       ...
       Fact Filter Copy File Reads: 0
 
-and at a `work_mem` of 64 kB, where the same copy spills, `Fact Filter Copies Spilled: 1` with
-file reads no more than the keys' containers and temporary blocks read no more than those reads and
-one.
+and, for a filter whose rows alternate - `x IN (0, 1, 3, 5, 7)`, a copy of 27 bitsets, where the
+eight values' runs of rows above are run containers that fit in 64 kB - at a `work_mem` of 64 kB,
+where that copy spills, `Fact Filter Copies Spilled: 1` with file reads no more than the keys'
+containers and temporary blocks read no more than those reads and one.
 
 ### The per-key path, end to end (2026-09-28)
 
