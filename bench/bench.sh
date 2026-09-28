@@ -1,8 +1,24 @@
 #!/bin/bash
 S=${SCRATCH:?set SCRATCH to the directory holding pginst/ and q/}
 B=$S/pginst/bin; Q=$S/q; LOG=$S/bench_plans.log; RES=$S/bench_results.txt
-# the launcher (bench/lib.sh) sets the endpoint; these defaults only apply when bench.sh is run by hand
-export PGHOST=${PGHOST:-/tmp/claude-1000/pgsk} PGPORT=${PGPORT:-54329} PGUSER=${PGUSER:-postgres} PGDATABASE=${PGDATABASE:-postgres}
+# valid() and invalid() below write pg_index.indisvalid, so this runs only as
+# the child of a launcher (run_bench.sh, rerun_pushdown.sh,
+# run_container_bits_experiment.sh) whose bench_start_cluster (bench/lib.sh)
+# started the benchmark cluster on a private endpoint, checked SHOW
+# data_directory and recorded which fact_% indexes were already invalid.  It
+# exports that; there is no default endpoint to fall back on, and the data
+# directory is checked again here before anything else is run.
+if [ "${BENCH_VERIFIED:-0}" != 1 ] || [ "${BENCH_CAPTURED:-0}" != 1 ] || [ -z "${BENCH_DATA:-}" ] ||
+   [ -z "${PGHOST:-}" ] || [ -z "${PGPORT:-}" ]; then
+  echo "bench.sh: no verified benchmark cluster; run it through a launcher that uses bench/lib.sh's bench_start_cluster, never by hand" >&2
+  exit 1
+fi
+export PGUSER=${PGUSER:-postgres} PGDATABASE=${PGDATABASE:-postgres}
+actual=$($B/psql -X -tA -c "show data_directory" 2>/dev/null || true)
+if [ -z "$actual" ] || [ "$(cd "$actual" 2>/dev/null && pwd)" != "$BENCH_DATA" ]; then
+  echo "bench.sh: $PGHOST:$PGPORT serves data_directory '$actual', not the verified benchmark cluster $BENCH_DATA; refusing to run" >&2
+  exit 1
+fi
 T=${T:-5}
 # ONLY="1 2b 2c" runs a subset of phases; default all
 only() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
@@ -13,8 +29,13 @@ run() { local name="$1" opts="$2" f="$Q/$3"
   lat=$(PGOPTIONS="$opts" $B/pgbench -n -M prepared -T $T -f $f 2>&1 | grep 'latency average' | awk '{print $4}')
   printf "%-28s %12s ms\n" "$name" "$lat" | tee -a $RES
 }
+# valid() never validates an index that was already invalid when the run
+# began (BENCH_ORIG_INVALID, quoted names from bench_start_cluster): someone
+# left it that way on purpose, and the exit trap leaves it alone too.
 valid()   { # usage: valid btree|gin|roaring
-   $B/psql -X -q -c "update pg_index set indisvalid = true  where indexrelid::regclass::text like 'fact\_%\_$1'"; }
+   local excl=""
+   [ -n "${BENCH_ORIG_INVALID:-}" ] && excl="and indexrelid::regclass::text not in ($BENCH_ORIG_INVALID)"
+   $B/psql -X -q -c "update pg_index set indisvalid = true  where indexrelid::regclass::text like 'fact\_%\_$1' $excl"; }
 invalid() { $B/psql -X -q -c "update pg_index set indisvalid = false where indexrelid::regclass::text like 'fact\_%\_$1'"; }
 $B/psql -X -q -c "select count(pg_prewarm(c.oid)) from pg_class c where relname like 'fact_%' and relname not like 'fact_tids%' or relname like 'rb_%' or relname = 'vm_mask' or relname = 'fact'" >/dev/null
 BIT="-c enable_seqscan=off -c enable_indexonlyscan=off -c enable_indexscan=off"

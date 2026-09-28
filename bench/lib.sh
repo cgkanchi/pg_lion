@@ -7,8 +7,17 @@
 # socket directory and port that nothing else uses, fail if it does not start,
 # verify SHOW data_directory before the first statement, stop it on exit if we
 # started it, and put every fact_% index back to indisvalid = true on exit.
+#
+# bench.sh, which flips indisvalid, runs as a child of a launcher: it refuses
+# to run unless bench_start_cluster() has exported BENCH_VERIFIED=1 and the
+# data directory it verified, and checks that directory again itself.
+#
+# The socket directory is BENCH_SOCKDIR if the caller names one; otherwise a
+# private one that mktemp -d makes under $TMPDIR (else /tmp) and that the exit
+# trap removes.
 
-BENCH_SOCKDIR=${BENCH_SOCKDIR:-/tmp/claude-1000/pgsk_bench}
+BENCH_SOCKDIR=${BENCH_SOCKDIR:-}
+BENCH_SOCKDIR_OWN=""     # the socket directory mktemp made for this run
 BENCH_PORT=${BENCH_PORT:-54331}
 BENCH_STARTED=0          # we started the postmaster and must stop it
 BENCH_VERIFIED=0         # SHOW data_directory matched the requested directory
@@ -33,6 +42,15 @@ bench_restore_indexes() {
 	bench_psql -c "update pg_index set indisvalid = true where indexrelid::regclass::text like 'fact\\_%' and not indisvalid $excl" >/dev/null 2>&1 || true
 }
 
+# Remove the socket directory mktemp made, and nothing else: only a path of
+# the shape it was made with.
+bench_remove_sockdir() {
+	case $BENCH_SOCKDIR_OWN in
+		*/lion_bench_sock.??????) rm -rf -- "$BENCH_SOCKDIR_OWN" ;;
+	esac
+	BENCH_SOCKDIR_OWN=""
+}
+
 bench_cleanup() {
 	local rc=$?
 	trap - EXIT
@@ -40,7 +58,30 @@ bench_cleanup() {
 		bench_restore_indexes
 		"$BENCH_PREFIX/bin/pg_ctl" -D "$BENCH_DATA" stop -m fast >/dev/null 2>&1 || true
 	fi
+	bench_remove_sockdir
 	exit $rc
+}
+
+# The socket directory: BENCH_SOCKDIR if the caller named one, else a private
+# mktemp -d one (mode 0700, a name nobody else has).  A Unix-domain socket
+# path is limited to ~107 bytes, so a TMPDIR too deep for one falls back to
+# /tmp.
+bench_make_sockdir() {
+	if [ -n "$BENCH_SOCKDIR" ]; then
+		mkdir -p -m 0700 -- "$BENCH_SOCKDIR" ||
+			{ echo "cannot create the socket directory $BENCH_SOCKDIR" >&2; exit 1; }
+		return 0
+	fi
+	BENCH_SOCKDIR=$(mktemp -d "${TMPDIR:-/tmp}/lion_bench_sock.XXXXXX") ||
+		{ echo "mktemp -d for the socket directory failed" >&2; exit 1; }
+	if [ "${#BENCH_SOCKDIR}" -gt 80 ]; then
+		rmdir -- "$BENCH_SOCKDIR"
+		BENCH_SOCKDIR=$(mktemp -d /tmp/lion_bench_sock.XXXXXX) ||
+			{ echo "mktemp -d for the socket directory failed" >&2; exit 1; }
+	fi
+	[ -n "$BENCH_SOCKDIR" ] && [ -d "$BENCH_SOCKDIR" ] ||
+		{ echo "mktemp -d returned no directory" >&2; exit 1; }
+	BENCH_SOCKDIR_OWN=$BENCH_SOCKDIR
 }
 
 # bench_start_cluster <prefix> <datadir>
@@ -50,19 +91,20 @@ bench_cleanup() {
 # catalog writes are gated on the identity check below.
 bench_start_cluster() {
 	BENCH_PREFIX=$1; BENCH_DATA=$(cd "$2" && pwd)
-	mkdir -p "$BENCH_SOCKDIR"
-	export PGHOST=$BENCH_SOCKDIR PGPORT=$BENCH_PORT PGUSER=postgres PGDATABASE=postgres
 	if "$BENCH_PREFIX/bin/pg_ctl" -D "$BENCH_DATA" status >/dev/null 2>&1; then
 		echo "cluster at $BENCH_DATA is already running; refusing to guess its endpoint" >&2
 		exit 1
 	fi
+	bench_make_sockdir
+	export PGHOST=$BENCH_SOCKDIR PGPORT=$BENCH_PORT PGUSER=postgres PGDATABASE=postgres
 	if [ -S "$BENCH_SOCKDIR/.s.PGSQL.$BENCH_PORT" ]; then
 		echo "something already listens on $BENCH_SOCKDIR:$BENCH_PORT; refusing to share the endpoint" >&2
 		exit 1
 	fi
 	"$BENCH_PREFIX/bin/pg_ctl" -D "$BENCH_DATA" -l "$BENCH_DATA/../bench_pg.log" \
 		-o "-p $BENCH_PORT -k $BENCH_SOCKDIR -c listen_addresses=''" -w start >/dev/null 2>&1 \
-		|| { echo "could not start the benchmark cluster at $BENCH_DATA (see $BENCH_DATA/../bench_pg.log)" >&2; exit 1; }
+		|| { echo "could not start the benchmark cluster at $BENCH_DATA (see $BENCH_DATA/../bench_pg.log)" >&2
+			 bench_remove_sockdir; exit 1; }
 	BENCH_STARTED=1
 	trap bench_cleanup EXIT
 	local actual
@@ -77,12 +119,17 @@ bench_start_cluster() {
 		exit 1
 	fi
 	BENCH_CAPTURED=1
+	# What bench.sh, a child, needs to check that it runs against this
+	# cluster and to leave the already-invalid indexes alone.
+	export BENCH_VERIFIED BENCH_CAPTURED BENCH_DATA BENCH_ORIG_INVALID
 }
 
 # bench_build_extension <prefix> <project dir>  -> builds a clean copy against <prefix>
 bench_build_extension() {
 	local prefix=$1 p=$2 b
-	b=$(mktemp -d /tmp/claude-1000/lion_bench_build.XXXX)
+	b=$(mktemp -d "${TMPDIR:-/tmp}/lion_bench_build.XXXXXX") ||
+		{ echo "mktemp -d for the build directory failed" >&2; exit 1; }
+	[ -n "$b" ] && [ -d "$b" ] || { echo "mktemp -d returned no directory" >&2; exit 1; }
 	cp -r "$p/src" "$p/Makefile" "$p"/pg_lion*.control "$p"/pg_lion*--*.sql "$b/"
 	rm -f "$b"/src/*.o "$b"/src/*.bc "$b"/*.so   # never reuse objects built against another server
 	mkdir -p "$b/test/sql" "$b/test/isolation"
