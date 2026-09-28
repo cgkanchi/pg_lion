@@ -96,7 +96,12 @@ def video(build, jobs):
 
 
 def mux(build):
-    """Join the rendered parts with the narration, captions and chapters."""
+    """Join the rendered parts with the narration, captions and chapters.
+
+    The parts are near-lossless intermediates; the one encode here is sized for the web (about
+    14 MB for the whole video: flat graphics compress well, and the narration is 24 kHz speech).
+    No -shortest: it counts the subtitle track, which ends with the last caption.
+    """
     out = os.path.join(build, "pg_lion_explained.mp4")
     subprocess.check_call([FFMPEG, "-y", "-loglevel", "error",
                            "-f", "concat", "-safe", "0", "-i", os.path.join(build, "parts.txt"),
@@ -104,9 +109,11 @@ def mux(build):
                            "-i", os.path.join(build, "captions.srt"),
                            "-i", os.path.join(build, "chapters.txt"),
                            "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map_metadata", "3", "-map_chapters", "3",
-                           "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+                           "-c:v", "libx264", "-preset", "slower", "-crf", "24", "-tune", "animation",
+                           "-pix_fmt", "yuv420p", "-g", str(FPS * 8),
+                           "-c:a", "aac", "-b:a", "56k", "-ar", "24000",
                            "-c:s", "mov_text", "-metadata:s:s:0", "language=eng",
-                           "-movflags", "+faststart", "-shortest", out])
+                           "-movflags", "+faststart", out])
     print(out)
 
 
