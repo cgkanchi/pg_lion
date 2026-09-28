@@ -8538,6 +8538,27 @@ lion_stream_next(LionSetStream *st)
 	return st->cursor.valid ? st->cursor.cur : NULL;
 }
 
+const LionContainer *
+lion_stream_at(LionSetStream *st, uint32 target)
+{
+	if (st->empty)
+		return NULL;
+
+	/*
+	 * Standing on a container already handed out is standing on it still:
+	 * the seek moves the cursors past every key below target, and nothing
+	 * else.
+	 */
+	if (st->cursor.valid && st->cursor.ckey < target)
+	{
+		lion_ecursor_seek(&st->cursor, target);
+		CHECK_FOR_INTERRUPTS();
+	}
+	st->first = false;
+
+	return st->cursor.valid ? st->cursor.cur : NULL;
+}
+
 void
 lion_stream_end(LionSetStream *st)
 {

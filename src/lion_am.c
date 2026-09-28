@@ -232,6 +232,20 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §29.11, "Correlated sets": whether lion's own estimates of a
+	 * conjunction of set clauses on one lion index may be measured from the
+	 * index when core's product of their selectivities may be far off.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_intersection_probe",
+							 "Measures conjunctions of lion-indexed clauses from the index for lion's own cost estimates.",
+							 "Off, lion prices its paths with the planner's product of the clauses' selectivities.",
+							 &lion_enable_intersection_probe,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * The LionOrdered CustomScan (DESIGN.md §30): its GUC, its scan methods
 	 * and the set_rel_pathlist_hook that offers it, chained like the other.
 	 */
@@ -1758,9 +1772,10 @@ lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
  * rather than as the selective lookup its predicate's output selectivity
  * suggests, a range pays for the entries it walks (lion_range_entry_cost()),
  * an AND of two sets or more is priced as the count pushdown prices the same
- * sets (lion_cost_set_and()), and a plain index scan's heap side is priced by
- * the correlation: for a scan in heap order, the bitmap heap scan's price for
- * the same pages and the plain scan's per-row work
+ * sets, from a selectivity the intersection probe may have measured
+ * (lion_cost_set_and(), lion_isect_factor()), and a plain index scan's heap
+ * side is priced by the correlation: for a scan in heap order, the bitmap
+ * heap scan's price for the same pages and the plain scan's per-row work
  * (lion_plain_heap_correlation()), otherwise the column's correlation as
  * btree's is (lion_index_correlation(), DESIGN.md §29.11); a bitmap path,
  * which shares this estimate, does not read that last number.  With
@@ -1863,6 +1878,12 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * (cpu_index_tuple_cost), and the quals' arguments.  A nested loop's inner
 	 * scan repeats the AND, and its pages are spread over the repetitions as
 	 * genericcostestimate() spreads its own (index_pages_fetched()).
+	 *
+	 * The selectivity is corrected first, by what the intersection probe
+	 * measured of the same sets ("Correlated sets"): a factor on core's
+	 * estimate, 1 unless the probe found it three times off or more.  It
+	 * moves the TIDs charged here and everything priced from the selectivity:
+	 * the heap side of a plain or bitmap path, and LionOrdered's lion side.
 	 */
 	if (!fullscan)
 	{
@@ -1878,11 +1899,27 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			Cost		setcost;
 			Cost		pagecost = lion_generic_page_cost(root, path, loop_count,
 														  &costs);
+			double		factor;
 			int			i;
 
 			setidx = (IndexOptInfo **) palloc(sizeof(IndexOptInfo *) * nsets);
 			for (i = 0; i < nsets; i++)
 				setidx[i] = index;
+
+			factor = lion_isect_factor(root, index->rel, index, nsets, setcols,
+									   (Node **) setquals);
+			if (factor != 1.0)
+			{
+				Selectivity sel = Min(costs.indexSelectivity * factor, 1.0);
+				double		tuples = rint(sel * index->rel->tuples /
+										  Max(costs.num_sa_scans, 1.0));
+
+				tuples = Max(Min(tuples, index->tuples), 1.0);
+				costs.indexTotalCost += (tuples - costs.numIndexTuples) *
+					costs.num_sa_scans * cpu_index_tuple_cost;
+				costs.numIndexTuples = tuples;
+				costs.indexSelectivity = sel;
+			}
 
 			setcost = lion_cost_set_and(root, index->rel, nsets, setidx,
 										setcols, (Node **) setquals, &setand);
