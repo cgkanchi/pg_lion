@@ -7163,9 +7163,9 @@ Formerly the §23 backlog item of the same name; the semi and anti joins (`EXIST
 EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`,
 parallel plans and the forward semi join over a non-unique key after them; the lookups in key order
 on 2026-09-28, and after them what a key's time is made of, the per-key path and the cost of a key
-("Where a key's time goes" and the two sections after it), and counts beside the aggregates that
-need the dimension rows ("Every aggregate over the node's rows"). The shape is the
-star-schema aggregate
+("Where a key's time goes" and the two sections after it), counts beside the aggregates that
+need the dimension rows ("Every aggregate over the node's rows"), and a GROUP BY of the join key,
+the fact's or the dimension's ("Grouped by the join key"). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -7245,7 +7245,11 @@ case-insensitive collation unique. Lifting the rule is a costing change, not a c
 The proof is therefore a COSTING AND SCOPE GUARD ONLY, and nothing about correctness rests on it
 (2026-09-23 review): because the per-dimension-row sum is exact with duplicates, a unique index that
 is later dropped, becomes invalid, or is deferrable and violated inside the current transaction can
-make the node do more lookups than it was priced for, never give a wrong answer.
+make the node do more lookups than it was priced for, never give a wrong answer. The one exception
+is a GROUP BY of the key, whose Agg takes each of the node's rows as a group of its own ("Grouped
+by the join key"): it relies on the proof as core's unique inner join relies on its own, and with
+the same guarantees - an index that is valid, enforced immediately and not partial when the plan is
+made, and whose DROP invalidates the plan.
 
 It guards the inner join only. A semi join's count is not a sum over join pairs, and the forward
 one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
@@ -7319,7 +7323,8 @@ that `lion_collect_targets()` finds and checks the fk index for it like any clau
 in what it lets through the target list:
 
 - the grouped target and the HAVING may reference only dimension Vars (in any non-volatile
-  expression) and count aggregates: `count(*)`, and `count(x)` where `x` is a non-NULL constant or
+  expression), the fact's join column where it stands for the dimension's key ("Grouped by the
+  join key"), and count aggregates: `count(*)`, and `count(x)` where `x` is a non-NULL constant or
   either side of the join key (non-NULL in every joined row). Other aggregates, window functions,
   SRFs, grouping sets and row marks decline, as for a single table, and so does a DISTINCT
   aggregate but the `count(DISTINCT)` of "count(DISTINCT)" below, which takes a path of its own -
@@ -7741,9 +7746,8 @@ Why it is the join's answer:
   clause's - all of `d`'s fact values are one distinct value, and `d.pk` is it; so the node emits
   `d.pk` where the aggregate reads `f.fk`, which needs the two to be of one type (an `int4` fk
   against an `int8` key declines). The DISTINCT sees equality, never a representation, so §10's
-  value-representation rule has nothing to ask; the fact's key is accepted only as the argument of
-  such a count, and in the target list or a GROUP BY, where it would be printed, it declines as
-  before.
+  value-representation rule has nothing to ask. In the target list or a GROUP BY, where it is
+  printed, the fact's key is taken under that rule as well ("Grouped by the join key").
 - **Uniqueness is not needed for the answer.** Two dimension rows with one key are two rows whose
   equal keys the DISTINCT collapses, as it collapses the join's pairs. (An earlier version of this
   section held that it would make uniqueness a correctness premise; that is true of counting the
@@ -8035,8 +8039,9 @@ with `LION_JOINFLAG_UNIQUE`. What the query above the EXISTS can name is the fac
 `count(1)`, `count(f.fk)` (a matched row's key is not NULL) and `count(DISTINCT f.fk)`, whose rows
 ("count(DISTINCT)") are then one per distinct key with a match, carrying the key - and, since "Every
 aggregate over the node's rows", its count too when a count stands beside it. A GROUP BY can only
-be of fact columns, which no FK-side join puts in its output ("Declined"), and declines; so does the
-anti join the other way round, `NOT EXISTS` over the fact's rows, which would count the fact rows
+be of fact columns, which no FK-side join puts in its output ("Declined"), and declines - but for
+the key itself, each distinct key a group of its own ("Grouped by the join key"); so does the anti
+join the other way round, `NOT EXISTS` over the fact's rows, which would count the fact rows
 WITHOUT a match.
 
 **A sort in the node, not core's unique-ification as the child.** Core's path for it is
@@ -8687,7 +8692,9 @@ So when any aggregate of the query needs the rows, every aggregate is answered o
   count of a column, which as it stands it is.
 - **GROUP BY and HAVING** are the Agg's, as for `count(DISTINCT)`: sorted by the group pathkeys
   when a DISTINCT needs them, and - when no aggregate is a DISTINCT one and the GROUP BY hashes -
-  also hashed over the rows as they come, which needs no Sort; the cost model chooses.
+  also hashed over the rows as they come, which needs no Sort; the cost model chooses. Grouped by
+  the join key, each row is a group and the Agg neither sorts nor hashes ("Grouped by the join
+  key").
 
 **The aggregates that add n up.** Two are wanted: one with count's answer, an int8 that is 0 over no
 rows, and one with sum's, NULL over no rows. They are the extension's own, in pg_lion--0.1.sql:
@@ -8769,6 +8776,134 @@ the Sort and the Agg over a few hundred rows add a few units to either.
 prints as `lion_join_count((PARTIAL count(*))) FILTER (WHERE (d.name IS NOT NULL))` and
 `sum(d.small)` as `lion_join_sum((d.small * (PARTIAL count(*))))`.
 
+### Grouped by the join key (2026-09-28)
+
+A benchmark counts the join pairs per key, and then aggregates the per-key counts:
+
+    WITH a AS (SELECT d.pk FROM dim d WHERE <d filters>),
+    n AS (SELECT f.fk, count(*) AS n FROM fact f JOIN a ON a.pk = f.fk
+          WHERE <f filters> GROUP BY f.fk)
+    SELECT count(*) AS keys, sum(LEAST(n, 3)) AS capped FROM n
+
+Both CTEs are inlined. `a` is pulled up into the join, and `n`, which has a GROUP BY, stays a
+subquery that is planned on its own; its UPPERREL_GROUP_AGG is where the node is offered, as for any
+grouped join of two tables. The outer level is an ordinary aggregate over the subquery's rows.
+`GROUP BY f.fk` with `count(*)` is exactly the node's count per dimension row: one group per
+dimension row that joins. Before this change, the query with `GROUP BY a.pk` (the dimension's key)
+was pushed down: partial counts, with a Finalize HashAggregate over them that hashed as many groups
+as it had rows. As written, with `GROUP BY f.fk`, it was not pushed down, because a fact column in
+the output declined ("Declined in v1"). `GROUP BY f.fk, d.pk` declined too, in either order: core
+keeps one of the two as the group key, since the join's equivalence class makes the other redundant,
+but the target still names the fact's column.
+
+**The fact's key stands for the dimension's.** The rule is `lion_fkjoin_agg_is_distinct()`'s, with
+the grouping column in place of the DISTINCT argument (`lion_fkjoin_fk_groups_ok()`):
+
+- an inner join, or the forward semi join over its distinct keys;
+- one type on both sides;
+- a grouping equality compatible with the join operator;
+- the join's collation.
+
+Under those conditions the fact values a dimension row joins make one group, and the node emits the
+row's key where the fact's column stands (`lion_plan_fkjoin_path()`, as it does for the DISTINCT). A
+GROUP BY prints its column, and a DISTINCT does not, so one more condition applies
+(`lion_fkjoin_fk_is_key()`). The key has to BE each fact value it stands for, not only equal to it:
+the join operator has to be the type's own equality, and that equality has to imply an identical
+representation under the join's collation. That is §10's value-representation rule,
+`lion_type_equalimage()`. numeric's 1.0 and 1.00 are one group and print differently. If the node
+emitted the dimension's 1.00 for a group whose fact rows all hold 1.0, it would print a value that
+no fact row has. So a numeric key declines (tested), and so do citext, text under a nondeterministic
+collation, bpchar and the floats. An expression of the column (`GROUP BY f.fk + 1`) declines. An
+expression that the target computes from the grouped column (`SELECT f.fk + 1 ... GROUP BY f.fk`) is
+the Agg's. With the fact's key grouped, the node emits partial counts, or rows with any of the
+aggregates "Every aggregate over the node's rows" answers. min and max of the key still decline; the
+dimension's key answers those.
+
+**Each row a group.** When the grouping key is one the node's rows never repeat, each row is a group
+of its own (`lion_fkjoin_groups_per_row()`). There are three such keys:
+
+- the dimension's key of an inner join, which `lion_column_is_unique()` proved unique under the
+  join's equality and collation when the join was recognised;
+- the dimension's key of a reverse semi join, where the same proof holds;
+- the fact's key standing for the dimension's. An inner join emits each dimension row's key once.
+  The forward semi join emits each of its DISTINCT keys once, having made them distinct itself.
+
+In each case the key has to be grouped by an equality compatible with the join operator, under the
+join's collation. Other grouping columns beside the key change nothing. No inner or semi join
+emits a NULL key. An anti join's rows can hold several NULL keys, which form one group, so the anti
+join is not asked. When each row is a group, the Agg above the node is AGG_SORTED over the node as
+it is, with no Sort under it. This applies both to the Finalize Agg over partial counts and to the
+plain Agg over rows. A sorted Agg compares each row with the one before it, and when no two rows
+belong to one group, every row starts a group of its own, whatever their order. The Agg claims no
+order: its pathkeys are the node's, which are none. A DISTINCT aggregate sees one value a group,
+which is as sorted as a presorted one needs. In a parallel plan each row comes from one participant,
+so the rows stay distinct across the Gather as well.
+
+This is the first answer of the FK-side join that depends on the uniqueness proof for correctness.
+"Uniqueness of the dimension key" otherwise treats the proof as a costing guard. If two visible
+dimension rows shared a key, the per-row Agg would make two groups where there should be one.
+Core's own plans rest on the same premise: a unique inner join stops at the first match. The proof
+is also of the same kind: a unique btree index that is valid, immediately enforced and not partial,
+under the join's equality and collation, and whose DROP invalidates the plan. The forward semi join
+needs no index, because the node makes its keys distinct itself.
+
+**Cost.** Core's `cost_agg()` prices AGG_SORTED over its input as the input comes: a comparison per
+row and grouping column, the transitions, and `cpu_tuple_cost` a group, starting when the node
+starts. It charges nothing else: no hash table built before the first group, no spill when the table
+outgrows `hash_mem`, and no Sort. Before this change, the Finalize HashAggregate over the partial
+counts paid all of that for as many groups as rows, and the plain Agg over the rows paid for a hash
+or a Sort of every row, which grouped nothing. A grouping that is not per row is still hashed or
+sorted, and core prices it so, with nothing taken off. Such groupings include `d.attr`, `d.pk + 0`,
+a unique dimension column other than the key, the key under another collation, and an anti join's
+key. `fkjoin_bykey.sql` pins both behaviours: the per-row Agg costs the same at 64 kB and at 64 MB
+of `work_mem`, while a hashed Agg over the same groups costs more at 64 kB.
+
+**Estimate.** The per-row Agg's groups are the dimension rows that join
+(`lion_fkjoin_per_row_groups()`). Of the n dimension rows the node reads (or the forward semi join's
+distinct keys), those are the rows that at least one of the join's p pairs falls on: n(1 - e^(-p/n))
+when the pairs fall at random, which is no more than n or p. That number is also capped by core's
+own estimate of the groups over the join's pairs, `estimate_num_groups()` of the grouping columns
+over the join rel's rows. For the fact's key, that estimate counts the fact's distinct fk values. By
+itself, core's estimate for GROUP BY f.fk over the join exceeds the dimension rows when the
+dimension is filtered. A semi join's rows are already its result rows. The outer level of the CTE
+form sees this number as the subquery's rows. In the test, 2,000 are estimated for 1,882 (the kept
+dimension rows, less those with no fact row). Under three fact filters, 574 are estimated for 517,
+where the node reads 3,000 dimension rows and core's own estimate is 637. In the measurements below,
+6,438 are estimated for 6,293 under `x = 3`, where the node reads 10,120 by its estimate (10,000 in
+fact) and core's plan estimates 10,231.
+
+**Measured** (PostgreSQL 18.6 packaged build, a VM shared with other work, warm, best of five;
+repeated runs agree within a third): two million fact rows with `fk` a hash over 200,000 keys (10
+rows a key), `x` with 10 values and `hot` true on three rows in four, all under lion indexes; a
+200,000-row dimension. The CTE form above, with `WHERE d.attr < 5` leaving 10,000 dimension rows:
+
+| fact filter | node | ordinary (hash join, HashAggregate) |
+|---|---|---|
+| `x = 3` | **28.2 ms** (21,957) | 77.0 (31,297) |
+| `hot` | **22.4** (22,406) | 189.0 (53,044) |
+
+Over 100,000 dimension rows (`attr < 50`), the model keeps the hash join. That is right for `x = 3`
+(140 ms against 157 for the node when forced). It is wrong for `hot`, where the hash join takes 572
+ms against the node's 180: a node cost of 147,307 against the hash join's 60,964. The per-key terms
+of "The cost of a key" are dear at that many keys, which predates the per-row Agg and is not the
+grouping's doing. Grouped by `d.pk` over all 200,000 dimension rows (`hot`, joins disabled), the
+per-row Agg takes 274 ms, against 344 for the same groups hashed (`GROUP BY d.pk + 0`). With
+`work_mem` at 4 MB, where the hash spills, the times are 279 and 381.
+
+**EXPLAIN**:
+
+    Aggregate
+      ->  Finalize GroupAggregate
+            Group Key: fk
+            ->  Custom Scan (LionCount)
+                  Lion Indexes: fact_fk (fk = d.pk), fact_hot (hot = true)
+                  Fact Filters: collected once
+                  ->  Seq Scan on dim d
+                        Filter: kept
+
+A GroupAggregate directly over the node, with no Sort between them, is the per-row Agg. The group
+key prints unqualified, as `count(DISTINCT)`'s sort key does.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -8783,7 +8918,11 @@ prints as `lion_join_count((PARTIAL count(*))) FILTER (WHERE (d.name IS NOT NULL
   itself.
 - **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
   over `f.x`, which composes, but is not in v1. It is also every GROUP BY of a forward semi join,
-  whose dimension the query above the EXISTS cannot name.
+  whose dimension the query above the EXISTS cannot name. The one exception is the fact's join
+  column, which stands for the dimension's key ("Grouped by the join key"). That exception does not
+  cover an fk of another type than the key, a key whose equal values may be spelled differently
+  (numeric, citext, bpchar, the floats, a nondeterministic collation), the key under another
+  collation than the join's, or an expression of it.
 - **`count(f.col)` of a nullable fact column, and the aggregates "Every aggregate over the node's
   rows" does not answer**: of a fact column other than the key, ones that see multiplicity but
   counts and int2 or int4 sums (`avg`, `sum` of int8 or numeric, `string_agg`), and any with FILTER
@@ -9008,6 +9147,42 @@ none, are still pushed down; one without USAGE on the extension's schema (moved 
 test) gets the counted rows. And a dirty heap before and after VACUUM. Beside it, `fkjoin_distinct`,
 `fkjoin_semi` and `fkjoin_nonunique` answer the queries they used to decline, and `fkjoin_walk` walks
 counted rows in key order.
+
+`test/sql/fkjoin_bykey.sql` (2026-09-28), grouped by the join key, against the pushdown off. The
+data is `fkjoin_mixed.sql`'s, with a unique text key beside the dimension's int8 one and its fact
+side, plus a numeric dimension and fact whose equal keys are spelled 1.00 and 1.0. `lion_bk()`
+reports the plan's form, and how the Agg nearest above the node groups: hashed, sorted, each row a
+group, or no groups. The cases are:
+
+- the CTE form as written (`GROUP BY f.fk`) and with `GROUP BY a.pk`, under other filters, with
+  other aggregates at the outer level, and over nothing;
+- `GROUP BY f.fk` with every count, fact filters of each kind, expressions the target computes from
+  the grouped column, ORDER BY and LIMIT, the text key, and a dimension column beside the key in
+  either order;
+- `GROUP BY d.pk`, both keys in either order, and the dimension's key over an int4 fk;
+- HAVING on a count, and on the key alone, which becomes a range of the fk index;
+- the aggregates of "Every aggregate over the node's rows" grouped by either key (`count(*)` with
+  `max(d.attr)`, counts of columns, sums, min, `bool_or`, `bit_and`, `count(DISTINCT)` of a
+  dimension column and of the key), and one CTE level above them;
+- the forward semi join's distinct keys grouped, and a reverse semi join whose key an index proves
+  unique; an anti join's key, and a non-unique key, are hashed;
+- the declines: an int4 fk against the int8 key, alone and in the CTE form; the numeric key, whose
+  answer (`lion_bk_val()`) keeps the fact's spelling where `GROUP BY d.pk` prints the dimension's
+  (and where `count(DISTINCT)` of it is still taken); the key under `"C"`; `GROUP BY f.fk + 1`;
+  other fact columns. Taken but hashed: another unique dimension column, the dimension's key under
+  `"C"`, and `d.pk + 0`.
+
+From EXPLAIN's JSON (`lion_bk_plan()`): the per-row Agg starts when the node does, while a hashed
+Agg waits for the node's last row; the per-row Agg's cost is the same at 64 kB and at 64 MB of
+`work_mem`, where a real grouping of as many groups costs more at 64 kB; and counted rows with a
+DISTINCT have no Sort below them when grouped by the key, while grouped by a dimension column they
+have one. The estimate is the node's rows in the CTE form, fewer under narrow fact filters, and
+within a factor of 1.5 of the actual rows either way. The cost model with nothing disabled takes the
+node for a few dimension rows grouped by either key and in the CTE form, and the hash join for all
+of them. Also covered: generic plans with NULL Params included, correlated subqueries, parallel
+plans (the Finalize GroupAggregate over a Gather, forward semi join included), and a dirty heap
+before and after VACUUM. `fkjoin_walk` groups walked rows by either key, and the forward semi join's
+walked distinct keys by the fact's.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
