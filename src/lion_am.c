@@ -29,6 +29,7 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/paths.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
@@ -1310,6 +1311,29 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 #define LION_WALK_PASS_COST		5.0
 
 /*
+ * Does a plain scan whose rows lie on `pages` heap pages compete with a
+ * PARALLEL bitmap heap scan of them (DESIGN.md §29.11, "One process against
+ * several")?  core's own answer, create_partial_bitmap_paths()'s: the
+ * relation may be scanned in parallel and compute_parallel_worker() gives
+ * that many pages a worker - never below min_parallel_table_scan_size, at a
+ * max_parallel_workers_per_gather of 0 or for a table whose parallel_workers
+ * is 0.  An inheritance child is given one whatever its size, for a Parallel
+ * Append to combine; below that size a child's plain scan is taken as a base
+ * relation's is, against one process's bitmap heap scan.
+ */
+static bool
+lion_plain_meets_workers(RelOptInfo *rel, double pages)
+{
+	if (!rel->consider_parallel || max_parallel_workers_per_gather <= 0)
+		return false;
+	if (rel->reloptkind != RELOPT_BASEREL &&
+		pages < (double) min_parallel_table_scan_size)
+		return false;
+	return compute_parallel_worker(rel, pages, -1,
+								   max_parallel_workers_per_gather) > 0;
+}
+
+/*
  * The correlation handed to cost_index() for a plain scan (DESIGN.md
  * §29.11).  A LIST, which restarts the heap for every batch, gets the
  * column's, as btree's does (lion_index_correlation()).
@@ -1339,6 +1363,22 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
  * measurement behind that constant the plain scan spent 0.4 us a page LESS
  * than the bitmap heap scan, which is not credited: with one row to a page
  * the two cost about the same.
+ *
+ * That is one process against one process.  Against a PARALLEL bitmap heap
+ * scan - where core would give the bitmap heap scan of the same pages
+ * workers (lion_plain_meets_workers()) - it is not.  The plain scan is one
+ * process (amcanparallel is false: cost_index() divides none of its price)
+ * that reads a page when it needs it; the parallel scan reads its pages in
+ * several processes, each reading ahead.  core credits that scan with its CPU
+ * divided and nothing for its reads, so the plain scan gives back the credit
+ * it took from cost_bitmap_heap_scan() for reading in block order: a page is
+ * priced as one process's read, random_page_cost but for the pages that
+ * follow the one read before them, which the kernel's read-ahead of a
+ * consecutive run serves - their share of the heap, where the bitmap heap
+ * scan's price takes its square root.  Below that size, and wherever no
+ * parallel plan can be made, it is one process against one, priced alike,
+ * which is what keeps a selective result on the plain scan (DESIGN.md
+ * §29.11, "One process against several").
  *
  * A WALK hands out one entry's TIDs in heap order, then the next entry's:
  * it is a pass over the heap per entry, each reading its entry's pages in
@@ -1385,6 +1425,9 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	double		passes = 1.0;	/* heap passes: the entries of a WALK */
 	double		passpages;		/* the pages one pass reads */
 	double		visits;			/* the page visits of all the passes */
+	double		bmpages;		/* the pages a bitmap heap scan reads */
+	double		share;			/* of the price between random and seq */
+	bool		serial;			/* against a parallel bitmap heap scan */
 	int			walkcol;
 	int			shape;
 
@@ -1427,10 +1470,26 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	else
 		passpages = pages;
 	visits = Min(passes * passpages, tuples);
-	target = pages * ((passpages >= 2.0) ?
-					  spc_random_page_cost -
-					  (spc_random_page_cost - spc_seq_page_cost) * sqrt(passpages / T) :
-					  spc_random_page_cost);
+
+	/*
+	 * The price of a page.  Against one process's bitmap heap scan, that
+	 * scan's: random_page_cost falling to seq_page_cost with the square root
+	 * of the share of the heap a pass reads.  Against a parallel one, over
+	 * the pages compute_bitmap_pages() counts for it, one process's reading a
+	 * page when it needs it: random_page_cost, and seq_page_cost for a page
+	 * that follows the one read before it - the share itself, not its root.
+	 */
+	bmpages = Min(ceil((2.0 * T * tuples) / (2.0 * T + tuples)), T);
+	serial = loop_count <= 1.0 && path->path.param_info == NULL &&
+		lion_plain_meets_workers(baserel, bmpages);
+	if (passpages < 2.0)
+		share = 0.0;
+	else if (serial)
+		share = passpages / T;
+	else
+		share = sqrt(passpages / T);
+	target = pages * (spc_random_page_cost -
+					  (spc_random_page_cost - spc_seq_page_cost) * share);
 
 	/* cost_index()'s ends: uncorrelated (max_io) and packed (min_io) */
 	if (loop_count > 1)

@@ -1,0 +1,56 @@
+-- A plain index scan (amgettuple) against a PARALLEL bitmap heap scan
+-- (DESIGN.md §29.11, "One process against several").
+--
+-- A plain lion scan reads its heap pages in one process, a page when it needs
+-- it; the bitmap heap scan of the same pages reads ahead, and in parallel in
+-- several processes.  Where core would run that bitmap heap scan in parallel,
+-- the plain scan's pages are priced as one process's reads, and a large
+-- result goes to the bitmap scan; below that size the two are one process
+-- each, priced alike, and a selective result stays on the plain scan.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+-- a sample of every row: the statistics, and the plans, do not depend on it
+SET default_statistics_target = 1000;
+
+-- 20000 rows, 18 to a page: 1112 pages.  Every column is a hash of the row
+-- number: k has 60 values and k2 1000, placed at random.
+CREATE TABLE lpp (id int PRIMARY KEY, k int, k2 int, pad text);
+INSERT INTO lpp
+SELECT g,
+	   ((hashint8extended(g, 1) & 2147483647) % 60)::int,
+	   ((hashint8extended(g, 2) & 2147483647) % 1000)::int,
+	   repeat('x', 400)
+  FROM generate_series(1, 20000) g;
+CREATE INDEX lpp_k ON lpp USING lion (k);
+CREATE INDEX lpp_k2 ON lpp USING lion (k2);
+VACUUM (FREEZE, ANALYZE) lpp;
+
+-- ---------- 1. a large result, against a parallel bitmap heap scan ----------
+-- k = 7 is a sixtieth of the rows, on about a quarter of the pages.  With no
+-- parallel plans, and while those pages are fewer than core gives a parallel
+-- worker (min_parallel_table_scan_size), the plain scan competes with one
+-- process's bitmap scan, is priced alike, and is chosen for building no
+-- bitmap.  Once core would run that bitmap scan in parallel, the plain scan's
+-- pages are one process's reads, some 30% dearer here, and the bitmap
+-- scan is chosen - serially, as it happens: over some 290 pages a parallel
+-- one does not pay for starting its workers.
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lpp WHERE k = 7;
+SET max_parallel_workers_per_gather = 2;
+SET min_parallel_table_scan_size = '8MB';
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lpp WHERE k = 7;
+SET min_parallel_table_scan_size = '1MB';
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lpp WHERE k = 7;
+-- 20 rows on 20 pages are no parallel scan's, and stay on the plain scan
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lpp WHERE k2 = 5;
+-- and the answers are the sequential scan's
+SELECT (SELECT sum(id) FROM lpp WHERE k = 7) =
+	   (SELECT sum(id) FROM lpp WHERE k + 0 = 7) AS same_answer;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+
+DROP TABLE lpp;
