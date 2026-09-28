@@ -125,6 +125,7 @@
 #include "utils/typcache.h"
 
 #include "port/atomics.h"
+#include "port/pg_bitutils.h"
 #include "storage/predicate.h"
 #include "storage/shm_toc.h"
 #include "storage/spin.h"
@@ -183,6 +184,11 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 										 * them: the forward semi join over a
 										 * non-unique key, an inner join over
 										 * the distinct keys */
+#define LION_JOINFLAG_WALK		0x08	/* the child's rows are looked up a
+										 * batch at a time, sorted into the fk
+										 * index's key order and located by one
+										 * walk of its leaves ("Lookups in key
+										 * order") */
 
 /*
  * How many distinct keys of a forward semi join over a non-unique key
@@ -282,6 +288,31 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  */
 #define LION_FKJOIN_SORT_COMPARE_COST	(0.25 * cpu_operator_cost)
 #define LION_FKJOIN_SORT_KEY_COST	(6.0 * cpu_operator_cost)
+
+/*
+ * Looking the child's rows up in the fk index's key order (DESIGN.md §27,
+ * "Lookups in key order"), which the node does a batch at a time:
+ *
+ *	BATCH_ROW		per row, its place in the batch - the row copied in, its
+ *					share of the sort (log2 of the batch comparisons through the
+ *					opclass's comparison function) and the slot it is handed
+ *					back to the target list in.  Priced as one directory page
+ *					visit (LION_DESCENT_COST), which is on the high side:
+ *					putting a key into the datum sort of the distinct keys
+ *					above, sorting it and taking it out again measured at a
+ *					fraction of what a page visit is fitted at, and a row's
+ *					copy and its slot are of the same order.  High on purpose:
+ *					the walk replaces a descent's internal levels with this, so
+ *					it is taken only where it saves a page a key or more -
+ *					never over a directory of height 1, whose descent is the
+ *					root and the leaf.
+ *	BATCH_ENT_BYTES	per row, what a batch holds besides the row's own columns:
+ *					the entry that sorts it, the MinimalTuple's header and the
+ *					allocator's chunk headers of the row and of a key copied
+ *					by reference.
+ */
+#define LION_FKJOIN_BATCH_ROW_COST	LION_DESCENT_COST
+#define LION_FKJOIN_BATCH_ENT_BYTES	(sizeof(LionJoinEnt) + 48)
 
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
@@ -795,6 +826,23 @@ typedef struct LionPartState
 	Oid		   *clauseidxoid;	/* one per WHERE clause */
 } LionPartState;
 
+/*
+ * One child row of a batch the FK-side join looks up in key order (DESIGN.md
+ * §27, "Lookups in key order"): its key, copied into the batch, with the hash
+ * the directory order uses after the comparison; the row itself for the
+ * target list, or NULL where the key is all the row there is (the distinct
+ * keys of a forward semi join); and its place in the child's order, which
+ * breaks the sort's ties so that a batch always sorts the same way.
+ */
+typedef struct LionJoinEnt
+{
+	Datum		key;
+	uint32		hash;
+	bool		isnull;			/* joins nothing: an anti join's row only */
+	int32		seq;
+	MinimalTuple tuple;
+} LionJoinEnt;
+
 typedef struct LionCountScanState
 {
 	CustomScanState css;
@@ -1203,6 +1251,37 @@ typedef struct LionCountScanState
 	TuplesortInstrumentation joinsortstats;
 
 	/*
+	 * Lookups in key order (DESIGN.md §27, "Lookups in key order"): joinwalk
+	 * says the plan reads the child's rows - or the distinct keys - a batch
+	 * at a time, as many as work_mem holds, into joinbatch in joinbatchcxt,
+	 * sorts them into the fk index's directory order and locates their keys
+	 * with one walk of its leaves, joinwalker, begun at the first batch
+	 * (joinwalkbegun).  joinbatchpos is the next row of the batch to look up,
+	 * joinchilddone that the child has no rows left, joinbatchslot the slot a
+	 * batched row is handed to the target list in, and joinbatches how many
+	 * batches there were, for EXPLAIN ANALYZE.  The last key looked up and
+	 * what it found (joinlast*) answer the next row as well when it has the
+	 * same key: a duplicated dimension key is looked up once a batch.  The
+	 * key's type (joinkeytype, joinkeybyval, joinkeylen) is set for this as
+	 * for joinunique.
+	 */
+	bool		joinwalk;
+	bool		joinwalkbegun;
+	LionLookupWalk joinwalker;
+	MemoryContext joinbatchcxt;
+	LionJoinEnt *joinbatch;
+	int			joinbatchn;
+	int			joinbatchcap;
+	int			joinbatchpos;
+	bool		joinchilddone;
+	TupleTableSlot *joinbatchslot;
+	int64		joinbatches;
+	bool		joinlasthave;
+	Datum		joinlastkey;
+	bool		joinlastfound;
+	int64		joinlastcount;
+
+	/*
 	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
 	 * counts the dimension rows its share of the child returns and adds what
 	 * EXPLAIN ANALYZE reports into joinshared, in the dynamic shared memory
@@ -1219,6 +1298,7 @@ typedef struct LionCountScanState
 	int64		joinworkerfilterrows;
 	int64		joinworkersorted;
 	int64		joinworkerspilled;
+	int64		joinworkerbatches;
 } LionCountScanState;
 
 /*
@@ -1234,6 +1314,7 @@ typedef struct LionCountScanState
  * non-unique key that nobody has claimed yet.  participants is how many the
  * leader started the plan for, itself included, which is how many ways each
  * of them divides the list pin budget (lion_list_pin_participants()).
+ * batches is the batches of keys looked up in key order, summed.
  */
 typedef struct LionJoinShared
 {
@@ -1246,6 +1327,7 @@ typedef struct LionJoinShared
 	int64		spilled;
 	int64		sorted;
 	int64		sortedruns;
+	int64		batches;
 	pg_atomic_uint32 nextchunk;
 	int			participants;
 } LionJoinShared;
@@ -4730,6 +4812,42 @@ lion_parallel_divisor(int workers)
 }
 
 /*
+ * The directory pages of the FK-side join's lookups when the child's rows are
+ * looked up in key order (DESIGN.md §27, "Lookups in key order"): `rows` of
+ * them, over a key column of `leaves` leaves in a directory `height` levels
+ * above them, each row taking `rowbytes` of a batch.  From what the walk does
+ * (lion_lookup_walk_find()):
+ *
+ *	- the rows are sorted in batches of what work_mem holds, and the first key
+ *	  of each batch is a descent, height + 1 pages;
+ *	- every row is the visit of its key's leaf, one page, and its place in the
+ *	  batch, LION_FKJOIN_BATCH_ROW_COST;
+ *	- the keys of a batch lie `leaves / keys` leaves apart on average.  While
+ *	  that is at most the height, the walk steps over them, a page each; past
+ *	  it a key descends, which costs the height of the directory over and
+ *	  above its leaf.
+ *
+ * Against a descent per row, height + 1 pages, the walk is cheaper only where
+ * the height is at least two and a batch holds more keys than there are
+ * leaves between them: a directory of height 1 descends through the root
+ * alone, which a row's place in the batch costs as much as.
+ */
+static Cost
+lion_cost_fkjoin_walk(double rows, double leaves, double height,
+					  double rowbytes)
+{
+	double		perbatch = Max(floor((double) work_mem * 1024.0 /
+									 Max(rowbytes, 1.0)), 1.0);
+	double		batches = ceil(rows / perbatch);
+	double		keys = rows / Max(batches, 1.0);
+	double		apart = leaves / Max(keys, 1.0);
+
+	return batches * (height + 1.0) * LION_DESCENT_COST +
+		rows * ((1.0 + Min(apart, height)) * LION_DESCENT_COST +
+				LION_FKJOIN_BATCH_ROW_COST);
+}
+
+/*
  * Cost the FK-side join (DESIGN.md §27) over the fact relation `rel`, for
  * `dimrows` dimension rows, `found` of which have an entry in the fk index;
  * the child plan's own cost is the caller's to add.  A key without an entry
@@ -4739,9 +4857,10 @@ lion_parallel_divisor(int workers)
  *
  * What the node does per dimension row: one lookup of the key in the fk
  * index - a directory descent, whose leaf is charged at lion_heap_page_cost()'s
- * interpolated cost over as many distinct leaves as the lookups can touch,
- * because the dimension's rows arrive in its own order and not in key order -
- * then one count of that key's set ANDed with the fact filters: a merge set up
+ * interpolated cost over as many distinct leaves as the lookups can touch, or
+ * a step of a walk of the leaves in key order where that is cheaper (*walk,
+ * lion_cost_fkjoin_walk(); `rowbytes` is what one child row takes of a batch)
+ * - then one count of that key's set ANDed with the fact filters: a merge set up
  * and torn down (LION_FKJOIN_COUNT_COST), the set's containers at §10's two
  * cpu_operator_cost each, and the set's chain pages, which are none at all
  * when the fk entries are INLINE.  Then a row out.  A semi or anti join's
@@ -4784,7 +4903,8 @@ static Cost
 lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 					 Var *fkvar, int joinclause, List *whereclauses,
 					 List *wherekinds, List *ors, double dimrows,
-					 double found, bool exists, bool *collect)
+					 double found, bool exists, double rowbytes,
+					 bool *collect, bool *walk)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -4807,6 +4927,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	double		dirpages;
 	double		container_pages;
 	double		lookups;
+	Cost		descents;
+	Cost		walked;
 	double		cfk;
 	double		readshare = 1.0;
 	double		probes = 0;
@@ -4832,6 +4954,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	dimrows = Max(dimrows, 1.0);
 	found = Min(Max(found, 1.0), dimrows);
 	*collect = false;
+	*walk = false;
 
 	/* How many rows one key of the fk column has, and in how many containers. */
 	nd = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
@@ -4857,7 +4980,22 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	lookups = Min(dimrows, dirpages);
 	run += lookups * lion_heap_page_cost(root, rel, lookups,
 										 Max((double) fkidx->pages, 1.0));
-	run += dimrows * (height + 1.0) * LION_DESCENT_COST;
+
+	/*
+	 * A descent per row, or the walk in key order when it reads fewer pages
+	 * (DESIGN.md §27, "Lookups in key order").  The leaves themselves are
+	 * charged above either way, each once: that is what the walk reads, and
+	 * what the descents read too while the directory stays in the cache.
+	 */
+	descents = dimrows * (height + 1.0) * LION_DESCENT_COST;
+	walked = lion_cost_fkjoin_walk(dimrows, dirpages, height, rowbytes);
+	if (walked < descents)
+	{
+		*walk = true;
+		run += walked;
+	}
+	else
+		run += descents;
 	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
@@ -6373,21 +6511,34 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	double		rows;
 	double		inrows;
 	double		numgroups;
+	double		rowbytes;
 	bool		collect;
+	bool		walk;
 	Cost		run;
 	Cost		startup;
 	int			flags;
 	AggStrategy aggstrategy;
 	AggClauseCosts agg_costs;
 
+	/*
+	 * What a child row takes of a batch looked up in key order: its columns
+	 * and the batch's own bookkeeping - or, for the distinct keys of a forward
+	 * semi join, the key alone.
+	 */
+	rowbytes = (double) LION_FKJOIN_BATCH_ENT_BYTES +
+		MAXALIGN(unique ?
+				 get_typavgwidth(fj->pkvar->vartype, fj->pkvar->vartypmod) :
+				 child->pathtarget->width);
+
 	run = lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
 							   whereclauses, wherekinds, ors, childrows,
 							   childfound,
 							   jointype != LION_JOIN_INNER || emitrows,
-							   &collect);
+							   rowbytes, &collect, &walk);
 	flags = (collect ? LION_JOINFLAG_COLLECT : 0) |
 		(emitrows ? LION_JOINFLAG_ROWS : 0) |
-		(unique ? LION_JOINFLAG_UNIQUE : 0);
+		(unique ? LION_JOINFLAG_UNIQUE : 0) |
+		(walk ? LION_JOINFLAG_WALK : 0);
 
 	/*
 	 * The node starts when its child does - or, when it sorts the child's
@@ -9319,6 +9470,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joincollect = false;
 	st->joinrows = false;
 	st->joinunique = false;
+	st->joinwalk = false;
 	st->joinsortop = InvalidOid;
 	st->joinsortcoll = InvalidOid;
 	if (join != NIL)
@@ -9331,6 +9483,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->joincollect = (lthird_int(join) & LION_JOINFLAG_COLLECT) != 0;
 		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
 		st->joinunique = (lthird_int(join) & LION_JOINFLAG_UNIQUE) != 0;
+		st->joinwalk = (lthird_int(join) & LION_JOINFLAG_WALK) != 0;
 		st->joinsortop = (Oid) list_nth_int(join, 3);
 		st->joinsortcoll = (Oid) list_nth_int(join, 4);
 		st->joinkeyresno = (AttrNumber) list_nth_int(join, 5);
@@ -9722,6 +9875,51 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->joinkeycxt = AllocSetContextCreate(estate->es_query_cxt,
 											   "LionCount join key",
 											   ALLOCSET_SMALL_SIZES);
+	}
+
+	/*
+	 * Lookups in key order (DESIGN.md §27): the batches of rows - or of the
+	 * distinct keys, which the target list reads through joinsortslot above -
+	 * live in a context of their own, emptied at every batch, and a batched
+	 * row goes back to the target list through a slot of the child's shape.
+	 */
+	st->joinwalkbegun = false;
+	st->joinbatchcxt = NULL;
+	st->joinbatch = NULL;
+	st->joinbatchn = 0;
+	st->joinbatchcap = 0;
+	st->joinbatchpos = 0;
+	st->joinchilddone = false;
+	st->joinbatchslot = NULL;
+	st->joinbatches = 0;
+	st->joinlasthave = false;
+	st->joinworkerbatches = 0;
+	if (st->joinwalk)
+	{
+		TupleDesc	childdesc = ExecGetResultType(st->child);
+		Form_pg_attribute keyatt;
+
+		if (st->joinkeyresno > childdesc->natts)
+			elog(ERROR, "LionCount: malformed join");
+		keyatt = TupleDescAttr(childdesc, st->joinkeyresno - 1);
+		st->joinkeytype = keyatt->atttypid;
+		st->joinkeybyval = keyatt->attbyval;
+		st->joinkeylen = keyatt->attlen;
+		/*
+		 * A batch is full when the context's blocks reach work_mem, and a
+		 * block may overshoot it by as much as a block: an eighth of it at
+		 * most, rather than the allocator's usual 8 MB.
+		 */
+		st->joinbatchcxt =
+			AllocSetContextCreate(estate->es_query_cxt,
+								  "LionCount join batch",
+								  ALLOCSET_DEFAULT_MINSIZE,
+								  ALLOCSET_DEFAULT_INITSIZE,
+								  Min((Size) ALLOCSET_DEFAULT_MAXSIZE,
+									  Max((Size) ALLOCSET_DEFAULT_INITSIZE,
+										  pg_prevpower2_size_t((Size) work_mem * 1024 / 8))));
+		st->joinbatchslot = ExecInitExtraTupleSlot(estate, childdesc,
+												   &TTSOpsMinimalTuple);
 	}
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
@@ -13129,6 +13327,276 @@ lion_join_next_key(LionCountScanState *st)
 }
 
 /*
+ * LOOKUPS IN KEY ORDER (DESIGN.md §27).  Each child row's lookup used to be a
+ * descent of the fk index's directory - the root, the internal levels and a
+ * leaf - in the order the dimension's rows came, which is not the fk index's.
+ * Over a high-cardinality fk the directory is large, the leaves those lookups
+ * read are spread all over it, and consecutive rows share none of them.  So a
+ * plan that asks for it (LION_JOINFLAG_WALK, which the cost model sets where
+ * the walk saves a page a key: lion_cost_fkjoin_walk()) reads the child's
+ * rows a BATCH at a time, sorts the batch into the directory's order and
+ * locates the keys with one walk of the leaves (LionLookupWalk, lion_count.c):
+ * a key on the leaf the last one was found on costs that leaf, one on the next
+ * leaf a step right, and only a key further away a descent.
+ *
+ * Why the answers are the same.  Each row's count is the one the row-at-a-time
+ * loop computes, from the same set: the walk locates exactly the entry a
+ * descent would, and the count is made the same way, under the same
+ * snapshot, the set located, counted and released before the next row's is
+ * located.  Only the ORDER of the rows changes, and nothing above the node
+ * depends on it: the node claims no order (its path has no pathkeys), a
+ * partial count is grouped and added up by core's Finalize Agg whatever order
+ * the rows come in, and the rows of a count(DISTINCT) go through a Sort.  A
+ * key that appears again in a batch - two dimension rows with one key, which
+ * a semi or anti join counts once each - comes out next to the first by the
+ * sort, and takes its answer instead of a second lookup: the count of one key
+ * under one snapshot is one number.
+ *
+ * The batch holds rows as the child made them, copied, and is bounded by
+ * work_mem - another input of the node, as each input of a hash join has an
+ * allowance of its own - with at least one row in it.  Nothing is pinned
+ * while it is filled, since the child may run for as long as its quals take:
+ * the walk lets go of its leaf, and the WHERE sets let go of theirs as they
+ * do before a row goes up (lion_pause_run()), which a row-at-a-time run first
+ * does after the child's first rows and a batched one would otherwise do only
+ * after its whole first batch.  Every count after that is carried by its fk
+ * set's own pin, as every count after the first row always was (§27,
+ * "Visibility and the §9 interlock").
+ */
+
+/* The most rows a batch takes whatever work_mem allows: its array's limit. */
+#define LION_JOIN_BATCH_MAX		((int) (MaxAllocSize / sizeof(LionJoinEnt) - 1))
+
+static void lion_pause_run(LionCountScanState *st);
+
+/* The directory's order of two batched rows; NULL keys (an anti join's) first. */
+static int
+lion_join_ent_cmp(const void *a, const void *b, void *arg)
+{
+	const LionJoinEnt *x = (const LionJoinEnt *) a;
+	const LionJoinEnt *y = (const LionJoinEnt *) b;
+
+	if (x->isnull != y->isnull)
+		return x->isnull ? -1 : 1;
+	if (!x->isnull)
+	{
+		int			c = lion_lookup_walk_cmp((LionLookupWalk *) arg,
+											 x->key, x->hash, y->key, y->hash);
+
+		if (c != 0)
+			return c;
+	}
+	return (x->seq > y->seq) - (x->seq < y->seq);
+}
+
+/*
+ * Empty the batch: what it held, the slots that point into it, and the walk's
+ * place, which the next batch's first key may be left of.
+ */
+static void
+lion_join_batch_reset(LionCountScanState *st)
+{
+	if (st->joinwalkbegun)
+		lion_lookup_walk_restart(&st->joinwalker);
+	if (st->joinbatchslot != NULL)
+		ExecClearTuple(st->joinbatchslot);
+	if (st->joinsortslot != NULL)
+		ExecClearTuple(st->joinsortslot);
+	if (st->joinbatchcxt != NULL)
+		MemoryContextReset(st->joinbatchcxt);
+	st->joinbatch = NULL;
+	st->joinbatchn = 0;
+	st->joinbatchcap = 0;
+	st->joinbatchpos = 0;
+	st->joinlasthave = false;
+}
+
+/*
+ * Read the next batch: child rows (or distinct keys) until work_mem is full or
+ * the child has no more, the rows whose NULL key joins nothing left out but
+ * for an anti join, whose rows they are.  Then sort it into the directory's
+ * order.  False when the child had no row left at all.
+ */
+static bool
+lion_join_fill_batch(LionCountScanState *st)
+{
+	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	Size		limit = (Size) work_mem * 1024;
+	MemoryContext oldcxt;
+	int			n = 0;
+
+	ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+	st->childslot = NULL;
+	lion_join_batch_reset(st);
+	lion_pause_run(st);
+
+	while (!st->joinchilddone)
+	{
+		TupleTableSlot *slot;
+		LionJoinEnt *ent;
+		Datum		key;
+		bool		isnull;
+
+		if (n > 0 &&
+			(MemoryContextMemAllocated(st->joinbatchcxt, false) >= limit ||
+			 n >= LION_JOIN_BATCH_MAX))
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+		slot = st->joinunique ? lion_join_next_key(st) :
+			ExecProcNode(st->child);
+		if (TupIsNull(slot))
+		{
+			st->joinchilddone = true;
+			break;
+		}
+		key = slot_getattr(slot, st->joinkeyresno, &isnull);
+		if (isnull && !anti)
+			continue;
+
+		oldcxt = MemoryContextSwitchTo(st->joinbatchcxt);
+		if (n >= st->joinbatchcap)
+		{
+			int			cap = (st->joinbatchcap == 0) ? 1024 :
+				(int) Min((Size) st->joinbatchcap * 2,
+						  (Size) LION_JOIN_BATCH_MAX);
+
+			if (st->joinbatch == NULL)
+				st->joinbatch = (LionJoinEnt *)
+					palloc(sizeof(LionJoinEnt) * cap);
+			else
+				st->joinbatch = (LionJoinEnt *)
+					repalloc(st->joinbatch, sizeof(LionJoinEnt) * cap);
+			st->joinbatchcap = cap;
+		}
+		ent = &st->joinbatch[n];
+		ent->seq = n;
+		ent->isnull = isnull;
+		ent->key = (Datum) 0;
+		ent->hash = 0;
+		if (!isnull)
+		{
+			ent->key = datumCopy(key, st->joinkeybyval, st->joinkeylen);
+			ent->hash = lion_lookup_walk_hash(&st->joinwalker, ent->key);
+		}
+		ent->tuple = st->joinunique ? NULL : ExecCopySlotMinimalTuple(slot);
+		MemoryContextSwitchTo(oldcxt);
+		n++;
+	}
+
+	st->joinbatchn = n;
+	if (n == 0)
+		return false;
+	st->joinbatches++;
+	if (n > 1)
+		qsort_arg(st->joinbatch, n, sizeof(LionJoinEnt), lion_join_ent_cmp,
+				  &st->joinwalker);
+	return true;
+}
+
+/* A batched row as the child's current row, for the target list. */
+static void
+lion_join_batch_row(LionCountScanState *st, const LionJoinEnt *ent)
+{
+	if (st->joinunique)
+	{
+		TupleTableSlot *slot = st->joinsortslot;
+
+		ExecClearTuple(slot);
+		memset(slot->tts_isnull, true,
+			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
+		slot->tts_values[st->joinkeyresno - 1] = ent->key;
+		slot->tts_isnull[st->joinkeyresno - 1] = false;
+		st->childslot = ExecStoreVirtualTuple(slot);
+	}
+	else
+		st->childslot = ExecStoreMinimalTuple(ent->tuple, st->joinbatchslot,
+											  false);
+}
+
+/*
+ * lion_next_join_row() for a plan that looks the keys up in key order: the
+ * same rows, counted the same way, from the batches above.
+ */
+static TupleTableSlot *
+lion_next_join_walk(LionCountScanState *st)
+{
+	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	MemoryContext oldcxt;
+
+	for (;;)
+	{
+		LionJoinEnt *ent;
+		bool		found;
+		int64		count;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (st->joinbatchpos >= st->joinbatchn &&
+			!lion_join_fill_batch(st))
+		{
+			lion_join_batch_reset(st);
+			st->done = true;
+			return NULL;
+		}
+		ent = &st->joinbatch[st->joinbatchpos++];
+
+		if (ent->isnull)
+		{
+			/* joins nothing: an anti join's row, which only it batched */
+			Assert(anti);
+			lion_join_batch_row(st, ent);
+			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 1);
+		}
+		st->joinlookups++;
+
+		if (st->joinlasthave &&
+			datumIsEqual(ent->key, st->joinlastkey, st->joinkeybyval,
+						 st->joinkeylen))
+		{
+			found = st->joinlastfound;
+			count = st->joinlastcount;
+		}
+		else
+		{
+			MemoryContextReset(st->pergroup);
+			oldcxt = MemoryContextSwitchTo(st->pergroup);
+			found = lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
+										  &st->groupset);
+			count = 0;
+			if (found)
+			{
+				if (st->jointype == LION_JOIN_INNER && !st->joinrows)
+					count = st->joinfiltered ?
+						lion_node_count(st, 2, st->joinsources, false) :
+						lion_node_count(st, st->nsource, st->sources, false);
+				else
+					count = st->joinfiltered ?
+						lion_node_count(st, 2, st->joinsources, true) :
+						lion_node_count(st, st->nsource, st->sources, true);
+			}
+			lion_posting_set_release(&st->groupset);
+			MemoryContextSwitchTo(oldcxt);
+
+			st->joinlasthave = true;
+			st->joinlastkey = ent->key;
+			st->joinlastfound = found;
+			st->joinlastcount = count;
+		}
+
+		if (!found)
+			st->joinmissing++;
+		if (anti)
+			count = 1 - count;	/* no entry, or a test that found nothing */
+		if (count == 0)
+			continue;
+
+		lion_join_batch_row(st, ent);
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
+	}
+}
+
+/*
  * The FK-side join (DESIGN.md §27): the next dimension row with fact rows, as
  * one partial row - its dimension columns and its count.
  *
@@ -13190,6 +13658,27 @@ lion_next_join_row(LionCountScanState *st)
 
 	if (st->joinunique && !st->joinsortdone)
 		lion_join_sort_keys(st);
+
+	/*
+	 * Lookups in key order, when the plan asks for them and there are any to
+	 * make: begun once for the node, in its query memory.  Keys the directory
+	 * cannot be sorted by - a cross-type key whose family has no ordering of
+	 * its own for that type (lion_probe_init()) - are looked up a row at a
+	 * time below, as they would be without the walk.
+	 */
+	if (st->joinwalk && !st->wheremissing)
+	{
+		if (!st->joinwalkbegun)
+		{
+			oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+			lion_lookup_walk_begin(&st->joinwalker, jcl->idx, jcl->idxcol,
+								   jcl->valtype);
+			MemoryContextSwitchTo(oldcxt);
+			st->joinwalkbegun = true;
+		}
+		if (lion_lookup_walk_ordered(&st->joinwalker))
+			return lion_next_join_walk(st);
+	}
 
 	for (;;)
 	{
@@ -13442,6 +13931,13 @@ lion_pause_run(LionCountScanState *st)
 	}
 	if (st->outeropen)
 		lion_posting_set_unpin(&st->groupset);
+
+	/*
+	 * ... and a walk of the fk index in key order (§27) lets go of the leaf it
+	 * stands on; the next key reads it again by its block number.
+	 */
+	if (st->joinwalkbegun)
+		lion_lookup_walk_pause(&st->joinwalker);
 }
 
 /*
@@ -13469,6 +13965,7 @@ lion_finish_run(LionCountScanState *st)
 	lion_posting_set_release(&st->groupset);
 	lion_posting_set_release(&st->groupset2);
 	st->outeropen = false;
+	lion_join_batch_reset(st);
 	lion_release_where(st);
 }
 
@@ -13670,6 +14167,10 @@ lion_reset_run(LionCountScanState *st)
 	st->joinkeypos = 0;
 	st->joinchunk = -1;
 
+	/* ... and the batch of keys being looked up in key order, and the walk */
+	lion_join_batch_reset(st);
+	st->joinchilddone = false;
+
 	if (st->npart > 0)
 		lion_close_relation(st);
 
@@ -13842,6 +14343,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->filterrows = Max(shared->filterrows, st->joinfilterrows);
 		shared->spilled += st->joinspilled;
 		shared->sorted = Max(shared->sorted, st->joinsorted);
+		shared->batches += st->joinbatches;
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -13855,6 +14357,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkerfilterrows = shared->filterrows;
 	st->joinworkerspilled = shared->spilled;
 	st->joinworkersorted = shared->sortedruns + shared->sorted;
+	st->joinworkerbatches = shared->batches;
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -13917,6 +14420,11 @@ lion_end_custom_scan(CustomScanState *node)
 	{
 		MemoryContextDelete(st->joinkeycxt);
 		st->joinkeycxt = NULL;
+	}
+	if (st->joinbatchcxt != NULL)
+	{
+		MemoryContextDelete(st->joinbatchcxt);
+		st->joinbatchcxt = NULL;
 	}
 	if (st->viscache != NULL)
 	{
@@ -14244,6 +14752,13 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			ExplainPropertyText("Join Type", "Anti", es);
 		if (st->joinunique)
 			ExplainPropertyText("Join Keys", "distinct, sorted", es);
+
+		/*
+		 * The keys are looked up a batch at a time, sorted into the fk
+		 * index's order ("Lookups in key order").
+		 */
+		if (st->joinwalk)
+			ExplainPropertyText("Join Key Lookups", "in index order", es);
 		if (st->joinrows)
 			ExplainPropertyText("Join Rows",
 								st->jointype == LION_JOIN_ANTI ?
@@ -14490,6 +15005,15 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 								   st->joinlookups + st->joinworkerlookups, es);
 			ExplainPropertyInteger("Join Keys Without Entry", NULL,
 								   st->joinmissing + st->joinworkermissing, es);
+
+			/*
+			 * The batches the keys were looked up in, in the fk index's order:
+			 * one per work_mem of the child's rows, per participant and run.
+			 */
+			if (st->joinwalk)
+				ExplainPropertyInteger("Join Key Batches", NULL,
+									   st->joinbatches + st->joinworkerbatches,
+									   es);
 
 			/*
 			 * The rows of the collected fact filters, or -1 when the plan

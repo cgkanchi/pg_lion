@@ -92,6 +92,7 @@
 #include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/spccache.h"
 #include "utils/syscache.h"
 
 #include "lion.h"
@@ -299,7 +300,12 @@ StaticAssertDecl(LION_BATCH_MIN_SETS <= LION_OPEN_MIN_PINS,
  * may keep them elsewhere: containers[] then points at wherever they are
  * (a range's union, lion_range_collect()), or - SPILLED - containers is NULL
  * and they are in `file`, described by spill[] (LionSpillEnt), which the set
- * owns and lion_posting_set_release() closes.
+ * owns and lion_posting_set_release() closes.  A spilled intersection
+ * (lion_sources_collect()) keeps its FIRST container in memory as well
+ * (first): every cursor over it reads that one when it is built, and the
+ * FK-side join's copy of its fact filters (DESIGN.md §27) and a GROUP BY's of
+ * its WHERE items (§10) get a cursor per count, which read it back from the
+ * file each time.
  */
 typedef struct LionMatSet
 {
@@ -310,6 +316,7 @@ typedef struct LionMatSet
 	LionContainer **containers;
 	BufFile    *file;			/* spilled: the containers, or NULL */
 	LionSpillEnt *spill;		/* spilled: where each one is */
+	LionContainer *first;		/* spilled: container 0, or NULL */
 } LionMatSet;
 
 /*
@@ -1675,6 +1682,325 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	return nsets;
 }
 
+/* ---------------------------------------------------------------------
+ * A walk of the leaves for keys that come one at a time (DESIGN.md §27)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Start a walk of key column `attno` of index for keys of type keytype
+ * (InvalidOid: the column's own).  The resolution is lion_probe_init()'s, made
+ * once for every key instead of once per lookup, and what the walk keeps -
+ * the probe's FmgrInfos and the copy of a high key - is allocated in the
+ * current memory context, which must outlive the walk.  The column state it
+ * keeps is valid for as long as the caller keeps the index open, a relcache
+ * flush included (LionAmCache, lion_pages.c).  Nothing is read yet.
+ */
+void
+lion_lookup_walk_begin(LionLookupWalk *walk, Relation index, AttrNumber attno,
+					   Oid keytype)
+{
+	memset(walk, 0, sizeof(LionLookupWalk));
+	walk->index = index;
+	walk->state = lion_index_column_state(index, attno);
+	lion_probe_init(index, walk->state, keytype, &walk->probe);
+	walk->blk = InvalidBlockNumber;
+	walk->buf = InvalidBuffer;
+	walk->rightlink = InvalidBlockNumber;
+	walk->prefetched = InvalidBlockNumber;
+
+	/* a high key is a pivot: a header and a key, never a payload */
+	walk->hikey = (LionEntryTuple *)
+		palloc(MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE));
+	walk->hikeylen = 0;
+
+	/*
+	 * Stepping right over s leaves reads s pages where a descent reads the
+	 * root, the levels below it and the leaf: height + 1.  So a walk steps
+	 * over at most `height` of them and descends for a key further away.
+	 */
+	walk->maxsteps = (int) Max(walk->state->ix->meta.height, 1);
+	walk->stepok = true;
+
+	/*
+	 * The leaves come in the order the keys do, so the next one can be asked
+	 * for before it is needed - where the storage can overlap the reads at
+	 * all, which is what the tablespace's io concurrency says.
+	 */
+	walk->prefetch =
+		(get_tablespace_io_concurrency(index->rd_rel->reltablespace) > 0);
+}
+
+/*
+ * Can the keys be sorted into the directory's order (lion_lookup_walk_cmp())?
+ * Without that each key is located by a descent of its own, in any order.
+ */
+bool
+lion_lookup_walk_ordered(const LionLookupWalk *walk)
+{
+	return walk->probe.walk;
+}
+
+/* The hash a key is sorted by, after its comparison, and searched with. */
+uint32
+lion_lookup_walk_hash(LionLookupWalk *walk, Datum key)
+{
+	return lion_probe_hash(walk->state, &walk->probe,
+						   lion_probe_value(&walk->probe, key));
+}
+
+/*
+ * The directory's order of two keys (lion_probe_key_cmp()): the probe's own
+ * comparison of two values of the key type, then the hash, which is all an
+ * unordered column's directory is ordered by.  Keys that tie are the same
+ * position in the directory - the same entry, or a run of hash collisions
+ * that a lookup of either scans from its start.  A long sort calls this some
+ * n log n times through the opclass, and nothing else in it answers a cancel;
+ * the caller holds no lock while it sorts.
+ */
+int
+lion_lookup_walk_cmp(LionLookupWalk *walk, Datum a, uint32 ahash, Datum b,
+					 uint32 bhash)
+{
+	if ((++walk->ncmp & 0xffff) == 0)
+		CHECK_FOR_INTERRUPTS();
+	if (walk->probe.hassort)
+	{
+		int32		c = DatumGetInt32(FunctionCall2Coll(&walk->probe.sortproc,
+														walk->state->collation,
+														a, b));
+
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
+	if (ahash != bhash)
+		return ahash < bhash ? -1 : 1;
+	return 0;
+}
+
+/* Let go of the leaf the walk stands on, and remember where it was. */
+void
+lion_lookup_walk_pause(LionLookupWalk *walk)
+{
+	if (BufferIsValid(walk->buf))
+		ReleaseBuffer(walk->buf);
+	walk->buf = InvalidBuffer;
+}
+
+/* ... and forget it too: the next key may be anywhere. */
+void
+lion_lookup_walk_restart(LionLookupWalk *walk)
+{
+	lion_lookup_walk_pause(walk);
+	walk->blk = InvalidBlockNumber;
+	walk->rightlink = InvalidBlockNumber;
+	walk->hikeylen = 0;
+	walk->stepok = true;
+}
+
+/*
+ * Locate the posting set of key, whose hash is lion_lookup_walk_hash()'s,
+ * into *ps - exactly the set lion_posting_set_lookup_col() would locate, and
+ * as a single lookup does, an INLINE set keeps a pin of its own on its leaf
+ * (DESIGN.md §9).  The key must not sort before the last one this walk
+ * located since it was begun or restarted.
+ *
+ * Where the walk starts looking:
+ *
+ *	- below the high key the last leaf had: that leaf, pinned still or read
+ *	  again by its block number.  If it has split since, the key may have gone
+ *	  to a page on its right, and the walk moves right as a descent does;
+ *	- at or above it, while the keys have been close: the leaf that was its
+ *	  right sibling.  That page's lower bound was the high key just passed, and
+ *	  a lower bound never moves, so the key is there or further right - even if
+ *	  the last leaf has split and has a new right sibling in between, which then
+ *	  holds only keys below that bound.  At most maxsteps pages further right;
+ *	- otherwise, or past those: a descent from the root.  A descent that lands
+ *	  on the leaf right of the last one says the keys are close again.
+ *
+ * A key found by following a run of hash collisions across a page boundary
+ * leaves the walk to the right of where that run begins, and the next key may
+ * belong to it: the walk forgets its place then, as the list walk does
+ * (lion_posting_set_lookup_many_col()).
+ *
+ * No lock is held on return, and a pin only on the leaf the key was located
+ * on, when the set is INLINE and pins it as well, or when the key has no
+ * entry and no count follows; lion_lookup_walk_pause() lets it go.  A CHAIN
+ * set's count reads the posting tree for as long as it takes, and the leaf is
+ * not held through it.
+ */
+bool
+lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
+					  LionPostingSet *ps)
+{
+	Relation	index = walk->index;
+	LionSearchKey sk;
+	Buffer		buf = InvalidBuffer;
+	OffsetNumber off;
+	BlockNumber prevright = walk->rightlink;
+	bool		had = BlockNumberIsValid(walk->blk);
+	bool		stepping = false;
+	bool		located;
+	bool		moved = false;
+	bool		keeppin = false;
+	int			steps;
+
+	memset(ps, 0, sizeof(LionPostingSet));
+	ps->index = index;
+	ps->attno = walk->state->attno;
+	ps->pinbuf = InvalidBuffer;
+	ps->head = InvalidBlockNumber;
+	ps->entryblk = InvalidBlockNumber;
+	ps->entryoff = InvalidOffsetNumber;
+
+	key = lion_probe_value(&walk->probe, key);
+	lion_probe_search_key(walk->state, &walk->probe, key, hash, &sk);
+
+	if (!walk->probe.walk)
+	{
+		/*
+		 * The keys are in no order the directory knows: every one is located
+		 * as the single lookup locates it - a descent, or the leaf walk.
+		 */
+		if (!lion_dir_find(index, NULL, walk->state->ix, &sk,
+						   BUFFER_LOCK_SHARE, false, &buf, &off, NULL))
+		{
+			if (BufferIsValid(buf))
+				UnlockReleaseBuffer(buf);
+			return false;
+		}
+		lion_posting_set_take(index, walk->state, buf, off, ps);
+		return true;
+	}
+
+	if (had)
+	{
+		if (walk->hikeylen == 0 || lion_cmp_entry(walk->hikey, &sk) > 0)
+		{
+			/* on the last leaf, or right of it if it has split since */
+			if (BufferIsValid(walk->buf))
+			{
+				buf = walk->buf;
+				walk->buf = InvalidBuffer;
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+			}
+			else
+				buf = lion_dir_read_leaf(index, walk->blk);
+			walk->stepok = true;
+		}
+		else
+		{
+			lion_lookup_walk_pause(walk);
+			if (walk->stepok && BlockNumberIsValid(walk->rightlink))
+			{
+				buf = lion_dir_read_leaf(index, walk->rightlink);
+				stepping = true;
+			}
+		}
+
+		/*
+		 * Right, past what split off since - as far as it takes, as in a
+		 * descent - or past leaves with no key of the caller's, a few at most.
+		 */
+		for (steps = 1; BufferIsValid(buf); steps++)
+		{
+			Page		page = BufferGetPage(buf);
+
+			if (LionPageIsRightmost(page) ||
+				lion_cmp_entry(lion_dir_highkey(page), &sk) > 0)
+				break;
+			if (stepping && steps >= walk->maxsteps)
+			{
+				UnlockReleaseBuffer(buf);
+				buf = InvalidBuffer;
+				walk->stepok = false;
+				break;
+			}
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+		}
+	}
+	else
+		lion_lookup_walk_pause(walk);
+
+	if (BufferIsValid(buf))
+		off = lion_dir_binsrch(BufferGetPage(buf), &sk);
+	else
+	{
+		buf = lion_dir_search(index, NULL, walk->state->ix, &sk,
+							  BUFFER_LOCK_SHARE, false, &off);
+		if (had)
+			walk->stepok = (BufferGetBlockNumber(buf) == prevright);
+	}
+
+	/*
+	 * Where the walk stands now: the leaf the key's run begins on, its right
+	 * sibling and its high key, copied while it is locked.  A high key longer
+	 * than a pivot can be is damage the next read of the page reports; the
+	 * walk just does not keep its place past it.
+	 */
+	{
+		Page		page = BufferGetPage(buf);
+
+		walk->blk = BufferGetBlockNumber(buf);
+		walk->rightlink = LionPageGetOpaque(page)->rightlink;
+		walk->hikeylen = 0;
+		if (!LionPageIsRightmost(page))
+		{
+			ItemId		iid = PageGetItemId(page, FirstOffsetNumber);
+			LionEntryTuple *hk = (LionEntryTuple *) PageGetItem(page, iid);
+			Size		len = ItemIdGetLength(iid);
+
+			if (len >= LION_ENTRY_HDRSZ &&
+				len <= MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) &&
+				(Size) hk->keylen <= len - LION_ENTRY_HDRSZ)
+			{
+				memcpy(walk->hikey, hk, len);
+				walk->hikeylen = len;
+			}
+			else
+				walk->blk = InvalidBlockNumber;
+		}
+	}
+
+	located = lion_dir_scan_run(index, &sk, BUFFER_LOCK_SHARE, &buf, &off,
+								&moved);
+	if (located)
+	{
+		lion_fill_posting_set(index, walk->state, buf, off, ps, &keeppin);
+		if (keeppin)
+		{
+			IncrBufferRefCount(buf);
+			ps->pinbuf = buf;
+		}
+	}
+
+	if (moved)
+	{
+		UnlockReleaseBuffer(buf);
+		lion_lookup_walk_restart(walk);
+		return located;
+	}
+
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	if (located && !keeppin)
+		ReleaseBuffer(buf);
+	else
+		walk->buf = buf;
+
+	/*
+	 * Keys that come close together will want the next leaf too: ask for it
+	 * now, with nothing locked, so that the read overlaps the count.
+	 */
+	if (walk->prefetch && walk->stepok && BlockNumberIsValid(walk->blk) &&
+		BlockNumberIsValid(walk->rightlink) &&
+		walk->rightlink != walk->prefetched)
+	{
+		(void) PrefetchBuffer(index, MAIN_FORKNUM, walk->rightlink);
+		walk->prefetched = walk->rightlink;
+	}
+
+	return located;
+}
+
 /*
  * The same for the rows whose key is NULL (DESIGN.md §14).  The entry sorts
  * before every real key (LION_KIND_NULL), so the descent finds it on the
@@ -2154,6 +2480,23 @@ lion_spill_read(const LionMatSet *mat, int i, LionContainer *buf)
 	BufFileReadExact(mat->file, buf, e->size);
 }
 
+/*
+ * Keep a finished spill's first container in memory (LionMatSet.first): what
+ * every cursor built over the set reads first, whatever it is sought to next.
+ */
+static void
+lion_spill_keep_first(LionMatSet *mat, MemoryContext cxt)
+{
+	Size		size;
+
+	if (mat->ncontainers == 0)
+		return;
+	size = MAXALIGN(Max((Size) mat->spill[0].size, LION_CONTAINER_HDRSZ));
+	mat->first = (LionContainer *) MemoryContextAlloc(cxt, size);
+	lion_spill_read(mat, 0, mat->first);
+	mat->held += size;
+}
+
 
 /* ---------------------------------------------------------------------
  * Container cursors
@@ -2309,6 +2652,11 @@ lion_cursor_next_item(LionSetCursor *cur)
 			return NULL;
 		if (mat->file != NULL)
 		{
+			if (cur->matidx == 0 && mat->first != NULL)
+			{
+				cur->matidx++;
+				return mat->first;
+			}
 			lion_spill_read(mat, cur->matidx++, cur->cbuf);
 			return cur->cbuf;
 		}
@@ -6404,6 +6752,15 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	if (col.spilled)
 	{
 		mat = lion_spill_finish(&col.sp);
+
+		/*
+		 * Every count against the copy - the FK-side join's per dimension
+		 * key, a GROUP BY's per group - builds a cursor over it, and a cursor
+		 * starts at the first container: keep that one in memory, so that a
+		 * count reads the file once, for the container it is sought to, and
+		 * not twice.
+		 */
+		lion_spill_keep_first(mat, CurrentMemoryContext);
 		out->found = true;
 		out->mat = mat;
 		out->ntids = col.members;

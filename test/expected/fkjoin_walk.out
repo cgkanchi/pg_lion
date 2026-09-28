@@ -1,0 +1,716 @@
+-- FK-side join pushdown, part six (DESIGN.md §27, "Lookups in key order"):
+-- the dimension's keys looked up a batch at a time, sorted into the fk
+-- index's order, by one walk of its directory leaves instead of a descent
+-- per key.
+--
+-- The cost model takes the walk where a descent crosses two internal levels
+-- or more and a batch holds more keys than there are leaves between them.
+-- So the fk index here is built with a low fillfactor: some eleven thousand
+-- keys over some five hundred leaves, under a directory of height 2, which
+-- a dimension of a few thousand keys covers densely.  Every answer is
+-- checked against the same query with the pushdown off, as a multiset in
+-- both directions, and the helpers say whether the node walked.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+/*
+ * lion_wj() runs a query through the pushdown with every join method
+ * disabled, so that the node is EXERCISED, and again with the pushdown off
+ * and sequential scans only, so that the reference reads no lion posting
+ * set, and compares the two.  It reports whether the node was used, and
+ * whether it looked its keys up in key order or a row at a time.
+ */
+CREATE FUNCTION lion_wj(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	walked boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		ELSIF ln LIKE '%Join Key Lookups: in index order%' THEN
+			walked := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_wj_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_wj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_wj_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_wj_on EXCEPT ALL SELECT * FROM lion_wj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_wj_off EXCEPT ALL SELECT * FROM lion_wj_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_wj_on, lion_wj_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  CASE WHEN walked THEN 'in key order' ELSE 'a row at a time' END,
+				  nrows);
+END $$;
+/*
+ * The same with a generic prepared plan, which keeps $n a Param: the fact
+ * filter's value is known only when the node starts.
+ */
+CREATE FUNCTION lion_wj_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	walked boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_wjp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_wjp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		ELSIF ln LIKE '%Join Key Lookups: in index order%' THEN
+			walked := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_wj_on AS EXECUTE lion_wjp_on(%s)', args);
+
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'PREPARE lion_wjp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_wj_off AS EXECUTE lion_wjp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_wjp_on';
+	EXECUTE 'DEALLOCATE lion_wjp_off';
+
+	EXECUTE 'SELECT count(*) FROM lion_wj_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_wj_on EXCEPT ALL SELECT * FROM lion_wj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_wj_off EXCEPT ALL SELECT * FROM lion_wj_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_wj_on, lion_wj_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  CASE WHEN walked THEN 'in key order' ELSE 'a row at a time' END,
+				  nrows);
+END $$;
+/*
+ * lion_wj_par() runs a query through the pushdown with every join method
+ * disabled three ways - as planned with parallel plans allowed, serially,
+ * and with the pushdown off - and compares both of the first two with the
+ * third.  It says which plan the first one had.
+ */
+CREATE FUNCTION lion_wj_par(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	walked boolean := false;
+	nrows bigint;
+	ndiff bigint;
+	sdiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'parallel' THEN
+			how := 'serial';
+		ELSIF ln LIKE '%Join Key Lookups: in index order%' THEN
+			walked := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_wj_par AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE format('CREATE TEMP TABLE lion_wj_ser AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_wj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_wj_par' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_wj_par EXCEPT ALL SELECT * FROM lion_wj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_wj_off EXCEPT ALL SELECT * FROM lion_wj_par) b)'
+		INTO ndiff;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_wj_ser EXCEPT ALL SELECT * FROM lion_wj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_wj_off EXCEPT ALL SELECT * FROM lion_wj_ser) b)'
+		INTO sdiff;
+	EXECUTE 'DROP TABLE lion_wj_par, lion_wj_ser, lion_wj_off';
+
+	IF ndiff <> 0 OR sdiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ in parallel, %s serially', ndiff, sdiff);
+	END IF;
+	RETURN format('%s, %s, %s rows', how,
+				  CASE WHEN walked THEN 'in key order' ELSE 'a row at a time' END,
+				  nrows);
+END $$;
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_wj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+/*
+ * EXPLAIN of the node and what is above it, joins disabled.  The dimension's
+ * own plan is printed as one line: it is whatever each major makes of it.
+ */
+CREATE FUNCTION lion_wj_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	seen boolean := false;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		IF seen AND ln ~ '^\s*->' THEN
+			RETURN NEXT regexp_replace(ln, '->.*$', '->  (the dimension''s plan)');
+			RETURN;
+		END IF;
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			seen := true;
+		END IF;
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+/*
+ * The fact: 24000 rows whose int8 fk runs over 1..12000, every key twice and
+ * in an order unrelated to the key's.  NULL on every 50th row - both rows of
+ * the 240 keys those are, which therefore have none - and no row for the
+ * keys that are multiples of 23.  x has 10 values, t 7.  The fk index is
+ * built at fillfactor 20, some 23 entries a leaf.
+ */
+CREATE TABLE lion_kof (id int NOT NULL, fk int8, x int NOT NULL, t text NOT NULL);
+INSERT INTO lion_kof
+SELECT i, CASE WHEN i % 50 = 0 THEN NULL WHEN k % 23 = 0 THEN NULL ELSE k END,
+	   i % 10, 't' || (i % 7)
+FROM (SELECT i, (i * 7919) % 12000 + 1 AS k FROM generate_series(1, 24000) i) s;
+CREATE INDEX lion_kof_fk ON lion_kof USING lion (fk) WITH (fillfactor = 20);
+CREATE INDEX lion_kof_x ON lion_kof USING lion (x);
+CREATE INDEX lion_kof_t ON lion_kof USING lion (t);
+/*
+ * The dimension: 4000 rows, an int8 primary key over every third key of the
+ * fact's range - 260 of them have no fact row, ten of those past its end -
+ * attr 0..6 with NULL on every 13th, a region and a group.
+ */
+CREATE TABLE lion_kod (
+	pk		int8	PRIMARY KEY,
+	attr	int,
+	region	text	NOT NULL,
+	grp		text	NOT NULL
+);
+INSERT INTO lion_kod
+SELECT CASE WHEN i <= 3990 THEN i * 3 ELSE 12000 + (i - 3990) * 5 END,
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
+	   CASE i % 3 WHEN 0 THEN 'eu' WHEN 1 THEN 'us' ELSE 'ap' END,
+	   'g' || (i % 5)
+FROM generate_series(1, 4000) i;
+/*
+ * A dimension whose key nothing proves unique: 6000 rows over 3000 keys
+ * spread over the fact's range, every key twice but where a row's key is
+ * NULL (every 40th row).
+ */
+CREATE TABLE lion_kodn (k int8, attr int NOT NULL);
+INSERT INTO lion_kodn
+SELECT CASE WHEN i % 40 = 0 THEN NULL ELSE ((i * 13) % 3000) * 4 + 1 END, i % 4
+FROM generate_series(1, 6000) i;
+VACUUM (FREEZE, ANALYZE) lion_kof;
+VACUUM (FREEZE, ANALYZE) lion_kod;
+VACUUM (FREEZE, ANALYZE) lion_kodn;
+-- ---- 1. the directory and the plans -------------------------------------------
+SELECT directory_height, leaf_pages < 4000 AS fewer_leaves_than_keys
+FROM lion_index_stats('lion_kof_fk');
+ directory_height | fewer_leaves_than_keys 
+------------------+------------------------
+                2 | t
+(1 row)
+
+-- the dimension's keys are looked up in key order
+SELECT * FROM lion_wj_explain('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+                lion_wj_explain                
+-----------------------------------------------
+ Finalize HashAggregate
+   Group Key: d.attr
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_kof_fk (fk = d.pk)
+         Join Key Lookups: in index order
+         ->  (the dimension's plan)
+(6 rows)
+
+-- ... and the distinct keys of a forward semi join over a non-unique key
+SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+               lion_wj_explain                
+----------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_kof_fk (fk = d.k)
+         Join Type: Semi
+         Join Keys: distinct, sorted
+         Join Key Lookups: in index order
+         ->  (the dimension's plan)
+(7 rows)
+
+-- a few dozen keys over five hundred leaves: a descent each, as before
+SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
+                lion_wj_explain                
+-----------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_kof_fk (fk = d.pk)
+         ->  (the dimension's plan)
+(4 rows)
+
+-- ---- 2. the answers ------------------------------------------------------------
+-- inner joins, grouped and not, with fact filters and dimension filters
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 8 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 8 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.grp, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x IN (1, 2) AND d.region = ''eu'' GROUP BY d.grp');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 2 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.region, d.grp, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.t = ''t4'' GROUP BY d.region, d.grp');
+              lion_wj               
+------------------------------------
+ pushed down, in key order, 15 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.grp = ''g1''');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 77');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr HAVING count(*) > 900 ORDER BY d.attr NULLS FIRST');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
+(1 row)
+
+-- the forward EXISTS over the unique key is the inner join
+SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE f.x = 4 AND EXISTS (SELECT 1 FROM lion_kod d WHERE d.pk = f.fk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+-- count(DISTINCT): the dimension rows that join, tested in key order
+SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.grp, count(DISTINCT d.attr) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.t = ''t2'') GROUP BY d.grp');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 5 rows
+(1 row)
+
+-- reverse semi and anti joins, the dimension's rows each once
+SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kod d WHERE d.pk IN (SELECT f.fk FROM lion_kof f WHERE f.t = ''t3'') GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 8 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.region, count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3) GROUP BY d.region');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 3 rows
+(1 row)
+
+-- ... over the non-unique key: every row of a duplicated key, NULL keys too
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kodn d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k AND f.t = ''t3'') GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 4 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k AND f.x = 77)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+-- the forward semi join over the non-unique key, counted over its distinct keys
+SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE f.x = 4 AND f.fk IN (SELECT d.k FROM lion_kodn d)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+-- three filters keep too few keys to walk; the answer is the same
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
+               lion_wj                
+--------------------------------------
+ pushed down, a row at a time, 1 rows
+(1 row)
+
+-- ---- 3. what the walk read -------------------------------------------------------
+-- every dimension key is looked up; 260 of them find no entry, the ten past
+-- the fact's range among them
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk', 'Join Keys Looked Up') AS looked_up,
+	   lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk', 'Join Keys Without Entry') AS without_entry,
+	   lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk', 'Join Key Batches') AS batches;
+ looked_up | without_entry | batches 
+-----------+---------------+---------
+      4000 |           260 |       1
+(1 row)
+
+-- 5850 rows with a key, 2925 distinct: a duplicated key is looked up once
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k)', 'Join Keys Looked Up') AS looked_up,
+	   lion_wj_counter('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)', 'Join Keys Looked Up') AS distinct_keys;
+ looked_up | distinct_keys 
+-----------+---------------
+      5850 |          2925
+(1 row)
+
+-- few of the keys have a row the filter leaves: the walk stays on each leaf
+-- from one key to the next and reads fewer directory pages than there are
+-- keys, where a descent per key reads three a key
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t3'')', 'Directory Pages Read')
+	< lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t3'')', 'Join Keys Looked Up') AS fewer_pages_than_keys;
+ fewer_pages_than_keys 
+-----------------------
+ t
+(1 row)
+
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Directory Pages Read')
+	>= 3 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Join Keys Looked Up') AS a_descent_a_key;
+ a_descent_a_key 
+-----------------
+ t
+(1 row)
+
+-- a batch is what work_mem holds: at 256 kB the keys come in more than one
+SET work_mem = '256kB';
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x < 8 GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 8 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.t = ''t6'')');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj_counter('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x < 8 GROUP BY d.attr', 'Join Key Batches') > 1 AS several_batches;
+ several_batches 
+-----------------
+ t
+(1 row)
+
+RESET work_mem;
+-- ---- 4. rescans and generic plans ---------------------------------------------------
+-- a correlated subquery rescans the node - its batches and its walk - with a
+-- new fact filter per outer row
+SELECT lion_wj('SELECT g, (SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = g.g) FROM generate_series(0, 4) g');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 5 rows
+(1 row)
+
+SELECT lion_wj('SELECT g, (SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = g.g)) FROM generate_series(0, 10) g');
+              lion_wj               
+------------------------------------
+ pushed down, in key order, 11 rows
+(1 row)
+
+SELECT lion_wj_prep('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = $1 GROUP BY d.attr', '5');
+           lion_wj_prep            
+-----------------------------------
+ pushed down, in key order, 8 rows
+(1 row)
+
+SELECT lion_wj_prep('SELECT count(*) FROM lion_kof f WHERE f.t = $1 AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)', '''t5''');
+           lion_wj_prep            
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj_prep('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = $1)', 'NULL');
+           lion_wj_prep            
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+-- ---- 5. parallel plans -------------------------------------------------------------
+-- each participant sorts and walks the share of the keys it gets
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+ALTER TABLE lion_kod SET (parallel_workers = 2);
+ALTER TABLE lion_kodn SET (parallel_workers = 2);
+SELECT lion_wj_par('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+          lion_wj_par           
+--------------------------------
+ parallel, in key order, 8 rows
+(1 row)
+
+SELECT lion_wj_par('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
+          lion_wj_par           
+--------------------------------
+ parallel, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj_par('SELECT d.region, count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.t = ''t2'') GROUP BY d.region');
+          lion_wj_par           
+--------------------------------
+ parallel, in key order, 3 rows
+(1 row)
+
+SELECT lion_wj_par('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x IN (2, 4)');
+          lion_wj_par           
+--------------------------------
+ parallel, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj_par('SELECT count(*) FROM lion_kof f WHERE f.x = 6 AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+          lion_wj_par           
+--------------------------------
+ parallel, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj_par('SELECT d.attr, count(*) FROM lion_kodn d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k) GROUP BY d.attr');
+          lion_wj_par           
+--------------------------------
+ parallel, in key order, 4 rows
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET parallel_leader_participation;
+-- ---- 6. a dirty heap: deletes and updates on both sides, not yet vacuumed ----------
+DELETE FROM lion_kof WHERE fk % 11 = 0;
+UPDATE lion_kof SET fk = fk + 3 WHERE fk % 13 = 1 AND x < 5;
+UPDATE lion_kof SET x = 3 WHERE id % 97 = 0;
+INSERT INTO lion_kof SELECT 24000 + i, i * 3, 3, 't3' FROM generate_series(1, 40) i;
+DELETE FROM lion_kod WHERE pk % 39 = 0;
+UPDATE lion_kod SET attr = 6 WHERE pk % 17 = 0;
+DELETE FROM lion_kodn WHERE k % 19 = 0;
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.region, count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk) GROUP BY d.region');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 3 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k AND f.t = ''t3'')');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+-- ... and after VACUUM
+VACUUM (FREEZE, ANALYZE) lion_kof;
+VACUUM (FREEZE, ANALYZE) lion_kod;
+VACUUM (FREEZE, ANALYZE) lion_kodn;
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.region, count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk) GROUP BY d.region');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 3 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k AND f.t = ''t3'')');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+DROP TABLE lion_kof, lion_kod, lion_kodn;
+DROP FUNCTION lion_wj(text);
+DROP FUNCTION lion_wj_prep(text, text);
+DROP FUNCTION lion_wj_par(text);
+DROP FUNCTION lion_wj_counter(text, text);
+DROP FUNCTION lion_wj_explain(text);

@@ -238,6 +238,29 @@ lion_dir_step_right(Relation index, Buffer buf, int lockmode)
 	return nbuf;
 }
 
+/*
+ * A leaf a reader remembered by its block number, read and locked SHARE again
+ * (DESIGN.md §27, "Lookups in key order").  A directory page never changes
+ * level and is never freed, and a split moves keys only rightwards, so the
+ * page is still a leaf and still holds every key at or above the lower bound
+ * it had when it was remembered - or has passed it to a page on its right,
+ * which the caller reaches by moving right as a descent does.  The caller
+ * holds no content lock, so interrupts are checked first, with none held.
+ */
+Buffer
+lion_dir_read_leaf(Relation index, BlockNumber blk)
+{
+	Buffer		buf;
+
+	CHECK_FOR_INTERRUPTS();
+	buf = lion_dir_readbuf(index, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	lion_dir_check_page(index, BufferGetPage(buf), blk);
+	lion_dir_check_level(index, BufferGetPage(buf), blk, 0);
+
+	return buf;
+}
+
 /* ---------------------------------------------------------------------
  * The order (DESIGN.md §21)
  * --------------------------------------------------------------------- */

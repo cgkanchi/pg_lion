@@ -4800,6 +4800,12 @@ EXPLAIN ANALYZE reports **Directory Pages Read**, the leaves and internal pages 
 is what `test/sql/directory.sql` uses to prove that a thousand-value IN list costs one pass over the
 leaves its values live on rather than a descent each.
 
+The FK-side join's lookups take the same order one key at a time (`LionLookupWalk`, §27 "Lookups in
+key order"): a count runs between two of them and reads the heap, so no directory page may stay
+locked from one to the next, and the walk keeps its PLACE instead - the leaf, its right sibling and
+a copy of its high key - and reads the leaf again by its block number. That rests on the same
+invariant the list walk does: a page's lower bound never moves.
+
 **A link read from a directory page is data, and a damaged one is an ERROR (INDEX_CORRUPTED), not a
 walk** (2026-09-25 review). verify() checks all of the above offline; a reader checks, per page it
 reads and at the cost of a comparison each, only what it would otherwise follow blindly:
@@ -7076,7 +7082,8 @@ per-partition unique indexes over repeating values, then a primary key.
 
 Formerly the §23 backlog item of the same name; the semi and anti joins (`EXISTS`, `IN`, `NOT
 EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`,
-parallel plans and the forward semi join over a non-unique key after them. The shape is the
+parallel plans and the forward semi join over a non-unique key after them; the lookups in key order
+on 2026-09-28. The shape is the
 star-schema aggregate
 
     SELECT d.attr, count(*)
@@ -7195,11 +7202,13 @@ lookup answers that clause exactly when the clause is one the pushdown already a
 - **The fact side is the §9 count, unchanged.** Each dimension row's fk set is located with
   `lion_posting_set_lookup_col()`, counted with `lion_count_sources_cached()` beside the fact
   filters' sources, and released before the next dimension row, so at any moment one fk set and
-  the WHERE sets hold pins. The pin budget of §15 applies to that lookup as to every single lookup
-  (a NOPIN set is re-located, or covered by another source, by the count itself), and no argument
-  of §9, §11 or §15 changes: the fk set is to this node what one group's set is to §15's GROUP BY
-  driver. The visibility cache is shared across dimension rows as it is across groups, and the fk
-  index takes the `PredicateLockRelation()` every index the node opens takes.
+  the WHERE sets hold pins - and, when the keys are looked up in key order, the walk's leaf, which
+  is the fk set's own leaf or one no count follows on ("Lookups in key order"). The pin budget of
+  §15 applies to that lookup as to every single lookup (a NOPIN set is re-located, or covered by
+  another source, by the count itself), and no argument of §9, §11 or §15 changes: the fk set is to
+  this node what one group's set is to §15's GROUP BY driver. The visibility cache is shared
+  across dimension rows as it is across groups, and the fk index takes the
+  `PredicateLockRelation()` every index the node opens takes.
 - **One snapshot for both sides.** The child and the count both read `es_snapshot`, so a fact row
   is counted for a dimension row exactly when both are visible to it - which is the join.
 - **The WHERE sets' pins are held across the child** - until the node returns its first row. The
@@ -7211,6 +7220,8 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   under a slow qual - and not a correctness issue: the VACUUM waits (autovacuum skips the page).
   From the first row on the WHERE sets are NOPIN copies, each count carried by its fk set's pin,
   and the node holds no pin between rows or after its last (§15, "Paused and finished counts").
+  A plan that looks its keys up in key order gives them up before it reads its first batch of
+  child rows instead ("Lookups in key order"), so its child never runs with them pinned.
 
 ### Planner integration
 
@@ -7244,8 +7255,9 @@ a dimension column's target-list kind is its position in the child's target list
 `LION_PRIV_NMEMBERS` 12.
 
 **Cost** (`lion_cost_fkjoin_rel()`): the child's total cost, plus per dimension row one directory
-descent (the leaf at `lion_heap_page_cost()`'s interpolated cost, capped by the directory's pages:
-dimension rows come in heap order, not key order), a fixed per-count cost for a merge set up and
+descent (the leaf at `lion_heap_page_cost()`'s interpolated cost, capped by the directory's pages) -
+or, where that is cheaper, a step of a walk of the leaves in key order ("Lookups in key order",
+2026-09-28) - a fixed per-count cost for a merge set up and
 torn down (`LION_FKJOIN_COUNT_COST`, 50 `cpu_tuple_cost`, the order §26 measured per test), the fk
 set's containers - `lion_containers_for(heap_pages, rows per fk value)` - at §10's two
 `cpu_operator_cost` each, a PROBE into each fact filter's set at the container keys the two have in
@@ -7936,6 +7948,119 @@ with 139,929 dimension rows, which the inner join's node loses to the hash join 
 here because it looks up the 46,957 distinct keys and not the rows. The workers are the fk index
 pages' (as for the other joins), so `bdh`'s thousand keys get none.
 
+### Lookups in key order (2026-09-28)
+
+Each dimension row's lookup was a descent of the fk index's directory - the root, the internal
+levels and a leaf - in the order the child returned the rows, which is not the fk index's. Over a
+high-cardinality fk the directory is large: at the default fillfactor a leaf holds about a hundred
+INLINE entries of a few rows each, so a million keys are some ten thousand leaves under a directory
+of height 2. A dimension set of tens of thousands of keys then descended as many times, through
+leaves spread all over that directory with no two consecutive lookups on the same one - a random
+read of a leaf per key wherever the directory is not in the cache, and each leaf read again for
+every key it holds. A benchmark found such a join slower than the hash join the planner chose in
+its place. What the model charged for those leaves - each read once, at the interpolated cost of
+a set that dense - was what a lookup in key order would read, not what the lookups did.
+
+So the node looks the keys up in key order when the plan says so (`LION_JOINFLAG_WALK`, chosen by
+the cost model, below):
+
+- it reads the child's rows a BATCH at a time, as many as `work_mem` holds - each row copied as a
+  MinimalTuple, and for a forward semi join over a non-unique key each distinct key alone - and
+  sorts the batch into the directory's order: the probe's own comparison of two key values, then
+  the hash, which is the order `lion_posting_set_lookup_many_col()` sorts an IN list into (§21,
+  "Readers") and the order of an unordered column's directory. Keys the directory cannot sort (a
+  cross-type key whose family has no ordering for that type, `lion_probe_init()`) are looked up a
+  row at a time, as before;
+- it looks the batch's keys up in that order with one WALK of the leaves (`LionLookupWalk`,
+  lion_count.c), and counts each key's set exactly as the row-at-a-time loop does;
+- a key that appears again in the batch - two dimension rows with one key, which a semi or anti
+  join counts once each - comes out of the sort next to the first, and takes its answer instead
+  of a second lookup.
+
+**The walk keeps its place between keys**: the leaf the last key was located on, that leaf's right
+sibling and a copy of its high key, all taken while the leaf was locked. A key below that high key
+is on that leaf, or - if the leaf has split since - right of it, where the walk moves right as a
+descent does. A key at or above it is on the right sibling or further right, and while the keys
+have been close together the walk steps there, at most `height` pages (stepping over s pages reads
+s, a descent height + 1); otherwise, or past those, it descends from the root. A descent that
+lands on the old right sibling says the keys are close again. A key found by following a run of
+hash collisions across a page boundary leaves the walk to the right of where that run begins, and
+the walk forgets its place, as the list walk does. So a batch whose keys are dense reads each leaf
+it covers once, and one whose keys are sparse costs a descent a key, as before.
+
+**Why the place may be kept.** A directory page never changes level and is never freed, and a split
+moves keys only rightwards (§21, "Readers"), so a page's lower bound never moves. A key that sorts
+at or after the last one is therefore on the remembered leaf or to its right. The remembered right
+sibling's lower bound is the high key the walk copied, so a key at or above that is on the sibling
+or to its right - even when the leaf has split meanwhile and has a new right sibling in between,
+which holds only keys below that bound. A leaf read again by its block number is checked to be a
+directory leaf, as every link the readers follow is (`lion_dir_read_leaf()`), and every step right
+releases the page it leaves first and checks for interrupts with nothing locked
+(`lion_dir_step_right()`).
+
+**Why the counts are the join's.** Each row's count is computed from the set a descent would have
+located - the walk finds the same entry - the same way and under the same snapshot, and the set is
+located, counted and released before the next row's is located. Only the ORDER of the rows
+changes, and nothing above the node depends on it: the node claims no pathkeys, the partial counts
+are grouped and added up by core's Finalize Agg whatever order they come in, and the rows of a
+`count(DISTINCT)` go through core's Sort. A duplicate's answer is its first occurrence's because
+the count of one key under one snapshot is one number. In a parallel plan each participant sorts
+and walks its own share: the rows its partial child gives it, or the runs of distinct keys it
+claims ("Forward semi joins over a non-unique key"), which are claimed as the keys are read into a
+batch, in the same sequence as before.
+
+**Pins and locks (§9, §15 "Paused and finished counts").** No lock is held between two keys, and
+none while a set is counted, which is when the heap is read. The walk holds a pin on its leaf from
+one lookup to the next only when the key's set is INLINE - whose own §9 pin is on that very leaf -
+or the key has no entry, when no count follows at all; a CHAIN set's count may read its posting tree
+for as long as it takes, and the leaf is not held through it. Before a row goes up
+(`lion_pause_run()`) the walk lets its leaf go and reads it again by its block number for the next
+key. It does the same before each batch is filled, since the child runs then, and the WHERE sets
+give up their pins at that point as well: the row-at-a-time loop keeps them across the child only
+until its first row that joins, a batch would keep them across a whole batch of child rows. Every
+count after that is carried by its fk set's own pin, as every count after the first row always was
+("Visibility and the §9 interlock"); the §9 argument is unchanged, since each set counted against
+the visibility map is still counted under its own pin.
+
+**Cost** (`lion_cost_fkjoin_walk()`), in `LION_DESCENT_COST` a page visited, from what the walk
+does: a descent (height + 1 pages) per batch; per row, the visit of its leaf, one page, and its
+place in the batch - the row copied in, its share of the sort and the slot it is handed back in -
+`LION_FKJOIN_BATCH_ROW_COST`; and between two keys `leaves / keys` leaves on average, stepped over a
+page each while that is at most the height, or a descent's internal levels past it. The batches are
+`work_mem` over the child row's width plus `LION_FKJOIN_BATCH_ENT_BYTES`. The model takes the walk
+where it is cheaper than a descent a row, (height + 1) pages. `LION_FKJOIN_BATCH_ROW_COST` is one
+page visit, on the high side: putting a key into the datum sort of "Forward semi joins over a
+non-unique key", sorting it and taking it out again measured at a fraction of what a page visit is
+fitted at, and a row's copy and its slot are of the same order. High on purpose: the walk replaces
+the internal levels of a descent with it, so it is taken only where a descent crosses two internal
+levels or more and a batch holds more keys than there are leaves between them - never over a
+directory of height 1, whose descent is the root and a leaf. So no plan over an fk index of a few
+thousand keys changes, and the plans the suite pins are all of that kind. The leaves themselves are
+priced as before, each read once: that is what the walk reads, and what the descents read too while
+the directory stays in the cache.
+
+**Prefetch.** While the keys are close together the walk asks for the right sibling of each leaf it
+lands on (`PrefetchBuffer()`), after letting go of its lock, where the tablespace's io concurrency
+is above zero: a leaf the next keys will want, read while the current key's set is counted.
+
+**The fact filters' copy, probed per key.** Each count of an fk set against the collected copy of
+the fact filters ("The fact filters, collected once") is driven by the source with the fewer rows -
+the fk set, a few rows, against a copy of many - and seeks the copy with a binary search at each of
+the set's container keys (`lion_cursor_seek()`), over the keys memory keeps of it when it is
+spilled; no count passes over the copy. What each count did read that it did not need was the copy's
+FIRST container: a cursor is built standing at it, and a spilled copy read it back from its
+temporary file at every count, a second read of the file for every key. The spilled copy now keeps
+that one container in memory as well (`LionMatSet.first`), so a count reads the file once, for the
+container it is sought to. So does a GROUP BY's spilled copy of its WHERE items (§10, "The WHERE
+sets, collected once"), which `lion_sources_collect()` makes the same way and every group's count
+reads the same way; a range taken as a source (§32) is collected by a union of its own and is left
+as it was.
+
+**EXPLAIN** prints `Join Key Lookups: in index order` under the join's other properties, and with
+ANALYZE `Join Key Batches`, the batches of every participant and run. `Directory Pages Read` is the
+walk's pages: about the leaves the keys cover plus a descent a batch, and a leaf again after each
+row that goes up, where a descent per key reads height + 1 pages a key.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -8073,6 +8198,29 @@ Sorted` to one participant's, both over four rescans of the Gather as well, a ge
 volatile dimension filter that keeps the node serial, `parallel_workers = 0` and
 `debug_parallel_query`. EXPLAIN prints the node and what is above it, and the dimension's own plan
 as one line (`lion_nj_explain()`), because that plan is whatever each major makes of a small scan.
+
+`test/sql/fkjoin_walk.sql` (2026-09-28), lookups in key order, against the pushdown off: a fact of
+24,000 rows whose fk runs over 12,000 keys, every key twice in an order unrelated to the key's, with
+NULL fks and keys without rows, under an fk index built at fillfactor 20 so that its directory has
+height 2 with some five hundred leaves; a 4,000-row dimension over every third key, some of them
+absent from the fact and ten past its range, and a 6,000-row dimension over 3,000 keys, duplicated,
+with NULL keys. Each answer is checked as `lion_wj()` checks it, which also says whether the plan
+walked: inner joins grouped by one and two dimension columns and ungrouped, with fact filters (`=`,
+IN, one with no entry) and dimension filters, HAVING and ORDER BY; the forward EXISTS over the
+unique key; `count(DISTINCT)` of the key and of a dimension column; reverse semi and anti joins over
+both dimensions, duplicated and NULL keys among them, and an anti join whose fact filter selects
+nothing; the forward semi join over the non-unique key, counted over its distinct keys, and its
+`count(DISTINCT)`; and a dimension filtered to a few dozen keys, which the model looks up a row at a
+time. EXPLAIN shows `Join Key Lookups: in index order` for the walked plans and not for that one.
+The counters: `Join Keys Looked Up` and `Without Entry` (every key looked up, a duplicated one too),
+the distinct keys of the forward semi join, a walk that reads fewer directory pages than it has keys
+(a fact filter few keys have rows under, so the walk stays on each leaf from key to key) against the
+row-at-a-time plan's three pages a key, and more than one batch at a `work_mem` of 256 kB, with the
+answers unchanged. Then correlated subqueries that rescan the node - its batches and its walk -
+with a new fact filter per outer row, generic plans with a Param fact filter (a NULL one included),
+parallel plans of each shape (`lion_wj_par()`, as `lion_pj()` does), and a dirty heap - deletes and
+updates on both sides, and fks moved to other keys - before and after VACUUM. The walk's choices do
+not depend on `work_mem` above a few hundred kilobytes, and at the default the batches are one.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 

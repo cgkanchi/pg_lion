@@ -505,6 +505,60 @@ extern bool lion_probe_find(Relation index, LionState *state, LionProbe *probe,
 							OffsetNumber *off);
 
 /*
+ * A WALK of one key column's directory leaves, for the single lookups of many
+ * keys that a caller hands over one at a time, in the directory's order: the
+ * FK-side join's dimension keys, sorted a batch at a time (DESIGN.md §27,
+ * "Lookups in key order").  Where lion_posting_set_lookup_many_col() locates
+ * a whole list under one walk, this keeps the walk's PLACE between lookups -
+ * the leaf the last key was located on - because between two of them the
+ * caller counts a set, which reads the heap, and no directory page may be
+ * locked while it does.  So the walk holds no lock between lookups, and a pin
+ * only on the leaf the last key's INLINE set pins as well (or, for a key with
+ * no entry, until the next lookup): lion_lookup_walk_pause() lets it go, and
+ * the next lookup reads the leaf again by its block number.
+ *
+ * A key sorted after the last one is on that leaf, or to its right: a
+ * directory page never changes level and is never freed, and splits move keys
+ * only rightwards (DESIGN.md §21, "Readers").  The walk stays on the leaf
+ * while the key is below the high key it copied from it, steps to the right
+ * sibling while the keys come that close together, and descends from the root
+ * for a key further away, so a batch whose keys are dense reads each leaf once
+ * and one whose keys are sparse costs a descent a key, as single lookups do.
+ *
+ * Keys must be handed over in the order lion_lookup_walk_cmp() sorts them, or
+ * the walk would look for a key to the right of where it is; a caller whose
+ * keys cannot be sorted so (lion_lookup_walk_ordered() false) still gets every
+ * key located, each by a descent of its own.
+ */
+typedef struct LionLookupWalk
+{
+	Relation	index;
+	LionState  *state;
+	LionProbe	probe;
+	BlockNumber blk;			/* the leaf the last key was located on */
+	Buffer		buf;			/* ... still pinned, not locked; or Invalid */
+	BlockNumber rightlink;		/* its right sibling when it was read */
+	LionEntryTuple *hikey;		/* a copy of its high key then ... */
+	Size		hikeylen;		/* ... this long; 0 if it was the rightmost */
+	int			maxsteps;		/* a step costs a page, a descent height + 1 */
+	bool		stepok;			/* the keys are close: step right, not descend */
+	bool		prefetch;		/* read the next leaf ahead of the walk */
+	BlockNumber prefetched;		/* the last block prefetched */
+	uint32		ncmp;			/* comparisons made by a sort (interrupts) */
+} LionLookupWalk;
+
+extern void lion_lookup_walk_begin(LionLookupWalk *walk, Relation index,
+								   AttrNumber attno, Oid keytype);
+extern bool lion_lookup_walk_ordered(const LionLookupWalk *walk);
+extern uint32 lion_lookup_walk_hash(LionLookupWalk *walk, Datum key);
+extern int	lion_lookup_walk_cmp(LionLookupWalk *walk, Datum a, uint32 ahash,
+								 Datum b, uint32 bhash);
+extern bool lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
+								  LionPostingSet *ps);
+extern void lion_lookup_walk_pause(LionLookupWalk *walk);
+extern void lion_lookup_walk_restart(LionLookupWalk *walk);
+
+/*
  * Count the members of the intersection of nsets already located posting
  * sets, applying snapshot to every heap block that is not all-visible.
  * *stats is accumulated into (not reset) when it is not NULL.
