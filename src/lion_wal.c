@@ -394,7 +394,17 @@ lion_wal_begin(Relation index)
 
 	state->rmgr = (lion_wal_mode(index) == LION_WAL_MODE_RMGR);
 
-	if (state->rmgr && !lion_rmgr_is_registered)
+	/*
+	 * A record of the resource manager is refused without it (see
+	 * lion_rmgr_id) - but only a record that would be WRITTEN.  An unlogged
+	 * or temporary index writes none (lion_wal_finish() only dirties the
+	 * pages, and lion_wal_visit() keeps no barrier for it), so it is written
+	 * without the preload like any other (2026-09-27 review); nothing about
+	 * it names the resource manager but the mode on its meta page.  ALTER
+	 * TABLE ... SET LOGGED rebuilds it, and the build picks the mode afresh
+	 * (lion_wal_mode_for_build()).
+	 */
+	if (state->rmgr && state->needwal && !lion_rmgr_is_registered)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("lion index \"%s\" was built for the pg_lion WAL resource manager, which this server has not registered",

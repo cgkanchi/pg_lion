@@ -1239,6 +1239,11 @@ phase1e() {
 # Both modes run it: generic mode preloads the library for the build, rmgr
 # mode drops the preload (and wal_consistency_checking, which names the
 # manager) for the VACUUM.
+#
+# An UNLOGGED rmgr-mode index rides along: it writes no WAL at all, so the
+# server without the manager must let it be written - inserted into and
+# vacuumed - where it used to refuse every write with the preload hint
+# (lion_wal_begin(), 2026-09-27 review).
 phase1f() {
 	local before after custom off
 	log ""
@@ -1258,9 +1263,16 @@ phase1f() {
 		INSERT INTO lion_norm SELECT i, i % 500 FROM generate_series(1, 100000) i;
 		CREATE INDEX lion_norm_k ON lion_norm USING lion (k)
 			WITH (wal_mode = rmgr, inline_limit = 64) WHERE id % 2 = 0;
+		DROP TABLE IF EXISTS lion_norm_u;
+		CREATE UNLOGGED TABLE lion_norm_u (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_norm_u SELECT i, i % 500 FROM generate_series(1, 20000) i;
+		CREATE INDEX lion_norm_u_k ON lion_norm_u USING lion (k)
+			WITH (wal_mode = rmgr, inline_limit = 64);
 	SQL
 	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_k'::regclass)")" = rmgr ] ||
 		die "phase 1f: the partial index was not built in rmgr mode"
+	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_u_k'::regclass)")" = rmgr ] ||
+		die "phase 1f: the unlogged index was not built in rmgr mode"
 
 	# A fast stop checkpoints, so nothing of the build is left to replay.
 	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
@@ -1271,6 +1283,20 @@ phase1f() {
 	verify_node psql_p "$PRIMARY_DATA"
 	[ "$(psql_p -tAc "select count(*) from pg_get_wal_resource_managers() where rm_name = 'pg_lion'")" = 0 ] ||
 		die "phase 1f: the resource manager is still registered"
+
+	# The unlogged index, written without the manager: inserts that spill and
+	# split its entries, and a VACUUM that removes TIDs from them.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: the unlogged rmgr-mode index could not be written without the manager"
+		INSERT INTO lion_norm_u SELECT i, i % 500 FROM generate_series(20001, 40000) i;
+		DELETE FROM lion_norm_u WHERE id % 3 = 0;
+		VACUUM (INDEX_CLEANUP ON) lion_norm_u;
+	SQL
+	run_check "phase 1f unlogged" psql_p \
+		"select lion_index_verify('lion_norm_u_k', true) is not null, 'verify the unlogged index'
+		 union all
+		 select lion_index_count('lion_norm_u_k', 4) =
+				(select count(*) from lion_norm_u where k = 4),
+				'the unlogged index counts k = 4 as the heap does'"
 
 	# The deleted rows are not in the partial index, so the VACUUM removes
 	# nothing from it and only visits its pages; one visited range per
@@ -1311,10 +1337,11 @@ phase1f() {
 		die "phase 1f: could not stop the primary"
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
-	psql_p -c "DROP TABLE lion_norm, lion_norm_flush" >>"$RUNLOG" 2>&1
+	psql_p -c "DROP TABLE lion_norm, lion_norm_flush, lion_norm_u" >>"$RUNLOG" 2>&1
 
 	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
 	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
+	SUMMARY+=("phase1f            an unlogged rmgr-mode index was written without the manager")
 }
 
 # ---------------------------------------------------------------- phase 2

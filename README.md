@@ -318,7 +318,8 @@ dense key whose container has to be rewritten whole costs ~1.6 KB where a generi
 manager and `generic` otherwise, so one CREATE INDEX script works on a cluster that preloads the
 library and on one that does not.  The mode is fixed at build time and recorded on the meta page;
 `SELECT lion_index_wal_mode(idx)` reports it and REINDEX is what changes it.  An rmgr-mode index can
-be READ on any server but can only be WRITTEN where the resource manager is registered, which needs
+be READ on any server but can only be WRITTEN where the resource manager is registered (an unlogged
+or temporary one writes no WAL and is written anywhere), which needs
 
     shared_preload_libraries = 'pg_lion'      # and a restart
     # optional: pg_lion.rmgr_id = 128         # the id to register under

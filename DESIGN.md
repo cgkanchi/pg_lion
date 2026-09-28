@@ -5617,7 +5617,8 @@ GUC `pg_lion.rmgr_id` (default: one of the reserved custom ids; document the col
 to check `pg_get_wal_resource_managers()`). Without preload the extension keeps working on generic
 WAL: the rmgr is optional, chosen at index creation and recorded on the meta page (`wal_mode`), so a
 cluster can mix; an index created in rmgr mode refuses to be written by a backend whose server did
-not register the rmgr (ERROR with the preload hint) but can still be read.
+not register the rmgr (ERROR with the preload hint) but can still be read. (Implemented so, with
+one exception: an unlogged or temporary index writes no WAL, and is written anywhere.)
 
 ### The shim (`lion_wal.[ch]`, implemented)
 
@@ -5969,7 +5970,10 @@ a server without it is an ERROR with the preload hint, at CREATE INDEX (from
 `lionoptions()`) and again at build. READING an rmgr-mode index works on any
 server; WRITING one without the manager ERRORs in `lion_wal_begin()`, which is
 the one place every write path passes through, with the preload hint and the
-REINDEX alternative. REINDEX is what changes an index's mode.
+REINDEX alternative - unless the index is unlogged or temporary, whose writes
+insert no record at all, so that nothing about them needs the manager
+(2026-09-27 review: they used to be refused all the same). REINDEX is what
+changes an index's mode.
 `lion_index_wal_mode(idx)` reports it.
 
 **VACUUM is the one path that could write without `lion_wal_begin()`**
@@ -5991,7 +5995,8 @@ write - a VACUUM that has something to remove from such an index still stops
 at its first write, with the hint. `test/recovery/run.sh` phase 1f vacuums an
 rmgr-mode partial index on a server restarted without the preload, then
 crashes it: no custom-manager record may be in the range, and recovery must
-succeed.
+succeed. Before that it inserts into and vacuums an UNLOGGED rmgr-mode index
+there, which must work.
 
 ### Testing (implemented)
 
