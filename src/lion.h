@@ -1200,6 +1200,7 @@ extern bool lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 /* The pieces of the above, for a caller that walks the leaves itself. */
 extern LionEntryTuple *lion_dir_highkey(Page page);
 extern Buffer lion_dir_step_right(Relation index, Buffer buf, int lockmode);
+extern Buffer lion_dir_read_leaf(Relation index, BlockNumber blk);
 extern OffsetNumber lion_dir_binsrch(Page page, const LionSearchKey *sk);
 extern bool lion_dir_scan_run(Relation index, const LionSearchKey *sk,
 							 int lockmode, Buffer *bufp, OffsetNumber *offp,
