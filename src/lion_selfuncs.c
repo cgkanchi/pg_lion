@@ -1,12 +1,15 @@
 /*-------------------------------------------------------------------------
  *
  * lion_selfuncs.c
- *		Two corrections to what the planner's own machinery tells lion's cost
- *		model: the endpoint probe - a range bound beyond a column's histogram,
- *		estimated from the column's first or last live key in the lion
- *		directory (DESIGN.md §28, "The endpoint probe") - and the part of a
- *		plain scan's price that cost_index() cannot charge (DESIGN.md §29.11,
- *		lion_plain_note_remainder()).
+ *		Three corrections to what the planner's own machinery tells lion's
+ *		cost model: the endpoint probe - a range bound beyond a column's
+ *		histogram, estimated from the column's first or last live key in the
+ *		lion directory (DESIGN.md §28, "The endpoint probe"); the intersection
+ *		probe - a conjunction of set clauses on one lion index, measured from
+ *		the index where core's product of their selectivities may be far off
+ *		(DESIGN.md §29.11, "Correlated sets", lion_isect_factor()); and the
+ *		part of a plain scan's price that cost_index() cannot charge
+ *		(DESIGN.md §29.11, lion_plain_note_remainder()).
  *
  * ANALYZE's histogram ends at the largest value its sample saw.  A column
  * that grows at one end - a timestamp, a serial id - puts every row inserted
@@ -53,12 +56,15 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
+#include "executor/instrument.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -70,6 +76,7 @@
 #include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/inval.h"
@@ -155,6 +162,9 @@ typedef struct LionProbeCache
 	MemoryContext cxt;
 	List	   *ends;			/* LionEndpoint */
 	List	   *remainders;		/* LionPlainRemainder */
+	List	   *isects;			/* LionIsect: the intersection probe's */
+	int			nisectprobes;	/* ... how many it has made */
+	int64		isectbuffers;	/* ... and the buffers they accessed */
 } LionProbeCache;
 
 static LionProbeCache lion_probe_cache;
@@ -183,6 +193,9 @@ lion_probe_cache_for(PlannerInfo *root)
 		lion_probe_cache.cxt = cxt;
 		lion_probe_cache.ends = NIL;
 		lion_probe_cache.remainders = NIL;
+		lion_probe_cache.isects = NIL;
+		lion_probe_cache.nisectprobes = 0;
+		lion_probe_cache.isectbuffers = 0;
 	}
 	return &lion_probe_cache;
 }
@@ -1199,17 +1212,802 @@ lion_probe_end(void)
 	MemoryContextDelete(scope->cxt);
 }
 
+/* ---------------------------------------------------------------------
+ * The intersection probe (DESIGN.md §29.11, "Correlated sets")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Core estimates a conjunction as the product of its clauses' selectivities,
+ * as though the columns were independent.  Filters on columns derived from
+ * one hidden attribute are not, and their AND comes out as many times too
+ * small as the product of the other clauses' selectivities: a benchmark's
+ * count over such filters was estimated at a small fraction of its rows, the
+ * heap paths were priced for that, and the count that reads no heap was
+ * priced out of the plan.
+ *
+ * Each of those clauses is a posting set of a lion index with an exact row
+ * count, and the index can AND their containers at any container key.  So
+ * where the AND of two or more set clauses on one lion index may be far from
+ * core's product, lion MEASURES it for its own estimates: it samples
+ * container keys of the smallest set (the driver), ANDs the other sets'
+ * containers at each, and takes the share of the driver's rows that survive
+ * as the conjunction's share of them.  Bounded like the endpoint probe:
+ *
+ *	- where it can matter: core's estimate of the AND at most
+ *	  1/LION_ISECT_ERROR of the smallest clause's own - the most the AND can
+ *	  hold - so that the probe can find it off by that much;
+ *	- LION_ISECT_KEYS driver containers at most, fewer when the clauses
+ *	  locate many sets (LION_ISECT_SEEKS seeks of a set in all), in strata of
+ *	  the heap's container keys: the first container of the driver's in each,
+ *	  so that the sample spreads over the heap, and every container of a heap
+ *	  of no more container keys than that.  The strata still ahead widen when
+ *	  the samples so far, at what they cost, would overrun the probe's
+ *	  budget, and a driver that lies in a few strata only is sampled again,
+ *	  in strata of its own stretch;
+ *	- LION_ISECT_MAX_SETS sets located, LION_ISECT_BUFFERS buffer accesses a
+ *	  probe and LION_ISECT_RUN_BUFFERS a planner run, or the probe gives up
+ *	  and core's estimate stands; LION_ISECT_RUN_PROBES probes a planner run,
+ *	  each conjunction measured once in it;
+ *	- no heap page is read, and no lock or pin is held between two containers:
+ *	  the sets are located and let go of before the first container is read,
+ *	  and the streams copy each posting leaf and release it (DESIGN.md §29.5).
+ *	  The TIDs are counted whatever their visibility, which is what makes that
+ *	  possible: a dead row not yet vacuumed counts as a row of its sets, as it
+ *	  does in the sets' own counts, and dilutes the survivors and the driver
+ *	  alike.
+ *
+ * The result corrects lion's OWN estimates only - the selectivity
+ * lioncostestimate() returns for lion's plain and bitmap paths, and the rows
+ * the count pushdown's recheck is priced for (lion_probe_rel_rows()) - as a
+ * factor on core's estimate of the same clauses, applied when the probe finds
+ * it off by LION_ISECT_ERROR or more either way.  rel->rows, and every other
+ * path's estimate, stay core's: the relation is sized before its paths are
+ * built, and a row count changed while they are would leave the paths built
+ * before it priced for another relation than the ones built after.
+ */
+
+/* GUC pg_lion.enable_intersection_probe (DESIGN.md §29.11) */
+bool		lion_enable_intersection_probe = true;
+
+/*
+ * The driver containers the probe samples at most, and at least however many
+ * sets it seeks; and the seeks it makes of all its sets together at most, the
+ * keys it samples times the sets it seeks at each.  A seek is a descent of a
+ * posting tree - two or three pages - or a step to the next leaf, and most
+ * are a buffer access or none: the leaf the last seek copied often holds the
+ * next key too.  A few dozen containers of a set that has hundreds of rows in
+ * each put a factor of LION_ISECT_ERROR far outside what the sample can err
+ * by: every conjunction measured on 100k and 2M rows, uniform, clustered by
+ * the hidden attribute or sparse, came out within 6% of its count at 8 to 32
+ * containers (DESIGN.md §29.11, "Correlated sets").
+ */
+#define LION_ISECT_KEYS			32
+#define LION_ISECT_MIN_KEYS		8
+#define LION_ISECT_SEEKS		128
+
+/* The posting sets its clauses may locate: a list's values, a query's keys */
+#define LION_ISECT_MAX_SETS		32
+
+/*
+ * The buffer accesses one probe may make, locating the sets and seeking them,
+ * and all of a planner run's probes together, before a probe gives up and
+ * core's estimate stands.  The bound is checked before each clause is located
+ * and before each sample, so a probe overruns it by one clause's lookups (an
+ * IN list of LION_ISECT_MAX_SETS values) or one sample's seeks at most, and
+ * the strata ahead widen to keep a sample's worth of it to spare
+ * (lion_isect_pass()).  Measured (DESIGN.md §29.11): 6 to 90 accesses a probe
+ * on 100k rows and 13 to 240 on 2M rows - where the first version's 64
+ * containers took up to 547 - so a probe's bound is the dearest measured, and
+ * the run's four of them: a millisecond or two of shared-buffer hits, or that
+ * many reads on a cold cache.
+ */
+#define LION_ISECT_BUFFERS		256
+#define LION_ISECT_RUN_BUFFERS	1024
+
+/* The probes one planner run makes: a conjunction is measured once in it. */
+#define LION_ISECT_RUN_PROBES	8
+
+/* One past the last container key: the end of the first pass's range. */
+#define LION_ISECT_KEY_END		((double) PG_UINT32_MAX + 1.0)
+
+/*
+ * How far core's estimate of a conjunction must be able to be off - and how
+ * far the probe must find it off, either way - for the probe's number to be
+ * taken instead.  Less than that is within what ANALYZE's per-column
+ * estimates and the sample leave of an independent conjunction, and would
+ * move plans on noise.
+ */
+#define LION_ISECT_ERROR		3.0
+
+/* One set clause of a probed conjunction. */
+typedef struct LionIsectClause
+{
+	AttrNumber	col;			/* the index's key column, 1-based */
+	Node	   *clause;			/* as the caller has it */
+	ScanKeyData skey;			/* ... as the scan's key */
+	Selectivity sel;			/* core's selectivity of it */
+} LionIsectClause;
+
+/* A conjunction measured in this planner run, and what it came to. */
+typedef struct LionIsect
+{
+	Oid			indexoid;
+	int			n;
+	AttrNumber *cols;
+	Node	  **clauses;		/* bare, in the cache's memory */
+	double		factor;			/* core's estimate is multiplied by it */
+} LionIsect;
+
+static Node *
+lion_isect_bare(Node *clause)
+{
+	if (IsA(clause, RestrictInfo))
+		return (Node *) ((RestrictInfo *) clause)->clause;
+	return clause;
+}
+
+static Node *
+lion_isect_strip(Node *node)
+{
+	while (node != NULL && IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+	return node;
+}
+
+/*
+ * Is `clause` a set clause of index key column col0 (0-based) with a value to
+ * look up now - an equality or a multi-key query with a constant, an IN list
+ * of at most LION_ISECT_MAX_SETS constants, `IS NULL` - and what is it as the
+ * scan's key?  The indexed expression may stand on either side of an
+ * operator, as core matches it (match_index_to_operand()).
+ */
+static bool
+lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
+{
+	Oid			opfamily = idx->opfamily[col0];
+	bool		multikey = OidIsValid(get_opfamily_proc(opfamily,
+														idx->opcintype[col0],
+														idx->opcintype[col0],
+														LION_EXTRACTVALUE_PROC));
+	Oid			opno;
+	Oid			collid;
+	Node	   *value;
+	int			flags = 0;
+	int			strategy;
+	Oid			lefttype;
+	Oid			righttype;
+
+	clause = lion_isect_bare(clause);
+	if (IsA(clause, NullTest))
+	{
+		NullTest   *nt = (NullTest *) clause;
+
+		if (nt->nulltesttype != IS_NULL || nt->argisrow ||
+			!match_index_to_operand((Node *) nt->arg, col0, idx))
+			return false;
+		ScanKeyEntryInitialize(skey, SK_ISNULL | SK_SEARCHNULL,
+							   (AttrNumber) (col0 + 1), InvalidStrategy,
+							   InvalidOid, InvalidOid, InvalidOid, (Datum) 0);
+		return true;
+	}
+	if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+		Const	   *arr;
+
+		if (!saop->useOr || list_length(saop->args) != 2 ||
+			!match_index_to_operand((Node *) linitial(saop->args), col0, idx))
+			return false;
+		value = lion_isect_strip((Node *) lsecond(saop->args));
+		if (value == NULL || !IsA(value, Const))
+			return false;
+		arr = (Const *) value;
+		if (arr->constisnull ||
+			ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(arr->constvalue)),
+						   ARR_DIMS(DatumGetArrayTypeP(arr->constvalue))) >
+			LION_ISECT_MAX_SETS)
+			return false;
+		opno = saop->opno;
+		collid = saop->inputcollid;
+		flags = SK_SEARCHARRAY;
+	}
+	else if (IsA(clause, OpExpr) && list_length(((OpExpr *) clause)->args) == 2)
+	{
+		OpExpr	   *op = (OpExpr *) clause;
+
+		if (match_index_to_operand((Node *) linitial(op->args), col0, idx))
+		{
+			opno = op->opno;
+			value = lion_isect_strip((Node *) lsecond(op->args));
+		}
+		else if (match_index_to_operand((Node *) lsecond(op->args), col0, idx))
+		{
+			opno = get_commutator(op->opno);
+			value = lion_isect_strip((Node *) linitial(op->args));
+		}
+		else
+			return false;
+		if (!OidIsValid(opno) || value == NULL || !IsA(value, Const) ||
+			((Const *) value)->constisnull)
+			return false;
+		collid = op->inputcollid;
+	}
+	else
+		return false;
+
+	if (!op_in_opfamily(opno, opfamily))
+		return false;
+	get_op_opfamily_properties(opno, opfamily, false, &strategy, &lefttype,
+							   &righttype);
+	if (multikey ? (strategy < LION_STRAT_CONTAINS ||
+					strategy > LION_STRAT_MATCH) :
+		strategy != LION_STRAT_EQUAL)
+		return false;
+
+	ScanKeyEntryInitialize(skey, flags, (AttrNumber) (col0 + 1),
+						   (StrategyNumber) strategy, righttype, collid,
+						   get_opcode(opno), ((Const *) value)->constvalue);
+	return true;
+}
+
+/* The buffers this backend has accessed, hits and reads, shared and local. */
+static int64
+lion_isect_buffers(void)
+{
+	return pgBufferUsage.shared_blks_hit + pgBufferUsage.shared_blks_read +
+		pgBufferUsage.local_blks_hit + pgBufferUsage.local_blks_read;
+}
+
+/*
+ * One probe's sample (lion_isect_measure()): the sources' streams, the driver
+ * first, and what the containers sampled so far came to.
+ */
+typedef struct LionIsectSample
+{
+	int			n;				/* the sources */
+	LionSetStream **st;			/* ... their streams, in the clauses' order */
+	int		   *order;			/* order[0] the driver, the others by rows */
+	bool	   *done;			/* a source with nothing left at or past a key */
+	LionContainer *acc;			/* the running AND, and room for the next */
+	LionContainer *tmp;
+	int64		start;			/* lion_isect_buffers() when the probe began */
+	int64		budget;			/* ... and what it may add to that */
+	double		drvrows;		/* the driver's rows in the containers sampled */
+	double		androws;		/* ... and those the AND kept */
+	int			nsampled;		/* the containers sampled */
+	uint32		first;			/* ... the first of them */
+	double		end;			/* the key past the last one's stratum */
+} LionIsectSample;
+
+static bool
+lion_isect_spent(const LionIsectSample *s)
+{
+	return lion_isect_buffers() - s->start > s->budget;
+}
+
+/*
+ * One pass of the sample over the container keys [lo, hi), in `keys` strata
+ * of [lo, end) - end the key past the last the heap is expected to hold -
+ * and as many more past end as the heap has grown: the driver's first
+ * container at or past each stratum's first key, ANDed with the other
+ * sources' containers at its key, both weighted by the stratum's width.  The
+ * strata still ahead widen when the samples so far, at what they cost, would
+ * not all fit the budget, so that the sample spreads over the heap whatever
+ * the seeks cost.  False when a sample would not fit it before
+ * LION_ISECT_MIN_KEYS were taken, or the pass met twice as many containers as
+ * strata (a heap grown far past rel->pages).
+ */
+static bool
+lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
+{
+	int64		passstart = lion_isect_buffers();
+	double		stride = Max((end - lo) / (double) keys, 1.0);
+	double		target = lo;
+	int			taken = 0;
+
+	while (target < hi)
+	{
+		const LionContainer *c;
+		double		survive;
+		double		next;
+		double		per;
+		double		affordable;
+		int			j;
+
+		if (lion_isect_spent(s))
+			return taken >= LION_ISECT_MIN_KEYS;
+		c = lion_stream_at(s->st[s->order[0]], (uint32) target);
+		if (c == NULL || (double) c->ckey >= hi)
+			break;
+		if (taken >= 2 * keys)
+			return false;
+
+		memcpy(s->acc, c, lion_container_size(c));
+		survive = (double) s->acc->cardinality;
+		s->drvrows += survive * stride;
+		if (taken == 0)
+			s->first = c->ckey;
+		for (j = 1; j < s->n && survive > 0; j++)
+		{
+			int			k = s->order[j];
+			const LionContainer *cj = NULL;
+			LionContainer *swap;
+
+			if (!s->done[k])
+				cj = lion_stream_at(s->st[k], s->acc->ckey);
+			if (cj == NULL)
+				s->done[k] = true;	/* nothing at or past this key, ever */
+			if (cj == NULL || cj->ckey != s->acc->ckey)
+			{
+				survive = 0;
+				break;
+			}
+			survive = (double) lion_container_and(s->acc, cj, s->tmp);
+			swap = s->acc;
+			s->acc = s->tmp;
+			s->tmp = swap;
+		}
+		s->androws += survive * stride;
+		s->nsampled++;
+		taken++;
+
+		/*
+		 * The next stratum's first key, past this container in any case -
+		 * unless the strata left before end would cost more than the budget
+		 * has left, at what a sample has cost so far: then those fit it,
+		 * wider, with a sample's worth to spare.
+		 */
+		next = Max(lo + (floor(((double) c->ckey - lo) / stride) + 1.0) *
+				   stride, (double) c->ckey + 1.0);
+		per = Max((double) (lion_isect_buffers() - passstart) / taken, 1.0);
+		affordable = floor((double) (s->budget -
+									 (lion_isect_buffers() - s->start)) / per) - 1.0;
+		if (next < end && (end - next) / stride > affordable)
+		{
+			if (affordable < 1.0)
+				return taken >= LION_ISECT_MIN_KEYS;
+			stride = Max((end - (double) c->ckey - 1.0) / affordable, 1.0);
+			next = (double) c->ckey + 1.0;
+		}
+		target = ceil(next);
+	}
+	s->end = Min(target, hi);
+	return true;
+}
+
+/*
+ * Measure the AND of the n clauses: the share of the driver's rows that
+ * survive it at the sampled container keys, times the driver's rows - its
+ * sets' exact count when that is its rows (one set, or an IN list's disjoint
+ * entries), core's estimate of it otherwise (a multi-key query's keys
+ * overlap).  At most `budget` buffer accesses, and *used says how many it
+ * made; false when a bound was reached first.
+ */
+static bool
+lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
+				   LionIsectClause *cl, int64 budget, double *probesel,
+				   int64 *used)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "lion intersection probe",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+	int64		buffers = lion_isect_buffers();
+	Relation	index = index_open(idx->indexoid, NoLock);
+	LionPostingSet **sets = (LionPostingSet **)
+		palloc0(sizeof(LionPostingSet *) * n);
+	int		   *nsets = (int *) palloc0(sizeof(int) * n);
+	LionKeyNode **trees = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * n);
+	double	   *ntids = (double *) palloc0(sizeof(double) * n);
+	bool	   *exact = (bool *) palloc0(sizeof(bool) * n);
+	LionIsectSample s;
+	double		tuples = Max(rel->tuples, 1.0);
+	double		ckeys = Max(ceil((double) rel->pages / LION_BLOCKS_PER_CONTAINER),
+							1.0);
+	double		stride;
+	int			keys;
+	int			totalsets = 0;
+	int			driver = 0;
+	bool		ok = true;
+	bool		empty = false;
+	int			i;
+	int			j;
+
+	memset(&s, 0, sizeof(s));
+	s.n = n;
+	s.st = (LionSetStream **) palloc0(sizeof(LionSetStream *) * n);
+	s.order = (int *) palloc(sizeof(int) * n);
+	s.done = (bool *) palloc0(sizeof(bool) * n);
+	s.acc = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	s.tmp = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	s.start = buffers;
+	s.budget = budget;
+
+	/* ---- locate every clause's sets, and let go of their pins ---- */
+	for (i = 0; i < n && ok; i++)
+	{
+		LionState  *state = lion_index_column_state(index, cl[i].col);
+		bool		nomatch = false;
+
+		if (lion_isect_spent(&s) ||
+			!lion_scankey_sets(index, &cl[i].skey, &nsets[i], &sets[i],
+							   &trees[i], &nomatch))
+			ok = false;
+		else if (nomatch)
+			empty = true;
+		totalsets += nsets[i];
+		for (j = 0; j < nsets[i]; j++)
+		{
+			if (!sets[i][j].found)
+				continue;
+			lion_posting_set_unpin(&sets[i][j]);
+			ntids[i] += (double) sets[i][j].ntids;
+		}
+		exact[i] = (nsets[i] == 1 || !state->multikey);
+		if (totalsets > LION_ISECT_MAX_SETS)
+			ok = false;
+	}
+
+	if (ok && !empty)
+	{
+		/* the driver is the set of the fewest rows; the others by their rows */
+		for (i = 0; i < n; i++)
+		{
+			int			k;
+
+			for (k = i; k > 0 && ntids[s.order[k - 1]] > ntids[i]; k--)
+				s.order[k] = s.order[k - 1];
+			s.order[k] = i;
+			s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i], false);
+		}
+		driver = s.order[0];
+
+		/*
+		 * The heap's container keys in `keys` strata, and the driver's first
+		 * container in each: every container, when there are no more keys
+		 * than strata.  A heap grown past rel->pages makes more strata than
+		 * that, up to twice as many before the probe gives up.
+		 */
+		keys = Min(LION_ISECT_KEYS,
+				   Max(LION_ISECT_MIN_KEYS, LION_ISECT_SEEKS / Max(totalsets, 1)));
+		stride = Max(ckeys / (double) keys, 1.0);
+		ok = lion_isect_pass(&s, 0.0, LION_ISECT_KEY_END, ckeys, keys);
+
+		/*
+		 * A driver whose rows lie in a stretch of the heap a few strata wide
+		 * - a hidden attribute that follows the order the rows came in - was
+		 * sampled at a few keys only.  Its keys lie in [first, the end of the
+		 * last one's stratum): sample that stretch again, in strata of its
+		 * own, and take the second pass when it completes.
+		 */
+		if (ok && s.nsampled > 0 && s.nsampled < LION_ISECT_MIN_KEYS &&
+			stride > 1.0)
+		{
+			LionIsectSample again = s;
+			double		lo = (double) s.first;
+			double		hi = s.end;
+
+			for (i = 0; i < n; i++)
+			{
+				lion_stream_end(s.st[i]);
+				s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i], false);
+				s.done[i] = false;
+			}
+			again.drvrows = 0;
+			again.androws = 0;
+			again.nsampled = 0;
+			if (lion_isect_pass(&again, lo, hi, hi, keys))
+				s = again;
+		}
+
+		for (i = 0; i < n; i++)
+			lion_stream_end(s.st[i]);
+	}
+
+	if (ok)
+	{
+		double		rows = 0;
+
+		if (!empty && s.drvrows > 0)
+			rows = s.androws / s.drvrows *
+				(exact[driver] ? ntids[driver] : cl[driver].sel * tuples);
+		*probesel = Min(rows / tuples, 1.0);
+	}
+	*used = lion_isect_buffers() - buffers;
+
+	for (i = 0; i < n; i++)
+		for (j = 0; j < nsets[i]; j++)
+			lion_posting_set_release(&sets[i][j]);
+	index_close(index, NoLock);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+	return ok;
+}
+
+/*
+ * May the probe count rows of rel by these clauses' columns?  Only when the
+ * user may read every row of them - SELECT on the table or on each column,
+ * and no security barrier view's or row-level policy's quals - as core asks
+ * before a statistic of a column reaches a user's function
+ * (all_rows_selectable()): the probe's count is of the rows themselves,
+ * those the user may not see included, and an estimate is shown by EXPLAIN.
+ * An inheritance child is asked about as its parent is, the table the query
+ * names; a column there is not the child's, so only the whole table will
+ * do.  An expression key is no column: only the whole table will do either.
+ */
+static bool
+lion_isect_readable(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					int n, const LionIsectClause *cl)
+{
+	Index		varno = rel->relid;
+	Oid			userid = OidIsValid(rel->userid) ? rel->userid : GetUserId();
+	bool		child = false;
+	RangeTblEntry *rte;
+	int			i;
+
+	while (root->append_rel_array != NULL &&
+		   root->append_rel_array[varno] != NULL &&
+		   planner_rt_fetch(root->append_rel_array[varno]->parent_relid,
+							root)->rtekind == RTE_RELATION)
+	{
+		varno = root->append_rel_array[varno]->parent_relid;
+		child = true;
+	}
+	rte = planner_rt_fetch(varno, root);
+	if (rte->securityQuals != NIL)
+		return false;
+	if (pg_class_aclcheck(rte->relid, userid, ACL_SELECT) == ACLCHECK_OK)
+		return true;
+	if (child)
+		return false;
+	for (i = 0; i < n; i++)
+	{
+		AttrNumber	attno = idx->indexkeys[cl[i].col - 1];
+
+		if (attno <= 0 ||
+			pg_attribute_aclcheck(rte->relid, attno, userid,
+								  ACL_SELECT) != ACLCHECK_OK)
+			return false;
+	}
+	return true;
+}
+
+/* Is the cached conjunction e this one: the same clauses, in any order? */
+static bool
+lion_isect_same(LionIsect *e, IndexOptInfo *idx, int n, LionIsectClause *cl)
+{
+	bool	   *used;
+	bool		same = true;
+	int			i;
+	int			j;
+
+	if (e->indexoid != idx->indexoid || e->n != n)
+		return false;
+	used = (bool *) palloc0(sizeof(bool) * n);
+	for (i = 0; i < n && same; i++)
+	{
+		Node	   *bare = lion_isect_bare(cl[i].clause);
+
+		same = false;
+		for (j = 0; j < n && !same; j++)
+		{
+			if (!used[j] && e->cols[j] == cl[i].col &&
+				equal(e->clauses[j], bare))
+				used[j] = same = true;
+		}
+	}
+	pfree(used);
+	return same;
+}
+
+/*
+ * What lion's estimate of the AND of the n clauses - RestrictInfos or bare
+ * clauses, each on key column cols[i] (1-based) of lion index idx of rel - is
+ * to be multiplied by: 1 unless the intersection probe measured the set
+ * clauses among them to be LION_ISECT_ERROR times more or less selective
+ * together than core's estimate of them says.  The factor applies to core's
+ * estimate of any conjunction that holds those clauses: what else it holds -
+ * a range, a clause the probe has no value for - is taken to be independent
+ * of them, as core takes it.
+ */
+double
+lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+				  int n, const AttrNumber *cols, Node **clauses)
+{
+	LionProbeCache *cache;
+	LionIsectClause *cl;
+	LionIsect  *e = NULL;
+	RangeTblEntry *rte;
+	List	   *group = NIL;
+	Selectivity coresel;
+	Selectivity minsel = 1.0;
+	double		probesel;
+	double		factor = 1.0;
+	int			ncl = 0;
+	int			i;
+	ListCell   *lc;
+
+	/*
+	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
+	 * is set (DESIGN.md §9), and every lion path is priced out then anyway.
+	 */
+	if (!lion_enable_intersection_probe || n < 2 || root == NULL ||
+		root->glob == NULL || rel == NULL || rel->relid == 0 ||
+		rel->rtekind != RTE_RELATION || idx == NULL || idx->hypothetical ||
+		idx->indpred != NIL || idx->relam != lion_get_am_oid() ||
+		lion_old_snapshot_threshold_active())
+		return 1.0;
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte->rtekind != RTE_RELATION || rte->inh ||
+		rte->relkind == RELKIND_PARTITIONED_TABLE)
+		return 1.0;
+
+	/* the clauses it has a value to look up for */
+	cl = (LionIsectClause *) palloc(sizeof(LionIsectClause) * n);
+	for (i = 0; i < n; i++)
+	{
+		if (cols[i] < 1 || cols[i] > idx->nkeycolumns ||
+			!lion_isect_scankey(idx, cols[i] - 1, clauses[i], &cl[ncl].skey))
+			continue;
+		cl[ncl].col = cols[i];
+		cl[ncl].clause = clauses[i];
+		cl[ncl].sel = clause_selectivity(root, clauses[i], 0, JOIN_INNER,
+										 NULL);
+		minsel = Min(minsel, cl[ncl].sel);
+		group = lappend(group, clauses[i]);
+		ncl++;
+	}
+
+	/*
+	 * Where it can matter: the AND holds at most the smallest clause's rows,
+	 * so core's estimate can be too small by at most that over it.
+	 */
+	coresel = (ncl >= 2) ?
+		clauselist_selectivity(root, group, 0, JOIN_INNER, NULL) : 0.0;
+	if (ncl < 2 || coresel <= 0.0 || coresel * LION_ISECT_ERROR > minsel ||
+		!lion_isect_readable(root, rel, idx, ncl, cl))
+	{
+		list_free(group);
+		pfree(cl);
+		return 1.0;
+	}
+	list_free(group);
+
+	cache = lion_probe_cache_for(root);
+	foreach(lc, cache->isects)
+	{
+		if (lion_isect_same((LionIsect *) lfirst(lc), idx, ncl, cl))
+		{
+			e = (LionIsect *) lfirst(lc);
+			break;
+		}
+	}
+	if (e == NULL)
+	{
+		MemoryContext oldcxt;
+		int64		used = 0;
+		bool		measured;
+
+		if (cache->nisectprobes >= LION_ISECT_RUN_PROBES ||
+			cache->isectbuffers >= LION_ISECT_RUN_BUFFERS)
+		{
+			pfree(cl);
+			return 1.0;
+		}
+		cache->nisectprobes++;
+
+		measured = lion_isect_measure(rel, idx, ncl, cl,
+									  Min(LION_ISECT_BUFFERS,
+										  LION_ISECT_RUN_BUFFERS -
+										  cache->isectbuffers),
+									  &probesel, &used);
+		cache->isectbuffers += used;
+		if (measured)
+		{
+			probesel = Min(probesel, minsel);
+			if (probesel >= coresel * LION_ISECT_ERROR ||
+				probesel * LION_ISECT_ERROR <= coresel)
+				factor = probesel / coresel;
+		}
+
+		oldcxt = MemoryContextSwitchTo(cache->cxt);
+		e = (LionIsect *) palloc(sizeof(LionIsect));
+		e->indexoid = idx->indexoid;
+		e->n = ncl;
+		e->cols = (AttrNumber *) palloc(sizeof(AttrNumber) * ncl);
+		e->clauses = (Node **) palloc(sizeof(Node *) * ncl);
+		for (i = 0; i < ncl; i++)
+		{
+			e->cols[i] = cl[i].col;
+			e->clauses[i] = (Node *) copyObject(lion_isect_bare(cl[i].clause));
+		}
+		e->factor = factor;
+		cache->isects = lappend(cache->isects, e);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	pfree(cl);
+	return e->factor;
+}
+
+/*
+ * The factor for rel's own restriction clauses: those of them that are set
+ * clauses of ONE lion index - the one that has the most, two at least - as
+ * the count pushdown ANDs them.
+ */
+static double
+lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
+{
+	int			nclauses = list_length(rel->baserestrictinfo);
+	Oid			amoid;
+	IndexOptInfo *best = NULL;
+	AttrNumber *bestcols = NULL;
+	Node	  **bestclauses = NULL;
+	int			bestn = 0;
+	double		factor = 1.0;
+	ListCell   *lc;
+
+	if (!lion_enable_intersection_probe || nclauses < 2 ||
+		rel->reloptkind == RELOPT_JOINREL || rel->indexlist == NIL)
+		return 1.0;
+
+	amoid = lion_get_am_oid();
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		AttrNumber *cols;
+		Node	  **clauses;
+		int			n = 0;
+		ListCell   *lc2;
+
+		if (idx->relam != amoid || idx->hypothetical || idx->indpred != NIL)
+			continue;
+		cols = (AttrNumber *) palloc(sizeof(AttrNumber) * nclauses);
+		clauses = (Node **) palloc(sizeof(Node *) * nclauses);
+		foreach(lc2, rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			ScanKeyData skey;
+			int			c;
+
+			for (c = 0; c < idx->nkeycolumns; c++)
+			{
+				if (lion_isect_scankey(idx, c, (Node *) rinfo, &skey))
+				{
+					cols[n] = (AttrNumber) (c + 1);
+					clauses[n++] = (Node *) rinfo;
+					break;
+				}
+			}
+		}
+		if (n > bestn)
+		{
+			best = idx;
+			bestn = n;
+			bestcols = cols;
+			bestclauses = clauses;
+		}
+	}
+
+	if (best != NULL && bestn >= 2)
+		factor = lion_isect_factor(root, rel, best, bestn, bestcols,
+								   bestclauses);
+	return factor;
+}
+
 /*
  * rel's rows as lion's estimates see them: core's own count (rel->rows), or,
  * inside a scope that corrects rel, its restriction clauses' selectivity
- * with the probed ends, as set_baserel_size_estimates() computes rel->rows.
- * For a cost formula that reads the rows a range leaves; the row count the
+ * with the probed ends, as set_baserel_size_estimates() computes rel->rows -
+ * either of them times what the intersection probe found of the set clauses
+ * among them (lion_isect_rel_factor()).  For a cost formula that reads the
+ * rows the WHERE leaves: the count pushdown's recheck; the row count the
  * planner compares paths by stays core's.
  */
 double
 lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 {
 	LionProbeScope *scope;
+	double		rows = rel->rows;
 
 	for (scope = lion_probe_scope; scope != NULL; scope = scope->outer)
 	{
@@ -1221,10 +2019,13 @@ lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 																   rel->baserestrictinfo,
 																   0, JOIN_INNER,
 																   NULL));
-			return scope->rows;
+			rows = scope->rows;
+			break;
 		}
 	}
-	return rel->rows;
+	if (root == NULL)
+		return rows;
+	return clamp_row_est(rows * lion_isect_rel_factor(root, rel));
 }
 
 /*

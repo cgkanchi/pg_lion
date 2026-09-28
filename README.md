@@ -389,6 +389,12 @@ working around a bad choice:
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
   also take away B-tree index scans. The count pushdown and `LionOrdered` still use Lion indexes.
+- `pg_lion.enable_intersection_probe`: let Lion measure, at plan time, how many rows the AND of
+  two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
+  planner's product of their selectivities may be far off - correlated filters - and price its
+  own paths (its index scans and the count pushdown) from that (DESIGN.md §29.11, "Correlated
+  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most; the
+  planner's own row counts are left alone. Off, Lion prices its paths from the planner's estimate.
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`

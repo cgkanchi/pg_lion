@@ -781,6 +781,15 @@ extern void lion_stream_seek(LionSetStream *st, uint32 target);
 extern const LionContainer *lion_stream_next(LionSetStream *st);
 
 /*
+ * The first container at or above target, reached by the cursors' seeks
+ * (§22) wherever the stream stands - the one it stands on, when that is at or
+ * above target - or NULL at the end; valid until the stream moves again.
+ * Targets only ever ascend: what a caller that SAMPLES a set's container
+ * keys asks (DESIGN.md §29.11, "Correlated sets").
+ */
+extern const LionContainer *lion_stream_at(LionSetStream *st, uint32 target);
+
+/*
  * A bitset image of one container key's whole range (LION_BITSET_WORDS
  * words), which lion_container_or_into_bitset() ORs containers into: turn it
  * back into a container in the smallest representation (dest has
@@ -812,6 +821,19 @@ typedef struct LionSource LionSource;
 
 extern LionSource *lion_source_open(Relation index, ScanKey keys, int nkeys,
 									bool keeppins, MemoryContext cxt);
+
+/*
+ * The posting sets ONE scan key selects and the tree that combines them,
+ * located as a scan locates them (§29.2), for a caller outside a scan - the
+ * planner's intersection probe (DESIGN.md §29.11, "Correlated sets").  False
+ * when the key is no tree over sets (`IS NOT NULL`, a range, a multi-key
+ * query that needs every row); *nomatch when it selects nothing.  The caller
+ * releases the *nsets sets, whether or not true is returned.
+ */
+extern bool lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
+							  LionPostingSet **sets, LionKeyNode **tree,
+							  bool *nomatch);
+
 extern const LionContainer *lion_source_next(LionSource *src);
 extern bool lion_source_sorted(LionSource *src);
 extern bool lion_source_exact(LionSource *src);
@@ -1165,6 +1187,35 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,
 								  double tuples, double *probes);
+
+/*
+ * The AND of the posting sets of n clauses of one relation (DESIGN.md §29.11,
+ * "One price for the AND of sets"): the price lion_cost_count_rel() charges
+ * an ungrouped count's WHERE sources, and lioncostestimate() a scan that ANDs
+ * the same sets - the index's work only.  Returns the total; *out has its
+ * parts, whose costs add up to it:
+ *
+ *	leafpages / leafcost	the lookups' directory leaves: one read at
+ *							random_page_cost a lookup, an IN list's in key
+ *							order
+ *	setpages / setcost		the posting pages: the driver's walked in order,
+ *							the others' as far as the seeks reach
+ *	cpu						the descents, the IN lists' unions and the AND's
+ *							merge
+ */
+typedef struct LionAndCost
+{
+	int			nsrc;
+	double		leafpages;
+	Cost		leafcost;
+	double		setpages;
+	Cost		setcost;
+	Cost		cpu;
+} LionAndCost;
+
+extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
+							  IndexOptInfo **idxs, const AttrNumber *cols,
+							  Node **clauses, LionAndCost *out);
 extern double lion_containers_for(double heap_pages, double members);
 extern double lion_index_column_posting_share(PlannerInfo *root,
 											  RelOptInfo *rel,
@@ -1201,6 +1252,18 @@ extern bool lion_probe_begin(PlannerInfo *root, RelOptInfo *rel,
 							 List *clauses);
 extern void lion_probe_end(void);
 extern double lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel);
+
+/*
+ * The intersection probe (DESIGN.md §29.11, "Correlated sets"): what lion's
+ * estimate of a conjunction holding the n set clauses - on key columns
+ * cols[] (1-based) of lion index idx of rel - is to be multiplied by, 1 when
+ * the probe measured nothing that differs from core's estimate of them.
+ * lion_probe_rel_rows() applies it to rel's own restriction clauses.
+ */
+extern PGDLLIMPORT bool lion_enable_intersection_probe;
+extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
+								IndexOptInfo *idx, int n,
+								const AttrNumber *cols, Node **clauses);
 extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
 								double loop_count, Cost *indexStartupCost,
 								Cost *indexTotalCost,

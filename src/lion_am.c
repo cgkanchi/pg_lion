@@ -232,6 +232,20 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §29.11, "Correlated sets": whether lion's own estimates of a
+	 * conjunction of set clauses on one lion index may be measured from the
+	 * index when core's product of their selectivities may be far off.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_intersection_probe",
+							 "Measures conjunctions of lion-indexed clauses from the index for lion's own cost estimates.",
+							 "Off, lion prices its paths with the planner's product of the clauses' selectivities.",
+							 &lion_enable_intersection_probe,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * The LionOrdered CustomScan (DESIGN.md §30): its GUC, its scan methods
 	 * and the set_rel_pathlist_hook that offers it, chained like the other.
 	 */
@@ -1671,71 +1685,43 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 }
 
 /*
- * What the AND of the key columns' SETS costs the index side (DESIGN.md
- * §29.11, "The AND of sets"), in CPU, and the pages it reads in *pages.
+ * The quals of a scan's AND of SETS (DESIGN.md §29.11, "One price for the
+ * AND of sets"): every set qual the scan answers, of every key column and as
+ * many as a column has (lion_cost_col_quals()) - an equality, `IS NULL`, a
+ * multi-key query, or an IN list, whose sets are united - as lion_scan_choose()
+ * answers them.  Two `&&` on one array column are two sets as much as two
+ * columns are.  A multi-key query that needs every row is none: the scan
+ * drops it beside the others and rechecks it (lion_cost_qual_is_full()).  A
+ * range or `IS NOT NULL` is a walk, priced by lion_range_entry_cost(), and
+ * every other qual of a column is left to the heap recheck.
  *
- * genericcostestimate() prorates the index by the selectivity of all the
- * quals together, which prices an AND by what it RETURNS.  What it reads is
- * the sets: every set qual the scan answers, of every key column and as many
- * as a column has (lion_cost_col_quals()), is a posting set - an equality,
- * `IS NULL`, a multi-key query - or the union of an IN list's, and the scan
- * ANDs them as a count does: the smallest drives, and the others are sought
- * at each of its container keys (lion_merge_cpu_cost(), the count pushdown's
- * own price).  Two `&&` on one array column are two sources as much as two
- * columns are; a multi-key query that needs every row is none, since the
- * scan drops it beside the others and rechecks it.  Four dense sets whose AND
- * is a few hundred rows read every container of the smallest and probe the
- * other three at each, which the prorating priced as a few hundred rows:
- * `status = 'val2' AND supp = 'supp' AND flag AND country = 'c7'` over 8M
- * rows, 1,730 rows out, ran 52 ms on lion against 1.2 ms on a btree over the
- * four columns, at about the same cost (6.5k against 6.2k).  A range or `IS
- * NOT NULL` is a walk, priced by lion_range_entry_cost(); one set alone is
- * what the prorating prices.
- *
- * The pages: the driver's sets are walked, each a share of the index's
- * container pages (lion_index_column_posting_share()) by its selectivity, and
- * each other set is sought, a descent of its posting tree a probe, never more
- * than a walk of it (DESIGN.md §22).  Plain and bitmap paths share the
- * estimate, and both scans make the same AND (§29.2).
+ * Returns how many there are, with their key columns (1-based) in *cols and
+ * their RestrictInfos in *quals, in column order, both palloc'd; 0 when a
+ * column selects nothing, since the scan then reads no set at all.
  */
-/* An internal page of a posting tree: its downlinks (lion_customscan.c). */
-#define LION_POSTING_FANOUT_EST \
-	((double) (LION_PAGE_CAPACITY / (MAXALIGN(LION_POSTING_PIVOT_SIZE) + \
-									 sizeof(ItemIdData))))
-
-static Cost
-lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
+static int
+lion_scan_set_quals(IndexPath *path, AttrNumber **cols, RestrictInfo ***quals)
 {
 	IndexOptInfo *index = path->indexinfo;
-	RelOptInfo *rel = index->rel;
 	int			ncols = index->nkeycolumns;
-	double	   *members;
-	double	   *containers;
-	double	   *nkeys;
-	double	   *probes;
-	int		   *cols;
-	List	   *srcs = NIL;
-	List	   *srccols = NIL;
-	double		tuples = Max(rel->tuples, 1.0);
-	double		heap_pages = Max((double) rel->pages, 1.0);
-	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	int			maxsets = 0;
+	int			nsets = 0;
 	bool		nomatch = false;
-	int			nsrc = 0;
-	Cost		cost;
 	ListCell   *lc;
-	ListCell   *lc2;
 	int			c;
-	int			i;
 
-	*pages = 0.0;
+	*cols = NULL;
+	*quals = NULL;
 	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
-		return 0.0;
+		return 0;
 
-	/*
-	 * Every set qual of every column is a source (lion_cost_col_quals()) but a
-	 * multi-key query that needs every row, which the scan drops beside the
-	 * others and rechecks instead of merging (lion_cost_qual_is_full()).
-	 */
+	foreach(lc, path->indexclauses)
+		maxsets += list_length(((IndexClause *) lfirst(lc))->indexquals);
+	if (maxsets < 2)
+		return 0;
+	*cols = (AttrNumber *) palloc(sizeof(AttrNumber) * maxsets);
+	*quals = (RestrictInfo **) palloc(sizeof(RestrictInfo *) * maxsets);
+
 	for (c = 0; c < ncols && !nomatch; c++)
 	{
 		LionCostCol cc;
@@ -1744,112 +1730,56 @@ lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
 		nomatch = cc.nomatch;
 		foreach(lc, cc.sets)
 		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 			bool		all;
 
-			if (lion_cost_qual_is_full(index, c,
-									   (Node *) lfirst_node(RestrictInfo, lc)->clause,
-									   &all))
+			if (lion_cost_qual_is_full(index, c, (Node *) rinfo->clause, &all))
 				continue;
-			srcs = lappend(srcs, lfirst(lc));
-			srccols = lappend_int(srccols, c);
+			(*cols)[nsets] = (AttrNumber) (c + 1);
+			(*quals)[nsets] = rinfo;
+			nsets++;
 		}
 		lion_cost_col_free(&cc);
 	}
 
-	/* nothing is read when a column selects nothing, and one set is prorated */
-	if (nomatch || list_length(srcs) < 2)
-	{
-		list_free(srcs);
-		list_free(srccols);
-		return 0.0;
-	}
-
-	members = (double *) palloc(sizeof(double) * list_length(srcs));
-	containers = (double *) palloc(sizeof(double) * list_length(srcs));
-	nkeys = (double *) palloc(sizeof(double) * list_length(srcs));
-	probes = (double *) palloc(sizeof(double) * list_length(srcs));
-	cols = (int *) palloc(sizeof(int) * list_length(srcs));
-
-	forboth(lc, srcs, lc2, srccols)
-	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-		Node	   *clause = (Node *) rinfo->clause;
-		double		k = 1.0;
-		Selectivity sel;
-
-		c = lfirst_int(lc2);
-
-		/* A list of a scalar column is the union of its values' sets. */
-		if (!lion_index_is_multikey(index, c) &&
-			IsA(clause, ScalarArrayOpExpr))
-		{
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
-
-#if PG_VERSION_NUM >= 170000
-			k = Max(estimate_array_length(root, (Node *) lsecond(saop->args)),
-					1.0);
-#else
-			k = Max(estimate_array_length((Node *) lsecond(saop->args)), 1.0);
-#endif
-		}
-
-		sel = clauselist_selectivity(root, list_make1(rinfo), rel->relid,
-									 JOIN_INNER, NULL);
-		members[nsrc] = Max(sel * tuples, 0.0);
-		nkeys[nsrc] = k;
-		containers[nsrc] = Min(k * lion_containers_for(heap_pages,
-													   members[nsrc] / k),
-							   ckeys);
-		cols[nsrc] = c;
-		nsrc++;
-	}
-
-	cost = lion_merge_cpu_cost(nsrc, members, containers, NULL, tuples,
-							   probes);
-
-	for (i = 0; i < nsrc; i++)
-	{
-		double		setpages = Max(1.0, (double) index->pages *
-								   lion_index_column_posting_share(root, rel, index,
-																   (AttrNumber) (cols[i] + 1)) *
-								   members[i] / tuples);
-
-		if (probes[i] <= 0.0)
-			*pages += setpages; /* the driver: walked */
-		else
-		{
-			double		leaves = Max(setpages / nkeys[i], 1.0);
-			double		height = (leaves > 1.0) ?
-				ceil(log(leaves) / log(LION_POSTING_FANOUT_EST)) : 0.0;
-
-			*pages += Min(setpages,
-						  nkeys[i] * Min(leaves, probes[i] * (height + 1.0)));
-		}
-	}
-
-	pfree(members);
-	pfree(containers);
-	pfree(nkeys);
-	pfree(probes);
-	pfree(cols);
-	list_free(srcs);
-	list_free(srccols);
-
-	return cost;
+	return nomatch ? 0 : nsets;
 }
 
 /*
- * Cost estimate: the generic estimate, with three corrections and the heap
+ * What genericcostestimate() charged for the index pages it prorated by the
+ * selectivity of the quals (costs->numIndexPages at random_page_cost, spread
+ * over the repeated scans of a nested loop or a list as index_pages_fetched()
+ * spreads them): the part of its estimate that the AND of sets replaces.
+ */
+static Cost
+lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
+					   const GenericCosts *costs)
+{
+	IndexOptInfo *index = path->indexinfo;
+	double		num_scans = costs->num_sa_scans * loop_count;
+
+	if (num_scans > 1)
+		return index_pages_fetched(costs->numIndexPages * num_scans,
+								   index->pages, (double) index->pages,
+								   root) *
+			costs->spc_random_page_cost / loop_count;
+	return costs->numIndexPages * costs->spc_random_page_cost;
+}
+
+/*
+ * Cost estimate: the generic estimate, with four corrections and the heap
  * correlation.  A scan that has to walk the whole index is priced as one
  * rather than as the selective lookup its predicate's output selectivity
  * suggests, a range pays for the entries it walks (lion_range_entry_cost()),
- * and a plain index scan's heap side is priced by the correlation: for a scan
- * in heap order, the bitmap heap scan's price for the same pages and the
- * plain scan's per-row work (lion_plain_heap_correlation()), otherwise the
- * column's correlation as btree's is (lion_index_correlation(), DESIGN.md
- * §29.11); a bitmap path, which shares this estimate, does not read that
- * last number.  With pg_lion.enable_plain_scan off there is no plain path to
- * price.
+ * an AND of two sets or more is priced as the count pushdown prices the same
+ * sets, from a selectivity the intersection probe may have measured
+ * (lion_cost_set_and(), lion_isect_factor()), and a plain index scan's heap
+ * side is priced by the correlation: for a scan in heap order, the bitmap
+ * heap scan's price for the same pages and the plain scan's per-row work
+ * (lion_plain_heap_correlation()), otherwise the column's correlation as
+ * btree's is (lion_index_correlation(), DESIGN.md §29.11); a bitmap path,
+ * which shares this estimate, does not read that last number.  With
+ * pg_lion.enable_plain_scan off there is no plain path to price.
  */
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -1937,29 +1867,79 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	costs.indexTotalCost += lion_range_entry_cost(root, path, &walkrows);
 
 	/*
-	 * The AND of several columns' sets reads the sets, not what the AND
-	 * returns (lion_set_merge_cost()): their merge, and the pages its driver
-	 * walks and its probes touch beyond the prorated share already charged,
-	 * which are read along posting chains, in order.
+	 * The AND of several sets (DESIGN.md §29.11, "One price for the AND of
+	 * sets"): of several columns, or several of one.  genericcostestimate()
+	 * prorated the index by the selectivity of the quals together, which
+	 * prices an AND by what it RETURNS; what the scan reads is the sets,
+	 * located, united where a list is, and ANDed as a count ANDs them.  So the
+	 * prorated pages give way to the price the count pushdown charges for the
+	 * same sets (lion_cost_set_and()), and what is left of
+	 * genericcostestimate() is the scan's own: a TID a result row
+	 * (cpu_index_tuple_cost), and the quals' arguments.  A nested loop's inner
+	 * scan repeats the AND, and its pages are spread over the repetitions as
+	 * genericcostestimate() spreads its own (index_pages_fetched()).
+	 *
+	 * The selectivity is corrected first, by what the intersection probe
+	 * measured of the same sets ("Correlated sets"): a factor on core's
+	 * estimate, 1 unless the probe found it three times off or more.  It
+	 * moves the TIDs charged here and everything priced from the selectivity:
+	 * the heap side of a plain or bitmap path, and LionOrdered's lion side.
 	 */
+	if (!fullscan)
 	{
-		double		setpages;
-		Cost		setcpu = lion_set_merge_cost(root, path, &setpages);
+		IndexOptInfo *index = path->indexinfo;
+		IndexOptInfo **setidx;
+		AttrNumber *setcols;
+		RestrictInfo **setquals;
+		int			nsets = lion_scan_set_quals(path, &setcols, &setquals);
 
-		if (setcpu > 0.0)
+		if (nsets >= 2)
 		{
-			double		spc_random_page_cost;
-			double		spc_seq_page_cost;
+			LionAndCost setand;
+			Cost		setcost;
+			Cost		pagecost = lion_generic_page_cost(root, path, loop_count,
+														  &costs);
+			double		factor;
+			int			i;
 
-			get_tablespace_page_costs(path->indexinfo->reltablespace,
-									  &spc_random_page_cost, &spc_seq_page_cost);
-			costs.indexTotalCost += setcpu;
-			if (setpages > costs.numIndexPages)
+			setidx = (IndexOptInfo **) palloc(sizeof(IndexOptInfo *) * nsets);
+			for (i = 0; i < nsets; i++)
+				setidx[i] = index;
+
+			factor = lion_isect_factor(root, index->rel, index, nsets, setcols,
+									   (Node **) setquals);
+			if (factor != 1.0)
 			{
-				costs.indexTotalCost += (setpages - costs.numIndexPages) *
-					spc_seq_page_cost;
-				costs.numIndexPages = setpages;
+				Selectivity sel = Min(costs.indexSelectivity * factor, 1.0);
+				double		tuples = rint(sel * index->rel->tuples /
+										  Max(costs.num_sa_scans, 1.0));
+
+				tuples = Max(Min(tuples, index->tuples), 1.0);
+				costs.indexTotalCost += (tuples - costs.numIndexTuples) *
+					costs.num_sa_scans * cpu_index_tuple_cost;
+				costs.numIndexTuples = tuples;
+				costs.indexSelectivity = sel;
 			}
+
+			setcost = lion_cost_set_and(root, index->rel, nsets, setidx,
+										setcols, (Node **) setquals, &setand);
+			if (loop_count > 1)
+				setcost = setand.cpu +
+					index_pages_fetched((setand.leafpages + setand.setpages) *
+										loop_count,
+										index->pages, (double) index->pages,
+										root) *
+					costs.spc_random_page_cost / loop_count;
+			costs.indexTotalCost += setcost - pagecost;
+			costs.indexTotalCost = Max(costs.indexTotalCost,
+									   costs.indexStartupCost);
+			costs.numIndexPages = Max(setand.leafpages + setand.setpages, 1.0);
+			pfree(setidx);
+		}
+		if (setcols != NULL)
+		{
+			pfree(setcols);
+			pfree(setquals);
 		}
 	}
 

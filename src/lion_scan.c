@@ -1293,10 +1293,9 @@ lion_scan_shift(LionKeyNode *node, int base)
  * the qual selects nothing whatsoever, which settles the entire scan.
  */
 static LionKeyNode *
-lion_scan_col_tree(LionScanOpaque so, LionState *col,
+lion_scan_col_tree(Relation index, LionState *col,
 				  ScanKey skey, LionScanSets *acc, bool *ok, bool *nomatch)
 {
-	Relation	index = so->index;
 	AttrNumber	attno = (AttrNumber) col->attno;
 
 	*ok = true;
@@ -1461,6 +1460,37 @@ lion_scan_col_tree(LionScanOpaque so, LionState *col,
 }
 
 /*
+ * The posting sets ONE scan key selects, located as a scan locates them
+ * (lion_scan_col_tree()), and the tree that combines them, for a caller
+ * outside a scan: the planner's intersection probe (DESIGN.md §29.11,
+ * "Correlated sets").  False when the key is not a tree over sets (`IS NOT
+ * NULL`, a range, a multi-key query that needs every row); *nomatch when it
+ * selects nothing at all.  The sets are allocated in the current memory
+ * context and the caller releases them (lion_posting_set_release()); a set
+ * may keep its INLINE leaf's pin until then.
+ */
+bool
+lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
+				  LionPostingSet **sets, LionKeyNode **tree, bool *nomatch)
+{
+	LionState  *col = lion_index_column_state(index, skey->sk_attno);
+	LionScanSets acc;
+	LionKeyNode *node;
+	bool		ok;
+
+	acc.maxsets = 4;
+	acc.nsets = 0;
+	acc.sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * acc.maxsets);
+
+	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch);
+
+	*nsets = acc.nsets;
+	*sets = acc.sets;
+	*tree = ok ? node : NULL;
+	return ok || *nomatch;
+}
+
+/*
  * Answer a scan of SEVERAL set quals, of one key column or of several:
  * intersect their set trees (DESIGN.md §24).  Any qual that cannot be
  * expressed is dropped and *recheck is set, which is correct because the
@@ -1498,7 +1528,7 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		bool		ok;
 		bool		nomatch;
 
-		node = lion_scan_col_tree(so, col, keys[i], &acc, &ok, &nomatch);
+		node = lion_scan_col_tree(so->index, col, keys[i], &acc, &ok, &nomatch);
 
 		if (nomatch)
 		{
@@ -1942,7 +1972,8 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		bool		ok;
 		bool		none;
 
-		node = lion_scan_col_tree(so, lion_column(so->ix, keys[i]->sk_attno),
+		node = lion_scan_col_tree(so->index,
+								  lion_column(so->ix, keys[i]->sk_attno),
 								  keys[i], &acc, &ok, &none);
 		if (none)
 			nomatch = true;
@@ -2906,7 +2937,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			{
 				/* Answered, and rechecked all the same (§29.6). */
 				src->recheck = true;
-				node = lion_scan_col_tree(so, col, skey, &acc, &ok, &none);
+				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none);
 				if (none)
 					nomatch = true;
 				else if (!ok)
@@ -2935,7 +2966,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 					 RelationGetRelationName(so->index),
 					 (int) skey->sk_strategy);
 
-			node = lion_scan_col_tree(so, col, skey, &acc, &ok, &none);
+			node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none);
 			if (none)
 				nomatch = true;
 			else
