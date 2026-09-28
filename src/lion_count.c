@@ -7114,6 +7114,12 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
  * The item is what puts the landings of SEVERAL bounds in order
  * (lion_cmp_entries(), the directory order itself), which is how a walk finds
  * the tightest of them (lion_range_side_leaf()).
+ *
+ * An item that sorts BEFORE the search key is stepped over, as
+ * lion_dir_search_first() does: never there on a sound directory, it is what
+ * a descent to a summary lands on in an index an earlier version damaged (a
+ * SUMLAST pivot above the summary it routes to, DESIGN.md §32), and taking it
+ * as E_j made the walk count whole buckets below the range's bound.
  */
 static BlockNumber
 lion_range_landing(Relation index, LionRange *range, int bound, int kind,
@@ -7139,6 +7145,11 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 		{
 			ItemId		iid = PageGetItemId(page, off);
 
+			if (lion_cmp_entry(lion_page_entry(page, off), &sk) < 0)
+			{
+				off = OffsetNumberNext(off);
+				continue;
+			}
 			*posp = (LionEntryTuple *) palloc(ItemIdGetLength(iid));
 			memcpy(*posp, PageGetItem(page, iid), ItemIdGetLength(iid));
 			break;

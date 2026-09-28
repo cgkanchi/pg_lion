@@ -656,6 +656,15 @@ restart:
  * item's offset, or past the last item of the rightmost leaf.  The summary
  * insert of DESIGN.md §32 looks its bucket up this way: the first summary of
  * the column whose key is at or above the row's.
+ *
+ * The item is compared with sk before it is taken, and one that sorts BEFORE
+ * it is stepped over.  On a sound directory the descent never lands on one;
+ * on an index an earlier version damaged it does - a SUMLAST pivot left above
+ * the summary it routes to once that bucket closed (§32) sends a descent to
+ * the left of summaries whose keys are below its own - and taking such an
+ * item as "the first at or above the key" filed every later row of a
+ * summarized column into one closed bucket.  Walking right from wherever the
+ * descent lands finds the right item on either.
  */
 Buffer
 lion_dir_search_first(Relation index, Relation heaprel, LionIndexState *ix,
@@ -670,7 +679,14 @@ lion_dir_search_first(Relation index, Relation heaprel, LionIndexState *ix,
 	{
 		Page		page = BufferGetPage(buf);
 
-		if (off <= PageGetMaxOffsetNumber(page) || LionPageIsRightmost(page))
+		if (off <= PageGetMaxOffsetNumber(page))
+		{
+			if (lion_cmp_entry(lion_page_item(page, off), sk) >= 0)
+				break;
+			off = OffsetNumberNext(off);
+			continue;
+		}
+		if (LionPageIsRightmost(page))
 			break;
 		if (forwrite && LionPageIncompleteSplit(page))
 		{
@@ -1133,7 +1149,11 @@ lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
 /*
  * A pivot tuple - a high key or a downlink - carrying src's key and kind.
  * child is the downlink target, or InvalidBlockNumber for a high key; a NULL
- * src makes the minus-infinity downlink.
+ * src makes the minus-infinity downlink.  The open summary bucket's entry
+ * gives a pivot of the SUMMARY kind with its key as it is now, never one of
+ * its own kind (lion_pivot_kindflags(), DESIGN.md §32): an append split puts
+ * the new SUMLAST entry alone on the right page, and when that bucket closed
+ * in place a SUMLAST high key left of it sorted above it.
  */
 static LionEntryTuple *
 lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
@@ -1145,9 +1165,8 @@ lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 
 	p->hash = (src != NULL) ? src->hash : 0;
 	p->flags = pivotflag |
-		(uint16) ((src != NULL) ?
-				  (src->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF)) :
-				  LION_ENTRY_MINUSINF);
+		((src != NULL) ? lion_pivot_kindflags(src->flags) :
+		 (uint16) LION_ENTRY_MINUSINF);
 	p->keylen = (uint16) keylen;
 	p->head = child;
 	p->tail = InvalidBlockNumber;

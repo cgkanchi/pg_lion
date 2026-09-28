@@ -550,7 +550,11 @@ lion_build_parent(LionBuildState *bs, LionBuildLevel *lv)
 	return lv->parent;
 }
 
-/* A pivot tuple carrying src's key: a high key, or a downlink to child. */
+/*
+ * A pivot tuple carrying src's key: a high key, or a downlink to child.  A
+ * column's SUMLAST entry gives a SUMMARY-kind pivot (lion_pivot_kindflags(),
+ * DESIGN.md §32), as a split's does.
+ */
 static LionEntryTuple *
 lion_build_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 				Size *size)
@@ -561,9 +565,8 @@ lion_build_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
 
 	p->hash = (src != NULL) ? src->hash : 0;
 	p->flags = pivotflag |
-		(uint16) ((src != NULL) ?
-				  (src->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF)) :
-				  LION_ENTRY_MINUSINF);
+		((src != NULL) ? lion_pivot_kindflags(src->flags) :
+		 (uint16) LION_ENTRY_MINUSINF);
 	p->keylen = (uint16) keylen;
 	p->head = child;
 	p->tail = InvalidBlockNumber;
@@ -1570,9 +1573,7 @@ lion_sum_close_bucket(LionBuildState *bs, LionSumBuild *sum, bool last)
 
 /*
  * The key whose codes lion_sum_add() was just handed has been written: it is
- * now the largest key of the bucket, and the bucket closes once it holds
- * summary_tids codes - at a key boundary, since a key's rows are never split
- * between two buckets.
+ * now the largest key of the bucket.
  */
 static void
 lion_sum_key_done(LionBuildState *bs, LionSumBuild *sum, const char *raw,
@@ -1587,7 +1588,22 @@ lion_sum_key_done(LionBuildState *bs, LionSumBuild *sum, const char *raw,
 	sum->lastrawlen = rawlen;
 	sum->bucketkeys++;
 	sum->nkeys++;
+}
 
+/*
+ * A key is about to hand its codes to the bucket: close the bucket first when
+ * it already holds summary_tids codes - at a key boundary, since a key's rows
+ * are never split between two buckets.  Closing here and not as soon as the
+ * bucket fills is what leaves the column's LAST bucket open (DESIGN.md §32):
+ * one that fills exactly at the column's last key is still the one
+ * lion_sum_finish() makes the SUMLAST entry, so a column with rows always has
+ * one.  (It used to be closed as a regular summary, leaving a column with no
+ * open bucket, whose next insert above it then created one below whatever
+ * pivot the closed one's leaf had.)
+ */
+static void
+lion_sum_key_begin(LionBuildState *bs, LionSumBuild *sum)
+{
 	if (sum->ncodes >= (int64) sum->bucket_tids)
 		lion_sum_close_bucket(bs, sum, false);
 }
@@ -1726,6 +1742,17 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 	int			i;
 	bool		sumkey;
 
+	/*
+	 * A summarized column's values go into its current summary bucket as well
+	 * (DESIGN.md §32); its reserved entries are in no bucket.  A full bucket
+	 * is closed before this key's builders exist, as it used to be after the
+	 * previous key's were flushed.
+	 */
+	sumkey = (bs->sum != NULL &&
+			  lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE);
+	if (sumkey)
+		lion_sum_key_begin(bs, bs->sum);
+
 	Assert(bs->nbuilders == 0);
 	for (i = 0; i < n; i++)
 	{
@@ -1733,13 +1760,6 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 
 		b[i] = lion_builder_create(bs, e->key, e->kind, e->hash);
 	}
-
-	/*
-	 * A summarized column's values go into its current summary bucket as well
-	 * (DESIGN.md §32); its reserved entries are in no bucket.
-	 */
-	sumkey = (bs->sum != NULL &&
-			  lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE);
 
 	while (lion_spool_group_next(group, &which, &code))
 	{

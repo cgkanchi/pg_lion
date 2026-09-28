@@ -1,0 +1,169 @@
+-- Summary posting sets and the directory order (DESIGN.md §32, "The open
+-- bucket and the directory order").
+--
+-- A pivot made from a column's open summary bucket used to carry that entry's
+-- kind, SUMLAST, and closing the bucket in place then left the closed summary
+-- sorting below the separator that routes to it: every later row of the
+-- column was filed into that one bucket, and range counts summed it where it
+-- did not belong.  Rows appended in key order close a bucket every
+-- summary_tids rows, and once the column's summaries fill the rightmost leaf
+-- a close has to split the new open bucket off onto a leaf of its own; with
+-- buckets of 16 rows that happens again and again below.  VACUUM deleting the
+-- emptied top buckets, the open one included, led to the same state.
+--
+-- Every count is compared with a sequential scan with the pushdown off, and
+-- lion_index_verify() - which checks every high key against the page to its
+-- right, and every summary against the keys of its bucket - runs after each
+-- step.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+/*
+ * lion_sa(q) runs the count q with the pushdown on and every other scan
+ * disabled, and again as a sequential scan with the pushdown off: `same` says
+ * the answers agree, `summed` that the node added up summaries.
+ */
+CREATE FUNCTION lion_sa(q text, OUT same boolean, OUT summed boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	got bigint;
+	want bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) '
+		|| q INTO j;
+	summed := coalesce((jsonb_path_query_first(j,
+		'strict $.** ? (@."Custom Plan Provider" == "LionCount")')
+		->> 'Summaries Summed')::int, 0) > 0;
+	EXECUTE q INTO got;
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE q INTO want;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	same := got IS NOT DISTINCT FROM want;
+END $$;
+-- ---------- 1. appends, a statement at a time ----------
+-- The index is built on the empty table, so the first row opens the first
+-- bucket; every 16th row after it closes one, keyed 16, 32, ... 19984, and
+-- rows 19985 .. 20000 are the open one.
+CREATE TABLE lion_sa_t (id int NOT NULL);
+CREATE INDEX lion_sa_i ON lion_sa_t USING lion (id)
+	WITH (summaries = on, summary_tids = 16);
+INSERT INTO lion_sa_t SELECT g FROM generate_series(1, 2500) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(2501, 5000) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(5001, 7500) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(7501, 10000) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(10001, 12500) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(12501, 15000) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(15001, 17500) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(17501, 20000) g;
+VACUUM (FREEZE, ANALYZE) lion_sa_t;
+SELECT lion_index_verify('lion_sa_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT summary_entries = 1250 AS buckets, summary_tids = ntids AS covers
+  FROM lion_index_stats('lion_sa_i');
+ buckets | covers 
+---------+--------
+ t       | t
+(1 row)
+
+-- at and around bucket bounds; the ones within a bucket sum no summary
+SELECT r.q AS range, s.same, s.summed
+  FROM unnest(ARRAY['id <= 10000', 'id < 10000', 'id > 10000', 'id >= 10000',
+					'id BETWEEN 4001 AND 4016', 'id BETWEEN 4000 AND 4017',
+					'id BETWEEN 2000 AND 18000', 'id <= 16', 'id < 16',
+					'id > 19990', 'id < 20001'])
+	   WITH ORDINALITY AS r(q, n),
+	   LATERAL lion_sa('SELECT count(*) FROM lion_sa_t WHERE ' || r.q) s
+ ORDER BY r.n;
+           range           | same | summed 
+---------------------------+------+--------
+ id <= 10000               | t    | t
+ id < 10000                | t    | t
+ id > 10000                | t    | t
+ id >= 10000               | t    | t
+ id BETWEEN 4001 AND 4016  | t    | f
+ id BETWEEN 4000 AND 4017  | t    | t
+ id BETWEEN 2000 AND 18000 | t    | t
+ id <= 16                  | t    | t
+ id < 16                   | t    | f
+ id > 19990                | t    | f
+ id < 20001                | t    | t
+(11 rows)
+
+-- ---------- 2. the top buckets deleted, VACUUM, keys below the old top ----------
+-- VACUUM deletes the emptied summaries 14016 .. 19984 but keeps the emptied
+-- open bucket, keyed 20000: the rows 14001 .. 20000 go into it again, and the
+-- appends above 20000 close it and open new ones.  Deleted, it made the next
+-- insert open a bucket keyed 14001, below the summary pivots the deleted
+-- buckets' leaves left behind.
+DELETE FROM lion_sa_t WHERE id > 14000;
+VACUUM (FREEZE) lion_sa_t;
+SELECT lion_index_verify('lion_sa_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+INSERT INTO lion_sa_t SELECT g FROM generate_series(14001, 15000) g;
+SELECT lion_index_verify('lion_sa_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+INSERT INTO lion_sa_t SELECT g FROM generate_series(15001, 20000) g;
+INSERT INTO lion_sa_t SELECT g FROM generate_series(20001, 24000) g;
+VACUUM (FREEZE, ANALYZE) lion_sa_t;
+SELECT lion_index_verify('lion_sa_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT summary_tids = ntids AS covers FROM lion_index_stats('lion_sa_i');
+ covers 
+--------
+ t
+(1 row)
+
+SELECT r.q AS range, s.same, s.summed
+  FROM unnest(ARRAY['id <= 14000', 'id > 14000', 'id BETWEEN 13990 AND 14010',
+					'id <= 20000', 'id > 19990', 'id BETWEEN 14500 AND 22000',
+					'id < 24000', 'id >= 20001', 'id BETWEEN 14003 AND 14010'])
+	   WITH ORDINALITY AS r(q, n),
+	   LATERAL lion_sa('SELECT count(*) FROM lion_sa_t WHERE ' || r.q) s
+ ORDER BY r.n;
+           range            | same | summed 
+----------------------------+------+--------
+ id <= 14000                | t    | t
+ id > 14000                 | t    | t
+ id BETWEEN 13990 AND 14010 | t    | f
+ id <= 20000                | t    | t
+ id > 19990                 | t    | t
+ id BETWEEN 14500 AND 22000 | t    | t
+ id < 24000                 | t    | t
+ id >= 20001                | t    | t
+ id BETWEEN 14003 AND 14010 | t    | f
+(9 rows)
+
+DROP TABLE lion_sa_t;
+DROP FUNCTION lion_sa(text);

@@ -1132,19 +1132,34 @@ lion_summary_make_last(LionState *state, Datum key, uint32 hash, uint32 ckey,
 }
 
 /*
- * Raise the key of the column's SUMLAST entry at (buf, off), held EXCLUSIVE,
- * to `key`: the largest key its bucket will hold once the caller's row is in
- * it.  The entry is rebuilt around the new key with everything else as it
- * was, and put back through lion_dir_place(), which splits the leaf when a
- * longer key no longer fits; the SUMLAST kind sorts after every other summary
- * whatever its key, so its position does not change.  An INLINE payload that
- * a longer key would push past what an entry may inline is spilled instead
- * (lion_entry_spill(), as an insert's would be), and the caller's next try
- * raises the key of a CHAIN entry.
+ * The column's SUMLAST entry at (buf, off), held EXCLUSIVE, holds fewer than
+ * summary_tids rows and a key below `key`: raise its key to `key` - the
+ * largest key its bucket holds once the caller's row is in it - and put the
+ * row in, under the lock the lookup took.  Returns false when the caller has
+ * to look the entry up again and add the row there (nothing is lost: the key
+ * is raised, and the next lookup finds the entry with a key at or above the
+ * row's).
+ *
+ * An INLINE entry (the open bucket of an appending column nearly always is)
+ * is rebuilt around the new key with the row already in its payload and put
+ * back through lion_dir_place() - ONE record, which splits the leaf when the
+ * entry no longer fits it; the SUMLAST kind sorts after every other summary
+ * whatever its key, so its position does not change.  It used to be the key
+ * alone, in a record of its own, and then a second descent from the root and
+ * a second record for the row: every append to a summarized column paid
+ * twice (2026-09-28 review).  A payload that the row and a longer key push
+ * past what an entry may inline is spilled first (lion_entry_spill(), as an
+ * insert's would be), with the old key, and the entry is then a CHAIN.
+ *
+ * A CHAIN entry's key is raised in a record of its own, and the row goes into
+ * its posting tree through the chain insert straight after, still under the
+ * leaf's lock - unless the rewrite split the leaf and moved the entry off it,
+ * which is what the false return is for.
  */
-static void
-lion_summary_rekey(Relation index, Relation heaprel, LionState *state,
-				   Buffer buf, OffsetNumber off, Datum key, uint32 hash)
+static bool
+lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
+						  Buffer buf, OffsetNumber off, Datum key,
+						  uint32 hash, uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
@@ -1153,18 +1168,32 @@ lion_summary_rekey(Relation index, Relation heaprel, LionState *state,
 	Size		newsize;
 	Size		newpayoff = MAXALIGN(LION_ENTRY_HDRSZ +
 									 lion_key_datum_size(state, key));
+	Size		inline_limit = (Size) state->ix->meta.inline_limit;
 
 	if ((e->flags & LION_ENTRY_INLINE) != 0)
 	{
+		Size		itemsz = ItemIdGetLength(iid);
 		Size		payoff = LionEntryPayloadOffset(e);
-		Size		paylen = LION_ENTRY_PAYLOAD_LEN(e, ItemIdGetLength(iid));
-		char	   *payload = (char *) palloc(Max(paylen, 1));
+		Size		paylen = LION_ENTRY_PAYLOAD_LEN(e, itemsz);
+		char	   *oldpay = (char *) palloc(Max(paylen, 1));
+		char	   *newpay = (char *) palloc(paylen + LION_CONTAINER_MAX_SIZE);
+		Size		newlen;
+		int			ndelta = 0;
+		uint64		added = 1;
 
-		memcpy(payload, (char *) e + payoff, paylen);
+		memcpy(oldpay, (char *) e + payoff, paylen);
+		newlen = lion_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
+		if (newlen == 0)
+		{
+			/* The row is in already; only the key is raised. */
+			memcpy(newpay, oldpay, paylen);
+			newlen = paylen;
+			ndelta = 0;
+			added = 0;
+		}
 
 		if (newpayoff >= (Size) LION_MAX_ENTRY_SIZE ||
-			paylen > lion_inline_max(newpayoff,
-									 (Size) state->ix->meta.inline_limit))
+			newlen > lion_inline_max(newpayoff, inline_limit))
 		{
 			LionEntryTuple *chain;
 			Size		chainsize;
@@ -1172,29 +1201,79 @@ lion_summary_rekey(Relation index, Relation heaprel, LionState *state,
 			chain = lion_entry_rebuild(e, NULL, 0, &chainsize);
 			chain->ncontainers = e->ncontainers;
 			chain->ntids = e->ntids;
-			lion_entry_spill(index, heaprel, buf, off, chain, payload, paylen);
+			lion_entry_spill(index, heaprel, buf, off, chain, oldpay, paylen);
 			pfree(chain);
-			pfree(payload);
-			return;
-		}
+			pfree(newpay);
+			pfree(oldpay);
 
-		newentry = lion_make_entry(state, key, hash, e->flags, payload, paylen,
-								   &newsize);
-		pfree(payload);
+			/* The CHAIN entry took the INLINE one's place, and is smaller. */
+			e = lion_page_entry(BufferGetPage(buf), off);
+			Assert(LionEntryIsSumLast(e) && (e->flags & LION_ENTRY_CHAIN) != 0);
+		}
+		else
+		{
+			LionEntryTuple *shape;
+			Size		shapesize;
+			Size		need = newpayoff + newlen;
+			Size		writesz;
+
+			/*
+			 * Growth slack as lion_insert_inline() gives it (DESIGN.md §4):
+			 * the bytes the page has allotted the entry when they still fit
+			 * the new payload, else its new length and fresh slack.
+			 */
+			if (itemsz >= need && itemsz - need <= LION_ENTRY_SLACK_BOUND)
+				writesz = itemsz;
+			else
+			{
+				Size		maxsize = MAXALIGN_DOWN(MAXALIGN(itemsz) +
+													PageGetExactFreeSpace(page));
+
+				writesz = lion_entry_alloc_size(newpayoff, newlen, inline_limit,
+												Max(maxsize, need));
+			}
+
+			shape = lion_make_entry(state, key, hash, e->flags, NULL, 0,
+									&shapesize);
+			newentry = lion_entry_rebuild_slack(shape, newpay, newlen, writesz,
+												&newsize);
+			newentry->ncontainers = (uint32) ((int) e->ncontainers + ndelta);
+			newentry->ntids = e->ntids + added;
+			pfree(shape);
+			pfree(newpay);
+			pfree(oldpay);
+
+			/* `e` points into the page, and is not valid after this. */
+			lion_dir_place(index, heaprel, state->ix, buf, off, true,
+						   newentry, newsize);
+			pfree(newentry);
+			return true;
+		}
 	}
-	else
-	{
-		newentry = lion_make_entry(state, key, hash, e->flags, NULL, 0,
-								   &newsize);
-		newentry->head = e->head;
-		newentry->tail = e->tail;
-	}
+
+	/* A CHAIN entry: its key, then the row. */
+	newentry = lion_make_entry(state, key, hash, e->flags, NULL, 0, &newsize);
+	newentry->head = e->head;
+	newentry->tail = e->tail;
 	newentry->ncontainers = e->ncontainers;
 	newentry->ntids = e->ntids;
-
 	lion_dir_place(index, heaprel, state->ix, buf, off, true, newentry,
 				   newsize);
 	pfree(newentry);
+
+	/*
+	 * A column has one SUMLAST entry, so one of that kind and column at off
+	 * is this one.  Anywhere else, the rewrite split the leaf under it.
+	 */
+	page = BufferGetPage(buf);
+	if (off < lion_page_first_data(page) || off > PageGetMaxOffsetNumber(page))
+		return false;
+	e = lion_page_entry(page, off);
+	if (LionEntryIsPivot(e) || !LionEntryIsSumLast(e) ||
+		e->attno != state->attno || (e->flags & LION_ENTRY_CHAIN) == 0)
+		return false;
+	lion_insert_chain(index, heaprel, buf, off, ckey, lo);
+	return true;
 }
 
 /*
@@ -1247,13 +1326,15 @@ lion_summary_close_last(Relation index, Relation heaprel, LionState *state,
  * bucket holds so far.  So the bucket of `key` is the first summary of the
  * column whose key is at or above it, which a descent to (SUMMARY, key) lands
  * on - the column's SUMLAST entry when every other summary's key is below it.
- * Then:
+ * lion_dir_search_first() compares what it lands on with the key, and steps
+ * over a summary whose key is below it, which only an index damaged by an
+ * earlier version has in that place (see there).  Then:
  *
  *	- a summary whose key is at or above `key`: the row joins it;
  *	- the SUMLAST entry, with a key at or above `key`: the same;
  *	- the SUMLAST entry with a smaller key, while it holds fewer than
- *	  summary_tids TIDs: its key is raised to `key` (a record of its own), and
- *	  the lookup starts over and finds the first case;
+ *	  summary_tids TIDs: its key is raised to `key` and the row joins it, in
+ *	  one step under the lock the lookup took (lion_summary_rekey_insert());
  *	- the SUMLAST entry with a smaller key once it is FULL: the bucket is
  *	  closed where it stands - the entry loses LION_ENTRY_SUMLAST and becomes
  *	  an ordinary summary whose key, the largest it holds, is its upper bound -
@@ -1262,6 +1343,19 @@ lion_summary_close_last(Relation index, Relation heaprel, LionState *state,
  *	  which is what a key above all of them is the moment to say;
  *	- no summary at all at or above `key`: a SUMLAST entry holding the row is
  *	  added where the column's summaries end.
+ *
+ * The last case is an index built on an empty table, whose first insert opens
+ * the first bucket, or a crash between the two records of a close.  It is no
+ * longer VACUUM: an emptied SUMLAST entry stays (lion_vacuum.c), because a
+ * new one opened after it was deleted was keyed by the row that opened it -
+ * possibly below the key of a pivot that the deleted buckets' leaves left in
+ * the directory - and once that bucket closed it sorted below the separator
+ * that routes to it.  After such a crash the new entry is above every summary
+ * the column has (the lookup found none at or above the row's key), and the
+ * item in front of the place it goes is compared with the key as well, when
+ * it is on the same leaf, to be sure.  (What is left is that closed bucket
+ * emptied and deleted by VACUUM before any row above it arrives, and then a
+ * row below its key: DESIGN.md §32, "Open for the owner".)
  *
  * Every one of those changes the summary run under the EXCLUSIVE lock of the
  * leaf the summary lives on, which every writer of that summary holds - the
@@ -1279,11 +1373,12 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 {
 	uint32		hash = LION_SUMMARY_HASH;	/* whatever the key: see lion.h */
 	uint32		bucket_tids = state->ix->meta.summary_tids;
+	bool		guarded = false;
 
 	/*
 	 * Each turn either places the row or changes the summary run so that the
-	 * next one gets further: a raised key, an open bucket made by this insert
-	 * or by another.
+	 * next one gets further: an open bucket made by this insert or by another,
+	 * or an entry the rewrite of its key moved off its leaf.
 	 */
 	for (;;)
 	{
@@ -1311,7 +1406,7 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 
 		if (kind == LION_KIND_SUMMARY)
 		{
-			/* The descent's own comparison put its key at or above ours. */
+			/* lion_dir_search_first() found its key at or above ours. */
 			if ((e->flags & LION_ENTRY_INLINE) != 0)
 				lion_insert_inline(index, heaprel, state, buf, off, ckey, lo);
 			else
@@ -1326,6 +1421,7 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 			int32		c = DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
 															state->collation,
 															key, lastkey));
+			bool		done = true;
 
 			if (c <= 0)
 			{
@@ -1334,31 +1430,26 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 									  lo);
 				else
 					lion_insert_chain(index, heaprel, buf, off, ckey, lo);
-				UnlockReleaseBuffer(buf);
-				return;
 			}
-
-			if (e->ntids >= (uint64) bucket_tids)
-			{
+			else if (e->ntids >= (uint64) bucket_tids)
 				lion_summary_close_last(index, heaprel, state, buf, off, key,
 										hash, ckey, lo);
-				UnlockReleaseBuffer(buf);
-				return;
-			}
-
-			/* Raise the open bucket's key to ours, then look again. */
-			lion_summary_rekey(index, heaprel, state, buf, off, key, hash);
+			else
+				done = lion_summary_rekey_insert(index, heaprel, state, buf,
+												 off, key, hash, ckey, lo);
 			UnlockReleaseBuffer(buf);
+			if (done)
+				return;
 			continue;
 		}
 
 		/*
 		 * No summary of the column is at or above the key, and it has no open
-		 * bucket either: every summary it had was emptied by VACUUM and
-		 * deleted, or it never had one - an index built on an empty table.
-		 * The new SUMLAST entry goes where the column's summaries end, through
-		 * the find-or-create every new entry takes (lion_dir_find()), which
-		 * serialises it against another insert doing the same.
+		 * bucket either: an index built on an empty table, or a crash between
+		 * the two records of a close (see above).  The new SUMLAST entry goes
+		 * where the column's summaries end, through the find-or-create every
+		 * new entry takes (lion_dir_find()), which serialises it against
+		 * another insert doing the same.
 		 */
 		UnlockReleaseBuffer(buf);
 		{
@@ -1377,6 +1468,44 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 				UnlockReleaseBuffer(buf);
 				continue;
 			}
+
+			/*
+			 * The summary in front of the new entry, when it is on this leaf,
+			 * must be below the key: the new bucket is above every other.
+			 * One that is not came after the lookup - which nothing but a
+			 * close can make, and a close makes its SUMLAST under the same
+			 * lock - or was missed by it, which only damage explains.  Look
+			 * again once, and then say so.
+			 */
+			page = BufferGetPage(buf);
+			if (OffsetNumberIsValid(off) &&
+				off > lion_page_first_data(page) &&
+				off <= OffsetNumberNext(PageGetMaxOffsetNumber(page)))
+			{
+				LionEntryTuple *prev = lion_page_entry(page,
+													   OffsetNumberPrev(off));
+
+				if (!LionEntryIsPivot(prev) && prev->attno == state->attno &&
+					lion_entry_kind(prev) == LION_KIND_SUMMARY &&
+					DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
+													state->collation,
+													lion_fetch_key(state,
+																   LionEntryGetKey(prev)),
+													key)) >= 0)
+				{
+					UnlockReleaseBuffer(buf);
+					if (guarded)
+						ereport(ERROR,
+								(errcode(ERRCODE_INDEX_CORRUPTED),
+								 errmsg("lion index \"%s\": the summaries of key column %d are out of order",
+										RelationGetRelationName(index),
+										state->attno),
+								 errhint("REINDEX the index.")));
+					guarded = true;
+					continue;
+				}
+			}
+
 			last = lion_summary_make_last(state, key, hash, ckey, lo, &size);
 			lion_dir_add_entry(index, heaprel, ix, &buf, off, movedright,
 							   last, size);

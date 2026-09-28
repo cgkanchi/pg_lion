@@ -215,6 +215,16 @@ typedef struct LionVerifySetResult
 			 errmsg(__VA_ARGS__)))
 
 /*
+ * The same, for damage that nothing but a rebuild repairs and that an earlier
+ * version is known to have made: the order of the summaries of DESIGN.md §32.
+ */
+#define lion_corrupt_reindex(...) \
+	ereport(ERROR, \
+			(errcode(ERRCODE_INDEX_CORRUPTED), \
+			 errmsg(__VA_ARGS__), \
+			 errhint("REINDEX the index.")))
+
+/*
  * Open relid as a lion index.
  */
 static Relation
@@ -1247,6 +1257,20 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 		lion_corrupt("lion index \"%s\": entry %u on block %u belongs to key column %u, but the index has %d",
 					RelationGetRelationName(vs->index), off, blk, item->attno,
 					vs->ix->ncolumns);
+
+	/*
+	 * A pivot is never of the open summary bucket's kind
+	 * (lion_pivot_kindflags(), DESIGN.md §32).  Before 2026-09-28 a split or
+	 * the build could make one, and once that bucket closed in place it sorted
+	 * below the separator that routes to it: every later insert filed its row
+	 * into that one closed bucket and range counts summed it where it did not
+	 * belong.  An index with one is damaged or about to be.
+	 */
+	if (LionEntryIsPivot(item) && kind == LION_KIND_SUMLAST)
+		lion_corrupt_reindex("lion index \"%s\": %s %u on block %u has the kind of an open summary bucket, which puts the summaries of key column %u out of order once that bucket closes",
+							 RelationGetRelationName(vs->index),
+							 LionEntryIsHighKey(item) ? "high key" : "downlink",
+							 off, blk, item->attno);
 
 	if (kind == LION_KIND_NULL || kind == LION_KIND_EMPTY)
 	{
@@ -2874,16 +2898,16 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			/* Strictly increasing within the page (DESIGN.md §21). */
 			if (prevkey != NULL &&
 				lion_cmp_entries(vs->ix, prevkey, item) >= 0)
-				lion_corrupt("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
-							RelationGetRelationName(vs->index), off, blk);
+				lion_corrupt_reindex("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
+									RelationGetRelationName(vs->index), off, blk);
 
 			if (firstkey == NULL)
 			{
 				firstkey = lion_verify_copy_item(page, off);
 				if (prevhigh != NULL &&
 					lion_cmp_entries(vs->ix, prevhigh, firstkey) > 0)
-					lion_corrupt("lion index \"%s\": the high key of the page left of %u sorts after its first key",
-								RelationGetRelationName(vs->index), blk);
+					lion_corrupt_reindex("lion index \"%s\": the high key of the page left of %u sorts after its first key",
+										RelationGetRelationName(vs->index), blk);
 			}
 			if (prevkey != NULL)
 				pfree(prevkey);
@@ -2907,8 +2931,8 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 
 		if (highkey != NULL && prevkey != NULL &&
 			lion_cmp_entries(vs->ix, prevkey, highkey) >= 0)
-			lion_corrupt("lion index \"%s\": the last key of directory page %u is not below its high key",
-						RelationGetRelationName(vs->index), blk);
+			lion_corrupt_reindex("lion index \"%s\": the last key of directory page %u is not below its high key",
+								RelationGetRelationName(vs->index), blk);
 		if (prevkey != NULL)
 			pfree(prevkey);
 
@@ -3151,9 +3175,9 @@ lion_verify_directory(LionVerifyState *vs)
 					below->highkey[p] != NULL &&
 					lion_cmp_entries(vs->ix, below->highkey[p],
 									 children.firstkey[j]) > 0)
-					lion_corrupt("lion index \"%s\": the high key of block %u sorts after the separator of its right sibling",
-								RelationGetRelationName(vs->index),
-								below->blocks[p]);
+					lion_corrupt_reindex("lion index \"%s\": the high key of block %u sorts after the separator of its right sibling",
+										RelationGetRelationName(vs->index),
+										below->blocks[p]);
 			}
 
 			if (j < children.npages)
