@@ -2382,7 +2382,8 @@ The length cap then applies only when the length is known at plan time - a liter
 ArrayExpr's, and a stable expression's that `estimate_expression_value()` reduces to a literal. A
 Param that IS an array has no length until the executor has it, and by then there is no plan left
 to decline in favour of, so it is answered whatever its length, and the pins are bounded by the
-lookup instead (below).
+lookup instead (below) - and, in a plain count, the memory by locating it a batch at a time ("A
+list too long to locate at once").
 
 ### The pin budget (2026-09-23 review)
 
@@ -2686,10 +2687,41 @@ The pins dropped are pins that carried no interlock; a pin too many never made a
 **What is still per value.** The located sets themselves: a `LionPostingSet`, its INLINE payload
 copy and a tree node, about 200 bytes a value, which is what the executor spends on the array
 anyway (a 30000-value list costs 7.8 MB of VmHWM with the pushdown off, 15.6 MB with it on at
-work_mem 4MB, 499 MB before). Locating a list a batch at a time, as the plain scan does (§29.4),
-would need the pushdown to keep the values instead of the sets, and the GROUP BY list driver walks
-them. And the query's own text: a multi-key AND of 1000 CHAIN keys (the extraction's cap) still
-holds 1000 page images, 8 MB, though past the pin budget only one child's pins.
+work_mem 4MB, 499 MB before) - except in a plain count, which locates a long list a batch at a
+time (below). And the query's own text: a multi-key AND of 1000 CHAIN keys (the extraction's cap)
+still holds 1000 page images, 8 MB, though past the pin budget only one child's pins.
+
+#### A list too long to locate at once (2026-09-28 review)
+
+A parameter's array has no length cap, and every value's located set was held at once whatever
+work_mem said: some 200 bytes a value, and past about nine million values an array of sets larger
+than the 1GB a plain allocation may be, so `k = ANY ($1)` failed with "invalid memory alloc request
+size" where the ordinary plan answers. Two things now:
+
+- **A plain count locates it a batch at a time** (`lion_array_batch_prepare()`,
+  `lion_count_batched()`). When the node counts the relation as one row - no GROUP BY, no
+  count(DISTINCT) walk, no FK-side join - and an IN list that is a source of its own has more
+  values than `lion_array_batch_size()` (a work_mem of 256-byte sets, never fewer than the thousand
+  a literal may have), the list is not located with the other clauses. Its values are sorted as a
+  lookup sorts them (`lion_probe_sort()`) and kept with their hashes, and the count locates a batch,
+  counts it with the other sources, releases it - pins and all - and goes on to the next. The count
+  of the list is the SUM of the batches' counts for the reason lion_run_batches() gives one level
+  down: with the batches B_j of whole entries of one scalar index, R the other positive sources and
+  N the negated ones, `|((B_1 ∪ ... ∪ B_m) ∩ R) \ N| = Σ_j |(B_j ∩ R) \ N|`, the terms being
+  disjoint. A batch ends only where the hash changes, so two values of one equality class - which
+  hash alike and sort together - are never in two batches, and neither is any entry: the argument
+  of the plain scan's pieces (§29.4). A batch none of whose values has an entry adds nothing.
+  EXPLAIN ANALYZE prints `List Batches` when there were any.
+- **Every other shape holds the list whole, in a huge allocation**, so that it answers at any length
+  the array itself can have instead of failing at nine million values. A GROUP BY, a count(DISTINCT)
+  and an FK-side join count the list many times over - batching it would locate it again for every
+  group - and a list under an OR is not a disjoint union.
+
+What a batched count still holds per value is the values: the array, and a Datum and a hash each -
+what the executor's own `= ANY` holds, and core's B-tree scan of the same array deconstructs and
+sorts it just the same. A list that is not batched costs its sets' memory outside work_mem as
+before; the planner cannot see a parameter's length to decline it (the literal cap), and at run
+time there is no plan left to fall back to.
 
 Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
 

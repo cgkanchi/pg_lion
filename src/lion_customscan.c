@@ -953,6 +953,22 @@ typedef struct LionCountScanState
 	int			ndsource;
 
 	/*
+	 * An IN list too long to locate at once (DESIGN.md §15, "A list too long
+	 * to locate at once"): the WHERE item it is, -1 for none, and its non-NULL
+	 * values - of type batchtype - sorted into the order a lookup takes them
+	 * in, with their hashes, which lion_count_batched() locates and counts a
+	 * batch at a time.  Only a count of one row per relation takes it; the
+	 * values live in wherecxt.  listbatches is how many batches were counted,
+	 * for EXPLAIN ANALYZE.
+	 */
+	int			batchitem;
+	Oid			batchtype;
+	int			nbatchval;
+	Datum	   *batchval;
+	uint32	   *batchhash;
+	int64		listbatches;
+
+	/*
 	 * GROUP BY over a partitioned table (DESIGN.md §16): the partitions are
 	 * walked one at a time and each one's groups are emitted as PARTIAL
 	 * aggregates as they are counted, so the node's only state between rows
@@ -9266,6 +9282,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->dsources = (LionCountSource *)
 		palloc0(sizeof(LionCountSource) * st->nsource);
 	st->disttests = 0;
+	st->batchitem = -1;
 }
 
 /*
@@ -9401,7 +9418,15 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
-	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
+	/*
+	 * A parameter's array has no length cap (DESIGN.md §15), and past some
+	 * nine million values the sets pass the 1GB a plain allocation may have.
+	 * A plain count locates such a list a batch at a time instead
+	 * (lion_count_batched()); every other shape holds it whole.
+	 */
+	*sets = (LionPostingSet *)
+		palloc_extended(sizeof(LionPostingSet) * Max(nelems, 1),
+						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 
 	/*
 	 * One call rather than a lookup per element: the values are hashed first
@@ -9422,6 +9447,100 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 		pfree(arr);
 
 	return nsets;
+}
+
+/*
+ * What one value of an IN list costs once located: its LionPostingSet, the
+ * copies of its INLINE payload and stored key, its leaf of the source's tree
+ * and the pointer to it - some 200 bytes, rounded up.
+ */
+#define LION_ARRAY_SET_BYTES	256
+
+/*
+ * The most values of one IN list a count locates at once (DESIGN.md §15, "A
+ * list too long to locate at once"): what a work_mem of located sets holds,
+ * and never fewer than the longest list a literal may be, which is located
+ * whole as it always was.
+ */
+static int
+lion_array_batch_size(void)
+{
+	Size		n = (Size) work_mem * 1024 / LION_ARRAY_SET_BYTES;
+
+	n = Min(n, (Size) (INT_MAX / 2));
+	return (int) Max(n, (Size) LION_MAX_ARRAY_ELEMS);
+}
+
+/*
+ * Is WHERE item k, the IN list cl, to be located and counted a batch at a
+ * time?  A parameter's array has no length cap (DESIGN.md §15), and the
+ * located sets of a long one were all held at once, work_mem or not - about
+ * 200 bytes a value, and past nine million values an array of them larger
+ * than an allocation may be (2026-09-28 review).
+ *
+ * The count of a list is a SUM over pieces of it in one shape: a count of
+ * the relation as one row (lion_count_relation()).  The entries of one
+ * scalar index are disjoint (§15), so with the list cut into batches of
+ * whole entries B_1 .. B_m, R the other positive sources and N the negated
+ * ones,
+ *
+ *		|((B_1 ∪ ... ∪ B_m) ∩ R) \ N| = Σ_j |(B_j ∩ R) \ N|,
+ *
+ * the terms being disjoint - lion_run_batches()'s argument, one level up.  A
+ * GROUP BY, a count(DISTINCT) and an FK-side join count the list many times
+ * over and hold it whole, as a list under an OR does, whose union is not a
+ * disjoint one.  One list per relation is batched.
+ *
+ * The values are sorted as a lookup sorts them (lion_probe_sort()) and a
+ * batch ends only where the hash changes: two values of one equality class
+ * hash alike and sort together, so no class is split and no entry is located
+ * in two batches - the argument that lets a plain scan locate a long list
+ * piece by piece (§29.4).  What is held whole is the values themselves: the
+ * array, and a Datum and a hash per value.
+ */
+static bool
+lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
+{
+	ArrayType  *arr;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+
+	if (st->hasgroupidx || st->joinclause >= 0 || st->batchitem >= 0 ||
+		cl->valisnull)
+		return false;
+
+	arr = DatumGetArrayTypeP(cl->val);
+	if (ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) <= lion_array_batch_size())
+	{
+		if ((Pointer) arr != DatumGetPointer(cl->val))
+			pfree(arr);
+		return false;
+	}
+
+	elemtype = ARR_ELEMTYPE(arr);
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	st->batchval = (Datum *)
+		palloc_extended(sizeof(Datum) * Max(nelems, 1), MCXT_ALLOC_HUGE);
+	st->batchhash = (uint32 *)
+		palloc_extended(sizeof(uint32) * Max(nelems, 1), MCXT_ALLOC_HUGE);
+	st->nbatchval = lion_probe_sort(cl->idx, cl->idxcol, elemtype, nelems,
+									elems, nulls, st->batchval,
+									st->batchhash);
+	st->batchtype = elemtype;
+	st->batchitem = k;
+
+	/* a by-reference value points into arr, which stays in wherecxt */
+	pfree(elems);
+	pfree(nulls);
+	return true;
 }
 
 /*
@@ -9774,16 +9893,25 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	/* One array for the whole source, with every leaf's tree moved onto it. */
-	src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
-										   Max(total, 1));
+	/*
+	 * One array for the whole source, with every leaf's tree moved onto it,
+	 * and each leaf's own array let go as it is copied: an IN list of a
+	 * parameter can be millions of sets long (DESIGN.md §15).
+	 */
+	src->sets = (LionPostingSet *)
+		palloc_extended(sizeof(LionPostingSet) * Max(total, 1),
+						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 	src->nsets = total;
 	src->nomaterialize = true;
 	for (i = 0; i < orst->nleaves; i++)
 	{
 		if (leafn[i] > 0)
+		{
 			memcpy(&src->sets[off], leafsets[i],
 				   sizeof(LionPostingSet) * leafn[i]);
+			pfree(leafsets[i]);
+			leafsets[i] = NULL;
+		}
 		lion_shift_keynos(leaftree[i], off);
 		off += leafn[i];
 	}
@@ -10003,6 +10131,18 @@ lion_locate_where(LionCountScanState *st)
 			continue;
 		}
 
+		/*
+		 * An IN list too long to locate at once, in a count that can take it
+		 * a batch at a time (lion_array_batch_prepare()): the count locates
+		 * it, and until then it is a positive source of no sets.
+		 */
+		if (cl->kind == LION_CLAUSE_ARRAY &&
+			lion_array_batch_prepare(st, k, cl))
+		{
+			src->disjoint = true;
+			continue;
+		}
+
 		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
 		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
 
@@ -10199,6 +10339,12 @@ lion_release_where(LionCountScanState *st)
 		src->rangewalk = NULL;
 	}
 	st->rangesrc_held = 0;
+
+	/* ... and so do the values of a list counted in batches */
+	st->batchitem = -1;
+	st->batchval = NULL;
+	st->batchhash = NULL;
+	st->nbatchval = 0;
 
 	/* the row filter lives in wherecxt too, and names this relation */
 	st->filter = NULL;
@@ -10458,6 +10604,85 @@ lion_node_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 									 st->rel_read_only);
 }
 
+/*
+ * The count of the relation with its IN list located a batch at a time
+ * (lion_array_batch_prepare()): the sum of the counts of the batches, each
+ * ANDed with the other sources exactly as the whole list would have been.  A
+ * batch is lion_array_batch_size() values, moved on to where the hash
+ * changes, and its sets are released - pins and all - before the next one is
+ * located, so a list of any length holds one batch of sets at a time.  A
+ * batch none of whose values has an entry adds nothing, as a list with no
+ * entry makes the whole count 0.
+ */
+static int64
+lion_count_batched(LionCountScanState *st)
+{
+	LionClauseState *cl = &st->clause[st->item[st->batchitem].clauseno];
+	LionCountSource *src = &st->sources[st->batchitem + 1];
+	int			batch = lion_array_batch_size();
+	MemoryContext batchcxt;
+	MemoryContext oldcxt;
+	int64		count = 0;
+	int			start = 0;
+
+	batchcxt = AllocSetContextCreate(st->wherecxt, "LionCount list batch",
+									 ALLOCSET_DEFAULT_SIZES);
+	while (start < st->nbatchval)
+	{
+		int			end = start + Min(batch, st->nbatchval - start);
+		LionPostingSet *sets;
+		int			nsets;
+		int			nfound;
+		int			i;
+
+		while (end < st->nbatchval &&
+			   st->batchhash[end] == st->batchhash[end - 1])
+			end++;
+
+		st->listbatches++;
+		oldcxt = MemoryContextSwitchTo(batchcxt);
+		sets = (LionPostingSet *)
+			palloc0(sizeof(LionPostingSet) * (end - start));
+		nsets = lion_posting_set_lookup_many_col(cl->idx, cl->idxcol,
+												 st->batchtype, end - start,
+												 &st->batchval[start], NULL,
+												 sets, &nfound);
+		src->sets = sets;
+		src->nsets = nsets;
+		src->tree = NULL;
+		if (nfound > 0)
+		{
+			LionKeyNode **args = (LionKeyNode **)
+				palloc(sizeof(LionKeyNode *) * nsets);
+
+			for (i = 0; i < nsets; i++)
+				args[i] = lion_key_node(i);
+			src->tree = lion_bool_node(LION_KN_OR, args, nsets);
+		}
+		MemoryContextSwitchTo(oldcxt);
+
+		if (src->tree != NULL)
+		{
+			MemoryContextReset(st->pergroup);
+			oldcxt = MemoryContextSwitchTo(st->pergroup);
+			count += lion_node_count(st, st->nitem, &st->sources[1], false);
+			MemoryContextSwitchTo(oldcxt);
+		}
+
+		for (i = 0; i < nsets; i++)
+			lion_posting_set_release(&sets[i]);
+		src->sets = NULL;
+		src->nsets = 0;
+		src->tree = NULL;
+		MemoryContextReset(batchcxt);
+		start = end;
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextDelete(batchcxt);
+
+	return count;
+}
+
 static int64
 lion_count_relation(LionCountScanState *st)
 {
@@ -10467,6 +10692,10 @@ lion_count_relation(LionCountScanState *st)
 	Assert(st->nitem > 0);
 	if (st->wheremissing)
 		return 0;
+
+	/* the positive list is there, so this is never the filtered scan below */
+	if (st->batchitem >= 0)
+		return lion_count_batched(st);
 
 	MemoryContextReset(st->pergroup);
 	oldcxt = MemoryContextSwitchTo(st->pergroup);
@@ -12912,6 +13141,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->rangesrc_walked > 0)
 			ExplainPropertyInteger("Range Sources Walked", NULL,
 								   st->rangesrc_walked, es);
+
+		/*
+		 * The batches an IN list too long to locate at once was counted in
+		 * (DESIGN.md §15, "A list too long to locate at once").  Only when
+		 * there were any.
+		 */
+		if (st->listbatches > 0)
+			ExplainPropertyInteger("List Batches", NULL, st->listbatches, es);
 
 		/*
 		 * The existence (or count) tests a count(DISTINCT k) made: one per
