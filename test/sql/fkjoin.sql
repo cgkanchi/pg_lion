@@ -362,13 +362,17 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = 
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.pk = 5 GROUP BY d.attr');
 -- three relations
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk JOIN lion_fd4 e ON e.k = f.x GROUP BY d.attr');
--- a partitioned fact table
+-- a partitioned fact table is counted partition by partition (DESIGN.md §27,
+-- and fkjoin_partition), but not when a partition has no lion index on fk
 CREATE TABLE lion_ffp (fk int4, x int NOT NULL) PARTITION BY RANGE (x);
 CREATE TABLE lion_ffp1 PARTITION OF lion_ffp FOR VALUES FROM (0) TO (5);
 CREATE TABLE lion_ffp2 PARTITION OF lion_ffp FOR VALUES FROM (5) TO (10);
 INSERT INTO lion_ffp SELECT i % 120 + 1, i % 10 FROM generate_series(1, 3000) i;
-CREATE INDEX ON lion_ffp USING lion (fk);
+CREATE INDEX lion_ffp_fk ON lion_ffp USING lion (fk);
 ANALYZE lion_ffp;
+SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ffp f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
+DROP INDEX lion_ffp_fk;
+CREATE INDEX ON lion_ffp1 USING lion (fk);
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ffp f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
 DROP TABLE lion_ffp;
 -- ... and a partitioned dimension, which has no index list to prove its key

@@ -595,6 +595,29 @@ extern void lion_lookup_walk_pause(LionLookupWalk *walk);
 extern void lion_lookup_walk_restart(LionLookupWalk *walk);
 
 /*
+ * What the order lion_lookup_walk_cmp() sorts keys into is made of: the
+ * probe's comparison, its hash and the collation both are called under.  Two
+ * walks whose orders are equal (the leaf partitions of a partitioned fact
+ * table, whose fk indexes are usually one partitioned index's) take keys
+ * sorted for either; others each need the keys sorted for themselves
+ * (DESIGN.md §27, "A partitioned fact table").  `valid` is false for a walk
+ * whose keys cannot be sorted at all (lion_lookup_walk_ordered()).
+ */
+typedef struct LionWalkOrder
+{
+	bool		valid;
+	bool		hassort;
+	Oid			sortproc;
+	Oid			hashproc;
+	Oid			collation;
+} LionWalkOrder;
+
+extern void lion_lookup_walk_order(const LionLookupWalk *walk,
+								   LionWalkOrder *order);
+extern bool lion_walk_order_equal(const LionWalkOrder *a,
+								  const LionWalkOrder *b);
+
+/*
  * One key in any order, by a descent of its own - what
  * lion_posting_set_lookup_col() does - with the probe the walk resolved once
  * instead of one resolved for every key (DESIGN.md §27, "The per-key path,

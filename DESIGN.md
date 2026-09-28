@@ -3077,7 +3077,9 @@ pinned by a paused cursor - holds as before.
 At UPPERREL_GROUP_AGG the input rel may be a partitioned parent: `rte->inh`, relkind `p`,
 `IS_PARTITIONED_REL()` (part_scheme, boundinfo, nparts > 0, part_rels, not dummy), reloptkind
 RELOPT_BASEREL. The parent has no storage and, because `get_relation_info()` skips indexes for an
-inheritance parent, no `indexlist` either, so everything is resolved per leaf.
+inheritance parent, no `indexlist` either, so everything is resolved per leaf. The fact side of
+§27's FK-side join may be one too, resolved per leaf the same way and counted a batch of keys at a
+time in each (§27, "A partitioned fact table").
 
 Planning (`lion_try_count_path`, `lion_collect_targets`)
 - The query-level, GROUP BY, WHERE-clause and target-list checks of §10/§14/§15 are unchanged and
@@ -3099,7 +3101,8 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
   `lion_find_roaring_index` plus, per clause, strategy 1 of THAT index's opfamily for the clause's
   operator and an opfamily member and hash function for the compared type, all checked per
   partition because nothing stops two partitions from using different opclasses. A foreign table,
-  or a leaf without one of the indexes, bails out.
+  or a leaf without one of the indexes, bails out - unless the leaf's bounds imply the clause, which
+  it then leaves out ("Clauses the partition bounds imply", below).
 - The two §10 rules about what an index's entries MEAN are checked per partition for the same
   reason: the driving index's strategy-1 operator must be the grouping equality
   (`SortGroupClause.eqop`), and an index whose stored key will be printed - the group key in the
@@ -3236,14 +3239,170 @@ VACUUM of one partition cannot affect the count of another: the interlock argume
 one heap and its indexes, and each partition is its own.
 
 Not supported: run-time pruning (the node has no Append and no PartitionPruneInfo, so the partition
-set is fixed at plan time), parallel
-execution (`flags = 0`, `parallel_safe = false`), and partitionwise aggregation as above. Planning
+set is fixed at plan time), parallel execution of a count (`flags = 0`, `parallel_safe = false`;
+the FK-side join over a partitioned fact table, §27's "A partitioned fact table", is parallel), and
+partitionwise aggregation as above, for the join as for a count. Planning
 costs one `index_open` per clause per partition (`lion_index_bucket_pages` reads the meta page), and
 EXPLAIN's `Partitions` line names every one of them, so both are linear in the partition count.
 Also not supported, and refused rather than attempted: a partition whose opclass groups rows
 differently from the query, and a value-producing grouping over a type whose equality does not
 preserve the representation (§10). A grouping too large for `hash_mem` is no longer among them:
 the Finalize HashAggregate spills.
+
+### Clauses the partition bounds imply (2026-09-28)
+
+A count over a partitioned table needed a lion index for every WHERE clause in every partition it
+counted. A clause on the partition key that no lion index covers - `kind = 'a'` over a table
+LIST-partitioned by kind - then declined the query, although pruning had left only partitions every
+row of which satisfies it: a count such as `count(*) ... WHERE kind = 'a' AND tags && '{x}' AND ts >=
+now() - interval '365 days'`, over leaves that each have a lion index on `(tags, ts, fk)`, got a
+parallel bitmap heap scan and no LionCount. The key clause was the only blocker: the stable range on
+`ts` is a clause value like any other the node evaluates once per scan (§10), and the same query
+without `kind = 'a'` was pushed down.
+
+A leaf partition's constraint - `RelationGetPartitionQual()`, which adds every ancestor's bound to
+the leaf's own, so that a sub-partition of `kind = 'a'` by year on `ts` carries both - is TRUE for
+every row the leaf holds: partbounds.c builds it with explicit null tests so that it never
+evaluates to NULL, tuple routing puts a row only where its bound says, and neither
+ExecPartitionCheck() nor ATTACH PARTITION lets anything else in. So a WHERE clause the constraint
+STRONGLY implies - core's own `predicate_implied_by(clause, constraint, false)`, the proof partial
+indexes and constraint exclusion are decided by, with the clause mapped onto the leaf's columns
+through every level of partitioning (`adjust_appendrel_attrs_multilevel()`) - is TRUE of every row
+of the partition, selects nothing there, and is left out of that partition's count:
+
+- **Per partition, per restriction.** `lion_collect_targets()` asks it of each leaf for each
+  restriction - each entry of the parent's baserestrictinfo, so that an OR is left out whole or not
+  at all (`lion_leaf_drops()`). A restriction the leaf has no index for has to be implied, or the
+  query declines as before. One it has indexes for is left out too, which saves its lookups and an
+  AND with a set that holds every row of the partition - but not where the count would then have
+  nothing left to select rows by (below). The plan says which: the partition's index Oid for the
+  clause is InvalidOid (`LION_PRIV_PARTS`, shape 15), and the executor leaves the clause's source
+  out of that partition's items (`lion_relation_items()`), opens no index for it and asks it
+  nothing. The partition is priced for the clauses it keeps (`lion_target_lists()`).
+- **Never left out**: a range that bounds the walk driving the count (§28), which walks the same
+  entries with it or without it and is on the driver's own index; and a pinned column whose value
+  the target list prints, which comes out of the index's stored key (§10's value gate).
+- **Something must still select the rows.** A count that nothing but the WHERE clauses drives - no
+  GROUP BY, no sum over a column's entries, no fk key (§27) - needs, in every partition, a positive
+  clause or an OR of them that carries the §9 interlock (not a range collected into memory, §32),
+  as the planner asks of the query as a whole (`pinnedsrc`). A partition that would have to leave
+  out every such clause declines the query: `count(*) ... WHERE kind = 'a' AND fk IS NOT NULL`,
+  over partitions that do not index kind, is still the ordinary plan's, and so is `count(*) ...
+  WHERE kind = 'a'`, a count of whole partitions, which the node has never made.
+- **Implied by every partition.** A clause no posting set answers at all - an operator no lion
+  opclass has, an OR with an expression for an arm - declines the query unless every partition
+  counted implies it (`lion_implied_everywhere()`); then it is left out of the plan altogether, and
+  EXPLAIN is handed its text (`LION_PRIV_IMPLIED`). And a range every partition implies does not
+  drive a count that another clause, not implied everywhere, selects rows for: as the driver it
+  would walk every key of each partition, as a source it is left out.
+- **NULLs and default partitions.** The proof is strong implication by a constraint that is never
+  NULL, which is exactly "every row of the partition satisfies the clause". A partition `FOR VALUES
+  IN (NULL, 'n')` implies neither `kind = 'n'` nor `kind IS NULL`, only their OR; a LIST partition
+  without NULL implies `kind IS NOT NULL`; a default partition's constraint is the negation of its
+  siblings', which implies `kind NOT IN (...)` of all their values and no equality. A clause with a
+  volatile function or a subquery is never taken as implied - the query asked for it per row - and
+  a Param proves nothing at plan time, so a generic plan's `kind = $1` still needs an index, where a
+  custom plan's literal does not.
+- **What it does not change.** The row estimates, which are the planner's from the parent's
+  clauses; the partitions counted, the planner's pruned set (a partition only run-time pruning
+  would remove is counted, and matches nothing); and the EXECUTE checks, made on every clause of
+  the parent's quals as before (§9, "Privileges"), since the ordinary plan evaluates the clause as a
+  Filter. A plan relies on a constraint only ATTACH and DETACH change, and both invalidate every
+  plan over the parent; the executor's lock on each partition it counts keeps a concurrent ATTACH
+  from changing a default partition's bound under a running query - which is what partition
+  pruning rests on too.
+
+EXPLAIN prints what the partitions leave out on a line of its own, `Implied by Partition Bounds`,
+each clause followed by `in N of M partitions` where not all of them do; a clause every partition
+leaves out reads no index and is not in `Lion Indexes`:
+
+    Custom Scan (LionCount)
+      Partitions: ip_a_2025, ip_a_2026, ip_b, ip_cd
+      Lion Indexes: (kind = ANY ('{a,b,c}'::text[])), (tags && '{x1}'::text[])
+      Implied by Partition Bounds: (kind = ANY ('{a,b,c}'::text[])) in 3 of 4 partitions
+
+`test/sql/partition_implied.sql` checks every answer against the pushdown off, forcing the node
+wherever it has a path, over a table LIST-partitioned by an unindexed key with one list
+sub-partitioned by year, a partition with an index on the key, one that takes NULL and a default:
+clauses implied by every partition counted (through a parent's bound, an IN list, `IS NOT NULL`, a
+year's range beside another clause and alone, an OR with an unanswerable arm, the default
+partition's NOT IN), by some and not others (a list one partition answers from its own index, a
+range taken as a source, an OR across columns), and not at all (the NULL partition's equality and
+null test, the default's equality, a range on the key that keeps the default partition); counts,
+GROUP BYs of one and two columns; the declines (nothing left to select rows by, a printed pinned
+column, a volatile arm, a generic plan's parameter against a custom plan's literal); and a dirty
+heap before and after VACUUM. Since "OR arms the partition bounds refute" it also checks a filter
+per kind ORed, counted and grouped by one and two columns, with a range beside it and without,
+before and after VACUUM; an arm a sub-partition's bound refutes, whose range then no longer keeps
+the partition from carrying the pin; the two-value bound, which refutes one arm and answers the
+others from its own index; the default and the NULL partition declining the arm they do not decide;
+and, with plan-time pruning off, the partitions whose bounds refute every arm, which are not
+counted.
+
+### OR arms the partition bounds refute (2026-09-28)
+
+A filter per kind is often written as one OR, an arm per kind:
+
+    WHERE ((kind = 'a' AND tags && '{x}' AND tags && '{y}') OR (kind = 'b' AND tags && '{z}')
+           OR kind = 'c' OR kind = 'd')
+      AND ts >= now() - interval '...'
+
+over a table LIST-partitioned by kind. No partition's bounds imply the OR - `kind IN ('c', 'd')`
+does, but `kind = 'a'` does not - and the leaves `kind = ...` have no lion index, so every
+partition but that one had to decline the query, and nothing was pushed down. But in the partition
+of 'a' the arms on 'b', 'c' and 'd' are never true, and in the arm that is left `kind = 'a'` always
+is: the partition's filter is `tags && '{x}' AND tags && '{y}'`, which the posting sets answer.
+
+So after the implied restrictions, `lion_leaf_drops()` takes each OR restriction a partition's
+bounds do not imply as a whole, arm by arm:
+
+- **An arm the bounds refute is left out.** The partition constraint is TRUE for every row the
+  partition holds, so an arm it refutes in core's weak sense - `predicate_refuted_by(arm,
+  constraint, true)`: the constraint TRUE, the arm FALSE or NULL - is not TRUE for any of them, and
+  adds no row to the union. That is left out whether or not the partition has indexes for it. A
+  volatile function or a subquery keeps the arm, as it keeps a clause from being implied.
+- **In an arm it keeps, a leaf the bounds imply is left out of the arm's AND** - TRUE of every row
+  - except a range, whose bounds are one source together (§32) and are kept. An arm all of whose
+  leaves are implied is TRUE of every row, and so is the OR, which is then left out whole as an
+  implied restriction.
+- **What is left needs an index**, leaf by leaf; an arm the bounds decide neither way whose leaf
+  has none declines the query, as before: the default partition does not refute `kind = 'e'`, a
+  partition `FOR VALUES IN (NULL, 'n')` does not decide `kind IS NULL`.
+- **An OR every arm of which is refuted** is never TRUE in the partition, which then has nothing to
+  count and is not counted at all. Plan-time pruning uses the same arms, so this is met when
+  pruning is off (`enable_partition_pruning`).
+
+Nothing about the pin changes: an OR carries the §9 interlock when no leaf of it is a range
+collected into memory, and a range in an arm the partition refutes is no leaf of its union there.
+
+The plan says it as it says an implied clause: the partition's index Oid for each leaf left out is
+InvalidOid (`LION_PRIV_PARTS`). The executor tells the three cases apart by what is left of each
+arm (`lion_locate_or()`, `lion_relation_items()`): an OR with no leaf left is left out whole, an arm
+with none is refuted and out of the union, and a leaf missing from an arm that keeps others is
+implied and out of its AND - the planner never leaves an arm all of whose leaves are implied. The
+partition's cost is for the OR it keeps (`lion_target_lists()`), and the FK-side join's fact
+filters (§27) are reduced the same way, since `lion_collect_targets()` serves it too. EXPLAIN lists
+the refuted arms on a line of their own and the implied leaves with the implied clauses:
+
+    Custom Scan (LionCount)
+      Partitions: ip_a_2025, ip_a_2026, ip_b, ip_cd
+      Lion Indexes: (ts >= ...), (((kind = 'a') AND (tags && '{x1}') AND (tags && '{y2}')) OR
+                    ((kind = 'b') AND (tags && '{x3}')) OR (kind = 'c') OR (kind = 'd'))
+      Implied by Partition Bounds: ((...) OR (kind = 'c') OR (kind = 'd')) in 1 of 4 partitions,
+                    (kind = 'a') in 2 of 4 partitions, (kind = 'b') in 1 of 4 partitions
+      Refuted by Partition Bounds: ((kind = 'a') AND ...) in 1 of 4 partitions,
+                    ((kind = 'b') AND ...) in 2 of 4 partitions, (kind = 'c') in 3 of 4
+                    partitions, (kind = 'd') in 3 of 4 partitions
+
+**Not done: GROUP BY the partition key.** `SELECT kind, count(*) ... GROUP BY kind` still needs a
+lion index on kind in every partition, although in a partition whose bounds give kind one value
+every row is one group and its count the partition's count. Taking the value from the bound needs
+what §10's value gate asks of an index's stored key - the partition key's equality has to be the
+grouping's and has to preserve the representation (`numeric` 1.0 and 1.00 are one partition
+value; a nondeterministic collation groups different strings), which an opclass says for an index
+but the partition key has to be asked for - and an executor mode that counts one partition as one
+group; the FK-side join would also have to put a fact column in its output, which §27 declines.
+It is left for a change of its own.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
@@ -7164,8 +7323,9 @@ EXISTS`) and the fact filters collected once were added on 2026-09-27, below, an
 parallel plans and the forward semi join over a non-unique key after them; the lookups in key order
 on 2026-09-28, and after them what a key's time is made of, the per-key path and the cost of a key
 ("Where a key's time goes" and the two sections after it), counts beside the aggregates that
-need the dimension rows ("Every aggregate over the node's rows"), and a GROUP BY of the join key,
-the fact's or the dimension's ("Grouped by the join key"). The shape is the star-schema aggregate
+need the dimension rows ("Every aggregate over the node's rows"), a GROUP BY of the join key,
+the fact's or the dimension's ("Grouped by the join key"), and last a partitioned fact table
+("A partitioned fact table"). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -7283,7 +7443,9 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   range-table check, as before; EXECUTE on the join operator, which the node evaluates in place of
   a hash or nested-loop join, is the node's own check at executor startup (§9, "Privileges"). The
   fact side keeps §10's rule: a fact rel with security quals
-  (RLS) or TABLESAMPLE declines, and so does a partitioned fact table in v1.
+  (RLS) or TABLESAMPLE declines. A partitioned fact table is counted leaf partition by leaf
+  partition, each a table of its own in everything this section says ("A partitioned fact
+  table").
 - **The fact side is the §9 count, unchanged.** Each dimension row's fk set is located with
   `lion_posting_set_lookup_col()`, counted with `lion_count_sources_cached()` beside the fact
   filters' sources, and released before the next dimension row, so at any moment one fk set and
@@ -7314,7 +7476,8 @@ lookup answers that clause exactly when the clause is one the pushdown already a
 ### Planner integration
 
 `create_upper_paths_hook` at UPPERREL_GROUP_AGG, as today, with the input rel a JOIN rel of exactly
-two plain base tables. `lion_fkjoin_recognize()` (src/lion_fkjoin.c) finds the one join clause and
+two base tables, plain ones or a partitioned fact table ("A partitioned fact table", below).
+`lion_fkjoin_recognize()` (src/lion_fkjoin.c) finds the one join clause and
 proves the dimension key unique, for each orientation in turn, and hands `lion_try_count_path()` a
 `LionFkJoin`. That function then runs over the FACT rel, unchanged for everything about the fact
 side - the WHERE analysis of §10/§14/§15/§17/§19, Params, index matching per clause - with the join
@@ -8904,16 +9067,125 @@ per-row Agg takes 274 ms, against 344 for the same groups hashed (`GROUP BY d.pk
 A GroupAggregate directly over the node, with no Sort between them, is the per-row Agg. The group
 key prints unqualified, as `count(DISTINCT)`'s sort key does.
 
+### A partitioned fact table (2026-09-28)
+
+The fact side used to decline a partitioned table ("Declined in v1" said why: §16 opens one
+partition at a time). It is now counted the way §16 counts one: every dimension key is looked up
+in every live leaf partition's fk index, and each leaf is a table of its own in everything the
+sections above ask of the fact side.
+
+- **What is computed.** A fact row lives in exactly one leaf, so the fact rows of a key under the
+  fact filters are the disjoint union of each leaf's own. Per dimension row, an inner join's count
+  is therefore the sum of the leaves' counts; a semi join asks whether any leaf has a match, and an
+  anti join whether none has; a NULL key matches in none. The rows of `count(DISTINCT)`, the
+  counted rows under a LionJoinAgg (`lion_join_count()`) and the distinct keys of a forward semi
+  join over a non-unique key are the same sums and existence tests, so everything above the node
+  is unchanged.
+- **Which leaves.** The planner's live leaves, after plan-time pruning, in its order - the targets
+  `lion_collect_targets()` gives a count (§16) - each with its own fact filters less the ones its
+  bounds imply ("Clauses the partition bounds imply", §16): every leaf needs a lion index on fk,
+  and one for each filter it keeps, or the query declines. None left: the planner knows the join
+  is empty, and the node is not offered. The node has no Append and no PartitionPruneInfo, so a
+  leaf that only RUN-TIME pruning would remove - one whose bound excludes `ts >= now() - interval
+  '...'`, or a generic plan's `kind = $1` - is counted too. It is exact: such a clause proves
+  nothing at plan time (§16), so the leaf keeps it as a fact filter, and it selects none of the
+  leaf's rows. Mostly it is cheap: a leaf whose located filters select nothing at all
+  (`wheremissing`) has no turn, and no key is looked up in it. But its indexes are opened and its
+  filters located, and where they do select rows - a filter whose value run-time pruning would have
+  used, beside one that does not narrow the leaf to nothing - every key is looked up and counted
+  there for nothing. `test/sql/fkjoin_partition.sql` has such a leaf.
+- **A batch at a time, a leaf at a time.** The keys are read a batch at a time whatever the plan
+  chose ("Lookups in key order": the batches are `work_mem`'s), each key with an accumulator of its
+  own (`LionJoinEnt.acc`), and each batch goes to every leaf in turn (`lion_join_count_parts()`):
+  the leaf is opened, its fk index's walk begun, its fact filters located or its copy of them taken
+  up again (`lion_join_part_open()`), every key of the batch looked up and counted and the count
+  added into the key's accumulator, and the leaf closed - every set released, and its pins with
+  them - before the next one is opened (`lion_join_part_close()`). An existence test does not look
+  a key up again once one leaf has matched it. Where the plan walks the fk index in key order, the
+  batch is sorted into the first leaf's walk order and left alone for every leaf whose fk index
+  orders keys the same way (`LionWalkOrder`, `lion_walk_order_equal()`) - one partitioned index's
+  leaves do - and sorted again for one that does not; where it descends for each key, the batch
+  stays in the child's order. Only when every leaf has had the batch are its rows handed up (`lion_join_next_parts()`),
+  so the node never hands up a row with a leaf open, and no leaf's pin outlives its turn (§16).
+- **Each leaf is its own table.** Its own heap, visibility map and pins; the §9 interlock between
+  its own fk set and its own filters; the pin budget of §15 per turn. Where the plan collects the
+  filters, a leaf's are located and copied at its first turn into a copy of its own
+  (`LionJoinPart`), which its later turns count beside the fk sets they locate; the copy was made
+  after the snapshot was taken and is only ever counted beside that leaf's own located fk sets,
+  which is all "Why a stale copy is safe" asks of it. The copies are all held for the run, within
+  one hash table's memory between them - each leaf's collection has what the ones before it left,
+  and spills past it (`lion_sources_collect()`'s spill) - and are freed by a rescan. A plan that
+  probes the filters instead locates a leaf's again at each turn, since the leaf keeps nothing
+  from one batch to the next.
+- **Parallel.** The shared copy is kept, one per leaf. The DSM holds a `LionSharedCopy` for each
+  leaf, one after the other, each with its own barrier, chunks, DSA memory and SharedFileSet, and
+  the memory a Parallel Hash would have (a hash table's for each participant planned) divided among
+  them by their heaps' blocks (`lion_join_part_blocks()`). Each participant takes its share of the
+  dimension rows, a batch at a time, to every leaf in turn, and joins a leaf's collection the
+  first time it gets there; the participants that reach it collect it together, chunk by chunk, as
+  "One copy per query" does for one table, and every one of them then reads it. A participant
+  that never reads a dimension row never attaches. A rescan of the Gather frees and re-initializes
+  every leaf's copy. Private copies per participant, the fallback, were not needed: a shared copy
+  is self-contained, so one per leaf is the one-table code, repeated.
+- **Cost** (`lion_cost_fkjoin_path()`). Each leaf is priced as a table of its own
+  (`lion_cost_fkjoin_rel()` with the leaf's Var, statistics and kept filters), with the keys that
+  find rows there in proportion to the fk's distinct values the leaf holds against the parent's,
+  and the leaves' costs added up; the recheck of each leaf's dirty heap too. The plan's two
+  choices, walk or descend and collect or probe, are made once over the sums: a batch's place is
+  charged once a row, not once a leaf; collecting needs every leaf's copy to fit in one hash
+  table's memory per participant together; and a probing plan's locating of the filters is
+  charged once a batch per leaf. Row estimates are the planner's, as for a count (§16).
+- **EXPLAIN** has the `Partitions` line, `Lion Indexes` without index names and `Implied by
+  Partition Bounds`, as a count's (§16). The counters are summed over the leaves (and the
+  participants): `Join Keys Looked Up` counts a lookup per leaf that had a turn - an inner join's
+  keys times those leaves, fewer for an existence test - `Join Keys Without Entry` a key per leaf
+  it has no entry in, `Fact Filter Rows Collected` the rows of every leaf's copy and `Fact Filter
+  Copies Shared` one per leaf and run.
+
+**Measured** (2026-09-28, PostgreSQL 18, warm cache, four CPUs shared with other work; medians of
+five runs, ms). A synthetic star: a 500,000-row dimension with btrees on its filter columns that
+INCLUDE the key, and a 10,000,000-row fact LIST-partitioned by kind - `a` for half the rows,
+sub-partitioned by year on `ts` over three years, `b` and `c` - whose fk is skewed (half of the
+rows over 25,000 hot keys, the rest over all 500,000) and scattered over the heap, with one lion
+index on the parent over `(tags, ts, fk)` and a btree on fk; about 2 GB. The nested loop is into
+the leaves' fk btrees, reading the heap for the fact filters. Serial:
+
+| query (fact filters) | dimension rows | node | nested loop | hash join | chosen |
+|---|---|---|---|---|---|
+| inner, `kind = 'a'`, tags | 250 hot keys | 3.4 | 32 | 217 | node |
+| semi, `kind IN ('a', 'b')`, tags | 420 | 3.4 | 4.9 | 359 | node |
+| inner, `kind = 'a'`, tags | 5,000 | 22 | 485 | 247 | node |
+| grouped, `kind IN ('a', 'b')`, tags | 5,000 | 39 | 846 | 383 | node |
+| semi, `kind = 'a'`, tags, `ts` range | 5,000 | 62 | 236 | 87 | node |
+| grouped, `kind = 'a'`, `ts` range | 5,000 | 66 | 73 | 726 | node |
+| inner, `kind = 'a'`, tags, `ts` range | 25,000 | 105 | 283 | 103 | hash join |
+| semi, `kind = 'a'`, `ts` range | 420 | 41 | 2.7 | 1,045 | node |
+| inner, `kind = 'a'`, tags, `ts` range | 420 | 47 | 4.5 | 63 | node |
+
+With two workers the node wins by as much where it won serially (35 ms against 113 and 139 for
+the 5,000-row inner join; 42 against 203 and 205 grouped) and is chosen over the parallel hash
+join of the 25,000 rows at 95 ms against 125. Its misses are all one: a range on `ts` whose value
+is `now() - interval '365 days'` over a few hundred dimension rows, where a nested loop reads a
+few thousand heap rows from a warm cache. The node then collects the range in each leaf it keeps
+(§32's "range as a source"), some two million `ts` entries from their summaries - 49 of the 54 ms
+of the 420-row semi join, none of it in the node's timers, since it happens while the filters are
+located - and `lion_cost_range_source()` prices that as the walk of a summed range, a fraction of
+it. That is a plain table's cost too (the same query on the one leaf: 26 ms against 5), and it is
+left for a costing change of its own; so is the nested loop's warm cache, which its cost does not
+assume. With two workers the same holds of the 5,000-row joins with the range: the node, chosen
+at 60 to 70 ms, against a parallel nested loop's 36 (semi) and 41 (grouped).
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
   correctness one). The forward semi join over one is counted over its distinct keys ("Forward semi
   joins over a non-unique key").
-- **A partitioned fact table.** §16 opens one partition at a time, so the join would have to re-run
-  the dimension child per partition or look every key up in every partition's index; both are
-  straightforward but double the tested surface. A partitioned, inheritance or subquery DIMENSION
-  is declined for want of an index list to prove uniqueness from; `innerrel_is_unique()` would
-  prove some of those and is the natural v2.
+- **A partitioned fact table** with a leaf that has no lion index on fk, or none for a fact filter
+  its bounds do not imply; an old-style inheritance parent as the fact; partitionwise aggregation
+  turned on, as for a count (§16); and run-time pruning of the leaves ("A partitioned fact table",
+  which counts every other one). A partitioned,
+  inheritance or subquery DIMENSION is declined for want of an index list to prove uniqueness
+  from; `innerrel_is_unique()` would prove some of those and is the natural v2.
 - **More than two relations**, composite keys, snowflake chains: the dimension would be a join
   itself.
 - **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
@@ -8959,8 +9231,9 @@ outer row; the declines - a non-unique dimension key, a key unique only under an
 than the join's (and accepted once a unique index under the join's own exists), a second join
 clause, an outer join, three relations, a fact filter the posting sets cannot answer, a dimension
 key pinned to a constant, fact RLS, a fact column in the output, a volatile grouping expression,
-another aggregate, `count` of a nullable fact column, a partitioned fact and a partitioned
-dimension; the cost model's choice with nothing disabled, including a 50,000-row dimension it must
+another aggregate, `count` of a nullable fact column, a partitioned fact one of whose partitions
+has no lion index on fk (the same table with one on every partition is pushed down) and a
+partitioned dimension; the cost model's choice with nothing disabled, including a 50,000-row dimension it must
 refuse unless its own quals leave few rows; dimension RLS applied (a policy hiding rows changes the
 answer exactly as it does the ordinary plan's) and column privileges on `d.attr` enforced; the
 `Join Keys Looked Up` / `Join Keys Without Entry` counters (NULL keys not looked up; keys whose
@@ -9183,6 +9456,37 @@ of them. Also covered: generic plans with NULL Params included, correlated subqu
 plans (the Finalize GroupAggregate over a Gather, forward semi join included), and a dirty heap
 before and after VACUUM. `fkjoin_walk` groups walked rows by either key, and the forward semi join's
 walked distinct keys by the fact's.
+
+`test/sql/fkjoin_partition.sql` (2026-09-28), a partitioned fact table: 60,000 rows LIST-partitioned
+by kind, which no lion index covers - one list sub-partitioned by year on `ts`, one alone, two
+kinds together in the one partition with a lion index on kind, and a default partition that takes
+the rest and NULL - with a partitioned lion index on `(tags, ts, fk)` and one on another column;
+fk skewed (a few keys with many rows), scattered, NULL on some rows and past the dimension's keys
+on others; a 3,000-row dimension and one of 3,000 rows over 1,500 keys, duplicated, with NULL keys.
+`lion_xj()` runs every query as planned (in parallel wherever the plan is), serially and with the
+pushdown off, and compares both of the first two with the third: reverse semi and anti joins over
+one list partition, a sub-partitioned one, several and all of them, duplicated and NULL keys among
+them; inner joins, ungrouped, grouped by one and two columns and an expression, with HAVING, ORDER
+BY and LIMIT; `count(DISTINCT)` of dimension columns and of the key, and beside `count(*)` under a
+LionJoinAgg; the forward semi join over the non-unique key and its `count(DISTINCT)`; no fact
+filter left in any partition (the key clause implied everywhere), a filter that selects nothing in
+some partitions or all; a filter per kind ORed, which each partition narrows to the arm its bounds
+leave it (§16, "OR arms the partition bounds refute") - semi, anti and grouped inner joins, the
+mixed aggregates, a range beside it, and the default partition declining the arm it does not
+decide; and a partition only run-time pruning would remove. EXPLAIN of each shape
+(the dimension's plan as one line) shows `Partitions`, `Lion Indexes` and `Implied by Partition
+Bounds` - a list one partition answers from its own index on kind, a range on `ts` one
+sub-partition's bound implies. The counters: `Join Keys Looked Up` a key per partition that has a
+turn for an inner join, fewer for a semi join, and none in a partition whose filters select nothing;
+more than one batch at a `work_mem` of 64 kB with the answers unchanged; `Fact Filter Copies Shared`
+one per partition, and one per partition and run over three rescans of the Gather. A generic plan
+with a Param fact filter (a NULL one too) and a correlated subquery that rescans the node with a
+new fact filter; the declines (a partition without a lion index on fk, a key clause the default
+partition's bound does not imply and no index of it answers, alone and among others, an old-style
+inheritance parent, partitionwise aggregation turned on); the model's
+choice with nothing disabled (the node for a few dimension rows against filters that leave many
+fact rows, and not for a filter that leaves few); and a dirty heap - deletes and updates in three
+partitions, an fk moved - before and after VACUUM.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
