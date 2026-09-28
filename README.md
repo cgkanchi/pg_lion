@@ -168,7 +168,10 @@ once pruning has left only the `kind = 'a'` partitions (sub-partitions included)
 row they hold: it needs no index there and is left out of their counts, and `EXPLAIN` lists it
 under `Implied by Partition Bounds`. The proof is PostgreSQL's own, the one partial indexes use, so
 a partition that also takes NULLs, a default partition, or a generic plan's parameter implies
-only what that proof can show.
+only what that proof can show. An `OR` with an arm per kind - `(kind = 'a' AND tags && '{x}') OR
+(kind = 'b' AND tags && '{y}')` - is narrowed the same way: each partition leaves out the arms its
+bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
+counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
 
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension

@@ -196,9 +196,61 @@ SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'c' AND tags && '{x1}'$q$
 SELECT lion_ipplan($q$SELECT fk, count(*) FROM ip WHERE kind IN ('a', 'b') AND ts >= '2026-01-01' GROUP BY fk$q$);
 SELECT lion_ip($q$SELECT fk, count(*) FROM ip WHERE kind IN ('a', 'b') AND ts >= '2026-01-01' GROUP BY fk$q$);
 SELECT lion_ip($q$SELECT x, count(*) FROM ip WHERE kind IN ('a', 'b') AND ts >= '2026-01-01' AND ts < '2026-06-01' GROUP BY x$q$);
-/* an OR across columns, implied as a whole by ip_a_2026 alone */
+/*
+ * an OR across columns, implied as a whole by ip_a_2026 alone; ip_a_2025's
+ * bound refutes its first arm, and leaves it fk = 3
+ */
 SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE kind IN ('a', 'b') AND (ts >= '2026-01-01' OR fk = 3) AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind IN ('a', 'b') AND (ts >= '2026-01-01' OR fk = 3) AND tags && '{x1}'$q$);
+
+-- ---- OR arms the partition bounds refute ---------------------------------
+/*
+ * A filter per kind, ORed: in a partition of one kind the arms of the others
+ * are never true and are left out, and in the arm it keeps `kind = ...` is
+ * implied and left out too.  ip_a's leaves count tags && '{x1}' AND tags &&
+ * '{y2}', ip_b counts tags && '{x3}', and ip_cd, whose two-value bound
+ * implies what is left of the OR (kind = 'c' OR kind = 'd'), leaves it out
+ * whole.  Without the refutation no partition but ip_cd has an index for
+ * `kind = ...`, and the query was declined.
+ */
+SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND ts >= '2025-06-01'$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND ts >= '2025-06-01'$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND ts >= now() - interval '100 years'$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND tags && '{y5}'$q$);
+SELECT lion_ip($q$SELECT x, count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND ts >= '2025-06-01' GROUP BY x$q$);
+SELECT lion_ip($q$SELECT fk, x, count(*) FROM ip WHERE (kind = 'a' AND tags && '{x1}') OR (kind = 'b' AND tags && '{x3}') GROUP BY fk, x$q$);
+/*
+ * An arm a sub-partition's bound refutes: ip_a_2025 keeps only the second
+ * arm, ip_a_2026 both.  The first arm's range carries no pin (§32), so where
+ * it is kept the count needs another clause to select rows by: tags &&
+ * '{y1}', or, with ip_a_2025 the only partition left, the range on ts that
+ * then drives the count.  With neither, ip_a_2026 declines the query.
+ */
+SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE kind = 'a' AND tags && '{y1}' AND ((ts >= '2026-03-01' AND tags && '{x1}') OR x = 2)$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND tags && '{y1}' AND ((ts >= '2026-03-01' AND tags && '{x1}') OR x = 2)$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND ts < '2026-01-01' AND ((ts >= '2026-03-01' AND tags && '{x1}') OR x = 2)$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND ((ts >= '2026-03-01' AND tags && '{x1}') OR x = 2)$q$);
+/*
+ * The two-value bound of ip_cd refutes the arm on 'a' and implies neither
+ * `kind = 'c'` nor `kind = 'd'`: it answers them from its own index on kind.
+ */
+SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE (kind = 'c' AND tags && '{x1}') OR (kind = 'a' AND tags && '{x2}')$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind = 'c' AND tags && '{x1}') OR (kind = 'a' AND tags && '{x2}')$q$);
+SELECT lion_ip($q$SELECT fk, count(*) FROM ip WHERE (kind = 'c' AND tags && '{x1}') OR (kind = 'd' AND x = 1) OR (kind = 'b' AND tags && '{x2}') GROUP BY fk$q$);
+/*
+ * The default partition refutes the arm on 'a', but not `kind = 'e'`, which
+ * it has no index for: declined, as ip_n is for the arm `kind IS NULL`.
+ */
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind = 'e' AND tags && '{x1}') OR (kind = 'a' AND tags && '{x2}')$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind IS NULL AND tags && '{x1}') OR (kind = 'b' AND tags && '{x2}')$q$);
+/*
+ * Without plan-time pruning every partition is counted, and one whose bounds
+ * refute every arm has nothing to count: it is not counted at all.
+ */
+SET enable_partition_pruning = off;
+SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE (kind = 'a' AND tags && '{x1}') OR (kind = 'b' AND tags && '{x3}')$q$);
+SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind = 'a' AND tags && '{x1}') OR (kind = 'b' AND tags && '{x3}')$q$);
+RESET enable_partition_pruning;
 
 -- ---- NULLs and the default partition -------------------------------------
 /*
@@ -249,9 +301,11 @@ DELETE FROM ip WHERE kind = 'a' AND id % 5 = 0;
 UPDATE ip SET tags = ARRAY['x1'] WHERE kind = 'b' AND id % 9 = 0;
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT fk, count(*) FROM ip WHERE kind IN ('a', 'b', 'c') AND tags && '{x1}' GROUP BY fk$q$);
+SELECT lion_ip($q$SELECT x, count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND ts >= '2025-06-01' GROUP BY x$q$);
 VACUUM (FREEZE) ip;
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT fk, count(*) FROM ip WHERE kind IN ('a', 'b', 'c') AND tags && '{x1}' GROUP BY fk$q$);
+SELECT lion_ip($q$SELECT x, count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1}' AND tags && '{y2}') OR (kind = 'b' AND tags && '{x3}') OR kind = 'c' OR kind = 'd') AND ts >= '2025-06-01' GROUP BY x$q$);
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;

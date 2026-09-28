@@ -240,6 +240,11 @@ SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.pk), count(*) FROM lion_x
 -- the forward semi join over a non-unique key, counted over its distinct keys
 SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xf f WHERE f.kind = ''b'' AND f.x IN (1, 2) AND f.fk IN (SELECT n.k FROM lion_xdn n WHERE n.region = ''eu'')');
 
+-- a filter per kind, ORed: each partition leaves out the arms its bounds
+-- refute and, in the arm it keeps, the kind its bounds imply; lion_xf_cd's
+-- bound implies what is left of the OR, and leaves it out whole
+SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND ((f.kind = ''a'' AND f.tags && ''{t1}'' AND f.tags && ''{u2}'') OR (f.kind = ''b'' AND f.x = 3) OR f.kind = ''c'' OR f.kind = ''d''))');
+
 -- ---- 2. the answers ------------------------------------------------------------
 -- reverse semi and anti joins, over one list partition, one sub-partitioned
 -- list, several, and every partition
@@ -274,6 +279,14 @@ SELECT lion_xj('SELECT count(DISTINCT f.fk) FROM lion_xf f WHERE f.kind IN (''a'
 SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.grp = ''g3'' AND f.kind = ''b''');
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''c'') AND f.ts >= ''2026-03-01'' AND f.ts < ''2026-03-02'')');
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.x = 99)');
+-- a filter per kind, ORed, over semi, anti and inner joins, grouped and with
+-- a range beside it; the default partition refutes the arm on 'b' but has no
+-- index for `kind = 'e'`, and declines
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND ((f.kind = ''a'' AND f.tags && ''{t1}'' AND f.tags && ''{u2}'') OR (f.kind = ''b'' AND f.x = 3) OR f.kind = ''c'' OR f.kind = ''d''))');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''us'' AND NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND ((f.kind = ''a'' AND f.tags && ''{t1}'') OR (f.kind = ''b'' AND f.x = 3)))');
+SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE ((f.kind = ''a'' AND f.tags && ''{t1}'') OR (f.kind = ''b'' AND f.x = 3) OR (f.kind = ''c'' AND f.x = 5)) AND f.ts >= ''2025-06-01'' GROUP BY d.attr');
+SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''eu'' AND ((f.kind = ''a'' AND f.x = 2) OR (f.kind = ''d'' AND f.tags && ''{t4}''))');
+SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE (f.kind = ''e'' AND f.x = 7) OR (f.kind = ''b'' AND f.x = 3)');
 -- a partition only run-time pruning would remove is counted, and matches
 -- nothing: the range's value is a stable expression
 SET lion.cut = '2026-01-01';
@@ -402,12 +415,14 @@ SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXIST
 SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.x = 3 GROUP BY d.attr');
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''b'', ''c''))');
 SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind IN (''a'', ''c'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND ((f.kind = ''a'' AND f.tags && ''{t1}'' AND f.tags && ''{u2}'') OR (f.kind = ''b'' AND f.x = 3) OR f.kind = ''c'' OR f.kind = ''d''))');
 VACUUM (FREEZE) lion_xf;
 VACUUM (FREEZE) lion_xd;
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
 SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.x = 3 GROUP BY d.attr');
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''b'', ''c''))');
 SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind IN (''a'', ''c'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND ((f.kind = ''a'' AND f.tags && ''{t1}'' AND f.tags && ''{u2}'') OR (f.kind = ''b'' AND f.x = 3) OR f.kind = ''c'' OR f.kind = ''d''))');
 
 DROP TABLE lion_xf, lion_xd, lion_xdn;
 DROP FUNCTION lion_xj(text);
