@@ -12,6 +12,12 @@
  *		executor - is lion_customscan.c's, which treats the join key as one
  *		more equality clause whose value comes from the dimension's rows.
  *
+ *		The dimension may be a join itself: one base table that carries the
+ *		key, and other tables joined to it only as the inner side of semi and
+ *		anti joins, which never duplicate its rows (DESIGN.md §27, "A
+ *		dimension that is a join").  Its rows are then the rows of that join
+ *		rel's cheapest path, which the node runs as its child.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef LION_FKJOIN_H
@@ -38,11 +44,24 @@
  * then counted as an inner join counts a dimension row: distinct keys have
  * disjoint posting sets, so the counts add up to the fact rows that have a
  * match, each once.
+ *
+ * The dimension is `dimrel` alone, or - when the query joins more tables -
+ * the join rel `dimchild` of dimrel and the tables semi or anti joined to it
+ * (DESIGN.md §27, "A dimension that is a join"): its rows are dimrel's rows,
+ * each at most once, so everything this struct says about dimrel's key holds
+ * of the join's rows.  dimrel is what the dimension's columns and its key's
+ * uniqueness are asked of, dimchild what the child path is of.  A forward
+ * semi join over such a dimension whose key an index proves unique is an
+ * inner join, as core makes of one over a single table
+ * (reduce_unique_semijoins()), which cannot see through a join.
  */
 typedef struct LionFkJoin
 {
 	RelOptInfo *factrel;		/* the side whose posting sets are counted */
-	RelOptInfo *dimrel;			/* the side run as the node's child plan */
+	RelOptInfo *dimrel;			/* the dimension's table, whose column is the
+								 * key */
+	RelOptInfo *dimchild;		/* the rel the child plan is a path of: dimrel,
+								 * or the join rel of the dimension */
 	Var		   *fkvar;			/* the fact's join column */
 	Var		   *pkvar;			/* the dimension's join column */
 	Node	   *pkexpr;			/* ... as the clause compares it: pkvar, or a
@@ -51,7 +70,7 @@ typedef struct LionFkJoin
 	Oid			opno;			/* the join clause's operator */
 	Oid			collation;		/* and its input collation, or InvalidOid */
 	Node	   *clause;			/* the join clause, for selectivity */
-	Path	   *dimpath;		/* the dimension's cheapest total path */
+	Path	   *dimpath;		/* dimchild's cheapest total path */
 	JoinType	jointype;		/* JOIN_INNER; or JOIN_SEMI or JOIN_ANTI, the
 								 * dimension the outer side and the fact the
 								 * inner one; or JOIN_UNIQUE_INNER, a semi
@@ -64,14 +83,15 @@ typedef struct LionFkJoin
 } LionFkJoin;
 
 /*
- * How many orientations of joinrel qualify (0, 1 or 2), filled into out[0]
- * and out[1].  Everything returned has passed every check that is about the
- * JOIN and the DIMENSION; whether the fact side has a lion index that can
- * answer the join operator, and whether its own quals can be pushed down, is
- * for the caller to decide.
+ * How many ways of taking joinrel apart qualify, one per table that may be the
+ * fact - each way round of a join of two tables, and every fact of a joined
+ * dimension - in a palloc'd array set into *out.  Everything returned has
+ * passed every check that is about the JOIN and the DIMENSION; whether the
+ * fact side has a lion index that can answer the join operator, and whether
+ * its own quals can be pushed down, is for the caller to decide.
  */
 extern int	lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel,
-								  LionFkJoin *out);
+								  LionFkJoin **out);
 
 /*
  * Whether rel's column attno is provably unique under the equality opno
