@@ -181,6 +181,21 @@ extern uint32 lion_container_or_raw(const LionContainer *a, const LionContainer 
 									LionContainer *dest);
 
 /*
+ * dest = a AND (b[0] OR ... OR b[nb - 1]), without building the union: each
+ * of a's members is looked up in b[0], the ones not found in b[1], and so on
+ * (the count engine's AND of a running intersection with an IN list's or a
+ * multi-key `&&`'s containers at one key, DESIGN.md §29.11, "Unions
+ * probed").  a holds at most LION_ARRAY_MAX_CARD members, which the caller
+ * checks by its cardinality; the result is an ARRAY of those found, not
+ * optimized, with a's ckey, and its cardinality is returned.  Every b has
+ * a's ckey; dest (capacity LION_CONTAINER_MAX_SIZE) overlaps none of them.
+ * a and the b's may come off pages.
+ */
+extern uint32 lion_container_and_union_raw(const LionContainer *a,
+										   const LionContainer *const *b,
+										   uint32 nb, LionContainer *dest);
+
+/*
  * A BITSET a caller ORs containers into (the count engine's union of several
  * containers of one key): bitset_init() makes dest (capacity
  * LION_CONTAINER_MAX_SIZE) an empty BITSET of ckey, whose words
