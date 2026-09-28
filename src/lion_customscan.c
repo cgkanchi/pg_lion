@@ -19145,6 +19145,21 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		ExplainPropertyInteger("Probes Avoided", NULL,
 							   tot.probes_avoided, es);
+
+		/*
+		 * How the AND met its unions (DESIGN.md §29.11, "Unions probed"): the
+		 * container keys at which an IN list's, a multi-key query's or an OR's
+		 * union of two containers or more was built, and those at which the
+		 * running intersection was looked up in the containers instead.
+		 * Printed only where there was a union to meet.
+		 */
+		if (tot.unions_built > 0 || tot.unions_probed > 0)
+		{
+			ExplainPropertyInteger("Unions Built", NULL,
+								   tot.unions_built, es);
+			ExplainPropertyInteger("Unions Probed", NULL,
+								   tot.unions_probed, es);
+		}
 		ExplainPropertyInteger("Heap Blocks From Cache", NULL,
 							   tot.cache_hits, es);
 		ExplainPropertyInteger("Heap Blocks Past Cache Budget", NULL,
