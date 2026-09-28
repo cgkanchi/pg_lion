@@ -695,15 +695,16 @@ RESET enable_indexscan;
 RESET enable_indexonlyscan;
 -- ---- 5. what the cost model picks, with nothing disabled -------------------
 -- A value it cannot estimate is priced as the shape that needs the most
--- rechecking, which alone is a sequential scan of its own: the ordinary
--- plan's wins.  A stable value is priced as its estimate extracts, here
--- exactly.
+-- rechecking: every row, which is no source of the AND (the node locates no
+-- set for it), and alone a sequential scan of the node's own - the ordinary
+-- plan's scan without its Aggregate, and the node's.  A stable value is
+-- priced as its estimate extracts, here exactly.
 SET plan_cache_mode = force_generic_plan;
 PREPARE lion_mk_c1(text[]) AS SELECT count(*) FROM lion_mk_t WHERE tags @> $1;
 SELECT lion_mk_pick('EXECUTE lion_mk_c1(''{t1}'')');
  lion_mk_pick 
 --------------
- not pushed
+ LionCount
 (1 row)
 
 DEALLOCATE lion_mk_c1;
@@ -715,6 +716,36 @@ SELECT lion_mk_pick($$SELECT count(*) FROM lion_mk_t WHERE tags @> string_to_arr
  LionCount
 (1 row)
 
+/*
+ * Beside another clause the same: the node's price for a query of unknown
+ * shape and `k = $1` is `k = $1`'s count and a recheck of its rows, whichever
+ * query it is.  `tags @> $2` and `tags && $2` have different default
+ * selectivities (0.005 and 0.01), which priced them apart while the price
+ * counted such a query a source of the AND.
+ */
+CREATE FUNCTION lion_mk_cost(q text, args text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'PREPARE lion_mk_pc AS ' || q;
+	EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE lion_mk_pc(' || args || ')' INTO p;
+	EXECUTE 'DEALLOCATE lion_mk_pc';
+	RETURN (p->0->'Plan'->>'Total Cost')::float8;
+END $$;
+SELECT lion_mk_cost('SELECT count(*) FROM lion_mk_t WHERE k = $1 AND tags @> $2', '1, ''{t1}''') =
+	   lion_mk_cost('SELECT count(*) FROM lion_mk_t WHERE k = $1 AND tags && $2', '1, ''{t1}''') AS same_price;
+ same_price 
+------------
+ t
+(1 row)
+
+DROP FUNCTION lion_mk_cost(text, text);
 -- ---- 6. a partitioned table, whose partitions number the column apart -----
 CREATE TABLE lion_mk_p (id int NOT NULL, g int NOT NULL, tags text[]) PARTITION BY LIST (g);
 CREATE TABLE lion_mk_p0 PARTITION OF lion_mk_p FOR VALUES IN (0, 1);

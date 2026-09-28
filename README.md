@@ -274,6 +274,7 @@ expressions as the table's owner (DESIGN.md §7).
     src/lion_funcs.c        lion_index_stats(), lion_index_verify() and the other diagnostics
     src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
     src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
+    src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)
     src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS)
     src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered, btree-ordered scans
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
@@ -410,6 +411,46 @@ Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the l
 scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`
 (superuser), how many visited-block ranges VACUUM batches in rmgr mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
+
+Cost settings, for calibrating Lion's cost model on your own workload the way `random_page_cost`
+calibrates core's (DESIGN.md §31, "The settings"). Each is the price of one operation as a multiple
+of a core cost setting, so Lion's prices still scale with core's; the defaults are what the model
+was fitted at, and changing one changes plans, not results. Settable per session, and shown by
+`EXPLAIN (SETTINGS)` when changed:
+
+| `pg_lion.` | default | unit | the operation it prices |
+|---|---|---|---|
+| `plain_fetch_row_cost` | 1.0 | `cpu_tuple_cost` | a plain scan's heap fetch of a row past the first on its page, beyond a bitmap heap scan's |
+| `bitmap_row_cost` | 0.1 | `cpu_operator_cost` | a row's bitmap entry, which a plain scan is charged as a bitmap heap scan is |
+| `walk_pass_cost` | 5.0 | `cpu_tuple_cost` | a plain scan's walk of an entry past the first, a heap pass each |
+| `container_cost` | 8.0 | `cpu_operator_cost` | a container of a posting set read and counted |
+| `member_cost` | 0.15 | `cpu_operator_cost` | a member of it, up to 1,024 a container |
+| `probe_cost` | 40 | `cpu_operator_cost` | a seek of a posting tree to a container key |
+| `memory_probe_cost` | 30 | `cpu_operator_cost` | the same into a set copied into memory |
+| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found |
+| `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
+| `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY or join |
+| `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
+| `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
+| `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
+| `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
+| `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |
+| `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
+| `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
+| `fkjoin_count_cost` | 25 | `cpu_tuple_cost` | an FK-side join's count, a dimension row |
+| `fkjoin_row_cost` | 10 | `cpu_tuple_cost` | a row the FK-side join hands up |
+| `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |
+| `fkjoin_collect_container_cost` | 2.0 | `cpu_operator_cost` | a container of the driving filter, read to collect the fact filters |
+| `fkjoin_copy_count_cost` | 25 | `cpu_tuple_cost` | a count against the collected copy |
+| `fkjoin_copy_probe_cost` | 15 | `cpu_operator_cost` | a seek of the copy, an fk container |
+| `fkjoin_copy_member_cost` | 3.0 | `cpu_operator_cost` | a member of that container |
+| `fkjoin_copy_container_cost` | 20 | `cpu_operator_cost` | a container of the copy made |
+| `fkjoin_batch_row_cost` | 120 | `cpu_operator_cost` | a dimension row's place in a batch looked up in key order |
+| `fkjoin_sort_compare_cost` | 0.25 | `cpu_operator_cost` | a comparison in the sort that makes the dimension's keys distinct |
+| `fkjoin_sort_key_cost` | 6.0 | `cpu_operator_cost` | a key into and out of that sort |
+| `fkjoin_sort_seq_page_cost` | 0.75 | `seq_page_cost` | a page that sort writes or reads past `work_mem`, the sequential share |
+| `fkjoin_sort_random_page_cost` | 0.25 | `random_page_cost` | ... and the random share |
 
 ## Known limitations
 
