@@ -179,6 +179,8 @@ typedef struct LionCountCtx
 								 * cursor lets go of a posting leaf as soon as
 								 * it has copied it (a plain index scan under
 								 * an MVCC snapshot, DESIGN.md §29.5) */
+	bool		farseeks;		/* every seek is to a key many leaves past the
+								 * last: descend at once (lion_stream_far()) */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
 
 	/*
@@ -3010,7 +3012,7 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 			return;
 		}
 
-		if (steps >= LION_POSTING_SEEK_STEPS)
+		if (steps >= LION_POSTING_SEEK_STEPS || cur->cx->farseeks)
 		{
 			cur->descend = true;
 			cur->seekckey = target;
@@ -8557,6 +8559,12 @@ lion_stream_at(LionSetStream *st, uint32 target)
 	st->first = false;
 
 	return st->cursor.valid ? st->cursor.cur : NULL;
+}
+
+void
+lion_stream_far(LionSetStream *st)
+{
+	st->cx.farseeks = true;
 }
 
 void

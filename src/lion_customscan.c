@@ -3018,12 +3018,25 @@ lion_merge_ops(double heap_pages, double members, double nkeys)
  * of 219 keys, when c200 empties all but two of them, and the node was refused
  * at 777 against a BitmapAnd's 237 for 0.03 ms against 2.8.
  *
+ * isect is what the intersection probe measured of the same AND: the factor
+ * its rows are over (or under) the product of the sources' selectivities,
+ * 1 where nothing was measured (DESIGN.md §29.11, "Correlated sets").  The
+ * sources of a correlated filter do not empty the intersection as the
+ * product says they do: twenty sets that hold a few thousand rows of six
+ * million together, where the product says one, kept a row at every key the
+ * driver produced, and the merge sought every source there - 27,365
+ * containers for 1,374 keys, 73 seeks avoided.  The factor is spread over the
+ * sources after the driver evenly, as each source's share of it (isect to the
+ * power 1 / (nsrc - 1)), so that the intersection shrinks towards what the
+ * probe found rather than to nothing.
+ *
  * probes[i], when probes is not NULL, is set to how often source i is sought
  * (0 for the driver), for the pages those probes read.
  */
 double
 lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
-					const bool *inmem, double tuples, double *probes)
+					const bool *inmem, double tuples, double isect,
+					double *probes)
 {
 	int		   *order;
 	int			i;
@@ -3031,6 +3044,7 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
 	double		keys;
 	double		lambda;
 	double		alive = 1.0;
+	double		share = 1.0;
 	double		cost;
 
 	if (nsrc <= 0)
@@ -3053,6 +3067,8 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
 				   LION_MEMBER_COST * Min(lambda, LION_MEMBER_CAP));
 	if (probes != NULL)
 		probes[order[0]] = 0.0;
+	if (nsrc > 1 && isect > 0.0 && isect != 1.0)
+		share = pow(isect, 1.0 / (double) (nsrc - 1));
 
 	for (k = 1; k < nsrc; k++)
 	{
@@ -3065,7 +3081,7 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
 		if (probes != NULL)
 			probes[j] = sought;
 
-		lambda *= Min(Max(members[j], 0.0) / Max(tuples, 1.0), 1.0);
+		lambda *= Min(Max(members[j], 0.0) / Max(tuples, 1.0) * share, 1.0);
 		alive = 1.0 - exp(-lambda);
 	}
 
@@ -3400,11 +3416,13 @@ lion_cost_set_pages(PlannerInfo *root, RelOptInfo *rel,
  *
  * The parts come back in *out, so that a caller that repeats the AND - a
  * nested loop's inner scan - can amortize its pages over the repetitions.
+ * isect is what the intersection probe found of the AND's rows against the
+ * product of the clauses' selectivities (lion_merge_cpu_cost()).
  */
 Cost
 lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 				  IndexOptInfo **idxs, const AttrNumber *cols, Node **clauses,
-				  LionAndCost *out)
+				  double isect, LionAndCost *out)
 {
 	LionSetClause *sc;
 	double	   *members;
@@ -3448,7 +3466,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	randompages = lion_cost_leaf_pages(n, idxs, sc);
 	out->leafpages += randompages;
 	out->cpu += lion_merge_cpu_cost(n, members, containers, NULL,
-									Max(rel->tuples, 1.0), probes);
+									Max(rel->tuples, 1.0), isect, probes);
 
 	for (i = 0; i < n; i++)
 		probed += lion_cost_set_pages(root, rel, &sc[i], i == driver,
@@ -4463,7 +4481,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	if (groupidx == NULL && !rangesum && nsrc > 0 &&
 		(nsrc > 1 || !srcunion[0]))
 		merge_cpu = lion_merge_cpu_cost(nsrc, srcmembers, srccontainers,
-										NULL, tuples, srcprobes);
+										NULL, tuples,
+										lion_probe_rel_factor(root, rel),
+										srcprobes);
 	else if (groupidx != NULL && !rangesum)
 	{
 		double	   *mem = (double *) palloc(sizeof(double) * (nsrc + 2));
@@ -4546,7 +4566,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				recheckshare = share;
 			}
 			per = lion_merge_cpu_cost(nsrc + 1, mem, keys, inmem, tuples,
-									  srcprobes) + unionsets * LION_UNION_SET_COST;
+									  1.0, srcprobes) +
+				unionsets * LION_UNION_SET_COST;
 			merge_cpu = walked * per * share;
 
 			/*
@@ -4587,7 +4608,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 * aggregate's 10,694 for 27.
 			 */
 			per = lion_merge_cpu_cost(nsrc + 2, mem, keys, inmem, tuples,
-									  srcprobes) + unionsets * LION_UNION_SET_COST;
+									  1.0, srcprobes) +
+				unionsets * LION_UNION_SET_COST;
 			walked = oe * ie;
 			merge_cpu = walked * per;
 		}
@@ -7756,6 +7778,26 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 			if (orform != NULL)
 				clause = (Node *) orform;
+		}
+
+		/*
+		 * An OR of equalities on one column with constants is the IN list it
+		 * spells (lion_or_as_array(), DESIGN.md §29.11, "An OR of equalities
+		 * is its IN list"): one source, located, priced and counted as the
+		 * list is - its values looked up in one walk of the directory, the
+		 * disjoint sum when it is the only source, its batches past the
+		 * budget - rather than a union of leaves looked up one by one.  The
+		 * list is only taken when the posting sets answer it as a list; an
+		 * OR whose operator is not the column's equality stays an OR.
+		 */
+		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
+		{
+			Node	   *arr = lion_or_as_array(clause);
+
+			if (arr != NULL &&
+				lion_analyze_leaf(root, arr, rti, true, true, true, &leaf) &&
+				leaf.kind == LION_CLAUSE_ARRAY)
+				clause = arr;
 		}
 
 		/*
