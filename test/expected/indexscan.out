@@ -286,7 +286,8 @@ SELECT lion_iq('SELECT id FROM lis WHERE n = ANY (''{3, NULL}''::int[])');
  index scan on lis_n, 514 rows
 (1 row)
 
--- two quals on one column: one answered, the other rechecked
+-- two quals on one column: two lists are both answered and the recheck
+-- removes nothing; a range beside a list is left to the recheck
 SELECT lion_iq('SELECT id FROM lis WHERE k IN (17, 18) AND k IN (18, 19)');
             lion_iq            
 -------------------------------
@@ -300,6 +301,12 @@ SELECT lion_iq('SELECT id FROM lis WHERE k = 17 AND k > 10');
 (1 row)
 
 SELECT lion_ir('SELECT id FROM lis WHERE k IN (17, 18) AND k IN (18, 19)');
+        lion_ir         
+------------------------
+ Index Scan using lis_k
+(1 row)
+
+SELECT lion_ir('SELECT id FROM lis WHERE k IN (17, 18) AND k > 17');
               lion_ir               
 ------------------------------------
  Index Scan using lis_k
