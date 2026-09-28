@@ -4135,11 +4135,23 @@ lion_verify_heapallindexed(LionVerifyState *vs)
  * looked up as it is at that moment (lion_verify_summary_after()), the codes
  * of the bucket's keys are collected and sorted, and the summary's codes are
  * streamed past them in code order (lion_verify_bucket_compare()).  The keys'
- * codes are held in an array up to a quarter of maintenance_work_mem and in a
- * tuplesort that spills past it, and the summary's are never held at all: one
- * bucket can be most of the table - a column of few keys with summaries = on,
- * or the single bucket every row of a column whose keys arrive in descending
- * order goes into - and both used to be collected whole.
+ * codes are held in an array up to a quarter of maintenance_work_mem and past
+ * it in a tuplesort of as much, which spills, and the array goes (as the
+ * build's, lion_build.c); the summary's are never held at all: one bucket can
+ * be most of the table - a column of few keys with summaries = on, or the
+ * single bucket every row of a column whose keys arrive in descending order
+ * goes into - and both used to be collected whole.
+ *
+ * Nothing else the check holds grows with the column either.  A bucket's
+ * bounds are kept only while a candidate (below) is in it: the record of a
+ * bucket without one goes as the walk leaves it, and every record but the
+ * current one once the candidates are settled, and the candidates and the
+ * records of their buckets, bounds included, are settled once they fill a
+ * quarter of maintenance_work_mem.  A key's set and the summary compared with
+ * its bucket are read in memory contexts of their own, emptied for the next:
+ * a located set copies its key and an INLINE payload into the caller's
+ * context, and the walk used to leave them all there, with every bucket's
+ * bounds beside them, until the column was done (2026-09-28 review).
  *
  * Beside writers (DESIGN.md §7) the two cannot be read at one instant: an
  * insert puts a row under its key's entry and then into its summary, with
@@ -4158,18 +4170,27 @@ lion_verify_heapallindexed(LionVerifyState *vs)
  *
  * The OPEN bucket is read when the walk reaches it: its key and its summary as
  * they are then, and every key the walk finds above that key belongs to a row
- * that ARRIVED while the check ran - an append - and is no candidate.  Only
- * the largest such key is kept, and it has to be inside a bucket once the
- * writers are done (lion_verify_check_above()).  The walk used to take the
- * open bucket's key from a copy of its leaf made at its start, so every row
- * appended while it ran was a candidate, and one that cost a walk of the whole
- * column to settle; and a cap on the candidates, meant for a summary of
- * garbage, was applied before any was settled - so a column under steady
- * appends was reported corrupt (2026-09-28 review).  Now nothing caps the
- * candidates but memory: once a quarter of maintenance_work_mem's worth of
- * them (and at least LION_VERIFY_MAX_SUM_CANDS) are waiting, they are settled
- * there and then and the walk goes on, and the first one that is still a
- * candidate after settling is what is reported.
+ * that ARRIVED while the check ran - an append - and is no candidate.  So does
+ * every key of a column that has no summary at all above the last one the
+ * walk read (one built on an empty table with summaries = on, or one a crash
+ * left between the two records of a close): a row that went through both of
+ * its steps before that lookup is in a summary above its key, so a row whose
+ * key is above every summary there was is one whose insert had not, and it
+ * may be in any bucket the inserts running beside the walk open and close
+ * after it - it used to be a candidate looked for in the first of them only,
+ * and a load into such a column reported the rows of the second as missing.
+ * Only the largest key that arrived is kept, and it has to be inside a bucket
+ * once the writers are done (lion_verify_check_above()).
+ *
+ * The walk used to take the open bucket's key from a copy of its leaf made at
+ * its start, so every row appended while it ran was a candidate, and one that
+ * cost a walk of the whole column to settle; and a cap on the candidates,
+ * meant for a summary of garbage, was applied before any was settled - so a
+ * column under steady appends was reported corrupt (2026-09-28 review).  Now
+ * nothing caps the candidates but memory: once they fill their quarter of
+ * maintenance_work_mem (above), they are settled there and then and the walk
+ * goes on, and the first one that is still a candidate after settling is what
+ * is reported.
  * --------------------------------------------------------------------- */
 
 /* One difference the walk found, to be looked at again. */
@@ -4181,7 +4202,11 @@ typedef struct LionVerifySumCand
 	bool		settled;		/* found where it belongs on the second look */
 } LionVerifySumCand;
 
-/* A bucket as the walk saw it: its bounds, for the second look. */
+/*
+ * A bucket as the walk saw it: its bounds, for the second look.  Only the
+ * buckets candidates are in, and the one being walked, have one
+ * (lion_verify_add_bucket()); the bounds are copies of their own.
+ */
 typedef struct LionVerifyBucket
 {
 	char	   *lo;				/* the previous summary's key, or NULL */
@@ -4212,15 +4237,20 @@ typedef struct LionVerifySumState
 {
 	LionVerifyState *vs;
 	LionState  *col;
-	MemoryContext cxt;
+	MemoryContext cxt;			/* what lasts for the column */
+	MemoryContext bucketcxt;	/* the summary of the bucket being compared */
+	MemoryContext keycxt;		/* the set of the key being read */
+	MemoryContext settlecxt;	/* what a settle reads */
 	LionVerifyCodes keys;		/* the codes of the bucket's keys */
 	LionVerifySumCand *cands;
 	int64		ncands;
 	int64		maxcands;
-	int64		candcap;		/* settle once this many are waiting */
-	LionVerifyBucket *buckets;
+	int64		candcap;		/* the most candidates `budget` holds */
+	Size		budget;			/* for the candidates and their buckets */
+	LionVerifyBucket *buckets;	/* the candidates' and the current one */
 	int64		nbuckets;
 	int64		maxbuckets;
+	Size		bucketspace;	/* the records in buckets[], bounds included */
 	/* the largest key the walk found above the open bucket's */
 	char	   *above;
 	Size		abovelen;
@@ -4232,7 +4262,7 @@ typedef struct LionVerifySumState
 	bool		hasresume;
 	uint64		resume;			/* the summary's codes up to it are merged */
 	uint32		ckey;
-	bool		overflow;		/* candcap reached: settle, then go on */
+	bool		overflow;		/* budget full: settle, then go on */
 	/* for the DEBUG1 line */
 	int64		nsummaries;
 	int64		nkeys;
@@ -4241,9 +4271,10 @@ typedef struct LionVerifySumState
 } LionVerifySumState;
 
 /*
- * The fewest candidates settled at a time; a quarter of maintenance_work_mem
- * holds more.  It used to be a cap past which the column was reported
- * corrupt, applied before a single candidate was settled.
+ * The candidates' budget is never less than this many of them take; a quarter
+ * of maintenance_work_mem is more unless it is set near its least.  It used
+ * to be a cap past which the column was reported corrupt, applied before a
+ * single candidate was settled.
  */
 #define LION_VERIFY_MAX_SUM_CANDS	10000
 
@@ -4267,6 +4298,15 @@ lion_verify_codes_put(LionVerifySumState *ss, uint64 code, bool arrived)
 		tuplesort_putdatum(kc->sort, Int64GetDatum((int64) tagged), false);
 		return;
 	}
+
+	/* the first code after a bucket the tuplesort took (see below) */
+	if (kc->codes == NULL)
+	{
+		kc->cap = 1024;
+		kc->codes = (uint64 *) MemoryContextAlloc(ss->cxt,
+												  sizeof(uint64) * kc->cap);
+	}
+
 	if (kc->n >= kc->cap)
 	{
 		if (kc->n >= kc->max)
@@ -4284,6 +4324,15 @@ lion_verify_codes_put(LionVerifySumState *ss, uint64 code, bool arrived)
 								   false);
 			kc->n = 0;
 			tuplesort_putdatum(kc->sort, Int64GetDatum((int64) tagged), false);
+
+			/*
+			 * The array's quarter is the tuplesort's now: the array goes, and
+			 * the bucket after this one starts a small one again.  It used to
+			 * stay, full, beside the sort.
+			 */
+			pfree(kc->codes);
+			kc->codes = NULL;
+			kc->cap = 0;
 			return;
 		}
 		kc->cap = Min(kc->cap * 2, kc->max);
@@ -4339,7 +4388,7 @@ lion_verify_codes_finish(LionVerifyCodes *kc)
 {
 	if (kc->sort != NULL)
 		tuplesort_performsort(kc->sort);
-	else
+	else if (kc->n > 1)
 		qsort(kc->codes, (size_t) kc->n, sizeof(uint64), lion_verify_code_cmp);
 	kc->pos = 0;
 }
@@ -4376,14 +4425,21 @@ lion_verify_codes_reset(LionVerifyCodes *kc)
 	kc->pos = 0;
 }
 
+/*
+ * A difference in the bucket being walked.  The candidates and the records of
+ * their buckets are settled once they fill the budget; the array never grows
+ * past what the budget holds of candidates alone, where it used to double
+ * past it.
+ */
 static void
 lion_verify_sum_cand(LionVerifySumState *ss, uint64 code, bool insummary)
 {
 	LionVerifySumCand *c;
 
+	Assert(!ss->overflow && ss->ncands < ss->candcap);
 	if (ss->ncands >= ss->maxcands)
 	{
-		ss->maxcands *= 2;
+		ss->maxcands = Min(ss->maxcands * 2, ss->candcap);
 		ss->cands = (LionVerifySumCand *)
 			repalloc_huge(ss->cands, sizeof(LionVerifySumCand) * ss->maxcands);
 	}
@@ -4392,18 +4448,112 @@ lion_verify_sum_cand(LionVerifySumState *ss, uint64 code, bool insummary)
 	c->bucket = ss->nbuckets - 1;
 	c->insummary = insummary;
 	c->settled = false;
-	if (ss->ncands >= ss->candcap)
+	if (ss->ncands >= ss->candcap ||
+		(Size) ss->ncands * sizeof(LionVerifySumCand) + ss->bucketspace >=
+		ss->budget)
 		ss->overflow = true;
 }
 
+/* A copy of raw, len bytes, in the current memory context. */
 static char *
-lion_verify_keydup(LionVerifySumState *ss, const LionEntryTuple *e, Size *lenp)
+lion_verify_keycopy(const char *raw, Size len)
 {
-	char	   *k = (char *) MemoryContextAlloc(ss->cxt, Max(e->keylen, 1));
+	char	   *k = (char *) palloc(Max(len, 1));
 
-	memcpy(k, LionEntryGetKey(e), e->keylen);
-	*lenp = e->keylen;
+	memcpy(k, raw, len);
 	return k;
+}
+
+static char *
+lion_verify_keydup(const LionEntryTuple *e, Size *lenp)
+{
+	*lenp = e->keylen;
+	return lion_verify_keycopy(LionEntryGetKey(e), e->keylen);
+}
+
+/* What a bucket's record takes of the budget: itself and its bounds. */
+static Size
+lion_verify_bucket_space(const LionVerifyBucket *b)
+{
+	return sizeof(LionVerifyBucket) +
+		(b->lo != NULL ? GetMemoryChunkSpace(b->lo) : 0) +
+		(b->hi != NULL ? GetMemoryChunkSpace(b->hi) : 0);
+}
+
+static void
+lion_verify_free_bucket(LionVerifySumState *ss, LionVerifyBucket *b)
+{
+	ss->bucketspace -= lion_verify_bucket_space(b);
+	if (b->lo != NULL)
+		pfree(b->lo);
+	if (b->hi != NULL)
+		pfree(b->hi);
+	b->lo = b->hi = NULL;
+}
+
+/*
+ * The record of the next bucket: (lo, hi], hi NULL for one open above, with
+ * copies of both.  The record of the bucket the walk leaves goes first unless
+ * a candidate is in it, so that buckets[] holds the buckets of the candidates
+ * waiting and the current one, and no more: every bucket of the column used
+ * to be kept, bounds and all, until the column was done.
+ */
+static void
+lion_verify_add_bucket(LionVerifySumState *ss, const char *lo, Size lolen,
+					   const char *hi, Size hilen)
+{
+	LionVerifyBucket *b;
+	MemoryContext old;
+
+	if (ss->nbuckets > 0 &&
+		(ss->ncands == 0 ||
+		 ss->cands[ss->ncands - 1].bucket != ss->nbuckets - 1))
+		lion_verify_free_bucket(ss, &ss->buckets[--ss->nbuckets]);
+
+	/*
+	 * Every record kept has a candidate, and was charged to the budget when
+	 * the last of them came, which left it short of full: so they are fewer
+	 * than the budget holds of records alone, and the array never needs to
+	 * grow past that and the current one.
+	 */
+	Assert(ss->nbuckets <= ss->ncands &&
+		   (Size) ss->nbuckets * sizeof(LionVerifyBucket) < ss->budget);
+	if (ss->nbuckets >= ss->maxbuckets)
+	{
+		ss->maxbuckets = Min(ss->maxbuckets * 2,
+							 (int64) (ss->budget / sizeof(LionVerifyBucket)) + 1);
+		ss->buckets = (LionVerifyBucket *)
+			repalloc_huge(ss->buckets,
+						  sizeof(LionVerifyBucket) * ss->maxbuckets);
+	}
+	Assert(ss->nbuckets < ss->maxbuckets);
+
+	old = MemoryContextSwitchTo(ss->cxt);
+	b = &ss->buckets[ss->nbuckets++];
+	b->lo = (lo != NULL) ? lion_verify_keycopy(lo, lolen) : NULL;
+	b->lolen = (lo != NULL) ? lolen : 0;
+	b->hi = (hi != NULL) ? lion_verify_keycopy(hi, hilen) : NULL;
+	b->hilen = (hi != NULL) ? hilen : 0;
+	MemoryContextSwitchTo(old);
+	ss->bucketspace += lion_verify_bucket_space(b);
+}
+
+/*
+ * Every candidate is settled: no record but the current bucket's is wanted,
+ * and that one is the first from now on.
+ */
+static void
+lion_verify_forget_buckets(LionVerifySumState *ss)
+{
+	int64		i;
+
+	Assert(ss->ncands == 0);
+	if (ss->nbuckets <= 1)
+		return;
+	for (i = 0; i < ss->nbuckets - 1; i++)
+		lion_verify_free_bucket(ss, &ss->buckets[i]);
+	ss->buckets[0] = ss->buckets[ss->nbuckets - 1];
+	ss->nbuckets = 1;
 }
 
 /* proc 4 of the column on a stored key and a raw one */
@@ -4414,9 +4564,28 @@ lion_verify_keycmp(LionState *col, Datum key, const char *raw)
 										   lion_fetch_key(col, raw)));
 }
 
-/* Is (the heap row at) code dead to every transaction there is? */
-static bool
-lion_verify_tid_dead(LionVerifyState *vs, uint64 code)
+/* What the heap says of the row a code names (lion_verify_row_state()). */
+typedef enum LionVerifyRow
+{
+	LION_VERIFY_ROW_DEAD,		/* dead to every transaction there is */
+	LION_VERIFY_ROW_INSERTING,	/* the transaction that inserted it runs on */
+	LION_VERIFY_ROW_INSERTED	/* its insert committed */
+} LionVerifyRow;
+
+/*
+ * The heap row at code: DEAD - an unused or dead line pointer, or a tuple
+ * HeapTupleSatisfiesVacuum() calls dead against the oldest non-removable xid,
+ * which is what an insert that failed or crashed between its two steps leaves
+ * - INSERTING while the transaction that inserted it is in progress, and
+ * INSERTED otherwise: its insert went through both of its steps before it
+ * committed.  A redirected line pointer is a HOT chain with a live member,
+ * whose root's insert committed: pruning redirects only a dead root.  A row
+ * the check's own transaction inserted is INSERTING, or INSERTED if it has
+ * deleted it too; either is sound, as nothing of that transaction's is
+ * between the two steps while the check runs.
+ */
+static LionVerifyRow
+lion_verify_row_state(LionVerifyState *vs, uint64 code)
 {
 	ItemPointerData tid;
 	BlockNumber blk;
@@ -4424,13 +4593,13 @@ lion_verify_tid_dead(LionVerifyState *vs, uint64 code)
 	Buffer		buf;
 	Page		page;
 	ItemId		lp;
-	bool		dead;
+	LionVerifyRow row;
 
 	lion_code_to_tid(code, &tid);
 	blk = ItemPointerGetBlockNumber(&tid);
 	off = ItemPointerGetOffsetNumber(&tid);
 	if (blk >= RelationGetNumberOfBlocks(vs->heap))
-		return true;
+		return LION_VERIFY_ROW_DEAD;
 
 	buf = ReadBuffer(vs->heap, blk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -4438,14 +4607,14 @@ lion_verify_tid_dead(LionVerifyState *vs, uint64 code)
 
 	if (PageIsNew(page) || off < FirstOffsetNumber ||
 		off > PageGetMaxOffsetNumber(page))
-		dead = true;
+		row = LION_VERIFY_ROW_DEAD;
 	else
 	{
 		lp = PageGetItemId(page, off);
 		if (!ItemIdIsUsed(lp) || ItemIdIsDead(lp))
-			dead = true;
+			row = LION_VERIFY_ROW_DEAD;
 		else if (ItemIdIsRedirected(lp))
-			dead = false;		/* a HOT chain with a live member */
+			row = LION_VERIFY_ROW_INSERTED;
 		else
 		{
 			HeapTupleData tup;
@@ -4454,13 +4623,25 @@ lion_verify_tid_dead(LionVerifyState *vs, uint64 code)
 			tup.t_len = ItemIdGetLength(lp);
 			tup.t_tableOid = RelationGetRelid(vs->heap);
 			ItemPointerSet(&tup.t_self, blk, off);
-			dead = HeapTupleSatisfiesVacuum(&tup,
-											GetOldestNonRemovableTransactionId(vs->heap),
-											buf) == HEAPTUPLE_DEAD;
+			switch (HeapTupleSatisfiesVacuum(&tup,
+											 GetOldestNonRemovableTransactionId(vs->heap),
+											 buf))
+			{
+				case HEAPTUPLE_DEAD:
+					row = LION_VERIFY_ROW_DEAD;
+					break;
+				case HEAPTUPLE_INSERT_IN_PROGRESS:
+					row = LION_VERIFY_ROW_INSERTING;
+					break;
+				default:
+					/* LIVE, RECENTLY_DEAD, DELETE_IN_PROGRESS */
+					row = LION_VERIFY_ROW_INSERTED;
+					break;
+			}
 		}
 	}
 	UnlockReleaseBuffer(buf);
-	return dead;
+	return row;
 }
 
 /*
@@ -4471,7 +4652,8 @@ lion_verify_tid_dead(LionVerifyState *vs, uint64 code)
  * lands on the summary keyed lo, and the walk steps past it.  Returns false
  * when the column has no summary there; otherwise *ps is its set, located as
  * a count's is (the caller releases it), *keyp a copy of its key and
- * *islastp whether it is the open bucket's.
+ * *islastp whether it is the open bucket's.  The copy, and what locating the
+ * set copies, are in the current memory context.
  */
 static bool
 lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
@@ -4523,7 +4705,7 @@ lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
 			off = OffsetNumberNext(off);
 			continue;
 		}
-		*keyp = lion_verify_keydup(ss, e, keylenp);
+		*keyp = lion_verify_keydup(e, keylenp);
 		*islastp = LionEntryIsSumLast(e);
 		lion_posting_set_at(vs->index, col, buf, off, ps);
 		UnlockReleaseBuffer(buf);
@@ -4534,9 +4716,9 @@ lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
 }
 
 /*
- * The key of the column's open bucket now, in a copy, or false when it has
- * none (a column that never had a row, or a crash between the two records
- * of a close).
+ * The key of the column's open bucket now, in a copy in the current memory
+ * context, or false when it has none (a column that never had a row, or a
+ * crash between the two records of a close).
  */
 static bool
 lion_verify_open_key(LionVerifySumState *ss, char **keyp, Size *keylenp)
@@ -4560,7 +4742,7 @@ lion_verify_open_key(LionVerifySumState *ss, char **keyp, Size *keylenp)
 		if (!LionEntryIsPivot(e) && e->attno == col->attno &&
 			LionEntryIsSumLast(e))
 		{
-			*keyp = lion_verify_keydup(ss, e, keylenp);
+			*keyp = lion_verify_keydup(e, keylenp);
 			found = true;
 		}
 	}
@@ -4571,10 +4753,14 @@ lion_verify_open_key(LionVerifySumState *ss, char **keyp, Size *keylenp)
 /*
  * Is a key inside a bucket now: at or below the key of a summary of its
  * column, the open one's included?  The lookup an insert makes
- * (lion_summary_insert()).
+ * (lion_summary_insert()).  If it is and coverp is given, *coverp is a copy,
+ * in the current memory context, of that summary's key - every key up to
+ * which is inside a bucket too, and stays so while VACUUM waits: a closed
+ * summary's key never changes and the open one's only rises.
  */
 static bool
-lion_verify_key_bucketed(LionVerifySumState *ss, const char *keyraw)
+lion_verify_key_bucketed(LionVerifySumState *ss, const char *keyraw,
+						 char **coverp, Size *coverlenp)
 {
 	LionVerifyState *vs = ss->vs;
 	LionState  *col = lion_column(vs->ix, ss->col->attno);
@@ -4598,6 +4784,8 @@ lion_verify_key_bucketed(LionVerifySumState *ss, const char *keyraw)
 			LionEntryIsSummary(e))
 			ok = !LionEntryIsSumLast(e) ||
 				lion_verify_keycmp(col, key, LionEntryGetKey(e)) <= 0;
+		if (ok && coverp != NULL)
+			*coverp = lion_verify_keydup(e, coverlenp);
 	}
 	UnlockReleaseBuffer(buf);
 	return ok;
@@ -4723,6 +4911,7 @@ lion_verify_settle(LionVerifySumState *ss)
 {
 	LionVerifyState *vs = ss->vs;
 	LionState  *col = ss->col;
+	MemoryContext old;
 	int64		from;
 	int64		to;
 	int64		i;
@@ -4736,7 +4925,11 @@ lion_verify_settle(LionVerifySumState *ss)
 		vs->nwaits++;
 	}
 
-	/* The rows a summary lacked: in the summary of their bucket now? */
+	/*
+	 * The rows a summary lacked: in the summary of their bucket now?  Each
+	 * summary is located and read in ss->settlecxt, emptied for the next.
+	 */
+	old = MemoryContextSwitchTo(ss->settlecxt);
 	from = 0;
 	while (lion_verify_next_run(ss, from, false, &from, &to))
 	{
@@ -4746,6 +4939,7 @@ lion_verify_settle(LionVerifySumState *ss)
 		bool		islast;
 
 		CHECK_FOR_INTERRUPTS();
+		MemoryContextReset(ss->settlecxt);
 		if (lion_verify_summary_after(ss, ss->buckets[ss->cands[from].bucket].lo,
 									  &ps, &key, &keylen, &islast))
 		{
@@ -4764,8 +4958,12 @@ lion_verify_settle(LionVerifySumState *ss)
 		}
 		from = to;
 	}
+	MemoryContextSwitchTo(old);
 
-	/* The rows its keys lacked: under a key of their bucket now? */
+	/*
+	 * The rows its keys lacked: under a key of their bucket now?  The walk
+	 * lasts for the settle; each key's set is read in ss->settlecxt.
+	 */
 	if (lion_verify_next_run(ss, 0, true, &from, &to))
 	{
 		LionEntryScan es;
@@ -4773,12 +4971,17 @@ lion_verify_settle(LionVerifySumState *ss)
 		Datum		dummy;
 		bool		more = true;
 
+		old = MemoryContextSwitchTo(ss->cxt);
 		lion_entry_scan_begin_col(&es, vs->index, col->attno);
-		while (more && lion_entry_scan_next(&es, &dummy, &ps))
+		MemoryContextSwitchTo(ss->settlecxt);
+		for (;;)
 		{
 			LionVerifyBucket *b = &ss->buckets[ss->cands[from].bucket];
 
 			CHECK_FOR_INTERRUPTS();
+			MemoryContextReset(ss->settlecxt);
+			if (!more || !lion_entry_scan_next(&es, &dummy, &ps))
+				break;
 			if (ps.keyisnull || !ps.hasstoredkey)
 			{
 				lion_posting_set_release(&ps);
@@ -4814,6 +5017,7 @@ lion_verify_settle(LionVerifySumState *ss)
 			}
 			lion_posting_set_release(&ps);
 		}
+		MemoryContextSwitchTo(old);
 		lion_entry_scan_end(&es);
 	}
 
@@ -4822,7 +5026,8 @@ lion_verify_settle(LionVerifySumState *ss)
 		LionVerifySumCand *c = &ss->cands[i];
 
 		CHECK_FOR_INTERRUPTS();
-		if (c->settled || lion_verify_tid_dead(vs, c->code))
+		if (c->settled ||
+			lion_verify_row_state(vs, c->code) == LION_VERIFY_ROW_DEAD)
 			continue;
 		if (c->insummary)
 			lion_corrupt_reindex("lion index \"%s\": a summary of key column %d holds row (%u,%u), which no key of its bucket holds",
@@ -4840,6 +5045,8 @@ lion_verify_settle(LionVerifySumState *ss)
 	ss->nsettled += ss->ncands;
 	ss->ncands = 0;
 	ss->overflow = false;
+	lion_verify_forget_buckets(ss);
+	MemoryContextReset(ss->settlecxt);
 }
 
 /* The next of the bucket's keys' codes; no row is under two keys. */
@@ -4865,7 +5072,7 @@ lion_verify_merge_advance(LionVerifySumState *ss)
 /*
  * The keys' codes below `upto` - all of them, unbounded - are not in the
  * summary: a candidate each, but for a row that arrived.  Stops early when
- * the candidates reach their cap, for the caller to settle them.
+ * the candidates fill their budget, for the caller to settle them.
  */
 static void
 lion_verify_merge_keys_below(LionVerifySumState *ss, uint64 upto,
@@ -4917,7 +5124,7 @@ lion_verify_merge_container_cb(const LionContainer *c, void *arg)
  * Compare the codes of the bucket's keys, collected in ss->keys, with those of
  * its summary `ps` (NULL: it has none), and note every difference.  The
  * summary's codes stream past the sorted keys' in code order.  When the
- * candidates reach their cap the stream stops, they are settled, and it
+ * candidates fill their budget the stream stops, they are settled, and it
  * starts again past the last code merged.
  */
 static void
@@ -4952,120 +5159,169 @@ lion_verify_bucket_compare(LionVerifySumState *ss, LionPostingSet *ps)
 	lion_verify_codes_reset(kc);
 }
 
+/* Is a row of a key's set one whose insert committed?  (below) */
+typedef struct LionVerifyInsertedArg
+{
+	LionVerifyState *vs;
+	uint32		ckey;
+	bool		found;
+	uint64		code;			/* the first such row */
+} LionVerifyInsertedArg;
+
+static bool
+lion_verify_inserted_code_cb(uint16 lo, void *arg)
+{
+	LionVerifyInsertedArg *ia = (LionVerifyInsertedArg *) arg;
+	uint64		code = lion_make_code(ia->ckey, lo);
+
+	if (lion_verify_row_state(ia->vs, code) != LION_VERIFY_ROW_INSERTED)
+		return true;
+	ia->found = true;
+	ia->code = code;
+	return false;
+}
+
+static bool
+lion_verify_inserted_container_cb(const LionContainer *c, void *arg)
+{
+	LionVerifyInsertedArg *ia = (LionVerifyInsertedArg *) arg;
+
+	CHECK_FOR_INTERRUPTS();
+	ia->ckey = c->ckey;
+	lion_container_iterate(c, lion_verify_inserted_code_cb, ia);
+	return !ia->found;
+}
+
 /*
- * The keys the walk found above the open bucket's key belong to rows that
+ * One key of the column, with its set ps, for lion_verify_check_above():
+ * false once it is past the largest key the walk found above the open
+ * bucket's.  Every key at or below *boundp - a copy in ss->cxt, or NULL - is
+ * inside a bucket; it is raised to the key of every bucket found on the way,
+ * so that the keys are looked up about once a bucket.
+ */
+static bool
+lion_verify_above_key(LionVerifySumState *ss, LionPostingSet *ps,
+					  char **boundp)
+{
+	LionVerifyState *vs = ss->vs;
+	LionState  *col = ss->col;
+	char	   *raw;
+	char	   *cover = NULL;
+	Size		coverlen = 0;
+
+	if (ps->keyisnull || !ps->hasstoredkey)
+		return true;
+	if (*boundp != NULL && lion_verify_keycmp(col, ps->storedkey, *boundp) <= 0)
+		return true;
+	if (lion_verify_keycmp(col, ps->storedkey, ss->above) > 0)
+		return false;
+
+	raw = (char *) palloc(lion_key_datum_size(col, ps->storedkey));
+	lion_store_key(col, ps->storedkey, raw);
+
+	/*
+	 * A key inside a bucket now is inside one for good, which is all that is
+	 * asked of it here.  One that is not has its rows looked at, in code
+	 * order, up to the first whose insert committed.
+	 */
+	if (!lion_verify_key_bucketed(ss, raw, &cover, &coverlen))
+	{
+		LionVerifyInsertedArg ia;
+
+		ia.vs = vs;
+		ia.ckey = 0;
+		ia.found = false;
+		ia.code = 0;
+		if (ps->found)
+			(void) lion_sets_iterate(1, ps, NULL,
+									 lion_verify_inserted_container_cb, &ia);
+		if (!ia.found)
+			return true;		/* dead rows, or inserts still running */
+
+		/*
+		 * That insert went through both of its steps before it committed, and
+		 * so before its row was looked at just now: the key is inside a
+		 * bucket from then on, or the row is in no summary and never will be.
+		 */
+		if (!lion_verify_key_bucketed(ss, raw, &cover, &coverlen))
+			lion_corrupt_reindex("lion index \"%s\": row (%u,%u) of key column %d is in no summary: its key is above the key of every summary of the column",
+								 RelationGetRelationName(vs->index),
+								 (unsigned) (ia.code >> LION_OFFSET_BITS),
+								 (unsigned) (ia.code & ((1 << LION_OFFSET_BITS) - 1)),
+								 col->attno);
+	}
+
+	if (*boundp != NULL)
+		pfree(*boundp);
+	*boundp = (char *) MemoryContextAlloc(ss->cxt, Max(coverlen, 1));
+	memcpy(*boundp, cover, coverlen);
+	return true;
+}
+
+/*
+ * The keys the walk found above the open bucket's key - or above the last
+ * summary it read, where the column had none after it - belong to rows that
  * arrived while it ran, and the largest of them has to be inside a bucket
  * once their inserts are done: an insert raises the open bucket's key, or
- * closes it and opens the next, right after putting its row under its key.
- * If it is not, every row of a key above the column's last summary is looked
- * at: it has to be DEAD - an insert that failed or crashed between its two
- * steps - or belong to an insert that came after the wait, which one more
- * wait settles.  Anything else is a row no summary will ever hold.
+ * closes it and opens the next, or opens the column's first, right after
+ * putting its row under its key.  If it is not, the keys up to it that are
+ * not inside a bucket are looked at (lion_verify_above_key()): each row of
+ * theirs has to be DEAD - an insert that failed or crashed between its two
+ * steps - or belong to a transaction still running, which may be between the
+ * two right now: one that began after the wait, as the next statement of a
+ * steady load does.  A row whose insert COMMITTED went through both steps
+ * before it did, so its key is inside a bucket by the time the row is seen
+ * committed, or the row is in no summary and never will be.
+ *
+ * This used to wait a second time and report any row not dead after it -
+ * which was every insert that happened to be between its steps then, below
+ * a largest key whose own insert had failed - and to compare the keys with
+ * the open bucket's key as it was before the walk of them began.
  */
 static void
 lion_verify_check_above(LionVerifySumState *ss)
 {
 	LionVerifyState *vs = ss->vs;
-	LionState  *col = ss->col;
-	int			attempt;
+	LionEntryScan es;
+	LionPostingSet ps;
+	Datum		dummy;
+	char	   *bound = NULL;
+	Size		boundlen = 0;
+	MemoryContext old;
 
-	if (ss->above == NULL || lion_verify_key_bucketed(ss, ss->above))
+	if (ss->above == NULL ||
+		lion_verify_key_bucketed(ss, ss->above, NULL, NULL))
 		return;
-
-	for (attempt = 0;; attempt++)
+	if (vs->concurrent)
 	{
-		LionEntryScan es;
-		LionPostingSet ps;
-		Datum		dummy;
-		char	   *open = NULL;
-		Size		openlen = 0;
-		bool		again = false;
-
-		if (vs->concurrent)
-		{
-			lion_verify_wait_for_writers(vs);
-			vs->nwaits++;
-		}
-		if (lion_verify_key_bucketed(ss, ss->above))
-			return;
-
-		/* the keys above the open bucket's key now, up to the largest seen */
-		(void) lion_verify_open_key(ss, &open, &openlen);
-		lion_entry_scan_begin_col(&es, vs->index, col->attno);
-		while (!again && lion_entry_scan_next(&es, &dummy, &ps))
-		{
-			CHECK_FOR_INTERRUPTS();
-			if (ps.keyisnull || !ps.hasstoredkey ||
-				(open != NULL &&
-				 lion_verify_keycmp(col, ps.storedkey, open) <= 0))
-			{
-				lion_posting_set_release(&ps);
-				continue;
-			}
-			if (lion_verify_keycmp(col, ps.storedkey, ss->above) > 0)
-			{
-				lion_posting_set_release(&ps);
-				break;
-			}
-			if (open == NULL)
-			{
-				/* no open bucket: a crash between the records of a close */
-				Size		len = lion_key_datum_size(es.state, ps.storedkey);
-				char	   *raw = (char *) MemoryContextAlloc(ss->cxt, len);
-				bool		bucketed;
-
-				lion_store_key(es.state, ps.storedkey, raw);
-				bucketed = lion_verify_key_bucketed(ss, raw);
-				pfree(raw);
-				if (bucketed)
-				{
-					lion_posting_set_release(&ps);
-					continue;
-				}
-			}
-
-			lion_verify_codes_reset(&ss->keys);
-			lion_verify_put_set(ss, &ps, false);
-			lion_verify_codes_finish(&ss->keys);
-			while (lion_verify_codes_next(&ss->keys, &ss->key))
-			{
-				if (lion_verify_tid_dead(vs, ss->key >> 1))
-					continue;
-				if (attempt > 0 || !vs->concurrent)
-					lion_corrupt_reindex("lion index \"%s\": a row of a key of key column %d is not in the summary of that key's bucket, whose key is below it",
-										 RelationGetRelationName(vs->index),
-										 col->attno);
-				again = true;
-				break;
-			}
-			lion_verify_codes_reset(&ss->keys);
-			lion_posting_set_release(&ps);
-		}
-		lion_entry_scan_end(&es);
-
-		if (!again)
+		lion_verify_wait_for_writers(vs);
+		vs->nwaits++;
+		if (lion_verify_key_bucketed(ss, ss->above, NULL, NULL))
 			return;
 	}
-}
 
-/* Open a bucket record: (lo, hi], hi NULL for one open above. */
-static void
-lion_verify_add_bucket(LionVerifySumState *ss, char *lo, Size lolen, char *hi,
-					   Size hilen)
-{
-	LionVerifyBucket *b;
-
-	if (ss->nbuckets >= ss->maxbuckets)
+	/* every key at or below the open bucket's key now is inside a bucket */
+	old = MemoryContextSwitchTo(ss->cxt);
+	(void) lion_verify_open_key(ss, &bound, &boundlen);
+	lion_entry_scan_begin_col(&es, vs->index, ss->col->attno);
+	MemoryContextSwitchTo(ss->keycxt);
+	for (;;)
 	{
-		ss->maxbuckets *= 2;
-		ss->buckets = (LionVerifyBucket *)
-			repalloc_huge(ss->buckets, sizeof(LionVerifyBucket) * ss->maxbuckets);
+		bool		more;
+
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextReset(ss->keycxt);
+		if (!lion_entry_scan_next(&es, &dummy, &ps))
+			break;
+		more = lion_verify_above_key(ss, &ps, &bound);
+		lion_posting_set_release(&ps);
+		if (!more)
+			break;
 	}
-	b = &ss->buckets[ss->nbuckets++];
-	b->lo = lo;
-	b->lolen = lolen;
-	b->hi = hi;
-	b->hilen = hilen;
+	MemoryContextSwitchTo(old);
+	lion_entry_scan_end(&es);
+	if (bound != NULL)
+		pfree(bound);
 }
 
 /*
@@ -5081,12 +5337,13 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 	LionPostingSet vps;
 	bool		havevps = false;
 	bool		valsdone = false;
-	char	   *prevkey = NULL;
+	char	   *prevkey = NULL;	/* the last bucket's key, in ss.cxt */
 	Size		prevlen = 0;
 	char	   *startkey = NULL;
 	Size		startlen = 0;
 	bool		hasstart;
 	Datum		dummy;
+	MemoryContext old;
 
 	memset(&ss, 0, sizeof(ss));
 	ss.vs = vs;
@@ -5094,17 +5351,28 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 	ss.cxt = AllocSetContextCreate(CurrentMemoryContext,
 								   "lion index verify summaries",
 								   ALLOCSET_DEFAULT_SIZES);
+	ss.bucketcxt = AllocSetContextCreate(ss.cxt,
+										 "lion index verify summary",
+										 ALLOCSET_DEFAULT_SIZES);
+	ss.keycxt = AllocSetContextCreate(ss.cxt,
+									  "lion index verify key",
+									  ALLOCSET_DEFAULT_SIZES);
+	ss.settlecxt = AllocSetContextCreate(ss.cxt,
+										 "lion index verify settle",
+										 ALLOCSET_DEFAULT_SIZES);
 	ss.keys.cap = 1024;
 	ss.keys.codes = (uint64 *) MemoryContextAlloc(ss.cxt,
 												  sizeof(uint64) * ss.keys.cap);
 	ss.keys.max = Max((int64) maintenance_work_mem * 1024L / 4 /
 					  (int64) sizeof(uint64), (int64) 8192);
+
+	/* the candidates and the records of their buckets: see above */
+	ss.budget = Max((Size) maintenance_work_mem * 1024 / 4,
+					(Size) LION_VERIFY_MAX_SUM_CANDS * sizeof(LionVerifySumCand));
+	ss.candcap = (int64) (ss.budget / sizeof(LionVerifySumCand));
 	ss.maxcands = 64;
 	ss.cands = (LionVerifySumCand *)
 		MemoryContextAlloc(ss.cxt, sizeof(LionVerifySumCand) * ss.maxcands);
-	ss.candcap = Max((int64) maintenance_work_mem * 1024L / 4 /
-					 (int64) sizeof(LionVerifySumCand),
-					 (int64) LION_VERIFY_MAX_SUM_CANDS);
 	ss.maxbuckets = 64;
 	ss.buckets = (LionVerifyBucket *)
 		MemoryContextAlloc(ss.cxt, sizeof(LionVerifyBucket) * ss.maxbuckets);
@@ -5114,9 +5382,10 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 	 * was the open bucket then, closed since, and is taken as the open one -
 	 * which bounds the walk however fast appends close buckets behind it.
 	 */
+	old = MemoryContextSwitchTo(ss.cxt);
 	hasstart = lion_verify_open_key(&ss, &startkey, &startlen);
-
 	lion_entry_scan_begin_col(&vals, vs->index, col->attno);
+	MemoryContextSwitchTo(old);
 
 	for (;;)
 	{
@@ -5128,6 +5397,9 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/* the bucket's summary, located in ss.bucketcxt: emptied for the next */
+		MemoryContextReset(ss.bucketcxt);
+		old = MemoryContextSwitchTo(ss.bucketcxt);
 		found = lion_verify_summary_after(&ss, prevkey, &sps, &key, &keylen,
 										  &isopen);
 		if (found)
@@ -5154,17 +5426,23 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 							   isopen ? 0 : keylen);
 
 		/*
-		 * The keys of the bucket: every value up to its key, or - the open
-		 * bucket - every one left, those above its key as it was read just
-		 * now being rows that arrived since.
+		 * The keys of the bucket, each key's set read in ss.keycxt, emptied
+		 * for the next: every value up to its key, or - the open bucket -
+		 * every one left, those above its key as it was read just now being
+		 * rows that arrived since.  Where the column has no summary after
+		 * prevkey, every key left is one that arrived since (see above).
 		 */
+		MemoryContextSwitchTo(ss.keycxt);
 		for (;;)
 		{
 			bool		arrived = false;
 
 			if (!havevps)
 			{
-				if (valsdone || !lion_entry_scan_next(&vals, &dummy, &vps))
+				if (valsdone)
+					break;
+				MemoryContextReset(ss.keycxt);
+				if (!lion_entry_scan_next(&vals, &dummy, &vps))
 				{
 					valsdone = true;
 					break;
@@ -5177,7 +5455,7 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 				havevps = false;
 				continue;
 			}
-			if (key != NULL && lion_verify_keycmp(col, vps.storedkey, key) > 0)
+			if (key == NULL || lion_verify_keycmp(col, vps.storedkey, key) > 0)
 			{
 				if (!isopen)
 					break;		/* the next bucket's */
@@ -5195,13 +5473,20 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 			havevps = false;
 		}
 
+		MemoryContextSwitchTo(ss.bucketcxt);
 		lion_verify_bucket_compare(&ss, found ? &sps : NULL);
 		if (found)
 			lion_posting_set_release(&sps);
+		MemoryContextSwitchTo(old);
 
 		if (isopen)
 			break;
-		prevkey = key;
+
+		/* the next bucket's lower bound, kept past ss.bucketcxt's reset */
+		if (prevkey != NULL)
+			pfree(prevkey);
+		prevkey = (char *) MemoryContextAlloc(ss.cxt, Max(keylen, 1));
+		memcpy(prevkey, key, keylen);
 		prevlen = keylen;
 	}
 	if (havevps)
