@@ -66,6 +66,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/tablespace.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -75,6 +76,7 @@
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
 #include "port/pg_bitutils.h"
+#include "storage/buffile.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
 #include "utils/acl.h"
@@ -87,6 +89,7 @@
 #include "utils/typcache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -210,11 +213,39 @@ typedef struct LionCountCtx
 } LionCountCtx;
 
 /*
+ * A collected set too large for its memory, written to a temporary file
+ * instead (DESIGN.md §27, "The fact filters, collected once", and §32, "A
+ * range as a source"): the containers in ascending key order, back to back,
+ * and in memory only where each one is and its key - what a cursor reads
+ * one container at a time and a seek searches (lion_cursor_next_item(),
+ * lion_cursor_seek()): sixteen bytes a container key of the heap, however
+ * full the container.
+ */
+typedef struct LionSpillEnt
+{
+	pgoff_t		off;			/* in segment `fileno` of the file */
+	uint32		ckey;
+	uint16		size;			/* at most LION_CONTAINER_MAX_SIZE */
+	int16		fileno;
+} LionSpillEnt;
+
+typedef struct LionSpill
+{
+	MemoryContext cxt;			/* where the entries and the file live */
+	BufFile    *file;
+	LionSpillEnt *ents;
+	int			nents;
+	int			cap;
+} LionSpill;
+
+/*
  * The containers an intersection yields, copied out as the merge produces
  * them: in ascending container key order, each MAXALIGNed in buf so that a
  * BITSET keeps its uint64 alignment - the layout of a LionMatSet, which is
  * what lion_sources_collect() turns this into.  failed says the copy has
- * outgrown maxbytes; the merge stops at the next container boundary.
+ * outgrown maxbytes; the merge stops at the next container boundary.  Unless
+ * the caller allowed it to SPILL: the copy then goes on in a temporary file
+ * (spilled), and what buf held so far is moved there first.
  */
 typedef struct LionCollect
 {
@@ -228,6 +259,9 @@ typedef struct LionCollect
 	int			offcap;
 	uint64		members;
 	bool		failed;
+	bool		spill;			/* past maxbytes, a file rather than failed */
+	bool		spilled;
+	LionSpill	sp;
 } LionCollect;
 
 /*
@@ -261,7 +295,11 @@ StaticAssertDecl(LION_BATCH_MIN_SETS <= LION_OPEN_MIN_PINS,
  * A posting set's containers copied out of the index, private to the backend
  * and holding no pin.  Containers are MAXALIGNed inside buf so that a BITSET
  * payload keeps its uint64 alignment, and are in ascending ckey order, which
- * is what the merge in lion_count_posting_sets() requires.
+ * is what the merge in lion_count_posting_sets() requires.  A collected set
+ * may keep them elsewhere: containers[] then points at wherever they are
+ * (a range's union, lion_range_collect()), or - SPILLED - containers is NULL
+ * and they are in `file`, described by spill[] (LionSpillEnt), which the set
+ * owns and lion_posting_set_release() closes.
  */
 typedef struct LionMatSet
 {
@@ -270,6 +308,8 @@ typedef struct LionMatSet
 	Size		held;			/* what the copy takes from its context */
 	char	   *buf;
 	LionContainer **containers;
+	BufFile    *file;			/* spilled: the containers, or NULL */
+	LionSpillEnt *spill;		/* spilled: where each one is */
 } LionMatSet;
 
 /*
@@ -799,6 +839,7 @@ typedef struct LionProbeSort
 	const Datum *values;
 	LionProbe  *probe;
 	Oid			collation;
+	uint32		ncmp;			/* comparisons made by the sort */
 } LionProbeSort;
 
 static int
@@ -824,6 +865,22 @@ lion_probe_key_cmp(const void *a, const void *b, void *arg)
 }
 
 /*
+ * The same, as the sort of a whole list calls it: a list whose length is a
+ * parameter's has no cap (DESIGN.md §15), its sort calls the opclass's
+ * comparison some n log n times, and nothing else in it would answer a
+ * cancel.  No lock is held while a list is sorted.
+ */
+static int
+lion_probe_sort_cmp(const void *a, const void *b, void *arg)
+{
+	LionProbeSort *ctx = (LionProbeSort *) arg;
+
+	if ((++ctx->ncmp & 0xffff) == 0)
+		CHECK_FOR_INTERRUPTS();
+	return lion_probe_key_cmp(a, b, arg);
+}
+
+/*
  * Sort the non-NULL values of a list into the order a lookup locates them in
  * (lion_probe_key_cmp(): the probe's own comparison, then the hash), and hand
  * back each one's hash.  Returns how many there are.  Two values of one
@@ -846,7 +903,9 @@ lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
 	int			i;
 
 	lion_probe_init(index, state, keytype, &probe);
-	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * Max(nvalues, 1));
+	probes = (LionProbeKey *) palloc_extended(sizeof(LionProbeKey) *
+											  Max(nvalues, 1),
+											  MCXT_ALLOC_HUGE);
 	for (i = 0; i < nvalues; i++)
 	{
 		if (isnull != NULL && isnull[i])
@@ -854,13 +913,17 @@ lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
 		probes[n].hash = lion_probe_hash(state, &probe, values[i]);
 		probes[n].idx = i;
 		n++;
+		if ((n & 0x3ff) == 0)
+			CHECK_FOR_INTERRUPTS();
 	}
 
 	sortctx.values = values;
 	sortctx.probe = &probe;
 	sortctx.collation = state->collation;
+	sortctx.ncmp = 0;
 	if (n > 1)
-		qsort_arg(probes, n, sizeof(LionProbeKey), lion_probe_key_cmp, &sortctx);
+		qsort_arg(probes, n, sizeof(LionProbeKey), lion_probe_sort_cmp,
+				  &sortctx);
 
 	for (i = 0; i < n; i++)
 	{
@@ -945,6 +1008,50 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 	return lion_posting_set_locate(index, state, &probe, key, hash, ps);
 }
 
+static uint32 lion_list_pin_budget(Relation index);
+static void lion_list_pin_charge(LionPostingSet *ps);
+
+/*
+ * One of many single lookups a caller keeps located together - the keys of a
+ * multi-key clause, as many as LION_MAX_QUERY_KEYS of them, and one clause
+ * per `@>` or `@@` of the query - under the list pin budget (DESIGN.md §15,
+ * "The pin budget").  They used to keep every INLINE leaf pin whatever the
+ * budget said, which a clause whose query is a parameter (DESIGN.md §17, "A
+ * query known only at run time") sets to a thousand pins a clause with
+ * nothing in the query text to show for it (2026-09-28 review).
+ *
+ * The lookup is lion_posting_set_lookup_col()'s; only what the set keeps
+ * differs.  A pin on the leaf the caller's previous set took (*lastpinned)
+ * costs no buffer and is not charged, as in a list; a pin on another leaf is
+ * charged while the budget lasts, and past it the set lets its leaf go and
+ * comes out NOPIN, which every count copes with (lion_count_sources_run()).
+ * The keys are looked up in the order the query names them, not in the
+ * directory's, so the same leaf may be charged twice: the budget runs out
+ * early, never late.
+ */
+bool
+lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
+									 Datum key, Oid keytype,
+									 LionPostingSet *ps, Buffer *lastpinned)
+{
+	bool		found;
+
+	found = lion_posting_set_lookup_col(index, attno, key, keytype, ps);
+	if (!BufferIsValid(ps->pinbuf))
+		return found;			/* not found, or a CHAIN set: no leaf kept */
+
+	if (ps->pinbuf == *lastpinned)
+		return found;
+	if (lion_list_pin_budget(index) == 0)
+	{
+		lion_posting_set_unpin(ps);
+		return found;
+	}
+	lion_list_pin_charge(ps);
+	*lastpinned = ps->pinbuf;
+	return found;
+}
+
 /*
  * How many leaves a walk may step right over before it is cheaper to descend
  * again (DESIGN.md §21).  A dense list steps; a list of a handful of values
@@ -956,7 +1063,7 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 /*
  * THE LIST PIN BUDGET (DESIGN.md §15): how many distinct leaves the IN lists
  * this backend has located and not yet released may keep pinned, all of them
- * together.  It is the smaller of
+ * together.  It is the smallest of
  *
  *	- LION_LOOKUP_MAX_PINS, 1000: the longest list the planner accepts as a
  *	  literal, so that a literal list pins exactly what it always did - a set
@@ -972,19 +1079,45 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  *	  binds below 64MB of shared_buffers.  The pool of a TEMPORARY index is
  *	  the backend's own local buffers, temp_buffers (1024 by default, and as
  *	  few as 100), which nothing else shares and which run out just the same:
- *	  "no empty local buffer available" (lion_pin_pool()).
+ *	  "no empty local buffer available" (lion_pin_pool());
+ *	- for the SHARED pool, LION_LOOKUP_SHARES times the backend's fair share
+ *	  of it, NBuffers / MaxBackends, but never less than LION_LOOKUP_MIN_PINS
+ *	  (2026-09-28 review).  The eighth keeps one backend from taking the
+ *	  pool, but eight backends running such lists at once still took all of
+ *	  it; with the share, the backends that must do so are a sixteenth of all
+ *	  the server is configured for, however many that is.  On a stock server
+ *	  (128MB, 100 connections: some 130 buffers a backend) the share is 2000
+ *	  and the thousand binds, so an ordinary configuration pins what it always
+ *	  did; the share binds where max_connections is large for shared_buffers.
  *
- * Neither depends on the backend's "fair share" (GetAdditionalPinLimit() of
- * 18): that is NBuffers / MaxBackends, 86 buffers on a stock 128MB server, and
- * a budget of it sent ordinary thousand-value lists to the heap.
+ * and a participant of a parallel plan gets its SHARE of that: the limit
+ * divided by the participants the plan was started with
+ * (lion_list_pin_participants()).  Each participant of a parallel FK-side
+ * join locates the fact filters for itself (DESIGN.md §27), and a leader with
+ * seven workers took eight budgets for one query.
+ *
+ * None of them is the backend's plain "fair share" (GetAdditionalPinLimit()
+ * of 18): 86 buffers on a stock 128MB server, and a budget of it sent
+ * ordinary thousand-value lists to the heap.  No bound kept per backend can
+ * promise the pool to every backend at once - that needs a count in shared
+ * memory, which an extension that need not be preloaded does not have - and a
+ * set past the budget only costs time: it comes out NOPIN, never wrong.
  *
  * The count is backend-wide because the budget is: two unbounded lists in one
  * query share it instead of taking one budget each.  Every set that took a
  * NEW leaf for it is marked `budgeted` and gives it back when released or
- * unpinned; a set abandoned by an error is not released, so the count is
- * zeroed at the end of every top-level transaction, when no set can be left.
- * Between an error and that point it can only be too high, which makes sets
- * NOPIN early - slower, never wrong.
+ * unpinned.  A set abandoned by an error is never released - but its pin is,
+ * by the resource owner that was current when it was taken, and that owner is
+ * released with the transaction, subtransaction or portal the error ends.  So
+ * each pin is charged to its OWNER as well (lion_list_pin_charge()), and an
+ * owner that is released gives back what its sets still had charged
+ * (lion_list_pins_resowner()).  A subtransaction failing in a loop - a
+ * PL/pgSQL EXCEPTION block around a count - used to leave its charges behind
+ * until the top-level transaction ended, and every list after it came out
+ * NOPIN (2026-09-28 review); now they go when its pins do, while the sets of
+ * a portal that outlives it (a cursor FETCHed inside it) keep theirs, as they
+ * keep their pins.  The count is still zeroed at the end of every top-level
+ * transaction, when no set can be left.
  *
  * The CURSORS that read the located sets draw on what is left of the same
  * limit (lion_open_budget_init()): a CHAIN set pins the posting page its
@@ -992,9 +1125,28 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * pin at all and then pinned a page per value when its cursors were built.
  */
 #define LION_LOOKUP_MAX_PINS	1000
+#define LION_LOOKUP_SHARES		16
+#define LION_LOOKUP_MIN_PINS	64
 
 static uint32 lion_list_pins = 0;
 static bool lion_list_pins_cb = false;
+static int	lion_list_participants = 1;
+
+/*
+ * The pins charged to one resource owner.  There are as many of these as
+ * owners that hold list pins at one time - the portal a count runs in, a
+ * cursor's, a function's - which is a handful, so they are an array searched
+ * from its end.
+ */
+typedef struct LionPinCharge
+{
+	ResourceOwner owner;
+	uint32		pins;
+} LionPinCharge;
+
+static LionPinCharge *lion_pin_charges = NULL;
+static int	lion_pin_ncharges = 0;
+static int	lion_pin_chargecap = 0;
 
 /*
  * The buffer pool a relation's pages are pinned in: the backend's local
@@ -1013,7 +1165,32 @@ lion_pin_pool(Relation rel)
 static uint32
 lion_pin_limit(Relation rel)
 {
-	return (uint32) Min(LION_LOOKUP_MAX_PINS, Max(lion_pin_pool(rel) / 8, 1));
+	uint32		limit;
+
+	limit = (uint32) Min(LION_LOOKUP_MAX_PINS, Max(lion_pin_pool(rel) / 8, 1));
+	if (rel == NULL || !RelationUsesLocalBuffers(rel))
+	{
+		int64		share;
+
+		share = (int64) LION_LOOKUP_SHARES * NBuffers / Max(MaxBackends, 1);
+		share = Max(share, (int64) LION_LOOKUP_MIN_PINS);
+		limit = (uint32) Min((int64) limit, share);
+	}
+	if (lion_list_participants > 1)
+		limit = Max(limit / (uint32) lion_list_participants, (uint32) 1);
+	return limit;
+}
+
+/*
+ * Set by the count pushdown when a parallel plan starts (DESIGN.md §27): how
+ * many participants it was started with, the leader included, each of which
+ * locates lists of its own.  Back to 1 when the leader's node ends, and at
+ * the end of every top-level transaction.
+ */
+void
+lion_list_pin_participants(int participants)
+{
+	lion_list_participants = Max(participants, 1);
 }
 
 static void
@@ -1027,9 +1204,37 @@ lion_list_pins_xact(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
 			lion_list_pins = 0;
+			lion_pin_ncharges = 0;
+			lion_list_participants = 1;
 			break;
 		default:
 			break;
+	}
+}
+
+/*
+ * A resource owner is being released - a portal's, a subtransaction's, the
+ * transaction's - and with it every buffer pin it still holds, among them the
+ * pins of the sets an error abandoned: their charges go with them.  The
+ * callback runs with CurrentResourceOwner set to the owner being released,
+ * once per phase.  A set charged to it that is released after all finds no
+ * charge left and gives nothing back (lion_list_pin_return()).
+ */
+static void
+lion_list_pins_resowner(ResourceReleasePhase phase, bool isCommit,
+						bool isTopLevel, void *arg)
+{
+	int			i;
+
+	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS || lion_pin_ncharges == 0)
+		return;
+	for (i = lion_pin_ncharges - 1; i >= 0; i--)
+	{
+		if (lion_pin_charges[i].owner != CurrentResourceOwner)
+			continue;
+		lion_list_pins -= Min(lion_list_pins, lion_pin_charges[i].pins);
+		lion_pin_charges[i] = lion_pin_charges[--lion_pin_ncharges];
+		break;
 	}
 }
 
@@ -1041,6 +1246,7 @@ lion_list_pin_budget(Relation index)
 	if (!lion_list_pins_cb)
 	{
 		RegisterXactCallback(lion_list_pins_xact, NULL);
+		RegisterResourceReleaseCallback(lion_list_pins_resowner, NULL);
 		lion_list_pins_cb = true;
 	}
 	return (lion_list_pins < limit) ? limit - lion_list_pins : 0;
@@ -1072,16 +1278,74 @@ lion_open_budget_init(LionOpenBudget *budget, Relation rel)
 	budget->pins = (int) Max(left, (uint32) LION_OPEN_MIN_PINS);
 }
 
-/* A set that took a leaf of the budget gives it back. */
+/*
+ * A set takes a leaf of the budget.  The pin it has just taken belongs to the
+ * current resource owner, and so does the charge.  The callbacks are
+ * registered by lion_list_pin_budget(), which every caller has asked first.
+ */
+static void
+lion_list_pin_charge(LionPostingSet *ps)
+{
+	ResourceOwner owner = CurrentResourceOwner;
+	int			i;
+
+	Assert(lion_list_pins_cb);
+	for (i = lion_pin_ncharges - 1; i >= 0; i--)
+	{
+		if (lion_pin_charges[i].owner == owner)
+			break;
+	}
+	if (i < 0)
+	{
+		if (lion_pin_ncharges >= lion_pin_chargecap)
+		{
+			int			newcap = Max(lion_pin_chargecap * 2, 8);
+
+			if (lion_pin_charges == NULL)
+				lion_pin_charges = (LionPinCharge *)
+					MemoryContextAlloc(TopMemoryContext,
+									   sizeof(LionPinCharge) * newcap);
+			else
+				lion_pin_charges = (LionPinCharge *)
+					repalloc(lion_pin_charges, sizeof(LionPinCharge) * newcap);
+			lion_pin_chargecap = newcap;
+		}
+		i = lion_pin_ncharges++;
+		lion_pin_charges[i].owner = owner;
+		lion_pin_charges[i].pins = 0;
+	}
+	lion_pin_charges[i].pins++;
+	lion_list_pins++;
+	ps->budgeted = true;
+	ps->pinowner = owner;
+}
+
+/*
+ * A set that took a leaf of the budget gives it back - to the owner it was
+ * charged to, unless that owner has been released since and given it back
+ * already.
+ */
 static inline void
 lion_list_pin_return(LionPostingSet *ps)
 {
-	if (ps->budgeted)
+	int			i;
+
+	if (!ps->budgeted)
+		return;
+	ps->budgeted = false;
+	for (i = lion_pin_ncharges - 1; i >= 0; i--)
 	{
+		if (lion_pin_charges[i].owner != ps->pinowner)
+			continue;
+		if (lion_pin_charges[i].pins > 0)
+			lion_pin_charges[i].pins--;
 		if (lion_list_pins > 0)
 			lion_list_pins--;
-		ps->budgeted = false;
+		if (lion_pin_charges[i].pins == 0)
+			lion_pin_charges[i] = lion_pin_charges[--lion_pin_ncharges];
+		break;
 	}
+	ps->pinowner = NULL;
 }
 
 /*
@@ -1170,7 +1434,9 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	/* A binary coercion - the only one taken - changes no value. */
 	vals = values;
 
-	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * nvalues);
+	/* an array parameter has no length cap (DESIGN.md §15) */
+	probes = (LionProbeKey *) palloc_extended(sizeof(LionProbeKey) * nvalues,
+											  MCXT_ALLOC_HUGE);
 	for (i = 0; i < nvalues; i++)
 	{
 		if (isnull != NULL && isnull[i])
@@ -1178,13 +1444,16 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		probes[nprobe].hash = lion_probe_hash(state, &probe, vals[i]);
 		probes[nprobe].idx = i;
 		nprobe++;
+		if ((nprobe & 0x3ff) == 0)
+			CHECK_FOR_INTERRUPTS();
 	}
 
 	sortctx.values = vals;
 	sortctx.probe = &probe;
 	sortctx.collation = state->collation;
+	sortctx.ncmp = 0;
 	if (nprobe > 1)
-		qsort_arg(probes, nprobe, sizeof(LionProbeKey), lion_probe_key_cmp,
+		qsort_arg(probes, nprobe, sizeof(LionProbeKey), lion_probe_sort_cmp,
 				  &sortctx);
 
 	for (i = 0; i < nprobe; i++)
@@ -1194,6 +1463,25 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		bool		dup = false;
 		bool		located;
 		int			steps;
+
+		/*
+		 * Every so often, with no lock held.  The walk keeps the leaf it
+		 * stands on LOCKED from one value to the next, and a content lock
+		 * holds interrupts off, so the check this loop used to make answered
+		 * no cancel however long the list (2026-09-28 review).  The leaf is
+		 * let go here, and the next value descends again - what it does
+		 * anyway whenever it lies more than a few leaves further right.  The
+		 * pins the sets took are theirs and stay.
+		 */
+		if (i > 0 && (i & 0x3f) == 0)
+		{
+			if (BufferIsValid(buf))
+			{
+				UnlockReleaseBuffer(buf);
+				buf = InvalidBuffer;
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
 
 		/*
 		 * A new sort run starts a new set of possible duplicates: with an
@@ -1311,8 +1599,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 					if (buf != lastpinned)
 					{
 						npinned++;
-						lion_list_pins++;
-						sets[nsets].budgeted = true;
+						lion_list_pin_charge(&sets[nsets]);
 					}
 					lastpinned = buf;
 					IncrBufferRefCount(buf);
@@ -1354,9 +1641,6 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		}
 
 		nsets++;
-
-		if ((i & 0x3f) == 0)
-			CHECK_FOR_INTERRUPTS();
 	}
 
 	if (BufferIsValid(buf))
@@ -1470,6 +1754,13 @@ lion_posting_set_release(LionPostingSet *ps)
 	ps->nopin = false;
 	ps->payload = NULL;			/* the memory belongs to the caller's context */
 	ps->paylen = 0;
+
+	/* a spilled copy owns its temporary file (lion_spill_finish()) */
+	if (ps->mat != NULL && ps->mat->file != NULL)
+	{
+		BufFileClose(ps->mat->file);
+		ps->mat->file = NULL;
+	}
 	ps->mat = NULL;				/* ... and so does the materialized copy */
 	ps->matfailed = false;
 	ps->nuses = 0;
@@ -1658,7 +1949,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 
 	if (ok)
 	{
-		LionMatSet  *mat = (LionMatSet *) palloc(sizeof(LionMatSet));
+		LionMatSet  *mat = (LionMatSet *) palloc0(sizeof(LionMatSet));
 
 		/*
 		 * The buffer grew by doubling from a page; what is kept is the exact
@@ -1717,6 +2008,116 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 
 
 /* ---------------------------------------------------------------------
+ * Spilled copies (LionSpill)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Start a spill whose entries - and file - live in cxt.  The file honours
+ * temp_tablespaces, which the caller has had PrepareTempTablespaces() look up
+ * BEFORE it started to read the index: the lookup reads catalogs, which may
+ * process invalidations, and that must not happen here, with a walk of the
+ * index under way.
+ */
+static void
+lion_spill_begin(LionSpill *sp, MemoryContext cxt)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+
+	sp->cxt = cxt;
+	sp->file = BufFileCreateTemp(false);
+	sp->cap = 256;
+	sp->ents = (LionSpillEnt *) palloc(sizeof(LionSpillEnt) * sp->cap);
+	sp->nents = 0;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/* Append one container: the next in ascending key order, one per key. */
+static void
+lion_spill_add(LionSpill *sp, const LionContainer *c)
+{
+	Size		sz = lion_item_size(c);
+	LionSpillEnt *e;
+	int			fileno;
+	pgoff_t		off;
+
+	Assert(sz <= LION_CONTAINER_MAX_SIZE);
+	Assert(sp->nents == 0 || sp->ents[sp->nents - 1].ckey < c->ckey);
+
+	if (sp->nents >= sp->cap)
+	{
+		sp->cap *= 2;
+		sp->ents = (LionSpillEnt *)
+			repalloc_huge(sp->ents, sizeof(LionSpillEnt) * sp->cap);
+	}
+	BufFileTell(sp->file, &fileno, &off);
+	if (fileno > PG_INT16_MAX)
+		elog(ERROR, "lion index: a spilled posting set of more than %d file segments",
+			 PG_INT16_MAX);
+
+	e = &sp->ents[sp->nents++];
+	e->off = off;
+	e->ckey = c->ckey;
+	e->size = (uint16) sz;
+	e->fileno = (int16) fileno;
+	BufFileWrite(sp->file, c, sz);
+}
+
+/*
+ * The set a finished spill makes.  What it holds in memory is its entries and
+ * the file's one-block buffer; the entries are cut to their number.
+ */
+static LionMatSet *
+lion_spill_finish(LionSpill *sp)
+{
+	LionMatSet *mat;
+	Size		bytes = 0;
+	int			i;
+
+	mat = (LionMatSet *) MemoryContextAllocZero(sp->cxt, sizeof(LionMatSet));
+	if (sp->nents < sp->cap)
+		sp->ents = (LionSpillEnt *)
+			repalloc_huge(sp->ents, sizeof(LionSpillEnt) * Max(sp->nents, 1));
+	for (i = 0; i < sp->nents; i++)
+		bytes += sp->ents[i].size;
+
+	mat->ncontainers = sp->nents;
+	mat->bytes = bytes;
+	mat->held = sizeof(LionMatSet) + sizeof(LionSpillEnt) * Max(sp->nents, 1) +
+		BLCKSZ;
+	mat->file = sp->file;
+	mat->spill = sp->ents;
+	sp->file = NULL;
+	sp->ents = NULL;
+	return mat;
+}
+
+/* Give up on a spill: close its file. */
+static void
+lion_spill_abandon(LionSpill *sp)
+{
+	if (sp->file != NULL)
+		BufFileClose(sp->file);
+	sp->file = NULL;
+	if (sp->ents != NULL)
+		pfree(sp->ents);
+	sp->ents = NULL;
+}
+
+/* Read container i of a spilled set into buf, LION_CONTAINER_MAX_SIZE long. */
+static void
+lion_spill_read(const LionMatSet *mat, int i, LionContainer *buf)
+{
+	const LionSpillEnt *e = &mat->spill[i];
+
+	if (BufFileSeek(mat->file, e->fileno, e->off, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in the temporary file of a spilled lion posting set")));
+	BufFileReadExact(mat->file, buf, e->size);
+}
+
+
+/* ---------------------------------------------------------------------
  * Container cursors
  * --------------------------------------------------------------------- */
 
@@ -1768,6 +2169,11 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		/* a private copy: nothing to pin, nothing to walk */
 		cur->matidx = 0;
+
+		/* ... and when it is spilled, a container at a time is read back */
+		if (set->mat->file != NULL)
+			cur->cbuf = (LionContainer *)
+				palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
 	}
 	else if (set->is_inline)
 	{
@@ -1863,6 +2269,11 @@ lion_cursor_next_item(LionSetCursor *cur)
 
 		if (cur->matidx >= mat->ncontainers)
 			return NULL;
+		if (mat->file != NULL)
+		{
+			lion_spill_read(mat, cur->matidx++, cur->cbuf);
+			return cur->cbuf;
+		}
 		return mat->containers[cur->matidx++];
 	}
 
@@ -2231,12 +2642,20 @@ lion_cursor_seek(LionSetCursor *cur, uint32 target)
 		int			lo = cur->matidx;
 		int			hi = mat->ncontainers;
 
-		/* a private copy is an array: binary search it */
+		/*
+		 * A private copy is an array: binary search it - a spilled one by the
+		 * keys it keeps in memory, one per container.
+		 */
 		while (lo < hi)
 		{
 			int			mid = lo + (hi - lo) / 2;
+			uint32		last;
 
-			if (lion_item_last_ckey(mat->containers[mid]) < target)
+			if (mat->file != NULL)
+				last = mat->spill[mid].ckey;
+			else
+				last = lion_item_last_ckey(mat->containers[mid]);
+			if (last < target)
 				lo = mid + 1;
 			else
 				hi = mid;
@@ -2459,6 +2878,12 @@ lion_leaf_cost(const LionPostingSet *ps, bool droppins, Size *mem, int *pins)
 {
 	*mem = sizeof(LionExprCursor);
 	*pins = 0;
+	if (ps->found && ps->mat != NULL && ps->mat->file != NULL)
+	{
+		/* a spilled copy: the container it reads back */
+		*mem += lion_alloc_size(MAXALIGN(LION_CONTAINER_MAX_SIZE));
+		return;
+	}
 	if (!ps->found || ps->mat != NULL)
 		return;					/* nothing to walk, or a private copy */
 
@@ -4294,15 +4719,40 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 {
 	Size		sz = lion_item_size(c);
 	MemoryContext oldcxt;
+	int			i;
 
 	if (col->failed)
 		return;
 	if (lion_container_cardinality(c) == 0)
 		return;
-	if (sizeof(LionMatSet) + MAXALIGN(col->used + sz) +
+	if (!col->spilled &&
+		sizeof(LionMatSet) + MAXALIGN(col->used + sz) +
 		sizeof(LionContainer *) * (col->noffs + 1) > col->maxbytes)
 	{
-		col->failed = true;
+		if (!col->spill)
+		{
+			col->failed = true;
+			return;
+		}
+
+		/*
+		 * Past the memory, and allowed to SPILL: what the copy holds so far
+		 * goes to a temporary file, and so does everything after it.
+		 */
+		lion_spill_begin(&col->sp, col->cxt);
+		for (i = 0; i < col->noffs; i++)
+			lion_spill_add(&col->sp,
+						   (const LionContainer *) (col->buf + col->offs[i]));
+		pfree(col->buf);
+		pfree(col->offs);
+		col->buf = NULL;
+		col->offs = NULL;
+		col->spilled = true;
+	}
+	if (col->spilled)
+	{
+		lion_spill_add(&col->sp, c);
+		col->members += lion_container_cardinality(c);
 		return;
 	}
 
@@ -5843,11 +6293,18 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * list too long to open at once is read as a windowed union, not in the
  * batches a count takes it in (lion_count_sources_run()).  The copy is
  * allocated in the current memory context.
+ *
+ * With spill, a copy past maxbytes goes on in a temporary file instead
+ * (LionSpill, 2026-09-28 review): what memory then keeps is sixteen bytes a
+ * container, and a count reads the file a container at a time.  The ordinary
+ * way it would otherwise fall back to seeks every source at every container
+ * key of every located set it is counted beside - for a long IN list among
+ * the sources, a union of all its sets built again for each of them.
  */
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
-					 LionCountSource *sources, Size maxbytes,
-					 LionPostingSet *out, LionCountStats *stats)
+					 LionCountSource *sources, Size maxbytes, bool spill,
+					 LionPostingSet *out, bool *spilled, LionCountStats *stats)
 {
 	LionCollect col;
 	LionMatSet *mat;
@@ -5858,6 +6315,7 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	memset(out, 0, sizeof(LionPostingSet));
 	out->pinbuf = InvalidBuffer;
 	out->head = InvalidBlockNumber;
+	*spilled = false;
 
 	for (i = 0; i < nsources && index == NULL; i++)
 	{
@@ -5873,9 +6331,14 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	if (index == NULL)
 		return false;
 
+	/* the catalogs a spill's file needs, looked up before the merge starts */
+	if (spill)
+		PrepareTempTablespaces();
+
 	memset(&col, 0, sizeof(col));
 	col.cxt = CurrentMemoryContext;
 	col.maxbytes = maxbytes;
+	col.spill = spill;
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
@@ -5900,6 +6363,16 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	out->cxt = CurrentMemoryContext;
 	out->entryblk = InvalidBlockNumber;
 	out->entryoff = InvalidOffsetNumber;
+	if (col.spilled)
+	{
+		mat = lion_spill_finish(&col.sp);
+		out->found = true;
+		out->mat = mat;
+		out->ntids = col.members;
+		out->ncontainers = (uint32) mat->ncontainers;
+		*spilled = true;
+		return true;
+	}
 	if (col.noffs == 0)
 	{
 		pfree(col.buf);
@@ -5907,7 +6380,7 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 		return true;
 	}
 
-	mat = (LionMatSet *) palloc(sizeof(LionMatSet));
+	mat = (LionMatSet *) palloc0(sizeof(LionMatSet));
 	mat->ncontainers = col.noffs;
 	mat->bytes = col.used;
 	mat->held = sizeof(LionMatSet) + MAXALIGN(Max(col.used, (Size) 1)) +
@@ -5932,7 +6405,11 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
  * each the OR of what every set of the range has at that key.  The sets come
  * in key order, which for a column stored in the heap's order is container
  * key order too, but in general is not - so the containers are kept by key
- * in a hash table and put in order once at the end.
+ * in a hash table and put in order at the end.
+ *
+ * Only the container keys in [lo, hi) are kept: all of them, until a
+ * WINDOWED collection runs out of memory and lowers hi
+ * (lion_range_union_evict()).
  */
 typedef struct LionRangeUnionEnt
 {
@@ -5944,15 +6421,80 @@ typedef struct LionRangeUnionEnt
 typedef struct LionRangeUnion
 {
 	HTAB	   *byckey;
-	MemoryContext cxt;
-	Size		held;			/* what the containers take, with overhead */
+	MemoryContext cxt;			/* the containers */
+	Size		held;			/* what they take, with overhead */
 	Size		maxbytes;
 	bool		failed;
+	bool		window;			/* past maxbytes, lower hi rather than fail */
+	uint64		lo;				/* the container keys kept: [lo, hi) */
+	uint64		hi;
 	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes */
 } LionRangeUnion;
 
-/* What one kept container costs beyond its bytes: its entry and its chunk. */
+/* No upper bound on the container keys of a window. */
+#define LION_CKEY_END				((uint64) PG_UINT32_MAX + 1)
+
+/* What one kept container costs beyond its chunk: its hash entry. */
 #define LION_RANGE_UNION_OVERHEAD	(sizeof(LionRangeUnionEnt) + 16)
+
+/*
+ * The least memory a window has, whatever is left of the caller's: several
+ * bitsets, so that a window always keeps some keys and gets on.
+ */
+#define LION_RANGE_WINDOW_MIN		(32 * 1024)
+
+static int
+lion_ckey_cmp(const void *a, const void *b)
+{
+	uint32		x = *(const uint32 *) a;
+	uint32		y = *(const uint32 *) b;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/*
+ * A windowed collection past its memory: keep the lower half of the keys
+ * the window holds, give the others back, and end the window where they
+ * began - the next window starts there, and reads the range again for them.
+ * With the window's memory at least LION_RANGE_WINDOW_MIN there are always
+ * two keys or more to split.
+ */
+static void
+lion_range_union_evict(LionRangeUnion *u)
+{
+	long		n = hash_get_num_entries(u->byckey);
+	HASH_SEQ_STATUS seq;
+	LionRangeUnionEnt *e;
+	uint32	   *keys;
+	uint32		cut;
+	long		i = 0;
+
+	if (n < 2)
+		return;
+	keys = (uint32 *) MemoryContextAlloc(u->cxt, sizeof(uint32) * n);
+	hash_seq_init(&seq, u->byckey);
+	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
+		keys[i++] = e->ckey;
+	Assert(i == n);
+	qsort(keys, n, sizeof(uint32), lion_ckey_cmp);
+	cut = keys[n / 2];
+	pfree(keys);
+
+	/* deleting the entry just returned is allowed during a hash_seq_search */
+	hash_seq_init(&seq, u->byckey);
+	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
+	{
+		uint32		ckey = e->ckey;
+
+		if (ckey < cut)
+			continue;
+		u->held -= Min(u->held,
+					   GetMemoryChunkSpace(e->c) + LION_RANGE_UNION_OVERHEAD);
+		pfree(e->c);
+		(void) hash_search(u->byckey, &ckey, HASH_REMOVE, NULL);
+	}
+	u->hi = cut;
+}
 
 static bool
 lion_range_union_cb(const LionContainer *c, void *arg)
@@ -5965,7 +6507,16 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 
 	if (lion_container_cardinality(c) == 0)
 		return true;
+	if ((uint64) ckey < u->lo || (uint64) ckey >= u->hi)
+		return true;			/* another window's */
 
+	/*
+	 * What a container takes is counted as the allocator hands it out
+	 * (GetMemoryChunkSpace()): a BITSET's 4104 bytes rounded up to a chunk of
+	 * 8 kB was counted as 4104, and a union held twice what it said.  The
+	 * containers' context gives anything over a kilobyte a block of its own
+	 * (lion_range_collect()), so that no longer happens either.
+	 */
 	e = (LionRangeUnionEnt *) hash_search(u->byckey, &ckey, HASH_ENTER, &found);
 	if (!found)
 	{
@@ -5973,7 +6524,7 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
 		memcpy(e->c, c, size);
 		e->size = (uint32) size;
-		u->held += size + LION_RANGE_UNION_OVERHEAD;
+		u->held += GetMemoryChunkSpace(e->c) + LION_RANGE_UNION_OVERHEAD;
 	}
 	else
 	{
@@ -5981,9 +6532,10 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		size = lion_container_size(u->tmp);
 		if (size != e->size)
 		{
+			u->held -= Min(u->held, GetMemoryChunkSpace(e->c));
 			pfree(e->c);
 			e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
-			u->held = u->held - e->size + size;
+			u->held += GetMemoryChunkSpace(e->c);
 			e->size = (uint32) size;
 		}
 		memcpy(e->c, u->tmp, size);
@@ -5991,8 +6543,13 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 
 	if (u->held > u->maxbytes)
 	{
-		u->failed = true;
-		return false;
+		if (!u->window)
+		{
+			u->failed = true;
+			return false;
+		}
+		while (u->held > u->maxbytes && hash_get_num_entries(u->byckey) > 1)
+			lion_range_union_evict(u);
 	}
 	return true;
 }
@@ -6004,6 +6561,55 @@ lion_range_union_cmp(const void *a, const void *b)
 	uint32		y = (*(LionRangeUnionEnt *const *) b)->ckey;
 
 	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/*
+ * One window of a range's union (above): walk the range and keep what its
+ * sets hold at the window's keys.  nsets and nsummaries, when given, say what
+ * the walk read.
+ */
+static void
+lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
+					  LionRangeUnion *u, int64 *nsets, int64 *nsummaries)
+{
+	LionEntryScan es;
+	LionPostingSet ps;
+	Datum		key;
+
+	lion_entry_scan_begin_sum(&es, index, attno, range, LION_WALK_INSIDE);
+	while (!u->failed && lion_entry_scan_next(&es, &key, &ps))
+	{
+		if (ps.found)
+			(void) lion_sets_iterate(1, &ps, NULL, lion_range_union_cb, u);
+		lion_posting_set_release(&ps);
+		if (nsets != NULL)
+			(*nsets)++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (nsummaries != NULL)
+		*nsummaries = es.nsummaries;
+	lion_entry_scan_end(&es);
+}
+
+/* The union's entries, in key order, in the current memory context. */
+static LionRangeUnionEnt **
+lion_range_union_sorted(LionRangeUnion *u, long *n)
+{
+	HASH_SEQ_STATUS seq;
+	LionRangeUnionEnt *e;
+	LionRangeUnionEnt **ents;
+	long		i = 0;
+
+	*n = hash_get_num_entries(u->byckey);
+	ents = (LionRangeUnionEnt **)
+		palloc(sizeof(LionRangeUnionEnt *) * Max(*n, 1));
+	hash_seq_init(&seq, u->byckey);
+	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
+		ents[i++] = e;
+	Assert(i == *n);
+	if (*n > 1)
+		qsort(ents, *n, sizeof(LionRangeUnionEnt *), lion_range_union_cmp);
+	return ents;
 }
 
 /*
@@ -6024,117 +6630,172 @@ lion_range_union_cmp(const void *a, const void *b)
  * insert puts its row under its key and then under its bucket's summary, both
  * before it commits, and the walk reads the keys of a bucket or its summary,
  * never both (DESIGN.md §32, "Readers").
+ *
+ * A union that fits in maxbytes IS the set: its containers stay where the
+ * union built them, in a context that becomes the set's, and are handed out
+ * in key order through containers[].  It used to be copied into one buffer
+ * at the end, while the hash table still held it, which took twice what the
+ * union did at the peak (2026-09-28 review).
+ *
+ * One that does not fit fails - the caller walks the range at every count
+ * instead - unless spill says it may not: an OR's leaf, which cannot be taken
+ * apart that way and used to be collected whatever it took.  It is then
+ * collected a WINDOW of container keys at a time into a temporary file
+ * (LionSpill): a window keeps the keys from where the last one ended; when
+ * its memory - maxbytes, and never below LION_RANGE_WINDOW_MIN - runs out it
+ * gives back the upper half of its keys and ends where they began
+ * (lion_range_union_evict()); at the end of the walk its containers go to
+ * the file in key order, and the next window reads the range again from its
+ * end.  Every window is a walk of the range, so a union n times the memory
+ * costs about 2n walks; each is read after the snapshot like the first, and
+ * the windows are disjoint ranges of TIDs, so the file holds each row once.
+ * The set reads the file a container at a time; what it keeps in memory is
+ * sixteen bytes a container key.
  */
 bool
 lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
-				   Size maxbytes, LionPostingSet *out, Size *held,
-				   int64 *nsets, int64 *nsummaries)
+				   Size maxbytes, bool spill, LionPostingSet *out, Size *held,
+				   bool *spilled, int64 *nsets, int64 *nsummaries)
 {
 	LionRangeUnion u;
-	LionEntryScan es;
-	LionPostingSet ps;
+	LionSpill	sp;
 	HASHCTL		ctl;
-	HASH_SEQ_STATUS seq;
-	LionRangeUnionEnt *e;
 	LionRangeUnionEnt **ents;
-	LionCollect col;
 	LionMatSet *mat;
 	MemoryContext cxt;
-	MemoryContext oldcxt;
-	Datum		key;
+	uint64		lo = 0;
+	uint64		members = 0;
+	bool		windowed = false;
 	long		n;
 	long		i;
 
 	memset(out, 0, sizeof(LionPostingSet));
 	out->pinbuf = InvalidBuffer;
 	out->head = InvalidBlockNumber;
-	*held = 0;
-	*nsets = 0;
-	*nsummaries = 0;
-
-	/* The union is built in a context of its own and copied out at the end. */
-	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion range collect",
-								ALLOCSET_DEFAULT_SIZES);
-	memset(&u, 0, sizeof(u));
-	u.cxt = cxt;
-	u.maxbytes = maxbytes;
-	u.tmp = (LionContainer *) MemoryContextAlloc(cxt, LION_CONTAINER_MAX_SIZE);
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(uint32);
-	ctl.entrysize = sizeof(LionRangeUnionEnt);
-	ctl.hcxt = cxt;
-	u.byckey = hash_create("lion range union", 256, &ctl,
-						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
-	lion_entry_scan_begin_sum(&es, index, attno, range, LION_WALK_INSIDE);
-	while (!u.failed && lion_entry_scan_next(&es, &key, &ps))
-	{
-		if (ps.found)
-			(void) lion_sets_iterate(1, &ps, NULL, lion_range_union_cb, &u);
-		lion_posting_set_release(&ps);
-		(*nsets)++;
-		CHECK_FOR_INTERRUPTS();
-	}
-	*nsummaries = es.nsummaries;
-	lion_entry_scan_end(&es);
-
-	if (u.failed)
-	{
-		MemoryContextDelete(cxt);
-		return false;
-	}
-
-	/* The containers in key order, into one buffer as a collection has them. */
-	n = hash_get_num_entries(u.byckey);
 	out->index = index;
 	out->attno = attno;
 	out->cxt = CurrentMemoryContext;
 	out->entryblk = InvalidBlockNumber;
 	out->entryoff = InvalidOffsetNumber;
-	if (n == 0)
+	*held = 0;
+	*spilled = false;
+	*nsets = 0;
+	*nsummaries = 0;
+	memset(&sp, 0, sizeof(sp));
+
+	/* the catalogs a spill's file needs, looked up before the walk starts */
+	if (spill)
+		PrepareTempTablespaces();
+
+	for (;;)
 	{
+		/*
+		 * One window, in a context of its own.  Anything over a kilobyte - a
+		 * BITSET, a long ARRAY - is a block of its own there, allocated at
+		 * its size and given back to malloc when freed (ALLOCSET_SMALL_SIZES
+		 * put the chunk limit at 1 kB), so the union takes about what its
+		 * containers are.
+		 */
+		cxt = AllocSetContextCreate(CurrentMemoryContext, "lion range collect",
+									ALLOCSET_SMALL_SIZES);
+		memset(&u, 0, sizeof(u));
+		u.cxt = cxt;
+		u.maxbytes = spill ? Max(maxbytes, (Size) LION_RANGE_WINDOW_MIN) :
+			maxbytes;
+		u.window = spill;
+		u.lo = lo;
+		u.hi = LION_CKEY_END;
+		u.tmp = (LionContainer *) MemoryContextAlloc(cxt,
+													 LION_CONTAINER_MAX_SIZE);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(uint32);
+		ctl.entrysize = sizeof(LionRangeUnionEnt);
+		ctl.hcxt = cxt;
+		u.byckey = hash_create("lion range union", 256, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		/* the first window's walk is the one that says what the range read */
+		lion_range_union_walk(index, attno, range, &u,
+							  windowed ? NULL : nsets,
+							  windowed ? NULL : nsummaries);
+
+		if (u.failed)
+		{
+			Assert(!windowed);
+			MemoryContextDelete(cxt);
+			return false;
+		}
+
+		ents = lion_range_union_sorted(&u, &n);
+
+		if (!windowed && u.hi == LION_CKEY_END)
+		{
+			/*
+			 * All of it, in memory: the containers stay where they are, and
+			 * cxt - with nothing else left in it - is the set's.
+			 */
+			if (n == 0)
+			{
+				pfree(ents);
+				MemoryContextDelete(cxt);
+				return true;	/* the range selects nothing: not found */
+			}
+			mat = (LionMatSet *) palloc0(sizeof(LionMatSet));
+			mat->ncontainers = (int) n;
+			mat->containers = (LionContainer **)
+				palloc(sizeof(LionContainer *) * n);
+			for (i = 0; i < n; i++)
+			{
+				mat->containers[i] = ents[i]->c;
+				mat->bytes += ents[i]->size;
+				members += lion_container_cardinality(ents[i]->c);
+			}
+			pfree(ents);
+			pfree(u.tmp);
+			hash_destroy(u.byckey);
+			mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
+				MemoryContextMemAllocated(cxt, true);
+
+			out->found = true;
+			out->mat = mat;
+			out->ntids = members;
+			out->ncontainers = (uint32) n;
+			*held = mat->held;
+			return true;
+		}
+
+		/* A window of more: its containers, in key order, to the file. */
+		if (!windowed)
+		{
+			lion_spill_begin(&sp, CurrentMemoryContext);
+			windowed = true;
+		}
+		for (i = 0; i < n; i++)
+		{
+			lion_spill_add(&sp, ents[i]->c);
+			members += lion_container_cardinality(ents[i]->c);
+		}
+		pfree(ents);
 		MemoryContextDelete(cxt);
-		return true;			/* the range selects nothing: not found */
+
+		if (u.hi == LION_CKEY_END)
+			break;
+		Assert(u.hi > lo);
+		lo = u.hi;
 	}
 
-	oldcxt = MemoryContextSwitchTo(cxt);
-	ents = (LionRangeUnionEnt **) palloc(sizeof(LionRangeUnionEnt *) * n);
-	i = 0;
-	hash_seq_init(&seq, u.byckey);
-	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
-		ents[i++] = e;
-	Assert(i == n);
-	qsort(ents, n, sizeof(LionRangeUnionEnt *), lion_range_union_cmp);
-	MemoryContextSwitchTo(oldcxt);
-
-	memset(&col, 0, sizeof(col));
-	col.cxt = CurrentMemoryContext;
-	col.maxbytes = SIZE_MAX;
-	col.cap = 8192;
-	col.buf = (char *) palloc(col.cap);
-	col.offcap = 256;
-	col.offs = (Size *) palloc(sizeof(Size) * col.offcap);
-	for (i = 0; i < n; i++)
-		lion_collect_container(&col, ents[i]->c);
-	MemoryContextDelete(cxt);
-
-	mat = (LionMatSet *) palloc(sizeof(LionMatSet));
-	mat->ncontainers = col.noffs;
-	mat->bytes = col.used;
-	mat->held = sizeof(LionMatSet) + MAXALIGN(Max(col.used, (Size) 1)) +
-		sizeof(LionContainer *) * Max(col.noffs, 1);
-	mat->buf = col.buf;
-	mat->containers = (LionContainer **)
-		palloc(sizeof(LionContainer *) * Max(col.noffs, 1));
-	for (i = 0; i < col.noffs; i++)
-		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
-	pfree(col.offs);
-
+	if (sp.nents == 0)
+	{
+		lion_spill_abandon(&sp);
+		return true;			/* the range selects nothing: not found */
+	}
+	mat = lion_spill_finish(&sp);
 	out->found = true;
 	out->mat = mat;
-	out->ntids = col.members;
-	out->ncontainers = (uint32) col.noffs;
+	out->ntids = members;
+	out->ncontainers = (uint32) mat->ncontainers;
 	*held = mat->held;
+	*spilled = true;
 	return true;
 }
 

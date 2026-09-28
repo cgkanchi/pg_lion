@@ -2457,7 +2457,8 @@ The length cap then applies only when the length is known at plan time - a liter
 ArrayExpr's, and a stable expression's that `estimate_expression_value()` reduces to a literal. A
 Param that IS an array has no length until the executor has it, and by then there is no plan left
 to decline in favour of, so it is answered whatever its length, and the pins are bounded by the
-lookup instead (below).
+lookup instead (below) - and, in a plain count, the memory by locating it a batch at a time ("A
+list too long to locate at once").
 
 ### The pin budget (2026-09-23 review)
 
@@ -2484,10 +2485,36 @@ so on any ordinary configuration a literal list pins exactly the leaves it alway
 that read the located sets draw on what the lists leave of the same limit ("Bounded cursors",
 below). Pins on the
 leaf the previous set already pins cost no buffer and are not counted. Every set that took a new
-leaf is marked `budgeted` and returns it when released; a set abandoned by an error never is, so
-the count is zeroed at the end of each top-level transaction, and until then it can only be too
-high - sets go NOPIN early, which is slower and never wrong. An INLINE set found past the budget
-comes out **NOPIN**: its payload copied, its leaf let go, exactly like a materialized set (§9).
+leaf is marked `budgeted` and returns it when released. A set abandoned by an error never is, but
+its PIN is released - by the resource owner that was current when it was taken, with the
+transaction, subtransaction or portal the error ends - so each charge is recorded against that
+owner too, and an owner being released gives back what its sets still had charged
+(`lion_list_pins_resowner()`, a resource-release callback; 2026-09-28 review). Before that the
+count was only zeroed at the end of the top-level transaction, and a subtransaction failing in a
+loop - a PL/pgSQL `EXCEPTION` block around a count - left its charges behind until then, so every
+list after it came out NOPIN: never wrong, but a cliff. Restoring the count saved at the start of
+the subtransaction would not have been right either: a cursor opened outside the subtransaction and
+FETCHed inside it keeps its sets, and their pins, when the subtransaction is rolled back, and the
+owner is what tells those apart. The top-level zeroing stays as a backstop. An INLINE set found past
+the budget comes out **NOPIN**: its payload copied, its leaf let go, exactly like a materialized set
+(§9).
+
+The limit is per backend, and two things it did not account for were other backends and a
+query's own parallel workers (2026-09-28 review). An eighth of the pool keeps one backend from
+exhausting it, but eight at once still could. So for the shared pool the limit is also at most
+`LION_LOOKUP_SHARES` = 16 times the backend's fair share, `NBuffers / MaxBackends`, and never less
+than `LION_LOOKUP_MIN_PINS` = 64: exhausting the pool that way takes a sixteenth of all the
+backends the server is configured for, running lists over the budget at the same moment. On a stock
+server (128MB, 100 connections, some 130 buffers a backend) the share is about 2000 and the thousand
+still binds, so an ordinary configuration pins exactly what it did; the share binds where
+max_connections is large for shared_buffers (128MB and 500 connections: about 500). A plain fair
+share, the budget's first version below, sent ordinary lists to the heap; sixteen of them do not.
+And each participant of a parallel FK-side join locates the fact filters for itself (§27), so a
+leader and seven workers took eight budgets: the node now tells each participant how many the plan
+was started with (`lion_list_pin_participants()`, the workers planned plus the leader, whether it
+takes part or not), and each takes that share of the limit. No bound kept per backend promises the
+pool to every backend at once - that needs a count in shared memory, which an extension that need
+not be preloaded does not have - and what the bound costs past it is only time: sets come out NOPIN.
 
 The first version of this budget (2fb790e) was this backend's "fair share" of the pool,
 `GetAdditionalPinLimit()`, which is NBuffers / MaxBackends: 86 buffers on a stock 128MB,
@@ -2496,12 +2523,19 @@ The first version of this budget (2fb790e) was this backend's "fair share" of th
 the map answered before - and 18's function returns 0 outright once the share is at most eight,
 which made the same version drop the pin of EVERY single lookup (`lion_posting_set_take()`) on a
 small pool with many connections, so a plain `k = 5 AND x = 5` over two INLINE sets lost the map.
-Single lookups keep their pin unconditionally now. What a caller's loop of them holds is bounded by
-the query rather than by the data: a multi-key clause extracts at most `LION_MAX_QUERY_KEYS` = 1000
-keys (lion_multikey.c; beyond that the query is answered as ALL and rechecked), so one `@>` or `@@`
-clause of the pushdown pins at most 1000 leaves, and a query with many such clauses holds 1000 per
-clause - the residual, and the one place a query's text rather than its data sets the number. The
-bitmap scan holds none of them past the lookup (below).
+Single lookups keep their pin unconditionally now. A caller's LOOP of them does not: a multi-key
+clause extracts up to `LION_MAX_QUERY_KEYS` = 1000 keys (lion_multikey.c; beyond that the query is
+answered as ALL and rechecked), and since a clause's query may be a parameter (§17, "A query known
+only at run time") nothing in the query text shows how many - one `@>` of a thousand-element array
+parameter pinned a thousand leaves, and a query of several such clauses a thousand each, outside
+the budget (2026-09-28 review). The pushdown locates a multi-key clause's keys with
+`lion_posting_set_lookup_budgeted_col()`: the single lookup, but a pin it keeps is charged to the
+list budget like a list's (another pin on the leaf the clause's previous key took is free), and a
+key found past the budget comes out NOPIN. The keys are not sorted into the directory's order
+first - their positions are the tree's leaves - so a leaf two keys share at a distance is charged
+twice: the budget runs out early, never late. A multi-key source copes with NOPIN leaves as any
+source does (below): its plan is not `pinned`, so another source carries the interlock or the count
+trusts no map. The bitmap scan holds none of them past the lookup (below).
 
 A NOPIN set carries no §9 interlock of its own, and the count restores one in each of its shapes:
 
@@ -2579,7 +2613,14 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   the entries up in (bucket, hash) order, so the bucket pages are read in ascending block order and
   duplicates - which hash equally and are therefore adjacent in that order - are dropped in one pass
   instead of by comparing every value with every earlier one (half a million `datumIsEqual()` calls
-  at 1000 values). `lion_index_count_any(idx, keys)` is the SQL form of the whole path.
+  at 1000 values). `lion_index_count_any(idx, keys)` is the SQL form of the whole path. A list
+  whose length is a parameter's has no cap, so all three steps answer a cancel (2026-09-28
+  review): the hashing every thousand values, the sort every 65536 comparisons, and the walk every
+  64 values - where it lets go of the leaf it has been keeping LOCKED from one value to the next
+  and lets the next value descend again, because a content lock holds interrupts off and the check
+  the walk used to make under it did nothing. (A lookup that steps right with lock COUPLING - the
+  insert path's run of one prefix - holds a lock at every moment and cannot check; its run is one
+  prefix's collisions.)
 
 **Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one
 bucket page each - but read in ascending block order, so at `lion_heap_page_cost()`'s interpolated
@@ -2721,10 +2762,41 @@ The pins dropped are pins that carried no interlock; a pin too many never made a
 **What is still per value.** The located sets themselves: a `LionPostingSet`, its INLINE payload
 copy and a tree node, about 200 bytes a value, which is what the executor spends on the array
 anyway (a 30000-value list costs 7.8 MB of VmHWM with the pushdown off, 15.6 MB with it on at
-work_mem 4MB, 499 MB before). Locating a list a batch at a time, as the plain scan does (§29.4),
-would need the pushdown to keep the values instead of the sets, and the GROUP BY list driver walks
-them. And the query's own text: a multi-key AND of 1000 CHAIN keys (the extraction's cap) still
-holds 1000 page images, 8 MB, though past the pin budget only one child's pins.
+work_mem 4MB, 499 MB before) - except in a plain count, which locates a long list a batch at a
+time (below). And the query's own text: a multi-key AND of 1000 CHAIN keys (the extraction's cap)
+still holds 1000 page images, 8 MB, though past the pin budget only one child's pins.
+
+#### A list too long to locate at once (2026-09-28 review)
+
+A parameter's array has no length cap, and every value's located set was held at once whatever
+work_mem said: some 200 bytes a value, and past about nine million values an array of sets larger
+than the 1GB a plain allocation may be, so `k = ANY ($1)` failed with "invalid memory alloc request
+size" where the ordinary plan answers. Two things now:
+
+- **A plain count locates it a batch at a time** (`lion_array_batch_prepare()`,
+  `lion_count_batched()`). When the node counts the relation as one row - no GROUP BY, no
+  count(DISTINCT) walk, no FK-side join - and an IN list that is a source of its own has more
+  values than `lion_array_batch_size()` (a work_mem of 256-byte sets, never fewer than the thousand
+  a literal may have), the list is not located with the other clauses. Its values are sorted as a
+  lookup sorts them (`lion_probe_sort()`) and kept with their hashes, and the count locates a batch,
+  counts it with the other sources, releases it - pins and all - and goes on to the next. The count
+  of the list is the SUM of the batches' counts for the reason lion_run_batches() gives one level
+  down: with the batches B_j of whole entries of one scalar index, R the other positive sources and
+  N the negated ones, `|((B_1 ∪ ... ∪ B_m) ∩ R) \ N| = Σ_j |(B_j ∩ R) \ N|`, the terms being
+  disjoint. A batch ends only where the hash changes, so two values of one equality class - which
+  hash alike and sort together - are never in two batches, and neither is any entry: the argument
+  of the plain scan's pieces (§29.4). A batch none of whose values has an entry adds nothing.
+  EXPLAIN ANALYZE prints `List Batches` when there were any.
+- **Every other shape holds the list whole, in a huge allocation**, so that it answers at any length
+  the array itself can have instead of failing at nine million values. A GROUP BY, a count(DISTINCT)
+  and an FK-side join count the list many times over - batching it would locate it again for every
+  group - and a list under an OR is not a disjoint union.
+
+What a batched count still holds per value is the values: the array, and a Datum and a hash each -
+what the executor's own `= ANY` holds, and core's B-tree scan of the same array deconstructs and
+sorts it just the same. A list that is not batched costs its sets' memory outside work_mem as
+before; the planner cannot see a parameter's length to decline it (the literal cap), and at run
+time there is no plan left to fall back to.
 
 Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
 
@@ -6919,8 +6991,10 @@ expression's array at its plan-time estimate, which the clause analysis puts in 
 and probed, per dimension row, as the longest list a literal may be (LION_MAX_ARRAY_ELEMS). A
 wrong guess about a scan's one-off work costs little; a wrong guess about a dimension row's costs
 that many times over, which is what the review measured. So the copy is what is chosen whenever it
-is expected to fit, and a copy that does not fit at run time falls back to the probes, as a literal
-list's does. `IN ($1, $2)` keeps its length at plan time and is priced like a literal list.
+is expected to fit, and a copy that does not fit at run time spills to a temporary file ("The fact
+filters, collected once" below; it used to fall back to the probes, the very per-row work the
+guess was meant to avoid). `IN ($1, $2)` keeps its length at plan time and is priced like a literal
+list.
 
 **Measured** (2026-09-23, prune slot's PostgreSQL 20devel install - assert-enabled, so ratios and
 not absolute numbers; two million fact rows over 22,728 heap pages with a 40-byte pad, `fk` = a
@@ -7054,11 +7128,23 @@ count seeks by a binary search in memory. The same forward count takes 135 ms (t
   `hash_mem_multiplier` - and not by a setting of its own: the copy stands where the ordinary
   plan's hash table would, over the same rows, and is the same kind of memory; in a parallel plan
   each participant makes its own, as each participant of a hash join below a Gather builds its
-  own table ("Parallel" below). A copy that would outgrow it is abandoned at the container where it
-  does (the merge stops there: `lion_exists_settled()` reads the collection's `failed`), and that
-  run reads the filters per count as before; EXPLAIN ANALYZE then prints `Fact Filter Rows
-  Collected: -1`. The same on a hot standby, where whether the map may be trusted depends on the
-  WAL mode of every index read.
+  own table ("Parallel" below). A copy that outgrows it SPILLS, as a hash join's table would
+  (2026-09-28 review): what it holds so far goes to a temporary file (`LionSpill`, lion_count.c),
+  and so does every container after it, in key order; memory keeps sixteen bytes a container - its
+  key, where it is and its size - and a count reads the file a container at a time, a seek being a
+  binary search over those keys. EXPLAIN ANALYZE prints `Fact Filter Copies Spilled`. It used to be
+  abandoned there, and the run read the filters per count - for an IN list whose length the planner
+  could not see (a parameter, priced at `estimate_array_length()`'s ten values) that is the union
+  of every one of its sets built again for every dimension row, hour-scale for a long list over
+  many rows, and exactly the plan the cost model had just refused. The temporary file honours
+  `temp_tablespaces`, which are looked up before the merge starts (a lookup reads catalogs, which
+  may process invalidations, and must not do so in the middle of a walk of the index); it belongs
+  to the copy and is closed when the copy is released, and on an error with the resource owner it
+  was opened under.
+- On a hot standby, where whether the map may be trusted depends on the WAL mode of every index
+  read, no copy is made, and the run reads the filters per count, as before. The planner now knows
+  it: in recovery `lion_cost_fkjoin_rel()` never prices the copy, and a plan is chosen for the
+  probing it will do.
 - An IN list too long to open at once used to be refused a copy as well: a count takes such a list
   in batches (§15, "Bounded cursors"), each yielding every container key of its own, which would
   reach a copy out of order. A collection is never batched now (2026-09-27): the batches exist to
@@ -7106,7 +7192,18 @@ the join member of `custom_private` became `{clause, kind of join, flags [, chil
   `LION_FKJOIN_COPY_COUNT_COST`, and per fk container `LION_FKJOIN_COPY_PROBE_COST` and
   `LION_FKJOIN_COPY_MEMBER_COST` per member it holds. Only when the copy is expected to fit in
   the same `get_hash_memory_limit()` the executor gives it: a container's members at two bytes
-  each, a bitset's 4 kB at most.
+  each, a bitset's 4 kB at most - and never on a hot standby, which makes no copy.
+
+A copy the estimate said would fit and that does not is spilled, not abandoned (above), so the plan
+the estimate chose runs as collected whatever the fact filters turn out to hold; an IN list of a
+parameter that was estimated at ten values and holds a hundred thousand costs its one merge and a
+file, not a union per dimension row. That is why the probed price of such a list (the longest
+literal list, "An IN list whose array is a PARAMETER" in "Planner integration" above) is only the
+price of the probed PLAN: the review
+that found the fallback proposed pricing a list of unknown length at the worse of the two, which
+with the spill would refuse plans that run as collected. What still reads the filters per count is
+a run without a copy: a hot standby, which is priced so, and fact filters with a range too large
+to collect (§32), which is priced as walked by every count.
 
 A directory descent costs `LION_DESCENT_COST` (120 `cpu_operator_cost`) a level, as every lookup
 of the count does (§10, "The units"). A semi or anti join's existence test reads the share of the
@@ -7309,7 +7406,9 @@ it is offered, besides the serial path, over the dimension's cheapest partial pa
   counter to do it: "Forward semi joins over a non-unique key".)
 - **Nothing is shared but EXPLAIN's counters.** Each participant locates the fact filters and makes
   its own copy of them (`lion_sources_collect()`) under its own `get_hash_memory_limit()`, and
-  falls back to probing on its own when its copy does not fit. The copy is not built once in
+  spills it to a temporary file of its own when it does not fit (it used to fall back to probing
+  on its own). Each locates its lists under its share of the list pin budget (§15). The copy is
+  not built once in
   dynamic shared memory: its size is known only once the merge has run, after the Gather has sized
   its DSM, and one copy would make every worker wait for its builder (the barrier a Parallel Hash
   needs) to save a merge that took 0.8 ms for 1,500 containers of one set ("Cost, revisited"). It
@@ -10161,12 +10260,39 @@ as a source only beside something that does: the walk that drives the count (a G
 over another range, a count(DISTINCT) walk), the fk set of a join, or a clause - or an OR of
 clauses - outside the ranges. `count(*) WHERE k < 10 OR a = 3` alone is left to the ordinary plan.
 An OR's leaf cannot be walked (the union's other arms would have to be subtracted from each piece),
-so it is collected whatever it takes, and the planner prices one it expects not to fit out of the
-plan (`lion_cost_range_source()`). **Flagged:** a walked OR arm by inclusion-exclusion -
-`|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B ∩ Z − Y|` over R's pieces B - is the way to lift that.
+and the planner prices one it expects not to fit out of the plan (`lion_cost_range_source()`). One
+that does not fit anyway - the estimate was wrong - used to be collected whatever it took, with no
+limit, and at about twice the union at the peak: the hash table still held every container while
+the final copy was built. Both are gone (2026-09-28 review):
+
+- **The union is the set.** A collection that fits keeps its containers where the union built them,
+  and the set's `containers[]` points at them in key order; there is no second copy. The containers
+  live in a context whose chunk limit is a kilobyte (`ALLOCSET_SMALL_SIZES`), so a bitset or a long
+  array is a block of its own at its own size, where the default context rounded a 4104-byte bitset
+  up to 8 kB; and what the union holds is counted as the allocator hands it out
+  (`GetMemoryChunkSpace()`), where it used to be counted at the containers' own sizes.
+- **An OR's leaf is collected in WINDOWS past the memory**, into a temporary file (`LionSpill`, the
+  same the FK-side join's copy spills into, §27). It gets what every range of the relation gets -
+  what is left of the hash table's memory, and never less than `LION_RANGE_WINDOW_MIN` (32 kB,
+  several bitsets, so that a window always gets on).
+  A window keeps the container keys from where the last one ended; when its memory runs out it
+  gives back the upper half of the keys it holds and ends where they began
+  (`lion_range_union_evict()`); at the end of its walk its containers go to the file in key order,
+  and the next window walks the range again from there. The set reads the file a container at a
+  time and seeks it by the keys it keeps in memory, sixteen bytes a container key. Every window is
+  read after the snapshot, as the one walk always was, and the windows are disjoint ranges of TIDs,
+  so the file holds every row of the range once and none twice - the collected set's argument
+  unchanged. A union n times the memory costs about 2n walks of the range: a price for a
+  misestimate, not a plan, and bounded where it was not. EXPLAIN ANALYZE counts `Range Sources
+  Spilled`.
+
+**Flagged:** a walked OR arm by inclusion-exclusion - `|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B
+∩ Z − Y|` over R's pieces B - would answer such a leaf without its union, and is still the way to
+let the planner take one it expects to be large.
 
 EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <= 900)`), and
-EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any.
+EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any, and
+of the collected, `Range Sources Spilled`.
 
 ### Costs (lion_customscan.c)
 
@@ -10272,6 +10398,11 @@ leave out.
   directory order" - rows appended one statement at a time over several leaves with
   `summary_tids = 16`, verify and range counts at and around bucket bounds against a sequential
   scan, then the top buckets deleted, VACUUM, keys below the old top and appends again.
+- `test/sql/spill.sql` (2026-09-28): an OR's range leaf planned where its union fits and run at
+  64 kB, collected into memory and then windowed into a temporary file (`Range Sources Spilled`),
+  on a clean and a dirty heap; and an FK-side join whose fact filter is `= ANY ($1)`, planned to
+  collect at the ten values a parameter is guessed at and run with 5000, its copy spilled (`Fact
+  Filter Copies Spilled`) - each against the ordinary plan's answer.
 - `test/sql/corrupt.sql` section 4, and `test/sql/rangesum.sql`'s two-bounds case; `range.sql`,
   `distinct.sql` and `fkjoin.sql` keep their formerly declined shapes, now answered, beside a clause
   no posting set answers.

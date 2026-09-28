@@ -225,6 +225,8 @@ typedef struct LionPostingSet
 	Buffer		pinbuf;			/* INLINE: pinned bucket page, else Invalid */
 	bool		nopin;			/* INLINE, but located without its pin */
 	bool		budgeted;		/* its pin took a leaf of the list budget */
+	struct ResourceOwnerData *pinowner; /* ... charged to this owner, the
+										 * one the pin belongs to */
 	uint64		ntids;			/* entry's recorded member count (a hint) */
 	uint32		ncontainers;	/* entry's recorded ITEM count (a hint):
 								 * containers and sparse segments */
@@ -432,6 +434,28 @@ extern void lion_posting_set_release(LionPostingSet *ps);
 extern void lion_posting_set_unpin(LionPostingSet *ps);
 
 /*
+ * lion_posting_set_lookup_col() for a caller that keeps MANY single lookups
+ * located at once - the keys of a multi-key clause (DESIGN.md §17), up to
+ * LION_MAX_QUERY_KEYS of them per clause: a pin the set keeps is charged to
+ * the list pin budget of DESIGN.md §15, and a set found past that budget
+ * comes out NOPIN, exactly like a list's.  *lastpinned is the leaf the
+ * caller's previous set took (InvalidBuffer to start): another pin on it
+ * costs no buffer and is not charged.
+ */
+extern bool lion_posting_set_lookup_budgeted_col(Relation index,
+												 AttrNumber attno, Datum key,
+												 Oid keytype,
+												 LionPostingSet *ps,
+												 Buffer *lastpinned);
+
+/*
+ * How many participants the parallel plan now starting has, the leader
+ * included (DESIGN.md §27): each gets that share of the list pin budget.
+ * 1 again when the plan ends.
+ */
+extern void lion_list_pin_participants(int participants);
+
+/*
  * Everything needed to probe one key column with values of one search type:
  * DESIGN.md §21's cross-type resolution, made ONCE and shared by every path
  * that looks values up - the single and the batched lookup of lion_count.c
@@ -537,26 +561,32 @@ extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
  * intersects one fixed set of sources with many located sets in turn builds
  * once.  Nothing is checked against the visibility map or the heap, so the
  * copy may only ever be counted beside a located set that carries the §9
- * interlock.  False when it would take more than maxbytes.
+ * interlock.  False when it would take more than maxbytes - unless spill
+ * allows the copy to go on in a temporary file past them, and *spilled then
+ * says whether it did.
  */
 extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 int nsources, LionCountSource *sources,
-								 Size maxbytes, LionPostingSet *out,
+								 Size maxbytes, bool spill,
+								 LionPostingSet *out, bool *spilled,
 								 LionCountStats *stats);
 
 /*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
- * private, pinless posting set: their union, copied into memory.  Like a
+ * private, pinless posting set: their union, collected in memory.  Like a
  * collected intersection it may only ever be counted beside a located set that
- * carries the §9 interlock.  False, with nothing allocated, when the copy
- * would take more than maxbytes.  *held is what the copy takes, and *nsets
- * and *nsummaries say what the walk read.
+ * carries the §9 interlock.  False, with nothing allocated, when the union
+ * would take more than maxbytes - unless spill allows it to be built a window
+ * of container keys at a time into a temporary file, and *spilled then says
+ * whether it was.  *held is what the set takes in memory, and *nsets and
+ * *nsummaries say what the walk read.
  */
 struct LionRange;
 extern bool lion_range_collect(Relation index, AttrNumber attno,
 							   struct LionRange *range, Size maxbytes,
-							   LionPostingSet *out, Size *held, int64 *nsets,
+							   bool spill, LionPostingSet *out, Size *held,
+							   bool *spilled, int64 *nsets,
 							   int64 *nsummaries);
 
 /*
