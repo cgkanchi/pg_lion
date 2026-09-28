@@ -597,7 +597,11 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		aggregates of the target list and the HAVING; the functions of the
  *		WHERE clauses and of the FK-side join clause; and the equality
  *		functions of the GROUP BY
- *	12	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	12	List: GROUP BY coalesce(col, c) (DESIGN.md §10), or empty: the Const
+ *		c, then an OidList of the grouping equality operator and collation,
+ *		with which the entry walk recognises c's own entry.  The group
+ *		column in member 2 is col
+ *	13	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -612,7 +616,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_DISTINCT	9
 #define LION_PRIV_JOIN		10
 #define LION_PRIV_EXECUTE	11
-#define LION_PRIV_TLKINDS	12
+#define LION_PRIV_COALESCE	12
+#define LION_PRIV_TLKINDS	13
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -645,6 +650,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * joins, and the fact filters collected once), and shape 13 the sort operator
  * and collation after them (the forward semi join over a non-unique key).
  *
+ * Shape 14 added the COALESCE member (12) in front of the target-list kinds
+ * (GROUP BY coalesce(col, c), DESIGN.md §10).
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -657,8 +665,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242490d
-#define LION_PRIV_NMEMBERS	13
+#define LION_PRIV_MAGIC		0x5242490e
+#define LION_PRIV_NMEMBERS	14
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -815,6 +823,22 @@ typedef struct LionCountScanState
 	int64		distcount;
 	int64		distcolcount;
 	int64		disttests;
+
+	/*
+	 * GROUP BY coalesce(g, c) (DESIGN.md §10), when hascoal: c, and the
+	 * grouping equality and collation the entry walk recognises c's own entry
+	 * by.  The walk adds the NULL entry's count and that entry's into
+	 * coalcount instead of emitting either, and emits their one group - as c
+	 * - after the last entry of the relation; coalwalked says that has
+	 * happened, so the next call returns nothing more.
+	 */
+	bool		hascoal;
+	Const	   *coalconst;
+	Oid			coaleqop;
+	Oid			coalcoll;
+	FmgrInfo	coaleqfn;
+	int64		coalcount;
+	bool		coalwalked;
 	bool		singlegroup;	/* GROUP BY over constant columns only */
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
@@ -2184,6 +2208,68 @@ lion_agg_distinct_var(Aggref *agg, Index rti, Var **var, Oid *eqop,
 
 	*eqop = sgc->eqop;
 	*collation = exprCollation((Node *) tle->expr);
+	return true;
+}
+
+/*
+ * Is a GROUP BY expression `coalesce(col, c)` one the entry walk can group by
+ * exactly (DESIGN.md §10, "coalesce")?  Its groups are col's, except that the
+ * rows where col is NULL belong to the group of c - which is c's own group
+ * when some row has col = c, and a group of their own printed as c when none
+ * does.  lion_next_group() holds both back and emits them as one row after
+ * the last entry, so all this has to prove is that "the entry whose key is c"
+ * means exactly what the GROUP BY means by it:
+ *
+ *	- two arguments, a plain column of the relation and a non-NULL Const.
+ *	  eval_const_expressions() has already dropped NULL arguments and
+ *	  everything after the first non-NULL constant, and folded a constant
+ *	  expression into its value; anything else - a Param, a stable function,
+ *	  a second column - declines;
+ *	- no coercion anywhere: the column, the Const and the expression all of
+ *	  the column's own type, so that the grouping equality - the planner's
+ *	  SortGroupClause.eqop, which lion_collect_targets() requires to be the
+ *	  driving index's strategy 1, as for a bare column - compares c with the
+ *	  stored keys as it compares the rows.  A cast of the column (int4 to
+ *	  int8, say) makes the first argument a function call and declines, even
+ *	  where the cast would preserve equality, and so does a relabelled one;
+ *	- and the column's own collation for the expression: the index's
+ *	  collation is checked against the column's, per relation, and so the
+ *	  lookup of c is made under the very collation the GROUP BY compares
+ *	  under (`coalesce(t, 'x' COLLATE "C")` declines).
+ *
+ * The value printed for the group of c is the Const - the constant as the
+ * query wrote it, as core prints it for a group of NULL rows; for c's own
+ * group that is the value the rows hold too, because a key the target list
+ * prints is only ever produced by an index whose equality implies an
+ * identical representation (the value gate of lion_collect_targets()).
+ */
+static bool
+lion_group_coalesce(CoalesceExpr *ce, Index rti, Var **var, Const **con)
+{
+	Node	   *a0;
+	Node	   *a1;
+	Var		   *v;
+	Const	   *c;
+
+	if (list_length(ce->args) != 2)
+		return false;
+	a0 = (Node *) linitial(ce->args);
+	a1 = (Node *) lsecond(ce->args);
+	if (!IsA(a0, Var) || !IsA(a1, Const))
+		return false;
+	v = (Var *) a0;
+	c = (Const *) a1;
+	if (v->varno != (int) rti || v->varattno <= 0 || v->varlevelsup != 0)
+		return false;
+	if (c->constisnull)
+		return false;
+	if (ce->coalescetype != v->vartype || c->consttype != v->vartype)
+		return false;
+	if (ce->coalescecollid != v->varcollid)
+		return false;
+
+	*var = v;
+	*con = c;
 	return true;
 }
 
@@ -6578,6 +6664,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	base = lappend(base, lion_replaced_functions(rel,
 												 output_rel->reltarget->exprs,
 												 having, NIL, fj));
+	base = lappend(base, NIL);	/* coalesce: the fact side groups nothing */
 
 	/*
 	 * ---- may it run in a worker ----
@@ -6787,6 +6874,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	double		distest = 0;
 	List	   *uniqattnos = NIL;	/* columns of a count(DISTINCT) proved
 									 * unique: a count(col) each (§26) */
+	Const	   *groupcoal = NULL;	/* GROUP BY coalesce(col, c): c (§10) */
+	Node	   *groupexpr = NULL;	/* ... and the whole expression */
 	ListCell   *lc;
 
 	/* ---- the query as a whole ---- */
@@ -6908,7 +6997,25 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 			if (tle == NULL)
 				return;
-			expr = lion_strip((Node *) tle->expr);
+
+			/*
+			 * `GROUP BY coalesce(col, c)` is col's groups with the NULL group
+			 * relabelled c - and merged into c's own group when col has that
+			 * value (DESIGN.md §10, "coalesce").  Only that one grouping
+			 * column, and only in the plain form, where the node's entry walk
+			 * can do the merge exactly (lion_group_coalesce()).
+			 */
+			if (IsA(tle->expr, CoalesceExpr))
+			{
+				if (list_length(root->processed_groupClause) != 1 ||
+					!lion_group_coalesce((CoalesceExpr *) tle->expr, rti,
+										 &groupvar[ngroup], &groupcoal))
+					return;
+				groupexpr = (Node *) tle->expr;
+				expr = (Node *) groupvar[ngroup];
+			}
+			else
+				expr = lion_strip((Node *) tle->expr);
 			if (expr == NULL || !IsA(expr, Var))
 				return;
 			groupvar[ngroup] = (Var *) expr;
@@ -7340,6 +7447,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			return;
 		if (partitioned || ngroup > 1)
 			return;
+		/* a coalesce group is §10's walk, not the (g, k) loop of §26 */
+		if (groupcoal != NULL)
+			return;
 		for (g = 0; g < ngroup; g++)
 		{
 			if (groupattno[g] == distvar->varattno)
@@ -7357,6 +7467,16 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 			if (v->varno != (int) rti || v->varattno <= 0 ||
 				v->varlevelsup != 0)
+				return;
+
+			/*
+			 * Under GROUP BY coalesce(g, c) the group's value is the whole
+			 * expression, which the node prints, and never g by itself: a
+			 * bare g can only reach here out of a HAVING that takes the
+			 * expression apart, and the key the node holds for the merged
+			 * group is not g's value in all of its rows.
+			 */
+			if (groupcoal != NULL && v->varattno == groupattno[0])
 				return;
 
 			/*
@@ -7388,6 +7508,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			else if (!list_member_int(nullattnos, (int) v->varattno))
 				return;
 		}
+		else if (groupcoal != NULL && equal(node, groupexpr))
+		{
+			/* the coalesce group's value, printed as the node emits it */
+			groupvalueout[0] = true;
+		}
 		else if (IsA(node, Aggref))
 		{
 			Aggref	   *agg = (Aggref *) node;
@@ -7406,6 +7531,21 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				haveagg = true;
 				continue;
 			}
+
+			/*
+			 * GROUP BY coalesce(g, c) counts g's NULL rows in c's group
+			 * (DESIGN.md §10), where count(g) - or a count(DISTINCT g) proved
+			 * to be it - counts only the rest, a number the node does not
+			 * keep apart.  So it is answered only where no row it counts has
+			 * g NULL: g declared NOT NULL, or a clause of the WHERE that says
+			 * so, and then there is nothing to merge and it is the group's
+			 * count.
+			 */
+			if (groupcoal != NULL && argattno != 0 &&
+				argattno == groupattno[0] &&
+				!list_member_int(nonnullattnos, (int) argattno) &&
+				!bms_is_member(argattno, lion_notnullattnums(root, input_rel)))
+				return;
 
 			/*
 			 * count(k) of the distinct column is answered too, whatever k's
@@ -7849,12 +7989,15 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 *	  planner to a detail of how the list is located;
 	 *	- a partitioned table: each partition is ordered, but the Finalize
 	 *	  HashAggregate core puts on top destroys it (§16);
-	 *	- and a NULLABLE group column, because the reserved NULL entry sorts
+	 *	- a NULLABLE group column, because the reserved NULL entry sorts
 	 *	  FIRST and `ORDER BY col` means NULLS LAST.  A column the planner
-	 *	  knows is NOT NULL has no NULL group to emit, so the two agree.
+	 *	  knows is NOT NULL has no NULL group to emit, so the two agree;
+	 *	- and GROUP BY coalesce(col, c) (DESIGN.md §10), whose group c the
+	 *	  walk holds back and emits after the last entry, wherever c sorts.
 	 */
 	cpath->path.pathkeys = NIL;
 	if (ngroup == 1 && !partitioned && !sumall && !singlegroup &&
+		groupcoal == NULL &&
 		first->driveidx[0] != NULL &&
 		bms_is_member(groupattno[0], lion_notnullattnums(root, input_rel)) &&
 		lion_index_orders_naturally(first->driveidx[0], first->drivecol[0]))
@@ -7927,6 +8070,20 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 															having,
 															root->processed_groupClause,
 															NULL));
+
+	/*
+	 * GROUP BY coalesce(col, c) (DESIGN.md §10): c, and the grouping equality
+	 * the walk tells c's own entry by, under the grouping collation - which
+	 * lion_collect_targets() has made the driving index's strategy 1 and its
+	 * collation, per relation.
+	 */
+	cpath->custom_private =
+		lappend(cpath->custom_private,
+				(groupcoal != NULL) ?
+				list_make2(copyObject(groupcoal),
+						   list_make2_oid(groupeqop[0],
+										  groupvar[0]->varcollid)) :
+				NIL);
 	cpath->methods = &lion_count_path_methods;
 
 	/*
@@ -8398,6 +8555,18 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					elog(ERROR, "LionCount: column %d is neither grouped nor constrained",
 						 attno);
 			}
+		}
+		else if (IsA(expr, CoalesceExpr) &&
+				 (List *) list_nth(best_path->custom_private,
+								   LION_PRIV_COALESCE) != NIL)
+		{
+			/*
+			 * GROUP BY coalesce(col, c) (DESIGN.md §10): the only expression
+			 * the planner lets through is the grouping one, and the node
+			 * emits its value - the entry's key, or c for the group of the
+			 * NULL entry and c's own.
+			 */
+			kind = LION_TL_GROUPKEY;
 		}
 		else
 			elog(ERROR, "unexpected expression in LionCount target list");
@@ -8901,6 +9070,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *kinds;
 	List	   *dist;
 	List	   *join;
+	List	   *coal;
 	int			flags;
 	int			i;
 	int			k;
@@ -8934,6 +9104,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
 	dist = (List *) list_nth(cscan->custom_private, LION_PRIV_DISTINCT);
 	join = (List *) list_nth(cscan->custom_private, LION_PRIV_JOIN);
+	coal = (List *) list_nth(cscan->custom_private, LION_PRIV_COALESCE);
 	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
 
 	st->heapoid = linitial_oid(oids);
@@ -8949,6 +9120,31 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->hasrange = (flags & LION_FLAG_RANGE) != 0;
 	st->nclause = list_length(ckinds);
 	st->distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
+
+	/* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
+	st->hascoal = false;
+	st->coalcount = 0;
+	st->coalwalked = false;
+	if (coal != NIL)
+	{
+		List	   *ops;
+
+		if (list_length(coal) != 2 || !IsA(linitial(coal), Const) ||
+			!IsA(lsecond(coal), OidList) ||
+			list_length((List *) lsecond(coal)) != 2 ||
+			st->groupattno == 0 || st->groupattno2 != 0 ||
+			st->distattno != 0 || !st->hasgroupidx)
+			elog(ERROR, "LionCount: malformed coalesce group");
+		st->coalconst = (Const *) linitial(coal);
+		ops = (List *) lsecond(coal);
+		st->coaleqop = linitial_oid(ops);
+		st->coalcoll = lsecond_oid(ops);
+		if (st->coalconst->constisnull || !OidIsValid(st->coaleqop))
+			elog(ERROR, "LionCount: malformed coalesce group");
+		fmgr_info_cxt(get_opcode(st->coaleqop), &st->coaleqfn,
+					  estate->es_query_cxt);
+		st->hascoal = true;
+	}
 
 	/*
 	 * One value expression per clause, in custom_exprs (see the shape marker
@@ -11455,6 +11651,16 @@ lion_sumall_relation(LionCountScanState *st)
  * DESIGN.md §10, shared by the single-table path and by each partition of a
  * partitioned one (§16), which is why nothing here knows about partitions:
  * the caller has opened one relation and located its WHERE clauses.
+ *
+ * GROUP BY coalesce(g, c) (st->hascoal, DESIGN.md §10) takes two entries out
+ * of the stream: the NULL entry, whose rows are c's group, and the entry whose
+ * key the grouping equality finds equal to c, if the walk meets one.  Their
+ * counts are added up in coalcount and the one group they make is emitted,
+ * with the value c, after the last entry - wherever the two came in the walk,
+ * and whichever of them exists.  An entry of c that VACUUM removes before the
+ * walk reaches it held no row this snapshot sees, so the group is the same
+ * without it; a key equal to c inserted meanwhile holds none either.  The
+ * classes of one index are disjoint, so no other entry can equal c.
  */
 static TupleTableSlot *
 lion_next_group(LionCountScanState *st, bool *exhausted)
@@ -11480,9 +11686,24 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
-		if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
+		if (st->coalwalked ||
+			!lion_entry_scan_next(&st->escan, &key, &st->groupset))
 		{
 			MemoryContextSwitchTo(oldcxt);
+
+			/*
+			 * The group of c, once: a HAVING that rejects it sends the caller
+			 * back here, and the walk is not asked for another entry after
+			 * it has run out.
+			 */
+			if (st->hascoal && !st->coalwalked)
+			{
+				st->coalwalked = true;
+				if (st->coalcount > 0)
+					return lion_emit_tuple(st, st->coalconst->constvalue,
+										   false, (Datum) 0, true,
+										   st->coalcount);
+			}
 			*exhausted = true;
 			return NULL;
 		}
@@ -11490,6 +11711,16 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		count = lion_node_count(st, st->nsource, st->sources, false);
 		keyisnull = st->groupset.keyisnull;
 		lion_posting_set_release(&st->groupset);
+
+		if (st->hascoal &&
+			(keyisnull ||
+			 DatumGetBool(FunctionCall2Coll(&st->coaleqfn, st->coalcoll, key,
+											st->coalconst->constvalue))))
+		{
+			st->coalcount += count;
+			MemoryContextSwitchTo(oldcxt);
+			continue;
+		}
 		MemoryContextSwitchTo(oldcxt);
 
 		/* A group exists only if at least one of its rows is visible. */
@@ -12463,6 +12694,9 @@ lion_next_partial_group(LionCountScanState *st)
 											st->groupidxcol,
 											st->hasrange ? &st->range : NULL);
 				st->scanning = true;
+				/* each partition's group of c is its own partial row */
+				st->coalcount = 0;
+				st->coalwalked = false;
 			}
 		}
 
@@ -12727,6 +12961,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
 									st->hasrange ? &st->range : NULL);
 		st->scanning = true;
+		st->coalcount = 0;
+		st->coalwalked = false;
 	}
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
@@ -12765,6 +13001,8 @@ lion_reset_run(LionCountScanState *st)
 	lion_posting_set_release(&st->groupset2);
 	st->outeropen = false;
 	st->inneridx = 0;
+	st->coalcount = 0;
+	st->coalwalked = false;
 	lion_release_where(st);
 
 	/* The FK-side join's collected filters (in outercxt, reset below). */
@@ -13372,7 +13610,26 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			ExplainPropertyText("Fact Filters", "collected once", es);
 	}
 
-	if (st->hasgroupidx && st->groupattno != 0)
+	if (st->hasgroupidx && st->groupattno != 0 && st->hascoal)
+	{
+		/*
+		 * GROUP BY coalesce(g, c) (DESIGN.md §10), printed as core prints the
+		 * expression, with c deparsed like a clause value.
+		 */
+		List	   *context = set_deparse_context_plan(es->deparse_cxt,
+													   st->css.ss.ps.plan,
+													   ancestors);
+		char	   *val = deparse_expression((Node *) st->coalconst, context,
+											 false, false);
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "COALESCE(%s, %s)",
+						 get_attname(st->heapoid, st->groupattno, false), val);
+		ExplainPropertyText("Group Key", buf.data, es);
+		pfree(buf.data);
+		pfree(val);
+	}
+	else if (st->hasgroupidx && st->groupattno != 0)
 	{
 		initStringInfo(&buf);
 		appendStringInfoString(&buf,

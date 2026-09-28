@@ -1502,6 +1502,62 @@ Planner integration
     between two indexes. A grouped column
     may also appear in the WHERE clause (then it is a single group). §14 removed the `attnotnull`
     requirement: the NULL group comes out of the reserved NULL entry.
+  - **`GROUP BY coalesce(col, c)`** (2026-09-28, from a benchmark). A report that labels the rows
+    with no value writes the group as `coalesce(col, c)`, and only a bare column used to be
+    accepted. Its groups are col's with ONE change, which is where an inexact answer would come
+    from: the rows where col is NULL are counted in the group of c - a group of their own, printed
+    as c, when no row has col = c, and MERGED into that key's group when one does, so that the key
+    is emitted once with the two counts added. The node does exactly that. `lion_next_group()`
+    walks col's entries as for `GROUP BY col` and takes two of them out of the stream: the reserved
+    NULL entry, and the entry whose key the grouping equality finds equal to c (the equality
+    operator's function called on each key under the grouping collation, one call per entry).
+    Their counts are added up instead of emitted, and the one group they make comes out as c after
+    the last entry, when it has a visible row. That is exact whatever order the two come in and
+    whichever of them exists: the classes of one index are disjoint, so no second entry can equal
+    c; an entry of c that VACUUM deletes before the walk reaches it held no row the snapshot sees
+    (§18), and one inserted meanwhile holds none either, so the group is the same without it; and
+    the decision is made in the walk itself, never by a lookup of c at another moment. The value
+    printed for that group is the Const - the constant as the query wrote it, which is what core
+    prints for NULL rows - and for c's own group it is the value those rows hold as well, because
+    a key the target list prints is only produced by an index whose equality implies an identical
+    representation (the value gate below). What `lion_group_coalesce()` requires, and why:
+    - exactly one GROUP BY expression, `coalesce(col, c)` as `eval_const_expressions()` leaves it:
+      a plain column of the relation and a non-NULL Const (NULL arguments and everything after
+      the first non-NULL constant are gone by then, and a constant expression is folded). A
+      Param - `coalesce(col, $1)` under a generic plan - another column or a stable function is
+      declined; so is anything wrapped around the expression;
+    - no coercion: the column, the Const and the expression all of the column's own type, so that
+      the grouping equality (`SortGroupClause.eqop`, which the next rule makes the driving index's
+      strategy 1, as for a bare column) compares c with the stored keys as it compares the rows. A
+      cast of the column - `coalesce(i4::int8, 0)` - is a function call and declines, even where
+      it would keep equality, and a relabelled one declines too; the constant is coerced to the
+      column's type by the parser, which is what a written `coalesce(col, 0)` is;
+    - the expression's collation the column's, which the driving index's collation has to match
+      per relation as for a bare column, so that c is compared under the collation the GROUP BY
+      groups under (`coalesce(t, 'x' COLLATE "C")` over a default-collation index declines).
+
+    The target list and the HAVING may use the expression itself, which the node prints as the
+    group key, and the counts; not the bare column (a HAVING that takes the expression apart) and
+    no other expression over it. `count(col)` of the coalesced column is the one count the merge
+    changes - in the merged group it is c's rows alone - so it, and a `count(DISTINCT col)` proved
+    to be it (§26), is answered only where no counted row has col NULL: col declared NOT NULL, or a
+    clause of the WHERE that says so, and then nothing is merged. `count(DISTINCT k)` of §26 beside
+    it and a second GROUP BY column decline. An IN list on col drives the groups as in §15 and
+    never meets the NULL entry, and neither does a range on col (§28) or `col IS NOT NULL`. The
+    path claims no pathkeys - the group of c comes last, wherever c sorts - so an `ORDER BY` puts
+    a Sort above the node. A partitioned table is §16's shape unchanged: each partition emits its
+    own partial group of c, and the Finalize Aggregate adds the partitions' groups of c up like
+    any other key's. EXPLAIN prints `Group Key: COALESCE(g, 0)`. The constant travels in the new
+    `LION_PRIV_COALESCE` member of `custom_private` with the equality and its collation (shape 14).
+    `test/sql/group_coalesce.sql` compares each form against a sequential scan: a constant that is
+    a key and one that is not, for int, text and boolean columns, no NULL rows (a NOT NULL column,
+    `IS NOT NULL`, an IN list, a range), only NULL rows, a key the WHERE leaves no row of beside
+    NULL rows that it does, HAVING that keeps or drops the merged group alone, parameters, a
+    LATERAL rescan, a dirty heap in which c's key has lost every row, after VACUUM has deleted that
+    entry, a partitioned table whose NULLs and whose c rows are in different partitions, and the
+    declines. Not done: another spelling of the same grouping (`CASE WHEN col IS NULL THEN c ELSE
+    col END`), and a c known only at run time, which the node could evaluate once per scan like a
+    clause value (§10) but does not.
   - **The driving index's equality is the grouping equality** (2026-09-20 review, finding 3). An
     index's entries are the classes of
     strategy 1 of ITS opfamily on its own key type, and an operator class is free to define a
