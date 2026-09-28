@@ -3096,6 +3096,345 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 		(spc_random_page_cost - spc_seq_page_cost) * seqness;
 }
 
+/*
+ * ONE CLAUSE'S POSTING SETS, as the cost model prices them wherever they are
+ * ANDed (DESIGN.md §22; §29.11, "One price for the AND of sets"): a WHERE
+ * source of the count pushdown, and a qual a lion index scan answers.  The
+ * same clause is located, read and sought the same way by both, so both take
+ * these terms from here - lion_cost_count_rel() clause by clause, and
+ * lion_cost_set_and() for a plain AND.  What the caller decides is how the
+ * terms combine: whether the sets are read whole (an IN list's union, an OR's
+ * leaf) or only sought, which source drives the leapfrog, and how often the
+ * others are sought.
+ *
+ *	sel			the clause's own selectivity
+ *	nkeys		the sets it locates: an IN list's values, 1 otherwise (a
+ *				multi-key query is priced as one set, as it always was)
+ *	members		its rows, every set of it together
+ *	containers	the containers they lie in (lion_key_containers()), a list's
+ *				counted set by set
+ *	pages		the posting pages a WALK of its sets reads
+ *	leaves		... of ONE of its sets, and that set's posting tree's height
+ *	idxpages	the index's pages, which lion_heap_page_cost() prices its reads
+ *				against
+ *	randompages	directory leaves read at random_page_cost: one for a lookup
+ *	lookuppages	an IN list's directory leaves, read in key order ...
+ *	lookup		... and what they cost
+ *	descent		the lookups' comparisons, LION_DESCENT_COST a level
+ *	readall		reading every container of its sets, for a union or a sum
+ *	unionops	the k-way union of an IN list's sets, in cpu_operator_cost
+ */
+typedef struct LionSetClause
+{
+	double		sel;
+	double		nkeys;
+	double		members;
+	double		containers;
+	double		pages;
+	double		leaves;
+	double		height;
+	double		idxpages;
+	double		randompages;
+	double		lookuppages;
+	Cost		lookup;
+	Cost		descent;
+	Cost		readall;
+	double		unionops;
+} LionSetClause;
+
+static void
+lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					 AttrNumber col, Node *clause, LionSetClause *sc)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	Node	   *bare = IsA(clause, RestrictInfo) ?
+		(Node *) ((RestrictInfo *) clause)->clause : clause;
+	double		share;
+	double		dirpages;
+	double		height = 0;
+	double		container_pages;
+	double		nkeys = 1.0;
+	double		sel;
+
+	memset(sc, 0, sizeof(*sc));
+	sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+	sc->sel = sel;
+
+	/*
+	 * The page terms belong to ONE KEY COLUMN of this index (DESIGN.md §24):
+	 * the directory it descends is its own share of the relation's, and so
+	 * are the container pages its chains lie on.  The DEPTH is not scaled -
+	 * the descent passes through the upper levels the columns share - and
+	 * neither is the index's own size below, which is what the caching
+	 * argument of lion_heap_page_cost() is about and is a property of the
+	 * relation.
+	 */
+	share = lion_index_column_share(root, rel, idx, col);
+	dirpages = lion_index_dir_pages(idx, &height);
+
+	container_pages = ((double) idx->pages - 1.0 - dirpages) *
+		lion_index_column_posting_share(root, rel, idx, col);
+	container_pages = Max(container_pages, 0.0);
+	dirpages = Max(dirpages * share, 1.0);
+
+	/*
+	 * An IN list costs one lookup per element (DESIGN.md §15).  Each of them
+	 * lands on a directory leaf of its own - at most one per leaf, so a list
+	 * longer than the column has leaves shares them - walks a chain of its
+	 * own, whose pages are its share of the container pages but never fewer
+	 * than one, and contributes a sub-cursor of its own to the union the
+	 * merge evaluates.  A union of k sets merges the members of all of them,
+	 * which costs log2(k) comparisons per member however the merge is
+	 * organised, and that is the term that makes a long list lose: at one
+	 * million rows a thousand-element list took 15 ms against the B-tree
+	 * index-only scan's 3.1 ms and was chosen anyway, because every element
+	 * was priced as one bucket page (the 2026-09-21 follow-up review).  A
+	 * single-key clause has k = 1 and pays nothing for a merge it does not
+	 * make.
+	 */
+	if (IsA(bare, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) bare;
+
+#if PG_VERSION_NUM >= 170000
+		nkeys = Max(estimate_array_length(root, (Node *) lsecond(saop->args)),
+					1.0);
+#else
+		nkeys = Max(estimate_array_length((Node *) lsecond(saop->args)), 1.0);
+#endif
+	}
+
+	if (nkeys > 1.0)
+	{
+		/*
+		 * A list's lookups are NOT a sequence of random reads.
+		 * lion_posting_set_lookup_many() sorts the values into the directory
+		 * order and walks the leaves left to right (DESIGN.md §21), so the
+		 * same argument lion_heap_page_cost() makes about a recheck's heap
+		 * pages applies to them, and more strongly than it did to the hash
+		 * directory this replaced: a set of pages that is dense in the index,
+		 * or that fits in the cache, is read at something near seq_page_cost.
+		 * Charging a thousand-element list five hundred RANDOM reads of a
+		 * one-megabyte index is what kept the node from being chosen for a
+		 * query it answers in 2.9 ms against the B-tree index-only scan's
+		 * 3.7.
+		 *
+		 * The chain is capped at the container pages the index has: a list
+		 * cannot read more of them than exist, and an index whose entries are
+		 * all INLINE (which is what a high-cardinality column looks like since
+		 * DESIGN.md §13) has none to read at all - its payloads are on the
+		 * leaves already charged.
+		 */
+		double		idx_pages = Max((double) idx->pages, 1.0);
+
+		sc->lookuppages = Min(nkeys, dirpages);
+		sc->lookup = sc->lookuppages *
+			lion_heap_page_cost(root, rel, sc->lookuppages, idx_pages);
+
+		/*
+		 * ... and each value's search: a binary search of its leaf, and the
+		 * levels above it too where the values are too sparse for the walk to
+		 * step from one to the next (a descent each, §21).  Free before
+		 * 2026-09-27, which chose a thousand-value list over a near-unique
+		 * column at 7.6 ms against the btree index-only scan's 1.8.
+		 */
+		sc->descent = nkeys * LION_DESCENT_COST *
+			(1.0 + height * Min(1.0, dirpages / nkeys));
+		sc->pages = Min(Max(nkeys, container_pages * sel), container_pages);
+	}
+	else
+	{
+		/*
+		 * One descent.  Only the LEAF is charged as a page read: the root and
+		 * the internal pages above it are a handful of blocks that every
+		 * lookup touches, so they stay in cache, which is exactly the argument
+		 * btcostestimate() makes about a btree's upper levels.  What the
+		 * descent does cost is the comparisons, one page's worth per level.
+		 */
+		sc->randompages = 1.0;
+		sc->descent = (height + 1.0) * LION_DESCENT_COST;
+		sc->pages = Max(1.0, container_pages * sel);
+	}
+
+	/*
+	 * What a walk of this clause's sets would read; how much of it is really
+	 * read depends on whether it drives the leapfrog join, which is the
+	 * caller's to say (lion_cost_set_pages()).  One of its sets - a list has
+	 * nkeys of them - occupies this many container pages, and its posting
+	 * tree is that tall.
+	 */
+	sc->nkeys = nkeys;
+	sc->leaves = Max(sc->pages / nkeys, 1.0);
+	sc->height = lion_posting_height(sc->leaves);
+	sc->idxpages = Max((double) idx->pages, 1.0);
+
+	/*
+	 * Its rows lie in this many containers, and reading every one of them -
+	 * what a union is built of (§15, §19), or a sum adds up - costs the
+	 * merge's price of a container the driver reads (lion_merge_cpu_cost()).
+	 */
+	sc->members = tuples * sel;
+	sc->containers = nkeys * lion_key_containers(root, rel, idx, col,
+												 tuples * sel / nkeys);
+	sc->readall = sc->containers *
+		(LION_CONTAINER_COST +
+		 LION_MEMBER_COST * Min(sc->members / sc->containers, LION_MEMBER_CAP));
+	if (nkeys > 1.0)
+		sc->unionops = lion_merge_ops(heap_pages, sc->members, nkeys);
+}
+
+/*
+ * The directory leaves the single-key lookups of an AND read (DESIGN.md
+ * §29.11, "One price for the AND of sets"): one a lookup, at
+ * random_page_cost (lion_cost_set_clause()), but no more of one index than
+ * its directory has - two lookups into a directory of one leaf read that
+ * leaf once, and the second is a buffer hit.  An index is asked as often as
+ * the AND has clauses on it: of its columns, or several of one column.
+ */
+static double
+lion_cost_leaf_pages(int n, IndexOptInfo **idxs, const LionSetClause *sc)
+{
+	double		pages = 0;
+	int			i;
+	int			j;
+
+	for (i = 0; i < n; i++)
+	{
+		double		lookups = 0;
+		bool		seen = false;
+
+		if (idxs[i] == NULL || sc[i].randompages <= 0.0)
+			continue;
+		for (j = 0; j < i && !seen; j++)
+			seen = (idxs[j] != NULL && sc[j].randompages > 0.0 &&
+					idxs[j]->indexoid == idxs[i]->indexoid);
+		if (seen)
+			continue;			/* counted with the first lookup of its index */
+		for (j = i; j < n; j++)
+		{
+			if (idxs[j] != NULL && idxs[j]->indexoid == idxs[i]->indexoid)
+				lookups += sc[j].randompages;
+		}
+		pages += Min(lookups, lion_index_dir_pages(idxs[i], NULL));
+	}
+	return pages;
+}
+
+/*
+ * What a clause's sets read of their posting trees in the AND (DESIGN.md
+ * §22): the DRIVER - the source with the fewest members - walks its sets end
+ * to end, and pays for its whole share of the index's container pages, in
+ * order (added to *seqpages); every other source is SOUGHT to the container
+ * keys the driver produces, `probes` times, and pays for the pages those
+ * probes touch (lion_probed_pages()), never for more than a walk of it would
+ * have cost, priced as lion_heap_page_cost() prices a read of them (added to
+ * *probedpages; the price is returned).
+ */
+static Cost
+lion_cost_set_pages(PlannerInfo *root, RelOptInfo *rel,
+					const LionSetClause *sc, bool walked, double probes,
+					double *seqpages, double *probedpages)
+{
+	double		pages = sc->pages;
+
+	if (pages <= 0.0)
+		return 0.0;
+	if (walked)
+	{
+		*seqpages += pages;
+		return 0.0;
+	}
+	pages = Min(pages, sc->nkeys * lion_probed_pages(sc->leaves, probes,
+													 sc->height));
+	*probedpages += pages;
+	return pages * lion_heap_page_cost(root, rel, pages, sc->idxpages);
+}
+
+/*
+ * THE AND OF POSTING SETS (DESIGN.md §29.11, "One price for the AND of
+ * sets"): what locating the sets of n clauses on rel's lion indexes, building
+ * the unions of the IN lists among them and intersecting them costs.  It is
+ * the price lion_cost_count_rel() charges an ungrouped count for the same
+ * WHERE sources, term for term and from the same functions - the lookups (a
+ * directory leaf at random_page_cost and a descent each; an IN list's leaves
+ * in key order), the unions (every container of a list's sets read, and
+ * their k-way merge), the AND (lion_merge_cpu_cost(): the smallest source
+ * drives, the others are sought at its keys) and the posting pages (the
+ * driver's walked in order, the others' as far as the seeks reach) - and the
+ * one lioncostestimate() charges a scan that ANDs the same sets.  Only the
+ * index's work: the heap, and what a count does in its place, are each
+ * path's own.
+ *
+ * The parts come back in *out, so that a caller that repeats the AND - a
+ * nested loop's inner scan - can amortize its pages over the repetitions.
+ */
+Cost
+lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
+				  IndexOptInfo **idxs, const AttrNumber *cols, Node **clauses,
+				  LionAndCost *out)
+{
+	LionSetClause *sc;
+	double	   *members;
+	double	   *containers;
+	double	   *probes;
+	double		ckeys = Max((double) rel->pages / LION_BLOCKS_PER_CONTAINER,
+							1.0);
+	double		seqpages = 0;
+	double		probedpages = 0;
+	double		randompages = 0;
+	Cost		probed = 0;
+	Cost		lookup = 0;
+	int			driver = -1;
+	int			i;
+
+	memset(out, 0, sizeof(*out));
+	if (n <= 0)
+		return 0.0;
+
+	sc = (LionSetClause *) palloc(sizeof(LionSetClause) * n);
+	members = (double *) palloc(sizeof(double) * n);
+	containers = (double *) palloc(sizeof(double) * n);
+	probes = (double *) palloc0(sizeof(double) * n);
+
+	for (i = 0; i < n; i++)
+	{
+		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], &sc[i]);
+
+		lookup += sc[i].lookup;
+		out->leafpages += sc[i].lookuppages;
+		out->cpu += sc[i].descent;
+		if (sc[i].nkeys > 1.0)
+			out->cpu += sc[i].readall + sc[i].unionops * cpu_operator_cost;
+
+		members[i] = sc[i].members;
+		containers[i] = Min(sc[i].containers, ckeys);
+		if (driver < 0 || members[i] < members[driver])
+			driver = i;
+	}
+
+	randompages = lion_cost_leaf_pages(n, idxs, sc);
+	out->leafpages += randompages;
+	out->cpu += lion_merge_cpu_cost(n, members, containers, NULL,
+									Max(rel->tuples, 1.0), probes);
+
+	for (i = 0; i < n; i++)
+		probed += lion_cost_set_pages(root, rel, &sc[i], i == driver,
+									  probes[i], &seqpages, &probedpages);
+
+	out->nsrc = n;
+	out->leafcost = randompages * random_page_cost + lookup;
+	out->setpages = seqpages + probedpages;
+	out->setcost = seqpages * seq_page_cost + probed;
+
+	pfree(sc);
+	pfree(members);
+	pfree(containers);
+	pfree(probes);
+
+	return out->leafcost + out->setcost + out->cpu;
+}
+
 static bool *lion_or_leaf_map(List *ors, int nclause);
 static int *lion_or_group_map(List *ors, int nclause);
 static Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
@@ -3715,7 +4054,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		dirty_pages;
 	double		matching = Max(lion_probe_rel_rows(root, rel), 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
-	double		random_pages = 0;	/* directory leaves, one per lookup */
+	double		random_pages = 0;	/* directory leaves, one a lookup (§29.11) */
 	Cost		descent_cost = 0;	/* comparisons on the way down (§21) */
 	double		seq_pages = 0;	/* container chains, read in order */
 	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
@@ -3726,12 +4065,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		merge_ops = 0;	/* comparisons a union of k sets makes */
 	double		recheck_tids;
 	double		recheck_pages;
+	double		probed_pages = 0;	/* the pages the sought sources read */
 	double	   *clausesel;		/* each clause's own selectivity, for §19 */
-	double	   *clausepages;	/* what a WALK of its sets would read */
-	double	   *clauseleaves;	/* leaves of ONE of its sets */
-	double	   *clauseheight;	/* how tall that set's posting tree is */
-	double	   *clausekeys;		/* how many sets it looks up */
-	double	   *clauseidx;		/* the pages of the index it reads */
+	LionSetClause *clauseset;	/* its sets as the AND prices them (§22) */
+	IndexOptInfo **clauseindex; /* ... in this index, for its lookup */
 	int		   *clausesrc;		/* the AND source it is part of, or -1 */
 	double	   *srcmembers;		/* members of each AND source */
 	double	   *srccontainers;	/* and the containers they lie in */
@@ -3787,11 +4124,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 								&sumshort, &groupdrive);
 
 	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	clausepages = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	clauseleaves = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	clauseheight = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	clausekeys = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	clauseidx = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	clauseset = (LionSetClause *) palloc0(sizeof(LionSetClause) *
+										  Max(nclause, 1));
+	clauseindex = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) *
+											Max(nclause, 1));
 	clausesrc = (int *) palloc0(sizeof(int) * Max(nclause, 1));
 	srcmembers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 	srccontainers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
@@ -3817,12 +4153,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
+		LionSetClause *sc = &clauseset[ci];
 		Selectivity sel;
-		double		share;
-		double		dirpages;
-		double		height = 0;
-		double		container_pages;
-		double		nkeys = 1.0;
+		double		nkeys;
 
 		if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
 		{
@@ -3862,9 +4195,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 													(AttrNumber) lfirst_int(lc4),
 													sel, Max(ingroups, 1.0),
 													orgrp[ci - 1] >= 0);
-			clausekeys[ci - 1] = 1.0;
-			clauseleaves[ci - 1] = 1.0;
-			clauseidx[ci - 1] = Max((double) idx->pages, 1.0);
+			sc->nkeys = 1.0;
+			sc->leaves = 1.0;
+			sc->idxpages = Max((double) idx->pages, 1.0);
 
 			/*
 			 * As one set of the AND, it drives the merge or is probed at the
@@ -3885,179 +4218,65 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			continue;
 		}
 
-		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		/*
+		 * The clause's sets, priced as every AND of them is priced
+		 * (lion_cost_set_clause()): its lookups - a directory leaf and a
+		 * descent, or an IN list's leaves in key order and a search per value
+		 * - are charged here, and what a walk of them reads once the driver
+		 * is known, below.
+		 */
+		lion_cost_set_clause(root, rel, idx, (AttrNumber) lfirst_int(lc4),
+							 clause, sc);
+		sel = sc->sel;
+		nkeys = sc->nkeys;
+		clauseindex[ci] = idx;
 		clausesel[ci++] = sel;
+		lookup_cost += sc->lookup;
+		descent_cost += sc->descent;
 
 		/*
-		 * The page terms belong to ONE KEY COLUMN of this index (DESIGN.md
-		 * §24): the directory it descends is its own share of the relation's,
-		 * and so are the container pages its chains lie on.  The DEPTH is not
-		 * scaled - the descent passes through the upper levels the columns
-		 * share - and neither is the index's own size below, which is what the
-		 * caching argument of lion_heap_page_cost() is about and is a property
-		 * of the relation.
+		 * A single set ANDed with the others is read only where it drives the
+		 * merge, and PROBED at the driver's container keys elsewhere
+		 * (DESIGN.md §22), which lion_merge_cpu_cost() prices below.  The
+		 * containers of an OR leaf and of an IN list's sets are all READ: a
+		 * union is built of them (§15, §19) or they are summed.  A list that
+		 * drives the groups is read one entry a group, below.
 		 */
-		share = lion_index_column_share(root, rel, idx,
-										(AttrNumber) lfirst_int(lc4));
-		dirpages = lion_index_dir_pages(idx, &height);
-
-		container_pages = ((double) idx->pages - 1.0 - dirpages) *
-			lion_index_column_posting_share(root, rel, idx,
-											(AttrNumber) lfirst_int(lc4));
-		container_pages = Max(container_pages, 0.0);
-		dirpages = Max(dirpages * share, 1.0);
+		if (!(groupdrive && ci - 1 == inlistci) &&
+			(orgrp[ci - 1] >= 0 || nkeys > 1.0))
+			read_cpu += sc->readall;
 
 		/*
-		 * An IN list costs one lookup per element (DESIGN.md §15).  Each of
-		 * them hashes to a bucket page of its own - at most one per bucket,
-		 * so a list longer than the index has buckets shares them - walks a
-		 * chain of its own, whose pages are its share of the container pages
-		 * but never fewer than one, and contributes a sub-cursor of its own
-		 * to the union the merge evaluates.  A union of k sets merges the
-		 * members of all of them, which costs log2(k) comparisons per member
-		 * however the merge is organised, and that is the term that makes a
-		 * long list lose: at one million rows a thousand-element list took
-		 * 15 ms against the B-tree index-only scan's 3.1 ms and was chosen
-		 * anyway, because every element was priced as one bucket page (the
-		 * 2026-09-21 follow-up review).  A single-key clause has k = 1 and
-		 * pays nothing for a merge it does not make.
-		 *
-		 * ... unless there is no union to build.  When the list is the only
-		 * positive source, or when it drives the groups, the entries are
-		 * counted one at a time and added up (the disjoint-sum short-circuit,
-		 * DESIGN.md §15): what is left is the per-element lookup and the
-		 * per-element container work, both already priced above, and nothing
-		 * at all for a merge that does not happen.  Dropping the term is what
-		 * lets a thousand-value list on a high-cardinality column be chosen
-		 * again, which it should be: 1.5 ms against the B-tree's 4.5 at one
-		 * million rows.
+		 * Which source of the AND this clause belongs to: the union of its OR
+		 * restriction, or one of its own.  A list that drives the groups is
+		 * not a source at all - each group IS one of its entries - so it
+		 * neither drives the leapfrog nor is sought by it.
 		 */
-		if (IsA(clause, ScalarArrayOpExpr))
-		{
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
-
-#if PG_VERSION_NUM >= 170000
-			nkeys = Max(estimate_array_length(root,
-											  (Node *) lsecond(saop->args)),
-						1.0);
-#else
-			nkeys = Max(estimate_array_length((Node *) lsecond(saop->args)),
-						1.0);
-#endif
-		}
-
-		if (nkeys > 1.0)
-		{
-			/*
-			 * A list's lookups are NOT a sequence of random reads.
-			 * lion_posting_set_lookup_many() sorts the values into the
-			 * directory order and walks the leaves left to right (DESIGN.md
-			 * §21), so the same argument lion_heap_page_cost() makes about a
-			 * recheck's heap pages applies to them, and more strongly than it
-			 * did to the hash directory this replaced: a set of pages that is
-			 * dense in the index, or that fits in the cache, is read at
-			 * something near seq_page_cost.  Charging a thousand-element list
-			 * five hundred RANDOM reads of a one-megabyte index is what kept
-			 * the node from being chosen for a query it answers in 2.9 ms
-			 * against the B-tree index-only scan's 3.7.
-			 *
-			 * The chain is capped at the container pages the index has: a
-			 * list cannot read more of them than exist, and an index whose
-			 * entries are all INLINE (which is what a high-cardinality column
-			 * looks like since DESIGN.md §13) has none to read at all - its
-			 * payloads are on the leaves already charged.
-			 */
-			double		lookups = Min(nkeys, dirpages);
-			double		idx_pages = Max((double) idx->pages, 1.0);
-
-			lookup_cost += lookups *
-				lion_heap_page_cost(root, rel, lookups, idx_pages);
-
-			/*
-			 * ... and each value's search: a binary search of its leaf, and
-			 * the levels above it too where the values are too sparse for the
-			 * walk to step from one to the next (a descent each, §21).  Free
-			 * before 2026-09-27, which chose a thousand-value list over a
-			 * near-unique column at 7.6 ms against the btree index-only scan's
-			 * 1.8.
-			 */
-			descent_cost += nkeys * LION_DESCENT_COST *
-				(1.0 + height * Min(1.0, dirpages / nkeys));
-			clausepages[ci - 1] = Min(Max(nkeys, container_pages * sel),
-									  container_pages);
-		}
+		if (groupdrive && ci - 1 == inlistci)
+			clausesrc[ci - 1] = -1;
 		else
 		{
-			/*
-			 * One descent.  Only the LEAF is charged as a page read: the root
-			 * and the internal pages above it are a handful of blocks that
-			 * every lookup touches, so they stay in cache, which is exactly
-			 * the argument btcostestimate() makes about a btree's upper
-			 * levels.  What the descent does cost is the comparisons, one
-			 * page's worth per level.
-			 */
-			random_pages += 1.0;
-			descent_cost += (height + 1.0) * LION_DESCENT_COST;
-			clausepages[ci - 1] = Max(1.0, container_pages * sel);
+			clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
+			srcmembers[clausesrc[ci - 1]] += sc->members;
+			srccontainers[clausesrc[ci - 1]] += sc->containers;
+			srcsets[clausesrc[ci - 1]] += nkeys;
+			if (orgrp[ci - 1] >= 0 || nkeys > 1.0)
+				srcunion[clausesrc[ci - 1]] = true;
 		}
 
 		/*
-		 * What a walk of this clause's sets would read is on the books; how
-		 * much of it is really read depends on whether its source drives the
-		 * leapfrog join, which is not known until every clause has been seen
-		 * (the page terms are charged below).  One of its sets - a list has
-		 * nkeys of them - occupies this many container pages, and its posting
-		 * tree is that tall.
-		 */
-		clauseleaves[ci - 1] = Max(clausepages[ci - 1] / nkeys, 1.0);
-		clauseheight[ci - 1] = lion_posting_height(clauseleaves[ci - 1]);
-		clausekeys[ci - 1] = nkeys;
-		clauseidx[ci - 1] = Max((double) idx->pages, 1.0);
-
-		{
-			double		clc = nkeys * lion_key_containers(root, rel, idx,
-														  (AttrNumber) lfirst_int(lc4),
-														  tuples * sel / nkeys);
-
-			/*
-			 * A single set ANDed with the others is read only where it drives
-			 * the merge, and PROBED at the driver's container keys elsewhere
-			 * (DESIGN.md §22), which lion_merge_cpu_cost() prices below.  The
-			 * containers of an OR leaf and of an IN list's sets are all READ:
-			 * a union is built of them (§15, §19) or they are summed.  A list
-			 * that drives the groups is read one entry a group, below.
-			 */
-			if (!(groupdrive && ci - 1 == inlistci) &&
-				(orgrp[ci - 1] >= 0 || nkeys > 1.0))
-				read_cpu += clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
-								   Min(tuples * sel / clc, LION_MEMBER_CAP));
-
-			/*
-			 * Which source of the AND this clause belongs to: the union of its
-			 * OR restriction, or one of its own.  A list that drives the groups
-			 * is not a source at all - each group IS one of its entries - so it
-			 * neither drives the leapfrog nor is sought by it.
-			 */
-			if (groupdrive && ci - 1 == inlistci)
-				clausesrc[ci - 1] = -1;
-			else
-			{
-				clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
-				srcmembers[clausesrc[ci - 1]] += tuples * sel;
-				srccontainers[clausesrc[ci - 1]] += clc;
-				srcsets[clausesrc[ci - 1]] += nkeys;
-				if (orgrp[ci - 1] >= 0 || nkeys > 1.0)
-					srcunion[clausesrc[ci - 1]] = true;
-			}
-		}
-
-		/*
-		 * Does the merge build this clause's union?  A list that drives the
-		 * groups is not a source at all, and a list that is the only positive
-		 * source is SUMMED instead - but only while the sum is the cheaper of
-		 * the two, which is lion_sum_is_cheaper() in the executor and the same
-		 * test from estimates here: dense entries, enough of them for the
-		 * merge's bitset image, and the merge runs after all.
+		 * Does the merge build this clause's union?  ... unless there is no
+		 * union to build.  A list that drives the groups is not a source at
+		 * all, and a list that is the only positive source is SUMMED instead
+		 * - its entries counted one at a time and added up (the disjoint-sum
+		 * short-circuit, DESIGN.md §15), which leaves the per-element lookup
+		 * and container work priced above and nothing for a merge that does
+		 * not happen: what lets a thousand-value list on a high-cardinality
+		 * column be chosen, 1.5 ms against the B-tree's 4.5 at one million
+		 * rows.  But only while the sum is the cheaper of the two, which is
+		 * lion_sum_is_cheaper() in the executor and the same test from
+		 * estimates here: dense entries, enough of them for the merge's
+		 * bitset image, and the merge runs after all.
 		 */
 		if (nkeys > 1.0)
 		{
@@ -4071,7 +4290,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 						  (double) LION_SUM_MAX_DENSITY);
 
 			if (merged)
-				merge_ops += lion_merge_ops(heap_pages, tuples * sel, nkeys);
+				merge_ops += sc->unionops;
 		}
 
 		/*
@@ -4319,31 +4538,25 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		pfree(inmem);
 	}
 
+	/*
+	 * Walked: the driver, a group's own list, and what a range's entries are
+	 * ANDed with; everything else sought (lion_cost_set_pages()).  A negated
+	 * clause has nothing to read.  The single-key lookups' directory leaves,
+	 * one a lookup and no more of an index than it has (lion_cost_leaf_pages()).
+	 */
 	for (i = 0; i < nclause; i++)
 	{
-		double		pages = clausepages[i];
+		bool		walk = (clausesrc[i] < 0 || clausesrc[i] == driver ||
+							rangesum);
 
-		if (pages <= 0.0)
-			continue;			/* a negated clause, or nothing to read */
-
-		if (clausesrc[i] < 0 || clausesrc[i] == driver || rangesum)
-			seq_pages += pages; /* walked: the driver, a group's own list,
-								 * and what a range's entries are ANDed with */
-		else
-		{
-			pages = Min(pages,
-						clausekeys[i] * lion_probed_pages(clauseleaves[i],
-														  srcprobes[clausesrc[i]] * walked,
-														  clauseheight[i]));
-			probe_cost += pages *
-				lion_heap_page_cost(root, rel, pages, clauseidx[i]);
-		}
+		probe_cost += lion_cost_set_pages(root, rel, &clauseset[i], walk,
+										  walk ? 0.0 :
+										  srcprobes[clausesrc[i]] * walked,
+										  &seq_pages, &probed_pages);
 	}
-	pfree(clausepages);
-	pfree(clauseleaves);
-	pfree(clauseheight);
-	pfree(clausekeys);
-	pfree(clauseidx);
+	random_pages = lion_cost_leaf_pages(nclause, clauseindex, clauseset);
+	pfree(clauseset);
+	pfree(clauseindex);
 	pfree(clausesrc);
 	pfree(srcmembers);
 	pfree(srccontainers);
