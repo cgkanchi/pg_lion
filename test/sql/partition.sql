@@ -466,6 +466,12 @@ DROP TABLE lion_pbig;
  * follow-up review).  With the merge gone the estimate bounds nothing that
  * matters: the query is pushed down, every group is counted exactly, and the
  * Finalize HashAggregate spills.
+ *
+ * The partitions' lion indexes know better (DESIGN.md §33): the VACUUM below
+ * counts ten thousand and five keys in each, and with that count the planner
+ * expects every group and scans the partitions instead - the first plan.  The
+ * rest of the section is about a planner that does not know, so it runs
+ * without the index's count.
  */
 CREATE TABLE lion_pstale (g int NOT NULL, k int NOT NULL) PARTITION BY RANGE (k);
 CREATE TABLE lion_pstale1 PARTITION OF lion_pstale FOR VALUES FROM (0) TO (5);
@@ -484,10 +490,13 @@ SELECT n_distinct FROM pg_stats
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1.0;
 SELECT lion_pplan('SELECT g, count(*) FROM lion_pstale GROUP BY g');
+SET pg_lion.enable_index_ndistinct = off;
+SELECT lion_pplan('SELECT g, count(*) FROM lion_pstale GROUP BY g');
 SELECT lion_pspill('SELECT g, count(*) FROM lion_pstale GROUP BY g');
 SELECT lion_pp('SELECT g, count(*) FROM lion_pstale GROUP BY g');
 SELECT count(*) AS groups, sum(c) AS rows
   FROM (SELECT g, count(*) c FROM lion_pstale GROUP BY g) s;
+RESET pg_lion.enable_index_ndistinct;
 RESET work_mem;
 RESET hash_mem_multiplier;
 DROP TABLE lion_pstale;

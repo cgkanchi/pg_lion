@@ -202,6 +202,12 @@ twice, or one freed a moment ago called reusable, breaks the equation.
   `lion_index_verify(idx, true)` and a key count through each on the standby.
   It is the one place a build's own WAL is replayed - the bulk writer's page
   images, which on 16 come from `lion_build.c`'s copy of 17's bulk-write API.
+  The same two indexes then carry the key counts of DESIGN.md §33: the
+  build's, an ANALYZE's after new keys and a VACUUM's after their rows are
+  deleted - counted by ambulkdelete's walk, so the VACUUM is retried until
+  the standby's feedback lets it remove them - each read on the standby
+  through `lion_index_stats()` and compared with the primary's, and with the
+  exact count, once it has replayed the META record that wrote it.
 * the recovery-conflict case, run twice. A standby session opens a
   `REPEATABLE READ` transaction and counts key K; the run waits (on
   `pg_stat_activity`, not on a timer) until that session really holds its

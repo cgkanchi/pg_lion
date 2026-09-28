@@ -341,8 +341,139 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 	meta->dirpages = dirpages;
 	meta->wal_mode = wal_mode;
 
-	((PageHeader) page)->pd_lower += sizeof(LionMetaPageData);
+	/*
+	 * ... and the key counts of DESIGN.md §33 after it, none of them valid
+	 * until a build records its own (lion_meta_record_ndistinct()).
+	 */
+	memset(LionPageGetMetaNdistinct(page), 0, sizeof(LionMetaNdistinct));
+	((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
 	Assert(((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper);
+}
+
+/*
+ * The key counts of DESIGN.md §33 for ix's columns: the VALUE entries of each
+ * scalar key column, and the rows under the first of them, as of now.
+ */
+void
+lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
+						 const uint64 *nvalues, uint64 rows)
+{
+	int			i;
+
+	memset(nd, 0, sizeof(LionMetaNdistinct));
+	for (i = 0; i < ix->ncolumns && i < LION_META_MAX_COLS; i++)
+	{
+		/* a multi-key column's entries are elements, not its values */
+		if (ix->cols[i].multikey)
+			continue;
+		nd->valid_cols |= ((uint32) 1) << i;
+		nd->ndistinct[i] = nvalues[i];
+	}
+	nd->rows = rows;
+}
+
+/*
+ * Put the counts on a meta page image that nothing else can see yet: the
+ * build's, which the bulk writer logs whole.
+ */
+void
+lion_meta_record_ndistinct(Page metapage, const LionMetaNdistinct *nd)
+{
+	Assert(LionMetaHasNdistinct(metapage));
+	memcpy(LionPageGetMetaNdistinct(metapage), nd, sizeof(LionMetaNdistinct));
+}
+
+/*
+ * Write the counts VACUUM or ANALYZE took on the index's meta page, in a
+ * record of their own (LION_XLOG_META, operation NDISTINCT, DESIGN.md §25 and
+ * §33).  A meta page written before §33 gets the area here: pd_lower moves to
+ * cover it, in generic mode as in rmgr mode, so that neither GenericXLog's
+ * diff - which leaves out, and at redo zeroes, what lies between pd_lower and
+ * pd_upper - nor a full-page image drops it.
+ *
+ * Counts the page holds already are not written again: an ANALYZE of a table
+ * nothing has changed in, or whose changes left every count and the rows as
+ * they were, writes no WAL for them - nor, the first time after a checkpoint,
+ * an image of the meta page.
+ *
+ * The caller has read the meta page through lion_get_index_state(), so the
+ * index's WAL mode is known without reading it again under the lock taken here
+ * (lion_index_meta_wal_mode()).
+ */
+void
+lion_meta_write_ndistinct(Relation index, const LionMetaNdistinct *nd)
+{
+	Buffer		buf;
+	Page		page;
+	LionWalState *xstate;
+
+	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	/* the special area's size first, as lion_read_meta() checks it */
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		!LionPageIsMeta(page) ||
+		((PageHeader) page)->pd_upper < LION_META_NDISTINCT_END)
+	{
+		UnlockReleaseBuffer(buf);
+		elog(ERROR, "lion index \"%s\": block 0 is not the meta page",
+			 RelationGetRelationName(index));
+	}
+	if (LionMetaHasNdistinct(page) &&
+		memcmp(LionPageGetMetaNdistinct(page), nd,
+			   sizeof(LionMetaNdistinct)) == 0)
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+
+	xstate = lion_wal_begin(index);
+	page = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+	memcpy(LionPageGetMetaNdistinct(page), nd, sizeof(LionMetaNdistinct));
+	if (((PageHeader) page)->pd_lower < LION_META_NDISTINCT_END)
+		((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
+	lion_wal_op(xstate, page, LION_OP_NDISTINCT, 0, 0, nd,
+				sizeof(LionMetaNdistinct));
+	lion_wal_finish(xstate, LION_XLOG_META);
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * The counts on the index's meta page; false, and *nd zeroed, when it carries
+ * none - a meta page written before DESIGN.md §33 that nothing has counted
+ * since.  A bad meta page is refused as lion_read_meta() refuses it.
+ */
+bool
+lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
+{
+	Buffer		buf;
+	Page		page;
+	bool		have = false;
+
+	memset(nd, 0, sizeof(LionMetaNdistinct));
+
+	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		!LionPageIsMeta(page))
+	{
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index))));
+	}
+	if (LionMetaHasNdistinct(page) &&
+		((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper)
+	{
+		memcpy(nd, LionPageGetMetaNdistinct(page), sizeof(LionMetaNdistinct));
+		have = true;
+	}
+	UnlockReleaseBuffer(buf);
+
+	return have;
 }
 
 /*

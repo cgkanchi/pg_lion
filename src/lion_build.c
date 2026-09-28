@@ -470,6 +470,10 @@ typedef struct LionBuildState
 	LionBuildLevel *leaf;		/* the bottom of the directory */
 	int64		ndirpages;
 	int64		ndistinct;		/* entries written, for the §17 guard */
+	uint64	   *nvalues;		/* VALUE entries of each key column, and */
+	uint64		rows;			/* ... the TIDs of the first scalar one's
+								 * entries: the key counts of §33 */
+	AttrNumber	rowcol;			/* that column (lion_index_row_column()) */
 	BlockNumber root;
 	uint32		height;
 
@@ -791,6 +795,15 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 	/* the keys, for the §17 guard; a summary (§32) is not one */
 	if (!LionEntryIsSummary(entry))
 		bs->ndistinct++;
+
+	/*
+	 * ... and each column's values and the rows, for the planner (DESIGN.md
+	 * §33): exact here, where every entry passes once.
+	 */
+	if (lion_entry_kind(entry) == LION_KIND_VALUE)
+		bs->nvalues[entry->attno - 1]++;
+	if (entry->attno == bs->rowcol && !LionEntryIsSummary(entry))
+		bs->rows += entry->ntids;
 }
 
 /*
@@ -2269,6 +2282,10 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	bs.inline_limit = lion_build_index_state(index, &bs.ix, bs.buildctx);
 	ncols = bs.ix.ncolumns;
+	bs.nvalues = (uint64 *) MemoryContextAllocZero(bs.buildctx,
+												   sizeof(uint64) * ncols);
+	bs.rows = 0;
+	bs.rowcol = lion_index_row_column(&bs.ix);
 
 	bs.maxbuilders = 8;
 	bs.builders = (LionBuilder **) MemoryContextAlloc(bs.buildctx,
@@ -2366,6 +2383,13 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* ... and which columns got summaries, which makes it version 7 (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
+	/* ... and each column's distinct keys, for the planner (§33). */
+	{
+		LionMetaNdistinct nd;
+
+		lion_meta_fill_ndistinct(&nd, &bs.ix, bs.nvalues, bs.rows);
+		lion_meta_record_ndistinct((Page) metabuf->data, &nd);
+	}
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);

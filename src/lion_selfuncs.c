@@ -52,6 +52,12 @@
  *	  changed (lion_probe_missed()), which stands in for core's marking the
  *	  dead btree entries it steps over.
  *
+ * The same hook, and get_index_stats_hook, carry a third correction, which is
+ * every estimate's and not only lion's: a column's n_distinct, taken from the
+ * count of its keys a lion index keeps on its meta page, where ANALYZE's
+ * sample misses the rare values of a column that has many (DESIGN.md §33,
+ * lion_ndistinct_stats()).
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -68,6 +74,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -78,7 +85,9 @@
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
+#include "utils/attoptcache.h"
 #include "utils/datum.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -933,6 +942,16 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 static void lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 										Index rti, RangeTblEntry *rte);
 
+/* n_distinct from the directory (DESIGN.md §33), at the end of this file */
+static get_index_stats_hook_type lion_prev_index_stats_hook = NULL;
+static bool lion_enable_index_ndistinct = true;
+static bool lion_ndistinct_nested = false;
+static bool lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte,
+								 AttrNumber attnum, VariableStatData *vardata);
+static bool lion_index_expr_stats(PlannerInfo *root, Oid indexOid,
+								  AttrNumber indexattnum,
+								  VariableStatData *vardata);
+
 static bool
 lion_relation_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 					VariableStatData *vardata)
@@ -957,9 +976,17 @@ lion_relation_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 			}
 		}
 	}
-	if (lion_prev_relation_stats_hook != NULL)
-		return lion_prev_relation_stats_hook(root, rte, attnum, vardata);
-	return false;
+
+	/*
+	 * The lookup lion_ndistinct_stats() asks core for: core's own row and
+	 * acl_ok, which the hooks before this one have declined already.
+	 */
+	if (lion_ndistinct_nested)
+		return false;
+	if (lion_prev_relation_stats_hook != NULL &&
+		lion_prev_relation_stats_hook(root, rte, attnum, vardata))
+		return true;
+	return lion_ndistinct_stats(root, rte, attnum, vardata);
 }
 
 /*
@@ -975,6 +1002,22 @@ lion_selfuncs_init(void)
 	get_relation_stats_hook = lion_relation_stats;
 	lion_prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = lion_plain_set_rel_pathlist;
+
+	/*
+	 * DESIGN.md §33: a column's n_distinct from a lion index's count of its
+	 * keys, through both statistics hooks, the one above for a column and
+	 * get_index_stats_hook for an expression an index holds.
+	 */
+	lion_prev_index_stats_hook = get_index_stats_hook;
+	get_index_stats_hook = lion_index_expr_stats;
+	DefineCustomBoolVariable("pg_lion.enable_index_ndistinct",
+							 "Takes a column's number of distinct values from a lion index on it.",
+							 "Off, the planner uses the number ANALYZE estimated from its sample.",
+							 &lion_enable_index_ndistinct,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 }
 
 /*
@@ -2187,4 +2230,547 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
+}
+
+/* ---------------------------------------------------------------------
+ * n_distinct from the directory (DESIGN.md §33)
+ * --------------------------------------------------------------------- */
+
+/*
+ * ANALYZE estimates a column's distinct values from a sample of 300 rows per
+ * unit of statistics target, and a column with a long tail of rare values -
+ * a foreign key whose referenced rows have a handful of rows each - is where
+ * that estimate falls short: most of its values are not in the sample at all,
+ * and Haas and Stokes' estimator, which ANALYZE extrapolates the rest with,
+ * cannot see them.  Every estimate that divides by n_distinct inherits the
+ * error - the groups of a GROUP BY or a DISTINCT, the size of a hash
+ * aggregate, `col = x` for a value that is not a most common one, a join on
+ * the column.
+ *
+ * A lion index on the column has the answer: each VALUE entry of a scalar key
+ * column is one distinct value, and the build, VACUUM and the ANALYZE of a
+ * small directory count them onto the meta page (lionbuild(),
+ * lion_vac_count(), lion_vacuum_count_keys()).  So where a plain
+ * column of a table has a lion index on it, examine_variable() is handed the
+ * column's pg_statistic row with stadistinct taken from the index, and
+ * everything else in it - the null fraction, the most common values, the
+ * histogram - as ANALYZE left it.  The same for an expression a lion index
+ * holds, through get_index_stats_hook, with the statistics ANALYZE keeps for
+ * that index column.
+ *
+ * What is supplied, and when (DESIGN.md §33, "The hook"):
+ *	- only where core has a row to supply: a column never analyzed stays
+ *	  without statistics, and the index's count waits for the first ANALYZE;
+ *	- never for a column whose n_distinct the user set (ALTER TABLE ... ALTER
+ *	  COLUMN ... SET (n_distinct = ...)), which ANALYZE has put in the row;
+ *	- never for inheritance-tree statistics or a partitioned table's own,
+ *	  which one index of one table does not count;
+ *	- from a valid, non-partial, non-hypothetical lion index whose key column
+ *	  is exactly the column (or the expression), with a scalar opclass whose
+ *	  equality is the column type's own, under the column's collation or one
+ *	  with the same equality: a multi-key opclass's keys are elements, a
+ *	  partial index counts a part of the table, and an opclass that equates
+ *	  what the type does not counts classes the planner would not;
+ *	- only while the rows the count was taken over are within a factor of 2
+ *	  of the rows the planner finds the table to have (lion_nd_current());
+ *	- of several, the one counted over the rows nearest the table's now, and
+ *	  of those the largest count;
+ *	- in ANALYZE's own convention: a count above a tenth of the rows the
+ *	  index held when it was counted goes in as the negative fraction of them,
+ *	  which the planner scales by the table's current size, and any other as
+ *	  the count (lion_ndistinct_value()).
+ *
+ * acl_ok - whether the user may read every row of the column, which decides
+ * whether a non-leakproof operator is handed the row's values - is core's
+ * own: the row is looked up by examine_variable() itself, with both hooks
+ * standing aside for that one lookup (lion_ndistinct_nested), and its acl_ok is
+ * what the copy is handed out with.  Nothing here decides a permission.
+ *
+ * The copy is made once per planner run and column and handed out as is, with
+ * a release function that frees nothing: it lives, like the meta pages read,
+ * in the memory of the planner run (lion_nd_cache_for()).  A run reads each
+ * index's meta page once; the next run reads it again, so a count VACUUM,
+ * ANALYZE or a REINDEX has written since is what the next plan sees.
+ */
+
+/* One index's meta page, as this planner run read it. */
+typedef struct LionNdistinctIndex
+{
+	Oid			indexoid;
+	bool		have;			/* the meta page carries counts at all */
+	LionMetaNdistinct nd;
+} LionNdistinctIndex;
+
+/*
+ * One column's row with the count in it: a table's column, or an index's
+ * expression column.  stats is NULL when this run decided there is none to
+ * supply.
+ */
+typedef struct LionNdistinctRow
+{
+	Oid			relid;			/* the table, or the index */
+	AttrNumber	attnum;
+	HeapTuple	stats;
+} LionNdistinctRow;
+
+typedef struct LionNdistinctCache
+{
+	PlannerGlobal *glob;
+	MemoryContext cxt;
+	Oid			amoid;			/* lion's, or InvalidOid without the AM */
+	List	   *indexes;		/* LionNdistinctIndex */
+	List	   *rows;			/* LionNdistinctRow */
+} LionNdistinctCache;
+
+static LionNdistinctCache lion_nd_cache;
+
+static void
+lion_nd_cache_reset(void *arg)
+{
+	if (lion_nd_cache.glob == (PlannerGlobal *) arg)
+		memset(&lion_nd_cache, 0, sizeof(lion_nd_cache));
+}
+
+/* The cache of root's planner run, as lion_probe_cache_for() keeps its own. */
+static LionNdistinctCache *
+lion_nd_cache_for(PlannerInfo *root)
+{
+	if (lion_nd_cache.glob != root->glob)
+	{
+		MemoryContext cxt = GetMemoryChunkContext(root->glob);
+		MemoryContextCallback *cb;
+
+		cb = (MemoryContextCallback *) MemoryContextAlloc(cxt, sizeof(*cb));
+		cb->func = lion_nd_cache_reset;
+		cb->arg = root->glob;
+		MemoryContextRegisterResetCallback(cxt, cb);
+
+		lion_nd_cache.glob = root->glob;
+		lion_nd_cache.cxt = cxt;
+		lion_nd_cache.amoid = lion_get_am_oid();
+		lion_nd_cache.indexes = NIL;
+		lion_nd_cache.rows = NIL;
+	}
+	return &lion_nd_cache;
+}
+
+/* The copies belong to the planner run's memory, not to the caller. */
+static void
+lion_nd_release(HeapTuple tuple)
+{
+}
+
+/*
+ * The counts on an index's meta page, read once per planner run: one pin and
+ * a SHARE lock.  The planner holds the index locked since get_relation_info().
+ */
+static LionNdistinctIndex *
+lion_nd_index(LionNdistinctCache *cache, Oid indexoid)
+{
+	LionNdistinctIndex *ent;
+	MemoryContext oldcxt;
+	Relation	index;
+	ListCell   *lc;
+
+	foreach(lc, cache->indexes)
+	{
+		ent = (LionNdistinctIndex *) lfirst(lc);
+		if (ent->indexoid == indexoid)
+			return ent;
+	}
+
+	oldcxt = MemoryContextSwitchTo(cache->cxt);
+	ent = (LionNdistinctIndex *) palloc0(sizeof(LionNdistinctIndex));
+	ent->indexoid = indexoid;
+	cache->indexes = lappend(cache->indexes, ent);
+	MemoryContextSwitchTo(oldcxt);
+
+	index = index_open(indexoid, NoLock);
+	ent->have = lion_read_meta_ndistinct(index, &ent->nd);
+	index_close(index, NoLock);
+
+	return ent;
+}
+
+static LionNdistinctRow *
+lion_nd_row(LionNdistinctCache *cache, Oid relid, AttrNumber attnum)
+{
+	ListCell   *lc;
+
+	foreach(lc, cache->rows)
+	{
+		LionNdistinctRow *row = (LionNdistinctRow *) lfirst(lc);
+
+		if (row->relid == relid && row->attnum == attnum)
+			return row;
+	}
+	return NULL;
+}
+
+/*
+ * Remember what this run decided for the column: stats, a row whose
+ * stadistinct is the index's (copied into the run's memory), or none.
+ */
+static LionNdistinctRow *
+lion_nd_remember(LionNdistinctCache *cache, Oid relid, AttrNumber attnum,
+				 HeapTuple stats, float4 stadistinct)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(cache->cxt);
+	LionNdistinctRow *row;
+
+	row = (LionNdistinctRow *) palloc(sizeof(LionNdistinctRow));
+	row->relid = relid;
+	row->attnum = attnum;
+	row->stats = NULL;
+	if (HeapTupleIsValid(stats))
+	{
+		row->stats = heap_copytuple(stats);
+		((Form_pg_statistic) GETSTRUCT(row->stats))->stadistinct = stadistinct;
+	}
+	cache->rows = lappend(cache->rows, row);
+	MemoryContextSwitchTo(oldcxt);
+
+	return row;
+}
+
+/*
+ * Does key column col of idx hold the values of an expression of this type
+ * and collation as the planner counts them: one key per class of the type's
+ * own equality, under the collation?  The index's equality is its opclass's
+ * strategy 1, under the index column's collation.  Every scalar opclass
+ * pg_lion ships has the type's `=` (varchar reaches text's through binary
+ * coercion, as the type's default btree class does); a multi-key one has no
+ * strategy 1 at all.  Two deterministic collations have one equality, the
+ * bytes'.
+ */
+static bool
+lion_nd_same_equality(IndexOptInfo *idx, int col, Oid type, Oid collation)
+{
+	TypeCacheEntry *tce = lookup_type_cache(type, TYPECACHE_EQ_OPR);
+	Oid			indexcoll = idx->indexcollations[col];
+	Oid			eqop;
+
+	eqop = get_opfamily_member(idx->opfamily[col], idx->opcintype[col],
+							   idx->opcintype[col], LION_STRAT_EQUAL);
+	if (!OidIsValid(eqop) || eqop != tce->eq_opr)
+		return false;
+	if (indexcoll == collation)
+		return true;
+	return OidIsValid(indexcoll) && OidIsValid(collation) &&
+		get_collation_isdeterministic(indexcoll) &&
+		get_collation_isdeterministic(collation);
+}
+
+/*
+ * stadistinct for count distinct values among rows rows, in ANALYZE's
+ * convention (compute_scalar_stats(), compute_distinct_stats()): a positive
+ * number is the count, a negative one a fraction of the table's rows, taken
+ * when the values are more than a tenth of the rows - "it seems likely that
+ * the number of distinct values will scale with the table" - which the
+ * planner multiplies by the rows it finds the table to have now
+ * (get_variable_numdistinct()).  So a column whose values grow with the table,
+ * an ever-growing foreign key, keeps its proportion between two counts, and
+ * one with a fixed set of values keeps its number.  rows counts the NULLs too,
+ * as ANALYZE's totalrows does.
+ */
+static float4
+lion_ndistinct_value(uint64 count, uint64 rows)
+{
+	if (rows > 0 && (double) count > 0.1 * (double) rows)
+		return (float4) -Min((double) count / (double) rows, 1.0);
+	return (float4) count;
+}
+
+/*
+ * Is a count taken over rows rows still one for a table the planner finds
+ * to hold tuples rows now?  Within a factor of 2 either way (DESIGN.md §33,
+ * "Stale counts").  A count is refreshed by every VACUUM that deletes and by
+ * the ANALYZE of a table whose directory is small (lion_vacuum_count_keys());
+ * the directory of a large table that only grows is counted by neither, and
+ * its count falls further behind with every insert.  A fraction keeps up
+ * with a column whose values grow with the table, but a count of a fixed set
+ * of values does not shrink with it, and a column whose tail of rare values
+ * is what grows is off either way: past a factor of 2 the planner is better
+ * served by ANALYZE's estimate, which that ANALYZE has kept up to date.
+ */
+static bool
+lion_nd_current(uint64 rows, double tuples)
+{
+	return rows > 0 && tuples >= 0.5 * (double) rows &&
+		tuples <= 2.0 * (double) rows;
+}
+
+/*
+ * The count of key column col of idx, if its meta page has one this column's
+ * values may be counted by (above) and the table of tuples rows has not
+ * outgrown; and how far the table has drifted from the rows it was taken
+ * over, as |ln(rows / tuples)|, 0 for none.
+ */
+static bool
+lion_nd_column_count(LionNdistinctCache *cache, IndexOptInfo *idx, int col,
+					 Oid type, Oid collation, double tuples,
+					 float4 *stadistinct, double *drift, uint64 *count)
+{
+	LionNdistinctIndex *ent;
+
+	if (idx->relam != cache->amoid || idx->hypothetical ||
+		idx->indpred != NIL || col >= LION_META_MAX_COLS ||
+		!lion_nd_same_equality(idx, col, type, collation))
+		return false;
+	ent = lion_nd_index(cache, idx->indexoid);
+	if (!ent->have || (ent->nd.valid_cols & (((uint32) 1) << col)) == 0 ||
+		ent->nd.ndistinct[col] == 0 ||
+		!lion_nd_current(ent->nd.rows, tuples))
+		return false;
+
+	*stadistinct = lion_ndistinct_value(ent->nd.ndistinct[col], ent->nd.rows);
+	*drift = fabs(log((double) ent->nd.rows / tuples));
+	*count = ent->nd.ndistinct[col];
+	return true;
+}
+
+/*
+ * Core's own lookup of node's statistics, with lion's hooks standing aside:
+ * the row core would have used, and the acl_ok it computed for this very
+ * reference to it.
+ */
+static void
+lion_nd_core_lookup(PlannerInfo *root, Node *node, int varRelid,
+					VariableStatData *core)
+{
+	bool		save = lion_ndistinct_nested;
+
+	lion_ndistinct_nested = true;
+	PG_TRY();
+	{
+		examine_variable(root, node, varRelid, core);
+	}
+	PG_FINALLY();
+	{
+		lion_ndistinct_nested = save;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * get_relation_stats_hook, for column attnum of the table rte names: its
+ * pg_statistic row with stadistinct from a lion index on it (above).
+ */
+static bool
+lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
+					 VariableStatData *vardata)
+{
+	LionNdistinctCache *cache;
+	LionNdistinctRow *row;
+	RelOptInfo *rel = NULL;
+	Index		varno = 0;
+	Oid			vartype;
+	int32		vartypmod;
+	Oid			varcollid;
+	VariableStatData core;
+	float4		stadistinct = 0;
+	bool		keyed = false;
+	ListCell   *lc;
+	int			i;
+
+	if (!lion_enable_index_ndistinct || root == NULL || root->glob == NULL ||
+		root->simple_rte_array == NULL || attnum <= 0 ||
+		rte->rtekind != RTE_RELATION || rte->inh ||
+		rte->relkind == RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	/*
+	 * The rel of this query level that rte is the range table entry of: core
+	 * hands the hook root->simple_rte_array[varno] itself
+	 * (examine_simple_variable()), which is also what planner_rt_fetch()
+	 * gives the index cost estimators that ask.
+	 */
+	for (i = 1; i < root->simple_rel_array_size; i++)
+	{
+		if (root->simple_rte_array[i] == rte)
+		{
+			varno = (Index) i;
+			rel = root->simple_rel_array[i];
+			break;
+		}
+	}
+	if (rel == NULL || rel->indexlist == NIL)
+		return false;
+
+	/* the common case first: no lion index of the table has the column */
+	cache = lion_nd_cache_for(root);
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		for (i = 0; i < idx->nkeycolumns && !keyed; i++)
+			keyed = (idx->relam == cache->amoid && idx->indexkeys[i] == attnum);
+	}
+	if (!keyed)
+		return false;
+
+	row = lion_nd_row(cache, rte->relid, attnum);
+	if (row != NULL && row->stats == NULL)
+		return false;
+
+	/*
+	 * Core's row, and the acl_ok it gives this reference to the column, first:
+	 * a column never analyzed has nothing to supply until ANALYZE has run, and
+	 * no meta page is read for it.
+	 */
+	get_atttypetypmodcoll(rte->relid, attnum, &vartype, &vartypmod,
+						  &varcollid);
+	lion_nd_core_lookup(root,
+						(Node *) makeVar(varno, attnum, vartype, vartypmod,
+										 varcollid, 0),
+						0, &core);
+	if (!HeapTupleIsValid(core.statsTuple) ||
+		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->starelid != rte->relid ||
+		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->staattnum != attnum ||
+		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->stainherit)
+	{
+		if (row == NULL && !HeapTupleIsValid(core.statsTuple))
+			(void) lion_nd_remember(cache, rte->relid, attnum, NULL, 0);
+		ReleaseVariableStats(core);
+		return false;
+	}
+
+	if (row == NULL)
+	{
+		AttributeOpts *aopt = get_attribute_options(rte->relid, attnum);
+		bool		found = false;
+		double		best_drift = 0;
+		uint64		best = 0;
+
+		/*
+		 * The index counted over the rows nearest the table's now, and then
+		 * the largest count.
+		 */
+		if (aopt == NULL || aopt->n_distinct == 0)
+		{
+			foreach(lc, rel->indexlist)
+			{
+				IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+				int			c;
+
+				for (c = 0; c < idx->nkeycolumns; c++)
+				{
+					float4		value;
+					double		drift;
+					uint64		count;
+
+					if (idx->indexkeys[c] != attnum ||
+						!lion_nd_column_count(cache, idx, c, vartype,
+											  varcollid, rel->tuples,
+											  &value, &drift, &count))
+						continue;
+					if (!found || drift < best_drift ||
+						(drift == best_drift && count > best))
+					{
+						found = true;
+						best_drift = drift;
+						best = count;
+						stadistinct = value;
+					}
+				}
+			}
+		}
+		row = lion_nd_remember(cache, rte->relid, attnum,
+							   found ? core.statsTuple : NULL, stadistinct);
+		if (row->stats == NULL)
+		{
+			ReleaseVariableStats(core);
+			return false;
+		}
+	}
+
+	vardata->statsTuple = row->stats;
+	vardata->freefunc = lion_nd_release;
+	vardata->acl_ok = core.acl_ok;
+	ReleaseVariableStats(core);
+	return true;
+}
+
+/*
+ * get_index_stats_hook, for expression column indexattnum of index indexOid,
+ * which examine_variable() has matched vardata->var to: that index column's
+ * pg_statistic row, which ANALYZE keeps for an expression, with stadistinct
+ * from the index when it is a lion index that may say (above).  The index
+ * core asks about is the one whose count is used.
+ */
+static bool
+lion_index_expr_stats(PlannerInfo *root, Oid indexOid, AttrNumber indexattnum,
+					  VariableStatData *vardata)
+{
+	LionNdistinctCache *cache;
+	LionNdistinctRow *row;
+	IndexOptInfo *idx = NULL;
+	VariableStatData core;
+	float4		stadistinct = 0;
+	ListCell   *lc;
+
+	if (lion_ndistinct_nested)
+		return false;
+	if (lion_prev_index_stats_hook != NULL &&
+		lion_prev_index_stats_hook(root, indexOid, indexattnum, vardata))
+		return true;
+
+	if (!lion_enable_index_ndistinct || root == NULL || root->glob == NULL ||
+		vardata->rel == NULL || vardata->var == NULL ||
+		!IS_SIMPLE_REL(vardata->rel) || indexattnum < 1)
+		return false;
+	foreach(lc, vardata->rel->indexlist)
+	{
+		if (((IndexOptInfo *) lfirst(lc))->indexoid == indexOid)
+			idx = (IndexOptInfo *) lfirst(lc);
+	}
+	if (idx == NULL || indexattnum > idx->nkeycolumns ||
+		idx->indexkeys[indexattnum - 1] != 0)
+		return false;
+
+	cache = lion_nd_cache_for(root);
+	row = lion_nd_row(cache, indexOid, indexattnum);
+	if (row != NULL && row->stats == NULL)
+		return false;
+	if (row == NULL)
+	{
+		double		drift;
+		uint64		count;
+
+		if (!lion_nd_column_count(cache, idx, indexattnum - 1,
+								  exprType((Node *) vardata->var),
+								  exprCollation((Node *) vardata->var),
+								  vardata->rel->tuples,
+								  &stadistinct, &drift, &count))
+		{
+			(void) lion_nd_remember(cache, indexOid, indexattnum, NULL, 0);
+			return false;
+		}
+	}
+
+	/*
+	 * Core's lookup of the same expression walks the same indexes to this
+	 * one, whose row it takes; one that another index's row stopped at, where
+	 * a hook before this one declined to supply, is left to core.
+	 */
+	lion_nd_core_lookup(root, (Node *) vardata->var, vardata->rel->relid,
+						&core);
+	if (!HeapTupleIsValid(core.statsTuple) ||
+		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->starelid != indexOid ||
+		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->staattnum != indexattnum)
+	{
+		if (row == NULL && !HeapTupleIsValid(core.statsTuple))
+			(void) lion_nd_remember(cache, indexOid, indexattnum, NULL, 0);
+		ReleaseVariableStats(core);
+		return false;
+	}
+	if (row == NULL)
+		row = lion_nd_remember(cache, indexOid, indexattnum, core.statsTuple,
+							   stadistinct);
+
+	vardata->statsTuple = row->stats;
+	vardata->freefunc = lion_nd_release;
+	vardata->acl_ok = core.acl_ok;
+	ReleaseVariableStats(core);
+	return true;
 }
