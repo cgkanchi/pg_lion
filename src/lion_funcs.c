@@ -3902,11 +3902,10 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 			cbuf = ReadBuffer(index, blk);
 			LockBuffer(cbuf, BUFFER_LOCK_SHARE);
 			cpage = BufferGetPage(cbuf);
-			off = lion_page_find_item(cpage, ckey, &found);
+			off = lion_page_find_item(index, cpage, blk, ckey, &found);
 			if (found)
-				present = lion_item_contains((LionContainer *)
-											PageGetItem(cpage,
-														PageGetItemId(cpage, off)),
+				present = lion_item_contains(lion_page_item_fetch(index, cpage,
+																  blk, off),
 											ckey, lo);
 			UnlockReleaseBuffer(cbuf);
 		}

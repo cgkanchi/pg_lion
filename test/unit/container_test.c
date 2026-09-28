@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "port/pg_bitutils.h"
+
 #include "lion_container.h"
 
 #define TEST_CKEY	0x0BADF00D
@@ -188,6 +190,33 @@ ref_nruns(const Ref *r)
 
 static uint16 scratch_array[LION_CONTAINER_RANGE];
 static uint16 scratch_iter[LION_CONTAINER_RANGE];
+static uint64 scratch_img[LION_BITSET_WORDS];
+
+/* Every bit block_mask() may set: the LION_BLOCKS_PER_CONTAINER blocks. */
+#define TEST_BLOCK_BITS	(~UINT64CONST(0) >> (64 - LION_BLOCKS_PER_CONTAINER))
+
+/* The block_mask() of a bitset image: the blocks with a bit set. */
+static uint64
+image_blocks(const uint64 *w)
+{
+	uint32		words = LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER;
+	uint64		mask = 0;
+	uint32		b;
+	uint32		k;
+
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+		for (k = 0; k < words; k++)
+			if (w[b * words + k] != 0)
+				mask |= UINT64CONST(1) << b;
+	return mask;
+}
+
+/* The block of lo, which the caller has already masked into range. */
+static uint64
+lo_block_bit(uint32 lo)
+{
+	return UINT64CONST(1) << (lo >> LION_OFFSET_BITS);
+}
 
 typedef struct IterState
 {
@@ -233,6 +262,7 @@ verify_full(const LionContainer *c, const Ref *r)
 	uint32		bad;
 	IterState	st;
 	Size		expected;
+	uint64		expect_blocks;
 
 	verify_light(c, r);
 
@@ -275,6 +305,30 @@ verify_full(const LionContainer *c, const Ref *r)
 		if (scratch_iter[i] != scratch_array[i])
 			bad++;
 	CHECK(bad == 0, "iterate() order differs from to_array()");
+
+	/*
+	 * The count engine's two readers: or_into_bitset() into an image with
+	 * bits of its own, which it has to keep, and block_mask(), against the
+	 * blocks of the reference's members.
+	 */
+	memset(scratch_img, 0, sizeof(scratch_img));
+	for (i = 0; i < LION_CONTAINER_RANGE; i += 61)
+		scratch_img[i >> 6] |= UINT64CONST(1) << (i & 63);
+	lion_container_or_into_bitset(c, scratch_img);
+	bad = 0;
+	expect_blocks = 0;
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+	{
+		bool		got = ((scratch_img[i >> 6] >> (i & 63)) & 1) != 0;
+
+		if (got != (r->m[i] || i % 61 == 0))
+			bad++;
+		if (r->m[i])
+			expect_blocks |= lo_block_bit(i);
+	}
+	CHECK(bad == 0, "or_into_bitset() ORs exactly the members into the image");
+	CHECK(lion_container_block_mask(c) == expect_blocks,
+		  "block_mask() names exactly the blocks with members");
 
 	/* the size must be exactly what the representation implies */
 	switch (c->type)
@@ -2197,6 +2251,7 @@ typedef struct DamageIter
 {
 	uint32		n;
 	uint32		bad;			/* lo values out of range */
+	uint64		blocks;			/* the blocks of the lo values */
 } DamageIter;
 
 static bool
@@ -2207,6 +2262,39 @@ damage_iter_cb(uint16 lo, void *arg)
 	st->n++;
 	if ((uint32) lo > LION_CONTAINER_RANGE - 1)
 		st->bad++;
+	st->blocks |= lo_block_bit(lo & (LION_CONTAINER_RANGE - 1));
+	return true;
+}
+
+/*
+ * Every member a container stores, read raw rather than through the library
+ * (which masks what it reads): is it below LION_CONTAINER_RANGE?  What a
+ * result of the set algebra has to be, whatever its operands were, because a
+ * result is handed on - onto a page, into another operation.
+ */
+static bool
+raw_in_range(const LionContainer *c)
+{
+	uint32		i;
+
+	if (c->type == LION_CT_ARRAY)
+	{
+		const uint16 *arr = (const uint16 *) LION_CONTAINER_PAYLOAD(c);
+		uint32		n = Min((uint32) c->cardinality, (uint32) LION_ARRAY_MAX_CARD);
+
+		for (i = 0; i < n; i++)
+			if ((uint32) arr[i] > LION_CONTAINER_RANGE - 1)
+				return false;
+	}
+	else if (c->type == LION_CT_RUN)
+	{
+		const LionRun *runs = (const LionRun *) (LION_CONTAINER_PAYLOAD(c) + sizeof(uint16));
+		uint32		n = Min((uint32) LION_RUN_NRUNS(c), (uint32) LION_RUN_MAX_NRUNS);
+
+		for (i = 0; i < n; i++)
+			if ((uint32) runs[i].start + runs[i].len_minus_1 > LION_CONTAINER_RANGE - 1)
+				return false;
+	}
 	return true;
 }
 
@@ -2227,6 +2315,7 @@ static LionContainer *dmg_b;
 static LionContainer *dmg_dst;
 static LionContainer *dmg_work;
 static uint16 *dmg_out;
+static uint64 *dmg_img;			/* LION_BITSET_BYTES */
 
 /*
  * Run every reader over c (and c against other), and every mutator over a
@@ -2242,6 +2331,7 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 	uint32		lo = rng_below(LION_CONTAINER_RANGE);
 	uint32		s = rng_below(LION_CONTAINER_RANGE);
 	uint32		e = s + rng_below(LION_CONTAINER_RANGE - s);
+	uint64		mask;
 
 	/* readers */
 	(void) lion_container_contains(c, (uint16) lo);
@@ -2249,9 +2339,28 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 
 	st.n = 0;
 	st.bad = 0;
+	st.blocks = 0;
 	lion_container_iterate(c, damage_iter_cb, &st);
 	CHECK(st.n <= LION_CONTAINER_RANGE, "damaged: iterate() visits at most 32768 values");
 	CHECK(st.bad == 0, "damaged: iterate() hands out only lo values in range");
+
+	/*
+	 * The count engine's readers.  An image of exactly LION_BITSET_BYTES, and
+	 * a block mask that has every block iterate() hands out a member of - the
+	 * members the engine queues for a heap recheck - and no bit past
+	 * LION_BLOCKS_PER_CONTAINER, which the engine's per-block flags stop at.
+	 */
+	memset(dmg_img, 0, LION_BITSET_BYTES);
+	lion_container_or_into_bitset(c, dmg_img);
+	CHECK(guard_ok(dmg_img, LION_BITSET_BYTES),
+		  "damaged: or_into_bitset() stays inside its 4096-byte image");
+	mask = lion_container_block_mask(c);
+	CHECK((mask & ~TEST_BLOCK_BITS) == 0,
+		  "damaged: block_mask() sets no bit past LION_BLOCKS_PER_CONTAINER");
+	CHECK((st.blocks & ~mask) == 0,
+		  "damaged: block_mask() has every block iterate() hands out a member of");
+	CHECK(mask == image_blocks(dmg_img),
+		  "damaged: block_mask() names the blocks or_into_bitset() fills");
 
 	n = lion_container_to_array(c, dmg_out);
 	CHECK(n <= LION_CONTAINER_RANGE, "damaged: to_array() returns at most 32768 values");
@@ -2265,18 +2374,23 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 
 	(void) lion_container_and_cardinality(c, other);
 	(void) lion_container_and_cardinality(other, c);
-	(void) lion_container_and(c, other, dmg_dst);
-	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: and() result size");
-	(void) lion_container_and(other, c, dmg_dst);
-	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: and() result size");
-	(void) lion_container_or(c, other, dmg_dst);
-	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: or() result size");
-	(void) lion_container_or(other, c, dmg_dst);
-	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: or() result size");
-	(void) lion_container_andnot(c, other, dmg_dst);
-	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: andnot() result size");
-	(void) lion_container_andnot(other, c, dmg_dst);
-	CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, "damaged: andnot() result size");
+
+#define DAMAGE_SETOP(what, stmt) \
+	do { \
+		stmt; \
+		CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE, \
+			  "damaged: " what " result size"); \
+		CHECK(raw_in_range(dmg_dst), \
+			  "damaged: " what " result holds only members in range"); \
+	} while (0)
+
+	DAMAGE_SETOP("and()", (void) lion_container_and(c, other, dmg_dst));
+	DAMAGE_SETOP("and()", (void) lion_container_and(other, c, dmg_dst));
+	DAMAGE_SETOP("or()", (void) lion_container_or(c, other, dmg_dst));
+	DAMAGE_SETOP("or()", (void) lion_container_or(other, c, dmg_dst));
+	DAMAGE_SETOP("andnot()", (void) lion_container_andnot(c, other, dmg_dst));
+	DAMAGE_SETOP("andnot()", (void) lion_container_andnot(other, c, dmg_dst));
+#undef DAMAGE_SETOP
 	CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "damaged: set algebra stays inside dest");
 
 	/* mutators, each on a fresh copy */
@@ -2290,6 +2404,7 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 			  "damaged: " what " stays inside its buffer"); \
 		st.n = 0; \
 		st.bad = 0; \
+		st.blocks = 0; \
 		lion_container_iterate(dmg_work, damage_iter_cb, &st); \
 		CHECK(st.n <= LION_CONTAINER_RANGE && st.bad == 0, \
 			  "damaged: " what " leaves a container that iterates in range"); \
@@ -2384,6 +2499,7 @@ test_damaged_reported(void)
 	CHECK(n == LION_CONTAINER_RANGE, "overlapping runs yield each value once");
 	st.n = 0;
 	st.bad = 0;
+	st.blocks = 0;
 	lion_container_iterate(dmg_a, damage_iter_cb, &st);
 	CHECK(st.n == LION_CONTAINER_RANGE, "and iterate() visits each value once");
 	damage_exercise(dmg_a, dmg_b);
@@ -2447,6 +2563,253 @@ test_damaged_reported(void)
 	CHECK(guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE),
 		  "remove_range() over an unordered array stays inside its buffer");
 	damage_exercise(dmg_a, dmg_b);
+}
+
+/* Is bit lo of an image set? */
+static bool
+img_test(const uint64 *w, uint32 lo)
+{
+	return ((w[lo >> 6] >> (lo & 63)) & 1) != 0;
+}
+
+/* Number of bits set in an image. */
+static uint32
+img_card(const uint64 *w)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	for (i = 0; i < LION_BITSET_WORDS; i++)
+		n += (uint32) pg_popcount64(w[i]);
+	return n;
+}
+
+/*
+ * The count engine's union of k containers and its visibility-map mask
+ * carried their own copies of or_into_bitset() and block_mask(), without the
+ * library's masks, and a 2026-09-27 review found these shapes writing up to
+ * 12 KiB past a 4 KiB image and shifting by 64 or more.  Both are the
+ * library's now; this is what they must do with them.
+ */
+static void
+test_damaged_count_readers(void)
+{
+	uint64		mask;
+	uint64		expect;
+	uint32		i;
+
+	phase("damaged: ARRAY members past 32767, into an image and a block mask");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->cardinality = 3;
+	LION_ARRAY_DATA(dmg_a)[0] = 7;
+	LION_ARRAY_DATA(dmg_a)[1] = 32768 + 7000;
+	LION_ARRAY_DATA(dmg_a)[2] = 65535;	/* word 1023 of a 512-word image */
+	memset(dmg_img, 0, LION_BITSET_BYTES);
+	lion_container_or_into_bitset(dmg_a, dmg_img);
+	CHECK(guard_ok(dmg_img, LION_BITSET_BYTES),
+		  "or_into_bitset() stays inside a 4096-byte image");
+	CHECK(img_card(dmg_img) == 3 && img_test(dmg_img, 7) &&
+		  img_test(dmg_img, 7000) && img_test(dmg_img, 32767),
+		  "members past the range are masked into it, as iterate() takes them");
+	mask = lion_container_block_mask(dmg_a);
+	expect = lo_block_bit(7) | lo_block_bit(7000) | lo_block_bit(32767);
+	CHECK(mask == expect, "block_mask() masks them the same way");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* a full ARRAY of the largest uint16, which shifted by 127 at 8K */
+	for (i = 0; i < LION_ARRAY_MAX_CARD; i++)
+		LION_ARRAY_DATA(dmg_a)[i] = 65535;
+	dmg_a->cardinality = LION_ARRAY_MAX_CARD;
+	CHECK(lion_container_block_mask(dmg_a) == lo_block_bit(32767),
+		  "block_mask() of 2048 members of 65535 is the last block");
+	damage_exercise(dmg_a, dmg_b);
+
+	phase("damaged: RUN past 32767, into an image and a block mask");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->cardinality = 9;
+	LION_RUN_NRUNS(dmg_a) = 3;
+	LION_RUN_DATA(dmg_a)[0].start = 100;
+	LION_RUN_DATA(dmg_a)[0].len_minus_1 = 0;
+	LION_RUN_DATA(dmg_a)[1].start = 30000;
+	LION_RUN_DATA(dmg_a)[1].len_minus_1 = 65535;	/* to 95535 */
+	LION_RUN_DATA(dmg_a)[2].start = 65535;			/* empty */
+	LION_RUN_DATA(dmg_a)[2].len_minus_1 = 65535;
+	memset(dmg_img, 0, LION_BITSET_BYTES);
+	lion_container_or_into_bitset(dmg_a, dmg_img);
+	CHECK(guard_ok(dmg_img, LION_BITSET_BYTES),
+		  "or_into_bitset() of a run past the range stays inside the image");
+	CHECK(img_card(dmg_img) == 1 + (LION_CONTAINER_RANGE - 30000) &&
+		  img_test(dmg_img, 100) && img_test(dmg_img, 30000) &&
+		  img_test(dmg_img, 32767),
+		  "a run is clamped at 32767, and one starting past it is empty");
+	expect = lo_block_bit(100);
+	for (i = 30000 >> LION_OFFSET_BITS; i < LION_BLOCKS_PER_CONTAINER; i++)
+		expect |= UINT64CONST(1) << i;
+	CHECK(lion_container_block_mask(dmg_a) == expect,
+		  "block_mask() clamps the runs the same way");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* 1023 runs from 32767 to 98301 each, the most the clamp lets through */
+	LION_RUN_NRUNS(dmg_a) = 65535;
+	for (i = 0; i < LION_RUN_MAX_NRUNS; i++)
+	{
+		LION_RUN_DATA(dmg_a)[i].start = 32767;
+		LION_RUN_DATA(dmg_a)[i].len_minus_1 = 65534;
+	}
+	memset(dmg_img, 0, LION_BITSET_BYTES);
+	lion_container_or_into_bitset(dmg_a, dmg_img);
+	CHECK(guard_ok(dmg_img, LION_BITSET_BYTES) && img_card(dmg_img) == 1,
+		  "1023 runs past the range, claiming 65535, set lo 32767 alone");
+	CHECK(lion_container_block_mask(dmg_a) == lo_block_bit(32767),
+		  "and block_mask() the last block alone");
+	damage_exercise(dmg_a, dmg_b);
+}
+
+/*
+ * What the set algebra and the other mutators leave behind for operands the
+ * 2026-09-27 review listed: a result never stores a member past the range,
+ * even where an operand does; remove_range() leaves a container of at most
+ * LION_CONTAINER_MAX_SIZE even when it has nothing to remove; and the bulk
+ * builder, fed the pairs of a damaged sparse segment
+ * (lion_cursor_emit_segment()), builds a well-formed container of what it
+ * was fed, masked, instead of an unsorted one - or an assertion failure.
+ */
+static void
+test_damaged_results(void)
+{
+	Ref		   *r = &ref_a;
+	static const uint16 fed[] = {10, 5, 10, 40000, 3, 65535, 32767, 0};
+	uint32		i;
+
+	phase("damaged: set algebra of an ARRAY with members past 32767");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->cardinality = 4;
+	LION_ARRAY_DATA(dmg_a)[0] = 5;
+	LION_ARRAY_DATA(dmg_a)[1] = 40000;
+	LION_ARRAY_DATA(dmg_a)[2] = 50000;
+	LION_ARRAY_DATA(dmg_a)[3] = 65535;
+	lion_container_init(dmg_b, TEST_CKEY);
+	dmg_b->cardinality = 3;
+	LION_ARRAY_DATA(dmg_b)[0] = 5;
+	LION_ARRAY_DATA(dmg_b)[1] = 40000;
+	LION_ARRAY_DATA(dmg_b)[2] = 60000;
+
+	(void) lion_container_and(dmg_a, dmg_b, dmg_dst);
+	CHECK(dmg_dst->type == LION_CT_ARRAY && dmg_dst->cardinality == 2 &&
+		  LION_ARRAY_DATA(dmg_dst)[1] == (uint16) (40000 - LION_CONTAINER_RANGE),
+		  "and() of two ARRAYs stores the common member past the range masked");
+	(void) lion_container_or(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "or() of two ARRAYs stores members in range");
+	(void) lion_container_andnot(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "andnot() of two ARRAYs stores members in range");
+	damage_exercise(dmg_a, dmg_b);
+
+	/* against a BITSET and a RUN: the ARRAY x other paths */
+	gen_typed(r, &buf_b, LION_CT_BITSET);
+	memcpy(dmg_b, &buf_b, LION_CONTAINER_MAX_SIZE);
+	(void) lion_container_and(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "and() with a BITSET stores members in range");
+	(void) lion_container_andnot(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "andnot() of a BITSET stores members in range");
+	gen_typed(r, &buf_b, LION_CT_RUN);
+	memcpy(dmg_b, &buf_b, LION_CONTAINER_MAX_SIZE);
+	(void) lion_container_and(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "and() with a RUN stores members in range");
+	(void) lion_container_andnot(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "andnot() of a RUN stores members in range");
+
+	/*
+	 * The shortcuts that copy an operand (container_copy()): an empty BITSET,
+	 * because two ARRAYs that fit one take array_union() instead.
+	 */
+	lion_container_init(dmg_b, TEST_CKEY);
+	dmg_b->type = LION_CT_BITSET;
+	memset(LION_BITSET_DATA(dmg_b), 0, LION_BITSET_BYTES);
+	(void) lion_container_or(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst) && dmg_dst->cardinality == 4,
+		  "or() with an empty operand copies the other one masked");
+	(void) lion_container_or(dmg_b, dmg_a, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "... either way round");
+	(void) lion_container_andnot(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst) && dmg_dst->cardinality == 4,
+		  "andnot() of an empty operand copies the other one masked");
+	damage_exercise(dmg_a, dmg_b);
+
+	phase("damaged: set algebra of a RUN reaching past 32767");
+	lion_container_init(dmg_a, TEST_CKEY);
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->cardinality = 5;
+	LION_RUN_NRUNS(dmg_a) = 3;
+	LION_RUN_DATA(dmg_a)[0].start = 10;
+	LION_RUN_DATA(dmg_a)[0].len_minus_1 = 4;
+	LION_RUN_DATA(dmg_a)[1].start = 32000;
+	LION_RUN_DATA(dmg_a)[1].len_minus_1 = 10000;
+	LION_RUN_DATA(dmg_a)[2].start = 40000;
+	LION_RUN_DATA(dmg_a)[2].len_minus_1 = 3;
+	(void) lion_container_or(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst) && lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE,
+		  "or() with an empty operand copies a RUN clamped");
+	CHECK(lion_container_contains(dmg_dst, 12) && lion_container_contains(dmg_dst, 32767) &&
+		  lion_container_range_cardinality(dmg_dst, 0, LION_CONTAINER_RANGE - 1) ==
+		  5 + (LION_CONTAINER_RANGE - 32000),
+		  "... keeping what iterate() reads of it");
+	(void) lion_container_andnot(dmg_a, dmg_b, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "andnot() of an empty operand copies a RUN clamped");
+	(void) lion_container_and(dmg_a, dmg_a, dmg_dst);
+	CHECK(raw_in_range(dmg_dst), "and() of the RUN with itself stays in range");
+	damage_exercise(dmg_a, dmg_b);
+
+	phase("damaged: remove_range() of an empty RUN claiming 60000 runs");
+	for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+		((char *) dmg_a)[i] = (char) rng_next();
+	dmg_a->ckey = TEST_CKEY;
+	dmg_a->type = LION_CT_RUN;
+	dmg_a->flags = 0;
+	dmg_a->cardinality = 0;
+	LION_RUN_NRUNS(dmg_a) = 60000;
+	memcpy(dmg_work, dmg_a, LION_CONTAINER_MAX_SIZE);
+	CHECK(lion_container_remove_range(dmg_work, 100, 200) == 0,
+		  "remove_range() of an empty container removes nothing");
+	CHECK(lion_container_size(dmg_work) <= LION_CONTAINER_MAX_SIZE &&
+		  guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE),
+		  "... and leaves it at most 4104 bytes, like every mutator");
+	memcpy(dmg_work, dmg_a, LION_CONTAINER_MAX_SIZE);
+	(void) lion_container_remove_range(dmg_work, 200, 100);
+	CHECK(lion_container_size(dmg_work) <= LION_CONTAINER_MAX_SIZE,
+		  "... with an empty range too");
+	dmg_a->type = LION_CT_ARRAY;
+	dmg_a->cardinality = 0;
+	damage_exercise(dmg_a, dmg_b);
+
+	phase("damaged: append_sorted() fed values out of order, repeated and past 32767");
+	ref_init(r);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < lengthof(fed); i++)
+	{
+		lion_container_append_sorted(&buf_a.c, fed[i]);
+		(void) ref_add(r, fed[i] & (LION_CONTAINER_RANGE - 1));
+	}
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "a few members stay an ARRAY");
+	verify_full(&buf_a.c, r);
+
+	/* past LION_ARRAY_MAX_CARD, descending, into the BITSET it becomes */
+	for (i = 0; i < 3 * LION_ARRAY_MAX_CARD; i++)
+	{
+		uint32		v = 65535 - 10 * i;
+
+		lion_container_append_sorted(&buf_a.c, (uint16) v);
+		(void) ref_add(r, v & (LION_CONTAINER_RANGE - 1));
+		if (i % 7 == 0)
+		{
+			/* and a repeat of one it already has */
+			lion_container_append_sorted(&buf_a.c, (uint16) v);
+		}
+	}
+	CHECK(buf_a.c.type == LION_CT_BITSET, "past 2048 members it is a BITSET");
+	verify_full(&buf_a.c, r);
+	lion_container_optimize(&buf_a.c);
+	verify_full(&buf_a.c, r);
 }
 
 /*
@@ -2743,8 +3106,11 @@ main(void)
 	dmg_dst = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	dmg_work = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	dmg_out = exact_alloc(LION_CONTAINER_RANGE * sizeof(uint16));
+	dmg_img = exact_alloc(LION_BITSET_BYTES);
 	rng_seed(UINT64CONST(0x5EED3000));
 	test_damaged_reported();
+	test_damaged_count_readers();
+	test_damaged_results();
 	test_damaged_random(3000, UINT64CONST(0x5EED3002));
 	test_inplace_growth();
 

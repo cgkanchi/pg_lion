@@ -164,7 +164,8 @@ at the cost of a mask or a comparison where the payload meets an index:
   the array, and a representation change the claim allows but the payload contradicts (to ARRAY,
   from a BITSET that holds more than 2048 members) is not made, which leaves the container as damaged
   as it was for verify() to report rather than silently shorter;
-- every lo value handed to a caller is below 32768, which the callers' per-block arrays rely on.
+- every lo value handed to a caller is below 32768, which the callers' per-block arrays rely on,
+  and so is every member a result of the set algebra stores, because a result is handed on.
 
 For a well-formed container all of this is a no-op and every result is byte for byte what it was;
 for a damaged one the results are unspecified but deterministic, which WAL replay needs. Assert()
@@ -179,6 +180,23 @@ unit tests feed every function hand-made and random damaged containers in exact-
 READER's job is the size check itself: a container used straight from a page must lie inside its
 item, as `lion_inline_fetch()` checks, because reading up to 4104 bytes from the start of a short
 item can leave the page.
+
+The 2026-09-27 review found the readers outside the library skipping that job, and code outside it
+reading containers without the library's masks. So: every reader of a posting-tree leaf - the count
+cursors and the copies they materialize, the bitmap scan, VACUUM, the insert path and the page
+searches - takes its items through `lion_page_item_fetch()`, which checks the line pointer (a
+normal one, inside the page's item space at a MAXALIGNed offset, the test verify() and amcheck
+make), the item kind, the size the header gives against the line pointer's length and 4104, and
+that a segment is not empty (§13), and raises INDEX_CORRUPTED naming the block otherwise; an
+unchecked item used to be read wherever its line pointer and header said, up to 256 KiB past the
+page image. And the count engine's OR of k containers into a bitset image and its visibility-map
+block mask are the library's own (`lion_container_or_into_bitset()`, `lion_container_block_mask()`,
+unit-tested with the rest): its copies of them took an ARRAY member or a RUN past 32767 as it was,
+which wrote up to 12 KiB past a 4 KiB image, and shifted by 64 or more, which is undefined, could
+drop a block with members from the mask - its rows then counted without a look at the map - and at
+BLCKSZ 16K and 32K set flags past the engine's per-block array. A WAL redo of the two in-place calls
+(LION_OP_CONTAINER_ADD, LION_OP_SPARSE_INS, §25) checks its item the way the writer did before it
+logged the call.
 
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
@@ -2222,6 +2240,13 @@ Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contai
   array. `lion_sparse_extract()` builds its container with `lion_container_add()` rather than the
   bulk builder, which is promised ascending, unique members that a damaged segment need not have
   (the same bytes for a well-formed one, and at most three members).
+- And (2026-09-27 review): `lion_sparse_iterate()` and `lion_sparse_remove_if()` hand their callbacks
+  lo values masked into range - the window scan indexed a 4 KiB bitset image with them - and the
+  count cursor, which expands a segment's pairs through the bulk builder, masks them too, while the
+  builder itself now checks its promise instead of Assert()ing it (a value out of order or repeated
+  is added the slow way). An EMPTY segment is never stored, but a damaged page can hold one, and
+  `lion_item_last_ckey()` read its pair n - 1, 16 GiB past it: it now answers the header ckey, and
+  `lion_sparse_check()`, `lion_inline_fetch()` and `lion_page_item_fetch()` refuse one.
 
 Expected effect: c20k 475 MB → ~125 MB, c1m 337 MB → ~170 MB (GIN: 157 / 199 MB).
 

@@ -324,6 +324,7 @@ typedef struct LionSetCursor
 	OffsetNumber maxoff;
 	PGAlignedBlock *imgbuf;		/* private copy of the current container page */
 	Page		img;
+	BlockNumber imgblk;			/* the block img is a copy of */
 	bool		haspage;		/* img holds a leaf whose items are being
 								 * consumed; pinbuf pins it unless the cursor
 								 * was told to drop its pins (cx->droppins) */
@@ -1575,6 +1576,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 
 	while (BlockNumberIsValid(blkno))
 	{
+		BlockNumber imgblk = blkno;
 		OffsetNumber off;
 		OffsetNumber maxoff;
 
@@ -1583,15 +1585,10 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
-			ItemId		iid = PageGetItemId(img, off);
-			const LionContainer *c;
-			Size		sz;
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			c = (const LionContainer *) PageGetItem(img, iid);
-			sz = lion_item_size(c);
-			Assert(sz <= LION_CONTAINER_MAX_SIZE);
+			/* checked for what the copy and its readers need (§3) */
+			const LionContainer *c = lion_page_item_fetch(ps->index, img,
+														  imgblk, off);
+			Size		sz = lion_item_size(c);
 
 			/*
 			 * Give up as soon as the set fails BOTH budgets: a wide set is
@@ -1816,6 +1813,7 @@ static void
 lion_cursor_take_page(LionSetCursor *cur, Buffer buf)
 {
 	memcpy(cur->img, BufferGetPage(buf), BLCKSZ);
+	cur->imgblk = BufferGetBlockNumber(buf);
 	cur->haspage = true;
 
 	/*
@@ -1881,15 +1879,18 @@ lion_cursor_next_item(LionSetCursor *cur)
 		Buffer		buf;
 		Page		page;
 
-		/* Finish the page we already have in hand. */
-		while (cur->haspage && cur->off <= cur->maxoff)
+		/*
+		 * Finish the page we already have in hand.  An item goes to the
+		 * container code only once lion_page_item_fetch() has made sure it
+		 * holds what its header says (DESIGN.md §3, "untrusted containers").
+		 */
+		if (cur->haspage && cur->off <= cur->maxoff)
 		{
-			ItemId		iid = PageGetItemId(cur->img, cur->off);
+			OffsetNumber off = cur->off;
 
-			cur->off = OffsetNumberNext(cur->off);
-			if (!ItemIdIsUsed(iid))
-				continue;
-			return (const LionContainer *) PageGetItem(cur->img, iid);
+			cur->off = OffsetNumberNext(off);
+			return lion_page_item_fetch(cur->set->index, cur->img, cur->imgblk,
+										off);
 		}
 
 		/* Its items have all been consumed: the pin may go. */
@@ -1913,7 +1914,8 @@ lion_cursor_next_item(LionSetCursor *cur)
 				return NULL;
 			}
 			lion_cursor_take_page(cur, buf);
-			cur->off = lion_page_find_item(cur->img, cur->seekckey, &found);
+			cur->off = lion_page_find_item(cur->set->index, cur->img,
+										   cur->imgblk, cur->seekckey, &found);
 			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
@@ -1968,8 +1970,9 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 {
 	const LionContainer *seg = cur->seg;
 	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(seg);
-	const uint16 *los = LION_SPARSE_LOS_CONST(seg);
-	uint32		n = seg->cardinality;
+	/* the pairs a reader may look at, and los[] where that many ckeys end */
+	uint32		n = lion_sparse_npairs(seg);
+	const uint16 *los = LION_SPARSE_LOS_CONST_AT(seg, n);
 	uint32		ckey;
 	uint32		end;
 	Size		need;
@@ -2016,10 +2019,16 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 		cur->segbuf = (LionContainer *) palloc(cur->segcap);
 	}
 
+	/*
+	 * A segment's pairs are data (DESIGN.md §3): a lo is masked into range
+	 * before the builder sees it, and the builder copes with pairs that are
+	 * out of order or repeated.
+	 */
 	lion_container_init(cur->segbuf, ckey);
 	do
 	{
-		lion_container_append_sorted(cur->segbuf, los[cur->segpos]);
+		lion_container_append_sorted(cur->segbuf,
+									 (uint16) (los[cur->segpos] & LION_LO_MASK));
 		cur->segpos++;
 	} while (cur->segpos < n && ckeys[cur->segpos] == ckey);
 
@@ -2151,7 +2160,8 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 			 * page after it.  Either way this is where the walk resumes; an
 			 * offset past the last item simply ends the cursor.
 			 */
-			cur->off = lion_page_find_item(cur->img, target, &found);
+			cur->off = lion_page_find_item(cur->set->index, cur->img,
+										   cur->imgblk, target, &found);
 			return;
 		}
 
@@ -2810,7 +2820,7 @@ lion_wide_fill(LionExprCursor *c, uint64 start)
 			img = lion_wide_image(w, sub.ckey);
 			if (img == NULL)
 				break;			/* the key is the new end, and next */
-			lion_bits_or_container(img, sub.cur);
+			lion_container_or_into_bitset(sub.cur, img);
 			lion_ecursor_next(&sub);
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -2957,73 +2967,11 @@ lion_or_heap_pop(LionExprCursor *c)
 /* ---- the union of more than two containers, in one pass ---- */
 
 /*
- * OR one container into a bitset image of a whole container key's range.
- * This is lion_container.c's own container_or_bitset(), which is private to
- * that module; it is repeated here rather than exported because the union of
- * k containers is this file's problem (DESIGN.md §15) and the shape of a
- * container payload is lion_container.h's published interface.
- */
-void
-lion_bits_or_container(uint64 *w, const LionContainer *c)
-{
-	const char *payload = (const char *) c + LION_CONTAINER_HDRSZ;
-	uint32		i;
-
-	switch (c->type)
-	{
-		case LION_CT_ARRAY:
-			{
-				const uint16 *arr = (const uint16 *) payload;
-
-				for (i = 0; i < c->cardinality; i++)
-					w[arr[i] >> 6] |= UINT64CONST(1) << (arr[i] & 63);
-				break;
-			}
-		case LION_CT_BITSET:
-			{
-				const uint64 *src = (const uint64 *) payload;
-				int			k;
-
-				for (k = 0; k < LION_BITSET_WORDS; k++)
-					w[k] |= src[k];
-				break;
-			}
-		case LION_CT_RUN:
-			{
-				uint32		nruns = *(const uint16 *) payload;
-				const LionRun *runs = (const LionRun *) (payload + sizeof(uint16));
-
-				for (i = 0; i < nruns; i++)
-				{
-					uint32		first = runs[i].start;
-					uint32		last = first + runs[i].len_minus_1;
-					uint32		fw = first >> 6;
-					uint32		lw = last >> 6;
-					uint64		fmask = PG_UINT64_MAX << (first & 63);
-					uint64		lmask = PG_UINT64_MAX >> (63 - (last & 63));
-
-					Assert(last < LION_CONTAINER_RANGE);
-					if (fw == lw)
-						w[fw] |= fmask & lmask;
-					else
-					{
-						uint32		j;
-
-						w[fw] |= fmask;
-						for (j = fw + 1; j < lw; j++)
-							w[j] = PG_UINT64_MAX;
-						w[lw] |= lmask;
-					}
-				}
-				break;
-			}
-		default:
-			Assert(false);		/* a sparse segment is never a container */
-			break;
-	}
-}
-
-/*
+ * The containers are ORed into the image by lion_container_or_into_bitset(),
+ * the container library's own: this file used to carry a copy of it, which
+ * lacked the library's masks and wrote up to 12 KiB past the image for a
+ * damaged container (2026-09-27 review).
+ *
  * Turn the accumulated image into a container in dest (capacity
  * LION_CONTAINER_MAX_SIZE), in the smallest representation, exactly as
  * lion_container_or() would have left it.
@@ -3209,7 +3157,7 @@ lion_ecursor_build(LionExprCursor *c)
 			/* One pass over the containers, one container built at the end. */
 			memset(c->bits, 0, LION_BITSET_BYTES);
 			for (i = 0; i < c->nhot; i++)
-				lion_bits_or_container(c->bits, c->hot[i].cur);
+				lion_container_or_into_bitset(c->hot[i].cur, c->bits);
 			lion_bits_to_container(c->bits, minckey, c->acc[0]);
 			c->cur = c->acc[0];
 		}
@@ -3759,79 +3707,14 @@ lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, uint64 wanted,
 }
 
 /*
- * The other half of the pair: which of the heap blocks a container covers have
- * at least one member, in the same bit numbering.
- *
- * One pass over the container, whatever its representation.  The obvious
- * alternative - lion_container_range_cardinality() once per block range - is
- * LION_BLOCKS_PER_CONTAINER binary searches whether the container holds three
- * members or thirty-two thousand, and that cost is paid even when the answer
- * is going to be "all of it is all-visible, count the cardinality".
+ * The other half of the pair - which of the heap blocks a container covers
+ * have at least one member, in the same bit numbering - is the container
+ * library's lion_container_block_mask().  This file used to carry its own,
+ * which took a damaged container's members and runs unmasked: past the range
+ * they shifted by 64 or more, which is undefined and could drop a block with
+ * members from the mask, and at BLCKSZ 16K and 32K they set bits past the
+ * flags lion_count_container_vm() keeps per block (2026-09-27 review).
  */
-#define LION_BITSET_WORDS_PER_BLOCK	(LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER)
-
-StaticAssertDecl(LION_BITSET_WORDS_PER_BLOCK * LION_BLOCKS_PER_CONTAINER ==
-				 LION_BITSET_WORDS,
-				 "pg_lion: bitset words do not divide evenly among heap blocks");
-
-static uint64
-lion_container_block_mask(const LionContainer *c)
-{
-	const char *payload = (const char *) c + LION_CONTAINER_HDRSZ;
-	uint64		mask = 0;
-	uint32		i;
-
-	switch (c->type)
-	{
-		case LION_CT_ARRAY:
-			{
-				const uint16 *arr = (const uint16 *) payload;
-
-				for (i = 0; i < c->cardinality; i++)
-					mask |= UINT64CONST(1) << (arr[i] >> LION_OFFSET_BITS);
-				break;
-			}
-		case LION_CT_BITSET:
-			{
-				const uint64 *w = (const uint64 *) payload;
-				int			b;
-
-				for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
-				{
-					uint64		any = 0;
-					int			k;
-
-					for (k = 0; k < LION_BITSET_WORDS_PER_BLOCK; k++)
-						any |= w[b * LION_BITSET_WORDS_PER_BLOCK + k];
-					if (any != 0)
-						mask |= UINT64CONST(1) << b;
-				}
-				break;
-			}
-		case LION_CT_RUN:
-			{
-				uint32		nruns = *(const uint16 *) payload;
-				const LionRun *runs = (const LionRun *) (payload + sizeof(uint16));
-
-				for (i = 0; i < nruns; i++)
-				{
-					uint32		first = runs[i].start >> LION_OFFSET_BITS;
-					uint32		last = (((uint32) runs[i].start +
-										 runs[i].len_minus_1) >> LION_OFFSET_BITS);
-
-					Assert(last < LION_BLOCKS_PER_CONTAINER);
-					mask |= (PG_UINT64_MAX >> (63 - last)) &
-						(PG_UINT64_MAX << first);
-				}
-				break;
-			}
-		default:
-			Assert(false);
-			break;
-	}
-
-	return mask;
-}
 
 /*
  * Assert builds cross-check every mask against the function it replaces.  This
@@ -4534,7 +4417,15 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 			needrecheck[b] = true;
 			dirty_members += lion_container_range_cardinality(c, lo_start, lo_end);
 		}
-		Assert(dirty_members <= lion_container_cardinality(c));
+
+		/*
+		 * Only a damaged container can hold more members in some blocks than
+		 * its header says it holds in all of them (DESIGN.md §3: the header's
+		 * cardinality is a claim).  Its count is then wrong either way, but
+		 * not by four billion, and not by an assertion failure.
+		 */
+		if (unlikely(dirty_members > lion_container_cardinality(c)))
+			dirty_members = lion_container_cardinality(c);
 
 		cx->count += lion_container_cardinality(c) - dirty_members;
 		cx->stats.blocks_skipped_via_vm += pg_popcount64(members & allvis);

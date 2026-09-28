@@ -53,8 +53,9 @@
  *
  *	  DAMAGED INPUT, as for containers (lion_container.h): every function is
  *	  memory-safe for any pairs behind a LION_CT_SPARSE header, never looks
- *	  at more than lion_sparse_npairs() pairs - 4100 bytes - and never leaves
- *	  a segment larger than LION_CONTAINER_MAX_SIZE; what a damaged segment
+ *	  at more than lion_sparse_npairs() pairs - 4100 bytes - never hands a
+ *	  caller a lo at or above LION_CONTAINER_RANGE, and never leaves a
+ *	  segment larger than LION_CONTAINER_MAX_SIZE; what a damaged segment
  *	  yields is unspecified, and lion_sparse_check() is what finds it.
  *-------------------------------------------------------------------------
  */
@@ -94,6 +95,10 @@ StaticAssertDecl(LION_SPARSE_MAX_PAIRS == 682,
 #define LION_SPARSE_LOS_CONST(s) \
 	((const uint16 *) ((const char *) (s) + LION_CONTAINER_HDRSZ + \
 					   (Size) (s)->cardinality * sizeof(uint32)))
+/* los[] where n ckeys end: with n = lion_sparse_npairs(), for a reader */
+#define LION_SPARSE_LOS_CONST_AT(s, n) \
+	((const uint16 *) ((const char *) (s) + LION_CONTAINER_HDRSZ + \
+					   (Size) (n) * sizeof(uint32)))
 
 /* Size of a segment with npairs pairs. */
 static inline Size
@@ -149,14 +154,23 @@ lion_item_first_ckey(const LionContainer *item)
 	return item->ckey;
 }
 
-/* Last ckey an item covers: a container covers one, a segment a range. */
+/*
+ * Last ckey an item covers: a container covers one, a segment a range.  An
+ * empty segment is never stored, but a damaged page can hold one, and its
+ * pair n - 1 is 16 GiB past the item: it covers its header ckey instead, like
+ * a container.  The readers refuse one anyway (lion_inline_fetch(),
+ * lion_page_item_fetch()); this is for everything else that asks.
+ */
 static inline uint32
 lion_item_last_ckey(const LionContainer *item)
 {
 	if (item->type == LION_CT_SPARSE)
 	{
-		Assert(item->cardinality > 0);
-		return LION_SPARSE_CKEYS_CONST(item)[lion_sparse_npairs(item) - 1];
+		uint32		n = lion_sparse_npairs(item);
+
+		if (unlikely(n == 0))
+			return item->ckey;
+		return LION_SPARSE_CKEYS_CONST(item)[n - 1];
 	}
 	return item->ckey;
 }
@@ -262,9 +276,10 @@ extern void lion_sparse_iterate(const LionContainer *s, lion_pair_callback cb,
 							   void *arg);
 
 /*
- * Structural validation for lion_index_verify(): type, flags, pair count,
- * the header ckey, sortedness and uniqueness, and that the segment fits in
- * avail_bytes.  Returns false and sets *errmsg (a static string) on failure.
+ * Structural validation for lion_index_verify(): type, flags, pair count
+ * (an empty segment is refused: one is never stored), the header ckey,
+ * sortedness and uniqueness, and that the segment fits in avail_bytes.
+ * Returns false and sets *errmsg (a static string) on failure.
  */
 extern bool lion_sparse_check(const LionContainer *s, Size avail_bytes,
 							 const char **errmsg);

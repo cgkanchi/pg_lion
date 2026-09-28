@@ -1354,21 +1354,39 @@ extern void lion_posting_finish_split_sep(Relation index, Relation heaprel,
 										  Buffer pbuf, const uint32 *knownsep);
 
 /*
+ * The item at off of a container page (block blkno of index; page may be a
+ * private copy of it), checked for what the container and segment code needs
+ * of an item it is handed: a normal line pointer inside the page, a known
+ * item type, a size that fits the item, and no empty segment.  Any damage is
+ * an ERROR (ERRCODE_INDEX_CORRUPTED).  Every reader of a container page takes
+ * its items through this.
+ */
+extern LionContainer *lion_page_item_fetch(Relation index, Page page,
+										   BlockNumber blkno, OffsetNumber off);
+
+/*
  * Locate a container by ckey on a container page.  Returns the offset of the
  * item whose own ckey is exactly ckey, or the offset where it should be
  * inserted with *found=false.  Only for callers that know they are looking
- * for a regular container (a segment's own ckey is its first one).
+ * for a regular container (a segment's own ckey is its first one).  Every
+ * item the search looks at goes through lion_page_item_fetch(), so the one
+ * found is fit to be handed on.
  */
-extern OffsetNumber lion_page_find_container(Page page, uint32 ckey, bool *found);
+extern OffsetNumber lion_page_find_container(Relation index, Page page,
+											 BlockNumber blkno, uint32 ckey,
+											 bool *found);
 
 /*
  * Locate the item that covers ckey on a container page: the container with
  * that ckey, or the sparse segment whose range [first ckey, last ckey]
  * contains it.  With *found=false the return value is the offset at which an
  * item for ckey would have to be inserted to keep the items ordered by first
- * ckey (DESIGN.md §13; item ranges never overlap or interleave).
+ * ckey (DESIGN.md §13; item ranges never overlap or interleave).  Items are
+ * checked as lion_page_find_container() checks them.
  */
-extern OffsetNumber lion_page_find_item(Page page, uint32 ckey, bool *found);
+extern OffsetNumber lion_page_find_item(Relation index, Page page,
+										BlockNumber blkno, uint32 ckey,
+										bool *found);
 
 /*
  * Insert-or-replace a container in the chain of an entry, splitting pages as

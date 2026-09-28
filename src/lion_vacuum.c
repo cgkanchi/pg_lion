@@ -2155,18 +2155,18 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
 	for (off = FirstOffsetNumber; off <= maxoff; off++)
 	{
 		ItemId		iid = PageGetItemId(page, off);
+		LionContainer *onpage;
 		LionVacItem *item;
 		Size		isize;
 		uint32		nremoved;
 
-		if (!ItemIdIsUsed(iid))
-			continue;
-
+		/* its line pointer, type and size checked (DESIGN.md §3) */
+		onpage = lion_page_item_fetch(vs->index, page, blk, off);
 		isize = ItemIdGetLength(iid);
 		if (isize > LION_CONTAINER_MAX_SIZE)
 			elog(ERROR, "lion index: item of %zu bytes at %u/%u",
 				 isize, blk, off);
-		memcpy(vs->cbuf, PageGetItem(page, iid), isize);
+		memcpy(vs->cbuf, onpage, isize);
 
 		nremoved = lion_vac_filter_item(vs->cbuf, &pred);
 		if (nremoved == 0)
@@ -2397,7 +2397,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			continue;
 		}
 
-		off = lion_page_find_container(page, ckey, &found);
+		off = lion_page_find_container(index, page, blk, ckey, &found);
 		next = LionPageGetOpaque(page)->rightlink;
 
 		if (!found)
@@ -2452,7 +2452,8 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		if (ItemIdGetLength(iid) > LION_CONTAINER_MAX_SIZE)
 			elog(ERROR, "lion index: container of %zu bytes at %u/%u",
 				 (Size) ItemIdGetLength(iid), blk, off);
-		memcpy(vs->cbuf, PageGetItem(page, iid), ItemIdGetLength(iid));
+		memcpy(vs->cbuf, lion_page_item_fetch(index, page, blk, off),
+			   ItemIdGetLength(iid));
 
 		/*
 		 * Only containers can grow while being filtered, and a container's

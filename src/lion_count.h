@@ -607,10 +607,10 @@ extern const LionContainer *lion_stream_next(LionSetStream *st);
 
 /*
  * A bitset image of one container key's whole range (LION_BITSET_WORDS
- * words): OR a container into it, and turn it back into a container in the
- * smallest representation (dest has LION_CONTAINER_MAX_SIZE bytes).
+ * words), which lion_container_or_into_bitset() ORs containers into: turn it
+ * back into a container in the smallest representation (dest has
+ * LION_CONTAINER_MAX_SIZE bytes).
  */
-extern void lion_bits_or_container(uint64 *w, const LionContainer *c);
 extern void lion_bits_to_container(const uint64 *w, uint32 ckey,
 								   LionContainer *dest);
 

@@ -323,6 +323,7 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 	{
 		Page		page;
 		Page		cpage = (Page) copy->data;
+		BlockNumber cblkno = BufferGetBlockNumber(buf);
 		OffsetNumber maxoff;
 		OffsetNumber off;
 
@@ -333,15 +334,11 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 		blkno = LionPageGetOpaque(cpage)->rightlink;
 
 		maxoff = PageGetMaxOffsetNumber(cpage);
+		/* each item checked before the container code reads it (§3) */
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
-		{
-			ItemId		iid = PageGetItemId(cpage, off);
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			ntids += lion_container_to_tbm((LionContainer *) PageGetItem(cpage, iid),
-										  tbm, recheck);
-		}
+			ntids += lion_container_to_tbm(lion_page_item_fetch(index, cpage,
+																 cblkno, off),
+										   tbm, recheck);
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -2722,7 +2719,7 @@ lion_source_union_window(LionSource *src)
 			if (src->uimg[k - src->ustart] == NULL)
 				src->uimg[k - src->ustart] = (uint64 *)
 					MemoryContextAllocZero(src->cxt, LION_BITSET_BYTES);
-			lion_bits_or_container(src->uimg[k - src->ustart], c);
+			lion_container_or_into_bitset(c, src->uimg[k - src->ustart]);
 			src->utouched[k - src->ustart] = true;
 		}
 		lion_stream_end(st);
@@ -2832,7 +2829,7 @@ lion_window_or_item(LionWindowPos *pos, const LionContainer *c)
 	if (!lion_window_slot(pos, c->ckey, &slot))
 		return false;
 	if (slot >= 0)
-		lion_bits_or_container(pos->src->wwalk[slot], c);
+		lion_container_or_into_bitset(c, pos->src->wwalk[slot]);
 	return true;
 }
 
@@ -2882,7 +2879,7 @@ lion_source_window(LionSource *src)
 		if (src->wrest[k] == NULL)
 			src->wrest[k] = (uint64 *) palloc(LION_BITSET_BYTES);
 		memset(src->wrest[k], 0, LION_BITSET_BYTES);
-		lion_bits_or_container(src->wrest[k], c);
+		lion_container_or_into_bitset(c, src->wrest[k]);
 		src->wkeys[k] = c->ckey;
 		src->wn++;
 	}

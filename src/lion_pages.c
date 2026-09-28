@@ -1483,6 +1483,9 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	if (csize < LION_CONTAINER_HDRSZ || csize > LION_CONTAINER_MAX_SIZE ||
 		csize > avail)
 		elog(ERROR, "lion index: malformed inline item");
+	/* never stored, and it has no last container key (lion_sparse.h) */
+	if (buf->type == LION_CT_SPARSE && buf->cardinality == 0)
+		elog(ERROR, "lion index: empty sparse segment in an inline payload");
 
 	memcpy(buf, payload + *off, csize);
 	*off += csize;
@@ -1808,6 +1811,108 @@ lion_replace_entry(Relation index, LionWalState *state, Buffer buf,
  * --------------------------------------------------------------------- */
 
 /*
+ * The item at off of a container page - a posting-tree leaf - for a caller
+ * that is about to hand it to the container or segment code.
+ *
+ * AN ITEM ON A PAGE IS DATA (lion_container.c, "untrusted containers").  The
+ * container and segment code is memory-safe for any payload behind a header
+ * of a valid type, provided the item really holds the lion_item_size() its
+ * header claims: that is the one thing a caller has to know, and this is
+ * where it is made sure of for a page item, as lion_inline_fetch() makes sure
+ * of it for an INLINE payload.  The line pointer has to be a normal one - a
+ * container page never has any other kind, because every delete there
+ * compacts - that lies inside the page's item space at a MAXALIGNed offset,
+ * the test lion_verify_itemid() makes, which is amcheck's; the type has to be
+ * one of the four item kinds; the size the header gives has to fit both the
+ * line pointer's length and the largest legal item; and a sparse segment has
+ * to hold a pair, because an empty one is never stored and has no last
+ * container key.  Anything else is an ERROR naming the index and the block.
+ * Before this, a damaged item was read wherever its line pointer and its
+ * header said, up to 256 KiB past the page image (2026-09-27 review).  What
+ * the payload itself holds is lion_index_verify()'s business.
+ *
+ * It is a dozen comparisons per item, against the hundreds to thousands of
+ * instructions the container code then spends on it.  page may be a private
+ * copy of the block - the readers copy a leaf under its lock and read the
+ * copy - which is why the block number is passed in, for the message.
+ */
+LionContainer *
+lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
+					 OffsetNumber off)
+{
+	PageHeader	phdr = (PageHeader) page;
+	ItemId		iid;
+	LionContainer *item;
+	unsigned	lpoff;
+	unsigned	lplen;
+	Size		size;
+
+	/* the line pointer array and the item space are on the page */
+	if (unlikely(phdr->pd_lower > phdr->pd_upper ||
+				 phdr->pd_upper > phdr->pd_special ||
+				 phdr->pd_special > BLCKSZ))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": container page %u has a corrupt page header (lower %u, upper %u, special %u)",
+						RelationGetRelationName(index), blkno,
+						phdr->pd_lower, phdr->pd_upper, phdr->pd_special)));
+	if (unlikely(off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": container page %u has no item %u",
+						RelationGetRelationName(index), blkno, off)));
+
+	iid = PageGetItemId(page, off);
+	if (unlikely(!ItemIdIsNormal(iid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": line pointer %u on container page %u is %s, which a container page never has",
+						RelationGetRelationName(index), off, blkno,
+						!ItemIdIsUsed(iid) ? "unused" :
+						ItemIdIsDead(iid) ? "dead" : "a redirect")));
+
+	lpoff = ItemIdGetOffset(iid);
+	lplen = ItemIdGetLength(iid);
+	if (unlikely(lplen < LION_CONTAINER_HDRSZ ||
+				 lpoff < phdr->pd_upper || lpoff + lplen > phdr->pd_special ||
+				 lpoff != MAXALIGN(lpoff)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": line pointer %u on container page %u points at %u bytes at offset %u, outside the item space %u .. %u",
+						RelationGetRelationName(index), off, blkno, lplen,
+						lpoff, phdr->pd_upper, phdr->pd_special)));
+
+	item = (LionContainer *) PageGetItem(page, iid);
+	if (unlikely(item->type != LION_CT_ARRAY && item->type != LION_CT_BITSET &&
+				 item->type != LION_CT_RUN && item->type != LION_CT_SPARSE))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": item %u on container page %u has type %u, which is no item kind",
+						RelationGetRelationName(index), off, blkno,
+						item->type)));
+
+	/* a RUN is sized by its run count, which follows the header */
+	if (item->type == LION_CT_RUN && lplen < LION_CONTAINER_HDRSZ + sizeof(uint16))
+		size = LION_CONTAINER_HDRSZ + sizeof(uint16);
+	else
+		size = lion_item_size(item);
+	if (unlikely(size > lplen || size > LION_CONTAINER_MAX_SIZE))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": item %u on container page %u needs %zu bytes, but has %u",
+						RelationGetRelationName(index), off, blkno, size,
+						lplen)));
+
+	if (unlikely(item->type == LION_CT_SPARSE && item->cardinality == 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": sparse segment %u on container page %u is empty",
+						RelationGetRelationName(index), off, blkno)));
+
+	return item;
+}
+
+/*
  * Recompute minckey/maxckey of a container page from its items.
  *
  * The bounds are the first ckey of the first item and the LAST ckey of the
@@ -1846,7 +1951,8 @@ lion_page_update_minmax(Page page)
  * item that can possibly cover it.
  */
 OffsetNumber
-lion_page_find_item(Page page, uint32 ckey, bool *found)
+lion_page_find_item(Relation index, Page page, BlockNumber blkno, uint32 ckey,
+					bool *found)
 {
 	OffsetNumber low = FirstOffsetNumber;
 	OffsetNumber high = PageGetMaxOffsetNumber(page);
@@ -1857,7 +1963,7 @@ lion_page_find_item(Page page, uint32 ckey, bool *found)
 	while (low <= high)
 	{
 		OffsetNumber mid = low + (high - low) / 2;
-		LionContainer *c = (LionContainer *) PageGetItem(page, PageGetItemId(page, mid));
+		LionContainer *c = lion_page_item_fetch(index, page, blkno, mid);
 
 		if (lion_item_first_ckey(c) <= ckey)
 		{
@@ -1876,7 +1982,7 @@ lion_page_find_item(Page page, uint32 ckey, bool *found)
 		return FirstOffsetNumber;	/* ckey belongs before every item */
 
 	{
-		LionContainer *c = (LionContainer *) PageGetItem(page, PageGetItemId(page, cand));
+		LionContainer *c = lion_page_item_fetch(index, page, blkno, cand);
 
 		if (lion_item_last_ckey(c) >= ckey)
 		{
@@ -1893,7 +1999,8 @@ lion_page_find_item(Page page, uint32 ckey, bool *found)
  * offset is the position the container should be inserted at.
  */
 OffsetNumber
-lion_page_find_container(Page page, uint32 ckey, bool *found)
+lion_page_find_container(Relation index, Page page, BlockNumber blkno,
+						 uint32 ckey, bool *found)
 {
 	OffsetNumber low = FirstOffsetNumber;
 	OffsetNumber high = PageGetMaxOffsetNumber(page);
@@ -1904,7 +2011,7 @@ lion_page_find_container(Page page, uint32 ckey, bool *found)
 	while (low <= high)
 	{
 		OffsetNumber mid = low + (high - low) / 2;
-		LionContainer *c = (LionContainer *) PageGetItem(page, PageGetItemId(page, mid));
+		LionContainer *c = lion_page_item_fetch(index, page, blkno, mid);
 
 		if (c->ckey == ckey)
 		{
@@ -2014,7 +2121,8 @@ lion_chain_put_container_locked_ext(Relation index, Relation heaprel, Buffer buf
 	Assert(c->type != LION_CT_SPARSE);
 	Assert(LionPageIsContainer(page));
 
-	off = lion_page_find_container(page, c->ckey, &found);
+	off = lion_page_find_container(index, page, BufferGetBlockNumber(buf),
+								   c->ckey, &found);
 	*ncontainers_delta = found ? 0 : 1;
 
 	lion_chain_put_items_locked_ext(index, heaprel, buf, entrybuf, entryoff,
@@ -2763,9 +2871,20 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		{
 			ItemId		iid = PageGetItemId(page, firstright + i);
 			Size		sz = ItemIdGetLength(iid);
+			const LionContainer *item;
 
-			Assert(used + MAXALIGN(sz) <= BLCKSZ);
-			memcpy(movebuf + used, PageGetItem(page, iid), sz);
+			/*
+			 * Items are data (lion_page_item_fetch()), and so are the line
+			 * pointers' lengths: ones that overlap could add up to more than
+			 * the page, and movebuf is a page.
+			 */
+			item = lion_page_item_fetch(index, page, blk, firstright + i);
+			if (unlikely(used + MAXALIGN(sz) > BLCKSZ))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": the items of container page %u add up to more than a page",
+								RelationGetRelationName(index), blk)));
+			memcpy(movebuf + used, item, sz);
 			moveptr[i] = movebuf + used;
 			movelen[i] = sz;
 			used += MAXALIGN(sz);
