@@ -72,10 +72,40 @@ SELECT lion_cmp('lion_vac', 'k = 7');
 SELECT lion_cmp('lion_vac', 'k = 39');
 SELECT lion_cmp('lion_vac', 't = ''v3''');
 
--- The index statistics VACUUM reported match what the index holds.
+-- The index statistics VACUUM reported match what the index holds: its rows
+-- (DESIGN.md §18, "Statistics"), which a one-column index has one posting of
+-- each.
 SELECT (SELECT ntids FROM lion_index_stats('lion_vac_k')) =
 	   (SELECT reltuples::int8 FROM pg_class WHERE relname = 'lion_vac_k')
 	   AS reltuples_matches_ntids;
+
+/*
+ * Rows, not postings.  A multicolumn index posts a row once per key column,
+ * a multi-key one once per element, so their postings are a multiple of
+ * their rows - and VACUUM used to report the postings, which ANALYZE then
+ * overwrote with rows, and the next VACUUM with postings again.  Each index
+ * here holds the rows the one-column index holds.  The multi-key index has
+ * no scalar column to count them by and reports the heap's count, as GIN
+ * does.
+ */
+CREATE TABLE lion_vacrows (i int4, k int4, t text, a int4[]);
+INSERT INTO lion_vacrows
+SELECT i, i % 50, 'v' || (i % 7), ARRAY[i % 3, 10 + i % 5, 20 + i % 4]
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lion_vacrows_k ON lion_vacrows USING lion (k);
+CREATE INDEX lion_vacrows_kt ON lion_vacrows USING lion (k, t);
+CREATE INDEX lion_vacrows_a ON lion_vacrows USING lion (a);
+DELETE FROM lion_vacrows WHERE i % 3 = 0;
+VACUUM lion_vacrows;
+SELECT c.relname,
+	   c.reltuples::int8 = (SELECT ntids FROM lion_index_stats('lion_vacrows_k'))
+		   AS reltuples_is_rows,
+	   c.reltuples::int8 < (SELECT sum(ntids) FROM lion_index_stats(c.oid))
+		   AS fewer_than_postings
+  FROM pg_class c
+ WHERE c.relname IN ('lion_vacrows_k', 'lion_vacrows_kt', 'lion_vacrows_a')
+ ORDER BY c.relname COLLATE "C";
+DROP TABLE lion_vacrows;
 
 -- Whole keys: the entries whose posting sets are now empty are DELETED
 -- (DESIGN.md §18), so the index forgets those keys entirely.

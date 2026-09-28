@@ -595,13 +595,17 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    whose ntids reaches 0 is DELETED, and its whole posting tree freed bottom up, in a final step for
    its leaf (§18). A page VACUUM cleanup-locked without writing to it joins the standby barrier of
    §25.
-3. Report stats: num_pages, num_index_tuples = Σ ntids, tuples_removed, and the free pages (§18,
-   "Page counts"): pages_newly_deleted, the pages this VACUUM freed - including what the leak sweep
-   at the end recovered from blocks the walk never reached - ADDED UP over its ambulkdelete calls;
-   pages_deleted, the free pages the index holds at the end of the call; and pages_free, those of
-   them the next allocation could take already.
+3. Report stats: num_pages, num_index_tuples = the ROWS the index holds (§18, "Statistics": Σ
+   ntids over the entries of its first scalar key column, the heap's row count when it has none),
+   tuples_removed (postings), and the free pages (§18, "Page counts"): pages_newly_deleted, the
+   pages this VACUUM freed - including what the leak sweep at the end recovered from blocks the walk
+   never reached - ADDED UP over its ambulkdelete calls; pages_deleted, the free pages the index
+   holds at the end of the call; and pages_free, those of them the next allocation could take
+   already.
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
-   counting pages; otherwise pass it through.
+   counting pages, with the heap's row count marked as an estimate; otherwise pass it through. An
+   index of multi-key columns only reports the heap's row count either way, exact when the heap's
+   is (§18, "Statistics").
 
 BUILD (`lion_build.c`, `lion_spool.c`)
 1. table_index_build_scan's callback APPENDS each row's code to its key's entry in a per-key-column
@@ -3095,10 +3099,11 @@ phrase form **68.6 against 31.8**. So `lioncostestimate` now asks, before callin
   same way the count pushdown asks;
 - a multi-key query whose value is not a plan-time Const is costed as ALL, because the MODE follows
   the query's shape and an unknown shape has to be assumed to be the expensive one;
-- then `numIndexTuples` is the index's whole `reltuples` - its (key, row) postings, which is what
-  `lionbuild` reports and `lionvacuumcleanup` keeps, though an ANALYZE since will have overwritten it
-  with the heap's row count and made this a lower bound - which prorates into every index page, and
-  any page the proration still leaves out is added at random_page_cost;
+- then `numIndexTuples` is the index's whole tuple count as the planner has it - its ROWS, the
+  table's or a partial index's `reltuples`, which VACUUM and ANALYZE both set to rows (§18,
+  "Statistics"; VACUUM used to set the postings) and which is therefore a lower bound on the
+  postings a multi-key column's walk reads - which prorates into every index page, and any page the
+  proration still leaves out is added at random_page_cost;
 - and for the multi-key fallback ONLY, `indexSelectivity` becomes 1.0, so the bitmap heap scan above
   is costed as a recheck of the whole table. `IS NOT NULL` keeps the clause's own selectivity: the
   rows it emits are exactly the rows it selects, so its heap side is not a full recheck even though
@@ -3506,6 +3511,24 @@ reusable when it is all-zero, or DELETED with its safexid behind every snapshot,
 lion_alloc_page()'s test.  A page freed a moment ago is free and not yet reusable: "30 newly
 deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all still
 reports none of them, §5 step 4: counting them would mean reading every page of the index.)
+
+**Statistics** (2026-09-27 review).  `num_index_tuples` becomes the index's `pg_class.reltuples`
+whenever it is not marked estimated, and the planner reads that as ROWS - a partial index's size
+is estimate_rel_size()'s tuples-per-page density of it, clamped to the table's rows - and ANALYZE
+writes rows there too.  ambulkdelete used to report Σ ntids over every entry, exact
+(`estimated_count = false`): the NULL entry, every column of a multicolumn index, every element of a
+multi-key one and every SUMMARY entry (§32) all over again, so every VACUUM put a multiple of the
+rows there and every ANALYZE put the rows back, and plans flipped between the two.  Now it reports
+the rows: Σ ntids over the entries of the index's FIRST SCALAR key column, SUMMARY entries left
+out, which is exact because a scalar column files every row the index holds under exactly one
+entry, the NULL entry for a NULL (§14, §24); for a partial index that is the count ANALYZE only
+estimates.  An index whose key columns are all multi-key files a row under any number of entries,
+the EMPTY entry included (§17), and nothing short of their union counts its rows, so it reports
+the heap's row count instead, exact when the heap's is - `ginvacuumcleanup()`'s answer, and wrong
+for a partial index the same way. `tuples_removed` stays a count of postings, as GIN's is. ambuild
+still reports the postings it wrote as `index_tuples`, as GIN's does, until the first ANALYZE, or
+the first VACUUM that removes something, replaces them (not done: a row count per build
+participant).
 
 **The spill** (2026-09-25 review).  An INLINE posting set that outgrows its entry moves onto
 container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry by an order of
