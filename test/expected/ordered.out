@@ -921,6 +921,12 @@ CREATE INDEX orb_k ON orb (k);
 CREATE INDEX orb_ab ON orb USING lion (a, b);
 CREATE INDEX orb_c ON orb USING lion (c);
 VACUUM (FREEZE, ANALYZE) orb;
+-- The node's plan with plain index scans off, so that its lion side is core's
+-- bitmap path: the BitmapOr whose arm reuses a = 3, which is what this case is
+-- about.  At the defaults the node takes a = 3 alone for its lion side - the
+-- cheaper and, measured, the faster of the two - a few cost units below the
+-- ordered btree scan, which is too close to pin.
+SET enable_indexscan = off;
 SELECT * FROM lion_ord_plan('SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50');
                      lion_ord_plan                     
 -------------------------------------------------------
@@ -932,6 +938,7 @@ SELECT * FROM lion_ord_plan('SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) 
          Lion Indexes: orb_ab, orb_c
 (6 rows)
 
+RESET enable_indexscan;
 SELECT count(*) FILTER (WHERE a <> 3) AS wrong, count(*)
   FROM (SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50) s;
  wrong | count 
