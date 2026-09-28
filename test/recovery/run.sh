@@ -336,6 +336,9 @@ psql_p() {
 	"$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$PRIMARY_PORT" \
 		-U postgres -d "$DBNAME" "$@"
 }
+# Planner settings for a reference count that must come from the heap, not
+# from a lion index: no index plan of any kind and no count pushdown.
+HEAPONLY="-c pg_lion.enable_count_pushdown=off -c enable_indexscan=off -c enable_indexonlyscan=off -c enable_bitmapscan=off"
 psql_s() {
 	"$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$STANDBY_PORT" \
 		-U postgres -d "$DBNAME" "$@"
@@ -1349,11 +1352,14 @@ phase1f() {
 		DELETE FROM lion_norm_u WHERE id % 3 = 0;
 		VACUUM (INDEX_CLEANUP ON) lion_norm_u;
 	SQL
+	# The heap's own answer, read with every index plan and the count
+	# pushdown off - otherwise LionCount answers it through the very index
+	# under test.
+	nu=$(PGOPTIONS="$HEAPONLY" psql_p -tAc "select count(*) from lion_norm_u where k = 4")
 	run_check "phase 1f unlogged" psql_p \
 		"select lion_index_verify('lion_norm_u_k', true) is not null, 'verify the unlogged index'
 		 union all
-		 select lion_index_count('lion_norm_u_k', 4) =
-				(select count(*) from lion_norm_u where k = 4),
+		 select lion_index_count('lion_norm_u_k', 4) = $nu,
 				'the unlogged index counts k = 4 as the heap does'"
 
 	# The deleted rows are not in the partial index, so the VACUUM removes
@@ -1714,8 +1720,8 @@ standby_build_replay() {
 		CREATE INDEX lion_built_k ON lion_built USING lion (k);
 		CREATE INDEX lion_built_t ON lion_built USING lion (t) WITH (inline_limit = 64);
 	SQL
-	nk=$(psql_p -tAc "select count(*) from lion_built where k = 3")
-	nt=$(psql_p -tAc "select count(*) from lion_built where t = 'key-17'")
+	nk=$(PGOPTIONS="$HEAPONLY" psql_p -tAc "select count(*) from lion_built where k = 3")
+	nt=$(PGOPTIONS="$HEAPONLY" psql_p -tAc "select count(*) from lion_built where t = 'key-17'")
 	wait_catchup
 
 	run_check "standby build replay" psql_s "
