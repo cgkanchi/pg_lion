@@ -161,6 +161,18 @@ rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
 to a temporary file past it.
 
+On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
+own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
+except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,
+once pruning has left only the `kind = 'a'` partitions (sub-partitions included), is true of every
+row they hold: it needs no index there and is left out of their counts, and `EXPLAIN` lists it
+under `Implied by Partition Bounds`. The proof is PostgreSQL's own, the one partial indexes use, so
+a partition that also takes NULLs, a default partition, or a generic plan's parameter implies
+only what that proof can show. An `OR` with an arm per kind - `(kind = 'a' AND tags && '{x}') OR
+(kind = 'b' AND tags && '{y}')` - is narrowed the same way: each partition leaves out the arms its
+bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
+counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
+
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
 side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for
@@ -221,6 +233,16 @@ once per process into memory bounded like a hash join's (`work_mem` × `hash_mem
 that the copy spills to a temporary file, as a hash join's table would. Their values may be
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
 (`o.status = ANY ($1)`) included: every process evaluates them once per scan.
+
+The fact table may be partitioned, when every partition the planner keeps has a Lion index on the
+foreign-key column (one on the partitioned table gives each partition its own) and on each fact
+filter its bounds do not imply. The node then takes each batch of dimension keys to every partition
+in turn and adds the partitions' counts up per dimension row - for `EXISTS` a match in any of them,
+for `NOT EXISTS` in none (DESIGN.md §27, "A partitioned fact table"). `EXPLAIN` lists the partitions
+and what their bounds imply, and its counters are summed over them: `Join Keys Looked Up` counts a
+key once per partition it was looked up in. The partitions are the ones plan-time pruning keeps: a
+partition that only run-time pruning would remove, as with `ts >= now() - interval '1 year'` over
+partitions by year, is counted too, and contributes nothing.
 
 `EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
 key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
