@@ -26,11 +26,11 @@ SELECT name, setting, boot_val, context, vartype
   FROM pg_settings
  WHERE name LIKE 'pg_lion.%\_cost'
  ORDER BY name;
--- from 0 up, in core's group of cost settings
+-- from 0 up, among the customized options as every extension's settings are
 SELECT count(*) AS settings,
 	   bool_and(min_val::float8 = 0) AS from_zero,
 	   bool_and(max_val::float8 > 1e300) AS unbounded,
-	   bool_and(category = 'Query Tuning / Planner Cost Constants') AS cost_group,
+	   bool_and(category = 'Customized Options') AS custom_group,
 	   bool_and(short_desc ~ ', in multiples of (cpu_operator_cost|cpu_tuple_cost|seq_page_cost|random_page_cost)\.$') AS unit_named
   FROM pg_settings
  WHERE name LIKE 'pg_lion.%\_cost';
