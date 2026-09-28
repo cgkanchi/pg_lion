@@ -2010,14 +2010,12 @@ the clause's; two GROUP BY columns (§20), whose pairs each AND two groups' sets
 (§26), whose tests stop at a row. They count against the collected copy one count at a time, as
 before.
 
-**Parallel.** Neither a grouped nor an ungrouped LionCount path is parallel: `parallel_safe` false,
-no workers (the FK-side join of §27 is the node's only parallel shape). With
-`max_parallel_workers_per_gather` 4 the repro's grouped count still plans as the serial node, and
-the plan without the pushdown - a Parallel Bitmap Heap Scan of four workers under a partial
-HashAggregate - took 1,138 ms. The walk and the collection would split by container-key ranges -
-each participant collecting its range of the WHERE (`LionCollect.ranged`, which the FK join's
-shared copy already cuts by) and counting every group over it into partial counts that core's
-Finalize Agg adds up - and that is left for a change of its own.
+**Parallel.** As first written the walk was serial, as every LionCount path but the FK-side join
+of §27 was: `parallel_safe` false, no workers. With `max_parallel_workers_per_gather` 4 the repro's
+grouped count still planned as the serial node, and the plan without the pushdown - a Parallel
+Bitmap Heap Scan of four workers under a partial HashAggregate - took 1,138 ms. The walk and the
+collection split by ranges of container keys, and do now: "A GROUP BY in parallel", below. An
+ungrouped count is still serial.
 
 **Cost.** A grouped count whose WHERE the executor will collect (`lion_cost_where_collected()`, the
 rule of `lion_where_describe()` from the planner's sources) is priced as the collection - the WHERE
@@ -2063,6 +2061,111 @@ NULL one, counted in three batches and, at a work_mem of 64 kB, in twenty; group
 are RUNs; a WHERE that is a BITSET at every key, and one of a row or two a key, ANDed directly; a
 HAVING, a LIMIT inside a batch, SERIALIZABLE, the order an ORDER BY relies on across two batches with
 no Sort, and a dirty heap - each against a sequential scan with the pushdown off.
+
+### A GROUP BY in parallel (2026-09-28)
+
+The walk above divides by container key: a group's count is the sum over any cut of the heap's keys
+of its rows at the keys of each piece, and the collected WHERE of a piece is the whole copy's
+containers at its keys. So the grouped count is offered, besides the serial node, as a
+parallel-aware one below a Gather and core's Finalize HashAggregate:
+
+    Finalize HashAggregate
+      Group Key: grp
+      ->  Gather
+            Workers Planned: 3
+            ->  Parallel Custom Scan (LionCount)
+                  Lion Indexes: rp_lion.grp (grp), rp_lion.f1 (f1 = true), ...
+                  Group Key: grp
+
+- **Ranges.** When the Gather sets up its shared memory the heap's container keys are cut into
+  ranges, a few for each participant the plan was made for (`lion_key_ranges()`: four each, at most
+  64, no fewer than 16 keys a range - `pg_lion.parallel_range_keys` at run time, a testing knob;
+  the planner prices the default), as evenly as whole keys go, the last one open-ended for a heap
+  that has grown since. The shared copy of §27's FK-side join is cut the same way, and no longer
+  leaves its last chunks empty when the keys do not divide. Each participant claims the next range
+  nobody has from a shared counter (`LionJoinShared.nextchunk`, the struct the FK-side join keeps
+  in the Gather's DSM; its sums carry the workers' counters to EXPLAIN), collects the WHERE of that
+  range alone (`lion_sources_collect_range()`: the sources sought to the range's first key, the
+  merge stopped at its end, `LionCollect.ranged`), walks the entries from the first and counts
+  every group against the range's copy a batch at a time, exactly as above - a partial row per
+  group with rows in the range - and claims the next. A range whose copy is empty walks nothing.
+- **Why it is exact (§9).** Each range is the walk above over a copy of its keys: every group's set
+  located afresh by the participant's own walk under its own pins, the map asked once a key after
+  every group there has copied its container, the copy pinless and made after the snapshot was
+  taken (workers run under the leader's). The ranges cover every key once, so every row is counted
+  in one range by one participant, and the Finalize Agg adds a group's partial counts up - and
+  applies the HAVING, which the node's partial target (`lion_make_partial_target()`, as for a
+  partitioned table, §16) leaves to it.
+- **When.** One GROUP BY column walked whole over one table, whose WHERE the planner prices as
+  collected (`lion_cost_where_collected()`), with a positive clause that is positive whatever its
+  value - an equality, an IN list, `IS NULL`, a multi-key literal; a multi-key parameter may narrow
+  nothing at run time and turn into a negated source, and a WHERE of negated sources alone has
+  nothing to collect by range - and no range taken as a source; a grouping core can hash and
+  aggregates it can split, and the table, the target and the clause values parallel-safe. Not a
+  partitioned table, `GROUP BY coalesce()`, two GROUP BY columns, count(DISTINCT), an IN list that
+  drives the groups, and not during recovery, where the WHERE is never collected. A parallel-aware
+  node run without the Gather's shared memory (a Gather that cannot use parallel mode sets none up)
+  is the only participant and counts every group whole, the serial walk.
+- **Workers.** What a parallel scan of the grouping column's posting pages would get
+  (`compute_parallel_worker()` over them, `lion_index_column_posting_share()` of the index's pages),
+  capped by `max_parallel_workers_per_gather`; the table's `parallel_workers` decides alone.
+- **Cost**, one participant's: the serial node's price before its HAVING divided among the
+  participants (`get_parallel_divisor()`'s rule), since the collection, the groups' containers and
+  the pages they lie on all divide by key; plus, for its share of the ranges, what each range pays
+  again - the entry walk, and for each group and each WHERE source a descent to the range's first
+  key: `LION_ENTRY_COUNT_COST` and `LION_PROBE_COST` a group, `LION_PROBE_COST` a source, a page
+  each (`LION_RANGE_DESCENT_PAGES`); plus a `cpu_tuple_cost` a partial row, a group's per range it
+  has rows in. The Gather prices its rows and `parallel_setup_cost`, core's Finalize Agg its own
+  work.
+
+Two things the ranges made worth doing in the walk itself, serial or not. A group's cursor now
+begins at the copy's first key (`lion_cursor_init_at()`: a CHAIN set's first leaf comes from a
+descent for that key, an INLINE set skips to it, a copy is sought) where it began at the group's
+first container and was sought from there; and the walk's cursors copy their leaves into page
+images the node allocates once (`gbimages`), where each batch allocated and freed a page per group:
+one participant counting the repro's first GROUP BY below as 16 ranges took 18 ms more than the
+serial walk (65 ms) while each batch allocated its pages, much of it page faults and `brk()`, and
+takes 7 ms more now.
+
+**Measured** on the repro above, the library of this change with `max_parallel_workers_per_gather`
+at 0, 2 and 3 - medians of 24 runs each, the settings' order rotated round by round, on four cores
+that other work shared (the one-minute load rose from 1 to 3 while it ran); plans and costs are the
+planner's own, every parallel one the node below a Finalize HashAggregate:
+
+| grouped count | serial | 2 workers | 3 workers | cost: serial, 2, 3 |
+|---|---|---|---|---|
+| `grp ... WHERE f1 AND NOT f2 AND lvl = 1 AND tags && '{4}'` | 69.3 ms | 44.1 | 36.0 | 44,857; 21,115; 16,998 |
+| `c20 ... WHERE tags && '{1,2}' AND NOT f1` | 22.2 | 19.8 | 19.2 | 10,068; 5,397; 4,464 |
+| `lvl ... WHERE tags2 && '{1,5,9}' AND c20 IN (1, 2)` | 25.6 | 23.9 | 21.8 | 11,198; 5,728; 4,679 |
+| `grp ... WHERE f2 AND lvl = 1` | 55.6 | 39.8 | 33.4 | 32,293; 15,869; 12,933 |
+| `grp ... WHERE c20 = 3 AND tags && '{2}'` | 43.8 | 32.0 | 27.4 | 28,222; 14,173; 11,620 |
+| `grp ... WHERE tags && '{1}'` | 51.1 | 32.4 | 28.2 | 27,694; 13,948; 11,444 |
+| `c20 ... WHERE tags && '{1000,1001,1002}' AND f1` | 6.9 | 11.1 | 12.6 | 5,097; 3,326; 2,861 |
+
+Every parallel plan here starts its workers first, and on this machine that takes about 6 ms
+whatever the plan: core's own Parallel Seq Scan of a table of 1,000 rows took 6 ms with one worker
+or three, against 0.05 ms serially, with the library loaded or not. `parallel_setup_cost` prices it
+at 1,000 - 2 ms at the 500 units a millisecond the model is fitted to - so the counts of 20 to 25 ms
+gain a little, and the last one, 7 ms, loses: it goes parallel as core's plans of its price would,
+and takes 11. At a `parallel_setup_cost` of 3,000, what the start is worth here, it stays serial
+with two workers. The larger counts gain 1.6 to 1.9 times with three workers on the shared cores;
+over a larger table the walk grows and the start does not. Serially the library is the one before
+this change within the noise (12 rounds of the same seven, the two alternated: -3% to +1%).
+
+The per-range price was fitted with the leader alone (`max_parallel_workers = 0`, so the Gather
+launches nothing and its node counts all 16 ranges): the four-clause GROUP BY above took 73 ms
+against the serial 65 (perf's task clock, 60 runs), 500 us a range for 150 groups, priced at 245
+units; the 1,500-row WHERE took 6.9 ms against 5.6, 83 us a range for 20 groups, priced at 35.
+
+`test/sql/groupparallel.sql` checks the plans - the node below a Gather with two workers and one, the
+serial node with none or with the table's `parallel_workers` at 0 - and, at ranges of one key (a
+table of fourteen keys, cut into twelve ranges for three participants), the answers of filters, a
+negated filter and the NULL entry as one, an IN list, an OR across columns, multi-key queries, a
+filter in two ranges of the twelve and groups that lie in one range or two, the NULL group, counts of
+columns, a printed filter column, a HAVING, an ORDER BY with LIMIT, the leader alone with no worker
+started, SERIALIZABLE, a generic plan's parameters and a heap the map cannot vouch for - each against
+the same query run serially and with the pushdown off - and the ranges, collections and batches the
+participants counted.
 
 ### The units (2026-09-27, release build)
 

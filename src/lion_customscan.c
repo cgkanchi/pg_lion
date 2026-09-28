@@ -1205,9 +1205,11 @@ typedef struct LionCountScanState
 	 * emitted in the walk's order, one a call.  gbatchcxt holds the batch -
 	 * its located sets while they are counted, its keys and counts until the
 	 * last row is emitted.  groupbatches and groupsbatched are what EXPLAIN
-	 * ANALYZE reports.
+	 * ANALYZE reports.  gbimages is a page image for each group of a batch,
+	 * which the groups' cursors of every batch copy their leaves to.
 	 */
 	MemoryContext gbatchcxt;
+	PGAlignedBlock *gbimages;
 	LionPostingSet *gbsets;
 	Datum	   *gbkey;
 	bool	   *gbnull;
@@ -1217,6 +1219,28 @@ typedef struct LionCountScanState
 	int			gbpos;
 	int64		groupbatches;
 	int64		groupsbatched;
+
+	/*
+	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,
+	 * the plan node being parallel-aware and no join): each participant claims
+	 * a range of container keys at a time (lion_key_ranges(), the counter in
+	 * joinshared), collects the WHERE of that range alone into wherecoll - in
+	 * grangecxt, emptied at the next range - and counts every group of the
+	 * entry walk against it, a partial row per group; the Finalize Agg above
+	 * adds a group's rows up.  grange is the range being counted, -1 between
+	 * them, and granges how many this participant counted, which EXPLAIN
+	 * ANALYZE reports with the workers' (workerranges, and the workers'
+	 * collections and batches beside it).
+	 */
+	bool		granged;
+	int			grange;
+	MemoryContext grangecxt;
+	int64		granges;
+	int64		workerranges;
+	int64		workerwherecollected;
+	int64		workerwherespilled;
+	int64		workergroupbatches;
+	int64		workergroupsbatched;
 
 	/*
 	 * An IN list too long to locate at once (DESIGN.md §15, "A list too long
@@ -1470,6 +1494,12 @@ typedef struct LionCountScanState
  * batches is the batches of keys looked up in key order, summed, and
  * childrows, posting and time the rows, the posting pages and the phases of
  * "Where a key's time goes" (DESIGN.md §27), summed.
+ *
+ * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") keeps its
+ * state here too: nextchunk is then the next range of container keys nobody
+ * has claimed, of nranges ranges cut from ckeys keys (lion_key_ranges()), and
+ * ranges, wherecollected, wherespilled, groupbatches and groupsbatched its
+ * workers' counters, summed.
  */
 typedef struct LionJoinShared
 {
@@ -1488,8 +1518,15 @@ typedef struct LionJoinShared
 	instr_time	time[LION_JT_N];
 	int64		copies;
 	int64		copychunks;
+	int64		ranges;
+	int64		wherecollected;
+	int64		wherespilled;
+	int64		groupbatches;
+	int64		groupsbatched;
 	pg_atomic_uint32 nextchunk;
 	int			participants;
+	int			nranges;
+	uint32		ckeys;
 	bool		copyready;		/* a LionSharedCopy follows this struct */
 } LionJoinShared;
 
@@ -4222,6 +4259,31 @@ lion_cost_where_collected(int nsrc, const double *members,
 		members[0] > (double) (LION_MATERIALIZE_MAX_BYTES / sizeof(uint16));
 }
 
+/*
+ * What a parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") needs of
+ * the serial node's price: whether it is the price of the groups of a walk
+ * counted together against the collected WHERE (batched), and what each range
+ * of container keys a participant counts pays again of it (perrange): the
+ * entry walk from its first entry, each group's set decoded, set up and sought
+ * to the range's first key, and each WHERE source sought there.
+ */
+typedef struct LionRangeCost
+{
+	bool		batched;
+	Cost		perrange;
+} LionRangeCost;
+
+/*
+ * The page each set reads again at a range's first key: the leaf its descent
+ * lands on, as I/O like every page the model charges - with the entry decoded
+ * again (LION_ENTRY_COUNT_COST) and the descent itself (LION_PROBE_COST).
+ * Fitted on the synthetic repro to what one participant counting a GROUP BY
+ * as 16 ranges took over the same count made whole: 83 us a range for 20
+ * groups under a WHERE of 1,500 rows, and 500 us for 150 groups under a WHERE
+ * of four clauses - 42 and 250 units a range, priced at 35 and 245.
+ */
+#define LION_RANGE_DESCENT_PAGES	1.0
+
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -4230,7 +4292,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *wherekinds,
 				   List *ors, double numgroups,
 				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar, bool rangesum)
+				   double drivefrac, Var *rangevar, bool rangesum,
+				   LionRangeCost *rc)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
@@ -4745,6 +4808,18 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 					(LION_CONTAINER_COST + LION_MEMBER_COST *
 					 Min(matching / wkeys, LION_MEMBER_CAP));
 				whereonce = true;
+
+				/* ... and what a range of a parallel one pays again of it */
+				if (rc != NULL)
+				{
+					rc->batched = true;
+					rc->perrange = walked * (LION_ENTRY_COUNT_COST +
+											 LION_PROBE_COST +
+											 LION_RANGE_DESCENT_PAGES *
+											 seq_page_cost) +
+						nsrc * (LION_PROBE_COST +
+								LION_RANGE_DESCENT_PAGES * seq_page_cost);
+				}
 			}
 			else
 			{
@@ -4845,9 +4920,14 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * a range bounds the walk to drivefrac of those (§28), the share of
 		 * the column's entries it selects.
 		 */
-		seq_pages += Max(1.0, (double) groupidx->pages *
-						 lion_index_column_share(root, rel, groupidx,
-												 groupcol) * drivefrac);
+		double		entrypages = Max(1.0, (double) groupidx->pages *
+									 lion_index_column_share(root, rel, groupidx,
+															 groupcol) *
+									 drivefrac);
+
+		seq_pages += entrypages;
+		if (rc != NULL && rc->batched)
+			rc->perrange += entrypages * seq_page_cost;
 
 		/*
 		 * Beside a second GROUP BY column a count(DISTINCT k) tests each
@@ -5064,10 +5144,16 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 					List *whereclauses, List *wherekinds, List *ors,
 					double numgroups, double outer_entries,
 					double inner_entries, double outrows, int distinct,
-					int ranged, double drivefrac)
+					int ranged, double drivefrac, LionRangeCost *rc)
 {
 	Cost		run = 0;
 	ListCell   *lc;
+
+	if (rc != NULL)
+	{
+		rc->batched = false;
+		rc->perrange = 0;
+	}
 
 	foreach(lc, targets)
 	{
@@ -5103,7 +5189,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  outer_entries, inner_entries, distinct,
 								  tfrac, rangevar,
 								  tranged == LION_RANGED_SUM && rangevar != NULL &&
-								  t->driveidx[0] != NULL);
+								  t->driveidx[0] != NULL,
+								  list_length(targets) == 1 ? rc : NULL);
 
 		/*
 		 * A multi-key query the node only has at run time may need its
@@ -8126,6 +8213,107 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * A PARALLEL GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"): the serial
+ * node `serial` made parallel-aware, below a Gather and core's Finalize
+ * HashAggregate.  Its participants divide the heap's container keys into
+ * ranges, a few each (lion_key_ranges()), and count every group in each range
+ * they claim against the WHERE collected for that range: a partial count a
+ * group a range, which the Finalize Agg adds up - and applies the HAVING to,
+ * which the node's partial target leaves to it.
+ *
+ * WORKERS: what a parallel scan of the index pages the walk reads - the
+ * pages of the grouping column's posting sets - would get, capped by
+ * max_parallel_workers_per_gather; a parallel_workers setting on the table
+ * decides alone, as for core's scans.
+ *
+ * COST, one participant's: its share of the serial walk (`serialrun`, the
+ * serial node's price before its HAVING) - the collection and the groups'
+ * containers divide by key, the pages each range reads being its own - plus
+ * what each of its ranges pays again (rc->perrange: the entry walk, each
+ * group's set set up and sought to the range, each WHERE source sought
+ * there), plus a cpu_tuple_cost a partial row.  The rows are a group's per
+ * range it has rows in, at most the WHERE's rows.  The Gather prices its
+ * rows and set-up, core's Finalize Agg its own work.
+ */
+static void
+lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
+							 RelOptInfo *output_rel, CustomPath *serial,
+							 Cost serialrun, const LionRangeCost *rc,
+							 IndexOptInfo *groupidx, AttrNumber groupcol,
+							 List *having, double numgroups)
+{
+	PathTarget *partialtarget;
+	CustomPath *cpath;
+	Path	   *gather;
+	AggClauseCosts agg_final_costs;
+	double		pages;
+	double		divisor;
+	double		rows;
+	double		totalrows;
+	uint32		ckeys;
+	int			workers;
+	int			nranges;
+
+	pages = Max(1.0, (double) groupidx->pages *
+				lion_index_column_posting_share(root, rel, groupidx,
+												groupcol));
+	workers = compute_parallel_worker(rel, -1, pages,
+									  max_parallel_workers_per_gather);
+	if (workers <= 0)
+		return;
+
+	divisor = lion_parallel_divisor(workers);
+	nranges = lion_key_ranges(rel->pages, workers + 1,
+							  LION_PARALLEL_RANGE_KEYS, &ckeys);
+	totalrows = clamp_row_est(Min(numgroups * nranges,
+								  Max(rel->rows, numgroups)));
+	rows = clamp_row_est(totalrows / divisor);
+
+	partialtarget = lion_make_partial_target(root, output_rel->reltarget,
+											 having);
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = partialtarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = true;
+	cpath->path.parallel_safe = true;
+	cpath->path.parallel_workers = workers;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = rows;
+	cpath->path.startup_cost = 0;
+	cpath->path.total_cost = serialrun / divisor +
+		((double) nranges / divisor) * rc->perrange + rows * cpu_tuple_cost;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->flags = serial->flags;
+	cpath->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	/* the serial node's plan, but for the HAVING, which is the Agg's here */
+	cpath->custom_private = list_copy(serial->custom_private);
+	lfirst(list_nth_cell(cpath->custom_private, LION_PRIV_HAVING)) = NIL;
+	cpath->methods = serial->methods;
+
+	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
+										 partialtarget, NULL, &totalrows);
+
+	MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
+	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, gather,
+							 output_rel->reltarget,
+							 AGG_HASHED, AGGSPLIT_FINAL_DESERIAL,
+							 root->processed_groupClause,
+							 having,
+							 &agg_final_costs,
+							 numgroups));
+}
+
+/*
  * Decide whether count(*) over input_rel can be answered from roaring
  * posting sets and, if so, add a CustomPath to output_rel.  Every failed
  * check simply returns: the normal plan is always available.
@@ -8236,6 +8424,12 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 									 * unique: a count(col) each (§26) */
 	Const	   *groupcoal = NULL;	/* GROUP BY coalesce(col, c): c (§10) */
 	Node	   *groupexpr = NULL;	/* ... and the whole expression */
+	bool		plainpositive = false;	/* a positive clause outside ORs that
+										 * is positive whatever its value: a
+										 * WHERE a parallel GROUP BY can
+										 * collect by ranges (§10) */
+	LionRangeCost rangeprice;	/* ... and what its ranges pay */
+	Cost		serialrun;		/* the serial node's price, without HAVING */
 	ListCell   *lc;
 
 	/* ---- the query as a whole ---- */
@@ -8615,6 +8809,17 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			havepositive = true;
 			pinnedsrc = true;
 		}
+
+		/*
+		 * A multi-key clause whose value is only known at run time may turn
+		 * out to narrow nothing, and be counted as a negated source (§17);
+		 * every other positive clause stays one.
+		 */
+		if (leaf.kind == LION_CLAUSE_EQ || leaf.kind == LION_CLAUSE_ARRAY ||
+			leaf.kind == LION_CLAUSE_NULL ||
+			(leaf.kind == LION_CLAUSE_MULTI && leaf.val != NULL &&
+			 IsA(leaf.val, Const)))
+			plainpositive = true;
 
 		if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)
 		{
@@ -9483,7 +9688,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						((sumall && distvar == NULL) ? LION_RANGED_SUMALL :
 						 LION_RANGED_NONE) :
 						sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
-						rangesel);
+						rangesel, &rangeprice);
+	serialrun = cpath->path.total_cost;
 
 	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
@@ -9530,6 +9736,30 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								 numgroups));
 		return;
 	}
+
+	/*
+	 * ... and, where the query may run in parallel, the same GROUP BY divided
+	 * among the participants of a Gather by ranges of container keys, below
+	 * core's Finalize HashAggregate (DESIGN.md §10, "A GROUP BY in parallel"):
+	 * one grouping column walked whole, a WHERE that is collected - priced as
+	 * the groups of a walk counted together (rangeprice.batched), with a
+	 * source that is positive whatever its value, and no range taken as one -
+	 * and partial counts core can add up.  Before the serial path is added,
+	 * which may free it.
+	 */
+	if (ngroup == 1 && !sumall && !singlegroup && groupcoal == NULL &&
+		distvar == NULL && rangevar == NULL && !hasrangesrc &&
+		plainpositive && rangeprice.batched &&
+		first->driveidx[0] != NULL &&
+		input_rel->consider_parallel && output_rel->consider_parallel &&
+		is_parallel_safe(root, (Node *) consts) &&
+		extra != NULL && (extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
+		grouping_is_hashable(root->processed_groupClause) &&
+		!RecoveryInProgress())
+		lion_add_parallel_group_path(root, input_rel, output_rel, cpath,
+									 serialrun, &rangeprice,
+									 first->driveidx[0], first->drivecol[0],
+									 having, numgroups);
 
 	add_path(output_rel, &cpath->path);
 }
@@ -11021,10 +11251,31 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->ingroupleft = 0;
 	st->gbatchcxt = NULL;		/* made by the first batch */
 	st->gbmax = 0;
+	st->gbimages = NULL;
 	st->gbn = 0;
 	st->gbpos = 0;
 	st->groupbatches = 0;
 	st->groupsbatched = 0;
+
+	/*
+	 * A parallel-aware node that is no join is a parallel GROUP BY (DESIGN.md
+	 * §10, "A GROUP BY in parallel"), which the planner offers for one shape
+	 * alone: one column's entries walked whole, over one table.
+	 */
+	st->granged = cscan->scan.plan.parallel_aware && st->joinclause < 0;
+	if (st->granged &&
+		(!st->hasgroupidx || st->groupattno == 0 || st->groupattno2 != 0 ||
+		 st->sumall || st->singlegroup || st->hascoal ||
+		 st->distattno != 0 || st->hasrange || st->npart > 0))
+		elog(ERROR, "LionCount: malformed parallel GROUP BY");
+	st->grange = -1;
+	st->grangecxt = NULL;		/* made by the first range */
+	st->granges = 0;
+	st->workerranges = 0;
+	st->workerwherecollected = 0;
+	st->workerwherespilled = 0;
+	st->workergroupbatches = 0;
+	st->workergroupsbatched = 0;
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
@@ -12467,6 +12718,11 @@ lion_release_where(LionCountScanState *st)
 	if (st->gbatchcxt != NULL)
 		MemoryContextReset(st->gbatchcxt);
 
+	/* ... and a parallel GROUP BY's range, whose copy it was (grangecxt) */
+	st->grange = -1;
+	if (st->grangecxt != NULL)
+		MemoryContextReset(st->grangecxt);
+
 	/* ... and so do the values of a list counted in batches */
 	st->batchitem = -1;
 	st->batchval = NULL;
@@ -13803,7 +14059,12 @@ lion_group_batch_fill(LionCountScanState *st)
 	st->gbn = 0;
 	st->gbpos = 0;
 	if (st->gbmax <= 0)
+	{
 		st->gbmax = lion_count_groups_batch(st->groupidx);
+		st->gbimages = (PGAlignedBlock *)
+			MemoryContextAlloc(estate->es_query_cxt,
+							   sizeof(PGAlignedBlock) * st->gbmax);
+	}
 
 	oldcxt = MemoryContextSwitchTo(st->gbatchcxt);
 	st->gbsets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * st->gbmax);
@@ -13822,7 +14083,7 @@ lion_group_batch_fill(LionCountScanState *st)
 
 	lion_count_groups_copy(st->heap, estate->es_snapshot, n, st->gbsets,
 						   &st->wherecoll, st->gbcount, &st->stats,
-						   st->viscache, st->rel_read_only);
+						   st->viscache, st->rel_read_only, st->gbimages);
 	for (i = 0; i < n; i++)
 		lion_posting_set_release(&st->gbsets[i]);
 
@@ -13831,6 +14092,184 @@ lion_group_batch_fill(LionCountScanState *st)
 	st->groupbatches++;
 	st->groupsbatched += n;
 	return true;
+}
+
+/*
+ * The WHERE items of a parallel GROUP BY collected for one range of container
+ * keys, lo up to hi (lion_sources_collect_range()), into st->wherecoll in
+ * grangecxt: lion_where_collect() for the keys of the range alone, under the
+ * same budget and spilling the same way.  False when the range needs no
+ * counting at all: the intersection has no container there, or no source has
+ * a found set - which leaves a positive source with none, and nothing in the
+ * intersection anywhere.  A WHERE of negated sources alone has nothing to
+ * collect, and the planner never makes a parallel GROUP BY of one.
+ */
+static bool
+lion_where_collect_range(LionCountScanState *st, uint32 lo, uint64 hi)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *items;
+	MemoryContext oldcxt;
+	bool		positive = false;
+	bool		spilled;
+	bool		ok;
+	int			k;
+
+	if (RecoveryInProgress())
+		elog(ERROR, "LionCount: a parallel GROUP BY during recovery");
+
+	oldcxt = MemoryContextSwitchTo(st->grangecxt);
+	items = (LionCountSource *) palloc(sizeof(LionCountSource) *
+									   Max(st->nitem, 1));
+	for (k = 1; k <= st->nitem; k++)
+	{
+		items[k - 1] = st->sources[k];
+		if (!st->sources[k].negated)
+			positive = true;
+	}
+	ok = lion_sources_collect_range(st->heap, estate->es_snapshot, st->nitem,
+									items, get_hash_memory_limit(), true,
+									lo, hi, &st->wherecoll, &spilled,
+									&st->stats);
+	MemoryContextSwitchTo(oldcxt);
+
+	if (!ok)
+	{
+		if (!positive)
+			elog(ERROR, "LionCount: a parallel GROUP BY without a positive WHERE source");
+		return false;
+	}
+	st->wcollected = true;
+	st->wherecollected++;
+	if (spilled)
+		st->wherespilled++;
+	return st->wherecoll.found;
+}
+
+/*
+ * A PARALLEL GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"): the next
+ * range of container keys for this participant to count, its WHERE collected
+ * and the entry walk begun again from the first entry.  False once every range
+ * has been claimed.
+ *
+ * The heap's container keys are cut into ranges (lion_key_ranges(), when the
+ * Gather sets up its shared memory: a few for each participant), and each
+ * participant claims the next range nobody has from the shared counter,
+ * collects the WHERE of that range alone and counts every group of the entry
+ * walk against it a batch at a time (lion_group_batch_fill()), a group's rows
+ * in the range being one partial row that the Finalize Agg above adds to the
+ * group's others.  The ranges cover every key once, so every row a group
+ * counts is counted in exactly one range, by one participant.  Each range
+ * walks the entries from the first, and each group's cursor is sought to the
+ * first key of the range the copy has (§22): that is what a range costs over
+ * its share of the serial walk, and why a range is never narrower than a few
+ * keys.
+ *
+ * WHY IT IS EXACT (§9): lion_count_groups_copy()'s argument, range by range.
+ * Every group's set is located afresh by this participant's own walk, under
+ * its own pins, and is counted against a pinless copy of the WHERE made after
+ * the snapshot was taken, whose containers are the whole copy's at the keys
+ * of the range.  Workers run under the leader's snapshot.
+ */
+static bool
+lion_group_range_next(LionCountScanState *st)
+{
+	LionJoinShared *shared = st->joinshared;
+	EState	   *estate = st->css.ss.ps.state;
+	int			k;
+
+	/* the range the batches came to the end of: its walk and its copy */
+	if (st->scanning)
+	{
+		lion_entry_scan_end(&st->escan);
+		st->scanning = false;
+	}
+	lion_posting_set_release(&st->wherecoll);
+	st->wcollected = false;
+	st->grange = -1;
+	if (st->grangecxt == NULL)
+		st->grangecxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "LionCount key range",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(st->grangecxt);
+
+	/*
+	 * Every count is the group's set ANDed with the one copy: nothing else
+	 * may be a source (lion_group_batch_ok()), which the planner has seen to.
+	 */
+	if (st->nsource != st->nitem + 1 || st->ingroupitem >= 0)
+		elog(ERROR, "LionCount: a parallel GROUP BY of another shape");
+	for (k = 1; k <= st->nitem; k++)
+	{
+		if (st->sources[k].rangewalk != NULL)
+			elog(ERROR, "LionCount: a parallel GROUP BY of another shape");
+	}
+
+	for (;;)
+	{
+		uint32		r = pg_atomic_fetch_add_u32(&shared->nextchunk, 1);
+		uint32		lo;
+		uint64		hi;
+
+		if (r >= (uint32) shared->nranges)
+			return false;
+		CHECK_FOR_INTERRUPTS();
+
+		st->granges++;
+		lion_key_range(shared->nranges, shared->ckeys, (int) r, &lo, &hi);
+		if (!lion_where_collect_range(st, lo, hi))
+		{
+			/* nothing of the WHERE in the range: no group has a row there */
+			lion_posting_set_release(&st->wherecoll);
+			st->wcollected = false;
+			MemoryContextReset(st->grangecxt);
+			continue;
+		}
+
+		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
+									NULL);
+		st->scanning = true;
+		st->grange = (int) r;
+		return true;
+	}
+}
+
+/*
+ * The next partial row of a parallel GROUP BY (lion_group_range_next()): a
+ * group's count in the range this participant is counting, the ranges taken
+ * one after the other until none is left.  A group with no row in the range
+ * has no row of it.
+ */
+static TupleTableSlot *
+lion_next_group_ranged(LionCountScanState *st, bool *exhausted)
+{
+	*exhausted = false;
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		/* the key of the last row lives in the batch, and pergroup is spare */
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+		MemoryContextReset(st->pergroup);
+
+		if (st->gbpos < st->gbn)
+		{
+			int			i = st->gbpos++;
+
+			if (st->gbcount[i] == 0)
+				continue;
+			return lion_emit_tuple(st, st->gbkey[i], st->gbnull[i],
+								   (Datum) 0, true, st->gbcount[i]);
+		}
+		if (st->grange >= 0 && lion_group_batch_fill(st))
+			continue;
+		if (!lion_group_range_next(st))
+		{
+			*exhausted = true;
+			return NULL;
+		}
+	}
 }
 
 /*
@@ -15696,6 +16135,24 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	}
 
 	/*
+	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") walks the
+	 * entries once per range of container keys it counts, and begins each walk
+	 * itself.  Run without the Gather's shared memory - which a Gather that
+	 * cannot run in parallel mode does not set up - the node is the only
+	 * participant, and counts every group whole as the serial node does: one
+	 * partial row a group, which the Finalize Agg takes as it takes any.
+	 */
+	if (st->granged && st->joinshared != NULL)
+	{
+		bool		exhausted;
+		TupleTableSlot *slot = lion_next_group_ranged(st, &exhausted);
+
+		if (exhausted)
+			st->done = true;
+		return slot;
+	}
+
+	/*
 	 * An IN list on the grouping column drives the groups itself (DESIGN.md
 	 * §15) and never looks at the index's entries, so there is no entry scan to
 	 * begin.  (The partitioned path opens one per partition either way; a scan
@@ -15850,12 +16307,20 @@ lion_rescan_custom_scan(CustomScanState *node)
  * the copy's own state follows the struct, and its containers are in the
  * query's DSA or in files of its file set.  Each participant reads its share
  * of the dimension rows from the parallel-aware child and locates the fact
- * filters for itself.  A node that is not a join, or a join run without a
- * Gather, never gets here.
+ * filters for itself.
+ *
+ * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") keeps the same
+ * struct, with no copy after it: the ranges of container keys its participants
+ * claim one at a time, and the sums of their counters.  A node that is
+ * neither, or one run without a Gather, never gets here.
  */
 static Size
 lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
+	LionCountScanState *st = (LionCountScanState *) node;
+
+	if (st->granged)
+		return MAXALIGN(sizeof(LionJoinShared));
 	return MAXALIGN(sizeof(LionJoinShared)) + lion_shared_copy_size();
 }
 
@@ -15881,6 +16346,17 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	lion_list_pin_participants(shared->participants);
 
 	/*
+	 * A parallel GROUP BY's ranges: a few for each participant the plan was
+	 * made for, whether they all start or not - the ones that do claim the
+	 * ranges of the ones that do not.
+	 */
+	if (st->granged)
+		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
+										  shared->participants,
+										  lion_parallel_range_keys,
+										  &shared->ckeys);
+
+	/*
 	 * The copy of the fact filters, when the plan collects them: its memory
 	 * is a Parallel Hash's, a hash table's for each participant the plan was
 	 * made for.  Not where the DSM could not be made (pcxt->seg is NULL, and
@@ -15904,7 +16380,8 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
  * Before the workers are launched again for a rescan.  The sums are kept:
  * they are the whole execution's, as the leader's own counters are.  The runs
  * of distinct keys a forward semi join's participants claim start again from
- * the first, since the rescan's keys are sorted again (and may be others).
+ * the first, since the rescan's keys are sorted again (and may be others), and
+ * so do a parallel GROUP BY's ranges of keys.
  * No participant is running: the Gather has shut the workers down, and the
  * leader's own node claims nothing before the Gather launches them again.
  *
@@ -15925,6 +16402,13 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	shared->sortedruns += shared->sorted;
 	shared->sorted = 0;
 	SpinLockRelease(&shared->mutex);
+
+	/* a parallel GROUP BY's ranges, cut again over the heap as it is now */
+	if (st->granged)
+		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
+										  shared->participants,
+										  lion_parallel_range_keys,
+										  &shared->ckeys);
 
 	if (st->joinsharedcopy != NULL)
 	{
@@ -16006,6 +16490,11 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->copychunks += st->joincopychunks;
 		for (i = 0; i < LION_JT_N; i++)
 			INSTR_TIME_ADD(shared->time[i], st->jointime[i]);
+		shared->ranges += st->granges;
+		shared->wherecollected += st->wherecollected;
+		shared->wherespilled += st->wherespilled;
+		shared->groupbatches += st->groupbatches;
+		shared->groupsbatched += st->groupsbatched;
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -16026,6 +16515,11 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkercopychunks = shared->copychunks;
 	for (i = 0; i < LION_JT_N; i++)
 		st->joinworkertime[i] = shared->time[i];
+	st->workerranges = shared->ranges;
+	st->workerwherecollected = shared->wherecollected;
+	st->workerwherespilled = shared->wherespilled;
+	st->workergroupbatches = shared->groupbatches;
+	st->workergroupsbatched = shared->groupsbatched;
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -16610,25 +17104,40 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 * that did; and of those, the ones past a hash table's memory that
 		 * went to a temporary file.  Only when there were any.
 		 */
-		if (st->wherecollected > 0)
+		if (st->wherecollected + st->workerwherecollected > 0)
 			ExplainPropertyInteger("WHERE Sets Collected", NULL,
-								   st->wherecollected, es);
-		if (st->wherespilled > 0)
+								   st->wherecollected +
+								   st->workerwherecollected, es);
+		if (st->wherespilled + st->workerwherespilled > 0)
 			ExplainPropertyInteger("WHERE Sets Spilled", NULL,
-								   st->wherespilled, es);
+								   st->wherespilled + st->workerwherespilled,
+								   es);
 
 		/*
 		 * ... and the batches of groups counted together against it, in one
 		 * walk of container keys each (DESIGN.md §10, "The groups of a walk,
 		 * counted together").  Only when there were any.
 		 */
-		if (st->groupbatches > 0)
+		if (st->groupbatches + st->workergroupbatches > 0)
 		{
-			ExplainPropertyInteger("Group Batches", NULL, st->groupbatches,
+			ExplainPropertyInteger("Group Batches", NULL,
+								   st->groupbatches + st->workergroupbatches,
 								   es);
 			ExplainPropertyInteger("Groups Counted in Batches", NULL,
-								   st->groupsbatched, es);
+								   st->groupsbatched + st->workergroupsbatched,
+								   es);
 		}
+
+		/*
+		 * The ranges of container keys a parallel GROUP BY's participants
+		 * counted (DESIGN.md §10, "A GROUP BY in parallel"), the leader's and
+		 * its workers' - each range a WHERE collected and a walk of the
+		 * entries - which is every range of the cut, whichever participants
+		 * took them.
+		 */
+		if (st->granged)
+			ExplainPropertyInteger("Key Ranges", NULL,
+								   st->granges + st->workerranges, es);
 
 		/*
 		 * The batches an IN list too long to locate at once was counted in
