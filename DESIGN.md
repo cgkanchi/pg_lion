@@ -9660,7 +9660,13 @@ them stays without them.
 **Upgrade.** Existing indexes are format 6 and keep working unchanged, walking keys as §28 does;
 `REINDEX` with the option adds summaries. **Downgrade:** a build before this one refuses a format 7
 index (its version check), so an index with summaries has to be rebuilt with `summaries = off`
-before going back.
+before going back. *(Since the 2026-09-27 review the hint with which a build refuses a version it
+does not know says which way the version differs - an index too old for the build is REINDEXed,
+and one a NEWER build wrote is read by that build or rebuilt by this one - where every unknown
+version used to be told that it "predates this build". `lion_read_meta()` also checks the size of
+the meta page's special area before it reads the page flags there: the buffer manager accepts any
+pd_special up to BLCKSZ, and a damaged one had the flags read from past the page on every open of
+the index.)*
 
 ### Build (lion_build.c)
 

@@ -464,7 +464,9 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	if (PageIsNew(page) || !LionPageIsMeta(page))
+	/* the special area's size first, as lion_read_meta() checks it */
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		!LionPageIsMeta(page))
 	{
 		UnlockReleaseBuffer(buf);
 		elog(ERROR, "lion index \"%s\": block 0 is not the meta page",
