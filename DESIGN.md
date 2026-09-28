@@ -11836,3 +11836,132 @@ ANALYZE and of a VACUUM that deletes on the primary, each read back on the stand
 `lion_index_stats()` and compared with the exact counts, under `wal_consistency_checking` in
 `make recovery-check-rmgr`).
 
+### The hook (lion_selfuncs.c)
+
+`get_relation_stats_hook` is lion's already, for the endpoint probe's scope (§28); the count comes
+through the same hook, and through `get_index_stats_hook` for an expression. `lion_relation_stats()`
+is, in order: the probe scope's corrected row when a scope covers the column (unchanged), the
+previous hook when it takes the column, then `lion_ndistinct_stats()`, then nothing. It supplies,
+for column `attnum` of the base relation `rte` names, the column's `pg_statistic` row with
+`stadistinct` replaced, and everything else - null fraction, most common values, histogram,
+correlation - as ANALYZE left it, when all of these hold:
+
+- `pg_lion.enable_index_ndistinct` is on (the default; PGC_USERSET);
+- a plain column (`attnum > 0`) of a table's own statistics: not `rte->inh`, which asks for the
+  statistics of an inheritance tree, and not a partitioned table, which has no index storage of its
+  own - one index of one table does not count a tree;
+- core has a row for it: a column never analyzed gets nothing, and the index's count waits for the
+  first ANALYZE (a count without the rest of the row would be an estimate out of nothing);
+- the user has not set the column's `n_distinct` (`ALTER TABLE ... ALTER COLUMN ... SET
+  (n_distinct = ...)`, which ANALYZE puts in the row): `get_attribute_options()` says so, and the
+  row stands as ANALYZE wrote it;
+- the relation has a lion index - valid and usable (the planner's own index list), not partial (it
+  counts a part of the table), not hypothetical (there is no meta page to read) - one of whose key
+  columns is exactly that column;
+- whose opclass decides the equality the planner counts by: its strategy 1 is the column type's
+  default equality operator (`TYPECACHE_EQ_OPR`), under the column's collation or, where the two
+  collations differ, two deterministic ones (they have one equality, the bytes'). Every scalar
+  opclass pg_lion ships passes; a multi-key one has no strategy 1 (and no count); a user opclass
+  whose `=` is coarser than the type's (a case-folding one, as in test/sql/pushdown.sql) counts
+  classes the planner would not, and is passed over;
+- with a count on its meta page for that column, and a count above zero;
+- and a count the table has not outgrown (**stale counts**, `lion_nd_current()`): the rows it was
+  counted over are within a factor of 2, either way, of the rows the planner finds the table to
+  have (`rel->tuples`, `pg_class.reltuples` scaled to the table's current pages). Between counts
+  the value is scaled with the table (below), which is right for a column whose values grow with
+  its rows and wrong for one whose new rows bring no new values - by as much as the table has
+  grown. A factor of 2 bounds that error to the one a table doubling between two ANALYZEs would
+  give ANALYZE's own fraction, and past it the planner has ANALYZE's estimate, which the ANALYZEs
+  that could not count the directory have kept up to date.
+
+Of several such indexes the one counted over the rows nearest the table's now is taken (the least
+`|ln(rows / tuples)|`), and of those the largest count: every VACUUM and ANALYZE reaches every
+index of the table, so the counts differ only where one index was built since, or where one
+directory is past ANALYZE's bound and another is not, and the one whose rows match the table's is
+the one that has seen its present.
+
+**The value.** ANALYZE's own convention (`compute_scalar_stats()`): a count above a tenth of the
+rows the index held when it was counted is supplied as the negative fraction `-(count / rows)`,
+which `get_variable_numdistinct()` multiplies by the rows the planner finds the table to have when
+it plans, and any other count as the count. The choice follows the one ANALYZE makes because the
+question is the same - does the number of values grow with the table? - and because the fraction
+is what keeps a count useful between two counts: a table that has grown by a tenth since its last
+count plans a foreign key of distinct-per-row values with a tenth more of them, where a fixed count
+would have gone stale at exactly the rate autovacuum tolerates. A column of a fixed set of values
+keeps its number. The fraction's denominator is the index's own rows at the same moment - the TIDs
+of its first scalar column - not `pg_class.reltuples`, which ANALYZE passes to the cleanup call
+from the relation's cache and which may be the previous ANALYZE's; the one cost of that choice is
+that dead row versions not yet vacuumed count in the rows, so between VACUUMs a column whose rows
+were updated in place reads as having somewhat fewer values per row than it has (a unique column
+without a unique index, ANALYZE's `-1`, reads as the live share of its TIDs; one WITH a unique
+index is `-1` whatever the row says, `vardata->isunique`).
+
+**acl_ok is core's.** Whether the user may read every row of the column decides whether a
+non-leakproof operator may be handed the row's values (`statistic_proc_security_check()`), and it
+is computed from the column's privileges, the table's row-level security and any security-barrier
+view above it. Nothing here decides it: `lion_nd_core_lookup()` asks core's own
+`examine_variable()` for the column - a Var of the same range table entry, found by its position
+in `root->simple_rte_array`, which is where core took the entry it handed the hook - with both of
+lion's statistics hooks standing aside for that one lookup (`lion_ndistinct_nested`, reset on
+error), and the row it returns is the one supplied, with its `acl_ok`. As `lion_probe_begin()`
+does for the probe's row. The lookup also checks that core's row is the column's own
+(`starelid`, `staattnum`, not `stainherit`).
+
+**Caching.** Each index's meta page is read once per planner run (one pin, a SHARE lock and 272
+bytes, `lion_nd_index()`), and each column's corrected row is made once per planner run and handed
+out as is, with a release function that frees nothing: both live in the memory of the planner run,
+forgotten when it is reset (`lion_nd_cache_for()`, as `lion_probe_cache_for()`). The next plan
+reads the meta page again, so a count written by a build, a REINDEX, a VACUUM or an ANALYZE is what
+the next plan sees, and there is no relcache state to invalidate: a relcache callback was the
+alternative, but the count changes without any catalog change (an ANALYZE inside a transaction that
+rolls back has written it all the same, and a transactional invalidation would be rolled back with
+it), and backends have ten relcache callback slots in all.
+
+**Expressions.** An expression a lion index holds gets its count through `get_index_stats_hook`,
+where core asks, for an expression it has matched to an index column, whether a hook supplies that
+column's statistics (the ones ANALYZE keeps for an expression index): `lion_index_expr_stats()`,
+once the hook installed before it has declined, applies the same rules to the index core asks
+about - lion, not partial, not hypothetical, an expression column, the expression's type's equality
+and collation, a count the table has not outgrown - and takes the row by the same nested lookup,
+which walks the same indexes to the same one. A lookup that another index's row stopped at is left
+to core. Only the index core asks about is considered; it asks in the order of the relation's index
+list and stops at the first with statistics.
+
+**Tests.** `test/sql/ndistinct.sql`: a column of 200,000 rows, half in ten heavy values and half two
+rows each of 50,000 others, sampled at statistics target 10 - ANALYZE puts it at about 3,000 values -
+planned at the exact count after CREATE INDEX, after inserts and an ANALYZE of its (small enough)
+directory, after deletes and the VACUUM whose ambulkdelete counted them - at a statistics target
+of 1, whose bound the directory is past, so that nothing else could have - and for an expression
+index. At that target, an ANALYZE and a VACUUM with nothing to delete leave the count as it was. A
+smaller table of the same shape plans with its count while it grows to 1.9 times the rows counted,
+and with ANALYZE's estimate at 2.25 times. ANALYZE's number with the setting off and with the user's
+`n_distinct`; nothing for a partial index or a multi-key column; and a leaky operator given the
+most common values exactly when core would give them: to the owner, not to a role without SELECT
+on the column, with the count or without it, and to that role once it has the column.
+`lion_index_stats()` shows the stored counts (`ndistinct`, NULL where none).
+
+What moved in the rest of the suite, measured by running it with every supplied estimate logged
+beside ANALYZE's and the column's true count at plan time: every supplied estimate is the true
+count, or nearer it than ANALYZE's, except for columns planned between a DELETE or UPDATE and the
+VACUUM after it, where both are off by the dead rows (a spill test's column 13% over where
+ANALYZE's is 9% under, a range test's 3% over where ANALYZE's is 3% under, a count test's both a
+third over), and ndistinct.sql's grown table, on purpose. One plan changed:
+`test/sql/partition.sql`'s stale-statistics section, whose partitions' indexes count the 20,010
+groups ANALYZE has not seen. The planner now expects them all and scans the two partitions under
+a HashAggregate, where it chose the pushdown under a Finalize HashAggregate expecting ten groups -
+and the scan takes about half the pushdown's time there. The section is about the planner that
+does not know, so the rest of it runs with the setting off.
+
+### Limits
+
+- The count is as fresh as the last build, VACUUM that deleted, or ANALYZE of a directory within
+  its bound: inserts of new values in between are seen through the fraction's scaling, not
+  counted, and past a factor of 2 in the table's rows the count is not used at all.
+- Inheritance trees and partitioned tables are left to ANALYZE's estimate of the tree; their
+  partitions and children, planned as relations of their own, get their indexes' counts.
+- A column indexed only as a later key column of a multicolumn lion index is counted like the
+  first: each key column's run of entries is its own (§24). Its directory is the whole index's, so
+  the bound is met sooner than for an index of the column alone.
+- Dead row versions count until VACUUM (above).
+- An index whose meta page predates this section supplies nothing until a build, a VACUUM that
+  deletes, or an ANALYZE within the bound has counted it.

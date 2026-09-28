@@ -390,6 +390,15 @@ working around a bad choice:
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
   also take away B-tree index scans. The count pushdown and `LionOrdered` still use Lion indexes.
+- `pg_lion.enable_index_ndistinct`: give the planner a column's number of distinct values from a
+  Lion index on it - the index's count of its keys, taken at build, by every VACUUM that deletes
+  rows (in the walk it makes anyway) and by an ANALYZE when the index's directory is no larger than
+  ANALYZE's own sample - in place of the number ANALYZE estimates from its sample, which a column
+  with many rare values gets far too low (DESIGN.md §33). It applies to a column with statistics, a
+  non-partial index with a scalar opclass on exactly that column (or an expression index on the
+  expression), while the table holds within a factor of 2 of the rows the count was taken over, and
+  never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
+  number.
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`
