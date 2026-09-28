@@ -97,7 +97,35 @@ typedef struct LionCountStats
 	 * whenever no count had a filter.
 	 */
 	int64		rows_removed;
+
+	/*
+	 * What a count's work is made of, container by container (DESIGN.md §27,
+	 * "Where a key's time goes"), which the FK-side join reports per key:
+	 *
+	 *	key_containers	containers read from the one set of source slot 0 -
+	 *					a group's set, a join key's fk set - so the count's
+	 *					own share of containers_visited
+	 *	copy_containers	containers read from a private copy: a collected
+	 *					intersection (the join's copy of its fact filters, a
+	 *					GROUP BY's of its WHERE items) or a materialized set
+	 *	copy_seeks		binary searches of such a copy, one a probe
+	 *	copy_file_reads	containers of a SPILLED copy read back from its
+	 *					temporary file, one read each
+	 *	vm_checks		containers whose heap blocks the visibility map was
+	 *					asked about
+	 *	vm_pins			visibility map pages pinned to answer them
+	 */
+	int64		key_containers;
+	int64		copy_containers;
+	int64		copy_seeks;
+	int64		copy_file_reads;
+	int64		vm_checks;
+	int64		vm_pins;
 } LionCountStats;
+
+/* dst += src, every field. */
+extern void lion_count_stats_add(LionCountStats *dst,
+								 const LionCountStats *src);
 
 /*
  * A per-query cache of heap visibility answers for blocks that are not
@@ -122,6 +150,14 @@ typedef struct LionVisCache LionVisCache;
 extern LionVisCache *lion_vis_cache_create(MemoryContext parent);
 extern void lion_vis_cache_reset(LionVisCache *cache);
 extern void lion_vis_cache_destroy(LionVisCache *cache);
+
+/*
+ * The counts handed one cache keep a visibility-map page pinned from one to
+ * the next, and their working memory (DESIGN.md §27, "The per-key path, end
+ * to end").  The holder of the cache lets go of the pin with this when it is
+ * done with the relation; a reset and a destroy do it too.
+ */
+extern void lion_vis_cache_release_vm(LionVisCache *cache);
 
 /*
  * A test every row a count counts has to pass as well, made on the heap tuple
@@ -557,6 +593,15 @@ extern bool lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 								  LionPostingSet *ps);
 extern void lion_lookup_walk_pause(LionLookupWalk *walk);
 extern void lion_lookup_walk_restart(LionLookupWalk *walk);
+
+/*
+ * One key in any order, by a descent of its own - what
+ * lion_posting_set_lookup_col() does - with the probe the walk resolved once
+ * instead of one resolved for every key (DESIGN.md §27, "The per-key path,
+ * end to end").  The walk's place is neither used nor moved.
+ */
+extern bool lion_lookup_walk_descend(LionLookupWalk *walk, Datum key,
+									 LionPostingSet *ps);
 
 /*
  * Count the members of the intersection of nsets already located posting
