@@ -7360,6 +7360,27 @@ lion_stream_end(LionSetStream *st)
 }
 
 /*
+ * The stream of lion_sets_iterate(), below, for a caller that pulls it: a
+ * bitmap scan's intersection of a range with other columns (DESIGN.md §28,
+ * "Bitmap scans").
+ */
+LionSetStream *
+lion_stream_begin_bounded(int nsets, LionPostingSet *sets, LionKeyNode *tree)
+{
+	LionOpenBudget budget;
+	Relation	rel = NULL;
+	int			i;
+
+	for (i = 0; i < nsets && rel == NULL; i++)
+	{
+		if (sets[i].found)
+			rel = sets[i].index;
+	}
+	lion_open_budget_init(&budget, rel);
+	return lion_stream_begin_budget(nsets, sets, tree, false, &budget);
+}
+
+/*
  * Walk the containers of one expression over located posting sets, without
  * any visibility-map interlock: what a bitmap scan of a multi-key opclass
  * (DESIGN.md §17) or of several key columns (§24) needs.  Every TID goes to
@@ -7375,20 +7396,11 @@ int64
 lion_sets_iterate(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 				 lion_container_callback cb, void *arg)
 {
-	LionOpenBudget budget;
 	LionSetStream *st;
 	const LionContainer *c;
-	Relation	rel = NULL;
 	int64		total = 0;
-	int			i;
 
-	for (i = 0; i < nsets && rel == NULL; i++)
-	{
-		if (sets[i].found)
-			rel = sets[i].index;
-	}
-	lion_open_budget_init(&budget, rel);
-	st = lion_stream_begin_budget(nsets, sets, tree, false, &budget);
+	st = lion_stream_begin_bounded(nsets, sets, tree);
 
 	while ((c = lion_stream_next(st)) != NULL)
 	{

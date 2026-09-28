@@ -5621,7 +5621,8 @@ an AND of set trees whatever produced them. A qual the sets cannot express is DR
 are marked for recheck, which is always correct because the bitmap heap scan re-applies the original
 quals: `IS NOT NULL` (the complement of a set), a multi-key query the extractor answers with
 LION_QMODE_ALL, and any second qual on a column. `IS NULL` per column is that column's reserved
-entry.
+entry. A RANGE column (§28) is a walk and not a set: its entries are ANDed with the other columns'
+answer a container at a time, a window of that answer per walk (§28, "Bitmap scans").
 
 **`amoptionalkey` is TRUE** (it was false). Without it the planner refuses any path that does not
 constrain the FIRST index column, which for independent key sets is meaningless - `WHERE b = 1` on
@@ -7969,16 +7970,55 @@ widest bound, 108 ms on the assert build.)* `lioncostestimate()` charges such a 
 of that one walk, as it does a plain range.
 
 On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - its answer is a union
-of an unbounded number of entries - so it is answered into a TIDBitmap of its own and INTERSECTED
-(`tbm_intersect()`) with the bitmap of the other columns' tree, and the result is OR-ed into the
-caller's bitmap, which a BitmapOr above may share with its other arms. Two range columns are two such
-bitmaps. It is what core's BitmapAnd does, inside one index scan. `k < ANY (array)` is such a column
-too - its one walk to the widest element goes into a bitmap of its own - although it ranks as a list
-in the per-column choice. *(Deviation from the first version, which sorted columns into set trees
+of an unbounded number of entries - so its WALK is intersected with the other columns' answer a
+container at a time (`lion_emit_intersect()`), exactly:
+
+- The other columns' set trees are ANDed into ONE stream of containers in ascending container key,
+  planned against work_mem as `lion_sets_iterate()` plans it (§15, "Bounded cursors"), holding no pin
+  between two containers (`lion_stream_begin_bounded()`).
+- The stream is taken a WINDOW at a time: its next containers, copied, until they take
+  `max(pg_lion.scan_window_floor, work_mem)`, the plain scan's window memory (§29.3). Each range
+  column is then walked once for the window, every entry sought to the window's first container key
+  and read up to its last - an INLINE entry from the walk's copy of the leaf, item by item, a posting
+  tree through a stream - and the window's position found by binary search from where the entry
+  has got to, so a window of any size costs a walk and not a walk per container.
+- The LAST range column's walk ANDs each of its containers with the window's container at that key
+  and adds what is left to the caller's bitmap at once - a bitmap is a set, so it does not matter
+  which entry a TID came from, and the entries of one scalar column are disjoint anyway. A range
+  column before it ORs what its walk finds into a bitset image per window container instead, and the
+  window's containers are cut down to that before the next column's walk; those windows count the
+  image a container may need against the memory as well.
+- With nothing beside the ranges that the sets can express, the first range column is COLLECTED
+  into a set of its own (`lion_range_collect()`, summaries and all, into a temporary file past the
+  window's memory, §32) and stands for the other columns; a range left on its own is walked straight
+  into the bitmap, rechecked for the qual that was dropped.
+
+A selective answer of the other columns is one window, and each range one walk - with summaries a
+walk of the range's buckets. The result goes into the caller's bitmap, which a BitmapOr above may
+share with its other arms, and the scan reports the TIDs it added: the intersection's own count.
+`k < ANY (array)` is such a column too - its one walk to the widest element - although it ranks as a
+list in the per-column choice. *(Deviation from the first version, which sorted columns into set trees
 and walks by that rank alone: the array range went to the set trees, which cannot express it, and was
 dropped for the heap recheck while `lioncostestimate()` and the plain scan both counted it as
 answered - `a < ANY ('{-40,-45}') AND b = 3` handed the heap every row of `b = 3` to throw away
 (2026-09-25 review). `test/sql/range.sql` shows no row removed by the recheck now.)*
+
+*(Deviation from the second version, which walked each range column into a TIDBitmap of its own, of
+`work_mem`, and intersected the bitmaps with `tbm_intersect()` - core's BitmapAnd inside one scan. A
+range whose rows lie on more heap pages than a bitmap of `work_mem` holds exactly went LOSSY, and
+`tbm_intersect()` keeps every exact page of the other side that falls on a lossy page, only marked
+for recheck. A time window over rows stored in no time order has a row on nearly every page, so
+the range removed almost nothing: in a benchmark, an equality, a multi-key overlap and a time window
+on three columns of one index handed the heap about every row the first two selected, most of which
+the recheck then threw away, with many lossy pages - after walking the range key by key into its
+bitmap, its summaries unused. The scan reported the smaller input's count as its own, which made it
+look as though the range had not been answered at all. Nothing else dropped it: a bound that is a
+STABLE expression arrives as a runtime key and is read at every rescan like a constant; neither the
+multi-key clause beside it nor the summaries changed the choice; and the ranking leaves range keys to
+the recheck only on a column that has an equality or a list of its own. `test/sql/rangebitmap.sql`
+has the shape - a synthetic table, the bound a literal, a stable expression and a generic plan's
+parameter, with and without summaries - at a `work_mem` that holds the answer exactly and the range
+alone lossily: no row removed by the recheck and no lossy page.)*
 
 ### amcostestimate
 
@@ -8006,9 +8046,10 @@ no column (§29.9), and a non-MVCC one.
 On a MULTICOLUMN path `genericcostestimate()` prorates by every column's selectivity together,
 while the range column is walked whole whatever the others select; the postings of the range that
 the prorating leaves out are charged on top, and the entries once per window of the plain scan's
-WINDOW shape (§29.11). *(Added 2026-09-25: before it, `a BETWEEN 1 AND 900000 AND b = 5` over a
-million unique `a` was priced at two thirds of the sequential scan and ran 1.4 to 1.6 times as
-long.)*
+WINDOW shape (§29.11). The bitmap scan walks once per window of the same memory, its windows holding
+the other columns' containers at their own size, so it makes at most as many walks as it is charged.
+*(Added 2026-09-25: before it, `a BETWEEN 1 AND 900000 AND b = 5` over a million unique `a` was
+priced at two thirds of the sequential scan and ran 1.4 to 1.6 times as long.)*
 
 ### Count pushdown: a range BOUNDS the driver, it is never a source
 
@@ -8388,9 +8429,11 @@ only visibility. Teaching it to evaluate a qual would give LionCount a second, b
 execution with a cost model of its own, for a case where a plan the planner already has is at best
 equal. With the walk priced as it runs, the planner already declines the pushdown for it: the 7-day
 window below goes to the index scan. When F and the range are columns of ONE multicolumn index,
-core has no F-only index path, and the lion bitmap scan answers the range by a walk into a bitmap of
-its own (above). Leaving that range to the heap recheck is a question for `lioncostestimate()` and
-the bitmap scan, not for this node.
+core has no F-only index path, and the lion bitmap scan answers the range by a walk ANDed with F's
+containers (above) - with summaries, a walk of the range's buckets. Leaving that range to the heap
+recheck is a question for `lioncostestimate()` and the bitmap scan, not for this node, and the
+bitmap scan does not: the walk it would save is short when the range is summarized, and bounded by
+F's windows when it is not.
 
 ### Measured (2026-09-24, the distinct slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
@@ -8519,6 +8562,20 @@ range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
 both counts against the heap.
 
+`test/sql/rangebitmap.sql` (2026-09-28) covers "Bitmap scans" on a multicolumn index of a text
+column, a text array, a timestamp and an integer, over two copies of one synthetic table - one with
+`summaries = auto`, which summarizes the timestamp and the integer, one without - laid out nine
+rows a page, the timestamp a permutation of the heap order, so that a window of it has rows on
+nearly every page. At a work_mem of 64kB, which holds the answer's pages exactly but not the
+range's, an equality, an overlap and a range with the bound a literal, a stable expression (a
+runtime key) and a generic plan's parameter (a NULL one included), a lower bound, an upper one,
+both and one past every key: each answer against a sequential scan's, and from EXPLAIN ANALYZE only
+that the range is an Index Cond, that the recheck removed no row and that no page was lossy - the
+version before this one removed rows and read lossy pages there. Then that the summarized walk
+reads under half the index blocks of the other; two ranges across the windows of the least
+`pg_lion.scan_window_floor`; ranges alone, the first one collected; a qual dropped for the recheck
+beside them; and the plain scan's walks over the summaries.
+
 ## 29. Index scans: amgettuple, ordered scans, index-only scans
 
 Until this section lion answered only bitmap scans. Measured on release PG18.6 at 98ecedd
@@ -8588,10 +8645,14 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   (`lion_emit_all_keys_ext()`: copy a leaf, release it, test each entry with `lion_range_test()`,
   stop at the first entry past an upper bound or of the next column), and each selected entry is
   streamed as `AND(entry, rest)`, where `rest` is the set tree of the other columns' chosen quals
-  (empty for a one-column scan). Within one entry the TIDs come out in heap order; across entries
-  in key order. A second walk column is dropped and rechecked: a range column cannot be a set-tree
-  node (its answer is a union of an unbounded number of entries), and the bitmap path's answer for
-  two range columns - one TIDBitmap each, intersected - is not a stream. An `op ANY (array)` range
+  (empty for a one-column scan). On a column with summaries (§32) the "entries" of one range are
+  the keys of the buckets at its ends and the summaries of the buckets between, as for the bitmap
+  walk (§28, "Bitmap scans") - disjoint, so the WALK still returns no TID twice - unless the scan
+  keeps its pins (§29.5), whose walk is the keys'. Within one entry the TIDs come out in heap order;
+  across entries in key order. A second walk column is dropped and rechecked: a range column cannot
+  be a set-tree node (its answer is a union of an unbounded number of entries), and the bitmap
+  path's answer for two range columns - the first walk ORed into an image per container of a
+  window of the others, the second ANDed with that - is not one stream. An `op ANY (array)` range
   walks to the widest element (§28) when the column orders the elements; an UNORDERED column walks
   ONCE, testing each entry against every element's range (the bitmap path walks once per element
   and lets the bitmap absorb the overlap, which a stream cannot). `IS NOT NULL` next to any column
@@ -9251,8 +9312,10 @@ same, and the model now charges what that is:
 
 - the range's entries once per WINDOW (`lion_range_entry_cost()`): the heap's container keys over
   `lion_walk_window()`, 1 below 32768 heap blocks at the default floor - an upper bound, since the
-  other columns may have containers at fewer keys, and an overcharge of the bitmap scan on a heap
-  that large, the UNION's trade;
+  other columns may have containers at fewer keys; the bitmap scan walks once per window too, its
+  windows holding those containers at their own size rather than as images (§28, "Bitmap
+  scans"), so it makes at most as many walks. With summaries (§32) the entries are the walk's
+  edge keys and summaries (`lion_cost_walk_entries()`);
 - and the postings of the range itself. `genericcostestimate()` prorates a multicolumn path's
   index by every column's selectivity together, which is about what an AND of set trees reads
   (they leapfrog, §22), but a range column is walked whole whatever the others select (§28): it

@@ -1,0 +1,374 @@
+-- A range beside other columns of a multicolumn lion index, answered by the
+-- bitmap scan (DESIGN.md §28, "Bitmap scans").
+--
+-- A range column is not a set of the index but a walk of its entries, and the
+-- scan ANDs that walk with the other columns' answer a container at a time.
+-- It used to walk the range into a TIDBitmap of its own and intersect that
+-- with the others': with work_mem too small for the range alone - its rows on
+-- more heap pages than the bitmap holds exactly - the range's bitmap went
+-- lossy, the intersection kept every page of the other columns' answer, and
+-- the heap recheck, not the index, removed the rows outside the range.  The
+-- tables below are laid out that way: a timestamp in no heap order, nine rows
+-- a page, and a work_mem that holds the answer exactly but not the range.
+-- The bound is a literal, a stable expression (a runtime key of the scan)
+-- and a generic plan's parameter; the timestamp has summaries in one table
+-- (DESIGN.md §32) and none in the other.  Every answer is checked against a
+-- sequential scan, as a multiset, and of the plan only booleans are kept.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET max_parallel_workers_per_gather = 0;
+/*
+ * lion_rb() runs q as a BITMAP scan - every other scan and the count
+ * pushdown disabled - under EXPLAIN ANALYZE and again for its rows, and ref
+ * (q itself when NULL) as a sequential scan, and compares the answers as
+ * multisets.  Of the plan it reports whether a range on `at` is an Index Cond
+ * of the Bitmap Index Scan, whether the recheck removed no row and whether no
+ * heap page was lossy.
+ */
+CREATE FUNCTION lion_rb(q text, ref text DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	heap jsonb;
+	idx jsonb;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) ' || q
+		INTO j;
+	heap := jsonb_path_query_first(j, 'strict $.** ? (@."Node Type" == "Bitmap Heap Scan")');
+	idx := jsonb_path_query_first(j, 'strict $.** ? (@."Node Type" == "Bitmap Index Scan")');
+	EXECUTE 'CREATE TEMP TABLE lion_rb_on AS ' || q;
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'CREATE TEMP TABLE lion_rb_off AS ' || coalesce(ref, q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_rb_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_rb_on EXCEPT ALL SELECT * FROM lion_rb_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_rb_off EXCEPT ALL SELECT * FROM lion_rb_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_rb_on, lion_rb_off';
+	RETURN format('%s, %s rows; as the seqscan: %s; range in the Index Cond: %s; none removed by the recheck: %s; no lossy page: %s',
+				  CASE WHEN idx IS NULL THEN 'no bitmap' ELSE 'bitmap' END,
+				  nrows, ndiff = 0,
+				  coalesce(idx ->> 'Index Cond', '') ~ '\(at [<>]',
+				  (heap ->> 'Rows Removed by Index Recheck')::numeric = 0,
+				  (heap ->> 'Lossy Heap Blocks')::numeric = 0);
+END $$;
+/* The index blocks the Bitmap Index Scan of q reads, from shared buffers or not. */
+CREATE FUNCTION lion_rb_blocks(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	idx jsonb;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) ' || q
+		INTO j;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	idx := jsonb_path_query_first(j, 'strict $.** ? (@."Node Type" == "Bitmap Index Scan")');
+	RETURN (idx ->> 'Shared Hit Blocks')::bigint + (idx ->> 'Shared Read Blocks')::bigint;
+END $$;
+/* The same answer through a PLAIN index scan (DESIGN.md §29), against a seqscan. */
+CREATE FUNCTION lion_rb_plain(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	plain boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ '^\s*(->\s*)?Index Scan' THEN
+			plain := true;
+		END IF;
+	END LOOP;
+	EXECUTE 'CREATE TEMP TABLE lion_rb_on AS ' || q;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE 'CREATE TEMP TABLE lion_rb_off AS ' || q;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_rb_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_rb_on EXCEPT ALL SELECT * FROM lion_rb_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_rb_off EXCEPT ALL SELECT * FROM lion_rb_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_rb_on, lion_rb_off';
+	RETURN format('%s, %s rows; as the seqscan: %s',
+				  CASE WHEN plain THEN 'index scan' ELSE 'no index scan' END,
+				  nrows, ndiff = 0);
+END $$;
+-- ---------- the data ----------
+-- id 1 .. 24000 in heap order, nine rows a page (fillfactor 10); tag: four
+-- values, and nullable, so that `tag IS NOT NULL` stays a qual; labels: one
+-- of 'a' .. 'e' and one of 'f' .. 'l', so 'b' is in a fifth of the rows; at:
+-- a distinct minute each, a permutation of the id that leaves the rows of
+-- any time window on nearly every heap page.  From 2025-03-11 on there are
+-- 9600 rows.
+CREATE TABLE lion_rb_s (id int NOT NULL, tag text,
+						labels text[] NOT NULL, at timestamptz NOT NULL)
+	WITH (fillfactor = 10);
+CREATE TABLE lion_rb_n (LIKE lion_rb_s) WITH (fillfactor = 10);
+INSERT INTO lion_rb_s
+SELECT i, (ARRAY['w', 'x', 'y', 'z'])[1 + i % 4],
+	   ARRAY[chr(97 + i % 5), chr(102 + (i / 5) % 7)],
+	   timestamptz '2025-03-01 00:00:00+00' + ((i * 7919) % 24000) * interval '1 minute'
+  FROM generate_series(1, 24000) i;
+INSERT INTO lion_rb_n SELECT * FROM lion_rb_s ORDER BY id;
+-- summaries = auto keeps them for at and id (a key a row) and not for tag
+-- (four keys); labels is multi-key and never has any
+CREATE INDEX lion_rb_s_i ON lion_rb_s USING lion (tag, labels, at, id)
+	WITH (summaries = auto, summary_tids = 64);
+CREATE INDEX lion_rb_n_i ON lion_rb_n USING lion (tag, labels, at, id);
+VACUUM ANALYZE lion_rb_s;
+VACUUM ANALYZE lion_rb_n;
+SELECT attno, summary_entries > 0 AS summarized
+  FROM lion_index_stats('lion_rb_s_i') ORDER BY attno;
+ attno | summarized 
+-------+------------
+     1 | f
+     2 | f
+     3 | t
+     4 | t
+(4 rows)
+
+SELECT count(*) AS summarized_columns
+  FROM lion_index_stats('lion_rb_n_i') WHERE summary_entries > 0;
+ summarized_columns 
+--------------------
+                  0
+(1 row)
+
+-- the premise: the range's rows are on far more heap pages than a bitmap of
+-- 64kB holds exactly (about a thousand), the answer's on far fewer
+SELECT count(DISTINCT (ctid::text::point)[0]) > 2000 AS range_on_over_2000_pages
+  FROM lion_rb_s WHERE at >= '2025-03-11 00:00:00+00';
+ range_on_over_2000_pages 
+--------------------------
+ t
+(1 row)
+
+SELECT count(DISTINCT (ctid::text::point)[0]) < 600 AS answer_on_under_600_pages
+  FROM lion_rb_s
+ WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00';
+ answer_on_under_600_pages 
+---------------------------
+ t
+(1 row)
+
+-- ---------- 1. the range bounds the bitmap ----------
+-- 64kB of work_mem holds about a thousand heap pages exactly: the answer's
+-- 480 rows, one a page, but not the 9600 rows of the range, nor the 1200 of
+-- the other two columns.  Nothing is removed by the recheck, and no page is
+-- lossy, with the bound a literal ...
+SET work_mem = '64kB';
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 480 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_n WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 480 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+-- ... a stable expression, which the executor evaluates at the scan's first
+-- rescan and hands the index as a runtime key ...
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at >= timestamptz '2025-03-11 00:00:00+00' + interval '0 days'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 480 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_n WHERE tag = 'x' AND labels && '{b}' AND at >= timestamptz '2025-03-11 00:00:00+00' + interval '0 days'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 480 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+-- ... or a generic plan's parameter, a runtime key as well - which may also
+-- come out NULL, and then selects nothing
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_rb_ps(timestamptz) AS
+	SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at >= $1;
+PREPARE lion_rb_pn(timestamptz) AS
+	SELECT id FROM lion_rb_n WHERE tag = 'x' AND labels && '{b}' AND at >= $1;
+SELECT lion_rb($$EXECUTE lion_rb_ps('2025-03-11 00:00:00+00')$$,
+			   $$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 480 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$EXECUTE lion_rb_pn('2025-03-11 00:00:00+00')$$,
+			   $$SELECT id FROM lion_rb_n WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 480 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$EXECUTE lion_rb_ps(NULL)$$,
+			   $$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at >= NULL$$);
+                                                     lion_rb                                                     
+-----------------------------------------------------------------------------------------------------------------
+ bitmap, 0 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+DEALLOCATE lion_rb_ps;
+DEALLOCATE lion_rb_pn;
+RESET plan_cache_mode;
+-- an upper bound, and both: the walk's edges and the buckets between them
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at < '2025-03-06 00:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 360 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at BETWEEN '2025-03-04 00:00:00+00' AND '2025-03-13 12:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 684 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_n WHERE tag = 'x' AND labels && '{b}' AND at BETWEEN '2025-03-04 00:00:00+00' AND '2025-03-13 12:00:00+00'$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 684 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+-- a bound past every key
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at > '2025-04-01 00:00:00+00'$$);
+                                                     lion_rb                                                     
+-----------------------------------------------------------------------------------------------------------------
+ bitmap, 0 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+-- ---------- 2. with summaries the walk reads the buckets, not the keys ----------
+-- a range over 70% of the column, beside tag = 'x': the walk over the
+-- summarized column reads well under half the index blocks of the walk over
+-- the keys of the other
+RESET work_mem;
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND at >= '2025-03-06 00:00:00+00'$$);
+                                                      lion_rb                                                       
+--------------------------------------------------------------------------------------------------------------------
+ bitmap, 4200 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT 2 * lion_rb_blocks($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND at >= '2025-03-06 00:00:00+00'$$)
+	   < lion_rb_blocks($$SELECT id FROM lion_rb_n WHERE tag = 'x' AND at >= '2025-03-06 00:00:00+00'$$)
+	   AS summaries_read_under_half;
+ summaries_read_under_half 
+---------------------------
+ t
+(1 row)
+
+-- ---------- 3. windows, two ranges, and ranges alone ----------
+-- At the least window there is (64kB), the other columns' answer is taken a
+-- window of its containers at a time and the ranges are walked once per
+-- window; a range before the last is ORed into an image per container.
+SET pg_lion.scan_window_floor = '64kB';
+SET work_mem = '64kB';
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00' AND id <= 18000$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 360 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_n WHERE tag = 'x' AND labels && '{b}' AND at >= '2025-03-11 00:00:00+00' AND id <= 18000$$);
+                                                      lion_rb                                                      
+-------------------------------------------------------------------------------------------------------------------
+ bitmap, 360 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag IN ('w', 'x', 'y') AND at >= '2025-03-11 00:00:00+00' AND id <= 6000$$);
+                                                      lion_rb                                                       
+--------------------------------------------------------------------------------------------------------------------
+ bitmap, 1801 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+-- nothing but ranges: the first, collected into a set, stands for the others
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE at >= '2025-03-11 00:00:00+00' AND id <= 6000$$);
+                                                      lion_rb                                                       
+--------------------------------------------------------------------------------------------------------------------
+ bitmap, 2400 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_n WHERE at >= '2025-03-11 00:00:00+00' AND id <= 6000$$);
+                                                      lion_rb                                                       
+--------------------------------------------------------------------------------------------------------------------
+ bitmap, 2400 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+-- a qual the sets cannot express is dropped for the recheck, which then
+-- removes nothing, whether two ranges are left or one
+RESET work_mem;
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag IS NOT NULL AND at >= '2025-03-11 00:00:00+00' AND id <= 6000$$);
+                                                      lion_rb                                                       
+--------------------------------------------------------------------------------------------------------------------
+ bitmap, 2400 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+SELECT lion_rb($$SELECT id FROM lion_rb_s WHERE tag IS NOT NULL AND at >= '2025-03-11 00:00:00+00'$$);
+                                                      lion_rb                                                       
+--------------------------------------------------------------------------------------------------------------------
+ bitmap, 9600 rows; as the seqscan: t; range in the Index Cond: t; none removed by the recheck: t; no lossy page: t
+(1 row)
+
+RESET pg_lion.scan_window_floor;
+-- ---------- 4. the plain index scan walks the summaries too ----------
+SELECT lion_rb_plain($$SELECT id FROM lion_rb_s WHERE at >= '2025-03-11 00:00:00+00'$$);
+              lion_rb_plain               
+------------------------------------------
+ index scan, 9600 rows; as the seqscan: t
+(1 row)
+
+SELECT lion_rb_plain($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND at >= '2025-03-11 00:00:00+00'$$);
+              lion_rb_plain               
+------------------------------------------
+ index scan, 2400 rows; as the seqscan: t
+(1 row)
+
+SELECT lion_rb_plain($$SELECT id FROM lion_rb_s WHERE tag = 'x' AND at BETWEEN '2025-03-04 00:00:00+00' AND '2025-03-13 12:00:00+00'$$);
+              lion_rb_plain               
+------------------------------------------
+ index scan, 3420 rows; as the seqscan: t
+(1 row)
+
+SELECT lion_index_verify('lion_rb_s_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_rb_s, lion_rb_n;
+DROP FUNCTION lion_rb(text, text);
+DROP FUNCTION lion_rb_blocks(text);
+DROP FUNCTION lion_rb_plain(text);

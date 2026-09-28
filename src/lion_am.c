@@ -936,11 +936,12 @@ lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
  * the entries are paid once per window: the heap's container keys over the
  * window, which is 1 below 32768 heap blocks at the default floor and an
  * upper bound above it (the sets may have containers at fewer keys).  The
- * bitmap scan, which shares the path, walks once and is overcharged by that
- * on a heap that large - the UNION's trade in lioncostestimate().  The plain
- * scan used to restart the other columns' stream for every entry instead, a
- * descent of each of their posting trees, and that was never charged at all
- * (2026-09-25 review).
+ * bitmap scan, which shares the path, walks once per window of the same
+ * memory too (lion_emit_intersect()), whose containers are held at their own
+ * size rather than as bitset images, so it makes at most as many walks.  The
+ * plain scan used to restart the other columns' stream for every entry
+ * instead, a descent of each of their posting trees, and that was never
+ * charged at all (2026-09-25 review).
  *
  * *walkrows is what the walks read beyond that, for lioncostestimate() to
  * charge: on a MULTICOLUMN path genericcostestimate() prorates the index by

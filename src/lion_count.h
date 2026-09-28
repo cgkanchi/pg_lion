@@ -632,6 +632,16 @@ typedef struct LionSetStream LionSetStream;
 
 extern LionSetStream *lion_stream_begin(int nsets, LionPostingSet *sets,
 										LionKeyNode *tree, bool keeppins);
+
+/*
+ * The stream lion_sets_iterate() pulls, for a caller that pulls it itself: no
+ * pins kept, and the tree planned against work_mem, so that a union too wide
+ * to open at once is read as a windowed union (DESIGN.md §15, "Bounded
+ * cursors").  What a bitmap scan wants (§28, "Bitmap scans").
+ */
+extern LionSetStream *lion_stream_begin_bounded(int nsets,
+												LionPostingSet *sets,
+												LionKeyNode *tree);
 extern void lion_stream_seek(LionSetStream *st, uint32 target);
 extern const LionContainer *lion_stream_next(LionSetStream *st);
 
