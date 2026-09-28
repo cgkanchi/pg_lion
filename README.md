@@ -187,9 +187,27 @@ it does not: over a key that repeats - `o.customer_id IN (SELECT customer_id FRO
 ...)` - the node sorts the subquery's keys and counts each distinct key's orders once (DESIGN.md
 §27; five million fact rows against 9,776 rows over 8,848 distinct keys took 117 ms, against 585
 for the hash semi join, on an assert build). The JOIN and the second form may group by the
-dimension's columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of
-`count(*)` is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate
-counts their distinct values. So are, in place of `count(*)` or beside it, `min`, `max`,
+dimension's columns. To count each customer's orders, the JOIN may also group by the join key,
+`cu.id` or `o.customer_id`, and the first form by `o.customer_id`. Each customer the node counts is
+then a group of its own, which PostgreSQL's aggregate takes as it comes, with no sort and no hash
+table (DESIGN.md §27, "Grouped by the join key"). A query that aggregates those per-key counts in
+turn gets the node at its inner level:
+
+```sql
+WITH n AS (SELECT o.customer_id, count(*) AS n
+           FROM orders o JOIN customers cu ON cu.id = o.customer_id
+           WHERE o.status = 'open' AND cu.country = 'NZ'
+           GROUP BY o.customer_id)
+SELECT count(*) AS customers, sum(LEAST(n, 3)) AS capped FROM n;
+```
+
+`GROUP BY o.customer_id` needs both key columns of one type, compared with that type's own `=`,
+whose equal values are always spelled alike: integers, text under a deterministic collation, or
+uuid, for example, but not numeric, where 1.0 and 1.00 are equal.
+
+`count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of `count(*)` is pushed down
+too: the node emits the matching customers, and PostgreSQL's own aggregate counts their distinct
+values. So are, in place of `count(*)` or beside it, `min`, `max`,
 `bool_and`, `bool_or`, `every`, `bit_and` and `bit_or` of the customers' columns, `count` of them,
 and `sum` of their `smallint` and `integer` ones (DESIGN.md §27, "Every aggregate over the node's
 rows"): where one of those stands beside a count of the join's rows, each customer the node emits
