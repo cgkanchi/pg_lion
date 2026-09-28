@@ -76,6 +76,9 @@ PG_FUNCTION_INFO_V1(lion_handler);
 /* Kind of relation options for lion indexes */
 static relopt_kind lion_relopt_kind;
 
+/* GUC pg_lion.enable_plain_scan (DESIGN.md §29.11, lioncostestimate()) */
+static bool lion_enable_plain_scan = true;
+
 static const relopt_parse_elt lion_relopt_tab[] = {
 	{"buckets", RELOPT_TYPE_INT, offsetof(LionOptions, buckets)},
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
@@ -104,8 +107,8 @@ static relopt_enum_elt_def lion_wal_mode_options[] = {
 
 /*
  * Module initialisation: register the reloptions of the roaring AM, the
- * count-pushdown GUC and the planner hook that plants the LionCount
- * CustomScan (DESIGN.md section 10, implemented in lion_customscan.c).
+ * planner GUCs and the planner hook that plants the LionCount CustomScan
+ * (DESIGN.md section 10, implemented in lion_customscan.c).
  *
  * This runs the first time the library is loaded into a backend, which for
  * any query over a lion index happens in get_relation_info() when the
@@ -207,6 +210,22 @@ _PG_init(void)
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
 							 NULL,
 							 &lion_enable_count_pushdown,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §29.11, "Plain scans switched off": whether the planner may
+	 * scan a lion index with a plain or an index-only scan.  Off, it plans
+	 * lion indexes as it plans GIN's, for bitmap scans only, where
+	 * enable_indexscan = off would take every other access method's index
+	 * scans away as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_plain_scan",
+							 "Enables the planner's use of plain and index-only scans of lion indexes.",
+							 "Off, lion indexes are planned for bitmap scans only; other index access methods are unaffected.",
+							 &lion_enable_plain_scan,
 							 true,
 							 PGC_USERSET,
 							 0,
@@ -1718,7 +1737,8 @@ lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
  * plain scan's per-row work (lion_plain_heap_correlation()), otherwise the
  * column's correlation as btree's is (lion_index_correlation(), DESIGN.md
  * §29.11); a bitmap path, which shares this estimate, does not read that
- * last number.
+ * last number.  With pg_lion.enable_plain_scan off there is no plain path to
+ * price.
  */
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -1730,6 +1750,22 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	bool		emits_all_rows;
 	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
 	double		walkrows = 0.0;
+
+	/*
+	 * pg_lion.enable_plain_scan off (DESIGN.md §29.11, "Plain scans switched
+	 * off"): the planner is to plan this index as it plans a GIN index, for
+	 * bitmap scans only.  get_index_paths() offers an IndexPath as a plain or
+	 * index-only scan only when the index's amhasgettuple says so, and asks
+	 * once the path is built and costed - here - so clearing the flag now
+	 * keeps every plain path of the index, parameterized ones included, out
+	 * of this planning run before add_path() has compared one with anything
+	 * else.  The bitmap paths are built from the same IndexPaths and do not
+	 * change, nor does what reads them: LionOrdered takes its lion side from
+	 * a bitmap path when there is no plain one (lion_ordered.c).  The next
+	 * planning run reads the flag from the handler again.
+	 */
+	if (!lion_enable_plain_scan)
+		path->indexinfo->amhasgettuple = false;
 
 	/*
 	 * A full walk visits every index tuple, and genericcostestimate() then
@@ -1896,8 +1932,9 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;
-	*indexCorrelation = lion_plain_heap_correlation(root, path, loop_count,
-													costs.indexSelectivity);
+	*indexCorrelation = lion_enable_plain_scan ?
+		lion_plain_heap_correlation(root, path, loop_count,
+									costs.indexSelectivity) : 0.0;
 	*indexPages = costs.numIndexPages;
 }
 

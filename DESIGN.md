@@ -9301,6 +9301,26 @@ row of its lossy pages), under a LIMIT (the plain scan's startup cost is the ind
 scan's the whole bitmap), and over a column stored in heap order (the packed end); with the walk
 priced as a single reader's the planner makes the comparison itself.
 
+**Plain scans switched off** (2026-09-28, `pg_lion.enable_plain_scan`, bool, default on,
+`PGC_USERSET`). Off, the planner plans lion indexes as it plans GIN's, for bitmap scans only: no
+plain and no index-only scan of a lion index is offered, parameterized or not, and every other
+access method's index scans are left alone - `enable_indexscan = off`, the only switch before it,
+takes btree's away as well. The mechanism is the one core has for an access method without
+`amgettuple`. get_index_paths() builds an index's IndexPaths - costing each through amcostestimate -
+and then offers them as plain or index-only scans only if the IndexOptInfo's `amhasgettuple` is set;
+the bitmap paths are built from the same IndexPaths. `lioncostestimate()` clears the flag, so no
+plain path of the index reaches add_path() in that planning run, and the next run reads it from the
+handler again (plancat.c). The two ways first considered both come too late or land wrong: a plain
+path removed from the set_rel_pathlist hook, or given a `disable_cost` / `disabled_nodes` penalty
+there, has already made add_path() discard the paths it dominated, of which the hook can offer back
+the bitmap scan of the same index and the sequential and TID scans (as it does for a remainder,
+above) but not another index's scans or a BitmapAnd; and a penalty in amcostestimate lands in the
+index cost the bitmap path shares. LionOrdered, which runs create_index_paths() over a copy of the
+relation that sees only its lion indexes, takes its lion side from a bitmap path when no plain path
+is offered - the same lion access (§30.2). It is a planner setting: an exclusion constraint's check
+calls `amgettuple` whatever it says, and a plan cached before it changed is not planned again for
+it, as with core's `enable_*` settings.
+
 ### 29.12 Tests
 
 `test/sql/indexscan.sql`, written before the code and failing on HEAD (no plan can show an Index
@@ -9359,16 +9379,21 @@ takes 10 ms - the price of a numeric `=`, one cpu_operator_cost like any other, 
 it prints the bitmap scan, the fastest of the three: 2.5 ms of CPU on the release build against
 the plain scan's 3.0 and the sequential scan's 5.3.
 
-`test/sql/plainscan.sql` (2026-09-28, §29.11 "One process against several"), on 20,000 rows of
-18 to a page placed at random: a sixtieth of the rows, on about a quarter of the pages, goes to the
-plain scan with parallel plans off and while its pages are fewer than min_parallel_table_scan_size,
-and to the bitmap scan once core would give the bitmap scan of those pages a worker (the plain scan
-some 30% dearer); 20 rows stay on the plain scan either way; the answers are the sequential scan's.
-The existing pinned plans do not move: every test that pins a plain lion scan sets
-max_parallel_workers_per_gather to 0, or pins a result of a few hundred pages at most under the
-default min_parallel_table_scan_size, and the tests that lower min_parallel_table_scan_size to 0
-(`fkjoin_parallel.sql`, `fkjoin_nonunique.sql`, `countmultikey.sql`) print which count node is
-chosen, which a dearer plain scan does not change.
+`test/sql/plainscan.sql` (2026-09-28, §29.11 "One process against several" and "Plain scans
+switched off"), on 20,000 rows of 18 to a page placed at random: a sixtieth of the rows, on about a
+quarter of the pages, goes to the plain scan with parallel plans off and while its pages are fewer
+than min_parallel_table_scan_size, and to the bitmap scan once core would give the bitmap scan of
+those pages a worker (the plain scan some 30% dearer); 20 rows stay on the plain scan either way.
+With `pg_lion.enable_plain_scan` off the plain scan of the lion index gives way to its bitmap scan
+and the primary key's btree keeps its index scan; with the other scans disabled, the index-only scan
+of a partial lion index and the parameterized lion scan inside a nested loop are made with the
+setting on and not with it off, the btree's scan is made either way, and LionOrdered (every core
+scan disabled) is chosen either way - each with the sequential scan's answers. The existing pinned
+plans do not move: every test that pins a plain lion scan sets max_parallel_workers_per_gather to 0,
+or pins a result of a few hundred pages at most under the default min_parallel_table_scan_size, and
+the tests that lower min_parallel_table_scan_size to 0 (`fkjoin_parallel.sql`,
+`fkjoin_nonunique.sql`, `countmultikey.sql`) print which count node is chosen, which a dearer plain
+scan does not change.
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
