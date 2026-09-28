@@ -63,6 +63,7 @@ INSERT INTO lpm_est
 -- the next one reads none.
 DELETE FROM lpm WHERE id > 20000;
 VACUUM (FREEZE) lpm;
+SELECT 'DIAG shape' AS diag, leaf_pages, entries, ntids FROM lion_index_stats('lpm_lion');
 CREATE TABLE lpm_io (step text, bufs bigint);
 INSERT INTO lpm_io
 	SELECT 'first', lpm_bufs($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
@@ -85,6 +86,39 @@ SELECT (SELECT est FROM lpm_est WHERE step = 'probed') >
 	   10 * (SELECT est FROM lpm_est WHERE step = 'given up') AS probed_again;
 SELECT count(*) FROM lpm WHERE ts >= '2026-01-10';
 
+SELECT 'DIAG io' AS diag, * FROM lpm_io ORDER BY step;
+SELECT 'DIAG est' AS diag, * FROM lpm_est ORDER BY step;
+-- DIAG twin with plain VACUUM
+CREATE FUNCTION lpq_rows(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	RETURN (regexp_match(j::text, '"Node Type": "Bitmap Index Scan",[^}]*"Index Name": "lpq_lion",[^}]*"Plan Rows": (\d+)'))[1];
+END $$;
+CREATE TABLE lpq (id int, ts timestamptz) WITH (autovacuum_enabled = off);
+ALTER TABLE lpq ALTER ts SET STATISTICS 5;
+INSERT INTO lpq SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute'
+  FROM generate_series(1, 1500) g;
+CREATE INDEX lpq_lion ON lpq USING lion (ts);
+VACUUM (ANALYZE) lpq;
+INSERT INTO lpq SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute'
+  FROM generate_series(1501, 30000) g;
+VACUUM lpq;
+SELECT 'DIAG q probed' AS diag, lpq_rows($$SELECT * FROM lpq WHERE ts >= '2026-01-10'$$) AS est;
+DELETE FROM lpq WHERE id > 20000;
+VACUUM lpq;
+SELECT 'DIAG q shape' AS diag, leaf_pages, entries, ntids FROM lion_index_stats('lpq_lion');
+SELECT 'DIAG q first' AS diag, lpm_bufs($$SELECT * FROM lpq WHERE ts >= '2026-01-10'$$);
+SELECT 'DIAG q again' AS diag, lpm_bufs($$SELECT * FROM lpq WHERE ts >= '2026-01-10'$$);
+SELECT 'DIAG q given up' AS diag, lpq_rows($$SELECT * FROM lpq WHERE ts >= '2026-01-10'$$) AS est;
+DROP TABLE lpq;
+DROP FUNCTION lpq_rows(text);
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE lpm, lpm_est, lpm_io;
 DROP FUNCTION lpm_bufs(text);
