@@ -1472,6 +1472,234 @@ lion_container_or_into_bitset(const LionContainer *c, uint64 *w)
 }
 
 /*
+ * DENSE ACCUMULATION (DESIGN.md §32, "Summed ranges: dense and probed").
+ *
+ * The union of many small containers of one container key - a range's sets,
+ * collected - was folded one lion_container_or() at a time: each built a
+ * bitset image of the union so far, set the newcomer's bits, counted the
+ * whole image, optimized it and copied it out, a 4 KB round trip per
+ * member once the union was a bitset, and a merge of the whole array per
+ * member before that.  The three functions below let a caller keep the
+ * union in the form it grows in instead, and optimize it once at the end.
+ */
+
+/*
+ * acc |= c in place, for an acc that is a BITSET of the caller's (its full
+ * LION_CONTAINER_MAX_SIZE bytes): c's members are set in acc's words and
+ * acc's cardinality is raised by the ones that were new, which is what is
+ * returned.  acc stays a BITSET whatever it now holds; the caller optimizes
+ * it when it is done.  c may come off a page: its members are taken as
+ * iterate() takes them, and nothing outside acc's words is written.
+ */
+uint32
+lion_container_or_inplace(LionContainer *acc, const LionContainer *c)
+{
+	uint64	   *w = bitset_mdata(acc);
+	uint32		added = 0;
+	uint32		i;
+
+	Assert(acc->type == LION_CT_BITSET);
+
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(c);
+				uint32		n = array_card(c);
+
+				for (i = 0; i < n; i++)
+				{
+					uint32		lo = arr[i] & LION_LO_MASK;
+					uint64		bit = UINT64CONST(1) << (lo & 63);
+
+					if ((w[lo >> 6] & bit) == 0)
+					{
+						w[lo >> 6] |= bit;
+						added++;
+					}
+				}
+				break;
+			}
+		case LION_CT_BITSET:
+			{
+				const uint64 *src = bitset_cdata(c);
+
+				for (i = 0; i < LION_BITSET_WORDS; i++)
+				{
+					added += (uint32) pg_popcount64(src[i] & ~w[i]);
+					w[i] |= src[i];
+				}
+				break;
+			}
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(c);
+				uint32		nruns = run_nruns(c);
+
+				/*
+				 * Overlapping runs (a damaged container) count what the
+				 * earlier ones set as already there, so nothing is counted
+				 * twice.
+				 */
+				for (i = 0; i < nruns; i++)
+				{
+					int32		last = run_last(&runs[i]);
+					uint32		had;
+
+					if ((int32) runs[i].start > last)
+						continue;
+					had = bits_range_cardinality(w, runs[i].start, (uint32) last);
+					bits_set_range(w, runs[i].start, (uint32) last);
+					added += (uint32) (last - (int32) runs[i].start + 1) - had;
+				}
+				break;
+			}
+		default:
+			Assert(false);
+			break;
+	}
+
+	acc->cardinality = (uint16) Min((uint32) acc->cardinality + added,
+									(uint32) LION_CONTAINER_RANGE);
+	return added;
+}
+
+/*
+ * acc ∪= the n values of vals: in any order, repeats allowed, each masked into
+ * range.  acc has LION_CONTAINER_MAX_SIZE bytes of capacity and comes back
+ * optimized, which is its cardinality returned; w is the caller's image of
+ * LION_BITSET_WORDS words, which must not overlap acc.  One pass over acc and
+ * the values and one over the image, however many values there are: what a
+ * union whose members arrive a few at a time flushes a batch of them with.
+ */
+uint32
+lion_container_add_many(LionContainer *acc, const uint16 *vals, uint32 n,
+						uint64 *w)
+{
+	uint32		card;
+	uint32		i;
+
+	container_clamp(acc);
+	container_fill_bitset(acc, w);
+	for (i = 0; i < n; i++)
+		bits_set(w, vals[i]);
+	card = bits_cardinality(w);
+
+	acc->type = LION_CT_BITSET;
+	acc->flags = 0;
+	memcpy(bitset_mdata(acc), w, LION_BITSET_BYTES);
+	acc->cardinality = (uint16) card;
+	lion_container_optimize(acc);
+	return acc->cardinality;
+}
+
+/*
+ * Which of the values sorted[0 .. n - 1] c holds: bit j of marks, which has
+ * (n + 63) / 64 words, is set for every j whose value is a member of c, and
+ * no other bit is written.  Returns how many of the bits it set were clear.
+ * sorted must be strictly ascending and below LION_CONTAINER_RANGE, and n at
+ * most LION_CONTAINER_RANGE: the members of an ARRAY container the caller
+ * holds, whose rows it asks a range about (DESIGN.md §32, "probed").  c may
+ * come off a page and be damaged; which bits it then sets is unspecified,
+ * but none past bit n - 1.
+ *
+ * The smaller side drives: an ARRAY no larger than a few times n is walked
+ * member by member, each looked up in sorted by a galloping search from
+ * where the last one was found; otherwise every value of sorted is looked up
+ * in c - a bit test in a BITSET, a merge step against a RUN's runs, a binary
+ * search in a large ARRAY.
+ */
+uint32
+lion_container_mark_members(const LionContainer *c, const uint16 *sorted,
+							uint32 n, uint64 *marks)
+{
+	uint32		added = 0;
+	uint32		j;
+
+#define MARK(j) \
+	do { \
+		uint64		bit_ = UINT64CONST(1) << ((j) & 63); \
+		if ((marks[(j) >> 6] & bit_) == 0) \
+		{ \
+			marks[(j) >> 6] |= bit_; \
+			added++; \
+		} \
+	} while (0)
+
+	Assert(n <= LION_CONTAINER_RANGE);
+	if (n == 0)
+		return 0;
+
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(c);
+				uint32		na = array_card(c);
+				uint32		i;
+
+				if (na <= 4 * n)
+				{
+					j = 0;
+					for (i = 0; i < na && j < n; i++)
+					{
+						uint32		lo = arr[i] & LION_LO_MASK;
+
+						j = array_gallop(sorted, n, j, lo);
+						if (j < n && (uint32) sorted[j] == lo)
+							MARK(j);
+					}
+				}
+				else
+				{
+					for (j = 0; j < n; j++)
+					{
+						uint32		pos = array_lower_bound(arr, na, sorted[j]);
+
+						if (pos < na && (uint32) (arr[pos] & LION_LO_MASK) ==
+							(uint32) sorted[j])
+							MARK(j);
+					}
+				}
+				break;
+			}
+		case LION_CT_BITSET:
+			{
+				const uint64 *w = bitset_cdata(c);
+
+				for (j = 0; j < n; j++)
+					if (bits_test(w, sorted[j]))
+						MARK(j);
+				break;
+			}
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(c);
+				uint32		nruns = run_nruns(c);
+				uint32		r = 0;
+
+				/* both ascending: one merge of the values against the runs */
+				for (j = 0; j < n && r < nruns; j++)
+				{
+					int32		lo = (int32) sorted[j];
+
+					while (r < nruns && run_last(&runs[r]) < lo)
+						r++;
+					if (r < nruns && (int32) runs[r].start <= lo)
+						MARK(j);
+				}
+				break;
+			}
+		default:
+			Assert(false);
+			break;
+	}
+#undef MARK
+
+	return added;
+}
+
+/*
  * One pass over the container, whatever its representation.  The obvious
  * alternative - lion_container_range_cardinality() once per block range - is
  * LION_BLOCKS_PER_CONTAINER binary searches whether the container holds three
