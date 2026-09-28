@@ -16,3 +16,6 @@ pg_lion-*.zip
 # Frequent automatically named measurements stay local; named baselines can be committed.
 bench/results/quick/*T*Z-*/
 test/modules/*/results/
+
+# bench/write_micro.sh temporary pgbench log directories
+.pgbench-*/
