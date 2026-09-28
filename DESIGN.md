@@ -3099,7 +3099,8 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
   `lion_find_roaring_index` plus, per clause, strategy 1 of THAT index's opfamily for the clause's
   operator and an opfamily member and hash function for the compared type, all checked per
   partition because nothing stops two partitions from using different opclasses. A foreign table,
-  or a leaf without one of the indexes, bails out.
+  or a leaf without one of the indexes, bails out - unless the leaf's bounds imply the clause, which
+  it then leaves out ("Clauses the partition bounds imply", below).
 - The two §10 rules about what an index's entries MEAN are checked per partition for the same
   reason: the driving index's strategy-1 operator must be the grouping equality
   (`SortGroupClause.eqop`), and an index whose stored key will be printed - the group key in the
@@ -3244,6 +3245,90 @@ Also not supported, and refused rather than attempted: a partition whose opclass
 differently from the query, and a value-producing grouping over a type whose equality does not
 preserve the representation (§10). A grouping too large for `hash_mem` is no longer among them:
 the Finalize HashAggregate spills.
+
+### Clauses the partition bounds imply (2026-09-28)
+
+A count over a partitioned table needed a lion index for every WHERE clause in every partition it
+counted. A clause on the partition key that no lion index covers - `kind = 'a'` over a table
+LIST-partitioned by kind - then declined the query, although pruning had left only partitions every
+row of which satisfies it: a count such as `count(*) ... WHERE kind = 'a' AND tags && '{x}' AND ts >=
+now() - interval '365 days'`, over leaves that each have a lion index on `(tags, ts, fk)`, got a
+parallel bitmap heap scan and no LionCount. The key clause was the only blocker: the stable range on
+`ts` is a clause value like any other the node evaluates once per scan (§10), and the same query
+without `kind = 'a'` was pushed down.
+
+A leaf partition's constraint - `RelationGetPartitionQual()`, which adds every ancestor's bound to
+the leaf's own, so that a sub-partition of `kind = 'a'` by year on `ts` carries both - is TRUE for
+every row the leaf holds: partbounds.c builds it with explicit null tests so that it never
+evaluates to NULL, tuple routing puts a row only where its bound says, and neither
+ExecPartitionCheck() nor ATTACH PARTITION lets anything else in. So a WHERE clause the constraint
+STRONGLY implies - core's own `predicate_implied_by(clause, constraint, false)`, the proof partial
+indexes and constraint exclusion are decided by, with the clause mapped onto the leaf's columns
+through every level of partitioning (`adjust_appendrel_attrs_multilevel()`) - is TRUE of every row
+of the partition, selects nothing there, and is left out of that partition's count:
+
+- **Per partition, per restriction.** `lion_collect_targets()` asks it of each leaf for each
+  restriction - each entry of the parent's baserestrictinfo, so that an OR is left out whole or not
+  at all (`lion_leaf_drops()`). A restriction the leaf has no index for has to be implied, or the
+  query declines as before. One it has indexes for is left out too, which saves its lookups and an
+  AND with a set that holds every row of the partition - but not where the count would then have
+  nothing left to select rows by (below). The plan says which: the partition's index Oid for the
+  clause is InvalidOid (`LION_PRIV_PARTS`, shape 15), and the executor leaves the clause's source
+  out of that partition's items (`lion_relation_items()`), opens no index for it and asks it
+  nothing. The partition is priced for the clauses it keeps (`lion_target_lists()`).
+- **Never left out**: a range that bounds the walk driving the count (§28), which walks the same
+  entries with it or without it and is on the driver's own index; and a pinned column whose value
+  the target list prints, which comes out of the index's stored key (§10's value gate).
+- **Something must still select the rows.** A count that nothing but the WHERE clauses drives - no
+  GROUP BY, no sum over a column's entries, no fk key (§27) - needs, in every partition, a positive
+  clause or an OR of them that carries the §9 interlock (not a range collected into memory, §32),
+  as the planner asks of the query as a whole (`pinnedsrc`). A partition that would have to leave
+  out every such clause declines the query: `count(*) ... WHERE kind = 'a' AND fk IS NOT NULL`,
+  over partitions that do not index kind, is still the ordinary plan's, and so is `count(*) ...
+  WHERE kind = 'a'`, a count of whole partitions, which the node has never made.
+- **Implied by every partition.** A clause no posting set answers at all - an operator no lion
+  opclass has, an OR with an expression for an arm - declines the query unless every partition
+  counted implies it (`lion_implied_everywhere()`); then it is left out of the plan altogether, and
+  EXPLAIN is handed its text (`LION_PRIV_IMPLIED`). And a range every partition implies does not
+  drive a count that another clause, not implied everywhere, selects rows for: as the driver it
+  would walk every key of each partition, as a source it is left out.
+- **NULLs and default partitions.** The proof is strong implication by a constraint that is never
+  NULL, which is exactly "every row of the partition satisfies the clause". A partition `FOR VALUES
+  IN (NULL, 'n')` implies neither `kind = 'n'` nor `kind IS NULL`, only their OR; a LIST partition
+  without NULL implies `kind IS NOT NULL`; a default partition's constraint is the negation of its
+  siblings', which implies `kind NOT IN (...)` of all their values and no equality. A clause with a
+  volatile function or a subquery is never taken as implied - the query asked for it per row - and
+  a Param proves nothing at plan time, so a generic plan's `kind = $1` still needs an index, where a
+  custom plan's literal does not.
+- **What it does not change.** The row estimates, which are the planner's from the parent's
+  clauses; the partitions counted, the planner's pruned set (a partition only run-time pruning
+  would remove is counted, and matches nothing); and the EXECUTE checks, made on every clause of
+  the parent's quals as before (§9, "Privileges"), since the ordinary plan evaluates the clause as a
+  Filter. A plan relies on a constraint only ATTACH and DETACH change, and both invalidate every
+  plan over the parent; the executor's lock on each partition it counts keeps a concurrent ATTACH
+  from changing a default partition's bound under a running query - which is what partition
+  pruning rests on too.
+
+EXPLAIN prints what the partitions leave out on a line of its own, `Implied by Partition Bounds`,
+each clause followed by `in N of M partitions` where not all of them do; a clause every partition
+leaves out reads no index and is not in `Lion Indexes`:
+
+    Custom Scan (LionCount)
+      Partitions: ip_a_2025, ip_a_2026, ip_b, ip_cd
+      Lion Indexes: (kind = ANY ('{a,b,c}'::text[])), (tags && '{x1}'::text[])
+      Implied by Partition Bounds: (kind = ANY ('{a,b,c}'::text[])) in 3 of 4 partitions
+
+`test/sql/partition_implied.sql` checks every answer against the pushdown off, forcing the node
+wherever it has a path, over a table LIST-partitioned by an unindexed key with one list
+sub-partitioned by year, a partition with an index on the key, one that takes NULL and a default:
+clauses implied by every partition counted (through a parent's bound, an IN list, `IS NOT NULL`, a
+year's range beside another clause and alone, an OR with an unanswerable arm, the default
+partition's NOT IN), by some and not others (a list one partition answers from its own index, a
+range taken as a source, an OR across columns), and not at all (the NULL partition's equality and
+null test, the default's equality, a range on the key that keeps the default partition); counts,
+GROUP BYs of one and two columns; the declines (nothing left to select rows by, a printed pinned
+column, a volatile arm, a generic plan's parameter against a custom plan's literal); and a dirty
+heap before and after VACUUM.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
