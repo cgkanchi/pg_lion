@@ -2563,7 +2563,9 @@ say there is - either one sends the count back to the merge:
   image (`LION_OR_BITSET_MIN` containers at one key); below that it folds them pairwise, which is
   quadratic in the sets. On the 200-key column above, sum against merge at 5 values is 0.49 ms
   against 0.64, at 15 values 1.14 against 2.37, at 30 values 2.15 against 7.6 - and at 50, where the
-  image takes over, 3.5 against 2.5.
+  image takes over, 3.5 against 2.5. (A range collected as a source had the same quadratic fold,
+  one container at a time into its union, and now keeps the union as an image once it is one -
+  §32, "Summed ranges: dense and probed".)
 
 The density is read off the entries' own row counts, which the located posting sets carry already
 (`ntids`), against the number of container keys the heap has; no extra page is read to decide it.
@@ -10615,7 +10617,10 @@ writers, with an MVCC snapshot deciding every row:
   the heap recheck decide it as they decide every candidate (§9).
 
 The §9 interlock is the ordinary one: a summary's containers are read under a pin on the page they
-came from, like a key's.
+came from, like a key's. (A sum beside a clause with far fewer rows than the walk hands out probes
+the rest of its walk at that clause's rows instead of counting set by set, and a range collected as
+a source grows its union in place: "Summed ranges: dense and probed" below, whose §9 argument is a
+collected set's.)
 
 The landing that finds E_j (`lion_range_landing()`) steps over an item that sorts before its search
 key, as the insert's lookup does: on a sound directory it never lands on one, and on an index the
@@ -10767,6 +10772,119 @@ EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <
 EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any, and
 of the collected, `Range Sources Spilled`.
 
+### Summed ranges: dense and probed (2026-09-28)
+
+A column whose rows lie in no heap order - a timestamp on a table loaded in some other order, a key
+that is a permutation of the row number - gives every summary a member or two at nearly every
+container key the heap has: a bucket of `summary_tids` rows over a heap of more container keys than
+that is that many one-member containers, stored as the pairs of sparse segments (§13). The
+summaries still do what they are for - a range reads a set per whole bucket, not a set per key -
+but each of those sets now costs its ROWS, not its keys, and two places paid for them many times
+over:
+
+- **A sum beside other clauses F.** The sum counts each set of its walk ANDed with F (§28,
+  "Counting a walk"), and a scattered summary is a large entry, so each is a count of its own: a
+  merge of its thousands of tiny containers with F, the smaller side driving and the other sought
+  at its keys, with a count's set-up around it. Over T whole buckets of S rows, with F in F_c
+  containers, that is some T × min(S, F_c) merge steps - a seek, a container AND and, for what
+  survives, a visibility-map question each - however few rows F has, and F's containers read
+  again for every summary. A benchmark found such counts slower than the bitmap scan the planner
+  (correctly) preferred.
+- **A range collected as a source** ("A range as a source" above). Each container of each set was
+  ORed into the union with a `lion_container_or()`: a merge of the whole union while it was an
+  ARRAY, and past 2048 members a 4 KB image filled, counted, optimized and copied back - per
+  incoming container, which for such a column is per member.
+
+**The probed sum** (`lion_sum_walk()`, and `lion_walk_range_part()` for a range source walked
+because it would not fit in memory). A summed walk over a summarized column that has handed out
+`LION_PROBE_SWITCH` (2) times the rows of F's smallest positive source - it has shown itself to be
+the larger side - turns around for the rest of its sets (`lion_sum_probe_due()`):
+
+1. F is collected once (`lion_sources_collect()`: the intersection of its positive sources minus
+   the negated ones, pinless, in at most half of `work_mem`).
+2. Each further set of the walk is read only at F's container keys (`lion_range_probe_add()`): a
+   cursor that holds no pin is sought from one of F's keys to the next - §22's seek, a comparison
+   per pair inside a sparse segment, a descent across posting pages - and what the set holds at a
+   key of F's is MARKED against F's members there: a bit per member of an ARRAY container of F
+   (`lion_container_mark_members()`), a bitset image the set's container is ORed into for any
+   other. What the marks of all of F can take - the ARRAYs' bits allocated at once, an image per
+   other container when something first lands there - is checked with the copy against
+   `work_mem` before the walk goes on, so the probe is never given up halfway.
+3. When the walk ends the marked rows - F's rows the range holds - are one set, and it is counted
+   ONCE, ANDed with F (`lion_range_probe_count()`), through the ordinary merge with its
+   visibility map, heap recheck and row filter.
+
+What the rest of the walk costs is then a cursor per set stepped to F's keys and the members it
+marks: no count, no merge and no set-up per set, and F's containers read once instead of once per
+summary. The step count is still up to T × min(S, F_c), but a step is a comparison or two - a pair
+compared, a key found by a galloping search - where a merge step was a probe, an AND and a map
+question. The switch is bounded regret: the probe costs one count of F to collect it and one to
+finish, and is only begun once the walk has read twice F's rows.
+
+**Why it is exact.** The sets of a summed walk are disjoint and their union is exactly the rows of
+the part ("Readers" above), so the sum of their counts is the count of their union ANDed with F;
+the sets counted before the switch and those probed after it are disjoint too, so the two add up.
+The marked set holds every visible row of the probed sets' union that F holds - F's copy is read
+after the snapshot was taken, and a visible row was in every index before its transaction
+committed (the collected set's argument, `lion_sources_collect()`) - and nothing outside that
+union, since a member is marked only when a set of the walk holds it. ANDed with F again it is the
+count those sets' counts would have added up to.
+
+**§9, unchanged in what it asks.** The probed sets are read without pins, as a collected range's
+are, and the marks and F's copy are copies. So the count of the marked set is made beside F AS
+THE COUNT READS IT - copies of F's sets in which a CHAIN set an earlier count of the walk copied
+into memory (`lion_posting_set_materialize()`) is walked from its root again, under its cursor's
+own pins, and none is copied - and the probe is only begun when a positive source of that view
+carries the interlock under the open budget (`lion_source_pinned()`). Otherwise the walk goes on
+counting set by set, where each set carries it. Every member the final count takes from the map is
+in the container of that source it holds a pin on, which is all §9 asks of a candidate (the
+argument on `lion_posting_set_materialize()`, and "A range as a source" above). The walk pins what
+it pinned before - a leaf while its INLINE copies are handed out, each INLINE set until it is
+released - and the probe's cursors pin nothing. In recovery the marked set counts as a set of the
+range's index (`lion_sources_all_rmgr()`), as each set did when it was counted on its own.
+
+**Not probed:** a walk that reads no summary (a column without them, a range inside one bucket:
+§28 and its measurements stand), an existence test (it stops at the first set with a row), F with
+a range still to be walked, F with no positive source, or none that carries the interlock, and F
+whose copy would not fit `work_mem`. Nor the range ALONE: `count(*) WHERE <scattered range>` still
+counts each summary on its own, a map question per container under the summary's own pin. A dense
+union with one question per container key would need, at each key, a pin on every page its members
+came from - every summary of a window at once, which the pin budget (§15) forbids.
+
+**Why not a source the merge seeks.** The other way to let F drive - the summed range as one source
+of the merge, sought by container key across its summaries and edges - opens a cursor per set at
+once: thousands of posting sets, past the open budget (§15, "Bounded cursors"), so the merge would
+read it as a windowed union with no pins, rebuilt window by window and each summary sought at every
+key F drives it to: the same seeks, with the window's images and its re-reads on top. The probe
+makes those seeks one set at a time, with one cursor open. It is the count's form of what the bitmap
+scan does with a range beside other columns (§28, "Bitmap scans", `lion_emit_intersect()`): the
+range's sets - summaries and all, by the same phased walk - read only at the other side's container
+keys, and what they hold there kept. The scan keeps it in the caller's bitmap, a window of the
+other columns' containers at a time, and needs no pin; the count keeps F's rows marked, all of F at
+once within `work_mem`, and counts them once beside F under its pins.
+
+**The collected union, dense** (`lion_range_union_cb()`). A union keeps the form it grows in, as the
+OR node's image does (§15, `LION_OR_BITSET_MIN`): once it is a BITSET, containers are ORed into it
+in place (`lion_container_or_inplace()`), and it is optimized once, when the walk is over
+(`lion_range_union_finish()`); while it is an ARRAY, the members of incoming ARRAYs of at most 32
+members wait in a buffer and are folded in through one image (`lion_container_add_many()`) once
+half as many as the union holds have come. Since the union grows by at least half between two
+folds, each member is moved a bounded number of times; the buffer - at most half the union, counted
+in the collection's memory as the union is - may put a collection over its memory a little sooner
+than before, which then walks or spills as any other. A RUN on either side (a column in heap
+order) is folded as before. The windowed union of §15 (`lion_wide_fill()`) was not reused: a window
+of container keys would walk the range once per window, where the union either fits the memory it
+is allowed or is walked instead. It is also what a bitmap scan collects of the first of several
+range columns with nothing else beside them (§28, "Bitmap scans"), and grows the same way there.
+
+EXPLAIN ANALYZE prints `Range Walks Probed` when there were any: each probed walk, so a complement
+whose walks below and above both turned is two.
+
+**Future work, a format change: summaries of summaries.** A range over a scattered column reads a
+set per whole bucket, and each is as many containers as the bucket has rows; a second level of
+buckets - a summary per run of summaries - would let a wide range read a set per run instead. It
+changes what VACUUM and inserts maintain and the readers' disjointness argument, and is not done.
+
 ### Costs (lion_customscan.c)
 
 `lion_cost_range_sum()` prices each side of a summed range with `lion_cost_range_side()`. On a
@@ -10795,6 +10913,26 @@ summaries that the executor walked key by key. A summarized column with no summa
 over an empty table) is priced as walked, as it is. (2026-09-28. The alternative - a per-bucket
 model with a giant bucket's share of the keys walked - needs the keys per bucket, which the
 summaries do not carry; the average is what the index can say cheaply.)
+
+**A probed side** (2026-09-28, "Summed ranges: dense and probed" above;
+`lion_cost_range_side_probed()`). Beside F with a positive source that is not itself a range, whose
+copy would fit `work_mem`, a side that uses summaries and holds `LION_PROBE_SWITCH` times F's rows
+(`tuples x selectivity of F`, as the rest of the model estimates them) is priced as the executor
+runs it: the share of its sets before the switch as above, the rest probed - a summary and an entry
+each `LION_RANGE_UNION_ENTRY_COST` with no count of its own, every container of it
+`LION_PROBE_STEP_COST` (2 `cpu_operator_cost`) and the ones at F's keys `LION_AND_MEMBER_COST` for
+each member marked, the fewer of the two sides' per container - and two counts of F on top, the
+copy and the final count, each what the complement's count of F costs. The heap recheck is then
+spread over the counts before the switch and the one after it. The step constant is DERIVED, not
+measured - a quarter of `LION_CONTAINER_COST`, by what the step leaves out (no map, no merge, no
+count) - and is flagged for §31's next calibration. Every other shape is priced exactly as before:
+the function returns `lion_cost_range_side()`'s price whenever the probe does not apply, so plans
+change only for sums over a summarized column beside a clause with far fewer rows than the range,
+where the per-summary merges it used to charge - a probe into F per container of every summary -
+made a scattered column's range cost many times what the executor now spends. A scattered range of
+a thousand whole buckets of 4096 rows beside a clause of 5000 scattered rows, on a heap of 100,000
+container keys, was about 400 units a summary (4096 probes into F at `LION_MEMORY_PROBE_COST`) and
+is now about 30.
 
 A range taken as a source costs its collection once per relation - the same walk, with nothing to
 AND and nothing to recheck, plus a step per container of the union - and is then a source read from
@@ -10876,6 +11014,16 @@ leave out.
   on a clean and a dirty heap; and an FK-side join whose fact filter is `= ANY ($1)`, planned to
   collect at the ten values a parameter is guessed at and run with 5000, its copy spilled (`Fact
   Filter Copies Spilled`) - each against the ordinary plan's answer.
+- `test/sql/summary_scatter.sql` (2026-09-28, "Summed ranges: dense and probed"): keys that are a
+  permutation of the row number, on a heap of a score of container keys, one column with INLINE
+  summaries and a timestamp whose summaries are posting trees; sums alone, within a bucket, beside
+  a clause with fewer rows (probed: inside, and each walk of a complement), beside one with more
+  (counted), beside an OR across columns, an IN list and a negated source; on a clean heap, a dirty
+  one (new row versions, keys moved above every key, deletes) and after VACUUM; ranges collected
+  as sources; and a narrow table whose range and clause are bitsets at every container key, so
+  that the probe ORs into images as well as marking an ARRAY's members, with a range source too
+  large for work_mem's floor walked, and probed, at each group's count. Every count against a
+  sequential scan, with whether the walk was probed or the range collected.
 - `test/sql/corrupt.sql` section 4, and `test/sql/rangesum.sql`'s two-bounds case; `range.sql`,
   `distinct.sql` and `fkjoin.sql` keep their formerly declined shapes, now answered, beside a clause
   no posting set answers.
@@ -10921,6 +11069,13 @@ The choices made conservatively here, each with the alternative:
 - **Not used by**: GROUP BY k walks, count(DISTINCT k), ordered scans, and the index scans' walks
   of a whole column (`IS NOT NULL`) - they want keys, or could take summaries (a whole column) in a
   later change. The bitmap and plain index scans of a range use them (§28, "Bitmap scans").
+- **The probed sum** ("Summed ranges: dense and probed") turns at twice F's rows
+  (`LION_PROBE_SWITCH`), within `work_mem` for F's copy and the marks, and prices its steps at a
+  derived constant (`LION_PROBE_STEP_COST`). The alternatives are a switch the planner decides
+  from its estimates - no regret bound when they are wrong - and a measured constant, which is
+  §31's next calibration. A scattered range ALONE still counts summary by summary; a union with one
+  map question per container key needs pins no budget allows, and summaries of summaries (a format
+  change) are the way to fewer, larger sets.
 - **The insert fast path** an appending column could have - remembering where the open bucket is,
   as btree remembers its rightmost leaf - is not there: every summarized row descends from the root
   (once; an append that raises the open bucket's key no longer descends twice).

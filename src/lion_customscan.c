@@ -413,6 +413,26 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_SUMMARY_PHASE_DESCENTS	2.0
 
 /*
+ * One container of a set a summed walk PROBES at the other sources' rows
+ * (DESIGN.md §32, "Summed ranges: dense and probed"): the cursor's step to it
+ * or past it - a sparse segment's pair skipped, an item fetched - and the
+ * search for its key among the probe's.  No visibility map, no merge and no
+ * count set up per set, which is what LION_CONTAINER_COST and the per-entry
+ * constants above are mostly made of: a quarter of LION_CONTAINER_COST,
+ * derived from what the step leaves out rather than measured.  The members a
+ * probed container marks are charged LION_AND_MEMBER_COST each, the probe's
+ * as a set of LION_RANGE_UNION_ENTRY_COST.
+ */
+#define LION_PROBE_STEP_COST	(2.0 * cpu_operator_cost)
+
+/*
+ * ... and when a walk turns to probing: once it has handed out this many
+ * times the rows of the other sources' smallest positive one
+ * (lion_sum_probe_due()), which the cost model predicts the same way.
+ */
+#define LION_PROBE_SWITCH	2.0
+
+/*
  * THE MERGE'S CPU (DESIGN.md §10, "The units"), which lion_merge_cpu_cost()
  * charges wherever posting sets are counted or intersected - the count
  * pushdown's AND, each group of a GROUP BY and each pair of two, and the AND a
@@ -867,6 +887,14 @@ typedef struct LionCountScanState
 	 * (DESIGN.md §32): what EXPLAIN ANALYZE prints as "Summaries Summed".
 	 */
 	int64		summaries;
+
+	/*
+	 * Summed walks over a summarized column that were PROBED at the rows of
+	 * the other sources instead of counted set by set (DESIGN.md §32, "Summed
+	 * ranges: dense and probed"): what EXPLAIN ANALYZE prints as "Range Walks
+	 * Probed".
+	 */
+	int64		rangeprobed;
 
 	/*
 	 * The ranges taken as sources (DESIGN.md §32, "A range as a source"): how
@@ -3182,6 +3210,45 @@ lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
 	return cost + LION_SUMMARY_PHASE_DESCENTS * random_page_cost;
 }
 
+/*
+ * The same side beside the other sources F when the executor may PROBE it
+ * (DESIGN.md §32, "Summed ranges: dense and probed"): `probe` and
+ * `probeentry` are what a summary and an entry cost probed rather than
+ * counted, siderows the rows the side holds and frows F's.  A walk that uses
+ * summaries turns to probing once it has handed out LION_PROBE_SWITCH times
+ * F's rows (lion_sum_probe_due()); the sets before that are counted as they
+ * always were, those after it probed, and F is counted twice more - once
+ * collected, once ANDed with what the probe marked - which is `fcount` each.
+ * Without a whole bucket, or when the side never gets that far, it is
+ * lion_cost_range_side()'s.  *counts is the counts the heap recheck is spread
+ * over: the ones before the switch, and the probe's one.
+ */
+static Cost
+lion_cost_range_side_probed(double nkeys, double nedges,
+							const LionSumModel *sum, const LionSumModel *probe,
+							double perentry, double probeentry,
+							double pageper, double siderows, double frows,
+							Cost fcount, double *counts, double *pages)
+{
+	Cost		counted = lion_cost_range_side(nkeys, nedges, sum, perentry,
+											   pageper, counts, pages);
+	Cost		probed;
+	double		pcounts;
+	double		ppages;
+	double		before;
+
+	if (sum == NULL || probe == NULL ||
+		nkeys / sum->keysper - 0.5 * nedges < 1.0 ||
+		siderows < LION_PROBE_SWITCH * frows)
+		return counted;
+
+	probed = lion_cost_range_side(nkeys, nedges, probe, probeentry, pageper,
+								  &pcounts, &ppages);
+	before = Min(1.0, LION_PROBE_SWITCH * frows / Max(siderows, 1.0));
+	*counts = before * *counts + 1.0;
+	return before * counted + (1.0 - before) * probed + 2.0 * fcount;
+}
+
 static Cost
 lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 					AttrNumber groupcol, Var *rangevar, Selectivity rangesel,
@@ -3205,9 +3272,14 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	double		pageper;
 	double		frows = Min(tuples, matching / sel);
 	double		fcont = lion_containers_for(heap_pages, frows);
+	double		fm = Min(frows / Max(fcont, 1.0), LION_MEMBER_CAP);
+	double		m = Min(rowsper / Max(percont, 1.0), LION_MEMBER_CAP);
 	double		steps;
 	double		perentry;
+	double		probeentry = 0.0;
+	Cost		fcount;
 	int			nsrc = list_length(ors);
+	int			nplain = list_length(ors);
 	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
 	int			ci = 0;
 	LionState  *colstate;
@@ -3218,6 +3290,8 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	ListCell   *lc;
 	LionSumModel summodel;
 	LionSumModel *sum = NULL;
+	LionSumModel probemodel;
+	LionSumModel *probe = NULL;
 	LionSumShape shape;
 	double		incounts;
 	double		inpages;
@@ -3230,10 +3304,19 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	foreach(lc, wherekinds)
 	{
 		if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc)) && orgrp[ci] < 0)
+		{
 			nsrc++;
+			/* a source that is a range carries no pin (§32) */
+			if (lfirst_int(lc) != LION_CLAUSE_RANGESRC)
+				nplain++;
+		}
 		ci++;
 	}
 	pfree(orgrp);
+
+	/* One count of F: its containers, each of its sources probed at them. */
+	fcount = fcont * (LION_CONTAINER_COST + LION_MEMBER_COST * fm +
+					  nsrc * LION_PROBE_COST);
 
 	indexrel = index_open(groupidx->indexoid, AccessShareLock);
 	colstate = lion_index_column_state(indexrel, groupcol);
@@ -3250,7 +3333,6 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * source of F.  Small ones are counted a leaf at a time.
 	 */
 	{
-		double		m = Min(rowsper / Max(percont, 1.0), LION_MEMBER_CAP);
 		double		keys = (nsrc > 0) ? Min(percont, fcont) : percont;
 
 		/*
@@ -3318,10 +3400,34 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		summodel.sumpages = Max(1.0, summodel.keysper * pageper *
 								Min(1.0, sc / (summodel.keysper * percont)));
 		sum = &summodel;
+
+		/*
+		 * ... and PROBED at F's rows instead (DESIGN.md §32, "Summed ranges:
+		 * dense and probed"), which the executor turns to part of the way
+		 * through a side that holds more rows than F, when F has a source
+		 * that carries a pin and a copy of it fits work_mem
+		 * (lion_sum_probe_due()): each summary and each entry a set with no
+		 * count of its own, its containers stepped over at
+		 * LION_PROBE_STEP_COST and the ones at F's keys marked against F's
+		 * members, the fewer of the two sides' per container.
+		 */
+		if (!collect && nplain > 0 &&
+			frows * 2.0 * sizeof(uint16) <= (double) work_mem * 1024.0)
+		{
+			probemodel = summodel;
+			probemodel.persum = LION_RANGE_UNION_ENTRY_COST +
+				sc * LION_PROBE_STEP_COST +
+				Min(sc, fcont) * LION_AND_MEMBER_COST * Min(sm, fm);
+			probeentry = LION_RANGE_UNION_ENTRY_COST +
+				percont * LION_PROBE_STEP_COST +
+				Min(percont, fcont) * LION_AND_MEMBER_COST * Min(m, fm);
+			probe = &probemodel;
+		}
 	}
 
-	inside = lion_cost_range_side(nin, 2.0, sum, perentry, pageper,
-								  &incounts, &inpages);
+	inside = lion_cost_range_side_probed(nin, 2.0, sum, probe, perentry,
+										 probeentry, pageper, tuples * sel,
+										 frows, fcount, &incounts, &inpages);
 
 	/*
 	 * A range collected as a source (DESIGN.md §32) reads the same walk and
@@ -3340,11 +3446,11 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * the NULL entry (F's containers once more, and a descent), and F's
 	 * candidates on top of the outside entries' for the recheck.
 	 */
-	outside = lion_cost_range_side(nout, 2.0, sum, perentry, pageper,
-								   &outcounts, &outpages) +
-		fcont * (LION_CONTAINER_COST +
-				 LION_MEMBER_COST * Min(frows / fcont, LION_MEMBER_CAP) +
-				 nsrc * LION_PROBE_COST) + random_page_cost +
+	outside = lion_cost_range_side_probed(nout, 2.0, sum, probe, perentry,
+										  probeentry, pageper, nout * rowsper,
+										  frows, fcount, &outcounts,
+										  &outpages) +
+		fcount + random_page_cost +
 		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
 						   Max(outcounts, 1.0), corr);
 
@@ -9503,6 +9609,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	memset(&st->stats, 0, sizeof(st->stats));
 	memset(st->rangeeval, 0, sizeof(st->rangeeval));
 	st->summaries = 0;
+	st->rangeprobed = 0;
 	st->rangesrc_collected = 0;
 	st->rangesrc_walked = 0;
 	st->rangesrc_held = 0;
@@ -11250,6 +11357,135 @@ lion_count_relation(LionCountScanState *st)
 }
 
 /*
+ * A SUMMED WALK PROBED AT THE OTHER SOURCES' ROWS (DESIGN.md §32, "Summed
+ * ranges: dense and probed").
+ *
+ * A walk over a summarized column counts each set it hands out - a key of a
+ * partial bucket, a whole bucket's summary - ANDed with the other sources F.
+ * On a column whose rows lie all over the heap a summary has a few rows at
+ * nearly every container key, and each of those counts is a merge of
+ * thousands of containers with F, however few rows F has.  Once the walk has
+ * handed out LION_PROBE_SWITCH times the rows of F's smallest positive source
+ * - it has shown itself to be the larger side - the rest of it is PROBED
+ * instead (lion_range_probe_begin()): F is collected once, each further set
+ * is read only at F's container keys, and the rows it holds among F's are
+ * counted ONCE at the end of the walk.  The sets counted before the switch
+ * and the ones probed after it are disjoint, as every set of the walk is, so
+ * their counts add up.
+ *
+ * The switch is bounded regret: the probe costs a count of F to collect and
+ * one to finish, and it is only taken after the walk has already read more
+ * than F holds.  It is not taken when F has no positive source, holds a
+ * range still to be walked, would not carry the §9 interlock, or does not fit
+ * work_mem - the walk then counts every set as it always has - nor for a walk
+ * that uses no summaries: a column without them keeps what §28 measured.
+ */
+typedef struct LionSumProbe
+{
+	double		frows;			/* F's smallest positive source's rows, or
+								 * -1: never probe */
+	double		walked;			/* rows of the sets handed out so far */
+	bool		tried;
+	LionRangeProbe *rp;
+	MemoryContext cxt;			/* where the probe is begun: outlives the
+								 * walk's batches */
+} LionSumProbe;
+
+static void
+lion_sum_probe_init(LionSumProbe *sp, const LionEntryScan *walk,
+					const LionCountSource *sources, int nsource, int slot)
+{
+	Size		maxbytes = (Size) work_mem * 1024;
+	int			i;
+	int			j;
+
+	sp->frows = -1.0;
+	sp->walked = 0.0;
+	sp->tried = false;
+	sp->rp = NULL;
+	sp->cxt = CurrentMemoryContext;
+
+	if (!walk->usesum)
+		return;
+	for (i = 0; i < nsource; i++)
+	{
+		double		rows = 0.0;
+
+		if (i == slot)
+			continue;
+		if (sources[i].rangewalk != NULL)
+		{
+			sp->frows = -1.0;
+			return;
+		}
+		if (sources[i].negated)
+			continue;
+		for (j = 0; j < sources[i].nsets; j++)
+			if (sources[i].sets[j].found)
+				rows += (double) sources[i].sets[j].ntids;
+		if (sp->frows < 0.0 || rows < sp->frows)
+			sp->frows = rows;
+	}
+
+	/* a copy of F takes some two bytes a row: not worth trying past memory */
+	if (sp->frows * 2.0 * sizeof(uint16) > (double) maxbytes)
+		sp->frows = -1.0;
+}
+
+/*
+ * The walk has handed out `rows` more: the probe, if the rest of it is to be
+ * probed - begun now, when this is where the walk has shown itself to be the
+ * larger side - or NULL.
+ */
+static LionRangeProbe *
+lion_sum_probe_due(LionCountScanState *st, LionSumProbe *sp, double rows,
+				   LionCountSource *sources, int nsource, int slot)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *others;
+	MemoryContext oldcxt;
+	int			n = 0;
+	int			i;
+
+	sp->walked += rows;
+	if (sp->rp != NULL || sp->tried || sp->frows < 0.0 ||
+		sp->walked < LION_PROBE_SWITCH * sp->frows)
+		return sp->rp;
+	sp->tried = true;
+
+	oldcxt = MemoryContextSwitchTo(sp->cxt);
+	others = (LionCountSource *) palloc(sizeof(LionCountSource) * nsource);
+	for (i = 0; i < nsource; i++)
+		if (i != slot)
+			others[n++] = sources[i];
+	sp->rp = lion_range_probe_begin(st->heap, estate->es_snapshot, n, others,
+									(Size) work_mem * 1024, &st->stats);
+	pfree(others);
+	MemoryContextSwitchTo(oldcxt);
+
+	if (sp->rp != NULL)
+		st->rangeprobed++;
+	return sp->rp;
+}
+
+/* The count of what the probe gathered: the rest of the walk's sum. */
+static int64
+lion_sum_probe_finish(LionCountScanState *st, LionSumProbe *sp)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	int64		count;
+
+	if (sp->rp == NULL)
+		return 0;
+	count = lion_range_probe_count(sp->rp, st->heap, estate->es_snapshot,
+								   &st->stats, st->viscache,
+								   st->rel_read_only);
+	lion_range_probe_end(sp->rp);
+	sp->rp = NULL;
+	return count;
+}
+
+/*
  * Sum the counts of the entries one walk of the driving column returns - all
  * of them (LION_WALK_ALL), or one part of a range's (LION_WALK_*) - each ANDed
  * with sources[1 .. nsource - 1]; sources[0] is the driver's slot, which is
@@ -11278,6 +11514,7 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 {
 	LionCountSource saved = sources[0];
 	LionPostingSet *sets;
+	LionSumProbe probe;
 	int64		total = 0;
 	int			i;
 
@@ -11293,13 +11530,16 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 	/* One leaf's entries, which is at most what lion_count.c copies of one. */
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) *
 									 st->escan.maxbatch);
+	lion_sum_probe_init(&probe, &st->escan, sources, nsource, 0);
 
 	for (;;)
 	{
 		MemoryContext oldcxt;
+		LionRangeProbe *rp;
 		int			nsets = 0;
 		int			per;
 		double		items = 0;
+		double		rows = 0;
 		Datum		key;
 		bool		more = true;
 
@@ -11327,14 +11567,27 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 				continue;
 			}
 			items += sets[nsets].ncontainers;
+			rows += (double) sets[nsets].ntids;
 			nsets++;
 		} while (lion_entry_scan_batch_left(&st->escan) > 0);
+
+		/*
+		 * Past the rows of the other sources, the rest of the walk is probed
+		 * at theirs and counted once at the end (lion_sum_probe_due()).
+		 */
+		rp = lion_sum_probe_due(st, &probe, rows, sources, nsource, 0);
+		if (rp != NULL)
+		{
+			for (i = 0; i < nsets; i++)
+				lion_range_probe_add(rp, &sets[i]);
+			st->stats.sets_summed += nsets;
+		}
 
 		/* Small entries are one count, large ones one count each. */
 		per = (items <= (double) nsets * LION_SUM_UNION_MAX_ITEMS) ?
 			Max(nsets, 1) : 1;
 
-		for (i = 0; i < nsets; i += per)
+		for (i = 0; rp == NULL && i < nsets; i += per)
 		{
 			int64		summed = st->stats.sets_summed;
 			int			n = Min(per, nsets - i);
@@ -11368,6 +11621,9 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 	st->summaries += st->escan.nsummaries;
 	lion_entry_scan_end(&st->escan);
 	st->scanning = false;
+
+	/* the probed rest of the walk, counted once (§9 as for any count) */
+	total += lion_sum_probe_finish(st, &probe);
 	return total;
 }
 
@@ -11540,12 +11796,18 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 	LionEntryScan es;
 	LionPostingSet *sets;
 	LionCountSource saved = sources[slot];
+	LionSumProbe probe;
 	MemoryContext cxt;
 	int64		total = 0;
 	bool		found = false;
 
 	lion_entry_scan_begin_sum(&es, rs->index, rs->col, &rs->range, part);
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * es.maxbatch);
+
+	/* A count may be probed (lion_sum_walk()); an existence test stops early. */
+	lion_sum_probe_init(&probe, &es, sources, nsource, slot);
+	if (exists)
+		probe.frows = -1.0;
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"LionCount range source walk",
 								ALLOCSET_DEFAULT_SIZES);
@@ -11553,10 +11815,12 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 	for (;;)
 	{
 		MemoryContext oldcxt;
+		LionRangeProbe *rp;
 		int			nsets = 0;
 		int			per;
 		int			i;
 		double		items = 0;
+		double		rows = 0;
 		Datum		key;
 		bool		more = true;
 
@@ -11571,12 +11835,20 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 				break;
 			}
 			items += sets[nsets].ncontainers;
+			rows += (double) sets[nsets].ntids;
 			nsets++;
 		} while (lion_entry_scan_batch_left(&es) > 0);
 
+		rp = lion_sum_probe_due(st, &probe, rows, sources, nsource, slot);
+		if (rp != NULL)
+		{
+			for (i = 0; i < nsets; i++)
+				lion_range_probe_add(rp, &sets[i]);
+		}
+
 		per = (items <= (double) nsets * LION_SUM_UNION_MAX_ITEMS) ?
 			Max(nsets, 1) : 1;
-		for (i = 0; i < nsets && !found; i += per)
+		for (i = 0; rp == NULL && i < nsets && !found; i += per)
 		{
 			int			n = Min(per, nsets - i);
 			int64		c;
@@ -11609,6 +11881,7 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 	lion_entry_scan_end(&es);
 	MemoryContextDelete(cxt);
 	pfree(sets);
+	total += lion_sum_probe_finish(st, &probe);
 	return exists ? (found ? 1 : 0) : total;
 }
 
@@ -14125,6 +14398,15 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		if (st->summaries > 0)
 			ExplainPropertyInteger("Summaries Summed", NULL, st->summaries, es);
+
+		/*
+		 * Of those sums, the walks that were probed at the other sources'
+		 * rows rather than counted a set at a time (DESIGN.md §32, "Summed
+		 * ranges: dense and probed").  Only when there were any.
+		 */
+		if (st->rangeprobed > 0)
+			ExplainPropertyInteger("Range Walks Probed", NULL, st->rangeprobed,
+								   es);
 
 		/*
 		 * The ranges taken as sources (DESIGN.md §32): collected into memory,
