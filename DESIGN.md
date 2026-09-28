@@ -4640,7 +4640,47 @@ Operations.
   makes a count wrong - it only makes VACUUM wait.
 - **Owner validation (§18) applies to internal pages as well**, and to the LEVEL: a leaf's right link
   always names another leaf, so a page above level 0 reached through one is treated exactly as a page
-  whose owner no longer matches - the end of the set.
+  whose owner no longer matches - the end of the set. *(Until the 2026-09-27 review
+  `lion_posting_search()` started its descent again there instead, and a damaged right link sent it
+  back to the same page for ever; it and `lion_posting_search_level()` now end the set.)*
+- **A link read from a posting page is data**, as §21's "Readers" says of the directory, and the
+  posting tree now checks what its descents and walks would otherwise follow blindly (2026-09-27
+  review; `lion_posting.c`, "POSTING-TREE LINKS ARE DATA"). Every failure is an ERROR,
+  INDEX_CORRUPTED:
+  - a pivot's line pointer is one whole pivot inside the page before it is read, and a non-rightmost
+    internal page has its high key (`lion_posting_pivot_at()`, `lion_posting_highkey_at()`) - the
+    binary search, the high key and the repair's scans used to take `lion_posting_pivot()` on
+    trust, and a damaged line pointer put the "pivot" up to 32 kB past the page;
+  - a downlink names a valid block (`lion_posting_downlink()`, which VACUUM's descent uses too), and
+    so do the head and tail an insert reads off its entry (`lion_insert_lock_chain_page()`):
+    InvalidBlockNumber is P_NEW, and `ReadBuffer()` EXTENDS the index when asked for it;
+  - a child is one level below its parent and a right sibling at its page's level. Only the root
+    changes level (the push-down), and the root is nobody's child or sibling, so this is exact.
+    VACUUM's descent, `lion_posting_level_start()` and `lion_posting_scan_for_downlink()` had no
+    level check at all. `lion_posting_search()` retries a mismatch as it retries the one real race,
+    a one-page root pushed down between its two locks, and COUNTS those restarts: more than
+    LION_POSTING_MAX_HEIGHT - more push-downs than a set's root can have in its whole life - is the
+    ERROR. Finishing an unfinished split is not counted, because each one clears a flag for good and
+    writers of the key serialise. Before the bound, a downlink to the root or to the page itself
+    restarted the descent for ever;
+  - a page reached through a link is not one the backend already holds, checked before the lock: the
+    insert's head and tail against the directory leaf it holds, the repair's scan for a downlink and
+    `lion_posting_level_start()` against the child being repaired, `lion_posting_downlink_present()`
+    against the parent and the child, and a flagged page's right sibling against the page itself. A
+    repair that recurses up several levels holds a page per level and checks only the nearest, and a
+    link from inside the tree to the entry's directory leaf is caught only when it is the head or
+    the tail; both are double faults this does not chase;
+  - and a walk right along a level ends (`LionRightWalk`, lion.h): a walk that only moves right
+    never passes a page twice, since no page leaves a level of a live set and a split puts its new
+    page to the right, so one that has taken more steps than the index has blocks is going round a
+    cycle of right links, and is refused. The index's size is asked for only once a walk is 1024
+    pages long.
+
+  "For ever" meant UNCANCELLABLE on every writer's path, which is why the bounds, and not the checks
+  for interrupts, are what matter there: a writer holds the key's directory leaf throughout, a held
+  content lock holds interrupts off, and every other writer of the leaf, VACUUM and the checkpointer
+  queued behind it. The descents' checks for interrupts now run between pages, with none of the
+  descent's own locks held, which is what lets a READER be cancelled.
 - **Bulk build**: leaves are written left to right as before, and the internal levels are built
   bottom-up in the same pass, one open page per level, through the bulk-write API (nbtree's
   `_bt_buildadd` shape, which is what §21's directory build already does). A set that fits one page

@@ -232,12 +232,57 @@ lion_posting_pivot(Page page, OffsetNumber off)
 	return (LionPostingPivot *) PageGetItem(page, PageGetItemId(page, off));
 }
 
-/* The high key of a non-rightmost internal posting page. */
+/*
+ * The high key of a non-rightmost internal posting page, UNCHECKED: nothing
+ * here looks at maxoff or at the line pointer.  lion_posting.c reads a page's
+ * high key and pivots through checking versions of these two, which make a
+ * damaged page an ERROR instead of a read past it (DESIGN.md §22).
+ */
 static inline LionPostingPivot *
 lion_posting_highkey(Page page)
 {
 	Assert(LionPageGetOpaque(page)->level > 0 && !LionPageIsRightmost(page));
 	return lion_posting_pivot(page, FirstOffsetNumber);
+}
+
+/*
+ * A WALK RIGHT ALONG ONE LEVEL IS BOUNDED BY THE SIZE OF THE INDEX (DESIGN.md
+ * §21, §22).  A walk that only moves right never passes a page twice: no
+ * page is ever taken out of a level of a live tree, and a split puts its new
+ * page to the right of the page it splits, where the walk has not been yet.
+ * So a walk that has taken more steps than the index has blocks is going
+ * round a cycle of damaged right links.  That needs catching because some
+ * walks cannot be cancelled: a posting-tree writer holds its key's directory
+ * leaf the whole time, the directory's find-or-create holds its guard, and a
+ * content lock holds interrupts off, so CHECK_FOR_INTERRUPTS() does nothing
+ * there and statement_timeout never fires.  The size is asked for only once a
+ * walk is LION_RIGHTWALK_CHEAP pages long, which almost no walk ever is, and
+ * again each time the walk outgrows it, because the index grows meanwhile.
+ */
+typedef struct LionRightWalk
+{
+	uint32		steps;
+	uint32		limit;
+} LionRightWalk;
+
+#define LION_RIGHTWALK_CHEAP	1024
+
+extern void lion_rightwalk_exceeded(Relation index, LionRightWalk *walk,
+									BlockNumber blk);
+
+static inline void
+lion_rightwalk_init(LionRightWalk *walk)
+{
+	walk->steps = 0;
+	walk->limit = LION_RIGHTWALK_CHEAP;
+}
+
+/* One step right from blk; an ERROR when the walk has gone round a cycle. */
+static inline void
+lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk)
+{
+	if (unlikely(++walk->steps > walk->limit))
+		lion_rightwalk_exceeded(index, walk, blk);
 }
 
 /* ---------- meta page ---------- */
@@ -1253,6 +1298,17 @@ extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,
 extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,
 									   BlockNumber head, BlockNumber tail,
 									   uint32 ckey);
+
+/*
+ * The child block of the downlink at off on internal posting page blk,
+ * checked: off names a downlink the page has, its line pointer is one whole
+ * pivot inside the page, and the child is a valid block number (which
+ * ReadBuffer() would otherwise take for P_NEW and extend the index).  Anything
+ * else is an ERROR, ERRCODE_INDEX_CORRUPTED.  For every descent of a posting
+ * tree, lion_vacuum_descend() included.
+ */
+extern BlockNumber lion_posting_downlink(Relation index, Page page,
+										 BlockNumber blk, OffsetNumber off);
 
 /*
  * Turn the one-page posting set whose root is `buf` into a two-level tree
