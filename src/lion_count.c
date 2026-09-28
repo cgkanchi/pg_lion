@@ -313,6 +313,14 @@ StaticAssertDecl(LION_BATCH_MIN_SETS <= LION_OPEN_MIN_PINS,
  * FK-side join's copy of its fact filters (DESIGN.md §27) and a GROUP BY's of
  * its WHERE items (§10) get a cursor per count, which read it back from the
  * file each time.
+ *
+ * A collected copy is also INDEXED by its container keys (lion_mat_index(),
+ * DESIGN.md §27, "The copy, looked up by key"), because every count against
+ * it seeks it at each of its key's containers: keys[] holds them in order,
+ * four bytes a container searched without touching the containers, and where
+ * they are dense, dir[] answers a seek in one read - dir[k - dirbase] is the
+ * first container whose key is at or above k, for every k from the first
+ * container's key to the last's.
  */
 typedef struct LionMatSet
 {
@@ -324,6 +332,12 @@ typedef struct LionMatSet
 	BufFile    *file;			/* spilled: the containers, or NULL */
 	LionSpillEnt *spill;		/* spilled: where each one is */
 	LionContainer *first;		/* spilled: container 0, or NULL */
+	uint32	   *keys;			/* the containers' keys, or NULL */
+	uint32	   *dir;			/* the direct index, or NULL */
+	uint32		dirbase;		/* the key dir[0] stands for */
+	uint32		dirlen;			/* keys dir[] covers */
+	bool		collected;		/* every item a container, one a key: an
+								 * intersection lion_sources_collect() made */
 } LionMatSet;
 
 /*
@@ -2528,6 +2542,170 @@ lion_spill_keep_first(LionMatSet *mat, MemoryContext cxt)
 
 
 /* ---------------------------------------------------------------------
+ * Seeking a private copy (LionMatSet)
+ * --------------------------------------------------------------------- */
+
+/*
+ * The most key slots a direct index spends on one container: four bytes a
+ * slot, so at most sixteen bytes a container, the size of a spilled
+ * container's entry and less than any container in memory takes with its
+ * pointer.  A copy whose keys are sparser than that is searched instead.
+ */
+#define LION_MAT_DIR_SPREAD		4
+
+/* Container i's key: the last one an item covers, as a seek compares it. */
+static inline uint32
+lion_mat_key(const LionMatSet *mat, int i)
+{
+	if (mat->keys != NULL)
+		return mat->keys[i];
+	if (mat->file != NULL)
+		return mat->spill[i].ckey;
+	return lion_item_last_ckey(mat->containers[i]);
+}
+
+/*
+ * The first container at or after `from` whose key is at or above target
+ * (ncontainers when there is none): what a cursor over the copy is sought
+ * to.  Direct where the copy has an index of its keys (lion_mat_index()),
+ * else a binary search - over keys[], where the copy keeps them, without a
+ * branch to mispredict at every step; the keys of a FK-side join's counts
+ * come in no order the copy can predict.
+ */
+static inline int
+lion_mat_seek(const LionMatSet *mat, int from, uint32 target)
+{
+	int			lo = from;
+	int			hi = mat->ncontainers;
+
+	if (lo >= hi)
+		return hi;
+
+	if (mat->dir != NULL)
+	{
+		uint32		slot;
+
+		if (target <= mat->dirbase)
+			return lo;
+		slot = target - mat->dirbase;
+		if (slot >= mat->dirlen)
+			return hi;
+		return Max(lo, (int) mat->dir[slot]);
+	}
+
+	if (mat->keys != NULL)
+	{
+		const uint32 *base = mat->keys + lo;
+		int			n = hi - lo;
+
+		while (n > 1)
+		{
+			int			half = n / 2;
+
+			base = (base[half] < target) ? base + half : base;
+			n -= half;
+		}
+		return (int) (base - mat->keys) + (*base < target ? 1 : 0);
+	}
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (lion_mat_key(mat, mid) < target)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * Index a copy by its container keys, for the seeks every count makes of it
+ * (DESIGN.md §27, "The copy, looked up by key"): the keys in an array of
+ * their own - what a binary search reads, four bytes a container, where it
+ * used to follow a pointer to each container it compared - and, where they
+ * are dense, the direct index, which answers a seek with one read.  A copy
+ * is never changed once it is made, so neither goes stale.
+ *
+ * A key an item covers is its last (lion_item_last_ckey()): the seek looks
+ * for the first item whose last key is at or above the target, as it always
+ * has.  The items of a copy are in ascending key order and never overlap, so
+ * those keys ascend strictly, which is what both rely on; a copy whose keys
+ * would not is left as it is.
+ *
+ * `room` is what the index may take from the copy's memory; what it takes is
+ * added to mat->held.  A spilled copy keeps its keys in its entries already,
+ * and gets the direct index alone - sixteen bytes a container at most, the
+ * size of those entries.
+ */
+static void
+lion_mat_index(LionMatSet *mat, MemoryContext cxt, Size room)
+{
+	uint32	   *keys;
+	uint32		first;
+	uint32		last;
+	Size		dirbytes;
+	int			n = mat->ncontainers;
+	int			i;
+
+	if (n < 2)
+		return;
+
+	keys = (uint32 *) MemoryContextAlloc(cxt, sizeof(uint32) * n);
+	for (i = 0; i < n; i++)
+	{
+		keys[i] = lion_mat_key(mat, i);
+		if (i > 0 && keys[i] <= keys[i - 1])
+		{
+			pfree(keys);
+			return;
+		}
+	}
+
+	first = keys[0];
+	last = keys[n - 1];
+	dirbytes = sizeof(uint32) * ((Size) (last - first) + 1);
+
+	if (mat->file == NULL)
+	{
+		if (sizeof(uint32) * n > room)
+		{
+			pfree(keys);
+			return;
+		}
+		mat->keys = keys;
+		mat->held += sizeof(uint32) * n;
+		room -= sizeof(uint32) * n;
+	}
+	else
+		room = dirbytes;		/* bounded by the spread alone */
+
+	if ((uint64) last - first + 1 <= (uint64) n * LION_MAT_DIR_SPREAD &&
+		dirbytes <= room)
+	{
+		uint32	   *dir = (uint32 *) MemoryContextAlloc(cxt, dirbytes);
+		uint64		k = 0;
+
+		/* slot k: the first container whose key is at or above first + k */
+		for (i = 0; i < n; i++)
+		{
+			while ((uint64) first + k <= keys[i])
+				dir[k++] = (uint32) i;
+		}
+		Assert(k == (uint64) last - first + 1);
+		mat->dir = dir;
+		mat->dirbase = first;
+		mat->dirlen = (uint32) k;
+		mat->held += dirbytes;
+	}
+
+	if (mat->keys == NULL)
+		pfree(keys);
+}
+
+
+/* ---------------------------------------------------------------------
  * Container cursors
  * --------------------------------------------------------------------- */
 
@@ -3073,30 +3251,13 @@ lion_cursor_seek(LionSetCursor *cur, uint32 target)
 
 	if (cur->set->mat != NULL)
 	{
-		const LionMatSet *mat = cur->set->mat;
-		int			lo = cur->matidx;
-		int			hi = mat->ncontainers;
-
 		/*
-		 * A private copy is an array: binary search it - a spilled one by the
+		 * A private copy is an array: its index answers where the target is
+		 * (lion_mat_seek()) - or a binary search does, a spilled one by the
 		 * keys it keeps in memory, one per container.
 		 */
 		cur->cx->stats.copy_seeks++;
-		while (lo < hi)
-		{
-			int			mid = lo + (hi - lo) / 2;
-			uint32		last;
-
-			if (mat->file != NULL)
-				last = mat->spill[mid].ckey;
-			else
-				last = lion_item_last_ckey(mat->containers[mid]);
-			if (last < target)
-				lo = mid + 1;
-			else
-				hi = mid;
-		}
-		cur->matidx = lo;
+		cur->matidx = lion_mat_seek(cur->set->mat, cur->matidx, target);
 	}
 	else if (cur->set->is_inline)
 		lion_inline_skip(cur->set->payload, cur->set->paylen, &cur->payoff,
@@ -5233,7 +5394,8 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 		return;
 	if (!col->spilled &&
 		sizeof(LionMatSet) + MAXALIGN(col->used + sz) +
-		sizeof(LionContainer *) * (col->noffs + 1) > col->maxbytes)
+		(sizeof(LionContainer *) + sizeof(uint32)) * (col->noffs + 1) >
+		col->maxbytes)
 	{
 		if (!col->spill)
 		{
@@ -6000,6 +6162,119 @@ lion_count_sources(Relation heap, Snapshot snapshot, int nsources,
 }
 
 /*
+ * The collected copy a count's other source is, when it is one: a source of
+ * one set, a copy lion_sources_collect() made (LionMatSet.collected).  NULL
+ * for anything else.
+ */
+static const LionPostingSet *
+lion_source_collected(const LionCountSource *src, const LionNodePlan *plan)
+{
+	const LionPostingSet *ps;
+
+	if (src->negated || src->nsets != 1 || plan->node == NULL ||
+		plan->node->kind != LION_KN_KEY)
+		return NULL;
+	ps = &src->sets[plan->node->keyno];
+	if (!ps->found || ps->mat == NULL || !ps->mat->collected)
+		return NULL;
+	return ps;
+}
+
+/*
+ * Container i of a collected copy, where it is: in memory, or read back from
+ * the spilled copy's file into buf (its first container is kept in memory).
+ * What EXPLAIN ANALYZE counts of it is what a cursor over it would count.
+ */
+static inline const LionContainer *
+lion_mat_container(LionCountCtx *cx, const LionMatSet *mat, int i,
+				   LionContainer *buf)
+{
+	cx->stats.containers_visited++;
+	cx->stats.copy_containers++;
+	if (mat->file == NULL)
+		return mat->containers[i];
+	if (i == 0 && mat->first != NULL)
+		return mat->first;
+	lion_spill_read(mat, i, buf);
+	cx->stats.copy_file_reads++;
+	return buf;
+}
+
+/*
+ * THE MERGE OF A SET AND A COLLECTED COPY (DESIGN.md §27, "The copy, looked
+ * up by key"): lion_run_merge() for its commonest pair, the key's set of an
+ * FK-side join - or a group's set, §10 - driving, and the copy of the WHERE
+ * sources that every one of those counts is ANDed with.  The copy is an array
+ * of containers in key order, never changed once made, so it needs no cursor:
+ * each of the driver's containers looks its key up in it (lion_mat_seek(),
+ * direct where the copy's keys are dense) and is ANDed with the container
+ * found there, and where the copy has none at that key the driver is sought
+ * to the next key it has, as the leapfrog of the general merge would seek it.
+ * What that saves is the general merge's bookkeeping round every container
+ * of the key: a cursor over the copy sought, advanced and rebuilt, the
+ * sources' keys compared, their order walked.
+ *
+ * The §9 rule reads as in lion_count_container(): a container of the result
+ * is put to the visibility map before the driver - the one source that
+ * carries a pin - moves past it, and a key the copy has nothing at, or
+ * whose AND is empty, asks the map nothing and lets the driver go on.  The
+ * copy holds no pin and is only ever counted beside the driver's pinned
+ * containers, which is lion_sources_collect()'s argument.
+ */
+static void
+lion_run_merge_copy(LionCountCtx *cx, LionCountSource *drvsrc,
+					const LionNodePlan *drvplan, const LionPostingSet *copy)
+{
+	const LionMatSet *mat = copy->mat;
+	LionExprCursor drv;
+	LionContainer *work;
+	LionContainer *buf = NULL;
+	int			idx = 0;
+
+	work = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	if (mat->file != NULL)
+		buf = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
+
+	lion_ecursor_init(&drv, drvplan, drvsrc->sets, drvsrc->nsets, cx, false);
+	while (drv.valid)
+	{
+		uint32		key;
+
+		cx->stats.copy_seeks++;
+		idx = lion_mat_seek(mat, idx, drv.ckey);
+		if (idx >= mat->ncontainers)
+			break;				/* nothing of the copy at or past the key */
+		key = lion_mat_key(mat, idx);
+		if (key != drv.ckey)
+		{
+			/* the copy has nothing here: on to the next key it has (§22) */
+			lion_ecursor_seek(&drv, key);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		if (lion_container_and(drv.cur,
+							   lion_mat_container(cx, mat, idx, buf),
+							   work) > 0)
+		{
+			/* the map is asked before the driver lets its page go */
+			lion_count_container_vm(cx, work);
+			lion_ecursor_next(&drv);
+			if (lion_exists_settled(cx))
+				break;
+		}
+		else
+			lion_ecursor_next(&drv);
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_ecursor_close(&drv);
+
+	pfree(work);
+	if (buf != NULL)
+		pfree(buf);
+}
+
+/*
  * One pass of the merge: intersect the positive sources container key by
  * container key, subtract the negated ones, and count what is left against the
  * visibility map.  Everything the caller set up in *cx - the recheck batch, the
@@ -6069,6 +6344,28 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	}
 	Assert(nprobe > 0);
 	driver = probeord[0];
+
+	/*
+	 * A set against a collected copy - what an FK-side join's every count
+	 * is, and a GROUP BY's once its WHERE is collected - with the set
+	 * driving: the copy is looked up at the set's keys, and needs no cursor
+	 * (lion_run_merge_copy()).  A collection is a merge of the sources
+	 * themselves, never of a copy.
+	 */
+	if (nsources == 2 && nprobe == 2 && cx->collect == NULL)
+	{
+		const LionPostingSet *copy = lion_source_collected(&sources[probeord[1]],
+														   plans[probeord[1]]);
+
+		if (copy != NULL)
+		{
+			lion_run_merge_copy(cx, &sources[driver], plans[driver], copy);
+			pfree(cursors);
+			pfree(est);
+			pfree(probeord);
+			return;
+		}
+	}
 
 	/*
 	 * Only an intersection needs a place to put one: a single source hands its
@@ -6894,6 +7191,10 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 		 * not twice.
 		 */
 		lion_spill_keep_first(mat, CurrentMemoryContext);
+
+		/* ... and seek it by its keys, directly where they are dense */
+		lion_mat_index(mat, CurrentMemoryContext, 0);
+		mat->collected = true;
 		out->found = true;
 		out->mat = mat;
 		out->ntids = col.members;
@@ -6919,6 +7220,15 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	for (i = 0; i < col.noffs; i++)
 		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
 	pfree(col.offs);
+
+	/*
+	 * The keys, which the budget above made room for, and the direct index
+	 * where they are dense and it fits what is left: every count against the
+	 * copy seeks it at each container of its own key's set.
+	 */
+	lion_mat_index(mat, CurrentMemoryContext,
+				   maxbytes > mat->held ? maxbytes - mat->held : 0);
+	mat->collected = true;
 
 	out->found = true;
 	out->mat = mat;

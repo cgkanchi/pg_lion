@@ -289,9 +289,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *
  *	COPY_COUNT		one count of an fk set against the copy - the merge of two
  *					sources set up and torn down - in place of COUNT_COST;
- *	COPY_PROBE		per fk container, the copy sought by a binary search in
- *					memory and the two containers ANDed, in place of a probe
- *					into each filter's posting tree;
+ *	COPY_PROBE		per fk container, the copy looked up at its key in memory
+ *					and the two containers ANDed, in place of a probe into
+ *					each filter's posting tree;
  *	COPY_MEMBER		... and per member of that fk container, which the AND
  *					walks and the visibility map is asked about;
  *	COPY_CONTAINER	once per scan, one container of the copy made.
@@ -304,6 +304,15 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * without the member term, `x = 3 GROUP BY d.attr` over a thousand dimension
  * rows was chosen at 152 ms against the hash join's 125.  A copy of 1,500
  * containers takes 0.8 ms when the filter is one set.
+ *
+ * COPY_PROBE was 15 while the lookup was a binary search of the copy that
+ * followed a pointer to a container at every step: 0.115 us an fk container
+ * of one member on the release build.  Since the copy is looked up directly
+ * by its keys and a container of a member or two is ANDed by looking its
+ * members up (DESIGN.md §27, "The copy, looked up by key") the same takes
+ * 25 to 30 ns, five cpu_operator_cost.  COPY_MEMBER is unchanged: the AND of
+ * a larger fk container still merges it with the copy's, and at six members a
+ * container the node is still slower than the hash join it is priced above.
  */
 #define LION_FKJOIN_COPY_COUNT_COST	(lion_fkjoin_copy_count_cost * cpu_tuple_cost)
 #define LION_FKJOIN_COPY_PROBE_COST	(lion_fkjoin_copy_probe_cost * cpu_operator_cost)
@@ -5213,12 +5222,12 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  *	  sixteen times slower;
  *	- or COLLECTED once (lion_sources_collect()): one merge of the filters
  *	  over all of their containers, as a single count of them would make, and
- *	  a private copy of what survives, which every count then seeks with a
- *	  binary search (LION_FKJOIN_COPY_PROBE_COST a probe).  Only when the copy
- *	  is expected to fit in a hash join's memory (get_hash_memory_limit(),
- *	  which is also what the executor gives it) - a container's members at two
- *	  bytes each, a bitset's 4 kB at most - because past it the executor gives
- *	  up and probes.
+ *	  a private copy of what survives, which every count then looks up at its
+ *	  own containers' keys (LION_FKJOIN_COPY_PROBE_COST a lookup and its AND).
+ *	  Only when the copy is expected to fit in a hash join's memory
+ *	  (get_hash_memory_limit(), which is also what the executor gives it) - a
+ *	  container's members at two bytes each, a bitset's 4 kB at most - because
+ *	  past it the executor gives up and probes.
  *
  * Either way the filters are located once for the whole scan, each one lookup
  * and one walk of its chain, as a single count prices them.
