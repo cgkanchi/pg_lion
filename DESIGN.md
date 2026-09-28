@@ -749,7 +749,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT deleted_pages bigint,
         OUT posting_internal_pages bigint, OUT max_posting_height int,
         OUT inline_slack_bytes bigint, OUT summary_entries bigint, OUT summary_tids bigint,
-        OUT summary_bytes bigint, OUT summary_pages bigint) RETURNS SETOF record
+        OUT summary_bytes bigint, OUT summary_pages bigint, OUT ndistinct bigint)
+        RETURNS SETOF record
         -- ONE ROW PER KEY COLUMN (§24), in attno order.  Counters that describe an entry or a
         -- posting set - entries, inline_entries, ntids, null_tids, empty_tids, the container and
         -- sparse counts, container_bytes, slack_bytes, container_pages, posting_internal_pages -
@@ -767,7 +768,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- posting tree in the index (§22; 0 means every set fits one page);
         -- the SUMMARY entries of §32 are counted apart, in summary_entries, summary_tids (the rows
         -- they hold), summary_bytes (their items) and summary_pages (their posting-tree pages),
-        -- and in none of the counters above
+        -- and in none of the counters above;
+        -- ndistinct is the column's distinct keys as the meta page records them for the planner
+        -- (§33) - the last build's, VACUUM's or ANALYZE's count, not this walk's - and NULL for a
+        -- column with none (a multi-key one, or an index nothing has counted since before §33)
     lion_index_posting_root(regclass, key anyelement) RETURNS bigint
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
@@ -6244,10 +6248,11 @@ image.
                                    posting-tree root push-down.
     DOWNLINK        0x60  1        ADD of one LionPostingPivot into a parent.
     SPLIT_CLEAR     0x70  1        FLAGS: clears LION_PAGE_INCOMPLETE_SPLIT.
-    META            0x80  1        META.  Reserved: the meta page only ever
-                                   changes inside a directory split today, so
-                                   that record carries the META operation and
-                                   this type is not written.
+    META            0x80  1        NDISTINCT: the key counts of §33, which
+                                   VACUUM and ANALYZE write on the meta page.
+                                   The meta page's other fields change only
+                                   inside a directory split, whose record
+                                   carries the META operation.
     VACUUM_PAGE     0x90  1-2      MULTIDEL + REPLACE per shrunk item + MINMAX +
                                    the entry, or a batch of REPLACEs on a
                                    directory leaf's INLINE entries.  CLEANUP
@@ -6267,7 +6272,7 @@ image.
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
 ADDMANY, REPLACE, DELTA, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS,
-META, DELETED, CONTAINER_ADD, SPARSE_INS.
+META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
 
 **DELTA is what a rewrite of one item costs now**, and it is the one operation
 whose payload is a function of the page as well as of the record. It says: the
@@ -11675,3 +11680,159 @@ order; the index is 159 MB -> 169 MB (+6%) at that size.
 
 **Not measured here**: the rmgr WAL mode's timings (the records are the same ones, so its ratios
 should follow), and a production build - these are assert-build CPU times, for ratios only.
+
+## 33. n_distinct from the directory (implemented)
+
+Core estimates a column's number of distinct values - `pg_statistic.stadistinct` - from ANALYZE's
+sample of 300 rows per unit of statistics target, with Haas and Stokes' estimator for what the
+sample did not see. A column with a long tail of rare values is where that falls short: a foreign
+key whose referenced rows have a handful of rows each, beside a few that have thousands, is sampled
+as the heavy values over and over and a sliver of the tail, and the estimator puts the column at a
+small fraction of what it holds. Every estimate that divides by n_distinct inherits the error:
+`estimate_num_groups()` for GROUP BY and DISTINCT and the hash aggregate sized from it, `eqsel()`
+for a value that is not a most common one, the join selectivity of the column.
+
+A lion index knows the answer. Each VALUE entry of a scalar key column is one distinct value
+(§21, §24), so a lion index on a plain column counts its keys, keeps the count on its meta page,
+and the planner is given it in place of ANALYZE's.
+
+### When the keys are counted
+
+- **At build** (`lionbuild()`): every entry passes `lion_build_add_entry()` once, in directory
+  order, so the count is exact - the VALUE entries of each key column, and the rows: the TIDs
+  under the entries of the first scalar key column, NULL entry included
+  (`lion_index_row_column()`, which §18's row count uses too). A parallel build counts on the
+  leader, which writes every entry.
+- **At VACUUM, in ambulkdelete's own walk** (`lion_vac_count()`): `lionbulkdelete()` visits every
+  leaf left to right already, and every entry once - an INLINE one in pass 1, a CHAIN one at the
+  end of its pass 2 - where it adds the entry's TIDs to the rows it reports (§18). The same place
+  counts the entry as one of its column's keys when it is a VALUE entry left with a TID after this
+  VACUUM's deletions; an entry left without one is the one the leaf's final step deletes. When the
+  walk is over the survivors are recorded, and `lionvacuumcleanup()`, which is handed that call's
+  result, does not walk again. A VACUUM whose dead TIDs take several ambulkdelete calls records
+  each call's count, and the last stands.
+- **At a VACUUM without ambulkdelete, and at ANALYZE** - a VACUUM that found no dead row (an
+  insert-only table's autovacuum), and ANALYZE, which calls the cleanup with `analyze_only` when it
+  is not part of a VACUUM (`do_analyze_rel()`, after `update_attstats()` and the pg_class updates):
+  `lion_vacuum_count_keys()` walks the directory, **but only when the directory is small** (below).
+  `VACUUM (ANALYZE)` calls the cleanup once, from VACUUM, and its ANALYZE step does not call it
+  again. A VACUUM with `INDEX_CLEANUP off` calls neither and does not count.
+
+An entry is counted on the leaf ambulkdelete's pass 1 found it on, and a split that moves it right
+afterwards moves it to a page between that leaf and the right link pass 1 read, which the walk does
+not visit: nothing is counted twice. The cleanup's walk reads each leaf under a SHARE lock alone,
+through the VACUUM's or ANALYZE's buffer ring, with the cost-based delay (and CHECK_FOR_INTERRUPTS)
+between leaves and a right-walk guard against a cycle of right links (§21); a leaf that splits after
+the walk has read it moves entries already counted onto a page between it and the right sibling
+the walk goes to next, one that split before is read with its new sibling. Either way nothing is
+missed but what writers add or VACUUM deletes meanwhile. Counted: the VALUE entries of each column
+with at least one TID. Not counted: the NULL and EMPTY entries (§14, §17), SUMMARY and SUMLAST
+entries (§32), pivots. A key whose rows are all dead is counted until the VACUUM that empties its
+entry deletes it (§18), and dead TIDs count in the rows: the count is an estimate, as ANALYZE's own
+is.
+
+A multi-key column (§17) is not counted - its keys are elements, not values of the column - and an
+index whose key columns are all multi-key records nothing. Nor is an rmgr-mode index counted on a
+server that has not registered the resource manager: the record could not be written
+(`lion_wal_begin()` refuses it), and a VACUUM must still go through there (§25, "VACUUM is the one
+path that could write without `lion_wal_begin()`"; `test/recovery/run.sh` phase 1f vacuums such
+an index). It keeps the counts it has until the preload is back. An unlogged or temporary index is
+counted like any other and writes no WAL.
+
+### What counting costs
+
+For a column of many values the directory is as large as a btree over it: a column of a hundred
+million keys has a directory of a few gigabytes. Counting it may not cost what ANALYZE was never
+meant to cost, so:
+
+- **VACUUM counts for nothing.** ambulkdelete reads and cleanup-locks every leaf whether or not the
+  count is taken; the count adds a comparison and an increment per entry to a pass that filters its
+  posting set, and one meta page record at the end. The first version of this section walked the
+  directory again in the cleanup, right after ambulkdelete had walked it: that walk is gone.
+- **ANALYZE, and a VACUUM with nothing to delete, count only a small directory.** The bound is what
+  ANALYZE's own sample of the table reads for the index's columns: 300 rows - from at most as many
+  heap blocks - per unit of the largest statistics target among the index's key columns
+  (`lion_vacuum_count_budget()`: a table column's target is the table's, an expression's the index
+  column's, -1 is `default_statistics_target` as `std_typanalyze()` takes it, 0 is nothing). At the
+  default target of 100 that is 30,000 pages, some 230 MB of directory - a column of several
+  million keys. The meta page knows the directory's size exactly (`dirpages`, which the build and
+  every split keep, §21), so a directory larger than the bound is not read at all: the cost of
+  deciding is the meta page. A walk that finds the directory has grown past the bound while it
+  walks (a concurrent insert splitting leaves) is abandoned at the page that would pass it.
+- **Nothing is written that was not counted whole.** Past the bound the index keeps the count it
+  has; a count of part of the directory would be wrong where an old one is only old, and the
+  planner stops using an old one once the table has outgrown it (below, "Stale counts").
+- **Nothing is written that is already there.** `lion_meta_write_ndistinct()` compares the counts
+  under the meta page's lock and writes no record - and so, the first time after a checkpoint, no
+  image of the meta page - when an ANALYZE of an unchanged table counts what the page holds.
+
+So a large table's count is refreshed by its VACUUMs, which delete dead rows sooner or later on
+any table that is updated or deleted from, and a small table's by every ANALYZE as well. A large
+table that is only ever inserted into is counted at build (or REINDEX) and then not again: its
+VACUUMs have nothing to delete and its directory is past ANALYZE's bound. Its count is used while
+the table stays within a factor of 2 of the rows it was counted over, and after that the planner
+has ANALYZE's estimate again, exactly as without lion.
+
+### The meta page, and the format
+
+`LionMetaNdistinct` (lion.h), 272 bytes, right after `LionMetaPageData` on the meta page at
+`LION_META_NDISTINCT_OFFSET`:
+
+    valid_cols   uint32   bit i - 1: key column i has a count
+    unused       uint32
+    rows         uint64   the rows the index held when counted (above)
+    ndistinct    uint64[32]  the VALUE entries of each key column
+
+Nothing in it says when it was counted. A build writes exactly the bytes every other build of the
+same rows writes, whatever its memory, its workers or its snapshot - `test/sql/build.sql` and
+`buildspill.sql` compare the files - and a time would differ; the planner needs the rows it was
+counted over, which it has, and not the moment.
+
+The reserved words of `LionMetaPageData` are all spent (§25's `wal_mode`, §21's order record and
+§32's summaries took them), and its 56 bytes are asserted not to change: a meta page written by
+any build since version 4 reads as the others. So the counts do not go inside it; they follow it,
+and they are there only where `pd_lower` covers them (`LionMetaHasNdistinct()`). Every meta page
+written before this section ends at `LionMetaPageData`, which is what its `pd_lower` says, and reads
+as a meta page without counts - "absent", which supplies nothing, exactly as a zero `wal_mode`
+reads as generic. `lion_init_metapage()` now sets `pd_lower` past the area, zeroed (no column
+valid); a build fills it in; an older index gets it from the first VACUUM or ANALYZE that counts,
+which moves `pd_lower`. The array has 32 slots whatever `INDEX_MAX_KEYS` the server was built with,
+so that the layout does not depend on it (`ordered_cols` already caps a lion index at 32 key
+columns).
+
+**The format version does not move**, by §14's test for a bump: does a build that predates the
+change read the index wrongly? It does not. Nothing before this section reads past
+`LionMetaPageData`; the counts are advice to the planner, and an older build that ignores them
+plans as it always did. The other direction - this build reading an older index - finds no area
+and supplies nothing. An older build writing an index that has the area leaves it alone in generic
+mode (GenericXLog diffs the whole page below `pd_lower`, and `pd_lower` is the page's), and in
+rmgr mode its redo of the META operation sets `pd_lower` back to the end of `LionMetaPageData`,
+which hides the area rather than corrupting it: the next count writes it whole again. A version
+number that moved would have made every index built from now on unreadable to the builds before,
+for nothing they could get wrong.
+
+### WAL
+
+`lion_meta_write_ndistinct()` writes the area in a record of its own, through the shim (§25):
+the meta page locked EXCLUSIVE, `lion_wal_begin()`, the area copied onto the registered page and
+`pd_lower` raised to cover it, a `LION_OP_NDISTINCT` operation carrying the 272 bytes, and
+`lion_wal_finish(LION_XLOG_META)` - the record type §25 had reserved for the meta page and never
+written. In generic mode the operation is a no-op and GenericXLog's diff of the image carries the
+change, `pd_lower` included; generic redo zeroes what lies between `pd_lower` and `pd_upper`, and
+the area is below `pd_lower` by then. In rmgr mode redo copies the payload into the area and raises
+`pd_lower` the same way. The WAL mode is known without reading the meta page under the lock
+(`lion_index_meta_wal_mode()`), because the caller - `lionbulkdelete()` or
+`lion_vacuum_count_keys()` - built the index state first.
+
+Two redo rules changed with it. The META operation of a directory split used to SET `pd_lower` to
+the end of `LionMetaPageData`; on a meta page with the area that would cut it off on the standby
+while the primary kept it, which `wal_consistency_checking` compares (`pd_lower` is header, not
+masked, and `mask_unused_space()` masks from the page's own `pd_lower`). It now only raises
+`pd_lower` to at least that, which is what it always did on a page without the area. A full-page
+image of the meta page carries the area, because the page is registered `REGBUF_STANDARD` and the
+hole is `pd_lower`..`pd_upper`. A standby therefore reads the count as the primary wrote it, and
+the recovery harness checks that it does (`standby_build_replay()`: the counts of a build, of an
+ANALYZE and of a VACUUM that deletes on the primary, each read back on the standby through
+`lion_index_stats()` and compared with the exact counts, under `wal_consistency_checking` in
+`make recovery-check-rmgr`).
+

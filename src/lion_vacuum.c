@@ -140,6 +140,7 @@
 
 #include "access/generic_xlog.h"
 #include "access/transam.h"
+#include "catalog/pg_attribute.h"
 #include "commands/vacuum.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -150,6 +151,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include "lion.h"
 
@@ -200,6 +202,9 @@ typedef struct LionVacState
 								 * 0 (lion_vac_row_column()) */
 	double		numtids;		/* sum of ntids over its entries, which is
 								 * what the index reports it holds */
+	uint64	   *nvalues;		/* per key column, the VALUE entries left
+								 * holding a TID: the distinct keys of §33
+								 * (lion_vac_count()) */
 	LionContainer *cbuf;			/* aligned container work buffer */
 	LionContainer *cbuf2;		/* and a second one, for the unchanged items
 								 * in front of the first INLINE item that
@@ -258,25 +263,13 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
 
 /*
  * The key column whose postings count the index's ROWS (DESIGN.md §18,
- * "Statistics"): its first scalar one.  A scalar column files every row the
- * index holds under exactly one of its entries - the NULL entry for a NULL -
- * so the ntids of its entries add up to the rows, where the postings of the
- * whole index count a row once per key column, once per element of a
- * multi-key column, and again in a SUMMARY of its bucket.  0 when every key
- * column is multi-key: a row may be filed under any number of their entries,
- * and nothing short of the union of them all says how many rows there are.
+ * "Statistics"): its first scalar one, or 0 when every key column is
+ * multi-key (lion_index_row_column()).
  */
 static AttrNumber
 lion_vac_row_column(LionIndexState *ix)
 {
-	int			i;
-
-	for (i = 0; i < ix->ncolumns; i++)
-	{
-		if (!ix->cols[i].multikey)
-			return (AttrNumber) (i + 1);
-	}
-	return InvalidAttrNumber;
+	return lion_index_row_column(ix);
 }
 
 /* Is entry one of those whose ntids add up to the rows? */
@@ -286,6 +279,27 @@ lion_vac_counts_rows(LionVacState *vs, const LionEntryTuple *entry)
 	return vs->rowattno != InvalidAttrNumber &&
 		entry->attno == vs->rowattno &&
 		(entry->flags & LION_ENTRY_SUMKINDS) == 0;
+}
+
+/*
+ * entry holds ntids TIDs now that this VACUUM has filtered it: add them to
+ * the rows when it is one of those that count them, and count it as one of
+ * its column's distinct keys when it is a VALUE entry left with a TID
+ * (DESIGN.md §33).  Every entry is counted here exactly once - an INLINE one
+ * by pass 1, a CHAIN one at the end of its pass 2 - on the leaf pass 1 found
+ * it on, so a split that moves it right afterwards moves it to a page the walk
+ * does not go to; and an entry left without a TID is the one the final step
+ * of its leaf deletes.  So what the walk has counted when it is over is the
+ * keys that survived it.
+ */
+static inline void
+lion_vac_count(LionVacState *vs, const LionEntryTuple *entry, uint64 ntids)
+{
+	if (lion_vac_counts_rows(vs, entry))
+		vs->numtids += (double) ntids;
+	if (ntids > 0 && entry->attno >= 1 && entry->attno <= vs->ix->ncolumns &&
+		lion_entry_kind(entry) == LION_KIND_VALUE)
+		vs->nvalues[entry->attno - 1]++;
 }
 
 /*
@@ -400,6 +414,8 @@ static LionEntryTuple *lion_vacuum_entry_copy(Buffer entrybuf,
 static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 								  BlockNumber head);
 static void lion_vacuum_sweep(LionVacState *vs);
+static bool lion_vac_may_count(Relation index, LionIndexState *ix);
+static void lion_vacuum_count_keys(IndexVacuumInfo *info);
 
 /*
  * The predicate handed to lion_container_remove_if(): map the container
@@ -484,6 +500,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.stats = stats;
 	vs.rowattno = lion_vac_row_column(vs.ix);
 	vs.numtids = 0;
+	vs.nvalues = (uint64 *) palloc0(sizeof(uint64) * vs.ix->ncolumns);
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.cbuf2 = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.nblocks = RelationGetNumberOfBlocks(index);
@@ -540,6 +557,22 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 */
 	lion_vacuum_sweep(&vs);
 	lion_wal_visits_reset();
+
+	/*
+	 * The walk has counted each key column's distinct keys on its way, as it
+	 * counted the rows (lion_vac_count()): record them for the planner
+	 * (DESIGN.md §33), so that the cleanup call after this one need not walk
+	 * the leaves again.  A VACUUM whose dead TIDs take more than one call
+	 * records each call's count, and the last one stands.
+	 */
+	if (lion_vac_may_count(index, vs.ix))
+	{
+		LionMetaNdistinct nd;
+
+		lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues, (uint64) vs.numtids);
+		lion_meta_write_ndistinct(index, &nd);
+	}
+	pfree(vs.nvalues);
 
 	MemoryContextDelete(vs.bucketcxt);
 	MemoryContextDelete(vs.pagecxt);
@@ -606,6 +639,17 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 IndexBulkDeleteResult *
 lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	/*
+	 * The distinct keys of each key column, for the planner (DESIGN.md §33).
+	 * A VACUUM that called ambulkdelete has counted them already, on the walk
+	 * that deleted (stats is what that call returned).  Without one - a
+	 * VACUUM that found no dead row, and ANALYZE, which calls this with
+	 * analyze_only once it has written the table's statistics - they are
+	 * counted here, if the directory is small enough.
+	 */
+	if (stats == NULL)
+		lion_vacuum_count_keys(info);
+
 	if (info->analyze_only)
 		return stats;
 
@@ -648,6 +692,188 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	}
 
 	return stats;
+}
+
+/*
+ * May this VACUUM or ANALYZE record the index's key counts (DESIGN.md §33)?
+ * Not in an index whose key columns are all multi-key: their keys are
+ * elements, not values.  Nor in an rmgr-mode index on a server that has not
+ * registered the resource manager, where the record could not be written
+ * (lion_wal_begin() refuses it) and VACUUM must still go through (§25,
+ * "VACUUM is the one path that could write without lion_wal_begin()"): such
+ * an index keeps the counts it has until the preload is back.
+ */
+static bool
+lion_vac_may_count(Relation index, LionIndexState *ix)
+{
+	if (lion_index_row_column(ix) == InvalidAttrNumber)
+		return false;
+	return !(lion_wal_mode(index) == LION_WAL_MODE_RMGR &&
+			 RelationNeedsWAL(index) && !lion_rmgr_registered());
+}
+
+/*
+ * The directory pages a count without ambulkdelete may read (DESIGN.md §33,
+ * "What counting costs"): as many as ANALYZE's sample of the table reads for
+ * the index's columns - 300 rows, from as many blocks at most, for each unit
+ * of the largest statistics target among its key columns.  A table column's
+ * target is the table's (ALTER TABLE ... SET STATISTICS) and an expression's
+ * the index column's (ALTER INDEX ... SET STATISTICS); -1, or none at all
+ * since PostgreSQL 17, is default_statistics_target, as std_typanalyze()
+ * takes it, and 0 - "do not analyze" - is nothing.
+ */
+static BlockNumber
+lion_vacuum_count_budget(Relation index)
+{
+	Form_pg_index indexform = index->rd_index;
+	int			nkeys = IndexRelationGetNumberOfKeyAttributes(index);
+	int			target = 0;
+	int			i;
+
+	for (i = 0; i < nkeys; i++)
+	{
+		AttrNumber	attnum = indexform->indkey.values[i];
+		Oid			relid = indexform->indrelid;
+		HeapTuple	tup;
+		Datum		dat;
+		bool		isnull;
+		int			t;
+
+		if (attnum == 0)
+		{
+			relid = RelationGetRelid(index);
+			attnum = (AttrNumber) (i + 1);
+		}
+		tup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+							  Int16GetDatum(attnum));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+				 attnum, relid);
+		dat = SysCacheGetAttr(ATTNUM, tup, Anum_pg_attribute_attstattarget,
+							  &isnull);
+		t = isnull ? -1 : DatumGetInt16(dat);
+		ReleaseSysCache(tup);
+
+		if (t < 0)
+			t = default_statistics_target;
+		target = Max(target, t);
+	}
+	return (BlockNumber) 300 * (BlockNumber) target;
+}
+
+/*
+ * Count the VALUE entries of each key column, and the rows under the first
+ * scalar one, and record them on the meta page for the planner's n_distinct
+ * (DESIGN.md §33): for a VACUUM or an ANALYZE that has no ambulkdelete walk
+ * to count them on (lion_vac_count()), and only when the directory is small.
+ *
+ * It may read no more pages than ANALYZE's sample of the table does
+ * (lion_vacuum_count_budget()).  The meta page knows how many pages the
+ * directory has - exactly, as the build and every split keep it (§21) - so a
+ * directory larger than that is not read at all, and one that grows past it
+ * while it is walked is abandoned at the page that would pass it.  Either way
+ * nothing is written and the index keeps the counts it has: a count of part
+ * of the directory is a wrong count, where an old one is only old, and the
+ * planner stops using an old one once the table has outgrown it (§33,
+ * "Stale counts").
+ *
+ * One walk of the directory leaves, left to right from the leftmost, each
+ * read under a SHARE lock alone and let go before the next: nothing else is
+ * held, so a writer waits for one leaf at most, and the walk is cancellable
+ * and paced by the cost-based delay between leaves.  A leaf that splits after
+ * the walk has read it moves entries the walk has counted onto a new page
+ * between it and the right sibling the walk goes to next, and one that split
+ * before is read with its new sibling: nothing is counted twice or missed but
+ * what writers add or VACUUM deletes meanwhile, which is the precision an
+ * estimate needs.  Neither the NULL nor the EMPTY entry is a value, nor is a
+ * summary (§32), nor an entry with no TID at all; a key whose rows are all
+ * dead is, until the VACUUM that empties its entry deletes it - an estimate,
+ * as ANALYZE's own is.  The leaves go through the VACUUM's or ANALYZE's
+ * buffer ring.
+ */
+static void
+lion_vacuum_count_keys(IndexVacuumInfo *info)
+{
+	Relation	index = info->index;
+	LionIndexState *ix = lion_get_index_state(index);
+	AttrNumber	rowcol = lion_index_row_column(ix);
+	LionMetaPageData meta;
+	LionMetaNdistinct nd;
+	LionRightWalk walk;
+	uint64	   *nvalues;
+	uint64		rows = 0;
+	BlockNumber budget;
+	BlockNumber nread;
+	BlockNumber blk;
+
+	if (!lion_vac_may_count(index, ix))
+		return;
+	budget = lion_vacuum_count_budget(index);
+	lion_read_meta(index, &meta);
+	if (meta.dirpages > budget)
+		return;
+
+	nvalues = (uint64 *) palloc0(sizeof(uint64) * ix->ncolumns);
+	lion_rightwalk_init(&walk);
+
+	/* the internal pages of the descent to the leftmost leaf, then leaves */
+	nread = meta.height;
+	blk = lion_dir_leftmost_leaf(index, ix);
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+		OffsetNumber off;
+		BlockNumber next;
+
+		if (++nread > budget)
+		{
+			pfree(nvalues);
+			return;
+		}
+
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL,
+								 info->strategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!LionPageIsLeaf(page))
+		{
+			UnlockReleaseBuffer(buf);
+			elog(ERROR, "lion index \"%s\": block %u is not a directory leaf",
+				 RelationGetRelationName(index), blk);
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (off = lion_page_first_data(page); off <= maxoff; off++)
+		{
+			ItemId		iid = PageGetItemId(page, off);
+			LionEntryTuple *entry;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+			entry = (LionEntryTuple *) PageGetItem(page, iid);
+			if (entry->attno < 1 || entry->attno > ix->ncolumns)
+				continue;
+			/* a key with no row at all, whose entry VACUUM has not deleted */
+			if (lion_entry_kind(entry) == LION_KIND_VALUE && entry->ntids > 0)
+				nvalues[entry->attno - 1]++;
+			if (entry->attno == rowcol && !LionEntryIsSummary(entry))
+				rows += entry->ntids;
+		}
+
+		next = LionPageIsRightmost(page) ? InvalidBlockNumber :
+			LionPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+		if (BlockNumberIsValid(next))
+			lion_rightwalk_step(index, &walk, next);
+		blk = next;
+		lion_vacuum_delay_point();
+	}
+
+	lion_meta_fill_ndistinct(&nd, ix, nvalues, rows);
+	lion_meta_write_ndistinct(index, &nd);
+	pfree(nvalues);
 }
 
 /*
@@ -756,14 +982,12 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 
 	if (removed == 0)
 	{
-		if (lion_vac_counts_rows(vs, entry))
-			vs->numtids += (double) entry->ntids;
+		lion_vac_count(vs, entry, entry->ntids);
 		return false;
 	}
 
 	vs->stats->tuples_removed += (double) removed;
-	if (lion_vac_counts_rows(vs, entry))
-		vs->numtids += (double) ntids;
+	lion_vac_count(vs, entry, ntids);
 
 	res->off = off;
 	res->spill = false;
@@ -1408,8 +1632,7 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	/* Report what the entry holds now that every page has been visited. */
 	lion_vac_ref_lock(vs, &ref, ent, BUFFER_LOCK_SHARE);
 	entry = lion_page_entry(BufferGetPage(ref.buf), ref.off);
-	if (lion_vac_counts_rows(vs, entry))
-		vs->numtids += (double) entry->ntids;
+	lion_vac_count(vs, entry, entry->ntids);
 	ent->maydelete = (entry->ntids == 0 && entry->ncontainers == 0);
 	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(ref.buf);

@@ -96,7 +96,7 @@ PG_FUNCTION_INFO_V1(lion_index_verify);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
 PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 
-#define LION_STATS_NCOLS		28
+#define LION_STATS_NCOLS		29
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
@@ -331,6 +331,7 @@ typedef struct LionStats
 	LionColStats *cols;			/* [ncolumns] */
 	bool	   *ordered;		/* [ncolumns]: the column's own opclass (§21) */
 	HTAB	   *sets;			/* head block -> LionSetStats, or NULL */
+	LionMetaNdistinct nd;		/* the key counts on the meta page (§33) */
 } LionStats;
 
 /*
@@ -728,6 +729,13 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		(void) lion_dir_root(index, ix, &height);
 		st->height = height;
 
+		/*
+		 * The distinct keys the planner is given (DESIGN.md §33), as the last
+		 * build, VACUUM or ANALYZE counted them: not this walk's entries, which
+		 * count the NULL and EMPTY entries too and are as of now.
+		 */
+		(void) lion_read_meta_ndistinct(index, &st->nd);
+
 		index_close(index, AccessShareLock);
 
 		funcctx->user_fctx = (void *) st;
@@ -776,6 +784,11 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		values[25] = Int64GetDatum(cs->summary_tids);
 		values[26] = Int64GetDatum(cs->summary_bytes);
 		values[27] = Int64GetDatum(cs->summary_pages);
+		if (call < LION_META_MAX_COLS &&
+			(st->nd.valid_cols & (((uint32) 1) << call)) != 0)
+			values[28] = Int64GetDatum((int64) st->nd.ndistinct[call]);
+		else
+			nulls[28] = true;
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
