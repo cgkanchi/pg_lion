@@ -371,8 +371,12 @@ SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.pad LIKE ''q%'')');
 -- another aggregate
 SELECT lion_sj('SELECT avg(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
--- three relations
+-- three relations: the dimension semi-joined to a second table is a dimension
+-- that is a join (DESIGN.md §27, "A dimension that is a join"), pushed down
+-- since, and fkjoin_dimjoin tests it; an inner join inside the dimension,
+-- which may repeat its rows, is still declined
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3) AND EXISTS (SELECT 1 FROM lion_sdn n WHERE n.k = d.pk)');
+SELECT lion_sj('SELECT count(*) FROM lion_sd d JOIN lion_sdn n ON n.k = d.pk WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
 -- a subquery the planner cannot pull up
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3 LIMIT 1 OFFSET 0)');
 
