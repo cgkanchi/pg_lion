@@ -152,6 +152,14 @@ extern void lion_vis_cache_reset(LionVisCache *cache);
 extern void lion_vis_cache_destroy(LionVisCache *cache);
 
 /*
+ * The counts handed one cache keep a visibility-map page pinned from one to
+ * the next, and their working memory (DESIGN.md §27, "The per-key path, end
+ * to end").  The holder of the cache lets go of the pin with this when it is
+ * done with the relation; a reset and a destroy do it too.
+ */
+extern void lion_vis_cache_release_vm(LionVisCache *cache);
+
+/*
  * A test every row a count counts has to pass as well, made on the heap tuple
  * the snapshot sees (DESIGN.md §17, "A query known only at run time").  The
  * count pushdown sets one while a multi-key clause whose query it only had at
@@ -585,6 +593,15 @@ extern bool lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 								  LionPostingSet *ps);
 extern void lion_lookup_walk_pause(LionLookupWalk *walk);
 extern void lion_lookup_walk_restart(LionLookupWalk *walk);
+
+/*
+ * One key in any order, by a descent of its own - what
+ * lion_posting_set_lookup_col() does - with the probe the walk resolved once
+ * instead of one resolved for every key (DESIGN.md §27, "The per-key path,
+ * end to end").  The walk's place is neither used nor moved.
+ */
+extern bool lion_lookup_walk_descend(LionLookupWalk *walk, Datum key,
+									 LionPostingSet *ps);
 
 /*
  * Count the members of the intersection of nsets already located posting

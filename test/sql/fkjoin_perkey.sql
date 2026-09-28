@@ -163,6 +163,16 @@ SELECT (n->>'Join Child Rows')::int AS child_rows,
 	   (n->>'Join Key Containers Read')::int <= 2 * ((n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int) AS two_a_key,
 	   (n->>'Visibility Map Checks')::int <= (n->>'Join Keys Looked Up')::int - (n->>'Join Keys Without Entry')::int AS a_check_a_key
 FROM lion_pk_node('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r1'' AND EXISTS (SELECT 1 FROM lion_pkf f WHERE f.fk = d.pk AND f.x IN (0, 1, 2, 3, 4, 5, 6, 7))') n;
+-- a count alone goes up as ONE partial row, the sum of its keys' counts,
+-- where a GROUP BY hands up a row for each of the 3000 dimension rows that
+-- join; and either way the counts of the run share one pinned page of the
+-- visibility map, which a count used to pin and let go of every time
+SELECT (s->>'Actual Rows')::numeric::int AS summed_rows,
+	   (g->>'Actual Rows')::numeric::int AS grouped_rows,
+	   (s->>'Visibility Map Pages Pinned')::int AS summed_vm_pins,
+	   (g->>'Visibility Map Pages Pinned')::int AS grouped_vm_pins
+FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') s,
+	 lion_pk_node('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr') g;
 -- the timings are there with TIMING, and only then
 SELECT n ? 'Join Child Time' AS child, n ? 'Join Lookup Time' AS lookup,
 	   n ? 'Join Count Time' AS count, n ? 'Fact Filter Collect Time' AS collect

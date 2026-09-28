@@ -205,6 +205,8 @@ collected copy of the fact filters (`Fact Filter Copy Containers Read`, `Seeks`,
 when the copy spilled), the posting-tree pages they read (`Join Posting Pages Read`) and the
 visibility map (`Visibility Map Checks`, `Pages Pinned`); with `TIMING` on, also `Join Child Time`,
 `Join Lookup Time`, `Join Count Time` and `Fact Filter Collect Time`, summed over parallel workers.
+A join whose result is counts alone (no `GROUP BY`, no dimension column in the output) adds the
+dimension rows' counts up inside the node and hands up one row per process.
 
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 

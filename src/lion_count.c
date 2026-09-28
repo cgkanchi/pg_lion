@@ -2009,6 +2009,26 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 }
 
 /*
+ * One key's set by a descent of its own, as lion_posting_set_lookup_col()
+ * locates it, but with the probe lion_lookup_walk_begin() resolved: for a key
+ * of another type than the column's, lion_probe_init() looks up the family's
+ * cross-type operators and support functions in the catalogs and sets up
+ * their FmgrInfos, which a lookup per key of an FK-side join made thousands
+ * of times over for the same answer.  The key needs no order and the walk
+ * keeps its place: the leaf found is released here, as a single lookup's is.
+ */
+bool
+lion_lookup_walk_descend(LionLookupWalk *walk, Datum key, LionPostingSet *ps)
+{
+	uint32		hash;
+
+	key = lion_probe_value(&walk->probe, key);
+	hash = lion_probe_hash(walk->state, &walk->probe, key);
+	return lion_posting_set_locate(walk->index, walk->state, &walk->probe, key,
+								   hash, ps);
+}
+
+/*
  * The same for the rows whose key is NULL (DESIGN.md §14).  The entry sorts
  * before every real key (LION_KIND_NULL), so the descent finds it on the
  * leftmost leaf; everything after that - the pin discipline of DESIGN.md §9
@@ -4724,7 +4744,46 @@ struct LionVisCache
 	 * relation it names; a reset leaves it alone.
 	 */
 	LionRowFilter *filter;
+
+	/*
+	 * What one count of this node execution leaves the next (DESIGN.md §27,
+	 * "The per-key path, end to end"), so that a count's fixed cost is not
+	 * paid again for every key of an FK-side join, every group of a GROUP
+	 * BY:
+	 *
+	 *	scratch		the memory a count works in - its cursors and their
+	 *				staging buffers, the merge's two work containers, the
+	 *				plans, the recheck list - made once, in `parent`, with a
+	 *				first block large enough for an ordinary count, and RESET
+	 *				when a count is over rather than made and deleted by every
+	 *				count.  scratchbusy while a count uses it: a count made
+	 *				inside another (none is, today) makes its own.
+	 *	vmbuf		the visibility-map page the last count left pinned, of
+	 *				relation vmrelid, which the next count of that relation
+	 *				starts from instead of pinning it again - between the rows
+	 *				of a node as well, as an index-only scan keeps its map page
+	 *				(ioss_VMBuffer).  It is a map page, not an index page: no
+	 *				part of the §9 interlock, and no VACUUM waits for its pin
+	 *				(setting a bit takes the page's content lock, and only a
+	 *				truncation, under an AccessExclusiveLock this query's lock
+	 *				excludes, would drop it).  The holder of the cache lets go
+	 *				of it when it is done, rescans, ends or moves to another
+	 *				relation (lion_vis_cache_release_vm()); a reset and a
+	 *				destroy do too.
+	 */
+	MemoryContext parent;
+	MemoryContext scratch;
+	bool		scratchbusy;
+	Buffer		vmbuf;
+	Oid			vmrelid;
 };
+
+/*
+ * The first block of a count's scratch memory (LionVisCache.scratch): the two
+ * work containers of a merge and a spilled copy's staging buffer are 8 kB
+ * chunks each, and a count of a few sources holds some 30 kB in all.
+ */
+#define LION_COUNT_SCRATCH_BLOCK	(64 * 1024)
 
 /*
  * How many entries work_mem allows.
@@ -4757,7 +4816,26 @@ lion_vis_cache_create(MemoryContext parent)
 	cache->cxt = AllocSetContextCreate(parent,
 									   "LionCount visibility cache",
 									   ALLOCSET_SMALL_SIZES);
+	cache->parent = parent;
+	cache->scratch = NULL;
+	cache->scratchbusy = false;
+	cache->vmbuf = InvalidBuffer;
+	cache->vmrelid = InvalidOid;
 	return cache;
+}
+
+/*
+ * Let go of the visibility-map page the counts kept pinned from one to the
+ * next (LionVisCache.vmbuf): when the node is done with the relation.
+ */
+void
+lion_vis_cache_release_vm(LionVisCache *cache)
+{
+	if (cache == NULL || !BufferIsValid(cache->vmbuf))
+		return;
+	ReleaseBuffer(cache->vmbuf);
+	cache->vmbuf = InvalidBuffer;
+	cache->vmrelid = InvalidOid;
 }
 
 void
@@ -4765,6 +4843,7 @@ lion_vis_cache_reset(LionVisCache *cache)
 {
 	if (cache == NULL)
 		return;
+	lion_vis_cache_release_vm(cache);
 	cache->ht = NULL;
 	MemoryContextReset(cache->cxt);
 	cache->relid = InvalidOid;
@@ -4778,11 +4857,16 @@ lion_vis_cache_destroy(LionVisCache *cache)
 {
 	if (cache == NULL)
 		return;
+	lion_vis_cache_release_vm(cache);
 	cache->ht = NULL;
 	cache->filter = NULL;
 	if (cache->cxt != NULL)
 		MemoryContextDelete(cache->cxt);
 	cache->cxt = NULL;
+	if (cache->scratch != NULL)
+		MemoryContextDelete(cache->scratch);
+	cache->scratch = NULL;
+	cache->scratchbusy = false;
 }
 
 void
@@ -7837,6 +7921,7 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	bool	   *carry;
 	bool		summed;
 	bool		oneset;
+	bool		scratch = false;
 	int			batchsrc;
 	Size		matheld;
 	Size		matbudget = (Size) work_mem * 1024;
@@ -8042,16 +8127,64 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 		}
 	}
 
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
-								"lion index count",
-								ALLOCSET_DEFAULT_SIZES);
+	/*
+	 * A collection counts nothing, keeps no answer and asks the map nothing
+	 * (below): it has no use for the node's cache.
+	 */
+	if (collect != NULL)
+		cache = NULL;
+
+	/*
+	 * The memory the count works in: the node's scratch context, reset when
+	 * the count is over, where the caller keeps a cache for its execution
+	 * (LionVisCache.scratch) - one AllocSet made per node instead of one per
+	 * count, whose first block, and the two blocks past it that a merge's 8 kB
+	 * work containers used to take, were allocated and freed again for every
+	 * key of an FK-side join.
+	 */
+	if (cache != NULL && !cache->scratchbusy)
+	{
+		if (cache->scratch == NULL)
+			cache->scratch = AllocSetContextCreate(cache->parent,
+												   "lion index count",
+												   ALLOCSET_DEFAULT_MINSIZE,
+												   LION_COUNT_SCRATCH_BLOCK,
+												   ALLOCSET_DEFAULT_MAXSIZE);
+		cxt = cache->scratch;
+		cache->scratchbusy = true;
+		scratch = true;
+	}
+	else
+		cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"lion index count",
+									ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
 	memset(&cx, 0, sizeof(cx));
 	cx.cxt = cxt;
 	cx.heap = heap;
 	cx.snapshot = snapshot;
+
+	/*
+	 * The visibility-map page the last count of this relation left pinned
+	 * (LionVisCache.vmbuf): the map of a large heap is a few pages, and
+	 * every count of the node asks the same one or two, so a count takes the
+	 * pin over rather than pinning the page again - a buffer lookup and two
+	 * atomic operations on a buffer header that every participant of a
+	 * parallel plan shares.  A pin of another relation's map is let go.
+	 */
 	cx.vmbuf = InvalidBuffer;
+	if (cache != NULL && BufferIsValid(cache->vmbuf))
+	{
+		if (cache->vmrelid == RelationGetRelid(heap))
+		{
+			cx.vmbuf = cache->vmbuf;
+			cache->vmbuf = InvalidBuffer;
+			cache->vmrelid = InvalidOid;
+		}
+		else
+			lion_vis_cache_release_vm(cache);
+	}
 	/* SerializationNeededForRead() begins with exactly this test; hoisting it
 	 * lets non-serializable counts skip the per-block PredicateLockPage loop. */
 	cx.serializable = IsolationIsSerializable();
@@ -8142,10 +8275,7 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.collect = collect;
 	if (collect != NULL)
-	{
 		cx.droppins = true;
-		cache = NULL;
-	}
 
 	/*
 	 * The count's own key set, when source slot 0 is one (a group's set, an
@@ -8246,11 +8376,29 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	lion_recheck_flush(&cx);
 	result = cx.count + cx.recheck_count;
 
+	/*
+	 * The map page stays pinned for the next count, when there is a cache to
+	 * keep it in (and nothing kept there since, which no count does).
+	 */
 	if (BufferIsValid(cx.vmbuf))
-		ReleaseBuffer(cx.vmbuf);
+	{
+		if (cache != NULL && !BufferIsValid(cache->vmbuf))
+		{
+			cache->vmbuf = cx.vmbuf;
+			cache->vmrelid = RelationGetRelid(heap);
+		}
+		else
+			ReleaseBuffer(cx.vmbuf);
+	}
 
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextDelete(cxt);
+	if (scratch)
+	{
+		MemoryContextReset(cxt);
+		cache->scratchbusy = false;
+	}
+	else
+		MemoryContextDelete(cxt);
 
 	if (stats != NULL)
 		lion_count_stats_add(stats, &cx.stats);
