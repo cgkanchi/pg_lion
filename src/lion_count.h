@@ -225,6 +225,8 @@ typedef struct LionPostingSet
 	Buffer		pinbuf;			/* INLINE: pinned bucket page, else Invalid */
 	bool		nopin;			/* INLINE, but located without its pin */
 	bool		budgeted;		/* its pin took a leaf of the list budget */
+	struct ResourceOwnerData *pinowner; /* ... charged to this owner, the
+										 * one the pin belongs to */
 	uint64		ntids;			/* entry's recorded member count (a hint) */
 	uint32		ncontainers;	/* entry's recorded ITEM count (a hint):
 								 * containers and sparse segments */
@@ -428,6 +430,28 @@ extern void lion_posting_set_release(LionPostingSet *ps);
  * every TID is checked in the heap by the executor.
  */
 extern void lion_posting_set_unpin(LionPostingSet *ps);
+
+/*
+ * lion_posting_set_lookup_col() for a caller that keeps MANY single lookups
+ * located at once - the keys of a multi-key clause (DESIGN.md §17), up to
+ * LION_MAX_QUERY_KEYS of them per clause: a pin the set keeps is charged to
+ * the list pin budget of DESIGN.md §15, and a set found past that budget
+ * comes out NOPIN, exactly like a list's.  *lastpinned is the leaf the
+ * caller's previous set took (InvalidBuffer to start): another pin on it
+ * costs no buffer and is not charged.
+ */
+extern bool lion_posting_set_lookup_budgeted_col(Relation index,
+												 AttrNumber attno, Datum key,
+												 Oid keytype,
+												 LionPostingSet *ps,
+												 Buffer *lastpinned);
+
+/*
+ * How many participants the parallel plan now starting has, the leader
+ * included (DESIGN.md §27): each gets that share of the list pin budget.
+ * 1 again when the plan ends.
+ */
+extern void lion_list_pin_participants(int participants);
 
 /*
  * Everything needed to probe one key column with values of one search type:

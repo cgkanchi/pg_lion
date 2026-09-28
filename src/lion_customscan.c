@@ -1106,7 +1106,9 @@ typedef struct LionCountScanState
  *
  * nextchunk is the one thing the participants share while they run: the next
  * run of LION_FKJOIN_UNIQUE_CHUNK distinct keys of a forward semi join over a
- * non-unique key that nobody has claimed yet.
+ * non-unique key that nobody has claimed yet.  participants is how many the
+ * leader started the plan for, itself included, which is how many ways each
+ * of them divides the list pin budget (lion_list_pin_participants()).
  */
 typedef struct LionJoinShared
 {
@@ -1119,6 +1121,7 @@ typedef struct LionJoinShared
 	int64		sorted;
 	int64		sortedruns;
 	pg_atomic_uint32 nextchunk;
+	int			participants;
 } LionJoinShared;
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
@@ -9446,6 +9449,7 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	LionState   *istate = lion_index_column_state(cl->idx, cl->idxcol);
 	StrategyNumber strategy;
 	LionQuery	q;
+	Buffer		lastpinned = InvalidBuffer;
 	int			i;
 
 	strategy = (StrategyNumber)
@@ -9482,10 +9486,16 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(q.nkeys, 1));
 	*tree = q.tree;
 
+	/*
+	 * Up to LION_MAX_QUERY_KEYS lookups, and every one of them may keep an
+	 * INLINE leaf pinned for as long as the node runs: they draw on the list
+	 * pin budget, as an IN list's do (DESIGN.md §15, "The pin budget").
+	 */
 	for (i = 0; i < q.nkeys; i++)
 	{
-		(void) lion_posting_set_lookup_col(cl->idx, cl->idxcol, q.keys[i],
-										  InvalidOid, &(*sets)[i]);
+		(void) lion_posting_set_lookup_budgeted_col(cl->idx, cl->idxcol,
+													q.keys[i], InvalidOid,
+													&(*sets)[i], &lastpinned);
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -12284,6 +12294,14 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	shared->filterrows = -1;
 	pg_atomic_init_u32(&shared->nextchunk, 0);
 	st->joinshared = shared;
+
+	/*
+	 * Every participant locates the fact filters for itself, so each takes
+	 * its share of the list pin budget (DESIGN.md §15, "The pin budget"):
+	 * the workers planned and the leader, whether it takes part or not.
+	 */
+	shared->participants = pcxt->nworkers + 1;
+	lion_list_pin_participants(shared->participants);
 }
 
 /*
@@ -12313,6 +12331,7 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 	LionCountScanState *st = (LionCountScanState *) node;
 
 	st->joinshared = (LionJoinShared *) coordinate;
+	lion_list_pin_participants(st->joinshared->participants);
 }
 
 /*
@@ -12374,6 +12393,10 @@ lion_end_custom_scan(CustomScanState *node)
 	LionCountScanState *st = (LionCountScanState *) node;
 
 	lion_reset_run(st);
+
+	/* the leader's share of the list pin budget is its whole again */
+	if (st->joinshared != NULL && !IsParallelWorker())
+		lion_list_pin_participants(1);
 
 	if (st->child != NULL)
 	{

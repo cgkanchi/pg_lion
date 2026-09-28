@@ -86,6 +86,7 @@
 #include "utils/typcache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -797,6 +798,7 @@ typedef struct LionProbeSort
 	const Datum *values;
 	LionProbe  *probe;
 	Oid			collation;
+	uint32		ncmp;			/* comparisons made by the sort */
 } LionProbeSort;
 
 static int
@@ -822,6 +824,22 @@ lion_probe_key_cmp(const void *a, const void *b, void *arg)
 }
 
 /*
+ * The same, as the sort of a whole list calls it: a list whose length is a
+ * parameter's has no cap (DESIGN.md §15), its sort calls the opclass's
+ * comparison some n log n times, and nothing else in it would answer a
+ * cancel.  No lock is held while a list is sorted.
+ */
+static int
+lion_probe_sort_cmp(const void *a, const void *b, void *arg)
+{
+	LionProbeSort *ctx = (LionProbeSort *) arg;
+
+	if ((++ctx->ncmp & 0xffff) == 0)
+		CHECK_FOR_INTERRUPTS();
+	return lion_probe_key_cmp(a, b, arg);
+}
+
+/*
  * Sort the non-NULL values of a list into the order a lookup locates them in
  * (lion_probe_key_cmp(): the probe's own comparison, then the hash), and hand
  * back each one's hash.  Returns how many there are.  Two values of one
@@ -844,7 +862,9 @@ lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
 	int			i;
 
 	lion_probe_init(index, state, keytype, &probe);
-	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * Max(nvalues, 1));
+	probes = (LionProbeKey *) palloc_extended(sizeof(LionProbeKey) *
+											  Max(nvalues, 1),
+											  MCXT_ALLOC_HUGE);
 	for (i = 0; i < nvalues; i++)
 	{
 		if (isnull != NULL && isnull[i])
@@ -852,13 +872,17 @@ lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
 		probes[n].hash = lion_probe_hash(state, &probe, values[i]);
 		probes[n].idx = i;
 		n++;
+		if ((n & 0x3ff) == 0)
+			CHECK_FOR_INTERRUPTS();
 	}
 
 	sortctx.values = values;
 	sortctx.probe = &probe;
 	sortctx.collation = state->collation;
+	sortctx.ncmp = 0;
 	if (n > 1)
-		qsort_arg(probes, n, sizeof(LionProbeKey), lion_probe_key_cmp, &sortctx);
+		qsort_arg(probes, n, sizeof(LionProbeKey), lion_probe_sort_cmp,
+				  &sortctx);
 
 	for (i = 0; i < n; i++)
 	{
@@ -943,6 +967,50 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 	return lion_posting_set_locate(index, state, &probe, key, hash, ps);
 }
 
+static uint32 lion_list_pin_budget(Relation index);
+static void lion_list_pin_charge(LionPostingSet *ps);
+
+/*
+ * One of many single lookups a caller keeps located together - the keys of a
+ * multi-key clause, as many as LION_MAX_QUERY_KEYS of them, and one clause
+ * per `@>` or `@@` of the query - under the list pin budget (DESIGN.md §15,
+ * "The pin budget").  They used to keep every INLINE leaf pin whatever the
+ * budget said, which a clause whose query is a parameter (DESIGN.md §17, "A
+ * query known only at run time") sets to a thousand pins a clause with
+ * nothing in the query text to show for it (2026-09-28 review).
+ *
+ * The lookup is lion_posting_set_lookup_col()'s; only what the set keeps
+ * differs.  A pin on the leaf the caller's previous set took (*lastpinned)
+ * costs no buffer and is not charged, as in a list; a pin on another leaf is
+ * charged while the budget lasts, and past it the set lets its leaf go and
+ * comes out NOPIN, which every count copes with (lion_count_sources_run()).
+ * The keys are looked up in the order the query names them, not in the
+ * directory's, so the same leaf may be charged twice: the budget runs out
+ * early, never late.
+ */
+bool
+lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
+									 Datum key, Oid keytype,
+									 LionPostingSet *ps, Buffer *lastpinned)
+{
+	bool		found;
+
+	found = lion_posting_set_lookup_col(index, attno, key, keytype, ps);
+	if (!BufferIsValid(ps->pinbuf))
+		return found;			/* not found, or a CHAIN set: no leaf kept */
+
+	if (ps->pinbuf == *lastpinned)
+		return found;
+	if (lion_list_pin_budget(index) == 0)
+	{
+		lion_posting_set_unpin(ps);
+		return found;
+	}
+	lion_list_pin_charge(ps);
+	*lastpinned = ps->pinbuf;
+	return found;
+}
+
 /*
  * How many leaves a walk may step right over before it is cheaper to descend
  * again (DESIGN.md §21).  A dense list steps; a list of a handful of values
@@ -954,7 +1022,7 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 /*
  * THE LIST PIN BUDGET (DESIGN.md §15): how many distinct leaves the IN lists
  * this backend has located and not yet released may keep pinned, all of them
- * together.  It is the smaller of
+ * together.  It is the smallest of
  *
  *	- LION_LOOKUP_MAX_PINS, 1000: the longest list the planner accepts as a
  *	  literal, so that a literal list pins exactly what it always did - a set
@@ -970,19 +1038,45 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  *	  binds below 64MB of shared_buffers.  The pool of a TEMPORARY index is
  *	  the backend's own local buffers, temp_buffers (1024 by default, and as
  *	  few as 100), which nothing else shares and which run out just the same:
- *	  "no empty local buffer available" (lion_pin_pool()).
+ *	  "no empty local buffer available" (lion_pin_pool());
+ *	- for the SHARED pool, LION_LOOKUP_SHARES times the backend's fair share
+ *	  of it, NBuffers / MaxBackends, but never less than LION_LOOKUP_MIN_PINS
+ *	  (2026-09-28 review).  The eighth keeps one backend from taking the
+ *	  pool, but eight backends running such lists at once still took all of
+ *	  it; with the share, the backends that must do so are a sixteenth of all
+ *	  the server is configured for, however many that is.  On a stock server
+ *	  (128MB, 100 connections: some 130 buffers a backend) the share is 2000
+ *	  and the thousand binds, so an ordinary configuration pins what it always
+ *	  did; the share binds where max_connections is large for shared_buffers.
  *
- * Neither depends on the backend's "fair share" (GetAdditionalPinLimit() of
- * 18): that is NBuffers / MaxBackends, 86 buffers on a stock 128MB server, and
- * a budget of it sent ordinary thousand-value lists to the heap.
+ * and a participant of a parallel plan gets its SHARE of that: the limit
+ * divided by the participants the plan was started with
+ * (lion_list_pin_participants()).  Each participant of a parallel FK-side
+ * join locates the fact filters for itself (DESIGN.md §27), and a leader with
+ * seven workers took eight budgets for one query.
+ *
+ * None of them is the backend's plain "fair share" (GetAdditionalPinLimit()
+ * of 18): 86 buffers on a stock 128MB server, and a budget of it sent
+ * ordinary thousand-value lists to the heap.  No bound kept per backend can
+ * promise the pool to every backend at once - that needs a count in shared
+ * memory, which an extension that need not be preloaded does not have - and a
+ * set past the budget only costs time: it comes out NOPIN, never wrong.
  *
  * The count is backend-wide because the budget is: two unbounded lists in one
  * query share it instead of taking one budget each.  Every set that took a
  * NEW leaf for it is marked `budgeted` and gives it back when released or
- * unpinned; a set abandoned by an error is not released, so the count is
- * zeroed at the end of every top-level transaction, when no set can be left.
- * Between an error and that point it can only be too high, which makes sets
- * NOPIN early - slower, never wrong.
+ * unpinned.  A set abandoned by an error is never released - but its pin is,
+ * by the resource owner that was current when it was taken, and that owner is
+ * released with the transaction, subtransaction or portal the error ends.  So
+ * each pin is charged to its OWNER as well (lion_list_pin_charge()), and an
+ * owner that is released gives back what its sets still had charged
+ * (lion_list_pins_resowner()).  A subtransaction failing in a loop - a
+ * PL/pgSQL EXCEPTION block around a count - used to leave its charges behind
+ * until the top-level transaction ended, and every list after it came out
+ * NOPIN (2026-09-28 review); now they go when its pins do, while the sets of
+ * a portal that outlives it (a cursor FETCHed inside it) keep theirs, as they
+ * keep their pins.  The count is still zeroed at the end of every top-level
+ * transaction, when no set can be left.
  *
  * The CURSORS that read the located sets draw on what is left of the same
  * limit (lion_open_budget_init()): a CHAIN set pins the posting page its
@@ -990,9 +1084,28 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * pin at all and then pinned a page per value when its cursors were built.
  */
 #define LION_LOOKUP_MAX_PINS	1000
+#define LION_LOOKUP_SHARES		16
+#define LION_LOOKUP_MIN_PINS	64
 
 static uint32 lion_list_pins = 0;
 static bool lion_list_pins_cb = false;
+static int	lion_list_participants = 1;
+
+/*
+ * The pins charged to one resource owner.  There are as many of these as
+ * owners that hold list pins at one time - the portal a count runs in, a
+ * cursor's, a function's - which is a handful, so they are an array searched
+ * from its end.
+ */
+typedef struct LionPinCharge
+{
+	ResourceOwner owner;
+	uint32		pins;
+} LionPinCharge;
+
+static LionPinCharge *lion_pin_charges = NULL;
+static int	lion_pin_ncharges = 0;
+static int	lion_pin_chargecap = 0;
 
 /*
  * The buffer pool a relation's pages are pinned in: the backend's local
@@ -1011,7 +1124,32 @@ lion_pin_pool(Relation rel)
 static uint32
 lion_pin_limit(Relation rel)
 {
-	return (uint32) Min(LION_LOOKUP_MAX_PINS, Max(lion_pin_pool(rel) / 8, 1));
+	uint32		limit;
+
+	limit = (uint32) Min(LION_LOOKUP_MAX_PINS, Max(lion_pin_pool(rel) / 8, 1));
+	if (rel == NULL || !RelationUsesLocalBuffers(rel))
+	{
+		int64		share;
+
+		share = (int64) LION_LOOKUP_SHARES * NBuffers / Max(MaxBackends, 1);
+		share = Max(share, (int64) LION_LOOKUP_MIN_PINS);
+		limit = (uint32) Min((int64) limit, share);
+	}
+	if (lion_list_participants > 1)
+		limit = Max(limit / (uint32) lion_list_participants, (uint32) 1);
+	return limit;
+}
+
+/*
+ * Set by the count pushdown when a parallel plan starts (DESIGN.md §27): how
+ * many participants it was started with, the leader included, each of which
+ * locates lists of its own.  Back to 1 when the leader's node ends, and at
+ * the end of every top-level transaction.
+ */
+void
+lion_list_pin_participants(int participants)
+{
+	lion_list_participants = Max(participants, 1);
 }
 
 static void
@@ -1025,9 +1163,37 @@ lion_list_pins_xact(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
 			lion_list_pins = 0;
+			lion_pin_ncharges = 0;
+			lion_list_participants = 1;
 			break;
 		default:
 			break;
+	}
+}
+
+/*
+ * A resource owner is being released - a portal's, a subtransaction's, the
+ * transaction's - and with it every buffer pin it still holds, among them the
+ * pins of the sets an error abandoned: their charges go with them.  The
+ * callback runs with CurrentResourceOwner set to the owner being released,
+ * once per phase.  A set charged to it that is released after all finds no
+ * charge left and gives nothing back (lion_list_pin_return()).
+ */
+static void
+lion_list_pins_resowner(ResourceReleasePhase phase, bool isCommit,
+						bool isTopLevel, void *arg)
+{
+	int			i;
+
+	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS || lion_pin_ncharges == 0)
+		return;
+	for (i = lion_pin_ncharges - 1; i >= 0; i--)
+	{
+		if (lion_pin_charges[i].owner != CurrentResourceOwner)
+			continue;
+		lion_list_pins -= Min(lion_list_pins, lion_pin_charges[i].pins);
+		lion_pin_charges[i] = lion_pin_charges[--lion_pin_ncharges];
+		break;
 	}
 }
 
@@ -1039,6 +1205,7 @@ lion_list_pin_budget(Relation index)
 	if (!lion_list_pins_cb)
 	{
 		RegisterXactCallback(lion_list_pins_xact, NULL);
+		RegisterResourceReleaseCallback(lion_list_pins_resowner, NULL);
 		lion_list_pins_cb = true;
 	}
 	return (lion_list_pins < limit) ? limit - lion_list_pins : 0;
@@ -1070,16 +1237,74 @@ lion_open_budget_init(LionOpenBudget *budget, Relation rel)
 	budget->pins = (int) Max(left, (uint32) LION_OPEN_MIN_PINS);
 }
 
-/* A set that took a leaf of the budget gives it back. */
+/*
+ * A set takes a leaf of the budget.  The pin it has just taken belongs to the
+ * current resource owner, and so does the charge.  The callbacks are
+ * registered by lion_list_pin_budget(), which every caller has asked first.
+ */
+static void
+lion_list_pin_charge(LionPostingSet *ps)
+{
+	ResourceOwner owner = CurrentResourceOwner;
+	int			i;
+
+	Assert(lion_list_pins_cb);
+	for (i = lion_pin_ncharges - 1; i >= 0; i--)
+	{
+		if (lion_pin_charges[i].owner == owner)
+			break;
+	}
+	if (i < 0)
+	{
+		if (lion_pin_ncharges >= lion_pin_chargecap)
+		{
+			int			newcap = Max(lion_pin_chargecap * 2, 8);
+
+			if (lion_pin_charges == NULL)
+				lion_pin_charges = (LionPinCharge *)
+					MemoryContextAlloc(TopMemoryContext,
+									   sizeof(LionPinCharge) * newcap);
+			else
+				lion_pin_charges = (LionPinCharge *)
+					repalloc(lion_pin_charges, sizeof(LionPinCharge) * newcap);
+			lion_pin_chargecap = newcap;
+		}
+		i = lion_pin_ncharges++;
+		lion_pin_charges[i].owner = owner;
+		lion_pin_charges[i].pins = 0;
+	}
+	lion_pin_charges[i].pins++;
+	lion_list_pins++;
+	ps->budgeted = true;
+	ps->pinowner = owner;
+}
+
+/*
+ * A set that took a leaf of the budget gives it back - to the owner it was
+ * charged to, unless that owner has been released since and given it back
+ * already.
+ */
 static inline void
 lion_list_pin_return(LionPostingSet *ps)
 {
-	if (ps->budgeted)
+	int			i;
+
+	if (!ps->budgeted)
+		return;
+	ps->budgeted = false;
+	for (i = lion_pin_ncharges - 1; i >= 0; i--)
 	{
+		if (lion_pin_charges[i].owner != ps->pinowner)
+			continue;
+		if (lion_pin_charges[i].pins > 0)
+			lion_pin_charges[i].pins--;
 		if (lion_list_pins > 0)
 			lion_list_pins--;
-		ps->budgeted = false;
+		if (lion_pin_charges[i].pins == 0)
+			lion_pin_charges[i] = lion_pin_charges[--lion_pin_ncharges];
+		break;
 	}
+	ps->pinowner = NULL;
 }
 
 /*
@@ -1168,7 +1393,9 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 	/* A binary coercion - the only one taken - changes no value. */
 	vals = values;
 
-	probes = (LionProbeKey *) palloc(sizeof(LionProbeKey) * nvalues);
+	/* an array parameter has no length cap (DESIGN.md §15) */
+	probes = (LionProbeKey *) palloc_extended(sizeof(LionProbeKey) * nvalues,
+											  MCXT_ALLOC_HUGE);
 	for (i = 0; i < nvalues; i++)
 	{
 		if (isnull != NULL && isnull[i])
@@ -1176,13 +1403,16 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		probes[nprobe].hash = lion_probe_hash(state, &probe, vals[i]);
 		probes[nprobe].idx = i;
 		nprobe++;
+		if ((nprobe & 0x3ff) == 0)
+			CHECK_FOR_INTERRUPTS();
 	}
 
 	sortctx.values = vals;
 	sortctx.probe = &probe;
 	sortctx.collation = state->collation;
+	sortctx.ncmp = 0;
 	if (nprobe > 1)
-		qsort_arg(probes, nprobe, sizeof(LionProbeKey), lion_probe_key_cmp,
+		qsort_arg(probes, nprobe, sizeof(LionProbeKey), lion_probe_sort_cmp,
 				  &sortctx);
 
 	for (i = 0; i < nprobe; i++)
@@ -1192,6 +1422,25 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		bool		dup = false;
 		bool		located;
 		int			steps;
+
+		/*
+		 * Every so often, with no lock held.  The walk keeps the leaf it
+		 * stands on LOCKED from one value to the next, and a content lock
+		 * holds interrupts off, so the check this loop used to make answered
+		 * no cancel however long the list (2026-09-28 review).  The leaf is
+		 * let go here, and the next value descends again - what it does
+		 * anyway whenever it lies more than a few leaves further right.  The
+		 * pins the sets took are theirs and stay.
+		 */
+		if (i > 0 && (i & 0x3f) == 0)
+		{
+			if (BufferIsValid(buf))
+			{
+				UnlockReleaseBuffer(buf);
+				buf = InvalidBuffer;
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
 
 		/*
 		 * A new sort run starts a new set of possible duplicates: with an
@@ -1309,8 +1558,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 					if (buf != lastpinned)
 					{
 						npinned++;
-						lion_list_pins++;
-						sets[nsets].budgeted = true;
+						lion_list_pin_charge(&sets[nsets]);
 					}
 					lastpinned = buf;
 					IncrBufferRefCount(buf);
@@ -1352,9 +1600,6 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		}
 
 		nsets++;
-
-		if ((i & 0x3f) == 0)
-			CHECK_FOR_INTERRUPTS();
 	}
 
 	if (BufferIsValid(buf))

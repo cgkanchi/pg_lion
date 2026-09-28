@@ -2409,10 +2409,36 @@ so on any ordinary configuration a literal list pins exactly the leaves it alway
 that read the located sets draw on what the lists leave of the same limit ("Bounded cursors",
 below). Pins on the
 leaf the previous set already pins cost no buffer and are not counted. Every set that took a new
-leaf is marked `budgeted` and returns it when released; a set abandoned by an error never is, so
-the count is zeroed at the end of each top-level transaction, and until then it can only be too
-high - sets go NOPIN early, which is slower and never wrong. An INLINE set found past the budget
-comes out **NOPIN**: its payload copied, its leaf let go, exactly like a materialized set (§9).
+leaf is marked `budgeted` and returns it when released. A set abandoned by an error never is, but
+its PIN is released - by the resource owner that was current when it was taken, with the
+transaction, subtransaction or portal the error ends - so each charge is recorded against that
+owner too, and an owner being released gives back what its sets still had charged
+(`lion_list_pins_resowner()`, a resource-release callback; 2026-09-28 review). Before that the
+count was only zeroed at the end of the top-level transaction, and a subtransaction failing in a
+loop - a PL/pgSQL `EXCEPTION` block around a count - left its charges behind until then, so every
+list after it came out NOPIN: never wrong, but a cliff. Restoring the count saved at the start of
+the subtransaction would not have been right either: a cursor opened outside the subtransaction and
+FETCHed inside it keeps its sets, and their pins, when the subtransaction is rolled back, and the
+owner is what tells those apart. The top-level zeroing stays as a backstop. An INLINE set found past
+the budget comes out **NOPIN**: its payload copied, its leaf let go, exactly like a materialized set
+(§9).
+
+The limit is per backend, and two things it did not account for were other backends and a
+query's own parallel workers (2026-09-28 review). An eighth of the pool keeps one backend from
+exhausting it, but eight at once still could. So for the shared pool the limit is also at most
+`LION_LOOKUP_SHARES` = 16 times the backend's fair share, `NBuffers / MaxBackends`, and never less
+than `LION_LOOKUP_MIN_PINS` = 64: exhausting the pool that way takes a sixteenth of all the
+backends the server is configured for, running lists over the budget at the same moment. On a stock
+server (128MB, 100 connections, some 130 buffers a backend) the share is about 2000 and the thousand
+still binds, so an ordinary configuration pins exactly what it did; the share binds where
+max_connections is large for shared_buffers (128MB and 500 connections: about 490). A plain fair
+share, the budget's first version below, sent ordinary lists to the heap; sixteen of them do not.
+And each participant of a parallel FK-side join locates the fact filters for itself (§27), so a
+leader and seven workers took eight budgets: the node now tells each participant how many the plan
+was started with (`lion_list_pin_participants()`, the workers planned plus the leader, whether it
+takes part or not), and each takes that share of the limit. No bound kept per backend promises the
+pool to every backend at once - that needs a count in shared memory, which an extension that need
+not be preloaded does not have - and what the bound costs past it is only time: sets come out NOPIN.
 
 The first version of this budget (2fb790e) was this backend's "fair share" of the pool,
 `GetAdditionalPinLimit()`, which is NBuffers / MaxBackends: 86 buffers on a stock 128MB,
@@ -2421,12 +2447,19 @@ The first version of this budget (2fb790e) was this backend's "fair share" of th
 the map answered before - and 18's function returns 0 outright once the share is at most eight,
 which made the same version drop the pin of EVERY single lookup (`lion_posting_set_take()`) on a
 small pool with many connections, so a plain `k = 5 AND x = 5` over two INLINE sets lost the map.
-Single lookups keep their pin unconditionally now. What a caller's loop of them holds is bounded by
-the query rather than by the data: a multi-key clause extracts at most `LION_MAX_QUERY_KEYS` = 1000
-keys (lion_multikey.c; beyond that the query is answered as ALL and rechecked), so one `@>` or `@@`
-clause of the pushdown pins at most 1000 leaves, and a query with many such clauses holds 1000 per
-clause - the residual, and the one place a query's text rather than its data sets the number. The
-bitmap scan holds none of them past the lookup (below).
+Single lookups keep their pin unconditionally now. A caller's LOOP of them does not: a multi-key
+clause extracts up to `LION_MAX_QUERY_KEYS` = 1000 keys (lion_multikey.c; beyond that the query is
+answered as ALL and rechecked), and since a clause's query may be a parameter (§17, "A query known
+only at run time") nothing in the query text shows how many - one `@>` of a thousand-element array
+parameter pinned a thousand leaves, and a query of several such clauses a thousand each, outside
+the budget (2026-09-28 review). The pushdown locates a multi-key clause's keys with
+`lion_posting_set_lookup_budgeted_col()`: the single lookup, but a pin it keeps is charged to the
+list budget like a list's (another pin on the leaf the clause's previous key took is free), and a
+key found past the budget comes out NOPIN. The keys are not sorted into the directory's order
+first - their positions are the tree's leaves - so a leaf two keys share at a distance is charged
+twice: the budget runs out early, never late. A multi-key source copes with NOPIN leaves as any
+source does (below): its plan is not `pinned`, so another source carries the interlock or the count
+trusts no map. The bitmap scan holds none of them past the lookup (below).
 
 A NOPIN set carries no §9 interlock of its own, and the count restores one in each of its shapes:
 
@@ -2504,7 +2537,14 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   the entries up in (bucket, hash) order, so the bucket pages are read in ascending block order and
   duplicates - which hash equally and are therefore adjacent in that order - are dropped in one pass
   instead of by comparing every value with every earlier one (half a million `datumIsEqual()` calls
-  at 1000 values). `lion_index_count_any(idx, keys)` is the SQL form of the whole path.
+  at 1000 values). `lion_index_count_any(idx, keys)` is the SQL form of the whole path. A list
+  whose length is a parameter's has no cap, so all three steps answer a cancel (2026-09-28
+  review): the hashing every thousand values, the sort every 65536 comparisons, and the walk every
+  64 values - where it lets go of the leaf it has been keeping LOCKED from one value to the next
+  and lets the next value descend again, because a content lock holds interrupts off and the check
+  the walk used to make under it did nothing. (A lookup that steps right with lock COUPLING - the
+  insert path's run of one prefix - holds a lock at every moment and cannot check; its run is one
+  prefix's collisions.)
 
 **Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one
 bucket page each - but read in ascending block order, so at `lion_heap_page_cost()`'s interpolated
