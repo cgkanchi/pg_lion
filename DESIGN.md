@@ -1259,6 +1259,24 @@ taken (§21), and a coercion merely existing is not enough: text is binary-coerc
 rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
 the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
 `lion_index_count_any()` resolves its array's element type the same way.
+**So is its collation** (`lion_count_check_collation()`, 2026-09-28 review; the functions used to
+look every key up under the index's collation whatever the call said). The index hashed and
+compared its keys under its own collation; `col = key` compares under the key's when the key brings
+one of its own - an explicit COLLATE, or a column of another collation, read from the argument's own
+expression (`lion_count_arg_collation()`, so that the two-key form's keys are taken one by one, as
+the two clauses of its query are) - and otherwise under the column's: a literal or a parameter brings
+the default collation, which gives way to the column's in the parser's rule for an operator's inputs
+(an explicit COLLATE "default" therefore reads as none). The column's collation is the table
+column's, or the expression's for an expression column, and need not be the index's: `(c COLLATE
+"x")` keeps c and compares under x. Two deterministic collations agree on which values are equal -
+each calls two values equal when their bytes are - so a count under another deterministic collation
+than the index's is made, and is the query's. A nondeterministic one agrees with no other: a
+case-insensitive index counts 'ABC' under the key 'abc', and `c = 'abc'` under the column's own
+collation does not; so where either collation is nondeterministic and the two differ the count is
+an ERROR (`collation_mismatch`), never a different number. `lion_index_count_group_stats()` stands for
+`GROUP BY col`, which groups under the column's collation, and is refused the same way.
+`test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
+and is skipped without them (`countcoll_1.out`), as it is on CI's source builds.
 **A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
 STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
 argument - a NULL constant folds the call away when the query is planned - so no count is made,
@@ -8119,9 +8137,14 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
 
 - **Where.** Exactly where core would read an end: lion runs core's binary search over the
   histogram with the clause's own operator and constant (`lion_probe_ends_wanted()`), under core's
-  own conditions for using the histogram (its collation, `comparison_ops_are_compatible()`). The
-  constant is what `get_restriction_variable()` makes of the other side, so `now() - interval` is
-  one. A Param is not, and is not probed.
+  own conditions for using the histogram (its collation, `comparison_ops_are_compatible()`,
+  `statistic_proc_security_check()`). The constant is what `get_restriction_variable()` makes of the
+  other side, so `now() - interval` is one. A Param is not, and is not probed. The search calls the
+  clause's operator on the histogram's values, which the user may not be allowed to read - a column
+  without SELECT, a table behind a security barrier view or a row-level policy - so, as core's
+  search does, it runs only when the operator is leakproof or the user can read every row of the
+  column; otherwise core uses no histogram for the clause and the probe reads nothing (2026-09-28
+  review: the search ran regardless, and a leaky operator was handed the histogram).
 - **What is read.** The column's first or last VALUE entry whose posting set has a live row. The
   directory is in the key's order within each key column (§21), so a descent to (attno, VALUE) with
   no key lands on the first VALUE entry (`lion_dir_value_start()`), and one to (attno, the first kind
@@ -8134,15 +8157,35 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
   scalar column is probed, and only when its order is the histogram's (the key type's default btree
   comparison, the index's collation the statistics').
 - **Bounded, as core's is.** `LION_PROBE_HEAP_PAGES` (100, core's `VISITED_PAGES_LIMIT`) heap pages
-  without a live row, or `LION_PROBE_LEAVES` (100) directory leaves, and the probe gives up and the
-  histogram's own end stands. The leaves bound matters where core's does not: a directory leaf is
-  never unlinked (§18), so deleting a column's newest keys and vacuuming leaves their leaves empty
-  and linked, where a btree would have deleted its pages. An index that grew by inserts holds about
-  34 one-row keys of a column to a leaf, so the 10,000 newest keys deleted are past the bound and
-  1,000 are not (`test/sql/rangeprobe.sql` §3 shows both).
+  without a live row, `LION_PROBE_HEAP_TIDS` (10,000) TIDs without one, or `LION_PROBE_LEAVES` (100)
+  directory leaves, and the probe gives up and the histogram's own end stands. The leaves bound
+  matters where core's does not: a directory leaf is never unlinked (§18), so deleting a column's
+  newest keys and vacuuming leaves their leaves empty and linked, where a btree would have deleted
+  its pages. An index that grew by inserts holds about 34 one-row keys of a column to a leaf, so the
+  10,000 newest keys deleted are past the bound and 1,000 are not (`test/sql/rangeprobe.sql` §3 shows
+  both). The TIDs bound is there because core's probe asks about a dead TID once - it marks the btree
+  entry dead (`kill_prior_tuple`) and the next plan skips it - where a posting set has nothing to
+  mark, so every plan until VACUUM asks about the same dead rows again, and 100 pages of small rows
+  hold up to 29,100 of them; 10,000 is those pages at 100 rows a page. Each TID used to be asked
+  about through `table_index_fetch_tuple_check()`, which on 16-19 builds and drops a slot and a fetch
+  state per TID; the probe keeps one of each (`lion_tid_fetch_begin()`, lion_compat.h), and the pin
+  on a page while its TIDs are asked about (2026-09-28 review).
 - **Once per planner run.** The ends are cached for the PlannerGlobal of the query, in its memory,
   and forgotten when that memory is reset. Neither a hypothetical nor a partial index is read, nor the
   parent of an inheritance tree. A column core reads itself - it has a btree on it - is left to core.
+- **An end found empty is not read again at every plan** (2026-09-28 review). Where the probe found
+  no live key - it reached a bound, or read the column's whole run - the backend remembers so, per
+  index, key column and end (`lion_probe_missed()`, sixteen at most), in place of the dead entries
+  core's probe would have marked; before, the end whose newest rows were deleted in bulk was walked
+  to the bounds by every plan until VACUUM. A dead row never becomes live again, so only new rows,
+  VACUUM or a new relation under the same OID can change the answer, and the memory is forgotten
+  when the `pg_class` row of the table or the index changes - VACUUM and ANALYZE change it whenever
+  they update the statistics there, and so does DDL that rewrites or drops either (a syscache
+  callback on RELOID; a relcache callback would take one of the ten slots a backend has for all of
+  them, and running out of those is FATAL) - or once the table or the index has more pages than
+  when it was made, which rows added past the end soon give it. Rows that grow neither and
+  come with no VACUUM or ANALYZE are not seen until one of those; the estimate meanwhile is the
+  histogram's own end, which is what core's probe leaves when it gives up.
 - **Lion's estimates only.** The probed ends go into a copy of the column's `pg_statistic` row, which
   `get_relation_stats_hook` hands to core's own `clauselist_selectivity()` while lion prices one of
   its accesses (`lion_probe_begin()` .. `lion_probe_end()`): `lioncostestimate()` for every lion
@@ -8310,7 +8353,14 @@ where a sequential scan is three times faster. It checks lion's estimate against
 and the answers against a sequential scan's; a bound inside the histogram, which is not probed; the
 newest 1,000 rows deleted, before VACUUM and after, where lion's estimate is the number core makes
 with a btree on the column; 9,000 more, past `LION_PROBE_LEAVES`, where the probe gives up and the
-histogram's end stands; a partial index, and a Param. `test/isolation/count_range_split_race.spec` parks a
+histogram's end stands; a partial index, and a Param. `test/sql/rangeprobe_leak.sql` (2026-09-28)
+counts the calls of a non-leakproof `>=` of a lion operator class made while a query is planned: the
+table's owner has the histogram searched with it, a role under a row-level policy does not, and the
+same role does once the operator is leakproof. `test/sql/rangeprobe_memo.sql` deletes the newest
+10,000 keys of the same shape of table and vacuums: the first plan reads a hundred leaves and gives
+up, the next reads none (their planning buffers differ by 100 or more), and rows added past the end,
+more than the deletion left room for, grow the table and the index and have the end read again.
+`test/isolation/count_range_split_race.spec` parks a
 range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
 both counts against the heap.
@@ -8951,7 +9001,16 @@ it. So `lion_plain_heap_correlation()` notes what is left over for an unparamete
 relation's paths are built and offers the bitmap heap scan of the same index path again beside it
 (`lion_plain_set_rel_pathlist()`, in `lion_selfuncs.c`, before LionOrdered's hook sees the paths);
 set_rel_pathlist() allows a hook to modify the core paths, and the two are then compared as any
-others. The plain path keeps its startup cost, which is what a LIMIT asks of it. At 1.1, 43% of the
+others. The plain path keeps its startup cost, which is what a LIMIT asks of it. The hook offers the
+sequential scan and the TID scans again as well, rebuilt as set_plain_rel_pathlist() builds them
+(2026-09-28 review): core adds the sequential scan before the index paths, and a plain path priced
+short by its remainder could dominate it and have add_path() free it, leaving a relation whose best
+path was the sequential scan without one. Where nothing had been displaced the rebuilt path is a copy
+of one still there, and add_path() throws it away. The other indexes' paths are not rebuilt - that
+would mean building every index path again, lion's among them - and would have had to cost less than
+the plain path with its remainder and more than without it. `plaincost.sql`'s 43% query at 1.1 is
+one that had lost its sequential scan (about 7,550 by core's formula, against the plain path's 7,294
+before the charge); the bitmap scan, at 7,273, still wins it. At 1.1, 43% of the
 rows, 18 to a page, on every page (`plaincost.sql`'s shape, `status = 0 AND supp = 0
 AND flag`):
 
