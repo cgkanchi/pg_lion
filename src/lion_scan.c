@@ -321,6 +321,7 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 	{
 		Page		page;
 		Page		cpage = (Page) copy->data;
+		BlockNumber cblkno = BufferGetBlockNumber(buf);
 		OffsetNumber maxoff;
 		OffsetNumber off;
 
@@ -331,15 +332,11 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 		blkno = LionPageGetOpaque(cpage)->rightlink;
 
 		maxoff = PageGetMaxOffsetNumber(cpage);
+		/* each item checked before the container code reads it (§3) */
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
-		{
-			ItemId		iid = PageGetItemId(cpage, off);
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			ntids += lion_container_to_tbm((LionContainer *) PageGetItem(cpage, iid),
-										  tbm, recheck);
-		}
+			ntids += lion_container_to_tbm(lion_page_item_fetch(index, cpage,
+																 cblkno, off),
+										   tbm, recheck);
 
 		CHECK_FOR_INTERRUPTS();
 

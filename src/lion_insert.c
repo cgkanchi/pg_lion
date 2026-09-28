@@ -940,12 +940,15 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 	bool		found;
 	int			delta;
 
-	/* Which item owns this ckey: a container, a segment, or nothing yet? */
-	off = lion_page_find_item(cpage, ckey, &found);
+	/*
+	 * Which item owns this ckey: a container, a segment, or nothing yet?
+	 * Every item looked at here has been through lion_page_item_fetch(), so
+	 * the in-place paths below may take the item at off as it stands.
+	 */
+	off = lion_page_find_item(index, cpage, blk, ckey, &found);
 
 	if (found &&
-		((LionContainer *) PageGetItem(cpage, PageGetItemId(cpage, off)))->type
-		== LION_CT_SPARSE)
+		lion_page_item_fetch(index, cpage, blk, off)->type == LION_CT_SPARSE)
 	{
 		bool		done = false;
 
@@ -970,13 +973,12 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 		OffsetNumber target = InvalidOffsetNumber;
 
 		if (off > FirstOffsetNumber &&
-			lion_segment_has_room((LionContainer *)
-								 PageGetItem(cpage,
-											 PageGetItemId(cpage, OffsetNumberPrev(off)))))
+			lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
+													   OffsetNumberPrev(off))))
 			target = OffsetNumberPrev(off);
 		else if (off <= maxoff &&
-				 lion_segment_has_room((LionContainer *)
-									  PageGetItem(cpage, PageGetItemId(cpage, off))))
+				 lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
+															off)))
 			target = off;
 
 		if (target != InvalidOffsetNumber)

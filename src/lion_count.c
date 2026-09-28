@@ -323,6 +323,7 @@ typedef struct LionSetCursor
 	OffsetNumber maxoff;
 	PGAlignedBlock *imgbuf;		/* private copy of the current container page */
 	Page		img;
+	BlockNumber imgblk;			/* the block img is a copy of */
 	bool		haspage;		/* img holds a leaf whose items are being
 								 * consumed; pinbuf pins it unless the cursor
 								 * was told to drop its pins (cx->droppins) */
@@ -1574,6 +1575,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 
 	while (BlockNumberIsValid(blkno))
 	{
+		BlockNumber imgblk = blkno;
 		OffsetNumber off;
 		OffsetNumber maxoff;
 
@@ -1582,15 +1584,10 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
-			ItemId		iid = PageGetItemId(img, off);
-			const LionContainer *c;
-			Size		sz;
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			c = (const LionContainer *) PageGetItem(img, iid);
-			sz = lion_item_size(c);
-			Assert(sz <= LION_CONTAINER_MAX_SIZE);
+			/* checked for what the copy and its readers need (§3) */
+			const LionContainer *c = lion_page_item_fetch(ps->index, img,
+														  imgblk, off);
+			Size		sz = lion_item_size(c);
 
 			/*
 			 * Give up as soon as the set fails BOTH budgets: a wide set is
@@ -1815,6 +1812,7 @@ static void
 lion_cursor_take_page(LionSetCursor *cur, Buffer buf)
 {
 	memcpy(cur->img, BufferGetPage(buf), BLCKSZ);
+	cur->imgblk = BufferGetBlockNumber(buf);
 	cur->haspage = true;
 
 	/*
@@ -1880,15 +1878,18 @@ lion_cursor_next_item(LionSetCursor *cur)
 		Buffer		buf;
 		Page		page;
 
-		/* Finish the page we already have in hand. */
-		while (cur->haspage && cur->off <= cur->maxoff)
+		/*
+		 * Finish the page we already have in hand.  An item goes to the
+		 * container code only once lion_page_item_fetch() has made sure it
+		 * holds what its header says (DESIGN.md §3, "untrusted containers").
+		 */
+		if (cur->haspage && cur->off <= cur->maxoff)
 		{
-			ItemId		iid = PageGetItemId(cur->img, cur->off);
+			OffsetNumber off = cur->off;
 
-			cur->off = OffsetNumberNext(cur->off);
-			if (!ItemIdIsUsed(iid))
-				continue;
-			return (const LionContainer *) PageGetItem(cur->img, iid);
+			cur->off = OffsetNumberNext(off);
+			return lion_page_item_fetch(cur->set->index, cur->img, cur->imgblk,
+										off);
 		}
 
 		/* Its items have all been consumed: the pin may go. */
@@ -1912,7 +1913,8 @@ lion_cursor_next_item(LionSetCursor *cur)
 				return NULL;
 			}
 			lion_cursor_take_page(cur, buf);
-			cur->off = lion_page_find_item(cur->img, cur->seekckey, &found);
+			cur->off = lion_page_find_item(cur->set->index, cur->img,
+										   cur->imgblk, cur->seekckey, &found);
 			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
@@ -2150,7 +2152,8 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 			 * page after it.  Either way this is where the walk resumes; an
 			 * offset past the last item simply ends the cursor.
 			 */
-			cur->off = lion_page_find_item(cur->img, target, &found);
+			cur->off = lion_page_find_item(cur->set->index, cur->img,
+										   cur->imgblk, target, &found);
 			return;
 		}
 
