@@ -4225,6 +4225,14 @@ Readers, below, for how a LIST of cross-type values is sorted.)*
 - **The root** is cached in `LionState` and validated by the LION_PAGE_ROOT flag, which a root split
   clears on the page it demotes - nbtree's BTP_ROOT trick. A lookup therefore costs no meta-page
   visit at all until the root really moves.
+  A root split can also land between reading the meta page and locking the root it names, and then
+  that page is demoted too. `lion_dir_get_root()` reads the meta page again for as long as the
+  height it names keeps growing - a root split raises it in the very record that demotes the old
+  root, and nothing lowers it - and refuses as damage only a meta page that names the same height
+  again with a page that is not the root. It used to allow one refresh, which made a root split
+  racing it a spurious "is not the root page" ERROR (2026-09-27 review). nbtree's `_bt_getroot()`
+  descends from the demoted page instead, which would do for a search but not for the split repair's
+  `lion_dir_find_parent()`, whose parent may be on the new level above it.
 - **Insert of a new entry**: descend with the leaf EXCLUSIVE; scan the prefix run for the key; if it
   is absent, walk back to its exact bytewise position on that leaf and insert. On no room, split.
   **Find-or-create is one serialised operation**: the directory holds one entry per equality class,
@@ -4472,23 +4480,43 @@ reads and at the cost of a comparison each, only what it would otherwise follow 
   terminate: a downlink to the page itself, or to one above it, used to send it round for ever;
 - a non-rightmost page has the high key every reader takes as its first item without looking;
 - the parent's right sibling that `lion_dir_downlink_present()` reads during a split repair is a
-  directory page at the parent's level, like every other page this file reads; and
+  directory page at the parent's level, like every other page this file reads;
 - an entry's `attno` names a key column the index has before `lion_search_key_exact()` takes that
   column's state, which `lion_column()` only Asserts: past the end of `ix->cols` the comparison would
-  have called whatever function pointers it found there.
+  have called whatever function pointers it found there;
+- *(2026-09-27 review)* a page reached through a link is not one this backend already holds, and
+  that is checked BEFORE the lock (`lion_dir_held_link()`), because a buffer content lock is neither
+  reentrant nor watched by the deadlock detector: a second lock on a page one holds waits for ever,
+  with every lock held. The walks that hold a page while they lock the next are the coupled steps
+  through a prefix run (the page stepped from and the find-or-create guard), a split's old right
+  sibling (the page being split and its new sibling), `lion_dir_place_again()` (the left half),
+  `lion_dir_downlink_present()` (the parent and the child being repaired) and
+  `lion_dir_find_parent()`, whose caller holds the child from the descent to the end of the scan; a
+  right link or downlink to one of those used to hang the backend; and
+- *(the same review)* a split's old right sibling is a directory page at the split page's level
+  before the split record writes its leftlink. It was not checked at all, so a damaged right link
+  had that write land on whatever page it named.
 
-A block number past the end, a right-link cycle and a damaged key datum are not caught here: the
-first fails in `ReadBuffer()`, the second walks until it is cancelled, and the third is the same
-risk every index AM takes with its own keys. "Until it is cancelled" is new as well: every step of
-a descent and of an uncoupled walk right now checks for interrupts BETWEEN the pages, with no content
-lock held. It used to check just after locking the next page, where the lock holds interrupts off,
-so a descent round a cycle of downlinks (the third case of the test below, before the level check
-refused it) ignored statement_timeout and pg_terminate_backend() alike and only SIGKILL stopped it. (The lock-coupled steps through a prefix run that spans pages
-still hold a lock at every point; they are bounded by that run.) `test/sql/corrupt.sql` damages a
-freshly built index's root on disk in the first three ways and checks that queries and inserts fail
-with INDEX_CORRUPTED and leave the relation's size alone; against the code before this review the
-first grew the index by a block per statement, the second answered from a line pointer past
-pd_lower, and the third never returned.
+A block number past the end and a damaged key datum are not caught here: the first fails in
+`ReadBuffer()`, and the second is the same risk every index AM takes with its own keys. A right-link
+cycle that an uncoupled walk follows walks until it is cancelled. "Until it is cancelled" is new as
+well: every step of a descent and of an uncoupled walk right now checks for interrupts BETWEEN the
+pages, with no content lock held. It used to check just after locking the next page, where the lock
+holds interrupts off, so a descent round a cycle of downlinks (the third case of the test below,
+before the level check refused it) ignored statement_timeout and pg_terminate_backend() alike and
+only SIGKILL stopped it. The walks that can NOT be cancelled, because they hold a page at every
+point - the coupled steps through a prefix run, and `lion_dir_find_parent()`'s walks right, under
+the child - are bounded instead (`LionRightWalk`, lion.h, 2026-09-27 review): a walk that only
+moves right never passes a page twice, since no page leaves a level and a split puts its new page
+to the right, so a walk that has taken more steps than the index has blocks is going round a cycle
+and is refused. The size is only asked for once a walk is 1024 pages long, and asked again whenever
+the walk outgrows it, since the index grows meanwhile. `test/sql/corrupt.sql` damages a freshly
+built index's root on disk in the first three ways of the list above and checks that queries and
+inserts fail with INDEX_CORRUPTED and leave the relation's size alone; against the code before that
+review the first grew the index by a block per statement, the second answered from a line pointer
+past pd_lower, and the third never returned. The cases the 2026-09-27 review added are not in that
+test yet, and neither is the root-split race above, which needs two backends and a split to land
+between one's meta-page read and its lock.
 
 ### Planner
 
@@ -4690,7 +4718,47 @@ Operations.
   makes a count wrong - it only makes VACUUM wait.
 - **Owner validation (§18) applies to internal pages as well**, and to the LEVEL: a leaf's right link
   always names another leaf, so a page above level 0 reached through one is treated exactly as a page
-  whose owner no longer matches - the end of the set.
+  whose owner no longer matches - the end of the set. *(Until the 2026-09-27 review
+  `lion_posting_search()` started its descent again there instead, and a damaged right link sent it
+  back to the same page for ever; it and `lion_posting_search_level()` now end the set.)*
+- **A link read from a posting page is data**, as §21's "Readers" says of the directory, and the
+  posting tree now checks what its descents and walks would otherwise follow blindly (2026-09-27
+  review; `lion_posting.c`, "POSTING-TREE LINKS ARE DATA"). Every failure is an ERROR,
+  INDEX_CORRUPTED:
+  - a pivot's line pointer is one whole pivot inside the page before it is read, and a non-rightmost
+    internal page has its high key (`lion_posting_pivot_at()`, `lion_posting_highkey_at()`) - the
+    binary search, the high key and the repair's scans used to take `lion_posting_pivot()` on
+    trust, and a damaged line pointer put the "pivot" up to 32 kB past the page;
+  - a downlink names a valid block (`lion_posting_downlink()`, which VACUUM's descent uses too), and
+    so do the head and tail an insert reads off its entry (`lion_insert_lock_chain_page()`):
+    InvalidBlockNumber is P_NEW, and `ReadBuffer()` EXTENDS the index when asked for it;
+  - a child is one level below its parent and a right sibling at its page's level. Only the root
+    changes level (the push-down), and the root is nobody's child or sibling, so this is exact.
+    VACUUM's descent, `lion_posting_level_start()` and `lion_posting_scan_for_downlink()` had no
+    level check at all. `lion_posting_search()` retries a mismatch as it retries the one real race,
+    a one-page root pushed down between its two locks, and COUNTS those restarts: more than
+    LION_POSTING_MAX_HEIGHT - more push-downs than a set's root can have in its whole life - is the
+    ERROR. Finishing an unfinished split is not counted, because each one clears a flag for good and
+    writers of the key serialise. Before the bound, a downlink to the root or to the page itself
+    restarted the descent for ever;
+  - a page reached through a link is not one the backend already holds, checked before the lock: the
+    insert's head and tail against the directory leaf it holds, the repair's scan for a downlink and
+    `lion_posting_level_start()` against the child being repaired, `lion_posting_downlink_present()`
+    against the parent and the child, and a flagged page's right sibling against the page itself. A
+    repair that recurses up several levels holds a page per level and checks only the nearest, and a
+    link from inside the tree to the entry's directory leaf is caught only when it is the head or
+    the tail; both are double faults this does not chase;
+  - and a walk right along a level ends (`LionRightWalk`, lion.h): a walk that only moves right
+    never passes a page twice, since no page leaves a level of a live set and a split puts its new
+    page to the right, so one that has taken more steps than the index has blocks is going round a
+    cycle of right links, and is refused. The index's size is asked for only once a walk is 1024
+    pages long.
+
+  "For ever" meant UNCANCELLABLE on every writer's path, which is why the bounds, and not the checks
+  for interrupts, are what matter there: a writer holds the key's directory leaf throughout, a held
+  content lock holds interrupts off, and every other writer of the leaf, VACUUM and the checkpointer
+  queued behind it. The descents' checks for interrupts now run between pages, with none of the
+  descent's own locks held, which is what lets a READER be cancelled.
 - **Bulk build**: leaves are written left to right as before, and the internal levels are built
   bottom-up in the same pass, one open page per level, through the bulk-write API (nbtree's
   `_bt_buildadd` shape, which is what §21's directory build already does). A set that fits one page
@@ -9684,7 +9752,13 @@ them stays without them.
 **Upgrade.** Existing indexes are format 6 and keep working unchanged, walking keys as §28 does;
 `REINDEX` with the option adds summaries. **Downgrade:** a build before this one refuses a format 7
 index (its version check), so an index with summaries has to be rebuilt with `summaries = off`
-before going back.
+before going back. *(Since the 2026-09-27 review the hint with which a build refuses a version it
+does not know says which way the version differs - an index too old for the build is REINDEXed,
+and one a NEWER build wrote is read by that build or rebuilt by this one - where every unknown
+version used to be told that it "predates this build". `lion_read_meta()` also checks the size of
+the meta page's special area before it reads the page flags there: the buffer manager accepts any
+pd_special up to BLCKSZ, and a damaged one had the flags read from past the page on every open of
+the index.)*
 
 ### Build (lion_build.c)
 

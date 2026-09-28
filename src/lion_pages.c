@@ -408,13 +408,27 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	Buffer		buf;
 	Page		page;
 	LionMetaPageData *ondisk;
+	uint16		special;
 
 	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	if (PageIsNew(page) || !LionPageIsMeta(page) ||
-		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
+	/*
+	 * The special area's SIZE is checked before anything reads it.  The
+	 * buffer manager's page check accepts any pd_special up to BLCKSZ, so a
+	 * damaged meta page - or one of another format, whose special area had
+	 * another size - would otherwise have the opaque read past the end of the
+	 * page.  The meta data itself sits right after the page header in every
+	 * format, so a page of the wrong size is still read for its magic and
+	 * version: an index of an older or newer format gets the message about
+	 * its version below, which is the one that says what to do.
+	 */
+	special = PageIsNew(page) ? 0 : PageGetSpecialSize(page);
+	if (PageIsNew(page) ||
+		(special == LION_SPECIAL_SIZE &&
+		 (!LionPageIsMeta(page) ||
+		  LionPageGetOpaque(page)->page_id != LION_PAGE_ID)))
 	{
 		UnlockReleaseBuffer(buf);
 		ereport(ERROR,
@@ -432,11 +446,18 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	 * sets (DESIGN.md §32): both are read, and a version 6 index is one whose
 	 * columns have no summaries.  Anything older predates a format change that
 	 * moved or reinterpreted items, and anything newer is a format this build
-	 * does not know.
+	 * does not know - and the hint says which of the two it is, since REINDEX
+	 * with this build is the way out of either, but the reason differs.
 	 */
-	if (meta->magic != LION_MAGIC ||
-		(meta->version != LION_VERSION &&
-		 meta->version != LION_VERSION_SUMMARIES))
+	if (meta->magic != LION_MAGIC)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Meta page magic %08X, expected %08X.",
+						   meta->magic, LION_MAGIC)));
+	if (meta->version != LION_VERSION &&
+		meta->version != LION_VERSION_SUMMARIES)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
@@ -444,7 +465,18 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 				 errdetail("Meta page magic %08X version %u, expected %08X version %u or %u.",
 						   meta->magic, meta->version, LION_MAGIC, LION_VERSION,
 						   LION_VERSION_SUMMARIES),
-				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.")));
+				 meta->version < LION_VERSION ?
+				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
+				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
+
+	/* The right version, and a special area of the wrong size: damage. */
+	if (special != LION_SPECIAL_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Its meta page has a special area of %u bytes, expected %u.",
+						   (unsigned) special, (unsigned) LION_SPECIAL_SIZE)));
 
 	/*
 	 * The summary words (§32) must agree with the version: a version 6 meta

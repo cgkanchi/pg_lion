@@ -92,9 +92,9 @@ static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumb
 										 LionEntryTuple *entry, Size entrysize,
 										 uint16 lo, bool *done);
 static Buffer lion_insert_lock_chain_page(Relation index, Relation heaprel,
-										  uint32 hash, BlockNumber head,
-										  BlockNumber tail, uint32 ckey,
-										  bool *ontail);
+										  BlockNumber entryblk, uint32 hash,
+										  BlockNumber head, BlockNumber tail,
+										  uint32 ckey, bool *ontail);
 static bool lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 								   Buffer entrybuf, OffsetNumber entryoff,
 								   LionEntryTuple *ecopy, Size esize,
@@ -871,16 +871,29 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
  *
  * Nothing is held while descending: the tail lock is dropped first, so no page
  * is ever locked before a page to its left (DESIGN.md §22 rule 3).
+ *
+ * entryblk is the directory leaf the caller holds EXCLUSIVE.  The entry's
+ * head and tail are links read off it, and data like any other (DESIGN.md
+ * §21, "Readers"): InvalidBlockNumber is P_NEW, which ReadBuffer() answers by
+ * EXTENDING the index, once per insert, and a link to the leaf itself would
+ * lock it a second time and wait for this backend for ever.  Both are refused
+ * before anything is read; a block past the end fails in ReadBuffer().
  */
 static Buffer
-lion_insert_lock_chain_page(Relation index, Relation heaprel, uint32 hash,
+lion_insert_lock_chain_page(Relation index, Relation heaprel,
+						   BlockNumber entryblk, uint32 hash,
 						   BlockNumber head, BlockNumber tail, uint32 ckey,
 						   bool *ontail)
 {
 	Buffer		buf;
 	Page		page;
 
-	Assert(BlockNumberIsValid(head) && BlockNumberIsValid(tail));
+	if (unlikely(!BlockNumberIsValid(head) || !BlockNumberIsValid(tail) ||
+				 head == entryblk || tail == entryblk))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": a chain entry on block %u links to head %u and tail %u, and one of them cannot be a page of its posting set",
+						RelationGetRelationName(index), entryblk, head, tail)));
 
 	buf = ReadBuffer(index, tail);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -1086,8 +1099,10 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-	buf = lion_insert_lock_chain_page(index, heaprel, ecopy->hash, ecopy->head,
-									 ecopy->tail, ckey, &ontail);
+	buf = lion_insert_lock_chain_page(index, heaprel,
+									 BufferGetBlockNumber(entrybuf),
+									 ecopy->hash, ecopy->head, ecopy->tail,
+									 ckey, &ontail);
 
 	if (!lion_insert_chain_leaf(index, heaprel, buf, entrybuf, entryoff, ecopy,
 								esize, cbuf, ckey, lo, !ontail))

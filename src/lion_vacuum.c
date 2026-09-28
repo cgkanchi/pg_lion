@@ -1283,12 +1283,12 @@ lion_vacuum_descend(LionVacState *vs, const LionVacEntry *ent)
 {
 	BlockNumber blk = ent->head;
 	int			depth = 0;
+	int			expect = -1;	/* the level blk must be at; the root's is its own */
 
 	for (;;)
 	{
 		Buffer		buf;
 		Page		page;
-		OffsetNumber first;
 		BlockNumber child;
 		instr_time	t0;
 
@@ -1310,27 +1310,51 @@ lion_vacuum_descend(LionVacState *vs, const LionVacEntry *ent)
 				 RelationGetRelationName(vs->index), blk, ent->head);
 		}
 
+		/*
+		 * A child is one level below its parent (DESIGN.md §22): only the
+		 * root changes level, and a root push-down between two steps of this
+		 * descent leaves the child it moved under still one below the page
+		 * that pointed at it.  Anything else is a downlink to the wrong page.
+		 */
+		if (expect >= 0 && (int) LionPageGetOpaque(page)->level != expect)
+		{
+			uint16		level = LionPageGetOpaque(page)->level;
+
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": posting block %u is at level %u, but the link to it expects level %d",
+							RelationGetRelationName(vs->index), blk, level,
+							expect)));
+		}
+
 		if (LionPageIsPostingLeaf(page))
 		{
 			UnlockReleaseBuffer(buf);
 			return blk;
 		}
 
+		if (depth > LION_POSTING_MAX_HEIGHT)
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the posting set at %u is more than %d levels deep",
+							RelationGetRelationName(vs->index), ent->head,
+							LION_POSTING_MAX_HEIGHT)));
+		}
+
 		/*
 		 * The leftmost downlink: the first item after the high key, whose
 		 * separator is minus infinity on the leftmost page of every level.
 		 * A split of this page moves its UPPER half away, so the leftmost
-		 * downlink stays here.
+		 * downlink stays here.  It is checked before it is followed, which
+		 * matters most for InvalidBlockNumber: ReadBuffer() takes that for
+		 * P_NEW and would EXTEND the index (lion_posting_downlink()).
 		 */
-		first = lion_posting_first_data(page);
-		if (first > PageGetMaxOffsetNumber(page) ||
-			depth > LION_POSTING_MAX_HEIGHT)
-		{
-			UnlockReleaseBuffer(buf);
-			elog(ERROR, "lion index \"%s\": internal posting page %u of the set at %u has no downlink",
-				 RelationGetRelationName(vs->index), blk, ent->head);
-		}
-		child = lion_posting_pivot(page, first)->child;
+		child = lion_posting_downlink(vs->index, page, blk,
+									  lion_posting_first_data(page));
+		expect = LionPageGetOpaque(page)->level - 1;
 		lion_vac_visit(vs, blk);
 		UnlockReleaseBuffer(buf);
 		lion_wal_visit(vs->index, blk);
