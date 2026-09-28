@@ -635,7 +635,7 @@ SELECT lion_gj('SELECT f1.fk, count(*) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1
 
 -- an inner join inside an EXISTS of the dimension, and nested EXISTS there:
 -- the dimension's rows are still its table's, each once
-SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 JOIN lion_gj_n n ON n.k = f1.fk WHERE f1.fk = d.pk AND n.attr = 2)');
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 JOIN lion_gj_n n ON n.k = f1.fk WHERE f1.fk = d.pk AND n.attr = 2)');
        lion_gj       
 ---------------------
  pushed down, 1 rows
@@ -1019,7 +1019,7 @@ SELECT lion_gj('SELECT count(*) FROM lion_gj_d d LEFT JOIN (SELECT n.k, 1 AS one
 (1 row)
 
 -- a LATERAL reference
-SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1, LATERAL (SELECT n.attr FROM lion_gj_n n WHERE n.k = f1.fk ORDER BY n.attr LIMIT 1) s WHERE f1.fk = d.pk AND s.attr = 2)');
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d, LATERAL (SELECT n.attr FROM lion_gj_n n WHERE n.k = d.pk ORDER BY n.attr LIMIT 1) s WHERE d.pk < 300 AND s.attr = 2 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = 1)');
          lion_gj         
 -------------------------
  not pushed down, 1 rows

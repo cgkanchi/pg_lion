@@ -421,7 +421,7 @@ SELECT lion_gj('SELECT d.region, count(*), sum(d.small), count(d.attr) FROM lion
 SELECT lion_gj('SELECT f1.fk, count(*) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind = ''b'' AND f1.x = 4 AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 1) GROUP BY f1.fk');
 -- an inner join inside an EXISTS of the dimension, and nested EXISTS there:
 -- the dimension's rows are still its table's, each once
-SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 JOIN lion_gj_n n ON n.k = f1.fk WHERE f1.fk = d.pk AND n.attr = 2)');
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 JOIN lion_gj_n n ON n.k = f1.fk WHERE f1.fk = d.pk AND n.attr = 2)');
 SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = 1 AND EXISTS (SELECT 1 FROM lion_gj_n n WHERE n.k = f1.fk AND n.attr = f1.x))');
 -- the answers themselves, of (A) both ways and of (B)
 SELECT * FROM lion_gj_val('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
@@ -584,7 +584,7 @@ SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d
 SELECT lion_gj('SELECT count(*) FROM lion_gj_d d LEFT JOIN lion_gj_n n ON n.k = d.pk WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
 SELECT lion_gj('SELECT count(*) FROM lion_gj_d d LEFT JOIN (SELECT n.k, 1 AS one FROM lion_gj_n n) s ON s.k = d.pk WHERE d.pk < 300 AND s.one IS NULL AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
 -- a LATERAL reference
-SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1, LATERAL (SELECT n.attr FROM lion_gj_n n WHERE n.k = f1.fk ORDER BY n.attr LIMIT 1) s WHERE f1.fk = d.pk AND s.attr = 2)');
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d, LATERAL (SELECT n.attr FROM lion_gj_n n WHERE n.k = d.pk ORDER BY n.attr LIMIT 1) s WHERE d.pk < 300 AND s.attr = 2 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = 1)');
 -- a join clause that is not the one fk equality: a second one, and the other
 -- fact's EXISTS correlated to the fact
 SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = d.attr)');
