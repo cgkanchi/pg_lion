@@ -25,7 +25,6 @@
 #include <float.h>
 
 #include "utils/guc.h"
-#include "utils/guc_tables.h"
 #include "utils/memutils.h"
 
 #include "lion_costs.h"
@@ -162,10 +161,10 @@ static const LionCostSetting lion_cost_settings[] = {
 
 /*
  * Register the settings, from _PG_init.  They are user settings, real-valued
- * from 0 to DBL_MAX as core's cost settings are, shown by EXPLAIN (SETTINGS)
- * when changed, and listed in core's group of them: a custom setting is
- * always put in CUSTOM_OPTIONS, which no API changes, so the group is set on
- * the registered record itself.
+ * from 0 to DBL_MAX as core's cost settings are, and shown by EXPLAIN
+ * (SETTINGS) when changed.  pg_settings lists them among the customized
+ * options, as it does every extension's: no API puts a custom setting in one
+ * of core's groups, and core's own records are not an extension's to edit.
  */
 void
 lion_costs_init(void)
@@ -176,7 +175,6 @@ lion_costs_init(void)
 	for (i = 0; i < (int) lengthof(lion_cost_settings); i++)
 	{
 		const LionCostSetting *s = &lion_cost_settings[i];
-		struct config_generic *record;
 
 		/* the setting keeps the description: it is made once, and kept */
 		DefineCustomRealVariable(s->name,
@@ -189,10 +187,6 @@ lion_costs_init(void)
 								 PGC_USERSET,
 								 GUC_EXPLAIN,
 								 NULL, NULL, NULL);
-
-		record = find_option(s->name, false, true, ERROR);
-		if (record != NULL)
-			record->group = QUERY_TUNING_COST;
 	}
 
 	MemoryContextSwitchTo(oldcxt);
