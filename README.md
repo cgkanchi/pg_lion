@@ -159,7 +159,13 @@ A `GROUP BY` with several filters (`SELECT country, count(*) FROM events WHERE e
 partition, and counts each group against that one set, so the filters' index pages are read once
 rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when it did (DESIGN.md
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
-to a temporary file past it.
+to a temporary file past it. The groups are then counted against it up to a few hundred at a time,
+in one pass over its containers for all of them (`Group Batches` in `EXPLAIN ANALYZE`). With
+parallel query enabled (`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can
+run in parallel: the workers divide the table's blocks into ranges, each collects the filters of
+its ranges and counts every group there, and a `Finalize HashAggregate` above the `Gather` adds
+the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
+ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
 
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
@@ -454,8 +460,11 @@ working around a bad choice:
   number.
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
-scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`
-(superuser), how many visited-block ranges VACUUM batches in rmgr mode (DESIGN.md §25).
+scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
+fewest container keys - of 64 heap blocks each - a range of a parallel count covers when it runs
+(DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default), and
+`pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
+mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
 
 Cost settings, for calibrating Lion's cost model on your own workload the way `random_page_cost`

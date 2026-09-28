@@ -285,7 +285,7 @@ bits_clear(uint64 *w, uint32 lo)
 	w[lo >> 6] &= ~(UINT64CONST(1) << (lo & 63));
 }
 
-static void
+static inline void
 bits_set_range(uint64 *w, uint32 lo, uint32 hi)
 {
 	uint32		wlo = lo >> 6;
@@ -507,8 +507,35 @@ array_upper_bound(const uint16 *arr, uint32 n, uint32 key)
 }
 
 /*
+ * array_lower_bound() without a branch to mispredict at every step: the base
+ * moves by a conditional move, and only the loop's own count decides when it
+ * ends.  The count engine searches a large ARRAY for each member of a small
+ * one at keys that follow no pattern - a group's container against the
+ * WHERE's, DESIGN.md §10 - where a mispredicted step costs more than the
+ * comparison it decides.  For a well-formed (ascending) array it returns what
+ * array_lower_bound() returns.
+ */
+static inline uint32
+array_lower_bound_bl(const uint16 *arr, uint32 n, uint32 key)
+{
+	const uint16 *base = arr;
+
+	if (n == 0)
+		return 0;
+	while (n > 1)
+	{
+		uint32		half = n / 2;
+
+		base = ((uint32) base[half] < key) ? base + half : base;
+		n -= half;
+	}
+	return (uint32) (base - arr) + ((uint32) *base < key ? 1 : 0);
+}
+
+/*
  * Exponential ("galloping") search: first index i >= from with arr[i] >= key.
- * Used when intersecting arrays of very different sizes.
+ * Used when intersecting arrays of very different sizes.  The search inside
+ * the window the gallop found is the branch-free one.
  */
 static uint32
 array_gallop(const uint16 *arr, uint32 n, uint32 from, uint32 key)
@@ -529,7 +556,7 @@ array_gallop(const uint16 *arr, uint32 n, uint32 from, uint32 key)
 		step *= 2;
 	}
 	hi = (from + step < n) ? from + step : n;
-	return lo + 1 + array_lower_bound(arr + lo + 1, hi - lo - 1, key);
+	return lo + 1 + array_lower_bound_bl(arr + lo + 1, hi - lo - 1, key);
 }
 
 
@@ -2099,22 +2126,77 @@ array_out(uint16 lo)
 	return (uint16) (lo & LION_LO_MASK);
 }
 
-/* Intersection of two sorted arrays; out gets at most min(na, nb) values. */
+/* Branch-free: every member is written, and kept when its bit is set. */
+static uint32
+array_and_bitset(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	for (i = 0; i < na; i++)
+	{
+		out[n] = array_out(arr[i]);
+		n += bits_test(w, arr[i]) ? 1 : 0;
+	}
+	return n;
+}
+
+/*
+ * HOW TWO SIDES OF AN AND MEET (the count engine's merges, DESIGN.md §15,
+ * "Unions and intersections unoptimized").  A merge of two sorted sides is a
+ * chain of dependent steps - each comparison decides where the next loads
+ * are - and costs 2.5 to 4 ns a step however it is branched, measured on
+ * containers of a heap of 34 rows a block.  Setting the larger side's members
+ * in a bitset image and testing the smaller side's against it are
+ * independent steps, about a nanosecond each, after a fixed 4 KB clear: three
+ * to four times faster than the merge for two ARRAYs of a hundred members or
+ * more (1,035 x 1,022 members: 4.2 us merged, 1.8 as an image) and for an
+ * ARRAY against a dense column's RUN (591 members against 400 runs: 4.3 us,
+ * 1.1).  The merge stays for two small sides, where the clear would cost more
+ * than the steps; and a few members against many are searched for instead -
+ * galloped through a large ARRAY, or each looked up in a RUN's runs by a
+ * branch-free binary search (8 members against 400 runs: 1.1 us merged,
+ * 0.06 searched).  The thresholds are those measurements'.
+ */
+#define LION_AND_MERGE_MAX		48	/* both sides together, at most: merge */
+#define LION_AND_SEARCH_RATIO	8	/* fewer than 1/8 of the other side (plus
+									 * the clear's worth): search, not image */
+#define LION_AND_SEARCH_SLACK	64
+
+/* The larger ARRAY's members as an image, and the smaller's tested against it. */
+static uint32
+array_and_image(const uint16 *small, uint32 nsmall, const uint16 *large,
+				uint32 nlarge, uint16 *out)
+{
+	uint64		w[LION_BITSET_WORDS];
+	uint32		i;
+
+	memset(w, 0, sizeof(w));
+	for (i = 0; i < nlarge; i++)
+		bits_set(w, large[i]);
+	return array_and_bitset(small, nsmall, w, out);
+}
+
+/*
+ * Intersection of two sorted arrays; out gets at most min(na, nb) values, in
+ * the order of the smaller side's (both ascending for well-formed operands).
+ */
 static uint32
 array_intersect(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 				uint16 *out)
 {
+	const uint16 *small = (na <= nb) ? a : b;
+	const uint16 *large = (na <= nb) ? b : a;
+	uint32		nsmall = (na <= nb) ? na : nb;
+	uint32		nlarge = (na <= nb) ? nb : na;
 	uint32		n = 0;
 	uint32		i = 0;
 	uint32		j = 0;
 
-	/* very different sizes: gallop through the larger array */
-	if (na > nb * 8 || nb > na * 8)
+	/* a few members against many: gallop through the larger array */
+	if (nsmall * LION_AND_SEARCH_RATIO <= nlarge + LION_AND_SEARCH_SLACK &&
+		nlarge > nsmall * 8)
 	{
-		const uint16 *small = (na <= nb) ? a : b;
-		const uint16 *large = (na <= nb) ? b : a;
-		uint32		nsmall = (na <= nb) ? na : nb;
-		uint32		nlarge = (na <= nb) ? nb : na;
 		uint32		li = 0;
 
 		for (i = 0; i < nsmall; i++)
@@ -2128,23 +2210,36 @@ array_intersect(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 		return n;
 	}
 
+	if (na + nb > LION_AND_MERGE_MAX)
+		return array_and_image(small, nsmall, large, nlarge, out);
+
+	/*
+	 * The merge of two small arrays, without a branch on the comparison:
+	 * whether a member is written, and which side steps, are sums of
+	 * comparisons.  out[n] is written at every step and kept only on a
+	 * match; n never reaches min(na, nb) while the loop runs, so the write
+	 * stays inside the result's room.  The steps are exactly those of the
+	 * three-way branch it replaces, for any input.
+	 */
 	while (i < na && j < nb)
 	{
-		if (a[i] < b[j])
-			i++;
-		else if (a[i] > b[j])
-			j++;
-		else
-		{
-			out[n++] = array_out(a[i]);
-			i++;
-			j++;
-		}
+		uint16		va = a[i];
+		uint16		vb = b[j];
+
+		out[n] = array_out(va);
+		n += (va == vb);
+		i += (va <= vb);
+		j += (vb <= va);
 	}
 	return n;
 }
 
-/* Union of two sorted arrays. */
+/*
+ * Union of two sorted arrays.  The merge writes the smaller of the two heads
+ * and steps the side (or sides, on a tie) it came from, without a branch on
+ * the comparison - the steps of the three-way branch it replaces, for any
+ * input.
+ */
 static uint32
 array_union(const uint16 *a, uint32 na, const uint16 *b, uint32 nb, uint16 *out)
 {
@@ -2154,15 +2249,12 @@ array_union(const uint16 *a, uint32 na, const uint16 *b, uint32 nb, uint16 *out)
 
 	while (i < na && j < nb)
 	{
-		if (a[i] < b[j])
-			out[n++] = array_out(a[i++]);
-		else if (a[i] > b[j])
-			out[n++] = array_out(b[j++]);
-		else
-		{
-			out[n++] = array_out(a[i++]);
-			j++;
-		}
+		uint16		va = a[i];
+		uint16		vb = b[j];
+
+		out[n++] = array_out(va <= vb ? va : vb);
+		i += (va <= vb);
+		j += (vb <= va);
 	}
 	while (i < na)
 		out[n++] = array_out(a[i++]);
@@ -2197,7 +2289,38 @@ array_difference(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 	return n;
 }
 
-/* Members of arr that are (not) in the run container rc. */
+/*
+ * Is v in a run of runs[0 .. nruns - 1] (nruns > 0)?  A branch-free binary
+ * search for the last run that starts at or below v.  For damaged runs the
+ * answer is unspecified, and the search stays inside the runs.
+ */
+static inline bool
+run_has_member(const LionRun *runs, uint32 nruns, uint32 v)
+{
+	const LionRun *base = runs;
+
+	while (nruns > 1)
+	{
+		uint32		half = nruns / 2;
+
+		base = ((uint32) base[half].start <= v) ? base + half : base;
+		nruns -= half;
+	}
+	return (uint32) base->start <= v && (int32) v <= run_end(base);
+}
+
+/*
+ * Members of arr that are (not) in the run container rc.
+ *
+ * The AND takes one of three ways (see "how two sides of an AND meet" above):
+ * a few members are each looked up in the runs; many are tested against an
+ * image of the runs; two small sides are merged, without a branch on the
+ * comparison - a member at or below the current run's end steps the array,
+ * and is written when it is also at or above its start, one past the end
+ * steps the runs (for a well-formed run the three-way branch's steps; a
+ * damaged run that ends before it starts is passed over where the branch
+ * stepped the array).  Each writes at most one member per member of arr.
+ */
 static uint32
 array_and_run(const uint16 *arr, uint32 na, const LionContainer *rc, uint16 *out)
 {
@@ -2207,14 +2330,39 @@ array_and_run(const uint16 *arr, uint32 na, const LionContainer *rc, uint16 *out
 	uint32		j = 0;
 	uint32		n = 0;
 
+	if (nruns == 0 || na == 0)
+		return 0;
+
+	if (na + nruns > LION_AND_MERGE_MAX)
+	{
+		if (na * LION_AND_SEARCH_RATIO <= nruns + LION_AND_SEARCH_SLACK)
+		{
+			for (i = 0; i < na; i++)
+			{
+				out[n] = array_out(arr[i]);
+				n += run_has_member(runs, nruns, arr[i]) ? 1 : 0;
+			}
+			return n;
+		}
+		else
+		{
+			uint64		w[LION_BITSET_WORDS];
+
+			memset(w, 0, sizeof(w));
+			container_or_bitset(rc, w);
+			return array_and_bitset(arr, na, w, out);
+		}
+	}
+
 	while (i < na && j < nruns)
 	{
-		if ((int32) arr[i] < (int32) runs[j].start)
-			i++;
-		else if ((int32) arr[i] > run_end(&runs[j]))
-			j++;
-		else
-			out[n++] = array_out(arr[i++]);
+		int32		v = (int32) arr[i];
+		uint32		inrun = (v <= run_end(&runs[j]));
+
+		out[n] = array_out(arr[i]);
+		n += inrun & (v >= (int32) runs[j].start);
+		i += inrun;
+		j += inrun ^ 1;
 	}
 	return n;
 }
@@ -2240,18 +2388,6 @@ array_andnot_run(const uint16 *arr, uint32 na, const LionContainer *rc,
 	}
 	while (i < na)
 		out[n++] = array_out(arr[i++]);
-	return n;
-}
-
-static uint32
-array_and_bitset(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
-{
-	uint32		n = 0;
-	uint32		i;
-
-	for (i = 0; i < na; i++)
-		if (bits_test(w, arr[i]))
-			out[n++] = array_out(arr[i]);
 	return n;
 }
 
@@ -2647,6 +2783,227 @@ lion_container_andnot(const LionContainer *a, const LionContainer *b,
 	return container_emit_result(o, dest);
 }
 
+/*
+ * THE SET ALGEBRA UNOPTIMIZED (lion_container.h).  Each is its optimizing
+ * twin above without container_emit_result(): the result is written straight
+ * into dest in the representation the operation builds it in, and is not
+ * searched for a smaller one.  The count engine's merge ANDs a container with
+ * the next source's and hands the result on at once - to the next AND, to
+ * the visibility map, to a count - where optimizing each intermediate result
+ * cost a count of its runs and, as often as not, a conversion the next
+ * operation undid: an ARRAY of a dense column's members turned into a RUN,
+ * only to be filled into a bitset image by the OR after it.  On the synthetic
+ * repro's filter of six clauses, over a heap of 34 rows a page, that was most
+ * of the count's time (DESIGN.md §15, "Unions and intersections
+ * unoptimized").
+ */
+uint32
+lion_container_and_raw(const LionContainer *a, const LionContainer *b,
+					   LionContainer *dest)
+{
+	uint32		n;
+
+	Assert(a->ckey == b->ckey);
+	Assert(dest != a && dest != b);
+
+	if (a->cardinality != 0 && b->cardinality != 0)
+	{
+		if (a->type == LION_CT_ARRAY && array_card(a) <= LION_AND_PROBE_MAX)
+			return container_and_probe(a, b, a->ckey, dest);
+		if (b->type == LION_CT_ARRAY && array_card(b) <= LION_AND_PROBE_MAX)
+			return container_and_probe(b, a, a->ckey, dest);
+	}
+
+	lion_container_init(dest, a->ckey);
+
+	if (a->cardinality == 0 || b->cardinality == 0)
+		return 0;
+
+	if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
+	{
+		const LionContainer *arr = (a->type == LION_CT_ARRAY) ? a : b;
+		const LionContainer *oth = (a->type == LION_CT_ARRAY) ? b : a;
+		uint16	   *out = array_mdata(dest);
+
+		if (oth->type == LION_CT_ARRAY)
+			n = array_intersect(array_cdata(a), array_card(a),
+								array_cdata(b), array_card(b), out);
+		else if (oth->type == LION_CT_BITSET)
+			n = array_and_bitset(array_cdata(arr), array_card(arr),
+								 bitset_cdata(oth), out);
+		else
+			n = array_and_run(array_cdata(arr), array_card(arr), oth, out);
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+
+	if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
+		run_and_run(a, b, dest))
+		return dest->cardinality;
+
+	{
+		uint64	   *w = bitset_mdata(dest);
+
+		/* a BITSET operand is copied and the other ANDed in */
+		if (b->type == LION_CT_BITSET)
+		{
+			container_fill_bitset(b, w);
+			container_and_bitset(a, w);
+		}
+		else
+		{
+			container_fill_bitset(a, w);
+			container_and_bitset(b, w);
+		}
+		dest->type = LION_CT_BITSET;
+		n = bits_cardinality(w);
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+}
+
+uint32
+lion_container_andnot_raw(const LionContainer *a, const LionContainer *b,
+						  LionContainer *dest)
+{
+	uint32		n;
+
+	Assert(a->ckey == b->ckey);
+	Assert(dest != a && dest != b);
+
+	lion_container_init(dest, a->ckey);
+
+	if (a->cardinality == 0)
+		return 0;
+	if (b->cardinality == 0)
+	{
+		container_copy(a, dest);
+		dest->ckey = a->ckey;
+		dest->flags = 0;
+		return dest->cardinality;
+	}
+	if (a->type == LION_CT_ARRAY)
+	{
+		uint16	   *out = array_mdata(dest);
+
+		if (b->type == LION_CT_ARRAY)
+			n = array_difference(array_cdata(a), array_card(a),
+								 array_cdata(b), array_card(b), out);
+		else if (b->type == LION_CT_BITSET)
+			n = array_andnot_bitset(array_cdata(a), array_card(a),
+									bitset_cdata(b), out);
+		else
+			n = array_andnot_run(array_cdata(a), array_card(a), b, out);
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+
+	{
+		uint64	   *w = bitset_mdata(dest);
+
+		container_fill_bitset(a, w);
+		container_andnot_bitset(b, w);
+		dest->type = LION_CT_BITSET;
+		n = bits_cardinality(w);
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+}
+
+uint32
+lion_container_or_raw(const LionContainer *a, const LionContainer *b,
+					  LionContainer *dest)
+{
+	uint32		n;
+
+	Assert(a->ckey == b->ckey);
+	Assert(dest != a && dest != b);
+
+	lion_container_init(dest, a->ckey);
+
+	if (a->type == LION_CT_ARRAY && b->type == LION_CT_ARRAY &&
+		array_card(a) + array_card(b) <= LION_ARRAY_MAX_CARD)
+	{
+		n = array_union(array_cdata(a), array_card(a),
+						array_cdata(b), array_card(b), array_mdata(dest));
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+	if (a->cardinality == 0 || b->cardinality == 0)
+	{
+		container_copy((a->cardinality == 0) ? b : a, dest);
+		dest->ckey = a->ckey;
+		dest->flags = 0;
+		return dest->cardinality;
+	}
+
+	{
+		uint64	   *w = bitset_mdata(dest);
+
+		container_fill_bitset(a, w);
+		container_or_bitset(b, w);
+		dest->type = LION_CT_BITSET;
+		n = bits_cardinality(w);
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+}
+
+/*
+ * How many members of an ARRAY c are set in the image w, and in *blocks which
+ * heap blocks they lie on - the cardinality and lion_container_block_mask()
+ * of the intersection, without writing it.  The count engine's grouped walk
+ * (DESIGN.md §10, "The groups of a walk, counted together") tests every
+ * group's container at a key against one image of the WHERE's there, and
+ * needs no more than this of an intersection whose blocks the visibility map
+ * vouches for.  Branch-free; a member is masked into range as iterate() and
+ * block_mask() take it, so *blocks has no bit at or above
+ * LION_BLOCKS_PER_CONTAINER.
+ */
+uint32
+lion_container_and_image_count(const LionContainer *c, const uint64 *w,
+							   uint64 *blocks)
+{
+	const uint16 *arr = array_cdata(c);
+	uint32		n = array_card(c);
+	uint32		card = 0;
+	uint64		mask = 0;
+	uint32		i;
+
+	Assert(c->type == LION_CT_ARRAY);
+	for (i = 0; i < n; i++)
+	{
+		uint32		lo = arr[i] & LION_LO_MASK;
+		uint64		hit = (w[lo >> 6] >> (lo & 63)) & 1;
+
+		card += (uint32) hit;
+		mask |= hit << (lo >> LION_OFFSET_BITS);
+	}
+	*blocks = mask;
+	return card;
+}
+
+void
+lion_container_bitset_init(LionContainer *dest, uint32 ckey)
+{
+	dest->ckey = ckey;
+	dest->cardinality = 0;
+	dest->type = LION_CT_BITSET;
+	dest->flags = 0;
+	memset(bitset_mdata(dest), 0, LION_BITSET_BYTES);
+}
+
+uint32
+lion_container_bitset_recount(LionContainer *c)
+{
+	uint32		n;
+
+	Assert(c->type == LION_CT_BITSET);
+	n = bits_cardinality(bitset_cdata(c));
+	c->cardinality = (uint16) n;
+	return n;
+}
+
 uint32
 lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 {
@@ -2693,18 +3050,15 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 			uint32		x = 0;
 			uint32		y = 0;
 
+			/* branch-free, as array_intersect()'s merge */
 			while (x < na && y < nb)
 			{
-				if (ba[x] < bb[y])
-					x++;
-				else if (ba[x] > bb[y])
-					y++;
-				else
-				{
-					card++;
-					x++;
-					y++;
-				}
+				uint16		va = ba[x];
+				uint16		vb = bb[y];
+
+				card += (va == vb);
+				x += (va <= vb);
+				y += (vb <= va);
 			}
 			return card;
 		}
@@ -2713,11 +3067,10 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 			const uint64 *w = bitset_cdata(oth);
 
 			for (i = 0; i < n; i++)
-				if (bits_test(w, data[i]))
-					card++;
+				card += bits_test(w, data[i]) ? 1 : 0;
 			return card;
 		}
-		/* ARRAY x RUN */
+		/* ARRAY x RUN, branch-free as array_and_run() */
 		{
 			const LionRun *runs = run_cdata(oth);
 			uint32		nruns = run_nruns(oth);
@@ -2726,15 +3079,12 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 			i = 0;
 			while (i < n && j < nruns)
 			{
-				if ((int32) data[i] < (int32) runs[j].start)
-					i++;
-				else if ((int32) data[i] > run_end(&runs[j]))
-					j++;
-				else
-				{
-					card++;
-					i++;
-				}
+				int32		v = (int32) data[i];
+				uint32		inrun = (v <= run_end(&runs[j]));
+
+				card += inrun & (v >= (int32) runs[j].start);
+				i += inrun;
+				j += inrun ^ 1;
 			}
 			return card;
 		}
