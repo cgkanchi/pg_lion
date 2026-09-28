@@ -114,6 +114,65 @@ lion_ordering_op_is_lt(Oid ltopr, Oid *opfamily, Oid *opcintype)
 #endif
 
 /*
+ * The same question of many TIDs of one relation in a row, the planner's
+ * endpoint probe's (DESIGN.md §28).  16-19's table_index_fetch_tuple_check()
+ * creates a fetch state and a slot for every TID it is asked about and drops
+ * both, and the pin on the page with them; here one of each serves all the
+ * TIDs, and the pin is kept while they stay on a page, as an index scan
+ * keeps it.  19 gave table_index_fetch_begin() scan options, of which this
+ * passes none, as table_index_fetch_tuple_check() does.  20's
+ * table_fetch_tid() creates neither, and is called as it is.
+ */
+typedef struct LionTidFetch
+{
+	Relation	rel;
+#if PG_VERSION_NUM < 200000
+	struct IndexFetchTableData *fetch;
+	TupleTableSlot *slot;
+#endif
+} LionTidFetch;
+
+static inline void
+lion_tid_fetch_begin(LionTidFetch *tf, Relation rel)
+{
+	tf->rel = rel;
+#if PG_VERSION_NUM >= 200000
+#elif PG_VERSION_NUM >= 190000
+	tf->slot = table_slot_create(rel, NULL);
+	tf->fetch = table_index_fetch_begin(rel, SO_NONE);
+#else
+	tf->slot = table_slot_create(rel, NULL);
+	tf->fetch = table_index_fetch_begin(rel);
+#endif
+}
+
+static inline bool
+lion_tid_fetch(LionTidFetch *tf, ItemPointer tid, Snapshot snapshot,
+			   bool *all_dead)
+{
+#if PG_VERSION_NUM >= 200000
+	return table_fetch_tid(tf->rel, tid, snapshot, all_dead);
+#else
+	bool		call_again = false;
+	bool		found;
+
+	found = table_index_fetch_tuple(tf->fetch, tid, snapshot, tf->slot,
+									&call_again, all_dead);
+	ExecClearTuple(tf->slot);
+	return found;
+#endif
+}
+
+static inline void
+lion_tid_fetch_end(LionTidFetch *tf)
+{
+#if PG_VERSION_NUM < 200000
+	table_index_fetch_end(tf->fetch);
+	ExecDropSingleTupleTableSlot(tf->slot);
+#endif
+}
+
+/*
  * On-access pruning of a heap page the count's recheck is about to read
  * (DESIGN.md §11, "On-access pruning sets the visibility map too").  19 gave
  * heap_page_prune_opt() a visibility map pin and a rel_read_only flag, with

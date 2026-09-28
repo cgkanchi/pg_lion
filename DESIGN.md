@@ -7914,15 +7914,35 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
   scalar column is probed, and only when its order is the histogram's (the key type's default btree
   comparison, the index's collation the statistics').
 - **Bounded, as core's is.** `LION_PROBE_HEAP_PAGES` (100, core's `VISITED_PAGES_LIMIT`) heap pages
-  without a live row, or `LION_PROBE_LEAVES` (100) directory leaves, and the probe gives up and the
-  histogram's own end stands. The leaves bound matters where core's does not: a directory leaf is
-  never unlinked (§18), so deleting a column's newest keys and vacuuming leaves their leaves empty
-  and linked, where a btree would have deleted its pages. An index that grew by inserts holds about
-  34 one-row keys of a column to a leaf, so the 10,000 newest keys deleted are past the bound and
-  1,000 are not (`test/sql/rangeprobe.sql` §3 shows both).
+  without a live row, `LION_PROBE_HEAP_TIDS` (10,000) TIDs without one, or `LION_PROBE_LEAVES` (100)
+  directory leaves, and the probe gives up and the histogram's own end stands. The leaves bound
+  matters where core's does not: a directory leaf is never unlinked (§18), so deleting a column's
+  newest keys and vacuuming leaves their leaves empty and linked, where a btree would have deleted
+  its pages. An index that grew by inserts holds about 34 one-row keys of a column to a leaf, so the
+  10,000 newest keys deleted are past the bound and 1,000 are not (`test/sql/rangeprobe.sql` §3 shows
+  both). The TIDs bound is there because core's probe asks about a dead TID once - it marks the btree
+  entry dead (`kill_prior_tuple`) and the next plan skips it - where a posting set has nothing to
+  mark, so every plan until VACUUM asks about the same dead rows again, and 100 pages of small rows
+  hold up to 29,100 of them; 10,000 is those pages at 100 rows a page. Each TID used to be asked
+  about through `table_index_fetch_tuple_check()`, which on 16-19 builds and drops a slot and a fetch
+  state per TID; the probe keeps one of each (`lion_tid_fetch_begin()`, lion_compat.h), and the pin
+  on a page while its TIDs are asked about (2026-09-28 review).
 - **Once per planner run.** The ends are cached for the PlannerGlobal of the query, in its memory,
   and forgotten when that memory is reset. Neither a hypothetical nor a partial index is read, nor the
   parent of an inheritance tree. A column core reads itself - it has a btree on it - is left to core.
+- **An end found empty is not read again at every plan** (2026-09-28 review). Where the probe found
+  no live key - it reached a bound, or read the column's whole run - the backend remembers so, per
+  index, key column and end (`lion_probe_missed()`, sixteen at most), in place of the dead entries
+  core's probe would have marked; before, the end whose newest rows were deleted in bulk was walked
+  to the bounds by every plan until VACUUM. A dead row never becomes live again, so only new rows,
+  VACUUM or a new relation under the same OID can change the answer, and the memory is forgotten
+  when the `pg_class` row of the table or the index changes - VACUUM and ANALYZE change it whenever
+  they update the statistics there, and so does DDL that rewrites or drops either (a syscache
+  callback on RELOID; a relcache callback would take one of the ten slots a backend has for all of
+  them, and running out of those is FATAL) - or once the table or the index has more pages than
+  when it was made, which rows added past the end soon give it. Rows that grow neither and
+  come with no VACUUM or ANALYZE are not seen until one of those; the estimate meanwhile is the
+  histogram's own end, which is what core's probe leaves when it gives up.
 - **Lion's estimates only.** The probed ends go into a copy of the column's `pg_statistic` row, which
   `get_relation_stats_hook` hands to core's own `clauselist_selectivity()` while lion prices one of
   its accesses (`lion_probe_begin()` .. `lion_probe_end()`): `lioncostestimate()` for every lion
@@ -8093,7 +8113,10 @@ with a btree on the column; 9,000 more, past `LION_PROBE_LEAVES`, where the prob
 histogram's end stands; a partial index, and a Param. `test/sql/rangeprobe_leak.sql` (2026-09-28)
 counts the calls of a non-leakproof `>=` of a lion operator class made while a query is planned: the
 table's owner has the histogram searched with it, a role under a row-level policy does not, and the
-same role does once the operator is leakproof.
+same role does once the operator is leakproof. `test/sql/rangeprobe_memo.sql` deletes the newest
+10,000 keys of the same shape of table and vacuums: the first plan reads a hundred leaves and gives
+up, the next reads none (their planning buffers differ by 100 or more), and rows added past the end,
+more than the deletion left room for, grow the table and the index and have the end read again.
 `test/isolation/count_range_split_race.spec` parks a
 range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks

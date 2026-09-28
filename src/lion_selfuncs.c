@@ -40,11 +40,14 @@
  *	  an end.  A row is accepted by the visibility map, or by
  *	  SnapshotNonVacuumable, which takes recently dead and uncommitted rows
  *	  as core's probe does, and the probe gives up after
- *	  LION_PROBE_HEAP_PAGES heap pages without one, leaving the histogram's
- *	  own end in place;
+ *	  LION_PROBE_HEAP_PAGES heap pages or LION_PROBE_HEAP_TIDS TIDs without
+ *	  one, leaving the histogram's own end in place;
  *	- neither hypothetical nor partial indexes are read, nor the parent of an
  *	  inheritance tree;
- *	- each end is read once per planner run (lion_probe_cache_for()).
+ *	- each end is read once per planner run (lion_probe_cache_for()), and an
+ *	  end found empty is not read again until the table or the index has
+ *	  changed (lion_probe_missed()), which stands in for core's marking the
+ *	  dead btree entries it steps over.
  *
  *-------------------------------------------------------------------------
  */
@@ -69,6 +72,7 @@
 #include "storage/bufmgr.h"
 #include "utils/array.h"
 #include "utils/datum.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -92,6 +96,18 @@
  * it; a page the visibility map vouches for is not visited at all.
  */
 #define LION_PROBE_HEAP_PAGES	100
+
+/*
+ * The TIDs the probe asks the heap about at one end of a column, however few
+ * pages they are on, before it gives up the same way.  Core bounds pages
+ * alone because it asks about a TID once: a btree entry whose rows it finds
+ * dead is marked so (kill_prior_tuple) and skipped by the next plan.  A
+ * posting set marks nothing, so every plan until VACUUM asks about the same
+ * dead TIDs again, and LION_PROBE_HEAP_PAGES pages of small rows hold up to
+ * 29,100 of them.  10,000 is those pages at 100 rows a page, rows of about
+ * 80 bytes: as many as core would read, once, on such a table.
+ */
+#define LION_PROBE_HEAP_TIDS	10000
 
 /*
  * The directory leaves the probe reads at one end of a column: the one the
@@ -172,6 +188,126 @@ lion_probe_cache_for(PlannerInfo *root)
 }
 
 /* ---------------------------------------------------------------------
+ * The ends found empty, remembered across planner runs
+ * --------------------------------------------------------------------- */
+
+/*
+ * An end where the probe found no live key - it gave up at one of its
+ * bounds, or read the column's whole run - is not probed again until
+ * something that could change the answer has happened.  An end whose rows
+ * were deleted in bulk used to be walked to the bounds at every plan until
+ * VACUUM: core's probe marks the btree entries it finds dead and skips them
+ * the next time, and a posting set has nothing to mark.
+ *
+ * A dead row never becomes live again, so what can change the answer is new
+ * rows, VACUUM (which removes entries and their leaves' contents), and a new
+ * index or table under the same OIDs.  The memory is forgotten
+ *	- when the pg_class row of the table or of the index changes, which VACUUM
+ *	  and ANALYZE make it do whenever they update the statistics there, and
+ *	  every DDL that rewrites or drops either (lion_probe_miss_inval(), a
+ *	  syscache callback: a relcache callback would take one of the ten slots a
+ *	  backend has for them all, and running out of those is FATAL);
+ *	- when the table or the index has grown since - rel->pages and the index's
+ *	  pages as the planner has just read them - which rows added past the end
+ *	  soon make it.
+ * Rows that neither grow the table or the index nor come with a VACUUM or an
+ * ANALYZE are not noticed until one of those; until then the estimate is the
+ * histogram's own end, which is what core's probe leaves when it gives up.
+ *
+ * A handful per backend, the oldest replaced first.
+ */
+typedef struct LionProbeMiss
+{
+	Oid			indexoid;		/* InvalidOid: a free slot */
+	AttrNumber	col;			/* the index's key column */
+	bool		last;			/* its last end, or its first */
+	uint32		heaphash;		/* the pg_class syscache hash of the table */
+	uint32		indexhash;		/* ... and of the index */
+	BlockNumber heappages;		/* rel->pages when the probe found nothing */
+	BlockNumber indexpages;		/* ... and the index's */
+} LionProbeMiss;
+
+#define LION_PROBE_MISSES		16
+
+static LionProbeMiss lion_probe_misses[LION_PROBE_MISSES];
+static int	lion_probe_miss_next = 0;
+static bool lion_probe_miss_callback = false;
+
+/* A pg_class row changed, or (hashvalue 0) any may have. */
+static void
+lion_probe_miss_inval(Datum arg, LionSysCacheId cacheid, uint32 hashvalue)
+{
+	int			i;
+
+	for (i = 0; i < LION_PROBE_MISSES; i++)
+	{
+		LionProbeMiss *m = &lion_probe_misses[i];
+
+		if (hashvalue == 0 || m->heaphash == hashvalue ||
+			m->indexhash == hashvalue)
+			m->indexoid = InvalidOid;
+	}
+}
+
+/* Did the probe find nothing at this end, with nothing changed since? */
+static bool
+lion_probe_missed(RelOptInfo *rel, IndexOptInfo *idx, AttrNumber col,
+				  bool last)
+{
+	int			i;
+
+	for (i = 0; i < LION_PROBE_MISSES; i++)
+	{
+		LionProbeMiss *m = &lion_probe_misses[i];
+
+		if (m->indexoid == idx->indexoid && m->col == col && m->last == last)
+		{
+			if (m->heappages == rel->pages && m->indexpages == idx->pages)
+				return true;
+			m->indexoid = InvalidOid;	/* grown since: probe again */
+			return false;
+		}
+	}
+	return false;
+}
+
+static void
+lion_probe_miss_note(RelOptInfo *rel, IndexOptInfo *idx, Oid heapoid,
+					 AttrNumber col, bool last)
+{
+	LionProbeMiss *m = NULL;
+	int			i;
+
+	if (!lion_probe_miss_callback)
+	{
+		CacheRegisterSyscacheCallback(RELOID, lion_probe_miss_inval, (Datum) 0);
+		lion_probe_miss_callback = true;
+	}
+
+	/* the slot this end had, or the oldest */
+	for (i = 0; i < LION_PROBE_MISSES && m == NULL; i++)
+	{
+		if (lion_probe_misses[i].indexoid == idx->indexoid &&
+			lion_probe_misses[i].col == col &&
+			lion_probe_misses[i].last == last)
+			m = &lion_probe_misses[i];
+	}
+	if (m == NULL)
+	{
+		m = &lion_probe_misses[lion_probe_miss_next];
+		lion_probe_miss_next = (lion_probe_miss_next + 1) % LION_PROBE_MISSES;
+	}
+	m->indexoid = idx->indexoid;
+	m->col = col;
+	m->last = last;
+	m->heaphash = GetSysCacheHashValue1(RELOID, ObjectIdGetDatum(heapoid));
+	m->indexhash = GetSysCacheHashValue1(RELOID,
+										 ObjectIdGetDatum(idx->indexoid));
+	m->heappages = rel->pages;
+	m->indexpages = idx->pages;
+}
+
+/* ---------------------------------------------------------------------
  * Is an entry's key live?
  * --------------------------------------------------------------------- */
 
@@ -179,12 +315,15 @@ typedef struct LionProbeHeap
 {
 	Relation	heap;
 	SnapshotData snapshot;		/* SnapshotNonVacuumable */
+	LionTidFetch fetch;			/* one fetch state for every TID */
 	Buffer		vmbuf;
 	uint32		ckey;			/* the container being read */
 	BlockNumber lastblk;		/* the heap page visited last */
 	int			npages;			/* heap pages visited */
+	int			ntids;			/* TIDs asked about */
 	bool		alive;			/* the entry has a row the probe accepts */
-	bool		gaveup;			/* LION_PROBE_HEAP_PAGES were not enough */
+	bool		gaveup;			/* LION_PROBE_HEAP_PAGES or _TIDS were not
+								 * enough */
 } LionProbeHeap;
 
 static bool
@@ -198,9 +337,14 @@ lion_probe_member(uint16 lo, void *arg)
 	blk = ItemPointerGetBlockNumber(&tid);
 
 	if (VM_ALL_VISIBLE(ph->heap, blk, &ph->vmbuf) ||
-		lion_table_fetch_tid(ph->heap, &tid, &ph->snapshot, NULL))
+		lion_tid_fetch(&ph->fetch, &tid, &ph->snapshot, NULL))
 	{
 		ph->alive = true;
+		return false;
+	}
+	if (++ph->ntids >= LION_PROBE_HEAP_TIDS)
+	{
+		ph->gaveup = true;
 		return false;
 	}
 	if (blk != ph->lastblk)
@@ -285,10 +429,15 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
  * emptied stays linked (DESIGN.md §18) and is read like any other: an end
  * whose last LION_PROBE_LEAVES leaves hold no live key, which is what deleting
  * the newest rows in bulk leaves, is given up on.
+ *
+ * *settled is whether the answer holds until the index or its table changes
+ * (lion_probe_miss_note()): an end found, a bound reached, or the column's
+ * whole run read.  It is false only when a left sibling could not be found
+ * among the pages concurrent splits put in the way.
  */
 static bool
 lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
-				bool last, Datum *value)
+				bool last, Datum *value, bool *settled)
 {
 	char	   *copy = (char *) palloc(BLCKSZ);
 	LionEntryTuple **items;
@@ -298,6 +447,8 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	Buffer		buf;
 	int			nleaves = 0;
 	bool		found = false;
+
+	*settled = false;
 
 	/* every item at least an entry header and a line pointer, as a batch */
 	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_HDRSZ) + sizeof(ItemIdData)) + 1;
@@ -372,7 +523,8 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 			n++;
 			dst += MAXALIGN(sz);
 		}
-		if (!last && LionPageIsRightmost(page))
+		if (last ? !BlockNumberIsValid(LionPageGetOpaque(page)->leftlink) :
+			LionPageIsRightmost(page))
 			runends = true;
 		UnlockReleaseBuffer(buf);
 		nleaves++;
@@ -390,7 +542,10 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 			}
 		}
 		if (found || ph->gaveup || runends || nleaves >= LION_PROBE_LEAVES)
+		{
+			*settled = true;
 			break;
+		}
 
 		/* the next leaf, as this one's links now say */
 		buf = ReadBuffer(index, blkno);
@@ -488,7 +643,8 @@ lion_probe_order_ok(LionState *state, Oid valtype, Oid staop, Oid stacoll)
 /*
  * The first (last = false) or last key of rel's column attno that has a row,
  * read from a lion index on it, once per planner run.  False when no lion
- * index can answer, or the probe gave up.
+ * index can answer, or the probe gave up - now, or in an earlier run with
+ * nothing changed since (lion_probe_missed()).
  */
 static bool
 lion_probe_endpoint(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
@@ -525,7 +681,8 @@ lion_probe_endpoint(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
 	}
 
 	if (!ep->probed[end] &&
-		(idx = lion_probe_index(rel, attno, &col)) != NULL)
+		(idx = lion_probe_index(rel, attno, &col)) != NULL &&
+		!lion_probe_missed(rel, idx, col, last))
 	{
 		MemoryContext probecxt = AllocSetContextCreate(CurrentMemoryContext,
 													   "lion endpoint probe",
@@ -540,16 +697,21 @@ lion_probe_endpoint(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
 		if (lion_probe_order_ok(state, valtype, staop, stacoll))
 		{
 			LionProbeHeap ph;
+			bool		settled;
 
 			memset(&ph, 0, sizeof(ph));
 			ph.heap = heap;
 			ph.vmbuf = InvalidBuffer;
 			ph.lastblk = InvalidBlockNumber;
 			InitNonVacuumableSnapshot(ph.snapshot, GlobalVisTestFor(heap));
+			lion_tid_fetch_begin(&ph.fetch, heap);
 
-			found = lion_probe_walk(&ph, index, state, last, &key);
+			found = lion_probe_walk(&ph, index, state, last, &key, &settled);
+			lion_tid_fetch_end(&ph.fetch);
 			if (BufferIsValid(ph.vmbuf))
 				ReleaseBuffer(ph.vmbuf);
+			if (!found && settled)
+				lion_probe_miss_note(rel, idx, rte->relid, col, last);
 			if (found)
 			{
 				MemoryContextSwitchTo(cache->cxt);
