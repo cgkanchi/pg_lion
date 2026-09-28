@@ -1,0 +1,251 @@
+-- A column's number of distinct values from a lion index on it (DESIGN.md
+-- §33).
+--
+-- ANALYZE estimates n_distinct from a sample, and a column with a few heavy
+-- values and a long tail of rare ones is where the estimate falls short: the
+-- sample sees the heavy values over and over and a sliver of the tail, and
+-- Haas and Stokes' estimator cannot see the rest.  Every estimate that divides
+-- by n_distinct inherits the error - GROUP BY and DISTINCT, the size of a hash
+-- aggregate, a join on the column.  A lion index counts its keys at build, in
+-- a VACUUM's walk and in the ANALYZE of a small directory, and the planner is
+-- given that count in place of ANALYZE's while the table has not outgrown it.
+--
+-- k here: half of 200,000 rows in ten heavy values, the other half two rows
+-- each of 50,000 others.  Statistics target 10 samples 3,000 rows, of which
+-- some 1,500 are tail rows seen once, and ANALYZE puts k at about 3,000
+-- values where it has 50,010.  Only booleans and exact counts are printed:
+-- the sample, and so ANALYZE's own number, differs from run to run.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET max_parallel_workers_per_gather = 0;
+
+/* The rows the planner expects of q's top node, the count pushdown off. */
+CREATE FUNCTION lnd_rows(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN (j -> 0 -> 'Plan' ->> 'Plan Rows')::numeric::bigint;
+END $$;
+
+/* Is est within 3% of want? */
+CREATE FUNCTION lnd_near(est bigint, want bigint) RETURNS boolean
+LANGUAGE sql AS $$ SELECT abs(est - want) <= 0.03 * want $$;
+
+CREATE TABLE lnd (id int NOT NULL, k int NOT NULL, j int NOT NULL)
+	WITH (autovacuum_enabled = off);
+ALTER TABLE lnd ALTER id SET STATISTICS 10, ALTER k SET STATISTICS 10,
+	ALTER j SET STATISTICS 10;
+INSERT INTO lnd
+SELECT i,
+	   CASE WHEN i % 2 = 0 THEN (i / 2) % 10 ELSE 1000 + i / 4 END,
+	   CASE WHEN i % 2 = 1 THEN (i / 2) % 10 ELSE 1000 + i / 4 END
+  FROM generate_series(1, 200000) i;
+ANALYZE lnd;
+
+-- ---------- 1. core's estimate, from the sample ----------
+SELECT count(DISTINCT k) AS k_values FROM lnd;
+SELECT lnd_rows('SELECT k FROM lnd GROUP BY k') < 50010 / 2 AS core_below_half;
+
+-- ---------- 2. after CREATE INDEX: the build's count ----------
+CREATE INDEX lnd_k ON lnd USING lion (k);
+SELECT ndistinct FROM lion_index_stats('lnd_k');
+SELECT lnd_near(lnd_rows('SELECT k FROM lnd GROUP BY k'), 50010) AS lion_count;
+SELECT lnd_near(lnd_rows('SELECT DISTINCT k FROM lnd'), 50010) AS lion_distinct;
+-- pg_stats is ANALYZE's, as it was
+SELECT n_distinct < 50010 / 2 AS pg_stats_sampled
+  FROM pg_stats WHERE tablename = 'lnd' AND attname = 'k';
+-- switched off, the planner has ANALYZE's number again
+SET pg_lion.enable_index_ndistinct = off;
+SELECT lnd_rows('SELECT k FROM lnd GROUP BY k') < 50010 / 2 AS core_below_half;
+RESET pg_lion.enable_index_ndistinct;
+
+-- ---------- 3. after inserts and ANALYZE: ANALYZE counts again ----------
+-- 20,000 new values, two rows each.  ANALYZE walks the directory when it is
+-- no larger than what its own sample reads, 300 blocks per unit of k's
+-- statistics target: 3,000 pages here.
+INSERT INTO lnd SELECT i, 100000 + (i - 200001) / 2, 0
+  FROM generate_series(200001, 240000) i;
+ANALYZE lnd;
+SELECT count(DISTINCT k) AS k_values FROM lnd;
+SELECT ndistinct FROM lion_index_stats('lnd_k');
+SELECT lnd_near(lnd_rows('SELECT k FROM lnd GROUP BY k'), 70010) AS lion_count;
+SET pg_lion.enable_index_ndistinct = off;
+SELECT lnd_rows('SELECT k FROM lnd GROUP BY k') < 70010 / 2 AS core_below_half;
+RESET pg_lion.enable_index_ndistinct;
+
+-- ---------- 4. past that, ANALYZE leaves the count as it was ----------
+-- At statistics target 1 the bound is 300 pages, and k's directory is larger.
+-- 10,000 more values: neither ANALYZE nor a VACUUM with nothing to delete
+-- counts them.
+ALTER TABLE lnd ALTER k SET STATISTICS 1;
+SELECT leaf_pages + internal_pages > 300 AS past_bound
+  FROM lion_index_stats('lnd_k');
+INSERT INTO lnd SELECT i, 120000 + (i - 240001) / 2, 0
+  FROM generate_series(240001, 260000) i;
+ANALYZE lnd;
+SELECT ndistinct FROM lion_index_stats('lnd_k');
+VACUUM lnd;
+SELECT ndistinct FROM lion_index_stats('lnd_k');
+SELECT count(DISTINCT k) AS k_values FROM lnd;
+
+-- ---------- 5. after deletes, VACUUM counts on its own walk ----------
+-- 20,000 values go, and their entries with them.  The VACUUM that deletes
+-- them counts what is left as it goes, whatever the statistics target; the
+-- statistics are still the last ANALYZE's.
+DELETE FROM lnd WHERE k BETWEEN 1000 AND 20999;
+VACUUM lnd;
+SELECT count(DISTINCT k) AS k_values FROM lnd;
+SELECT ndistinct FROM lion_index_stats('lnd_k');
+SELECT lnd_near(lnd_rows('SELECT k FROM lnd GROUP BY k'), 60010) AS lion_count;
+ALTER TABLE lnd ALTER k SET STATISTICS 10;
+
+-- ---------- 6. the user's n_distinct stands ----------
+ALTER TABLE lnd ALTER k SET (n_distinct = 1234);
+ANALYZE lnd;
+SELECT lnd_rows('SELECT k FROM lnd GROUP BY k') AS overridden;
+ALTER TABLE lnd ALTER k RESET (n_distinct);
+ANALYZE lnd;
+SELECT lnd_near(lnd_rows('SELECT k FROM lnd GROUP BY k'), 60010) AS lion_count;
+
+-- ---------- 7. an expression a lion index holds ----------
+CREATE INDEX lnd_kx ON lnd USING lion ((k + 1));
+ALTER INDEX lnd_kx ALTER COLUMN 1 SET STATISTICS 10;
+ANALYZE lnd;
+SELECT ndistinct FROM lion_index_stats('lnd_kx');
+SELECT lnd_near(lnd_rows('SELECT k + 1 FROM lnd GROUP BY k + 1'), 60010) AS lion_count;
+SET pg_lion.enable_index_ndistinct = off;
+SELECT lnd_rows('SELECT k + 1 FROM lnd GROUP BY k + 1') < 60010 / 2 AS core_below_half;
+RESET pg_lion.enable_index_ndistinct;
+DROP INDEX lnd_kx;
+
+-- ---------- 8. a count the table has outgrown is not used ----------
+-- k of lnd's shape at a tenth of the size: 5,010 values in 20,000 rows, which
+-- the build counts.  Rows of the ten heavy values are added with nothing
+-- counting again, and the table the planner sees grows from its pages: the
+-- count - a quarter of the rows it was taken over, which the planner would
+-- scale by the table's size - is used up to twice those rows, and past that
+-- the estimate is ANALYZE's.
+CREATE TABLE lnd_s (id int NOT NULL, k int NOT NULL)
+	WITH (autovacuum_enabled = off);
+ALTER TABLE lnd_s ALTER id SET STATISTICS 10, ALTER k SET STATISTICS 10;
+INSERT INTO lnd_s
+SELECT i, CASE WHEN i % 2 = 0 THEN (i / 2) % 10 ELSE 1000 + i / 4 END
+  FROM generate_series(1, 20000) i;
+ANALYZE lnd_s;
+CREATE INDEX lnd_s_k ON lnd_s USING lion (k);
+SELECT ndistinct FROM lion_index_stats('lnd_s_k');
+SELECT lnd_near(lnd_rows('SELECT k FROM lnd_s GROUP BY k'), 5010) AS lion_count;
+CREATE TEMP TABLE lnd_est (guc text, est bigint);
+-- 18,000 more rows, 1.9 times as many: still used
+INSERT INTO lnd_s SELECT i, i % 10 FROM generate_series(20001, 38000) i;
+INSERT INTO lnd_est SELECT 'on', lnd_rows('SELECT k FROM lnd_s GROUP BY k');
+SET pg_lion.enable_index_ndistinct = off;
+INSERT INTO lnd_est SELECT 'off', lnd_rows('SELECT k FROM lnd_s GROUP BY k');
+RESET pg_lion.enable_index_ndistinct;
+SELECT (SELECT est FROM lnd_est WHERE guc = 'on') <>
+	   (SELECT est FROM lnd_est WHERE guc = 'off') AS used;
+TRUNCATE lnd_est;
+-- 7,000 more, 2.25 times as many: not
+INSERT INTO lnd_s SELECT i, i % 10 FROM generate_series(38001, 45000) i;
+INSERT INTO lnd_est SELECT 'on', lnd_rows('SELECT k FROM lnd_s GROUP BY k');
+SET pg_lion.enable_index_ndistinct = off;
+INSERT INTO lnd_est SELECT 'off', lnd_rows('SELECT k FROM lnd_s GROUP BY k');
+RESET pg_lion.enable_index_ndistinct;
+SELECT (SELECT est FROM lnd_est WHERE guc = 'on') =
+	   (SELECT est FROM lnd_est WHERE guc = 'off') AS stale_same;
+TRUNCATE lnd_est;
+DROP TABLE lnd_s;
+
+-- ---------- 9. what supplies nothing ----------
+-- A partial index counts a part of the column: j's estimate is ANALYZE's.
+CREATE INDEX lnd_j ON lnd USING lion (j) WHERE id % 2 = 0;
+ANALYZE lnd;
+INSERT INTO lnd_est SELECT 'on', lnd_rows('SELECT j FROM lnd GROUP BY j');
+SET pg_lion.enable_index_ndistinct = off;
+INSERT INTO lnd_est SELECT 'off', lnd_rows('SELECT j FROM lnd GROUP BY j');
+RESET pg_lion.enable_index_ndistinct;
+SELECT (SELECT est FROM lnd_est WHERE guc = 'on') =
+	   (SELECT est FROM lnd_est WHERE guc = 'off') AS partial_same;
+TRUNCATE lnd_est;
+DROP INDEX lnd_j;
+-- A multi-key opclass's keys are the arrays' elements, 1,007 of them, not the
+-- 7,000 arrays: nothing is recorded, and the estimate is ANALYZE's.
+CREATE TABLE lnd_m (id int NOT NULL, tags int[] NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lnd_m SELECT i, ARRAY[i % 1000, 5000 + i % 7]
+  FROM generate_series(1, 20000) i;
+CREATE INDEX lnd_m_tags ON lnd_m USING lion (tags);
+ANALYZE lnd_m;
+SELECT ndistinct IS NULL AS no_count FROM lion_index_stats('lnd_m_tags');
+INSERT INTO lnd_est SELECT 'on', lnd_rows('SELECT tags FROM lnd_m GROUP BY tags');
+SET pg_lion.enable_index_ndistinct = off;
+INSERT INTO lnd_est SELECT 'off', lnd_rows('SELECT tags FROM lnd_m GROUP BY tags');
+RESET pg_lion.enable_index_ndistinct;
+SELECT (SELECT est FROM lnd_est WHERE guc = 'on') =
+	   (SELECT est FROM lnd_est WHERE guc = 'off') AS multikey_same;
+DROP TABLE lnd_m, lnd_est;
+
+-- ---------- 10. who may see the statistics is core's to say ----------
+/*
+ * The row handed out is core's own, found by core's own lookup, and so is its
+ * acl_ok: a user who may not read the column gets no statistics a non-leakproof
+ * operator could leak, exactly as without lion.  lnd_eq() is int4's = that
+ * counts its calls in a sequence, which an error does not roll back: EXPLAIN
+ * plans the query before it finds the user may not run it.
+ */
+CREATE SEQUENCE lnd_calls;
+SELECT nextval('lnd_calls') AS first;
+CREATE FUNCTION lnd_eq(a int4, b int4) RETURNS bool
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+	PERFORM nextval('lnd_calls');
+	RETURN a = b;
+END $$;
+CREATE OPERATOR =% (LEFTARG = int4, RIGHTARG = int4, FUNCTION = lnd_eq,
+					RESTRICT = eqsel);
+/* How many times planning q called lnd_eq(). */
+CREATE FUNCTION lnd_leaks(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	before bigint := (SELECT last_value FROM lnd_calls);
+BEGIN
+	BEGIN
+		EXECUTE 'EXPLAIN ' || q;
+	EXCEPTION WHEN insufficient_privilege THEN
+		NULL;
+	END;
+	RETURN (SELECT last_value FROM lnd_calls) - before;
+END $$;
+CREATE ROLE lion_nd_reader;
+GRANT SELECT (id) ON lnd TO lion_nd_reader;
+GRANT SELECT ON SEQUENCE lnd_calls TO lion_nd_reader;
+-- the owner reads every row: the most common values are searched
+SELECT lnd_leaks('SELECT id FROM lnd WHERE k =% 5') > 0 AS searched;
+-- a reader without SELECT on k: they are not, with the count or without it
+SET ROLE lion_nd_reader;
+SELECT lnd_leaks('SELECT id FROM lnd WHERE k =% 5') AS calls;
+SET pg_lion.enable_index_ndistinct = off;
+SELECT lnd_leaks('SELECT id FROM lnd WHERE k =% 5') AS calls;
+RESET pg_lion.enable_index_ndistinct;
+RESET ROLE;
+-- and with it, they are
+GRANT SELECT (k) ON lnd TO lion_nd_reader;
+SET ROLE lion_nd_reader;
+SELECT lnd_leaks('SELECT id FROM lnd WHERE k =% 5') > 0 AS searched;
+RESET ROLE;
+
+DROP TABLE lnd;
+DROP FUNCTION lnd_leaks(text);
+DROP OPERATOR =% (int4, int4);
+DROP FUNCTION lnd_eq(int4, int4);
+DROP SEQUENCE lnd_calls;
+DROP ROLE lion_nd_reader;
+DROP FUNCTION lnd_near(bigint, bigint);
+DROP FUNCTION lnd_rows(text);

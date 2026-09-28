@@ -1188,8 +1188,26 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				if (op.len != sizeof(LionMetaPageData))
 					elog(PANIC, "pg_lion: bad META payload on block %u", blkno);
 				memcpy(LionPageGetMeta(page), payload, sizeof(LionMetaPageData));
-				((PageHeader) page)->pd_lower =
-					SizeOfPageHeaderData + sizeof(LionMetaPageData);
+
+				/*
+				 * At least the meta data, and never less than the page has:
+				 * the key counts of §33 follow it on a page that carries them,
+				 * and the writer's page keeps its pd_lower.
+				 */
+				if (((PageHeader) page)->pd_lower <
+					SizeOfPageHeaderData + sizeof(LionMetaPageData))
+					((PageHeader) page)->pd_lower =
+						SizeOfPageHeaderData + sizeof(LionMetaPageData);
+				break;
+
+			case LION_OP_NDISTINCT:
+				if (op.len != sizeof(LionMetaNdistinct) || !LionPageIsMeta(page))
+					elog(PANIC, "pg_lion: bad NDISTINCT payload on block %u",
+						 blkno);
+				memcpy(LionPageGetMetaNdistinct(page), payload,
+					   sizeof(LionMetaNdistinct));
+				if (((PageHeader) page)->pd_lower < LION_META_NDISTINCT_END)
+					((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
 				break;
 
 			case LION_OP_DELETED:
@@ -1475,6 +1493,8 @@ lion_op_name(uint8 op)
 			return "sparse_ins";
 		case LION_OP_DELTA:
 			return "delta";
+		case LION_OP_NDISTINCT:
+			return "ndistinct";
 		default:
 			return "?";
 	}

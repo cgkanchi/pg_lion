@@ -369,7 +369,8 @@ directory's height, its leaf and internal pages and whether that column is `orde
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
 column's entries, its containers by kind, its sparse segments, its posting trees' internal pages and
 tallest height, `null_tids`, the number of rows whose key in that column is NULL, and `empty_tids`,
-the number of rows a multi-key opclass extracted no key from.  `slack_bytes` and
+the number of rows a multi-key opclass extracted no key from, and `ndistinct`, the distinct keys
+the planner is given for the column (DESIGN.md §33; NULL where none is recorded).  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either.  The counters that describe the
@@ -395,6 +396,15 @@ working around a bad choice:
   own paths (its index scans and the count pushdown) from that (DESIGN.md §29.11, "Correlated
   sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most; the
   planner's own row counts are left alone. Off, Lion prices its paths from the planner's estimate.
+- `pg_lion.enable_index_ndistinct`: give the planner a column's number of distinct values from a
+  Lion index on it - the index's count of its keys, taken at build, by every VACUUM that deletes
+  rows (in the walk it makes anyway) and by an ANALYZE when the index's directory is no larger than
+  ANALYZE's own sample - in place of the number ANALYZE estimates from its sample, which a column
+  with many rare values gets far too low (DESIGN.md §33). It applies to a column with statistics, a
+  non-partial index with a scalar opclass on exactly that column (or an expression index on the
+  expression), while the table holds within a factor of 2 of the rows the count was taken over, and
+  never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
+  number.
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`
