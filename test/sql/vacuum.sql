@@ -61,7 +61,7 @@ SELECT entries, inline_entries, container_pages > 0 AS has_chains, ntids
 -- Every other row of a dense, clustered key: the runs split into singletons,
 -- which no longer fit inline, so the entries spill onto container pages.
 DELETE FROM lion_vac WHERE i % 2 = 0;
-VACUUM lion_vac;
+VACUUM (FREEZE) lion_vac;
 
 SELECT entries, inline_entries, bitset_containers > 0 AS has_bitsets, ntids
   FROM lion_index_stats('lion_vac_k');
@@ -82,7 +82,7 @@ SELECT (SELECT ntids FROM lion_index_stats('lion_vac_k')) =
 CREATE TEMP TABLE lion_vac_keys AS
 	SELECT entries FROM lion_index_stats('lion_vac_k');
 DELETE FROM lion_vac WHERE k IN (3, 4);
-VACUUM lion_vac;
+VACUUM (FREEZE) lion_vac;
 SELECT entries, ntids FROM lion_index_stats('lion_vac_k');
 SELECT (SELECT entries FROM lion_vac_keys) -
 	   (SELECT entries FROM lion_index_stats('lion_vac_k')) AS entries_deleted;
@@ -92,7 +92,7 @@ SELECT lion_cmp('lion_vac', 'k = 5');
 
 -- Scattered rows.
 DELETE FROM lion_vac WHERE i % 7 = 0;
-VACUUM lion_vac;
+VACUUM (FREEZE) lion_vac;
 SELECT ntids FROM lion_index_stats('lion_vac_k');
 SELECT ntids FROM lion_index_stats('lion_vac_t');
 SELECT lion_index_verify('lion_vac_k', true);
@@ -129,7 +129,7 @@ SELECT ntids FROM lion_index_stats('lion_vac_k');
 
 -- ... and VACUUM after those inserts.
 DELETE FROM lion_vac WHERE i > 240000;
-VACUUM lion_vac;
+VACUUM (FREEZE) lion_vac;
 SELECT lion_index_verify('lion_vac_k', true);
 SELECT lion_cmp('lion_vac', 'k = 7');
 
@@ -164,7 +164,7 @@ CREATE TEMP TABLE lion_vacrun_before AS
 SELECT run_containers, ntids FROM lion_index_stats('lion_vacrun_k');
 
 DELETE FROM lion_vacrun WHERE i % 2 = 0;
-VACUUM lion_vacrun;
+VACUUM (FREEZE) lion_vacrun;
 
 SELECT bitset_containers, run_containers, ntids
   FROM lion_index_stats('lion_vacrun_k');
@@ -178,7 +178,7 @@ SELECT lion_cmp('lion_vacrun', 'k = 2');
 
 -- Delete everything: every container disappears, the entries stay.
 DELETE FROM lion_vacrun;
-VACUUM lion_vacrun;
+VACUUM (FREEZE) lion_vacrun;
 SELECT entries, containers, ntids FROM lion_index_stats('lion_vacrun_k');
 SELECT lion_index_verify('lion_vacrun_k', true);
 SELECT lion_cmp('lion_vacrun', 'k = 1');
@@ -217,7 +217,7 @@ CREATE TEMP TABLE lion_vacsp_before AS
 	SELECT sparse_segments, sparse_members, containers
 	  FROM lion_index_stats('lion_vacsp_k');
 DELETE FROM lion_vacsp WHERE i % 4 <> 0;
-VACUUM lion_vacsp;
+VACUUM (FREEZE) lion_vacsp;
 
 SELECT (SELECT sparse_segments FROM lion_index_stats('lion_vacsp_k')) <
 	   (SELECT sparse_segments FROM lion_vacsp_before) AS fewer_segments,
@@ -244,7 +244,7 @@ SELECT lion_cmp('lion_vacsp', 'd = 7');		-- d = 7 needs an odd i: all gone
 -- Delete the rest: every segment goes away and so does every entry
 -- (DESIGN.md §18); an index that indexes nothing holds no entries at all.
 DELETE FROM lion_vacsp;
-VACUUM lion_vacsp;
+VACUUM (FREEZE) lion_vacsp;
 SELECT entries > 0 AS entries_are_kept, containers, sparse_segments,
 	   sparse_members, ntids
   FROM lion_index_stats('lion_vacsp_k');
@@ -285,7 +285,7 @@ SELECT entries, container_pages > 0 AS has_chains, deleted_pages,
 
 -- Two of the four keys vanish entirely.
 DELETE FROM lion_free WHERE k IN (0, 1);
-VACUUM lion_free;
+VACUUM (FREEZE) lion_free;
 SELECT entries,
 	   deleted_pages > 0 AS pages_were_freed,
 	   container_pages < (SELECT container_pages FROM lion_free_before)
@@ -349,7 +349,7 @@ SELECT empty_tids > 0 AS has_empty_entry FROM lion_index_stats('lion_vnull_a');
 
 DELETE FROM lion_vnull WHERE k IS NULL;
 DELETE FROM lion_vnull WHERE a = ARRAY[]::text[];
-VACUUM lion_vnull;
+VACUUM (FREEZE) lion_vnull;
 SELECT null_tids, (SELECT count(*) FROM lion_vnull WHERE k IS NULL) AS heap_nulls
   FROM lion_index_stats('lion_vnull_k');
 SELECT empty_tids FROM lion_index_stats('lion_vnull_a');
@@ -378,7 +378,7 @@ INSERT INTO lion_slackv SELECT i, i % 8 FROM generate_series(1, 200000) i;
 VACUUM lion_slackv;
 SELECT slack_bytes AS slack_after_build FROM lion_index_stats('lion_slackv_k');
 DELETE FROM lion_slackv WHERE i % 50 = 0;
-VACUUM lion_slackv;
+VACUUM (FREEZE) lion_slackv;
 SELECT slack_bytes > 0 AS vacuum_left_slack,
 	   slack_bytes < container_bytes AS slack_is_a_minority
   FROM lion_index_stats('lion_slackv_k');
@@ -407,7 +407,7 @@ INSERT INTO lion_slacki SELECT i, i % 40 FROM generate_series(1, 4000) i;
 SELECT inline_entries, inline_slack_bytes > 0 AS insert_left_slack
   FROM lion_index_stats('lion_slacki_k');
 DELETE FROM lion_slacki WHERE i % 5 = 0;
-VACUUM lion_slacki;
+VACUUM (FREEZE) lion_slacki;
 SELECT inline_entries, ntids,
 	   inline_slack_bytes > 0 AS still_has_slack
   FROM lion_index_stats('lion_slacki_k');
@@ -444,7 +444,7 @@ SELECT entries, inline_entries, run_containers > 0 AS has_runs, ntids
   FROM lion_index_stats('lion_vacpre_r');
 DELETE FROM lion_vacpre WHERE i > 48000 AND i % 7 = 0;
 DELETE FROM lion_vacpre WHERE k = 5 AND i BETWEEN 12001 AND 36000;
-VACUUM lion_vacpre;
+VACUUM (FREEZE) lion_vacpre;
 SELECT entries, inline_entries, containers, ntids,
 	   ntids = (SELECT count(*) FROM lion_vacpre) AS ntids_matches_heap
   FROM lion_index_stats('lion_vacpre_k');
@@ -473,7 +473,7 @@ SELECT lion_cmp('lion_vacpre', 'r = 20');
 SET min_parallel_index_scan_size = 0;
 SET max_parallel_maintenance_workers = 2;
 DELETE FROM lion_vacpre WHERE i % 11 = 0;
-VACUUM (PARALLEL 2) lion_vacpre;
+VACUUM (FREEZE, PARALLEL 2) lion_vacpre;
 RESET min_parallel_index_scan_size;
 RESET max_parallel_maintenance_workers;
 SELECT ntids = (SELECT count(*) FROM lion_vacpre) AS k_ntids_matches_heap
@@ -507,14 +507,14 @@ CREATE INDEX lion_vacbig_k ON lion_vacbig
 	USING lion ((lpad('', 1990, 'y') || (i * 0)::text));
 SELECT inline_entries, run_containers, ntids FROM lion_index_stats('lion_vacbig_k');
 DELETE FROM lion_vacbig WHERE i % 2 = 0;
-VACUUM lion_vacbig;
+VACUUM (FREEZE) lion_vacbig;
 SELECT inline_entries, array_containers, ntids FROM lion_index_stats('lion_vacbig_k');
 SELECT lion_index_verify('lion_vacbig_k', true);
 SELECT lion_index_count('lion_vacbig_k', lpad('', 1990, 'y') || '0') AS n;
 -- ... and the spilled set takes the next rows and VACUUMs like any other
 INSERT INTO lion_vacbig SELECT i FROM generate_series(4061, 4100) i;
 DELETE FROM lion_vacbig WHERE i % 3 = 0;
-VACUUM lion_vacbig;
+VACUUM (FREEZE) lion_vacbig;
 SELECT inline_entries, ntids FROM lion_index_stats('lion_vacbig_k');
 SELECT lion_index_verify('lion_vacbig_k', true);
 
@@ -537,7 +537,7 @@ SELECT entries, inline_entries, run_containers, ntids
   FROM lion_index_stats('lion_vacwide_k');
 SELECT entries, inline_entries, null_tids FROM lion_index_stats('lion_vacwide_n');
 DELETE FROM lion_vacwide WHERE i % 10 = 3;
-VACUUM lion_vacwide;
+VACUUM (FREEZE) lion_vacwide;
 SELECT entries, inline_entries, container_pages, posting_internal_pages,
 	   bitset_containers, ntids
   FROM lion_index_stats('lion_vacwide_k');
@@ -553,7 +553,7 @@ SELECT lion_index_count('lion_vacwide_k', 0) AS n;
 -- ... and the tree it built takes new rows and VACUUMs like any other
 INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(150001, 152000) i;
 DELETE FROM lion_vacwide WHERE i % 10 = 7;
-VACUUM lion_vacwide;
+VACUUM (FREEZE) lion_vacwide;
 SELECT entries, inline_entries, ntids = (SELECT count(*) FROM lion_vacwide)
 	   AS ntids_matches_heap
   FROM lion_index_stats('lion_vacwide_k');

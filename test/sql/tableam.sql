@@ -64,7 +64,7 @@ CREATE TABLE lion_tam_h2 (k int, g int, v int) USING lion_tam_heap2;
 INSERT INTO lion_tam_h2 SELECT i % 50, i % 7, i FROM generate_series(1, 20000) i;
 CREATE INDEX lion_tam_h2_k ON lion_tam_h2 USING lion (k);
 CREATE INDEX lion_tam_h2_g ON lion_tam_h2 USING lion (g);
-VACUUM ANALYZE lion_tam_h2;
+VACUUM (FREEZE, ANALYZE) lion_tam_h2;
 
 SELECT lion_tam_pp('SELECT count(*) FROM lion_tam_h2 WHERE k = 3');
 SELECT lion_tam_pp('SELECT g, count(*) FROM lion_tam_h2 WHERE k = 3 GROUP BY g');
@@ -77,7 +77,7 @@ DELETE FROM lion_tam_h2 WHERE v % 3 = 0;
 SELECT lion_tam_pp('SELECT count(*) FROM lion_tam_h2 WHERE k = 3');
 SELECT lion_index_count('lion_tam_h2_k', 3) AS sql_count,
 	   (SELECT count(*) FROM lion_tam_h2 WHERE k = 3) AS actual;
-VACUUM lion_tam_h2;
+VACUUM (FREEZE) lion_tam_h2;
 SELECT lion_tam_pp('SELECT g, count(*) FROM lion_tam_h2 WHERE k = 3 GROUP BY g');
 SELECT lion_index_verify('lion_tam_h2_k', true);
 
@@ -93,7 +93,7 @@ SELECT a.amname, pg_relation_filenode('lion_tam_alt_k') <> f.before AS index_reb
   FROM pg_class c JOIN pg_am a ON a.oid = c.relam, lion_tam_fn f
  WHERE c.oid = 'lion_tam_alt'::regclass;
 SELECT lion_index_verify('lion_tam_alt_k', true);
-VACUUM lion_tam_alt;
+VACUUM (FREEZE) lion_tam_alt;
 SELECT lion_tam_pp('SELECT count(*) FROM lion_tam_alt WHERE k = 7');
 
 ALTER TABLE lion_tam_alt SET ACCESS METHOD heap;
@@ -101,7 +101,7 @@ SELECT a.amname
   FROM pg_class c JOIN pg_am a ON a.oid = c.relam
  WHERE c.oid = 'lion_tam_alt'::regclass;
 SELECT lion_index_verify('lion_tam_alt_k', true);
-VACUUM lion_tam_alt;
+VACUUM (FREEZE) lion_tam_alt;
 SELECT lion_tam_pp('SELECT k, count(*) FROM lion_tam_alt GROUP BY k');
 
 -- ---- partitions with different table AMs ----------------------------------
@@ -115,7 +115,7 @@ CREATE INDEX lion_tam_p_k ON lion_tam_p USING lion (k);
 CREATE TABLE lion_tam_p3 (k int, v int) USING lion_tam_heap2;
 INSERT INTO lion_tam_p3 SELECT i % 30, i FROM generate_series(20000, 24999) i;
 ALTER TABLE lion_tam_p ATTACH PARTITION lion_tam_p3 FOR VALUES FROM (20000) TO (30000);
-VACUUM ANALYZE lion_tam_p;
+VACUUM (FREEZE, ANALYZE) lion_tam_p;
 
 SELECT c.relname, a.amname
   FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid

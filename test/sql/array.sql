@@ -106,7 +106,7 @@ INSERT INTO lion_arr VALUES (-1, 1, NULL, NULL);
 CREATE INDEX lion_arr_tags ON lion_arr USING lion (tags);
 CREATE INDEX lion_arr_nums ON lion_arr USING lion (nums);
 CREATE INDEX lion_arr_grp ON lion_arr USING lion (grp);
-VACUUM ANALYZE lion_arr;
+VACUUM (FREEZE, ANALYZE) lion_arr;
 
 -- The opclasses validate.
 SELECT amvalidate(oid) FROM pg_opclass
@@ -247,7 +247,7 @@ SELECT lion_index_verify('lion_arr_tags', true);
 SELECT lion_index_verify('lion_arr_nums', true);
 
 -- an all-visible heap: the count comes out of the visibility map
-VACUUM ANALYZE lion_arr;
+VACUUM (FREEZE, ANALYZE) lion_arr;
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{upd,t5}'$$);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5}'$$);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags && '{upd,new1}'$$);
@@ -316,7 +316,7 @@ SELECT entries, inline_entries, run_containers, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
   FROM lion_index_stats('lion_arr_res2_a');
 DELETE FROM lion_arr_res2 WHERE id % 2 = 0;
-VACUUM lion_arr_res2;
+VACUUM (FREEZE) lion_arr_res2;
 -- every entry has spilled during the VACUUM, reserved ones included
 SELECT entries, inline_entries, bitset_containers, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
@@ -340,7 +340,7 @@ CREATE INDEX ON lion_arr_p1 USING lion (tags);
 CREATE INDEX ON lion_arr_p2 USING lion (tags);
 CREATE INDEX ON lion_arr_p1 USING lion (grp);
 CREATE INDEX ON lion_arr_p2 USING lion (grp);
-VACUUM ANALYZE lion_arr_part;
+VACUUM (FREEZE, ANALYZE) lion_arr_part;
 
 SELECT lion_arrplan($$SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}'$$);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}'$$);
@@ -389,7 +389,7 @@ INSERT INTO lion_arrc
 SELECT i, ARRAY['t' || (i % 20), 't' || (i % 400), 'u' || i]
   FROM generate_series(1, 20000) i;
 CREATE INDEX lion_arrc_tags ON lion_arrc USING lion (tags);
-VACUUM ANALYZE lion_arrc;
+VACUUM (FREEZE, ANALYZE) lion_arrc;
 -- exact: containment and overlap over real elements
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc WHERE tags @> ARRAY['u500'];
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc

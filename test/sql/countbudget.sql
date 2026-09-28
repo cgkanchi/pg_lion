@@ -107,7 +107,7 @@ CREATE INDEX lion_cb_x ON lion_cb USING lion (x);
 CREATE INDEX lion_cb_t ON lion_cb USING lion (t);
 CREATE INDEX lion_cb_tags ON lion_cb USING lion (tags) WITH (inline_limit = 64);
 CREATE INDEX lion_cb_kx ON lion_cb USING lion (k, x) WITH (inline_limit = 64);
-VACUUM ANALYZE lion_cb;
+VACUUM (FREEZE, ANALYZE) lion_cb;
 SELECT pg_relation_size('lion_cb') / current_setting('block_size')::int / 64 > 62 AS many_container_keys;
 SELECT entries = 3000 AND inline_entries = 0 AS k_is_chain FROM lion_index_stats('lion_cb_k');
 SELECT entries = 3000 AND inline_entries = 3000 AS ki_is_inline FROM lion_index_stats('lion_cb_ki');
@@ -225,7 +225,7 @@ CREATE INDEX lion_cbm_k ON lion_cbm USING lion (k) WITH (inline_limit = 64);
 CREATE INDEX lion_cbm_ki ON lion_cbm USING lion (ki);
 CREATE INDEX lion_cbm_x ON lion_cbm USING lion (x);
 CREATE INDEX lion_cbm_kx ON lion_cbm USING lion (k, x) WITH (inline_limit = 64);
-VACUUM ANALYZE lion_cbm;
+VACUUM (FREEZE, ANALYZE) lion_cbm;
 SELECT inline_entries = 0 AS k_is_chain FROM lion_index_stats('lion_cbm_k');
 CREATE FUNCTION lion_cb_hwm() RETURNS bigint
 LANGUAGE sql AS $$

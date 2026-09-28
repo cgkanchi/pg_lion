@@ -36,9 +36,9 @@ INSERT INTO lion_exp SELECT i % 4, i % 10, i % 3 FROM generate_series(1, 3000) i
 CREATE INDEX lion_exp_k ON lion_exp USING lion (k);
 CREATE INDEX lion_exp_g ON lion_exp USING lion (g);
 
-VACUUM ANALYZE lion_ex;
-VACUUM ANALYZE lion_exd;
-VACUUM ANALYZE lion_exp;
+VACUUM (FREEZE, ANALYZE) lion_ex;
+VACUUM (FREEZE, ANALYZE) lion_exd;
+VACUUM (FREEZE, ANALYZE) lion_exp;
 GRANT SELECT ON lion_ex, lion_exd, lion_exp TO lion_exec_user, lion_exec_other;
 
 /*
@@ -148,7 +148,7 @@ INSERT INTO lion_exe
 SELECT (enum_range(NULL::lion_ex_mood))[1 + i % 3], 'v' || (i % 4) FROM generate_series(1, 300) i;
 CREATE INDEX lion_exe_e ON lion_exe USING lion (e);
 CREATE INDEX lion_exe_v ON lion_exe USING lion (v);
-VACUUM ANALYZE lion_exe;
+VACUUM (FREEZE, ANALYZE) lion_exe;
 GRANT SELECT ON lion_exe TO lion_exec_user;
 REVOKE EXECUTE ON FUNCTION enum_eq(anyenum, anyenum) FROM PUBLIC;
 SELECT lion_ex('SELECT count(*) FROM lion_exe WHERE e = ''ok''');

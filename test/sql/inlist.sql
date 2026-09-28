@@ -102,7 +102,7 @@ CREATE INDEX lion_in_a ON lion_in USING lion (a);
 CREATE INDEX lion_in_b ON lion_in USING lion (b);
 CREATE INDEX lion_in_c ON lion_in USING lion (c);
 CREATE INDEX lion_in_n ON lion_in USING lion (n);
-VACUUM ANALYZE lion_in;
+VACUUM (FREEZE, ANALYZE) lion_in;
 
 SELECT lion_index_verify('lion_in_a', true);
 
@@ -201,7 +201,7 @@ SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2)');
 SELECT lion_incmp('SELECT b, count(*) FROM lion_in WHERE b IN (1, 2) GROUP BY b');
 
 -- ---- and after VACUUM (the visibility-map path) ------------------------
-VACUUM lion_in;
+VACUUM (FREEZE) lion_in;
 SELECT lion_index_verify('lion_in_a', true);
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_incmp('SELECT id FROM lion_in WHERE a IN (7, 8, 9)');
@@ -283,7 +283,7 @@ SELECT lion_index_count_any('lion_in_a', NULL::int[]) IS NULL AS null_array;
 -- ---- an empty table ----------------------------------------------------
 CREATE TABLE lion_in_empty (k int NOT NULL);
 CREATE INDEX lion_in_empty_k ON lion_in_empty USING lion (k);
-VACUUM ANALYZE lion_in_empty;
+VACUUM (FREEZE, ANALYZE) lion_in_empty;
 SELECT lion_incmp('SELECT count(*) FROM lion_in_empty WHERE k IN (1, 2)');
 SELECT lion_incmp('SELECT k, count(*) FROM lion_in_empty WHERE k IN (1, 2) GROUP BY k');
 
@@ -365,7 +365,7 @@ CREATE INDEX lion_inbig_lo ON lion_inbig USING lion (lo);
 CREATE INDEX lion_inbig_md ON lion_inbig USING lion (md);
 CREATE INDEX lion_inbig_n ON lion_inbig USING lion (n);
 CREATE INDEX lion_inbig_tags ON lion_inbig USING lion (tags);
-VACUUM ANALYZE lion_inbig;
+VACUUM (FREEZE, ANALYZE) lion_inbig;
 SELECT lion_index_verify('lion_inbig_k', true);
 SELECT lion_index_verify('lion_inbig_tags', true);
 
@@ -454,7 +454,7 @@ SELECT lion_insum(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s'':
 						lion_inlist(0, 999, 100000)));
 SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY k',
 						lion_inlist(0, 999, 100000)));
-VACUUM lion_inbig;
+VACUUM (FREEZE) lion_inbig;
 SELECT lion_index_verify('lion_inbig_k', true);
 SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
 						lion_inlist(0, 999, 100000)));
@@ -471,7 +471,7 @@ CREATE TABLE lion_inpart2 PARTITION OF lion_inpart FOR VALUES FROM (50000) TO (2
 INSERT INTO lion_inpart SELECT i, i % 20000 FROM generate_series(1, 199999) i;
 CREATE INDEX lion_inpart1_k ON lion_inpart1 USING lion (k);
 CREATE INDEX lion_inpart2_k ON lion_inpart2 USING lion (k);
-VACUUM ANALYZE lion_inpart;
+VACUUM (FREEZE, ANALYZE) lion_inpart;
 SELECT lion_incmp(format('SELECT count(*) FROM lion_inpart WHERE k = ANY (''%s''::int[])',
 						lion_inlist(0, 999, 100000)));
 SELECT lion_insum(format('SELECT count(*) FROM lion_inpart WHERE k = ANY (''%s''::int[])',
@@ -489,7 +489,7 @@ SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inpart WHERE k = ANY (''%
  */
 CREATE INDEX lion_inbig_kb ON lion_inbig (k);
 CREATE INDEX lion_inbig_lob ON lion_inbig (lo);
-VACUUM ANALYZE lion_inbig;
+VACUUM (FREEZE, ANALYZE) lion_inbig;
 SELECT n, lion_inpick(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[])',
 							lion_inlist(0, n - 1, 100000)))
   FROM (VALUES (3), (10), (100), (1000)) v(n);

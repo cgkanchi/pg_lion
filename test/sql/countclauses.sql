@@ -344,7 +344,7 @@ CREATE INDEX lion_cc_pc ON lion_cc_t USING lion (pc);
 CREATE INDEX lion_cc_d ON lion_cc_t USING lion (d);
 CREATE INDEX lion_cc_ts ON lion_cc_t USING lion (ts);
 CREATE INDEX lion_cc_country ON lion_cc_t USING lion (country);
-VACUUM ANALYZE lion_cc_t, lion_cc_dim;
+VACUUM (FREEZE, ANALYZE) lion_cc_t, lion_cc_dim;
 
 SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
 
@@ -448,7 +448,7 @@ SELECT lion_index_posting_root('lion_cc_status', 'val4'::lion_cc_other);
 DROP INDEX lion_cc_status, lion_cc_dstatus, lion_cc_flag, lion_cc_pc, lion_cc_d,
 	lion_cc_ts, lion_cc_country;
 CREATE INDEX lion_cc_m ON lion_cc_t USING lion (status, flag, pc, d, ts, country, dstatus);
-VACUUM ANALYZE lion_cc_t;
+VACUUM (FREEZE, ANALYZE) lion_cc_t;
 
 SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
 

@@ -87,7 +87,7 @@ CREATE TABLE lion_coll (id int, name text NOT NULL, k int NOT NULL);
 INSERT INTO lion_coll SELECT g, (ARRAY['a','B','c'])[1 + g % 3], g % 4 FROM generate_series(1, 3000) g;
 CREATE INDEX lion_coll_name_c ON lion_coll USING lion (name COLLATE "C");
 CREATE INDEX lion_coll_k ON lion_coll USING lion (k);
-VACUUM ANALYZE lion_coll;
+VACUUM (FREEZE, ANALYZE) lion_coll;
 -- EXPLAIN in a form every supported release prints the same way: subplans
 -- are named "expr_N" as in PostgreSQL 19 ("N" before), 18's "Disabled: true"
 -- lines are dropped, actual row counts are integers (18 adds ".00"), and

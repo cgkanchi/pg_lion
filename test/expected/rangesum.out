@@ -497,7 +497,7 @@ SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k < 1000 AND g = 3');
  complement, summed 1: (2610)
 (1 row)
 
-VACUUM lion_rs;
+VACUUM (FREEZE) lion_rs;
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k >= 0 AND g = 3');
             lion_rs            
 -------------------------------

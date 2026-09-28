@@ -146,7 +146,7 @@ INSERT INTO lion_ord
 	FROM generate_series(1, 100000) i;
 CREATE INDEX lion_ord_k ON lion_ord USING lion (k);
 CREATE INDEX lion_ord_nk ON lion_ord USING lion (nk);
-VACUUM (ANALYZE) lion_ord;
+VACUUM (FREEZE, ANALYZE) lion_ord;
 SELECT ordered FROM lion_index_stats('lion_ord_k');
  ordered 
 ---------
@@ -244,7 +244,7 @@ CREATE TABLE lion_unord (x xid NOT NULL, v int);
 INSERT INTO lion_unord SELECT (i % 50)::text::xid, i
 	FROM generate_series(1, 20000) i;
 CREATE INDEX lion_unord_x ON lion_unord USING lion (x);
-VACUUM (ANALYZE) lion_unord;
+VACUUM (FREEZE, ANALYZE) lion_unord;
 SELECT ordered FROM lion_index_stats('lion_unord_x');
  ordered 
 ---------
@@ -295,7 +295,7 @@ DROP TABLE lion_unord;
 CREATE TABLE lion_in (k int NOT NULL, v int);
 INSERT INTO lion_in SELECT i % 20000, i FROM generate_series(1, 200000) i;
 CREATE INDEX lion_in_k ON lion_in USING lion (k);
-VACUUM (ANALYZE) lion_in;
+VACUUM (FREEZE, ANALYZE) lion_in;
 CREATE FUNCTION lion_dirpages(q text) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
 	j json;
@@ -593,7 +593,7 @@ CREATE OPERATOR CLASS lion_rev_ops FOR TYPE int4 USING lion AS
 CREATE TABLE lion_rev (k int NOT NULL);
 INSERT INTO lion_rev SELECT i % 500 FROM generate_series(1, 5000) i;
 CREATE INDEX lion_rev_k ON lion_rev USING lion (k lion_rev_ops);
-VACUUM (ANALYZE) lion_rev;
+VACUUM (FREEZE, ANALYZE) lion_rev;
 SELECT ordered, entries FROM lion_index_stats('lion_rev_k');
  ordered | entries 
 ---------+---------
@@ -1134,7 +1134,7 @@ ALTER OPERATOR FAMILY lion_oddx_ops USING lion ADD
 CREATE TABLE lion_oddx (k int NOT NULL, v int);
 INSERT INTO lion_oddx SELECT i % 5000, i FROM generate_series(1, 50000) i;
 CREATE INDEX lion_oddx_k ON lion_oddx USING lion (k lion_oddx_int4_ops);
-VACUUM (ANALYZE) lion_oddx;
+VACUUM (FREEZE, ANALYZE) lion_oddx;
 SELECT ordered FROM lion_index_stats('lion_oddx_k');
  ordered 
 ---------
@@ -1299,7 +1299,7 @@ CREATE TABLE lion_textv (k text NOT NULL);
 INSERT INTO lion_textv SELECT 'v' || lpad((i % 20000)::text, 6, '0')
 	FROM generate_series(1, 40000) i;
 CREATE INDEX lion_textv_k ON lion_textv USING lion (k lion_textv_text_ops);
-VACUUM (ANALYZE) lion_textv;
+VACUUM (FREEZE, ANALYZE) lion_textv;
 SELECT ordered, leaf_pages > 100 AS many_leaves FROM lion_index_stats('lion_textv_k');
  ordered | many_leaves 
 ---------+-------------

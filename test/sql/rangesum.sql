@@ -212,7 +212,7 @@ SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE u > 10 AND g = 3');
 DELETE FROM lion_rs WHERE id > 30000;
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k >= 0 AND g = 3');
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k < 1000 AND g = 3');
-VACUUM lion_rs;
+VACUUM (FREEZE) lion_rs;
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k >= 0 AND g = 3');
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k < 1000 AND g = 3');
 SELECT lion_rs('SELECT count(*) FROM lion_rs WHERE k BETWEEN 3 AND 995 AND g = 3');

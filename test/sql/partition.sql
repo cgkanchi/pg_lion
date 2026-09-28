@@ -179,7 +179,7 @@ CREATE INDEX lion_part_n ON lion_part USING lion (n);
 CREATE INDEX lion_part_s ON lion_part USING lion (s);
 CREATE INDEX lion_part_k ON lion_part USING lion (k);
 
-VACUUM ANALYZE lion_part;
+VACUUM (FREEZE, ANALYZE) lion_part;
 
 -- the attnums really do differ between the partitions
 SELECT c.relname, a.attname, a.attnum
@@ -334,7 +334,7 @@ SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a');
 SELECT lion_pp('SELECT a, count(*) FROM lion_part WHERE b = 2 GROUP BY a');
 SELECT a, count(*) FROM lion_part GROUP BY a ORDER BY a;
 
-VACUUM lion_part;
+VACUUM (FREEZE) lion_part;
 
 SELECT lion_pp('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a');
@@ -349,7 +349,7 @@ SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a');
 SELECT count(*) FROM lion_part;
 
 ALTER TABLE lion_part ATTACH PARTITION lion_part_p1 FOR VALUES FROM (0) TO (10);
-VACUUM ANALYZE lion_part;
+VACUUM (FREEZE, ANALYZE) lion_part;
 SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pp('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a');
@@ -362,7 +362,7 @@ SELECT 200000 + i, i % 10, i % 7, i % 5, 'y', 30 + (i % 5)
   FROM generate_series(1, 5000) i;
 ALTER TABLE lion_part ATTACH PARTITION lion_part_p3
 	FOR VALUES FROM (30) TO (40);
-VACUUM ANALYZE lion_part;
+VACUUM (FREEZE, ANALYZE) lion_part;
 SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pp('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pp('SELECT a, count(*) FROM lion_part GROUP BY a');
@@ -373,7 +373,7 @@ CREATE TABLE lion_parte (a int NOT NULL, k int NOT NULL) PARTITION BY RANGE (k);
 CREATE TABLE lion_parte1 PARTITION OF lion_parte FOR VALUES FROM (0) TO (10);
 CREATE TABLE lion_parte2 PARTITION OF lion_parte FOR VALUES FROM (10) TO (20);
 CREATE INDEX ON lion_parte USING lion (a);
-VACUUM ANALYZE lion_parte;
+VACUUM (FREEZE, ANALYZE) lion_parte;
 SELECT lion_pp('SELECT count(*) FROM lion_parte WHERE a = 1');
 SELECT lion_pp('SELECT a, count(*) FROM lion_parte GROUP BY a');
 /*
@@ -412,7 +412,7 @@ CREATE TABLE lion_pbig2 PARTITION OF lion_pbig FOR VALUES FROM (5) TO (10);
 INSERT INTO lion_pbig SELECT i % 5000, i % 10 FROM generate_series(1, 50000) i;
 CREATE INDEX lion_pbig_g ON lion_pbig USING lion (g);
 CREATE INDEX lion_pbig_k ON lion_pbig USING lion (k);
-VACUUM ANALYZE lion_pbig;
+VACUUM (FREEZE, ANALYZE) lion_pbig;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
@@ -478,7 +478,7 @@ SELECT n_distinct FROM pg_stats
  WHERE tablename = 'lion_pstale' AND attname = 'g' AND inherited;
 -- twenty thousand brand-new keys, vacuumed (all-visible) but NOT analyzed
 INSERT INTO lion_pstale SELECT 1000 + i, i % 10 FROM generate_series(1, 20000) i;
-VACUUM lion_pstale;
+VACUUM (FREEZE) lion_pstale;
 SELECT n_distinct FROM pg_stats
  WHERE tablename = 'lion_pstale' AND attname = 'g' AND inherited;
 SET work_mem = '64kB';
@@ -501,7 +501,7 @@ INSERT INTO lion_pnx SELECT i, (i / 7) % 10, i % 20 FROM generate_series(1, 6000
 CREATE INDEX lion_pnx1_a ON lion_pnx1 USING lion (a);
 CREATE INDEX lion_pnx2_a ON lion_pnx2 USING lion (a);
 CREATE INDEX lion_pnx_k ON lion_pnx USING lion (k);
-VACUUM ANALYZE lion_pnx;
+VACUUM (FREEZE, ANALYZE) lion_pnx;
 
 -- both partitions have one
 SELECT lion_pp('SELECT count(*) FROM lion_pnx WHERE a = 3');
@@ -589,7 +589,7 @@ BEGIN
 	END IF;
 END $$;
 
-VACUUM lion_part;
+VACUUM (FREEZE) lion_part;
 SELECT lion_pp_counters('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pp_counters('SELECT a, count(*) FROM lion_part GROUP BY a');
 -- the pages a DELETE dirties are no longer all-visible

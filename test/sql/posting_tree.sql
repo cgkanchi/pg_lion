@@ -83,7 +83,7 @@ SELECT (SELECT count(*) FROM pt_grow WHERE k = 0) +
 	   (SELECT count(*) FROM pt_grow) AS every_row_indexed;
 
 -- ntids agrees with the heap after a VACUUM that has nothing left to remove
-VACUUM pt_grow;
+VACUUM (FREEZE) pt_grow;
 SELECT ntids = (SELECT count(*) FROM pt_grow) AS ntids_exact
   FROM lion_index_stats('pt_grow_k');
 
@@ -158,7 +158,7 @@ SELECT container_pages + posting_internal_pages AS pages_before
   FROM lion_index_stats('pt_grow_k') \gset
 
 DELETE FROM pt_grow WHERE k = 0;
-VACUUM pt_grow;
+VACUUM (FREEZE) pt_grow;
 
 -- the entry is gone, and so are the leaves AND the root above them
 SELECT entries = 1 AS one_entry_left,

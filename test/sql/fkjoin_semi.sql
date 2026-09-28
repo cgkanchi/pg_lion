@@ -253,9 +253,9 @@ CREATE TABLE lion_sdn (k int8, attr int NOT NULL);
 INSERT INTO lion_sdn SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE i % 150 + 1 END, i % 4
 FROM generate_series(1, 300) i;
 CREATE INDEX lion_sdn_k ON lion_sdn (k);
-VACUUM ANALYZE lion_sf;
-VACUUM ANALYZE lion_sd;
-VACUUM ANALYZE lion_sdn;
+VACUUM (FREEZE, ANALYZE) lion_sf;
+VACUUM (FREEZE, ANALYZE) lion_sd;
+VACUUM (FREEZE, ANALYZE) lion_sdn;
 
 -- ---- 1. forward: fact rows whose dimension row qualifies ---------------------
 -- EXISTS and IN over a unique key are inner joins by now: the planner proved
@@ -454,7 +454,7 @@ INSERT INTO lion_sfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000
 FROM generate_series(1, 250000) i;
 CREATE INDEX lion_sfw_fk ON lion_sfw USING lion (fk);
 CREATE INDEX lion_sfw_x ON lion_sfw USING lion (x);
-VACUUM ANALYZE lion_sfw;
+VACUUM (FREEZE, ANALYZE) lion_sfw;
 SET plan_cache_mode = force_generic_plan;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
@@ -488,7 +488,7 @@ SELECT lion_sj_pick('SELECT count(*) FROM lion_sf f WHERE f.doc @@ ''(a0 | a1) &
 CREATE TABLE lion_sdbig (k int8 PRIMARY KEY, attr int NOT NULL);
 INSERT INTO lion_sdbig SELECT i, i % 5 FROM generate_series(1, 60000) i;
 CREATE INDEX lion_sdbig_attr ON lion_sdbig USING lion (attr);
-VACUUM ANALYZE lion_sdbig;
+VACUUM (FREEZE, ANALYZE) lion_sdbig;
 SELECT lion_sj_pick('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sdbig d WHERE d.k = f.fk)');
 SELECT lion_sj_pick('SELECT count(*) FROM lion_sdbig d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 3)');
 -- ... unless the dimension's own filter leaves few rows
@@ -519,8 +519,8 @@ SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.t = ''t5'' AND EXISTS (SELECT 1 FROM lion_sd d WHERE d.pk = f.fk4)');
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)', 'Heap TIDs Rechecked') > 0 AS dirty_heap_rechecks;
 -- the same after VACUUM, from the visibility map
-VACUUM lion_sf;
-VACUUM lion_sd;
+VACUUM (FREEZE) lion_sf;
+VACUUM (FREEZE) lion_sd;
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk)');
 SELECT lion_sj('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sd d WHERE d.pk = f.fk AND d.region = ''eu'')');

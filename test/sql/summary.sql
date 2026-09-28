@@ -213,13 +213,13 @@ INSERT INTO lion_sm_chain SELECT i, repeat('p', 200) FROM generate_series(1, 400
 CREATE INDEX lion_sm_chain_k ON lion_sm_chain USING lion (k)
 	WITH (summaries = on, summary_tids = 64, inline_limit = 64);
 DELETE FROM lion_sm_chain WHERE k % 3 <> 0;
-VACUUM lion_sm_chain;
+VACUUM (FREEZE) lion_sm_chain;
 INSERT INTO lion_sm_chain SELECT 4000 + i, repeat('p', 200) FROM generate_series(1, 3000) i;
 SELECT summary_entries > 60 AS many, summary_tids = ntids AS covers,
 	   summary_pages > 0 AS chained
   FROM lion_index_stats('lion_sm_chain_k');
 SELECT lion_index_verify('lion_sm_chain_k', true);
-VACUUM (ANALYZE) lion_sm_chain;
+VACUUM (FREEZE, ANALYZE) lion_sm_chain;
 SELECT lion_sm('SELECT count(*) FROM lion_sm_chain WHERE k > 3000');
 SELECT lion_sm('SELECT count(*) FROM lion_sm_chain WHERE k BETWEEN 2000 AND 6500');
 DROP TABLE lion_sm_chain;
@@ -233,7 +233,7 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 5000 AND 15000 AND 
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u > 100000');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE r > 50 AND r < 8000');
 SELECT lion_index_verify('lion_sm_urg', true);
-VACUUM lion_sm;
+VACUUM (FREEZE) lion_sm;
 SELECT lion_index_verify('lion_sm_urg', true);
 SELECT lion_index_verify('lion_sm_k', true);
 SELECT lion_index_verify('lion_sm_t', true);
@@ -243,7 +243,7 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u > 100000');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE r > 50 AND r < 8000');
 -- a run of whole buckets deleted: their summaries are emptied and removed
 DELETE FROM lion_sm WHERE u BETWEEN 2000 AND 9000;
-VACUUM lion_sm;
+VACUUM (FREEZE) lion_sm;
 SELECT lion_index_verify('lion_sm_urg', true);
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u >= 100');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1000 AND 10000');
@@ -251,7 +251,7 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1990 AND 9010 AND g
 -- ... and every row of a column: every summary goes, and the next insert
 -- opens a bucket again
 DELETE FROM lion_sm WHERE k IS NOT NULL;
-VACUUM lion_sm;
+VACUUM (FREEZE) lion_sm;
 SELECT summary_entries, summary_tids FROM lion_index_stats('lion_sm_k');
 INSERT INTO lion_sm VALUES (50001, 50001, 1, 1, 42, 'x', 'q'), (50002, 50002, 2, 2, 41, 'y', 'q');
 SELECT summary_entries, summary_tids FROM lion_index_stats('lion_sm_k');

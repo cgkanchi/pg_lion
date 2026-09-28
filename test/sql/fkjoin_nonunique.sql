@@ -281,10 +281,10 @@ FROM generate_series(1, 3000) i;
 -- every row the same key
 CREATE TABLE lion_nda (k int8, attr int NOT NULL);
 INSERT INTO lion_nda SELECT 7, i % 4 FROM generate_series(1, 400) i;
-VACUUM ANALYZE lion_nf;
-VACUUM ANALYZE lion_nd;
-VACUUM ANALYZE lion_ndh;
-VACUUM ANALYZE lion_nda;
+VACUUM (FREEZE, ANALYZE) lion_nf;
+VACUUM (FREEZE, ANALYZE) lion_nd;
+VACUUM (FREEZE, ANALYZE) lion_ndh;
+VACUUM (FREEZE, ANALYZE) lion_nda;
 
 -- ---- 1. the plan ---------------------------------------------------------------
 -- the keys are sorted and each is counted once; the partial counts are added
@@ -386,7 +386,7 @@ SELECT lion_nj_pick('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SE
 CREATE TABLE lion_ndb (k int8, attr int NOT NULL);
 INSERT INTO lion_ndb SELECT i % 30000 + 1, i % 100 FROM generate_series(1, 60000) i;
 CREATE INDEX lion_ndb_attr ON lion_ndb USING lion (attr);
-VACUUM ANALYZE lion_ndb;
+VACUUM (FREEZE, ANALYZE) lion_ndb;
 SELECT lion_nj_pick('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndb d WHERE d.k = f.fk)');
 SELECT lion_nj_pick('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndb d WHERE d.k = f.fk AND d.attr = 5)');
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndb d WHERE d.k = f.fk)');

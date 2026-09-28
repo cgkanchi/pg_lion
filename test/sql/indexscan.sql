@@ -303,7 +303,7 @@ SELECT lion_iq('SELECT id FROM lis WHERE g = 3 AND kk BETWEEN 10 AND 60');
 SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{99}''');
 SELECT lion_ios('SELECT count(*) FROM lis WHERE flag');
 SELECT lion_ios('SELECT count(*) FROM lis WHERE flag2');
-VACUUM lis;
+VACUUM (FREEZE) lis;
 SELECT lion_iq('SELECT id FROM lis WHERE k = 17');
 SELECT lion_iq('SELECT id FROM lis WHERE k IN (17, 18, 19)');
 SELECT lion_iq('SELECT id FROM lis WHERE k BETWEEN 10 AND 20');
@@ -353,7 +353,7 @@ CREATE TABLE lis_f (id int, k int, u int);
 INSERT INTO lis_f SELECT i, (i::int8 * 7919 % 300)::int, i FROM generate_series(1, 600000) i;
 CREATE INDEX lis_f_k ON lis_f USING lion (k);
 CREATE INDEX lis_f_u ON lis_f USING lion (u);
-VACUUM ANALYZE lis_f;
+VACUUM (FREEZE, ANALYZE) lis_f;
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_top('SELECT id FROM lis_f WHERE u = 123456');
 SELECT lion_top('SELECT id FROM lis_f WHERE u IN (1, 123456, 500000)');
@@ -378,7 +378,7 @@ SELECT lion_top('SELECT k, count(*) FROM lis_f GROUP BY k');
 CREATE TABLE lis_cl (id int, c int, x int);
 INSERT INTO lis_cl SELECT i, i / 2000, 0 FROM generate_series(1, 300000) i;
 CREATE INDEX lis_cl_c ON lis_cl USING lion (c);
-VACUUM ANALYZE lis_cl;
+VACUUM (FREEZE, ANALYZE) lis_cl;
 UPDATE lis_cl SET x = 1 WHERE id % 20 = 7;
 ANALYZE lis_cl;
 SELECT lion_top('SELECT count(*) FROM lis_cl WHERE c = 17');
@@ -424,7 +424,7 @@ SELECT id, tags FROM lis_ex4 ORDER BY id;
 CREATE TABLE lis_pr (id int, tags int[], flag bool);
 INSERT INTO lis_pr SELECT g, ARRAY[g % 10], g % 2 = 0 FROM generate_series(1, 400000) g;
 CREATE INDEX lis_pr_tags ON lis_pr USING lion (tags) WHERE flag;
-VACUUM ANALYZE lis_pr;
+VACUUM (FREEZE, ANALYZE) lis_pr;
 SET work_mem = '64kB';
 SET pg_lion.enable_count_pushdown = off;
 SET enable_bitmapscan = off;
@@ -443,7 +443,7 @@ CREATE TABLE lis_pt (id int, tags int[], flag bool, pad text);
 INSERT INTO lis_pt SELECT g, ARRAY[g % 10], g % 2 = 0, repeat('x', 200)
   FROM generate_series(1, 200000) g;
 CREATE INDEX lis_pt_tags ON lis_pt USING lion (tags) WHERE flag;
-VACUUM ANALYZE lis_pt;
+VACUUM (FREEZE, ANALYZE) lis_pt;
 -- with nothing disabled: an index-only scan of the partial multi-key index
 SELECT lion_top('SELECT count(*) FROM lis_pt WHERE flag');
 SELECT count(*) FROM lis_pt WHERE flag;
@@ -507,7 +507,7 @@ RESET work_mem;
 CREATE TABLE lis_pw (id int, tags int[], flag bool);
 INSERT INTO lis_pw SELECT g, ARRAY[g % 300], g % 2 = 0 FROM generate_series(1, 600000) g;
 CREATE INDEX lis_pw_tags ON lis_pw USING lion (tags) WITH (inline_limit = 64) WHERE flag;
-VACUUM ANALYZE lis_pw;
+VACUUM (FREEZE, ANALYZE) lis_pw;
 CREATE TABLE lis_pw_blks (wm text, blks bigint);
 CREATE FUNCTION lis_pw_blks() RETURNS bigint LANGUAGE sql AS
 $$ SELECT idx_blks_hit + idx_blks_read FROM pg_statio_user_indexes
@@ -567,7 +567,7 @@ INSERT INTO lis_w SELECT g, g % 50, (g::int8 * 7919 % 20000)::int, g
   FROM generate_series(1, 200000) g;
 INSERT INTO lis_w SELECT NULL, g % 50, g, -g FROM generate_series(1, 500) g;
 CREATE INDEX lis_w_abd ON lis_w USING lion (a, b, d);
-VACUUM ANALYZE lis_w;
+VACUUM (FREEZE, ANALYZE) lis_w;
 
 /*
  * lion_bufs() runs a query as a plain index scan, or as a bitmap scan, under

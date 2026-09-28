@@ -219,8 +219,8 @@ CREATE INDEX lion_ff_fk ON lion_ff USING lion (fk);
 CREATE INDEX lion_ff_x ON lion_ff USING lion (x);
 CREATE INDEX lion_ff_y ON lion_ff USING lion (y);
 CREATE INDEX lion_ff_tk ON lion_ff USING lion (tk);
-VACUUM ANALYZE lion_ff;
-VACUUM ANALYZE lion_fd;
+VACUUM (FREEZE, ANALYZE) lion_ff;
+VACUUM (FREEZE, ANALYZE) lion_fd;
 
 -- ---- 1. the shapes, on an all-visible heap ---------------------------------
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
@@ -263,7 +263,7 @@ SELECT lion_fj_pick('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.p
 -- loses to the hash join, and the model says so
 CREATE TABLE lion_fdbig (k int8 PRIMARY KEY, attr int);
 INSERT INTO lion_fdbig SELECT i, i % 5 FROM generate_series(1, 50000) i;
-VACUUM ANALYZE lion_fdbig;
+VACUUM (FREEZE, ANALYZE) lion_fdbig;
 SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k GROUP BY d.attr');
 -- ... unless its own quals leave few rows
 SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k WHERE d.k < 60 GROUP BY d.attr');
@@ -307,8 +307,8 @@ INSERT INTO lion_ff8 SELECT CASE WHEN i % 17 = 0 THEN NULL ELSE i % 70 END, i % 
 FROM generate_series(1, 7000) i;
 CREATE INDEX ON lion_ff8 USING lion (fk8);
 CREATE INDEX ON lion_ff8 USING lion (x);
-VACUUM ANALYZE lion_fd4;
-VACUUM ANALYZE lion_ff8;
+VACUUM (FREEZE, ANALYZE) lion_fd4;
+VACUUM (FREEZE, ANALYZE) lion_ff8;
 SELECT lion_fj('SELECT d.grp, count(*) FROM lion_ff8 f JOIN lion_fd4 d ON f.fk8 = d.k GROUP BY d.grp');
 SELECT lion_fj('SELECT d.grp, count(*) FROM lion_ff8 f JOIN lion_fd4 d ON f.fk8 = d.k WHERE f.x = 1 GROUP BY d.grp');
 SELECT lion_fj('SELECT count(*) FROM lion_ff8 f JOIN lion_fd4 d ON d.k = f.fk8 WHERE d.grp = ''g2''');
@@ -445,8 +445,8 @@ SELECT lion_fj('SELECT d.pk, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.tk = d.tpk WHERE f.x = 3 GROUP BY d.attr');
 SELECT lion_fj_counter('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk', 'Heap Blocks Rechecked') > 0 AS dirty_heap_rechecks;
 -- the same after VACUUM, from the visibility map
-VACUUM lion_ff;
-VACUUM lion_fd;
+VACUUM (FREEZE) lion_ff;
+VACUUM (FREEZE) lion_fd;
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
 SELECT lion_fj_counter('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk', 'Heap Blocks Rechecked') AS vacuumed_heap_rechecks;

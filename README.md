@@ -99,6 +99,14 @@ replay, so turning it on for a primary that never replays proves nothing.
   in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into; as root it also
   needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).
 
+The regression files VACUUM with `FREEZE` wherever what they print depends on the VACUUM having
+done all its work - index statistics after a DELETE, a plan the visibility map prices, a count
+that must skip every heap block.  A plain VACUUM that cannot get a heap page's cleanup lock at
+once (the checkpointer and the background writer pin the pages they write) checks that page
+without pruning it: its dead TIDs stay in every index and its visibility-map bit stays clear.  An
+aggressive VACUUM waits for the lock instead.  The isolation specs keep plain VACUUMs, whose waits
+are part of what they test.
+
 `dev.sh` puts its cluster's socket in `$XDG_RUNTIME_DIR/pg_lion-<user>` (or `/tmp/pg_lion-<user>`)
 on port 54329, and `LION_SOCK` / `LION_PORT` move it.  The cluster trusts local connections, so
 `dev.sh` makes a missing socket directory mode 0700, and refuses the default one if it is a symlink,

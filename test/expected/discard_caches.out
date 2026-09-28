@@ -200,7 +200,7 @@ INSERT INTO lion_ddco SELECT i, i, (i - 1) / 300, i % 7 FROM generate_series(1, 
 CREATE INDEX lion_ddco_k ON lion_ddco (k, id);
 CREATE INDEX lion_ddco_c ON lion_ddco USING lion (c);
 CREATE INDEX lion_ddco_g ON lion_ddco USING lion (g);
-VACUUM ANALYZE lion_ddco;
+VACUUM (FREEZE, ANALYZE) lion_ddco;
 -- q through LionOrdered under debug_discard_caches (every other scan off),
 -- then without the node and without the flushes: whether the node ran, and
 -- whether the two agree row for row, in order.

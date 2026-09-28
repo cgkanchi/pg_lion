@@ -320,7 +320,7 @@ SELECT count = 20000 AS count_ok,
  t        | t                      | t
 (1 row)
 
-VACUUM lion_cnt;
+VACUUM (FREEZE) lion_cnt;
 SELECT count = 20000 AS count_ok, blocks_skipped > 0 AS skipped_some,
        tids_rechecked = 0 AS nothing_rechecked
   FROM lion_index_count_stats('lion_cnt_c10', 0);
@@ -369,7 +369,7 @@ SELECT lion_ccmp2('lion_cnt_c10', '3', 'lion_cnt_m7', '2',
 (1 row)
 
 -- ... and after VACUUM the dead TIDs are gone and the map answers again.
-VACUUM lion_cnt;
+VACUUM (FREEZE) lion_cnt;
 SELECT count = (SELECT count(*) FROM lion_cnt WHERE c10 = 0) AS count_ok,
        blocks_skipped > 0 AS skipped_some,
        tids_rechecked = 0 AS nothing_rechecked
@@ -566,7 +566,7 @@ INSERT INTO lion_cnt_hot
 SELECT i, i % 5, i % 37, 0 FROM generate_series(1, 20000) i;
 CREATE INDEX lion_cnt_hot_k ON lion_cnt_hot USING lion (k);
 CREATE INDEX lion_cnt_hot_g ON lion_cnt_hot USING lion (g);
-VACUUM ANALYZE lion_cnt_hot;
+VACUUM (FREEZE, ANALYZE) lion_cnt_hot;
 -- everything all-visible: no heap visit, so no blocks either
 SELECT count = 4000 AS count_ok, blocks_skipped > 0 AS skipped_some,
        tids_rechecked = 0 AS nothing_rechecked,
@@ -675,7 +675,7 @@ SELECT count(*) > 0 AS took_predicate_locks
 
 COMMIT;
 -- ... and once more with every block all-visible again.
-VACUUM lion_cnt_hot;
+VACUUM (FREEZE) lion_cnt_hot;
 BEGIN ISOLATION LEVEL SERIALIZABLE;
 SELECT lion_ccmp('lion_cnt_hot_k', 'lion_cnt_hot', 'k', '0');
  lion_ccmp 

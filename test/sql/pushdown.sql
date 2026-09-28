@@ -165,7 +165,7 @@ CREATE INDEX lion_pdt_c ON lion_pdt USING lion (c);
 CREATE INDEX lion_pdt_n ON lion_pdt USING lion (n);
 -- The pushdown only wins when most of the heap is all-visible, which is the
 -- case it exists for; VACUUM makes that true and deterministic here.
-VACUUM ANALYZE lion_pdt;
+VACUUM (FREEZE, ANALYZE) lion_pdt;
 
 -- ---- plans -------------------------------------------------------------
 SELECT lion_plans('SELECT count(*) FROM lion_pdt WHERE a = 3');
@@ -340,7 +340,7 @@ SELECT lion_pd('SELECT a, count(*) FROM lion_pdt WHERE b = 2 GROUP BY a');
 SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
 
 -- ---- and after VACUUM (the visibility-map path) ------------------------
-VACUUM lion_pdt;
+VACUUM (FREEZE) lion_pdt;
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3');
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND b = 2');
@@ -352,14 +352,14 @@ SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
 DELETE FROM lion_pdt WHERE a = 5;
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
 SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
-VACUUM lion_pdt;
+VACUUM (FREEZE) lion_pdt;
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a');
 SELECT a, count(*) FROM lion_pdt GROUP BY a ORDER BY a;
 
 -- ---- an empty table ----------------------------------------------------
 CREATE TABLE lion_pde (k int NOT NULL);
 CREATE INDEX lion_pde_k ON lion_pde USING lion (k);
-VACUUM ANALYZE lion_pde;
+VACUUM (FREEZE, ANALYZE) lion_pde;
 SELECT lion_pd('SELECT count(*) FROM lion_pde WHERE k = 1');
 SELECT lion_pd('SELECT k, count(*) FROM lion_pde GROUP BY k');
 SELECT count(*) FROM lion_pde WHERE k = 1;
@@ -370,7 +370,7 @@ SELECT lion_pd('SELECT x, c FROM (VALUES (1), (2)) v(x), LATERAL (SELECT count(*
 SELECT lion_pd('SELECT * FROM (SELECT a, count(*) AS c FROM lion_pdt GROUP BY a) s WHERE c > 0');
 
 -- ---- what EXPLAIN ANALYZE reports ---------------------------------------
-VACUUM lion_pdt;
+VACUUM (FREEZE) lion_pdt;
 SELECT lion_pd_counters('SELECT count(*) FROM lion_pdt WHERE a = 3');
 -- the pages a DELETE dirties are no longer all-visible, so their TIDs are
 -- fetched from the heap and counted as rechecked blocks
@@ -398,7 +398,7 @@ CREATE INDEX lion_pdd_g ON lion_pdd USING lion (g);
 ANALYZE lion_pdd;			-- no VACUUM: relallvisible stays 0
 SELECT lion_pd('SELECT g, count(*) FROM lion_pdd GROUP BY g');
 -- and once it is all-visible there is nothing left to recheck at all
-VACUUM ANALYZE lion_pdd;
+VACUUM (FREEZE, ANALYZE) lion_pdd;
 SELECT lion_pd('SELECT g, count(*) FROM lion_pdd GROUP BY g');
 
 -- ---- the cost model still refuses a grouping it cannot win -------------
@@ -438,7 +438,7 @@ CREATE TABLE lion_pdg (id int NOT NULL, k int NOT NULL, pad text NOT NULL);
 INSERT INTO lion_pdg
 SELECT i, i % 20, repeat('x', 200) FROM generate_series(1, 100000) i;
 CREATE INDEX lion_pdg_k ON lion_pdg USING lion (k);
-VACUUM ANALYZE lion_pdg;
+VACUUM (FREEZE, ANALYZE) lion_pdg;
 UPDATE lion_pdg SET pad = pad || 'y' WHERE id <= 5000;
 ANALYZE lion_pdg;			-- no VACUUM: the updated pages stay dirty
 SELECT relallvisible > 0 AND relallvisible < relpages AS mostly_all_visible
@@ -474,7 +474,7 @@ CREATE TABLE lion_pdi (id int NOT NULL, k int NOT NULL);
 INSERT INTO lion_pdi SELECT i, i % 1000 FROM generate_series(1, 200000) i;
 CREATE INDEX lion_pdi_r ON lion_pdi USING lion (k);
 CREATE INDEX lion_pdi_b ON lion_pdi (k);
-VACUUM ANALYZE lion_pdi;
+VACUUM (FREEZE, ANALYZE) lion_pdi;
 /* The list is generated rather than written out, so that the plan text this
  * reports stays short; lion_pd() prints the choice and the row count only. */
 CREATE OR REPLACE FUNCTION lion_pd_in(n int) RETURNS text
@@ -503,7 +503,7 @@ DROP FUNCTION lion_pd_in(int);
 CREATE TABLE lion_pdw (id int NOT NULL, k int NOT NULL);
 INSERT INTO lion_pdw SELECT i, i % 10 FROM generate_series(1, 200000) i;
 CREATE INDEX lion_pdw_k ON lion_pdw USING lion (k);
-VACUUM ANALYZE lion_pdw;
+VACUUM (FREEZE, ANALYZE) lion_pdw;
 INSERT INTO lion_pdw SELECT 200000 + i, i % 10 FROM generate_series(1, 4000) i;
 ANALYZE lion_pdw;
 SELECT relallvisible > 0 AND relallvisible < relpages AS nearly_all_visible
@@ -539,7 +539,7 @@ CREATE TABLE lion_pdc (v text NOT NULL);
 INSERT INTO lion_pdc SELECT 'A' FROM generate_series(1, 50000);
 INSERT INTO lion_pdc SELECT 'a' FROM generate_series(1, 50000);
 CREATE INDEX lion_pdc_v ON lion_pdc USING lion (v lion_lower_ops);
-VACUUM ANALYZE lion_pdc;
+VACUUM (FREEZE, ANALYZE) lion_pdc;
 -- one entry for the two spellings, which is what the opclass says
 SELECT entries FROM lion_index_stats('lion_pdc_v');
 SELECT lion_pd('SELECT v, count(*) FROM lion_pdc GROUP BY v');
@@ -555,7 +555,7 @@ CREATE TABLE lion_pdv (v text NOT NULL);
 INSERT INTO lion_pdv SELECT 'A' FROM generate_series(1, 50000);
 INSERT INTO lion_pdv SELECT 'a' FROM generate_series(1, 50000);
 CREATE INDEX lion_pdv_v ON lion_pdv USING lion (v);
-VACUUM ANALYZE lion_pdv;
+VACUUM (FREEZE, ANALYZE) lion_pdv;
 SELECT entries FROM lion_index_stats('lion_pdv_v');
 SELECT lion_pd('SELECT v, count(*) FROM lion_pdv GROUP BY v');
 SELECT lion_plans('SELECT v, count(*) FROM lion_pdv GROUP BY v');
@@ -574,7 +574,7 @@ INSERT INTO lion_pdn SELECT 1.0 FROM generate_series(1, 20000);
 INSERT INTO lion_pdn SELECT 1.00 FROM generate_series(1, 20000);
 INSERT INTO lion_pdn SELECT 2.5 FROM generate_series(1, 20000);
 CREATE INDEX lion_pdn_v ON lion_pdn USING lion (v);
-VACUUM ANALYZE lion_pdn;
+VACUUM (FREEZE, ANALYZE) lion_pdn;
 SELECT entries FROM lion_index_stats('lion_pdn_v');
 SELECT lion_pd('SELECT v, count(*) FROM lion_pdn GROUP BY v');
 SELECT lion_pd('SELECT v, count(*) FROM lion_pdn WHERE v = 1.000 GROUP BY v');
@@ -817,7 +817,7 @@ CREATE INDEX lion_pdo_a ON lion_pdo USING lion (a);
 CREATE INDEX lion_pdo_b ON lion_pdo USING lion (b);
 CREATE INDEX lion_pdo_c ON lion_pdo USING lion (c);
 CREATE INDEX lion_pdo_n ON lion_pdo USING lion (n);
-VACUUM ANALYZE lion_pdo;
+VACUUM (FREEZE, ANALYZE) lion_pdo;
 
 SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
@@ -920,7 +920,7 @@ DELETE FROM lion_pdo WHERE id % 7 = 0;
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
 SELECT lion_pd('SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c');
 SELECT lion_pd_counters('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
-VACUUM lion_pdo;
+VACUUM (FREEZE) lion_pdo;
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
 SELECT lion_pd('SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c');
 SELECT lion_pd_counters('SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3');
@@ -933,7 +933,7 @@ SELECT i, i % 50, ARRAY['t' || (i % 13), 't' || (i % 29)]
   FROM generate_series(1, 50000) i;
 CREATE INDEX lion_pdmo_k ON lion_pdmo USING lion (k);
 CREATE INDEX lion_pdmo_tags ON lion_pdmo USING lion (tags);
-VACUUM ANALYZE lion_pdmo;
+VACUUM (FREEZE, ANALYZE) lion_pdmo;
 SELECT lion_plans($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5}' OR k = 7$$);
 SELECT lion_pd($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5}' OR k = 7$$);
 SELECT lion_pd($$SELECT count(*) FROM lion_pdmo WHERE tags @> '{t5,t7}' OR k = 7$$);
@@ -953,7 +953,7 @@ CREATE INDEX ON lion_pdpo1 USING lion (a);
 CREATE INDEX ON lion_pdpo1 USING lion (b);
 CREATE INDEX ON lion_pdpo2 USING lion (a);
 CREATE INDEX ON lion_pdpo2 USING lion (b);
-VACUUM ANALYZE lion_pdpo;
+VACUUM (FREEZE, ANALYZE) lion_pdpo;
 SELECT lion_plans('SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3');
 SELECT lion_pd('SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3');
 SELECT lion_plans('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP BY a');
@@ -999,7 +999,7 @@ DELETE FROM lion_pdt WHERE id % 11 = 0;
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 SELECT lion_pd('SELECT a, n, count(*) FROM lion_pdt GROUP BY a, n');
 SELECT lion_pd_counters('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
-VACUUM lion_pdt;
+VACUUM (FREEZE) lion_pdt;
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 SELECT lion_pd_counters('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b ORDER BY a, b LIMIT 8;
@@ -1014,7 +1014,7 @@ CREATE INDEX ON lion_pdq1 USING lion (a);
 CREATE INDEX ON lion_pdq1 USING lion (b);
 CREATE INDEX ON lion_pdq2 USING lion (a);
 CREATE INDEX ON lion_pdq2 USING lion (b);
-VACUUM ANALYZE lion_pdq;
+VACUUM (FREEZE, ANALYZE) lion_pdq;
 SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdq GROUP BY a, b');
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdq GROUP BY a, b');
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdq WHERE b = 2 GROUP BY a, b');
@@ -1036,7 +1036,7 @@ CREATE INDEX lion_pd2_c2 ON lion_pd2 USING lion (c2);
 CREATE INDEX lion_pd2_c20 ON lion_pd2 USING lion (c20);
 CREATE INDEX lion_pd2_c200 ON lion_pd2 USING lion (c200);
 CREATE INDEX lion_pd2_c20k ON lion_pd2 USING lion (c20k);
-VACUUM ANALYZE lion_pd2;
+VACUUM (FREEZE, ANALYZE) lion_pd2;
 -- 20 x 2 and 200 x 2 are worth it
 SELECT lion_pd('SELECT c20, c2, count(*) FROM lion_pd2 GROUP BY c20, c2');
 SELECT lion_plans('SELECT c20, c2, count(*) FROM lion_pd2 GROUP BY c20, c2');
@@ -1077,7 +1077,7 @@ SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
  * seq_page_cost.  DESIGN.md §22 records that as the open item.
  */
 CREATE INDEX lion_pd2_id ON lion_pd2 USING lion (id);
-VACUUM ANALYZE lion_pd2;
+VACUUM (FREEZE, ANALYZE) lion_pd2;
 SELECT lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c2 = 1')
 	 < lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE c2 = 1')
 	AS probing_beats_walking;
@@ -1203,7 +1203,7 @@ CREATE TABLE lion_pdk (k int NOT NULL, h int NOT NULL);
 INSERT INTO lion_pdk SELECT i % 200, i % 7 FROM generate_series(1, 100000) i;
 CREATE INDEX lion_pdk_k ON lion_pdk USING lion (k lion_pdk_ops);
 CREATE INDEX lion_pdk_h ON lion_pdk USING lion (h);
-VACUUM ANALYZE lion_pdk;
+VACUUM (FREEZE, ANALYZE) lion_pdk;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
@@ -1241,7 +1241,7 @@ CREATE TABLE lion_pdk (k int NOT NULL, h int NOT NULL);
 INSERT INTO lion_pdk SELECT i % 20000, i % 7 FROM generate_series(1, 100000) i;
 CREATE INDEX lion_pdk_k ON lion_pdk USING lion (k);
 CREATE INDEX lion_pdk_h ON lion_pdk USING lion (h);
-VACUUM ANALYZE lion_pdk;
+VACUUM (FREEZE, ANALYZE) lion_pdk;
 SELECT lion_pd('SELECT k, count(*) FROM lion_pdk WHERE k IN (5, 17, 3, 150, 42, 99, 1, 120) AND h IN (1, 2) GROUP BY k');
 EXPLAIN (COSTS OFF)
 SELECT k, count(*) FROM lion_pdk
@@ -1281,7 +1281,7 @@ CREATE TABLE lion_pwa (k int NOT NULL);
 INSERT INTO lion_pwa SELECT g % 10 FROM generate_series(1, 20000) g;
 CREATE INDEX lion_pwa_k ON lion_pwa USING lion (k);
 SET synchronous_commit = on;
-VACUUM ANALYZE lion_pwa;
+VACUUM (FREEZE, ANALYZE) lion_pwa;
 SET enable_partitionwise_aggregate = on;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pwa WHERE k = 3;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_pwa GROUP BY k;

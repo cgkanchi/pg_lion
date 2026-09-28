@@ -236,11 +236,11 @@ SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE 'c' || (abs(hashint4(i)) % 240 + 1) E
 FROM generate_series(1, 10000) i;
 CREATE INDEX lion_dtf_code ON lion_dtf USING lion (code);
 CREATE INDEX lion_dtf_x ON lion_dtf USING lion (x);
-VACUUM ANALYZE lion_df;
-VACUUM ANALYZE lion_dd;
-VACUUM ANALYZE lion_ddn;
-VACUUM ANALYZE lion_dt;
-VACUUM ANALYZE lion_dtf;
+VACUUM (FREEZE, ANALYZE) lion_df;
+VACUUM (FREEZE, ANALYZE) lion_dd;
+VACUUM (FREEZE, ANALYZE) lion_ddn;
+VACUUM (FREEZE, ANALYZE) lion_dt;
+VACUUM (FREEZE, ANALYZE) lion_dtf;
 
 -- ---- 1. count(DISTINCT fact.fk) over the inner join ----------------------------
 -- the fact rows' keys that have a qualifying dimension row: the dimension rows

@@ -200,7 +200,7 @@ SELECT entries, ntids FROM lion_index_stats('lion_vfy_hot_k');
 (1 row)
 
 -- the HOT chains survive a VACUUM (which prunes them) unchanged
-VACUUM lion_vfy_hot;
+VACUUM (FREEZE) lion_vfy_hot;
 SELECT lion_index_verify('lion_vfy_hot_k', true);
  lion_index_verify 
 -------------------
@@ -254,7 +254,7 @@ SELECT lion_index_verify('lion_vfy_u', true);
  
 (1 row)
 
-VACUUM lion_vfy;
+VACUUM (FREEZE) lion_vfy;
 SELECT lion_index_verify('lion_vfy_k', true);
  lion_index_verify 
 -------------------
@@ -296,7 +296,7 @@ SELECT lion_index_verify('lion_vfy_i', true);
 (1 row)
 
 DELETE FROM lion_vfy WHERE i % 7 = 0;
-VACUUM lion_vfy;
+VACUUM (FREEZE) lion_vfy;
 SELECT lion_index_verify('lion_vfy_i', true);
  lion_index_verify 
 -------------------

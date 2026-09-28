@@ -157,7 +157,7 @@ CREATE INDEX lion_mk_n ON lion_mk_t USING lion (n);
 CREATE INDEX lion_mk_tags ON lion_mk_t USING lion (tags);
 CREATE INDEX lion_mk_nums ON lion_mk_t USING lion (nums);
 CREATE INDEX lion_mk_tsv ON lion_mk_t USING lion (tsv);
-VACUUM ANALYZE lion_mk_t;
+VACUUM (FREEZE, ANALYZE) lion_mk_t;
 
 -- ---- 1. a generic plan's parameter, of every shape ------------------------
 -- @>: exact; exact over two keys; no row, NULL; the empty array (every row
@@ -337,7 +337,7 @@ ALTER TABLE lion_mk_p ATTACH PARTITION lion_mk_p1 FOR VALUES IN (2, 3);
 INSERT INTO lion_mk_p (id, g, tags) SELECT id, g, tags FROM lion_mk_t;
 CREATE INDEX lion_mk_p_tags ON lion_mk_p USING lion (tags);
 CREATE INDEX lion_mk_p_g ON lion_mk_p USING lion (g);
-VACUUM ANALYZE lion_mk_p;
+VACUUM (FREEZE, ANALYZE) lion_mk_p;
 SELECT lion_mk('SELECT count(*) FROM lion_mk_p WHERE tags @> $1', '''{t2}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_p WHERE tags @> $1', '''{}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_p WHERE tags @> $1', '''{t2,NULL}''');
@@ -363,7 +363,7 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1', '''{t1,NULL}''
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1', '''{}''');
 SELECT lion_mk('SELECT g, count(*) FROM lion_mk_t WHERE tags && $1 GROUP BY g', '''{moved,NULL}''');
 SELECT lion_mk('SELECT d.attr, count(*) FROM lion_mk_t f JOIN lion_mk_d d ON f.k = d.pk WHERE f.tags @> $1 GROUP BY d.attr', '''{t1,NULL}''');
-VACUUM lion_mk_t;
+VACUUM (FREEZE) lion_mk_t;
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1', '''{t1,NULL}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1', '''{}''');
 
@@ -386,7 +386,7 @@ CREATE INDEX lion_mk_pf_fk ON lion_mk_pf USING lion (fk);
 CREATE INDEX lion_mk_pf_x ON lion_mk_pf USING lion (x);
 CREATE INDEX lion_mk_pf_tags ON lion_mk_pf USING lion (tags);
 CREATE INDEX lion_mk_pf_tsv ON lion_mk_pf USING lion (tsv);
-VACUUM ANALYZE lion_mk_pd, lion_mk_pf;
+VACUUM (FREEZE, ANALYZE) lion_mk_pd, lion_mk_pf;
 
 /*
  * lion_mk_par() runs a prepared statement's generic plan through the

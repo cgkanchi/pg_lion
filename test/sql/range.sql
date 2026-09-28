@@ -296,7 +296,7 @@ CREATE INDEX lion_r_u ON lion_r USING lion (u);
 CREATE INDEX lion_r_b ON lion_r USING lion (b);
 CREATE INDEX lion_r_e ON lion_r USING lion (e);
 CREATE INDEX lion_r_ci ON lion_r USING lion (ci);
-VACUUM ANALYZE lion_r;
+VACUUM (FREEZE, ANALYZE) lion_r;
 
 -- ---------- 1. every strategy, on int4 (the bitmap scan) ----------
 SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < 10');
@@ -535,7 +535,7 @@ CREATE TABLE lion_rm (id int NOT NULL, a int NOT NULL, b int, c text);
 INSERT INTO lion_rm SELECT i, i % 50, CASE WHEN i % 9 = 0 THEN NULL ELSE i % 13 END,
 						   chr(97 + i % 26) FROM generate_series(1, 10000) i;
 CREATE INDEX lion_rm_abc ON lion_rm USING lion (a, b, c);
-VACUUM ANALYZE lion_rm;
+VACUUM (FREEZE, ANALYZE) lion_rm;
 SELECT lion_rq('SELECT id FROM lion_rm WHERE a BETWEEN 3 AND 7');
 SELECT lion_rq('SELECT id FROM lion_rm WHERE b > 10');
 SELECT lion_rq('SELECT id FROM lion_rm WHERE c >= ''x''');
@@ -621,7 +621,7 @@ ALTER TABLE lion_rpt ATTACH PARTITION lion_rpt_2 FOR VALUES FROM (5000) TO (2000
 INSERT INTO lion_rpt SELECT i, i % 100, i % 7 FROM generate_series(1, 12000) i;
 CREATE INDEX lion_rpt_k ON lion_rpt USING lion (k);
 CREATE INDEX lion_rpt_x ON lion_rpt USING lion (x);
-VACUUM ANALYZE lion_rpt;
+VACUUM (FREEZE, ANALYZE) lion_rpt;
 SELECT lion_rc('SELECT count(*) FROM lion_rpt WHERE k < 30');
 SELECT lion_rc('SELECT count(*) FROM lion_rpt WHERE k BETWEEN 30 AND 60 AND x = 2');
 SELECT lion_rc('SELECT k, count(*) FROM lion_rpt WHERE k > 90 GROUP BY k');
@@ -644,7 +644,7 @@ SELECT lion_rc('SELECT k, count(*) FROM lion_r WHERE k < 20 GROUP BY k');
 SELECT lion_rc('SELECT count(DISTINCT k) FROM lion_r WHERE k < 20 AND x = 2');
 SELECT lion_rc('SELECT count(*) FROM lion_r WHERE i4 < 10');
 SELECT lion_rc('SELECT d, count(*) FROM lion_r WHERE d >= ''2024-02-10'' GROUP BY d');
-VACUUM lion_r;
+VACUUM (FREEZE) lion_r;
 SELECT lion_rq('SELECT id FROM lion_r WHERE k BETWEEN 20 AND 40');
 SELECT lion_rq('SELECT id FROM lion_r WHERE i4 < 10');
 SELECT lion_rq('SELECT id FROM lion_r WHERE d >= ''2024-02-10'' AND d < ''2024-03-01''');
@@ -690,7 +690,7 @@ CREATE INDEX lion_rp_lo_lion ON lion_rp USING lion (lo);
 CREATE INDEX lion_rp_lo_bt ON lion_rp (lo);
 CREATE INDEX lion_rp_uq_lion ON lion_rp USING lion (uq);
 CREATE INDEX lion_rp_uq_bt ON lion_rp (uq);
-VACUUM ANALYZE lion_rp;
+VACUUM (FREEZE, ANALYZE) lion_rp;
 SELECT lion_rpick('SELECT count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30');
 SELECT lion_rpick('SELECT count(*) FROM lion_rp WHERE lo < 100');
 SELECT lion_rpick('SELECT sum(length(pad)) FROM lion_rp WHERE lo BETWEEN 10 AND 11');

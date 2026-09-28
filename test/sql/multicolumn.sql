@@ -207,7 +207,7 @@ SELECT lion_mccmp($$SELECT id FROM lion_mc WHERE k = 1007 AND t = 't47'$$);
 SELECT lion_mccmp($$SELECT id FROM lion_mc WHERE t IS NULL$$);
 SELECT lion_mccmp($$SELECT id FROM lion_mc WHERE k = 7 AND a @> ARRAY[3]$$);
 
-VACUUM (ANALYZE) lion_mc;
+VACUUM (FREEZE, ANALYZE) lion_mc;
 
 SELECT lion_index_verify('lion_mc_kta', true);
 
@@ -277,7 +277,7 @@ SELECT i, i % 9,
 FROM generate_series(1, 6000) i;
 
 CREATE INDEX lion_mc_ts_i ON lion_mc_ts USING lion (g, tsv);
-VACUUM (ANALYZE) lion_mc_ts;
+VACUUM (FREEZE, ANALYZE) lion_mc_ts;
 
 SELECT attno, ordered, entries, null_tids, empty_tids
   FROM lion_index_stats('lion_mc_ts_i');
@@ -515,8 +515,8 @@ CREATE INDEX lion_mcs_c ON lion_mcs USING lion (c);
 CREATE INDEX lion_mcs_n ON lion_mcs USING lion (n);
 CREATE INDEX lion_mcs_m ON lion_mcs USING lion (m);
 
-VACUUM (ANALYZE) lion_mcp;
-VACUUM (ANALYZE) lion_mcs;
+VACUUM (FREEZE, ANALYZE) lion_mcp;
+VACUUM (FREEZE, ANALYZE) lion_mcs;
 
 SELECT lion_index_verify('lion_mcp_i', true);
 
@@ -766,7 +766,7 @@ INSERT INTO lion_mcpart SELECT i, i % 10, i % 7
 CREATE INDEX ON lion_mcpart1 USING lion (a, b);
 CREATE INDEX ON lion_mcpart2 USING lion (b, a);
 CREATE INDEX ON lion_mcpart3 USING lion (b, a);
-VACUUM (ANALYZE) lion_mcpart;
+VACUUM (FREEZE, ANALYZE) lion_mcpart;
 
 SELECT lion_mcpd($$SELECT count(*) FROM lion_mcpart WHERE a = 3$$);
 SELECT lion_mcpd($$SELECT count(*) FROM lion_mcpart WHERE b = 2$$);
@@ -789,7 +789,7 @@ SELECT lion_mcpd($$SELECT count(*) FROM lion_mcp WHERE a = 3 AND b = 2$$);
 SELECT lion_mcpd($$SELECT a, count(*) FROM lion_mcp GROUP BY a$$);
 SELECT lion_mcpd($$SELECT count(*) FROM lion_mcp WHERE n IS NULL$$);
 SELECT lion_mcpd($$SELECT count(*) FROM lion_mcp WHERE a = 3 OR b = 2$$);
-VACUUM lion_mcp;
+VACUUM (FREEZE) lion_mcp;
 SELECT lion_mcpd($$SELECT count(*) FROM lion_mcp WHERE a = 3 AND b = 2$$);
 SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b$$);
 SELECT lion_index_verify('lion_mcp_i', true);

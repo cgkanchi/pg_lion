@@ -90,7 +90,7 @@ COMMIT;
 SELECT lion_index_verify('lion_vfy_hot_k', true);
 SELECT entries, ntids FROM lion_index_stats('lion_vfy_hot_k');
 -- the HOT chains survive a VACUUM (which prunes them) unchanged
-VACUUM lion_vfy_hot;
+VACUUM (FREEZE) lion_vfy_hot;
 SELECT lion_index_verify('lion_vfy_hot_k', true);
 SELECT entries, ntids FROM lion_index_stats('lion_vfy_hot_k');
 
@@ -112,7 +112,7 @@ SELECT lion_index_verify('lion_vfy_k', true);
 DELETE FROM lion_vfy WHERE i % 5 = 0;
 SELECT lion_index_verify('lion_vfy_k', true);
 SELECT lion_index_verify('lion_vfy_u', true);
-VACUUM lion_vfy;
+VACUUM (FREEZE) lion_vfy;
 SELECT lion_index_verify('lion_vfy_k', true);
 SELECT lion_index_verify('lion_vfy_u', true);
 SELECT entries, ntids FROM lion_index_stats('lion_vfy_k');
@@ -130,7 +130,7 @@ SELECT containers, sparse_segments > 0 AS has_segments,
   FROM lion_index_stats('lion_vfy_i');
 SELECT lion_index_verify('lion_vfy_i', true);
 DELETE FROM lion_vfy WHERE i % 7 = 0;
-VACUUM lion_vfy;
+VACUUM (FREEZE) lion_vfy;
 SELECT lion_index_verify('lion_vfy_i', true);
 SELECT sparse_members = ntids AS still_all_segments,
 	   ntids = (SELECT count(*) FROM lion_vfy WHERE i IS NOT NULL) AS ntids_matches_heap
