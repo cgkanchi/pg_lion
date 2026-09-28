@@ -1091,7 +1091,8 @@ phase1d() {
 #    leaves, which are FULL - the sweep used to free only empty unreferenced
 #    leaves, so these stayed leaked for good.  Its VERBOSE page counts
 #    (DESIGN.md §18, "Page counts") are checked here, where a shell can read
-#    them: the ten orphans newly deleted, and never counted twice;
+#    them: the ten orphans and the root their spill logged before them (with
+#    no downlink yet) newly deleted, and never counted twice;
 #  * and a second crash replays that VACUUM, the whole multi-leaf spill
 #    included (under wal_consistency_checking when --conf asks for it).
 #
@@ -1170,27 +1171,29 @@ phase1e() {
 		>>"$RUNLOG" 2>&1 || true
 
 	# The next VACUUM spills the set and sweeps the orphans away, and says so:
-	# the ten orphans are what it newly deleted, and they are not reusable
-	# yet.  Every other free page is all-zero - the root the crash left
-	# unwritten - and reusable, so the two differences agree exactly unless a
-	# page is counted twice or a fresh one is called reusable.
+	# the ten orphans and their root - logged first, as an internal page with
+	# no downlink, so that its block is never handed out again (DESIGN.md
+	# §18) - are what it newly deleted, and they are not reusable yet.  Any
+	# other free page is all-zero and reusable, so the two differences agree
+	# exactly unless a page is counted twice or a fresh one is called
+	# reusable.
 	vacuum_page_counts "phase 1e" lion_mspill lion_mspill_k
-	[ "$NEWLY" = 10 ] ||
-		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the ten orphan leaves"
+	[ "$NEWLY" = 11 ] ||
+		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the ten orphan leaves and their root"
 	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
 		die "phase 1e: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
 
 	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
 		grep -c 'unused and unreachable' || true)
 	[ "$warn" -le 1 ] ||
-		die "phase 1e: $warn page(s) are still leaked after the sweep (only the never-written root may be left, all-zero)"
+		die "phase 1e: $warn page(s) are still leaked after the sweep"
 	run_check "phase 1e swept" psql_p \
 		"select inline_entries = 0 and posting_internal_pages = 1 and container_pages = 10,
 				format('spilled: %s INLINE, %s internal, %s leaves',
 					   inline_entries, posting_internal_pages, container_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
-		 select deleted_pages = 10, format('%s DELETED pages, the ten orphans', deleted_pages)
+		 select deleted_pages = 11, format('%s DELETED pages, the ten orphans and their root', deleted_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
 		 select ntids = (select count(*) from lion_mspill), 'ntids agrees with the heap'

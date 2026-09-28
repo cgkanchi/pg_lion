@@ -2400,10 +2400,33 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	}
 
 	/*
-	 * Several leaves, left to right, one record each.  Where each one ends is
-	 * decided before its record opens, and so is its right sibling, which is
-	 * allocated then: nothing fallible happens inside a record (§25), and a
-	 * leaf is linked to a page that exists the moment it is written.
+	 * Several leaves.  The ROOT is written first, in a record of its own: an
+	 * internal page of the set with no downlink yet.  Every leaf is stamped
+	 * with its block, and "a block is a root once in the life of the index"
+	 * rests on the block having been handed out by an extension that stays
+	 * handed out - which an extension that no record ever touched does not,
+	 * when an OS crash loses it: the next extension hands the same block out
+	 * again, as the root of another set, and the leaves a crashed spill had
+	 * stamped with it then looked live to the leak sweep and to verify() for
+	 * as long as that set lived (lion_posting_root_live(); every summary's
+	 * and every NULL entry's hash is the same 0, so the stamp could not tell
+	 * them apart).  Replaying this record extends the relation past the root
+	 * whatever the leaves' blocks, so the block is never a root again; a
+	 * crash after it leaves an internal page without downlinks, which the
+	 * sweep frees (lion_vac_children_deleted()) and after it the leaves.
+	 */
+	xstate = lion_wal_begin(index);
+	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
+	LionPageGetOpaque(rootpage)->level = 1;
+	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_wal_log_special(xstate, rootpage);
+	lion_wal_finish(xstate, LION_XLOG_PAGE_INIT);
+
+	/*
+	 * Then the leaves, left to right, one record each.  Where each one ends
+	 * is decided before its record opens, and so is its right sibling, which
+	 * is allocated then: nothing fallible happens inside a record (§25), and
+	 * a leaf is linked to a page that exists the moment it is written.
 	 */
 	pivots = (LionPostingPivot *) palloc(sizeof(LionPostingPivot) * nleaves);
 	leafbuf = lion_alloc_page(index, heaprel, true);
@@ -2488,21 +2511,25 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
  * right answer for the leaves an interrupted spill leaves behind, whose root
  * was never written.
  *
- * Live means what the readers' owner check means: the page at `head` is a
- * container page, not DELETED, and stamped with (hash, head) itself.  Only a
- * ROOT carries its own block as owner_head, and a block is a root at most
- * once in the life of the index (lion_entry_spill() takes roots with reuse =
- * false), so:
+ * Live means what the readers' owner check means - the page at `head` is a
+ * container page, not DELETED, and stamped with (hash, head) itself - and a
+ * downlink on it when it is an internal page.  Only a ROOT carries its own
+ * block as owner_head, and a block is a root at most once in the life of the
+ * index (lion_entry_spill() takes roots with reuse = false, and logs a
+ * multi-leaf spill's root before its first leaf, so that not even an OS
+ * crash hands the block out again), so:
  *
  *	- every page of a set that exists names a root that passes: its own set's,
- *	  which stays live until the entry is gone and the set is freed;
+ *	  which stays live until the entry is gone and the set is freed, and has a
+ *	  downlink from the moment it is internal (a push-down makes it one with
+ *	  one, in one record);
  *	- a spill that is still writing holds its root EXCLUSIVE from before it
- *	  stamps its first leaf until the root is written, so the lock below
+ *	  stamps its first leaf until the root is complete, so the lock below
  *	  waits for it (wait = true) or fails and answers "live" (wait = false);
- *	- a root seen under that lock unwritten, DELETED, or stamped for another
- *	  set (its block recycled) stays that way for every leaf stamped with it:
- *	  the spill that stamped the leaf ended without writing the root, and
- *	  nothing will make that block a root again.
+ *	- a root seen under that lock unwritten, with no downlink, DELETED, or
+ *	  stamped for another set (its block recycled) stays that way for every
+ *	  leaf stamped with it: the spill that stamped the leaf ended without
+ *	  completing the root, and nothing will make that block a root again.
  *
  * With wait = false the only lock taken is a conditional one, so the caller
  * may hold other buffer locks (the sweep holds the leaf's cleanup lock); with
@@ -2513,6 +2540,7 @@ bool
 lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
 {
 	Buffer		buf;
+	Page		page;
 	bool		live;
 
 	if (!BlockNumberIsValid(head) || head == LION_METAPAGE_BLKNO ||
@@ -2528,7 +2556,10 @@ lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
 		return true;			/* busy: somebody is writing it, keep it */
 	}
 
-	live = lion_page_owns_entry(BufferGetPage(buf), hash, head);
+	page = BufferGetPage(buf);
+	live = lion_page_owns_entry(page, hash, head) &&
+		!(LionPageIsPostingInternal(page) &&
+		  PageGetMaxOffsetNumber(page) < lion_posting_first_data(page));
 	UnlockReleaseBuffer(buf);
 
 	return live;

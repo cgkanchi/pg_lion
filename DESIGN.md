@@ -3485,7 +3485,13 @@ container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry
 magnitude (§5, VACUUM step 2), so `lion_entry_spill()` writes as many leaves as the payload needs:
 
 1. the ROOT first, with reuse = false and held EXCLUSIVE to the end - every page of a set is
-   stamped with its root's block, and a root block is never handed out twice (above);
+   stamped with its root's block, and a root block is never handed out twice (above) - and
+   LOGGED first, as an internal page of the set with no downlink yet, in a record of its own
+   (2026-09-28): an extension no record touches is one an OS crash can lose, and the next
+   extension then handed the same block out again as the root of another set, whose stamp
+   the leaves the crashed spill had written could not be told from (every summary's hash and
+   every NULL entry's is 0, §32).  Replaying the record extends the relation past the root
+   whatever blocks the leaves took, so the block is never a root again;
 2. then each LEAF, filled, linked to the next one and logged in a record of its own that
    registers that one buffer.  The next leaf is allocated just before the record of the one in
    front of it, because that record carries the rightlink and a record may not allocate (§25), so
@@ -3500,18 +3506,22 @@ magnitude (§5, VACUUM step 2), so `lion_entry_spill()` writes as many leaves as
 The entry changes in the last record and in no other, so it is INLINE until the whole set is on
 disk and CHAIN from the moment it is, never half of each.  An ERROR or a crash before the last
 record loses nothing - the entry still holds the payload it held, dead TIDs included, which the
-next VACUUM removes - and leaves FULL leaves that nothing references, stamped with a root that was
-never written.  The spill's own comment promised that the next VACUUM's sweep collects those; it
-did not, because the sweep only ever freed EMPTY unreferenced leaves, so they stayed leaked for
-good.  The sweep now asks the leaf's ROOT (`lion_posting_root_live()`): a leaf is an orphan when
+next VACUUM removes - and leaves FULL leaves that nothing references, stamped with a root that
+has no downlink (before 2026-09-28: that was never written).  The spill's own comment promised
+that the next VACUUM's sweep collects those; it did not, because the sweep only ever freed EMPTY
+unreferenced leaves, so they stayed leaked for good.  The sweep now asks the leaf's ROOT (`lion_posting_root_live()`): a leaf is an orphan when
 the page at its owner_head is not a live container page stamped with that same (owner_hash,
-owner_head).  Every page of a set that exists passes - its root is live until the entry is gone
-and the set freed, and the whole-set free only frees EMPTY sets, whose leaves the sweep frees for
-being empty - and a spill that is still writing holds its root EXCLUSIVE, which the sweep's
-conditional lock reads as live.  A root seen unwritten, DELETED or stamped for another set under
-its lock stays that way for every leaf stamped with it, because the spill that stamped the leaf
-has ended and no block is a root twice.  lion_index_verify() reports such a leaf as the leak it
-is, with a WARNING, like an empty one (which extends what §4 says verify() tolerates).
+owner_head), with a downlink on it when it is an internal page.  Every page of a set that exists
+passes - its root is live until the entry is gone and the set freed, is internal only with a
+downlink (a push-down makes it one with one, in one record), and the whole-set free only frees
+EMPTY sets, whose leaves the sweep frees for being empty - and a spill that is still writing
+holds its root EXCLUSIVE, which the sweep's conditional lock reads as live.  A root seen
+unwritten, without a downlink, DELETED or stamped for another set under its lock stays that way
+for every leaf stamped with it, because the spill that stamped the leaf has ended and no block
+is a root twice.  The root itself is freed by the same sweep: an internal page all of whose
+children are DELETED - here, none - is dead (§22).  lion_index_verify() reports such a leaf as the
+leak it is, with a WARNING, like an empty one (which extends what §4 says verify() tolerates), and
+the root as an empty page.
 `test/isolation/vacuum_spill_interrupted.spec` stops a VACUUM's spill between the leaves and the
 root with an ERROR (injection point `lion-spill-leaves-written`), and `test/recovery/run.sh`
 phase 1e with a crash.
