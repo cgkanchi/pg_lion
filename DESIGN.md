@@ -3255,7 +3255,7 @@ A count over a partitioned table needed a lion index for every WHERE clause in e
 counted. A clause on the partition key that no lion index covers - `kind = 'a'` over a table
 LIST-partitioned by kind - then declined the query, although pruning had left only partitions every
 row of which satisfies it: a count such as `count(*) ... WHERE kind = 'a' AND tags && '{x}' AND ts >=
-now() - interval '365 days'`, over leaves that each have a lion index on `(tags, ts, fk)`, got a
+now() - interval '30 days'`, over leaves that each have a lion index on `(tags, ts)`, got a
 parallel bitmap heap scan and no LionCount. The key clause was the only blocker: the stable range on
 `ts` is a clause value like any other the node evaluates once per scan (§10), and the same query
 without `kind = 'a'` was pushed down.
@@ -9144,11 +9144,11 @@ sections above ask of the fact side.
 
 **Measured** (2026-09-28, PostgreSQL 18, warm cache, four CPUs shared with other work; medians of
 five runs, ms). A synthetic star: a 500,000-row dimension with btrees on its filter columns that
-INCLUDE the key, and a 10,000,000-row fact LIST-partitioned by kind - `a` for half the rows,
-sub-partitioned by year on `ts` over three years, `b` and `c` - whose fk is skewed (half of the
-rows over 25,000 hot keys, the rest over all 500,000) and scattered over the heap, with one lion
-index on the parent over `(tags, ts, fk)` and a btree on fk; about 2 GB. The nested loop is into
-the leaves' fk btrees, reading the heap for the fact filters. Serial:
+INCLUDE the key, and a 10,000,000-row fact LIST-partitioned by kind into five leaves, one kind
+sub-partitioned by range on `ts`, whose fk is skewed (a small set of hot keys holds many of the
+rows) and scattered over the heap, with a partitioned lion index over the filter columns and fk and
+a btree on fk; about 2 GB. The nested loop is into the leaves' fk btrees, reading the heap for the
+fact filters. Serial:
 
 | query (fact filters) | dimension rows | node | nested loop | hash join | chosen |
 |---|---|---|---|---|---|
@@ -9165,7 +9165,7 @@ the leaves' fk btrees, reading the heap for the fact filters. Serial:
 With two workers the node wins by as much where it won serially (35 ms against 113 and 139 for
 the 5,000-row inner join; 42 against 203 and 205 grouped) and is chosen over the parallel hash
 join of the 25,000 rows at 95 ms against 125. Its misses are all one: a range on `ts` whose value
-is `now() - interval '365 days'` over a few hundred dimension rows, where a nested loop reads a
+is `now()` less an interval, over a few hundred dimension rows, where a nested loop reads a
 few thousand heap rows from a warm cache. The node then collects the range in each leaf it keeps
 (§32's "range as a source"), some two million `ts` entries from their summaries - 49 of the 54 ms
 of the 420-row semi join, none of it in the node's timers, since it happens while the filters are
