@@ -262,8 +262,8 @@ SELECT lion_tscmp($$SELECT id FROM lion_ts
 (1 row)
 
 -- ---- two index quals, and `@@ ANY (...)` --------------------------------
--- The access method answers ONE qual per scan and marks every TID for
--- recheck, so the bitmap heap scan applies the rest (DESIGN.md §5).
+-- The access method answers both and ANDs their lexeme trees, as it ANDs
+-- two columns' (DESIGN.md §5 SCAN step 5).
 SELECT lion_tscmp($$SELECT id FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'w1')
 					AND tsv @@ to_tsquery('english', 'w2')$$);

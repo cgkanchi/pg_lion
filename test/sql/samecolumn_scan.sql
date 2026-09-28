@@ -1,0 +1,295 @@
+-- Several quals on ONE key column, answered together by the index scans
+-- (DESIGN.md §5 SCAN step 5, §29.2).
+--
+-- The planner hands a key column every qual that names it: two overlaps of
+-- an array column, two matches of a tsvector, two lists or a list and an
+-- equality of a scalar column.  The bitmap and the plain scan used to answer
+-- the most selective-looking one and leave the others to the heap recheck,
+-- which then threw away every row of the answered set that the others did
+-- not select.  Every qual that is a set tree is answered now, and one
+-- column's sets are ANDed as several columns' are: the index emits the rows
+-- the quals select together and the recheck removes none of them.  A range
+-- beside its column's sets and a multi-key query that needs every row are
+-- still left to the recheck, which then removes what they do not select.
+-- Every answer is checked against a sequential scan's as a multiset, through
+-- the bitmap scan, the plain index scan and the count pushdown, on a clean
+-- heap and on a dirty one; of the plans only booleans are kept.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+/*
+ * lion_ss_bm() runs q as a BITMAP scan - every other scan and the count
+ * pushdown disabled - under EXPLAIN ANALYZE and again for its rows, and as a
+ * sequential scan, and compares the answers as multisets.  Of the plan it
+ * reports whether the recheck removed no row and, on a clean heap, whether
+ * the Bitmap Index Scan emitted exactly the rows of the answer - which it
+ * does when it answers every qual itself.
+ */
+CREATE FUNCTION lion_ss_bm(q text, clean boolean DEFAULT true) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	heap jsonb;
+	idx jsonb;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) ' || q
+		INTO j;
+	heap := jsonb_path_query_first(j, 'strict $.** ? (@."Node Type" == "Bitmap Heap Scan")');
+	idx := jsonb_path_query_first(j, 'strict $.** ? (@."Node Type" == "Bitmap Index Scan")');
+	EXECUTE 'CREATE TEMP TABLE lion_ss_on AS ' || q;
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'CREATE TEMP TABLE lion_ss_off AS ' || q;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_ss_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_ss_on EXCEPT ALL SELECT * FROM lion_ss_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_ss_off EXCEPT ALL SELECT * FROM lion_ss_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_ss_on, lion_ss_off';
+	RETURN format('%s, %s rows; as the seqscan: %s; none removed by the recheck: %s',
+				  CASE WHEN idx IS NULL THEN 'no bitmap' ELSE 'bitmap' END,
+				  nrows, ndiff = 0,
+				  (heap ->> 'Rows Removed by Index Recheck')::numeric = 0) ||
+		CASE WHEN clean
+			 THEN format('; the index emitted the answer: %s',
+						 (idx ->> 'Actual Rows')::numeric = nrows)
+			 ELSE '' END;
+END $$;
+/*
+ * lion_ss_ix() is the same through a PLAIN index scan (DESIGN.md §29), which
+ * rechecks a multi-key column's rows whatever it answers (§29.6): its recheck
+ * removes none when the index answered every qual.
+ */
+CREATE FUNCTION lion_ss_ix(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	scan jsonb;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) ' || q
+		INTO j;
+	scan := jsonb_path_query_first(j, 'strict $.** ? (@."Node Type" == "Index Scan")');
+	EXECUTE 'CREATE TEMP TABLE lion_ss_on AS ' || q;
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE 'CREATE TEMP TABLE lion_ss_off AS ' || q;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_ss_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_ss_on EXCEPT ALL SELECT * FROM lion_ss_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_ss_off EXCEPT ALL SELECT * FROM lion_ss_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_ss_on, lion_ss_off';
+	RETURN format('%s, %s rows; as the seqscan: %s; none removed by the recheck: %s',
+				  CASE WHEN scan IS NULL THEN 'no index scan' ELSE 'index scan' END,
+				  nrows, ndiff = 0,
+				  (scan ->> 'Rows Removed by Index Recheck')::numeric = 0);
+END $$;
+/*
+ * lion_ss_cnt() runs a count with every other scan disabled, so that the
+ * count pushdown is the plan whenever it is built, and again as a sequential
+ * scan with the pushdown off.
+ */
+CREATE FUNCTION lion_ss_cnt(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	a bigint;
+	b bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE q INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE q INTO b;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN format('%s, %s; as the seqscan: %s',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  a, a = b);
+END $$;
+/* Whether the plan of q, with nothing disabled, reads a lion index. */
+CREATE FUNCTION lion_ss_pick(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Index Scan (on|using) lion_ss' THEN
+			RETURN 'a lion scan';
+		END IF;
+	END LOOP;
+	RETURN 'no lion scan';
+END $$;
+
+-- ---------- the data ----------
+-- id 1 .. 12000 in heap order, seven rows a page (fillfactor 10), so that the
+-- sets spread over some thirty container keys; k: i % 40, NULL on every
+-- 101st row; tags: one element each of a0 .. a6, b0 .. b10 and c0 .. c12
+-- (i % 7, i % 11 and i % 13), so no row has two a's and an a and a b meet
+-- on one row in 77; doc: the lexemes d0 .. d4 and e0 .. e8 (i % 5, i % 9).
+-- lion_ss has one index over the three columns, k first: PostgreSQL 16 also
+-- builds an index path that leaves the `= ANY` lists of a later column to a
+-- filter, and the scans here are to answer them.  lion_ss1 holds the same
+-- rows and an index on tags alone.
+CREATE TABLE lion_ss (id int NOT NULL, k int, tags text[] NOT NULL,
+					  doc tsvector NOT NULL) WITH (fillfactor = 10);
+INSERT INTO lion_ss
+SELECT i, CASE WHEN i % 101 = 0 THEN NULL ELSE i % 40 END,
+	   ARRAY['a' || (i % 7), 'b' || (i % 11), 'c' || (i % 13)],
+	   array_to_tsvector(ARRAY['d' || (i % 5), 'e' || (i % 9)])
+  FROM generate_series(1, 12000) i;
+CREATE TABLE lion_ss1 (LIKE lion_ss) WITH (fillfactor = 10);
+INSERT INTO lion_ss1 SELECT * FROM lion_ss ORDER BY id;
+CREATE INDEX lion_ss_i ON lion_ss USING lion (k, tags, doc);
+CREATE INDEX lion_ss1_tags ON lion_ss1 USING lion (tags);
+VACUUM (FREEZE, ANALYZE) lion_ss, lion_ss1;
+
+-- ---------- 1. two quals on one column, through the bitmap scan ----------
+-- two overlaps, an AND and an overlap, three of them, two tsquery matches,
+-- two lists, an equality and a list: the index emits their AND, and the
+-- recheck removes nothing
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags @> '{a1}' AND tags && '{b2,b3}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2}' AND tags && '{c3,c4}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE doc @@ 'd1'::tsquery AND doc @@ 'e2 | e3'::tsquery$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k = ANY ('{1,2,3,4}') AND k = ANY ('{3,4,5}')$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k = 3 AND k = ANY ('{3,4,5}')$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss1 WHERE tags && '{a1}' AND tags && '{b2}'$$);
+-- ... beside the other columns' quals, and beside a range on another column
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}' AND k = ANY ('{1,2,3}')$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2}' AND doc @@ 'd1'::tsquery AND doc @@ 'e2 | e4'::tsquery$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE doc @@ 'd1'::tsquery AND doc @@ 'e2'::tsquery AND k = ANY ('{1,6,11,16,21}') AND k = ANY ('{6,11,26}')$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}' AND k < 20$$);
+-- `IS NOT NULL` beside a strict qual of its column is implied by it, and
+-- `IS NULL` of one column beside another column's quals is a set as ever
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k IS NOT NULL AND k = ANY ('{1,2}') AND tags && '{b3}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k IS NULL AND tags && '{a1}'$$);
+
+-- ---------- 2. contradictions: nothing, and nothing to recheck ----------
+-- no row has two a's; k = 3 is not 4 or 5; a NULL k is not 4 or 5; `&& '{}'`
+-- holds of no array
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags @> '{a1}' AND tags @> '{a2}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k = 3 AND k = ANY ('{4,5}')$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k IS NULL AND k = ANY ('{4,5}')$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{}'$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags @> '{a1}' AND tags @> '{a2}'$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE k IS NULL AND k = ANY ('{4,5}')$$);
+
+-- ---------- 3. what the index still leaves to the recheck ----------
+-- a range beside its column's sets (k = 30 is not below 20), and a multi-key
+-- query that needs every row (a NULL element) beside one the sets answer:
+-- the recheck removes the rows the dropped qual does not select.  Two such
+-- queries and nothing else walk the whole column, rechecked.
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k = ANY ('{1,2,3,30}') AND k < 20 AND tags && '{a1}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1,NULL}' AND tags && '{b2}'$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags @> '{}' AND tags && '{a1,NULL}'$$);
+
+-- ---------- 4. the plain index scan, every shape ----------
+-- sets (SETS), a range beside them walked entry by entry (WALK: five
+-- entries) and in windows (WINDOW: thirty entries, several windows at the
+-- least window there is).  No plan shows the shape: each query is built to
+-- take one, and its answer is what is checked.
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE doc @@ 'd1'::tsquery AND doc @@ 'e2 | e3'::tsquery$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE k = ANY ('{1,2,3,4}') AND k = ANY ('{3,4,5}')$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2}' AND doc @@ 'd1'::tsquery AND doc @@ 'e2 | e4'::tsquery$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss1 WHERE tags && '{a1}' AND tags && '{b2}'$$);
+SET pg_lion.scan_window_floor = '64kB';
+SET work_mem = '64kB';
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}' AND k < 5$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2,b3}' AND k < 30$$);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2,b3}' AND k < 30$$);
+-- a list longer than a batch (32 values at 64kB) with a short one on its
+-- column (LIST) is exact; a second long list is left to the recheck
+SELECT lion_ss_ix(format($$SELECT id FROM lion_ss WHERE k = ANY (%L::int[]) AND k = ANY ('{3,5,38}') AND tags && '{a1}'$$,
+						 (SELECT array_agg(g)::text FROM generate_series(0, 35) g)));
+SELECT lion_ss_ix(format($$SELECT id FROM lion_ss WHERE k = ANY (%L::int[]) AND k = ANY (%L::int[]) AND tags && '{a1}'$$,
+						 (SELECT array_agg(g)::text FROM generate_series(0, 35) g),
+						 (SELECT array_agg(g)::text FROM generate_series(4, 39) g)));
+RESET work_mem;
+RESET pg_lion.scan_window_floor;
+-- a multi-key column read whole (UNION), rechecked
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags @> '{}' AND tags && '{a1,NULL}'$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1,NULL}' AND tags && '{b2}'$$);
+
+-- ---------- 5. the count pushdown ANDs them too ----------
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE doc @@ 'd1'::tsquery AND doc @@ 'e2 | e3'::tsquery$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE k = ANY ('{1,2,3,4}') AND k = ANY ('{3,4,5}') AND tags && '{a1}'$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}' AND k < 20$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE tags @> '{a1}' AND tags @> '{a2}'$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss1 WHERE tags && '{a1}' AND tags && '{b2}'$$);
+
+-- ---------- 6. the cost model prices the AND the scan makes ----------
+-- a query that needs every row (a NULL element) beside one the sets answer:
+-- the scan answers the second, whichever comes first, and the planner takes
+-- the lion scan for a result on one row in 77.  It used to price the first
+-- qual alone - a walk of the whole index and a recheck of every row - and
+-- took the sequential scan.
+SELECT lion_ss_pick($$SELECT id FROM lion_ss1 WHERE tags && '{a1,NULL}' AND tags && '{b2}'$$);
+SELECT lion_ss_pick($$SELECT id FROM lion_ss1 WHERE tags && '{b2}' AND tags && '{a1,NULL}'$$);
+
+-- ---------- 7. a dirty heap ----------
+-- every 17th row moved to a1, b2 and k + 1, every 19th deleted, no VACUUM:
+-- the index still holds the old versions, which the heap turns away, and the
+-- recheck still removes nothing
+UPDATE lion_ss SET tags = ARRAY['a1', 'b2', 'c0'], k = k + 1 WHERE id % 17 = 0;
+DELETE FROM lion_ss WHERE id % 19 = 0;
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$, false);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}' AND k = ANY ('{1,2,3}')$$, false);
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE k = ANY ('{1,2,3,4}') AND k = ANY ('{3,4,5}')$$, false);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2,b3}' AND k < 30$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE k = ANY ('{1,2,3,4}') AND k = ANY ('{3,4,5}') AND tags && '{a1}'$$);
+-- ... and after VACUUM, which takes the old versions out of the sets
+VACUUM (FREEZE) lion_ss;
+SELECT lion_ss_bm($$SELECT id FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$, false);
+SELECT lion_ss_ix($$SELECT id FROM lion_ss WHERE tags && '{a1,a2}' AND tags && '{b2,b3}' AND k < 30$$);
+SELECT lion_ss_cnt($$SELECT count(*) FROM lion_ss WHERE tags && '{a1}' AND tags && '{b2}'$$);
+
+SELECT lion_index_verify('lion_ss_i', true);
+DROP TABLE lion_ss, lion_ss1;
+DROP FUNCTION lion_ss_bm(text, boolean);
+DROP FUNCTION lion_ss_ix(text);
+DROP FUNCTION lion_ss_cnt(text);
+DROP FUNCTION lion_ss_pick(text);
