@@ -57,7 +57,8 @@ INSERT INTO lion_wr SELECT i, i FROM generate_series(100000, 130000) i;
 
 -- Removal: VACUUM rewrites containers under a cleanup lock, deletes the
 -- entries it empties and hands the pages they owned back to the free space
--- map.
+-- map - and then counts the keys that are left onto the meta page, for the
+-- planner (the META record, DESIGN.md §33).
 DELETE FROM lion_wr WHERE k >= 100000;
 VACUUM (FREEZE) lion_wr;
 

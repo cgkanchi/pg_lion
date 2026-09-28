@@ -426,6 +426,63 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 
 #define LionPageGetMeta(page)	((LionMetaPageData *) PageGetContents(page))
 
+/*
+ * THE DISTINCT KEYS OF EACH KEY COLUMN (DESIGN.md §33), for the planner's
+ * n_distinct.  The reserved words of LionMetaPageData are all spent, so they
+ * follow it on the meta page, at LION_META_NDISTINCT_OFFSET, and are there
+ * only when pd_lower covers them.  A meta page written before §33 ends at
+ * LionMetaPageData, which is what pd_lower says, and reads as one without
+ * counts - the zero that "no count" is everywhere else.  A build writes the
+ * area, and a meta page without one gets it from the first VACUUM or ANALYZE
+ * that counts; nothing before §33 reads past LionMetaPageData, which is why
+ * the format version does not move (§33, "Format").
+ *
+ *	valid_cols	bit i - 1: ndistinct[i - 1] is key column i's count.  A
+ *				multi-key column's keys are elements, not values of the
+ *				column, and it never has one.
+ *	rows		the rows the index held when it was counted: the TIDs under
+ *				its first scalar key column's entries, NULL entry included.
+ *				ANALYZE's convention divides by it (§33, "The value"), and
+ *				the planner compares it with the table's rows to tell a
+ *				count the table has outgrown (§33, "Stale counts").
+ *	ndistinct	the VALUE entries of each key column - neither its NULL nor
+ *				its EMPTY entry, nor a summary (§32).  A key whose rows are
+ *				all dead is counted until VACUUM deletes its entry: an
+ *				estimate, as ANALYZE's own is.
+ *
+ * Nothing in it says when it was counted: a build writes exactly the bytes
+ * every other build of the same rows writes, whatever the memory, the workers
+ * or the snapshot (test/sql/build.sql compares them), and a time would differ.
+ *
+ * The array has room for 32 columns whatever INDEX_MAX_KEYS this server was
+ * built with, so that the layout does not depend on it (ordered_cols above
+ * already caps a lion index at 32 key columns).
+ */
+#define LION_META_MAX_COLS		32
+
+typedef struct LionMetaNdistinct
+{
+	uint32		valid_cols;
+	uint32		unused;			/* zero */
+	uint64		rows;
+	uint64		ndistinct[LION_META_MAX_COLS];
+} LionMetaNdistinct;
+
+StaticAssertDecl(INDEX_MAX_KEYS <= LION_META_MAX_COLS,
+				 "lion's meta page counts the keys of at most 32 key columns");
+StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
+				 "the lion meta page's key counts must not change size");
+
+#define LION_META_NDISTINCT_OFFSET \
+	(MAXALIGN(SizeOfPageHeaderData) + MAXALIGN(sizeof(LionMetaPageData)))
+#define LION_META_NDISTINCT_END \
+	(LION_META_NDISTINCT_OFFSET + sizeof(LionMetaNdistinct))
+#define LionPageGetMetaNdistinct(page) \
+	((LionMetaNdistinct *) ((char *) (page) + LION_META_NDISTINCT_OFFSET))
+/* Does this meta page carry the counts at all? */
+#define LionMetaHasNdistinct(page) \
+	(((PageHeader) (page))->pd_lower >= LION_META_NDISTINCT_END)
+
 /* The first block after the meta page; where ambuild puts the first leaf. */
 #define LION_FIRST_BLKNO		((BlockNumber) 1)
 
@@ -846,6 +903,29 @@ lion_column(LionIndexState *ix, AttrNumber attno)
 {
 	Assert(attno >= 1 && attno <= ix->ncolumns);
 	return &ix->cols[attno - 1];
+}
+
+/*
+ * The key column whose postings count the index's ROWS (DESIGN.md §18,
+ * "Statistics"): its first scalar one.  A scalar column files every row the
+ * index holds under exactly one of its entries - the NULL entry for a NULL -
+ * so the ntids of its entries add up to the rows, where the postings of the
+ * whole index count a row once per key column, once per element of a
+ * multi-key column, and again in a SUMMARY of its bucket.  0 when every key
+ * column is multi-key: a row may be filed under any number of their entries,
+ * and nothing short of the union of them all says how many rows there are.
+ */
+static inline AttrNumber
+lion_index_row_column(const LionIndexState *ix)
+{
+	int			i;
+
+	for (i = 0; i < ix->ncolumns; i++)
+	{
+		if (!ix->cols[i].multikey)
+			return (AttrNumber) (i + 1);
+	}
+	return InvalidAttrNumber;
 }
 
 /* ---------- multi-key extraction (DESIGN.md §17, lion_multikey.c) ---------- */
@@ -1519,6 +1599,23 @@ extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
  */
 extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
+
+/*
+ * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of
+ * ix's columns from the VALUE entries of each (nvalues[], one per key column)
+ * and the rows under its first scalar column, taken now; put it on a meta page
+ * image nothing else can see yet (ambuild); write it on the index's meta page
+ * in a WAL record of its own (VACUUM and ANALYZE); read it back, false when the
+ * meta page carries none.
+ */
+extern void lion_meta_fill_ndistinct(LionMetaNdistinct *nd,
+									 const LionIndexState *ix,
+									 const uint64 *nvalues, uint64 rows);
+extern void lion_meta_record_ndistinct(Page metapage,
+									   const LionMetaNdistinct *nd);
+extern void lion_meta_write_ndistinct(Relation index,
+									  const LionMetaNdistinct *nd);
+extern bool lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd);
 
 /*
  * Like lion_find_entry(), but with the comparison functions the caller wants:

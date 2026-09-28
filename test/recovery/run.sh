@@ -1707,7 +1707,7 @@ standby_index_only() {
 # primary, one of a few dense keys and one of many text keys, each verified on
 # the standby and counted there against the primary's heap.
 standby_build_replay() {
-	local nk nt
+	local nk nt i
 	log ""
 	log "-- standby: index builds replayed"
 
@@ -1733,11 +1733,65 @@ standby_build_replay() {
 		union all
 		select lion_index_count('lion_built_t'::regclass, 'key-17'::text) = $nt, 't = key-17 counted through the replayed build'"
 
+	# DESIGN.md §33: the key counts on the meta page, as the build wrote them
+	# and as an ANALYZE and a VACUUM of the primary write them again, each in
+	# a META record: the standby reads what the primary does.  The ANALYZE's
+	# are exact - 1000 new keys of t and one of k, every row live, and a
+	# directory well inside what ANALYZE may walk.  The VACUUM's are counted
+	# by ambulkdelete's own walk, so the VACUUM that counts is one that
+	# removes the rows: with hot_standby_feedback on, the primary's horizon is
+	# the standby's last report, and the VACUUM is retried until it has
+	# removed them (standby_chain_reuse does the same) - until the primary
+	# counts t's and k's keys back at 5000 and 7.
+	standby_ndistinct_check "standby key counts after the build" 5000 7
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_build_replay: ANALYZE failed"
+		SET synchronous_commit = on;
+		INSERT INTO lion_built SELECT i, 7, 'new-' || i FROM generate_series(1, 1000) i;
+		ANALYZE lion_built;
+	SQL
+	standby_ndistinct_check "standby key counts after ANALYZE" 6000 8
+	psql_p -c "SET synchronous_commit = on; DELETE FROM lion_built WHERE t LIKE 'new-%'" \
+		>>"$RUNLOG" 2>&1 || die "standby_build_replay: DELETE failed"
+	wait_catchup
+	for i in $(seq 1 40); do
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_built" >>"$RUNLOG" 2>&1 ||
+			die "standby_build_replay: VACUUM failed"
+		[ "$(psql_p -tAc "select ndistinct from lion_index_stats('lion_built_t')")" = 5000 ] &&
+			break
+		nap 0.5
+	done
+	standby_ndistinct_check "standby key counts after VACUUM" 5000 7
+
 	psql_p -c "DROP TABLE lion_built" >>"$RUNLOG" 2>&1
 	wait_catchup
 
-	log "standby: two index builds replayed, verified and counted ($nk and $nt rows)"
+	log "standby: two index builds replayed, verified and counted ($nk and $nt rows), and their key counts read as the primary wrote them"
 	SUMMARY+=("phase2 standby      two index builds replayed, verified and counted")
+	SUMMARY+=("phase2 standby      key counts of a build, an ANALYZE and a VACUUM replayed (§33)")
+}
+
+# standby_ndistinct_check <label> <t's count> <k's count>
+#
+# The ndistinct of lion_built_t and lion_built_k (lion_index_stats(), DESIGN.md
+# §33) on the standby, once it has replayed everything, against the primary's
+# - and against the counts given, when they are.
+standby_ndistinct_check() {
+	local label=$1 want_t=$2 want_k=$3 nd_t nd_k
+	nd_t=$(psql_p -tAc "select ndistinct from lion_index_stats('lion_built_t')")
+	nd_k=$(psql_p -tAc "select ndistinct from lion_index_stats('lion_built_k')")
+	if [ -z "$nd_t" ] || [ -z "$nd_k" ]; then
+		die "$label: the primary records no key count"
+	fi
+	if [ -n "$want_t" ] && { [ "$nd_t" != "$want_t" ] || [ "$nd_k" != "$want_k" ]; }; then
+		die "$label: the primary counted $nd_t and $nd_k keys, not $want_t and $want_k"
+	fi
+	wait_catchup
+	run_check "$label" psql_s "
+		select ndistinct = $nd_t, 'lion_built_t: $nd_t keys, as the primary counted them'
+		  from lion_index_stats('lion_built_t')
+		union all
+		select ndistinct = $nd_k, 'lion_built_k: $nd_k keys, as the primary counted them'
+		  from lion_index_stats('lion_built_k')"
 }
 
 phase2() {
