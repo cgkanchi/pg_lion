@@ -3258,7 +3258,11 @@ participant of a parallel plan), and extracted per relation counted:
 clause `col op value` with the clause's operator and this scan's value, the column numbered as the
 index that answers it says, which for a partition is the partition's own numbering (§16) - and hangs
 it on the visibility cache every count of the execution is handed (`lion_vis_cache_set_filter()`),
-so that no caller of the count changes.  A count that finds one:
+so that no caller of the count changes.  The operator's function is handed the call expression the
+parser built, relabels included, since a polymorphic function reads its argument types from it
+(`get_fn_expr_argtype()`): a column of a domain over an array reaches `@>(anyarray, anyarray)` as the
+base type, never as the domain (`lion_arg_type_passed()`; the 2026-09-27 review,
+`test/sql/rowfilter_domain.sql`).  A count that finds one:
 
 - asks nothing of the visibility map: it vouches for visibility, not for the query.  Every candidate
   TID goes to the heap recheck, as on a standby or with no pinned source (§9's `novm`);

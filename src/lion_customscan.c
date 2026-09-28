@@ -9897,6 +9897,51 @@ lion_save_clause_key(LionCountScanState *st, LionClauseState *cl,
 }
 
 /*
+ * The type an argument of type `type` has when the parser hands it to a
+ * function that declares `declared` (coerce_type(), parse_coerce.c), for the
+ * row filter below, which rebuilds the call the executor would have made.  The
+ * clause analysis peeled the relabels off both operands (lion_strip()), so the
+ * column is a bare Var of its own type and the value an expression of its own
+ * - a domain, say - where the parser had passed:
+ *
+ *	- the actual type, domains included, to an argument of that very type and
+ *	  to one declared any, anyelement, anynonarray, anycompatible or
+ *	  anycompatiblenonarray;
+ *	- the BASE type to the other polymorphic types (anyarray, anyrange, ...),
+ *	  which relabel a domain over an array, a range or an enum to what it is
+ *	  over: a function declared on anyarray never sees the domain;
+ *	- and the declared type itself to any other argument, which can only have
+ *	  got here by a binary coercion - of a domain over that type, or of a
+ *	  type binary-coercible to it.
+ */
+static Oid
+lion_arg_type_passed(Oid type, Oid declared)
+{
+	if (!OidIsValid(declared) || type == declared)
+		return type;
+
+	switch (declared)
+	{
+		case ANYOID:
+		case ANYELEMENTOID:
+		case ANYNONARRAYOID:
+		case ANYCOMPATIBLEOID:
+		case ANYCOMPATIBLENONARRAYOID:
+			return type;
+		case ANYARRAYOID:
+		case ANYENUMOID:
+		case ANYRANGEOID:
+		case ANYMULTIRANGEOID:
+		case ANYCOMPATIBLEARRAYOID:
+		case ANYCOMPATIBLERANGEOID:
+		case ANYCOMPATIBLEMULTIRANGEOID:
+			return getBaseType(type);
+		default:
+			return declared;
+	}
+}
+
+/*
  * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
  * query known only at run time"), as a row filter over the relation being
  * counted, set on the visibility cache every count of this execution is
@@ -9945,6 +9990,11 @@ lion_build_filter(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[i];
 		LionRowFilterClause *c;
 		Form_pg_attribute att;
+		Oid			lefttype;
+		Oid			righttype;
+		Oid			coltype;
+		Oid			valtype;
+		Expr	   *col;
 		int16		typlen;
 		bool		typbyval;
 
@@ -9964,18 +10014,28 @@ lion_build_filter(LionCountScanState *st)
 		/*
 		 * The call the executor would have made for the clause, expression
 		 * included, which is what a polymorphic operator's function asks
-		 * its argument types of (get_fn_expr_argtype()).
+		 * its argument types of (get_fn_expr_argtype()).  That includes the
+		 * parser's relabels (lion_arg_type_passed()): a column of a domain
+		 * over int[] reaches `@>(anyarray, anyarray)` as int[], and the Var
+		 * alone would have shown the function the domain (the 2026-09-27
+		 * review).  The value is a Const of the type the parser would have
+		 * given it, as constant folding leaves a relabelled literal.
 		 */
 		att = TupleDescAttr(RelationGetDescr(st->heap), c->attno - 1);
-		get_typlenbyval(cl->valtype, &typlen, &typbyval);
+		op_input_types(cl->opno, &lefttype, &righttype);
+		col = (Expr *) makeVar(1, c->attno, att->atttypid, att->atttypmod,
+							   att->attcollation, 0);
+		coltype = lion_arg_type_passed(att->atttypid, lefttype);
+		if (coltype != att->atttypid)
+			col = (Expr *) makeRelabelType(col, coltype, -1,
+										   type_is_collatable(coltype) ?
+										   att->attcollation : InvalidOid,
+										   COERCE_IMPLICIT_CAST);
+		valtype = lion_arg_type_passed(cl->valtype, righttype);
+		get_typlenbyval(valtype, &typlen, &typbyval);
 		fmgr_info_set_expr((Node *)
-						   make_opclause(cl->opno, BOOLOID, false,
-										 (Expr *) makeVar(1, c->attno,
-														  att->atttypid,
-														  att->atttypmod,
-														  att->attcollation,
-														  0),
-										 (Expr *) makeConst(cl->valtype, -1,
+						   make_opclause(cl->opno, BOOLOID, false, col,
+										 (Expr *) makeConst(valtype, -1,
 															InvalidOid,
 															typlen, cl->val,
 															false, typbyval),

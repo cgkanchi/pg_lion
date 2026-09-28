@@ -1,0 +1,111 @@
+-- The heap recheck of a multi-key clause whose query the pushdown only has at
+-- run time (DESIGN.md §17, "A query known only at run time") calls the
+-- clause's operator itself, with the call expression the executor would have
+-- built - which is what a polymorphic function asks its argument types of
+-- (get_fn_expr_argtype()).  On a column of a domain over an array, the parser
+-- hands `@>(anyarray, anyarray)` the column relabelled to the BASE type, and
+-- the row filter used to hand it the bare column, of the domain type (the
+-- 2026-09-27 review).  The operator below is a containment that also says
+-- whether its function was shown the base type, so a filter built with the
+-- domain rejects every row.  `'{}'` is a query no key narrows (every row is a
+-- candidate, rechecked); `'{1}'` is answered exactly and never rechecked.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+CREATE DOMAIN lion_rfd_ints AS int[];
+CREATE FUNCTION lion_rfd_contains(anyarray, anyarray) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+BEGIN
+	RETURN $1 @> $2 AND pg_typeof($1) = 'integer[]'::regtype;
+END $$;
+CREATE OPERATOR @>> (LEFTARG = anyarray, RIGHTARG = anyarray,
+					 FUNCTION = lion_rfd_contains);
+CREATE OPERATOR CLASS lion_rfd_ops FOR TYPE anyarray USING lion AS
+	OPERATOR	2	@>> (anyarray, anyarray),
+	FUNCTION	2	ginarrayextract(anyarray, internal, internal),
+	FUNCTION	3	ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
+	STORAGE		anyelement;
+/*
+ * lion_rfd() prepares q, whose $1 is an int[], under a generic plan, which
+ * keeps $1 a Param, and executes it with args through the pushdown with every other scan disabled,
+ * then prepares it again with the pushdown off and executes it as a
+ * sequential scan, and returns the pushdown's answer - after proving the two
+ * equal.
+ */
+CREATE FUNCTION lion_rfd(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	got text;
+	want text;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_rfd_on(int[]) AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_rfd_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE 'CREATE TEMP TABLE lion_rfd_r AS EXECUTE lion_rfd_on(' || args || ')';
+	EXECUTE 'SELECT r::text FROM lion_rfd_r r' INTO got;
+	EXECUTE 'DROP TABLE lion_rfd_r';
+	EXECUTE 'DEALLOCATE lion_rfd_on';
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE 'PREPARE lion_rfd_off(int[]) AS ' || q;
+	EXECUTE 'CREATE TEMP TABLE lion_rfd_r AS EXECUTE lion_rfd_off(' || args || ')';
+	EXECUTE 'SELECT r::text FROM lion_rfd_r r' INTO want;
+	EXECUTE 'DROP TABLE lion_rfd_r';
+	EXECUTE 'DEALLOCATE lion_rfd_off';
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	IF got IS DISTINCT FROM want THEN
+		RETURN format('MISMATCH: %s, expected %s', got, want);
+	END IF;
+	RETURN format('%s, %s',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  got);
+END $$;
+/*
+ * g = 1 holds for 234 of the 700 rows; `@> '{1}'` for the 140 whose first
+ * element is 1, 47 of them with g = 1.
+ */
+CREATE TABLE lion_rfd (tags lion_rfd_ints NOT NULL, g int NOT NULL);
+INSERT INTO lion_rfd SELECT ARRAY[i % 5, 10 + i % 7], i % 3 FROM generate_series(1, 700) i;
+CREATE INDEX lion_rfd_tags ON lion_rfd USING lion (tags lion_rfd_ops);
+CREATE INDEX lion_rfd_g ON lion_rfd USING lion (g);
+VACUUM ANALYZE lion_rfd;
+SELECT lion_rfd('SELECT count(*) FROM lion_rfd WHERE tags @>> $1 AND g = 1',
+				$$'{}'::int[]$$);
+      lion_rfd      
+--------------------
+ pushed down, (234)
+(1 row)
+
+SELECT lion_rfd('SELECT count(*) FROM lion_rfd WHERE tags @>> $1 AND g = 1',
+				$$'{1}'::int[]$$);
+     lion_rfd      
+-------------------
+ pushed down, (47)
+(1 row)
+
+DROP TABLE lion_rfd;
+DROP FUNCTION lion_rfd(text, text);
+DROP OPERATOR FAMILY lion_rfd_ops USING lion;
+DROP OPERATOR @>> (anyarray, anyarray);
+DROP FUNCTION lion_rfd_contains(anyarray, anyarray);
+DROP DOMAIN lion_rfd_ints;
