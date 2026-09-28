@@ -76,9 +76,10 @@ typedef union LionContainerBuf
  * and_cardinality() of two bitsets costs too).  What a reader does check is
  * the header and the size: lion_inline_fetch() refuses an item whose type is
  * not one of the four or whose lion_item_size() is past the payload or past
- * LION_CONTAINER_MAX_SIZE.  So everything in this file is written to be
- * memory-safe for ANY payload behind a header of a valid type, which costs a
- * mask or a comparison where the payload meets an index:
+ * LION_CONTAINER_MAX_SIZE, and lion_page_item_fetch() does the same for an
+ * item on a page, its line pointer included.  So everything in this file is
+ * written to be memory-safe for ANY payload behind a header of a valid type,
+ * which costs a mask or a comparison where the payload meets an index:
  *
  *	- A count is never trusted to size a loop past the largest legal
  *	  container.  array_card() and run_nruns() clamp the member and run counts
@@ -100,16 +101,18 @@ typedef union LionContainerBuf
  *	  RUN is walked strictly ascending, skipping what an earlier run already
  *	  covered, so that a caller never sees more than LION_CONTAINER_RANGE
  *	  members of one container - which is the size lion_container_to_array()
- *	  promises its output array needs.
+ *	  promises its output array needs.  The same goes for what a result of
+ *	  the set algebra stores (array_out()), because a result is handed on.
  *
  * For a well-formed container every one of these is a no-op, and every
  * result is byte for byte what it was without them.  For a damaged one the
  * results are unspecified - lion_container_check() is what says why - but
  * deterministic, which WAL replay relies on: redo runs this same code on the
  * same bytes (DESIGN.md §25).  Assert() states the caller's side of each
- * contract - the arguments, and the ordering the bulk builder is promised -
- * and never what a container's bytes say, so that an assert-enabled build
- * does not stop in here on a damaged page any more than a production one.
+ * contract - the arguments - and never what a container's bytes say, nor the
+ * order of the values the bulk builder is handed, which one of its callers
+ * reads off a page; so an assert-enabled build does not stop in here on a
+ * damaged page any more than a production one.
  *
  * Measured in instructions (callgrind, -O2, 2026-09-25): and_cardinality()
  * and contains() of every type pair within 0 - 8% of what they were (six more
@@ -567,7 +570,7 @@ run_locate(const LionRun *runs, uint32 nruns, uint32 lo)
  * ----------------------------------------------------------------
  */
 
-/* w |= c */
+/* w |= c; exported as lion_container_or_into_bitset() */
 static void
 container_or_bitset(const LionContainer *c, uint64 *w)
 {
@@ -1309,17 +1312,32 @@ lion_container_remove(LionContainer *c, uint16 lo)
 	}
 }
 
+/*
+ * The builder is promised ascending, unique values in range, and a well-formed
+ * input keeps that promise; but one of its callers expands a sparse segment
+ * straight off a page (lion_cursor_emit_segment()), whose pairs are data.  So
+ * the promise is checked rather than Assert()ed, as everything here that
+ * meets disk bytes is ("untrusted containers"): a value is masked into range,
+ * one that does not ascend is added the slow way - which keeps the members
+ * sorted and unique whatever order they came in - and one a BITSET already
+ * holds is not counted twice.  For a well-formed input that is one comparison
+ * per member and the same bytes as before.
+ */
 void
 lion_container_append_sorted(LionContainer *c, uint16 lo)
 {
-	Assert((uint32) lo <= LION_LO_MAX);
+	lo &= (uint16) LION_LO_MASK;
 
 	if (c->type == LION_CT_ARRAY)
 	{
 		uint16	   *arr = array_mdata(c);
 		uint32		n = c->cardinality;
 
-		Assert(n == 0 || arr[n - 1] < lo);
+		if (unlikely(n > 0 && n <= LION_ARRAY_MAX_CARD && arr[n - 1] >= lo))
+		{
+			(void) lion_container_add(c, lo);
+			return;
+		}
 		if (n < LION_ARRAY_MAX_CARD)
 		{
 			arr[n] = lo;
@@ -1333,7 +1351,8 @@ lion_container_append_sorted(LionContainer *c, uint16 lo)
 	{
 		uint64	   *w = bitset_mdata(c);
 
-		Assert(!bits_test(w, lo));
+		if (unlikely(bits_test(w, lo)))
+			return;
 		bits_set(w, lo);
 		c->cardinality++;
 		return;
@@ -1431,6 +1450,112 @@ lion_container_to_array(const LionContainer *c, uint16 *out)
 
 	Assert(n <= LION_CONTAINER_RANGE);
 	return n;
+}
+
+
+/* ----------------------------------------------------------------
+ *				images for the count engine
+ *
+ * Two readers the count engine (lion_count.c) used to carry copies of, and
+ * which met page bytes without the masks above: an ARRAY member or a RUN past
+ * the range wrote up to 12 KiB past a 4 KiB image, or set block bits past
+ * LION_BLOCKS_PER_CONTAINER through undefined shifts (2026-09-27 review).
+ * They live here so that they are written, and unit-tested, like everything
+ * else that reads a container.
+ * ----------------------------------------------------------------
+ */
+
+void
+lion_container_or_into_bitset(const LionContainer *c, uint64 *w)
+{
+	container_or_bitset(c, w);
+}
+
+/*
+ * One pass over the container, whatever its representation.  The obvious
+ * alternative - lion_container_range_cardinality() once per block range - is
+ * LION_BLOCKS_PER_CONTAINER binary searches whether the container holds three
+ * members or thirty-two thousand, and that cost is paid even when the answer
+ * is going to be "all of it is all-visible, count the cardinality".
+ *
+ * A member is masked and a run clamped exactly as iterate() takes them, so
+ * the bit of every block that iterate() hands out a member of is set - the
+ * count engine queues exactly those members for a heap recheck, and a block
+ * missing here would have its members counted without a look at the
+ * visibility map - and no bit at or above LION_BLOCKS_PER_CONTAINER ever is:
+ * the engine indexes an array of that many flags with them.
+ */
+#define LION_BITSET_WORDS_PER_BLOCK	(LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER)
+
+StaticAssertDecl(LION_BITSET_WORDS_PER_BLOCK * LION_BLOCKS_PER_CONTAINER ==
+				 LION_BITSET_WORDS,
+				 "pg_lion: bitset words do not divide evenly among heap blocks");
+
+/* the bits of the LION_BLOCKS_PER_CONTAINER blocks, all 64 at BLCKSZ 8K */
+#define LION_BLOCK_BITS		(LION_ALL_ONES >> (64 - LION_BLOCKS_PER_CONTAINER))
+
+uint64
+lion_container_block_mask(const LionContainer *c)
+{
+	uint64		mask = 0;
+	uint32		i;
+
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(c);
+				uint32		n = array_card(c);
+
+				for (i = 0; i < n; i++)
+					mask |= UINT64CONST(1) <<
+						((arr[i] & LION_LO_MASK) >> LION_OFFSET_BITS);
+				break;
+			}
+		case LION_CT_BITSET:
+			{
+				const uint64 *w = bitset_cdata(c);
+				uint32		b;
+
+				for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+				{
+					uint64		any = 0;
+					uint32		k;
+
+					for (k = 0; k < LION_BITSET_WORDS_PER_BLOCK; k++)
+						any |= w[b * LION_BITSET_WORDS_PER_BLOCK + k];
+					if (any != 0)
+						mask |= UINT64CONST(1) << b;
+				}
+				break;
+			}
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(c);
+				uint32		nruns = run_nruns(c);
+
+				for (i = 0; i < nruns; i++)
+				{
+					int32		last = run_last(&runs[i]);
+					uint32		first_blk;
+					uint32		last_blk;
+
+					if ((int32) runs[i].start > last)
+						continue;	/* starts past the range: empty */
+					first_blk = (uint32) runs[i].start >> LION_OFFSET_BITS;
+					last_blk = (uint32) last >> LION_OFFSET_BITS;
+					mask |= (LION_ALL_ONES >> (63 - last_blk)) &
+						(LION_ALL_ONES << first_blk);
+				}
+				break;
+			}
+		default:
+			Assert(false);
+			break;
+	}
+
+	/* a no-op, given the above; the engine's flag array is that long */
+	return mask & LION_BLOCK_BITS;
 }
 
 
@@ -1611,10 +1736,12 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 	uint32		removed;
 
 	Assert((uint32) lo_start <= LION_LO_MAX && (uint32) lo_end <= LION_LO_MAX);
+
+	/* first, like every mutator: an early return leaves a container too */
+	container_clamp(c);
 	if (lo_start > lo_end || c->cardinality == 0)
 		return 0;
 
-	container_clamp(c);
 	switch (c->type)
 	{
 		case LION_CT_ARRAY:
@@ -1730,6 +1857,20 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
  * ----------------------------------------------------------------
  */
 
+/*
+ * An ARRAY operand's member as a result stores it: masked into range, which
+ * is how bits_test() and iterate() read it.  The merges below compare the
+ * members as they are, and for a well-formed operand that is the same thing;
+ * but a result is handed on - into a caller's bitset image, into the next
+ * operation, onto a page - and must not carry a damaged operand's member past
+ * LION_LO_MAX with it ("untrusted containers").  One AND per member written.
+ */
+static inline uint16
+array_out(uint16 lo)
+{
+	return (uint16) (lo & LION_LO_MASK);
+}
+
 /* Intersection of two sorted arrays; out gets at most min(na, nb) values. */
 static uint32
 array_intersect(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
@@ -1754,7 +1895,7 @@ array_intersect(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 			if (li >= nlarge)
 				break;
 			if (large[li] == small[i])
-				out[n++] = small[i];
+				out[n++] = array_out(small[i]);
 		}
 		return n;
 	}
@@ -1767,7 +1908,7 @@ array_intersect(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 			j++;
 		else
 		{
-			out[n++] = a[i];
+			out[n++] = array_out(a[i]);
 			i++;
 			j++;
 		}
@@ -1786,19 +1927,19 @@ array_union(const uint16 *a, uint32 na, const uint16 *b, uint32 nb, uint16 *out)
 	while (i < na && j < nb)
 	{
 		if (a[i] < b[j])
-			out[n++] = a[i++];
+			out[n++] = array_out(a[i++]);
 		else if (a[i] > b[j])
-			out[n++] = b[j++];
+			out[n++] = array_out(b[j++]);
 		else
 		{
-			out[n++] = a[i++];
+			out[n++] = array_out(a[i++]);
 			j++;
 		}
 	}
 	while (i < na)
-		out[n++] = a[i++];
+		out[n++] = array_out(a[i++]);
 	while (j < nb)
-		out[n++] = b[j++];
+		out[n++] = array_out(b[j++]);
 	return n;
 }
 
@@ -1814,7 +1955,7 @@ array_difference(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 	while (i < na && j < nb)
 	{
 		if (a[i] < b[j])
-			out[n++] = a[i++];
+			out[n++] = array_out(a[i++]);
 		else if (a[i] > b[j])
 			j++;
 		else
@@ -1824,7 +1965,7 @@ array_difference(const uint16 *a, uint32 na, const uint16 *b, uint32 nb,
 		}
 	}
 	while (i < na)
-		out[n++] = a[i++];
+		out[n++] = array_out(a[i++]);
 	return n;
 }
 
@@ -1845,7 +1986,7 @@ array_and_run(const uint16 *arr, uint32 na, const LionContainer *rc, uint16 *out
 		else if ((int32) arr[i] > run_end(&runs[j]))
 			j++;
 		else
-			out[n++] = arr[i++];
+			out[n++] = array_out(arr[i++]);
 	}
 	return n;
 }
@@ -1863,14 +2004,14 @@ array_andnot_run(const uint16 *arr, uint32 na, const LionContainer *rc,
 	while (i < na && j < nruns)
 	{
 		if ((int32) arr[i] < (int32) runs[j].start)
-			out[n++] = arr[i++];
+			out[n++] = array_out(arr[i++]);
 		else if ((int32) arr[i] > run_end(&runs[j]))
 			j++;
 		else
 			i++;
 	}
 	while (i < na)
-		out[n++] = arr[i++];
+		out[n++] = array_out(arr[i++]);
 	return n;
 }
 
@@ -1882,7 +2023,7 @@ array_and_bitset(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
 
 	for (i = 0; i < na; i++)
 		if (bits_test(w, arr[i]))
-			out[n++] = arr[i];
+			out[n++] = array_out(arr[i]);
 	return n;
 }
 
@@ -1894,7 +2035,7 @@ array_andnot_bitset(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
 
 	for (i = 0; i < na; i++)
 		if (!bits_test(w, arr[i]))
-			out[n++] = arr[i];
+			out[n++] = array_out(arr[i]);
 	return n;
 }
 
@@ -1979,12 +2120,16 @@ run_and_run_cardinality(const LionContainer *a, const LionContainer *b)
  * a well-formed c is copied byte for byte, and a header claiming more than
  * LION_ARRAY_MAX_CARD members or LION_RUN_MAX_NRUNS runs is copied as its
  * clamped self, so that the copy fits the LION_CONTAINER_MAX_SIZE work buffer
- * whatever the header says.
+ * whatever the header says.  The copy is a result like any other, so its
+ * members are in range too (array_out()): an ARRAY's are masked, a run is
+ * clamped at LION_LO_MAX (run_last()) and one that starts past it, which is
+ * empty, is left out.
  */
 static void
 container_copy(const LionContainer *c, LionContainer *o)
 {
 	Size		size;
+	uint32		i;
 
 	switch (c->type)
 	{
@@ -2000,6 +2145,33 @@ container_copy(const LionContainer *c, LionContainer *o)
 	}
 	memcpy(o, c, size);
 	container_clamp(o);
+
+	if (o->type == LION_CT_ARRAY)
+	{
+		uint16	   *arr = array_mdata(o);
+		uint32		n = o->cardinality;
+
+		for (i = 0; i < n; i++)
+			arr[i] = array_out(arr[i]);
+	}
+	else if (o->type == LION_CT_RUN)
+	{
+		LionRun    *runs = run_mdata(o);
+		uint32		nruns = run_nruns(o);
+		uint32		keep = 0;
+
+		for (i = 0; i < nruns; i++)
+		{
+			int32		last = run_last(&runs[i]);
+
+			if ((int32) runs[i].start > last)
+				continue;
+			runs[keep].start = runs[i].start;
+			runs[keep].len_minus_1 = (uint16) (last - (int32) runs[i].start);
+			keep++;
+		}
+		run_set_nruns(o, keep);
+	}
 }
 
 /* Finish a freshly computed result: optimize and copy into dest. */

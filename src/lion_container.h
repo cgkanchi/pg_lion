@@ -11,14 +11,18 @@
  *	  memory-safe for any payload behind a header of a valid type: nothing
  *	  here reads more than LION_CONTAINER_MAX_SIZE bytes from the start of a
  *	  container or writes past a buffer of the documented size, every lo value
- *	  handed to a caller is below LION_CONTAINER_RANGE, and a mutator never
- *	  leaves a container larger than LION_CONTAINER_MAX_SIZE, whatever the
- *	  header claimed.  What a damaged container yields is unspecified (but
- *	  deterministic); lion_container_check() is what finds it.  A reader that
- *	  hands in a container straight from a page must still know that
- *	  lion_container_size() of it lies inside the item, as lion_inline_fetch()
- *	  checks - reading LION_CONTAINER_MAX_SIZE bytes from the start of a short
- *	  item could leave the page.  lion_container.c, "untrusted containers".
+ *	  handed to a caller - and every member of a set-algebra result - is
+ *	  below LION_CONTAINER_RANGE, and a mutator never leaves a container
+ *	  larger than LION_CONTAINER_MAX_SIZE, whatever the header claimed.
+ *	  Nothing Assert()s what a container's bytes say, so an assert-enabled
+ *	  build does not stop on a damaged page either.  What a damaged container
+ *	  yields is unspecified (but deterministic); lion_container_check() is
+ *	  what finds it.  A reader that hands in a container straight from a page
+ *	  must still know that lion_container_size() of it lies inside the item,
+ *	  as lion_inline_fetch() checks for an INLINE payload and
+ *	  lion_page_item_fetch() for a page item - reading
+ *	  LION_CONTAINER_MAX_SIZE bytes from the start of a short item could leave
+ *	  the page.  lion_container.c, "untrusted containers".
  *
  *	  Mutators operate IN PLACE on a caller-supplied buffer that must have at
  *	  least LION_CONTAINER_MAX_SIZE bytes of capacity, because a mutation may
@@ -112,7 +116,10 @@ extern bool lion_container_remove(LionContainer *c, uint16 lo);
 /*
  * Bulk builder: append lo values in strictly ascending order to a container
  * that started from lion_container_init().  Cheaper than repeated add().
- * The caller calls lion_container_optimize() once at the end.
+ * The caller calls lion_container_optimize() once at the end.  The values
+ * may come off a page (a sparse segment's pairs), so the order is checked,
+ * not trusted: one that is out of order or repeated is add()ed instead, and
+ * one past the range is masked into it.
  */
 extern void lion_container_append_sorted(LionContainer *c, uint16 lo);
 
@@ -155,6 +162,23 @@ extern uint32 lion_container_and_cardinality(const LionContainer *a, const LionC
  */
 extern uint32 lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16 lo_end);
 extern uint32 lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end);
+
+/*
+ * w |= c, for a caller that accumulates the union of several containers of
+ * one container key in a bitset image of LION_BITSET_WORDS words (the count
+ * engine's OR of k containers, DESIGN.md §15).  w must not overlap c.
+ */
+extern void lion_container_or_into_bitset(const LionContainer *c, uint64 *w);
+
+/*
+ * Which of the LION_BLOCKS_PER_CONTAINER heap blocks the container covers
+ * hold a member: bit b for the block of lo values b << LION_OFFSET_BITS ..
+ * ((b + 1) << LION_OFFSET_BITS) - 1, which is the count engine's
+ * visibility-map mask (lion_count_container_vm()).  For any payload, damaged
+ * or not, the bit of every block that iterate() hands out a member of is
+ * set, and no bit at or above LION_BLOCKS_PER_CONTAINER is.
+ */
+extern uint64 lion_container_block_mask(const LionContainer *c);
 
 /*
  * Structural validation for lion_index_verify(): checks type, cardinality

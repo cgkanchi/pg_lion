@@ -1155,7 +1155,7 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 
 			memset(img, 0, LION_BITSET_BYTES);
 			for (m = i; m < j; m++)
-				lion_bits_or_container(img, set->conts[order[m]]);
+				lion_container_or_into_bitset(set->conts[order[m]], img);
 			lion_bits_to_container(img, key, out);
 			size = lion_container_size(out);
 			conts[n] = (LionContainer *) MemoryContextAlloc(st->setcxt, size);

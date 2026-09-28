@@ -2714,7 +2714,7 @@ lion_source_union_window(LionSource *src)
 			if (src->uimg[k - src->ustart] == NULL)
 				src->uimg[k - src->ustart] = (uint64 *)
 					MemoryContextAllocZero(src->cxt, LION_BITSET_BYTES);
-			lion_bits_or_container(src->uimg[k - src->ustart], c);
+			lion_container_or_into_bitset(c, src->uimg[k - src->ustart]);
 			src->utouched[k - src->ustart] = true;
 		}
 		lion_stream_end(st);
@@ -2824,7 +2824,7 @@ lion_window_or_item(LionWindowPos *pos, const LionContainer *c)
 	if (!lion_window_slot(pos, c->ckey, &slot))
 		return false;
 	if (slot >= 0)
-		lion_bits_or_container(pos->src->wwalk[slot], c);
+		lion_container_or_into_bitset(c, pos->src->wwalk[slot]);
 	return true;
 }
 
@@ -2874,7 +2874,7 @@ lion_source_window(LionSource *src)
 		if (src->wrest[k] == NULL)
 			src->wrest[k] = (uint64 *) palloc(LION_BITSET_BYTES);
 		memset(src->wrest[k], 0, LION_BITSET_BYTES);
-		lion_bits_or_container(src->wrest[k], c);
+		lion_container_or_into_bitset(c, src->wrest[k]);
 		src->wkeys[k] = c->ckey;
 		src->wn++;
 	}
