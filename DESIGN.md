@@ -3632,12 +3632,23 @@ generic plan's parameter - is priced as ALL: its shape is unknown, and is assume
 expensive one, as lioncostestimate() assumes it for a bitmap scan.  Each candidate is fetched on
 the pages each count reads for itself (`lion_heap_page_cost()`, a filtered recheck having no cache)
 and tested at the clause's own evaluation cost; §10's recheck of the dirty pages is still charged
-beside it.  So a lone `tags @> $1` in a generic plan loses to the ordinary plan, whose own index
-path is priced as ALL too; beside a selective clause the rows the node would recheck are the ones
-the ordinary plan fetches anyway, and the two come out close, the node ahead by what the posting
-sets save (18% in the table below, 4% on the smaller table of the tests, which is why those pin
-only the lone clause); and under `plan_cache_mode = auto` the generic plan's price keeps the plan
-cache choosing custom plans, whose literals are pushed down exactly.
+beside it.  An ALL query is no source of the AND, in the price as in the executor: the model
+leaves it out of the sources `lion_cost_count_rel()` merges, by the same `lion_multikey_cost_mode()`
+the recheck is priced by, as a scan's price leaves it out of the scan's AND (§29.11).  That is the
+count's extraction, a superset, and not the scan's exact one (`lion_cost_qual_is_full()`), which
+would leave out a phrase or a NULL element too, whose superset the count does locate and AND.
+Until 2026-09-28 the price counted it a source all the same, at its default selectivity: a lookup,
+and a probe at each key of the driver - or, where that selectivity made it the smallest source, the
+driver of every count, which priced a grouped count's merges as though a set of a few rows cut each
+of them short.  So a lone `tags @> $1` in a generic plan, priced as ALL, is priced as the
+sequential scan the node then makes, and is chosen over the ordinary plan's sequential scan by the
+Aggregate above that one: at worst the node does the ordinary plan's work without the Aggregate,
+and any other value it answers from the posting sets (below).  Beside a selective clause the rows
+the node would recheck are the ones the ordinary plan fetches anyway, and the two come out close,
+the node ahead by what the posting sets save (18% in the table below, 4% on the smaller table of
+the tests, which is why those pin the choice of the lone clause only, and beside another clause the
+price); and under `plan_cache_mode = auto` the generic plan's price keeps the plan cache choosing
+custom plans, whose literals are pushed down exactly.
 
 **EXPLAIN** prints the clause with its value as core does (`tags @> $1`, `tsv @@
 to_tsquery('simple'::regconfig, current_setting('app.q'::text))`); with ANALYZE, `Heap TIDs
@@ -3657,13 +3668,25 @@ rows over 9,757 heap pages, all-visible; `k` 50 values, `tags` three elements ou
 | ... `'{t1,NULL}'` (the rows of `t1`, rechecked) | 33.5 | **122** |
 | ... `'{}'` (a sequential scan) | 79.5 | **105** |
 
-Bold is the plan the model picks, which does not know the value: beside a selective clause the
-node, whose worst case - `!w1` - is the ordinary plan's work to a tenth; alone the sequential scan,
-by 22 units in 14,762, because priced as every row the node IS a sequential scan - and one that
-runs faster than the ordinary plan's, since the query is extracted once where the ordinary plan
-evaluates it per row, so the worst case the model assumes is not worse than what it replaces.
-What the lone clause gives up is the exact case, 0.2 ms against 126; under `plan_cache_mode =
-auto` the plan cache keeps choosing custom plans for it, whose literal is exact.
+Bold is the plan the model picked then, which does not know the value: beside a selective clause
+the node, whose worst case - `!w1` - is the ordinary plan's work to a tenth; alone the sequential
+scan, by 22 units in 14,762, because priced as every row the node IS a sequential scan - and one
+that runs faster than the ordinary plan's, since the query is extracted once where the ordinary
+plan evaluates it per row, so the worst case the model assumes is not worse than what it replaces.
+The 22 units were the lookup and the probes of a source the node never reads; without them
+(2026-09-28, above) the lone clause goes to the node, and gives up nothing: measured again on
+PostgreSQL 16.15 (a distribution's build, no assertions; generic plans, medians of fifteen, warm,
+all-visible), on the two tables the tests pin it on and on a million rows with
+`countmultikey.sql`'s tags (20, 7 and 500 values) beside a few other columns, 16,210 heap pages:
+
+| `count(*) ... WHERE tags @> $1` | node | ordinary plan |
+|---|---|---|
+| `array.sql`'s 20,000 rows: `'{u500}'` (exact) / `'{t3,NULL}'` (rechecked) / `'{}'` | **0.003 / 0.16 / 2.1 ms** (457.01) | 3.1 / 3.0 / 3.0 (457.26) |
+| `countmultikey.sql`'s 12,000: `'{t1}'` / `'{t1,NULL}'` / `'{}'` | **0.005 / 0.39 / 1.4** (400.01) | 2.2 / 2.0 / 1.9 (400.16) |
+| 1,000,000: `'{u499}'` / `'{t3,u7}'` / `'{t1,NULL}'` / `'{}'` | **0.013 / 0.11 / 58 / 127** (28,710) | 193 / 192 / 184 / 170 (28,723) |
+
+Under `plan_cache_mode = auto` the plan cache still keeps choosing custom plans for it, whose
+literal is exact.
 
 `test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
 counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
@@ -8087,8 +8110,9 @@ place in the batch - the row copied in, its share of the sort and the slot it is
 `LION_FKJOIN_BATCH_ROW_COST`; and between two keys `leaves / keys` leaves on average, stepped over a
 page each while that is at most the height, or a descent's internal levels past it. The batches are
 `work_mem` over the child row's width plus `LION_FKJOIN_BATCH_ENT_BYTES`. The model takes the walk
-where it is cheaper than a descent a row, (height + 1) pages. `LION_FKJOIN_BATCH_ROW_COST` is one
-page visit, on the high side: putting a key into the datum sort of "Forward semi joins over a
+where it is cheaper than a descent a row, (height + 1) pages. `LION_FKJOIN_BATCH_ROW_COST` is priced
+as one page visit - its setting defaults to `LION_DESCENT_COST`'s (§31, "The settings") - on the
+high side: putting a key into the datum sort of "Forward semi joins over a
 non-unique key", sorting it and taking it out again measured at a fraction of what a page visit is
 fitted at, and a row's copy and its slot are of the same order. High on purpose: the walk replaces
 the internal levels of a descent with it, so it is taken only where a descent crosses two internal
@@ -8289,7 +8313,7 @@ ns and a `cpu_tuple_cost` 20 ns at 500 units a millisecond:
 
 | step | constant | charged | what it stands for |
 |---|---|---|---|
-| 2 | `LION_FKJOIN_BATCH_ROW_COST` (`LION_DESCENT_COST`, 120 `cpu_operator_cost`) | a row, in key order | its place in a batch |
+| 2 | `LION_FKJOIN_BATCH_ROW_COST` (120 `cpu_operator_cost`, `LION_DESCENT_COST`'s) | a row, in key order | its place in a batch |
 | 3 | `LION_DESCENT_COST` | a directory page visited | a level of a descent, a step of the walk, a leaf |
 | 5 | `LION_FKJOIN_COUNT_COST` / `LION_FKJOIN_COPY_COUNT_COST` (25 `cpu_tuple_cost` each) | a key found | a count's set-up and tear-down, against the filters or their copy |
 | 7 | `LION_CONTAINER_COST` (8 `cpu_operator_cost`) and `LION_MEMBER_COST` (0.15, at most `LION_MEMBER_CAP` a container) | an fk container, a member | the key's own set, read and counted |
@@ -9157,7 +9181,7 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
   `get_relation_stats_hook` hands to core's own `clauselist_selectivity()` while lion prices one of
   its accesses (`lion_probe_begin()` .. `lion_probe_end()`): `lioncostestimate()` for every lion
   index path - the selectivity `genericcostestimate()` prorates the index by, the entries
-  `lion_range_entry_cost()` prices, the heap side priced from them, and so LionOrdered's lion side -
+  `lion_range_walk_cost()` prices, the heap side priced from them, and so LionOrdered's lion side -
   and the count pushdown's paths (`lion_try_count_path()`: the range's share of its entries, and the
   rows `lion_cost_count_rel()` and `lion_cost_range_sum()` recheck, `lion_probe_rel_rows()`, which
   since 2026-09-28 also carries the intersection probe's correction, §29.11). The
@@ -9933,7 +9957,7 @@ and it ANDs them as a count does - the smallest drives, the others are sought at
 keys - so `lioncostestimate()` now charges §10's merge CPU for them (`lion_merge_cpu_cost()`, the
 count pushdown's own price) and the pages the
 driver walks and the probes touch, beyond the prorated share, at `seq_page_cost`. One set alone,
-and a range or `IS NOT NULL` (a walk, priced by `lion_range_entry_cost()`), add nothing. Four dense
+and a range or `IS NOT NULL` (a walk, priced by `lion_range_walk_cost()`), add nothing. Four dense
 sets whose AND was 1,730 rows of 8M ran 52 ms on lion against 1.2 ms on a btree over the four
 columns at about the same cost (6.5k against 6.2k). On §31's 5M-row `w` the same shape, four
 sets ANDed to 48,000 rows, raised the lion plain scan from 80,300 to 83,900, and the planner now
@@ -9971,10 +9995,11 @@ the two prices differed in:
   every column since (§29.2, `samecolumn_scan.sql`), as the count ANDs every positive clause;
   `lion_set_merge_cost()` then counted every set qual a source, priced as above. A scan and a count
   over the same clauses now AND the same sets. What is no set is each path's own: a range, which
-  the scan walks on a column without sets (`lion_range_entry_cost()`) and the count may take for a
+  the scan walks on a column without sets (`lion_range_walk_cost()`) and the count may take for a
   source (§32), and a multi-key query that needs every row, which both leave to a recheck of the
-  rows the other sources leave - and which the count's price still counts a source of its AND as
-  well (`lion_cost_count_rel()`, an overcharge of the count on that shape, left as it was).
+  rows the other sources leave, and neither price counts a source of its AND: the scan's by
+  `lion_cost_qual_is_full()`, the count's since 2026-09-28 by `lion_multikey_cost_mode()`, the
+  count's own extraction of the same query (§17, "A query known only at run time").
 
 One function prices it now. `lion_cost_set_and()` (lion_customscan.c) prices each clause as
 `lion_cost_count_rel()` prices a WHERE source - `lion_cost_set_clause()`: its lookups, what a walk
@@ -10274,7 +10299,7 @@ b = 5` over a million unique `a` at 409 ms against the bitmap scan's 38. The exe
 WINDOW shape, and `IS NOT NULL` dropped beside anything that answers) makes both paths read the
 same, and the model now charges what that is:
 
-- the range's entries once per WINDOW (`lion_range_entry_cost()`): the heap's container keys over
+- the range's entries once per WINDOW (`lion_range_walk_cost()`): the heap's container keys over
   `lion_walk_window()`, 1 below 32768 heap blocks at the default floor - an upper bound, since the
   other columns may have containers at fewer keys; the bitmap scan walks once per window too, its
   windows holding those containers at their own size rather than as images (§28, "Bitmap
@@ -11104,6 +11129,66 @@ model and win on the machine: `inlist.sql`'s two GROUP BY counts over IN lists, 
 **Provisional**: the range sums (§28) and the plain scan's heap side (§29.11), whose costing other
 work is reworking; the matrix's `range` and `fetch` rows are theirs to rerun. Parallel plans were
 not in the CPU-time matrix.
+
+### The settings (2026-09-28)
+
+Every per-operation price of the model is a planner setting, so that it can be calibrated on a
+workload of one's own by changing settings, as core's model is with `random_page_cost`, rather than
+by rebuilding. `pg_lion.<name>_cost` is the multiplier of `LION_<NAME>_COST` - `pg_lion.container_cost`
+of `LION_CONTAINER_COST`, which is `lion_container_cost * cpu_operator_cost` - in the unit the constant
+was always written in: `cpu_operator_cost` or `cpu_tuple_cost`, and for the FK-side join's sort past
+`work_mem` `seq_page_cost` and `random_page_cost`, one setting each for the two parts of its page
+(`LION_FKJOIN_SORT_PAGE_COST`). So lion's prices still move with core's CPU and page costs, and a
+calibration made at one `cpu_operator_cost` holds at another. Each defaults to the value it was
+fitted or derived at - this section's tables and the comment above each macro are why - so a server
+that sets none plans exactly as it did; the regression suite runs at the defaults, and
+`costgucs.sql` checks that each setting is there and that three of them move the plans they price.
+`lion_costs.c` holds the table of them and registers them from `_PG_init`, user settings from 0 up
+as core's cost settings are, in core's group of them (`Query Tuning / Planner Cost Constants`) and
+shown by `EXPLAIN (SETTINGS)` when changed; the README lists them with their defaults and units.
+
+Two constants that were written as another are decided by what they price. `LION_FKJOIN_SET_COST`
+stays `LION_UNION_SET_COST` and has no setting of its own: both are a union source's set rebuilt by
+a count, in the same code (`lion_count_sources_cached()`), whether the counts are a GROUP BY's or an
+FK-side join's. `LION_FKJOIN_BATCH_ROW_COST` was `LION_DESCENT_COST` by choice, not by identity - a
+row's place in a batch priced as a page visit, on purpose on the high side (§27, "Lookups in key
+order") - and has its own setting, `pg_lion.fkjoin_batch_row_cost`, at the same 120. Two inline
+numbers became constants as well: the collecting merge's driver containers
+(`LION_FKJOIN_COLLECT_CONTAINER_COST`, two `cpu_operator_cost`) and the sort's page mix (0.75
+`seq_page_cost` and 0.25 `random_page_cost`, `cost_tuplesort()`'s). A count of operations times a
+core cost - one comparison a container, a row handed up at `cpu_tuple_cost` - is core's own price
+and stays one; so do the constants that are not prices: sizes (`LION_BLOCKS_PER_CONTAINER`), caps
+(`LION_MEMBER_CAP`), the intersection probe's bounds, fanouts and selectivity heuristics.
+
+**Calibrating.** On the build and cache state the server runs in - §10's release build, warm, is
+what the defaults are fitted to:
+
+- For a query where a lion path competes with another - the count against core's aggregate, a
+  lion plain scan against a bitmap one, the FK-side join against a hash join - force each
+  alternative (`pg_lion.enable_count_pushdown`, `pg_lion.enable_plain_scan`, core's `enable_*`
+  settings) and set each plan's `EXPLAIN` total cost beside its `EXPLAIN ANALYZE` time. Their
+  ratios, units a millisecond, are what the model says each plan does per unit of time; a lion
+  path well above the competitor's ratio is overpriced, and well below it underpriced, which is
+  the mispick waiting to happen. Core's own CPU-bound scans ran at 400 to 700 (§10, "The units").
+- Which setting to move is the one whose term dominates the path's price, read against the
+  node's counters: `Containers Visited`, `Directory Pages Read` and `Heap TIDs Rechecked` of a
+  count are the containers, the descents and the recheck candidates `container_cost`,
+  `descent_cost` and `recheck_tid_cost` price; `Distinct Keys Tested` the tests of
+  `distinct_test_cost`. `SET` it, plan again, and compare again: the price moves and the answer
+  does not. Once the ratios agree, the value goes into `postgresql.conf` or `ALTER DATABASE ...
+  SET`, as a tuned `random_page_cost` would.
+- For the FK-side join, §27's "Where a key's time goes" gives the per-key terms directly:
+  `Join Lookup Time` over `Join Keys Looked Up`, with `Directory Pages Read` over the same keys,
+  is a lookup's price in pages of `descent_cost` (and `fkjoin_batch_row_cost` a key in key
+  order); `Join Count Time` over the keys found is a count - `fkjoin_count_cost` or
+  `fkjoin_copy_count_cost`, and `Join Key Containers Read` over the keys found times
+  `container_cost` and `member_cost`, with `fkjoin_copy_probe_cost` for each of those containers
+  against a collected copy (`Fact Filter Copy Seeks`), or `fkjoin_probe_cost` probed; and `Fact
+  Filter Collect Time` is the once-a-run collection (`fkjoin_collect_container_cost`,
+  `fkjoin_copy_container_cost`). A phase's time per key over the operations a key makes of it is
+  the time of one, and at R units a millisecond a microsecond is R/1000 units: at 500, a lookup of
+  0.6 us a directory page is 0.3 units a page, which at a `cpu_operator_cost` of 0.0025 is
+  `descent_cost` 120. The child's rows and pages are core's plan, priced by core.
 
 ## 32. Summary posting sets for ranges (format version 7)
 

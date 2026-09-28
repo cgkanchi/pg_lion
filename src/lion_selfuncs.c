@@ -2074,7 +2074,7 @@ lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 /*
  * The index AM's amcostestimate: lioncostestimate() inside a probe scope over
  * the path's own quals, so that genericcostestimate()'s selectivity, the
- * entries of lion_range_entry_cost() and the heap side priced from them see
+ * entries of lion_range_walk_cost() and the heap side priced from them see
  * a range past the histogram as the directory has it.
  */
 void

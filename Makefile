@@ -4,7 +4,8 @@ MODULE_big = pg_lion
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o src/lion_pages.o src/lion_dir.o src/lion_posting.o src/lion_am.o \
        src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o src/lion_funcs.o src/lion_count.o src/lion_customscan.o \
-       src/lion_multikey.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o
+       src/lion_multikey.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
+       src/lion_costs.o
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
 
 EXTENSION = pg_lion pg_lion_citext
@@ -87,6 +88,7 @@ $(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src
 src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o src/lion_scan.o \
           src/lion_funcs.o src/lion_selfuncs.o: src/lion_count.h
 src/lion_customscan.o src/lion_fkjoin.o: src/lion_fkjoin.h
+src/lion_costs.o src/lion_customscan.o src/lion_am.o: src/lion_costs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
