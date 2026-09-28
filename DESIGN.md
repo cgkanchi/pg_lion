@@ -10950,16 +10950,16 @@ plan-time endpoint probe of another change may sharpen; nothing here depends on 
 as it is at that moment (`lion_verify_summary_after()`, a descent), collects and sorts the codes of
 the bucket's keys from one walk of the column's VALUE entries, and streams the summary's codes past
 them in code order. The keys' codes are held in an array up to a quarter of `maintenance_work_mem`
-and in an INT8 tuplesort that spills past it, and the summary's are not held at all: one bucket can
-be most of the table (a column of few keys, or the one bucket descending keys go into), and both
-sides used to be collected whole, which ran a backend out of memory. It also checks that no row is
-under two keys, and (in the directory walk before it) that summaries are in order, that a SUMLAST
-is the last and no pivot is one, and that a summary is of a summarized column and carries
-`LION_SUMMARY_HASH`. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside
+and past that in an INT8 tuplesort of as much, which spills - the array goes when the sort takes
+over, as the build's does - and the summary's are not held at all: one bucket can be most of the
+table (a column of few keys, or the one bucket descending keys go into), and both sides used to be
+collected whole, which ran a backend out of memory. It also checks that no row is under two keys,
+and (in the directory walk before it) that summaries are in order, that a SUMLAST is the last and
+no pivot is one, and that a summary is of a summarized column and carries `LION_SUMMARY_HASH`. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside
 inserts (VACUUM waits for it), so a difference is a CANDIDATE, not an error: an insert may be
-between its key and its summary. Once the column is walked - or earlier, when a quarter of
-`maintenance_work_mem`'s worth of them, and at least `LION_VERIFY_MAX_SUM_CANDS` (10,000), are
-waiting - the writers that could explain them are waited for (`lion_verify_wait_for_writers()`) and the
+between its key and its summary. Once the column is walked - or earlier, when the candidates and
+the records of the buckets they are in fill a quarter of `maintenance_work_mem` (below) - the
+writers that could explain them are waited for (`lion_verify_wait_for_writers()`) and the
 candidates are SETTLED in one pass over the summaries of their buckets and one walk of the
 column's keys (`lion_verify_settle()`): a row a summary lacked must be in its bucket's summary now,
 a row a summary holds must be in one of its bucket's keys now - and a DEAD row
@@ -10967,20 +10967,49 @@ a row a summary holds must be in one of its bucket's keys now - and a DEAD row
 pointer) is never a difference, which is what a crash or an error between an insert's two steps
 leaves. The first candidate that is still one is reported; nothing else is capped.
 
+**What the check holds does not grow with the column.** Beside the quarter for one bucket's codes,
+the candidates and the RECORDS of their buckets - each bucket's two bounds, which a settle looks the
+bucket up by - share a second quarter of `maintenance_work_mem` (never less than
+`LION_VERIFY_MAX_SUM_CANDS` (10,000) candidates' worth), and are settled when they fill it: the
+record of a bucket with no candidate goes as the walk leaves it, every record but the current
+bucket's goes once the candidates are settled, and neither array grows past what its quarter holds.
+A key's set and a bucket's summary are read in memory contexts emptied for the next, since locating
+a set copies its key and an INLINE payload into the caller's memory. (Before the 2026-09-28 review
+every bucket's bounds were kept to the end of the column, whatever it settled, as were the copies
+of every key and INLINE payload the walk and each settle read; the array stayed, full, beside the
+tuplesort; and the candidates' array doubled past its quarter.)
+
 The OPEN bucket is read when the walk gets to it - its key and its summary as they are then - and a
 key the walk finds above that key belongs to a row that arrived while the check ran: no candidate.
-Only the largest such key is kept, and it has to be inside a bucket once the writers are done
-(`lion_verify_check_above()`: the lookup an insert makes; if it is not, every row of a key above
-the column's last summary has to be dead, or an insert a second wait settles). A summary at or
-above the open bucket's key as the check began was the open bucket then and is taken as the open
-one, which bounds the walk however fast appends close buckets behind it. Before 2026-09-28 the open
-bucket's key came from a copy of its leaf made when the walk began, so every row appended during
-the check was a candidate that cost a walk of the whole column to settle, and the cap on
-candidates, meant for a summary of garbage, was applied before any was settled: a column under
-steady appends was reported corrupt. `test/sql/corrupt.sql`
-rewrites a summary's key on disk to one that still sorts between its neighbours, so that every
-entry is sound on its own and only the comparison can tell; verify reports the row the summary
-holds and no key of its bucket does.
+So is every key of a column with NO summary above the last one the walk read (`on` over an empty
+table, or a crash between the two records of a close): a row whose insert went through both steps
+before that lookup is in a summary at or above its key, so a row above every summary there was is
+one whose insert had not, and by the time its writer is waited for it may be in any of the buckets
+the inserts beside the walk opened and closed since. It used to be a candidate looked for in the
+first of those buckets only - a load into such a column had the rows of the second reported as
+corrupt, with the hint to REINDEX a sound index.
+
+Only the largest key that arrived is kept, and it has to be inside a bucket once the writers are
+done (`lion_verify_check_above()`: the lookup an insert makes). If it is not - its own insert may
+have failed between the steps - every key up to it that is not inside a bucket has its rows looked
+at: a DEAD row is a failed insert; a row whose inserting transaction is still RUNNING may be between
+the steps now (one that began after the wait, as a load's next statement does) and is left alone,
+as is one of a transaction that sits idle after its insert, which only makes the check look at
+less; and a row whose insert COMMITTED went through both steps before it did, so its key must be
+inside a bucket once that is seen, or the row is in no summary and never will be - which is
+reported. That check used to wait a second time and report any row not dead after it, which was
+any insert that happened to be between its steps then, and it compared the keys with the open
+bucket's key as it was before its walk of them began.
+
+A summary at or above the open bucket's key as the check began was the open bucket then and is
+taken as the open one, which bounds the walk however fast appends close buckets behind it. Before
+2026-09-28 the open bucket's key came from a copy of its leaf made when the walk began, so every
+row appended during the check was a candidate that cost a walk of the whole column to settle, and
+the cap on candidates, meant for a summary of garbage, was applied before any was settled: a
+column under steady appends was reported corrupt. `test/sql/corrupt.sql` rewrites a summary's key
+on disk to one that still sorts between its neighbours, so that every entry is sound on its own and
+only the comparison can tell; verify reports the row the summary holds and no key of its bucket
+does.
 
 `lion_index_stats()` reports per column the summaries' entries, rows, bytes and posting pages
 (`summary_entries`, `summary_tids`, `summary_bytes`, `summary_pages`), which the other counters
@@ -11009,6 +11038,12 @@ leave out.
   directory order" - rows appended one statement at a time over several leaves with
   `summary_tids = 16`, verify and range counts at and around bucket bounds against a sequential
   scan, then the top buckets deleted, VACUUM, keys below the old top and appends again.
+- `test/sql/summary_verify.sql` (2026-09-28): verify of a summarized index built on an empty table
+  before any insert (no summary at all), after appends that open and close buckets a statement at a
+  time, and after one key of 36,000 rows at `maintenance_work_mem = 1MB`, whose bucket's codes go
+  from the array to the tuplesort and back to a new array for the buckets after it. What it cannot
+  show single-session - the load beside the walk that §32's "Verification" is about - is argued
+  there; `summary_race.spec` keeps verify beside an insert parked between its two steps.
 - `test/sql/spill.sql` (2026-09-28): an OR's range leaf planned where its union fits and run at
   64 kB, collected into memory and then windowed into a temporary file (`Range Sources Spilled`),
   on a clean and a dirty heap; and an FK-side join whose fact filter is `= ANY ($1)`, planned to

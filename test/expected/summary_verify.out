@@ -1,0 +1,66 @@
+-- lion_index_verify() on summarized columns (DESIGN.md §32, "Verification"):
+-- a column with no summary at all, buckets opened and closed a statement at
+-- a time, and a bucket whose keys' codes outgrow a quarter of
+-- maintenance_work_mem, which the check sorts in a tuplesort - giving the
+-- array it began in back - before it goes on with a new array for the
+-- buckets after it.  The check keeps the record of no bucket that has no
+-- candidate in it, so each walk here forgets every bucket it leaves.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- summaries = on over an empty table: no summary until the first insert
+CREATE TABLE lion_sv (k int NOT NULL, t text NOT NULL);
+CREATE INDEX lion_sv_i ON lion_sv USING lion (k, t)
+	WITH (summaries = on, summary_tids = 16);
+SELECT attno, summary_entries, summary_tids FROM lion_index_stats('lion_sv_i');
+ attno | summary_entries | summary_tids 
+-------+-----------------+--------------
+     1 |               0 |            0
+     2 |               0 |            0
+(2 rows)
+
+SELECT lion_index_verify('lion_sv_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+-- keys in order, a statement at a time: the first row opens the first
+-- bucket, the buckets close at 16, 32, ... 96, and 97 .. 100 are the open one
+INSERT INTO lion_sv SELECT i, 't' || lpad(i::text, 5, '0') FROM generate_series(1, 50) i;
+INSERT INTO lion_sv SELECT i, 't' || lpad(i::text, 5, '0') FROM generate_series(51, 100) i;
+SELECT attno, summary_entries, summary_tids FROM lion_index_stats('lion_sv_i');
+ attno | summary_entries | summary_tids 
+-------+-----------------+--------------
+     1 |               7 |          100
+     2 |               7 |          100
+(2 rows)
+
+SELECT lion_index_verify('lion_sv_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+-- 36000 rows of one key: k's open bucket takes them and closes at the next
+-- key, a bucket of 36004 rows - past the 32768 codes a quarter of 1MB holds -
+-- followed by six more of 16 and the open one; every t below 'wide' joins
+-- t's open bucket, which is keyed 'wide' from then on
+SET maintenance_work_mem = '1MB';
+INSERT INTO lion_sv SELECT 101, 'wide' FROM generate_series(1, 36000);
+INSERT INTO lion_sv SELECT i, 't' || lpad(i::text, 5, '0') FROM generate_series(102, 200) i;
+SELECT attno, summary_entries, summary_tids FROM lion_index_stats('lion_sv_i');
+ attno | summary_entries | summary_tids 
+-------+-----------------+--------------
+     1 |              14 |        36199
+     2 |               7 |        36199
+(2 rows)
+
+SELECT lion_index_verify('lion_sv_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+RESET maintenance_work_mem;
+DROP TABLE lion_sv;
