@@ -200,6 +200,9 @@ SELECT q.q AS predicate, s.same, s.probed
 (17 rows)
 
 -- ---------- 3. ranges as sources, collected into a union that grows in place ----------
+-- k is a multiple of the row number modulo a prime, so a range as wide as
+-- these holds a page's rows in runs: its union ends as RUN containers, which
+-- are folded pairwise.
 SELECT s.same, s.probed, s.collected
   FROM lion_sc('SELECT g, count(*) FROM lion_sc WHERE k BETWEEN 2000 AND 25000 GROUP BY g') s;
  same | probed | collected 
@@ -218,11 +221,27 @@ SELECT s.same, s.probed, s.collected
 -- Some two hundred rows a page and a heap of 17 container keys: g = 3 is a
 -- fifth of every page, a bitset at each key, so a sum beside it is probed
 -- into images; s = 7 is a dozen rows at each, an ARRAY whose members are
--- marked.  A range over half the rows is a bitset at each key too.
+-- marked.  r is 2^i modulo the prime 200003 (2 generates every nonzero
+-- residue, and 73755 is 2^1000): a permutation of the row number in no order
+-- at all, so that a range over a fifth of the rows or more is a bitset at
+-- each key too.  A multiple of i, as k is, would put a wide range's rows in
+-- runs, whose union is RUN containers of half a bitset's size or less.
 CREATE TABLE lion_sc_w (r int NOT NULL, g int NOT NULL, s int NOT NULL)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lion_sc_w
-SELECT (i * 7919) % 200003, i % 5, i % 1009 FROM generate_series(1, 200000) i;
+WITH RECURSIVE lo(i, r) AS (
+	SELECT 1, 2::int8
+	UNION ALL
+	SELECT i + 1, r * 2 % 200003 FROM lo WHERE i < 1000
+), hi(j, m) AS (
+	SELECT 0, 1::int8
+	UNION ALL
+	SELECT j + 1, m * 73755 % 200003 FROM hi WHERE j < 199
+)
+SELECT (lo.r * hi.m % 200003)::int, (1000 * hi.j + lo.i) % 5,
+	   (1000 * hi.j + lo.i) % 1009
+  FROM hi, lo
+ ORDER BY hi.j, lo.i;
 CREATE INDEX lion_sc_w_r ON lion_sc_w USING lion (r)
 	WITH (summaries = on, summary_tids = 64);
 CREATE INDEX lion_sc_w_g ON lion_sc_w USING lion (g);
@@ -256,9 +275,11 @@ SELECT s.same, s.probed, s.collected
  t    | f      | t
 (1 row)
 
--- At work_mem's floor a range over most rows is a bitset at every key, more
--- than 64 kB: it is walked at each group's count, and each walk is probed at
--- the rows of the group and s = 7 (DESIGN.md §32, "A range as a source").
+-- At work_mem's floor a range over three quarters of the rows is a bitset at
+-- every one of the 17 keys, some 70 kB, more than the 64 kB a relation's
+-- ranges may collect into: it is not collected but walked at each group's
+-- count, and each such walk is probed at the rows of the group and s = 7
+-- (DESIGN.md §32, "A range as a source").
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT s.same, s.probed, s.collected
