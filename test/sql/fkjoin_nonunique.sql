@@ -340,6 +340,9 @@ SELECT lion_nj('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE f.x = 3 AND EXI
 SELECT lion_nj('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_ndh d)');
 SELECT lion_nj('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE f.x = 77 AND f.fk IN (SELECT d.k FROM lion_nd d)');
 SELECT lion_nj('SELECT count(DISTINCT f.tk) FROM lion_nf f WHERE f.y = 2 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.tk = f.tk AND d.attr = 1)');
+-- ... and a count of rows beside it: the distinct keys carry their counts,
+-- which the Agg adds up (fkjoin_mixed.sql)
+SELECT lion_nj('SELECT count(*), count(DISTINCT f.fk) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1)');
 
 -- ---- 3. what EXPLAIN ANALYZE counts ------------------------------------------------
 -- the keys sorted (NULLs are not), the distinct ones looked up, and those
@@ -355,9 +358,8 @@ SELECT lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FR
 -- ---- 4. declined ---------------------------------------------------------------
 -- a fact column in the output, as for every FK-side join
 SELECT lion_nj('SELECT f.x, count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.x');
--- another aggregate; a count of rows beside a count of distinct values
+-- another aggregate
 SELECT lion_nj('SELECT sum(f.x) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1)');
-SELECT lion_nj('SELECT count(*), count(DISTINCT f.fk) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1)');
 -- a second correlation
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = f.x)');
 -- the fact rows WITHOUT a qualifying dimension row: an anti join the other

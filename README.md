@@ -189,7 +189,13 @@ it does not: over a key that repeats - `o.customer_id IN (SELECT customer_id FRO
 for the hash semi join, on an assert build). The JOIN and the second form may group by the
 dimension's columns, and `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of
 `count(*)` is pushed down too: the node emits the matching customers, and PostgreSQL's own aggregate
-counts their distinct values. The node pays a lookup per dimension row (per distinct key), so the
+counts their distinct values. So are, in place of `count(*)` or beside it, `min`, `max`,
+`bool_and`, `bool_or`, `every`, `bit_and` and `bit_or` of the customers' columns, `count` of them,
+and `sum` of their `smallint` and `integer` ones (DESIGN.md §27, "Every aggregate over the node's
+rows"): where one of those stands beside a count of the join's rows, each customer the node emits
+carries its count of orders, and the counts and sums become sums of those counts
+(`lion_join_count()`, `lion_join_sum()`, two aggregates of the extension's). The node pays a lookup
+per dimension row (per distinct key), so the
 cost model leaves a large dimension set to the hash join. With parallel query enabled
 (`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
 dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
