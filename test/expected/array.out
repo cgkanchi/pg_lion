@@ -910,19 +910,21 @@ DEALLOCATE lion_arrc_p;
  * ... and the count pushdown prices a multi-key clause it cannot see the
  * query of the same way: `tags @> $1` with `$1 = '{}'` extracts to ALL mode,
  * which the node answers from a sequential scan that tests every row
- * (DESIGN.md §17, "A query known only at run time"), so alone the clause
- * loses to the ordinary plan.  A CUSTOM plan folds the parameter to a
- * literal and is pushed down as usual.
+ * (DESIGN.md §17, "A query known only at run time").  Alone, the clause is
+ * then no source of the node's AND, and the node is priced as that
+ * sequential scan - the ordinary plan's, without its Aggregate - and chosen:
+ * no slower than the ordinary plan at worst, and for a value that turns out
+ * exact, like this one, answered from the posting sets.  A CUSTOM plan folds
+ * the parameter to a literal and is pushed down as usual.
  */
 PREPARE lion_arrc_c(text[]) AS SELECT count(*) FROM lion_arrc WHERE tags @> $1;
 SET plan_cache_mode = force_generic_plan;
 EXPLAIN (COSTS OFF) EXECUTE lion_arrc_c(ARRAY['u500']);
-          QUERY PLAN          
-------------------------------
- Aggregate
-   ->  Seq Scan on lion_arrc
-         Filter: (tags @> $1)
-(3 rows)
+                 QUERY PLAN                  
+---------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_arrc_tags (tags @> $1)
+(2 rows)
 
 EXECUTE lion_arrc_c(ARRAY['u500']);
  count 
