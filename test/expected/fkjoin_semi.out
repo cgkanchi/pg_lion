@@ -476,6 +476,20 @@ SELECT lion_sj('SELECT count(1), count(d.pk), count(*) FROM lion_sd d WHERE EXIS
  pushed down, 1 rows
 (1 row)
 
+-- a sum and a count of a nullable dimension column, over the join's rows as
+-- they stand (fkjoin_mixed.sql)
+SELECT lion_sj('SELECT sum(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
+       lion_sj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_sj('SELECT count(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
+       lion_sj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
 -- duplicated dimension keys are two rows, each tested on its own; a NULL key
 -- has no match
 CREATE INDEX lion_sdn_kl ON lion_sdn USING lion (k);
@@ -563,11 +577,12 @@ SELECT lion_sj('SELECT count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM 
  pushed down, 1 rows
 (1 row)
 
--- count of the key is not count(*) in an anti join: NULL keys are rows
+-- count of the key is not count(*) in an anti join: NULL keys are rows, so
+-- there it is the count of a dimension column, over the rows as they stand
 SELECT lion_sj('SELECT count(d.k), count(*) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
-         lion_sj         
--------------------------
- not pushed down, 1 rows
+       lion_sj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sj('SELECT count(1) FROM lion_sdn d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.k AND f.x = 2)');
@@ -631,14 +646,8 @@ SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_
  not pushed down, 1 rows
 (1 row)
 
--- another aggregate, a nullable dimension column counted
-SELECT lion_sj('SELECT sum(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
-         lion_sj         
--------------------------
- not pushed down, 1 rows
-(1 row)
-
-SELECT lion_sj('SELECT count(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
+-- another aggregate
+SELECT lion_sj('SELECT avg(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
          lion_sj         
 -------------------------
  not pushed down, 1 rows

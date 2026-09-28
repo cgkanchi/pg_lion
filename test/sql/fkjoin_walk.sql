@@ -323,6 +323,10 @@ SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE f.x = 4 AND EXISTS (SELECT
 -- count(DISTINCT): the dimension rows that join, tested in key order
 SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3');
 SELECT lion_wj('SELECT d.grp, count(DISTINCT d.attr) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.t = ''t2'') GROUP BY d.grp');
+-- ... and counts of join pairs beside it: the rows walked carry their counts
+-- (fkjoin_mixed.sql)
+SELECT lion_wj('SELECT count(DISTINCT f.fk), count(*), max(d.attr) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3');
+SELECT lion_wj('SELECT d.grp, count(DISTINCT d.attr), count(*), count(d.attr) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.grp');
 -- reverse semi and anti joins, the dimension's rows each once
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)');
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kod d WHERE d.pk IN (SELECT f.fk FROM lion_kof f WHERE f.t = ''t3'') GROUP BY d.attr');
@@ -336,6 +340,7 @@ SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM
 SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
 SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE f.x = 4 AND f.fk IN (SELECT d.k FROM lion_kodn d)');
 SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+SELECT lion_wj('SELECT count(DISTINCT f.fk), count(*) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
 -- three filters keep too few keys to walk; the answer is the same
 SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
 
@@ -409,6 +414,7 @@ DELETE FROM lion_kodn WHERE k % 19 = 0;
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
 SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk');
+SELECT lion_wj('SELECT d.attr, count(DISTINCT f.fk), count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
 SELECT lion_wj('SELECT d.region, count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk) GROUP BY d.region');
 SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k AND f.t = ''t3'')');
@@ -420,6 +426,7 @@ VACUUM (FREEZE, ANALYZE) lion_kodn;
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
 SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk');
+SELECT lion_wj('SELECT d.attr, count(DISTINCT f.fk), count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
 SELECT lion_wj('SELECT d.region, count(*) FROM lion_kod d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk) GROUP BY d.region');
 SELECT lion_wj('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.k AND f.t = ''t3'')');

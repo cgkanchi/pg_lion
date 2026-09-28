@@ -538,6 +538,52 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 COMMENT ON FUNCTION lion_index_count_group_stats(regclass, boolean, int2) IS
 	'count every key of one key column of a lion index, as the GROUP BY pushdown does, and report the heap visits';
 
+/* ---------------------------------------------------------------------
+ * aggregates of the FK-side join (lion_customscan.c, DESIGN.md §27,
+ * "Every aggregate over the node's rows")
+ *
+ * When a join's aggregates need the dimension rows themselves -
+ * count(DISTINCT), min, max - beside counts of join pairs, the node hands up
+ * one row per dimension row that joins, carrying that row's count of fact
+ * rows, and the core Agg above it adds those counts up with these in place of
+ * count() and sum():
+ *
+ *	lion_join_count(n)	count's answer from counts: 0 over no rows, never
+ *						NULL, a NULL n skipped (count(x) of a dimension column
+ *						is lion_join_count(n) FILTER (WHERE x IS NOT NULL));
+ *	lion_join_sum(n)	sum's: NULL over no rows, a NULL n skipped
+ *						(sum(x) of an int2 or int4 column is lion_join_sum(x *
+ *						n), whose answer is sum()'s int8).
+ *
+ * Both add in int8 with int8pl, which fails with "bigint out of range" where
+ * count()'s own int8inc would (the counts are never negative, so no partial
+ * sum passes the total), and combine with it, so they may be split into
+ * partial aggregates.  They are core's sum(int8) minus what that one does
+ * for a total past int8 (a numeric answer, from 128-bit or numeric state):
+ * a count past int8 is an error for count() too.
+ * --------------------------------------------------------------------- */
+
+CREATE AGGREGATE lion_join_count(bigint) (
+	SFUNC = pg_catalog.int8pl,
+	STYPE = bigint,
+	COMBINEFUNC = pg_catalog.int8pl,
+	INITCOND = '0',
+	PARALLEL = SAFE
+);
+
+COMMENT ON AGGREGATE lion_join_count(bigint) IS
+	'the sum of the counts, 0 over no rows: count() of a join from its dimension rows'' counts';
+
+CREATE AGGREGATE lion_join_sum(bigint) (
+	SFUNC = pg_catalog.int8pl,
+	STYPE = bigint,
+	COMBINEFUNC = pg_catalog.int8pl,
+	PARALLEL = SAFE
+);
+
+COMMENT ON AGGREGATE lion_join_sum(bigint) IS
+	'the sum of the values in int8, NULL over no rows: sum() of a join from its dimension rows'' products';
+
 /* ------------------------------------------------------------------ */
 -- stats/verify functions (lion_funcs.c)
 /* ------------------------------------------------------------------ */
