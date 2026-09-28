@@ -27,7 +27,7 @@ SET parallel_leader_participation = off;
  * lion_pj() runs a query through the pushdown with every join method
  * disabled, so that the node is EXERCISED: once as planned here - in
  * parallel, when the plan says so - once with max_parallel_workers_per_gather
- * at 0, and once with the pushdown off and the planner left alone.  It
+ * at 0, and once with the pushdown off and sequential scans only.  It
  * compares both of the first two with the third and says which plan the
  * first one had.
  */
@@ -57,12 +57,23 @@ BEGIN
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	EXECUTE format('CREATE TEMP TABLE lion_pj_ser AS SELECT s::text AS r FROM (%s) s', q);
 
-	/* the reference: the ordinary plan, with the pushdown off */
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_pj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
 

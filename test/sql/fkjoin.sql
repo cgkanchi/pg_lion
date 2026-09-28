@@ -18,8 +18,9 @@ SET default_statistics_target = 1000;
  * lion_fj() runs a query through the pushdown - with every join method
  * disabled when force is set, so that a shape the cost model would not pick
  * is still EXERCISED (the node joins nothing; the ordinary plan does) - and
- * again with the pushdown off and the planner left alone, and compares the
- * two.  It reports whether the node was used.
+ * again with the pushdown off and sequential scans only, so that the
+ * reference reads no lion posting set, and compares the two.  It reports
+ * whether the node was used.
  */
 CREATE FUNCTION lion_fj(q text, force boolean DEFAULT true) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -42,12 +43,23 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lion_fj_on AS SELECT s::text AS r FROM (%s) s', q);
 
-	/* the reference: the ordinary join, with the pushdown off */
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_fj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_fj_on' INTO nrows;
@@ -100,12 +112,24 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lion_fj_on AS EXECUTE lion_fjp_on(%s)', args);
 
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE 'PREPARE lion_fjp_off AS ' || q;
 	EXECUTE format('CREATE TEMP TABLE lion_fj_off AS EXECUTE lion_fjp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_fjp_on';
 	EXECUTE 'DEALLOCATE lion_fjp_off';

@@ -23,7 +23,8 @@ SET max_parallel_workers_per_gather = 0;
 /*
  * lion_mk() runs a query with every other scan and join method disabled, so
  * that a LionCount path that is built at all is the plan, and compares its
- * rows with the ordinary plan's (the pushdown off, the planner left alone).
+ * rows with the reference plan's: the pushdown off and sequential scans
+ * only, so that it reads no lion posting set.
  * It says whether the node ran, how many rows came out, and the node's two
  * recheck counters from EXPLAIN ANALYZE: the candidate TIDs it resolved in the
  * heap and the rows the recheck turned away.
@@ -69,10 +70,12 @@ BEGIN
 	END LOOP;
 	EXECUTE 'CREATE TEMP TABLE lion_mk_r_on AS ' || ex;
 
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
@@ -85,6 +88,9 @@ BEGIN
 	IF args IS NOT NULL THEN
 		EXECUTE 'DEALLOCATE lion_mk_off';
 	END IF;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_mk_r_on' INTO nrows;
@@ -854,7 +860,8 @@ VACUUM ANALYZE lion_mk_pd, lion_mk_pf;
  * lion_mk_par() runs a prepared statement's generic plan through the
  * pushdown with the join methods disabled - in parallel, when the plan says
  * so - then with max_parallel_workers_per_gather at 0, and then with the
- * pushdown off, and compares both of the first two with the third.
+ * pushdown off and sequential scans only, and compares both of the first two
+ * with the third.
  */
 CREATE FUNCTION lion_mk_par(q text, args text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -883,13 +890,25 @@ BEGIN
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	EXECUTE 'CREATE TEMP TABLE lion_mk_ser AS ' || ex;
 	EXECUTE 'DEALLOCATE lion_mk_ps';
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE 'PREPARE lion_mk_ps AS ' || q;
 	EXECUTE 'CREATE TEMP TABLE lion_mk_off AS ' || ex;
 	EXECUTE 'DEALLOCATE lion_mk_ps';
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
 
