@@ -5459,11 +5459,25 @@ few bytes a row and a column of unique keys the most, and each takes what it nee
 maintenance_work_mem (divided between the participants of a parallel build), and it counts what the
 columns' entries take, not the empty table and first block every column has whatever the budget -
 counting those made a 64kB budget on a wide index spill every column at every heap page. It is
-checked when the scan moves to the next heap page, and when it is exceeded the LARGEST columns are
-spilled until half of it is free: sorted into directory order and written to a logical tape as one
-RUN, and their memory reset. Runs therefore begin and end at page boundaries. Block sizes (the
-columns' contexts, the arena that entries and keys are carved from) scale with the budget, so a small
-one is not gone in one block.
+checked when the scan moves to the next heap page and after every 1024 keys (`LION_CHECK_KEYS`), since
+one row of a multi-key column can bring any number of keys, and when it is exceeded the LARGEST
+columns are spilled until half of it is free: sorted into directory order and written to a logical
+tape as one RUN, and their memory reset. A run can therefore end in the middle of a heap page or of a
+row, and the codes a key has on that page are then split between two runs - out of order between
+them, when a HOT root offset came late. Nothing depends on runs ending at page boundaries: each run
+holds a key's codes in ascending order, and the merge orders a key's codes across its inputs whatever
+their order. *(Until 2026-09-28 the budget was checked only when the heap page changed, and a page of
+rows with large arrays or tsvectors could add millions of entries between two checks.)* Block sizes
+(the columns' contexts, the arena that entries and keys are carved from) scale with the budget, so a
+small one is not gone in one block.
+
+The budget holds while the columns are written out too. When the scan is over, the entries of every
+column not written yet can still be in memory, and a column's merge needs read buffers, the build's
+summaries of that column (§32) take up to a quarter of maintenance_work_mem, and a colliding group
+(below) sorts its codes, all at once. So before a column is merged the largest columns - that one
+included - are spilled until what is left in memory, the merge's buffers and the summaries' share fit
+the budget together (`lion_spool_merge_column()`), and a colliding group's sort gets what is left
+over. *(Before, all of that stacked up to about twice maintenance_work_mem.)*
 
 A run is a sequence of records - kind, flags, hash, key length, the key's stored bytes, then the
 codes as varbyte deltas in chunks of at most 8kB - and an end marker. A record whose successor in the
@@ -5479,11 +5493,19 @@ the hash for an unordered one - and pops every input that ties with the smallest
   codes stay below the runner-up's, which makes the runs of a serial scan, whose codes follow one
   another, a concatenation, and a parallel build's participants, whose codes interleave one block
   chunk at a time, one comparison per chunk rather than per code;
-- several keys (a collision, within a run or across runs): every record of the group is read into
-  memory, the records are gathered into distinct keys by the opclass equality, and the keys are
-  handed over together in the directory's full order, their codes interleaved in code order - which
-  is how the sorted build fed the builders of one hash, so their pages are allocated in the same
-  order too.
+- several keys (a collision, within a run or across runs): every record of the group is read once,
+  its key matched to the group's distinct keys by the opclass equality and its codes put into a
+  tuplesort as (code, distinct key) pairs, in whatever memory the budget has left; the keys are
+  then handed over together in the directory's full order, their codes interleaved in code order -
+  which is how the sorted build fed the builders of one hash, so their pages are allocated in the
+  same order too. A merge that writes a run (a pass over too many runs, or a parallel participant's
+  export) does not gather them at all: it copies the group's records to the run as they are, all
+  of them TIED, and the merge that reads the run gathers them. *(Until 2026-09-28 every record's
+  codes were copied into arrays of 8-byte codes, and again per distinct key: one large key that
+  collided with another took gigabytes.)* Matching costs an equality call per record and distinct
+  key, which for an opclass whose hash collides freely - one group for the whole column - is
+  quadratic in the column's keys; so is its accumulator's hash table, and so is every lookup in its
+  directory.
 
 More runs than a merge pass reads at once (`maxorder`, the buffers of one pass taking at most half the
 budget) are merged in passes first. The distinct keys of a spill are sorted through the key type's
@@ -9602,8 +9624,10 @@ leader's either way, so parallel builds get summaries too. For a summarized colu
 (`lion_sum_begin()`), every code the pass hands a VALUE entry's builder is also added to the current
 bucket, and once a key is written the bucket closes if it holds `summary_tids` codes or more
 (`lion_sum_key_done()`). A bucket's codes are collected in an array, which switches to an INT8
-tuplesort past a quarter of `maintenance_work_mem` (one key of a column with few keys can be most of
-the table); a closed bucket is sorted, run through a collecting builder into the same items a
+tuplesort of an eighth of `maintenance_work_mem` past an eighth (one key of a column with few keys
+can be most of the table), freeing the array; the spool leaves the summaries that quarter of its
+budget (§24 "Build"). A closed bucket is sorted, run through a collecting builder into the same
+items a
 posting set is made of, and put aside in a temporary BufFile after a header naming its key. When
 the column's values are done (`lion_sum_finish()`), the last bucket is closed as the SUMLAST, `auto`
 decides, and the file is replayed through ordinary builders into entries written after the

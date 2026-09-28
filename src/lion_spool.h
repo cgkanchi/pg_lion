@@ -63,9 +63,14 @@ extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 extern double lion_spool_ntids(const LionSpool *spool);
 extern int	lion_spool_nruns(const LionSpool *spool);
 
-/* Serial build: one column's entries, in directory order, to emit. */
+/*
+ * Serial build: one column's entries, in directory order, to emit.  reserve
+ * is what emit itself will take of the budget meanwhile, which the spool
+ * leaves it (DESIGN.md §24, "Build").
+ */
 extern void lion_spool_emit_column(LionSpool *spool, int col,
-								   LionSpoolEmit emit, void *arg);
+								   LionSpoolEmit emit, void *arg,
+								   Size reserve);
 
 /* Parallel participant: every column's entries, to one tape for the leader. */
 extern void lion_spool_export(LionSpool *spool, TapeShare *share);
@@ -74,7 +79,7 @@ extern void lion_spool_end(LionSpool *spool);
 
 /*
  * Parallel leader: the participants' tapes, which filenums[] and shares[]
- * name, merged one column at a time.
+ * name, merged one column at a time in membytes, reserve as above.
  */
 extern LionSpoolReader *lion_spool_reader_begin(LionIndexState *ix,
 												SharedFileSet *fileset,
@@ -83,7 +88,8 @@ extern LionSpoolReader *lion_spool_reader_begin(LionIndexState *ix,
 												TapeShare *shares,
 												Size membytes);
 extern void lion_spool_reader_emit_column(LionSpoolReader *reader, int col,
-										  LionSpoolEmit emit, void *arg);
+										  LionSpoolEmit emit, void *arg,
+										  Size reserve);
 extern void lion_spool_reader_end(LionSpoolReader *reader);
 
 #endif							/* LION_SPOOL_H */
