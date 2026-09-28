@@ -165,6 +165,22 @@ lion_dir_check_level(Relation index, Page page, BlockNumber blk, int expected)
 }
 
 /*
+ * blk links to next, a page this backend already holds locked.  Locking it
+ * again would wait for this very backend for ever - a buffer content lock is
+ * not reentrant, and no deadlock detector watches it - so such a link, which
+ * only damage makes, is refused BEFORE the lock, where the level check that
+ * would otherwise catch it cannot run yet.
+ */
+static void
+lion_dir_held_link(Relation index, BlockNumber blk, BlockNumber next)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index \"%s\": directory block %u links to block %u, which this backend already holds",
+					RelationGetRelationName(index), blk, next)));
+}
+
+/*
  * The child block of the downlink at off, on internal page blk.  off comes
  * from a binary search, which answers one past the last item on a page that
  * has none - and an internal page is never left without a downlink, so such
@@ -836,14 +852,29 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
  * Step from buf to its right sibling holding buf until the sibling is locked
  * (lock coupling, left to right), and then release buf unless keep says the
  * caller still needs it.
+ *
+ * guard is the page the caller holds besides buf (InvalidBuffer, or buf
+ * itself, when there is none), and walk the walk this step belongs to.  A
+ * coupled walk holds a lock at every moment, so two things a damaged right
+ * link does to it have to be caught here: a link to buf or to the guard
+ * would lock a page this backend holds and wait for itself for ever, and is
+ * refused before the lock; and a cycle that avoids both would go round with
+ * interrupts held off, until the walk's bound refuses it (lion.h).
  */
 static Buffer
-lion_dir_step_right_coupled(Relation index, Buffer buf, int lockmode, bool keep)
+lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
+							int lockmode, bool keep, LionRightWalk *walk)
 {
+	BlockNumber blk = BufferGetBlockNumber(buf);
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 	Buffer		nbuf;
 
 	Assert(BlockNumberIsValid(next));
+	if (unlikely(next == blk ||
+				 (BufferIsValid(guard) && next == BufferGetBlockNumber(guard))))
+		lion_dir_held_link(index, blk, next);
+	lion_rightwalk_step(index, walk, blk);
+
 	nbuf = lion_dir_readbuf(index, next);
 	LockBuffer(nbuf, lockmode);
 	lion_dir_check_page(index, BufferGetPage(nbuf), next);
@@ -877,10 +908,12 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 	Buffer		buf = *bufp;
 	OffsetNumber off = *offp;
 	bool		moved = false;
+	LionRightWalk walk;
 
 	if (guardp != NULL)
 		*guardp = InvalidBuffer;
 
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page = BufferGetPage(buf);
@@ -945,7 +978,8 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 
 			if (keep)
 				*guardp = buf;
-			buf = lion_dir_step_right_coupled(index, buf, lockmode, keep);
+			buf = lion_dir_step_right_coupled(index, buf, *guardp, lockmode,
+											  keep, &walk);
 		}
 		else
 			buf = lion_dir_step_right(index, buf, lockmode);
@@ -1561,8 +1595,23 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 
 	if (BlockNumberIsValid(oldright))
 	{
+		/*
+		 * The old right sibling is reached through a link of the page being
+		 * split, while this backend holds that page and the sibling it has
+		 * just allocated: a link to either, which only damage makes, would
+		 * wait for this backend for ever, and is refused before the lock.
+		 * (A root has no right sibling; that was refused above.)  Once locked
+		 * the page is checked like every page read through a link, and here
+		 * it matters more than anywhere: the record below WRITES its leftlink,
+		 * and a damaged link would otherwise land that write on whatever page
+		 * it names.
+		 */
+		if (oldright == pblk || oldright == rblk)
+			lion_dir_held_link(index, pblk, oldright);
 		qbuf = lion_dir_readbuf(index, oldright);
 		LockBuffer(qbuf, BUFFER_LOCK_EXCLUSIVE);
+		lion_dir_check_page(index, BufferGetPage(qbuf), oldright);
+		lion_dir_check_level(index, BufferGetPage(qbuf), oldright, level);
 	}
 
 	metabuf = ReadBuffer(index, LION_METAPAGE_BLKNO);
@@ -1724,9 +1773,13 @@ lion_dir_place_again(Relation index, Relation heaprel, LionIndexState *ix,
 		lion_cmp_entry(lion_page_highkey(page), &sk) <= 0)
 	{
 		BlockNumber next = LionPageGetOpaque(page)->rightlink;
-		Buffer		rbuf = lion_dir_readbuf(index, next);
+		Buffer		rbuf;
 		OffsetNumber roff;
 
+		/* buf is held: a right link back to it would wait for itself */
+		if (next == BufferGetBlockNumber(buf))
+			lion_dir_held_link(index, next, next);
+		rbuf = lion_dir_readbuf(index, next);
 		LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
 		lion_dir_check_page(index, BufferGetPage(rbuf), next);
 		lion_dir_check_level(index, BufferGetPage(rbuf), next,
@@ -1745,11 +1798,12 @@ lion_dir_place_again(Relation index, Relation heaprel, LionIndexState *ix,
  * Is the downlink for rblk already in the parent level, immediately after the
  * one at (pbuf, off)?  A crash between the two records of a split leaves the
  * flag set with the downlink already there, and the repair must not add a
- * second one.
+ * second one.  childblk is the page whose split is being finished; the caller
+ * holds it and pbuf EXCLUSIVE.
  */
 static bool
 lion_dir_downlink_present(Relation index, Buffer pbuf, OffsetNumber off,
-						 BlockNumber rblk)
+						 BlockNumber childblk, BlockNumber rblk)
 {
 	Page		page = BufferGetPage(pbuf);
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
@@ -1764,6 +1818,10 @@ lion_dir_downlink_present(Relation index, Buffer pbuf, OffsetNumber off,
 	next = LionPageGetOpaque(page)->rightlink;
 	if (!BlockNumberIsValid(next))
 		return false;
+
+	/* ... which is neither of the pages held here, unless it is damaged */
+	if (next == BufferGetBlockNumber(pbuf) || next == childblk)
+		lion_dir_held_link(index, BufferGetBlockNumber(pbuf), next);
 
 	nbuf = ReadBuffer(index, next);
 	LockBuffer(nbuf, BUFFER_LOCK_SHARE);
@@ -1831,7 +1889,7 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 
 	parent = lion_dir_find_parent(index, heaprel, ix, skp, pblk, level, &off);
 
-	if (!lion_dir_downlink_present(index, parent, off, rblk))
+	if (!lion_dir_downlink_present(index, parent, off, pblk, rblk))
 		lion_dir_place(index, heaprel, ix, parent, OffsetNumberNext(off),
 					   false, sep, sepsz);
 
@@ -1850,6 +1908,12 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
  * The page at childlevel + 1 that holds the downlink of childblk, locked
  * EXCLUSIVE, with *offp its offset.  sk may be NULL, which starts the scan at
  * the leftmost page of that level.
+ *
+ * The caller holds childblk EXCLUSIVE throughout, so none of the checks for
+ * interrupts below can do anything, and a link to childblk from anywhere this
+ * reads - a level above it - would lock it a second time and wait for this
+ * backend for ever.  Such a link is refused before the lock, and the walks
+ * right are bounded (lion.h), so that damage ends in an ERROR here too.
  */
 static Buffer
 lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
@@ -1858,6 +1922,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 {
 	Buffer		buf;
 	BlockNumber blk;
+	LionRightWalk walk;
 
 	/* Descend to the level above the child, reading only. */
 	buf = lion_dir_get_root(index, ix);
@@ -1868,6 +1933,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 			 RelationGetRelationName(index), childlevel, childblk);
 	}
 
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page = BufferGetPage(buf);
@@ -1883,6 +1949,10 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 			while (!LionPageIsRightmost(page) &&
 				   lion_cmp_entry(lion_page_highkey(page), sk) <= 0)
 			{
+				if (LionPageGetOpaque(page)->rightlink == childblk)
+					lion_dir_held_link(index, BufferGetBlockNumber(buf),
+									   childblk);
+				lion_rightwalk_step(index, &walk, BufferGetBlockNumber(buf));
 				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buf);
 			}
@@ -1892,8 +1962,11 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 			off = lion_page_first_data(page);
 
 		child = lion_dir_downlink_block(index, page, BufferGetBlockNumber(buf), off);
+		if (child == childblk)
+			lion_dir_held_link(index, BufferGetBlockNumber(buf), childblk);
 		level = LionPageGetOpaque(page)->level;
 		UnlockReleaseBuffer(buf);
+		lion_rightwalk_init(&walk);
 		CHECK_FOR_INTERRUPTS();
 		buf = lion_dir_readbuf(index, child);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1909,12 +1982,15 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 	blk = BufferGetBlockNumber(buf);
 	UnlockReleaseBuffer(buf);
 
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page;
 		OffsetNumber off;
 		OffsetNumber maxoff;
 
+		if (blk == childblk)
+			lion_dir_held_link(index, blk, childblk);
 		buf = lion_dir_readbuf(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
@@ -1944,6 +2020,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 			}
 		}
 
+		lion_rightwalk_step(index, &walk, blk);
 		blk = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
 		if (!BlockNumberIsValid(blk))
@@ -1976,6 +2053,7 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 	LionSearchKey exact;
 	Buffer		guard = *bufp;
 	Buffer		buf = guard;
+	LionRightWalk walk;
 
 	lion_search_key_exact(ix, &exact, entry);
 
@@ -1997,6 +2075,7 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 		 */
 		LION_INJECTION_POINT("lion-dir-add-entry-spanning");
 
+		lion_rightwalk_init(&walk);
 		for (;;)
 		{
 			Page		page = BufferGetPage(buf);
@@ -2009,9 +2088,9 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 				lion_dir_finish_split(index, heaprel, ix, buf);
 				continue;
 			}
-			buf = lion_dir_step_right_coupled(index, buf,
+			buf = lion_dir_step_right_coupled(index, buf, guard,
 											  BUFFER_LOCK_EXCLUSIVE,
-											  buf == guard);
+											  buf == guard, &walk);
 		}
 		off = lion_dir_binsrch(BufferGetPage(buf), &exact);
 	}

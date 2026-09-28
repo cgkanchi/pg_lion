@@ -4430,23 +4430,43 @@ reads and at the cost of a comparison each, only what it would otherwise follow 
   terminate: a downlink to the page itself, or to one above it, used to send it round for ever;
 - a non-rightmost page has the high key every reader takes as its first item without looking;
 - the parent's right sibling that `lion_dir_downlink_present()` reads during a split repair is a
-  directory page at the parent's level, like every other page this file reads; and
+  directory page at the parent's level, like every other page this file reads;
 - an entry's `attno` names a key column the index has before `lion_search_key_exact()` takes that
   column's state, which `lion_column()` only Asserts: past the end of `ix->cols` the comparison would
-  have called whatever function pointers it found there.
+  have called whatever function pointers it found there;
+- *(2026-09-27 review)* a page reached through a link is not one this backend already holds, and
+  that is checked BEFORE the lock (`lion_dir_held_link()`), because a buffer content lock is neither
+  reentrant nor watched by the deadlock detector: a second lock on a page one holds waits for ever,
+  with every lock held. The walks that hold a page while they lock the next are the coupled steps
+  through a prefix run (the page stepped from and the find-or-create guard), a split's old right
+  sibling (the page being split and its new sibling), `lion_dir_place_again()` (the left half),
+  `lion_dir_downlink_present()` (the parent and the child being repaired) and
+  `lion_dir_find_parent()`, whose caller holds the child from the descent to the end of the scan; a
+  right link or downlink to one of those used to hang the backend; and
+- *(the same review)* a split's old right sibling is a directory page at the split page's level
+  before the split record writes its leftlink. It was not checked at all, so a damaged right link
+  had that write land on whatever page it named.
 
-A block number past the end, a right-link cycle and a damaged key datum are not caught here: the
-first fails in `ReadBuffer()`, the second walks until it is cancelled, and the third is the same
-risk every index AM takes with its own keys. "Until it is cancelled" is new as well: every step of
-a descent and of an uncoupled walk right now checks for interrupts BETWEEN the pages, with no content
-lock held. It used to check just after locking the next page, where the lock holds interrupts off,
-so a descent round a cycle of downlinks (the third case of the test below, before the level check
-refused it) ignored statement_timeout and pg_terminate_backend() alike and only SIGKILL stopped it. (The lock-coupled steps through a prefix run that spans pages
-still hold a lock at every point; they are bounded by that run.) `test/sql/corrupt.sql` damages a
-freshly built index's root on disk in the first three ways and checks that queries and inserts fail
-with INDEX_CORRUPTED and leave the relation's size alone; against the code before this review the
-first grew the index by a block per statement, the second answered from a line pointer past
-pd_lower, and the third never returned.
+A block number past the end and a damaged key datum are not caught here: the first fails in
+`ReadBuffer()`, and the second is the same risk every index AM takes with its own keys. A right-link
+cycle that an uncoupled walk follows walks until it is cancelled. "Until it is cancelled" is new as
+well: every step of a descent and of an uncoupled walk right now checks for interrupts BETWEEN the
+pages, with no content lock held. It used to check just after locking the next page, where the lock
+holds interrupts off, so a descent round a cycle of downlinks (the third case of the test below,
+before the level check refused it) ignored statement_timeout and pg_terminate_backend() alike and
+only SIGKILL stopped it. The walks that can NOT be cancelled, because they hold a page at every
+point - the coupled steps through a prefix run, and `lion_dir_find_parent()`'s walks right, under
+the child - are bounded instead (`LionRightWalk`, lion.h, 2026-09-27 review): a walk that only
+moves right never passes a page twice, since no page leaves a level and a split puts its new page
+to the right, so a walk that has taken more steps than the index has blocks is going round a cycle
+and is refused. The size is only asked for once a walk is 1024 pages long, and asked again whenever
+the walk outgrows it, since the index grows meanwhile. `test/sql/corrupt.sql` damages a freshly
+built index's root on disk in the first three ways of the list above and checks that queries and
+inserts fail with INDEX_CORRUPTED and leave the relation's size alone; against the code before that
+review the first grew the index by a block per statement, the second answered from a line pointer
+past pd_lower, and the third never returned. The cases the 2026-09-27 review added are not in that
+test yet, and neither is the root-split race above, which needs two backends and a split to land
+between one's meta-page read and its lock.
 
 ### Planner
 
