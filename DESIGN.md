@@ -2771,7 +2771,9 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   over the whole 32768-value range however few members arrive. The threshold is worth a lot in both
   directions: raising it past any list length, so that the fold runs everywhere, took `c20k IN (1000
   values) AND c2 = 1` from 11.1 ms to 21.0 and `c200 IN (1000 values) AND c2 = 1` from 7.6 to
-  **263**.
+  **263**. *(Since 2026-09-28 a count folds only ARRAYs of 128 members together or fewer, and
+  takes the image for any other union, which it no longer optimizes: "Unions and intersections
+  unoptimized", below. A scan's stream keeps this rule.)*
   A third construction was tried and **rejected**, and it is recorded because the shape that
   suggests it is the common one: a union over sparse segments (§13) arrives at every container key
   as a hundred or two throw-away one-member ARRAYs, for which the image's 4 KiB memset and 512-word
@@ -3071,6 +3073,108 @@ is an index page or part of the §9 interlock, and no VACUUM waits for a map pag
 when the node is done, rescanned or ended, or moves to another partition
 (`lion_vis_cache_release_vm()`). `test/sql/countpause.sql`'s check - no page of a lion index
 pinned by a paused cursor - holds as before.
+
+### Unions and intersections unoptimized (2026-09-28)
+
+A benchmark's count over a wide filter - a multi-key union of dense elements beside several dense
+clauses - took several times what bitset unions and ANDs of its data should take. The synthetic
+repro of §10 ("The groups of a walk, counted together", which describes it) has such a filter:
+`tags && '{1,2,3,4}' AND tags2 && '{1}' AND c20 IN (3, 7, 11) AND f1 AND NOT f2 AND lvl = 1`, 224 ms,
+over 3,896 container keys - 57 us a key for eleven containers of a few hundred to two thousand
+members. Its profile (`perf`, the backend alone):
+
+| function | share |
+|---|---|
+| `lion_container_or()` | 30.5% |
+| `lion_container_optimize()` | 24.4% |
+| `lion_container_and()` | 17.4% |
+| `container_make_run()` | 12.0% |
+| `bits_extract_runs()` | 5.8% |
+
+Nine tenths of it was the set algebra converting its results. Every `lion_container_and()`,
+`_or()` and `_andnot()` optimizes its result - counts its runs, picks the smallest representation,
+converts, copies it out - which is what a container kept on a page needs, and what an intermediate
+result of the merge, ANDed with the next source at once, does not. With 34 rows a heap page a dense
+column's containers are runs of a block's rows: the union of the four elements' ARRAYs came out a
+RUN at each fold, which the next fold filled back into a bitset image, and the AND chain's ARRAY of
+an IN list was checked for runs after each of its five ANDs. And the merges that remained were
+three-way branches on members that interleave at random, mispredicted at most steps.
+
+So, for a count (and a collection, §10 and §27) and nothing else:
+
+- **The merge's results are left unoptimized** (`LionCountCtx.raw`; `lion_container_and_raw()`,
+  `_andnot_raw()`, `_or_raw()`). An AND is an ARRAY when either side is one, a RUN when both are
+  RUNs whose runs fit, else a BITSET; an ANDNOT an ARRAY when its left side is one; an OR an ARRAY
+  when two ARRAYs fit one, else a BITSET - written straight into the destination, never optimized.
+  A result may be larger than its smallest form (a BITSET of a few members), and every reader takes
+  it: the next AND, the visibility map's block mask, the count, the recheck's iteration. What keeps
+  a container optimizes it first: a collection's copy (`lion_collect_container()`), so a copy takes
+  what it always took. The streams a plain, bitmap or ordered scan reads (`lion_stream_*`) keep the
+  optimizing forms, since their callers copy the containers and budget them by size.
+- **A union of dense containers is a bitset image** (`lion_or_hot_raw()`). The containers standing
+  at a key are folded pairwise only while they are ARRAYs of `LION_OR_FOLD_MEMBERS` (128) members
+  together or fewer, and fewer than `LION_OR_BITSET_MIN` of them; anything else is ORed into the
+  payload of a BITSET container in place and counted once, where it used to take 32 containers
+  before the image did. Measured: three ARRAYs of 110 members, folded in two branch-free merges,
+  took a sixth longer than their image.
+- **An AND of an ARRAY meets the other side one of three ways** (lion_container.c, "how two sides
+  of an AND meet"). A merge of two sorted sides is a chain of dependent steps, each comparison
+  deciding where the next loads are, and costs 2.5 to 4 ns a step however it is branched; setting
+  the larger side's members in a stack image and testing the smaller's against it are independent
+  steps of about a nanosecond, after a 4 kB clear. So two ARRAYs of more than 48 members together
+  are intersected through an image of the larger - unless the smaller has fewer than an eighth of
+  the larger's (plus the clear's worth), when it is galloped through as before, the gallop's last
+  binary search now branch-free; an ARRAY against a RUN through an image of the runs - or, for a
+  few members against many runs, a branch-free binary search of the runs per member; two small
+  sides by a merge without a branch on the comparison, whose steps are the three-way branch's. The
+  union merge and `lion_container_and_cardinality()`'s merges lost their branch the same way.
+  Every choice is made per call from the two sides' counts, and every path is memory-safe for a
+  damaged container as the rest of the library is ("untrusted containers").
+
+Measured by a harness beside the container library (-O2, containers of a heap of 34 rows a block,
+members only at offsets 1 to 34 of each of the 64 blocks; a key's AND timed 20,000 times):
+
+| AND | merged | as an image | searched |
+|---|---|---|---|
+| ARRAY 1,035 x ARRAY 1,022 | 4.2 us | 1.8 us | |
+| ARRAY 356 x ARRAY 353 | 1.8 us | 0.64 us | |
+| ARRAY 15 x ARRAY 340 (galloped) | 0.19 us | 0.33 us | |
+| ARRAY 591 x RUN 1,740 (about 400 runs) | 4.3 us | 1.1 us | 4.7 us |
+| ARRAY 53 x RUN 1,724 | 2.1 us | 0.69 us | 0.53 us |
+| ARRAY 8 x RUN 1,716 | 1.3 us | 0.74 us | 0.09 us |
+
+Measured on the repro, the node against itself before and after (PostgreSQL 18.6, medians of 18
+runs, three libraries interleaved, serial; §10's subsection has the setup):
+
+| count | before | after | cost units a millisecond, before and after |
+|---|---|---|---|
+| the wide filter above | 223.9 ms | 33.6 ms | 99, 659 |
+| `tags && '{1,2,3,4}'` alone | 152.7 | 10.7 | 28, 404 |
+| `tags @> '{1,2}'` | 17.7 | 4.4 | 19, 76 |
+| `f1 AND NOT f2 AND lvl = 1 AND tags && '{4}'` | 72.4 | 18.0 | 256, 1,031 |
+| `c20 IN (1, 2, 3) AND f1` | 30.7 | 9.5 | 356, 1,147 |
+| `tags && '{1}' AND tags2 && '{1}'` | 21.3 | 8.0 | 299, 800 |
+| `grp IN (1, 2, 3) AND c20 IN (4, 5)` | 11.1 | 3.8 | 427, 1,264 |
+| `NOT f1 AND f2` | 10.6 | 3.8 | 277, 771 |
+| `c20 = 3 AND lvl = 1` | 8.4 | 5.0 | 327, 542 |
+| `grp = 7 AND tags && '{2}'` | 3.0 | 2.7 | 502, 559 |
+
+The wide filter's profile after: `container_or_bitset()` (the images of the unions and of the runs
+an ARRAY is tested against) 35%, `array_union()` (the IN list's fold) 22% before the fold's
+threshold came down to 128, `array_and_image()` 11%, the page copies of `lion_cursor_take_page()` 6%,
+buffer lookups 5%. A GROUP BY's WHERE is collected with the same merge, and the collection of §10's
+grouped count took about what its ungrouped count does, 18 ms where it took 72.
+
+**The cost model is not refitted.** Its AND terms (`LION_PROBE_COST`, `LION_AND_MEMBER_COST`, §10,
+"The units") were fitted to the optimizing merge on §31's data sets, which are outside the tree
+and were not at hand. What the repro says: the counts whose time went to converting unions were
+priced far below core's scans - the union of four elements at 28 units a millisecond - and are in
+the band now; the ANDs of dense columns, which gained most from the images, are priced at about
+twice the reference (1,000 to 1,260 units a millisecond, against 500). Both errors are on the side
+of refusing the node, and no plan the regression suite pins moved. Refitting `LION_AND_MEMBER_COST`
+(4 to 5 ns a member when it was fitted; about a nanosecond now for the dense sides) and
+`LION_PROBE_COST` on §31's counts is the open item. `lion_merge_ops()` still prices a union by
+`LION_OR_BITSET_MIN` alone.
 
 ## 16. Partitioned tables (v1, implemented)
 
