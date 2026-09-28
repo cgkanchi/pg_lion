@@ -1748,6 +1748,7 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 	int			n;
 	LogicalTape *tape;
 	LionRunWriter *w;
+	uint64	   *page = NULL;
 	int			i;
 
 	if (col->nentries == 0)
@@ -1773,7 +1774,16 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 		{
 			LionRunCursor c;
 
+			/*
+			 * A cursor of its own for each unsorted entry, and one page
+			 * buffer for all of them: a cursor allocates its own otherwise,
+			 * and nothing frees it before the spill is over, which with many
+			 * HOT-updated keys is many times the budget.
+			 */
+			if (page == NULL)
+				page = palloc(sizeof(uint64) * LION_PAGE_CODES);
 			lion_cursor_init_memory(&c, col->state, 0, &items[i], NULL, 1);
+			c.page = page;
 			lion_cursor_next_record(&c);
 			while (c.hascode)
 			{
