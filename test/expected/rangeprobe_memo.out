@@ -8,8 +8,12 @@
 -- too while the emptied leaves were more than the bound.  The probe now
 -- remembers that it found nothing until the table or the index has changed.
 --
--- The table's shape is rangeprobe.sql's: 1500 rows analyzed, then 28,500
--- newer ones, so that the index grew by inserts, about 34 keys to a leaf.
+-- 1500 rows analyzed, then 38,500 newer ones.  The index is on the one
+-- column, whose keys arrive in order, and appends fill its leaves: about 130
+-- one-row keys to a leaf (a 32-byte entry header, the 8-byte key and a
+-- one-TID payload, 60 bytes with the line pointer), so the probe's hundred
+-- leaves are some 13,000 keys - not rangeprobe.sql's 34 to a leaf, whose
+-- three-column index takes each column's keys in the middle of its leaves.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -49,15 +53,15 @@ INSERT INTO lpm SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute'
 CREATE INDEX lpm_lion ON lpm USING lion (ts);
 VACUUM (ANALYZE) lpm;
 INSERT INTO lpm SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute'
-  FROM generate_series(1501, 30000) g;
+  FROM generate_series(1501, 40000) g;
 VACUUM (FREEZE) lpm;
 CREATE TABLE lpm_est (step text, est bigint);
 INSERT INTO lpm_est
 	SELECT 'probed', lpm_rows($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
--- The newest 10,000 keys go, and VACUUM empties their leaves, some 300: more
+-- The newest 25,000 keys go, and VACUUM empties their leaves, some 190: more
 -- than the probe reads.  The first plan reads a hundred of them and gives up;
 -- the next one reads none.
-DELETE FROM lpm WHERE id > 20000;
+DELETE FROM lpm WHERE id > 15000;
 VACUUM (FREEZE) lpm;
 CREATE TABLE lpm_io (step text, bufs bigint);
 INSERT INTO lpm_io
@@ -76,7 +80,7 @@ INSERT INTO lpm_est
 -- Rows past the end, more than the deleted ones left room for, grow the
 -- table and the index: the probe reads the end again and finds them.
 INSERT INTO lpm SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute'
-  FROM generate_series(30001, 50000) g;
+  FROM generate_series(40001, 70000) g;
 INSERT INTO lpm_est
 	SELECT 'grown', lpm_rows($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
 SELECT (SELECT est FROM lpm_est WHERE step = 'probed') >
@@ -91,7 +95,7 @@ SELECT (SELECT est FROM lpm_est WHERE step = 'probed') >
 SELECT count(*) FROM lpm WHERE ts >= '2026-01-10';
  count 
 -------
- 27041
+ 32041
 (1 row)
 
 RESET pg_lion.enable_count_pushdown;

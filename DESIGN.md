@@ -8490,9 +8490,12 @@ histogram's end stands; a partial index, and a Param. `test/sql/rangeprobe_leak.
 counts the calls of a non-leakproof `>=` of a lion operator class made while a query is planned: the
 table's owner has the histogram searched with it, a role under a row-level policy does not, and the
 same role does once the operator is leakproof. `test/sql/rangeprobe_memo.sql` deletes the newest
-10,000 keys of the same shape of table and vacuums: the first plan reads a hundred leaves and gives
-up, the next reads none (their planning buffers differ by 100 or more), and rows added past the end,
-more than the deletion left room for, grow the table and the index and have the end read again.
+25,000 of 40,000 keys of a one-column index and vacuums - keys that arrive in order fill that
+index's leaves, about 130 one-row keys to a leaf against the 34 of `rangeprobe.sql`'s three-column
+index, so it takes some 13,000 of them to empty `LION_PROBE_LEAVES` leaves: the first plan reads a
+hundred leaves and gives up, the next reads none (their planning buffers differ by 100 or more), and
+rows added past the end, more than the deletion left room for, grow the table and the index and have
+the end read again.
 `test/isolation/count_range_split_race.spec` parks a
 range sum between two entries of a leaf (`lion-entry-scan-resumed`) and the race of the complement
 between two leaves (`lion-entry-scan-leaf`), splits every leaf of the column under them, and checks
