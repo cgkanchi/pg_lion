@@ -220,8 +220,11 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_JT_CHILD		0	/* the child plan, producing its rows */
 #define LION_JT_LOOKUP		1	/* locating each key's fk set */
 #define LION_JT_COUNT		2	/* counting it, or testing it, and letting it go */
-#define LION_JT_COLLECT		3	/* collecting the fact filters, once a run */
-#define LION_JT_N			4
+#define LION_JT_LOCATE		3	/* locating the fact filters - a range among
+								 * them collected (§32) - once a run, or once
+								 * a leaf's turn */
+#define LION_JT_COLLECT		4	/* collecting the fact filters, once a run */
+#define LION_JT_N			5
 
 /*
  * How many distinct keys of a forward semi join over a non-unique key
@@ -16361,6 +16364,25 @@ lion_join_clock(LionCountScanState *st, int phase, instr_time *since)
 	*since = now;
 }
 
+/*
+ * The FK-side join's fact filters located - each clause's sets found, and a
+ * range among them collected into memory (DESIGN.md §32, "A range as a
+ * source"), which can be most of a run - and timed when the node is: once a
+ * run over a plain table, once a leaf's turn over a partitioned one
+ * (lion_join_part_open()).  It used to be in no phase, so EXPLAIN ANALYZE
+ * left a range's collection out of every timer the node prints.
+ */
+static void
+lion_join_locate_where(LionCountScanState *st)
+{
+	instr_time	t;
+
+	INSTR_TIME_SET_ZERO(t);
+	lion_join_clock(st, -1, &t);
+	lion_locate_where(st);
+	lion_join_clock(st, LION_JT_LOCATE, &t);
+}
+
 /* The child's next row, counted, and timed when the node is. */
 static TupleTableSlot *
 lion_join_child_next(LionCountScanState *st)
@@ -17176,7 +17198,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 		return;
 	}
 
-	lion_locate_where(st);
+	lion_join_locate_where(st);
 	if (jp->collected)
 		return;					/* probed, and located again each turn */
 
@@ -17791,12 +17813,16 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		return (st->joinclause >= 0) ? lion_next_join_row(st) :
 			lion_exec_partitioned(st);
 
-	if (!st->located)
-		lion_locate_where(st);
-
 	/* ---- the FK-side join: one partial row per dimension row ---- */
 	if (st->joinclause >= 0)
+	{
+		if (!st->located)
+			lion_join_locate_where(st);
 		return lion_next_join_row(st);
+	}
+
+	if (!st->located)
+		lion_locate_where(st);
 
 	/* ---- no index to iterate: exactly one row ---- */
 	if (!st->hasgroupidx)
@@ -19419,16 +19445,17 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 			/*
 			 * With TIMING, the time spent in each phase, summed over the
-			 * participants: the child producing its rows, the lookups, the
-			 * counts, and the collection of the fact filters.  What the node
-			 * took besides - its batches, its rows handed up - is its own
-			 * total less these.
+			 * participants and the leaves of a partitioned fact table: the
+			 * child producing its rows, the lookups, the counts, the locating
+			 * of the fact filters (a range among them collected, §32), and
+			 * the collection of their copy.  What the node took besides - its
+			 * batches, its rows handed up - is its own total less these.
 			 */
 			if (es->timing)
 			{
 				static const char *const phasename[LION_JT_N] = {
 					"Join Child Time", "Join Lookup Time", "Join Count Time",
-					"Fact Filter Collect Time"
+					"Fact Filter Locate Time", "Fact Filter Collect Time"
 				};
 
 				for (i = 0; i < LION_JT_N; i++)

@@ -8814,10 +8814,11 @@ It can now. Every run keeps:
     temporary file);
 - **timings**, only under EXPLAIN ANALYZE's TIMING option, as core times a node only then (the
   executor's `es_instrument` has `INSTRUMENT_TIMER`, in every participant):
-  `Join Child Time`, `Join Lookup Time`, `Join Count Time` and, when the filters are collected,
-  `Fact Filter Collect Time`, in milliseconds summed over the participants. Untimed, a phase costs
-  a flag test and no clock read; timed, a key costs three clock reads and a child row two, which
-  is what core's instrumentation of the child already spends on it.
+  `Join Child Time`, `Join Lookup Time`, `Join Count Time`, `Fact Filter Locate Time` (since
+  2026-09-29) and, when the filters are collected, `Fact Filter Collect Time`, in milliseconds
+  summed over the participants and over the leaves of a partitioned fact. Untimed, a phase costs a
+  flag test and no clock read; timed, a key costs three clock reads and a child row two, which is
+  what core's instrumentation of the child already spends on it.
 
 How to read them, for any workload:
 
@@ -8838,6 +8839,10 @@ How to read them, for any workload:
   copy) would show here as copy containers far above those bounds.
 - `Join Posting Pages Read`, and with BUFFERS the node's shared reads less its child's, are what the
   node itself read from disk.
+- `Fact Filter Locate Time` is the fact filters located - once a run, and once a leaf's turn over
+  a partitioned fact - and it is mostly a range among them collected into memory (§32, "A range as
+  a source"); `Range Sources Collected` says how many. It was in no phase before 2026-09-29, and a
+  semi join whose 90 ms were 87 of collecting a range showed none of it.
 - What the node took besides these phases - its batches, and handing its rows up - is its time less
   them.
 
@@ -9494,7 +9499,8 @@ sections above ask of the fact side.
   participants): `Join Keys Looked Up` counts a lookup per leaf that had a turn - an inner join's
   keys times those leaves, fewer for an existence test - `Join Keys Without Entry` a key per leaf
   it has no entry in, `Fact Filter Rows Collected` the rows of every leaf's copy and `Fact Filter
-  Copies Shared` one per leaf and run.
+  Copies Shared` one per leaf and run; and the timers, `Fact Filter Locate Time` every leaf's
+  locating of its filters at each of its turns.
 
 **Measured** (2026-09-28, PostgreSQL 18, warm cache, four CPUs shared with other work; medians of
 five runs, ms). A synthetic star: a 500,000-row dimension with btrees on its filter columns that

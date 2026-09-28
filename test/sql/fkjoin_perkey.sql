@@ -196,9 +196,11 @@ FROM lion_pk_plan('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.p
 	 lion_pk_plan('SELECT d.attr, count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1'' GROUP BY d.attr') g;
 -- the timings are there with TIMING, and only then
 SELECT n ? 'Join Child Time' AS child, n ? 'Join Lookup Time' AS lookup,
-	   n ? 'Join Count Time' AS count, n ? 'Fact Filter Collect Time' AS collect
+	   n ? 'Join Count Time' AS count, n ? 'Fact Filter Locate Time' AS locate,
+	   n ? 'Fact Filter Collect Time' AS collect
 FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''', 'TIMING ON, BUFFERS OFF') n;
-SELECT n ? 'Join Child Time' AS child, n ? 'Join Count Time' AS count
+SELECT n ? 'Join Child Time' AS child, n ? 'Join Count Time' AS count,
+	   n ? 'Fact Filter Locate Time' AS locate
 FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 2, 3, 4, 5, 6, 7) AND d.region = ''r1''') n;
 
 -- ---- 3. a copy spilled to a temporary file ------------------------------------
