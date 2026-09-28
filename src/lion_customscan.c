@@ -11115,6 +11115,13 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
  * (lion_load_inner_keys()); when they did not fit its budget, innerkey is
  * NULL and the inner index's entry scan is walked once per outer group
  * instead, which holds one pin at a time as well.
+ *
+ * That walk outlives many pairs, and so do the memory contexts
+ * lion_entry_scan_begin_col() creates for its position and its batch, under
+ * whatever context is current: it is begun in the query's context, never
+ * inside pergroup, whose reset before every pair would delete them under the
+ * walk (the 2026-09-27 review found exactly that: a leaf copied into freed
+ * memory at the next pair, and the contexts deleted twice at the end).
  */
 static TupleTableSlot *
 lion_next_group2(LionCountScanState *st, bool *exhausted)
@@ -11146,6 +11153,16 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 			st->outerisnull = st->groupset.keyisnull;
 			st->outeropen = true;
 			st->inneridx = 0;
+		}
+
+		/* ---- the fallback: the inner index's walk, per outer group ---- */
+		if (st->innerkey == NULL && !st->scanning2)
+		{
+			oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+			lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
+									 st->groupidxcol2);
+			MemoryContextSwitchTo(oldcxt);
+			st->scanning2 = true;
 		}
 
 		/*
@@ -11184,12 +11201,7 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		}
 		else
 		{
-			if (!st->scanning2)
-			{
-				lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
-										 st->groupidxcol2);
-				st->scanning2 = true;
-			}
+			Assert(st->scanning2);
 			if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
 			{
 				MemoryContextSwitchTo(oldcxt);

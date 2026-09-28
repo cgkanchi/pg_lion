@@ -3827,6 +3827,11 @@ inner index `outer_entries` times; it is kept as the FALLBACK for when the keys 
 `work_mem` budget (checked every 256 keys with `MemoryContextMemAllocated()`), because the §16
 lesson is that a plan-time bound is only as good as `estimate_num_groups`. `innerkey == NULL` selects
 that path, and then the inner key lives in the per-pair context like a single-column group's does.
+The walk itself does not: it outlives every pair of its outer group, and the contexts its position
+and batch live in are created under whatever context is current when it begins, so it begins in the
+query's context. It used to begin inside the per-pair context, whose reset before the next pair
+deleted them under the walk - a leaf copied into freed memory, and the contexts deleted twice at the
+end (2026-09-27 review; `test/sql/group2_lowmem.sql` runs the fallback, plain and partitioned).
 
 **Cost** (`lion_cost_count_rel()`). Three terms on top of §10's:
 
