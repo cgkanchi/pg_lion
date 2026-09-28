@@ -1,13 +1,21 @@
-# A bitmap scan of a lion index against a concurrent DELETE and VACUUM.
+# Bitmap scans of a lion index under snapshots taken before and after a
+# DELETE and a VACUUM: the MVCC interleavings.
 #
 # The counting queries carry a second aggregate on purpose: it keeps the
 # plans bitmap heap scans, which is what this spec is about.
 #
 # s1 holds a REPEATABLE READ snapshot taken before the delete, so its bitmap
 # heap scan must keep returning the old rows even after s2 has deleted them
-# and s3 has vacuumed; a new snapshot must see the new count.  ambulkdelete
-# takes cleanup locks on the pages it changes, so it also has to wait for the
-# pins a concurrent scan holds.
+# and s3 has vacuumed - a VACUUM that, with that snapshot open, may remove
+# none of them - and a new snapshot must see the new count.  Once no old
+# snapshot is left, the VACUUM does remove the TIDs from the index.
+#
+# Every step runs to completion before the next one starts, so no scan is
+# ever in progress - holding a pin - while the VACUUM runs, and this spec does
+# not exercise the pin / cleanup-lock interlock between ambulkdelete and a
+# scan (DESIGN.md §9, §11).  The specs that park a scan on an injection point
+# with its page pinned do: count_vacuum_race, count_prune_race,
+# vacuum_entry_delete, gettuple_dirty_pin and their neighbours.
 
 setup
 {
@@ -45,8 +53,9 @@ step s3_check	{ SELECT (SELECT count(*) + 0 * coalesce(max(i), 0) FROM lion_vsc 
 step s3_verify	{ SELECT lion_index_verify('lion_vsc_k', true); }
 step s3_stats	{ SELECT entries, ntids FROM lion_index_stats('lion_vsc_k'); }
 
-# s1 keeps its old snapshot across the delete and the vacuum; a fresh
-# snapshot in s3 sees the new rows.
+# s1 keeps its old snapshot across the delete and the vacuum, which can
+# remove none of the deleted rows while it is open; a fresh snapshot in s3
+# sees the new rows.
 permutation s1_begin s1_count s2_delete s2_commit s3_count s3_vacuum s1_count s1_commit s1_count s3_check s3_verify
 
 # Once no old snapshot is left, VACUUM really removes the TIDs from the

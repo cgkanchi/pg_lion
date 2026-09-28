@@ -358,7 +358,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s3_prep s4_attach s4_insert s3_verify s2_wakeup_insert s3_shape
+starting permutation: s3_prep s4_attach s4_insert s3_verify s2_verify_waits s2_wakeup_insert s3_shape
 injection_points_set_local
 --------------------------
                           
@@ -378,6 +378,12 @@ injection_points_attach
 
 step s4_insert: INSERT INTO sr VALUES (99999, 2500, 1); <waiting ...>
 step s3_verify: SELECT lion_index_verify('sr_k', true); <waiting ...>
+step s2_verify_waits: SELECT count(*) = 1 AS verify_waits FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT lion_index_verify%';
+verify_waits
+------------
+t           
+(1 row)
+
 step s2_wakeup_insert: SELECT sr_release('lion-insert-before-summary');
 sr_release
 ----------

@@ -10,10 +10,38 @@ P=$(cd "$(dirname "$0")" && pwd)
 export PGHOST=${LION_SOCK:-${XDG_RUNTIME_DIR:-/tmp}/pg_lion-$(id -un)} PGPORT=${LION_PORT:-54329} PGUSER=postgres PGDATABASE=postgres
 export PATH=$P/.local/pg/bin:$PATH
 D=$P/.local/data
+
+# The cluster trusts every local connection (initdb's default), so whoever can
+# reach its socket is the superuser.  A missing socket directory is made 0700,
+# and the default one - which may be in the shared /tmp - is refused unless it
+# is a plain directory (not a symlink) owned by this user that nobody else can
+# enter: one someone else made first, or one open to others, is not used.
+# LION_SOCK names a directory of the caller's own choosing, which is only
+# created if it is missing.
+sockdir() {
+	local mode uid
+	mkdir -p -m 0700 -- "$PGHOST" || { echo "cannot create the socket directory $PGHOST" >&2; exit 1; }
+	[ -n "${LION_SOCK:-}" ] && return 0
+	if [ -L "$PGHOST" ] || [ ! -d "$PGHOST" ]; then
+		echo "refusing to use $PGHOST as the socket directory: not a plain directory" >&2
+		exit 1
+	fi
+	read -r mode _ uid _ <<<"$(ls -ldn -- "$PGHOST")"
+	if [ "$uid" != "$(id -u)" ]; then
+		echo "refusing to use $PGHOST as the socket directory: it belongs to uid $uid, not to $(id -un)" >&2
+		exit 1
+	fi
+	case $mode in
+		drwx------ | drwx------.) ;;
+		*)	echo "refusing to use $PGHOST as the socket directory: its mode is $mode, not drwx------ (chmod 700 it, or set LION_SOCK)" >&2
+			exit 1 ;;
+	esac
+}
+
 case "$1" in
-  start)   mkdir -p "$PGHOST"; pg_ctl -D "$D" -l "$P/.local/pg.log" start ;;
+  start)   sockdir; pg_ctl -D "$D" -l "$P/.local/pg.log" start ;;
   stop)    pg_ctl -D "$D" stop -m fast ;;
-  restart) mkdir -p "$PGHOST"; pg_ctl -D "$D" -l "$P/.local/pg.log" restart -m fast ;;
+  restart) sockdir; pg_ctl -D "$D" -l "$P/.local/pg.log" restart -m fast ;;
   psql)    shift; exec psql -X "$@" ;;
   env)     printf "export PGHOST=%q PGPORT=%q PGUSER=%q PGDATABASE=%q PATH=%q\n" "$PGHOST" "$PGPORT" "$PGUSER" "$PGDATABASE" "$PATH" ;;
   # wal_level = replica, not minimal.  Under minimal a relation whose file was
@@ -46,6 +74,6 @@ autovacuum = off
 jit = off
 log_min_messages = warning
 CONF
-           mkdir -p "$PGHOST"; pg_ctl -D "$D" -l "$P/.local/pg.log" start >/dev/null && echo "cluster reset and started on $PGHOST:$PGPORT" ;;
+           sockdir; pg_ctl -D "$D" -l "$P/.local/pg.log" start >/dev/null && echo "cluster reset and started on $PGHOST:$PGPORT" ;;
   *) echo "usage: $0 {start|stop|restart|psql|reset|env}"; exit 1 ;;
 esac

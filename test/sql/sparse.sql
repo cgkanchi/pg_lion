@@ -256,7 +256,7 @@ SELECT lion_sp_ccmp('sp_wide_k', 'sp_wide', 'k', '1');
 CREATE TEMP TABLE sp_wide_before AS
 	SELECT sparse_segments, containers FROM lion_index_stats('sp_wide_k');
 DELETE FROM sp_wide WHERE (i / 64) % 16 = 0 AND i > 512;
-VACUUM sp_wide;
+VACUUM (FREEZE) sp_wide;
 SELECT lion_index_verify('sp_wide_k', true);
 
 /*
@@ -302,7 +302,7 @@ SELECT lion_sp_cmp('sp_hi', 'k = 1');
 SELECT lion_sp_ccmp('sp_hi_k', 'sp_hi', 'k', '1');
 SELECT lion_sp_ccmp('sp_hi_k', 'sp_hi', 'k', '3');
 SELECT lion_index_verify('sp_hi_k', true);
-VACUUM sp_hi;
+VACUUM (FREEZE) sp_hi;
 SELECT sparse_members = ntids AS still_all_sparse,
 	   ntids = (SELECT count(*) FROM sp_hi) AS ntids_matches_heap,
 	   entries AS entries_are_kept
@@ -315,7 +315,7 @@ SELECT lion_sp_ccmp('sp_hi_k', 'sp_hi', 'k', '3');
 
 -- every segment of a spilled posting set can go away
 DELETE FROM sp_mix WHERE k <> 1;
-VACUUM sp_mix;
+VACUUM (FREEZE) sp_mix;
 SELECT containers, sparse_segments, sparse_members,
 	   ntids = (SELECT count(*) FROM sp_mix) AS ntids_matches_heap
   FROM lion_index_stats('sp_mix_k');
@@ -325,7 +325,7 @@ SELECT lion_sp_cmp('sp_mix', 'k = 1042');
 
 -- and deleting everything empties the posting sets without losing the entries
 DELETE FROM sp_thr;
-VACUUM sp_thr;
+VACUUM (FREEZE) sp_thr;
 SELECT entries, containers, sparse_segments, ntids
   FROM lion_index_stats('sp_thr_k');
 SELECT lion_index_verify('sp_thr_k', true);
@@ -335,7 +335,7 @@ SELECT lion_sp_cmp('sp_thr', 'k = 1');
  * 6. The count pushdown over segment-heavy posting sets
  * ------------------------------------------------------------------ */
 
-VACUUM (ANALYZE) sp_hi;
+VACUUM (FREEZE, ANALYZE) sp_hi;
 ANALYZE sp_wide;
 
 -- an all-visible heap: the count comes straight from the visibility map
@@ -386,7 +386,7 @@ SELECT lion_index_count('sp_hi_few', 7, 'sp_hi_k', 999) =
 	   AS seek_past_a_segment_matches;
 
 -- and again once the heap is all-visible
-VACUUM (ANALYZE) sp_hi;
+VACUUM (FREEZE, ANALYZE) sp_hi;
 SELECT lion_sp_pd('SELECT count(*) FROM sp_hi WHERE k = 3');
 SELECT lion_sp_pd('SELECT count(*) FROM sp_hi WHERE k = 999');
 SELECT lion_sp_pd('SELECT few, count(*) FROM sp_hi GROUP BY few');

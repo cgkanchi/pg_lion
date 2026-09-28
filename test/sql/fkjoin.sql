@@ -18,8 +18,9 @@ SET default_statistics_target = 1000;
  * lion_fj() runs a query through the pushdown - with every join method
  * disabled when force is set, so that a shape the cost model would not pick
  * is still EXERCISED (the node joins nothing; the ordinary plan does) - and
- * again with the pushdown off and the planner left alone, and compares the
- * two.  It reports whether the node was used.
+ * again with the pushdown off and sequential scans only, so that the
+ * reference reads no lion posting set, and compares the two.  It reports
+ * whether the node was used.
  */
 CREATE FUNCTION lion_fj(q text, force boolean DEFAULT true) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -42,12 +43,23 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lion_fj_on AS SELECT s::text AS r FROM (%s) s', q);
 
-	/* the reference: the ordinary join, with the pushdown off */
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_fj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_fj_on' INTO nrows;
@@ -100,12 +112,24 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lion_fj_on AS EXECUTE lion_fjp_on(%s)', args);
 
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE 'PREPARE lion_fjp_off AS ' || q;
 	EXECUTE format('CREATE TEMP TABLE lion_fj_off AS EXECUTE lion_fjp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_fjp_on';
 	EXECUTE 'DEALLOCATE lion_fjp_off';
@@ -195,8 +219,8 @@ CREATE INDEX lion_ff_fk ON lion_ff USING lion (fk);
 CREATE INDEX lion_ff_x ON lion_ff USING lion (x);
 CREATE INDEX lion_ff_y ON lion_ff USING lion (y);
 CREATE INDEX lion_ff_tk ON lion_ff USING lion (tk);
-VACUUM ANALYZE lion_ff;
-VACUUM ANALYZE lion_fd;
+VACUUM (FREEZE, ANALYZE) lion_ff;
+VACUUM (FREEZE, ANALYZE) lion_fd;
 
 -- ---- 1. the shapes, on an all-visible heap ---------------------------------
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
@@ -239,7 +263,7 @@ SELECT lion_fj_pick('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.p
 -- loses to the hash join, and the model says so
 CREATE TABLE lion_fdbig (k int8 PRIMARY KEY, attr int);
 INSERT INTO lion_fdbig SELECT i, i % 5 FROM generate_series(1, 50000) i;
-VACUUM ANALYZE lion_fdbig;
+VACUUM (FREEZE, ANALYZE) lion_fdbig;
 SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k GROUP BY d.attr');
 -- ... unless its own quals leave few rows
 SELECT lion_fj_pick('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdbig d ON f.fk = d.k WHERE d.k < 60 GROUP BY d.attr');
@@ -283,8 +307,8 @@ INSERT INTO lion_ff8 SELECT CASE WHEN i % 17 = 0 THEN NULL ELSE i % 70 END, i % 
 FROM generate_series(1, 7000) i;
 CREATE INDEX ON lion_ff8 USING lion (fk8);
 CREATE INDEX ON lion_ff8 USING lion (x);
-VACUUM ANALYZE lion_fd4;
-VACUUM ANALYZE lion_ff8;
+VACUUM (FREEZE, ANALYZE) lion_fd4;
+VACUUM (FREEZE, ANALYZE) lion_ff8;
 SELECT lion_fj('SELECT d.grp, count(*) FROM lion_ff8 f JOIN lion_fd4 d ON f.fk8 = d.k GROUP BY d.grp');
 SELECT lion_fj('SELECT d.grp, count(*) FROM lion_ff8 f JOIN lion_fd4 d ON f.fk8 = d.k WHERE f.x = 1 GROUP BY d.grp');
 SELECT lion_fj('SELECT count(*) FROM lion_ff8 f JOIN lion_fd4 d ON d.k = f.fk8 WHERE d.grp = ''g2''');
@@ -421,8 +445,8 @@ SELECT lion_fj('SELECT d.pk, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.tk = d.tpk WHERE f.x = 3 GROUP BY d.attr');
 SELECT lion_fj_counter('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk', 'Heap Blocks Rechecked') > 0 AS dirty_heap_rechecks;
 -- the same after VACUUM, from the visibility map
-VACUUM lion_ff;
-VACUUM lion_fd;
+VACUUM (FREEZE) lion_ff;
+VACUUM (FREEZE) lion_fd;
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x = 3 GROUP BY d.attr');
 SELECT lion_fj_counter('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk', 'Heap Blocks Rechecked') AS vacuumed_heap_rechecks;

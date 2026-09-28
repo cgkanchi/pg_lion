@@ -57,7 +57,7 @@ CREATE INDEX lo_mc ON lo USING lion (k2, nl);
 CREATE INDEX lo_tags ON lo USING lion (tags);
 CREATE INDEX lo_tsv ON lo USING lion (tsv);
 CREATE INDEX lo_part ON lo USING lion (c1k) WHERE c2 = 0;
-VACUUM ANALYZE lo;
+VACUUM (FREEZE, ANALYZE) lo;
 
 /*
  * lion_ord() runs q through the node - every core scan disabled, so that
@@ -279,7 +279,7 @@ SELECT lion_ord('SELECT id, k, note FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT
 SELECT lion_ord('SELECT id, k, note FROM lo WHERE c200 = 17 ORDER BY k DESC, id DESC');
 SELECT lion_ord('SELECT id, k FROM lo WHERE c200 = 16 AND c2 = 0 ORDER BY k, id LIMIT 50');
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 50');
-VACUUM lo;
+VACUUM (FREEZE) lo;
 SELECT lion_ord('SELECT id, k, note FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 50');
 SELECT lion_ord('SELECT id, k, note FROM lo WHERE c200 = 17 ORDER BY k DESC, id DESC');
 SELECT lion_ord('SELECT id, k FROM lo WHERE c200 = 16 AND c2 = 0 ORDER BY k, id LIMIT 50');
@@ -404,7 +404,7 @@ INSERT INTO orb SELECT i, i, i % 7, i % 11, i % 13 FROM generate_series(1, 20000
 CREATE INDEX orb_k ON orb (k);
 CREATE INDEX orb_ab ON orb USING lion (a, b);
 CREATE INDEX orb_c ON orb USING lion (c);
-VACUUM ANALYZE orb;
+VACUUM (FREEZE, ANALYZE) orb;
 SELECT * FROM lion_ord_plan('SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50');
 SELECT count(*) FILTER (WHERE a <> 3) AS wrong, count(*)
   FROM (SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50) s;
@@ -430,7 +430,7 @@ CREATE INDEX lcor_k3 ON lcor (k3, id);
 CREATE INDEX lcor_c ON lcor USING lion (c);
 CREATE INDEX lcor_h ON lcor USING lion (h);
 CREATE INDEX lcor_h2 ON lcor USING lion (h2);
-VACUUM ANALYZE lcor;
+VACUUM (FREEZE, ANALYZE) lcor;
 -- whatever the planner picks (it cannot see the correlation), forced here
 SELECT * FROM lion_ord_plan('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
 SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
@@ -472,7 +472,7 @@ CREATE TABLE lwalk (id int PRIMARY KEY, u int, k int) WITH (autovacuum_enabled =
 INSERT INTO lwalk SELECT i, i, (i * 7919) % 20011 FROM generate_series(1, 20000) i;
 CREATE INDEX lwalk_k ON lwalk (k, id);
 CREATE INDEX lwalk_u ON lwalk USING lion (u);
-VACUUM ANALYZE lwalk;
+VACUUM (FREEZE, ANALYZE) lwalk;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT * FROM lion_ord_run('SELECT id FROM lwalk WHERE u BETWEEN 1 AND 15000 ORDER BY k, id LIMIT 5');
@@ -503,7 +503,7 @@ INSERT INTO ldbl SELECT i, i % 100, i % 7, (i * 7919) % 100003, repeat('x', 60)
 CREATE INDEX ldbl_gk ON ldbl (g, k);
 CREATE INDEX ldbl_g ON ldbl USING lion (g);
 CREATE INDEX ldbl_h ON ldbl USING lion (h);
-VACUUM ANALYZE ldbl;
+VACUUM (FREEZE, ANALYZE) ldbl;
 SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 ORDER BY k');
 SELECT * FROM lion_ord_plan('SELECT id, pad FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 10');
 SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 ORDER BY k');

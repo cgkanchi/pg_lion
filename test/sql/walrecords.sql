@@ -59,13 +59,13 @@ INSERT INTO lion_wr SELECT i, i FROM generate_series(100000, 130000) i;
 -- entries it empties and hands the pages they owned back to the free space
 -- map.
 DELETE FROM lion_wr WHERE k >= 100000;
-VACUUM lion_wr;
+VACUUM (FREEZE) lion_wr;
 
 -- ... and a key whose posting set owns whole container pages, so that
 -- deleting it frees them: the entry goes, then its pages are marked deleted
 -- and recorded in the map.
 DELETE FROM lion_wr WHERE k < 2;
-VACUUM lion_wr;
+VACUUM (FREEZE) lion_wr;
 
 SELECT pg_switch_wal() IS NOT NULL AS wal_switched;
 SELECT pg_current_wal_lsn() AS lsn1 \gset

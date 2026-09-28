@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s3_prep s1_group s2_split s2_wakeup s1_plain s3_shape s3_verify
+starting permutation: s3_prep s1_group s3_parked s2_split s2_wakeup s1_plain s3_shape s3_verify
 injection_points_attach
 -----------------------
                        
@@ -12,6 +12,12 @@ step s1_group:
 		   sum(c) AS rows_counted, min(c) AS min_rows, max(c) AS max_rows
 	  FROM (SELECT k, count(*) AS c FROM dsp GROUP BY k) g;
  <waiting ...>
+step s3_parked: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed';
+parked
+------
+t     
+(1 row)
+
 step s2_split: 
 	BEGIN;
 	INSERT INTO dsp

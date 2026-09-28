@@ -9,7 +9,7 @@ SET synchronous_commit = on;
 CREATE TABLE lion_ci (id int, name citext NOT NULL);
 INSERT INTO lion_ci SELECT g, (ARRAY['Alice','BOB','carol','Alice ','bob'])[1 + g % 5] FROM generate_series(1, 5000) g;
 CREATE INDEX lion_ci_name ON lion_ci USING lion (name);
-VACUUM ANALYZE lion_ci;
+VACUUM (FREEZE, ANALYZE) lion_ci;
 SET enable_seqscan = off;
 -- 'alice' matches 'Alice' (case-insensitive) but not 'Alice ' (trailing space)
 SELECT count(*) FROM lion_ci WHERE name = 'alice';
@@ -72,7 +72,7 @@ INSERT INTO lion_cirep VALUES ('SecretOldSpelling');
 CREATE INDEX lion_cirep_name ON lion_cirep USING lion (name);
 DELETE FROM lion_cirep;
 INSERT INTO lion_cirep SELECT 'secretoldspelling' FROM generate_series(1, 10000);
-VACUUM ANALYZE lion_cirep;
+VACUUM (FREEZE, ANALYZE) lion_cirep;
 -- one entry, and the key in it is the spelling that was deleted
 SELECT entries FROM lion_index_stats('lion_cirep_name');
 EXPLAIN (COSTS OFF) SELECT name, count(*) FROM lion_cirep GROUP BY name;

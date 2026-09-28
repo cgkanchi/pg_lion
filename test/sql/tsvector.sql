@@ -97,7 +97,7 @@ UPDATE lion_ts SET tsv = to_tsvector('english', coalesce(body, ''))
 
 CREATE INDEX lion_ts_tsv ON lion_ts USING lion (tsv);
 CREATE INDEX lion_ts_grp ON lion_ts USING lion (grp);
-VACUUM ANALYZE lion_ts;
+VACUUM (FREEZE, ANALYZE) lion_ts;
 
 -- The key column of a tsvector_ops index is text: the lexeme.
 SELECT a.attname, a.atttypid::regtype
@@ -243,7 +243,7 @@ SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 VACUUM lion_ts;
 SELECT lion_index_verify('lion_ts_tsv', true);
 
-VACUUM ANALYZE lion_ts;
+VACUUM (FREEZE, ANALYZE) lion_ts;
 -- an all-visible heap: the counts come out of the visibility map
 SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'alpha & bravo')$$);
@@ -278,7 +278,7 @@ SELECT entries, null_tids, empty_tids
 SELECT lion_index_verify('lion_ts_empty_tsv', true);
 -- and once more after a VACUUM has rewritten the entries
 DELETE FROM lion_ts_empty WHERE id % 4 = 0;
-VACUUM lion_ts_empty;
+VACUUM (FREEZE) lion_ts_empty;
 SELECT entries, null_tids, empty_tids
   FROM lion_index_stats('lion_ts_empty_tsv');
 SELECT lion_index_verify('lion_ts_empty_tsv', true);
@@ -310,7 +310,7 @@ SELECT i, to_tsvector('simple',
 					  ' rare' || i || ' endword')
   FROM generate_series(1, 20000) i;
 CREATE INDEX lion_tsc_tsv ON lion_tsc USING lion (tsv);
-VACUUM ANALYZE lion_tsc;
+VACUUM (FREEZE, ANALYZE) lion_tsc;
 -- exact: one lexeme, an AND and an OR over lexemes
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare500'::tsquery;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc

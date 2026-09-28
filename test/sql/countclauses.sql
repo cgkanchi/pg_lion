@@ -10,7 +10,8 @@
 -- Every query here runs with the other scans disabled, so that a LionCount
 -- path that is built at all is the plan whatever the cost model says, and its
 -- rows are compared with the same query's under
--- pg_lion.enable_count_pushdown = off, as a multiset both ways round.
+-- pg_lion.enable_count_pushdown = off with sequential scans only - no scan of
+-- any index, a lion one included - as a multiset both ways round.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -23,7 +24,8 @@ SET max_parallel_workers_per_gather = 0;
 /*
  * lion_cc() runs a query with every other scan and join method disabled,
  * notes whether the plan is the LionCount node, and compares its rows with
- * the ordinary plan's (the pushdown off, the planner left alone).
+ * the reference plan's: the pushdown off and sequential scans only, so that
+ * it reads no lion posting set; the join methods are the planner's.
  */
 CREATE FUNCTION lion_cc(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -48,15 +50,20 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lion_cc_on AS SELECT s::text AS r FROM (%s) s', q);
 
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_cc_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_cc_on' INTO nrows;
@@ -98,13 +105,18 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lion_cc_on AS EXECUTE lion_ccp_on(%s)', args);
 
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE 'PREPARE lion_ccp_off AS ' || q;
 	EXECUTE format('CREATE TEMP TABLE lion_cc_off AS EXECUTE lion_ccp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_ccp_on';
 	EXECUTE 'DEALLOCATE lion_ccp_off';
@@ -332,7 +344,7 @@ CREATE INDEX lion_cc_pc ON lion_cc_t USING lion (pc);
 CREATE INDEX lion_cc_d ON lion_cc_t USING lion (d);
 CREATE INDEX lion_cc_ts ON lion_cc_t USING lion (ts);
 CREATE INDEX lion_cc_country ON lion_cc_t USING lion (country);
-VACUUM ANALYZE lion_cc_t, lion_cc_dim;
+VACUUM (FREEZE, ANALYZE) lion_cc_t, lion_cc_dim;
 
 SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
 
@@ -436,7 +448,7 @@ SELECT lion_index_posting_root('lion_cc_status', 'val4'::lion_cc_other);
 DROP INDEX lion_cc_status, lion_cc_dstatus, lion_cc_flag, lion_cc_pc, lion_cc_d,
 	lion_cc_ts, lion_cc_country;
 CREATE INDEX lion_cc_m ON lion_cc_t USING lion (status, flag, pc, d, ts, country, dstatus);
-VACUUM ANALYZE lion_cc_t;
+VACUUM (FREEZE, ANALYZE) lion_cc_t;
 
 SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
 

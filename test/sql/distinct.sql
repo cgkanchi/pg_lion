@@ -203,7 +203,7 @@ CREATE INDEX lion_dt_g ON lion_dt USING lion (g);
 CREATE INDEX lion_dt_k ON lion_dt USING lion (k);
 CREATE INDEX lion_dt_a ON lion_dt USING lion (a);
 CREATE INDEX lion_dt_t ON lion_dt USING lion (t);
-VACUUM ANALYZE lion_dt;
+VACUUM (FREEZE, ANALYZE) lion_dt;
 
 -- ---- 1. count(DISTINCT k) over the WHERE (shape 1) ------------------------
 SELECT count(DISTINCT k) FROM lion_dt;
@@ -323,7 +323,7 @@ SELECT count(DISTINCT k) FROM lion_dt;
 CREATE TABLE lion_dtm AS SELECT * FROM lion_dt;
 CREATE INDEX lion_dtm_gk ON lion_dtm USING lion (g, k);
 CREATE INDEX lion_dtm_a ON lion_dtm USING lion (a);
-VACUUM ANALYZE lion_dtm;
+VACUUM (FREEZE, ANALYZE) lion_dtm;
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtm');
 SELECT lion_dc('SELECT count(DISTINCT g) FROM lion_dtm WHERE a = 2');
 SELECT lion_dc('SELECT g, count(DISTINCT k) FROM lion_dtm GROUP BY g');
@@ -436,7 +436,7 @@ CREATE INDEX lion_dtc_k50 ON lion_dtc USING lion (k50);
 CREATE INDEX lion_dtc_g200 ON lion_dtc USING lion (g200);
 CREATE INDEX lion_dtc_g2k ON lion_dtc USING lion (g2k);
 CREATE INDEX lion_dtc_k1k ON lion_dtc USING lion (k1k);
-VACUUM ANALYZE lion_dtc;
+VACUUM (FREEZE, ANALYZE) lion_dtc;
 SELECT lion_dc_pick('SELECT count(DISTINCT k50) FROM lion_dtc');
 SELECT lion_dc_pick('SELECT g8, count(DISTINCT k50) FROM lion_dtc GROUP BY g8');
 SELECT lion_dc_pick('SELECT g200, count(DISTINCT k50) FROM lion_dtc GROUP BY g200');

@@ -27,7 +27,7 @@ CREATE INDEX lion_pin_k ON lion_pin USING lion (k);
 CREATE INDEX lion_pin_x ON lion_pin USING lion (x);
 CREATE INDEX lion_pin_y ON lion_pin USING lion (y);
 CREATE INDEX lion_pin_kx ON lion_pin USING lion (k, x);
-VACUUM ANALYZE lion_pin;
+VACUUM (FREEZE, ANALYZE) lion_pin;
 SELECT pg_relation_size('lion_pin_k') / current_setting('block_size')::int > 1200 AS many_leaves;
 /*
  * How many of an index's pages some backend pins right now: this one's pins

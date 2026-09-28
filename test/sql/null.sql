@@ -95,7 +95,7 @@ SELECT i,
 CREATE INDEX lion_null_k ON lion_null USING lion (k);
 CREATE INDEX lion_null_t ON lion_null USING lion (t);
 CREATE INDEX lion_null_d ON lion_null USING lion (d);
-VACUUM ANALYZE lion_null;
+VACUUM (FREEZE, ANALYZE) lion_null;
 
 -- ---- what the index holds ----------------------------------------------
 SELECT lion_index_verify('lion_null_k', true);
@@ -199,7 +199,7 @@ ALTER TABLE lion_null_late ALTER COLUMN k DROP NOT NULL;
 INSERT INTO lion_null_late VALUES (5001, NULL), (5002, NULL);
 SELECT lion_index_verify('lion_null_late_k', true);
 SELECT entries, ntids, null_tids FROM lion_index_stats('lion_null_late_k');
-VACUUM ANALYZE lion_null_late;
+VACUUM (FREEZE, ANALYZE) lion_null_late;
 SELECT lion_nullcmp('SELECT id FROM lion_null_late WHERE k IS NULL');
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null_late WHERE k IS NULL');
 
@@ -210,7 +210,7 @@ SELECT lion_index_verify('lion_null_k', true);
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
 SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL AND d = 1');
 
-VACUUM lion_null;
+VACUUM (FREEZE) lion_null;
 SELECT lion_index_verify('lion_null_k', true);
 SELECT lion_index_verify('lion_null_t', true);
 SELECT null_tids = (SELECT count(*) FROM lion_null WHERE k IS NULL) AS null_tids_match
@@ -221,7 +221,7 @@ SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null GROUP BY k');
 
 -- every NULL row gone: the entry stays, empty, and produces no group
 DELETE FROM lion_null WHERE k IS NULL;
-VACUUM lion_null;
+VACUUM (FREEZE) lion_null;
 SELECT lion_index_verify('lion_null_k', true);
 SELECT entries, null_tids FROM lion_index_stats('lion_null_k');
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null WHERE k IS NULL');
@@ -232,7 +232,7 @@ SELECT lion_nullcmp('SELECT id FROM lion_null WHERE k IS NULL');
 CREATE TABLE lion_null_all (id int NOT NULL, k int);
 INSERT INTO lion_null_all SELECT i, NULL FROM generate_series(1, 20000) i;
 CREATE INDEX lion_null_all_k ON lion_null_all USING lion (k);
-VACUUM ANALYZE lion_null_all;
+VACUUM (FREEZE, ANALYZE) lion_null_all;
 SELECT lion_index_verify('lion_null_all_k', true);
 SELECT entries, ntids, null_tids, container_pages > 0 AS null_entry_spilled
   FROM lion_index_stats('lion_null_all_k');
@@ -242,7 +242,7 @@ SELECT lion_nullcmp('SELECT k, count(*) FROM lion_null_all GROUP BY k');
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k = 1');
 -- and the same index after half of it is deleted and vacuumed
 DELETE FROM lion_null_all WHERE id % 2 = 0;
-VACUUM lion_null_all;
+VACUUM (FREEZE) lion_null_all;
 SELECT lion_index_verify('lion_null_all_k', true);
 /*
  * Deleting every other row turns each run container into a bitset, so the
@@ -263,12 +263,12 @@ SELECT entries, null_tids, container_pages > 0 AS null_entry_spilled
 INSERT INTO lion_null_all SELECT i, NULL FROM generate_series(20001, 20500) i;
 SELECT lion_index_verify('lion_null_all_k2', true);
 SELECT null_tids FROM lion_index_stats('lion_null_all_k2');
-VACUUM ANALYZE lion_null_all;
+VACUUM (FREEZE, ANALYZE) lion_null_all;
 SELECT lion_nullcmp('SELECT count(*) FROM lion_null_all WHERE k IS NULL');
 
 -- VACUUM filtering a NULL entry that is a chain of container pages
 DELETE FROM lion_null_all WHERE id % 3 = 0;
-VACUUM lion_null_all;
+VACUUM (FREEZE) lion_null_all;
 SELECT lion_index_verify('lion_null_all_k', true);
 SELECT lion_index_verify('lion_null_all_k2', true);
 SELECT null_tids = (SELECT count(*) FROM lion_null_all) AS null_tids_match

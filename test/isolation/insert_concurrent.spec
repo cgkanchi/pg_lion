@@ -1,12 +1,22 @@
-# Concurrent inserts into one directory leaf of a lion index.
+# Inserts from two open transactions into one directory leaf of a lion index,
+# and scans between them: the MVCC interleavings.
 #
 # The counting queries carry a second aggregate on purpose: it keeps the
 # plans bitmap heap scans, which is what this spec is about.
 #
-# Every key here shares one directory leaf, so they share one page lock and
-# all writers serialise on it.  Two sessions insert rows with the same key
-# while a third scans; the scan must see exactly the committed rows, and the
-# index must still be structurally sound afterwards.
+# Every key here shares one directory leaf.  Two transactions insert rows
+# with the same key, and then with a key that did not exist, while a third
+# session scans; the index holds both transactions' TIDs from the moment
+# each INSERT ends, committed or not, and the scan must see exactly the
+# committed rows - none of an open transaction's, none of a rolled-back
+# one's - and the index must still be structurally sound afterwards.
+#
+# Every step runs to completion before the next one starts, so the two
+# INSERTs never hold the leaf at the same time and neither ever waits for the
+# other's page lock: the second session to insert a key finds the entry the
+# first one made.  This spec does not exercise two writers racing on a page
+# or on the creation of one entry; dir_insert_race does that, with an
+# injection point.
 
 setup
 {
@@ -49,7 +59,8 @@ step s3_verify	{ SELECT lion_index_verify('lion_conc_k', true); }
 step s3_stats	{ SELECT entries, ntids FROM lion_index_stats('lion_conc_k'); }
 
 # Both sessions insert into the same key, then into a key that does not exist
-# yet (so both try to create the same entry), with a scan in between.
+# yet (the first INSERT creates its entry, the second finds it), with a scan
+# in between.
 permutation s1_ins s2_ins s3_count s1_ins2 s2_ins2 s3_count s1_commit s2_commit s3_check s3_stats s3_verify
 
 # The same, but one of the two transactions rolls back: its TIDs stay in the

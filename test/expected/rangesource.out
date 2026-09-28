@@ -440,7 +440,7 @@ SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u >= 100 AND r < 5000');
  collected 1, walked 0, inside: (4516)
 (1 row)
 
-VACUUM lion_src_t;
+VACUUM (FREEZE) lion_src_t;
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u >= 5000 GROUP BY g');
                                        lion_src                                        
 ---------------------------------------------------------------------------------------

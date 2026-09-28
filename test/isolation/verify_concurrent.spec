@@ -72,10 +72,16 @@
 #    while verify() waits for the table: it takes the table first, holding
 #    nothing on the index (the deadlock the old lock order had).
 #
-# A parked step carries no (*) marker: isolationtester sees a session waiting
-# on an injection point as blocked, so it moves on only once verify() has
-# really parked.  The markers in parentheses pin the order completions are
-# reported in.
+# A parked step carries no (*) marker, which would move on at once and let the
+# next step race the park.  isolationtester then moves on once the session is
+# blocked - pg_isolation_test_session_is_blocked() counts a wait on an
+# injection point - or once the step has finished.  The markers in
+# parentheses pin the order completions are reported in, and they also make a
+# check that never parked, and simply finished, print "<waiting ...>" exactly
+# as a parked one does; so every parked check with a marker is followed by
+# s3_at_<point> (v_parked, which fails if the check never parks there), or,
+# for lock_drop's lock wait, s3_at_table, and that is what shows the race was
+# run.
 
 setup
 {
@@ -252,6 +258,9 @@ step s3_wake_set_again	{ SELECT injection_points_wakeup('lion-verify-set-leaves-
 step s3_wake_rewalk	{ SELECT injection_points_wakeup('lion-verify-set-rewalk'); }
 step s3_at_set		{ SELECT v_parked('lion-verify-set-leaves-walked'); }
 step s3_at_rewalk	{ SELECT v_parked('lion-verify-set-rewalk'); }
+step s3_at_meta		{ SELECT v_parked('lion-verify-meta-read'); }
+# lock_drop's check waits for the table lock instead of an injection point.
+step s3_at_table	{ SELECT count(*) = 1 AS waits_for_the_table FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT lion_index_verify%'; }
 step s3_note_free	{
 	CREATE TABLE v_free AS
 	SELECT deleted_pages, pg_relation_size('vp_k') AS size
@@ -310,6 +319,7 @@ step s3_new_set	{
 permutation
 	s1_park_level
 	s1_verify_c(s3_wake_level)	# parks with the leaves walked
+	s3_at_level				# ... and it really is parked there
 	s2_split_right				# goes through: nothing waits for the check
 	s3_park_page
 	s3_wake_level_again			# parks on the first page of level 1
@@ -324,6 +334,7 @@ permutation
 permutation
 	s1_park_page
 	s1_verify_c(s3_wake_page)	# parks on the first leaf
+	s3_at_page				# ... and it really is parked there
 	s2_split_left				# splits it
 	s3_wake_page				# the next leaf's left link is the new page
 	s1_done						# the check has ended
@@ -332,6 +343,7 @@ permutation
 permutation
 	s1_park_meta
 	s1_verify_r(s3_wake_meta)	# parks with the root and height read
+	s3_at_meta				# ... and it really is parked there
 	s2_split_root				# splits the root
 	s3_wake_meta
 	s1_done						# the check has ended
@@ -340,6 +352,7 @@ permutation
 permutation
 	s1_park_set
 	s1_verify_p(s3_wake_set)	# parks with the first set's leaves walked
+	s3_at_set				# ... and it really is parked there
 	s2_grow_p					# splits its last leaf
 	s3_wake_set					# the walk sees a downlink it did not expect
 	s1_done						# the check has ended
@@ -348,6 +361,7 @@ permutation
 permutation
 	s1_park_set
 	s1_verify_q(s3_wake_set)	# parks with a one-page set walked
+	s3_at_set				# ... and it really is parked there
 	s2_push_q					# pushes its root down; a new key spills
 	s3_wake_set
 	s1_done						# the check has ended
@@ -356,6 +370,7 @@ permutation
 permutation
 	s1_park_level
 	s1_verify_c(s3_wake_level)
+	s3_at_level				# ... and it really is parked there
 	s2_spill					# an INLINE entry the walk checked spills
 	s3_wake_level
 	s1_done						# the check has ended
@@ -366,6 +381,7 @@ permutation
 	s1_park_rewalk
 	s1_note_held
 	s1_verify_p(s3_wake_set)	# walk 1 parks after the set's leaves
+	s3_at_set				# ... and it really is parked there
 	s2_touch_p
 	s3_wake_set_again			# walk 1 is thrown away
 	s3_at_rewalk				# walk 2 is about to start
@@ -388,6 +404,7 @@ permutation
 	s3_note_free
 	s1_park_level
 	s1_verify_p(s3_wake_level)	# parks with the leaves walked
+	s3_at_level				# ... and it really is parked there
 	s2_grow_p					# splits k = 0's leaves into the freed pages
 	s3_wake_level
 	s1_done						# the check has ended
@@ -400,6 +417,7 @@ permutation
 	s3_note_free
 	s1_park_level
 	s1_verify_p(s3_wake_level)	# parks with the leaves walked
+	s3_at_level				# ... and it really is parked there
 	s2_grow_new					# a new key: its root from the end of the
 								# relation, its leaves from the freed pages
 	s3_wake_level
@@ -409,6 +427,7 @@ permutation
 permutation
 	s1_park_meta
 	s1_verify_c(s3_wake_meta)
+	s3_at_meta				# ... and it really is parked there
 	s2_vacuum_c(s1_verify_c)	# waits for the check's lock
 	s3_wake_meta
 	s1_done						# the check ends first
@@ -419,6 +438,7 @@ permutation
 	s3_hold
 	s1_park_level
 	s1_verify_c(s2_late)		# parks with the leaves walked
+	s3_at_level				# ... and it really is parked there
 	s2_split_right
 	s2_late						# one row in, then stopped: holds the index
 	s3_wake_level				# the check has candidates, and waits for it
@@ -439,5 +459,6 @@ permutation
 permutation
 	s2_lock
 	s1_verify_c(s2_rollback)	# waits for the table, holding nothing on the index
+	s3_at_table				# ... and it really is waiting
 	s2_drop						# ... so this does not wait for it
 	s2_rollback

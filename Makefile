@@ -84,7 +84,8 @@ unit: test/unit/container_test test/unit/sparse_test
 # line leaves a stale object with an old struct layout after a header change)
 $(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src/lion_tid.h \
          src/lion_wal.h
-src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o src/lion_scan.o: src/lion_count.h
+src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o src/lion_scan.o \
+          src/lion_funcs.o src/lion_selfuncs.o: src/lion_count.h
 src/lion_customscan.o src/lion_fkjoin.o: src/lion_fkjoin.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 

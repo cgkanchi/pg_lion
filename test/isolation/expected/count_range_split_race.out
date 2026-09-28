@@ -1,6 +1,6 @@
 Parsed test spec with 4 sessions
 
-starting permutation: s3_prep s3_how s1_inside s2_split s2_wakeup_resumed s3_plain s3_shape s3_verify
+starting permutation: s3_prep s3_how s1_inside s3_parked_resumed s2_split s2_wakeup_resumed s3_plain s3_shape s3_verify
 injection_points_attach
 -----------------------
                        
@@ -31,6 +31,12 @@ inside|complement|t
 (1 row)
 
 step s1_inside: SELECT count(*) FROM rsr WHERE k BETWEEN 1000 AND 1800 AND g = 1; <waiting ...>
+step s3_parked_resumed: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed';
+parked
+------
+t     
+(1 row)
+
 step s2_split: 
 	BEGIN;
 	INSERT INTO rsr SELECT 100000 + i, 2 * i + 1, 1 FROM generate_series(0, 1999) i;
@@ -108,7 +114,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s3_prep s3_how s4_complement s2_split s2_wakeup_leaf s3_plain s3_shape s3_verify
+starting permutation: s3_prep s3_how s4_complement s3_parked_leaf s2_split s2_wakeup_leaf s3_plain s3_shape s3_verify
 injection_points_attach
 -----------------------
                        
@@ -139,6 +145,12 @@ inside|complement|t
 (1 row)
 
 step s4_complement: SELECT count(*) FROM rsr WHERE k >= 800 AND g = 1; <waiting ...>
+step s3_parked_leaf: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-leaf';
+parked
+------
+t     
+(1 row)
+
 step s2_split: 
 	BEGIN;
 	INSERT INTO rsr SELECT 100000 + i, 2 * i + 1, 1 FROM generate_series(0, 1999) i;

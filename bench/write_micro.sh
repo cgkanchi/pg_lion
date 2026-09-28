@@ -55,9 +55,21 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # goes into DESIGN.md.
 PGBIN=${LION_WM_PGBIN:-$ROOT/.local/pg/bin}
 DATA=${LION_WM_DATA:-$ROOT/.local/data-wm}
-SOCK=${LION_WM_SOCK:-/tmp/claude-1000/pgsk-wm}
 PORT=${LION_WM_PORT:-54330}
 OUT=$ROOT/bench/results/write-micro
+# The socket directory.  LION_WM_SOCK names one of the caller's choosing (made
+# 0700 if it is missing).  Otherwise `init` makes a private one with mktemp -d
+# under $TMPDIR (else /tmp) and records it in $DATA/wm_sockdir, where every
+# later command finds it, and `drop` removes it with the data directory.  The
+# cluster trusts every local connection, so that directory is refused unless
+# it is a plain directory of this user's that nobody else can enter.
+if [ -n "${LION_WM_SOCK:-}" ]; then
+	SOCK=$LION_WM_SOCK
+elif [ -f "$DATA/wm_sockdir" ]; then
+	SOCK=$(cat "$DATA/wm_sockdir")
+else
+	SOCK=""			# no cluster yet: wm_init makes it
+fi
 export PATH=$PGBIN:$PATH
 export PGHOST=$SOCK PGPORT=$PORT PGUSER=postgres PGDATABASE=postgres
 
@@ -85,10 +97,54 @@ q() { psql -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 # ---------------------------------------------------------------- cluster ----
 
+# The socket directory, checked (and made 0700 if it is missing: a tmp cleaner
+# may have removed it since init) before a postmaster is started in it.
+wm_sockdir() {
+	local mode uid
+	[ -n "$SOCK" ] || { echo "no socket directory: run '$0 init' first" >&2; exit 1; }
+	mkdir -p -m 0700 -- "$SOCK"
+	[ -n "${LION_WM_SOCK:-}" ] && return 0
+	if [ -L "$SOCK" ] || [ ! -d "$SOCK" ]; then
+		echo "refusing to use $SOCK as the socket directory: not a plain directory" >&2
+		exit 1
+	fi
+	read -r mode _ uid _ <<<"$(ls -ldn -- "$SOCK")"
+	if [ "$uid" != "$(id -u)" ]; then
+		echo "refusing to use $SOCK as the socket directory: it belongs to uid $uid" >&2
+		exit 1
+	fi
+	case $mode in
+		drwx------ | drwx------.) ;;
+		*)	echo "refusing to use $SOCK as the socket directory: its mode is $mode, not drwx------" >&2
+			exit 1 ;;
+	esac
+}
+
+# Every command that talks to the cluster needs to know where its socket is;
+# without that, libpq would try its compiled-in default directory instead.
+wm_need_cluster() {
+	[ -n "$SOCK" ] && return 0
+	echo "no socket directory is recorded for $DATA: run '$0 init' first (or set LION_WM_SOCK to the one its postgresql.conf names)" >&2
+	exit 1
+}
+
 wm_init() {
 	if [ -d "$DATA" ]; then echo "$DATA exists; run 'drop' first" >&2; exit 1; fi
-	mkdir -p "$SOCK" "$OUT"
+	mkdir -p "$OUT"
+	if [ -z "$SOCK" ]; then
+		SOCK=$(mktemp -d "${TMPDIR:-/tmp}/lion_wm_sock.XXXXXX") ||
+			{ echo "mktemp -d for the socket directory failed" >&2; exit 1; }
+		# A Unix-domain socket path is limited to ~107 bytes.
+		if [ "${#SOCK}" -gt 80 ]; then
+			rmdir -- "$SOCK"
+			SOCK=$(mktemp -d /tmp/lion_wm_sock.XXXXXX) ||
+				{ echo "mktemp -d for the socket directory failed" >&2; exit 1; }
+		fi
+		export PGHOST=$SOCK
+	fi
+	wm_sockdir
 	initdb -D "$DATA" -U postgres --no-locale -E UTF8 >/dev/null
+	[ -n "${LION_WM_SOCK:-}" ] || printf '%s\n' "$SOCK" >"$DATA/wm_sockdir"
 	cat >>"$DATA/postgresql.conf" <<CONF
 port = $PORT
 unix_socket_directories = '$SOCK'
@@ -120,9 +176,19 @@ CONF
 # STOP and START, never `pg_ctl restart`, which reuses the previous
 # postmaster's options out of postmaster.opts and would keep the preload of a
 # previous rmgr arm (DESIGN.md §25 records the trap).
-wm_start() { pg_ctl -D "$DATA" -l "$DATA/server.log" -o "$PGOPTS" -w start >/dev/null; }
+wm_start() { wm_sockdir; pg_ctl -D "$DATA" -l "$DATA/server.log" -o "$PGOPTS" -w start >/dev/null; }
 wm_stop() { pg_ctl -D "$DATA" -m fast -w stop >/dev/null 2>&1 || true; }
-wm_drop() { wm_stop; rm -rf "$DATA"; }
+# The socket directory goes too when init made it: only a path of the shape
+# mktemp gave it, never LION_WM_SOCK.
+wm_drop() {
+	wm_stop
+	rm -rf "$DATA"
+	if [ -z "${LION_WM_SOCK:-}" ]; then
+		case $SOCK in
+			*/lion_wm_sock.??????) rm -rf -- "$SOCK" ;;
+		esac
+	fi
+}
 
 # The template database: the 1M-row fact table of bench/comprehensive's scalar
 # suite plus the 10,000 rows every insert measurement adds to it.  Every
@@ -447,6 +513,10 @@ SQL
 }
 
 # --------------------------------------------------------------------- main --
+
+case "${1:-}" in
+	start | reload | psql | wal | headline | burstscale | burst | run | waits) wm_need_cluster ;;
+esac
 
 case "${1:-}" in
 	init) wm_init ;;

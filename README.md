@@ -82,10 +82,12 @@ replay, so turning it on for a primary that never replays proves nothing.
 
 `.local/pg` can be any PostgreSQL 16 or later install.  What the suites need from it:
 
-- **contrib: `citext`, `pg_buffercache` and `pg_walinspect`.**  The regression suite creates all
-  three.  Without `pg_buffercache` the `pinbudget` and `range` files and the `gettuple_pause` spec
-  fail, without `pg_walinspect` `walrecords` fails, and most files use `citext`.  The PGDG packages
-  (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
+- **contrib: `citext`, `pageinspect`, `pg_buffercache` and `pg_walinspect`.**  The regression
+  suite creates all four.  Without `pageinspect` the `build`, `corrupt` and `summary` files fail,
+  without `pg_buffercache` the `corrupt`, `pinbudget` and `range` files and the `count_batch_race`
+  and `gettuple_pause` specs fail, without `pg_walinspect` `walrecords` fails, and most files use
+  `citext`.  The PGDG packages (`postgresql-N`) include contrib; a source build needs
+  `make -C contrib install`.
 - **`pg_isolation_regress`** for the isolation specs: a source build installs it with
   `make -C src/test/isolation install`, and the packages ship it in `postgresql-server-dev-N`.
 - **`injection_points`** for the specs that park a backend on an injection point: a server
@@ -94,11 +96,24 @@ replay, so turning it on for a primary that never replays proves nothing.
   skipped and the run says which (`INJECTION_POINTS=1` forces them, and makes a missing module an
   error instead).
 - **The recovery harness** (`make recovery-check`) needs a whole installation to initdb clusters
-  in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into; as root it also
-  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).
+  in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into
+  (`RECOVERY_SKIP_INSTALL=1` uses the one already installed there instead); as root it also
+  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e and 3
+  need `injection_points`, and are skipped without it unless `INJECTION_POINTS=1` makes that an
+  error.
+
+The regression files VACUUM with `FREEZE` wherever what they print depends on the VACUUM having
+done all its work - index statistics after a DELETE, a plan the visibility map prices, a count
+that must skip every heap block.  A plain VACUUM that cannot get a heap page's cleanup lock at
+once (the checkpointer and the background writer pin the pages they write) checks that page
+without pruning it: its dead TIDs stay in every index and its visibility-map bit stays clear.  An
+aggressive VACUUM waits for the lock instead.  The isolation specs keep plain VACUUMs, whose waits
+are part of what they test.
 
 `dev.sh` puts its cluster's socket in `$XDG_RUNTIME_DIR/pg_lion-<user>` (or `/tmp/pg_lion-<user>`)
-on port 54329, and `LION_SOCK` / `LION_PORT` move it; the cluster runs with `wal_level = replica`, so
+on port 54329, and `LION_SOCK` / `LION_PORT` move it.  The cluster trusts local connections, so
+`dev.sh` makes a missing socket directory mode 0700, and refuses the default one if it is a symlink,
+belongs to someone else or is open to others.  The cluster runs with `wal_level = replica`, so
 that index builds and the write paths of indexes created in the same transaction are WAL-logged in
 the suite as they are in production.
 

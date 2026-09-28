@@ -288,7 +288,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk)
 /* ---------- meta page ---------- */
 
 #define LION_METAPAGE_BLKNO	0
-#define LION_MAGIC			0x52424931	/* 'LION1' */
+#define LION_MAGIC			0x52424931	/* 'RBI1' */
 /*
  * Version 2 indexes NULL keys (DESIGN.md §14).  The page format did not
  * change - a version 1 index is structurally valid - but it holds no NULL

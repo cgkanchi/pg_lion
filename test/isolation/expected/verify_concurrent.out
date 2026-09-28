@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_park_level s1_verify_c s2_split_right s3_park_page s3_wake_level_again s3_at_page s3_wake_page s3_at_level s2_split_right2 s3_wake_level s1_done s3_dir
+starting permutation: s1_park_level s1_verify_c s3_at_level s2_split_right s3_park_page s3_wake_level_again s3_at_page s3_wake_page s3_at_level s2_split_right2 s3_wake_level s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -13,6 +13,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s3_at_level: SELECT v_parked('lion-verify-dir-level-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_split_right: 
 	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
 	  FROM generate_series(1, 1000) g;
@@ -103,7 +109,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_page s1_verify_c s2_split_left s3_wake_page s1_done s3_dir
+starting permutation: s1_park_page s1_verify_c s3_at_page s2_split_left s3_wake_page s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -116,6 +122,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s3_at_page: SELECT v_parked('lion-verify-dir-page-read');
+v_parked
+--------
+        
+(1 row)
+
 step s2_split_left: 
 	INSERT INTO vc SELECT 'key0-' || g || repeat('z', 100)
 	  FROM generate_series(1, 100) g;
@@ -164,7 +176,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_meta s1_verify_r s2_split_root s3_wake_meta s1_done s3_root
+starting permutation: s1_park_meta s1_verify_r s3_at_meta s2_split_root s3_wake_meta s1_done s3_root
 injection_points_set_local
 --------------------------
                           
@@ -177,6 +189,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_r: SELECT lion_index_verify('vr_k', true); <waiting ...>
+step s3_at_meta: SELECT v_parked('lion-verify-meta-read');
+v_parked
+--------
+        
+(1 row)
+
 step s2_split_root: 
 	INSERT INTO vr SELECT 'root' || g || repeat('r', 200)
 	  FROM generate_series(1, 300) g;
@@ -223,7 +241,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_verify_p s2_grow_p s3_wake_set s1_done s3_posting
+starting permutation: s1_park_set s1_verify_p s3_at_set s2_grow_p s3_wake_set s1_done s3_posting
 injection_points_set_local
 --------------------------
                           
@@ -236,6 +254,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s3_at_set: SELECT v_parked('lion-verify-set-leaves-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 30000) i;
 step s3_wake_set: 
 	SELECT injection_points_detach('lion-verify-set-leaves-walked');
@@ -280,7 +304,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_verify_q s2_push_q s3_wake_set s1_done s3_pushdown
+starting permutation: s1_park_set s1_verify_q s3_at_set s2_push_q s3_wake_set s1_done s3_pushdown
 injection_points_set_local
 --------------------------
                           
@@ -293,6 +317,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_q: SELECT lion_index_verify('vq_k', true); <waiting ...>
+step s3_at_set: SELECT v_parked('lion-verify-set-leaves-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_push_q: 
 	INSERT INTO vq SELECT 4000 + i, CASE WHEN i % 2 = 0 THEN 0 ELSE 5 END
 	  FROM generate_series(1, 40000) i;
@@ -341,7 +371,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_level s1_verify_c s2_spill s3_wake_level s1_done s3_spilled
+starting permutation: s1_park_level s1_verify_c s3_at_level s2_spill s3_wake_level s1_done s3_spilled
 injection_points_set_local
 --------------------------
                           
@@ -354,6 +384,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s3_at_level: SELECT v_parked('lion-verify-dir-level-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_spill: 
 	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 200);
 
@@ -401,7 +437,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_set s1_park_rewalk s1_note_held s1_verify_p s2_touch_p s3_wake_set_again s3_at_rewalk s3_wake_rewalk s3_at_set s2_touch_p s3_wake_set_again s3_at_rewalk s3_wake_rewalk s3_at_set s2_touch_p s3_wake_set s1_done s3_touched
+starting permutation: s1_park_set s1_park_rewalk s1_note_held s1_verify_p s3_at_set s2_touch_p s3_wake_set_again s3_at_rewalk s3_wake_rewalk s3_at_set s2_touch_p s3_wake_set_again s3_at_rewalk s3_wake_rewalk s3_at_set s2_touch_p s3_wake_set s1_done s3_touched
 injection_points_set_local
 --------------------------
                           
@@ -426,6 +462,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s3_at_set: SELECT v_parked('lion-verify-set-leaves-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_touch_p: INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i;
 step s3_wake_set_again: SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
 injection_points_wakeup
@@ -519,7 +561,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_p s3_wake_level s1_done s3_reused
+starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s3_at_level s2_grow_p s3_wake_level s1_done s3_reused
 injection_points_set_local
 --------------------------
                           
@@ -551,6 +593,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s3_at_level: SELECT v_parked('lion-verify-dir-level-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 30000) i;
 step s3_wake_level: 
 	SELECT injection_points_detach('lion-verify-dir-level-walked');
@@ -595,7 +643,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s2_grow_new s3_wake_level s1_done s3_new_set
+starting permutation: s2_free_p s2_vacuum_p s2_xid s3_note_free s1_park_level s1_verify_p s3_at_level s2_grow_new s3_wake_level s1_done s3_new_set
 injection_points_set_local
 --------------------------
                           
@@ -627,6 +675,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_p: SELECT lion_index_verify('vp_k', true); <waiting ...>
+step s3_at_level: SELECT v_parked('lion-verify-dir-level-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_grow_new: INSERT INTO vp SELECT 100000 + i, 2 FROM generate_series(1, 30000) i;
 step s3_wake_level: 
 	SELECT injection_points_detach('lion-verify-dir-level-walked');
@@ -671,7 +725,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s1_park_meta s1_verify_c s2_vacuum_c s3_wake_meta s1_done s2_done s3_dir
+starting permutation: s1_park_meta s1_verify_c s3_at_meta s2_vacuum_c s3_wake_meta s1_done s2_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -684,6 +738,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s3_at_meta: SELECT v_parked('lion-verify-meta-read');
+v_parked
+--------
+        
+(1 row)
+
 step s2_vacuum_c: VACUUM vc; <waiting ...>
 step s3_wake_meta: 
 	SELECT injection_points_detach('lion-verify-meta-read');
@@ -736,7 +796,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s3_hold s1_park_level s1_verify_c s2_split_right s2_late s3_wake_level s3_release s1_done s3_dir
+starting permutation: s3_hold s1_park_level s1_verify_c s3_at_level s2_split_right s2_late s3_wake_level s3_release s1_done s3_dir
 injection_points_set_local
 --------------------------
                           
@@ -755,6 +815,12 @@ injection_points_attach
 (1 row)
 
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s3_at_level: SELECT v_parked('lion-verify-dir-level-walked');
+v_parked
+--------
+        
+(1 row)
+
 step s2_split_right: 
 	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
 	  FROM generate_series(1, 1000) g;
@@ -878,7 +944,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_lock s1_verify_c s2_drop s2_rollback
+starting permutation: s2_lock s1_verify_c s3_at_table s2_drop s2_rollback
 injection_points_set_local
 --------------------------
                           
@@ -886,6 +952,12 @@ injection_points_set_local
 
 step s2_lock: BEGIN; LOCK TABLE vc IN ACCESS EXCLUSIVE MODE;
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
+step s3_at_table: SELECT count(*) = 1 AS waits_for_the_table FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT lion_index_verify%';
+waits_for_the_table
+-------------------
+t                  
+(1 row)
+
 step s2_drop: DROP INDEX vc_k;
 step s2_rollback: ROLLBACK;
 step s1_verify_c: <... completed>

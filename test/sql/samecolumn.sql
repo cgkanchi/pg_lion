@@ -117,7 +117,7 @@ INSERT INTO lion_sc_t SELECT 'b', 'b', i % 4 FROM generate_series(1, 2000) i;
 CREATE INDEX lion_sc_v ON lion_sc_t USING lion (v lion_sc_ops);
 CREATE INDEX lion_sc_w ON lion_sc_t USING lion (w);
 CREATE INDEX lion_sc_g ON lion_sc_t USING lion (g);
-VACUUM ANALYZE lion_sc_t;
+VACUUM (FREEZE, ANALYZE) lion_sc_t;
 -- one entry for the two spellings, which is what the opclass says
 SELECT entries FROM lion_index_stats('lion_sc_v');
 

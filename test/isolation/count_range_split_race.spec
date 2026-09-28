@@ -171,15 +171,24 @@ step s3_shape	{
 	  FROM lion_index_stats('rsr_k');
 }
 step s3_verify	{ SELECT lion_index_verify('rsr_k', true); }
+# Is s1, or s4, waiting at its injection point right now?
+step s3_parked_resumed	{ SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed'; }
+step s3_parked_leaf	{ SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-leaf'; }
 
-# The parked steps carry no (*) marker: isolationtester sees a session waiting
-# on an injection point as blocked, so it moves on only once the step has
-# really parked.  The marker in parentheses pins the report of its completion
-# after the step that releases it.
+# The parked steps carry no (*) marker, which would move on at once, and the
+# next step could then race the park.  Without it isolationtester moves on
+# once the session is blocked (pg_isolation_test_session_is_blocked counts a
+# wait on an injection point) - or once the step has finished: the marker in
+# parentheses, which pins the report of its completion after the step that
+# releases it, also makes a step that never parked, and simply completed,
+# print "<waiting ...>" exactly as a parked one does.  So the output alone
+# cannot show that the race was run; s3_parked_*, straight after the parked
+# step, is what shows the session really is parked there.
 permutation
 	s3_prep					# make the heap all-visible
 	s3_how					# inside and complement, some twenty leaves
 	s1_inside(s2_wakeup_resumed)	# parks between two entries of a leaf
+	s3_parked_resumed		# ... and it really is parked there
 	s2_split				# splits every leaf, the one it stands on too
 	s2_wakeup_resumed		# detaches the point and releases s1
 	s3_plain				# the same numbers without the pushdown
@@ -190,6 +199,7 @@ permutation
 	s3_prep
 	s3_how
 	s4_complement(s2_wakeup_leaf)	# parks between two leaves of the race
+	s3_parked_leaf			# ... and it really is parked there
 	s2_split
 	s2_wakeup_leaf
 	s3_plain

@@ -235,7 +235,7 @@ INSERT INTO lion_src_t SELECT 30000 + i, 30000 + i, 20011 + i, i % 7, i % 800, i
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u >= 5000 GROUP BY g');
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE r < 900 OR a = 3 GROUP BY g');
 SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u >= 100 AND r < 5000');
-VACUUM lion_src_t;
+VACUUM (FREEZE) lion_src_t;
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u >= 5000 GROUP BY g');
 SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u >= 100 AND r < 5000');
 SELECT lion_index_verify('lion_src_ur', true);

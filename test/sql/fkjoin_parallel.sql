@@ -27,7 +27,7 @@ SET parallel_leader_participation = off;
  * lion_pj() runs a query through the pushdown with every join method
  * disabled, so that the node is EXERCISED: once as planned here - in
  * parallel, when the plan says so - once with max_parallel_workers_per_gather
- * at 0, and once with the pushdown off and the planner left alone.  It
+ * at 0, and once with the pushdown off and sequential scans only.  It
  * compares both of the first two with the third and says which plan the
  * first one had.
  */
@@ -57,12 +57,23 @@ BEGIN
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	EXECUTE format('CREATE TEMP TABLE lion_pj_ser AS SELECT s::text AS r FROM (%s) s', q);
 
-	/* the reference: the ordinary plan, with the pushdown off */
+	/*
+	 * The reference: the pushdown off, and sequential scans only - no bitmap,
+	 * index or index-only scan, which could read the very lion posting sets
+	 * the node reads and agree with it about a wrong answer.
+	 */
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);
 	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_pj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
 
@@ -157,9 +168,9 @@ CREATE TABLE lion_pdn (k int8, attr int NOT NULL) WITH (parallel_workers = 2);
 INSERT INTO lion_pdn SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE i % 1500 + 1 END, i % 4
 FROM generate_series(1, 3000) i;
 CREATE INDEX lion_pdn_k ON lion_pdn USING lion (k);
-VACUUM ANALYZE lion_pf;
-VACUUM ANALYZE lion_pd;
-VACUUM ANALYZE lion_pdn;
+VACUUM (FREEZE, ANALYZE) lion_pf;
+VACUUM (FREEZE, ANALYZE) lion_pd;
+VACUUM (FREEZE, ANALYZE) lion_pdn;
 
 -- ---- 1. the plans ------------------------------------------------------------
 SET enable_hashjoin = off;
@@ -291,7 +302,7 @@ INSERT INTO lion_pfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000
 FROM generate_series(1, 250000) i;
 CREATE INDEX lion_pfw_fk ON lion_pfw USING lion (fk);
 CREATE INDEX lion_pfw_x ON lion_pfw USING lion (x);
-VACUUM ANALYZE lion_pfw;
+VACUUM (FREEZE, ANALYZE) lion_pfw;
 SET plan_cache_mode = force_generic_plan;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;

@@ -502,7 +502,7 @@ INSERT INTO lion_sm_chain SELECT i, repeat('p', 200) FROM generate_series(1, 400
 CREATE INDEX lion_sm_chain_k ON lion_sm_chain USING lion (k)
 	WITH (summaries = on, summary_tids = 64, inline_limit = 64);
 DELETE FROM lion_sm_chain WHERE k % 3 <> 0;
-VACUUM lion_sm_chain;
+VACUUM (FREEZE) lion_sm_chain;
 INSERT INTO lion_sm_chain SELECT 4000 + i, repeat('p', 200) FROM generate_series(1, 3000) i;
 SELECT summary_entries > 60 AS many, summary_tids = ntids AS covers,
 	   summary_pages > 0 AS chained
@@ -518,7 +518,7 @@ SELECT lion_index_verify('lion_sm_chain_k', true);
  
 (1 row)
 
-VACUUM (ANALYZE) lion_sm_chain;
+VACUUM (FREEZE, ANALYZE) lion_sm_chain;
 SELECT lion_sm('SELECT count(*) FROM lion_sm_chain WHERE k > 3000');
            lion_sm            
 ------------------------------
@@ -566,7 +566,7 @@ SELECT lion_index_verify('lion_sm_urg', true);
  
 (1 row)
 
-VACUUM lion_sm;
+VACUUM (FREEZE) lion_sm;
 SELECT lion_index_verify('lion_sm_urg', true);
  lion_index_verify 
 -------------------
@@ -611,7 +611,7 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE r > 50 AND r < 8000');
 
 -- a run of whole buckets deleted: their summaries are emptied and removed
 DELETE FROM lion_sm WHERE u BETWEEN 2000 AND 9000;
-VACUUM lion_sm;
+VACUUM (FREEZE) lion_sm;
 SELECT lion_index_verify('lion_sm_urg', true);
  lion_index_verify 
 -------------------
@@ -639,7 +639,7 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1990 AND 9010 AND g
 -- ... and every row of a column: every summary goes, and the next insert
 -- opens a bucket again
 DELETE FROM lion_sm WHERE k IS NOT NULL;
-VACUUM lion_sm;
+VACUUM (FREEZE) lion_sm;
 SELECT summary_entries, summary_tids FROM lion_index_stats('lion_sm_k');
  summary_entries | summary_tids 
 -----------------+--------------

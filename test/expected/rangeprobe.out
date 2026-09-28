@@ -83,7 +83,7 @@ VACUUM (ANALYZE) lpr;
 INSERT INTO lpr SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute',
 	   g % 10, 1500 - g
   FROM generate_series(1501, 30000) g;
-VACUUM lpr;
+VACUUM (FREEZE) lpr;
 -- ---------- 1. lion's estimate reads the ends; core's does not ----------
 -- past the last end, 28,441 rows
 SELECT count(*) AS actual,

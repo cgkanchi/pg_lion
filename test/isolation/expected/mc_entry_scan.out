@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s3_prep s1_group s2_fill s2_wakeup s1_plain s1_group2 s3_shape s3_verify
+starting permutation: s3_prep s1_group s3_parked s2_fill s2_wakeup s1_plain s1_group2 s3_shape s3_verify
 injection_points_attach
 -----------------------
                        
@@ -10,6 +10,12 @@ step s3_prep: VACUUM (FREEZE, ANALYZE) mces;
 step s1_group: 
 	SELECT groups, count FROM lion_index_count_group_stats('mces_go', true, 1::int2);
  <waiting ...>
+step s3_parked: SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE wait_event_type = 'InjectionPoint' AND wait_event = 'lion-entry-scan-resumed';
+parked
+------
+t     
+(1 row)
+
 step s2_fill: 
 	BEGIN;
 	INSERT INTO mces

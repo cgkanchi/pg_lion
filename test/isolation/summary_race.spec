@@ -153,6 +153,8 @@ step s2_wakeup_pinned	{
 }
 step s2_wakeup_phase	{ SELECT sr_release('lion-entry-scan-phase'); }
 step s2_wakeup_insert	{ SELECT sr_release('lion-insert-before-summary'); }
+# Is verify() waiting on a lock - the parked inserter's - right now?
+step s2_verify_waits	{ SELECT count(*) = 1 AS verify_waits FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT lion_index_verify%'; }
 
 # The session whose insert parks between its key and its summary.
 session s4
@@ -241,10 +243,17 @@ permutation
 	s3_verify
 
 # verify() beside an insert that is between its key and its summary.
+#
+# The marker on s3_verify pins the report of its completion after the step
+# that releases the inserter, but it also makes a verify() that never waited,
+# and simply finished, print "<waiting ...>" exactly as a waiting one does.
+# isolationtester moves on from s3_verify once it is blocked on a lock or has
+# finished; s2_verify_waits, straight after it, shows it is the former.
 permutation
 	s3_prep
 	s4_attach
 	s4_insert				# parks: the row is under its key only
 	s3_verify(s2_wakeup_insert)	# a candidate; waits for the inserter
+	s2_verify_waits			# ... and it really is waiting
 	s2_wakeup_insert		# releases the insert, which commits
 	s3_shape
