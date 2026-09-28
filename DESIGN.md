@@ -5349,7 +5349,15 @@ The column does NOT travel in `custom_private`. The executor derives it in `lion
 from the index it really opened and the clause's heap attnum (`lion_index_col_for()`), because a
 partition's index may order the same columns differently from the parent's - and may number the
 heap column differently too, which is resolved by name (`lion_heap_attno_in()`). So the planner has
-only to be right about WHICH index. The one thing the executor cannot derive is the driving column
+only to be right about WHICH index. The executor matches the column by the planner's own rule: the
+first key column on that heap column whose opclass is multi-key exactly when the use needs one - a
+multi-key clause does, every other clause and every driving column needs a scalar one. An index may
+list one heap column twice, `(tags array_ops, tags <a whole-array class>)`, and the two columns hold
+different entries, elements under one and whole arrays under the other; the first match on the heap
+column alone used to be taken whatever its opclass, so `count(DISTINCT tags)` counted elements, and
+the reversed index handed `tags @> '{1}'` to the scalar column, whose state has no extraction
+function to call (2026-09-27 review). `lion_extract_query()` now refuses a scalar column's state with
+an error instead of an Assert. The one thing the executor cannot derive is the driving column
 of a sum-over-all (§14), which has no group column at all: it is the column of the first
 `IS NOT NULL` clause, which is exactly the clause the planner drove from. Two `IS NOT NULL` clauses
 over one index made that distinction load-bearing - the driver's own clause is DROPPED and the

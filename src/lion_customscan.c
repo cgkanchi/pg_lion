@@ -538,7 +538,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		then one Oid per WHERE clause, in the same order as the other lists.
  *		An index may be a MULTICOLUMN one (DESIGN.md §24); which of its key
  *		columns each of these is read for is NOT carried here but derived at
- *		execution time from the opened index and the attnum in member 2.
+ *		execution time from the opened index, the attnum in member 2 and
+ *		the kind of opclass the use needs - multi-key for a multi-key clause
+ *		(member 4), scalar for everything else (lion_index_col_for()).
  *		For a partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
  *		column names against it) and every index Oid is InvalidOid: the real
  *		ones are per partition, in LION_PRIV_PARTS.
@@ -646,11 +648,14 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
- * derives it from the index it really opened and the clause's heap attnum
- * (lion_index_col_for()), because a partition's index may put the same column
- * at a different position from the parent's.  A plan built before that would
- * have been made by a planner that never chose a multicolumn index, so it
- * would still decode correctly; saying so is cheaper than having to know that.
+ * derives it from the index it really opened, the clause's heap attnum and
+ * its kind (lion_index_col_for()), because a partition's index may put the
+ * same column at a different position from the parent's.  A plan built before
+ * that would have been made by a planner that never chose a multicolumn
+ * index, so it would still decode correctly; saying so is cheaper than having
+ * to know that.  Matching the kind as well changed no member either: the
+ * planner has always chosen the column by it, so a plan of any shape-13 build
+ * names the column the executor now derives.
  */
 #define LION_PRIV_MAGIC		0x5242490d
 #define LION_PRIV_NMEMBERS	13
@@ -8441,21 +8446,43 @@ lion_load_inner_keys(LionCountScanState *st)
  * (DESIGN.md §24).  A single-column index answers 1 for its own column and
  * nothing else; a multicolumn one is searched, because the columns may be in
  * any order - and, with partitions, in a DIFFERENT order in each of them.
+ *
+ * The search is the planner's own (lion_find_roaring_index()): the first key
+ * column on that heap column whose opclass is multi-key exactly when
+ * `multikey` says so, which is how the executor arrives at the very column
+ * the plan was made for without the plan carrying it.  An index may list one
+ * heap column twice, under a multi-key and a scalar opclass - `(tags
+ * array_ops, tags <a whole-array class>)` - and the two hold different
+ * entries, elements under one and whole arrays under the other.  The first
+ * column on the heap column used to be taken whatever its opclass, so
+ * `count(DISTINCT tags)` counted elements, and a multi-key query was handed
+ * to a scalar column that has no extraction function at all (the 2026-09-27
+ * review).  The kind a caller needs is always known: multi-key for a
+ * multi-key clause (LION_CLAUSE_MULTI), scalar for every other clause and for
+ * every index whose entries drive the scan.  Two columns of the SAME kind on
+ * one heap column are told apart the way the planner tells them apart, by
+ * position: it matches the first and never tries the second
+ * (lion_match_index()).  An index with no such column is not the one the
+ * plan was made for, and that is said rather than read.
  */
 static AttrNumber
-lion_index_col_for(Relation index, AttrNumber heapattno)
+lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey)
 {
 	int			c;
 
 	for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
 	{
-		if (index->rd_index->indkey.values[c] == heapattno)
-			return (AttrNumber) (c + 1);
+		if (index->rd_index->indkey.values[c] != heapattno)
+			continue;
+		if (lion_opfamily_is_multikey(index->rd_opfamily[c],
+									 index->rd_opcintype[c]) != multikey)
+			continue;
+		return (AttrNumber) (c + 1);
 	}
 
-	elog(ERROR, "lion index \"%s\" does not index column %d of \"%s\"",
-		 RelationGetRelationName(index), (int) heapattno,
-		 get_rel_name(index->rd_index->indrelid));
+	elog(ERROR, "lion index \"%s\" has no %s key column on column %d of \"%s\"",
+		 RelationGetRelationName(index), multikey ? "multi-key" : "scalar",
+		 (int) heapattno, get_rel_name(index->rd_index->indrelid));
 	return 0;					/* keep the compiler quiet */
 }
 
@@ -8587,14 +8614,17 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->clause[i].idxcol =
 			lion_index_col_for(st->clause[i].idx,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->clause[i].attno));
+												  st->clause[i].attno),
+							   st->clause[i].kind == LION_CLAUSE_MULTI);
 	}
 
 	/*
 	 * The driving index's key column comes from the index that was really
 	 * opened rather than from the plan (DESIGN.md §24): the planner only has
 	 * to be right about WHICH index, and a partition's own index may put the
-	 * same heap column at a different position from the parent's.
+	 * same heap column at a different position from the parent's.  A driving
+	 * column is always a scalar one: its entries have to be the column's
+	 * values, one per row.
 	 */
 	if (OidIsValid(groupidxoid))
 	{
@@ -8602,7 +8632,8 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->groupidxcol =
 			lion_index_col_for(st->groupidx,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->driveattno));
+												  st->driveattno),
+							   false);
 	}
 	if (OidIsValid(groupidxoid2))
 	{
@@ -8610,7 +8641,8 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->groupidxcol2 =
 			lion_index_col_for(st->groupidx2,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->innerattno));
+												  st->innerattno),
+							   false);
 	}
 
 	/*
@@ -9447,6 +9479,18 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	StrategyNumber strategy;
 	LionQuery	q;
 	int			i;
+
+	/*
+	 * Only a multi-key column has an extractQuery to call; a scalar one's
+	 * state leaves it unset (lion_fill_state()).  lion_open_relation() asked
+	 * for a multi-key column, so this is drift - but it is an error, not a
+	 * call through an empty FmgrInfo (the 2026-09-27 review).
+	 */
+	if (!istate->multikey)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("key column %d of lion index \"%s\" is not a multi-key column",
+						(int) cl->idxcol, RelationGetRelationName(cl->idx))));
 
 	strategy = (StrategyNumber)
 		get_op_opfamily_strategy(cl->opno,
@@ -12525,7 +12569,7 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
  * index name at all, so it never gets here with a parent's numbering.
  */
 static const char *
-lion_explain_col(Oid idxoid, AttrNumber heapattno)
+lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey)
 {
 	static char buf[NAMEDATALEN + 2];
 	Relation	idx;
@@ -12541,12 +12585,20 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno)
 		return "";
 	}
 
-	col = lion_index_col_for(idx, heapattno);
+	col = lion_index_col_for(idx, heapattno, multikey);
 	snprintf(buf, sizeof(buf), ".%s",
 			 NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
 	index_close(idx, AccessShareLock);
 
 	return buf;
+}
+
+/* ... for one clause, whose kind says which kind of column answers it. */
+static const char *
+lion_explain_clause_col(const LionClauseState *cl)
+{
+	return lion_explain_col(cl->idxoid, cl->attno,
+							cl->kind == LION_CLAUSE_MULTI);
 }
 
 static void
@@ -12582,7 +12634,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->npart == 0)
 			appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid),
 							 lion_explain_col(st->groupidxoid,
-											  st->driveattno));
+											  st->driveattno, false));
 		if (st->hasrange)
 		{
 			bool		firstrange = true;
@@ -12616,7 +12668,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			if (st->npart == 0)
 				appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid2),
 								 lion_explain_col(st->groupidxoid2,
-												  st->innerattno));
+												  st->innerattno, false));
 			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->innerattno, false));
 		}
@@ -12631,7 +12683,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		LionClauseState *cl = &st->clause[st->joinclause];
 
 		appendStringInfo(&buf, "%s%s (", get_rel_name(cl->idxoid),
-						 lion_explain_col(cl->idxoid, cl->attno));
+						 lion_explain_clause_col(cl));
 		lion_explain_clause(st, cl, ancestors, es, &buf);
 		appendStringInfoChar(&buf, ')');
 	}
@@ -12655,7 +12707,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 			if (st->npart == 0)
 				appendStringInfo(&buf, "%s%s ", get_rel_name(first->idxoid),
-								 lion_explain_col(first->idxoid, first->attno));
+								 lion_explain_clause_col(first));
 			appendStringInfoChar(&buf, '(');
 			for (j = 0; j < st->nclause; j++)
 			{
@@ -12676,7 +12728,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				LionClauseState *cl = &st->clause[st->item[i].clauseno];
 
 				appendStringInfo(&buf, "%s%s ", get_rel_name(cl->idxoid),
-								 lion_explain_col(cl->idxoid, cl->attno));
+								 lion_explain_clause_col(cl));
 			}
 			appendStringInfoChar(&buf, '(');
 			lion_explain_clause(st, &st->clause[st->item[i].clauseno],
@@ -12704,7 +12756,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 					appendStringInfo(&buf, "%s%s%s",
 									 leaf > 0 ? ", " : "",
 									 get_rel_name(cl->idxoid),
-									 lion_explain_col(cl->idxoid, cl->attno));
+									 lion_explain_clause_col(cl));
 				}
 				appendStringInfoChar(&buf, ' ');
 			}
