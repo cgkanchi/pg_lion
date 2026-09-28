@@ -155,16 +155,20 @@ SELECT lip_rows(q, false) * 50 <= lip_actual(q) AS unprobed_50x_short
 
 -- ---------- 2. the count ----------
 -- The count ANDs every clause, the IN list's union of two dense sets
--- included; the lion scan may leave that list to its heap filter and AND the
--- other four sets.  Priced for the two rows core's product says, that scan
--- and its heap cost about a third of the count; priced for the 2,000 rows the
--- probe measures - the rows it fetches - over ten times the count, which reads
--- the visibility map where the scan reads the heap.
-SELECT lip_pushed(q, true) AS probed, lip_pushed(q, false) AS unprobed
+-- included.  Before PostgreSQL 17 core also builds a lion scan that leaves an
+-- IN list on a later key column to its heap filter and ANDs the other four
+-- sets: priced for the two rows core's product says, that scan and its heap
+-- cost about a third of the count, and win without the probe; priced for the
+-- 2,000 rows the probe measures - the rows it fetches - over ten times the
+-- count, which reads the visibility map where the scan reads the heap.  From
+-- 17 core passes the list to the index, the scan ANDs what the count ANDs,
+-- and the count is the cheaper with or without the probe; so only the probed
+-- choice is the same on every version.
+SELECT lip_pushed(q, true) AS probed
   FROM (VALUES ($$SELECT count(*) FROM lip WHERE c5 = 1 AND c25 = 5 AND c50 = 11 AND m5 IN (1, 3) AND tags && '{t2}'$$)) v(q);
- probed | unprobed 
---------+----------
- t      | f
+ probed 
+--------
+ t
 (1 row)
 
 -- A GROUP BY count merges the sets with each of k23's 23 entries, which
