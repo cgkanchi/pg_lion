@@ -70,11 +70,12 @@ lion_fkjoin_strip(Node *node)
 }
 
 /*
- * Is one side of the join an ordinary table this node can take apart?  A plain
- * table or a materialized view, not an inheritance or partitioned parent (the
- * fact side of §16 is not in v1, and a parent has no index list to prove a
- * dimension key unique from), with no LATERAL references, and not proved
- * empty.
+ * Is one side of the join a table this node can take apart?  A plain table or
+ * a materialized view, or - for the fact side only (lion_fkjoin_is_parent()) -
+ * a partitioned table, whose live leaf partitions the node counts one by one
+ * (DESIGN.md §27, "A partitioned fact table"); never an old-style inheritance
+ * parent, whose children need not share its columns.  With no LATERAL
+ * references, and not proved empty.
  */
 static bool
 lion_fkjoin_rel_ok(PlannerInfo *root, RelOptInfo *rel)
@@ -86,9 +87,16 @@ lion_fkjoin_rel_ok(PlannerInfo *root, RelOptInfo *rel)
 	if (rel->relid == 0 || rel->relid >= (Index) root->simple_rel_array_size)
 		return false;
 	rte = root->simple_rte_array[rel->relid];
-	if (rte == NULL || rte->rtekind != RTE_RELATION || rte->inh)
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
 		return false;
-	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+	if (rte->inh)
+	{
+		if (rte->relkind != RELKIND_PARTITIONED_TABLE ||
+			!IS_PARTITIONED_REL(rel))
+			return false;
+	}
+	else if (rte->relkind != RELKIND_RELATION &&
+			 rte->relkind != RELKIND_MATVIEW)
 		return false;
 	if (rte->tablesample != NULL)
 		return false;
@@ -97,6 +105,18 @@ lion_fkjoin_rel_ok(PlannerInfo *root, RelOptInfo *rel)
 	if (IS_DUMMY_REL(rel))
 		return false;
 	return true;
+}
+
+/*
+ * Is rel a partitioned table?  It may be the FACT side of the join, never the
+ * dimension: a partitioned or inheritance dimension has no index list of its
+ * own to prove its key unique from, and the node runs the dimension as one
+ * child plan whatever it is.
+ */
+static bool
+lion_fkjoin_is_parent(PlannerInfo *root, RelOptInfo *rel)
+{
+	return root->simple_rte_array[rel->relid]->inh;
 }
 
 /*
@@ -329,6 +349,8 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin *out)
 		if (argvar[fi]->varno != (int) fact->relid ||
 			argvar[di]->varno != (int) dim->relid)
 			return 0;
+		if (lion_fkjoin_is_parent(root, dim))
+			continue;
 
 		if (jointype == JOIN_SEMI && (int) fact->relid != semifact)
 		{

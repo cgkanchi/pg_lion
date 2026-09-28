@@ -1,0 +1,416 @@
+-- FK-side join pushdown over a PARTITIONED fact table (DESIGN.md §27, "A
+-- partitioned fact table").
+--
+-- Every dimension key is looked up in every leaf partition's fk index and
+-- counted against that partition's own fact filters, less the ones its bounds
+-- imply (§16): an inner join adds the partitions' counts up, a semi join asks
+-- whether any partition has a match and an anti join whether none has.  The
+-- keys go to the partitions a batch at a time, one partition's turn after the
+-- other's, and each partition keeps its copy of the fact filters from batch
+-- to batch.  Every answer is checked against the same query run serially
+-- through the pushdown, and with the pushdown off and sequential scans only.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+
+-- parallel plans at any size; the suite's own setting is 0, and lion_xj()
+-- runs every query serially as well
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+
+/*
+ * lion_xj() runs a query through the pushdown with every join method
+ * disabled, so that the node is exercised: once as planned - in parallel,
+ * when the plan says so - once with max_parallel_workers_per_gather at 0, and
+ * once with the pushdown off and sequential scans only.  It compares both of
+ * the first two with the third and says which plan the first one had.
+ */
+CREATE FUNCTION lion_xj(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+	sdiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'parallel' THEN
+			how := 'serial';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_xj_par AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE format('CREATE TEMP TABLE lion_xj_ser AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_xj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_xj_par' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_xj_par EXCEPT ALL SELECT * FROM lion_xj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_xj_off EXCEPT ALL SELECT * FROM lion_xj_par) b)'
+		INTO ndiff;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_xj_ser EXCEPT ALL SELECT * FROM lion_xj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_xj_off EXCEPT ALL SELECT * FROM lion_xj_ser) b)'
+		INTO sdiff;
+	EXECUTE 'DROP TABLE lion_xj_par, lion_xj_ser, lion_xj_off';
+
+	IF ndiff <> 0 OR sdiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ in parallel, %s serially', ndiff, sdiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/*
+ * The node and what is above it, joins disabled, with the dimension's own plan
+ * as one line: that plan is whatever each major makes of a small scan.
+ */
+CREATE FUNCTION lion_xj_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	seen boolean := false;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		IF seen AND ln ~ '^\s*->' THEN
+			RETURN NEXT regexp_replace(ln, '->.*$', '->  (the dimension''s plan)');
+			RETURN;
+		END IF;
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			seen := true;
+		END IF;
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+
+/* Whether the plan has the node, nothing disabled. */
+CREATE FUNCTION lion_xj_plans(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_xj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+
+/*
+ * The dimension: 3000 rows over some twenty pages, so that two workers both
+ * have a share, int8 primary key 1..3000, attr 0..6 with NULL on every 13th,
+ * a small int, a region and a group.
+ */
+CREATE TABLE lion_xd (
+	pk		int8	PRIMARY KEY,
+	attr	int,
+	small	int2,
+	region	text	NOT NULL,
+	grp		text	NOT NULL
+) WITH (parallel_workers = 2);
+INSERT INTO lion_xd
+SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END, (i % 5)::int2,
+	   (ARRAY['eu', 'us', 'ap'])[1 + i % 3], 'g' || (i % 4)
+  FROM generate_series(1, 3000) i;
+
+/*
+ * A second dimension over 1,500 keys, duplicated, with NULL keys and no
+ * uniqueness: a semi join's outer side and a forward semi join's inner one.
+ */
+CREATE TABLE lion_xdn (
+	k		int8,
+	attr	int,
+	region	text	NOT NULL
+) WITH (parallel_workers = 2);
+INSERT INTO lion_xdn
+SELECT CASE WHEN i % 29 = 0 THEN NULL ELSE 1 + (i * 7) % 1500 END, i % 5,
+	   (ARRAY['eu', 'us', 'ap'])[1 + i % 3]
+  FROM generate_series(1, 3000) i;
+
+/*
+ * The fact: 60000 rows LIST-partitioned by kind, which no lion index covers -
+ * 'a' sub-partitioned by year on ts, 'b' alone, 'c' and 'd' together (the one
+ * partition with a lion index on kind), and a default partition for the rest,
+ * NULL kind included.  fk runs over 1..3600 in an order unrelated to the key,
+ * a few keys with many rows each and the others with few, NULL on every 40th
+ * row, and no row at all for the keys that are multiples of 17: keys
+ * 3001..3600 join no dimension row.  The fk index is one partitioned lion
+ * index on (tags, ts, fk), and x has one of its own.
+ */
+CREATE TABLE lion_xf (
+	id		int		NOT NULL,
+	kind	text,
+	fk		int8,
+	x		int		NOT NULL,
+	tags	text[],
+	ts		timestamptz NOT NULL
+) PARTITION BY LIST (kind);
+CREATE TABLE lion_xf_a PARTITION OF lion_xf FOR VALUES IN ('a')
+	PARTITION BY RANGE (ts);
+CREATE TABLE lion_xf_a_2025 PARTITION OF lion_xf_a
+	FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE lion_xf_a_2026 PARTITION OF lion_xf_a
+	FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+CREATE TABLE lion_xf_b PARTITION OF lion_xf FOR VALUES IN ('b');
+CREATE TABLE lion_xf_cd PARTITION OF lion_xf FOR VALUES IN ('c', 'd');
+CREATE TABLE lion_xf_def PARTITION OF lion_xf DEFAULT;
+INSERT INTO lion_xf
+SELECT i,
+	   CASE i % 10 WHEN 0 THEN 'a' WHEN 1 THEN 'a' WHEN 2 THEN 'a'
+				   WHEN 3 THEN 'b' WHEN 4 THEN 'b' WHEN 5 THEN 'c'
+				   WHEN 6 THEN 'd' WHEN 7 THEN 'e' WHEN 8 THEN NULL ELSE 'b' END,
+	   CASE WHEN i % 40 = 0 THEN NULL
+			WHEN (i * 7919) % 17 = 0 THEN NULL
+			WHEN i % 3 = 0 THEN 1 + (i * 7919) % 60
+			ELSE 1 + (i * 7919) % 3600 END,
+	   i % 10,
+	   ARRAY['t' || (i % 11), 'u' || (i % 7)],
+	   timestamptz '2025-01-01' + ((i * 37) % 700) * interval '1 day'
+  FROM generate_series(1, 60000) i;
+UPDATE lion_xf SET fk = NULL WHERE fk % 17 = 0;
+CREATE INDEX lion_xf_tsf ON lion_xf USING lion (tags, ts, fk);
+CREATE INDEX lion_xf_x ON lion_xf USING lion (x);
+CREATE INDEX lion_xf_cd_kind ON lion_xf_cd USING lion (kind);
+VACUUM (FREEZE, ANALYZE) lion_xd;
+VACUUM (FREEZE, ANALYZE) lion_xdn;
+VACUUM (FREEZE, ANALYZE) lion_xf;
+
+-- ---- 1. the plans --------------------------------------------------------------
+-- a reverse semi join, the key clause left out by every partition kind = 'a'
+-- leaves: no index on kind is needed
+SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
+-- an inner join grouped by a dimension column, over partitions one of which
+-- answers the list from its own index on kind
+SELECT * FROM lion_xj_explain('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'' GROUP BY d.attr');
+-- an anti join, and a range taken as a source that one sub-partition's bound
+-- implies and the others' do not
+SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE d.grp = ''g1'' AND NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.ts >= ''2026-01-01'')');
+-- the rows of a count(DISTINCT) and the counted rows of the mixed aggregates
+SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.attr) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''b'' AND f.x = 3)');
+SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind = ''a'' AND f.tags && ''{u2}''');
+-- the forward semi join over a non-unique key, counted over its distinct keys
+SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xf f WHERE f.kind = ''b'' AND f.x IN (1, 2) AND f.fk IN (SELECT n.k FROM lion_xdn n WHERE n.region = ''eu'')');
+
+-- ---- 2. the answers ------------------------------------------------------------
+-- reverse semi and anti joins, over one list partition, one sub-partitioned
+-- list, several, and every partition
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''b'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.x = 3)');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.pk IN (SELECT f.fk FROM lion_xf f WHERE f.x = 7 AND f.tags && ''{u1}'')');
+SELECT lion_xj('SELECT d.grp, count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'') GROUP BY d.grp');
+SELECT lion_xj('SELECT d.grp, count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.ts >= ''2026-01-01'') GROUP BY d.grp HAVING count(*) > 10');
+-- duplicated and NULL keys on the outer side of a semi and an anti join
+SELECT lion_xj('SELECT count(*) FROM lion_xdn n WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = n.k AND f.kind = ''a'' AND f.x IN (1, 2))');
+SELECT lion_xj('SELECT n.attr, count(*) FROM lion_xdn n WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = n.k AND f.kind IN (''a'', ''b'') AND f.x IN (1, 2)) GROUP BY n.attr');
+-- inner joins: counts, grouped by one and two columns and an expression,
+-- HAVING, ORDER BY and LIMIT, count of either side of the key
+SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''ap'' AND f.kind = ''a''');
+SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''ap'' AND f.kind IN (''a'', ''b'') AND f.tags && ''{t3}''');
+SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'' GROUP BY d.attr');
+SELECT lion_xj('SELECT d.region, d.grp, count(f.fk) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.x IN (2, 4, 6) GROUP BY d.region, d.grp');
+SELECT lion_xj('SELECT upper(d.region), count(1) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind = ''a'' AND f.ts < ''2025-06-01'' GROUP BY upper(d.region)');
+SELECT lion_xj('SELECT d.grp, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'', ''d'') AND f.x = 5 GROUP BY d.grp HAVING count(*) > 100 ORDER BY 2 DESC LIMIT 2');
+-- count(DISTINCT), and every aggregate over the counted rows
+SELECT lion_xj('SELECT count(DISTINCT d.attr) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''b'' AND f.x = 3)');
+SELECT lion_xj('SELECT count(DISTINCT f.fk) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.grp = ''g2'' AND f.kind IN (''a'', ''c'')');
+SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind = ''a'' AND f.tags && ''{u2}''');
+SELECT lion_xj('SELECT d.region, count(DISTINCT d.attr), count(*), count(d.attr), sum(d.small), max(d.grp), min(d.attr) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE f.kind IN (''b'', ''c'', ''d'') AND f.x > 6 GROUP BY d.region');
+-- the forward semi join over a non-unique key, and its count(DISTINCT)
+SELECT lion_xj('SELECT count(*) FROM lion_xf f WHERE f.kind = ''b'' AND f.x IN (1, 2) AND f.fk IN (SELECT n.k FROM lion_xdn n WHERE n.region = ''eu'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xf f WHERE f.kind IN (''a'', ''b'') AND EXISTS (SELECT 1 FROM lion_xdn n WHERE n.k = f.fk AND n.attr = 3)');
+SELECT lion_xj('SELECT count(DISTINCT f.fk) FROM lion_xf f WHERE f.kind IN (''a'', ''b'') AND f.fk IN (SELECT n.k FROM lion_xdn n WHERE n.attr < 2)');
+-- no fact filter left in any partition, and one that selects nothing in some
+SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.grp = ''g3'' AND f.kind = ''b''');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''c'') AND f.ts >= ''2026-03-01'' AND f.ts < ''2026-03-02'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.x = 99)');
+-- a partition only run-time pruning would remove is counted, and matches
+-- nothing: the range's value is a stable expression
+SET lion.cut = '2026-01-01';
+SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.ts >= current_setting(''lion.cut'')::timestamptz)');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.ts >= current_setting(''lion.cut'')::timestamptz)');
+SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''eu'' AND f.kind = ''a'' AND f.ts >= current_setting(''lion.cut'')::timestamptz');
+RESET lion.cut;
+
+-- ---- 3. the counters -----------------------------------------------------------
+/*
+ * Every key is looked up in every partition that has a turn: 1000 dimension
+ * rows of region 'eu' in the two partitions of kind 'a' are 2000 lookups for
+ * the inner join; the semi join looks a key up again only where the first
+ * partition had no match for it, so fewer.  A partition whose filters select
+ * nothing has no turn at all: no row of kind 'b' has x = 1.
+ */
+SELECT lion_xj_counter('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''eu'' AND f.kind = ''a'' AND f.x = 1', 'Join Keys Looked Up') AS inner_lookups,
+	   lion_xj_counter('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'')', 'Join Keys Looked Up') < 2000 AS semi_fewer,
+	   lion_xj_counter('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''eu'' AND f.kind IN (''a'', ''b'') AND f.x = 1', 'Join Keys Looked Up') AS b_no_turn;
+/*
+ * The copies of the fact filters, one per partition that collects one, kept
+ * from batch to batch: at a work_mem of 64 kB the keys are read in several
+ * batches, and the answers do not change.
+ */
+SET work_mem = '64kB';
+SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'' GROUP BY d.attr');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.tags && ''{t1,t2,u3}'')');
+SET max_parallel_workers_per_gather = 0;
+SELECT lion_xj_counter('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'' GROUP BY d.attr', 'Join Key Batches') > 1 AS batches;
+SET max_parallel_workers_per_gather = 2;
+RESET work_mem;
+
+-- ---- 4. parallel plans ---------------------------------------------------------
+/*
+ * Each participant takes its share of the dimension rows to every partition,
+ * and the participants collect one copy of each partition's fact filters
+ * together.
+ */
+SELECT * FROM lion_xj_explain('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'' GROUP BY d.attr');
+SELECT lion_xj_counter('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.tags && ''{t1,t2,u3}'' GROUP BY d.attr', 'Fact Filter Copies Shared') AS copies_shared;
+/*
+ * The Gather started again for every outer row: each run collects one copy of
+ * each of the three partitions' filters, the last run's freed first, and the
+ * answers do not change.
+ */
+SET enable_material = off;
+SET enable_memoize = off;
+SELECT lion_xj('SELECT g, s.c FROM generate_series(1, 3) g LEFT JOIN (SELECT count(*) AS c FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.tags && ''{t1,u1}'')) s ON s.c > g');
+SELECT lion_xj_counter('SELECT g, s.c FROM generate_series(1, 3) g LEFT JOIN (SELECT count(*) AS c FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''a'', ''b'') AND f.tags && ''{t1,u1}'')) s ON s.c > g', 'Fact Filter Copies Shared') AS copies_shared;
+RESET enable_material;
+RESET enable_memoize;
+
+-- ---- 5. generic plans and rescans -------------------------------------------
+PREPARE lion_xj_q(int, text) AS
+	SELECT d.grp, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk
+	 WHERE f.kind IN ('a', 'b') AND f.x = $1 AND d.region = $2 GROUP BY d.grp;
+SET plan_cache_mode = force_generic_plan;
+SET max_parallel_workers_per_gather = 0;
+SELECT * FROM lion_xj_explain('EXECUTE lion_xj_q(3, ''eu'')');
+CREATE TEMP TABLE lion_xj_g1 AS EXECUTE lion_xj_q(3, 'eu');
+CREATE TEMP TABLE lion_xj_g2 AS EXECUTE lion_xj_q(NULL, 'eu');
+RESET plan_cache_mode;
+SET pg_lion.enable_count_pushdown = off;
+SELECT (SELECT count(*) FROM (TABLE lion_xj_g1 EXCEPT ALL
+		SELECT d.grp, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk
+		 WHERE f.kind IN ('a', 'b') AND f.x = 3 AND d.region = 'eu' GROUP BY d.grp) a) AS diff,
+	   (SELECT count(*) FROM lion_xj_g1) AS groups,
+	   (SELECT count(*) FROM lion_xj_g2) AS null_param_groups;
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_xj_q;
+SET max_parallel_workers_per_gather = 2;
+-- a correlated subquery that rescans the node with a new fact filter
+SELECT lion_xj('SELECT v.x, (SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''us'' AND f.kind IN (''a'', ''b'') AND f.x = v.x) FROM (VALUES (1), (4), (8)) v(x)');
+
+-- ---- 6. declined ---------------------------------------------------------------
+/*
+ * A partition whose fk has no lion index; a clause of the key that the
+ * default partition's bounds do not imply and no index of it answers, alone
+ * and among others; an old-style inheritance parent; and partitionwise
+ * aggregation, as for a count: the ordinary plan.
+ */
+CREATE TABLE lion_xf2 (fk int8, x int NOT NULL) PARTITION BY RANGE (x);
+CREATE TABLE lion_xf2_1 PARTITION OF lion_xf2 FOR VALUES FROM (0) TO (5);
+CREATE TABLE lion_xf2_2 PARTITION OF lion_xf2 FOR VALUES FROM (5) TO (10);
+INSERT INTO lion_xf2 SELECT 1 + i % 3000, i % 10 FROM generate_series(1, 6000) i;
+CREATE INDEX ON lion_xf2_1 USING lion (fk);
+VACUUM (FREEZE, ANALYZE) lion_xf2;
+SELECT lion_xj('SELECT count(*) FROM lion_xf2 f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''eu''');
+SELECT lion_xj('SELECT count(*) FROM lion_xf2 f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''eu'' AND f.x < 5');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''e'')');
+SELECT lion_xj('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IS NOT NULL AND f.x = 5');
+DROP TABLE lion_xf2;
+CREATE TABLE lion_xf3 (fk int8, x int NOT NULL);
+CREATE TABLE lion_xf3_c () INHERITS (lion_xf3);
+INSERT INTO lion_xf3_c SELECT 1 + i % 3000, i % 10 FROM generate_series(1, 6000) i;
+CREATE INDEX ON lion_xf3 USING lion (fk);
+CREATE INDEX ON lion_xf3_c USING lion (fk);
+VACUUM (FREEZE, ANALYZE) lion_xf3;
+VACUUM (FREEZE, ANALYZE) lion_xf3_c;
+SELECT lion_xj('SELECT count(*) FROM lion_xf3 f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''eu''');
+DROP TABLE lion_xf3 CASCADE;
+SET enable_partitionwise_aggregate = on;
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
+RESET enable_partitionwise_aggregate;
+
+-- ---- 7. the cost model ---------------------------------------------------------
+/*
+ * Nothing disabled: a few dimension rows against fact filters that leave many
+ * fact rows is the node's; the whole dimension against a filter that leaves
+ * few fact rows is an ordinary join's.
+ */
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT d.grp, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.pk < 200 AND f.kind IN ('a', 'b') GROUP BY d.grp;
+SELECT lion_xj_plans('SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind = ''a'' AND f.x = 1 AND f.tags && ''{t1}'' AND f.tags && ''{u1}''') AS node;
+SET max_parallel_workers_per_gather = 2;
+
+-- ---- 8. a dirty heap -----------------------------------------------------------
+DELETE FROM lion_xf WHERE kind = 'a' AND id % 7 = 0;
+UPDATE lion_xf SET x = 3 WHERE kind = 'b' AND id % 11 = 0;
+UPDATE lion_xf SET fk = 1 + fk % 50 WHERE kind = 'c' AND id % 13 = 0;
+DELETE FROM lion_xd WHERE pk % 97 = 0;
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
+SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.x = 3 GROUP BY d.attr');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''b'', ''c''))');
+SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind IN (''a'', ''c'')');
+VACUUM (FREEZE) lion_xf;
+VACUUM (FREEZE) lion_xd;
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.tags && ''{t1}'')');
+SELECT lion_xj('SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE f.kind IN (''a'', ''b'', ''c'') AND f.x = 3 GROUP BY d.attr');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind IN (''b'', ''c''))');
+SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind IN (''a'', ''c'')');
+
+DROP TABLE lion_xf, lion_xd, lion_xdn;
+DROP FUNCTION lion_xj(text);
+DROP FUNCTION lion_xj_explain(text);
+DROP FUNCTION lion_xj_plans(text);
+DROP FUNCTION lion_xj_counter(text, text);
