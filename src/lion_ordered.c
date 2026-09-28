@@ -551,12 +551,13 @@ lo_residual(List *rinfos, IndexPath *ord, List *lionrinfos, List *lionqual)
 
 /*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
- * size its set is expected to have.
+ * size its set is expected to have.  rows is what the node returns, as lion's
+ * estimates see it (lion_probe_rel_rows()).
  */
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-		List *lionrinfos, List *residual, Cost *startup_p, Cost *total_p,
-		double *setbytes)
+		List *lionrinfos, List *residual, double rows, Cost *startup_p,
+		Cost *total_p, double *setbytes)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -640,7 +641,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	cost_qual_eval(&qcost, residual, root);
 	startup += qcost.startup + rel->reltarget->cost.startup;
 	run += fetched * (cpu_tuple_cost + qcost.per_tuple) +
-		rel->rows * rel->reltarget->cost.per_tuple;
+		rows * rel->reltarget->cost.per_tuple;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -691,6 +692,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	ListCell   *lc;
 	ListCell   *lc2;
 	Size		limit;
+	double		rows;
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
@@ -771,6 +773,17 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	scratch->consider_parallel = false;
 	create_index_paths(root, scratch);
 
+#if PG_VERSION_NUM < 180000
+
+	/*
+	 * ... and the paths 18's matching builds for an OR of equalities, as the
+	 * IN list it spells (lion_or_list_paths(), DESIGN.md §29.11): the lion
+	 * side of `k = 1 OR k = 7` is then the lion side of `k IN (1, 7)`.
+	 */
+	scratch->pathlist = list_concat(scratch->pathlist,
+									lion_or_list_paths(root, rel, lionidx));
+#endif
+
 	foreach(lc, scratch->pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
@@ -790,6 +803,19 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	limit = get_hash_memory_limit();
 
+	/*
+	 * The rows the node returns, as lion's estimates see them: core's, times
+	 * what the intersection probe measured of the set clauses among the
+	 * relation's restriction clauses (lion_probe_rel_rows(), DESIGN.md
+	 * §29.11, "Correlated sets"), as the lion side's selectivity already is
+	 * (lioncostestimate()).  Core's LIMIT planning takes the share of the
+	 * walk a LIMIT needs from them (§30.3): priced for the few rows core's
+	 * product of the clauses' selectivities says, the node was charged its
+	 * whole walk for a page of a correlated filter's thousands of rows, and
+	 * lost to the lion scan and Sort that fetch every one of them.
+	 */
+	rows = lion_probe_rel_rows(root, rel);
+
 	foreach(lc, ordpaths)
 	{
 		IndexPath  *ord = (IndexPath *) lfirst(lc);
@@ -807,8 +833,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			Cost		total;
 			double		setbytes;
 
-			lo_cost(root, rel, ord, lion, lionrinfos, residual, &startup,
-					&total, &setbytes);
+			lo_cost(root, rel, ord, lion, lionrinfos, residual, rows,
+					&startup, &total, &setbytes);
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
 
@@ -820,7 +846,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			cp->path.parallel_aware = false;
 			cp->path.parallel_safe = false;
 			cp->path.parallel_workers = 0;
-			cp->path.rows = rel->rows;
+			cp->path.rows = rows;
 			cp->path.startup_cost = startup;
 			cp->path.total_cost = total;
 			cp->path.pathkeys = ord->path.pathkeys;
