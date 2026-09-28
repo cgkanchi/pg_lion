@@ -538,7 +538,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		then one Oid per WHERE clause, in the same order as the other lists.
  *		An index may be a MULTICOLUMN one (DESIGN.md §24); which of its key
  *		columns each of these is read for is NOT carried here but derived at
- *		execution time from the opened index and the attnum in member 2.
+ *		execution time from the opened index, the attnum in member 2 and
+ *		the kind of opclass the use needs - multi-key for a multi-key clause
+ *		(member 4), scalar for everything else (lion_index_col_for()).
  *		For a partitioned table the heap Oid is the PARENT's (EXPLAIN resolves
  *		column names against it) and every index Oid is InvalidOid: the real
  *		ones are per partition, in LION_PRIV_PARTS.
@@ -646,11 +648,14 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
- * derives it from the index it really opened and the clause's heap attnum
- * (lion_index_col_for()), because a partition's index may put the same column
- * at a different position from the parent's.  A plan built before that would
- * have been made by a planner that never chose a multicolumn index, so it
- * would still decode correctly; saying so is cheaper than having to know that.
+ * derives it from the index it really opened, the clause's heap attnum and
+ * its kind (lion_index_col_for()), because a partition's index may put the
+ * same column at a different position from the parent's.  A plan built before
+ * that would have been made by a planner that never chose a multicolumn
+ * index, so it would still decode correctly; saying so is cheaper than having
+ * to know that.  Matching the kind as well changed no member either: the
+ * planner has always chosen the column by it, so a plan of any shape-13 build
+ * names the column the executor now derives.
  */
 #define LION_PRIV_MAGIC		0x5242490d
 #define LION_PRIV_NMEMBERS	13
@@ -884,9 +889,11 @@ typedef struct LionCountScanState
 	 * a sumall), slots 1 .. nitem the WHERE items - one per plain clause and
 	 * one per OR restriction (DESIGN.md §19) - and, for a two-column GROUP BY
 	 * (DESIGN.md §20), slot nitem + 1 is the inner group.  The clause sources
-	 * are located once per node execution and keep their pins (DESIGN.md
-	 * section 9) until the node is reset or closed; the groups' sets are
-	 * located, counted and released one group (one pair) at a time.
+	 * are located once per node execution and kept until the node is done,
+	 * reset or closed - their pins (DESIGN.md section 9) only until the first
+	 * row goes up, which leaves them NOPIN copies (lion_pause_run()); the
+	 * groups' sets are located, counted and released one group (one pair) at
+	 * a time.
 	 */
 	LionCountSource *sources;
 	int			nsource;		/* nitem + 1, or nitem + 2 with two group cols */
@@ -8449,21 +8456,43 @@ lion_load_inner_keys(LionCountScanState *st)
  * (DESIGN.md §24).  A single-column index answers 1 for its own column and
  * nothing else; a multicolumn one is searched, because the columns may be in
  * any order - and, with partitions, in a DIFFERENT order in each of them.
+ *
+ * The search is the planner's own (lion_find_roaring_index()): the first key
+ * column on that heap column whose opclass is multi-key exactly when
+ * `multikey` says so, which is how the executor arrives at the very column
+ * the plan was made for without the plan carrying it.  An index may list one
+ * heap column twice, under a multi-key and a scalar opclass - `(tags
+ * array_ops, tags <a whole-array class>)` - and the two hold different
+ * entries, elements under one and whole arrays under the other.  The first
+ * column on the heap column used to be taken whatever its opclass, so
+ * `count(DISTINCT tags)` counted elements, and a multi-key query was handed
+ * to a scalar column that has no extraction function at all (the 2026-09-27
+ * review).  The kind a caller needs is always known: multi-key for a
+ * multi-key clause (LION_CLAUSE_MULTI), scalar for every other clause and for
+ * every index whose entries drive the scan.  Two columns of the SAME kind on
+ * one heap column are told apart the way the planner tells them apart, by
+ * position: it matches the first and never tries the second
+ * (lion_match_index()).  An index with no such column is not the one the
+ * plan was made for, and that is said rather than read.
  */
 static AttrNumber
-lion_index_col_for(Relation index, AttrNumber heapattno)
+lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey)
 {
 	int			c;
 
 	for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
 	{
-		if (index->rd_index->indkey.values[c] == heapattno)
-			return (AttrNumber) (c + 1);
+		if (index->rd_index->indkey.values[c] != heapattno)
+			continue;
+		if (lion_opfamily_is_multikey(index->rd_opfamily[c],
+									 index->rd_opcintype[c]) != multikey)
+			continue;
+		return (AttrNumber) (c + 1);
 	}
 
-	elog(ERROR, "lion index \"%s\" does not index column %d of \"%s\"",
-		 RelationGetRelationName(index), (int) heapattno,
-		 get_rel_name(index->rd_index->indrelid));
+	elog(ERROR, "lion index \"%s\" has no %s key column on column %d of \"%s\"",
+		 RelationGetRelationName(index), multikey ? "multi-key" : "scalar",
+		 (int) heapattno, get_rel_name(index->rd_index->indrelid));
 	return 0;					/* keep the compiler quiet */
 }
 
@@ -8595,14 +8624,17 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->clause[i].idxcol =
 			lion_index_col_for(st->clause[i].idx,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->clause[i].attno));
+												  st->clause[i].attno),
+							   st->clause[i].kind == LION_CLAUSE_MULTI);
 	}
 
 	/*
 	 * The driving index's key column comes from the index that was really
 	 * opened rather than from the plan (DESIGN.md §24): the planner only has
 	 * to be right about WHICH index, and a partition's own index may put the
-	 * same heap column at a different position from the parent's.
+	 * same heap column at a different position from the parent's.  A driving
+	 * column is always a scalar one: its entries have to be the column's
+	 * values, one per row.
 	 */
 	if (OidIsValid(groupidxoid))
 	{
@@ -8610,7 +8642,8 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->groupidxcol =
 			lion_index_col_for(st->groupidx,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->driveattno));
+												  st->driveattno),
+							   false);
 	}
 	if (OidIsValid(groupidxoid2))
 	{
@@ -8618,7 +8651,8 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		st->groupidxcol2 =
 			lion_index_col_for(st->groupidx2,
 							   lion_heap_attno_in(st->heap, st->heapoid,
-												  st->innerattno));
+												  st->innerattno),
+							   false);
 	}
 
 	/*
@@ -9456,6 +9490,18 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	LionQuery	q;
 	int			i;
 
+	/*
+	 * Only a multi-key column has an extractQuery to call; a scalar one's
+	 * state leaves it unset (lion_fill_state()).  lion_open_relation() asked
+	 * for a multi-key column, so this is drift - but it is an error, not a
+	 * call through an empty FmgrInfo (the 2026-09-27 review).
+	 */
+	if (!istate->multikey)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("key column %d of lion index \"%s\" is not a multi-key column",
+						(int) cl->idxcol, RelationGetRelationName(cl->idx))));
+
 	strategy = (StrategyNumber)
 		get_op_opfamily_strategy(cl->opno,
 								 cl->idx->rd_opfamily[cl->idxcol - 1]);
@@ -9859,6 +9905,51 @@ lion_save_clause_key(LionCountScanState *st, LionClauseState *cl,
 }
 
 /*
+ * The type an argument of type `type` has when the parser hands it to a
+ * function that declares `declared` (coerce_type(), parse_coerce.c), for the
+ * row filter below, which rebuilds the call the executor would have made.  The
+ * clause analysis peeled the relabels off both operands (lion_strip()), so the
+ * column is a bare Var of its own type and the value an expression of its own
+ * - a domain, say - where the parser had passed:
+ *
+ *	- the actual type, domains included, to an argument of that very type and
+ *	  to one declared any, anyelement, anynonarray, anycompatible or
+ *	  anycompatiblenonarray;
+ *	- the BASE type to the other polymorphic types (anyarray, anyrange, ...),
+ *	  which relabel a domain over an array, a range or an enum to what it is
+ *	  over: a function declared on anyarray never sees the domain;
+ *	- and the declared type itself to any other argument, which can only have
+ *	  got here by a binary coercion - of a domain over that type, or of a
+ *	  type binary-coercible to it.
+ */
+static Oid
+lion_arg_type_passed(Oid type, Oid declared)
+{
+	if (!OidIsValid(declared) || type == declared)
+		return type;
+
+	switch (declared)
+	{
+		case ANYOID:
+		case ANYELEMENTOID:
+		case ANYNONARRAYOID:
+		case ANYCOMPATIBLEOID:
+		case ANYCOMPATIBLENONARRAYOID:
+			return type;
+		case ANYARRAYOID:
+		case ANYENUMOID:
+		case ANYRANGEOID:
+		case ANYMULTIRANGEOID:
+		case ANYCOMPATIBLEARRAYOID:
+		case ANYCOMPATIBLERANGEOID:
+		case ANYCOMPATIBLEMULTIRANGEOID:
+			return getBaseType(type);
+		default:
+			return declared;
+	}
+}
+
+/*
  * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
  * query known only at run time"), as a row filter over the relation being
  * counted, set on the visibility cache every count of this execution is
@@ -9907,6 +9998,11 @@ lion_build_filter(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[i];
 		LionRowFilterClause *c;
 		Form_pg_attribute att;
+		Oid			lefttype;
+		Oid			righttype;
+		Oid			coltype;
+		Oid			valtype;
+		Expr	   *col;
 		int16		typlen;
 		bool		typbyval;
 
@@ -9926,18 +10022,28 @@ lion_build_filter(LionCountScanState *st)
 		/*
 		 * The call the executor would have made for the clause, expression
 		 * included, which is what a polymorphic operator's function asks
-		 * its argument types of (get_fn_expr_argtype()).
+		 * its argument types of (get_fn_expr_argtype()).  That includes the
+		 * parser's relabels (lion_arg_type_passed()): a column of a domain
+		 * over int[] reaches `@>(anyarray, anyarray)` as int[], and the Var
+		 * alone would have shown the function the domain (the 2026-09-27
+		 * review).  The value is a Const of the type the parser would have
+		 * given it, as constant folding leaves a relabelled literal.
 		 */
 		att = TupleDescAttr(RelationGetDescr(st->heap), c->attno - 1);
-		get_typlenbyval(cl->valtype, &typlen, &typbyval);
+		op_input_types(cl->opno, &lefttype, &righttype);
+		col = (Expr *) makeVar(1, c->attno, att->atttypid, att->atttypmod,
+							   att->attcollation, 0);
+		coltype = lion_arg_type_passed(att->atttypid, lefttype);
+		if (coltype != att->atttypid)
+			col = (Expr *) makeRelabelType(col, coltype, -1,
+										   type_is_collatable(coltype) ?
+										   att->attcollation : InvalidOid,
+										   COERCE_IMPLICIT_CAST);
+		valtype = lion_arg_type_passed(cl->valtype, righttype);
+		get_typlenbyval(valtype, &typlen, &typbyval);
 		fmgr_info_set_expr((Node *)
-						   make_opclause(cl->opno, BOOLOID, false,
-										 (Expr *) makeVar(1, c->attno,
-														  att->atttypid,
-														  att->atttypmod,
-														  att->attcollation,
-														  0),
-										 (Expr *) makeConst(cl->valtype, -1,
+						   make_opclause(cl->opno, BOOLOID, false, col,
+										 (Expr *) makeConst(valtype, -1,
 															InvalidOid,
 															typlen, cl->val,
 															false, typbyval),
@@ -9952,11 +10058,14 @@ lion_build_filter(LionCountScanState *st)
 
 /*
  * Locate the posting sets of every WHERE clause of the relation the node is
- * counting.  They keep their pins (for INLINE entries) until
- * lion_release_where(), which is exactly the DESIGN.md section 9 discipline
- * applied for the length of that relation's processing rather than for one
- * container.  With partitions that is one partition's turn; with a plain
- * table it is the whole node execution.
+ * counting.  They stay located until lion_release_where() - with partitions
+ * for one partition's turn, with a plain table until the node is done - and
+ * keep their pins (for INLINE entries) until the node first hands a row to
+ * the executor, when they become NOPIN copies (lion_pause_run(); DESIGN.md
+ * §15, "Paused and finished counts").  Until then that is the DESIGN.md
+ * section 9 discipline applied for the length of the counts rather than for
+ * one container; after it, each count takes its interlock from the set that
+ * drives it.
  */
 static void
 lion_locate_where(LionCountScanState *st)
@@ -11051,14 +11160,19 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
  * the ungrouped form short-circuits to - split into its terms.
  *
  * Pins and memory (DESIGN.md §9).  The sets belong to the clause and were
- * located once for this relation, with their pins, by lion_locate_where(); the
- * group loop neither takes nor releases any, and the key it emits is the copy
- * the set already holds, which outlives the row.
+ * located once for this relation, with their pins, by lion_locate_where(), and
+ * the key the loop emits is the copy the set already holds, which outlives the
+ * row.  A set that holds no pin - every INLINE one once a row has gone up
+ * (lion_pause_run()), and any located past the §15 pin budget - is located
+ * again for its group, into groupset, and released after the count: it is the
+ * source that carries the interlock for the group, the other WHERE sets being
+ * NOPIN copies by then too.
  */
 static TupleTableSlot *
 lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 {
 	LionCountSource *src = &st->sources[st->ingroupitem + 1];
+	LionClauseState *cl = &st->clause[st->item[st->ingroupitem].clauseno];
 	MemoryContext oldcxt;
 
 	*exhausted = false;
@@ -11093,7 +11207,26 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 		st->dsources[0].nomaterialize = false;
 		st->dsources[0].disjoint = false;
 
+		/*
+		 * The entry as it is now, under a pin of its own.  One that has gone
+		 * meanwhile held no row anyone can see (VACUUM deletes only an empty
+		 * entry, §18): no group.
+		 */
+		if (ps->nopin)
+		{
+			if (!lion_posting_set_lookup_col(cl->idx, cl->idxcol,
+											 ps->storedkey, InvalidOid,
+											 &st->groupset))
+			{
+				lion_posting_set_release(&st->groupset);
+				MemoryContextSwitchTo(oldcxt);
+				continue;
+			}
+			st->dsources[0].sets = &st->groupset;
+		}
+
 		count = lion_node_count(st, st->ndsource, st->dsources, false);
+		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
 		/* A group exists only if at least one of its rows is visible. */
@@ -11116,13 +11249,22 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
  * visible row is a group at all, so only those are emitted.
  *
  * Pins and memory (DESIGN.md §9).  The outer group's set is located once and
- * held - with its pin - for the whole of its inner loop, in outercxt; each
+ * held for the whole of its inner loop, in outercxt - with its pin until the
+ * first of its pairs goes up as a row, and as a NOPIN copy after that
+ * (lion_pause_run()), the pairs being carried by their inner sets; each
  * pair's inner set is located, counted and released inside pergroup, so at
  * most two group pins exist at a time however many distinct values either
  * column has.  The inner keys were read once per relation into innercxt
  * (lion_load_inner_keys()); when they did not fit its budget, innerkey is
  * NULL and the inner index's entry scan is walked once per outer group
  * instead, which holds one pin at a time as well.
+ *
+ * That walk outlives many pairs, and so do the memory contexts
+ * lion_entry_scan_begin_col() creates for its position and its batch, under
+ * whatever context is current: it is begun in the query's context, never
+ * inside pergroup, whose reset before every pair would delete them under the
+ * walk (the 2026-09-27 review found exactly that: a leaf copied into freed
+ * memory at the next pair, and the contexts deleted twice at the end).
  */
 static TupleTableSlot *
 lion_next_group2(LionCountScanState *st, bool *exhausted)
@@ -11154,6 +11296,16 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 			st->outerisnull = st->groupset.keyisnull;
 			st->outeropen = true;
 			st->inneridx = 0;
+		}
+
+		/* ---- the fallback: the inner index's walk, per outer group ---- */
+		if (st->innerkey == NULL && !st->scanning2)
+		{
+			oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+			lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
+									 st->groupidxcol2);
+			MemoryContextSwitchTo(oldcxt);
+			st->scanning2 = true;
 		}
 
 		/*
@@ -11192,12 +11344,7 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		}
 		else
 		{
-			if (!st->scanning2)
-			{
-				lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
-										 st->groupidxcol2);
-				st->scanning2 = true;
-			}
+			Assert(st->scanning2);
 			if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
 			{
 				MemoryContextSwitchTo(oldcxt);
@@ -12004,6 +12151,84 @@ lion_exec_partitioned(LionCountScanState *st)
 	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 }
 
+/*
+ * A row is about to go up to the executor, which may not ask for the next one
+ * for as long as a cursor stays open - so nothing the node keeps across the
+ * row may hold a buffer pin, or an idle cursor would hold VACUUM up on that
+ * page (§11 takes a cleanup lock on every page it rewrites).  DESIGN.md §9's
+ * pin is the interlock for a count's visibility-map questions and nothing
+ * else, and between two rows no count is running:
+ *
+ *	- the walks let go of the directory leaf they stand on
+ *	  (lion_entry_scan_pause());
+ *	- every located WHERE set that holds a pin - an INLINE one - gives it up
+ *	  and becomes NOPIN (lion_posting_set_unpin()): a private copy, which is
+ *	  what a set located past the §15 pin budget has always been, and which
+ *	  every count already knows how to take.  Each count after this row gets
+ *	  the interlock from the set that drives it, which every shape that
+ *	  returns more than one row locates afresh under a pin of its own - a
+ *	  group's entry, the inner set of a (g, k) pair (§20, §26), the fk set of
+ *	  a dimension row (§27), and the listed value an IN list drives the
+ *	  groups by, which lion_next_group_inlist() locates again for that
+ *	  reason.  A count that is left with no source that carries it trusts no
+ *	  map and rechecks, and a lone NOPIN set is located again before it is
+ *	  counted, as always (lion_count_sources_cached());
+ *	- and the outer group's set of a two-column GROUP BY (§20) does the same:
+ *	  its remaining pairs are carried by their inner sets.
+ */
+static void
+lion_pause_run(LionCountScanState *st)
+{
+	int			i;
+	int			j;
+
+	if (st->scanning)
+		lion_entry_scan_pause(&st->escan);
+	if (st->scanning2)
+		lion_entry_scan_pause(&st->escan2);
+
+	if (st->sources != NULL)
+	{
+		for (i = 1; i <= st->nitem; i++)
+		{
+			LionCountSource *src = &st->sources[i];
+
+			for (j = 0; j < src->nsets; j++)
+				lion_posting_set_unpin(&src->sets[j]);
+		}
+	}
+	if (st->outeropen)
+		lion_posting_set_unpin(&st->groupset);
+}
+
+/*
+ * The node has produced its last row.  A plain table stays open until the
+ * node ends, and everything located in it used to stay located with it - the
+ * WHERE sets and their pins, which a cursor left open after its last FETCH, or
+ * after the one row of a plain count, held until the transaction ended.
+ * Nothing is counted again before a rescan, which locates everything afresh,
+ * so the walks, the group sets and the WHERE sets all go now.  (A partitioned
+ * scan has let go of each partition's at the end of its turn already.)
+ */
+static void
+lion_finish_run(LionCountScanState *st)
+{
+	if (st->scanning)
+	{
+		lion_entry_scan_end(&st->escan);
+		st->scanning = false;
+	}
+	if (st->scanning2)
+	{
+		lion_entry_scan_end(&st->escan2);
+		st->scanning2 = false;
+	}
+	lion_posting_set_release(&st->groupset);
+	lion_posting_set_release(&st->groupset2);
+	st->outeropen = false;
+	lion_release_where(st);
+}
+
 static TupleTableSlot *
 lion_exec_custom_scan(CustomScanState *node)
 {
@@ -12030,18 +12255,17 @@ lion_exec_custom_scan(CustomScanState *node)
 	}
 
 	/*
-	 * A row goes up to the executor, which may not ask for the next one for as
-	 * long as a cursor stays open: the walks let go of the directory leaf they
-	 * stand on (lion_entry_scan_pause()), so that an idle cursor over a GROUP BY
-	 * does not hold VACUUM up on it.
+	 * No pin outlives the call (DESIGN.md §15, "Paused and finished counts"):
+	 * a node that is done lets go of everything, and one that returns a row
+	 * with more to come keeps its sets but none of their pins.  The row
+	 * itself points at nothing either releases: a key the WHERE pinned is in
+	 * keycxt, a group's key in pergroup or outercxt, and a listed value's in
+	 * the set, which a pause keeps.
 	 */
-	if (slot != NULL)
-	{
-		if (st->scanning)
-			lion_entry_scan_pause(&st->escan);
-		if (st->scanning2)
-			lion_entry_scan_pause(&st->escan2);
-	}
+	if (st->done)
+		lion_finish_run(st);
+	else if (slot != NULL)
+		lion_pause_run(st);
 	st->dirpages += lion_dir_pages_read - dirbefore;
 
 	return slot;
@@ -12521,7 +12745,7 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
  * index name at all, so it never gets here with a parent's numbering.
  */
 static const char *
-lion_explain_col(Oid idxoid, AttrNumber heapattno)
+lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey)
 {
 	static char buf[NAMEDATALEN + 2];
 	Relation	idx;
@@ -12537,12 +12761,20 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno)
 		return "";
 	}
 
-	col = lion_index_col_for(idx, heapattno);
+	col = lion_index_col_for(idx, heapattno, multikey);
 	snprintf(buf, sizeof(buf), ".%s",
 			 NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
 	index_close(idx, AccessShareLock);
 
 	return buf;
+}
+
+/* ... for one clause, whose kind says which kind of column answers it. */
+static const char *
+lion_explain_clause_col(const LionClauseState *cl)
+{
+	return lion_explain_col(cl->idxoid, cl->attno,
+							cl->kind == LION_CLAUSE_MULTI);
 }
 
 static void
@@ -12578,7 +12810,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->npart == 0)
 			appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid),
 							 lion_explain_col(st->groupidxoid,
-											  st->driveattno));
+											  st->driveattno, false));
 		if (st->hasrange)
 		{
 			bool		firstrange = true;
@@ -12612,7 +12844,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			if (st->npart == 0)
 				appendStringInfo(&buf, "%s%s ", get_rel_name(st->groupidxoid2),
 								 lion_explain_col(st->groupidxoid2,
-												  st->innerattno));
+												  st->innerattno, false));
 			appendStringInfo(&buf, "(%s)",
 							 get_attname(st->heapoid, st->innerattno, false));
 		}
@@ -12627,7 +12859,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		LionClauseState *cl = &st->clause[st->joinclause];
 
 		appendStringInfo(&buf, "%s%s (", get_rel_name(cl->idxoid),
-						 lion_explain_col(cl->idxoid, cl->attno));
+						 lion_explain_clause_col(cl));
 		lion_explain_clause(st, cl, ancestors, es, &buf);
 		appendStringInfoChar(&buf, ')');
 	}
@@ -12651,7 +12883,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 			if (st->npart == 0)
 				appendStringInfo(&buf, "%s%s ", get_rel_name(first->idxoid),
-								 lion_explain_col(first->idxoid, first->attno));
+								 lion_explain_clause_col(first));
 			appendStringInfoChar(&buf, '(');
 			for (j = 0; j < st->nclause; j++)
 			{
@@ -12672,7 +12904,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				LionClauseState *cl = &st->clause[st->item[i].clauseno];
 
 				appendStringInfo(&buf, "%s%s ", get_rel_name(cl->idxoid),
-								 lion_explain_col(cl->idxoid, cl->attno));
+								 lion_explain_clause_col(cl));
 			}
 			appendStringInfoChar(&buf, '(');
 			lion_explain_clause(st, &st->clause[st->item[i].clauseno],
@@ -12700,7 +12932,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 					appendStringInfo(&buf, "%s%s%s",
 									 leaf > 0 ? ", " : "",
 									 get_rel_name(cl->idxoid),
-									 lion_explain_col(cl->idxoid, cl->attno));
+									 lion_explain_clause_col(cl));
 				}
 				appendStringInfoChar(&buf, ' ');
 			}

@@ -425,7 +425,9 @@ extern void lion_posting_set_release(LionPostingSet *ps);
 /*
  * Drop an INLINE set's pin but keep its payload: the set becomes NOPIN.  For
  * callers that need no visibility-map interlock at all - a bitmap scan, whose
- * every TID is checked in the heap by the executor.
+ * every TID is checked in the heap by the executor - and for the count
+ * pushdown between two rows, whose later counts take a NOPIN set as they take
+ * one located past the pin budget (lion_count_sources_cached()).
  */
 extern void lion_posting_set_unpin(LionPostingSet *ps);
 

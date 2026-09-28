@@ -499,6 +499,19 @@ lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
 {
 	Pointer    *extra_data = NULL;
 
+	/*
+	 * Only a multi-key column's state has an extractQuery: a scalar one's is
+	 * left unset (lion_fill_state()), and calling through it would jump to
+	 * address zero.  No caller means to hand one over, but a column mix-up
+	 * once did (the 2026-09-27 review: an index listing one column under a
+	 * scalar and a multi-key opclass), so this is an error, not an Assert.
+	 */
+	if (!state->multikey || !OidIsValid(state->extractquery.fn_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("lion index key column %d is not a multi-key column",
+						(int) state->attno)));
+
 	raw->nkeys = 0;
 	raw->pmatch = NULL;
 	raw->nulls = NULL;
@@ -542,8 +555,6 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 	bool	   *nulls;
 	Datum	   *keys;
 	int			i;
-
-	Assert(state->multikey);
 
 	memset(q, 0, sizeof(LionQuery));
 
@@ -815,8 +826,6 @@ lion_extract_query_superset(LionState *state, Datum query,
 	Datum	   *keys;
 	int			nkeys = 0;
 	int			i;
-
-	Assert(state->multikey);
 
 	memset(q, 0, sizeof(LionQuery));
 

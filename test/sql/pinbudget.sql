@@ -32,8 +32,11 @@ SELECT pg_relation_size('lion_pin_k') / current_setting('block_size')::int > 120
 /*
  * How many of an index's pages some backend pins right now: this one's pins
  * included, which is the point - a GROUP BY count keeps its WHERE sets
- * located, and their pins held, from its first group to its last, so a
- * cursor stopped after the first group shows what the lookup kept.
+ * located from its first group to its last, and a cursor stopped after the
+ * first group shows what it keeps of them between two rows.  That used to be
+ * the lookup's pins, a leaf of the list's each up to the budget; it is the
+ * sets' copies and no pin at all now (DESIGN.md §15, "Paused and finished
+ * counts"), the budget bounding what a count holds while it runs.
  */
 CREATE FUNCTION lion_pinned(idx regclass) RETURNS bigint
 LANGUAGE sql AS $$
@@ -48,8 +51,8 @@ DECLARE lion_pin_c CURSOR FOR
 	SELECT x, count(*) FROM lion_pin
 	 WHERE k = ANY ((SELECT array_agg(k) FROM lion_pin)::text[]) GROUP BY x ORDER BY x;
 FETCH 1 FROM lion_pin_c;
-/* the list's leaves, plus the one or two the GROUP BY's entry scan holds */
-SELECT lion_pinned('lion_pin_k') + lion_pinned('lion_pin_kx') BETWEEN 1 AND 1002 AS pins_bounded;
+/* neither the list's leaves nor the leaf the GROUP BY's entry scan stands on */
+SELECT lion_pinned('lion_pin_k') + lion_pinned('lion_pin_kx') AS pins_paused;
 FETCH 1 FROM lion_pin_c;
 COMMIT;
 SELECT lion_pinned('lion_pin_k') + lion_pinned('lion_pin_kx') AS pins_after;
