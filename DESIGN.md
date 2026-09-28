@@ -11144,8 +11144,9 @@ fitted or derived at - this section's tables and the comment above each macro ar
 that sets none plans exactly as it did; the regression suite runs at the defaults, and
 `costgucs.sql` checks that each setting is there and that three of them move the plans they price.
 `lion_costs.c` holds the table of them and registers them from `_PG_init`, user settings from 0 up
-as core's cost settings are, in core's group of them (`Query Tuning / Planner Cost Constants`) and
-shown by `EXPLAIN (SETTINGS)` when changed; the README lists them with their defaults and units.
+as core's cost settings are, and shown by `EXPLAIN (SETTINGS)` when changed; `pg_settings` lists
+them among the customized options, as it does any extension's, since no API puts a custom setting in
+one of core's groups. The README lists them with their defaults and units.
 
 Two constants that were written as another are decided by what they price. `LION_FKJOIN_SET_COST`
 stays `LION_UNION_SET_COST` and has no setting of its own: both are a union source's set rebuilt by
