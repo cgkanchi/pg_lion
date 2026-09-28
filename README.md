@@ -213,6 +213,16 @@ that the copy spills to a temporary file, as a hash join's table would. Their va
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
 (`o.status = ANY ($1)`) included: every process evaluates them once per scan.
 
+The fact table may be partitioned, when every partition the planner keeps has a Lion index on the
+foreign-key column (one on the partitioned table gives each partition its own) and on each fact
+filter its bounds do not imply. The node then takes each batch of dimension keys to every partition
+in turn and adds the partitions' counts up per dimension row - for `EXISTS` a match in any of them,
+for `NOT EXISTS` in none (DESIGN.md §27, "A partitioned fact table"). `EXPLAIN` lists the partitions
+and what their bounds imply, and its counters are summed over them: `Join Keys Looked Up` counts a
+key once per partition it was looked up in. The partitions are the ones plan-time pruning keeps: a
+partition that only run-time pruning would remove, as with `ts >= now() - interval '1 year'` over
+partitions by year, is counted too, and contributes nothing.
+
 `EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
 key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
 Entry`, the containers the counts read from each key's FK set (`Join Key Containers Read`), from the

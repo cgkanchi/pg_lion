@@ -1852,6 +1852,28 @@ lion_lookup_walk_cmp(LionLookupWalk *walk, Datum a, uint32 ahash, Datum b,
 	return 0;
 }
 
+/* The order of lion_lookup_walk_cmp(), as lion_walk_order_equal() compares it. */
+void
+lion_lookup_walk_order(const LionLookupWalk *walk, LionWalkOrder *order)
+{
+	memset(order, 0, sizeof(LionWalkOrder));
+	order->valid = walk->probe.walk;
+	order->hassort = walk->probe.hassort;
+	if (walk->probe.hassort)
+		order->sortproc = walk->probe.sortproc.fn_oid;
+	order->hashproc = walk->probe.crosstype ? walk->probe.hashinfo.fn_oid :
+		walk->state->hashproc.fn_oid;
+	order->collation = walk->state->collation;
+}
+
+bool
+lion_walk_order_equal(const LionWalkOrder *a, const LionWalkOrder *b)
+{
+	return a->valid && b->valid && a->hassort == b->hassort &&
+		a->sortproc == b->sortproc && a->hashproc == b->hashproc &&
+		a->collation == b->collation;
+}
+
 /* Let go of the leaf the walk stands on, and remember where it was. */
 void
 lion_lookup_walk_pause(LionLookupWalk *walk)

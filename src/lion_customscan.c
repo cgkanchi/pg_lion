@@ -947,7 +947,38 @@ typedef struct LionJoinEnt
 	bool		isnull;			/* joins nothing: an anti join's row only */
 	int32		seq;
 	MinimalTuple tuple;
+	int64		acc;			/* a partitioned fact table: the counts of the
+								 * partitions visited so far, added up - or,
+								 * for an existence test, whether any matched
+								 * (lion_join_count_parts()) */
 } LionJoinEnt;
+
+/*
+ * One leaf partition of a partitioned fact table, as the FK-side join keeps
+ * it from one batch of keys to the next (DESIGN.md §27, "A partitioned fact
+ * table").  The partition is opened for each batch and closed after it, but
+ * its fact filters are located and collected once a run: `filter` is its
+ * copy of them, in `cxt`, which the later batches read - named after an index
+ * the partition reopens each time (filterindex), whose Relation the copy is
+ * pointed at again - or, in a parallel plan whose workers started, a view of
+ * the copy the participants made together (`shared`, viewshared).  qmode is
+ * what the run's values made of its multi-key clauses (lion_locate_multikey()),
+ * which the row filter of a later batch is built from without locating them
+ * again.  missing says the filters select no row of it at all.
+ */
+typedef struct LionJoinPart
+{
+	bool		collected;		/* its filters were located, and collected
+								 * where the plan asks for it */
+	bool		filtered;		/* ... into filter */
+	bool		missing;
+	bool		viewshared;
+	Oid			filterindex;
+	LionPostingSet filter;
+	LionQueryMode *qmode;		/* one per clause */
+	MemoryContext cxt;
+	struct LionSharedCopy *shared;
+} LionJoinPart;
 
 typedef struct LionCountScanState
 {
@@ -1402,6 +1433,22 @@ typedef struct LionCountScanState
 	int64		joinlastcount;
 
 	/*
+	 * A partitioned fact table (DESIGN.md §27, "A partitioned fact table"):
+	 * every batch of keys is taken to each leaf partition in turn, and each
+	 * key's counts added up in its entry (LionJoinEnt.acc).  joinpart is the
+	 * partitions' state from batch to batch, their copies in joinpartcxt;
+	 * joinvisitcxt is one partition's turn - its walk of the fk index, begun
+	 * again each turn - and joinorder the order the batch is sorted in, which
+	 * a partition whose fk index orders its keys another way sorts it into
+	 * again.  joinrunfilterrows is the run's copies' rows, summed.
+	 */
+	LionJoinPart *joinpart;
+	MemoryContext joinpartcxt;
+	MemoryContext joinvisitcxt;
+	LionWalkOrder joinorder;
+	int64		joinrunfilterrows;
+
+	/*
 	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
 	 * counts the dimension rows its share of the child returns and adds what
 	 * EXPLAIN ANALYZE reports into joinshared, in the dynamic shared memory
@@ -1499,9 +1546,16 @@ typedef struct LionJoinShared
 	bool		copyready;		/* a LionSharedCopy follows this struct */
 } LionJoinShared;
 
-/* The shared copy of the fact filters, right after the struct above. */
+/*
+ * The shared copy of the fact filters, right after the struct above - or,
+ * over a partitioned fact table, one copy per leaf partition, one after the
+ * other (DESIGN.md §27, "A partitioned fact table").
+ */
 #define LION_JOIN_SHARED_COPY(shared) \
 	((LionSharedCopy *) ((char *) (shared) + MAXALIGN(sizeof(LionJoinShared))))
+#define LION_JOIN_SHARED_PART_COPY(shared, p) \
+	((LionSharedCopy *) ((char *) LION_JOIN_SHARED_COPY(shared) + \
+						 (Size) (p) * lion_shared_copy_size()))
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								  CustomPath *best_path, List *tlist,
@@ -5846,20 +5900,38 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * what the fact filters leave of them, on dirty pages fetched once per query.
  * Nothing here charges the whole fact heap: that is what the node exists not
  * to read.
+ *
+ * With `parts` the terms the two choices above are made between are handed
+ * back as well, and the rest beside them (LionFkJoinCost): a partitioned fact
+ * table is priced one leaf partition at a time, and the choices are then the
+ * plan's, made over the sum of its partitions (lion_cost_fkjoin_path()).
  */
+typedef struct LionFkJoinCost
+{
+	Cost		other;			/* everything but the terms below */
+	Cost		descents;		/* the lookups, a descent each */
+	Cost		walked;			/* ... or a walk of the leaves in key order */
+	Cost		probed;			/* the fact filters, probed by every count */
+	Cost		collected;		/* ... or collected once, and looked up */
+	Cost		located;		/* the part of `other` locating the filters */
+	double		copybytes;		/* what the collected copy is expected to take */
+	bool		cancollect;		/* there is anything to collect at all */
+} LionFkJoinCost;
+
 static Cost
-lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
-					 Var *fkvar, int joinclause, List *whereclauses,
-					 List *wherekinds, List *ors, double dimrows,
-					 double found, bool exists, double rowbytes, int workers,
-					 bool *collect, bool *walk)
+lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
+					 List *wherecol, Var *fkvar, int joinclause,
+					 List *whereclauses, List *wherekinds, List *ors,
+					 double dimrows, double found, bool exists,
+					 double rowbytes, int workers, bool *collect, bool *walk,
+					 LionFkJoinCost *parts)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		tuples = Max(rel->tuples, 1.0);
 	double		wheresel = Min(Max(rel->rows, 1.0) / tuples, 1.0);
-	IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(t->whereidx, joinclause);
-	AttrNumber	fkcol = (AttrNumber) list_nth_int(t->wherecol, joinclause);
+	IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(whereidx, joinclause);
+	AttrNumber	fkcol = (AttrNumber) list_nth_int(wherecol, joinclause);
 	int			nclause = list_length(whereclauses);
 	int		   *orgrp = lion_or_group_map(ors, nclause);
 	int			nsrc = list_length(ors);
@@ -5889,6 +5961,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	double		copybytes;
 	int			npositive = 0;
 	Cost		run = 0;
+	Cost		located = 0;
 	Cost		probed = 0;
 	Cost		collected = 0;
 	int			ci = 0;
@@ -5944,13 +6017,19 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 	}
 	else
 		run += descents;
+	if (parts != NULL)
+	{
+		memset(parts, 0, sizeof(LionFkJoinCost));
+		parts->descents = descents;
+		parts->walked = walked;
+	}
 	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
-	rangelead = lion_rangesrc_leaders(t->whereidx, t->wherecol, wherekinds,
+	rangelead = lion_rangesrc_leaders(whereidx, wherecol, wherekinds,
 									  ors, nclause);
-	forfour(lc1, t->whereidx, lc2, whereclauses, lc3, wherekinds,
-			lc4, t->wherecol)
+	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds,
+			lc4, wherecol)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
@@ -5992,9 +6071,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 			sno = (orgrp[ci] >= 0) ? orgrp[ci] : nsrc + ci;
 			srcsets[sno] += 1.0;
 			srcmembers[sno] += tuples * sel;
-			run += lion_cost_range_source(root, rel, idx,
-										  (AttrNumber) lfirst_int(lc4), sel,
-										  dimrows, orgrp[ci] >= 0);
+			located += lion_cost_range_source(root, rel, idx,
+											  (AttrNumber) lfirst_int(lc4), sel,
+											  dimrows, orgrp[ci] >= 0);
 			ci++;
 			continue;
 		}
@@ -6061,10 +6140,11 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 													 (AttrNumber) lfirst_int(lc4)),
 					 0.0);
 
-		run += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
+		located += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
 			nkeys * (cheight + 1.0) * LION_DESCENT_COST;
-		run += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
+		located += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
 	}
+	run += located;
 
 	/*
 	 * PROBED: every count seeks each source at the container keys the fk set
@@ -6139,8 +6219,19 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		if (copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
 			collected < probed && !RecoveryInProgress())
 			*collect = true;
+		if (parts != NULL)
+		{
+			parts->cancollect = true;
+			parts->copybytes = copybytes;
+		}
 	}
 	run += *collect ? collected : probed;
+	if (parts != NULL)
+	{
+		parts->probed = probed;
+		parts->collected = collected;
+		parts->located = located;
+	}
 
 	/*
 	 * The fk set's containers at every count, read and counted as any count's
@@ -6159,6 +6250,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 											   heap_pages);
 	run += recheck_tids * LION_RECHECK_TID_COST;
 
+	if (parts != NULL)
+		parts->other = run - (*walk ? walked : descents) -
+			(*collect ? collected : probed);
 	return run;
 }
 
@@ -7818,6 +7912,139 @@ lion_add_join_agg_path(PlannerInfo *root, RelOptInfo *output_rel,
 }
 
 /*
+ * What the FK-side join does over the fact relation `rel` (DESIGN.md §27),
+ * for `dimrows` dimension rows `found` of which have fact rows: its lookups
+ * and counts (lion_cost_fkjoin_rel()), and the heap recheck of a multi-key
+ * fact filter the node only has at run time (DESIGN.md §17, "A query known
+ * only at run time") - the fact rows the keys reach, each count reading its
+ * own.  *collect and *walk are the plan's two choices.
+ *
+ * A partitioned fact table (DESIGN.md §27, "A partitioned fact table") is
+ * every key looked up in every leaf partition, each with its own fk index,
+ * its own fact filters - less the ones its bounds imply (§16) - and its own
+ * copy of them, so each leaf is priced as a table of its own and the costs
+ * add up.  A key finds rows in a leaf as often as the fk's distinct values
+ * are there: the share of the parent's that the leaf's own statistics count.
+ * The choices are the plan's, one for all the leaves, made over the sums:
+ * the keys are read a batch at a time whatever is chosen, since each batch
+ * is taken to every leaf in turn, so a batch's place costs a row once and
+ * not once a leaf; and the leaves' copies of the fact filters are all held
+ * for the whole scan, so together they have to fit where one would.  A plan
+ * that probes the filters locates each leaf's again at every turn - a leaf
+ * keeps nothing located from one batch to the next - so their locating is
+ * charged once a batch, where a plain table's is charged once.
+ */
+static Cost
+lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
+					  Var *fkvar, int joinclause, List *whereclauses,
+					  List *wherekinds, List *ors, double dimrows, double found,
+					  bool exists, double rowbytes, int workers, bool *collect,
+					  bool *walk)
+{
+	LionCountTarget *first = (LionCountTarget *) linitial(targets);
+	double		ndall;
+	double		nleaves = list_length(targets);
+	Cost		other = 0;
+	Cost		descents = 0;
+	Cost		walked = 0;
+	Cost		probed = 0;
+	Cost		collected = 0;
+	Cost		located = 0;
+	double		copybytes = 0;
+	double		batches;
+	Cost		run;
+	ListCell   *lc;
+
+	if (list_length(targets) == 1 && first->rel == rel)
+	{
+		double		tuples = Max(rel->tuples, 1.0);
+		double		reach = Min(found * tuples /
+								lion_fkjoin_fk_ndistinct(root, rel, fkvar),
+								tuples);
+
+		run = lion_cost_fkjoin_rel(root, rel, first->whereidx,
+								   first->wherecol, fkvar, joinclause,
+								   whereclauses, wherekinds, ors, dimrows,
+								   found, exists, rowbytes, workers,
+								   collect, walk, NULL);
+		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
+								 whereclauses, wherekinds, ors,
+								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
+								 found, reach);
+		return run;
+	}
+
+	ndall = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
+	foreach(lc, targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		Var		   *leafvar = lion_child_var(root, t->rel->relid,
+											 fkvar->varattno);
+		double		tuples = Max(t->rel->tuples, 1.0);
+		double		nd;
+		double		tfound;
+		double		reach;
+		int			tjoin = joinclause;
+		List	   *tidx;
+		List	   *tcol;
+		List	   *tclauses;
+		List	   *tkinds;
+		List	   *tors;
+		LionFkJoinCost parts;
+		bool		tcollect;
+		bool		twalk;
+
+		if (leafvar == NULL)
+			leafvar = fkvar;	/* lion_collect_targets() found the column */
+		lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
+						  &tclauses, &tkinds, &tors, &tjoin);
+		nd = lion_fkjoin_fk_ndistinct(root, t->rel, leafvar);
+		tfound = clamp_row_est(found * Min(nd / ndall, 1.0));
+
+		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar, tjoin,
+									tclauses, tkinds, tors, dimrows, tfound,
+									exists, rowbytes, workers, &tcollect,
+									&twalk, &parts);
+		other += parts.other;
+		descents += parts.descents;
+		walked += parts.walked;
+		probed += parts.probed;
+		located += parts.located;
+		if (parts.cancollect)
+		{
+			collected += parts.collected;
+			copybytes += parts.copybytes;
+		}
+		else
+			collected += parts.probed;
+
+		reach = Min(tfound * tuples / nd, tuples);
+		other += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds,
+								   tors,
+								   reach * Min(Max(t->rel->rows, 1.0) / tuples,
+											   1.0),
+								   tfound, reach);
+	}
+
+	/* a batch's place in it is a row's once, however many leaves it visits */
+	walked -= (nleaves - 1.0) * dimrows * LION_FKJOIN_BATCH_ROW_COST;
+	descents += dimrows * LION_FKJOIN_BATCH_ROW_COST;
+
+	/* each batch after the first locates every leaf's filters again */
+	batches = ceil(Max(dimrows, 1.0) /
+				   Max(floor((double) work_mem * 1024.0 / Max(rowbytes, 1.0)),
+					   1.0));
+	probed += (batches - 1.0) * located;
+
+	*walk = (walked < descents);
+	*collect = (copybytes > 0 &&
+				copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
+				collected < probed && !RecoveryInProgress());
+	return other + (*walk ? walked : descents) +
+		(*collect ? collected : probed);
+}
+
+/*
  * One FK-side join path (DESIGN.md §27) over `child` - the dimension's
  * cheapest path, or, with `workers` above zero, its cheapest partial path run
  * by that many workers - and what goes above it into the grouped rel.
@@ -7860,7 +8087,7 @@ lion_add_join_agg_path(PlannerInfo *root, RelOptInfo *output_rel,
 static void
 lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 					  RelOptInfo *output_rel, const LionFkJoin *fj,
-					  List *having, LionCountTarget *first, Path *child,
+					  List *having, List *targets, Path *child,
 					  int workers, PathTarget *nodetarget, List *base,
 					  int joinclause, int jointype,
 					  const LionFkJoinAgg *rowagg,
@@ -7903,12 +8130,12 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 				 get_typavgwidth(fj->pkvar->vartype, fj->pkvar->vartypmod) :
 				 child->pathtarget->width);
 
-	run = lion_cost_fkjoin_rel(root, rel, first, fj->fkvar, joinclause,
-							   whereclauses, wherekinds, ors, childrows,
-							   childfound,
-							   jointype != LION_JOIN_INNER ||
-							   (emitrows && !counts),
-							   rowbytes, workers, &collect, &walk);
+	run = lion_cost_fkjoin_path(root, rel, targets, fj->fkvar, joinclause,
+								whereclauses, wherekinds, ors, childrows,
+								childfound,
+								jointype != LION_JOIN_INNER ||
+								(emitrows && !counts),
+								rowbytes, workers, &collect, &walk);
 
 	/*
 	 * Partial counts and nothing else - no dimension column to group by or
@@ -7933,24 +8160,6 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 		startup = child->total_cost +
 			lion_fkjoin_sort_cost(child->rows, child->pathtarget->width);
 		run += startup - child->total_cost;
-	}
-
-	/*
-	 * A fact filter that is a multi-key query the node only has at run time
-	 * may need the candidates of every count rechecked in the heap (DESIGN.md
-	 * §17, "A query known only at run time"): the fact rows the keys it looks
-	 * up reach, each count reading its own.
-	 */
-	{
-		double		tuples = Max(rel->tuples, 1.0);
-		double		reach = Min(childfound * tuples /
-								lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar),
-								tuples);
-
-		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
-								 whereclauses, wherekinds, ors,
-								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
-								 childfound, reach);
 	}
 
 	cpath = makeNode(CustomPath);
@@ -8143,7 +8352,9 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	LionDriveInfo nodrive[LION_MAX_GROUPCOLS];
 	int			joinclause;
 	List	   *targets = NIL;
-	LionCountTarget *first;
+	bool		partitioned;
+	double		fkpages;		/* the fk index's pages, in every partition */
+	List	   *parts = NIL;
 	PathTarget *nodetarget;
 	List	   *oids;
 	List	   *ints;
@@ -8355,15 +8566,23 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * ---- the fact rel and its indexes ----
 	 *
 	 * Nothing drives an entry scan: the child's rows drive the counts.  A
-	 * partitioned fact rel was refused by the caller, so there is one target.
+	 * partitioned fact rel is one target per live leaf partition, each with
+	 * its own fk index and its own fact filters, less the ones its bounds
+	 * imply (DESIGN.md §27, "A partitioned fact table"); all of them pruned
+	 * away leaves the join to the planner, which knows it is empty.
 	 */
 	memset(nodrive, 0, sizeof(nodrive));
 	if (!lion_collect_targets(root, rel, nodrive, 0, whereattnos, clauseinfos,
 							 imply, &targets))
 		return;
-	if (list_length(targets) != 1)
+	if (targets == NIL)
 		return;
-	first = (LionCountTarget *) linitial(targets);
+	partitioned = rte->inh;
+	fkpages = 0;
+	foreach(lc, targets)
+		fkpages += (double)
+			((IndexOptInfo *) list_nth(((LionCountTarget *) lfirst(lc))->whereidx,
+									   joinclause))->pages;
 
 	/*
 	 * ---- what every path of it carries ----
@@ -8400,18 +8619,37 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI :
 		(fj->jointype == JOIN_ANTI) ? LION_JOIN_ANTI : LION_JOIN_INNER;
 
+	/*
+	 * A partitioned fact table's own index Oids are InvalidOid, its
+	 * partitions' in LION_PRIV_PARTS - InvalidOid where a partition leaves a
+	 * fact filter out - as for a count (DESIGN.md §16).
+	 */
 	oids = list_make3_oid(rte->relid, InvalidOid, InvalidOid);
 	ints = list_make4_int((int) rel->relid, 0, 0, 0);
 	i = 0;
 	forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
 	{
-		oids = lappend_oid(oids,
-						   ((IndexOptInfo *) list_nth(first->whereidx,
+		oids = lappend_oid(oids, partitioned ? InvalidOid :
+						   ((IndexOptInfo *) list_nth(((LionCountTarget *) linitial(targets))->whereidx,
 													  i))->indexoid);
 		ints = lappend_int(ints, lfirst_int(l1));
 		consts = lappend(consts, copyObject((Node *) lfirst(l2)));
 		ckinds = lappend_int(ckinds, lfirst_int(l3));
 		i++;
+	}
+	if (partitioned)
+	{
+		foreach(lc, targets)
+		{
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+			List	   *one = list_make3_oid(t->heapoid, InvalidOid, InvalidOid);
+
+			foreach(l1, t->whereidx)
+				one = lappend_oid(one, lfirst(l1) != NULL ?
+								  ((IndexOptInfo *) lfirst(l1))->indexoid :
+								  InvalidOid);
+			parts = lappend(parts, one);
+		}
 	}
 
 	base = list_make1(list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS));
@@ -8419,7 +8657,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	base = lappend(base, ints);
 	base = lappend(base, consts);
 	base = lappend(base, ckinds);
-	base = lappend(base, NIL);	/* parts */
+	base = lappend(base, parts);
 	base = lappend(base, whereopnos);
 	base = lappend(base, ors);
 	base = lappend(base, NIL);	/* having */
@@ -8450,17 +8688,14 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 				fj->dimrel->consider_parallel &&
 				is_parallel_safe(root, (Node *) consts));
 
-	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 						  fj->dimpath, 0, nodetarget, base, joinclause,
 						  jointype, rowagg, whereclauses, wherekinds, ors,
 						  dimrows, found,
 						  parallel && fj->dimpath->parallel_safe);
 	if (parallel && fj->jointype == JOIN_UNIQUE_INNER)
 	{
-		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
-														joinclause);
 		Path	   *whole = NULL;
-		double		fkpages;
 		int			workers;
 
 		/*
@@ -8484,14 +8719,17 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 				(whole == NULL || compare_path_costs(p, whole, TOTAL_COST) < 0))
 				whole = p;
 		}
-		fkpages = (double) fkidx->pages *
-			Min(dimrows / lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar), 1.0);
-		workers = compute_parallel_worker(fj->dimrel, -1, fkpages,
+		workers = compute_parallel_worker(fj->dimrel, -1,
+										  fkpages *
+										  Min(dimrows /
+											  lion_fkjoin_fk_ndistinct(root, rel,
+																	   fj->fkvar),
+											  1.0),
 										  max_parallel_workers_per_gather);
 
 		if (whole != NULL && workers > 0 &&
 			!contain_volatile_functions((Node *) fj->dimrel->baserestrictinfo))
-			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 								  whole, workers, nodetarget, base,
 								  joinclause, jointype, rowagg, whereclauses,
 								  wherekinds, ors, dimrows, found, true);
@@ -8499,9 +8737,6 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	else if (parallel && fj->dimrel->partial_pathlist != NIL)
 	{
 		Path	   *partial = (Path *) linitial(fj->dimrel->partial_pathlist);
-		IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(first->whereidx,
-														joinclause);
-		double		fkpages;
 		int			workers;
 
 		/*
@@ -8516,15 +8751,18 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		 * child's parallel scan hands out its rows to however many
 		 * participants come.
 		 */
-		fkpages = (double) fkidx->pages *
-			Min(dimrows / lion_fkjoin_fk_ndistinct(root, rel, fj->fkvar), 1.0);
-		workers = compute_parallel_worker(fj->dimrel, -1, fkpages,
+		workers = compute_parallel_worker(fj->dimrel, -1,
+										  fkpages *
+										  Min(dimrows /
+											  lion_fkjoin_fk_ndistinct(root, rel,
+																	   fj->fkvar),
+											  1.0),
 										  max_parallel_workers_per_gather);
 		if (fj->dimrel->rel_parallel_workers == -1)
 			workers = Max(workers, partial->parallel_workers);
 
 		if (partial->param_info == NULL && workers > 0)
-			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, first,
+			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 								  partial, workers, nodetarget, base,
 								  joinclause, jointype, rowagg, whereclauses,
 								  wherekinds, ors, dimrows, dimrows, true);
@@ -8706,9 +8944,6 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (rte->relkind != RELKIND_PARTITIONED_TABLE)
 			return;
 		if (input_rel->part_scheme == NULL || !IS_PARTITIONED_REL(input_rel))
-			return;
-		/* ... but not as the fact side of a join, in v1 (DESIGN.md §27) */
-		if (fj != NULL)
 			return;
 
 		/*
@@ -11734,7 +11969,42 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinbatches = 0;
 	st->joinlasthave = false;
 	st->joinworkerbatches = 0;
-	if (st->joinwalk)
+	st->joinpart = NULL;
+	st->joinpartcxt = NULL;
+	st->joinvisitcxt = NULL;
+	st->joinrunfilterrows = 0;
+	memset(&st->joinorder, 0, sizeof(st->joinorder));
+
+	/*
+	 * A partitioned fact table's keys are looked up a batch at a time
+	 * whatever the plan says (DESIGN.md §27, "A partitioned fact table"):
+	 * each batch goes to every partition in turn, with a turn of its own and
+	 * a copy of each partition's fact filters kept from batch to batch.
+	 */
+	if (st->joinclause >= 0 && st->npart > 0)
+	{
+		st->joinpart = (LionJoinPart *)
+			palloc0(sizeof(LionJoinPart) * st->npart);
+		st->joinpartcxt = AllocSetContextCreate(estate->es_query_cxt,
+												"LionCount partition copies",
+												ALLOCSET_DEFAULT_SIZES);
+		st->joinvisitcxt = AllocSetContextCreate(estate->es_query_cxt,
+												 "LionCount partition turn",
+												 ALLOCSET_SMALL_SIZES);
+		for (i = 0; i < st->npart; i++)
+		{
+			LionJoinPart *jp = &st->joinpart[i];
+
+			jp->filter.pinbuf = InvalidBuffer;
+			jp->qmode = (LionQueryMode *)
+				palloc0(sizeof(LionQueryMode) * Max(st->nclause, 1));
+			jp->cxt = AllocSetContextCreate(st->joinpartcxt,
+											"LionCount partition copy",
+											ALLOCSET_DEFAULT_SIZES);
+		}
+	}
+
+	if (st->joinwalk || st->joinpart != NULL)
 	{
 		TupleDesc	childdesc = ExecGetResultType(st->child);
 		Form_pg_attribute keyatt;
@@ -15068,18 +15338,26 @@ lion_join_count_key(LionCountScanState *st)
  * workers makes a copy of its own, as a serial plan does.
  */
 static bool
-lion_join_shares_copy(LionCountScanState *st)
+lion_join_shares_copy(LionCountScanState *st, LionSharedCopy *shared)
 {
-	if (st->joinsharedcopy == NULL ||
-		st->css.ss.ps.state->es_query_dsa == NULL)
+	if (shared == NULL || st->css.ss.ps.state->es_query_dsa == NULL)
 		return false;
 	if (IsParallelWorker())
 		return true;
 	return st->joinpcxt != NULL && st->joinpcxt->nworkers_launched > 0;
 }
 
+/*
+ * The copy is made into *out, in memory context cxt, from the relation being
+ * counted, and shared as `shared` says: st->joinfilter in outercxt for a
+ * plain table, and each leaf partition's own copy for a partitioned one
+ * (lion_join_part_open()), held for the whole run, all of them within the
+ * one hash table's memory `budget` leaves them.
+ */
 static void
-lion_join_collect(LionCountScanState *st)
+lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
+					   MemoryContext cxt, LionSharedCopy *shared,
+					   bool *viewshared, Size budget)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
@@ -15127,8 +15405,8 @@ lion_join_collect(LionCountScanState *st)
 	INSTR_TIME_SET_ZERO(t);
 	lion_join_clock(st, -1, &t);
 	memset(&cstats, 0, sizeof(cstats));
-	oldcxt = MemoryContextSwitchTo(st->outercxt);
-	if (lion_join_shares_copy(st))
+	oldcxt = MemoryContextSwitchTo(cxt);
+	if (lion_join_shares_copy(st, shared))
 	{
 		int			chunks;
 		bool		built;
@@ -15137,12 +15415,11 @@ lion_join_collect(LionCountScanState *st)
 		 * The participant that indexed the copy counts it, and its spill,
 		 * once for all of them; each counts the chunks it collected.
 		 */
-		lion_shared_copy_collect(st->joinsharedcopy,
-								 estate->es_query_dsa, st->heap,
+		lion_shared_copy_collect(shared, estate->es_query_dsa, st->heap,
 								 estate->es_snapshot, st->nitem,
-								 &st->sources[1], &st->joinfilter, &chunks,
+								 &st->sources[1], out, &chunks,
 								 &built, &spilled, &cstats);
-		st->joinviewshared = true;
+		*viewshared = true;
 		st->joincopychunks += chunks;
 		if (built)
 			st->joincopies++;
@@ -15152,8 +15429,8 @@ lion_join_collect(LionCountScanState *st)
 	}
 	else
 		ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
-								  &st->sources[1], get_hash_memory_limit(),
-								  true, &st->joinfilter, &spilled, &cstats);
+								  &st->sources[1], budget,
+								  true, out, &spilled, &cstats);
 	MemoryContextSwitchTo(oldcxt);
 	lion_join_clock(st, LION_JT_COLLECT, &t);
 
@@ -15171,7 +15448,14 @@ lion_join_collect(LionCountScanState *st)
 		return;
 
 	st->joinfiltered = true;
-	st->joinfilterrows = (int64) st->joinfilter.ntids;
+	if (st->npart > 0)
+	{
+		/* a partitioned fact table's copies are one per partition: summed */
+		st->joinrunfilterrows += (int64) out->ntids;
+		st->joinfilterrows = st->joinrunfilterrows;
+	}
+	else
+		st->joinfilterrows = (int64) out->ntids;
 	if (spilled)
 		st->joinspilled++;
 
@@ -15185,7 +15469,7 @@ lion_join_collect(LionCountScanState *st)
 	lion_unpin_where(st);
 
 	/* The filters select no row at all: as a clause with no entry does. */
-	if (!st->joinfilter.found)
+	if (!out->found)
 	{
 		st->wheremissing = true;
 		return;
@@ -15195,7 +15479,15 @@ lion_join_collect(LionCountScanState *st)
 	st->joinsources[0].nsets = 1;
 	st->joinsources[0].sets = &st->groupset;
 	st->joinsources[1].nsets = 1;
-	st->joinsources[1].sets = &st->joinfilter;
+	st->joinsources[1].sets = out;
+}
+
+static void
+lion_join_collect(LionCountScanState *st)
+{
+	lion_join_collect_into(st, &st->joinfilter, st->outercxt,
+						   st->joinsharedcopy, &st->joinviewshared,
+						   get_hash_memory_limit());
 }
 
 /*
@@ -15455,10 +15747,14 @@ lion_join_fill_batch(LionCountScanState *st)
 		ent->isnull = isnull;
 		ent->key = (Datum) 0;
 		ent->hash = 0;
+		ent->acc = 0;
 		if (!isnull)
 		{
 			ent->key = datumCopy(key, st->joinkeybyval, st->joinkeylen);
-			ent->hash = lion_lookup_walk_hash(&st->joinwalker, ent->key);
+
+			/* a partitioned fact table sorts it for each partition's walk */
+			if (st->joinpart == NULL)
+				ent->hash = lion_lookup_walk_hash(&st->joinwalker, ent->key);
 		}
 		ent->tuple = st->joinunique ? NULL : ExecCopySlotMinimalTuple(slot);
 		MemoryContextSwitchTo(oldcxt);
@@ -15469,7 +15765,7 @@ lion_join_fill_batch(LionCountScanState *st)
 	if (n == 0)
 		return false;
 	st->joinbatches++;
-	if (n > 1)
+	if (n > 1 && st->joinpart == NULL)
 		qsort_arg(st->joinbatch, n, sizeof(LionJoinEnt), lion_join_ent_cmp,
 				  &st->joinwalker);
 	return true;
@@ -15696,6 +15992,286 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 }
 
 /*
+ * A PARTITIONED FACT TABLE (DESIGN.md §27, "A partitioned fact table").  The
+ * join's count for one dimension row is its count over the fact's rows, which
+ * are the rows of the fact's leaf partitions - the ones the planner kept - so
+ * it is the SUM of the row's counts in each of them: every key is looked up in
+ * every partition's fk index and counted against that partition's own fact
+ * filters.  A semi join's row joins when any partition has a match, and an
+ * anti join's when none has; both are that sum compared with zero.
+ *
+ * The keys are read a batch at a time - the batches of "Lookups in key order",
+ * whatever the plan says of the walk - and each batch is taken to the leaf
+ * partitions in turn: a partition is opened, its fk index walked (or descended
+ * into) for every key of the batch, each key's count added into the key's own
+ * entry, and the partition closed before the next one is opened, so that no
+ * partition's pin outlives its turn (DESIGN.md §16).  A key that has matched
+ * in one partition is not looked up again by an existence test.  Only when
+ * every partition has had the batch are its rows handed up, each with its
+ * sum; the node hands up no row with a partition open.
+ *
+ * Each partition is its own table in everything §9 asks: its own heap and
+ * visibility map, its own pins, and a count only ever beside its own fk set,
+ * located under its own pin.  Its fact filters - without the ones its bounds
+ * imply (§16) - are located at its first turn and, where the plan collects
+ * them, copied then into a copy of its own (lion_join_part_open()), which the
+ * later batches read: the copy is made after the snapshot was taken, and is
+ * counted only beside this partition's fk sets, which is all "Why a stale copy
+ * is safe" asks of it.  The copies stay for the run, within one hash table's
+ * memory between them, and spill past it.
+ */
+
+/*
+ * Leaf partition p's turn begins: the partition opened, its fk index's walk
+ * begun, and its fact filters located - or, once they were collected, its copy
+ * of them made the filters of every count again, with the row filter its
+ * multi-key clauses need rebuilt from what they made of this run's values.
+ */
+static void
+lion_join_part_open(LionCountScanState *st, int p)
+{
+	LionJoinPart *jp = &st->joinpart[p];
+	LionClauseState *jcl = &st->clause[st->joinclause];
+	MemoryContext oldcxt;
+	int			i;
+
+	lion_open_relation(st, st->part[p].heapoid, InvalidOid, InvalidOid,
+					   st->part[p].clauseidxoid);
+
+	oldcxt = MemoryContextSwitchTo(st->joinvisitcxt);
+	lion_lookup_walk_begin(&st->joinwalker, jcl->idx, jcl->idxcol,
+						   jcl->valtype);
+	MemoryContextSwitchTo(oldcxt);
+	st->joinwalkbegun = true;
+	st->joinlasthave = false;
+	st->joinfiltered = false;
+
+	if (jp->collected && jp->filtered)
+	{
+		/* the copy is named after an index the partition has reopened */
+		jp->filter.index = NULL;
+		for (i = 0; i < st->nclause; i++)
+		{
+			if (st->clause[i].idx != NULL &&
+				RelationGetRelid(st->clause[i].idx) == jp->filterindex)
+			{
+				jp->filter.index = st->clause[i].idx;
+				break;
+			}
+		}
+		if (jp->filter.index == NULL)
+			elog(ERROR, "LionCount: a partition's copy of its fact filters has no index");
+
+		for (i = 0; i < st->nclause; i++)
+			st->clause[i].qmode = jp->qmode[i];
+		lion_build_filter(st);
+		st->located = true;
+		st->wheremissing = jp->missing;
+		st->joinfiltered = true;
+		memset(st->joinsources, 0, sizeof(st->joinsources));
+		st->joinsources[0].nsets = 1;
+		st->joinsources[0].sets = &st->groupset;
+		st->joinsources[1].nsets = 1;
+		st->joinsources[1].sets = &jp->filter;
+		return;
+	}
+
+	lion_locate_where(st);
+	if (jp->collected)
+		return;					/* probed, and located again each turn */
+
+	jp->collected = true;
+	for (i = 0; i < st->nclause; i++)
+		jp->qmode[i] = st->clause[i].qmode;
+	if (st->joincollect)
+	{
+		Size		limit = get_hash_memory_limit();
+		Size		held = MemoryContextMemAllocated(st->joinpartcxt, true);
+
+		lion_join_collect_into(st, &jp->filter, jp->cxt, jp->shared,
+							   &jp->viewshared,
+							   (held < limit) ? limit - held : 0);
+		jp->filtered = st->joinfiltered;
+		if (jp->filtered && jp->filter.index != NULL)
+			jp->filterindex = RelationGetRelid(jp->filter.index);
+	}
+	jp->missing = st->wheremissing;
+}
+
+/* ... and ends: everything it located let go of, and the partition closed. */
+static void
+lion_join_part_close(LionCountScanState *st)
+{
+	if (st->joinwalkbegun)
+	{
+		lion_lookup_walk_pause(&st->joinwalker);
+		st->joinwalkbegun = false;
+	}
+	lion_posting_set_release(&st->groupset);
+	lion_release_where(st);
+	st->joinfiltered = false;
+	memset(st->joinsources, 0, sizeof(st->joinsources));
+	lion_close_relation(st);
+	MemoryContextReset(st->joinvisitcxt);
+}
+
+/*
+ * The batch into the order the partition's walk takes its keys in - unless
+ * it is in that order already, as it is for every partition after the first
+ * whose fk index orders its keys the same way (lion_walk_order_equal()).
+ */
+static void
+lion_join_part_sort(LionCountScanState *st)
+{
+	LionWalkOrder order;
+	int			k;
+
+	lion_lookup_walk_order(&st->joinwalker, &order);
+	if (lion_walk_order_equal(&order, &st->joinorder))
+		return;
+	for (k = 0; k < st->joinbatchn; k++)
+	{
+		LionJoinEnt *ent = &st->joinbatch[k];
+
+		if (!ent->isnull)
+			ent->hash = lion_lookup_walk_hash(&st->joinwalker, ent->key);
+	}
+	if (st->joinbatchn > 1)
+		qsort_arg(st->joinbatch, st->joinbatchn, sizeof(LionJoinEnt),
+				  lion_join_ent_cmp, &st->joinwalker);
+	st->joinorder = order;
+}
+
+/*
+ * Every partition's turn with the batch just read: each key looked up and
+ * counted in each partition, and the counts added up in the key's entry.  An
+ * existence test - a semi or anti join, the rows of a count(DISTINCT) - needs
+ * one match, and a key that has one is not looked up in the partitions after.
+ * A partition whose fact filters select nothing has no turn.
+ */
+static void
+lion_join_count_parts(LionCountScanState *st)
+{
+	bool		exists = (st->jointype != LION_JOIN_INNER ||
+						  (st->joinrows && !st->joincounts));
+	MemoryContext oldcxt;
+	int			p;
+	int			k;
+
+	for (p = 0; p < st->npart; p++)
+	{
+		bool		walked;
+
+		CHECK_FOR_INTERRUPTS();
+		lion_join_part_open(st, p);
+		if (st->wheremissing)
+		{
+			lion_join_part_close(st);
+			continue;
+		}
+		walked = (st->joinwalk && lion_lookup_walk_ordered(&st->joinwalker));
+		if (walked)
+			lion_join_part_sort(st);
+
+		for (k = 0; k < st->joinbatchn; k++)
+		{
+			LionJoinEnt *ent = &st->joinbatch[k];
+			bool		found;
+			int64		count;
+
+			if (ent->isnull || (exists && ent->acc > 0))
+				continue;
+			CHECK_FOR_INTERRUPTS();
+			st->joinlookups++;
+
+			if (st->joinlasthave &&
+				datumIsEqual(ent->key, st->joinlastkey, st->joinkeybyval,
+							 st->joinkeylen))
+			{
+				found = st->joinlastfound;
+				count = st->joinlastcount;
+			}
+			else
+			{
+				instr_time	t;
+
+				INSTR_TIME_SET_ZERO(t);
+				lion_join_clock(st, -1, &t);
+				MemoryContextReset(st->pergroup);
+				oldcxt = MemoryContextSwitchTo(st->pergroup);
+				found = walked ?
+					lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
+										  &st->groupset) :
+					lion_lookup_walk_descend(&st->joinwalker, ent->key,
+											 &st->groupset);
+				lion_join_clock(st, LION_JT_LOOKUP, &t);
+				count = found ? lion_join_count_key(st) : 0;
+				lion_posting_set_release(&st->groupset);
+				MemoryContextSwitchTo(oldcxt);
+				lion_join_clock(st, LION_JT_COUNT, &t);
+
+				st->joinlasthave = true;
+				st->joinlastkey = ent->key;
+				st->joinlastfound = found;
+				st->joinlastcount = count;
+			}
+			if (!found)
+				st->joinmissing++;
+			ent->acc += count;
+		}
+		lion_join_part_close(st);
+	}
+}
+
+/*
+ * lion_join_next_row() for a partitioned fact table: the same rows, each with
+ * its counts summed over the partitions (lion_join_count_parts()).  A NULL
+ * key joins nothing, in any partition.
+ */
+static bool
+lion_join_next_parts(LionCountScanState *st, int64 *countp)
+{
+	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	bool		exists = (st->jointype != LION_JOIN_INNER ||
+						  (st->joinrows && !st->joincounts));
+
+	for (;;)
+	{
+		LionJoinEnt *ent;
+		int64		count;
+
+		CHECK_FOR_INTERRUPTS();
+		if (st->joinbatchpos >= st->joinbatchn)
+		{
+			if (!lion_join_fill_batch(st))
+			{
+				lion_join_batch_reset(st);
+				return false;
+			}
+			memset(&st->joinorder, 0, sizeof(st->joinorder));
+			lion_join_count_parts(st);
+		}
+		ent = &st->joinbatch[st->joinbatchpos++];
+
+		if (ent->isnull)
+			count = anti ? 1 : 0;
+		else if (anti)
+			count = (ent->acc == 0) ? 1 : 0;
+		else if (exists)
+			count = (ent->acc > 0) ? 1 : 0;
+		else
+			count = ent->acc;
+		if (count == 0)
+			continue;
+
+		if (!st->joinsum)
+			lion_join_batch_row(st, ent);
+		*countp = count;
+		return true;
+	}
+}
+
+/*
  * The FK-side join's next row (DESIGN.md §27): one PARTIAL row per dimension
  * row with fact rows - its dimension columns and its count - which core's
  * Finalize Agg above groups by the dimension columns and adds up, the join's
@@ -15726,6 +16302,32 @@ lion_next_join_row(LionCountScanState *st)
 	bool		walked = false;
 	int64		count;
 	MemoryContext oldcxt;
+
+	/* a partitioned fact table: every batch to every partition in turn */
+	if (st->joinpart != NULL)
+	{
+		if (st->joinunique && !st->joinsortdone)
+			lion_join_sort_keys(st);
+		if (st->joinsum)
+		{
+			int64		total = 0;
+
+			while (lion_join_next_parts(st, &count))
+				total += count;
+			st->done = true;
+			st->childslot = NULL;
+			if (total == 0)
+				return NULL;
+			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true,
+								   total);
+		}
+		if (!lion_join_next_parts(st, &count))
+		{
+			st->done = true;
+			return NULL;
+		}
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
+	}
 
 	if (!st->joincollected)
 		lion_join_collect(st);
@@ -16081,9 +16683,13 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	if (!st->valsdone)
 		lion_eval_clause_values(st);
 
-	/* A partitioned table counts one partition at a time. */
+	/*
+	 * A partitioned table counts one partition at a time - and the FK-side
+	 * join over one takes each batch of keys to every partition in turn.
+	 */
 	if (st->npart > 0)
-		return lion_exec_partitioned(st);
+		return (st->joinclause >= 0) ? lion_next_join_row(st) :
+			lion_exec_partitioned(st);
 
 	if (!st->located)
 		lion_locate_where(st);
@@ -16209,6 +16815,25 @@ lion_reset_run(LionCountScanState *st)
 	st->joinfiltered = false;
 	st->joinviewshared = false;
 
+	/* ... or a partitioned fact table's, one copy per partition */
+	if (st->joinpart != NULL)
+	{
+		for (i = 0; i < st->npart; i++)
+		{
+			LionJoinPart *jp = &st->joinpart[i];
+
+			lion_posting_set_release(&jp->filter);
+			memset(&jp->filter, 0, sizeof(jp->filter));
+			jp->filter.pinbuf = InvalidBuffer;
+			jp->collected = false;
+			jp->filtered = false;
+			jp->missing = false;
+			jp->viewshared = false;
+			MemoryContextReset(jp->cxt);
+		}
+		st->joinrunfilterrows = 0;
+	}
+
 	/* ... and a forward semi join's sorted keys, sorted again next run. */
 	if (st->joinsort != NULL)
 	{
@@ -16230,6 +16855,8 @@ lion_reset_run(LionCountScanState *st)
 
 	if (st->npart > 0)
 		lion_close_relation(st);
+	if (st->joinvisitcxt != NULL)
+		MemoryContextReset(st->joinvisitcxt);
 
 	if (st->pergroup != NULL)
 		MemoryContextReset(st->pergroup);
@@ -16309,7 +16936,35 @@ lion_rescan_custom_scan(CustomScanState *node)
 static Size
 lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
-	return MAXALIGN(sizeof(LionJoinShared)) + lion_shared_copy_size();
+	LionCountScanState *st = (LionCountScanState *) node;
+
+	return MAXALIGN(sizeof(LionJoinShared)) +
+		(Size) ((st->joincollect && st->npart > 0) ? st->npart : 1) *
+		lion_shared_copy_size();
+}
+
+/*
+ * The heap blocks of each leaf partition of a partitioned fact table, which
+ * its shared copy's chunks are cut from - opened for the moment it takes to
+ * ask, in the leader, which holds the lock the executor took on each of them.
+ */
+static BlockNumber *
+lion_join_part_blocks(LionCountScanState *st, double *total)
+{
+	BlockNumber *blocks = (BlockNumber *) palloc(sizeof(BlockNumber) *
+												 Max(st->npart, 1));
+	int			p;
+
+	*total = 0;
+	for (p = 0; p < st->npart; p++)
+	{
+		Relation	heap = table_open(st->part[p].heapoid, NoLock);
+
+		blocks[p] = RelationGetNumberOfBlocks(heap);
+		table_close(heap, NoLock);
+		*total += (double) blocks[p];
+	}
+	return blocks;
 }
 
 static void
@@ -16342,7 +16997,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 * launched whether any of them started.
 	 */
 	st->joinpcxt = pcxt;
-	if (st->joincollect && pcxt->seg != NULL)
+	if (st->joincollect && pcxt->seg != NULL && st->joinpart == NULL)
 	{
 		lion_shared_copy_init(LION_JOIN_SHARED_COPY(shared), pcxt->seg,
 							  shared->participants,
@@ -16350,6 +17005,33 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 							  RelationGetNumberOfBlocks(st->heap));
 		shared->copyready = true;
 		st->joinsharedcopy = LION_JOIN_SHARED_COPY(shared);
+	}
+
+	/*
+	 * A partitioned fact table has a copy per leaf partition, each collected
+	 * by the participants together when they first take a batch to it; the
+	 * memory a Parallel Hash would have is divided among them by their heaps'
+	 * sizes, and past its share each copy's chunks go to its own files.
+	 */
+	if (st->joincollect && pcxt->seg != NULL && st->joinpart != NULL)
+	{
+		Size		memory = get_hash_memory_limit() * (Size) shared->participants;
+		double		total;
+		BlockNumber *blocks = lion_join_part_blocks(st, &total);
+		int			p;
+
+		for (p = 0; p < st->npart; p++)
+		{
+			double		frac = (total > 0) ? (double) blocks[p] / total :
+				1.0 / st->npart;
+
+			lion_shared_copy_init(LION_JOIN_SHARED_PART_COPY(shared, p),
+								  pcxt->seg, shared->participants,
+								  (Size) ((double) memory * frac), blocks[p]);
+			st->joinpart[p].shared = LION_JOIN_SHARED_PART_COPY(shared, p);
+		}
+		pfree(blocks);
+		shared->copyready = true;
 	}
 }
 
@@ -16392,6 +17074,31 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 								node->ss.ps.state->es_query_dsa,
 								RelationGetNumberOfBlocks(st->heap));
 	}
+
+	/* ... one per leaf partition of a partitioned fact table */
+	if (st->joinpart != NULL && shared->copyready)
+	{
+		double		total;
+		BlockNumber *blocks = lion_join_part_blocks(st, &total);
+		int			p;
+
+		for (p = 0; p < st->npart; p++)
+		{
+			LionJoinPart *jp = &st->joinpart[p];
+
+			if (jp->viewshared)
+			{
+				lion_posting_set_release(&jp->filter);
+				jp->viewshared = false;
+				jp->filtered = false;
+				jp->collected = false;
+			}
+			lion_shared_copy_reinit(jp->shared,
+									node->ss.ps.state->es_query_dsa,
+									blocks[p]);
+		}
+		pfree(blocks);
+	}
 }
 
 static void
@@ -16403,10 +17110,23 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 	lion_list_pin_participants(st->joinshared->participants);
 
 	/* the fact filters' copy, and the file set its chunks may spill to */
-	if (st->joinshared->copyready)
+	if (st->joinshared->copyready && st->joinpart == NULL)
 	{
 		st->joinsharedcopy = LION_JOIN_SHARED_COPY(st->joinshared);
 		lion_shared_copy_attach(st->joinsharedcopy);
+	}
+
+	/* ... or each leaf partition's */
+	if (st->joinshared->copyready && st->joinpart != NULL)
+	{
+		int			p;
+
+		for (p = 0; p < st->npart; p++)
+		{
+			st->joinpart[p].shared =
+				LION_JOIN_SHARED_PART_COPY(st->joinshared, p);
+			lion_shared_copy_attach(st->joinpart[p].shared);
+		}
 	}
 }
 
@@ -16438,6 +17158,23 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	{
 		lion_posting_set_release(&st->joinfilter);
 		st->joinviewshared = false;
+	}
+	if (st->joinpart != NULL)
+	{
+		int			p;
+
+		for (p = 0; p < st->npart; p++)
+		{
+			LionJoinPart *jp = &st->joinpart[p];
+
+			if (jp->viewshared)
+			{
+				lion_posting_set_release(&jp->filter);
+				jp->viewshared = false;
+				jp->filtered = false;
+				jp->collected = false;
+			}
+		}
 	}
 
 	if (IsParallelWorker())
@@ -16547,6 +17284,17 @@ lion_end_custom_scan(CustomScanState *node)
 		MemoryContextDelete(st->joinbatchcxt);
 		st->joinbatchcxt = NULL;
 	}
+	if (st->joinvisitcxt != NULL)
+	{
+		MemoryContextDelete(st->joinvisitcxt);
+		st->joinvisitcxt = NULL;
+	}
+	if (st->joinpartcxt != NULL)
+	{
+		MemoryContextDelete(st->joinpartcxt);
+		st->joinpartcxt = NULL;
+	}
+	st->joinpart = NULL;
 	if (st->viscache != NULL)
 	{
 		lion_vis_cache_destroy(st->viscache);
@@ -16833,8 +17581,11 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	{
 		LionClauseState *cl = &st->clause[st->joinclause];
 
-		appendStringInfo(&buf, "%s%s (", get_rel_name(cl->idxoid),
-						 lion_explain_clause_col(cl));
+		/* a partitioned fact table's fk index is one per partition (§16) */
+		if (st->npart == 0)
+			appendStringInfo(&buf, "%s%s ", get_rel_name(cl->idxoid),
+							 lion_explain_clause_col(cl));
+		appendStringInfoChar(&buf, '(');
 		lion_explain_clause(st, cl, ancestors, es, &buf);
 		appendStringInfoChar(&buf, ')');
 	}
