@@ -5859,6 +5859,19 @@ after the visit; pages visited after the last removal of an ambulkdelete are
 dropped (every dead TID of the cycle has been removed by then, and a TID that
 moved off a page later in the walk moved onto a page later still).
 
+Redo takes only the barrier blocks that are in shared buffers (2026-09-27
+review). A reader that still pins a page it copied containers out of keeps
+that page's buffer from being evicted, so a block the buffer mapping does not
+have has no reader to wait for; redo looks each one up there
+(`lion_redo_resident_buffer()`, the lookup `PrefetchSharedBuffer()` makes
+before it starts a read of a block it misses) and pins it with
+`ReadRecentBuffer()` only when it is there and valid. A reader that pins the
+block after the lookup copies the page as replay has left it, which is the
+position of a reader that pins a resident block the moment the barrier lets go
+of it. Before, the barrier read every block with `XLogReadBufferExtended()`,
+and the ranges of one sparse VACUUM cover nearly the whole index: its replay
+read nearly all of it, synchronously, a block at a time.
+
 Redo. `lion_redo()` reads the header, applies the barrier if there is one, then
 takes each registered block in the order the record lists it, with
 RBM_ZERO_AND_LOCK for a block in `initmask` and `get_cleanup_lock = true` for a
@@ -6286,8 +6299,8 @@ barrier of 7,488 blocks in 11,960 bytes, 0.15% of its 7.8 MB of index WAL, and
 still no stand-alone record. The generic arm writes no barrier (a generic-mode
 standby rechecks every TID, §9) and pays only for the cleanup locks of the
 posting-tree descents, which are not measurable here. Replay pays one buffer
-lookup and one uncontended cleanup lock per barrier block, and only in hot
-standby.
+lookup per barrier block and one uncontended cleanup lock per barrier block in
+shared buffers, and only in hot standby.
 
 ## 26. `count(DISTINCT k)` in the pushdown (v1, implemented)
 
