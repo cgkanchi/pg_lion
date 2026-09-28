@@ -900,6 +900,72 @@ lion_wal_abort(LionWalState *state)
  */
 static PGAlignedBlock lion_redo_scratch;
 
+/*
+ * The item a replayed call (LION_OP_CONTAINER_ADD, LION_OP_SPARSE_INS) works
+ * on in place, checked the way the writer checked it before logging the call
+ * (lion_insert_container_inplace(), lion_insert_segment_inplace()): an item
+ * of the page, of a kind the call is for, whose allotted length has room for
+ * everything the call can write (lion_container.h and lion_sparse.h, "growth
+ * in place"), and a member in range.  The operations that patch an item's
+ * bytes check their item as well (LION_OP_DELTA, LION_OP_SETBYTES); a record
+ * that fails this was not written against this page, and replaying it would
+ * write past the item.
+ */
+static LionContainer *
+lion_redo_inplace_item(Page page, const xl_lion_op *op, BlockNumber blkno)
+{
+	ItemId		iid;
+	LionContainer *item;
+	Size		alloc;
+	Size		need = 0;		/* 0: the call cannot be made in place */
+
+	if (op->off < FirstOffsetNumber || op->off > PageGetMaxOffsetNumber(page))
+		elog(PANIC, "pg_lion: in-place operation %u for item %u past the end of block %u",
+			 op->op, op->off, blkno);
+	iid = PageGetItemId(page, op->off);
+	alloc = ItemIdGetLength(iid);
+
+	/* every item that can grow in place has a member, so a count after it */
+	if (!ItemIdHasStorage(iid) || alloc < LION_CONTAINER_HDRSZ + sizeof(uint16))
+		elog(PANIC, "pg_lion: in-place operation %u for unused item %u on block %u",
+			 op->op, op->off, blkno);
+	if ((uint32) op->aux >= LION_CONTAINER_RANGE)
+		elog(PANIC, "pg_lion: in-place operation %u adds member %u to item %u on block %u, past the container range",
+			 op->op, op->aux, op->off, blkno);
+
+	item = (LionContainer *) PageGetItem(page, iid);
+	if (op->op == LION_OP_SPARSE_INS)
+	{
+		if (item->type == LION_CT_SPARSE &&
+			item->cardinality < LION_SPARSE_MAX_PAIRS)
+			need = lion_sparse_size(item) + LION_SPARSE_PAIR_SIZE;
+	}
+	else
+	{
+		switch (item->type)
+		{
+			case LION_CT_BITSET:
+				need = LION_CONTAINER_MAX_SIZE;
+				break;
+			case LION_CT_ARRAY:
+				if (item->cardinality < LION_ARRAY_MAX_CARD)
+					need = lion_container_size(item) + sizeof(uint16);
+				break;
+			case LION_CT_RUN:
+				if (LION_RUN_NRUNS(item) < LION_RUN_MAX_NRUNS)
+					need = lion_container_size(item) + sizeof(LionRun);
+				break;
+			default:
+				break;
+		}
+	}
+	if (need == 0 || alloc < need)
+		elog(PANIC, "pg_lion: item %u on block %u (type %u, %zu bytes) cannot take in-place operation %u",
+			 op->off, blkno, item->type, alloc, op->op);
+
+	return item;
+}
+
 static void
 lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 {
@@ -1129,8 +1195,7 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 
 			case LION_OP_CONTAINER_ADD:
 				{
-					LionContainer *c = (LionContainer *)
-						PageGetItem(page, PageGetItemId(page, op.off));
+					LionContainer *c = lion_redo_inplace_item(page, &op, blkno);
 
 					if (!lion_container_add(c, op.aux))
 						elog(PANIC, "pg_lion: could not add member %u to the item at %u on block %u",
@@ -1140,8 +1205,7 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 
 			case LION_OP_SPARSE_INS:
 				{
-					LionContainer *s = (LionContainer *)
-						PageGetItem(page, PageGetItemId(page, op.off));
+					LionContainer *s = lion_redo_inplace_item(page, &op, blkno);
 					uint32		ckey;
 					bool		dup = false;
 
