@@ -207,6 +207,22 @@ _PG_init(void)
 							GUC_UNIT_KB | GUC_NOT_IN_SAMPLE,
 							NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §10, "A GROUP BY in parallel": the fewest container keys a
+	 * range of a parallel count covers - a parallel GROUP BY's, and a chunk of
+	 * the FK-side join's shared copy (§27).  A testing knob: the regression
+	 * suite lowers it to cut a table of a few megabytes into several ranges,
+	 * and the planner prices the ranges of the default width whatever it says.
+	 */
+	DefineCustomIntVariable("pg_lion.parallel_range_keys",
+							"Fewest container keys a range of a parallel lion count covers.",
+							"A container key is 64 heap blocks; every range walks the groups' entries again.",
+							&lion_parallel_range_keys,
+							LION_PARALLEL_RANGE_KEYS, 1, INT_MAX,
+							PGC_USERSET,
+							GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_count_pushdown",
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
 							 NULL,

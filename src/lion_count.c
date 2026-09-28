@@ -298,7 +298,8 @@ typedef struct LionCollect
 	/*
 	 * A chunk of the intersection only (ranged): its container keys from lo
 	 * up to, not including, hi - what one participant of a parallel plan
-	 * collects of a shared copy (LionSharedCopy).
+	 * collects of a shared copy (LionSharedCopy), or of the WHERE of a
+	 * parallel GROUP BY for one range of keys (lion_sources_collect_range()).
 	 */
 	bool		ranged;
 	uint32		lo;
@@ -2841,9 +2842,23 @@ lion_inline_stage_size(Size paylen)
 	return MAXALIGN(Min(size, LION_CONTAINER_MAX_SIZE));
 }
 
+static void lion_inline_skip(const char *payload, Size paylen, Size *off,
+							 uint32 target, LionContainer *buf);
+
+/*
+ * A cursor over `set`, standing at its first container whose key is at or
+ * above `target` - lion_cursor_seek() from nothing in hand: a CHAIN set's
+ * first leaf comes from a descent for that key rather than for key 0 and the
+ * leaves between.  Nothing below the target is read, so nothing of it is
+ * counted or pinned (§9 asks nothing of it).  `image` is where a CHAIN set's
+ * leaves are copied to, the caller's to keep - a walk that sets up many
+ * cursors again and again gives each the same one every time - or NULL for
+ * one of the cursor's own.
+ */
 static void
-lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx,
-				 bool droppins)
+lion_cursor_init_at(LionSetCursor *cur, const LionPostingSet *set,
+					LionCountCtx *cx, bool droppins, uint32 target,
+					PGAlignedBlock *image)
 {
 	memset(cur, 0, sizeof(LionSetCursor));
 	cur->set = set;
@@ -2851,6 +2866,7 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	cur->pinbuf = InvalidBuffer;
 	cur->nextblk = InvalidBlockNumber;
 	cur->droppins = droppins || cx->droppins;
+	cur->mintarget = target;
 
 	if (!set->found)
 		return;
@@ -2859,6 +2875,11 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		/* a private copy: nothing to pin, nothing to walk */
 		cur->matidx = 0;
+		if (target > 0)
+		{
+			cx->stats.copy_seeks++;
+			cur->matidx = lion_mat_seek(set->mat, 0, target);
+		}
 
 		/* ... and when it is spilled, a container at a time is read back */
 		if (lion_mat_spills(set->mat))
@@ -2869,6 +2890,9 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		cur->cbuf = (LionContainer *) palloc(lion_inline_stage_size(set->paylen));
 		cur->payoff = 0;
+		if (target > 0)
+			lion_inline_skip(set->payload, set->paylen, &cur->payoff, target,
+							 cur->cbuf);
 		/* borrowed, not owned: the LionPostingSet releases it */
 		cur->pinbuf = set->pinbuf;
 		cur->ownpin = false;
@@ -2877,15 +2901,17 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		/*
 		 * The entry's head block is the ROOT of the posting tree (DESIGN.md
-		 * §22), so the first leaf comes from a descent for container key 0 -
-		 * which is also how a root push-down cannot be raced: the descent
-		 * hands back a page that WAS a leaf under the lock it read it with.
+		 * §22), so the first leaf comes from a descent for the first key
+		 * wanted - which is also how a root push-down cannot be raced: the
+		 * descent hands back a page that WAS a leaf under the lock it read it
+		 * with.
 		 */
-		cur->imgbuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+		cur->imgbuf = (image != NULL) ? image :
+			(PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 		cur->img = (Page) cur->imgbuf->data;
 		cur->nextblk = InvalidBlockNumber;
 		cur->descend = true;
-		cur->seekckey = 0;
+		cur->seekckey = target;
 
 		/*
 		 * Test hook: the entry has been copied and its leaf released, and
@@ -2898,6 +2924,14 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	}
 
 	lion_cursor_next(cur);
+}
+
+/* A cursor over `set`, standing at its first container. */
+static void
+lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx,
+				 bool droppins)
+{
+	lion_cursor_init_at(cur, set, cx, droppins, 0, NULL);
 }
 
 /*
@@ -5916,11 +5950,10 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		}
 	}
 
-	lion_cursor_init(&cur, ps, cx, false);
-
-	/* a chunk of a shared copy: from its first key, up to its end */
-	if (cx->collect != NULL && cx->collect->ranged)
-		lion_cursor_seek(&cur, cx->collect->lo);
+	/* a chunk of a collection (ranged): from its first key, up to its end */
+	lion_cursor_init_at(&cur, ps, cx, false,
+						(cx->collect != NULL && cx->collect->ranged) ?
+						cx->collect->lo : 0, NULL);
 	while (cur.valid)
 	{
 		if (lion_collect_past(cx, cur.cur->ckey))
@@ -7374,11 +7407,52 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * way it would otherwise fall back to seeks every source at every container
  * key of every located set it is counted beside - for a long IN list among
  * the sources, a union of all its sets built again for each of them.
+ *
+ * It returns false as well where no source has a found set to copy from.
  */
+static bool lion_sources_collect_keys(Relation heap, Snapshot snapshot,
+									  int nsources, LionCountSource *sources,
+									  Size maxbytes, bool spill, bool ranged,
+									  uint32 lo, uint64 hi,
+									  LionPostingSet *out, bool *spilled,
+									  LionCountStats *stats);
+
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 					 LionCountSource *sources, Size maxbytes, bool spill,
 					 LionPostingSet *out, bool *spilled, LionCountStats *stats)
+{
+	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
+									 maxbytes, spill, false, 0, 0,
+									 out, spilled, stats);
+}
+
+/*
+ * The same copy of the container keys from lo up to, not including, hi alone
+ * (LION_KEYS_END: every key from lo on) - one range of lion_key_ranges()'s
+ * cut, which one participant of a parallel GROUP BY counts its groups against
+ * (DESIGN.md §10, "A GROUP BY in parallel").  The sources are sought to lo and
+ * the merge stops at hi, as for a chunk of a shared copy (LionCollect.ranged);
+ * what it holds is the whole copy's containers at those keys, on the same
+ * terms.
+ */
+bool
+lion_sources_collect_range(Relation heap, Snapshot snapshot, int nsources,
+						   LionCountSource *sources, Size maxbytes, bool spill,
+						   uint32 lo, uint64 hi, LionPostingSet *out,
+						   bool *spilled, LionCountStats *stats)
+{
+	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
+									 maxbytes, spill, true, lo, hi,
+									 out, spilled, stats);
+}
+
+static bool
+lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
+						  LionCountSource *sources, Size maxbytes, bool spill,
+						  bool ranged, uint32 lo, uint64 hi,
+						  LionPostingSet *out, bool *spilled,
+						  LionCountStats *stats)
 {
 	LionCollect col;
 	LionMatSet *mat;
@@ -7413,6 +7487,9 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	col.cxt = CurrentMemoryContext;
 	col.maxbytes = maxbytes;
 	col.spill = spill;
+	col.ranged = ranged;
+	col.lo = lo;
+	col.hi = hi;
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
@@ -7639,12 +7716,18 @@ lion_count_groups_batch(Relation index)
  * the groups sought past such keys let go of what they held there: no answer
  * rests on it.  Each group keeps its own recheck queue, as its count did, and
  * they share the visibility cache as the counts did.
+ *
+ * `images`, when not NULL, is ngroups page images of the caller's that the
+ * groups' cursors copy their leaves to, so that a caller walking batch after
+ * batch - a parallel GROUP BY's ranges above all - does not allocate and free
+ * a page for every group every time.
  */
 void
 lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 					   LionPostingSet *groups, const LionPostingSet *copy,
 					   int64 *counts, LionCountStats *stats,
-					   LionVisCache *cache, bool rel_read_only)
+					   LionVisCache *cache, bool rel_read_only,
+					   PGAlignedBlock *images)
 {
 	const LionMatSet *mat;
 	MemoryContext cxt;
@@ -7736,7 +7819,9 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 		trust[g] = ps->found && !ps->nopin && ps->mat == NULL;
 		gcx[g].novm = !trust[g];
 
-		lion_cursor_init(&cur[g], ps, &gcx[g], false);
+		/* nothing below the copy's first key can be counted: begin there */
+		lion_cursor_init_at(&cur[g], ps, &gcx[g], false, lion_mat_key(mat, 0),
+							images != NULL ? &images[g] : NULL);
 		if (cur[g].valid)
 			lion_group_heap_push(gheap, &nheap, cur[g].cur->ckey, g);
 	}
@@ -7967,15 +8052,61 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
  */
 #define LION_COPY_MAX_CHUNKS		64
 #define LION_COPY_CHUNKS_EACH		4	/* chunks a participant: the work evens out */
-#define LION_COPY_MIN_CHUNK_KEYS	16	/* container keys a chunk covers at least */
 
 /* the phases of LionSharedCopy.barrier */
 #define LION_COPY_COLLECTING		0
 #define LION_COPY_INDEXING			1
 #define LION_COPY_DONE				2
 
-/* no end: the last chunk takes every key past its first */
-#define LION_COPY_END				((uint64) PG_UINT32_MAX + 1)
+/*
+ * The fewest container keys a range covers when the executor cuts them,
+ * pg_lion.parallel_range_keys: a range seeks every source to its first key,
+ * and a parallel GROUP BY walks every group's entry again for each.  A testing
+ * knob rather than a tuning one - the regression suite lowers it to cut a
+ * table of a few megabytes into several ranges - so the planner prices the
+ * ranges of the default width, LION_PARALLEL_RANGE_KEYS, whatever it is set
+ * to.
+ */
+int			lion_parallel_range_keys = LION_PARALLEL_RANGE_KEYS;
+
+/*
+ * Cut the heap's container keys into ranges for the participants of a
+ * parallel plan: a few for each, so that one that is slow to start or has
+ * denser keys is made up for by the others, and no fewer than minkeys keys
+ * each.  Returns how many there are, and in *ckeys the container keys they
+ * are cut from, which lion_key_range() divides among them as evenly as whole
+ * keys go - no range is empty.  The last one is open-ended.  The shared
+ * copy's chunks are these ranges, and so are the ranges a parallel GROUP BY
+ * counts its groups over (DESIGN.md §10, "A GROUP BY in parallel").
+ */
+int
+lion_key_ranges(BlockNumber heapblocks, int participants, int minkeys,
+				uint32 *ckeys)
+{
+	uint64		keys = (uint64) heapblocks / LION_BLOCKS_PER_CONTAINER + 1;
+	uint64		n;
+
+	n = Min((uint64) LION_COPY_MAX_CHUNKS,
+			(uint64) Max(participants, 1) * LION_COPY_CHUNKS_EACH);
+	n = Min(n, Max(keys / (uint64) Max(minkeys, 1), (uint64) 1));
+	*ckeys = (uint32) keys;
+	return (int) n;
+}
+
+/*
+ * The container keys of range r of lion_key_ranges()'s cut of ckeys keys
+ * into nranges: lo up to, not including, hi.  The last range has no end - the
+ * heap may have grown since the ranges were cut - and takes every key from
+ * its first on (LION_KEYS_END).
+ */
+void
+lion_key_range(int nranges, uint32 ckeys, int r, uint32 *lo, uint64 *hi)
+{
+	Assert(r >= 0 && r < nranges);
+	*lo = (uint32) ((uint64) r * ckeys / (uint64) nranges);
+	*hi = (r == nranges - 1) ? LION_KEYS_END :
+		(uint64) (r + 1) * ckeys / (uint64) nranges;
+}
 
 typedef struct LionCopyChunk
 {
@@ -7997,7 +8128,7 @@ struct LionSharedCopy
 	dsm_handle	seg;			/* the plan's DSM, which a worker attaches
 								 * the file set through */
 	int			nchunks;
-	uint32		width;			/* container keys a chunk covers */
+	uint32		ckeys;			/* the container keys they are cut from */
 
 	/* the index, made by the participant elected once every chunk is in */
 	int			ncontainers;
@@ -8043,23 +8174,12 @@ lion_copy_chunk_name(char *name, Size len, int c)
 	snprintf(name, len, "lioncopy.%d", c);
 }
 
-/*
- * Cut the heap's container keys into chunks: a few for each participant, so
- * that one that is slow to start or has dense chunks is made up for by the
- * others, and no fewer keys than LION_COPY_MIN_CHUNK_KEYS each, since a chunk
- * seeks every source to its first key.
- */
+/* Cut the heap's container keys into chunks (lion_key_ranges()). */
 static void
 lion_copy_cut(LionSharedCopy *sc, BlockNumber heapblocks)
 {
-	uint64		ckeys = (uint64) heapblocks / LION_BLOCKS_PER_CONTAINER + 1;
-	uint64		n;
-
-	n = Min((uint64) LION_COPY_MAX_CHUNKS,
-			(uint64) Max(sc->participants, 1) * LION_COPY_CHUNKS_EACH);
-	n = Min(n, Max(ckeys / LION_COPY_MIN_CHUNK_KEYS, (uint64) 1));
-	sc->nchunks = (int) n;
-	sc->width = (uint32) ((ckeys + n - 1) / n);
+	sc->nchunks = lion_key_ranges(heapblocks, sc->participants,
+								  lion_parallel_range_keys, &sc->ckeys);
 }
 
 /* The copy as it is before anyone collects it. */
@@ -8178,9 +8298,7 @@ lion_copy_chunk(LionSharedCopy *sc, dsa_area *area, Relation heap,
 	col.sp.fileset = &sc->fileset.fs;
 	col.sp.name = name;
 	col.ranged = true;
-	col.lo = (uint32) ((uint64) c * sc->width);
-	col.hi = (c == sc->nchunks - 1) ? LION_COPY_END :
-		(uint64) (c + 1) * sc->width;
+	lion_key_range(sc->nchunks, sc->ckeys, c, &col.lo, &col.hi);
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;

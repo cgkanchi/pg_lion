@@ -682,6 +682,28 @@ extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 LionCountStats *stats);
 
 /*
+ * The heap's container keys cut into ranges for the participants of a
+ * parallel plan: how many, and the keys they are cut from - no fewer than
+ * minkeys a range, which the executor takes from pg_lion.parallel_range_keys
+ * and the planner prices at its default.  lion_key_range() gives range r's
+ * first key and the key past its last, the last range having no end
+ * (LION_KEYS_END); lion_sources_collect_range() is the copy above of the keys
+ * of one range alone.
+ */
+#define LION_KEYS_END	((uint64) PG_UINT32_MAX + 1)
+#define LION_PARALLEL_RANGE_KEYS	16	/* pg_lion.parallel_range_keys */
+extern PGDLLIMPORT int lion_parallel_range_keys;
+extern int	lion_key_ranges(BlockNumber heapblocks, int participants,
+							int minkeys, uint32 *ckeys);
+extern void lion_key_range(int nranges, uint32 ckeys, int r, uint32 *lo,
+						   uint64 *hi);
+extern bool lion_sources_collect_range(Relation heap, Snapshot snapshot,
+									   int nsources, LionCountSource *sources,
+									   Size maxbytes, bool spill, uint32 lo,
+									   uint64 hi, LionPostingSet *out,
+									   bool *spilled, LionCountStats *stats);
+
+/*
  * The counts of many located sets against ONE such copy, made in one walk of
  * container keys for all of them (DESIGN.md §10, "The groups of a walk,
  * counted together"): counts[g] is what lion_count_sources_cached() answers
@@ -690,12 +712,13 @@ extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
  * copy's container at each key is read once and made a bitset image that
  * every group's container there is tested against, and the visibility map is
  * asked once per key for all of them.  The sets stay the caller's to release.
+ * images is NULL, or ngroups page images the cursors may use as theirs.
  */
 extern void lion_count_groups_copy(Relation heap, Snapshot snapshot,
 								   int ngroups, LionPostingSet *groups,
 								   const LionPostingSet *copy, int64 *counts,
 								   LionCountStats *stats, LionVisCache *cache,
-								   bool rel_read_only);
+								   bool rel_read_only, PGAlignedBlock *images);
 
 /* How many groups of index one lion_count_groups_copy() may take. */
 extern int	lion_count_groups_batch(Relation index);
