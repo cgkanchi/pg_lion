@@ -9903,9 +9903,9 @@ under two keys, and (in the directory walk before it) that summaries are in orde
 is the last and no pivot is one, and that a summary is of a summarized column and carries
 `LION_SUMMARY_HASH`. Like the rest of the function it runs under ShareUpdateExclusiveLock, beside
 inserts (VACUUM waits for it), so a difference is a CANDIDATE, not an error: an insert may be
-between its key and its summary. Once the column is walked - or earlier, when
-`LION_VERIFY_MAX_SUM_CANDS` (10,000) or a quarter of `maintenance_work_mem`'s worth are waiting -
-the writers that could explain them are waited for (`lion_verify_wait_for_writers()`) and the
+between its key and its summary. Once the column is walked - or earlier, when a quarter of
+`maintenance_work_mem`'s worth of them, and at least `LION_VERIFY_MAX_SUM_CANDS` (10,000), are
+waiting - the writers that could explain them are waited for (`lion_verify_wait_for_writers()`) and the
 candidates are SETTLED in one pass over the summaries of their buckets and one walk of the
 column's keys (`lion_verify_settle()`): a row a summary lacked must be in its bucket's summary now,
 a row a summary holds must be in one of its bucket's keys now - and a DEAD row

@@ -4155,10 +4155,10 @@ lion_verify_heapallindexed(LionVerifyState *vs)
  * column to settle; and a cap on the candidates, meant for a summary of
  * garbage, was applied before any was settled - so a column under steady
  * appends was reported corrupt (2026-09-28 review).  Now nothing caps the
- * candidates but memory: once LION_VERIFY_MAX_SUM_CANDS of them, or a quarter
- * of maintenance_work_mem's worth, are waiting, they are settled there and
- * then and the walk goes on, and the first one that is still a candidate after
- * settling is what is reported.
+ * candidates but memory: once a quarter of maintenance_work_mem's worth of
+ * them (and at least LION_VERIFY_MAX_SUM_CANDS) are waiting, they are settled
+ * there and then and the walk goes on, and the first one that is still a
+ * candidate after settling is what is reported.
  * --------------------------------------------------------------------- */
 
 /* One difference the walk found, to be looked at again. */
