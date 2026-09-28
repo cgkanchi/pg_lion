@@ -8167,8 +8167,9 @@ It can now. Every run keeps:
   - `Visibility Map Checks` and `Visibility Map Pages Pinned`: the containers whose heap blocks the
     map was asked about, and the map pages pinned to answer them;
   - with the fact filters collected: `Fact Filter Copy Containers Read`, `Fact Filter Copy Seeks`
-    (the binary searches) and `Fact Filter Copy File Reads` (the containers read back from a
-    spilled copy's temporary file);
+    (the copy looked up at a key container's key; a binary search, before "The copy, looked up by
+    key") and `Fact Filter Copy File Reads` (the containers read back from a spilled copy's
+    temporary file);
 - **timings**, only under EXPLAIN ANALYZE's TIMING option, as core times a node only then (the
   executor's `es_instrument` has `INSTRUMENT_TIMER`, in every participant):
   `Join Child Time`, `Join Lookup Time`, `Join Count Time` and, when the filters are collected,
@@ -8188,10 +8189,11 @@ How to read them, for any workload:
   `Join Key Containers Read` over them what one reads of its own set. Against the copy a count is
   bounded by those containers, never by the copy: it reads the copy's first container when its
   cursor is built and one more per binary search, and it searches once for each of the key's
-  containers at most - so `Fact Filter Copy Containers Read` is at most `Join Key Containers Read`
-  plus the keys, `Fact Filter Copy Seeks` at most `Join Key Containers Read`, and `Fact Filter Copy
-  File Reads`, of a spilled copy, at most the seeks. A count that is O(the copy) would show here as
-  copy containers far above those bounds.
+  containers at most (since "The copy, looked up by key" it builds no cursor over the copy and
+  reads the one container a lookup finds) - so `Fact Filter Copy Containers Read` is at most `Join
+  Key Containers Read` plus the keys, `Fact Filter Copy Seeks` at most `Join Key Containers Read`,
+  and `Fact Filter Copy File Reads`, of a spilled copy, at most the seeks. A count that is O(the
+  copy) would show here as copy containers far above those bounds.
 - `Join Posting Pages Read`, and with BUFFERS the node's shared reads less its child's, are what the
   node itself read from disk.
 - What the node took besides these phases - its batches, and handing its rows up - is its time less
@@ -8265,7 +8267,9 @@ from what the code does where it does not; the fixes of 2026-09-28 are marked.
    one read of that container from the temporary file (a system call reading a block of it) - the
    first container stays in memory ("Lookups in key order"); the AND of the two containers; the
    visibility map's mask of it. O(the set's containers x log(the copy)), and nothing else of the
-   copy is read.
+   copy is read. *Since "The copy, looked up by key" below*: a lookup of the copy at the
+   container's key, one read where its keys are dense, and for a container of a row or two a
+   lookup of each row in the copy's - O(the set's containers).
 8. **The heap recheck** of candidates on pages the map does not vouch for, through the node's
    visibility cache: O(the key's intersection).
 9. **The set released**: its pin, its charge to the list budget.
@@ -8305,6 +8309,127 @@ child's rows (1), for pages read from disk - by the lookups, the fk sets' chains
 Pages Read`) or the rechecks - or, in a parallel plan, for its row's trip through the Gather (10);
 the counters and timings of "Where a key's time goes" tell which.
 
+### The copy, looked up by key (2026-09-28)
+
+A benchmark's summed FK-side join spent most of its time in `Join Count Time`, and there in the
+containers of the keys' own sets: its keys' rows lay about one to a container all over the heap,
+so each count read as many containers as its key had rows, and none of its time went to the terms
+"The per-key path, end to end" lists as O(the copy). Its fact filters' copy was dense in container
+keys, with a container at nearly every key of the heap. So step 7 was the whole of it, and it was
+profiled (perf, cpu-clock) on synthetic data of that shape: 20 million fact rows whose uuid fk runs
+over 667,000 keys by a hash of the row number, a flag kept by 0.3% of them (a copy of 58,819 rows,
+with a container at every one of the heap's 1,992 container keys), and a dimension selecting one
+key in ten through a partial covering btree - 66,700 keys, 1.98 million key containers of one row
+each - run serially with the join methods disabled, PostgreSQL 18.6, release build
+(`bench/fkjoin_perkey.sh` makes it). Of the node's time:
+
+- 33% was the copy's binary search, 45% of `Join Count Time`: eleven steps a key container, each
+  following the pointer to a container to read its key - a cache miss and a mispredicted branch a
+  step;
+- 17% was the AND of the key's one-row container with the copy's: the general path galloped
+  through the copy container's thirty rows, built the result in a work buffer, optimized it and
+  copied it out, for a result that was empty 997 times in 1,000;
+- 20% was the rest of the merge: the key's own containers read (a sparse segment expanded a key
+  at a time), the cursor over the copy sought, advanced and rebuilt, the two sources' keys
+  compared and their order walked;
+- 6% was the counts' set-up, 0.3 us a key; the visibility map under 1% (only the containers whose
+  AND is not empty ask it); the lookups and the batch's sort the remaining quarter, outside `Join
+  Count Time`.
+
+Three changes, each measured on its own:
+
+- **The copy indexed by its keys** (`lion_mat_index()`, made once with the copy by
+  `lion_sources_collect()` and never changed after, as the copy is not). The keys in an array of
+  their own, four bytes a container, which a binary search reads without touching a container and
+  without a branch; and where they are dense - at most four key slots a container - a DIRECT
+  index, `dir[k - first]` the first container at or above key k, which answers a seek with one
+  read (`lion_mat_seek()`). Both are memory of the copy: the collection's budget makes room for
+  the keys, the direct index is made only where what is left of the budget holds it, and a spilled
+  copy, whose entries keep its keys already, gets the direct index alone - sixteen bytes a
+  container at most, an entry's size.
+- **The AND of a container of at most three rows** (`lion_container_and()`): each row looked up in
+  the other container - a bit of a bitset, a branch-free binary search of an array's rows or of a
+  run container's runs - and the result written straight into the destination. Three rows or
+  fewer is an ARRAY in `lion_container_optimize()`'s choice (three in one run take fourteen bytes
+  either way, and a tie goes to the ARRAY), so the result is the one the general path makes, byte
+  for byte; a damaged operand's row that is not above the last one written is passed over (§3's
+  untrusted containers), and `test/unit/container_test.c` checks every kind of other operand
+  against its reference, the small one on either side.
+- **The merge of a set and a collected copy** (`lion_run_merge_copy()`): a count of two positive
+  sources, the key's set driving and the other a copy `lion_sources_collect()` made
+  (`LionMatSet.collected`), needs no cursor over the copy: each of the set's containers looks its
+  key up in the copy and is ANDed with the container found there, and where the copy has none the
+  set is sought on to the next key it has - the leapfrog of the general merge. §9 reads as it does
+  in `lion_count_container()`: a container of the result is put to the visibility map before the
+  set, which carries the pin, moves past it, and a key the copy has nothing at, or whose AND is
+  empty, asks the map nothing. The copy holds no pin and is counted beside the set only, which is
+  `lion_sources_collect()`'s argument, unchanged. A copy that drives - fewer rows than the key's
+  set - takes the general merge. So does a GROUP BY's count against its collected WHERE sets (§10)
+  take this one, when the group's set drives.
+
+`Fact Filter Copy Seeks` is still one a key container looked up, and `Fact Filter Copy Containers
+Read` the copy's containers found there: fewer than before, since a count no longer reads the
+copy's first container to build a cursor, and within the bounds "Where a key's time goes" gives.
+
+Measured on the data above, medians of seven, `Join Count Time` / the query's time in ms, serially
+with the join methods disabled, and with three workers (`Join Count Time` summed over the four
+participants):
+
+| build | serial | three workers |
+|---|---|---|
+| before | 333 / 445 | 319 / 268 |
+| the AND by lookup alone | 240 / 339 | 255 / 190 |
+| the direct index alone | 217 / 312 | 214 / 161 |
+| the keys' array and the AND, no direct index | 195 / 281 | 209 / 160 |
+| the direct index and the AND | 136-144 / 222-236 | 144-164 / 130-165 |
+| and the merge of a set and a copy | 97 / 203 | 105 / 101 |
+
+A key container went from 157 ns to about 40: some 10 for the key's own container, 25 to 30 for
+the copy's lookup and the AND. With a flag kept by 2% of the rows (a copy of 391,274 rows, 196 a
+container), 401 to 123 ms serially, the query 518 to 235 ms, and 359 to 136 ms with three workers.
+Over §27's two million rows, whose fk sets hold six rows a container, the node is 8 to 12% faster
+(`... WHERE f.x = 3 GROUP BY d.attr` 124 to 113 ms, `f.x IN (1, 2)` 147 to 131): its ANDs merge,
+and only the seek went.
+
+**The accumulator, considered and not taken.** For a summed join the alternative was to OR the
+keys' sets into one accumulator and AND it with the copy once, instead of an AND per key
+container. A prototype (not kept) measured what it could be worth at best: with ONE AND of the
+whole accumulator at the end, `Join Count Time` 70 to 75 ms against the 136 to 144 of the per-key
+path with the first two changes above. It cannot be had at that price:
+
+- As stated, it breaks §9. The accumulator is a collected set; once the keys' pins are gone,
+  nothing carries the interlock for the TIDs it holds, and the copy is never counted beside
+  anything else - where a collected set is only ever counted beside a located set that carries
+  the interlock.
+- Keeping the interlock by keeping the pins: every set in the accumulator would hold its pin
+  until the AND - an INLINE set its directory leaf, a CHAIN set every leaf its cursor crossed,
+  which the cursor lets go of now as it moves on. The pins are bounded by the list pin budget (at
+  most a thousand, shared by a parallel plan's participants), so the accumulator would be ANDed
+  every so many keys, and each AND reads all of it - a container per container key of the heap
+  the keys touched, which keys scattered over the heap make all of them. With an AND every 2,048
+  keys the prototype took 102 ms; every 256, 328 ms - worse than before any of this.
+- Keeping the interlock by asking the map first: each key container asked about under its own
+  pin as it is ORed in, the AND with the copy after. 141 ms serially, no better, and 234 against
+  158 with three workers: the map is asked about every container of every key, where the per-key
+  path asks it only about the few whose AND is not empty.
+- And exactness: a key that appears twice is counted twice by the join and once by a union; the
+  keys' sets are disjoint only for distinct keys, so every OR would have to test for an overlap.
+
+So the node keeps its count per key, and the third change took `Join Count Time` to 97 ms without
+any of it.
+
+**Cost.** `LION_FKJOIN_COPY_PROBE_COST`, the copy sought and ANDed per fk container, was 15
+`cpu_operator_cost` (75 ns) while the seek was the binary search: about 115 ns an fk container of
+one row on the release build. The same is 25 to 30 ns now, and `pg_lion.fkjoin_copy_probe_cost`
+defaults to 5. `LION_FKJOIN_COPY_MEMBER_COST` stays 3: an fk container of more than three rows is
+still merged with the copy's, and §27's rows of six a container still run slower than the hash
+join (113 against 67 ms, 131 against 90), which it keeps refusing - at 5 and 1 the planner took the
+node for both, at twice the hash join's time. Measured with the data above and §27's two million
+rows, serially: every choice the model made at 15 it makes at 5. The flag of 0.3% stays with the
+hash join (171,372 against 152,381), which the node now matches in time (198 to 213 ms against 206
+to 219) where it was 2.3 times slower; the 2% flag stays with the node (171,417 against 453,424;
+184 to 202 ms against 460 to 495).
+
 ### The cost of a key, after the per-key path (2026-09-28)
 
 The model prices a key as the sum of what "The per-key path, end to end" lists, each term a named
@@ -8317,7 +8442,7 @@ ns and a `cpu_tuple_cost` 20 ns at 500 units a millisecond:
 | 3 | `LION_DESCENT_COST` | a directory page visited | a level of a descent, a step of the walk, a leaf |
 | 5 | `LION_FKJOIN_COUNT_COST` / `LION_FKJOIN_COPY_COUNT_COST` (25 `cpu_tuple_cost` each) | a key found | a count's set-up and tear-down, against the filters or their copy |
 | 7 | `LION_CONTAINER_COST` (8 `cpu_operator_cost`) and `LION_MEMBER_COST` (0.15, at most `LION_MEMBER_CAP` a container) | an fk container, a member | the key's own set, read and counted |
-| 7 | `LION_FKJOIN_COPY_PROBE_COST` (15 `cpu_operator_cost`) and `LION_FKJOIN_COPY_MEMBER_COST` (3) | an fk container, a member | the copy sought and ANDed there |
+| 7 | `LION_FKJOIN_COPY_PROBE_COST` (5 `cpu_operator_cost`; 15 before "The copy, looked up by key") and `LION_FKJOIN_COPY_MEMBER_COST` (3) | an fk container, a member | the copy looked up and ANDed there |
 | 7 | `LION_FKJOIN_PROBE_COST` (80 `cpu_operator_cost`), `LION_FKJOIN_SET_COST` (100 `cpu_tuple_cost`) | a probe; a union's set, a count | the same against the filters, probed |
 | 8 | `LION_RECHECK_TID_COST` (1.5 `cpu_tuple_cost`), `lion_heap_page_cost()` | a candidate, a dirty page | the heap recheck |
 | 10 | `LION_FKJOIN_ROW_COST` (10 `cpu_tuple_cost`, new) | a row handed up | the node's side of handing it up |
@@ -8569,7 +8694,12 @@ without. A copy that spills at a `work_mem` of 64 kB, from a generic plan
 made at the default: spilled once, read back, its file reads at most the keys' containers and the
 copy containers read, and the temporary blocks the node read at most those reads and one - the
 count's reads of a spilled copy are bounded by the key, not by the copy. And a parallel plan, whose
-counters are the participants' sums.
+counters are the participants' sums. Since "The copy, looked up by key", a copy whose container
+keys are too far apart for the direct index - the first and the last thousand rows of a 60,000-row
+fact - against keys whose rows lie anywhere, so that most key containers find nothing of the copy
+at their key and the key is sought on: inner, grouped, semi and anti joins against the pushdown
+off, and the copy's containers read fewer than the key's. `test/unit/container_test.c` checks the
+AND of an ARRAY of one to three rows against every kind of container, and damaged ones.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
