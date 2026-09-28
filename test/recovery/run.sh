@@ -1612,6 +1612,47 @@ standby_chain_reuse() {
 	SUMMARY+=("phase2 standby      chain free + reuse replayed under a reader ($freed pages)")
 }
 
+# An index BUILD over existing rows, replayed on the standby.  Everything else
+# a standby replays here is written by aminsert and VACUUM, and phase 1 crashes
+# only after the checkpoint that follows its builds, so this is where the
+# build's own WAL - the bulk writer's page images, which on 16 lion_build.c's
+# copy of 17's bulk-write API writes - is read back: two indexes built on the
+# primary, one of a few dense keys and one of many text keys, each verified on
+# the standby and counted there against the primary's heap.
+standby_build_replay() {
+	local nk nt
+	log ""
+	log "-- standby: index builds replayed"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_build_replay: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_built;
+		CREATE TABLE lion_built (id int NOT NULL, k int NOT NULL, t text NOT NULL);
+		INSERT INTO lion_built
+		SELECT i, i % 7, 'key-' || (i % 5000) FROM generate_series(1, 300000) i;
+		CREATE INDEX lion_built_k ON lion_built USING lion (k);
+		CREATE INDEX lion_built_t ON lion_built USING lion (t) WITH (inline_limit = 64);
+	SQL
+	nk=$(psql_p -tAc "select count(*) from lion_built where k = 3")
+	nt=$(psql_p -tAc "select count(*) from lion_built where t = 'key-17'")
+	wait_catchup
+
+	run_check "standby build replay" psql_s "
+		select lion_index_verify('lion_built_k'::regclass, true) is not null, 'verify lion_built_k'
+		union all
+		select lion_index_verify('lion_built_t'::regclass, true) is not null, 'verify lion_built_t'
+		union all
+		select lion_index_count('lion_built_k'::regclass, 3) = $nk, 'k = 3 counted through the replayed build'
+		union all
+		select lion_index_count('lion_built_t'::regclass, 'key-17'::text) = $nt, 't = key-17 counted through the replayed build'"
+
+	psql_p -c "DROP TABLE lion_built" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	log "standby: two index builds replayed, verified and counted ($nk and $nt rows)"
+	SUMMARY+=("phase2 standby      two index builds replayed, verified and counted")
+}
+
 phase2() {
 	local probe_p probe_s ck
 	log ""
@@ -1660,6 +1701,7 @@ phase2() {
 	SUMMARY+=("phase2 standby      $(wc -l <"$probe_s") index probes identical to the primary")
 
 	standby_chain_reuse
+	standby_build_replay
 
 	rr_variant on 11
 	rr_variant off 7

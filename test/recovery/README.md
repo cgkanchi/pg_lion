@@ -197,6 +197,11 @@ twice, or one freed a moment ago called reusable, breaks the equation.
   with the plan node that answered it — must be byte-identical between primary
   and standby. Comparing the node too means a standby that quietly stopped
   using the pushdown is a failure rather than a silently weaker test.
+* an index build replayed: two indexes built on the primary over 300000 rows
+  that are already there (a few dense keys; 5000 text keys), then
+  `lion_index_verify(idx, true)` and a key count through each on the standby.
+  It is the one place a build's own WAL is replayed - the bulk writer's page
+  images, which on 16 come from `lion_build.c`'s copy of 17's bulk-write API.
 * the recovery-conflict case, run twice. A standby session opens a
   `REPEATABLE READ` transaction and counts key K; the run waits (on
   `pg_stat_activity`, not on a timer) until that session really holds its
