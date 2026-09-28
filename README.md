@@ -318,7 +318,8 @@ dense key whose container has to be rewritten whole costs ~1.6 KB where a generi
 manager and `generic` otherwise, so one CREATE INDEX script works on a cluster that preloads the
 library and on one that does not.  The mode is fixed at build time and recorded on the meta page;
 `SELECT lion_index_wal_mode(idx)` reports it and REINDEX is what changes it.  An rmgr-mode index can
-be READ on any server but can only be WRITTEN where the resource manager is registered, which needs
+be READ on any server but can only be WRITTEN where the resource manager is registered (an unlogged
+or temporary one writes no WAL and is written anywhere), which needs
 
     shared_preload_libraries = 'pg_lion'      # and a restart
     # optional: pg_lion.rmgr_id = 128         # the id to register under
@@ -363,7 +364,9 @@ stale `relallvisible` blind spot of index-only scans. Indexes built before NULL 
 with an error and have to be rebuilt with REINDEX.
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
-interlock relies on; they stay correct there but are no longer O(1) per container.  An rmgr-mode
+interlock relies on; they stay correct there but are no longer O(1) per container.  Index-only
+scans of such an index (of a query that needs no column, such as `SELECT count(*)`) look every TID
+up in the heap there for the same reason.  An rmgr-mode
 index does not pay that: its removal records replay under a cleanup lock, so the standby uses the
 visibility map again (DESIGN.md §25) - at the price that a standby reader holding a pin makes replay
 wait, which `max_standby_streaming_delay` resolves as a recovery conflict.  A count that reads even
@@ -371,6 +374,11 @@ one generic-mode index falls back to rechecking everything, because the interloc
 every source it intersects. The SQL count functions require SELECT
 on the table or on the indexed columns and refuse tables where row-level security applies to the
 caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
+On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
+the setting) does not read lion indexes at all: lion does not detect "snapshot too old", so the
+planner prices them out and declines the count pushdown and `LionOrdered`, and a scan or SQL count
+that reaches one anyway fails with an error rather than return a different answer than the
+snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
 ## Latest benchmarks
 

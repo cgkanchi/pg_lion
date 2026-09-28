@@ -196,7 +196,10 @@ typedef struct LionVacState
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
 	IndexBulkDeleteResult *stats;
-	double		numtids;		/* sum of ntids over every entry */
+	AttrNumber	rowattno;		/* the column whose postings are the rows, or
+								 * 0 (lion_vac_row_column()) */
+	double		numtids;		/* sum of ntids over its entries, which is
+								 * what the index reports it holds */
 	LionContainer *cbuf;			/* aligned container work buffer */
 	LionContainer *cbuf2;		/* and a second one, for the unchanged items
 								 * in front of the first INLINE item that
@@ -251,6 +254,38 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
 {
 	return blk < vs->nblocks &&
 		(vs->visited[blk / 8] & (uint8) (1 << (blk % 8))) != 0;
+}
+
+/*
+ * The key column whose postings count the index's ROWS (DESIGN.md §18,
+ * "Statistics"): its first scalar one.  A scalar column files every row the
+ * index holds under exactly one of its entries - the NULL entry for a NULL -
+ * so the ntids of its entries add up to the rows, where the postings of the
+ * whole index count a row once per key column, once per element of a
+ * multi-key column, and again in a SUMMARY of its bucket.  0 when every key
+ * column is multi-key: a row may be filed under any number of their entries,
+ * and nothing short of the union of them all says how many rows there are.
+ */
+static AttrNumber
+lion_vac_row_column(LionIndexState *ix)
+{
+	int			i;
+
+	for (i = 0; i < ix->ncolumns; i++)
+	{
+		if (!ix->cols[i].multikey)
+			return (AttrNumber) (i + 1);
+	}
+	return InvalidAttrNumber;
+}
+
+/* Is entry one of those whose ntids add up to the rows? */
+static inline bool
+lion_vac_counts_rows(LionVacState *vs, const LionEntryTuple *entry)
+{
+	return vs->rowattno != InvalidAttrNumber &&
+		entry->attno == vs->rowattno &&
+		(entry->flags & LION_ENTRY_SUMKINDS) == 0;
 }
 
 /*
@@ -447,6 +482,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.callback = callback;
 	vs.callback_state = callback_state;
 	vs.stats = stats;
+	vs.rowattno = lion_vac_row_column(vs.ix);
 	vs.numtids = 0;
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.cbuf2 = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
@@ -512,9 +548,28 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	pfree(vs.cbuf2);
 	pfree(vs.cbuf);
 
+	/*
+	 * The rows the index holds (DESIGN.md §18, "Statistics"), counted, when
+	 * it has a scalar column to count them by.  num_index_tuples becomes the
+	 * index's pg_class.reltuples, which the planner reads as rows (a partial
+	 * index's size is estimate_rel_size()'s tuples per page of it) and which
+	 * ANALYZE rewrites with rows; the postings this used to report count a
+	 * row once per key column and once per element, and made plans flip
+	 * between the two.  Without a scalar column only the heap's row count is
+	 * known, as for GIN, and only the cleanup call is told whether that is
+	 * exact (lionvacuumcleanup()).
+	 */
 	stats->num_pages = RelationGetNumberOfBlocks(index);
-	stats->num_index_tuples = vs.numtids;
-	stats->estimated_count = false;
+	if (vs.rowattno != InvalidAttrNumber)
+	{
+		stats->num_index_tuples = vs.numtids;
+		stats->estimated_count = false;
+	}
+	else
+	{
+		stats->num_index_tuples = Max(info->num_heap_tuples, 0);
+		stats->estimated_count = true;
+	}
 
 	/*
 	 * A VACUUM whose dead TIDs do not fit maintenance_work_mem calls this
@@ -562,12 +617,28 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	 */
 	IndexFreeSpaceMapVacuum(info->index);
 
-	if (stats == NULL)
+	if (lion_vac_row_column(lion_get_index_state(info->index)) ==
+		InvalidAttrNumber)
+	{
+		/*
+		 * Every key column is multi-key, so nothing counted the rows
+		 * (lionbulkdelete()): report the heap's, and whether that is exact,
+		 * which is what ginvacuumcleanup() does for the same reason.  Wrong
+		 * for a partial index, as GIN's is.
+		 */
+		if (stats == NULL)
+			stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+		stats->num_pages = RelationGetNumberOfBlocks(info->index);
+		stats->num_index_tuples = Max(info->num_heap_tuples, 0);
+		stats->estimated_count = info->estimated_count;
+	}
+	else if (stats == NULL)
 	{
 		/*
 		 * No ambulkdelete call was needed, so nothing has been counted: hand
 		 * back the heap's estimate rather than zero, which would tell the
-		 * planner the index is empty.
+		 * planner the index is empty, marked as an estimate, so that a
+		 * partial index keeps the count it has.
 		 */
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 		stats->num_pages = RelationGetNumberOfBlocks(info->index);
@@ -685,12 +756,14 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 
 	if (removed == 0)
 	{
-		vs->numtids += (double) entry->ntids;
+		if (lion_vac_counts_rows(vs, entry))
+			vs->numtids += (double) entry->ntids;
 		return false;
 	}
 
 	vs->stats->tuples_removed += (double) removed;
-	vs->numtids += (double) ntids;
+	if (lion_vac_counts_rows(vs, entry))
+		vs->numtids += (double) ntids;
 
 	res->off = off;
 	res->spill = false;
@@ -1311,7 +1384,8 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	/* Report what the entry holds now that every page has been visited. */
 	lion_vac_ref_lock(vs, &ref, ent, BUFFER_LOCK_SHARE);
 	entry = lion_page_entry(BufferGetPage(ref.buf), ref.off);
-	vs->numtids += (double) entry->ntids;
+	if (lion_vac_counts_rows(vs, entry))
+		vs->numtids += (double) entry->ntids;
 	ent->maydelete = (entry->ntids == 0 && entry->ncontainers == 0);
 	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(ref.buf);

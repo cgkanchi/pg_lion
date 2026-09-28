@@ -697,6 +697,9 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	if (!lion_enable_ordered_scan)
 		return;
+	/* no lion index is read under 16's old_snapshot_threshold (§9) */
+	if (lion_old_snapshot_threshold_active())
+		return;
 	if (!lo_rel_ok(root, rel, rte))
 		return;
 

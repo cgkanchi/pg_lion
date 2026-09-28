@@ -8828,6 +8828,12 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("cannot count through index \"%s\" because %s",
 							RelationGetRelationName(call->index[i]), why)));
+
+		/*
+		 * And none at all under PostgreSQL 16's old_snapshot_threshold, which
+		 * the planner's pushdown declines for the same reason (DESIGN.md §9).
+		 */
+		lion_check_old_snapshot(call->index[i], snapshot);
 	}
 }
 

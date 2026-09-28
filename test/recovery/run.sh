@@ -1239,6 +1239,11 @@ phase1e() {
 # Both modes run it: generic mode preloads the library for the build, rmgr
 # mode drops the preload (and wal_consistency_checking, which names the
 # manager) for the VACUUM.
+#
+# An UNLOGGED rmgr-mode index rides along: it writes no WAL at all, so the
+# server without the manager must let it be written - inserted into and
+# vacuumed - where it used to refuse every write with the preload hint
+# (lion_wal_begin(), 2026-09-27 review).
 phase1f() {
 	local before after custom off
 	log ""
@@ -1258,9 +1263,16 @@ phase1f() {
 		INSERT INTO lion_norm SELECT i, i % 500 FROM generate_series(1, 100000) i;
 		CREATE INDEX lion_norm_k ON lion_norm USING lion (k)
 			WITH (wal_mode = rmgr, inline_limit = 64) WHERE id % 2 = 0;
+		DROP TABLE IF EXISTS lion_norm_u;
+		CREATE UNLOGGED TABLE lion_norm_u (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_norm_u SELECT i, i % 500 FROM generate_series(1, 20000) i;
+		CREATE INDEX lion_norm_u_k ON lion_norm_u USING lion (k)
+			WITH (wal_mode = rmgr, inline_limit = 64);
 	SQL
 	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_k'::regclass)")" = rmgr ] ||
 		die "phase 1f: the partial index was not built in rmgr mode"
+	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_u_k'::regclass)")" = rmgr ] ||
+		die "phase 1f: the unlogged index was not built in rmgr mode"
 
 	# A fast stop checkpoints, so nothing of the build is left to replay.
 	as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" stop -m fast -w >>"$RUNLOG" 2>&1 ||
@@ -1271,6 +1283,20 @@ phase1f() {
 	verify_node psql_p "$PRIMARY_DATA"
 	[ "$(psql_p -tAc "select count(*) from pg_get_wal_resource_managers() where rm_name = 'pg_lion'")" = 0 ] ||
 		die "phase 1f: the resource manager is still registered"
+
+	# The unlogged index, written without the manager: inserts that spill and
+	# split its entries, and a VACUUM that removes TIDs from them.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: the unlogged rmgr-mode index could not be written without the manager"
+		INSERT INTO lion_norm_u SELECT i, i % 500 FROM generate_series(20001, 40000) i;
+		DELETE FROM lion_norm_u WHERE id % 3 = 0;
+		VACUUM (INDEX_CLEANUP ON) lion_norm_u;
+	SQL
+	run_check "phase 1f unlogged" psql_p \
+		"select lion_index_verify('lion_norm_u_k', true) is not null, 'verify the unlogged index'
+		 union all
+		 select lion_index_count('lion_norm_u_k', 4) =
+				(select count(*) from lion_norm_u where k = 4),
+				'the unlogged index counts k = 4 as the heap does'"
 
 	# The deleted rows are not in the partial index, so the VACUUM removes
 	# nothing from it and only visits its pages; one visited range per
@@ -1311,10 +1337,11 @@ phase1f() {
 		die "phase 1f: could not stop the primary"
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
-	psql_p -c "DROP TABLE lion_norm, lion_norm_flush" >>"$RUNLOG" 2>&1
+	psql_p -c "DROP TABLE lion_norm, lion_norm_flush, lion_norm_u" >>"$RUNLOG" 2>&1
 
 	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
 	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
+	SUMMARY+=("phase1f            an unlogged rmgr-mode index was written without the manager")
 }
 
 # ---------------------------------------------------------------- phase 2
@@ -1557,6 +1584,57 @@ standby_chain_reuse() {
 	SUMMARY+=("phase2 standby      chain free + reuse replayed under a reader ($freed pages)")
 }
 
+# Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9).  An
+# index-only scan trusts the visibility map for every TID it returns, which a
+# standby may only do where replay waits for the pin the scan keeps: rmgr
+# mode.  In generic mode liongettuple() looks every TID up in the heap first
+# (it used to return the dead rows instead, 2026-09-27 review).  Either way
+# the standby's index-only scan must answer what its sequential scan answers,
+# before and after the primary deletes rows and vacuums them away.  lion plans
+# an index-only scan only for a query that needs no column, which a partial
+# index whose predicate is the WHERE clause gives.
+standby_index_only() {
+	local plan ios seq want round
+	local ioset="set enable_seqscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	local seqset="set enable_indexscan = off; set enable_indexonlyscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	log ""
+	log "-- standby: index-only scans"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_index_only: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_ios;
+		CREATE TABLE lion_ios (id int NOT NULL, k int NOT NULL, flag bool NOT NULL);
+		INSERT INTO lion_ios SELECT i, i % 50, i % 2 = 0 FROM generate_series(1, 40000) i;
+		CREATE INDEX lion_ios_k ON lion_ios USING lion (k) WHERE flag;
+	SQL
+	psql_p -c "VACUUM (ANALYZE) lion_ios" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	plan=$(psql_s -tAc "$ioset explain (costs off) select count(*) from lion_ios where flag")
+	grep -q "Index Only Scan using lion_ios_k" <<<"$plan" ||
+		die "standby_index_only: the standby plans no index-only scan of lion_ios_k: $plan"
+
+	for round in before after; do
+		if [ "$round" = after ]; then
+			psql_p -c "SET synchronous_commit = on; DELETE FROM lion_ios WHERE id % 4 = 0" \
+				>>"$RUNLOG" 2>&1 || die "standby_index_only: delete failed"
+			psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_ios" >>"$RUNLOG" 2>&1
+			wait_catchup
+		fi
+		want=$(psql_p -tAc "select count(*) from lion_ios where flag")
+		ios=$(psql_s -tAc "$ioset select count(*) from lion_ios where flag")
+		seq=$(psql_s -tAc "$seqset select count(*) from lion_ios where flag")
+		{ [ "$ios" = "$seq" ] && [ "$seq" = "$want" ]; } ||
+			die "BUG: standby_index_only ($round the delete): the standby's index-only scan counts $ios, its sequential scan $seq, the primary $want"
+	done
+
+	psql_p -c "DROP TABLE lion_ios" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	log "standby: index-only scans answer $ios rows, as the sequential scan does, before and after a VACUUM"
+	SUMMARY+=("phase2 standby      index-only scans agree with the heap ($MODE mode)")
+}
+
 phase2() {
 	local probe_p probe_s ck
 	log ""
@@ -1605,6 +1683,7 @@ phase2() {
 	SUMMARY+=("phase2 standby      $(wc -l <"$probe_s") index probes identical to the primary")
 
 	standby_chain_reuse
+	standby_index_only
 
 	rr_variant on 11
 	rr_variant off 7

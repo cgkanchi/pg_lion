@@ -44,6 +44,7 @@
 #include "access/bufmask.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -394,7 +395,17 @@ lion_wal_begin(Relation index)
 
 	state->rmgr = (lion_wal_mode(index) == LION_WAL_MODE_RMGR);
 
-	if (state->rmgr && !lion_rmgr_is_registered)
+	/*
+	 * A record of the resource manager is refused without it (see
+	 * lion_rmgr_id) - but only a record that would be WRITTEN.  An unlogged
+	 * or temporary index writes none (lion_wal_finish() only dirties the
+	 * pages, and lion_wal_visit() keeps no barrier for it), so it is written
+	 * without the preload like any other (2026-09-27 review); nothing about
+	 * it names the resource manager but the mode on its meta page.  ALTER
+	 * TABLE ... SET LOGGED rebuilds it, and the build picks the mode afresh
+	 * (lion_wal_mode_for_build()).
+	 */
+	if (state->rmgr && state->needwal && !lion_rmgr_is_registered)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("lion index \"%s\" was built for the pg_lion WAL resource manager, which this server has not registered",
@@ -1163,6 +1174,33 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 }
 
 /*
+ * The shared buffer that holds block blk of rloc's main fork, or InvalidBuffer
+ * when none does: the buffer mapping table's answer, which is what
+ * PrefetchSharedBuffer() looks up too - but that function then starts a read
+ * of a block it misses, and the barrier below wants no read at all.  Nothing
+ * is pinned, so the buffer may hold another block by the time the caller
+ * looks; ReadRecentBuffer() is what checks.
+ */
+static Buffer
+lion_redo_resident_buffer(RelFileLocator rloc, BlockNumber blk)
+{
+	BufferTag	tag;
+	uint32		hash;
+	LWLock	   *partlock;
+	int			buf_id;
+
+	InitBufferTag(&tag, &rloc, MAIN_FORKNUM, blk);
+	hash = BufTableHashCode(&tag);
+	partlock = BufMappingPartitionLock(hash);
+
+	LWLockAcquire(partlock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hash);
+	LWLockRelease(partlock);
+
+	return (buf_id < 0) ? InvalidBuffer : (Buffer) (buf_id + 1);
+}
+
+/*
  * Replay one record.
  *
  * Blocks are taken in the order the writer registered them, which is the
@@ -1189,6 +1227,22 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
  * Only while hot standby is possible: there is nobody to wait for during
  * crash recovery or archive recovery before a consistent state.  A block that
  * does not exist (any more) has nothing to protect.
+ *
+ * Nor has a block that is not in shared buffers, so the barrier never READS
+ * one (2026-09-27 review: it used to, with XLogReadBufferExtended(), and the
+ * ranges of one sparse VACUUM cover nearly the whole index, so its replay
+ * read nearly the whole index synchronously, a block at a time).  A reader
+ * that copied containers out of a page and still pins it keeps that page's
+ * buffer from being evicted, so a block missing from the buffer mapping has
+ * no such reader; only a resident block is pinned (ReadRecentBuffer(), which
+ * fails rather than read when the buffer has been given to another block or
+ * is still being read in) and cleanup-locked.  A reader that pins the block
+ * after the lookup - reading it in, or finding it read in by someone else -
+ * is harmless for the reason a reader that pins a resident block the moment
+ * the barrier lets go of it is: it copies the page as replay has left it,
+ * after every record before this one, so the TIDs this record and the ones
+ * after it remove from the pages they moved to are not on the page it holds,
+ * and its own pin makes each later removal from that page wait for it.
  */
 static void
 lion_redo_barrier(RelFileLocator rloc, const char *data, int nvisit)
@@ -1206,11 +1260,11 @@ lion_redo_barrier(RelFileLocator rloc, const char *data, int nvisit)
 		memcpy(&v, data + i * SizeOfLionVisit, SizeOfLionVisit);
 		for (k = 0; k < v.count; k++)
 		{
-			Buffer		buf;
+			BlockNumber blk = v.start + k;
+			Buffer		buf = lion_redo_resident_buffer(rloc, blk);
 
-			buf = XLogReadBufferExtended(rloc, MAIN_FORKNUM, v.start + k,
-										 RBM_NORMAL_NO_LOG, InvalidBuffer);
-			if (!BufferIsValid(buf))
+			if (!BufferIsValid(buf) ||
+				!ReadRecentBuffer(rloc, MAIN_FORKNUM, blk, buf))
 				continue;
 			LockBufferForCleanup(buf);
 			UnlockReleaseBuffer(buf);

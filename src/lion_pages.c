@@ -124,6 +124,39 @@ lion_index_usable(Relation index, Snapshot snapshot, const char **why)
 }
 
 /*
+ * Refuse to read index under snapshot while old_snapshot_threshold is set
+ * (PostgreSQL 16 only; DESIGN.md §9, "old_snapshot_threshold").
+ *
+ * With the threshold set, VACUUM prunes with a horizon that may have passed
+ * an old snapshot's xmin: it removes TIDs that snapshot still sees and marks
+ * their heap pages all-visible.  Core's access methods notice by comparing
+ * the LSN of every page they read with the snapshot's (TestForOldSnapshot())
+ * and raise "snapshot too old"; lion does not, so a count, a bitmap scan or
+ * an index-only scan would give a silently different answer - a row missing
+ * whose TID is gone, a dead row counted from the visibility map.  Rather than
+ * test every page of every path, lion is not read at all under an MVCC
+ * snapshot on such a server: the planner never picks it (lioncostestimate()
+ * and the CustomScan hooks), and whatever reaches it anyway - a direct SQL
+ * count, a plan with every other path disabled - stops here.  Other snapshots
+ * are not affected by early pruning, and neither are inserts or VACUUM.
+ */
+void
+lion_check_old_snapshot(Relation index, Snapshot snapshot)
+{
+	if (!lion_old_snapshot_threshold_active())
+		return;
+	if (snapshot != NULL && !IsMVCCSnapshot(snapshot))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("lion index \"%s\" cannot be read while old_snapshot_threshold is set",
+					RelationGetRelationName(index)),
+			 errdetail("A lion index does not detect \"snapshot too old\", so it could answer rows an old snapshot must not see, or miss rows it must."),
+			 errhint("Set old_snapshot_threshold to -1 and restart the server.")));
+}
+
+/*
  * Initialise a page of the lion index.  Sets up the special area.
  */
 void

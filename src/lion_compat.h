@@ -59,6 +59,22 @@
 #endif
 
 /*
+ * old_snapshot_threshold (16 only; 17 removed the feature).  When it is set,
+ * VACUUM removes rows an old snapshot can still see and marks their pages
+ * all-visible, and every read of a page has to call TestForOldSnapshot() to
+ * turn that into "snapshot too old" - which lion does not, so it refuses to
+ * be read at all while the threshold is set (DESIGN.md §9,
+ * lion_check_old_snapshot()).  It is a postmaster setting, so the answer
+ * cannot change under a running server; on 17 and later it is constant false
+ * and the refusals compile away.
+ */
+#if PG_VERSION_NUM < 170000
+#define lion_old_snapshot_threshold_active()	OldSnapshotThresholdActive()
+#else
+#define lion_old_snapshot_threshold_active()	false
+#endif
+
+/*
  * RestrictSearchPath() (17) sets search_path to "pg_catalog, pg_temp" for the
  * current GUC nest level; 17's maintenance commands - CREATE INDEX, REINDEX,
  * VACUUM, amcheck - evaluate the table owner's index expressions under it.

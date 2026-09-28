@@ -1673,9 +1673,11 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	double		walkrows = 0.0;
 
 	/*
-	 * A full walk visits every index tuple - every (key, row) posting, which
-	 * is what pg_class.reltuples of a lion index counts - and
-	 * genericcostestimate() then prorates that into every index page.
+	 * A full walk visits every index tuple, and genericcostestimate() then
+	 * prorates the index's tuples into every index page.  The planner's
+	 * count of those is ROWS: the table's, or for a partial index its
+	 * reltuples, which VACUUM and ANALYZE both set to rows (DESIGN.md §18,
+	 * "Statistics").
 	 */
 	if (fullscan)
 		costs.numIndexTuples = Max(path->indexinfo->tuples, 1.0);
@@ -1704,10 +1706,10 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		double		allpages = Max((double) path->indexinfo->pages, 1.0);
 
 		/*
-		 * reltuples of an index is whatever the last ANALYZE or VACUUM left
-		 * there, and ANALYZE writes the HEAP's row count onto every index of
-		 * a table, so the prorated page count can come out short of the
-		 * index the scan really reads.  Charge the rest of it.
+		 * Rows, not postings: a row is posted once per key column and once
+		 * per element of a multi-key one, so the prorated page count can come
+		 * out short of the index the scan really reads.  Charge the rest of
+		 * it.
 		 */
 		if (costs.numIndexPages < allpages)
 		{
@@ -1818,6 +1820,18 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				costs.indexTotalCost += (windows - 1.0) *
 					Max((double) index->pages, 1.0) * seq_page_cost;
 		}
+	}
+
+	/*
+	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
+	 * is set (DESIGN.md §9, lion_check_old_snapshot()): price every path on
+	 * one out of the running, the way 16 prices a disabled scan.  A plan that
+	 * has nothing else left still gets it, and stops at the scan's ERROR.
+	 */
+	if (lion_old_snapshot_threshold_active())
+	{
+		costs.indexStartupCost += disable_cost;
+		costs.indexTotalCost += disable_cost;
 	}
 
 	*indexStartupCost = costs.indexStartupCost;

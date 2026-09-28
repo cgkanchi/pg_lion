@@ -595,13 +595,17 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    whose ntids reaches 0 is DELETED, and its whole posting tree freed bottom up, in a final step for
    its leaf (§18). A page VACUUM cleanup-locked without writing to it joins the standby barrier of
    §25.
-3. Report stats: num_pages, num_index_tuples = Σ ntids, tuples_removed, and the free pages (§18,
-   "Page counts"): pages_newly_deleted, the pages this VACUUM freed - including what the leak sweep
-   at the end recovered from blocks the walk never reached - ADDED UP over its ambulkdelete calls;
-   pages_deleted, the free pages the index holds at the end of the call; and pages_free, those of
-   them the next allocation could take already.
+3. Report stats: num_pages, num_index_tuples = the ROWS the index holds (§18, "Statistics": Σ
+   ntids over the entries of its first scalar key column, the heap's row count when it has none),
+   tuples_removed (postings), and the free pages (§18, "Page counts"): pages_newly_deleted, the
+   pages this VACUUM freed - including what the leak sweep at the end recovered from blocks the walk
+   never reached - ADDED UP over its ambulkdelete calls; pages_deleted, the free pages the index
+   holds at the end of the call; and pages_free, those of them the next allocation could take
+   already.
 4. amvacuumcleanup: if stats is NULL (no bulkdelete was needed) return a fresh stats struct by
-   counting pages; otherwise pass it through.
+   counting pages, with the heap's row count marked as an estimate; otherwise pass it through. An
+   index of multi-key columns only reports the heap's row count either way, exact when the heap's
+   is (§18, "Statistics").
 
 BUILD (`lion_build.c`, `lion_spool.c`)
 1. table_index_build_scan's callback APPENDS each row's code to its key's entry in a per-key-column
@@ -1133,6 +1137,33 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   The decision is per COUNT and not per index (`lion_sources_all_rmgr()`): a container of an
   intersection carries the dead TIDs of every source it came from, so ONE generic-mode source puts
   the whole count back on rechecking everything.
+  *The index-only scan* (§29.9) trusts the map for every TID it returns, and its pin is the same
+  interlock, so it makes the same decision per index (2026-09-27 review; `liongettuple()` never
+  asked whether it was in recovery, and returned the dead rows of a generic-mode index on a
+  standby): in recovery, over a generic-mode index, it looks every TID up in the heap under its
+  snapshot, as its UNION shape always does, and returns only the visible ones
+  (`test/recovery/run.sh` phase 2 compares a standby's index-only scan with its sequential scan,
+  before and after a VACUUM on the primary, in both modes). A bitmap scan needs nothing of the
+  kind: the bitmap heap scan fetches every page and applies the snapshot itself (its skip-fetch
+  shortcut, which trusted the map, was unsafe for every index AM and is disabled in core's current
+  minor releases - 16.15's `can_skip_fetch = false` - and gone from master), and a plain index scan
+  fetches every tuple.
+- **old_snapshot_threshold (PostgreSQL 16 only).** With the threshold set, VACUUM and pruning use a
+  horizon that may have passed an old snapshot's xmin: they remove TIDs that snapshot still sees and
+  mark their pages all-visible. Core's access methods compare every page they read with the
+  snapshot (`TestForOldSnapshot()`) and raise "snapshot too old"; lion had not one such test, so a
+  count, a bitmap scan and an index-only scan answered silently differently inside one snapshot
+  (2026-09-27 review) - a TID gone is a row missed, and nothing in the heap raises for a page it is
+  never asked to read. Rather than test every page of every path, lion is not READ at all while
+  the threshold is set (`lion_check_old_snapshot()`, the test in lion_compat.h, constant false
+  from 17, which removed the setting): `lioncostestimate()` adds `disable_cost` to every path on a
+  lion index, the LionCount (count, GROUP BY, FK join) and LionOrdered hooks offer nothing, and
+  what reaches a lion index under an MVCC snapshot anyway - a direct SQL count, a plan with every
+  other path disabled - is an ERROR (`ERRCODE_FEATURE_NOT_SUPPORTED`) in amgettuple, amgetbitmap
+  and the count functions. The snapshot is not known yet in ambeginscan, which is why the refusal
+  is in the calls that read. Inserts and VACUUM are not affected; neither is
+  `lion_index_verify()`, whose heap scan raises "snapshot too old" itself on any page early
+  pruning changed, and whose structural checks use no snapshot.
 
 Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
@@ -3068,10 +3099,11 @@ phrase form **68.6 against 31.8**. So `lioncostestimate` now asks, before callin
   same way the count pushdown asks;
 - a multi-key query whose value is not a plan-time Const is costed as ALL, because the MODE follows
   the query's shape and an unknown shape has to be assumed to be the expensive one;
-- then `numIndexTuples` is the index's whole `reltuples` - its (key, row) postings, which is what
-  `lionbuild` reports and `lionvacuumcleanup` keeps, though an ANALYZE since will have overwritten it
-  with the heap's row count and made this a lower bound - which prorates into every index page, and
-  any page the proration still leaves out is added at random_page_cost;
+- then `numIndexTuples` is the index's whole tuple count as the planner has it - its ROWS, the
+  table's or a partial index's `reltuples`, which VACUUM and ANALYZE both set to rows (§18,
+  "Statistics"; VACUUM used to set the postings) and which is therefore a lower bound on the
+  postings a multi-key column's walk reads - which prorates into every index page, and any page the
+  proration still leaves out is added at random_page_cost;
 - and for the multi-key fallback ONLY, `indexSelectivity` becomes 1.0, so the bitmap heap scan above
   is costed as a recheck of the whole table. `IS NOT NULL` keeps the clause's own selectivity: the
   rows it emits are exactly the rows it selects, so its heap side is not a full recheck even though
@@ -3479,6 +3511,24 @@ reusable when it is all-zero, or DELETED with its safexid behind every snapshot,
 lion_alloc_page()'s test.  A page freed a moment ago is free and not yet reusable: "30 newly
 deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all still
 reports none of them, §5 step 4: counting them would mean reading every page of the index.)
+
+**Statistics** (2026-09-27 review).  `num_index_tuples` becomes the index's `pg_class.reltuples`
+whenever it is not marked estimated, and the planner reads that as ROWS - a partial index's size
+is estimate_rel_size()'s tuples-per-page density of it, clamped to the table's rows - and ANALYZE
+writes rows there too.  ambulkdelete used to report Σ ntids over every entry, exact
+(`estimated_count = false`): the NULL entry, every column of a multicolumn index, every element of a
+multi-key one and every SUMMARY entry (§32) all over again, so every VACUUM put a multiple of the
+rows there and every ANALYZE put the rows back, and plans flipped between the two.  Now it reports
+the rows: Σ ntids over the entries of the index's FIRST SCALAR key column, SUMMARY entries left
+out, which is exact because a scalar column files every row the index holds under exactly one
+entry, the NULL entry for a NULL (§14, §24); for a partial index that is the count ANALYZE only
+estimates.  An index whose key columns are all multi-key files a row under any number of entries,
+the EMPTY entry included (§17), and nothing short of their union counts its rows, so it reports
+the heap's row count instead, exact when the heap's is - `ginvacuumcleanup()`'s answer, and wrong
+for a partial index the same way. `tuples_removed` stays a count of postings, as GIN's is. ambuild
+still reports the postings it wrote as `index_tuples`, as GIN's does, until the first ANALYZE, or
+the first VACUUM that removes something, replaces them (not done: a row count per build
+participant).
 
 **The spill** (2026-09-25 review).  An INLINE posting set that outgrows its entry moves onto
 container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry by an order of
@@ -5567,7 +5617,8 @@ GUC `pg_lion.rmgr_id` (default: one of the reserved custom ids; document the col
 to check `pg_get_wal_resource_managers()`). Without preload the extension keeps working on generic
 WAL: the rmgr is optional, chosen at index creation and recorded on the meta page (`wal_mode`), so a
 cluster can mix; an index created in rmgr mode refuses to be written by a backend whose server did
-not register the rmgr (ERROR with the preload hint) but can still be read.
+not register the rmgr (ERROR with the preload hint) but can still be read. (Implemented so, with
+one exception: an unlogged or temporary index writes no WAL, and is written anywhere.)
 
 ### The shim (`lion_wal.[ch]`, implemented)
 
@@ -5808,6 +5859,19 @@ after the visit; pages visited after the last removal of an ambulkdelete are
 dropped (every dead TID of the cycle has been removed by then, and a TID that
 moved off a page later in the walk moved onto a page later still).
 
+Redo takes only the barrier blocks that are in shared buffers (2026-09-27
+review). A reader that still pins a page it copied containers out of keeps
+that page's buffer from being evicted, so a block the buffer mapping does not
+have has no reader to wait for; redo looks each one up there
+(`lion_redo_resident_buffer()`, the lookup `PrefetchSharedBuffer()` makes
+before it starts a read of a block it misses) and pins it with
+`ReadRecentBuffer()` only when it is there and valid. A reader that pins the
+block after the lookup copies the page as replay has left it, which is the
+position of a reader that pins a resident block the moment the barrier lets go
+of it. Before, the barrier read every block with `XLogReadBufferExtended()`,
+and the ranges of one sparse VACUUM cover nearly the whole index: its replay
+read nearly all of it, synchronously, a block at a time.
+
 Redo. `lion_redo()` reads the header, applies the barrier if there is one, then
 takes each registered block in the order the record lists it, with
 RBM_ZERO_AND_LOCK for a block in `initmask` and `get_cleanup_lock = true` for a
@@ -5919,7 +5983,10 @@ a server without it is an ERROR with the preload hint, at CREATE INDEX (from
 `lionoptions()`) and again at build. READING an rmgr-mode index works on any
 server; WRITING one without the manager ERRORs in `lion_wal_begin()`, which is
 the one place every write path passes through, with the preload hint and the
-REINDEX alternative. REINDEX is what changes an index's mode.
+REINDEX alternative - unless the index is unlogged or temporary, whose writes
+insert no record at all, so that nothing about them needs the manager
+(2026-09-27 review: they used to be refused all the same). REINDEX is what
+changes an index's mode.
 `lion_index_wal_mode(idx)` reports it.
 
 **VACUUM is the one path that could write without `lion_wal_begin()`**
@@ -5941,7 +6008,8 @@ write - a VACUUM that has something to remove from such an index still stops
 at its first write, with the hint. `test/recovery/run.sh` phase 1f vacuums an
 rmgr-mode partial index on a server restarted without the preload, then
 crashes it: no custom-manager record may be in the range, and recovery must
-succeed.
+succeed. Before that it inserts into and vacuums an UNLOGGED rmgr-mode index
+there, which must work.
 
 ### Testing (implemented)
 
@@ -6231,8 +6299,8 @@ barrier of 7,488 blocks in 11,960 bytes, 0.15% of its 7.8 MB of index WAL, and
 still no stand-alone record. The generic arm writes no barrier (a generic-mode
 standby rechecks every TID, §9) and pays only for the cleanup locks of the
 posting-tree descents, which are not measurable here. Replay pays one buffer
-lookup and one uncontended cleanup lock per barrier block, and only in hot
-standby.
+lookup per barrier block and one uncontended cleanup lock per barrier block in
+shared buffers, and only in hot standby.
 
 ## 26. `count(DISTINCT k)` in the pushdown (v1, implemented)
 
@@ -8548,7 +8616,9 @@ none; `amoptionalkey` lets the planner scan a lion index with no key at all, and
 - `xs_want_itup` turns `dropPin` off, so a WALK keeps the directory leaf of each INLINE entry and
   the posting leaf of each container pinned until the next batch - the §9 interlock, which is
   what makes the executor's visibility-map test of each returned TID safe, exactly as for the
-  count;
+  count - except on a hot standby over a generic-mode index, whose replay takes no cleanup lock:
+  there every shape's TIDs are looked up in the heap first, as the UNION's are below (§9, "Hot
+  standby"; 2026-09-27 review);
 - the UNION shape (a multi-key first column) returns only TIDs the index holds (§29.6) but pins
   none of the pages they came from, so each of them is looked up in the heap under the scan's
   snapshot first (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays
