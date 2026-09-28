@@ -8384,6 +8384,71 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 }
 
 /*
+ * Do the child's rows carry the dimension's column `var`?  The node reads
+ * every dimension column it emits, and the key, from its child's row
+ * (lion_child_resno()).  A dimension of one table always carries the columns
+ * the query needs of it above the scan; a dimension that is a join (DESIGN.md
+ * §27, "A dimension that is a join") carries those its join rel's target
+ * holds, which are the ones needed above the join - every one the node's own
+ * target can name - and that is checked here rather than assumed.
+ */
+static bool
+lion_fkjoin_child_has(const LionFkJoin *fj, Var *var)
+{
+	ListCell   *lc;
+
+	foreach(lc, fj->dimpath->pathtarget->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (IsA(v, Var) && v->varno == var->varno &&
+			v->varattno == var->varattno && v->varlevelsup == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Could the dimension's rows differ from one run of its plan to the next -
+ * something volatile in a qual of one of its tables, in a join condition
+ * inside it (a semi or anti join of a dimension that is a join, DESIGN.md
+ * §27, "A dimension that is a join"), or inside a table of it that is no
+ * table: a subquery, a function or a VALUES list?  The forward semi join's
+ * parallel plan has every participant run the dimension whole and needs them
+ * all to see the same rows.
+ */
+static bool
+lion_fkjoin_dim_volatile(PlannerInfo *root, const LionFkJoin *fj)
+{
+	Relids		dimrels = fj->dimchild->relids;
+	int			i = -1;
+
+	while ((i = bms_next_member(dimrels, i)) >= 0)
+	{
+		RelOptInfo *r = root->simple_rel_array[i];
+		RangeTblEntry *rte = root->simple_rte_array[i];
+		ListCell   *lc;
+
+		if (contain_volatile_functions((Node *) r->baserestrictinfo))
+			return true;
+		foreach(lc, r->joininfo)
+		{
+			RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+			if (bms_is_subset(ri->required_relids, dimrels) &&
+				contain_volatile_functions((Node *) ri->clause))
+				return true;
+		}
+		if (rte->rtekind != RTE_RELATION &&
+			(contain_volatile_functions((Node *) rte->subquery) ||
+			 contain_volatile_functions((Node *) rte->functions) ||
+			 contain_volatile_functions((Node *) rte->values_lists)))
+			return true;
+	}
+	return false;
+}
+
+/*
  * One FK-side join path (DESIGN.md §27) over `child` - the dimension's
  * cheapest path, or, with `workers` above zero, its cheapest partial path run
  * by that many workers - and what goes above it into the grouped rel.
@@ -8798,14 +8863,19 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 			/*
 			 * Only the dimension's own columns: they come out of the child's
-			 * rows.  A fact column would have to be a group of the posting
-			 * sets under each dimension row, which v1 does not build - but
-			 * for the fact's join column where it stands for the key.
+			 * rows, which have to carry them (lion_fkjoin_child_has()).  A
+			 * fact column would have to be a group of the posting sets under
+			 * each dimension row, which v1 does not build - but for the
+			 * fact's join column where it stands for the key.
 			 */
 			if (v->varattno <= 0 || v->varlevelsup != 0)
 				return;
 			if (v->varno == (int) fj->dimrel->relid)
+			{
+				if (!lion_fkjoin_child_has(fj, v))
+					return;
 				continue;
+			}
 			if (fkkey && v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno)
 				continue;
@@ -8898,7 +8968,11 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			if (!IsA(v, Var) || v->varlevelsup != 0 || v->varattno <= 0)
 				return;
 			if (v->varno == (int) fj->dimrel->relid)
+			{
+				if (!lion_fkjoin_child_has(fj, v))
+					return;
 				continue;
+			}
 			if (v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno &&
 				(fj->jointype == JOIN_INNER ||
@@ -9089,7 +9163,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	parallel = (output_rel->consider_parallel &&
 				fj->joinrel->consider_parallel &&
 				rel->consider_parallel &&
-				fj->dimrel->consider_parallel &&
+				fj->dimchild->consider_parallel &&
 				is_parallel_safe(root, (Node *) consts));
 
 	/*
@@ -9116,12 +9190,14 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		 * in a worker, and nothing in the dimension's quals is volatile,
 		 * which could keep a row in one participant and drop it in another.
 		 * It is the dimension's cheapest path that may run in a worker, which
-		 * is not its cheapest path when that is a Gather.  The workers are
+		 * is not its cheapest path when that is a Gather - of its table, or of
+		 * the join rel of a dimension that is a join, whose semi and anti
+		 * joins and the tables inside them are asked the same.  The workers are
 		 * what a parallel scan of the fk index pages the distinct keys read
 		 * would get, as for the other joins; there is no partial child whose
 		 * own count could be more.
 		 */
-		foreach(lc, fj->dimrel->pathlist)
+		foreach(lc, fj->dimchild->pathlist)
 		{
 			Path	   *p = (Path *) lfirst(lc);
 
@@ -9137,17 +9213,16 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 											  1.0),
 										  max_parallel_workers_per_gather);
 
-		if (whole != NULL && workers > 0 &&
-			!contain_volatile_functions((Node *) fj->dimrel->baserestrictinfo))
+		if (whole != NULL && workers > 0 && !lion_fkjoin_dim_volatile(root, fj))
 			lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 								  whole, workers, nodetarget, base,
 								  joinclause, jointype, rowagg, perrow,
 								  whereclauses, wherekinds, ors, dimrows,
 								  found, true);
 	}
-	else if (parallel && fj->dimrel->partial_pathlist != NIL)
+	else if (parallel && fj->dimchild->partial_pathlist != NIL)
 	{
-		Path	   *partial = (Path *) linitial(fj->dimrel->partial_pathlist);
+		Path	   *partial = (Path *) linitial(fj->dimchild->partial_pathlist);
 		int			workers;
 
 		/*
@@ -10688,14 +10763,16 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/*
-	 * A join of two tables may be the FK-side join of DESIGN.md §27, either
-	 * way round; each orientation that qualifies is tried, and the cost model
-	 * chooses among them and the ordinary plan.
+	 * A join may be the FK-side join of DESIGN.md §27: of two tables, either
+	 * way round, or of a fact and a dimension that is itself a join ("A
+	 * dimension that is a join"), with each table that could be the fact.
+	 * Each way that qualifies is tried, and the cost model chooses among them
+	 * and the ordinary plan.
 	 */
 	if (input_rel->reloptkind == RELOPT_JOINREL)
 	{
-		LionFkJoin	fj[2];
-		int			nfj = lion_fkjoin_recognize(root, input_rel, fj);
+		LionFkJoin *fj;
+		int			nfj = lion_fkjoin_recognize(root, input_rel, &fj);
 		int			i;
 
 		for (i = 0; i < nfj; i++)

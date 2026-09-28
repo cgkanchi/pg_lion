@@ -1,0 +1,1175 @@
+-- FK-side join pushdown whose DIMENSION is a join (DESIGN.md §27, "A
+-- dimension that is a join").
+--
+-- The dimension is one base table that carries the key, and other tables
+-- joined to it only as the inner side of semi and anti joins (EXISTS, IN, NOT
+-- EXISTS), which never repeat its rows.  The node's child is then core's plan
+-- of that join, and the fact is any other table of the query that qualifies
+-- as one: a dimension with an EXISTS on each of two facts is either fact
+-- counted against the dimension semi-joined to the other.  Every answer is
+-- checked against the same query run serially through the pushdown, and with
+-- the pushdown off and sequential scans only.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+-- parallel plans at any size; the suite's own setting is 0, and lion_gj()
+-- runs every query serially as well
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+/*
+ * lion_gj() runs a query through the pushdown with every join method
+ * disabled (but hash joins, when lion.gj_hash is on), so that the node is
+ * exercised wherever it has a path: once as
+ * planned - in parallel, when the plan says so - once with
+ * max_parallel_workers_per_gather at 0, and once with the pushdown off and
+ * sequential scans only.  It compares both of the first two with the third
+ * and says whether the first was pushed down.  Which table was the fact, and
+ * whether the plan was parallel, it says only when asked (`show` 'fact' or
+ * 'plan'): with two facts that qualify, and between the serial node and the
+ * parallel one, the choice follows core's price of the joined dimension's
+ * own plan, which is not the same on every major (PostgreSQL 18 has right
+ * semi joins, 16 does not), so it is asked where the query leaves no choice
+ * or a setting makes it.
+ */
+CREATE FUNCTION lion_gj(q text, show text DEFAULT '') RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	fact text := '';
+	nrows bigint;
+	ndiff bigint;
+	sdiff bigint;
+BEGIN
+	IF coalesce(current_setting('lion.gj_hash', true), '') <> 'on' THEN
+		PERFORM set_config('enable_hashjoin', 'off', true);
+	END IF;
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'parallel' THEN
+			how := 'serial';
+		ELSIF ln LIKE '%Partitions: lion_gj_f1%' THEN
+			fact := ', fact f1';
+		ELSIF ln LIKE '%Lion Indexes: lion_gj_f2%' THEN
+			fact := ', fact f2';
+		ELSIF ln LIKE '%Lion Indexes: lion_gj_f3%' THEN
+			fact := ', fact f3';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_gj_par AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE format('CREATE TEMP TABLE lion_gj_ser AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_gj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_gj_par' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gj_par EXCEPT ALL SELECT * FROM lion_gj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gj_off EXCEPT ALL SELECT * FROM lion_gj_par) b)'
+		INTO ndiff;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gj_ser EXCEPT ALL SELECT * FROM lion_gj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gj_off EXCEPT ALL SELECT * FROM lion_gj_ser) b)'
+		INTO sdiff;
+	EXECUTE 'DROP TABLE lion_gj_par, lion_gj_ser, lion_gj_off';
+
+	IF ndiff <> 0 OR sdiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ in parallel, %s serially', ndiff, sdiff);
+	END IF;
+	IF how = 'not pushed down' OR show <> 'fact' THEN
+		fact := '';
+	END IF;
+	IF how <> 'not pushed down' AND show <> 'plan' THEN
+		how := 'pushed down';
+	END IF;
+	RETURN format('%s%s, %s rows', how, fact, nrows);
+END $$;
+/* The answer itself, joins disabled: to pin a value, not only an agreement. */
+CREATE FUNCTION lion_gj_val(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	RETURN QUERY EXECUTE format('SELECT s::text FROM (%s) s', q);
+END $$;
+/*
+ * The node and what is above it, joins disabled, with the dimension's own plan
+ * as one line: that plan is whatever each major makes of a small join, and
+ * what matters is that it is one.
+ */
+CREATE FUNCTION lion_gj_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	seen boolean := false;
+	child text := NULL;
+	isjoin boolean := false;
+BEGIN
+	IF coalesce(current_setting('lion.gj_hash', true), '') <> 'on' THEN
+		PERFORM set_config('enable_hashjoin', 'off', true);
+	END IF;
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		IF child IS NOT NULL THEN
+			IF ln ~ '(Join|Nested Loop)' THEN
+				isjoin := true;
+			END IF;
+			CONTINUE;
+		END IF;
+		IF seen AND ln ~ '^\s*->' THEN
+			child := ln;
+			isjoin := ln ~ '(Join|Nested Loop)';
+			CONTINUE;
+		END IF;
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			seen := true;
+		END IF;
+		RETURN NEXT ln;
+	END LOOP;
+	IF child IS NOT NULL THEN
+		RETURN NEXT regexp_replace(child, '->.*$',
+								   CASE WHEN isjoin THEN '->  (the dimension''s plan: a join)'
+										ELSE '->  (the dimension''s plan: a scan)' END);
+	END IF;
+END $$;
+/* Which plan the cost model picks with nothing disabled, and its fact. */
+CREATE FUNCTION lion_gj_pick(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'ordinary plan';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			how := 'the node';
+		ELSIF how = 'the node' AND ln LIKE '%Partitions: lion_gj_f1%' THEN
+			how := 'the node, fact f1';
+		ELSIF how = 'the node' AND ln LIKE '%Lion Indexes: lion_gj_f2%' THEN
+			how := 'the node, fact f2';
+		END IF;
+	END LOOP;
+	RETURN how;
+END $$;
+/* Whether the plan, every join disabled, is the parallel node. */
+CREATE FUNCTION lion_gj_parallel(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_gj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+/*
+ * Every column below is drawn from its own hash of the row number
+ * (lion_gj_h()), so that no two of them - a filter of one fact, the key, a
+ * dimension filter - line up by the arithmetic of the row numbers, and every
+ * answer has rows to count.
+ */
+CREATE FUNCTION lion_gj_h(i int8, seed int8) RETURNS int8
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS 'SELECT hashint8extended(i, seed) & 9223372036854775807';
+/*
+ * The dimension: 3000 rows over some twenty pages, so that two workers both
+ * have a share, int8 primary key 1..3000, attr 0..6 with NULL on every 13th,
+ * a small int, a region and a group.
+ */
+CREATE TABLE lion_gj_d (
+	pk		int8	PRIMARY KEY,
+	attr	int,
+	small	int2,
+	region	text	NOT NULL,
+	grp		text	NOT NULL
+) WITH (parallel_workers = 2);
+INSERT INTO lion_gj_d
+SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE lion_gj_h(i, 1) % 7 END,
+	   (lion_gj_h(i, 2) % 5)::int2,
+	   (ARRAY['eu', 'us', 'ap'])[1 + (lion_gj_h(i, 3) % 3)::int], 'g' || lion_gj_h(i, 4) % 4
+  FROM generate_series(1, 3000) i;
+CREATE INDEX lion_gj_d_rg ON lion_gj_d USING lion (region, grp);
+/*
+ * A second dimension over 1,500 keys, duplicated, with NULL keys and no
+ * uniqueness.
+ */
+CREATE TABLE lion_gj_n (
+	k		int8,
+	attr	int,
+	region	text	NOT NULL
+) WITH (parallel_workers = 2);
+INSERT INTO lion_gj_n
+SELECT CASE WHEN i % 29 = 0 THEN NULL ELSE 1 + lion_gj_h(i, 11) % 1500 END,
+	   lion_gj_h(i, 12) % 5,
+	   (ARRAY['eu', 'us', 'ap'])[1 + (lion_gj_h(i, 13) % 3)::int]
+  FROM generate_series(1, 3000) i;
+/*
+ * f1: 40000 rows LIST-partitioned by kind, which no lion index covers - 'a'
+ * sub-partitioned by range on ts, 'b' alone, 'c' and 'd' together, and a
+ * default partition for the rest, NULL kind included.  ts is a day in the
+ * last sixty or between 180 and 780 days back, so that `ts >= now() -
+ * interval '120 days'`, a stable range, keeps the recent third whatever the
+ * day; the sub-partitions of 'a' are cut 150 days back.  fk runs over
+ * 1..3600, a third of the rows on keys 1..60, NULL on every 40th row: keys
+ * 3001..3600 join no dimension row.  One
+ * partitioned lion index on (tags, ts, fk), x has one of its own, and the
+ * partition of 'c' and 'd' one on kind, which its bounds do not decide.
+ */
+CREATE TABLE lion_gj_f1 (
+	id		int		NOT NULL,
+	kind	text,
+	fk		int8,
+	x		int		NOT NULL,
+	tags	text[],
+	ts		timestamptz NOT NULL
+) PARTITION BY LIST (kind);
+CREATE TABLE lion_gj_f1_a PARTITION OF lion_gj_f1 FOR VALUES IN ('a')
+	PARTITION BY RANGE (ts);
+DO $$
+BEGIN
+	EXECUTE format('CREATE TABLE lion_gj_f1_a_old PARTITION OF lion_gj_f1_a FOR VALUES FROM (%L) TO (%L)',
+				   date_trunc('day', now()) - interval '3000 days',
+				   date_trunc('day', now()) - interval '150 days');
+	EXECUTE format('CREATE TABLE lion_gj_f1_a_new PARTITION OF lion_gj_f1_a FOR VALUES FROM (%L) TO (%L)',
+				   date_trunc('day', now()) - interval '150 days',
+				   date_trunc('day', now()) + interval '30 days');
+END $$;
+CREATE TABLE lion_gj_f1_b PARTITION OF lion_gj_f1 FOR VALUES IN ('b');
+CREATE TABLE lion_gj_f1_cd PARTITION OF lion_gj_f1 FOR VALUES IN ('c', 'd');
+CREATE TABLE lion_gj_f1_def PARTITION OF lion_gj_f1 DEFAULT;
+INSERT INTO lion_gj_f1
+SELECT i,
+	   CASE lion_gj_h(i, 21) % 10 WHEN 0 THEN 'a' WHEN 1 THEN 'a' WHEN 2 THEN 'a'
+				   WHEN 3 THEN 'b' WHEN 4 THEN 'b' WHEN 5 THEN 'c'
+				   WHEN 6 THEN 'd' WHEN 7 THEN 'e' WHEN 8 THEN NULL ELSE 'b' END,
+	   CASE WHEN i % 40 = 0 THEN NULL
+			WHEN lion_gj_h(i, 22) % 3 = 0 THEN 1 + lion_gj_h(i, 23) % 60
+			ELSE 1 + lion_gj_h(i, 23) % 3600 END,
+	   lion_gj_h(i, 24) % 10,
+	   ARRAY['t' || lion_gj_h(i, 25) % 11, 'u' || lion_gj_h(i, 26) % 7],
+	   date_trunc('day', now()) -
+	   (CASE WHEN lion_gj_h(i, 27) % 3 = 0 THEN lion_gj_h(i, 28) % 60
+			 ELSE 180 + lion_gj_h(i, 28) % 600 END) * interval '1 day'
+  FROM generate_series(1, 40000) i;
+CREATE INDEX lion_gj_f1_tsf ON lion_gj_f1 USING lion (tags, ts, fk);
+CREATE INDEX lion_gj_f1_x ON lion_gj_f1 USING lion (x);
+CREATE INDEX lion_gj_f1_cd_kind ON lion_gj_f1_cd USING lion (kind);
+/*
+ * f2: 30000 rows of a plain table, fk over 1..3300, NULL on every 37th row
+ * and no row for the keys that are multiples of 19, a tsvector of two lexemes
+ * and y 0..12; lion indexes on (doc, fk) and on y.
+ */
+CREATE TABLE lion_gj_f2 (
+	id		int		NOT NULL,
+	fk		int8,
+	doc		tsvector,
+	y		int		NOT NULL
+) WITH (parallel_workers = 2);
+INSERT INTO lion_gj_f2
+SELECT i,
+	   CASE WHEN i % 37 = 0 THEN NULL
+			WHEN (1 + lion_gj_h(i, 31) % 3300) % 19 = 0 THEN NULL
+			ELSE 1 + lion_gj_h(i, 31) % 3300 END,
+	   array_to_tsvector(ARRAY['w' || lion_gj_h(i, 32) % 17, 'v' || lion_gj_h(i, 33) % 5]),
+	   lion_gj_h(i, 34) % 13
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lion_gj_f2_df ON lion_gj_f2 USING lion (doc, fk);
+CREATE INDEX lion_gj_f2_y ON lion_gj_f2 USING lion (y);
+/* f3: a third fact, 20000 rows, fk over 1..3000, z 0..6 */
+CREATE TABLE lion_gj_f3 (
+	fk		int8,
+	z		int		NOT NULL
+);
+INSERT INTO lion_gj_f3
+SELECT 1 + lion_gj_h(i, 41) % 3000, lion_gj_h(i, 42) % 7 FROM generate_series(1, 20000) i;
+CREATE INDEX lion_gj_f3_fk ON lion_gj_f3 USING lion (fk);
+CREATE INDEX lion_gj_f3_z ON lion_gj_f3 USING lion (z);
+VACUUM (FREEZE, ANALYZE) lion_gj_d;
+VACUUM (FREEZE, ANALYZE) lion_gj_n;
+VACUUM (FREEZE, ANALYZE) lion_gj_f1;
+VACUUM (FREEZE, ANALYZE) lion_gj_f2;
+VACUUM (FREEZE, ANALYZE) lion_gj_f3;
+-- ---- 1. the plans --------------------------------------------------------------
+-- serially: which is cheaper, the node or the parallel node, is section 5's
+SET max_parallel_workers_per_gather = 0;
+-- (A) a dimension semi-joined to two facts: f2 counted against the dimension
+-- semi-joined to f1, which is the node's child; f1's filter is one no posting
+-- set answers, so f2 is the only fact there can be
+SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
+                                              lion_gj_explain                                              
+-----------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+         Join Type: Semi
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(6 rows)
+
+-- ... and the other way round: f1 counted against the dimension semi-joined
+-- to f2, partition by partition, with a filter per kind ORed and a stable
+-- range
+SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)');
+                                                                                               lion_gj_explain                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Partitions: lion_gj_f1_a_old, lion_gj_f1_a_new, lion_gj_f1_b, lion_gj_f1_cd
+         Lion Indexes: (fk = d.pk), (((kind = 'a'::text) AND (tags && '{t1}'::text[])) OR ((kind = 'b'::text) AND (x = 3)) OR (kind = 'c'::text)), (ts >= (now() - '@ 120 days'::interval))
+         Implied by Partition Bounds: (kind = 'a'::text) in 2 of 4 partitions, (kind = 'b'::text) in 1 of 4 partitions
+         Refuted by Partition Bounds: ((kind = 'a'::text) AND (tags && '{t1}'::text[])) in 2 of 4 partitions, ((kind = 'b'::text) AND (x = 3)) in 3 of 4 partitions, (kind = 'c'::text) in 3 of 4 partitions
+         Join Type: Semi
+         Join Key Lookups: in index order
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(10 rows)
+
+-- (B) a fact counted against a dimension narrowed by a semi join to another
+-- fact: the forward semi join over a key the primary key proves unique, which
+-- is the inner join over the joined dimension
+SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.doc @@ ''w3 | w5'' AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''a'' AND f1.ts >= now() - interval ''120 days''))');
+                                              lion_gj_explain                                              
+-----------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(5 rows)
+
+-- ... over the non-unique dimension, whose keys the node makes distinct
+SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 3 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b''))');
+                             lion_gj_explain                             
+-------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = n.k), lion_gj_f2_y (y = 5)
+         Join Type: Semi
+         Join Keys: distinct, sorted
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(7 rows)
+
+-- an anti join inside the dimension
+SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+                             lion_gj_explain                              
+--------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = 5)
+         Join Type: Semi
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(6 rows)
+
+-- the anti join as the node's: the dimension semi-joined to f2 and anti-joined to f1
+SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)');
+                     lion_gj_explain                     
+---------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Partitions: lion_gj_f1_b
+         Lion Indexes: (fk = d.pk), (x = 3)
+         Implied by Partition Bounds: (kind = 'b'::text)
+         Join Type: Anti
+         Join Key Lookups: in index order
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(9 rows)
+
+-- an inner join over the joined dimension, grouped by a dimension column
+SELECT * FROM lion_gj_explain('SELECT d.attr, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.attr');
+                             lion_gj_explain                              
+--------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: d.attr
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = 5)
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(6 rows)
+
+-- grouped by the key: each row a group of its own, as over one table
+SELECT * FROM lion_gj_explain('SELECT d.pk, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.pk');
+                             lion_gj_explain                              
+--------------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d.pk
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = 5)
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(6 rows)
+
+-- the rows with their counts, below a LionJoinAgg
+SELECT * FROM lion_gj_explain('SELECT count(DISTINCT d.attr), count(*), max(d.grp) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0)');
+                                   lion_gj_explain                                    
+--------------------------------------------------------------------------------------
+ Custom Scan (LionJoinAgg)
+   ->  Aggregate
+         ->  Sort
+               Sort Key: d.attr
+               ->  Custom Scan (LionCount)
+                     Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = 5)
+                     Join Rows: the dimension rows with a match, each with its count
+                     Fact Filters: collected once
+                     ->  (the dimension's plan: a join)
+(9 rows)
+
+SET max_parallel_workers_per_gather = 2;
+-- ---- 2. the answers ------------------------------------------------------------
+-- (A), with each fact the only one there can be, and with both, the cheaper
+-- taken
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f2, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f1, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.tags && ''{u2}'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.grp = ''g1'' AND d.pk IN (SELECT f1.fk FROM lion_gj_f1 f1 WHERE f1.kind = ''b'' AND f1.x > 5) AND d.pk IN (SELECT f2.fk FROM lion_gj_f2 f2 WHERE f2.doc @@ ''v2'')');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- three facts: any of them counted against the dimension semi-joined to the
+-- other two
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y < 4) AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 2)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- grouped, with HAVING, ORDER BY and LIMIT; count of the key; count(DISTINCT)
+-- and the aggregates of the node's rows
+SELECT lion_gj('SELECT d.attr, count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'') GROUP BY d.attr');
+       lion_gj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.region, d.grp, count(d.pk) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y IN (1, 2, 3)) GROUP BY d.region, d.grp HAVING count(*) > 10 ORDER BY 3 DESC LIMIT 4');
+       lion_gj       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(DISTINCT d.attr), min(d.small), sum(d.small), count(d.attr), bool_or(d.attr = 3) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.pk, count(*) FROM lion_gj_d d WHERE d.region = ''us'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y < 6) GROUP BY d.pk');
+        lion_gj        
+-----------------------
+ pushed down, 816 rows
+(1 row)
+
+-- (B): the forward semi join over the joined dimension, grouped by the fact's
+-- key, counted distinct, and beside another aggregate
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.doc @@ ''w3 | w5'' AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''a'' AND f1.ts >= now() - interval ''120 days''))', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f2, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 5 AND EXISTS (SELECT 1 FROM lion_gj_d d WHERE d.pk = f2.fk AND d.grp = ''g2'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT f2.fk, count(*) FROM lion_gj_f2 f2 WHERE f2.y = 7 AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'')) GROUP BY f2.fk');
+        lion_gj         
+------------------------
+ pushed down, 1234 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(DISTINCT f2.fk), count(*) FROM lion_gj_f2 f2 WHERE f2.doc @@ ''v1'' AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.attr > 3 AND NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = 3))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- ... over the non-unique dimension, its keys made distinct
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 3 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b''))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(DISTINCT f2.fk) FROM lion_gj_f2 f2 WHERE f2.doc @@ ''w1'' AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.id % 3 = 0))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- anti joins: inside the dimension, and as the node's
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f1, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.grp, count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.ts >= now() - interval ''120 days'') AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3'') GROUP BY d.grp');
+       lion_gj       
+---------------------
+ pushed down, 4 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*), count(d.pk) FROM lion_gj_d d WHERE d.region = ''ap'' AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 1) AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z < 3)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- inner joins over the joined dimension: counts, grouped, the key, the
+-- aggregates of counted rows
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.attr, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.attr');
+       lion_gj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.pk, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.pk');
+        lion_gj         
+------------------------
+ pushed down, 1294 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(DISTINCT d.attr), count(*), max(d.grp) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.region, count(*), sum(d.small), count(d.attr) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind IN (''a'', ''c'') AND f1.ts >= now() - interval ''120 days'' AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w2'') GROUP BY d.region', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f1, 3 rows
+(1 row)
+
+SELECT lion_gj('SELECT f1.fk, count(*) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind = ''b'' AND f1.x = 4 AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 1) GROUP BY f1.fk');
+        lion_gj        
+-----------------------
+ pushed down, 375 rows
+(1 row)
+
+-- an inner join inside an EXISTS of the dimension, and nested EXISTS there:
+-- the dimension's rows are still its table's, each once
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 JOIN lion_gj_n n ON n.k = f1.fk WHERE f1.fk = d.pk AND n.attr = 2)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = 1 AND EXISTS (SELECT 1 FROM lion_gj_n n WHERE n.k = f1.fk AND n.attr = f1.x))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- the answers themselves, of (A) both ways and of (B)
+SELECT * FROM lion_gj_val('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
+ lion_gj_val 
+-------------
+ (191)
+(1 row)
+
+SELECT * FROM lion_gj_val('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.doc @@ ''w3 | w5'' AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''a'' AND f1.ts >= now() - interval ''120 days''))');
+ lion_gj_val 
+-------------
+ (504)
+(1 row)
+
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_gj_d d WHERE d.region = 'eu' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = 'a' AND f1.tags && '{t1}') OR (f1.kind = 'b' AND f1.x = 3) OR f1.kind = 'c') AND f1.ts >= now() - interval '120 days') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ 'w3 | w5');
+ count 
+-------
+   191
+(1 row)
+
+SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.doc @@ 'w3 | w5' AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.region = 'eu' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = 'a' AND f1.ts >= now() - interval '120 days'));
+ count 
+-------
+   504
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+-- ---- 3. NULL and duplicated keys -----------------------------------------------
+-- NULL keys on the fact side are in every fact above (fk NULL on every 40th
+-- row of f1 and 37th of f2).  On the dimension side: the non-unique
+-- dimension's NULL and duplicated keys, semi- and anti-joined to one fact and
+-- tested against another, as a reverse semi join needs no uniqueness
+SELECT lion_gj('SELECT count(*) FROM lion_gj_n n WHERE n.attr < 3 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.y = 5)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT n.attr, count(*), count(n.k) FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = n.k AND f3.z = 4) AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.y < 3) GROUP BY n.attr');
+       lion_gj       
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_n n WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.x = 2) AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.doc @@ ''v4'')');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- an inner join over the joined non-unique dimension is declined: nothing
+-- proves its key unique
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_n n ON f2.fk = n.k WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'')');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ... and grouped by its key it is not a group a row: hashed
+SELECT * FROM lion_gj_explain('SELECT n.k, count(*) FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.id % 3 = 0) GROUP BY n.k');
+                        lion_gj_explain                        
+---------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: n.k
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (LionCount)
+               Partitions: lion_gj_f1_b
+               Lion Indexes: (fk = n.k)
+               Implied by Partition Bounds: (kind = 'b'::text)
+               Join Type: Semi
+               Join Key Lookups: in index order
+               ->  (the dimension's plan: a join)
+(11 rows)
+
+SELECT lion_gj('SELECT n.k, count(*) FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.id % 3 = 0) GROUP BY n.k');
+        lion_gj         
+------------------------
+ pushed down, 1024 rows
+(1 row)
+
+-- the forward semi join needs no proof: its keys are made distinct, NULLs
+-- left out
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.doc @@ ''w7'' AND EXISTS (SELECT 1 FROM lion_gj_n n WHERE n.k = f2.fk AND NOT EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = n.k AND f3.z = 0))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT f2.fk, count(*) FROM lion_gj_f2 f2 WHERE f2.y = 3 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.region = ''us'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.x = 5)) GROUP BY f2.fk');
+        lion_gj        
+-----------------------
+ pushed down, 186 rows
+(1 row)
+
+-- a dimension filtered to nothing, and a fact filter that selects nothing
+SELECT * FROM lion_gj_val('SELECT count(*) FROM lion_gj_d d WHERE d.pk > 5000 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+ lion_gj_val 
+-------------
+ (0)
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 99)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 99)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- ---- 4. the counters ------------------------------------------------------------
+/*
+ * The child's rows are the joined dimension's: the dimension rows with an f1
+ * row of kind 'b', each once, whatever f1 holds of them - and every one of
+ * them is looked up in f2.  Serially, where the counters are one process's.
+ */
+SET max_parallel_workers_per_gather = 0;
+SELECT lion_gj_counter('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.id % 1 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)', 'Join Child Rows') =
+	   (SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = 'b')) AS child_rows,
+	   lion_gj_counter('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.id % 1 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)', 'Join Keys Looked Up') =
+	   (SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = 'b')) AS keys_looked_up,
+	   (SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = 'b')) AS dimension_rows_joined;
+ child_rows | keys_looked_up | dimension_rows_joined 
+------------+----------------+-----------------------
+ t          | t              |                  2692
+(1 row)
+
+/*
+ * The forward semi join over the non-unique dimension looks each distinct
+ * key of its joined rows up once.
+ */
+SELECT lion_gj_counter('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 3 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b''))', 'Join Keys Looked Up') =
+	   (SELECT count(DISTINCT n.k) FROM lion_gj_n n WHERE n.attr < 3 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = 'b')) AS distinct_keys;
+ distinct_keys 
+---------------
+ t
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+-- ---- 5. parallel plans ---------------------------------------------------------
+/*
+ * The node over the joined dimension's partial path below a Gather: each
+ * participant counts the rows its share of that join returns.  Hash joins
+ * stay allowed here (lion.gj_hash), nested loops and merge joins do not: the
+ * child of each is a hash join, and so is any plan it competes with.  With
+ * every join method disabled, PostgreSQL 16 and 17 add disable_cost to both
+ * the serial node's price and the parallel one's, through their children, and
+ * at that size add_path() takes the two for the same price and keeps the
+ * serial path, which is parallel-safe; from 18 disabled nodes are counted
+ * apart from the cost.
+ */
+SET lion.gj_hash = on;
+SELECT * FROM lion_gj_explain('SELECT d.grp, count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.tags && ''{u2}'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0) GROUP BY d.grp');
+                              lion_gj_explain                               
+----------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: d.grp
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (LionCount)
+               Partitions: lion_gj_f1_a_old, lion_gj_f1_a_new, lion_gj_f1_b
+               Lion Indexes: (fk = d.pk), (tags && '{u2}'::text[])
+               Implied by Partition Bounds: (kind = ANY ('{a,b}'::text[]))
+               Join Type: Semi
+               Join Key Lookups: in index order
+               Fact Filters: collected once
+               ->  (the dimension's plan: a join)
+(12 rows)
+
+SELECT lion_gj('SELECT d.grp, count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.tags && ''{u2}'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0) GROUP BY d.grp', 'plan');
+     lion_gj      
+------------------
+ parallel, 4 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(DISTINCT d.attr), count(*) FROM lion_gj_f3 f3 JOIN lion_gj_d d ON f3.fk = d.pk WHERE f3.z = 3 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)', 'plan');
+     lion_gj      
+------------------
+ parallel, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 12 AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 1))', 'plan');
+     lion_gj      
+------------------
+ parallel, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 1) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.tags && ''{u2}'')', 'plan');
+     lion_gj      
+------------------
+ parallel, 1 rows
+(1 row)
+
+/*
+ * The Gather started again for every outer row, the node, its joined child
+ * and the fact filters' copy with it; the answers do not change.
+ */
+SET enable_material = off;
+SET enable_memoize = off;
+SELECT lion_gj('SELECT g, s.c FROM generate_series(1, 3) g LEFT JOIN (SELECT count(*) AS c FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.tags && ''{t1,u1}'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)) s ON s.c > g', 'plan');
+     lion_gj      
+------------------
+ parallel, 3 rows
+(1 row)
+
+RESET enable_material;
+RESET enable_memoize;
+RESET lion.gj_hash;
+/*
+ * The forward semi join over the non-unique dimension runs the joined
+ * dimension whole in every participant and divides its distinct keys.  It
+ * competes with nothing but the serial node here, with every join disabled
+ * and a count priced high enough to make dividing the keys worth it - which
+ * before PostgreSQL 18 is the tie above, and serial; the answers are checked
+ * either way.  A volatile qual inside the joined dimension - of the table
+ * semi-joined to it, not of its own table - keeps it serial on every major:
+ * every participant must see the same rows (an EXISTS with one is not made a
+ * semi join at all; an IN is).
+ */
+SET pg_lion.fkjoin_count_cost = 1000;
+SET pg_lion.fkjoin_copy_count_cost = 1000;
+CREATE FUNCTION lion_gj_vol(int) RETURNS int LANGUAGE plpgsql VOLATILE PARALLEL SAFE
+	AS 'BEGIN RETURN $1; END';
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 12 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 1 AND n.k IN (SELECT f3.fk FROM lion_gj_f3 f3 WHERE f3.z = 1))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj_parallel('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 12 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 1 AND n.k IN (SELECT f3.fk FROM lion_gj_f3 f3 WHERE f3.z = 1))')
+	   OR current_setting('server_version_num')::int < 180000 AS parallel_from_18;
+ parallel_from_18 
+------------------
+ t
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 12 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 1 AND n.k IN (SELECT f3.fk FROM lion_gj_f3 f3 WHERE f3.z = lion_gj_vol(1)))', 'plan');
+    lion_gj     
+----------------
+ serial, 1 rows
+(1 row)
+
+SET max_parallel_workers_per_gather = 0;
+SELECT lion_gj_counter('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 12 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE n.attr < 1 AND n.k IN (SELECT f3.fk FROM lion_gj_f3 f3 WHERE f3.z = 1))', 'Join Keys Looked Up') =
+	   (SELECT count(DISTINCT n.k) FROM lion_gj_n n WHERE n.attr < 1 AND n.k IN (SELECT f3.fk FROM lion_gj_f3 f3 WHERE f3.z = 1)) AS distinct_keys;
+ distinct_keys 
+---------------
+ t
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+RESET pg_lion.fkjoin_count_cost;
+RESET pg_lion.fkjoin_copy_count_cost;
+-- ---- 6. generic plans and rescans ------------------------------------------------
+-- Params in the fact filters, the dimension's and the other fact's, a NULL one
+-- too
+PREPARE lion_gj_q(int, text, int) AS
+	SELECT d.grp, count(*) FROM lion_gj_d d
+	 WHERE d.region = $2
+	   AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = $3 AND f1.id % 3 = 0)
+	   AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = $1)
+	 GROUP BY d.grp;
+SET plan_cache_mode = force_generic_plan;
+SET max_parallel_workers_per_gather = 0;
+SELECT * FROM lion_gj_explain('EXECUTE lion_gj_q(5, ''eu'', 3)');
+                              lion_gj_explain                              
+---------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: d.grp
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = $1)
+         Join Type: Semi
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(7 rows)
+
+CREATE TEMP TABLE lion_gj_g1 AS EXECUTE lion_gj_q(5, 'eu', 3);
+CREATE TEMP TABLE lion_gj_g2 AS EXECUTE lion_gj_q(NULL, 'eu', 3);
+CREATE TEMP TABLE lion_gj_g3 AS EXECUTE lion_gj_q(5, 'eu', NULL);
+PREPARE lion_gj_r(int) AS
+	SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = $1
+	   AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = 'b'));
+SELECT * FROM lion_gj_explain('EXECUTE lion_gj_r(5)');
+                              lion_gj_explain                              
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = $1)
+         Fact Filters: collected once
+         ->  (the dimension's plan: a join)
+(5 rows)
+
+CREATE TEMP TABLE lion_gj_g4 AS EXECUTE lion_gj_r(5);
+CREATE TEMP TABLE lion_gj_g5 AS EXECUTE lion_gj_r(NULL);
+RESET plan_cache_mode;
+SET pg_lion.enable_count_pushdown = off;
+SELECT (SELECT count(*) FROM (TABLE lion_gj_g1 EXCEPT ALL
+		SELECT d.grp, count(*) FROM lion_gj_d d
+		 WHERE d.region = 'eu'
+		   AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = 3 AND f1.id % 3 = 0)
+		   AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)
+		 GROUP BY d.grp) a) AS diff,
+	   (SELECT count(*) FROM lion_gj_g1) AS groups,
+	   (SELECT count(*) FROM lion_gj_g2) AS null_fact_param_groups,
+	   (SELECT count(*) FROM lion_gj_g3) AS null_dim_param_groups,
+	   (SELECT count FROM lion_gj_g4) =
+	   (SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5
+		   AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = 'b'))) AS forward_same,
+	   (SELECT count FROM lion_gj_g5) AS null_param_count;
+ diff | groups | null_fact_param_groups | null_dim_param_groups | forward_same | null_param_count 
+------+--------+------------------------+-----------------------+--------------+------------------
+    0 |      4 |                      0 |                     0 | t            |                0
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_gj_q;
+DEALLOCATE lion_gj_r;
+SET max_parallel_workers_per_gather = 2;
+-- correlated subqueries that rescan the node with a new filter of the fact,
+-- of the joined dimension's other fact, and of the dimension
+SELECT lion_gj('SELECT v.x, (SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = v.x)) FROM (VALUES (1), (4), (8)) v(x)');
+       lion_gj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lion_gj('SELECT v.x, (SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = v.x AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)) FROM (VALUES (1), (4), (8)) v(x)');
+       lion_gj       
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lion_gj('SELECT v.r, (SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 7 AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.region = v.r AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b''))) FROM (VALUES (''eu''), (''ap'')) v(r)');
+       lion_gj       
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ---- 7. declined ---------------------------------------------------------------
+-- (over a few hundred dimension rows: with every join disabled, the ordinary
+-- plans of these can be slow)
+-- an inner join inside the dimension, which may repeat its rows
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d JOIN lion_gj_n n ON n.k = d.pk WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk JOIN lion_gj_n n ON n.attr = d.attr WHERE d.pk < 300 AND n.k < 100 AND f2.y = 5');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- an outer join, and with it a PlaceHolderVar
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d LEFT JOIN lion_gj_n n ON n.k = d.pk WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d LEFT JOIN (SELECT n.k, 1 AS one FROM lion_gj_n n) s ON s.k = d.pk WHERE d.pk < 300 AND s.one IS NULL AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a LATERAL reference
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND EXISTS (SELECT 1 FROM lion_gj_f1 f1, LATERAL (SELECT n.attr FROM lion_gj_n n WHERE n.k = f1.fk ORDER BY n.attr LIMIT 1) s WHERE f1.fk = d.pk AND s.attr = 2)');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a join clause that is not the one fk equality: a second one, and the other
+-- fact's EXISTS correlated to the fact
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = d.attr)');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.x = f2.y)');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- the fact's EXISTS nested inside another's: its join is the other table's,
+-- whose key the equivalence class makes look like the dimension's
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = f1.fk AND f2.y = 5))');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a pseudoconstant qual
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) AND current_setting(''lion.gj_on'', true) IS NULL');
+         lion_gj         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- ---- 8. the cost model -----------------------------------------------------------
+/*
+ * Nothing disabled.  A fact counted against a few rows of the joined
+ * dimension is the node's: f2 against sixty dimension rows semi-joined to
+ * f1.  The whole dimension against both facts unfiltered, where every
+ * dimension row would be looked up, is an ordinary join's: two hashed semi
+ * joins.
+ */
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET max_parallel_workers_per_gather = 0;
+SELECT lion_gj_pick('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 12 AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE d.pk < 60 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b''))') AS few_rows;
+     few_rows      
+-------------------
+ the node, fact f2
+(1 row)
+
+SELECT lion_gj_pick('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk)') AS whole_dimension;
+ whole_dimension 
+-----------------
+ ordinary plan
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+-- ---- 9. a dirty heap -----------------------------------------------------------
+DELETE FROM lion_gj_f1 WHERE kind = 'a' AND id % 7 = 0;
+UPDATE lion_gj_f1 SET x = 3 WHERE kind = 'b' AND id % 11 = 0;
+UPDATE lion_gj_f1 SET fk = 1 + fk % 50 WHERE kind = 'c' AND id % 13 = 0;
+DELETE FROM lion_gj_f2 WHERE id % 17 = 0;
+UPDATE lion_gj_f2 SET fk = 1 + fk % 70 WHERE id % 19 = 0;
+UPDATE lion_gj_f2 SET y = 5 WHERE id % 23 = 0;
+DELETE FROM lion_gj_d WHERE pk % 97 = 0;
+UPDATE lion_gj_n SET k = k + 1 WHERE k % 31 = 0;
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f1, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''c''))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'' AND f1.x = 3))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.attr, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.attr');
+       lion_gj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+VACUUM (FREEZE) lion_gj_f1;
+VACUUM (FREEZE) lion_gj_f2;
+VACUUM (FREEZE) lion_gj_d;
+VACUUM (FREEZE) lion_gj_n;
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)', 'fact');
+           lion_gj            
+------------------------------
+ pushed down, fact f1, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT d.pk FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''c''))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y = 5 AND f2.fk IN (SELECT n.k FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'' AND f1.x = 3))');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_gj('SELECT d.attr, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.attr');
+       lion_gj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_gj('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3) AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0)');
+       lion_gj       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+DROP TABLE lion_gj_f1, lion_gj_f2, lion_gj_f3, lion_gj_d, lion_gj_n;
+DROP FUNCTION lion_gj(text, text);
+DROP FUNCTION lion_gj_val(text);
+DROP FUNCTION lion_gj_explain(text);
+DROP FUNCTION lion_gj_pick(text);
+DROP FUNCTION lion_gj_parallel(text);
+DROP FUNCTION lion_gj_counter(text, text);
+DROP FUNCTION lion_gj_vol(int);
+DROP FUNCTION lion_gj_h(int8, int8);

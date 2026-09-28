@@ -244,6 +244,15 @@ key once per partition it was looked up in. The partitions are the ones plan-tim
 partition that only run-time pruning would remove, as with `ts >= now() - interval '1 year'` over
 partitions by year, is counted too, and contributes nothing.
 
+The dimension may itself be a join: one table that carries the key, and other tables joined to it
+only by `EXISTS`, `IN` or `NOT EXISTS`, which never repeat its rows (DESIGN.md §27, "A dimension
+that is a join"). A dimension `d` with an `EXISTS` on each of two fact tables `f1` and `f2` is
+then `f2` counted against `d` semi-joined to `f1`, or `f1` against `d` semi-joined to `f2`,
+whichever the cost model prices lower; and `SELECT count(*) FROM f2 WHERE ... AND f2.fk IN (SELECT
+d.pk FROM dim d WHERE ... AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND ...))` counts `f2`
+against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. An
+inner or outer join inside the dimension, which could repeat a row, keeps the ordinary plan.
+
 `EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
 key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
 Entry`, the containers the counts read from each key's FK set (`Join Key Containers Read`), from the

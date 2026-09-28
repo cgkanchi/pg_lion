@@ -7324,8 +7324,9 @@ parallel plans and the forward semi join over a non-unique key after them; the l
 on 2026-09-28, and after them what a key's time is made of, the per-key path and the cost of a key
 ("Where a key's time goes" and the two sections after it), counts beside the aggregates that
 need the dimension rows ("Every aggregate over the node's rows"), a GROUP BY of the join key,
-the fact's or the dimension's ("Grouped by the join key"), and last a partitioned fact table
-("A partitioned fact table"). The shape is the star-schema aggregate
+the fact's or the dimension's ("Grouped by the join key"), a partitioned fact table ("A
+partitioned fact table"), and last a dimension that is itself a join of a table and the tables
+semi- or anti-joined to it ("A dimension that is a join"). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -7429,8 +7430,8 @@ lookup answers that clause exactly when the clause is one the pushdown already a
 - the join is the ONLY join clause: one equality between a plain column of the fact rel and a plain
   column of the dimension rel, from an equivalence class or from `joininfo`. A second join clause
   (`AND f.a < d.b`, a composite key), a pseudoconstant qual anywhere in the query, an outer join
-  (any `join_info_list` entry but the one semi or anti join of "Semi and anti joins" below), a
-  LATERAL reference or a PlaceHolderVar all decline.
+  (any `join_info_list` entry but the one semi or anti join of "Semi and anti joins" below and
+  those inside a dimension that is a join), a LATERAL reference or a PlaceHolderVar all decline.
   An equivalence class with a constant (`d.pk = 5`) generates no join clause at all - both sides
   are restricted to the constant - and is left to the ordinary plan.
 
@@ -7475,8 +7476,9 @@ lookup answers that clause exactly when the clause is one the pushdown already a
 
 ### Planner integration
 
-`create_upper_paths_hook` at UPPERREL_GROUP_AGG, as today, with the input rel a JOIN rel of exactly
-two base tables, plain ones or a partitioned fact table ("A partitioned fact table", below).
+`create_upper_paths_hook` at UPPERREL_GROUP_AGG, as today, with the input rel a JOIN rel of two
+base tables, plain ones or a partitioned fact table ("A partitioned fact table", below) - or of a
+fact and a dimension that is itself a join ("A dimension that is a join", below).
 `lion_fkjoin_recognize()` (src/lion_fkjoin.c) finds the one join clause and
 proves the dimension key unique, for each orientation in turn, and hands `lion_try_count_path()` a
 `LionFkJoin`. That function then runs over the FACT rel, unchanged for everything about the fact
@@ -7647,7 +7649,8 @@ Recognition (`lion_fkjoin_recognize()`): exactly one SpecialJoinInfo, JOIN_SEMI 
 no `ojrelid`, whose minimal sides are one base relation each and equal to its syntactic sides; the
 fact is its inner (right) side and the dimension its outer side (a semi join is also taken the other
 way round, as "Forward semi joins over a non-unique key" below); the one join clause is found as for
-an inner join, from the equivalence class or joininfo. A qual of a NOT EXISTS that names only the
+an inner join, from the equivalence class or joininfo. (Over three tables or more, the other special
+joins are the dimension's own: "A dimension that is a join".) A qual of a NOT EXISTS that names only the
 outer side (`NOT EXISTS (... AND d.attr = 2)`) stays a join clause of the anti join and is a second
 one, which declines; inside an EXISTS the planner moves it to the outer relation, where it is a
 dimension filter like any other. No uniqueness is asked: the count is per dimension row, so a
@@ -9175,6 +9178,206 @@ left for a costing change of its own; so is the nested loop's warm cache, which 
 assume. With two workers the same holds of the 5,000-row joins with the range: the node, chosen
 at 60 to 70 ms, against a parallel nested loop's 36 (semi) and 41 (grouped).
 
+### A dimension that is a join (2026-09-28)
+
+A benchmark's star queries over three tables timed out (past 120 s) where the same queries over two
+tables ran in 0.2 to 0.4 s through the node. Two shapes, over a dimension `d` and two facts:
+
+    -- (A) a dimension semi-joined to two facts
+    SELECT count(*) FROM dim d
+    WHERE <d filters>
+      AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND <f1 filters>)
+      AND EXISTS (SELECT 1 FROM f2 WHERE f2.fk = d.pk AND <f2 filters>)
+
+    -- (B) a fact counted against a dimension narrowed by a semi join to another fact
+    SELECT count(*) FROM f2
+    WHERE <f2 filters>
+      AND f2.fk IN (SELECT d.pk FROM dim d WHERE <d filters>
+                    AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND <f1 filters>))
+
+The node was offered for a join of exactly two tables, so both went to the ordinary plan: a nested
+loop that walked a btree on a fact's fk for each dimension row and read the heap to test its
+filter, a tsvector detoasted a row at a time. Core priced that loop at the fact's average rows a
+key, where the dimension filter kept the keys that hold most of the fact's rows.
+
+The dimension may now be a join: ONE table `d` that carries the key, and other tables joined to it
+only as the inner side of semi and anti joins (`EXISTS`, `IN`, `NOT EXISTS`). (A) is then f2
+semi-joined by the node to the dimension `d ⋉ f1`, or f1 to `d ⋉ f2`; (B) is f2's count against
+the dimension `d ⋉ f1`. The node's child is core's plan of that join, and everything the node does
+with the child's rows is what it does with a single table's.
+
+**Why it is the query's answer.** A semi or anti join returns rows of its outer side, each at most
+once, and the tables of its inner side add nothing to them - neither rows nor columns the query
+above may name. So when every table of the dimension but `d` is inside the inner side of one of its
+semi or anti joins, the join rel of the dimension's tables returns rows of `d`, each at most once:
+the dimension rows that pass `d`'s own filters and every one of those joins. The query is that rel
+joined to the fact by one join on `f.fk = d.pk`, and the node computes exactly what it computes for
+a dimension of one table, per row of the child: the count of the row's key, or the existence test.
+What makes the order legal is core's: each of the dimension's semi and anti joins needs, on its
+outer side, only relations of the dimension (its `min_lefthand`, below), so it may be done before
+the join with the fact, and the join rel of the dimension is one core builds for that order. The
+node runs core's cheapest path of it, under the query's snapshot, as it runs a table's.
+
+**Recognition** (`lion_fkjoin_recognize()`, `lion_fkjoin_try_fact()`), from the SpecialJoinInfos,
+not from the shape of the join tree:
+
+- every special join is a semi or anti join with no range table entry of its own (`ojrelid` 0:
+  an outer join, and an anti join made of `LEFT JOIN ... IS NULL`, decline), inside the join;
+  every table of the join is a base relation with no LATERAL references and no TABLESAMPLE; and,
+  as before, no PlaceHolderVar, no pseudoconstant qual and no LATERAL range table entry anywhere;
+- each table of the join is tried as the fact `F` - a plain or partitioned table with no RLS or
+  TABLESAMPLE, as before - and the others are the dimension `D`. The join between them is the
+  special join whose minimal and syntactic inner sides are `F` alone (the reverse semi join or the
+  anti join, `D` its outer side); or a semi join whose minimal and syntactic outer sides are `F`
+  alone and whose syntactic inner side is all of `D` (the forward semi join); or, when neither
+  exists, an inner join;
+- every other special join is the dimension's own and must not involve `F`: `F` in its minimal
+  outer side (`EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND f1.x = f2.y)`, a condition on the
+  fact's rows no posting set answers) or in its inner side declines. `F` may be in its syntactic
+  outer side, which only says where the `EXISTS` was written;
+- the dimension's own table `d` is the one table of `D` in no inner side of those special joins,
+  and there has to be exactly one: a second (`d JOIN x ON ...`) is an inner join inside the
+  dimension, which may repeat a row of `d`, and declines. `d` is a plain table or a materialized
+  view, as a dimension of one table is;
+- exactly one join clause between `F` and all of `D` - the equivalence classes' clauses between
+  them and `F`'s joininfo, as before - and it is taken between `F` and `d`. A dimension that is a
+  join may hold other members of the key's class: with `f1.fk = d.pk` and `f2.fk = d.pk`, one class
+  holds all three, and its clause between `D` and f2 may be `f1.fk = f2.fk`, the same rows by the
+  class's transitivity. The class is asked again for the pair `(d, F)`, which names `d.pk`; that
+  clause has to be of the same class, or be the same joininfo clause. The special join with the
+  fact must have `d` in its minimal outer side (the inner one, for the forward semi join): an
+  `EXISTS` on the fact nested inside another table's `EXISTS` and correlated to it - `EXISTS
+  (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND EXISTS (SELECT 1 FROM f2 WHERE f2.fk = f1.fk))` - gets
+  the pair clause `f2.fk = d.pk` from the class, but its join is f1's, and declines;
+- the child is `find_join_rel()` of `D`'s relations: the join search has made it when that order
+  is legal, and nothing here assumes it - a join rel that is not there, or is proved empty,
+  declines. Its target has to carry `d.pk`, which a join to the fact above it always needs, and
+  every column of `d` the node emits (`lion_fkjoin_child_has()`: checked, not assumed); its
+  cheapest total path must not be parameterized.
+
+What is not required: the inner sides may hold anything core plans - a partitioned table (f1 in the
+benchmark), an inner join (`EXISTS (SELECT 1 FROM f1 JOIN x ON ... WHERE f1.fk = d.pk)`), a nested
+`EXISTS` - since only core reads them. Each table that qualifies as the fact is offered as one: in
+(A) f2 against `d ⋉ f1` and f1 against `d ⋉ f2`, and the cost model chooses. Three facts each with
+an `EXISTS` are three offers.
+
+**Uniqueness.** It is asked where it was asked, and of `d`: `lion_column_is_unique()` over `d`'s
+index list. A key unique in `d` is unique in the dimension's rows, since they are rows of `d` each
+at most once - which the recognition above checks rather than assumes.
+
+- An inner join needs the proof, as before (a non-unique key declines, tested).
+- A reverse semi join and an anti join need none: they are per dimension row, and duplicated and
+  NULL keys among the child's rows are rows as before (tested over a non-unique dimension). GROUP
+  BY the key of a reverse semi join is each row a group of its own only with the proof ("Grouped
+  by the join key"), which holds for `d`'s rows here as it does there.
+- The forward semi join needs none: over a key nothing proves unique it is JOIN_UNIQUE_INNER, the
+  child's keys sorted and each counted once ("Forward semi joins over a non-unique key"). With the
+  proof it is the inner join over the dimension's rows: each fact row matches at most one of them,
+  so counting pairs counts fact rows. That is `reduce_unique_semijoins()`'s equivalence, which
+  core makes only when the inner side is one table and so never makes here; the node makes it on
+  the same kind of proof. It saves the sort, and lets a parallel plan divide the child's rows
+  instead of running the dimension whole in every participant - which for a joined dimension is
+  the join, run once a participant.
+
+**Everything on the fact side is unchanged**: the fact filters, collected or probed; the lookups in
+key order and their batches; a partitioned fact's leaves; the shared copy of a parallel plan; the
+§9 interlock, which is about the fact's own sets. The dimension is a different child.
+
+**Parallel.** The node over the dimension join rel's partial path below a Gather, as over a table's:
+a partial join path gives each participant a disjoint share of the join's rows (core's guarantee
+for every partial path, which a Gather over the join relies on too), so each dimension row is
+counted by one participant. The forward semi join over its distinct keys takes the join rel's
+cheapest path that may run in a worker and runs it whole in every participant, which needs every
+participant to see the same rows: nothing volatile in the quals of any of the dimension's tables,
+in the conditions of its semi and anti joins, or inside a table of it that is a subquery, a
+function or a VALUES list (`lion_fkjoin_dim_volatile()`; before, `d`'s quals alone). The workers are
+still counted from the fk index pages the lookups read and `d`'s own `parallel_workers`.
+
+**Cost.** Unchanged: the child's total cost - core's price of the join rel's path - plus the
+lookups, and the child's rows are the join rel's estimate. So the node inherits core's estimate of
+the dimension's own join. Where the fact left inside the dimension has the same skew the node was
+brought in for, core's cheapest path of the dimension may be the very nested loop the node replaces
+one level up, priced at the fact's average rows a key; the node's cost is then as wrong as that
+path's, and the node as slow as it. Nothing here corrects that: the child's price is core's. In the
+measurements below it did not happen - core's cheapest path of the dimension semi-joined to f1 was
+a hash semi join over f1's filtered rows - but the child was the larger part of every plan.
+
+**Taken**: the counts, grouped by `d`'s columns or not, `count(DISTINCT)`, the aggregates
+of "Every aggregate over the node's rows" (counted rows below a LionJoinAgg for an inner join),
+GROUP BY the join key - `d`'s or the fact's - over inner, reverse semi, anti and forward semi joins,
+with the dimension's own semi and anti joins in any number, nested or not, and a partitioned fact.
+**Declined**: an inner or outer join inside the dimension; a non-unique key in an inner join; a
+LATERAL reference, a PlaceHolderVar, a pseudoconstant qual; a second join clause between the fact
+and any table of the dimension; a semi join of the dimension's that needs the fact; the fact
+inside another semi join's inner side (its join is that table's); a dimension whose own table is
+partitioned or not a table (as before).
+
+EXPLAIN is unchanged: the child is the join, under the node, as core plans it. A forward semi join
+taken as the inner join prints no `Join Type`, as the one core makes of a single table's does not.
+
+**Measured** (2026-09-28, PostgreSQL 18.6 packaged build, `shared_buffers` 256 MB, a VM of four
+cores shared with other work; warm cache, all-visible, medians of five runs after one, in ms, cost
+in parentheses). Synthetic data of the benchmark's character, 3.2 GB: a 500,000-row dimension with a
+unique btree key and a lion index on `(status, region, grade)`, `status = 1` keeping 75,000 rows
+(15%); f1, 10,000,000 rows LIST-partitioned by kind into five partitions, the first sub-partitioned
+by range on `ts` into two, `ts` within the last two years, a partitioned lion index on `(tags, ts,
+fk)`, one on `x` and a btree on fk; f2, 5,000,000 rows of a plain table with a tsvector of twelve
+common lexemes and `'rare1'` or `'rare2'` in 1% of the rows each, lion indexes on `(doc, fk)` and
+`y` and a btree on fk. 80% of each fact's rows are on the kept keys: 107 rows a kept key in f1 and
+53 in f2, where the averages core prices a key at are 20 and 10. The fact filters are f1's `ts >=
+now() - interval '90 days' AND ((kind = 'a' AND tags && '{t1}') OR (kind = 'b' AND x < 3) OR kind =
+'c')` (269,000 rows; the partitions leave out the arms their bounds refute and the kinds they imply)
+and f2's `doc @@ 'rare1 | rare2'` (100,000 rows). "Node" is the node the model builds; where it is
+not chosen, the plan with nested loops and merge joins disabled, which is the node over the hash
+join child the chosen plans have. "Nested loop" is the pushdown off with hash and merge joins
+disabled, "hash join" with nested loops and merge joins disabled. Bold is the plan chosen with
+nothing disabled; "core" marks core's own choice with the pushdown off.
+
+| query, serial | node | nested loop | hash join |
+|---|---|---|---|
+| (A) | **986** (201,536) | 10,721 (215,240) core; 6,068 (280,473) | 1,026 (287,575) |
+| (B) | **1,029** (201,535) | 15,454 (355,797) | 988 (288,022) core |
+| (A), `NOT EXISTS` on f1 | 767 (253,200) | **5,336** (243,309) core | 1,079 (287,593) |
+| (A), `GROUP BY d.region` | **981** (201,961) | 10,311 (215,503) core | 1,002 (287,833) |
+| f2 JOIN (d ⋉ f1), `GROUP BY d.region` | **963** (203,356) | 15,911 (308,025) core | 1,066 (433,004) |
+| (A), 3,831 dimension rows (`grade < 5`) | 655 (176,910); probed 738 (183,117) | **601-660** (121,671) core | 914 (284,603) |
+| (B), 3,831 dimension rows | **637** (176,917) | 1,335 (209,420) core; 1,737 (280,004) | 862 (285,122) |
+| **two workers** | | | |
+| (A) | 398 (162,699) | **1,935** (158,588) core | 749 (264,593) |
+| (B) | **405** (162,699) | | 501 (261,361) core |
+| (A), `NOT EXISTS` on f1 | 344 (183,495) | **1,834** (169,628) core | 544 (260,563) |
+
+Every plan the model chose for the node counts f2 against the dimension semi-joined to f1, with
+core's hash semi join of the dimension's rows against f1's filtered rows as the child, and collects
+f2's filter. The node is ten to sixteen times faster than the nested loops core picks for (A) and
+the inner join, which core prices at the fact's average rows a key, and about as fast as the hash
+joins core prices at 1.4 to 2.1 times the node. EXPLAIN ANALYZE of (A) says why no faster: of its
+931 ms, `Join Child Time` is 710 - the child's hash semi join, most of it the bitmap heap scans of
+f1's partitions - and the node's own lookups and counts 180 ms for 70,758 keys. The same key walk
+over one table's child ran in 0.2 to 0.4 s in the benchmark's two-table queries; over a joined
+dimension the child is the other half of the query, and costs what core's plan of it costs.
+
+Where the node loses, it loses on cost to a nested loop that core underprices: the anti join
+(253,200 against 243,309; 767 ms against 5,336) and (A) in parallel (162,699 against 158,588; 398 ms
+against 1,935). The node's own price there is its child's plus the lookups, as for one table, and
+nothing is taken off it; the nested loop's estimate is core's. For (A) over 3,831 dimension rows the
+nested loop is priced right and about as fast as the node (0.6 s against 0.66 s), and is chosen.
+
+f1 is never the node's fact here. Forced with f2 inside the dimension (a filter `f1.id > 0` that no
+posting set answers keeps f1 out of the other orientation), the node over f1 is priced above
+core's hash join and runs in about the same time; the two-table half alone, `d ⋉ f1` through the
+node, ran in 792 ms at 426,754 against the hash semi join's 698 ms at 176,583. Some 450 ms of the
+792 is collecting the `ts` range in each partition it keeps while the filters are located (`Range
+Sources Collected: 5`), outside the node's timers - the costing gap "A partitioned fact table"
+leaves open - and the rest is 143,331 lookups, 75,000 keys in up to four partitions.
+
+**Probe or collect for a few thousand dimension rows.** For (A) and (B) over 3,831 dimension rows
+(884 estimated in the child) the model collects f2's filter: 3,059 for the node's own work against
+9,265 probed, 655 ms against 738 measured with the copy priced out
+(`pg_lion.fkjoin_copy_container_cost = 1e9`). Both are small beside the child's 173,851, which is
+what puts the node above the nested loop's 121,671 for (A) - the nested loop probes f1 for the 805
+rows core expects the dimension semi-joined to f2 to have, a plan whose price is close to its time.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -9186,8 +9389,10 @@ at 60 to 70 ms, against a parallel nested loop's 36 (semi) and 41 (grouped).
   which counts every other one). A partitioned,
   inheritance or subquery DIMENSION is declined for want of an index list to prove uniqueness
   from; `innerrel_is_unique()` would prove some of those and is the natural v2.
-- **More than two relations**, composite keys, snowflake chains: the dimension would be a join
-  itself.
+- **An inner or outer join inside the dimension**, composite keys, snowflake chains: a dimension
+  that is a join is taken only as one table with others semi- or anti-joined to it ("A dimension
+  that is a join"), whose rows are that table's, each once; an inner join to a unique key would
+  keep that too (core's `innerrel_is_unique()` proves it) and is the natural next step.
 - **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
   over `f.x`, which composes, but is not in v1. It is also every GROUP BY of a forward semi join,
   whose dimension the query above the EXISTS cannot name. The one exception is the fact's join
@@ -9254,7 +9459,9 @@ before "Every aggregate over the node's rows"); the anti joins, NULL keys among 
 key there (a count of a column, over the join's rows, since then), and the LEFT JOIN and `NOT IN`
 forms left alone; the declines (a second
 correlation, an outer-side qual inside NOT EXISTS, a fact filter the posting sets cannot answer,
-another aggregate - `avg` - three relations, a subquery that cannot be pulled up);
+another aggregate - `avg` - an inner join inside the dimension, a subquery that cannot be pulled
+up; the dimension semi-joined to a second table was declined as three relations until "A dimension
+that is a join", and is pushed down now);
 generic plans with Param filters on both sides, NULL ones included; correlated subqueries that
 rescan the node with a new dimension filter and with a new FACT filter, whose copy is made again;
 EXPLAIN of the collected and the probed plans and of a dimension filtered through its own lion
@@ -9487,6 +9694,51 @@ inheritance parent, partitionwise aggregation turned on); the model's
 choice with nothing disabled (the node for a few dimension rows against filters that leave many
 fact rows, and not for a filter that leaves few); and a dirty heap - deletes and updates in three
 partitions, an fk moved - before and after VACUUM.
+
+`test/sql/fkjoin_dimjoin.sql` (2026-09-28), a dimension that is a join, against the pushdown off
+(`lion_gj()`, as `lion_xj()` does: as planned - in parallel where the plan says so - serially, and
+with the pushdown off and sequential scans only, and where asked which table was the fact or whether
+the plan was parallel): a 3,000-row dimension with a primary key and a lion index on its filter
+columns, a 3,000-row dimension over 1,500 keys, duplicated, with NULL keys; f1, 40,000 rows
+LIST-partitioned by kind with one list sub-partitioned by range on `ts`, whose `ts` lies relative to
+`now()` so that `ts >= now() - interval '120 days'` - a stable range - keeps the same rows on any
+day; f2, 30,000 rows of a plain table with a lion index over a tsvector and fk; and f3, a third fact
+- every column drawn from a hash of its own, so that no filter lines up with a key by the arithmetic
+of the row numbers and every answer has rows to count (the answers of (A) and (B) are pinned).
+EXPLAIN (with the dimension's plan as one line saying it is a join) of (A) with each fact the only
+one there can be, with the filter per kind ORed and the stable range when f1 is the fact; (B) over
+the unique key, as the inner join it is, and over the non-unique dimension, its keys made distinct;
+an anti join inside the dimension and one as the node's; an inner join grouped by a dimension column
+and by the key; the counted rows below a LionJoinAgg. The answers of each shape, and of (A) with
+both facts, three facts, grouped, with HAVING, ORDER BY and LIMIT, `count(DISTINCT)` and the
+aggregates of the node's rows, GROUP BY either key, (B) grouped by the fact's key and counted
+distinct, anti joins both ways, inner joins with counted rows, a partitioned fact against a
+dimension anti-joined to f2, an inner join and a nested `EXISTS` inside an `EXISTS` of the
+dimension; (A) and (B) pinned by value. NULL and duplicated keys: reverse semi and anti joins over
+the non-unique dimension, joined, grouped by its key (hashed, not a group a row); an inner join over
+it declined; the forward semi join over it, its keys made distinct; a dimension filtered to nothing,
+fact filters that select nothing. The counters: `Join Child Rows` and `Join Keys Looked Up` equal to
+the dimension rows the dimension's own semi join leaves, and the forward semi join's keys looked up
+equal to its distinct keys. Parallel plans over the join rel's partial path - reverse semi, inner,
+forward and anti joins, and rescans of the Gather - with hash joins allowed and nested loops and
+merge joins not: with every join method disabled, PostgreSQL 16 and 17 add `disable_cost` to the
+serial node's price and to the parallel one's, through their children, and `add_path()` takes the
+two for one price and keeps the serial path, which is parallel-safe. The forward semi join over the
+non-unique dimension run whole in every participant is therefore parallel from 18 and serial before,
+its answer checked either way and its keys looked up once each; a volatile (PARALLEL SAFE) qual of a
+table semi-joined inside the dimension keeps it serial on every major. Generic plans with Params in
+the fact's, the dimension's and the other fact's filters, NULL ones included; correlated subqueries
+that rescan the node with a new filter of each. The declines: an inner join inside the dimension, an
+outer join and a PlaceHolderVar, a LATERAL reference, a second join clause, another fact's `EXISTS`
+correlated to the fact, the fact's `EXISTS` nested inside another table's, a pseudoconstant qual.
+The cost model with nothing disabled: (B) over a few dimension rows is the node's, and the whole
+dimension against both facts unfiltered two hashed semi joins. Which of two facts that qualify the
+node takes, and whether it runs in parallel, follows core's price of the joined dimension's plan,
+which differs between majors (right semi joins from 18, for one); the test prints either only where
+the query leaves no choice or a setting makes it. And a dirty heap - deletes, updates, fks moved, on
+every table - before and after VACUUM. `fkjoin_semi.sql`'s "three relations", a dimension
+semi-joined to a second table, is pushed down now; beside it an inner join inside the dimension
+still declines.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
