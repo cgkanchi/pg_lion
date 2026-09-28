@@ -172,9 +172,9 @@ cost model leaves a large dimension set to the hash join. With parallel query en
 (`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
 dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
 once per process into memory bounded like a hash join's (`work_mem` × `hash_mem_multiplier`); past
-that the node reads them per dimension row instead. Their values may be parameters and stable
-expressions as for a single table, an `IN` list whose array is a parameter (`o.status = ANY ($1)`)
-included: every process evaluates them once per scan.
+that the copy spills to a temporary file, as a hash join's table would. Their values may be
+parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
+(`o.status = ANY ($1)`) included: every process evaluates them once per scan.
 
 For an existing `docs(tags text[], tsv tsvector)` table, a count-oriented array example is:
 
