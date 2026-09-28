@@ -188,6 +188,12 @@ typedef struct LionCountCtx
 								 * an MVCC snapshot, DESIGN.md §29.5) */
 	bool		farseeks;		/* every seek is to a key many leaves past the
 								 * last: descend at once (lion_stream_far()) */
+	bool		raw;			/* the merge's intermediate containers are
+								 * left unoptimized: every one is counted or
+								 * handed to the next operation, never kept
+								 * (DESIGN.md §15, "Unions and intersections
+								 * unoptimized").  A stream's are optimized:
+								 * its callers copy them. */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
 
 	/*
@@ -3531,6 +3537,8 @@ typedef struct LionExprCursor
 	int			nhot;
 	uint64	   *bits;
 
+	bool		raw;			/* build unoptimized containers (cx->raw) */
+
 	/* the container the cursor currently stands on */
 	bool		valid;
 	uint32		ckey;
@@ -4146,6 +4154,66 @@ lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
 }
 
 /*
+ * The union of the containers standing at one key, for a count (c->raw;
+ * DESIGN.md §15, "Unions and intersections unoptimized"), whose merge ANDs
+ * it with the other sources and counts it and never keeps it.  Unoptimized:
+ *
+ *	- ARRAYs of LION_OR_FOLD_MEMBERS members or fewer together are folded
+ *	  pairwise, each union a merge of two arrays and nothing else - the
+ *	  fold's cost grows with the containers times their members, so only
+ *	  while those are small;
+ *	- anything else is ORed into one bitset image, written in place as the
+ *	  payload of a BITSET container and counted once.  The image costs a
+ *	  fixed 4 kB clear and count, which a union of a hundred-odd members
+ *	  already repays: the pairwise fold of four dense ARRAYs merged, counted
+ *	  its runs and converted to a RUN three times over at every key, only for
+ *	  the AND after it to fill it back into a bitset; and three ARRAYs of 110
+ *	  members, folded in two merges, took a sixth longer than their image on
+ *	  the repro of §15's measurements.
+ *
+ * Which of the two the old rule took depended on the containers alone
+ * (LION_OR_BITSET_MIN), which is still where a fold stops.
+ */
+#define LION_OR_FOLD_MEMBERS	128
+
+static const LionContainer *
+lion_or_hot_raw(LionExprCursor *c, uint32 ckey)
+{
+	const LionContainer *a;
+	uint32		members = 0;
+	bool		arrays = true;
+	int			w = 0;
+	int			i;
+
+	for (i = 0; i < c->nhot; i++)
+	{
+		members += lion_container_cardinality(c->hot[i].cur);
+		if (c->hot[i].cur->type != LION_CT_ARRAY)
+			arrays = false;
+	}
+
+	if (arrays && members <= LION_OR_FOLD_MEMBERS &&
+		c->nhot < LION_OR_BITSET_MIN)
+	{
+		a = c->hot[0].cur;
+		for (i = 1; i < c->nhot; i++)
+		{
+			lion_container_or_raw(a, c->hot[i].cur, c->acc[w]);
+			a = c->acc[w];
+			w ^= 1;
+		}
+		return a;
+	}
+
+	lion_container_bitset_init(c->acc[0], ckey);
+	for (i = 0; i < c->nhot; i++)
+		lion_container_or_into_bitset(c->hot[i].cur,
+									  LION_BITSET_DATA(c->acc[0]));
+	(void) lion_container_bitset_recount(c->acc[0]);
+	return c->acc[0];
+}
+
+/*
  * Build the cursor of one planned node (lion_plan_node()).  droppins: carry
  * no interlock anywhere below - a child of a wide union, a child of a
  * trimmed AND other than the one that keeps its pins.
@@ -4163,6 +4231,7 @@ lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 	memset(c, 0, sizeof(LionExprCursor));
 	c->node = node;
 	c->plan = plan;
+	c->raw = cx->raw;
 	if (node == NULL)
 		return;					/* a source with no sets at all */
 
@@ -4273,6 +4342,8 @@ lion_ecursor_build(LionExprCursor *c)
 
 		if (c->nhot == 1)
 			c->cur = c->hot[0].cur;
+		else if (c->raw)
+			c->cur = lion_or_hot_raw(c, minckey);
 		else if (c->nhot < LION_OR_BITSET_MIN)
 		{
 			const LionContainer *a = c->hot[0].cur;
@@ -4346,7 +4417,10 @@ lion_ecursor_build(LionExprCursor *c)
 		w = 0;
 		for (i = 1; i < c->nsub; i++)
 		{
-			lion_container_and(acc, c->sub[i].cur, c->acc[w]);
+			if (c->raw)
+				lion_container_and_raw(acc, c->sub[i].cur, c->acc[w]);
+			else
+				lion_container_and(acc, c->sub[i].cur, c->acc[w]);
 			acc = c->acc[w];
 			w ^= 1;
 		}
@@ -5491,11 +5565,21 @@ lion_recheck_cb(uint16 lo, void *arg)
  * order a LionMatSet keeps.  A copy that would outgrow its budget is given up
  * on: failed is set, the merge stops at the next container boundary
  * (lion_exists_settled()), and the caller counts the ordinary way instead.
+ *
+ * The merge's results come unoptimized (LionCountCtx.raw): what is kept is
+ * the smallest representation, as the optimizing set algebra used to leave
+ * it, so that a copy takes what it always took.
  */
 static void
 lion_collect_container(LionCollect *col, const LionContainer *c)
 {
-	Size		sz = lion_item_size(c);
+	union
+	{
+		LionContainer hdr;
+		uint64		align;
+		char		data[LION_CONTAINER_MAX_SIZE];
+	}			opt;
+	Size		sz;
 	MemoryContext oldcxt;
 	int			i;
 
@@ -5503,6 +5587,11 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 		return;
 	if (lion_container_cardinality(c) == 0)
 		return;
+
+	memcpy(opt.data, c, lion_container_size(c));
+	lion_container_optimize(&opt.hdr);
+	c = &opt.hdr;
+	sz = lion_item_size(c);
 	if (!col->spilled &&
 		sizeof(LionMatSet) + MAXALIGN(col->used + sz) +
 		(sizeof(LionContainer *) + sizeof(uint32)) * (col->noffs + 1) >
@@ -6381,9 +6470,9 @@ lion_run_merge_copy(LionCountCtx *cx, LionCountSource *drvsrc,
 			continue;
 		}
 
-		if (lion_container_and(drv.cur,
-							   lion_mat_container(cx, mat, idx, buf),
-							   work) > 0)
+		if (lion_container_and_raw(drv.cur,
+								   lion_mat_container(cx, mat, idx, buf),
+								   work) > 0)
 		{
 			/* the map is asked before the driver lets its page go */
 			lion_count_container_vm(cx, work);
@@ -6643,7 +6732,8 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 				acc = cursors[s].cur;
 			else
 			{
-				lion_container_and(acc, cursors[s].cur, work[w]);
+				/* unoptimized: it is ANDed again or counted, never kept */
+				lion_container_and_raw(acc, cursors[s].cur, work[w]);
 				acc = work[w];
 				w ^= 1;
 			}
@@ -6698,7 +6788,7 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 
 			if (lion_container_cardinality(acc) > 0)
 			{
-				lion_container_andnot(acc, cursors[i].cur, work[w]);
+				lion_container_andnot_raw(acc, cursors[i].cur, work[w]);
 				acc = work[w];
 				w ^= 1;
 			}
@@ -9306,6 +9396,7 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.novm = false;
 	cx.rel_read_only = rel_read_only;
+	cx.raw = true;
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
 	cx.exists = exists;
