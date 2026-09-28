@@ -230,8 +230,13 @@ compare(const LionContainer *s, const Ref *r, int line)
 	IterState	it;
 	uint32		i;
 
-	check_impl(lion_sparse_check(s, lion_sparse_size_for(r->n), &err), line,
-			   err ? err : "check() rejected a good segment");
+	/* an empty segment is a work state only: it is never stored */
+	if (r->n > 0)
+		check_impl(lion_sparse_check(s, lion_sparse_size_for(r->n), &err), line,
+				   err ? err : "check() rejected a good segment");
+	else
+		check_impl(!lion_sparse_check(s, lion_sparse_size_for(r->n), &err) &&
+				   err != NULL, line, "check() refuses an empty segment");
 	check_impl(s->cardinality == r->n, line, "cardinality matches");
 	check_impl(lion_sparse_size(s) == lion_sparse_size_for(r->n), line,
 			   "size matches the pair count");
@@ -327,7 +332,10 @@ test_empty(void)
 	CHECK(b.c.type == LION_CT_SPARSE, "a fresh segment is a segment");
 	CHECK(b.c.flags == 0, "a fresh segment has no flags");
 	CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ, "an empty segment is a header");
-	CHECK(lion_sparse_check(&b.c, LION_CONTAINER_HDRSZ, &err), "check() accepts an empty segment");
+	CHECK(!lion_sparse_check(&b.c, LION_CONTAINER_HDRSZ, &err) && err != NULL,
+		  "check() refuses an empty segment, which is never stored");
+	CHECK(lion_item_last_ckey(&b.c) == 0,
+		  "an empty segment's last ckey is its header's, not a pair before the first");
 	CHECK(!lion_sparse_contains(&b.c, 0, 0), "an empty segment contains nothing");
 	CHECK(lion_sparse_count(&b.c, 17) == 0, "count() of an empty segment is 0");
 	CHECK(!lion_sparse_remove(&b.c, 1, 1), "remove() from an empty segment says no");
@@ -1038,11 +1046,14 @@ guard_ok(const void *p, Size size)
 }
 
 static uint32 damage_pairs;
+static uint32 damage_bad_lo;	/* lo values handed out past the range */
 
 static bool
 damage_count_cb(uint32 ckey, uint16 lo, void *arg)
 {
 	damage_pairs++;
+	if ((uint32) lo >= LION_CONTAINER_RANGE)
+		damage_bad_lo++;
 	return true;
 }
 
@@ -1052,7 +1063,22 @@ static bool
 damage_pair_pred(uint32 ckey, uint16 lo, void *arg)
 {
 	damage_pairs++;
+	if ((uint32) lo >= LION_CONTAINER_RANGE)
+		damage_bad_lo++;
 	return (((ckey ^ lo) * 2654435761U ^ damage_seed) >> 30) == 0;
+}
+
+/*
+ * What a caller does with an iterated lo: index a bitset image of exactly
+ * LION_BITSET_BYTES with it, as the window scan's lion_window_pair_cb() does.
+ */
+static uint64 *damage_img;
+
+static bool
+damage_img_cb(uint32 ckey, uint16 lo, void *arg)
+{
+	damage_img[lo >> 6] |= UINT64CONST(1) << (lo & 63);
+	return true;
 }
 
 static bool
@@ -1086,10 +1112,31 @@ damage_exercise_segment(const LionContainer *s, LionContainer *work,
 	CHECK(first + count <= LION_SPARSE_MAX_PAIRS, "damaged: find() stays within the pairs");
 	(void) lion_sparse_count(s, ckey + 1);
 	damage_pairs = 0;
+	damage_bad_lo = 0;
 	lion_sparse_iterate(s, damage_count_cb, NULL);
 	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS, "damaged: iterate() visits at most 682 pairs");
-	if (s->cardinality > 0)
+	CHECK(damage_bad_lo == 0, "damaged: iterate() hands out only lo values in range");
+	memset(damage_img, 0, LION_BITSET_BYTES);
+	lion_sparse_iterate(s, damage_img_cb, NULL);
+	CHECK(guard_ok(damage_img, LION_BITSET_BYTES),
+		  "damaged: an iterated lo indexes a 4096-byte image inside it");
+
+	/* an empty segment covers its header ckey, and nothing reads a pair */
+	if (s->cardinality == 0)
+		CHECK(lion_item_last_ckey(s) == s->ckey,
+			  "damaged: an empty segment's last ckey is its header ckey");
+	else
 		(void) lion_item_last_ckey(s);
+	(void) lion_item_covers(s, ckey);
+	{
+		const char *err = NULL;
+
+		if (s->cardinality == 0)
+			CHECK(!lion_sparse_check(s, LION_CONTAINER_MAX_SIZE, &err) && err != NULL,
+				  "damaged: check() refuses an empty segment");
+		else
+			(void) lion_sparse_check(s, LION_CONTAINER_MAX_SIZE, &err);
+	}
 
 	if (lion_sparse_split_half(s, left, right))
 		CHECK(lion_sparse_size(left) <= LION_CONTAINER_MAX_SIZE &&
@@ -1120,9 +1167,12 @@ damage_exercise_segment(const LionContainer *s, LionContainer *work,
 	DAMAGE_MUTATE("remove()", (void) lion_sparse_remove(work, ckey, lo));
 	damage_seed = rng_next();
 	damage_pairs = 0;
+	damage_bad_lo = 0;
 	DAMAGE_MUTATE("remove_if()", (void) lion_sparse_remove_if(work, damage_pair_pred, NULL));
 	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS,
 		  "damaged: remove_if() asks about at most 682 pairs");
+	CHECK(damage_bad_lo == 0,
+		  "damaged: remove_if() asks only about lo values in range");
 	DAMAGE_MUTATE("extract()", (void) lion_sparse_extract(work, ckey, cont));
 	CHECK(lion_container_size(cont) <= LION_CONTAINER_MAX_SIZE &&
 		  guard_ok(cont, LION_CONTAINER_MAX_SIZE),
@@ -1142,6 +1192,8 @@ test_damaged(uint32 iters, uint64 seed)
 	LionContainer *cont = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	uint32		it;
 	uint32		i;
+
+	damage_img = exact_alloc(LION_BITSET_BYTES);
 
 	/*
 	 * The case a 2026-09 review found: VACUUM copies a page item into a
@@ -1175,6 +1227,45 @@ test_damaged(uint32 iters, uint64 seed)
 	s->ckey = LION_SPARSE_CKEYS(s)[0];
 	damage_exercise_segment(s, work, left, right, cont);
 
+	/*
+	 * The two a 2026-09-27 review found: a lo past the range, which the
+	 * window scan's callback indexed its bitset image with, and an empty
+	 * segment, whose last ckey was read 16 GiB past it.
+	 */
+	phase("damaged: a segment whose lo values are past 32767");
+	lion_sparse_init(s, 7);
+	s->cardinality = 3;
+	LION_SPARSE_CKEYS(s)[0] = 7;
+	LION_SPARSE_CKEYS(s)[1] = 7;
+	LION_SPARSE_CKEYS(s)[2] = 9;
+	LION_SPARSE_LOS(s)[0] = 32768;
+	LION_SPARSE_LOS(s)[1] = 40000;
+	LION_SPARSE_LOS(s)[2] = 65535;
+	memset(damage_img, 0, LION_BITSET_BYTES);
+	lion_sparse_iterate(s, damage_img_cb, NULL);
+	CHECK(guard_ok(damage_img, LION_BITSET_BYTES) &&
+		  (damage_img[0] & 1) != 0 &&
+		  (damage_img[(40000 - 32768) >> 6] & (UINT64CONST(1) << (40000 & 63))) != 0 &&
+		  (damage_img[LION_BITSET_WORDS - 1] >> 63) != 0,
+		  "iterate() hands out lo values masked into range");
+	memcpy(work, s, LION_CONTAINER_MAX_SIZE);
+	CHECK(lion_sparse_extract(work, 7, cont) == 2 &&
+		  lion_container_contains(cont, 0) && lion_container_contains(cont, 40000 - 32768),
+		  "extract() builds a container of the masked values");
+	damage_exercise_segment(s, work, left, right, cont);
+
+	phase("damaged: an empty segment");
+	for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+		((char *) s)[i] = (char) 0xFF;
+	lion_sparse_init(s, 12345);
+	CHECK(lion_item_last_ckey(s) == 12345 && lion_item_covers(s, 12345) &&
+		  !lion_item_covers(s, 12346),
+		  "an empty segment covers its header ckey alone");
+	damage_pairs = 0;
+	lion_sparse_iterate(s, damage_count_cb, NULL);
+	CHECK(damage_pairs == 0, "iterate() of an empty segment visits nothing");
+	damage_exercise_segment(s, work, left, right, cont);
+
 	phase("damaged: random segments");
 	for (it = 0; it < iters; it++)
 	{
@@ -1197,6 +1288,7 @@ test_damaged(uint32 iters, uint64 seed)
 	free(left);
 	free(right);
 	free(cont);
+	free(damage_img);
 }
 
 /*

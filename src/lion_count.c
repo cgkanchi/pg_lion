@@ -1969,8 +1969,9 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 {
 	const LionContainer *seg = cur->seg;
 	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(seg);
-	const uint16 *los = LION_SPARSE_LOS_CONST(seg);
-	uint32		n = seg->cardinality;
+	/* the pairs a reader may look at, and los[] where that many ckeys end */
+	uint32		n = lion_sparse_npairs(seg);
+	const uint16 *los = LION_SPARSE_LOS_CONST_AT(seg, n);
 	uint32		ckey;
 	uint32		end;
 	Size		need;
@@ -2017,10 +2018,16 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 		cur->segbuf = (LionContainer *) palloc(cur->segcap);
 	}
 
+	/*
+	 * A segment's pairs are data (DESIGN.md §3): a lo is masked into range
+	 * before the builder sees it, and the builder copes with pairs that are
+	 * out of order or repeated.
+	 */
 	lion_container_init(cur->segbuf, ckey);
 	do
 	{
-		lion_container_append_sorted(cur->segbuf, los[cur->segpos]);
+		lion_container_append_sorted(cur->segbuf,
+									 (uint16) (los[cur->segpos] & LION_LO_MASK));
 		cur->segpos++;
 	} while (cur->segpos < n && ckeys[cur->segpos] == ckey);
 

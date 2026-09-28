@@ -39,8 +39,11 @@
  * past the largest legal segment, 4100 bytes; and a mutator first rewrites
  * such a claim to that count (sparse_clamp()), so that what it leaves behind
  * fits a LION_CONTAINER_MAX_SIZE buffer.  The pairs' values are only ever
- * compared, never used as an index, and a lo handed to the container library
- * is masked into range.  For a well-formed segment all of this is a no-op.
+ * compared here, never used as an index, and a lo handed on - to the
+ * container library, to an iterate() or remove_if() callback - is masked into
+ * range: the callers index bitset images and per-block arrays with it (the
+ * window scan's did, 2026-09-27 review).  For a well-formed segment all of
+ * this is a no-op.
  * ----------------------------------------------------------------
  */
 
@@ -301,7 +304,7 @@ lion_sparse_remove_if(LionContainer *s, lion_pair_predicate pred, void *arg)
 
 	for (i = 0; i < n; i++)
 	{
-		keep[i] = !pred(ckeys[i], los[i], arg);
+		keep[i] = !pred(ckeys[i], (uint16) (los[i] & LION_LO_MASK), arg);
 		if (keep[i])
 			nkept++;
 	}
@@ -472,7 +475,7 @@ lion_sparse_iterate(const LionContainer *s, lion_pair_callback cb, void *arg)
 
 	for (i = 0; i < n; i++)
 	{
-		if (!cb(ckeys[i], los[i], arg))
+		if (!cb(ckeys[i], (uint16) (los[i] & LION_LO_MASK), arg))
 			return;
 	}
 }
@@ -503,8 +506,9 @@ lion_sparse_check(const LionContainer *s, Size avail_bytes, const char **errmsg)
 	if (lion_sparse_size_for(n) > avail_bytes)
 		LION_SPARSE_CHECK_FAIL("sparse segment does not fit in the available space");
 
+	/* lion_sparse.h: a segment holds 1 .. LION_SPARSE_MAX_PAIRS pairs */
 	if (n == 0)
-		return true;
+		LION_SPARSE_CHECK_FAIL("sparse segment has no pairs");
 
 	ckeys = LION_SPARSE_CKEYS_CONST(s);
 	los = LION_SPARSE_LOS_CONST(s);

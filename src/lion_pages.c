@@ -1418,6 +1418,9 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	if (csize < LION_CONTAINER_HDRSZ || csize > LION_CONTAINER_MAX_SIZE ||
 		csize > avail)
 		elog(ERROR, "lion index: malformed inline item");
+	/* never stored, and it has no last container key (lion_sparse.h) */
+	if (buf->type == LION_CT_SPARSE && buf->cardinality == 0)
+		elog(ERROR, "lion index: empty sparse segment in an inline payload");
 
 	memcpy(buf, payload + *off, csize);
 	*off += csize;
