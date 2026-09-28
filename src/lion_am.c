@@ -1820,6 +1820,18 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		}
 	}
 
+	/*
+	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
+	 * is set (DESIGN.md §9, lion_check_old_snapshot()): price every path on
+	 * one out of the running, the way 16 prices a disabled scan.  A plan that
+	 * has nothing else left still gets it, and stops at the scan's ERROR.
+	 */
+	if (lion_old_snapshot_threshold_active())
+	{
+		costs.indexStartupCost += disable_cost;
+		costs.indexTotalCost += disable_cost;
+	}
+
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;

@@ -1144,6 +1144,22 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   shortcut, which trusted the map, was unsafe for every index AM and is disabled in core's current
   minor releases - 16.15's `can_skip_fetch = false` - and gone from master), and a plain index scan
   fetches every tuple.
+- **old_snapshot_threshold (PostgreSQL 16 only).** With the threshold set, VACUUM and pruning use a
+  horizon that may have passed an old snapshot's xmin: they remove TIDs that snapshot still sees and
+  mark their pages all-visible. Core's access methods compare every page they read with the
+  snapshot (`TestForOldSnapshot()`) and raise "snapshot too old"; lion had not one such test, so a
+  count, a bitmap scan and an index-only scan answered silently differently inside one snapshot
+  (2026-09-27 review) - a TID gone is a row missed, and nothing in the heap raises for a page it is
+  never asked to read. Rather than test every page of every path, lion is not READ at all while
+  the threshold is set (`lion_check_old_snapshot()`, the test in lion_compat.h, constant false
+  from 17, which removed the setting): `lioncostestimate()` adds `disable_cost` to every path on a
+  lion index, the LionCount (count, GROUP BY, FK join) and LionOrdered hooks offer nothing, and
+  what reaches a lion index under an MVCC snapshot anyway - a direct SQL count, a plan with every
+  other path disabled - is an ERROR (`ERRCODE_FEATURE_NOT_SUPPORTED`) in amgettuple, amgetbitmap
+  and the count functions. The snapshot is not known yet in ambeginscan, which is why the refusal
+  is in the calls that read. Inserts and VACUUM are not affected; neither is
+  `lion_index_verify()`, whose heap scan raises "snapshot too old" itself on any page early
+  pruning changed, and whose structural checks use no snapshot.
 
 Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE

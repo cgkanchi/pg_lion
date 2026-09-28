@@ -7884,6 +7884,14 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/*
+	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
+	 * is set (DESIGN.md §9, lion_check_old_snapshot()), so there is no count
+	 * to push down, into one table or into a join.
+	 */
+	if (lion_old_snapshot_threshold_active())
+		return;
+
+	/*
 	 * A join of two tables may be the FK-side join of DESIGN.md §27, either
 	 * way round; each orientation that qualifies is tried, and the cost model
 	 * chooses among them and the ordinary plan.

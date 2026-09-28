@@ -1783,6 +1783,9 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	LionScanOpaque so = (LionScanOpaque) scan->opaque;
 
+	/* Not under old_snapshot_threshold (DESIGN.md §9). */
+	lion_check_old_snapshot(scan->indexRelation, scan->xs_snapshot);
+
 	/*
 	 * Re-fetch the cached state: a relcache invalidation since ambeginscan
 	 * would have thrown the copy in rd_amcache away.
@@ -3185,6 +3188,9 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 
 		if (so->srcdone)
 			return false;
+
+		/* Not under old_snapshot_threshold (DESIGN.md §9). */
+		lion_check_old_snapshot(scan->indexRelation, scan->xs_snapshot);
 
 		/* A relcache invalidation may have replaced the cached state. */
 		so->ix = lion_get_index_state(scan->indexRelation);

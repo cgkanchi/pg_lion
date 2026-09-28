@@ -1445,6 +1445,12 @@ extern bool lion_find_entry_ext(Relation index, LionState *state, int lockmode,
 extern bool lion_index_usable(Relation index, Snapshot snapshot,
 							 const char **why);
 
+/*
+ * ERROR unless index may be read under snapshot: never under an MVCC one
+ * while PostgreSQL 16's old_snapshot_threshold is set (DESIGN.md §9).
+ */
+extern void lion_check_old_snapshot(Relation index, Snapshot snapshot);
+
 
 /* ---------- additive helpers (wave 2, insert/vacuum/verify) ---------- */
 
