@@ -159,8 +159,8 @@ SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{nosuchtag,t39}'$$);
 SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags && '{nosuchtag}'$$);
 
 -- ---- two index quals on one column --------------------------------------
--- The access method answers ONE qual per scan and marks every TID for
--- recheck, so the bitmap heap scan applies the rest (DESIGN.md §5).
+-- The access method answers both and ANDs their key sets, as it ANDs two
+-- columns' (DESIGN.md §5 SCAN step 5).
 SELECT lion_arrcmp($$SELECT id FROM lion_arr
 				   WHERE tags @> '{t5}' AND tags && '{t2,t7}'$$);
 SELECT lion_arrcmp($$SELECT id FROM lion_arr

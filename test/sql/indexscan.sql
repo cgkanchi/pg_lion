@@ -202,10 +202,12 @@ SELECT lion_iq('SELECT id FROM lis WHERE k > ANY (''{195, 190}''::int[])');
 SELECT lion_iq('SELECT id FROM lis WHERE n IS NULL');
 SELECT lion_iq('SELECT id FROM lis WHERE n IS NOT NULL');
 SELECT lion_iq('SELECT id FROM lis WHERE n = ANY (''{3, NULL}''::int[])');
--- two quals on one column: one answered, the other rechecked
+-- two quals on one column: two lists are both answered and the recheck
+-- removes nothing; a range beside a list is left to the recheck
 SELECT lion_iq('SELECT id FROM lis WHERE k IN (17, 18) AND k IN (18, 19)');
 SELECT lion_iq('SELECT id FROM lis WHERE k = 17 AND k > 10');
 SELECT lion_ir('SELECT id FROM lis WHERE k IN (17, 18) AND k IN (18, 19)');
+SELECT lion_ir('SELECT id FROM lis WHERE k IN (17, 18) AND k > 17');
 -- a multicolumn index: sets ANDed, a range walked with the other column's sets,
 -- two ranges (one walked, one rechecked), and the second column alone
 SELECT lion_iq('SELECT id FROM lis WHERE g = 3 AND kk = 17');

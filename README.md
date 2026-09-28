@@ -291,6 +291,9 @@ extraction functions, and answer
     tags <@ '{a,b}'    every indexed row, rechecked in the heap
     tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact
 
+Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two lists on a scalar
+column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
+select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
 combined with a `GROUP BY` on a scalar roaring column. Everything a plain AND/OR of key sets cannot
 express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*` or weights - falls

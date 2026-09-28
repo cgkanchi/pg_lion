@@ -12,18 +12,20 @@
  * page of its current batch under any other (§29.5).  The rest of this
  * comment is about the bitmap scan, whose walk and trees the source shares.
  *
- * A lion index answers one qual per key column: an equality to a value,
- * `= ANY (array)` (DESIGN.md §15, amsearcharray), a range - every `<`,
- * `<=`, `>=` and `>` on the column at once, as one bounded walk of the
- * sorted directory (DESIGN.md §28) - or `IS NULL` or `IS NOT NULL`
- * (DESIGN.md §14, amsearchnulls).  The scan finds the entries the qual
- * selects and emits their posting sets into the caller's TIDBitmap.
+ * A lion index answers an equality to a value, `= ANY (array)` (DESIGN.md
+ * §15, amsearcharray), a range - every `<`, `<=`, `>=` and `>` on the column
+ * at once, as one bounded walk of the sorted directory (DESIGN.md §28) - and
+ * `IS NULL` or `IS NOT NULL` (DESIGN.md §14, amsearchnulls).  The scan finds
+ * the entries a qual selects and emits their posting sets into the caller's
+ * TIDBitmap.
  *
- * A MULTICOLUMN index (DESIGN.md §24) holds each column's keys as an
- * independent set of entries, so a scan key resolves to its column by
- * sk_attno and several columns' answers are INTERSECTED - through the very
- * expression evaluator a multi-key query already uses, because "the sets of
- * a and the sets of b" is an AND of set trees whatever produced them.  A qual
+ * Several quals are INTERSECTED, whether they are on one key column (`b =
+ * ANY (x) AND b = ANY (y)`, lion_scan_choose()) or on the several columns of
+ * a MULTICOLUMN index (DESIGN.md §24), which holds each column's keys as an
+ * independent set of entries, so that a scan key resolves to its column by
+ * sk_attno.  The AND goes through the very expression evaluator a multi-key
+ * query already uses, because "the sets of a and the sets of b" is an AND of
+ * set trees whatever produced them.  A qual
  * the sets cannot express (`IS NOT NULL`, a multi-key query that needs the
  * whole index) is dropped and the TIDs are marked for recheck, which is
  * always correct: the bitmap heap scan re-applies the original quals.  A
@@ -865,8 +867,8 @@ lion_scankey_is_range(LionState *col, ScanKey skey)
 /*
  * ... and is it `col < ANY (array)` or a sibling: an array key with a range
  * strategy on a scalar column, one walk to the widest element (below).  It
- * ranks as a list in lion_scan_choose(), but it is a walk and not a set tree,
- * so every caller that sorts columns into trees and walks asks this first.
+ * arrives as an array key, as a list does, but it is a walk and not a set
+ * tree, so every caller that sorts quals into trees and walks asks this first.
  * A NULL array (SK_ISNULL) is still one: it selects nothing.
  */
 static bool
@@ -1200,12 +1202,12 @@ lion_emit_multikey(LionScanOpaque so, LionState *col,
 }
 
 /* ---------------------------------------------------------------------
- * Several key columns at once (DESIGN.md §24)
+ * Several quals at once, of several key columns (DESIGN.md §24) or of one
  *
- * Each column's qual becomes a boolean TREE over posting sets, all of them
- * located into one array, and the columns are ANDed together.  That is the
- * very shape a multi-key query already produces (§17), so the evaluator of
- * lion_count.c answers both without knowing which is which.
+ * Each qual becomes a boolean TREE over posting sets, all of them located
+ * into one array, and the trees are ANDed together.  That is the very shape
+ * a multi-key query already produces (§17), so the evaluator of lion_count.c
+ * answers both without knowing which is which.
  *
  * Every set is located BEFORE the merge starts, which is the reader side of
  * the §11 rule: the directory locks are all taken and released before the
@@ -1459,11 +1461,11 @@ lion_scan_col_tree(LionScanOpaque so, LionState *col,
 }
 
 /*
- * Answer a scan whose keys span SEVERAL key columns: intersect the columns'
- * set trees (DESIGN.md §24).  Any column whose qual cannot be expressed is
- * dropped and *recheck is set, which is correct because the bitmap heap scan
- * re-applies the original quals.  Returns -1 when NOTHING could be expressed,
- * so the caller falls back to a single-column answer.
+ * Answer a scan of SEVERAL set quals, of one key column or of several:
+ * intersect their set trees (DESIGN.md §24).  Any qual that cannot be
+ * expressed is dropped and *recheck is set, which is correct because the
+ * bitmap heap scan re-applies the original quals.  Returns -1 when NOTHING
+ * could be expressed, so the caller falls back to a single-qual answer.
  */
 static int64
 lion_emit_columns(LionScanOpaque so, ScanKey *keys,
@@ -2070,156 +2072,216 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 }
 
 /*
- * The per-column choice both kinds of scan make (DESIGN.md §5 SCAN step 5,
- * §24, §28, §29.2).  ONE qual per key column is answered: the planner may
- * hand a column more than one (`b = ANY (x) AND b = ANY (y)`, or an equality
- * next to a null test), and the most selective-looking one is answered while
- * the rest are left to the heap recheck, which is correct because the others
- * only shrink the result.  The ranking is a plain equality first, then a
- * list, then a range, then a null test - and it is mirrored in
- * lion_scan_walks_whole_index() so that the path is priced as the path it
- * takes.  A range is every `<`, `<=`, `>=` and `>` of the column at once
- * (DESIGN.md §28): the walk answers all of them, so when the range is the
- * chosen qual none of them is dropped.
+ * The choice both kinds of scan make of the quals they answer (DESIGN.md §5
+ * SCAN step 5, §24, §28, §29.2).  The planner may hand one key column several
+ * quals - `tags && '{a}' AND tags && '{b}'`, `b = ANY (x) AND b = ANY (y)`,
+ * an equality next to a range or a null test - and every one of them that is
+ * a SET TREE is answered: an equality, a list, `IS NULL` and a multi-key
+ * query.  A column's trees are ANDed with each other exactly as they are with
+ * the other columns' (lion_emit_columns(), lion_emit_intersect(), the plain
+ * scan's streams), which only ever shrinks the answer: it is the rows the
+ * quals select together, with nothing left for the heap to throw away.
+ *
+ * What is not a set tree is a WALK of the column's entries, one per column:
+ *
+ *	- `op ANY (array)` with a range strategy, one walk to the widest element
+ *	  (§28), beside which a second one and the column's plain range keys are
+ *	  left to the recheck, as they were when it outranked them;
+ *	- else a range, every `<`, `<=`, `>=` and `>` of the column at once;
+ *	- else `IS NOT NULL`, every entry but the NULL one (§14).
+ *
+ * A column with a set tree is not walked at all: its range keys are left to
+ * the recheck, which tests one bound per row of the sets, where the walk
+ * would read every entry the range holds to remove whole entries from them.
+ * `IS NOT NULL` beside a strict qual of its column - anything but a null test
+ * - is IMPLIED by it and neither answered nor rechecked: the strict qual
+ * never selects a NULL, whether the index answers it or the recheck does
+ * (and a second `IS NOT NULL` is implied by the first).  A qual that can
+ * select nothing settles the whole scan (*nomatch): a comparison with NULL,
+ * and `IS NULL` beside a strict qual or `IS NOT NULL` of its column.  Two
+ * set trees that contradict each other (`k = 5 AND k = 6`) need no such
+ * test: their AND is empty.
+ *
+ * ndropped counts the quals left to the recheck here; a set tree the scan
+ * cannot build after all - a multi-key query in mode ALL (§17) - is dropped
+ * where it is built, and sets the recheck there.  The same classification is
+ * mirrored in lion_am.c (lion_cost_col_quals()) so that the path is priced as
+ * the scan it takes.
  */
 typedef struct LionScanChoice
 {
-	ScanKey		best[INDEX_MAX_KEYS];
-	int			bestrank[INDEX_MAX_KEYS];
-	int			nchosen;		/* columns with a chosen qual */
+	ScanKey    *sets;			/* the set quals answered, in key order */
+	int			nsets;
+	ScanKey		walk[INDEX_MAX_KEYS];	/* per column: its walk, if any */
+	ScanKey		first[INDEX_MAX_KEYS];	/* per column: its first answered
+										 * qual, set or walk */
+	int			nwalks;
 	int			ndropped;		/* quals left to the recheck */
+	bool		nomatch;		/* the quals can select nothing */
 } LionScanChoice;
 
 static void
 lion_scan_choose(LionScanOpaque so, LionScanChoice *ch)
 {
-	int			nkeys[INDEX_MAX_KEYS];
-	int			nrangekeys[INDEX_MAX_KEYS];
+	int			nrange[INDEX_MAX_KEYS];
+	int			narray[INDEX_MAX_KEYS];
+	int			nisnull[INDEX_MAX_KEYS];
+	int			nstrict[INDEX_MAX_KEYS];
+	ScanKey		firstset[INDEX_MAX_KEYS];
+	ScanKey		firstrange[INDEX_MAX_KEYS];
+	ScanKey		firstarray[INDEX_MAX_KEYS];
+	ScanKey		firstnotnull[INDEX_MAX_KEYS];
 	int			ncols = so->ix->ncolumns;
 	int			i;
 
-	ch->nchosen = 0;
+	ch->sets = (ScanKey *) palloc(sizeof(ScanKey) * Max(so->nkeys, 1));
+	ch->nsets = 0;
+	ch->nwalks = 0;
 	ch->ndropped = 0;
+	ch->nomatch = false;
 	for (i = 0; i < ncols; i++)
 	{
-		ch->best[i] = NULL;
-		ch->bestrank[i] = 4;
-		nkeys[i] = 0;
-		nrangekeys[i] = 0;
+		ch->walk[i] = NULL;
+		ch->first[i] = NULL;
+		nrange[i] = 0;
+		narray[i] = 0;
+		nisnull[i] = 0;
+		nstrict[i] = 0;
+		firstset[i] = NULL;
+		firstrange[i] = NULL;
+		firstarray[i] = NULL;
+		firstnotnull[i] = NULL;
 	}
 
+	/* One pass in key order: the set quals go straight into ch->sets. */
 	for (i = 0; i < so->nkeys; i++)
 	{
 		ScanKey		k = &so->keys[i];
 		int			ci = k->sk_attno - 1;
-		int			rank;
+		LionState  *col;
 
 		if (k->sk_attno < 1 || k->sk_attno > ncols)
 			continue;			/* not a key column of this index */
+		col = lion_column(so->ix, k->sk_attno);
 
-		if ((k->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL)) != 0)
-			rank = 3;
-		else if ((k->sk_flags & SK_SEARCHARRAY) != 0)
-			rank = 1;
-		else if (lion_scankey_is_range(lion_column(so->ix, k->sk_attno), k))
+		/* The null tests carry no strategy number and must be tested first. */
+		if ((k->sk_flags & SK_SEARCHNOTNULL) != 0)
 		{
-			rank = 2;
-			nrangekeys[ci]++;
+			if (firstnotnull[ci] == NULL)
+				firstnotnull[ci] = k;
+			continue;
 		}
+		if ((k->sk_flags & SK_SEARCHNULL) != 0)
+			nisnull[ci]++;
 		else
-			rank = 0;
-
-		if (ch->best[ci] == NULL)
-			ch->nchosen++;
-		nkeys[ci]++;
-
-		if (rank < ch->bestrank[ci])
 		{
-			ch->bestrank[ci] = rank;
-			ch->best[ci] = k;
+			/*
+			 * A strict qual, which with a NULL value - `col = NULL`, a NULL
+			 * array, a NULL bound - is never true.
+			 */
+			nstrict[ci]++;
+			if ((k->sk_flags & SK_ISNULL) != 0)
+				ch->nomatch = true;
+
+			if (lion_scankey_is_range(col, k))
+			{
+				if (firstrange[ci] == NULL)
+					firstrange[ci] = k;
+				nrange[ci]++;
+				continue;
+			}
+			if (lion_scankey_is_array_range(col, k))
+			{
+				if (firstarray[ci] == NULL)
+					firstarray[ci] = k;
+				narray[ci]++;
+				continue;
+			}
 		}
+
+		/* An equality, a list, `IS NULL` or a multi-key query: a set tree. */
+		ch->sets[ch->nsets++] = k;
+		if (firstset[ci] == NULL)
+			firstset[ci] = k;
 	}
 
 	for (i = 0; i < ncols; i++)
 	{
-		if (ch->best[i] != NULL)
-			ch->ndropped += nkeys[i] - (ch->bestrank[i] == 2 ? nrangekeys[i] : 1);
+		/* `IS NULL` beside a strict qual or `IS NOT NULL` holds of no row */
+		if (nisnull[i] > 0 && (nstrict[i] > 0 || firstnotnull[i] != NULL))
+			ch->nomatch = true;
+
+		if (firstset[i] != NULL)
+			ch->ndropped += nrange[i] + narray[i];	/* the recheck bounds the sets */
+		else if (firstarray[i] != NULL)
+		{
+			ch->walk[i] = firstarray[i];
+			ch->ndropped += narray[i] - 1 + nrange[i];
+		}
+		else if (firstrange[i] != NULL)
+			ch->walk[i] = firstrange[i];	/* every range key, one walk */
+		else if (firstnotnull[i] != NULL)
+			ch->walk[i] = firstnotnull[i];
+		if (ch->walk[i] != NULL)
+			ch->nwalks++;
+		ch->first[i] = (firstset[i] != NULL) ? firstset[i] : ch->walk[i];
 	}
 }
 
 /*
- * The bitmap scan proper, on the keys so->keys[0 .. so->nkeys - 1].  The
- * plain scan runs it as well, into a private bitmap, for the one shape it
- * cannot stream (DESIGN.md §29.3, BITMAP).
+ * The bitmap scan of the quals *ch answers (lion_scan_choose()).
  */
 static int64
-lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
+lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 {
 	Relation	index = so->index;
-	LionScanChoice ch;
-	int			ncols;
+	int			ncols = so->ix->ncolumns;
 	int			i;
 	LionState  *col;
 	ScanKey		skey;
 
-	ncols = so->ix->ncolumns;
-
-	/*
-	 * No scan key at all: a PARTIAL index whose predicate the query implies
-	 * (amoptionalkey, DESIGN.md §24).  The answer is every row the index
-	 * holds, which is the union of every entry of ANY ONE key column - the
-	 * NULL entry included this time, because a row whose value is NULL is
-	 * still an indexed row.  No recheck: these TIDs are exactly the rows the
-	 * scan selects.
-	 */
-	if (so->nkeys < 1)
-	{
-		so->recheck = false;
-		return lion_emit_all_keys_ext(index, lion_column(so->ix, 1), tbm,
-									 false, true, NULL);
-	}
-
-	lion_scan_choose(so, &ch);
-
-	if (ch.nchosen == 0)
+	if (ch->nomatch || ch->nsets + ch->nwalks == 0)
 		return 0;
 
-	so->recheck = (ch.ndropped > 0);
+	so->recheck = (ch->ndropped > 0);
 
 	/*
-	 * Several columns: intersect their set trees.  A column whose qual the
-	 * sets cannot express is dropped there and rechecked; when NONE of them
-	 * can be expressed the answer falls through to the single-column path
-	 * below, which knows how to walk a whole column.  A RANGE column is not a
-	 * set tree at all - its answer is a union of however many entries the
-	 * range holds (DESIGN.md §28), `col < ANY (array)` included - so its
+	 * Several quals, of one column or of several: intersect their set trees.
+	 * A qual the sets cannot express is dropped there and rechecked; when NONE
+	 * of them can be expressed the answer falls through to the single-qual
+	 * path below, which knows how to walk a whole column.  A RANGE column is
+	 * not a set tree at all - its answer is a union of however many entries
+	 * the range holds (DESIGN.md §28), `col < ANY (array)` included - so its
 	 * walk is ANDed with the others' stream a container at a time
-	 * (lion_emit_intersect()).
+	 * (lion_emit_intersect()).  `IS NOT NULL` goes with the sets, which drop
+	 * it: beside anything that answers, it is only rechecked.
 	 */
-	if (ch.nchosen > 1)
+	if (ch->nsets + ch->nwalks > 1)
 	{
-		ScanKey		chosen[INDEX_MAX_KEYS];
+		ScanKey    *keys;
 		ScanKey		rangekeys[INDEX_MAX_KEYS];
 		int			n = 0;
 		int			nrange = 0;
 		int64		ntids;
 
+		keys = (ScanKey *) palloc(sizeof(ScanKey) * (ch->nsets + ncols));
+		for (i = 0; i < ch->nsets; i++)
+			keys[n++] = ch->sets[i];
 		for (i = 0; i < ncols; i++)
 		{
-			if (ch.best[i] == NULL)
+			if (ch->walk[i] == NULL)
 				continue;
-			if (ch.bestrank[i] == 2 ||
-				lion_scankey_is_array_range(lion_column(so->ix, (AttrNumber) (i + 1)),
-											ch.best[i]))
-				rangekeys[nrange++] = ch.best[i];
+			if ((ch->walk[i]->sk_flags & SK_SEARCHNOTNULL) != 0)
+				keys[n++] = ch->walk[i];
 			else
-				chosen[n++] = ch.best[i];
+				rangekeys[nrange++] = ch->walk[i];
 		}
 
 		if (nrange > 0)
-			return lion_emit_intersect(so, chosen, n, rangekeys, nrange, tbm);
-
-		ntids = lion_emit_columns(so, chosen, n, tbm);
+			ntids = lion_emit_intersect(so, keys, n, rangekeys, nrange, tbm);
+		else
+			ntids = lion_emit_columns(so, keys, n, tbm);
+		pfree(keys);
 		if (ntids >= 0)
 			return ntids;
 
@@ -2229,11 +2291,11 @@ lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
 
 	for (i = 0; i < ncols; i++)
 	{
-		if (ch.best[i] != NULL)
+		if (ch->first[i] != NULL)
 			break;
 	}
 	Assert(i < ncols);
-	skey = ch.best[i];
+	skey = ch->first[i];
 	col = lion_column(so->ix, skey->sk_attno);
 
 	/* The null tests carry no strategy number and must be tested first. */
@@ -2272,6 +2334,37 @@ lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
 		return lion_emit_array(so, col, skey, tbm);
 
 	return lion_emit_value(so, col, skey, skey->sk_argument, tbm);
+}
+
+/*
+ * The bitmap scan proper, on the keys so->keys[0 .. so->nkeys - 1].
+ */
+static int64
+lion_getbitmap_so(LionScanOpaque so, TIDBitmap *tbm)
+{
+	LionScanChoice ch;
+	int64		ntids;
+
+	/*
+	 * No scan key at all: a PARTIAL index whose predicate the query implies
+	 * (amoptionalkey, DESIGN.md §24).  The answer is every row the index
+	 * holds, which is the union of every entry of ANY ONE key column - the
+	 * NULL entry included this time, because a row whose value is NULL is
+	 * still an indexed row.  No recheck: these TIDs are exactly the rows the
+	 * scan selects.
+	 */
+	if (so->nkeys < 1)
+	{
+		so->recheck = false;
+		return lion_emit_all_keys_ext(so->index, lion_column(so->ix, 1), tbm,
+									 false, true, NULL);
+	}
+
+	lion_scan_choose(so, &ch);
+	ntids = lion_getbitmap_choice(so, &ch, tbm);
+	pfree(ch.sets);
+
+	return ntids;
 }
 
 int64
@@ -2744,7 +2837,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	int			nargs = 0;
 	int			walkcol = -1;
 	int			notnullcol = -1;
-	int			listcol = -1;
+	ScanKey		listkey = NULL;
 	int			unioncol = -1;
 	bool		withnull = false;
 	bool		nomatch = false;
@@ -2771,7 +2864,6 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	acc.maxsets = 8;
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
-	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (INDEX_MAX_KEYS + 1));
 
 	if (so->nkeys < 1)
 	{
@@ -2781,6 +2873,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		 * included - streamed by a walk, or as a union when that column is
 		 * multi-key and a walk would repeat rows.
 		 */
+		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *));
 		withnull = true;
 		if (lion_column(so->ix, 1)->multikey)
 			unioncol = 0;
@@ -2790,74 +2883,49 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	else
 	{
 		lion_scan_choose(so, &ch);
-		if (ch.nchosen == 0)
+		if (ch.nomatch || ch.nsets + ch.nwalks == 0)
 			nomatch = true;
 		src->recheck = (ch.ndropped > 0);
 
-		for (i = 0; i < ncols && !nomatch; i++)
+		/* one tree per set qual, and one more slot for a WALK's entry */
+		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (ch.nsets + 1));
+
+		/*
+		 * The set quals, every one of every column: a set tree each, ANDed
+		 * below, or a long list that drives the scan a batch at a time.
+		 */
+		for (i = 0; i < ch.nsets && !nomatch; i++)
 		{
-			ScanKey		skey = ch.best[i];
-			LionState  *col;
+			ScanKey		skey = ch.sets[i];
+			LionState  *col = lion_column(so->ix, skey->sk_attno);
 			LionKeyNode *node;
 			bool		ok;
 			bool		none;
-
-			if (skey == NULL)
-				continue;
-			col = lion_column(so->ix, (AttrNumber) (i + 1));
 
 			if (col->multikey)
 			{
 				/* Answered, and rechecked all the same (§29.6). */
 				src->recheck = true;
-				if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
-				{
-					if (unioncol < 0)
-						unioncol = i;	/* a walk would repeat rows */
-					continue;
-				}
 				node = lion_scan_col_tree(so, col, skey, &acc, &ok, &none);
 				if (none)
 					nomatch = true;
 				else if (!ok)
 				{
-					if (unioncol < 0)
-						unioncol = i;	/* mode ALL: every row */
+					/* mode ALL: every row; the first such column, as below */
+					if (unioncol < 0 || skey->sk_attno - 1 < unioncol)
+						unioncol = skey->sk_attno - 1;
 				}
 				else
 					args[nargs++] = node;
 				continue;
 			}
 
-			/*
-			 * A scalar column: `IS NOT NULL`, a walk, a long list, or a set
-			 * tree.  `IS NOT NULL` is every entry of the column but its NULL
-			 * one - a walk of the whole column - and it only drives the scan
-			 * when nothing else answers it (below).
-			 */
-			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
-			{
-				if (notnullcol < 0)
-					notnullcol = i;
-				else
-					src->recheck = true;	/* a second one is not answered */
-				continue;
-			}
-			if (ch.bestrank[i] == 2 || lion_scankey_is_array_range(col, skey))
-			{
-				if (walkcol < 0)
-					walkcol = i;
-				else
-					src->recheck = true;	/* a second walk is not answered */
-				continue;
-			}
-
 			if (lion_scankey_list_length(col, skey) > batch)
 			{
-				if (listcol < 0)
-					listcol = i;
+				if (listkey == NULL)
+					listkey = skey;
 				else
-					src->recheck = true;	/* a second long list, too */
+					src->recheck = true;	/* a second long list is not answered */
 				continue;
 			}
 
@@ -2878,12 +2946,46 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		}
 
 		/*
+		 * The walks, one per column at most: a range, or `IS NOT NULL`, which
+		 * is every entry of the column but its NULL one - a walk of the whole
+		 * column - and only drives the scan when nothing else answers it
+		 * (below).  A multi-key column's is a union: a walk would repeat rows.
+		 */
+		for (i = 0; i < ncols && !nomatch; i++)
+		{
+			ScanKey		skey = ch.walk[i];
+
+			if (skey == NULL)
+				continue;
+
+			if (lion_column(so->ix, (AttrNumber) (i + 1))->multikey)
+			{
+				src->recheck = true;
+				if (unioncol < 0 || i < unioncol)
+					unioncol = i;
+				continue;
+			}
+			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
+			{
+				if (notnullcol < 0)
+					notnullcol = i;
+				else
+					src->recheck = true;	/* a second one is not answered */
+				continue;
+			}
+			if (walkcol < 0)
+				walkcol = i;
+			else
+				src->recheck = true;	/* a second walk is not answered */
+		}
+
+		/*
 		 * One driver: a long list outranks a walk, which is then left to the
-		 * recheck.  A multi-key column that needs every row, next to a column
+		 * recheck.  A multi-key column that needs every row, next to a qual
 		 * that does answer, is dropped and rechecked, as the bitmap path does;
 		 * only when nothing else answers is it streamed as a union.
 		 */
-		if (listcol >= 0 && walkcol >= 0)
+		if (listkey != NULL && walkcol >= 0)
 		{
 			walkcol = -1;
 			src->recheck = true;
@@ -2901,29 +3003,28 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		 */
 		if (notnullcol >= 0)
 		{
-			if (nargs > 0 || walkcol >= 0 || listcol >= 0)
+			if (nargs > 0 || walkcol >= 0 || listkey != NULL)
 				src->recheck = true;
 			else
 				walkcol = notnullcol;
 		}
-		if (unioncol >= 0 && (nargs > 0 || walkcol >= 0 || listcol >= 0))
+		if (unioncol >= 0 && (nargs > 0 || walkcol >= 0 || listkey != NULL))
 			unioncol = -1;
 	}
 
 	if (!nomatch && walkcol >= 0 && !withnull)
 	{
 		LionState  *col = lion_column(so->ix, (AttrNumber) (walkcol + 1));
-		ScanKey		best = ch.best[walkcol];
+		ScanKey		walk = ch.walk[walkcol];
 
-		if ((best->sk_flags & SK_SEARCHNOTNULL) == 0 &&
-			!lion_source_ranges(src, col, best))
+		if ((walk->sk_flags & SK_SEARCHNOTNULL) == 0 &&
+			!lion_source_ranges(src, col, walk))
 			nomatch = true;
 	}
 
-	if (!nomatch && listcol >= 0)
+	if (!nomatch && listkey != NULL)
 	{
-		ScanKey		best = ch.best[listcol];
-		ArrayType  *arr = DatumGetArrayTypeP(best->sk_argument);
+		ArrayType  *arr = DatumGetArrayTypeP(listkey->sk_argument);
 		int16		elmlen;
 		bool		elmbyval;
 		char		elmalign;
@@ -2931,7 +3032,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		bool	   *nulls;
 		int			nelems;
 
-		src->listattno = (AttrNumber) (listcol + 1);
+		src->listattno = listkey->sk_attno;
 		src->listtype = ARR_ELEMTYPE(arr);
 		get_typlenbyvalalign(src->listtype, &elmlen, &elmbyval, &elmalign);
 		deconstruct_array(arr, src->listtype, elmlen, elmbyval, elmalign,
@@ -2993,7 +3094,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			src->recheck = true;
 	}
 
-	if (listcol >= 0)
+	if (listkey != NULL)
 	{
 		src->shape = LION_SRC_LIST;
 		src->restargs = args;
