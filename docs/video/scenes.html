@@ -1,0 +1,915 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pg_lion explained</title>
+<!--
+  Every frame of the video is this page at one instant: renderAt(t) poses the whole stage for time t
+  (seconds), from the cue times in timeline.js, which build_audio.py writes from the narration.
+  Nothing here animates by itself; render.py steps t and screenshots each frame.
+  Open it in a browser with ?play to watch it in real time (without sound).
+-->
+<style>
+@font-face { font-family: Inter; font-weight: 400; src: url(fonts/inter-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family: Inter; font-weight: 500; src: url(fonts/inter-latin-500-normal.woff2) format("woff2"); }
+@font-face { font-family: Inter; font-weight: 600; src: url(fonts/inter-latin-600-normal.woff2) format("woff2"); }
+@font-face { font-family: Inter; font-weight: 700; src: url(fonts/inter-latin-700-normal.woff2) format("woff2"); }
+@font-face { font-family: Inter; font-weight: 800; src: url(fonts/inter-latin-800-normal.woff2) format("woff2"); }
+@font-face { font-family: JBM; font-weight: 400; src: url(fonts/jetbrains-mono-latin-400-normal.woff2) format("woff2"); }
+@font-face { font-family: JBM; font-weight: 500; src: url(fonts/jetbrains-mono-latin-500-normal.woff2) format("woff2"); }
+@font-face { font-family: JBM; font-weight: 700; src: url(fonts/jetbrains-mono-latin-700-normal.woff2) format("woff2"); }
+
+:root {
+  --bg: #0b0e13; --bg2: #10151d; --panel: #151b25; --panel2: #1b2330; --line: #2a3446; --line2: #36425a;
+  --text: #eef1f6; --muted: #929cae; --dim: #5d6779;
+  --blue: #5b9cff; --blue-bg: #13233d; --green: #3ecf8e; --green-bg: #0f2c22;
+  --amber: #f7b03c; --amber-bg: #33240c; --pink: #f0648c; --pink-bg: #36121f;
+  --orange: #ff8a4c; --red: #ff6464; --gray: #8f99ab;
+}
+html, body { margin: 0; padding: 0; background: #000; }
+body { font-family: Inter, sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
+#stage { position: relative; width: 1920px; height: 1080px; overflow: hidden;
+  background: radial-gradient(1400px 900px at 50% 38%, #121824 0%, var(--bg) 70%); }
+.a { position: absolute; }
+.scene { position: absolute; inset: 0; display: none; }
+.mono { font-family: JBM, monospace; }
+svg.layer { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; overflow: visible; }
+canvas.layer { position: absolute; left: 0; top: 0; }
+
+#chapter { position: absolute; left: 96px; top: 50px; display: flex; gap: 18px; align-items: baseline; }
+#chapter .num { font-family: JBM, monospace; font-weight: 700; font-size: 22px; color: var(--amber); }
+#chapter .ttl { font-size: 22px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+#brand { position: absolute; right: 96px; top: 50px; font-family: JBM, monospace; font-size: 22px; color: var(--dim); }
+#caption { position: absolute; left: 0; right: 0; bottom: 34px; display: flex; justify-content: center; }
+#caption span { max-width: 1500px; font-size: 32px; line-height: 1.38; font-weight: 500; color: #f4f6fa;
+  background: rgba(6, 8, 12, .78); padding: 9px 24px 11px; border-radius: 12px; text-align: center; }
+#progress { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; display: flex; gap: 3px; }
+#progress div { position: relative; height: 100%; background: #1a212d; overflow: hidden; }
+#progress div i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--amber); opacity: .75; }
+
+.card { background: var(--panel); border: 1.5px solid var(--line); border-radius: 18px; }
+.chip { border-radius: 12px; padding: 8px 26px; font-weight: 700; border: 2px solid; display: inline-block; }
+.pill { border-radius: 999px; padding: 6px 18px; font-weight: 700; display: inline-block; }
+.center { text-align: center; }
+.code { font-family: JBM, monospace; white-space: pre; }
+.kw { color: #c792ea; } .fn { color: #82aaff; } .str { color: #c3e88d; } .num { color: #f78c6c; } .cm { color: #5d6779; }
+.big { font-weight: 800; letter-spacing: -.02em; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="scenes"></div>
+  <div id="chapter"><span class="num"></span><span class="ttl"></span></div>
+  <div id="brand">pg_lion</div>
+  <div id="caption"><span></span></div>
+  <div id="progress"></div>
+</div>
+<script src="timeline.js"></script>
+<script>
+"use strict";
+/* ------------------------------------------------------------------ helpers */
+const TL = window.TIMELINE;
+const CUE = {};
+TL.scenes.forEach(s => s.cues.forEach(c => { CUE[c.id] = c; }));
+const SC = {};
+TL.scenes.forEach(s => { SC[s.id] = s; });
+const A = (id, k = 0) => CUE[id].sentences[k].start;      // when sentence k of a cue starts
+const Z = (id) => CUE[id].end;                               // when a cue's speech ends
+// when a phrase of a cue's caption is spoken, by its share of the sentence's characters
+function wt(id, phrase) {
+  for (const s of CUE[id].sentences) {
+    const i = s.cap.indexOf(phrase);
+    if (i >= 0) return s.start + (s.end - s.start) * (i / s.cap.length);
+  }
+  throw new Error("no phrase '" + phrase + "' in cue " + id);
+}
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, x) => a + (b - a) * x;
+const P = (t, a, d) => clamp((t - a) / d);
+const E = {
+  out: x => 1 - Math.pow(1 - clamp(x), 3),
+  io: x => { x = clamp(x); return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; },
+  back: x => { x = clamp(x); const c1 = 1.5, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); },
+};
+const fmt = n => Math.round(n).toLocaleString("en-US");
+function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+function mk(parent, cls, css, html) {
+  const e = document.createElement("div");
+  e.className = "a" + (cls ? " " + cls : "");
+  if (css) Object.assign(e.style, css);
+  if (html !== undefined) e.innerHTML = html;
+  parent.appendChild(e);
+  return e;
+}
+function box(x, y, w, h) { const s = { left: x + "px", top: y + "px" }; if (w != null) s.width = w + "px"; if (h != null) s.height = h + "px"; return s; }
+// pose an element: opacity, offset, scale
+function st(e, o = 1, x = 0, y = 0, s = 1) {
+  e.style.opacity = o;
+  e.style.visibility = o <= 0.001 ? "hidden" : "visible";
+  e.style.transform = (e._base || "") + " translate(" + x + "px," + y + "px) scale(" + s + ")";
+}
+// fade and rise in at a, fade out at b (if given)
+function show(e, t, a, b, dy = 22, d = 0.5) {
+  const pin = E.out(P(t, a, d));
+  const pout = b == null ? 0 : E.io(P(t, b, 0.4));
+  st(e, pin * (1 - pout), 0, (1 - pin) * dy - pout * 10, 1);
+  return pin * (1 - pout);
+}
+function pop(e, t, a, b, d = 0.45) {
+  const pin = P(t, a, d), pout = b == null ? 0 : E.io(P(t, b, 0.35));
+  st(e, clamp(pin * 2) * (1 - pout), 0, 0, lerp(0.6, 1, E.back(pin)) * (1 - pout * 0.1));
+  return pin * (1 - pout);
+}
+const SVGNS = "http://www.w3.org/2000/svg";
+function svgLayer(parent) { const s = document.createElementNS(SVGNS, "svg"); s.setAttribute("class", "layer"); s.setAttribute("viewBox", "0 0 1920 1080"); parent.appendChild(s); return s; }
+function sv(parent, tag, attrs) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; }
+function canvasLayer(parent) {
+  const c = document.createElement("canvas"); c.className = "layer"; c.width = 1920; c.height = 1080;
+  c.style.width = "1920px"; c.style.height = "1080px"; parent.appendChild(c); return c.getContext("2d");
+}
+function rrect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+const COL = { blue: "#5b9cff", green: "#3ecf8e", amber: "#f7b03c", pink: "#f0648c", orange: "#ff8a4c",
+  cell: "#1e2635", cellLine: "#2a3446", text: "#eef1f6", muted: "#929cae", dim: "#5d6779", white: "#ffffff" };
+
+function titleBlock(root, word, color, sub, y = 330) {
+  const g = mk(root, "", box(0, y, 1920));
+  mk(g, "center big", { width: "1920px", fontSize: "132px", color: color, lineHeight: "1" }, word);
+  const s = mk(g, "center", { width: "1920px", top: "160px", fontSize: "40px", color: "var(--muted)", fontWeight: 500 }, sub);
+  return { g, s };
+}
+
+/* ------------------------------------------------------------------ scenes */
+const SCENES = [];
+function scene(id, build) { SCENES.push({ id, build }); }
+
+/* 1. intro ---------------------------------------------------------------- */
+scene("intro", root => {
+  const r = rng(7), cols = 20, rows = 5, cs = 38, gap = 10;
+  const gx = 960 - (cols * (cs + gap) - gap) / 2, gy = 200;
+  const cells = [];
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const on = r() < 0.46;
+    const e = mk(root, "", Object.assign(box(gx + i * (cs + gap), gy + j * (cs + gap), cs, cs), { borderRadius: "8px", background: "#1a2130" }));
+    cells.push({ e, on, i, j, d: r() });
+  }
+  const title = mk(root, "center big", Object.assign(box(0, 470, 1920), { fontSize: "168px", lineHeight: "1" }),
+    '<span style="color:#7d889c">pg_</span><span style="color:var(--amber)">lion</span>');
+  const sub = mk(root, "center", Object.assign(box(0, 668, 1920), { fontSize: "46px", fontWeight: 500, color: "var(--text)" }),
+    "an index that answers <b style='color:var(--amber)'>how many?</b>");
+  const row = mk(root, "", Object.assign(box(0, 780, 1920), { display: "flex", justifyContent: "center", gap: "26px", alignItems: "center" }));
+  const chips = [["Lion", "amber"], ["vs", null], ["B-tree", "blue"], ["vs", null], ["GIN", "green"]].map(([w, c]) => {
+    const e = document.createElement("div");
+    if (c) { e.className = "chip"; Object.assign(e.style, { color: "var(--" + c + ")", borderColor: "var(--" + c + ")", fontSize: "36px", background: "var(--" + c + "-bg)" }); }
+    else Object.assign(e.style, { color: "var(--dim)", fontSize: "30px", fontWeight: 600 });
+    e.textContent = w; row.appendChild(e); return e;
+  });
+  const t3 = A("i3");
+  const chipAt = [t3 + 0.4, t3 + 0.9, wt("i3", "B-tree"), wt("i3", "B-tree") + 0.35, wt("i3", "GIN")];
+  return t => {
+    for (const c of cells) {
+      const lit = c.on ? E.out(P(t, 0.25 + c.i * 0.05 + c.j * 0.04 + c.d * 0.2, 0.4)) : 0;
+      const shimmer = c.on ? 0.12 * Math.max(0, Math.sin((t * 1.1 - c.i * 0.18 - c.j * 0.1))) : 0;
+      c.e.style.background = lit > 0 ? `rgba(247,176,60,${0.25 + 0.75 * lit - shimmer})` : "#1a2130";
+      st(c.e, E.out(P(t, 0.05 + c.i * 0.02, 0.5)), 0, 0, 1);
+    }
+    pop(title, t, 1.0, null, 0.7);
+    show(sub, t, A("i2"), null);
+    chips.forEach((c, k) => { c.style.opacity = E.out(P(t, chipAt[k], 0.4)); c.style.transform = `translateY(${(1 - E.out(P(t, chipAt[k], 0.4))) * 18}px)`; });
+  };
+});
+
+/* 2. the question ---------------------------------------------------------- */
+scene("question", root => {
+  // dashboard mock
+  const dash = mk(root, "card", box(110, 160, 790, 690));
+  mk(dash, "", Object.assign(box(40, 30), { fontSize: "30px", fontWeight: 700 }), "Events");
+  mk(dash, "mono", Object.assign(box(40, 74), { fontSize: "20px", color: "var(--muted)" }), "5,000,000 rows");
+  const f1 = mk(dash, "pill", Object.assign(box(40, 122), { fontSize: "22px", background: "#232c3b", color: "var(--text)" }), "country: Japan");
+  const f2 = mk(dash, "pill", Object.assign(box(260, 122), { fontSize: "22px", background: "#232c3b", color: "var(--text)" }), "type: purchase");
+  mk(dash, "", Object.assign(box(40, 190), { fontSize: "20px", color: "var(--muted)", fontWeight: 600, letterSpacing: ".08em" }), "MATCHING EVENTS");
+  const stat = mk(dash, "big", Object.assign(box(40, 218), { fontSize: "64px" }), "2,500,000");
+  const stat2 = mk(dash, "", Object.assign(box(420, 240), { fontSize: "26px", color: "var(--pink)", fontWeight: 700 }), "purchases: 312,408");
+  mk(dash, "", Object.assign(box(40, 318), { fontSize: "20px", color: "var(--muted)", fontWeight: 600, letterSpacing: ".08em" }), "EVENTS BY COUNTRY");
+  const facets = [["Japan", 2500000], ["USA", 1000000], ["Brazil", 600000], ["India", 450000], ["Germany", 250000], ["France", 200000]];
+  const bars = facets.map(([k, v], i) => {
+    const y = 356 + i * 52;
+    const lab = mk(dash, "", Object.assign(box(40, y), { fontSize: "23px", width: "130px" }), k);
+    const bar = mk(dash, "", Object.assign(box(180, y + 4, 0, 26), { borderRadius: "6px", background: "var(--amber)" }));
+    const num = mk(dash, "mono", Object.assign(box(0, y + 1), { fontSize: "21px", color: "var(--muted)" }), fmt(v));
+    return { lab, bar, num, w: 400 * v / 2500000 };
+  });
+  // questions
+  const qs = ["How many from Japan?", "…and of those, purchases?", "How many per country?"].map((q, i) =>
+    mk(root, "", Object.assign(box(990, 250 + i * 120, 820), { fontSize: "46px", fontWeight: 700 }), q));
+  // SQL
+  const sqlLines = [
+    "<span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events",
+    "<span class=kw>WHERE</span> country = <span class=str>'Japan'</span>;",
+    "",
+    "<span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events",
+    "<span class=kw>WHERE</span> country = <span class=str>'Japan'</span>",
+    "  <span class=kw>AND</span> type = <span class=str>'purchase'</span>;",
+    "",
+    "<span class=kw>SELECT</span> country, <span class=fn>count</span>(*) <span class=kw>FROM</span> events",
+    "<span class=kw>GROUP BY</span> country;"];
+  const sql = mk(root, "card", box(970, 180, 850, 500));
+  const sqlEls = sqlLines.map((l, i) => mk(sql, "code", Object.assign(box(40, 34 + i * 48), { fontSize: "29px" }), l));
+  // dots: 5,000 dots, one per 1,000 rows
+  const ctx = canvasLayer(root);
+  const r = rng(11), N = 5000, cols = 100, sp = 13.2, dx = 960 - (cols - 1) * sp / 2, dy = 250;
+  const dots = []; for (let k = 0; k < N; k++) dots.push({ m: r() < 0.5, d: r() });
+  const lbl = mk(root, "", Object.assign(box(305, 170), { fontSize: "34px", fontWeight: 700 }), "events <span class=mono style='color:var(--muted);font-weight:500;font-size:28px'>5,000,000 rows</span>");
+  const leg = mk(root, "", Object.assign(box(1310, 180, 310), { fontSize: "24px", color: "var(--muted)", textAlign: "right" }), "● = 1,000 rows");
+  const match = mk(root, "", Object.assign(box(305, 170, 1310), { fontSize: "34px", fontWeight: 700, color: "var(--amber)", textAlign: "right" }), "2,500,000 match");
+  const ask = mk(root, "card", Object.assign(box(560, 430, 800, 190), { background: "rgba(16,21,29,.94)" }));
+  mk(ask, "center", Object.assign(box(0, 30, 800), { fontSize: "36px", fontWeight: 700 }), "How fast can Postgres count them?");
+  const askRow = mk(ask, "", Object.assign(box(0, 100, 800), { display: "flex", justifyContent: "center", gap: "22px" }),
+    "<span class=chip style='color:var(--blue);border-color:var(--blue);font-size:30px;background:var(--blue-bg)'>B-tree</span>" +
+    "<span class=chip style='color:var(--green);border-color:var(--green);font-size:30px;background:var(--green-bg)'>GIN</span>" +
+    "<span class=chip style='color:var(--amber);border-color:var(--amber);font-size:30px;background:var(--amber-bg)'>Lion</span>");
+
+  const tq1 = A("q1"), tq3 = A("q3"), tq4 = A("q4"), tq5 = A("q5");
+  const halfAt = wt("q4", "half");
+  return t => {
+    const out1 = tq4 - 0.2;
+    show(dash, t, tq1 - 0.3, out1, 30, 0.7);
+    st(dash, +dash.style.opacity, lerp(405, 0, E.io(P(t, A("q2") - 0.5, 0.8))), 0);
+    bars.forEach((b, i) => {
+      const p = E.out(P(t, tq1 + 0.6 + i * 0.12, 0.8));
+      b.bar.style.width = (b.w * p) + "px";
+      b.num.style.left = (190 + b.w * p) + "px";
+      st(b.num, p);
+      const hl = i === 0 ? E.out(P(t, A("q2", 0), 0.4)) : 0;
+      const hl3 = E.out(P(t, A("q2", 2), 0.4));
+      b.bar.style.background = hl3 > 0 ? "var(--amber)" : "var(--amber)";
+      b.bar.style.opacity = i === 0 ? 1 : lerp(0.55, 1, hl3);
+      b.lab.style.color = (i === 0 && hl > 0.5) || hl3 > 0.5 ? "var(--text)" : "var(--muted)";
+    });
+    const h1 = E.out(P(t, A("q2", 0), 0.4)), h2 = E.out(P(t, A("q2", 1), 0.4));
+    f1.style.background = h1 > 0.5 ? "var(--amber)" : "#232c3b"; f1.style.color = h1 > 0.5 ? "#1a1204" : "var(--text)";
+    f2.style.background = h2 > 0.5 ? "var(--pink)" : "#232c3b"; f2.style.color = h2 > 0.5 ? "#1a0610" : "var(--text)";
+    st(stat, lerp(0.35, 1, h1)); st(stat2, h2);
+    qs.forEach((q, i) => show(q, t, A("q2", i) - 0.1, tq3 - 0.1, 24));
+    const sqlp = show(sql, t, tq3 - 0.1, out1, 24);
+    sqlEls.forEach((e, i) => st(e, E.out(P(t, tq3 + 0.15 + i * 0.22, 0.35)), (1 - E.out(P(t, tq3 + 0.15 + i * 0.22, 0.35))) * -12));
+    // dots
+    ctx.clearRect(0, 0, 1920, 1080);
+    const pd = P(t, tq4 - 0.1, 1.0);
+    if (pd > 0) {
+      const dim = 1 - 0.7 * E.out(P(t, A("q5", 1) - 0.2, 0.6));
+      for (let k = 0; k < N; k++) {
+        const i = k % cols, j = (k / cols) | 0;
+        const a = clamp((pd * 1.6 - i / cols) * 3);
+        if (a <= 0) continue;
+        const d = dots[k];
+        const m = d.m ? E.out(P(t, halfAt + d.d * 1.2, 0.3)) : 0;
+        ctx.globalAlpha = a * dim;
+        ctx.fillStyle = m > 0.5 ? COL.amber : "#3a4458";
+        ctx.beginPath(); ctx.arc(dx + i * sp, dy + j * sp, m > 0.5 ? 4.4 : 3.8, 0, 6.2832); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+    show(lbl, t, tq4, null, 12); show(leg, t, tq4 + 0.3, halfAt, 12); show(match, t, halfAt + 0.8, null, 12);
+    show(ask, t, A("q5", 1) - 0.1, null, 30, 0.6);
+  };
+});
+
+/* 3. B-tree ---------------------------------------------------------------- */
+scene("btree", root => {
+  const tb = titleBlock(root, "B-tree", "var(--blue)", "the index Postgres gives you by default<br><span class=mono style='font-size:32px;color:var(--dim)'>CREATE INDEX ON events (country);</span>");
+  const svg = svgLayer(root);
+  const diag = mk(root, "", box(0, 0, 1920, 1080));
+  diag.appendChild(svg);
+  const node = (x, y, w, txt) => mk(diag, "center mono", Object.assign(box(x - w / 2, y, w, 60), { lineHeight: "56px", fontSize: "24px", border: "2px solid var(--line2)", borderRadius: "12px", background: "var(--panel)" }), txt);
+  const root0 = node(960, 230, 300, "Japan │ Mexico");
+  const keys = ["Brazil", "Brazil", "Chile", "Fiji", "India", "Japan", "Japan", "Japan", "Japan", "Japan", "Mexico", "Peru", "Peru", "USA", "USA"];
+  const ew = 100, eg = 10, ex0 = 960 - (15 * (ew + eg) - eg) / 2, ey = 430;
+  // three leaf pages of five entries
+  const leaves = [0, 1, 2].map(k => mk(diag, "", Object.assign(box(ex0 - 10 + k * 5 * (ew + eg), ey - 12, 5 * (ew + eg) - eg + 20, 86), { border: "2px solid var(--line2)", borderRadius: "14px", background: "rgba(21,27,37,.6)" })));
+  const ents = keys.map((k, i) => mk(diag, "center", Object.assign(box(ex0 + i * (ew + eg), ey, ew, 62), { lineHeight: "62px", fontSize: "21px", fontWeight: 600, borderRadius: "9px", background: "#222b3a" }), k));
+  mk(diag, "", Object.assign(box(ex0 - 10, ey + 84), { fontSize: "20px", color: "var(--dim)" }), "leaf pages: every key, in sorted order, one entry per row");
+  // table rows, shuffled
+  const r = rng(5), order = keys.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+  const rowAt = []; order.forEach((ki, slot) => { rowAt[ki] = slot; });
+  const ry = 690;
+  mk(diag, "", Object.assign(box(ex0 - 10, ry - 40), { fontSize: "20px", color: "var(--dim)" }), "the table (heap): rows in no particular order");
+  const rowsEl = keys.map((k, i) => mk(diag, "center", Object.assign(box(ex0 + i * (ew + eg), ry, ew, 48), { lineHeight: "48px", fontSize: "18px", borderRadius: "8px", border: "1.5px solid var(--line)", background: "var(--bg2)", color: "var(--muted)" }), keys[order[i]]));
+  // edges
+  const edge = (x1, y1, x2, y2) => sv(svg, "line", { x1, y1, x2, y2, stroke: "#36425a", "stroke-width": 2.5 });
+  const leafMid = k => ex0 + k * 5 * (ew + eg) + (5 * (ew + eg) - eg) / 2;
+  const e0 = [0, 1, 2].map(i => edge(960, 290, leafMid(i), ey - 12));
+  const ptr = keys.map((k, i) => sv(svg, "path", { d: `M${ex0 + i * (ew + eg) + ew / 2},${ey + 64} C${ex0 + i * (ew + eg) + ew / 2},${ey + 170} ${ex0 + rowAt[i] * (ew + eg) + ew / 2},${ry - 110} ${ex0 + rowAt[i] * (ew + eg) + ew / 2},${ry}`, fill: "none", stroke: "#2f3a4e", "stroke-width": 2 }));
+  const dot = sv(svg, "circle", { r: 9, fill: "#5b9cff" });
+  const hops = mk(diag, "", Object.assign(box(1140, 244), { fontSize: "26px", color: "var(--blue)", fontWeight: 700 }), "2 hops to find 'Japan'");
+  // strengths card
+  const good = mk(root, "card", box(520, 200, 880, 520));
+  mk(good, "", Object.assign(box(56, 44), { fontSize: "34px", fontWeight: 700, color: "var(--blue)" }), "B-trees are great at");
+  const goods = ["Fetching a few rows by key", "Reading a range, in order", "ORDER BY … LIMIT", "UNIQUE and primary keys"];
+  const phr = ["fetching a few rows", "reading ranges in order", "ORDER BY with LIMIT", "enforcing uniqueness"];
+  const goodEls = goods.map((g, i) => mk(good, "", Object.assign(box(56, 130 + i * 96), { fontSize: "38px", fontWeight: 600 }), "<span style='color:var(--blue)'>✓</span>&nbsp; " + g));
+  // counters
+  const cnt = mk(root, "card", box(100, 140, 380, 116));
+  mk(cnt, "mono", Object.assign(box(28, 16), { fontSize: "22px", color: "var(--muted)" }), "count(*)");
+  const cntN = mk(cnt, "big mono", Object.assign(box(28, 46), { fontSize: "48px", color: "var(--blue)" }), "0");
+  const res = mk(root, "card", box(1440, 140, 380, 116));
+  mk(res, "", Object.assign(box(28, 16), { fontSize: "22px", color: "var(--muted)" }), "one step per matching row");
+  const resN = mk(res, "big", Object.assign(box(28, 44), { fontSize: "50px", color: "var(--blue)" }), "≈157 ms");
+  const foot = mk(root, "", Object.assign(box(1440, 266, 380), { fontSize: "18px", color: "var(--dim)" }), "2.5M of 5M rows · vacuumed · PG 18.6");
+
+  const t1 = A("b1"), t2 = A("b2"), t3 = A("b3"), t4 = A("b4"), t5 = A("b5"), t6 = A("b6");
+  const path = [[960, 260], [960, 290], [leafMid(1), ey - 12], [ex0 + 5 * (ew + eg) + ew / 2, ey + 31]];
+  const walkStart = t5 + 1.4, step = 0.55;
+  return t => {
+    show(tb.g, t, t1 - 0.3, t2 - 0.2, 24, 0.6);
+    const dIn = E.out(P(t, t2 - 0.1, 0.6)), dimG = 1 - 0.85 * E.io(P(t, t4 - 0.2, 0.5)) + 0.85 * E.io(P(t, t5 - 0.5, 0.5));
+    st(diag, dIn * dimG, 0, (1 - dIn) * 20);
+    // build order: nodes, leaves, then pointers and rows on "Each entry points"
+    const pb = A("b2", 1);
+    st(root0, E.out(P(t, t2, 0.4)));
+    e0.forEach((e, i) => e.setAttribute("opacity", E.out(P(t, t2 + 0.3 + i * 0.1, 0.4))));
+    leaves.forEach((e, i) => st(e, E.out(P(t, t2 + 0.6 + i * 0.1, 0.4))));
+    ents.forEach((e, i) => st(e, E.out(P(t, t2 + 0.7 + i * 0.07, 0.35))));
+    ptr.forEach((p, i) => p.setAttribute("opacity", E.out(P(t, pb + i * 0.06, 0.4))));
+    rowsEl.forEach((e, i) => st(e, E.out(P(t, pb + 0.2 + i * 0.04, 0.4))));
+    // search path
+    const ps = P(t, t3 + 0.2, 2.2);
+    const hot = (e, on) => { e.style.borderColor = on ? "var(--blue)" : "var(--line2)"; e.style.boxShadow = on ? "0 0 0 4px rgba(91,156,255,.18)" : "none"; };
+    hot(root0, ps > 0.02); hot(leaves[1], ps > 0.6);
+    if (ps > 0 && ps < 1) {
+      const seg = ps * (path.length - 1), k = Math.min(path.length - 2, Math.floor(seg)), f = seg - k;
+      dot.setAttribute("cx", lerp(path[k][0], path[k + 1][0], f)); dot.setAttribute("cy", lerp(path[k][1], path[k + 1][1], f)); dot.setAttribute("opacity", 1);
+    } else dot.setAttribute("opacity", 0);
+    show(hops, t, t3 + 1.6, t4 - 0.3, 10);
+    // strengths
+    show(good, t, t4, t5 - 0.4, 24);
+    goodEls.forEach((e, i) => show(e, t, wt("b4", phr[i]) - 0.15, null, 14, 0.4));
+    // walk the Japan entries one at a time
+    let n = 0;
+    ents.forEach((e, i) => {
+      const isJ = keys[i] === "Japan";
+      const k = i - 5, a = walkStart + k * step;
+      const on = isJ && t >= a;
+      e.style.background = on ? (t < a + step ? "var(--blue)" : "#2a4777") : (isJ && ps > 0.6 && t < walkStart ? "#2a4777" : "#222b3a");
+      e.style.color = on && t < a + step ? "#06101f" : "var(--text)";
+      const re = rowsEl[rowAt[i]];
+      re.style.borderColor = on ? "var(--blue)" : "var(--line)"; re.style.color = on ? "var(--text)" : "var(--dim)";
+      ptr[i].setAttribute("stroke", on ? "#5b9cff" : "#2f3a4e"); ptr[i].setAttribute("stroke-width", on ? 3 : 2);
+      if (on) n++;
+    });
+    // after the five visible entries, the count keeps going: 2.5 million steps
+    const fast = P(t, t6 - 0.2, A("b6", 1) - t6 + 0.4);
+    const total = fast > 0 ? 5 + (2500000 - 5) * Math.pow(fast, 3.2) : n;
+    show(cnt, t, walkStart - 0.6, null, 12);
+    cntN.textContent = fmt(total);
+    show(res, t, A("b6", 1) + 0.5, null, 14); show(foot, t, A("b6", 1) + 0.9, null, 8);
+  };
+});
+
+/* 4. GIN ------------------------------------------------------------------- */
+scene("gin", root => {
+  const tb = titleBlock(root, "GIN", "var(--green)", "an <b style='color:var(--text)'>inverted</b> index: for every key, the rows that contain it");
+  const keys = [["jam", [4, 31, 77]], ["japan", [3, 7, 12, 19, 40, 41, 57, 63, 88]], ["jazz", [12, 90]], ["new", [7, 12, 55]], ["purchase", [12, 19, 41, 88]], ["sale", [3, 12, 40, 63]]];
+  const list = mk(root, "", box(0, 0, 1920, 1080));
+  const svg = svgLayer(list);
+  mk(list, "", Object.assign(box(130, 150), { fontSize: "22px", color: "var(--dim)", fontWeight: 600, letterSpacing: ".08em" }), "KEYS (SORTED)");
+  mk(list, "", Object.assign(box(370, 150), { fontSize: "22px", color: "var(--dim)", fontWeight: 600, letterSpacing: ".08em" }), "ROWS THAT CONTAIN THE KEY");
+  const K = keys.map(([k, rows], i) => {
+    const y = 196 + i * 84;
+    const ke = mk(list, "mono", Object.assign(box(130, y, 210, 62), { lineHeight: "62px", fontSize: "27px", paddingLeft: "20px", boxSizing: "border-box", borderRadius: "10px", background: "var(--panel2)", border: "2px solid var(--line2)" }), k);
+    const chips = rows.map((rn, j) => mk(list, "center mono", Object.assign(box(370 + j * 74, y + 7, 64, 48), { lineHeight: "48px", fontSize: "22px", borderRadius: "8px", background: "#17352a", color: "#a9f0cf" }), String(rn)));
+    return { k, ke, chips, rows, y };
+  });
+  // a row with many keys
+  const doc = mk(root, "card", box(1150, 196, 660, 190));
+  const docRow = mk(doc, "mono", Object.assign(box(34, 26), { fontSize: "24px", color: "var(--green)", fontWeight: 700 }), "row 12 → listed under 5 keys");
+  mk(doc, "mono", Object.assign(box(34, 70, 600), { fontSize: "27px", lineHeight: "1.5" }), "tags: {<span class=str>japan</span>, <span class=str>jazz</span>, <span class=str>new</span>,<br>       <span class=str>purchase</span>, <span class=str>sale</span>}");
+  const uses = mk(root, "", Object.assign(box(1150, 420, 660), { display: "flex", gap: "16px" }));
+  const useEls = ["arrays", "JSONB", "full-text"].map(w => { const e = document.createElement("span"); e.className = "chip"; Object.assign(e.style, { color: "var(--green)", borderColor: "var(--green)", fontSize: "30px", background: "var(--green-bg)" }); e.textContent = w; uses.appendChild(e); return e; });
+  // prefix
+  const pre = mk(root, "card", box(1150, 560, 660, 250));
+  mk(pre, "", Object.assign(box(34, 28), { fontSize: "26px", color: "var(--muted)" }), "prefix search");
+  mk(pre, "mono big", Object.assign(box(34, 68), { fontSize: "54px", color: "var(--green)" }), "ja*");
+  mk(pre, "", Object.assign(box(34, 152, 600), { fontSize: "24px", color: "var(--muted)", lineHeight: "1.4" }), "keys are sorted, so the matches sit side by side: <b style='color:var(--text)'>jam, japan, jazz</b>");
+  const brk = mk(list, "", Object.assign(box(112, 190, 8, 3 * 84 - 10), { borderRadius: "4px", background: "var(--green)" }));
+  // counting through the table
+  const cnt = mk(root, "", box(0, 0, 1920, 1080));
+  const bm = mk(cnt, "card", box(110, 250, 520, 330));
+  mk(bm, "", Object.assign(box(30, 22), { fontSize: "24px", color: "var(--muted)" }), "bitmap of matching rows");
+  const r = rng(3), bmc = [];
+  for (let j = 0; j < 8; j++) for (let i = 0; i < 16; i++) bmc.push(mk(bm, "", Object.assign(box(30 + i * 29, 70 + j * 29, 24, 24), { borderRadius: "5px", background: r() < 0.5 ? "var(--green)" : "#222b3a" })));
+  const arrow = mk(cnt, "", Object.assign(box(650, 380), { fontSize: "60px", color: "var(--dim)" }), "→");
+  const pagesCard = mk(cnt, "", box(740, 200, 1080, 480));
+  mk(pagesCard, "", Object.assign(box(0, 0), { fontSize: "24px", color: "var(--muted)" }), "then Postgres reads the <b style='color:var(--text)'>table pages</b> and counts row by row");
+  const pages = [];
+  for (let j = 0; j < 5; j++) for (let i = 0; i < 12; i++) pages.push(mk(pagesCard, "", Object.assign(box(i * 88, 50 + j * 80, 76, 66), { borderRadius: "8px", background: "var(--panel2)", border: "1.5px solid var(--line2)" })));
+  const ctr = mk(cnt, "card", box(110, 610, 520, 116));
+  mk(ctr, "mono", Object.assign(box(28, 16), { fontSize: "22px", color: "var(--muted)" }), "count(*)");
+  const ctrN = mk(ctr, "big mono", Object.assign(box(28, 46), { fontSize: "48px", color: "var(--green)" }), "0");
+  // comparison
+  const cmp = mk(root, "", box(740, 700, 1080, 200));
+  const cmpRows = [["B-tree", 157, "blue"], ["GIN", 665, "green"]].map(([n, v, c], i) => {
+    const y = i * 64;
+    mk(cmp, "", Object.assign(box(0, y + 6, 120), { fontSize: "28px", fontWeight: 700, color: "var(--" + c + ")" }), n);
+    const b = mk(cmp, "", Object.assign(box(130, y + 6, 0, 36), { borderRadius: "6px", background: "var(--" + c + ")" }));
+    const l = mk(cmp, "big", Object.assign(box(0, y + 2), { fontSize: "34px" }), v + " ms");
+    return { b, l, w: 700 * v / 665 };
+  });
+
+  const t1 = A("g1"), t2 = A("g2"), t3 = A("g3"), t4 = A("g4"), t5 = A("g5"), t6 = A("g6");
+  return t => {
+    show(tb.g, t, t1 - 0.3, t2 - 0.2, 24, 0.6);
+    const lo = show(list, t, t2 - 0.1, t5 - 0.2, 20, 0.5);
+    K.forEach((o, i) => {
+      const a = t2 + 0.3 + i * 0.75;
+      show(o.ke, t, a, null, 10, 0.35);
+      o.chips.forEach((c, j) => {
+        show(c, t, a + 0.2 + j * 0.05, null, 6, 0.3);
+        const hl = o.rows[j] === 12 && t > t3 + 0.6;
+        c.style.background = hl ? "var(--green)" : "#17352a"; c.style.color = hl ? "#04140d" : "#a9f0cf";
+      });
+      const pr = t > t4 + 1.4 && i < 3;
+      o.ke.style.borderColor = pr ? "var(--green)" : "var(--line2)"; o.ke.style.color = pr ? "var(--green)" : "var(--text)";
+    });
+    show(doc, t, t3, t4 + 0.8, 18);
+    useEls.forEach((e, i) => { const p = E.out(P(t, wt("g3", ["arrays", "JSONB", "full-text"][i]) - 0.1, 0.4)); e.style.opacity = p * (1 - E.io(P(t, t4 + 0.8, 0.4))); e.style.transform = `translateY(${(1 - p) * 12}px)`; });
+    show(pre, t, t4 + 0.6, t5 - 0.2, 18);
+    st(brk, E.out(P(t, t4 + 1.4, 0.4)) * lo, 0, 0, 1);
+    // bitmap then pages
+    show(cnt, t, t5 - 0.1, null, 20);
+    bmc.forEach((c, i) => st(c, E.out(P(t, t5 + 0.2 + (i % 16) * 0.04 + ((i / 16) | 0) * 0.02, 0.3))));
+    show(arrow, t, A("g5", 1) - 0.4, null, 0);
+    show(pagesCard, t, A("g5", 1) - 0.3, null, 12);
+    const scan = A("g5", 1) + 0.3, per = 0.075;
+    let rowsCounted = 0;
+    pages.forEach((p, i) => {
+      const a = scan + i * per, on = t >= a, cur = on && t < a + per * 2;
+      p.style.background = cur ? "var(--green)" : on ? "#1d4a37" : "var(--panel2)";
+      p.style.borderColor = on ? "var(--green)" : "var(--line2)";
+      if (on) rowsCounted += 1;
+    });
+    show(ctr, t, scan - 0.3, null, 10);
+    ctrN.textContent = fmt(Math.round(2500000 * Math.pow(rowsCounted / pages.length, 1.0)));
+    show(cmp, t, t6 - 0.1, null, 10);
+    cmpRows.forEach((c, i) => {
+      const p = E.out(P(t, t6 + 0.2 + i * 0.6, 0.9));
+      c.b.style.width = (c.w * p) + "px"; c.l.style.left = (150 + c.w * p) + "px"; st(c.l, p);
+    });
+  };
+});
+
+/* 5. Lion ------------------------------------------------------------------ */
+// shared geometry of the chunk row, used again by the counting scene
+const CH = { n: 8, w: 196, g: 12, y: 196, cy: 470 };
+CH.x0 = 960 - (CH.n * (CH.w + CH.g) - CH.g) / 2;
+CH.x = i => CH.x0 + i * (CH.w + CH.g);
+CH.types = ["bitmap", "list", "bitmap", "runs", "bitmap", "list", "bitmap", "runs"];
+CH.counts = [4812, 38, 4211, 2400, 5020, 12, 3877, 1950];
+function buildChunks(parent, withLabels) {
+  const chunks = [], pages = [];
+  for (let c = 0; c < CH.n; c++) {
+    const e = mk(parent, "", Object.assign(box(CH.x(c), CH.y, CH.w, CH.w), { borderRadius: "14px", border: "2px solid var(--line2)", background: "var(--panel)" }));
+    const ps = [];
+    for (let j = 0; j < 8; j++) for (let i = 0; i < 8; i++)
+      ps.push(mk(e, "", Object.assign(box(12 + i * 21.5, 12 + j * 21.5, 17, 17), { borderRadius: "3px", background: "#263043" })));
+    const lab = mk(parent, "center mono", Object.assign(box(CH.x(c), CH.y - 34, CH.w), { fontSize: "18px", color: "var(--dim)" }), "pages " + c * 64 + "–" + (c * 64 + 63));
+    chunks.push({ e, lab }); pages.push(ps);
+  }
+  const cons = CH.types.map((ty, c) => {
+    const e = mk(parent, "center", Object.assign(box(CH.x(c), CH.cy, CH.w, 70), { borderRadius: "12px", border: "2px solid var(--amber)", background: "var(--amber-bg)", lineHeight: "66px", fontSize: "22px", fontWeight: 700, color: "var(--amber)" }), "");
+    const badge = mk(parent, "center mono", Object.assign(box(CH.x(c) + CH.w / 2 - 70, CH.cy + 82, 140, 42), { lineHeight: "42px", fontSize: "24px", fontWeight: 700, borderRadius: "999px", background: "var(--amber)", color: "#1a1204" }), fmt(CH.counts[c]));
+    return { e, badge, ty };
+  });
+  return { chunks, pages, cons };
+}
+const ICON = { list: "[ 17, 402, … ]", bitmap: "▦ bitmap", runs: "▬▬ runs" };
+// which pages of each chunk hold rows of the key, the same in both scenes
+CH.fill = (() => { const r = rng(9), dens = [0.7, 0.05, 0.6, 0.45, 0.8, 0.02, 0.6, 0.35];
+  return dens.map(d => Array.from({ length: 64 }, () => r() < d)); })();
+scene("lion", root => {
+  const tb = titleBlock(root, "Lion", "var(--amber)", "an inverted index too: for every key, the <b style='color:var(--text)'>set of rows</b> that have it", 300);
+  const how = mk(root, "center", Object.assign(box(0, 640, 1920), { fontSize: "44px", fontWeight: 700 }), "The difference: <span style='color:var(--amber)'>how the set is stored</span>");
+  const svg = svgLayer(root);
+  const B = buildChunks(root, true);
+  const keyLab = mk(root, "mono", Object.assign(box(CH.x0 - 10, CH.cy - 50), { fontSize: "22px", color: "var(--amber)", background: "var(--bg)", padding: "4px 10px", borderRadius: "8px" }), "key 'Japan': one container per chunk");
+  const tableLab = mk(root, "", Object.assign(box(CH.x0, 128), { fontSize: "22px", color: "var(--muted)" }), "");
+  const conn = B.cons.map((c, i) => sv(svg, "line", { x1: CH.x(i) + CH.w / 2, y1: CH.y + CH.w, x2: CH.x(i) + CH.w / 2, y2: CH.cy, stroke: "#f7b03c", "stroke-width": 2, "stroke-dasharray": "4 5" }));
+  // detail cards
+  const cw = 540, cy = 640, ch = 250, cxs = [CH.x0, 960 - cw / 2, 1920 - CH.x0 - cw];
+  const src = [1, 2, 3];
+  const cards = [0, 1, 2].map(k => mk(root, "card", Object.assign(box(cxs[k], cy, cw, ch), { borderColor: "var(--amber)" })));
+  const cl = cards.map((c, k) => sv(svg, "path", { d: `M${CH.x(src[k]) + CH.w / 2},${CH.cy + 70} L${cxs[k] + cw / 2},${cy}`, stroke: "#f7b03c", "stroke-width": 2, fill: "none", opacity: 0 }));
+  mk(cards[0], "", Object.assign(box(30, 22), { fontSize: "28px", fontWeight: 700 }), "A few rows → <span style='color:var(--amber)'>sorted list</span>");
+  mk(cards[0], "mono", Object.assign(box(30, 90, 480), { fontSize: "30px", color: "var(--text)", background: "#0e1219", borderRadius: "10px", padding: "16px 20px", boxSizing: "border-box" }), "[ 17, 402, 1311, … ]");
+  mk(cards[0], "", Object.assign(box(30, 186, 480), { fontSize: "22px", color: "var(--muted)" }), "just the row positions that match");
+  mk(cards[1], "", Object.assign(box(30, 22), { fontSize: "28px", fontWeight: 700 }), "Lots of rows → <span style='color:var(--amber)'>bitmap</span>");
+  const r = rng(21), bits = [];
+  for (let j = 0; j < 6; j++) for (let i = 0; i < 30; i++) bits.push({ e: mk(cards[1], "", Object.assign(box(30 + i * 16, 80 + j * 16, 12, 12), { borderRadius: "2px", background: "#263043" })), on: r() < 0.55 });
+  mk(cards[1], "", Object.assign(box(30, 186, 480), { fontSize: "22px", color: "var(--muted)" }), "one bit for every row slot in the chunk");
+  mk(cards[2], "", Object.assign(box(30, 22), { fontSize: "28px", fontWeight: 700 }), "Long stretches → <span style='color:var(--amber)'>runs</span>");
+  const runBar = mk(cards[2], "", Object.assign(box(30, 92, 480, 40), { borderRadius: "6px", background: "#263043", overflow: "hidden" }));
+  const runs = [[0.04, 0.3], [0.42, 0.2], [0.7, 0.26]].map(([a, l]) => mk(runBar, "", Object.assign(box(480 * a, 0, 480 * l, 40), { background: "var(--amber)" })));
+  mk(cards[2], "mono", Object.assign(box(30, 142, 480), { fontSize: "20px", color: "var(--muted)" }), "(start, length) ×3");
+  mk(cards[2], "", Object.assign(box(30, 186, 480), { fontSize: "22px", color: "var(--muted)" }), "a start and a length per stretch");
+  const roar = mk(root, "", Object.assign(box(1180, CH.cy - 54, 1920 - CH.x0 - 1180, 44), { textAlign: "right", fontSize: "30px", fontWeight: 800, color: "var(--amber)" }), "<span style='background:var(--bg);padding:2px 12px;border-radius:8px'>= a roaring bitmap 🦁</span>");
+
+  const t1 = A("l1"), t2 = A("l2"), t3 = A("l3"), t4 = A("l4"), t5 = A("l5"), t6 = A("l6"), t7 = A("l7"), t8 = A("l8"), t9 = A("l9");
+  return t => {
+    show(tb.g, t, t1 - 0.3, t3 - 0.2, 24, 0.6);
+    show(how, t, t2 - 0.1, t3 - 0.2, 16);
+    B.chunks.forEach((c, i) => { show(c.e, t, t3 + 0.2 + i * 0.12, null, 14, 0.4); show(c.lab, t, t3 + 0.3 + i * 0.12, null, 6, 0.4); });
+    B.pages.forEach((ps, c) => ps.forEach((p, k) => {
+      const lit = t > A("l3", 1) + 0.2 + c * 0.1 && CH.fill[c][k];
+      p.style.background = lit ? "rgba(247,176,60,.7)" : "#263043";
+    }));
+    const tc = A("l3", 1);
+    B.cons.forEach((c, i) => {
+      show(c.e, t, tc + 0.3 + i * 0.14, null, 10, 0.4);
+      conn[i].setAttribute("opacity", E.out(P(t, tc + 0.2 + i * 0.14, 0.4)));
+      const known = t > [t6, t5, t6, t7, t6, t5, t6, t7][i] + 0.3 || t > t8;
+      c.e.textContent = known ? ICON[c.ty] : "container";
+      c.e.style.fontSize = known ? "24px" : "20px";
+      c.e.style.color = known ? "var(--amber)" : "var(--muted)";
+      pop(c.badge, t, t9 + 0.6 + i * 0.12, null, 0.4);
+    });
+    show(keyLab, t, tc + 0.1, t8 - 0.2, 8);
+    pop(roar, t, t8 + 0.2, null, 0.6);
+    // the three shapes, one per sentence
+    const at = [t5, t6, t7];
+    cards.forEach((c, k) => { show(c, t, at[k] - 0.1, null, 20); cl[k].setAttribute("opacity", E.out(P(t, at[k], 0.4))); });
+    bits.forEach((b, i) => { b.e.style.background = b.on && t > t6 + 0.3 + (i % 30) * 0.02 ? "var(--amber)" : "#263043"; });
+    runs.forEach((e, i) => { const p = E.out(P(t, t7 + 0.3 + i * 0.3, 0.5)); e.style.transform = `scaleX(${p})`; e.style.transformOrigin = "left"; });
+    // on "records how many rows it holds", the badges pop in (above) and the cards step back
+    cards.forEach((c, k) => { if (t > t9) c.style.opacity = String(Math.min(+c.style.opacity, 1 - 0.6 * E.io(P(t, t9, 0.5)))); });
+  };
+});
+
+/* 6. counting and the visibility map --------------------------------------- */
+scene("count", root => {
+  const B = buildChunks(root, true);
+  B.cons.forEach(c => { c.e.textContent = ICON[c.ty]; c.e.style.fontSize = "24px"; });
+  const cur = mk(root, "", Object.assign(box(0, CH.cy - 10, CH.w + 20, 150), { borderRadius: "16px", border: "3px solid var(--text)", boxSizing: "border-box" }));
+  // accumulator
+  const acc = mk(root, "card", box(560, 660, 800, 150));
+  mk(acc, "mono", Object.assign(box(40, 22), { fontSize: "24px", color: "var(--muted)" }), "count(*) = sum of the containers' totals");
+  const accN = mk(acc, "big mono", Object.assign(box(40, 60), { fontSize: "64px", color: "var(--amber)" }), "0");
+  const steps = mk(root, "", Object.assign(box(1400, 660, 420), { fontSize: "26px", lineHeight: "1.6" }),
+    "<span style='color:var(--amber);font-weight:700'>Lion:</span> one step per chunk<br><span style='color:var(--blue);font-weight:700'>B-tree:</span> one step per row");
+  const flies = CH.counts.map((n, i) => mk(root, "center mono", Object.assign(box(0, 0, 120, 38), { lineHeight: "38px", fontSize: "22px", fontWeight: 700, borderRadius: "999px", background: "var(--amber)", color: "#1a1204" }), "+" + fmt(n)));
+  // the catch
+  const catchC = mk(root, "card", Object.assign(box(260, 650, 1400, 230), { borderColor: "var(--orange)" }));
+  const c1 = mk(catchC, "", Object.assign(box(44, 30), { fontSize: "34px", fontWeight: 800, color: "var(--orange)" }), "One catch: visibility");
+  const c2 = mk(catchC, "", Object.assign(box(44, 92, 1320), { fontSize: "30px", lineHeight: "1.45" }), "Is this row visible to <i>my</i> transaction? &nbsp;<span style='color:var(--amber)'>The index can't tell.</span> <span style='color:var(--green)'>The table can.</span>");
+  const vmC = mk(root, "card", Object.assign(box(260, 650, 1400, 230), { borderColor: "var(--green)" }));
+  mk(vmC, "", Object.assign(box(44, 30), { fontSize: "34px", fontWeight: 800, color: "var(--green)" }), "The visibility map");
+  mk(vmC, "", Object.assign(box(44, 92, 1320), { fontSize: "30px", lineHeight: "1.45" }), "One flag per table page: <b>“every row here is visible to everyone.”</b><br><span style='color:var(--muted)'>VACUUM sets the flags; any change to a page clears its flag.</span>");
+  const vac = mk(root, "", Object.assign(box(0, CH.y - 10, 16, CH.w + 20), { borderRadius: "8px", background: "var(--green)", boxShadow: "0 0 40px 10px rgba(62,207,142,.35)" }));
+  const vacL = mk(root, "mono", Object.assign(box(0, CH.y + CH.w + 22), { fontSize: "22px", fontWeight: 700, color: "var(--green)" }), "VACUUM");
+  // the recheck zoom
+  const zoom = mk(root, "card", Object.assign(box(1180, 640, 640, 250), { borderColor: "var(--orange)" }));
+  mk(zoom, "", Object.assign(box(30, 22, 580), { fontSize: "26px", fontWeight: 700, color: "var(--orange)" }), "changed page: check each row in the table");
+  const zr = [];
+  for (let i = 0; i < 10; i++) zr.push(mk(zoom, "center", Object.assign(box(30 + i * 58, 88, 48, 48), { lineHeight: "48px", fontSize: "26px", fontWeight: 800, borderRadius: "8px", background: "#263043" }), ""));
+  const zVis = [1, 1, 0, 1, 1, 1, 0, 1, 1, 1];
+  mk(zoom, "", Object.assign(box(30, 170, 580), { fontSize: "24px", color: "var(--muted)" }), "so the answer is always <b style='color:var(--text)'>exact</b>");
+  // chart
+  const chart = mk(root, "", box(0, 0, 1920, 1080));
+  mk(chart, "", Object.assign(box(200, 170), { fontSize: "40px", fontWeight: 800 }), "<span class=mono style='font-weight:700'>count(*)</span> where half of 5,000,000 rows match");
+  mk(chart, "", Object.assign(box(200, 230), { fontSize: "24px", color: "var(--muted)" }), "vacuumed table · PostgreSQL 18.6 release build · median of 3 runs · lower is better");
+  const bars = [["B-tree", 157.0, "blue"], ["GIN", 665.0, "green"], ["Lion", 1.744, "amber"]].map(([n, v, c], i) => {
+    const y = 320 + i * 120;
+    mk(chart, "", Object.assign(box(200, y + 12, 180), { fontSize: "38px", fontWeight: 800, color: "var(--" + c + ")" }), n);
+    const b = mk(chart, "", Object.assign(box(390, y, 0, 70), { borderRadius: "8px", background: "var(--" + c + ")" }));
+    const l = mk(chart, "big", Object.assign(box(0, y + 10), { fontSize: "44px" }), (v < 10 ? v.toFixed(1) : v.toFixed(0)) + " ms");
+    return { b, l, w: Math.max(6, 1100 * v / 665) };
+  });
+  const x1 = mk(chart, "", Object.assign(box(200, 700, 700), { fontSize: "64px", fontWeight: 800, color: "var(--amber)" }), "90× <span style='font-size:34px;color:var(--text)'>faster than B-tree</span>");
+  const x2 = mk(chart, "", Object.assign(box(1000, 700, 800), { fontSize: "64px", fontWeight: 800, color: "var(--amber)" }), "381× <span style='font-size:34px;color:var(--text)'>faster than GIN</span>");
+
+  const t1 = A("c1"), t2 = A("c2"), t3 = A("c3"), t4 = A("c4"), t5 = A("c5"), t6 = A("c6"), t7 = A("c7");
+  const dirty = { 5: [19, 44] };            // chunk 5 has two changed pages
+  const s1 = A("c1", 1) + 0.2, sp1 = 0.55;  // first pass: every container trusted
+  const s2 = t5 + 0.5, sp2 = 0.45;           // second pass, after the visibility map
+  const recheckAt = t6 + 0.4, recheckEnd = A("c6", 1) - 0.1;
+  const accFor = (t) => {
+    // pass 1
+    let n = 0, idx = -1;
+    if (t < t2 - 0.3) {
+      for (let i = 0; i < CH.n; i++) if (t >= s1 + i * sp1 + 0.35) n += CH.counts[i];
+      idx = Math.floor((t - s1) / sp1);
+      return { n, idx: t >= s1 && idx < CH.n ? idx : -1, pass: 1 };
+    }
+    // pass 2: chunks 0-4 in c5, chunk 5 by recheck, 6-7 after it
+    for (let i = 0; i < 5; i++) if (t >= s2 + i * sp2 + 0.35) n += CH.counts[i];
+    if (t >= recheckEnd + 0.3) n += CH.counts[5] - 2;
+    for (let i = 6; i < 8; i++) if (t >= recheckEnd + 0.4 + (i - 5) * sp2) n += CH.counts[i];
+    if (t >= s2 && t < s2 + 5 * sp2) idx = Math.floor((t - s2) / sp2);
+    else if (t >= s2 + 5 * sp2 && t < recheckEnd + 0.4) idx = 5;
+    else if (t >= recheckEnd + 0.4 && t < recheckEnd + 0.4 + 3 * sp2) idx = 5 + Math.floor((t - recheckEnd - 0.4) / sp2);
+    return { n, idx: idx < CH.n ? idx : -1, pass: 2 };
+  };
+  return t => {
+    const main = 1 - E.io(P(t, t7 - 0.3, 0.5));
+    B.chunks.forEach((c, i) => { st(c.e, main); st(c.lab, main); });
+    const vacX = lerp(CH.x0 - 40, 1920 - CH.x0 + 20, E.io(P(t, wt("c4", "VACUUM"), 1.4)));
+    B.pages.forEach((ps, c) => ps.forEach((p, k) => {
+      const flagged = t > wt("c4", "VACUUM") && CH.x(c) + 12 + (k % 8) * 21.5 < vacX;
+      const changed = dirty[c] && dirty[c].includes(k) && t > t6 - 0.2;
+      const grey = t > t4 - 0.2 && !flagged;
+      p.style.background = changed ? "var(--orange)" : flagged ? "rgba(62,207,142,.8)" : grey ? "#303a4d" : CH.fill[c][k] ? "rgba(247,176,60,.7)" : "#263043";
+    }));
+    st(vac, E.out(P(t, wt("c4", "VACUUM") - 0.1, 0.2)) * (1 - E.out(P(t, wt("c4", "VACUUM") + 1.4, 0.3))), vacX, 0);
+    st(vacL, E.out(P(t, wt("c4", "VACUUM") - 0.1, 0.2)) * (1 - E.out(P(t, wt("c4", "VACUUM") + 1.4, 0.3))), vacX - 40, 0);
+    B.cons.forEach((c, i) => { st(c.e, main); st(c.badge, main); });
+    const s = accFor(t);
+    if (s.idx >= 0 && t < t7 - 0.3) {
+      st(cur, 1, CH.x(s.idx) - 10, 0);
+      cur.style.borderColor = s.pass === 2 && s.idx === 5 ? "var(--orange)" : s.pass === 2 ? "var(--green)" : "var(--text)";
+    } else st(cur, 0);
+    flies.forEach((f, i) => {
+      let a;
+      if (t < t2 - 0.3) a = s1 + i * sp1;
+      else a = i < 5 ? s2 + i * sp2 : i === 5 ? recheckEnd : recheckEnd + 0.4 + (i - 5) * sp2;
+      const p = P(t, a, 0.45);
+      const x0 = CH.x(i) + CH.w / 2 - 60, y0 = CH.cy + 82, x1 = 960 - 60, y1 = 740;
+      st(f, p > 0 && p < 1 ? Math.sin(p * Math.PI) * 1.2 : 0, lerp(x0, x1, E.io(p)), lerp(y0, y1, E.io(p)) - Math.sin(p * Math.PI) * 60);
+      f.textContent = "+" + fmt(i === 5 && t > t2 ? CH.counts[5] - 2 : CH.counts[i]);
+    });
+    const accVis = show(acc, t, t1 - 0.2, t2 - 0.3, 16) + show(acc, t, t5 - 0.1, t7 - 0.3, 16);
+    st(acc, clamp(accVis));
+    accN.textContent = fmt(s.n);
+    show(steps, t, A("c1", 1) + 1.5, t2 - 0.3, 12);
+    st(steps, +steps.style.opacity);
+    show(catchC, t, t2 - 0.1, t4 - 0.2, 16);
+    show(c1, t, t2, null, 8); show(c2, t, t3, null, 8);
+    show(vmC, t, t4 - 0.1, t5 - 0.3, 16);
+    // recheck zoom
+    show(zoom, t, recheckAt - 0.2, recheckEnd + 1.6, 12);
+    acc.style.left = (t > t6 - 0.5 && t < t7 ? 260 : 560) + "px";
+    zr.forEach((z, i) => {
+      const a = recheckAt + 0.3 + i * ((recheckEnd - recheckAt - 0.5) / 10);
+      const done = t >= a;
+      z.textContent = done ? (zVis[i] ? "✓" : "✗") : "";
+      z.style.background = done ? (zVis[i] ? "#1d4a37" : "#4a2323") : "#263043";
+      z.style.color = zVis[i] ? "var(--green)" : "var(--red)";
+    });
+    // chart
+    show(chart, t, t7 - 0.2, null, 20);
+    bars.forEach((b, i) => {
+      const p = E.out(P(t, t7 + 0.3 + i * 0.5, 1.0));
+      b.b.style.width = (b.w * p) + "px"; b.l.style.left = (410 + b.w * p) + "px"; st(b.l, p);
+    });
+    pop(x1, t, wt("c7", "90×"), null, 0.5); pop(x2, t, wt("c7", "nearly 400×"), null, 0.5);
+  };
+});
+
+/* 7. combining filters and GROUP BY ---------------------------------------- */
+scene("combine", root => {
+  const cols = 24, rows = 10, cs = 20, cg = 4, gw = cols * (cs + cg) - cg, gh = rows * (cs + cg) - cg;
+  const r = rng(33), A1 = [], A2 = [];
+  for (let k = 0; k < cols * rows; k++) { A1.push(r() < 0.5); A2.push(r() < 0.3); }
+  const grid = (x, y, color, label, set) => {
+    const g = mk(root, "", box(x, y, gw, gh + 60));
+    const lab = mk(g, "mono", Object.assign(box(0, 0), { fontSize: "28px", fontWeight: 700, color }), label);
+    const cells = set.map((on, k) => mk(g, "", Object.assign(box((k % cols) * (cs + cg), 52 + ((k / cols) | 0) * (cs + cg), cs, cs), { borderRadius: "4px", background: on ? color : "#222b3a" })));
+    return { g, lab, cells };
+  };
+  const L = grid(150, 170, "#f7b03c", "country = 'Japan'", A1);
+  const R = grid(1920 - 150 - gw, 170, "#f0648c", "type = 'purchase'", A2);
+  const and = mk(root, "center", Object.assign(box(760, 280, 400), { fontSize: "72px", fontWeight: 800, color: "var(--text)" }), "AND");
+  const both = A1.map((a, k) => a && A2[k]);
+  const Rs = grid(960 - gw / 2, 520, "#ffffff", "both", both);
+  const chunkHi = mk(root, "", Object.assign(box(0, 0, 4 * (cs + cg) + 8, gh + 16), { borderRadius: "8px", border: "3px solid var(--text)", boxSizing: "border-box" }));
+  const cntE = mk(root, "", Object.assign(box(1330, 640, 460), { fontSize: "30px", color: "var(--muted)" }), "");
+  // GROUP BY
+  const gb = mk(root, "", box(0, 0, 1920, 1080));
+  mk(gb, "code card", Object.assign(box(150, 160, 1620, 84), { fontSize: "30px", lineHeight: "84px", paddingLeft: "40px", boxSizing: "border-box" }),
+    "<span class=kw>SELECT</span> country, <span class=fn>count</span>(*) <span class=kw>FROM</span> events <span class=kw>GROUP BY</span> country;");
+  const groups = [["Japan", 2500000], ["USA", 1000000], ["Brazil", 600000], ["India", 450000], ["Germany", 250000], ["France", 200000]];
+  const gr = rng(4);
+  const gRows = groups.map(([k, v], i) => {
+    const y = 290 + i * 94;
+    mk(gb, "mono", Object.assign(box(150, y + 14), { fontSize: "30px", fontWeight: 700 }), k);
+    const strip = []; for (let j = 0; j < 40; j++) strip.push(mk(gb, "", Object.assign(box(420 + j * 24, y + 14, 18, 36), { borderRadius: "3px", background: gr() < v / 2600000 + 0.05 ? "rgba(247,176,60,.75)" : "#222b3a" })));
+    const n = mk(gb, "big mono", Object.assign(box(1420, y + 8, 350), { fontSize: "40px", textAlign: "right", color: "var(--amber)" }), fmt(v));
+    return { strip, n };
+  });
+  const one = mk(gb, "", Object.assign(box(420, 860), { fontSize: "26px", color: "var(--muted)" }), "");
+  // speedups
+  const sp = mk(root, "", box(0, 0, 1920, 1080));
+  mk(sp, "", Object.assign(box(150, 160), { fontSize: "40px", fontWeight: 800 }), "More counts, 5,000,000 rows, vacuumed");
+  mk(sp, "", Object.assign(box(150, 218), { fontSize: "24px", color: "var(--muted)" }), "median execution time · PostgreSQL 18.6");
+  const hdr = mk(sp, "", Object.assign(box(150, 280, 1620), { fontSize: "22px", color: "var(--dim)", fontWeight: 600, letterSpacing: ".08em" }), "");
+  hdr.innerHTML = "<span class=a style='left:0'>QUERY</span><span class=a style='left:760px'>OTHER INDEX</span><span class=a style='left:1060px'>LION</span><span class=a style='left:1310px'>SPEEDUP</span>";
+  const rowsSp = [
+    ["Two equality filters", "B-tree 16.4 ms", "1.8 ms", "9.2×", "blue", "two filters"],
+    ["Count per country (200 groups)", "B-tree 405.7 ms", "17.1 ms", "23.8×", "blue", "200 groups"],
+    ["1,000-value IN list", "B-tree 17.1 ms", "6.7 ms", "2.5×", "blue", "1,000-value"],
+    ["Range: BETWEEN 100 AND 199", "B-tree 1.6 ms", "0.66 ms", "2.5×", "blue", "a range"],
+    ["Array tag count (200k docs)", "GIN 4.0 ms", "0.024 ms", "168×", "green", "counting array tags"]];
+  const spEls = rowsSp.map(([q, o, l, x, c], i) => {
+    const e = mk(sp, "", Object.assign(box(150, 326 + i * 100, 1620, 84), { borderTop: "1.5px solid var(--line)" }));
+    mk(e, "", Object.assign(box(0, 24), { fontSize: "32px", fontWeight: 600 }), q);
+    mk(e, "mono", Object.assign(box(760, 28), { fontSize: "28px", color: "var(--" + c + ")" }), o);
+    mk(e, "mono", Object.assign(box(1060, 28), { fontSize: "28px", color: "var(--amber)" }), l);
+    mk(e, "big", Object.assign(box(1310, 12), { fontSize: "50px", color: "var(--amber)" }), x);
+    return e;
+  });
+  const t1 = A("m1"), t2 = A("m2"), t3 = A("m3"), t4 = A("m4"), t5 = A("m5");
+  const sweep = A("m2", 1) + 0.2, per = 0.55;
+  return t => {
+    const g1 = 1 - E.io(P(t, t3 - 0.3, 0.4));
+    show(L.g, t, t1 - 0.1, null, 16); show(R.g, t, t1 + 0.3, null, 16);
+    st(L.g, +L.g.style.opacity * g1); st(R.g, +R.g.style.opacity * g1);
+    st(and, E.out(P(t, t2 + 0.3, 0.4)) * g1);
+    show(Rs.g, t, sweep - 0.4, null, 12); st(Rs.g, +Rs.g.style.opacity * g1);
+    const ci = Math.floor((t - sweep) / per);
+    Rs.cells.forEach((c, k) => {
+      const col = k % cols, done = t >= sweep + Math.floor(col / 4) * per + 0.2;
+      c.style.background = done && both[k] ? "#ffffff" : done ? "#1a212d" : "#222b3a";
+    });
+    let n = 0; both.forEach((b, k) => { if (b && t >= sweep + Math.floor((k % cols) / 4) * per + 0.2) n++; });
+    cntE.innerHTML = "count = <b class=mono style='font-size:44px;color:var(--text)'>" + n + "</b>";
+    st(cntE, E.out(P(t, sweep, 0.3)) * g1);
+    if (ci >= 0 && ci < 6 && t < t3 - 0.3) {
+      st(chunkHi, 1, L.g.offsetLeft + ci * 4 * (cs + cg) - 4 + 0, 170 + 52 - 8);
+    } else st(chunkHi, 0);
+    // group by
+    const gbv = show(gb, t, t3 - 0.1, t4 - 0.3, 16);
+    gRows.forEach((g, i) => { const p = E.out(P(t, t3 + 1.3 + i * 0.28, 0.3)); st(g.n, p, (1 - p) * 20); });
+    one.innerHTML = "<span style='color:var(--amber)'>one count per key</span>: no rows read";
+    st(one, E.out(P(t, t3 + 3.0, 0.4)) * gbv);
+    show(sp, t, t4 - 0.1, null, 16);
+    spEls.forEach((e, i) => show(e, t, wt(i < 2 ? "m4" : "m5", rowsSp[i][5]) - 0.2, null, 14, 0.4));
+  };
+});
+
+/* 8. limits ---------------------------------------------------------------- */
+scene("limits", root => {
+  const head = mk(root, "center", Object.assign(box(0, 360, 1920), { fontSize: "76px", fontWeight: 800 }), "Where Lion doesn't win");
+  const sub = mk(root, "center", Object.assign(box(0, 480, 1920), { fontSize: "40px", color: "var(--muted)", fontWeight: 500 }), "It's not a better <span style='color:var(--blue)'>B-tree</span>, and not a better <span style='color:var(--green)'>GIN</span>.");
+  const verdict = { TIE: ["#2a3140", "#c9d1de"], "B-TREE": ["var(--blue-bg)", "var(--blue)"], GIN: ["var(--green-bg)", "var(--green)"], CAUTION: ["#3a2012", "var(--orange)"], COST: ["#3a2012", "var(--orange)"] };
+  const cards = [
+    ["TIE", "Looking up a rare key", ["B-tree <b>0.034 ms</b> · Lion <b>0.017 ms</b>", "tens of microseconds either way"]],
+    ["TIE", "Fetching the matching rows", ["B-tree <b>14.8 ms</b> · Lion <b>16.3 ms</b>", "reading the table dominates"]],
+    ["B-TREE", "ORDER BY … LIMIT, UNIQUE", ["LIMIT 100: B-tree <b>0.021 ms</b> · Lion <b>857 ms</b>", "no ordered scans, so a full table scan"]],
+    ["GIN", "Phrase and prefix search", ["phrase: GIN <b>7.0 ms</b> · Lion <b>32.5 ms</b>", "prefix: GIN <b>1.6 ms</b> · Lion <b>25.1 ms</b>"]],
+    ["CAUTION", "Busy tables before VACUUM", ["1% of rows updated: Lion <b>1.7 → 81 ms</b>", "B-tree: <b>712 ms</b>, so still ahead"]],
+    ["COST", "Writes and index builds", ["INSERT <b>~1.25×</b> B-tree's time", "<b>~1.5×</b> the WAL · build <b>~2.8×</b>"]]];
+  const cw = 540, chh = 300, gx = 34, x0 = 960 - (3 * cw + 2 * gx) / 2;
+  const els = cards.map(([v, title, lines], i) => {
+    const e = mk(root, "card", box(x0 + (i % 3) * (cw + gx), 250 + Math.floor(i / 3) * (chh + 30), cw, chh));
+    mk(e, "pill", Object.assign(box(32, 30), { fontSize: "20px", letterSpacing: ".08em", background: verdict[v][0], color: verdict[v][1] }), v);
+    mk(e, "", Object.assign(box(32, 88, cw - 64), { fontSize: "31px", fontWeight: 700, lineHeight: "1.25" }), title);
+    mk(e, "", Object.assign(box(32, 186, cw - 64), { fontSize: "24px", lineHeight: "1.55", color: "var(--muted)" }), lines.join("<br>"));
+    return e;
+  });
+  const t1 = A("x1");
+  const at = ["x2", "x3", "x4", "x5", "x6", "x7"].map(id => A(id));
+  return t => {
+    const hp = E.io(P(t, at[0] - 0.4, 0.6));
+    st(head, E.out(P(t, t1 - 0.2, 0.5)), 0, lerp(0, -230, hp), lerp(1, 0.62, hp));
+    show(sub, t, A("x1", 1), at[0] - 0.4, 14);
+    els.forEach((e, i) => show(e, t, at[i] - 0.1, null, 24));
+  };
+});
+
+/* 9. using it -------------------------------------------------------------- */
+scene("use", root => {
+  const lines = [
+    "<span class=kw>CREATE EXTENSION</span> pg_lion;",
+    "<span class=kw>CREATE INDEX</span> events_country_lion <span class=kw>ON</span> events <span class=kw>USING</span> lion (country);",
+    "<span class=kw>CREATE INDEX</span> events_type_lion    <span class=kw>ON</span> events <span class=kw>USING</span> lion (event_type);",
+    "<span class=kw>VACUUM</span> (<span class=kw>ANALYZE</span>) events;",
+    "",
+    "<span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events",
+    "<span class=kw>WHERE</span> country = <span class=str>'Japan'</span> <span class=kw>AND</span> event_type = <span class=str>'purchase'</span>;"];
+  const code = mk(root, "card", box(150, 140, 1620, 360));
+  const ls = lines.map((l, i) => mk(code, "code", Object.assign(box(44, 30 + i * 44), { fontSize: "28px" }), l));
+  const ex = mk(root, "card", box(150, 530, 1620, 250));
+  mk(ex, "code", Object.assign(box(44, 28), { fontSize: "26px" }), "<span class=kw>EXPLAIN</span> (<span class=kw>COSTS OFF</span>) <span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events <span class=kw>WHERE</span> country = <span class=str>'Japan'</span>;");
+  mk(ex, "code", Object.assign(box(44, 78), { fontSize: "26px", color: "var(--dim)" }), "                         QUERY PLAN\n──────────────────────────────────────────────────────────────");
+  const plan1 = mk(ex, "code", Object.assign(box(44, 158), { fontSize: "26px" }), " Custom Scan (LionCount)");
+  mk(ex, "code", Object.assign(box(44, 196), { fontSize: "26px", color: "var(--muted)" }), "   Lion Indexes: events_country_lion (country = 'Japan'::text)");
+  const hl = mk(ex, "", Object.assign(box(44, 150, 420, 46), { border: "3px solid var(--amber)", borderRadius: "10px", boxSizing: "border-box" }));
+  const note = mk(ex, "", Object.assign(box(1080, 150, 500), { fontSize: "28px", fontWeight: 700, color: "var(--amber)" }), "← answered from the index");
+  const sum = mk(root, "card", box(150, 810, 1620, 96));
+  mk(sum, "code", Object.assign(box(44, 28), { fontSize: "26px" }), "<span class=kw>CREATE INDEX</span> events_time_lion <span class=kw>ON</span> events <span class=kw>USING</span> lion (created_at) <span class=kw>WITH</span> (summaries = <span class=str>auto</span>);");
+  // side by side
+  const side = mk(root, "", box(0, 0, 1920, 1080));
+  const svg = svgLayer(side);
+  const tbl = mk(side, "card center", Object.assign(box(760, 170, 400, 150), { borderColor: "var(--text)" }));
+  mk(tbl, "center mono", Object.assign(box(0, 34, 400), { fontSize: "40px", fontWeight: 700 }), "events");
+  mk(tbl, "center", Object.assign(box(0, 94, 400), { fontSize: "22px", color: "var(--muted)" }), "one table, three kinds of index");
+  const idx = [["Lion", "amber", "(country), (event_type)", "counts · filters · GROUP BY"], ["B-tree", "blue", "(id), (created_at)", "lookups · ORDER BY · UNIQUE"], ["GIN", "green", "(payload jsonb)", "JSON and text search"]];
+  const idxEls = idx.map(([n, c, cols, use], i) => {
+    const x = 150 + i * 560;
+    sv(svg, "path", { d: `M960,320 C960,400 ${x + 250},400 ${x + 250},470`, stroke: `var(--${c})`, "stroke-width": 3, fill: "none" });
+    const e = mk(side, "card", Object.assign(box(x, 470, 500, 250), { borderColor: "var(--" + c + ")" }));
+    mk(e, "", Object.assign(box(36, 30), { fontSize: "44px", fontWeight: 800, color: "var(--" + c + ")" }), n);
+    mk(e, "mono", Object.assign(box(36, 104), { fontSize: "24px", color: "var(--text)" }), cols);
+    mk(e, "", Object.assign(box(36, 160), { fontSize: "27px", color: "var(--muted)" }), use);
+    return e;
+  });
+  const t1 = A("u1"), t2 = A("u2"), t3 = A("u3"), t4 = A("u4"), t5 = A("u5"), t6 = A("u6");
+  const lineAt = [wt("u2", "Create the extension"), wt("u2", "add Lion indexes"), wt("u2", "add Lion indexes") + 0.6, wt("u2", "VACUUM ANALYZE"), 1e9, t3, t3 + 0.5];
+  return t => {
+    const gone = t6 - 0.3;
+    show(code, t, t1 - 0.1, gone, 16);
+    ls.forEach((l, i) => {
+      const p = P(t, lineAt[i], 0.7);
+      l.style.clipPath = `inset(0 ${100 - p * 100}% 0 0)`;
+      st(l, p > 0 ? 1 : 0);
+    });
+    show(ex, t, t4 - 0.1, gone, 16);
+    pop(hl, t, wt("u4", "Custom Scan") + 0.2, null, 0.4);
+    show(note, t, A("u4", 1), null, 0);
+    show(sum, t, t5 - 0.1, gone, 16);
+    show(side, t, t6 - 0.1, null, 16);
+    idxEls.forEach((e, i) => show(e, t, wt("u6", ["Lion", "B-tree", "GIN"][i] + (i === 0 ? ", " : "")) - 0.1, null, 14));
+  };
+});
+
+/* 10. summary -------------------------------------------------------------- */
+scene("summary", root => {
+  const head = mk(root, "center", Object.assign(box(0, 140, 1920), { fontSize: "56px", fontWeight: 800 }), "Which index, when");
+  const cols = [
+    ["Lion", "amber", ["count(*) with filters", "GROUP BY and facet counts", "dashboards over big tables", "array tag counts"]],
+    ["B-tree", "blue", ["fetch rows by key", "ORDER BY … LIMIT", "UNIQUE and primary keys", "the safe default"]],
+    ["GIN", "green", ["full-text phrase and prefix", "JSONB documents", "fetching documents", "LIKE '%…%' with pg_trgm"]]];
+  const cw = 540, gx = 34, x0 = 960 - (3 * cw + 2 * gx) / 2;
+  const cards = cols.map(([n, c, items], i) => {
+    const e = mk(root, "card", Object.assign(box(x0 + i * (cw + gx), 250, cw, 400), { borderColor: "var(--" + c + ")", borderWidth: "2px" }));
+    mk(e, "", Object.assign(box(40, 32), { fontSize: "50px", fontWeight: 800, color: "var(--" + c + ")" }), n);
+    mk(e, "", Object.assign(box(40, 120, cw - 80), { fontSize: "31px", lineHeight: "1.75", fontWeight: 500 }), items.map(x => "<span style='color:var(--" + c + ")'>•</span>&nbsp; " + x).join("<br>"));
+    return e;
+  });
+  const warn = mk(root, "card", Object.assign(box(x0, 680, 3 * cw + 2 * gx, 80), { borderColor: "var(--orange)" }));
+  mk(warn, "", Object.assign(box(40, 20), { fontSize: "30px", fontWeight: 600 }), "<span style='color:var(--orange);font-weight:800'>Measure first:</span> busy, write-heavy tables that rarely get vacuumed");
+  const foot = mk(root, "", Object.assign(box(x0, 790, 3 * cw + 2 * gx), { fontSize: "23px", color: "var(--muted)", lineHeight: "1.5" }),
+    "<b style='color:var(--text)'>pg_lion is a prototype.</b> Numbers are from one focused benchmark: PostgreSQL 18.6 release build, 1M and 5M rows, median of 3 timed runs.<br>Full results: README.md → “Latest benchmarks”.");
+  const end = mk(root, "", box(0, 0, 1920, 1080));
+  mk(end, "center big", Object.assign(box(0, 360, 1920), { fontSize: "150px", lineHeight: "1" }), '<span style="color:#7d889c">pg_</span><span style="color:var(--amber)">lion</span>');
+  mk(end, "center mono", Object.assign(box(0, 560, 1920), { fontSize: "38px", color: "var(--muted)" }), "CREATE INDEX … USING lion (…);");
+  mk(end, "center mono", Object.assign(box(0, 640, 1920), { fontSize: "30px", color: "var(--dim)" }), "github.com/cgkanchi/pg_lion");
+  const t1 = A("s1"), at = [A("s2"), A("s3"), A("s4")], t5 = A("s5"), t6 = A("s6"), fin = Z("s6") + 0.8;
+  return t => {
+    show(head, t, t1 - 0.2, fin, 14);
+    cards.forEach((c, i) => show(c, t, at[i] - 0.1, fin, 24));
+    show(warn, t, t5 - 0.1, fin, 16);
+    show(foot, t, t6, fin, 10);
+    show(end, t, fin + 0.4, null, 16, 0.8);
+  };
+});
+
+/* ------------------------------------------------------------------ stage */
+const scenesEl = document.getElementById("scenes");
+const DRAW = SCENES.map(s => {
+  const root = document.createElement("div"); root.className = "scene"; scenesEl.appendChild(root);
+  return { id: s.id, root, meta: SC[s.id], draw: s.build(root) };
+});
+const chapter = document.getElementById("chapter"), chNum = chapter.querySelector(".num"), chTtl = chapter.querySelector(".ttl");
+const cap = document.getElementById("caption"), capSpan = cap.querySelector("span");
+const prog = document.getElementById("progress");
+const segs = TL.scenes.map(s => { const d = document.createElement("div"); d.style.flex = String(s.end - s.start); const i = document.createElement("i"); d.appendChild(i); prog.appendChild(d); return { s, i }; });
+const SENT = []; TL.scenes.forEach(s => s.cues.forEach(c => c.sentences.forEach(x => SENT.push(x))));
+
+function renderAt(t) {
+  DRAW.forEach((d, k) => {
+    const m = d.meta, first = k === 0, last = k === DRAW.length - 1;
+    const fin = first ? E.out(P(t, 0, 0.8)) : E.io(P(t, m.start - 0.05, 0.5));
+    const fout = last ? E.io(P(t, TL.total - 0.9, 0.9)) : E.io(P(t, m.end - 0.45, 0.45));
+    const o = t < m.start - 0.05 || t > m.end ? 0 : fin * (1 - fout);
+    if (o <= 0) { d.root.style.display = "none"; return; }
+    d.root.style.display = "block"; d.root.style.opacity = o;
+    d.draw(t);
+  });
+  // chapter label
+  const k = TL.scenes.findIndex(s => t >= s.start && t < s.end);
+  const s = TL.scenes[Math.max(0, k)];
+  if (k > 0) {
+    chNum.textContent = String(k).padStart(2, "0"); chTtl.textContent = s.title;
+    chapter.style.opacity = E.io(P(t, s.start + 0.1, 0.5)) * (1 - E.io(P(t, s.end - 0.45, 0.4)));
+  } else chapter.style.opacity = 0;
+  document.getElementById("brand").style.opacity = k > 0 ? 1 : 0;
+  // caption
+  const c = SENT.find(x => t >= x.start - 0.08 && t < x.end + 0.35);
+  if (c) {
+    if (capSpan.textContent !== c.cap) capSpan.textContent = c.cap;
+    cap.style.opacity = E.out(P(t, c.start - 0.08, 0.15)) * (1 - E.io(P(t, c.end + 0.2, 0.15)));
+  } else cap.style.opacity = 0;
+  segs.forEach(g => { g.i.style.width = (100 * clamp((t - g.s.start) / (g.s.end - g.s.start))) + "%"; });
+  prog.style.opacity = t > TL.total - 1 ? 1 - P(t, TL.total - 1, 0.8) : 1;
+}
+window.renderAt = renderAt;
+window.TOTAL = TL.total;
+if (location.search.includes("play")) {
+  const t0 = performance.now(), m = /t=([\d.]+)/.exec(location.search), off = m ? +m[1] : 0;
+  const tick = () => { renderAt(off + (performance.now() - t0) / 1000); requestAnimationFrame(tick); };
+  tick();
+} else renderAt(+(/t=([\d.]+)/.exec(location.search) || [0, 0])[1]);
+</script>
+</body>
+</html>
