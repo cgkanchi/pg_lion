@@ -5611,12 +5611,16 @@ Operations.
   counted - the others are left standing and are sought forward on the next round. Leaving them
   standing is what makes the probe a probe: stepping every source by one first would cost each of
   them a container at `key + 1` that the seek is about to skip anyway. The same holds inside an AND
-  node of the expression evaluator (§17), where only the first child steps. Union and single-set
+  node of the expression evaluator (§17), where only the driver steps. Union and single-set
   counting keep the sequential walk.
   **Since §25 the probes are ordered and abandoned early**: the non-driver sources are sorted by
   ascending members (the same `ntids`), and a container key is abandoned - the remaining sources
   neither sought nor read - the moment the running intersection empties or a seek lands past the
   target. That is the executor half of the open item below, and it is measured there.
+  **Since 2026-09-28 an AND node is the same leapfrog** (`lion_leapfrog()`, one function for both):
+  it used to step its FIRST child, seek every other one to it at every key and AND all of their
+  containers, and it is what a lion index scan's AND of its quals' sets is (§29.11, "The AND, as
+  the count makes it").
 - **The §9 pin discipline is unchanged.** A leaf stays pinned until the container taken from it has
   passed the visibility-map check, and a seek releases the previous leaf's pin only at that same
   point: the two callers of `seek` are the merge's "this container key is missing from some set"
@@ -10705,8 +10709,10 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
 - **SETS**: every answered qual is a set tree. The trees are ANDed (§24) and the whole
   expression is ONE stream of containers in ascending container key, produced by the very
   evaluator the count and the bitmap path already share (§9 cursors, §15 k-way OR, §22 leapfrog
-  AND: `LionExprCursor`). An IN list is the OR of its sets - a union by container key - so the TIDs
-  come out in HEAP order, each exactly once, and the heap is visited in physical order, one pass.
+  AND: `LionExprCursor`) - since 2026-09-28 the count's own leapfrog, the tree of fewest rows
+  driving whatever the order of the index's columns (§29.11, "The AND, as the count makes it"). An
+  IN list is the OR of its sets - a union by container key - so the TIDs come out in HEAP order,
+  each exactly once, and the heap is visited in physical order, one pass.
   Equality, IN, `IS NULL`, multicolumn ANDs, several quals of one column and multi-key queries
   (arrays, tsvector) in mode KEYS all take this shape.
 - **WALK**: one scalar column is walked for its range (§28, including `op ANY (array)`), an
@@ -11423,9 +11429,9 @@ in 0.2 ms against that scan's 1.2 to 1.7.
 A benchmark wrote one wide filter two ways, each multi-value column as `a = x OR a = y` and as `a IN
 (x, y)`, and the two planned differently, at different prices, and were estimated differently. They
 select the same rows, and where lion answered, priced or measured them they diverged in six places,
-found on a synthetic repro (6M rows, 200 hidden groups each driving nine columns of one lion index
-over seventeen, the filter of one group: four equalities, a boolean among them, four lists of two to
-four values and a three-key `&&` - twenty posting sets, 3,835 rows):
+found on a synthetic repro (6M rows, 200 hidden groups each driving several columns of one wide
+lion index, the filter of one group: equalities, short IN lists and a multi-key `&&` - twenty
+posting sets, 3,835 rows):
 
 1. **Core's selectivity.** Core estimates the OR as though its arms could overlap, `1 - (1 - s1)(1 -
    s2)`, and the list as the disjoint entries they are, `s1 + s2`: 15 rows against 22 for the same
@@ -11589,6 +11595,95 @@ members from the same estimate, and with the probe off, core's product put the f
 11,700 rows at 3,509, predicted a switch that does not happen, and sent the page to the btree walk
 with a heap filter - 202 ms against 40 for LionOrdered. The switch bounds what a wrong bet costs,
 and the model does not second-guess it.
+
+**The AND, as the count makes it** (2026-09-28, `lion_leapfrog()`). "One price for the AND of
+sets" prices a scan's AND as the count's merge, because the two make the same AND of the same sets.
+They did not make it the same way. A benchmark's count over a wide correlated filter, answered by a
+plain lion scan and an Aggregate, ran several times as long as the same count as `LionCount`,
+while the two were priced within a few units of each other - a coin toss that cost a multiple when
+it fell the wrong way - and a Bitmap Index Scan of the same kind of AND, building a parallel bitmap
+heap scan's bitmap in one process, was as slow.
+
+- **The two ANDs.** The count's merge (§22, §25) drives from the source of fewest members, seeks
+  the others to its keys in ascending members, one at a time, each folded into the running
+  intersection before the next is touched, and gives the key up at the first that empties it or has
+  no container there. A scan's AND was an AND node of the evaluator (§17), whose children are the
+  quals' trees in the index's column order: it stepped its FIRST child, sought every other child to
+  the largest key any of them stood at, ANDed all of their containers, and at a key whose AND came
+  out empty stepped every child. The answers were the same; the work was not.
+- **The repro** (synthetic, PostgreSQL 18 release build, `random_page_cost` 1.1, 8 GB of
+  `effective_cache_size`, 2 GB of shared buffers holding the heap and the index, serial plans): 8M
+  rows in 1,000 hidden groups that take turns over the heap, 117,198 heap pages, one wide lion
+  index. The filter of one group - a few dense clauses on the index's first columns, then
+  selective ones: an equality, short IN lists and a multi-key `&&` - is twenty posting sets and
+  2,184 rows; the product of the
+  clauses says 2, the probe 2,028. `LionCount` took 49 ms and 2,377 buffers; the plain scan and its
+  Aggregate 92 ms and 4,536 - the same 2,373 index pages and 2,163 heap pages; the Bitmap Index Scan
+  alone 84 ms.
+- **Where the time went** (`perf` on the backend, each path forced and run thirty times): the
+  scan's AND spent 44% of it in `lion_container_and()`, the count's merge 11%. The first children in
+  the index's order are the dense ones, so every key began by ANDing two of their RUN containers
+  and optimizing the result, before a selective set was reached; the count's first AND is its
+  driver's small ARRAY probed against the next set. The lists' unions - `lion_container_or()` and
+  its optimize - took two thirds of the count's time, and the same work of the scan's. The buffers
+  were the same here, because every set has a container at every key; where the sets leave keys
+  empty, stepping every child read the dense sets' pages at keys the others had ruled out - 47 index
+  buffers against the count's 22 on the table of `scanand.sql` (§29.12), 21 now.
+- **The change.** One function, `lion_leapfrog()`, is the merge's loop taken out of
+  `lion_run_merge()`, which calls it for its positive sources; an AND node orders its children once,
+  when it is built, by the merge's own estimate (`lion_node_members()`: a set's `ntids`, a union's
+  sum, an intersection's least), steps only the first of them, seeks only it when it is sought
+  itself, and builds its container with the same function. The §9 argument moved with the loop and
+  is unchanged: a key given up asks the visibility map nothing, a cursor not sought keeps its pin,
+  and the key handed up has every child standing on it with its container's pin - for a trimmed AND
+  (§15, "Bounded cursors") the one child that keeps pins. EXPLAIN's `Probes Avoided` counts the
+  merge's own sources, as it did. The plain scan's shapes all AND through it - SETS, a WALK's
+  entry and the other columns' trees, a WINDOW's rest, a LIST's batches - and so do the bitmap
+  scan's `lion_sets_iterate()`, the intersection probe's samples and the count's multi-key trees.
+
+Measured on the repro, medians of eleven runs, the old and new builds alternating (the machine was
+shared, the runs spread by 20 to 40%); no price changed, so no plan did:
+
+| query (the plan chosen) | path | before | after | buffers | cost |
+|---|---|---|---|---|---|
+| count, twenty sets (`LionCount`) | `LionCount` | 48.8 ms | 48.1 ms | 2,377 | 17,892 |
+| | plain + Aggregate | 91.6 | 51.7 | 4,536 | 20,165 |
+| | bitmap + Aggregate (index side) | 88.4 (84.4) | 52.9 (48.0) | 4,536 (2,373) | 20,159 |
+| page, `ORDER BY ts DESC LIMIT 100` (plain + top-N) | plain + top-N | 91.6 | 58.6 | 4,536 | 20,188 |
+| | `LionOrdered` | 94.9 | 55.0 | 6,893 | 22,760 |
+| rows, six clauses, ten sets, 8,533 rows (plain) | plain | 73.6 | 44.0 | 9,970 | 23,069 |
+| | bitmap (index side) | 75.4 (59.0) | 41.1 (24.4) | 9,970 (1,745) | 23,044 |
+| count, the same six clauses (`LionCount`) | `LionCount` | 22.7 | 25.4 | 1,749 | 14,121 |
+| | plain + Aggregate | 72.0 | 38.6 | 9,970 | 23,076 |
+| `arr @> '{13,30}'` beside two dense sets (`LionCount`) | plain + Aggregate | 25.3 | 19.2 | 8,169 | 13,275 |
+| | bitmap + Aggregate (index side) | 28.4 (14.1) | 20.7 (6.6) | 8,169 (751) | 13,253 |
+| a range of 4 keys beside three sets (`LionCount`) | plain + Aggregate, a WALK | 32.8 | 23.3 | 826 | 5,485 |
+| a range of 3,900 keys beside three sets (plain) | plain + Aggregate, a WINDOW | 400 | 388 | 80,943 | 151,784 |
+
+- **The price is true now.** The model priced the scan's AND as the count's, and the scan now runs
+  it in the count's time: 370 to 390 units a millisecond for all three paths of the twenty-set
+  count, where the plain scan ran at 220 before, and 540 to 600 for the six-clause one, where it ran
+  at 320. What is left between the paths is what they differ in. The plain and the bitmap path are
+  charged the heap for the rows the probe measured and not for core's: `lioncostestimate()`
+  returns the corrected selectivity, and `cost_index()` and `cost_bitmap_heap_scan()` take the rows
+  they fetch, and the pages those lie on, from it - 2,273 units over the count for 2,163 heap pages
+  and 2,028 rows, 3.6 ms measured. Without the probe all three come out within three units (15,570,
+  15,572 and 15,572), core's product saying two rows: that is the coin toss, and it is what any
+  path of a filter nothing measures is priced for; the executors now make it a toss between 48 and
+  52 ms rather than between 49 and 92. The count's visibility-map checks stay in the merge's
+  constants, which were fitted on counts, and the scans are charged them as well - under 1% of the
+  count's time in its profile, against the 3.6 ms the scans spend on the heap.
+- **The plans.** The count stays `LionCount`, now ahead of the scans by their heap and nothing
+  else; the page stays the plain scan and its top-N sort, a tie with `LionOrdered`, which makes the
+  same AND before its walk (§30.4); the six-clause rows stay the plain scan, a tie with the bitmap
+  scan. A parallel bitmap heap scan's bitmap is still built by one process, as core builds it, and
+  that process's AND is the table's bitmap index side.
+- **Not done.** The lists' unions are the larger part of both executors' time on such filters: each
+  key's union of a list's containers is built whole, and optimized, before the running
+  intersection, a few rows or none, is ANDed with it. Probing the intersection's members in each set
+  of the list instead would take most of that out of the scan and the count alike, but it needs the
+  evaluator's OR node to build its union only when it is asked for, and the merge's constants were
+  fitted on the unions as they are.
 
 **A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
 in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
@@ -11967,6 +12062,25 @@ and on 991c315 every plan, cost and row check of it fails and every answer passe
 expected output moved on 16, 17, 18 or 19, in either WAL mode: the suite's ORs are across columns
 or not of constants, its probed conjunctions fit the old budget, and the merge's correction moves
 no pinned plan.
+
+`test/sql/scanand.sql` (2026-09-28, §29.11 "The AND, as the count makes it"), on 120,000 rows in 60
+hidden groups that take turns over the heap, two dense columns first in the index and
+five columns following the group eight times in ten: nine filters - the group's fourteen sets, an
+AND inside a multi-key `@>`, a range beside the sets as several WINDOWs at the least floor and as a
+short WALK, a list of 429 values beside them in batches of 32, a dense set beside one or two
+selective ones, and two contradictions - each answered through the plain scan and through the
+bitmap scan with the sequential scan's rows; a cursor that pauses the plain scan between rows, a
+nested loop's parameterized inner scan rescanned per outer row, an exclusion constraint's pinned
+check of three equalities, a dirty heap and the same after VACUUM; the count of the filter planned
+as `LionCount` at a `random_page_cost` of 1.1, both scans priced above it by more than half its
+rows with the probe and by less without it (core's product); and, on a table where two dense columns
+come first and the selective two meet at four container keys, the plain and the bitmap scan
+reading fewer index buffers than the count, whose one visibility map page is the difference. On
+bc2a017 that last check fails - the scans read 47 index buffers to the count's 22 - and every other
+passes: the answers were right, and the plan was already the count's. No other expected output
+moved on 16, 17, 18 or 19, in either WAL mode: no price changed, the suite's counts print the same
+`Containers Visited` and `Probes Avoided`, which are the merge's, and its scans' buffers are not
+printed where an AND of several sets would move them.
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
