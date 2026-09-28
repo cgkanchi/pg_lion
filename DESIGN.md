@@ -8756,7 +8756,16 @@ it. So `lion_plain_heap_correlation()` notes what is left over for an unparamete
 relation's paths are built and offers the bitmap heap scan of the same index path again beside it
 (`lion_plain_set_rel_pathlist()`, in `lion_selfuncs.c`, before LionOrdered's hook sees the paths);
 set_rel_pathlist() allows a hook to modify the core paths, and the two are then compared as any
-others. The plain path keeps its startup cost, which is what a LIMIT asks of it. At 1.1, 43% of the
+others. The plain path keeps its startup cost, which is what a LIMIT asks of it. The hook offers the
+sequential scan and the TID scans again as well, rebuilt as set_plain_rel_pathlist() builds them
+(2026-09-28 review): core adds the sequential scan before the index paths, and a plain path priced
+short by its remainder could dominate it and have add_path() free it, leaving a relation whose best
+path was the sequential scan without one. Where nothing had been displaced the rebuilt path is a copy
+of one still there, and add_path() throws it away. The other indexes' paths are not rebuilt - that
+would mean building every index path again, lion's among them - and would have had to cost less than
+the plain path with its remainder and more than without it. `plaincost.sql`'s 43% query at 1.1 is
+one that had lost its sequential scan (about 7,550 by core's formula, against the plain path's 7,294
+before the charge); the bitmap scan, at 7,273, still wins it. At 1.1, 43% of the
 rows, 18 to a page, on every page (`plaincost.sql`'s shape, `status = 0 AND supp = 0
 AND flag`):
 

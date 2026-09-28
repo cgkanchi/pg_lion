@@ -1315,6 +1315,17 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
  * paths added here are compared as any others (set_rel_pathlist() allows a
  * hook to modify the core paths).  The plain path keeps its startup cost, which
  * is what a LIMIT asks of it.
+ *
+ * The bitmap heap scan is not all the plain path may have displaced before it
+ * paid: set_plain_rel_pathlist() offers the sequential scan before the index
+ * paths, and a plain path priced short by the remainder can dominate it -
+ * add_path() frees what it discards - and the TID scans likewise.  Those are
+ * rebuilt and offered again as core builds them; where the plain path had
+ * displaced nothing, each is a copy of a path that is still there, and
+ * add_path() throws the copy away.  The paths of the other indexes cannot be
+ * rebuilt without building the relation's index paths again, lion's among
+ * them, and are not: they would have had to cost less than the plain path
+ * with its remainder and more than it without.
  */
 static void
 lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
@@ -1361,6 +1372,14 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			add_path(rel, p);
 			add_path(rel, (Path *) create_bitmap_heap_path(root, rel, p, NULL,
 														   1.0, 0));
+		}
+		if (repriced != NIL && rte->rtekind == RTE_RELATION &&
+			rte->tablesample == NULL)
+		{
+			/* as set_plain_rel_pathlist() offers them */
+			add_path(rel, create_seqscan_path(root, rel, rel->lateral_relids,
+											  0));
+			(void) create_tidscan_paths(root, rel);
 		}
 		list_free(repriced);
 	}
