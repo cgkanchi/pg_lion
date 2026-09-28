@@ -1,6 +1,6 @@
 # pg_lion explained (video)
 
-`pg_lion_explained.mp4` is a 7-minute narrated explainer of Lion for people who *use* PostgreSQL:
+`pg_lion_explained.mp4` (6:54, 1080p, 14 MB) is a narrated explainer of Lion for people who *use* PostgreSQL:
 DBAs and application developers, not people who build database internals.  It covers what Lion is,
 how it differs from the B-tree and GIN indexes they already use, where it wins, where it doesn't,
 and how to try it.  Every number in it comes from the README's "Latest benchmarks" (PostgreSQL
