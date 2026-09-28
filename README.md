@@ -449,7 +449,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |
 | `fkjoin_collect_container_cost` | 2.0 | `cpu_operator_cost` | a container of the driving filter, read to collect the fact filters |
 | `fkjoin_copy_count_cost` | 25 | `cpu_tuple_cost` | a count against the collected copy |
-| `fkjoin_copy_probe_cost` | 15 | `cpu_operator_cost` | a seek of the copy, an fk container |
+| `fkjoin_copy_probe_cost` | 5 | `cpu_operator_cost` | a lookup of the copy and its AND, an fk container |
 | `fkjoin_copy_member_cost` | 3.0 | `cpu_operator_cost` | a member of that container |
 | `fkjoin_copy_container_cost` | 20 | `cpu_operator_cost` | a container of the copy made |
 | `fkjoin_batch_row_cost` | 120 | `cpu_operator_cost` | a dimension row's place in a batch looked up in key order |

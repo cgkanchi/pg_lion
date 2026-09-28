@@ -38,7 +38,7 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.fkjoin_copy_container_cost    | 20      | 20       | user    | real
  pg_lion.fkjoin_copy_count_cost        | 25      | 25       | user    | real
  pg_lion.fkjoin_copy_member_cost       | 3       | 3        | user    | real
- pg_lion.fkjoin_copy_probe_cost        | 15      | 15       | user    | real
+ pg_lion.fkjoin_copy_probe_cost        | 5       | 5        | user    | real
  pg_lion.fkjoin_count_cost             | 25      | 25       | user    | real
  pg_lion.fkjoin_probe_cost             | 80      | 80       | user    | real
  pg_lion.fkjoin_row_cost               | 10      | 10       | user    | real

@@ -1908,6 +1908,134 @@ test_gallop_intersection(void)
 	run_binops();
 }
 
+static bool raw_in_range(const LionContainer *c);
+
+/*
+ * An ARRAY of one to three members against every kind of operand: and()
+ * looks each member up in the other one instead of merging (the count
+ * engine's commonest AND, a key's container of a row or two against a
+ * filter's).  Members that hit and miss, at 0 and 32767, and at a run's
+ * edges and just past them; the small operand on either side.
+ */
+static void
+test_and_probe(void)
+{
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN};
+	uint32		t;
+	uint32		trial;
+
+	phase("ARRAY of 1-3 members x every type (member lookups)");
+	rng_seed(UINT64CONST(0x5EED0006));
+	for (t = 0; t < lengthof(types); t++)
+		for (trial = 0; trial < 60; trial++)
+		{
+			Ref		   *big = (trial & 1) ? &ref_a : &ref_b;
+			Ref		   *small = (trial & 1) ? &ref_b : &ref_a;
+			CBuf	   *bigbuf = (trial & 1) ? &buf_a : &buf_b;
+			CBuf	   *smallbuf = (trial & 1) ? &buf_b : &buf_a;
+			uint32		want = 1 + rng_below(3);
+			uint32		i;
+
+			if (types[t] == LION_CT_ARRAY && trial % 3 == 0)
+			{
+				/* the thinnest ARRAYs too, where the lookup is a few steps */
+				gen_sparse(big, 1 + rng_below(8));
+				build_by_append(bigbuf, big);
+				lion_container_optimize(&bigbuf->c);
+			}
+			else
+				gen_typed(big, bigbuf, types[t]);
+
+			ref_init(small);
+			while (small->card < want)
+			{
+				uint32		lo;
+
+				switch (rng_below(5))
+				{
+					case 0:
+						lo = 0;
+						break;
+					case 1:
+						lo = LION_CONTAINER_RANGE - 1;
+						break;
+					case 2:
+						lo = ref_pick_member(big);
+						if (lo >= LION_CONTAINER_RANGE)
+							lo = rng_below(LION_CONTAINER_RANGE);
+						break;
+					case 3:
+						/* just past a member: a run's end + 1, or a neighbour */
+						lo = ref_pick_member(big);
+						lo = (lo >= LION_CONTAINER_RANGE - 1) ? 0 : lo + 1;
+						break;
+					default:
+						lo = rng_below(LION_CONTAINER_RANGE);
+						break;
+				}
+				(void) ref_add(small, lo);
+			}
+			lion_container_init(&smallbuf->c, TEST_CKEY);
+			for (i = 0; i < LION_CONTAINER_RANGE; i++)
+				if (small->m[i])
+					lion_container_append_sorted(&smallbuf->c, (uint16) i);
+			CHECK(smallbuf->c.type == LION_CT_ARRAY &&
+				  smallbuf->c.cardinality == want,
+				  "the small operand is an ARRAY of 1-3 members");
+			run_binops();
+		}
+
+	phase("damaged: an ARRAY of 1-3 members out of order, repeated, past 32767");
+	{
+		static const uint16 bad[][3] = {
+			{7, 5, 9}, {5, 5, 9}, {40000, 5, 7}, {65535, 65535, 3}, {9, 40000, 40000}
+		};
+		uint32		k;
+
+		for (k = 0; k < lengthof(bad); k++)
+		{
+			for (t = 0; t < lengthof(types); t++)
+			{
+				const LionContainer *o;
+				const uint16 *arr;
+				uint32		i;
+				bool		ascending = true;
+
+				/* the other operand holds every member, as it reads them */
+				gen_typed(&ref_b, &buf_b, types[t]);
+				for (i = 0; i < 3; i++)
+					(void) ref_add(&ref_b, bad[k][i] & (LION_CONTAINER_RANGE - 1));
+				if (types[t] == LION_CT_RUN)
+					build_run_direct(&buf_b, &ref_b);
+				else
+				{
+					build_by_append(&buf_b, &ref_b);
+					if (types[t] == LION_CT_BITSET)
+						lion_container_to_bitset(&buf_b.c);
+				}
+
+				lion_container_init(&buf_a.c, TEST_CKEY);
+				buf_a.c.cardinality = 3;
+				for (i = 0; i < 3; i++)
+					LION_ARRAY_DATA(&buf_a.c)[i] = bad[k][i];
+				(void) lion_container_and(&buf_a.c, &buf_b.c, &buf_d.c);
+				o = &buf_d.c;
+				arr = (const uint16 *) LION_CONTAINER_PAYLOAD(o);
+				for (i = 1; i < o->cardinality && i < 3; i++)
+					if (arr[i] <= arr[i - 1])
+						ascending = false;
+				CHECK(o->type == LION_CT_ARRAY && o->cardinality <= 3 &&
+					  o->ckey == TEST_CKEY && o->flags == 0,
+					  "and() of a damaged small ARRAY is an ARRAY of at most 3");
+				CHECK(raw_in_range(o) && ascending,
+					  "... strictly ascending, and in range");
+				(void) lion_container_and(&buf_b.c, &buf_a.c, &buf_d.c);
+				CHECK(raw_in_range(&buf_d.c), "... either way round");
+			}
+		}
+	}
+}
+
 static void
 test_run_intersection_overflow(void)
 {
@@ -3394,6 +3522,7 @@ main(void)
 	test_run_edge_cases();
 	test_iterate_early_stop();
 	test_gallop_intersection();
+	test_and_probe();
 	test_run_intersection_overflow();
 	test_remove_if_rebuild();
 	test_check_rejects();

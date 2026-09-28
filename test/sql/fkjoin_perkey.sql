@@ -264,6 +264,34 @@ RESET parallel_tuple_cost;
 RESET parallel_setup_cost;
 SET max_parallel_workers_per_gather = 0;
 
+-- ---- 5. a copy whose container keys are far apart ------------------------------
+-- A count looks the copy up at each of its key's containers (DESIGN.md §27,
+-- "The copy, looked up by key"): directly where the copy's keys are dense, as
+-- in every section above, by a search of its keys where they are not.  Here
+-- the filter keeps the first and the last thousand rows of a 60000-row fact,
+-- two or three containers at the two ends of some fourteen container keys,
+-- too few for the direct index, while each key's two rows lie anywhere: most
+-- of the keys' containers find nothing of the copy at their key, and the key
+-- is sought on to the next one the copy has.
+CREATE TABLE lion_pks (id int NOT NULL, fk int8 NOT NULL, z int NOT NULL,
+					   pad text);
+INSERT INTO lion_pks
+SELECT i, (i * 7919) % 30000 + 1,
+	   CASE WHEN i <= 1000 OR i > 59000 THEN 1 ELSE 0 END, repeat('p', 60)
+FROM generate_series(1, 60000) i;
+CREATE INDEX lion_pks_fk ON lion_pks USING lion (fk);
+CREATE INDEX lion_pks_z ON lion_pks USING lion (z);
+VACUUM (FREEZE, ANALYZE) lion_pks;
+SELECT lion_pk('SELECT count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.pk WHERE f.z = 1');
+SELECT lion_pk('SELECT d.attr, count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.pk WHERE f.z = 1 GROUP BY d.attr');
+SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE EXISTS (SELECT 1 FROM lion_pks f WHERE f.fk = d.pk AND f.z = 1)');
+SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r2'' AND NOT EXISTS (SELECT 1 FROM lion_pks f WHERE f.fk = d.pk AND f.z = 1)');
+SELECT (n->>'Fact Filter Rows Collected')::int AS collected,
+	   (n->>'Fact Filter Copy Seeks')::int <= (n->>'Join Key Containers Read')::int AS a_seek_a_container,
+	   (n->>'Fact Filter Copy Containers Read')::int < (n->>'Join Key Containers Read')::int AS most_find_nothing
+FROM lion_pk_node('SELECT count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.pk WHERE f.z = 1') n;
+
+DROP TABLE lion_pks;
 DROP TABLE lion_pkf, lion_pkd;
 DROP FUNCTION lion_pk(text);
 DROP FUNCTION lion_pk_node(text, text);
