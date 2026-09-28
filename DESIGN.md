@@ -1133,6 +1133,17 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   The decision is per COUNT and not per index (`lion_sources_all_rmgr()`): a container of an
   intersection carries the dead TIDs of every source it came from, so ONE generic-mode source puts
   the whole count back on rechecking everything.
+  *The index-only scan* (§29.9) trusts the map for every TID it returns, and its pin is the same
+  interlock, so it makes the same decision per index (2026-09-27 review; `liongettuple()` never
+  asked whether it was in recovery, and returned the dead rows of a generic-mode index on a
+  standby): in recovery, over a generic-mode index, it looks every TID up in the heap under its
+  snapshot, as its UNION shape always does, and returns only the visible ones
+  (`test/recovery/run.sh` phase 2 compares a standby's index-only scan with its sequential scan,
+  before and after a VACUUM on the primary, in both modes). A bitmap scan needs nothing of the
+  kind: the bitmap heap scan fetches every page and applies the snapshot itself (its skip-fetch
+  shortcut, which trusted the map, was unsafe for every index AM and is disabled in core's current
+  minor releases - 16.15's `can_skip_fetch = false` - and gone from master), and a plain index scan
+  fetches every tuple.
 
 Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
@@ -8548,7 +8559,9 @@ none; `amoptionalkey` lets the planner scan a lion index with no key at all, and
 - `xs_want_itup` turns `dropPin` off, so a WALK keeps the directory leaf of each INLINE entry and
   the posting leaf of each container pinned until the next batch - the §9 interlock, which is
   what makes the executor's visibility-map test of each returned TID safe, exactly as for the
-  count;
+  count - except on a hot standby over a generic-mode index, whose replay takes no cleanup lock:
+  there every shape's TIDs are looked up in the heap first, as the UNION's are below (§9, "Hot
+  standby"; 2026-09-27 review);
 - the UNION shape (a multi-key first column) returns only TIDs the index holds (§29.6) but pins
   none of the pages they came from, so each of them is looked up in the heap under the scan's
   snapshot first (`lion_table_fetch_tid()`) and only a visible one is handed on - which stays

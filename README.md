@@ -363,7 +363,9 @@ stale `relallvisible` blind spot of index-only scans. Indexes built before NULL 
 with an error and have to be rebuilt with REINDEX.
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
-interlock relies on; they stay correct there but are no longer O(1) per container.  An rmgr-mode
+interlock relies on; they stay correct there but are no longer O(1) per container.  Index-only
+scans of such an index (of a query that needs no column, such as `SELECT count(*)`) look every TID
+up in the heap there for the same reason.  An rmgr-mode
 index does not pay that: its removal records replay under a cleanup lock, so the standby uses the
 visibility map again (DESIGN.md §25) - at the price that a standby reader holding a pin makes replay
 wait, which `max_standby_streaming_delay` resolves as a recovery conflict.  A count that reads even

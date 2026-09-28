@@ -1557,6 +1557,57 @@ standby_chain_reuse() {
 	SUMMARY+=("phase2 standby      chain free + reuse replayed under a reader ($freed pages)")
 }
 
+# Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9).  An
+# index-only scan trusts the visibility map for every TID it returns, which a
+# standby may only do where replay waits for the pin the scan keeps: rmgr
+# mode.  In generic mode liongettuple() looks every TID up in the heap first
+# (it used to return the dead rows instead, 2026-09-27 review).  Either way
+# the standby's index-only scan must answer what its sequential scan answers,
+# before and after the primary deletes rows and vacuums them away.  lion plans
+# an index-only scan only for a query that needs no column, which a partial
+# index whose predicate is the WHERE clause gives.
+standby_index_only() {
+	local plan ios seq want round
+	local ioset="set enable_seqscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	local seqset="set enable_indexscan = off; set enable_indexonlyscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	log ""
+	log "-- standby: index-only scans"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_index_only: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_ios;
+		CREATE TABLE lion_ios (id int NOT NULL, k int NOT NULL, flag bool NOT NULL);
+		INSERT INTO lion_ios SELECT i, i % 50, i % 2 = 0 FROM generate_series(1, 40000) i;
+		CREATE INDEX lion_ios_k ON lion_ios USING lion (k) WHERE flag;
+	SQL
+	psql_p -c "VACUUM (ANALYZE) lion_ios" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	plan=$(psql_s -tAc "$ioset explain (costs off) select count(*) from lion_ios where flag")
+	grep -q "Index Only Scan using lion_ios_k" <<<"$plan" ||
+		die "standby_index_only: the standby plans no index-only scan of lion_ios_k: $plan"
+
+	for round in before after; do
+		if [ "$round" = after ]; then
+			psql_p -c "SET synchronous_commit = on; DELETE FROM lion_ios WHERE id % 4 = 0" \
+				>>"$RUNLOG" 2>&1 || die "standby_index_only: delete failed"
+			psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_ios" >>"$RUNLOG" 2>&1
+			wait_catchup
+		fi
+		want=$(psql_p -tAc "select count(*) from lion_ios where flag")
+		ios=$(psql_s -tAc "$ioset select count(*) from lion_ios where flag")
+		seq=$(psql_s -tAc "$seqset select count(*) from lion_ios where flag")
+		{ [ "$ios" = "$seq" ] && [ "$seq" = "$want" ]; } ||
+			die "BUG: standby_index_only ($round the delete): the standby's index-only scan counts $ios, its sequential scan $seq, the primary $want"
+	done
+
+	psql_p -c "DROP TABLE lion_ios" >>"$RUNLOG" 2>&1
+	wait_catchup
+
+	log "standby: index-only scans answer $ios rows, as the sequential scan does, before and after a VACUUM"
+	SUMMARY+=("phase2 standby      index-only scans agree with the heap ($MODE mode)")
+}
+
 phase2() {
 	local probe_p probe_s ck
 	log ""
@@ -1605,6 +1656,7 @@ phase2() {
 	SUMMARY+=("phase2 standby      $(wc -l <"$probe_s") index probes identical to the primary")
 
 	standby_chain_reuse
+	standby_index_only
 
 	rr_variant on 11
 	rr_variant off 7

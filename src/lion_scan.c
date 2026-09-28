@@ -48,6 +48,7 @@
 
 #include "access/itup.h"
 #include "access/relscan.h"
+#include "access/xlog.h"
 #if PG_VERSION_NUM >= 190000
 #include "executor/instrument_node.h"
 #endif
@@ -103,6 +104,7 @@ typedef struct LionScanOpaqueData
 	int			pos;
 	BlockNumber firstblk;		/* first heap block of the batch's container */
 	IndexTuple	nullitup;		/* what an index-only scan is handed (§29.9) */
+	bool		heapcheck;		/* ... after its TID is looked up in the heap */
 } LionScanOpaqueData;
 
 typedef LionScanOpaqueData *LionScanOpaque;
@@ -3241,6 +3243,25 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 		so->src = lion_source_build(so, !droppin, so->gtcxt);
 		so->nlo = 0;
 		so->pos = 0;
+
+		/*
+		 * Which TIDs an index-only scan has to look up in the heap before it
+		 * hands them on (see below).  The UNION shape's, always.  And on a hot
+		 * standby every shape's, when the index is in generic WAL mode
+		 * (DESIGN.md §9, "Hot standby"): replay of a generic record takes no
+		 * cleanup lock, so the pin a batch keeps does not stop the startup
+		 * process from removing its TIDs and then replaying the heap records
+		 * that set their pages all-visible - the executor would trust the
+		 * visibility map for a row that is dead to this snapshot.  The count
+		 * rechecks everything there for the same reason (cx.in_recovery in
+		 * lion_count.c).  An rmgr-mode index keeps the interlock on the
+		 * standby, because its removals replay under a cleanup lock behind
+		 * the barrier of §25.
+		 */
+		so->heapcheck = scan->xs_want_itup &&
+			(so->src->shape == LION_SRC_UNION ||
+			 (RecoveryInProgress() &&
+			  lion_wal_mode(scan->indexRelation) != LION_WAL_MODE_RMGR));
 	}
 
 	for (;;)
@@ -3265,16 +3286,18 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 				 * (xs_want_itup turned dropPin off), which is the §9
 				 * interlock the count relies on.  The UNION shape copies
 				 * containers out of many pages into its window and pins none
-				 * of them: its TIDs are checked in the heap here, and only a
-				 * tuple visible to the snapshot is handed on - which stays
-				 * visible to it, so no VACUUM can take it away before the
-				 * executor looks.  Every TID is one the index holds (§29.6),
-				 * so a visible one is a row the scan selects.  A WINDOW,
-				 * which pins nothing either, is only ever built without
-				 * keeppins, so it never gets here.
+				 * of them, and on a hot standby a generic-mode index's pins
+				 * interlock nothing (so->heapcheck): those TIDs are checked
+				 * in the heap here, and only a tuple visible to the snapshot
+				 * is handed on - which stays visible to it, so neither VACUUM
+				 * nor replay can take it away before the executor looks.
+				 * Every TID is one the index holds (§29.6), so a visible one
+				 * is a row the scan selects.  A WINDOW, which pins nothing
+				 * either, is only ever built without keeppins, so it never
+				 * gets here.
 				 */
 				Assert(so->src->shape != LION_SRC_WINDOW);
-				if (so->src->shape == LION_SRC_UNION)
+				if (so->heapcheck)
 				{
 					ItemPointerData tid = scan->xs_heaptid;
 
