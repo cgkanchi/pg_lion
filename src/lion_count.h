@@ -671,6 +671,38 @@ extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 LionCountStats *stats);
 
 /*
+ * The same intersection collected ONCE for all the participants of a parallel
+ * plan, into its dynamic shared memory (DESIGN.md §27, "One copy per query"):
+ * the participants divide its container keys into chunks and collect them
+ * together, the chunks past the memory the copy may take spill to files of
+ * the plan's file set, and every participant then reads the one copy through
+ * a view of its own (*out), which it releases as it would any posting set.
+ * The shared state is lion_shared_copy_size() bytes of the plan's DSM chunk:
+ * made by the leader (_init(), when the DSM is), attached to by each worker
+ * (_attach()) and emptied between runs (_reinit(), when no participant is
+ * running).  memory is what the copy may keep in shared memory; the rest of
+ * it goes to files.  *chunks is how many chunks this participant collected,
+ * *built whether it was the one that indexed the copy - once a run - and
+ * *spilled whether any chunk went to a file.
+ */
+typedef struct LionSharedCopy LionSharedCopy;
+struct dsa_area;
+struct dsm_segment;
+extern Size lion_shared_copy_size(void);
+extern void lion_shared_copy_init(LionSharedCopy *sc, struct dsm_segment *seg,
+								  int participants, Size memory,
+								  BlockNumber heapblocks);
+extern void lion_shared_copy_attach(LionSharedCopy *sc);
+extern void lion_shared_copy_reinit(LionSharedCopy *sc, struct dsa_area *area,
+									BlockNumber heapblocks);
+extern void lion_shared_copy_collect(LionSharedCopy *sc, struct dsa_area *area,
+									 Relation heap, Snapshot snapshot,
+									 int nsources, LionCountSource *sources,
+									 LionPostingSet *out, int *chunks,
+									 bool *built, bool *spilled,
+									 LionCountStats *stats);
+
+/*
  * Does a count that reads ps again and again walk its pages every time?  A
  * CHAIN set that lion_count_sources_cached() keeps no private copy of - one
  * that is hopeless even as an ARRAY of members, or whose copy was tried and

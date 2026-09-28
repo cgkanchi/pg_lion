@@ -7516,8 +7516,10 @@ count seeks by a binary search in memory. The same forward count takes 135 ms (t
 - It is budgeted by a hash join's memory, `get_hash_memory_limit()` - `work_mem` times
   `hash_mem_multiplier` - and not by a setting of its own: the copy stands where the ordinary
   plan's hash table would, over the same rows, and is the same kind of memory; in a parallel plan
-  each participant makes its own, as each participant of a hash join below a Gather builds its
-  own table ("Parallel" below). A copy that outgrows it SPILLS, as a hash join's table would
+  each participant used to make its own, as each participant of a hash join below a Gather builds
+  its own table ("Parallel" below), and the participants now make one together, in a Parallel
+  Hash's memory ("One copy per query" below). A copy that outgrows it SPILLS, as a hash join's
+  table would
   (2026-09-28 review): what it holds so far goes to a temporary file (`LionSpill`, lion_count.c),
   and so does every container after it, in key order; memory keeps sixteen bytes a container - its
   key, where it is and its size - and a count reads the file a container at a time, a seek being a
@@ -7797,18 +7799,18 @@ it is offered, besides the serial path, over the dimension's cheapest partial pa
   a `count(DISTINCT)` are sorted and aggregated above it by core's Agg. (The forward semi join over
   a non-unique key divides its distinct keys instead, over the dimension's whole plan, and shares a
   counter to do it: "Forward semi joins over a non-unique key".)
-- **Nothing is shared but EXPLAIN's counters.** Each participant locates the fact filters and makes
-  its own copy of them (`lion_sources_collect()`) under its own `get_hash_memory_limit()`, and
-  spills it to a temporary file of its own when it does not fit (it used to fall back to probing
-  on its own). Each locates its lists under its share of the list pin budget (§15). The copy is
-  not built once in
-  dynamic shared memory: its size is known only once the merge has run, after the Gather has sized
-  its DSM, and one copy would make every worker wait for its builder (the barrier a Parallel Hash
-  needs) to save a merge that took 0.8 ms for 1,500 containers of one set ("Cost, revisited"). It
-  is what a hash join below a Gather that is not a Parallel Hash does with its table - one per
-  participant, each within hash_mem - and the cost model charges it that way: the filters'
-  lookups, their merge and the copy in full to every participant, the per-dimension-row work over
-  one participant's share of the rows, so that the path's cost is one participant's. The shared
+- **Nothing is shared but EXPLAIN's counters** - and, since "One copy per query" below, the fact
+  filters' copy. Each participant locates the fact filters (and its lists under its share of the
+  list pin budget, §15), and used to make its own copy of them (`lion_sources_collect()`) under
+  its own `get_hash_memory_limit()`, spilling it to a temporary file of its own when it did not
+  fit. The copy was not built once in dynamic shared memory: its size is known only once the
+  merge has run, after the Gather has sized its DSM, and one copy would make every worker wait
+  for its builder (the barrier a Parallel Hash needs) to save a merge that took 0.8 ms for 1,500
+  containers of one set ("Cost, revisited"). A benchmark whose filters took far longer than that
+  to collect is why it now is, in the query's DSA (the size is no longer the DSM's question), and
+  collected by all of them together. The cost model charges the filters' lookups in full to every
+  participant, the making of the copy divided among them, and the per-dimension-row work over one
+  participant's share of the rows, so that the path's cost is one participant's. The shared
   struct (`LionJoinShared`: a spinlock and sums) takes each worker's counters when it shuts down
   (`ShutdownCustomScan`); the leader's EXPLAIN ANALYZE prints its own plus the workers' - `Join
   Keys Looked Up` is the number of dimension rows with a key, whichever participants had them -
@@ -7866,6 +7868,111 @@ keeps the parallel hash join. With the child's own worker count (one worker for 
 dimension rows) the first row took 94 ms and the third 650; the fk index's pages give it two and
 three. The serial `count(DISTINCT)` over the 2,000,000-key fk is the one serial choice the model
 gets wrong here (the hash join at 121,557 against the node's 123,222, 706 ms against 507).
+
+### One copy per query (2026-09-28)
+
+Every participant of a parallel plan used to collect the fact filters for itself: the same merge
+over the same sets, the same copy, as many times as there were processes, and at the same time,
+so that each took longer than the serial collection did - `Fact Filter Collect Time`, summed, was
+several times the serial one and each participant's share of it was spent before its first
+count. A benchmark's collection was a large part of its parallel join's wall time for that
+reason. Now the participants collect ONE copy, together, into the query's dynamic shared memory,
+the way a Parallel Hash builds one table, and every one of them reads it
+(`lion_shared_copy_collect()`, lion_count.c; `LionSharedCopy`).
+
+- **When.** A parallel-aware node whose plan collects the filters, in a Gather whose workers
+  started. A plan run without them - none started, or no DSM could be made - runs in the leader,
+  which makes a copy of its own within a hash join's memory, exactly as a serial plan does; so does
+  the serial node a worker runs whole under `debug_parallel_query`, which is not parallel-aware.
+  Each participant still locates the filters for itself (under its share of the list pin budget,
+  §15): collecting reads its own located sets, and every count its own located fk set.
+- **Collecting, cooperatively.** The heap's container keys are cut into chunks - four for each
+  participant the plan was made for, so that the work evens out, at most 64, at least 16 container
+  keys each, the last one open-ended because the heap may grow - and each participant claims the
+  next chunk nobody has from an atomic counter and collects it: `lion_sources_collect()`'s merge of
+  its own located sources, sought to the chunk's first key and stopped at its end
+  (`LionCollect.ranged`). A windowed union (§15, "Bounded cursors") starts its first window at the
+  chunk's first key and reads no child past its end; before it did, every chunk read its lists
+  from the heap's first key to its last. When a participant has no chunk left it waits at a
+  barrier (the wait event `LionFactFilterCopy` from PostgreSQL 17, `Extension` before), and the
+  last to arrive is ELECTED to index the copy: where every container is, its key, and the direct
+  index where the keys are dense ("The copy, looked up by key"), in shared memory. The others wait
+  for that, and every participant then reads the copy through a view of its own - its own array of
+  pointers to the containers, eight bytes a container, and the files of the chunks that spilled
+  opened read-only - and never writes it. A participant that starts late joins whatever phase the
+  copy is in: it collects the chunks left, waits for the index, or just reads; one that never
+  starts is waited for by nobody.
+- **Memory.** The copy's containers are in the query's DSA (`es_query_dsa`), whose size is not the
+  DSM's question - the reason the copy could not be built there when the DSM was the only shared
+  memory ("Parallel" above). They may take what a Parallel Hash's table may: a hash table's memory
+  (`get_hash_memory_limit()`) for each participant the plan was made for, the leader included -
+  the Gather's workers planned, plus one. A chunk is collected into its participant's own memory
+  first, at most what the copy has left of its memory, and then goes into the DSA if the room is
+  still there when it is reserved, atomically; otherwise, and for a chunk that outgrew it while it
+  was collected, into a file of the plan's `SharedFileSet`, named for the chunk, as a Parallel
+  Hash's batches go to theirs - with where each container is in it, sixteen bytes a container, in
+  the DSA. So a copy may be partly in memory and partly in files, and a count reads a container
+  from its chunk's file only when the container is there. The index - sixteen bytes a container
+  and four for its key, and a direct index of at most sixteen - is the copy's price of being read,
+  as a spilled serial copy's entries are, and is not held to the limit.
+- **Why the counts stay exact (§9).** The copy is the serial node's, made in parts: every chunk is
+  read after the query's snapshot was taken, which is all "Why a stale copy is safe" asks of a
+  copy - it cannot lack a row the snapshot sees - and each participant counts the copy only ever
+  beside its own located fk set, which carries the interlock. The chunks cover every container key
+  once, and a key's containers are the merge's at that key whichever participant collected them.
+  A participant waits at the barrier with its located filters still pinned, as a serial collection
+  holds them while it runs, and lets them go when the copy is done; a VACUUM held up by those pins
+  waits for them with nothing else held (§9), so the wait closes no cycle - the participants it
+  waits on need nothing of it to finish.
+- **Rescans.** A rescan of the Gather ends its workers and, before it starts new ones, calls
+  `ReInitializeDSMCustomScan`, with no participant running: the leader lets go of its view (the
+  rescan of its own node may come only after this, `ExecReScanGather()`), the copy's memory is
+  freed and its files deleted (`SharedFileSetDeleteAll()`), the barrier and the counters start
+  again and the heap is cut into chunks again. The next run collects again, with the new values of
+  whatever it depends on. A participant's view goes when it shuts down, before the Gather detaches
+  the memory it points into.
+- **Errors and cancels.** An error in a worker is rethrown in the leader, whose abort ends the other
+  workers; a cancel reaches the leader, which does the same. A participant waiting at the barrier
+  answers both, since a condition variable's sleep checks for interrupts. The copy's memory goes
+  with the query's DSA and its files with the DSM, whatever happened. Tried by hand on the repro
+  below, with chunks spilling at a `work_mem` of 256 kB: statement timeouts of 3 to 120 ms, all
+  cancelled cleanly, and workers terminated while they waited at the barrier - found by their wait
+  event - which failed their query; the next query answered right, and no temporary file was left.
+- **EXPLAIN ANALYZE.** The counters keep their meaning. `Fact Filter Rows Collected` is the
+  copy's rows - the largest copy any participant made, which with one shared copy is the one they
+  all read. `Fact Filter Copies Spilled` counts a shared copy once a run, when any of its chunks
+  went to a file (the participant that indexes it counts it), where a copy of each participant's
+  own counts once for each. `Fact Filter Collect Time` is still summed over the participants, and
+  is now each one's chunks and its wait at the barrier - divided by the participants, about the
+  collection's elapsed time. Two counters are new, printed only when a copy was shared: `Fact
+  Filter Copies Shared`, one a run, and `Fact Filter Copy Chunks`, the chunks the participants
+  collected, summed.
+- **Cost.** `lion_cost_fkjoin_rel()` divides what making the copy costs - the filters' merge, the
+  containers copied - among the participants, as it divides the dimension rows
+  (`lion_parallel_divisor()`), and takes the copy for a parallel path when it fits a hash table's
+  memory for each of the Gather's workers and the leader. The filters' lookups stay every
+  participant's in full.
+
+Measured on the repro of "The copy, looked up by key", with a column of 16,384 values of which an
+IN list of 400 keeps 2.4% of the rows (`bench/fkjoin_perkey.sh --in 400 --force-node`: a copy of
+487,677 rows, collected serially in 38 ms), three workers and the leader; medians of interleaved
+runs on four cores that other work kept busy (a load of three to nine):
+
+| | query | `Fact Filter Collect Time`, summed | cost |
+|---|---|---|---|
+| a copy each | 289 to 377 ms | 398 to 465 ms | 94,310 |
+| one copy, 16 chunks | 176 to 297 ms | 73 to 152 ms | 84,001 |
+
+Serially nothing changed (38 ms to collect either way). With the 0.3% flag, whose copy of one set
+takes a millisecond to collect, the parallel query was within the noise either way. The sums of
+`Join Count Time` and `Join Lookup Time` came out higher with one copy, and the query faster, for
+one reason. With a copy each, the leader, which starts before its workers, was done collecting
+first and read the dimension's rows into its first batch (walked lookups read theirs a `work_mem`
+at a time) before any worker was done: `EXPLAIN (ANALYZE, VERBOSE)` showed every worker's Parallel
+Index Only Scan returning no row, so the parallel plan's counting was the leader's alone. With one
+copy every participant leaves the barrier when the others do, and the rows are divided among them
+(in two runs, 11,165 to 25,984 a worker, the rest the leader's), so their counting times add up -
+on cores that other work shared - while the query's goes down.
 
 ### Forward semi joins over a non-unique key (2026-09-27)
 
@@ -8623,8 +8730,16 @@ none on a dimension set to 0); and the serial node under `debug_parallel_query`'
 Gather, whose answers are checked too. The summed counters (`Join Keys Looked Up` is the dimension's
 3,000 rows however they were shared, and 18,000 over six rescans); rescans of the Gather as the
 inner side of a nested loop; a generic plan's Params evaluated in every participant, a NULL one
-included; each participant's copy abandoned at run time over a 64 kB memory limit with the answer
-unchanged; and a dirty heap before and after VACUUM. Its plans are ones every supported release
+included; the fact filters' copy under a 64 kB memory limit with the answer unchanged; and a dirty
+heap before and after VACUUM. Since 2026-09-28 ("One copy per query") it checks that the copy is
+shared: collected once a run over the six rescans of the Gather (`Fact Filter Copies Shared` 6 and
+one chunk each); a copy of some 90 kB that a hash join's 64 kB would spill but the participants'
+shared memory - 64 kB for each of the three the plan was made for - holds, collected once in one
+chunk and not spilled; the same plan with `max_parallel_workers = 0`, whose leader runs it alone
+with a copy of its own that spills, and shares nothing; and a copy of some 240 kB over three chunks,
+past the shared memory, spilled once for the query, its containers read back from the chunks' files
+(`Fact Filter Copy File Reads`), with the answers of a semi join and of a grouped join the same as
+with the pushdown off. Its plans are ones every supported release
 makes alike (a parallel sequential scan of the dimension, the worker count from its
 `parallel_workers`); the expected output was checked on PostgreSQL 16 and 18. Section 9 of
 `test/sql/countmultikey.sql` (2026-09-27) does the same for the values every participant evaluates

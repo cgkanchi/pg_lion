@@ -1368,6 +1368,25 @@ typedef struct LionCountScanState
 	 */
 	struct LionJoinShared *joinshared;
 	bool		joinreported;
+
+	/*
+	 * One copy per query (DESIGN.md §27, "One copy per query"): in a parallel
+	 * plan whose workers started, the fact filters are collected once, by all
+	 * the participants together, into joinsharedcopy in the Gather's dynamic
+	 * shared memory, and joinfilter is this participant's view of it
+	 * (joinviewshared).  joinpcxt is the leader's parallel context, which
+	 * says whether any worker started.  joincopies counts the shared copies
+	 * this participant indexed - one a run - and joincopychunks the chunks of
+	 * them it collected, for EXPLAIN ANALYZE.
+	 */
+	LionSharedCopy *joinsharedcopy;
+	ParallelContext *joinpcxt;
+	bool		joinviewshared;
+	int64		joincopies;
+	int64		joincopychunks;
+	int64		joinworkercopies;
+	int64		joinworkercopychunks;
+
 	LionCountStats joinworkerstats;
 	int64		joinworkerlookups;
 	int64		joinworkermissing;
@@ -1403,9 +1422,12 @@ typedef struct LionCountScanState
  * every participant sorts all of them - and sortedruns the same summed over
  * the runs before it (lion_reinitialize_dsm()).
  *
- * nextchunk is the one thing the participants share while they run: the next
- * run of LION_FKJOIN_UNIQUE_CHUNK distinct keys of a forward semi join over a
- * non-unique key that nobody has claimed yet.  participants is how many the
+ * nextchunk is one of the two things the participants share while they run:
+ * the next run of LION_FKJOIN_UNIQUE_CHUNK distinct keys of a forward semi
+ * join over a non-unique key that nobody has claimed yet.  The other is the
+ * fact filters' copy (copyready: a LionSharedCopy after this struct, in the
+ * same DSM chunk), and copies and copychunks are what its participants
+ * indexed and collected of it, summed.  participants is how many the
  * leader started the plan for, itself included, which is how many ways each
  * of them divides the list pin budget (lion_list_pin_participants()).
  * batches is the batches of keys looked up in key order, summed, and
@@ -1427,9 +1449,16 @@ typedef struct LionJoinShared
 	int64		childrows;
 	int64		posting;
 	instr_time	time[LION_JT_N];
+	int64		copies;
+	int64		copychunks;
 	pg_atomic_uint32 nextchunk;
 	int			participants;
+	bool		copyready;		/* a LionSharedCopy follows this struct */
 } LionJoinShared;
+
+/* The shared copy of the fact filters, right after the struct above. */
+#define LION_JOIN_SHARED_COPY(shared) \
+	((LionSharedCopy *) ((char *) (shared) + MAXALIGN(sizeof(LionJoinShared))))
 
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								  CustomPath *best_path, List *tlist,
@@ -5229,6 +5258,13 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  *	  container's members at two bytes each, a bitset's 4 kB at most - because
  *	  past it the executor gives up and probes.
  *
+ *	  In a parallel plan (workers above zero) the participants collect ONE
+ *	  copy together (DESIGN.md §27, "One copy per query"), so what it takes
+ *	  to make is divided among them as the dimension rows are
+ *	  (lion_parallel_divisor()), and it may take a hash table's memory for
+ *	  each of them, a Parallel Hash's.  Its lookups stay each participant's:
+ *	  every one of them locates the filters for itself.
+ *
  * Either way the filters are located once for the whole scan, each one lookup
  * and one walk of its chain, as a single count prices them.
  *
@@ -5243,7 +5279,7 @@ static Cost
 lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 					 Var *fkvar, int joinclause, List *whereclauses,
 					 List *wherekinds, List *ors, double dimrows,
-					 double found, bool exists, double rowbytes,
+					 double found, bool exists, double rowbytes, int workers,
 					 bool *collect, bool *walk)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
@@ -5513,6 +5549,10 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		collected += drive * LION_FKJOIN_COLLECT_CONTAINER_COST +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
 			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
+
+		/* ... made once, by all the participants of a parallel plan */
+		if (workers > 0)
+			collected /= lion_parallel_divisor(workers);
 		collected += found * (LION_FKJOIN_COPY_COUNT_COST +
 							  Min(cfk, copyckeys) * readshare *
 							  (LION_FKJOIN_COPY_PROBE_COST +
@@ -5524,7 +5564,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 		 * made there as if the copy would be made chose the node where each
 		 * dimension row then built the filters' unions again.
 		 */
-		if (copybytes <= (double) get_hash_memory_limit() &&
+		if (copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
 			collected < probed && !RecoveryInProgress())
 			*collect = true;
 	}
@@ -6826,9 +6866,9 @@ lion_target_counts_only(PathTarget *target)
  * counted by two participants counts its fact rows twice - and the
  * participants divide the sorted, distinct keys among themselves instead, in
  * runs of LION_FKJOIN_UNIQUE_CHUNK (lion_join_next_key()).  So the child and
- * the sort are charged to every participant in full, as the fact filters'
- * copy is, and the lookups and counts are one participant's share of the
- * keys.
+ * the sort are charged to every participant in full, and the lookups and
+ * counts are one participant's share of the keys, as the making of the fact
+ * filters' copy is.
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
@@ -6838,10 +6878,10 @@ lion_target_counts_only(PathTarget *target)
  * In a parallel plan the child hands each participant its share of the
  * dimension rows, the dimension rows divided as core divides a partial path's
  * (the Gather may start more workers than the child planned, "Parallel");
- * every participant locates the fact filters and makes its own copy of them,
- * so the cost of those is charged in full to each, as a hash join below a
- * Gather charges its hash table - the elapsed cost of the parallel plan is
- * one participant's.
+ * every participant locates the fact filters, whose cost is charged in full
+ * to each, and they make ONE copy of them together, whose cost is divided
+ * among them as a Parallel Hash divides its build ("One copy per query") -
+ * the elapsed cost of the parallel plan is one participant's.
  *
  * Above a partial path goes a Gather; above that, or above the node itself,
  * core's Finalize Agg over the partial counts - or, for emitted rows, a Sort
@@ -6894,7 +6934,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 							   whereclauses, wherekinds, ors, childrows,
 							   childfound,
 							   jointype != LION_JOIN_INNER || emitrows,
-							   rowbytes, &collect, &walk);
+							   rowbytes, workers, &collect, &walk);
 
 	/*
 	 * Partial counts and nothing else - no dimension column to group by or
@@ -10214,6 +10254,13 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinfilterrows = -1;
 	st->joinshared = NULL;
 	st->joinreported = false;
+	st->joinsharedcopy = NULL;
+	st->joinpcxt = NULL;
+	st->joinviewshared = false;
+	st->joincopies = 0;
+	st->joincopychunks = 0;
+	st->joinworkercopies = 0;
+	st->joinworkercopychunks = 0;
 	memset(&st->joinworkerstats, 0, sizeof(st->joinworkerstats));
 	st->joinworkerlookups = 0;
 	st->joinworkermissing = 0;
@@ -13617,7 +13664,7 @@ lion_join_count_key(LionCountScanState *st)
  * of its sets merged at that key - which for an fk of a few rows per key over
  * a large heap is a descent per ROW of the fk set, per dimension row.  The
  * copy is the filters' intersection, made in one pass over their containers,
- * and a count seeks it with a binary search in memory.
+ * and a count looks it up in memory at its fk set's container keys.
  *
  * Its safety is lion_sources_collect()'s: the copy is only ever counted beside
  * the dimension row's fk set, which is located under its own pin and carries
@@ -13634,8 +13681,27 @@ lion_join_count_key(LionCountScanState *st)
  * a parameter the planner had estimated at ten values, a union of every one
  * of its sets built again for each row - hour-scale for a long list over many
  * dimension rows.  A spilled copy is read a container at a time, and a count
- * seeks it with a binary search over what memory keeps of it.
+ * seeks it by the keys memory keeps of it.
+ *
+ * In a parallel plan whose workers started, the copy is made ONCE, by all the
+ * participants together, in the Gather's dynamic shared memory
+ * (lion_shared_copy_collect(), DESIGN.md §27 "One copy per query"), and each
+ * reads it through a view of its own.  Its memory is a Parallel Hash's: a hash
+ * table's times the participants the plan was made for, and past that its
+ * chunks spill to files of the plan's file set.  A plan run without its
+ * workers makes a copy of its own, as a serial plan does.
  */
+static bool
+lion_join_shares_copy(LionCountScanState *st)
+{
+	if (st->joinsharedcopy == NULL ||
+		st->css.ss.ps.state->es_query_dsa == NULL)
+		return false;
+	if (IsParallelWorker())
+		return true;
+	return st->joinpcxt != NULL && st->joinpcxt->nworkers_launched > 0;
+}
+
 static void
 lion_join_collect(LionCountScanState *st)
 {
@@ -13679,16 +13745,39 @@ lion_join_collect(LionCountScanState *st)
 	/*
 	 * The budget is a hash join's (get_hash_memory_limit(): work_mem times
 	 * hash_mem_multiplier): the copy stands where the ordinary plan's hash
-	 * table would, and a participant of a parallel plan makes one of its own,
-	 * as each participant of a hash join below a Gather builds its own table.
+	 * table would - or, shared by a parallel plan's participants, where its
+	 * Parallel Hash's would, which is that times the participants.
 	 */
 	INSTR_TIME_SET_ZERO(t);
 	lion_join_clock(st, -1, &t);
 	memset(&cstats, 0, sizeof(cstats));
 	oldcxt = MemoryContextSwitchTo(st->outercxt);
-	ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
-							  &st->sources[1], get_hash_memory_limit(), true,
-							  &st->joinfilter, &spilled, &cstats);
+	if (lion_join_shares_copy(st))
+	{
+		int			chunks;
+		bool		built;
+
+		/*
+		 * The participant that indexed the copy counts it, and its spill,
+		 * once for all of them; each counts the chunks it collected.
+		 */
+		lion_shared_copy_collect(st->joinsharedcopy,
+								 estate->es_query_dsa, st->heap,
+								 estate->es_snapshot, st->nitem,
+								 &st->sources[1], &st->joinfilter, &chunks,
+								 &built, &spilled, &cstats);
+		st->joinviewshared = true;
+		st->joincopychunks += chunks;
+		if (built)
+			st->joincopies++;
+		else
+			spilled = false;
+		ok = true;
+	}
+	else
+		ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
+								  &st->sources[1], get_hash_memory_limit(),
+								  true, &st->joinfilter, &spilled, &cstats);
 	MemoryContextSwitchTo(oldcxt);
 	lion_join_clock(st, LION_JT_COLLECT, &t);
 
@@ -14739,6 +14828,7 @@ lion_reset_run(LionCountScanState *st)
 	lion_posting_set_release(&st->joinfilter);
 	st->joincollected = false;
 	st->joinfiltered = false;
+	st->joinviewshared = false;
 
 	/* ... and a forward semi join's sorted keys, sorted again next run. */
 	if (st->joinsort != NULL)
@@ -14827,17 +14917,20 @@ lion_rescan_custom_scan(CustomScanState *node)
 }
 
 /*
- * A parallel FK-side join (DESIGN.md §27, "Parallel") keeps one small struct
- * in the Gather's dynamic shared memory: what the participants add up for
- * EXPLAIN ANALYZE.  Nothing else is shared - each participant reads its share
- * of the dimension rows from the parallel-aware child, locates the fact
- * filters and makes its own copy of them - so a node that is not a join, or
- * a join run without a Gather, never gets here.
+ * A parallel FK-side join (DESIGN.md §27, "Parallel") keeps a small struct in
+ * the Gather's dynamic shared memory: what the participants add up for EXPLAIN
+ * ANALYZE, and the fact filters' copy, which they collect once for all of them
+ * when the plan collects the filters (DESIGN.md §27, "One copy per query"):
+ * the copy's own state follows the struct, and its containers are in the
+ * query's DSA or in files of its file set.  Each participant reads its share
+ * of the dimension rows from the parallel-aware child and locates the fact
+ * filters for itself.  A node that is not a join, or a join run without a
+ * Gather, never gets here.
  */
 static Size
 lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
-	return MAXALIGN(sizeof(LionJoinShared));
+	return MAXALIGN(sizeof(LionJoinShared)) + lion_shared_copy_size();
 }
 
 static void
@@ -14860,6 +14953,25 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 */
 	shared->participants = pcxt->nworkers + 1;
 	lion_list_pin_participants(shared->participants);
+
+	/*
+	 * The copy of the fact filters, when the plan collects them: its memory
+	 * is a Parallel Hash's, a hash table's for each participant the plan was
+	 * made for.  Not where the DSM could not be made (pcxt->seg is NULL, and
+	 * the plan runs in the leader alone, which then makes a copy of its own).
+	 * The leader keeps its parallel context, which says once the workers are
+	 * launched whether any of them started.
+	 */
+	st->joinpcxt = pcxt;
+	if (st->joincollect && pcxt->seg != NULL)
+	{
+		lion_shared_copy_init(LION_JOIN_SHARED_COPY(shared), pcxt->seg,
+							  shared->participants,
+							  get_hash_memory_limit() * (Size) shared->participants,
+							  RelationGetNumberOfBlocks(st->heap));
+		shared->copyready = true;
+		st->joinsharedcopy = LION_JOIN_SHARED_COPY(shared);
+	}
 }
 
 /*
@@ -14869,11 +14981,17 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
  * the first, since the rescan's keys are sorted again (and may be others).
  * No participant is running: the Gather has shut the workers down, and the
  * leader's own node claims nothing before the Gather launches them again.
+ *
+ * The fact filters' shared copy is emptied - its memory freed, its files
+ * deleted - and collected again by the next run, whose parameters may be
+ * others.  The leader's view of it goes first: the rescan of its own node,
+ * which would let it go too, may come after this (ExecReScanGather()).
  */
 static void
 lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 					  void *coordinate)
 {
+	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinShared *shared = (LionJoinShared *) coordinate;
 
 	pg_atomic_write_u32(&shared->nextchunk, 0);
@@ -14881,6 +14999,20 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	shared->sortedruns += shared->sorted;
 	shared->sorted = 0;
 	SpinLockRelease(&shared->mutex);
+
+	if (st->joinsharedcopy != NULL)
+	{
+		if (st->joinviewshared)
+		{
+			lion_posting_set_release(&st->joinfilter);
+			st->joinviewshared = false;
+			st->joinfiltered = false;
+			st->joincollected = false;
+		}
+		lion_shared_copy_reinit(st->joinsharedcopy,
+								node->ss.ps.state->es_query_dsa,
+								RelationGetNumberOfBlocks(st->heap));
+	}
 }
 
 static void
@@ -14890,6 +15022,13 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 
 	st->joinshared = (LionJoinShared *) coordinate;
 	lion_list_pin_participants(st->joinshared->participants);
+
+	/* the fact filters' copy, and the file set its chunks may spill to */
+	if (st->joinshared->copyready)
+	{
+		st->joinsharedcopy = LION_JOIN_SHARED_COPY(st->joinshared);
+		lion_shared_copy_attach(st->joinsharedcopy);
+	}
 }
 
 /*
@@ -14901,6 +15040,10 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
  * (gather_readnext() shuts them down), and every shape above this node reads
  * all of it.  A Gather stopped early would leave some worker's counters out
  * of EXPLAIN, and nothing else.
+ *
+ * A participant's view of the shared copy of the fact filters goes here as
+ * well: the Gather's shutdown, which comes next, detaches the memory it
+ * points into and deletes the files it has open.
  */
 static void
 lion_shutdown_custom_scan(CustomScanState *node)
@@ -14911,6 +15054,12 @@ lion_shutdown_custom_scan(CustomScanState *node)
 
 	if (shared == NULL)
 		return;
+
+	if (st->joinviewshared)
+	{
+		lion_posting_set_release(&st->joinfilter);
+		st->joinviewshared = false;
+	}
 
 	if (IsParallelWorker())
 	{
@@ -14927,6 +15076,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->batches += st->joinbatches;
 		shared->childrows += st->joinchildrows;
 		shared->posting += st->joinposting;
+		shared->copies += st->joincopies;
+		shared->copychunks += st->joincopychunks;
 		for (i = 0; i < LION_JT_N; i++)
 			INSTR_TIME_ADD(shared->time[i], st->jointime[i]);
 		SpinLockRelease(&shared->mutex);
@@ -14945,6 +15096,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkerbatches = shared->batches;
 	st->joinworkerchildrows = shared->childrows;
 	st->joinworkerposting = shared->posting;
+	st->joinworkercopies = shared->copies;
+	st->joinworkercopychunks = shared->copychunks;
 	for (i = 0; i < LION_JT_N; i++)
 		st->joinworkertime[i] = shared->time[i];
 	SpinLockRelease(&shared->mutex);
@@ -15625,9 +15778,10 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 			/*
 			 * The rows of the collected fact filters, or -1 when the plan
-			 * collected them and the run could not (a copy over the memory
-			 * limit, a standby) and every count read the filters instead - in
-			 * a parallel plan, the largest copy any participant made.
+			 * collected them and the run could not (a standby) and every
+			 * count read the filters instead - in a parallel plan, the
+			 * largest copy any participant made, which is the one they all
+			 * read when they share it.
 			 */
 			if (st->joincollect)
 				ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
@@ -15636,13 +15790,29 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 			/*
 			 * Copies past a hash join's memory, which went to a temporary
-			 * file instead: one per participant and run.  Only when there
-			 * were any.
+			 * file instead: one per participant and run - or one a run, a
+			 * copy shared by the participants (any of whose chunks went to
+			 * a file).  Only when there were any.
 			 */
 			if (st->joinspilled + st->joinworkerspilled > 0)
 				ExplainPropertyInteger("Fact Filter Copies Spilled", NULL,
 									   st->joinspilled + st->joinworkerspilled,
 									   es);
+
+			/*
+			 * The copies collected once for all the participants of a
+			 * parallel plan - one a run - and the chunks the participants
+			 * collected of them, summed.  Only when there were any.
+			 */
+			if (st->joincopies + st->joinworkercopies > 0)
+			{
+				ExplainPropertyInteger("Fact Filter Copies Shared", NULL,
+									   st->joincopies + st->joinworkercopies,
+									   es);
+				ExplainPropertyInteger("Fact Filter Copy Chunks", NULL,
+									   st->joincopychunks +
+									   st->joinworkercopychunks, es);
+			}
 
 			/*
 			 * What the counts read of the copy: its containers, the binary
