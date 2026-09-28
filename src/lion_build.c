@@ -107,6 +107,15 @@
  * the real page's image overwrites them), and the fork is fsynced at the end
  * unless the relation is temporary, because none of these writes went through
  * shared buffers and a checkpoint during the build cannot know about them.
+ *
+ * The writer keeps the Relation, not its SMgrRelation, and asks
+ * RelationGetSmgr() for the handle at every write, as 16's nbtsort.c does:
+ * the handle does not survive a relcache flush, and an sinval reset during
+ * the write phase - which any lock taken meanwhile can bring, a spilling
+ * tuplesort's PrepareTempTablespaces() for one - closes every handle there is
+ * (RelationCacheInvalidate() calls smgrcloseall()).  From 17 on a handle
+ * stays valid to the end of the transaction, which is what lets 17's own bulk
+ * writer keep one.
  */
 #define LION_BULK_PENDING	64
 
@@ -119,7 +128,7 @@ typedef struct LionPendingWrite
 
 struct BulkWriteState
 {
-	SMgrRelation smgr;
+	Relation	rel;			/* RelationGetSmgr() at every use: see above */
 	ForkNumber	forknum;
 	RelFileLocator locator;
 	bool		use_wal;
@@ -144,12 +153,12 @@ smgr_bulk_start_rel(Relation rel, ForkNumber forknum)
 {
 	BulkWriteState *bw = palloc0(sizeof(BulkWriteState));
 
-	bw->smgr = RelationGetSmgr(rel);
+	bw->rel = rel;
 	bw->forknum = forknum;
 	bw->locator = rel->rd_locator;
 	bw->use_wal = RelationNeedsWAL(rel) || forknum == INIT_FORKNUM;
 	bw->need_sync = !RelationUsesLocalBuffers(rel);
-	bw->pages_written = smgrnblocks(bw->smgr, forknum);
+	bw->pages_written = smgrnblocks(RelationGetSmgr(rel), forknum);
 	bw->memcxt = CurrentMemoryContext;
 
 	return bw;
@@ -199,19 +208,21 @@ lion_bulk_flush(BulkWriteState *bw)
 				bw->zeropage = MemoryContextAllocAligned(bw->memcxt, BLCKSZ,
 														 PG_IO_ALIGN_SIZE,
 														 MCXT_ALLOC_ZERO);
-			smgrextend(bw->smgr, bw->forknum, bw->pages_written++,
-					   bw->zeropage->data, true);
+			smgrextend(RelationGetSmgr(bw->rel), bw->forknum,
+					   bw->pages_written++, bw->zeropage->data, true);
 		}
 
 		PageSetChecksumInplace(page, blkno);
 
 		if (blkno == bw->pages_written)
 		{
-			smgrextend(bw->smgr, bw->forknum, blkno, page, true);
+			smgrextend(RelationGetSmgr(bw->rel), bw->forknum, blkno, page,
+					   true);
 			bw->pages_written++;
 		}
 		else
-			smgrwrite(bw->smgr, bw->forknum, blkno, page, true);
+			smgrwrite(RelationGetSmgr(bw->rel), bw->forknum, blkno, page,
+					  true);
 
 		pfree(page);
 	}
@@ -238,7 +249,7 @@ smgr_bulk_finish(BulkWriteState *bw)
 {
 	lion_bulk_flush(bw);
 	if (bw->need_sync)
-		smgrimmedsync(bw->smgr, bw->forknum);
+		smgrimmedsync(RelationGetSmgr(bw->rel), bw->forknum);
 	if (bw->zeropage != NULL)
 		pfree(bw->zeropage);
 	pfree(bw);
