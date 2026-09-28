@@ -154,6 +154,13 @@ fetches heap tuples and does not have the same count shortcut. Normal SQL is suf
 `lion_index_count()` calls are optional. Use `lion_index_stats('events_country_lion')` to inspect
 storage and `lion_index_verify('events_country_lion', heapallindexed => true)` for verification.
 
+A `GROUP BY` with several filters (`SELECT country, count(*) FROM events WHERE event_type =
+'purchase' AND ... GROUP BY country`) collects the rows the filters select once per table, or per
+partition, and counts each group against that one set, so the filters' index pages are read once
+rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when it did (DESIGN.md
+§10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
+to a temporary file past it.
+
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
 side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for

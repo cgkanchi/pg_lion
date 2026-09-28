@@ -572,6 +572,16 @@ extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 LionCountStats *stats);
 
 /*
+ * Does a count that reads ps again and again walk its pages every time?  A
+ * CHAIN set that lion_count_sources_cached() keeps no private copy of - one
+ * that is hopeless even as an ARRAY of members, or whose copy was tried and
+ * did not fit (DESIGN.md §15, "Bounded cursors").  What the count pushdown
+ * asks of a GROUP BY's lone WHERE set before it collects it (DESIGN.md §10,
+ * "The WHERE sets, collected once").
+ */
+extern bool lion_posting_set_rewalked(const LionPostingSet *ps);
+
+/*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
  * private, pinless posting set: their union, collected in memory.  Like a

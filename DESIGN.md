@@ -1808,6 +1808,103 @@ and number their heap columns differently again, a dirty heap and a clean one - 
 same query with the pushdown off, as a multiset both ways round - and it pins the plan CHOICE
 against a twin table carrying one single-column index per column.
 
+### The WHERE sets, collected once (2026-09-28)
+
+A GROUP BY is one count per entry of its column - per PAIR of entries with two columns (§20) - and
+each count is the group's own set ANDed with the WHERE items. So every count intersected the WHERE
+again: it probed each item at the group's container keys, built the union of an IN list, an OR
+(§19) or a multi-key query (§17) again from its sets, and read the pages of every set it keeps no
+private copy of. §9's materialization copies a WHERE set on its second use, but only a CHAIN set
+small enough (`LION_MATERIALIZE_MAX_CONTAINERS` or `_BYTES`), only while the copies of one count
+stay within work_mem (§15, "Bounded cursors"), and never a leaf of an OR, whose interlock is that
+every leaf holds a pin. A benchmark measured the rest: over a large table with several filters, the
+buffers a GROUP BY read grew with its groups - about the buffers of the same count without the
+GROUP BY, once per group.
+
+Now the WHERE items are COLLECTED once per relation into one private posting set - their
+intersection, less what the negated ones subtract, made by `lion_sources_collect()` exactly as the
+FK-side join's fact filters are (§27) - and every count after that is the group's set ANDed with
+that one set (`lion_group_count()`, lion_customscan.c). Three drivers take it: the entry walk
+(`lion_next_group()`), an IN list that drives its own groups (`lion_next_group_inlist()`, §15, whose
+list is no item of the WHERE), and the pairs of two columns (`lion_next_group2()`, §20).
+
+- **What is collected.** Every WHERE item of the relation except a range taken as a source that was
+  too large to collect (§32): each count still walks that one beside the collected set, which is
+  how the planner priced it. A negated item with nothing to subtract (`IS NOT NULL` over a column
+  with no NULLs, a multi-key query no key narrows) is no item, and a WHERE with no positive item has
+  nothing to intersect and is never collected.
+- **Memory.** What the ranges taken as sources have left of a hash table's memory
+  (`get_hash_memory_limit()`), and past that the set SPILLS to a temporary file (`LionSpill`, §27):
+  sixteen bytes a container key in memory, a container read back at a time. It lives in the WHERE
+  sets' context and goes with them - at the end of the relation (of each partition's turn, §16), on
+  a rescan, which collects again with the new parameters, and when the node is done. Nothing
+  collects on a hot standby, where whether a count may trust the map depends on the WAL mode of
+  every index it reads (§25) and a collected set carries the TIDs of all of them under one index's
+  name; the counts read the items there, as before.
+- **When.** Collecting reads the items once, a merge over all of their containers. A count reads
+  them again at the container keys of its own set. Neither is known in advance - the walk only finds
+  out how many groups there are, and how many rows each has, as it goes - so the node decides as it
+  goes: the counts read the items until what they have read of them, WITH what the next count would
+  read, reaches what the collection reads, and the items are collected before that count. Both are
+  counted in container keys: a set's reach is its rows, up to the relation's container keys; the
+  collection reads the reach of its smallest positive item (the one that drives its merge), and a
+  count the reach of its own smallest set, but no more than the collection would. Collecting at
+  that point costs at most what the counts so far and the next one would have read, so never more
+  than twice the better of never collecting and collecting before the first group. A count is
+  preceded by a collection only when another count of the relation is sure to follow - another
+  entry in hand, another listed value, another inner key - so a GROUP BY with ONE group is the count
+  it always was. Over groups that span the heap the first count already reaches it, and the WHERE is
+  read once, before the first group - or, when the walk's first leaf hands out one entry, after
+  that entry's count; a handful of one-row groups (a range over a unique column, §28) never do. And a
+  WHERE that is one set a count keeps a copy of anyway - an INLINE set, a CHAIN set the count
+  materializes, a collected range - is never collected; one it does not keep
+  (`lion_posting_set_rewalked()`) is.
+- **Why the counts stay exact (§9).** The collected set is a copy, pinless and possibly stale by the
+  time it is counted, and it is safe on `lion_posting_set_materialize()`'s terms: it is only ever
+  counted ANDed with the group's own set, which each count locates afresh under a pin of its own - the
+  walk's entry, the listed value located again (§15, "Paused and finished counts"), the inner set of
+  a pair. A dead TID the copy still lists is either gone from the group's container, and out of the
+  intersection, or in it, which means the group's page was read before VACUUM's ambulkdelete got past
+  it: VACUUM has not finished ambulkdelete on that index, so it has not set the TID's heap page
+  all-visible, and the TID goes to the recheck, where the snapshot decides. The copy cannot lack a
+  row the snapshot sees: it is made after the snapshot was taken, and a visible row was in every
+  index before its transaction committed. What a negated item's stale copy subtracts beyond the
+  truth is dead rows and rows inserted after the snapshot, the argument that lets a negated set
+  always be copied. A count with no pinned positive source trusts no map (`cx.novm`), as any count
+  does; none of the three drivers leaves one without, because the group's set always holds its pin.
+  A multi-key query's row filter (§17, "A query known only at run time") is not applied to the copy
+  but to every count of it, which sends each candidate to the heap as before.
+- **Pauses.** The copy holds no pin, so it is kept across rows (§15, "Paused and finished counts")
+  like the WHERE sets' own copies, and collecting needs no pin either: a count after a pause
+  collects the NOPIN copies as it would the pinned sets.
+- **Not taken.** A count(DISTINCT) walk (§26): its tests stop at the first visible row and read a
+  share of each intersection, so a collection of all of it could read more than every test together.
+  The sums of §14 and §28, which make many counts for one row, re-read their WHERE sets the same way
+  and are left for later. The FK-side join has had its own copy since §27.
+
+**The cost model is unchanged, and so is every plan.** It priced a grouped count's WHERE sets as
+read once and probed in memory (the comment in `lion_cost_count_rel()`: "the sets a GROUP BY
+intersects with every group are copied out on their second use"), which was true only of the sets
+small enough to copy; the collection makes it true of the rest. What it now overstates is per count:
+every item probed where one collected set is, and each union's sets set up again
+(`LION_UNION_SET_COST`). A later calibration can price the collection itself, as
+`lion_cost_fkjoin_rel()` prices the fact filters' copy; until then a grouped count is priced as it
+was, which errs high where the WHERE is collected. A range too large to collect is still priced as
+walked by every count, which it still is.
+
+EXPLAIN ANALYZE prints `WHERE Sets Collected` - the relations whose WHERE was collected, one per
+partition, summed over rescans - and `WHERE Sets Spilled`, each only when there were any.
+`test/sql/groupwhere.sql` checks every shape against a sequential scan with the pushdown off - plain
+filters and a NULL group, `IS NULL` and `IS NOT NULL` beside them, IN lists on the group column and
+on another, ORs, multi-key queries, a range as a source, two GROUP BY columns, a partitioned table, a
+generic plan, a LATERAL rescan, a cursor paused between groups (which pins no page of the indexes
+while it waits), a dirty heap and a collection that spills - and says which of them collected: none
+of a GROUP BY with one group, without a WHERE, over one set, over only `IS NOT NULL`, over a
+collected range alone, of a count(DISTINCT), or of a handful of one-row groups. And it compares the
+shared buffers a grouped count over an OR of two CHAIN sets reads with the same count ungrouped:
+beyond the walk of the groups, at most three times the ungrouped count's, where each group used to
+read the OR's sets again.
+
 ### The units (2026-09-27, release build)
 
 Every lion constant used to be fitted on the assert-enabled development build (-O1, cassert),
@@ -2937,7 +3034,9 @@ is a dead row's, and one added since is a row the snapshot cannot see (§29.5 ca
 
 The cost is a loop over the located sets per row, with nothing left to unpin after the first, and
 one lookup per group of a list-driven GROUP BY. Between two rows the node holds private memory
-only: the located sets' copies, the walk's batch of CHAIN copies, §20's inner keys.
+only: the located sets' copies, the walk's batch of CHAIN copies, §20's inner keys - and, once a
+GROUP BY has collected its WHERE (§10, "The WHERE sets, collected once"), that one set, which never
+held a pin and is counted beside each group's set under the group's own pin, as a NOPIN copy is.
 `test/sql/countpause.sql` checks with pg_buffercache that each shape, paused in a cursor, pins no
 page of any lion index and that a finished one pins none either, and that the rows after the pause
 are the ordinary plan's; `test/sql/pinbudget.sql`'s GROUP BY under a long list, which held a pin
