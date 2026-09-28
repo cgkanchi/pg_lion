@@ -2412,6 +2412,99 @@ container_emit_result(LionContainer *o, LionContainer *dest)
 	return o->cardinality;
 }
 
+/*
+ * The AND of an ARRAY of a few members with anything, member by member.
+ *
+ * The count engine's commonest AND is a key's container of one or two rows
+ * against a filter's container of dozens or thousands (an FK-side join's key
+ * against the collected copy of its fact filters, DESIGN.md §27, "The copy,
+ * looked up by key"): the general path merged or galloped through the other
+ * operand and then built its result in a work buffer, optimized it and copied
+ * it out, for a result that is almost always empty.  Here each member is
+ * looked up in the other operand - a bit, a binary search of its members or
+ * of its runs - and the result is written straight into dest.
+ *
+ * LION_AND_PROBE_MAX members at most, because a result of that many or fewer
+ * is an ARRAY in lion_container_optimize()'s choice (three members in one
+ * run take fourteen bytes either way, and a tie goes to the ARRAY): the
+ * result is the one the general path makes, byte for byte.  A member is
+ * compared as the merges compare it, unmasked (bits_test() masks it itself),
+ * and written masked (array_out()); a damaged operand's member that is not
+ * above the last one written is passed over, so that what comes out is a
+ * well-formed ARRAY whatever went in.
+ */
+#define LION_AND_PROBE_MAX	3
+
+/* Is v, an ARRAY operand's member, in c - as the merges would find it? */
+static inline bool
+container_has_member(const LionContainer *c, uint16 v)
+{
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			{
+				const uint16 *base = array_cdata(c);
+				uint32		n = array_card(c);
+
+				if (n == 0)
+					return false;
+
+				/*
+				 * The last member at or below v, if there is one, is in
+				 * base[0 .. n - 1] - with no branch to mispredict.
+				 */
+				while (n > 1)
+				{
+					uint32		half = n / 2;
+
+					base = (base[half] <= v) ? base + half : base;
+					n -= half;
+				}
+				return *base == v;
+			}
+		case LION_CT_BITSET:
+			return bits_test(bitset_cdata(c), v);
+		default:
+			{
+				const LionRun *runs = run_cdata(c);
+				int32		idx = run_locate(runs, run_nruns(c), v);
+
+				return idx >= 0 && (int32) v <= run_end(&runs[idx]);
+			}
+	}
+}
+
+static uint32
+container_and_probe(const LionContainer *small, const LionContainer *other,
+					uint32 ckey, LionContainer *dest)
+{
+	const uint16 *arr = array_cdata(small);
+	uint32		na = array_card(small);
+	uint16		out[LION_AND_PROBE_MAX];
+	uint32		n = 0;
+	uint32		i;
+
+	Assert(na <= LION_AND_PROBE_MAX);
+	for (i = 0; i < na; i++)
+	{
+		uint16		v = arr[i];
+
+		if (n > 0 && array_out(v) <= out[n - 1])
+			continue;			/* damaged: out of order, or repeated */
+		if (container_has_member(other, v))
+			out[n++] = array_out(v);
+	}
+
+	/* dest may be either operand: it is written only now */
+	dest->ckey = ckey;
+	dest->cardinality = (uint16) n;
+	dest->type = LION_CT_ARRAY;
+	dest->flags = 0;
+	if (n > 0)
+		memcpy(array_mdata(dest), out, (size_t) n * sizeof(uint16));
+	return n;
+}
+
 uint32
 lion_container_and(const LionContainer *a, const LionContainer *b,
 				  LionContainer *dest)
@@ -2420,6 +2513,15 @@ lion_container_and(const LionContainer *a, const LionContainer *b,
 	LionContainer *o = &buf.hdr;
 
 	Assert(a->ckey == b->ckey);
+
+	if (a->cardinality != 0 && b->cardinality != 0)
+	{
+		if (a->type == LION_CT_ARRAY && array_card(a) <= LION_AND_PROBE_MAX)
+			return container_and_probe(a, b, a->ckey, dest);
+		if (b->type == LION_CT_ARRAY && array_card(b) <= LION_AND_PROBE_MAX)
+			return container_and_probe(b, a, a->ckey, dest);
+	}
+
 	lion_container_init(o, a->ckey);
 
 	if (a->cardinality == 0 || b->cardinality == 0)

@@ -2,8 +2,9 @@
 -- over a partial path of the dimension, below a Gather.
 --
 -- Each participant counts the dimension rows its share of the child returns,
--- with its own copy of the fact filters; the leader's Finalize Agg adds the
--- partial counts up, or core's Agg aggregates the rows of a count(DISTINCT).
+-- against the one copy of the fact filters all of them collect together
+-- ("One copy per query"); the leader's Finalize Agg adds the partial counts
+-- up, or core's Agg aggregates the rows of a count(DISTINCT).
 -- Every answer is checked against the same query run serially through the
 -- pushdown, and with the pushdown off.
 \set VERBOSITY terse
@@ -264,6 +265,10 @@ RESET enable_mergejoin;
 SELECT lion_pj('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g');
 SELECT lion_pj('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(DISTINCT d.attr) AS c FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.t = ''t4'')) s ON s.c > g');
 SELECT lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g', 'Join Keys Looked Up');
+-- each run collects the fact filters once, all its workers together: the
+-- Gather's DSM is made again for a rescan, and the last run's copy freed first
+SELECT lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g', 'Fact Filter Copies Shared') AS shared_copies,
+	   lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g', 'Fact Filter Copy Chunks') AS chunks;
 RESET enable_material;
 RESET enable_memoize;
 RESET enable_indexscan;
@@ -293,12 +298,13 @@ DEALLOCATE lion_pj_p;
 DEALLOCATE lion_pj_q;
 RESET plan_cache_mode;
 
--- ---- 6. each participant's copy of the fact filters, and its budget -----------
+-- ---- 6. the copy of the fact filters, shared, and its budget -----------------
 -- Half of 250000 narrow rows is a bitset in each of 22 containers, some 90 kB:
--- more than a hash join's memory at 64 kB, so every participant that makes
--- one goes on in a temporary file, as a hash join's batches would, and reads
--- it back at every count - with the same answer.  (Each used to give up and
--- read the filters per count.)
+-- more than a hash join's memory at 64 kB, which a copy of one process's own
+-- would spill past - but the participants collect ONE copy, whose memory is a
+-- Parallel Hash's: 64 kB for each of the three the plan was made for, the
+-- leader included.  So it is collected once, in one chunk (a heap this small
+-- is not divided), and kept in shared memory, with the same answer.
 CREATE TABLE lion_pfw (fk int8, x int NOT NULL);
 INSERT INTO lion_pfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10
 FROM generate_series(1, 250000) i;
@@ -316,9 +322,20 @@ SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT count(*) FILTER (WHERE p ~ 'Fact Filters: collected once') AS planned_to_collect,
 	   count(*) FILTER (WHERE p ~ 'Fact Filter Rows Collected: -1') AS could_not,
-	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Spilled: [1-9]') AS spilled
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Spilled: [1-9]') AS spilled,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Shared: 1$') AS shared_once,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copy Chunks: 1$') AS one_chunk
 FROM (SELECT * FROM lion_pj_analyze('EXECUTE lion_pj_big')) AS e(p);
 EXECUTE lion_pj_big;
+-- ... and when no worker starts, the leader runs the plan alone with a copy
+-- of its own, a hash join's memory, as a serial plan does: it spills
+SET max_parallel_workers = 0;
+SELECT count(*) FILTER (WHERE p ~ 'Workers Launched: 0') AS no_workers,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Spilled: 1$') AS spilled,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Shared') AS shared
+FROM (SELECT * FROM lion_pj_analyze('EXECUTE lion_pj_big')) AS e(p);
+EXECUTE lion_pj_big;
+RESET max_parallel_workers;
 RESET work_mem;
 RESET hash_mem_multiplier;
 RESET enable_hashjoin;
@@ -330,6 +347,53 @@ RESET pg_lion.enable_count_pushdown;
 DEALLOCATE lion_pj_big;
 RESET plan_cache_mode;
 DROP TABLE lion_pfw;
+
+-- A copy past that memory: alternate rows of 700000 narrow ones, a bitset in
+-- each of some sixty container keys, about 240 kB.  The heap is cut into
+-- three chunks, the participants collect them, and those that do not fit
+-- what the copy has left of its 192 kB go to files of the plan's file set,
+-- which every participant reads back, a container at a time, beside the
+-- chunks in shared memory.  Spilled once, for the query, and the same
+-- answers as the pushdown off, grouped and not.  (The counters are the
+-- grouped count's, which reads every container of each key; the semi join's
+-- tests stop at the first that shows a row.)
+CREATE TABLE lion_pfs (fk int8, x int NOT NULL);
+INSERT INTO lion_pfs SELECT abs(hashint4(i)) % 360 + 1, i % 10
+FROM generate_series(1, 700000) i;
+CREATE INDEX lion_pfs_fk ON lion_pfs USING lion (fk);
+CREATE INDEX lion_pfs_x ON lion_pfs USING lion (x);
+VACUUM (FREEZE, ANALYZE) lion_pfs;
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE lion_pj_spill AS SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pfs f WHERE f.fk = d.pk AND f.x IN (0, 2, 4, 6, 8));
+PREPARE lion_pj_spillg AS SELECT d.grp, count(*) FROM lion_pfs f JOIN lion_pd d ON d.pk = f.fk WHERE f.x IN (0, 2, 4, 6, 8) GROUP BY d.grp ORDER BY d.grp;
+EXPLAIN (COSTS OFF) EXECUTE lion_pj_spill;
+EXECUTE lion_pj_spill;
+EXECUTE lion_pj_spillg;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT count(*) FILTER (WHERE p ~ 'Fact Filter Copies Spilled: 1$') AS spilled_once,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Shared: 1$') AS shared_once,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copy Chunks: 3$') AS three_chunks,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copy File Reads: [1-9]') AS read_back
+FROM (SELECT * FROM lion_pj_analyze('EXECUTE lion_pj_spillg')) AS e(p);
+EXECUTE lion_pj_spill;
+EXECUTE lion_pj_spillg;
+RESET work_mem;
+RESET hash_mem_multiplier;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pfs f WHERE f.fk = d.pk AND f.x IN (0, 2, 4, 6, 8));
+SELECT d.grp, count(*) FROM lion_pfs f JOIN lion_pd d ON d.pk = f.fk WHERE f.x IN (0, 2, 4, 6, 8) GROUP BY d.grp ORDER BY d.grp;
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_pj_spill;
+DEALLOCATE lion_pj_spillg;
+RESET plan_cache_mode;
+DROP TABLE lion_pfs;
 
 -- ---- 7. a dirty heap: deletes and updates on both sides, not yet vacuumed -----
 DELETE FROM lion_pf WHERE fk = 7;
