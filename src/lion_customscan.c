@@ -1198,6 +1198,27 @@ typedef struct LionCountScanState
 	int64		wherespilled;
 
 	/*
+	 * The groups of the entry walk, counted together once the WHERE is
+	 * collected (DESIGN.md §10, "The groups of a walk, counted together";
+	 * lion_count_groups_copy()): a batch of up to gbmax entries is taken
+	 * from the walk, counted in one walk of container keys, and its rows are
+	 * emitted in the walk's order, one a call.  gbatchcxt holds the batch -
+	 * its located sets while they are counted, its keys and counts until the
+	 * last row is emitted.  groupbatches and groupsbatched are what EXPLAIN
+	 * ANALYZE reports.
+	 */
+	MemoryContext gbatchcxt;
+	LionPostingSet *gbsets;
+	Datum	   *gbkey;
+	bool	   *gbnull;
+	int64	   *gbcount;
+	int			gbmax;
+	int			gbn;
+	int			gbpos;
+	int64		groupbatches;
+	int64		groupsbatched;
+
+	/*
 	 * An IN list too long to locate at once (DESIGN.md §15, "A list too long
 	 * to locate at once"): the WHERE item it is, -1 for none, and its non-NULL
 	 * values - of type batchtype - sorted into the order a lookup takes them
@@ -4180,6 +4201,27 @@ lion_range_recheck(PlannerInfo *root, RelOptInfo *rel, double tids,
 		tids * LION_RECHECK_TID_COST;
 }
 
+/*
+ * Will a GROUP BY's WHERE be collected into one set (DESIGN.md §10, "The
+ * WHERE sets, collected once")?  lion_where_describe()'s rule, from the
+ * planner's sources: two or more, or one that is a union; a lone set only
+ * where no count would keep a copy of it, being too large to materialize
+ * (lion_posting_set_rewalked()).  Over groups that span the heap the
+ * executor collects before the first group; over groups of a few rows, once
+ * they have read as much as collecting reads, which prices about the same.
+ */
+static bool
+lion_cost_where_collected(int nsrc, const double *members,
+						  const double *containers, const bool *isunion)
+{
+	if (nsrc <= 0)
+		return false;
+	if (nsrc > 1 || isunion[0])
+		return true;
+	return containers[0] > (double) LION_MATERIALIZE_MAX_CONTAINERS &&
+		members[0] > (double) (LION_MATERIALIZE_MAX_BYTES / sizeof(uint16));
+}
+
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   IndexOptInfo *groupidx, AttrNumber groupcol,
@@ -4234,6 +4276,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	int		   *rangelead;		/* each clause's range source, or -1 */
 	double		listrows = 0;	/* rows of one entry of a group-driving list */
 	double		walked = 1.0;	/* counts the merge runs: groups, pairs */
+	bool		whereonce = false;	/* the WHERE is collected once and the
+									 * groups counted in batches (§10) */
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
@@ -4654,10 +4698,61 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				share = lion_exists_fraction(drvkeys, matching / walked);
 				recheckshare = share;
 			}
-			per = lion_merge_cpu_cost(nsrc + 1, mem, keys, inmem, tuples,
-									  1.0, srcprobes) +
-				unionsets * LION_UNION_SET_COST;
-			merge_cpu = walked * per * share;
+			if (distinct == LION_DISTINCT_NONE && !groupdrive &&
+				walked >= 2.0 &&
+				lion_cost_where_collected(nsrc, srcmembers, srccontainers,
+										  srcunion))
+			{
+				/*
+				 * THE GROUPS OF THE WALK, COUNTED TOGETHER (DESIGN.md §10).
+				 * The WHERE is collected once - a merge of its sources as an
+				 * ungrouped count makes it, and a container of the copy
+				 * written at each key it keeps - and the groups are counted
+				 * against the copy in batches of LION_GROUP_BATCH_MAX, one
+				 * walk of container keys a batch (lion_count_groups_copy()):
+				 * each group's container at a key the copy has is read and
+				 * its members tested against the copy's, made a bitset image
+				 * once a batch, and a batch's cursors stand on a heap, a sift
+				 * of log2(batch) a container.  A group is walked only as far
+				 * as the copy's keys reach, which is all of them where the
+				 * WHERE is dense.  The unions of the WHERE are built once, in
+				 * the collection.  Priced as each group's merge with the
+				 * WHERE's sets probed in memory, the synthetic repro's GROUP BY
+				 * of 150 groups under four filters cost 217,000 for 68 ms; it
+				 * now costs about the 500 units a millisecond of §10's
+				 * reference.
+				 */
+				double		wkeys = lion_containers_for(heap_pages, matching);
+				double		batch = Min(walked, (double) LION_GROUP_BATCH_MAX);
+				double		visits;
+				double		collect;
+
+				for (s = 0; s < nsrc; s++)
+					wkeys = Min(wkeys, keys[s]);
+				wkeys = Max(wkeys, 1.0);
+				visits = Min(keys[nsrc], wkeys);
+
+				collect = lion_merge_cpu_cost(nsrc, mem, keys, NULL, tuples,
+											  lion_probe_rel_factor(root, rel),
+											  srcprobes) +
+					wkeys * LION_FKJOIN_COPY_CONTAINER_COST;
+				per = visits * (LION_CONTAINER_COST +
+								LION_MEMBER_COST *
+								Min(gm / Max(keys[nsrc], 1.0), LION_MEMBER_CAP) +
+								log2(Max(batch, 2.0)) * cpu_operator_cost);
+				merge_cpu = collect + walked * per +
+					ceil(walked / batch) * wkeys *
+					(LION_CONTAINER_COST + LION_MEMBER_COST *
+					 Min(matching / wkeys, LION_MEMBER_CAP));
+				whereonce = true;
+			}
+			else
+			{
+				per = lion_merge_cpu_cost(nsrc + 1, mem, keys, inmem, tuples,
+										  1.0, srcprobes) +
+					unionsets * LION_UNION_SET_COST;
+				merge_cpu = walked * per * share;
+			}
 
 			/*
 			 * ... and each count's own set-up and tear-down (a memory context,
@@ -4720,7 +4815,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		probe_cost += lion_cost_set_pages(root, rel, &clauseset[i], walk,
 										  walk ? 0.0 :
-										  srcprobes[clausesrc[i]] * walked,
+										  srcprobes[clausesrc[i]] *
+										  (whereonce ? 1.0 : walked),
 										  &seq_pages, &probed_pages);
 	}
 	random_pages = lion_cost_leaf_pages(nclause, clauseindex, clauseset);
@@ -10923,6 +11019,12 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	memset(&st->wherecoll, 0, sizeof(st->wherecoll));
 	st->wherecoll.pinbuf = InvalidBuffer;
 	st->ingroupleft = 0;
+	st->gbatchcxt = NULL;		/* made by the first batch */
+	st->gbmax = 0;
+	st->gbn = 0;
+	st->gbpos = 0;
+	st->groupbatches = 0;
+	st->groupsbatched = 0;
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
@@ -12359,6 +12461,12 @@ lion_release_where(LionCountScanState *st)
 	st->wcounts = 0;
 	st->wckeys = 0;
 
+	/* ... and a batch of groups counted against it, whose sets are gone */
+	st->gbn = 0;
+	st->gbpos = 0;
+	if (st->gbatchcxt != NULL)
+		MemoryContextReset(st->gbatchcxt);
+
 	/* ... and so do the values of a list counted in batches */
 	st->batchitem = -1;
 	st->batchval = NULL;
@@ -13644,6 +13752,88 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 }
 
 /*
+ * May the rest of the entry walk be counted a batch of groups at a time
+ * (lion_count_groups_copy(); DESIGN.md §10, "The groups of a walk, counted
+ * together")?  Once the WHERE is collected, when every count is that one set
+ * ANDed with the group's own: no range still to walk beside it
+ * (LionCountSource.rangewalk), no second group column, and every entry its
+ * own row - GROUP BY coalesce(g, c) adds two entries into one, and keeps the
+ * walk one entry at a time.
+ */
+static bool
+lion_group_batch_ok(LionCountScanState *st)
+{
+	int			k;
+
+	if (!st->wcollected || st->hascoal || st->nsource != st->nitem + 1)
+		return false;
+	for (k = 1; k <= st->nitem; k++)
+	{
+		if (st->sources[k].rangewalk != NULL)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Take the next batch of entries from the walk, count them together against
+ * the collected WHERE, and keep their keys and counts for the rows that
+ * follow; the sets are released before this returns.  False when the walk
+ * has no entry left.
+ *
+ * The sets come from the walk as its one-at-a-time counts took them: an
+ * INLINE one keeps the pin of the leaf it was copied from, a CHAIN one is
+ * pinned by the cursor that reads it, and each group's count rests on those
+ * pins as its own count did (lion_group_count()'s argument).  Nothing is
+ * pinned between the rows of a batch.
+ */
+static bool
+lion_group_batch_fill(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext oldcxt;
+	int			n = 0;
+	int			i;
+
+	if (st->gbatchcxt == NULL)
+		st->gbatchcxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "LionCount group batch",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(st->gbatchcxt);
+	st->gbn = 0;
+	st->gbpos = 0;
+	if (st->gbmax <= 0)
+		st->gbmax = lion_count_groups_batch(st->groupidx);
+
+	oldcxt = MemoryContextSwitchTo(st->gbatchcxt);
+	st->gbsets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * st->gbmax);
+	st->gbkey = (Datum *) palloc(sizeof(Datum) * st->gbmax);
+	st->gbnull = (bool *) palloc(sizeof(bool) * st->gbmax);
+	st->gbcount = (int64 *) palloc(sizeof(int64) * st->gbmax);
+	while (n < st->gbmax &&
+		   lion_entry_scan_next(&st->escan, &st->gbkey[n], &st->gbsets[n]))
+	{
+		st->gbnull[n] = st->gbsets[n].keyisnull;
+		n++;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	if (n == 0)
+		return false;
+
+	lion_count_groups_copy(st->heap, estate->es_snapshot, n, st->gbsets,
+						   &st->wherecoll, st->gbcount, &st->stats,
+						   st->viscache, st->rel_read_only);
+	for (i = 0; i < n; i++)
+		lion_posting_set_release(&st->gbsets[i]);
+
+	st->gbn = n;
+	st->wcounts += n;
+	st->groupbatches++;
+	st->groupsbatched += n;
+	return true;
+}
+
+/*
  * The next group of the relation the node has open, as one row.
  *
  * Returns NULL and sets *exhausted once the relation's entry scan has run
@@ -13684,6 +13874,30 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		 */
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
 		MemoryContextReset(st->pergroup);
+
+		/*
+		 * Once the WHERE is collected, the rest of the walk is counted a
+		 * batch at a time (lion_group_batch_fill()), and a batch's rows go up
+		 * one a call, in the walk's order.  A group exists only if at least
+		 * one of its rows is visible.
+		 */
+		if (st->gbpos < st->gbn)
+		{
+			int			i = st->gbpos++;
+
+			if (st->gbcount[i] == 0)
+				continue;
+			return lion_emit_tuple(st, st->gbkey[i], st->gbnull[i],
+								   (Datum) 0, true, st->gbcount[i]);
+		}
+		if (lion_group_batch_ok(st))
+		{
+			if (lion_group_batch_fill(st))
+				continue;
+			*exhausted = true;
+			return NULL;
+		}
+
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
 		if (st->coalwalked ||
@@ -16402,6 +16616,19 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->wherespilled > 0)
 			ExplainPropertyInteger("WHERE Sets Spilled", NULL,
 								   st->wherespilled, es);
+
+		/*
+		 * ... and the batches of groups counted together against it, in one
+		 * walk of container keys each (DESIGN.md §10, "The groups of a walk,
+		 * counted together").  Only when there were any.
+		 */
+		if (st->groupbatches > 0)
+		{
+			ExplainPropertyInteger("Group Batches", NULL, st->groupbatches,
+								   es);
+			ExplainPropertyInteger("Groups Counted in Batches", NULL,
+								   st->groupsbatched, es);
+		}
 
 		/*
 		 * The batches an IN list too long to locate at once was counted in

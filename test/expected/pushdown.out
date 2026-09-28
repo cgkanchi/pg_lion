@@ -2392,23 +2392,12 @@ SELECT lion_plans('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP
                           lion_plans                           
 ---------------------------------------------------------------
  -- on:
- HashAggregate
+ Finalize HashAggregate
    Group Key: lion_pdpo.a
-   ->  Append
-         ->  Bitmap Heap Scan on lion_pdpo1 lion_pdpo_1
-               Recheck Cond: ((a = 17) OR (b = 3))
-               ->  BitmapOr
-                     ->  Bitmap Index Scan on lion_pdpo1_a_idx
-                           Index Cond: (a = 17)
-                     ->  Bitmap Index Scan on lion_pdpo1_b_idx
-                           Index Cond: (b = 3)
-         ->  Bitmap Heap Scan on lion_pdpo2 lion_pdpo_2
-               Recheck Cond: ((a = 17) OR (b = 3))
-               ->  BitmapOr
-                     ->  Bitmap Index Scan on lion_pdpo2_a_idx
-                           Index Cond: (a = 17)
-                     ->  Bitmap Index Scan on lion_pdpo2_b_idx
-                           Index Cond: (b = 3)
+   ->  Custom Scan (LionCount)
+         Partitions: lion_pdpo1, lion_pdpo2
+         Lion Indexes: (a), ((a = 17) OR (b = 3))
+         Group Key: a
  -- off:
  HashAggregate
    Group Key: lion_pdpo.a
@@ -2427,12 +2416,12 @@ SELECT lion_plans('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP
                            Index Cond: (a = 17)
                      ->  Bitmap Index Scan on lion_pdpo2_b_idx
                            Index Cond: (b = 3)
-(36 rows)
+(25 rows)
 
 SELECT lion_pd('SELECT a, count(*) FROM lion_pdpo WHERE a = 17 OR b = 3 GROUP BY a');
-         lion_pd          
---------------------------
- not pushed down, 11 rows
+       lion_pd        
+----------------------
+ pushed down, 11 rows
 (1 row)
 
 SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3;

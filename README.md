@@ -159,7 +159,8 @@ A `GROUP BY` with several filters (`SELECT country, count(*) FROM events WHERE e
 partition, and counts each group against that one set, so the filters' index pages are read once
 rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when it did (DESIGN.md
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
-to a temporary file past it.
+to a temporary file past it. The groups are then counted against it up to a few hundred at a time,
+in one pass over its containers for all of them (`Group Batches` in `EXPLAIN ANALYZE`).
 
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension

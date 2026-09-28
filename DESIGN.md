@@ -1906,7 +1906,8 @@ every item probed where one collected set is, and each union's sets set up again
 (`LION_UNION_SET_COST`). A later calibration can price the collection itself, as
 `lion_cost_fkjoin_rel()` prices the fact filters' copy; until then a grouped count is priced as it
 was, which errs high where the WHERE is collected. A range too large to collect is still priced as
-walked by every count, which it still is.
+walked by every count, which it still is. *(Superseded by the next subsection, which prices the
+collection and the batched walk that follows it.)*
 
 EXPLAIN ANALYZE prints `WHERE Sets Collected` - the relations whose WHERE was collected, one per
 partition, summed over rescans - and `WHERE Sets Spilled`, each only when there were any.
@@ -1920,6 +1921,148 @@ collected range alone, of a count(DISTINCT), or of a handful of one-row groups. 
 shared buffers a grouped count over an OR of two CHAIN sets reads with the same count ungrouped:
 beyond the walk of the groups, at most three times the ungrouped count's, where each group used to
 read the OR's sets again.
+
+### The groups of a walk, counted together (2026-09-28)
+
+A benchmark's `GROUP BY` over a column of many values on nearly every row, under a WHERE of
+several clauses, took several times what the same WHERE took ungrouped. The WHERE was collected
+once (the subsection above), so what remained was the counts:
+each group's set ANDed with the collected set, at each of the group's container keys - which read
+the whole collected set again for every group.
+
+**The repro.** Every measurement of this subsection and of §15's "Unions and intersections
+unoptimized" is from a synthetic table built to that shape, scaled to a 4-core, 15 GB VM: 8.5M rows
+in arrival order (every value drawn at random per row, so no column follows the heap), 1.9 GB of
+heap (249,321 pages, 34 rows a page, 3,896 container keys), all-visible, and one lion index of 246 MB
+over seven columns - `grp`, 150 values over 99% of the rows; `f1` and `f2`, booleans true on 90% and
+20%; `lvl`, five values, one on 80%; `c20`, 20 values; `tags int[]`, four elements on 17 to 28% of
+the rows and two of 30,000 rare ones on each; `tags2 int[]`, one element on 48% and one of 199 others.
+PostgreSQL 18.6 as packaged (-O2), `shared_buffers` 1 GB with the index resident, `work_mem` 64 MB,
+`max_parallel_workers_per_gather` 0; times are medians of EXPLAIN ANALYZE's Execution Time over 18
+runs, the libraries before and after alternated round by round on a machine shared with other work.
+A key holds about 2,200 rows here, so a group's container has some fifteen members; on a wider
+row a key holds fewer, and a group's container fewer still.
+
+The grouped count, `grp, count(*) ... WHERE f1 AND NOT f2 AND lvl = 1 AND tags && '{4}' GROUP BY
+grp`, took 394 ms against 72 ungrouped. Its profile:
+
+| function | share |
+|---|---|
+| `array_gallop()` | 62.6% |
+| `lion_container_and()` | 20.2% |
+| `lion_container_optimize()` | 4.7% |
+| `lion_count_container_vm()` | 3.3% |
+
+Each group's container of fifteen members was galloped through the collected ARRAY of 350 at its
+key - 584,000 ANDs, half a microsecond each in mispredicted branches - and each non-empty result
+asked the visibility map again about blocks the previous group had just asked about. §15's
+"Unions and intersections unoptimized" made the collection four times faster and left the walk as it
+was: 266 ms, 61% of it still `array_gallop()`.
+
+**The walk.** Once the WHERE is collected, `lion_next_group()` takes the rest of the entry walk a
+batch at a time - up to `LION_GROUP_BATCH_MAX` (256) entries, fewer when the open budget of one
+count's cursors (work_mem, and the pins the lists leave; §15, "Bounded cursors") holds fewer, since
+each group holds a cursor, a page image for a CHAIN set, and a pin - and counts the batch in ONE
+walk of container keys (`lion_count_groups_copy()`, lion_count.c):
+
+- the groups' cursors stand on a binary heap by container key. At each key the copy has and a group
+  stands at, the copy's container is made a bitset image once, and every group standing there is
+  tested against it: a bit test per member of the group's ARRAY, which gives the AND's count and the
+  heap blocks it lies on without building it (`lion_container_and_image_count()`); a group's RUN or
+  BITSET is ANDed with the image (`lion_container_and_raw()`). Where the copy's container has few
+  members for the groups standing at it (fewer than `LION_GROUP_IMAGE_MIN`, 128, members times
+  groups) there is no image, and each group ANDs its container with the copy's directly - a lookup
+  of those few members;
+- the visibility map is asked ONCE per key, about every block the copy's container has a member on -
+  every group's intersection there lies on those. A group whose intersection lies on all-visible
+  blocks is counted without the intersection being built; otherwise it is built and counted as
+  every container is (`lion_count_container_masks()`, the second half of
+  `lion_count_container_vm()`), its dirty blocks' TIDs queued for the heap in the group's own
+  recheck queue, which takes a share of one count's budget. The queues are flushed group by group
+  after the walk and share the visibility cache as the groups' counts did, each a count begun;
+- where the copy has no container, the groups below its next key are sought to it, and after a key
+  each group standing there goes straight to the copy's next key - a step where that is the next
+  key, a seek (§22) past the keys between otherwise.
+
+The rows come out in the walk's order, one a call, as before - so the pathkeys of a GROUP BY
+driven by its entry walk (§21) still hold - and between them the node holds the batch's keys and
+counts and nothing pinned: the sets are released as soon as the batch is counted (§15, "Paused and
+finished counts"). HAVING and LIMIT apply per row as always.
+
+**Why it is exact (§9).** Each group's set comes from the walk as its own count took it - an INLINE
+one with its leaf's pin, a CHAIN one read by a cursor that pins the page each container came from -
+and the copy is the same pinless copy those counts were ANDed with, on the same argument
+(`lion_sources_collect()`). At a key the map is asked after every group standing there has copied
+its container under its pin, and before any of them moves past it: `lion_count_container()`'s
+order, for all of them at once. A key the copy has nothing at, and a group whose intersection there
+is empty, ask the map nothing, and the pins let go of past them had nothing counted from them. A
+group whose set holds no pin - located past the pin budget, or a private copy - trusts no map (its
+own `novm`), as its count alone would; every group does while a row filter applies (§17, "A query
+known only at run time"), whose rows all go to the heap. Under SERIALIZABLE a group counted from
+the map takes its blocks' predicate locks through the ordinary path.
+
+**When.** A single GROUP BY column walked by its index's entries, once its WHERE is collected, when
+every count is that one set ANDed with the group's own: not beside a range walked with it (§32, a
+range too large to collect), and not for `GROUP BY coalesce(g, c)`, which adds two entries into one
+group. The group counted before the collection - the first, over groups that span the heap - is
+counted as it always was. **Not taken**: an IN list that drives its own groups (§15), whose sets are
+the clause's; two GROUP BY columns (§20), whose pairs each AND two groups' sets; count(DISTINCT)
+(§26), whose tests stop at a row. They count against the collected copy one count at a time, as
+before.
+
+**Parallel.** Neither a grouped nor an ungrouped LionCount path is parallel: `parallel_safe` false,
+no workers (the FK-side join of §27 is the node's only parallel shape). With
+`max_parallel_workers_per_gather` 4 the repro's grouped count still plans as the serial node, and
+the plan without the pushdown - a Parallel Bitmap Heap Scan of four workers under a partial
+HashAggregate - took 1,138 ms. The walk and the collection would split by container-key ranges -
+each participant collecting its range of the WHERE (`LionCollect.ranged`, which the FK join's
+shared copy already cuts by) and counting every group over it into partial counts that core's
+Finalize Agg adds up - and that is left for a change of its own.
+
+**Cost.** A grouped count whose WHERE the executor will collect (`lion_cost_where_collected()`, the
+rule of `lion_where_describe()` from the planner's sources) is priced as the collection - the WHERE
+sources' merge as an ungrouped count's (`lion_merge_cpu_cost()`), and a container of the copy
+written at each key it keeps (`LION_FKJOIN_COPY_CONTAINER_COST`, the same copy the FK-side join
+makes) - plus, per group, its containers at the keys the copy has, each `LION_CONTAINER_COST`,
+`LION_MEMBER_COST` a member and a heap sift of log2(batch) `cpu_operator_cost`, plus, per batch,
+the copy's containers made images, and `LION_ENTRY_COUNT_COST` a group; the WHERE's pages are read
+once. It was priced as every group's merge with each WHERE set probed in memory
+(`LION_MEMORY_PROBE_COST` a set a key) and each union's sets set up again (`LION_UNION_SET_COST`),
+which the batched walk does neither of.
+
+**Measured**, the node before (the library before this subsection and before §15's, `base`), with
+only §15's change (`c1`), and now:
+
+| grouped count | base | c1 | now | cost, before and now | units a ms, base and now |
+|---|---|---|---|---|---|
+| `grp ... WHERE f1 AND NOT f2 AND lvl = 1 AND tags && '{4}'` | 394.4 ms | 281.0 | 68.4 | 217,468; 44,857 | 551, 656 |
+| `c20 ... WHERE tags && '{1,2}' AND NOT f1` | 116.2 | 38.3 | 24.0 | 36,747; 10,068 | 316, 419 |
+| `lvl ... WHERE tags2 && '{1,5,9}' AND c20 IN (1, 2)` | 92.7 | 30.4 | 26.1 | 20,359; 11,198 | 220, 428 |
+| `grp ... WHERE f2 AND lvl = 1` | 355.8 | 260.2 | 52.5 | 121,973; 32,293 | 343, 615 |
+| `grp ... WHERE c20 = 3 AND tags && '{2}'` | 124.0 | 85.6 | 43.5 | 99,621; 28,222 | 803, 648 |
+| `grp ... WHERE tags && '{1}'` (one set, too large to copy) | 348.8 | 256.7 | 47.5 | 76,520; 27,694 | 219, 583 |
+| `c20 ... WHERE tags && '{1000,1001,1002}' AND f1` (a WHERE of 1,500 rows) | 6.5 | 6.3 | 6.2 | 7,758; 5,097 | 1,201, 823 |
+
+The first of them went from 5.5 times its ungrouped count (72 ms) to 3.8 times (18 ms, §15),
+most of the difference a group's own set read from its pages: some 90 ns a group's container,
+against half a microsecond before. Its profile now: the walk itself (inlined, 32%),
+`lion_page_item_fetch()` and `lion_cursor_take_page()` (the groups' posting pages, 21%), the images
+(`container_or_bitset()`, 13%, the collection's too), the collection's ANDs and copies (11%),
+buffer lookups (5%). Priced as before, the batched counts ran at 860 to 2,900 units a
+millisecond, overpriced up to six times; they are at 419 to 823 now.
+
+One plan the regression suite pins moved with it: `pushdown.sql`'s `SELECT a, count(*) FROM
+lion_pdpo WHERE a = 17 OR b = 3 GROUP BY a`, 200 groups over two partitions of 50,000 rows, is the
+node now (a Finalize HashAggregate over it) where it was a HashAggregate over each partition's
+BitmapOr: 0.63 ms against 1.15, the node before this change 1.17.
+
+EXPLAIN ANALYZE prints `Group Batches` and `Groups Counted in Batches` when there were any.
+`test/sql/groupwhere.sql` reports the batches of every shape it checks - one per relation that
+collected, none where the groups are an IN list's or pairs - and adds a table of 600 groups and a
+NULL one, counted in three batches and, at a work_mem of 64 kB, in twenty; groups whose containers
+are RUNs; a WHERE that is a BITSET at every key, and one of a row or two a key, ANDed directly; a
+HAVING, a LIMIT inside a batch, SERIALIZABLE, the order an ORDER BY relies on across two batches with
+no Sort, and a dirty heap - each against a sequential scan with the pushdown off.
 
 ### The units (2026-09-27, release build)
 
