@@ -289,6 +289,11 @@ ANALYZE lion_ddn;
 SELECT lion_dj('SELECT count(DISTINCT d.attr) FROM lion_ddn d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.k AND f.x = 2 AND f.t = ''t1'')');
 SELECT lion_dj('SELECT count(DISTINCT d.k), count(DISTINCT d.attr) FROM lion_ddn d WHERE NOT EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.k AND f.x = 2 AND f.t = ''t1'')');
 SELECT lion_dj('SELECT d.attr, count(DISTINCT d.k) FROM lion_ddn d WHERE d.k IN (SELECT f.fk FROM lion_df f WHERE f.t = ''t11'') GROUP BY d.attr');
+-- a count of rows beside a count of distinct values: an inner join's rows
+-- carry their counts, which the Agg adds up, and a semi join's rows are the
+-- join's own (fkjoin_mixed.sql)
+SELECT lion_dj('SELECT count(*), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
+SELECT lion_dj('SELECT count(*), count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
 
 -- ---- 3. declined ---------------------------------------------------------------
 -- the key is not unique: the inner join counts a fact row once per duplicate
@@ -297,10 +302,6 @@ SELECT lion_dj('SELECT d.attr, count(DISTINCT d.k) FROM lion_ddn d WHERE d.k IN 
 SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_ddn d ON d.k = f.fk WHERE f.x = 3');
 SELECT lion_dj('SELECT count(DISTINCT f.fk) FROM lion_df f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ddn d WHERE d.k = f.fk AND d.attr = 1)');
 DROP INDEX lion_ddn_kl;
--- a count of rows beside a count of distinct values: the rows stand for
--- dimension rows, not for pairs
-SELECT lion_dj('SELECT count(*), count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3');
-SELECT lion_dj('SELECT count(*), count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
 -- a fact column that is not the join key
 SELECT lion_dj('SELECT count(DISTINCT f.x) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t3''');
 SELECT lion_dj('SELECT count(DISTINCT f.fk4) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.t = ''t3''');

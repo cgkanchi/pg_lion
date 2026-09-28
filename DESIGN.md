@@ -7163,7 +7163,8 @@ Formerly the §23 backlog item of the same name; the semi and anti joins (`EXIST
 EXISTS`) and the fact filters collected once were added on 2026-09-27, below, and `count(DISTINCT)`,
 parallel plans and the forward semi join over a non-unique key after them; the lookups in key order
 on 2026-09-28, and after them what a key's time is made of, the per-key path and the cost of a key
-("Where a key's time goes" and the two sections after it). The shape is the
+("Where a key's time goes" and the two sections after it), and counts beside the aggregates that
+need the dimension rows ("Every aggregate over the node's rows"). The shape is the
 star-schema aggregate
 
     SELECT d.attr, count(*)
@@ -7321,7 +7322,8 @@ in what it lets through the target list:
   expression) and count aggregates: `count(*)`, and `count(x)` where `x` is a non-NULL constant or
   either side of the join key (non-NULL in every joined row). Other aggregates, window functions,
   SRFs, grouping sets and row marks decline, as for a single table, and so does a DISTINCT
-  aggregate but the `count(DISTINCT)` of "count(DISTINCT)" below, which takes a path of its own;
+  aggregate but the `count(DISTINCT)` of "count(DISTINCT)" below, which takes a path of its own -
+  and so do the aggregates "Every aggregate over the node's rows" answers over that path's rows;
 - the aggregates must be splittable (`GROUPING_CAN_PARTIAL_AGG`) and every grouping column
   hashable. The node's target is `lion_make_partial_target()` of the grouped target, and what goes
   into the grouped rel is `create_agg_path(AGG_HASHED, or AGG_SORTED over zero columns for a folded
@@ -7484,7 +7486,9 @@ dimension filter like any other. No uniqueness is asked: the count is per dimens
 duplicated key is two rows tested twice and counted twice, as the semi join counts them, and a NULL
 key is looked up by nobody. The aggregates are the inner join's counts: `count(*)`, `count(1)`, and
 in a semi join `count(d.pk)` (a matched row's key is not NULL); an anti join's rows include the NULL
-keys, so there `count(d.pk)` declines. The partial path's row estimate is the join rel's own.
+keys, so there `count(d.pk)` is no count of rows. It used to decline; it is now a count of a column,
+answered over the anti join's rows ("Every aggregate over the node's rows"). The partial path's row
+estimate is the join rel's own.
 
 Visibility is §26's argument, unchanged: an existence test is a count compared with zero, computed
 from the same containers read the same way, and the per-dimension-row structure is this section's.
@@ -7753,9 +7757,10 @@ Why it is the join's answer:
 What is accepted: `count(DISTINCT v)` of one plain column (under a relabelling cast), with no
 FILTER and no ORDER BY, and several of them over different columns (the Agg sorts for the ones it
 does not presort); any sortable GROUP BY of dimension columns and expressions of them, HAVING,
-ORDER BY and LIMIT above. A count of rows beside a DISTINCT count declines - the rows stand for
-dimension rows, not for pairs - and so does a DISTINCT of an expression, of a fact column other
-than the key, of another aggregate (`sum(DISTINCT)`), or under another collation.
+ORDER BY and LIMIT above. A count of rows beside a DISTINCT count used to decline - the rows stand
+for dimension rows, not for pairs - and is answered now by rows that carry their counts ("Every
+aggregate over the node's rows", below); a DISTINCT of an expression, of a fact column other than
+the key, of another aggregate (`sum(DISTINCT)`), or under another collation still declines.
 
 The node's target is the join rel's, the grouping input core would compute over the join, with the
 fact key's Var mapped to the key's child column (`lion_plan_fkjoin_path()`); the join member of
@@ -7921,7 +7926,8 @@ roles exchanged is offered beside it and the cost model chooses (the tests' mode
 keys). `lion_try_fkjoin_path()` treats it as an inner join over the distinct keys, `LION_JOIN_INNER`
 with `LION_JOINFLAG_UNIQUE`. What the query above the EXISTS can name is the fact's: `count(*)`,
 `count(1)`, `count(f.fk)` (a matched row's key is not NULL) and `count(DISTINCT f.fk)`, whose rows
-("count(DISTINCT)") are then one per distinct key with a match, carrying the key. A GROUP BY can only
+("count(DISTINCT)") are then one per distinct key with a match, carrying the key - and, since "Every
+aggregate over the node's rows", its count too when a count stands beside it. A GROUP BY can only
 be of fact columns, which no FK-side join puts in its output ("Declined"), and declines; so does the
 anti join the other way round, `NOT EXISTS` over the fact's rows, which would count the fact rows
 WITHOUT a match.
@@ -8393,6 +8399,144 @@ for what it does: the node O(keys), per the table above, and core's plan O(the c
 core. That is what keeps the node from being chosen where the copy is small and the keys many, and
 chosen where the keys are few, whatever the copy.
 
+### Every aggregate over the node's rows (2026-09-28)
+
+A benchmark asked, in one statement, how many dimension rows join and how many join pairs there
+are - a CTE of filtered dimension rows, an inner join to the fact, and
+
+    SELECT count(DISTINCT d.pk), count(*) FROM fact f JOIN dim d ON d.pk = f.fk
+    WHERE <f filters> AND <d filters>
+
+Each aggregate alone is pushed down; together they had no path at all. The counts are partial
+counts per dimension row that a Finalize Agg adds up, `count(DISTINCT)` needs the dimension rows and
+a plain Agg over them ("count(DISTINCT)"), and one core Agg is one or the other: the split is the
+Agg's, and nodeAgg asserts that every Aggref under it has it. With the join methods disabled the plan
+was a disabled nested loop; the benchmark's own plan was a nested loop blind to how many fact rows
+each key has, which timed out where the node reads each key's posting set once.
+
+So when any aggregate of the query needs the rows, every aggregate is answered over them:
+
+- **The rows carry their counts.** An inner join's rows (and the forward semi join's distinct keys)
+  stand for dimension rows, not for pairs. The node emits them as for `count(DISTINCT)`, and beside
+  each its count of join pairs, n - the count the partial path computes for that row, where the
+  rows alone take the existence test (`LION_JOINFLAG_COUNTS`). The column is a partial `count(*)`
+  in the node's target (a `LION_TL_COUNT` column, which the executor already fills), and EXPLAIN
+  prints it as `(PARTIAL count(*))`, which is what it is.
+- **The Agg's aggregates are rewritten over n** (`lion_fkjoin_agg_kind()`,
+  `lion_fkjoin_rewrite_mutator()`), each in its place in the target list and in the HAVING:
+
+  | the query's | over counted rows | why it is the join's |
+  |---|---|---|
+  | `count(*)`, `count(1)`, count of either side of the key | `lion_join_count(n)` | a group's pairs are the sum of its rows' n; neither side of the key is NULL in a pair |
+  | `count(x)`, x any expression of dimension columns | `lion_join_count(n) FILTER (WHERE x IS NOT NULL)` | each of a row's n pairs holds that row's x |
+  | `sum(x)`, x such an expression of type int2 or int4 | `lion_join_sum(x * n)` | the sum over the pairs is the sum over the rows of x times n |
+  | `count(DISTINCT x)` | as it stands | "count(DISTINCT)" |
+  | `min`, `max`, `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or` of such an x | as they stand | each is blind to multiplicity - min(v, v) is v, v AND v is v - and skips NULLs, so the rows give it the pairs' values, each once |
+
+  `min` and `max` are core's aggregates with a sort operator, of every type, which planagg.c
+  already answers as the first value in that operator's order; `every` is `bool_and` by its SQL
+  name. `any_value` would do as well and is left out (its answer is any row's, which no test can
+  pin). `bit_xor`, `avg`, `string_agg`, `array_agg`, the statistical aggregates and `sum` of
+  anything else see multiplicity, and decline.
+- **`sum` of an int8 or numeric column is left out.** x times n of an int8 needs numeric arithmetic
+  and a numeric sum, a row, where core sums the pairs in 128-bit integers: exact, but not cheap. An
+  int2 or int4 x is exact in int8: the product and the sum fail with "bigint out of range" rather
+  than wrap, and the one difference from core's `sum(int4)` is which intermediate sum may overflow
+  on the way to a total that does not - which the order of the pairs decides for core too (a
+  parallel partial sum's order is not a serial one's).
+- **Declined as before**: a fact column other than the key, min or max of the fact's key included
+  (the dimension's key answers the same and is taken; which of two keys the join calls equal to
+  print is §10's representation question), FILTER, ORDER BY or DISTINCT (but count's) in an
+  aggregate, and a volatile expression.
+- **Semi and anti joins keep their rows.** A semi or anti join's rows are its result rows, each
+  once, so every aggregate is computed over them as it stands and no count is carried: n would be
+  1, over which `lion_join_count(n)` is `count(*)`. The one aggregate whose meaning differs is the
+  count of the key in an anti join, whose NULL keys are rows: there it is no count of rows but a
+  count of a column, which as it stands it is.
+- **GROUP BY and HAVING** are the Agg's, as for `count(DISTINCT)`: sorted by the group pathkeys
+  when a DISTINCT needs them, and - when no aggregate is a DISTINCT one and the GROUP BY hashes -
+  also hashed over the rows as they come, which needs no Sort; the cost model chooses.
+
+**The aggregates that add n up.** Two are wanted: one with count's answer, an int8 that is 0 over no
+rows, and one with sum's, NULL over no rows. They are the extension's own, in pg_lion--0.1.sql:
+`lion_join_count(int8)` is `int8pl` from an initial 0, and `lion_join_sum(int8)` is `int8pl` from
+NULL (the strict transition takes the first value as its state); both combine with `int8pl` and are
+PARALLEL SAFE. Against core's `sum(int8)` with a cast back from numeric (and a `coalesce(..., 0)` for
+count's 0):
+
+- **Exactness**: both are exact.
+- **Overflow**: n is never negative, so no partial sum of `lion_join_count` passes the total, and it
+  fails exactly where `count()` itself would - count's `int8inc` fails past int8 too. `sum(int8)`
+  never overflows (its state is a 128-bit integer or a numeric) and the cast back fails at the same
+  total: the same answer, later.
+- **Parallel combining**: both have a combine function. `lion_join_count`'s state is an int8 passed
+  by value; `sum(int8)`'s is internal, with serial and deserial functions.
+- **Cost**: an `int8pl` a row, against `int8_avg_accum`'s 128-bit add into palloc'd state, a numeric
+  made by the final function, a cast and, for count, a coalesce - more work for the same answer, and
+  a less plain EXPLAIN.
+
+So the extension's own. They are found at plan time in the extension's schema
+(`lion_fkjoin_rewrite_init()`) and must be objects of the extension - no namesake in another schema
+is taken - that the current user may EXECUTE, which the Agg asks at run time as for any aggregate
+(the node still asks what the plan it replaces would have asked, `count()` included: §9,
+"Privileges"). They are read from the catalog cache, not looked up by name as a query's functions
+are: a lookup by a qualified name asks USAGE on the schema, and failed the planning of a user who
+had none, where running the aggregate asks no such thing. A database whose pg_lion was created by a script without them keeps the ordinary
+plan for these queries; the rows alone and the partial counts need neither.
+
+**The LionJoinAgg.** The rewritten Agg cannot go into the grouped rel as it is. What core puts above
+a grouped path finds the query's aggregates in its input's target list by `equal()`: a Sort for
+`ORDER BY count(*)` looks for its key there (`prepare_sort_from_pathkeys()`) and, not finding it,
+would ADD a `count(*)` of its own to the projection-capable Agg - one that over the rows counts
+dimension rows, silently - and a projection above matches its expressions there (`fix_upper_expr()`)
+and fails. Nor can the grouped rel's target be rewritten in place: core's own paths share it. So the
+Agg path gets a target of its own, the grouped rel's with each aggregate rewritten where it stands,
+and goes into the grouped rel below a LionJoinAgg (`lion_add_join_agg_path()`): a CustomScan whose
+target list and `custom_scan_tlist` are the grouped rel's own, whose one child is the Agg, and which
+hands the Agg's rows up unchanged. Column i of the Agg is column i of the query's target, of the same
+type (checked when the plan is made), so the node has no projection to make - but for a target that
+names one aggregate twice, which setrefs.c points at the first - and returns the Agg's own slot.
+Everything above it sees the query's aggregates, everything below it the rewritten ones. It costs
+nothing, and it is registered with the scan methods (`lion_count_scan_register()`), since under
+`debug_parallel_query` a worker runs it.
+
+**Parallel.** The rewritten aggregates are plain: a partial Agg would need partial states of
+`count(DISTINCT)`, which it has none of. So the plan is the plain Agg above a Gather of the counted
+rows, as for `count(DISTINCT)`: every row that joins goes through the Gather's tuple queue, which
+core prices at `parallel_tuple_cost` a row, and the leader aggregates them all. A query of counts
+alone keeps the partial path, summed in the node ("The per-key path, end to end"), which hands up one
+row a participant and is cheaper for it.
+
+**Cost.** The counted rows are priced as the rows of `count(DISTINCT)` but counted - the count's terms
+of "Cost, revisited" where the rows alone take the existence test's, since each row's whole set is
+counted - with `LION_FKJOIN_ROW_COST` a row handed up; core prices the Sort, the Agg and the Gather,
+and the LionJoinAgg adds nothing. A query of counts alone is never offered this path, so its plan and
+its price are what they were. In `fkjoin_mixed.sql` the cost model takes the counted rows where, and
+only where, it takes the partial counts of the same query without its `count(DISTINCT)` or `max`:
+the Sort and the Agg over a few hundred rows add a few units to either.
+
+**EXPLAIN** (VERBOSE):
+
+    Custom Scan (LionJoinAgg)
+      Output: (count(DISTINCT d.pk)), (count(*))
+      ->  Aggregate
+            Output: count(DISTINCT d.pk), lion_join_count((PARTIAL count(*)))
+            ->  Sort
+                  Output: d.pk, (PARTIAL count(*))
+                  Sort Key: d.pk
+                  ->  Custom Scan (LionCount)
+                        Output: d.pk, (PARTIAL count(*))
+                        Lion Indexes: fact_fk (fk = d.pk), fact_hot (hot = true)
+                        Join Rows: the dimension rows with a match, each with its count
+                        Fact Filters: collected once
+                        ->  Seq Scan on public.dim d
+                              Output: d.pk
+                              Filter: d.kept
+
+(`the distinct keys with a match, each with its count` for the forward semi join); `count(d.name)`
+prints as `lion_join_count((PARTIAL count(*))) FILTER (WHERE (d.name IS NOT NULL))` and
+`sum(d.small)` as `lion_join_sum((d.small * (PARTIAL count(*))))`.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -8408,13 +8552,17 @@ chosen where the keys are few, whatever the copy.
 - **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
   over `f.x`, which composes, but is not in v1. It is also every GROUP BY of a forward semi join,
   whose dimension the query above the EXISTS cannot name.
-- **`count(f.col)` of a nullable column, and every non-count aggregate**, as for a single table.
+- **`count(f.col)` of a nullable fact column, and the aggregates "Every aggregate over the node's
+  rows" does not answer**: of a fact column other than the key, ones that see multiplicity but
+  counts and int2 or int4 sums (`avg`, `sum` of int8 or numeric, `string_agg`), and any with FILTER
+  or ORDER BY.
 - **The anti join the other way round**, `NOT EXISTS (SELECT 1 FROM dim d WHERE d.k = f.fk ...)`
   over the fact's rows: the fact rows WITHOUT a qualifying key, a complement of the forward semi
   join's union that no count per key gives.
-- **A count of rows beside a `count(DISTINCT)`**, a DISTINCT over an expression or over a fact
-  column other than the key, an fk of another type than the key, a DISTINCT under another
-  collation than the join's ("count(DISTINCT)" above).
+- **A DISTINCT over an expression** or over a fact column other than the key, an fk of another
+  type than the key, a DISTINCT under another collation than the join's ("count(DISTINCT)" above).
+  A count of rows beside a `count(DISTINCT)` used to be declined here ("Every aggregate over the
+  node's rows").
 - **An anti join from `LEFT JOIN ... IS NULL`, and `NOT IN`** (above).
 - **Driving the count from the collected copy of the fact filters** when it is small against the
   keys: that is core's plan ("The cost of a key, after the per-key path").
@@ -8457,10 +8605,12 @@ over its distinct keys, and - once the dimension has lion indexes - also offered
 shape with the roles exchanged, which the model does not take; the reverse EXISTS and IN forms,
 grouped, with HAVING, ORDER BY and LIMIT, `count(1)` and `count` of the key, duplicated and NULL
 dimension keys, keys with no fact rows (`lion_sj_val()` pins the answers themselves) and fact rows
-whose key has no dimension row; the anti joins, NULL keys among them, `count` of the key declined
-there, and the LEFT JOIN and `NOT IN` forms left alone; the declines (a second correlation, an
-outer-side qual inside NOT EXISTS, a fact filter the posting sets cannot answer, another aggregate,
-`count` of a nullable dimension column, three relations, a subquery that cannot be pulled up);
+whose key has no dimension row, and a sum and a count of a nullable dimension column (declined
+before "Every aggregate over the node's rows"); the anti joins, NULL keys among them, `count` of the
+key there (a count of a column, over the join's rows, since then), and the LEFT JOIN and `NOT IN`
+forms left alone; the declines (a second
+correlation, an outer-side qual inside NOT EXISTS, a fact filter the posting sets cannot answer,
+another aggregate - `avg` - three relations, a subquery that cannot be pulled up);
 generic plans with Param filters on both sides, NULL ones included; correlated subqueries that
 rescan the node with a new dimension filter and with a new FACT filter, whose copy is made again;
 EXPLAIN of the collected and the probed plans and of a dimension filtered through its own lion
@@ -8482,8 +8632,9 @@ selects nothing, grouped by one and two dimension columns and by an expression, 
 BY and LIMIT, a GROUP BY folded to a constant over something and over nothing, and an ungrouped
 count over nothing (`lion_dj_val()` pins 0); a text key; `count(DISTINCT)` of dimension columns
 (several in one query, a nullable one) over inner, semi and anti joins; duplicated and NULL
-dimension keys; the declines (a non-unique key, forward and inner; a count of rows beside a
-DISTINCT count; a fact column other than the key; an `int4` fk against the `int8` key, while a
+dimension keys; a count of rows beside a DISTINCT count, over an inner and a semi join (declined
+before "Every aggregate over the node's rows"); the declines (a non-unique key, forward and inner; a
+fact column other than the key; an `int4` fk against the `int8` key, while a
 dimension column over that join is accepted; a DISTINCT under `"C"`; an expression; FILTER;
 `string_agg(DISTINCT ... ORDER BY)`; `sum(DISTINCT)`); EXPLAIN of the Sort and the Agg over the
 rows, forward and anti; the existence tests of an inner join's rows reading fewer containers than
@@ -8522,11 +8673,11 @@ none, dimension filters and none, a fact filter with no entry, a dimension filte
 one that leaves only NULL keys (`lion_nj_val()` pins 0); heavy duplication (3,000 rows over six
 keys, one without fact rows) and every row the same key (the answer pinned against that key's own
 count); cross-type keys both ways and a text key; `count(1)`, `count` of the fact's key, and
-`count(DISTINCT)` of it, over nothing too; HAVING, ORDER BY and LIMIT; the counters (`Join Keys
-Sorted` without the NULL keys, `Join Keys Looked Up` the distinct keys, `Join Keys Without Entry`);
-the declines (a fact column in the GROUP BY, another aggregate, a count of rows beside a
-`count(DISTINCT)`, a second correlation, the anti join the other way round, a fact filter the
-posting sets cannot answer); generic plans with Params on both sides, NULL ones included;
+`count(DISTINCT)` of it, over nothing too, and `count(*)` beside it (declined before "Every aggregate
+over the node's rows"); HAVING, ORDER BY and LIMIT; the counters (`Join Keys Sorted` without the
+NULL keys, `Join Keys Looked Up` the distinct keys, `Join Keys Without Entry`); the declines (a fact
+column in the GROUP BY, another aggregate, a second correlation, the anti join the other way round,
+a fact filter the posting sets cannot answer); generic plans with Params on both sides, NULL ones included;
 correlated subqueries that rescan the node, its child and its sort with a new dimension filter and
 with a new fact filter; the model's choice, including a 60,000-row dimension it refuses unless its
 filter leaves few keys that are fk values; and a dirty heap before and after VACUUM. Its parallel
@@ -8546,11 +8697,12 @@ absent from the fact and ten past its range, and a 6,000-row dimension over 3,00
 with NULL keys. Each answer is checked as `lion_wj()` checks it, which also says whether the plan
 walked: inner joins grouped by one and two dimension columns and ungrouped, with fact filters (`=`,
 IN, one with no entry) and dimension filters, HAVING and ORDER BY; the forward EXISTS over the
-unique key; `count(DISTINCT)` of the key and of a dimension column; reverse semi and anti joins over
-both dimensions, duplicated and NULL keys among them, and an anti join whose fact filter selects
+unique key; `count(DISTINCT)` of the key and of a dimension column, and beside counts of join pairs
+(the counted rows of "Every aggregate over the node's rows", walked too); reverse semi and anti joins
+over both dimensions, duplicated and NULL keys among them, and an anti join whose fact filter selects
 nothing; the forward semi join over the non-unique key, counted over its distinct keys, and its
-`count(DISTINCT)`; and a dimension filtered to a few dozen keys, which the model looks up a row at a
-time. EXPLAIN shows `Join Key Lookups: in index order` for the walked plans and not for that one.
+`count(DISTINCT)`, alone and beside `count(*)`; and a dimension filtered to a few dozen keys, which
+the model looks up a row at a time. EXPLAIN shows `Join Key Lookups: in index order` for the walked plans and not for that one.
 The counters: `Join Keys Looked Up` and `Without Entry` (every key looked up, a duplicated one too),
 the distinct keys of the forward semi join, a walk that reads fewer directory pages than it has keys
 (a fact filter few keys have rows under, so the walk stays on each leaf from key to key) against the
@@ -8577,6 +8729,40 @@ made at the default: spilled once, read back, its file reads at most the keys' c
 copy containers read, and the temporary blocks the node read at most those reads and one - the
 count's reads of a spilled copy are bounded by the key, not by the copy. And a parallel plan, whose
 counters are the participants' sums.
+
+`test/sql/fkjoin_mixed.sql` (2026-09-28), every aggregate over the node's rows, against the pushdown
+off: a 3,000-row dimension with nullable int, int2 and text columns, a 60,000-row fact whose fk runs
+over 3,600 keys (with NULL fks, keys past the dimension's and dimension keys without fact rows) and
+an int4 copy of it, and a 3,000-row dimension over 1,500 keys, duplicated, with NULL keys.
+`lion_mj()` reports the plan's form - counted rows below a LionJoinAgg, rows as they stand, partial
+counts, or none. `count(DISTINCT)` beside `count(*)`, `count(1)` and counts of either side of the
+key, the dimension rows through an inlined CTE, a cross-type key; grouped by columns and by an
+expression, HAVING on a count, on a DISTINCT count and on a count the target does not name, ORDER
+BY an aggregate and LIMIT, expressions of aggregates and one aggregate twice, GROUP BYs folded to a
+constant, over something and over nothing, and answers over nothing pinned (`lion_mj_val()`: 0 for
+the counts, NULL for a sum and a max); min and max of text, int8, int and int2 columns and of
+expressions, `bool_and`, `bool_or`, `every`, `bit_and` and `bit_or`, beside counts and alone (the
+rows then need no counts), over rows whose values are all NULL; `count(col)` of nullable columns and
+expressions, 0 where every value is NULL; `sum` of int4 and int2 columns and expressions, NULL where
+every value is NULL; semi and anti joins over unique and duplicated keys with NULL keys, their
+aggregates as they stand; the forward semi join over the non-unique key, its distinct keys counted.
+The declines: fact columns but the key, min of the fact's key, FILTER, ORDER BY and DISTINCT in
+other aggregates, `avg`, `sum` of int8, `bit_xor`, `array_agg`, a volatile expression. EXPLAIN
+(VERBOSE) of the rewritten aggregates, grouped with HAVING under an ORDER BY, the fact's key counted
+distinct and the forward semi join's keys; a hashed Agg with no Sort where nothing is DISTINCT; a semi
+and an anti join's aggregates as they stand; counts alone still partial. `Containers Visited` of
+counted rows equal to the partial counts', and above the rows alone's existence tests. The cost
+model with nothing disabled: counted rows where the counts alone are pushed down, and not where they
+are not. Generic plans, NULL Params included; correlated subqueries that rescan the LionJoinAgg, the
+Agg and the node; parallel plans (`lion_mj_par()`, as `lion_pj()`), the Gather below the plain Agg,
+hashed and sorted, semi, anti and the forward semi join, `Join Keys Looked Up` summed over the
+participants, and the serial plan under `debug_parallel_query`. The aggregates themselves: 0 and
+NULL over no rows and over NULLs, "bigint out of range" past int8. A role without EXECUTE on
+`lion_join_count()` gets the ordinary plan with the same answer, while the rows alone, which need
+none, are still pushed down; one without USAGE on the extension's schema (moved there for the
+test) gets the counted rows. And a dirty heap before and after VACUUM. Beside it, `fkjoin_distinct`,
+`fkjoin_semi` and `fkjoin_nonunique` answer the queries they used to decline, and `fkjoin_walk` walks
+counted rows in key order.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 

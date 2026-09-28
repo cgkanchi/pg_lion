@@ -402,6 +402,20 @@ SELECT lion_wj('SELECT d.grp, count(DISTINCT d.attr) FROM lion_kod d WHERE EXIST
  pushed down, in key order, 5 rows
 (1 row)
 
+-- ... and counts of join pairs beside it: the rows walked carry their counts
+-- (fkjoin_mixed.sql)
+SELECT lion_wj('SELECT count(DISTINCT f.fk), count(*), max(d.attr) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x = 3');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.grp, count(DISTINCT d.attr), count(*), count(d.attr) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.grp');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 5 rows
+(1 row)
+
 -- reverse semi and anti joins, the dimension's rows each once
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)');
               lion_wj              
@@ -460,6 +474,12 @@ SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE f.x = 4 AND f.fk IN (SELEC
 (1 row)
 
 SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT count(DISTINCT f.fk), count(*) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
               lion_wj              
 -----------------------------------
  pushed down, in key order, 1 rows
@@ -649,6 +669,12 @@ SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f
  pushed down, in key order, 1 rows
 (1 row)
 
+SELECT lion_wj('SELECT d.attr, count(DISTINCT f.fk), count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
+(1 row)
+
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
               lion_wj              
 -----------------------------------
@@ -693,6 +719,12 @@ SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f JOIN lion_kod d ON f
               lion_wj              
 -----------------------------------
  pushed down, in key order, 1 rows
+(1 row)
+
+SELECT lion_wj('SELECT d.attr, count(DISTINCT f.fk), count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 7 rows
 (1 row)
 
 SELECT lion_wj('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3)');
