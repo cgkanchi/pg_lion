@@ -2006,6 +2006,21 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 	return ok;
 }
 
+/*
+ * The sets lion_count_sources_run() gives up on copying: hopeless even as an
+ * ARRAY of members - the test it makes before it tries - or tried and too big
+ * for what was left of the budget.  Each count walks their pages again.
+ */
+bool
+lion_posting_set_rewalked(const LionPostingSet *ps)
+{
+	if (!ps->found || ps->is_inline || ps->mat != NULL)
+		return false;
+	return ps->matfailed ||
+		(ps->ncontainers > LION_MATERIALIZE_MAX_CONTAINERS &&
+		 ps->ntids > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16));
+}
+
 
 /* ---------------------------------------------------------------------
  * Spilled copies (LionSpill)

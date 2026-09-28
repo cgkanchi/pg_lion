@@ -956,9 +956,54 @@ typedef struct LionCountScanState
 	 */
 	int			ingroupitem;
 	int			ingroupset;		/* next set of that item */
+	int			ingroupleft;	/* ... and how many of its sets that have an
+								 * entry are still to come */
 	int			sumallitem;
 	LionCountSource *dsources;
 	int			ndsource;
+
+	/*
+	 * The WHERE items of a GROUP BY, COLLECTED once per relation into one
+	 * private posting set that every later group - or pair of groups (§20) -
+	 * is counted against instead of the items themselves (DESIGN.md §10, "The
+	 * WHERE sets, collected once"; lion_group_count()).  Without it each
+	 * count intersects the items again and reads the pages of every set it
+	 * cannot keep a copy of once per group.
+	 *
+	 *	wtried		the collection has been made, or refused for good, for
+	 *				the relation being counted
+	 *	wcollected	... and made: wherecoll holds it, in wherecxt
+	 *	wknown		wreach, wcompound and wsingle describe the WHERE items
+	 *	wreach		what collecting them reads, in container keys: the reach
+	 *				of the positive item with the fewest rows, which drives
+	 *				the collection's merge
+	 *	wcompound	more than one item to combine, or one union - worth
+	 *				collecting whatever the sets are
+	 *	wsingle		the one set of a lone item, which is worth collecting
+	 *				only while every count walks its pages
+	 *				(lion_posting_set_rewalked()), or NULL
+	 *	wspent		what the counts so far read of the items, in the same
+	 *				units, and wcounts how many there were
+	 *	wckeys		the relation's container keys, which cap every reach
+	 *
+	 * wsources is where a count's sources are put together with wherecoll:
+	 * the driver's slot, the collected set, the items it does not hold, and a
+	 * second group's slot.  wherecollected and wherespilled are what EXPLAIN
+	 * ANALYZE reports.
+	 */
+	bool		wtried;
+	bool		wcollected;
+	bool		wknown;
+	bool		wcompound;
+	LionPostingSet *wsingle;
+	LionPostingSet wherecoll;
+	double		wreach;
+	double		wspent;
+	int64		wcounts;
+	double		wckeys;
+	LionCountSource *wsources;
+	int64		wherecollected;
+	int64		wherespilled;
 
 	/*
 	 * An IN list too long to locate at once (DESIGN.md §15, "A list too long
@@ -9191,6 +9236,11 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->rangesrc_collected = 0;
 	st->rangesrc_walked = 0;
 	st->rangesrc_held = 0;
+	st->wherecollected = 0;
+	st->wherespilled = 0;
+	memset(&st->wherecoll, 0, sizeof(st->wherecoll));
+	st->wherecoll.pinbuf = InvalidBuffer;
+	st->ingroupleft = 0;
 
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
@@ -9362,6 +9412,13 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		palloc0(sizeof(LionCountSource) * st->nsource);
 	st->disttests = 0;
 	st->batchitem = -1;
+
+	/*
+	 * A count against the collected WHERE (lion_group_count()) takes one slot
+	 * for the collected set on top of what it keeps of st->sources.
+	 */
+	st->wsources = (LionCountSource *)
+		palloc0(sizeof(LionCountSource) * (st->nsource + 1));
 }
 
 /*
@@ -10418,6 +10475,17 @@ lion_locate_where(LionCountScanState *st)
 			break;
 		}
 	}
+	st->ingroupleft = 0;
+	if (st->ingroupitem >= 0)
+	{
+		LionCountSource *src = &st->sources[st->ingroupitem + 1];
+
+		for (k = 0; k < src->nsets; k++)
+		{
+			if (src->sets[k].found)
+				st->ingroupleft++;
+		}
+	}
 
 	/*
 	 * And the sum-over-all's own `IS NOT NULL` (DESIGN.md §14, the sumallitem
@@ -10499,6 +10567,21 @@ lion_release_where(LionCountScanState *st)
 	}
 	st->rangesrc_held = 0;
 
+	/*
+	 * The collected WHERE (lion_group_count()): its file, if it spilled, is
+	 * closed here, and its memory goes with wherecxt below.
+	 */
+	lion_posting_set_release(&st->wherecoll);
+	st->wtried = false;
+	st->wcollected = false;
+	st->wknown = false;
+	st->wcompound = false;
+	st->wsingle = NULL;
+	st->wreach = 0;
+	st->wspent = 0;
+	st->wcounts = 0;
+	st->wckeys = 0;
+
 	/* ... and so do the values of a list counted in batches */
 	st->batchitem = -1;
 	st->batchval = NULL;
@@ -10515,6 +10598,7 @@ lion_release_where(LionCountScanState *st)
 	st->wheremissing = false;
 	st->ingroupitem = -1;
 	st->ingroupset = 0;
+	st->ingroupleft = 0;
 	st->sumallitem = -1;
 }
 
@@ -11375,6 +11459,235 @@ lion_sumall_relation(LionCountScanState *st)
 	return total;
 }
 
+/* ---------------------------------------------------------------------
+ * The WHERE sets of a GROUP BY, collected once (DESIGN.md §10)
+ * --------------------------------------------------------------------- */
+
+/*
+ * What the WHERE items sources[1 .. nwhere] of the relation being counted
+ * are, as lion_group_count() weighs them: worked out once per relation, from
+ * the hints of the sets lion_locate_where() located once per relation.
+ *
+ * A range still to be walked - one too large to collect (DESIGN.md §32) - is
+ * no item here: every count walks it beside the collected set, as the planner
+ * priced it.  A NEGATED item is one to combine when it has a set to subtract,
+ * and nothing when it has none (`IS NOT NULL` over a column without NULLs, a
+ * multi-key query no key narrows); the collection needs a POSITIVE item to
+ * start from, and a WHERE without one is never collected.
+ *
+ * The REACH of a set is the container keys its rows can lie at: its rows, up
+ * to the relation's container keys.  A merge reads about that many containers
+ * of its driver and probes each other source at about as many keys, so the
+ * collection - driven by the positive item with the fewest rows - and the
+ * counts are weighed in it.
+ */
+static void
+lion_where_describe(LionCountScanState *st, LionCountSource *sources,
+					int nwhere)
+{
+	LionCountSource *lone = NULL;
+	int			nitems = 0;
+	int			npositive = 0;
+	int			k;
+	int			j;
+
+	st->wknown = true;
+	st->wcompound = false;
+	st->wsingle = NULL;
+	st->wreach = -1;
+	if (st->wckeys <= 0)
+		st->wckeys = (double) (RelationGetNumberOfBlocks(st->heap) /
+							   LION_BLOCKS_PER_CONTAINER + 1);
+
+	for (k = 1; k <= nwhere; k++)
+	{
+		LionCountSource *src = &sources[k];
+		double		rows = 0;
+		bool		any = false;
+
+		if (src->rangewalk != NULL)
+			continue;
+		for (j = 0; j < src->nsets; j++)
+		{
+			if (src->sets[j].found)
+			{
+				any = true;
+				rows += (double) src->sets[j].ntids;
+			}
+		}
+		if (src->negated)
+		{
+			if (any)
+				nitems++;
+			continue;
+		}
+		nitems++;
+		npositive++;
+		lone = src;
+		rows = Min(rows, st->wckeys);
+		if (st->wreach < 0 || rows < st->wreach)
+			st->wreach = rows;
+	}
+
+	if (npositive == 0)
+	{
+		st->wtried = true;		/* nothing to intersect */
+		return;
+	}
+
+	/*
+	 * Two items or more, or one that is a union - an IN list, an OR (§19), a
+	 * multi-key query of several keys (§17) - are merged again by every
+	 * count, whatever copies the count keeps of their sets.  One item of one
+	 * set is worth collecting only where no count keeps a copy of it.
+	 */
+	if (nitems > 1 || lone->nsets > 1 || lone->nomaterialize ||
+		(lone->tree != NULL && lone->tree->kind != LION_KN_KEY))
+		st->wcompound = true;
+	else if (lone->nsets == 1)
+		st->wsingle = &lone->sets[0];
+}
+
+/*
+ * Collect the WHERE items sources[1 .. nwhere] into st->wherecoll: the
+ * intersection of the positive ones less what the negated ones subtract, as
+ * one private, pinless posting set (lion_sources_collect()).  Made at most
+ * once per relation, whatever comes of it.
+ *
+ * It is budgeted like every set the node collects: what the ranges taken as
+ * sources have left of a hash table's memory (get_hash_memory_limit(),
+ * lion_locate_range()), and past that it SPILLS to a temporary file, as the
+ * FK-side join's copy of its fact filters does (DESIGN.md §27).  A spilled
+ * set keeps sixteen bytes a container key in memory, and a count reads it a
+ * container at a time.
+ *
+ * Not on a standby.  Whether a count there may trust the visibility map
+ * depends on the WAL mode of every index it reads (lion_sources_all_rmgr()),
+ * and a collected set carries the TIDs of every item under the name of one
+ * index; the counts read the items there, as they always did.
+ */
+static void
+lion_where_collect(LionCountScanState *st, LionCountSource *sources,
+				   int nwhere)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *items;
+	MemoryContext oldcxt;
+	Size		limit = get_hash_memory_limit();
+	bool		spilled;
+	int			n = 0;
+	int			k;
+
+	st->wtried = true;
+	if (RecoveryInProgress())
+		return;
+
+	oldcxt = MemoryContextSwitchTo(st->wherecxt);
+	items = (LionCountSource *) palloc(sizeof(LionCountSource) * nwhere);
+	for (k = 1; k <= nwhere; k++)
+	{
+		if (sources[k].rangewalk == NULL)
+			items[n++] = sources[k];
+	}
+	if (lion_sources_collect(st->heap, estate->es_snapshot, n, items,
+							 (st->rangesrc_held < limit) ?
+							 limit - st->rangesrc_held : 0,
+							 true, &st->wherecoll, &spilled, &st->stats))
+	{
+		st->wcollected = true;
+		st->wherecollected++;
+		if (spilled)
+			st->wherespilled++;
+	}
+	pfree(items);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * One count of a GROUP BY: the group's set in sources[0] - and, beside a
+ * second GROUP BY column (§20), the inner group's in the slots after the WHERE
+ * items - ANDed with the WHERE items sources[1 .. nwhere].  It is
+ * lion_node_count(), except that once the WHERE items are collected into
+ * st->wherecoll the count reads that one set in their place, and that before
+ * each count it decides whether to collect them now (DESIGN.md §10, "The
+ * WHERE sets, collected once").
+ *
+ * WHEN.  Collecting reads the items once, a merge over all their containers.
+ * A count reads them again at the container keys of its own set: probes into
+ * each of them, and for a set the count keeps no copy of, its pages - which is
+ * how a GROUP BY of many groups used to read the WHERE about once per group.
+ * Neither is known in advance: the walk finds out how many groups there
+ * are, and how many rows each has, as it goes.  So the counts go on reading
+ * the items until what they have read of them, with what THIS count would
+ * read, reaches what the collection reads, and the items are collected then.
+ * Collecting at that point costs at most what the counts so far and this one
+ * would have read: never more than twice the better of never collecting and
+ * collecting before the first group.  `ownrows` is the rows of the count's own
+ * smallest set - the count reads the items at no more keys than that set
+ * spans - and `more` says that another count of this relation is sure to
+ * follow.  Without
+ * one, the first count is never preceded by a collection - which is what keeps
+ * a GROUP BY that has one group the count it always was.
+ *
+ * WHY THE COUNT IS STILL EXACT (DESIGN.md §9).  The collected set is a copy,
+ * pinless and possibly stale, and it is safe on the terms of
+ * lion_posting_set_materialize(): it is only ever counted ANDed with the
+ * group's own set, which each count locates afresh under a pin of its own -
+ * the walk's entry, the listed value located again (§15), the inner set of a
+ * pair (§20).  A dead TID the copy still lists is then either gone from the
+ * group's container, and out of the intersection, or in it - which means the
+ * group's page was read before VACUUM's ambulkdelete got past it, so VACUUM
+ * has not finished ambulkdelete on that index, so it has not set the TID's
+ * heap page all-visible, and the TID goes to the heap recheck where the
+ * snapshot decides.  The copy cannot lack a row the snapshot sees: it was
+ * made after the snapshot was taken, and a visible row was in every index
+ * before its transaction committed.  With no pinned positive source in a
+ * count the merge trusts no map (cx.novm), as for any count; none of the
+ * shapes that come here lacks one.
+ */
+static int64
+lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
+				 int nwhere, uint64 ownrows, bool more)
+{
+	int			n = 0;
+	int			k;
+
+	if (!st->wtried && !st->wknown)
+		lion_where_describe(st, sources, nwhere);
+	if (!st->wtried)
+	{
+		double		own = Min(Min((double) ownrows, st->wckeys), st->wreach);
+
+		if ((st->wcounts > 0 || more) &&
+			st->wspent + own >= st->wreach &&
+			(st->wcompound ||
+			 (st->wsingle != NULL && lion_posting_set_rewalked(st->wsingle))))
+			lion_where_collect(st, sources, nwhere);
+		st->wspent += own;
+	}
+	st->wcounts++;
+
+	if (!st->wcollected)
+		return lion_node_count(st, nsource, sources, false);
+
+	/* the group, the collected set, what it does not hold, a second group */
+	st->wsources[n++] = sources[0];
+	memset(&st->wsources[n], 0, sizeof(LionCountSource));
+	st->wsources[n].nsets = 1;
+	st->wsources[n].sets = &st->wherecoll;
+	n++;
+	for (k = 1; k <= nwhere; k++)
+	{
+		if (sources[k].rangewalk != NULL)
+			st->wsources[n++] = sources[k];
+	}
+	for (k = nwhere + 1; k < nsource; k++)
+		st->wsources[n++] = sources[k];
+	Assert(n <= st->nsource + 1);
+
+	return lion_node_count(st, n, st->wsources, false);
+}
+
 /*
  * The next group of the relation the node has open, as one row.
  *
@@ -11415,7 +11728,10 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 			return NULL;
 		}
 
-		count = lion_node_count(st, st->nsource, st->sources, false);
+		/* another entry already in hand is another count to come */
+		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
+								 st->groupset.ntids,
+								 lion_entry_scan_batch_left(&st->escan) > 0);
 		keyisnull = st->groupset.keyisnull;
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
@@ -11447,7 +11763,8 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
  * (lion_pause_run()), and any located past the §15 pin budget - is located
  * again for its group, into groupset, and released after the count: it is the
  * source that carries the interlock for the group, the other WHERE sets being
- * NOPIN copies by then too.
+ * NOPIN copies by then too - or, once they are worth it, one collected set
+ * (lion_group_count()), which is a pinless copy as well.
  */
 static TupleTableSlot *
 lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
@@ -11475,6 +11792,7 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 		ps = &src->sets[st->ingroupset++];
 		if (!ps->found)
 			continue;			/* a listed value with no entry: no group */
+		st->ingroupleft--;
 
 		Assert(ps->hasstoredkey && !ps->keyisnull);
 
@@ -11506,7 +11824,10 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 			st->dsources[0].sets = &st->groupset;
 		}
 
-		count = lion_node_count(st, st->ndsource, st->dsources, false);
+		/* the WHERE is every other item: collected once, when that pays */
+		count = lion_group_count(st, st->ndsource, st->dsources,
+								 st->ndsource - 1, st->dsources[0].sets->ntids,
+								 st->ingroupleft > 0);
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
@@ -11538,7 +11859,10 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
  * column has.  The inner keys were read once per relation into innercxt
  * (lion_load_inner_keys()); when they did not fit its budget, innerkey is
  * NULL and the inner index's entry scan is walked once per outer group
- * instead, which holds one pin at a time as well.
+ * instead, which holds one pin at a time as well.  The WHERE items are
+ * collected once per relation when that pays (lion_group_count()), and the
+ * pairs after that are counted against the copy - the inner set carrying the
+ * interlock, as it does for the WHERE sets' copies once a row has gone up.
  *
  * That walk outlives many pairs, and so do the memory contexts
  * lion_entry_scan_begin_col() creates for its position and its batch, under
@@ -11558,6 +11882,7 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 	{
 		Datum		ikey = (Datum) 0;
 		bool		ikeyisnull;
+		bool		more;
 		int64		count;
 
 		CHECK_FOR_INTERRUPTS();
@@ -11638,7 +11963,17 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 			ikeyisnull = st->groupset2.keyisnull;
 		}
 
-		count = lion_node_count(st, st->nsource, st->sources, false);
+		/*
+		 * The WHERE items are collected once, when that pays, and the pair is
+		 * counted against the copy; another inner key, or another outer entry
+		 * in hand, is another count to come.
+		 */
+		more = (st->innerkey != NULL) ? (st->inneridx < st->ninnerkey) :
+			(lion_entry_scan_batch_left(&st->escan2) > 0);
+		more = more || lion_entry_scan_batch_left(&st->escan) > 0;
+		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
+								 Min(st->groupset.ntids, st->groupset2.ntids),
+								 more);
 		lion_posting_set_release(&st->groupset2);
 		MemoryContextSwitchTo(oldcxt);
 
@@ -13440,6 +13775,20 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->rangesrc_spilled > 0)
 			ExplainPropertyInteger("Range Sources Spilled", NULL,
 								   st->rangesrc_spilled, es);
+
+		/*
+		 * The WHERE items of a GROUP BY collected into one set that the groups
+		 * were counted against (DESIGN.md §10, "The WHERE sets, collected
+		 * once"): once per relation - per partition, and again on a rescan -
+		 * that did; and of those, the ones past a hash table's memory that
+		 * went to a temporary file.  Only when there were any.
+		 */
+		if (st->wherecollected > 0)
+			ExplainPropertyInteger("WHERE Sets Collected", NULL,
+								   st->wherecollected, es);
+		if (st->wherespilled > 0)
+			ExplainPropertyInteger("WHERE Sets Spilled", NULL,
+								   st->wherespilled, es);
 
 		/*
 		 * The batches an IN list too long to locate at once was counted in
