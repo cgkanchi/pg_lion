@@ -3642,18 +3642,30 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
 		}
 		else if (LionPageIsContainer(page) && maxoff >= FirstOffsetNumber)
 		{
+			OffsetNumber first = lion_posting_first_data(page);
+
 			u->ohead = opaque->owner_head;
 			if (opaque->level == 0)
 			{
 				u->ckey = opaque->minckey;
 				ok = true;
 			}
-			else if (lion_posting_first_data(page) <= maxoff &&
-					 ItemIdGetLength(PageGetItemId(page, lion_posting_first_data(page))) ==
-					 LION_POSTING_PIVOT_SIZE)
+			else if (first <= maxoff)
 			{
-				u->ckey = lion_posting_pivot(page, lion_posting_first_data(page))->ckey;
-				ok = true;
+				/*
+				 * The line pointer is vouched for before the pivot is read,
+				 * as every other item this file reads is: its length alone
+				 * says nothing about WHERE it points, and a damaged offset
+				 * put the "pivot" past the end of the page.
+				 */
+				ItemId		iid = lion_verify_itemid(vs, blk, page, first);
+
+				if (ItemIdIsUsed(iid) &&
+					ItemIdGetLength(iid) == LION_POSTING_PIVOT_SIZE)
+				{
+					u->ckey = lion_posting_pivot(page, first)->ckey;
+					ok = true;
+				}
 			}
 		}
 	}
