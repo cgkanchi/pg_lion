@@ -1,0 +1,76 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s2_delete s1_group s3_pins s3_vacuum s2_reuse s1_rest s1_check
+step s2_delete: DELETE FROM cpv WHERE c = 1 AND id <= 2000;
+step s1_group: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE cpv_cur CURSOR FOR SELECT g, count(*) FROM cpv WHERE c = 1 GROUP BY g;
+	SELECT cpv_take(1) AS first;
+
+first
+-----
+    1
+(1 row)
+
+step s3_pins: 
+	SELECT count(*) AS lion_pages_pinned FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode IN (pg_relation_filenode('cpv_g'), pg_relation_filenode('cpv_c'))
+	   AND pinning_backends > 0;
+
+lion_pages_pinned
+-----------------
+                0
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) cpv;
+step s2_reuse: INSERT INTO cpv SELECT 10000 + i, i % 4, 1 FROM generate_series(1, 2000) i;
+step s1_rest: SELECT cpv_take(NULL) AS rest;
+rest
+----
+   1
+(1 row)
+
+step s1_check: 
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SELECT (SELECT count(*) FROM cpv_got) AS groups,
+		   (SELECT count(*) FROM
+			((SELECT g, n FROM cpv_got
+			  EXCEPT ALL SELECT g, count(*) FROM cpv WHERE c = 1 GROUP BY g)
+			 UNION ALL
+			 (SELECT g, count(*) FROM cpv WHERE c = 1 GROUP BY g
+			  EXCEPT ALL SELECT g, n FROM cpv_got)) d) AS wrong;
+	COMMIT;
+
+groups|wrong
+------+-----
+     2|    0
+(1 row)
+
+
+starting permutation: s2_delete s1_count s3_pins s3_vacuum s1_commit
+step s2_delete: DELETE FROM cpv WHERE c = 1 AND id <= 2000;
+step s1_count: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE cpv_cnt CURSOR FOR SELECT count(*) FROM cpv WHERE c = 1 AND g = 1;
+	FETCH 1 FROM cpv_cnt;
+
+count
+-----
+  100
+(1 row)
+
+step s3_pins: 
+	SELECT count(*) AS lion_pages_pinned FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode IN (pg_relation_filenode('cpv_g'), pg_relation_filenode('cpv_c'))
+	   AND pinning_backends > 0;
+
+lion_pages_pinned
+-----------------
+                0
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) cpv;
+step s1_commit: COMMIT;

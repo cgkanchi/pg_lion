@@ -1616,7 +1616,8 @@ Executor
   context of the node's that lives exactly as long as the scan - the per-tuple memory the evaluation
   leaves its result in belongs to nobody here). ReScan throws them away with everything else.
 - ExecCustomScan without GROUP BY: on the first call compute lion_count_keys for the WHERE keys and
-  return one tuple (count); subsequent calls return NULL.
+  return one tuple (count); subsequent calls return NULL. (What the node holds between two rows and
+  after its last one: §15, "Paused and finished counts".)
 - ExecCustomScan with GROUP BY: iterate all entries of the group-by index in bucket order (walk
   bucket pages; copy each entry's key and head/inline payload while pinned as in §9). For each
   entry, count the AND of its posting set with the WHERE posting sets (§9). Emit (key, count) only
@@ -2697,6 +2698,51 @@ a GROUP BY's copies of its WHERE sets stay within work_mem; and that a temporary
 buffers answers what failed before. On the old code every one of those checks fails.
 `test/isolation/count_batch_race.spec` parks a batched count at its first visibility-map question:
 one batch's pages are pinned where the whole list's were, and a VACUUM waits for them.
+
+### Paused and finished counts (2026-09-28)
+
+The cursors above are those of ONE count. Between two counts the node held pins as well (2026-09-27
+review): the WHERE sets are located once per relation (§10) and an INLINE one keeps its leaf pinned
+(§9), so a GROUP BY paused in a cursor held those pins for as long as the client left it open, and
+a node that had returned its last row - the one row of a plain count included - held them until the
+transaction ended; the outer group of §20 kept its set's pin across the rows of its inner loop.
+VACUUM's cleanup lock on those leaves (§11) waited for all of it. §9 wants the pin only while a
+container of the set is checked against the visibility map, which no count does between two rows,
+so now:
+
+- **A node that is done lets go of everything** at once (`lion_finish_run()`): its walks, its group
+  sets and its WHERE sets. A rescan locates them afresh, as it always did. (A partitioned scan
+  already let go of each partition's at the end of that partition's turn.)
+- **A row with more to come keeps the sets but not their pins** (`lion_pause_run()`). Besides the
+  walk's own pause (§28, `lion_entry_scan_pause()`), every located WHERE set that holds a pin gives
+  it up and becomes NOPIN (`lion_posting_set_unpin()`): the private copy a set located past the pin
+  budget above has always been, which every count already knows how to take. The outer set of §20
+  does the same.
+
+Why the counts after a pause stay exact and still trust the map. A NOPIN copy carries no interlock
+of its own; a count needs ONE positive source that holds a pin at every container key
+(`lion_source_pinned()`) and otherwise trusts no map (`cx.novm`). Every shape that returns more than
+one row locates the set that drives each count afresh, under a pin of its own: a group's entry from
+the walk (§10), the inner set of a (g, k) pair (§20, §26), the fk set of a dimension row (§27). That
+is §9's argument for a materialized WHERE set: every member of the intersection is in the pinned
+source's container, so VACUUM cannot have finished ambulkdelete on the page it came from, nor set
+any of those heap pages all-visible. The one driver that was not located per count is the IN list
+that drives its own groups, whose groups ARE the clause's located sets; a set of it that holds no
+pin is now located again for its group (`lion_next_group_inlist()`) - which also gives the interlock
+back to the sets past the pin budget, whose groups went to the heap when every other source was
+NOPIN too. What a copy can disagree with a fresh locate about does not matter: a TID removed since
+is a dead row's, and one added since is a row the snapshot cannot see (§29.5 cases 1 to 3).
+
+The cost is a loop over the located sets per row, with nothing left to unpin after the first, and
+one lookup per group of a list-driven GROUP BY. Between two rows the node holds private memory
+only: the located sets' copies, the walk's batch of CHAIN copies, §20's inner keys.
+`test/sql/countpause.sql` checks with pg_buffercache that each shape, paused in a cursor, pins no
+page of any lion index and that a finished one pins none either, and that the rows after the pause
+are the ordinary plan's; `test/sql/pinbudget.sql`'s GROUP BY under a long list, which held a pin
+per leaf of the list while paused, holds none. `test/isolation/count_pause_vacuum.spec` has VACUUM
+complete under a GROUP BY paused after its first group and under a plain count done after its row,
+and the paused cursor's other groups come out as its snapshot saw them after VACUUM has removed TIDs
+its copy of the WHERE set still lists and an insert has taken their slots back.
 
 ## 16. Partitioned tables (v1, implemented)
 
@@ -3806,12 +3852,14 @@ before anything else looks at them, so `groupattno`/`groupidxoid` are always the
 EXPLAIN names them first. The choice does not change the total intersection work (below); what it
 decides is how many entry scans there are and whose keys are held in memory.
 
-**The loop** (`lion_next_group2()`). For each outer entry: hold its key and its posting set - and
-that set's pin - in `outercxt` for the whole of its inner loop; for each inner key, locate the inner
-posting set, count the AND of (outer group, WHERE sources, inner group) through
-`lion_count_sources_cached()`, release the inner set, and emit (outer key, inner key, count) when
-the count is above zero. At most two group pins exist at a time, however many distinct values either
-column has, which is the pin budget of §9. NULL groups are each column's reserved NULL entry (§14)
+**The loop** (`lion_next_group2()`). For each outer entry: hold its key and its posting set in
+`outercxt` for the whole of its inner loop; for each inner key, locate the inner posting set, count
+the AND of (outer group, WHERE sources, inner group) through `lion_count_sources_cached()`, release
+the inner set, and emit (outer key, inner key, count) when the count is above zero. At most two
+group pins exist at a time, however many distinct values either column has, which is the pin budget
+of §9 - and none while a row is up with the executor: the outer set gives its pin up then and is a
+NOPIN copy for the rest of its loop, whose pairs the inner sets carry (§15, "Paused and finished
+counts"). NULL groups are each column's reserved NULL entry (§14)
 and come out like any other; `count(col)` of a group column is 0 in THAT column's NULL group, which
 is why there are two target-list kinds for it.
 
@@ -6568,14 +6616,15 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   index takes the `PredicateLockRelation()` every index the node opens takes.
 - **One snapshot for both sides.** The child and the count both read `es_snapshot`, so a fact row
   is counted for a dimension row exactly when both are visible to it - which is the join.
-- **The WHERE sets' pins are held across the child.** The fact filters are located once per scan
-  and keep their pins (§9) while the node calls `ExecProcNode()` on the dimension child between
-  counts. A child that runs user code - a slow function in a dimension qual, a `pg_sleep()` - can
-  therefore keep a manual VACUUM of the fact table waiting on its cleanup lock on those index pages
-  for the whole query (2026-09-23 review). That is the exposure every scan that holds a pin while
-  the query runs has - a core index scan parked under a slow qual, or §10's streaming GROUP BY
-  node, whose WHERE pins live from its first group to its last - and not a correctness issue: the
-  VACUUM waits (autovacuum skips the page), and the query ends.
+- **The WHERE sets' pins are held across the child** - until the node returns its first row. The
+  fact filters are located once per scan and keep their pins (§9) while the node calls
+  `ExecProcNode()` on the dimension child between counts. A child that runs user code - a slow
+  function in a dimension qual, a `pg_sleep()` - can therefore keep a manual VACUUM of the fact
+  table waiting on its cleanup lock on those index pages until then (2026-09-23 review). That is
+  the exposure every scan that holds a pin while the query runs has - a core index scan parked
+  under a slow qual - and not a correctness issue: the VACUUM waits (autovacuum skips the page).
+  From the first row on the WHERE sets are NOPIN copies, each count carried by its fk set's pin,
+  and the node holds no pin between rows or after its last (§15, "Paused and finished counts").
 
 ### Planner integration
 
@@ -7558,6 +7607,7 @@ can hold that row for ever, so the node calls `lion_entry_scan_pause()` whenever
 batch that still holds INLINE copies drops them with their pin, and the next call reads the leaf
 again from the last entry handed out. A GROUP BY over INLINE entries therefore still reads a leaf per
 group, as it always did; it emits a row per group anyway. A batch of CHAIN copies survives the pause.
+The node's located sets give their pins up at the same point (§15, "Paused and finished counts").
 The sums never pause: the sum over a range, the sum-over-all of §14, the count(DISTINCT) walk of §26
 and `lion_index_count_group_stats()` each walk to the end within one call. §28's pinned-GROUP-BY
 test (`range.sql` §14, at most one leaf pinned) holds as before.

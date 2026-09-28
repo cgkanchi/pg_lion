@@ -889,9 +889,11 @@ typedef struct LionCountScanState
 	 * a sumall), slots 1 .. nitem the WHERE items - one per plain clause and
 	 * one per OR restriction (DESIGN.md §19) - and, for a two-column GROUP BY
 	 * (DESIGN.md §20), slot nitem + 1 is the inner group.  The clause sources
-	 * are located once per node execution and keep their pins (DESIGN.md
-	 * section 9) until the node is reset or closed; the groups' sets are
-	 * located, counted and released one group (one pair) at a time.
+	 * are located once per node execution and kept until the node is done,
+	 * reset or closed - their pins (DESIGN.md section 9) only until the first
+	 * row goes up, which leaves them NOPIN copies (lion_pause_run()); the
+	 * groups' sets are located, counted and released one group (one pair) at
+	 * a time.
 	 */
 	LionCountSource *sources;
 	int			nsource;		/* nitem + 1, or nitem + 2 with two group cols */
@@ -9988,11 +9990,14 @@ lion_build_filter(LionCountScanState *st)
 
 /*
  * Locate the posting sets of every WHERE clause of the relation the node is
- * counting.  They keep their pins (for INLINE entries) until
- * lion_release_where(), which is exactly the DESIGN.md section 9 discipline
- * applied for the length of that relation's processing rather than for one
- * container.  With partitions that is one partition's turn; with a plain
- * table it is the whole node execution.
+ * counting.  They stay located until lion_release_where() - with partitions
+ * for one partition's turn, with a plain table until the node is done - and
+ * keep their pins (for INLINE entries) until the node first hands a row to
+ * the executor, when they become NOPIN copies (lion_pause_run(); DESIGN.md
+ * §15, "Paused and finished counts").  Until then that is the DESIGN.md
+ * section 9 discipline applied for the length of the counts rather than for
+ * one container; after it, each count takes its interlock from the set that
+ * drives it.
  */
 static void
 lion_locate_where(LionCountScanState *st)
@@ -11087,14 +11092,19 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
  * the ungrouped form short-circuits to - split into its terms.
  *
  * Pins and memory (DESIGN.md §9).  The sets belong to the clause and were
- * located once for this relation, with their pins, by lion_locate_where(); the
- * group loop neither takes nor releases any, and the key it emits is the copy
- * the set already holds, which outlives the row.
+ * located once for this relation, with their pins, by lion_locate_where(), and
+ * the key the loop emits is the copy the set already holds, which outlives the
+ * row.  A set that holds no pin - every INLINE one once a row has gone up
+ * (lion_pause_run()), and any located past the §15 pin budget - is located
+ * again for its group, into groupset, and released after the count: it is the
+ * source that carries the interlock for the group, the other WHERE sets being
+ * NOPIN copies by then too.
  */
 static TupleTableSlot *
 lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 {
 	LionCountSource *src = &st->sources[st->ingroupitem + 1];
+	LionClauseState *cl = &st->clause[st->item[st->ingroupitem].clauseno];
 	MemoryContext oldcxt;
 
 	*exhausted = false;
@@ -11129,7 +11139,26 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 		st->dsources[0].nomaterialize = false;
 		st->dsources[0].disjoint = false;
 
+		/*
+		 * The entry as it is now, under a pin of its own.  One that has gone
+		 * meanwhile held no row anyone can see (VACUUM deletes only an empty
+		 * entry, §18): no group.
+		 */
+		if (ps->nopin)
+		{
+			if (!lion_posting_set_lookup_col(cl->idx, cl->idxcol,
+											 ps->storedkey, InvalidOid,
+											 &st->groupset))
+			{
+				lion_posting_set_release(&st->groupset);
+				MemoryContextSwitchTo(oldcxt);
+				continue;
+			}
+			st->dsources[0].sets = &st->groupset;
+		}
+
 		count = lion_node_count(st, st->ndsource, st->dsources, false);
+		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
 		/* A group exists only if at least one of its rows is visible. */
@@ -11152,7 +11181,9 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
  * visible row is a group at all, so only those are emitted.
  *
  * Pins and memory (DESIGN.md §9).  The outer group's set is located once and
- * held - with its pin - for the whole of its inner loop, in outercxt; each
+ * held for the whole of its inner loop, in outercxt - with its pin until the
+ * first of its pairs goes up as a row, and as a NOPIN copy after that
+ * (lion_pause_run()), the pairs being carried by their inner sets; each
  * pair's inner set is located, counted and released inside pergroup, so at
  * most two group pins exist at a time however many distinct values either
  * column has.  The inner keys were read once per relation into innercxt
@@ -12052,6 +12083,84 @@ lion_exec_partitioned(LionCountScanState *st)
 	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 }
 
+/*
+ * A row is about to go up to the executor, which may not ask for the next one
+ * for as long as a cursor stays open - so nothing the node keeps across the
+ * row may hold a buffer pin, or an idle cursor would hold VACUUM up on that
+ * page (§11 takes a cleanup lock on every page it rewrites).  DESIGN.md §9's
+ * pin is the interlock for a count's visibility-map questions and nothing
+ * else, and between two rows no count is running:
+ *
+ *	- the walks let go of the directory leaf they stand on
+ *	  (lion_entry_scan_pause());
+ *	- every located WHERE set that holds a pin - an INLINE one - gives it up
+ *	  and becomes NOPIN (lion_posting_set_unpin()): a private copy, which is
+ *	  what a set located past the §15 pin budget has always been, and which
+ *	  every count already knows how to take.  Each count after this row gets
+ *	  the interlock from the set that drives it, which every shape that
+ *	  returns more than one row locates afresh under a pin of its own - a
+ *	  group's entry, the inner set of a (g, k) pair (§20, §26), the fk set of
+ *	  a dimension row (§27), and the listed value an IN list drives the
+ *	  groups by, which lion_next_group_inlist() locates again for that
+ *	  reason.  A count that is left with no source that carries it trusts no
+ *	  map and rechecks, and a lone NOPIN set is located again before it is
+ *	  counted, as always (lion_count_sources_cached());
+ *	- and the outer group's set of a two-column GROUP BY (§20) does the same:
+ *	  its remaining pairs are carried by their inner sets.
+ */
+static void
+lion_pause_run(LionCountScanState *st)
+{
+	int			i;
+	int			j;
+
+	if (st->scanning)
+		lion_entry_scan_pause(&st->escan);
+	if (st->scanning2)
+		lion_entry_scan_pause(&st->escan2);
+
+	if (st->sources != NULL)
+	{
+		for (i = 1; i <= st->nitem; i++)
+		{
+			LionCountSource *src = &st->sources[i];
+
+			for (j = 0; j < src->nsets; j++)
+				lion_posting_set_unpin(&src->sets[j]);
+		}
+	}
+	if (st->outeropen)
+		lion_posting_set_unpin(&st->groupset);
+}
+
+/*
+ * The node has produced its last row.  A plain table stays open until the
+ * node ends, and everything located in it used to stay located with it - the
+ * WHERE sets and their pins, which a cursor left open after its last FETCH, or
+ * after the one row of a plain count, held until the transaction ended.
+ * Nothing is counted again before a rescan, which locates everything afresh,
+ * so the walks, the group sets and the WHERE sets all go now.  (A partitioned
+ * scan has let go of each partition's at the end of its turn already.)
+ */
+static void
+lion_finish_run(LionCountScanState *st)
+{
+	if (st->scanning)
+	{
+		lion_entry_scan_end(&st->escan);
+		st->scanning = false;
+	}
+	if (st->scanning2)
+	{
+		lion_entry_scan_end(&st->escan2);
+		st->scanning2 = false;
+	}
+	lion_posting_set_release(&st->groupset);
+	lion_posting_set_release(&st->groupset2);
+	st->outeropen = false;
+	lion_release_where(st);
+}
+
 static TupleTableSlot *
 lion_exec_custom_scan(CustomScanState *node)
 {
@@ -12078,18 +12187,17 @@ lion_exec_custom_scan(CustomScanState *node)
 	}
 
 	/*
-	 * A row goes up to the executor, which may not ask for the next one for as
-	 * long as a cursor stays open: the walks let go of the directory leaf they
-	 * stand on (lion_entry_scan_pause()), so that an idle cursor over a GROUP BY
-	 * does not hold VACUUM up on it.
+	 * No pin outlives the call (DESIGN.md §15, "Paused and finished counts"):
+	 * a node that is done lets go of everything, and one that returns a row
+	 * with more to come keeps its sets but none of their pins.  The row
+	 * itself points at nothing either releases: a key the WHERE pinned is in
+	 * keycxt, a group's key in pergroup or outercxt, and a listed value's in
+	 * the set, which a pause keeps.
 	 */
-	if (slot != NULL)
-	{
-		if (st->scanning)
-			lion_entry_scan_pause(&st->escan);
-		if (st->scanning2)
-			lion_entry_scan_pause(&st->escan2);
-	}
+	if (st->done)
+		lion_finish_run(st);
+	else if (slot != NULL)
+		lion_pause_run(st);
 	st->dirpages += lion_dir_pages_read - dirbefore;
 
 	return slot;

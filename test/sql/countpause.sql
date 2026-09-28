@@ -1,0 +1,122 @@
+-- What a count pushdown holds while a cursor leaves it paused between two
+-- rows, and once it has returned its last one (DESIGN.md §15, "Paused and
+-- finished counts").  The WHERE sets are located once and an INLINE one keeps
+-- its directory leaf pinned while it is counted (§9); they used to keep those
+-- pins across every row and after the last, until the transaction ended, so
+-- an idle cursor held VACUUM up on the leaf (the 2026-09-27 review).  Now a
+-- node that is done lets go of everything and one paused between rows keeps
+-- its sets as NOPIN copies, each later count carried by the set that drives
+-- it.  Every shape below is read through a cursor: one row, then how many
+-- pages of the table's lion indexes some backend pins (this one's own pins
+-- included), then the rest, then the pins again; and its rows must be the
+-- ordinary plan's.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+/* Pages of lion_cp's lion indexes that some backend pins right now. */
+CREATE FUNCTION lion_cp_pinned() RETURNS bigint
+LANGUAGE sql AS $$
+	SELECT count(*) FROM pg_buffercache
+	 WHERE reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+	   AND relfilenode IN (SELECT pg_relation_filenode(c.oid) FROM pg_class c
+						   WHERE c.relname LIKE 'lion\_cp\_%' AND c.relkind = 'i')
+	   AND pinning_backends > 0
+$$;
+
+/*
+ * lion_cp() reads q through a cursor with every other scan disabled - one
+ * row, the pins, the rest, the pins again - and reads it once more as a
+ * sequential scan with the pushdown off.  It says whether the node ran, how
+ * many rows came out and how many pages were pinned at each point, after
+ * proving the two answers equal as multisets.
+ */
+CREATE FUNCTION lion_cp(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	c refcursor := 'lion_cp_cur';
+	r record;
+	ln text;
+	pushed boolean := false;
+	paused bigint;
+	done bigint;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+
+	EXECUTE 'CREATE TEMP TABLE lion_cp_on (r text)';
+	OPEN c FOR EXECUTE q;
+	FETCH c INTO r;
+	EXECUTE 'INSERT INTO lion_cp_on VALUES ($1)' USING r::text;
+	paused := lion_cp_pinned();
+	LOOP
+		FETCH c INTO r;
+		EXIT WHEN NOT FOUND;
+		EXECUTE 'INSERT INTO lion_cp_on VALUES ($1)' USING r::text;
+	END LOOP;
+	done := lion_cp_pinned();
+	CLOSE c;
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_cp_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_cp_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_cp_on EXCEPT ALL SELECT * FROM lion_cp_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_cp_off EXCEPT ALL SELECT * FROM lion_cp_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_cp_on, lion_cp_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows, %s pinned while paused, %s when done',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows, paused, done);
+END $$;
+
+/*
+ * c = 1 is 300 rows, an INLINE entry; g has 4 values, h 3.  The rows with
+ * c = 1 are the odd ones, so their g is 1 or 3, and they make 6 (g, h) pairs.
+ */
+CREATE TABLE lion_cp (g int NOT NULL, h int NOT NULL, c int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cp SELECT i % 4, i % 3, i % 10 FROM generate_series(1, 3000) i;
+CREATE INDEX lion_cp_g ON lion_cp USING lion (g);
+CREATE INDEX lion_cp_h ON lion_cp USING lion (h);
+CREATE INDEX lion_cp_c ON lion_cp USING lion (c);
+VACUUM ANALYZE lion_cp;
+
+-- a GROUP BY: each group's entry, from the walk, carries the counts after the pause
+SELECT lion_cp('SELECT g, count(*) FROM lion_cp WHERE c = 1 GROUP BY g');
+-- two columns (§20): the outer group's set is held across its pairs
+SELECT lion_cp('SELECT g, h, count(*) FROM lion_cp WHERE c = 1 GROUP BY g, h');
+-- an IN list that drives its own groups (§15): each group located again
+SELECT lion_cp('SELECT g, count(*) FROM lion_cp WHERE g IN (0, 1, 3) AND c = 1 GROUP BY g');
+-- count(DISTINCT) per group (§26)
+SELECT lion_cp('SELECT g, count(DISTINCT h) FROM lion_cp WHERE c = 1 GROUP BY g');
+-- one row, and done at once
+SELECT lion_cp('SELECT count(*) FROM lion_cp WHERE c = 1 AND h = 2');
+
+DROP TABLE lion_cp;
+DROP FUNCTION lion_cp(text);
+DROP FUNCTION lion_cp_pinned();
