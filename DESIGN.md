@@ -1969,13 +1969,14 @@ count competes with a hash aggregate on close to equal terms, the aggregate wins
 loses on the machine (§31 lists the cases). Pricing lion at the hash aggregate's rate instead would
 make it beat sequential and index-only scans it is up to twice as slow as.
 
-**The merge** (`lion_merge_cpu_cost()`; every count, every group and pair of a GROUP BY, the AND
-of a lion index scan's sets in `lioncostestimate()`). Fitted to the backend CPU time of 35 counts
-over the 5M-row `s` - eleven single sets holding 1 to 4,500 rows a container (sparse arrays,
-dense arrays, bitsets, RUN containers), eighteen pairs, five triples and a quadruple of them ANDed
-- by non-negative least squares on the features the planner can compute (the driver's containers
-and members, the probes after the early exit, the running intersection's members, the probed
-pages):
+**The merge** (`lion_merge_cpu_cost()`; every count, every group and pair of a GROUP BY, the AND of
+a lion index scan's sets in `lioncostestimate()` - since 2026-09-28 with the lookups, unions and
+pages around it, one price for both, `lion_cost_set_and()`, §29.11). Fitted to the backend CPU time
+of 35 counts over the 5M-row `s` - eleven single sets holding 1 to 4,500 rows a container (sparse
+arrays, dense arrays, bitsets, RUN containers), eighteen pairs, five triples and a quadruple of them
+ANDed - by non-negative least squares on the features the planner can compute (the driver's
+containers and members, the probes after the early exit, the running intersection's members, the
+probed pages):
 
 | constant | value | fitted | what |
 |---|---|---|---|
@@ -5219,6 +5220,14 @@ tree - at each of the 219 container keys of `c20k = 77`, where the executor aban
 them once `c200 = 17` is empty (217 "Probes Avoided"). It cost 777 against a BitmapAnd's 237 and
 took 0.03 ms against 2.8; it now costs 59. The probed pages of `lion_probed_pages()` are counted
 over the probes that happen, too.
+
+**Since 2026-09-28 these terms are shared with the lion index scan** (§29.11, "One price for the
+AND of sets"). A WHERE source's lookup, the pages a walk of its sets reads, its containers and a
+list's union are `lion_cost_set_clause()`'s, what the driver walks and the others' probes touch is
+`lion_cost_set_pages()`'s, and the directory leaves the lookups read - one each, and no more of an
+index than its directory has - `lion_cost_leaf_pages()`'s; `lion_cost_set_and()` puts them
+together with `lion_merge_cpu_cost()` exactly as an ungrouped count does, and `lioncostestimate()`
+charges that for a scan's AND of two sets or more.
 
 ### The open item: the node is charged for pages, its competitor for tuples
 
@@ -9919,7 +9928,90 @@ sets whose AND was 1,730 rows of 8M ran 52 ms on lion against 1.2 ms on a btree 
 columns at about the same cost (6.5k against 6.2k). On §31's 5M-row `w` the same shape, four
 sets ANDed to 48,000 rows, raised the lion plain scan from 80,300 to 83,900, and the planner now
 takes the btree's bitmap heap scan (79,800; 52 ms of CPU) over it (82 ms). Plain and bitmap paths
-share the estimate, and both make the same AND (§29.2).
+share the estimate, and both make the same AND (§29.2). *(Superseded by "One price for the AND of
+sets", below: the merge is still the count's, and now so is everything else about the sets.)*
+
+**One price for the AND of sets** (2026-09-28, `lion_cost_set_and()`). The count pushdown and a
+lion index scan make the same AND of the same posting sets, and were priced for it by two models.
+A benchmark's count over several correlated filters answered by one multicolumn index ran faster
+as `LionCount` than as the plain lion scan the planner chose, and was priced well above it. For
+the same clauses the two prices differed in:
+
+- **the lookups.** The count charged each clause's directory leaf at `random_page_cost` and its
+  descent, `LION_DESCENT_COST` a level (§21), and an IN list's values their leaves, read in key
+  order at `lion_heap_page_cost()`, and a search each. The scan charged none of them:
+  `genericcostestimate()` prorated the index by the selectivity of the quals together - the pages
+  of the RESULT's postings at `random_page_cost`, one at least, spread over an IN list's
+  `num_sa_scans` - so clauses whose product is a few rows paid for about one page however many
+  there were.
+- **the unions.** The count read every container of an IN list's sets (`LION_CONTAINER_COST`, and
+  `LION_MEMBER_COST` a member up to `LION_MEMBER_CAP`) and merged them (`lion_merge_ops()`, in
+  `cpu_operator_cost`); the scan took the list for one set and charged neither.
+- **the containers.** The count counted a key's containers by its column's correlation with the
+  heap (`lion_key_containers()`), the scan as scattered (`lion_containers_for()`); both merge
+  them with `lion_merge_cpu_cost()`.
+- **the posting pages.** The count charged the driver's walk at `seq_page_cost` and the pages the
+  others' probes touch at `lion_heap_page_cost()`, a clause's pages being its column's share of
+  the index's container pages - the index less its meta page and directory - by the clause's
+  selectivity, one at least (an IN list: one a value). The scan charged the whole index's share by
+  the selectivity, and only what exceeded the prorated pages, all at `seq_page_cost`.
+- **the clauses.** The scan answered one qual per key column - an equality before a list before a
+  range before a null test, the rest left to the recheck - until 2026-09-28, and every set qual of
+  every column since (§29.2, `samecolumn_scan.sql`), as the count ANDs every positive clause;
+  `lion_set_merge_cost()` then counted every set qual a source, priced as above. A scan and a count
+  over the same clauses now AND the same sets. What is no set is each path's own: a range, which
+  the scan walks on a column without sets (`lion_range_entry_cost()`) and the count may take for a
+  source (§32), and a multi-key query that needs every row, which both leave to a recheck of the
+  rows the other sources leave - and which the count's price still counts a source of its AND as
+  well (`lion_cost_count_rel()`, an overcharge of the count on that shape, left as it was).
+
+One function prices it now. `lion_cost_set_and()` (lion_customscan.c) prices each clause as
+`lion_cost_count_rel()` prices a WHERE source - `lion_cost_set_clause()`: its lookups, what a walk
+of its sets reads, its containers and, for a list, the union - intersects them with
+`lion_merge_cpu_cost()`, and charges the driver's walk and the sought sources' pages
+(`lion_cost_set_pages()`), and the lookups' directory leaves (`lion_cost_leaf_pages()`);
+`lion_cost_count_rel()` takes the same terms from the same functions for its sources, clause by
+clause. `lioncostestimate()` feeds it every set qual the scan answers, of every key column and
+several of one - item for item the classification `lion_scan_choose()` makes, which
+`lion_cost_col_quals()` mirrors, less a multi-key query that needs every row
+(`lion_cost_qual_is_full()`) - and where there are two or more, charges it in place of the pages
+`genericcostestimate()` prorated (`lion_generic_page_cost()`, that function's own formula) and of
+`lion_set_merge_cost()`, which is gone; it keeps what is the scan's: a TID a result row at
+`cpu_index_tuple_cost`, the quals' arguments, and the heap, which core prices. A nested loop's inner
+scan repeats the AND, and its pages are spread over the repetitions as `genericcostestimate()`
+spreads its own (`index_pages_fetched()`). What is the count's own is the heap recheck of the pages
+the visibility map cannot vouch for, and its row; its visibility-map checks are inside the merge's
+constants, which were fitted on counts (`LION_MEMBER_COST` is the mask built from a container's
+members), so the scan is charged them too - 0.74 ns a member beside the 10 ns a TID it pays anyway.
+Over the same sets an ungrouped count therefore costs the scan's index side, its recheck and a row,
+and no more than the scan with its heap. One set alone is priced as before: what the scan reads of
+it is what it returns, which is what the prorating prices.
+
+Every lion path of two sets or more is priced anew. A small result over several clauses costs
+more: a directory leaf a lookup at `random_page_cost` where the prorating charged one page for all
+of them, and their descents; but no more leaves of one index than its directory has
+(`lion_cost_leaf_pages()`): lookups into a directory of one leaf read it once, and the second is a
+buffer hit. The count had charged every lookup its own leaf, which only ever differed for several
+clauses on one multicolumn index with a small directory, and it now charges the same. Two
+equalities on a larger directory cost about 5 more at the default `random_page_cost`; on a directory
+of one leaf, about 1.5. A large result costs less there, its sets' pages walked and sought at
+`seq_page_cost` and the cache-aware price where they were prorated at `random_page_cost`:
+`plaincost.sql`'s 43% query, three dense sets, by roughly a third on the index side, and by a few
+percent at a `random_page_cost` of 1.1 (derived from the model, not measured). On PostgreSQL 16,
+in both WAL modes, no plan the regression suite pins moves but one. `ordered.sql`'s LionOrdered
+over `a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50` took for its lion side the BitmapOr of
+`a = 3 AND b = 5` and `c = 7`, and now takes `a = 3` alone: the arm's AND rose by its lookups, from
+11.3 to 17.1, and the node is priced 86.6 with `a = 3` against 86.9 with the BitmapOr and 88.4 for
+the ordered btree scan. The new side is the faster: 0.12 to 0.14 ms for the 50 rows against 0.15 to
+0.17, every page in shared buffers - 308 heap fetches against 192, but one set located where the
+BitmapOr locates three and ANDs two. Two units from the btree scan is too close to pin, and the
+test is about the BitmapOr (a restriction clause an arm reuses stays a filter), so it now shows the
+node's plan with plain index scans off, which leaves core's bitmap path, the BitmapOr, for its
+lion side; its expected plan is the one it printed before. Disabling every core scan instead would
+not do: core prices a disabled bitmap path out of the lion-only relation the node takes its lion
+side from, and the node then shows `a = 3` whatever the price. The §31 comparison above of four
+sets against a btree's bitmap heap scan was made with the model this replaces and has not been made
+again.
 
 **A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
 in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
@@ -10258,9 +10350,9 @@ used to be priced as a whole-index walk and a full recheck. Then a dirty heap (r
 answer, rows deleted) and the same after VACUUM. `indexscan.sql` pins the plain scan's recheck: none
 for two lists, the rows a range beside a list removes. No existing plan moves: the suite's other
 queries with two set quals on one column - now charged their merge on a one-column index too
-(`lion_set_merge_cost()`) - force their scan or are counts, which the dearer scan leaves to the
-pushdown, and the qual evaluation per row a plain scan saves on an implied `IS NOT NULL` is far
-below any margin a pinned plan has.
+(`lion_set_merge_cost()`; `lion_cost_set_and()` since, §29.11) - force their scan or are counts,
+which the dearer scan leaves to the pushdown, and the qual evaluation per row a plain scan saves
+on an implied `IS NOT NULL` is far below any margin a pinned plan has.
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 

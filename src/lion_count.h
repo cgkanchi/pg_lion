@@ -1165,6 +1165,35 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,
 								  double tuples, double *probes);
+
+/*
+ * The AND of the posting sets of n clauses of one relation (DESIGN.md §29.11,
+ * "One price for the AND of sets"): the price lion_cost_count_rel() charges
+ * an ungrouped count's WHERE sources, and lioncostestimate() a scan that ANDs
+ * the same sets - the index's work only.  Returns the total; *out has its
+ * parts, whose costs add up to it:
+ *
+ *	leafpages / leafcost	the lookups' directory leaves: one read at
+ *							random_page_cost a lookup, an IN list's in key
+ *							order
+ *	setpages / setcost		the posting pages: the driver's walked in order,
+ *							the others' as far as the seeks reach
+ *	cpu						the descents, the IN lists' unions and the AND's
+ *							merge
+ */
+typedef struct LionAndCost
+{
+	int			nsrc;
+	double		leafpages;
+	Cost		leafcost;
+	double		setpages;
+	Cost		setcost;
+	Cost		cpu;
+} LionAndCost;
+
+extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
+							  IndexOptInfo **idxs, const AttrNumber *cols,
+							  Node **clauses, LionAndCost *out);
 extern double lion_containers_for(double heap_pages, double members);
 extern double lion_index_column_posting_share(PlannerInfo *root,
 											  RelOptInfo *rel,
