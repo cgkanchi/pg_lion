@@ -100,7 +100,9 @@ replay, so turning it on for a primary that never replays proves nothing.
   needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).
 
 `dev.sh` puts its cluster's socket in `$XDG_RUNTIME_DIR/pg_lion-<user>` (or `/tmp/pg_lion-<user>`)
-on port 54329, and `LION_SOCK` / `LION_PORT` move it; the cluster runs with `wal_level = replica`, so
+on port 54329, and `LION_SOCK` / `LION_PORT` move it.  The cluster trusts local connections, so
+`dev.sh` makes a missing socket directory mode 0700, and refuses the default one if it is a symlink,
+belongs to someone else or is open to others.  The cluster runs with `wal_level = replica`, so
 that index builds and the write paths of indexes created in the same transaction are WAL-logged in
 the suite as they are in production.
 
