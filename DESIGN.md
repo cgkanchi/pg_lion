@@ -2432,7 +2432,7 @@ than `LION_LOOKUP_MIN_PINS` = 64: exhausting the pool that way takes a sixteenth
 backends the server is configured for, running lists over the budget at the same moment. On a stock
 server (128MB, 100 connections, some 130 buffers a backend) the share is about 2000 and the thousand
 still binds, so an ordinary configuration pins exactly what it did; the share binds where
-max_connections is large for shared_buffers (128MB and 500 connections: about 490). A plain fair
+max_connections is large for shared_buffers (128MB and 500 connections: about 500). A plain fair
 share, the budget's first version below, sent ordinary lists to the heap; sixteen of them do not.
 And each participant of a parallel FK-side join locates the fact filters for itself (§27), so a
 leader and seven workers took eight budgets: the node now tells each participant how many the plan
