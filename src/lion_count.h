@@ -920,6 +920,16 @@ extern void lion_entry_scan_begin_sum(LionEntryScan *es, Relation index,
 									 int part);
 
 /*
+ * ... and only that: the walk is set up and true is returned when it WILL
+ * read summaries; otherwise false, with nothing left to end, and the caller
+ * walks the keys its own way.  What the bitmap and plain index scans ask
+ * (DESIGN.md §28, "Bitmap scans"), whose key walks predate §32.
+ */
+extern bool lion_entry_scan_begin_summed(LionEntryScan *es, Relation index,
+										 AttrNumber attno, LionRange *range,
+										 int part);
+
+/*
  * Fetch the next entry.  On true, *key is a private copy of the entry's key
  * (palloc'd in the current context) and *ps is its located posting set, which
  * the caller must hand to lion_posting_set_release().  Entries whose posting
@@ -928,6 +938,17 @@ extern void lion_entry_scan_begin_sum(LionEntryScan *es, Relation index,
  */
 extern bool lion_entry_scan_next(LionEntryScan *es, Datum *key,
 								LionPostingSet *ps);
+
+/*
+ * The next entry as the copy the leaf read made, valid until the next call:
+ * no set located, no key copied and no pin kept - the batch's pin for its
+ * INLINE copies (DESIGN.md §9) is dropped at once.  For a caller that hands
+ * every TID it reads to the executor, which visits each in the heap: a bitmap
+ * or plain index scan (§28, §29.5).  A walk is read either this way or with
+ * lion_entry_scan_next(), never both.  *itemlen is the entry's item size.
+ */
+extern LionEntryTuple *lion_entry_scan_next_copy(LionEntryScan *es,
+												 Size *itemlen);
 
 /*
  * Read ONE more leaf of the walk and say how many entries on it the walk

@@ -111,8 +111,9 @@ teardown
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
-# The counting session.  Its reference counts turn the pushdown off, so only
-# the pushdown's steps run into a point.
+# The counting session.  Its reference counts are a sequential scan's, so only
+# the pushdown's steps run into a point: a bitmap or plain index scan of a
+# range reads the summaries as well (DESIGN.md §28, "Bitmap scans").
 session s1
 setup
 {
@@ -128,9 +129,11 @@ step s1_attach_phase	{ SELECT injection_points_attach('lion-entry-scan-phase', '
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step s1_plain	{
 	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL enable_seqscan = on;
 	SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500;
 	SELECT count(*) AS from_500 FROM sr WHERE k >= 500;
 	SELECT count(*) AS between_500_3500 FROM sr WHERE k BETWEEN 500 AND 3500;
+	SET LOCAL enable_seqscan = off;
 	SET LOCAL pg_lion.enable_count_pushdown = on;
 }
 step s1_upto	{ SELECT count(*) AS upto_3500 FROM sr WHERE k <= 3500; }

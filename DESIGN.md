@@ -7945,6 +7945,17 @@ therefore holds at most one index pin at a time and draws nothing from §15's pi
 scan needs no §9 interlock at all, since the executor visits every TID it emits - and its memory is
 the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing.
 
+On a column with SUMMARY posting sets (§32) the walk is the summed walk of a count
+(`lion_entry_scan_begin_summed()`, from `lion_walk_begin()`): the keys of the buckets at the range's
+two ends one by one, and every bucket the range covers whole as its summary - pairwise disjoint sets
+that together are exactly the range's rows, by §32's argument ("Readers"). Whoever takes an entry's
+posting set cannot tell one from the other, so the bitmap scan emits the same TIDs from a few
+thousand entries where a near-unique column's range has a million keys. The entries are the entry
+scan's copies, handed out with no pin (`lion_entry_scan_next_copy()`); the plain scan's walks (§29.3)
+take them the same way, except one that must keep its pins (a non-MVCC snapshot, §29.5), which walks
+the keys. *(Deviation from §32 as first written, which left summaries to the counts and walked the
+keys here: a wide range of a timestamp was a walk of every key it holds, summaries or not.)*
+
 `k < ANY (array)` arrives as an array key with a range strategy (amsearcharray is on for the whole
 family); only `ANY` is ever an index qual. The union of `k < e` over the elements is `k < max(e)`, so
 it is ONE walk to the widest element - the largest for `<` and `<=`, the smallest for `>=` and `>`,
@@ -7981,6 +7992,16 @@ bitmap scan wins; on a near-unique column every row is an entry, the index is la
 correlation to exploit, and a lion scan never has one - wins. `test/sql/range.sql` pins both choices.
 A bound past the histogram's end is estimated with the column's actual end, read from the directory
 (The endpoint probe, below).
+
+A column with SUMMARIES walks fewer entries, and is charged them (`lion_cost_walk_entries()`, which
+`lion_plain_walk_entries()` shares): the keys of the buckets at the range's two ends and one entry per
+bucket it covers whole, by the count's model of a summed side (§32, "Costs": a bucket holds
+`max(summary_tids, rows per key)` rows, or what the column's first summaries hold on average when
+that is more than twice as many, and a run of n keys covers about `n / keys per bucket - 1` buckets
+whole). The index is opened at plan time for that, as the count's costing opens it; a hypothetical
+index is priced as walked. A plain scan that keeps its pins walks the keys all the same (§29.5) and
+is charged the summaries' walk: an index-only scan, which lion builds only for a query that needs
+no column (§29.9), and a non-MVCC one.
 
 On a MULTICOLUMN path `genericcostestimate()` prorates by every column's selectivity together,
 while the range column is walked whole whatever the others select; the postings of the range that
@@ -8589,7 +8610,8 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   descent; an entry spread over the heap - every entry of a low-cardinality column - costs reading
   the rest whole. A WINDOW reads the rest once. The rest is
   ONE stream, and a window is its next `lion_walk_window()` containers, each ORed into a bitset
-  image; the range is then walked once for the window, each entry sought to the window's first
+  image; the range is then walked once for the window (its buckets' summaries and edge keys, on a
+  summarized column), each entry sought to the window's first
   container key and read up to its last - an INLINE entry straight from the walk's copy of the
   leaf, item by item, a posting tree through a stream - and ORed into a second image wherever the
   rest has a container. The two images' AND is the answer for the window, handed out in container
@@ -10153,9 +10175,12 @@ bug below damaged, taking a summary whose key is below the bound as E_j counted 
 the range.
 
 **Where summaries are not used.** Anything that needs keys: a GROUP BY k walk (its groups ARE the
-keys), count(DISTINCT k), the bitmap and plain index scans of §28 and §29 and the ordered scans of
-§30 (they return TIDs per key or in key order), `k IS NULL`. The bitmap scan of a range could use
-them - a summary's containers are TIDs like any - and is left for later.
+keys), count(DISTINCT k), the ordered scans of §30 (they return TIDs in key order), `k IS NULL`, and
+the walks of a whole column (`k IS NOT NULL` in a bitmap or plain index scan). The bitmap and plain
+index scans of a RANGE do use them since 2026-09-28 - a summary's containers are TIDs like any, and a
+scan hands every one of them to the executor: they take the phased walk above without its sets and
+pins (`lion_entry_scan_begin_summed()`, `lion_entry_scan_next_copy()`; §28, "Bitmap scans"), except
+a plain scan that keeps its pins (§29.5).
 
 ### The open bucket and the directory order (2026-09-28)
 
@@ -10445,8 +10470,9 @@ The choices made conservatively here, each with the alternative:
   against the other arms.
 - **Downgrade**: an index with summaries is format 7, which an older build refuses; REINDEX with
   `summaries = off` first.
-- **Not used by**: the bitmap and plain index scans, GROUP BY k walks, count(DISTINCT k), ordered
-  scans - they want keys, or could take summaries (the bitmap scan of a range) in a later change.
+- **Not used by**: GROUP BY k walks, count(DISTINCT k), ordered scans, and the index scans' walks
+  of a whole column (`IS NOT NULL`) - they want keys, or could take summaries (a whole column) in a
+  later change. The bitmap and plain index scans of a range use them (§28, "Bitmap scans").
 - **The insert fast path** an appending column could have - remembering where the open bucket is,
   as btree remembers its rightmost leaf - is not there: every summarized row descends from the root
   (once; an append that raises the open bucket's key no longer descends twice).

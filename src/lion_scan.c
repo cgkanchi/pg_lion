@@ -566,6 +566,19 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
  * scan needs for `op ANY (array)` on a column that cannot compare the
  * elements, walked ONCE rather than once per element, so that no entry comes
  * out twice; the walk ends when every range has ended.
+ *
+ * ONE range over a column with SUMMARY posting sets (DESIGN.md §32) is walked
+ * the way a sum walks it instead (lion_entry_scan_begin_summed()): the keys of
+ * the buckets at the range's ends one by one, and every bucket the range
+ * covers whole as its summary, one entry of up to summary_tids rows.  They are
+ * pairwise disjoint and together exactly the range's rows, as the keys are
+ * (§32, "Readers"), so no caller can tell them apart - every one of them
+ * takes an entry's posting set and nothing else of it - but a range over a
+ * near-unique column is a few thousand entries instead of a million.  The
+ * copies are the entry scan's batch, handed out with no pin, which is why a
+ * walk that must keep its pins (§29.5) walks the keys: the only such walk is
+ * a plain scan under a non-MVCC snapshot.  A walk with its NULL entry has no
+ * range and never gets here.
  */
 typedef struct LionLeafWalk
 {
@@ -583,6 +596,7 @@ typedef struct LionLeafWalk
 	OffsetNumber off;
 	OffsetNumber maxoff;
 	bool		done;
+	LionEntryScan *sum;			/* the summed walk above, or NULL */
 } LionLeafWalk;
 
 static void
@@ -619,6 +633,20 @@ lion_walk_begin(LionLeafWalk *w, Relation index, LionState *col,
 		}
 	}
 
+	/* One range over a summarized column: its summaries (above). */
+	if (w->nranges == 1 && col->summarized && !withnull && !keeppin)
+	{
+		LionEntryScan *es = (LionEntryScan *) palloc(sizeof(LionEntryScan));
+
+		if (lion_entry_scan_begin_summed(es, index, (AttrNumber) col->attno,
+										 &ranges[0], LION_WALK_INSIDE))
+		{
+			w->sum = es;
+			return;
+		}
+		pfree(es);
+	}
+
 	/*
 	 * A range starts at the leaf its lower bound lives on (DESIGN.md §28);
 	 * the entries of an earlier column and those below the bound that share
@@ -632,6 +660,17 @@ static LionEntryTuple *
 lion_walk_next(LionLeafWalk *w, Size *itemlen)
 {
 	Page		cpage = (Page) w->copy->data;
+
+	if (w->sum != NULL)
+	{
+		LionEntryTuple *entry = NULL;
+
+		if (!w->done)
+			entry = lion_entry_scan_next_copy(w->sum, itemlen);
+		if (entry == NULL)
+			w->done = true;
+		return entry;
+	}
 
 	for (;;)
 	{
@@ -752,6 +791,12 @@ lion_walk_end(LionLeafWalk *w)
 	if (BufferIsValid(w->pinbuf))
 		ReleaseBuffer(w->pinbuf);
 	w->pinbuf = InvalidBuffer;
+	if (w->sum != NULL)
+	{
+		lion_entry_scan_end(w->sum);
+		pfree(w->sum);
+		w->sum = NULL;
+	}
 	w->done = true;
 	w->haspage = false;
 }
@@ -833,7 +878,9 @@ lion_scankey_is_array_range(LionState *col, ScanKey skey)
  * wide the range is.  No pin budget is drawn on - a bitmap scan needs no
  * visibility-map interlock, since the executor visits every TID it emits -
  * and the memory is the TIDBitmap's own, which goes lossy under work_mem
- * rather than growing.
+ * rather than growing.  On a column with summaries (DESIGN.md §32) the walk
+ * reads the summary of every bucket the range covers whole instead of its
+ * keys (lion_walk_begin()): the same TIDs, from far fewer entries.
  */
 static int64
 lion_emit_range(LionScanOpaque so, LionState *col,
@@ -3051,6 +3098,8 @@ lion_source_next(LionSource *src)
 					src->walk.col = lion_column(ix, src->walkattno);
 					for (r = 0; r < src->nranges; r++)
 						src->ranges[r].state = src->walk.col;
+					if (src->walk.sum != NULL)
+						src->walk.sum->state = src->walk.col;
 					src->ix = ix;
 					src->so->ix = ix;
 				}
